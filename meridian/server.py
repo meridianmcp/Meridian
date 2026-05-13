@@ -20,8 +20,10 @@ import aiosqlite
 from fastapi import FastAPI, HTTPException, Request
 
 from . import db as db_module
+from . import enqueue as enqueue_module
 from . import handoff as handoff_module
 from .models import (
+    EnqueueTask,
     GoalSet,
     GoalState,
     HandoffResult,
@@ -233,6 +235,32 @@ async def create_task(body: TaskCreate, request: Request) -> dict[str, Any]:
     )
 
 
+@app.post("/tasks/enqueue", response_model=Task, status_code=202)
+async def enqueue_task(body: EnqueueTask, request: Request) -> dict[str, Any]:
+    """Paid-tier: queue a Claude subprocess and return the pending task row.
+
+    Responds with 202 Accepted so clients can distinguish this from a
+    synchronous task creation. The worker runs in the background; poll
+    ``GET /projects/{id}/tasks`` to see the result land.
+    """
+    project = await db_module.get_project(_db(request), body.project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="project not found")
+    async with _db(request).execute(
+        "SELECT id FROM sessions WHERE id = ?", (body.session_id,)
+    ) as cur:
+        row = await cur.fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="session not found")
+    return await enqueue_module.enqueue_claude_task(
+        _db(request),
+        body.session_id,
+        body.project_id,
+        body.prompt,
+        timeout=body.timeout,
+    )
+
+
 # ---------------------------------------------------------------------------
 # MCP server
 # ---------------------------------------------------------------------------
@@ -405,6 +433,35 @@ def build_mcp_server():
                     "required": ["project_id"],
                 },
             ),
+            Tool(
+                name="enqueue_claude_task",
+                description=(
+                    "PAID-TIER. Queue a long-running Claude Code subprocess "
+                    "without blocking this session. Returns immediately with "
+                    "a pending task row; the worker writes its result back "
+                    "into the same row when it finishes. Poll get_tasks to "
+                    "see the result. Use this when an MCP tool call would "
+                    "otherwise time out waiting for a Claude subprocess to "
+                    "complete."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "session_id": {"type": "string"},
+                        "project_id": {"type": "string"},
+                        "prompt": {"type": "string"},
+                        "timeout": {
+                            "type": "number",
+                            "default": 600.0,
+                            "description": (
+                                "Seconds before the worker is killed. Pass "
+                                "0 or a negative number to disable."
+                            ),
+                        },
+                    },
+                    "required": ["session_id", "project_id", "prompt"],
+                },
+            ),
         ]
 
     @server.call_tool()
@@ -462,6 +519,24 @@ def build_mcp_server():
                     db, arguments["project_id"], state["data_dir"]
                 )
                 result = {"path": path, "content": content}
+            elif name == "enqueue_claude_task":
+                raw_timeout = arguments.get("timeout", 600.0)
+                # Treat 0 / negative as "no timeout" — Claude jobs can be
+                # genuinely open-ended.
+                timeout: float | None
+                try:
+                    timeout = float(raw_timeout)
+                    if timeout <= 0:
+                        timeout = None
+                except (TypeError, ValueError):
+                    timeout = 600.0
+                result = await enqueue_module.enqueue_claude_task(
+                    db,
+                    arguments["session_id"],
+                    arguments["project_id"],
+                    arguments["prompt"],
+                    timeout=timeout,
+                )
             else:
                 result = {"error": f"unknown tool: {name}"}
         except Exception as exc:  # noqa: BLE001 — surface to MCP client

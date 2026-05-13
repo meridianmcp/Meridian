@@ -41,6 +41,19 @@ class TaskCreate(BaseModel):
     status: Literal["pending", "done", "failed"] = "done"
 
 
+class EnqueueTask(BaseModel):
+    """Body for POST /tasks/enqueue (paid-tier).
+
+    The prompt is handed to a Claude Code subprocess; the server returns
+    a pending task row immediately and updates it when the worker exits.
+    """
+
+    session_id: str
+    project_id: str
+    prompt: str = Field(..., min_length=1)
+    timeout: float | None = 600.0
+
+
 # ---------------------------------------------------------------------------
 # Response models
 # ---------------------------------------------------------------------------

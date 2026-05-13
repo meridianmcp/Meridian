@@ -276,6 +276,50 @@ async def log_task(
     return task
 
 
+async def get_task(
+    db: aiosqlite.Connection, task_id: str
+) -> dict[str, Any] | None:
+    """Look up a single task by id."""
+    async with db.execute(
+        "SELECT * FROM task_log WHERE id = ?", (task_id,)
+    ) as cur:
+        row = await cur.fetchone()
+    return _row_to_dict(row)
+
+
+async def update_task(
+    db: aiosqlite.Connection,
+    task_id: str,
+    *,
+    status: str | None = None,
+    description: str | None = None,
+) -> dict[str, Any] | None:
+    """Update a task's status and/or description in place.
+
+    Returns the updated task dict, or None if the id doesn't exist. Used by
+    the paid-tier ``enqueue_claude_task`` worker to mark a pending task done
+    or failed once the subprocess returns.
+    """
+    fields: list[str] = []
+    values: list[Any] = []
+    if status is not None:
+        if status not in {"pending", "done", "failed"}:
+            raise ValueError(f"invalid task status: {status}")
+        fields.append("status = ?")
+        values.append(status)
+    if description is not None:
+        fields.append("description = ?")
+        values.append(description)
+    if not fields:
+        return await get_task(db, task_id)
+    values.append(task_id)
+    await db.execute(
+        f"UPDATE task_log SET {', '.join(fields)} WHERE id = ?", values
+    )
+    await db.commit()
+    return await get_task(db, task_id)
+
+
 async def get_tasks(
     db: aiosqlite.Connection, project_id: str, limit: int = 20
 ) -> list[dict[str, Any]]:

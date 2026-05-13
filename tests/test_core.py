@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
+import sys
+
 import pytest
 
 from meridian import db as db_module
+from meridian import enqueue as enqueue_module
 from meridian import handoff as handoff_module
 
 
@@ -201,6 +205,158 @@ def test_close_session(client):
     assert r.status_code == 200
     sessions = client.get(f"/projects/{project['id']}/sessions").json()
     assert sess["id"] not in {s["id"] for s in sessions}
+
+
+# ---------------------------------------------------------------------------
+# Paid-tier: enqueue_claude_task
+# ---------------------------------------------------------------------------
+
+
+# Stub worker: a Python one-liner that echoes the prompt back. Used in place
+# of the real `claude` CLI so tests don't depend on it being installed.
+_OK_WORKER = [sys.executable, "-c", "import sys; sys.stdout.write(sys.argv[1])"]
+_FAIL_WORKER = [
+    sys.executable,
+    "-c",
+    "import sys; sys.stderr.write('boom'); sys.exit(2)",
+]
+
+
+@pytest.mark.asyncio
+async def test_update_task_changes_status_and_description(db):
+    p = await db_module.create_project(db, "alpha")
+    s = await db_module.register_session(db, p["id"], "sess")
+    t = await db_module.log_task(db, s["id"], p["id"], "old", "pending")
+    updated = await db_module.update_task(
+        db, t["id"], status="done", description="new"
+    )
+    assert updated is not None
+    assert updated["status"] == "done"
+    assert updated["description"] == "new"
+
+
+@pytest.mark.asyncio
+async def test_update_task_rejects_bad_status(db):
+    p = await db_module.create_project(db, "alpha")
+    s = await db_module.register_session(db, p["id"], "sess")
+    t = await db_module.log_task(db, s["id"], p["id"], "x", "pending")
+    with pytest.raises(ValueError):
+        await db_module.update_task(db, t["id"], status="bogus")
+
+
+@pytest.mark.asyncio
+async def test_enqueue_returns_pending_then_completes(db):
+    p = await db_module.create_project(db, "alpha")
+    s = await db_module.register_session(db, p["id"], "sess")
+    task = await enqueue_module.enqueue_claude_task(
+        db,
+        s["id"],
+        p["id"],
+        "hello world",
+        worker_argv=_OK_WORKER,
+        wait=False,
+    )
+    assert task["status"] == "pending"
+    assert task["description"].startswith(enqueue_module.PROMPT_PREFIX)
+
+    # Drain pending background tasks. asyncio.create_task() schedules the
+    # worker coroutine; yielding the loop lets it finish before we assert.
+    for _ in range(20):
+        await asyncio.sleep(0.05)
+        latest = await db_module.get_task(db, task["id"])
+        if latest and latest["status"] != "pending":
+            break
+    assert latest is not None
+    assert latest["status"] == "done"
+    assert "hello world" in latest["description"]
+    assert latest["description"].startswith(enqueue_module.RESULT_PREFIX)
+
+
+@pytest.mark.asyncio
+async def test_enqueue_marks_failed_on_nonzero_exit(db):
+    p = await db_module.create_project(db, "alpha")
+    s = await db_module.register_session(db, p["id"], "sess")
+    task = await enqueue_module.enqueue_claude_task(
+        db,
+        s["id"],
+        p["id"],
+        "trigger failure",
+        worker_argv=_FAIL_WORKER,
+        wait=True,
+    )
+    assert task["status"] == "failed"
+    assert "exit code 2" in task["description"]
+    assert "boom" in task["description"]
+
+
+@pytest.mark.asyncio
+async def test_enqueue_marks_failed_when_command_missing(db):
+    p = await db_module.create_project(db, "alpha")
+    s = await db_module.register_session(db, p["id"], "sess")
+    task = await enqueue_module.enqueue_claude_task(
+        db,
+        s["id"],
+        p["id"],
+        "ignored",
+        worker_argv=["definitely-not-a-real-binary-7878"],
+        wait=True,
+    )
+    assert task["status"] == "failed"
+    assert "not found" in task["description"]
+
+
+@pytest.mark.asyncio
+async def test_enqueue_rejects_empty_prompt(db):
+    p = await db_module.create_project(db, "alpha")
+    s = await db_module.register_session(db, p["id"], "sess")
+    with pytest.raises(ValueError):
+        await enqueue_module.enqueue_claude_task(
+            db, s["id"], p["id"], "   ", worker_argv=_OK_WORKER
+        )
+
+
+@pytest.mark.asyncio
+async def test_enqueue_respects_timeout(db):
+    p = await db_module.create_project(db, "alpha")
+    s = await db_module.register_session(db, p["id"], "sess")
+    slow = [sys.executable, "-c", "import time; time.sleep(5)"]
+    task = await enqueue_module.enqueue_claude_task(
+        db,
+        s["id"],
+        p["id"],
+        "will hang",
+        worker_argv=slow,
+        timeout=0.5,
+        wait=True,
+    )
+    assert task["status"] == "failed"
+    assert "timed out" in task["description"]
+
+
+def test_enqueue_http_endpoint_returns_202(client, monkeypatch):
+    # Force the worker command to the in-process Python stub so the
+    # endpoint test doesn't depend on `claude` being on PATH.
+    monkeypatch.setenv(
+        "MERIDIAN_WORKER_CMD",
+        f'"{sys.executable}" -c "import sys; sys.stdout.write(sys.argv[1])"',
+    )
+    project = client.post("/projects", json={"name": "alpha"}).json()
+    sess = client.post(
+        "/sessions/register",
+        json={"project_id": project["id"], "name": "s1"},
+    ).json()
+    r = client.post(
+        "/tasks/enqueue",
+        json={
+            "session_id": sess["id"],
+            "project_id": project["id"],
+            "prompt": "say hi",
+        },
+    )
+    assert r.status_code == 202
+    task = r.json()
+    assert task["status"] == "pending"
+    assert task["description"].startswith(enqueue_module.PROMPT_PREFIX)
 
 
 def test_handoff_endpoint(client):
