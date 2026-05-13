@@ -7,11 +7,54 @@ uuid4 strings; timestamps are ISO-format strings produced by SQLite's
 
 from __future__ import annotations
 
+import asyncio
 import json
 import uuid
 from typing import Any
 
 import aiosqlite
+
+# In-process pub/sub. Subscribers register an asyncio.Queue keyed by
+# project_id; any call to log_task / update_task forwards a serialisable
+# event dict so dashboard WebSockets see MCP-driven activity in real time.
+_TASK_LISTENERS: dict[str, set[asyncio.Queue]] = {}
+
+
+def subscribe_tasks(project_id: str) -> asyncio.Queue:
+    """Register a new listener queue for a project's task stream."""
+    q: asyncio.Queue = asyncio.Queue()
+    _TASK_LISTENERS.setdefault(project_id, set()).add(q)
+    return q
+
+
+def unsubscribe_tasks(project_id: str, queue: asyncio.Queue) -> None:
+    """Drop a previously-registered listener queue. Safe to call twice."""
+    bucket = _TASK_LISTENERS.get(project_id)
+    if bucket and queue in bucket:
+        bucket.discard(queue)
+        if not bucket:
+            _TASK_LISTENERS.pop(project_id, None)
+
+
+def _publish_task(event_type: str, task: dict[str, Any]) -> None:
+    """Fan-out a task event to every subscriber of the project.
+
+    Synchronous, non-blocking: drops the event if a queue is full. The
+    dashboard WebSocket reader drains its queue continuously so a full
+    queue means the socket is wedged — letting it back-pressure is wrong.
+    """
+    project_id = task.get("project_id")
+    if not project_id:
+        return
+    listeners = _TASK_LISTENERS.get(project_id)
+    if not listeners:
+        return
+    event = {"type": event_type, "task": task}
+    for q in list(listeners):
+        try:
+            q.put_nowait(event)
+        except asyncio.QueueFull:
+            pass
 
 CREATE_TABLES = """
 CREATE TABLE IF NOT EXISTS projects (
@@ -45,7 +88,7 @@ CREATE TABLE IF NOT EXISTS task_log (
     project_id TEXT NOT NULL REFERENCES projects(id),
     description TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'done'
-        CHECK (status IN ('pending','done','failed')),
+        CHECK (status IN ('pending','done','failed','pending-hitl')),
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -88,16 +131,62 @@ def _encode_content(content: Any) -> str:
     return json.dumps(content)
 
 
+async def _migrate_task_log_hitl(db: aiosqlite.Connection) -> None:
+    """Rebuild ``task_log`` if its CHECK constraint predates v0.2.0.
+
+    SQLite can't ``ALTER`` a CHECK constraint, so on an older database we
+    rebuild the table in place: copy rows out, drop, recreate with the new
+    constraint, copy rows back. No-op when the schema is already current.
+    """
+    async with db.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='task_log'"
+    ) as cur:
+        row = await cur.fetchone()
+    if row is None:
+        return
+    table_sql = row[0] or ""
+    if "pending-hitl" in table_sql:
+        return  # already migrated
+
+    await db.executescript(
+        """
+        BEGIN;
+        ALTER TABLE task_log RENAME TO task_log_v01;
+        CREATE TABLE task_log (
+            id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL REFERENCES sessions(id),
+            project_id TEXT NOT NULL REFERENCES projects(id),
+            description TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'done'
+                CHECK (status IN ('pending','done','failed','pending-hitl')),
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        INSERT INTO task_log (id, session_id, project_id, description, status, created_at)
+            SELECT id, session_id, project_id, description, status, created_at
+            FROM task_log_v01;
+        DROP TABLE task_log_v01;
+        CREATE INDEX IF NOT EXISTS idx_tasks_project
+            ON task_log(project_id, created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_tasks_session
+            ON task_log(session_id);
+        COMMIT;
+        """
+    )
+
+
 async def init_db(db_path: str) -> aiosqlite.Connection:
     """Open the SQLite database, apply schema, and return the connection.
 
     The caller owns the connection and is responsible for closing it.
+    Runs idempotent migrations: a v0.1.x database missing the
+    ``pending-hitl`` CHECK value is rebuilt in place.
     """
     db = await aiosqlite.connect(db_path)
     db.row_factory = aiosqlite.Row
     await db.execute("PRAGMA foreign_keys = ON")
     await db.executescript(CREATE_TABLES)
     await db.commit()
+    await _migrate_task_log_hitl(db)
     return db
 
 
@@ -256,8 +345,8 @@ async def log_task(
     description: str,
     status: str = "done",
 ) -> dict[str, Any]:
-    """Append a task-log entry."""
-    if status not in {"pending", "done", "failed"}:
+    """Append a task-log entry and broadcast to live subscribers."""
+    if status not in {"pending", "done", "failed", "pending-hitl"}:
         raise ValueError(f"invalid task status: {status}")
     tid = _new_id()
     await db.execute(
@@ -273,6 +362,7 @@ async def log_task(
         row = await cur.fetchone()
     task = _row_to_dict(row)
     assert task is not None
+    _publish_task("task_created", task)
     return task
 
 
@@ -303,7 +393,7 @@ async def update_task(
     fields: list[str] = []
     values: list[Any] = []
     if status is not None:
-        if status not in {"pending", "done", "failed"}:
+        if status not in {"pending", "done", "failed", "pending-hitl"}:
             raise ValueError(f"invalid task status: {status}")
         fields.append("status = ?")
         values.append(status)
@@ -317,7 +407,10 @@ async def update_task(
         f"UPDATE task_log SET {', '.join(fields)} WHERE id = ?", values
     )
     await db.commit()
-    return await get_task(db, task_id)
+    updated = await get_task(db, task_id)
+    if updated is not None:
+        _publish_task("task_updated", updated)
+    return updated
 
 
 async def get_tasks(

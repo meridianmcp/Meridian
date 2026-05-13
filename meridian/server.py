@@ -17,12 +17,15 @@ from pathlib import Path
 from typing import Any
 
 import aiosqlite
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, WebSocket
+from fastapi.responses import HTMLResponse, StreamingResponse
 
+from . import dashboard as dashboard_module
 from . import db as db_module
 from . import enqueue as enqueue_module
 from . import handoff as handoff_module
 from .models import (
+    ChatRequest,
     EnqueueTask,
     GoalSet,
     GoalState,
@@ -33,6 +36,7 @@ from .models import (
     SessionRegister,
     Task,
     TaskCreate,
+    TaskUpdate,
 )
 
 # Default on-disk location. Overridable via MERIDIAN_DB env var, which the
@@ -52,7 +56,20 @@ DEFAULT_DATA_DIR = Path(
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Open the SQLite connection on startup, close it on shutdown."""
+    """Open the SQLite connection on startup, close it on shutdown.
+
+    Also: load environment variables from ``./.env`` if present so the
+    dashboard chat proxy can find ``ANTHROPIC_API_KEY``. We do this here
+    rather than at import time so test fixtures can override the env
+    without an .env file leaking into them.
+    """
+    try:
+        from dotenv import load_dotenv
+
+        load_dotenv(override=False)
+    except ImportError:
+        pass  # dotenv is optional — env can be set by the launcher.
+
     db_path = os.environ.get("MERIDIAN_DB", DEFAULT_DB_PATH)
     data_dir = Path(os.environ.get("MERIDIAN_DATA_DIR", str(DEFAULT_DATA_DIR)))
 
@@ -64,6 +81,7 @@ async def lifespan(app: FastAPI):
     db = await db_module.init_db(db_path)
     app.state.db = db
     app.state.data_dir = str(data_dir)
+    app.state.ws_broadcaster = dashboard_module.WebSocketBroadcaster()
     try:
         yield
     finally:
@@ -233,6 +251,76 @@ async def create_task(body: TaskCreate, request: Request) -> dict[str, Any]:
         body.description,
         body.status,
     )
+
+
+@app.patch("/tasks/{task_id}", response_model=Task)
+async def patch_task(
+    task_id: str, body: TaskUpdate, request: Request
+) -> dict[str, Any]:
+    """Update a task's status and/or description in place.
+
+    Used by the dashboard to flip HITL tasks to done/failed when the
+    human replies. 404 when the id is unknown, 422 on invalid status.
+    """
+    existing = await db_module.get_task(_db(request), task_id)
+    if existing is None:
+        raise HTTPException(status_code=404, detail="task not found")
+    try:
+        updated = await db_module.update_task(
+            _db(request),
+            task_id,
+            status=body.status,
+            description=body.description,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    assert updated is not None
+    return updated
+
+
+@app.get("/dashboard", response_class=HTMLResponse)
+async def dashboard_html() -> str:
+    """Serve the single-file dashboard UI."""
+    return dashboard_module.DASHBOARD_HTML
+
+
+@app.get("/config/api-key")
+async def api_key_status() -> dict[str, bool]:
+    """Tell the dashboard whether ``ANTHROPIC_API_KEY`` is set on the server.
+
+    Returns ``{"configured": bool}`` — never the key itself.
+    """
+    return {"configured": bool(os.environ.get("ANTHROPIC_API_KEY"))}
+
+
+@app.post("/dashboard/chat")
+async def dashboard_chat(body: ChatRequest, request: Request):
+    """Proxy a streaming Anthropic chat call as Server-Sent Events.
+
+    The server holds the API key and forwards each text delta as a
+    ``data: {"delta": "..."}`` line. The frontend reads the stream and
+    appends deltas into the active assistant bubble.
+    """
+    project = await db_module.get_project(_db(request), body.project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="project not found")
+    messages = [m.model_dump() for m in body.messages]
+    stream = dashboard_module.stream_anthropic_chat(
+        messages=messages,
+        system_prompt=body.system_prompt,
+        model=body.model,
+        max_tokens=body.max_tokens,
+    )
+    return StreamingResponse(stream, media_type="text/event-stream")
+
+
+@app.websocket("/ws/{project_id}")
+async def ws_project(ws: WebSocket, project_id: str) -> None:
+    """Push task-log events to dashboard clients for one project."""
+    broadcaster: dashboard_module.WebSocketBroadcaster = (
+        ws.app.state.ws_broadcaster
+    )
+    await broadcaster.serve(ws, project_id)
 
 
 @app.post("/tasks/enqueue", response_model=Task, status_code=202)

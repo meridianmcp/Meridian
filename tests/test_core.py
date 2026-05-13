@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import sys
 
 import pytest
 
+from meridian import dashboard as dashboard_module
 from meridian import db as db_module
 from meridian import enqueue as enqueue_module
 from meridian import handoff as handoff_module
@@ -383,3 +385,225 @@ def test_handoff_endpoint(client):
     assert "ship it" in body["content"]
     assert "step 1" in body["content"]
     assert body["path"].endswith("alpha_handoff.md")
+
+
+# ---------------------------------------------------------------------------
+# v0.2.0: pending-hitl, dashboard, chat, WebSocket
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_log_task_accepts_pending_hitl(db):
+    p = await db_module.create_project(db, "alpha")
+    s = await db_module.register_session(db, p["id"], "sess")
+    t = await db_module.log_task(
+        db, s["id"], p["id"], "[ASK]: pick a color", "pending-hitl"
+    )
+    assert t["status"] == "pending-hitl"
+
+
+@pytest.mark.asyncio
+async def test_log_task_publishes_to_subscribers(db):
+    p = await db_module.create_project(db, "alpha")
+    s = await db_module.register_session(db, p["id"], "sess")
+    queue = db_module.subscribe_tasks(p["id"])
+    try:
+        t = await db_module.log_task(db, s["id"], p["id"], "ping", "done")
+        event = await asyncio.wait_for(queue.get(), timeout=1.0)
+        assert event["type"] == "task_created"
+        assert event["task"]["id"] == t["id"]
+    finally:
+        db_module.unsubscribe_tasks(p["id"], queue)
+
+
+@pytest.mark.asyncio
+async def test_update_task_publishes_to_subscribers(db):
+    p = await db_module.create_project(db, "alpha")
+    s = await db_module.register_session(db, p["id"], "sess")
+    t = await db_module.log_task(
+        db, s["id"], p["id"], "[ASK]: ?", "pending-hitl"
+    )
+    queue = db_module.subscribe_tasks(p["id"])
+    try:
+        await db_module.update_task(db, t["id"], status="done")
+        # Drain the task_created leftover if present, then look for the
+        # update — subscribe was after create, but be defensive anyway.
+        event = await asyncio.wait_for(queue.get(), timeout=1.0)
+        assert event["type"] == "task_updated"
+        assert event["task"]["status"] == "done"
+    finally:
+        db_module.unsubscribe_tasks(p["id"], queue)
+
+
+def test_dashboard_html_served(client):
+    r = client.get("/dashboard")
+    assert r.status_code == 200
+    assert "text/html" in r.headers["content-type"]
+    assert "Meridian Dashboard" in r.text
+    assert "/ws/" in r.text  # WebSocket wiring present
+    assert "/dashboard/chat" in r.text  # chat proxy hook present
+
+
+def test_config_api_key_unset(client, monkeypatch):
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    r = client.get("/config/api-key")
+    assert r.status_code == 200
+    body = r.json()
+    assert body == {"configured": False}
+
+
+def test_config_api_key_set(client, monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test-1234")
+    r = client.get("/config/api-key")
+    assert r.status_code == 200
+    assert r.json() == {"configured": True}
+    # Key itself never echoed.
+    assert "sk-test-1234" not in r.text
+
+
+def test_patch_task_flips_status(client):
+    project = client.post("/projects", json={"name": "alpha"}).json()
+    sess = client.post(
+        "/sessions/register",
+        json={"project_id": project["id"], "name": "s1"},
+    ).json()
+    task = client.post(
+        "/tasks",
+        json={
+            "session_id": sess["id"],
+            "project_id": project["id"],
+            "description": "[ASK]: ok?",
+            "status": "pending-hitl",
+        },
+    ).json()
+    r = client.patch(
+        f"/tasks/{task['id']}",
+        json={"status": "done", "description": "[ANSWERED] yes"},
+    )
+    assert r.status_code == 200
+    updated = r.json()
+    assert updated["status"] == "done"
+    assert updated["description"] == "[ANSWERED] yes"
+
+
+def test_patch_task_404(client):
+    r = client.patch("/tasks/no-such-id", json={"status": "done"})
+    assert r.status_code == 404
+
+
+def test_dashboard_chat_streams_sse(client, monkeypatch):
+    """The chat endpoint should respond with text/event-stream and emit
+    a stream of ``data:`` lines ending with ``[DONE]``. We stub the
+    generator so the test doesn't need a real Anthropic key.
+    """
+    async def fake_stream(messages, system_prompt, model, max_tokens):
+        yield b'data: {"delta": "hello "}\n\n'
+        yield b'data: {"delta": "world"}\n\n'
+        yield b"data: [DONE]\n\n"
+
+    monkeypatch.setattr(
+        dashboard_module, "stream_anthropic_chat", fake_stream
+    )
+
+    project = client.post("/projects", json={"name": "alpha"}).json()
+    r = client.post(
+        "/dashboard/chat",
+        json={
+            "project_id": project["id"],
+            "messages": [{"role": "user", "content": "hi"}],
+        },
+    )
+    assert r.status_code == 200
+    assert "text/event-stream" in r.headers["content-type"]
+    body = r.text
+    assert "hello " in body
+    assert "world" in body
+    assert "[DONE]" in body
+
+
+def test_dashboard_chat_unknown_project_404(client):
+    r = client.post(
+        "/dashboard/chat",
+        json={
+            "project_id": "no-such-project",
+            "messages": [{"role": "user", "content": "hi"}],
+        },
+    )
+    assert r.status_code == 404
+
+
+def test_websocket_receives_task_event(client):
+    project = client.post("/projects", json={"name": "alpha"}).json()
+    sess = client.post(
+        "/sessions/register",
+        json={"project_id": project["id"], "name": "s1"},
+    ).json()
+    with client.websocket_connect(f"/ws/{project['id']}") as ws:
+        # Trigger a task via HTTP; pub/sub should fan out to the socket.
+        client.post(
+            "/tasks",
+            json={
+                "session_id": sess["id"],
+                "project_id": project["id"],
+                "description": "[ASK]: pick one",
+                "status": "pending-hitl",
+            },
+        )
+        msg = ws.receive_text()
+    event = json.loads(msg)
+    assert event["type"] == "task_created"
+    assert event["task"]["status"] == "pending-hitl"
+    assert event["task"]["description"] == "[ASK]: pick one"
+
+
+def test_migration_rebuilds_old_check_constraint(tmp_path):
+    """Open a database that predates pending-hitl, then re-open via
+    init_db and confirm pending-hitl now passes validation."""
+    import sqlite3
+
+    db_path = tmp_path / "legacy.db"
+    legacy = sqlite3.connect(db_path)
+    legacy.executescript(
+        """
+        CREATE TABLE projects (id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')));
+        CREATE TABLE goal_states (id TEXT PRIMARY KEY, project_id TEXT NOT NULL,
+            content TEXT NOT NULL, version INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now')));
+        CREATE TABLE sessions (id TEXT PRIMARY KEY, project_id TEXT NOT NULL,
+            name TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'active'
+                CHECK (status IN ('active','idle','closed')),
+            last_seen TEXT NOT NULL DEFAULT (datetime('now')),
+            created_at TEXT NOT NULL DEFAULT (datetime('now')));
+        CREATE TABLE task_log (id TEXT PRIMARY KEY, session_id TEXT NOT NULL,
+            project_id TEXT NOT NULL, description TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'done'
+                CHECK (status IN ('pending','done','failed')),
+            created_at TEXT NOT NULL DEFAULT (datetime('now')));
+        INSERT INTO projects (id, name) VALUES ('p1', 'legacy');
+        INSERT INTO sessions (id, project_id, name) VALUES ('s1','p1','old');
+        INSERT INTO task_log (id, session_id, project_id, description, status)
+            VALUES ('t1','s1','p1','old task','done');
+        """
+    )
+    legacy.commit()
+    legacy.close()
+
+    async def run() -> None:
+        conn = await db_module.init_db(str(db_path))
+        try:
+            # Existing row survived the rebuild.
+            t = await db_module.get_task(conn, "t1")
+            assert t is not None
+            assert t["description"] == "old task"
+            # New pending-hitl status now accepted.
+            new = await db_module.log_task(
+                conn, "s1", "p1", "[ASK]: ?", "pending-hitl"
+            )
+            assert new["status"] == "pending-hitl"
+        finally:
+            await conn.close()
+
+    asyncio.run(run())

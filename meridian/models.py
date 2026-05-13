@@ -38,7 +38,7 @@ class TaskCreate(BaseModel):
     session_id: str
     project_id: str
     description: str = Field(..., min_length=1)
-    status: Literal["pending", "done", "failed"] = "done"
+    status: Literal["pending", "done", "failed", "pending-hitl"] = "done"
 
 
 class EnqueueTask(BaseModel):
@@ -97,7 +97,7 @@ class Task(BaseModel):
     session_id: str
     project_id: str
     description: str
-    status: Literal["pending", "done", "failed"]
+    status: Literal["pending", "done", "failed", "pending-hitl"]
     created_at: str
 
 
@@ -106,3 +106,28 @@ class HandoffResult(BaseModel):
 
     path: str
     content: str
+
+
+class TaskUpdate(BaseModel):
+    """Body for PATCH /tasks/{task_id}. Either field may be omitted."""
+
+    status: Literal["pending", "done", "failed", "pending-hitl"] | None = None
+    description: str | None = None
+
+
+class ChatMessage(BaseModel):
+    """One turn in the dashboard chat history."""
+
+    role: Literal["user", "assistant"]
+    content: str
+
+
+class ChatRequest(BaseModel):
+    """Body for POST /dashboard/chat. The server reads the API key from
+    the environment and proxies the streamed response."""
+
+    project_id: str
+    messages: list[ChatMessage]
+    system_prompt: str | None = None
+    model: str = "claude-sonnet-4-20250514"
+    max_tokens: int = 4096

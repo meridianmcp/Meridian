@@ -18,6 +18,9 @@ pytest-asyncio = ">=0.23"
 
 [pypi-dependencies]
 mcp = ">=1.0"
+anthropic = ">=0.40"
+python-dotenv = ">=1.0"
+websockets = ">=12.0"
 
 [tasks]
 start = "python -m meridian"
