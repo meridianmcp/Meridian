@@ -1,0 +1,70 @@
+Meridian Source License 1.0 (MSL-1.0)
+
+Copyright (c) 2025 Adam Camerer. All rights reserved.
+
+TERMS AND CONDITIONS
+
+1. GRANT OF RIGHTS
+
+   Permission is granted, free of charge, to any individual person to use,
+   copy, modify, and run this software solely for personal and non-commercial
+   purposes, subject to the conditions and restrictions below.
+
+   Individual developers may use this software for personal evaluation and
+   experimentation, including within a commercial organization, provided the
+   software is not deployed as part of any product, service, workflow, or
+   internal tooling that serves more than one person or provides value to
+   the organization beyond the individual's own personal use.
+
+2. RESTRICTIONS
+
+   The following uses are NOT permitted without a separate written commercial
+   license agreement from the copyright holder:
+
+   a) Use by, on behalf of, or for the benefit of any company, organization,
+      or team beyond individual personal experimentation by a single person.
+
+   b) Deployment as internal tooling, infrastructure, or automation serving
+      more than one user within any organization.
+
+   c) Embedding, bundling, or integration of this software or any derivative
+      work into any commercial product, service, or offering.
+
+   d) Offering this software or any derivative work as a hosted, managed,
+      or cloud-based service to any third party.
+
+   e) Redistribution of this software or any derivative work as part of any
+      commercial offering or product.
+
+   f) Use in any automated pipeline, CI/CD system, or production environment
+      within a commercial organization.
+
+3. NO CONVERSION
+
+   This license does not convert to any other license at any future date,
+   regardless of time elapsed since first publication.
+
+4. ATTRIBUTION
+
+   Any permitted use or redistribution must retain this license text,
+   copyright notice, and all original attribution intact and unmodified.
+
+5. DISCLAIMER
+
+   THIS SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+   OR IMPLIED, INCLUDING BUT NOT LIMITED TO WARRANTIES OF MERCHANTABILITY,
+   FITNESS FOR A PARTICULAR PURPOSE, AND NON-INFRINGEMENT. IN NO EVENT SHALL
+   THE COPYRIGHT HOLDER BE LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER LIABILITY
+   ARISING FROM USE OF THIS SOFTWARE.
+
+6. COMMERCIAL LICENSING
+
+   For commercial use, team deployment, product integration, or any use case
+   not explicitly permitted above, contact: [your-email@domain.com]
+
+   Commercial licenses are available and priced based on use case and scale.
+
+---
+
+This is the Meridian Source License version 1.0, created for the Meridian
+project. It is not an OSI-approved open source license.

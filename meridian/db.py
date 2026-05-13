@@ -1,0 +1,289 @@
+"""SQLite persistence layer for Meridian.
+
+All functions are async and operate on an `aiosqlite.Connection`. IDs are
+uuid4 strings; timestamps are ISO-format strings produced by SQLite's
+`datetime('now')`.
+"""
+
+from __future__ import annotations
+
+import json
+import uuid
+from typing import Any
+
+import aiosqlite
+
+CREATE_TABLES = """
+CREATE TABLE IF NOT EXISTS projects (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS goal_states (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES projects(id),
+    content TEXT NOT NULL,
+    version INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS sessions (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES projects(id),
+    name TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active'
+        CHECK (status IN ('active','idle','closed')),
+    last_seen TEXT NOT NULL DEFAULT (datetime('now')),
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS task_log (
+    id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL REFERENCES sessions(id),
+    project_id TEXT NOT NULL REFERENCES projects(id),
+    description TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'done'
+        CHECK (status IN ('pending','done','failed')),
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_goal_project
+    ON goal_states(project_id);
+CREATE INDEX IF NOT EXISTS idx_sessions_project
+    ON sessions(project_id, status);
+CREATE INDEX IF NOT EXISTS idx_tasks_project
+    ON task_log(project_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_tasks_session
+    ON task_log(session_id);
+"""
+
+
+def _new_id() -> str:
+    """Return a fresh uuid4 string."""
+    return str(uuid.uuid4())
+
+
+def _row_to_dict(row: aiosqlite.Row | None) -> dict[str, Any] | None:
+    """Convert an aiosqlite Row to a plain dict, or None."""
+    if row is None:
+        return None
+    return {k: row[k] for k in row.keys()}
+
+
+def _decode_content(raw: str) -> Any:
+    """Goal content is stored as text. If it parses as JSON, return the
+    parsed object; otherwise return the raw string."""
+    try:
+        return json.loads(raw)
+    except (ValueError, TypeError):
+        return raw
+
+
+def _encode_content(content: Any) -> str:
+    """Serialize goal content to text for storage."""
+    if isinstance(content, str):
+        return content
+    return json.dumps(content)
+
+
+async def init_db(db_path: str) -> aiosqlite.Connection:
+    """Open the SQLite database, apply schema, and return the connection.
+
+    The caller owns the connection and is responsible for closing it.
+    """
+    db = await aiosqlite.connect(db_path)
+    db.row_factory = aiosqlite.Row
+    await db.execute("PRAGMA foreign_keys = ON")
+    await db.executescript(CREATE_TABLES)
+    await db.commit()
+    return db
+
+
+async def create_project(db: aiosqlite.Connection, name: str) -> dict[str, Any]:
+    """Insert a project and return it as a dict. Raises if the name exists."""
+    pid = _new_id()
+    await db.execute(
+        "INSERT INTO projects (id, name) VALUES (?, ?)",
+        (pid, name),
+    )
+    await db.commit()
+    project = await get_project(db, pid)
+    assert project is not None
+    return project
+
+
+async def get_project(
+    db: aiosqlite.Connection, project_id: str
+) -> dict[str, Any] | None:
+    """Look up a project by id."""
+    async with db.execute(
+        "SELECT * FROM projects WHERE id = ?", (project_id,)
+    ) as cur:
+        row = await cur.fetchone()
+    return _row_to_dict(row)
+
+
+async def get_project_by_name(
+    db: aiosqlite.Connection, name: str
+) -> dict[str, Any] | None:
+    """Look up a project by its unique name."""
+    async with db.execute(
+        "SELECT * FROM projects WHERE name = ?", (name,)
+    ) as cur:
+        row = await cur.fetchone()
+    return _row_to_dict(row)
+
+
+async def list_projects(db: aiosqlite.Connection) -> list[dict[str, Any]]:
+    """Return every project, newest first."""
+    async with db.execute(
+        "SELECT * FROM projects ORDER BY created_at DESC"
+    ) as cur:
+        rows = await cur.fetchall()
+    return [_row_to_dict(r) for r in rows]  # type: ignore[misc]
+
+
+async def get_goal(
+    db: aiosqlite.Connection, project_id: str
+) -> dict[str, Any] | None:
+    """Return the latest goal state for a project, or None if unset."""
+    async with db.execute(
+        "SELECT * FROM goal_states WHERE project_id = ? "
+        "ORDER BY version DESC LIMIT 1",
+        (project_id,),
+    ) as cur:
+        row = await cur.fetchone()
+    goal = _row_to_dict(row)
+    if goal is None:
+        return None
+    goal["content"] = _decode_content(goal["content"])
+    return goal
+
+
+async def set_goal(
+    db: aiosqlite.Connection, project_id: str, content: Any
+) -> dict[str, Any]:
+    """Upsert the goal state for a project, incrementing version each call."""
+    existing = await get_goal(db, project_id)
+    encoded = _encode_content(content)
+    if existing is None:
+        gid = _new_id()
+        await db.execute(
+            "INSERT INTO goal_states (id, project_id, content, version) "
+            "VALUES (?, ?, ?, 1)",
+            (gid, project_id, encoded),
+        )
+    else:
+        new_version = int(existing["version"]) + 1
+        gid = _new_id()
+        await db.execute(
+            "INSERT INTO goal_states (id, project_id, content, version) "
+            "VALUES (?, ?, ?, ?)",
+            (gid, project_id, encoded, new_version),
+        )
+    await db.commit()
+    goal = await get_goal(db, project_id)
+    assert goal is not None
+    return goal
+
+
+async def register_session(
+    db: aiosqlite.Connection, project_id: str, name: str
+) -> dict[str, Any]:
+    """Create a session row in 'active' state."""
+    sid = _new_id()
+    await db.execute(
+        "INSERT INTO sessions (id, project_id, name) VALUES (?, ?, ?)",
+        (sid, project_id, name),
+    )
+    await db.commit()
+    async with db.execute(
+        "SELECT * FROM sessions WHERE id = ?", (sid,)
+    ) as cur:
+        row = await cur.fetchone()
+    session = _row_to_dict(row)
+    assert session is not None
+    return session
+
+
+async def update_session_seen(
+    db: aiosqlite.Connection, session_id: str
+) -> None:
+    """Bump a session's last_seen timestamp to now."""
+    await db.execute(
+        "UPDATE sessions SET last_seen = datetime('now') WHERE id = ?",
+        (session_id,),
+    )
+    await db.commit()
+
+
+async def close_session(db: aiosqlite.Connection, session_id: str) -> None:
+    """Mark a session as closed."""
+    await db.execute(
+        "UPDATE sessions SET status = 'closed' WHERE id = ?",
+        (session_id,),
+    )
+    await db.commit()
+
+
+async def get_sessions(
+    db: aiosqlite.Connection,
+    project_id: str,
+    active_only: bool = True,
+) -> list[dict[str, Any]]:
+    """List sessions for a project, newest first."""
+    if active_only:
+        query = (
+            "SELECT * FROM sessions WHERE project_id = ? "
+            "AND status != 'closed' ORDER BY last_seen DESC"
+        )
+    else:
+        query = (
+            "SELECT * FROM sessions WHERE project_id = ? "
+            "ORDER BY last_seen DESC"
+        )
+    async with db.execute(query, (project_id,)) as cur:
+        rows = await cur.fetchall()
+    return [_row_to_dict(r) for r in rows]  # type: ignore[misc]
+
+
+async def log_task(
+    db: aiosqlite.Connection,
+    session_id: str,
+    project_id: str,
+    description: str,
+    status: str = "done",
+) -> dict[str, Any]:
+    """Append a task-log entry."""
+    if status not in {"pending", "done", "failed"}:
+        raise ValueError(f"invalid task status: {status}")
+    tid = _new_id()
+    await db.execute(
+        "INSERT INTO task_log (id, session_id, project_id, description, status) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (tid, session_id, project_id, description, status),
+    )
+    await update_session_seen(db, session_id)
+    await db.commit()
+    async with db.execute(
+        "SELECT * FROM task_log WHERE id = ?", (tid,)
+    ) as cur:
+        row = await cur.fetchone()
+    task = _row_to_dict(row)
+    assert task is not None
+    return task
+
+
+async def get_tasks(
+    db: aiosqlite.Connection, project_id: str, limit: int = 20
+) -> list[dict[str, Any]]:
+    """Return recent tasks for a project, newest first."""
+    async with db.execute(
+        "SELECT * FROM task_log WHERE project_id = ? "
+        "ORDER BY created_at DESC, rowid DESC LIMIT ?",
+        (project_id, limit),
+    ) as cur:
+        rows = await cur.fetchall()
+    return [_row_to_dict(r) for r in rows]  # type: ignore[misc]

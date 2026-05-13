@@ -1,0 +1,9 @@
+version: "3.9"
+services:
+  meridian:
+    build: .
+    ports:
+      - "7878:7878"
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped

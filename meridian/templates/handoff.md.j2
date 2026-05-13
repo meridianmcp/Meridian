@@ -1,0 +1,33 @@
+---
+MERIDIAN_CONTEXT
+Generated: {{ generated_at }}
+Project: {{ project.name }} ({{ project.id }})
+---
+
+## Goal State (v{{ goal.version }})
+
+{{ goal.content }}
+
+## Active Sessions ({{ sessions | length }})
+
+{% for s in sessions -%}
+- {{ s.name }} — {{ s.status }} — last seen {{ s.last_seen }}
+{% endfor %}
+
+## Recent Task Log (last {{ tasks | length }} entries)
+
+{% for t in tasks -%}
+[{{ t.created_at }}] [{{ t.status | upper }}] {{ session_names[t.session_id] }}: {{ t.description }}
+{% endfor %}
+
+## Resume Instructions
+
+You are resuming a Meridian-coordinated session for "{{ project.name }}".
+
+1. Read Goal State above — this is your primary directive
+2. Read Task Log — this shows what has already been done
+3. Call register_session(project_id="{{ project.id }}", session_name="<your-name>")
+4. Call get_goal(project_id="{{ project.id }}") to confirm latest version
+5. Continue from where the task log ends
+
+Do not redo work already marked done in the task log.
