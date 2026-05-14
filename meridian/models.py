@@ -122,6 +122,16 @@ class ChatMessage(BaseModel):
     content: str
 
 
+class ChatHistoryItem(BaseModel):
+    """A persisted chat message row returned by GET /projects/{id}/chat/history."""
+
+    id: str
+    project_id: str
+    role: Literal["user", "assistant"]
+    content: str
+    created_at: str
+
+
 class ChatRequest(BaseModel):
     """Body for POST /dashboard/chat.
 
@@ -138,6 +148,6 @@ class ChatRequest(BaseModel):
     project_id: str
     messages: list[ChatMessage]
     system_prompt: str | None = None
-    model: str = "claude-sonnet-4-20250514"
+    model: str = "claude-haiku-4-5-20251001"
     max_tokens: int = 4096
     mode: Literal["cli", "api"] = "cli"

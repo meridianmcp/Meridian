@@ -209,6 +209,9 @@ def _default_claude_cli_argv() -> list[str]:
     env = os.environ.get("MERIDIAN_CLAUDE_CLI")
     if env:
         return shlex.split(env)
+    windows_claude = Path.home() / "AppData" / "Roaming" / "npm" / "claude.cmd"
+    if windows_claude.exists():
+        return ["cmd", "/c", str(windows_claude), "-p"]
     return ["claude", "-p"]
 
 
@@ -262,12 +265,14 @@ async def stream_claude_cli_chat(
     # Build full argv. Only append --model + --output-format when the
     # user hasn't supplied a custom worker command — otherwise tests
     # using a Python stub stay simple.
-    cmd = list(argv) + [prompt]
-    using_default = argv == ["claude", "-p"]
-    if using_default:
-        cmd += ["--output-format", "text"]
-        if model:
-            cmd += ["--model", model]
+    # Only pass the last user message - no system prompt for CLI to stay under Windows 8191 char limit
+    last_user = next((m["content"] for m in reversed(messages) if m.get("role") == "user"), "hello")
+    safe_prompt = last_user[:2000]
+    cmd = list(argv) + [safe_prompt]
+    # Always append output format flags
+    cmd += ["--output-format", "text"]
+    if model:
+        cmd += ["--model", model]
 
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -337,6 +342,7 @@ DASHBOARD_HTML = r"""<!doctype html>
 <head>
 <meta charset="utf-8">
 <title>Meridian Dashboard</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🧭</text></svg>">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
@@ -582,7 +588,7 @@ input[type=text] {
 <body>
 <div class="app">
   <aside class="sidebar">
-    <div class="sidebar-header">MERIDIAN<small>v0.2.0 dashboard</small></div>
+    <div class="sidebar-header">MERIDIAN<small>v0.3.0 dashboard</small></div>
     <div id="api-warn">No auth configured — chat disabled. Set ANTHROPIC_API_KEY or connect Claude Max.</div>
     <div id="auth-method" style="margin:6px 10px 0;padding:5px 10px;background:rgba(0,212,170,0.08);border:1px solid rgba(0,212,170,0.25);border-radius:4px;color:var(--accent-green);font-size:10px;display:none"></div>
     <div class="projects-label">Projects</div>
@@ -779,7 +785,7 @@ function buildTabBody(project) {
   // Per-tab state. chatMode defaults to 'cli' (Max plan, no API credits)
   // but is restored from localStorage when present so the user's choice
   // sticks across reloads.
-  let initialMode = 'cli';
+  let initialMode = 'api';
   try {
     const saved = localStorage.getItem('meridian.chatMode');
     if (saved === 'api' || saved === 'cli') initialMode = saved;
@@ -820,6 +826,24 @@ function buildTabBody(project) {
   }
 
   refreshTab(project.id);
+
+  // Restore persisted chat history so conversations survive page refresh.
+  (async () => {
+    try {
+      const history = await api(`/projects/${project.id}/chat/history`);
+      if (history && history.length) {
+        const chatDiv = document.getElementById(`chat-${project.id}`);
+        const panel = state.panels[project.id];
+        if (chatDiv && panel) {
+          history.forEach(msg => {
+            appendChatMessage(chatDiv, msg.role, msg.content);
+            panel.chatHistory.push({ role: msg.role, content: msg.content });
+          });
+        }
+      }
+    } catch(e) { /* no history yet or endpoint not reachable */ }
+  })();
+
   connectWs(project.id);
 }
 

@@ -92,6 +92,21 @@ CREATE TABLE IF NOT EXISTS task_log (
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+CREATE TABLE IF NOT EXISTS chat_sessions (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES projects(id),
+    cli_session_id TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS chat_messages (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES projects(id),
+    role TEXT NOT NULL CHECK (role IN ('user', 'assistant')),
+    content TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 CREATE INDEX IF NOT EXISTS idx_goal_project
     ON goal_states(project_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_project
@@ -100,6 +115,10 @@ CREATE INDEX IF NOT EXISTS idx_tasks_project
     ON task_log(project_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_tasks_session
     ON task_log(session_id);
+CREATE INDEX IF NOT EXISTS idx_chat_sessions_project
+    ON chat_sessions(project_id);
+CREATE INDEX IF NOT EXISTS idx_chat_messages_project
+    ON chat_messages(project_id, created_at);
 """
 
 
@@ -424,3 +443,107 @@ async def get_tasks(
     ) as cur:
         rows = await cur.fetchall()
     return [_row_to_dict(r) for r in rows]  # type: ignore[misc]
+
+
+# ---------------------------------------------------------------------------
+# Chat persistence (v0.3.0)
+# ---------------------------------------------------------------------------
+
+
+async def get_or_create_chat_session(
+    db: aiosqlite.Connection, project_id: str
+) -> dict[str, Any]:
+    """Return the existing chat session for a project, or create one.
+
+    Each project has at most one active chat session row; subsequent calls
+    return the same row. The ``cli_session_id`` column is populated later
+    by :func:`update_chat_session_cli_id` once the CLI emits its session
+    handle.
+    """
+    async with db.execute(
+        "SELECT * FROM chat_sessions WHERE project_id = ? "
+        "ORDER BY created_at DESC LIMIT 1",
+        (project_id,),
+    ) as cur:
+        row = await cur.fetchone()
+    if row is not None:
+        result = _row_to_dict(row)
+        assert result is not None
+        return result
+    sid = _new_id()
+    await db.execute(
+        "INSERT INTO chat_sessions (id, project_id) VALUES (?, ?)",
+        (sid, project_id),
+    )
+    await db.commit()
+    async with db.execute(
+        "SELECT * FROM chat_sessions WHERE id = ?", (sid,)
+    ) as cur:
+        row = await cur.fetchone()
+    result = _row_to_dict(row)
+    assert result is not None
+    return result
+
+
+async def update_chat_session_cli_id(
+    db: aiosqlite.Connection, project_id: str, cli_session_id: str
+) -> None:
+    """Store the claude CLI session ID so the next message can ``--resume``."""
+    await db.execute(
+        "UPDATE chat_sessions SET cli_session_id = ? WHERE project_id = ?",
+        (cli_session_id, project_id),
+    )
+    await db.commit()
+
+
+async def save_chat_message(
+    db: aiosqlite.Connection, project_id: str, role: str, content: str
+) -> dict[str, Any]:
+    """Persist one chat turn (user or assistant) for a project."""
+    if role not in {"user", "assistant"}:
+        raise ValueError(f"invalid chat message role: {role!r}")
+    mid = _new_id()
+    await db.execute(
+        "INSERT INTO chat_messages (id, project_id, role, content) "
+        "VALUES (?, ?, ?, ?)",
+        (mid, project_id, role, content),
+    )
+    await db.commit()
+    async with db.execute(
+        "SELECT * FROM chat_messages WHERE id = ?", (mid,)
+    ) as cur:
+        row = await cur.fetchone()
+    result = _row_to_dict(row)
+    assert result is not None
+    return result
+
+
+async def get_chat_history(
+    db: aiosqlite.Connection, project_id: str, limit: int = 50
+) -> list[dict[str, Any]]:
+    """Return chat messages for a project in chronological order (oldest first)."""
+    async with db.execute(
+        "SELECT * FROM chat_messages WHERE project_id = ? "
+        "ORDER BY created_at ASC, rowid ASC LIMIT ?",
+        (project_id, limit),
+    ) as cur:
+        rows = await cur.fetchall()
+    return [_row_to_dict(r) for r in rows]  # type: ignore[misc]
+
+
+async def expire_idle_sessions(
+    db: aiosqlite.Connection, max_age_minutes: int = 30
+) -> int:
+    """Mark sessions idle when their last_seen is older than *max_age_minutes*.
+
+    Returns the number of rows updated. Only 'active' sessions are
+    considered — 'idle' and 'closed' sessions are left untouched.
+    """
+    cursor = await db.execute(
+        "UPDATE sessions SET status = 'idle' "
+        "WHERE status = 'active' "
+        "AND last_seen < datetime('now', ? || ' minutes')",
+        (f"-{max_age_minutes}",),
+    )
+    await db.commit()
+    return cursor.rowcount

@@ -11,6 +11,7 @@ This module exposes two surfaces backed by the same async SQLite database:
 
 from __future__ import annotations
 
+import json
 import os
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -25,6 +26,7 @@ from . import db as db_module
 from . import enqueue as enqueue_module
 from . import handoff as handoff_module
 from .models import (
+    ChatHistoryItem,
     ChatRequest,
     EnqueueTask,
     GoalSet,
@@ -172,10 +174,15 @@ async def set_goal(
 async def get_sessions(
     project_id: str, request: Request
 ) -> list[dict[str, Any]]:
-    """List active sessions attached to the project."""
+    """List active sessions attached to the project.
+
+    Expires stale sessions (last_seen > 30 min ago) before returning so
+    the dashboard doesn't accumulate ghost entries indefinitely.
+    """
     project = await db_module.get_project(_db(request), project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="project not found")
+    await db_module.expire_idle_sessions(_db(request))
     return await db_module.get_sessions(
         _db(request), project_id, active_only=True
     )
@@ -278,6 +285,24 @@ async def patch_task(
     return updated
 
 
+@app.get(
+    "/projects/{project_id}/chat/history",
+    response_model=list[ChatHistoryItem],
+)
+async def get_chat_history(
+    project_id: str, request: Request, limit: int = 50
+) -> list[dict[str, Any]]:
+    """Return persisted chat messages for a project (oldest first).
+
+    The dashboard calls this on tab open to restore conversation history
+    across page refreshes. Returns an empty list when no messages exist yet.
+    """
+    project = await db_module.get_project(_db(request), project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="project not found")
+    return await db_module.get_chat_history(_db(request), project_id, limit=limit)
+
+
 @app.get("/dashboard", response_class=HTMLResponse)
 async def dashboard_html() -> str:
     """Serve the single-file dashboard UI."""
@@ -306,26 +331,62 @@ async def dashboard_chat(body: ChatRequest, request: Request):
 
     Each text chunk is forwarded as a ``data: {"delta": "..."}`` line;
     the stream terminates with ``data: [DONE]``.
+
+    Persistence: the user message is saved to ``chat_messages`` before
+    streaming begins; the complete assistant reply is appended after the
+    stream finishes. A ``chat_sessions`` row is created on first use so
+    future CLI ``--resume`` support has a home for the session handle.
     """
     project = await db_module.get_project(_db(request), body.project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="project not found")
+
     messages = [m.model_dump() for m in body.messages]
+    db = _db(request)
+    project_id = body.project_id
+
+    # Persist the user's message and ensure a chat session exists.
+    if messages and messages[-1].get("role") == "user":
+        await db_module.save_chat_message(db, project_id, "user", messages[-1]["content"])
+    await db_module.get_or_create_chat_session(db, project_id)
+
+    # Select the streaming backend.
     if body.mode == "cli":
-        stream = dashboard_module.stream_claude_cli_chat(
+        raw_stream = dashboard_module.stream_claude_cli_chat(
             messages=messages,
             system_prompt=body.system_prompt,
             model=body.model,
             max_tokens=body.max_tokens,
         )
     else:
-        stream = dashboard_module.stream_anthropic_chat(
+        raw_stream = dashboard_module.stream_anthropic_chat(
             messages=messages,
             system_prompt=body.system_prompt,
             model=body.model,
             max_tokens=body.max_tokens,
         )
-    return StreamingResponse(stream, media_type="text/event-stream")
+
+    async def _saving_stream():
+        """Yield every SSE chunk and save the full assistant reply at the end."""
+        acc: list[str] = []
+        async for chunk in raw_stream:
+            yield chunk
+            # Each chunk is one complete SSE event: b"data: {...}\n\n" or b"data: [DONE]\n\n"
+            if chunk != b"data: [DONE]\n\n" and chunk.startswith(b"data: "):
+                try:
+                    payload = json.loads(chunk[6:].decode("utf-8").strip())
+                    if "delta" in payload:
+                        acc.append(payload["delta"])
+                except Exception:  # noqa: BLE001
+                    pass
+        full_text = "".join(acc).strip()
+        if full_text:
+            try:
+                await db_module.save_chat_message(db, project_id, "assistant", full_text)
+            except Exception:  # noqa: BLE001
+                pass
+
+    return StreamingResponse(_saving_stream(), media_type="text/event-stream")
 
 
 @app.websocket("/ws/{project_id}")
