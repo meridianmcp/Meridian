@@ -123,11 +123,21 @@ class ChatMessage(BaseModel):
 
 
 class ChatRequest(BaseModel):
-    """Body for POST /dashboard/chat. The server reads the API key from
-    the environment and proxies the streamed response."""
+    """Body for POST /dashboard/chat.
+
+    ``mode`` selects the backend:
+
+    * ``"cli"`` (default) — shell out to the ``claude`` CLI binary,
+      which uses the OAuth token from ``~/.claude/.credentials.json``
+      and draws from the user's Max-plan allowance. No API credits.
+    * ``"api"`` — call ``api.anthropic.com`` directly via the official
+      Anthropic SDK. Bills metered API credits and needs
+      ``ANTHROPIC_API_KEY`` (or an OAuth token usable as a bearer).
+    """
 
     project_id: str
     messages: list[ChatMessage]
     system_prompt: str | None = None
     model: str = "claude-sonnet-4-20250514"
     max_tokens: int = 4096
+    mode: Literal["cli", "api"] = "cli"

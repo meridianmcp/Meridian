@@ -1,12 +1,19 @@
-"""Dashboard surface for Meridian v0.2.0.
+"""Dashboard surface for Meridian.
 
-Three pieces:
+Four pieces:
 
 * :class:`WebSocketBroadcaster` — bridges the in-process pub/sub in
   :mod:`meridian.db` to live WebSocket clients. One instance lives on
   ``app.state.ws_broadcaster``.
 * :func:`stream_anthropic_chat` — async generator that proxies the
-  Anthropic streaming API and yields Server-Sent-Event lines.
+  Anthropic streaming API directly. Bills API credits, needs an API
+  key. Kept as the "API mode" option.
+* :func:`stream_claude_cli_chat` — async generator that shells out to
+  the ``claude`` CLI binary and streams its stdout back as SSE. Uses
+  the OAuth token already on disk (``~/.claude/.credentials.json`` via
+  the Claude Code login), so this draws from the user's Max-plan
+  allowance instead of metered API credits. This is the default mode
+  for the dashboard chat in v0.3.0.
 * :data:`DASHBOARD_HTML` — the entire single-file dashboard, served by
   ``GET /dashboard``. No build step, no external assets except the IBM
   Plex Mono font loaded from Google Fonts.
@@ -17,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import shlex
 from pathlib import Path
 from typing import Any, AsyncIterator
 
@@ -187,6 +195,140 @@ async def stream_anthropic_chat(
 
 
 # ---------------------------------------------------------------------------
+# Claude CLI chat proxy (uses Max plan, no API key)
+# ---------------------------------------------------------------------------
+
+
+def _default_claude_cli_argv() -> list[str]:
+    """Resolve the argv prefix for the ``claude`` CLI binary.
+
+    Override via ``MERIDIAN_CLAUDE_CLI`` (shell-split). Tests use this to
+    substitute a Python stub so the suite never actually calls Anthropic.
+    The prompt is appended as a single argument after the prefix.
+    """
+    env = os.environ.get("MERIDIAN_CLAUDE_CLI")
+    if env:
+        return shlex.split(env)
+    return ["claude", "-p"]
+
+
+def _format_cli_prompt(
+    messages: list[dict[str, str]], system_prompt: str | None
+) -> str:
+    """Flatten a chat history into a single prompt string for ``claude -p``.
+
+    The CLI takes one prompt, not a structured conversation, so we
+    serialise the system prompt + each prior turn as labelled blocks.
+    The model has been trained on this conventional format and responds
+    to the last ``User:`` turn.
+    """
+    parts: list[str] = []
+    if system_prompt:
+        parts.append(f"System:\n{system_prompt.strip()}")
+    for msg in messages:
+        role = "User" if msg.get("role") == "user" else "Assistant"
+        content = (msg.get("content") or "").strip()
+        if content:
+            parts.append(f"{role}:\n{content}")
+    return "\n\n".join(parts)
+
+
+async def stream_claude_cli_chat(
+    messages: list[dict[str, str]],
+    system_prompt: str | None,
+    model: str,
+    max_tokens: int,
+) -> AsyncIterator[bytes]:
+    """Spawn the ``claude`` CLI and stream its text output back as SSE.
+
+    The signature matches :func:`stream_anthropic_chat` so the
+    endpoint can dispatch between them on a per-request basis. ``model``
+    and ``max_tokens`` are accepted for parity but only ``model`` is
+    forwarded (``--model``) — the CLI manages its own token budget via
+    the user's plan.
+
+    Emits one ``data: {"delta": "..."}`` line per stdout chunk and
+    terminates with ``data: [DONE]``. Errors surface as a single
+    ``data: {"error": "..."}`` line before ``[DONE]``.
+    """
+    argv = _default_claude_cli_argv()
+    prompt = _format_cli_prompt(messages, system_prompt)
+    if not prompt.strip():
+        payload = json.dumps({"error": "empty prompt"})
+        yield f"data: {payload}\n\n".encode("utf-8")
+        yield b"data: [DONE]\n\n"
+        return
+
+    # Build full argv. Only append --model + --output-format when the
+    # user hasn't supplied a custom worker command — otherwise tests
+    # using a Python stub stay simple.
+    cmd = list(argv) + [prompt]
+    using_default = argv == ["claude", "-p"]
+    if using_default:
+        cmd += ["--output-format", "text"]
+        if model:
+            cmd += ["--model", model]
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except FileNotFoundError as exc:
+        payload = json.dumps(
+            {"error": f"claude CLI not found: {exc}. Install Claude Code or set MERIDIAN_CLAUDE_CLI."}
+        )
+        yield f"data: {payload}\n\n".encode("utf-8")
+        yield b"data: [DONE]\n\n"
+        return
+    except Exception as exc:  # noqa: BLE001 — surface spawn errors
+        payload = json.dumps(
+            {"error": f"failed to spawn claude CLI: {type(exc).__name__}: {exc}"}
+        )
+        yield f"data: {payload}\n\n".encode("utf-8")
+        yield b"data: [DONE]\n\n"
+        return
+
+    assert proc.stdout is not None
+    try:
+        # Read stdout in moderate chunks rather than line-by-line so a
+        # word that crosses a chunk boundary still streams promptly.
+        while True:
+            chunk = await proc.stdout.read(256)
+            if not chunk:
+                break
+            text = chunk.decode("utf-8", errors="replace")
+            if not text:
+                continue
+            payload = json.dumps({"delta": text})
+            yield f"data: {payload}\n\n".encode("utf-8")
+    except Exception as exc:  # noqa: BLE001 — surface read errors
+        payload = json.dumps(
+            {"error": f"stdout read failed: {type(exc).__name__}: {exc}"}
+        )
+        yield f"data: {payload}\n\n".encode("utf-8")
+
+    # Drain remaining stderr and check exit code.
+    stderr_bytes = b""
+    if proc.stderr is not None:
+        try:
+            stderr_bytes = await proc.stderr.read()
+        except Exception:  # noqa: BLE001
+            stderr_bytes = b""
+    rc = await proc.wait()
+    if rc != 0:
+        msg = (
+            stderr_bytes.decode("utf-8", errors="replace").strip()
+            or f"exit code {rc}"
+        )
+        payload = json.dumps({"error": f"claude CLI failed: {msg[:500]}"})
+        yield f"data: {payload}\n\n".encode("utf-8")
+
+    yield b"data: [DONE]\n\n"
+
+
+# ---------------------------------------------------------------------------
 # Dashboard HTML
 # ---------------------------------------------------------------------------
 
@@ -305,6 +447,14 @@ html, body {
   background: var(--status-failed); display: inline-block;
 }
 .panel-header .ws-dot.connected { background: var(--status-done); }
+.chat-mode { display: inline-flex; gap: 0; border: 1px solid var(--border); border-radius: 4px; overflow: hidden; }
+.chat-mode .mode-btn {
+  background: transparent; color: var(--muted); border: none; padding: 3px 8px;
+  font-family: 'IBM Plex Mono', monospace; font-size: 10px; font-weight: 600;
+  letter-spacing: 0.06em; cursor: pointer;
+}
+.chat-mode .mode-btn:hover { color: var(--text); }
+.chat-mode .mode-btn.active { background: var(--accent); color: #001020; }
 
 .section {
   padding: 12px 14px; border-bottom: 1px solid var(--border);
@@ -612,6 +762,10 @@ function buildTabBody(project) {
     <section class="panel right">
       <div class="panel-header">
         <span>CHAT · claude-sonnet-4</span>
+        <span class="chat-mode" id="chat-mode-${project.id}">
+          <button class="mode-btn active" data-mode="cli" title="Use the claude CLI on this machine (draws from Max plan, no API credits)">CLI</button>
+          <button class="mode-btn"        data-mode="api" title="Call api.anthropic.com directly (bills API credits)">API</button>
+        </span>
       </div>
       <div class="chat-history" id="chat-${project.id}"></div>
       <div class="chat-input-row">
@@ -622,9 +776,17 @@ function buildTabBody(project) {
   `;
   root.appendChild(body);
 
+  // Per-tab state. chatMode defaults to 'cli' (Max plan, no API credits)
+  // but is restored from localStorage when present so the user's choice
+  // sticks across reloads.
+  let initialMode = 'cli';
+  try {
+    const saved = localStorage.getItem('meridian.chatMode');
+    if (saved === 'api' || saved === 'cli') initialMode = saved;
+  } catch(e) {}
   state.panels[project.id] = {
     ws: null, taskCache: [], goalRaw: null, goalIsJson: false,
-    chatHistory: [],
+    chatHistory: [], chatMode: initialMode,
   };
 
   document.getElementById(`save-goal-${project.id}`).onclick = () => saveGoal(project.id);
@@ -634,6 +796,28 @@ function buildTabBody(project) {
   input.addEventListener('keydown', (e) => {
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendChat(project.id); }
   });
+
+  // Mode toggle. Clicking either button updates the panel state, the
+  // active-button class, and localStorage. The toggle is mirrored
+  // across every open tab on the next render.
+  const modeRoot = document.getElementById(`chat-mode-${project.id}`);
+  if (modeRoot) {
+    modeRoot.querySelectorAll('.mode-btn').forEach(btn => {
+      if (btn.dataset.mode === initialMode) btn.classList.add('active');
+      else btn.classList.remove('active');
+      btn.onclick = () => {
+        const mode = btn.dataset.mode;
+        state.panels[project.id].chatMode = mode;
+        try { localStorage.setItem('meridian.chatMode', mode); } catch(e) {}
+        modeRoot.querySelectorAll('.mode-btn').forEach(b => {
+          b.classList.toggle('active', b.dataset.mode === mode);
+        });
+        toast(mode === 'cli'
+          ? 'CLI mode — uses Max plan, no API credits'
+          : 'API mode — bills metered API credits');
+      };
+    });
+  }
 
   refreshTab(project.id);
   connectWs(project.id);
@@ -849,9 +1033,15 @@ async function sendChat(projectId) {
   const input = document.getElementById(`chat-input-${projectId}`);
   const text = input.value.trim();
   if (!text) return;
-  if (!state.apiKeyConfigured) { toast('No auth configured — set ANTHROPIC_API_KEY or connect Claude Max', true); return; }
-  input.value = '';
   const panel = state.panels[projectId];
+  const mode = (panel && panel.chatMode) || 'cli';
+  // CLI mode uses the claude binary's own auth; only API mode needs
+  // ANTHROPIC_API_KEY / OAuth wired into the Anthropic SDK.
+  if (mode === 'api' && !state.apiKeyConfigured) {
+    toast('No auth configured — set ANTHROPIC_API_KEY or switch to CLI mode', true);
+    return;
+  }
+  input.value = '';
   panel.chatHistory.push({ role: 'user', content: text });
   const history = document.getElementById(`chat-${projectId}`);
   appendChatMessage(history, 'user', text);
@@ -879,6 +1069,7 @@ async function sendChat(projectId) {
         project_id: projectId,
         messages: panel.chatHistory,
         system_prompt: systemPrompt,
+        mode: mode,
       }),
     });
     if (!resp.ok || !resp.body) {

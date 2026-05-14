@@ -510,9 +510,8 @@ def test_patch_task_404(client):
     assert r.status_code == 404
 
 
-def test_dashboard_chat_streams_sse(client, monkeypatch):
-    """The chat endpoint should respond with text/event-stream and emit
-    a stream of ``data:`` lines ending with ``[DONE]``. We stub the
+def test_dashboard_chat_streams_sse_api_mode(client, monkeypatch):
+    """API mode dispatches to the Anthropic SDK proxy. We stub the
     generator so the test doesn't need a real Anthropic key.
     """
     async def fake_stream(messages, system_prompt, model, max_tokens):
@@ -530,6 +529,7 @@ def test_dashboard_chat_streams_sse(client, monkeypatch):
         json={
             "project_id": project["id"],
             "messages": [{"role": "user", "content": "hi"}],
+            "mode": "api",
         },
     )
     assert r.status_code == 200
@@ -538,6 +538,134 @@ def test_dashboard_chat_streams_sse(client, monkeypatch):
     assert "hello " in body
     assert "world" in body
     assert "[DONE]" in body
+
+
+def test_dashboard_chat_defaults_to_cli_mode(client, monkeypatch):
+    """A request with no ``mode`` field must dispatch to the CLI
+    streamer, not the API one. We stub *both* so the test fails loudly
+    if the dispatch picks the wrong backend.
+    """
+    cli_calls: list[str] = []
+    api_calls: list[str] = []
+
+    async def fake_cli(messages, system_prompt, model, max_tokens):
+        cli_calls.append("called")
+        yield b'data: {"delta": "via cli"}\n\n'
+        yield b"data: [DONE]\n\n"
+
+    async def fake_api(messages, system_prompt, model, max_tokens):
+        api_calls.append("called")
+        yield b'data: {"delta": "via api"}\n\n'
+        yield b"data: [DONE]\n\n"
+
+    monkeypatch.setattr(dashboard_module, "stream_claude_cli_chat", fake_cli)
+    monkeypatch.setattr(dashboard_module, "stream_anthropic_chat", fake_api)
+
+    project = client.post("/projects", json={"name": "alpha"}).json()
+    r = client.post(
+        "/dashboard/chat",
+        json={
+            "project_id": project["id"],
+            "messages": [{"role": "user", "content": "hi"}],
+        },
+    )
+    assert r.status_code == 200
+    assert "via cli" in r.text
+    assert "via api" not in r.text
+    assert cli_calls == ["called"]
+    assert api_calls == []
+
+
+def test_stream_claude_cli_chat_emits_stdout_as_sse(monkeypatch):
+    """End-to-end: with a Python stub as the worker command, the CLI
+    streamer should spawn the subprocess and forward stdout chunks as
+    ``data: {"delta": "..."}`` SSE lines, terminating with ``[DONE]``.
+    """
+    monkeypatch.setenv(
+        "MERIDIAN_CLAUDE_CLI",
+        f'"{sys.executable}" -c "import sys; sys.stdout.write(sys.argv[1])"',
+    )
+
+    async def run() -> bytes:
+        chunks: list[bytes] = []
+        async for chunk in dashboard_module.stream_claude_cli_chat(
+            messages=[{"role": "user", "content": "ping"}],
+            system_prompt=None,
+            model="claude-sonnet-4-20250514",
+            max_tokens=4096,
+        ):
+            chunks.append(chunk)
+        return b"".join(chunks)
+
+    body = asyncio.run(run())
+    text = body.decode("utf-8")
+    assert "ping" in text  # echoed by the stub
+    assert "data: [DONE]" in text
+
+
+def test_stream_claude_cli_chat_reports_missing_binary(monkeypatch):
+    """If the CLI is not installed (or MERIDIAN_CLAUDE_CLI points at a
+    bogus binary), the streamer must surface a clean error event
+    rather than crashing the request."""
+    monkeypatch.setenv(
+        "MERIDIAN_CLAUDE_CLI", "definitely-not-a-real-binary-7878"
+    )
+
+    async def run() -> bytes:
+        chunks: list[bytes] = []
+        async for chunk in dashboard_module.stream_claude_cli_chat(
+            messages=[{"role": "user", "content": "ping"}],
+            system_prompt=None,
+            model="claude-sonnet-4-20250514",
+            max_tokens=4096,
+        ):
+            chunks.append(chunk)
+        return b"".join(chunks)
+
+    body = asyncio.run(run()).decode("utf-8")
+    assert '"error"' in body
+    assert "data: [DONE]" in body
+
+
+def test_stream_claude_cli_chat_rejects_empty_prompt(monkeypatch):
+    """Empty messages + no system prompt must short-circuit with a
+    structured error rather than spawning the worker with an empty
+    argument."""
+    monkeypatch.setenv(
+        "MERIDIAN_CLAUDE_CLI",
+        f'"{sys.executable}" -c "import sys; sys.stdout.write(\'should not run\')"',
+    )
+
+    async def run() -> bytes:
+        chunks: list[bytes] = []
+        async for chunk in dashboard_module.stream_claude_cli_chat(
+            messages=[], system_prompt=None, model="x", max_tokens=4096
+        ):
+            chunks.append(chunk)
+        return b"".join(chunks)
+
+    body = asyncio.run(run()).decode("utf-8")
+    assert "empty prompt" in body
+    assert "should not run" not in body
+    assert "data: [DONE]" in body
+
+
+def test_format_cli_prompt_includes_system_and_history():
+    """Round-trip the prompt formatter: System block first, then each
+    turn in order. Hardening against accidental layout changes."""
+    out = dashboard_module._format_cli_prompt(
+        messages=[
+            {"role": "user", "content": "what is meridian?"},
+            {"role": "assistant", "content": "a coordination server"},
+            {"role": "user", "content": "and the goal field?"},
+        ],
+        system_prompt="be concise",
+    )
+    assert out.startswith("System:\nbe concise")
+    assert "User:\nwhat is meridian?" in out
+    assert "Assistant:\na coordination server" in out
+    # The most recent user turn lives at the end so claude -p answers it.
+    assert out.rstrip().endswith("User:\nand the goal field?")
 
 
 def test_dashboard_chat_unknown_project_404(client):

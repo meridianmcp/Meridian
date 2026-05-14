@@ -297,22 +297,34 @@ async def api_key_status() -> dict:
 
 @app.post("/dashboard/chat")
 async def dashboard_chat(body: ChatRequest, request: Request):
-    """Proxy a streaming Anthropic chat call as Server-Sent Events.
+    """Proxy a streaming Claude chat call as Server-Sent Events.
 
-    The server holds the API key and forwards each text delta as a
-    ``data: {"delta": "..."}`` line. The frontend reads the stream and
-    appends deltas into the active assistant bubble.
+    The default backend (``mode="cli"``) spawns the ``claude`` CLI
+    binary so the conversation draws from the user's Max-plan
+    allowance via the OAuth token already on disk. Set ``mode="api"``
+    in the request body to use the metered Anthropic API directly.
+
+    Each text chunk is forwarded as a ``data: {"delta": "..."}`` line;
+    the stream terminates with ``data: [DONE]``.
     """
     project = await db_module.get_project(_db(request), body.project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="project not found")
     messages = [m.model_dump() for m in body.messages]
-    stream = dashboard_module.stream_anthropic_chat(
-        messages=messages,
-        system_prompt=body.system_prompt,
-        model=body.model,
-        max_tokens=body.max_tokens,
-    )
+    if body.mode == "cli":
+        stream = dashboard_module.stream_claude_cli_chat(
+            messages=messages,
+            system_prompt=body.system_prompt,
+            model=body.model,
+            max_tokens=body.max_tokens,
+        )
+    else:
+        stream = dashboard_module.stream_anthropic_chat(
+            messages=messages,
+            system_prompt=body.system_prompt,
+            model=body.model,
+            max_tokens=body.max_tokens,
+        )
     return StreamingResponse(stream, media_type="text/event-stream")
 
 
