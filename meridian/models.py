@@ -148,6 +148,6 @@ class ChatRequest(BaseModel):
     project_id: str
     messages: list[ChatMessage]
     system_prompt: str | None = None
-    model: str = "claude-haiku-4-5-20251001"
+    model: str = "claude-sonnet-4-6"
     max_tokens: int = 4096
     mode: Literal["cli", "api"] = "cli"

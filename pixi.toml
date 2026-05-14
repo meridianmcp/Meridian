@@ -23,7 +23,7 @@ python-dotenv = ">=1.0"
 websockets = ">=12.0"
 
 [tasks]
-start = "python -m meridian"
+start = { cmd = "python -m meridian", env = { MERIDIAN_CLAUDE_CLI = "cmd /c C:/Users/13144/AppData/Roaming/npm/claude.cmd -p" } }
 dev = "uvicorn meridian.server:app --reload --port 7878"
 test = "pytest tests/ -v"
 demo = "python scripts/demo.py"

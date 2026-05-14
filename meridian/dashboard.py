@@ -768,9 +768,17 @@ function buildTabBody(project) {
     <section class="panel right">
       <div class="panel-header">
         <span>CHAT · claude-sonnet-4</span>
-        <span class="chat-mode" id="chat-mode-${project.id}">
-          <button class="mode-btn active" data-mode="cli" title="Use the claude CLI on this machine (draws from Max plan, no API credits)">CLI</button>
-          <button class="mode-btn"        data-mode="api" title="Call api.anthropic.com directly (bills API credits)">API</button>
+        <span style="display:flex;gap:6px;align-items:center">
+          <select id="model-select-${project.id}" style="background:var(--surface-2);border:1px solid var(--border);color:var(--text);padding:2px 6px;border-radius:4px;font-family:'IBM Plex Mono',monospace;font-size:10px;cursor:pointer">
+            <option value="claude-sonnet-4-6">sonnet-4.6</option>
+            <option value="claude-opus-4-5">opus-4.5</option>
+            <option value="claude-haiku-4-5-20251001">haiku-4.5</option>
+          </select>
+          <button id="clear-chat-${project.id}" title="Clear chat history" style="background:transparent;border:1px solid var(--border);color:var(--muted);padding:2px 8px;border-radius:4px;font-family:'IBM Plex Mono',monospace;font-size:10px;cursor:pointer">clear</button>
+          <span class="chat-mode" id="chat-mode-${project.id}">
+            <button class="mode-btn active" data-mode="cli" title="Use the claude CLI on this machine (draws from Max plan, no API credits)">CLI</button>
+            <button class="mode-btn"        data-mode="api" title="Call api.anthropic.com directly (bills API credits)">API</button>
+          </span>
         </span>
       </div>
       <div class="chat-history" id="chat-${project.id}"></div>
@@ -796,6 +804,32 @@ function buildTabBody(project) {
   };
 
   document.getElementById(`save-goal-${project.id}`).onclick = () => saveGoal(project.id);
+
+  // Clear chat button
+  document.getElementById(`clear-chat-${project.id}`).onclick = async () => {
+    if (!confirm('Clear chat history for this project?')) return;
+    try {
+      await fetch(`/projects/${project.id}/chat/history`, { method: 'DELETE' });
+      const history = document.getElementById(`chat-${project.id}`);
+      if (history) history.innerHTML = '';
+      if (state.panels[project.id]) state.panels[project.id].chatHistory = [];
+      toast('chat cleared');
+    } catch(e) { toast('clear failed: ' + e.message, true); }
+  };
+
+  // Model selector
+  const modelSel = document.getElementById(`model-select-${project.id}`);
+  if (modelSel) {
+    const savedModel = localStorage.getItem('meridian.chatModel') || 'claude-sonnet-4-6';
+    modelSel.value = savedModel;
+    if (state.panels[project.id]) state.panels[project.id].chatModel = savedModel;
+    modelSel.onchange = () => {
+      const m = modelSel.value;
+      if (state.panels[project.id]) state.panels[project.id].chatModel = m;
+      localStorage.setItem('meridian.chatModel', m);
+      toast('model: ' + m);
+    };
+  }
   document.getElementById(`goal-${project.id}`).addEventListener('blur', () => saveGoal(project.id));
   document.getElementById(`chat-send-${project.id}`).onclick = () => sendChat(project.id);
   const input = document.getElementById(`chat-input-${project.id}`);
@@ -1094,6 +1128,7 @@ async function sendChat(projectId) {
         messages: panel.chatHistory,
         system_prompt: systemPrompt,
         mode: mode,
+        model: (panel && panel.chatModel) || 'claude-sonnet-4-6',
       }),
     });
     if (!resp.ok || !resp.body) {
