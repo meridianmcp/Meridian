@@ -351,6 +351,12 @@ async def dashboard_chat(body: ChatRequest, request: Request):
         raise HTTPException(status_code=404, detail="project not found")
 
     messages = [m.model_dump() for m in body.messages]
+    # Inject model identity into system prompt so the model knows its version
+    model_hint = f"You are {body.model} running in the Meridian dashboard."
+    if body.system_prompt:
+        body = body.model_copy(update={"system_prompt": model_hint + "\n\n" + body.system_prompt})
+    else:
+        body = body.model_copy(update={"system_prompt": model_hint})
     db = _db(request)
     project_id = body.project_id
 
