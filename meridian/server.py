@@ -285,12 +285,14 @@ async def dashboard_html() -> str:
 
 
 @app.get("/config/api-key")
-async def api_key_status() -> dict[str, bool]:
-    """Tell the dashboard whether ``ANTHROPIC_API_KEY`` is set on the server.
+async def api_key_status() -> dict:
+    """Tell the dashboard which auth method is active.
 
-    Returns ``{"configured": bool}`` — never the key itself.
+    Returns ``{"configured": bool, "method": "oauth"|"api_key"|null}``.
+    The token itself is never included in the response.
     """
-    return {"configured": bool(os.environ.get("ANTHROPIC_API_KEY"))}
+    _, method = dashboard_module.get_auth_token()
+    return {"configured": method is not None, "method": method}
 
 
 @app.post("/dashboard/chat")

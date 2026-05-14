@@ -446,19 +446,38 @@ def test_dashboard_html_served(client):
 
 def test_config_api_key_unset(client, monkeypatch):
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.setattr(dashboard_module, "load_oauth_token", lambda: None)
     r = client.get("/config/api-key")
     assert r.status_code == 200
     body = r.json()
-    assert body == {"configured": False}
+    assert body["configured"] is False
+    assert body["method"] is None
 
 
 def test_config_api_key_set(client, monkeypatch):
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test-1234")
+    monkeypatch.setattr(dashboard_module, "load_oauth_token", lambda: None)
     r = client.get("/config/api-key")
     assert r.status_code == 200
-    assert r.json() == {"configured": True}
+    body = r.json()
+    assert body["configured"] is True
+    assert body["method"] == "api_key"
     # Key itself never echoed.
     assert "sk-test-1234" not in r.text
+
+
+def test_config_api_key_oauth_method(client, monkeypatch):
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.setattr(
+        dashboard_module, "load_oauth_token", lambda: "sk-ant-oat01-fake"
+    )
+    r = client.get("/config/api-key")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["configured"] is True
+    assert body["method"] == "oauth"
+    # Token itself never echoed.
+    assert "sk-ant-oat01-fake" not in r.text
 
 
 def test_patch_task_flips_status(client):
@@ -554,6 +573,51 @@ def test_websocket_receives_task_event(client):
     assert event["type"] == "task_created"
     assert event["task"]["status"] == "pending-hitl"
     assert event["task"]["description"] == "[ASK]: pick one"
+
+
+def test_get_auth_token_uses_oauth_first(monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test-env")
+    monkeypatch.setattr(
+        dashboard_module, "load_oauth_token", lambda: "sk-ant-oat01-fake"
+    )
+    token, method = dashboard_module.get_auth_token()
+    assert method == "oauth"
+    assert token == "sk-ant-oat01-fake"
+
+
+def test_get_auth_token_falls_back_to_api_key(monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test-env")
+    monkeypatch.setattr(dashboard_module, "load_oauth_token", lambda: None)
+    token, method = dashboard_module.get_auth_token()
+    assert method == "api_key"
+    assert token == "sk-test-env"
+
+
+def test_get_auth_token_returns_none_when_neither_set(monkeypatch):
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.setattr(dashboard_module, "load_oauth_token", lambda: None)
+    token, method = dashboard_module.get_auth_token()
+    assert token is None
+    assert method is None
+
+
+def test_load_oauth_token_reads_credentials_file(tmp_path, monkeypatch):
+    """load_oauth_token reads the token from a real credentials file."""
+    import json as _json
+
+    claude_dir = tmp_path / ".claude"
+    claude_dir.mkdir()
+    creds = {"claudeAiOauth": {"accessToken": "sk-ant-oat01-testtoken"}}
+    (claude_dir / ".credentials.json").write_text(
+        _json.dumps(creds), encoding="utf-8"
+    )
+
+    monkeypatch.setattr(
+        "pathlib.Path.home",
+        classmethod(lambda cls: tmp_path),
+    )
+    token = dashboard_module.load_oauth_token()
+    assert token == "sk-ant-oat01-testtoken"
 
 
 def test_migration_rebuilds_old_check_constraint(tmp_path):

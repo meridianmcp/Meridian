@@ -17,11 +17,54 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+from pathlib import Path
 from typing import Any, AsyncIterator
 
 from fastapi import WebSocket
 
 from . import db as db_module
+
+
+# ---------------------------------------------------------------------------
+# OAuth / API-key auth helpers
+# ---------------------------------------------------------------------------
+
+
+def load_oauth_token() -> str | None:
+    """Read the Claude Max OAuth access token from ~/.claude/.credentials.json.
+
+    Returns the access token string, or None if the file is absent, unreadable,
+    or does not contain a claudeAiOauth.accessToken entry. Never raises.
+    """
+    creds_path = Path.home() / ".claude" / ".credentials.json"
+    try:
+        data = json.loads(creds_path.read_text(encoding="utf-8"))
+        oauth = data.get("claudeAiOauth")
+        if isinstance(oauth, dict):
+            token = oauth.get("accessToken")
+            if token and isinstance(token, str):
+                return token
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
+def get_auth_token() -> tuple[str | None, str | None]:
+    """Return ``(token, method)`` for authenticating to the Anthropic API.
+
+    Tries OAuth first (from ~/.claude/.credentials.json), then falls back to
+    the ``ANTHROPIC_API_KEY`` environment variable. Returns ``(None, None)``
+    when neither is available.
+
+    ``method`` is one of ``"oauth"``, ``"api_key"``, or ``None``.
+    """
+    token = load_oauth_token()
+    if token:
+        return token, "oauth"
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if api_key:
+        return api_key, "api_key"
+    return None, None
 
 
 # ---------------------------------------------------------------------------
@@ -89,15 +132,16 @@ async def stream_anthropic_chat(
 ) -> AsyncIterator[bytes]:
     """Yield Server-Sent-Event lines for an Anthropic streaming response.
 
-    Reads ``ANTHROPIC_API_KEY`` from the environment at call time so the
-    key never reaches the browser. Each text delta is emitted as a
-    ``data: {...}`` line; a terminating ``data: [DONE]`` line is sent on
-    success or a single ``data: {"error": "..."}`` line on failure.
+    Tries OAuth from ~/.claude/.credentials.json first, then falls back to
+    ``ANTHROPIC_API_KEY``. The token never reaches the browser. Each text
+    delta is emitted as a ``data: {...}`` line; a terminating
+    ``data: [DONE]`` line is sent on success or a single
+    ``data: {"error": "..."}`` line on failure.
     """
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
-    if not api_key:
+    token, method = get_auth_token()
+    if not token:
         payload = json.dumps(
-            {"error": "ANTHROPIC_API_KEY not set on server"}
+            {"error": "No auth configured: set ANTHROPIC_API_KEY or connect Claude Max"}
         )
         yield f"data: {payload}\n\n".encode("utf-8")
         yield b"data: [DONE]\n\n"
@@ -115,7 +159,10 @@ async def stream_anthropic_chat(
         yield b"data: [DONE]\n\n"
         return
 
-    client = AsyncAnthropic(api_key=api_key)
+    if method == "oauth":
+        client = AsyncAnthropic(auth_token=token)
+    else:
+        client = AsyncAnthropic(api_key=token)
 
     kwargs: dict[str, Any] = {
         "model": model,
@@ -386,7 +433,8 @@ input[type=text] {
 <div class="app">
   <aside class="sidebar">
     <div class="sidebar-header">MERIDIAN<small>v0.2.0 dashboard</small></div>
-    <div id="api-warn">ANTHROPIC_API_KEY not set — chat disabled.</div>
+    <div id="api-warn">No auth configured — chat disabled. Set ANTHROPIC_API_KEY or connect Claude Max.</div>
+    <div id="auth-method" style="margin:6px 10px 0;padding:5px 10px;background:rgba(0,212,170,0.08);border:1px solid rgba(0,212,170,0.25);border-radius:4px;color:var(--accent-green);font-size:10px;display:none"></div>
     <div class="projects-label">Projects</div>
     <div id="project-list" class="project-list"></div>
     <div class="new-project">
@@ -436,6 +484,16 @@ async function loadConfig() {
     const cfg = await api('/config/api-key');
     state.apiKeyConfigured = !!cfg.configured;
     document.getElementById('api-warn').style.display = cfg.configured ? 'none' : 'block';
+    const methodEl = document.getElementById('auth-method');
+    if (cfg.method === 'oauth') {
+      methodEl.textContent = 'Auth: Claude Max OAuth';
+      methodEl.style.display = 'block';
+    } else if (cfg.method === 'api_key') {
+      methodEl.textContent = 'Auth: API key';
+      methodEl.style.display = 'block';
+    } else {
+      methodEl.style.display = 'none';
+    }
   } catch (e) { /* ignore */ }
 }
 
@@ -791,7 +849,7 @@ async function sendChat(projectId) {
   const input = document.getElementById(`chat-input-${projectId}`);
   const text = input.value.trim();
   if (!text) return;
-  if (!state.apiKeyConfigured) { toast('ANTHROPIC_API_KEY not set', true); return; }
+  if (!state.apiKeyConfigured) { toast('No auth configured — set ANTHROPIC_API_KEY or connect Claude Max', true); return; }
   input.value = '';
   const panel = state.panels[projectId];
   panel.chatHistory.push({ role: 'user', content: text });
