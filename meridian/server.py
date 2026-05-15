@@ -288,10 +288,10 @@ async def patch_task(
 @app.delete("/projects/{project_id}/chat/history", status_code=204)
 async def clear_chat_history(project_id: str, request: Request) -> None:
     """Delete all chat messages and session for a project."""
-    async with db.get_db() as database:
-        await database.execute("DELETE FROM chat_messages WHERE project_id = ?", (project_id,))
-        await database.execute("DELETE FROM chat_sessions WHERE project_id = ?", (project_id,))
-        await database.commit()
+    database = _db(request)
+    await database.execute("DELETE FROM chat_messages WHERE project_id = ?", (project_id,))
+    await database.execute("DELETE FROM chat_sessions WHERE project_id = ?", (project_id,))
+    await database.commit()
 
 
 @app.get(
