@@ -576,12 +576,17 @@ html, body {
   font-family: 'IBM Plex Mono', monospace; font-weight: 600;
 }
 .goal-area {
-  width: 100%; min-height: 90px; max-height: 280px;
+  width: 100%; min-height: 70px; max-height: 180px;
   background: var(--surface-2); border: 1px solid var(--border);
   border-radius: 4px; padding: 8px; color: var(--text);
   font-family: 'IBM Plex Mono', monospace; font-size: 12px;
   resize: vertical;
 }
+.goal-area.readonly { background: var(--surface-1); color: var(--muted); cursor: default; }
+.goal-area.sprint { min-height: 50px; max-height: 100px; }
+.goal-label { font-size: 10px; font-family: 'IBM Plex Mono', monospace; font-weight: 600;
+  letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); margin-bottom: 3px; }
+.goal-section { display: flex; flex-direction: column; flex-shrink: 0; }
 .goal-actions { display: flex; gap: 6px; margin-top: 6px; align-items: center; }
 .goal-version { color: var(--muted); font-size: 11px; font-family: 'IBM Plex Mono', monospace; }
 
@@ -920,16 +925,31 @@ function buildTabBody(project) {
       </div>
       <div class="drawer-panel" id="drawer-goal-${project.id}">
         <div class="drawer-header">GOAL · ${escapeHtml(project.name)}</div>
-        <div style="flex:1;display:flex;flex-direction:column;padding:12px 14px;gap:8px;overflow:hidden">
+        <div style="flex:1;display:flex;flex-direction:column;padding:12px 14px;gap:10px;overflow-y:auto">
           <div style="display:flex;align-items:center;justify-content:space-between;flex-shrink:0">
             <span class="goal-version" id="goal-version-${project.id}"></span>
             <span style="display:flex;gap:6px;align-items:center">
               <button class="secondary" id="goal-mode-${project.id}" title="Toggle between manual and auto goal mode">mode: manual</button>
-              <button class="primary" id="save-goal-${project.id}">save</button>
             </span>
           </div>
-          <textarea class="goal-area mono" id="goal-${project.id}" placeholder="(no goal set)" style="flex:1;max-height:none;resize:none"></textarea>
-          <span class="goal-version" id="goal-state-${project.id}"></span>
+          <div class="goal-section">
+            <div class="goal-label">🔭 North Star <span id="goal-ns-lock-${project.id}" style="opacity:0.5"></span></div>
+            <textarea class="goal-area mono" id="goal-north-star-${project.id}" placeholder="(north star not set)"></textarea>
+            <div class="goal-actions"><button class="primary" id="save-north-star-${project.id}">save north star</button></div>
+          </div>
+          <div class="goal-section">
+            <div class="goal-label">◎ Version Goal</div>
+            <textarea class="goal-area mono" id="goal-${project.id}" placeholder="(no version goal set)" style="flex:1;max-height:none;resize:vertical"></textarea>
+            <div class="goal-actions">
+              <button class="primary" id="save-goal-${project.id}">save version goal</button>
+              <span class="goal-version" id="goal-state-${project.id}"></span>
+            </div>
+          </div>
+          <div class="goal-section">
+            <div class="goal-label">⚡ Sprint</div>
+            <textarea class="goal-area sprint mono" id="goal-sprint-${project.id}" placeholder="(sprint not set)"></textarea>
+            <div class="goal-actions"><button class="secondary" id="save-sprint-${project.id}">save sprint</button></div>
+          </div>
         </div>
       </div>
       <div class="drawer-panel" id="drawer-files-${project.id}">
@@ -1017,6 +1037,8 @@ function buildTabBody(project) {
   }
 
   document.getElementById(`save-goal-${project.id}`).onclick = () => saveGoal(project.id);
+  document.getElementById(`save-north-star-${project.id}`).onclick = () => saveNorthStar(project.id);
+  document.getElementById(`save-sprint-${project.id}`).onclick = () => saveSprint(project.id);
 
   // v0.4.2 — goal-mode toggle. The button label tracks the current
   // mode; clicking it PATCHes the server to flip between manual/auto
@@ -1068,6 +1090,8 @@ function buildTabBody(project) {
     };
   }
   document.getElementById(`goal-${project.id}`).addEventListener('blur', () => saveGoal(project.id));
+  document.getElementById(`goal-north-star-${project.id}`).addEventListener('blur', () => saveNorthStar(project.id));
+  document.getElementById(`goal-sprint-${project.id}`).addEventListener('blur', () => saveSprint(project.id));
   document.getElementById(`chat-send-${project.id}`).onclick = () => sendChat(project.id);
   const input = document.getElementById(`chat-input-${project.id}`);
   input.addEventListener('keydown', (e) => {
@@ -1206,6 +1230,11 @@ async function refreshGoal(projectId) {
     }
     ta.value = text;
     v.textContent = `v${goal.version}`;
+    // v0.5.2 — north star and sprint textareas
+    const nsTA = document.getElementById(`goal-north-star-${projectId}`);
+    const spTA = document.getElementById(`goal-sprint-${projectId}`);
+    if (nsTA) nsTA.value = goal.north_star || '';
+    if (spTA) spTA.value = goal.sprint || '';
   } catch (e) {
     ta.value = '';
     v.textContent = '(unset)';
@@ -1224,7 +1253,43 @@ async function saveGoal(projectId) {
   try {
     await api(`/projects/${projectId}/goal`, { method: 'POST', body: JSON.stringify({ content }) });
     state.panels[projectId]._lastSaved = raw;
-    toast('goal saved');
+    toast('version goal saved');
+    refreshGoal(projectId);
+  } catch (e) {
+    toast('save failed: ' + e.message, true);
+  }
+}
+
+async function saveNorthStar(projectId) {
+  const ta = document.getElementById(`goal-north-star-${projectId}`);
+  if (!ta) return;
+  const val = ta.value.trim();
+  if (!val) return;
+  try {
+    const humanInput = document.getElementById('new-project-human');
+    const humanId = humanInput ? humanInput.value.trim() : '';
+    await api(`/projects/${projectId}/goal/north-star`, {
+      method: 'POST',
+      body: JSON.stringify({ north_star: val, human_id: humanId || 'owner' }),
+    });
+    toast('north star saved');
+    refreshGoal(projectId);
+  } catch (e) {
+    toast('save failed: ' + e.message, true);
+  }
+}
+
+async function saveSprint(projectId) {
+  const ta = document.getElementById(`goal-sprint-${projectId}`);
+  if (!ta) return;
+  const val = ta.value.trim();
+  if (!val) return;
+  try {
+    await api(`/projects/${projectId}/goal/sprint`, {
+      method: 'POST',
+      body: JSON.stringify({ sprint: val }),
+    });
+    toast('sprint saved');
     refreshGoal(projectId);
   } catch (e) {
     toast('save failed: ' + e.message, true);

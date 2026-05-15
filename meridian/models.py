@@ -26,10 +26,39 @@ class GoalSet(BaseModel):
     """Body for POST /projects/{id}/goal. Content may be a JSON object or
     a plain string — both forms are accepted. ``human_id`` is optional
     but when provided is checked against the project's creator; a
-    mismatch returns 403 to prevent silent overwrites between teammates."""
+    mismatch returns 403 to prevent silent overwrites between teammates.
+
+    ``north_star`` and ``sprint`` are optional (v0.5.2). When omitted,
+    previously-set values are preserved.
+    """
 
     content: dict[str, Any] | str
     human_id: str | None = None
+    north_star: str | None = None
+    sprint: str | None = None
+
+
+class SetNorthStarRequest(BaseModel):
+    """Body for POST /projects/{id}/goal/north-star (v0.5.2).
+
+    Requires the project owner's human_id — non-owners receive 403.
+    """
+
+    north_star: str = Field(..., min_length=1)
+    human_id: str = Field(..., min_length=1, description="Must match project owner.")
+
+
+class SetSprintRequest(BaseModel):
+    """Body for POST /projects/{id}/goal/sprint (v0.5.2).
+
+    Any team member can update the sprint — no ownership check.
+    """
+
+    sprint: str = Field(..., min_length=1)
+    session_id: str | None = Field(
+        default=None,
+        description="Optional session identifier for logging.",
+    )
 
 
 class SessionRegister(BaseModel):
@@ -86,6 +115,9 @@ class GoalState(BaseModel):
     ``ambient_tasks`` (v0.4.2/3) carries the last few task descriptions
     so cold sessions read recent activity inline with the directive
     they get from a single ``get_goal`` call — no extra round trip.
+
+    ``north_star`` and ``sprint`` (v0.5.2) are the structured goal
+    hierarchy fields. Both are None when not yet set.
     """
 
     id: str
@@ -95,6 +127,8 @@ class GoalState(BaseModel):
     created_at: str
     updated_at: str
     ambient_tasks: list[dict[str, Any]] | None = None
+    north_star: str | None = None
+    sprint: str | None = None
 
 
 class GoalModeSet(BaseModel):

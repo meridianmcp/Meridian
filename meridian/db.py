@@ -71,6 +71,8 @@ CREATE TABLE IF NOT EXISTS goal_states (
     project_id TEXT NOT NULL REFERENCES projects(id),
     content TEXT NOT NULL,
     version INTEGER NOT NULL DEFAULT 1,
+    goal_north_star TEXT,
+    goal_sprint TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
@@ -245,6 +247,37 @@ async def _migrate_goal_mode(db: aiosqlite.Connection) -> None:
     )
 
 
+async def _migrate_goal_hierarchy(db: aiosqlite.Connection) -> None:
+    """v0.5.2 — add ``goal_north_star`` and ``goal_sprint`` columns.
+
+    Seeding: for each project's latest goal row that has no north_star
+    set yet, copy the current content into north_star so existing goals
+    are promoted to the structured hierarchy automatically.
+    """
+    await _migrate_add_column_if_missing(
+        db, "goal_states", "goal_north_star", "TEXT"
+    )
+    await _migrate_add_column_if_missing(
+        db, "goal_states", "goal_sprint", "TEXT"
+    )
+    # Seed: promote content → north_star for the latest version per project
+    # where north_star is still NULL (i.e., legacy rows from before v0.5.2).
+    await db.execute(
+        """
+        UPDATE goal_states
+        SET goal_north_star = content
+        WHERE goal_north_star IS NULL
+          AND id IN (
+              SELECT id FROM goal_states g2
+              WHERE g2.project_id = goal_states.project_id
+              ORDER BY version DESC
+              LIMIT 1
+          )
+        """
+    )
+    await db.commit()
+
+
 async def init_db(db_path: str) -> aiosqlite.Connection:
     """Open the SQLite database, apply schema, and return the connection.
 
@@ -262,6 +295,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_human_identity(db)
     await _migrate_task_claims(db)
     await _migrate_goal_mode(db)
+    await _migrate_goal_hierarchy(db)
     return db
 
 
@@ -321,7 +355,12 @@ async def list_projects(db: aiosqlite.Connection) -> list[dict[str, Any]]:
 async def get_goal(
     db: aiosqlite.Connection, project_id: str
 ) -> dict[str, Any] | None:
-    """Return the latest goal state for a project, or None if unset."""
+    """Return the latest goal state for a project, or None if unset.
+
+    Since v0.5.2 the returned dict also includes ``north_star`` and
+    ``sprint`` pulled from the ``goal_north_star`` / ``goal_sprint``
+    columns. Both are None when not yet set.
+    """
     async with db.execute(
         "SELECT * FROM goal_states WHERE project_id = ? "
         "ORDER BY version DESC LIMIT 1",
@@ -332,34 +371,79 @@ async def get_goal(
     if goal is None:
         return None
     goal["content"] = _decode_content(goal["content"])
+    goal["north_star"] = goal.pop("goal_north_star", None)
+    goal["sprint"] = goal.pop("goal_sprint", None)
     return goal
 
 
 async def set_goal(
-    db: aiosqlite.Connection, project_id: str, content: Any
+    db: aiosqlite.Connection,
+    project_id: str,
+    content: Any,
+    north_star: str | None = None,
+    sprint: str | None = None,
 ) -> dict[str, Any]:
-    """Upsert the goal state for a project, incrementing version each call."""
+    """Upsert the goal state for a project, incrementing version each call.
+
+    ``north_star`` and ``sprint`` are optional. When omitted, the values
+    from the previous goal row are carried forward (backward compat). Pass
+    an explicit value to change them. Since v0.5.2.
+    """
     existing = await get_goal(db, project_id)
     encoded = _encode_content(content)
-    if existing is None:
-        gid = _new_id()
-        await db.execute(
-            "INSERT INTO goal_states (id, project_id, content, version) "
-            "VALUES (?, ?, ?, 1)",
-            (gid, project_id, encoded),
-        )
-    else:
-        new_version = int(existing["version"]) + 1
-        gid = _new_id()
-        await db.execute(
-            "INSERT INTO goal_states (id, project_id, content, version) "
-            "VALUES (?, ?, ?, ?)",
-            (gid, project_id, encoded, new_version),
-        )
+    # Carry forward north_star / sprint from the previous row when not given.
+    final_north_star = north_star if north_star is not None else (
+        existing.get("north_star") if existing else None
+    )
+    final_sprint = sprint if sprint is not None else (
+        existing.get("sprint") if existing else None
+    )
+    new_version = 1 if existing is None else int(existing["version"]) + 1
+    gid = _new_id()
+    await db.execute(
+        "INSERT INTO goal_states "
+        "(id, project_id, content, version, goal_north_star, goal_sprint) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (gid, project_id, encoded, new_version, final_north_star, final_sprint),
+    )
     await db.commit()
     goal = await get_goal(db, project_id)
     assert goal is not None
     return goal
+
+
+async def set_north_star(
+    db: aiosqlite.Connection, project_id: str, north_star: str
+) -> dict[str, Any]:
+    """Update only the north_star field, preserving current content and sprint.
+
+    Creates a new goal row (increments version). 404-equivalent: raises
+    ValueError if no goal exists yet — set the version goal first.
+    """
+    existing = await get_goal(db, project_id)
+    if existing is None:
+        raise ValueError("no goal set — call set_goal before set_north_star")
+    return await set_goal(
+        db, project_id, existing["content"],
+        north_star=north_star, sprint=existing.get("sprint")
+    )
+
+
+async def set_sprint(
+    db: aiosqlite.Connection, project_id: str, sprint: str
+) -> dict[str, Any]:
+    """Update only the sprint field, preserving current content and north_star.
+
+    Any team member can call this (no ownership check at the db layer).
+    Creates a new goal row (increments version).
+    """
+    existing = await get_goal(db, project_id)
+    if existing is None:
+        raise ValueError("no goal set — call set_goal before set_sprint")
+    return await set_goal(
+        db, project_id, existing["content"],
+        north_star=existing.get("north_star"), sprint=sprint
+    )
 
 
 async def register_session(

@@ -42,6 +42,8 @@ from .models import (
     ProjectCreate,
     Session,
     SessionRegister,
+    SetNorthStarRequest,
+    SetSprintRequest,
     StartSessionRequest,
     Task,
     TaskCreate,
@@ -259,7 +261,59 @@ async def set_goal(
                 ),
             },
         )
-    return await db_module.set_goal(_db(request), project_id, body.content)
+    return await db_module.set_goal(
+        _db(request), project_id, body.content,
+        north_star=body.north_star, sprint=body.sprint,
+    )
+
+
+@app.post("/projects/{project_id}/goal/north-star", response_model=GoalState)
+async def set_north_star(
+    project_id: str, body: SetNorthStarRequest, request: Request
+) -> dict[str, Any]:
+    """v0.5.2 — update only the north star field.
+
+    Owner-only: requires ``human_id`` matching the project creator.
+    Returns the new goal version.
+    """
+    project = await db_module.get_project(_db(request), project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="project not found")
+    owner = await db_module.get_project_owner(_db(request), project_id)
+    if owner is not None and body.human_id != owner:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "error": "goal_locked",
+                "message": "Only the project owner can set the north star.",
+            },
+        )
+    try:
+        return await db_module.set_north_star(
+            _db(request), project_id, body.north_star
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+
+@app.post("/projects/{project_id}/goal/sprint", response_model=GoalState)
+async def set_sprint(
+    project_id: str, body: SetSprintRequest, request: Request
+) -> dict[str, Any]:
+    """v0.5.2 — update only the sprint field.
+
+    Any team member can update the sprint — no ownership check.
+    Returns the new goal version.
+    """
+    project = await db_module.get_project(_db(request), project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="project not found")
+    try:
+        return await db_module.set_sprint(
+            _db(request), project_id, body.sprint
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
 
 
 @app.get("/projects/{project_id}/sessions", response_model=list[Session])
@@ -868,10 +922,11 @@ def build_mcp_server():
                 name="get_goal",
                 description=(
                     "Read the current goal state plus ambient context "
-                    "for a project. Returns the goal + the last 5 task "
-                    "descriptions so a cold session knows the directive "
-                    "AND recent activity from one call. Read this after "
-                    "registering."
+                    "for a project. Returns all three goal levels "
+                    "(north_star, content/version goal, sprint) plus the "
+                    "last 5 task descriptions so a cold session knows the "
+                    "directive AND recent activity from one call. Read "
+                    "this after registering."
                 ),
                 inputSchema={
                     "type": "object",
@@ -882,9 +937,12 @@ def build_mcp_server():
             Tool(
                 name="set_goal",
                 description=(
-                    "Set or update the goal state. All sessions see this "
-                    "immediately. Version increments on each update. "
-                    "Content may be a JSON object or a plain string."
+                    "Set or update the version goal (content). All "
+                    "sessions see this immediately. Version increments on "
+                    "each update. Content may be a JSON object or a plain "
+                    "string. Optionally supply north_star or sprint to "
+                    "update those fields at the same time; omit to "
+                    "preserve existing values."
                 ),
                 inputSchema={
                     "type": "object",
@@ -896,8 +954,44 @@ def build_mcp_server():
                                 {"type": "string"},
                             ]
                         },
+                        "north_star": {"type": "string"},
+                        "sprint": {"type": "string"},
                     },
                     "required": ["project_id", "content"],
+                },
+            ),
+            Tool(
+                name="set_north_star",
+                description=(
+                    "Update only the north star — the long-lived product "
+                    "vision that rarely changes. Owner-only: pass the "
+                    "same human_id used when creating the project. "
+                    "Returns 403 if the human_id doesn't match."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "project_id": {"type": "string"},
+                        "north_star": {"type": "string"},
+                        "human_id": {"type": "string"},
+                    },
+                    "required": ["project_id", "north_star", "human_id"],
+                },
+            ),
+            Tool(
+                name="set_sprint",
+                description=(
+                    "Update only the sprint — the short-term focus that "
+                    "changes each session or week. Any team member can "
+                    "call this; no ownership check."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "project_id": {"type": "string"},
+                        "sprint": {"type": "string"},
+                    },
+                    "required": ["project_id", "sprint"],
                 },
             ),
             Tool(
@@ -1128,8 +1222,35 @@ def build_mcp_server():
                     result = goal
             elif name == "set_goal":
                 result = await db_module.set_goal(
-                    db, arguments["project_id"], arguments["content"]
+                    db,
+                    arguments["project_id"],
+                    arguments["content"],
+                    north_star=arguments.get("north_star"),
+                    sprint=arguments.get("sprint"),
                 )
+            elif name == "set_north_star":
+                owner = await db_module.get_project_owner(
+                    db, arguments["project_id"]
+                )
+                if owner is not None and arguments["human_id"] != owner:
+                    result = {
+                        "error": "goal_locked",
+                        "message": "Only the project owner can set the north star.",
+                    }
+                else:
+                    try:
+                        result = await db_module.set_north_star(
+                            db, arguments["project_id"], arguments["north_star"]
+                        )
+                    except ValueError as exc:
+                        result = {"error": str(exc)}
+            elif name == "set_sprint":
+                try:
+                    result = await db_module.set_sprint(
+                        db, arguments["project_id"], arguments["sprint"]
+                    )
+                except ValueError as exc:
+                    result = {"error": str(exc)}
             elif name == "log_task":
                 result = await db_module.log_task(
                     db,

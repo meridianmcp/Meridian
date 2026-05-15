@@ -1785,6 +1785,187 @@ def test_dashboard_html_has_relative_time_helper(client):
 
 
 # ---------------------------------------------------------------------------
+# v0.5.2 — structured goal hierarchy (north_star / version_goal / sprint)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_set_goal_carries_north_star_and_sprint_forward(db):
+    """When set_goal is called without north_star/sprint the old values persist."""
+    p = await db_module.create_project(db, "alpha")
+    await db_module.set_goal(db, p["id"], "v1", north_star="the big vision", sprint="week 1")
+    goal = await db_module.set_goal(db, p["id"], "v2")
+    assert goal["north_star"] == "the big vision"
+    assert goal["sprint"] == "week 1"
+
+
+@pytest.mark.asyncio
+async def test_set_north_star_owner_only(db):
+    """set_north_star updates north_star and increments version."""
+    p = await db_module.create_project(db, "alpha")
+    await db_module.set_goal(db, p["id"], "go")
+    updated = await db_module.set_north_star(db, p["id"], "be the best")
+    assert updated["north_star"] == "be the best"
+    assert updated["version"] == 2
+
+
+@pytest.mark.asyncio
+async def test_set_sprint_any_member(db):
+    """set_sprint updates sprint and increments version."""
+    p = await db_module.create_project(db, "alpha")
+    await db_module.set_goal(db, p["id"], "go")
+    updated = await db_module.set_sprint(db, p["id"], "ship auth this week")
+    assert updated["sprint"] == "ship auth this week"
+    assert updated["version"] == 2
+
+
+@pytest.mark.asyncio
+async def test_get_goal_returns_north_star_and_sprint(db):
+    """get_goal exposes north_star and sprint fields since v0.5.2."""
+    p = await db_module.create_project(db, "alpha")
+    await db_module.set_goal(
+        db, p["id"], "version content",
+        north_star="long-term vision", sprint="current sprint"
+    )
+    goal = await db_module.get_goal(db, p["id"])
+    assert goal is not None
+    assert goal["north_star"] == "long-term vision"
+    assert goal["sprint"] == "current sprint"
+    assert goal["content"] == "version content"
+
+
+@pytest.mark.asyncio
+async def test_get_goal_returns_null_fields_when_unset(db):
+    """north_star and sprint are None when not explicitly set."""
+    p = await db_module.create_project(db, "alpha")
+    await db_module.set_goal(db, p["id"], "bare goal")
+    goal = await db_module.get_goal(db, p["id"])
+    assert goal is not None
+    assert goal["north_star"] is None
+    assert goal["sprint"] is None
+
+
+def test_http_set_north_star_owner_succeeds(client):
+    """POST /goal/north-star with matching human_id returns 200."""
+    project = client.post(
+        "/projects", json={"name": "alpha", "human_id": "adam"}
+    ).json()
+    client.post(f"/projects/{project['id']}/goal", json={"content": "go"})
+    r = client.post(
+        f"/projects/{project['id']}/goal/north-star",
+        json={"north_star": "be the best", "human_id": "adam"},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["north_star"] == "be the best"
+
+
+def test_http_set_north_star_non_owner_returns_403(client):
+    """POST /goal/north-star with wrong human_id returns 403."""
+    project = client.post(
+        "/projects", json={"name": "alpha", "human_id": "adam"}
+    ).json()
+    client.post(f"/projects/{project['id']}/goal", json={"content": "go"})
+    r = client.post(
+        f"/projects/{project['id']}/goal/north-star",
+        json={"north_star": "steal the vision", "human_id": "eve"},
+    )
+    assert r.status_code == 403
+
+
+def test_http_set_sprint_any_member(client):
+    """POST /goal/sprint succeeds without ownership check."""
+    project = client.post("/projects", json={"name": "alpha"}).json()
+    client.post(f"/projects/{project['id']}/goal", json={"content": "go"})
+    r = client.post(
+        f"/projects/{project['id']}/goal/sprint",
+        json={"sprint": "ship login flow"},
+    )
+    assert r.status_code == 200
+    assert r.json()["sprint"] == "ship login flow"
+
+
+def test_http_get_goal_includes_all_three_levels(client):
+    """GET /goal returns north_star, content, and sprint."""
+    project = client.post("/projects", json={"name": "alpha"}).json()
+    client.post(
+        f"/projects/{project['id']}/goal",
+        json={"content": "v1", "north_star": "vision", "sprint": "week 1"},
+    )
+    r = client.get(f"/projects/{project['id']}/goal")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["content"] == "v1"
+    assert body["north_star"] == "vision"
+    assert body["sprint"] == "week 1"
+
+
+def test_set_goal_backward_compat_without_hierarchy_fields(client):
+    """Old callers that omit north_star/sprint keep working without error."""
+    project = client.post("/projects", json={"name": "alpha"}).json()
+    r = client.post(
+        f"/projects/{project['id']}/goal", json={"content": "ship it"}
+    )
+    assert r.status_code == 200
+    assert r.json()["content"] == "ship it"
+    assert r.json()["north_star"] is None
+    assert r.json()["sprint"] is None
+
+
+def test_migration_seeds_north_star_from_existing_goal(tmp_path):
+    """On a legacy DB, init_db seeds north_star = content for the latest row."""
+    import sqlite3
+
+    db_path = tmp_path / "legacy052.db"
+    legacy = sqlite3.connect(db_path)
+    legacy.executescript(
+        """
+        CREATE TABLE projects (id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')));
+        CREATE TABLE goal_states (id TEXT PRIMARY KEY, project_id TEXT NOT NULL,
+            content TEXT NOT NULL, version INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now')));
+        CREATE TABLE sessions (id TEXT PRIMARY KEY, project_id TEXT NOT NULL,
+            name TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'active',
+            last_seen TEXT NOT NULL DEFAULT (datetime('now')),
+            created_at TEXT NOT NULL DEFAULT (datetime('now')));
+        CREATE TABLE task_log (id TEXT PRIMARY KEY, session_id TEXT NOT NULL,
+            project_id TEXT NOT NULL, description TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'done',
+            created_at TEXT NOT NULL DEFAULT (datetime('now')));
+        INSERT INTO projects (id, name) VALUES ('p1', 'legacy');
+        INSERT INTO goal_states (id, project_id, content, version)
+            VALUES ('g1', 'p1', 'the original goal', 1);
+        """
+    )
+    legacy.commit()
+    legacy.close()
+
+    async def run():
+        conn = await db_module.init_db(str(db_path))
+        try:
+            goal = await db_module.get_goal(conn, "p1")
+            assert goal is not None
+            assert goal["north_star"] == "the original goal"
+            assert goal["sprint"] is None
+        finally:
+            await conn.close()
+
+    import asyncio
+    asyncio.run(run())
+
+
+def test_dashboard_html_has_three_goal_textareas(client):
+    """v0.5.2 UI: dashboard renders north-star, version goal, and sprint panes."""
+    html = client.get("/dashboard").text
+    assert "goal-north-star-" in html
+    assert "goal-sprint-" in html
+    assert "saveNorthStar" in html
+    assert "saveSprint" in html
+
+
+# ---------------------------------------------------------------------------
 # v0.4.5 — auto-generate handoff on session TTL expiry
 # ---------------------------------------------------------------------------
 
