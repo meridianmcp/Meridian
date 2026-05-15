@@ -1671,3 +1671,33 @@ def test_get_goal_ambient_tasks_carry_status_and_timestamp(client):
     assert item["status"] == "failed"
     assert item["description"] == "blocked task"
     assert item["created_at"]
+
+
+# ---------------------------------------------------------------------------
+# v0.5.0 — markdown file editor allow-list pinned
+# ---------------------------------------------------------------------------
+
+
+def test_files_allow_list_includes_claude_md(client):
+    """v0.5.0 spec: CLAUDE.md joins the editable allow-list alongside
+    AGENTS.md / ROADMAP.md / DEVLOG.md."""
+    project = client.post("/projects", json={"name": "alpha"}).json()
+    r = client.get(f"/projects/{project['id']}/files")
+    assert r.status_code == 200
+    files = r.json()
+    assert {"AGENTS.md", "ROADMAP.md", "DEVLOG.md", "CLAUDE.md"} <= set(files)
+
+
+def test_files_get_for_claude_md_is_allowed(client, tmp_path, monkeypatch):
+    """CLAUDE.md must read through the same code path as the others."""
+    # Point the file root at a temp dir so we don't depend on the repo
+    # actually containing CLAUDE.md on disk during the test run.
+    from meridian import server as srv
+    monkeypatch.setattr(srv, "_REPO_ROOT", tmp_path)
+    (tmp_path / "CLAUDE.md").write_text("# claude\n", encoding="utf-8")
+    project = client.post("/projects", json={"name": "alpha"}).json()
+    r = client.get(f"/projects/{project['id']}/files/CLAUDE.md")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["filename"] == "CLAUDE.md"
+    assert "# claude" in body["content"]
