@@ -1602,3 +1602,72 @@ def test_patch_goal_mode_rejects_invalid_mode(client):
     )
     # Pydantic catches the literal mismatch as 422.
     assert r.status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# v0.4.3 — get_goal ambient_tasks contract (HTTP + MCP)
+# ---------------------------------------------------------------------------
+
+
+def test_get_goal_ambient_tasks_empty_when_no_tasks(client):
+    """When no tasks have been logged yet ``ambient_tasks`` must be an
+    empty list, not absent — sessions can rely on the field shape."""
+    project = client.post("/projects", json={"name": "alpha"}).json()
+    client.post(f"/projects/{project['id']}/goal", json={"content": "go"})
+    r = client.get(f"/projects/{project['id']}/goal")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ambient_tasks"] == []
+
+
+def test_get_goal_ambient_tasks_caps_at_five(client):
+    """``ambient_tasks`` must include at most 5 rows, newest first.
+    Cold sessions get a fixed-size context window."""
+    project = client.post("/projects", json={"name": "alpha"}).json()
+    sess = client.post(
+        "/sessions/register",
+        json={"project_id": project["id"], "name": "w"},
+    ).json()
+    client.post(f"/projects/{project['id']}/goal", json={"content": "go"})
+    for i in range(8):
+        client.post(
+            "/tasks",
+            json={
+                "session_id": sess["id"],
+                "project_id": project["id"],
+                "description": f"task-{i}",
+                "status": "done",
+            },
+        )
+    r = client.get(f"/projects/{project['id']}/goal")
+    body = r.json()
+    assert len(body["ambient_tasks"]) == 5
+    descs = [t["description"] for t in body["ambient_tasks"]]
+    # Newest first — task-7 leads, task-3 trails.
+    assert descs[0] == "task-7"
+    assert descs[-1] == "task-3"
+
+
+def test_get_goal_ambient_tasks_carry_status_and_timestamp(client):
+    """Each ambient task entry exposes the fields a worker needs to
+    decide what's been done vs pending without another round trip."""
+    project = client.post("/projects", json={"name": "alpha"}).json()
+    sess = client.post(
+        "/sessions/register",
+        json={"project_id": project["id"], "name": "w"},
+    ).json()
+    client.post(f"/projects/{project['id']}/goal", json={"content": "go"})
+    client.post(
+        "/tasks",
+        json={
+            "session_id": sess["id"],
+            "project_id": project["id"],
+            "description": "blocked task",
+            "status": "failed",
+        },
+    )
+    r = client.get(f"/projects/{project['id']}/goal")
+    item = r.json()["ambient_tasks"][0]
+    assert item["status"] == "failed"
+    assert item["description"] == "blocked task"
+    assert item["created_at"]
