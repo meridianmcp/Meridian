@@ -202,6 +202,8 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     """
     db = await aiosqlite.connect(db_path)
     db.row_factory = aiosqlite.Row
+    await db.execute("PRAGMA journal_mode = WAL")   # concurrent read+write
+    await db.execute("PRAGMA busy_timeout = 5000")  # retry up to 5 s before LOCKED
     await db.execute("PRAGMA foreign_keys = ON")
     await db.executescript(CREATE_TABLES)
     await db.commit()
