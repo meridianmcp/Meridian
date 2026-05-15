@@ -61,6 +61,8 @@ CREATE TABLE IF NOT EXISTS projects (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL UNIQUE,
     creator_human_id TEXT,
+    goal_mode TEXT NOT NULL DEFAULT 'manual'
+        CHECK (goal_mode IN ('manual', 'auto')),
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -228,6 +230,21 @@ async def _migrate_task_claims(db: aiosqlite.Connection) -> None:
     await _migrate_add_column_if_missing(db, "task_log", "claimed_at", "TEXT")
 
 
+async def _migrate_goal_mode(db: aiosqlite.Connection) -> None:
+    """v0.4.2 — add ``goal_mode`` column to projects.
+
+    SQLite ``ALTER TABLE ADD COLUMN`` cannot include a CHECK constraint,
+    so we add the column with a plain default and rely on the Python
+    layer (``set_goal_mode``) to validate the input value.
+    """
+    await _migrate_add_column_if_missing(
+        db,
+        "projects",
+        "goal_mode",
+        "TEXT NOT NULL DEFAULT 'manual'",
+    )
+
+
 async def init_db(db_path: str) -> aiosqlite.Connection:
     """Open the SQLite database, apply schema, and return the connection.
 
@@ -244,6 +261,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_task_log_hitl(db)
     await _migrate_human_identity(db)
     await _migrate_task_claims(db)
+    await _migrate_goal_mode(db)
     return db
 
 
@@ -370,6 +388,123 @@ async def register_session(
     session = _row_to_dict(row)
     assert session is not None
     return session
+
+
+async def set_goal_mode(
+    db: aiosqlite.Connection, project_id: str, mode: str
+) -> None:
+    """Switch a project between 'manual' and 'auto' goal modes (v0.4.2).
+
+    Auto mode lets a background task append [AUTO SUMMARY] blocks to
+    the goal every ten minutes so cold sessions read recent activity
+    inline with the human directive.
+    """
+    if mode not in {"manual", "auto"}:
+        raise ValueError(f"invalid goal mode: {mode!r}")
+    await db.execute(
+        "UPDATE projects SET goal_mode = ? WHERE id = ?", (mode, project_id)
+    )
+    await db.commit()
+
+
+async def get_goal_mode(
+    db: aiosqlite.Connection, project_id: str
+) -> str:
+    """Return 'manual' or 'auto' for a project (defaults to 'manual')."""
+    async with db.execute(
+        "SELECT goal_mode FROM projects WHERE id = ?", (project_id,)
+    ) as cur:
+        row = await cur.fetchone()
+    if row is None or row[0] is None:
+        return "manual"
+    return row[0]
+
+
+async def list_auto_mode_projects(
+    db: aiosqlite.Connection,
+) -> list[dict[str, Any]]:
+    """Every project currently in auto-summary mode."""
+    async with db.execute(
+        "SELECT * FROM projects WHERE goal_mode = 'auto'"
+    ) as cur:
+        rows = await cur.fetchall()
+    return [_row_to_dict(r) for r in rows]  # type: ignore[misc]
+
+
+def format_auto_summary_block(
+    tasks: list[dict[str, Any]], timestamp: str | None = None
+) -> str:
+    """Render a ``[AUTO SUMMARY - <ts>]`` block from recent tasks.
+
+    Pure function so the periodic worker is trivial to unit-test. The
+    summary is plain text: one line per task with status + description.
+    """
+    if timestamp is None:
+        from datetime import datetime, timezone
+        timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    if not tasks:
+        return f"[AUTO SUMMARY - {timestamp}]\n(no recent activity)"
+    lines = [f"[AUTO SUMMARY - {timestamp}]"]
+    for t in tasks:
+        status = t.get("status", "?")
+        desc = (t.get("description") or "").strip().splitlines()[0][:200]
+        lines.append(f"- [{status.upper()}] {desc}")
+    return "\n".join(lines)
+
+
+# Anchor that separates the human-written goal text from auto-appended
+# blocks. Anything BELOW this marker may be rewritten by the periodic
+# task; anything above is sacred.
+_AUTO_SECTION_MARKER = "\n\n--- AUTO BLOCKS BELOW ---\n"
+
+
+async def run_auto_summary_cycle(
+    db: aiosqlite.Connection, task_limit: int = 10
+) -> int:
+    """Run one pass of the v0.4.2 auto-summary loop.
+
+    For every project in ``auto`` mode: take the last ``task_limit``
+    tasks, render an [AUTO SUMMARY] block, and append it to the goal.
+    Returns the number of projects updated. Exposed as a standalone
+    function so the background task is trivial *and* unit-testable.
+    """
+    updated = 0
+    projects = await list_auto_mode_projects(db)
+    for project in projects:
+        tasks = await get_tasks(db, project["id"], limit=task_limit)
+        block = format_auto_summary_block(tasks)
+        result = await append_auto_summary(db, project["id"], block)
+        if result is not None:
+            updated += 1
+    return updated
+
+
+async def append_auto_summary(
+    db: aiosqlite.Connection,
+    project_id: str,
+    summary_block: str,
+) -> dict[str, Any] | None:
+    """Append a fresh ``[AUTO SUMMARY ...]`` block to the project goal.
+
+    Strategy: preserve the human-written prefix above
+    ``--- AUTO BLOCKS BELOW ---`` exactly, then replace the auto
+    section with just the new block (single, freshest summary — old
+    blocks are discarded to keep the goal compact). Returns the new
+    goal row, or None when there's no goal yet.
+    """
+    existing = await get_goal(db, project_id)
+    if existing is None:
+        return None
+    content = existing["content"]
+    if not isinstance(content, str):
+        # JSON-typed goals are out of scope for auto-append; bail safely.
+        return existing
+    if _AUTO_SECTION_MARKER in content:
+        prefix = content.split(_AUTO_SECTION_MARKER, 1)[0]
+    else:
+        prefix = content
+    new_content = prefix.rstrip() + _AUTO_SECTION_MARKER + summary_block
+    return await set_goal(db, project_id, new_content)
 
 
 async def get_project_owner(

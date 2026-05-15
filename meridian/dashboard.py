@@ -906,7 +906,10 @@ function buildTabBody(project) {
         <div style="flex:1;display:flex;flex-direction:column;padding:12px 14px;gap:8px;overflow:hidden">
           <div style="display:flex;align-items:center;justify-content:space-between;flex-shrink:0">
             <span class="goal-version" id="goal-version-${project.id}"></span>
-            <button class="primary" id="save-goal-${project.id}">save</button>
+            <span style="display:flex;gap:6px;align-items:center">
+              <button class="secondary" id="goal-mode-${project.id}" title="Toggle between manual and auto goal mode">mode: manual</button>
+              <button class="primary" id="save-goal-${project.id}">save</button>
+            </span>
           </div>
           <textarea class="goal-area mono" id="goal-${project.id}" placeholder="(no goal set)" style="flex:1;max-height:none;resize:none"></textarea>
           <span class="goal-version" id="goal-state-${project.id}"></span>
@@ -997,6 +1000,28 @@ function buildTabBody(project) {
   }
 
   document.getElementById(`save-goal-${project.id}`).onclick = () => saveGoal(project.id);
+
+  // v0.4.2 — goal-mode toggle. The button label tracks the current
+  // mode; clicking it PATCHes the server to flip between manual/auto
+  // and toasts the new value.
+  const modeBtn = document.getElementById(`goal-mode-${project.id}`);
+  if (modeBtn) {
+    const renderMode = (m) => { modeBtn.textContent = 'mode: ' + m; };
+    api(`/projects/${project.id}/goal-mode`)
+      .then(r => renderMode(r.goal_mode || 'manual'))
+      .catch(() => {});
+    modeBtn.onclick = async () => {
+      const current = modeBtn.textContent.replace(/^mode:\s*/, '').trim();
+      const next = current === 'auto' ? 'manual' : 'auto';
+      try {
+        await api(`/projects/${project.id}/goal-mode`, {
+          method: 'PATCH', body: JSON.stringify({ mode: next })
+        });
+        renderMode(next);
+        toast('goal mode: ' + next);
+      } catch(e) { toast('mode change failed: ' + e.message, true); }
+    };
+  }
 
   // Clear chat button
   document.getElementById(`clear-chat-${project.id}`).onclick = async () => {

@@ -12,6 +12,7 @@ This module exposes two surfaces backed by the same async SQLite database:
 from __future__ import annotations
 
 import json
+import asyncio
 import os
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -32,6 +33,7 @@ from .models import (
     ClaimTaskResponse,
     EnqueueTask,
     FileContent,
+    GoalModeSet,
     GoalSet,
     GoalState,
     HandoffResult,
@@ -87,9 +89,31 @@ async def lifespan(app: FastAPI):
     app.state.db = db
     app.state.data_dir = str(data_dir)
     app.state.ws_broadcaster = dashboard_module.WebSocketBroadcaster()
+
+    # v0.4.2 — periodic auto-summary task. Interval comes from env so
+    # tests can run it on a sub-second cadence; default is ten minutes.
+    interval_s = float(os.environ.get("MERIDIAN_AUTO_SUMMARY_INTERVAL", 600))
+
+    async def _auto_summary_loop() -> None:
+        while True:
+            try:
+                await asyncio.sleep(interval_s)
+                await db_module.run_auto_summary_cycle(db)
+            except asyncio.CancelledError:
+                break
+            except Exception:  # noqa: BLE001 — never let the loop die
+                continue
+
+    summary_task = asyncio.create_task(_auto_summary_loop())
+    app.state.auto_summary_task = summary_task
     try:
         yield
     finally:
+        summary_task.cancel()
+        try:
+            await summary_task
+        except (asyncio.CancelledError, Exception):  # noqa: BLE001
+            pass
         await db.close()
 
 
@@ -154,14 +178,56 @@ async def get_project(project_id: str, request: Request) -> dict[str, Any]:
 
 @app.get("/projects/{project_id}/goal", response_model=GoalState)
 async def get_goal(project_id: str, request: Request) -> dict[str, Any]:
-    """Read the latest goal state. 404 if the project or goal is missing."""
+    """Read the latest goal state plus ambient task context.
+
+    The response payload (v0.4.2+) includes ``ambient_tasks`` — the
+    five most recent task rows, newest first, as ``{status, description,
+    created_at}`` dicts. Cold sessions can render the directive *and*
+    last activity from a single MCP call.
+
+    404 if the project does not exist or the goal hasn't been set yet.
+    """
     project = await db_module.get_project(_db(request), project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="project not found")
     goal = await db_module.get_goal(_db(request), project_id)
     if goal is None:
         raise HTTPException(status_code=404, detail="goal not set")
+    recent = await db_module.get_tasks(_db(request), project_id, limit=5)
+    goal["ambient_tasks"] = [
+        {
+            "status": t["status"],
+            "description": t["description"],
+            "created_at": t["created_at"],
+        }
+        for t in recent
+    ]
     return goal
+
+
+@app.patch("/projects/{project_id}/goal-mode")
+async def patch_goal_mode(
+    project_id: str, body: GoalModeSet, request: Request
+) -> dict[str, str]:
+    """Switch a project between 'manual' and 'auto' goal modes."""
+    project = await db_module.get_project(_db(request), project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="project not found")
+    try:
+        await db_module.set_goal_mode(_db(request), project_id, body.mode)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    return {"project_id": project_id, "goal_mode": body.mode}
+
+
+@app.get("/projects/{project_id}/goal-mode")
+async def get_goal_mode(project_id: str, request: Request) -> dict[str, str]:
+    """Return the current goal mode for a project."""
+    project = await db_module.get_project(_db(request), project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="project not found")
+    mode = await db_module.get_goal_mode(_db(request), project_id)
+    return {"project_id": project_id, "goal_mode": mode}
 
 
 @app.post("/projects/{project_id}/goal", response_model=GoalState)
@@ -682,9 +748,11 @@ def build_mcp_server():
             Tool(
                 name="get_goal",
                 description=(
-                    "Read the current goal state for a project. This is "
-                    "the shared directive all sessions work toward. Read "
-                    "this after registering."
+                    "Read the current goal state plus ambient context "
+                    "for a project. Returns the goal + the last 5 task "
+                    "descriptions so a cold session knows the directive "
+                    "AND recent activity from one call. Read this after "
+                    "registering."
                 ),
                 inputSchema={
                     "type": "object",
@@ -879,7 +947,24 @@ def build_mcp_server():
                 )
             elif name == "get_goal":
                 goal = await db_module.get_goal(db, arguments["project_id"])
-                result = goal or {"error": "goal not set"}
+                if goal is None:
+                    result = {"error": "goal not set"}
+                else:
+                    # v0.4.2/3 — surface the last five task descriptions
+                    # alongside the goal so cold sessions get ambient
+                    # context inline with the directive.
+                    recent = await db_module.get_tasks(
+                        db, arguments["project_id"], limit=5
+                    )
+                    goal["ambient_tasks"] = [
+                        {
+                            "status": t["status"],
+                            "description": t["description"],
+                            "created_at": t["created_at"],
+                        }
+                        for t in recent
+                    ]
+                    result = goal
             elif name == "set_goal":
                 result = await db_module.set_goal(
                     db, arguments["project_id"], arguments["content"]

@@ -81,7 +81,12 @@ class Project(BaseModel):
 
 class GoalState(BaseModel):
     """A goal-state row. Content is decoded back to its original form
-    (dict if it was stored as JSON, str otherwise)."""
+    (dict if it was stored as JSON, str otherwise).
+
+    ``ambient_tasks`` (v0.4.2/3) carries the last few task descriptions
+    so cold sessions read recent activity inline with the directive
+    they get from a single ``get_goal`` call — no extra round trip.
+    """
 
     id: str
     project_id: str
@@ -89,6 +94,13 @@ class GoalState(BaseModel):
     version: int
     created_at: str
     updated_at: str
+    ambient_tasks: list[dict[str, Any]] | None = None
+
+
+class GoalModeSet(BaseModel):
+    """Body for PATCH /projects/{id}/goal-mode."""
+
+    mode: Literal["manual", "auto"]
 
 
 class Session(BaseModel):

@@ -1455,3 +1455,150 @@ async def test_update_chat_session_cli_id_persists(db):
     await db_module.update_chat_session_cli_id(db, p["id"], "uuid-1")
     fresh = await db_module.get_or_create_chat_session(db, p["id"])
     assert fresh["cli_session_id"] == "uuid-1"
+
+
+# ---------------------------------------------------------------------------
+# v0.4.2 — auto goal mode + ambient context injection
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_goal_mode_defaults_to_manual(db):
+    p = await db_module.create_project(db, "alpha")
+    assert await db_module.get_goal_mode(db, p["id"]) == "manual"
+
+
+@pytest.mark.asyncio
+async def test_set_goal_mode_round_trip(db):
+    p = await db_module.create_project(db, "alpha")
+    await db_module.set_goal_mode(db, p["id"], "auto")
+    assert await db_module.get_goal_mode(db, p["id"]) == "auto"
+    await db_module.set_goal_mode(db, p["id"], "manual")
+    assert await db_module.get_goal_mode(db, p["id"]) == "manual"
+
+
+@pytest.mark.asyncio
+async def test_set_goal_mode_rejects_invalid(db):
+    p = await db_module.create_project(db, "alpha")
+    with pytest.raises(ValueError):
+        await db_module.set_goal_mode(db, p["id"], "bogus")
+
+
+def test_format_auto_summary_block_includes_task_lines():
+    block = db_module.format_auto_summary_block(
+        [
+            {"status": "done", "description": "shipped widget"},
+            {"status": "pending", "description": "fix typo"},
+        ],
+        timestamp="2026-01-01 00:00 UTC",
+    )
+    assert block.startswith("[AUTO SUMMARY - 2026-01-01 00:00 UTC]")
+    assert "[DONE] shipped widget" in block
+    assert "[PENDING] fix typo" in block
+
+
+def test_format_auto_summary_block_handles_empty():
+    block = db_module.format_auto_summary_block([], timestamp="ts")
+    assert "(no recent activity)" in block
+
+
+@pytest.mark.asyncio
+async def test_append_auto_summary_preserves_human_prefix(db):
+    p = await db_module.create_project(db, "alpha")
+    await db_module.set_goal(db, p["id"], "Human-written directive.")
+    s = await db_module.register_session(db, p["id"], "worker")
+    await db_module.log_task(db, s["id"], p["id"], "did thing", "done")
+    await db_module.append_auto_summary(db, p["id"], "[AUTO SUMMARY - t1]\n- [DONE] did thing")
+    goal = await db_module.get_goal(db, p["id"])
+    assert goal["content"].startswith("Human-written directive.")
+    assert "--- AUTO BLOCKS BELOW ---" in goal["content"]
+    assert "AUTO SUMMARY - t1" in goal["content"]
+
+
+@pytest.mark.asyncio
+async def test_append_auto_summary_replaces_previous_auto_block(db):
+    p = await db_module.create_project(db, "alpha")
+    await db_module.set_goal(db, p["id"], "Directive.")
+    s = await db_module.register_session(db, p["id"], "worker")
+    await db_module.append_auto_summary(db, p["id"], "[AUTO SUMMARY - first]")
+    await db_module.append_auto_summary(db, p["id"], "[AUTO SUMMARY - second]")
+    goal = await db_module.get_goal(db, p["id"])
+    assert "first" not in goal["content"]
+    assert "second" in goal["content"]
+    # Human prefix still intact.
+    assert goal["content"].startswith("Directive.")
+
+
+@pytest.mark.asyncio
+async def test_run_auto_summary_cycle_only_touches_auto_projects(db):
+    manual_p = await db_module.create_project(db, "manual-proj")
+    auto_p = await db_module.create_project(db, "auto-proj")
+    await db_module.set_goal(db, manual_p["id"], "manual goal")
+    await db_module.set_goal(db, auto_p["id"], "auto goal")
+    await db_module.set_goal_mode(db, auto_p["id"], "auto")
+    s_m = await db_module.register_session(db, manual_p["id"], "w1")
+    s_a = await db_module.register_session(db, auto_p["id"], "w2")
+    await db_module.log_task(db, s_m["id"], manual_p["id"], "manual task", "done")
+    await db_module.log_task(db, s_a["id"], auto_p["id"], "auto task", "done")
+    updated = await db_module.run_auto_summary_cycle(db)
+    assert updated == 1
+    manual_goal = await db_module.get_goal(db, manual_p["id"])
+    auto_goal = await db_module.get_goal(db, auto_p["id"])
+    assert "AUTO SUMMARY" not in manual_goal["content"]
+    assert "AUTO SUMMARY" in auto_goal["content"]
+    assert "auto task" in auto_goal["content"]
+
+
+def test_get_goal_response_includes_ambient_tasks(client):
+    project = client.post("/projects", json={"name": "alpha"}).json()
+    sess = client.post(
+        "/sessions/register",
+        json={"project_id": project["id"], "name": "w"},
+    ).json()
+    client.post(
+        f"/projects/{project['id']}/goal", json={"content": "ship it"}
+    )
+    for desc in ("t1", "t2", "t3"):
+        client.post(
+            "/tasks",
+            json={
+                "session_id": sess["id"],
+                "project_id": project["id"],
+                "description": desc,
+                "status": "done",
+            },
+        )
+    r = client.get(f"/projects/{project['id']}/goal")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["content"] == "ship it"
+    assert isinstance(body["ambient_tasks"], list)
+    descs = [t["description"] for t in body["ambient_tasks"]]
+    # Newest-first ordering. Only the 5 most recent appear (we created 3).
+    assert descs[0] == "t3"
+    assert {"t1", "t2", "t3"} <= set(descs)
+
+
+def test_patch_goal_mode_round_trip_http(client):
+    project = client.post("/projects", json={"name": "alpha"}).json()
+    # Default is manual.
+    r = client.get(f"/projects/{project['id']}/goal-mode")
+    assert r.status_code == 200
+    assert r.json()["goal_mode"] == "manual"
+    # Flip to auto.
+    r = client.patch(
+        f"/projects/{project['id']}/goal-mode", json={"mode": "auto"}
+    )
+    assert r.status_code == 200
+    assert r.json()["goal_mode"] == "auto"
+    r = client.get(f"/projects/{project['id']}/goal-mode")
+    assert r.json()["goal_mode"] == "auto"
+
+
+def test_patch_goal_mode_rejects_invalid_mode(client):
+    project = client.post("/projects", json={"name": "alpha"}).json()
+    r = client.patch(
+        f"/projects/{project['id']}/goal-mode", json={"mode": "bogus"}
+    )
+    # Pydantic catches the literal mismatch as 422.
+    assert r.status_code == 422
