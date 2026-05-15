@@ -181,6 +181,16 @@ class FileContent(BaseModel):
     content: str
 
 
+class StartSessionRequest(BaseModel):
+    """Body for POST /projects/{id}/start-session (v0.4.4)."""
+
+    session_name: str = Field(..., min_length=1)
+    human_id: str | None = Field(
+        default=None,
+        description="Optional human owner of this session.",
+    )
+
+
 class ChatRequest(BaseModel):
     """Body for POST /dashboard/chat.
 

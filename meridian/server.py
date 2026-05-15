@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import asyncio
 import os
+import re
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -41,6 +42,7 @@ from .models import (
     ProjectCreate,
     Session,
     SessionRegister,
+    StartSessionRequest,
     Task,
     TaskCreate,
     TaskUpdate,
@@ -682,6 +684,84 @@ async def enqueue_task(body: EnqueueTask, request: Request) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# v0.4.4 — start_session composite helper + endpoint
+# ---------------------------------------------------------------------------
+
+
+async def _start_session_composite(
+    db: aiosqlite.Connection,
+    project_id: str,
+    session_name: str,
+    data_dir: str,
+    human_id: str | None = None,
+) -> dict[str, Any]:
+    """Register + goal + tasks + sessions + handoff-check in one shot.
+
+    Replaces the four-call cold-start sequence (register_session, get_goal,
+    get_tasks, check handoff file) with a single call that returns everything
+    a new session needs before touching anything.
+    """
+    session = await db_module.register_session(
+        db, project_id, session_name, human_id=human_id
+    )
+
+    goal = await db_module.get_goal(db, project_id)
+    if goal is not None:
+        recent_5 = await db_module.get_tasks(db, project_id, limit=5)
+        goal["ambient_tasks"] = [
+            {
+                "status": t["status"],
+                "description": t["description"],
+                "created_at": t["created_at"],
+            }
+            for t in recent_5
+        ]
+
+    recent_tasks = await db_module.get_tasks(db, project_id, limit=10)
+
+    await db_module.expire_idle_sessions(db)
+    active_sessions = await db_module.get_sessions(db, project_id, active_only=True)
+
+    project = await db_module.get_project(db, project_id)
+    project_name = project["name"] if project else project_id
+    slug = re.sub(r"[^a-zA-Z0-9_-]+", "-", project_name).strip("-") or "project"
+    handoff_path_str = str(Path(data_dir) / f"{slug}_handoff.md")
+    handoff_exists = Path(handoff_path_str).exists()
+
+    return {
+        "session_id": session["id"],
+        "goal": goal,
+        "recent_tasks": recent_tasks,
+        "active_sessions": active_sessions,
+        "handoff_exists": handoff_exists,
+        "handoff_path": handoff_path_str,
+        "files": list(_EDITABLE_FILES),
+    }
+
+
+@app.post("/projects/{project_id}/start-session")
+async def start_session_endpoint(
+    project_id: str, body: StartSessionRequest, request: Request
+) -> dict[str, Any]:
+    """v0.4.4 — one call to start a coordinated session.
+
+    Registers the caller, fetches goal + ambient tasks, fetches the last 10
+    tasks, lists active sessions, and reports whether a handoff file already
+    exists on disk. Replaces 4 separate MCP calls at session cold-start.
+    """
+    project = await db_module.get_project(_db(request), project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="project not found")
+    return await _start_session_composite(
+        _db(request),
+        project_id,
+        body.session_name,
+        _data_dir(request),
+        human_id=body.human_id,
+    )
+
+
+# ---------------------------------------------------------------------------
 # MCP server
 # ---------------------------------------------------------------------------
 
@@ -947,6 +1027,30 @@ def build_mcp_server():
                     "required": ["project_id", "task_id", "session_id"],
                 },
             ),
+            Tool(
+                name="start_session",
+                description=(
+                    "Single call to start a coordinated session. Registers "
+                    "you, reads goal + ambient context, shows recent work, "
+                    "lists active sessions, and tells you where the handoff "
+                    "file is. Call this INSTEAD of register_session + "
+                    "get_goal + get_tasks separately. Returns: session_id, "
+                    "goal (with ambient_tasks), recent_tasks (last 10), "
+                    "active_sessions, handoff_exists, handoff_path, files."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "project_id": {"type": "string"},
+                        "session_name": {"type": "string"},
+                        "human_id": {
+                            "type": "string",
+                            "description": "Optional human owner identifier.",
+                        },
+                    },
+                    "required": ["project_id", "session_name"],
+                },
+            ),
         ]
 
     @server.call_tool()
@@ -1080,6 +1184,14 @@ def build_mcp_server():
                     db, arguments["session_id"]
                 )
                 result = {"session_id": arguments["session_id"], "ok": ok}
+            elif name == "start_session":
+                result = await _start_session_composite(
+                    db,
+                    arguments["project_id"],
+                    arguments["session_name"],
+                    state["data_dir"],
+                    human_id=arguments.get("human_id"),
+                )
             else:
                 result = {"error": f"unknown tool: {name}"}
         except Exception as exc:  # noqa: BLE001 — surface to MCP client

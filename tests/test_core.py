@@ -1780,3 +1780,106 @@ def test_dashboard_html_has_relative_time_helper(client):
     workers' liveness is obvious at a glance."""
     html = client.get("/dashboard").text
     assert "formatRelativeTime" in html
+
+
+# ---------------------------------------------------------------------------
+# v0.4.4 — start_session composite tool
+# ---------------------------------------------------------------------------
+
+
+def test_start_session_returns_all_fields(client):
+    """start_session response contains every field the protocol promises."""
+    project = client.post("/projects", json={"name": "alpha"}).json()
+    client.post(f"/projects/{project['id']}/goal", json={"content": "ship it"})
+    r = client.post(
+        f"/projects/{project['id']}/start-session",
+        json={"session_name": "test-worker"},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["session_id"]
+    assert isinstance(body["goal"], dict)
+    assert isinstance(body["recent_tasks"], list)
+    assert isinstance(body["active_sessions"], list)
+    assert isinstance(body["handoff_exists"], bool)
+    assert body["handoff_path"]
+    assert isinstance(body["files"], list)
+    assert "AGENTS.md" in body["files"]
+
+
+def test_start_session_goal_has_ambient_tasks(client):
+    """goal.ambient_tasks is populated from the last task log entries."""
+    project = client.post("/projects", json={"name": "alpha"}).json()
+    sess = client.post(
+        "/sessions/register",
+        json={"project_id": project["id"], "name": "prep"},
+    ).json()
+    client.post(f"/projects/{project['id']}/goal", json={"content": "go"})
+    for desc in ("t1", "t2", "t3"):
+        client.post(
+            "/tasks",
+            json={
+                "session_id": sess["id"],
+                "project_id": project["id"],
+                "description": desc,
+                "status": "done",
+            },
+        )
+    r = client.post(
+        f"/projects/{project['id']}/start-session",
+        json={"session_name": "new-worker"},
+    )
+    body = r.json()
+    assert isinstance(body["goal"]["ambient_tasks"], list)
+    descs = [t["description"] for t in body["goal"]["ambient_tasks"]]
+    assert {"t1", "t2", "t3"} <= set(descs)
+
+
+def test_start_session_recent_tasks_capped_at_10(client):
+    """recent_tasks returns at most 10 rows newest-first."""
+    project = client.post("/projects", json={"name": "alpha"}).json()
+    sess = client.post(
+        "/sessions/register",
+        json={"project_id": project["id"], "name": "prep"},
+    ).json()
+    client.post(f"/projects/{project['id']}/goal", json={"content": "go"})
+    for i in range(15):
+        client.post(
+            "/tasks",
+            json={
+                "session_id": sess["id"],
+                "project_id": project["id"],
+                "description": f"task-{i}",
+                "status": "done",
+            },
+        )
+    r = client.post(
+        f"/projects/{project['id']}/start-session",
+        json={"session_name": "new-worker"},
+    )
+    body = r.json()
+    assert len(body["recent_tasks"]) == 10
+    # Newest first — task-14 must lead.
+    assert body["recent_tasks"][0]["description"] == "task-14"
+
+
+def test_start_session_handoff_exists_reflects_disk_reality(client, tmp_path):
+    """handoff_exists flips True once the file lands on disk."""
+    project = client.post("/projects", json={"name": "myproj"}).json()
+    # No handoff file yet.
+    r = client.post(
+        f"/projects/{project['id']}/start-session",
+        json={"session_name": "w1"},
+    )
+    assert r.status_code == 200
+    assert r.json()["handoff_exists"] is False
+
+    # Write the handoff file that the slug logic would produce.
+    (tmp_path / "myproj_handoff.md").write_text("# handoff", encoding="utf-8")
+
+    r2 = client.post(
+        f"/projects/{project['id']}/start-session",
+        json={"session_name": "w2"},
+    )
+    assert r2.status_code == 200
+    assert r2.json()["handoff_exists"] is True
