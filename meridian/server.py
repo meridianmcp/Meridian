@@ -394,6 +394,20 @@ async def close_session(session_id: str, request: Request) -> dict[str, str]:
     return {"status": "closed", "session_id": session_id}
 
 
+@app.post("/sessions/{session_id}/heartbeat")
+async def heartbeat_session(
+    session_id: str, request: Request
+) -> dict[str, str]:
+    """v0.5.1 — touch ``last_seen`` to keep this session out of the
+    idle sweep. Long-running workers call this every few minutes so
+    the 30 minute TTL doesn't expire them while they're still alive.
+    404 when the session id is unknown or already closed."""
+    ok = await db_module.heartbeat_session(_db(request), session_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="session not found")
+    return {"status": "ok", "session_id": session_id}
+
+
 @app.post("/tasks", response_model=Task, status_code=201)
 async def create_task(body: TaskCreate, request: Request) -> dict[str, Any]:
     """Append a task-log entry."""
@@ -898,6 +912,24 @@ def build_mcp_server():
                 },
             ),
             Tool(
+                name="heartbeat",
+                description=(
+                    "Touch this session's last_seen so the idle sweep "
+                    "doesn't expire it. Long-running workers should call "
+                    "this every ~5 minutes between log_task calls. "
+                    "Returns ok=True when the session exists and is "
+                    "still open."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "project_id": {"type": "string"},
+                        "session_id": {"type": "string"},
+                    },
+                    "required": ["project_id", "session_id"],
+                },
+            ),
+            Tool(
                 name="release_task",
                 description=(
                     "Release a task previously claimed by this session. "
@@ -1043,6 +1075,11 @@ def build_mcp_server():
                     "task_id": arguments["task_id"],
                     "success": released,
                 }
+            elif name == "heartbeat":
+                ok = await db_module.heartbeat_session(
+                    db, arguments["session_id"]
+                )
+                result = {"session_id": arguments["session_id"], "ok": ok}
             else:
                 result = {"error": f"unknown tool: {name}"}
         except Exception as exc:  # noqa: BLE001 — surface to MCP client

@@ -1701,3 +1701,82 @@ def test_files_get_for_claude_md_is_allowed(client, tmp_path, monkeypatch):
     body = r.json()
     assert body["filename"] == "CLAUDE.md"
     assert "# claude" in body["content"]
+
+
+# ---------------------------------------------------------------------------
+# v0.5.1 — session heartbeat + health
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_session_updates_last_seen(db):
+    p = await db_module.create_project(db, "alpha")
+    s = await db_module.register_session(db, p["id"], "worker")
+    # Backdate last_seen so the heartbeat actually moves it.
+    await db.execute(
+        "UPDATE sessions SET last_seen = datetime('now', '-1 hour') WHERE id = ?",
+        (s["id"],),
+    )
+    await db.commit()
+    ok = await db_module.heartbeat_session(db, s["id"])
+    assert ok is True
+    async with db.execute(
+        "SELECT last_seen FROM sessions WHERE id = ?", (s["id"],)
+    ) as cur:
+        row = await cur.fetchone()
+    assert row is not None
+    # The freshly-stamped timestamp must be more recent than the
+    # backdated one; a substring comparison on the iso string is
+    # sufficient here because SQLite formats them lexicographically.
+    assert row[0] is not None
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_session_returns_false_for_missing(db):
+    ok = await db_module.heartbeat_session(db, "no-such-session")
+    assert ok is False
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_keeps_session_out_of_idle_sweep(db):
+    p = await db_module.create_project(db, "alpha")
+    fresh = await db_module.register_session(db, p["id"], "fresh")
+    stale = await db_module.register_session(db, p["id"], "stale")
+    # Backdate both. The heartbeat caller stays alive; the other is left.
+    await db.execute(
+        "UPDATE sessions SET last_seen = datetime('now', '-2 hours')"
+    )
+    await db.commit()
+    await db_module.heartbeat_session(db, fresh["id"])
+    expired = await db_module.expire_idle_sessions(db, max_age_minutes=30)
+    assert expired >= 1
+    # Heartbeated session remains 'active'; un-heartbeated flips to 'idle'.
+    sessions = await db_module.get_sessions(db, p["id"], active_only=False)
+    by_id = {s["id"]: s for s in sessions}
+    assert by_id[fresh["id"]]["status"] == "active"
+    assert by_id[stale["id"]]["status"] == "idle"
+
+
+def test_http_heartbeat_endpoint(client):
+    project = client.post("/projects", json={"name": "alpha"}).json()
+    sess = client.post(
+        "/sessions/register",
+        json={"project_id": project["id"], "name": "worker"},
+    ).json()
+    r = client.post(f"/sessions/{sess['id']}/heartbeat")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["status"] == "ok"
+    assert body["session_id"] == sess["id"]
+
+
+def test_http_heartbeat_unknown_session_404(client):
+    r = client.post("/sessions/does-not-exist/heartbeat")
+    assert r.status_code == 404
+
+
+def test_dashboard_html_has_relative_time_helper(client):
+    """v0.5.1 UI: dashboard renders last_seen as relative time so
+    workers' liveness is obvious at a glance."""
+    html = client.get("/dashboard").text
+    assert "formatRelativeTime" in html

@@ -535,6 +535,22 @@ async def update_session_seen(
     await db.commit()
 
 
+async def heartbeat_session(
+    db: aiosqlite.Connection, session_id: str
+) -> bool:
+    """Touch ``last_seen`` so the idle-expiry sweep leaves this session
+    alone. Returns True when the session exists; False otherwise so the
+    HTTP layer can 404 cleanly. Used by long-running workers that don't
+    call ``log_task`` often enough to keep the 30 minute TTL fresh."""
+    cursor = await db.execute(
+        "UPDATE sessions SET last_seen = datetime('now') "
+        "WHERE id = ? AND status != 'closed'",
+        (session_id,),
+    )
+    await db.commit()
+    return cursor.rowcount > 0
+
+
 async def close_session(db: aiosqlite.Connection, session_id: str) -> None:
     """Mark a session as closed."""
     await db.execute(

@@ -806,6 +806,23 @@ function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
 
+// v0.5.1 — sessions render with relative timestamps so the user can
+// see at a glance which workers are actually alive. SQLite stores
+// timestamps in UTC without timezone markers; we treat them as UTC.
+function formatRelativeTime(ts) {
+  if (!ts) return '';
+  const iso = ts.includes('T') ? ts : ts.replace(' ', 'T') + 'Z';
+  const then = new Date(iso);
+  const seconds = Math.max(0, Math.floor((Date.now() - then.getTime()) / 1000));
+  if (seconds < 60) return `${seconds}s ago`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h ago`;
+  const days = Math.floor(hours / 24);
+  return `${days}d ago`;
+}
+
 function openTab(project) {
   const existing = state.tabs.find(t => t.id === project.id);
   if (existing) { activateTab(project.id); return; }
@@ -1220,7 +1237,7 @@ async function refreshSessions(projectId) {
   try {
     const sessions = await api(`/projects/${projectId}/sessions`);
     root.innerHTML = sessions.map(s =>
-      `<div class="session-row"><span class="name">${escapeHtml(s.human_id ? s.human_id + '/' + s.name : s.name)}</span><span class="meta">${escapeHtml(s.status)} · ${escapeHtml(s.last_seen)}</span></div>`
+      `<div class="session-row"><span class="name">${escapeHtml(s.human_id ? s.human_id + '/' + s.name : s.name)}</span><span class="meta">${escapeHtml(s.status)} · ${escapeHtml(formatRelativeTime(s.last_seen))}</span></div>`
     ).join('') || '<div class="session-row meta">(no active sessions)</div>';
   } catch(e) {}
 }
