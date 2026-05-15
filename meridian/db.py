@@ -60,6 +60,7 @@ CREATE_TABLES = """
 CREATE TABLE IF NOT EXISTS projects (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL UNIQUE,
+    creator_human_id TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -76,6 +77,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     id TEXT PRIMARY KEY,
     project_id TEXT NOT NULL REFERENCES projects(id),
     name TEXT NOT NULL,
+    human_id TEXT,
     status TEXT NOT NULL DEFAULT 'active'
         CHECK (status IN ('active','idle','closed')),
     last_seen TEXT NOT NULL DEFAULT (datetime('now')),
@@ -193,12 +195,35 @@ async def _migrate_task_log_hitl(db: aiosqlite.Connection) -> None:
     )
 
 
+async def _column_exists(
+    db: aiosqlite.Connection, table: str, column: str
+) -> bool:
+    """Return True if ``column`` already exists on ``table`` in this DB."""
+    async with db.execute(f"PRAGMA table_info({table})") as cur:
+        rows = await cur.fetchall()
+    return any(row[1] == column for row in rows)
+
+
+async def _migrate_add_column_if_missing(
+    db: aiosqlite.Connection, table: str, column: str, decl: str
+) -> None:
+    """Idempotently ``ALTER TABLE ADD COLUMN`` if it's not already there."""
+    if not await _column_exists(db, table, column):
+        await db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+        await db.commit()
+
+
+async def _migrate_human_identity(db: aiosqlite.Connection) -> None:
+    """v0.3.2 — add nullable human-identity columns to legacy DBs."""
+    await _migrate_add_column_if_missing(db, "projects", "creator_human_id", "TEXT")
+    await _migrate_add_column_if_missing(db, "sessions", "human_id", "TEXT")
+
+
 async def init_db(db_path: str) -> aiosqlite.Connection:
     """Open the SQLite database, apply schema, and return the connection.
 
     The caller owns the connection and is responsible for closing it.
-    Runs idempotent migrations: a v0.1.x database missing the
-    ``pending-hitl`` CHECK value is rebuilt in place.
+    Runs idempotent migrations: legacy DBs are upgraded in place.
     """
     db = await aiosqlite.connect(db_path)
     db.row_factory = aiosqlite.Row
@@ -208,15 +233,25 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await db.executescript(CREATE_TABLES)
     await db.commit()
     await _migrate_task_log_hitl(db)
+    await _migrate_human_identity(db)
     return db
 
 
-async def create_project(db: aiosqlite.Connection, name: str) -> dict[str, Any]:
-    """Insert a project and return it as a dict. Raises if the name exists."""
+async def create_project(
+    db: aiosqlite.Connection,
+    name: str,
+    human_id: str | None = None,
+) -> dict[str, Any]:
+    """Insert a project and return it as a dict. Raises if the name exists.
+
+    ``human_id`` (when provided) is recorded as the project's
+    ``creator_human_id``. The creator's id is the only one allowed to
+    update the goal state once goal-ownership enforcement is active.
+    """
     pid = _new_id()
     await db.execute(
-        "INSERT INTO projects (id, name) VALUES (?, ?)",
-        (pid, name),
+        "INSERT INTO projects (id, name, creator_human_id) VALUES (?, ?, ?)",
+        (pid, name, human_id),
     )
     await db.commit()
     project = await get_project(db, pid)
@@ -300,13 +335,22 @@ async def set_goal(
 
 
 async def register_session(
-    db: aiosqlite.Connection, project_id: str, name: str
+    db: aiosqlite.Connection,
+    project_id: str,
+    name: str,
+    human_id: str | None = None,
 ) -> dict[str, Any]:
-    """Create a session row in 'active' state."""
+    """Create a session row in 'active' state.
+
+    ``human_id`` lets a session attach a human owner identifier so the
+    dashboard can group ``adam/claude-sonnet-xyz`` sessions together and
+    so the goal-ownership rule can match a writer to the project creator.
+    """
     sid = _new_id()
     await db.execute(
-        "INSERT INTO sessions (id, project_id, name) VALUES (?, ?, ?)",
-        (sid, project_id, name),
+        "INSERT INTO sessions (id, project_id, name, human_id) "
+        "VALUES (?, ?, ?, ?)",
+        (sid, project_id, name, human_id),
     )
     await db.commit()
     async with db.execute(
@@ -316,6 +360,23 @@ async def register_session(
     session = _row_to_dict(row)
     assert session is not None
     return session
+
+
+async def get_project_owner(
+    db: aiosqlite.Connection, project_id: str
+) -> str | None:
+    """Return the ``creator_human_id`` for a project, or None if unset.
+
+    Used by the ``POST /projects/{id}/goal`` endpoint to enforce the
+    "only the project owner can set goal" contract introduced in v0.3.2.
+    """
+    async with db.execute(
+        "SELECT creator_human_id FROM projects WHERE id = ?", (project_id,)
+    ) as cur:
+        row = await cur.fetchone()
+    if row is None:
+        return None
+    return row[0]
 
 
 async def update_session_seen(

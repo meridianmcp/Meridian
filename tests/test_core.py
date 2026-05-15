@@ -1053,3 +1053,106 @@ def test_file_endpoints_404_for_unknown_project(client, monkeypatch, tmp_path):
     assert client.put(
         "/projects/no-such/files/AGENTS.md", json={"content": "x"}
     ).status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# v0.3.2 — human identity + goal ownership
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_create_project_records_creator_human_id(db):
+    p = await db_module.create_project(db, "alpha", human_id="adam")
+    assert p["creator_human_id"] == "adam"
+    owner = await db_module.get_project_owner(db, p["id"])
+    assert owner == "adam"
+
+
+@pytest.mark.asyncio
+async def test_create_project_without_human_id_has_null_owner(db):
+    p = await db_module.create_project(db, "alpha")
+    assert p["creator_human_id"] is None
+    owner = await db_module.get_project_owner(db, p["id"])
+    assert owner is None
+
+
+@pytest.mark.asyncio
+async def test_register_session_records_human_id(db):
+    p = await db_module.create_project(db, "alpha")
+    s = await db_module.register_session(db, p["id"], "sess", human_id="adam")
+    assert s["human_id"] == "adam"
+
+
+@pytest.mark.asyncio
+async def test_register_session_without_human_id_is_null(db):
+    p = await db_module.create_project(db, "alpha")
+    s = await db_module.register_session(db, p["id"], "sess")
+    assert s["human_id"] is None
+
+
+def test_post_project_propagates_creator_human_id(client):
+    r = client.post("/projects", json={"name": "alpha", "human_id": "adam"})
+    assert r.status_code == 201
+    project = r.json()
+    assert project["creator_human_id"] == "adam"
+
+
+def test_post_register_session_propagates_human_id(client):
+    project = client.post(
+        "/projects", json={"name": "alpha", "human_id": "adam"}
+    ).json()
+    r = client.post(
+        "/sessions/register",
+        json={"project_id": project["id"], "name": "s1", "human_id": "adam"},
+    )
+    assert r.status_code == 201
+    assert r.json()["human_id"] == "adam"
+
+
+def test_set_goal_403_when_human_id_does_not_match_owner(client):
+    project = client.post(
+        "/projects", json={"name": "alpha", "human_id": "adam"}
+    ).json()
+    r = client.post(
+        f"/projects/{project['id']}/goal",
+        json={"content": "stealth edit", "human_id": "beth"},
+    )
+    assert r.status_code == 403
+    detail = r.json()["detail"]
+    # detail can be dict or string depending on how FastAPI serialises;
+    # we accept either form but require the marker string is present.
+    body = json.dumps(detail) if not isinstance(detail, str) else detail
+    assert "goal_locked" in body
+
+
+def test_set_goal_200_when_owner_matches(client):
+    project = client.post(
+        "/projects", json={"name": "alpha", "human_id": "adam"}
+    ).json()
+    r = client.post(
+        f"/projects/{project['id']}/goal",
+        json={"content": "ship it", "human_id": "adam"},
+    )
+    assert r.status_code == 200
+    assert r.json()["content"] == "ship it"
+
+
+def test_set_goal_200_when_no_human_id_anywhere_backward_compat(client):
+    # No creator_human_id, no body.human_id — legacy callers still work.
+    project = client.post("/projects", json={"name": "alpha"}).json()
+    r = client.post(
+        f"/projects/{project['id']}/goal", json={"content": "ship it"}
+    )
+    assert r.status_code == 200
+
+
+def test_set_goal_200_when_owner_set_but_body_human_id_absent(client):
+    # Sessions that don't claim an identity still get their old write
+    # privilege — the ownership rule only fires when both sides assert.
+    project = client.post(
+        "/projects", json={"name": "alpha", "human_id": "adam"}
+    ).json()
+    r = client.post(
+        f"/projects/{project['id']}/goal", json={"content": "ship it"}
+    )
+    assert r.status_code == 200

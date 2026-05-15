@@ -16,13 +16,20 @@ class ProjectCreate(BaseModel):
     """Body for POST /projects."""
 
     name: str = Field(..., min_length=1, description="Unique project name.")
+    human_id: str | None = Field(
+        default=None,
+        description="Optional creator identifier. Becomes the project's owner.",
+    )
 
 
 class GoalSet(BaseModel):
     """Body for POST /projects/{id}/goal. Content may be a JSON object or
-    a plain string — both forms are accepted."""
+    a plain string — both forms are accepted. ``human_id`` is optional
+    but when provided is checked against the project's creator; a
+    mismatch returns 403 to prevent silent overwrites between teammates."""
 
     content: dict[str, Any] | str
+    human_id: str | None = None
 
 
 class SessionRegister(BaseModel):
@@ -30,6 +37,10 @@ class SessionRegister(BaseModel):
 
     project_id: str
     name: str = Field(..., min_length=1)
+    human_id: str | None = Field(
+        default=None,
+        description="Optional human owner of this session.",
+    )
 
 
 class TaskCreate(BaseModel):
@@ -64,6 +75,7 @@ class Project(BaseModel):
 
     id: str
     name: str
+    creator_human_id: str | None = None
     created_at: str
 
 
@@ -85,6 +97,7 @@ class Session(BaseModel):
     id: str
     project_id: str
     name: str
+    human_id: str | None = None
     status: Literal["active", "idle", "closed"]
     last_seen: str
     created_at: str

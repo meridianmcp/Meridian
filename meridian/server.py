@@ -136,7 +136,9 @@ async def create_project(
         raise HTTPException(
             status_code=409, detail=f"project '{body.name}' already exists"
         )
-    return await db_module.create_project(_db(request), body.name)
+    return await db_module.create_project(
+        _db(request), body.name, human_id=body.human_id
+    )
 
 
 @app.get("/projects/{project_id}", response_model=Project)
@@ -164,10 +166,29 @@ async def get_goal(project_id: str, request: Request) -> dict[str, Any]:
 async def set_goal(
     project_id: str, body: GoalSet, request: Request
 ) -> dict[str, Any]:
-    """Upsert the goal state, incrementing version."""
+    """Upsert the goal state, incrementing version.
+
+    Goal-ownership rule (v0.3.2): if the project has a recorded
+    ``creator_human_id`` *and* the request body supplies a ``human_id``
+    that doesn't match, refuse with 403. Sessions without a human_id
+    (legacy callers, MCP workers that don't claim an identity) keep
+    their old write privilege.
+    """
     project = await db_module.get_project(_db(request), project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="project not found")
+    owner = await db_module.get_project_owner(_db(request), project_id)
+    if owner is not None and body.human_id is not None and body.human_id != owner:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "error": "goal_locked",
+                "message": (
+                    "Only the project owner can set the goal. "
+                    "Use the HITL queue to propose changes."
+                ),
+            },
+        )
     return await db_module.set_goal(_db(request), project_id, body.content)
 
 
@@ -223,7 +244,7 @@ async def register_session(
     if project is None:
         raise HTTPException(status_code=404, detail="project not found")
     return await db_module.register_session(
-        _db(request), body.project_id, body.name
+        _db(request), body.project_id, body.name, human_id=body.human_id
     )
 
 
@@ -563,13 +584,20 @@ def build_mcp_server():
                     "Register this Claude session with a project. Call at "
                     "the START of every session before using any other "
                     "tools. Store the returned session_id — you need it "
-                    "for log_task."
+                    "for log_task. Optionally pass human_id to attach "
+                    "the session to a teammate (e.g. \"adam\") so the "
+                    "dashboard groups sessions per human and the goal "
+                    "ownership rule can recognise the writer."
                 ),
                 inputSchema={
                     "type": "object",
                     "properties": {
                         "project_id": {"type": "string"},
                         "session_name": {"type": "string"},
+                        "human_id": {
+                            "type": "string",
+                            "description": "Optional human owner identifier.",
+                        },
                     },
                     "required": ["project_id", "session_name"],
                 },
@@ -729,7 +757,10 @@ def build_mcp_server():
                     )
             elif name == "register_session":
                 result = await db_module.register_session(
-                    db, arguments["project_id"], arguments["session_name"]
+                    db,
+                    arguments["project_id"],
+                    arguments["session_name"],
+                    human_id=arguments.get("human_id"),
                 )
             elif name == "get_goal":
                 goal = await db_module.get_goal(db, arguments["project_id"])

@@ -1101,7 +1101,7 @@ async function refreshSessions(projectId) {
   try {
     const sessions = await api(`/projects/${projectId}/sessions`);
     root.innerHTML = sessions.map(s =>
-      `<div class="session-row"><span class="name">${escapeHtml(s.name)}</span><span class="meta">${escapeHtml(s.status)} · ${escapeHtml(s.last_seen)}</span></div>`
+      `<div class="session-row"><span class="name">${escapeHtml(s.human_id ? s.human_id + '/' + s.name : s.name)}</span><span class="meta">${escapeHtml(s.status)} · ${escapeHtml(s.last_seen)}</span></div>`
     ).join('') || '<div class="session-row meta">(no active sessions)</div>';
   } catch(e) {}
 }
