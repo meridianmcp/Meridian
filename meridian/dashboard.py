@@ -429,9 +429,56 @@ html, body {
 .tab-bodies { flex: 1; overflow: hidden; position: relative; }
 .tab-body {
   position: absolute; inset: 0;
-  display: none; grid-template-columns: 1fr 1fr;
+  display: none; flex-direction: row; overflow: hidden;
 }
-.tab-body.active { display: grid; }
+.tab-body.active { display: flex; }
+
+.vtab-strip {
+  width: 44px; flex-shrink: 0; background: var(--bg);
+  border-right: 1px solid var(--border);
+  display: flex; flex-direction: column; align-items: center;
+  padding-top: 6px; gap: 2px; z-index: 20; position: relative;
+}
+.vtab-btn {
+  width: 36px; height: 36px; border-radius: 6px;
+  background: transparent; border: none; cursor: pointer;
+  color: var(--muted); font-size: 15px;
+  display: flex; align-items: center; justify-content: center;
+  transition: background 0.15s, color 0.15s;
+}
+.vtab-btn:hover { background: var(--surface-2); color: var(--text); }
+.vtab-btn.active { background: var(--surface-2); color: var(--accent); }
+
+.vtab-drawer {
+  position: absolute; left: 44px; top: 0; bottom: 0; width: 360px;
+  background: var(--bg); border-right: 1px solid var(--border);
+  z-index: 10; transform: translateX(-360px);
+  transition: transform 0.18s ease; display: flex; flex-direction: column;
+  overflow: hidden;
+}
+.vtab-drawer.open { transform: translateX(0); }
+
+.drawer-panel { display: none; flex-direction: column; flex: 1; overflow: hidden; }
+.drawer-panel.active { display: flex; }
+.drawer-header {
+  padding: 10px 14px; border-bottom: 1px solid var(--border);
+  font-family: 'IBM Plex Mono', monospace; font-size: 11px;
+  color: var(--muted); letter-spacing: 0.06em; text-transform: uppercase;
+  display: flex; justify-content: space-between; align-items: center;
+  flex-shrink: 0; gap: 6px;
+}
+.chat-full {
+  flex: 1; display: flex; flex-direction: column;
+  overflow: hidden; min-width: 0; background: var(--surface);
+}
+.file-list { display: flex; flex-direction: column; gap: 4px; padding: 12px 14px; }
+.file-item {
+  padding: 7px 10px; background: var(--surface-2);
+  border: 1px solid var(--border); border-radius: 4px;
+  font-family: 'IBM Plex Mono', monospace; font-size: 11px;
+  cursor: pointer; color: var(--text);
+}
+.file-item:hover { border-color: var(--accent); color: var(--accent); }
 
 .empty {
   display: flex; align-items: center; justify-content: center;
@@ -588,7 +635,7 @@ input[type=text] {
 <body>
 <div class="app">
   <aside class="sidebar">
-    <div class="sidebar-header">MERIDIAN<small>v0.3.0 dashboard</small></div>
+    <div class="sidebar-header">MERIDIAN<small>v0.3.1 dashboard</small></div>
     <div id="api-warn">No auth configured — chat disabled. Set ANTHROPIC_API_KEY or connect Claude Max.</div>
     <div id="auth-method" style="margin:6px 10px 0;padding:5px 10px;background:rgba(0,212,170,0.08);border:1px solid rgba(0,212,170,0.25);border-radius:4px;color:var(--accent-green);font-size:10px;display:none"></div>
     <div class="projects-label">Projects</div>
@@ -741,31 +788,56 @@ function buildTabBody(project) {
   body.className = 'tab-body';
   body.id = `tab-body-${project.id}`;
   body.innerHTML = `
-    <section class="panel left">
-      <div class="panel-header">
-        <span>STATUS · ${escapeHtml(project.name)}</span>
-        <span><span class="ws-dot" id="ws-${project.id}"></span></span>
+    <div class="vtab-strip" id="vtab-strip-${project.id}">
+      <button class="vtab-btn active" data-vtab="status" title="Status &amp; Sessions">≡</button>
+      <button class="vtab-btn" data-vtab="goal" title="Goal State">◎</button>
+      <button class="vtab-btn" data-vtab="files" title="Files">⊞</button>
+      <button class="vtab-btn" data-vtab="devlog" title="Dev Log">≋</button>
+    </div>
+    <div class="vtab-drawer open" id="drawer-${project.id}">
+      <div class="drawer-panel active" id="drawer-status-${project.id}">
+        <div class="drawer-header">
+          <span>STATUS · ${escapeHtml(project.name)}</span>
+          <span class="ws-dot" id="ws-${project.id}"></span>
+        </div>
+        <div class="section">
+          <h3>Active Sessions</h3>
+          <div class="sessions-list" id="sessions-${project.id}"></div>
+        </div>
+        <div class="hitl-banner" id="hitl-banner-${project.id}" style="display:none">HITL queue</div>
+        <div id="hitl-queue-${project.id}"></div>
       </div>
-      <div class="section">
-        <h3>Goal State <span class="goal-version" id="goal-version-${project.id}"></span></h3>
-        <textarea class="goal-area mono" id="goal-${project.id}" placeholder="(no goal set)"></textarea>
-        <div class="goal-actions">
-          <button class="primary" id="save-goal-${project.id}">save</button>
+      <div class="drawer-panel" id="drawer-goal-${project.id}">
+        <div class="drawer-header">GOAL · ${escapeHtml(project.name)}</div>
+        <div style="flex:1;display:flex;flex-direction:column;padding:12px 14px;gap:8px;overflow:hidden">
+          <div style="display:flex;align-items:center;justify-content:space-between;flex-shrink:0">
+            <span class="goal-version" id="goal-version-${project.id}"></span>
+            <button class="primary" id="save-goal-${project.id}">save</button>
+          </div>
+          <textarea class="goal-area mono" id="goal-${project.id}" placeholder="(no goal set)" style="flex:1;max-height:none;resize:none"></textarea>
           <span class="goal-version" id="goal-state-${project.id}"></span>
         </div>
       </div>
-      <div class="section">
-        <h3>Active Sessions</h3>
-        <div class="sessions-list" id="sessions-${project.id}"></div>
+      <div class="drawer-panel" id="drawer-files-${project.id}">
+        <div class="drawer-header">FILES · ${escapeHtml(project.name)}</div>
+        <div id="files-browse-${project.id}" style="flex:1;overflow-y:auto">
+          <div class="file-list" id="files-list-${project.id}"></div>
+        </div>
+        <div id="file-editor-wrap-${project.id}" style="display:none;flex:1;flex-direction:column;overflow:hidden">
+          <div class="drawer-header" style="flex-shrink:0">
+            <button class="secondary" id="file-back-${project.id}" style="padding:2px 8px;font-size:10px">← back</button>
+            <span id="file-name-${project.id}" style="flex:1;color:var(--accent);font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"></span>
+            <button class="primary" id="file-save-${project.id}" style="padding:2px 8px;font-size:10px">save</button>
+          </div>
+          <textarea id="file-content-${project.id}" style="flex:1;background:var(--surface-2);border:none;border-top:1px solid var(--border);color:var(--text);padding:10px 14px;font-family:'IBM Plex Mono',monospace;font-size:12px;resize:none;outline:none;overflow-y:auto"></textarea>
+        </div>
       </div>
-      <div class="hitl-banner" id="hitl-banner-${project.id}" style="display:none">HITL queue</div>
-      <div id="hitl-queue-${project.id}"></div>
-      <div class="section" style="border-bottom:none">
-        <h3>Task Log</h3>
+      <div class="drawer-panel" id="drawer-devlog-${project.id}">
+        <div class="drawer-header">DEV LOG · ${escapeHtml(project.name)}</div>
+        <div class="scroll-area"><div class="task-list" id="tasks-${project.id}"></div></div>
       </div>
-      <div class="scroll-area"><div class="task-list" id="tasks-${project.id}"></div></div>
-    </section>
-    <section class="panel right">
+    </div>
+    <section class="chat-full">
       <div class="panel-header">
         <span>CHAT · claude-sonnet-4</span>
         <span style="display:flex;gap:6px;align-items:center">
@@ -777,7 +849,7 @@ function buildTabBody(project) {
           <button id="clear-chat-${project.id}" title="Clear chat history" style="background:transparent;border:1px solid var(--border);color:var(--muted);padding:2px 8px;border-radius:4px;font-family:'IBM Plex Mono',monospace;font-size:10px;cursor:pointer">clear</button>
           <span class="chat-mode" id="chat-mode-${project.id}">
             <button class="mode-btn active" data-mode="cli" title="Use the claude CLI on this machine (draws from Max plan, no API credits)">CLI</button>
-            <button class="mode-btn"        data-mode="api" title="Call api.anthropic.com directly (bills API credits)">API</button>
+            <button class="mode-btn" data-mode="api" title="Call api.anthropic.com directly (bills API credits)">API</button>
           </span>
         </span>
       </div>
@@ -790,9 +862,8 @@ function buildTabBody(project) {
   `;
   root.appendChild(body);
 
-  // Per-tab state. chatMode defaults to 'cli' (Max plan, no API credits)
-  // but is restored from localStorage when present so the user's choice
-  // sticks across reloads.
+  // Per-tab state. chatMode restored from localStorage so the user's choice
+  // persists across reloads. activeVtab tracks which drawer panel is open.
   let initialMode = 'api';
   try {
     const saved = localStorage.getItem('meridian.chatMode');
@@ -800,8 +871,35 @@ function buildTabBody(project) {
   } catch(e) {}
   state.panels[project.id] = {
     ws: null, taskCache: [], goalRaw: null, goalIsJson: false,
-    chatHistory: [], chatMode: initialMode,
+    chatHistory: [], chatMode: initialMode, activeVtab: 'status',
   };
+
+  // Vtab drawer toggle — same tab again collapses; different tab switches.
+  const vtabStrip = document.getElementById(`vtab-strip-${project.id}`);
+  const drawer = document.getElementById(`drawer-${project.id}`);
+  if (vtabStrip && drawer) {
+    vtabStrip.querySelectorAll('.vtab-btn').forEach(btn => {
+      btn.onclick = () => {
+        const vtab = btn.dataset.vtab;
+        const p = state.panels[project.id];
+        if (p.activeVtab === vtab && drawer.classList.contains('open')) {
+          drawer.classList.remove('open');
+          vtabStrip.querySelectorAll('.vtab-btn').forEach(b => b.classList.remove('active'));
+        } else {
+          drawer.classList.add('open');
+          vtabStrip.querySelectorAll('.vtab-btn').forEach(b => {
+            b.classList.toggle('active', b.dataset.vtab === vtab);
+          });
+          drawer.querySelectorAll('.drawer-panel').forEach(dp => {
+            dp.classList.toggle('active', dp.id === `drawer-${vtab}-${project.id}`);
+          });
+          p.activeVtab = vtab;
+          if (vtab === 'files') loadFilesTab(project.id);
+          if (vtab === 'devlog') refreshTasks(project.id);
+        }
+      };
+    });
+  }
 
   document.getElementById(`save-goal-${project.id}`).onclick = () => saveGoal(project.id);
 
@@ -837,9 +935,7 @@ function buildTabBody(project) {
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendChat(project.id); }
   });
 
-  // Mode toggle. Clicking either button updates the panel state, the
-  // active-button class, and localStorage. The toggle is mirrored
-  // across every open tab on the next render.
+  // Mode toggle — updates panel state, active-button class, and localStorage.
   const modeRoot = document.getElementById(`chat-mode-${project.id}`);
   if (modeRoot) {
     modeRoot.querySelectorAll('.mode-btn').forEach(btn => {
@@ -858,6 +954,17 @@ function buildTabBody(project) {
       };
     });
   }
+
+  // Files tab: back button returns to browse view; save button persists edits.
+  const fileBackBtn = document.getElementById(`file-back-${project.id}`);
+  const fileSaveBtn = document.getElementById(`file-save-${project.id}`);
+  if (fileBackBtn) fileBackBtn.onclick = () => {
+    const browse = document.getElementById(`files-browse-${project.id}`);
+    const editorWrap = document.getElementById(`file-editor-wrap-${project.id}`);
+    if (browse) browse.style.display = '';
+    if (editorWrap) editorWrap.style.display = 'none';
+  };
+  if (fileSaveBtn) fileSaveBtn.onclick = () => saveFile(project.id);
 
   refreshTab(project.id);
 
@@ -879,6 +986,60 @@ function buildTabBody(project) {
   })();
 
   connectWs(project.id);
+}
+
+async function loadFilesTab(projectId) {
+  /**Load the list of editable files from the server and render them as
+   * clickable items in the files drawer panel. */
+  const listEl = document.getElementById(`files-list-${projectId}`);
+  if (!listEl) return;
+  try {
+    const files = await api(`/projects/${projectId}/files`);
+    if (!files || !files.length) {
+      listEl.innerHTML = `<div style="padding:14px;color:var(--muted);font-family:'IBM Plex Mono',monospace;font-size:11px">No editable files found.</div>`;
+      return;
+    }
+    listEl.innerHTML = files.map(f =>
+      `<div class="file-item" data-filename="${escapeHtml(f)}">${escapeHtml(f)}</div>`
+    ).join('');
+    listEl.querySelectorAll('.file-item').forEach(item => {
+      item.onclick = () => openFileEditor(projectId, item.dataset.filename);
+    });
+  } catch(e) {
+    listEl.innerHTML = `<div style="padding:14px;color:var(--status-failed);font-family:'IBM Plex Mono',monospace;font-size:11px">Error: ${escapeHtml(e.message)}</div>`;
+  }
+}
+
+async function openFileEditor(projectId, filename) {
+  /**Fetch file content and switch the files panel into editor mode. */
+  const browseEl = document.getElementById(`files-browse-${projectId}`);
+  const editorEl = document.getElementById(`file-editor-wrap-${projectId}`);
+  const nameEl = document.getElementById(`file-name-${projectId}`);
+  const contentEl = document.getElementById(`file-content-${projectId}`);
+  if (!browseEl || !editorEl || !contentEl || !nameEl) return;
+  try {
+    const data = await api(`/projects/${projectId}/files/${encodeURIComponent(filename)}`);
+    contentEl.value = data.content || '';
+    nameEl.textContent = filename;
+    browseEl.style.display = 'none';
+    editorEl.style.display = 'flex';
+  } catch(e) { toast('open failed: ' + e.message, true); }
+}
+
+async function saveFile(projectId) {
+  /**Write the current editor content back to the server. */
+  const nameEl = document.getElementById(`file-name-${projectId}`);
+  const contentEl = document.getElementById(`file-content-${projectId}`);
+  if (!nameEl || !contentEl) return;
+  const filename = nameEl.textContent.trim();
+  if (!filename) return;
+  try {
+    await api(`/projects/${projectId}/files/${encodeURIComponent(filename)}`, {
+      method: 'PUT',
+      body: JSON.stringify({ content: contentEl.value }),
+    });
+    toast(`saved ${filename}`);
+  } catch(e) { toast('save failed: ' + e.message, true); }
 }
 
 async function refreshTab(projectId) {
@@ -1154,8 +1315,12 @@ async function sendChat(projectId) {
         if (payload === '[DONE]') break;
         try {
           const obj = JSON.parse(payload);
-          if (obj.error) { acc += `\n[error: ${obj.error}]`; }
-          else if (obj.delta) { acc += obj.delta; }
+          if (obj.error) {
+            const is429 = obj.error.includes('429') || /rate.?limit/i.test(obj.error);
+            acc += is429
+              ? '\n\n⚠️ Rate limited — wait ~60s then retry, or switch to Haiku model'
+              : `\n[error: ${obj.error}]`;
+          } else if (obj.delta) { acc += obj.delta; }
           assistantNode.textContent = acc;
           history.scrollTop = history.scrollHeight;
         } catch(e){}

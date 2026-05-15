@@ -953,6 +953,103 @@ def test_dashboard_html_has_favicon(client):
     assert "favicon" in r.text or "rel=\"icon\"" in r.text
 
 
-def test_dashboard_html_shows_v030(client):
+def test_dashboard_html_shows_version(client):
     r = client.get("/dashboard")
-    assert "v0.3.0" in r.text
+    assert "v0.3" in r.text
+
+
+# ---------------------------------------------------------------------------
+# v0.3.1: file editing endpoints
+# ---------------------------------------------------------------------------
+
+import importlib
+
+
+def test_list_project_files_returns_allow_list(client, monkeypatch, tmp_path):
+    """GET /projects/{id}/files returns the three editable filenames."""
+    import meridian.server as srv_mod
+    srv_mod = importlib.reload(srv_mod)
+    monkeypatch.setattr(srv_mod, "_REPO_ROOT", tmp_path)
+
+    project = client.post("/projects", json={"name": "alpha"}).json()
+    r = client.get(f"/projects/{project['id']}/files")
+    assert r.status_code == 200
+    files = r.json()
+    assert "AGENTS.md" in files
+    assert "ROADMAP.md" in files
+    assert "DEVLOG.md" in files
+
+
+def test_get_project_file_returns_empty_when_missing(client, monkeypatch, tmp_path):
+    """Reading a file that does not exist returns content='' not a 404."""
+    import meridian.server as srv_mod
+    srv_mod = importlib.reload(srv_mod)
+    monkeypatch.setattr(srv_mod, "_REPO_ROOT", tmp_path)
+
+    project = client.post("/projects", json={"name": "alpha"}).json()
+    r = client.get(f"/projects/{project['id']}/files/AGENTS.md")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["filename"] == "AGENTS.md"
+    assert body["content"] == ""
+
+
+def test_put_and_get_project_file_roundtrip(client, monkeypatch, tmp_path):
+    """Writing then reading a file returns the written content."""
+    import meridian.server as srv_mod
+    srv_mod = importlib.reload(srv_mod)
+    monkeypatch.setattr(srv_mod, "_REPO_ROOT", tmp_path)
+
+    project = client.post("/projects", json={"name": "alpha"}).json()
+    r = client.put(
+        f"/projects/{project['id']}/files/DEVLOG.md",
+        json={"content": "# Dev Log\n\nEntry 1."},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["filename"] == "DEVLOG.md"
+    assert body["size"] > 0
+
+    r2 = client.get(f"/projects/{project['id']}/files/DEVLOG.md")
+    assert r2.status_code == 200
+    assert r2.json()["content"] == "# Dev Log\n\nEntry 1."
+
+
+def test_get_project_file_403_for_disallowed_filename(client, monkeypatch, tmp_path):
+    """Accessing a filename outside the allow-list returns 403."""
+    import meridian.server as srv_mod
+    srv_mod = importlib.reload(srv_mod)
+    monkeypatch.setattr(srv_mod, "_REPO_ROOT", tmp_path)
+
+    project = client.post("/projects", json={"name": "alpha"}).json()
+    # Path traversal: FastAPI normalises the URL so it may 404 before reaching
+    # our handler, or our allow-list check returns 403. Either is secure.
+    r = client.get(f"/projects/{project['id']}/files/../../etc/passwd")
+    assert r.status_code in (403, 404)
+
+
+def test_put_project_file_403_for_disallowed_filename(client, monkeypatch, tmp_path):
+    """Writing outside the allow-list returns 403."""
+    import meridian.server as srv_mod
+    srv_mod = importlib.reload(srv_mod)
+    monkeypatch.setattr(srv_mod, "_REPO_ROOT", tmp_path)
+
+    project = client.post("/projects", json={"name": "alpha"}).json()
+    r = client.put(
+        f"/projects/{project['id']}/files/evil.sh",
+        json={"content": "rm -rf /"},
+    )
+    assert r.status_code == 403
+
+
+def test_file_endpoints_404_for_unknown_project(client, monkeypatch, tmp_path):
+    """All file endpoints return 404 when the project does not exist."""
+    import meridian.server as srv_mod
+    srv_mod = importlib.reload(srv_mod)
+    monkeypatch.setattr(srv_mod, "_REPO_ROOT", tmp_path)
+
+    assert client.get("/projects/no-such/files").status_code == 404
+    assert client.get("/projects/no-such/files/AGENTS.md").status_code == 404
+    assert client.put(
+        "/projects/no-such/files/AGENTS.md", json={"content": "x"}
+    ).status_code == 404

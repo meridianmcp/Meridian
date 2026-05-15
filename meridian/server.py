@@ -29,6 +29,7 @@ from .models import (
     ChatHistoryItem,
     ChatRequest,
     EnqueueTask,
+    FileContent,
     GoalSet,
     GoalState,
     HandoffResult,
@@ -402,6 +403,69 @@ async def dashboard_chat(body: ChatRequest, request: Request):
                 pass
 
     return StreamingResponse(_saving_stream(), media_type="text/event-stream")
+
+
+# ---------------------------------------------------------------------------
+# File editing endpoints
+# ---------------------------------------------------------------------------
+
+# Repo root is the parent of this package directory (meridian/).
+_REPO_ROOT = Path(__file__).parent.parent
+# The dashboard only allows editing these specific files.
+_EDITABLE_FILES: list[str] = ["AGENTS.md", "ROADMAP.md", "DEVLOG.md"]
+
+
+@app.get("/projects/{project_id}/files")
+async def list_project_files(
+    project_id: str, request: Request
+) -> list[str]:
+    """Return the list of editable markdown files for a project.
+
+    Files that do not yet exist on disk are still listed so the user can
+    create them from the dashboard. 403 is raised if the project is unknown.
+    """
+    project = await db_module.get_project(_db(request), project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="project not found")
+    return _EDITABLE_FILES
+
+
+@app.get("/projects/{project_id}/files/{filename}")
+async def get_project_file(
+    project_id: str, filename: str, request: Request
+) -> dict[str, str]:
+    """Read one editable markdown file and return its content.
+
+    Returns ``{"filename": ..., "content": ...}`` with an empty string when
+    the file does not yet exist. 403 if the filename is not in the allow-list.
+    """
+    project = await db_module.get_project(_db(request), project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="project not found")
+    if filename not in _EDITABLE_FILES:
+        raise HTTPException(status_code=403, detail="file not in allow-list")
+    path = _REPO_ROOT / filename
+    content = path.read_text(encoding="utf-8") if path.exists() else ""
+    return {"filename": filename, "content": content}
+
+
+@app.put("/projects/{project_id}/files/{filename}")
+async def put_project_file(
+    project_id: str, filename: str, body: FileContent, request: Request
+) -> dict[str, object]:
+    """Write content to one editable markdown file.
+
+    Creates the file if it does not exist. 403 if the filename is not in the
+    allow-list. Returns ``{"filename": ..., "size": <bytes>}``.
+    """
+    project = await db_module.get_project(_db(request), project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="project not found")
+    if filename not in _EDITABLE_FILES:
+        raise HTTPException(status_code=403, detail="file not in allow-list")
+    path = _REPO_ROOT / filename
+    path.write_text(body.content, encoding="utf-8")
+    return {"filename": filename, "size": len(body.content.encode("utf-8"))}
 
 
 @app.websocket("/ws/{project_id}")

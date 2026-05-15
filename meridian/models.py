@@ -132,6 +132,12 @@ class ChatHistoryItem(BaseModel):
     created_at: str
 
 
+class FileContent(BaseModel):
+    """Body for PUT /projects/{id}/files/{filename}."""
+
+    content: str
+
+
 class ChatRequest(BaseModel):
     """Body for POST /dashboard/chat.
 
