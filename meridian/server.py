@@ -274,7 +274,7 @@ async def get_sessions(
     project = await db_module.get_project(_db(request), project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="project not found")
-    await db_module.expire_idle_sessions(_db(request))
+    await _expire_and_generate_handoffs(_db(request), _data_dir(request))
     return await db_module.get_sessions(
         _db(request), project_id, active_only=True
     )
@@ -684,6 +684,31 @@ async def enqueue_task(body: EnqueueTask, request: Request) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# v0.4.5 — expire sessions and auto-generate handoffs
+# ---------------------------------------------------------------------------
+
+
+async def _expire_and_generate_handoffs(
+    db: aiosqlite.Connection, data_dir: str
+) -> dict[str, Any]:
+    """Expire stale sessions and regenerate handoffs for affected projects.
+
+    Returns ``{"count": n, "auto_handoff_generated": bool}``. Handoff
+    generation failures are swallowed so a bad project never blocks the
+    sessions endpoint from returning.
+    """
+    result = await db_module.expire_idle_sessions(db)
+    generated = False
+    for pid in result["project_ids"]:
+        try:
+            await handoff_module.generate_handoff(db, pid, data_dir)
+            generated = True
+        except Exception:  # noqa: BLE001
+            pass
+    return {"count": result["count"], "auto_handoff_generated": generated}
+
+
+# ---------------------------------------------------------------------------
 # v0.4.4 — start_session composite helper + endpoint
 # ---------------------------------------------------------------------------
 
@@ -719,7 +744,7 @@ async def _start_session_composite(
 
     recent_tasks = await db_module.get_tasks(db, project_id, limit=10)
 
-    await db_module.expire_idle_sessions(db)
+    await _expire_and_generate_handoffs(db, data_dir)
     active_sessions = await db_module.get_sessions(db, project_id, active_only=True)
 
     project = await db_module.get_project(db, project_id)

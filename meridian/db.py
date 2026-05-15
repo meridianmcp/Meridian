@@ -828,12 +828,24 @@ async def get_chat_history(
 
 async def expire_idle_sessions(
     db: aiosqlite.Connection, max_age_minutes: int = 30
-) -> int:
+) -> dict[str, Any]:
     """Mark sessions idle when their last_seen is older than *max_age_minutes*.
 
-    Returns the number of rows updated. Only 'active' sessions are
-    considered — 'idle' and 'closed' sessions are left untouched.
+    Returns ``{"count": n, "project_ids": [...]}`` where ``project_ids`` is
+    the list of distinct projects that had at least one session expire. The
+    caller can use this to trigger handoff generation for affected projects
+    (v0.4.5). Only 'active' sessions are considered; 'idle' and 'closed'
+    sessions are left untouched.
     """
+    async with db.execute(
+        "SELECT DISTINCT project_id FROM sessions "
+        "WHERE status = 'active' "
+        "AND last_seen < datetime('now', ? || ' minutes')",
+        (f"-{max_age_minutes}",),
+    ) as cur:
+        rows = await cur.fetchall()
+    affected_project_ids: list[str] = [row[0] for row in rows]
+
     cursor = await db.execute(
         "UPDATE sessions SET status = 'idle' "
         "WHERE status = 'active' "
@@ -841,4 +853,4 @@ async def expire_idle_sessions(
         (f"-{max_age_minutes}",),
     )
     await db.commit()
-    return cursor.rowcount
+    return {"count": cursor.rowcount, "project_ids": affected_project_ids}

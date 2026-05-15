@@ -872,8 +872,9 @@ async def test_expire_idle_sessions_marks_old_sessions(db):
         (s["id"],),
     )
     await db.commit()
-    count = await db_module.expire_idle_sessions(db, max_age_minutes=30)
-    assert count >= 1
+    result = await db_module.expire_idle_sessions(db, max_age_minutes=30)
+    assert result["count"] >= 1
+    assert p["id"] in result["project_ids"]
     sessions = await db_module.get_sessions(db, p["id"], active_only=False)
     stale = next(x for x in sessions if x["id"] == s["id"])
     assert stale["status"] == "idle"
@@ -884,8 +885,9 @@ async def test_expire_idle_sessions_leaves_recent_sessions(db):
     """Sessions seen within the TTL window must not be touched."""
     p = await db_module.create_project(db, "alpha")
     s = await db_module.register_session(db, p["id"], "fresh")
-    count = await db_module.expire_idle_sessions(db, max_age_minutes=30)
-    assert count == 0
+    result = await db_module.expire_idle_sessions(db, max_age_minutes=30)
+    assert result["count"] == 0
+    assert result["project_ids"] == []
     sessions = await db_module.get_sessions(db, p["id"], active_only=False)
     fresh = next(x for x in sessions if x["id"] == s["id"])
     assert fresh["status"] == "active"
@@ -1748,8 +1750,8 @@ async def test_heartbeat_keeps_session_out_of_idle_sweep(db):
     )
     await db.commit()
     await db_module.heartbeat_session(db, fresh["id"])
-    expired = await db_module.expire_idle_sessions(db, max_age_minutes=30)
-    assert expired >= 1
+    expire_result = await db_module.expire_idle_sessions(db, max_age_minutes=30)
+    assert expire_result["count"] >= 1
     # Heartbeated session remains 'active'; un-heartbeated flips to 'idle'.
     sessions = await db_module.get_sessions(db, p["id"], active_only=False)
     by_id = {s["id"]: s for s in sessions}
@@ -1780,6 +1782,63 @@ def test_dashboard_html_has_relative_time_helper(client):
     workers' liveness is obvious at a glance."""
     html = client.get("/dashboard").text
     assert "formatRelativeTime" in html
+
+
+# ---------------------------------------------------------------------------
+# v0.4.5 — auto-generate handoff on session TTL expiry
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_expire_idle_sessions_returns_dict_with_project_ids(db):
+    """expire_idle_sessions returns {count, project_ids} since v0.4.5."""
+    p = await db_module.create_project(db, "alpha")
+    s = await db_module.register_session(db, p["id"], "stale")
+    await db.execute(
+        "UPDATE sessions SET last_seen = datetime('now', '-60 minutes') WHERE id = ?",
+        (s["id"],),
+    )
+    await db.commit()
+    result = await db_module.expire_idle_sessions(db, max_age_minutes=30)
+    assert isinstance(result, dict)
+    assert "count" in result
+    assert "project_ids" in result
+    assert result["count"] >= 1
+    assert p["id"] in result["project_ids"]
+
+
+@pytest.mark.asyncio
+async def test_expire_and_generate_handoffs_creates_file(db, tmp_path):
+    """When sessions expire, _expire_and_generate_handoffs writes the file."""
+    from meridian import server as srv
+
+    p = await db_module.create_project(db, "myproj")
+    await db_module.set_goal(db, p["id"], "ship it")
+    s = await db_module.register_session(db, p["id"], "stale")
+    await db.execute(
+        "UPDATE sessions SET last_seen = datetime('now', '-60 minutes') WHERE id = ?",
+        (s["id"],),
+    )
+    await db.commit()
+
+    result = await srv._expire_and_generate_handoffs(db, str(tmp_path))
+    assert result["count"] >= 1
+    assert result["auto_handoff_generated"] is True
+    assert (tmp_path / "myproj_handoff.md").exists()
+
+
+@pytest.mark.asyncio
+async def test_expire_and_generate_handoffs_skips_when_nothing_expires(db, tmp_path):
+    """Fresh sessions don't trigger handoff generation."""
+    from meridian import server as srv
+
+    p = await db_module.create_project(db, "myproj")
+    await db_module.register_session(db, p["id"], "fresh")
+
+    result = await srv._expire_and_generate_handoffs(db, str(tmp_path))
+    assert result["count"] == 0
+    assert result["auto_handoff_generated"] is False
+    assert not (tmp_path / "myproj_handoff.md").exists()
 
 
 # ---------------------------------------------------------------------------
