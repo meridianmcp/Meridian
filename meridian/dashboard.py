@@ -839,11 +839,12 @@ function buildTabBody(project) {
     </div>
     <section class="chat-full">
       <div class="panel-header">
-        <span>CHAT · claude-sonnet-4</span>
+        <span>CHAT · claude-sonnet-4.6</span>
         <span style="display:flex;gap:6px;align-items:center">
           <select id="model-select-${project.id}" style="background:var(--surface-2);border:1px solid var(--border);color:var(--text);padding:2px 6px;border-radius:4px;font-family:'IBM Plex Mono',monospace;font-size:10px;cursor:pointer">
             <option value="claude-sonnet-4-6">sonnet-4.6</option>
-            <option value="claude-opus-4-5">opus-4.5</option>
+            <option value="claude-opus-4-6">opus-4.6</option>
+            <option value="claude-opus-4-7">opus-4.7</option>
             <option value="claude-haiku-4-5-20251001">haiku-4.5</option>
           </select>
           <button id="clear-chat-${project.id}" title="Clear chat history" style="background:transparent;border:1px solid var(--border);color:var(--muted);padding:2px 8px;border-radius:4px;font-family:'IBM Plex Mono',monospace;font-size:10px;cursor:pointer">clear</button>
@@ -918,7 +919,9 @@ function buildTabBody(project) {
   // Model selector
   const modelSel = document.getElementById(`model-select-${project.id}`);
   if (modelSel) {
-    const savedModel = localStorage.getItem('meridian.chatModel') || 'claude-sonnet-4-6';
+    const VALID_MODELS = ['claude-sonnet-4-6','claude-opus-4-6','claude-opus-4-7','claude-haiku-4-5-20251001'];
+    let savedModel = localStorage.getItem('meridian.chatModel') || 'claude-sonnet-4-6';
+    if (!VALID_MODELS.includes(savedModel)) savedModel = 'claude-sonnet-4-6'; // evict stale
     modelSel.value = savedModel;
     if (state.panels[project.id]) state.panels[project.id].chatModel = savedModel;
     modelSel.onchange = () => {
@@ -1316,10 +1319,10 @@ async function sendChat(projectId) {
         try {
           const obj = JSON.parse(payload);
           if (obj.error) {
-            const is429 = obj.error.includes('429') || /rate.?limit/i.test(obj.error);
+            const is429 = /rate.?limit/i.test(obj.error) && obj.error.includes('429');
             acc += is429
               ? '\n\n⚠️ Rate limited — wait ~60s then retry, or switch to Haiku model'
-              : `\n[error: ${obj.error}]`;
+              : `\n\n⚠️ API error: ${obj.error}`;
           } else if (obj.delta) { acc += obj.delta; }
           assistantNode.textContent = acc;
           history.scrollTop = history.scrollHeight;
