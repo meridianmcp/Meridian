@@ -394,6 +394,17 @@ html, body {
   font-family: 'IBM Plex Mono', monospace;
 }
 .project-list { flex: 1; overflow-y: auto; padding: 4px 8px 16px; }
+.project-switcher {
+  width: calc(100% - 16px);
+  margin: 4px 8px 6px;
+  background: var(--surface-2);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 5px 8px;
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 11px;
+}
 .project-item {
   padding: 8px 10px; border-radius: 4px; cursor: pointer;
   font-family: 'IBM Plex Mono', monospace; font-size: 12px;
@@ -640,13 +651,15 @@ input[type=text] {
 <body>
 <div class="app">
   <aside class="sidebar">
-    <div class="sidebar-header">MERIDIAN<small>v0.3.1 dashboard</small></div>
+    <div class="sidebar-header">MERIDIAN<small>v0.4.0 dashboard</small></div>
     <div id="api-warn">No auth configured — chat disabled. Set ANTHROPIC_API_KEY or connect Claude Max.</div>
     <div id="auth-method" style="margin:6px 10px 0;padding:5px 10px;background:rgba(0,212,170,0.08);border:1px solid rgba(0,212,170,0.25);border-radius:4px;color:var(--accent-green);font-size:10px;display:none"></div>
     <div class="projects-label">Projects</div>
+    <select id="project-switcher" class="project-switcher"></select>
     <div id="project-list" class="project-list"></div>
     <div class="new-project">
       <input id="new-project-name" type="text" placeholder="new project name">
+      <input id="new-project-human" type="text" placeholder="your name (optional)" style="max-width:120px">
       <button class="primary" id="new-project-btn">+</button>
     </div>
   </aside>
@@ -661,6 +674,7 @@ input[type=text] {
 
 <script>
 const TABS_KEY = 'meridian.openTabs';
+const ACTIVE_PROJECT_KEY = 'meridian.activeProject';
 const state = {
   projects: [],
   tabs: [], // [{id, project}]
@@ -716,6 +730,29 @@ async function loadProjects() {
     div.onclick = () => openTab(p);
     list.appendChild(div);
   });
+  // Mirror the same list into the top-of-sidebar dropdown so users can
+  // switch the active project from one place. Selection drives the
+  // single-active concept; the multi-tab UI still works on top.
+  const switcher = document.getElementById('project-switcher');
+  if (switcher) {
+    const previous = switcher.value;
+    switcher.innerHTML = '';
+    const placeholder = document.createElement('option');
+    placeholder.value = '';
+    placeholder.textContent = state.projects.length
+      ? '— switch project —'
+      : '(no projects yet)';
+    switcher.appendChild(placeholder);
+    state.projects.forEach(p => {
+      const opt = document.createElement('option');
+      opt.value = p.id;
+      opt.textContent = p.name;
+      switcher.appendChild(opt);
+    });
+    if (previous && state.projects.some(p => p.id === previous)) {
+      switcher.value = previous;
+    }
+  }
 }
 
 function escapeHtml(s) {
@@ -782,6 +819,11 @@ function activateTab(id) {
   // clear empty placeholder
   const empty = document.querySelector('.tab-bodies > .empty');
   if (empty) empty.remove();
+  // Persist active project so a refresh reopens to the same tab.
+  try { localStorage.setItem(ACTIVE_PROJECT_KEY, id); } catch(e) {}
+  // Keep the sidebar dropdown in sync with whichever tab the user is on.
+  const switcher = document.getElementById('project-switcher');
+  if (switcher) switcher.value = id;
 }
 
 function buildTabBody(project) {
@@ -1354,15 +1396,34 @@ function appendChatMessage(history, role, text) {
 
 document.getElementById('new-project-btn').onclick = async () => {
   const inp = document.getElementById('new-project-name');
+  const humanInp = document.getElementById('new-project-human');
   const name = inp.value.trim();
   if (!name) return;
+  const body = { name };
+  const humanId = (humanInp && humanInp.value || '').trim();
+  if (humanId) body.human_id = humanId;
   try {
-    const p = await api('/projects', { method: 'POST', body: JSON.stringify({ name }) });
+    const p = await api('/projects', { method: 'POST', body: JSON.stringify(body) });
     inp.value = '';
+    if (humanInp) humanInp.value = '';
     await loadProjects();
     openTab(p);
   } catch(e) { toast('create failed: ' + e.message, true); }
 };
+
+// Sidebar dropdown — switch active project (opens the tab if not
+// already open, otherwise just activates it).
+{
+  const switcher = document.getElementById('project-switcher');
+  if (switcher) {
+    switcher.addEventListener('change', (ev) => {
+      const id = ev.target.value;
+      if (!id) return;
+      const p = state.projects.find(x => x.id === id);
+      if (p) openTab(p);
+    });
+  }
+}
 
 async function restoreTabs() {
   let saved = [];
@@ -1370,6 +1431,14 @@ async function restoreTabs() {
   for (const id of saved) {
     const p = state.projects.find(x => x.id === id);
     if (p) openTab(p);
+  }
+  // If no tabs were restored, fall back to the persisted active project
+  // or — failing that — the first project in the list.
+  if (state.tabs.length === 0 && state.projects.length > 0) {
+    let preferred = null;
+    try { preferred = localStorage.getItem(ACTIVE_PROJECT_KEY); } catch(e) {}
+    const fallback = state.projects.find(p => p.id === preferred) || state.projects[0];
+    if (fallback) openTab(fallback);
   }
 }
 

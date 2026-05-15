@@ -955,7 +955,8 @@ def test_dashboard_html_has_favicon(client):
 
 def test_dashboard_html_shows_version(client):
     r = client.get("/dashboard")
-    assert "v0.3" in r.text
+    # Loose match — the version label moves but the prefix stays "v0."
+    assert "v0." in r.text
 
 
 # ---------------------------------------------------------------------------
@@ -1328,3 +1329,30 @@ def test_http_claimable_filters_claimed(client):
     ids = {t["id"] for t in r.json()}
     assert task_a["id"] not in ids
     assert task_b["id"] in ids
+
+
+# ---------------------------------------------------------------------------
+# v0.4.0 — project switcher in dashboard
+# ---------------------------------------------------------------------------
+
+
+def test_dashboard_html_contains_project_switcher(client):
+    """HTML smoke test: the v0.4.0 switcher + human_id input are present."""
+    html = client.get("/dashboard").text
+    assert 'id="project-switcher"' in html
+    assert 'id="new-project-human"' in html
+    assert "ACTIVE_PROJECT_KEY" in html  # localStorage persistence wired
+
+
+def test_get_projects_returns_list_with_creator(client):
+    """v0.4.0 contract: GET /projects returns every project the
+    switcher needs to render, including the creator_human_id."""
+    client.post("/projects", json={"name": "alpha", "human_id": "adam"})
+    client.post("/projects", json={"name": "beta"})
+    r = client.get("/projects")
+    assert r.status_code == 200
+    names = {p["name"] for p in r.json()}
+    assert {"alpha", "beta"} <= names
+    by_name = {p["name"]: p for p in r.json()}
+    assert by_name["alpha"]["creator_human_id"] == "adam"
+    assert by_name["beta"]["creator_human_id"] is None
