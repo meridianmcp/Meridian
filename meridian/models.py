@@ -111,7 +111,25 @@ class Task(BaseModel):
     project_id: str
     description: str
     status: Literal["pending", "done", "failed", "pending-hitl"]
+    claimed_by: str | None = None
+    claimed_at: str | None = None
     created_at: str
+
+
+class ClaimTaskRequest(BaseModel):
+    """Body for POST /projects/{id}/tasks/claim and /tasks/release."""
+
+    task_id: str
+    session_id: str
+
+
+class ClaimTaskResponse(BaseModel):
+    """Result of a claim attempt — ``claimed`` is False when another
+    worker beat us to the lock."""
+
+    task_id: str
+    claimed: bool
+    claimed_by: str | None = None
 
 
 class HandoffResult(BaseModel):

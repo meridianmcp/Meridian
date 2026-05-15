@@ -28,6 +28,8 @@ from . import handoff as handoff_module
 from .models import (
     ChatHistoryItem,
     ChatRequest,
+    ClaimTaskRequest,
+    ClaimTaskResponse,
     EnqueueTask,
     FileContent,
     GoalSet,
@@ -219,6 +221,71 @@ async def get_tasks(
     if project is None:
         raise HTTPException(status_code=404, detail="project not found")
     return await db_module.get_tasks(_db(request), project_id, limit=limit)
+
+
+@app.get("/projects/{project_id}/tasks/claimable", response_model=list[Task])
+async def get_claimable_tasks(
+    project_id: str, request: Request, limit: int = 20
+) -> list[dict[str, Any]]:
+    """List unclaimed pending tasks for a project (v0.3.3).
+
+    Workers poll this endpoint to find work that isn't already locked
+    by another session.
+    """
+    project = await db_module.get_project(_db(request), project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="project not found")
+    return await db_module.get_claimable_tasks(
+        _db(request), project_id, limit=limit
+    )
+
+
+@app.post(
+    "/projects/{project_id}/tasks/claim", response_model=ClaimTaskResponse
+)
+async def claim_task_endpoint(
+    project_id: str, body: ClaimTaskRequest, request: Request
+) -> dict[str, Any]:
+    """Atomically claim a pending task. Returns ``claimed=False`` when
+    another worker holds the lock — the worker should try the next row."""
+    project = await db_module.get_project(_db(request), project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="project not found")
+    claimed = await db_module.claim_task(
+        _db(request), body.task_id, body.session_id
+    )
+    if claimed is None:
+        existing = await db_module.get_task(_db(request), body.task_id)
+        return {
+            "task_id": body.task_id,
+            "claimed": False,
+            "claimed_by": existing["claimed_by"] if existing else None,
+        }
+    return {
+        "task_id": body.task_id,
+        "claimed": True,
+        "claimed_by": claimed["claimed_by"],
+    }
+
+
+@app.post("/projects/{project_id}/tasks/release")
+async def release_task_endpoint(
+    project_id: str, body: ClaimTaskRequest, request: Request
+) -> dict[str, Any]:
+    """Release a previously-claimed task. 404 when no claim is held
+    by the given session."""
+    project = await db_module.get_project(_db(request), project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="project not found")
+    released = await db_module.release_task(
+        _db(request), body.task_id, body.session_id
+    )
+    if not released:
+        raise HTTPException(
+            status_code=404,
+            detail="task not claimed by this session",
+        )
+    return {"task_id": body.task_id, "released": True}
 
 
 @app.post("/projects/{project_id}/handoff", response_model=HandoffResult)
@@ -732,6 +799,44 @@ def build_mcp_server():
                     "required": ["session_id", "project_id", "prompt"],
                 },
             ),
+            Tool(
+                name="claim_task",
+                description=(
+                    "Atomically claim a pending task so no other worker "
+                    "picks it up. Returns claimed=True on success or "
+                    "claimed=False (with the current holder) when another "
+                    "session already holds the lock. Call this before "
+                    "doing the work; pair with release_task on completion "
+                    "or failure."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "project_id": {"type": "string"},
+                        "task_id": {"type": "string"},
+                        "session_id": {"type": "string"},
+                    },
+                    "required": ["project_id", "task_id", "session_id"],
+                },
+            ),
+            Tool(
+                name="release_task",
+                description=(
+                    "Release a task previously claimed by this session. "
+                    "Returns success=True when the claim was held by the "
+                    "calling session, False otherwise (someone else's lock "
+                    "is left untouched)."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "project_id": {"type": "string"},
+                        "task_id": {"type": "string"},
+                        "session_id": {"type": "string"},
+                    },
+                    "required": ["project_id", "task_id", "session_id"],
+                },
+            ),
         ]
 
     @server.call_tool()
@@ -810,6 +915,39 @@ def build_mcp_server():
                     arguments["prompt"],
                     timeout=timeout,
                 )
+            elif name == "claim_task":
+                claimed = await db_module.claim_task(
+                    db,
+                    arguments["task_id"],
+                    arguments["session_id"],
+                )
+                if claimed is None:
+                    existing = await db_module.get_task(
+                        db, arguments["task_id"]
+                    )
+                    result = {
+                        "task_id": arguments["task_id"],
+                        "claimed": False,
+                        "claimed_by": (
+                            existing["claimed_by"] if existing else None
+                        ),
+                    }
+                else:
+                    result = {
+                        "task_id": arguments["task_id"],
+                        "claimed": True,
+                        "claimed_by": claimed["claimed_by"],
+                    }
+            elif name == "release_task":
+                released = await db_module.release_task(
+                    db,
+                    arguments["task_id"],
+                    arguments["session_id"],
+                )
+                result = {
+                    "task_id": arguments["task_id"],
+                    "success": released,
+                }
             else:
                 result = {"error": f"unknown tool: {name}"}
         except Exception as exc:  # noqa: BLE001 — surface to MCP client

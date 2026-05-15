@@ -1156,3 +1156,175 @@ def test_set_goal_200_when_owner_set_but_body_human_id_absent(client):
         f"/projects/{project['id']}/goal", json={"content": "ship it"}
     )
     assert r.status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# v0.3.3 — claim_task / release_task
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_claim_task_succeeds_when_unclaimed(db):
+    p = await db_module.create_project(db, "alpha")
+    s = await db_module.register_session(db, p["id"], "worker-1")
+    t = await db_module.log_task(db, s["id"], p["id"], "do thing", "pending")
+    claimed = await db_module.claim_task(db, t["id"], s["id"])
+    assert claimed is not None
+    assert claimed["claimed_by"] == s["id"]
+    assert claimed["claimed_at"] is not None
+
+
+@pytest.mark.asyncio
+async def test_claim_task_fails_when_already_claimed(db):
+    p = await db_module.create_project(db, "alpha")
+    s1 = await db_module.register_session(db, p["id"], "worker-1")
+    s2 = await db_module.register_session(db, p["id"], "worker-2")
+    t = await db_module.log_task(db, s1["id"], p["id"], "do thing", "pending")
+    first = await db_module.claim_task(db, t["id"], s1["id"])
+    second = await db_module.claim_task(db, t["id"], s2["id"])
+    assert first is not None
+    assert second is None
+
+
+@pytest.mark.asyncio
+async def test_claim_task_fails_when_status_not_pending(db):
+    p = await db_module.create_project(db, "alpha")
+    s = await db_module.register_session(db, p["id"], "worker-1")
+    t = await db_module.log_task(db, s["id"], p["id"], "did it", "done")
+    claimed = await db_module.claim_task(db, t["id"], s["id"])
+    assert claimed is None
+
+
+@pytest.mark.asyncio
+async def test_release_task_succeeds_for_owner(db):
+    p = await db_module.create_project(db, "alpha")
+    s = await db_module.register_session(db, p["id"], "worker-1")
+    t = await db_module.log_task(db, s["id"], p["id"], "do thing", "pending")
+    await db_module.claim_task(db, t["id"], s["id"])
+    released = await db_module.release_task(db, t["id"], s["id"])
+    assert released is True
+    fresh = await db_module.get_task(db, t["id"])
+    assert fresh is not None
+    assert fresh["claimed_by"] is None
+    assert fresh["claimed_at"] is None
+
+
+@pytest.mark.asyncio
+async def test_release_task_fails_for_non_owner(db):
+    p = await db_module.create_project(db, "alpha")
+    s1 = await db_module.register_session(db, p["id"], "worker-1")
+    s2 = await db_module.register_session(db, p["id"], "worker-2")
+    t = await db_module.log_task(db, s1["id"], p["id"], "do thing", "pending")
+    await db_module.claim_task(db, t["id"], s1["id"])
+    released = await db_module.release_task(db, t["id"], s2["id"])
+    assert released is False
+    fresh = await db_module.get_task(db, t["id"])
+    assert fresh is not None
+    assert fresh["claimed_by"] == s1["id"]
+
+
+@pytest.mark.asyncio
+async def test_get_claimable_tasks_filters_correctly(db):
+    p = await db_module.create_project(db, "alpha")
+    s = await db_module.register_session(db, p["id"], "worker-1")
+    pending_unclaimed = await db_module.log_task(
+        db, s["id"], p["id"], "ready", "pending"
+    )
+    pending_claimed = await db_module.log_task(
+        db, s["id"], p["id"], "taken", "pending"
+    )
+    await db_module.claim_task(db, pending_claimed["id"], s["id"])
+    await db_module.log_task(db, s["id"], p["id"], "shipped", "done")
+    rows = await db_module.get_claimable_tasks(db, p["id"])
+    ids = {r["id"] for r in rows}
+    assert pending_unclaimed["id"] in ids
+    assert pending_claimed["id"] not in ids
+    assert all(r["status"] == "pending" for r in rows)
+    assert all(r["claimed_by"] is None for r in rows)
+
+
+def test_http_claim_and_release_round_trip(client):
+    project = client.post("/projects", json={"name": "alpha"}).json()
+    sess = client.post(
+        "/sessions/register",
+        json={"project_id": project["id"], "name": "worker-1"},
+    ).json()
+    task = client.post(
+        "/tasks",
+        json={
+            "session_id": sess["id"],
+            "project_id": project["id"],
+            "description": "step 1",
+            "status": "pending",
+        },
+    ).json()
+    r = client.post(
+        f"/projects/{project['id']}/tasks/claim",
+        json={"task_id": task["id"], "session_id": sess["id"]},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["claimed"] is True
+    assert body["claimed_by"] == sess["id"]
+
+    # Second claim from a different session is refused
+    sess2 = client.post(
+        "/sessions/register",
+        json={"project_id": project["id"], "name": "worker-2"},
+    ).json()
+    r2 = client.post(
+        f"/projects/{project['id']}/tasks/claim",
+        json={"task_id": task["id"], "session_id": sess2["id"]},
+    )
+    assert r2.status_code == 200
+    assert r2.json()["claimed"] is False
+
+    # Release by non-owner -> 404
+    r3 = client.post(
+        f"/projects/{project['id']}/tasks/release",
+        json={"task_id": task["id"], "session_id": sess2["id"]},
+    )
+    assert r3.status_code == 404
+
+    # Release by owner -> 200
+    r4 = client.post(
+        f"/projects/{project['id']}/tasks/release",
+        json={"task_id": task["id"], "session_id": sess["id"]},
+    )
+    assert r4.status_code == 200
+    assert r4.json()["released"] is True
+
+
+def test_http_claimable_filters_claimed(client):
+    project = client.post("/projects", json={"name": "alpha"}).json()
+    sess = client.post(
+        "/sessions/register",
+        json={"project_id": project["id"], "name": "worker-1"},
+    ).json()
+    task_a = client.post(
+        "/tasks",
+        json={
+            "session_id": sess["id"],
+            "project_id": project["id"],
+            "description": "a",
+            "status": "pending",
+        },
+    ).json()
+    task_b = client.post(
+        "/tasks",
+        json={
+            "session_id": sess["id"],
+            "project_id": project["id"],
+            "description": "b",
+            "status": "pending",
+        },
+    ).json()
+    client.post(
+        f"/projects/{project['id']}/tasks/claim",
+        json={"task_id": task_a["id"], "session_id": sess["id"]},
+    )
+    r = client.get(f"/projects/{project['id']}/tasks/claimable")
+    assert r.status_code == 200
+    ids = {t["id"] for t in r.json()}
+    assert task_a["id"] not in ids
+    assert task_b["id"] in ids

@@ -91,6 +91,8 @@ CREATE TABLE IF NOT EXISTS task_log (
     description TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'done'
         CHECK (status IN ('pending','done','failed','pending-hitl')),
+    claimed_by TEXT,
+    claimed_at TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -219,6 +221,13 @@ async def _migrate_human_identity(db: aiosqlite.Connection) -> None:
     await _migrate_add_column_if_missing(db, "sessions", "human_id", "TEXT")
 
 
+async def _migrate_task_claims(db: aiosqlite.Connection) -> None:
+    """v0.3.3 — add ``claimed_by`` / ``claimed_at`` columns for the
+    distributed task lock. Both nullable, so ALTER TABLE is safe."""
+    await _migrate_add_column_if_missing(db, "task_log", "claimed_by", "TEXT")
+    await _migrate_add_column_if_missing(db, "task_log", "claimed_at", "TEXT")
+
+
 async def init_db(db_path: str) -> aiosqlite.Connection:
     """Open the SQLite database, apply schema, and return the connection.
 
@@ -234,6 +243,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await db.commit()
     await _migrate_task_log_hitl(db)
     await _migrate_human_identity(db)
+    await _migrate_task_claims(db)
     return db
 
 
@@ -502,6 +512,77 @@ async def get_tasks(
     async with db.execute(
         "SELECT * FROM task_log WHERE project_id = ? "
         "ORDER BY created_at DESC, rowid DESC LIMIT ?",
+        (project_id, limit),
+    ) as cur:
+        rows = await cur.fetchall()
+    return [_row_to_dict(r) for r in rows]  # type: ignore[misc]
+
+
+# ---------------------------------------------------------------------------
+# Distributed task locking (v0.3.3)
+# ---------------------------------------------------------------------------
+
+
+async def claim_task(
+    db: aiosqlite.Connection, task_id: str, session_id: str
+) -> dict[str, Any] | None:
+    """Atomically claim a pending task for ``session_id``.
+
+    Returns the freshly-claimed task row, or ``None`` if the task is
+    already claimed / not pending / does not exist. The single UPDATE
+    statement encodes the "first writer wins" race: SQLite serialises
+    writes so even concurrent claims from two parallel workers will
+    only see one of them flip ``claimed_by`` from NULL.
+    """
+    cursor = await db.execute(
+        "UPDATE task_log SET claimed_by = ?, claimed_at = datetime('now') "
+        "WHERE id = ? AND claimed_by IS NULL AND status = 'pending'",
+        (session_id, task_id),
+    )
+    await db.commit()
+    if cursor.rowcount == 0:
+        return None
+    updated = await get_task(db, task_id)
+    if updated is not None:
+        _publish_task("task_updated", updated)
+    return updated
+
+
+async def release_task(
+    db: aiosqlite.Connection, task_id: str, session_id: str
+) -> bool:
+    """Release a claim previously taken by ``session_id``.
+
+    Returns True if a claim was released; False if the task wasn't held
+    by that session (someone else's claim is left untouched).
+    """
+    cursor = await db.execute(
+        "UPDATE task_log SET claimed_by = NULL, claimed_at = NULL "
+        "WHERE id = ? AND claimed_by = ?",
+        (task_id, session_id),
+    )
+    await db.commit()
+    if cursor.rowcount == 0:
+        return False
+    updated = await get_task(db, task_id)
+    if updated is not None:
+        _publish_task("task_updated", updated)
+    return True
+
+
+async def get_claimable_tasks(
+    db: aiosqlite.Connection, project_id: str, limit: int = 20
+) -> list[dict[str, Any]]:
+    """Return unclaimed pending tasks, newest first.
+
+    Worker pattern: poll this, pick a row, call :func:`claim_task` —
+    if the claim returns None another worker beat you to it, try the
+    next row.
+    """
+    async with db.execute(
+        "SELECT * FROM task_log WHERE project_id = ? "
+        "AND status = 'pending' AND claimed_by IS NULL "
+        "ORDER BY created_at ASC, rowid ASC LIMIT ?",
         (project_id, limit),
     ) as cur:
         rows = await cur.fetchall()

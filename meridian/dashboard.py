@@ -578,6 +578,11 @@ input[type=text] {
 .task.pending-hitl .status-badge { background: rgba(255,159,67,0.2); color: var(--status-hitl); }
 .task.pending-hitl .desc { font-weight: 600; }
 .task .desc { flex: 1; word-break: break-word; }
+.claim-badge {
+  display: inline-block; margin-left: 6px; padding: 1px 5px;
+  border-radius: 3px; background: rgba(74,158,255,0.15);
+  color: var(--accent); font-size: 10px; font-weight: 600;
+}
 .task .meta { font-size: 10px; color: var(--muted); }
 
 .hitl-banner {
@@ -1128,12 +1133,15 @@ function renderTasks(projectId) {
 }
 
 function renderTaskRow(t) {
+  const claimBadge = t.claimed_by
+    ? `<span class="claim-badge" title="claimed at ${escapeHtml(t.claimed_at || '')}">🔒 ${escapeHtml(t.claimed_by.slice(0, 8))}</span>`
+    : '';
   return `
     <div class="task ${t.status}">
       <span class="status-badge">${t.status}</span>
       <div>
         <div class="desc">${escapeHtml(t.description)}</div>
-        <div class="meta">${escapeHtml(t.created_at)}</div>
+        <div class="meta">${escapeHtml(t.created_at)} ${claimBadge}</div>
       </div>
     </div>`;
 }
