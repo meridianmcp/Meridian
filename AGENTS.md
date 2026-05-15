@@ -2,133 +2,123 @@
 
 ## What this project is
 
-Meridian is a local Python MCP server that gives multiple Claude sessions a
-shared persistent brain. It solves the context window problem for multi-session
-AI workflows by providing goal state, task log, HITL queue, session registry,
-and handoff generation.
+Meridian is a local Python MCP server that gives multiple Claude Code sessions a
+shared persistent brain. It solves the context loss problem for multi-session AI
+workflows by providing: goal state, task log, HITL queue, session registry, and
+handoff generation.
 
 **Stack:** Python, FastAPI, aiosqlite, Pydantic v2, MCP Python SDK, pixi
+
+## STARTUP PROTOCOL — do this before anything else
+
+Every Claude Code session MUST follow this sequence in order:
+
+### Step 1 — Read the handoff file if it exists
+```
+read: data/meridian-build_handoff.md
+```
+This file contains everything that happened before you arrived — recent task log,
+current goal version, active sessions. If the file exists, read it BEFORE calling
+any MCP tools. It is more current than AGENTS.md.
+
+### Step 2 — Register with Meridian
+```python
+register_session(
+    project_id="5787cc92-ba7d-4788-b17c-28ab7938b839",
+    session_name="claude-[model]-[task]",
+    human_id="adam"  # or your name if you're a contributor
+)
+# Store the returned session_id — you need it for log_task
+```
+
+### Step 3 — Read the current goal
+```python
+get_goal(project_id="5787cc92-ba7d-4788-b17c-28ab7938b839")
+```
+The goal is the contract. Read it. Don't start work until you understand it.
+
+### Step 4 — Read recent tasks
+```python
+get_tasks(project_id="5787cc92-ba7d-4788-b17c-28ab7938b839", limit=10)
+```
+See what other sessions did recently. Don't duplicate work already marked done.
+
+### Step 5 — Log that you've started
+```python
+log_task(
+    project_id="5787cc92-ba7d-4788-b17c-28ab7938b839",
+    session_id="<your session_id>",
+    description="Starting session — read handoff, goal v{N}, recent tasks reviewed. Plan: ...",
+    status="pending"
+)
+```
+
+## During the session
+
+- Call `log_task` after every significant action
+- Call `log_task(status="pending")` when starting a task, `status="done"` when finished
+- If context is filling up: call `generate_handoff` BEFORE ending
+- If goal changes significantly: call `set_goal` — but only if you own the project
+  (non-owners must use the HITL queue to propose goal changes)
+
+## Before ending the session
+
+```python
+generate_handoff(project_id="5787cc92-ba7d-4788-b17c-28ab7938b839")
+log_task(..., description="Session ending. Handoff generated.", status="done")
+```
 
 ## Project layout
 
 ```
 meridian/
-  server.py       — FastAPI REST + MCP stdio server (9+ tools)
-  dashboard.py    — Dashboard UI at localhost:7878
+  server.py       — FastAPI REST + MCP tool handlers
+  dashboard.py    — Dashboard HTML + JS + SSE chat proxy
   db.py           — aiosqlite database layer
   models.py       — Pydantic v2 models
   enqueue.py      — async worker dispatch
   handoff.py      — handoff file generation
 data/
-  meridian.db     — SQLite database (auto-created)
-  meridian-build_handoff.md — latest context handoff
-tests/            — pytest test suite (66+ tests)
-pixi.toml         — environment and task definitions
+  meridian.db     — SQLite database (WAL mode)
+  meridian-build_handoff.md — latest handoff (read this first!)
+tests/
+  test_core.py    — full test suite (must pass before every commit)
+pixi.toml         — environment + task definitions
 ```
 
-## How to run
+## Running
 
 ```bash
-pixi run start   # MCP + dashboard at localhost:7878
-pixi run test    # run test suite
+pixi run start   # start server at localhost:7878
+pixi run test    # run all tests (must be green before committing)
 ```
-
-## Session startup protocol
-
-Every Claude Code session MUST follow this protocol in order.
-The behavior differs depending on how you're arriving:
-
----
-
-### Case 1 — Normal resume (handoff file exists and is recent)
-
-1. Read `data/meridian-build_handoff.md` — full context
-2. `register_session(project_id, session_name, human_id="yourname")`
-3. `get_goal(project_id)` — confirm latest version matches handoff
-4. `get_tasks(project_id, limit=10)` — catch up on work since handoff
-5. `get_sessions(project_id)` — see who else is active
-6. Begin work. Log tasks frequently.
-
----
-
-### Case 2 — Teammate did work while you were gone
-
-1. Read `data/meridian-build_handoff.md` — baseline context
-2. `register_session(project_id, session_name, human_id="yourname")`
-3. `get_goal(project_id)` — may have changed since handoff
-4. `get_tasks(project_id, limit=50)` — THIS is your changelog. Read all of it.
-5. `get_sessions(project_id)` — who is active right now, what are they claiming
-6. Read DEVLOG.md — any architectural decisions made outside the task log
-7. Do NOT redo work marked `done` in the task log
-
----
-
-### Case 3 — Nuked chat, no recent handoff
-
-1. Read `data/meridian-build_handoff.md` — may be stale, use for structure only
-2. `register_session(project_id, session_name, human_id="yourname")`
-3. `get_goal(project_id)` — authoritative current directive
-4. `get_tasks(project_id, limit=50)` — reconstruct what happened after handoff
-5. Read ROADMAP.md — what versions are planned
-6. Read DEVLOG.md — what decisions were made and why
-7. Synthesize: goal + tasks + devlog = full current picture
-
----
-
-### Case 4 — Brand new project (not meridian-build)
-
-1. `create_project(name="your-project-name")`
-2. Store the returned project_id — this is your anchor
-3. `register_session(project_id, session_name, human_id="yourname")`
-4. `set_goal(project_id, "your directive here")`
-5. Create a project-specific AGENTS.md with the new project_id
-
----
-
-## Project ID (meridian-build)
-
-`5787cc92-ba7d-4788-b17c-28ab7938b839`
 
 ## MCP tools available
 
-| Tool | Description |
+| Tool | When to call |
 |------|-------------|
-| `create_project` | Create a new coordination project |
-| `register_session` | Register this session (include human_id) |
-| `get_goal` | Read current shared goal |
-| `set_goal` | Update goal (owner only if human_id set) |
-| `log_task` | Record what this session did/is doing/failed |
-| `get_tasks` | See what all sessions have done |
-| `get_sessions` | List active sessions |
-| `generate_handoff` | Generate context handoff file |
-| `enqueue_claude_task` | Spawn async Claude Code worker |
+| `register_session` | First thing, every session |
+| `get_goal` | After registering, and whenever you need the directive |
+| `get_tasks` | After registering, to see recent work |
+| `log_task` | Frequently — after every significant action |
+| `set_goal` | Only on deliberate milestones, only if you're the project owner |
+| `claim_task` | Before starting a task — prevents duplicate work |
+| `release_task` | If you can't finish a claimed task |
+| `generate_handoff` | Before ending any session |
+| `heartbeat` | Every 5 min in long-running sessions |
 
-## Goal state discipline
-
-- `get_goal` on every connect — always read before acting
-- `set_goal` only on deliberate milestones — not every commit
-- If human_id ownership is set — only the owner can set_goal
-- Others must use the HITL queue to propose changes
-
-## Task log discipline
-
-- `log_task` at start of every significant action (status: pending)
-- `log_task` on completion (status: done)
-- `log_task` on failure with error detail (status: failed)
-- The task log IS the project changelog — treat it that way
-
-## Before ending any session
+## Key constants
 
 ```
-generate_handoff(project_id)
+PROJECT ID: 5787cc92-ba7d-4788-b17c-28ab7938b839
+START CMD:  pixi run start
+TESTS:      pixi run test (66+ must pass)
+REPO:       C:\Users\13144\Documents\Meridian\repository
 ```
 
-Always. Even if context is not full. The next session may arrive cold.
+## Code standards
 
-## Key files to know
-
-- `ROADMAP.md` — full version plan, check before starting new work
-- `DEVLOG.md` — incident log, read before debugging anything
-- `CONTRIBUTING.md` — code standards, PR process, IP terms
-- `OWNERSHIP.md` — who owns what and when
-- `data/meridian-build_handoff.md` — latest context handoff
+- Surgical edits only — never rewrite whole files
+- dashboard.py is large — find/replace only
+- pixi run test must pass before every commit
+- Commit after every logical unit: `git commit -m "feat: vX.Y.Z — description"`
