@@ -24,9 +24,18 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import shlex
 from pathlib import Path
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Awaitable, Callable
+
+# Regex that picks the Claude CLI session ID line out of an output
+# stream so we can persist it and pass ``--resume <uuid>`` on the next
+# message. The CLI emits a line such as "Session ID: <uuid>"; we
+# accept any 20+ char hex/dash sequence after the marker.
+_SESSION_ID_RE = re.compile(
+    r"Session\s*ID:\s*([0-9a-fA-F][0-9a-fA-F\-]{19,})"
+)
 
 from fastapi import WebSocket
 
@@ -241,6 +250,9 @@ async def stream_claude_cli_chat(
     system_prompt: str | None,
     model: str,
     max_tokens: int,
+    *,
+    resume_session_id: str | None = None,
+    on_session_id: Callable[[str], Awaitable[None]] | None = None,
 ) -> AsyncIterator[bytes]:
     """Spawn the ``claude`` CLI and stream its text output back as SSE.
 
@@ -249,6 +261,13 @@ async def stream_claude_cli_chat(
     and ``max_tokens`` are accepted for parity but only ``model`` is
     forwarded (``--model``) — the CLI manages its own token budget via
     the user's plan.
+
+    Multi-turn (v0.4.1): when ``resume_session_id`` is provided we
+    insert ``--resume <id>`` into the argv so the CLI rejoins an
+    existing conversation. When ``on_session_id`` is provided we scan
+    the streamed output for a ``Session ID: <uuid>`` marker and call
+    the callback once with the captured id, so the server can persist
+    it for the next turn.
 
     Emits one ``data: {"delta": "..."}`` line per stdout chunk and
     terminates with ``data: [DONE]``. Errors surface as a single
@@ -268,7 +287,10 @@ async def stream_claude_cli_chat(
     # Only pass the last user message - no system prompt for CLI to stay under Windows 8191 char limit
     last_user = next((m["content"] for m in reversed(messages) if m.get("role") == "user"), "hello")
     safe_prompt = last_user[:2000]
-    cmd = list(argv) + [safe_prompt]
+    cmd = list(argv)
+    if resume_session_id:
+        cmd += ["--resume", resume_session_id]
+    cmd += [safe_prompt]
     # Always append output format flags
     cmd += ["--output-format", "text"]
     if model:
@@ -296,6 +318,8 @@ async def stream_claude_cli_chat(
         return
 
     assert proc.stdout is not None
+    captured_id = False
+    tail_buffer = ""  # last ~2 KB of stdout, scanned for the Session ID line
     try:
         # Read stdout in moderate chunks rather than line-by-line so a
         # word that crosses a chunk boundary still streams promptly.
@@ -306,6 +330,18 @@ async def stream_claude_cli_chat(
             text = chunk.decode("utf-8", errors="replace")
             if not text:
                 continue
+            # Look for the Session ID marker exactly once. Keeping a
+            # rolling tail buffer means the regex still matches if the
+            # marker is split across two chunks.
+            if not captured_id and on_session_id is not None:
+                tail_buffer = (tail_buffer + text)[-2048:]
+                match = _SESSION_ID_RE.search(tail_buffer)
+                if match:
+                    captured_id = True
+                    try:
+                        await on_session_id(match.group(1))
+                    except Exception:  # noqa: BLE001 — never fail the stream
+                        pass
             payload = json.dumps({"delta": text})
             yield f"data: {payload}\n\n".encode("utf-8")
     except Exception as exc:  # noqa: BLE001 — surface read errors
@@ -321,6 +357,17 @@ async def stream_claude_cli_chat(
             stderr_bytes = await proc.stderr.read()
         except Exception:  # noqa: BLE001
             stderr_bytes = b""
+    # Some CLI versions emit the session-id line to stderr instead of
+    # stdout. Scan it too before declaring the capture done.
+    if not captured_id and on_session_id is not None and stderr_bytes:
+        match = _SESSION_ID_RE.search(
+            stderr_bytes.decode("utf-8", errors="replace")
+        )
+        if match:
+            try:
+                await on_session_id(match.group(1))
+            except Exception:  # noqa: BLE001
+                pass
     rc = await proc.wait()
     if rc != 0:
         msg = (

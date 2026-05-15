@@ -452,15 +452,25 @@ async def dashboard_chat(body: ChatRequest, request: Request):
     # Persist the user's message and ensure a chat session exists.
     if messages and messages[-1].get("role") == "user":
         await db_module.save_chat_message(db, project_id, "user", messages[-1]["content"])
-    await db_module.get_or_create_chat_session(db, project_id)
+    chat_session = await db_module.get_or_create_chat_session(db, project_id)
 
     # Select the streaming backend.
     if body.mode == "cli":
+        # v0.4.1 — if the CLI session id is known from a previous turn
+        # pass it as --resume so the conversation continues; capture
+        # whatever id the CLI emits on this turn for the next one.
+        resume_id = chat_session.get("cli_session_id") if chat_session else None
+
+        async def _save_session_id(new_id: str) -> None:
+            await db_module.update_chat_session_cli_id(db, project_id, new_id)
+
         raw_stream = dashboard_module.stream_claude_cli_chat(
             messages=messages,
             system_prompt=body.system_prompt,
             model=body.model,
             max_tokens=body.max_tokens,
+            resume_session_id=resume_id,
+            on_session_id=_save_session_id,
         )
     else:
         raw_stream = dashboard_module.stream_anthropic_chat(

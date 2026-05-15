@@ -514,7 +514,7 @@ def test_dashboard_chat_streams_sse_api_mode(client, monkeypatch):
     """API mode dispatches to the Anthropic SDK proxy. We stub the
     generator so the test doesn't need a real Anthropic key.
     """
-    async def fake_stream(messages, system_prompt, model, max_tokens):
+    async def fake_stream(messages, system_prompt, model, max_tokens, **_kwargs):
         yield b'data: {"delta": "hello "}\n\n'
         yield b'data: {"delta": "world"}\n\n'
         yield b"data: [DONE]\n\n"
@@ -548,12 +548,12 @@ def test_dashboard_chat_defaults_to_cli_mode(client, monkeypatch):
     cli_calls: list[str] = []
     api_calls: list[str] = []
 
-    async def fake_cli(messages, system_prompt, model, max_tokens):
+    async def fake_cli(messages, system_prompt, model, max_tokens, **_kwargs):
         cli_calls.append("called")
         yield b'data: {"delta": "via cli"}\n\n'
         yield b"data: [DONE]\n\n"
 
-    async def fake_api(messages, system_prompt, model, max_tokens):
+    async def fake_api(messages, system_prompt, model, max_tokens, **_kwargs):
         api_calls.append("called")
         yield b'data: {"delta": "via api"}\n\n'
         yield b"data: [DONE]\n\n"
@@ -901,7 +901,7 @@ def test_chat_history_endpoint_empty(client):
 
 def test_chat_history_endpoint_returns_messages(client, monkeypatch):
     """After a chat round-trip the history endpoint reflects saved messages."""
-    async def fake_cli(messages, system_prompt, model, max_tokens):
+    async def fake_cli(messages, system_prompt, model, max_tokens, **_kwargs):
         yield b'data: {"delta": "hi there"}\n\n'
         yield b"data: [DONE]\n\n"
 
@@ -1356,3 +1356,102 @@ def test_get_projects_returns_list_with_creator(client):
     by_name = {p["name"]: p for p in r.json()}
     assert by_name["alpha"]["creator_human_id"] == "adam"
     assert by_name["beta"]["creator_human_id"] is None
+
+
+# ---------------------------------------------------------------------------
+# v0.4.1 — --resume for true multi-turn CLI chat
+# ---------------------------------------------------------------------------
+
+
+def test_cli_streamer_passes_resume_flag_when_id_given(monkeypatch):
+    """When ``resume_session_id`` is set the streamer must spawn the
+    worker with ``--resume <id>`` ahead of the prompt. We swap the
+    worker for a Python stub that dumps its argv and we assert against
+    that."""
+    monkeypatch.setenv(
+        "MERIDIAN_CLAUDE_CLI",
+        f'"{sys.executable}" -c "import sys; print(sys.argv)"',
+    )
+
+    async def run() -> str:
+        chunks: list[bytes] = []
+        async for chunk in dashboard_module.stream_claude_cli_chat(
+            messages=[{"role": "user", "content": "hi"}],
+            system_prompt=None,
+            model="claude-sonnet-4-6",
+            max_tokens=4096,
+            resume_session_id="abc-123-resume-uuid",
+        ):
+            chunks.append(chunk)
+        return b"".join(chunks).decode("utf-8")
+
+    body = asyncio.run(run())
+    assert "--resume" in body
+    assert "abc-123-resume-uuid" in body
+
+
+def test_cli_streamer_captures_session_id_into_callback(monkeypatch):
+    """When the worker emits ``Session ID: <uuid>`` the streamer must
+    pass that uuid to ``on_session_id`` exactly once. Sub-second
+    capture is the whole point of the v0.4.1 plumbing."""
+    monkeypatch.setenv(
+        "MERIDIAN_CLAUDE_CLI",
+        f'"{sys.executable}" -c "import sys; sys.stdout.write(\'Session ID: ' \
+        f'abcdef01-2345-6789-abcd-ef0123456789\nhello\n\')"',
+    )
+
+    captured: list[str] = []
+
+    async def on_id(new_id: str) -> None:
+        captured.append(new_id)
+
+    async def run() -> None:
+        async for _ in dashboard_module.stream_claude_cli_chat(
+            messages=[{"role": "user", "content": "hi"}],
+            system_prompt=None,
+            model="claude-sonnet-4-6",
+            max_tokens=4096,
+            on_session_id=on_id,
+        ):
+            pass
+
+    asyncio.run(run())
+    assert captured == ["abcdef01-2345-6789-abcd-ef0123456789"]
+
+
+def test_cli_streamer_gracefully_no_ops_when_no_session_id_present(monkeypatch):
+    """If the CLI output never contains the marker the callback must
+    not fire. Otherwise older CLI versions would crash with bad data."""
+    monkeypatch.setenv(
+        "MERIDIAN_CLAUDE_CLI",
+        f'"{sys.executable}" -c "import sys; sys.stdout.write(\'just chat\')"',
+    )
+
+    captured: list[str] = []
+
+    async def on_id(new_id: str) -> None:
+        captured.append(new_id)
+
+    async def run() -> None:
+        async for _ in dashboard_module.stream_claude_cli_chat(
+            messages=[{"role": "user", "content": "hi"}],
+            system_prompt=None,
+            model="claude-sonnet-4-6",
+            max_tokens=4096,
+            on_session_id=on_id,
+        ):
+            pass
+
+    asyncio.run(run())
+    assert captured == []
+
+
+@pytest.mark.asyncio
+async def test_update_chat_session_cli_id_persists(db):
+    """The helper writes the captured CLI session uuid into the
+    chat_sessions row so the next /dashboard/chat call can ``--resume``."""
+    p = await db_module.create_project(db, "alpha")
+    await db_module.get_or_create_chat_session(db, p["id"])
+    await db_module.update_chat_session_cli_id(db, p["id"], "uuid-1")
+    fresh = await db_module.get_or_create_chat_session(db, p["id"])
+    assert fresh["cli_session_id"] == "uuid-1"
