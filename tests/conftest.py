@@ -35,6 +35,9 @@ def client(tmp_path, monkeypatch):
     """FastAPI TestClient backed by an in-memory DB and a temp data dir."""
     monkeypatch.setenv("MERIDIAN_DB", ":memory:")
     monkeypatch.setenv("MERIDIAN_DATA_DIR", str(tmp_path))
+    # v0.6.3 — redirect GOAL.md into the same temp dir so test
+    # writebacks don't touch the repo's real file.
+    monkeypatch.setenv("MERIDIAN_GOAL_MD", str(tmp_path / "GOAL.md"))
 
     # Import after env vars are set so the module sees them.
     from fastapi.testclient import TestClient

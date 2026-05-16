@@ -25,6 +25,7 @@ from fastapi.responses import HTMLResponse, StreamingResponse
 
 from . import dashboard as dashboard_module
 from . import db as db_module
+from . import goal_md as goal_md_module
 from . import enqueue as enqueue_module
 from . import handoff as handoff_module
 from .models import (
@@ -110,12 +111,30 @@ async def lifespan(app: FastAPI):
 
     summary_task = asyncio.create_task(_auto_summary_loop())
     app.state.auto_summary_task = summary_task
+
+    # v0.6.3 — GOAL.md startup sync: if the file exists and names a known
+    # project, pull its contents into the DB before serving any requests.
+    if db_path != ":memory:":
+        try:
+            await goal_md_module.sync_goal_md_to_db(db)
+        except Exception:  # noqa: BLE001
+            pass
+
+    # v0.6.3 — optional live file-watch (no-op when watchfiles not installed).
+    watch_task = asyncio.create_task(goal_md_module.watch_goal_md(db))
+    app.state.watch_task = watch_task
+
     try:
         yield
     finally:
         summary_task.cancel()
+        watch_task.cancel()
         try:
             await summary_task
+        except (asyncio.CancelledError, Exception):  # noqa: BLE001
+            pass
+        try:
+            await watch_task
         except (asyncio.CancelledError, Exception):  # noqa: BLE001
             pass
         await db.close()
@@ -330,9 +349,11 @@ async def set_north_star(
             },
         )
     try:
-        return await db_module.set_north_star(
+        result = await db_module.set_north_star(
             _db(request), project_id, body.north_star
         )
+        await goal_md_module.sync_db_to_goal_md(_db(request), project_id)
+        return result
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
 
@@ -350,9 +371,11 @@ async def set_sprint(
     if project is None:
         raise HTTPException(status_code=404, detail="project not found")
     try:
-        return await db_module.set_sprint(
+        result = await db_module.set_sprint(
             _db(request), project_id, body.sprint
         )
+        await goal_md_module.sync_db_to_goal_md(_db(request), project_id)
+        return result
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
 
@@ -1357,12 +1380,18 @@ def build_mcp_server():
                         result = await db_module.set_north_star(
                             db, arguments["project_id"], arguments["north_star"]
                         )
+                        await goal_md_module.sync_db_to_goal_md(
+                            db, arguments["project_id"]
+                        )
                     except ValueError as exc:
                         result = {"error": str(exc)}
             elif name == "set_sprint":
                 try:
                     result = await db_module.set_sprint(
                         db, arguments["project_id"], arguments["sprint"]
+                    )
+                    await goal_md_module.sync_db_to_goal_md(
+                        db, arguments["project_id"]
                     )
                 except ValueError as exc:
                     result = {"error": str(exc)}

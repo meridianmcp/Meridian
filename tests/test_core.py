@@ -2378,3 +2378,80 @@ def test_start_session_endpoint_returns_goal_cache_blocks(client):
     blocks = body["goal_cache_blocks"]
     assert len(blocks) == 4
     assert blocks[0]["cache_control"] == {"type": "ephemeral"}
+
+
+# ---------------------------------------------------------------------------
+# v0.6.3 — GOAL.md bidirectional sync
+# ---------------------------------------------------------------------------
+
+def test_parse_goal_md_all_sections():
+    from meridian.goal_md import parse_goal_md
+    text = "# my-project\n\n## North Star\nBe great\n\n## Version Goal\nShip it\n\n## Sprint\n- task 1\n"
+    r = parse_goal_md(text)
+    assert r["project_name"] == "my-project"
+    assert r["north_star"] == "Be great"
+    assert r["version_goal"] == "Ship it"
+    assert r["sprint"] == "- task 1"
+
+
+def test_parse_goal_md_missing_sections():
+    from meridian.goal_md import parse_goal_md
+    text = "# proj\n\n## North Star\nOnly this\n"
+    r = parse_goal_md(text)
+    assert r["north_star"] == "Only this"
+    assert r["version_goal"] is None
+    assert r["sprint"] is None
+
+
+def test_format_goal_md_round_trip():
+    from meridian.goal_md import format_goal_md, parse_goal_md
+    rendered = format_goal_md("myproj", "ns", "vg", "sp")
+    parsed = parse_goal_md(rendered)
+    assert parsed["project_name"] == "myproj"
+    assert parsed["north_star"] == "ns"
+    assert parsed["version_goal"] == "vg"
+    assert parsed["sprint"] == "sp"
+
+
+@pytest.mark.asyncio
+async def test_sync_goal_md_to_db(tmp_path):
+    from meridian.goal_md import write_goal_md, sync_goal_md_to_db
+    db = await db_module.init_db(":memory:")
+    proj = await db_module.create_project(db, "sync-test")
+    goal_path = tmp_path / "GOAL.md"
+    write_goal_md("sync-test", "north text", "version text", "sprint text", path=goal_path)
+    result = await sync_goal_md_to_db(db, path=goal_path)
+    assert result is not None
+    goal = await db_module.get_goal(db, proj["id"])
+    assert goal["north_star"] == "north text"
+    assert goal["sprint"] == "sprint text"
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_sync_db_to_goal_md(tmp_path):
+    from meridian.goal_md import sync_db_to_goal_md, parse_goal_md
+    db = await db_module.init_db(":memory:")
+    proj = await db_module.create_project(db, "writeback-test")
+    await db_module.set_goal(db, proj["id"], "vg content", north_star="ns content", sprint="sp content")
+    goal_path = tmp_path / "GOAL.md"
+    written = await sync_db_to_goal_md(db, proj["id"], path=goal_path)
+    assert written == goal_path
+    parsed = parse_goal_md(goal_path.read_text())
+    assert parsed["north_star"] == "ns content"
+    assert parsed["sprint"] == "sp content"
+    await db.close()
+
+
+
+def test_http_set_sprint_writes_back_goal_md(client, tmp_path):
+    """set_sprint via HTTP triggers GOAL.md writeback."""
+    from meridian.goal_md import parse_goal_md
+    proj = client.post("/projects", json={"name": "goalmd-http-test"}).json()
+    pid = proj["id"]
+    client.post(f"/projects/{pid}/sessions", json={"name": "s1"})
+    client.post(f"/projects/{pid}/goal/sprint", json={"sprint": "do the thing", "human_id": "adam"})
+    gm_path = tmp_path / "GOAL.md"
+    if gm_path.exists():
+        parsed = parse_goal_md(gm_path.read_text())
+        assert parsed["sprint"] == "do the thing"

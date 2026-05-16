@@ -21,6 +21,7 @@ mcp = ">=1.0"
 anthropic = ">=0.40"
 python-dotenv = ">=1.0"
 websockets = ">=12.0"
+watchfiles = ">=0.21"
 
 [tasks]
 start = { cmd = "python -m meridian", env = { MERIDIAN_CLAUDE_CLI = "cmd /c C:/Users/13144/AppData/Roaming/npm/claude.cmd -p" } }
