@@ -206,6 +206,13 @@ async def create_project(
     )
 
 
+@app.get("/setup/needed")
+async def setup_needed(request: Request) -> dict[str, Any]:
+    """Returns {needed: true} if no projects exist yet (first-run wizard trigger)."""
+    projects = await db_module.list_projects(_db(request))
+    return {"needed": len(projects) == 0}
+
+
 @app.get("/projects/by-name/{name}")
 async def get_project_by_name(name: str, request: Request) -> dict[str, Any]:
     """Look up a project by name (case-insensitive substring match).

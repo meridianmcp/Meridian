@@ -2493,3 +2493,36 @@ def test_http_set_goal_writes_back_goal_md(client, tmp_path):
     goal_md = tmp_path / "GOAL.md"
     assert goal_md.exists()
     assert "ship it" in goal_md.read_text(encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
+# v0.6.6 — First-run wizard + /setup/needed endpoint
+# ---------------------------------------------------------------------------
+
+
+def test_setup_needed_true_when_no_projects(client):
+    """GET /setup/needed returns needed=True when DB has no projects."""
+    r = client.get("/setup/needed")
+    assert r.status_code == 200
+    assert r.json()["needed"] is True
+
+
+def test_setup_needed_false_when_projects_exist(client):
+    """GET /setup/needed returns needed=False once a project exists."""
+    client.post("/projects", json={"name": "demo"})
+    r = client.get("/setup/needed")
+    assert r.status_code == 200
+    assert r.json()["needed"] is False
+
+
+def test_dashboard_html_has_setup_wizard(client):
+    """Dashboard HTML contains the setup wizard element."""
+    r = client.get("/dashboard")
+    assert "ez-wizard" in r.text
+    assert "ez-create-btn" in r.text
+
+
+def test_dashboard_html_has_project_switcher(client):
+    """Dashboard HTML contains the project switcher dropdown."""
+    r = client.get("/dashboard")
+    assert "project-switcher" in r.text
