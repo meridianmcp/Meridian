@@ -19,13 +19,20 @@ handoff files so new sessions resume with full context instantly.
 source of truth. Any session — Desktop, Code, terminal, or browser tab —
 hydrates from Meridian on connect. No manual context pasting.
 
-## Current version: v0.1.1
+## Current version: v1.0.0 (166 tests passing)
 
-- 9 MCP tools: `create_project`, `register_session`, `get_goal`, `set_goal`,
-  `log_task`, `get_tasks`, `get_sessions`, `generate_handoff`, `enqueue_claude_task`
+- MCP tools: `create_project`, `register_session`, `get_goal`, `set_goal`,
+  `set_north_star`, `set_sprint`, `log_task`, `get_tasks`, `get_sessions`,
+  `generate_handoff`, `enqueue_claude_task`, `claim_task`, `release_task`,
+  `list_projects`, `get_project_by_name`, `start_session`
 - FastAPI HTTP server on port 7878
-- SQLite at `./data/meridian.db`
-- 25 tests passing
+- SQLite at `~/.meridian/meridian.db`
+- XML-tagged goal output with prompt caching hints
+- GOAL.md bidirectional file sync
+- First-run setup wizard, project switcher
+- IP attribution PDF export (SHA-256 tamper-evident)
+- PyInstaller single-file exe (run `pixi run build-exe`)
+- License: MSL-2.0 (free for individual use, paid for team/shared use)
 
 ## Quick start
 
