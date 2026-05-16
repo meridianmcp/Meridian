@@ -171,6 +171,35 @@ async def create_project(
     )
 
 
+@app.get("/projects/by-name/{name}")
+async def get_project_by_name(name: str, request: Request) -> dict[str, Any]:
+    """Look up a project by name (case-insensitive substring match).
+
+    Returns the project row plus a brief goal summary so a cold session
+    can confirm it found the right project without a second round-trip.
+    """
+    db = _db(request)
+    # Exact match first (most common case).
+    project = await db_module.get_project_by_name(db, name)
+    if project is None:
+        # Case-insensitive substring fallback.
+        all_projects = await db_module.list_projects(db)
+        lower = name.lower()
+        matches = [p for p in all_projects if lower in p["name"].lower()]
+        if matches:
+            project = matches[0]
+    if project is None:
+        raise HTTPException(
+            status_code=404, detail=f"no project found matching '{name}'"
+        )
+    goal = await db_module.get_goal(db, project["id"])
+    return {
+        "project": project,
+        "goal_version": goal["version"] if goal else None,
+        "goal_summary": (str(goal["content"])[:200] if goal else None),
+    }
+
+
 @app.get("/projects/{project_id}", response_model=Project)
 async def get_project(project_id: str, request: Request) -> dict[str, Any]:
     """Look up a project by id."""
@@ -1170,6 +1199,40 @@ def build_mcp_server():
                     "required": ["project_id", "session_name"],
                 },
             ),
+            Tool(
+                name="list_projects",
+                description=(
+                    "List all Meridian projects with their names and ids. "
+                    "No parameters required. Use this when you don't know "
+                    "the project_id — find the project by name, then pass "
+                    "its id to register_session or start_session. Returns "
+                    "[{id, name, created_at}] newest first."
+                ),
+                inputSchema={"type": "object", "properties": {}},
+            ),
+            Tool(
+                name="get_project_by_name",
+                description=(
+                    "Look up a project by name (case-insensitive, substring "
+                    "match). Returns the project id plus a brief goal "
+                    "summary. Use this for cold starts when you know the "
+                    "project name but not the UUID: call this first, then "
+                    "pass the returned id to start_session."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "name": {
+                            "type": "string",
+                            "description": (
+                                "Full or partial project name — "
+                                "case-insensitive substring match."
+                            ),
+                        }
+                    },
+                    "required": ["name"],
+                },
+            ),
         ]
 
     @server.call_tool()
@@ -1338,6 +1401,32 @@ def build_mcp_server():
                     state["data_dir"],
                     human_id=arguments.get("human_id"),
                 )
+            elif name == "list_projects":
+                result = await db_module.list_projects(db)
+            elif name == "get_project_by_name":
+                name_arg = arguments["name"]
+                project = await db_module.get_project_by_name(db, name_arg)
+                if project is None:
+                    all_projects = await db_module.list_projects(db)
+                    lower = name_arg.lower()
+                    matches = [
+                        p for p in all_projects
+                        if lower in p["name"].lower()
+                    ]
+                    project = matches[0] if matches else None
+                if project is None:
+                    result = {
+                        "error": f"no project found matching '{name_arg}'"
+                    }
+                else:
+                    goal = await db_module.get_goal(db, project["id"])
+                    result = {
+                        "project": project,
+                        "goal_version": goal["version"] if goal else None,
+                        "goal_summary": (
+                            str(goal["content"])[:200] if goal else None
+                        ),
+                    }
             else:
                 result = {"error": f"unknown tool: {name}"}
         except Exception as exc:  # noqa: BLE001 — surface to MCP client

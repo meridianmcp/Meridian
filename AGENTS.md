@@ -13,6 +13,15 @@ handoff generation.
 
 Every Claude Code session MUST follow this sequence in order:
 
+### Step 0 — If you don't know the project_id
+```python
+list_projects()                        # see all projects with names + ids
+# or
+get_project_by_name("meridian-build")  # fuzzy match → returns id + goal summary
+```
+The UUID is `5787cc92-ba7d-4788-b17c-28ab7938b839` but you never need to
+memorise it — look it up by name when in doubt.
+
 ### Step 1 — Read the handoff file if it exists
 ```
 read: data/meridian-build_handoff.md
@@ -97,11 +106,16 @@ pixi run test    # run all tests (must be green before committing)
 
 | Tool | When to call |
 |------|-------------|
-| `register_session` | First thing, every session |
+| `list_projects` | When you don't know the project_id — lists all projects |
+| `get_project_by_name` | Cold start by name — returns id + goal summary |
+| `start_session` | Cold start shortcut — replaces steps 2-5 in one call |
+| `register_session` | First thing, every session (or use start_session) |
 | `get_goal` | After registering, and whenever you need the directive |
 | `get_tasks` | After registering, to see recent work |
 | `log_task` | Frequently — after every significant action |
 | `set_goal` | Only on deliberate milestones, only if you're the project owner |
+| `set_north_star` | Rarely — only the project owner, only on major pivots |
+| `set_sprint` | Per-session or per-week focus update |
 | `claim_task` | Before starting a task — prevents duplicate work |
 | `release_task` | If you can't finish a claimed task |
 | `generate_handoff` | Before ending any session |
@@ -112,7 +126,7 @@ pixi run test    # run all tests (must be green before committing)
 ```
 PROJECT ID: 5787cc92-ba7d-4788-b17c-28ab7938b839
 START CMD:  pixi run start
-TESTS:      pixi run test (66+ must pass)
+TESTS:      pixi run test (138+ must pass)
 REPO:       C:\Users\13144\Documents\Meridian\repository
 ```
 

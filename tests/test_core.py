@@ -2123,3 +2123,70 @@ def test_start_session_handoff_exists_reflects_disk_reality(client, tmp_path):
     )
     assert r2.status_code == 200
     assert r2.json()["handoff_exists"] is True
+
+
+# ---------------------------------------------------------------------------
+# v0.4.6 — list_projects + get_project_by_name MCP tools
+# ---------------------------------------------------------------------------
+
+
+def test_list_projects_returns_all(client):
+    """GET /projects returns every project that was created."""
+    client.post("/projects", json={"name": "proj-one"})
+    client.post("/projects", json={"name": "proj-two"})
+    r = client.get("/projects")
+    assert r.status_code == 200
+    names = {p["name"] for p in r.json()}
+    assert "proj-one" in names
+    assert "proj-two" in names
+
+
+def test_list_projects_empty(client):
+    """GET /projects returns an empty list when no projects exist."""
+    r = client.get("/projects")
+    assert r.status_code == 200
+    assert r.json() == []
+
+
+def test_get_project_by_name_exact(client):
+    """GET /projects/by-name/{name} resolves an exact match."""
+    proj = client.post("/projects", json={"name": "exact-match"}).json()
+    client.post(f"/projects/{proj['id']}/goal", json={"content": "ship it"})
+    r = client.get("/projects/by-name/exact-match")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["project"]["id"] == proj["id"]
+    assert body["goal_version"] == 1
+    assert "ship it" in body["goal_summary"]
+
+
+def test_get_project_by_name_case_insensitive(client):
+    """GET /projects/by-name/{name} matches regardless of case."""
+    proj = client.post("/projects", json={"name": "meridian-build"}).json()
+    r = client.get("/projects/by-name/MERIDIAN-BUILD")
+    assert r.status_code == 200
+    assert r.json()["project"]["id"] == proj["id"]
+
+
+def test_get_project_by_name_substring(client):
+    """GET /projects/by-name/{name} matches on a substring."""
+    proj = client.post("/projects", json={"name": "my-cool-project"}).json()
+    r = client.get("/projects/by-name/cool")
+    assert r.status_code == 200
+    assert r.json()["project"]["id"] == proj["id"]
+
+
+def test_get_project_by_name_no_goal(client):
+    """goal_version and goal_summary are None when no goal has been set."""
+    client.post("/projects", json={"name": "goalless"})
+    r = client.get("/projects/by-name/goalless")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["goal_version"] is None
+    assert body["goal_summary"] is None
+
+
+def test_get_project_by_name_not_found(client):
+    """GET /projects/by-name/{name} returns 404 for an unknown name."""
+    r = client.get("/projects/by-name/does-not-exist")
+    assert r.status_code == 404
