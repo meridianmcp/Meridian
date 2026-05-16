@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import os
 import sys
 
 
@@ -38,10 +39,15 @@ def main(argv: list[str] | None = None) -> int:
         help="Run the MCP server over stdio (for Claude Desktop / Code).",
     )
     parser.add_argument(
-        "--host", default="127.0.0.1", help="HTTP bind host (default 127.0.0.1)."
+        "--host",
+        default=os.environ.get("MERIDIAN_HOST", "127.0.0.1"),
+        help="HTTP bind host (default 127.0.0.1, override with MERIDIAN_HOST).",
     )
     parser.add_argument(
-        "--port", type=int, default=7878, help="HTTP port (default 7878)."
+        "--port",
+        type=int,
+        default=int(os.environ.get("MERIDIAN_PORT", "7878")),
+        help="HTTP port (default 7878, override with MERIDIAN_PORT).",
     )
     args = parser.parse_args(argv)
 

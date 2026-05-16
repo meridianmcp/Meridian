@@ -169,6 +169,22 @@ async def health() -> dict[str, str]:
     return {"status": "ok", "service": "meridian"}
 
 
+@app.get("/config")
+async def server_config() -> dict[str, Any]:
+    """v0.6.5 — expose runtime configuration to the dashboard.
+
+    Allows the frontend to be location-agnostic: it reads the server URL
+    from this endpoint rather than hardcoding localhost. Also used by the
+    PyInstaller exe launcher to confirm the server is up.
+    """
+    return {
+        "host": os.environ.get("MERIDIAN_HOST", "127.0.0.1"),
+        "port": int(os.environ.get("MERIDIAN_PORT", "7878")),
+        "version": "0.6.5",
+        "db": "memory" if os.environ.get("MERIDIAN_DB") == ":memory:" else "sqlite",
+    }
+
+
 @app.get("/projects", response_model=list[Project])
 async def list_projects(request: Request) -> list[dict[str, Any]]:
     """List every project."""

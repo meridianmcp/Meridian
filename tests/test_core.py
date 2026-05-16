@@ -2455,3 +2455,32 @@ def test_http_set_sprint_writes_back_goal_md(client, tmp_path):
     if gm_path.exists():
         parsed = parse_goal_md(gm_path.read_text())
         assert parsed["sprint"] == "do the thing"
+
+
+# ---------------------------------------------------------------------------
+# v0.6.5 — MERIDIAN_HOST / MERIDIAN_PORT env vars + /config endpoint
+# ---------------------------------------------------------------------------
+
+def test_config_endpoint_returns_version(client):
+    r = client.get("/config")
+    assert r.status_code == 200
+    data = r.json()
+    assert "version" in data
+    assert "port" in data
+    assert data["db"] == "memory"
+
+
+def test_config_endpoint_reflects_env(monkeypatch, tmp_path):
+    monkeypatch.setenv("MERIDIAN_DB", ":memory:")
+    monkeypatch.setenv("MERIDIAN_HOST", "0.0.0.0")
+    monkeypatch.setenv("MERIDIAN_PORT", "9999")
+    monkeypatch.setenv("MERIDIAN_DATA_DIR", str(tmp_path))
+    import importlib, meridian.server as srv
+    srv = importlib.reload(srv)
+    from fastapi.testclient import TestClient
+    with TestClient(srv.app) as c:
+        r = c.get("/config")
+        assert r.status_code == 200
+        data = r.json()
+        assert data["host"] == "0.0.0.0"
+        assert data["port"] == 9999
