@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sys
 
 import pytest
@@ -2561,3 +2562,42 @@ def test_export_pdf_404_unknown_project(client):
     """GET /projects/bad-id/export/pdf returns 404."""
     r = client.get("/projects/doesnotexist/export/pdf")
     assert r.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# v1.0.0 — PyInstaller entry point
+# ---------------------------------------------------------------------------
+
+
+def test_main_entry_imports_without_error():
+    """__main__entry.py can be imported without raising."""
+    import importlib
+    mod = importlib.import_module("meridian.__main__entry")
+    assert hasattr(mod, "main")
+    assert hasattr(mod, "_set_frozen_defaults")
+
+
+def test_frozen_db_path_resolves_to_home():
+    """When sys.frozen is set, DB path defaults to ~/.meridian."""
+    from pathlib import Path
+    from meridian.__main__entry import _set_frozen_defaults
+
+    original = getattr(sys, "frozen", None)
+    original_db = os.environ.pop("MERIDIAN_DB", None)
+    try:
+        sys.frozen = True
+        _set_frozen_defaults()
+        expected = str(Path.home() / ".meridian" / "meridian.db")
+        assert os.environ.get("MERIDIAN_DB") == expected
+    finally:
+        if original is not None:
+            sys.frozen = original
+        else:
+            try:
+                del sys.frozen
+            except AttributeError:
+                pass
+        if original_db is not None:
+            os.environ["MERIDIAN_DB"] = original_db
+        elif "MERIDIAN_DB" in os.environ:
+            del os.environ["MERIDIAN_DB"]
