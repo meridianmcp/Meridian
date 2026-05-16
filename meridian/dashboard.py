@@ -1630,6 +1630,11 @@ async function restoreTabs() {
 (async function init() {
   await loadConfig();
   await loadProjects();
+  // v0.6.6 — EZ first-run wizard: if no projects exist, show the overlay
+  if (state.projects.length === 0) {
+    document.getElementById('ez-wizard').style.display = 'flex';
+    return; // don't restore tabs until wizard completes
+  }
   await restoreTabs();
   // Periodic session refresh on the active tab — sessions don't generate
   // pub/sub events so polling fills that gap.
@@ -1637,6 +1642,58 @@ async function restoreTabs() {
     if (state.activeTab) refreshSessions(state.activeTab);
   }, 10000);
 })();
+</script>
+
+<!-- v0.6.6 EZ first-run wizard -->
+<div id="ez-wizard" style="display:none;position:fixed;inset:0;background:var(--bg);z-index:9999;flex-direction:column;align-items:center;justify-content:center;gap:16px;padding:40px">
+  <div style="font-size:28px;font-weight:700;color:var(--accent);font-family:'IBM Plex Mono',monospace;letter-spacing:0.05em">MERIDIAN</div>
+  <div style="color:var(--muted);font-size:13px;font-family:'IBM Plex Mono',monospace;text-align:center;max-width:400px">coordinate your AI agents across sessions, humans, and time.</div>
+  <div style="background:var(--surface-2);border:1px solid var(--border);border-radius:8px;padding:28px 32px;display:flex;flex-direction:column;gap:14px;width:100%;max-width:400px">
+    <div style="font-size:11px;color:var(--muted);font-family:'IBM Plex Mono',monospace;letter-spacing:0.08em;text-transform:uppercase">create your first project</div>
+    <input id="ez-project-name" type="text" placeholder="project name (e.g. my-app)"
+      style="background:var(--surface-1);border:1px solid var(--border);border-radius:4px;padding:10px 12px;color:var(--text);font-family:'IBM Plex Mono',monospace;font-size:13px;outline:none;width:100%;box-sizing:border-box">
+    <input id="ez-human-name" type="text" placeholder="your name (optional)"
+      style="background:var(--surface-1);border:1px solid var(--border);border-radius:4px;padding:10px 12px;color:var(--text);font-family:'IBM Plex Mono',monospace;font-size:13px;outline:none;width:100%;box-sizing:border-box">
+    <button id="ez-create-btn" class="primary" style="padding:12px;font-size:13px;margin-top:4px">Create Project →</button>
+    <div id="ez-error" style="color:var(--status-failed);font-size:11px;font-family:'IBM Plex Mono',monospace;display:none"></div>
+  </div>
+  <div style="font-size:10px;color:var(--muted);font-family:'IBM Plex Mono',monospace">
+    <a href="#" id="ez-advanced-link" style="color:var(--muted);text-decoration:underline">advanced setup ↗</a>
+  </div>
+</div>
+
+<script>
+// v0.6.6 — EZ wizard logic
+document.getElementById('ez-create-btn').onclick = async () => {
+  const nameEl = document.getElementById('ez-project-name');
+  const humanEl = document.getElementById('ez-human-name');
+  const errEl = document.getElementById('ez-error');
+  const name = nameEl.value.trim();
+  if (!name) { errEl.textContent = 'project name is required'; errEl.style.display = 'block'; return; }
+  errEl.style.display = 'none';
+  try {
+    const body = { name };
+    if (humanEl.value.trim()) body.human_id = humanEl.value.trim();
+    const p = await api('/projects', { method: 'POST', body: JSON.stringify(body) });
+    document.getElementById('ez-wizard').style.display = 'none';
+    await loadProjects();
+    await restoreTabs();
+    openTab(p);
+    setInterval(() => { if (state.activeTab) refreshSessions(state.activeTab); }, 10000);
+  } catch(e) { errEl.textContent = 'create failed: ' + e.message; errEl.style.display = 'block'; }
+};
+document.getElementById('ez-project-name').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') document.getElementById('ez-create-btn').click();
+});
+document.getElementById('ez-advanced-link').onclick = (e) => {
+  e.preventDefault();
+  document.getElementById('ez-wizard').style.display = 'none';
+  // Show the sidebar new-project form and focus it
+  document.getElementById('new-project-name').focus();
+  restoreTabs().then(() => {
+    setInterval(() => { if (state.activeTab) refreshSessions(state.activeTab); }, 10000);
+  });
+};
 </script>
 </body>
 </html>
