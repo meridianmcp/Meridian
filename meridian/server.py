@@ -651,7 +651,7 @@ async def export_project_pdf(project_id: str, request: Request):
     lines = [
         f"MERIDIAN IP ATTRIBUTION RECORD",
         f"Project: {project['name']} ({project['id']})",
-        f"Generated: {__import__('datetime').datetime.utcnow().isoformat()}Z",
+        f"Generated: {__import__('datetime').datetime.now(__import__('datetime').timezone.utc).isoformat()}",
         "",
     ]
     if goal:
