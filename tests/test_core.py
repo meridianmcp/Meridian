@@ -2281,3 +2281,100 @@ def test_start_session_endpoint_returns_goal_xml(client):
     assert "goal_xml" in body
     assert '<goal version="1"' in body["goal_xml"]
     assert '<north_star cache="true">vision</north_star>' in body["goal_xml"]
+
+
+# ---------------------------------------------------------------------------
+# v0.6.2 — Prompt caching hints on static goal fields
+# ---------------------------------------------------------------------------
+
+
+def test_build_goal_cache_blocks_layout():
+    """Four blocks, in order: north_star → version_goal → sprint →
+    recent_tasks. The first two carry cache_control: ephemeral; the
+    last two don't, because they mutate every sprint / task."""
+    goal = {
+        "version": 2,
+        "content": "build v0.6",
+        "north_star": "ship Meridian",
+        "sprint": "v0.6 context layer",
+    }
+    recent = [
+        {"status": "done", "created_at": "2026-01-01 00:00", "description": "did A"},
+    ]
+    blocks = db_module.build_goal_cache_blocks(goal, "meridian", recent)
+    assert len(blocks) == 4
+    # All blocks are text-type Anthropic content blocks.
+    assert all(b["type"] == "text" for b in blocks)
+    # Static fields cached.
+    assert blocks[0]["cache_control"] == {"type": "ephemeral"}
+    assert blocks[1]["cache_control"] == {"type": "ephemeral"}
+    assert "ship Meridian" in blocks[0]["text"]
+    assert "build v0.6" in blocks[1]["text"]
+    # Dynamic fields *not* cached — absence of the key is the contract.
+    assert "cache_control" not in blocks[2]
+    assert "cache_control" not in blocks[3]
+    assert "v0.6 context layer" in blocks[2]["text"]
+    assert "did A" in blocks[3]["text"]
+
+
+def test_build_goal_cache_blocks_cache_blocks_come_first():
+    """Anthropic's prompt cache is prefix-keyed: cached blocks MUST
+    precede uncached ones, otherwise mutable text invalidates the
+    cache for every cold session."""
+    goal = {"version": 1, "content": "g", "north_star": "n", "sprint": "s"}
+    blocks = db_module.build_goal_cache_blocks(goal, "p", [])
+    seen_uncached = False
+    for b in blocks:
+        if "cache_control" not in b:
+            seen_uncached = True
+        else:
+            assert not seen_uncached, (
+                "cached blocks must lead so the prefix is stable"
+            )
+
+
+def test_build_goal_cache_blocks_handles_none_goal():
+    """An unset goal yields four empty blocks rather than zero — the
+    caller can still hand a uniform shape to Anthropic without
+    branching on goal existence."""
+    blocks = db_module.build_goal_cache_blocks(None, "fresh", [])
+    assert len(blocks) == 4
+    assert blocks[0]["cache_control"] == {"type": "ephemeral"}
+    assert blocks[3]["type"] == "text"
+
+
+def test_get_goal_endpoint_includes_cache_blocks(client):
+    """GET /projects/{id}/goal exposes the cache_blocks field next to
+    the JSON shape and XML envelope."""
+    project = client.post("/projects", json={"name": "alpha"}).json()
+    client.post(
+        f"/projects/{project['id']}/goal",
+        json={"content": "ship", "north_star": "vision", "sprint": "now"},
+    )
+    r = client.get(f"/projects/{project['id']}/goal")
+    blocks = r.json()["cache_blocks"]
+    assert isinstance(blocks, list)
+    assert len(blocks) == 4
+    assert blocks[0]["cache_control"] == {"type": "ephemeral"}
+    assert blocks[1]["cache_control"] == {"type": "ephemeral"}
+    assert "cache_control" not in blocks[2]
+    assert "cache_control" not in blocks[3]
+
+
+def test_start_session_endpoint_returns_goal_cache_blocks(client):
+    """start_session surfaces goal_cache_blocks at the top level so
+    cold sessions can splat it into messages.create() immediately."""
+    project = client.post("/projects", json={"name": "alpha"}).json()
+    client.post(
+        f"/projects/{project['id']}/goal",
+        json={"content": "ship", "north_star": "vision", "sprint": "now"},
+    )
+    r = client.post(
+        f"/projects/{project['id']}/start-session",
+        json={"session_name": "worker", "human_id": "adam"},
+    )
+    body = r.json()
+    assert "goal_cache_blocks" in body
+    blocks = body["goal_cache_blocks"]
+    assert len(blocks) == 4
+    assert blocks[0]["cache_control"] == {"type": "ephemeral"}

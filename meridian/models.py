@@ -133,6 +133,10 @@ class GoalState(BaseModel):
     # under one wire format so MCP consumers can hand the whole thing
     # to Claude as a single block with structured cache hints.
     xml: str | None = None
+    # v0.6.2 — Anthropic-API content blocks with cache_control on the
+    # static fields (north_star + version_goal). Caller passes these
+    # straight to messages.create() to get prompt caching.
+    cache_blocks: list[dict[str, Any]] | None = None
 
 
 class GoalModeSet(BaseModel):

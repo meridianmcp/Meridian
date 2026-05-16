@@ -416,6 +416,78 @@ def build_goal_xml(
     return "\n".join(out)
 
 
+def build_goal_cache_blocks(
+    goal: dict[str, Any] | None,
+    project_name: str,
+    recent_tasks: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    """Return goal text as Anthropic-API content blocks with cache hints.
+
+    Layout (v0.6.2): four ordered text blocks ready to splat into
+    ``messages[0].content`` or ``system`` on an Anthropic request.
+
+    ``cache_control: {"type": "ephemeral"}`` is attached to the two
+    blocks that change rarely:
+
+      1. north_star  — cached
+      2. version_goal — cached
+      3. sprint      — no cache marker (moves every sprint review)
+      4. recent_tasks — no cache marker (moves every task)
+
+    Putting the cached blocks first matters: Anthropic's cache key is
+    a prefix of the full prompt, so a hit requires the cached blocks
+    to lead. Anything mutable that appears before a cached block
+    invalidates the cache for every cold session.
+    """
+    if goal is None:
+        north_star = version_goal = sprint = ""
+        version = 0
+    else:
+        version = int(goal.get("version") or 0)
+        north_star = goal.get("north_star") or ""
+        content = goal.get("content")
+        if isinstance(content, str):
+            version_goal = content
+        elif content is None:
+            version_goal = ""
+        else:
+            version_goal = json.dumps(content, indent=2)
+        sprint = goal.get("sprint") or ""
+
+    header = (
+        f"# Meridian goal — project: {project_name} (v{version})\n\n"
+    )
+    blocks: list[dict[str, Any]] = [
+        {
+            "type": "text",
+            "text": f"{header}## North star\n{north_star}".rstrip(),
+            "cache_control": {"type": "ephemeral"},
+        },
+        {
+            "type": "text",
+            "text": f"## Version goal\n{version_goal}".rstrip(),
+            "cache_control": {"type": "ephemeral"},
+        },
+        {
+            "type": "text",
+            "text": f"## Sprint\n{sprint}".rstrip(),
+        },
+    ]
+    if recent_tasks:
+        task_lines = ["## Recent tasks (newest first)"]
+        for t in recent_tasks:
+            status = (t.get("status") or "").upper()
+            ts = t.get("created_at") or ""
+            desc = (t.get("description") or "").replace("\n", " ")
+            task_lines.append(f"- [{status}] {ts} — {desc}")
+        blocks.append({"type": "text", "text": "\n".join(task_lines)})
+    else:
+        blocks.append(
+            {"type": "text", "text": "## Recent tasks\n(no activity yet)"}
+        )
+    return blocks
+
+
 async def get_goal(
     db: aiosqlite.Connection, project_id: str
 ) -> dict[str, Any] | None:

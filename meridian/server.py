@@ -241,6 +241,12 @@ async def get_goal(project_id: str, request: Request) -> dict[str, Any]:
     goal["xml"] = db_module.build_goal_xml(
         goal, project["name"], goal["ambient_tasks"]
     )
+    # v0.6.2 — pre-built Anthropic content blocks with cache_control
+    # markers on the static fields. Callers can pass these straight
+    # into messages.create() to get prompt caching for free.
+    goal["cache_blocks"] = db_module.build_goal_cache_blocks(
+        goal, project["name"], goal["ambient_tasks"]
+    )
     return goal
 
 
@@ -847,13 +853,20 @@ async def _start_session_composite(
     # goal is None) so the contract is uniform.
     ambient_for_xml = goal.get("ambient_tasks") if goal else []
     goal_xml = db_module.build_goal_xml(goal, project_name, ambient_for_xml)
+    # v0.6.2 — Anthropic-API content blocks with cache_control on
+    # the two static fields. Same ambient slice used by the XML.
+    goal_cache_blocks = db_module.build_goal_cache_blocks(
+        goal, project_name, ambient_for_xml
+    )
     if goal is not None:
         goal["xml"] = goal_xml
+        goal["cache_blocks"] = goal_cache_blocks
 
     return {
         "session_id": session["id"],
         "goal": goal,
         "goal_xml": goal_xml,  # v0.6.1 — always present
+        "goal_cache_blocks": goal_cache_blocks,  # v0.6.2 — ready for Anthropic
         "recent_tasks": recent_tasks,
         "active_sessions": active_sessions,
         "handoff_exists": handoff_exists,
@@ -1292,6 +1305,9 @@ def build_mcp_server():
                         "xml": db_module.build_goal_xml(
                             None, project_name, []
                         ),
+                        "cache_blocks": db_module.build_goal_cache_blocks(
+                            None, project_name, []
+                        ),
                     }
                 else:
                     # v0.4.2/3 — surface the last five task descriptions
@@ -1311,10 +1327,12 @@ def build_mcp_server():
                     project = await db_module.get_project(
                         db, arguments["project_id"]
                     )
+                    project_name = project["name"] if project else ""
                     goal["xml"] = db_module.build_goal_xml(
-                        goal,
-                        project["name"] if project else "",
-                        goal["ambient_tasks"],
+                        goal, project_name, goal["ambient_tasks"]
+                    )
+                    goal["cache_blocks"] = db_module.build_goal_cache_blocks(
+                        goal, project_name, goal["ambient_tasks"]
                     )
                     result = goal
             elif name == "set_goal":
