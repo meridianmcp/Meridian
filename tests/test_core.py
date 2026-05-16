@@ -2190,3 +2190,94 @@ def test_get_project_by_name_not_found(client):
     """GET /projects/by-name/{name} returns 404 for an unknown name."""
     r = client.get("/projects/by-name/does-not-exist")
     assert r.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# v0.6.1 — XML-wrap get_goal output
+# ---------------------------------------------------------------------------
+
+
+def test_build_goal_xml_structure():
+    """The XML envelope must contain a <goal> root with the four
+    expected children and the cache hints pinned by the contract."""
+    goal = {
+        "version": 3,
+        "content": "build the thing",
+        "north_star": "ship Meridian",
+        "sprint": "v0.6 context layer",
+    }
+    recent = [
+        {"status": "done", "created_at": "2026-01-01 00:00:00", "description": "did it"},
+        {"status": "failed", "created_at": "2026-01-02 00:00:00", "description": "tried"},
+    ]
+    xml = db_module.build_goal_xml(goal, "meridian-build", recent)
+    assert xml.startswith('<goal version="3" project="meridian-build">')
+    assert '<north_star cache="true">ship Meridian</north_star>' in xml
+    assert '<version_goal cache="true">build the thing</version_goal>' in xml
+    assert '<sprint cache="false">v0.6 context layer</sprint>' in xml
+    assert '<recent_tasks cache="false">' in xml
+    assert '<task status="done" ts="2026-01-01 00:00:00">did it</task>' in xml
+    assert '<task status="failed" ts="2026-01-02 00:00:00">tried</task>' in xml
+    assert xml.endswith("</goal>")
+
+
+def test_build_goal_xml_escapes_dangerous_chars():
+    """Values with XML metacharacters must be escaped, not break the doc."""
+    goal = {
+        "version": 1,
+        "content": "<bad> & \"evil\"",
+        "north_star": "1 < 2",
+        "sprint": None,
+    }
+    xml = db_module.build_goal_xml(goal, 'proj"name', [])
+    assert "<bad>" not in xml  # raw tag injection blocked
+    assert "&lt;bad&gt;" in xml
+    assert "1 &lt; 2" in xml
+    # Attribute is quoted with quoteattr — content is safe regardless of quoting style.
+
+
+def test_build_goal_xml_none_goal_returns_skeleton():
+    """When no goal exists yet we still get a parseable XML doc with
+    empty fields rather than a broken document."""
+    xml = db_module.build_goal_xml(None, "fresh-project", [])
+    assert '<goal version="0" project="fresh-project">' in xml
+    assert '<north_star cache="true"></north_star>' in xml
+    assert '<recent_tasks cache="false">' in xml
+    assert "</goal>" in xml
+
+
+def test_get_goal_endpoint_includes_xml_envelope(client):
+    """GET /projects/{id}/goal exposes the v0.6.1 ``xml`` field
+    alongside the existing JSON shape."""
+    project = client.post("/projects", json={"name": "alpha"}).json()
+    client.post(
+        f"/projects/{project['id']}/goal",
+        json={"content": "ship", "north_star": "vision", "sprint": "now"},
+    )
+    r = client.get(f"/projects/{project['id']}/goal")
+    assert r.status_code == 200
+    body = r.json()
+    assert isinstance(body["xml"], str)
+    assert '<goal version="1"' in body["xml"]
+    assert '<north_star cache="true">vision</north_star>' in body["xml"]
+    assert '<version_goal cache="true">ship</version_goal>' in body["xml"]
+    assert '<sprint cache="false">now</sprint>' in body["xml"]
+
+
+def test_start_session_endpoint_returns_goal_xml(client):
+    """The composite tool surfaces goal_xml at the top level so cold
+    sessions can prompt with it without unwrapping a nullable goal."""
+    project = client.post("/projects", json={"name": "alpha"}).json()
+    client.post(
+        f"/projects/{project['id']}/goal",
+        json={"content": "ship", "north_star": "vision", "sprint": "now"},
+    )
+    r = client.post(
+        f"/projects/{project['id']}/start-session",
+        json={"session_name": "worker", "human_id": "adam"},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert "goal_xml" in body
+    assert '<goal version="1"' in body["goal_xml"]
+    assert '<north_star cache="true">vision</north_star>' in body["goal_xml"]

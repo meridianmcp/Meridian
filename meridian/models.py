@@ -129,6 +129,10 @@ class GoalState(BaseModel):
     ambient_tasks: list[dict[str, Any]] | None = None
     north_star: str | None = None
     sprint: str | None = None
+    # v0.6.1 — XML-serialised goal envelope. Mirrors the same fields
+    # under one wire format so MCP consumers can hand the whole thing
+    # to Claude as a single block with structured cache hints.
+    xml: str | None = None
 
 
 class GoalModeSet(BaseModel):

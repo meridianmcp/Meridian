@@ -235,6 +235,12 @@ async def get_goal(project_id: str, request: Request) -> dict[str, Any]:
         }
         for t in recent
     ]
+    # v0.6.1 — also serve the XML envelope so MCP / cache-aware consumers
+    # don't have to re-stitch fields locally. The JSON keys stay for the
+    # dashboard and the test suite.
+    goal["xml"] = db_module.build_goal_xml(
+        goal, project["name"], goal["ambient_tasks"]
+    )
     return goal
 
 
@@ -836,9 +842,18 @@ async def _start_session_composite(
     handoff_path_str = str(Path(data_dir) / f"{slug}_handoff.md")
     handoff_exists = Path(handoff_path_str).exists()
 
+    # v0.6.1 — stamp the XML envelope onto the goal so MCP consumers
+    # get a single ready-to-prompt block. Always present (even when
+    # goal is None) so the contract is uniform.
+    ambient_for_xml = goal.get("ambient_tasks") if goal else []
+    goal_xml = db_module.build_goal_xml(goal, project_name, ambient_for_xml)
+    if goal is not None:
+        goal["xml"] = goal_xml
+
     return {
         "session_id": session["id"],
         "goal": goal,
+        "goal_xml": goal_xml,  # v0.6.1 — always present
         "recent_tasks": recent_tasks,
         "active_sessions": active_sessions,
         "handoff_exists": handoff_exists,
@@ -1266,7 +1281,18 @@ def build_mcp_server():
             elif name == "get_goal":
                 goal = await db_module.get_goal(db, arguments["project_id"])
                 if goal is None:
-                    result = {"error": "goal not set"}
+                    # Even an unset goal returns a valid XML skeleton so
+                    # cold sessions don't have to special-case 404.
+                    project = await db_module.get_project(
+                        db, arguments["project_id"]
+                    )
+                    project_name = project["name"] if project else ""
+                    result = {
+                        "error": "goal not set",
+                        "xml": db_module.build_goal_xml(
+                            None, project_name, []
+                        ),
+                    }
                 else:
                     # v0.4.2/3 — surface the last five task descriptions
                     # alongside the goal so cold sessions get ambient
@@ -1282,6 +1308,14 @@ def build_mcp_server():
                         }
                         for t in recent
                     ]
+                    project = await db_module.get_project(
+                        db, arguments["project_id"]
+                    )
+                    goal["xml"] = db_module.build_goal_xml(
+                        goal,
+                        project["name"] if project else "",
+                        goal["ambient_tasks"],
+                    )
                     result = goal
             elif name == "set_goal":
                 result = await db_module.set_goal(

@@ -352,6 +352,70 @@ async def list_projects(db: aiosqlite.Connection) -> list[dict[str, Any]]:
     return [_row_to_dict(r) for r in rows]  # type: ignore[misc]
 
 
+def build_goal_xml(
+    goal: dict[str, Any] | None,
+    project_name: str,
+    recent_tasks: list[dict[str, Any]] | None = None,
+) -> str:
+    """Serialise the goal + ambient context as XML for MCP consumers.
+
+    Layout (v0.6.1):
+
+        <goal version="N" project="NAME">
+          <north_star cache="true">...</north_star>
+          <version_goal cache="true">...</version_goal>
+          <sprint cache="false">...</sprint>
+          <recent_tasks cache="false">
+            <task status="done" ts="...">...</task>
+          </recent_tasks>
+        </goal>
+
+    ``cache="true"`` on fields that change rarely (north_star,
+    version_goal) is a hint for v0.6.2's Anthropic prompt-cache
+    plumbing — the field text doesn't drive any cache behaviour by
+    itself but it makes the contract explicit in the wire format.
+    Returns a valid XML document even when ``goal`` is None so cold
+    sessions get a parseable response instead of a 404.
+    """
+    from xml.sax.saxutils import escape, quoteattr
+
+    if goal is None:
+        version = 0
+        north_star = version_goal = sprint = ""
+    else:
+        version = int(goal.get("version") or 0)
+        north_star = goal.get("north_star") or ""
+        content = goal.get("content")
+        if isinstance(content, str):
+            version_goal = content
+        elif content is None:
+            version_goal = ""
+        else:
+            version_goal = json.dumps(content, indent=2)
+        sprint = goal.get("sprint") or ""
+
+    out: list[str] = []
+    out.append(
+        f'<goal version="{version}" project={quoteattr(project_name)}>'
+    )
+    out.append(f'  <north_star cache="true">{escape(north_star)}</north_star>')
+    out.append(
+        f'  <version_goal cache="true">{escape(version_goal)}</version_goal>'
+    )
+    out.append(f'  <sprint cache="false">{escape(sprint)}</sprint>')
+    out.append('  <recent_tasks cache="false">')
+    for t in recent_tasks or []:
+        status = escape(str(t.get("status") or ""))
+        ts = escape(str(t.get("created_at") or ""))
+        desc = escape(str(t.get("description") or ""))
+        out.append(
+            f'    <task status="{status}" ts="{ts}">{desc}</task>'
+        )
+    out.append("  </recent_tasks>")
+    out.append("</goal>")
+    return "\n".join(out)
+
+
 async def get_goal(
     db: aiosqlite.Connection, project_id: str
 ) -> dict[str, Any] | None:
