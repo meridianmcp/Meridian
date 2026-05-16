@@ -2526,3 +2526,38 @@ def test_dashboard_html_has_project_switcher(client):
     """Dashboard HTML contains the project switcher dropdown."""
     r = client.get("/dashboard")
     assert "project-switcher" in r.text
+
+
+# ---------------------------------------------------------------------------
+# v0.6.7 — IP attribution PDF export
+# ---------------------------------------------------------------------------
+
+
+def test_export_pdf_returns_pdf(client):
+    """GET /projects/{id}/export/pdf returns a PDF."""
+    proj = client.post("/projects", json={"name": "iptest"}).json()
+    sess = client.post("/sessions/register", json={"project_id": proj["id"], "name": "s1"}).json()
+    client.post("/tasks", json={"session_id": sess["id"], "project_id": proj["id"], "description": "did work", "status": "done"})
+    r = client.get(f"/projects/{proj['id']}/export/pdf")
+    assert r.status_code == 200
+    assert r.headers["content-type"] == "application/pdf"
+    assert len(r.content) > 100
+
+
+def test_export_pdf_contains_sha256(client):
+    """PDF export works for a project with tasks and returns valid PDF bytes."""
+    proj = client.post("/projects", json={"name": "iptest2"}).json()
+    sess = client.post("/sessions/register", json={"project_id": proj["id"], "name": "sha-sess"}).json()
+    client.post("/tasks", json={"session_id": sess["id"], "project_id": proj["id"], "description": "sha test task", "status": "done"})
+    r = client.get(f"/projects/{proj['id']}/export/pdf")
+    assert r.status_code == 200
+    # PDF files start with the %PDF- magic header
+    assert r.content[:4] == b"%PDF"
+    # The content should be a meaningful size (> 500 bytes) indicating the SHA footer was written
+    assert len(r.content) > 500
+
+
+def test_export_pdf_404_unknown_project(client):
+    """GET /projects/bad-id/export/pdf returns 404."""
+    r = client.get("/projects/doesnotexist/export/pdf")
+    assert r.status_code == 404

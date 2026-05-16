@@ -952,6 +952,9 @@ function buildTabBody(project) {
             <textarea class="goal-area sprint mono" id="goal-sprint-${project.id}" placeholder="(sprint not set)"></textarea>
             <div class="goal-actions"><button class="secondary" id="save-sprint-${project.id}">save sprint</button></div>
           </div>
+          <div style="flex-shrink:0;padding:4px 0 8px 0">
+            <a class="secondary" style="display:inline-block;padding:5px 12px;border:1px solid var(--border);border-radius:4px;color:var(--muted);font-size:10px;text-decoration:none;font-family:'IBM Plex Mono',monospace;cursor:pointer" href="/projects/${project.id}/export/pdf" download>⬇ Export IP Record (PDF)</a>
+          </div>
         </div>
       </div>
       <div class="drawer-panel" id="drawer-files-${project.id}">

@@ -21,7 +21,7 @@ from typing import Any
 
 import aiosqlite
 from fastapi import FastAPI, HTTPException, Request, WebSocket
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, Response, StreamingResponse
 
 from . import dashboard as dashboard_module
 from . import db as db_module
@@ -624,6 +624,100 @@ async def get_chat_history(
     if project is None:
         raise HTTPException(status_code=404, detail="project not found")
     return await db_module.get_chat_history(_db(request), project_id, limit=limit)
+
+
+@app.get("/projects/{project_id}/export/pdf")
+async def export_project_pdf(project_id: str, request: Request):
+    """Generate a tamper-evident IP attribution PDF for the project.
+
+    Contains north star, version goal, sprint, full task log with
+    timestamps and session names, and a SHA-256 hash of the content
+    embedded in the footer.
+    """
+    import hashlib
+    from fpdf import FPDF
+    import io
+
+    db = _db(request)
+    project = await db_module.get_project(db, project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="project not found")
+    goal = await db_module.get_goal(db, project_id)
+    tasks = await db_module.get_tasks(db, project_id, limit=200)
+    sessions = await db_module.get_sessions(db, project_id, active_only=False)
+    session_names = {s["id"]: s["name"] for s in sessions}
+
+    # Build text content for hashing
+    lines = [
+        f"MERIDIAN IP ATTRIBUTION RECORD",
+        f"Project: {project['name']} ({project['id']})",
+        f"Generated: {__import__('datetime').datetime.utcnow().isoformat()}Z",
+        "",
+    ]
+    if goal:
+        lines += [
+            f"Goal Version: {goal['version']}",
+            f"North Star: {goal.get('north_star') or '(not set)'}",
+            f"Version Goal: {goal['content']}",
+            f"Sprint: {goal.get('sprint') or '(not set)'}",
+            "",
+        ]
+    lines.append("TASK LOG:")
+    for t in tasks:
+        sname = session_names.get(t["session_id"], t["session_id"][:8])
+        lines.append(f"[{t['created_at']}] [{t['status'].upper()}] {sname}: {t['description']}")
+
+    full_text = "\n".join(lines)
+    sha256 = hashlib.sha256(full_text.encode()).hexdigest()
+
+    # Build PDF
+    pdf = FPDF()
+    pdf.add_page()
+    pdf.set_font("Helvetica", "B", 16)
+    pdf.cell(0, 10, "Meridian IP Attribution Record", new_x="LMARGIN", new_y="NEXT")
+    pdf.set_font("Helvetica", "", 10)
+    pdf.cell(0, 7, f"Project: {project['name']}", new_x="LMARGIN", new_y="NEXT")
+    pdf.ln(4)
+
+    if goal:
+        pdf.set_font("Helvetica", "B", 12)
+        pdf.cell(0, 8, "Goal Hierarchy", new_x="LMARGIN", new_y="NEXT")
+        pdf.set_font("Helvetica", "", 9)
+        for label, val in [
+            ("North Star", goal.get("north_star") or "(not set)"),
+            ("Version Goal", str(goal["content"])),
+            ("Sprint", goal.get("sprint") or "(not set)"),
+        ]:
+            pdf.set_font("Helvetica", "B", 9)
+            pdf.cell(30, 6, f"{label}:", new_x="RIGHT", new_y="LAST")
+            pdf.set_font("Helvetica", "", 9)
+            # Multi-line safe: use multi_cell for value
+            x, y = pdf.get_x(), pdf.get_y()
+            pdf.multi_cell(0, 6, val[:300])
+        pdf.ln(4)
+
+    pdf.set_font("Helvetica", "B", 12)
+    pdf.cell(0, 8, f"Task Log ({len(tasks)} entries)", new_x="LMARGIN", new_y="NEXT")
+    pdf.set_font("Courier", "", 7)
+    for t in tasks:
+        sname = session_names.get(t["session_id"], t["session_id"][:8])
+        row = f"[{t['created_at']}] [{t['status'].upper()}] {sname}: {t['description']}"
+        pdf.multi_cell(0, 5, row[:200])
+
+    # Footer with SHA256
+    pdf.ln(6)
+    pdf.set_font("Helvetica", "I", 7)
+    pdf.set_text_color(120, 120, 120)
+    pdf.multi_cell(0, 5, f"SHA-256: {sha256}")
+
+    pdf_bytes = pdf.output()
+    return Response(
+        content=bytes(pdf_bytes),
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": f'attachment; filename="{project["name"]}_ip_record.pdf"'
+        },
+    )
 
 
 @app.get("/dashboard", response_class=HTMLResponse)
