@@ -2484,3 +2484,12 @@ def test_config_endpoint_reflects_env(monkeypatch, tmp_path):
         data = r.json()
         assert data["host"] == "0.0.0.0"
         assert data["port"] == 9999
+
+
+def test_http_set_goal_writes_back_goal_md(client, tmp_path):
+    """POST /goal syncs content back to GOAL.md."""
+    proj = client.post("/projects", json={"name": "p1"}).json()
+    client.post(f"/projects/{proj['id']}/goal", json={"content": "ship it"})
+    goal_md = tmp_path / "GOAL.md"
+    assert goal_md.exists()
+    assert "ship it" in goal_md.read_text(encoding="utf-8")

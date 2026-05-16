@@ -337,10 +337,12 @@ async def set_goal(
                 ),
             },
         )
-    return await db_module.set_goal(
+    result = await db_module.set_goal(
         _db(request), project_id, body.content,
         north_star=body.north_star, sprint=body.sprint,
     )
+    await goal_md_module.sync_db_to_goal_md(_db(request), project_id)
+    return result
 
 
 @app.post("/projects/{project_id}/goal/north-star", response_model=GoalState)
