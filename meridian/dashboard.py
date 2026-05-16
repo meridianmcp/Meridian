@@ -584,8 +584,10 @@ html, body {
 }
 .goal-area.readonly { background: var(--surface-1); color: var(--muted); cursor: default; }
 .goal-area.sprint { min-height: 50px; max-height: 100px; }
+.goal-area.dirty { border-color: var(--accent) !important; }
 .goal-label { font-size: 10px; font-family: 'IBM Plex Mono', monospace; font-weight: 600;
   letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); margin-bottom: 3px; }
+.goal-label .goal-ts { font-weight: 400; opacity: 0.6; margin-left: 6px; text-transform: none; letter-spacing: 0; }
 .goal-section { display: flex; flex-direction: column; flex-shrink: 0; }
 .goal-actions { display: flex; gap: 6px; margin-top: 6px; align-items: center; }
 .goal-version { color: var(--muted); font-size: 11px; font-family: 'IBM Plex Mono', monospace; }
@@ -933,12 +935,12 @@ function buildTabBody(project) {
             </span>
           </div>
           <div class="goal-section">
-            <div class="goal-label">🔭 North Star <span id="goal-ns-lock-${project.id}" style="opacity:0.5"></span></div>
+            <div class="goal-label">🔭 North Star <span id="goal-ns-lock-${project.id}" style="opacity:0.5"></span><span class="goal-ts" id="goal-ns-ts-${project.id}"></span></div>
             <textarea class="goal-area mono" id="goal-north-star-${project.id}" placeholder="(north star not set)"></textarea>
             <div class="goal-actions"><button class="primary" id="save-north-star-${project.id}">save north star</button></div>
           </div>
           <div class="goal-section">
-            <div class="goal-label">◎ Version Goal</div>
+            <div class="goal-label">◎ Version Goal<span class="goal-ts" id="goal-vg-ts-${project.id}"></span></div>
             <textarea class="goal-area mono" id="goal-${project.id}" placeholder="(no version goal set)" style="flex:1;max-height:none;resize:vertical"></textarea>
             <div class="goal-actions">
               <button class="primary" id="save-goal-${project.id}">save version goal</button>
@@ -946,7 +948,7 @@ function buildTabBody(project) {
             </div>
           </div>
           <div class="goal-section">
-            <div class="goal-label">⚡ Sprint</div>
+            <div class="goal-label">⚡ Sprint<span class="goal-ts" id="goal-sp-ts-${project.id}"></span></div>
             <textarea class="goal-area sprint mono" id="goal-sprint-${project.id}" placeholder="(sprint not set)"></textarea>
             <div class="goal-actions"><button class="secondary" id="save-sprint-${project.id}">save sprint</button></div>
           </div>
@@ -1092,6 +1094,19 @@ function buildTabBody(project) {
   document.getElementById(`goal-${project.id}`).addEventListener('blur', () => saveGoal(project.id));
   document.getElementById(`goal-north-star-${project.id}`).addEventListener('blur', () => saveNorthStar(project.id));
   document.getElementById(`goal-sprint-${project.id}`).addEventListener('blur', () => saveSprint(project.id));
+  // v0.6.4 — dirty state: highlight textarea border when unsaved changes exist
+  document.getElementById(`goal-${project.id}`).addEventListener('input', function() {
+    const p = state.panels[project.id];
+    this.classList.toggle('dirty', this.value !== (p._lastSaved || ''));
+  });
+  document.getElementById(`goal-north-star-${project.id}`).addEventListener('input', function() {
+    const p = state.panels[project.id];
+    this.classList.toggle('dirty', this.value !== (p._serverNorthStar || ''));
+  });
+  document.getElementById(`goal-sprint-${project.id}`).addEventListener('input', function() {
+    const p = state.panels[project.id];
+    this.classList.toggle('dirty', this.value !== (p._serverSprint || ''));
+  });
   document.getElementById(`chat-send-${project.id}`).onclick = () => sendChat(project.id);
   const input = document.getElementById(`chat-input-${project.id}`);
   input.addEventListener('keydown', (e) => {
@@ -1235,6 +1250,22 @@ async function refreshGoal(projectId) {
     const spTA = document.getElementById(`goal-sprint-${projectId}`);
     if (nsTA) nsTA.value = goal.north_star || '';
     if (spTA) spTA.value = goal.sprint || '';
+    // v0.6.4 — store server values for dirty tracking; clear dirty state
+    const p = state.panels[projectId];
+    p._serverNorthStar = goal.north_star || '';
+    p._serverSprint = goal.sprint || '';
+    p._lastSaved = text;
+    if (nsTA) { nsTA.classList.remove('dirty'); }
+    if (spTA) { spTA.classList.remove('dirty'); }
+    ta.classList.remove('dirty');
+    // v0.6.4 — last-modified timestamps
+    const tsNs = document.getElementById(`goal-ns-ts-${projectId}`);
+    const tsVg = document.getElementById(`goal-vg-ts-${projectId}`);
+    const tsSp = document.getElementById(`goal-sp-ts-${projectId}`);
+    const updAt = goal.updated_at ? formatRelativeTime(goal.updated_at) : '';
+    if (tsNs) tsNs.textContent = updAt ? `· ${updAt}` : '';
+    if (tsVg) tsVg.textContent = updAt ? `· ${updAt}` : '';
+    if (tsSp) tsSp.textContent = updAt ? `· ${updAt}` : '';
   } catch (e) {
     ta.value = '';
     v.textContent = '(unset)';
