@@ -433,6 +433,30 @@ async def set_sprint(
         raise HTTPException(status_code=422, detail=str(exc))
 
 
+@app.post("/projects/{project_id}/start-worker-session")
+async def start_worker_session_endpoint(
+    project_id: str, request: Request,
+    body: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """v1.2.0 — REST mirror of the MCP ``start_worker_session`` tool.
+
+    Optional body: ``{task_id}``. Returns
+    ``{session_id, task, worker_context}`` or 404 when there's no
+    claimable task / the named task doesn't belong to this project.
+    """
+    project = await db_module.get_project(_db(request), project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="project not found")
+    try:
+        return await db_module.start_worker_session(
+            _db(request),
+            project_id,
+            task_id=(body or {}).get("task_id"),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+
+
 @app.post("/projects/{project_id}/decisions")
 async def post_decision_endpoint(
     project_id: str, body: dict[str, Any], request: Request
@@ -1504,6 +1528,28 @@ def build_mcp_server():
                 },
             ),
             Tool(
+                name="start_worker_session",
+                description=(
+                    "v1.2.0 — register a worker session and claim its "
+                    "task in one call. Returns a slim worker_context "
+                    "XML block (version_goal + claimed task + repo + "
+                    "test_cmd + commit_pattern + done_when) under ~500 "
+                    "tokens. Use this for Claude Code subprocess workers "
+                    "that should NOT see north_star, decisions, sprint "
+                    "history, or ambient task log. If task_id is "
+                    "omitted, the oldest unclaimed pending task is "
+                    "picked automatically."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "project_id": {"type": "string"},
+                        "task_id": {"type": "string"},
+                    },
+                    "required": ["project_id"],
+                },
+            ),
+            Tool(
                 name="set_decision",
                 description=(
                     "Append a decision entry to the project's "
@@ -1889,6 +1935,15 @@ def build_mcp_server():
                             str(goal["content"])[:200] if goal else None
                         ),
                     }
+            elif name == "start_worker_session":
+                try:
+                    result = await db_module.start_worker_session(
+                        db,
+                        arguments["project_id"],
+                        task_id=arguments.get("task_id"),
+                    )
+                except ValueError as exc:
+                    result = {"error": str(exc)}
             elif name == "set_decision":
                 try:
                     updated = await db_module.set_decision(

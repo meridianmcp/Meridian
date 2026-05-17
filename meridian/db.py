@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import uuid
+from pathlib import Path
 from typing import Any
 
 import aiosqlite
@@ -83,6 +85,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     project_id TEXT NOT NULL REFERENCES projects(id),
     name TEXT NOT NULL,
     human_id TEXT,
+    session_type TEXT DEFAULT 'human',
     status TEXT NOT NULL DEFAULT 'active'
         CHECK (status IN ('active','idle','closed')),
     last_seen TEXT NOT NULL DEFAULT (datetime('now')),
@@ -255,6 +258,18 @@ async def _migrate_task_claims(db: aiosqlite.Connection) -> None:
     await _migrate_add_column_if_missing(db, "task_log", "claimed_at", "TEXT")
 
 
+async def _migrate_session_type(db: aiosqlite.Connection) -> None:
+    """v1.2.0 — distinguish human vs worker sessions.
+
+    'human' = the default startup protocol's session (full goal +
+    decisions + ambient context). 'worker' = a slim context built
+    by ``start_worker_session`` with just the task it needs to ship.
+    """
+    await _migrate_add_column_if_missing(
+        db, "sessions", "session_type", "TEXT DEFAULT 'human'"
+    )
+
+
 async def _migrate_decisions(db: aiosqlite.Connection) -> None:
     """v1.1.4 — append-only decisions log per project.
 
@@ -328,6 +343,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_human_identity(db)
     await _migrate_task_claims(db)
     await _migrate_decisions(db)
+    await _migrate_session_type(db)
     await _migrate_goal_mode(db)
     await _migrate_goal_hierarchy(db)
     return db
@@ -644,18 +660,25 @@ async def register_session(
     project_id: str,
     name: str,
     human_id: str | None = None,
+    session_type: str = "human",
 ) -> dict[str, Any]:
     """Create a session row in 'active' state.
 
     ``human_id`` lets a session attach a human owner identifier so the
     dashboard can group ``adam/claude-sonnet-xyz`` sessions together and
     so the goal-ownership rule can match a writer to the project creator.
+
+    ``session_type`` (v1.2.0) is ``human`` by default and ``worker`` for
+    sessions started via :func:`start_worker_session`. The timeline /
+    auto-summary loops use it to distinguish the two kinds.
     """
+    if session_type not in {"human", "worker"}:
+        raise ValueError(f"invalid session_type: {session_type!r}")
     sid = _new_id()
     await db.execute(
-        "INSERT INTO sessions (id, project_id, name, human_id) "
-        "VALUES (?, ?, ?, ?)",
-        (sid, project_id, name, human_id),
+        "INSERT INTO sessions (id, project_id, name, human_id, session_type) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (sid, project_id, name, human_id, session_type),
     )
     await db.commit()
     async with db.execute(
@@ -665,6 +688,116 @@ async def register_session(
     session = _row_to_dict(row)
     assert session is not None
     return session
+
+
+def build_worker_context_xml(
+    *,
+    version_goal: str,
+    task_id: str,
+    task_description: str,
+    repo: str,
+    test_cmd: str = "pixi run test",
+    commit_pattern: str = (
+        "Use commit.py pattern: write commit message to commit.py "
+        "in repo root, run via pixi run python commit.py, then "
+        "delete commit.py in the same command."
+    ),
+    done_when: str = (
+        "log_task done, tests green, committed (no stray .py at repo root)."
+    ),
+) -> str:
+    """v1.2.0 — slim XML for worker sessions.
+
+    Workers don't need north_star, decisions, or sprint history —
+    they need the version goal + the one task they're claiming, plus
+    the operational machinery (repo path, test cmd, commit pattern,
+    completion criteria). The resulting block is intentionally short
+    (under ~500 tokens) so it costs nothing to splat into a
+    Claude Code worker's first turn.
+    """
+    from xml.sax.saxutils import escape, quoteattr
+
+    return "\n".join([
+        "<worker_context>",
+        f"  <version_goal>{escape(version_goal)}</version_goal>",
+        f"  <task id={quoteattr(task_id)}>{escape(task_description)}</task>",
+        f"  <repo>{escape(repo)}</repo>",
+        f"  <test_cmd>{escape(test_cmd)}</test_cmd>",
+        f"  <commit_pattern>{escape(commit_pattern)}</commit_pattern>",
+        f"  <done_when>{escape(done_when)}</done_when>",
+        "</worker_context>",
+    ])
+
+
+async def start_worker_session(
+    db: aiosqlite.Connection,
+    project_id: str,
+    task_id: str | None = None,
+    repo: str | None = None,
+    test_cmd: str | None = None,
+) -> dict[str, Any]:
+    """v1.2.0 — register a worker session + claim its task in one call.
+
+    When ``task_id`` is None we pick the oldest unclaimed pending task
+    for this project. The returned dict carries the new worker session
+    id, the claimed task row, and the ``worker_context`` XML the
+    worker should splat into its first prompt.
+
+    Raises ``ValueError`` when no claimable task is available (and
+    none was provided explicitly).
+    """
+    if task_id is None:
+        claimable = await get_claimable_tasks(db, project_id, limit=1)
+        if not claimable:
+            raise ValueError("no claimable tasks available for this project")
+        task = claimable[0]
+    else:
+        task = await get_task(db, task_id)
+        if task is None or task["project_id"] != project_id:
+            raise ValueError(f"task not found: {task_id}")
+
+    short = task["id"][:8]
+    session = await register_session(
+        db, project_id, f"worker/{short}",
+        human_id=None, session_type="worker",
+    )
+
+    claimed = await claim_task(db, task["id"], session["id"])
+    if claimed is None:
+        # Another worker beat us to it. Mark this session closed so
+        # the timeline doesn't show a zombie row, and surface the
+        # contention to the caller.
+        await close_session(db, session["id"])
+        raise ValueError(
+            f"task {task['id']} already claimed by another worker"
+        )
+
+    goal = await get_goal(db, project_id)
+    version_goal_text = ""
+    if goal is not None:
+        content = goal.get("content")
+        if isinstance(content, str):
+            version_goal_text = content
+        elif content is not None:
+            version_goal_text = str(content)
+
+    xml = build_worker_context_xml(
+        version_goal=version_goal_text,
+        task_id=claimed["id"],
+        task_description=claimed["description"] or "",
+        repo=repo or os.environ.get(
+            "MERIDIAN_WORKER_REPO",
+            str(Path(__file__).resolve().parent.parent),
+        ),
+        test_cmd=test_cmd or os.environ.get(
+            "MERIDIAN_WORKER_TEST_CMD", "pixi run test"
+        ),
+    )
+    return {
+        "session_id": session["id"],
+        "task": claimed,
+        "worker_context": xml,
+    }
 
 
 async def set_goal_mode(

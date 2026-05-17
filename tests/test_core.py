@@ -3198,3 +3198,125 @@ def test_build_goal_xml_omits_decisions_when_empty():
         "alpha", [], None, decisions=None,
     )
     assert "<decisions" not in xml
+
+
+# ---------------------------------------------------------------------------
+# v1.2.0 — start_worker_session
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_start_worker_session_claims_oldest_pending(db):
+    p = await db_module.create_project(db, "alpha")
+    human = await db_module.register_session(db, p["id"], "human")
+    # Two pending tasks; oldest must be picked.
+    older = await db_module.log_task(
+        db, human["id"], p["id"], "do first", "pending"
+    )
+    newer = await db_module.log_task(
+        db, human["id"], p["id"], "do later", "pending"
+    )
+    await db_module.set_goal(
+        db, p["id"], "ship v1.2", north_star="vision", sprint="now"
+    )
+    result = await db_module.start_worker_session(db, p["id"])
+    assert result["task"]["id"] == older["id"]
+    assert result["task"]["claimed_by"] == result["session_id"]
+    # Worker session is tagged.
+    async with db.execute(
+        "SELECT session_type FROM sessions WHERE id = ?",
+        (result["session_id"],),
+    ) as cur:
+        row = await cur.fetchone()
+    assert row[0] == "worker"
+
+
+@pytest.mark.asyncio
+async def test_start_worker_session_xml_is_slim(db):
+    p = await db_module.create_project(db, "alpha")
+    human = await db_module.register_session(db, p["id"], "human")
+    await db_module.log_task(db, human["id"], p["id"], "do it", "pending")
+    await db_module.set_goal(
+        db, p["id"], "ship v1.2", north_star="N", sprint="S"
+    )
+    await db_module.set_decision(db, p["id"], "internal call")
+    result = await db_module.start_worker_session(db, p["id"])
+    xml = result["worker_context"]
+    # Under 700 chars per spec (matters because it lands in every
+    # worker's first prompt).
+    assert len(xml) < 700, f"worker_context too big: {len(xml)} chars"
+    # Worker-relevant fields present.
+    assert "<version_goal>" in xml
+    assert "<task " in xml
+    assert "<repo>" in xml
+    assert "<test_cmd>" in xml
+    assert "<commit_pattern>" in xml
+    assert "<done_when>" in xml
+    # Excluded fields absent — workers must NOT see these.
+    assert "north_star" not in xml
+    assert "decisions" not in xml
+    assert "<sprint>" not in xml
+    assert "<recent_tasks>" not in xml
+
+
+@pytest.mark.asyncio
+async def test_start_worker_session_explicit_task_id(db):
+    p = await db_module.create_project(db, "alpha")
+    human = await db_module.register_session(db, p["id"], "human")
+    t1 = await db_module.log_task(db, human["id"], p["id"], "first", "pending")
+    t2 = await db_module.log_task(db, human["id"], p["id"], "second", "pending")
+    await db_module.set_goal(db, p["id"], "x")
+    result = await db_module.start_worker_session(db, p["id"], task_id=t2["id"])
+    assert result["task"]["id"] == t2["id"]
+
+
+@pytest.mark.asyncio
+async def test_start_worker_session_raises_when_no_claimable(db):
+    p = await db_module.create_project(db, "alpha")
+    await db_module.set_goal(db, p["id"], "x")
+    with pytest.raises(ValueError):
+        await db_module.start_worker_session(db, p["id"])
+
+
+@pytest.mark.asyncio
+async def test_start_worker_session_raises_when_already_claimed(db):
+    p = await db_module.create_project(db, "alpha")
+    human = await db_module.register_session(db, p["id"], "human")
+    t = await db_module.log_task(db, human["id"], p["id"], "x", "pending")
+    await db_module.set_goal(db, p["id"], "x")
+    await db_module.claim_task(db, t["id"], human["id"])
+    with pytest.raises(ValueError):
+        await db_module.start_worker_session(db, p["id"], task_id=t["id"])
+
+
+def test_start_worker_session_http_endpoint(client):
+    project = client.post("/projects", json={"name": "alpha"}).json()
+    sess = client.post(
+        "/sessions/register",
+        json={"project_id": project["id"], "name": "human"},
+    ).json()
+    task = client.post(
+        "/tasks",
+        json={
+            "session_id": sess["id"],
+            "project_id": project["id"],
+            "description": "ship feature",
+            "status": "pending",
+        },
+    ).json()
+    client.post(
+        f"/projects/{project['id']}/goal",
+        json={"content": "v", "north_star": "n", "sprint": "s"},
+    )
+    r = client.post(
+        f"/projects/{project['id']}/start-worker-session", json={}
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["task"]["id"] == task["id"]
+    assert "<worker_context>" in body["worker_context"]
+    # When no claimable tasks → 404
+    r = client.post(
+        f"/projects/{project['id']}/start-worker-session", json={}
+    )
+    assert r.status_code == 404
