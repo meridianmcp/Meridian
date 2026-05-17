@@ -670,6 +670,47 @@ input[type=text] {
 .hitl-row .controls { display: flex; gap: 6px; align-items: center; }
 .hitl-row input[type=text] { flex: 1; }
 
+/* v1.1.1 — Activity Timeline */
+.timeline-wrap { position: relative; min-width: 100%; }
+.timeline-axis {
+  display: grid; grid-template-columns: 120px 1fr; align-items: center;
+  border-bottom: 1px dashed var(--border); padding-bottom: 4px;
+  margin-bottom: 8px; font-family: 'IBM Plex Mono', monospace;
+  font-size: 10px; color: var(--muted);
+}
+.timeline-axis .ticks { display: flex; justify-content: space-between; }
+.timeline-row {
+  display: grid; grid-template-columns: 120px 1fr;
+  border-bottom: 1px solid var(--border); padding: 6px 0;
+  min-height: 28px;
+}
+.timeline-row .label {
+  font-family: 'IBM Plex Mono', monospace; font-size: 11px;
+  color: var(--muted); overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap; padding-right: 8px;
+}
+.timeline-track {
+  position: relative; height: 22px; background: var(--surface-2);
+  border-radius: 4px;
+}
+.timeline-pill {
+  position: absolute; top: 3px; height: 16px; border-radius: 3px;
+  min-width: 6px; cursor: pointer; box-shadow: 0 0 0 1px var(--bg);
+}
+.timeline-pill.done    { background: var(--status-done); }
+.timeline-pill.failed  { background: var(--status-failed); }
+.timeline-pill.pending { background: var(--status-pending); }
+.timeline-pill.pending-hitl { background: var(--accent); }
+.timeline-event-line {
+  position: absolute; top: 0; bottom: 0; width: 0;
+  border-left: 1px dashed var(--accent); opacity: 0.6;
+  pointer-events: none;
+}
+.timeline-empty {
+  color: var(--muted); font-family: 'IBM Plex Mono', monospace;
+  font-size: 12px; padding: 20px;
+}
+
 .claude-handoff-panel {
   display: flex; flex-direction: column;
   background: var(--surface);
@@ -972,6 +1013,7 @@ function buildTabBody(project) {
       <button class="vtab-btn" data-vtab="goal" title="Goal State">◎</button>
       <button class="vtab-btn" data-vtab="files" title="Files">⊞</button>
       <button class="vtab-btn" data-vtab="devlog" title="Dev Log">≋</button>
+      <button class="vtab-btn" data-vtab="timeline" title="Activity Timeline">⌬</button>
     </div>
     <div class="vtab-drawer open" id="drawer-${project.id}">
       <div class="drawer-panel active" id="drawer-status-${project.id}">
@@ -1036,6 +1078,16 @@ function buildTabBody(project) {
         <div class="drawer-header">DEV LOG · ${escapeHtml(project.name)}</div>
         <div class="scroll-area"><div class="task-list" id="tasks-${project.id}"></div></div>
       </div>
+      <div class="drawer-panel" id="drawer-timeline-${project.id}">
+        <div class="drawer-header" style="justify-content:space-between">
+          <span>TIMELINE · ${escapeHtml(project.name)}</span>
+          <span style="display:flex;gap:6px;align-items:center">
+            <button class="secondary" id="timeline-axis-${project.id}" title="Toggle relative/absolute time" style="padding:2px 8px;font-size:10px">relative</button>
+            <button class="secondary" id="timeline-refresh-${project.id}" title="Refresh" style="padding:2px 8px;font-size:10px">refresh</button>
+          </span>
+        </div>
+        <div class="timeline-wrap" id="timeline-wrap-${project.id}" style="flex:1;overflow:auto;padding:14px"></div>
+      </div>
     </div>
     <section class="claude-handoff-panel">
       <div class="panel-header">
@@ -1095,6 +1147,7 @@ function buildTabBody(project) {
           p.activeVtab = vtab;
           if (vtab === 'files') loadFilesTab(project.id);
           if (vtab === 'devlog') refreshTasks(project.id);
+          if (vtab === 'timeline') loadTimeline(project.id);
         }
       };
     });
@@ -1250,6 +1303,85 @@ function buildTabBody(project) {
   })();
 
   connectWs(project.id);
+}
+
+// v1.1.1 — Activity Timeline. Load /timeline, lay out a swimlane
+// per session, paint task pills positioned on a shared time axis.
+async function loadTimeline(projectId) {
+  const wrap = document.getElementById(`timeline-wrap-${projectId}`);
+  if (!wrap) return;
+  wrap.innerHTML = `<div class="timeline-empty">loading…</div>`;
+  let data;
+  try {
+    data = await api(`/projects/${projectId}/timeline`);
+  } catch (e) {
+    wrap.innerHTML = `<div class="timeline-empty">timeline failed: ${escapeHtml(e.message)}</div>`;
+    return;
+  }
+  renderTimeline(projectId, data);
+  const axisBtn = document.getElementById(`timeline-axis-${projectId}`);
+  if (axisBtn) axisBtn.onclick = () => {
+    const p = state.panels[projectId];
+    p._timelineAbsolute = !p._timelineAbsolute;
+    axisBtn.textContent = p._timelineAbsolute ? 'absolute' : 'relative';
+    renderTimeline(projectId, data);
+  };
+  const refreshBtn = document.getElementById(`timeline-refresh-${projectId}`);
+  if (refreshBtn) refreshBtn.onclick = () => loadTimeline(projectId);
+}
+
+function renderTimeline(projectId, data) {
+  const wrap = document.getElementById(`timeline-wrap-${projectId}`);
+  if (!wrap) return;
+  const { tasks = [], sessions = [], goal_events = [] } = data || {};
+  if (!sessions.length && !tasks.length) {
+    wrap.innerHTML = `<div class="timeline-empty">no activity yet — log a task to see it here</div>`;
+    return;
+  }
+  const allTs = [
+    ...tasks.map(t => Date.parse(t.created_at.replace(' ', 'T') + 'Z')),
+    ...sessions.map(s => Date.parse(s.registered_at.replace(' ', 'T') + 'Z')),
+    ...sessions.map(s => Date.parse(s.last_seen.replace(' ', 'T') + 'Z')),
+    ...goal_events.map(g => Date.parse(g.updated_at.replace(' ', 'T') + 'Z')),
+  ].filter(n => !isNaN(n));
+  if (!allTs.length) { wrap.innerHTML = `<div class="timeline-empty">no timestamps</div>`; return; }
+  const minTs = Math.min(...allTs);
+  const maxTs = Math.max(...allTs, minTs + 60_000); // 1-min minimum span
+  const span = maxTs - minTs;
+  const isAbs = !!(state.panels[projectId] && state.panels[projectId]._timelineAbsolute);
+  const fmtTs = (ts) => isAbs
+    ? new Date(ts).toISOString().replace('T', ' ').slice(0, 16)
+    : formatRelativeTime(new Date(ts).toISOString().replace('T', ' ').slice(0, 19));
+
+  let html = `<div class="timeline-axis"><div class="label">session</div><div class="ticks">` +
+    `<span>${escapeHtml(fmtTs(minTs))}</span>` +
+    `<span>${escapeHtml(fmtTs((minTs+maxTs)/2))}</span>` +
+    `<span>${escapeHtml(fmtTs(maxTs))}</span>` +
+    `</div></div>`;
+
+  const tasksBySession = {};
+  tasks.forEach(t => {
+    (tasksBySession[t.session_id] = tasksBySession[t.session_id] || []).push(t);
+  });
+
+  sessions.forEach(s => {
+    const label = s.human_id ? `${s.human_id}/${s.name}` : s.name;
+    const pills = (tasksBySession[s.id] || []).map(t => {
+      const ts = Date.parse(t.created_at.replace(' ', 'T') + 'Z');
+      const pct = ((ts - minTs) / span) * 100;
+      const cls = `timeline-pill ${escapeHtml(t.status)}`;
+      const tooltip = `[${t.status}] ${t.description.slice(0, 120)} · ${t.created_at}`;
+      return `<div class="${cls}" style="left:${pct.toFixed(2)}%;width:6px" title="${escapeHtml(tooltip)}"></div>`;
+    }).join('');
+    const events = goal_events.map(g => {
+      const ts = Date.parse(g.updated_at.replace(' ', 'T') + 'Z');
+      const pct = ((ts - minTs) / span) * 100;
+      return `<div class="timeline-event-line" style="left:${pct.toFixed(2)}%" title="goal:${escapeHtml(g.field)} v${g.version} ${escapeHtml(g.updated_at)}"></div>`;
+    }).join('');
+    html += `<div class="timeline-row"><div class="label" title="${escapeHtml(s.id)}">${escapeHtml(label)}</div>` +
+            `<div class="timeline-track">${events}${pills}</div></div>`;
+  });
+  wrap.innerHTML = html;
 }
 
 async function loadFilesTab(projectId) {

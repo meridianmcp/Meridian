@@ -1238,6 +1238,108 @@ async def get_sprint_items(
     return [_row_to_dict(r) for r in rows]  # type: ignore[misc]
 
 
+async def get_timeline(
+    db: aiosqlite.Connection, project_id: str
+) -> dict[str, Any]:
+    """v1.1.1 — return everything the Activity Timeline needs in one call.
+
+    Returns ``{tasks, sessions, goal_events}`` where:
+
+      * ``tasks``     — every task in the project with its session
+        name attached so the frontend can lay them out per swimlane.
+      * ``sessions``  — id, name, human_id, created_at (registered),
+        last_seen. Drives one swimlane per row.
+      * ``goal_events`` — every (north_star, version_goal, sprint)
+        update with the field that changed and the timestamp. Drives
+        the vertical dashed lines on the time axis.
+    """
+    async with db.execute(
+        "SELECT t.id, t.created_at, t.status, t.description, "
+        "       t.session_id, s.name AS session_name, s.human_id "
+        "FROM task_log t LEFT JOIN sessions s ON s.id = t.session_id "
+        "WHERE t.project_id = ? "
+        "ORDER BY t.created_at ASC, t.rowid ASC",
+        (project_id,),
+    ) as cur:
+        task_rows = await cur.fetchall()
+    tasks = [
+        {
+            "id": r["id"],
+            "created_at": r["created_at"],
+            "status": r["status"],
+            "description": r["description"],
+            "session_id": r["session_id"],
+            "session_name": r["session_name"] or "(unknown)",
+            "human_id": r["human_id"],
+        }
+        for r in task_rows
+    ]
+
+    async with db.execute(
+        "SELECT id, name, human_id, status, created_at, last_seen "
+        "FROM sessions WHERE project_id = ? "
+        "ORDER BY created_at ASC, rowid ASC",
+        (project_id,),
+    ) as cur:
+        session_rows = await cur.fetchall()
+    sessions = [
+        {
+            "id": r["id"],
+            "name": r["name"],
+            "human_id": r["human_id"],
+            "status": r["status"],
+            "registered_at": r["created_at"],
+            "last_seen": r["last_seen"],
+        }
+        for r in session_rows
+    ]
+
+    async with db.execute(
+        "SELECT version, goal_north_star, content, goal_sprint, "
+        "       created_at, updated_at "
+        "FROM goal_states WHERE project_id = ? "
+        "ORDER BY version ASC",
+        (project_id,),
+    ) as cur:
+        goal_rows = await cur.fetchall()
+    # Derive change events by diffing successive goal rows. Each row
+    # produces 0–3 events depending on which fields actually changed.
+    goal_events: list[dict[str, Any]] = []
+    prev: dict[str, Any] | None = None
+    for r in goal_rows:
+        row = {
+            "north_star": r["goal_north_star"] or "",
+            "version_goal": _decode_content(r["content"] or ""),
+            "sprint": r["goal_sprint"] or "",
+            "version": r["version"],
+            "updated_at": r["updated_at"],
+        }
+        if prev is None:
+            # Seed events for v1 of each field.
+            for field in ("north_star", "version_goal", "sprint"):
+                if row[field]:
+                    goal_events.append({
+                        "field": field,
+                        "version": row["version"],
+                        "updated_at": row["updated_at"],
+                    })
+        else:
+            for field in ("north_star", "version_goal", "sprint"):
+                if row[field] != prev[field]:
+                    goal_events.append({
+                        "field": field,
+                        "version": row["version"],
+                        "updated_at": row["updated_at"],
+                    })
+        prev = row
+
+    return {
+        "tasks": tasks,
+        "sessions": sessions,
+        "goal_events": goal_events,
+    }
+
+
 def build_sprint_items_xml(items: list[dict[str, Any]]) -> str:
     """Serialise sprint items as a ``<sprint_items>`` XML block.
 

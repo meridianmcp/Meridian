@@ -2822,3 +2822,72 @@ def test_dashboard_html_no_chat_input_textarea(client):
     assert "chat-input-row" not in html
     # And the new CTA replaces it.
     assert "claude-handoff-panel" in html
+
+
+# ---------------------------------------------------------------------------
+# v1.1.1 — Activity Timeline
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_get_timeline_shape(db):
+    p = await db_module.create_project(db, "alpha")
+    s1 = await db_module.register_session(
+        db, p["id"], "worker-1", human_id="adam"
+    )
+    s2 = await db_module.register_session(db, p["id"], "worker-2")
+    await db_module.log_task(db, s1["id"], p["id"], "did A", "done")
+    await db_module.log_task(db, s2["id"], p["id"], "did B", "failed")
+    await db_module.set_goal(db, p["id"], "v1", north_star="N", sprint="S")
+    await db_module.set_north_star(db, p["id"], "N2")
+    timeline = await db_module.get_timeline(db, p["id"])
+    assert {"tasks", "sessions", "goal_events"} <= set(timeline)
+    assert len(timeline["tasks"]) == 2
+    assert {t["status"] for t in timeline["tasks"]} == {"done", "failed"}
+    # session_name is attached for swimlane rendering.
+    assert {t["session_name"] for t in timeline["tasks"]} == {
+        "worker-1", "worker-2"
+    }
+    assert len(timeline["sessions"]) == 2
+    # Goal events fire on initial fields + north_star change.
+    fields = {e["field"] for e in timeline["goal_events"]}
+    assert "north_star" in fields
+
+
+def test_get_timeline_endpoint_returns_payload(client):
+    project = client.post("/projects", json={"name": "alpha"}).json()
+    sess = client.post(
+        "/sessions/register",
+        json={"project_id": project["id"], "name": "w", "human_id": "adam"},
+    ).json()
+    client.post(
+        "/tasks",
+        json={
+            "session_id": sess["id"],
+            "project_id": project["id"],
+            "description": "shipped",
+            "status": "done",
+        },
+    )
+    r = client.get(f"/projects/{project['id']}/timeline")
+    assert r.status_code == 200
+    body = r.json()
+    assert isinstance(body["tasks"], list)
+    assert isinstance(body["sessions"], list)
+    assert isinstance(body["goal_events"], list)
+    assert len(body["tasks"]) == 1
+    assert body["tasks"][0]["session_name"] == "w"
+    assert body["tasks"][0]["human_id"] == "adam"
+
+
+def test_get_timeline_endpoint_404_for_unknown(client):
+    r = client.get("/projects/no-such-project/timeline")
+    assert r.status_code == 404
+
+
+def test_dashboard_html_has_timeline_tab(client):
+    """The dashboard exposes a TIMELINE drawer tab and loads it lazily."""
+    html = client.get("/dashboard").text
+    assert 'data-vtab="timeline"' in html
+    assert "drawer-timeline-" in html
+    assert "loadTimeline" in html
