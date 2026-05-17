@@ -154,7 +154,7 @@ async def enqueue_claude_task(
     prompt: str,
     *,
     worker_argv: list[str] | None = None,
-    timeout: float | None = 600.0,
+    timeout: float | None = 900.0,
     wait: bool = False,
 ) -> dict[str, Any]:
     """Queue a Claude subprocess for async execution; return the pending task.
