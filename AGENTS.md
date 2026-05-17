@@ -136,3 +136,5 @@ REPO:       C:\Users\13144\Documents\Meridian\repository
 - dashboard.py is large — find/replace only
 - pixi run test must pass before every commit
 - Commit after every logical unit: `git commit -m "feat: vX.Y.Z — description"`
+
+
