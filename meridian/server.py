@@ -1688,6 +1688,30 @@ def build_mcp_server():
                 },
             ),
             Tool(
+                name="complete_task",
+                description=(
+                    "Mark a claimed task as done and log an optional "
+                    "completion note. Call this after finishing the work "
+                    "described in the task. Pair with claim_task at the "
+                    "start of work. If the task was already marked done "
+                    "or failed by another process, the call is safe and "
+                    "returns the current task state."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "project_id": {"type": "string"},
+                        "task_id": {"type": "string"},
+                        "session_id": {"type": "string"},
+                        "note": {
+                            "type": "string",
+                            "description": "optional completion note appended to the task description",
+                        },
+                    },
+                    "required": ["project_id", "task_id", "session_id"],
+                },
+            ),
+            Tool(
                 name="start_worker_session",
                 description=(
                     "v1.2.0 — register a worker session and claim its "
@@ -2146,6 +2170,23 @@ def build_mcp_server():
                     arguments["project_id"],
                     status=arguments.get("status"),
                 )
+            elif name == "complete_task":
+                task = await db_module.get_task(db, arguments["task_id"])
+                if task is None:
+                    result = {"error": f"task {arguments['task_id']} not found"}
+                else:
+                    note = arguments.get("note", "")
+                    new_desc = (
+                        f"{task['description']} — {note}" if note else task["description"]
+                    )
+                    updated = await db_module.update_task(
+                        db,
+                        arguments["task_id"],
+                        status="done",
+                        description=new_desc,
+                    )
+                    db_module._publish_task("task_updated", updated or task)
+                    result = updated or task
             else:
                 result = {"error": f"unknown tool: {name}"}
         except Exception as exc:  # noqa: BLE001 — surface to MCP client

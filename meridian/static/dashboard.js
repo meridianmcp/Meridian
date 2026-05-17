@@ -217,6 +217,7 @@ function buildTabBody(project) {
         <div class="drawer-header" style="justify-content:space-between">
           <span>LIVE · ${escapeHtml(project.name)}</span>
           <span style="display:flex;gap:6px;align-items:center">
+            <button class="secondary" id="live-auto-btn-${project.id}" title="Toggle auto-refresh" style="padding:2px 8px;font-size:10px">↻ Auto</button>
             <button class="secondary" id="live-pause-${project.id}" title="Pause queue (UI stub)" style="padding:2px 8px;font-size:10px">Pause</button>
             <button class="secondary" id="live-run-${project.id}" title="Run all pending (UI stub)" style="padding:2px 8px;font-size:10px">Run All</button>
           </span>
@@ -562,7 +563,48 @@ function buildTabBody(project) {
 // Section A: active sessions (filtered to last 24h) with claimed task
 // per session, freshness dot, and human_id badge.
 // Section B: pending + in_progress tasks, [+ Add task] input, cancel
-// per row. WebSocket-driven refresh (no setInterval polling).
+// per row. WS-driven + optional 30s auto-refresh (v1.7.0).
+
+const LIVE_REFRESH_MS = 30000;
+const LIVE_THROTTLE_MS = 10000;
+const liveRefreshState = {}; // keyed by projectId
+
+function scheduleLiveRefresh(projectId) {
+  const s = liveRefreshState[projectId] || (liveRefreshState[projectId] = {});
+  clearTimeout(s.timer);
+  if (!s.enabled) return;
+  const sinceLastMs = Date.now() - (s.lastRefresh || 0);
+  const wait = Math.max(LIVE_THROTTLE_MS, LIVE_REFRESH_MS - sinceLastMs);
+  s.timer = setTimeout(async () => {
+    s.lastRefresh = Date.now();
+    const panel = state.panels[projectId];
+    if (panel && panel.activeVtab === 'live') {
+      await refreshLiveTab(projectId);
+    }
+    scheduleLiveRefresh(projectId);
+  }, wait);
+}
+
+function initLiveAutoRefresh(projectId) {
+  const s = liveRefreshState[projectId] || (liveRefreshState[projectId] = {});
+  const stored = localStorage.getItem('meridian.liveAutoRefresh');
+  s.enabled = stored === null ? true : stored === 'true';
+  const btn = document.getElementById(`live-auto-btn-${projectId}`);
+  if (btn) {
+    btn.textContent = s.enabled ? '↻ Auto' : '↻ Off';
+    btn.style.opacity = s.enabled ? '1' : '0.4';
+    btn.onclick = () => {
+      s.enabled = !s.enabled;
+      localStorage.setItem('meridian.liveAutoRefresh', String(s.enabled));
+      btn.textContent = s.enabled ? '↻ Auto' : '↻ Off';
+      btn.style.opacity = s.enabled ? '1' : '0.4';
+      if (s.enabled) scheduleLiveRefresh(projectId);
+      else clearTimeout(s.timer);
+    };
+  }
+  if (s.enabled) scheduleLiveRefresh(projectId);
+}
+
 async function loadLiveTab(projectId) {
   const panel = state.panels[projectId];
   if (!panel) return;
@@ -586,6 +628,7 @@ async function loadLiveTab(projectId) {
     panel.liveWired = true;
   }
   await refreshLiveTab(projectId);
+  initLiveAutoRefresh(projectId);
 }
 
 async function refreshLiveTab(projectId) {
@@ -1416,9 +1459,10 @@ function handleWsEvent(projectId, event) {
   // A goal change is often triggered by a HITL reply — re-pull.
   refreshGoal(projectId);
   // v1.6.x — keep the LIVE tab fresh when it's the visible panel.
+  // v1.7.0 — throttle WS bursts via scheduleLiveRefresh (10s floor).
   const panel = state.panels[projectId];
   if (panel && panel.activeVtab === 'live') {
-    refreshLiveTab(projectId);
+    scheduleLiveRefresh(projectId);
   }
 }
 
