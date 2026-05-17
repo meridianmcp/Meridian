@@ -698,14 +698,20 @@ async function openFileEditor(projectId, filename) {
     nameEl.textContent = filename;
     browseEl.style.display = 'none';
     editorEl.style.display = 'flex';
-    // Reset to edit mode when opening a new file
+    // Default to preview mode when opening a file
     const editBtn = document.getElementById(`file-mode-edit-${projectId}`);
     const previewBtn = document.getElementById(`file-mode-preview-${projectId}`);
     const previewDiv = document.getElementById(`file-preview-${projectId}`);
-    if (editBtn) editBtn.classList.add('active');
-    if (previewBtn) previewBtn.classList.remove('active');
-    contentEl.style.display = '';
-    if (previewDiv) previewDiv.style.display = 'none';
+    if (editBtn) editBtn.classList.remove('active');
+    if (previewBtn) previewBtn.classList.add('active');
+    // Render markdown immediately into preview
+    if (previewDiv) {
+      const md = data.content || '';
+      const html = (typeof marked !== 'undefined') ? marked.parse(md) : escapeHtml(md);
+      previewDiv.innerHTML = html;
+      previewDiv.style.display = '';
+    }
+    contentEl.style.display = 'none';
     // Wire edit/preview toggle if not already wired
     if (editBtn && !editBtn._wired) {
       editBtn._wired = true;
