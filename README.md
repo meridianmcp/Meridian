@@ -56,6 +56,16 @@ pixi run demo         # two-session coordination demo
 }
 ```
 
+## Privacy
+
+**Free tier:** runs entirely on your machine. No server, no telemetry, no accounts. We physically cannot see your data because it never leaves your computer.
+
+**Paid/hosted tier:** your data lives on our server. We do not sell it. We do not train models on it — Meridian calls AI APIs, it is not an AI model, and task logs are coordination data not training data. Full export and deletion available at any time. Your SQLite database is an open file format you can take anywhere.
+
+**Enterprise/self-hosted:** runs on your infrastructure. We never have access.
+
+Meridian shows managers what shipped, not how many hours someone worked. No productivity scores, no per-developer rankings, no surveillance features. The developer is the customer.
+
 ## Roadmap
 
 See [ROADMAP.md](ROADMAP.md) for the full version plan and free/paid split.
