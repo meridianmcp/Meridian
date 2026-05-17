@@ -735,6 +735,8 @@ const state = {
   activeTab: null,
   panels: {}, // tabId -> { ws, taskCache, sessionName, chatHistory, goalRaw, goalIsJson }
   apiKeyConfigured: false,
+  // v0.6.5 — server runtime config fetched from /config on startup.
+  serverConfig: { server_url: '', host: '', port: 0, version: '' },
 };
 
 function toast(msg, isError=false) {
@@ -753,6 +755,17 @@ async function api(path, opts={}) {
     throw new Error(`${r.status}: ${text}`);
   }
   return r.status === 204 ? null : r.json();
+}
+
+async function loadServerConfig() {
+  // v0.6.5 — pull /config so the dashboard can show the version and
+  // (in hosted deployments) target a non-localhost server_url.
+  try {
+    const cfg = await api('/config');
+    state.serverConfig = cfg || state.serverConfig;
+    const verEl = document.getElementById('server-version');
+    if (verEl && cfg?.version) verEl.textContent = `v${cfg.version}`;
+  } catch (e) { /* offline / older server — ignore */ }
 }
 
 async function loadConfig() {
@@ -1631,6 +1644,7 @@ async function restoreTabs() {
 }
 
 (async function init() {
+  await loadServerConfig();
   await loadConfig();
   await loadProjects();
   // v0.6.6 — EZ first-run wizard: if no projects exist, show the overlay

@@ -2733,3 +2733,56 @@ def test_http_sprint_items_endpoints(client):
         json={"reason": "nope"},
     )
     assert r.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# v0.6.5 — /config endpoint contract
+# ---------------------------------------------------------------------------
+
+
+def test_config_endpoint_shape(client, monkeypatch):
+    """GET /config exposes server_url + host + port + version + db."""
+    monkeypatch.setenv("MERIDIAN_HOST", "127.0.0.1")
+    monkeypatch.setenv("MERIDIAN_PORT", "7878")
+    monkeypatch.delenv("MERIDIAN_SERVER_URL", raising=False)
+    r = client.get("/config")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["host"] == "127.0.0.1"
+    assert body["port"] == 7878
+    assert body["server_url"] == "http://127.0.0.1:7878"
+    assert isinstance(body["version"], str)
+    assert body["db"] in {"memory", "sqlite"}
+
+
+def test_config_endpoint_respects_server_url_override(client, monkeypatch):
+    """When MERIDIAN_SERVER_URL is set the dashboard targets that URL,
+    not the host/port pair — needed for hosted / reverse-proxied deploys."""
+    monkeypatch.setenv("MERIDIAN_SERVER_URL", "https://meridian.example.com")
+    r = client.get("/config")
+    assert r.status_code == 200
+    assert r.json()["server_url"] == "https://meridian.example.com"
+
+
+def test_dashboard_html_calls_loadServerConfig(client):
+    """The dashboard JS must call /config on startup so it can render
+    the version label and (in hosted mode) target the right URL."""
+    html = client.get("/dashboard").text
+    assert "loadServerConfig" in html
+    assert "/config" in html
+
+
+# ---------------------------------------------------------------------------
+# v0.6.4 — dashboard save + dirty state (confirmation tests)
+# ---------------------------------------------------------------------------
+
+
+def test_dashboard_html_has_save_buttons_and_dirty_state(client):
+    """All three goal fields have their own save button + the dirty
+    CSS class is wired up so unsaved edits are visible."""
+    html = client.get("/dashboard").text
+    assert "save-north-star-" in html
+    assert "save-goal-" in html
+    assert "save-sprint-" in html
+    assert ".goal-area.dirty" in html
+    assert ".goal-area.readonly" in html

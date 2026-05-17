@@ -176,11 +176,26 @@ async def server_config() -> dict[str, Any]:
     Allows the frontend to be location-agnostic: it reads the server URL
     from this endpoint rather than hardcoding localhost. Also used by the
     PyInstaller exe launcher to confirm the server is up.
+
+    Fields:
+      * ``server_url`` — the absolute URL the frontend should target.
+        Defaults to ``http://{host}:{port}`` but is overridable via
+        ``MERIDIAN_SERVER_URL`` for hosted / reverse-proxied deployments.
+      * ``host`` / ``port`` — split form, useful for tooling.
+      * ``version`` — current Meridian version, surfaced in the dashboard
+        title bar so a user can see which build they're talking to.
+      * ``db`` — ``memory`` or ``sqlite``; lets the dashboard show a
+        scratch-DB warning during tests.
     """
+    host = os.environ.get("MERIDIAN_HOST", "127.0.0.1")
+    port = int(os.environ.get("MERIDIAN_PORT", "7878"))
+    default_url = f"http://{host}:{port}"
+    server_url = os.environ.get("MERIDIAN_SERVER_URL", default_url)
     return {
-        "host": os.environ.get("MERIDIAN_HOST", "127.0.0.1"),
-        "port": int(os.environ.get("MERIDIAN_PORT", "7878")),
-        "version": "0.6.5",
+        "server_url": server_url,
+        "host": host,
+        "port": port,
+        "version": "1.1.0",
         "db": "memory" if os.environ.get("MERIDIAN_DB") == ":memory:" else "sqlite",
     }
 
