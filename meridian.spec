@@ -12,6 +12,7 @@ a = Analysis(
     binaries=[],
     datas=[
         ('meridian/templates', 'meridian/templates'),
+        ('meridian/static', 'meridian/static'),
     ],
     hiddenimports=[
         'meridian',

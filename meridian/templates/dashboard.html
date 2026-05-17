@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Meridian Dashboard</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🧭</text></svg>">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<!-- v1.1.0 — marked.js for goal edit/preview toggle. CDN, no build step. -->
+<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+<link rel="stylesheet" href="/static/dashboard.css">
+</head>
+<body>
+<div class="app">
+  <aside class="sidebar">
+    <div class="sidebar-header">MERIDIAN<small>v0.4.0 dashboard</small></div>
+    <div id="api-warn">No auth configured — chat disabled. Set ANTHROPIC_API_KEY or connect Claude Max.</div>
+    <div id="auth-method" style="margin:6px 10px 0;padding:5px 10px;background:rgba(0,212,170,0.08);border:1px solid rgba(0,212,170,0.25);border-radius:4px;color:var(--accent-green);font-size:10px;display:none"></div>
+    <div class="projects-label">Projects</div>
+    <select id="project-switcher" class="project-switcher"></select>
+    <div id="project-list" class="project-list"></div>
+    <div class="new-project">
+      <input id="new-project-name" type="text" placeholder="new project name">
+      <input id="new-project-human" type="text" placeholder="your name (optional)" style="max-width:120px">
+      <button class="primary" id="new-project-btn">+</button>
+    </div>
+  </aside>
+  <main class="main">
+    <div class="tabs" id="tabs"></div>
+    <div class="tab-bodies" id="tab-bodies">
+      <div class="empty">no project open — pick one on the left</div>
+    </div>
+  </main>
+</div>
+<div class="toast" id="toast"></div>
+
+
+
+<!-- v0.6.6 EZ first-run wizard -->
+<div id="ez-wizard" style="display:none;position:fixed;inset:0;background:var(--bg);z-index:9999;flex-direction:column;align-items:center;justify-content:center;gap:16px;padding:40px">
+  <div style="font-size:28px;font-weight:700;color:var(--accent);font-family:'IBM Plex Mono',monospace;letter-spacing:0.05em">MERIDIAN</div>
+  <div style="color:var(--muted);font-size:13px;font-family:'IBM Plex Mono',monospace;text-align:center;max-width:400px">coordinate your AI agents across sessions, humans, and time.</div>
+  <div style="background:var(--surface-2);border:1px solid var(--border);border-radius:8px;padding:28px 32px;display:flex;flex-direction:column;gap:14px;width:100%;max-width:400px">
+    <div style="font-size:11px;color:var(--muted);font-family:'IBM Plex Mono',monospace;letter-spacing:0.08em;text-transform:uppercase">create your first project</div>
+    <input id="ez-project-name" type="text" placeholder="project name (e.g. my-app)"
+      style="background:var(--surface-1);border:1px solid var(--border);border-radius:4px;padding:10px 12px;color:var(--text);font-family:'IBM Plex Mono',monospace;font-size:13px;outline:none;width:100%;box-sizing:border-box">
+    <input id="ez-human-name" type="text" placeholder="your name (optional)"
+      style="background:var(--surface-1);border:1px solid var(--border);border-radius:4px;padding:10px 12px;color:var(--text);font-family:'IBM Plex Mono',monospace;font-size:13px;outline:none;width:100%;box-sizing:border-box">
+    <button id="ez-create-btn" class="primary" style="padding:12px;font-size:13px;margin-top:4px">Create Project →</button>
+    <div id="ez-error" style="color:var(--status-failed);font-size:11px;font-family:'IBM Plex Mono',monospace;display:none"></div>
+  </div>
+  <div style="font-size:10px;color:var(--muted);font-family:'IBM Plex Mono',monospace">
+    <a href="#" id="ez-advanced-link" style="color:var(--muted);text-decoration:underline">advanced setup ↗</a>
+  </div>
+</div>
+
+<script src="/static/dashboard.js"></script>
+
+</body>
+</html>

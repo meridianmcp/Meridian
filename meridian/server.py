@@ -22,6 +22,8 @@ from typing import Any
 import aiosqlite
 from fastapi import FastAPI, HTTPException, Request, WebSocket
 from fastapi.responses import HTMLResponse, Response, StreamingResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
 
 from . import dashboard as dashboard_module
 from . import db as db_module
@@ -168,6 +170,32 @@ app = FastAPI(
     version="0.1.0",
     lifespan=lifespan,
 )
+
+
+# ---------------------------------------------------------------------------
+# v1.0.2 — Static files + Jinja2 templates
+# ---------------------------------------------------------------------------
+
+
+def _resource_path(relative: str) -> str:
+    """Resolve a resource path relative to the package root.
+
+    Works in dev (relative to repo) and in frozen PyInstaller exe.
+    In a frozen exe, ``sys._MEIPASS`` is the temp directory where PyInstaller
+    unpacks the bundle; in development it falls back to the repo root
+    (two levels above this file's directory).
+    """
+    import sys
+    base = getattr(sys, "_MEIPASS", Path(__file__).parent.parent)
+    return str(Path(base) / relative)
+
+
+app.mount(
+    "/static",
+    StaticFiles(directory=_resource_path("meridian/static")),
+    name="static",
+)
+_templates = Jinja2Templates(directory=_resource_path("meridian/templates"))
 
 
 def _db(request: Request) -> aiosqlite.Connection:
@@ -902,9 +930,9 @@ async def export_project_pdf(project_id: str, request: Request):
 
 
 @app.get("/dashboard", response_class=HTMLResponse)
-async def dashboard_html() -> str:
-    """Serve the single-file dashboard UI."""
-    return dashboard_module.DASHBOARD_HTML
+async def dashboard_html(request: Request) -> Any:
+    """Serve the Meridian dashboard from a Jinja2 template."""
+    return _templates.TemplateResponse(request, "dashboard.html")
 
 
 @app.get("/config/api-key")
