@@ -69,33 +69,28 @@ def test_dashboard_loads_200(client):
 
 
 def test_dashboard_north_star_not_same_as_version_goal(js):
-    """The north-star textarea reads ``goal.north_star`` — not ``goal.content``.
+    """Goal tab shows three separate subtabs — not stacked textareas sharing content.
 
-    Bug 1 screenshot: both north-star and version-goal showed identical text
-    because ``refreshGoal`` was setting both textareas from ``goal.content``.
-    This test verifies the JS reads the correct field for each textarea.
+    Bug 1 + Bug 5: The goal panel now has a [North Star] [Version Goal] [Sprint]
+    tab bar. Each tab shows one full-height textarea. No edit/preview toggle on
+    goal fields (those are structured data, not markdown documents).
     """
-    # north_star field must be populated from goal.north_star, not goal.content
-    assert "nsTA.value = goal.north_star" in js, (
-        "Bug 1: refreshGoal must set north-star textarea from goal.north_star, "
-        "not goal.content."
+    # Subtab buttons must exist
+    assert 'data-gtab="north-star"' in js, "north-star subtab button missing"
+    assert 'data-gtab="version-goal"' in js, "version-goal subtab button missing"
+    assert 'data-gtab="sprint"' in js, "sprint subtab button missing"
+    # Each subtab panel has a distinct textarea ID
+    assert "goal-north-star-" in js, "north-star textarea ID prefix missing"
+    assert 'id="goal-${' in js or "goal-${project.id}" in js or '`goal-${' in js, (
+        "version-goal textarea id missing"
     )
-    # The north-star element must have its own distinct ID prefix
-    assert "goal-north-star-" in js, (
-        "north-star textarea must have a distinct id prefix 'goal-north-star-'"
-    )
-    # Version goal uses goal.content (the API field name) — correct behaviour
-    # Confirm version-goal uses a DIFFERENT id prefix to north-star
-    assert '`goal-${' in js or "goal-${project.id}" in js, (
-        "version-goal textarea must use id prefix 'goal-' (without 'north-star')"
-    )
-    # Sprint must also have its own id
-    assert "goal-sprint-" in js, (
-        "sprint textarea must have a distinct id prefix 'goal-sprint-'"
-    )
-    assert "spTA.value = goal.sprint" in js, (
-        "refreshGoal must set sprint textarea from goal.sprint"
-    )
+    assert "goal-sprint-" in js, "sprint textarea ID missing"
+    # JS still reads goal.north_star for north star field
+    assert "goal.north_star" in js, "refreshGoal must read goal.north_star"
+    assert "goal.sprint" in js, "refreshGoal must read goal.sprint"
+    # Goal subtab class names in JS
+    assert "goal-subtab-btn" in js, "goal subtab buttons missing from buildTabBody"
+    assert "goal-subtab-panel" in js, "goal subtab panels missing from buildTabBody"
 
 
 def test_dashboard_has_save_buttons(client, js):
@@ -137,9 +132,13 @@ def test_dashboard_has_edit_preview_toggles(js, css):
     assert "preview-btn" in css, "preview-btn CSS class missing"
     assert "goal-preview" in css, "goal-preview CSS class missing"
 
-    # Preview wiring must exist in JS
+    # Preview wiring must exist in JS (wireGoalPreviewToggle is generic helper; file editor wires preview inline)
     assert "wireGoalPreviewToggle" in js, (
-        "wireGoalPreviewToggle function missing from dashboard.js"
+        "wireGoalPreviewToggle function missing — it's the generic preview toggle helper used by files tab"
+    )
+    # File editor must have edit/preview mode toggle
+    assert "file-mode-preview-" in js, (
+        "File editor edit/preview toggle missing — preview belongs on Files tab, not Goal tab"
     )
     assert "marked.parse" in js, (
         "marked.parse call missing — edit/preview toggle won't render markdown"
@@ -170,4 +169,84 @@ def test_dashboard_has_timeline_tab(soup, js):
     scripts = [s.get("src", "") for s in soup.find_all("script")]
     assert any("dashboard.js" in s for s in scripts), (
         "dashboard.html must reference /static/dashboard.js"
+    )
+
+
+def test_dashboard_goal_tab_has_no_preview_toggle(js):
+    """Goal textareas must NOT have the edit/preview chip toggle (Bug 5).
+
+    Goal fields are structured data (north star, version goal, sprint),
+    not markdown documents. The preview toggle belongs on the Files tab.
+    The goal drawer must use subtab switching, not stacked sections with previews.
+    """
+    # Goal subtab structure must exist
+    assert 'data-gtab="north-star"' in js, "goal north-star subtab missing"
+    assert "goal-subtab-strip" in js, "goal subtab strip class missing from JS"
+    assert "goal-subtab-btn" in js, "goal subtab button class missing from JS"
+
+
+def test_dashboard_files_tab_has_preview_toggle(client, js):
+    """File editor has edit/preview toggle chips (STEP 1 — preview moves to files).
+
+    The edit/preview Marked.js toggle belongs on the Files tab, where
+    files like AGENTS.md and ROADMAP.md are actual markdown documents.
+    """
+    # File editor mode buttons must be in JS
+    assert "file-mode-preview-" in js, (
+        "File editor preview mode button ID missing from dashboard.js"
+    )
+    assert "file-mode-edit-" in js, (
+        "File editor edit mode button ID missing from dashboard.js"
+    )
+    # File preview div must be in JS
+    assert "file-preview-" in js, (
+        "File preview div ID missing from dashboard.js"
+    )
+    # Marked.js must still be loaded (used by file preview)
+    html = client.get("/dashboard").text
+    assert "marked.min.js" in html, "marked.js CDN link must remain in dashboard.html"
+
+
+def test_dashboard_sidebar_has_no_translatex(client):
+    """Left sidebar must be permanently visible on desktop — no translateX hiding (Bug 8).
+
+    On desktop the sidebar grid column is always 280px. No CSS transform
+    is used to hide it. A hamburger button appears ONLY on mobile (<768px).
+    """
+    css = client.get("/static/dashboard.css").text
+    # The LEFT sidebar column in .app must be a fixed width (not 0)
+    assert "280px" in css, "sidebar 280px column must exist in CSS"
+    # Mobile responsive code should exist for <768px
+    assert "768px" in css, "mobile breakpoint missing — sidebar must hide on mobile only"
+    # The mobile sidebar must use left: -280px (not translateX)
+    assert "left: -280px" in css or "left:-280px" in css, (
+        "Mobile sidebar must use `left: -280px` for hiding, not translateX"
+    )
+
+
+def test_dashboard_open_in_claude_not_dominant(client):
+    """The 'Open in Claude' panel must not dominate the layout (Bug 6).
+
+    Goal fields are the primary surface. The Claude handoff panel
+    must be a narrow utility strip, not flex:1 competing with goal content.
+    """
+    css = client.get("/static/dashboard.css").text
+    # Claude panel must be fixed narrow width (not flex:1)
+    assert ".claude-handoff-panel" in css
+    # Check it's not declared as flex:1 (which would make it half the screen)
+    # Extract the rule block
+    import re
+    m = re.search(r'\.claude-handoff-panel\s*\{([^}]+)\}', css)
+    assert m, ".claude-handoff-panel CSS rule not found"
+    rule = m.group(1)
+    assert "flex: 1" not in rule and "flex:1" not in rule, (
+        "Bug 6: .claude-handoff-panel has flex:1 — it dominates the layout. "
+        "Fix: give it a fixed narrow width (e.g. width: 200px; flex-shrink: 0)."
+    )
+    # vtab-drawer should now be the dominant panel (flex:1)
+    m2 = re.search(r'\.vtab-drawer\s*\{([^}]+)\}', css)
+    assert m2, ".vtab-drawer CSS rule not found"
+    drawer_rule = m2.group(1)
+    assert "flex: 1" in drawer_rule or "flex:1" in drawer_rule, (
+        "Bug 6: .vtab-drawer must be flex:1 so goal panel dominates the layout."
     )

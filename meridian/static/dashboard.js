@@ -213,35 +213,45 @@ function buildTabBody(project) {
         <div id="hitl-queue-${project.id}"></div>
       </div>
       <div class="drawer-panel" id="drawer-goal-${project.id}">
-        <div class="drawer-header">GOAL · ${escapeHtml(project.name)}</div>
-        <div style="flex:1;display:flex;flex-direction:column;padding:12px 14px;gap:10px;overflow-y:auto">
-          <div style="display:flex;align-items:center;justify-content:space-between;flex-shrink:0">
+        <div class="drawer-header" style="justify-content:space-between">
+          <span>GOAL · ${escapeHtml(project.name)}</span>
+          <span style="display:flex;gap:6px;align-items:center">
             <span class="goal-version" id="goal-version-${project.id}"></span>
-            <span style="display:flex;gap:6px;align-items:center">
-              <button class="secondary" id="goal-mode-${project.id}" title="Toggle between manual and auto goal mode">mode: manual</button>
-            </span>
+            <button class="secondary" id="goal-mode-${project.id}" title="Toggle between manual and auto goal mode">mode: manual</button>
+          </span>
+        </div>
+        <div class="goal-subtab-strip">
+          <button class="goal-subtab-btn active" data-gtab="north-star">🔭 North Star</button>
+          <button class="goal-subtab-btn" data-gtab="version-goal">◎ Version Goal</button>
+          <button class="goal-subtab-btn" data-gtab="sprint">⚡ Sprint</button>
+        </div>
+        <div class="goal-subtab-body">
+          <div class="goal-subtab-panel active" id="gtab-north-star-${project.id}">
+            <textarea class="goal-area goal-full mono" id="goal-north-star-${project.id}" placeholder="(north star not set — set once, rarely change)"></textarea>
+            <div class="goal-actions">
+              <button class="primary" id="save-north-star-${project.id}">save north star</button>
+              <span class="goal-ts" id="goal-ns-ts-${project.id}"></span>
+              <span id="goal-ns-lock-${project.id}" style="opacity:0.5;font-size:11px"></span>
+            </div>
           </div>
-          <div class="goal-section">
-            <div class="goal-label">🔭 North Star <span id="goal-ns-lock-${project.id}" style="opacity:0.5"></span><span class="goal-ts" id="goal-ns-ts-${project.id}"></span></div>
-            <textarea class="goal-area mono" id="goal-north-star-${project.id}" placeholder="(north star not set)"></textarea>
-            <div class="goal-actions"><button class="primary" id="save-north-star-${project.id}">save north star</button></div>
-          </div>
-          <div class="goal-section">
-            <div class="goal-label">◎ Version Goal<span class="goal-ts" id="goal-vg-ts-${project.id}"></span></div>
-            <textarea class="goal-area mono" id="goal-${project.id}" placeholder="(no version goal set)" style="flex:1;max-height:none;resize:vertical"></textarea>
+          <div class="goal-subtab-panel" id="gtab-version-goal-${project.id}">
+            <textarea class="goal-area goal-full mono" id="goal-${project.id}" placeholder="(no version goal set)"></textarea>
             <div class="goal-actions">
               <button class="primary" id="save-goal-${project.id}">save version goal</button>
               <span class="goal-version" id="goal-state-${project.id}"></span>
+              <span class="goal-ts" id="goal-vg-ts-${project.id}"></span>
             </div>
           </div>
-          <div class="goal-section">
-            <div class="goal-label">⚡ Sprint<span class="goal-ts" id="goal-sp-ts-${project.id}"></span></div>
-            <textarea class="goal-area sprint mono" id="goal-sprint-${project.id}" placeholder="(sprint not set)"></textarea>
-            <div class="goal-actions"><button class="secondary" id="save-sprint-${project.id}">save sprint</button></div>
+          <div class="goal-subtab-panel" id="gtab-sprint-${project.id}">
+            <textarea class="goal-area goal-full mono" id="goal-sprint-${project.id}" placeholder="(sprint not set)"></textarea>
+            <div class="goal-actions">
+              <button class="secondary" id="save-sprint-${project.id}">save sprint</button>
+              <span class="goal-ts" id="goal-sp-ts-${project.id}"></span>
+            </div>
           </div>
-          <div style="flex-shrink:0;padding:4px 0 8px 0">
-            <a class="secondary" style="display:inline-block;padding:5px 12px;border:1px solid var(--border);border-radius:4px;color:var(--muted);font-size:10px;text-decoration:none;font-family:'IBM Plex Mono',monospace;cursor:pointer" href="/projects/${project.id}/export/pdf" download>⬇ Export IP Record (PDF)</a>
-          </div>
+        </div>
+        <div style="flex-shrink:0;padding:8px 14px;border-top:1px solid var(--border)">
+          <a class="secondary" style="display:inline-block;padding:5px 12px;border:1px solid var(--border);border-radius:4px;color:var(--muted);font-size:10px;text-decoration:none;font-family:'IBM Plex Mono',monospace;cursor:pointer" href="/projects/${project.id}/export/pdf" download>⬇ Export IP Record (PDF)</a>
         </div>
       </div>
       <div class="drawer-panel" id="drawer-files-${project.id}">
@@ -255,7 +265,12 @@ function buildTabBody(project) {
             <span id="file-name-${project.id}" style="flex:1;color:var(--accent);font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"></span>
             <button class="primary" id="file-save-${project.id}" style="padding:2px 8px;font-size:10px">save</button>
           </div>
+          <div class="preview-toggle-row" style="padding:6px 14px 4px;flex-shrink:0" id="file-toggle-row-${project.id}">
+            <button class="preview-btn active" data-fmode="edit" id="file-mode-edit-${project.id}">edit</button>
+            <button class="preview-btn" data-fmode="preview" id="file-mode-preview-${project.id}">preview</button>
+          </div>
           <textarea id="file-content-${project.id}" style="flex:1;background:var(--surface-2);border:none;border-top:1px solid var(--border);color:var(--text);padding:10px 14px;font-family:'IBM Plex Mono',monospace;font-size:12px;resize:none;outline:none;overflow-y:auto"></textarea>
+          <div id="file-preview-${project.id}" class="goal-preview" style="display:none;flex:1;margin:10px 14px;"></div>
         </div>
       </div>
       <div class="drawer-panel" id="drawer-devlog-${project.id}">
@@ -358,6 +373,20 @@ function buildTabBody(project) {
         if (vtab === 'timeline') loadTimeline(project.id);
         if (vtab === 'rewind') initRewindTab(project.id);
         if (vtab === 'queue') loadQueue(project.id);
+      };
+    });
+  }
+
+  // Goal subtab switching (North Star / Version Goal / Sprint)
+  const goalDrawer = document.getElementById(`drawer-goal-${project.id}`);
+  if (goalDrawer) {
+    goalDrawer.querySelectorAll('.goal-subtab-btn').forEach(btn => {
+      btn.onclick = () => {
+        goalDrawer.querySelectorAll('.goal-subtab-btn').forEach(b => b.classList.toggle('active', b === btn));
+        const gtab = btn.dataset.gtab;
+        goalDrawer.querySelectorAll('.goal-subtab-panel').forEach(p => {
+          p.classList.toggle('active', p.id === `gtab-${gtab}-${project.id}`);
+        });
       };
     });
   }
@@ -477,9 +506,6 @@ function buildTabBody(project) {
       };
     });
   }
-
-  // v1.1.0 — marked.js edit/preview toggle per goal field.
-  wireGoalPreviewToggle(project.id);
 
   // Files tab: back button returns to browse view; save button persists edits.
   const fileBackBtn = document.getElementById(`file-back-${project.id}`);
@@ -672,6 +698,33 @@ async function openFileEditor(projectId, filename) {
     nameEl.textContent = filename;
     browseEl.style.display = 'none';
     editorEl.style.display = 'flex';
+    // Reset to edit mode when opening a new file
+    const editBtn = document.getElementById(`file-mode-edit-${projectId}`);
+    const previewBtn = document.getElementById(`file-mode-preview-${projectId}`);
+    const previewDiv = document.getElementById(`file-preview-${projectId}`);
+    if (editBtn) editBtn.classList.add('active');
+    if (previewBtn) previewBtn.classList.remove('active');
+    contentEl.style.display = '';
+    if (previewDiv) previewDiv.style.display = 'none';
+    // Wire edit/preview toggle if not already wired
+    if (editBtn && !editBtn._wired) {
+      editBtn._wired = true;
+      [editBtn, previewBtn].forEach(btn => {
+        btn.onclick = () => {
+          [editBtn, previewBtn].forEach(b => b.classList.toggle('active', b === btn));
+          if (btn.dataset.fmode === 'preview') {
+            const md = contentEl.value || '';
+            const html = (typeof marked !== 'undefined') ? marked.parse(md) : escapeHtml(md);
+            previewDiv.innerHTML = html;
+            contentEl.style.display = 'none';
+            previewDiv.style.display = '';
+          } else {
+            previewDiv.style.display = 'none';
+            contentEl.style.display = '';
+          }
+        };
+      });
+    }
   } catch(e) { toast('open failed: ' + e.message, true); }
 }
 
@@ -743,52 +796,37 @@ async function refreshGoal(projectId) {
   }
 }
 
-// v1.1.0 — marked.js edit/preview toggle for the three goal fields.
-// Each textarea gets a small Edit / Preview chip pair injected just
-// above it. Preview mode swaps the textarea out for a rendered div
-// whose innerHTML is marked(textarea.value). Edit mode swaps back.
-function wireGoalPreviewToggle(projectId) {
-  const fields = [
-    { ta: `goal-${projectId}`,            preview: `preview-goal-${projectId}` },
-    { ta: `goal-north-star-${projectId}`, preview: `preview-north-star-${projectId}` },
-    { ta: `goal-sprint-${projectId}`,     preview: `preview-sprint-${projectId}` },
-  ];
-  fields.forEach(({ ta, preview }) => {
-    const taEl = document.getElementById(ta);
-    if (!taEl) return;
-    if (document.getElementById(`row-${ta}`)) return; // already wired
-    const row = document.createElement('div');
-    row.id = `row-${ta}`;
-    row.className = 'preview-toggle-row';
-    row.innerHTML =
-      `<button class="preview-btn active" data-mode="edit">edit</button>` +
-      `<button class="preview-btn"        data-mode="preview">preview</button>`;
-    taEl.parentNode.insertBefore(row, taEl);
-    const previewDiv = document.createElement('div');
-    previewDiv.id = preview;
-    previewDiv.className = 'goal-preview';
-    previewDiv.style.display = 'none';
-    taEl.parentNode.insertBefore(previewDiv, taEl.nextSibling);
-    row.querySelectorAll('.preview-btn').forEach(btn => {
-      btn.onclick = () => {
-        const mode = btn.dataset.mode;
-        row.querySelectorAll('.preview-btn').forEach(b => {
-          b.classList.toggle('active', b.dataset.mode === mode);
-        });
-        if (mode === 'preview') {
-          const md = taEl.value || '';
-          const html = (typeof marked !== 'undefined')
-            ? marked.parse(md)
-            : escapeHtml(md);
-          previewDiv.innerHTML = html;
-          taEl.style.display = 'none';
-          previewDiv.style.display = '';
-        } else {
-          previewDiv.style.display = 'none';
-          taEl.style.display = '';
-        }
-      };
-    });
+function wireGoalPreviewToggle(taEl, previewEl) {
+  /**v1.4.1 — repurposed as generic edit/preview toggle for a single
+   * textarea + preview div pair.  Used by the Files tab editor.
+   * Old per-goal-field wiring removed — goal fields are structured data,
+   * not markdown documents.  Called as wireGoalPreviewToggle(taEl, prevEl). */
+  if (!taEl || !previewEl) return;
+  const row = document.createElement('div');
+  row.className = 'preview-toggle-row';
+  row.innerHTML =
+    `<button class="preview-btn active" data-mode="edit">edit</button>` +
+    `<button class="preview-btn"        data-mode="preview">preview</button>`;
+  taEl.parentNode.insertBefore(row, taEl);
+  row.querySelectorAll('.preview-btn').forEach(btn => {
+    btn.onclick = () => {
+      const mode = btn.dataset.mode;
+      row.querySelectorAll('.preview-btn').forEach(b => {
+        b.classList.toggle('active', b.dataset.mode === mode);
+      });
+      if (mode === 'preview') {
+        const md = taEl.value || '';
+        const html = (typeof marked !== 'undefined')
+          ? marked.parse(md)
+          : escapeHtml(md);
+        previewEl.innerHTML = html;
+        taEl.style.display = 'none';
+        previewEl.style.display = '';
+      } else {
+        previewEl.style.display = 'none';
+        taEl.style.display = '';
+      }
+    };
   });
 }
 
@@ -852,9 +890,22 @@ async function refreshSessions(projectId) {
   if (!root) return;
   try {
     const sessions = await api(`/projects/${projectId}/sessions`);
-    root.innerHTML = sessions.map(s =>
-      `<div class="session-row"><span class="name">${escapeHtml(s.human_id ? s.human_id + '/' + s.name : s.name)}</span><span class="meta">${escapeHtml(s.status)} · ${escapeHtml(formatRelativeTime(s.last_seen))}</span></div>`
-    ).join('') || '<div class="session-row meta">(no active sessions)</div>';
+    root.innerHTML = sessions.map(s => {
+      // v1.4.1 — dim stale sessions: active (<1h) full, idle (1-24h) 70%, old (24h+) 40%
+      let ageMs = 0;
+      try {
+        const ts = s.last_seen ? s.last_seen.replace(' ', 'T') + 'Z' : '';
+        if (ts) ageMs = Date.now() - new Date(ts).getTime();
+      } catch(e) {}
+      const ageH = ageMs / 3_600_000;
+      const opacity = ageH < 1 ? 1 : ageH < 24 ? 0.7 : 0.4;
+      const fontStyle = ageH >= 24 ? 'italic' : 'normal';
+      const label = s.human_id ? `${s.human_id}/${s.name}` : s.name;
+      return `<div class="session-row" style="opacity:${opacity};font-style:${fontStyle}">` +
+        `<span class="name">${escapeHtml(label)}</span>` +
+        `<span class="meta">${escapeHtml(s.status)} · ${escapeHtml(formatRelativeTime(s.last_seen))}</span>` +
+        `</div>`;
+    }).join('') || '<div class="session-row meta">(no active sessions)</div>';
   } catch(e) {}
 }
 

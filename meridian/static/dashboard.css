@@ -112,7 +112,7 @@ html, body {
 .vtab-btn.active { background: var(--surface-2); color: var(--accent); }
 
 .vtab-drawer {
-  width: 280px; flex-shrink: 0;
+  flex: 1; min-width: 0;
   background: var(--bg); border-right: 1px solid var(--border);
   display: flex; flex-direction: column; overflow: hidden;
 }
@@ -314,17 +314,16 @@ input[type=text] {
 }
 
 .claude-handoff-panel {
-  flex: 1; min-width: 0;
+  width: 200px; flex-shrink: 0;
   display: flex; flex-direction: column;
   background: var(--surface);
   border-left: 1px solid var(--border);
 }
 .claude-cta {
-  flex: 1; display: flex; flex-direction: column; gap: 14px;
-  padding: 48px 36px; max-width: 480px; margin: 0 auto;
-  justify-content: center; text-align: center;
+  flex: 1; display: flex; flex-direction: column; gap: 10px;
+  padding: 24px 14px; justify-content: center; text-align: center;
 }
-.claude-cta-title { font-size: 18px; font-weight: 600; margin: 0; }
+.claude-cta-title { font-size: 13px; font-weight: 600; margin: 0; }
 .claude-cta-body { color: var(--muted); line-height: 1.55; margin: 0; }
 .claude-cta-button {
   display: inline-block; align-self: center; margin-top: 12px;
@@ -434,3 +433,47 @@ input[type=text] {
   border-color: var(--accent);
 }
 .rewind-wrap section { line-height: 1.45; }
+
+/* v1.4.1 — goal subtab bar */
+.goal-subtab-strip {
+  display: flex; flex-shrink: 0;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
+}
+.goal-subtab-btn {
+  padding: 8px 14px; background: transparent; border: none;
+  border-bottom: 2px solid transparent; cursor: pointer;
+  color: var(--muted); font-family: 'IBM Plex Mono', monospace; font-size: 11px;
+  white-space: nowrap;
+}
+.goal-subtab-btn:hover { color: var(--text); }
+.goal-subtab-btn.active { color: var(--accent); border-bottom-color: var(--accent); }
+.goal-subtab-body {
+  flex: 1; position: relative; overflow: hidden;
+}
+.goal-subtab-panel {
+  display: none; flex-direction: column;
+  position: absolute; inset: 0; padding: 12px 14px; gap: 8px; overflow-y: auto;
+}
+.goal-subtab-panel.active { display: flex; }
+.goal-area.goal-full {
+  flex: 1; min-height: unset; resize: none;
+}
+
+/* v1.4.1 — sidebar is always visible on desktop; hamburger only on mobile */
+#sidebar-toggle { display: none; }
+@media (max-width: 768px) {
+  .app { grid-template-columns: 1fr; }
+  .sidebar {
+    position: fixed; left: -280px; top: 0; bottom: 0; width: 280px;
+    z-index: 200; transition: left 0.18s ease; box-shadow: 4px 0 24px rgba(0,0,0,0.4);
+  }
+  .sidebar.mobile-open { left: 0; }
+  #sidebar-toggle {
+    display: flex; position: fixed; top: 10px; left: 10px; z-index: 300;
+    width: 36px; height: 36px; background: var(--surface-2);
+    border: 1px solid var(--border); border-radius: 6px;
+    align-items: center; justify-content: center; cursor: pointer;
+    color: var(--text); font-size: 18px; font-family: monospace;
+  }
+}
