@@ -321,20 +321,40 @@ function buildTabBody(project) {
         <span>CLAUDE</span>
         <span class="server-version-pill" id="server-version"></span>
       </div>
-      <div class="claude-cta">
-        <p class="claude-cta-title">Talk to Claude in the real chat surface</p>
-        <p class="claude-cta-body">
-          The dashboard is no longer the conversation. Meridian is the
-          source of truth — generate a handoff, paste it into claude.ai,
-          and let workers report back via MCP. Faster, cheaper, no API
-          credits.
-        </p>
-        <a class="claude-cta-button" id="open-in-claude-${project.id}"
-           href="https://claude.ai/new" target="_blank" rel="noopener">
-          Open in Claude →
-        </a>
-        <a class="claude-cta-secondary" id="copy-handoff-${project.id}"
-           href="#">Copy latest handoff to clipboard</a>
+      <div class="claude-launch-body">
+        <div class="claude-section" data-section="continue">
+          <div class="claude-section-label">Continue session</div>
+          <select class="claude-session-select" id="continue-session-${project.id}">
+            <option value="">(no sessions yet)</option>
+          </select>
+          <button class="primary claude-section-btn" id="copy-resume-${project.id}">Copy resume command</button>
+        </div>
+        <hr class="claude-divider">
+        <div class="claude-section" data-section="worker">
+          <div class="claude-section-label">Start worker</div>
+          <button class="primary claude-section-btn" id="start-worker-${project.id}">Start Worker Session</button>
+          <div class="claude-worker-result" id="worker-result-${project.id}" style="display:none">
+            <pre class="claude-worker-xml" id="worker-xml-${project.id}"></pre>
+            <button class="secondary claude-section-btn" id="copy-worker-${project.id}">Copy worker context</button>
+            <p class="claude-hint">Paste into a new Claude Code terminal to start a worker</p>
+          </div>
+          <div class="claude-worker-empty" id="worker-empty-${project.id}" style="display:none">
+            <p class="claude-hint">No pending tasks. Add one to the queue first.</p>
+          </div>
+        </div>
+        <hr class="claude-divider">
+        <div class="claude-section" data-section="handoff">
+          <div class="claude-section-label">Handoff</div>
+          <button class="primary claude-section-btn" id="copy-handoff-${project.id}">Copy latest handoff</button>
+          <div class="claude-handoff-ts" id="handoff-ts-${project.id}">no handoff yet</div>
+          <button class="secondary claude-section-btn" id="regen-handoff-${project.id}">Regenerate handoff</button>
+        </div>
+        <hr class="claude-divider">
+        <div class="claude-section claude-section-narrow" data-section="open">
+          <a class="claude-cta-secondary-btn" id="open-in-claude-${project.id}"
+             href="https://claude.ai/new" target="_blank" rel="noopener">Open in Claude →</a>
+          <p class="claude-hint">Paste your handoff there to start a planning session</p>
+        </div>
       </div>
     </section>
   `;
@@ -445,25 +465,8 @@ function buildTabBody(project) {
       toast('model: ' + m);
     };
   }
-  // v1.1.0 — Open in Claude CTA replaces the chat panel.
-  const openInClaude = document.getElementById(`open-in-claude-${project.id}`);
-  if (openInClaude) openInClaude.href = 'https://claude.ai/new';
-  const copyHandoff = document.getElementById(`copy-handoff-${project.id}`);
-  if (copyHandoff) copyHandoff.onclick = async (ev) => {
-    ev.preventDefault();
-    try {
-      const r = await fetch(`/projects/${project.id}/handoff`, { method: 'POST' });
-      if (!r.ok) throw new Error(`${r.status}`);
-      const body = await r.json();
-      const text = body.content || '';
-      if (text && navigator.clipboard) {
-        await navigator.clipboard.writeText(text);
-        toast('handoff copied — paste into Claude');
-      } else {
-        toast('handoff written: ' + (body.path || 'data/'), false);
-      }
-    } catch(e) { toast('handoff failed: ' + e.message, true); }
-  };
+  // v1.5.x — Claude launch control panel (4 sections).
+  wireClaudeLaunchPanel(project.id);
   document.getElementById(`goal-${project.id}`).addEventListener('blur', () => saveGoal(project.id));
   document.getElementById(`goal-north-star-${project.id}`).addEventListener('blur', () => saveNorthStar(project.id));
   document.getElementById(`goal-sprint-${project.id}`).addEventListener('blur', () => saveSprint(project.id));
@@ -538,6 +541,133 @@ function buildTabBody(project) {
   })();
 
   connectWs(project.id);
+}
+
+// v1.5.x — Claude launch control panel. Wires the 4 sections:
+// (1) continue session dropdown + copy resume command
+// (2) start worker → show XML → copy
+// (3) handoff copy + regenerate
+// (4) open in claude.ai
+function wireClaudeLaunchPanel(projectId) {
+  const PROJECT_QUOTE = projectId.replace(/"/g, '\\"');
+
+  // Section 1 — Copy resume command
+  const copyResumeBtn = document.getElementById(`copy-resume-${projectId}`);
+  if (copyResumeBtn) copyResumeBtn.onclick = async () => {
+    const sel = document.getElementById(`continue-session-${projectId}`);
+    const sessionName = sel && sel.value ? sel.value : '';
+    if (!sessionName) { toast('pick a session first', true); return; }
+    const cmd = `start_session(project_id="${PROJECT_QUOTE}", session_name="${sessionName.replace(/"/g, '\\"')}", human_id="adam")`;
+    try {
+      await navigator.clipboard.writeText(cmd);
+      toast('resume command copied');
+    } catch(e) { toast('copy failed: ' + e.message, true); }
+  };
+
+  // Section 2 — Start Worker
+  const startWorkerBtn = document.getElementById(`start-worker-${projectId}`);
+  if (startWorkerBtn) startWorkerBtn.onclick = async () => {
+    const resultEl = document.getElementById(`worker-result-${projectId}`);
+    const emptyEl = document.getElementById(`worker-empty-${projectId}`);
+    const xmlEl = document.getElementById(`worker-xml-${projectId}`);
+    if (resultEl) resultEl.style.display = 'none';
+    if (emptyEl) emptyEl.style.display = 'none';
+    try {
+      const r = await fetch(`/projects/${projectId}/start-worker-session`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({}),
+      });
+      if (r.status === 404) {
+        if (emptyEl) emptyEl.style.display = '';
+        return;
+      }
+      if (!r.ok) throw new Error(`${r.status}`);
+      const body = await r.json();
+      const xml = body.worker_context || '';
+      if (xmlEl) xmlEl.textContent = xml;
+      if (resultEl) resultEl.style.display = '';
+      toast('worker session ready');
+    } catch(e) { toast('start worker failed: ' + e.message, true); }
+  };
+  const copyWorkerBtn = document.getElementById(`copy-worker-${projectId}`);
+  if (copyWorkerBtn) copyWorkerBtn.onclick = async () => {
+    const xmlEl = document.getElementById(`worker-xml-${projectId}`);
+    const text = xmlEl ? xmlEl.textContent : '';
+    if (!text) { toast('nothing to copy', true); return; }
+    try {
+      await navigator.clipboard.writeText(text);
+      toast('worker context copied');
+    } catch(e) { toast('copy failed: ' + e.message, true); }
+  };
+
+  // Section 3 — Handoff copy + regenerate
+  const copyHandoffBtn = document.getElementById(`copy-handoff-${projectId}`);
+  if (copyHandoffBtn) copyHandoffBtn.onclick = async () => {
+    try {
+      const r = await fetch(`/projects/${projectId}/handoff`, { method: 'POST' });
+      if (!r.ok) throw new Error(`${r.status}`);
+      const body = await r.json();
+      const text = body.content || '';
+      if (text && navigator.clipboard) {
+        await navigator.clipboard.writeText(text);
+        toast('handoff copied — paste into Claude');
+      } else {
+        toast('handoff written: ' + (body.path || 'data/'), false);
+      }
+      stampHandoffTs(projectId, new Date());
+    } catch(e) { toast('handoff failed: ' + e.message, true); }
+  };
+  const regenBtn = document.getElementById(`regen-handoff-${projectId}`);
+  if (regenBtn) regenBtn.onclick = async () => {
+    const tsEl = document.getElementById(`handoff-ts-${projectId}`);
+    const orig = regenBtn.textContent;
+    regenBtn.disabled = true;
+    regenBtn.textContent = 'Regenerating…';
+    try {
+      const r = await fetch(`/projects/${projectId}/handoff`, { method: 'POST' });
+      if (!r.ok) throw new Error(`${r.status}`);
+      await r.json();
+      stampHandoffTs(projectId, new Date());
+      if (tsEl) {
+        const prev = tsEl.textContent;
+        tsEl.textContent = 'Regenerated ✓';
+        setTimeout(() => stampHandoffTs(projectId, new Date()), 2000);
+      }
+      toast('handoff regenerated');
+    } catch(e) { toast('regenerate failed: ' + e.message, true); }
+    finally {
+      regenBtn.disabled = false;
+      regenBtn.textContent = orig;
+    }
+  };
+}
+
+function stampHandoffTs(projectId, when) {
+  const tsEl = document.getElementById(`handoff-ts-${projectId}`);
+  if (!tsEl) return;
+  const iso = when.toISOString().replace('T', ' ').slice(0, 19);
+  tsEl.textContent = 'Last generated: ' + formatRelativeTime(iso);
+}
+
+function populateSessionDropdown(projectId, sessions) {
+  /** v1.5.x — fill the "Continue session" dropdown with the last 5 sessions
+   * (newest first by last_seen). Each option label: "{name} — {age} ago". */
+  const sel = document.getElementById(`continue-session-${projectId}`);
+  if (!sel) return;
+  const sorted = (sessions || []).slice().sort((a, b) =>
+    (b.last_seen || '').localeCompare(a.last_seen || '')
+  ).slice(0, 5);
+  if (!sorted.length) {
+    sel.innerHTML = '<option value="">(no sessions yet)</option>';
+    return;
+  }
+  const prev = sel.value;
+  sel.innerHTML = sorted.map(s => {
+    const label = `${s.name} — ${formatRelativeTime(s.last_seen)}`;
+    return `<option value="${escapeHtml(s.name)}">${escapeHtml(label)}</option>`;
+  }).join('');
+  if (prev && sorted.some(s => s.name === prev)) sel.value = prev;
 }
 
 // v1.1.1 — Activity Timeline. Load /timeline, lay out a swimlane
@@ -896,6 +1026,7 @@ async function refreshSessions(projectId) {
   if (!root) return;
   try {
     const sessions = await api(`/projects/${projectId}/sessions`);
+    populateSessionDropdown(projectId, sessions);
     root.innerHTML = sessions.map(s => {
       // v1.4.1 — dim stale sessions: active (<1h) full, idle (1-24h) 70%, old (24h+) 40%
       let ageMs = 0;
@@ -1214,11 +1345,9 @@ async function restoreTabs() {
     return; // don't restore tabs until wizard completes
   }
   await restoreTabs();
-  // Periodic session refresh on the active tab — sessions don't generate
-  // pub/sub events so polling fills that gap.
-  setInterval(() => {
-    if (state.activeTab) refreshSessions(state.activeTab);
-  }, 10000);
+  // v1.5.x — polling removed. WebSocket pushes task/goal updates; sessions
+  // refresh on initial page load + explicit user action only (tab switch,
+  // worker start, etc). Idle dropdowns no longer hammer /sessions every 1s.
 })();
 
 // --- v0.6.6 EZ wizard ---
@@ -1238,7 +1367,6 @@ document.getElementById('ez-create-btn').onclick = async () => {
     await loadProjects();
     await restoreTabs();
     openTab(p);
-    setInterval(() => { if (state.activeTab) refreshSessions(state.activeTab); }, 10000);
   } catch(e) { errEl.textContent = 'create failed: ' + e.message; errEl.style.display = 'block'; }
 };
 document.getElementById('ez-project-name').addEventListener('keydown', (e) => {
@@ -1249,9 +1377,7 @@ document.getElementById('ez-advanced-link').onclick = (e) => {
   document.getElementById('ez-wizard').style.display = 'none';
   // Show the sidebar new-project form and focus it
   document.getElementById('new-project-name').focus();
-  restoreTabs().then(() => {
-    setInterval(() => { if (state.activeTab) refreshSessions(state.activeTab); }, 10000);
-  });
+  restoreTabs();
 };
 
 // ---------------------------------------------------------------------------

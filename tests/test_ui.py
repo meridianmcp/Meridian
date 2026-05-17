@@ -224,6 +224,42 @@ def test_dashboard_sidebar_has_no_translatex(client):
     )
 
 
+def test_dashboard_claude_tab_has_session_controls(client):
+    """Claude launch panel exposes the 4 control sections (v1.5.x).
+
+    The panel was a single "Open in Claude" CTA; the v1.5.x overhaul splits it
+    into: (1) continue-session dropdown + copy-resume command, (2) start-worker
+    button that shows worker_context XML, (3) handoff copy + regenerate, and
+    (4) open in claude.ai as a narrow secondary action.  All wireup lives in
+    dashboard.js and the markup is generated dynamically per project tab.
+    """
+    js = client.get("/static/dashboard.js").text
+    html = client.get("/dashboard").text
+    # Section 1 — continue session controls
+    assert "continue-session-" in js, "continue session dropdown ID missing"
+    assert "copy-resume-" in js, "copy resume command button missing"
+    assert "start_session(project_id=" in js, (
+        "resume command template (start_session call) must be embedded in JS"
+    )
+    # Section 2 — worker session
+    assert "start-worker-" in js, "start worker button missing"
+    assert "copy-worker-" in js, "copy worker context button missing"
+    assert "worker_context" in js, "worker_context payload key not referenced"
+    assert "/start-worker-session" in js, "start-worker-session endpoint not called"
+    # Section 3 — handoff
+    assert "copy-handoff-" in js, "copy handoff button missing"
+    assert "regen-handoff-" in js, "regenerate handoff button missing"
+    assert "Regenerated" in js, "regenerated confirmation message missing"
+    # Section 4 — open in Claude (narrow secondary)
+    assert "open-in-claude-" in js, "open in Claude button missing"
+    assert "claude.ai" in js, "claude.ai destination missing"
+    # Generic markers — the new test from the handoff
+    text = html.lower() + js.lower()
+    assert "resume" in text or "session" in text
+    assert "worker" in text
+    assert "handoff" in text
+
+
 def test_dashboard_open_in_claude_not_dominant(client):
     """The 'Open in Claude' panel must not dominate the layout (Bug 6).
 
