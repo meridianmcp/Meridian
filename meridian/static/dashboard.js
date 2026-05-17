@@ -1033,7 +1033,7 @@ function renderQueue(tasks) {
   const pending = tasks.filter(t => t.status === 'pending');
   const inProg = tasks.filter(t => t.status === 'in_progress');
   const done = tasks.filter(t => t.status === 'done').slice(0, 10);
-  const failed = tasks.filter(t => t.status === 'failed').slice(0, 5);
+  const failed = tasks.filter(t => t.status === 'failed').slice(0, 10);
 
   const sect = (icon, title, items, emptyMsg) => {
     const rows = items.length
