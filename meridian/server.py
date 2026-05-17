@@ -529,13 +529,23 @@ async def get_timeline_endpoint(
 ) -> dict[str, Any]:
     """v1.1.1 — return the data needed to render the Activity Timeline.
 
-    The dashboard renders a swimlane per session with task pills laid
-    out on a time axis and vertical dashed lines at goal-change events.
+    v1.6.x — filtered to only meaningful history: completed/failed tasks
+    plus goal-change events. Session idle/active events were noise and
+    have been dropped (the LIVE vtab covers active sessions instead).
+    Pending/in_progress tasks belong on the LIVE tab, not in history.
     """
     project = await db_module.get_project(_db(request), project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="project not found")
-    return await db_module.get_timeline(_db(request), project_id)
+    timeline = await db_module.get_timeline(_db(request), project_id)
+    return {
+        "tasks": [
+            t for t in timeline.get("tasks", [])
+            if t.get("status") in ("done", "failed")
+        ],
+        "sessions": [],
+        "goal_events": timeline.get("goal_events", []),
+    }
 
 
 @app.get("/projects/{project_id}/rewind")

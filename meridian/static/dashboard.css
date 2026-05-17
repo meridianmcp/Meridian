@@ -313,6 +313,68 @@ input[type=text] {
   font-size: 12px; padding: 20px;
 }
 
+.live-body {
+  flex: 1; display: flex; flex-direction: column;
+  overflow-y: auto; padding: 14px; gap: 14px;
+}
+.live-section { display: flex; flex-direction: column; gap: 8px; }
+.live-section-label {
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 10px; color: var(--muted);
+  letter-spacing: 0.08em; text-transform: uppercase;
+}
+.live-divider {
+  border: 0; border-top: 1px solid var(--border); margin: 6px 0;
+}
+.live-empty {
+  color: var(--muted); font-family: 'IBM Plex Mono', monospace;
+  font-size: 11px; padding: 6px 0;
+}
+.live-sessions, .live-queue {
+  display: flex; flex-direction: column; gap: 6px;
+}
+.live-session-row, .live-task-row {
+  background: var(--surface-2); border: 1px solid var(--border);
+  border-radius: 4px; padding: 8px 10px;
+  font-family: 'IBM Plex Mono', monospace; font-size: 11px;
+}
+.live-session-head {
+  display: flex; align-items: center; gap: 8px;
+}
+.live-session-name { color: var(--text); flex: 1; min-width: 0;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.live-session-age { color: var(--muted); font-size: 10px; }
+.live-session-task {
+  color: var(--muted); font-size: 10px; margin-top: 4px;
+  padding-left: 22px; line-height: 1.4;
+}
+.live-task-row {
+  display: flex; align-items: flex-start; gap: 8px;
+}
+.live-task-body { flex: 1; min-width: 0; }
+.live-task-desc {
+  color: var(--text); line-height: 1.4; word-wrap: break-word;
+}
+.live-task-meta {
+  color: var(--muted); font-size: 10px; margin-top: 3px;
+  display: flex; gap: 8px;
+}
+.live-task-claim { color: var(--accent); }
+.live-task-cancel {
+  background: transparent; border: none; color: var(--muted);
+  cursor: pointer; font-size: 14px; line-height: 1; padding: 0 4px;
+}
+.live-task-cancel:hover { color: var(--status-failed); }
+.live-dot { font-size: 12px; flex-shrink: 0; }
+.live-add-row { display: flex; gap: 6px; }
+.live-add-input {
+  flex: 1; padding: 8px 10px;
+  background: var(--surface-2); color: var(--text);
+  border: 1px solid var(--border); border-radius: 4px;
+  font-family: 'IBM Plex Mono', monospace; font-size: 11px;
+}
+.live-add-input::placeholder { color: var(--muted); }
+
 .claude-handoff-panel {
   width: 300px; flex-shrink: 0;
   display: flex; flex-direction: column;

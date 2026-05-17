@@ -192,6 +192,7 @@ function buildTabBody(project) {
   body.innerHTML = `
     <div class="vtab-strip" id="vtab-strip-${project.id}">
       <button class="vtab-btn active" data-vtab="status" title="Status &amp; Sessions">≡</button>
+      <button class="vtab-btn" data-vtab="live" title="Live — right-now view">⚡</button>
       <button class="vtab-btn" data-vtab="goal" title="Goal State">◎</button>
       <button class="vtab-btn" data-vtab="files" title="Files">⊞</button>
       <button class="vtab-btn" data-vtab="devlog" title="Dev Log">≋</button>
@@ -212,12 +213,38 @@ function buildTabBody(project) {
         <div class="hitl-banner" id="hitl-banner-${project.id}" style="display:none">HITL queue</div>
         <div id="hitl-queue-${project.id}"></div>
       </div>
+      <div class="drawer-panel" id="drawer-live-${project.id}">
+        <div class="drawer-header" style="justify-content:space-between">
+          <span>LIVE · ${escapeHtml(project.name)}</span>
+          <span style="display:flex;gap:6px;align-items:center">
+            <button class="secondary" id="live-pause-${project.id}" title="Pause queue (UI stub)" style="padding:2px 8px;font-size:10px">Pause</button>
+            <button class="secondary" id="live-run-${project.id}" title="Run all pending (UI stub)" style="padding:2px 8px;font-size:10px">Run All</button>
+          </span>
+        </div>
+        <div class="live-body" id="live-body-${project.id}">
+          <div class="live-section">
+            <div class="live-section-label">Active sessions</div>
+            <div class="live-sessions" id="live-sessions-${project.id}">
+              <div class="live-empty">No active sessions.</div>
+            </div>
+          </div>
+          <hr class="live-divider">
+          <div class="live-section">
+            <div class="live-section-label">Queue</div>
+            <div class="live-queue" id="live-queue-${project.id}">
+              <div class="live-empty">Queue is empty. Add a task above.</div>
+            </div>
+            <div class="live-add-row">
+              <input type="text" class="live-add-input" id="live-add-input-${project.id}" placeholder="+ Add task… (Enter to submit)">
+            </div>
+          </div>
+        </div>
+      </div>
       <div class="drawer-panel" id="drawer-goal-${project.id}">
         <div class="drawer-header" style="justify-content:space-between">
           <span>GOAL · ${escapeHtml(project.name)}</span>
           <span style="display:flex;gap:6px;align-items:center">
             <span class="goal-version" id="goal-version-${project.id}"></span>
-            <button class="secondary" id="goal-mode-${project.id}" title="Toggle between manual and auto goal mode">mode: manual</button>
           </span>
         </div>
         <div class="goal-subtab-strip">
@@ -393,6 +420,7 @@ function buildTabBody(project) {
         if (vtab === 'timeline') loadTimeline(project.id);
         if (vtab === 'rewind') initRewindTab(project.id);
         if (vtab === 'queue') loadQueue(project.id);
+        if (vtab === 'live') loadLiveTab(project.id);
       };
     });
   }
@@ -415,27 +443,9 @@ function buildTabBody(project) {
   document.getElementById(`save-north-star-${project.id}`).onclick = () => saveNorthStar(project.id);
   document.getElementById(`save-sprint-${project.id}`).onclick = () => saveSprint(project.id);
 
-  // v0.4.2 — goal-mode toggle. The button label tracks the current
-  // mode; clicking it PATCHes the server to flip between manual/auto
-  // and toasts the new value.
-  const modeBtn = document.getElementById(`goal-mode-${project.id}`);
-  if (modeBtn) {
-    const renderMode = (m) => { modeBtn.textContent = 'mode: ' + m; };
-    api(`/projects/${project.id}/goal-mode`)
-      .then(r => renderMode(r.goal_mode || 'manual'))
-      .catch(() => {});
-    modeBtn.onclick = async () => {
-      const current = modeBtn.textContent.replace(/^mode:\s*/, '').trim();
-      const next = current === 'auto' ? 'manual' : 'auto';
-      try {
-        await api(`/projects/${project.id}/goal-mode`, {
-          method: 'PATCH', body: JSON.stringify({ mode: next })
-        });
-        renderMode(next);
-        toast('goal mode: ' + next);
-      } catch(e) { toast('mode change failed: ' + e.message, true); }
-    };
-  }
+  // v1.6.x — goal-mode toggle removed. Auto mode (v0.4.2) appended ambient
+  // task summaries to goal content; that role is now covered by the timeline
+  // + session summaries + task log. Manual is the only mode worth exposing.
 
   // v1.1.0 — chat panel removed in favour of "Open in Claude". The
   // wireups below guard for null elements so older deployments with
@@ -541,6 +551,183 @@ function buildTabBody(project) {
   })();
 
   connectWs(project.id);
+}
+
+// v1.6.x — LIVE tab. Right-now view of active sessions + work queue.
+// Section A: active sessions (filtered to last 24h) with claimed task
+// per session, freshness dot, and human_id badge.
+// Section B: pending + in_progress tasks, [+ Add task] input, cancel
+// per row. WebSocket-driven refresh (no setInterval polling).
+async function loadLiveTab(projectId) {
+  const panel = state.panels[projectId];
+  if (!panel) return;
+  panel.liveWired = panel.liveWired || false;
+  // Wire the [Pause]/[Run All] header stubs once.
+  if (!panel.liveWired) {
+    const pause = document.getElementById(`live-pause-${projectId}`);
+    const runAll = document.getElementById(`live-run-${projectId}`);
+    if (pause) pause.onclick = () => toast('Pause is a stub — coming soon');
+    if (runAll) runAll.onclick = () => toast('Run All is a stub — coming soon');
+    const input = document.getElementById(`live-add-input-${projectId}`);
+    if (input) input.addEventListener('keydown', (ev) => {
+      if (ev.key !== 'Enter') return;
+      ev.preventDefault();
+      const text = (input.value || '').trim();
+      if (!text) return;
+      addLiveTask(projectId, text).then((ok) => {
+        if (ok) input.value = '';
+      });
+    });
+    panel.liveWired = true;
+  }
+  await refreshLiveTab(projectId);
+}
+
+async function refreshLiveTab(projectId) {
+  /** Fetch fresh sessions + tasks and repaint both Live sections. */
+  try {
+    const [sessions, tasks] = await Promise.all([
+      api(`/projects/${projectId}/sessions`).catch(() => []),
+      api(`/projects/${projectId}/tasks?limit=200`).catch(() => []),
+    ]);
+    renderLiveSessions(projectId, sessions || [], tasks || []);
+    renderLiveQueue(projectId, tasks || []);
+    cacheMostRecentSession(projectId, sessions || []);
+  } catch(e) { /* ignore — WS will retry on next event */ }
+}
+
+function cacheMostRecentSession(projectId, sessions) {
+  /** Pick the most recent active session id for "add task" attribution. */
+  const panel = state.panels[projectId];
+  if (!panel) return;
+  const sorted = sessions.slice().sort((a, b) =>
+    (b.last_seen || '').localeCompare(a.last_seen || '')
+  );
+  const top = sorted.find(s => s.status !== 'closed') || sorted[0];
+  if (top) panel.liveLastSessionId = top.id;
+}
+
+function renderLiveSessions(projectId, sessions, tasks) {
+  const root = document.getElementById(`live-sessions-${projectId}`);
+  if (!root) return;
+  const now = Date.now();
+  const claimMap = new Map();
+  tasks.forEach(t => {
+    if (t.claimed_by && (t.status === 'pending' || t.status === 'in_progress')) {
+      claimMap.set(t.claimed_by, t);
+    }
+  });
+  const rows = sessions
+    .map(s => {
+      let ageMs = 0;
+      try {
+        const ts = s.last_seen ? s.last_seen.replace(' ', 'T') + 'Z' : '';
+        if (ts) ageMs = now - new Date(ts).getTime();
+      } catch(e) {}
+      return { s, ageMs };
+    })
+    .filter(({ ageMs }) => ageMs <= 24 * 3600 * 1000)
+    .sort((a, b) => a.ageMs - b.ageMs);
+  if (!rows.length) {
+    root.innerHTML = '<div class="live-empty">No active sessions.</div>';
+    return;
+  }
+  root.innerHTML = rows.map(({ s, ageMs }) => {
+    const mins = ageMs / 60000;
+    const dot = mins < 5 ? '🟢' : mins < 30 ? '🟡' : '⚫';
+    const label = s.human_id ? `${s.human_id}/${s.name}` : s.name;
+    const claimed = claimMap.get(s.id);
+    const claimedRow = claimed
+      ? `<div class="live-session-task">↳ ${escapeHtml((claimed.description || '').slice(0, 140))}</div>`
+      : '';
+    return `<div class="live-session-row">
+      <div class="live-session-head">
+        <span class="live-dot">${dot}</span>
+        <span class="live-session-name">${escapeHtml(label)}</span>
+        <span class="live-session-age">${escapeHtml(formatRelativeTime(s.last_seen))}</span>
+      </div>
+      ${claimedRow}
+    </div>`;
+  }).join('');
+}
+
+function renderLiveQueue(projectId, tasks) {
+  const root = document.getElementById(`live-queue-${projectId}`);
+  if (!root) return;
+  const live = tasks.filter(t => t.status === 'pending' || t.status === 'in_progress');
+  if (!live.length) {
+    root.innerHTML = '<div class="live-empty">Queue is empty. Add a task above.</div>';
+    return;
+  }
+  live.sort((a, b) => {
+    if (a.status !== b.status) return a.status === 'in_progress' ? -1 : 1;
+    return (b.created_at || '').localeCompare(a.created_at || '');
+  });
+  root.innerHTML = live.map(t => {
+    const dot = t.status === 'in_progress' ? '🔵' : '📋';
+    const claimed = t.claimed_by
+      ? `<span class="live-task-claim">claimed by: ${escapeHtml((t.session_name || t.claimed_by).slice(0, 24))}</span>`
+      : '';
+    const ts = formatRelativeTime(t.created_at);
+    return `<div class="live-task-row" data-task="${escapeHtml(t.id)}">
+      <span class="live-dot">${dot}</span>
+      <div class="live-task-body">
+        <div class="live-task-desc">${escapeHtml((t.description || '').slice(0, 200))}</div>
+        <div class="live-task-meta">${escapeHtml(ts)} ${claimed}</div>
+      </div>
+      <button class="live-task-cancel" data-cancel="${escapeHtml(t.id)}" title="Mark done / cancel">×</button>
+    </div>`;
+  }).join('');
+  root.querySelectorAll('button[data-cancel]').forEach(btn => {
+    btn.onclick = () => cancelLiveTask(projectId, btn.dataset.cancel);
+  });
+}
+
+async function addLiveTask(projectId, description) {
+  /** POST /tasks with the most recent active session as attribution. */
+  const panel = state.panels[projectId];
+  const sessionId = panel && panel.liveLastSessionId;
+  if (!sessionId) {
+    // Try to discover one synchronously.
+    try {
+      const sessions = await api(`/projects/${projectId}/sessions`);
+      cacheMostRecentSession(projectId, sessions || []);
+    } catch(e) {}
+  }
+  const sid = panel && panel.liveLastSessionId;
+  if (!sid) {
+    toast('No active session to attribute the task to', true);
+    return false;
+  }
+  try {
+    await api('/tasks', {
+      method: 'POST',
+      body: JSON.stringify({
+        session_id: sid, project_id: projectId,
+        description, status: 'pending',
+      }),
+    });
+    toast('task queued');
+    await refreshLiveTab(projectId);
+    return true;
+  } catch(e) {
+    toast('add task failed: ' + e.message, true);
+    return false;
+  }
+}
+
+async function cancelLiveTask(projectId, taskId) {
+  /** PATCH /tasks/{id} → status=done. WebSocket broadcast triggers refresh. */
+  try {
+    await api(`/tasks/${taskId}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ status: 'done' }),
+    });
+    toast('task closed');
+    await refreshLiveTab(projectId);
+  } catch(e) {
+    toast('cancel failed: ' + e.message, true);
+  }
 }
 
 // v1.5.x — Claude launch control panel. Wires the 4 sections:
@@ -1192,6 +1379,11 @@ function handleWsEvent(projectId, event) {
   renderTasks(projectId);
   // A goal change is often triggered by a HITL reply — re-pull.
   refreshGoal(projectId);
+  // v1.6.x — keep the LIVE tab fresh when it's the visible panel.
+  const panel = state.panels[projectId];
+  if (panel && panel.activeVtab === 'live') {
+    refreshLiveTab(projectId);
+  }
 }
 
 async function sendChat(projectId) {

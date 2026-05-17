@@ -224,6 +224,40 @@ def test_dashboard_sidebar_has_no_translatex(client):
     )
 
 
+def test_dashboard_live_tab_exists(client):
+    """LIVE vtab (⚡) is registered and wired in dashboard.js (v1.6.x).
+
+    Section A: active sessions (filtered to last 24h) with claimed task
+    shown indented per session.  Section B: queue (pending + in_progress
+    tasks) with an add-task input and per-row cancel.  Header buttons:
+    [Pause] / [Run All] (stubs).  WebSocket-driven — no setInterval.
+    """
+    js = client.get("/static/dashboard.js").text
+    css = client.get("/static/dashboard.css").text
+    assert 'data-vtab="live"' in js, "LIVE vtab button missing from buildTabBody"
+    assert "drawer-live-" in js, "LIVE drawer panel missing"
+    assert "loadLiveTab" in js, "loadLiveTab function missing"
+    assert "renderLiveSessions" in js, "renderLiveSessions function missing"
+    assert "renderLiveQueue" in js, "renderLiveQueue function missing"
+    assert "live-sessions-" in js, "live sessions container ID missing"
+    assert "live-queue-" in js, "live queue container ID missing"
+    assert "live-add-input-" in js, "add task input ID missing"
+    assert "live-pause-" in js, "Pause stub button missing"
+    assert "live-run-" in js, "Run All stub button missing"
+    # Add task posts to /tasks with status pending
+    assert "addLiveTask" in js, "addLiveTask helper missing"
+    assert "'/tasks'" in js or '"/tasks"' in js, "POST /tasks not referenced"
+    # Sessions older than 24h are filtered out
+    assert "24 * 3600 * 1000" in js or "24*3600*1000" in js, (
+        "session age > 24h filter missing from LIVE tab"
+    )
+    # WS handler refreshes the LIVE tab when active
+    assert "refreshLiveTab" in js, "refreshLiveTab missing from WS handler"
+    # CSS for the new panel
+    assert ".live-body" in css, "live-body CSS class missing"
+    assert ".live-task-row" in css, "live-task-row CSS class missing"
+
+
 def test_dashboard_claude_tab_has_session_controls(client):
     """Claude launch panel exposes the 4 control sections (v1.5.x).
 
