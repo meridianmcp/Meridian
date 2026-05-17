@@ -2786,3 +2786,39 @@ def test_dashboard_html_has_save_buttons_and_dirty_state(client):
     assert "save-sprint-" in html
     assert ".goal-area.dirty" in html
     assert ".goal-area.readonly" in html
+
+
+# ---------------------------------------------------------------------------
+# v1.1.0 — dashboard UX overhaul
+# ---------------------------------------------------------------------------
+
+
+def test_dashboard_html_has_open_in_claude_cta(client):
+    """The chat panel was replaced with an Open-in-Claude CTA."""
+    html = client.get("/dashboard").text
+    assert "Open in Claude" in html
+    assert "open-in-claude-" in html
+    assert "claude.ai/new" in html
+
+
+def test_dashboard_html_loads_marked_js(client):
+    """marked.js is loaded from a CDN for the goal edit/preview toggle."""
+    html = client.get("/dashboard").text
+    assert "marked.min.js" in html
+    assert "wireGoalPreviewToggle" in html
+    assert "preview-btn" in html
+
+
+def test_dashboard_html_no_chat_input_textarea(client):
+    """The chat input + send button were removed from the new layout.
+
+    The defensive JS still references the ids so older bundles don't
+    break; what we pin here is that the markup template no longer
+    emits a chat textarea or send button.
+    """
+    html = client.get("/dashboard").text
+    # Strings that only ever appeared inside the chat markup, never the JS.
+    assert "message claude (enter to send" not in html
+    assert "chat-input-row" not in html
+    # And the new CTA replaces it.
+    assert "claude-handoff-panel" in html

@@ -393,6 +393,8 @@ DASHBOARD_HTML = r"""<!doctype html>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<!-- v1.1.0 — marked.js for goal edit/preview toggle. CDN, no build step. -->
+<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
 <style>
 :root {
   --bg: #0d0f12;
@@ -416,7 +418,7 @@ html, body {
   font-size: 13px;
 }
 .mono { font-family: 'IBM Plex Mono', ui-monospace, monospace; }
-.app { display: grid; grid-template-columns: 220px 1fr; height: 100vh; }
+.app { display: grid; grid-template-columns: 280px 1fr; height: 100vh; }
 
 .sidebar {
   background: var(--surface);
@@ -668,6 +670,60 @@ input[type=text] {
 .hitl-row .controls { display: flex; gap: 6px; align-items: center; }
 .hitl-row input[type=text] { flex: 1; }
 
+.claude-handoff-panel {
+  display: flex; flex-direction: column;
+  background: var(--surface);
+  border-left: 1px solid var(--border);
+}
+.claude-cta {
+  flex: 1; display: flex; flex-direction: column; gap: 14px;
+  padding: 48px 36px; max-width: 480px; margin: 0 auto;
+  justify-content: center; text-align: center;
+}
+.claude-cta-title { font-size: 18px; font-weight: 600; margin: 0; }
+.claude-cta-body { color: var(--muted); line-height: 1.55; margin: 0; }
+.claude-cta-button {
+  display: inline-block; align-self: center; margin-top: 12px;
+  padding: 12px 22px; background: var(--accent); color: var(--bg);
+  border-radius: 6px; text-decoration: none; font-weight: 600;
+  font-family: 'IBM Plex Mono', monospace; letter-spacing: 0.03em;
+}
+.claude-cta-button:hover { filter: brightness(1.1); }
+.claude-cta-secondary {
+  color: var(--muted); font-size: 11px; text-decoration: underline dotted;
+}
+.server-version-pill {
+  color: var(--muted); font-size: 11px;
+  font-family: 'IBM Plex Mono', monospace;
+}
+.preview-toggle-row {
+  display: flex; gap: 6px; margin-bottom: 6px; align-items: center;
+}
+.preview-toggle-row .preview-btn {
+  background: transparent; color: var(--muted);
+  border: 1px solid var(--border); border-radius: 4px;
+  padding: 2px 8px; font-size: 10px; cursor: pointer;
+  font-family: 'IBM Plex Mono', monospace;
+}
+.preview-toggle-row .preview-btn.active {
+  background: var(--surface-2); color: var(--text);
+  border-color: var(--accent);
+}
+.goal-preview {
+  background: var(--surface-2); border: 1px solid var(--border);
+  border-radius: 6px; padding: 12px 14px; min-height: 120px;
+  color: var(--text); font-family: 'IBM Plex Sans', sans-serif;
+  line-height: 1.55; overflow-y: auto;
+}
+.goal-preview h1, .goal-preview h2, .goal-preview h3 {
+  margin-top: 0.6em; color: var(--accent);
+}
+.goal-preview code {
+  background: var(--surface); padding: 1px 5px; border-radius: 3px;
+  font-family: 'IBM Plex Mono', monospace; font-size: 90%;
+}
+.goal-preview ul, .goal-preview ol { padding-left: 1.4em; }
+
 .chat-history {
   flex: 1; overflow-y: auto; padding: 14px 18px;
   display: flex; flex-direction: column; gap: 12px;
@@ -680,16 +736,8 @@ input[type=text] {
 .msg.assistant { background: rgba(74,158,255,0.07); border: 1px solid rgba(74,158,255,0.25); align-self: flex-start; }
 .msg.system { background: rgba(0,212,170,0.05); border: 1px dashed var(--accent-green); color: var(--muted); font-size: 11px; align-self: stretch; font-family: 'IBM Plex Mono', monospace; }
 
-.chat-input-row {
-  display: flex; gap: 6px; padding: 10px 14px;
-  border-top: 1px solid var(--border); background: var(--surface);
-}
-.chat-input-row textarea {
-  flex: 1; background: var(--surface-2); border: 1px solid var(--border);
-  color: var(--text); padding: 8px 10px; border-radius: 4px;
-  font-family: 'IBM Plex Sans', sans-serif; font-size: 13px;
-  resize: none; max-height: 160px; min-height: 36px;
-}
+/* v1.1.0 — chat row removed; chat markup is gone. Defensive
+   JS handlers stay for older bundles but no styles are needed. */
 
 .toast {
   position: fixed; bottom: 16px; right: 16px; z-index: 100;
@@ -989,27 +1037,25 @@ function buildTabBody(project) {
         <div class="scroll-area"><div class="task-list" id="tasks-${project.id}"></div></div>
       </div>
     </div>
-    <section class="chat-full">
+    <section class="claude-handoff-panel">
       <div class="panel-header">
-        <span>CHAT · claude-sonnet-4.6</span>
-        <span style="display:flex;gap:6px;align-items:center">
-          <select id="model-select-${project.id}" style="background:var(--surface-2);border:1px solid var(--border);color:var(--text);padding:2px 6px;border-radius:4px;font-family:'IBM Plex Mono',monospace;font-size:10px;cursor:pointer">
-            <option value="claude-sonnet-4-6">sonnet-4.6</option>
-            <option value="claude-opus-4-6">opus-4.6</option>
-            <option value="claude-opus-4-7">opus-4.7</option>
-            <option value="claude-haiku-4-5-20251001">haiku-4.5</option>
-          </select>
-          <button id="clear-chat-${project.id}" title="Clear chat history" style="background:transparent;border:1px solid var(--border);color:var(--muted);padding:2px 8px;border-radius:4px;font-family:'IBM Plex Mono',monospace;font-size:10px;cursor:pointer">clear</button>
-          <span class="chat-mode" id="chat-mode-${project.id}">
-            <button class="mode-btn active" data-mode="cli" title="Use the claude CLI on this machine (draws from Max plan, no API credits)">CLI</button>
-            <button class="mode-btn" data-mode="api" title="Call api.anthropic.com directly (bills API credits)">API</button>
-          </span>
-        </span>
+        <span>CLAUDE</span>
+        <span class="server-version-pill" id="server-version"></span>
       </div>
-      <div class="chat-history" id="chat-${project.id}"></div>
-      <div class="chat-input-row">
-        <textarea id="chat-input-${project.id}" placeholder="message claude (enter to send, shift+enter for newline)"></textarea>
-        <button class="primary" id="chat-send-${project.id}">send</button>
+      <div class="claude-cta">
+        <p class="claude-cta-title">Talk to Claude in the real chat surface</p>
+        <p class="claude-cta-body">
+          The dashboard is no longer the conversation. Meridian is the
+          source of truth — generate a handoff, paste it into claude.ai,
+          and let workers report back via MCP. Faster, cheaper, no API
+          credits.
+        </p>
+        <a class="claude-cta-button" id="open-in-claude-${project.id}"
+           href="https://claude.ai/new" target="_blank" rel="noopener">
+          Open in Claude →
+        </a>
+        <a class="claude-cta-secondary" id="copy-handoff-${project.id}"
+           href="#">Copy latest handoff to clipboard</a>
       </div>
     </section>
   `;
@@ -1080,8 +1126,11 @@ function buildTabBody(project) {
     };
   }
 
-  // Clear chat button
-  document.getElementById(`clear-chat-${project.id}`).onclick = async () => {
+  // v1.1.0 — chat panel removed in favour of "Open in Claude". The
+  // wireups below guard for null elements so older deployments with
+  // the chat surface still mounted keep working.
+  const clearChatBtn = document.getElementById(`clear-chat-${project.id}`);
+  if (clearChatBtn) clearChatBtn.onclick = async () => {
     if (!confirm('Clear chat history for this project?')) return;
     try {
       await fetch(`/projects/${project.id}/chat/history`, { method: 'DELETE' });
@@ -1091,13 +1140,11 @@ function buildTabBody(project) {
       toast('chat cleared');
     } catch(e) { toast('clear failed: ' + e.message, true); }
   };
-
-  // Model selector
   const modelSel = document.getElementById(`model-select-${project.id}`);
   if (modelSel) {
     const VALID_MODELS = ['claude-sonnet-4-6','claude-opus-4-6','claude-opus-4-7','claude-haiku-4-5-20251001'];
     let savedModel = localStorage.getItem('meridian.chatModel') || 'claude-sonnet-4-6';
-    if (!VALID_MODELS.includes(savedModel)) savedModel = 'claude-sonnet-4-6'; // evict stale
+    if (!VALID_MODELS.includes(savedModel)) savedModel = 'claude-sonnet-4-6';
     modelSel.value = savedModel;
     if (state.panels[project.id]) state.panels[project.id].chatModel = savedModel;
     modelSel.onchange = () => {
@@ -1107,6 +1154,25 @@ function buildTabBody(project) {
       toast('model: ' + m);
     };
   }
+  // v1.1.0 — Open in Claude CTA replaces the chat panel.
+  const openInClaude = document.getElementById(`open-in-claude-${project.id}`);
+  if (openInClaude) openInClaude.href = 'https://claude.ai/new';
+  const copyHandoff = document.getElementById(`copy-handoff-${project.id}`);
+  if (copyHandoff) copyHandoff.onclick = async (ev) => {
+    ev.preventDefault();
+    try {
+      const r = await fetch(`/projects/${project.id}/handoff`, { method: 'POST' });
+      if (!r.ok) throw new Error(`${r.status}`);
+      const body = await r.json();
+      const text = body.content || '';
+      if (text && navigator.clipboard) {
+        await navigator.clipboard.writeText(text);
+        toast('handoff copied — paste into Claude');
+      } else {
+        toast('handoff written: ' + (body.path || 'data/'), false);
+      }
+    } catch(e) { toast('handoff failed: ' + e.message, true); }
+  };
   document.getElementById(`goal-${project.id}`).addEventListener('blur', () => saveGoal(project.id));
   document.getElementById(`goal-north-star-${project.id}`).addEventListener('blur', () => saveNorthStar(project.id));
   document.getElementById(`goal-sprint-${project.id}`).addEventListener('blur', () => saveSprint(project.id));
@@ -1123,13 +1189,14 @@ function buildTabBody(project) {
     const p = state.panels[project.id];
     this.classList.toggle('dirty', this.value !== (p._serverSprint || ''));
   });
-  document.getElementById(`chat-send-${project.id}`).onclick = () => sendChat(project.id);
+  // v1.1.0 — chat input + mode toggle removed. Defensive wireups for
+  // anyone running an older bundle: only attach if the elements exist.
+  const chatSendBtn = document.getElementById(`chat-send-${project.id}`);
+  if (chatSendBtn) chatSendBtn.onclick = () => sendChat(project.id);
   const input = document.getElementById(`chat-input-${project.id}`);
-  input.addEventListener('keydown', (e) => {
+  if (input) input.addEventListener('keydown', (e) => {
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendChat(project.id); }
   });
-
-  // Mode toggle — updates panel state, active-button class, and localStorage.
   const modeRoot = document.getElementById(`chat-mode-${project.id}`);
   if (modeRoot) {
     modeRoot.querySelectorAll('.mode-btn').forEach(btn => {
@@ -1148,6 +1215,9 @@ function buildTabBody(project) {
       };
     });
   }
+
+  // v1.1.0 — marked.js edit/preview toggle per goal field.
+  wireGoalPreviewToggle(project.id);
 
   // Files tab: back button returns to browse view; save button persists edits.
   const fileBackBtn = document.getElementById(`file-back-${project.id}`);
@@ -1286,6 +1356,55 @@ async function refreshGoal(projectId) {
     ta.value = '';
     v.textContent = '(unset)';
   }
+}
+
+// v1.1.0 — marked.js edit/preview toggle for the three goal fields.
+// Each textarea gets a small Edit / Preview chip pair injected just
+// above it. Preview mode swaps the textarea out for a rendered div
+// whose innerHTML is marked(textarea.value). Edit mode swaps back.
+function wireGoalPreviewToggle(projectId) {
+  const fields = [
+    { ta: `goal-${projectId}`,            preview: `preview-goal-${projectId}` },
+    { ta: `goal-north-star-${projectId}`, preview: `preview-north-star-${projectId}` },
+    { ta: `goal-sprint-${projectId}`,     preview: `preview-sprint-${projectId}` },
+  ];
+  fields.forEach(({ ta, preview }) => {
+    const taEl = document.getElementById(ta);
+    if (!taEl) return;
+    if (document.getElementById(`row-${ta}`)) return; // already wired
+    const row = document.createElement('div');
+    row.id = `row-${ta}`;
+    row.className = 'preview-toggle-row';
+    row.innerHTML =
+      `<button class="preview-btn active" data-mode="edit">edit</button>` +
+      `<button class="preview-btn"        data-mode="preview">preview</button>`;
+    taEl.parentNode.insertBefore(row, taEl);
+    const previewDiv = document.createElement('div');
+    previewDiv.id = preview;
+    previewDiv.className = 'goal-preview';
+    previewDiv.style.display = 'none';
+    taEl.parentNode.insertBefore(previewDiv, taEl.nextSibling);
+    row.querySelectorAll('.preview-btn').forEach(btn => {
+      btn.onclick = () => {
+        const mode = btn.dataset.mode;
+        row.querySelectorAll('.preview-btn').forEach(b => {
+          b.classList.toggle('active', b.dataset.mode === mode);
+        });
+        if (mode === 'preview') {
+          const md = taEl.value || '';
+          const html = (typeof marked !== 'undefined')
+            ? marked.parse(md, { mangle: false, headerIds: false })
+            : escapeHtml(md);
+          previewDiv.innerHTML = html;
+          taEl.style.display = 'none';
+          previewDiv.style.display = '';
+        } else {
+          previewDiv.style.display = 'none';
+          taEl.style.display = '';
+        }
+      };
+    });
+  });
 }
 
 async function saveGoal(projectId) {
