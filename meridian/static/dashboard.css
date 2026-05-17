@@ -180,14 +180,14 @@ html, body {
   font-family: 'IBM Plex Mono', monospace; font-weight: 600;
 }
 .goal-area {
-  width: 100%; min-height: 70px; max-height: 180px;
+  width: 100%; min-height: 200px;
   background: var(--surface-2); border: 1px solid var(--border);
   border-radius: 4px; padding: 8px; color: var(--text);
   font-family: 'IBM Plex Mono', monospace; font-size: 12px;
   resize: vertical;
 }
 .goal-area.readonly { background: var(--surface-1); color: var(--muted); cursor: default; }
-.goal-area.sprint { min-height: 50px; max-height: 100px; }
+.goal-area.sprint { min-height: 100px; }
 .goal-area.dirty { border-color: var(--accent) !important; }
 .goal-label { font-size: 10px; font-family: 'IBM Plex Mono', monospace; font-weight: 600;
   letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); margin-bottom: 3px; }

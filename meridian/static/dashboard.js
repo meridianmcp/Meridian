@@ -728,7 +728,7 @@ function wireGoalPreviewToggle(projectId) {
         if (mode === 'preview') {
           const md = taEl.value || '';
           const html = (typeof marked !== 'undefined')
-            ? marked.parse(md, { mangle: false, headerIds: false })
+            ? marked.parse(md)
             : escapeHtml(md);
           previewDiv.innerHTML = html;
           taEl.style.display = 'none';
