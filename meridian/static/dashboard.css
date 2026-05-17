@@ -540,6 +540,7 @@ input[type=text] {
   margin-bottom: 3px;
 }
 .queue-item-session { color: var(--muted); font-size: 10px; margin-top: 2px; }
+.queue-item-ts { color: var(--muted); font-size: 10px; margin-left: 6px; font-family: 'IBM Plex Mono', monospace; }
 .queue-empty { color: var(--muted); font-size: 11px; font-family: 'IBM Plex Mono', monospace; padding: 2px 0; }
 
 /* v1.3.0 — Rewind tab.

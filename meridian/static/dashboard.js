@@ -1,4 +1,4 @@
-const TABS_KEY = 'meridian.openTabs';
+﻿const TABS_KEY = 'meridian.openTabs';
 const ACTIVE_PROJECT_KEY = 'meridian.activeProject';
 const state = {
   projects: [],
@@ -700,7 +700,7 @@ function renderLiveSessions(projectId, sessions, tasks) {
       } catch(e) {}
       return { s, ageMs };
     })
-    .filter(({ ageMs }) => ageMs <= 24 * 3600 * 1000)
+    .filter(({ ageMs }) => ageMs > 0 && ageMs <= 24 * 3600 * 1000)
     .sort((a, b) => a.ageMs - b.ageMs);
   if (!rows.length) {
     root.innerHTML = '<div class="live-empty">No active sessions.</div>';
@@ -1040,7 +1040,9 @@ function renderQueue(tasks) {
       ? items.map(t => {
           const sessLine = t.session_name
             ? `<div class="queue-item-session">${escapeHtml(t.session_name)}</div>` : '';
-          return `<div class="queue-item">${escapeHtml((t.description || '').slice(0, 120))}${sessLine}</div>`;
+          const tsLine = t.created_at
+            ? `<span class="queue-item-ts">${escapeHtml(formatRelativeTime(t.created_at))}</span>` : '';
+          return `<div class="queue-item">${escapeHtml((t.description || '').slice(0, 120))}${sessLine}${tsLine}</div>`;
         }).join('')
       : `<div class="queue-empty">${emptyMsg}</div>`;
     return `<div class="queue-section">` +
@@ -1773,134 +1775,3 @@ async function copyRewindLink(projectId) {
   }
 }
 
-
-// ---------------------------------------------------------------------------
-// LIVE tab — RIGHT NOW view (sessions + queue)
-// ---------------------------------------------------------------------------
-
-async function loadLiveTab(projectId) {
-  await Promise.all([
-    refreshLiveSessions(projectId),
-    refreshLiveQueue(projectId),
-    refreshLiveProgress(projectId),
-  ]);
-  wireLiveAddInput(projectId);
-}
-
-async function refreshLiveProgress(projectId) {
-  const el = document.getElementById(`live-sprint-progress-${projectId}`);
-  if (!el) return;
-  try {
-    const items = await api(`/projects/${projectId}/sprint-items`);
-    const total = items.length;
-    const done = items.filter(i => i.status === 'done').length;
-    if (total === 0) { el.innerHTML = '<span style="color:var(--muted)">no sprint items</span>'; return; }
-    const pct = Math.round((done / total) * 100);
-    const filled = Math.round((done / total) * 10);
-    const bar = '█'.repeat(filled) + '░'.repeat(10 - filled);
-    el.innerHTML = `<span class="mono" style="color:var(--accent)">[${bar}]</span> <span style="color:var(--muted)">${done}/${total} (${pct}%)</span>`;
-  } catch (_) { el.innerHTML = ''; }
-}
-
-async function refreshLiveSessions(projectId) {
-  const el = document.getElementById(`live-sessions-${projectId}`);
-  if (!el) return;
-  try {
-    const [sessions, tasks] = await Promise.all([
-      api(`/projects/${projectId}/sessions`),
-      api(`/projects/${projectId}/tasks?limit=100`),
-    ]);
-    const cutoff = Date.now() - 24 * 60 * 60 * 1000;
-    const active = sessions.filter(s => new Date(s.last_seen + 'Z').getTime() > cutoff);
-    if (!active.length) { el.innerHTML = '<div class="live-empty">No active sessions.</div>'; return; }
-    el.innerHTML = active.map(s => {
-      const age = Date.now() - new Date(s.last_seen + 'Z').getTime();
-      const mins = Math.floor(age / 60000);
-      const dot = age < 5 * 60000 ? '🟢' : age < 30 * 60000 ? '🟡' : '⚫';
-      const label = mins < 60 ? `${mins}m ago` : `${Math.floor(mins/60)}h ago`;
-      const claimed = tasks.find(t => t.claimed_by === s.id && t.status === 'in_progress');
-      const taskLine = claimed
-        ? `<div class="live-session-task">→ ${escapeHtml((claimed.description || '').slice(0, 80))}</div>`
-        : '';
-      return `<div class="live-session-row">
-        <span class="live-dot">${dot}</span>
-        <div>
-          <span class="live-session-name">${escapeHtml(s.name || s.id.slice(0,8))}</span>
-          <span class="live-session-age" style="color:var(--muted);font-size:10px;margin-left:6px">${label}</span>
-          ${taskLine}
-        </div>
-      </div>`;
-    }).join('');
-  } catch (e) {
-    el.innerHTML = `<div class="live-empty" style="color:var(--danger)">sessions error: ${escapeHtml(e.message)}</div>`;
-  }
-}
-
-async function refreshLiveQueue(projectId) {
-  const el = document.getElementById(`live-queue-${projectId}`);
-  if (!el) return;
-  try {
-    const tasks = await api(`/projects/${projectId}/tasks?limit=100`);
-    const active = tasks.filter(t => t.status === 'pending' || t.status === 'in_progress');
-    if (!active.length) { el.innerHTML = '<div class="live-empty">Queue is empty.</div>'; return; }
-    const inProg = active.filter(t => t.status === 'in_progress');
-    const pending = active.filter(t => t.status === 'pending');
-    const renderRow = t => {
-      const dot = t.status === 'in_progress' ? '🔵' : '📋';
-      const claimer = t.status === 'in_progress' && t.claimed_by
-        ? ` <span style="color:var(--muted);font-size:9px">[claimed]</span>` : '';
-      return `<div class="live-queue-row" style="display:flex;align-items:center;gap:6px;padding:4px 0;border-bottom:1px solid var(--border)">
-        <span>${dot}</span>
-        <span style="flex:1;font-size:11px">${escapeHtml((t.description || '').slice(0, 100))}${claimer}</span>
-        <button class="secondary" style="padding:1px 6px;font-size:9px" onclick="cancelTask('${projectId}','${t.id}')">✕</button>
-      </div>`;
-    };
-    el.innerHTML = [...inProg, ...pending].map(renderRow).join('');
-  } catch (e) {
-    el.innerHTML = `<div class="live-empty" style="color:var(--danger)">queue error: ${escapeHtml(e.message)}</div>`;
-  }
-}
-
-async function cancelTask(projectId, taskId) {
-  try {
-    await api(`/tasks/${taskId}`, { method: 'PATCH', body: JSON.stringify({ status: 'done' }) });
-    await refreshLiveQueue(projectId);
-    toast('task cancelled');
-  } catch (e) { toast('cancel failed: ' + e.message, true); }
-}
-
-function wireLiveAddInput(projectId) {
-  const input = document.getElementById(`live-add-input-${projectId}`);
-  if (!input || input._wired) return;
-  input._wired = true;
-  input.addEventListener('keydown', async e => {
-    if (e.key !== 'Enter') return;
-    const desc = input.value.trim();
-    if (!desc) return;
-    input.value = '';
-    try {
-      // Get most recent session_id for this project to attach the task
-      const sessions = await api(`/projects/${projectId}/sessions`);
-      const sess = sessions.sort((a, b) =>
-        new Date(b.last_seen) - new Date(a.last_seen))[0];
-      await api(`/projects/${projectId}/tasks`, {
-        method: 'POST',
-        body: JSON.stringify({
-          session_id: sess ? sess.id : null,
-          description: desc,
-          status: 'pending',
-        }),
-      });
-      await refreshLiveQueue(projectId);
-      toast('task added to queue');
-    } catch (e) { toast('add failed: ' + e.message, true); }
-  });
-}
-
-// refreshLiveTab — alias called by WS handler when live tab is active
-async function refreshLiveTab(projectId) {
-  await Promise.all([
-    refreshLiveSessions(projectId),
-    refreshLiveQueue(projectId),
-  ]);
-}
