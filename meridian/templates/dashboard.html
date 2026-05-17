@@ -12,6 +12,10 @@
 <link rel="stylesheet" href="/static/dashboard.css">
 </head>
 <body>
+<div id="update-banner" style="display:none">
+  &#9888;&#65039; Server updated — restart to apply
+  <button onclick="document.getElementById('update-banner').style.display='none'" style="margin-left:12px;background:none;border:1px solid currentColor;border-radius:3px;color:inherit;cursor:pointer;font-size:11px;padding:1px 8px">Dismiss</button>
+</div>
 <button id="sidebar-toggle" title="Toggle sidebar" onclick="document.querySelector('.sidebar').classList.toggle('mobile-open')">☰</button>
 <div class="app">
   <aside class="sidebar">
@@ -25,6 +29,9 @@
       <input id="new-project-name" type="text" placeholder="new project name">
       <input id="new-project-human" type="text" placeholder="your name (optional)" style="max-width:120px">
       <button class="primary" id="new-project-btn">+</button>
+    </div>
+    <div class="sidebar-footer">
+      <button class="sidebar-stop-btn" id="stop-server-btn" title="Stop the Meridian server">⏹ Stop Server</button>
     </div>
   </aside>
   <main class="main">

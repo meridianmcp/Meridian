@@ -320,3 +320,26 @@ def test_dashboard_open_in_claude_not_dominant(client):
     assert "flex: 1" in drawer_rule or "flex:1" in drawer_rule, (
         "Bug 6: .vtab-drawer must be flex:1 so goal panel dominates the layout."
     )
+
+
+def test_dashboard_live_tab_has_progress_bar(client, js):
+    """LIVE tab shows a sprint progress bar ([████░░] done/total).
+
+    The bar is rendered by renderSprintProgress() which fetches
+    /sprint-items and produces a monospace block-character bar.
+    Checks JS source (bar is dynamically rendered, not in static HTML).
+    """
+    assert "live-sprint-progress-" in js, (
+        "sprint progress bar container ID missing from LIVE tab HTML in buildTabBody"
+    )
+    assert "renderSprintProgress" in js, (
+        "renderSprintProgress function missing from dashboard.js"
+    )
+    assert "sprint-items" in js, (
+        "/sprint-items API call missing — progress bar won't load"
+    )
+    # CSS classes for the bar must exist
+    css = client.get("/static/dashboard.css").text
+    assert "live-sprint-bar" in css, (
+        ".live-sprint-bar CSS class missing"
+    )

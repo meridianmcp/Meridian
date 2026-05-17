@@ -11,10 +11,12 @@ This module exposes two surfaces backed by the same async SQLite database:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import asyncio
 import os
 import re
+import signal
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -148,11 +150,43 @@ async def lifespan(app: FastAPI):
     watch_task = asyncio.create_task(goal_md_module.watch_goal_md(db))
     app.state.watch_task = watch_task
 
+    # v1.7.0 — server update detection: hash key files at startup,
+    # recheck every 60s, broadcast update_available to all WS clients if changed.
+    def _server_hash() -> str:
+        h = hashlib.md5()
+        for rel in [
+            "meridian/server.py",
+            "meridian/db.py",
+            "meridian/static/dashboard.js",
+        ]:
+            try:
+                h.update(Path(rel).read_bytes())
+            except OSError:
+                pass
+        return h.hexdigest()
+
+    app.state.startup_hash = _server_hash()
+
+    async def _version_check_loop() -> None:
+        while True:
+            try:
+                await asyncio.sleep(60)
+                if _server_hash() != app.state.startup_hash:
+                    db_module.publish_global({"type": "update_available"})
+            except asyncio.CancelledError:
+                break
+            except Exception:  # noqa: BLE001
+                continue
+
+    version_task = asyncio.create_task(_version_check_loop())
+    app.state.version_task = version_task
+
     try:
         yield
     finally:
         summary_task.cancel()
         watch_task.cancel()
+        version_task.cancel()
         try:
             await summary_task
         except (asyncio.CancelledError, Exception):  # noqa: BLE001
@@ -1324,6 +1358,27 @@ async def start_session_endpoint(
         _data_dir(request),
         human_id=body.human_id,
     )
+
+
+# ---------------------------------------------------------------------------
+# Admin — shutdown
+# ---------------------------------------------------------------------------
+
+
+@app.post("/admin/shutdown")
+async def admin_shutdown() -> dict[str, bool]:
+    """v1.7.0 — gracefully stop the server process.
+
+    Returns immediately with ``{"ok": True}`` then sends SIGINT to the
+    current process after a short delay so the HTTP response has time to
+    flush. The dashboard shows a "restart required" message on receipt.
+    """
+    async def _delayed_shutdown() -> None:
+        await asyncio.sleep(0.5)
+        os.kill(os.getpid(), signal.SIGINT)
+
+    asyncio.create_task(_delayed_shutdown())
+    return {"ok": True}
 
 
 # ---------------------------------------------------------------------------

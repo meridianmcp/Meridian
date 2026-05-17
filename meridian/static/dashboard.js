@@ -1399,6 +1399,11 @@ function connectWs(projectId) {
 }
 
 function handleWsEvent(projectId, event) {
+  if (event.type === 'update_available') {
+    const banner = document.getElementById('update-banner');
+    if (banner) banner.style.display = 'block';
+    return;
+  }
   const cache = state.panels[projectId].taskCache;
   if (event.type === 'task_created') {
     cache.unshift(event.task);
@@ -1571,6 +1576,21 @@ async function restoreTabs() {
   // v1.5.x — polling removed. WebSocket pushes task/goal updates; sessions
   // refresh on initial page load + explicit user action only (tab switch,
   // worker start, etc). Idle dropdowns no longer hammer /sessions every 1s.
+
+  // v1.7.0 — stop server button
+  const stopBtn = document.getElementById('stop-server-btn');
+  if (stopBtn) {
+    stopBtn.onclick = async () => {
+      if (!confirm('Stop the Meridian server? You will need to run `pixi run start` to restart.')) return;
+      try {
+        await api('/admin/shutdown', { method: 'POST' });
+        stopBtn.textContent = 'Server stopped. Run pixi run start to restart.';
+        stopBtn.disabled = true;
+      } catch(e) {
+        toast('Shutdown request sent.', false);
+      }
+    };
+  }
 })();
 
 // --- v0.6.6 EZ wizard ---

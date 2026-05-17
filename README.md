@@ -1,48 +1,28 @@
-# Meridian — Multi-Session Claude Coordinator
+# Meridian
 
-A local MCP server that gives multiple Claude sessions a shared persistent
-brain. Goal state, task log, session registry, and context handoff files —
-so you can run parallel sessions without losing context or repeating yourself.
+Your AI sessions don't remember each other.
 
-## What it solves
+Every Claude tab starts fresh. Parallel sessions duplicate work. Context fills up
+and you start over from scratch. Meridian fixes this — a local server every session
+connects to so they share goal state, see each other's task logs, and can resume
+instantly from a compressed handoff.
 
-- Claude sessions are isolated. Each tab or terminal knows nothing about the others.
-- Context fills up and dies. You lose everything mid-project and start over.
-- Parallel sessions on the same project means manually syncing state.
-- Switching between projects means re-loading context from scratch every time.
-
-Meridian fixes all four. Every session connects to the same local server.
-They share goal state, see each other's task logs, and generate compressed
-handoff files so new sessions resume with full context instantly.
-
-**Architecture principle:** The chat interface is stateless. Meridian is the
-source of truth. Any session — Desktop, Code, terminal, or browser tab —
-hydrates from Meridian on connect. No manual context pasting.
-
-## Current version: v1.0.0 (166 tests passing)
-
-- MCP tools: `create_project`, `register_session`, `get_goal`, `set_goal`,
-  `set_north_star`, `set_sprint`, `log_task`, `get_tasks`, `get_sessions`,
-  `generate_handoff`, `enqueue_claude_task`, `claim_task`, `release_task`,
-  `list_projects`, `get_project_by_name`, `start_session`
-- FastAPI HTTP server on port 7878
-- SQLite at `~/.meridian/meridian.db`
-- XML-tagged goal output with prompt caching hints
-- GOAL.md bidirectional file sync
-- First-run setup wizard, project switcher
-- IP attribution PDF export (SHA-256 tamper-evident)
-- PyInstaller single-file exe (run `pixi run build-exe`)
-- License: MSL-2.0 (free for individual use, paid for team/shared use)
-
-## Quick start
+## Install
 
 ```bash
-pixi run start        # FastAPI on port 7878
-pixi run test         # 25 tests
-pixi run demo         # two-session coordination demo
+# Requires pixi — https://prefix.dev/docs/pixi/overview
+git clone https://github.com/yourusername/meridian
+cd meridian
+pixi run start       # dashboard at http://localhost:7878
 ```
 
-## Claude Desktop / Code MCP config
+Open `http://localhost:7878` to see the dashboard.
+
+## Connect to Claude
+
+### Claude Code (recommended)
+
+Create `.mcp.json` in your project root:
 
 ```json
 {
@@ -50,22 +30,20 @@ pixi run demo         # two-session coordination demo
     "meridian": {
       "command": "pixi",
       "args": ["run", "python", "-m", "meridian", "--mcp"],
-      "cwd": "C:/Users/13144/Documents/Meridian/repository"
+      "cwd": "/path/to/meridian"
     }
   }
 }
 ```
 
-## Connect your AI planning session
+Every Claude Code session in that project gets Meridian tools automatically.
 
-Meridian MCP tools work inside any MCP-compatible client — your claude.ai
-chat tab becomes a project coordinator that dispatches workers and reads
-results without leaving the conversation.
+### Claude Desktop
 
-### Option A — Claude Desktop
+Add to `claude_desktop_config.json`:
 
-Add to `~/AppData/Roaming/Claude/claude_desktop_config.json` (Windows) or
-`~/Library/Application Support/Claude/claude_desktop_config.json` (macOS):
+- Windows: `%APPDATA%\Claude\claude_desktop_config.json`
+- macOS: `~/Library/Application Support/Claude/claude_desktop_config.json`
 
 ```json
 {
@@ -73,7 +51,7 @@ Add to `~/AppData/Roaming/Claude/claude_desktop_config.json` (Windows) or
     "meridian": {
       "command": "pixi",
       "args": ["run", "python", "-m", "meridian", "--mcp"],
-      "cwd": "/absolute/path/to/meridian/repository"
+      "cwd": "/path/to/meridian"
     }
   }
 }
@@ -81,53 +59,31 @@ Add to `~/AppData/Roaming/Claude/claude_desktop_config.json` (Windows) or
 
 Restart Claude Desktop. Your next chat has Meridian tools available.
 
-### Option B — Claude Code project
+## How it works
 
-Create `.mcp.json` in your project root (see `mcp.json.example` in this
-repo for the canonical template):
+1. Start a session: `start_session(project_id=..., session_name="my-session")`
+2. Read the goal, see what other sessions did: returned in the same call
+3. Do work, log tasks: `log_task(..., description="built the auth endpoint", status="done")`
+4. Before context fills up: `generate_handoff(project_id=...)` — writes a compressed file
+5. New session reads the handoff and picks up exactly where you left off
 
-```json
-{
-  "mcpServers": {
-    "meridian": {
-      "command": "pixi",
-      "args": ["run", "python", "-m", "meridian", "--mcp"],
-      "cwd": "/absolute/path/to/meridian/repository"
-    }
-  }
-}
-```
-
-Any Claude Code session in that project gets Meridian tools automatically.
-
-### The full loop (no terminals, no copy-paste)
-
-1. Human sets sprint: `set_sprint(project_id=..., sprint="build v1.3.0")`
-2. Human dispatches worker: `enqueue_claude_task(project_id=..., prompt="build the rewind endpoint")`
-3. Claude Code worker spawns automatically in the background
-4. Human checks results: `get_tasks(project_id=..., limit=5)`
-5. Context never lost — Meridian holds the state, not the chat window
+State lives in a local SQLite file. No accounts, no cloud, no sync required.
 
 ## Privacy
 
-**Free tier:** runs entirely on your machine. No server, no telemetry, no accounts. We physically cannot see your data because it never leaves your computer.
+**Free tier (this repo):** runs entirely on your machine. No telemetry, no accounts.
+We physically cannot see your data — it never leaves your computer.
 
-**Paid/hosted tier:** your data lives on our server. We do not sell it. We do not train models on it — Meridian calls AI APIs, it is not an AI model, and task logs are coordination data not training data. Full export and deletion available at any time. Your SQLite database is an open file format you can take anywhere.
+**Paid/hosted tier (future):** your data lives on our server. We do not sell it.
+We do not train models on it. Full export and deletion available at any time.
 
 **Enterprise/self-hosted:** runs on your infrastructure. We never have access.
 
-Meridian shows managers what shipped, not how many hours someone worked. No productivity scores, no per-developer rankings, no surveillance features. The developer is the customer.
-
-## Roadmap
-
-See [ROADMAP.md](ROADMAP.md) for the full version plan and free/paid split.
-
-- **v0.2.0** — Dashboard + project-scoped chat, HITL queue, WebSocket push
-- **v0.3.0** — claim/release task locking, session health, watch_goal
-- **v0.4.0** — Named project configs, multi-project workspace
-- **v1.0.0** — Tauri desktop app, system tray, worker dispatch panel
+Meridian shows what shipped, not how many hours someone worked. No surveillance
+features, no productivity scores, no per-developer rankings. The developer is the
+customer.
 
 ## License
 
-Meridian Source License 1.0 — free for individual personal use.
-Commercial use requires a license. See LICENSE for details.
+[MSL-2.0](LICENSE) — free for individual personal use. Commercial use requires a
+license. See LICENSE for details.

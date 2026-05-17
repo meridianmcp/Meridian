@@ -38,6 +38,16 @@ def unsubscribe_tasks(project_id: str, queue: asyncio.Queue) -> None:
             _TASK_LISTENERS.pop(project_id, None)
 
 
+def publish_global(event: dict[str, Any]) -> None:
+    """Fan-out a global event (e.g. update_available) to every WS subscriber."""
+    for listeners in list(_TASK_LISTENERS.values()):
+        for q in list(listeners):
+            try:
+                q.put_nowait(event)
+            except asyncio.QueueFull:
+                pass
+
+
 def _publish_task(event_type: str, task: dict[str, Any]) -> None:
     """Fan-out a task event to every subscriber of the project.
 

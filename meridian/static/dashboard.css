@@ -33,6 +33,20 @@ html, body {
   letter-spacing: 0.04em; color: var(--accent);
 }
 .sidebar-header small { display: block; color: var(--muted); font-weight: 400; font-size: 11px; }
+.sidebar-footer { margin-top: auto; padding: 10px 12px; border-top: 1px solid var(--border); }
+.sidebar-stop-btn {
+  width: 100%; padding: 7px 10px; background: none;
+  border: 1px solid var(--border); border-radius: 4px;
+  color: var(--muted); cursor: pointer; font-size: 11px;
+  font-family: 'IBM Plex Mono', monospace; text-align: left;
+}
+.sidebar-stop-btn:hover { border-color: var(--status-failed); color: var(--status-failed); }
+#update-banner {
+  position: fixed; top: 0; left: 0; right: 0; z-index: 10000;
+  background: #7c3aed; color: #fff;
+  padding: 8px 16px; font-size: 12px; font-family: 'IBM Plex Mono', monospace;
+  text-align: center;
+}
 #api-warn {
   margin: 10px; padding: 8px 10px;
   background: rgba(255,107,107,0.1); border: 1px solid rgba(255,107,107,0.3);
