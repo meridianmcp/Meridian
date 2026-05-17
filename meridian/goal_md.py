@@ -356,12 +356,18 @@ async def sync_db_to_goal_md(
     version_goal = content if isinstance(content, str) else (
         None if content is None else str(content)
     )
+    # v1.1.4 — surface the append-only decisions log in GOAL.md too
+    # so the human editor sees the running log alongside the goal
+    # fields. Decisions are read-only on the file side: edits to
+    # this section are NOT synced back into the DB.
+    decisions = await db_module.get_decisions(db, project_id)
     return write_goal_md(
         project["name"],
         goal.get("north_star"),
         version_goal,
         goal.get("sprint"),
         path=path,
+        decisions=decisions,
     )
 
 

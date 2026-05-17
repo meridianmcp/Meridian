@@ -3104,3 +3104,97 @@ def test_start_session_endpoint_carries_coherence_warning(client):
     body = r.json()
     assert body["goal"]["coherence_warning"]["level"] == "ok"
     assert "<coherence_warning" in body["goal_xml"]
+
+
+# ---------------------------------------------------------------------------
+# v1.1.4 — decisions field
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_set_decision_prepends_with_date(db):
+    p = await db_module.create_project(db, "alpha")
+    log = await db_module.set_decision(db, p["id"], "chose sqlite", timestamp="2026-01-15")
+    assert "[2026-01-15] chose sqlite" in log
+    # Append a second entry — newest first.
+    log = await db_module.set_decision(
+        db, p["id"], "pyinstaller for v1", timestamp="2026-02-01"
+    )
+    assert log.index("pyinstaller") < log.index("sqlite")
+
+
+@pytest.mark.asyncio
+async def test_get_decisions_returns_none_when_unset(db):
+    p = await db_module.create_project(db, "alpha")
+    assert await db_module.get_decisions(db, p["id"]) is None
+
+
+@pytest.mark.asyncio
+async def test_set_decision_unknown_project_raises(db):
+    with pytest.raises(ValueError):
+        await db_module.set_decision(db, "no-such", "x")
+
+
+def test_post_decisions_endpoint(client):
+    project = client.post("/projects", json={"name": "alpha"}).json()
+    r = client.post(
+        f"/projects/{project['id']}/decisions",
+        json={"text": "sqlite over postgres"},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert "sqlite over postgres" in body["decisions"]
+    # Empty text → 422
+    r = client.post(
+        f"/projects/{project['id']}/decisions", json={"text": "   "}
+    )
+    assert r.status_code == 422
+    # Unknown project → 404
+    r = client.post(
+        "/projects/no-such/decisions", json={"text": "x"}
+    )
+    assert r.status_code == 404
+
+
+def test_get_goal_endpoint_includes_decisions(client):
+    project = client.post("/projects", json={"name": "alpha"}).json()
+    client.post(
+        f"/projects/{project['id']}/goal",
+        json={"content": "v", "north_star": "n", "sprint": "s"},
+    )
+    client.post(
+        f"/projects/{project['id']}/decisions",
+        json={"text": "sqlite over postgres"},
+    )
+    body = client.get(f"/projects/{project['id']}/goal").json()
+    assert body["decisions"] and "sqlite" in body["decisions"]
+    assert '<decisions cache="true">' in body["xml"]
+
+
+def test_start_session_includes_decisions(client):
+    project = client.post("/projects", json={"name": "alpha"}).json()
+    client.post(
+        f"/projects/{project['id']}/goal",
+        json={"content": "v", "north_star": "n", "sprint": "s"},
+    )
+    client.post(
+        f"/projects/{project['id']}/decisions",
+        json={"text": "fpdf2 not reportlab"},
+    )
+    r = client.post(
+        f"/projects/{project['id']}/start-session",
+        json={"session_name": "w", "human_id": "adam"},
+    )
+    body = r.json()
+    assert "fpdf2" in (body["goal"]["decisions"] or "")
+    assert "fpdf2" in body["goal_xml"]
+
+
+def test_build_goal_xml_omits_decisions_when_empty():
+    """No <decisions> tag when there's nothing to show — worker
+    sessions in v1.2.0 will pass decisions=None for the same reason."""
+    xml = db_module.build_goal_xml(
+        {"version": 1, "content": "v", "north_star": "n", "sprint": "s"},
+        "alpha", [], None, decisions=None,
+    )
+    assert "<decisions" not in xml

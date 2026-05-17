@@ -63,6 +63,7 @@ CREATE TABLE IF NOT EXISTS projects (
     creator_human_id TEXT,
     goal_mode TEXT NOT NULL DEFAULT 'manual'
         CHECK (goal_mode IN ('manual', 'auto')),
+    decisions TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -254,6 +255,16 @@ async def _migrate_task_claims(db: aiosqlite.Connection) -> None:
     await _migrate_add_column_if_missing(db, "task_log", "claimed_at", "TEXT")
 
 
+async def _migrate_decisions(db: aiosqlite.Connection) -> None:
+    """v1.1.4 — append-only decisions log per project.
+
+    Stored as a TEXT blob on ``projects``. New entries are prepended
+    by :func:`set_decision` with a UTC date stamp so the file reads
+    newest-first.
+    """
+    await _migrate_add_column_if_missing(db, "projects", "decisions", "TEXT")
+
+
 async def _migrate_goal_mode(db: aiosqlite.Connection) -> None:
     """v0.4.2 — add ``goal_mode`` column to projects.
 
@@ -316,6 +327,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_task_log_hitl(db)
     await _migrate_human_identity(db)
     await _migrate_task_claims(db)
+    await _migrate_decisions(db)
     await _migrate_goal_mode(db)
     await _migrate_goal_hierarchy(db)
     return db
@@ -379,6 +391,7 @@ def build_goal_xml(
     project_name: str,
     recent_tasks: list[dict[str, Any]] | None = None,
     coherence_warning: dict[str, Any] | None = None,
+    decisions: str | None = None,
 ) -> str:
     """Serialise the goal + ambient context as XML for MCP consumers.
 
@@ -426,6 +439,12 @@ def build_goal_xml(
         f'  <version_goal cache="true">{escape(version_goal)}</version_goal>'
     )
     out.append(f'  <sprint cache="false">{escape(sprint)}</sprint>')
+    # v1.1.4 — append-only decisions log. Cached because it changes
+    # rarely and only by explicit set_decision calls.
+    if decisions is not None and decisions.strip():
+        out.append(
+            f'  <decisions cache="true">{escape(decisions)}</decisions>'
+        )
     out.append('  <recent_tasks cache="false">')
     for t in recent_tasks or []:
         status = escape(str(t.get("status") or ""))
@@ -763,6 +782,51 @@ async def append_auto_summary(
         prefix = content
     new_content = prefix.rstrip() + _AUTO_SECTION_MARKER + summary_block
     return await set_goal(db, project_id, new_content)
+
+
+async def get_decisions(
+    db: aiosqlite.Connection, project_id: str
+) -> str | None:
+    """v1.1.4 — return the project's append-only decisions log,
+    newest first. ``None`` when no decisions have been recorded."""
+    async with db.execute(
+        "SELECT decisions FROM projects WHERE id = ?", (project_id,)
+    ) as cur:
+        row = await cur.fetchone()
+    if row is None:
+        return None
+    return row[0]
+
+
+async def set_decision(
+    db: aiosqlite.Connection,
+    project_id: str,
+    text: str,
+    timestamp: str | None = None,
+) -> str:
+    """Prepend a decision entry to the project's decisions log.
+
+    Format per entry: ``[YYYY-MM-DD] <text>\\n\\n``. The entry is
+    prepended so the latest decision sits at the top of the log —
+    cold sessions read it first. Returns the full updated log.
+    """
+    from datetime import datetime, timezone
+    ts = timestamp or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    entry = f"[{ts}] {text.strip()}\n"
+    async with db.execute(
+        "SELECT decisions FROM projects WHERE id = ?", (project_id,)
+    ) as cur:
+        row = await cur.fetchone()
+    if row is None:
+        raise ValueError(f"unknown project: {project_id}")
+    existing = (row[0] or "").rstrip()
+    updated = (entry + ("\n" + existing if existing else "")).rstrip() + "\n"
+    await db.execute(
+        "UPDATE projects SET decisions = ? WHERE id = ?",
+        (updated, project_id),
+    )
+    await db.commit()
+    return updated
 
 
 async def get_project_owner(

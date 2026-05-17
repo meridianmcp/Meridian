@@ -301,11 +301,15 @@ async def get_goal(project_id: str, request: Request) -> dict[str, Any]:
     coherence = db_module.compute_coherence_warning(field_ages)
     goal["field_ages"] = field_ages
     goal["coherence_warning"] = coherence
+    # v1.1.4 — append-only decisions log.
+    decisions = await db_module.get_decisions(_db(request), project_id)
+    goal["decisions"] = decisions
     # v0.6.1 — also serve the XML envelope so MCP / cache-aware consumers
     # don't have to re-stitch fields locally. The JSON keys stay for the
     # dashboard and the test suite.
     goal["xml"] = db_module.build_goal_xml(
-        goal, project["name"], goal["ambient_tasks"], coherence
+        goal, project["name"], goal["ambient_tasks"], coherence,
+        decisions=decisions,
     )
     # v0.6.2 — pre-built Anthropic content blocks with cache_control
     # markers on the static fields. Callers can pass these straight
@@ -427,6 +431,22 @@ async def set_sprint(
         return result
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
+
+
+@app.post("/projects/{project_id}/decisions")
+async def post_decision_endpoint(
+    project_id: str, body: dict[str, Any], request: Request
+) -> dict[str, Any]:
+    """v1.1.4 — append a decision entry to the project's append-only
+    decisions log. Body: ``{text}``."""
+    project = await db_module.get_project(_db(request), project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="project not found")
+    text = (body.get("text") or "").strip()
+    if not text:
+        raise HTTPException(status_code=422, detail="text is required")
+    updated = await db_module.set_decision(_db(request), project_id, text)
+    return {"project_id": project_id, "decisions": updated}
 
 
 @app.get("/projects/{project_id}/timeline")
@@ -1112,11 +1132,17 @@ async def _start_session_composite(
     # v1.1.3 — coherence warning + per-field ages.
     field_ages = await db_module.get_goal_field_ages(db, project_id)
     coherence = db_module.compute_coherence_warning(field_ages)
+    # v1.1.4 — append-only decisions log (skipped for worker sessions
+    # since v1.2.0's start_worker_session builds its own slim
+    # worker_context block).
+    decisions = await db_module.get_decisions(db, project_id)
     if goal is not None:
         goal["field_ages"] = field_ages
         goal["coherence_warning"] = coherence
+        goal["decisions"] = decisions
     goal_xml = db_module.build_goal_xml(
-        goal, project_name, ambient_for_xml, coherence
+        goal, project_name, ambient_for_xml, coherence,
+        decisions=decisions,
     )
     # v0.6.2 — Anthropic-API content blocks with cache_control on
     # the two static fields. Same ambient slice used by the XML.
@@ -1478,6 +1504,26 @@ def build_mcp_server():
                 },
             ),
             Tool(
+                name="set_decision",
+                description=(
+                    "Append a decision entry to the project's "
+                    "append-only decisions log (v1.1.4). Each entry "
+                    "is prepended with a UTC date stamp so newest "
+                    "decisions appear first. Use this to record "
+                    "architectural calls, scope reductions, key "
+                    "trade-offs — anything a future session must "
+                    "know before doing the work."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "project_id": {"type": "string"},
+                        "text": {"type": "string"},
+                    },
+                    "required": ["project_id", "text"],
+                },
+            ),
+            Tool(
                 name="add_sprint_item",
                 description=(
                     "Append a pending item to the project's machine-trackable "
@@ -1681,8 +1727,13 @@ def build_mcp_server():
                     coherence = db_module.compute_coherence_warning(field_ages)
                     goal["field_ages"] = field_ages
                     goal["coherence_warning"] = coherence
+                    decisions = await db_module.get_decisions(
+                        db, arguments["project_id"]
+                    )
+                    goal["decisions"] = decisions
                     goal["xml"] = db_module.build_goal_xml(
-                        goal, project_name, goal["ambient_tasks"], coherence
+                        goal, project_name, goal["ambient_tasks"], coherence,
+                        decisions=decisions,
                     )
                     goal["cache_blocks"] = db_module.build_goal_cache_blocks(
                         goal, project_name, goal["ambient_tasks"]
@@ -1838,6 +1889,19 @@ def build_mcp_server():
                             str(goal["content"])[:200] if goal else None
                         ),
                     }
+            elif name == "set_decision":
+                try:
+                    updated = await db_module.set_decision(
+                        db,
+                        arguments["project_id"],
+                        arguments["text"],
+                    )
+                    result = {
+                        "project_id": arguments["project_id"],
+                        "decisions": updated,
+                    }
+                except ValueError as exc:
+                    result = {"error": str(exc)}
             elif name == "add_sprint_item":
                 result = await db_module.add_sprint_item(
                     db,

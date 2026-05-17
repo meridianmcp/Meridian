@@ -143,6 +143,8 @@ class GoalState(BaseModel):
     # v1.1.3 — per-field freshness so the dashboard can render the
     # green / amber / red dot next to each field.
     field_ages: dict[str, dict[str, Any]] | None = None
+    # v1.1.4 — append-only decisions log, newest first.
+    decisions: str | None = None
 
 
 class GoalModeSet(BaseModel):
