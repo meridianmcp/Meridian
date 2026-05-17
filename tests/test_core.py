@@ -3320,3 +3320,139 @@ def test_start_worker_session_http_endpoint(client):
         f"/projects/{project['id']}/start-worker-session", json={}
     )
     assert r.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# v1.2.1 — Session auto-summary + parent_session_id
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_summarize_session_skips_when_under_min_tasks(db):
+    p = await db_module.create_project(db, "alpha")
+    s = await db_module.register_session(db, p["id"], "human")
+    await db_module.log_task(db, s["id"], p["id"], "just one", "done")
+    called = []
+
+    async def stub(prompt: str):
+        called.append(prompt)
+        return {"session_type": "human", "tasks_completed": 1,
+                "key_decisions": [], "summary": "trivial"}
+
+    result = await db_module.summarize_session(
+        db, s["id"], min_tasks=3, summarizer=stub
+    )
+    assert result is None  # below threshold
+    assert called == []     # summarizer never invoked
+
+
+@pytest.mark.asyncio
+async def test_summarize_session_stores_structured_output(db):
+    p = await db_module.create_project(db, "alpha")
+    s = await db_module.register_session(db, p["id"], "human")
+    for i in range(3):
+        await db_module.log_task(db, s["id"], p["id"], f"task {i}", "done")
+
+    async def stub(prompt: str):
+        # Verify the prompt carries the task descriptions.
+        assert "task 0" in prompt and "task 2" in prompt
+        return {
+            "session_type": "human",
+            "tasks_completed": 3,
+            "key_decisions": ["sqlite", "pyinstaller"],
+            "summary": "shipped three tasks across v1.2",
+        }
+
+    summary = await db_module.summarize_session(db, s["id"], summarizer=stub)
+    assert summary is not None
+    assert summary["tasks_completed"] == 3
+    assert "sqlite" in summary["key_decisions"]
+    # Stored on the session row.
+    async with db.execute(
+        "SELECT session_summary FROM sessions WHERE id = ?", (s["id"],)
+    ) as cur:
+        row = await cur.fetchone()
+    assert row[0] and "shipped three tasks" in row[0]
+
+
+@pytest.mark.asyncio
+async def test_summarize_session_rejects_malformed_output(db):
+    p = await db_module.create_project(db, "alpha")
+    s = await db_module.register_session(db, p["id"], "human")
+    for i in range(3):
+        await db_module.log_task(db, s["id"], p["id"], f"task {i}", "done")
+
+    async def bad(prompt: str):
+        return {"summary": "missing required fields"}
+
+    result = await db_module.summarize_session(db, s["id"], summarizer=bad)
+    assert result is None
+    # session_summary stays null.
+    async with db.execute(
+        "SELECT session_summary FROM sessions WHERE id = ?", (s["id"],)
+    ) as cur:
+        row = await cur.fetchone()
+    assert row[0] is None
+
+
+@pytest.mark.asyncio
+async def test_timeline_carries_session_summary(db):
+    p = await db_module.create_project(db, "alpha")
+    s = await db_module.register_session(db, p["id"], "human")
+    for i in range(3):
+        await db_module.log_task(db, s["id"], p["id"], f"task {i}", "done")
+
+    async def stub(prompt: str):
+        return {
+            "session_type": "human", "tasks_completed": 3,
+            "key_decisions": [], "summary": "did three things",
+        }
+
+    await db_module.summarize_session(db, s["id"], summarizer=stub)
+    timeline = await db_module.get_timeline(db, p["id"])
+    sessions = {s["id"]: s for s in timeline["sessions"]}
+    assert sessions[s["id"]]["summary"]["summary"] == "did three things"
+    assert sessions[s["id"]]["session_type"] == "human"
+
+
+def test_session_summary_schema_shape():
+    """The JSON schema we hand to haiku has the four expected keys."""
+    schema = db_module.SESSION_SUMMARY_SCHEMA
+    props = schema["schema"]["properties"]
+    assert set(props.keys()) == {
+        "session_type", "tasks_completed", "key_decisions", "summary"
+    }
+    assert props["session_type"]["enum"] == ["human", "worker"]
+
+
+@pytest.mark.asyncio
+async def test_enqueue_claude_task_writes_parent_session_id(db):
+    p = await db_module.create_project(db, "alpha")
+    parent = await db_module.register_session(db, p["id"], "parent")
+    task = await enqueue_module.enqueue_claude_task(
+        db,
+        parent["id"],
+        p["id"],
+        "echo hi",
+        worker_argv=[sys.executable, "-c", "print('ok')"],
+        wait=True,
+    )
+    # Default parent_session_id is the enqueueing session.
+    assert task["parent_session_id"] == parent["id"]
+
+
+@pytest.mark.asyncio
+async def test_enqueue_claude_task_explicit_parent_session_id(db):
+    p = await db_module.create_project(db, "alpha")
+    parent = await db_module.register_session(db, p["id"], "parent")
+    other = await db_module.register_session(db, p["id"], "other")
+    task = await enqueue_module.enqueue_claude_task(
+        db,
+        parent["id"],
+        p["id"],
+        "echo hi",
+        worker_argv=[sys.executable, "-c", "print('ok')"],
+        wait=True,
+        parent_session_id=other["id"],
+    )
+    assert task["parent_session_id"] == other["id"]

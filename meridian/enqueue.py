@@ -156,6 +156,7 @@ async def enqueue_claude_task(
     worker_argv: list[str] | None = None,
     timeout: float | None = 900.0,
     wait: bool = False,
+    parent_session_id: str | None = None,
 ) -> dict[str, Any]:
     """Queue a Claude subprocess for async execution; return the pending task.
 
@@ -183,12 +184,17 @@ async def enqueue_claude_task(
     if not argv:
         raise ValueError("worker command resolved to empty argv")
 
+    # v1.2.1 — propagate parent_session_id so the timeline can
+    # show 'this worker run was kicked off by that session'.
+    # Defaults to the calling session itself when not specified.
+    effective_parent = parent_session_id or session_id
     task = await db_module.log_task(
         db,
         session_id,
         project_id,
         f"{PROMPT_PREFIX}{prompt}",
         status="pending",
+        parent_session_id=effective_parent,
     )
 
     coro = _run_worker(db, task["id"], prompt, argv, timeout)
