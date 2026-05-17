@@ -196,6 +196,7 @@ function buildTabBody(project) {
       <button class="vtab-btn" data-vtab="files" title="Files">⊞</button>
       <button class="vtab-btn" data-vtab="devlog" title="Dev Log">≋</button>
       <button class="vtab-btn" data-vtab="timeline" title="Activity Timeline">⌬</button>
+      <button class="vtab-btn" data-vtab="rewind" title="Rewind — Last X days">↻</button>
     </div>
     <div class="vtab-drawer open" id="drawer-${project.id}">
       <div class="drawer-panel active" id="drawer-status-${project.id}">
@@ -270,6 +271,25 @@ function buildTabBody(project) {
         </div>
         <div class="timeline-wrap" id="timeline-wrap-${project.id}" style="flex:1;overflow:auto;padding:14px"></div>
       </div>
+      <div class="drawer-panel" id="drawer-rewind-${project.id}">
+        <div class="drawer-header" style="justify-content:space-between">
+          <span>REWIND · ${escapeHtml(project.name)}</span>
+          <span style="display:flex;gap:6px;align-items:center">
+            <button class="secondary rewind-day-btn" data-days="7" data-pid="${project.id}" style="padding:2px 8px;font-size:10px">7d</button>
+            <button class="secondary rewind-day-btn" data-days="14" data-pid="${project.id}" style="padding:2px 8px;font-size:10px">14d</button>
+            <button class="secondary rewind-day-btn" data-days="30" data-pid="${project.id}" style="padding:2px 8px;font-size:10px">30d</button>
+            <button class="secondary rewind-day-btn" data-days="90" data-pid="${project.id}" style="padding:2px 8px;font-size:10px">90d</button>
+          </span>
+        </div>
+        <div class="rewind-wrap" id="rewind-wrap-${project.id}" style="flex:1;overflow:auto;padding:14px;font-family:'IBM Plex Mono',monospace;font-size:11px">
+          <div class="empty" style="color:var(--muted)">pick a window above</div>
+        </div>
+        <div style="flex-shrink:0;padding:8px 14px;border-top:1px solid var(--border);display:flex;gap:8px">
+          <button class="secondary" id="rewind-share-${project.id}" style="padding:4px 10px;font-size:10px">Copy shareable link</button>
+          <a class="secondary" href="/projects/${project.id}/export/pdf" download
+             style="padding:4px 10px;font-size:10px;border:1px solid var(--border);border-radius:4px;color:var(--muted);text-decoration:none;font-family:'IBM Plex Mono',monospace">Export as PDF</a>
+        </div>
+      </div>
     </div>
     <section class="claude-handoff-panel">
       <div class="panel-header">
@@ -330,6 +350,7 @@ function buildTabBody(project) {
           if (vtab === 'files') loadFilesTab(project.id);
           if (vtab === 'devlog') refreshTasks(project.id);
           if (vtab === 'timeline') loadTimeline(project.id);
+          if (vtab === 'rewind') initRewindTab(project.id);
         }
       };
     });
@@ -1125,3 +1146,109 @@ document.getElementById('ez-advanced-link').onclick = (e) => {
     setInterval(() => { if (state.activeTab) refreshSessions(state.activeTab); }, 10000);
   });
 };
+
+// ---------------------------------------------------------------------------
+// v1.3.0 — Rewind tab. Renders "Last X days" project recaps. The window
+// buttons live in the drawer header (see buildTabBody); the panel here
+// just wires their clicks + the "copy shareable link" / load handlers.
+// ---------------------------------------------------------------------------
+
+function initRewindTab(projectId) {
+  const p = state.panels[projectId];
+  if (!p) return;
+  if (p.rewindWired) {
+    // Already set up — repaint if we already have a window selected.
+    if (p.rewindDays) loadRewindTab(projectId, p.rewindDays);
+    return;
+  }
+  p.rewindWired = true;
+  document.querySelectorAll(`.rewind-day-btn[data-pid="${projectId}"]`).forEach(btn => {
+    btn.onclick = () => {
+      const days = parseInt(btn.dataset.days, 10) || 7;
+      loadRewindTab(projectId, days);
+    };
+  });
+  const shareBtn = document.getElementById(`rewind-share-${projectId}`);
+  if (shareBtn) shareBtn.onclick = () => copyRewindLink(projectId);
+  // Default to the 7-day view on first open.
+  loadRewindTab(projectId, 7);
+}
+
+async function loadRewindTab(projectId, days) {
+  const wrap = document.getElementById(`rewind-wrap-${projectId}`);
+  if (!wrap) return;
+  const p = state.panels[projectId];
+  if (p) p.rewindDays = days;
+  // Highlight the active window button.
+  document.querySelectorAll(`.rewind-day-btn[data-pid="${projectId}"]`).forEach(b => {
+    b.classList.toggle('active', parseInt(b.dataset.days, 10) === days);
+  });
+  wrap.innerHTML = '<div style="color:var(--muted)">loading rewind…</div>';
+  try {
+    const data = await api(`/projects/${projectId}/rewind?days=${days}`);
+    wrap.innerHTML = renderRewind(data);
+  } catch (e) {
+    wrap.innerHTML = `<div style="color:var(--status-failed)">rewind failed: ${escapeHtml(e.message)}</div>`;
+  }
+}
+
+function renderRewind(data) {
+  const sec = (icon, title, items, render) => {
+    if (!items || !items.length) {
+      return `<section style="margin-bottom:14px">
+        <div style="color:var(--accent);font-weight:600;margin-bottom:4px">${icon} ${title}</div>
+        <div style="color:var(--muted);font-size:10px">(none)</div>
+      </section>`;
+    }
+    return `<section style="margin-bottom:14px">
+      <div style="color:var(--accent);font-weight:600;margin-bottom:4px">${icon} ${title}</div>
+      ${items.map(render).join('')}
+    </section>`;
+  };
+  const versions = sec('📦', 'Versions shipped', data.versions_shipped,
+    v => `<div style="padding:2px 0">${escapeHtml(v)}</div>`);
+  const goals = sec('🎯', 'Goal changes', data.goal_changes, g =>
+    `<div style="padding:3px 0;border-left:2px solid var(--border);padding-left:8px;margin-bottom:4px">
+      <div style="color:var(--muted);font-size:10px">${escapeHtml(g.field)} · ${escapeHtml(g.changed_at || '')}</div>
+      <div>${escapeHtml(g.old_summary || '(empty)')} → ${escapeHtml(g.new_summary || '(empty)')}</div>
+    </div>`);
+  const decisions = sec('📋', 'Decisions logged', data.decisions_logged, d =>
+    `<div style="padding:2px 0"><span style="color:var(--muted);font-size:10px">[${escapeHtml(d.logged_at || '')}]</span> ${escapeHtml(d.text || '')}</div>`);
+  const sprints = sec('✅', 'Sprint items completed', data.sprint_items_completed, s =>
+    `<div style="padding:2px 0"><span style="color:var(--accent-green)">${escapeHtml(s.version || '')}</span> — ${escapeHtml(s.title || '')} <span style="color:var(--muted);font-size:10px">${escapeHtml(s.completed_at || '')}</span></div>`);
+  const sessions = sec('🧠', 'Sessions', data.session_summaries, s =>
+    `<div style="padding:3px 0;border-left:2px solid var(--border);padding-left:8px;margin-bottom:4px">
+      <div style="color:var(--accent)">${escapeHtml(s.session_name)} <span style="color:var(--muted);font-size:10px">· ${s.tasks_completed} done</span></div>
+      <div style="color:var(--muted);font-size:10px">${escapeHtml(s.summary || '')}</div>
+    </div>`);
+  const byStatus = data.tasks_by_status || {};
+  const summary = `<section style="margin-top:14px;padding-top:10px;border-top:1px solid var(--border)">
+    <div style="color:var(--accent);font-weight:600">📊 Tasks: ${byStatus.done || 0} done, ${byStatus.failed || 0} failed, ${byStatus.pending || 0} pending <span style="color:var(--muted);font-size:10px">(${data.tasks_total || 0} total over ${data.period_days}d)</span></div>
+  </section>`;
+  return versions + goals + decisions + sprints + sessions + summary;
+}
+
+async function copyRewindLink(projectId) {
+  const p = state.panels[projectId];
+  const days = (p && p.rewindDays) || 7;
+  try {
+    const res = await api(`/projects/${projectId}/rewind-token`, { method: 'POST' });
+    let base = '';
+    try {
+      const cfg = await api('/config');
+      base = cfg.server_url || window.location.origin;
+    } catch (_) {
+      base = window.location.origin;
+    }
+    const url = `${base}/projects/${projectId}/rewind?days=${days}&token=${encodeURIComponent(res.token)}`;
+    try {
+      await navigator.clipboard.writeText(url);
+      toast('shareable link copied');
+    } catch (_) {
+      // Older browsers — surface the URL so the user can copy manually.
+      window.prompt('copy this URL', url);
+    }
+  } catch (e) {
+    toast('share failed: ' + e.message);
+  }
+}

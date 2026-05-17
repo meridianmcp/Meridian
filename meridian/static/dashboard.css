@@ -394,3 +394,15 @@ input[type=text] {
 }
 .toast.show { display: block; }
 .toast.error { border-color: var(--status-failed); color: var(--status-failed); }
+
+/* v1.3.0 — Rewind tab.
+   Day-window buttons live in the drawer header; the .active variant
+   highlights the currently-loaded window so users always know which
+   period they're staring at. The rewind body uses the same monospace
+   stack as the rest of the drawer so the timeline reads as a log. */
+.rewind-day-btn.active {
+  background: var(--accent);
+  color: var(--bg);
+  border-color: var(--accent);
+}
+.rewind-wrap section { line-height: 1.45; }

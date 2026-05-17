@@ -245,7 +245,7 @@ async def server_config() -> dict[str, Any]:
         "server_url": server_url,
         "host": host,
         "port": port,
-        "version": "1.1.0",
+        "version": "1.3.0",
         "db": "memory" if os.environ.get("MERIDIAN_DB") == ":memory:" else "sqlite",
     }
 
@@ -536,6 +536,51 @@ async def get_timeline_endpoint(
     if project is None:
         raise HTTPException(status_code=404, detail="project not found")
     return await db_module.get_timeline(_db(request), project_id)
+
+
+@app.get("/projects/{project_id}/rewind")
+async def get_rewind(
+    project_id: str,
+    request: Request,
+    days: int = 7,
+    token: str | None = None,
+) -> dict[str, Any]:
+    """v1.3.0 — "Last X days" project rewind summary.
+
+    Returns versions shipped, goal changes, decisions logged, session
+    summaries, sprint items completed, and task counts for the period.
+    When a ``token`` query param is supplied, it must match the project's
+    stored ``rewind_token`` — letting an external link validate ownership
+    without any other auth (Meridian is local-first; no token = no auth
+    required, same as every other endpoint).
+    """
+    project = await db_module.get_project(_db(request), project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="project not found")
+    if token is not None:
+        stored = await db_module.get_rewind_token(_db(request), project_id)
+        if not stored or token != stored:
+            raise HTTPException(status_code=403, detail="invalid rewind token")
+    if days <= 0:
+        raise HTTPException(status_code=422, detail="days must be positive")
+    return await db_module.get_rewind_data(_db(request), project_id, days)
+
+
+@app.post("/projects/{project_id}/rewind-token")
+async def post_rewind_token(
+    project_id: str, request: Request
+) -> dict[str, str]:
+    """v1.3.0 — mint (or return) the project's shareable rewind token.
+
+    The token is stored on the projects row so subsequent calls return
+    the same value; teams can publish a link once without it rotating.
+    Response: ``{"token": "<uuid4>", "expires": "never"}``.
+    """
+    project = await db_module.get_project(_db(request), project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="project not found")
+    token = await db_module.get_or_create_rewind_token(_db(request), project_id)
+    return {"token": token, "expires": "never"}
 
 
 # ---------------------------------------------------------------------------

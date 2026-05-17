@@ -3566,3 +3566,74 @@ def test_dashboard_uses_static_assets(client):
     assert r.status_code == 200
     assert "/static/dashboard.js" in r.text
     assert "/static/dashboard.css" in r.text
+
+
+# ---------------------------------------------------------------------------
+# v1.3.0 — "Last X days" project rewind view
+# ---------------------------------------------------------------------------
+
+
+def test_rewind_returns_correct_schema(client):
+    """GET /rewind returns all required top-level keys."""
+    proj = client.post("/projects", json={"name": "rw-test"}).json()
+    r = client.get(f"/projects/{proj['id']}/rewind?days=7")
+    assert r.status_code == 200
+    body = r.json()
+    assert "period_days" in body
+    assert "tasks_total" in body
+    assert "tasks_by_status" in body
+    assert "versions_shipped" in body
+    assert "goal_changes" in body
+    assert "decisions_logged" in body
+    assert "session_summaries" in body
+    assert "sprint_items_completed" in body
+    assert body["period_days"] == 7
+
+
+def test_rewind_empty_period_returns_empty_arrays(client):
+    """Rewind over period with no activity returns zeros, not errors."""
+    proj = client.post("/projects", json={"name": "rw-empty"}).json()
+    r = client.get(f"/projects/{proj['id']}/rewind?days=7")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["tasks_total"] == 0
+    assert body["versions_shipped"] == []
+
+
+def test_rewind_counts_tasks_in_period(client):
+    """Rewind tasks_total reflects tasks logged in the period."""
+    proj = client.post("/projects", json={"name": "rw-tasks"}).json()
+    sess = client.post("/sessions/register", json={"project_id": proj["id"], "name": "s1"}).json()
+    client.post("/tasks", json={"session_id": sess["id"], "project_id": proj["id"],
+        "description": "task 1", "status": "done"})
+    client.post("/tasks", json={"session_id": sess["id"], "project_id": proj["id"],
+        "description": "task 2", "status": "done"})
+    r = client.get(f"/projects/{proj['id']}/rewind?days=7")
+    assert r.status_code == 200
+    assert r.json()["tasks_total"] == 2
+
+
+def test_rewind_token_endpoint(client):
+    """POST /rewind-token returns a token; GET /rewind accepts it."""
+    proj = client.post("/projects", json={"name": "rw-token"}).json()
+    r = client.post(f"/projects/{proj['id']}/rewind-token")
+    assert r.status_code == 200
+    token = r.json()["token"]
+    assert token
+    r2 = client.get(f"/projects/{proj['id']}/rewind?days=7&token={token}")
+    assert r2.status_code == 200
+
+
+def test_rewind_404_unknown_project(client):
+    """GET /rewind returns 404 for unknown project."""
+    r = client.get("/projects/doesnotexist/rewind?days=7")
+    assert r.status_code == 404
+
+
+def test_dashboard_has_rewind_tab(client):
+    """Dashboard HTML/JS contain the Rewind tab."""
+    r = client.get("/dashboard")
+    assert r.status_code == 200
+    js = client.get("/static/dashboard.js").text
+    # The rewind tab button should be wired up in the dashboard bundle.
+    assert "rewind" in js.lower() or "Rewind" in js

@@ -1910,3 +1910,249 @@ async def summarize_session(
     )
     await db.commit()
     return summary
+
+
+# ---------------------------------------------------------------------------
+# Rewind (v1.3.0) — "Last X days" shareable project summary.
+# Aggregates versions shipped, goal changes, decisions logged, session
+# summaries, sprint items completed, and task counts in one async call.
+# ---------------------------------------------------------------------------
+
+
+def _summarize(text: str | None, limit: int = 100) -> str:
+    """Truncate a multi-line string to a one-line ``limit``-char summary."""
+    if not text:
+        return ""
+    flat = " ".join(str(text).split())
+    if len(flat) <= limit:
+        return flat
+    return flat[: limit - 1].rstrip() + "…"
+
+
+async def get_rewind_data(
+    db: aiosqlite.Connection, project_id: str, days: int
+) -> dict[str, Any]:
+    """Aggregate the v1.3.0 rewind payload for a project over ``days`` days.
+
+    Returns a dict matching the documented response shape. Empty arrays
+    + zero counts (never errors) when the period has no activity. Caller
+    is responsible for the project existence 404 — this function trusts
+    its input.
+    """
+    from datetime import datetime, timezone
+
+    if days <= 0:
+        days = 7
+    cutoff_clause = f"-{int(days)} days"
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    # --- Task aggregates ---------------------------------------------------
+    async with db.execute(
+        "SELECT status, COUNT(*) AS n FROM task_log "
+        "WHERE project_id = ? AND created_at >= datetime('now', ?) "
+        "GROUP BY status",
+        (project_id, cutoff_clause),
+    ) as cur:
+        status_rows = await cur.fetchall()
+    tasks_by_status: dict[str, int] = {r["status"]: r["n"] for r in status_rows}
+    tasks_total = sum(tasks_by_status.values())
+
+    # --- Versions shipped (best-effort proxy) ------------------------------
+    # See module docstring above for the rationale: scan task_log
+    # descriptions for "shipped" / commit-style prefixes ("feat:", "fix:",
+    # "v1.2.0 —") in the period. Cap at 20.
+    async with db.execute(
+        "SELECT description, created_at FROM task_log "
+        "WHERE project_id = ? AND created_at >= datetime('now', ?) "
+        "AND ("
+        "    description LIKE '% shipped%' "
+        " OR description LIKE 'shipped %' "
+        " OR description LIKE 'feat:%' "
+        " OR description LIKE 'fix:%' "
+        " OR description LIKE 'docs:%' "
+        " OR description LIKE 'feat(%' "
+        " OR description LIKE 'v_._._%' ESCAPE '_'"
+        ") "
+        "ORDER BY created_at DESC LIMIT 20",
+        (project_id, cutoff_clause),
+    ) as cur:
+        ver_rows = await cur.fetchall()
+    versions_shipped: list[str] = []
+    seen: set[str] = set()
+    for r in ver_rows:
+        desc = _summarize(r["description"], limit=160)
+        if desc and desc not in seen:
+            seen.add(desc)
+            versions_shipped.append(desc)
+
+    # --- Goal changes ------------------------------------------------------
+    # Walk goal_states in version order and diff successive rows. Only
+    # rows whose created_at is within the period are emitted, but the
+    # comparison anchor is the prior row regardless of period so a
+    # field changed on day 8 isn't double-emitted on day 7.
+    async with db.execute(
+        "SELECT version, goal_north_star, content, goal_sprint, created_at "
+        "FROM goal_states WHERE project_id = ? ORDER BY version ASC",
+        (project_id,),
+    ) as cur:
+        all_goal_rows = await cur.fetchall()
+    goal_changes: list[dict[str, Any]] = []
+    prev = {"north_star": "", "version_goal": "", "sprint": ""}
+    for r in all_goal_rows:
+        current = {
+            "north_star": r["goal_north_star"] or "",
+            "version_goal": r["content"] or "",
+            "sprint": r["goal_sprint"] or "",
+        }
+        in_period = False
+        try:
+            ts = (r["created_at"] or "").replace(" ", "T")
+            dt = datetime.fromisoformat(ts).replace(tzinfo=timezone.utc)
+            cutoff_dt = datetime.now(timezone.utc).timestamp() - days * 86400
+            in_period = dt.timestamp() >= cutoff_dt
+        except (ValueError, TypeError):
+            in_period = False
+        if in_period:
+            for field_key, label in (
+                ("north_star", "north_star"),
+                ("version_goal", "version_goal"),
+                ("sprint", "sprint"),
+            ):
+                if current[field_key] != prev[field_key]:
+                    goal_changes.append({
+                        "field": label,
+                        "old_summary": _summarize(prev[field_key]),
+                        "new_summary": _summarize(current[field_key]),
+                        "changed_at": r["created_at"],
+                    })
+        prev = current
+
+    # --- Decisions logged --------------------------------------------------
+    # v1.1.4 stores decisions as a single TEXT blob on projects with
+    # ``[YYYY-MM-DD] ...`` entries newest-first. Parse + filter by date.
+    decisions_logged: list[dict[str, Any]] = []
+    async with db.execute(
+        "SELECT decisions FROM projects WHERE id = ?", (project_id,)
+    ) as cur:
+        drow = await cur.fetchone()
+    decisions_blob = drow[0] if drow else None
+    if decisions_blob:
+        import re as _re
+        from datetime import date as _date, timedelta as _td
+        cutoff_date = _date.today() - _td(days=days)
+        # Each entry: ``[YYYY-MM-DD] text`` separated by blank lines.
+        for chunk in _re.split(r"\n\s*\n", decisions_blob.strip()):
+            m = _re.match(r"^\[(\d{4}-\d{2}-\d{2})\]\s*(.*)$", chunk.strip(), _re.S)
+            if not m:
+                continue
+            try:
+                logged_date = _date.fromisoformat(m.group(1))
+            except ValueError:
+                continue
+            if logged_date < cutoff_date:
+                continue
+            decisions_logged.append({
+                "text": _summarize(m.group(2), limit=240),
+                "logged_at": m.group(1),
+            })
+
+    # --- Session summaries -------------------------------------------------
+    async with db.execute(
+        "SELECT id, name, session_summary FROM sessions "
+        "WHERE project_id = ? AND created_at >= datetime('now', ?) "
+        "ORDER BY created_at DESC",
+        (project_id, cutoff_clause),
+    ) as cur:
+        sess_rows = await cur.fetchall()
+    session_summaries: list[dict[str, Any]] = []
+    for s in sess_rows:
+        async with db.execute(
+            "SELECT COUNT(*) FROM task_log WHERE session_id = ? AND status = 'done'",
+            (s["id"],),
+        ) as cur:
+            row = await cur.fetchone()
+        completed = int(row[0]) if row else 0
+        summary_text: str = s["name"]
+        if s["session_summary"]:
+            try:
+                parsed = json.loads(s["session_summary"])
+                if isinstance(parsed, dict) and parsed.get("summary"):
+                    summary_text = _summarize(parsed["summary"], limit=240)
+            except (ValueError, TypeError):
+                pass
+        session_summaries.append({
+            "session_name": s["name"],
+            "summary": summary_text,
+            "tasks_completed": completed,
+        })
+
+    # --- Sprint items completed -------------------------------------------
+    async with db.execute(
+        "SELECT version, title, completed_at FROM sprint_items "
+        "WHERE project_id = ? AND status IN ('done','skipped') "
+        "AND completed_at IS NOT NULL "
+        "AND completed_at >= datetime('now', ?) "
+        "ORDER BY completed_at DESC",
+        (project_id, cutoff_clause),
+    ) as cur:
+        sprint_rows = await cur.fetchall()
+    sprint_items_completed = [
+        {
+            "version": r["version"],
+            "title": r["title"],
+            "completed_at": r["completed_at"],
+        }
+        for r in sprint_rows
+    ]
+
+    return {
+        "period_days": days,
+        "generated_at": now_iso,
+        "versions_shipped": versions_shipped,
+        "goal_changes": goal_changes,
+        "decisions_logged": decisions_logged,
+        "session_summaries": session_summaries,
+        "sprint_items_completed": sprint_items_completed,
+        "tasks_total": tasks_total,
+        "tasks_by_status": tasks_by_status,
+    }
+
+
+async def get_or_create_rewind_token(
+    db: aiosqlite.Connection, project_id: str
+) -> str:
+    """Return the project's rewind_token, minting a uuid4 if missing.
+
+    Idempotent: a project keeps the same token for life so previously
+    distributed share-links don't break on the next POST. Returns the
+    final token regardless of whether it was just created.
+    """
+    async with db.execute(
+        "SELECT rewind_token FROM projects WHERE id = ?", (project_id,)
+    ) as cur:
+        row = await cur.fetchone()
+    if row is None:
+        raise ValueError(f"unknown project: {project_id}")
+    existing = row[0]
+    if existing:
+        return existing
+    token = _new_id()
+    await db.execute(
+        "UPDATE projects SET rewind_token = ? WHERE id = ?",
+        (token, project_id),
+    )
+    await db.commit()
+    return token
+
+
+async def get_rewind_token(
+    db: aiosqlite.Connection, project_id: str
+) -> str | None:
+    """Return the stored rewind_token, or None if not yet minted."""
+    async with db.execute(
+        "SELECT rewind_token FROM projects WHERE id = ?", (project_id,)
+    ) as cur:
+        row = await cur.fetchone()
+    if row is None:
+        return None
+    return row[0]
