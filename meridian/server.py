@@ -405,6 +405,82 @@ async def set_sprint(
         raise HTTPException(status_code=422, detail=str(exc))
 
 
+# ---------------------------------------------------------------------------
+# Sprint items (v1.1) — checklist alongside the free-text sprint field.
+# ---------------------------------------------------------------------------
+
+
+@app.get("/projects/{project_id}/sprint-items")
+async def list_sprint_items(
+    project_id: str, request: Request, status: str | None = None
+) -> list[dict[str, Any]]:
+    """List sprint items, optionally filtered by status."""
+    project = await db_module.get_project(_db(request), project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="project not found")
+    try:
+        return await db_module.get_sprint_items(
+            _db(request), project_id, status=status
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+
+@app.post(
+    "/projects/{project_id}/sprint-items", status_code=201
+)
+async def add_sprint_item_endpoint(
+    project_id: str, body: dict[str, Any], request: Request
+) -> dict[str, Any]:
+    """Append a pending sprint item. Body: ``{version, title}``."""
+    project = await db_module.get_project(_db(request), project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="project not found")
+    version = (body.get("version") or "").strip()
+    title = (body.get("title") or "").strip()
+    if not version or not title:
+        raise HTTPException(
+            status_code=422, detail="version and title are required"
+        )
+    return await db_module.add_sprint_item(
+        _db(request), project_id, version, title
+    )
+
+
+@app.post("/projects/{project_id}/sprint-items/{item_id}/complete")
+async def complete_sprint_item_endpoint(
+    project_id: str, item_id: str, request: Request,
+    body: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Mark a sprint item ``done``. Optional body: ``{task_id}``."""
+    item = await db_module.complete_sprint_item(
+        _db(request),
+        project_id,
+        item_id,
+        task_id=(body or {}).get("task_id"),
+    )
+    if item is None:
+        raise HTTPException(status_code=404, detail="sprint item not found")
+    return item
+
+
+@app.post("/projects/{project_id}/sprint-items/{item_id}/skip")
+async def skip_sprint_item_endpoint(
+    project_id: str, item_id: str, request: Request,
+    body: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Mark a sprint item ``skipped``. Optional body: ``{reason}``."""
+    item = await db_module.skip_sprint_item(
+        _db(request),
+        project_id,
+        item_id,
+        reason=(body or {}).get("reason"),
+    )
+    if item is None:
+        raise HTTPException(status_code=404, detail="sprint item not found")
+    return item
+
+
 @app.get("/projects/{project_id}/sessions", response_model=list[Session])
 async def get_sessions(
     project_id: str, request: Request
@@ -1004,11 +1080,20 @@ async def _start_session_composite(
         goal["xml"] = goal_xml
         goal["cache_blocks"] = goal_cache_blocks
 
+    # v1.1 — surface the still-pending sprint checklist so cold sessions
+    # see what's in flight before doing anything.
+    pending_items = await db_module.get_sprint_items(
+        db, project_id, status="pending"
+    )
+    sprint_items_xml = db_module.build_sprint_items_xml(pending_items)
+
     return {
         "session_id": session["id"],
         "goal": goal,
         "goal_xml": goal_xml,  # v0.6.1 — always present
         "goal_cache_blocks": goal_cache_blocks,  # v0.6.2 — ready for Anthropic
+        "sprint_items": pending_items,  # v1.1 — pending checklist
+        "sprint_items_xml": sprint_items_xml,
         "recent_tasks": recent_tasks,
         "active_sessions": active_sessions,
         "handoff_exists": handoff_exists,
@@ -1346,6 +1431,79 @@ def build_mcp_server():
                 },
             ),
             Tool(
+                name="add_sprint_item",
+                description=(
+                    "Append a pending item to the project's machine-trackable "
+                    "sprint checklist (v1.1). Use this when you start work on "
+                    "a new version so the next session sees what's in flight. "
+                    "Returns the new item."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "project_id": {"type": "string"},
+                        "version": {"type": "string"},
+                        "title": {"type": "string"},
+                    },
+                    "required": ["project_id", "version", "title"],
+                },
+            ),
+            Tool(
+                name="complete_sprint_item",
+                description=(
+                    "Mark a sprint item done. Pass task_id to link the "
+                    "task that shipped it; the timeline correlates them. "
+                    "Returns the updated item or null if the id is unknown."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "project_id": {"type": "string"},
+                        "item_id": {"type": "string"},
+                        "task_id": {"type": "string"},
+                    },
+                    "required": ["project_id", "item_id"],
+                },
+            ),
+            Tool(
+                name="skip_sprint_item",
+                description=(
+                    "Mark a sprint item skipped (intentionally not shipped). "
+                    "Provide a one-line ``reason`` so a future session can "
+                    "understand the call."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "project_id": {"type": "string"},
+                        "item_id": {"type": "string"},
+                        "reason": {"type": "string"},
+                    },
+                    "required": ["project_id", "item_id"],
+                },
+            ),
+            Tool(
+                name="get_sprint_items",
+                description=(
+                    "List sprint items for a project. Optional status "
+                    "filter (pending|in_progress|done|skipped). Cold "
+                    "sessions read this to know what's still owed."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "project_id": {"type": "string"},
+                        "status": {
+                            "type": "string",
+                            "enum": [
+                                "pending", "in_progress", "done", "skipped",
+                            ],
+                        },
+                    },
+                    "required": ["project_id"],
+                },
+            ),
+            Tool(
                 name="start_session",
                 description=(
                     "Single call to start a coordinated session. Registers "
@@ -1627,6 +1785,35 @@ def build_mcp_server():
                             str(goal["content"])[:200] if goal else None
                         ),
                     }
+            elif name == "add_sprint_item":
+                result = await db_module.add_sprint_item(
+                    db,
+                    arguments["project_id"],
+                    arguments["version"],
+                    arguments["title"],
+                )
+            elif name == "complete_sprint_item":
+                item = await db_module.complete_sprint_item(
+                    db,
+                    arguments["project_id"],
+                    arguments["item_id"],
+                    task_id=arguments.get("task_id"),
+                )
+                result = item or {"error": "sprint item not found"}
+            elif name == "skip_sprint_item":
+                item = await db_module.skip_sprint_item(
+                    db,
+                    arguments["project_id"],
+                    arguments["item_id"],
+                    reason=arguments.get("reason"),
+                )
+                result = item or {"error": "sprint item not found"}
+            elif name == "get_sprint_items":
+                result = await db_module.get_sprint_items(
+                    db,
+                    arguments["project_id"],
+                    status=arguments.get("status"),
+                )
             else:
                 result = {"error": f"unknown tool: {name}"}
         except Exception as exc:  # noqa: BLE001 — surface to MCP client

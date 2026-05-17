@@ -107,6 +107,24 @@ CREATE TABLE IF NOT EXISTS chat_sessions (
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+-- v1.1 — sprint_items: machine-trackable checklist alongside the
+-- free-text sprint field. Each item is one thing the sprint needs
+-- shipped (a version number, a feature, a fix). status moves through
+-- pending → in_progress → done|skipped. task_id optionally links the
+-- item to the task that finished it so the timeline can correlate.
+CREATE TABLE IF NOT EXISTS sprint_items (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES projects(id),
+    version TEXT NOT NULL,
+    title TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending'
+        CHECK (status IN ('pending','in_progress','done','skipped')),
+    added_at TEXT NOT NULL DEFAULT (datetime('now')),
+    completed_at TEXT,
+    task_id TEXT,
+    notes TEXT
+);
+
 CREATE TABLE IF NOT EXISTS chat_messages (
     id TEXT PRIMARY KEY,
     project_id TEXT NOT NULL REFERENCES projects(id),
@@ -127,6 +145,10 @@ CREATE INDEX IF NOT EXISTS idx_chat_sessions_project
     ON chat_sessions(project_id);
 CREATE INDEX IF NOT EXISTS idx_chat_messages_project
     ON chat_messages(project_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_sprint_items_project
+    ON sprint_items(project_id, status);
+CREATE INDEX IF NOT EXISTS idx_sprint_items_version
+    ON sprint_items(project_id, version);
 """
 
 
@@ -1074,3 +1096,164 @@ async def expire_idle_sessions(
     )
     await db.commit()
     return {"count": cursor.rowcount, "project_ids": affected_project_ids}
+
+
+# ---------------------------------------------------------------------------
+# Sprint items (v1.1) — machine-trackable checklist alongside the
+# free-text sprint field. Fixes the "sprint drift" problem where items
+# get written and silently forgotten across sessions.
+# ---------------------------------------------------------------------------
+
+
+_VALID_SPRINT_STATUSES = {"pending", "in_progress", "done", "skipped"}
+
+
+async def add_sprint_item(
+    db: aiosqlite.Connection,
+    project_id: str,
+    version: str,
+    title: str,
+) -> dict[str, Any]:
+    """Append a new ``pending`` sprint item to a project's checklist."""
+    iid = _new_id()
+    await db.execute(
+        "INSERT INTO sprint_items (id, project_id, version, title) "
+        "VALUES (?, ?, ?, ?)",
+        (iid, project_id, version, title),
+    )
+    await db.commit()
+    item = await get_sprint_item(db, iid)
+    assert item is not None
+    return item
+
+
+async def get_sprint_item(
+    db: aiosqlite.Connection, item_id: str
+) -> dict[str, Any] | None:
+    """Fetch one sprint item by id."""
+    async with db.execute(
+        "SELECT * FROM sprint_items WHERE id = ?", (item_id,)
+    ) as cur:
+        row = await cur.fetchone()
+    return _row_to_dict(row)
+
+
+async def _update_sprint_item_status(
+    db: aiosqlite.Connection,
+    project_id: str,
+    item_id: str,
+    status: str,
+    task_id: str | None = None,
+    notes: str | None = None,
+) -> dict[str, Any] | None:
+    """Internal: flip a sprint item's status and optionally link a task."""
+    if status not in _VALID_SPRINT_STATUSES:
+        raise ValueError(f"invalid sprint-item status: {status!r}")
+    fields = ["status = ?"]
+    values: list[Any] = [status]
+    if status in {"done", "skipped"}:
+        fields.append("completed_at = datetime('now')")
+    else:
+        fields.append("completed_at = NULL")
+    if task_id is not None:
+        fields.append("task_id = ?")
+        values.append(task_id)
+    if notes is not None:
+        fields.append("notes = ?")
+        values.append(notes)
+    values.append(item_id)
+    values.append(project_id)
+    cursor = await db.execute(
+        f"UPDATE sprint_items SET {', '.join(fields)} "
+        f"WHERE id = ? AND project_id = ?",
+        values,
+    )
+    await db.commit()
+    if cursor.rowcount == 0:
+        return None
+    return await get_sprint_item(db, item_id)
+
+
+async def complete_sprint_item(
+    db: aiosqlite.Connection,
+    project_id: str,
+    item_id: str,
+    task_id: str | None = None,
+) -> dict[str, Any] | None:
+    """Mark a sprint item ``done`` and optionally link the task that shipped it."""
+    return await _update_sprint_item_status(
+        db, project_id, item_id, "done", task_id=task_id
+    )
+
+
+async def skip_sprint_item(
+    db: aiosqlite.Connection,
+    project_id: str,
+    item_id: str,
+    reason: str | None = None,
+) -> dict[str, Any] | None:
+    """Mark a sprint item ``skipped`` (intentionally not shipped)."""
+    return await _update_sprint_item_status(
+        db, project_id, item_id, "skipped", notes=reason
+    )
+
+
+async def start_sprint_item(
+    db: aiosqlite.Connection,
+    project_id: str,
+    item_id: str,
+) -> dict[str, Any] | None:
+    """Flip a sprint item from ``pending`` to ``in_progress``."""
+    return await _update_sprint_item_status(
+        db, project_id, item_id, "in_progress"
+    )
+
+
+async def get_sprint_items(
+    db: aiosqlite.Connection,
+    project_id: str,
+    status: str | None = None,
+) -> list[dict[str, Any]]:
+    """List sprint items for a project, oldest first.
+
+    ``status`` filter is optional. ``None`` returns everything so the
+    dashboard can render the full timeline.
+    """
+    if status is not None:
+        if status not in _VALID_SPRINT_STATUSES:
+            raise ValueError(f"invalid sprint-item status filter: {status!r}")
+        query = (
+            "SELECT * FROM sprint_items WHERE project_id = ? "
+            "AND status = ? ORDER BY added_at ASC, rowid ASC"
+        )
+        params: tuple = (project_id, status)
+    else:
+        query = (
+            "SELECT * FROM sprint_items WHERE project_id = ? "
+            "ORDER BY added_at ASC, rowid ASC"
+        )
+        params = (project_id,)
+    async with db.execute(query, params) as cur:
+        rows = await cur.fetchall()
+    return [_row_to_dict(r) for r in rows]  # type: ignore[misc]
+
+
+def build_sprint_items_xml(items: list[dict[str, Any]]) -> str:
+    """Serialise sprint items as a ``<sprint_items>`` XML block.
+
+    Mirrors the get_goal XML envelope (v0.6.1) so cold sessions render
+    the checklist alongside the goal text in a single prompt.
+    """
+    from xml.sax.saxutils import escape, quoteattr
+
+    out = ['<sprint_items cache="false">']
+    for it in items:
+        ver = quoteattr(it.get("version") or "")
+        status = quoteattr(it.get("status") or "pending")
+        iid = quoteattr(it.get("id") or "")
+        title = escape(it.get("title") or "")
+        out.append(
+            f"  <item id={iid} version={ver} status={status}>{title}</item>"
+        )
+    out.append("</sprint_items>")
+    return "\n".join(out)

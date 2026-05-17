@@ -2601,3 +2601,135 @@ def test_frozen_db_path_resolves_to_home():
             os.environ["MERIDIAN_DB"] = original_db
         elif "MERIDIAN_DB" in os.environ:
             del os.environ["MERIDIAN_DB"]
+
+
+# ---------------------------------------------------------------------------
+# STEP 0 / v1.1 — sprint_items checklist
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_add_sprint_item_round_trip(db):
+    p = await db_module.create_project(db, "alpha")
+    item = await db_module.add_sprint_item(
+        db, p["id"], "v0.6.4", "Dashboard save"
+    )
+    assert item["status"] == "pending"
+    assert item["version"] == "v0.6.4"
+    assert item["title"] == "Dashboard save"
+    assert item["completed_at"] is None
+
+
+@pytest.mark.asyncio
+async def test_complete_sprint_item_marks_done_and_links_task(db):
+    p = await db_module.create_project(db, "alpha")
+    s = await db_module.register_session(db, p["id"], "w")
+    item = await db_module.add_sprint_item(db, p["id"], "v0.6.4", "save")
+    t = await db_module.log_task(db, s["id"], p["id"], "shipped", "done")
+    done = await db_module.complete_sprint_item(
+        db, p["id"], item["id"], task_id=t["id"]
+    )
+    assert done is not None
+    assert done["status"] == "done"
+    assert done["task_id"] == t["id"]
+    assert done["completed_at"] is not None
+
+
+@pytest.mark.asyncio
+async def test_skip_sprint_item_stores_reason(db):
+    p = await db_module.create_project(db, "alpha")
+    item = await db_module.add_sprint_item(db, p["id"], "v0.6.4", "save")
+    skipped = await db_module.skip_sprint_item(
+        db, p["id"], item["id"], reason="superseded by v1.1.0"
+    )
+    assert skipped is not None
+    assert skipped["status"] == "skipped"
+    assert "superseded" in (skipped["notes"] or "")
+
+
+@pytest.mark.asyncio
+async def test_complete_sprint_item_wrong_project_returns_none(db):
+    a = await db_module.create_project(db, "alpha")
+    b = await db_module.create_project(db, "beta")
+    item = await db_module.add_sprint_item(db, a["id"], "v1", "thing")
+    # Try to complete from the wrong project — atomic guard refuses.
+    result = await db_module.complete_sprint_item(db, b["id"], item["id"])
+    assert result is None
+    fresh = await db_module.get_sprint_item(db, item["id"])
+    assert fresh["status"] == "pending"
+
+
+@pytest.mark.asyncio
+async def test_get_sprint_items_filters_by_status(db):
+    p = await db_module.create_project(db, "alpha")
+    pending = await db_module.add_sprint_item(db, p["id"], "v1", "a")
+    done_item = await db_module.add_sprint_item(db, p["id"], "v1", "b")
+    await db_module.complete_sprint_item(db, p["id"], done_item["id"])
+    pendings = await db_module.get_sprint_items(db, p["id"], status="pending")
+    assert [it["id"] for it in pendings] == [pending["id"]]
+    dones = await db_module.get_sprint_items(db, p["id"], status="done")
+    assert [it["id"] for it in dones] == [done_item["id"]]
+    all_items = await db_module.get_sprint_items(db, p["id"])
+    assert len(all_items) == 2
+
+
+def test_build_sprint_items_xml_layout():
+    xml = db_module.build_sprint_items_xml([
+        {
+            "id": "id-1",
+            "version": "v0.6.4",
+            "status": "pending",
+            "title": "Dashboard save",
+        }
+    ])
+    assert '<sprint_items cache="false">' in xml
+    assert '<item id="id-1" version="v0.6.4" status="pending">Dashboard save</item>' in xml
+    assert xml.endswith("</sprint_items>")
+
+
+def test_start_session_endpoint_includes_sprint_items(client):
+    project = client.post("/projects", json={"name": "alpha"}).json()
+    client.post(
+        f"/projects/{project['id']}/goal",
+        json={"content": "g", "north_star": "n", "sprint": "s"},
+    )
+    item = client.post(
+        f"/projects/{project['id']}/sprint-items",
+        json={"version": "v0.6.4", "title": "Dashboard save"},
+    ).json()
+    r = client.post(
+        f"/projects/{project['id']}/start-session",
+        json={"session_name": "w", "human_id": "adam"},
+    )
+    body = r.json()
+    assert any(it["id"] == item["id"] for it in body["sprint_items"])
+    assert "Dashboard save" in body["sprint_items_xml"]
+
+
+def test_http_sprint_items_endpoints(client):
+    project = client.post("/projects", json={"name": "alpha"}).json()
+    # 422 when version/title missing.
+    r = client.post(
+        f"/projects/{project['id']}/sprint-items", json={"version": "v1"}
+    )
+    assert r.status_code == 422
+    # Happy path.
+    r = client.post(
+        f"/projects/{project['id']}/sprint-items",
+        json={"version": "v1", "title": "thing"},
+    )
+    assert r.status_code == 201
+    item = r.json()
+    # Complete it.
+    r = client.post(
+        f"/projects/{project['id']}/sprint-items/{item['id']}/complete",
+        json={},
+    )
+    assert r.status_code == 200
+    assert r.json()["status"] == "done"
+    # 404 when item is unknown.
+    r = client.post(
+        f"/projects/{project['id']}/sprint-items/does-not-exist/skip",
+        json={"reason": "nope"},
+    )
+    assert r.status_code == 404
