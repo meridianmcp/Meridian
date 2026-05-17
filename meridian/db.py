@@ -1650,7 +1650,7 @@ async def get_timeline(
         "       t.session_id, s.name AS session_name, s.human_id "
         "FROM task_log t LEFT JOIN sessions s ON s.id = t.session_id "
         "WHERE t.project_id = ? "
-        "ORDER BY t.created_at ASC, t.rowid ASC",
+        "ORDER BY t.created_at DESC, t.rowid DESC",
         (project_id,),
     ) as cur:
         task_rows = await cur.fetchall()
@@ -1671,7 +1671,7 @@ async def get_timeline(
         "SELECT id, name, human_id, session_type, status, created_at, "
         "       last_seen, session_summary "
         "FROM sessions WHERE project_id = ? "
-        "ORDER BY created_at ASC, rowid ASC",
+        "ORDER BY created_at DESC, rowid DESC",
         (project_id,),
     ) as cur:
         session_rows = await cur.fetchall()

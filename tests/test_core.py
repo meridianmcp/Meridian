@@ -3665,3 +3665,66 @@ def test_mcp_json_example_is_valid_json():
     with open(path, encoding='utf-8') as f:
         data = json.load(f)
     assert 'mcpServers' in data
+
+
+# ---------------------------------------------------------------------------
+# v1.4.0 — dashboard layout overhaul
+# ---------------------------------------------------------------------------
+
+
+def test_timeline_tasks_newest_first(client):
+    """GET /timeline returns tasks newest-first so the dashboard shows recent
+    activity at the top (v1.4.0 requirement)."""
+    import uuid, time
+    proj = client.post("/projects", json={"name": f"tl-order-{uuid.uuid4().hex[:6]}"}).json()
+    pid = proj["id"]
+    sess = client.post("/sessions/register", json={"project_id": pid, "name": "s1"}).json()
+    sid = sess["id"]
+    client.post("/tasks", json={"session_id": sid, "project_id": pid,
+                                "description": "first task", "status": "done"})
+    time.sleep(0.05)
+    client.post("/tasks", json={"session_id": sid, "project_id": pid,
+                                "description": "second task", "status": "done"})
+    r = client.get(f"/projects/{pid}/timeline")
+    assert r.status_code == 200
+    tasks = r.json()["tasks"]
+    assert len(tasks) >= 2
+    # Newest first: second task must appear before first task
+    descriptions = [t["description"] for t in tasks]
+    assert descriptions.index("second task") < descriptions.index("first task"), (
+        "v1.4.0: timeline must return tasks newest first (DESC order)"
+    )
+
+
+def test_work_queue_vtab_in_dashboard(client):
+    """Dashboard JS exposes a 'queue' vtab and loadQueue function (v1.4.0)."""
+    js = client.get("/static/dashboard.js").text
+    assert 'data-vtab="queue"' in js, (
+        "v1.4.0: queue vtab button missing from buildTabBody"
+    )
+    assert "loadQueue" in js, (
+        "v1.4.0: loadQueue function missing from dashboard.js"
+    )
+    assert "renderQueue" in js, (
+        "v1.4.0: renderQueue function missing from dashboard.js"
+    )
+    assert "queue-body-" in js, (
+        "v1.4.0: queue-body element id missing from dashboard.js"
+    )
+
+
+def test_vtab_drawer_always_visible(client):
+    """CSS: vtab-drawer must not use transform for hiding (v1.4.0 always-visible).
+
+    The v1.4.0 layout change makes the drawer a permanent side panel
+    rather than a slide-out overlay.  It must not have translateX(-…)
+    in its style rule.
+    """
+    css = client.get("/static/dashboard.css").text
+    assert "translateX(-360px)" not in css, (
+        "v1.4.0: vtab-drawer still uses translateX(-360px) for hiding. "
+        "The drawer must be always-visible in v1.4.0."
+    )
+    assert "translateX(-280px)" not in css, (
+        "v1.4.0: vtab-drawer still uses translateX(-280px) for hiding."
+    )

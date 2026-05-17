@@ -197,6 +197,7 @@ function buildTabBody(project) {
       <button class="vtab-btn" data-vtab="devlog" title="Dev Log">≋</button>
       <button class="vtab-btn" data-vtab="timeline" title="Activity Timeline">⌬</button>
       <button class="vtab-btn" data-vtab="rewind" title="Rewind — Last X days">↻</button>
+      <button class="vtab-btn" data-vtab="queue" title="Work Queue">⚙</button>
     </div>
     <div class="vtab-drawer open" id="drawer-${project.id}">
       <div class="drawer-panel active" id="drawer-status-${project.id}">
@@ -290,6 +291,15 @@ function buildTabBody(project) {
              style="padding:4px 10px;font-size:10px;border:1px solid var(--border);border-radius:4px;color:var(--muted);text-decoration:none;font-family:'IBM Plex Mono',monospace">Export as PDF</a>
         </div>
       </div>
+      <div class="drawer-panel" id="drawer-queue-${project.id}">
+        <div class="drawer-header" style="justify-content:space-between">
+          <span>QUEUE · ${escapeHtml(project.name)}</span>
+          <button class="secondary" id="queue-refresh-${project.id}" style="padding:2px 8px;font-size:10px">refresh</button>
+        </div>
+        <div style="flex:1;overflow-y:auto" id="queue-body-${project.id}">
+          <div class="empty" style="color:var(--muted)">select queue to load</div>
+        </div>
+      </div>
     </div>
     <section class="claude-handoff-panel">
       <div class="panel-header">
@@ -335,23 +345,19 @@ function buildTabBody(project) {
       btn.onclick = () => {
         const vtab = btn.dataset.vtab;
         const p = state.panels[project.id];
-        if (p.activeVtab === vtab && drawer.classList.contains('open')) {
-          drawer.classList.remove('open');
-          vtabStrip.querySelectorAll('.vtab-btn').forEach(b => b.classList.remove('active'));
-        } else {
-          drawer.classList.add('open');
-          vtabStrip.querySelectorAll('.vtab-btn').forEach(b => {
-            b.classList.toggle('active', b.dataset.vtab === vtab);
-          });
-          drawer.querySelectorAll('.drawer-panel').forEach(dp => {
-            dp.classList.toggle('active', dp.id === `drawer-${vtab}-${project.id}`);
-          });
-          p.activeVtab = vtab;
-          if (vtab === 'files') loadFilesTab(project.id);
-          if (vtab === 'devlog') refreshTasks(project.id);
-          if (vtab === 'timeline') loadTimeline(project.id);
-          if (vtab === 'rewind') initRewindTab(project.id);
-        }
+        // v1.4.0: drawer is always visible — just switch active panel.
+        vtabStrip.querySelectorAll('.vtab-btn').forEach(b => {
+          b.classList.toggle('active', b.dataset.vtab === vtab);
+        });
+        drawer.querySelectorAll('.drawer-panel').forEach(dp => {
+          dp.classList.toggle('active', dp.id === `drawer-${vtab}-${project.id}`);
+        });
+        p.activeVtab = vtab;
+        if (vtab === 'files') loadFilesTab(project.id);
+        if (vtab === 'devlog') refreshTasks(project.id);
+        if (vtab === 'timeline') loadTimeline(project.id);
+        if (vtab === 'rewind') initRewindTab(project.id);
+        if (vtab === 'queue') loadQueue(project.id);
       };
     });
   }
@@ -537,54 +543,98 @@ function renderTimeline(projectId, data) {
   const wrap = document.getElementById(`timeline-wrap-${projectId}`);
   if (!wrap) return;
   const { tasks = [], sessions = [], goal_events = [] } = data || {};
-  if (!sessions.length && !tasks.length) {
+  if (!sessions.length && !tasks.length && !goal_events.length) {
     wrap.innerHTML = `<div class="timeline-empty">no activity yet — log a task to see it here</div>`;
     return;
   }
-  const allTs = [
-    ...tasks.map(t => Date.parse(t.created_at.replace(' ', 'T') + 'Z')),
-    ...sessions.map(s => Date.parse(s.registered_at.replace(' ', 'T') + 'Z')),
-    ...sessions.map(s => Date.parse(s.last_seen.replace(' ', 'T') + 'Z')),
-    ...goal_events.map(g => Date.parse(g.updated_at.replace(' ', 'T') + 'Z')),
-  ].filter(n => !isNaN(n));
-  if (!allTs.length) { wrap.innerHTML = `<div class="timeline-empty">no timestamps</div>`; return; }
-  const minTs = Math.min(...allTs);
-  const maxTs = Math.max(...allTs, minTs + 60_000); // 1-min minimum span
-  const span = maxTs - minTs;
   const isAbs = !!(state.panels[projectId] && state.panels[projectId]._timelineAbsolute);
-  const fmtTs = (ts) => isAbs
-    ? new Date(ts).toISOString().replace('T', ' ').slice(0, 16)
-    : formatRelativeTime(new Date(ts).toISOString().replace('T', ' ').slice(0, 19));
+  const fmtTs = (ts) => {
+    if (!ts) return '';
+    const iso = ts.includes('T') ? ts : ts.replace(' ', 'T') + 'Z';
+    return isAbs
+      ? new Date(iso).toISOString().replace('T', ' ').slice(0, 16)
+      : formatRelativeTime(ts);
+  };
 
-  let html = `<div class="timeline-axis"><div class="label">session</div><div class="ticks">` +
-    `<span>${escapeHtml(fmtTs(minTs))}</span>` +
-    `<span>${escapeHtml(fmtTs((minTs+maxTs)/2))}</span>` +
-    `<span>${escapeHtml(fmtTs(maxTs))}</span>` +
-    `</div></div>`;
-
-  const tasksBySession = {};
+  // Build a unified event list; sort newest first.
+  const events = [];
   tasks.forEach(t => {
-    (tasksBySession[t.session_id] = tasksBySession[t.session_id] || []).push(t);
+    const icon = { done: '✅', failed: '❌', pending: '⏳', in_progress: '🔄' }[t.status] || '•';
+    events.push({
+      ts: t.created_at,
+      actor: t.session_name || '(unknown)',
+      desc: `${icon} ${t.description.slice(0, 100)}`,
+    });
   });
-
   sessions.forEach(s => {
     const label = s.human_id ? `${s.human_id}/${s.name}` : s.name;
-    const pills = (tasksBySession[s.id] || []).map(t => {
-      const ts = Date.parse(t.created_at.replace(' ', 'T') + 'Z');
-      const pct = ((ts - minTs) / span) * 100;
-      const cls = `timeline-pill ${escapeHtml(t.status)}`;
-      const tooltip = `[${t.status}] ${t.description.slice(0, 120)} · ${t.created_at}`;
-      return `<div class="${cls}" style="left:${pct.toFixed(2)}%;width:6px" title="${escapeHtml(tooltip)}"></div>`;
-    }).join('');
-    const events = goal_events.map(g => {
-      const ts = Date.parse(g.updated_at.replace(' ', 'T') + 'Z');
-      const pct = ((ts - minTs) / span) * 100;
-      return `<div class="timeline-event-line" style="left:${pct.toFixed(2)}%" title="goal:${escapeHtml(g.field)} v${g.version} ${escapeHtml(g.updated_at)}"></div>`;
-    }).join('');
-    html += `<div class="timeline-row"><div class="label" title="${escapeHtml(s.id)}">${escapeHtml(label)}</div>` +
-            `<div class="timeline-track">${events}${pills}</div></div>`;
+    events.push({
+      ts: s.registered_at || s.last_seen || '',
+      actor: label,
+      desc: `🟢 session ${s.status || 'registered'}`,
+    });
   });
-  wrap.innerHTML = html;
+  goal_events.forEach(g => {
+    events.push({
+      ts: g.updated_at || '',
+      actor: 'goal',
+      desc: `📋 ${g.field} updated → v${g.version}`,
+    });
+  });
+  events.sort((a, b) => (b.ts || '').localeCompare(a.ts || ''));
+
+  const rows = events.map(e =>
+    `<div class="timeline-log-entry">` +
+    `<span class="timeline-log-ts">${escapeHtml(fmtTs(e.ts))}</span>` +
+    `<span class="timeline-log-actor">${escapeHtml(e.actor)}</span>` +
+    `<span class="timeline-log-desc">${escapeHtml(e.desc)}</span>` +
+    `</div>`
+  ).join('');
+  wrap.innerHTML = `<div class="timeline-log">${rows}</div>`;
+}
+
+async function loadQueue(projectId) {
+  /**v1.4.0 — work queue panel. Loads all tasks and segments them into
+   * pending / in_progress / done / failed buckets — a Minecraft-hopper view
+   * of the task flow: items arrive pending, get claimed in_progress, complete
+   * to done or fail. Newest entries appear first within each bucket. */
+  const body = document.getElementById(`queue-body-${projectId}`);
+  if (!body) return;
+  body.innerHTML = '<div class="empty" style="color:var(--muted)">loading…</div>';
+  try {
+    const tasks = await api(`/projects/${projectId}/tasks?limit=100`);
+    body.innerHTML = renderQueue(tasks);
+    const refreshBtn = document.getElementById(`queue-refresh-${projectId}`);
+    if (refreshBtn) refreshBtn.onclick = () => loadQueue(projectId);
+  } catch (e) {
+    body.innerHTML = `<div class="empty">queue failed: ${escapeHtml(e.message)}</div>`;
+  }
+}
+
+function renderQueue(tasks) {
+  /**Segment tasks into pipeline stages and render each as a collapsible section. */
+  const pending = tasks.filter(t => t.status === 'pending');
+  const inProg = tasks.filter(t => t.status === 'in_progress');
+  const done = tasks.filter(t => t.status === 'done').slice(0, 10);
+  const failed = tasks.filter(t => t.status === 'failed').slice(0, 5);
+
+  const sect = (icon, title, items, emptyMsg) => {
+    const rows = items.length
+      ? items.map(t => {
+          const sessLine = t.session_name
+            ? `<div class="queue-item-session">${escapeHtml(t.session_name)}</div>` : '';
+          return `<div class="queue-item">${escapeHtml((t.description || '').slice(0, 120))}${sessLine}</div>`;
+        }).join('')
+      : `<div class="queue-empty">${emptyMsg}</div>`;
+    return `<div class="queue-section">` +
+      `<div class="queue-section-header">${icon} ${title} <span style="color:var(--accent)">(${items.length})</span></div>` +
+      rows + `</div>`;
+  };
+
+  return sect('⏳', 'Pending', pending, 'no pending tasks') +
+         sect('🔄', 'In Progress', inProg, 'nothing running') +
+         sect('✅', 'Recently Done', done, 'no completed tasks') +
+         (failed.length ? sect('❌', 'Failed', failed, '') : '');
 }
 
 async function loadFilesTab(projectId) {

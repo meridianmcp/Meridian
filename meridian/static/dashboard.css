@@ -112,13 +112,10 @@ html, body {
 .vtab-btn.active { background: var(--surface-2); color: var(--accent); }
 
 .vtab-drawer {
-  position: absolute; left: 44px; top: 0; bottom: 0; width: 360px;
+  width: 280px; flex-shrink: 0;
   background: var(--bg); border-right: 1px solid var(--border);
-  z-index: 10; transform: translateX(-360px);
-  transition: transform 0.18s ease; display: flex; flex-direction: column;
-  overflow: hidden;
+  display: flex; flex-direction: column; overflow: hidden;
 }
-.vtab-drawer.open { transform: translateX(0); }
 
 .drawer-panel { display: none; flex-direction: column; flex: 1; overflow: hidden; }
 .drawer-panel.active { display: flex; }
@@ -317,6 +314,7 @@ input[type=text] {
 }
 
 .claude-handoff-panel {
+  flex: 1; min-width: 0;
   display: flex; flex-direction: column;
   background: var(--surface);
   border-left: 1px solid var(--border);
@@ -394,6 +392,36 @@ input[type=text] {
 }
 .toast.show { display: block; }
 .toast.error { border-color: var(--status-failed); color: var(--status-failed); }
+
+/* v1.4.0 — vertical timeline log (newest first) */
+.timeline-log { display: flex; flex-direction: column; }
+.timeline-log-entry {
+  display: grid; grid-template-columns: 80px 110px 1fr;
+  gap: 8px; padding: 5px 12px;
+  border-bottom: 1px solid var(--border);
+  font-family: 'IBM Plex Mono', monospace; font-size: 11px;
+  align-items: baseline;
+}
+.timeline-log-entry:hover { background: var(--surface-2); }
+.timeline-log-ts { color: var(--muted); }
+.timeline-log-actor { color: var(--accent); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.timeline-log-desc { color: var(--text); }
+
+/* v1.4.0 — work queue panel */
+.queue-section { padding: 10px 14px; border-bottom: 1px solid var(--border); }
+.queue-section-header {
+  font-size: 10px; letter-spacing: 0.06em; text-transform: uppercase;
+  color: var(--muted); font-family: 'IBM Plex Mono', monospace;
+  margin-bottom: 6px; display: flex; gap: 6px; align-items: center;
+}
+.queue-item {
+  padding: 5px 8px; background: var(--surface-2);
+  border: 1px solid var(--border); border-radius: 4px;
+  font-family: 'IBM Plex Mono', monospace; font-size: 11px;
+  margin-bottom: 3px;
+}
+.queue-item-session { color: var(--muted); font-size: 10px; margin-top: 2px; }
+.queue-empty { color: var(--muted); font-size: 11px; font-family: 'IBM Plex Mono', monospace; padding: 2px 0; }
 
 /* v1.3.0 — Rewind tab.
    Day-window buttons live in the drawer header; the .active variant
