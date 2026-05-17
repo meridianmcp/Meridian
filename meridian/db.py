@@ -322,6 +322,13 @@ async def _migrate_worker_pid(db: aiosqlite.Connection) -> None:
     await _migrate_add_column_if_missing(db, "task_log", "worker_pid", "INTEGER")
 
 
+async def _migrate_rewind_token(db: aiosqlite.Connection) -> None:
+    """v1.3.0 — add ``rewind_token`` column to projects for shareable
+    read-only links into the rewind endpoint. Nullable: a project
+    has no token until POST /rewind-token mints one."""
+    await _migrate_add_column_if_missing(db, "projects", "rewind_token", "TEXT")
+
+
 async def _migrate_goal_hierarchy(db: aiosqlite.Connection) -> None:
     """v0.5.2 — add ``goal_north_star`` and ``goal_sprint`` columns.
 
@@ -376,6 +383,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_goal_mode(db)
     await _migrate_goal_hierarchy(db)
     await _migrate_worker_pid(db)
+    await _migrate_rewind_token(db)
     return db
 
 
