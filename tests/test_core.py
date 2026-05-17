@@ -3004,3 +3004,103 @@ async def test_sync_goal_md_to_db_no_attribution_when_unchanged(db, tmp_path):
     # No new attribution log_tasks when nothing changed.
     new_descs = {t["description"] for t in after} - {t["description"] for t in before}
     assert not any("file watch" in d.lower() for d in new_descs)
+
+
+# ---------------------------------------------------------------------------
+# v1.1.3 — Goal coherence warning
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_get_goal_field_ages_reflects_field_history(db):
+    """Each field's age tracks the most recent goal_states row where
+    that specific field changed, not the latest goal version."""
+    import time as _t
+    p = await db_module.create_project(db, "alpha")
+    await db_module.set_goal(
+        db, p["id"], "v0-content", north_star="ns0", sprint="sp0"
+    )
+    # Pretend the original row landed long ago by backdating
+    # goal_states.updated_at directly.
+    await db.execute(
+        "UPDATE goal_states SET updated_at = datetime('now','-40 days')"
+    )
+    await db.commit()
+    # Fresh sprint update (today). north_star + version_goal stay old.
+    await db_module.set_sprint(db, p["id"], "sp1-fresh")
+    ages = await db_module.get_goal_field_ages(db, p["id"])
+    # north_star + version_goal should be ~40 days; sprint < 1 day.
+    assert ages["north_star"]["age_seconds"] > 30 * 86400
+    assert ages["version_goal"]["age_seconds"] > 30 * 86400
+    assert ages["sprint"]["age_seconds"] < 86400
+
+
+def test_compute_coherence_warning_levels():
+    """ok / warn / critical thresholds fire on the right ages."""
+    none = {
+        "north_star": {"age_seconds": 1_000},
+        "version_goal": {"age_seconds": 1_000},
+        "sprint": {"age_seconds": 1_000},
+    }
+    assert db_module.compute_coherence_warning(none)["level"] == "ok"
+    warn = {
+        "north_star": {"age_seconds": 14 * 86400},
+        "version_goal": {"age_seconds": 1_000},
+        "sprint": {"age_seconds": 1_000},
+    }
+    out = db_module.compute_coherence_warning(warn)
+    assert out["level"] == "warn"
+    assert [s["field"] for s in out["stale_fields"]] == ["north_star"]
+    crit = {
+        "north_star": {"age_seconds": 60 * 86400},
+        "version_goal": {"age_seconds": 8 * 86400},
+        "sprint": {"age_seconds": 1_000},
+    }
+    out = db_module.compute_coherence_warning(crit)
+    assert out["level"] == "critical"
+    # sorted oldest first
+    assert out["stale_fields"][0]["field"] == "north_star"
+
+
+def test_get_goal_endpoint_includes_coherence_warning(client):
+    project = client.post("/projects", json={"name": "alpha"}).json()
+    client.post(
+        f"/projects/{project['id']}/goal",
+        json={"content": "v", "north_star": "n", "sprint": "s"},
+    )
+    body = client.get(f"/projects/{project['id']}/goal").json()
+    assert "coherence_warning" in body
+    assert "field_ages" in body
+    assert body["coherence_warning"]["level"] in {"ok", "warn", "critical"}
+    assert set(body["field_ages"].keys()) == {
+        "north_star", "version_goal", "sprint"
+    }
+
+
+def test_get_goal_xml_includes_coherence_warning_when_stale(client):
+    """XML envelope grows a <coherence_warning> child when the
+    warning is non-ok so cold sessions see it inline."""
+    project = client.post("/projects", json={"name": "alpha"}).json()
+    client.post(
+        f"/projects/{project['id']}/goal",
+        json={"content": "v", "north_star": "n", "sprint": "s"},
+    )
+    body = client.get(f"/projects/{project['id']}/goal").json()
+    xml = body["xml"]
+    assert "<coherence_warning" in xml
+    assert 'level="ok"' in xml  # fresh project
+
+
+def test_start_session_endpoint_carries_coherence_warning(client):
+    project = client.post("/projects", json={"name": "alpha"}).json()
+    client.post(
+        f"/projects/{project['id']}/goal",
+        json={"content": "v", "north_star": "n", "sprint": "s"},
+    )
+    r = client.post(
+        f"/projects/{project['id']}/start-session",
+        json={"session_name": "w", "human_id": "adam"},
+    )
+    body = r.json()
+    assert body["goal"]["coherence_warning"]["level"] == "ok"
+    assert "<coherence_warning" in body["goal_xml"]

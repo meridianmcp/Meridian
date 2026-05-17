@@ -378,6 +378,7 @@ def build_goal_xml(
     goal: dict[str, Any] | None,
     project_name: str,
     recent_tasks: list[dict[str, Any]] | None = None,
+    coherence_warning: dict[str, Any] | None = None,
 ) -> str:
     """Serialise the goal + ambient context as XML for MCP consumers.
 
@@ -434,6 +435,21 @@ def build_goal_xml(
             f'    <task status="{status}" ts="{ts}">{desc}</task>'
         )
     out.append("  </recent_tasks>")
+    # v1.1.3 — coherence_warning surfaced inline so cold sessions
+    # immediately see which goal fields have gone stale.
+    if coherence_warning is not None:
+        level = escape(str(coherence_warning.get("level") or "ok"))
+        msg = escape(str(coherence_warning.get("message") or ""))
+        out.append(f'  <coherence_warning level="{level}">{msg}')
+        stale = coherence_warning.get("stale_fields") or []
+        for entry in stale:
+            f = escape(str(entry.get("field") or ""))
+            age = entry.get("age_seconds")
+            age_str = f"{int(age)}" if isinstance(age, (int, float)) else ""
+            out.append(
+                f'    <stale field="{f}" age_seconds="{age_str}" />'
+            )
+        out.append('  </coherence_warning>')
     out.append("</goal>")
     return "\n".join(out)
 
@@ -1236,6 +1252,109 @@ async def get_sprint_items(
     async with db.execute(query, params) as cur:
         rows = await cur.fetchall()
     return [_row_to_dict(r) for r in rows]  # type: ignore[misc]
+
+
+async def get_goal_field_ages(
+    db: aiosqlite.Connection, project_id: str, now: float | None = None
+) -> dict[str, dict[str, Any]]:
+    """v1.1.3 — per-field freshness for the three goal fields.
+
+    Walks ``goal_states`` history and finds the most recent version
+    where each of north_star / version_goal / sprint *actually
+    changed* (or was first set). Returns
+    ``{field: {updated_at, age_seconds}}`` with empty / never-set
+    fields reported as ``{updated_at: None, age_seconds: None}``.
+    """
+    import time as _time
+    now = now if now is not None else _time.time()
+    async with db.execute(
+        "SELECT version, goal_north_star, content, goal_sprint, updated_at "
+        "FROM goal_states WHERE project_id = ? ORDER BY version ASC",
+        (project_id,),
+    ) as cur:
+        rows = await cur.fetchall()
+    field_ts: dict[str, str | None] = {
+        "north_star": None, "version_goal": None, "sprint": None,
+    }
+    prev: dict[str, Any] = {"north_star": "", "version_goal": "", "sprint": ""}
+    for r in rows:
+        row = {
+            "north_star": r["goal_north_star"] or "",
+            "version_goal": (r["content"] or "")
+                if isinstance(r["content"], str) else str(r["content"] or ""),
+            "sprint": r["goal_sprint"] or "",
+        }
+        for field in ("north_star", "version_goal", "sprint"):
+            if row[field] and row[field] != prev[field]:
+                field_ts[field] = r["updated_at"]
+        prev = row
+
+    from datetime import datetime, timezone
+    out: dict[str, dict[str, Any]] = {}
+    for field, ts in field_ts.items():
+        if ts is None:
+            out[field] = {"updated_at": None, "age_seconds": None}
+            continue
+        try:
+            dt = datetime.fromisoformat(ts.replace(" ", "T")).replace(
+                tzinfo=timezone.utc
+            )
+            age = max(0.0, now - dt.timestamp())
+        except ValueError:
+            age = None  # type: ignore[assignment]
+        out[field] = {"updated_at": ts, "age_seconds": age}
+    return out
+
+
+def compute_coherence_warning(
+    field_ages: dict[str, dict[str, Any]],
+    warn_days: float = 7.0,
+    critical_days: float = 30.0,
+) -> dict[str, Any]:
+    """Turn per-field ages into a single warning level.
+
+    ``ok`` when every field's age < ``warn_days``.
+    ``warn`` when one or more sit between ``warn`` and ``critical``.
+    ``critical`` when any field is older than ``critical_days``.
+    ``stale_fields`` lists every field older than ``warn_days``
+    (sorted oldest-first so the UI can highlight the worst offender).
+    """
+    warn = warn_days * 86400
+    crit = critical_days * 86400
+    stale: list[dict[str, Any]] = []
+    level = "ok"
+    max_age = 0.0
+    for field, info in field_ages.items():
+        age = info.get("age_seconds")
+        if age is None:
+            continue
+        if age >= warn:
+            stale.append({"field": field, "age_seconds": age})
+        if age > max_age:
+            max_age = age
+    stale.sort(key=lambda x: x["age_seconds"], reverse=True)
+    if max_age >= crit:
+        level = "critical"
+    elif max_age >= warn:
+        level = "warn"
+    if level == "ok":
+        message = "Goal fields are fresh."
+    elif level == "warn":
+        message = (
+            "Some goal fields haven't been touched in over "
+            f"{int(warn_days)} days."
+        )
+    else:
+        message = (
+            "Goal fields are stale — review and update before "
+            "starting more work."
+        )
+    return {
+        "level": level,
+        "message": message,
+        "stale_fields": stale,
+        "max_age_seconds": max_age,
+    }
 
 
 async def get_timeline(

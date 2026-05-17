@@ -292,11 +292,20 @@ async def get_goal(project_id: str, request: Request) -> dict[str, Any]:
         }
         for t in recent
     ]
+    # v1.1.3 — per-field ages + coherence warning so the dashboard
+    # can paint green / amber / red dots and so cold sessions see
+    # which fields have gone stale before doing anything.
+    field_ages = await db_module.get_goal_field_ages(
+        _db(request), project_id
+    )
+    coherence = db_module.compute_coherence_warning(field_ages)
+    goal["field_ages"] = field_ages
+    goal["coherence_warning"] = coherence
     # v0.6.1 — also serve the XML envelope so MCP / cache-aware consumers
     # don't have to re-stitch fields locally. The JSON keys stay for the
     # dashboard and the test suite.
     goal["xml"] = db_module.build_goal_xml(
-        goal, project["name"], goal["ambient_tasks"]
+        goal, project["name"], goal["ambient_tasks"], coherence
     )
     # v0.6.2 — pre-built Anthropic content blocks with cache_control
     # markers on the static fields. Callers can pass these straight
@@ -1100,7 +1109,15 @@ async def _start_session_composite(
     # get a single ready-to-prompt block. Always present (even when
     # goal is None) so the contract is uniform.
     ambient_for_xml = goal.get("ambient_tasks") if goal else []
-    goal_xml = db_module.build_goal_xml(goal, project_name, ambient_for_xml)
+    # v1.1.3 — coherence warning + per-field ages.
+    field_ages = await db_module.get_goal_field_ages(db, project_id)
+    coherence = db_module.compute_coherence_warning(field_ages)
+    if goal is not None:
+        goal["field_ages"] = field_ages
+        goal["coherence_warning"] = coherence
+    goal_xml = db_module.build_goal_xml(
+        goal, project_name, ambient_for_xml, coherence
+    )
     # v0.6.2 — Anthropic-API content blocks with cache_control on
     # the two static fields. Same ambient slice used by the XML.
     goal_cache_blocks = db_module.build_goal_cache_blocks(
@@ -1658,8 +1675,14 @@ def build_mcp_server():
                         db, arguments["project_id"]
                     )
                     project_name = project["name"] if project else ""
+                    field_ages = await db_module.get_goal_field_ages(
+                        db, arguments["project_id"]
+                    )
+                    coherence = db_module.compute_coherence_warning(field_ages)
+                    goal["field_ages"] = field_ages
+                    goal["coherence_warning"] = coherence
                     goal["xml"] = db_module.build_goal_xml(
-                        goal, project_name, goal["ambient_tasks"]
+                        goal, project_name, goal["ambient_tasks"], coherence
                     )
                     goal["cache_blocks"] = db_module.build_goal_cache_blocks(
                         goal, project_name, goal["ambient_tasks"]

@@ -137,6 +137,12 @@ class GoalState(BaseModel):
     # static fields (north_star + version_goal). Caller passes these
     # straight to messages.create() to get prompt caching.
     cache_blocks: list[dict[str, Any]] | None = None
+    # v1.1.3 — coherence warning: how stale are the goal fields?
+    # {level: ok|warn|critical, message, stale_fields, max_age_seconds}
+    coherence_warning: dict[str, Any] | None = None
+    # v1.1.3 — per-field freshness so the dashboard can render the
+    # green / amber / red dot next to each field.
+    field_ages: dict[str, dict[str, Any]] | None = None
 
 
 class GoalModeSet(BaseModel):
