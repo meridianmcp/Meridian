@@ -172,7 +172,7 @@ class Task(BaseModel):
     session_id: str
     project_id: str
     description: str
-    status: Literal["pending", "done", "failed", "pending-hitl"]
+    status: Literal["pending", "in_progress", "done", "failed", "pending-hitl"]
     claimed_by: str | None = None
     claimed_at: str | None = None
     created_at: str
@@ -204,7 +204,7 @@ class HandoffResult(BaseModel):
 class TaskUpdate(BaseModel):
     """Body for PATCH /tasks/{task_id}. Either field may be omitted."""
 
-    status: Literal["pending", "done", "failed", "pending-hitl"] | None = None
+    status: Literal["pending", "in_progress", "done", "failed", "pending-hitl"] | None = None
     description: str | None = None
 
 

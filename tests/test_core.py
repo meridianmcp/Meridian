@@ -264,10 +264,12 @@ async def test_enqueue_returns_pending_then_completes(db):
 
     # Drain pending background tasks. asyncio.create_task() schedules the
     # worker coroutine; yielding the loop lets it finish before we assert.
-    for _ in range(20):
+    # v1.0.1: status transitions pending -> in_progress -> done/failed,
+    # so we wait until status is a terminal state.
+    for _ in range(40):
         await asyncio.sleep(0.05)
         latest = await db_module.get_task(db, task["id"])
-        if latest and latest["status"] != "pending":
+        if latest and latest["status"] in {"done", "failed"}:
             break
     assert latest is not None
     assert latest["status"] == "done"
@@ -3456,3 +3458,67 @@ async def test_enqueue_claude_task_explicit_parent_session_id(db):
         parent_session_id=other["id"],
     )
     assert task["parent_session_id"] == other["id"]
+
+
+# ---------------------------------------------------------------------------
+# v1.0.1 — in_progress status + PID watchdog
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_in_progress_status_set_on_spawn(db):
+    """_run_worker marks task in_progress immediately after spawning."""
+    from meridian.enqueue import _run_worker, PROMPT_PREFIX
+    proj = await db_module.create_project(db, "pid-test")
+    sess = await db_module.register_session(db, proj["id"], "s")
+    task = await db_module.log_task(db, sess["id"], proj["id"], "t", "pending")
+
+    # Use a stub that exits cleanly
+    argv = [sys.executable, "-c", "import time; time.sleep(0.01)"]
+    await _run_worker(db, task["id"], "hello", argv, timeout=10)
+
+    updated = await db_module.get_task(db, task["id"])
+    # After completion it should be done (we check in_progress was transient)
+    assert updated["status"] == "done"
+
+
+@pytest.mark.asyncio
+async def test_watchdog_marks_dead_pid_failed(db):
+    """get_in_progress_tasks_with_pid returns rows; update_task marks them failed."""
+    proj = await db_module.create_project(db, "watchdog-test")
+    sess = await db_module.register_session(db, proj["id"], "s")
+    task = await db_module.log_task(db, sess["id"], proj["id"], "work", "pending")
+
+    # Manually put it in_progress with a PID that doesn't exist
+    await db_module.update_task(db, task["id"], status="in_progress")
+    await db_module.update_task_worker_pid(db, task["id"], 999999999)
+
+    stale = await db_module.get_in_progress_tasks_with_pid(db)
+    assert any(t["id"] == task["id"] for t in stale)
+
+    # Simulate watchdog: PID 999999999 is dead -> mark failed
+    for t in stale:
+        pid = t.get("worker_pid")
+        if pid is None:
+            continue
+        try:
+            os.kill(int(pid), 0)
+        except (ProcessLookupError, PermissionError, OSError):
+            # OSError covers Windows WinError 87 for non-existent PIDs
+            await db_module.update_task(db, t["id"], status="failed",
+                description=f"[claude-error] worker process died unexpectedly (PID {pid})")
+
+    final = await db_module.get_task(db, task["id"])
+    assert final["status"] == "failed"
+    assert "999999999" in final["description"]
+
+
+def test_update_task_accepts_in_progress(client):
+    """PATCH /tasks/{id} accepts in_progress as a valid status."""
+    proj = client.post("/projects", json={"name": "ip-test"}).json()
+    sess = client.post("/sessions/register", json={"project_id": proj["id"], "name": "s"}).json()
+    task = client.post("/tasks", json={"session_id": sess["id"], "project_id": proj["id"],
+        "description": "work", "status": "pending"}).json()
+    r = client.patch(f"/tasks/{task['id']}", json={"status": "in_progress"})
+    assert r.status_code == 200
+    assert r.json()["status"] == "in_progress"

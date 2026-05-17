@@ -98,7 +98,7 @@ CREATE TABLE IF NOT EXISTS task_log (
     project_id TEXT NOT NULL REFERENCES projects(id),
     description TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'done'
-        CHECK (status IN ('pending','done','failed','pending-hitl')),
+        CHECK (status IN ('pending','in_progress','done','failed','pending-hitl')),
     claimed_by TEXT,
     claimed_at TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
@@ -211,7 +211,7 @@ async def _migrate_task_log_hitl(db: aiosqlite.Connection) -> None:
             project_id TEXT NOT NULL REFERENCES projects(id),
             description TEXT NOT NULL,
             status TEXT NOT NULL DEFAULT 'done'
-                CHECK (status IN ('pending','done','failed','pending-hitl')),
+                CHECK (status IN ('pending','in_progress','done','failed','pending-hitl')),
             created_at TEXT NOT NULL DEFAULT (datetime('now'))
         );
         INSERT INTO task_log (id, session_id, project_id, description, status, created_at)
@@ -313,6 +313,15 @@ async def _migrate_goal_mode(db: aiosqlite.Connection) -> None:
     )
 
 
+async def _migrate_worker_pid(db: aiosqlite.Connection) -> None:
+    """v1.0.1 — add ``worker_pid`` column for the PID watchdog.
+
+    Stores the OS PID of the subprocess spawned by ``enqueue_claude_task``.
+    The auto-summary loop uses this to detect orphaned in_progress tasks
+    whose worker process has died."""
+    await _migrate_add_column_if_missing(db, "task_log", "worker_pid", "INTEGER")
+
+
 async def _migrate_goal_hierarchy(db: aiosqlite.Connection) -> None:
     """v0.5.2 — add ``goal_north_star`` and ``goal_sprint`` columns.
 
@@ -366,6 +375,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_parent_session_id(db)
     await _migrate_goal_mode(db)
     await _migrate_goal_hierarchy(db)
+    await _migrate_worker_pid(db)
     return db
 
 
@@ -1071,7 +1081,7 @@ async def log_task(
     worker logs its result. The timeline + auto-summary use it to
     correlate parent / child sessions.
     """
-    if status not in {"pending", "done", "failed", "pending-hitl"}:
+    if status not in {"pending", "in_progress", "done", "failed", "pending-hitl"}:
         raise ValueError(f"invalid task status: {status}")
     tid = _new_id()
     await db.execute(
@@ -1119,7 +1129,7 @@ async def update_task(
     fields: list[str] = []
     values: list[Any] = []
     if status is not None:
-        if status not in {"pending", "done", "failed", "pending-hitl"}:
+        if status not in {"pending", "in_progress", "done", "failed", "pending-hitl"}:
             raise ValueError(f"invalid task status: {status}")
         fields.append("status = ?")
         values.append(status)
@@ -1137,6 +1147,36 @@ async def update_task(
     if updated is not None:
         _publish_task("task_updated", updated)
     return updated
+
+
+async def update_task_worker_pid(
+    db: aiosqlite.Connection, task_id: str, pid: int
+) -> None:
+    """Store the worker subprocess PID on the task row.
+
+    Called immediately after the subprocess spawns so the PID watchdog
+    can detect orphaned in_progress tasks whose worker process has died.
+    """
+    await db.execute(
+        "UPDATE task_log SET worker_pid = ? WHERE id = ?", (pid, task_id)
+    )
+    await db.commit()
+
+
+async def get_in_progress_tasks_with_pid(
+    db: aiosqlite.Connection,
+) -> list[dict[str, Any]]:
+    """Return all in_progress task rows that have a worker_pid set.
+
+    Used by the PID watchdog in the auto-summary loop to detect orphaned
+    workers. A task is orphaned if its worker_pid process is no longer
+    running (i.e., ``os.kill(pid, 0)`` raises ``ProcessLookupError``).
+    """
+    async with db.execute(
+        "SELECT * FROM task_log WHERE status = 'in_progress' AND worker_pid IS NOT NULL"
+    ) as cur:
+        rows = await cur.fetchall()
+    return [_row_to_dict(r) for r in rows]
 
 
 async def get_tasks(

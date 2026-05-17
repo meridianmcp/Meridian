@@ -105,6 +105,14 @@ async def _run_worker(
         )
         return
 
+    # v1.0.1 — mark in_progress and record PID immediately on spawn
+    await db_module.update_task(
+        db, task_id,
+        status="in_progress",
+        description=f"{PROMPT_PREFIX}{prompt}\n\n[worker PID: {proc.pid}]",
+    )
+    await db_module.update_task_worker_pid(db, task_id, proc.pid)
+
     try:
         stdout_bytes, stderr_bytes = await asyncio.wait_for(
             proc.communicate(), timeout=timeout

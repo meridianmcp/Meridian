@@ -104,6 +104,28 @@ async def lifespan(app: FastAPI):
             try:
                 await asyncio.sleep(interval_s)
                 await db_module.run_auto_summary_cycle(db)
+                # v1.0.1 — PID watchdog: mark orphaned in_progress tasks as failed
+                try:
+                    stale = await db_module.get_in_progress_tasks_with_pid(db)
+                    for t in stale:
+                        pid = t.get("worker_pid")
+                        if pid is None:
+                            continue
+                        try:
+                            os.kill(int(pid), 0)  # 0 = check existence only
+                        except (ProcessLookupError, PermissionError, OSError):
+                            # PID is dead — mark the task failed
+                            # OSError covers Windows WinError 87 for non-existent PIDs
+                            await db_module.update_task(
+                                db, t["id"],
+                                status="failed",
+                                description=(
+                                    f"[claude-error] worker process died "
+                                    f"unexpectedly (PID {pid})"
+                                ),
+                            )
+                except Exception:  # noqa: BLE001
+                    pass
             except asyncio.CancelledError:
                 break
             except Exception:  # noqa: BLE001 — never let the loop die

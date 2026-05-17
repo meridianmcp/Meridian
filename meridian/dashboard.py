@@ -638,6 +638,8 @@ input[type=text] {
 .task.pending .status-badge { background: rgba(240,198,116,0.15); color: var(--status-pending); }
 .task.done .status-badge    { background: rgba(0,212,170,0.15); color: var(--status-done); }
 .task.failed .status-badge  { background: rgba(255,107,107,0.15); color: var(--status-failed); }
+.task.in_progress .status-badge { background: rgba(133,77,14,0.2); color: #fef08a; animation: pulse 1.5s infinite; }
+@keyframes pulse { 0%,100% { opacity:1; } 50% { opacity:.5; } }
 .task.pending-hitl {
   background: rgba(255,159,67,0.08);
   border-left: 3px solid var(--status-hitl);
@@ -697,9 +699,10 @@ input[type=text] {
   position: absolute; top: 3px; height: 16px; border-radius: 3px;
   min-width: 6px; cursor: pointer; box-shadow: 0 0 0 1px var(--bg);
 }
-.timeline-pill.done    { background: var(--status-done); }
-.timeline-pill.failed  { background: var(--status-failed); }
-.timeline-pill.pending { background: var(--status-pending); }
+.timeline-pill.done       { background: var(--status-done); }
+.timeline-pill.failed     { background: var(--status-failed); }
+.timeline-pill.pending    { background: var(--status-pending); }
+.timeline-pill.in_progress { background: #fef08a; animation: pulse 1.5s infinite; }
 .timeline-pill.pending-hitl { background: var(--accent); }
 .timeline-event-line {
   position: absolute; top: 0; bottom: 0; width: 0;
