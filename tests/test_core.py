@@ -3637,3 +3637,31 @@ def test_dashboard_has_rewind_tab(client):
     js = client.get("/static/dashboard.js").text
     # The rewind tab button should be wired up in the dashboard bundle.
     assert "rewind" in js.lower() or "Rewind" in js
+
+
+# ---------------------------------------------------------------------------
+# v1.3.1 — Document Meridian MCP connection for claude.ai planning sessions
+# ---------------------------------------------------------------------------
+
+
+def test_readme_has_mcp_config_section(client):
+    """README.md contains the MCP configuration section."""
+    import os
+    readme = open(
+        os.path.join(os.path.dirname(__file__), '..', 'README.md'),
+        encoding='utf-8',
+    ).read()
+    assert 'mcpServers' in readme
+    assert 'meridian' in readme
+
+
+def test_mcp_json_example_is_valid_json():
+    """mcp.json.example is valid JSON."""
+    import json
+    import os
+    path = os.path.join(
+        os.path.dirname(__file__), '..', 'mcp.json.example'
+    )
+    with open(path, encoding='utf-8') as f:
+        data = json.load(f)
+    assert 'mcpServers' in data

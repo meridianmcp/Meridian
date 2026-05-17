@@ -56,6 +56,58 @@ pixi run demo         # two-session coordination demo
 }
 ```
 
+## Connect your AI planning session
+
+Meridian MCP tools work inside any MCP-compatible client — your claude.ai
+chat tab becomes a project coordinator that dispatches workers and reads
+results without leaving the conversation.
+
+### Option A — Claude Desktop
+
+Add to `~/AppData/Roaming/Claude/claude_desktop_config.json` (Windows) or
+`~/Library/Application Support/Claude/claude_desktop_config.json` (macOS):
+
+```json
+{
+  "mcpServers": {
+    "meridian": {
+      "command": "pixi",
+      "args": ["run", "python", "-m", "meridian", "--mcp"],
+      "cwd": "/absolute/path/to/meridian/repository"
+    }
+  }
+}
+```
+
+Restart Claude Desktop. Your next chat has Meridian tools available.
+
+### Option B — Claude Code project
+
+Create `.mcp.json` in your project root (see `mcp.json.example` in this
+repo for the canonical template):
+
+```json
+{
+  "mcpServers": {
+    "meridian": {
+      "command": "pixi",
+      "args": ["run", "python", "-m", "meridian", "--mcp"],
+      "cwd": "/absolute/path/to/meridian/repository"
+    }
+  }
+}
+```
+
+Any Claude Code session in that project gets Meridian tools automatically.
+
+### The full loop (no terminals, no copy-paste)
+
+1. Human sets sprint: `set_sprint(project_id=..., sprint="build v1.3.0")`
+2. Human dispatches worker: `enqueue_claude_task(project_id=..., prompt="build the rewind endpoint")`
+3. Claude Code worker spawns automatically in the background
+4. Human checks results: `get_tasks(project_id=..., limit=5)`
+5. Context never lost — Meridian holds the state, not the chat window
+
 ## Privacy
 
 **Free tier:** runs entirely on your machine. No server, no telemetry, no accounts. We physically cannot see your data because it never leaves your computer.
