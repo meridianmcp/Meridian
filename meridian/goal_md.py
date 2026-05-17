@@ -70,6 +70,10 @@ _SECTION_ALIASES = {
     "version": "version_goal",
     "goal": "version_goal",
     "sprint": "sprint",
+    # v1.1.2 — append-only decisions section. Parsed but file-watch
+    # treats it as separate from the three goal fields (decisions
+    # never trigger conflict detection or attribution log_tasks).
+    "decisions": "decisions",
 }
 
 
@@ -86,6 +90,7 @@ def parse_goal_md(text: str) -> dict[str, str | None]:
         "north_star": None,
         "version_goal": None,
         "sprint": None,
+        "decisions": None,
     }
 
     # Strip leading whitespace before the title scan so a BOM /
@@ -116,9 +121,13 @@ def format_goal_md(
     north_star: str | None,
     version_goal: str | None,
     sprint: str | None,
+    decisions: str | None = None,
 ) -> str:
     """Render the structured fields as GOAL.md text. Missing fields
-    become empty sections so the file always shows the full layout."""
+    become empty sections so the file always shows the full layout.
+
+    ``decisions`` (v1.1.2) is appended below ``Sprint`` when provided.
+    """
     parts = [f"# {project_name}", ""]
     parts.append("## North Star")
     parts.append("")
@@ -132,6 +141,11 @@ def format_goal_md(
     parts.append("")
     parts.append((sprint or "").rstrip())
     parts.append("")
+    if decisions is not None:
+        parts.append("## Decisions")
+        parts.append("")
+        parts.append(decisions.rstrip())
+        parts.append("")
     return "\n".join(parts).rstrip() + "\n"
 
 
@@ -153,13 +167,16 @@ def write_goal_md(
     version_goal: str | None,
     sprint: str | None,
     path: Path | None = None,
+    decisions: str | None = None,
 ) -> Path:
     """Render and write GOAL.md atomically (write tmp → rename).
 
     Returns the path that was written so the caller can log it.
     """
     path = path or default_goal_md_path()
-    content = format_goal_md(project_name, north_star, version_goal, sprint)
+    content = format_goal_md(
+        project_name, north_star, version_goal, sprint, decisions
+    )
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(content, encoding="utf-8")
@@ -172,16 +189,72 @@ def write_goal_md(
 # ---------------------------------------------------------------------------
 
 
-async def sync_goal_md_to_db(
-    db: aiosqlite.Connection, path: Path | None = None
-) -> dict[str, Any] | None:
-    """If GOAL.md exists and names a known project, upsert its fields
-    into that project's latest goal row.
+_FILE_WATCH_SESSION_NAME = "human/file-watch"
 
-    Returns the resulting goal dict, or ``None`` when nothing changed
-    (file missing / no project name / project not in DB). DB wins
-    when its ``updated_at`` is later than the file's mtime — the file
-    has presumably gone stale waiting for the next disk write.
+
+async def _file_watch_session_id(
+    db: aiosqlite.Connection, project_id: str
+) -> str:
+    """Return (creating if needed) the session row used for file-watch
+    attribution log_task entries (v1.1.2). One row per project."""
+    async with db.execute(
+        "SELECT id FROM sessions WHERE project_id = ? AND name = ? "
+        "ORDER BY created_at ASC LIMIT 1",
+        (project_id, _FILE_WATCH_SESSION_NAME),
+    ) as cur:
+        row = await cur.fetchone()
+    if row is not None:
+        return row[0]
+    sess = await db_module.register_session(
+        db, project_id, _FILE_WATCH_SESSION_NAME, human_id="human"
+    )
+    return sess["id"]
+
+
+def _diff_goal_fields(
+    new: dict[str, Any], old: dict[str, Any] | None
+) -> list[str]:
+    """Return the list of fields (north_star / version_goal / sprint)
+    that differ between the parsed file and the DB row. Empty when
+    the file says the same thing."""
+    if old is None:
+        old = {}
+    changed: list[str] = []
+    pairs = [
+        ("north_star", new.get("north_star"), old.get("north_star")),
+        ("version_goal", new.get("version_goal"), (
+            old.get("content")
+            if isinstance(old.get("content"), str)
+            else (None if old.get("content") is None else str(old.get("content")))
+        )),
+        ("sprint", new.get("sprint"), old.get("sprint")),
+    ]
+    for field, n, o in pairs:
+        nv = (n or "").strip()
+        ov = (o or "").strip()
+        if nv != ov:
+            changed.append(field)
+    return changed
+
+
+async def sync_goal_md_to_db(
+    db: aiosqlite.Connection,
+    path: Path | None = None,
+    *,
+    via_watch: bool = False,
+) -> dict[str, Any] | None:
+    """If GOAL.md exists and names a known project, upsert its fields.
+
+    v1.1.2 — when the DB row is newer than the file's mtime (someone
+    edited via MCP / dashboard since the file was last saved) we
+    *skip* the upsert AND write a conflict log_task entry so the
+    drift is visible. When ``via_watch=True`` and a real change
+    landed, we also write an attribution log_task per changed field
+    so timelines show which fields the human edited and when.
+
+    Returns the resulting goal dict, ``None`` when nothing changed,
+    or a ``{conflict: True, ...}`` marker on conflict so callers can
+    surface it (timeline rerender, dashboard toast).
     """
     path = path or default_goal_md_path()
     parsed = read_goal_md(path)
@@ -192,29 +265,74 @@ async def sync_goal_md_to_db(
         return None
 
     existing = await db_module.get_goal(db, project["id"])
+
+    # ── Conflict detection (v1.1.2) ────────────────────────────────────
     if existing is not None:
-        # If the DB row is newer than the file's mtime, treat the DB
-        # as authoritative — happens when MCP / dashboard wrote since
-        # the human last saved the file.
         try:
             file_mtime = path.stat().st_mtime
-            # SQLite timestamp is naïve UTC text.
             from datetime import datetime, timezone
             db_updated = datetime.fromisoformat(
                 existing["updated_at"].replace(" ", "T")
             ).replace(tzinfo=timezone.utc)
             if db_updated.timestamp() > file_mtime + 1:
-                return existing
+                # DB is newer. Log a conflict task once so the user
+                # sees it in the timeline; return the conflict marker.
+                try:
+                    sess_id = await _file_watch_session_id(db, project["id"])
+                    await db_module.log_task(
+                        db,
+                        sess_id,
+                        project["id"],
+                        (
+                            "GOAL.md conflict — file is older than DB "
+                            "(file_mtime < db_updated_at); skipped sync"
+                        ),
+                        status="failed",
+                    )
+                except Exception:  # noqa: BLE001 — never break sync on log fail
+                    pass
+                return {
+                    "conflict": True,
+                    "reason": "db_newer_than_file",
+                    "goal": existing,
+                }
         except (OSError, ValueError, KeyError):
             pass  # If we can't compare cleanly, fall through to upsert.
 
-    return await db_module.set_goal(
+    changed_fields = _diff_goal_fields(parsed, existing) if existing else [
+        f for f in ("north_star", "version_goal", "sprint")
+        if (parsed.get(f) or "").strip()
+    ]
+    if not changed_fields and existing is not None:
+        # Nothing actually changed in the goal fields. Decisions
+        # alone may have changed but we don't sync that field here
+        # (v1.1.4 handles the decisions column).
+        return existing
+
+    result = await db_module.set_goal(
         db,
         project["id"],
         parsed.get("version_goal") or (existing or {}).get("content") or "",
         north_star=parsed.get("north_star"),
         sprint=parsed.get("sprint"),
     )
+
+    # ── Attribution (v1.1.2) ──────────────────────────────────────────
+    if via_watch and changed_fields:
+        try:
+            sess_id = await _file_watch_session_id(db, project["id"])
+            for field in changed_fields:
+                await db_module.log_task(
+                    db,
+                    sess_id,
+                    project["id"],
+                    f"GOAL.md edit — {field} updated by human (file watch)",
+                    status="done",
+                )
+        except Exception:  # noqa: BLE001
+            pass
+
+    return result
 
 
 async def sync_db_to_goal_md(
@@ -272,7 +390,9 @@ async def watch_goal_md(
             # also triggers a sync. Filter to events on our target.
             if path.exists():
                 try:
-                    await sync_goal_md_to_db(db, path)
+                    # via_watch=True triggers attribution log_tasks for
+                    # any field that actually changed (v1.1.2).
+                    await sync_goal_md_to_db(db, path, via_watch=True)
                 except Exception:  # noqa: BLE001 — never crash the loop
                     continue
     except Exception:  # noqa: BLE001 — graceful exit if watchfiles dies

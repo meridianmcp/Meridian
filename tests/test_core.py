@@ -2891,3 +2891,116 @@ def test_dashboard_html_has_timeline_tab(client):
     assert 'data-vtab="timeline"' in html
     assert "drawer-timeline-" in html
     assert "loadTimeline" in html
+
+
+# ---------------------------------------------------------------------------
+# v1.1.2 — GOAL.md attribution + conflict detection + ## Decisions
+# ---------------------------------------------------------------------------
+
+from meridian import goal_md as goal_md_module
+
+
+def test_parse_goal_md_extracts_decisions_section():
+    text = """# proj
+
+## North Star
+n
+
+## Version Goal
+v
+
+## Sprint
+s
+
+## Decisions
+- 2026-01-01 went with sqlite
+- 2026-01-15 chose PyInstaller for v1
+"""
+    parsed = goal_md_module.parse_goal_md(text)
+    assert parsed["north_star"] == "n"
+    assert parsed["version_goal"] == "v"
+    assert parsed["sprint"] == "s"
+    assert "PyInstaller" in (parsed["decisions"] or "")
+
+
+def test_format_goal_md_includes_decisions_section():
+    out = goal_md_module.format_goal_md(
+        "proj", "n", "v", "s",
+        decisions="- 2026-01-01 sqlite chosen",
+    )
+    assert "## Decisions" in out
+    assert "sqlite chosen" in out
+
+
+@pytest.mark.asyncio
+async def test_sync_goal_md_to_db_logs_attribution_via_watch(db, tmp_path):
+    p = await db_module.create_project(db, "alpha")
+    await db_module.set_goal(db, p["id"], "v0", north_star="ns0", sprint="sp0")
+    md_path = tmp_path / "GOAL.md"
+    md_path.write_text(goal_md_module.format_goal_md(
+        "alpha", "ns0", "v0", "sp1-edited"
+    ), encoding="utf-8")
+    # Bump mtime ahead of the DB's updated_at so the conflict guard
+    # doesn't kick in.
+    import os, time as _t
+    future = _t.time() + 300
+    os.utime(md_path, (future, future))
+    result = await goal_md_module.sync_goal_md_to_db(
+        db, md_path, via_watch=True
+    )
+    assert result is not None and "conflict" not in result
+    tasks = await db_module.get_tasks(db, p["id"], limit=10)
+    descs = [t["description"] for t in tasks]
+    assert any("file watch" in d.lower() for d in descs)
+    # Only sprint changed in our edit, so only the sprint attribution
+    # should be logged — north_star + version_goal are unchanged.
+    sprint_logs = [d for d in descs if "sprint updated" in d]
+    assert sprint_logs, f"expected sprint attribution log; got {descs}"
+
+
+@pytest.mark.asyncio
+async def test_sync_goal_md_to_db_detects_db_newer_conflict(db, tmp_path):
+    p = await db_module.create_project(db, "alpha")
+    md_path = tmp_path / "GOAL.md"
+    md_path.write_text(goal_md_module.format_goal_md(
+        "alpha", "old", "old", "old"
+    ), encoding="utf-8")
+    # Force the file mtime to be 1 hour in the past.
+    import os, time as _t
+    past = _t.time() - 3600
+    os.utime(md_path, (past, past))
+    # DB write fresh after the file → conflict triggers.
+    await db_module.set_goal(db, p["id"], "new", north_star="new", sprint="new")
+    result = await goal_md_module.sync_goal_md_to_db(
+        db, md_path, via_watch=True
+    )
+    assert isinstance(result, dict)
+    assert result.get("conflict") is True
+    assert result.get("reason") == "db_newer_than_file"
+    # A conflict log_task fired so the timeline shows the skip.
+    tasks = await db_module.get_tasks(db, p["id"], limit=5)
+    assert any(
+        "GOAL.md conflict" in (t["description"] or "")
+        for t in tasks
+    )
+
+
+@pytest.mark.asyncio
+async def test_sync_goal_md_to_db_no_attribution_when_unchanged(db, tmp_path):
+    p = await db_module.create_project(db, "alpha")
+    await db_module.set_goal(
+        db, p["id"], "v0", north_star="ns0", sprint="sp0"
+    )
+    md_path = tmp_path / "GOAL.md"
+    md_path.write_text(goal_md_module.format_goal_md(
+        "alpha", "ns0", "v0", "sp0"  # identical to DB
+    ), encoding="utf-8")
+    import os, time as _t
+    future = _t.time() + 300
+    os.utime(md_path, (future, future))
+    before = await db_module.get_tasks(db, p["id"], limit=20)
+    await goal_md_module.sync_goal_md_to_db(db, md_path, via_watch=True)
+    after = await db_module.get_tasks(db, p["id"], limit=20)
+    # No new attribution log_tasks when nothing changed.
+    new_descs = {t["description"] for t in after} - {t["description"] for t in before}
+    assert not any("file watch" in d.lower() for d in new_descs)
