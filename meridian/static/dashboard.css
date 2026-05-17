@@ -366,6 +366,11 @@ input[type=text] {
 }
 .live-task-cancel:hover { color: var(--status-failed); }
 .live-dot { font-size: 12px; flex-shrink: 0; }
+.live-sprint-progress { font-size: 12px; color: var(--muted); }
+.live-sprint-bar { display: flex; gap: 8px; align-items: center; font-family: monospace; }
+.live-sprint-bar-track { color: var(--accent); letter-spacing: 1px; }
+.live-sprint-bar-count { color: var(--fg); font-weight: 600; }
+.live-sprint-bar-pct { color: var(--muted); }
 .live-add-row { display: flex; gap: 6px; }
 .live-add-input {
   flex: 1; padding: 8px 10px;

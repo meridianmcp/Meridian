@@ -178,9 +178,14 @@ def write_goal_md(
         project_name, north_star, version_goal, sprint, decisions
     )
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(content, encoding="utf-8")
-    os.replace(tmp, path)
+    global _meridian_writing
+    _meridian_writing = True
+    try:
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(content, encoding="utf-8")
+        os.replace(tmp, path)
+    finally:
+        _meridian_writing = False
     return path
 
 
@@ -275,27 +280,14 @@ async def sync_goal_md_to_db(
                 existing["updated_at"].replace(" ", "T")
             ).replace(tzinfo=timezone.utc)
             if db_updated.timestamp() > file_mtime + 1:
-                # DB is newer. Log a conflict task once so the user
-                # sees it in the timeline; return the conflict marker.
+                # DB is newer — DB wins. Write it back to the file so
+                # the next watch cycle sees them in agreement. No task
+                # logged: this is expected after MCP / dashboard edits.
                 try:
-                    sess_id = await _file_watch_session_id(db, project["id"])
-                    await db_module.log_task(
-                        db,
-                        sess_id,
-                        project["id"],
-                        (
-                            "GOAL.md conflict — file is older than DB "
-                            "(file_mtime < db_updated_at); skipped sync"
-                        ),
-                        status="failed",
-                    )
-                except Exception:  # noqa: BLE001 — never break sync on log fail
+                    await sync_db_to_goal_md(db, project["id"], path)
+                except Exception:  # noqa: BLE001 — never break sync on write fail
                     pass
-                return {
-                    "conflict": True,
-                    "reason": "db_newer_than_file",
-                    "goal": existing,
-                }
+                return existing
         except (OSError, ValueError, KeyError):
             pass  # If we can't compare cleanly, fall through to upsert.
 
@@ -375,16 +367,23 @@ async def sync_db_to_goal_md(
 # Optional live file-watch (watchfiles)
 # ---------------------------------------------------------------------------
 
+# Module-level flag: True while Meridian is writing GOAL.md so the
+# watchfiles loop skips events triggered by our own writes. Prevents
+# the write→watch→write infinite loop (v1.6.x fix).
+_meridian_writing = False
+
 
 async def watch_goal_md(
-    db: aiosqlite.Connection,
-    path: Path | None = None,
+    db,
+    path=None,
 ) -> None:
     """Watch GOAL.md for human edits and re-sync to the DB live.
 
-    No-op (graceful) when ``watchfiles`` is not installed. Designed to
-    be launched once at server startup via ``asyncio.create_task``.
+    No-op (graceful) when watchfiles is not installed.
+    Skips events triggered by Meridian's own writes to prevent the
+    write-loop that generated hundreds of spurious conflict log entries.
     """
+    global _meridian_writing
     path = path or default_goal_md_path()
     try:
         from watchfiles import awatch
@@ -392,14 +391,12 @@ async def watch_goal_md(
         return
     try:
         async for _ in awatch(str(path.parent)):
-            # We watch the parent dir so the file's eventual creation
-            # also triggers a sync. Filter to events on our target.
+            if _meridian_writing:
+                continue
             if path.exists():
                 try:
-                    # via_watch=True triggers attribution log_tasks for
-                    # any field that actually changed (v1.1.2).
                     await sync_goal_md_to_db(db, path, via_watch=True)
-                except Exception:  # noqa: BLE001 — never crash the loop
+                except Exception:
                     continue
-    except Exception:  # noqa: BLE001 — graceful exit if watchfiles dies
+    except Exception:
         return

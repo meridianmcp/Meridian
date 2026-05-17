@@ -223,6 +223,11 @@ function buildTabBody(project) {
         </div>
         <div class="live-body" id="live-body-${project.id}">
           <div class="live-section">
+            <div class="live-section-label">Sprint progress</div>
+            <div id="live-sprint-progress-${project.id}" class="live-sprint-progress"></div>
+          </div>
+          <hr class="live-divider">
+          <div class="live-section">
             <div class="live-section-label">Active sessions</div>
             <div class="live-sessions" id="live-sessions-${project.id}">
               <div class="live-empty">No active sessions.</div>
@@ -584,16 +589,42 @@ async function loadLiveTab(projectId) {
 }
 
 async function refreshLiveTab(projectId) {
-  /** Fetch fresh sessions + tasks and repaint both Live sections. */
+  /** Fetch fresh sessions + tasks + sprint items and repaint all Live sections. */
   try {
-    const [sessions, tasks] = await Promise.all([
+    const [sessions, tasks, sprintItems] = await Promise.all([
       api(`/projects/${projectId}/sessions`).catch(() => []),
       api(`/projects/${projectId}/tasks?limit=200`).catch(() => []),
+      api(`/projects/${projectId}/sprint-items`).catch(() => []),
     ]);
+    renderSprintProgress(projectId, sprintItems || []);
     renderLiveSessions(projectId, sessions || [], tasks || []);
     renderLiveQueue(projectId, tasks || []);
     cacheMostRecentSession(projectId, sessions || []);
   } catch(e) { /* ignore — WS will retry on next event */ }
+}
+
+function renderSprintProgress(projectId, items) {
+  const root = document.getElementById(`live-sprint-progress-${projectId}`);
+  if (!root) return;
+  const total = items.length;
+  if (total === 0) {
+    root.textContent = 'No sprint items defined.';
+    return;
+  }
+  const done = items.filter(i => i.status === 'done').length;
+  const skipped = items.filter(i => i.status === 'skipped').length;
+  const filled = done + skipped;
+  const pct = Math.round((done / total) * 100);
+  const barLen = 10;
+  const filledBlocks = Math.round((filled / total) * barLen);
+  const bar = '█'.repeat(filledBlocks) + '░'.repeat(barLen - filledBlocks);
+  root.innerHTML = `
+    <div class="live-sprint-bar">
+      <span class="live-sprint-bar-track">[${bar}]</span>
+      <span class="live-sprint-bar-count">${done}/${total}</span>
+      <span class="live-sprint-bar-pct">${pct}%</span>
+    </div>
+  `;
 }
 
 function cacheMostRecentSession(projectId, sessions) {

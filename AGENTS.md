@@ -30,33 +30,41 @@ This file contains everything that happened before you arrived — recent task l
 current goal version, active sessions. If the file exists, read it BEFORE calling
 any MCP tools. It is more current than AGENTS.md.
 
-### Step 2 — Register with Meridian
+### Step 2 — Register with Meridian (call this REGARDLESS of how you were launched)
+
+Use `start_session` — it's the composite helper that registers, reads goal, reads
+recent tasks, and returns everything in one call. Call it whether you're a normal
+session, an RC session (`/rc`), a cloud session, or a worker session.
+
 ```python
-register_session(
+start_session(
     project_id="5787cc92-ba7d-4788-b17c-28ab7938b839",
     session_name="claude-[model]-[task]",
     human_id="adam"  # or your name if you're a contributor
 )
-# Store the returned session_id — you need it for log_task
+# Returns: session_id, goal (north_star + content + sprint + version), recent tasks
+# Store the session_id — you need it for log_task and heartbeat
 ```
 
-### Step 3 — Read the current goal
-```python
-get_goal(project_id="5787cc92-ba7d-4788-b17c-28ab7938b839")
-```
-The goal is the contract. Read it. Don't start work until you understand it.
+Do NOT skip this step for RC sessions. RC sessions (`/rc`) must call `start_session`
+the same as any other session. The `.mcp.json` in the repo root configures the MCP
+server automatically for RC sessions.
 
-### Step 4 — Read recent tasks
-```python
-get_tasks(project_id="5787cc92-ba7d-4788-b17c-28ab7938b839", limit=10)
-```
-See what other sessions did recently. Don't duplicate work already marked done.
+### Step 3 — Read the current goal (already returned by start_session)
+
+The goal fields (north_star, version_goal, sprint) come back in the `start_session`
+response. You don't need a separate `get_goal` call — they're already there.
+
+### Step 4 — Read recent tasks (already returned by start_session)
+
+Recent tasks are also included in the `start_session` response. Don't redo work
+already marked done.
 
 ### Step 5 — Log that you've started
 ```python
 log_task(
     project_id="5787cc92-ba7d-4788-b17c-28ab7938b839",
-    session_id="<your session_id>",
+    session_id="<your session_id from start_session>",
     description="Starting session — read handoff, goal v{N}, recent tasks reviewed. Plan: ...",
     status="pending"
 )

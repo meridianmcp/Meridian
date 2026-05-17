@@ -2989,17 +2989,21 @@ async def test_sync_goal_md_to_db_detects_db_newer_conflict(db, tmp_path):
     import os, time as _t
     past = _t.time() - 3600
     os.utime(md_path, (past, past))
-    # DB write fresh after the file → conflict triggers.
+    # DB write fresh after the file → DB wins, file gets refreshed silently.
     await db_module.set_goal(db, p["id"], "new", north_star="new", sprint="new")
     result = await goal_md_module.sync_goal_md_to_db(
         db, md_path, via_watch=True
     )
+    # DB wins: returns the existing DB goal (no conflict marker, no failed task).
     assert isinstance(result, dict)
-    assert result.get("conflict") is True
-    assert result.get("reason") == "db_newer_than_file"
-    # A conflict log_task fired so the timeline shows the skip.
+    assert result.get("conflict") is not True
+    assert result.get("north_star") == "new"
+    # The file should now reflect DB content.
+    written = md_path.read_text(encoding="utf-8")
+    assert "new" in written
+    # No conflict log_task should exist.
     tasks = await db_module.get_tasks(db, p["id"], limit=5)
-    assert any(
+    assert not any(
         "GOAL.md conflict" in (t["description"] or "")
         for t in tasks
     )
