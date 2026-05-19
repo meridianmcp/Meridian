@@ -1696,6 +1696,18 @@ function initRewindTab(projectId) {
   loadRewindTab(projectId, 7);
 }
 
+function toggleExpand(id) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  const open = el.style.display !== 'none';
+  el.style.display = open ? 'none' : '';
+  const trigger = el.previousElementSibling;
+  if (trigger) {
+    const arrow = trigger.querySelector('.expand-arrow');
+    if (arrow) arrow.textContent = open ? '▶' : '▼';
+  }
+}
+
 async function loadRewindTab(projectId, days) {
   const wrap = document.getElementById(`rewind-wrap-${projectId}`);
   if (!wrap) return;
@@ -1707,14 +1719,17 @@ async function loadRewindTab(projectId, days) {
   });
   wrap.innerHTML = '<div style="color:var(--muted)">loading rewind…</div>';
   try {
-    const data = await api(`/projects/${projectId}/rewind?days=${days}`);
-    wrap.innerHTML = renderRewind(data);
+    const [data, history] = await Promise.all([
+      api(`/projects/${projectId}/rewind?days=${days}`),
+      api(`/projects/${projectId}/goal-history`).catch(() => []),
+    ]);
+    wrap.innerHTML = renderRewind(projectId, data) + renderGoalHistory(projectId, history);
   } catch (e) {
     wrap.innerHTML = `<div style="color:var(--status-failed)">rewind failed: ${escapeHtml(e.message)}</div>`;
   }
 }
 
-function renderRewind(data) {
+function renderRewind(projectId, data) {
   const sec = (icon, title, items, render) => {
     if (!items || !items.length) {
       return `<section style="margin-bottom:14px">
@@ -1727,13 +1742,24 @@ function renderRewind(data) {
       ${items.map(render).join('')}
     </section>`;
   };
+  const preStyle = 'margin:0;white-space:pre-wrap;word-break:break-word;background:var(--bg-card);padding:6px;border-radius:3px;font-size:10px;font-family:inherit';
   const versions = sec('📦', 'Versions shipped', data.versions_shipped,
     v => `<div style="padding:2px 0">${escapeHtml(v)}</div>`);
-  const goals = sec('🎯', 'Goal changes', data.goal_changes, g =>
-    `<div style="padding:3px 0;border-left:2px solid var(--border);padding-left:8px;margin-bottom:4px">
-      <div style="color:var(--muted);font-size:10px">${escapeHtml(g.field)} · ${escapeHtml(g.changed_at || '')}</div>
-      <div>${escapeHtml(g.old_summary || '(empty)')} → ${escapeHtml(g.new_summary || '(empty)')}</div>
-    </div>`);
+  const goals = sec('🎯', 'Goal changes', data.goal_changes, (g, idx) => {
+    const id = `gc-expand-${projectId}-${idx}`;
+    return `<div style="padding:3px 0;border-left:2px solid var(--border);padding-left:8px;margin-bottom:4px">
+      <div style="cursor:pointer;user-select:none" onclick="toggleExpand('${id}')">
+        <div style="color:var(--muted);font-size:10px">${escapeHtml(g.field)} · ${escapeHtml(g.changed_at || '')} <span class="expand-arrow" style="font-size:9px">▶</span></div>
+        <div>${escapeHtml(g.old_summary || '(empty)')} → ${escapeHtml(g.new_summary || '(empty)')}</div>
+      </div>
+      <div id="${id}" style="display:none;margin-top:6px">
+        <div style="color:var(--muted);font-size:10px;margin-bottom:2px">before:</div>
+        <pre style="${preStyle};margin-bottom:6px">${escapeHtml(g.old_full || '(empty)')}</pre>
+        <div style="color:var(--muted);font-size:10px;margin-bottom:2px">after:</div>
+        <pre style="${preStyle}">${escapeHtml(g.new_full || '(empty)')}</pre>
+      </div>
+    </div>`;
+  });
   const decisions = sec('📋', 'Decisions logged', data.decisions_logged, d =>
     `<div style="padding:2px 0"><span style="color:var(--muted);font-size:10px">[${escapeHtml(d.logged_at || '')}]</span> ${escapeHtml(d.text || '')}</div>`);
   const sprints = sec('✅', 'Sprint items completed', data.sprint_items_completed, s =>
@@ -1748,6 +1774,36 @@ function renderRewind(data) {
     <div style="color:var(--accent);font-weight:600">📊 Tasks: ${byStatus.done || 0} done, ${byStatus.failed || 0} failed, ${byStatus.pending || 0} pending <span style="color:var(--muted);font-size:10px">(${data.tasks_total || 0} total over ${data.period_days}d)</span></div>
   </section>`;
   return versions + goals + decisions + sprints + sessions + summary;
+}
+
+function renderGoalHistory(projectId, history) {
+  if (!history || !history.length) return '';
+  const preStyle = 'margin:0;white-space:pre-wrap;word-break:break-word;background:var(--bg-card);padding:6px;border-radius:3px;font-size:10px;font-family:inherit';
+  const rows = history.map((v, idx) => {
+    const id = `gv-expand-${projectId}-${idx}`;
+    const raw = (v.version_goal || v.north_star || '').replace(/\s+/g, ' ').trim();
+    const snippet = raw.length > 80 ? raw.slice(0, 79) + '…' : raw;
+    return `<div style="border-left:2px solid var(--border);padding-left:8px;margin-bottom:4px">
+      <div style="cursor:pointer;user-select:none" onclick="toggleExpand('${id}')">
+        <span style="color:var(--accent)">v${v.version}</span>
+        <span style="color:var(--muted);font-size:10px"> · ${escapeHtml(v.created_at || '')}</span>
+        <span> ${escapeHtml(snippet)}</span>
+        <span class="expand-arrow" style="color:var(--muted);font-size:9px"> ▶</span>
+      </div>
+      <div id="${id}" style="display:none;margin-top:6px">
+        <div style="color:var(--muted);font-size:10px;margin-bottom:2px">north_star:</div>
+        <pre style="${preStyle};margin-bottom:6px">${escapeHtml(v.north_star || '(empty)')}</pre>
+        <div style="color:var(--muted);font-size:10px;margin-bottom:2px">version_goal:</div>
+        <pre style="${preStyle};margin-bottom:6px">${escapeHtml(v.version_goal || '(empty)')}</pre>
+        <div style="color:var(--muted);font-size:10px;margin-bottom:2px">sprint:</div>
+        <pre style="${preStyle}">${escapeHtml(v.sprint || '(empty)')}</pre>
+      </div>
+    </div>`;
+  });
+  return `<section style="margin-top:14px;padding-top:10px;border-top:1px solid var(--border)">
+    <div style="color:var(--accent);font-weight:600;margin-bottom:6px">📜 Goal version history (${history.length} versions, newest first)</div>
+    ${rows.join('')}
+  </section>`;
 }
 
 async function copyRewindLink(projectId) {

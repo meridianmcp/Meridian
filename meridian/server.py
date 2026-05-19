@@ -627,6 +627,21 @@ async def post_rewind_token(
     return {"token": token, "expires": "never"}
 
 
+@app.get("/projects/{project_id}/goal-history")
+async def get_goal_history(
+    project_id: str, request: Request
+) -> list[dict[str, Any]]:
+    """Return all goal versions for a project, newest first.
+
+    Each entry: version, north_star, version_goal, sprint, created_at.
+    Used by the Rewind tab goal version browser.
+    """
+    project = await db_module.get_project(_db(request), project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="project not found")
+    return await db_module.get_goal_history(_db(request), project_id)
+
+
 # ---------------------------------------------------------------------------
 # Sprint items (v1.1) — checklist alongside the free-text sprint field.
 # ---------------------------------------------------------------------------

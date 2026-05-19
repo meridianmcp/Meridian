@@ -2033,6 +2033,8 @@ async def get_rewind_data(
                         "field": label,
                         "old_summary": _summarize(prev[field_key]),
                         "new_summary": _summarize(current[field_key]),
+                        "old_full": prev[field_key],
+                        "new_full": current[field_key],
                         "changed_at": r["created_at"],
                     })
         prev = current
@@ -2126,6 +2128,31 @@ async def get_rewind_data(
         "tasks_total": tasks_total,
         "tasks_by_status": tasks_by_status,
     }
+
+
+async def get_goal_history(
+    db: aiosqlite.Connection, project_id: str
+) -> list[dict[str, Any]]:
+    """Return all goal versions for a project, newest first.
+
+    Each entry has: version, north_star, version_goal, sprint, created_at.
+    """
+    async with db.execute(
+        "SELECT version, goal_north_star, content, goal_sprint, created_at "
+        "FROM goal_states WHERE project_id = ? ORDER BY version DESC",
+        (project_id,),
+    ) as cur:
+        rows = await cur.fetchall()
+    return [
+        {
+            "version": r["version"],
+            "north_star": r["goal_north_star"] or "",
+            "version_goal": r["content"] or "",
+            "sprint": r["goal_sprint"] or "",
+            "created_at": r["created_at"],
+        }
+        for r in rows
+    ]
 
 
 async def get_or_create_rewind_token(

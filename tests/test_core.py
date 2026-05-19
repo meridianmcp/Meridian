@@ -3732,3 +3732,71 @@ def test_vtab_drawer_always_visible(client):
     assert "translateX(-280px)" not in css, (
         "v1.4.0: vtab-drawer still uses translateX(-280px) for hiding."
     )
+
+
+# ---------------------------------------------------------------------------
+# Rewind tab improvements — expandable goal change rows + goal version browser
+# ---------------------------------------------------------------------------
+
+
+def test_goal_history_endpoint_returns_list(client):
+    """GET /goal-history returns a list of goal versions newest-first."""
+    import uuid
+    proj = client.post("/projects", json={"name": f"gh-{uuid.uuid4().hex[:6]}"}).json()
+    pid = proj["id"]
+    client.post(f"/projects/{pid}/goal", json={"content": "first goal"})
+    client.post(f"/projects/{pid}/goal", json={"content": "second goal"})
+    r = client.get(f"/projects/{pid}/goal-history")
+    assert r.status_code == 200
+    history = r.json()
+    assert isinstance(history, list)
+    assert len(history) >= 2
+    # newest first: version numbers descending
+    versions = [h["version"] for h in history]
+    assert versions == sorted(versions, reverse=True)
+
+
+def test_goal_history_contains_required_fields(client):
+    """Each goal-history entry has version, north_star, version_goal, sprint, created_at."""
+    import uuid
+    proj = client.post("/projects", json={"name": f"gh2-{uuid.uuid4().hex[:6]}"}).json()
+    pid = proj["id"]
+    client.post(f"/projects/{pid}/goal", json={"content": "v1 goal"})
+    r = client.get(f"/projects/{pid}/goal-history")
+    history = r.json()
+    assert len(history) >= 1
+    entry = history[0]
+    for field in ("version", "north_star", "version_goal", "sprint", "created_at"):
+        assert field in entry, f"goal-history entry missing field: {field}"
+
+
+def test_goal_history_404_unknown_project(client):
+    """GET /goal-history returns 404 for unknown project."""
+    r = client.get("/projects/doesnotexist/goal-history")
+    assert r.status_code == 404
+
+
+def test_rewind_goal_changes_include_full_content(client):
+    """goal_changes in rewind response include old_full and new_full fields."""
+    import uuid, time
+    proj = client.post("/projects", json={"name": f"gc-{uuid.uuid4().hex[:6]}"}).json()
+    pid = proj["id"]
+    client.post(f"/projects/{pid}/goal", json={"content": "initial goal content"})
+    time.sleep(0.05)
+    client.post(f"/projects/{pid}/goal", json={"content": "updated goal content"})
+    r = client.get(f"/projects/{pid}/rewind?days=7")
+    assert r.status_code == 200
+    body = r.json()
+    changes = body.get("goal_changes", [])
+    if changes:
+        c = changes[0]
+        assert "old_full" in c, "goal_changes entry missing old_full"
+        assert "new_full" in c, "goal_changes entry missing new_full"
+
+
+def test_dashboard_js_has_goal_history_functions(client):
+    """dashboard.js contains renderGoalHistory and toggleExpand (rewind improvements)."""
+    js = client.get("/static/dashboard.js").text
+    assert "renderGoalHistory" in js, "renderGoalHistory missing from dashboard.js"
+    assert "toggleExpand" in js, "toggleExpand missing from dashboard.js"
+    assert "goal-history" in js, "goal-history API call missing from dashboard.js"
