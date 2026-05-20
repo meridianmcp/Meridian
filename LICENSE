@@ -1,5 +1,5 @@
-Meridian Source License 2.0 (MSL-2.0)
-Based on the Functional Source License with additional terms.
+Meridian Source License 1.0 (MSL-1.0)
+Inspired by the Functional Source License (FSL-1.1).
 
 Copyright (c) 2026 Adam Camerer. All rights reserved.
 
@@ -7,19 +7,28 @@ Copyright (c) 2026 Adam Camerer. All rights reserved.
 PLAIN ENGLISH SUMMARY (not legally binding)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-  FREE:   One developer using Meridian for their own projects — personal
-          or commercial. Including CI/CD pipelines you own and run yourself.
+  FREE:   Any number of people running Meridian locally on their own
+          machines. Teams of any size where each person installs and
+          runs the software themselves. Connecting local instances to
+          a shared hosted database (e.g. Postgres on Neon or Railway)
+          for coordination is explicitly free regardless of team size.
 
-  PAID:   Any shared, team, or multi-human use. Any deployment where more
-          than one person accesses the same Meridian instance. Any use
-          inside an organization as shared infrastructure.
+          Self-hosting the dashboard and MCP server on your own
+          infrastructure for internal use is permitted, provided you
+          do not publish deployment instructions, tooling, or guides
+          that enable others to do the same.
 
-  NEVER:  Offering Meridian itself as a hosted service to third parties,
-          or any product that competes directly with Meridian's commercial
-          offerings, during the Protection Period.
+  PAID:   Offering Meridian or a substantially similar product as a
+          hosted service to third parties. Publishing deployment guides,
+          Docker images, Helm charts, or any tooling that packages
+          Meridian for others to host. Any product that competes
+          directly with Meridian's commercial offerings.
 
-  LATER:  After the Protection Period, this license converts to Apache 2.0.
-          Everything becomes fully open source.
+  NEVER:  The above Paid uses during the Protection Period, without
+          a separate written commercial license.
+
+  LATER:  After the Protection Period, this license converts to
+          AGPL-3.0. Everything becomes fully copyleft open source.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 TERMS AND CONDITIONS
@@ -30,134 +39,145 @@ TERMS AND CONDITIONS
    "Software" means the Meridian source code, binaries, documentation,
    and all associated files distributed under this license.
 
-   "Protection Period" means ten (10) years from the date each version
-   of the Software is first publicly distributed.
+   "Protection Period" means six (6) years from the date each version
+   of the Software is first publicly distributed. Each version carries
+   its own independent Protection Period clock from its own release date.
 
-   "Individual Use" means use by a single natural person for their own
-   projects, whether personal or commercial in nature, where no other
-   person accesses, operates, or benefits from the same running instance
-   of the Software in a shared or coordinated manner.
+   "Local Use" means installation and operation of the Software directly
+   on the physical or virtual machine of each individual user, such that
+   each user runs their own instance. Remote access to a centrally hosted
+   instance does not constitute Local Use, regardless of whether such
+   access is within a private network or organization.
 
-   "Competing Use" means making the Software or any substantially similar
-   derivative available to third parties as a hosted, managed, or
-   cloud-based service, or incorporating the Software into any product
-   whose primary purpose substantially replicates Meridian's commercial
-   offerings.
+   "Internal Self-Hosting" means deploying the Software on infrastructure
+   owned or controlled by you or your organization, accessible only to
+   members of that organization, and where no deployment knowledge,
+   instructions, tooling, or guidance is published or shared outside
+   that organization.
 
-   "Team Use" means any deployment, installation, or operation of the
-   Software where more than one natural person accesses, connects to,
-   or coordinates through the same running instance, regardless of
-   whether such use is commercial or non-commercial in nature.
+   "Competing Use" means any of the following:
+   a) Making the Software or any substantially similar derivative
+      available to third parties as a hosted, managed, or cloud-based
+      service, whether for a fee or free of charge.
+   b) Publishing, distributing, or sharing deployment instructions,
+      Docker images, Helm charts, docker-compose files, or any tooling
+      whose primary purpose is enabling others to host the Software
+      or a derivative thereof.
+   c) Building any product whose primary purpose substantially
+      replicates or replaces Meridian's commercial offerings.
 
-2. INDIVIDUAL USE GRANT (FREE)
+   "Hosted Database" means an external database service (such as
+   PostgreSQL on Neon, Railway, Supabase, or similar providers) used
+   as the data backend for locally-running instances of the Software.
+   A Hosted Database alone does not constitute hosting the Software.
+
+2. USE GRANT (FREE)
 
    During the Protection Period, permission is granted, free of charge,
-   to any individual person to:
+   to any person or organization to:
 
-   a) Use, copy, modify, and run the Software for their own projects,
-      including projects that are commercial in nature, provided such
-      use constitutes Individual Use as defined above.
+   a) Use, copy, modify, and run the Software under Local Use for any
+      purpose, personal or commercial, regardless of team size. There
+      is no seat limit on Local Use.
 
-   b) Run the Software in personal CI/CD pipelines, automated workflows,
-      and build systems, provided such pipelines are owned and operated
-      solely by that individual for their own projects.
+   b) Connect locally-running instances to a shared Hosted Database
+      for team coordination purposes. Using a Hosted Database does not
+      require a commercial license regardless of team size.
 
-   c) Evaluate and experiment with the Software within a commercial
-      organization, provided such evaluation is limited to Individual
-      Use and does not constitute deployment as shared organizational
-      infrastructure.
+   c) Self-host the Software under Internal Self-Hosting, provided
+      such deployment remains strictly internal and no deployment
+      knowledge, tooling, or instructions are published or shared
+      outside the organization.
 
-   d) Distribute unmodified copies of the Software for non-commercial
+   d) Run the Software in local or self-owned CI/CD pipelines and
+      automated workflows for your own projects.
+
+   e) Distribute unmodified copies of the Software for non-commercial
       purposes, provided this license is retained in full.
+
+   f) Use the Software for academic, research, and educational purposes.
 
 3. RESTRICTIONS DURING PROTECTION PERIOD
 
-   The following uses are NOT permitted without a separate written
-   commercial license from the copyright holder:
+   The following are NOT permitted without a separate written commercial
+   license from the copyright holder:
 
-   a) Team Use: Any deployment where more than one person accesses,
-      connects to, or coordinates through the same running instance.
-      This includes but is not limited to: shared internal tooling,
-      team dashboards, organizational infrastructure, and any
-      multi-human coordination use case.
+   a) Competing Use as defined in Section 1, including but not limited
+      to: offering Meridian as a hosted service, publishing deployment
+      tooling or guides, or building competing products.
 
-   b) Competing Use: Offering the Software or any derivative as a
-      hosted, managed, or cloud-based service to third parties. Building
-      any product whose primary purpose substantially replicates or
-      replaces Meridian's commercial offerings.
-
-   c) Organizational Deployment: Installing or operating the Software
-      as shared infrastructure within any company, organization, or
-      group, regardless of whether a fee is charged for access.
-
-   d) Redistribution for commercial gain: Selling, sublicensing, or
+   b) Redistribution for commercial gain: selling, sublicensing, or
       distributing the Software or derivatives as part of any commercial
-      product or service offering.
+      product or service offering intended for third parties.
+
+   c) Removing, altering, or obscuring this license or any copyright
+      notices in the Software.
 
 4. WHAT IS EXPLICITLY NOT RESTRICTED
 
-   For the avoidance of doubt, the following are permitted under the
-   Individual Use Grant above and are NOT restricted by Section 3:
+   For the avoidance of doubt, the following are permitted and are
+   NOT restricted by Section 3:
 
-   a) A solo developer using Meridian to coordinate their own AI agents
-      across their own sessions and projects.
+   a) Any number of developers each running Meridian locally on their
+      own machines, even within the same organization.
 
-   b) A solo developer using Meridian in their own CI/CD pipeline to
-      automate their own build, test, or deployment workflows.
+   b) A team of any size where each member installs and runs the
+      Software locally, all pointing at a shared Hosted Database
+      (e.g. Postgres on Neon or Supabase) for coordination.
 
-   c) A developer evaluating Meridian on their own machine within a
-      commercial organization, provided no other person accesses that
-      instance.
+   c) An organization deploying Meridian on internal infrastructure
+      for internal use only, provided they do not publish or share
+      deployment tooling or instructions externally.
 
-   d) Academic, research, and educational use by individuals.
+   d) Forking and modifying the Software for internal use, provided
+      modifications are not published as a competing product or
+      hosting solution.
+
+   e) A solo developer using Meridian to coordinate AI agents across
+      their own sessions, projects, and CI/CD pipelines.
 
 5. LICENSE CONVERSION
 
    Upon expiration of the Protection Period for a given version, that
-   version of the Software automatically becomes available under the
-   Apache License, Version 2.0 (https://www.apache.org/licenses/LICENSE-2.0),
-   with no further action required by any party. This conversion is
-   irrevocable. Subsequent versions released after that date may carry
-   their own Protection Period under a new MSL-2.0 notice.
+   version automatically becomes available under the GNU Affero General
+   Public License, Version 3.0 (https://www.gnu.org/licenses/agpl-3.0),
+   with no further action required. This conversion is irrevocable.
+   Subsequent versions may carry their own Protection Period under a
+   new MSL-1.0 notice.
 
 6. ATTRIBUTION
 
    Any permitted use, modification, or redistribution must retain this
-   license text, the copyright notice above, and all original attribution
+   license text, the copyright notice, and all original attribution
    intact and unmodified.
 
 7. CONTRIBUTIONS
 
-   By submitting any contribution (code, documentation, or otherwise)
-   to this project, the contributor grants the copyright holder a
-   perpetual, worldwide, royalty-free license to use, modify, and
-   distribute that contribution under any license the copyright holder
-   sees fit, including future versions of this license or commercial
-   licenses. Contributors retain their own copyright.
+   By submitting any contribution to this project, the contributor
+   grants the copyright holder a perpetual, worldwide, royalty-free
+   license to use, modify, and distribute that contribution under any
+   license the copyright holder sees fit, including future versions of
+   this license or commercial licenses. Contributors retain copyright
+   in their own contributions.
 
 8. DISCLAIMER
 
    THIS SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
    EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO WARRANTIES OF
-   MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, AND NON-INFRINGEMENT.
-   IN NO EVENT SHALL THE COPYRIGHT HOLDER BE LIABLE FOR ANY CLAIM,
-   DAMAGES, OR OTHER LIABILITY, WHETHER IN CONTRACT, TORT, OR OTHERWISE,
-   ARISING FROM, OUT OF, OR IN CONNECTION WITH THE SOFTWARE OR THE USE
-   OR OTHER DEALINGS IN THE SOFTWARE.
+   MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, AND
+   NON-INFRINGEMENT. IN NO EVENT SHALL THE COPYRIGHT HOLDER BE LIABLE
+   FOR ANY CLAIM, DAMAGES, OR OTHER LIABILITY, WHETHER IN CONTRACT,
+   TORT, OR OTHERWISE, ARISING FROM, OUT OF, OR IN CONNECTION WITH
+   THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 9. COMMERCIAL LICENSING
 
-   For Team Use, organizational deployment, Competing Use exemptions,
-   OEM licensing, or any use case not permitted under Section 2, contact:
-   [your-email@domain.com]
-
-   Commercial licenses are available and priced based on team size,
-   use case, and deployment scale.
+   For Competing Use exemptions, OEM licensing, or any use case not
+   permitted under Section 2, contact: [your-email@domain.com]
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-This is the Meridian Source License version 2.0 (MSL-2.0).
-It is not an OSI-approved open source license.
-It is inspired by the Functional Source License (FSL) with
-additional terms specific to the Meridian project.
-Protection Period: 10 years from first public distribution of each version.
-Change License: Apache License, Version 2.0.
+Meridian Source License 1.0 (MSL-1.0)
+Not an OSI-approved open source license.
+Inspired by the Functional Source License (FSL-1.1).
+Protection Period: 6 years per version from first public distribution.
+Change License: GNU Affero General Public License v3.0 (AGPL-3.0).
