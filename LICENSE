@@ -28,7 +28,7 @@ PLAIN ENGLISH SUMMARY (not legally binding)
           a separate written commercial license.
 
   LATER:  After the Protection Period, this license converts to
-          AGPL-3.0. Everything becomes fully copyleft open source.
+          GPL-3.0. Everything becomes fully copyleft open source.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 TERMS AND CONDITIONS
@@ -139,8 +139,8 @@ TERMS AND CONDITIONS
 5. LICENSE CONVERSION
 
    Upon expiration of the Protection Period for a given version, that
-   version automatically becomes available under the GNU Affero General
-   Public License, Version 3.0 (https://www.gnu.org/licenses/agpl-3.0),
+   version automatically becomes available under the GNU General Public
+   License, Version 3.0 (https://www.gnu.org/licenses/gpl-3.0),
    with no further action required. This conversion is irrevocable.
    Subsequent versions may carry their own Protection Period under a
    new MSL-1.0 notice.
@@ -180,4 +180,4 @@ Meridian Source License 1.0 (MSL-1.0)
 Not an OSI-approved open source license.
 Inspired by the Functional Source License (FSL-1.1).
 Protection Period: 6 years per version from first public distribution.
-Change License: GNU Affero General Public License v3.0 (AGPL-3.0).
+Change License: GNU General Public License v3.0 (GPL-3.0).
