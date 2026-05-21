@@ -1671,6 +1671,47 @@ async def save_connection(body: dict[str, Any]) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Git remote warning
+# ---------------------------------------------------------------------------
+
+
+@app.get("/admin/git-status")
+async def git_status() -> dict[str, Any]:
+    """v1.9.x — check whether the remote has commits ahead of local HEAD.
+
+    Runs ``git fetch --dry-run`` in the repo root. Non-blocking: uses
+    asyncio subprocess so it won't stall the event loop. Returns
+    ``warning`` (str) when the remote is ahead, ``None`` otherwise.
+    The dashboard polls this every 60 s and shows a yellow banner.
+    """
+    import asyncio
+
+    repo_root = Path(__file__).resolve().parent.parent
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "git", "-C", str(repo_root), "fetch", "--dry-run",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr = await asyncio.wait_for(proc.communicate(), timeout=10)
+        # git fetch --dry-run writes what it *would* fetch to stderr.
+        # Any non-empty output means the remote has new commits.
+        output = (stderr or b"").decode(errors="replace").strip()
+        if proc.returncode != 0 or not output:
+            return {"warning": None, "output": output}
+        # Extract branch name from first line like "   abc123..def456  main -> origin/main"
+        branch = ""
+        for line in output.splitlines():
+            if "->" in line:
+                branch = line.split("->")[-1].strip()
+                break
+        warning = f"Remote updated on {branch} — git pull recommended" if branch else "Remote has new commits — git pull recommended"
+        return {"warning": warning, "output": output}
+    except (OSError, asyncio.TimeoutError):
+        return {"warning": None, "output": ""}
+
+
+# ---------------------------------------------------------------------------
 # MCP server
 # ---------------------------------------------------------------------------
 

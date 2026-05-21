@@ -17,6 +17,10 @@
   <button id="banner-restart-btn" onclick="_doRestart()" style="margin-left:12px;background:none;border:1px solid currentColor;border-radius:3px;color:inherit;cursor:pointer;font-size:11px;padding:1px 8px">&#x27F3; Restart</button>
   <button onclick="document.getElementById('update-banner').style.display='none'" style="margin-left:6px;background:none;border:1px solid currentColor;border-radius:3px;color:inherit;cursor:pointer;font-size:11px;padding:1px 8px">Dismiss</button>
 </div>
+<div id="git-banner" style="display:none;position:fixed;top:0;left:0;right:0;z-index:9999;background:#92400e;color:#fef3c7;padding:8px 16px;font-size:12px;font-family:'IBM Plex Mono',monospace">
+  &#9888; <span id="git-banner-msg">Remote updated — git pull recommended</span>
+  <button onclick="document.getElementById('git-banner').style.display='none'" style="margin-left:12px;background:none;border:1px solid currentColor;border-radius:3px;color:inherit;cursor:pointer;font-size:11px;padding:1px 8px">Dismiss</button>
+</div>
 <button id="sidebar-toggle" title="Toggle sidebar" onclick="document.querySelector('.sidebar').classList.toggle('mobile-open')">☰</button>
 <div class="app">
   <aside class="sidebar">

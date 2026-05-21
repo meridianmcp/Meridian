@@ -1991,6 +1991,21 @@ async function restoreTabs() {
   if (bannerRestartBtn) {
     bannerRestartBtn.onclick = async () => { await _doRestart(); };
   }
+
+  // v1.9.x — git remote warning: poll every 60s, show yellow banner if remote ahead
+  async function _checkGitStatus() {
+    try {
+      const data = await api('/admin/git-status');
+      const banner = document.getElementById('git-banner');
+      const msg = document.getElementById('git-banner-msg');
+      if (banner && data.warning) {
+        if (msg) msg.textContent = data.warning;
+        banner.style.display = 'block';
+      }
+    } catch(_) {}
+  }
+  _checkGitStatus();
+  setInterval(_checkGitStatus, 60000);
 })();
 
 // --- v0.6.6 EZ wizard ---

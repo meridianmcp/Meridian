@@ -4105,3 +4105,39 @@ def test_pg_create_tables_has_sprint_item_group_columns():
     assert "item_group" in sprint_block
     assert "pushed_to" in sprint_block
     assert "human_id" in sprint_block
+
+
+def test_rewind_milestones_tab_label(client):
+    """Rewind Versions subtab is now labelled 'Milestones' in dashboard.js."""
+    js = client.get("/static/dashboard.js").text
+    assert "Milestones" in js
+    assert "📦 Milestones" in js
+
+
+@pytest.mark.asyncio
+async def test_get_tasks_includes_human_id(db):
+    """get_tasks JOIN returns human_id and session_name alongside task fields."""
+    p = await db_module.create_project(db, "tasks-human-test")
+    s = await db_module.register_session(db, p["id"], "test-session", human_id="alice")
+    await db_module.log_task(db, s["id"], p["id"], "did a thing", "done")
+    tasks = await db_module.get_tasks(db, p["id"])
+    assert tasks
+    t = tasks[0]
+    assert t["human_id"] == "alice"
+    assert t["session_name"] == "test-session"
+
+
+def test_git_status_endpoint_returns_shape(client):
+    """GET /admin/git-status returns warning field (may be null or str)."""
+    r = client.get("/admin/git-status")
+    assert r.status_code == 200
+    body = r.json()
+    assert "warning" in body
+    assert body["warning"] is None or isinstance(body["warning"], str)
+
+
+def test_dashboard_html_has_git_banner(client):
+    """dashboard.html includes the git-banner div for remote-ahead warnings."""
+    html = client.get("/dashboard").text
+    assert "git-banner" in html
+    assert "git pull recommended" in html
