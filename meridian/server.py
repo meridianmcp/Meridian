@@ -1539,9 +1539,7 @@ async def admin_restart() -> dict[str, bool]:
         # Spawn a detached helper that will restart after we die
         spawn_script = (
             f"import time, subprocess; time.sleep(2); "
-            f"subprocess.Popen(['pixi', 'run', 'start'], cwd={cwd!r}"
-            + (", creationflags=16" if os.name == "nt" else "")
-            + ")"
+            f"subprocess.Popen(['pixi', 'run', 'start'], cwd={cwd!r})"
         )
         subprocess.Popen(  # noqa: S603
             [sys.executable, "-c", spawn_script],
