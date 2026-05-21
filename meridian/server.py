@@ -1505,6 +1505,8 @@ async def admin_shutdown() -> dict[str, bool]:
 
 @app.post("/admin/restart")
 async def admin_restart() -> dict[str, bool]:
+    import logging
+    logging.getLogger("meridian").warning("=== RESTART ENDPOINT HIT ===")
     """v1.9.x — restart the server by spawning a new process then shutting down.
 
     Spawns ``pixi run start`` (falling back to the current Python interpreter)
