@@ -86,15 +86,18 @@ async def lifespan(app: FastAPI):
     except ImportError:
         pass  # dotenv is optional — env can be set by the launcher.
 
-    db_path = os.environ.get("MERIDIAN_DB", DEFAULT_DB_PATH)
     data_dir = Path(os.environ.get("MERIDIAN_DATA_DIR", str(DEFAULT_DATA_DIR)))
-
-    # In-memory DB skips filesystem setup.
-    if db_path != ":memory:":
-        Path(db_path).parent.mkdir(parents=True, exist_ok=True)
     data_dir.mkdir(parents=True, exist_ok=True)
 
-    db = await db_module.init_db(db_path)
+    db_url = os.environ.get("MERIDIAN_DB_URL")
+    db_path: str | None = None
+    if db_url:
+        db = await db_module.init_db(db_url)
+    else:
+        db_path = os.environ.get("MERIDIAN_DB", DEFAULT_DB_PATH)
+        if db_path != ":memory:":
+            Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+        db = await db_module.init_db(db_path)
     app.state.db = db
     app.state.data_dir = str(data_dir)
     app.state.ws_broadcaster = dashboard_module.WebSocketBroadcaster()
@@ -140,7 +143,7 @@ async def lifespan(app: FastAPI):
 
     # v0.6.3 — GOAL.md startup sync: if the file exists and names a known
     # project, pull its contents into the DB before serving any requests.
-    if db_path != ":memory:":
+    if db_path is None or db_path != ":memory:":
         try:
             await goal_md_module.sync_goal_md_to_db(db)
         except Exception:  # noqa: BLE001
@@ -280,7 +283,11 @@ async def server_config() -> dict[str, Any]:
         "host": host,
         "port": port,
         "version": "1.3.0",
-        "db": "memory" if os.environ.get("MERIDIAN_DB") == ":memory:" else "sqlite",
+        "db": (
+            "postgres" if os.environ.get("MERIDIAN_DB_URL")
+            else "memory" if os.environ.get("MERIDIAN_DB") == ":memory:"
+            else "sqlite"
+        ),
     }
 
 
@@ -1422,14 +1429,24 @@ def build_mcp_server():
 
     async def _ensure_db() -> aiosqlite.Connection:
         if state["db"] is None:
-            db_path = os.environ.get("MERIDIAN_DB", DEFAULT_DB_PATH)
+            try:
+                from dotenv import load_dotenv
+
+                load_dotenv(override=False)
+            except ImportError:
+                pass
             data_dir = Path(
                 os.environ.get("MERIDIAN_DATA_DIR", str(DEFAULT_DATA_DIR))
             )
-            if db_path != ":memory:":
-                Path(db_path).parent.mkdir(parents=True, exist_ok=True)
             data_dir.mkdir(parents=True, exist_ok=True)
-            state["db"] = await db_module.init_db(db_path)
+            db_url = os.environ.get("MERIDIAN_DB_URL")
+            if db_url:
+                state["db"] = await db_module.init_db(db_url)
+            else:
+                db_path = os.environ.get("MERIDIAN_DB", DEFAULT_DB_PATH)
+                if db_path != ":memory:":
+                    Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+                state["db"] = await db_module.init_db(db_path)
             state["data_dir"] = str(data_dir)
         return state["db"]
 

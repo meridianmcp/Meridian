@@ -1,12 +1,13 @@
 """Shared pytest fixtures for Meridian's test suite.
 
-Two fixtures:
+Fixtures:
 
-* ``db`` — an in-memory aiosqlite connection with schema applied. Async,
-  one connection per test.
-* ``client`` — a FastAPI :class:`fastapi.testclient.TestClient` wired up
-  to use an in-memory DB via ``MERIDIAN_DB=:memory:``. Sync, since
-  TestClient is sync.
+* ``db``    — in-memory aiosqlite connection (SQLite, always available).
+* ``db_pg`` — asyncpg-backed PostgresConnection.  Skipped unless
+              ``TEST_DATABASE_URL`` is set in the environment.
+* ``anydb`` — parametrized fixture that yields both ``db`` and ``db_pg``
+              (useful for tests that should pass on both backends).
+* ``client`` — FastAPI TestClient backed by an in-memory SQLite DB.
 """
 
 from __future__ import annotations
@@ -30,11 +31,71 @@ async def db():
         await conn.close()
 
 
+@pytest_asyncio.fixture
+async def db_pg():
+    """Fresh Postgres connection — skipped unless TEST_DATABASE_URL is set."""
+    url = os.environ.get("TEST_DATABASE_URL")
+    if not url:
+        pytest.skip("TEST_DATABASE_URL not set — skipping Postgres test")
+
+    from meridian import db as db_module
+
+    conn = await db_module.init_db(url)
+    # Wipe all tables before each test so tests are isolated.
+    for table in (
+        "chat_messages", "chat_sessions", "sprint_items",
+        "task_log", "sessions", "goal_states", "projects",
+    ):
+        await conn.execute(f"DELETE FROM {table}")
+    await conn.commit()
+    try:
+        yield conn
+    finally:
+        await conn.close()
+
+
+@pytest_asyncio.fixture(params=["sqlite", "postgres"])
+async def anydb(request):
+    """SQLite *or* Postgres DB — parametrized so tests run on both backends.
+
+    The 'postgres' variant is automatically skipped when TEST_DATABASE_URL
+    is not set in the environment, so the suite stays green locally with
+    SQLite only.
+    """
+    from meridian import db as db_module
+
+    if request.param == "sqlite":
+        conn = await db_module.init_db(":memory:")
+        try:
+            yield conn
+        finally:
+            await conn.close()
+    else:
+        url = os.environ.get("TEST_DATABASE_URL")
+        if not url:
+            pytest.skip("TEST_DATABASE_URL not set — skipping Postgres variant")
+        conn = await db_module.init_db(url)
+        for table in (
+            "chat_messages", "chat_sessions", "sprint_items",
+            "task_log", "sessions", "goal_states", "projects",
+        ):
+            await conn.execute(f"DELETE FROM {table}")
+        await conn.commit()
+        try:
+            yield conn
+        finally:
+            await conn.close()
+
+
 @pytest.fixture
 def client(tmp_path, monkeypatch):
     """FastAPI TestClient backed by an in-memory DB and a temp data dir."""
     monkeypatch.setenv("MERIDIAN_DB", ":memory:")
     monkeypatch.setenv("MERIDIAN_DATA_DIR", str(tmp_path))
+    # Block load_dotenv(override=False) from injecting a real MERIDIAN_DB_URL
+    # from a local .env file — the key must already be present so dotenv skips
+    # it. An empty string is falsy, so the lifespan still takes the SQLite path.
+    monkeypatch.setenv("MERIDIAN_DB_URL", "")
     # v0.6.3 — redirect GOAL.md into the same temp dir so test
     # writebacks don't touch the repo's real file.
     monkeypatch.setenv("MERIDIAN_GOAL_MD", str(tmp_path / "GOAL.md"))

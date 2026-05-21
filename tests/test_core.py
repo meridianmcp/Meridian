@@ -1180,6 +1180,7 @@ async def test_claim_task_succeeds_when_unclaimed(db):
     assert claimed is not None
     assert claimed["claimed_by"] == s["id"]
     assert claimed["claimed_at"] is not None
+    assert claimed["status"] == "in_progress"
 
 
 @pytest.mark.asyncio

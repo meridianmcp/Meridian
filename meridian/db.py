@@ -1,8 +1,13 @@
-"""SQLite persistence layer for Meridian.
+"""Persistence layer for Meridian — SQLite (default) or Postgres.
 
-All functions are async and operate on an `aiosqlite.Connection`. IDs are
-uuid4 strings; timestamps are ISO-format strings produced by SQLite's
-`datetime('now')`.
+All functions are async.  The ``db`` parameter accepted by every function is
+either an ``aiosqlite.Connection`` (SQLite path) or a
+``meridian.pg_adapter.PostgresConnection`` (Postgres path, activated when
+``MERIDIAN_DB_URL`` is set).  Both expose the same async cursor API so the
+function bodies are identical for both backends.
+
+IDs are uuid4 strings; timestamps are ISO-format strings produced by
+SQLite's ``datetime('now')`` or the Postgres equivalent in pg_adapter.
 """
 
 from __future__ import annotations
@@ -164,6 +169,23 @@ CREATE INDEX IF NOT EXISTS idx_sprint_items_project
 CREATE INDEX IF NOT EXISTS idx_sprint_items_version
     ON sprint_items(project_id, version);
 """
+
+
+def get_default_human_id() -> str | None:
+    """Return the best available human identifier for the current environment.
+
+    Checks in order: ``MERIDIAN_HUMAN_ID`` env var, ``USER`` (POSIX),
+    ``USERNAME`` (Windows), then the short hostname.  Returns ``None`` only
+    when none of the above are set (very unusual).
+    """
+    import socket
+
+    return (
+        os.environ.get("MERIDIAN_HUMAN_ID")
+        or os.environ.get("USER")
+        or os.environ.get("USERNAME")
+        or (socket.gethostname().split(".")[0][:20] or None)
+    )
 
 
 def _new_id() -> str:
@@ -371,11 +393,25 @@ async def _migrate_goal_hierarchy(db: aiosqlite.Connection) -> None:
 
 
 async def init_db(db_path: str) -> aiosqlite.Connection:
-    """Open the SQLite database, apply schema, and return the connection.
+    """Open the database, apply schema, and return the connection.
 
-    The caller owns the connection and is responsible for closing it.
-    Runs idempotent migrations: legacy DBs are upgraded in place.
+    When ``db_path`` starts with ``postgresql://`` or ``postgres://`` the
+    function opens an asyncpg pool and returns a
+    :class:`~meridian.pg_adapter.PostgresConnection` instead of an
+    aiosqlite connection.  Both expose the same async cursor API so all
+    callers are unaffected.
+
+    For Postgres, only ``CREATE TABLE IF NOT EXISTS`` is run — migration
+    helpers are skipped because a fresh Postgres DB already has the full
+    current schema.
+
+    The caller owns the returned connection and is responsible for closing it.
     """
+    if db_path.startswith(("postgresql://", "postgres://")):
+        from .pg_adapter import init_pg_db  # local import keeps SQLite path fast
+
+        return await init_pg_db(db_path)  # type: ignore[return-value]
+
     db = await aiosqlite.connect(db_path)
     db.row_factory = aiosqlite.Row
     await db.execute("PRAGMA journal_mode = WAL")   # concurrent read+write
@@ -1227,7 +1263,8 @@ async def claim_task(
     only see one of them flip ``claimed_by`` from NULL.
     """
     cursor = await db.execute(
-        "UPDATE task_log SET claimed_by = ?, claimed_at = datetime('now') "
+        "UPDATE task_log SET claimed_by = ?, claimed_at = datetime('now'), "
+        "status = 'in_progress' "
         "WHERE id = ? AND claimed_by IS NULL AND status = 'pending'",
         (session_id, task_id),
     )
