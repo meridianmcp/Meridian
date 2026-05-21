@@ -816,6 +816,19 @@ async def fail_sprint_item_endpoint(
     return item
 
 
+@app.delete("/projects/{project_id}/sprint-items/{item_id}", status_code=204)
+async def delete_sprint_item_endpoint(
+    project_id: str, item_id: str, request: Request
+) -> None:
+    """Delete a sprint item permanently."""
+    db = _db(request)
+    await db.execute(
+        "DELETE FROM sprint_items WHERE id = ? AND project_id = ?",
+        (item_id, project_id),
+    )
+    await db.commit()
+
+
 @app.post("/projects/{project_id}/sprint-items/{item_id}/push")
 async def push_sprint_item_endpoint(
     project_id: str, item_id: str, body: dict[str, Any], request: Request

@@ -734,7 +734,7 @@ function buildTabBody(project) {
         return `<div style="display:flex;align-items:flex-start;gap:6px;padding:4px 0;border-bottom:1px solid var(--border)">
           <span style="font-size:10px;${strike}color:${color};flex:1;word-break:break-word">${escapeHtml(it.title)}</span>
           ${!done ? `<button onclick="_sprintAction('${project.id}','${it.id}','complete')" title="Done" style="background:none;border:1px solid var(--status-done);color:var(--status-done);border-radius:3px;cursor:pointer;font-size:10px;padding:1px 5px">✓</button>
-          <button onclick="_sprintAction('${project.id}','${it.id}','fail')" title="Fail" style="background:none;border:1px solid var(--status-failed);color:var(--status-failed);border-radius:3px;cursor:pointer;font-size:10px;padding:1px 5px">✗</button>` : ''}
+          <button onclick="_deleteSprintItem('${project.id}','${it.id}')" title="Delete" style="background:none;border:1px solid var(--status-failed);color:var(--status-failed);border-radius:3px;cursor:pointer;font-size:10px;padding:1px 5px">✗</button>` : ''}
         </div>`;
       }).join('');
     } catch(e) { console.error('Sprint board load failed:', e); }
@@ -2211,6 +2211,14 @@ async function restoreTabs() {
 })();
 
 const _sprintBoardReloaders = {};
+
+async function _deleteSprintItem(projectId, itemId) {
+  if (!confirm('Remove this sprint item?')) return;
+  try {
+    await api(`/projects/${projectId}/sprint-items/${itemId}`, { method: 'DELETE' });
+    if (_sprintBoardReloaders[projectId]) _sprintBoardReloaders[projectId]();
+  } catch(e) { console.error('Delete sprint item failed:', e); }
+}
 
 async function _sprintAction(projectId, itemId, action) {
   try {
