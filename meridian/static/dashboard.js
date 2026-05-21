@@ -730,12 +730,13 @@ function buildTabBody(project) {
         const strike = done ? 'text-decoration:line-through;opacity:0.5;' : '';
         return `<div style="display:flex;align-items:flex-start;gap:6px;padding:4px 0;border-bottom:1px solid var(--border)">
           <span style="font-size:10px;${strike}color:${color};flex:1;word-break:break-word">${escapeHtml(it.title)}</span>
-          ${!done ? `<button onclick="completeSprintItem('${project.id}','${it.id}',loadSprintBoard)" title="Done" style="background:none;border:1px solid var(--status-done);color:var(--status-done);border-radius:3px;cursor:pointer;font-size:10px;padding:1px 5px">✓</button>
-          <button onclick="failSprintItem('${project.id}','${it.id}',loadSprintBoard)" title="Fail" style="background:none;border:1px solid var(--status-failed);color:var(--status-failed);border-radius:3px;cursor:pointer;font-size:10px;padding:1px 5px">✗</button>` : ''}
+          ${!done ? `<button onclick="_sprintAction('${project.id}','${it.id}','complete')" title="Done" style="background:none;border:1px solid var(--status-done);color:var(--status-done);border-radius:3px;cursor:pointer;font-size:10px;padding:1px 5px">✓</button>
+          <button onclick="_sprintAction('${project.id}','${it.id}','fail')" title="Fail" style="background:none;border:1px solid var(--status-failed);color:var(--status-failed);border-radius:3px;cursor:pointer;font-size:10px;padding:1px 5px">✗</button>` : ''}
         </div>`;
       }).join('');
     } catch(e) { console.error('Sprint board load failed:', e); }
   }
+  _sprintBoardReloaders[project.id] = loadSprintBoard;
   loadSprintBoard();
 
   const sprintAddBtn = document.getElementById(`sprint-add-btn-${project.id}`);
@@ -2202,17 +2203,26 @@ async function restoreTabs() {
   setInterval(_checkGitStatus, 60000);
 })();
 
-async function completeSprintItem(projectId, itemId, cb) {
+const _sprintBoardReloaders = {};
+
+async function _sprintAction(projectId, itemId, action) {
+  try {
+    await api(`/projects/${projectId}/sprint-items/${itemId}/${action}`, { method: 'POST' });
+    if (_sprintBoardReloaders[projectId]) _sprintBoardReloaders[projectId]();
+  } catch(e) { console.error('Sprint action failed:', action, e); }
+}
+
+async function completeSprintItem(projectId, itemId) {
   try {
     await api(`/projects/${projectId}/sprint-items/${itemId}/complete`, { method: 'POST' });
-    if (cb) cb();
+    if (_sprintBoardReloaders[projectId]) _sprintBoardReloaders[projectId]();
   } catch(e) { console.error('Complete sprint item failed:', e); }
 }
 
-async function failSprintItem(projectId, itemId, cb) {
+async function failSprintItem(projectId, itemId) {
   try {
     await api(`/projects/${projectId}/sprint-items/${itemId}/fail`, { method: 'POST' });
-    if (cb) cb();
+    if (_sprintBoardReloaders[projectId]) _sprintBoardReloaders[projectId]();
   } catch(e) { console.error('Fail sprint item failed:', e); }
 }
 
@@ -2432,20 +2442,7 @@ function renderRewindActivity(projectId, data) {
 function renderRewindVersions(projectId, data) {
   /** Versions subtab: milestones shipped + sprint items completed + stats. */
   const versions = _rewindSec('📦', 'Milestones shipped', data.versions_shipped,
-    (v, idx) => {
-      const id = `ms-${Math.random().toString(36).slice(2)}`;
-      const preview = escapeHtml(v.slice(0, 80)) + (v.length > 80 ? '…' : '');
-      return `<div style="padding:3px 0;border-bottom:1px solid var(--border);cursor:pointer" onclick="
-        var b=document.getElementById('${id}');
-        var a=this.querySelector('.ms-arrow');
-        if(b.style.display==='none'){b.style.display='block';a.textContent='▼';}
-        else{b.style.display='none';a.textContent='▶';}
-      ">
-        <span class="ms-arrow" style="color:var(--muted);font-size:9px;margin-right:4px">▶</span>
-        <span style="font-size:10px">${preview}</span>
-        <div id="${id}" style="display:none;margin-top:4px;font-size:10px;color:var(--muted);white-space:pre-wrap;word-break:break-word;line-height:1.4;padding:4px 0 2px 14px">${escapeHtml(v)}</div>
-      </div>`;
-    });
+    v => `<div style="padding:3px 0;border-bottom:1px solid var(--border);font-size:10px;white-space:normal;word-break:break-word;line-height:1.5">${escapeHtml(v)}</div>`);
   const sprints = _rewindSec('✅', 'Sprint items completed', data.sprint_items_completed, s =>
     `<div style="padding:2px 0"><span style="color:var(--accent-green)">${escapeHtml(s.version || '')}</span> — ${escapeHtml(s.title || '')} <span style="color:var(--muted);font-size:10px">${escapeHtml(s.completed_at || '')}</span></div>`);
   const byStatus = data.tasks_by_status || {};
