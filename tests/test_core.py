@@ -4081,7 +4081,7 @@ def test_delete_project_in_progress_guard(client):
         "description": "running", "status": "pending",
     }).json()
     client.post(f"/projects/{p['id']}/tasks/claim",
-                json={"session_id": s["id"], "session_name": "s1"})
+                json={"task_id": t["id"], "session_id": s["id"]})
     r = client.delete(f"/projects/{p['id']}")
     assert r.status_code == 409, f"expected 409, got {r.status_code}: {r.text}"
 
