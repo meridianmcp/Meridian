@@ -4093,3 +4093,15 @@ def test_dashboard_js_has_project_mgmt(client):
     assert "_deleteProject" in js
     assert "_openTabMenu" in js
     assert "project_renamed" in js
+
+
+def test_pg_create_tables_has_sprint_item_group_columns():
+    """CREATE_TABLES_PG sprint_items must include item_group/pushed_to/human_id."""
+    from meridian.pg_adapter import CREATE_TABLES_PG
+
+    sprint_block_start = CREATE_TABLES_PG.index("sprint_items")
+    sprint_block_end = CREATE_TABLES_PG.index(";", sprint_block_start)
+    sprint_block = CREATE_TABLES_PG[sprint_block_start:sprint_block_end]
+    assert "item_group" in sprint_block
+    assert "pushed_to" in sprint_block
+    assert "human_id" in sprint_block

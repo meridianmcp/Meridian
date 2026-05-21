@@ -361,6 +361,9 @@ CREATE TABLE IF NOT EXISTS sprint_items (
     version TEXT NOT NULL,
     title TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'pending',
+    item_group TEXT,
+    pushed_to TEXT,
+    human_id TEXT,
     added_at TEXT NOT NULL DEFAULT (to_char(now() at time zone 'utc', 'YYYY-MM-DD HH24:MI:SS')),
     completed_at TEXT,
     task_id TEXT,
@@ -404,4 +407,21 @@ async def init_pg_db(url: str) -> PostgresConnection:
     pool = await asyncpg.create_pool(url, min_size=1, max_size=10)
     conn = PostgresConnection(pool)
     await conn.executescript(CREATE_TABLES_PG)
+    await _migrate_pg_sprint_items_v2(pool)
     return conn
+
+
+async def _migrate_pg_sprint_items_v2(pool: Any) -> None:
+    """Add item_group/pushed_to/human_id to sprint_items if missing.
+
+    ADD COLUMN IF NOT EXISTS is idempotent — safe to run on every startup.
+    """
+    async with pool.acquire() as conn:
+        for col, decl in [
+            ("item_group", "TEXT"),
+            ("pushed_to", "TEXT"),
+            ("human_id", "TEXT"),
+        ]:
+            await conn.execute(
+                f"ALTER TABLE sprint_items ADD COLUMN IF NOT EXISTS {col} {decl}"
+            )
