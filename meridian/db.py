@@ -606,6 +606,59 @@ async def list_projects(db: aiosqlite.Connection) -> list[dict[str, Any]]:
     return [_row_to_dict(r) for r in rows]  # type: ignore[misc]
 
 
+async def rename_project(
+    db: aiosqlite.Connection, project_id: str, new_name: str
+) -> dict[str, Any] | None:
+    """Rename a project. Returns the updated project dict or None if not found."""
+    await db.execute(
+        "UPDATE projects SET name = ? WHERE id = ?",
+        (new_name, project_id),
+    )
+    await db.commit()
+    return await get_project(db, project_id)
+
+
+async def delete_project(db: aiosqlite.Connection, project_id: str) -> None:
+    """Delete a project and all associated data.
+
+    Raises ``ValueError`` if any tasks are currently ``in_progress`` so
+    callers can surface a warning before proceeding.  The delete is
+    unconditional for all other data (goal_states, sessions, task_log,
+    sprint_items, chat sessions/messages).
+    """
+    async with db.execute(
+        "SELECT COUNT(*) as cnt FROM task_log "
+        "WHERE project_id = ? AND status = 'in_progress'",
+        (project_id,),
+    ) as cur:
+        row = await cur.fetchone()
+        count = int((row or [0])[0])
+    if count:
+        raise ValueError(f"{count} task(s) in_progress — complete or cancel first")
+
+    # Cascade delete child rows first, then the project itself.
+    # chat_messages has no project_id — delete via chat_sessions FK.
+    for stmt, params in [
+        (
+            "DELETE FROM chat_messages WHERE session_id IN "
+            "(SELECT id FROM chat_sessions WHERE project_id = ?)",
+            (project_id,),
+        ),
+        ("DELETE FROM chat_sessions WHERE project_id = ?", (project_id,)),
+        ("DELETE FROM sprint_items WHERE project_id = ?", (project_id,)),
+        ("DELETE FROM task_log WHERE project_id = ?", (project_id,)),
+        ("DELETE FROM sessions WHERE project_id = ?", (project_id,)),
+        ("DELETE FROM sessions_archived WHERE project_id = ?", (project_id,)),
+        ("DELETE FROM goal_states WHERE project_id = ?", (project_id,)),
+        ("DELETE FROM projects WHERE id = ?", (project_id,)),  # projects uses 'id'
+    ]:
+        try:
+            await db.execute(stmt, params)
+        except Exception:  # noqa: BLE001 — table may not exist in older schemas
+            pass
+    await db.commit()
+
+
 def build_goal_xml(
     goal: dict[str, Any] | None,
     project_name: str,

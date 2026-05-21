@@ -371,6 +371,42 @@ async def get_project(project_id: str, request: Request) -> dict[str, Any]:
     return project
 
 
+@app.post("/projects/{project_id}/rename")
+async def rename_project(
+    project_id: str, body: dict[str, Any], request: Request
+) -> dict[str, Any]:
+    """v1.9.x — rename a project.  Broadcasts project_renamed WS event."""
+    new_name = str(body.get("name") or "").strip()
+    if not new_name:
+        raise HTTPException(400, "name is required")
+    project = await db_module.get_project(_db(request), project_id)
+    if project is None:
+        raise HTTPException(404, "project not found")
+    existing = await db_module.get_project_by_name(_db(request), new_name)
+    if existing and existing["id"] != project_id:
+        raise HTTPException(409, f"project '{new_name}' already exists")
+    updated = await db_module.rename_project(_db(request), project_id, new_name)
+    db_module.publish_global(
+        {"type": "project_renamed", "project_id": project_id, "name": new_name}
+    )
+    return updated
+
+
+@app.delete("/projects/{project_id}", status_code=204)
+async def delete_project(project_id: str, request: Request) -> None:
+    """v1.9.x — delete a project and all data.
+
+    Returns 409 if any tasks are in_progress, 404 if the project is unknown.
+    """
+    project = await db_module.get_project(_db(request), project_id)
+    if project is None:
+        raise HTTPException(404, "project not found")
+    try:
+        await db_module.delete_project(_db(request), project_id)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
 @app.get("/projects/{project_id}/goal", response_model=GoalState)
 async def get_goal(project_id: str, request: Request) -> dict[str, Any]:
     """Read the latest goal state plus ambient task context.

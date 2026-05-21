@@ -4028,3 +4028,68 @@ def test_dashboard_js_has_restart_logic(client):
     assert "_doRestart" in js, "_doRestart missing from dashboard.js"
     assert "_updateConnectionIndicator" in js, "_updateConnectionIndicator missing"
     assert "/admin/restart" in js, "/admin/restart not referenced in dashboard.js"
+
+
+# ---------------------------------------------------------------------------
+# v1.9.x — project rename / delete
+# ---------------------------------------------------------------------------
+
+def test_rename_project(client):
+    """POST /projects/{id}/rename updates the project name."""
+    import uuid as _uuid
+    p = client.post("/projects", json={"name": f"rename-test-{_uuid.uuid4().hex[:6]}"}).json()
+    r = client.post(f"/projects/{p['id']}/rename", json={"name": "new-name-xyz"})
+    assert r.status_code == 200
+    assert r.json()["name"] == "new-name-xyz"
+    assert client.get(f"/projects/{p['id']}").json()["name"] == "new-name-xyz"
+
+
+def test_rename_project_conflict(client):
+    """Renaming to an existing name returns 409."""
+    import uuid as _uuid
+    a = client.post("/projects", json={"name": f"rn-a-{_uuid.uuid4().hex[:6]}"}).json()
+    b = client.post("/projects", json={"name": f"rn-b-{_uuid.uuid4().hex[:6]}"}).json()
+    r = client.post(f"/projects/{a['id']}/rename", json={"name": b["name"]})
+    assert r.status_code == 409
+
+
+def test_rename_project_missing_name(client):
+    """Renaming with an empty name returns 400."""
+    import uuid as _uuid
+    p = client.post("/projects", json={"name": f"rn-empty-{_uuid.uuid4().hex[:6]}"}).json()
+    assert client.post(f"/projects/{p['id']}/rename", json={"name": ""}).status_code == 400
+    assert client.post(f"/projects/{p['id']}/rename", json={}).status_code == 400
+
+
+def test_delete_project(client):
+    """DELETE /projects/{id} removes the project and returns 204."""
+    import uuid as _uuid
+    p = client.post("/projects", json={"name": f"del-{_uuid.uuid4().hex[:6]}"}).json()
+    r = client.delete(f"/projects/{p['id']}")
+    assert r.status_code == 204
+    assert client.get(f"/projects/{p['id']}").status_code == 404
+
+
+def test_delete_project_in_progress_guard(client):
+    """DELETE returns 409 when in_progress tasks exist."""
+    import uuid as _uuid
+    p = client.post("/projects", json={"name": f"del-guard-{_uuid.uuid4().hex[:6]}"}).json()
+    s = client.post("/sessions/register", json={"project_id": p["id"], "name": "s1"}).json()
+    # Create a pending task then claim it → in_progress
+    t = client.post("/tasks", json={
+        "session_id": s["id"], "project_id": p["id"],
+        "description": "running", "status": "pending",
+    }).json()
+    client.post(f"/projects/{p['id']}/tasks/claim",
+                json={"session_id": s["id"], "session_name": "s1"})
+    r = client.delete(f"/projects/{p['id']}")
+    assert r.status_code == 409, f"expected 409, got {r.status_code}: {r.text}"
+
+
+def test_dashboard_js_has_project_mgmt(client):
+    """dashboard.js has rename/delete helpers and kebab menu logic."""
+    js = client.get("/static/dashboard.js").text
+    assert "_renameProject" in js
+    assert "_deleteProject" in js
+    assert "_openTabMenu" in js
+    assert "project_renamed" in js

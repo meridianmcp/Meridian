@@ -131,28 +131,18 @@ async function loadProjects() {
     div.onclick = () => openTab(p);
     list.appendChild(div);
   });
-  // Mirror the same list into the top-of-sidebar dropdown so users can
-  // switch the active project from one place. Selection drives the
-  // single-active concept; the multi-tab UI still works on top.
+  // v1.9.x — hide the legacy dropdown; keep element for switcher.value compat.
   const switcher = document.getElementById('project-switcher');
   if (switcher) {
+    switcher.style.display = 'none';
     const previous = switcher.value;
     switcher.innerHTML = '';
-    const placeholder = document.createElement('option');
-    placeholder.value = '';
-    placeholder.textContent = state.projects.length
-      ? '— switch project —'
-      : '(no projects yet)';
-    switcher.appendChild(placeholder);
     state.projects.forEach(p => {
       const opt = document.createElement('option');
-      opt.value = p.id;
-      opt.textContent = p.name;
+      opt.value = p.id; opt.textContent = p.name;
       switcher.appendChild(opt);
     });
-    if (previous && state.projects.some(p => p.id === previous)) {
-      switcher.value = previous;
-    }
+    if (previous && state.projects.some(p => p.id === previous)) switcher.value = previous;
   }
 }
 
@@ -211,21 +201,140 @@ function saveTabs() {
   } catch(e) {}
 }
 
+const TAB_OVERFLOW_THRESHOLD = 10;
+
 function renderTabs() {
   const bar = document.getElementById('tabs');
   bar.innerHTML = '';
-  state.tabs.forEach(t => {
-    const div = document.createElement('div');
-    div.className = 'tab' + (state.activeTab === t.id ? ' active' : '');
-    div.innerHTML = `<span>${escapeHtml(t.project.name)}</span>`;
-    div.onclick = () => activateTab(t.id);
-    const close = document.createElement('button');
-    close.className = 'close';
-    close.textContent = '×';
-    close.onclick = (e) => { e.stopPropagation(); closeTab(t.id); };
-    div.appendChild(close);
-    bar.appendChild(div);
-  });
+
+  // v1.9.x — overflow: show first (N-1) tabs + ">>" button if 10+
+  const overflow = state.tabs.length >= TAB_OVERFLOW_THRESHOLD;
+  const visible = overflow ? state.tabs.slice(0, TAB_OVERFLOW_THRESHOLD - 1) : state.tabs;
+  const hidden  = overflow ? state.tabs.slice(TAB_OVERFLOW_THRESHOLD - 1) : [];
+
+  visible.forEach(t => bar.appendChild(_makeTabEl(t)));
+
+  if (overflow) {
+    const more = document.createElement('div');
+    more.className = 'tab tab-overflow';
+    more.textContent = `>> ${hidden.length} more`;
+    more.title = hidden.map(t => t.project.name).join(', ');
+    // Click opens a small dropdown of hidden tabs.
+    more.onclick = (e) => {
+      e.stopPropagation();
+      let menu = document.getElementById('tab-overflow-menu');
+      if (menu) { menu.remove(); return; }
+      menu = document.createElement('div');
+      menu.id = 'tab-overflow-menu';
+      menu.style.cssText = 'position:fixed;background:var(--surface-2);border:1px solid var(--border);border-radius:4px;z-index:1000;min-width:160px;box-shadow:0 4px 12px rgba(0,0,0,0.4)';
+      const rect = more.getBoundingClientRect();
+      menu.style.top = (rect.bottom + 4) + 'px';
+      menu.style.left = rect.left + 'px';
+      hidden.forEach(t => {
+        const item = document.createElement('div');
+        item.style.cssText = 'padding:8px 12px;cursor:pointer;font-size:11px;font-family:var(--font-mono)';
+        item.textContent = t.project.name;
+        item.onmouseenter = () => item.style.background = 'var(--surface-1)';
+        item.onmouseleave = () => item.style.background = '';
+        item.onclick = () => { menu.remove(); activateTab(t.id); };
+        menu.appendChild(item);
+      });
+      document.body.appendChild(menu);
+      const close = () => { menu.remove(); document.removeEventListener('click', close); };
+      setTimeout(() => document.addEventListener('click', close), 0);
+    };
+    bar.appendChild(more);
+  }
+}
+
+function _makeTabEl(t) {
+  const div = document.createElement('div');
+  div.className = 'tab' + (state.activeTab === t.id ? ' active' : '');
+  div.dataset.tabId = t.id;
+  div.onclick = () => activateTab(t.id);
+
+  const nameSpan = document.createElement('span');
+  nameSpan.textContent = t.project.name;
+  div.appendChild(nameSpan);
+
+  // v1.9.x — kebab ⋯ menu
+  const kebab = document.createElement('button');
+  kebab.className = 'tab-kebab';
+  kebab.textContent = '⋯';
+  kebab.title = 'Project actions';
+  kebab.onclick = (e) => { e.stopPropagation(); _openTabMenu(t, kebab); };
+  div.appendChild(kebab);
+
+  const close = document.createElement('button');
+  close.className = 'close';
+  close.textContent = '×';
+  close.onclick = (e) => { e.stopPropagation(); closeTab(t.id); };
+  div.appendChild(close);
+
+  return div;
+}
+
+function _openTabMenu(t, anchor) {
+  // Close any existing menu.
+  document.querySelectorAll('.tab-context-menu').forEach(m => m.remove());
+
+  const menu = document.createElement('div');
+  menu.className = 'tab-context-menu';
+  menu.style.cssText = 'position:fixed;background:var(--surface-2);border:1px solid var(--border);border-radius:4px;z-index:1001;min-width:150px;box-shadow:0 4px 12px rgba(0,0,0,0.4);font-size:11px;font-family:var(--font-mono)';
+
+  function menuItem(label, fn) {
+    const item = document.createElement('div');
+    item.style.cssText = 'padding:8px 12px;cursor:pointer';
+    item.textContent = label;
+    item.onmouseenter = () => item.style.background = 'var(--surface-1)';
+    item.onmouseleave = () => item.style.background = '';
+    item.onclick = () => { menu.remove(); fn(); };
+    menu.appendChild(item);
+  }
+
+  menuItem('✏ Rename', () => _renameProject(t));
+  menuItem('💾 Download snapshot', () => window.open('/admin/snapshot?project=' + t.id, '_blank'));
+  menuItem('🗑 Delete project…', () => _deleteProject(t));
+
+  const rect = anchor.getBoundingClientRect();
+  menu.style.top = (rect.bottom + 4) + 'px';
+  menu.style.left = rect.left + 'px';
+  document.body.appendChild(menu);
+  const dismiss = () => { menu.remove(); document.removeEventListener('click', dismiss); };
+  setTimeout(() => document.addEventListener('click', dismiss), 0);
+}
+
+async function _renameProject(t) {
+  const newName = window.prompt(`Rename "${t.project.name}" to:`, t.project.name);
+  if (!newName || newName.trim() === t.project.name) return;
+  try {
+    const updated = await api(`/projects/${t.id}/rename`, {
+      method: 'POST', body: JSON.stringify({ name: newName.trim() }),
+    });
+    t.project = { ...t.project, name: updated.name };
+    // Update body header if open.
+    const hdr = document.querySelector(`#drawer-status-${t.id} .drawer-header span:first-child`);
+    if (hdr) hdr.textContent = 'STATUS · ' + updated.name;
+    renderTabs();
+    toast('Renamed to ' + updated.name);
+  } catch(e) { toast('Rename failed: ' + e.message, true); }
+}
+
+async function _deleteProject(t) {
+  const confirmed = window.confirm(
+    `Delete "${t.project.name}"?\n\nThis will permanently delete all sessions, tasks, and goal history. Cannot be undone.`
+  );
+  if (!confirmed) return;
+  try {
+    await api(`/projects/${t.id}`, { method: 'DELETE' });
+    closeTab(t.id);
+    state.projects = state.projects.filter(p => p.id !== t.id);
+    await loadProjects();
+    toast('Project deleted');
+  } catch(e) {
+    // 409 = in_progress tasks
+    toast(e.message.includes('409') ? e.message : 'Delete failed: ' + e.message, true);
+  }
 }
 
 function activateTab(id) {
@@ -1658,6 +1767,19 @@ function handleWsEvent(projectId, event) {
   if (event.type === 'update_available') {
     const banner = document.getElementById('update-banner');
     if (banner) banner.style.display = 'block';
+    return;
+  }
+  // v1.9.x — sync tab label and project state on rename from any session.
+  if (event.type === 'project_renamed') {
+    const tab = state.tabs.find(t => t.id === event.project_id);
+    if (tab) {
+      tab.project = { ...tab.project, name: event.name };
+      const hdr = document.querySelector(`#drawer-status-${event.project_id} .drawer-header span:first-child`);
+      if (hdr) hdr.textContent = 'STATUS · ' + event.name;
+      renderTabs();
+    }
+    const proj = state.projects.find(p => p.id === event.project_id);
+    if (proj) { proj.name = event.name; loadProjects(); }
     return;
   }
   const cache = state.panels[projectId].taskCache;

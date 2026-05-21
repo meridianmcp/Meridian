@@ -102,6 +102,14 @@ html, body {
   cursor: pointer; padding: 0 2px; font-size: 14px;
 }
 .tab .close:hover { color: var(--status-failed); }
+.tab-kebab {
+  color: var(--muted); border: none; background: transparent;
+  cursor: pointer; padding: 0 2px; font-size: 13px; opacity: 0;
+  transition: opacity 0.15s; font-family: inherit;
+}
+.tab:hover .tab-kebab, .tab.active .tab-kebab { opacity: 1; }
+.tab-kebab:hover { color: var(--text); }
+.tab-overflow { color: var(--accent); font-size: 11px; }
 .tab-bodies { flex: 1; overflow: hidden; position: relative; }
 .tab-body {
   position: absolute; inset: 0;
