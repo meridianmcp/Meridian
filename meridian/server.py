@@ -1516,20 +1516,38 @@ async def admin_restart() -> dict[str, bool]:
     import sys
 
     async def _delayed_restart() -> None:
-        await asyncio.sleep(0.3)
+        await asyncio.sleep(0.5)
+        # Kill self first so the port is freed before new process starts
         cwd = str(Path(__file__).parent.parent)
-        try:
-            kwargs: dict[str, Any] = {"cwd": cwd}
-            if os.name == "nt":
-                kwargs["creationflags"] = subprocess.CREATE_NEW_CONSOLE  # type: ignore[attr-defined]
-            subprocess.Popen(["pixi", "run", "start"], **kwargs)  # noqa: S603
-        except FileNotFoundError:
-            subprocess.Popen(  # noqa: S603
-                [sys.executable, "-m", "meridian"],
-                cwd=cwd,
-                env={**os.environ},
-            )
-        await asyncio.sleep(3.0)
+
+        async def _spawn_after_death() -> None:
+            # Wait for port to free up then spawn new process
+            import time
+            time.sleep(2.0)
+            try:
+                kwargs: dict[str, Any] = {"cwd": cwd}
+                if os.name == "nt":
+                    kwargs["creationflags"] = subprocess.CREATE_NEW_CONSOLE  # type: ignore[attr-defined]
+                subprocess.Popen(["pixi", "run", "start"], **kwargs)  # noqa: S603
+            except FileNotFoundError:
+                subprocess.Popen(  # noqa: S603
+                    [sys.executable, "-m", "meridian"],
+                    cwd=cwd,
+                    env={**os.environ},
+                )
+
+        # Spawn a detached helper that will restart after we die
+        spawn_script = (
+            f"import time, subprocess; time.sleep(2); "
+            f"subprocess.Popen(['pixi', 'run', 'start'], cwd={cwd!r}"
+            + (", creationflags=16" if os.name == "nt" else "")
+            + ")"
+        )
+        subprocess.Popen(  # noqa: S603
+            [sys.executable, "-c", spawn_script],
+            cwd=cwd,
+        )
+        await asyncio.sleep(0.5)
         os.kill(os.getpid(), signal.SIGINT)
 
     asyncio.create_task(_delayed_restart())
