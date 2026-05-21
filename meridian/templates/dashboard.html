@@ -61,7 +61,7 @@
 <!-- v1.9.x connection setup modal (shown when no meridian.toml exists) -->
 <div id="conn-setup-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.7);z-index:9998;align-items:center;justify-content:center">
   <div style="background:var(--surface-2);border:1px solid var(--border);border-radius:8px;padding:28px 32px;width:100%;max-width:420px;font-family:'IBM Plex Mono',monospace">
-    <div style="font-size:13px;font-weight:600;color:var(--accent);margin-bottom:8px">Database Setup</div>
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px"><div style="font-size:13px;font-weight:600;color:var(--accent)">Database Setup</div><button onclick="document.getElementById('conn-setup-modal').style.display='none'" style="background:none;border:none;color:var(--muted);cursor:pointer;font-size:16px;line-height:1;padding:0 2px" title="Close (Esc)">&times;</button></div>
     <div style="font-size:11px;color:var(--muted);margin-bottom:18px">Choose where Meridian stores your data. You can change this later.</div>
     <div style="display:flex;flex-direction:column;gap:10px">
       <button id="conn-local-btn" class="primary" style="padding:12px;font-size:12px;text-align:left">&#x1F4BE; Local SQLite (recommended)<br><span style="font-size:10px;color:rgba(255,255,255,0.7);font-weight:400">Stores data in data/meridian.db — no setup needed</span></button>

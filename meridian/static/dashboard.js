@@ -2164,6 +2164,14 @@ document.getElementById('ez-advanced-link').onclick = (e) => {
   function showErr(msg) { if (errEl) { errEl.textContent = msg; errEl.style.display = msg ? 'block' : 'none'; } }
 
   // Show if server config has no toml — checked in init() after loadServerConfig
+  // Escape closes the modal
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') {
+      const m = document.getElementById('conn-setup-modal');
+      if (m && m.style.display !== 'none') m.style.display = 'none';
+    }
+  });
+
   window._showConnSetupIfNeeded = (cfg) => {
     if (!cfg?.toml_exists && cfg?.db !== 'postgres') modal.style.display = 'flex';
   };
