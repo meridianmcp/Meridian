@@ -2233,13 +2233,13 @@ function renderRewindGoals(projectId, data, history) {
     return `<div style="padding:3px 0;border-left:2px solid var(--border);padding-left:8px;margin-bottom:4px">
       <div style="cursor:pointer;user-select:none" onclick="toggleExpand('${id}')">
         <div style="color:var(--muted);font-size:10px">${escapeHtml(g.field)} · ${escapeHtml(g.changed_at || '')} <span class="expand-arrow" style="font-size:9px">▶</span></div>
-        <div>${escapeHtml(g.old_summary || '(empty)')} → ${escapeHtml(g.new_summary || '(empty)')}</div>
+        <div style="white-space:normal;word-break:break-word;overflow:visible">${escapeHtml(g.old_summary || '(empty)')} → ${escapeHtml(g.new_summary || '(empty)')}</div>
       </div>
       <div id="${id}" style="display:none;margin-top:6px;overflow:visible;max-height:none">
         <div style="color:var(--muted);font-size:10px;margin-bottom:2px">before:</div>
-        <pre style="${preStyle};margin-bottom:6px;max-height:400px;overflow-y:auto">${escapeHtml(g.old_full || '(empty)')}</pre>
+        <pre style="${preStyle};margin-bottom:6px">${escapeHtml(g.old_full || '(empty)')}</pre>
         <div style="color:var(--muted);font-size:10px;margin-bottom:2px">after:</div>
-        <pre style="${preStyle};max-height:400px;overflow-y:auto">${escapeHtml(g.new_full || '(empty)')}</pre>
+        <pre style="${preStyle}">${escapeHtml(g.new_full || '(empty)')}</pre>
       </div>
     </div>`;
   });
