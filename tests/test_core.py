@@ -3946,8 +3946,8 @@ def test_rewind_goal_changes_include_full_content(client):
 
 
 def test_dashboard_js_has_goal_history_functions(client):
-    """dashboard.js contains renderGoalHistory and toggleExpand (rewind improvements)."""
+    """dashboard.js contains rewind goal rendering and toggleExpand (rewind improvements)."""
     js = client.get("/static/dashboard.js").text
-    assert "renderGoalHistory" in js, "renderGoalHistory missing from dashboard.js"
+    assert "renderRewindGoals" in js, "renderRewindGoals missing from dashboard.js"
     assert "toggleExpand" in js, "toggleExpand missing from dashboard.js"
     assert "goal-history" in js, "goal-history API call missing from dashboard.js"

@@ -587,6 +587,22 @@ input[type=text] {
 }
 .rewind-wrap section { line-height: 1.45; }
 
+/* v1.9x — rewind 3 subtabs */
+.rewind-subtab-bar {
+  display: flex; flex-shrink: 0; gap: 2px;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 10px;
+}
+.rewind-subtab-btn {
+  padding: 5px 12px; background: transparent; border: none;
+  border-bottom: 2px solid transparent; cursor: pointer;
+  color: var(--muted); font-family: 'IBM Plex Mono', monospace; font-size: 10px;
+  white-space: nowrap;
+}
+.rewind-subtab-btn:hover { color: var(--text); }
+.rewind-subtab-btn.active { color: var(--accent); border-bottom-color: var(--accent); }
+.rewind-subtab-pane { line-height: 1.45; }
+
 /* v1.4.1 — goal subtab bar */
 .goal-subtab-strip {
   display: flex; flex-shrink: 0;

@@ -872,11 +872,19 @@ function renderLiveQueue(projectId, tasks) {
       ? `<span class="live-task-claim">claimed by: ${escapeHtml((t.session_name || t.claimed_by).slice(0, 24))}</span>`
       : '';
     const ts = formatRelativeTime(t.created_at);
+    const eid = `live-expand-${projectId}-${t.id.slice(0, 8)}`;
+    const expandMeta = [
+      t.session_name ? `session: ${t.session_name}` : '',
+      t.claimed_by   ? `claimed_by: ${t.claimed_by}` : '',
+      t.created_at   ? `created: ${t.created_at}` : '',
+      t.claimed_at   ? `claimed: ${t.claimed_at}` : '',
+    ].filter(Boolean).join(' · ');
     return `<div class="live-task-row" data-task="${escapeHtml(t.id)}">
       <span class="live-dot">${dot}</span>
-      <div class="live-task-body">
+      <div class="live-task-body" style="cursor:pointer" onclick="toggleExpand('${eid}')">
         <div class="live-task-desc">${escapeHtml((t.description || '').slice(0, 200))}</div>
-        <div class="live-task-meta">${escapeHtml(ts)} ${claimed}</div>
+        <div class="live-task-meta">${escapeHtml(ts)} ${claimed} <span class="expand-arrow" style="font-size:9px;color:var(--muted)">▶</span></div>
+        <div id="${eid}" style="display:none;margin-top:4px;font-size:10px;color:var(--muted);white-space:pre-wrap;word-break:break-word">${escapeHtml(t.description || '')}${expandMeta ? '\n' + escapeHtml(expandMeta) : ''}</div>
       </div>
       <button class="live-task-cancel" data-cancel="${escapeHtml(t.id)}" title="Mark done / cancel">×</button>
     </div>`;
@@ -1171,7 +1179,18 @@ function renderQueue(tasks) {
             ? `<div class="queue-item-session">${escapeHtml(t.session_name)}</div>` : '';
           const tsLine = t.created_at
             ? `<span class="queue-item-ts">${escapeHtml(formatRelativeTime(t.created_at))}</span>` : '';
-          return `<div class="queue-item">${escapeHtml((t.description || '').slice(0, 120))}${sessLine}${tsLine}</div>`;
+          const eid = `queue-expand-${t.id.slice(0, 8)}`;
+          const expandMeta = [
+            t.session_name ? `session: ${t.session_name}` : '',
+            t.claimed_by   ? `claimed_by: ${t.claimed_by}` : '',
+            t.created_at   ? `created: ${t.created_at}` : '',
+            t.claimed_at   ? `claimed: ${t.claimed_at}` : '',
+          ].filter(Boolean).join(' · ');
+          return `<div class="queue-item" style="cursor:pointer" onclick="toggleExpand('${eid}')">
+            ${escapeHtml((t.description || '').slice(0, 120))}${sessLine}${tsLine}
+            <span class="expand-arrow" style="font-size:9px;color:var(--muted);margin-left:4px">▶</span>
+            <div id="${eid}" style="display:none;margin-top:4px;font-size:10px;color:var(--muted);white-space:pre-wrap;word-break:break-word">${escapeHtml(t.description || '')}${expandMeta ? '\n' + escapeHtml(expandMeta) : ''}</div>
+          </div>`;
         }).join('')
       : `<div class="queue-empty">${emptyMsg}</div>`;
     return `<div class="queue-section">` +
@@ -1852,29 +1871,88 @@ async function loadRewindTab(projectId, days) {
       api(`/projects/${projectId}/rewind?days=${days}`),
       api(`/projects/${projectId}/goal-history`).catch(() => []),
     ]);
-    wrap.innerHTML = renderRewind(projectId, data) + renderGoalHistory(projectId, history);
+    const activeTab = (p && p.rewindSubtab) || 'activity';
+    wrap.innerHTML = renderRewindSubtabs(projectId, data, history, activeTab);
+    wrap.querySelectorAll('.rewind-subtab-btn').forEach(btn => {
+      btn.onclick = () => {
+        const tab = btn.dataset.tab;
+        if (p) p.rewindSubtab = tab;
+        wrap.querySelectorAll('.rewind-subtab-btn').forEach(b =>
+          b.classList.toggle('active', b.dataset.tab === tab));
+        wrap.querySelectorAll('.rewind-subtab-pane').forEach(c =>
+          { c.style.display = c.dataset.tab === tab ? '' : 'none'; });
+      };
+    });
   } catch (e) {
     wrap.innerHTML = `<div style="color:var(--status-failed)">rewind failed: ${escapeHtml(e.message)}</div>`;
   }
 }
 
-function renderRewind(projectId, data) {
-  const sec = (icon, title, items, render) => {
-    if (!items || !items.length) {
-      return `<section style="margin-bottom:14px">
-        <div style="color:var(--accent);font-weight:600;margin-bottom:4px">${icon} ${title}</div>
-        <div style="color:var(--muted);font-size:10px">(none)</div>
-      </section>`;
-    }
+function renderRewindSubtabs(projectId, data, history, activeTab) {
+  /** Render rewind content split into three subtabs: Activity, Versions, Goals. */
+  const tabs = [
+    { id: 'activity', label: '📋 Activity' },
+    { id: 'versions', label: '📦 Versions' },
+    { id: 'goals',    label: '🎯 Goals' },
+  ];
+  const tabBar = `<div class="rewind-subtab-bar">${
+    tabs.map(t => `<button class="rewind-subtab-btn${activeTab === t.id ? ' active' : ''}" data-tab="${t.id}">${t.label}</button>`).join('')
+  }</div>`;
+  const make = (id, html) =>
+    `<div class="rewind-subtab-pane" data-tab="${id}" style="${activeTab === id ? '' : 'display:none'}">${html}</div>`;
+  return tabBar +
+    make('activity', renderRewindActivity(projectId, data)) +
+    make('versions', renderRewindVersions(projectId, data)) +
+    make('goals',    renderRewindGoals(projectId, data, history));
+}
+
+function _rewindSec(icon, title, items, render) {
+  /** Shared section renderer for rewind subtabs. */
+  if (!items || !items.length) {
     return `<section style="margin-bottom:14px">
       <div style="color:var(--accent);font-weight:600;margin-bottom:4px">${icon} ${title}</div>
-      ${items.map(render).join('')}
+      <div style="color:var(--muted);font-size:10px">(none)</div>
     </section>`;
-  };
-  const preStyle = 'margin:0;white-space:pre-wrap;word-break:break-word;background:var(--bg-card);padding:6px;border-radius:3px;font-size:10px;font-family:inherit';
-  const versions = sec('📦', 'Versions shipped', data.versions_shipped,
+  }
+  return `<section style="margin-bottom:14px">
+    <div style="color:var(--accent);font-weight:600;margin-bottom:4px">${icon} ${title}</div>
+    ${items.map(render).join('')}
+  </section>`;
+}
+
+function renderRewindActivity(projectId, data) {
+  /** Activity subtab: sessions + decisions + task stats. */
+  const sessions = _rewindSec('🧠', 'Sessions', data.session_summaries, s =>
+    `<div style="padding:3px 0;border-left:2px solid var(--border);padding-left:8px;margin-bottom:4px">
+      <div style="color:var(--accent)">${escapeHtml(s.session_name)} <span style="color:var(--muted);font-size:10px">· ${s.tasks_completed} done</span></div>
+      <div style="color:var(--muted);font-size:10px">${escapeHtml(s.summary || '')}</div>
+    </div>`);
+  const decisions = _rewindSec('📋', 'Decisions logged', data.decisions_logged, d =>
+    `<div style="padding:2px 0"><span style="color:var(--muted);font-size:10px">[${escapeHtml(d.logged_at || '')}]</span> ${escapeHtml(d.text || '')}</div>`);
+  const byStatus = data.tasks_by_status || {};
+  const summary = `<section style="margin-top:14px;padding-top:10px;border-top:1px solid var(--border)">
+    <div style="color:var(--accent);font-weight:600">📊 Tasks: ${byStatus.done || 0} done, ${byStatus.failed || 0} failed, ${byStatus.pending || 0} pending <span style="color:var(--muted);font-size:10px">(${data.tasks_total || 0} total over ${data.period_days}d)</span></div>
+  </section>`;
+  return sessions + decisions + summary;
+}
+
+function renderRewindVersions(projectId, data) {
+  /** Versions subtab: milestones shipped + sprint items completed + stats. */
+  const versions = _rewindSec('📦', 'Versions shipped', data.versions_shipped,
     v => `<div style="padding:2px 0">${escapeHtml(v)}</div>`);
-  const goals = sec('🎯', 'Goal changes', data.goal_changes, (g, idx) => {
+  const sprints = _rewindSec('✅', 'Sprint items completed', data.sprint_items_completed, s =>
+    `<div style="padding:2px 0"><span style="color:var(--accent-green)">${escapeHtml(s.version || '')}</span> — ${escapeHtml(s.title || '')} <span style="color:var(--muted);font-size:10px">${escapeHtml(s.completed_at || '')}</span></div>`);
+  const byStatus = data.tasks_by_status || {};
+  const summary = `<section style="margin-top:14px;padding-top:10px;border-top:1px solid var(--border)">
+    <div style="color:var(--accent);font-weight:600">📊 ${byStatus.done || 0} tasks completed over ${data.period_days}d</div>
+  </section>`;
+  return versions + sprints + summary;
+}
+
+function renderRewindGoals(projectId, data, history) {
+  /** Goals subtab: goal changes (newest first) + goal version history. */
+  const preStyle = 'margin:0;white-space:pre-wrap;word-break:break-word;background:var(--bg-card);padding:6px;border-radius:3px;font-size:10px;font-family:inherit';
+  const goals = _rewindSec('🎯', 'Goal changes', (data.goal_changes || []).slice().reverse(), (g, idx) => {
     const id = `gc-expand-${projectId}-${idx}`;
     return `<div style="padding:3px 0;border-left:2px solid var(--border);padding-left:8px;margin-bottom:4px">
       <div style="cursor:pointer;user-select:none" onclick="toggleExpand('${id}')">
@@ -1889,50 +1967,35 @@ function renderRewind(projectId, data) {
       </div>
     </div>`;
   });
-  const decisions = sec('📋', 'Decisions logged', data.decisions_logged, d =>
-    `<div style="padding:2px 0"><span style="color:var(--muted);font-size:10px">[${escapeHtml(d.logged_at || '')}]</span> ${escapeHtml(d.text || '')}</div>`);
-  const sprints = sec('✅', 'Sprint items completed', data.sprint_items_completed, s =>
-    `<div style="padding:2px 0"><span style="color:var(--accent-green)">${escapeHtml(s.version || '')}</span> — ${escapeHtml(s.title || '')} <span style="color:var(--muted);font-size:10px">${escapeHtml(s.completed_at || '')}</span></div>`);
-  const sessions = sec('🧠', 'Sessions', data.session_summaries, s =>
-    `<div style="padding:3px 0;border-left:2px solid var(--border);padding-left:8px;margin-bottom:4px">
-      <div style="color:var(--accent)">${escapeHtml(s.session_name)} <span style="color:var(--muted);font-size:10px">· ${s.tasks_completed} done</span></div>
-      <div style="color:var(--muted);font-size:10px">${escapeHtml(s.summary || '')}</div>
-    </div>`);
-  const byStatus = data.tasks_by_status || {};
-  const summary = `<section style="margin-top:14px;padding-top:10px;border-top:1px solid var(--border)">
-    <div style="color:var(--accent);font-weight:600">📊 Tasks: ${byStatus.done || 0} done, ${byStatus.failed || 0} failed, ${byStatus.pending || 0} pending <span style="color:var(--muted);font-size:10px">(${data.tasks_total || 0} total over ${data.period_days}d)</span></div>
-  </section>`;
-  return versions + goals + decisions + sprints + sessions + summary;
-}
-
-function renderGoalHistory(projectId, history) {
-  if (!history || !history.length) return '';
-  const preStyle = 'margin:0;white-space:pre-wrap;word-break:break-word;background:var(--bg-card);padding:6px;border-radius:3px;font-size:10px;font-family:inherit';
-  const rows = history.map((v, idx) => {
-    const id = `gv-expand-${projectId}-${idx}`;
-    const raw = (v.version_goal || v.north_star || '').replace(/\s+/g, ' ').trim();
-    const snippet = raw.length > 80 ? raw.slice(0, 79) + '…' : raw;
-    return `<div style="border-left:2px solid var(--border);padding-left:8px;margin-bottom:4px">
-      <div style="cursor:pointer;user-select:none" onclick="toggleExpand('${id}')">
-        <span style="color:var(--accent)">v${v.version}</span>
-        <span style="color:var(--muted);font-size:10px"> · ${escapeHtml(v.created_at || '')}</span>
-        <span> ${escapeHtml(snippet)}</span>
-        <span class="expand-arrow" style="color:var(--muted);font-size:9px"> ▶</span>
-      </div>
-      <div id="${id}" style="display:none;margin-top:6px">
-        <div style="color:var(--muted);font-size:10px;margin-bottom:2px">north_star:</div>
-        <pre style="${preStyle};margin-bottom:6px">${escapeHtml(v.north_star || '(empty)')}</pre>
-        <div style="color:var(--muted);font-size:10px;margin-bottom:2px">version_goal:</div>
-        <pre style="${preStyle};margin-bottom:6px">${escapeHtml(v.version_goal || '(empty)')}</pre>
-        <div style="color:var(--muted);font-size:10px;margin-bottom:2px">sprint:</div>
-        <pre style="${preStyle}">${escapeHtml(v.sprint || '(empty)')}</pre>
-      </div>
-    </div>`;
-  });
-  return `<section style="margin-top:14px;padding-top:10px;border-top:1px solid var(--border)">
-    <div style="color:var(--accent);font-weight:600;margin-bottom:6px">📜 Goal version history (${history.length} versions, newest first)</div>
-    ${rows.join('')}
-  </section>`;
+  let historyHtml = '';
+  if (history && history.length) {
+    const rows = history.map((v, idx) => {
+      const id = `gv-expand-${projectId}-${idx}`;
+      const raw = (v.version_goal || v.north_star || '').replace(/\s+/g, ' ').trim();
+      const snippet = raw.length > 80 ? raw.slice(0, 79) + '…' : raw;
+      return `<div style="border-left:2px solid var(--border);padding-left:8px;margin-bottom:4px">
+        <div style="cursor:pointer;user-select:none" onclick="toggleExpand('${id}')">
+          <span style="color:var(--accent)">v${v.version}</span>
+          <span style="color:var(--muted);font-size:10px"> · ${escapeHtml(v.created_at || '')}</span>
+          <span> ${escapeHtml(snippet)}</span>
+          <span class="expand-arrow" style="color:var(--muted);font-size:9px"> ▶</span>
+        </div>
+        <div id="${id}" style="display:none;margin-top:6px">
+          <div style="color:var(--muted);font-size:10px;margin-bottom:2px">north_star:</div>
+          <pre style="${preStyle};margin-bottom:6px">${escapeHtml(v.north_star || '(empty)')}</pre>
+          <div style="color:var(--muted);font-size:10px;margin-bottom:2px">version_goal:</div>
+          <pre style="${preStyle};margin-bottom:6px">${escapeHtml(v.version_goal || '(empty)')}</pre>
+          <div style="color:var(--muted);font-size:10px;margin-bottom:2px">sprint:</div>
+          <pre style="${preStyle}">${escapeHtml(v.sprint || '(empty)')}</pre>
+        </div>
+      </div>`;
+    });
+    historyHtml = `<section style="margin-top:14px;padding-top:10px;border-top:1px solid var(--border)">
+      <div style="color:var(--accent);font-weight:600;margin-bottom:6px">📜 Goal version history (${history.length} versions, newest first)</div>
+      ${rows.join('')}
+    </section>`;
+  }
+  return goals + historyHtml;
 }
 
 async function copyRewindLink(projectId) {
