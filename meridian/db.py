@@ -632,7 +632,7 @@ async def delete_project(db: aiosqlite.Connection, project_id: str) -> None:
         (project_id,),
     ) as cur:
         row = await cur.fetchone()
-        count = int((row or [0])[0])
+        count = int(row["cnt"] if row else 0)
     if count:
         raise ValueError(f"{count} task(s) in_progress — complete or cancel first")
 
