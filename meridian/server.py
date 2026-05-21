@@ -1552,9 +1552,12 @@ async def admin_restart() -> dict[str, bool]:
                 )
 
         # Spawn a detached helper that will restart after we die
+        # Use python directly to avoid nesting pixi activations (PATH too long bug)
+        python_exe = sys.executable
         spawn_script = (
-            f"import time, subprocess; time.sleep(2); "
-            f"subprocess.Popen(['pixi', 'run', 'start'], cwd={cwd!r})"
+            f"import time, subprocess, os; time.sleep(2); "
+            f"env = {{k: v for k, v in os.environ.items()}}; "
+            f"subprocess.Popen([{python_exe!r}, '-m', 'meridian'], cwd={cwd!r}, env=env)"
         )
         subprocess.Popen(  # noqa: S603
             [sys.executable, "-c", spawn_script],
