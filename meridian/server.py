@@ -293,7 +293,7 @@ async def server_config() -> dict[str, Any]:
         "server_url": server_url,
         "host": host,
         "port": port,
-        "version": "1.3.0",
+        "version": "1.9.x",
         "db": (
             "postgres" if os.environ.get("MERIDIAN_DB_URL")
             else "memory" if os.environ.get("MERIDIAN_DB") == ":memory:"
