@@ -784,6 +784,9 @@ async def complete_sprint_item_endpoint(
     )
     if item is None:
         raise HTTPException(status_code=404, detail="sprint item not found")
+    await _update_roadmap_version_history(
+        _db(request), project_id, item["version"], _REPO_ROOT
+    )
     return item
 
 
@@ -855,10 +858,12 @@ async def push_sprint_item_endpoint(
 
 @app.get("/projects/{project_id}/sessions", response_model=list[Session])
 async def get_sessions(
-    project_id: str, request: Request
+    project_id: str, request: Request, active_only: bool = True
 ) -> list[dict[str, Any]]:
-    """List active sessions attached to the project.
+    """List sessions attached to the project.
 
+    Pass ``?active_only=false`` to include closed and archived sessions
+    (useful for the LIVE tab showing recent session outcomes).
     Expires stale sessions (last_seen > 30 min ago) before returning so
     the dashboard doesn't accumulate ghost entries indefinitely.
     """
@@ -867,7 +872,7 @@ async def get_sessions(
         raise HTTPException(status_code=404, detail="project not found")
     await _expire_and_generate_handoffs(_db(request), _data_dir(request))
     return await db_module.get_sessions(
-        _db(request), project_id, active_only=True
+        _db(request), project_id, active_only=active_only
     )
 
 
@@ -985,6 +990,10 @@ async def close_session(session_id: str, request: Request) -> dict[str, str]:
         raise HTTPException(status_code=404, detail="session not found")
     project_id = row["project_id"]
     await db_module.close_session(_db(request), session_id)
+    try:
+        await db_module.summarize_session(_db(request), session_id)
+    except Exception:
+        pass
     await _regenerate_claude_md(_db(request), project_id, _REPO_ROOT)
     return {"status": "closed", "session_id": session_id}
 
@@ -1443,6 +1452,66 @@ async def _regenerate_claude_md(
         pass  # never block the caller on a write failure
 
 
+_ROADMAP_AUTO_COMMENT = "<!-- meridian-auto: {version} -->"
+
+
+async def _update_roadmap_version_history(
+    db: aiosqlite.Connection,
+    project_id: str,
+    version: str,
+    repo_root: Path,
+) -> None:
+    """Insert or replace a version-history bullet in ROADMAP.md.
+
+    Reads all *done* sprint items for *version*, builds a one-line summary,
+    and writes it into the ``## Version history`` section.  Each entry is
+    tagged with an HTML comment so it can be found on the next update.
+    Silently no-ops on any I/O or DB error.
+    """
+    try:
+        items = await db_module.get_sprint_items(db, project_id)
+        done = [i for i in items if i.get("version") == version and i.get("status") == "done"]
+        if not done:
+            return
+
+        roadmap_path = repo_root / "ROADMAP.md"
+        content = roadmap_path.read_text(encoding="utf-8") if roadmap_path.exists() else ""
+
+        titles = "; ".join(i["title"] for i in done[:5])
+        if len(done) > 5:
+            titles += f"; +{len(done) - 5} more"
+        marker = _ROADMAP_AUTO_COMMENT.format(version=version)
+        new_line = f"- **{version}** — {titles} {marker}"
+
+        lines = content.splitlines()
+        in_history = False
+        marker_idx: int | None = None
+        history_end_idx: int | None = None
+
+        for i, line in enumerate(lines):
+            if line.strip() == "## Version history":
+                in_history = True
+            elif in_history and marker in line:
+                marker_idx = i
+                break
+            elif in_history and line.startswith("---"):
+                history_end_idx = i
+                break
+
+        if marker_idx is not None:
+            lines[marker_idx] = new_line
+        elif history_end_idx is not None:
+            lines.insert(history_end_idx, new_line)
+        else:
+            content = content.rstrip() + "\n" + new_line + "\n"
+            roadmap_path.write_text(content, encoding="utf-8")
+            return
+
+        roadmap_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    except Exception:
+        pass  # never block the caller on a write failure
+
+
 @app.websocket("/ws/{project_id}")
 async def ws_project(ws: WebSocket, project_id: str) -> None:
     """Push task-log events to dashboard clients for one project."""
@@ -1551,6 +1620,10 @@ async def _expire_and_generate_handoffs(
         try:
             await handoff_module.generate_handoff(db, pid, data_dir)
             generated = True
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            await _regenerate_claude_md(db, pid, _REPO_ROOT)
         except Exception:  # noqa: BLE001
             pass
     return {"count": result["count"], "auto_handoff_generated": generated}

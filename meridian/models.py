@@ -161,9 +161,10 @@ class Session(BaseModel):
     project_id: str
     name: str
     human_id: str | None = None
-    status: Literal["active", "idle", "closed"]
+    status: Literal["active", "idle", "closed", "archived"]
     last_seen: str
     created_at: str
+    session_summary: dict | None = None
 
 
 class Task(BaseModel):

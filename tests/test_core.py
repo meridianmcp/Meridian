@@ -4322,3 +4322,157 @@ async def test_get_tasks_includes_claimed_by_human_id(db):
     # Creator identity still correct.
     assert row["human_id"] == "alice"
     assert row["session_name"] == "creator"
+
+
+# ---------------------------------------------------------------------------
+# v1.9.x — ROADMAP.md auto-update from sprint_items
+# ---------------------------------------------------------------------------
+
+
+def test_complete_sprint_item_updates_roadmap_md(client, tmp_path, monkeypatch):
+    """Completing a sprint item writes a version history entry to ROADMAP.md."""
+    from meridian import server as srv
+    monkeypatch.setattr(srv, "_REPO_ROOT", tmp_path)
+    # Seed a minimal ROADMAP.md with a version history section.
+    roadmap = tmp_path / "ROADMAP.md"
+    roadmap.write_text("# Roadmap\n\n## Version history\n\n---\n\n## Next\n", encoding="utf-8")
+
+    project = client.post("/projects", json={"name": "rtest"}).json()
+    # Add and complete a sprint item.
+    item = client.post(
+        f"/projects/{project['id']}/sprint-items",
+        json={"version": "v9.9.x", "title": "Ship ROADMAP auto-update"},
+    ).json()
+    r = client.post(f"/projects/{project['id']}/sprint-items/{item['id']}/complete")
+    assert r.status_code == 200
+
+    content = roadmap.read_text(encoding="utf-8")
+    assert "v9.9.x" in content
+    assert "Ship ROADMAP auto-update" in content
+    assert "<!-- meridian-auto: v9.9.x -->" in content
+
+
+def test_roadmap_auto_update_replaces_existing_entry(client, tmp_path, monkeypatch):
+    """Completing a second item for the same version replaces the existing line."""
+    from meridian import server as srv
+    monkeypatch.setattr(srv, "_REPO_ROOT", tmp_path)
+    roadmap = tmp_path / "ROADMAP.md"
+    roadmap.write_text(
+        "# R\n\n## Version history\n\n---\n",
+        encoding="utf-8",
+    )
+    project = client.post("/projects", json={"name": "rtest2"}).json()
+    item1 = client.post(
+        f"/projects/{project['id']}/sprint-items",
+        json={"version": "v8.0.x", "title": "First feature"},
+    ).json()
+    client.post(f"/projects/{project['id']}/sprint-items/{item1['id']}/complete")
+    item2 = client.post(
+        f"/projects/{project['id']}/sprint-items",
+        json={"version": "v8.0.x", "title": "Second feature"},
+    ).json()
+    client.post(f"/projects/{project['id']}/sprint-items/{item2['id']}/complete")
+
+    content = roadmap.read_text(encoding="utf-8")
+    # Only one auto entry for v8.0.x.
+    assert content.count("<!-- meridian-auto: v8.0.x -->") == 1
+    assert "Second feature" in content
+
+
+# ---------------------------------------------------------------------------
+# v1.9.x — CLAUDE.md auto-update on session expire
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_expire_regenerates_claude_md(db, tmp_path, monkeypatch):
+    """_expire_and_generate_handoffs regenerates CLAUDE.md for each project."""
+    from meridian import server as srv
+    monkeypatch.setattr(srv, "_REPO_ROOT", tmp_path)
+
+    p = await db_module.create_project(db, "cltest")
+    s = await db_module.register_session(db, p["id"], "old-sess")
+    await db.execute(
+        "UPDATE sessions SET last_seen = datetime('now', '-60 minutes') WHERE id = ?",
+        (s["id"],),
+    )
+    await db.commit()
+
+    await srv._expire_and_generate_handoffs(db, str(tmp_path))
+    claude_md = tmp_path / "CLAUDE.md"
+    assert claude_md.exists(), "CLAUDE.md should have been written after session expiry"
+    content = claude_md.read_text(encoding="utf-8")
+    assert "MERIDIAN STATE" in content
+
+
+# ---------------------------------------------------------------------------
+# v1.9.x — sessions endpoint supports active_only=false + session_summary
+# ---------------------------------------------------------------------------
+
+
+def test_sessions_endpoint_active_only_false_includes_closed(client):
+    """?active_only=false includes closed sessions in the response."""
+    project = client.post("/projects", json={"name": "stest"}).json()
+    sess = client.post(
+        "/sessions/register", json={"project_id": project["id"], "name": "runner"}
+    ).json()
+    client.post(f"/sessions/{sess['id']}/close")
+
+    # active_only=true (default) should exclude the closed session.
+    r_active = client.get(f"/projects/{project['id']}/sessions")
+    ids_active = [s["id"] for s in r_active.json()]
+    assert sess["id"] not in ids_active
+
+    # active_only=false should include it.
+    r_all = client.get(f"/projects/{project['id']}/sessions?active_only=false")
+    ids_all = [s["id"] for s in r_all.json()]
+    assert sess["id"] in ids_all
+
+
+def test_sessions_endpoint_returns_session_summary_field(client):
+    """Each session row includes a session_summary key (null when no summary)."""
+    project = client.post("/projects", json={"name": "stest2"}).json()
+    client.post("/sessions/register", json={"project_id": project["id"], "name": "s1"})
+    r = client.get(f"/projects/{project['id']}/sessions")
+    assert r.status_code == 200
+    rows = r.json()
+    assert rows, "expected at least one session"
+    assert "session_summary" in rows[0]
+
+
+# ---------------------------------------------------------------------------
+# v1.9.x — backlog/future statuses in queue UI
+# ---------------------------------------------------------------------------
+
+
+def test_dashboard_js_handles_future_status_in_render_queue(client):
+    """dashboard.js renderQueue segments future tasks into a Future section."""
+    js = client.get("/static/dashboard.js").text
+    assert "future" in js.lower(), "renderQueue must handle future status"
+    assert "'future'" in js or '"future"' in js, "future filter must be present"
+
+
+def test_http_task_accepts_future_status(client):
+    """POST /tasks with status=future is accepted."""
+    project = client.post("/projects", json={"name": "ftest"}).json()
+    sess = client.post(
+        "/sessions/register", json={"project_id": project["id"], "name": "s1"}
+    ).json()
+    r = client.post("/tasks", json={
+        "session_id": sess["id"], "project_id": project["id"],
+        "description": "someday item", "status": "future",
+    })
+    assert r.status_code == 201
+    assert r.json()["status"] == "future"
+
+
+# ---------------------------------------------------------------------------
+# v1.9.x — session_summary surfaced in LIVE tab JS
+# ---------------------------------------------------------------------------
+
+
+def test_dashboard_js_renders_session_summary_in_live_tab(client):
+    """renderLiveSessions must reference session_summary for closed/archived sessions."""
+    js = client.get("/static/dashboard.js").text
+    assert "session_summary" in js, "renderLiveSessions must use session_summary"
+    assert "active_only=false" in js, "LIVE tab must fetch with active_only=false"

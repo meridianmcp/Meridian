@@ -1019,7 +1019,7 @@ async function refreshLiveTab(projectId) {
   /** Fetch fresh sessions + tasks + sprint items and repaint all Live sections. */
   try {
     const [sessions, tasks, sprintItems] = await Promise.all([
-      api(`/projects/${projectId}/sessions`).catch(() => []),
+      api(`/projects/${projectId}/sessions?active_only=false`).catch(() => []),
       api(`/projects/${projectId}/tasks?limit=200`).catch(() => []),
       api(`/projects/${projectId}/sprint-items`).catch(() => []),
     ]);
@@ -1238,13 +1238,20 @@ function renderLiveSessions(projectId, sessions, tasks) {
     const claimedRow = claimed
       ? `<div class="live-session-task">↳ ${escapeHtml((claimed.description || '').slice(0, 140))}</div>`
       : '';
+    const summary = s.session_summary;
+    const summaryRow = (summary && summary.summary && (s.status === 'closed' || s.status === 'archived'))
+      ? `<div class="live-session-outcome" style="font-size:10px;color:var(--muted);margin-top:3px;padding-left:18px">`
+        + `✓ ${escapeHtml((summary.summary || '').slice(0, 160))}`
+        + (summary.tasks_completed != null ? ` · ${summary.tasks_completed} tasks` : '')
+        + `</div>`
+      : '';
     return `<div class="live-session-row">
       <div class="live-session-head">
         <span class="live-dot">${dot}</span>
         <span class="live-session-name">${escapeHtml(label)}</span>
         <span class="live-session-age">${escapeHtml(formatRelativeTime(s.last_seen))}</span>
       </div>
-      ${claimedRow}
+      ${claimedRow}${summaryRow}
     </div>`;
   }).join('');
 }
@@ -1610,6 +1617,7 @@ function renderQueue(tasks) {
   const done = tasks.filter(t => t.status === 'done').slice(0, 10);
   const failed = tasks.filter(t => t.status === 'failed').slice(0, 10);
   const backlog = tasks.filter(t => t.status === 'backlog');
+  const future = tasks.filter(t => t.status === 'future');
 
   const sect = (icon, title, items, emptyMsg) => {
     const rows = items.length
@@ -1642,7 +1650,8 @@ function renderQueue(tasks) {
          sect('🔄', 'In Progress', inProg, 'nothing running') +
          sect('✅', 'Recently Done', done, 'no completed tasks') +
          (failed.length ? sect('❌', 'Failed', failed, '') : '') +
-         (backlog.length ? sect('📦 Backlog', '', backlog, '') : '');
+         (backlog.length ? sect('📦', 'Backlog', backlog, '') : '') +
+         (future.length ? sect('🔮', 'Future', future, '') : '');
 }
 
 async function loadFilesTab(projectId) {
