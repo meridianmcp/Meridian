@@ -517,13 +517,14 @@ function buildTabBody(project) {
             </div>
           </div>
           <div class="goal-subtab-panel" id="gtab-version-goal-${project.id}">
-            <textarea class="goal-area goal-full mono" id="goal-${project.id}" placeholder="(no version goal set)"></textarea>
+            <div id="goal-title-${project.id}" style="font-family:var(--font-mono);font-size:11px;font-weight:600;color:var(--accent);padding:6px 8px;background:var(--surface-2);border:1px solid var(--border);border-radius:4px 4px 0 0;border-bottom:none;user-select:none;opacity:0.8" title="Version title (read-only — edit in pixi.toml or set_goal)"></div>
+            <textarea class="goal-area goal-full mono" id="goal-${project.id}" placeholder="(no version goal set)" style="border-radius:0 0 4px 4px"></textarea>
             <div class="goal-actions">
               <button class="primary" id="save-goal-${project.id}">save version goal</button>
               <span class="goal-version" id="goal-state-${project.id}"></span>
               <span class="goal-ts" id="goal-vg-ts-${project.id}"></span>
             </div>
-            <div id="goal-autoblocks-${project.id}" style="display:none;margin-top:8px;background:var(--surface-2);border:1px solid var(--border);border-radius:4px;padding:8px;font-family:var(--font-mono);font-size:10px;color:var(--muted);white-space:pre-wrap;word-break:break-word;max-height:200px;overflow-y:auto"></div>
+            <div id="goal-autoblocks-${project.id}" style="display:none;margin-top:8px;background:var(--surface-2);border:1px solid var(--border);border-radius:4px;padding:8px;font-family:var(--font-mono);font-size:10px;color:var(--muted);white-space:pre-wrap;word-break:break-word;max-height:300px;overflow-y:auto;font-size:11px;color:var(--text)"></div>
           </div>
           <div class="goal-subtab-panel" id="gtab-sprint-${project.id}">
             <div style="color:var(--muted);font-size:10px;margin-bottom:6px">Current sprint header (one-liner only — task list lives in the <a href="#" onclick="switchToLive_${project.id}()" style="color:var(--accent)">LIVE tab</a>):</div>
@@ -1582,20 +1583,28 @@ async function refreshGoal(projectId) {
       state.panels[projectId].goalIsJson = true;
       text = JSON.stringify(goal.content, null, 2);
     }
-    // Split at AUTO BLOCKS — editable zone above, read-only below
+    // Split out title line + AUTO BLOCKS zone
     const AUTO_SPLIT = '--- AUTO BLOCKS BELOW ---';
     const splitIdx = text.indexOf(AUTO_SPLIT);
-    if (splitIdx !== -1) {
-      ta.value = text.slice(0, splitIdx).trimEnd();
-      const autoBlocksEl = document.getElementById(`goal-autoblocks-${projectId}`);
-      if (autoBlocksEl) {
+    const mainText = splitIdx !== -1 ? text.slice(0, splitIdx).trimEnd() : text;
+
+    // First line = title (uneditable)
+    const lines = mainText.split('\n');
+    const titleLine = lines[0] || '';
+    const bodyText = lines.slice(1).join('\n').replace(/^\n/, '');
+
+    const titleEl = document.getElementById(`goal-title-${projectId}`);
+    if (titleEl) titleEl.textContent = titleLine;
+    ta.value = bodyText;
+
+    const autoBlocksEl = document.getElementById(`goal-autoblocks-${projectId}`);
+    if (autoBlocksEl) {
+      if (splitIdx !== -1) {
         autoBlocksEl.style.display = 'block';
         autoBlocksEl.textContent = text.slice(splitIdx);
+      } else {
+        autoBlocksEl.style.display = 'none';
       }
-    } else {
-      ta.value = text;
-      const autoBlocksEl = document.getElementById(`goal-autoblocks-${projectId}`);
-      if (autoBlocksEl) autoBlocksEl.style.display = 'none';
     }
     v.textContent = `v${goal.version}`;
     // v0.5.2 — north star and sprint textareas
@@ -1666,7 +1675,9 @@ async function saveGoal(projectId) {
   const autoBlocksEl = document.getElementById(`goal-autoblocks-${projectId}`);
   const autoBlocksText = (autoBlocksEl && autoBlocksEl.style.display !== 'none')
     ? '\n' + autoBlocksEl.textContent : '';
-  const raw = ta.value + autoBlocksText;
+  const titleEl = document.getElementById(`goal-title-${projectId}`);
+  const titleLine = (titleEl && titleEl.textContent) ? titleEl.textContent + '\n' : '';
+  const raw = titleLine + ta.value + autoBlocksText;
   if (raw === state.panels[projectId]._lastSaved) return;
   let content = raw;
   if (state.panels[projectId].goalIsJson) {
