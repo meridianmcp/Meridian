@@ -147,7 +147,7 @@ function _updateConnectionIndicator(cfg) {
 // v1.9.x — POST /admin/restart then poll /health until up, then reload.
 async function checkGitStatus() {
   const btn = document.getElementById('git-check-btn');
-  if (btn) { btn.textContent = 'checking...'; btn.style.color = 'var(--muted)'; }
+  if (btn) { btn.textContent = 'checking…'; btn.style.color = 'var(--muted)'; }
   try {
     const s = await api('/admin/git-status');
     if (!s.ok) throw new Error(s.error || 'git check failed');
@@ -161,10 +161,10 @@ async function checkGitStatus() {
       if (btn) { btn.textContent = `\u2193 ${s.behind} behind`; btn.style.color = 'var(--status-failed)'; }
     } else {
       if (btn) { btn.textContent = '\u2713 up to date'; btn.style.color = 'var(--status-done)'; }
-      setTimeout(() => { if (btn) { btn.textContent = 'git pull?'; btn.style.color = 'var(--muted)'; } }, 3000);
+      setTimeout(() => { if (btn) { btn.textContent = 'check updates'; btn.style.color = 'var(--muted)'; } }, 3000);
     }
   } catch(e) {
-    if (btn) { btn.textContent = 'git?'; btn.style.color = 'var(--muted)'; }
+    if (btn) { btn.textContent = 'check updates'; btn.style.color = 'var(--muted)'; }
   }
 }
 
