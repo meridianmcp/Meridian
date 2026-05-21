@@ -876,9 +876,20 @@ function renderSprintProgress(projectId, items) {
     return;
   }
 
+  // Show pending/in_progress always; show done only if recently completed (same version)
+  // Get current version from sprint header
+  const sprintHeader = document.querySelector(`#live-sprint-progress-${projectId}`)?.closest('.panel')
+    ?.querySelector('.sprint-version')?.textContent || '';
+  const activeStatuses = new Set(['pending', 'todo', 'in_progress']);
+  const visibleItems = items.filter(it =>
+    activeStatuses.has(it.status) ||
+    (it.status === 'done' && it.version && items.some(x => activeStatuses.has(x.status) && x.version === it.version))
+  );
+  const displayItems = visibleItems.length > 0 ? visibleItems : items.filter(it => activeStatuses.has(it.status));
+
   // Group by item_group; ungrouped first.
   const groups = new Map();
-  items.forEach(it => {
+  (displayItems.length > 0 ? displayItems : items).forEach(it => {
     const g = it.item_group || '';
     if (!groups.has(g)) groups.set(g, []);
     groups.get(g).push(it);
@@ -1678,7 +1689,7 @@ function renderTasks(projectId) {
 
 function renderTaskRow(t) {
   const claimBadge = t.claimed_by
-    ? `<span class="claim-badge" title="claimed at ${escapeHtml(t.claimed_at || '')}">🔒 ${escapeHtml(t.claimed_by.slice(0, 8))}</span>`
+    ? `<span class="claim-badge" title="claimed at ${escapeHtml(t.claimed_at || '')}">🔒 ${escapeHtml((t.human_id || t.session_name || t.claimed_by || '').slice(0, 16))}</span>`
     : '';
   return `
     <div class="task ${t.status}">
