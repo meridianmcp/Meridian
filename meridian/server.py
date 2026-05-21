@@ -1552,11 +1552,13 @@ async def admin_restart() -> dict[str, bool]:
                 )
 
         # Spawn a detached helper that will restart after we die
-        # Use python directly to avoid nesting pixi activations (PATH too long bug)
+        # Use python directly + clean env to avoid PATH nesting on repeated restarts
         python_exe = sys.executable
         spawn_script = (
             f"import time, subprocess, os; time.sleep(2); "
             f"env = {{k: v for k, v in os.environ.items()}}; "
+            f"env['CONDA_SHLVL'] = '1'; "
+            f"[env.pop(k, None) for k in list(env) if k.startswith('CONDA_ENV_SHLVL_')]; "
             f"subprocess.Popen([{python_exe!r}, '-m', 'meridian'], cwd={cwd!r}, env=env)"
         )
         subprocess.Popen(  # noqa: S603
