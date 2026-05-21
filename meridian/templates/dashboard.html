@@ -14,7 +14,7 @@
 <body>
 <div id="update-banner" style="display:none">
   &#9888;&#65039; Server updated — restart to apply
-  <button id="banner-restart-btn" style="margin-left:12px;background:none;border:1px solid currentColor;border-radius:3px;color:inherit;cursor:pointer;font-size:11px;padding:1px 8px">&#x27F3; Restart</button>
+  <button id="banner-restart-btn" onclick="_doRestart()" style="margin-left:12px;background:none;border:1px solid currentColor;border-radius:3px;color:inherit;cursor:pointer;font-size:11px;padding:1px 8px">&#x27F3; Restart</button>
   <button onclick="document.getElementById('update-banner').style.display='none'" style="margin-left:6px;background:none;border:1px solid currentColor;border-radius:3px;color:inherit;cursor:pointer;font-size:11px;padding:1px 8px">Dismiss</button>
 </div>
 <button id="sidebar-toggle" title="Toggle sidebar" onclick="document.querySelector('.sidebar').classList.toggle('mobile-open')">☰</button>
