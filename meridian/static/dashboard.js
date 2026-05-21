@@ -82,7 +82,7 @@ function _updateConnectionIndicator(cfg) {
 
 // v1.9.x — POST /admin/restart then poll /health until up, then reload.
 async function _doRestart() {
-  try { await api('/admin/restart', { method: 'POST' }); } catch(_) { /* expected */ }
+  try { await fetch('/admin/restart', { method: 'POST' }); } catch(_) { /* expected — server dies mid-request */ }
   // Replace any existing restart button text
   document.querySelectorAll('#restart-server-btn, #banner-restart-btn').forEach(b => {
     b.textContent = 'Restarting…'; b.disabled = true;
