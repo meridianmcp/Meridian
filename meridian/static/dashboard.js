@@ -527,11 +527,17 @@ function buildTabBody(project) {
             <div id="goal-autoblocks-${project.id}" style="display:none;margin-top:8px;background:var(--surface-2);border:1px solid var(--border);border-radius:4px;padding:8px;font-family:var(--font-mono);font-size:10px;color:var(--muted);white-space:pre-wrap;word-break:break-word;max-height:300px;overflow-y:auto;font-size:11px;color:var(--text)"></div>
           </div>
           <div class="goal-subtab-panel" id="gtab-sprint-${project.id}">
-            <div style="color:var(--muted);font-size:10px;margin-bottom:6px">Current sprint header (one-liner only — task list lives in the <a href="#" onclick="switchToLive_${project.id}()" style="color:var(--accent)">LIVE tab</a>):</div>
-            <textarea class="goal-area mono" id="goal-sprint-${project.id}" placeholder="(sprint not set)" style="height:48px;min-height:48px"></textarea>
-            <div class="goal-actions">
-              <button class="secondary" id="save-sprint-${project.id}">save sprint</button>
-              <span class="goal-ts" id="goal-sp-ts-${project.id}"></span>
+            <div style="color:var(--muted);font-size:10px;margin-bottom:4px">Sprint header:</div>
+            <div style="display:flex;gap:6px;margin-bottom:10px;align-items:center">
+              <input type="text" id="goal-sprint-${project.id}" placeholder="v1.9.x — description" style="flex:1;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;padding:6px 8px;color:var(--text);font-family:var(--font-mono);font-size:11px;outline:none">
+              <button class="secondary" id="save-sprint-${project.id}" style="white-space:nowrap">save</button>
+              <span class="goal-ts" id="goal-sp-ts-${project.id}" style="font-size:10px;color:var(--muted)"></span>
+            </div>
+            <div style="color:var(--muted);font-size:10px;margin-bottom:6px">Sprint tasks:</div>
+            <div id="sprint-board-goal-${project.id}"></div>
+            <div style="display:flex;gap:6px;margin-top:8px">
+              <input type="text" id="sprint-add-input-${project.id}" placeholder="Add task to sprint..." style="flex:1;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;padding:6px 8px;color:var(--text);font-family:var(--font-mono);font-size:11px;outline:none">
+              <button class="secondary" id="sprint-add-btn-${project.id}">+ Add</button>
             </div>
           </div>
         </div>
@@ -700,6 +706,46 @@ function buildTabBody(project) {
   document.getElementById(`save-goal-${project.id}`).onclick = () => saveGoal(project.id);
   document.getElementById(`save-north-star-${project.id}`).onclick = () => saveNorthStar(project.id);
   document.getElementById(`save-sprint-${project.id}`).onclick = () => saveSprint(project.id);
+
+  // Sprint tab board — load and render sprint items
+  async function loadSprintBoard() {
+    try {
+      const items = await api(`/projects/${project.id}/sprint-items`);
+      const board = document.getElementById(`sprint-board-goal-${project.id}`);
+      if (!board) return;
+      if (!items || !items.length) {
+        board.innerHTML = '<div style="color:var(--muted);font-size:10px;padding:4px 0">(no sprint items — add one below)</div>';
+        return;
+      }
+      board.innerHTML = items.map(it => {
+        const done = it.status === 'done' || it.status === 'skipped';
+        const color = done ? 'var(--status-done)' : it.status === 'failed' ? 'var(--status-failed)' : 'var(--text)';
+        const strike = done ? 'text-decoration:line-through;opacity:0.5;' : '';
+        return `<div style="display:flex;align-items:flex-start;gap:6px;padding:4px 0;border-bottom:1px solid var(--border)">
+          <span style="font-size:10px;${strike}color:${color};flex:1;word-break:break-word">${escapeHtml(it.title)}</span>
+          ${!done ? `<button onclick="completeSprintItem('${project.id}','${it.id}',loadSprintBoard)" title="Done" style="background:none;border:1px solid var(--status-done);color:var(--status-done);border-radius:3px;cursor:pointer;font-size:10px;padding:1px 5px">✓</button>
+          <button onclick="failSprintItem('${project.id}','${it.id}',loadSprintBoard)" title="Fail" style="background:none;border:1px solid var(--status-failed);color:var(--status-failed);border-radius:3px;cursor:pointer;font-size:10px;padding:1px 5px">✗</button>` : ''}
+        </div>`;
+      }).join('');
+    } catch(e) { console.error('Sprint board load failed:', e); }
+  }
+  loadSprintBoard();
+
+  const sprintAddBtn = document.getElementById(`sprint-add-btn-${project.id}`);
+  const sprintAddInput = document.getElementById(`sprint-add-input-${project.id}`);
+  if (sprintAddBtn && sprintAddInput) {
+    const doAdd = async () => {
+      const title = sprintAddInput.value.trim();
+      if (!title) return;
+      try {
+        await api(`/projects/${project.id}/sprint-items`, { method: 'POST', body: JSON.stringify({ title, version: state.panels[project.id]?.sprint || 'current' }) });
+        sprintAddInput.value = '';
+        loadSprintBoard();
+      } catch(e) { console.error('Add sprint item failed:', e); }
+    };
+    sprintAddBtn.onclick = doAdd;
+    sprintAddInput.onkeydown = (e) => { if (e.key === 'Enter') doAdd(); };
+  }
 
   // v1.6.x — goal-mode toggle removed. Auto mode (v0.4.2) appended ambient
   // task summaries to goal content; that role is now covered by the timeline
@@ -2134,6 +2180,21 @@ async function restoreTabs() {
   setInterval(_checkGitStatus, 60000);
 })();
 
+async function completeSprintItem(projectId, itemId, cb) {
+  try {
+    await api(`/projects/${projectId}/sprint-items/${itemId}/complete`, { method: 'POST' });
+    if (cb) cb();
+  } catch(e) { console.error('Complete sprint item failed:', e); }
+}
+
+async function failSprintItem(projectId, itemId, cb) {
+  try {
+    await api(`/projects/${projectId}/sprint-items/${itemId}/fail`, { method: 'POST' });
+    if (cb) cb();
+  } catch(e) { console.error('Fail sprint item failed:', e); }
+}
+
+
 // --- v0.6.6 EZ wizard ---
 // v0.6.6 — EZ wizard logic
 document.getElementById('ez-create-btn').onclick = async () => {
@@ -2349,7 +2410,20 @@ function renderRewindActivity(projectId, data) {
 function renderRewindVersions(projectId, data) {
   /** Versions subtab: milestones shipped + sprint items completed + stats. */
   const versions = _rewindSec('📦', 'Milestones shipped', data.versions_shipped,
-    v => `<div style="padding:2px 0;white-space:normal;word-break:break-word;line-height:1.4">${escapeHtml(v)}</div>`);
+    (v, idx) => {
+      const id = `ms-${Math.random().toString(36).slice(2)}`;
+      const preview = escapeHtml(v.slice(0, 80)) + (v.length > 80 ? '…' : '');
+      return `<div style="padding:3px 0;border-bottom:1px solid var(--border);cursor:pointer" onclick="
+        var b=document.getElementById('${id}');
+        var a=this.querySelector('.ms-arrow');
+        if(b.style.display==='none'){b.style.display='block';a.textContent='▼';}
+        else{b.style.display='none';a.textContent='▶';}
+      ">
+        <span class="ms-arrow" style="color:var(--muted);font-size:9px;margin-right:4px">▶</span>
+        <span style="font-size:10px">${preview}</span>
+        <div id="${id}" style="display:none;margin-top:4px;font-size:10px;color:var(--muted);white-space:pre-wrap;word-break:break-word;line-height:1.4;padding:4px 0 2px 14px">${escapeHtml(v)}</div>
+      </div>`;
+    });
   const sprints = _rewindSec('✅', 'Sprint items completed', data.sprint_items_completed, s =>
     `<div style="padding:2px 0"><span style="color:var(--accent-green)">${escapeHtml(s.version || '')}</span> — ${escapeHtml(s.title || '')} <span style="color:var(--muted);font-size:10px">${escapeHtml(s.completed_at || '')}</span></div>`);
   const byStatus = data.tasks_by_status || {};
