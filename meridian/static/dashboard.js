@@ -2531,7 +2531,7 @@ async function loadRewindTab(projectId, days) {
       api(`/projects/${projectId}/rewind?days=${days}`),
       api(`/projects/${projectId}/goal-history`).catch(() => []),
     ]);
-    const activeTab = (p && p.rewindSubtab) || 'activity';
+    const activeTab = (p && p.rewindSubtab) || 'versions';
     wrap.innerHTML = renderRewindSubtabs(projectId, data, history, activeTab);
     wrap.querySelectorAll('.rewind-subtab-btn').forEach(btn => {
       btn.onclick = () => {
@@ -2551,9 +2551,9 @@ async function loadRewindTab(projectId, days) {
 function renderRewindSubtabs(projectId, data, history, activeTab) {
   /** Render rewind content split into three subtabs: Activity, Versions, Goals. */
   const tabs = [
-    { id: 'activity', label: '📋 Activity' },
     { id: 'versions', label: '📦 Milestones' },
-    { id: 'goals',    label: '🎯 Goals' },
+    { id: 'goals',    label: '🎯 Goal' },
+    { id: 'activity', label: '📋 Activity' },
   ];
   const tabBar = `<div class="rewind-subtab-bar">${
     tabs.map(t => `<button class="rewind-subtab-btn${activeTab === t.id ? ' active' : ''}" data-tab="${t.id}">${t.label}</button>`).join('')
@@ -2599,7 +2599,7 @@ function renderRewindActivity(projectId, data) {
 function renderRewindVersions(projectId, data) {
   /** Versions subtab: milestones shipped + sprint items completed + stats. */
   const versions = _rewindSec('📦', 'Milestones shipped', data.versions_shipped,
-    v => `<div style="padding:3px 0;border-bottom:1px solid var(--border);font-size:10px;white-space:normal;word-break:break-word;line-height:1.5">${escapeHtml(v)}</div>`);
+    v => `<div style="padding:5px 0;border-bottom:1px solid var(--border);font-size:11px;white-space:pre-wrap;word-break:break-word;line-height:1.6;color:var(--text)">${escapeHtml(v)}</div>`);
   const sprints = _rewindSec('✅', 'Sprint items completed', data.sprint_items_completed, s =>
     `<div style="padding:2px 0"><span style="color:var(--accent-green)">${escapeHtml(s.version || '')}</span> — ${escapeHtml(s.title || '')} <span style="color:var(--muted);font-size:10px">${escapeHtml(s.completed_at || '')}</span></div>`);
   const byStatus = data.tasks_by_status || {};

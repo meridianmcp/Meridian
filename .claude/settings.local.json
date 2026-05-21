@@ -6,7 +6,11 @@
       "Bash(pixi run *)",
       "mcp__meridian__start_session",
       "mcp__meridian__add_sprint_item",
-      "mcp__meridian__log_task"
+      "mcp__meridian__log_task",
+      "mcp__meridian__complete_sprint_item",
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)",
+      "Bash(git push *)"
     ]
   }
 }
