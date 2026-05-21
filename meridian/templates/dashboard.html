@@ -38,7 +38,7 @@
         <select id="connection-switcher" style="display:none;margin-left:6px;background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:'IBM Plex Mono',monospace;padding:1px 4px"></select>
       </div>
       <div style="display:flex;gap:6px">
-        <button class="sidebar-stop-btn" id="restart-server-btn" title="Restart the Meridian server" style="flex:1">&#x27F3; Restart</button>
+        <button class="sidebar-stop-btn" id="restart-server-btn" title="Restart the Meridian server" style="flex:1" onclick="if(confirm('Restart the Meridian server?')) _doRestart()">&#x27F3; Restart</button>
         <button class="sidebar-stop-btn" id="stop-server-btn" title="Stop the Meridian server" style="flex:1">&#x23F9; Stop</button>
       </div>
     </div>
