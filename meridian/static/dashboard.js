@@ -531,7 +531,10 @@ function buildTabBody(project) {
               <span class="goal-version" id="goal-state-${project.id}"></span>
               <span class="goal-ts" id="goal-vg-ts-${project.id}"></span>
             </div>
-            <div id="goal-autoblocks-${project.id}" style="display:none;margin-top:8px;background:var(--surface-2);border:1px solid var(--border);border-radius:4px;padding:8px;font-family:var(--font-mono);font-size:10px;color:var(--muted);white-space:pre-wrap;word-break:break-word;max-height:300px;overflow-y:auto;font-size:11px;color:var(--text)"></div>
+            <div id="goal-autoblocks-wrapper-${project.id}" style="display:none;margin-top:8px">
+              <div style="font-size:10px;color:var(--muted);font-weight:600;margin-bottom:4px;padding:0 2px">📋 Session Log (auto-updated, read-only)</div>
+              <div id="goal-autoblocks-${project.id}" style="background:var(--surface-2);border:1px solid var(--border);border-radius:4px;padding:8px;font-family:var(--font-mono);font-size:11px;color:var(--text);white-space:pre-wrap;word-break:break-word;max-height:300px;overflow-y:auto"></div>
+            </div>
           </div>
           <div class="goal-subtab-panel" id="gtab-sprint-${project.id}">
             <div style="color:var(--muted);font-size:10px;margin-bottom:4px">Sprint header:</div>
@@ -1654,9 +1657,13 @@ async function refreshGoal(projectId) {
     const autoBlocksEl = document.getElementById(`goal-autoblocks-${projectId}`);
     if (autoBlocksEl) {
       if (splitIdx !== -1) {
+        const abWrapper = document.getElementById(`goal-autoblocks-wrapper-${projectId}`);
+        if (abWrapper) abWrapper.style.display = 'block';
         autoBlocksEl.style.display = 'block';
-        autoBlocksEl.textContent = text.slice(splitIdx);
+        autoBlocksEl.textContent = text.slice(splitIdx + '--- AUTO BLOCKS BELOW ---'.length).trimStart();
       } else {
+        const abWrapper2 = document.getElementById(`goal-autoblocks-wrapper-${projectId}`);
+        if (abWrapper2) abWrapper2.style.display = 'none';
         autoBlocksEl.style.display = 'none';
       }
     }
@@ -1728,7 +1735,7 @@ async function saveGoal(projectId) {
   // Reattach auto blocks before saving so they aren't lost
   const autoBlocksEl = document.getElementById(`goal-autoblocks-${projectId}`);
   const autoBlocksText = (autoBlocksEl && autoBlocksEl.style.display !== 'none')
-    ? '\n' + autoBlocksEl.textContent : '';
+    ? '\n--- AUTO BLOCKS BELOW ---\n' + autoBlocksEl.textContent : '';
   const titleEl = document.getElementById(`goal-title-${projectId}`);
   const titleLine = (titleEl && titleEl.textContent) ? titleEl.textContent + '\n' : '';
   const raw = titleLine + ta.value + autoBlocksText;

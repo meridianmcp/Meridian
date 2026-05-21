@@ -873,11 +873,18 @@ async def set_goal(
         # In-place update — no version bump, no new row
         # Strip existing AUTO BLOCKS from stored content, replace with new content's AUTO BLOCKS
         AUTO_SPLIT = "--- AUTO BLOCKS BELOW ---"
-        new_decoded = _decode_content(encoded) if not isinstance(encoded, str) else encoded
-        # Get the base (non-AUTO BLOCKS) part of existing content
-        existing_decoded = existing.get("content") or ""
-        if isinstance(existing_decoded, dict):
-            existing_decoded = existing_decoded.get("content", "") or ""
+        # Decode both to plain strings
+        def _to_str(v: Any) -> str:
+            if isinstance(v, str):
+                return v
+            if isinstance(v, dict):
+                return v.get("content", "") or str(v)
+            decoded = _decode_content(v)
+            if isinstance(decoded, dict):
+                return decoded.get("content", "") or ""
+            return str(decoded) if decoded else ""
+        new_decoded = _to_str(encoded)
+        existing_decoded = _to_str(existing.get("content") or "")
         split_idx = existing_decoded.find(AUTO_SPLIT)
         base = existing_decoded[:split_idx].rstrip() if split_idx != -1 else existing_decoded
         # Get new AUTO BLOCKS from incoming content
