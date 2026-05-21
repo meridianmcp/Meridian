@@ -102,7 +102,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     human_id TEXT,
     session_type TEXT DEFAULT 'human',
     status TEXT NOT NULL DEFAULT 'active'
-        CHECK (status IN ('active','idle','closed')),
+        CHECK (status IN ('active','idle','closed','archived')),
     last_seen TEXT NOT NULL DEFAULT (datetime('now')),
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
@@ -361,6 +361,60 @@ async def _migrate_rewind_token(db: aiosqlite.Connection) -> None:
     await _migrate_add_column_if_missing(db, "projects", "rewind_token", "TEXT")
 
 
+async def _migrate_sessions_archived(db: aiosqlite.Connection) -> None:
+    """v1.8.x — add 'archived' to the sessions CHECK constraint.
+
+    SQLite can't ALTER a CHECK constraint, so we rebuild the table in place
+    when the existing CHECK doesn't include 'archived'. No-op when current.
+
+    task_log has a FK → sessions, so we disable FK enforcement for the
+    rename/drop cycle (PRAGMA foreign_keys is a no-op inside a transaction,
+    so it must be toggled at the Python level before executescript).
+    """
+    async with db.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='sessions'"
+    ) as cur:
+        row = await cur.fetchone()
+    if row is None:
+        return
+    if "archived" in (row[0] or ""):
+        return  # already migrated
+
+    # SQLite 3.26+ auto-rewrites FK references in other tables when a table is
+    # RENAMED — so renaming sessions → sessions_v17 would silently update
+    # task_log's schema to say "REFERENCES sessions_v17" and break after the
+    # drop.  The safe pattern is: create sessions_new, copy, DROP old (not
+    # rename), then RENAME new→sessions.  task_log's "REFERENCES sessions(id)"
+    # is never touched and remains valid once sessions is back.
+    await db.execute("PRAGMA foreign_keys = OFF")
+    await db.executescript(
+        """
+        CREATE TABLE sessions_new (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL REFERENCES projects(id),
+            name TEXT NOT NULL,
+            human_id TEXT,
+            session_type TEXT DEFAULT 'human',
+            status TEXT NOT NULL DEFAULT 'active'
+                CHECK (status IN ('active','idle','closed','archived')),
+            last_seen TEXT NOT NULL DEFAULT (datetime('now')),
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            session_summary TEXT
+        );
+        INSERT INTO sessions_new
+            SELECT id, project_id, name, human_id, session_type, status,
+                   last_seen, created_at, session_summary
+            FROM sessions;
+        DROP TABLE sessions;
+        ALTER TABLE sessions_new RENAME TO sessions;
+        CREATE INDEX IF NOT EXISTS idx_sessions_project
+            ON sessions(project_id, status);
+        """
+    )
+    await db.execute("PRAGMA foreign_keys = ON")
+    await db.commit()
+
+
 async def _migrate_goal_hierarchy(db: aiosqlite.Connection) -> None:
     """v0.5.2 — add ``goal_north_star`` and ``goal_sprint`` columns.
 
@@ -430,6 +484,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_goal_hierarchy(db)
     await _migrate_worker_pid(db)
     await _migrate_rewind_token(db)
+    await _migrate_sessions_archived(db)
     return db
 
 
@@ -782,9 +837,10 @@ def build_worker_context_xml(
     repo: str,
     test_cmd: str = "pixi run test",
     commit_pattern: str = (
-        "Use commit.py pattern: write commit message to commit.py "
-        "in repo root, run via pixi run python commit.py, then "
-        "delete commit.py in the same command."
+        "Use commit.py pattern: write commit message to tmp/commit.py, "
+        "run via pixi run python tmp/commit.py, then delete tmp/commit.py "
+        "in the same command. GOAL.md is git-tracked — include it in the "
+        "staged files (git add GOAL.md) when it has been modified."
     ),
     done_when: str = (
         "log_task done, tests green, committed (no stray .py at repo root)."
@@ -909,9 +965,9 @@ async def get_goal_mode(
         "SELECT goal_mode FROM projects WHERE id = ?", (project_id,)
     ) as cur:
         row = await cur.fetchone()
-    if row is None or row[0] is None:
+    if row is None or row["goal_mode"] is None:
         return "manual"
-    return row[0]
+    return row["goal_mode"]
 
 
 async def list_auto_mode_projects(
@@ -1012,7 +1068,7 @@ async def get_decisions(
         row = await cur.fetchone()
     if row is None:
         return None
-    return row[0]
+    return row["decisions"]
 
 
 async def set_decision(
@@ -1036,7 +1092,7 @@ async def set_decision(
         row = await cur.fetchone()
     if row is None:
         raise ValueError(f"unknown project: {project_id}")
-    existing = (row[0] or "").rstrip()
+    existing = (row["decisions"] or "").rstrip()
     updated = (entry + ("\n" + existing if existing else "")).rstrip() + "\n"
     await db.execute(
         "UPDATE projects SET decisions = ? WHERE id = ?",
@@ -1060,7 +1116,7 @@ async def get_project_owner(
         row = await cur.fetchone()
     if row is None:
         return None
-    return row[0]
+    return row["creator_human_id"]
 
 
 async def update_session_seen(
@@ -1099,6 +1155,27 @@ async def close_session(db: aiosqlite.Connection, session_id: str) -> None:
     await db.commit()
 
 
+async def archive_stale_sessions(
+    db: aiosqlite.Connection, project_id: str, days: int = 7
+) -> int:
+    """Move sessions unseen for *days* days to 'archived'.
+
+    Only 'active' and 'idle' sessions are touched — 'closed' and already-
+    'archived' rows are left unchanged.  Returns the count updated.
+    """
+    from datetime import datetime, timedelta, timezone
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
+    cursor = await db.execute(
+        "UPDATE sessions SET status = 'archived' "
+        "WHERE project_id = ? "
+        "AND status NOT IN ('closed', 'archived') "
+        "AND last_seen < ?",
+        (project_id, cutoff),
+    )
+    await db.commit()
+    return cursor.rowcount
+
+
 async def get_sessions(
     db: aiosqlite.Connection,
     project_id: str,
@@ -1108,7 +1185,7 @@ async def get_sessions(
     if active_only:
         query = (
             "SELECT * FROM sessions WHERE project_id = ? "
-            "AND status != 'closed' ORDER BY last_seen DESC"
+            "AND status NOT IN ('closed', 'archived') ORDER BY last_seen DESC"
         )
     else:
         query = (
@@ -1422,7 +1499,7 @@ async def expire_idle_sessions(
         (f"-{max_age_minutes}",),
     ) as cur:
         rows = await cur.fetchall()
-    affected_project_ids: list[str] = [row[0] for row in rows]
+    affected_project_ids: list[str] = [row["project_id"] for row in rows]
 
     cursor = await db.execute(
         "UPDATE sessions SET status = 'idle' "
@@ -1986,19 +2063,20 @@ async def get_rewind_data(
     is responsible for the project existence 404 — this function trusts
     its input.
     """
-    from datetime import datetime, timezone
+    from datetime import datetime, timedelta, timezone
 
     if days <= 0:
         days = 7
-    cutoff_clause = f"-{int(days)} days"
-    now_iso = datetime.now(timezone.utc).isoformat()
+    now_dt = datetime.now(timezone.utc)
+    cutoff = (now_dt - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
+    now_iso = now_dt.isoformat()
 
     # --- Task aggregates ---------------------------------------------------
     async with db.execute(
         "SELECT status, COUNT(*) AS n FROM task_log "
-        "WHERE project_id = ? AND created_at >= datetime('now', ?) "
+        "WHERE project_id = ? AND created_at >= ? "
         "GROUP BY status",
-        (project_id, cutoff_clause),
+        (project_id, cutoff),
     ) as cur:
         status_rows = await cur.fetchall()
     tasks_by_status: dict[str, int] = {r["status"]: r["n"] for r in status_rows}
@@ -2010,7 +2088,7 @@ async def get_rewind_data(
     # "v1.2.0 —") in the period. Cap at 20.
     async with db.execute(
         "SELECT description, created_at FROM task_log "
-        "WHERE project_id = ? AND created_at >= datetime('now', ?) "
+        "WHERE project_id = ? AND created_at >= ? "
         "AND ("
         "    description LIKE '% shipped%' "
         " OR description LIKE 'shipped %' "
@@ -2021,7 +2099,7 @@ async def get_rewind_data(
         " OR description LIKE 'v_._._%' ESCAPE '_'"
         ") "
         "ORDER BY created_at DESC LIMIT 20",
-        (project_id, cutoff_clause),
+        (project_id, cutoff),
     ) as cur:
         ver_rows = await cur.fetchall()
     versions_shipped: list[str] = []
@@ -2084,7 +2162,7 @@ async def get_rewind_data(
         "SELECT decisions FROM projects WHERE id = ?", (project_id,)
     ) as cur:
         drow = await cur.fetchone()
-    decisions_blob = drow[0] if drow else None
+    decisions_blob = drow["decisions"] if drow else None
     if decisions_blob:
         import re as _re
         from datetime import date as _date, timedelta as _td
@@ -2108,19 +2186,19 @@ async def get_rewind_data(
     # --- Session summaries -------------------------------------------------
     async with db.execute(
         "SELECT id, name, session_summary FROM sessions "
-        "WHERE project_id = ? AND created_at >= datetime('now', ?) "
+        "WHERE project_id = ? AND created_at >= ? "
         "ORDER BY created_at DESC",
-        (project_id, cutoff_clause),
+        (project_id, cutoff),
     ) as cur:
         sess_rows = await cur.fetchall()
     session_summaries: list[dict[str, Any]] = []
     for s in sess_rows:
         async with db.execute(
-            "SELECT COUNT(*) FROM task_log WHERE session_id = ? AND status = 'done'",
+            "SELECT COUNT(*) AS cnt FROM task_log WHERE session_id = ? AND status = 'done'",
             (s["id"],),
         ) as cur:
             row = await cur.fetchone()
-        completed = int(row[0]) if row else 0
+        completed = int(row["cnt"]) if row else 0
         summary_text: str = s["name"]
         if s["session_summary"]:
             try:
@@ -2140,9 +2218,9 @@ async def get_rewind_data(
         "SELECT version, title, completed_at FROM sprint_items "
         "WHERE project_id = ? AND status IN ('done','skipped') "
         "AND completed_at IS NOT NULL "
-        "AND completed_at >= datetime('now', ?) "
+        "AND completed_at >= ? "
         "ORDER BY completed_at DESC",
-        (project_id, cutoff_clause),
+        (project_id, cutoff),
     ) as cur:
         sprint_rows = await cur.fetchall()
     sprint_items_completed = [
@@ -2207,7 +2285,7 @@ async def get_or_create_rewind_token(
         row = await cur.fetchone()
     if row is None:
         raise ValueError(f"unknown project: {project_id}")
-    existing = row[0]
+    existing = row["rewind_token"]
     if existing:
         return existing
     token = _new_id()
@@ -2229,4 +2307,4 @@ async def get_rewind_token(
         row = await cur.fetchone()
     if row is None:
         return None
-    return row[0]
+    return row["rewind_token"]

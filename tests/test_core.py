@@ -898,6 +898,53 @@ async def test_expire_idle_sessions_leaves_recent_sessions(db):
     assert fresh["status"] == "active"
 
 
+@pytest.mark.asyncio
+async def test_archive_stale_sessions_marks_old_sessions(db):
+    """Sessions with last_seen > 7 days are moved to 'archived'."""
+    p = await db_module.create_project(db, "alpha")
+    s = await db_module.register_session(db, p["id"], "old")
+    await db.execute(
+        "UPDATE sessions SET last_seen = datetime('now', '-8 days') WHERE id = ?",
+        (s["id"],),
+    )
+    await db.commit()
+    count = await db_module.archive_stale_sessions(db, p["id"])
+    assert count == 1
+    sessions = await db_module.get_sessions(db, p["id"], active_only=False)
+    archived = next(x for x in sessions if x["id"] == s["id"])
+    assert archived["status"] == "archived"
+
+
+@pytest.mark.asyncio
+async def test_archive_stale_sessions_excluded_from_active_view(db):
+    """Archived sessions must not appear in the default active-only list."""
+    p = await db_module.create_project(db, "alpha")
+    old = await db_module.register_session(db, p["id"], "old")
+    fresh = await db_module.register_session(db, p["id"], "fresh")
+    await db.execute(
+        "UPDATE sessions SET last_seen = datetime('now', '-8 days') WHERE id = ?",
+        (old["id"],),
+    )
+    await db.commit()
+    await db_module.archive_stale_sessions(db, p["id"])
+    active = await db_module.get_sessions(db, p["id"], active_only=True)
+    ids = [s["id"] for s in active]
+    assert old["id"] not in ids
+    assert fresh["id"] in ids
+
+
+@pytest.mark.asyncio
+async def test_archive_stale_sessions_leaves_recent_sessions(db):
+    """Sessions seen within 7 days must not be archived."""
+    p = await db_module.create_project(db, "alpha")
+    s = await db_module.register_session(db, p["id"], "fresh")
+    count = await db_module.archive_stale_sessions(db, p["id"])
+    assert count == 0
+    sessions = await db_module.get_sessions(db, p["id"], active_only=False)
+    still_active = next(x for x in sessions if x["id"] == s["id"])
+    assert still_active["status"] == "active"
+
+
 def test_chat_history_endpoint_empty(client):
     """GET /projects/{id}/chat/history returns [] when no messages exist."""
     project = client.post("/projects", json={"name": "alpha"}).json()

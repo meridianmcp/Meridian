@@ -1283,6 +1283,10 @@ async def _start_session_composite(
     get_tasks, check handoff file) with a single call that returns everything
     a new session needs before touching anything.
     """
+    # v1.8.x — archive sessions silent for 7+ days so they don't crowd
+    # the active list seen by new sessions.
+    await db_module.archive_stale_sessions(db, project_id)
+
     session = await db_module.register_session(
         db, project_id, session_name, human_id=human_id
     )
