@@ -1339,6 +1339,50 @@ async def ws_project(ws: WebSocket, project_id: str) -> None:
 
 
 
+@app.get("/admin/git-status")
+async def git_status() -> dict[str, Any]:
+    """Check if local repo is behind/ahead of remote."""
+    import subprocess as sp
+    try:
+        cwd = str(Path(__file__).parent.parent)
+        # Fetch without merging
+        sp.run(["git", "fetch", "origin"], cwd=cwd, capture_output=True, timeout=10)
+        # Count commits behind/ahead
+        result = sp.run(
+            ["git", "rev-list", "--left-right", "--count", "HEAD...@{upstream}"],
+            cwd=cwd, capture_output=True, text=True, timeout=5
+        )
+        if result.returncode == 0:
+            parts = result.stdout.strip().split()
+            ahead = int(parts[0]) if parts else 0
+            behind = int(parts[1]) if len(parts) > 1 else 0
+        else:
+            ahead, behind = 0, 0
+        # Get current branch
+        branch = sp.run(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            cwd=cwd, capture_output=True, text=True
+        ).stdout.strip()
+        # Get latest local + remote commit hashes
+        local_hash = sp.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=cwd, capture_output=True, text=True
+        ).stdout.strip()
+        remote_hash = sp.run(
+            ["git", "rev-parse", "--short", "@{upstream}"],
+            cwd=cwd, capture_output=True, text=True
+        ).stdout.strip()
+        return {
+            "ok": True, "branch": branch,
+            "ahead": ahead, "behind": behind,
+            "local_hash": local_hash, "remote_hash": remote_hash,
+            "up_to_date": behind == 0,
+            "warning": f"{behind} commit(s) behind origin/{branch}" if behind > 0 else None,
+        }
+    except Exception as e:
+        return {"ok": False, "error": str(e), "behind": 0, "ahead": 0}
+
+
 @app.delete("/tasks/{task_id}", status_code=204)
 async def delete_task(task_id: str, request: Request) -> None:
     """Delete a single task_log entry by ID. Permanent, no undo."""

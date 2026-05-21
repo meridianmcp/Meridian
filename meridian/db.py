@@ -632,7 +632,7 @@ async def delete_project(db: aiosqlite.Connection, project_id: str) -> None:
         (project_id,),
     ) as cur:
         row = await cur.fetchone()
-        count = int(next(iter(row.values())) if row else 0)
+        count = int(row[0] if row else 0)  # works for both sqlite Row and asyncpg Record
     if count:
         raise ValueError(f"{count} task(s) in_progress — complete or cancel first")
 
@@ -1636,7 +1636,7 @@ async def get_chat_history(
     """Return chat messages for a project in chronological order (oldest first)."""
     async with db.execute(
         "SELECT * FROM chat_messages WHERE project_id = ? "
-        "ORDER BY created_at ASC, rowid ASC LIMIT ?",
+        "ORDER BY created_at DESC, rowid DESC LIMIT ?",
         (project_id, limit),
     ) as cur:
         rows = await cur.fetchall()
@@ -2245,7 +2245,7 @@ async def summarize_session(
 
     async with db.execute(
         "SELECT * FROM task_log WHERE session_id = ? "
-        "ORDER BY created_at ASC, rowid ASC",
+        "ORDER BY created_at DESC, rowid DESC",
         (session_id,),
     ) as cur:
         task_rows = await cur.fetchall()

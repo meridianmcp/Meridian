@@ -74,7 +74,11 @@ function _updateConnectionIndicator(cfg) {
       hdr.textContent = 'Switch connection';
       popup.appendChild(hdr);
       // Connection options
-      (conns.length > 0 ? conns : [{name: cfg.connection_name || 'current', type: cfg.db, active: true}]).forEach(c => {
+      // Always include current env connection if not already in list
+      let displayConns = [...(conns || [])];
+      const envConn = {name: cfg.connection_name || (cfg.db === 'postgres' ? 'env (postgres)' : 'local'), type: cfg.db, active: true};
+      if (!displayConns.find(c => c.active)) displayConns.unshift(envConn);
+      displayConns.forEach(c => {
         const item = document.createElement('div');
         item.style.cssText = `padding:6px 12px;cursor:pointer;display:flex;align-items:center;gap:8px;${c.active ? 'color:var(--accent)' : 'color:var(--text)'}`;
         const dot2 = document.createElement('span');
@@ -141,6 +145,29 @@ function _updateConnectionIndicator(cfg) {
 }
 
 // v1.9.x — POST /admin/restart then poll /health until up, then reload.
+async function checkGitStatus() {
+  const btn = document.getElementById('git-check-btn');
+  if (btn) { btn.textContent = 'checking...'; btn.style.color = 'var(--muted)'; }
+  try {
+    const s = await api('/admin/git-status');
+    if (!s.ok) throw new Error(s.error || 'git check failed');
+    if (s.behind > 0) {
+      const banner = document.getElementById('update-banner');
+      const span = banner?.querySelector('span');
+      if (banner) {
+        banner.style.display = 'block';
+        if (span) span.textContent = `\u26A0\uFE0F ${s.behind} commit${s.behind>1?'s':''} behind origin/${s.branch} (${s.local_hash} \u2260 ${s.remote_hash}) \u2014 git pull recommended`;
+      }
+      if (btn) { btn.textContent = `\u2193 ${s.behind} behind`; btn.style.color = 'var(--status-failed)'; }
+    } else {
+      if (btn) { btn.textContent = '\u2713 up to date'; btn.style.color = 'var(--status-done)'; }
+      setTimeout(() => { if (btn) { btn.textContent = 'git pull?'; btn.style.color = 'var(--muted)'; } }, 3000);
+    }
+  } catch(e) {
+    if (btn) { btn.textContent = 'git?'; btn.style.color = 'var(--muted)'; }
+  }
+}
+
 async function _doRestart() {
   try { await fetch('/admin/restart', { method: 'POST' }); } catch(_) { /* expected */ }
   // Replace any existing restart button text
