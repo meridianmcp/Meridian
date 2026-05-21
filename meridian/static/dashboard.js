@@ -131,9 +131,7 @@ async function loadProjects() {
     const nameSpan = document.createElement('span');
     nameSpan.style.cssText = 'flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap';
     nameSpan.textContent = p.name;
-    const idSpan = document.createElement('span');
-    idSpan.className = 'id';
-    idSpan.textContent = p.id.slice(0,6);
+    // id shown in kebab menu instead
     const menuBtn = document.createElement('button');
     menuBtn.textContent = '⋯';
     menuBtn.title = 'Project actions';
@@ -148,7 +146,6 @@ async function loadProjects() {
       if (t) _openTabMenu(t, menuBtn);
     };
     div.appendChild(nameSpan);
-    div.appendChild(idSpan);
     div.appendChild(menuBtn);
     div.onclick = (e) => { if (e.target !== menuBtn) openTab(p); };
     list.appendChild(div);
@@ -314,9 +311,14 @@ function _openTabMenu(t, anchor) {
     menu.appendChild(item);
   }
 
-  menuItem('✏ Rename', () => _renameProject(t));
-  menuItem('💾 Download snapshot', () => window.open('/admin/snapshot?project=' + t.id, '_blank'));
-  menuItem('🗑 Delete project…', () => _deleteProject(t));
+  // UUID header
+  const uuidDiv = document.createElement('div');
+  uuidDiv.style.cssText = 'padding:6px 12px;color:var(--muted);font-size:10px;border-bottom:1px solid var(--border);user-select:all;cursor:text';
+  uuidDiv.textContent = t.id;
+  menu.appendChild(uuidDiv);
+  menuItem('\u270f Rename', () => _renameProject(t));
+  menuItem('\u2b07 Download DB', () => window.open('/admin/snapshot', '_blank'));
+  menuItem('\U0001f5d1 Delete project…', () => _deleteProject(t));
 
   const rect = anchor.getBoundingClientRect();
   menu.style.top = (rect.bottom + 4) + 'px';
