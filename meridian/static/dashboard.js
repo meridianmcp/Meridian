@@ -1336,12 +1336,16 @@ function renderTimeline(projectId, data) {
       desc: `🟢 session ${s.status || 'registered'}`,
     });
   });
+  // Collapse goal events — show only latest per field per hour
+  const goalByField = new Map();
   goal_events.forEach(g => {
-    events.push({
-      ts: g.updated_at || '',
-      actor: 'goal',
-      desc: `📋 ${g.field} updated → v${g.version}`,
-    });
+    const key = g.field + (g.updated_at || '').slice(0, 13);
+    if (!goalByField.has(key) || g.version > (goalByField.get(key).version || 0)) {
+      goalByField.set(key, g);
+    }
+  });
+  goalByField.forEach(g => {
+    events.push({ ts: g.updated_at || '', actor: 'goal', desc: `📋 ${g.field} → v${g.version}` });
   });
   events.sort((a, b) => (b.ts || '').localeCompare(a.ts || ''));
 
