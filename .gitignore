@@ -221,3 +221,7 @@ __marimo__/
 commit.py  
 
 tmp/
+  
+# Internal strategy documents  
+DECISIONS.md  
+ROADMAP.md  
