@@ -2233,7 +2233,11 @@ function renderRewindGoals(projectId, data, history) {
     return `<div style="padding:3px 0;border-left:2px solid var(--border);padding-left:8px;margin-bottom:4px">
       <div style="cursor:pointer;user-select:none" onclick="toggleExpand('${id}')">
         <div style="color:var(--muted);font-size:10px">${escapeHtml(g.field)} · ${escapeHtml(g.changed_at || '')} <span class="expand-arrow" style="font-size:9px">▶</span></div>
-        <div style="white-space:normal;word-break:break-word;overflow:visible">${escapeHtml(g.old_summary || '(empty)')} → ${escapeHtml(g.new_summary || '(empty)')}</div>
+        <div style="color:var(--muted);font-size:10px;white-space:normal;word-break:break-word">
+          ${escapeHtml((g.old_summary || '(empty)').slice(0,80))}${(g.old_summary||'').length>80?'…':''}
+          <span style="color:var(--accent)"> → </span>
+          ${escapeHtml((g.new_summary || '(empty)').slice(0,80))}${(g.new_summary||'').length>80?'…':''}
+        </div>
       </div>
       <div id="${id}" style="display:none;margin-top:6px;overflow:visible;max-height:none">
         <div style="color:var(--muted);font-size:10px;margin-bottom:2px">before:</div>
