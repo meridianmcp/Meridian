@@ -1272,7 +1272,7 @@ async def dashboard_chat(body: ChatRequest, request: Request):
 # Repo root is the parent of this package directory (meridian/).
 _REPO_ROOT = Path(__file__).parent.parent
 # The dashboard only allows editing these specific files.
-_EDITABLE_FILES: list[str] = ["AGENTS.md", "ROADMAP.md", "DEVLOG.md", "CLAUDE.md"]
+_EDITABLE_FILES: list[str] = ["AGENTS.md", "ROADMAP.md", "DEVLOG.md", "CLAUDE.md", "README.md"]
 
 
 @app.get("/projects/{project_id}/files")
@@ -1306,7 +1306,8 @@ async def get_project_file(
         raise HTTPException(status_code=403, detail="file not in allow-list")
     path = _REPO_ROOT / filename
     content = path.read_text(encoding="utf-8") if path.exists() else ""
-    return {"filename": filename, "content": content}
+    from fastapi.responses import JSONResponse
+    return JSONResponse(content={"filename": filename, "content": content}, headers={"Content-Type": "application/json; charset=utf-8"})
 
 
 @app.put("/projects/{project_id}/files/{filename}")

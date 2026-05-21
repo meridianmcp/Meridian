@@ -551,8 +551,9 @@ function buildTabBody(project) {
             </div>
           </div>
           <div class="goal-subtab-panel" id="gtab-version-goal-${project.id}">
-            <div id="goal-title-${project.id}" style="font-family:var(--font-mono);font-size:11px;font-weight:600;color:var(--accent);padding:6px 8px;background:var(--surface-2);border:1px solid var(--border);border-radius:4px 4px 0 0;border-bottom:none;user-select:none;opacity:0.8" title="Version title (read-only — edit in pixi.toml or set_goal)"></div>
-            <textarea class="goal-area goal-full mono" id="goal-${project.id}" placeholder="(no version goal set)" style="border-radius:0 0 4px 4px"></textarea>
+            <div id="goal-title-${project.id}" style="font-family:var(--font-mono);font-size:11px;font-weight:600;color:var(--accent);padding:6px 8px;background:var(--surface-2);border:1px solid var(--border);border-radius:4px 4px 0 0;border-bottom:none;user-select:none;opacity:0.8" title="Version title (read-only)"></div>
+            <div id="goal-shipped-${project.id}" style="display:none;font-family:var(--font-mono);font-size:10px;color:var(--muted);padding:6px 8px;background:var(--surface-2);border:1px solid var(--border);border-top:none;border-bottom:none;white-space:pre-wrap;user-select:none" title="SHIPPED section (read-only — updated by Claude Code)"></div>
+            <textarea class="goal-area goal-full mono" id="goal-${project.id}" placeholder="CURRENT FOCUS:" style="border-radius:0 0 4px 4px"></textarea>
             <div class="goal-actions">
               <button class="primary" id="save-goal-${project.id}">save version goal</button>
               <span class="goal-version" id="goal-state-${project.id}"></span>
@@ -1355,9 +1356,29 @@ function wireClaudeLaunchPanel(projectId) {
       if (!r.ok) throw new Error(`${r.status}`);
       const body = await r.json();
       const text = body.content || '';
-      if (text && navigator.clipboard) {
-        await navigator.clipboard.writeText(text);
-        toast('handoff copied — paste into Claude');
+      if (text) {
+        try {
+          await navigator.clipboard.writeText(text);
+          toast('handoff copied — paste into Claude');
+        } catch(_) {
+          // Clipboard blocked — show in modal for manual copy
+          const ta = document.createElement('textarea');
+          ta.value = text;
+          ta.style.cssText = 'position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);width:80vw;height:60vh;z-index:9999;font-family:monospace;font-size:11px;background:#1a1a2e;color:#e0e0e0;border:2px solid var(--accent);border-radius:6px;padding:12px';
+          const overlay = document.createElement('div');
+          overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.7);z-index:9998';
+          const closeBtn = document.createElement('button');
+          closeBtn.textContent = 'Close';
+          closeBtn.style.cssText = 'position:fixed;top:calc(50% - 31vh);left:calc(50% + 38vw);z-index:10000;background:var(--accent);border:none;color:white;padding:6px 14px;border-radius:4px;cursor:pointer';
+          document.body.appendChild(overlay);
+          document.body.appendChild(ta);
+          document.body.appendChild(closeBtn);
+          ta.select();
+          const close = () => { overlay.remove(); ta.remove(); closeBtn.remove(); };
+          overlay.onclick = close;
+          closeBtn.onclick = close;
+          toast('Clipboard blocked — select all and copy manually', true);
+        }
       } else {
         toast('handoff written: ' + (body.path || 'data/'), false);
       }
@@ -1479,7 +1500,7 @@ function renderTimeline(projectId, data) {
   // Collapse goal events — show only latest per field per hour
   const goalByField = new Map();
   goal_events.forEach(g => {
-    const key = g.field + (g.updated_at || '').slice(0, 13);
+    const key = g.field + (g.updated_at || '').slice(0, 15); // group by field+10min
     if (!goalByField.has(key) || g.version > (goalByField.get(key).version || 0)) {
       goalByField.set(key, g);
     }
@@ -1672,14 +1693,29 @@ async function refreshGoal(projectId) {
     const splitIdx = text.indexOf(AUTO_SPLIT);
     const mainText = splitIdx !== -1 ? text.slice(0, splitIdx).trimEnd() : text;
 
-    // First line = title (uneditable)
-    const lines = mainText.split('\n');
-    const titleLine = lines[0] || '';
-    const bodyText = lines.slice(1).join('\n').replace(/^\n/, '');
-
+    // Zone 1: title (line 0) — read-only
+    // Zone 2: SHIPPED block — read-only  
+    // Zone 3: CURRENT FOCUS onwards — editable
+    const allLines = mainText.split('\n');
+    const titleLine = allLines[0] || '';
     const titleEl = document.getElementById(`goal-title-${projectId}`);
     if (titleEl) titleEl.textContent = titleLine;
-    ta.value = bodyText;
+
+    const body = allLines.slice(1).join('\n').replace(/^\n/, '');
+    // Find CURRENT FOCUS as the start of editable zone
+    const editStart = body.search(/^(CURRENT FOCUS|KEY FILES)/m);
+    if (editStart > 0) {
+      const shippedEl = document.getElementById(`goal-shipped-${projectId}`);
+      if (shippedEl) {
+        shippedEl.style.display = 'block';
+        shippedEl.textContent = body.slice(0, editStart).trimEnd();
+      }
+      ta.value = body.slice(editStart);
+    } else {
+      const shippedEl = document.getElementById(`goal-shipped-${projectId}`);
+      if (shippedEl) shippedEl.style.display = 'none';
+      ta.value = body;
+    }
 
     const autoBlocksEl = document.getElementById(`goal-autoblocks-${projectId}`);
     if (autoBlocksEl) {
@@ -1765,7 +1801,10 @@ async function saveGoal(projectId) {
     ? '\n--- AUTO BLOCKS BELOW ---\n' + autoBlocksEl.textContent : '';
   const titleEl = document.getElementById(`goal-title-${projectId}`);
   const titleLine = (titleEl && titleEl.textContent) ? titleEl.textContent + '\n' : '';
-  const raw = titleLine + ta.value + autoBlocksText;
+  const shippedEl2 = document.getElementById(`goal-shipped-${projectId}`);
+  const shippedText = (shippedEl2 && shippedEl2.style.display !== 'none' && shippedEl2.textContent)
+    ? '\n' + shippedEl2.textContent + '\n' : '';
+  const raw = titleLine + shippedText + ta.value + autoBlocksText;
   if (raw === state.panels[projectId]._lastSaved) return;
   let content = raw;
   if (state.panels[projectId].goalIsJson) {
