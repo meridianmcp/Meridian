@@ -2010,6 +2010,9 @@ async function restoreTabs() {
         await api('/admin/shutdown', { method: 'POST' });
         stopBtn.textContent = 'Stopped — run pixi run start';
         stopBtn.disabled = true;
+        // Hide restart button — server is stopped, restart is impossible
+        const restartBtn = document.getElementById('restart-server-btn');
+        if (restartBtn) restartBtn.style.display = 'none';
       } catch(e) {
         toast('Shutdown request sent.', false);
       }
