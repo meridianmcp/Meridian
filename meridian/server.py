@@ -1976,6 +1976,39 @@ async def git_status() -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Waitlist
+# ---------------------------------------------------------------------------
+
+
+@app.post("/waitlist", status_code=201)
+async def join_waitlist(request: Request) -> dict[str, Any]:
+    """POST {"email": "...", "note": "..."} — add to hosted-tier waitlist.
+
+    Returns the created entry. 409 on duplicate email.
+    """
+    body = await request.json()
+    email = (body.get("email") or "").strip()
+    if not email or "@" not in email:
+        raise HTTPException(status_code=422, detail="valid email required")
+    note = (body.get("note") or "").strip() or None
+    db = _db(request)
+    try:
+        entry = await db_module.add_waitlist_entry(db, email, note)
+    except Exception as exc:
+        if "UNIQUE" in str(exc) or "unique" in str(exc):
+            raise HTTPException(status_code=409, detail="email already on waitlist")
+        raise
+    return entry
+
+
+@app.get("/waitlist")
+async def list_waitlist(request: Request) -> list[dict[str, Any]]:
+    """GET all waitlist entries, newest first. Admin use only."""
+    db = _db(request)
+    return await db_module.get_waitlist(db)
+
+
+# ---------------------------------------------------------------------------
 # MCP server
 # ---------------------------------------------------------------------------
 

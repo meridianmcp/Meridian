@@ -93,6 +93,15 @@ and task log. No Meridian server needed in the cloud.
 
 State lives in a local SQLite file. No accounts, no cloud, no sync required.
 
+## Hosted tier (coming soon)
+
+Zero-install dashboard at meridian.app — your team gets a shared URL, no Python required.
+[Join the waitlist](https://github.com/ajc3xc/Meridian/issues) to be notified at launch.
+
+## Contributors
+
+[![Contributors](https://contrib.rocks/image?repo=ajc3xc/Meridian)](https://github.com/ajc3xc/Meridian/graphs/contributors)
+
 ## License
 
 [MSL-1.0](LICENSE) — free for local use, any team size. See LICENSE for details.

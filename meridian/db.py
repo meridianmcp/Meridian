@@ -119,10 +119,12 @@ CREATE TABLE IF NOT EXISTS task_log (
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
-CREATE TABLE IF NOT EXISTS chat_sessions (
+-- v1.9.x — waitlist: pre-launch email capture for hosted tier.
+-- email is unique; note is optional "how will you use it" context.
+CREATE TABLE IF NOT EXISTS waitlist (
     id TEXT PRIMARY KEY,
-    project_id TEXT NOT NULL REFERENCES projects(id),
-    cli_session_id TEXT,
+    email TEXT NOT NULL UNIQUE,
+    note TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -149,14 +151,6 @@ CREATE TABLE IF NOT EXISTS sprint_items (
     notes TEXT
 );
 
-CREATE TABLE IF NOT EXISTS chat_messages (
-    id TEXT PRIMARY KEY,
-    project_id TEXT NOT NULL REFERENCES projects(id),
-    role TEXT NOT NULL CHECK (role IN ('user', 'assistant')),
-    content TEXT NOT NULL,
-    created_at TEXT NOT NULL DEFAULT (datetime('now'))
-);
-
 CREATE INDEX IF NOT EXISTS idx_goal_project
     ON goal_states(project_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_project
@@ -165,10 +159,6 @@ CREATE INDEX IF NOT EXISTS idx_tasks_project
     ON task_log(project_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_tasks_session
     ON task_log(session_id);
-CREATE INDEX IF NOT EXISTS idx_chat_sessions_project
-    ON chat_sessions(project_id);
-CREATE INDEX IF NOT EXISTS idx_chat_messages_project
-    ON chat_messages(project_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_sprint_items_project
     ON sprint_items(project_id, status);
 CREATE INDEX IF NOT EXISTS idx_sprint_items_version
@@ -571,6 +561,17 @@ async def _migrate_sprint_items_v2(db: aiosqlite.Connection) -> None:
     await db.commit()
 
 
+async def _migrate_drop_chat_tables(db: aiosqlite.Connection) -> None:
+    """v1.9.x — drop abandoned chat_sessions and chat_messages tables.
+
+    These were removed in v1.1.0 when the in-dashboard chat feature was
+    dropped. DROP IF EXISTS is idempotent — safe on both old and fresh DBs.
+    """
+    await db.execute("DROP TABLE IF EXISTS chat_messages")
+    await db.execute("DROP TABLE IF EXISTS chat_sessions")
+    await db.commit()
+
+
 async def init_db(db_path: str) -> aiosqlite.Connection:
     """Open the database, apply schema, and return the connection.
 
@@ -612,6 +613,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_rewind_token(db)
     await _migrate_sessions_archived(db)
     await _migrate_sprint_items_v2(db)
+    await _migrate_drop_chat_tables(db)
     return db
 
 
@@ -2630,3 +2632,38 @@ async def get_rewind_token(
     if row is None:
         return None
     return row["rewind_token"]
+
+
+# ---------------------------------------------------------------------------
+# Waitlist
+# ---------------------------------------------------------------------------
+
+
+async def add_waitlist_entry(
+    db: aiosqlite.Connection,
+    email: str,
+    note: str | None = None,
+) -> dict[str, Any]:
+    """Add an email to the waitlist. Returns the entry. Raises on duplicate."""
+    entry_id = _new_id()
+    await db.execute(
+        "INSERT INTO waitlist (id, email, note) VALUES (?, ?, ?)",
+        (entry_id, email.strip().lower(), note),
+    )
+    await db.commit()
+    async with db.execute(
+        "SELECT * FROM waitlist WHERE id = ?", (entry_id,)
+    ) as cur:
+        row = await cur.fetchone()
+    return _row_to_dict(row)
+
+
+async def get_waitlist(
+    db: aiosqlite.Connection,
+) -> list[dict[str, Any]]:
+    """Return all waitlist entries, newest first."""
+    async with db.execute(
+        "SELECT * FROM waitlist ORDER BY created_at DESC"
+    ) as cur:
+        rows = await cur.fetchall()
+    return [_row_to_dict(r) for r in rows]

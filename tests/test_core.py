@@ -515,6 +515,7 @@ def test_patch_task_404(client):
     assert r.status_code == 404
 
 
+@pytest.mark.skip(reason="chat feature removed v1.1.0; chat_sessions table dropped v1.9.x")
 def test_dashboard_chat_streams_sse_api_mode(client, monkeypatch):
     """API mode dispatches to the Anthropic SDK proxy. We stub the
     generator so the test doesn't need a real Anthropic key.
@@ -545,6 +546,7 @@ def test_dashboard_chat_streams_sse_api_mode(client, monkeypatch):
     assert "[DONE]" in body
 
 
+@pytest.mark.skip(reason="chat feature removed v1.1.0; chat_sessions table dropped v1.9.x")
 def test_dashboard_chat_defaults_to_cli_mode(client, monkeypatch):
     """A request with no ``mode`` field must dispatch to the CLI
     streamer, not the API one. We stub *both* so the test fails loudly
@@ -812,6 +814,7 @@ def test_migration_rebuilds_old_check_constraint(tmp_path):
 
 
 @pytest.mark.asyncio
+@pytest.mark.skip(reason="chat_sessions table dropped v1.9.x")
 async def test_get_or_create_chat_session_idempotent(db):
     """Two calls for the same project return the same session row."""
     p = await db_module.create_project(db, "alpha")
@@ -823,6 +826,7 @@ async def test_get_or_create_chat_session_idempotent(db):
 
 
 @pytest.mark.asyncio
+@pytest.mark.skip(reason="chat_sessions table dropped v1.9.x")
 async def test_update_chat_session_cli_id(db):
     """cli_session_id can be written after the row is created."""
     p = await db_module.create_project(db, "alpha")
@@ -947,6 +951,7 @@ async def test_archive_stale_sessions_leaves_recent_sessions(db):
     assert still_active["status"] == "active"
 
 
+@pytest.mark.skip(reason="chat_messages table dropped v1.9.x")
 def test_chat_history_endpoint_empty(client):
     """GET /projects/{id}/chat/history returns [] when no messages exist."""
     project = client.post("/projects", json={"name": "alpha"}).json()
@@ -955,6 +960,7 @@ def test_chat_history_endpoint_empty(client):
     assert r.json() == []
 
 
+@pytest.mark.skip(reason="chat_messages table dropped v1.9.x")
 def test_chat_history_endpoint_returns_messages(client, monkeypatch):
     """After a chat round-trip the history endpoint reflects saved messages."""
     async def fake_cli(messages, system_prompt, model, max_tokens, **_kwargs):
@@ -981,6 +987,7 @@ def test_chat_history_endpoint_returns_messages(client, monkeypatch):
     assert any(m["role"] == "assistant" and "hi there" in m["content"] for m in msgs)
 
 
+@pytest.mark.skip(reason="chat_messages table dropped v1.9.x")
 def test_chat_history_endpoint_404_for_unknown_project(client):
     r = client.get("/projects/no-such-project/chat/history")
     assert r.status_code == 404
@@ -1506,6 +1513,7 @@ def test_cli_streamer_gracefully_no_ops_when_no_session_id_present(monkeypatch):
 
 
 @pytest.mark.asyncio
+@pytest.mark.skip(reason="chat_sessions table dropped v1.9.x")
 async def test_update_chat_session_cli_id_persists(db):
     """The helper writes the captured CLI session uuid into the
     chat_sessions row so the next /dashboard/chat call can ``--resume``."""
@@ -4163,9 +4171,9 @@ async def test_schema_all_tables_exist(db):
                         "goal_north_star", "goal_sprint"},
         "sprint_items": {"id", "project_id", "version", "title", "status",
                          "item_group", "pushed_to", "human_id"},
-        "chat_sessions": {"id", "project_id", "cli_session_id"},
-        "chat_messages": {"id", "project_id", "role", "content"},
+        "waitlist": {"id", "email", "note", "created_at"},
     }
+    dropped = {"chat_sessions", "chat_messages"}  # removed in v1.9.x migration
     async with db.execute(
         "SELECT name FROM sqlite_master WHERE type='table'"
     ) as cur:
@@ -4178,6 +4186,8 @@ async def test_schema_all_tables_exist(db):
         found_cols = {r[1] for r in col_rows}
         for col in expected[table]:
             assert col in found_cols, f"missing column {table}.{col}"
+    for table in dropped:
+        assert table not in found_tables, f"table should have been dropped: {table}"
 
 
 @pytest.mark.asyncio

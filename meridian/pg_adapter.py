@@ -348,10 +348,11 @@ CREATE TABLE IF NOT EXISTS task_log (
     created_at TEXT NOT NULL DEFAULT (to_char(now() at time zone 'utc', 'YYYY-MM-DD HH24:MI:SS'))
 );
 
-CREATE TABLE IF NOT EXISTS chat_sessions (
+-- v1.9.x — waitlist: pre-launch email capture for hosted tier.
+CREATE TABLE IF NOT EXISTS waitlist (
     id TEXT PRIMARY KEY,
-    project_id TEXT NOT NULL REFERENCES projects(id),
-    cli_session_id TEXT,
+    email TEXT NOT NULL UNIQUE,
+    note TEXT,
     created_at TEXT NOT NULL DEFAULT (to_char(now() at time zone 'utc', 'YYYY-MM-DD HH24:MI:SS'))
 );
 
@@ -370,20 +371,10 @@ CREATE TABLE IF NOT EXISTS sprint_items (
     notes TEXT
 );
 
-CREATE TABLE IF NOT EXISTS chat_messages (
-    id TEXT PRIMARY KEY,
-    project_id TEXT NOT NULL REFERENCES projects(id),
-    role TEXT NOT NULL,
-    content TEXT NOT NULL,
-    created_at TEXT NOT NULL DEFAULT (to_char(now() at time zone 'utc', 'YYYY-MM-DD HH24:MI:SS'))
-);
-
 CREATE INDEX IF NOT EXISTS idx_goal_project ON goal_states(project_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_project ON sessions(project_id, status);
 CREATE INDEX IF NOT EXISTS idx_tasks_project ON task_log(project_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_tasks_session ON task_log(session_id);
-CREATE INDEX IF NOT EXISTS idx_chat_sessions_project ON chat_sessions(project_id);
-CREATE INDEX IF NOT EXISTS idx_chat_messages_project ON chat_messages(project_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_sprint_items_project ON sprint_items(project_id, status);
 CREATE INDEX IF NOT EXISTS idx_sprint_items_version ON sprint_items(project_id, version);
 """
@@ -408,7 +399,15 @@ async def init_pg_db(url: str) -> PostgresConnection:
     conn = PostgresConnection(pool)
     await conn.executescript(CREATE_TABLES_PG)
     await _migrate_pg_sprint_items_v2(pool)
+    await _migrate_pg_drop_chat_tables(pool)
     return conn
+
+
+async def _migrate_pg_drop_chat_tables(pool: Any) -> None:
+    """v1.9.x — drop abandoned chat_sessions and chat_messages tables."""
+    async with pool.acquire() as conn:
+        await conn.execute("DROP TABLE IF EXISTS chat_messages CASCADE")
+        await conn.execute("DROP TABLE IF EXISTS chat_sessions CASCADE")
 
 
 async def _migrate_pg_sprint_items_v2(pool: Any) -> None:

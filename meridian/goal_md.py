@@ -183,7 +183,15 @@ def write_goal_md(
     try:
         tmp = path.with_suffix(path.suffix + ".tmp")
         tmp.write_text(content, encoding="utf-8")
-        os.replace(tmp, path)
+        try:
+            os.replace(tmp, path)
+        except PermissionError:
+            # Windows: file locked by another process (e.g. live server running
+            # alongside tests). Clean up the tmp file and continue gracefully.
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
     finally:
         _meridian_writing = False
     return path

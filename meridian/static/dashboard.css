@@ -249,7 +249,7 @@ input[type=text] {
 .task-list { display: flex; flex-direction: column; }
 .task {
   padding: 8px 14px; border-bottom: 1px solid var(--border);
-  font-family: 'IBM Plex Mono', monospace; font-size: 12px;
+  font-family: 'IBM Plex Mono', monospace; font-size: 13px;
   display: flex; gap: 10px; align-items: flex-start;
 }
 .task .status-badge {
