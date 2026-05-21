@@ -2250,7 +2250,7 @@ function renderRewindActivity(projectId, data) {
 function renderRewindVersions(projectId, data) {
   /** Versions subtab: milestones shipped + sprint items completed + stats. */
   const versions = _rewindSec('📦', 'Milestones shipped', data.versions_shipped,
-    v => `<div style="padding:2px 0">${escapeHtml(v)}</div>`);
+    v => `<div style="padding:2px 0;white-space:normal;word-break:break-word;line-height:1.4">${escapeHtml(v)}</div>`);
   const sprints = _rewindSec('✅', 'Sprint items completed', data.sprint_items_completed, s =>
     `<div style="padding:2px 0"><span style="color:var(--accent-green)">${escapeHtml(s.version || '')}</span> — ${escapeHtml(s.title || '')} <span style="color:var(--muted);font-size:10px">${escapeHtml(s.completed_at || '')}</span></div>`);
   const byStatus = data.tasks_by_status || {};
