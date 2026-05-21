@@ -20,7 +20,7 @@ from a compressed handoff.
 ### Option A — single executable (Windows, no Python required)
 
 Download `meridian.exe` from [Releases](https://github.com/ajc3xc/Meridian/releases).
-Double-click. Dashboard opens automatically at `http://localhost:7700`.
+Double-click. Dashboard opens at `http://localhost:7878`.
 
 ### Option B — from source (all platforms)
 
@@ -72,33 +72,24 @@ Add to your Claude Desktop config:
 
 Restart Claude Desktop. Your next chat has Meridian tools available.
 
+## Team coordination
+
+Set `MERIDIAN_DB_URL=postgresql://...` and each person runs Meridian locally
+against a shared Postgres database. Everyone's sessions share the same goal state
+and task log. No Meridian server needed in the cloud.
+
 ## How it works
 
-1. Session starts: `start_session(project_id=..., session_name="my-session")` — returns
+1. `start_session(project_id=..., session_name="my-session")` — returns
    the current goal, recent task log, and active sprint in one call
-2. Do work, log tasks: `log_task(..., description="built auth endpoint", status="done")`
-3. Before context fills: `generate_handoff(project_id=...)` — compressed file captures
-   everything; a new session reads it and picks up exactly where you left off
-4. Parallel sessions? Each one calls `claim_task` to atomically lock a work item —
+2. Do work: `log_task(..., description="built auth endpoint", status="done")`
+3. Before context fills: `generate_handoff(project_id=...)` — a new session
+   reads this file and picks up exactly where you left off
+4. Parallel sessions: `claim_task` atomically locks a work item —
    no duplicated effort, no stepping on each other
 
 State lives in a local SQLite file. No accounts, no cloud, no sync required.
 
-## Privacy
-
-**Free tier (this repo):** runs entirely on your machine. No telemetry, no accounts.
-We physically cannot see your data — it never leaves your computer.
-
-**Paid/hosted tier (future):** your data lives on our server. We do not sell it.
-We do not train models on it. Full export and deletion available at any time.
-
-**Enterprise/self-hosted:** runs on your infrastructure. We never have access.
-
-Meridian shows what shipped, not how many hours someone worked. No surveillance
-features, no productivity scores, no per-developer rankings. The developer is the
-customer.
-
 ## License
 
-[MSL-2.0](LICENSE) — free for personal use. Commercial use requires a license.
-See LICENSE for details.
+[MSL-1.0](LICENSE) — free for local use, any team size. See LICENSE for details.

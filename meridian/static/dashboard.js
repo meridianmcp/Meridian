@@ -1040,8 +1040,9 @@ function renderLiveQueue(projectId, tasks) {
   });
   root.innerHTML = live.map(t => {
     const dot = t.status === 'in_progress' ? '🔵' : '📋';
+    const claimLabel = t.human_id || t.session_name || t.claimed_by || '';
     const claimed = t.claimed_by
-      ? `<span class="live-task-claim">claimed by: ${escapeHtml((t.session_name || t.claimed_by).slice(0, 24))}</span>`
+      ? `<span class="live-task-claim">claimed by: ${escapeHtml(claimLabel.slice(0, 24))}</span>`
       : '';
     const ts = formatRelativeTime(t.created_at);
     const eid = `live-expand-${projectId}-${t.id.slice(0, 8)}`;
@@ -1347,12 +1348,13 @@ function renderQueue(tasks) {
   const sect = (icon, title, items, emptyMsg) => {
     const rows = items.length
       ? items.map(t => {
-          const sessLine = t.session_name
-            ? `<div class="queue-item-session">${escapeHtml(t.session_name)}</div>` : '';
+          const who = t.human_id || t.session_name || '';
+          const sessLine = '';
           const tsLine = t.created_at
-            ? `<span class="queue-item-ts">${escapeHtml(formatRelativeTime(t.created_at))}</span>` : '';
+            ? `<span class="queue-item-ts">${escapeHtml((who ? who + ' · ' : '') + formatRelativeTime(t.created_at))}</span>` : '';
           const eid = `queue-expand-${t.id.slice(0, 8)}`;
           const expandMeta = [
+            t.human_id     ? `human: ${t.human_id}` : '',
             t.session_name ? `session: ${t.session_name}` : '',
             t.claimed_by   ? `claimed_by: ${t.claimed_by}` : '',
             t.created_at   ? `created: ${t.created_at}` : '',
@@ -2151,7 +2153,7 @@ function renderRewindSubtabs(projectId, data, history, activeTab) {
   /** Render rewind content split into three subtabs: Activity, Versions, Goals. */
   const tabs = [
     { id: 'activity', label: '📋 Activity' },
-    { id: 'versions', label: '📦 Versions' },
+    { id: 'versions', label: '📦 Milestones' },
     { id: 'goals',    label: '🎯 Goals' },
   ];
   const tabBar = `<div class="rewind-subtab-bar">${
@@ -2197,7 +2199,7 @@ function renderRewindActivity(projectId, data) {
 
 function renderRewindVersions(projectId, data) {
   /** Versions subtab: milestones shipped + sprint items completed + stats. */
-  const versions = _rewindSec('📦', 'Versions shipped', data.versions_shipped,
+  const versions = _rewindSec('📦', 'Milestones shipped', data.versions_shipped,
     v => `<div style="padding:2px 0">${escapeHtml(v)}</div>`);
   const sprints = _rewindSec('✅', 'Sprint items completed', data.sprint_items_completed, s =>
     `<div style="padding:2px 0"><span style="color:var(--accent-green)">${escapeHtml(s.version || '')}</span> — ${escapeHtml(s.title || '')} <span style="color:var(--muted);font-size:10px">${escapeHtml(s.completed_at || '')}</span></div>`);

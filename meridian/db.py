@@ -1431,10 +1431,16 @@ async def get_in_progress_tasks_with_pid(
 async def get_tasks(
     db: aiosqlite.Connection, project_id: str, limit: int = 20
 ) -> list[dict[str, Any]]:
-    """Return recent tasks for a project, newest first."""
+    """Return recent tasks for a project, newest first.
+
+    Joins sessions to include session_name and human_id for display.
+    """
     async with db.execute(
-        "SELECT * FROM task_log WHERE project_id = ? "
-        "ORDER BY created_at DESC, rowid DESC LIMIT ?",
+        "SELECT t.*, s.name AS session_name, s.human_id AS human_id "
+        "FROM task_log t "
+        "LEFT JOIN sessions s ON s.id = t.session_id "
+        "WHERE t.project_id = ? "
+        "ORDER BY t.created_at DESC, t.rowid DESC LIMIT ?",
         (project_id, limit),
     ) as cur:
         rows = await cur.fetchall()
