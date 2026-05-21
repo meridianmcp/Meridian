@@ -71,7 +71,7 @@ function _updateConnectionIndicator(cfg) {
       // Header
       const hdr = document.createElement('div');
       hdr.style.cssText = 'padding:4px 12px;color:var(--muted);font-size:10px;border-bottom:1px solid var(--border);margin-bottom:4px';
-      hdr.textContent = 'Switch connection';
+      hdr.textContent = 'Select connection';
       popup.appendChild(hdr);
       // Connection options
       // Always include current env connection if not already in list
@@ -109,6 +109,24 @@ function _updateConnectionIndicator(cfg) {
         popup.appendChild(item);
       });
       // Add connection option
+      // Create fresh SQLite option — only show if not already on sqlite with no data
+      const freshItem = document.createElement('div');
+      freshItem.style.cssText = 'padding:6px 12px;cursor:pointer;color:var(--muted);font-size:10px;border-top:1px solid var(--border)';
+      freshItem.textContent = '+ Create fresh local SQLite';
+      freshItem.onmouseenter = () => { freshItem.style.background = 'var(--surface-3)'; freshItem.style.color = 'var(--text)'; };
+      freshItem.onmouseleave = () => { freshItem.style.background = ''; freshItem.style.color = 'var(--muted)'; };
+      freshItem.onclick = async () => {
+        popup.remove();
+        if (!confirm('Create a fresh local SQLite database? This switches the connection to local storage — existing Postgres data is unaffected.')) return;
+        try {
+          await api('/config/connections', { method: 'POST', body: JSON.stringify({ name: 'local', type: 'sqlite', activate: true }) });
+          await loadServerConfig();
+          const banner = document.getElementById('update-banner');
+          if (banner) { banner.style.display = 'block'; banner.querySelector('span').textContent = '\u26A0\uFE0F Switched to local SQLite \u2014 restart to apply'; }
+        } catch(e) { console.error('Create fresh SQLite failed:', e); }
+      };
+      popup.appendChild(freshItem);
+
       const addItem = document.createElement('div');
       addItem.style.cssText = 'padding:6px 12px;cursor:pointer;color:var(--muted);border-top:1px solid var(--border);margin-top:4px';
       addItem.textContent = '+ Add connection...';
@@ -674,7 +692,7 @@ function buildTabBody(project) {
         <hr class="claude-divider">
         <div class="claude-section" data-section="handoff">
           <div class="claude-section-label">Handoff</div>
-          <button class="primary claude-section-btn" id="copy-handoff-${project.id}">Copy latest handoff</button>
+          <button class="primary claude-section-btn" id="copy-handoff-${project.id}">Code Handoff</button>
           <div class="claude-handoff-ts" id="handoff-ts-${project.id}">no handoff yet</div>
           <button class="secondary claude-section-btn" id="regen-handoff-${project.id}">Regenerate handoff</button>
         </div>

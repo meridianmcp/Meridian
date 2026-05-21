@@ -467,7 +467,7 @@ Do not stop until all six are true.
 
 ---
 <!-- MERIDIAN STATE — auto-generated, do not edit below -->
-## Current Sprint State  _(auto-updated 2026-05-21 19:51 UTC)_
+## Current Sprint State  _(auto-updated 2026-05-21 20:04 UTC)_
 
 **Key Files:**
 - `meridian/server.py` — FastAPI app + MCP handlers
