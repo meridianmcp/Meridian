@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__meridian__list_projects",
+      "Bash(git pull *)",
+      "Bash(pixi run *)",
+      "mcp__meridian__start_session",
+      "mcp__meridian__add_sprint_item",
+      "mcp__meridian__log_task"
+    ]
+  }
+}

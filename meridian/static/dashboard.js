@@ -670,44 +670,46 @@ function buildTabBody(project) {
       </div>
       <div class="claude-launch-body">
         <div class="claude-section" data-section="continue">
-          <div class="claude-section-label">Continue session</div>
+          <div class="claude-section-label">Resume Claude Code session</div>
           <select class="claude-session-select" id="continue-session-${project.id}">
             <option value="">(no sessions yet)</option>
           </select>
           <button class="primary claude-section-btn" id="copy-resume-${project.id}">Copy resume command</button>
+          <p class="claude-hint">Paste into Claude Code to continue a previous session</p>
         </div>
         <hr class="claude-divider">
         <div class="claude-section" data-section="worker">
-          <div class="claude-section-label">Start worker</div>
-          <button class="primary claude-section-btn" id="start-worker-${project.id}">Start Worker Session</button>
+          <div class="claude-section-label">Start Claude Code worker</div>
+          <button class="primary claude-section-btn" id="start-worker-${project.id}">Claim &amp; start worker</button>
           <div class="claude-worker-result" id="worker-result-${project.id}" style="display:none">
             <pre class="claude-worker-xml" id="worker-xml-${project.id}"></pre>
             <button class="secondary claude-section-btn" id="copy-worker-${project.id}">Copy worker context</button>
             <p class="claude-hint">Paste into a new Claude Code terminal to start a worker</p>
           </div>
           <div class="claude-worker-empty" id="worker-empty-${project.id}" style="display:none">
-            <p class="claude-hint">No pending tasks. Add one to the queue first.</p>
+            <p class="claude-hint">No pending tasks — add one to the queue first.</p>
           </div>
         </div>
         <hr class="claude-divider">
         <div class="claude-section" data-section="handoff">
-          <div class="claude-section-label">Handoff</div>
-          <button class="primary claude-section-btn" id="copy-handoff-${project.id}">Code Handoff</button>
-          <div class="claude-handoff-ts" id="handoff-ts-${project.id}">no handoff yet</div>
-          <button class="secondary claude-section-btn" id="regen-handoff-${project.id}">Regenerate handoff</button>
-        </div>
-        <hr class="claude-divider">
-        <div class="claude-section" data-section="context">
-          <div class="claude-section-label">New session onboarding</div>
-          <button class="primary claude-section-btn" id="copy-context-${project.id}">Copy context JSON</button>
-          <p class="claude-hint">Paste into a new chat to get up to speed instantly</p>
+          <div class="claude-section-label">Claude Code handoff</div>
+          <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
+            <button class="primary claude-section-btn" id="copy-handoff-${project.id}">Code Handoff</button>
+            <button class="secondary claude-section-btn" id="regen-handoff-${project.id}">Regenerate</button>
+            <span class="claude-handoff-ts" id="handoff-ts-${project.id}" style="font-size:10px;color:var(--muted)"></span>
+          </div>
+          <p class="claude-hint">Copy and paste into Claude Code to resume with full context</p>
         </div>
         <hr class="claude-divider">
         <div class="claude-section claude-section-narrow" data-section="open">
-          <a class="claude-cta-secondary-btn" id="open-in-claude-${project.id}"
-             href="https://claude.ai/new" target="_blank" rel="noopener">Open in Claude →</a>
-          <p class="claude-hint">Paste your handoff there to start a planning session</p>
+          <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+            <a class="claude-cta-secondary-btn" id="open-in-claude-${project.id}"
+               href="https://claude.ai/new" target="_blank" rel="noopener">New Chat →</a>
+            <button class="secondary claude-section-btn" id="copy-context-${project.id}" style="font-size:11px">Copy chat context</button>
+          </div>
+          <p class="claude-hint">Open a new Claude.ai chat, paste the context to get up to speed</p>
         </div>
+      </div>
       </div>
     </section>
   `;
@@ -779,15 +781,36 @@ function buildTabBody(project) {
         board.innerHTML = '<div style="color:var(--muted);font-size:10px;padding:4px 0">(no sprint items — add one below)</div>';
         return;
       }
-      board.innerHTML = items.map(it => {
-        const done = it.status === 'done' || it.status === 'skipped';
-        const color = done ? 'var(--status-done)' : it.status === 'failed' ? 'var(--status-failed)' : 'var(--text)';
-        const strike = done ? 'text-decoration:line-through;opacity:0.5;' : '';
-        return `<div style="display:flex;align-items:flex-start;gap:6px;padding:4px 0;border-bottom:1px solid var(--border)">
-          <span style="font-size:10px;${strike}color:${color};flex:1;word-break:break-word">${escapeHtml(it.title)}</span>
-          ${!done ? `<button onclick="_sprintAction('${project.id}','${it.id}','complete')" title="Done" style="background:none;border:1px solid var(--status-done);color:var(--status-done);border-radius:3px;cursor:pointer;font-size:10px;padding:1px 5px">✓</button>
-          <button onclick="_deleteSprintItem('${project.id}','${it.id}')" title="Delete" style="background:none;border:1px solid var(--status-failed);color:var(--status-failed);border-radius:3px;cursor:pointer;font-size:10px;padding:1px 5px">✗</button>` : ''}
-        </div>`;
+      // Group by version — current sprint expanded, older collapsed
+      const currentSprint = (state.panels[project.id] || {}).sprint || '';
+      const byVersion = {};
+      items.forEach(it => {
+        const v = it.version || 'unversioned';
+        if (!byVersion[v]) byVersion[v] = [];
+        byVersion[v].push(it);
+      });
+      const versions = Object.keys(byVersion).sort((a, b) => b.localeCompare(a));
+      board.innerHTML = versions.map((v, vi) => {
+        const vItems = byVersion[v];
+        const isCurrentV = vi === 0 || currentSprint.includes(v);
+        const doneCount = vItems.filter(it => it.status === 'done' || it.status === 'skipped').length;
+        const rows = vItems.map(it => {
+          const done = it.status === 'done' || it.status === 'skipped';
+          const color = done ? 'var(--status-done)' : it.status === 'failed' ? 'var(--status-failed)' : 'var(--text)';
+          const strike = done ? 'text-decoration:line-through;opacity:0.4;' : '';
+          return `<div style="display:flex;align-items:flex-start;gap:6px;padding:3px 0;border-bottom:1px solid var(--border)">
+            <span style="font-size:10px;${strike}color:${color};flex:1;word-break:break-word">${escapeHtml(it.title)}</span>
+            ${!done ? `<button onclick="_sprintAction('${project.id}','${it.id}','complete')" title="Done" style="background:none;border:1px solid var(--status-done);color:var(--status-done);border-radius:3px;cursor:pointer;font-size:10px;padding:1px 5px">✓</button>
+            <button onclick="_deleteSprintItem('${project.id}','${it.id}')" title="Delete" style="background:none;border:1px solid var(--status-failed);color:var(--status-failed);border-radius:3px;cursor:pointer;font-size:10px;padding:1px 5px">✗</button>` : ''}
+          </div>`;
+        }).join('');
+        return `<details ${isCurrentV ? 'open' : ''} style="margin-bottom:4px">
+          <summary style="font-size:10px;font-weight:600;color:${isCurrentV ? 'var(--accent)' : 'var(--muted)'};cursor:pointer;padding:3px 0;list-style:none;display:flex;justify-content:space-between;user-select:none">
+            <span>${escapeHtml(v)}</span>
+            <span style="font-weight:400;opacity:0.6">${doneCount}/${vItems.length}</span>
+          </summary>
+          <div style="padding-left:4px">${rows}</div>
+        </details>`;
       }).join('');
     } catch(e) { console.error('Sprint board load failed:', e); }
   }
