@@ -1,6 +1,5 @@
 # Meridian
 
-[![GitHub stars](https://img.shields.io/github/stars/ajc3xc/Meridian?style=social)](https://github.com/ajc3xc/Meridian/stargazers)
 [![License: MSL-2.0](https://img.shields.io/badge/license-MSL--2.0-blue)](LICENSE)
 
 Your AI sessions don't remember each other.
@@ -9,6 +8,13 @@ Every Claude tab starts fresh. Parallel sessions duplicate work. Context fills u
 and you lose everything. Meridian fixes this — a local server every session connects
 to so they share goal state, see each other's task logs, and can resume instantly
 from a compressed handoff.
+
+## Screenshots
+
+![Dashboard](docs/screenshots/01_dashboard.png)
+![Live tab](docs/screenshots/02_live_tab.png)
+![Goal state](docs/screenshots/03_goal_tab.png)
+![Rewind timeline](docs/screenshots/05_rewind_tab.png)
 
 ## What you get
 
@@ -104,4 +110,6 @@ Zero-install dashboard at meridian.app — your team gets a shared URL, no Pytho
 
 ## License
 
-[MSL-1.0](LICENSE) — free for local use, any team size. See LICENSE for details.
+[MSL-2.0](LICENSE) — free for local and internal use, any team size. Paid for hosting as a service to others. See LICENSE for details.
+
+For licensing questions: hello@usemeridian.us

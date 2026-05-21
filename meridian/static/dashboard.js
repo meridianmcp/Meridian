@@ -80,14 +80,37 @@ function _updateConnectionIndicator(cfg) {
       if (!displayConns.find(c => c.active)) displayConns.unshift(envConn);
       displayConns.forEach(c => {
         const item = document.createElement('div');
-        item.style.cssText = `padding:6px 12px;cursor:pointer;display:flex;align-items:center;gap:8px;${c.active ? 'color:var(--accent)' : 'color:var(--text)'}`;
+        item.style.cssText = `padding:6px 12px;cursor:pointer;display:flex;align-items:center;gap:8px;justify-content:space-between;${c.active ? 'color:var(--accent)' : 'color:var(--text)'}`;
+        const left = document.createElement('div');
+        left.style.cssText = 'display:flex;align-items:center;gap:8px;flex:1;min-width:0';
         const dot2 = document.createElement('span');
-        dot2.style.cssText = `display:inline-block;width:6px;height:6px;border-radius:50%;background:${c.active ? 'var(--accent)' : 'var(--muted)'}`;
-        item.appendChild(dot2);
-        item.appendChild(document.createTextNode(c.name + ' (' + (c.type || 'sqlite') + ')'));
-        item.onmouseenter = () => { if (!c.active) item.style.background = 'var(--surface-3)'; };
-        item.onmouseleave = () => item.style.background = '';
-        item.onclick = async () => {
+        dot2.style.cssText = `display:inline-block;width:6px;height:6px;border-radius:50%;flex-shrink:0;background:${c.active ? 'var(--accent)' : 'var(--muted)'}`;
+        left.appendChild(dot2);
+        left.appendChild(document.createTextNode(c.name + ' (' + (c.type || 'sqlite') + ')'));
+        item.appendChild(left);
+        // Delete button (only for non-active named connections)
+        if (!c.active && c.name && c.name !== 'local') {
+          const del = document.createElement('button');
+          del.textContent = '×';
+          del.title = 'Remove connection';
+          del.style.cssText = 'background:none;border:none;color:var(--muted);cursor:pointer;font-size:14px;padding:0 2px;line-height:1;flex-shrink:0';
+          del.onmouseenter = () => del.style.color = 'var(--status-failed)';
+          del.onmouseleave = () => del.style.color = 'var(--muted)';
+          del.onclick = async (e) => {
+            e.stopPropagation();
+            if (!confirm('Remove connection "' + c.name + '"?')) return;
+            try {
+              await api('/config/connections/' + encodeURIComponent(c.name), { method: 'DELETE' });
+              popup.remove();
+              await loadServerConfig();
+            } catch(ex) { toast('Remove failed: ' + ex.message, true); }
+          };
+          item.appendChild(del);
+        }
+        item.onmouseenter = () => { if (!c.active) left.style.color = 'var(--accent)'; item.style.background = 'var(--surface-3)'; };
+        item.onmouseleave = () => { left.style.color = ''; item.style.background = ''; };
+        item.onclick = async (e) => {
+          if (e.target.tagName === 'BUTTON') return; // don't activate on delete click
           popup.remove();
           try {
             await api('/config/connections', { method: 'POST', body: JSON.stringify({ name: c.name, activate: true }) });
@@ -108,25 +131,6 @@ function _updateConnectionIndicator(cfg) {
         };
         popup.appendChild(item);
       });
-      // Add connection option
-      // Create fresh SQLite option — only show if not already on sqlite with no data
-      const freshItem = document.createElement('div');
-      freshItem.style.cssText = 'padding:6px 12px;cursor:pointer;color:var(--muted);font-size:10px;border-top:1px solid var(--border)';
-      freshItem.textContent = '+ Create fresh local SQLite';
-      freshItem.onmouseenter = () => { freshItem.style.background = 'var(--surface-3)'; freshItem.style.color = 'var(--text)'; };
-      freshItem.onmouseleave = () => { freshItem.style.background = ''; freshItem.style.color = 'var(--muted)'; };
-      freshItem.onclick = async () => {
-        popup.remove();
-        if (!confirm('Create a fresh local SQLite database? This switches the connection to local storage — existing Postgres data is unaffected.')) return;
-        try {
-          await api('/config/connections', { method: 'POST', body: JSON.stringify({ name: 'local', type: 'sqlite', activate: true }) });
-          await loadServerConfig();
-          const banner = document.getElementById('update-banner');
-          if (banner) { banner.style.display = 'block'; banner.querySelector('span').textContent = '\u26A0\uFE0F Switched to local SQLite \u2014 restart to apply'; }
-        } catch(e) { console.error('Create fresh SQLite failed:', e); }
-      };
-      popup.appendChild(freshItem);
-
       const addItem = document.createElement('div');
       addItem.style.cssText = 'padding:6px 12px;cursor:pointer;color:var(--muted);border-top:1px solid var(--border);margin-top:4px';
       addItem.textContent = '+ Add connection...';
@@ -197,7 +201,7 @@ async function _doRestart() {
     await new Promise(r => setTimeout(r, 2000));
     try {
       const r = await fetch('/health');
-      if (r.ok) { window.location.reload(); return; }
+      if (r.ok) { window.location.href = window.location.pathname + '?_cb=' + Date.now(); return; }
     } catch(_) { /* server still down — keep polling */ }
   }
   // Timed out
@@ -579,7 +583,7 @@ function buildTabBody(project) {
             </div>
             <div id="goal-autoblocks-wrapper-${project.id}" style="display:none;margin-top:8px">
               <div style="font-size:10px;color:var(--muted);font-weight:600;margin-bottom:4px;padding:0 2px">📋 Session Log (auto-updated, read-only)</div>
-              <div id="goal-autoblocks-${project.id}" style="background:var(--surface-2);border:1px solid var(--border);border-radius:4px;padding:8px;font-family:var(--font-mono);font-size:11px;color:var(--text);white-space:pre-wrap;word-break:break-word;max-height:300px;overflow-y:auto"></div>
+              <div id="goal-autoblocks-${project.id}" style="background:var(--surface-2);border:1px solid var(--border);border-radius:4px;padding:8px;font-family:var(--font-mono);font-size:13px;color:var(--text);white-space:pre-wrap;word-break:break-word;max-height:300px;overflow-y:auto"></div>
             </div>
           </div>
           <div class="goal-subtab-panel" id="gtab-sprint-${project.id}">
@@ -2418,6 +2422,10 @@ document.getElementById('ez-advanced-link').onclick = (e) => {
 (function() {
   const modal = document.getElementById('conn-setup-modal');
   const localBtn = document.getElementById('conn-local-btn');
+  const sqliteForm = document.getElementById('conn-sqlite-form');
+  const sqlitePath = document.getElementById('conn-sqlite-path');
+  const sqliteName = document.getElementById('conn-sqlite-name');
+  const sqliteSave = document.getElementById('conn-sqlite-save-btn');
   const pgToggle = document.getElementById('conn-pg-toggle-btn');
   const pgForm = document.getElementById('conn-pg-form');
   const pgSave = document.getElementById('conn-pg-save-btn');
@@ -2428,8 +2436,6 @@ document.getElementById('ez-advanced-link').onclick = (e) => {
 
   function showErr(msg) { if (errEl) { errEl.textContent = msg; errEl.style.display = msg ? 'block' : 'none'; } }
 
-  // Show if server config has no toml — checked in init() after loadServerConfig
-  // Escape closes the modal
   document.addEventListener('keydown', (e) => {
     if (e.key === 'Escape') {
       const m = document.getElementById('conn-setup-modal');
@@ -2441,19 +2447,39 @@ document.getElementById('ez-advanced-link').onclick = (e) => {
     if (!cfg?.toml_exists && cfg?.db !== 'postgres') modal.style.display = 'flex';
   };
 
-  if (localBtn) localBtn.onclick = async () => {
+  // Local SQLite toggle — show path form
+  if (localBtn) localBtn.onclick = () => {
+    if (!sqliteForm) return;
+    const open = sqliteForm.style.display === 'flex';
+    sqliteForm.style.display = open ? 'none' : 'flex';
+    if (!open && sqlitePath && !sqlitePath.value) sqlitePath.value = 'data/meridian.db';
+    // Close postgres form
+    if (pgForm) pgForm.style.display = 'none';
+  };
+
+  if (sqliteSave) sqliteSave.onclick = async () => {
+    const path = sqlitePath?.value.trim() || 'data/meridian.db';
+    const name = sqliteName?.value.trim() || 'local';
+    showErr('');
     try {
+      sqliteSave.textContent = 'Saving…'; sqliteSave.disabled = true;
       await api('/config/connections', {
         method: 'POST',
-        body: JSON.stringify({ name: 'local', type: 'sqlite', activate: true }),
+        body: JSON.stringify({ name, type: 'sqlite', path, activate: true }),
       });
       modal.style.display = 'none';
-      await loadServerConfig();
-    } catch(e) { showErr('Failed: ' + e.message); }
+      toast('Saved — restarting…');
+      await _doRestart();
+    } catch(e) {
+      showErr('Failed: ' + e.message);
+      sqliteSave.textContent = 'Save & Restart →'; sqliteSave.disabled = false;
+    }
   };
 
   if (pgToggle) pgToggle.onclick = () => {
     if (pgForm) pgForm.style.display = pgForm.style.display === 'none' ? 'flex' : 'none';
+    // Close sqlite form
+    if (sqliteForm) sqliteForm.style.display = 'none';
   };
 
   if (pgSave) pgSave.onclick = async () => {

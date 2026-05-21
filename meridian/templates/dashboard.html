@@ -66,6 +66,13 @@
     <div style="font-size:11px;color:var(--muted);margin-bottom:18px">Choose where Meridian stores your data. You can change this later.</div>
     <div style="display:flex;flex-direction:column;gap:10px">
       <button id="conn-local-btn" class="primary" style="padding:12px;font-size:12px;text-align:left">&#x1F4BE; Local SQLite (recommended)<br><span style="font-size:10px;color:rgba(255,255,255,0.7);font-weight:400">Stores data in data/meridian.db — no setup needed</span></button>
+      <div id="conn-sqlite-form" style="display:none;flex-direction:column;gap:8px">
+        <input id="conn-sqlite-path" type="text" placeholder="path/to/meridian.db"
+          style="background:var(--surface-1);border:1px solid var(--border);border-radius:4px;padding:10px 12px;color:var(--text);font-family:'IBM Plex Mono',monospace;font-size:11px;outline:none;width:100%;box-sizing:border-box">
+        <input id="conn-sqlite-name" type="text" placeholder="connection name (e.g. local)"
+          style="background:var(--surface-1);border:1px solid var(--border);border-radius:4px;padding:8px 12px;color:var(--text);font-family:'IBM Plex Mono',monospace;font-size:11px;outline:none;width:100%;box-sizing:border-box">
+        <button id="conn-sqlite-save-btn" class="primary" style="padding:10px;font-size:12px">Save & Restart →</button>
+      </div>
       <button id="conn-pg-toggle-btn" style="padding:12px;font-size:12px;text-align:left;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;color:var(--text);cursor:pointer;font-family:'IBM Plex Mono',monospace">&#x1F5C4;&#xFE0F; PostgreSQL<br><span style="font-size:10px;color:var(--muted);font-weight:400">Use Neon, Supabase, or any Postgres URL</span></button>
       <div id="conn-pg-form" style="display:none;flex-direction:column;gap:8px">
         <input id="conn-pg-url" type="text" placeholder="postgresql://user:pass@host/db"

@@ -1934,6 +1934,29 @@ async def save_connection(body: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+
+@app.delete("/config/connections/{name}")
+async def delete_connection(name: str) -> dict[str, Any]:
+    """v1.9.x — remove a named connection profile from meridian.toml."""
+    data = toml_config_module.load_toml() or {}
+    connections: dict[str, dict[str, str]] = {
+        cname: dict(ccfg)
+        for cname, ccfg in data.get("connections", {}).items()
+    }
+    if name not in connections:
+        raise HTTPException(404, f"connection '{name}' not found")
+    del connections[name]
+    current_default = data.get("default", {}).get("connection", "local")
+    # If we deleted the active connection, fall back to local
+    if current_default == name:
+        current_default = "local"
+    toml_config_module.save_toml(
+        default_connection=current_default,
+        connections=connections,
+    )
+    return {"ok": True, "deleted": name}
+
+
 # ---------------------------------------------------------------------------
 # Git remote warning
 # ---------------------------------------------------------------------------
