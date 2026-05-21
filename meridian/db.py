@@ -129,15 +129,20 @@ CREATE TABLE IF NOT EXISTS chat_sessions (
 -- v1.1 — sprint_items: machine-trackable checklist alongside the
 -- free-text sprint field. Each item is one thing the sprint needs
 -- shipped (a version number, a feature, a fix). status moves through
--- pending → in_progress → done|skipped. task_id optionally links the
--- item to the task that finished it so the timeline can correlate.
+-- todo → in_progress → done|failed|skipped|pushed. task_id optionally
+-- links the item to the task that finished it. item_group lets items
+-- be grouped by objective. pushed_to records the version an item was
+-- deferred to. human_id attributes the item to a person.
 CREATE TABLE IF NOT EXISTS sprint_items (
     id TEXT PRIMARY KEY,
     project_id TEXT NOT NULL REFERENCES projects(id),
     version TEXT NOT NULL,
     title TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'pending'
-        CHECK (status IN ('pending','in_progress','done','skipped')),
+        CHECK (status IN ('pending','todo','in_progress','done','failed','skipped','pushed')),
+    item_group TEXT,
+    pushed_to TEXT,
+    human_id TEXT,
     added_at TEXT NOT NULL DEFAULT (datetime('now')),
     completed_at TEXT,
     task_id TEXT,
@@ -446,6 +451,65 @@ async def _migrate_goal_hierarchy(db: aiosqlite.Connection) -> None:
     await db.commit()
 
 
+async def _migrate_sprint_items_v2(db: aiosqlite.Connection) -> None:
+    """v1.9x — expand sprint_items: add item_group/pushed_to/human_id and
+    widen status CHECK to include 'todo', 'failed', 'pushed'.
+
+    Can't ALTER a CHECK constraint in SQLite, so the table is rebuilt in
+    place using the create-copy-drop-rename pattern. sprint_items has no
+    FK references FROM other tables (it only has a FK TO projects) so the
+    RENAME is safe without toggling foreign_keys.
+
+    No-op when the schema is already current (all new columns present and
+    status constraint includes 'failed').
+    """
+    async with db.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='sprint_items'"
+    ) as cur:
+        row = await cur.fetchone()
+    if row is None:
+        return  # fresh DB — CREATE_TABLES builds the current schema
+    sql = row[0] or ""
+    # Already migrated when all three new columns + 'failed' status are present.
+    if ("item_group" in sql and "pushed_to" in sql
+            and "human_id" in sql and "'failed'" in sql):
+        return
+    # Rebuild the table with the new schema.
+    await db.executescript(
+        """
+        CREATE TABLE sprint_items_new (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL REFERENCES projects(id),
+            version TEXT NOT NULL,
+            title TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending'
+                CHECK (status IN
+                    ('pending','todo','in_progress','done','failed','skipped','pushed')),
+            item_group TEXT,
+            pushed_to TEXT,
+            human_id TEXT,
+            added_at TEXT NOT NULL DEFAULT (datetime('now')),
+            completed_at TEXT,
+            task_id TEXT,
+            notes TEXT
+        );
+        INSERT INTO sprint_items_new
+            (id, project_id, version, title, status,
+             added_at, completed_at, task_id, notes)
+            SELECT id, project_id, version, title, status,
+                   added_at, completed_at, task_id, notes
+            FROM sprint_items;
+        DROP TABLE sprint_items;
+        ALTER TABLE sprint_items_new RENAME TO sprint_items;
+        CREATE INDEX IF NOT EXISTS idx_sprint_items_project
+            ON sprint_items(project_id, status);
+        CREATE INDEX IF NOT EXISTS idx_sprint_items_version
+            ON sprint_items(project_id, version);
+        """
+    )
+    await db.commit()
+
+
 async def init_db(db_path: str) -> aiosqlite.Connection:
     """Open the database, apply schema, and return the connection.
 
@@ -485,6 +549,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_worker_pid(db)
     await _migrate_rewind_token(db)
     await _migrate_sessions_archived(db)
+    await _migrate_sprint_items_v2(db)
     return db
 
 
@@ -1518,7 +1583,9 @@ async def expire_idle_sessions(
 # ---------------------------------------------------------------------------
 
 
-_VALID_SPRINT_STATUSES = {"pending", "in_progress", "done", "skipped"}
+_VALID_SPRINT_STATUSES = {
+    "pending", "todo", "in_progress", "done", "failed", "skipped", "pushed"
+}
 
 
 async def add_sprint_item(
@@ -1526,13 +1593,21 @@ async def add_sprint_item(
     project_id: str,
     version: str,
     title: str,
+    group: str | None = None,
+    human_id: str | None = None,
 ) -> dict[str, Any]:
-    """Append a new ``pending`` sprint item to a project's checklist."""
+    """Append a new ``todo`` sprint item to a project's checklist.
+
+    ``group`` (stored as ``item_group``) lets items be organised under
+    named objectives so the dashboard sprint board can render them in
+    logical clusters. ``human_id`` attributes the item to a person.
+    """
     iid = _new_id()
     await db.execute(
-        "INSERT INTO sprint_items (id, project_id, version, title) "
-        "VALUES (?, ?, ?, ?)",
-        (iid, project_id, version, title),
+        "INSERT INTO sprint_items "
+        "(id, project_id, version, title, item_group, human_id) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (iid, project_id, version, title, group, human_id),
     )
     await db.commit()
     item = await get_sprint_item(db, iid)
@@ -1558,13 +1633,19 @@ async def _update_sprint_item_status(
     status: str,
     task_id: str | None = None,
     notes: str | None = None,
+    pushed_to: str | None = None,
 ) -> dict[str, Any] | None:
-    """Internal: flip a sprint item's status and optionally link a task."""
+    """Internal: flip a sprint item's status and optionally link a task.
+
+    Terminal statuses (done / skipped / failed / pushed) stamp
+    ``completed_at``; non-terminal statuses clear it. ``pushed_to``
+    records the target version when status == 'pushed'.
+    """
     if status not in _VALID_SPRINT_STATUSES:
         raise ValueError(f"invalid sprint-item status: {status!r}")
     fields = ["status = ?"]
     values: list[Any] = [status]
-    if status in {"done", "skipped"}:
+    if status in {"done", "skipped", "failed", "pushed"}:
         fields.append("completed_at = datetime('now')")
     else:
         fields.append("completed_at = NULL")
@@ -1574,6 +1655,9 @@ async def _update_sprint_item_status(
     if notes is not None:
         fields.append("notes = ?")
         values.append(notes)
+    if pushed_to is not None:
+        fields.append("pushed_to = ?")
+        values.append(pushed_to)
     values.append(item_id)
     values.append(project_id)
     cursor = await db.execute(
@@ -1616,9 +1700,39 @@ async def start_sprint_item(
     project_id: str,
     item_id: str,
 ) -> dict[str, Any] | None:
-    """Flip a sprint item from ``pending`` to ``in_progress``."""
+    """Flip a sprint item from ``pending``/``todo`` to ``in_progress``."""
     return await _update_sprint_item_status(
         db, project_id, item_id, "in_progress"
+    )
+
+
+async def fail_sprint_item(
+    db: aiosqlite.Connection,
+    project_id: str,
+    item_id: str,
+    reason: str | None = None,
+) -> dict[str, Any] | None:
+    """Mark a sprint item ``failed``. ``reason`` stored in ``notes``."""
+    return await _update_sprint_item_status(
+        db, project_id, item_id, "failed", notes=reason
+    )
+
+
+async def push_sprint_item(
+    db: aiosqlite.Connection,
+    project_id: str,
+    item_id: str,
+    to_version: str,
+) -> dict[str, Any] | None:
+    """Mark a sprint item ``pushed`` — deferred to a future version.
+
+    ``to_version`` is stored in ``pushed_to`` so the board can show
+    where the item was moved and the next sprint can pick it up.
+    """
+    if not to_version:
+        raise ValueError("to_version is required for push_sprint_item")
+    return await _update_sprint_item_status(
+        db, project_id, item_id, "pushed", pushed_to=to_version
     )
 
 
@@ -1634,7 +1748,10 @@ async def get_sprint_items(
     """
     if status is not None:
         if status not in _VALID_SPRINT_STATUSES:
-            raise ValueError(f"invalid sprint-item status filter: {status!r}")
+            raise ValueError(
+                f"invalid sprint-item status filter: {status!r}. "
+                f"Valid: {sorted(_VALID_SPRINT_STATUSES)}"
+            )
         query = (
             "SELECT * FROM sprint_items WHERE project_id = ? "
             "AND status = ? ORDER BY added_at ASC, rowid ASC"
@@ -1867,20 +1984,43 @@ async def get_timeline(
 def build_sprint_items_xml(items: list[dict[str, Any]]) -> str:
     """Serialise sprint items as a ``<sprint_items>`` XML block.
 
+    Since v1.9x items are optionally grouped by ``item_group``. When a
+    group name is set, items are wrapped in ``<group name="...">`` tags
+    so cold sessions can parse the board structure. Items without a
+    group are emitted at the top level (ungrouped) before any groups.
+
     Mirrors the get_goal XML envelope (v0.6.1) so cold sessions render
     the checklist alongside the goal text in a single prompt.
     """
     from xml.sax.saxutils import escape, quoteattr
+    from collections import OrderedDict
+
+    # Preserve insertion order: ungrouped first, then named groups in
+    # first-seen order.
+    groups: OrderedDict[str, list[dict[str, Any]]] = OrderedDict()
+    for it in items:
+        g = it.get("item_group") or ""
+        if g not in groups:
+            groups[g] = []
+        groups[g].append(it)
 
     out = ['<sprint_items cache="false">']
-    for it in items:
-        ver = quoteattr(it.get("version") or "")
-        status = quoteattr(it.get("status") or "pending")
-        iid = quoteattr(it.get("id") or "")
-        title = escape(it.get("title") or "")
-        out.append(
-            f"  <item id={iid} version={ver} status={status}>{title}</item>"
-        )
+    for group_name, group_items in groups.items():
+        if group_name:
+            out.append(f'  <group name={quoteattr(group_name)}>')
+        for it in group_items:
+            ver = quoteattr(it.get("version") or "")
+            status = quoteattr(it.get("status") or "todo")
+            iid = quoteattr(it.get("id") or "")
+            title = escape(it.get("title") or "")
+            pushed_to = it.get("pushed_to")
+            attrs = f"id={iid} version={ver} status={status}"
+            if pushed_to:
+                attrs += f" pushed_to={quoteattr(str(pushed_to))}"
+            indent = "    " if group_name else "  "
+            out.append(f"{indent}<item {attrs}>{title}</item>")
+        if group_name:
+            out.append("  </group>")
     out.append("</sprint_items>")
     return "\n".join(out)
 

@@ -2731,11 +2731,114 @@ async def test_get_sprint_items_filters_by_status(db):
     assert len(all_items) == 2
 
 
+@pytest.mark.asyncio
+async def test_fail_sprint_item(db):
+    """fail_sprint_item sets status=failed and stores reason in notes."""
+    p = await db_module.create_project(db, "alpha")
+    item = await db_module.add_sprint_item(db, p["id"], "v1.9", "my item")
+    failed = await db_module.fail_sprint_item(db, p["id"], item["id"], reason="blocker")
+    assert failed is not None
+    assert failed["status"] == "failed"
+    assert failed["notes"] == "blocker"
+    assert failed["completed_at"] is not None
+
+
+@pytest.mark.asyncio
+async def test_push_sprint_item(db):
+    """push_sprint_item sets status=pushed and stores target version."""
+    p = await db_module.create_project(db, "alpha")
+    item = await db_module.add_sprint_item(db, p["id"], "v1.9", "deferred feat")
+    pushed = await db_module.push_sprint_item(db, p["id"], item["id"], "v2.0")
+    assert pushed is not None
+    assert pushed["status"] == "pushed"
+    assert pushed["pushed_to"] == "v2.0"
+    assert pushed["completed_at"] is not None
+
+
+@pytest.mark.asyncio
+async def test_add_sprint_item_with_group(db):
+    """add_sprint_item stores item_group correctly."""
+    p = await db_module.create_project(db, "alpha")
+    item = await db_module.add_sprint_item(
+        db, p["id"], "v1.9", "grouped task", group="Auth", human_id="adam"
+    )
+    assert item["item_group"] == "Auth"
+    assert item["human_id"] == "adam"
+    # Retrieve and confirm persistence
+    fetched = await db_module.get_sprint_item(db, item["id"])
+    assert fetched["item_group"] == "Auth"
+
+
+def test_build_sprint_items_xml_grouped():
+    """build_sprint_items_xml wraps items in <group> when item_group is set."""
+    xml = db_module.build_sprint_items_xml([
+        {"id": "id-1", "version": "v1", "status": "todo",
+         "title": "ungrouped", "item_group": None, "pushed_to": None},
+        {"id": "id-2", "version": "v1", "status": "todo",
+         "title": "grouped", "item_group": "Auth", "pushed_to": None},
+    ])
+    assert '<sprint_items cache="false">' in xml
+    assert '<item' in xml
+    assert 'ungrouped' in xml
+    assert '<group name="Auth">' in xml
+    assert 'grouped' in xml
+    assert xml.endswith("</sprint_items>")
+
+
+def test_build_sprint_items_xml_pushed_to_attr():
+    """build_sprint_items_xml includes pushed_to attribute when set."""
+    xml = db_module.build_sprint_items_xml([
+        {"id": "id-1", "version": "v1", "status": "pushed",
+         "title": "deferred", "item_group": None, "pushed_to": "v2.0"},
+    ])
+    assert 'pushed_to="v2.0"' in xml
+
+
+def test_http_sprint_items_fail_and_push(client):
+    """HTTP fail and push endpoints work and return 404 for unknown items."""
+    project = client.post("/projects", json={"name": "alpha"}).json()
+    r = client.post(
+        f"/projects/{project['id']}/sprint-items",
+        json={"version": "v1.9", "title": "will fail"},
+    )
+    assert r.status_code == 201
+    item = r.json()
+    # fail it
+    r = client.post(
+        f"/projects/{project['id']}/sprint-items/{item['id']}/fail",
+        json={"reason": "blocked"},
+    )
+    assert r.status_code == 200
+    assert r.json()["status"] == "failed"
+    # 404 for unknown item on push
+    r = client.post(
+        f"/projects/{project['id']}/sprint-items/not-real/push",
+        json={"to_version": "v2.0"},
+    )
+    assert r.status_code == 404
+
+
+def test_http_sprint_item_group_and_human_id(client):
+    """POST /sprint-items accepts group and human_id fields."""
+    project = client.post("/projects", json={"name": "alpha"}).json()
+    r = client.post(
+        f"/projects/{project['id']}/sprint-items",
+        json={"version": "v1.9", "title": "grouped item",
+              "group": "Infra", "human_id": "adam"},
+    )
+    assert r.status_code == 201
+    item = r.json()
+    assert item["item_group"] == "Infra"
+    assert item["human_id"] == "adam"
+
+
 def test_build_sprint_items_xml_layout():
     xml = db_module.build_sprint_items_xml([
         {
             "id": "id-1",
             "version": "v0.6.4",
+            "item_group": None,
+            "pushed_to": None,
             "status": "pending",
             "title": "Dashboard save",
         }

@@ -385,6 +385,38 @@ input[type=text] {
 .live-sprint-bar-track { color: var(--accent); letter-spacing: 1px; }
 .live-sprint-bar-count { color: var(--fg); font-weight: 600; }
 .live-sprint-bar-pct { color: var(--muted); }
+/* Sprint board (v1.9x) */
+.sprint-group-header {
+  font-size: 10px; font-family: 'IBM Plex Mono', monospace;
+  font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase;
+  color: var(--accent); margin: 8px 0 3px; padding: 2px 0;
+  border-bottom: 1px solid var(--border);
+}
+.sprint-item-row {
+  display: flex; align-items: center; gap: 6px;
+  padding: 3px 0; border-bottom: 1px solid var(--border);
+  font-size: 12px; min-height: 28px;
+}
+.sprint-item-icon { flex-shrink: 0; width: 14px; text-align: center; font-size: 11px; }
+.sprint-item-title { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sprint-item-ver { color: var(--muted); font-size: 10px; flex-shrink: 0; }
+.sprint-item-meta { color: var(--muted); font-size: 10px; flex-shrink: 0;
+  max-width: 80px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sprint-item-actions { display: flex; gap: 2px; flex-shrink: 0; }
+.sprint-btn {
+  background: none; border: 1px solid var(--border); border-radius: 3px;
+  padding: 1px 5px; font-size: 11px; cursor: pointer;
+  color: var(--muted); line-height: 1.4;
+}
+.sprint-btn:hover { color: var(--accent-green); border-color: var(--accent-green); }
+.sprint-btn-fail:hover { color: #e05; border-color: #e05; }
+.sprint-btn-push:hover { color: var(--accent); border-color: var(--accent); }
+.sprint-footer {
+  margin-top: 8px; padding-top: 6px; border-top: 1px solid var(--border);
+  display: flex; flex-direction: column; gap: 6px;
+}
+.sprint-pct { font-size: 11px; color: var(--muted); font-family: monospace; }
+.sprint-add-row { display: flex; gap: 4px; align-items: center; }
 .live-add-row { display: flex; gap: 6px; }
 .live-add-input {
   flex: 1; padding: 8px 10px;

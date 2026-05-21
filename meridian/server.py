@@ -676,7 +676,12 @@ async def list_sprint_items(
 async def add_sprint_item_endpoint(
     project_id: str, body: dict[str, Any], request: Request
 ) -> dict[str, Any]:
-    """Append a pending sprint item. Body: ``{version, title}``."""
+    """Append a todo sprint item.
+
+    Body: ``{version, title, group?, human_id?}``.
+    ``group`` (alias ``item_group``) groups the item under a named objective
+    on the sprint board.
+    """
     project = await db_module.get_project(_db(request), project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="project not found")
@@ -686,8 +691,11 @@ async def add_sprint_item_endpoint(
         raise HTTPException(
             status_code=422, detail="version and title are required"
         )
+    group = body.get("group") or body.get("item_group") or None
+    human_id = body.get("human_id") or None
     return await db_module.add_sprint_item(
-        _db(request), project_id, version, title
+        _db(request), project_id, version, title,
+        group=group, human_id=human_id,
     )
 
 
@@ -720,6 +728,42 @@ async def skip_sprint_item_endpoint(
         item_id,
         reason=(body or {}).get("reason"),
     )
+    if item is None:
+        raise HTTPException(status_code=404, detail="sprint item not found")
+    return item
+
+
+@app.post("/projects/{project_id}/sprint-items/{item_id}/fail")
+async def fail_sprint_item_endpoint(
+    project_id: str, item_id: str, request: Request,
+    body: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Mark a sprint item ``failed``. Optional body: ``{reason}``."""
+    item = await db_module.fail_sprint_item(
+        _db(request),
+        project_id,
+        item_id,
+        reason=(body or {}).get("reason"),
+    )
+    if item is None:
+        raise HTTPException(status_code=404, detail="sprint item not found")
+    return item
+
+
+@app.post("/projects/{project_id}/sprint-items/{item_id}/push")
+async def push_sprint_item_endpoint(
+    project_id: str, item_id: str, body: dict[str, Any], request: Request
+) -> dict[str, Any]:
+    """Push a sprint item to a future version. Body: ``{to_version}``."""
+    to_version = (body.get("to_version") or "").strip()
+    if not to_version:
+        raise HTTPException(status_code=422, detail="to_version is required")
+    try:
+        item = await db_module.push_sprint_item(
+            _db(request), project_id, item_id, to_version
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
     if item is None:
         raise HTTPException(status_code=404, detail="sprint item not found")
     return item
@@ -1342,11 +1386,13 @@ async def _start_session_composite(
         goal["xml"] = goal_xml
         goal["cache_blocks"] = goal_cache_blocks
 
-    # v1.1 — surface the still-pending sprint checklist so cold sessions
-    # see what's in flight before doing anything.
-    pending_items = await db_module.get_sprint_items(
-        db, project_id, status="pending"
-    )
+    # v1.1 — surface the active sprint checklist so cold sessions see
+    # what's in flight before doing anything. "Active" = todo/pending/in_progress.
+    active_statuses = ("todo", "pending", "in_progress")
+    all_sprint_items = await db_module.get_sprint_items(db, project_id)
+    pending_items = [
+        it for it in all_sprint_items if it.get("status") in active_statuses
+    ]
     sprint_items_xml = db_module.build_sprint_items_xml(pending_items)
 
     return {
@@ -1354,7 +1400,7 @@ async def _start_session_composite(
         "goal": goal,
         "goal_xml": goal_xml,  # v0.6.1 — always present
         "goal_cache_blocks": goal_cache_blocks,  # v0.6.2 — ready for Anthropic
-        "sprint_items": pending_items,  # v1.1 — pending checklist
+        "sprint_items": pending_items,  # v1.1 — active checklist
         "sprint_items_xml": sprint_items_xml,
         "recent_tasks": recent_tasks,
         "active_sessions": active_sessions,
@@ -1792,9 +1838,11 @@ def build_mcp_server():
             Tool(
                 name="add_sprint_item",
                 description=(
-                    "Append a pending item to the project's machine-trackable "
+                    "Append a todo item to the project's machine-trackable "
                     "sprint checklist (v1.1). Use this when you start work on "
                     "a new version so the next session sees what's in flight. "
+                    "Optional: group items under a named objective with "
+                    "'group'; attribute the item to a person with 'human_id'. "
                     "Returns the new item."
                 ),
                 inputSchema={
@@ -1803,6 +1851,17 @@ def build_mcp_server():
                         "project_id": {"type": "string"},
                         "version": {"type": "string"},
                         "title": {"type": "string"},
+                        "group": {
+                            "type": "string",
+                            "description": (
+                                "Optional objective name to group this item "
+                                "under on the sprint board."
+                            ),
+                        },
+                        "human_id": {
+                            "type": "string",
+                            "description": "Optional: person this item is assigned to.",
+                        },
                     },
                     "required": ["project_id", "version", "title"],
                 },
@@ -1842,11 +1901,51 @@ def build_mcp_server():
                 },
             ),
             Tool(
+                name="fail_sprint_item",
+                description=(
+                    "Mark a sprint item failed — attempted but could not "
+                    "be shipped. Provide a one-line ``reason`` so the next "
+                    "session knows what went wrong. The item stays on the "
+                    "board in 'failed' state so it isn't silently lost."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "project_id": {"type": "string"},
+                        "item_id": {"type": "string"},
+                        "reason": {"type": "string"},
+                    },
+                    "required": ["project_id", "item_id"],
+                },
+            ),
+            Tool(
+                name="push_sprint_item",
+                description=(
+                    "Push a sprint item to a future version. Use this when "
+                    "scope creep means the item won't fit this sprint. "
+                    "``to_version`` records where it was moved (e.g. 'v2.0'). "
+                    "The item status becomes 'pushed'; the next sprint can "
+                    "add it fresh with add_sprint_item."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "project_id": {"type": "string"},
+                        "item_id": {"type": "string"},
+                        "to_version": {
+                            "type": "string",
+                            "description": "Target version string, e.g. 'v2.0'.",
+                        },
+                    },
+                    "required": ["project_id", "item_id", "to_version"],
+                },
+            ),
+            Tool(
                 name="get_sprint_items",
                 description=(
-                    "List sprint items for a project. Optional status "
-                    "filter (pending|in_progress|done|skipped). Cold "
-                    "sessions read this to know what's still owed."
+                    "List sprint items for a project. Optional status filter "
+                    "(todo|pending|in_progress|done|failed|skipped|pushed). "
+                    "Cold sessions read this to know what's still owed."
                 ),
                 inputSchema={
                     "type": "object",
@@ -1855,7 +1954,8 @@ def build_mcp_server():
                         "status": {
                             "type": "string",
                             "enum": [
-                                "pending", "in_progress", "done", "skipped",
+                                "pending", "todo", "in_progress",
+                                "done", "failed", "skipped", "pushed",
                             ],
                         },
                     },
@@ -2183,6 +2283,8 @@ def build_mcp_server():
                     arguments["project_id"],
                     arguments["version"],
                     arguments["title"],
+                    group=arguments.get("group"),
+                    human_id=arguments.get("human_id"),
                 )
             elif name == "complete_sprint_item":
                 item = await db_module.complete_sprint_item(
@@ -2200,6 +2302,25 @@ def build_mcp_server():
                     reason=arguments.get("reason"),
                 )
                 result = item or {"error": "sprint item not found"}
+            elif name == "fail_sprint_item":
+                item = await db_module.fail_sprint_item(
+                    db,
+                    arguments["project_id"],
+                    arguments["item_id"],
+                    reason=arguments.get("reason"),
+                )
+                result = item or {"error": "sprint item not found"}
+            elif name == "push_sprint_item":
+                try:
+                    item = await db_module.push_sprint_item(
+                        db,
+                        arguments["project_id"],
+                        arguments["item_id"],
+                        arguments["to_version"],
+                    )
+                    result = item or {"error": "sprint item not found"}
+                except ValueError as exc:
+                    result = {"error": str(exc)}
             elif name == "get_sprint_items":
                 result = await db_module.get_sprint_items(
                     db,

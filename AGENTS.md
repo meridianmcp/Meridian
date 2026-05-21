@@ -110,6 +110,20 @@ pixi run start   # start server at localhost:7878
 pixi run test    # run all tests (must be green before committing)
 ```
 
+## Goal field permissions — READ CAREFULLY
+
+| Field | Who can write | What it is |
+|-------|--------------|------------|
+| `north_star` | **READ ONLY for Claude Code. Never write.** | Long-lived product vision. Only the human owner writes this. |
+| `version_goal` | Read + update SHIPPED section only | Current version's scope. Add "✓ Shipped X" lines but don't rewrite. |
+| `sprint` | One-line header only. NOT a task list. | e.g. `v1.9x — sprint board restructure`. Nothing else. |
+| `sprint_items` | **YOUR task list.** Claim todo items, mark done on complete. | Machine-trackable per-item checklist. Use the sprint_items MCP tools. |
+| `task_log` | `log_task(pending)` to add, `claim_task` + `complete_task` to work. | Per-task work log shared across sessions. |
+
+**`sprint` field rule:** The sprint field is a **ONE-LINE header only** — e.g. `"v1.9x — sprint board restructure"`. Do NOT put bullet points, task lists, or multi-line content here. Tasks go in `sprint_items`.
+
+**`sprint_items` workflow:** `add_sprint_item` → `claim_task` on related log_task → do work → `complete_sprint_item`.
+
 ## MCP tools available
 
 | Tool | When to call |
@@ -123,11 +137,17 @@ pixi run test    # run all tests (must be green before committing)
 | `log_task` | Frequently — after every significant action |
 | `set_goal` | Only on deliberate milestones, only if you're the project owner |
 | `set_north_star` | Rarely — only the project owner, only on major pivots |
-| `set_sprint` | Per-session or per-week focus update |
+| `set_sprint` | One-line sprint header update only — NOT a task list |
 | `claim_task` | Before starting a task — prevents duplicate work |
 | `release_task` | If you can't finish a claimed task |
 | `generate_handoff` | Before ending any session |
 | `heartbeat` | Every 5 min in long-running sessions |
+| `add_sprint_item` | Add a todo item to the sprint board (version + title + optional group) |
+| `complete_sprint_item` | Mark a sprint item done when shipped |
+| `skip_sprint_item` | Mark a sprint item intentionally not shipped (with reason) |
+| `fail_sprint_item` | Mark a sprint item failed (with reason) |
+| `push_sprint_item` | Defer a sprint item to a future version |
+| `get_sprint_items` | List sprint items (with optional status filter) |
 
 ## Key constants
 

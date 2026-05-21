@@ -647,27 +647,156 @@ async function refreshLiveTab(projectId) {
 }
 
 function renderSprintProgress(projectId, items) {
+  /** Full grouped sprint board — replaces the old plain progress bar. */
   const root = document.getElementById(`live-sprint-progress-${projectId}`);
   if (!root) return;
-  const total = items.length;
-  if (total === 0) {
-    root.textContent = 'No sprint items defined.';
+
+  const statusIcon = s => ({
+    pending: '○', todo: '○', in_progress: '◑',
+    done: '●', failed: '✕', skipped: '—', pushed: '→'
+  }[s] || '?');
+  const statusColor = s => ({
+    pending: 'var(--muted)', todo: 'var(--muted)',
+    in_progress: 'var(--accent)',
+    done: 'var(--accent-green)',
+    failed: '#e05',
+    skipped: 'var(--muted)',
+    pushed: 'var(--accent)'
+  }[s] || 'var(--muted)');
+  const activeSet = new Set(['pending', 'todo', 'in_progress']);
+
+  if (items.length === 0) {
+    root.innerHTML = `
+      <div class="live-empty">No sprint items. Add one below.</div>
+      <div class="sprint-add-row" style="margin-top:6px">
+        <input class="live-add-input" id="sprint-add-input-${projectId}"
+               placeholder="version:title (e.g. v1.9:My item)">
+        <button class="secondary sprint-add-btn" data-pid="${escapeHtml(projectId)}"
+                style="margin-left:4px">+ Add</button>
+      </div>`;
+    root.querySelector('.sprint-add-btn').onclick =
+      () => addSprintItemFromInput(projectId);
+    wireSprintAddEnter(projectId, root);
     return;
   }
+
+  // Group by item_group; ungrouped first.
+  const groups = new Map();
+  items.forEach(it => {
+    const g = it.item_group || '';
+    if (!groups.has(g)) groups.set(g, []);
+    groups.get(g).push(it);
+  });
+
+  let html = '';
+  for (const [groupName, groupItems] of groups) {
+    if (groupName) {
+      html += `<div class="sprint-group-header">${escapeHtml(groupName)}</div>`;
+    }
+    html += groupItems.map(it => {
+      const icon = statusIcon(it.status);
+      const color = statusColor(it.status);
+      const isActive = activeSet.has(it.status);
+      const meta = it.pushed_to
+        ? `<span class="sprint-item-meta">→ ${escapeHtml(it.pushed_to)}</span>`
+        : (it.notes ? `<span class="sprint-item-meta">${escapeHtml(it.notes.slice(0,60))}</span>` : '');
+      const actions = isActive
+        ? `<span class="sprint-item-actions">
+             <button class="sprint-btn" title="Done"
+               onclick="sprintAction('${escapeHtml(projectId)}','${escapeHtml(it.id)}','complete')">✓</button>
+             <button class="sprint-btn" title="Skip"
+               onclick="sprintAction('${escapeHtml(projectId)}','${escapeHtml(it.id)}','skip')">—</button>
+             <button class="sprint-btn sprint-btn-fail" title="Fail"
+               onclick="sprintAction('${escapeHtml(projectId)}','${escapeHtml(it.id)}','fail')">✕</button>
+             <button class="sprint-btn sprint-btn-push" title="Push to next version"
+               onclick="sprintPushPrompt('${escapeHtml(projectId)}','${escapeHtml(it.id)}')">→</button>
+           </span>`
+        : `<span class="sprint-item-actions">${meta}</span>`;
+      return `<div class="sprint-item-row" data-item="${escapeHtml(it.id)}">
+        <span class="sprint-item-icon" style="color:${color}">${icon}</span>
+        <span class="sprint-item-title">${escapeHtml(it.title)}</span>
+        <span class="sprint-item-ver">${escapeHtml(it.version)}</span>
+        ${actions}
+      </div>`;
+    }).join('');
+  }
+
+  // Footer: progress bar + add input
+  const total = items.length;
   const done = items.filter(i => i.status === 'done').length;
-  const skipped = items.filter(i => i.status === 'skipped').length;
-  const filled = done + skipped;
-  const pct = Math.round((done / total) * 100);
-  const barLen = 10;
-  const filledBlocks = Math.round((filled / total) * barLen);
-  const bar = '█'.repeat(filledBlocks) + '░'.repeat(barLen - filledBlocks);
-  root.innerHTML = `
-    <div class="live-sprint-bar">
-      <span class="live-sprint-bar-track">[${bar}]</span>
-      <span class="live-sprint-bar-count">${done}/${total}</span>
-      <span class="live-sprint-bar-pct">${pct}%</span>
+  const pct = total > 0 ? Math.round((done / total) * 100) : 0;
+  html += `<div class="sprint-footer">
+    <span class="sprint-pct">${done}/${total} · ${pct}%</span>
+    <div class="sprint-add-row">
+      <input class="live-add-input" id="sprint-add-input-${projectId}"
+             placeholder="version:title  or  just title" style="flex:1">
+      <button class="secondary sprint-add-btn" data-pid="${escapeHtml(projectId)}"
+              style="margin-left:4px">+ Add</button>
     </div>
-  `;
+  </div>`;
+  root.innerHTML = html;
+  root.querySelector('.sprint-add-btn').onclick =
+    () => addSprintItemFromInput(projectId);
+  wireSprintAddEnter(projectId, root);
+}
+
+function wireSprintAddEnter(projectId, root) {
+  /** Allow Enter in the sprint-add input to submit. */
+  const inp = root.querySelector(`#sprint-add-input-${projectId}`);
+  if (inp) inp.onkeydown = e => { if (e.key === 'Enter') addSprintItemFromInput(projectId); };
+}
+
+async function sprintAction(projectId, itemId, action) {
+  /** POST to one of the sprint-item action endpoints. */
+  try {
+    await api(`/projects/${projectId}/sprint-items/${itemId}/${action}`,
+      { method: 'POST', body: JSON.stringify({}) });
+    toast(`Sprint item ${action}d`);
+    await refreshLiveTab(projectId);
+  } catch(e) { toast(`Failed: ${e.message}`, true); }
+}
+
+async function sprintPushPrompt(projectId, itemId) {
+  /** Prompt for a target version then push the item. */
+  const toVersion = window.prompt('Push to version (e.g. v2.0):');
+  if (!toVersion) return;
+  try {
+    await api(`/projects/${projectId}/sprint-items/${itemId}/push`,
+      { method: 'POST', body: JSON.stringify({ to_version: toVersion }) });
+    toast('Sprint item pushed to ' + toVersion);
+    await refreshLiveTab(projectId);
+  } catch(e) { toast(`Push failed: ${e.message}`, true); }
+}
+
+async function addSprintItemFromInput(projectId) {
+  /** Parse "version:title" or fall back to current sprint version. */
+  const inp = document.getElementById(`sprint-add-input-${projectId}`);
+  if (!inp) return;
+  const val = inp.value.trim();
+  if (!val) return;
+  let version, title;
+  const colonIdx = val.indexOf(':');
+  if (colonIdx > 0) {
+    version = val.slice(0, colonIdx).trim();
+    title   = val.slice(colonIdx + 1).trim();
+  } else {
+    // Fall back to the sprint header text as a rough version token.
+    const panel = state.panels[projectId];
+    const sprint = (panel && panel._serverSprint) || '';
+    const m = sprint.match(/v[\d.x]+/i);
+    version = m ? m[0] : 'current';
+    title = val;
+  }
+  if (!title) { toast('Title required', true); return; }
+  try {
+    await api(`/projects/${projectId}/sprint-items`, {
+      method: 'POST',
+      body: JSON.stringify({ version, title }),
+    });
+    inp.value = '';
+    toast('Sprint item added');
+    await refreshLiveTab(projectId);
+  } catch(e) { toast('Add failed: ' + e.message, true); }
 }
 
 function cacheMostRecentSession(projectId, sessions) {
