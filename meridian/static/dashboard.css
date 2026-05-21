@@ -655,3 +655,5 @@ input[type=text] {
     color: var(--text); font-size: 18px; font-family: monospace;
   }
 }
+
+.tab-context-menu div:hover { background: var(--hover); cursor: pointer; }
