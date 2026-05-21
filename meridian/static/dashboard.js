@@ -470,9 +470,11 @@ function buildTabBody(project) {
               <span class="goal-version" id="goal-state-${project.id}"></span>
               <span class="goal-ts" id="goal-vg-ts-${project.id}"></span>
             </div>
+            <div id="goal-autoblocks-${project.id}" style="display:none;margin-top:8px;background:var(--surface-2);border:1px solid var(--border);border-radius:4px;padding:8px;font-family:var(--font-mono);font-size:10px;color:var(--muted);white-space:pre-wrap;word-break:break-word;max-height:200px;overflow-y:auto"></div>
           </div>
           <div class="goal-subtab-panel" id="gtab-sprint-${project.id}">
-            <textarea class="goal-area goal-full mono" id="goal-sprint-${project.id}" placeholder="(sprint not set)"></textarea>
+            <div style="color:var(--muted);font-size:10px;margin-bottom:6px">Current sprint header (one-liner only — task list lives in the <a href="#" onclick="switchToLive_${project.id}()" style="color:var(--accent)">LIVE tab</a>):</div>
+            <textarea class="goal-area mono" id="goal-sprint-${project.id}" placeholder="(sprint not set)" style="height:48px;min-height:48px"></textarea>
             <div class="goal-actions">
               <button class="secondary" id="save-sprint-${project.id}">save sprint</button>
               <span class="goal-ts" id="goal-sp-ts-${project.id}"></span>
@@ -1527,7 +1529,21 @@ async function refreshGoal(projectId) {
       state.panels[projectId].goalIsJson = true;
       text = JSON.stringify(goal.content, null, 2);
     }
-    ta.value = text;
+    // Split at AUTO BLOCKS — editable zone above, read-only below
+    const AUTO_SPLIT = '--- AUTO BLOCKS BELOW ---';
+    const splitIdx = text.indexOf(AUTO_SPLIT);
+    if (splitIdx !== -1) {
+      ta.value = text.slice(0, splitIdx).trimEnd();
+      const autoBlocksEl = document.getElementById(`goal-autoblocks-${projectId}`);
+      if (autoBlocksEl) {
+        autoBlocksEl.style.display = 'block';
+        autoBlocksEl.textContent = text.slice(splitIdx);
+      }
+    } else {
+      ta.value = text;
+      const autoBlocksEl = document.getElementById(`goal-autoblocks-${projectId}`);
+      if (autoBlocksEl) autoBlocksEl.style.display = 'none';
+    }
     v.textContent = `v${goal.version}`;
     // v0.5.2 — north star and sprint textareas
     const nsTA = document.getElementById(`goal-north-star-${projectId}`);
@@ -1593,7 +1609,11 @@ function wireGoalPreviewToggle(taEl, previewEl) {
 async function saveGoal(projectId) {
   const ta = document.getElementById(`goal-${projectId}`);
   if (!ta) return;
-  const raw = ta.value;
+  // Reattach auto blocks before saving so they aren't lost
+  const autoBlocksEl = document.getElementById(`goal-autoblocks-${projectId}`);
+  const autoBlocksText = (autoBlocksEl && autoBlocksEl.style.display !== 'none')
+    ? '\n' + autoBlocksEl.textContent : '';
+  const raw = ta.value + autoBlocksText;
   if (raw === state.panels[projectId]._lastSaved) return;
   let content = raw;
   if (state.panels[projectId].goalIsJson) {
