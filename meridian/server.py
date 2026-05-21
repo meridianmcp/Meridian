@@ -1485,7 +1485,7 @@ async def admin_restart() -> dict[str, bool]:
         try:
             kwargs: dict[str, Any] = {"cwd": cwd}
             if os.name == "nt":
-                kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP  # type: ignore[attr-defined]
+                kwargs["creationflags"] = subprocess.CREATE_NEW_CONSOLE  # type: ignore[attr-defined]
             subprocess.Popen(["pixi", "run", "start"], **kwargs)  # noqa: S603
         except FileNotFoundError:
             subprocess.Popen(  # noqa: S603
@@ -1493,7 +1493,7 @@ async def admin_restart() -> dict[str, bool]:
                 cwd=cwd,
                 env={**os.environ},
             )
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(3.0)
         os.kill(os.getpid(), signal.SIGINT)
 
     asyncio.create_task(_delayed_restart())
