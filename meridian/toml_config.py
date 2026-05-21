@@ -73,6 +73,25 @@ def save_toml(default_connection: str, connections: dict[str, dict[str, str]]) -
     return dest
 
 
+def get_toml_db_url() -> tuple[str | None, str | None]:
+    """Return ``(db_url_or_none, conn_name_or_none)`` from toml only, ignoring env.
+
+    Returns (None, None) if no meridian.toml exists.
+    Returns (None, "local") if toml says sqlite.
+    Returns (url, name) if toml says postgres.
+    """
+    data = load_toml()
+    if data is None:
+        return None, None  # no toml at all
+    conn_name = data.get("default", {}).get("connection", "local")
+    conn = data.get("connections", {}).get(conn_name, {})
+    conn_type = conn.get("type", "sqlite")
+    if conn_type == "postgres":
+        url = conn.get("url") or os.environ.get(conn.get("url_env", ""), "")
+        return url or None, conn_name
+    return None, conn_name  # sqlite
+
+
 def get_active_db_url() -> tuple[str | None, str]:
     """Return ``(db_url_or_none, connection_name)``.
 

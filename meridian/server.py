@@ -110,9 +110,14 @@ async def lifespan(app: FastAPI):
     # so the test suite isn't affected.
     _db_override = os.environ.get("MERIDIAN_DB", DEFAULT_DB_PATH)
     if _db_override != ":memory:":
-        _toml_url, _ = toml_config_module.get_active_db_url()
-        if _toml_url and not os.environ.get("MERIDIAN_DB_URL"):
+        _toml_url, _toml_conn_name = toml_config_module.get_toml_db_url()
+        if _toml_url:
+            # toml explicitly says use postgres — set env var
             os.environ["MERIDIAN_DB_URL"] = _toml_url
+        elif _toml_conn_name is not None:
+            # toml explicitly says use sqlite (local) — clear env var override
+            os.environ.pop("MERIDIAN_DB_URL", None)
+        # else: no toml at all — respect existing env var or use SQLite default
 
     db_url = os.environ.get("MERIDIAN_DB_URL")
     db_path: str | None = None
