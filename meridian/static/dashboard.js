@@ -358,8 +358,8 @@ function _openTabMenu(t, anchor) {
     const item = document.createElement('div');
     item.style.cssText = 'padding:8px 12px;cursor:pointer';
     item.textContent = label;
-    item.onmouseenter = () => item.style.background = 'var(--surface-1)';
-    item.onmouseleave = () => item.style.background = '';
+    item.onmouseenter = () => { item.style.background = 'var(--surface-3)'; item.style.color = 'var(--accent)'; };
+    item.onmouseleave = () => { item.style.background = ''; item.style.color = ''; };
     item.onclick = () => { menu.remove(); fn(); };
     menu.appendChild(item);
   }
@@ -371,7 +371,7 @@ function _openTabMenu(t, anchor) {
   menu.appendChild(uuidDiv);
   menuItem('\u270f Rename', () => _renameProject(t));
   menuItem('\u2b07 Download DB', () => window.open('/admin/snapshot', '_blank'));
-  menuItem('\U0001f5d1 Delete project…', () => _deleteProject(t));
+  menuItem('🗑 Delete project…', () => _deleteProject(t));
 
   const rect = anchor.getBoundingClientRect();
   menu.style.top = (rect.bottom + 4) + 'px';
