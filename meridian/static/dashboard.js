@@ -82,15 +82,7 @@ function _updateConnectionIndicator(cfg) {
 
 // v1.9.x — POST /admin/restart then poll /health until up, then reload.
 async function _doRestart() {
-  console.log('[restart] _doRestart() called');
-  alert('DEBUG: _doRestart called — watch terminal for POST /admin/restart');
-  try {
-    console.log('[restart] sending fetch to /admin/restart');
-    const resp = await fetch('/admin/restart', { method: 'POST' });
-    console.log('[restart] fetch returned status:', resp.status);
-  } catch(e) {
-    console.log('[restart] fetch error (expected if server died):', e.message);
-  }
+  try { await fetch('/admin/restart', { method: 'POST' }); } catch(_) { /* expected */ }
   // Replace any existing restart button text
   document.querySelectorAll('#restart-server-btn, #banner-restart-btn').forEach(b => {
     b.textContent = 'Restarting…'; b.disabled = true;
@@ -2045,7 +2037,7 @@ document.getElementById('ez-advanced-link').onclick = (e) => {
 
   // Show if server config has no toml — checked in init() after loadServerConfig
   window._showConnSetupIfNeeded = (cfg) => {
-    if (!cfg?.toml_exists) modal.style.display = 'flex';
+    if (!cfg?.toml_exists && cfg?.db !== 'postgres') modal.style.display = 'flex';
   };
 
   if (localBtn) localBtn.onclick = async () => {
