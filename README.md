@@ -3,20 +3,33 @@
 Your AI sessions don't remember each other.
 
 Every Claude tab starts fresh. Parallel sessions duplicate work. Context fills up
-and you start over from scratch. Meridian fixes this — a local server every session
-connects to so they share goal state, see each other's task logs, and can resume
-instantly from a compressed handoff.
+and you lose everything. Meridian fixes this — a local server every session connects
+to so they share goal state, see each other's task logs, and can resume instantly
+from a compressed handoff.
+
+## What you get
+
+- **Dashboard** at `http://localhost:7878` — live sessions, task queue, sprint board,
+  goal state, rewind timeline
+- **MCP tools** for Claude: `start_session`, `log_task`, `generate_handoff`, `claim_task`
+- **SQLite** by default; swap in Postgres for teams sharing one brain
+- Works with **Claude Code, Claude Desktop, Cursor, Windsurf**
 
 ## Install
 
+### Option A — single executable (Windows, no Python required)
+
+Download `meridian.exe` from [Releases](https://github.com/ajc3xc/Meridian/releases).
+Double-click. Dashboard opens automatically at `http://localhost:7700`.
+
+### Option B — from source (all platforms)
+
 ```bash
-# Requires pixi — https://prefix.dev/docs/pixi/overview
-git clone https://github.com/yourusername/meridian
-cd meridian
+# Requires pixi — https://prefix.dev
+git clone https://github.com/ajc3xc/Meridian
+cd Meridian
 pixi run start       # dashboard at http://localhost:7878
 ```
-
-Open `http://localhost:7878` to see the dashboard.
 
 ## Connect to Claude
 
@@ -30,7 +43,7 @@ Create `.mcp.json` in your project root:
     "meridian": {
       "command": "pixi",
       "args": ["run", "python", "-m", "meridian", "--mcp"],
-      "cwd": "/path/to/meridian"
+      "cwd": "/absolute/path/to/Meridian"
     }
   }
 }
@@ -40,7 +53,7 @@ Every Claude Code session in that project gets Meridian tools automatically.
 
 ### Claude Desktop
 
-Add to `claude_desktop_config.json`:
+Add to your Claude Desktop config:
 
 - Windows: `%APPDATA%\Claude\claude_desktop_config.json`
 - macOS: `~/Library/Application Support/Claude/claude_desktop_config.json`
@@ -51,7 +64,7 @@ Add to `claude_desktop_config.json`:
     "meridian": {
       "command": "pixi",
       "args": ["run", "python", "-m", "meridian", "--mcp"],
-      "cwd": "/path/to/meridian"
+      "cwd": "/absolute/path/to/Meridian"
     }
   }
 }
@@ -61,11 +74,13 @@ Restart Claude Desktop. Your next chat has Meridian tools available.
 
 ## How it works
 
-1. Start a session: `start_session(project_id=..., session_name="my-session")`
-2. Read the goal, see what other sessions did: returned in the same call
-3. Do work, log tasks: `log_task(..., description="built the auth endpoint", status="done")`
-4. Before context fills up: `generate_handoff(project_id=...)` — writes a compressed file
-5. New session reads the handoff and picks up exactly where you left off
+1. Session starts: `start_session(project_id=..., session_name="my-session")` — returns
+   the current goal, recent task log, and active sprint in one call
+2. Do work, log tasks: `log_task(..., description="built auth endpoint", status="done")`
+3. Before context fills: `generate_handoff(project_id=...)` — compressed file captures
+   everything; a new session reads it and picks up exactly where you left off
+4. Parallel sessions? Each one calls `claim_task` to atomically lock a work item —
+   no duplicated effort, no stepping on each other
 
 State lives in a local SQLite file. No accounts, no cloud, no sync required.
 
@@ -85,5 +100,5 @@ customer.
 
 ## License
 
-[MSL-2.0](LICENSE) — free for individual personal use. Commercial use requires a
-license. See LICENSE for details.
+[MSL-2.0](LICENSE) — free for personal use. Commercial use requires a license.
+See LICENSE for details.
