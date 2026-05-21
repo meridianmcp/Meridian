@@ -14,7 +14,8 @@
 <body>
 <div id="update-banner" style="display:none">
   &#9888;&#65039; Server updated — restart to apply
-  <button onclick="document.getElementById('update-banner').style.display='none'" style="margin-left:12px;background:none;border:1px solid currentColor;border-radius:3px;color:inherit;cursor:pointer;font-size:11px;padding:1px 8px">Dismiss</button>
+  <button id="banner-restart-btn" style="margin-left:12px;background:none;border:1px solid currentColor;border-radius:3px;color:inherit;cursor:pointer;font-size:11px;padding:1px 8px">&#x27F3; Restart</button>
+  <button onclick="document.getElementById('update-banner').style.display='none'" style="margin-left:6px;background:none;border:1px solid currentColor;border-radius:3px;color:inherit;cursor:pointer;font-size:11px;padding:1px 8px">Dismiss</button>
 </div>
 <button id="sidebar-toggle" title="Toggle sidebar" onclick="document.querySelector('.sidebar').classList.toggle('mobile-open')">☰</button>
 <div class="app">
@@ -31,7 +32,15 @@
       <button class="primary" id="new-project-btn">+</button>
     </div>
     <div class="sidebar-footer">
-      <button class="sidebar-stop-btn" id="stop-server-btn" title="Stop the Meridian server">⏹ Stop Server</button>
+      <div id="connection-indicator" style="font-size:10px;color:var(--muted);font-family:'IBM Plex Mono',monospace;margin-bottom:6px;padding:4px 6px;border:1px solid var(--border);border-radius:3px;display:none">
+        <span id="connection-dot" style="display:inline-block;width:6px;height:6px;border-radius:50%;background:var(--accent-green);margin-right:5px;vertical-align:middle"></span>
+        <span id="connection-label">local</span>
+        <select id="connection-switcher" style="display:none;margin-left:6px;background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:'IBM Plex Mono',monospace;padding:1px 4px"></select>
+      </div>
+      <div style="display:flex;gap:6px">
+        <button class="sidebar-stop-btn" id="restart-server-btn" title="Restart the Meridian server" style="flex:1">&#x27F3; Restart</button>
+        <button class="sidebar-stop-btn" id="stop-server-btn" title="Stop the Meridian server" style="flex:1">&#x23F9; Stop</button>
+      </div>
     </div>
   </aside>
   <main class="main">
@@ -44,6 +53,26 @@
 <div class="toast" id="toast"></div>
 
 
+
+<!-- v1.9.x connection setup modal (shown when no meridian.toml exists) -->
+<div id="conn-setup-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.7);z-index:9998;align-items:center;justify-content:center">
+  <div style="background:var(--surface-2);border:1px solid var(--border);border-radius:8px;padding:28px 32px;width:100%;max-width:420px;font-family:'IBM Plex Mono',monospace">
+    <div style="font-size:13px;font-weight:600;color:var(--accent);margin-bottom:8px">Database Setup</div>
+    <div style="font-size:11px;color:var(--muted);margin-bottom:18px">Choose where Meridian stores your data. You can change this later.</div>
+    <div style="display:flex;flex-direction:column;gap:10px">
+      <button id="conn-local-btn" class="primary" style="padding:12px;font-size:12px;text-align:left">&#x1F4BE; Local SQLite (recommended)<br><span style="font-size:10px;color:rgba(255,255,255,0.7);font-weight:400">Stores data in data/meridian.db — no setup needed</span></button>
+      <button id="conn-pg-toggle-btn" style="padding:12px;font-size:12px;text-align:left;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;color:var(--text);cursor:pointer;font-family:'IBM Plex Mono',monospace">&#x1F5C4;&#xFE0F; PostgreSQL<br><span style="font-size:10px;color:var(--muted);font-weight:400">Use Neon, Supabase, or any Postgres URL</span></button>
+      <div id="conn-pg-form" style="display:none;flex-direction:column;gap:8px">
+        <input id="conn-pg-url" type="text" placeholder="postgresql://user:pass@host/db"
+          style="background:var(--surface-1);border:1px solid var(--border);border-radius:4px;padding:10px 12px;color:var(--text);font-family:'IBM Plex Mono',monospace;font-size:11px;outline:none;width:100%;box-sizing:border-box">
+        <input id="conn-pg-name" type="text" placeholder="connection name (e.g. neon)"
+          style="background:var(--surface-1);border:1px solid var(--border);border-radius:4px;padding:8px 12px;color:var(--text);font-family:'IBM Plex Mono',monospace;font-size:11px;outline:none;width:100%;box-sizing:border-box">
+        <button id="conn-pg-save-btn" class="primary" style="padding:10px;font-size:12px">Save &amp; Restart →</button>
+      </div>
+      <div id="conn-setup-err" style="color:var(--status-failed);font-size:10px;display:none"></div>
+    </div>
+  </div>
+</div>
 
 <!-- v0.6.6 EZ first-run wizard -->
 <div id="ez-wizard" style="display:none;position:fixed;inset:0;background:var(--bg);z-index:9999;flex-direction:column;align-items:center;justify-content:center;gap:16px;padding:40px">

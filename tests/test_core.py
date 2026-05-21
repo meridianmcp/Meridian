@@ -3951,3 +3951,80 @@ def test_dashboard_js_has_goal_history_functions(client):
     assert "renderRewindGoals" in js, "renderRewindGoals missing from dashboard.js"
     assert "toggleExpand" in js, "toggleExpand missing from dashboard.js"
     assert "goal-history" in js, "goal-history API call missing from dashboard.js"
+
+
+# ---------------------------------------------------------------------------
+# v1.9.x — connection profiles + restart
+# ---------------------------------------------------------------------------
+
+def test_config_endpoint_has_toml_fields(client):
+    """GET /config exposes toml_exists, connection_name, and connections."""
+    r = client.get("/config")
+    assert r.status_code == 200
+    data = r.json()
+    assert "toml_exists" in data, "toml_exists missing from /config"
+    assert "connection_name" in data, "connection_name missing from /config"
+    assert "connections" in data, "connections missing from /config"
+    assert isinstance(data["connections"], list)
+
+
+def test_config_connections_save_local(client, tmp_path, monkeypatch):
+    """POST /config/connections saves a local SQLite profile."""
+    monkeypatch.chdir(tmp_path)
+    r = client.post(
+        "/config/connections",
+        json={"name": "local", "type": "sqlite", "activate": True},
+    )
+    assert r.status_code == 200
+    data = r.json()
+    assert data["ok"] is True
+    assert data["connection_name"] == "local"
+    assert (tmp_path / "meridian.toml").exists(), "meridian.toml not created"
+
+
+def test_config_connections_save_postgres(client, tmp_path, monkeypatch):
+    """POST /config/connections with type=postgres requires a url."""
+    # Missing url → 400
+    r = client.post(
+        "/config/connections",
+        json={"name": "neon", "type": "postgres", "activate": False},
+    )
+    assert r.status_code == 400
+
+    # With url → ok
+    monkeypatch.chdir(tmp_path)
+    r = client.post(
+        "/config/connections",
+        json={"name": "neon", "type": "postgres", "url": "postgresql://localhost/test", "activate": False},
+    )
+    assert r.status_code == 200
+    assert r.json()["ok"] is True
+
+
+def test_admin_restart_returns_ok(client):
+    """POST /admin/restart returns {ok: true} immediately."""
+    r = client.post("/admin/restart")
+    assert r.status_code == 200
+    assert r.json()["ok"] is True
+
+
+def test_admin_snapshot_memory_db_returns_400(client):
+    """GET /admin/snapshot on an in-memory DB returns 400."""
+    r = client.get("/admin/snapshot")
+    assert r.status_code == 400
+
+
+def test_dashboard_html_has_restart_button(client):
+    """dashboard.html contains the restart button elements."""
+    html = client.get("/dashboard").text
+    assert "banner-restart-btn" in html, "banner restart button missing"
+    assert "restart-server-btn" in html, "sidebar restart button missing"
+    assert "connection-indicator" in html, "connection indicator missing"
+
+
+def test_dashboard_js_has_restart_logic(client):
+    """dashboard.js contains _doRestart and connection indicator logic."""
+    js = client.get("/static/dashboard.js").text
+    assert "_doRestart" in js, "_doRestart missing from dashboard.js"
+    assert "_updateConnectionIndicator" in js, "_updateConnectionIndicator missing"
+    assert "/admin/restart" in js, "/admin/restart not referenced in dashboard.js"

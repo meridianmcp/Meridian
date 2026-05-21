@@ -32,6 +32,7 @@ from . import db as db_module
 from . import goal_md as goal_md_module
 from . import enqueue as enqueue_module
 from . import handoff as handoff_module
+from . import toml_config as toml_config_module
 from .models import (
     ChatHistoryItem,
     ChatRequest,
@@ -88,6 +89,15 @@ async def lifespan(app: FastAPI):
 
     data_dir = Path(os.environ.get("MERIDIAN_DATA_DIR", str(DEFAULT_DATA_DIR)))
     data_dir.mkdir(parents=True, exist_ok=True)
+
+    # v1.9.x — meridian.toml connection profiles. Loaded before env check so
+    # MERIDIAN_DB_URL env always wins (CI/containers).  Skipped for :memory:
+    # so the test suite isn't affected.
+    _db_override = os.environ.get("MERIDIAN_DB", DEFAULT_DB_PATH)
+    if _db_override != ":memory:":
+        _toml_url, _ = toml_config_module.get_active_db_url()
+        if _toml_url and not os.environ.get("MERIDIAN_DB_URL"):
+            os.environ["MERIDIAN_DB_URL"] = _toml_url
 
     db_url = os.environ.get("MERIDIAN_DB_URL")
     db_path: str | None = None
@@ -278,6 +288,7 @@ async def server_config() -> dict[str, Any]:
     port = int(os.environ.get("MERIDIAN_PORT", "7878"))
     default_url = f"http://{host}:{port}"
     server_url = os.environ.get("MERIDIAN_SERVER_URL", default_url)
+    _, conn_name = toml_config_module.get_active_db_url()
     return {
         "server_url": server_url,
         "host": host,
@@ -288,6 +299,9 @@ async def server_config() -> dict[str, Any]:
             else "memory" if os.environ.get("MERIDIAN_DB") == ":memory:"
             else "sqlite"
         ),
+        "toml_exists": toml_config_module.toml_exists(),
+        "connection_name": conn_name,
+        "connections": toml_config_module.list_connections(),
     }
 
 
@@ -1451,6 +1465,142 @@ async def admin_shutdown() -> dict[str, bool]:
 
     asyncio.create_task(_delayed_shutdown())
     return {"ok": True}
+
+
+@app.post("/admin/restart")
+async def admin_restart() -> dict[str, bool]:
+    """v1.9.x — restart the server by spawning a new process then shutting down.
+
+    Spawns ``pixi run start`` (falling back to the current Python interpreter)
+    in the repo root, then sends SIGINT to itself after a short delay so the
+    HTTP response flushes first.  The dashboard polls ``/health`` and reloads
+    when the new process is ready.
+    """
+    import subprocess
+    import sys
+
+    async def _delayed_restart() -> None:
+        await asyncio.sleep(0.3)
+        cwd = str(Path(__file__).parent.parent)
+        try:
+            kwargs: dict[str, Any] = {"cwd": cwd}
+            if os.name == "nt":
+                kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP  # type: ignore[attr-defined]
+            subprocess.Popen(["pixi", "run", "start"], **kwargs)  # noqa: S603
+        except FileNotFoundError:
+            subprocess.Popen(  # noqa: S603
+                [sys.executable, "-m", "meridian"],
+                cwd=cwd,
+                env={**os.environ},
+            )
+        await asyncio.sleep(0.5)
+        os.kill(os.getpid(), signal.SIGINT)
+
+    asyncio.create_task(_delayed_restart())
+    return {"ok": True}
+
+
+@app.get("/admin/snapshot")
+async def download_snapshot(request: Request) -> Response:
+    """v1.9.x — download the current DB as a SQLite file.
+
+    For a SQLite backend, streams the ``.db`` file directly.
+    For a Postgres backend, exports all tables into a fresh in-memory SQLite
+    database and streams that as a downloadable file.
+    """
+    headers = {"Content-Disposition": "attachment; filename=meridian-snapshot.db"}
+    db = _db(request)
+    db_url = os.environ.get("MERIDIAN_DB_URL")
+
+    if not db_url:
+        # SQLite — serve the file directly.
+        db_path = os.environ.get("MERIDIAN_DB", DEFAULT_DB_PATH)
+        if db_path == ":memory:":
+            raise HTTPException(400, "Cannot snapshot in-memory database")
+        try:
+            data = Path(db_path).read_bytes()
+        except OSError as exc:
+            raise HTTPException(500, f"Could not read DB file: {exc}") from exc
+        return Response(content=data, media_type="application/x-sqlite3", headers=headers)
+
+    # Postgres — export to a fresh in-memory SQLite then return its bytes.
+    import tempfile
+
+    tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+    tmp.close()
+    try:
+        async with aiosqlite.connect(tmp.name) as sdb:
+            await db_module.init_db(tmp.name)  # create schema
+            tables = [
+                "projects", "goal_states", "sessions", "sessions_archived",
+                "task_log", "sprint_items", "chat_sessions", "chat_messages",
+            ]
+            for table in tables:
+                try:
+                    rows = await db.execute_fetchall(f"SELECT * FROM {table}")  # type: ignore[attr-defined]
+                    if rows:
+                        cols = list(rows[0].keys())
+                        placeholders = ",".join("?" * len(cols))
+                        sql = (
+                            f"INSERT OR IGNORE INTO {table} "
+                            f"({','.join(cols)}) VALUES ({placeholders})"
+                        )
+                        await sdb.executemany(sql, [list(r.values()) for r in rows])
+                except Exception:  # noqa: BLE001 — skip missing tables
+                    pass
+            await sdb.commit()
+        data = Path(tmp.name).read_bytes()
+    finally:
+        try:
+            Path(tmp.name).unlink()
+        except OSError:
+            pass
+    return Response(content=data, media_type="application/x-sqlite3", headers=headers)
+
+
+@app.post("/config/connections")
+async def save_connection(body: dict[str, Any]) -> dict[str, Any]:
+    """v1.9.x — save a new connection profile to meridian.toml.
+
+    Body fields:
+      * ``name``      — profile name (e.g. "local", "neon")
+      * ``type``      — "sqlite" or "postgres"
+      * ``url``       — Postgres URL (required when type == "postgres")
+      * ``activate``  — if true, set as the active connection (default true)
+    """
+    name = str(body.get("name", "local")).strip()
+    conn_type = str(body.get("type", "sqlite"))
+    url = str(body.get("url", "")).strip()
+    activate = bool(body.get("activate", True))
+
+    if not name:
+        raise HTTPException(400, "name is required")
+    if conn_type not in ("sqlite", "postgres"):
+        raise HTTPException(400, "type must be 'sqlite' or 'postgres'")
+    if conn_type == "postgres" and not url:
+        raise HTTPException(400, "url is required for postgres connections")
+
+    # Load existing toml or start fresh.
+    data = toml_config_module.load_toml() or {}
+    connections: dict[str, dict[str, str]] = {}
+    for cname, ccfg in data.get("connections", {}).items():
+        connections[cname] = dict(ccfg)
+
+    new_cfg: dict[str, str] = {"type": conn_type}
+    if conn_type == "postgres":
+        new_cfg["url"] = url
+    connections[name] = new_cfg
+
+    current_default = data.get("default", {}).get("connection", "local")
+    toml_config_module.save_toml(
+        default_connection=name if activate else current_default,
+        connections=connections,
+    )
+    return {
+        "ok": True,
+        "connection_name": name,
+        "restart_required": activate and conn_type == "postgres",
+    }
 
 
 # ---------------------------------------------------------------------------

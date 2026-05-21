@@ -36,7 +36,70 @@ async function loadServerConfig() {
     state.serverConfig = cfg || state.serverConfig;
     const verEl = document.getElementById('server-version');
     if (verEl && cfg?.version) verEl.textContent = `v${cfg.version}`;
+    // v1.9.x — update connection indicator
+    _updateConnectionIndicator(cfg);
   } catch (e) { /* offline / older server — ignore */ }
+}
+
+// v1.9.x — show active DB connection in sidebar footer
+function _updateConnectionIndicator(cfg) {
+  if (!cfg) return;
+  const wrap = document.getElementById('connection-indicator');
+  const label = document.getElementById('connection-label');
+  const dot = document.getElementById('connection-dot');
+  const switcher = document.getElementById('connection-switcher');
+  if (!wrap || !label) return;
+  wrap.style.display = 'block';
+  const name = cfg.connection_name || (cfg.db === 'postgres' ? 'postgres' : 'local');
+  const dbType = cfg.db || 'sqlite';
+  label.textContent = name + ' (' + dbType + ')';
+  dot.style.background = dbType === 'postgres' ? 'var(--accent)' : 'var(--accent-green)';
+  // Populate dropdown if multiple connections
+  const conns = cfg.connections || [];
+  if (conns.length > 1 && switcher) {
+    switcher.style.display = 'inline-block';
+    switcher.innerHTML = conns.map(c =>
+      `<option value="${c.name}" ${c.active ? 'selected' : ''}>${c.name}</option>`
+    ).join('');
+    switcher.onchange = async () => {
+      try {
+        const sel = switcher.value;
+        const conn = (cfg.connections || []).find(c => c.name === sel) || {};
+        await api('/config/connections', {
+          method: 'POST',
+          body: JSON.stringify({ name: sel, type: conn.type || 'sqlite', activate: true }),
+        });
+        if (conn.type === 'postgres') {
+          toast('Switching to ' + sel + ' — restarting…');
+          await _doRestart();
+        } else {
+          toast('Switched to ' + sel + ' — restart to apply');
+        }
+      } catch(e) { toast('Switch failed: ' + e.message, true); }
+    };
+  }
+}
+
+// v1.9.x — POST /admin/restart then poll /health until up, then reload.
+async function _doRestart() {
+  try { await api('/admin/restart', { method: 'POST' }); } catch(_) { /* expected */ }
+  // Replace any existing restart button text
+  document.querySelectorAll('#restart-server-btn, #banner-restart-btn').forEach(b => {
+    b.textContent = 'Restarting…'; b.disabled = true;
+  });
+  const started = Date.now();
+  while (Date.now() - started < 30000) {
+    await new Promise(r => setTimeout(r, 2000));
+    try {
+      const r = await fetch('/health');
+      if (r.ok) { window.location.reload(); return; }
+    } catch(_) { /* server still down — keep polling */ }
+  }
+  // Timed out
+  document.querySelectorAll('#restart-server-btn, #banner-restart-btn').forEach(b => {
+    b.textContent = 'Restart timed out'; b.disabled = false;
+  });
+  toast('Server did not come back within 30s — start manually', true);
 }
 
 async function loadConfig() {
@@ -1759,6 +1822,10 @@ async function restoreTabs() {
 
 (async function init() {
   await loadServerConfig();
+  // v1.9.x — show connection setup modal if no meridian.toml exists
+  if (typeof window._showConnSetupIfNeeded === 'function') {
+    window._showConnSetupIfNeeded(state.serverConfig);
+  }
   await loadConfig();
   await loadProjects();
   // v0.6.6 — EZ first-run wizard: if no projects exist, show the overlay
@@ -1778,12 +1845,27 @@ async function restoreTabs() {
       if (!confirm('Stop the Meridian server? You will need to run `pixi run start` to restart.')) return;
       try {
         await api('/admin/shutdown', { method: 'POST' });
-        stopBtn.textContent = 'Server stopped. Run pixi run start to restart.';
+        stopBtn.textContent = 'Stopped — run pixi run start';
         stopBtn.disabled = true;
       } catch(e) {
         toast('Shutdown request sent.', false);
       }
     };
+  }
+
+  // v1.9.x — restart button in sidebar footer
+  const restartBtn = document.getElementById('restart-server-btn');
+  if (restartBtn) {
+    restartBtn.onclick = async () => {
+      if (!confirm('Restart the Meridian server?')) return;
+      await _doRestart();
+    };
+  }
+
+  // v1.9.x — restart button in update banner
+  const bannerRestartBtn = document.getElementById('banner-restart-btn');
+  if (bannerRestartBtn) {
+    bannerRestartBtn.onclick = async () => { await _doRestart(); };
   }
 })();
 
@@ -1816,6 +1898,61 @@ document.getElementById('ez-advanced-link').onclick = (e) => {
   document.getElementById('new-project-name').focus();
   restoreTabs();
 };
+
+// v1.9.x — connection setup modal
+(function() {
+  const modal = document.getElementById('conn-setup-modal');
+  const localBtn = document.getElementById('conn-local-btn');
+  const pgToggle = document.getElementById('conn-pg-toggle-btn');
+  const pgForm = document.getElementById('conn-pg-form');
+  const pgSave = document.getElementById('conn-pg-save-btn');
+  const pgUrl = document.getElementById('conn-pg-url');
+  const pgName = document.getElementById('conn-pg-name');
+  const errEl = document.getElementById('conn-setup-err');
+  if (!modal) return;
+
+  function showErr(msg) { if (errEl) { errEl.textContent = msg; errEl.style.display = msg ? 'block' : 'none'; } }
+
+  // Show if server config has no toml — checked in init() after loadServerConfig
+  window._showConnSetupIfNeeded = (cfg) => {
+    if (!cfg?.toml_exists) modal.style.display = 'flex';
+  };
+
+  if (localBtn) localBtn.onclick = async () => {
+    try {
+      await api('/config/connections', {
+        method: 'POST',
+        body: JSON.stringify({ name: 'local', type: 'sqlite', activate: true }),
+      });
+      modal.style.display = 'none';
+      await loadServerConfig();
+    } catch(e) { showErr('Failed: ' + e.message); }
+  };
+
+  if (pgToggle) pgToggle.onclick = () => {
+    if (pgForm) pgForm.style.display = pgForm.style.display === 'none' ? 'flex' : 'none';
+  };
+
+  if (pgSave) pgSave.onclick = async () => {
+    const url = pgUrl?.value.trim() || '';
+    const name = pgName?.value.trim() || 'postgres';
+    showErr('');
+    if (!url) { showErr('Postgres URL is required'); return; }
+    try {
+      pgSave.textContent = 'Saving…'; pgSave.disabled = true;
+      await api('/config/connections', {
+        method: 'POST',
+        body: JSON.stringify({ name, type: 'postgres', url, activate: true }),
+      });
+      modal.style.display = 'none';
+      toast('Saved — restarting…');
+      await _doRestart();
+    } catch(e) {
+      showErr('Failed: ' + e.message);
+      pgSave.textContent = 'Save & Restart →'; pgSave.disabled = false;
+    }
+  };
+})();
 
 // ---------------------------------------------------------------------------
 // v1.3.0 — Rewind tab. Renders "Last X days" project recaps. The window
