@@ -1,7 +1,8 @@
 import subprocess, os
 os.chdir(r'C:\Users\13144\Documents\Meridian\repository')
-import os as _os
-_os.remove('commit_s7.py')
+for f in ['c2.py', 'c3.py']:
+    try: os.remove(f)
+    except: pass
 subprocess.run(['git', 'add', '-A'])
-subprocess.run(['git', 'commit', '-m', 'cleanup'])
+subprocess.run(['git', 'commit', '-m', 'cleanup helpers'])
 subprocess.run(['git', 'push'])
