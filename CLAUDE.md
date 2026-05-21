@@ -465,3 +465,13 @@ Include this in README.md and as a comment in __main__.py:
 
 Do not stop until all six are true.
 
+---
+<!-- MERIDIAN STATE — auto-generated, do not edit below -->
+## Current Sprint State  _(auto-updated 2026-05-21 19:51 UTC)_
+
+**Key Files:**
+- `meridian/server.py` — FastAPI app + MCP handlers
+- `meridian/db.py` — all DB functions (SQLite + Postgres)
+- `meridian/static/dashboard.js` — dashboard UI
+- `tests/test_core.py` — full test suite
+- `data/meridian-build_handoff.md` — session handoff

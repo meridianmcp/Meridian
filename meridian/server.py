@@ -978,12 +978,14 @@ async def register_session(
 async def close_session(session_id: str, request: Request) -> dict[str, str]:
     """Mark a session closed."""
     async with _db(request).execute(
-        "SELECT id FROM sessions WHERE id = ?", (session_id,)
+        "SELECT id, project_id FROM sessions WHERE id = ?", (session_id,)
     ) as cur:
         row = await cur.fetchone()
     if row is None:
         raise HTTPException(status_code=404, detail="session not found")
+    project_id = row["project_id"]
     await db_module.close_session(_db(request), session_id)
+    await _regenerate_claude_md(_db(request), project_id, _REPO_ROOT)
     return {"status": "closed", "session_id": session_id}
 
 
@@ -1332,6 +1334,113 @@ async def put_project_file(
     path = _REPO_ROOT / filename
     path.write_text(body.content, encoding="utf-8")
     return {"filename": filename, "size": len(body.content.encode("utf-8"))}
+
+
+@app.get("/projects/{project_id}/context")
+async def get_project_context(
+    project_id: str, request: Request
+) -> dict[str, Any]:
+    """Return a onboarding context payload for new chat sessions (v1.9.x).
+
+    A new claude.ai chat can paste this JSON to get up to speed instantly.
+    Returns: north_star, current_sprint, sprint_items (pending), recent_decisions
+    (last 5), pending_tasks (last 10), recent_sessions (last 5), file_map.
+    """
+    project = await db_module.get_project(_db(request), project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="project not found")
+    goal = await db_module.get_goal(_db(request), project_id)
+    sprint_items = await db_module.get_sprint_items(_db(request), project_id, status="pending")
+    all_tasks = await db_module.get_tasks(_db(request), project_id, limit=20)
+    pending_tasks = [t for t in all_tasks if t["status"] in ("pending", "in_progress")][:10]
+    sessions = await db_module.get_sessions(_db(request), project_id, active_only=True)
+    decisions_raw = (project.get("decisions") or "").strip()
+    recent_decisions = [l.strip() for l in decisions_raw.splitlines() if l.strip()][-5:]
+    return {
+        "project": {"id": project["id"], "name": project["name"]},
+        "north_star": goal.get("north_star") if goal else None,
+        "current_sprint": goal.get("sprint") if goal else None,
+        "version_goal": goal.get("content") if goal else None,
+        "sprint_items": sprint_items,
+        "recent_decisions": recent_decisions,
+        "pending_tasks": pending_tasks,
+        "recent_sessions": sessions[:5],
+        "file_map": list(_EDITABLE_FILES),
+    }
+
+
+# ---------------------------------------------------------------------------
+# CLAUDE.md auto-update helper
+# ---------------------------------------------------------------------------
+
+_CLAUDE_MD_STATE_MARKER = "\n\n---\n<!-- MERIDIAN STATE — auto-generated, do not edit below -->\n"
+
+
+async def _regenerate_claude_md(
+    db: aiosqlite.Connection,
+    project_id: str,
+    repo_root: Path,
+) -> None:
+    """Append/replace the MERIDIAN STATE section at the bottom of CLAUDE.md.
+
+    The human-written content above the marker is preserved exactly.  Only
+    the section below the marker is overwritten.  If CLAUDE.md does not yet
+    have the marker it is appended.  Silently no-ops on any I/O error so a
+    failing write never blocks the caller.
+    """
+    try:
+        from datetime import datetime, timezone
+        goal = await db_module.get_goal(db, project_id)
+        sprint_items = await db_module.get_sprint_items(db, project_id, status="pending")
+        project = await db_module.get_project(db, project_id)
+        all_tasks = await db_module.get_tasks(db, project_id, limit=20)
+        pending_tasks = [t for t in all_tasks if t["status"] in ("pending", "in_progress")][:5]
+        decisions_raw = ((project or {}).get("decisions") or "").strip()
+        recent_decisions = [l.strip() for l in decisions_raw.splitlines() if l.strip()][-5:]
+
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        lines = [f"## Current Sprint State  _(auto-updated {now})_", ""]
+        if goal:
+            if goal.get("north_star"):
+                lines += [f"**North Star:** {goal['north_star']}", ""]
+            if goal.get("sprint"):
+                lines += [f"**Sprint:** {goal['sprint']}", ""]
+        if sprint_items:
+            lines.append("**Pending Sprint Items:**")
+            for item in sprint_items[:10]:
+                lines.append(f"- [ ] {item['title']}")
+            lines.append("")
+        if recent_decisions:
+            lines.append("**Recent Decisions:**")
+            for d in recent_decisions:
+                lines.append(f"- {d}")
+            lines.append("")
+        if pending_tasks:
+            lines.append("**Pending Tasks:**")
+            for t in pending_tasks:
+                lines.append(f"- [{t['status'].upper()}] {t['description'][:120]}")
+            lines.append("")
+        lines += [
+            "**Key Files:**",
+            "- `meridian/server.py` — FastAPI app + MCP handlers",
+            "- `meridian/db.py` — all DB functions (SQLite + Postgres)",
+            "- `meridian/static/dashboard.js` — dashboard UI",
+            "- `tests/test_core.py` — full test suite",
+            "- `data/meridian-build_handoff.md` — session handoff",
+            "",
+        ]
+        new_state_section = _CLAUDE_MD_STATE_MARKER + "\n".join(lines)
+
+        claude_md_path = repo_root / "CLAUDE.md"
+        existing = claude_md_path.read_text(encoding="utf-8") if claude_md_path.exists() else ""
+        if _CLAUDE_MD_STATE_MARKER.strip() in existing:
+            base = existing.split(_CLAUDE_MD_STATE_MARKER.strip())[0].rstrip()
+            updated = base + new_state_section
+        else:
+            updated = existing.rstrip() + new_state_section
+        claude_md_path.write_text(updated, encoding="utf-8")
+    except Exception:
+        pass  # never block the caller on a write failure
 
 
 @app.websocket("/ws/{project_id}")
@@ -2685,6 +2794,8 @@ def build_mcp_server():
                     )
                     db_module._publish_task("task_updated", updated or task)
                     result = updated or task
+                    # Update CLAUDE.md with current sprint state.
+                    await _regenerate_claude_md(db, task["project_id"], _REPO_ROOT)
             else:
                 result = {"error": f"unknown tool: {name}"}
         except Exception as exc:  # noqa: BLE001 — surface to MCP client

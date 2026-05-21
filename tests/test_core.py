@@ -4253,6 +4253,58 @@ async def test_set_goal_minor_no_auto_blocks_duplication(db):
     assert content.startswith("Human directive.")
 
 
+def test_context_endpoint_returns_expected_shape(client):
+    """GET /projects/{id}/context returns onboarding payload with required keys."""
+    project = client.post("/projects", json={"name": "alpha"}).json()
+    client.post(f"/projects/{project['id']}/goal", json={
+        "content": "ship it", "north_star": "be best", "sprint": "week 1"
+    })
+    r = client.get(f"/projects/{project['id']}/context")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["north_star"] == "be best"
+    assert body["current_sprint"] == "week 1"
+    assert isinstance(body["sprint_items"], list)
+    assert isinstance(body["pending_tasks"], list)
+    assert isinstance(body["recent_sessions"], list)
+    assert isinstance(body["file_map"], list)
+    assert "DECISIONS.md" in body["file_map"]
+
+
+def test_context_endpoint_404_for_unknown_project(client):
+    r = client.get("/projects/no-such/context")
+    assert r.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_log_task_accepts_backlog_status(db):
+    """'backlog' is a valid task status after v1.9.x migration."""
+    p = await db_module.create_project(db, "alpha")
+    s = await db_module.register_session(db, p["id"], "sess")
+    t = await db_module.log_task(db, s["id"], p["id"], "future idea", "backlog")
+    assert t["status"] == "backlog"
+
+
+@pytest.mark.asyncio
+async def test_log_task_accepts_future_status(db):
+    """'future' is a valid task status after v1.9.x migration."""
+    p = await db_module.create_project(db, "alpha")
+    s = await db_module.register_session(db, p["id"], "sess")
+    t = await db_module.log_task(db, s["id"], p["id"], "someday maybe", "future")
+    assert t["status"] == "future"
+
+
+def test_http_task_accepts_backlog_status(client):
+    project = client.post("/projects", json={"name": "alpha"}).json()
+    sess = client.post("/sessions/register", json={"project_id": project["id"], "name": "s1"}).json()
+    r = client.post("/tasks", json={
+        "session_id": sess["id"], "project_id": project["id"],
+        "description": "nice to have", "status": "backlog"
+    })
+    assert r.status_code == 201
+    assert r.json()["status"] == "backlog"
+
+
 @pytest.mark.asyncio
 async def test_get_tasks_includes_claimed_by_human_id(db):
     """get_tasks must return claimed_by_human_id from the claiming session."""

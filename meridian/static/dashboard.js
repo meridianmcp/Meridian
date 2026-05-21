@@ -679,6 +679,12 @@ function buildTabBody(project) {
           <button class="secondary claude-section-btn" id="regen-handoff-${project.id}">Regenerate handoff</button>
         </div>
         <hr class="claude-divider">
+        <div class="claude-section" data-section="context">
+          <div class="claude-section-label">New session onboarding</div>
+          <button class="primary claude-section-btn" id="copy-context-${project.id}">Copy context JSON</button>
+          <p class="claude-hint">Paste into a new chat to get up to speed instantly</p>
+        </div>
+        <hr class="claude-divider">
         <div class="claude-section claude-section-narrow" data-section="open">
           <a class="claude-cta-secondary-btn" id="open-in-claude-${project.id}"
              href="https://claude.ai/new" target="_blank" rel="noopener">Open in Claude →</a>
@@ -1385,6 +1391,24 @@ function wireClaudeLaunchPanel(projectId) {
       stampHandoffTs(projectId, new Date());
     } catch(e) { toast('handoff failed: ' + e.message, true); }
   };
+  const copyContextBtn = document.getElementById(`copy-context-${projectId}`);
+  if (copyContextBtn) copyContextBtn.onclick = async () => {
+    const orig = copyContextBtn.textContent;
+    copyContextBtn.disabled = true;
+    copyContextBtn.textContent = 'Loading…';
+    try {
+      const r = await fetch(`/projects/${projectId}/context`);
+      if (!r.ok) throw new Error(`${r.status}`);
+      const ctx = await r.json();
+      const text = JSON.stringify(ctx, null, 2);
+      await navigator.clipboard.writeText(text);
+      copyContextBtn.textContent = 'Copied ✓';
+      setTimeout(() => { copyContextBtn.textContent = orig; }, 2000);
+      toast('context copied to clipboard');
+    } catch(e) { toast('copy context failed: ' + e.message, true); }
+    finally { copyContextBtn.disabled = false; }
+  };
+
   const regenBtn = document.getElementById(`regen-handoff-${projectId}`);
   if (regenBtn) regenBtn.onclick = async () => {
     const tsEl = document.getElementById(`handoff-ts-${projectId}`);
@@ -1544,6 +1568,7 @@ function renderQueue(tasks) {
   const inProg = tasks.filter(t => t.status === 'in_progress');
   const done = tasks.filter(t => t.status === 'done').slice(0, 10);
   const failed = tasks.filter(t => t.status === 'failed').slice(0, 10);
+  const backlog = tasks.filter(t => t.status === 'backlog');
 
   const sect = (icon, title, items, emptyMsg) => {
     const rows = items.length
@@ -1575,7 +1600,8 @@ function renderQueue(tasks) {
   return sect('⏳', 'Pending', pending, 'no pending tasks') +
          sect('🔄', 'In Progress', inProg, 'nothing running') +
          sect('✅', 'Recently Done', done, 'no completed tasks') +
-         (failed.length ? sect('❌', 'Failed', failed, '') : '');
+         (failed.length ? sect('❌', 'Failed', failed, '') : '') +
+         (backlog.length ? sect('📦 Backlog', '', backlog, '') : '');
 }
 
 async function loadFilesTab(projectId) {

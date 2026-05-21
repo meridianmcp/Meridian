@@ -113,7 +113,7 @@ CREATE TABLE IF NOT EXISTS task_log (
     project_id TEXT NOT NULL REFERENCES projects(id),
     description TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'done'
-        CHECK (status IN ('pending','in_progress','done','failed','pending-hitl')),
+        CHECK (status IN ('pending','in_progress','done','failed','pending-hitl','backlog','future')),
     claimed_by TEXT,
     claimed_at TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
@@ -221,6 +221,67 @@ def _encode_content(content: Any) -> str:
     return json.dumps(content)
 
 
+async def _migrate_task_log_backlog_future(db: aiosqlite.Connection) -> None:
+    """Rebuild ``task_log`` to add 'backlog' and 'future' statuses (v1.9.x).
+
+    SQLite cannot ALTER a CHECK constraint, so the table is rebuilt in-place
+    with the extended status list. No-op when already migrated.
+    """
+    async with db.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='task_log'"
+    ) as cur:
+        row = await cur.fetchone()
+    if row is None:
+        return
+    table_sql = row[0] or ""
+    if "'backlog'" in table_sql:
+        return  # already migrated
+    # Introspect exact columns — handles any schema version (4, 8, 10 cols)
+    async with db.execute("PRAGMA table_info(task_log)") as _cur:
+        _col_rows = list(await _cur.fetchall())
+    _col_names = [r[1] for r in _col_rows]
+
+    def _make_col_def(r: Any) -> str:
+        cid, name, ctype, notnull, dflt, pk = r
+        if pk:
+            return f"{name} {ctype} PRIMARY KEY"
+        if name == "status":
+            return (
+                f"{name} {ctype} NOT NULL DEFAULT 'done' CHECK "
+                "(status IN ('pending','in_progress','done','failed',"
+                "'pending-hitl','backlog','future'))"
+            )
+        parts = [f"{name} {ctype}"]
+        if notnull:
+            parts.append("NOT NULL")
+        if dflt is not None:
+            # PRAGMA returns datetime('now') without outer parens; wrap if needed
+            wrapped = dflt if dflt.startswith("'") or dflt.lstrip('-').isdigit() else f"({dflt})"
+            parts.append(f"DEFAULT {wrapped}")
+        return " ".join(parts)
+
+    col_defs = ",\n            ".join(_make_col_def(r) for r in _col_rows)
+    col_list = ", ".join(_col_names)
+
+    await db.executescript(
+        f"""
+        BEGIN;
+        ALTER TABLE task_log RENAME TO task_log_pre_backlog;
+        CREATE TABLE task_log (
+            {col_defs}
+        );
+        INSERT INTO task_log ({col_list})
+        SELECT {col_list} FROM task_log_pre_backlog;
+        DROP TABLE task_log_pre_backlog;
+        CREATE INDEX IF NOT EXISTS idx_tasks_project
+            ON task_log(project_id, created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_tasks_session
+            ON task_log(session_id);
+        COMMIT;
+        """
+    )
+
+
 async def _migrate_task_log_hitl(db: aiosqlite.Connection) -> None:
     """Rebuild ``task_log`` if its CHECK constraint predates v0.2.0.
 
@@ -252,8 +313,8 @@ async def _migrate_task_log_hitl(db: aiosqlite.Connection) -> None:
             created_at TEXT NOT NULL DEFAULT (datetime('now'))
         );
         INSERT INTO task_log (id, session_id, project_id, description, status, created_at)
-            SELECT id, session_id, project_id, description, status, created_at
-            FROM task_log_v01;
+        SELECT id, session_id, project_id, description, status, created_at
+        FROM task_log_v01;
         DROP TABLE task_log_v01;
         CREATE INDEX IF NOT EXISTS idx_tasks_project
             ON task_log(project_id, created_at DESC);
@@ -538,6 +599,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await db.executescript(CREATE_TABLES)
     await db.commit()
     await _migrate_task_log_hitl(db)
+    await _migrate_task_log_backlog_future(db)
     await _migrate_human_identity(db)
     await _migrate_task_claims(db)
     await _migrate_decisions(db)
@@ -1389,7 +1451,7 @@ async def log_task(
     worker logs its result. The timeline + auto-summary use it to
     correlate parent / child sessions.
     """
-    if status not in {"pending", "in_progress", "done", "failed", "pending-hitl"}:
+    if status not in {"pending", "in_progress", "done", "failed", "pending-hitl", "backlog", "future"}:
         raise ValueError(f"invalid task status: {status}")
     tid = _new_id()
     await db.execute(
