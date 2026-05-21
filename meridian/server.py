@@ -1324,6 +1324,15 @@ async def ws_project(ws: WebSocket, project_id: str) -> None:
     await broadcaster.serve(ws, project_id)
 
 
+
+
+@app.delete("/tasks/{task_id}", status_code=204)
+async def delete_task(task_id: str, request: Request) -> None:
+    """Delete a single task_log entry by ID. Permanent, no undo."""
+    db = _db(request)
+    await db.execute("DELETE FROM task_log WHERE id = ?", (task_id,))
+    await db.commit()
+
 @app.post("/tasks/enqueue", response_model=Task, status_code=202)
 async def enqueue_task(body: EnqueueTask, request: Request) -> dict[str, Any]:
     """Paid-tier: queue a Claude subprocess and return the pending task row.

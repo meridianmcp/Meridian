@@ -88,12 +88,19 @@ function _updateConnectionIndicator(cfg) {
           try {
             await api('/config/connections', { method: 'POST', body: JSON.stringify({ name: c.name, activate: true }) });
             await loadServerConfig();
-            // Restart needed to switch DB connection
-            if (!c.active) {
-              const banner = document.getElementById('update-banner');
-              if (banner) { banner.style.display = 'block'; banner.querySelector('span').textContent = '\u26A0\uFE0F Connection changed \u2014 restart to apply'; }
+            // Show restart banner — DB connection change needs restart
+            const banner = document.getElementById('update-banner');
+            const bannerSpan = banner?.querySelector('span');
+            if (banner) {
+              banner.style.display = 'block';
+              if (bannerSpan) bannerSpan.textContent = '\u26A0\uFE0F Connection changed to ' + c.name + ' \u2014 restart to apply';
             }
-          } catch(e) { console.error('Switch failed:', e); }
+            // Update indicator immediately
+            const dot = document.getElementById('connection-dot');
+            const label = document.getElementById('connection-label');
+            if (dot) dot.style.background = 'var(--accent)';
+            if (label) label.textContent = c.name + ' (' + (c.type || 'sqlite') + ')';
+          } catch(e) { console.error('Switch failed:', e); toast('Switch failed: ' + e.message, true); }
         };
         popup.appendChild(item);
       });
@@ -1823,16 +1830,31 @@ function renderTasks(projectId) {
 
 function renderTaskRow(t) {
   const claimBadge = t.claimed_by
-    ? `<span class="claim-badge" title="claimed at ${escapeHtml(t.claimed_at || '')}">🔒 ${escapeHtml((t.human_id || t.session_name || t.claimed_by || '').slice(0, 16))}</span>`
+    ? `<span class="claim-badge" title="claimed at ${escapeHtml(t.claimed_at || '')}">\U0001f512 ${escapeHtml((t.human_id || t.session_name || t.claimed_by || '').slice(0, 16))}</span>`
     : '';
+  const deleteBtn = `<button title="Delete from task log (permanent)" onclick="deleteTaskRow(event,'${t.id}','${t.status}')" style="background:none;border:none;color:var(--muted);cursor:pointer;font-size:13px;padding:0 4px;flex-shrink:0;line-height:1" onmouseenter="this.style.color='var(--status-failed)'" onmouseleave="this.style.color='var(--muted)'">\u00d7</button>`;
   return `
-    <div class="task ${t.status}">
+    <div class="task ${t.status}" id="task-row-${t.id}" style="display:flex;align-items:flex-start;gap:4px">
       <span class="status-badge">${t.status}</span>
-      <div>
+      <div style="flex:1;min-width:0">
         <div class="desc">${escapeHtml(t.description)}</div>
         <div class="meta">${escapeHtml(t.created_at)} ${claimBadge}</div>
       </div>
+      ${deleteBtn}
     </div>`;
+}
+
+async function deleteTaskRow(e, taskId, status) {
+  e.stopPropagation();
+  const warn = (status === 'pending' || status === 'in_progress')
+    ? 'This task is ' + status + '. Deleting it is permanent. Continue?'
+    : 'Permanently delete this task from the log?';
+  if (!confirm(warn)) return;
+  try {
+    await api('/tasks/' + taskId, { method: 'DELETE' });
+    const row = document.getElementById('task-row-' + taskId);
+    if (row) row.remove();
+  } catch(e2) { console.error('Delete failed:', e2); }
 }
 
 function renderHitlRow(projectId, t) {
