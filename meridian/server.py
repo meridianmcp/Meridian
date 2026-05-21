@@ -19,6 +19,21 @@ import re
 import signal
 from contextlib import asynccontextmanager
 from pathlib import Path
+
+# ---------------------------------------------------------------------------
+# Version — read from pixi.toml so it never goes stale
+# ---------------------------------------------------------------------------
+def _read_version() -> str:
+    try:
+        import tomllib  # Python 3.11+
+        _root = Path(__file__).parent.parent
+        with open(_root / "pixi.toml", "rb") as _f:
+            return tomllib.load(_f).get("workspace", {}).get("version", "dev")
+    except Exception:
+        return "dev"
+
+_VERSION = _read_version()
+
 from typing import Any
 
 import aiosqlite
@@ -293,7 +308,7 @@ async def server_config() -> dict[str, Any]:
         "server_url": server_url,
         "host": host,
         "port": port,
-        "version": "1.9.x",
+        "version": _VERSION,
         "db": (
             "postgres" if os.environ.get("MERIDIAN_DB_URL")
             else "memory" if os.environ.get("MERIDIAN_DB") == ":memory:"
