@@ -1642,16 +1642,12 @@ async def save_connection(body: dict[str, Any]) -> dict[str, Any]:
       * ``activate``  — if true, set as the active connection (default true)
     """
     name = str(body.get("name", "local")).strip()
-    conn_type = str(body.get("type", "sqlite"))
+    conn_type = body.get("type")  # optional — if omitted, reuse existing
     url = str(body.get("url", "")).strip()
     activate = bool(body.get("activate", True))
 
     if not name:
         raise HTTPException(400, "name is required")
-    if conn_type not in ("sqlite", "postgres"):
-        raise HTTPException(400, "type must be 'sqlite' or 'postgres'")
-    if conn_type == "postgres" and not url:
-        raise HTTPException(400, "url is required for postgres connections")
 
     # Load existing toml or start fresh.
     data = toml_config_module.load_toml() or {}
@@ -1659,10 +1655,18 @@ async def save_connection(body: dict[str, Any]) -> dict[str, Any]:
     for cname, ccfg in data.get("connections", {}).items():
         connections[cname] = dict(ccfg)
 
-    new_cfg: dict[str, str] = {"type": conn_type}
-    if conn_type == "postgres":
-        new_cfg["url"] = url
-    connections[name] = new_cfg
+    if conn_type is not None:
+        # Creating or updating a connection profile
+        if conn_type not in ("sqlite", "postgres"):
+            raise HTTPException(400, "type must be 'sqlite' or 'postgres'")
+        if conn_type == "postgres" and not url:
+            raise HTTPException(400, "url is required for postgres connections")
+        new_cfg: dict[str, str] = {"type": conn_type}
+        if conn_type == "postgres":
+            new_cfg["url"] = url
+        connections[name] = new_cfg
+    elif name not in connections and name != "local":
+        raise HTTPException(404, f"connection '{name}' not found in meridian.toml")
 
     current_default = data.get("default", {}).get("connection", "local")
     toml_config_module.save_toml(

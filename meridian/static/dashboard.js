@@ -85,10 +85,14 @@ function _updateConnectionIndicator(cfg) {
         item.onmouseleave = () => item.style.background = '';
         item.onclick = async () => {
           popup.remove();
-          if (c.active) return;
           try {
             await api('/config/connections', { method: 'POST', body: JSON.stringify({ name: c.name, activate: true }) });
             await loadServerConfig();
+            // Restart needed to switch DB connection
+            if (!c.active) {
+              const banner = document.getElementById('update-banner');
+              if (banner) { banner.style.display = 'block'; banner.querySelector('span').textContent = '\u26A0\uFE0F Connection changed \u2014 restart to apply'; }
+            }
           } catch(e) { console.error('Switch failed:', e); }
         };
         popup.appendChild(item);
