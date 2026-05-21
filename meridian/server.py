@@ -1277,7 +1277,7 @@ async def dashboard_chat(body: ChatRequest, request: Request):
 # Repo root is the parent of this package directory (meridian/).
 _REPO_ROOT = Path(__file__).parent.parent
 # The dashboard only allows editing these specific files.
-_EDITABLE_FILES: list[str] = ["AGENTS.md", "ROADMAP.md", "DEVLOG.md", "CLAUDE.md", "README.md"]
+_EDITABLE_FILES: list[str] = ["AGENTS.md", "ROADMAP.md", "DEVLOG.md", "CLAUDE.md", "README.md", "DECISIONS.md"]
 
 
 @app.get("/projects/{project_id}/files")

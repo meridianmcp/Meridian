@@ -1216,7 +1216,7 @@ function renderLiveQueue(projectId, tasks) {
   });
   root.innerHTML = live.map(t => {
     const dot = t.status === 'in_progress' ? '🔵' : '📋';
-    const claimLabel = t.human_id || t.session_name || t.claimed_by || '';
+    const claimLabel = t.claimed_by_human_id || t.claimed_by_session_name || t.claimed_by || '';
     const claimed = t.claimed_by
       ? `<span class="live-task-claim">claimed by: ${escapeHtml(claimLabel.slice(0, 24))}</span>`
       : '';
@@ -1556,7 +1556,7 @@ function renderQueue(tasks) {
           const expandMeta = [
             t.human_id     ? `human: ${t.human_id}` : '',
             t.session_name ? `session: ${t.session_name}` : '',
-            t.claimed_by   ? `claimed_by: ${t.claimed_by}` : '',
+            t.claimed_by   ? `claimed_by: ${t.claimed_by_human_id || t.claimed_by_session_name || t.claimed_by}` : '',
             t.created_at   ? `created: ${t.created_at}` : '',
             t.claimed_at   ? `claimed: ${t.claimed_at}` : '',
           ].filter(Boolean).join(' · ');
@@ -1904,7 +1904,7 @@ function renderTasks(projectId) {
 
 function renderTaskRow(t) {
   const claimBadge = t.claimed_by
-    ? `<span class="claim-badge" title="claimed at ${escapeHtml(t.claimed_at || '')}">\U0001f512 ${escapeHtml((t.human_id || t.session_name || t.claimed_by || '').slice(0, 16))}</span>`
+    ? `<span class="claim-badge" title="claimed at ${escapeHtml(t.claimed_at || '')}">\U0001f512 ${escapeHtml((t.claimed_by_human_id || t.claimed_by_session_name || t.claimed_by || '').slice(0, 16))}</span>`
     : '';
   const deleteBtn = `<button title="Delete from task log (permanent)" onclick="deleteTaskRow(event,'${t.id}','${t.status}')" style="background:none;border:none;color:var(--muted);cursor:pointer;font-size:13px;padding:0 4px;flex-shrink:0;line-height:1" onmouseenter="this.style.color='var(--status-failed)'" onmouseleave="this.style.color='var(--muted)'">\u00d7</button>`;
   return `

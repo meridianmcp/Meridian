@@ -177,6 +177,10 @@ class Task(BaseModel):
     claimed_by: str | None = None
     claimed_at: str | None = None
     created_at: str
+    session_name: str | None = None
+    human_id: str | None = None
+    claimed_by_human_id: str | None = None
+    claimed_by_session_name: str | None = None
 
 
 class ClaimTaskRequest(BaseModel):

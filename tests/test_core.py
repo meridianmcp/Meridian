@@ -4143,3 +4143,130 @@ def test_dashboard_html_has_git_banner(client):
     html = client.get("/dashboard").text
     assert "git-banner" in html
     assert "git pull recommended" in html
+
+
+# ---------------------------------------------------------------------------
+# v1.9.x — schema safety, archive task-release, AUTO BLOCKS dedup,
+#           claimed_by_human_id
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_schema_all_tables_exist(db):
+    """After init_db() every expected table must be present with key columns."""
+    expected = {
+        "projects": {"id", "name", "creator_human_id", "goal_mode", "decisions"},
+        "sessions": {"id", "project_id", "name", "human_id", "status", "last_seen"},
+        "task_log": {"id", "session_id", "project_id", "description", "status",
+                     "claimed_by", "claimed_at"},
+        "goal_states": {"id", "project_id", "content", "version",
+                        "goal_north_star", "goal_sprint"},
+        "sprint_items": {"id", "project_id", "version", "title", "status",
+                         "item_group", "pushed_to", "human_id"},
+        "chat_sessions": {"id", "project_id", "cli_session_id"},
+        "chat_messages": {"id", "project_id", "role", "content"},
+    }
+    async with db.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'"
+    ) as cur:
+        rows = await cur.fetchall()
+    found_tables = {r[0] for r in rows}
+    for table in expected:
+        assert table in found_tables, f"missing table: {table}"
+        async with db.execute(f"PRAGMA table_info({table})") as cur:
+            col_rows = await cur.fetchall()
+        found_cols = {r[1] for r in col_rows}
+        for col in expected[table]:
+            assert col in found_cols, f"missing column {table}.{col}"
+
+
+@pytest.mark.asyncio
+async def test_archive_stale_sessions_releases_in_progress_tasks(db):
+    """When a session is archived its in_progress tasks must revert to pending."""
+    from datetime import datetime, timedelta, timezone
+    p = await db_module.create_project(db, "alpha")
+    s = await db_module.register_session(db, p["id"], "stale-worker")
+    t = await db_module.log_task(db, s["id"], p["id"], "unfinished work", "pending")
+    await db_module.claim_task(db, t["id"], s["id"])
+
+    # Confirm claimed → in_progress
+    fresh = await db_module.get_task(db, t["id"])
+    assert fresh is not None
+    assert fresh["status"] == "in_progress"
+
+    # Backdate the session so it qualifies for archiving.
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=8)).strftime("%Y-%m-%d %H:%M:%S")
+    await db.execute("UPDATE sessions SET last_seen = ? WHERE id = ?", (cutoff, s["id"]))
+    await db.commit()
+
+    count = await db_module.archive_stale_sessions(db, p["id"])
+    assert count == 1
+
+    released = await db_module.get_task(db, t["id"])
+    assert released is not None
+    assert released["status"] == "pending"
+    assert released["claimed_by"] is None
+    assert released["claimed_at"] is None
+
+
+@pytest.mark.asyncio
+async def test_archive_stale_sessions_does_not_touch_done_tasks(db):
+    """Done/failed tasks must not be touched by archive task-release."""
+    from datetime import datetime, timedelta, timezone
+    p = await db_module.create_project(db, "alpha")
+    s = await db_module.register_session(db, p["id"], "stale-worker")
+    t = await db_module.log_task(db, s["id"], p["id"], "already done", "done")
+
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=8)).strftime("%Y-%m-%d %H:%M:%S")
+    await db.execute("UPDATE sessions SET last_seen = ? WHERE id = ?", (cutoff, s["id"]))
+    await db.commit()
+
+    await db_module.archive_stale_sessions(db, p["id"])
+    fresh = await db_module.get_task(db, t["id"])
+    assert fresh is not None
+    assert fresh["status"] == "done"
+
+
+@pytest.mark.asyncio
+async def test_set_goal_minor_no_auto_blocks_duplication(db):
+    """set_goal(minor=True) called twice must not duplicate AUTO BLOCKS."""
+    p = await db_module.create_project(db, "alpha")
+    await db_module.set_goal(db, p["id"], "Human directive.")
+
+    auto_section = "--- AUTO BLOCKS BELOW ---\n[AUTO SUMMARY - t1]\n- [DONE] first"
+    full_1 = "Human directive.\n" + auto_section
+    await db_module.set_goal(db, p["id"], full_1, minor=True)
+
+    auto_section2 = "--- AUTO BLOCKS BELOW ---\n[AUTO SUMMARY - t2]\n- [DONE] second"
+    full_2 = "Human directive.\n" + auto_section2
+    await db_module.set_goal(db, p["id"], full_2, minor=True)
+
+    goal = await db_module.get_goal(db, p["id"])
+    assert goal is not None
+    content = goal["content"]
+    # Must contain exactly one AUTO BLOCKS marker.
+    assert content.count("--- AUTO BLOCKS BELOW ---") == 1
+    # Must contain the second summary, not the first.
+    assert "t2" in content
+    assert "t1" not in content
+    # Human prefix intact.
+    assert content.startswith("Human directive.")
+
+
+@pytest.mark.asyncio
+async def test_get_tasks_includes_claimed_by_human_id(db):
+    """get_tasks must return claimed_by_human_id from the claiming session."""
+    p = await db_module.create_project(db, "alpha")
+    creator = await db_module.register_session(db, p["id"], "creator", human_id="alice")
+    claimer = await db_module.register_session(db, p["id"], "claimer", human_id="bob")
+    t = await db_module.log_task(db, creator["id"], p["id"], "do thing", "pending")
+    await db_module.claim_task(db, t["id"], claimer["id"])
+
+    tasks = await db_module.get_tasks(db, p["id"])
+    assert tasks
+    row = tasks[0]
+    assert row["claimed_by_human_id"] == "bob"
+    assert row["claimed_by_session_name"] == "claimer"
+    # Creator identity still correct.
+    assert row["human_id"] == "alice"
+    assert row["session_name"] == "creator"

@@ -870,11 +870,14 @@ async def set_goal(
         existing.get("sprint") if existing else None
     )
     if minor and existing is not None:
-        # In-place update — no version bump, no new row
-        # Strip existing AUTO BLOCKS from stored content, replace with new content's AUTO BLOCKS
+        # In-place update — no version bump, no new row.
+        # Strict AUTO BLOCKS replace: strip ALL occurrences from both sides,
+        # take the new AUTO BLOCKS section from incoming only, then reconstruct.
+        from datetime import datetime, timezone
         AUTO_SPLIT = "--- AUTO BLOCKS BELOW ---"
-        # Decode both to plain strings
-        def _to_str(v: Any) -> str:
+
+        def _to_plain(v: Any) -> str:
+            """Decode goal content to a plain string for marker surgery."""
             if isinstance(v, str):
                 return v
             if isinstance(v, dict):
@@ -883,22 +886,28 @@ async def set_goal(
             if isinstance(decoded, dict):
                 return decoded.get("content", "") or ""
             return str(decoded) if decoded else ""
-        new_decoded = _to_str(encoded)
-        existing_decoded = _to_str(existing.get("content") or "")
-        split_idx = existing_decoded.find(AUTO_SPLIT)
-        base = existing_decoded[:split_idx].rstrip() if split_idx != -1 else existing_decoded
-        # Get new AUTO BLOCKS from incoming content
-        new_split = new_decoded.find(AUTO_SPLIT) if isinstance(new_decoded, str) else -1
-        if new_split != -1 and isinstance(new_decoded, str):
-            new_auto = new_decoded[new_split:]
+
+        existing_str = _to_plain(existing.get("content") or "")
+        incoming_str = _to_plain(encoded)
+
+        # Strip ALL occurrences of AUTO_SPLIT-and-below from existing → base.
+        base = existing_str.split(AUTO_SPLIT)[0].rstrip()
+
+        # Extract new AUTO BLOCKS from incoming (split on first occurrence).
+        incoming_parts = incoming_str.split(AUTO_SPLIT, 1)
+        if len(incoming_parts) > 1:
+            new_auto = AUTO_SPLIT + incoming_parts[1]
             final_content = base + "\n" + new_auto
         else:
-            final_content = new_decoded  # no AUTO BLOCKS in new content, use as-is
+            # No AUTO BLOCKS in incoming — use incoming content as-is (minor
+            # update that happens to contain no auto section is fine).
+            final_content = incoming_str
+
         final_encoded = _encode_content(final_content)
         await db.execute(
             "UPDATE goal_states SET content = ?, goal_north_star = ?, goal_sprint = ?, updated_at = ? "
             "WHERE id = ?",
-            (final_encoded, final_north_star, final_sprint, _now_iso(), existing["id"]),
+            (final_encoded, final_north_star, final_sprint, datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"), existing["id"]),
         )
         await db.commit()
     else:
@@ -1318,9 +1327,21 @@ async def archive_stale_sessions(
 
     Only 'active' and 'idle' sessions are touched — 'closed' and already-
     'archived' rows are left unchanged.  Returns the count updated.
+
+    Any in_progress tasks held by the archived sessions are released back
+    to 'pending' so they can be picked up by the next worker session.
     """
     from datetime import datetime, timedelta, timezone
     cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
+    # Release in_progress tasks claimed by sessions about to be archived.
+    await db.execute(
+        "UPDATE task_log SET status = 'pending', claimed_by = NULL, claimed_at = NULL "
+        "WHERE claimed_by IN ("
+        "  SELECT id FROM sessions "
+        "  WHERE project_id = ? AND status NOT IN ('closed', 'archived') AND last_seen < ?"
+        ") AND status = 'in_progress'",
+        (project_id, cutoff),
+    )
     cursor = await db.execute(
         "UPDATE sessions SET status = 'archived' "
         "WHERE project_id = ? "
@@ -1474,9 +1495,11 @@ async def get_tasks(
     Joins sessions to include session_name and human_id for display.
     """
     async with db.execute(
-        "SELECT t.*, s.name AS session_name, s.human_id AS human_id "
+        "SELECT t.*, s.name AS session_name, s.human_id AS human_id, "
+        "cs.human_id AS claimed_by_human_id, cs.name AS claimed_by_session_name "
         "FROM task_log t "
         "LEFT JOIN sessions s ON s.id = t.session_id "
+        "LEFT JOIN sessions cs ON cs.id = t.claimed_by "
         "WHERE t.project_id = ? "
         "ORDER BY t.created_at DESC, t.rowid DESC LIMIT ?",
         (project_id, limit),
