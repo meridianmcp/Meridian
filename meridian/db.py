@@ -848,12 +848,17 @@ async def set_goal(
     content: Any,
     north_star: str | None = None,
     sprint: str | None = None,
+    minor: bool = False,
 ) -> dict[str, Any]:
-    """Upsert the goal state for a project, incrementing version each call.
+    """Upsert the goal state for a project.
 
     ``north_star`` and ``sprint`` are optional. When omitted, the values
     from the previous goal row are carried forward (backward compat). Pass
     an explicit value to change them. Since v0.5.2.
+
+    When ``minor=True``, the latest row is updated in-place without
+    incrementing the version counter. Use this for AUTO BLOCKS appends
+    that should not pollute the goal history.
     """
     existing = await get_goal(db, project_id)
     encoded = _encode_content(content)
@@ -864,15 +869,24 @@ async def set_goal(
     final_sprint = sprint if sprint is not None else (
         existing.get("sprint") if existing else None
     )
-    new_version = 1 if existing is None else int(existing["version"]) + 1
-    gid = _new_id()
-    await db.execute(
-        "INSERT INTO goal_states "
-        "(id, project_id, content, version, goal_north_star, goal_sprint) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
-        (gid, project_id, encoded, new_version, final_north_star, final_sprint),
-    )
-    await db.commit()
+    if minor and existing is not None:
+        # In-place update — no version bump, no new row
+        await db.execute(
+            "UPDATE goal_states SET content = ?, goal_north_star = ?, goal_sprint = ?, updated_at = ? "
+            "WHERE id = ?",
+            (encoded, final_north_star, final_sprint, _now_iso(), existing["id"]),
+        )
+        await db.commit()
+    else:
+        new_version = 1 if existing is None else int(existing["version"]) + 1
+        gid = _new_id()
+        await db.execute(
+            "INSERT INTO goal_states "
+            "(id, project_id, content, version, goal_north_star, goal_sprint) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (gid, project_id, encoded, new_version, final_north_star, final_sprint),
+        )
+        await db.commit()
     goal = await get_goal(db, project_id)
     assert goal is not None
     return goal

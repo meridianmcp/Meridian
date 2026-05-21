@@ -36,6 +36,7 @@ class GoalSet(BaseModel):
     human_id: str | None = None
     north_star: str | None = None
     sprint: str | None = None
+    minor: bool = False  # if True, update in-place without version bump (for AUTO BLOCKS)
 
 
 class SetNorthStarRequest(BaseModel):

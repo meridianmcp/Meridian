@@ -531,6 +531,7 @@ async def set_goal(
     result = await db_module.set_goal(
         _db(request), project_id, body.content,
         north_star=body.north_star, sprint=body.sprint,
+        minor=body.minor,
     )
     await goal_md_module.sync_db_to_goal_md(_db(request), project_id)
     return result
@@ -2375,6 +2376,7 @@ def build_mcp_server():
                     arguments["content"],
                     north_star=arguments.get("north_star"),
                     sprint=arguments.get("sprint"),
+                    minor=bool(arguments.get("minor", False)),
                 )
             elif name == "set_north_star":
                 owner = await db_module.get_project_owner(
