@@ -54,10 +54,59 @@ function _updateConnectionIndicator(cfg) {
   const dbType = cfg.db || 'sqlite';
   label.textContent = name + ' (' + dbType + ')';
   dot.style.background = dbType === 'postgres' ? 'var(--accent)' : 'var(--accent-green)';
-  // Populate dropdown if multiple connections
+  // Make indicator clickable to show connection popup
   const conns = cfg.connections || [];
+  if (conns.length > 0 && wrap) {
+    wrap.style.cursor = 'pointer';
+    wrap.title = 'Click to switch connection';
+    wrap.onclick = (e) => {
+      e.stopPropagation();
+      document.querySelectorAll('.conn-popup').forEach(p => p.remove());
+      const popup = document.createElement('div');
+      popup.className = 'conn-popup';
+      popup.style.cssText = 'position:fixed;background:var(--surface-2);border:1px solid var(--border);border-radius:4px;z-index:1001;min-width:180px;box-shadow:0 4px 12px rgba(0,0,0,0.4);font-size:11px;font-family:var(--font-mono);padding:6px 0';
+      const rect = wrap.getBoundingClientRect();
+      popup.style.bottom = (window.innerHeight - rect.top + 4) + 'px';
+      popup.style.left = rect.left + 'px';
+      // Header
+      const hdr = document.createElement('div');
+      hdr.style.cssText = 'padding:4px 12px;color:var(--muted);font-size:10px;border-bottom:1px solid var(--border);margin-bottom:4px';
+      hdr.textContent = 'Switch connection';
+      popup.appendChild(hdr);
+      // Connection options
+      (conns.length > 0 ? conns : [{name: cfg.connection_name || 'current', type: cfg.db, active: true}]).forEach(c => {
+        const item = document.createElement('div');
+        item.style.cssText = `padding:6px 12px;cursor:pointer;display:flex;align-items:center;gap:8px;${c.active ? 'color:var(--accent)' : 'color:var(--text)'}`;
+        const dot2 = document.createElement('span');
+        dot2.style.cssText = `display:inline-block;width:6px;height:6px;border-radius:50%;background:${c.active ? 'var(--accent)' : 'var(--muted)'}`;
+        item.appendChild(dot2);
+        item.appendChild(document.createTextNode(c.name + ' (' + (c.type || 'sqlite') + ')'));
+        item.onmouseenter = () => { if (!c.active) item.style.background = 'var(--surface-3)'; };
+        item.onmouseleave = () => item.style.background = '';
+        item.onclick = async () => {
+          popup.remove();
+          if (c.active) return;
+          try {
+            await api('/config/connections', { method: 'POST', body: JSON.stringify({ name: c.name, activate: true }) });
+            await loadServerConfig();
+          } catch(e) { console.error('Switch failed:', e); }
+        };
+        popup.appendChild(item);
+      });
+      // Add connection option
+      const addItem = document.createElement('div');
+      addItem.style.cssText = 'padding:6px 12px;cursor:pointer;color:var(--muted);border-top:1px solid var(--border);margin-top:4px';
+      addItem.textContent = '+ Add connection...';
+      addItem.onmouseenter = () => addItem.style.color = 'var(--text)';
+      addItem.onmouseleave = () => addItem.style.color = 'var(--muted)';
+      addItem.onclick = () => { popup.remove(); document.getElementById('conn-setup-modal').style.display = 'flex'; };
+      popup.appendChild(addItem);
+      document.body.appendChild(popup);
+      setTimeout(() => document.addEventListener('click', () => popup.remove(), { once: true }), 0);
+    };
+  }
   if (conns.length > 1 && switcher) {
-    switcher.style.display = 'inline-block';
+    switcher.style.display = 'none'; // replaced by popup
     switcher.innerHTML = conns.map(c =>
       `<option value="${c.name}" ${c.active ? 'selected' : ''}>${c.name}</option>`
     ).join('');
