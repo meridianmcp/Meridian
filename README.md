@@ -1,5 +1,8 @@
 # Meridian
 
+[![GitHub stars](https://img.shields.io/github/stars/ajc3xc/Meridian?style=social)](https://github.com/ajc3xc/Meridian/stargazers)
+[![License: MSL-2.0](https://img.shields.io/badge/license-MSL--2.0-blue)](LICENSE)
+
 Your AI sessions don't remember each other.
 
 Every Claude tab starts fresh. Parallel sessions duplicate work. Context fills up
