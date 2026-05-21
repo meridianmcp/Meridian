@@ -127,8 +127,30 @@ async function loadProjects() {
   state.projects.forEach(p => {
     const div = document.createElement('div');
     div.className = 'project-item';
-    div.innerHTML = `<span>${escapeHtml(p.name)}</span><span class="id">${p.id.slice(0,6)}</span>`;
-    div.onclick = () => openTab(p);
+    div.style.cssText = 'display:flex;align-items:center;justify-content:space-between;gap:4px';
+    const nameSpan = document.createElement('span');
+    nameSpan.style.cssText = 'flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap';
+    nameSpan.textContent = p.name;
+    const idSpan = document.createElement('span');
+    idSpan.className = 'id';
+    idSpan.textContent = p.id.slice(0,6);
+    const menuBtn = document.createElement('button');
+    menuBtn.textContent = '⋯';
+    menuBtn.title = 'Project actions';
+    menuBtn.style.cssText = 'background:none;border:none;color:var(--muted);cursor:pointer;padding:0 4px;font-size:14px;line-height:1;flex-shrink:0';
+    menuBtn.onmouseenter = () => menuBtn.style.color = 'var(--text)';
+    menuBtn.onmouseleave = () => menuBtn.style.color = 'var(--muted)';
+    menuBtn.onclick = (e) => {
+      e.stopPropagation();
+      // Find or create a fake tab object for _openTabMenu
+      let t = state.tabs.find(tab => tab.id === p.id);
+      if (!t) { openTab(p); t = state.tabs.find(tab => tab.id === p.id); }
+      if (t) _openTabMenu(t, menuBtn);
+    };
+    div.appendChild(nameSpan);
+    div.appendChild(idSpan);
+    div.appendChild(menuBtn);
+    div.onclick = (e) => { if (e.target !== menuBtn) openTab(p); };
     list.appendChild(div);
   });
   // v1.9.x — hide the legacy dropdown; keep element for switcher.value compat.
