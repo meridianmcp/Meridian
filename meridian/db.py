@@ -871,10 +871,27 @@ async def set_goal(
     )
     if minor and existing is not None:
         # In-place update — no version bump, no new row
+        # Strip existing AUTO BLOCKS from stored content, replace with new content's AUTO BLOCKS
+        AUTO_SPLIT = "--- AUTO BLOCKS BELOW ---"
+        new_decoded = _decode_content(encoded) if not isinstance(encoded, str) else encoded
+        # Get the base (non-AUTO BLOCKS) part of existing content
+        existing_decoded = existing.get("content") or ""
+        if isinstance(existing_decoded, dict):
+            existing_decoded = existing_decoded.get("content", "") or ""
+        split_idx = existing_decoded.find(AUTO_SPLIT)
+        base = existing_decoded[:split_idx].rstrip() if split_idx != -1 else existing_decoded
+        # Get new AUTO BLOCKS from incoming content
+        new_split = new_decoded.find(AUTO_SPLIT) if isinstance(new_decoded, str) else -1
+        if new_split != -1 and isinstance(new_decoded, str):
+            new_auto = new_decoded[new_split:]
+            final_content = base + "\n" + new_auto
+        else:
+            final_content = new_decoded  # no AUTO BLOCKS in new content, use as-is
+        final_encoded = _encode_content(final_content)
         await db.execute(
             "UPDATE goal_states SET content = ?, goal_north_star = ?, goal_sprint = ?, updated_at = ? "
             "WHERE id = ?",
-            (encoded, final_north_star, final_sprint, _now_iso(), existing["id"]),
+            (final_encoded, final_north_star, final_sprint, _now_iso(), existing["id"]),
         )
         await db.commit()
     else:
