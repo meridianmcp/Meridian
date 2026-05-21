@@ -82,7 +82,8 @@ html, body {
   padding: 8px 16px; border-top: 1px solid var(--border);
   display: flex; gap: 6px;
 }
-.new-project input { flex: 1; }
+.new-project input:first-child { flex: 1; min-width: 0; }
+.new-project input:last-of-type { flex: 0 0 72px; min-width: 0; }
 
 .main { display: flex; flex-direction: column; min-width: 0; }
 .tabs {
