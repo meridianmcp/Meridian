@@ -12,9 +12,10 @@ from a compressed handoff.
 ## Screenshots
 
 ![Dashboard](docs/screenshots/01_dashboard.png)
-![Live tab](docs/screenshots/02_live_tab.png)
-![Goal state](docs/screenshots/03_goal_tab.png)
-![Rewind timeline](docs/screenshots/05_rewind_tab.png)
+![Live tab — active sessions + task queue](docs/screenshots/02_live_tab.png)
+![Goal state — north star, version goal, sprint](docs/screenshots/03_goal_tab.png)
+![Rewind — milestones shipped over last 7d](docs/screenshots/05_rewind_tab.png)
+![Charts — tasks/day + sprint velocity](docs/screenshots/05b_charts_tab.png)
 
 ## What you get
 
@@ -102,7 +103,7 @@ State lives in a local SQLite file. No accounts, no cloud, no sync required.
 ## Hosted tier (coming soon)
 
 Zero-install dashboard at meridian.app — your team gets a shared URL, no Python required.
-[Join the waitlist](https://github.com/ajc3xc/Meridian/issues) to be notified at launch.
+Email [hello@usemeridian.us](mailto:hello@usemeridian.us) to join the waitlist.
 
 ## Contributors
 
