@@ -36,6 +36,15 @@ async function loadServerConfig() {
     state.serverConfig = cfg || state.serverConfig;
     const verEl = document.getElementById('server-version');
     if (verEl && cfg?.version) verEl.textContent = `v${cfg.version}`;
+    // v2.0-fixes — demo mode banner
+    if (cfg?.demo_mode && !document.getElementById('demo-mode-banner')) {
+      const b = document.createElement('div');
+      b.id = 'demo-mode-banner';
+      b.style = 'position:fixed;top:0;left:0;right:0;z-index:9999;background:#7c3aed;color:#fff;text-align:center;padding:5px 12px;font-size:12px;font-family:inherit;letter-spacing:0.02em';
+      b.textContent = 'Preview mode — read only';
+      document.body.prepend(b);
+      document.body.style.paddingTop = ((parseInt(document.body.style.paddingTop || '0', 10)) + 28) + 'px';
+    }
     // v1.9.x — update connection indicator
     _updateConnectionIndicator(cfg);
   } catch (e) { /* offline / older server — ignore */ }
@@ -2853,7 +2862,7 @@ function renderRewindGoals(projectId, data, history) {
   });
   let historyHtml = '';
   if (history && history.length) {
-    const rows = history.map((v, idx) => {
+    const rows = [...history].reverse().map((v, idx) => {
       const id = `gv-expand-${projectId}-${idx}`;
       const raw = (v.version_goal || v.north_star || '').replace(/\s+/g, ' ').trim();
       const snippet = raw.length > 80 ? raw.slice(0, 79) + '…' : raw;

@@ -80,6 +80,134 @@ DEFAULT_DATA_DIR = Path(
     os.environ.get("MERIDIAN_DATA_DIR", "data")
 )
 
+_DEMO_COOKIE = "meridian_demo_access"
+_DEMO_COOKIE_MAX_AGE = 24 * 3600
+
+
+def _check_demo_cookie(request: Request) -> bool:
+    """Return True when the demo access cookie is present and valid."""
+    from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
+
+    secret = (
+        os.environ.get("SESSION_SECRET")
+        or os.environ.get("MERIDIAN_SESSION_SECRET")
+        or "demo-fallback-secret"
+    )
+    token = request.cookies.get(_DEMO_COOKIE, "")
+    if not token:
+        return False
+    try:
+        URLSafeTimedSerializer(secret).loads(token, max_age=_DEMO_COOKIE_MAX_AGE)
+        return True
+    except (BadSignature, SignatureExpired, Exception):  # noqa: BLE001
+        return False
+
+
+def _demo_gate_html(error: str = "") -> str:
+    """Return the password gate page HTML."""
+    err_html = f'<div class="err">{error}</div>' if error else '<div class="err"></div>'
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Meridian — Preview Access</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+*{{box-sizing:border-box;margin:0;padding:0}}
+body{{background:#0d0d0d;color:#e2e8f0;font-family:'IBM Plex Mono',monospace,sans-serif;min-height:100vh;display:flex;align-items:center;justify-content:center}}
+.card{{background:#161616;border:1px solid #2d2d2d;border-radius:8px;padding:40px;max-width:380px;width:100%;margin:20px}}
+.logo{{font-size:22px;font-weight:600;color:#a78bfa;margin-bottom:6px}}
+.sub{{color:#6b7280;font-size:12px;margin-bottom:28px}}
+.err{{color:#f87171;font-size:12px;margin-bottom:12px;min-height:18px}}
+label{{display:block;color:#9ca3af;font-size:11px;margin-bottom:6px}}
+input{{width:100%;background:#0d0d0d;border:1px solid #2d2d2d;color:#e2e8f0;padding:8px 12px;border-radius:4px;font-family:inherit;font-size:13px;margin-bottom:16px;outline:none}}
+input:focus{{border-color:#7c3aed}}
+button{{width:100%;background:#7c3aed;color:#fff;border:none;padding:10px;border-radius:4px;cursor:pointer;font-size:13px;font-family:inherit}}
+button:hover{{background:#6d28d9}}
+.req{{text-align:center;margin-top:16px;font-size:11px;color:#6b7280}}
+.req a{{color:#a78bfa;text-decoration:none}}
+.req a:hover{{text-decoration:underline}}
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="logo">&#x1f9ed; Meridian</div>
+  <div class="sub">Preview access required</div>
+  {err_html}
+  <form method="POST" action="/demo-auth">
+    <label>Access password</label>
+    <input type="password" name="password" autofocus placeholder="Enter password">
+    <button type="submit">Enter preview &#x2192;</button>
+  </form>
+  <div class="req">Request access: <a href="mailto:hello@usemeridian.us">hello@usemeridian.us</a></div>
+</div>
+</body>
+</html>"""
+
+
+async def _seed_demo_data(db) -> None:
+    """Seed realistic demo data when MERIDIAN_DEMO=true and DB is empty."""
+    existing = await db_module.list_projects(db)
+    if existing:
+        return
+
+    import uuid
+    from datetime import datetime, timedelta, timezone
+
+    now = datetime.now(tz=timezone.utc)
+
+    meridian = await db_module.create_project(db, "meridian-build")
+    chinampa = await db_module.create_project(db, "chinampa-ag")
+
+    await db_module.set_goal(
+        db, meridian["id"],
+        "Ship Meridian v2.0 hosted tier: Google OAuth, per-customer Neon DB, "
+        "Stripe $20/mo, deploy to usemeridian.us. Target: 10 paying teams by Q3 2026.",
+    )
+    await db_module.set_goal(
+        db, chinampa["id"],
+        "Build Chinampa AG field dashboard MVP: crop yield tracking, irrigation "
+        "schedules, weather integration. Demo to seed investors by end of sprint.",
+    )
+
+    # Sessions: 3 on meridian-build, 2 on chinampa-ag
+    m1 = await db_module.register_session(db, meridian["id"], "claude-code-1", human_id="adam")
+    m2 = await db_module.register_session(db, meridian["id"], "claude-code-2", human_id="adam")
+    m3 = await db_module.register_session(db, meridian["id"], "claude-code-3", human_id="adam")
+    c1 = await db_module.register_session(db, chinampa["id"], "claude-code-4", human_id="adam")
+    c2 = await db_module.register_session(db, chinampa["id"], "claude-code-5", human_id="adam")
+
+    # 20 tasks: mix of done/pending, realistic Meridian dogfood story
+    meridian_tasks = [
+        (m1, "Set up FastAPI + aiosqlite skeleton — hello world at /health", "done"),
+        (m1, "Wrote CREATE_TABLES with projects, sessions, task_log, goal_states", "done"),
+        (m1, "Implemented register_session and log_task db functions", "done"),
+        (m2, "Built MCP server with 8 tools — start_session, log_task, generate_handoff", "done"),
+        (m2, "Added generate_handoff endpoint — Jinja2 template renders compressed context", "done"),
+        (m2, "Wired up FastAPI lifespan — DB init on startup, graceful shutdown", "done"),
+        (m3, "Added Google OAuth flow — auth/login, auth/callback, session cookie", "done"),
+        (m3, "Created tenant tables + upsert_tenant, create_api_token db functions", "done"),
+        (m3, "Built remote MCP endpoint POST /mcp with bearer token auth", "done"),
+        (m1, "Stripe webhook + signature verification — provision Neon DB on checkout", "done"),
+        (m2, "Landing page (Jinja2 template, dark theme, waitlist form)", "done"),
+        (m3, "Deployed to Fly.io — meridian-hosted.fly.dev healthy", "done"),
+        (m1, "Write 316 tests — all passing before every commit", "done"),
+        (m2, "Add preview mode — DEMO_PASSWORD gate + MERIDIAN_DEMO read-only", "pending"),
+        (m3, "Deploy preview app to meridian-preview.fly.dev", "pending"),
+    ]
+    chinampa_tasks = [
+        (c1, "Set up Next.js project structure and Tailwind config", "done"),
+        (c1, "Built field map component — renders GeoJSON polygons from API", "done"),
+        (c2, "Irrigation schedule API — GET /fields/{id}/schedule returns weekly plan", "done"),
+        (c2, "Weather integration — pulls forecast from Open-Meteo, stores in Postgres", "done"),
+        (c2, "Dashboard layout — sidebar nav, field selector, weekly calendar view", "pending"),
+    ]
+
+    for (sess, desc, status) in meridian_tasks:
+        await db_module.log_task(db, sess["id"], meridian["id"], desc, status)
+    for (sess, desc, status) in chinampa_tasks:
+        await db_module.log_task(db, sess["id"], chinampa["id"], desc, status)
+
 
 # ---------------------------------------------------------------------------
 # Lifespan
@@ -131,6 +259,13 @@ async def lifespan(app: FastAPI):
     app.state.db = db
     app.state.data_dir = str(data_dir)
     app.state.ws_broadcaster = dashboard_module.WebSocketBroadcaster()
+
+    # v2.0-fixes — demo seed data when MERIDIAN_DEMO=true and DB is empty
+    if os.environ.get("MERIDIAN_DEMO", "").lower() in ("1", "true", "yes"):
+        try:
+            await _seed_demo_data(db)
+        except Exception:  # noqa: BLE001
+            pass
 
     # v0.4.2 — periodic auto-summary task. Interval comes from env so
     # tests can run it on a sub-second cadence; default is ten minutes.
@@ -256,6 +391,33 @@ except ImportError:
 
 
 # ---------------------------------------------------------------------------
+# v2.0-fixes — Demo read-only middleware (MERIDIAN_DEMO=true)
+# ---------------------------------------------------------------------------
+
+_DEMO_WRITE_ALLOWLIST = {"/demo-auth", "/waitlist"}
+
+
+@app.middleware("http")
+async def _demo_read_only_middleware(request: Request, call_next):
+    """Block all mutating requests when MERIDIAN_DEMO=true.
+
+    /demo-auth and /waitlist are exempted so the password gate and waitlist
+    signup still function in preview mode.
+    """
+    if (
+        os.environ.get("MERIDIAN_DEMO", "").lower() in ("1", "true", "yes")
+        and request.method in ("POST", "PUT", "PATCH", "DELETE")
+        and request.url.path not in _DEMO_WRITE_ALLOWLIST
+    ):
+        return Response(
+            content=json.dumps({"detail": "Preview mode — read only"}),
+            status_code=403,
+            media_type="application/json",
+        )
+    return await call_next(request)
+
+
+# ---------------------------------------------------------------------------
 # v1.0.2 — Static files + Jinja2 templates
 # ---------------------------------------------------------------------------
 
@@ -298,8 +460,51 @@ def _data_dir(request: Request) -> str:
 
 @app.get("/", response_class=HTMLResponse)
 async def landing_page(request: Request) -> HTMLResponse:
-    """Landing page — headline, CTAs, waitlist form."""
+    """Landing page — headline, CTAs, waitlist form.
+
+    When DEMO_PASSWORD is set the page is behind a password gate so the
+    preview URL can be shared without exposing the live dashboard publicly.
+    """
+    if os.environ.get("DEMO_PASSWORD"):
+        if not _check_demo_cookie(request):
+            return HTMLResponse(_demo_gate_html())
     return _templates.TemplateResponse(request, "landing.html")
+
+
+@app.post("/demo-auth")
+async def demo_auth_post(request: Request):
+    """Validate demo password and set a signed access cookie.
+
+    On success redirects to /dashboard; on failure re-renders the gate page
+    with an error message.  Exempt from the MERIDIAN_DEMO read-only
+    middleware so this endpoint is reachable in preview mode.
+    """
+    from fastapi.responses import RedirectResponse
+    from itsdangerous import URLSafeTimedSerializer
+
+    form = await request.form()
+    password = str(form.get("password", ""))
+    expected = os.environ.get("DEMO_PASSWORD", "")
+    if not expected or password != expected:
+        return HTMLResponse(
+            _demo_gate_html("Incorrect password. Please try again."),
+            status_code=401,
+        )
+    secret = (
+        os.environ.get("SESSION_SECRET")
+        or os.environ.get("MERIDIAN_SESSION_SECRET")
+        or "demo-fallback-secret"
+    )
+    token = URLSafeTimedSerializer(secret).dumps("demo")
+    resp = RedirectResponse(url="/dashboard", status_code=302)
+    resp.set_cookie(
+        _DEMO_COOKIE,
+        token,
+        max_age=_DEMO_COOKIE_MAX_AGE,
+        httponly=True,
+        samesite="lax",
+    )
+    return resp
 
 
 @app.get("/health")
@@ -370,6 +575,7 @@ async def server_config() -> dict[str, Any]:
         "toml_path": str(toml_config_module._toml_path() or (Path.cwd() / "meridian.toml")),
         "connection_name": conn_name,
         "connections": toml_config_module.list_connections(),
+        "demo_mode": os.environ.get("MERIDIAN_DEMO", "").lower() in ("1", "true", "yes"),
     }
 
 
@@ -1116,6 +1322,7 @@ async def patch_task(
             task_id,
             status=body.status,
             description=body.description,
+            project_id=existing["project_id"],
         )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
@@ -1247,7 +1454,10 @@ async def export_project_pdf(project_id: str, request: Request):
 @app.get("/dashboard", response_class=HTMLResponse)
 async def dashboard_html(request: Request) -> Any:
     """Serve the Meridian dashboard from a Jinja2 template."""
-    return _templates.TemplateResponse(request, "dashboard.html")
+    if os.environ.get("DEMO_PASSWORD"):
+        if not _check_demo_cookie(request):
+            return HTMLResponse(_demo_gate_html())
+    return _templates.TemplateResponse(request, "dashboard.html", {"version": _VERSION})
 
 
 @app.get("/config/api-key")

@@ -1568,12 +1568,17 @@ async def update_task(
     *,
     status: str | None = None,
     description: str | None = None,
+    project_id: str | None = None,
 ) -> dict[str, Any] | None:
     """Update a task's status and/or description in place.
 
     Returns the updated task dict, or None if the id doesn't exist. Used by
     the paid-tier ``enqueue_claude_task`` worker to mark a pending task done
     or failed once the subprocess returns.
+
+    ``project_id`` is an optional safety guard: when supplied the UPDATE
+    includes ``AND project_id = ?`` so a caller cannot accidentally mutate a
+    task that belongs to a different project.
     """
     fields: list[str] = []
     values: list[Any] = []
@@ -1587,9 +1592,14 @@ async def update_task(
         values.append(description)
     if not fields:
         return await get_task(db, task_id)
-    values.append(task_id)
+    if project_id is not None:
+        values.extend([task_id, project_id])
+        where = "id = ? AND project_id = ?"
+    else:
+        values.append(task_id)
+        where = "id = ?"
     await db.execute(
-        f"UPDATE task_log SET {', '.join(fields)} WHERE id = ?", values
+        f"UPDATE task_log SET {', '.join(fields)} WHERE {where}", values
     )
     await db.commit()
     updated = await get_task(db, task_id)
