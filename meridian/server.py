@@ -296,6 +296,12 @@ def _data_dir(request: Request) -> str:
 # ---------------------------------------------------------------------------
 
 
+@app.get("/", response_class=HTMLResponse)
+async def landing_page(request: Request) -> HTMLResponse:
+    """Landing page — headline, CTAs, waitlist form."""
+    return _templates.TemplateResponse("landing.html", {"request": request})
+
+
 @app.get("/health")
 async def health() -> dict[str, str]:
     """Liveness probe."""
