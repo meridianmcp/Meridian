@@ -12,13 +12,21 @@ RUN pip install --no-cache-dir uv
 COPY pyproject.toml ./
 COPY pixi.toml ./
 
-# Install dependencies via uv
-RUN uv pip install --system fastapi uvicorn[standard] aiosqlite asyncpg python-dotenv toml
+# Install dependencies via uv from pyproject.toml
+RUN uv pip install --system -r pyproject.toml
 
 # Copy the rest of the app
 COPY . .
 
 EXPOSE 8000
 
-# Use MERIDIAN_DB_URL env var — Neon postgres in hosted mode, SQLite fallback
-CMD ["uvicorn", "meridian.server:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers", "--forwarded-allow-ips=*"]
+ENV MERIDIAN_DB=/app/data/meridian.db
+
+# Startup: enforce Postgres when running on Fly
+CMD ["sh", "-c", "\
+  if [ -n \"$FLY_APP_NAME\" ] && [ -z \"$MERIDIAN_DB_URL\" ]; then \
+    echo 'ERROR: Hosted mode requires MERIDIAN_DB_URL (Postgres). For local use: docker compose up OR pixi run start'; \
+    exit 1; \
+  fi; \
+  exec uvicorn meridian.server:app --host 0.0.0.0 --port 8000 --proxy-headers --forwarded-allow-ips=* \
+"]
