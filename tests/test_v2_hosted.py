@@ -1,0 +1,382 @@
+"""v2.0 hosted-tier tests: tenant tables, token, webhook sig, landing, MCP auth, docker-compose."""
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import hmac
+import json
+import os
+import time
+from pathlib import Path
+
+import aiosqlite
+import pytest
+
+
+def _run(coro):
+    """Run a coroutine in a fresh event loop (pytest-safe)."""
+    return asyncio.run(coro)
+
+
+def _make_test_db():
+    """Coroutine that returns an in-memory DB with full schema applied."""
+    from meridian.db import CREATE_TABLES
+
+    async def _inner():
+        db = await aiosqlite.connect(":memory:")
+        db.row_factory = aiosqlite.Row
+        await db.executescript(CREATE_TABLES)
+        await db.commit()
+        return db
+
+    return _inner
+
+
+# ---------------------------------------------------------------------------
+# Tenant tables
+# ---------------------------------------------------------------------------
+
+def test_tenant_tables_exist_in_schema():
+    """CREATE_TABLES must define tenants, user_sessions, api_tokens."""
+    from meridian.db import CREATE_TABLES
+
+    for table in ("tenants", "user_sessions", "api_tokens"):
+        assert table in CREATE_TABLES, f"CREATE_TABLES missing {table!r}"
+
+
+def test_upsert_tenant_creates_row():
+    """upsert_tenant creates a tenant row and assigns an id."""
+    from meridian import db as db_module
+
+    async def _run_inner():
+        db = await _make_test_db()()
+        t = await db_module.upsert_tenant(db, "alice@example.com")
+        await db.close()
+        return t
+
+    t = _run(_run_inner())
+    assert t["email"] == "alice@example.com"
+    assert t["id"] is not None
+    assert t["plan"] == "free"
+
+
+def test_upsert_tenant_idempotent():
+    """Calling upsert_tenant twice with same email returns same id."""
+    from meridian import db as db_module
+
+    async def _run_inner():
+        db = await _make_test_db()()
+        t1 = await db_module.upsert_tenant(db, "alice@example.com")
+        t2 = await db_module.upsert_tenant(db, "alice@example.com")
+        await db.close()
+        return t1, t2
+
+    t1, t2 = _run(_run_inner())
+    assert t1["id"] == t2["id"]
+
+
+def test_upsert_tenant_updates_google_sub():
+    """upsert_tenant patches google_sub when provided on second call."""
+    from meridian import db as db_module
+
+    async def _run_inner():
+        db = await _make_test_db()()
+        await db_module.upsert_tenant(db, "bob@example.com")
+        t = await db_module.upsert_tenant(db, "bob@example.com", google_sub="sub_xyz")
+        await db.close()
+        return t
+
+    t = _run(_run_inner())
+    assert t["google_sub"] == "sub_xyz"
+
+
+# ---------------------------------------------------------------------------
+# API token round-trip
+# ---------------------------------------------------------------------------
+
+def test_api_token_create_and_lookup():
+    """create_api_token stores hash; get_tenant_from_token_hash finds tenant."""
+    from meridian import db as db_module
+
+    async def _run_inner():
+        db = await _make_test_db()()
+        tenant = await db_module.upsert_tenant(db, "carol@example.com")
+        raw_token, _row = await db_module.create_api_token(db, tenant["id"], label="test")
+        token_hash = hashlib.sha256(raw_token.encode()).hexdigest()
+        found = await db_module.get_tenant_from_token_hash(db, token_hash)
+        bad = await db_module.get_tenant_from_token_hash(db, "badhash000")
+        await db.close()
+        return raw_token, found, bad
+
+    raw_token, found, bad = _run(_run_inner())
+    assert raw_token.startswith("sk_meridian_")
+    assert found is not None
+    assert found["email"] == "carol@example.com"
+    assert bad is None
+
+
+def test_bearer_auth_endpoint_returns_401_without_token(client):
+    """POST /auth/tokens returns 401 when no auth provided."""
+    r = client.post("/auth/tokens", json={})
+    assert r.status_code == 401
+
+
+def test_bearer_auth_me_returns_401_without_token(client):
+    """GET /auth/me returns 401 when unauthenticated."""
+    r = client.get("/auth/me")
+    assert r.status_code == 401
+
+
+# ---------------------------------------------------------------------------
+# Stripe webhook signature verification
+# ---------------------------------------------------------------------------
+
+def _make_stripe_sig(payload: bytes, secret: str, ts: int | None = None) -> str:
+    ts_val = ts if ts is not None else int(time.time())
+    msg = f"{ts_val}.{payload.decode()}"
+    sig = hmac.new(secret.encode(), msg.encode(), hashlib.sha256).hexdigest()
+    return f"t={ts_val},v1={sig}"
+
+
+def test_stripe_sig_rejects_bad_sig(client):
+    """POST /webhooks/stripe returns 400 for wrong signature."""
+    os.environ["STRIPE_WEBHOOK_SECRET"] = "testsecret123"
+    try:
+        r = client.post(
+            "/webhooks/stripe",
+            content=b'{"type":"checkout.session.completed","data":{"object":{}}}',
+            headers={
+                "Content-Type": "application/json",
+                "Stripe-Signature": "t=12345,v1=badsig",
+            },
+        )
+        assert r.status_code == 400
+    finally:
+        os.environ.pop("STRIPE_WEBHOOK_SECRET", None)
+
+
+def test_stripe_sig_accepts_valid_sig(client):
+    """POST /webhooks/stripe accepts a correctly signed request (sig != 400)."""
+    secret = "wh_test_valid"
+    os.environ["STRIPE_WEBHOOK_SECRET"] = secret
+    try:
+        payload = json.dumps({
+            "type": "checkout.session.completed",
+            "data": {"object": {
+                "customer_email": "dave@example.com",
+                "customer": "cus_456",
+            }},
+        }).encode()
+        sig_header = _make_stripe_sig(payload, secret)
+        r = client.post(
+            "/webhooks/stripe",
+            content=payload,
+            headers={
+                "Content-Type": "application/json",
+                "Stripe-Signature": sig_header,
+            },
+        )
+        # 400 means signature check failed (wrong). Anything else means sig was ok.
+        assert r.status_code != 400, f"signature check rejected valid sig: {r.text}"
+    finally:
+        os.environ.pop("STRIPE_WEBHOOK_SECRET", None)
+
+
+def test_stripe_webhook_ignores_unknown_events(client):
+    """POST /webhooks/stripe returns ignored for unhandled event types."""
+    os.environ.pop("STRIPE_WEBHOOK_SECRET", None)
+    r = client.post(
+        "/webhooks/stripe",
+        json={"type": "customer.created", "data": {"object": {}}},
+    )
+    assert r.status_code == 200
+    assert r.json().get("status") == "ignored"
+
+
+def test_stripe_webhook_stale_timestamp_rejected(client):
+    """POST /webhooks/stripe rejects a request with a timestamp > 5 min old."""
+    secret = "staletstest"
+    os.environ["STRIPE_WEBHOOK_SECRET"] = secret
+    try:
+        payload = b'{"type":"checkout.session.completed","data":{"object":{}}}'
+        old_ts = int(time.time()) - 400  # 6+ minutes ago
+        sig_header = _make_stripe_sig(payload, secret, ts=old_ts)
+        r = client.post(
+            "/webhooks/stripe",
+            content=payload,
+            headers={
+                "Content-Type": "application/json",
+                "Stripe-Signature": sig_header,
+            },
+        )
+        assert r.status_code == 400
+    finally:
+        os.environ.pop("STRIPE_WEBHOOK_SECRET", None)
+
+
+# ---------------------------------------------------------------------------
+# Landing page
+# ---------------------------------------------------------------------------
+
+def test_landing_page_returns_200(client):
+    """GET / returns 200 HTML."""
+    r = client.get("/")
+    assert r.status_code == 200
+    assert "text/html" in r.headers.get("content-type", "")
+
+
+def test_landing_page_has_headline_and_ctas(client):
+    """Landing page contains Meridian branding, CTA links, and waitlist form."""
+    r = client.get("/")
+    html = r.text
+    assert "Meridian" in html
+    assert "/auth/login" in html
+    assert "github.com" in html
+    assert "waitlist" in html.lower()
+
+
+def test_landing_page_waitlist_form_posts_to_waitlist(client):
+    """Landing page form submits to /waitlist."""
+    r = client.get("/")
+    html = r.text
+    assert "/waitlist" in html
+    assert 'type="email"' in html
+
+
+def test_waitlist_join_from_landing(client):
+    """POST /waitlist accepts a new email."""
+    r = client.post("/waitlist", json={"email": "landing_test_v2@example.com"})
+    assert r.status_code in (201, 409)  # 201 new, 409 duplicate
+
+
+# ---------------------------------------------------------------------------
+# Remote MCP endpoint auth
+# ---------------------------------------------------------------------------
+
+def test_remote_mcp_requires_bearer_auth(client):
+    """POST /mcp without bearer token returns 401."""
+    r = client.post("/mcp", json={"jsonrpc": "2.0", "id": 1, "method": "ping"})
+    assert r.status_code == 401
+
+
+def test_remote_mcp_invalid_token_returns_401(client):
+    """POST /mcp with wrong bearer token returns 401."""
+    r = client.post(
+        "/mcp",
+        json={"jsonrpc": "2.0", "id": 1, "method": "ping"},
+        headers={"Authorization": "Bearer sk_meridian_totallyinvalid"},
+    )
+    assert r.status_code == 401
+
+
+def test_remote_mcp_initialize_with_valid_token(client):
+    """POST /mcp initialize returns protocolVersion with valid bearer token."""
+    from meridian import db as db_module
+
+    async def _setup():
+        db = client.app.state.db
+        tenant = await db_module.upsert_tenant(db, "mcp_init@example.com")
+        raw, _ = await db_module.create_api_token(db, tenant["id"], label="mcp-init")
+        return raw
+
+    raw_token = _run(_setup())
+
+    r = client.post(
+        "/mcp",
+        json={
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": {},
+            },
+        },
+        headers={"Authorization": f"Bearer {raw_token}"},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["result"]["protocolVersion"] == "2024-11-05"
+
+
+def test_remote_mcp_tools_list_returns_8_tools(client):
+    """POST /mcp tools/list returns at least 8 tools."""
+    from meridian import db as db_module
+
+    async def _setup():
+        db = client.app.state.db
+        tenant = await db_module.upsert_tenant(db, "mcp_tools2@example.com")
+        raw, _ = await db_module.create_api_token(db, tenant["id"])
+        return raw
+
+    raw_token = _run(_setup())
+
+    r = client.post(
+        "/mcp",
+        json={"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
+        headers={"Authorization": f"Bearer {raw_token}"},
+    )
+    assert r.status_code == 200
+    tools = r.json()["result"]["tools"]
+    names = {t["name"] for t in tools}
+    assert len(tools) >= 8
+    for expected in ("create_project", "register_session", "log_task", "generate_handoff"):
+        assert expected in names
+
+
+def test_remote_mcp_tools_call_create_project(client):
+    """POST /mcp tools/call create_project creates a project."""
+    from meridian import db as db_module
+
+    async def _setup():
+        db = client.app.state.db
+        tenant = await db_module.upsert_tenant(db, "mcp_call2@example.com")
+        raw, _ = await db_module.create_api_token(db, tenant["id"])
+        return raw
+
+    raw_token = _run(_setup())
+
+    r = client.post(
+        "/mcp",
+        json={
+            "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+            "params": {
+                "name": "create_project",
+                "arguments": {"name": "mcp-remote-proj-v2"},
+            },
+        },
+        headers={"Authorization": f"Bearer {raw_token}"},
+    )
+    assert r.status_code == 200
+    result = r.json()["result"]
+    content = json.loads(result["content"][0]["text"])
+    assert content["name"] == "mcp-remote-proj-v2"
+
+
+# ---------------------------------------------------------------------------
+# docker-compose.yml
+# ---------------------------------------------------------------------------
+
+def test_docker_compose_exists():
+    """docker-compose.yml exists at repo root."""
+    p = Path(__file__).parent.parent / "docker-compose.yml"
+    assert p.exists(), "docker-compose.yml not found at repo root"
+
+
+def test_docker_compose_port_mapping():
+    """docker-compose.yml maps port 7878 on host to 8000 in container."""
+    content = (Path(__file__).parent.parent / "docker-compose.yml").read_text()
+    assert "7878" in content
+    assert "8000" in content
+
+
+def test_docker_compose_volume_mount():
+    """docker-compose.yml mounts ./data:/app/data."""
+    content = (Path(__file__).parent.parent / "docker-compose.yml").read_text()
+    assert "./data:/app/data" in content
+
+
+def test_pyproject_toml_has_hosted_deps():
+    """pyproject.toml lists authlib, itsdangerous, resend, bcrypt, slowapi."""
+    content = (Path(__file__).parent.parent / "pyproject.toml").read_text()
+    for dep in ("authlib", "itsdangerous", "resend", "bcrypt", "slowapi"):
+        assert dep in content, f"pyproject.toml missing {dep}"

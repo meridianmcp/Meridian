@@ -299,7 +299,7 @@ def _data_dir(request: Request) -> str:
 @app.get("/", response_class=HTMLResponse)
 async def landing_page(request: Request) -> HTMLResponse:
     """Landing page — headline, CTAs, waitlist form."""
-    return _templates.TemplateResponse("landing.html", {"request": request})
+    return _templates.TemplateResponse(request, "landing.html")
 
 
 @app.get("/health")
