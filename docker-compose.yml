@@ -1,0 +1,11 @@
+version: "3.9"
+services:
+  meridian:
+    build: .
+    ports:
+      - "7878:8000"
+    volumes:
+      - ./data:/app/data
+    environment:
+      - MERIDIAN_DB=/app/data/meridian.db
+    restart: unless-stopped
