@@ -21,14 +21,30 @@ from fastapi.responses import RedirectResponse
 # Config helpers
 # ---------------------------------------------------------------------------
 
+_ALIASES: dict[str, str] = {
+    "MERIDIAN_BASE_URL": "APP_URL",        # Fly secret name
+    "MERIDIAN_SESSION_SECRET": "SESSION_SECRET",  # Fly secret name
+}
+
+
 def _cfg(key: str, default: str | None = None) -> str | None:
-    return os.environ.get(key, default)
+    v = os.environ.get(key)
+    if v:
+        return v
+    alias = _ALIASES.get(key)
+    if alias:
+        v = os.environ.get(alias)
+        if v:
+            return v
+    return default
 
 
 def _require_cfg(key: str) -> str:
-    v = os.environ.get(key)
+    v = _cfg(key)
     if not v:
-        raise RuntimeError(f"Required env var {key!r} is not set")
+        alias = _ALIASES.get(key, "")
+        hint = f" (or {alias!r})" if alias else ""
+        raise RuntimeError(f"Required env var {key!r}{hint} is not set")
     return v
 
 
