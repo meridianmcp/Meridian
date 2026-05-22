@@ -1,0 +1,8 @@
+.env
+.pixi/
+data/
+__pycache__/
+*.pyc
+.venv/
+*.sqlite3
+tmp/

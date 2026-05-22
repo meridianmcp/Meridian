@@ -10,7 +10,8 @@
       "mcp__meridian__complete_sprint_item",
       "Bash(git add *)",
       "Bash(git commit -m ' *)",
-      "Bash(git push *)"
+      "Bash(git push *)",
+      "mcp__meridian__get_goal"
     ]
   }
 }
