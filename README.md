@@ -32,7 +32,17 @@ from a compressed handoff.
 Download `meridian.exe` from [Releases](https://github.com/ajc3xc/Meridian/releases).
 Double-click. Dashboard opens at `http://localhost:7878`.
 
-### Option B — from source (all platforms)
+### Option B — Docker (no Python required)
+
+```bash
+git clone https://github.com/ajc3xc/Meridian
+cd Meridian
+docker compose up
+```
+
+Dashboard at `http://localhost:7878`. Data persists in `./data/`.
+
+### Option C — from source (all platforms)
 
 ```bash
 # Requires pixi — https://prefix.dev
@@ -100,10 +110,28 @@ and task log. No Meridian server needed in the cloud.
 
 State lives in a local SQLite file. No accounts, no cloud, no sync required.
 
-## Hosted tier (coming soon)
+## Hosted tier
 
-Zero-install dashboard at meridian.app — your team gets a shared URL, no Python required.
-Email [hello@usemeridian.us](mailto:hello@usemeridian.us) to join the waitlist.
+Zero-install dashboard at [usemeridian.us](https://usemeridian.us) — your team
+gets a shared URL, Google login, and a dedicated Postgres database. No Python
+required anywhere.
+
+Once you have an account, add this to your Claude Code `.mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "meridian": {
+      "command": "npx",
+      "args": ["-y", "mcp-remote", "https://usemeridian.us/mcp"],
+      "env": {"BEARER_TOKEN": "sk_meridian_your_token_here"}
+    }
+  }
+}
+```
+
+[Join the waitlist](https://usemeridian.us#waitlist) or email
+[hello@usemeridian.us](mailto:hello@usemeridian.us).
 
 ## Contributors
 
