@@ -2091,6 +2091,114 @@ async def list_waitlist(request: Request) -> list[dict[str, Any]]:
 
 
 # ---------------------------------------------------------------------------
+# v2.0 — Stripe webhook
+# ---------------------------------------------------------------------------
+
+
+@app.post("/webhooks/stripe", status_code=200)
+async def stripe_webhook(request: Request) -> dict[str, str]:
+    """Handle Stripe webhook events.
+
+    Verifies the ``Stripe-Signature`` header against ``STRIPE_WEBHOOK_SECRET``.
+    On ``checkout.session.completed`` or ``invoice.paid``:
+      1. Upserts the tenant by email.
+      2. Provisions a Neon DB if not already done.
+      3. Creates an API bearer token and sends a welcome email.
+
+    Returns ``{"status": "ok"}`` on success or if the event type is ignored.
+    Returns 400 on signature verification failure.
+    """
+    import hmac as _hmac
+    import hashlib as _hashlib
+    import time as _time
+
+    webhook_secret = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
+    raw_body = await request.body()
+    sig_header = request.headers.get("Stripe-Signature", "")
+
+    # Verify signature if secret is configured
+    if webhook_secret:
+        try:
+            _verify_stripe_signature(raw_body, sig_header, webhook_secret)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    try:
+        event = json.loads(raw_body)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="invalid JSON") from exc
+
+    event_type = event.get("type", "")
+    if event_type not in ("checkout.session.completed", "invoice.paid", "customer.subscription.created"):
+        return {"status": "ignored"}
+
+    event_obj = event.get("data", {}).get("object", {})
+    email = (
+        event_obj.get("customer_email")
+        or event_obj.get("customer_details", {}).get("email")
+        or ""
+    )
+    stripe_customer_id = event_obj.get("customer", "")
+
+    if not email:
+        return {"status": "no_email"}
+
+    db = _db(request)
+    tenant = await db_module.upsert_tenant(db, email=email)
+    if stripe_customer_id:
+        tenant = await db_module.update_tenant(
+            db, tenant["id"], stripe_customer_id=stripe_customer_id, plan="pro"
+        )
+
+    # Provision Neon DB
+    from .hosted import provision_neon_db, send_welcome_email
+    try:
+        tenant = await provision_neon_db(tenant["id"], db)
+    except Exception as exc:
+        # Log but don't fail the webhook — Stripe will retry
+        import logging
+        logging.getLogger(__name__).error("Neon provisioning failed for %s: %s", email, exc)
+        return {"status": "provisioning_queued"}
+
+    # Create API token + send welcome email
+    raw_token, _token_row = await db_module.create_api_token(db, tenant["id"], label="welcome")
+    try:
+        await send_welcome_email(email, raw_token, tenant)
+    except Exception as exc:
+        import logging
+        logging.getLogger(__name__).warning("Welcome email failed for %s: %s", email, exc)
+
+    return {"status": "ok"}
+
+
+def _verify_stripe_signature(raw_body: bytes, sig_header: str, secret: str) -> None:
+    """Verify a Stripe webhook signature. Raises ValueError on failure."""
+    import hmac
+    import hashlib
+    import time
+
+    parts = {k: v for part in sig_header.split(",") for k, v in [part.split("=", 1)] if "=" in part}
+    timestamp = parts.get("t", "")
+    sig = parts.get("v1", "")
+    if not timestamp or not sig:
+        raise ValueError("missing signature components")
+
+    try:
+        ts = int(timestamp)
+    except ValueError:
+        raise ValueError("invalid timestamp")
+
+    tolerance = 300  # 5 minutes
+    if abs(time.time() - ts) > tolerance:
+        raise ValueError("webhook timestamp too old")
+
+    payload = f"{timestamp}.{raw_body.decode()}"
+    expected = hmac.new(secret.encode(), payload.encode(), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(expected, sig):
+        raise ValueError("signature mismatch")
+
+
+# ---------------------------------------------------------------------------
 # v2.0 — Bearer token management
 # ---------------------------------------------------------------------------
 

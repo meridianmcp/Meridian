@@ -291,6 +291,60 @@ async def provision_neon_db(tenant_id: str, db: Any) -> dict[str, Any]:
     return updated
 
 
+# ---------------------------------------------------------------------------
+# Welcome email (Resend)
+# ---------------------------------------------------------------------------
+
+async def send_welcome_email(
+    email: str,
+    raw_token: str,
+    tenant: dict[str, Any],
+) -> None:
+    """Send a welcome email with the bearer token and MCP config snippet.
+
+    Requires ``RESEND_API_KEY`` env var.  Silently skips if not set (dev mode).
+    Never logs the raw token.
+    """
+    import httpx
+
+    api_key = _cfg("RESEND_API_KEY")
+    if not api_key:
+        return  # dev mode — skip
+
+    from_addr = _cfg("MERIDIAN_FROM_EMAIL", "Meridian <noreply@usemeridian.us>")
+    base = _cfg("MERIDIAN_BASE_URL", "https://usemeridian.us").rstrip("/")
+
+    mcp_snippet = f'''{{
+  "mcpServers": {{
+    "meridian": {{
+      "command": "npx",
+      "args": ["-y", "mcp-remote", "{base}/mcp"],
+      "env": {{"BEARER_TOKEN": "{raw_token}"}}
+    }}
+  }}
+}}'''
+
+    html_body = f"""<h2>Welcome to Meridian</h2>
+<p>Your account is ready. Add this to your Claude Code <code>.mcp.json</code>:</p>
+<pre>{mcp_snippet}</pre>
+<p><strong>Keep your token private.</strong> It grants full access to your Meridian projects.</p>
+<p>Dashboard: <a href="{base}/dashboard">{base}/dashboard</a></p>
+<p>Questions? Reply to this email.</p>"""
+
+    async with httpx.AsyncClient(timeout=15) as http:
+        resp = await http.post(
+            "https://api.resend.com/emails",
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            json={
+                "from": from_addr,
+                "to": [email],
+                "subject": "Your Meridian API token",
+                "html": html_body,
+            },
+        )
+        resp.raise_for_status()
+
+
 async def get_tenant_from_bearer(request: Request) -> dict[str, Any]:
     """FastAPI dependency: resolve the tenant from a Bearer token.
 
