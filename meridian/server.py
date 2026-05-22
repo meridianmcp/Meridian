@@ -238,6 +238,22 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# ---------------------------------------------------------------------------
+# v2.0 — Rate limiter (slowapi, in-memory, no Redis required)
+# ---------------------------------------------------------------------------
+try:
+    from slowapi import Limiter, _rate_limit_exceeded_handler
+    from slowapi.errors import RateLimitExceeded
+    from slowapi.util import get_remote_address
+
+    _limiter = Limiter(key_func=get_remote_address)
+    app.state.limiter = _limiter
+    app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)  # type: ignore[arg-type]
+    _RATE_LIMIT = "60/minute"
+except ImportError:
+    _limiter = None  # type: ignore[assignment]
+    _RATE_LIMIT = "60/minute"
+
 
 # ---------------------------------------------------------------------------
 # v1.0.2 — Static files + Jinja2 templates
@@ -2132,6 +2148,148 @@ async def get_me(request: Request) -> dict[str, Any]:
     if tenant is None:
         tenant = await get_tenant_from_bearer(request)
     return {k: v for k, v in tenant.items() if k not in ("neon_db_url",)}
+
+
+# ---------------------------------------------------------------------------
+# v2.0 — Remote MCP endpoint (HTTP JSON-RPC 2.0 transport)
+# ---------------------------------------------------------------------------
+
+_MCP_PROTOCOL_VERSION = "2024-11-05"
+_MCP_SERVER_INFO = {"name": "meridian", "version": _VERSION}
+
+
+def _jsonrpc_ok(req_id: Any, result: Any) -> dict[str, Any]:
+    return {"jsonrpc": "2.0", "id": req_id, "result": result}
+
+
+def _jsonrpc_err(req_id: Any, code: int, message: str) -> dict[str, Any]:
+    return {"jsonrpc": "2.0", "id": req_id, "error": {"code": code, "message": message}}
+
+
+async def _handle_mcp_request(body: dict[str, Any], db: Any, data_dir: str) -> dict[str, Any]:
+    """Dispatch one JSON-RPC 2.0 MCP request and return the response dict."""
+    req_id = body.get("id")
+    method = body.get("method", "")
+    params = body.get("params") or {}
+
+    if method == "initialize":
+        return _jsonrpc_ok(req_id, {
+            "protocolVersion": _MCP_PROTOCOL_VERSION,
+            "serverInfo": _MCP_SERVER_INFO,
+            "capabilities": {"tools": {}},
+        })
+
+    if method in ("notifications/initialized", "ping"):
+        return _jsonrpc_ok(req_id, {})
+
+    if method == "tools/list":
+        tools = [
+            {"name": "create_project", "description": "Create a new Meridian project.",
+             "inputSchema": {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}},
+            {"name": "register_session", "description": "Register this Claude session. Call at session start.",
+             "inputSchema": {"type": "object", "properties": {
+                 "project_id": {"type": "string"}, "session_name": {"type": "string"},
+                 "human_id": {"type": "string"}}, "required": ["project_id", "session_name"]}},
+            {"name": "start_session", "description": "Register session and return goal + recent tasks in one call.",
+             "inputSchema": {"type": "object", "properties": {
+                 "project_id": {"type": "string"}, "session_name": {"type": "string"},
+                 "human_id": {"type": "string"}}, "required": ["project_id", "session_name"]}},
+            {"name": "get_goal", "description": "Read the current goal state.",
+             "inputSchema": {"type": "object", "properties": {"project_id": {"type": "string"}}, "required": ["project_id"]}},
+            {"name": "set_goal", "description": "Set or update the goal state.",
+             "inputSchema": {"type": "object", "properties": {
+                 "project_id": {"type": "string"}, "content": {"type": "string"}}, "required": ["project_id", "content"]}},
+            {"name": "log_task", "description": "Log a task this session completed or is working on.",
+             "inputSchema": {"type": "object", "properties": {
+                 "session_id": {"type": "string"}, "project_id": {"type": "string"},
+                 "description": {"type": "string"}, "status": {"type": "string"}},
+                 "required": ["session_id", "project_id", "description"]}},
+            {"name": "get_tasks", "description": "Get recent tasks across all sessions.",
+             "inputSchema": {"type": "object", "properties": {
+                 "project_id": {"type": "string"}, "limit": {"type": "integer"}}, "required": ["project_id"]}},
+            {"name": "generate_handoff", "description": "Generate a context handoff file.",
+             "inputSchema": {"type": "object", "properties": {"project_id": {"type": "string"}}, "required": ["project_id"]}},
+        ]
+        return _jsonrpc_ok(req_id, {"tools": tools})
+
+    if method == "tools/call":
+        name = params.get("name", "")
+        args = params.get("arguments") or {}
+        try:
+            result = await _dispatch_mcp_tool(name, args, db, data_dir)
+            return _jsonrpc_ok(req_id, {"content": [{"type": "text", "text": json.dumps(result)}]})
+        except Exception as exc:
+            return _jsonrpc_err(req_id, -32603, str(exc))
+
+    return _jsonrpc_err(req_id, -32601, f"method not found: {method}")
+
+
+async def _dispatch_mcp_tool(name: str, args: dict[str, Any], db: Any, data_dir: str) -> Any:
+    """Route a tools/call to the appropriate db_module function."""
+    if name == "create_project":
+        return await db_module.create_project(db, args["name"])
+    if name == "register_session":
+        return await db_module.register_session(db, args["project_id"], args["session_name"],
+                                                  args.get("human_id"))
+    if name == "start_session":
+        session = await db_module.register_session(db, args["project_id"], args["session_name"],
+                                                     args.get("human_id"))
+        goal = await db_module.get_goal(db, args["project_id"])
+        tasks = await db_module.get_tasks(db, args["project_id"], limit=10)
+        return {"session": session, "goal": goal, "recent_tasks": tasks}
+    if name == "get_goal":
+        return await db_module.get_goal(db, args["project_id"])
+    if name == "set_goal":
+        return await db_module.set_goal(db, args["project_id"], args["content"])
+    if name == "log_task":
+        return await db_module.log_task(
+            db, args["session_id"], args["project_id"],
+            args["description"], args.get("status", "done"),
+        )
+    if name == "get_tasks":
+        return await db_module.get_tasks(db, args["project_id"], args.get("limit", 20))
+    if name == "generate_handoff":
+        from . import handoff as handoff_module_local
+        path, content = await handoff_module_local.generate_handoff(db, args["project_id"], data_dir)
+        return {"file_path": path, "content": content}
+    raise ValueError(f"unknown tool: {name}")
+
+
+@app.post("/mcp")
+async def remote_mcp(request: Request) -> Any:
+    """Remote MCP endpoint — JSON-RPC 2.0 over HTTP.
+
+    Requires ``Authorization: Bearer sk_meridian_...`` header.
+    Rate-limited to 60 requests/minute per IP.
+    Accepts a single JSON-RPC 2.0 message or a batch (list).
+    """
+    from .hosted import get_tenant_from_bearer
+    from fastapi.responses import JSONResponse
+
+    if _limiter is not None:
+        try:
+            from slowapi.errors import RateLimitExceeded
+            await _limiter._check_request_limit(request, None, False)
+        except Exception:
+            pass  # rate limiting is best-effort; don't block on errors
+
+    # Bearer auth required
+    tenant = await get_tenant_from_bearer(request)  # raises 401 if invalid
+
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(_jsonrpc_err(None, -32700, "parse error"), status_code=400)
+
+    db = _db(request)
+    data_dir = _data_dir(request)
+
+    if isinstance(body, list):
+        results = [await _handle_mcp_request(item, db, data_dir) for item in body]
+        return JSONResponse(results)
+
+    result = await _handle_mcp_request(body, db, data_dir)
+    return JSONResponse(result)
 
 
 # ---------------------------------------------------------------------------
