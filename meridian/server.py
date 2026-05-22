@@ -2075,6 +2075,66 @@ async def list_waitlist(request: Request) -> list[dict[str, Any]]:
 
 
 # ---------------------------------------------------------------------------
+# v2.0 — Bearer token management
+# ---------------------------------------------------------------------------
+
+
+@app.post("/auth/tokens", status_code=201)
+async def create_api_token(request: Request) -> dict[str, Any]:
+    """Generate a new API bearer token for the authenticated tenant.
+
+    Requires a valid session cookie (browser flow) or existing bearer token.
+    Returns ``{"token": "sk_meridian_...", "id": "...", "label": "..."}``
+    where ``token`` is shown exactly once and never stored in plain text.
+    """
+    from .hosted import get_current_tenant, get_tenant_from_bearer
+
+    # Accept either session cookie or existing bearer token
+    tenant = None
+    try:
+        tenant = await get_current_tenant(request)
+    except HTTPException:
+        pass
+    if tenant is None:
+        try:
+            tenant = await get_tenant_from_bearer(request)
+        except HTTPException:
+            pass
+    if tenant is None:
+        raise HTTPException(status_code=401, detail="authentication required")
+
+    body = {}
+    try:
+        body = await request.json()
+    except Exception:
+        pass
+    label = (body.get("label") or "").strip() or None
+    db = _db(request)
+    raw_token, token_row = await db_module.create_api_token(db, tenant["id"], label)
+    return {
+        "token": raw_token,
+        "id": token_row["id"],
+        "label": token_row["label"],
+        "created_at": token_row["created_at"],
+    }
+
+
+@app.get("/auth/me")
+async def get_me(request: Request) -> dict[str, Any]:
+    """Return the authenticated tenant's profile (session cookie or bearer)."""
+    from .hosted import get_current_tenant, get_tenant_from_bearer
+
+    tenant = None
+    try:
+        tenant = await get_current_tenant(request)
+    except HTTPException:
+        pass
+    if tenant is None:
+        tenant = await get_tenant_from_bearer(request)
+    return {k: v for k, v in tenant.items() if k not in ("neon_db_url",)}
+
+
+# ---------------------------------------------------------------------------
 # MCP server
 # ---------------------------------------------------------------------------
 
