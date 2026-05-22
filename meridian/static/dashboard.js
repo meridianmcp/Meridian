@@ -2609,12 +2609,13 @@ async function loadRewindTab(projectId, days) {
   });
   wrap.innerHTML = '<div style="color:var(--muted)">loading rewind…</div>';
   try {
-    const [data, history] = await Promise.all([
+    const [data, history, stats] = await Promise.all([
       api(`/projects/${projectId}/rewind?days=${days}`),
       api(`/projects/${projectId}/goal-history`).catch(() => []),
+      api(`/projects/${projectId}/stats?days=30`).catch(() => null),
     ]);
     const activeTab = (p && p.rewindSubtab) || 'versions';
-    wrap.innerHTML = renderRewindSubtabs(projectId, data, history, activeTab);
+    wrap.innerHTML = renderRewindSubtabs(projectId, data, history, stats, activeTab);
     wrap.querySelectorAll('.rewind-subtab-btn').forEach(btn => {
       btn.onclick = () => {
         const tab = btn.dataset.tab;
@@ -2623,20 +2624,23 @@ async function loadRewindTab(projectId, days) {
           b.classList.toggle('active', b.dataset.tab === tab));
         wrap.querySelectorAll('.rewind-subtab-pane').forEach(c =>
           { c.style.display = c.dataset.tab === tab ? '' : 'none'; });
+        if (tab === 'charts') initRewindCharts(projectId, stats);
       };
     });
+    if (activeTab === 'charts' && stats) initRewindCharts(projectId, stats);
   } catch (e) {
     wrap.innerHTML = `<div style="color:var(--status-failed)">rewind failed: ${escapeHtml(e.message)}</div>`;
   }
 }
 
-function renderRewindSubtabs(projectId, data, history, activeTab) {
-  /** Render rewind content split into four subtabs: Activity, Milestones, Sprint, Goals. */
+function renderRewindSubtabs(projectId, data, history, stats, activeTab) {
+  /** Render rewind content split into five subtabs: Activity, Milestones, Sprint, Goals, Charts. */
   const tabs = [
     { id: 'versions', label: '📦 Milestones' },
     { id: 'sprint',   label: '⚡ Sprint' },
     { id: 'goals',    label: '🎯 Goal' },
     { id: 'activity', label: '📋 Activity' },
+    { id: 'charts',   label: '📊 Charts' },
   ];
   const tabBar = `<div class="rewind-subtab-bar">${
     tabs.map(t => `<button class="rewind-subtab-btn${activeTab === t.id ? ' active' : ''}" data-tab="${t.id}">${t.label}</button>`).join('')
@@ -2647,7 +2651,87 @@ function renderRewindSubtabs(projectId, data, history, activeTab) {
     make('activity', renderRewindActivity(projectId, data)) +
     make('versions', renderRewindVersions(projectId, data)) +
     make('sprint',   renderRewindSprint(projectId, data)) +
-    make('goals',    renderRewindGoals(projectId, data, history));
+    make('goals',    renderRewindGoals(projectId, data, history)) +
+    make('charts',   renderRewindCharts(projectId, stats));
+}
+
+function renderRewindCharts(projectId, stats) {
+  /** Charts subtab: tasks/day bar chart + sprint completion % by version. */
+  if (!stats) {
+    return '<div style="padding:14px;color:var(--muted);font-size:11px">Charts unavailable — stats endpoint not reachable.</div>';
+  }
+  return `<div style="padding:8px 0">
+    <div style="color:var(--accent);font-weight:600;font-size:11px;margin-bottom:8px">📊 Tasks completed / day (last ${stats.period_days}d)</div>
+    <canvas id="chart-tasks-${escapeHtml(projectId)}" style="max-width:100%;max-height:160px"></canvas>
+    <div style="color:var(--accent);font-weight:600;font-size:11px;margin:18px 0 8px">⚡ Sprint completion % by version</div>
+    <canvas id="chart-sprint-${escapeHtml(projectId)}" style="max-width:100%;max-height:120px"></canvas>
+  </div>`;
+}
+
+function initRewindCharts(projectId, stats) {
+  /** Draw (or redraw) Chart.js instances for the Charts subtab. Destroys prior instances first. */
+  if (!stats || typeof Chart === 'undefined') return;
+  const p = state.panels[projectId];
+
+  // Destroy stale instances before re-creating to avoid duplicate chart warning.
+  if (p) {
+    if (p._chartTasks) { p._chartTasks.destroy(); p._chartTasks = null; }
+    if (p._chartSprint) { p._chartSprint.destroy(); p._chartSprint = null; }
+  }
+
+  const tasksCanvas = document.getElementById(`chart-tasks-${projectId}`);
+  if (tasksCanvas && stats.tasks_per_day) {
+    const labels = stats.tasks_per_day.map(d => d.day.slice(5));  // MM-DD
+    const totals = stats.tasks_per_day.map(d => d.total);
+    const chart = new Chart(tasksCanvas, {
+      type: 'bar',
+      data: {
+        labels,
+        datasets: [{
+          label: 'tasks done',
+          data: totals,
+          backgroundColor: 'rgba(96, 165, 250, 0.7)',
+          borderRadius: 2,
+        }],
+      },
+      options: {
+        responsive: true,
+        plugins: { legend: { display: false } },
+        scales: {
+          x: { ticks: { color: '#9ca3af', font: { size: 9 }, maxRotation: 45 }, grid: { color: '#1f2937' } },
+          y: { ticks: { color: '#9ca3af', font: { size: 9 }, stepSize: 1 }, grid: { color: '#1f2937' }, beginAtZero: true },
+        },
+      },
+    });
+    if (p) p._chartTasks = chart;
+  }
+
+  const sprintCanvas = document.getElementById(`chart-sprint-${projectId}`);
+  if (sprintCanvas && stats.sprint_velocity && stats.sprint_velocity.length) {
+    const sv = stats.sprint_velocity;
+    const chart = new Chart(sprintCanvas, {
+      type: 'bar',
+      data: {
+        labels: sv.map(v => v.version),
+        datasets: [{
+          label: '% done',
+          data: sv.map(v => v.pct),
+          backgroundColor: sv.map(v => v.pct === 100 ? 'rgba(52, 211, 153, 0.7)' : 'rgba(96, 165, 250, 0.7)'),
+          borderRadius: 2,
+        }],
+      },
+      options: {
+        responsive: true,
+        plugins: { legend: { display: false } },
+        scales: {
+          x: { ticks: { color: '#9ca3af', font: { size: 9 } }, grid: { color: '#1f2937' } },
+          y: { ticks: { color: '#9ca3af', font: { size: 9 } }, grid: { color: '#1f2937' }, min: 0, max: 100,
+               title: { display: true, text: '% done', color: '#9ca3af', font: { size: 9 } } },
+        },
+      },
+    });
+    if (p) p._chartSprint = chart;
+  }
 }
 
 function renderRewindSprint(projectId, data) {

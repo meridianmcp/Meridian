@@ -710,15 +710,32 @@ async def post_rewind_token(
 async def get_goal_history(
     project_id: str, request: Request
 ) -> list[dict[str, Any]]:
-    """Return all goal versions for a project, newest first.
+    """Return meaningful goal versions for a project, newest first.
 
-    Each entry: version, north_star, version_goal, sprint, created_at.
-    Used by the Rewind tab goal version browser.
+    AUTO BLOCKS-only versions are collapsed out so the history shows
+    only real content changes. Each entry: version, north_star,
+    version_goal, sprint, created_at. Used by the Rewind goal subtab.
     """
     project = await db_module.get_project(_db(request), project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="project not found")
     return await db_module.get_goal_history(_db(request), project_id)
+
+
+@app.get("/projects/{project_id}/stats")
+async def get_project_stats(
+    project_id: str, request: Request, days: int = 30
+) -> dict[str, Any]:
+    """Return activity stats for the Charts subtab.
+
+    Returns tasks/day series and sprint completion % per version.
+    ``days`` defaults to 30, max 365.
+    """
+    project = await db_module.get_project(_db(request), project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="project not found")
+    days = max(1, min(days, 365))
+    return await db_module.get_project_stats(_db(request), project_id, days)
 
 
 # ---------------------------------------------------------------------------

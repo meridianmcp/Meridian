@@ -2589,11 +2589,25 @@ async def get_rewind_data(
     }
 
 
+def _strip_auto_blocks(content: str) -> str:
+    """Return content with the AUTO BLOCKS section removed.
+
+    Used to detect versions that only differ in the auto-generated
+    section so they can be collapsed in the goal history view.
+    """
+    for marker in ("\n\n--- AUTO BLOCKS BELOW ---\n", "--- AUTO BLOCKS BELOW ---"):
+        if marker in content:
+            return content.split(marker)[0].rstrip()
+    return content
+
+
 async def get_goal_history(
     db: aiosqlite.Connection, project_id: str
 ) -> list[dict[str, Any]]:
-    """Return all goal versions for a project, newest first.
+    """Return meaningful goal versions for a project, newest first.
 
+    Filters out versions where only the AUTO BLOCKS section changed —
+    those are housekeeping updates and create noise in the history view.
     Each entry has: version, north_star, version_goal, sprint, created_at.
     """
     async with db.execute(
@@ -2602,16 +2616,103 @@ async def get_goal_history(
         (project_id,),
     ) as cur:
         rows = await cur.fetchall()
-    return [
-        {
-            "version": r["version"],
-            "north_star": r["goal_north_star"] or "",
-            "version_goal": r["content"] or "",
-            "sprint": r["goal_sprint"] or "",
-            "created_at": r["created_at"],
-        }
-        for r in rows
+
+    filtered: list[dict[str, Any]] = []
+    prev_key: tuple[str, str, str] | None = None
+    for r in rows:
+        stripped = _strip_auto_blocks(r["content"] or "")
+        key = (r["goal_north_star"] or "", stripped, r["goal_sprint"] or "")
+        if key != prev_key:
+            filtered.append(
+                {
+                    "version": r["version"],
+                    "north_star": r["goal_north_star"] or "",
+                    "version_goal": r["content"] or "",
+                    "sprint": r["goal_sprint"] or "",
+                    "created_at": r["created_at"],
+                }
+            )
+            prev_key = key
+    return filtered
+
+
+async def get_project_stats(
+    db: aiosqlite.Connection, project_id: str, days: int = 30
+) -> dict[str, Any]:
+    """Return activity stats for the charts subtab.
+
+    Returns tasks/day series (last ``days`` days) and sprint completion
+    percentage per version. Data is sourced from task_log + sprint_items.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    now = datetime.now(timezone.utc)
+    cutoff = (now - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
+
+    # Tasks done per day per human_id (join sessions for human attribution)
+    async with db.execute(
+        "SELECT substr(t.created_at, 1, 10) AS day, s.human_id, COUNT(*) AS cnt "
+        "FROM task_log t LEFT JOIN sessions s ON t.session_id = s.id "
+        "WHERE t.project_id = ? AND t.status = 'done' "
+        "AND t.created_at >= ? GROUP BY day, s.human_id ORDER BY day ASC",
+        (project_id, cutoff),
+    ) as cur:
+        task_rows = await cur.fetchall()
+
+    tasks_by_day: dict[str, dict[str, int]] = {}
+    for r in task_rows:
+        day = r["day"]
+        human = r["human_id"] or "unknown"
+        if day not in tasks_by_day:
+            tasks_by_day[day] = {}
+        tasks_by_day[day][human] = r["cnt"]
+
+    # Build full date series so days with 0 tasks still appear
+    all_days = [
+        (now - timedelta(days=days - 1 - i)).strftime("%Y-%m-%d")
+        for i in range(days)
     ]
+    tasks_per_day = [
+        {
+            "day": d,
+            "by_human": tasks_by_day.get(d, {}),
+            "total": sum(tasks_by_day.get(d, {}).values()),
+        }
+        for d in all_days
+    ]
+
+    # Sprint completion % per version
+    async with db.execute(
+        "SELECT version, status, COUNT(*) AS cnt FROM sprint_items "
+        "WHERE project_id = ? GROUP BY version, status",
+        (project_id,),
+    ) as cur:
+        sprint_rows = await cur.fetchall()
+
+    sprint_by_version: dict[str, dict[str, int]] = {}
+    for r in sprint_rows:
+        v = r["version"]
+        if v not in sprint_by_version:
+            sprint_by_version[v] = {"done": 0, "total": 0}
+        sprint_by_version[v]["total"] += r["cnt"]
+        if r["status"] in ("done", "skipped"):
+            sprint_by_version[v]["done"] += r["cnt"]
+
+    sprint_velocity = [
+        {
+            "version": v,
+            "done": d["done"],
+            "total": d["total"],
+            "pct": round(d["done"] / d["total"] * 100) if d["total"] else 0,
+        }
+        for v, d in sorted(sprint_by_version.items())
+    ]
+
+    return {
+        "period_days": days,
+        "tasks_per_day": tasks_per_day,
+        "sprint_velocity": sprint_velocity,
+    }
 
 
 async def get_or_create_rewind_token(

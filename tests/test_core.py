@@ -4486,3 +4486,87 @@ def test_dashboard_js_renders_session_summary_in_live_tab(client):
     js = client.get("/static/dashboard.js").text
     assert "session_summary" in js, "renderLiveSessions must use session_summary"
     assert "active_only=false" in js, "LIVE tab must fetch with active_only=false"
+
+
+# ---------------------------------------------------------------------------
+# Goal history filter — AUTO BLOCKS-only versions collapsed
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_goal_history_filters_auto_blocks_only_versions(db):
+    """Versions that only differ in AUTO BLOCKS section are not returned."""
+    p = await db_module.create_project(db, "hist-filter-proj")
+    base = "Real content here\n\n--- AUTO BLOCKS BELOW ---\nblock v1"
+    await db_module.set_goal(db, p["id"], base)
+    # Second set: only AUTO BLOCKS changes, real content identical
+    auto_only = "Real content here\n\n--- AUTO BLOCKS BELOW ---\nblock v2"
+    await db_module.set_goal(db, p["id"], auto_only)
+    history = await db_module.get_goal_history(db, p["id"])
+    # Should collapse the two AUTO-BLOCKS-only versions into one entry
+    assert len(history) == 1, f"expected 1 history entry, got {len(history)}"
+
+
+@pytest.mark.asyncio
+async def test_goal_history_keeps_real_content_changes(db):
+    """Versions with real content changes are all retained in history."""
+    p = await db_module.create_project(db, "hist-keep-proj")
+    await db_module.set_goal(db, p["id"], "Content A")
+    await db_module.set_goal(db, p["id"], "Content B")
+    await db_module.set_goal(db, p["id"], "Content C")
+    history = await db_module.get_goal_history(db, p["id"])
+    assert len(history) == 3, f"expected 3 history entries, got {len(history)}"
+    # Newest first
+    assert history[0]["version_goal"] == "Content C"
+    assert history[-1]["version_goal"] == "Content A"
+
+
+# ---------------------------------------------------------------------------
+# Stats endpoint — /projects/{id}/stats
+# ---------------------------------------------------------------------------
+
+
+def test_stats_endpoint_returns_expected_shape(client):
+    """GET /projects/{id}/stats returns tasks_per_day and sprint_velocity."""
+    r = client.post("/projects", json={"name": "stats-test-proj"})
+    assert r.status_code in (200, 201)
+    pid = r.json()["id"]
+    r = client.get(f"/projects/{pid}/stats")
+    assert r.status_code == 200
+    data = r.json()
+    assert "tasks_per_day" in data
+    assert "sprint_velocity" in data
+    assert "period_days" in data
+    assert data["period_days"] == 30
+
+
+def test_stats_endpoint_404_for_unknown_project(client):
+    """GET /projects/unknown/stats returns 404."""
+    r = client.get("/projects/00000000-0000-0000-0000-000000000000/stats")
+    assert r.status_code == 404
+
+
+def test_stats_tasks_per_day_length_matches_period(client):
+    """tasks_per_day series has exactly period_days entries."""
+    r = client.post("/projects", json={"name": "stats-days-proj"})
+    pid = r.json()["id"]
+    r = client.get(f"/projects/{pid}/stats?days=7")
+    assert r.status_code == 200
+    data = r.json()
+    assert data["period_days"] == 7
+    assert len(data["tasks_per_day"]) == 7
+
+
+def test_dashboard_js_has_charts_subtab(client):
+    """dashboard.js must reference the Charts subtab and Chart.js init."""
+    js = client.get("/static/dashboard.js").text
+    assert "renderRewindCharts" in js
+    assert "initRewindCharts" in js
+    assert "chart-tasks-" in js
+    assert "chart-sprint-" in js
+
+
+def test_dashboard_html_has_chartjs(client):
+    """dashboard.html must load Chart.js CDN."""
+    html = client.get("/dashboard").text
+    assert "chart.js" in html.lower() or "chartjs" in html.lower()
