@@ -65,7 +65,7 @@
     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px"><div style="font-size:13px;font-weight:600;color:var(--accent)">Database Setup</div><button onclick="document.getElementById('conn-setup-modal').style.display='none'" style="background:none;border:none;color:var(--muted);cursor:pointer;font-size:16px;line-height:1;padding:0 2px" title="Close (Esc)">&times;</button></div>
     <div style="font-size:11px;color:var(--muted);margin-bottom:18px">Choose where Meridian stores your data. You can change this later.</div>
     <div style="display:flex;flex-direction:column;gap:10px">
-      <button id="conn-local-btn" class="primary" style="padding:12px;font-size:12px;text-align:left">&#x1F4BE; Local SQLite (recommended)<br><span style="font-size:10px;color:rgba(255,255,255,0.7);font-weight:400">Stores data in data/meridian.db — no setup needed</span></button>
+      <button id="conn-local-btn" style="padding:12px;font-size:12px;text-align:left;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;color:var(--text);cursor:pointer;font-family:'IBM Plex Mono',monospace;width:100%">&#x1F4BE; Local SQLite (recommended)<br><span style="font-size:10px;color:var(--muted);font-weight:400">Stores data in data/meridian.db — no setup needed</span></button>
       <div id="conn-sqlite-form" style="display:none;flex-direction:column;gap:8px">
         <input id="conn-sqlite-path" type="text" placeholder="path/to/meridian.db"
           style="background:var(--surface-1);border:1px solid var(--border);border-radius:4px;padding:10px 12px;color:var(--text);font-family:'IBM Plex Mono',monospace;font-size:11px;outline:none;width:100%;box-sizing:border-box">
@@ -82,6 +82,7 @@
         <button id="conn-pg-save-btn" class="primary" style="padding:10px;font-size:12px">Save &amp; Restart →</button>
       </div>
       <div id="conn-setup-err" style="color:var(--status-failed);font-size:10px;display:none"></div>
+      <div id="conn-toml-path" style="margin-top:10px;font-size:10px;color:var(--muted);word-break:break-all"></div>
     </div>
   </div>
 </div>

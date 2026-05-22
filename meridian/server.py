@@ -320,6 +320,7 @@ async def server_config() -> dict[str, Any]:
             else "sqlite"
         ),
         "toml_exists": toml_config_module.toml_exists(),
+        "toml_path": str(toml_config_module._toml_path() or (Path.cwd() / "meridian.toml")),
         "connection_name": conn_name,
         "connections": toml_config_module.list_connections(),
     }

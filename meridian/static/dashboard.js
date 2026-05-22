@@ -138,6 +138,13 @@ function _updateConnectionIndicator(cfg) {
       addItem.onmouseleave = () => addItem.style.color = 'var(--muted)';
       addItem.onclick = () => { popup.remove(); document.getElementById('conn-setup-modal').style.display = 'flex'; };
       popup.appendChild(addItem);
+      // Config file path at bottom
+      if (cfg.toml_path) {
+        const pathRow = document.createElement('div');
+        pathRow.style.cssText = 'padding:4px 12px 6px;color:var(--muted);font-size:9px;border-top:1px solid var(--border);margin-top:2px;word-break:break-all';
+        pathRow.textContent = '📄 ' + cfg.toml_path;
+        popup.appendChild(pathRow);
+      }
       document.body.appendChild(popup);
       setTimeout(() => document.addEventListener('click', () => popup.remove(), { once: true }), 0);
     };
@@ -2445,7 +2452,21 @@ document.getElementById('ez-advanced-link').onclick = (e) => {
 
   window._showConnSetupIfNeeded = (cfg) => {
     if (!cfg?.toml_exists && cfg?.db !== 'postgres') modal.style.display = 'flex';
+    // Show config file path
+    const pathEl = document.getElementById('conn-toml-path');
+    if (pathEl && cfg?.toml_path) {
+      pathEl.innerHTML = '📄 Config: <span style="color:var(--text)">' + escapeHtml(cfg.toml_path) + '</span>';
+    }
   };
+
+  const PG_BTN_STYLE = 'padding:12px;font-size:12px;text-align:left;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;color:var(--text);cursor:pointer;font-family:\'IBM Plex Mono\',monospace';
+  const PRIMARY_BTN_STYLE = 'padding:12px;font-size:12px;text-align:left;border-radius:4px;cursor:pointer;font-family:\'IBM Plex Mono\',monospace;background:var(--accent);border:1px solid var(--accent);color:#001020;font-weight:600';
+
+  function setActiveBtn(which) {
+    // which: 'sqlite' | 'postgres' | null
+    if (localBtn) localBtn.style.cssText = which === 'sqlite' ? PRIMARY_BTN_STYLE : PG_BTN_STYLE;
+    if (pgToggle) pgToggle.style.cssText = which === 'postgres' ? PRIMARY_BTN_STYLE : PG_BTN_STYLE;
+  }
 
   // Local SQLite toggle — show path form
   if (localBtn) localBtn.onclick = () => {
@@ -2453,6 +2474,7 @@ document.getElementById('ez-advanced-link').onclick = (e) => {
     const open = sqliteForm.style.display === 'flex';
     sqliteForm.style.display = open ? 'none' : 'flex';
     if (!open && sqlitePath && !sqlitePath.value) sqlitePath.value = 'data/meridian.db';
+    setActiveBtn(open ? null : 'sqlite');
     // Close postgres form
     if (pgForm) pgForm.style.display = 'none';
   };
@@ -2477,7 +2499,11 @@ document.getElementById('ez-advanced-link').onclick = (e) => {
   };
 
   if (pgToggle) pgToggle.onclick = () => {
-    if (pgForm) pgForm.style.display = pgForm.style.display === 'none' ? 'flex' : 'none';
+    if (pgForm) {
+      const open = pgForm.style.display === 'flex';
+      pgForm.style.display = open ? 'none' : 'flex';
+      setActiveBtn(open ? null : 'postgres');
+    }
     // Close sqlite form
     if (sqliteForm) sqliteForm.style.display = 'none';
   };
