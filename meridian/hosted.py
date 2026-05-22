@@ -226,6 +226,71 @@ async def get_current_tenant(request: Request) -> dict[str, Any]:
     return tenant
 
 
+# ---------------------------------------------------------------------------
+# Neon provisioning
+# ---------------------------------------------------------------------------
+
+async def provision_neon_db(tenant_id: str, db: Any) -> dict[str, Any]:
+    """Create a Neon project for a tenant and save the connection URL.
+
+    Requires ``NEON_API_KEY`` env var.  Returns the updated tenant dict.
+    The connection URL is stored in ``tenants.neon_db_url`` and is the
+    Postgres URL that should be passed to ``init_db()`` for this tenant.
+
+    Raises ``RuntimeError`` if the Neon API call fails or the key is missing.
+    """
+    import httpx
+    from . import db as db_module
+
+    api_key = _require_cfg("NEON_API_KEY")
+    tenant = await db_module.get_tenant_by_id(db, tenant_id)
+    if tenant is None:
+        raise ValueError(f"tenant {tenant_id!r} not found")
+    if tenant.get("neon_project_id"):
+        return tenant  # already provisioned
+
+    project_name = f"meridian-{tenant['email'].split('@')[0][:20]}-{tenant_id[:8]}"
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    payload = {
+        "project": {
+            "name": project_name,
+            "region_id": "aws-us-east-2",
+            "pg_version": 16,
+        }
+    }
+    async with httpx.AsyncClient(timeout=30) as http:
+        resp = await http.post(
+            "https://console.neon.tech/api/v2/projects",
+            headers=headers,
+            json=payload,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+    project = data["project"]
+    neon_project_id = project["id"]
+
+    # Get the connection string for the default branch/database
+    conn_uri = data.get("connection_uris", [{}])[0].get("connection_uri", "")
+    if not conn_uri:
+        # Fallback: query the connection string endpoint
+        async with httpx.AsyncClient(timeout=15) as http:
+            cr = await http.get(
+                f"https://console.neon.tech/api/v2/projects/{neon_project_id}/connection_uri",
+                headers={"Authorization": f"Bearer {api_key}"},
+            )
+            cr.raise_for_status()
+            conn_uri = cr.json().get("uri", "")
+
+    updated = await db_module.update_tenant(
+        db,
+        tenant_id,
+        neon_project_id=neon_project_id,
+        neon_db_url=conn_uri,
+    )
+    return updated
+
+
 async def get_tenant_from_bearer(request: Request) -> dict[str, Any]:
     """FastAPI dependency: resolve the tenant from a Bearer token.
 
