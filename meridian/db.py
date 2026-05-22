@@ -163,6 +163,34 @@ CREATE INDEX IF NOT EXISTS idx_sprint_items_project
     ON sprint_items(project_id, status);
 CREATE INDEX IF NOT EXISTS idx_sprint_items_version
     ON sprint_items(project_id, version);
+
+-- v2.0 — hosted tier: tenants, web sessions, API bearer tokens
+CREATE TABLE IF NOT EXISTS tenants (
+    id TEXT PRIMARY KEY,
+    email TEXT NOT NULL UNIQUE,
+    google_sub TEXT UNIQUE,
+    neon_project_id TEXT,
+    neon_db_url TEXT,
+    stripe_customer_id TEXT,
+    plan TEXT NOT NULL DEFAULT 'free'
+        CHECK (plan IN ('free','pro','team')),
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS user_sessions (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL REFERENCES tenants(id),
+    expires_at TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS api_tokens (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL REFERENCES tenants(id),
+    token_hash TEXT NOT NULL UNIQUE,
+    label TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
 """
 
 
@@ -572,6 +600,54 @@ async def _migrate_drop_chat_tables(db: aiosqlite.Connection) -> None:
     await db.commit()
 
 
+async def _migrate_hosted_tables(db: aiosqlite.Connection) -> None:
+    """v2.0 — add tenants, user_sessions, api_tokens for hosted tier.
+
+    Uses CREATE TABLE IF NOT EXISTS so it is idempotent on existing DBs.
+    """
+    await db.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS tenants (
+            id TEXT PRIMARY KEY,
+            email TEXT NOT NULL UNIQUE,
+            google_sub TEXT UNIQUE,
+            neon_project_id TEXT,
+            neon_db_url TEXT,
+            stripe_customer_id TEXT,
+            plan TEXT NOT NULL DEFAULT 'free'
+                CHECK (plan IN ('free','pro','team')),
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+
+        CREATE TABLE IF NOT EXISTS user_sessions (
+            id TEXT PRIMARY KEY,
+            tenant_id TEXT NOT NULL REFERENCES tenants(id),
+            expires_at TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+
+        CREATE TABLE IF NOT EXISTS api_tokens (
+            id TEXT PRIMARY KEY,
+            tenant_id TEXT NOT NULL REFERENCES tenants(id),
+            token_hash TEXT NOT NULL UNIQUE,
+            label TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        """
+    )
+    await db.commit()
+
+
+async def init_hosted_tables(db: aiosqlite.Connection) -> None:
+    """Ensure hosted-tier tables exist on the given connection.
+
+    Idempotent — safe to call on both fresh and existing databases.
+    Delegates to ``_migrate_hosted_tables`` for SQLite; for Postgres the
+    tables are already included in ``CREATE_TABLES_PG``.
+    """
+    await _migrate_hosted_tables(db)
+
+
 async def init_db(db_path: str) -> aiosqlite.Connection:
     """Open the database, apply schema, and return the connection.
 
@@ -614,6 +690,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_sessions_archived(db)
     await _migrate_sprint_items_v2(db)
     await _migrate_drop_chat_tables(db)
+    await _migrate_hosted_tables(db)
     return db
 
 
@@ -2788,3 +2865,156 @@ async def get_waitlist(
     ) as cur:
         rows = await cur.fetchall()
     return [_row_to_dict(r) for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# v2.0 — Hosted tier: tenants, user sessions, API tokens
+# ---------------------------------------------------------------------------
+
+async def upsert_tenant(
+    db: aiosqlite.Connection,
+    email: str,
+    google_sub: str | None = None,
+) -> dict[str, Any]:
+    """Create or update a tenant record by email.
+
+    If the tenant already exists, updates ``google_sub`` if provided and
+    returns the current row.  Returns the tenant dict.
+    """
+    email = email.strip().lower()
+    async with db.execute("SELECT * FROM tenants WHERE email = ?", (email,)) as cur:
+        row = await cur.fetchone()
+    if row:
+        tenant = _row_to_dict(row)
+        if google_sub and tenant.get("google_sub") != google_sub:
+            await db.execute(
+                "UPDATE tenants SET google_sub = ? WHERE id = ?",
+                (google_sub, tenant["id"]),
+            )
+            await db.commit()
+            tenant["google_sub"] = google_sub
+        return tenant
+    tid = _new_id()
+    await db.execute(
+        "INSERT INTO tenants (id, email, google_sub) VALUES (?, ?, ?)",
+        (tid, email, google_sub),
+    )
+    await db.commit()
+    async with db.execute("SELECT * FROM tenants WHERE id = ?", (tid,)) as cur:
+        row = await cur.fetchone()
+    return _row_to_dict(row)
+
+
+async def get_tenant_by_id(
+    db: aiosqlite.Connection,
+    tenant_id: str,
+) -> dict[str, Any] | None:
+    """Return tenant by primary key, or None."""
+    async with db.execute("SELECT * FROM tenants WHERE id = ?", (tenant_id,)) as cur:
+        row = await cur.fetchone()
+    return _row_to_dict(row)
+
+
+async def update_tenant(
+    db: aiosqlite.Connection,
+    tenant_id: str,
+    **fields: object,
+) -> dict[str, Any] | None:
+    """Update arbitrary columns on a tenant row. Returns updated dict or None."""
+    allowed = {"neon_project_id", "neon_db_url", "stripe_customer_id", "plan"}
+    updates = {k: v for k, v in fields.items() if k in allowed}
+    if not updates:
+        return await get_tenant_by_id(db, tenant_id)
+    set_clause = ", ".join(f"{k} = ?" for k in updates)
+    await db.execute(
+        f"UPDATE tenants SET {set_clause} WHERE id = ?",
+        (*updates.values(), tenant_id),
+    )
+    await db.commit()
+    return await get_tenant_by_id(db, tenant_id)
+
+
+async def create_user_session(
+    db: aiosqlite.Connection,
+    tenant_id: str,
+    expires_at: str,
+) -> dict[str, Any]:
+    """Create a web session for a tenant. Returns the session dict."""
+    sid = _new_id()
+    await db.execute(
+        "INSERT INTO user_sessions (id, tenant_id, expires_at) VALUES (?, ?, ?)",
+        (sid, tenant_id, expires_at),
+    )
+    await db.commit()
+    async with db.execute("SELECT * FROM user_sessions WHERE id = ?", (sid,)) as cur:
+        row = await cur.fetchone()
+    return _row_to_dict(row)
+
+
+async def get_user_session(
+    db: aiosqlite.Connection,
+    session_id: str,
+) -> dict[str, Any] | None:
+    """Return a user_session row, or None if missing or expired."""
+    async with db.execute(
+        "SELECT * FROM user_sessions WHERE id = ?", (session_id,)
+    ) as cur:
+        row = await cur.fetchone()
+    if row is None:
+        return None
+    s = _row_to_dict(row)
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc).isoformat()
+    if s["expires_at"] < now:
+        await delete_user_session(db, session_id)
+        return None
+    return s
+
+
+async def delete_user_session(
+    db: aiosqlite.Connection,
+    session_id: str,
+) -> None:
+    """Delete a web session (logout)."""
+    await db.execute("DELETE FROM user_sessions WHERE id = ?", (session_id,))
+    await db.commit()
+
+
+async def create_api_token(
+    db: aiosqlite.Connection,
+    tenant_id: str,
+    label: str | None = None,
+) -> tuple[str, dict[str, Any]]:
+    """Generate a bearer token for a tenant.
+
+    Returns ``(raw_token, token_row_dict)``.  The raw token is shown once
+    and never stored.  Only the SHA-256 hash is persisted.
+    """
+    import secrets
+    import hashlib
+    raw = f"sk_meridian_{secrets.token_urlsafe(32)}"
+    token_hash = hashlib.sha256(raw.encode()).hexdigest()
+    tid = _new_id()
+    await db.execute(
+        "INSERT INTO api_tokens (id, tenant_id, token_hash, label) VALUES (?, ?, ?, ?)",
+        (tid, tenant_id, token_hash, label),
+    )
+    await db.commit()
+    async with db.execute("SELECT * FROM api_tokens WHERE id = ?", (tid,)) as cur:
+        row = await cur.fetchone()
+    return raw, _row_to_dict(row)
+
+
+async def get_tenant_from_token_hash(
+    db: aiosqlite.Connection,
+    token_hash: str,
+) -> dict[str, Any] | None:
+    """Look up a tenant by a pre-hashed API token.  Returns tenant dict or None."""
+    async with db.execute(
+        "SELECT t.* FROM tenants t "
+        "JOIN api_tokens a ON a.tenant_id = t.id "
+        "WHERE a.token_hash = ?",
+        (token_hash,),
+    ) as cur:
+        row = await cur.fetchone()
+    return _row_to_dict(row)

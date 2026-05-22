@@ -377,6 +377,33 @@ CREATE INDEX IF NOT EXISTS idx_tasks_project ON task_log(project_id, created_at 
 CREATE INDEX IF NOT EXISTS idx_tasks_session ON task_log(session_id);
 CREATE INDEX IF NOT EXISTS idx_sprint_items_project ON sprint_items(project_id, status);
 CREATE INDEX IF NOT EXISTS idx_sprint_items_version ON sprint_items(project_id, version);
+
+-- v2.0 — hosted tier: tenants, web sessions, API bearer tokens
+CREATE TABLE IF NOT EXISTS tenants (
+    id TEXT PRIMARY KEY,
+    email TEXT NOT NULL UNIQUE,
+    google_sub TEXT UNIQUE,
+    neon_project_id TEXT,
+    neon_db_url TEXT,
+    stripe_customer_id TEXT,
+    plan TEXT NOT NULL DEFAULT 'free',
+    created_at TEXT NOT NULL DEFAULT (to_char(now() at time zone 'utc', 'YYYY-MM-DD HH24:MI:SS'))
+);
+
+CREATE TABLE IF NOT EXISTS user_sessions (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL REFERENCES tenants(id),
+    expires_at TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (to_char(now() at time zone 'utc', 'YYYY-MM-DD HH24:MI:SS'))
+);
+
+CREATE TABLE IF NOT EXISTS api_tokens (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL REFERENCES tenants(id),
+    token_hash TEXT NOT NULL UNIQUE,
+    label TEXT,
+    created_at TEXT NOT NULL DEFAULT (to_char(now() at time zone 'utc', 'YYYY-MM-DD HH24:MI:SS'))
+);
 """
 
 
