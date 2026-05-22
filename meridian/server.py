@@ -286,6 +286,31 @@ async def health() -> dict[str, str]:
     return {"status": "ok", "service": "meridian"}
 
 
+# ---------------------------------------------------------------------------
+# v2.0 — Google OAuth routes
+# ---------------------------------------------------------------------------
+
+@app.get("/auth/login")
+async def auth_login(request: Request):
+    """Redirect browser to Google OAuth consent page."""
+    from .hosted import auth_login as _auth_login
+    return await _auth_login(request)
+
+
+@app.get("/auth/callback")
+async def auth_callback(request: Request):
+    """Handle Google OAuth callback — create/update tenant, set session cookie."""
+    from .hosted import auth_callback as _auth_callback
+    return await _auth_callback(request)
+
+
+@app.get("/auth/logout")
+async def auth_logout(request: Request):
+    """Clear session cookie and delete DB session."""
+    from .hosted import auth_logout as _auth_logout
+    return await _auth_logout(request)
+
+
 @app.get("/config")
 async def server_config() -> dict[str, Any]:
     """v0.6.5 — expose runtime configuration to the dashboard.
