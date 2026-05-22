@@ -627,15 +627,17 @@ input[type=text] {
 .goal-subtab-btn:hover { color: var(--text); }
 .goal-subtab-btn.active { color: var(--accent); border-bottom-color: var(--accent); }
 .goal-subtab-body {
-  flex: 1; position: relative; overflow: hidden;
+  flex: 1; position: relative; overflow: hidden; min-height: 0;
 }
 .goal-subtab-panel {
   display: none; flex-direction: column;
   position: absolute; inset: 0; padding: 12px 14px; gap: 8px; overflow-y: auto;
 }
 .goal-subtab-panel.active { display: flex; }
+/* version goal: textarea grows with content, no individual scrollbars */
 .goal-area.goal-full {
-  flex: 1; min-height: unset; resize: none;
+  min-height: 200px; resize: vertical; flex-shrink: 0;
+  overflow-y: visible; height: auto;
 }
 
 /* v1.4.1 — sidebar is always visible on desktop; hamburger only on mobile */

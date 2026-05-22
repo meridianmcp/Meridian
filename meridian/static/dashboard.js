@@ -581,8 +581,8 @@ function buildTabBody(project) {
           </div>
           <div class="goal-subtab-panel" id="gtab-version-goal-${project.id}">
             <div id="goal-title-${project.id}" style="font-family:var(--font-mono);font-size:11px;font-weight:600;color:var(--accent);padding:5px 8px;background:var(--surface-2);border:1px solid var(--border);border-radius:4px 4px 0 0;border-bottom:none;user-select:none;flex-shrink:0" title="Version title (read-only)"></div>
-            <div id="goal-shipped-${project.id}" style="display:none;font-family:var(--font-mono);font-size:10px;color:var(--muted);padding:6px 8px;background:var(--surface-2);border:1px solid var(--border);border-top:none;border-bottom:none;white-space:pre-wrap;user-select:none;max-height:80px;overflow-y:auto;flex-shrink:0" title="SHIPPED section (read-only — updated by Claude Code)"></div>
-            <textarea class="goal-area goal-full mono" id="goal-${project.id}" placeholder="CURRENT FOCUS:" style="border-radius:0 0 4px 4px;flex:1;font-size:13px"></textarea>
+            <div id="goal-shipped-${project.id}" style="display:none;font-family:var(--font-mono);font-size:10px;color:var(--muted);padding:6px 8px;background:var(--surface-2);border:1px solid var(--border);border-top:none;border-bottom:none;white-space:pre-wrap;user-select:none;flex-shrink:0" title="SHIPPED section (read-only — updated by Claude Code)"></div>
+            <textarea class="goal-area goal-full mono" id="goal-${project.id}" placeholder="CURRENT FOCUS:" style="border-radius:0 0 4px 4px;font-size:13px"></textarea>
             <div class="goal-actions" style="flex-shrink:0">
               <button class="primary" id="save-goal-${project.id}">save version goal</button>
               <span class="goal-version" id="goal-state-${project.id}"></span>
@@ -2631,9 +2631,10 @@ async function loadRewindTab(projectId, days) {
 }
 
 function renderRewindSubtabs(projectId, data, history, activeTab) {
-  /** Render rewind content split into three subtabs: Activity, Versions, Goals. */
+  /** Render rewind content split into four subtabs: Activity, Milestones, Sprint, Goals. */
   const tabs = [
     { id: 'versions', label: '📦 Milestones' },
+    { id: 'sprint',   label: '⚡ Sprint' },
     { id: 'goals',    label: '🎯 Goal' },
     { id: 'activity', label: '📋 Activity' },
   ];
@@ -2645,7 +2646,64 @@ function renderRewindSubtabs(projectId, data, history, activeTab) {
   return tabBar +
     make('activity', renderRewindActivity(projectId, data)) +
     make('versions', renderRewindVersions(projectId, data)) +
+    make('sprint',   renderRewindSprint(projectId, data)) +
     make('goals',    renderRewindGoals(projectId, data, history));
+}
+
+function renderRewindSprint(projectId, data) {
+  /** Sprint subtab: sprint_items grouped by version, showing done/pending/failed counts. */
+  const items = data.sprint_items_completed || [];
+  const pending = data.sprint_items_pending || [];
+  const allItems = [...items, ...pending];
+
+  if (!allItems.length) {
+    return '<div style="padding:14px;color:var(--muted);font-size:11px">No sprint items yet.</div>';
+  }
+
+  // Group by version
+  const byVersion = {};
+  allItems.forEach(s => {
+    const v = s.version || 'current';
+    if (!byVersion[v]) byVersion[v] = [];
+    byVersion[v].push(s);
+  });
+
+  const statusDot = (s) => {
+    if (s.status === 'done') return '<span style="color:var(--status-done)">✓</span>';
+    if (s.status === 'failed') return '<span style="color:var(--status-failed)">✗</span>';
+    if (s.status === 'pushed') return '<span style="color:var(--muted)">→</span>';
+    return '<span style="color:var(--status-pending)">○</span>';
+  };
+
+  let html = '';
+  // Sort versions: current first, then descending
+  const versions = Object.keys(byVersion).sort((a, b) => {
+    if (a === 'current') return -1;
+    if (b === 'current') return 1;
+    return b.localeCompare(a);
+  });
+
+  versions.forEach(v => {
+    const vItems = byVersion[v];
+    const doneCount = vItems.filter(s => s.status === 'done').length;
+    const total = vItems.length;
+    const pct = total ? Math.round((doneCount / total) * 100) : 0;
+    const id = `sprint-v-${projectId}-${v.replace(/[^a-z0-9]/gi, '')}`;
+    html += `<section style="margin-bottom:10px">
+      <div style="cursor:pointer;display:flex;justify-content:space-between;align-items:center;padding:5px 0;border-bottom:1px solid var(--border)" onclick="toggleExpand('${id}')">
+        <span style="color:var(--accent);font-weight:600;font-size:11px">${escapeHtml(v)}</span>
+        <span style="color:var(--muted);font-size:10px">${doneCount}/${total} done (${pct}%) <span class="expand-arrow">▶</span></span>
+      </div>
+      <div id="${id}" style="display:${v === 'current' ? 'block' : 'none'}">
+        ${vItems.map(s => `<div style="padding:3px 0 3px 8px;font-size:11px;display:flex;gap:6px;align-items:flex-start">
+          ${statusDot(s)}
+          <span style="color:${s.status === 'done' ? 'var(--muted)' : 'var(--text)'};${s.status === 'done' ? 'text-decoration:line-through' : ''}">${escapeHtml(s.title || '')}</span>
+        </div>`).join('')}
+      </div>
+    </section>`;
+  });
+
+  return `<div style="padding:8px 0">${html}</div>`;
 }
 
 function _rewindSec(icon, title, items, render) {

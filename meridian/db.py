@@ -2539,8 +2539,8 @@ async def get_rewind_data(
 
     # --- Sprint items completed -------------------------------------------
     async with db.execute(
-        "SELECT version, title, completed_at FROM sprint_items "
-        "WHERE project_id = ? AND status IN ('done','skipped') "
+        "SELECT version, title, completed_at, status, item_group FROM sprint_items "
+        "WHERE project_id = ? AND status IN ('done','skipped','failed','pushed') "
         "AND completed_at IS NOT NULL "
         "AND completed_at >= ? "
         "ORDER BY completed_at DESC",
@@ -2552,8 +2552,27 @@ async def get_rewind_data(
             "version": r["version"],
             "title": r["title"],
             "completed_at": r["completed_at"],
+            "status": r["status"],
         }
         for r in sprint_rows
+    ]
+
+    # All pending/todo sprint items regardless of time window (current sprint state)
+    async with db.execute(
+        "SELECT version, title, status, item_group, added_at FROM sprint_items "
+        "WHERE project_id = ? AND status IN ('pending','todo','in_progress') "
+        "ORDER BY added_at ASC",
+        (project_id,),
+    ) as cur:
+        pending_rows = await cur.fetchall()
+    sprint_items_pending = [
+        {
+            "version": r["version"],
+            "title": r["title"],
+            "status": r["status"],
+            "item_group": r["item_group"],
+        }
+        for r in pending_rows
     ]
 
     return {
@@ -2564,6 +2583,7 @@ async def get_rewind_data(
         "decisions_logged": decisions_logged,
         "session_summaries": session_summaries,
         "sprint_items_completed": sprint_items_completed,
+        "sprint_items_pending": sprint_items_pending,
         "tasks_total": tasks_total,
         "tasks_by_status": tasks_by_status,
     }
