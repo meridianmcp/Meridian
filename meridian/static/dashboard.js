@@ -580,17 +580,17 @@ function buildTabBody(project) {
             </div>
           </div>
           <div class="goal-subtab-panel" id="gtab-version-goal-${project.id}">
-            <div id="goal-title-${project.id}" style="font-family:var(--font-mono);font-size:11px;font-weight:600;color:var(--accent);padding:6px 8px;background:var(--surface-2);border:1px solid var(--border);border-radius:4px 4px 0 0;border-bottom:none;user-select:none;opacity:0.8" title="Version title (read-only)"></div>
-            <div id="goal-shipped-${project.id}" style="display:none;font-family:var(--font-mono);font-size:10px;color:var(--muted);padding:6px 8px;background:var(--surface-2);border:1px solid var(--border);border-top:none;border-bottom:none;white-space:pre-wrap;user-select:none" title="SHIPPED section (read-only — updated by Claude Code)"></div>
-            <textarea class="goal-area goal-full mono" id="goal-${project.id}" placeholder="CURRENT FOCUS:" style="border-radius:0 0 4px 4px"></textarea>
-            <div class="goal-actions">
+            <div id="goal-title-${project.id}" style="font-family:var(--font-mono);font-size:11px;font-weight:600;color:var(--accent);padding:5px 8px;background:var(--surface-2);border:1px solid var(--border);border-radius:4px 4px 0 0;border-bottom:none;user-select:none;flex-shrink:0" title="Version title (read-only)"></div>
+            <div id="goal-shipped-${project.id}" style="display:none;font-family:var(--font-mono);font-size:10px;color:var(--muted);padding:6px 8px;background:var(--surface-2);border:1px solid var(--border);border-top:none;border-bottom:none;white-space:pre-wrap;user-select:none;max-height:80px;overflow-y:auto;flex-shrink:0" title="SHIPPED section (read-only — updated by Claude Code)"></div>
+            <textarea class="goal-area goal-full mono" id="goal-${project.id}" placeholder="CURRENT FOCUS:" style="border-radius:0 0 4px 4px;flex:1;font-size:13px"></textarea>
+            <div class="goal-actions" style="flex-shrink:0">
               <button class="primary" id="save-goal-${project.id}">save version goal</button>
               <span class="goal-version" id="goal-state-${project.id}"></span>
               <span class="goal-ts" id="goal-vg-ts-${project.id}"></span>
             </div>
-            <div id="goal-autoblocks-wrapper-${project.id}" style="display:none;margin-top:8px">
-              <div style="font-size:10px;color:var(--muted);font-weight:600;margin-bottom:4px;padding:0 2px">📋 Session Log (auto-updated, read-only)</div>
-              <div id="goal-autoblocks-${project.id}" style="background:var(--surface-2);border:1px solid var(--border);border-radius:4px;padding:8px;font-family:var(--font-mono);font-size:13px;color:var(--text);white-space:pre-wrap;word-break:break-word;max-height:300px;overflow-y:auto"></div>
+            <div id="goal-autoblocks-wrapper-${project.id}" style="display:none;flex-shrink:0">
+              <button onclick="(function(b,c){var open=c.style.display!=='none';c.style.display=open?'none':'block';b.textContent=open?'📋 Session Log ▶':'📋 Session Log ▼';})(this,document.getElementById('goal-autoblocks-${project.id}'))" style="background:none;border:none;color:var(--muted);font-size:10px;font-weight:600;cursor:pointer;padding:2px 0;font-family:var(--font-mono);margin-top:6px">📋 Session Log ▶</button>
+              <div id="goal-autoblocks-${project.id}" style="display:none;background:var(--surface-2);border:1px solid var(--border);border-radius:4px;padding:8px;font-family:var(--font-mono);font-size:13px;color:var(--text);white-space:pre-wrap;word-break:break-word;max-height:250px;overflow-y:auto;margin-top:4px"></div>
             </div>
           </div>
           <div class="goal-subtab-panel" id="gtab-sprint-${project.id}">
@@ -1583,7 +1583,13 @@ function renderTimeline(projectId, data) {
   // Collapse goal events — show only latest per field per hour
   const goalByField = new Map();
   goal_events.forEach(g => {
-    const key = g.field + (g.updated_at || '').slice(0, 15); // group by field+10min
+    // Skip version_goal events that are ONLY an AUTO BLOCKS update (minor=True writes)
+    // These are identified by new_summary starting with AUTO SUMMARY or containing only auto-block content
+    if (g.field === 'version_goal') {
+      const summary = (g.new_summary || '');
+      if (summary.startsWith('[AUTO SUMMARY') || summary.startsWith('- [DONE]') || summary.startsWith('- [PENDING]')) return;
+    }
+    const key = g.field + (g.updated_at || '').slice(0, 13); // group by field+hour
     if (!goalByField.has(key) || g.version > (goalByField.get(key).version || 0)) {
       goalByField.set(key, g);
     }
@@ -1630,7 +1636,7 @@ function renderQueue(tasks) {
   const backlog = tasks.filter(t => t.status === 'backlog');
   const future = tasks.filter(t => t.status === 'future');
 
-  const sect = (icon, title, items, emptyMsg) => {
+  const sect = (icon, title, items, emptyMsg, showActions) => {
     const rows = items.length
       ? items.map(t => {
           const who = t.human_id || t.session_name || '';
@@ -1645,10 +1651,15 @@ function renderQueue(tasks) {
             t.created_at   ? `created: ${t.created_at}` : '',
             t.claimed_at   ? `claimed: ${t.claimed_at}` : '',
           ].filter(Boolean).join(' · ');
+          const actions = showActions ? `<div style="display:flex;gap:4px;margin-top:4px" onclick="event.stopPropagation()">
+            ${t.status === 'pending' ? `<button onclick="_queueAction('${escapeHtml(t.id)}','backlog')" style="background:none;border:1px solid var(--border);color:var(--muted);font-size:9px;padding:2px 6px;border-radius:3px;cursor:pointer;font-family:var(--font-mono)" title="Push to backlog">📦 backlog</button>` : ''}
+            ${t.status === 'pending' ? `<button onclick="_queueAction('${escapeHtml(t.id)}','done')" style="background:none;border:1px solid var(--status-done);color:var(--status-done);font-size:9px;padding:2px 6px;border-radius:3px;cursor:pointer;font-family:var(--font-mono)" title="Mark done">✓ done</button>` : ''}
+            <button onclick="_queueAction('${escapeHtml(t.id)}','delete')" style="background:none;border:1px solid var(--border);color:var(--status-failed);font-size:9px;padding:2px 6px;border-radius:3px;cursor:pointer;font-family:var(--font-mono)" title="Delete task">✕ delete</button>
+          </div>` : '';
           return `<div class="queue-item" style="cursor:pointer" onclick="toggleExpand('${eid}')">
             ${escapeHtml((t.description || '').slice(0, 120))}${sessLine}${tsLine}
             <span class="expand-arrow" style="font-size:9px;color:var(--muted);margin-left:4px">▶</span>
-            <div id="${eid}" style="display:none;margin-top:4px;font-size:10px;color:var(--muted);white-space:pre-wrap;word-break:break-word">${escapeHtml(t.description || '')}${expandMeta ? '\n' + escapeHtml(expandMeta) : ''}</div>
+            <div id="${eid}" style="display:none;margin-top:4px;font-size:10px;color:var(--muted);white-space:pre-wrap;word-break:break-word">${escapeHtml(t.description || '')}${expandMeta ? '\n' + escapeHtml(expandMeta) : ''}${actions}</div>
           </div>`;
         }).join('')
       : `<div class="queue-empty">${emptyMsg}</div>`;
@@ -1657,13 +1668,32 @@ function renderQueue(tasks) {
       rows + `</div>`;
   };
 
-  return sect('⏳', 'Pending', pending, 'no pending tasks') +
-         sect('🔄', 'In Progress', inProg, 'nothing running') +
-         sect('✅', 'Recently Done', done, 'no completed tasks') +
-         (failed.length ? sect('❌', 'Failed', failed, '') : '') +
-         (backlog.length ? sect('📦', 'Backlog', backlog, '') : '') +
-         (future.length ? sect('🔮', 'Future', future, '') : '');
+  return sect('⏳', 'Pending', pending, 'no pending tasks', true) +
+         sect('🔄', 'In Progress', inProg, 'nothing running', false) +
+         sect('✅', 'Recently Done', done, 'no completed tasks', true) +
+         (failed.length ? sect('❌', 'Failed', failed, '', true) : '') +
+         (backlog.length ? sect('📦', 'Backlog', backlog, '', true) : '') +
+         (future.length ? sect('🔮', 'Future', future, '', false) : '');
 }
+
+// Global queue action handler — called from inline onclick in renderQueue
+window._queueAction = async function(taskId, action) {
+  try {
+    if (action === 'delete') {
+      if (!confirm('Delete this task?')) return;
+      await api(`/tasks/${taskId}`, { method: 'DELETE' });
+    } else if (action === 'done') {
+      await api(`/tasks/${taskId}`, { method: 'PATCH', body: JSON.stringify({ status: 'done' }) });
+    } else if (action === 'backlog') {
+      await api(`/tasks/${taskId}`, { method: 'PATCH', body: JSON.stringify({ status: 'backlog' }) });
+    }
+    // Reload all queue panels
+    document.querySelectorAll('[id^="queue-body-"]').forEach(el => {
+      const pid = el.id.replace('queue-body-', '');
+      loadQueue(pid);
+    });
+  } catch(e) { toast('Action failed: ' + e.message, true); }
+};
 
 async function loadFilesTab(projectId) {
   /**Load the list of editable files from the server and render them as
