@@ -12,8 +12,8 @@ RUN pip install --no-cache-dir uv
 COPY pyproject.toml ./
 COPY pixi.toml ./
 
-# Install dependencies via uv from pyproject.toml
-RUN uv pip install --system -r pyproject.toml
+# Install dependencies via uv from pyproject.toml (PEP 517)
+RUN uv pip install --system .
 
 # Copy the rest of the app
 COPY . .
