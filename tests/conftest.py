@@ -96,6 +96,10 @@ def client(tmp_path, monkeypatch):
     # from a local .env file — the key must already be present so dotenv skips
     # it. An empty string is falsy, so the lifespan still takes the SQLite path.
     monkeypatch.setenv("MERIDIAN_DB_URL", "")
+    # v2.2 — also block MERIDIAN_DEMO_DB_URL so the lifespan doesn't try to
+    # connect to Neon and seed demo data during tests (would hang on every
+    # client fixture if a .env file with a real demo URL is present).
+    monkeypatch.setenv("MERIDIAN_DEMO_DB_URL", "")
     # v0.6.3 — redirect GOAL.md into the same temp dir so test
     # writebacks don't touch the repo's real file.
     monkeypatch.setenv("MERIDIAN_GOAL_MD", str(tmp_path / "GOAL.md"))

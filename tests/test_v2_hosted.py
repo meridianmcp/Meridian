@@ -57,7 +57,7 @@ def test_upsert_tenant_creates_row():
     t = _run(_run_inner())
     assert t["email"] == "alice@example.com"
     assert t["id"] is not None
-    assert t["plan"] == "free"
+    assert t["plan"] == "standard"
 
 
 def test_upsert_tenant_idempotent():
@@ -235,12 +235,17 @@ def test_landing_page_has_headline_and_ctas(client):
     assert "waitlist" in html.lower()
 
 
-def test_landing_page_waitlist_form_posts_to_waitlist(client):
-    """Landing page form submits to /waitlist."""
+def test_landing_page_has_pricing_section(client):
+    """Landing page has a pricing section with Standard and Pro plans (v2.2+)."""
     r = client.get("/")
     html = r.text
-    assert "/waitlist" in html
-    assert 'type="email"' in html
+    # Pricing cards for both tiers
+    assert "Standard" in html
+    assert "$20" in html
+    assert "Pro" in html
+    assert "$49" in html
+    # Pro plan should show waitlist CTA
+    assert "Join waitlist" in html or "waitlist" in html.lower()
 
 
 def test_waitlist_join_from_landing(client):

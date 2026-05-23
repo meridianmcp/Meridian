@@ -165,6 +165,7 @@ CREATE INDEX IF NOT EXISTS idx_sprint_items_version
     ON sprint_items(project_id, version);
 
 -- v2.0 — hosted tier: tenants, web sessions, API bearer tokens
+-- v2.2 — plan updated to standard/pro (was free/pro/team)
 CREATE TABLE IF NOT EXISTS tenants (
     id TEXT PRIMARY KEY,
     email TEXT NOT NULL UNIQUE,
@@ -172,8 +173,9 @@ CREATE TABLE IF NOT EXISTS tenants (
     neon_project_id TEXT,
     neon_db_url TEXT,
     stripe_customer_id TEXT,
-    plan TEXT NOT NULL DEFAULT 'free'
-        CHECK (plan IN ('free','pro','team')),
+    plan TEXT NOT NULL DEFAULT 'standard'
+        CHECK (plan IN ('standard','pro')),
+    pool_project_id TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -213,6 +215,19 @@ CREATE TABLE IF NOT EXISTS tenant_environments (
     token_hash TEXT,
     is_default INTEGER NOT NULL DEFAULT 0
         CHECK (is_default IN (0,1))
+);
+
+-- v2.2 — Neon pool project registry.  Each pool project holds up to
+-- MAX_CUSTOMERS_PER_PROJECT customer databases.  Pool projects are
+-- provisioned lazily: a new Neon project is created when all existing
+-- ones are full.  Tier 'standard' uses NEON_API_KEY; 'pro' uses NEON_API_KEY_PRO.
+CREATE TABLE IF NOT EXISTS neon_pool_projects (
+    id TEXT PRIMARY KEY,
+    neon_project_id TEXT NOT NULL UNIQUE,
+    tier TEXT NOT NULL DEFAULT 'standard'
+        CHECK (tier IN ('standard','pro')),
+    customer_count INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 """
 
@@ -624,9 +639,10 @@ async def _migrate_drop_chat_tables(db: aiosqlite.Connection) -> None:
 
 
 async def _migrate_hosted_tables(db: aiosqlite.Connection) -> None:
-    """v2.0 — add tenants, user_sessions, api_tokens for hosted tier.
+    """v2.0/v2.2 — add tenants, user_sessions, api_tokens, neon_pool_projects.
 
     Uses CREATE TABLE IF NOT EXISTS so it is idempotent on existing DBs.
+    v2.2: plan column migrated free/team→standard; pool_project_id column added.
     """
     await db.executescript(
         """
@@ -637,8 +653,8 @@ async def _migrate_hosted_tables(db: aiosqlite.Connection) -> None:
             neon_project_id TEXT,
             neon_db_url TEXT,
             stripe_customer_id TEXT,
-            plan TEXT NOT NULL DEFAULT 'free'
-                CHECK (plan IN ('free','pro','team')),
+            plan TEXT NOT NULL DEFAULT 'standard',
+            pool_project_id TEXT,
             created_at TEXT NOT NULL DEFAULT (datetime('now'))
         );
 
@@ -656,8 +672,21 @@ async def _migrate_hosted_tables(db: aiosqlite.Connection) -> None:
             label TEXT,
             created_at TEXT NOT NULL DEFAULT (datetime('now'))
         );
+
+        CREATE TABLE IF NOT EXISTS neon_pool_projects (
+            id TEXT PRIMARY KEY,
+            neon_project_id TEXT NOT NULL UNIQUE,
+            tier TEXT NOT NULL DEFAULT 'standard',
+            customer_count INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
         """
     )
+    # Migrate legacy plan values (free→standard, team→standard)
+    await db.execute(
+        "UPDATE tenants SET plan='standard' WHERE plan IN ('free','team')"
+    )
+    await _migrate_add_column_if_missing(db, "tenants", "pool_project_id", "TEXT")
     await db.commit()
 
 
@@ -2954,7 +2983,7 @@ async def update_tenant(
     **fields: object,
 ) -> dict[str, Any] | None:
     """Update arbitrary columns on a tenant row. Returns updated dict or None."""
-    allowed = {"neon_project_id", "neon_db_url", "stripe_customer_id", "plan"}
+    allowed = {"neon_project_id", "neon_db_url", "stripe_customer_id", "plan", "pool_project_id"}
     updates = {k: v for k, v in fields.items() if k in allowed}
     if not updates:
         return await get_tenant_by_id(db, tenant_id)
@@ -3051,3 +3080,82 @@ async def get_tenant_from_token_hash(
     ) as cur:
         row = await cur.fetchone()
     return _row_to_dict(row)
+
+
+# ---------------------------------------------------------------------------
+# v2.2 — Neon pool project management
+# ---------------------------------------------------------------------------
+
+async def get_available_pool_project(
+    db: aiosqlite.Connection,
+    tier: str = "standard",
+    max_customers: int = 8,
+) -> dict[str, Any] | None:
+    """Return a pool project for the given tier that has room for more customers.
+
+    Returns the pool project dict, or None if all projects are full (caller
+    should create a new Neon project and register it via register_pool_project).
+    """
+    async with db.execute(
+        "SELECT * FROM neon_pool_projects "
+        "WHERE tier = ? AND customer_count < ? "
+        "ORDER BY customer_count DESC LIMIT 1",
+        (tier, max_customers),
+    ) as cur:
+        row = await cur.fetchone()
+    return _row_to_dict(row)
+
+
+async def register_pool_project(
+    db: aiosqlite.Connection,
+    neon_project_id: str,
+    tier: str = "standard",
+) -> dict[str, Any]:
+    """Register a newly created Neon project as an available pool project."""
+    import uuid
+    pid = str(uuid.uuid4())
+    await db.execute(
+        "INSERT INTO neon_pool_projects (id, neon_project_id, tier, customer_count) "
+        "VALUES (?, ?, ?, 0)",
+        (pid, neon_project_id, tier),
+    )
+    await db.commit()
+    async with db.execute(
+        "SELECT * FROM neon_pool_projects WHERE id = ?", (pid,)
+    ) as cur:
+        row = await cur.fetchone()
+    return _row_to_dict(row)
+
+
+async def increment_pool_project_count(
+    db: aiosqlite.Connection,
+    neon_project_id: str,
+) -> None:
+    """Increment customer_count on a pool project after assigning a new customer."""
+    await db.execute(
+        "UPDATE neon_pool_projects SET customer_count = customer_count + 1 "
+        "WHERE neon_project_id = ?",
+        (neon_project_id,),
+    )
+    await db.commit()
+
+
+async def get_pool_project_counts(
+    db: aiosqlite.Connection,
+    tier: str = "standard",
+) -> dict[str, int]:
+    """Return total project count and total customer count for a tier."""
+    async with db.execute(
+        "SELECT COUNT(*) as projects, COALESCE(SUM(customer_count),0) as customers "
+        "FROM neon_pool_projects WHERE tier = ?",
+        (tier,),
+    ) as cur:
+        row = await cur.fetchone()
+    if row is None:
+        return {"projects": 0, "customers": 0}
+    if isinstance(row, dict):
+        return {"projects": row.get("projects", 0), "customers": row.get("customers", 0)}
+    keys = row.keys() if hasattr(row, "keys") else []
+    if keys:
+        return {"projects": row["projects"], "customers": row["customers"]}
+    return {"projects": row[0] or 0, "customers": row[1] or 0}

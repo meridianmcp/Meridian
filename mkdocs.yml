@@ -1,0 +1,66 @@
+site_name: Meridian
+site_description: Shared memory for your AI sessions — MCP server for Claude, Cursor, Windsurf
+site_url: https://ajc3xc.github.io/Meridian/
+repo_url: https://github.com/ajc3xc/Meridian
+repo_name: ajc3xc/Meridian
+edit_uri: edit/main/docs/
+
+theme:
+  name: material
+  palette:
+    scheme: slate
+    primary: custom
+    accent: custom
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - navigation.expand
+    - navigation.top
+    - search.suggest
+    - search.highlight
+    - content.code.copy
+    - content.code.annotate
+  icon:
+    repo: fontawesome/brands/github
+  font:
+    text: Inter
+    code: JetBrains Mono
+
+extra_css:
+  - stylesheets/extra.css
+
+nav:
+  - Home: index.md
+  - Getting Started:
+    - Quickstart: quickstart.md
+    - Configuration: configuration.md
+  - MCP Tools: mcp-tools.md
+  - Hosted (usemeridian.us): hosted.md
+  - Self-Hosting: self-hosting.md
+  - API Reference: api-reference.md
+
+markdown_extensions:
+  - admonition
+  - pymdownx.details
+  - pymdownx.superfences
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - pymdownx.tabbed:
+      alternate_style: true
+  - tables
+  - attr_list
+  - md_in_html
+  - toc:
+      permalink: true
+
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/ajc3xc/Meridian
+    - icon: fontawesome/solid/envelope
+      link: mailto:hello@usemeridian.us
+  analytics:
+    provider: google
+    property: G-PLACEHOLDER

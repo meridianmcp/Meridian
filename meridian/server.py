@@ -146,67 +146,233 @@ button:hover{{background:#6d28d9}}
 
 
 async def _seed_demo_data(db) -> None:
-    """Seed realistic demo data when MERIDIAN_DEMO=true and DB is empty."""
-    existing = await db_module.list_projects(db)
-    if existing:
-        return
+    """Seed realistic generic demo data into the demo DB.
 
-    import uuid
-    from datetime import datetime, timedelta, timezone
+    Always wipes and re-seeds so the demo is fresh on every restart.
+    Projects: 'backend-api-v2' (backend refactor) and 'data-pipeline' (ETL).
+    No Meridian-specific or customer-specific content — generic software demos.
+    """
+    # Always wipe and re-seed for a clean demo experience
+    try:
+        existing = await db_module.list_projects(db)
+        for proj in existing:
+            try:
+                await db_module.delete_project(db, proj["id"])
+            except Exception:  # noqa: BLE001
+                pass
+    except Exception:  # noqa: BLE001
+        pass
+
+    from datetime import datetime, timezone
 
     now = datetime.now(tz=timezone.utc)
 
-    meridian = await db_module.create_project(db, "meridian-build")
-    chinampa = await db_module.create_project(db, "chinampa-ag")
+    # ---- Project 1: backend-api-v2 ----
+    api = await db_module.create_project(db, "backend-api-v2")
 
-    await db_module.set_goal(
-        db, meridian["id"],
-        "Ship Meridian v2.0 hosted tier: Google OAuth, per-customer Neon DB, "
-        "Stripe $20/mo, deploy to usemeridian.us. Target: 10 paying teams by Q3 2026.",
+    await db_module.set_north_star(
+        db, api["id"],
+        "Achieve 99.9% uptime and <200ms p95 latency for all API endpoints. "
+        "Every service is observable, every failure is recoverable.",
     )
     await db_module.set_goal(
-        db, chinampa["id"],
-        "Build Chinampa AG field dashboard MVP: crop yield tracking, irrigation "
-        "schedules, weather integration. Demo to seed investors by end of sprint.",
+        db, api["id"],
+        "BACKEND API v2 REFACTOR\n\n"
+        "SHIPPED (12/12):\n"
+        "Auth module decoupled from monolith. Rate limiting (100 req/min per key).\n"
+        "N+1 query fixes across 8 endpoints. Redis caching layer (p95: 340ms→85ms).\n"
+        "Integration test suite (94% coverage). OpenAPI docs auto-generated.\n"
+        "DB index optimization — 3 slow queries eliminated. Security audit passed.\n\n"
+        "CURRENT FOCUS:\n"
+        "1. Load testing under 10k concurrent users\n"
+        "2. Canary deploy to 5% traffic\n"
+        "3. Deprecate v1 endpoints (grace period: 30 days)\n\n"
+        "KEY FILES:\n"
+        "src/api/v2/ — new versioned endpoints\n"
+        "src/middleware/ — rate limiting, auth, logging\n"
+        "tests/integration/ — full suite\n"
+        "docs/openapi.yaml — auto-generated spec",
+        minor=False,
+    )
+    await db_module.set_sprint(
+        db, api["id"],
+        "v2.3 week of May 26 — load test + canary deploy + v1 deprecation notice",
     )
 
-    # Sessions: 3 on meridian-build, 2 on chinampa-ag
-    m1 = await db_module.register_session(db, meridian["id"], "claude-code-1", human_id="adam")
-    m2 = await db_module.register_session(db, meridian["id"], "claude-code-2", human_id="adam")
-    m3 = await db_module.register_session(db, meridian["id"], "claude-code-3", human_id="adam")
-    c1 = await db_module.register_session(db, chinampa["id"], "claude-code-4", human_id="adam")
-    c2 = await db_module.register_session(db, chinampa["id"], "claude-code-5", human_id="adam")
+    # 8 sessions for backend-api-v2
+    s_auth   = await db_module.register_session(db, api["id"], "refactor-auth-module", human_id="sarah")
+    s_rate   = await db_module.register_session(db, api["id"], "add-rate-limiting", human_id="marcus")
+    s_n1     = await db_module.register_session(db, api["id"], "fix-n+1-queries", human_id="sarah")
+    s_cache  = await db_module.register_session(db, api["id"], "implement-caching", human_id="marcus")
+    s_tests  = await db_module.register_session(db, api["id"], "write-integration-tests", human_id="priya")
+    s_docs   = await db_module.register_session(db, api["id"], "update-openapi-docs", human_id="priya")
+    s_idx    = await db_module.register_session(db, api["id"], "db-index-optimization", human_id="marcus")
+    s_sec    = await db_module.register_session(db, api["id"], "security-audit", human_id="sarah")
 
-    # 20 tasks: mix of done/pending, realistic Meridian dogfood story
-    meridian_tasks = [
-        (m1, "Set up FastAPI + aiosqlite skeleton — hello world at /health", "done"),
-        (m1, "Wrote CREATE_TABLES with projects, sessions, task_log, goal_states", "done"),
-        (m1, "Implemented register_session and log_task db functions", "done"),
-        (m2, "Built MCP server with 8 tools — start_session, log_task, generate_handoff", "done"),
-        (m2, "Added generate_handoff endpoint — Jinja2 template renders compressed context", "done"),
-        (m2, "Wired up FastAPI lifespan — DB init on startup, graceful shutdown", "done"),
-        (m3, "Added Google OAuth flow — auth/login, auth/callback, session cookie", "done"),
-        (m3, "Created tenant tables + upsert_tenant, create_api_token db functions", "done"),
-        (m3, "Built remote MCP endpoint POST /mcp with bearer token auth", "done"),
-        (m1, "Stripe webhook + signature verification — provision Neon DB on checkout", "done"),
-        (m2, "Landing page (Jinja2 template, dark theme, waitlist form)", "done"),
-        (m3, "Deployed to Fly.io — meridian-hosted.fly.dev healthy", "done"),
-        (m1, "Write 316 tests — all passing before every commit", "done"),
-        (m2, "Add preview mode — DEMO_PASSWORD gate + MERIDIAN_DEMO read-only", "pending"),
-        (m3, "Deploy preview app to meridian-preview.fly.dev", "pending"),
-    ]
-    chinampa_tasks = [
-        (c1, "Set up Next.js project structure and Tailwind config", "done"),
-        (c1, "Built field map component — renders GeoJSON polygons from API", "done"),
-        (c2, "Irrigation schedule API — GET /fields/{id}/schedule returns weekly plan", "done"),
-        (c2, "Weather integration — pulls forecast from Open-Meteo, stores in Postgres", "done"),
-        (c2, "Dashboard layout — sidebar nav, field selector, weekly calendar view", "pending"),
+    api_tasks = [
+        (s_auth,  "Extracted auth module from UserService — 847 lines → 3 focused classes", "done"),
+        (s_auth,  "JWT validation moved to middleware — no more duplicate checks in handlers", "done"),
+        (s_auth,  "OAuth2 refresh token rotation implemented — old tokens invalidated on use", "done"),
+        (s_rate,  "SlowAPI rate limiter wired — 100 req/min per API key, 10 req/min anonymous", "done"),
+        (s_rate,  "Rate limit headers added to all responses (X-RateLimit-Remaining etc.)", "done"),
+        (s_n1,    "Identified 14 N+1 patterns via django-debug-toolbar query log analysis", "done"),
+        (s_n1,    "Fixed 8 critical N+1s with select_related/prefetch_related — queries: 340→28", "done"),
+        (s_n1,    "6 remaining N+1s in reporting endpoints — documented, deferred to v2.4", "backlog"),
+        (s_cache, "Redis caching layer added — user profiles, permission sets, feature flags", "done"),
+        (s_cache, "Cache invalidation strategy: event-driven via Celery signals, 15min TTL max", "done"),
+        (s_cache, "p95 latency improved: 340ms → 85ms on cached endpoints", "done"),
+        (s_tests, "Integration test suite: 247 tests, 94% line coverage, all green in CI", "done"),
+        (s_tests, "Load test scenario written — 10k concurrent users via Locust", "pending"),
+        (s_docs,  "OpenAPI 3.1 spec auto-generated from FastAPI route decorators", "done"),
+        (s_docs,  "Postman collection exported and added to developer portal", "done"),
+        (s_idx,   "EXPLAIN ANALYZE on top 20 slow queries — found 3 missing composite indexes", "done"),
+        (s_idx,   "Added indexes: (user_id, created_at), (tenant_id, status), (email, verified)", "done"),
+        (s_sec,   "OWASP top-10 audit completed — 0 critical, 2 medium findings fixed", "done"),
+        (s_sec,   "SQL injection via ORM confirmed not applicable — parameterized everywhere", "done"),
+        (s_sec,   "Dependency audit — 4 CVEs found, 3 patched, 1 tracked (low severity)", "done"),
+        (s_auth,  "Canary deploy config — 5% traffic split via feature flag in LaunchDarkly", "pending"),
+        (s_rate,  "v1 deprecation notice — add Sunset header + deprecation email to API key holders", "pending"),
     ]
 
-    for (sess, desc, status) in meridian_tasks:
-        await db_module.log_task(db, sess["id"], meridian["id"], desc, status)
-    for (sess, desc, status) in chinampa_tasks:
-        await db_module.log_task(db, sess["id"], chinampa["id"], desc, status)
+    # Sprint items for backend-api-v2
+    sprint_items_api = [
+        ("Set up v2 project structure and routing", "v2.0", "done"),
+        ("Auth module refactor", "v2.1", "done"),
+        ("Rate limiting middleware", "v2.1", "done"),
+        ("N+1 query fixes (8 endpoints)", "v2.2", "done"),
+        ("Redis caching layer", "v2.2", "done"),
+        ("Integration test suite (94% coverage)", "v2.2", "done"),
+        ("OpenAPI docs auto-generation", "v2.2", "done"),
+        ("DB index optimization", "v2.2", "done"),
+        ("Security audit", "v2.2", "done"),
+        ("Load test 10k concurrent users", "v2.3", "pending"),
+        ("Canary deploy to 5% traffic", "v2.3", "pending"),
+        ("v1 endpoint deprecation notices", "v2.3", "pending"),
+    ]
+
+    for (sess, desc, status_val) in api_tasks:
+        await db_module.log_task(db, sess["id"], api["id"], desc, status_val)
+
+    for (title, version, status_val) in sprint_items_api:
+        item_id = str(__import__("uuid").uuid4())
+        try:
+            await db.execute(
+                "INSERT INTO sprint_items (id, project_id, title, version, status, created_at) "
+                "VALUES (?, ?, ?, ?, ?, datetime('now'))",
+                (item_id, api["id"], title, version, status_val),
+            )
+        except Exception:  # noqa: BLE001
+            pass
+    try:
+        await db.commit()
+    except Exception:  # noqa: BLE001
+        pass
+
+    # 3 decisions
+    try:
+        decisions_text = (
+            "2026-05-10: Chose Redis over Memcached — better data structures for rate-limit counters, "
+            "native pub/sub for cache invalidation events.\n"
+            "2026-05-14: Deferred GraphQL support to v3 — REST covers 95% of use cases, "
+            "complexity not justified yet.\n"
+            "2026-05-19: Canary via feature flag (LaunchDarkly) over nginx split — "
+            "faster rollback, per-user targeting for beta customers."
+        )
+        await db.execute(
+            "UPDATE projects SET decisions=? WHERE id=?",
+            (decisions_text, api["id"]),
+        )
+        await db.commit()
+    except Exception:  # noqa: BLE001
+        pass
+
+    # ---- Project 2: data-pipeline ----
+    pipe = await db_module.create_project(db, "data-pipeline")
+
+    await db_module.set_north_star(
+        db, pipe["id"],
+        "Process 10M events/day with <5 min end-to-end latency, "
+        "zero data loss, and full lineage tracking for compliance.",
+    )
+    await db_module.set_goal(
+        db, pipe["id"],
+        "DATA PIPELINE ETL v1.4\n\n"
+        "SHIPPED (8/8):\n"
+        "Kafka consumer group with dead-letter queue. Schema registry integration.\n"
+        "dbt transformation layer (34 models). Airflow DAG orchestration.\n"
+        "Snowflake loader with COPY INTO — 2.4M rows/min throughput.\n"
+        "Data quality checks (Great Expectations). Lineage via OpenLineage.\n\n"
+        "CURRENT FOCUS:\n"
+        "1. Real-time streaming to replace nightly batch for 3 critical feeds\n"
+        "2. PII masking in transit (GDPR compliance by June 1)\n"
+        "3. Cost optimization — Snowflake credits up 40% MoM\n\n"
+        "KEY FILES:\n"
+        "pipelines/ — Airflow DAGs\n"
+        "transforms/ — dbt models\n"
+        "consumers/ — Kafka consumer workers\n"
+        "tests/ — Great Expectations suites",
+        minor=False,
+    )
+    await db_module.set_sprint(
+        db, pipe["id"],
+        "v1.4 week of May 26 — real-time streaming pilot + PII masking + cost review",
+    )
+
+    # 5 sessions for data-pipeline
+    p_kafka  = await db_module.register_session(db, pipe["id"], "kafka-consumer-setup", human_id="marcus")
+    p_dbt    = await db_module.register_session(db, pipe["id"], "dbt-models", human_id="priya")
+    p_snow   = await db_module.register_session(db, pipe["id"], "snowflake-loader", human_id="marcus")
+    p_qual   = await db_module.register_session(db, pipe["id"], "data-quality-checks", human_id="priya")
+    p_stream = await db_module.register_session(db, pipe["id"], "realtime-streaming", human_id="sarah")
+
+    pipe_tasks = [
+        (p_kafka,  "Kafka consumer group with 6 partitions — throughput: 45k events/sec", "done"),
+        (p_kafka,  "Dead-letter queue for poison messages — alerts on >10 DLQ events/hr", "done"),
+        (p_kafka,  "Schema registry integration — Avro schemas versioned and enforced", "done"),
+        (p_dbt,    "34 dbt models built — staging, intermediate, marts layers", "done"),
+        (p_dbt,    "dbt tests: not_null, unique, referential integrity on all FK columns", "done"),
+        (p_snow,   "Snowflake COPY INTO loader — 2.4M rows/min, merge on natural key", "done"),
+        (p_snow,   "Partitioning strategy: DATE_TRUNC day on event_at — 60% query cost reduction", "done"),
+        (p_qual,   "Great Expectations suite: 89 checks across 12 datasets, runs post-load", "done"),
+        (p_qual,   "OpenLineage integration — full job/dataset lineage in Marquez UI", "done"),
+        (p_stream, "Flink job prototype for click-stream real-time feed — POC passing", "done"),
+        (p_stream, "PII masking spec written — SHA-256 hash for email/phone in transit", "pending"),
+        (p_stream, "Snowflake credit analysis — top 5 cost drivers identified", "pending"),
+        (p_kafka,  "Consumer lag alerting — PagerDuty when lag >100k messages", "pending"),
+        (p_dbt,    "Incremental dbt models for 3 high-volume tables — replace full refresh", "backlog"),
+        (p_snow,   "Snowflake auto-clustering on 4 high-query tables", "backlog"),
+    ]
+
+    for (sess, desc, status_val) in pipe_tasks:
+        await db_module.log_task(db, sess["id"], pipe["id"], desc, status_val)
+
+    # Sprint items for data-pipeline
+    sprint_items_pipe = [
+        ("Kafka consumer + DLQ", "v1.2", "done"),
+        ("Schema registry", "v1.2", "done"),
+        ("dbt transformation layer (34 models)", "v1.3", "done"),
+        ("Snowflake COPY INTO loader", "v1.3", "done"),
+        ("Great Expectations data quality", "v1.3", "done"),
+        ("OpenLineage lineage tracking", "v1.3", "done"),
+        ("Real-time streaming pilot (Flink)", "v1.4", "in_progress"),
+        ("PII masking in transit (GDPR)", "v1.4", "pending"),
+        ("Snowflake cost optimization", "v1.4", "pending"),
+    ]
+
+    for (title, version, status_val) in sprint_items_pipe:
+        item_id = str(__import__("uuid").uuid4())
+        try:
+            await db.execute(
+                "INSERT INTO sprint_items (id, project_id, title, version, status, created_at) "
+                "VALUES (?, ?, ?, ?, ?, datetime('now'))",
+                (item_id, pipe["id"], title, version, status_val),
+            )
+        except Exception:  # noqa: BLE001
+            pass
+    try:
+        await db.commit()
+    except Exception:  # noqa: BLE001
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -260,14 +426,9 @@ async def lifespan(app: FastAPI):
     app.state.data_dir = str(data_dir)
     app.state.ws_broadcaster = dashboard_module.WebSocketBroadcaster()
 
-    # v2.0-fixes — demo seed data when MERIDIAN_DEMO=true and DB is empty
-    if os.environ.get("MERIDIAN_DEMO", "").lower() in ("1", "true", "yes"):
-        try:
-            await _seed_demo_data(db)
-        except Exception:  # noqa: BLE001
-            pass
-
-    # v2.1 — isolated demo DB from MERIDIAN_DEMO_DB_URL (separate Neon project)
+    # v2.2 — isolated demo DB from MERIDIAN_DEMO_DB_URL (separate Neon project).
+    # Always wipe-and-reseed on startup so the demo is always fresh.
+    # Falls back to main DB (legacy MERIDIAN_DEMO=true) if no separate URL.
     demo_db_url = os.environ.get("MERIDIAN_DEMO_DB_URL")
     if demo_db_url:
         try:
@@ -276,6 +437,14 @@ async def lifespan(app: FastAPI):
             await _seed_demo_data(demo_db)
         except Exception:  # noqa: BLE001
             app.state.demo_db = None
+    else:
+        app.state.demo_db = None
+        # Legacy: MERIDIAN_DEMO=true seeds main DB (dev only, not for production)
+        if os.environ.get("MERIDIAN_DEMO", "").lower() in ("1", "true", "yes"):
+            try:
+                await _seed_demo_data(db)
+            except Exception:  # noqa: BLE001
+                pass
 
     # v0.4.2 — periodic auto-summary task. Interval comes from env so
     # tests can run it on a sub-second cadence; default is ten minutes.
@@ -325,7 +494,14 @@ async def lifespan(app: FastAPI):
             pass
 
     # v0.6.3 — optional live file-watch (no-op when watchfiles not installed).
-    watch_task = asyncio.create_task(goal_md_module.watch_goal_md(db))
+    # Skip in :memory: mode (tests) — watchfiles.awatch blocks the asyncio
+    # ProactorEventLoop on Windows inside the TestClient's anyio portal.
+    if db_path != ":memory:":
+        watch_task = asyncio.create_task(goal_md_module.watch_goal_md(db))
+    else:
+        async def _noop_watch() -> None:
+            pass
+        watch_task = asyncio.create_task(_noop_watch())
     app.state.watch_task = watch_task
 
     # v1.7.0 — server update detection: hash key files at startup,
@@ -361,6 +537,7 @@ async def lifespan(app: FastAPI):
 
     try:
         yield
+
     finally:
         summary_task.cancel()
         watch_task.cancel()
@@ -555,7 +732,10 @@ async def landing_page(request: Request) -> HTMLResponse:
     if os.environ.get("DEMO_PASSWORD"):
         if not _check_demo_cookie(request):
             return HTMLResponse(_demo_gate_html())
-    return _templates.TemplateResponse(request, "landing.html")
+    stripe_payment_link = os.environ.get("STRIPE_PAYMENT_LINK", "/auth/login")
+    return _templates.TemplateResponse(
+        request, "landing.html", {"stripe_payment_link": stripe_payment_link}
+    )
 
 
 @app.post("/demo-auth")
@@ -618,9 +798,16 @@ async def privacy_page(request: Request) -> HTMLResponse:
 
 @app.get("/auth/login")
 async def auth_login(request: Request):
-    """Redirect browser to Google OAuth consent page."""
+    """Serve sign-in page with Google and GitHub OAuth buttons."""
     from .hosted import auth_login as _auth_login
     return await _auth_login(request)
+
+
+@app.get("/auth/google/login")
+async def auth_google_login(request: Request):
+    """Redirect browser directly to Google OAuth consent page."""
+    from .hosted import auth_google_login as _auth_google_login
+    return await _auth_google_login(request)
 
 
 @app.get("/auth/callback")
@@ -628,6 +815,20 @@ async def auth_callback(request: Request):
     """Handle Google OAuth callback — create/update tenant, set session cookie."""
     from .hosted import auth_callback as _auth_callback
     return await _auth_callback(request)
+
+
+@app.get("/auth/github/login")
+async def auth_github_login(request: Request):
+    """Redirect browser to GitHub OAuth consent page."""
+    from .hosted import auth_github_login as _auth_github_login
+    return await _auth_github_login(request)
+
+
+@app.get("/auth/github/callback")
+async def auth_github_callback(request: Request):
+    """Handle GitHub OAuth callback — create/update tenant, set session cookie."""
+    from .hosted import auth_github_callback as _auth_github_callback
+    return await _auth_github_callback(request)
 
 
 @app.get("/auth/logout")

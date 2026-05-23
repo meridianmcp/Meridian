@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Meridian — Shared memory for your Claude sessions</title>
+<title>Meridian — Your AI sessions finally remember each other</title>
 <style>
   :root {
     --bg: #0d0d0f;
@@ -22,9 +22,10 @@
   a:hover { text-decoration: underline; }
 
   /* Nav */
-  nav { display: flex; align-items: center; justify-content: space-between; padding: 1rem 2rem; border-bottom: 1px solid var(--border); }
-  .nav-logo { font-weight: 700; font-size: 1.2rem; color: var(--text); letter-spacing: -.3px; }
-  .nav-links { display: flex; gap: 1.5rem; align-items: center; font-size: .9rem; color: var(--muted); }
+  nav { display: flex; align-items: center; justify-content: space-between; padding: 1rem 2rem; border-bottom: 1px solid var(--border); position: sticky; top: 0; background: rgba(13,13,15,.95); backdrop-filter: blur(8px); z-index: 100; }
+  .nav-logo { font-weight: 700; font-size: 1.2rem; color: var(--text); letter-spacing: -.3px; text-decoration: none; }
+  .nav-logo:hover { text-decoration: none; }
+  .nav-links { display: flex; gap: 1.5rem; align-items: center; font-size: .9rem; }
   .nav-links a { color: var(--muted); }
   .nav-links a:hover { color: var(--text); text-decoration: none; }
   .nav-cta { background: var(--accent); color: #fff !important; padding: .45rem 1.1rem; border-radius: 6px; font-weight: 600; }
@@ -60,43 +61,60 @@
   .feature-item h4 { font-size: .95rem; font-weight: 700; margin-bottom: .2rem; }
   .feature-item p { font-size: .85rem; color: var(--muted); }
 
-  /* Waitlist */
-  .waitlist-section { max-width: 520px; margin: 0 auto 6rem; padding: 0 2rem; text-align: center; }
-  .waitlist-section h2 { font-size: 1.5rem; font-weight: 700; margin-bottom: .7rem; }
-  .waitlist-section p { color: var(--muted); margin-bottom: 1.5rem; font-size: .95rem; }
-  .waitlist-form { display: flex; gap: .7rem; flex-wrap: wrap; justify-content: center; }
-  .waitlist-form input[type="email"] { flex: 1; min-width: 220px; padding: .7rem 1rem; background: var(--surface); border: 1px solid var(--border); border-radius: 7px; color: var(--text); font-size: .95rem; outline: none; }
-  .waitlist-form input[type="email"]:focus { border-color: var(--accent); }
-  .waitlist-form button { background: var(--accent); color: #fff; border: none; padding: .7rem 1.4rem; border-radius: 7px; font-weight: 700; font-size: .95rem; cursor: pointer; transition: background .15s; }
-  .waitlist-form button:hover { background: #5577ee; }
-  .waitlist-form button:disabled { opacity: .5; cursor: default; }
-  #waitlist-msg { margin-top: .8rem; font-size: .9rem; color: var(--green); min-height: 1.2em; }
-  #waitlist-msg.err { color: #f87171; }
+  /* Pricing */
+  .pricing { max-width: 860px; margin: 0 auto 6rem; padding: 0 2rem; }
+  .pricing-header { text-align: center; margin-bottom: 2.5rem; }
+  .pricing-header h2 { font-size: 1.6rem; font-weight: 700; margin-bottom: .6rem; }
+  .pricing-header p { color: var(--muted); font-size: .95rem; }
+  .pricing-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 1.5rem; align-items: start; }
+  .plan-card { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 2rem; position: relative; }
+  .plan-card.featured { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent), 0 8px 32px rgba(108,143,255,.12); }
+  .plan-badge { position: absolute; top: -12px; left: 50%; transform: translateX(-50%); background: var(--accent); color: #fff; font-size: .72rem; font-weight: 700; letter-spacing: .5px; padding: .25rem .8rem; border-radius: 20px; white-space: nowrap; }
+  .plan-name { font-size: 1rem; font-weight: 700; color: var(--muted); letter-spacing: .5px; text-transform: uppercase; margin-bottom: .5rem; }
+  .plan-price { font-size: 2.8rem; font-weight: 800; letter-spacing: -1px; margin-bottom: .25rem; }
+  .plan-price span { font-size: 1rem; font-weight: 400; color: var(--muted); }
+  .plan-trial { font-size: .82rem; color: var(--muted); margin-bottom: 1.4rem; }
+  .plan-trial strong { color: var(--green); }
+  .plan-divider { border: none; border-top: 1px solid var(--border); margin: 1.2rem 0; }
+  .plan-features { list-style: none; margin-bottom: 1.8rem; }
+  .plan-features li { font-size: .875rem; color: var(--muted); padding: .35rem 0; display: flex; gap: .6rem; align-items: flex-start; }
+  .plan-features li::before { content: "✓"; color: var(--green); flex-shrink: 0; font-weight: 700; }
+  .plan-features li.dim::before { content: "—"; color: var(--border); }
+  .plan-features li.dim { color: #555; }
+  .plan-cta { display: block; width: 100%; text-align: center; padding: .85rem; border-radius: 8px; font-weight: 700; font-size: .95rem; cursor: pointer; transition: opacity .15s; text-decoration: none; }
+  .plan-cta:hover { text-decoration: none; opacity: .88; }
+  .plan-cta.primary { background: var(--accent); color: #fff; }
+  .plan-cta.secondary { background: transparent; border: 1px solid var(--border); color: var(--muted); }
+  .neon-badge { display: flex; align-items: center; gap: .4rem; justify-content: center; margin-top: 2rem; font-size: .78rem; color: var(--muted); }
+  .neon-badge svg { opacity: .7; }
 
   /* Footer */
   footer { border-top: 1px solid var(--border); padding: 1.5rem 2rem; text-align: center; color: var(--muted); font-size: .82rem; }
+  footer .footer-links { display: flex; flex-wrap: wrap; gap: 1rem; justify-content: center; margin-bottom: .5rem; }
   footer a { color: var(--muted); }
   footer a:hover { color: var(--text); text-decoration: none; }
+  footer .footer-powered { display: flex; align-items: center; justify-content: center; gap: .4rem; margin-top: .4rem; font-size: .76rem; opacity: .7; }
 </style>
 </head>
 <body>
 
 <nav>
-  <span class="nav-logo">⬡ Meridian</span>
+  <a href="/" class="nav-logo">⬡ Meridian</a>
   <div class="nav-links">
-    <a href="https://github.com/ajc3xc/Meridian">GitHub</a>
-    <a href="/dashboard">Dashboard</a>
-    <a href="/auth/login" class="nav-cta">Sign in</a>
+    <a href="/demo">Try Demo</a>
+    <a href="https://ajc3xc.github.io/Meridian/" target="_blank" rel="noopener">Docs</a>
+    <a href="https://github.com/ajc3xc/Meridian" target="_blank" rel="noopener">GitHub</a>
+    <a href="/auth/login" class="nav-cta">Get Started</a>
   </div>
 </nav>
 
 <section class="hero">
-  <div class="hero-badge">NOW IN BETA</div>
-  <h1>Your Claude sessions finally <span>remember each other</span></h1>
-  <p>Every Claude tab starts fresh. Parallel sessions duplicate work. Context fills up mid-task. Meridian fixes all three.</p>
+  <div class="hero-badge">OPEN BETA</div>
+  <h1>Your AI sessions finally <span>remember each other</span></h1>
+  <p>Every Claude tab starts fresh. Parallel sessions duplicate work. Context fills up mid-task. Meridian fixes all three — shared memory for every session, automatically.</p>
   <div class="cta-row">
-    <a href="https://github.com/ajc3xc/Meridian" class="btn-primary">Get started free</a>
-    <a href="/demo" class="btn-secondary">Try demo</a>
+    <a href="/auth/login" class="btn-primary">Get started free</a>
+    <a href="/demo" class="btn-secondary">Try live demo →</a>
   </div>
 </section>
 
@@ -163,61 +181,84 @@
       <span class="feature-check">✓</span>
       <div>
         <h4>No cloud required</h4>
-        <p>Runs locally on SQLite by default. Swap in Postgres for team sharing. No accounts, no sync needed.</p>
+        <p>Runs locally on SQLite by default. Or use our hosted tier — zero install, just sign in.</p>
       </div>
     </div>
   </div>
 </section>
 
-<section class="waitlist-section" id="waitlist">
-  <h2>Hosted tier — coming soon</h2>
-  <p>Zero-install shared dashboard at usemeridian.us. Your team gets a URL, no Python required. Join the waitlist.</p>
-  <form class="waitlist-form" id="wlForm">
-    <input type="email" id="wlEmail" placeholder="you@example.com" required autocomplete="email">
-    <button type="submit" id="wlBtn">Join waitlist</button>
-  </form>
-  <div id="waitlist-msg"></div>
+<section class="pricing" id="pricing">
+  <div class="pricing-header">
+    <h2>Simple pricing</h2>
+    <p>Start with a 7-day free trial. Cancel anytime.</p>
+  </div>
+  <div class="pricing-grid">
+
+    <!-- Standard — the real product -->
+    <div class="plan-card featured">
+      <div class="plan-badge">⭐ MOST POPULAR</div>
+      <div class="plan-name">Standard</div>
+      <div class="plan-price">$20<span>/mo</span></div>
+      <div class="plan-trial"><strong>7-day free trial</strong> — card required</div>
+      <hr class="plan-divider">
+      <ul class="plan-features">
+        <li>Managed Postgres DB — powered by Neon</li>
+        <li>1 Neon project · up to 10 databases</li>
+        <li>2 CU max · 0.5 GB storage</li>
+        <li>100 compute unit-hours / month</li>
+        <li>Hosted dashboard at usemeridian.us</li>
+        <li>Remote MCP endpoint (HTTPS + Bearer)</li>
+        <li>Unlimited Meridian projects</li>
+        <li>Unlimited team members</li>
+        <li>Google + GitHub OAuth sign-in</li>
+        <li>BYODB — bring your own Neon URL</li>
+        <li>Email support</li>
+      </ul>
+      <a href="{{ stripe_payment_link }}" class="plan-cta primary">Get started →</a>
+    </div>
+
+    <!-- Pro — waitlist -->
+    <div class="plan-card">
+      <div class="plan-name">Pro</div>
+      <div class="plan-price">$49<span>/mo</span></div>
+      <div class="plan-trial">Waitlist — coming soon</div>
+      <hr class="plan-divider">
+      <ul class="plan-features">
+        <li>Everything in Standard</li>
+        <li>1 Neon project · up to 50 databases</li>
+        <li>4 CU max · 5 GB storage</li>
+        <li>300 compute unit-hours / month</li>
+        <li>Multiple environments (prod / staging / dev)</li>
+        <li>Priority support</li>
+        <li>Custom subdomain</li>
+        <li class="dim">Same price as managed</li>
+      </ul>
+      <a href="mailto:hello@usemeridian.us?subject=Pro waitlist" class="plan-cta secondary">Join waitlist</a>
+    </div>
+
+  </div>
+
+  <div class="neon-badge">
+    <svg width="16" height="16" viewBox="0 0 32 32" fill="none"><circle cx="16" cy="16" r="16" fill="#00E599"/><path d="M8 20V12l8 8V12l8 8" stroke="#000" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+    Powered by <strong>Neon Postgres</strong> — each workspace gets an isolated, auto-scaling database
+  </div>
 </section>
 
 <footer>
-  <a href="https://github.com/ajc3xc/Meridian">GitHub</a> &nbsp;·&nbsp;
-  <a href="https://github.com/ajc3xc/Meridian/blob/main/LICENSE">License (MSL-2.0)</a> &nbsp;·&nbsp;
-  <a href="/terms">Terms</a> &nbsp;·&nbsp;
-  <a href="/privacy">Privacy</a> &nbsp;·&nbsp;
-  <a href="mailto:hello@usemeridian.us">Contact</a>
+  <div class="footer-links">
+    <a href="mailto:hello@usemeridian.us">hello@usemeridian.us</a>
+    <a href="/terms">Terms</a>
+    <a href="/privacy">Privacy</a>
+    <a href="https://ajc3xc.github.io/Meridian/" target="_blank" rel="noopener">Docs</a>
+    <a href="https://github.com/ajc3xc/Meridian" target="_blank" rel="noopener">GitHub</a>
+    <a href="https://github.com/ajc3xc/Meridian/blob/main/LICENSE">License (MSL-2.0)</a>
+  </div>
+  <div class="footer-powered">
+    Built on
+    <svg width="14" height="14" viewBox="0 0 32 32" fill="none"><circle cx="16" cy="16" r="16" fill="#00E599"/><path d="M8 20V12l8 8V12l8 8" stroke="#000" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+    Neon Postgres &nbsp;·&nbsp; Deployed on Fly.io
+  </div>
 </footer>
 
-<script>
-document.getElementById('wlForm').addEventListener('submit', async (e) => {
-  e.preventDefault();
-  const btn = document.getElementById('wlBtn');
-  const msg = document.getElementById('waitlist-msg');
-  const email = document.getElementById('wlEmail').value.trim();
-  btn.disabled = true;
-  msg.textContent = '';
-  msg.className = '';
-  try {
-    const r = await fetch('/waitlist', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({email})
-    });
-    if (r.status === 201) {
-      msg.textContent = "You're on the list. We'll email you when it's ready.";
-    } else if (r.status === 409) {
-      msg.textContent = "Already on the list — we'll be in touch!";
-    } else {
-      const d = await r.json().catch(() => ({}));
-      msg.textContent = d.detail || 'Something went wrong. Try again.';
-      msg.className = 'err';
-      btn.disabled = false;
-    }
-  } catch {
-    msg.textContent = 'Network error. Try again.';
-    msg.className = 'err';
-    btn.disabled = false;
-  }
-});
-</script>
 </body>
 </html>

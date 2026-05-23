@@ -31,6 +31,7 @@ itsdangerous = ">=2.1"
 resend = ">=0.7"
 bcrypt = ">=4.0"
 slowapi = ">=0.1"
+mkdocs-material = ">=9.5"
 
 [tasks]
 start = { cmd = "python -m meridian", env = { MERIDIAN_CLAUDE_CLI = "cmd /c C:/Users/13144/AppData/Roaming/npm/claude.cmd -p" } }
@@ -39,3 +40,5 @@ test = "pytest tests/ -v"
 build-exe = "pyinstaller meridian.spec --clean"
 demo = "python scripts/demo.py"
 test-mcp = "python scripts/test_mcp.py"
+docs-serve = "mkdocs serve"
+docs-build = "mkdocs build"

@@ -2544,6 +2544,10 @@ def test_config_endpoint_reflects_env(monkeypatch, tmp_path):
     monkeypatch.setenv("MERIDIAN_HOST", "0.0.0.0")
     monkeypatch.setenv("MERIDIAN_PORT", "9999")
     monkeypatch.setenv("MERIDIAN_DATA_DIR", str(tmp_path))
+    # Block real Neon URLs from .env from leaking into the test lifespan
+    monkeypatch.setenv("MERIDIAN_DB_URL", "")
+    monkeypatch.setenv("MERIDIAN_DEMO_DB_URL", "")
+    monkeypatch.setenv("MERIDIAN_GOAL_MD", str(tmp_path / "GOAL.md"))
     import importlib, meridian.server as srv
     srv = importlib.reload(srv)
     from fastapi.testclient import TestClient
@@ -4669,3 +4673,139 @@ def test_landing_page_footer_uses_meridian_email(client):
     assert r.status_code == 200
     assert "hello@usemeridian.us" in r.text
     assert "hello@usemeridian.us" not in r.text
+
+
+# ---------------------------------------------------------------------------
+# GitHub OAuth tests
+# ---------------------------------------------------------------------------
+
+def test_auth_login_page_has_google_button(client):
+    """GET /auth/login shows Google OAuth button."""
+    r = client.get("/auth/login", follow_redirects=False)
+    assert r.status_code == 200
+    assert "Google" in r.text
+    assert "/auth/google/login" in r.text
+
+
+def test_auth_login_page_has_github_button(client):
+    """GET /auth/login shows GitHub OAuth button."""
+    r = client.get("/auth/login", follow_redirects=False)
+    assert r.status_code == 200
+    assert "GitHub" in r.text
+    assert "/auth/github/login" in r.text
+
+
+def test_auth_login_page_returns_html(client):
+    """GET /auth/login serves an HTML page (not a redirect to Google)."""
+    r = client.get("/auth/login", follow_redirects=False)
+    assert r.status_code == 200
+    assert "text/html" in r.headers["content-type"]
+
+
+def test_auth_google_login_redirects_when_configured(client, monkeypatch):
+    """GET /auth/google/login redirects to Google when GOOGLE_CLIENT_ID is set."""
+    import os
+    monkeypatch.setenv("GOOGLE_CLIENT_ID", "fake-client-id")
+    monkeypatch.setenv("GOOGLE_CLIENT_SECRET", "fake-secret")
+    r = client.get("/auth/google/login", follow_redirects=False)
+    # Should redirect to Google (302) or return 503 if oauth client setup fails
+    assert r.status_code in (302, 503)
+
+
+def test_auth_github_login_redirects_when_configured(client, monkeypatch):
+    """GET /auth/github/login redirects to GitHub when GITHUB_CLIENT_ID is set."""
+    import os
+    monkeypatch.setenv("GITHUB_CLIENT_ID", "Ov23liFakeId")
+    r = client.get("/auth/github/login", follow_redirects=False)
+    # Should redirect to GitHub (302) or 503 if key missing
+    assert r.status_code in (302, 503)
+
+
+def test_auth_github_callback_missing_code(client):
+    """GET /auth/github/callback without code param returns 400."""
+    r = client.get("/auth/github/callback", follow_redirects=False)
+    assert r.status_code == 400
+    assert "missing oauth code" in r.json().get("detail", "")
+
+
+def test_auth_callback_missing_code(client):
+    """GET /auth/callback (Google) without code param returns 400."""
+    r = client.get("/auth/callback", follow_redirects=False)
+    assert r.status_code == 400
+    assert "missing oauth code" in r.json().get("detail", "")
+
+
+def test_landing_page_has_pricing_section(client):
+    """Landing page has pricing cards (Standard and Pro)."""
+    r = client.get("/")
+    assert r.status_code == 200
+    assert "Standard" in r.text
+    assert "$20" in r.text
+    assert "Pro" in r.text
+    assert "$49" in r.text
+
+
+def test_landing_page_has_neon_attribution(client):
+    """Landing page mentions Neon Postgres for transparency."""
+    r = client.get("/")
+    assert r.status_code == 200
+    assert "Neon" in r.text
+
+
+def test_landing_page_nav_has_docs_link(client):
+    """Landing page nav has a Docs link."""
+    r = client.get("/")
+    assert r.status_code == 200
+    # Docs link should be present
+    assert "Docs" in r.text
+
+
+async def test_neon_pool_projects_table_exists(db):
+    """neon_pool_projects table must exist after init_db."""
+    async with db.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='neon_pool_projects'"
+    ) as cur:
+        row = await cur.fetchone()
+    assert row is not None, "neon_pool_projects table missing"
+
+
+async def test_pool_project_register_and_count(db):
+    """register_pool_project and get_pool_project_counts work correctly."""
+    from meridian.db import register_pool_project, get_pool_project_counts, increment_pool_project_count
+    # Start clean
+    counts = await get_pool_project_counts(db, tier="standard")
+    initial = counts["projects"]
+
+    pool = await register_pool_project(db, "neon-test-proj-001", "standard")
+    assert pool["neon_project_id"] == "neon-test-proj-001"
+    assert pool["tier"] == "standard"
+    assert pool["customer_count"] == 0
+
+    await increment_pool_project_count(db, "neon-test-proj-001")
+    counts = await get_pool_project_counts(db, tier="standard")
+    assert counts["projects"] >= initial + 1
+    assert counts["customers"] >= 1
+
+
+async def test_get_available_pool_project(db):
+    """get_available_pool_project returns project with room or None."""
+    from meridian.db import register_pool_project, get_available_pool_project, increment_pool_project_count
+    import uuid
+
+    unique_id = str(uuid.uuid4())[:12]
+    pool = await register_pool_project(db, f"neon-{unique_id}", "standard")
+    neon_id = pool["neon_project_id"]
+
+    # Should be available (count=0)
+    found = await get_available_pool_project(db, tier="standard", max_customers=8)
+    assert found is not None
+
+    # Fill it up
+    for _ in range(8):
+        await increment_pool_project_count(db, neon_id)
+
+    # Should no longer be returned as available (count=8, max=8)
+    found = await get_available_pool_project(db, tier="standard", max_customers=8)
+    # May be None or a different pool project (if others exist with room)
+    if found is not None:
+        assert found["neon_project_id"] != neon_id or found["customer_count"] < 8

@@ -1,6 +1,9 @@
 # Meridian
 
 [![License: MSL-2.0](https://img.shields.io/badge/license-MSL--2.0-blue)](LICENSE)
+[![Docs](https://img.shields.io/badge/docs-ajc3xc.github.io%2FMeridian-6c8fff)](https://ajc3xc.github.io/Meridian/)
+[![Fly.io](https://img.shields.io/badge/hosted-usemeridian.us-a78bfa)](https://usemeridian.us)
+[![Neon](https://img.shields.io/badge/DB-Neon_Postgres-00e599)](https://neon.tech)
 
 Your AI sessions don't remember each other.
 
@@ -110,13 +113,29 @@ and task log. No Meridian server needed in the cloud.
 
 State lives in a local SQLite file. No accounts, no cloud, no sync required.
 
-## Hosted tier
+## Hosted tier — usemeridian.us
 
-Zero-install dashboard at [usemeridian.us](https://usemeridian.us) — your team
-gets a shared URL, Google login, and a dedicated Postgres database. No Python
-required anywhere.
+Zero-install dashboard at **[usemeridian.us](https://usemeridian.us)** — sign in with
+Google or GitHub, get an isolated Neon Postgres database, connect your AI clients
+over HTTPS. No Python required anywhere.
 
-Once you have an account, add this to your Claude Code `.mcp.json`:
+**$20/month** — 7-day free trial, card required.
+
+### Local config (self-hosted)
+
+```json
+{
+  "mcpServers": {
+    "meridian": {
+      "command": "pixi",
+      "args": ["run", "python", "-m", "meridian", "--mcp"],
+      "cwd": "/absolute/path/to/Meridian"
+    }
+  }
+}
+```
+
+### Hosted config (usemeridian.us)
 
 ```json
 {
@@ -130,8 +149,16 @@ Once you have an account, add this to your Claude Code `.mcp.json`:
 }
 ```
 
-[Join the waitlist](https://usemeridian.us#waitlist) or email
-[hello@usemeridian.us](mailto:hello@usemeridian.us).
+| | Standard | Pro |
+|--|--|--|
+| **Price** | $20/mo | $49/mo (waitlist) |
+| **Neon databases** | Up to 10 | Up to 50 |
+| **Compute** | 2 CU · 100 CU-hrs/mo | 4 CU · 300 CU-hrs/mo |
+| **Storage** | 0.5 GB | 5 GB |
+| **BYODB** | ✓ | ✓ |
+| **OAuth** | Google + GitHub | Google + GitHub |
+
+Questions: [hello@usemeridian.us](mailto:hello@usemeridian.us)
 
 ## Contributors
 
@@ -141,4 +168,4 @@ Once you have an account, add this to your Claude Code `.mcp.json`:
 
 [MSL-2.0](LICENSE) — free for local and internal use, any team size. Paid for hosting as a service to others. See LICENSE for details.
 
-For licensing questions: hello@usemeridian.us
+For licensing questions: [hello@usemeridian.us](mailto:hello@usemeridian.us)
