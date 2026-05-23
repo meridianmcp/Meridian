@@ -374,6 +374,72 @@ app = FastAPI(
 )
 
 # ---------------------------------------------------------------------------
+# Password gate middleware
+# ---------------------------------------------------------------------------
+_GATE_COOKIE = "meridian_site_access"
+_GATE_MAX_AGE = 24 * 3600
+
+def _gate_html(error=""):
+    err = f'<p style="color:#f87171;margin-top:8px;font-size:13px">{error}</p>' if error else ""
+    return f"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>Meridian</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>*{{box-sizing:border-box;margin:0;padding:0}}
+body{{background:#0d0d0f;color:#e8eaf0;font-family:-apple-system,sans-serif;min-height:100vh;display:flex;align-items:center;justify-content:center}}
+.card{{background:#16181c;border:1px solid #2a2d35;border-radius:10px;padding:40px;max-width:360px;width:100%;margin:20px}}
+.logo{{font-size:20px;font-weight:700;color:#6c8fff;margin-bottom:4px}}
+.sub{{color:#8b8fa8;font-size:12px;margin-bottom:28px}}
+label{{display:block;font-size:13px;color:#8b8fa8;margin-bottom:6px}}
+input{{width:100%;padding:10px 12px;background:#0d0d0f;border:1px solid #2a2d35;border-radius:6px;color:#e8eaf0;font-size:14px;outline:none}}
+input:focus{{border-color:#6c8fff}}
+button{{width:100%;margin-top:14px;padding:11px;background:#6c8fff;border:none;border-radius:6px;color:#fff;font-weight:700;font-size:14px;cursor:pointer}}</style>
+</head><body><div class="card">
+<div class="logo">⬡ Meridian</div>
+<div class="sub">Preview access required</div>
+<form method="post" action="/__gate__">
+<label>Password</label>
+<input type="password" name="password" autofocus placeholder="Enter preview password">
+{err}<button type="submit">Continue</button></form></div></body></html>"""
+
+@app.middleware("http")
+async def site_password_gate(request, call_next):
+    site_pw = os.environ.get("SITE_PASSWORD", "")
+    if not site_pw:
+        return await call_next(request)
+    path = request.url.path
+    if path in ("/health", "/mcp/health", "/__gate__"):
+        return await call_next(request)
+    from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
+    from fastapi.responses import HTMLResponse
+    secret = os.environ.get("SESSION_SECRET", "fallback")
+    token = request.cookies.get(_GATE_COOKIE, "")
+    valid = False
+    if token:
+        try:
+            URLSafeTimedSerializer(secret).loads(token, max_age=_GATE_MAX_AGE)
+            valid = True
+        except Exception:
+            valid = False
+    if not valid:
+        return HTMLResponse(_gate_html())
+    return await call_next(request)
+
+@app.post("/__gate__")
+async def gate_submit(request):
+    from fastapi.responses import HTMLResponse, RedirectResponse
+    from itsdangerous import URLSafeTimedSerializer
+    site_pw = os.environ.get("SITE_PASSWORD", "")
+    secret = os.environ.get("SESSION_SECRET", "fallback")
+    form = await request.form()
+    entered = form.get("password", "")
+    if entered != site_pw:
+        return HTMLResponse(_gate_html("Incorrect password"))
+    token = URLSafeTimedSerializer(secret).dumps("granted")
+    response = RedirectResponse("/", status_code=303)
+    response.set_cookie(_GATE_COOKIE, token, max_age=_GATE_MAX_AGE, httponly=True, samesite="lax")
+    return response
+
+# ---------------------------------------------------------------------------
 # v2.0 — Rate limiter (slowapi, in-memory, no Redis required)
 # ---------------------------------------------------------------------------
 try:
