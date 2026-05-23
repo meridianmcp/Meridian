@@ -267,6 +267,16 @@ async def lifespan(app: FastAPI):
         except Exception:  # noqa: BLE001
             pass
 
+    # v2.1 — isolated demo DB from MERIDIAN_DEMO_DB_URL (separate Neon project)
+    demo_db_url = os.environ.get("MERIDIAN_DEMO_DB_URL")
+    if demo_db_url:
+        try:
+            demo_db = await db_module.init_db(demo_db_url)
+            app.state.demo_db = demo_db
+            await _seed_demo_data(demo_db)
+        except Exception:  # noqa: BLE001
+            app.state.demo_db = None
+
     # v0.4.2 — periodic auto-summary task. Interval comes from env so
     # tests can run it on a sub-second cadence; default is ten minutes.
     interval_s = float(os.environ.get("MERIDIAN_AUTO_SUMMARY_INTERVAL", 600))
@@ -407,7 +417,7 @@ async def site_password_gate(request: Request, call_next):
     if not site_pw:
         return await call_next(request)
     path = request.url.path
-    if path in ("/health", "/mcp/health", "/__gate__"):
+    if path in ("/health", "/mcp/health", "/__gate__") or path == "/demo" or path.startswith("/demo/"):
         return await call_next(request)
     from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
     from fastapi.responses import HTMLResponse
@@ -461,22 +471,25 @@ except ImportError:
 # ---------------------------------------------------------------------------
 
 _DEMO_WRITE_ALLOWLIST = {"/demo-auth", "/waitlist"}
+_DEMO_CONTEXT_COOKIE = "meridian_demo"
 
 
 @app.middleware("http")
 async def _demo_read_only_middleware(request: Request, call_next):
-    """Block all mutating requests when MERIDIAN_DEMO=true.
+    """Block all mutating requests when MERIDIAN_DEMO=true or demo cookie set.
 
     /demo-auth and /waitlist are exempted so the password gate and waitlist
     signup still function in preview mode.
     """
+    env_demo = os.environ.get("MERIDIAN_DEMO", "").lower() in ("1", "true", "yes")
+    cookie_demo = bool(request.cookies.get(_DEMO_CONTEXT_COOKIE))
     if (
-        os.environ.get("MERIDIAN_DEMO", "").lower() in ("1", "true", "yes")
+        (env_demo or cookie_demo)
         and request.method in ("POST", "PUT", "PATCH", "DELETE")
         and request.url.path not in _DEMO_WRITE_ALLOWLIST
     ):
         return Response(
-            content=json.dumps({"detail": "Preview mode — read only"}),
+            content=json.dumps({"detail": "Demo mode — read only"}),
             status_code=403,
             media_type="application/json",
         )
@@ -510,7 +523,15 @@ _templates = Jinja2Templates(directory=_resource_path("meridian/templates"))
 
 
 def _db(request: Request) -> aiosqlite.Connection:
-    """Pull the active DB connection off ``app.state``."""
+    """Pull the active DB connection off ``app.state``.
+
+    Returns the demo DB when the meridian_demo cookie is set and a demo DB
+    was initialised from MERIDIAN_DEMO_DB_URL.
+    """
+    if request.cookies.get(_DEMO_CONTEXT_COOKIE):
+        demo_db = getattr(request.app.state, "demo_db", None)
+        if demo_db is not None:
+            return demo_db
     return request.app.state.db
 
 
@@ -577,6 +598,18 @@ async def demo_auth_post(request: Request):
 async def health() -> dict[str, str]:
     """Liveness probe."""
     return {"status": "ok", "service": "meridian"}
+
+
+@app.get("/terms", response_class=HTMLResponse)
+async def terms_page(request: Request) -> HTMLResponse:
+    """Static Terms of Service page."""
+    return _templates.TemplateResponse(request, "terms.html")
+
+
+@app.get("/privacy", response_class=HTMLResponse)
+async def privacy_page(request: Request) -> HTMLResponse:
+    """Static Privacy Policy page."""
+    return _templates.TemplateResponse(request, "privacy.html")
 
 
 # ---------------------------------------------------------------------------
@@ -1523,7 +1556,28 @@ async def dashboard_html(request: Request) -> Any:
     if os.environ.get("DEMO_PASSWORD"):
         if not _check_demo_cookie(request):
             return HTMLResponse(_demo_gate_html())
-    return _templates.TemplateResponse(request, "dashboard.html", {"version": _VERSION})
+    return _templates.TemplateResponse(request, "dashboard.html", {"version": _VERSION, "demo_mode": False})
+
+
+@app.get("/demo", response_class=HTMLResponse)
+async def demo_dashboard(request: Request) -> Any:
+    """Public read-only demo dashboard backed by MERIDIAN_DEMO_DB_URL.
+
+    Sets a short-lived cookie so subsequent API calls from this browser
+    session are routed to the isolated demo DB and writes are blocked.
+    Exempt from SITE_PASSWORD gate so the URL is always public.
+    """
+    response = _templates.TemplateResponse(
+        request, "dashboard.html", {"version": _VERSION, "demo_mode": True}
+    )
+    response.set_cookie(
+        _DEMO_CONTEXT_COOKIE,
+        "1",
+        max_age=3600,
+        httponly=True,
+        samesite="lax",
+    )
+    return response
 
 
 @app.get("/config/api-key")
@@ -1862,6 +1916,105 @@ async def ws_project(ws: WebSocket, project_id: str) -> None:
     await broadcaster.serve(ws, project_id)
 
 
+
+
+@app.get("/admin", response_class=HTMLResponse)
+async def admin_dashboard(request: Request) -> Any:
+    """Admin dashboard — restricted to ADMIN_EMAIL via Google OAuth.
+
+    Shows active tenants, churn stats, Neon usage, recent signups, and
+    payment failures.  Returns 403 if the authenticated tenant is not the
+    admin email.
+    """
+    from .hosted import get_current_tenant
+
+    admin_email = os.environ.get("ADMIN_EMAIL", "")
+
+    try:
+        tenant = await get_current_tenant(request)
+    except HTTPException:
+        return HTMLResponse(
+            '<meta http-equiv="refresh" content="0;url=/auth/login">',
+            status_code=302,
+        )
+
+    if admin_email and tenant.get("email") != admin_email:
+        raise HTTPException(status_code=403, detail="admin access only")
+
+    db = request.app.state.db
+
+    def _r(row: Any) -> dict[str, Any]:
+        """Convert an aiosqlite.Row or dict row to a plain dict."""
+        if row is None:
+            return {}
+        if isinstance(row, dict):
+            return row
+        return {k: row[k] for k in row.keys()}
+
+    # Gather stats
+    async with db.execute(
+        "SELECT COUNT(*) as n FROM tenants WHERE plan='pro'"
+    ) as cur:
+        row = await cur.fetchone()
+        active_count = _r(row).get("n", 0) if row else 0
+
+    async with db.execute(
+        "SELECT COUNT(*) as n FROM tenants WHERE plan='free'"
+    ) as cur:
+        row = await cur.fetchone()
+        free_count = _r(row).get("n", 0) if row else 0
+
+    async with db.execute(
+        "SELECT email, plan, created_at, neon_project_id FROM tenants ORDER BY created_at DESC LIMIT 20"
+    ) as cur:
+        rows = await cur.fetchall()
+        recent_tenants = [_r(r) for r in rows] if rows else []
+
+    rows_html = "".join(
+        f"<tr><td>{t['email']}</td><td>{t['plan']}</td><td>{t['created_at'][:10]}</td>"
+        f"<td>{'✓' if t['neon_project_id'] else '—'}</td></tr>"
+        for t in recent_tenants
+    )
+
+    html = f"""<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Meridian Admin</title>
+<style>
+*{{box-sizing:border-box;margin:0;padding:0}}
+body{{background:#0d0d0f;color:#e8eaf0;font-family:-apple-system,sans-serif;padding:2rem}}
+.wrap{{max-width:900px;margin:0 auto}}
+h1{{font-size:1.5rem;font-weight:800;margin-bottom:1.5rem}}
+.stats{{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:1rem;margin-bottom:2rem}}
+.stat{{background:#16181c;border:1px solid #2a2d35;border-radius:8px;padding:1.2rem;text-align:center}}
+.stat .n{{font-size:2rem;font-weight:800;color:#6c8fff}}
+.stat .l{{font-size:.8rem;color:#8b8fa8;margin-top:.3rem}}
+table{{width:100%;border-collapse:collapse;background:#16181c;border-radius:8px;overflow:hidden}}
+th{{background:#0d0d0f;color:#8b8fa8;font-size:.8rem;padding:.6rem 1rem;text-align:left}}
+td{{padding:.6rem 1rem;border-top:1px solid #2a2d35;font-size:.85rem;color:#e8eaf0}}
+a{{color:#6c8fff}}
+</style>
+</head>
+<body>
+<div class="wrap">
+<h1>&#x1f9ed; Meridian Admin <small style="font-size:.7em;color:#8b8fa8">{tenant['email']}</small></h1>
+<div class="stats">
+  <div class="stat"><div class="n">{active_count}</div><div class="l">Pro tenants</div></div>
+  <div class="stat"><div class="n">{free_count}</div><div class="l">Free tenants</div></div>
+  <div class="stat"><div class="n">{active_count + free_count}</div><div class="l">Total accounts</div></div>
+  <div class="stat"><div class="n">1000</div><div class="l">Neon project cap</div></div>
+</div>
+<h2 style="margin-bottom:.8rem;font-size:1rem;color:#8b8fa8">Recent accounts (last 20)</h2>
+<table>
+<thead><tr><th>Email</th><th>Plan</th><th>Joined</th><th>Neon</th></tr></thead>
+<tbody>{rows_html}</tbody>
+</table>
+<p style="margin-top:1.5rem;font-size:.8rem;color:#8b8fa8">
+  <a href="/">← Home</a> &nbsp;·&nbsp; <a href="/auth/logout">Sign out</a>
+</p>
+</div>
+</body>
+</html>"""
+    return HTMLResponse(html)
 
 
 @app.get("/admin/git-status")
@@ -2297,48 +2450,6 @@ async def delete_connection(name: str) -> dict[str, Any]:
     )
     return {"ok": True, "deleted": name}
 
-
-# ---------------------------------------------------------------------------
-# Git remote warning
-# ---------------------------------------------------------------------------
-
-
-@app.get("/admin/git-status")
-async def git_status() -> dict[str, Any]:
-    """v1.9.x — check whether the remote has commits ahead of local HEAD.
-
-    Runs ``git fetch --dry-run`` in the repo root. Non-blocking: uses
-    asyncio subprocess so it won't stall the event loop. Returns
-    ``warning`` (str) when the remote is ahead, ``None`` otherwise.
-    The dashboard polls this every 60 s and shows a yellow banner.
-    """
-    import asyncio
-
-    repo_root = Path(__file__).resolve().parent.parent
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            "git", "-C", str(repo_root), "fetch", "--dry-run",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        _, stderr = await asyncio.wait_for(proc.communicate(), timeout=10)
-        # git fetch --dry-run writes what it *would* fetch to stderr.
-        # Any non-empty output means the remote has new commits.
-        output = (stderr or b"").decode(errors="replace").strip()
-        if proc.returncode != 0 or not output:
-            return {"warning": None, "output": output}
-        # Extract branch name from first line like "   abc123..def456  main -> origin/main"
-        branch = ""
-        for line in output.splitlines():
-            if "->" in line:
-                branch = line.split("->")[-1].strip()
-                break
-        warning = f"Remote updated on {branch} — git pull recommended" if branch else "Remote has new commits — git pull recommended"
-        return {"warning": warning, "output": output}
-    except (OSError, asyncio.TimeoutError):
-        return {"warning": None, "output": ""}
-
-
 # ---------------------------------------------------------------------------
 # Waitlist
 # ---------------------------------------------------------------------------
@@ -2432,8 +2543,16 @@ async def stripe_webhook(request: Request) -> dict[str, str]:
             db, tenant["id"], stripe_customer_id=stripe_customer_id, plan="pro"
         )
 
+    # Capacity check before provisioning
+    from .hosted import check_capacity, provision_neon_db, send_welcome_email
+    try:
+        await check_capacity(db)
+    except RuntimeError as cap_exc:
+        import logging
+        logging.getLogger(__name__).error("Capacity exceeded: %s", cap_exc)
+        return {"status": "capacity_exceeded"}
+
     # Provision Neon DB
-    from .hosted import provision_neon_db, send_welcome_email
     try:
         tenant = await provision_neon_db(tenant["id"], db)
     except Exception as exc:
@@ -2645,12 +2764,15 @@ async def _dispatch_mcp_tool(name: str, args: dict[str, Any], db: Any, data_dir:
     raise ValueError(f"unknown tool: {name}")
 
 
+_MCP_RATE_LIMIT = "100/minute"
+
+
 @app.post("/mcp")
 async def remote_mcp(request: Request) -> Any:
     """Remote MCP endpoint — JSON-RPC 2.0 over HTTP.
 
     Requires ``Authorization: Bearer sk_meridian_...`` header.
-    Rate-limited to 60 requests/minute per IP.
+    Rate-limited to 100 requests/minute per IP.
     Accepts a single JSON-RPC 2.0 message or a batch (list).
     """
     from .hosted import get_tenant_from_bearer
@@ -2658,7 +2780,6 @@ async def remote_mcp(request: Request) -> Any:
 
     if _limiter is not None:
         try:
-            from slowapi.errors import RateLimitExceeded
             await _limiter._check_request_limit(request, None, False)
         except Exception:
             pass  # rate limiting is best-effort; don't block on errors

@@ -385,3 +385,153 @@ async def get_tenant_from_bearer(request: Request) -> dict[str, Any]:
             detail="invalid API token",
         )
     return tenant
+
+
+# ---------------------------------------------------------------------------
+# Capacity monitor
+# ---------------------------------------------------------------------------
+
+async def check_capacity(db: Any) -> dict[str, Any]:
+    """Return Neon project usage stats and emit alerts when thresholds are hit.
+
+    Sends an email to ADMIN_EMAIL when active tenants exceed 950.
+    Raises RuntimeError (blocks provisioning) when count reaches 1000.
+    """
+    async with db.execute(
+        "SELECT COUNT(*) as n FROM tenants WHERE neon_project_id IS NOT NULL"
+    ) as cur:
+        row = await cur.fetchone()
+        if row is None:
+            active = 0
+        elif isinstance(row, dict):
+            active = row.get("n", 0)
+        else:
+            active = row["n"] if hasattr(row, "keys") else (row[0] if row else 0)
+
+    if active >= 1000:
+        raise RuntimeError(
+            f"Neon project cap reached ({active}/1000) — provisioning blocked"
+        )
+
+    if active >= 950:
+        admin_email = _cfg("ADMIN_EMAIL")
+        if admin_email:
+            try:
+                import httpx
+                api_key = _cfg("RESEND_API_KEY")
+                if api_key:
+                    from_addr = _cfg("MERIDIAN_FROM_EMAIL", "Meridian <noreply@usemeridian.us>")
+                    async with httpx.AsyncClient(timeout=10) as http:
+                        await http.post(
+                            "https://api.resend.com/emails",
+                            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                            json={
+                                "from": from_addr,
+                                "to": [admin_email],
+                                "subject": f"[Meridian] Capacity warning: {active}/1000 Neon projects",
+                                "html": f"<p>Active Neon projects: <strong>{active}/1000</strong>. "
+                                        f"Consider upgrading the Neon tier before hitting the cap.</p>",
+                            },
+                        )
+            except Exception:  # noqa: BLE001
+                pass  # best-effort alert
+
+    return {"active": active, "cap": 1000, "warning": active >= 950}
+
+
+# ---------------------------------------------------------------------------
+# Churn cleanup
+# ---------------------------------------------------------------------------
+
+async def run_churn_cleanup(db: Any) -> None:
+    """Warn churned tenants on day 3-7 and day 14; delete on day 28.
+
+    A tenant is considered churned when their plan is 'free' and they have a
+    neon_project_id (i.e. previously paid).  In practice you'll call this from
+    a scheduled job or on server startup.
+    """
+    import httpx
+    from datetime import datetime, timedelta, timezone
+
+    now = datetime.now(tz=timezone.utc)
+    api_key = _cfg("RESEND_API_KEY")
+    from_addr = _cfg("MERIDIAN_FROM_EMAIL", "Meridian <noreply@usemeridian.us>")
+    base = _cfg("MERIDIAN_BASE_URL", "https://usemeridian.us").rstrip("/")
+
+    async with db.execute(
+        "SELECT id, email, neon_project_id, created_at FROM tenants "
+        "WHERE plan='free' AND neon_project_id IS NOT NULL"
+    ) as cur:
+        rows = await cur.fetchall()
+    def _to_d(r: Any) -> dict[str, Any]:
+        if isinstance(r, dict):
+            return r
+        return {k: r[k] for k in r.keys()}
+
+    churned = [_to_d(r) for r in rows] if rows else []
+
+    for tenant in churned:
+        try:
+            cancelled_at = datetime.fromisoformat(tenant["created_at"].replace("Z", "+00:00"))
+        except (ValueError, AttributeError):
+            continue
+
+        days_since = (now - cancelled_at).days
+
+        if days_since >= 28:
+            # Delete Neon project and mark tenant fully inactive
+            neon_id = tenant.get("neon_project_id")
+            if neon_id:
+                try:
+                    neon_key = _cfg("NEON_API_KEY")
+                    if neon_key:
+                        async with httpx.AsyncClient(timeout=15) as http:
+                            await http.delete(
+                                f"https://console.neon.tech/api/v2/projects/{neon_id}",
+                                headers={"Authorization": f"Bearer {neon_key}"},
+                            )
+                except Exception:  # noqa: BLE001
+                    pass
+            await db.execute(
+                "UPDATE tenants SET neon_project_id=NULL, neon_db_url=NULL WHERE id=?",
+                (tenant["id"],),
+            )
+            await db.commit()
+
+        elif days_since >= 14 and api_key:
+            try:
+                async with httpx.AsyncClient(timeout=10) as http:
+                    await http.post(
+                        "https://api.resend.com/emails",
+                        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                        json={
+                            "from": from_addr,
+                            "to": [tenant["email"]],
+                            "subject": "Your Meridian data will be deleted in 14 days",
+                            "html": f"<p>Your Meridian account was cancelled. Your data will be "
+                                    f"permanently deleted 14 days from now.</p>"
+                                    f"<p>To resubscribe: <a href='{base}/auth/login'>{base}</a></p>",
+                        },
+                    )
+            except Exception:  # noqa: BLE001
+                pass
+
+        elif 3 <= days_since <= 7 and api_key:
+            try:
+                async with httpx.AsyncClient(timeout=10) as http:
+                    await http.post(
+                        "https://api.resend.com/emails",
+                        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                        json={
+                            "from": from_addr,
+                            "to": [tenant["email"]],
+                            "subject": "Your Meridian data — action required in 21+ days",
+                            "html": f"<p>You cancelled your Meridian subscription. Your data is "
+                                    f"still intact. Resubscribe to keep it:</p>"
+                                    f"<p><a href='{base}/auth/login'>{base}</a></p>"
+                                    f"<p>If you do nothing, your data will be deleted 28 days after "
+                                    f"cancellation.</p>",
+                        },
+                    )
+            except Exception:  # noqa: BLE001
+                pass

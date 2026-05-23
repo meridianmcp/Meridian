@@ -191,6 +191,29 @@ CREATE TABLE IF NOT EXISTS api_tokens (
     label TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
+
+-- v2.1 dark — multi-user roles, not exposed in UI or API at launch
+CREATE TABLE IF NOT EXISTS workspace_members (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL REFERENCES tenants(id),
+    email TEXT NOT NULL,
+    role TEXT NOT NULL DEFAULT 'member'
+        CHECK (role IN ('owner','member','viewer')),
+    token_hash TEXT,
+    invited_at TEXT NOT NULL DEFAULT (datetime('now')),
+    joined_at TEXT
+);
+
+-- v2.1 dark — per-tenant named environments (prod/staging/dev), not exposed at launch
+CREATE TABLE IF NOT EXISTS tenant_environments (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL REFERENCES tenants(id),
+    name TEXT NOT NULL,
+    neon_db_name TEXT,
+    token_hash TEXT,
+    is_default INTEGER NOT NULL DEFAULT 0
+        CHECK (is_default IN (0,1))
+);
 """
 
 

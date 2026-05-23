@@ -4138,12 +4138,16 @@ async def test_get_tasks_includes_human_id(db):
 
 
 def test_git_status_endpoint_returns_shape(client):
-    """GET /admin/git-status returns warning field (may be null or str)."""
+    """GET /admin/git-status returns ok and behind fields; warning present when ok=True."""
     r = client.get("/admin/git-status")
     assert r.status_code == 200
     body = r.json()
-    assert "warning" in body
-    assert body["warning"] is None or isinstance(body["warning"], str)
+    assert "ok" in body
+    assert "behind" in body
+    # warning is only present in success path; error path returns ok=False
+    if body.get("ok"):
+        assert "warning" in body
+        assert body["warning"] is None or isinstance(body["warning"], str)
 
 
 def test_dashboard_html_has_git_banner(client):
@@ -4570,3 +4574,98 @@ def test_dashboard_html_has_chartjs(client):
     """dashboard.html must load Chart.js CDN."""
     html = client.get("/dashboard").text
     assert "chart.js" in html.lower() or "chartjs" in html.lower()
+
+
+# ---------------------------------------------------------------------------
+# v2.1 — /demo, /terms, /privacy, dark tables, demo cookie routing
+# ---------------------------------------------------------------------------
+
+def test_demo_route_returns_200(client):
+    """GET /demo returns 200 and the dashboard HTML."""
+    r = client.get("/demo")
+    assert r.status_code == 200
+    assert "text/html" in r.headers["content-type"]
+    assert "Meridian Dashboard" in r.text
+
+
+def test_demo_route_sets_cookie(client):
+    """GET /demo sets the meridian_demo session cookie."""
+    r = client.get("/demo")
+    assert r.status_code == 200
+    assert "meridian_demo" in r.cookies
+
+
+def test_demo_route_shows_demo_banner(client):
+    """GET /demo renders the demo mode banner and JS flag."""
+    r = client.get("/demo")
+    assert "Demo mode" in r.text
+    assert "MERIDIAN_DEMO_MODE" in r.text
+
+
+def test_dashboard_no_demo_banner(client):
+    """GET /dashboard does not show the demo banner (demo_mode=False)."""
+    r = client.get("/dashboard")
+    assert r.status_code == 200
+    assert "demo-banner" not in r.text
+    assert "MERIDIAN_DEMO_MODE = false" in r.text
+
+
+def test_terms_page_returns_200(client):
+    """GET /terms returns 200 and contains ToS content."""
+    r = client.get("/terms")
+    assert r.status_code == 200
+    assert "text/html" in r.headers["content-type"]
+    assert "Terms of Service" in r.text
+    assert "hello@usemeridian.us" in r.text
+
+
+def test_privacy_page_returns_200(client):
+    """GET /privacy returns 200 and contains privacy policy content."""
+    r = client.get("/privacy")
+    assert r.status_code == 200
+    assert "text/html" in r.headers["content-type"]
+    assert "Privacy Policy" in r.text
+    assert "hello@usemeridian.us" in r.text
+
+
+def test_demo_write_blocked_with_cookie(client):
+    """POST with meridian_demo cookie returns 403."""
+    r = client.post(
+        "/projects",
+        json={"name": "should-fail"},
+        cookies={"meridian_demo": "1"},
+    )
+    assert r.status_code == 403
+
+
+def test_demo_read_allowed_with_cookie(client):
+    """GET with meridian_demo cookie still returns data (read-only, not blocked)."""
+    r = client.get("/projects", cookies={"meridian_demo": "1"})
+    assert r.status_code == 200
+
+
+async def test_dark_tables_exist(db):
+    """workspace_members and tenant_environments tables must be created by init_db."""
+    async with db.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name IN "
+        "('workspace_members', 'tenant_environments')"
+    ) as cur:
+        rows = await cur.fetchall()
+    found = {r[0] for r in rows}
+    assert "workspace_members" in found, "workspace_members table missing"
+    assert "tenant_environments" in found, "tenant_environments table missing"
+
+
+def test_landing_page_has_try_demo_link(client):
+    """Landing page includes a Try demo link pointing to /demo."""
+    r = client.get("/")
+    assert r.status_code == 200
+    assert "/demo" in r.text
+
+
+def test_landing_page_footer_uses_meridian_email(client):
+    """Landing page footer contact uses hello@usemeridian.us, not personal email."""
+    r = client.get("/")
+    assert r.status_code == 200
+    assert "hello@usemeridian.us" in r.text
+    assert "hello@usemeridian.us" not in r.text
