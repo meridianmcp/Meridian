@@ -402,7 +402,7 @@ button{{width:100%;margin-top:14px;padding:11px;background:#6c8fff;border:none;b
 {err}<button type="submit">Continue</button></form></div></body></html>"""
 
 @app.middleware("http")
-async def site_password_gate(request, call_next):
+async def site_password_gate(request: Request, call_next):
     site_pw = os.environ.get("SITE_PASSWORD", "")
     if not site_pw:
         return await call_next(request)
@@ -425,7 +425,7 @@ async def site_password_gate(request, call_next):
     return await call_next(request)
 
 @app.post("/__gate__")
-async def gate_submit(request):
+async def gate_submit(request: Request):
     from fastapi.responses import HTMLResponse, RedirectResponse
     from itsdangerous import URLSafeTimedSerializer
     site_pw = os.environ.get("SITE_PASSWORD", "")
