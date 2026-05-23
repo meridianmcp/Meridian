@@ -1,0 +1,2462 @@
+
+<!doctype html>
+<html lang="en" class="no-js">
+  <head>
+    
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width,initial-scale=1">
+      
+        <meta name="description" content="Shared memory for your AI sessions — MCP server for Claude, Cursor, Windsurf">
+      
+      
+      
+        <link rel="canonical" href="https://docs.usemeridian.us/mcp-tools/">
+      
+      
+        <link rel="prev" href="../configuration/">
+      
+      
+        <link rel="next" href="../hosted/">
+      
+      
+        
+      
+      
+      <link rel="icon" href="../assets/images/favicon.png">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.6">
+    
+    
+      
+        <title>MCP Tools - Meridian</title>
+      
+    
+    
+      <link rel="stylesheet" href="../assets/stylesheets/main.484c7ddc.min.css">
+      
+        
+        <link rel="stylesheet" href="../assets/stylesheets/palette.ab4e12ef.min.css">
+      
+      
+
+
+    
+    
+      
+    
+    
+      
+        
+        
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+        <link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Inter:300,300i,400,400i,700,700i%7CJetBrains+Mono:400,400i,700,700i&display=fallback">
+        <style>:root{--md-text-font:"Inter";--md-code-font:"JetBrains Mono"}</style>
+      
+    
+    
+      <link rel="stylesheet" href="../stylesheets/extra.css">
+    
+    <script>__md_scope=new URL("..",location),__md_hash=e=>[...e].reduce(((e,_)=>(e<<5)-e+_.charCodeAt(0)),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
+    
+      
+  
+
+
+  
+  
+
+<script id="__analytics">function __md_analytics(){function e(){dataLayer.push(arguments)}window.dataLayer=window.dataLayer||[],e("js",new Date),e("config","G-PLACEHOLDER"),document.addEventListener("DOMContentLoaded",(function(){document.forms.search&&document.forms.search.query.addEventListener("blur",(function(){this.value&&e("event","search",{search_term:this.value})}));document$.subscribe((function(){var t=document.forms.feedback;if(void 0!==t)for(var a of t.querySelectorAll("[type=submit]"))a.addEventListener("click",(function(a){a.preventDefault();var n=document.location.pathname,d=this.getAttribute("data-md-value");e("event","feedback",{page:n,data:d}),t.firstElementChild.disabled=!0;var r=t.querySelector(".md-feedback__note [data-md-value='"+d+"']");r&&(r.hidden=!1)})),t.hidden=!1})),location$.subscribe((function(t){e("config","G-PLACEHOLDER",{page_path:t.pathname})}))}));var t=document.createElement("script");t.async=!0,t.src="https://www.googletagmanager.com/gtag/js?id=G-PLACEHOLDER",document.getElementById("__analytics").insertAdjacentElement("afterEnd",t)}</script>
+  
+    <script>"undefined"!=typeof __md_analytics&&__md_analytics()</script>
+  
+
+    
+    
+  </head>
+  
+  
+    
+    
+    
+    
+    
+    <body dir="ltr" data-md-color-scheme="slate" data-md-color-primary="custom" data-md-color-accent="custom">
+  
+    
+    <input class="md-toggle" data-md-toggle="drawer" type="checkbox" id="__drawer" autocomplete="off">
+    <input class="md-toggle" data-md-toggle="search" type="checkbox" id="__search" autocomplete="off">
+    <label class="md-overlay" for="__drawer"></label>
+    <div data-md-component="skip">
+      
+        
+        <a href="#mcp-tools-reference" class="md-skip">
+          Skip to content
+        </a>
+      
+    </div>
+    <div data-md-component="announce">
+      
+    </div>
+    
+    
+      
+
+<header class="md-header" data-md-component="header">
+  <nav class="md-header__inner md-grid" aria-label="Header">
+    <a href=".." title="Meridian" class="md-header__button md-logo" aria-label="Meridian" data-md-component="logo">
+      
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
+
+    </a>
+    <label class="md-header__button md-icon" for="__drawer">
+      
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M3 6h18v2H3zm0 5h18v2H3zm0 5h18v2H3z"/></svg>
+    </label>
+    <div class="md-header__title" data-md-component="header-title">
+      <div class="md-header__ellipsis">
+        <div class="md-header__topic">
+          <span class="md-ellipsis">
+            Meridian
+          </span>
+        </div>
+        <div class="md-header__topic" data-md-component="header-topic">
+          <span class="md-ellipsis">
+            
+              MCP Tools
+            
+          </span>
+        </div>
+      </div>
+    </div>
+    
+      
+    
+    
+    
+    
+      
+      
+        <label class="md-header__button md-icon" for="__search">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        </label>
+        <div class="md-search" data-md-component="search" role="dialog">
+  <label class="md-search__overlay" for="__search"></label>
+  <div class="md-search__inner" role="search">
+    <form class="md-search__form" name="search">
+      <input type="text" class="md-search__input" name="query" aria-label="Search" placeholder="Search" autocapitalize="off" autocorrect="off" autocomplete="off" spellcheck="false" data-md-component="search-query" required>
+      <label class="md-search__icon md-icon" for="__search">
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11z"/></svg>
+      </label>
+      <nav class="md-search__options" aria-label="Search">
+        
+        <button type="reset" class="md-search__icon md-icon" title="Clear" aria-label="Clear" tabindex="-1">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
+        </button>
+      </nav>
+      
+        <div class="md-search__suggest" data-md-component="search-suggest"></div>
+      
+    </form>
+    <div class="md-search__output">
+      <div class="md-search__scrollwrap" tabindex="0" data-md-scrollfix>
+        <div class="md-search-result" data-md-component="search-result">
+          <div class="md-search-result__meta">
+            Initializing search
+          </div>
+          <ol class="md-search-result__list" role="presentation"></ol>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+      
+    
+    
+      <div class="md-header__source">
+        <a href="https://github.com/meridianmcp/Meridian" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M173.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6m-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3m44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9M252.8 8C114.1 8 8 113.3 8 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C436.2 457.8 504 362.9 504 252 504 113.3 391.5 8 252.8 8M105.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1m-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7m32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1m-11.4-14.7c-1.6 1-1.6 3.6 0 5.9s4.3 3.3 5.6 2.3c1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2"/></svg>
+  </div>
+  <div class="md-source__repository">
+    meridianmcp/Meridian
+  </div>
+</a>
+      </div>
+    
+  </nav>
+  
+</header>
+    
+    <div class="md-container" data-md-component="container">
+      
+      
+        
+          
+            
+<nav class="md-tabs" aria-label="Tabs" data-md-component="tabs">
+  <div class="md-grid">
+    <ul class="md-tabs__list">
+      
+        
+  
+  
+  
+  
+    <li class="md-tabs__item">
+      <a href=".." class="md-tabs__link">
+        
+  
+  
+    
+  
+  Home
+
+      </a>
+    </li>
+  
+
+      
+        
+  
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../quickstart/" class="md-tabs__link">
+          
+  
+  
+  Getting Started
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+  
+    
+  
+  
+    <li class="md-tabs__item md-tabs__item--active">
+      <a href="./" class="md-tabs__link">
+        
+  
+  
+    
+  
+  MCP Tools
+
+      </a>
+    </li>
+  
+
+      
+        
+  
+  
+  
+  
+    <li class="md-tabs__item">
+      <a href="../hosted/" class="md-tabs__link">
+        
+  
+  
+    
+  
+  Hosted (usemeridian.us)
+
+      </a>
+    </li>
+  
+
+      
+        
+  
+  
+  
+  
+    <li class="md-tabs__item">
+      <a href="../self-hosting/" class="md-tabs__link">
+        
+  
+  
+    
+  
+  Self-Hosting
+
+      </a>
+    </li>
+  
+
+      
+        
+  
+  
+  
+  
+    <li class="md-tabs__item">
+      <a href="../api-reference/" class="md-tabs__link">
+        
+  
+  
+    
+  
+  API Reference
+
+      </a>
+    </li>
+  
+
+      
+    </ul>
+  </div>
+</nav>
+          
+        
+      
+      <main class="md-main" data-md-component="main">
+        <div class="md-main__inner md-grid">
+          
+            
+              
+              <div class="md-sidebar md-sidebar--primary" data-md-component="sidebar" data-md-type="navigation" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+
+  
+
+
+<nav class="md-nav md-nav--primary md-nav--lifted" aria-label="Navigation" data-md-level="0">
+  <label class="md-nav__title" for="__drawer">
+    <a href=".." title="Meridian" class="md-nav__button md-logo" aria-label="Meridian" data-md-component="logo">
+      
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
+
+    </a>
+    Meridian
+  </label>
+  
+    <div class="md-nav__source">
+      <a href="https://github.com/meridianmcp/Meridian" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M173.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6m-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3m44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9M252.8 8C114.1 8 8 113.3 8 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C436.2 457.8 504 362.9 504 252 504 113.3 391.5 8 252.8 8M105.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1m-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7m32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1m-11.4-14.7c-1.6 1-1.6 3.6 0 5.9s4.3 3.3 5.6 2.3c1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2"/></svg>
+  </div>
+  <div class="md-source__repository">
+    meridianmcp/Meridian
+  </div>
+</a>
+    </div>
+  
+  <ul class="md-nav__list" data-md-scrollfix>
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href=".." class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Home
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_2" >
+        
+          
+          <label class="md-nav__link" for="__nav_2" id="__nav_2_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Getting Started
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_2_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_2">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Getting Started
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../quickstart/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Quickstart
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../configuration/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Configuration
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+    
+  
+  
+  
+    <li class="md-nav__item md-nav__item--active">
+      
+      <input class="md-nav__toggle md-toggle" type="checkbox" id="__toc">
+      
+      
+        
+      
+      
+        <label class="md-nav__link md-nav__link--active" for="__toc">
+          
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    MCP Tools
+  
+
+    
+  </span>
+  
+  
+
+          <span class="md-nav__icon md-icon"></span>
+        </label>
+      
+      <a href="./" class="md-nav__link md-nav__link--active">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    MCP Tools
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+      
+        
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#session-management" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Session Management
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Session Management">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#start_session" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        start_session
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#register_session" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        register_session
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#heartbeat" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        heartbeat
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#get_sessions" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        get_sessions
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#task-management" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Task Management
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Task Management">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#log_task" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        log_task
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#get_tasks" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        get_tasks
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#claim_task" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        claim_task
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#release_task" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        release_task
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#complete_task" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        complete_task
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#goal-management" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Goal Management
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Goal Management">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#get_goal" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        get_goal
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#set_goal" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        set_goal
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#set_north_star" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        set_north_star
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#set_sprint" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        set_sprint
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#set_decision" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        set_decision
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#sprint-items" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Sprint Items
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Sprint Items">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#add_sprint_item" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        add_sprint_item
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#complete_sprint_item" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        complete_sprint_item
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#fail_sprint_item" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        fail_sprint_item
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#skip_sprint_item" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        skip_sprint_item
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#push_sprint_item" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        push_sprint_item
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#get_sprint_items" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        get_sprint_items
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#handoff" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Handoff
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Handoff">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#generate_handoff" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        generate_handoff
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#project-management" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Project Management
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Project Management">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#create_project" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        create_project
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#list_projects" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        list_projects
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#worker-sessions" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Worker Sessions
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Worker Sessions">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#start_worker_session" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        start_worker_session
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#enqueue_claude_task" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        enqueue_claude_task
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#typical-session-pattern" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Typical Session Pattern
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../hosted/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Hosted (usemeridian.us)
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../self-hosting/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Self-Hosting
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../api-reference/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    API Reference
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+  </ul>
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+            
+              
+              <div class="md-sidebar md-sidebar--secondary" data-md-component="sidebar" data-md-type="toc" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#session-management" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Session Management
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Session Management">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#start_session" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        start_session
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#register_session" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        register_session
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#heartbeat" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        heartbeat
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#get_sessions" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        get_sessions
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#task-management" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Task Management
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Task Management">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#log_task" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        log_task
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#get_tasks" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        get_tasks
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#claim_task" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        claim_task
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#release_task" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        release_task
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#complete_task" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        complete_task
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#goal-management" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Goal Management
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Goal Management">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#get_goal" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        get_goal
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#set_goal" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        set_goal
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#set_north_star" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        set_north_star
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#set_sprint" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        set_sprint
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#set_decision" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        set_decision
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#sprint-items" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Sprint Items
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Sprint Items">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#add_sprint_item" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        add_sprint_item
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#complete_sprint_item" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        complete_sprint_item
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#fail_sprint_item" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        fail_sprint_item
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#skip_sprint_item" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        skip_sprint_item
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#push_sprint_item" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        push_sprint_item
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#get_sprint_items" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        get_sprint_items
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#handoff" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Handoff
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Handoff">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#generate_handoff" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        generate_handoff
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#project-management" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Project Management
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Project Management">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#create_project" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        create_project
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#list_projects" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        list_projects
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#worker-sessions" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Worker Sessions
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Worker Sessions">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#start_worker_session" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        start_worker_session
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#enqueue_claude_task" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        enqueue_claude_task
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#typical-session-pattern" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Typical Session Pattern
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+          
+          
+            <div class="md-content" data-md-component="content">
+              
+              <article class="md-content__inner md-typeset">
+                
+                  
+
+
+  
+  
+
+
+<h1 id="mcp-tools-reference">MCP Tools Reference<a class="headerlink" href="#mcp-tools-reference" title="Permanent link">&para;</a></h1>
+<p>All Meridian tools are available as MCP tools in Claude Code, Claude Desktop, Cursor, and Windsurf.
+Add Meridian to your MCP config and these tools appear automatically.</p>
+<hr />
+<h2 id="session-management">Session Management<a class="headerlink" href="#session-management" title="Permanent link">&para;</a></h2>
+<h3 id="start_session"><code>start_session</code><a class="headerlink" href="#start_session" title="Permanent link">&para;</a></h3>
+<p>Single call to start a coordinated session. Registers you, reads goal + ambient context, shows recent work, lists active sessions, and tells you where the handoff file is.</p>
+<p><strong>Use this INSTEAD of <code>register_session</code> + <code>get_goal</code> + <code>get_tasks</code> separately.</strong></p>
+<table>
+<thead>
+<tr>
+<th>Parameter</th>
+<th>Type</th>
+<th>Required</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>project_id</code></td>
+<td>string</td>
+<td>✓</td>
+<td>Project UUID to connect to</td>
+</tr>
+<tr>
+<td><code>session_name</code></td>
+<td>string</td>
+<td>✓</td>
+<td>Descriptive name for this session (e.g. <code>"v2.1-auth-fix"</code>)</td>
+</tr>
+<tr>
+<td><code>human_id</code></td>
+<td>string</td>
+<td>—</td>
+<td>Your identifier (e.g. <code>"alice"</code>). Groups sessions per person in the dashboard.</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Returns:</strong> <code>session_id</code>, <code>goal</code> (with <code>ambient_tasks</code>), <code>recent_tasks</code> (last 10), <code>active_sessions</code>, <code>handoff_exists</code>, <code>handoff_path</code>, <code>files</code></p>
+<p><strong>Example:</strong>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="p">{</span>
+<a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a><span class="w">  </span><span class="nt">&quot;project_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;5787cc92-ba7d-4788-b17c-28ab7938b839&quot;</span><span class="p">,</span>
+<a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a><span class="w">  </span><span class="nt">&quot;session_name&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;feature-rate-limiting&quot;</span><span class="p">,</span>
+<a id="__codelineno-0-4" name="__codelineno-0-4" href="#__codelineno-0-4"></a><span class="w">  </span><span class="nt">&quot;human_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;alice&quot;</span>
+<a id="__codelineno-0-5" name="__codelineno-0-5" href="#__codelineno-0-5"></a><span class="p">}</span>
+</code></pre></div></p>
+<hr />
+<h3 id="register_session"><code>register_session</code><a class="headerlink" href="#register_session" title="Permanent link">&para;</a></h3>
+<p>Register this Claude session with a project. Use when you need the <code>session_id</code> separately, or prefer the low-level flow. Normally, use <code>start_session</code> instead.</p>
+<table>
+<thead>
+<tr>
+<th>Parameter</th>
+<th>Type</th>
+<th>Required</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>project_id</code></td>
+<td>string</td>
+<td>✓</td>
+<td>Project UUID</td>
+</tr>
+<tr>
+<td><code>session_name</code></td>
+<td>string</td>
+<td>✓</td>
+<td>Descriptive name for this session</td>
+</tr>
+<tr>
+<td><code>human_id</code></td>
+<td>string</td>
+<td>—</td>
+<td>Your identifier</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Returns:</strong> Full session dict including <code>session_id</code>, <code>status</code>, <code>created_at</code>, <code>last_seen</code></p>
+<hr />
+<h3 id="heartbeat"><code>heartbeat</code><a class="headerlink" href="#heartbeat" title="Permanent link">&para;</a></h3>
+<p>Keep a long-running session alive. Long-running workers should call this every ~5 minutes between <code>log_task</code> calls to prevent idle expiry.</p>
+<table>
+<thead>
+<tr>
+<th>Parameter</th>
+<th>Type</th>
+<th>Required</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>project_id</code></td>
+<td>string</td>
+<td>✓</td>
+<td>Project UUID</td>
+</tr>
+<tr>
+<td><code>session_id</code></td>
+<td>string</td>
+<td>✓</td>
+<td>Your session ID</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Returns:</strong> <code>{"ok": true}</code></p>
+<hr />
+<h3 id="get_sessions"><code>get_sessions</code><a class="headerlink" href="#get_sessions" title="Permanent link">&para;</a></h3>
+<p>List all active sessions connected to this project — name, status, last_seen, and human_id.</p>
+<table>
+<thead>
+<tr>
+<th>Parameter</th>
+<th>Type</th>
+<th>Required</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>project_id</code></td>
+<td>string</td>
+<td>✓</td>
+<td>Project UUID</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Returns:</strong> List of session dicts</p>
+<hr />
+<h2 id="task-management">Task Management<a class="headerlink" href="#task-management" title="Permanent link">&para;</a></h2>
+<h3 id="log_task"><code>log_task</code><a class="headerlink" href="#log_task" title="Permanent link">&para;</a></h3>
+<p>Log what this session just did, is doing, or failed at. Call frequently to keep all sessions informed.</p>
+<table>
+<thead>
+<tr>
+<th>Parameter</th>
+<th>Type</th>
+<th>Required</th>
+<th>Description</th>
+<th>Example</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>session_id</code></td>
+<td>string</td>
+<td>✓</td>
+<td>Your session ID from <code>start_session</code></td>
+<td><code>"abc-123"</code></td>
+</tr>
+<tr>
+<td><code>project_id</code></td>
+<td>string</td>
+<td>✓</td>
+<td>Project UUID</td>
+<td><code>"5787cc92..."</code></td>
+</tr>
+<tr>
+<td><code>description</code></td>
+<td>string</td>
+<td>✓</td>
+<td>What you did / are doing</td>
+<td><code>"Fixed JWT refresh bug — tokens now rotated on use"</code></td>
+</tr>
+<tr>
+<td><code>status</code></td>
+<td>string</td>
+<td>—</td>
+<td><code>"done"</code> | <code>"pending"</code> | <code>"failed"</code></td>
+<td><code>"done"</code></td>
+</tr>
+</tbody>
+</table>
+<p><strong>Returns:</strong> Task dict with <code>id</code>, <code>description</code>, <code>status</code>, <code>created_at</code></p>
+<hr />
+<h3 id="get_tasks"><code>get_tasks</code><a class="headerlink" href="#get_tasks" title="Permanent link">&para;</a></h3>
+<p>Get recent tasks across all sessions — what everyone has done. Newest first.</p>
+<table>
+<thead>
+<tr>
+<th>Parameter</th>
+<th>Type</th>
+<th>Required</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>project_id</code></td>
+<td>string</td>
+<td>✓</td>
+<td>Project UUID</td>
+</tr>
+<tr>
+<td><code>limit</code></td>
+<td>integer</td>
+<td>—</td>
+<td>Max tasks to return (default: 20)</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Returns:</strong> List of task dicts with <code>session_id</code>, <code>description</code>, <code>status</code>, <code>created_at</code></p>
+<hr />
+<h3 id="claim_task"><code>claim_task</code><a class="headerlink" href="#claim_task" title="Permanent link">&para;</a></h3>
+<p>Atomically claim a pending task so no other session picks it up. Returns <code>claimed=True</code> on success or <code>claimed=False</code> (with the current holder) when another session already holds it.</p>
+<table>
+<thead>
+<tr>
+<th>Parameter</th>
+<th>Type</th>
+<th>Required</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>project_id</code></td>
+<td>string</td>
+<td>✓</td>
+<td>Project UUID</td>
+</tr>
+<tr>
+<td><code>task_id</code></td>
+<td>string</td>
+<td>✓</td>
+<td>ID of the pending task to claim</td>
+</tr>
+<tr>
+<td><code>session_id</code></td>
+<td>string</td>
+<td>✓</td>
+<td>Your session ID</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Returns:</strong> <code>{"claimed": true, "task": {...}}</code> or <code>{"claimed": false, "held_by": "session-name"}</code></p>
+<hr />
+<h3 id="release_task"><code>release_task</code><a class="headerlink" href="#release_task" title="Permanent link">&para;</a></h3>
+<p>Release a task previously claimed by this session, making it available for others.</p>
+<table>
+<thead>
+<tr>
+<th>Parameter</th>
+<th>Type</th>
+<th>Required</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>project_id</code></td>
+<td>string</td>
+<td>✓</td>
+<td>Project UUID</td>
+</tr>
+<tr>
+<td><code>task_id</code></td>
+<td>string</td>
+<td>✓</td>
+<td>ID of the claimed task</td>
+</tr>
+<tr>
+<td><code>session_id</code></td>
+<td>string</td>
+<td>✓</td>
+<td>Your session ID</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Returns:</strong> <code>{"success": true}</code> or <code>{"success": false}</code> (if you don't hold the claim)</p>
+<hr />
+<h3 id="complete_task"><code>complete_task</code><a class="headerlink" href="#complete_task" title="Permanent link">&para;</a></h3>
+<p>Mark a claimed task as done with an optional completion note.</p>
+<table>
+<thead>
+<tr>
+<th>Parameter</th>
+<th>Type</th>
+<th>Required</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>project_id</code></td>
+<td>string</td>
+<td>✓</td>
+<td>Project UUID</td>
+</tr>
+<tr>
+<td><code>task_id</code></td>
+<td>string</td>
+<td>✓</td>
+<td>ID of the task</td>
+</tr>
+<tr>
+<td><code>session_id</code></td>
+<td>string</td>
+<td>✓</td>
+<td>Your session ID</td>
+</tr>
+<tr>
+<td><code>note</code></td>
+<td>string</td>
+<td>—</td>
+<td>Completion note appended to the description</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Returns:</strong> Updated task dict</p>
+<hr />
+<h2 id="goal-management">Goal Management<a class="headerlink" href="#goal-management" title="Permanent link">&para;</a></h2>
+<h3 id="get_goal"><code>get_goal</code><a class="headerlink" href="#get_goal" title="Permanent link">&para;</a></h3>
+<p>Read the current goal state plus ambient context. Returns all three goal levels (north_star, version goal, sprint) plus the last 5 task descriptions.</p>
+<p><strong>Read this after <code>start_session</code> if you need to refresh the goal.</strong></p>
+<table>
+<thead>
+<tr>
+<th>Parameter</th>
+<th>Type</th>
+<th>Required</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>project_id</code></td>
+<td>string</td>
+<td>✓</td>
+<td>Project UUID</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Returns:</strong>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a><span class="p">{</span>
+<a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a><span class="w">  </span><span class="nt">&quot;north_star&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;Long-term vision...&quot;</span><span class="p">,</span>
+<a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a><span class="w">  </span><span class="nt">&quot;content&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;CURRENT FOCUS:\n...&quot;</span><span class="p">,</span>
+<a id="__codelineno-1-4" name="__codelineno-1-4" href="#__codelineno-1-4"></a><span class="w">  </span><span class="nt">&quot;sprint&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;v2.3 — rate limiting + tests&quot;</span><span class="p">,</span>
+<a id="__codelineno-1-5" name="__codelineno-1-5" href="#__codelineno-1-5"></a><span class="w">  </span><span class="nt">&quot;version&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">42</span><span class="p">,</span>
+<a id="__codelineno-1-6" name="__codelineno-1-6" href="#__codelineno-1-6"></a><span class="w">  </span><span class="nt">&quot;ambient_tasks&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="s2">&quot;Fixed auth bug&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;Added caching&quot;</span><span class="p">,</span><span class="w"> </span><span class="err">...</span><span class="p">]</span>
+<a id="__codelineno-1-7" name="__codelineno-1-7" href="#__codelineno-1-7"></a><span class="p">}</span>
+</code></pre></div></p>
+<hr />
+<h3 id="set_goal"><code>set_goal</code><a class="headerlink" href="#set_goal" title="Permanent link">&para;</a></h3>
+<p>Set or update the version goal (content). All sessions see the change immediately. Version increments on each update.</p>
+<table>
+<thead>
+<tr>
+<th>Parameter</th>
+<th>Type</th>
+<th>Required</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>project_id</code></td>
+<td>string</td>
+<td>✓</td>
+<td>Project UUID</td>
+</tr>
+<tr>
+<td><code>content</code></td>
+<td>string | object</td>
+<td>✓</td>
+<td>The new version goal content</td>
+</tr>
+<tr>
+<td><code>north_star</code></td>
+<td>string</td>
+<td>—</td>
+<td>Optionally update the north star at the same time</td>
+</tr>
+<tr>
+<td><code>sprint</code></td>
+<td>string</td>
+<td>—</td>
+<td>Optionally update the sprint at the same time</td>
+</tr>
+<tr>
+<td><code>minor</code></td>
+<td>boolean</td>
+<td>—</td>
+<td><code>true</code> = update in place without bumping version (for AUTO BLOCKS)</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Returns:</strong> Updated goal state dict</p>
+<hr />
+<h3 id="set_north_star"><code>set_north_star</code><a class="headerlink" href="#set_north_star" title="Permanent link">&para;</a></h3>
+<p>Update only the north star — the long-lived product vision. Owner-only: pass the <code>human_id</code> used when creating the project.</p>
+<table>
+<thead>
+<tr>
+<th>Parameter</th>
+<th>Type</th>
+<th>Required</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>project_id</code></td>
+<td>string</td>
+<td>✓</td>
+<td>Project UUID</td>
+</tr>
+<tr>
+<td><code>north_star</code></td>
+<td>string</td>
+<td>✓</td>
+<td>New north star text</td>
+</tr>
+<tr>
+<td><code>human_id</code></td>
+<td>string</td>
+<td>✓</td>
+<td>Owner identifier (must match project creator)</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Returns:</strong> Updated goal state dict</p>
+<hr />
+<h3 id="set_sprint"><code>set_sprint</code><a class="headerlink" href="#set_sprint" title="Permanent link">&para;</a></h3>
+<p>Update only the sprint — the short-term focus. Any team member can call this.</p>
+<table>
+<thead>
+<tr>
+<th>Parameter</th>
+<th>Type</th>
+<th>Required</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>project_id</code></td>
+<td>string</td>
+<td>✓</td>
+<td>Project UUID</td>
+</tr>
+<tr>
+<td><code>sprint</code></td>
+<td>string</td>
+<td>✓</td>
+<td>New sprint description (e.g. <code>"v2.3 week of June 2 — auth + caching"</code>)</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Returns:</strong> Updated goal state dict</p>
+<hr />
+<h3 id="set_decision"><code>set_decision</code><a class="headerlink" href="#set_decision" title="Permanent link">&para;</a></h3>
+<p>Append a decision entry to the project's append-only decisions log. Each entry is date-stamped automatically.</p>
+<table>
+<thead>
+<tr>
+<th>Parameter</th>
+<th>Type</th>
+<th>Required</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>project_id</code></td>
+<td>string</td>
+<td>✓</td>
+<td>Project UUID</td>
+</tr>
+<tr>
+<td><code>text</code></td>
+<td>string</td>
+<td>✓</td>
+<td>Decision text (e.g. <code>"Chose Redis over Memcached — better pub/sub for cache invalidation"</code>)</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Returns:</strong> Updated goal state dict</p>
+<hr />
+<h2 id="sprint-items">Sprint Items<a class="headerlink" href="#sprint-items" title="Permanent link">&para;</a></h2>
+<h3 id="add_sprint_item"><code>add_sprint_item</code><a class="headerlink" href="#add_sprint_item" title="Permanent link">&para;</a></h3>
+<p>Append a todo item to the project's sprint board. Use when starting a new version so the next session sees what's in flight.</p>
+<table>
+<thead>
+<tr>
+<th>Parameter</th>
+<th>Type</th>
+<th>Required</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>project_id</code></td>
+<td>string</td>
+<td>✓</td>
+<td>Project UUID</td>
+</tr>
+<tr>
+<td><code>version</code></td>
+<td>string</td>
+<td>✓</td>
+<td>Version this item belongs to (e.g. <code>"v2.2"</code>)</td>
+</tr>
+<tr>
+<td><code>title</code></td>
+<td>string</td>
+<td>✓</td>
+<td>What needs to get done</td>
+</tr>
+<tr>
+<td><code>group</code></td>
+<td>string</td>
+<td>—</td>
+<td>Objective group name (e.g. <code>"Auth"</code>)</td>
+</tr>
+<tr>
+<td><code>human_id</code></td>
+<td>string</td>
+<td>—</td>
+<td>Person this is assigned to</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Returns:</strong> New sprint item dict with <code>id</code>, <code>title</code>, <code>version</code>, <code>status: "pending"</code></p>
+<hr />
+<h3 id="complete_sprint_item"><code>complete_sprint_item</code><a class="headerlink" href="#complete_sprint_item" title="Permanent link">&para;</a></h3>
+<p>Mark a sprint item done.</p>
+<table>
+<thead>
+<tr>
+<th>Parameter</th>
+<th>Type</th>
+<th>Required</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>project_id</code></td>
+<td>string</td>
+<td>✓</td>
+<td>Project UUID</td>
+</tr>
+<tr>
+<td><code>item_id</code></td>
+<td>string</td>
+<td>✓</td>
+<td>Sprint item UUID</td>
+</tr>
+<tr>
+<td><code>task_id</code></td>
+<td>string</td>
+<td>—</td>
+<td>Link the task that shipped it</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Returns:</strong> Updated item dict</p>
+<hr />
+<h3 id="fail_sprint_item"><code>fail_sprint_item</code><a class="headerlink" href="#fail_sprint_item" title="Permanent link">&para;</a></h3>
+<p>Mark a sprint item failed — attempted but could not be shipped.</p>
+<table>
+<thead>
+<tr>
+<th>Parameter</th>
+<th>Type</th>
+<th>Required</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>project_id</code></td>
+<td>string</td>
+<td>✓</td>
+<td>Project UUID</td>
+</tr>
+<tr>
+<td><code>item_id</code></td>
+<td>string</td>
+<td>✓</td>
+<td>Sprint item UUID</td>
+</tr>
+<tr>
+<td><code>reason</code></td>
+<td>string</td>
+<td>—</td>
+<td>One-line explanation of what went wrong</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Returns:</strong> Updated item dict</p>
+<hr />
+<h3 id="skip_sprint_item"><code>skip_sprint_item</code><a class="headerlink" href="#skip_sprint_item" title="Permanent link">&para;</a></h3>
+<p>Mark a sprint item skipped — intentionally not shipped this sprint.</p>
+<table>
+<thead>
+<tr>
+<th>Parameter</th>
+<th>Type</th>
+<th>Required</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>project_id</code></td>
+<td>string</td>
+<td>✓</td>
+<td>Project UUID</td>
+</tr>
+<tr>
+<td><code>item_id</code></td>
+<td>string</td>
+<td>✓</td>
+<td>Sprint item UUID</td>
+</tr>
+<tr>
+<td><code>reason</code></td>
+<td>string</td>
+<td>—</td>
+<td>Why it was skipped</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Returns:</strong> Updated item dict</p>
+<hr />
+<h3 id="push_sprint_item"><code>push_sprint_item</code><a class="headerlink" href="#push_sprint_item" title="Permanent link">&para;</a></h3>
+<p>Push a sprint item to a future version when scope creep means it won't fit this sprint.</p>
+<table>
+<thead>
+<tr>
+<th>Parameter</th>
+<th>Type</th>
+<th>Required</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>project_id</code></td>
+<td>string</td>
+<td>✓</td>
+<td>Project UUID</td>
+</tr>
+<tr>
+<td><code>item_id</code></td>
+<td>string</td>
+<td>✓</td>
+<td>Sprint item UUID</td>
+</tr>
+<tr>
+<td><code>to_version</code></td>
+<td>string</td>
+<td>✓</td>
+<td>Target version (e.g. <code>"v2.3"</code>)</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Returns:</strong> Updated item dict with <code>status: "pushed"</code></p>
+<hr />
+<h3 id="get_sprint_items"><code>get_sprint_items</code><a class="headerlink" href="#get_sprint_items" title="Permanent link">&para;</a></h3>
+<p>List sprint items for a project. Cold sessions read this to know what's still owed.</p>
+<table>
+<thead>
+<tr>
+<th>Parameter</th>
+<th>Type</th>
+<th>Required</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>project_id</code></td>
+<td>string</td>
+<td>✓</td>
+<td>Project UUID</td>
+</tr>
+<tr>
+<td><code>status</code></td>
+<td>string</td>
+<td>—</td>
+<td>Filter: <code>todo</code> | <code>pending</code> | <code>in_progress</code> | <code>done</code> | <code>failed</code> | <code>skipped</code> | <code>pushed</code></td>
+</tr>
+</tbody>
+</table>
+<p><strong>Returns:</strong> List of sprint item dicts</p>
+<hr />
+<h2 id="handoff">Handoff<a class="headerlink" href="#handoff" title="Permanent link">&para;</a></h2>
+<h3 id="generate_handoff"><code>generate_handoff</code><a class="headerlink" href="#generate_handoff" title="Permanent link">&para;</a></h3>
+<p>Generate a context handoff file. Call when context is filling up or before ending a session. A new session reads this file to resume with full context.</p>
+<table>
+<thead>
+<tr>
+<th>Parameter</th>
+<th>Type</th>
+<th>Required</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>project_id</code></td>
+<td>string</td>
+<td>✓</td>
+<td>Project UUID</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Returns:</strong>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a><span class="p">{</span>
+<a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a><span class="w">  </span><span class="nt">&quot;file_path&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;data/my-project_handoff.md&quot;</span><span class="p">,</span>
+<a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a><span class="w">  </span><span class="nt">&quot;content&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;---\nMERIDIAN_CONTEXT\n...&quot;</span>
+<a id="__codelineno-2-4" name="__codelineno-2-4" href="#__codelineno-2-4"></a><span class="p">}</span>
+</code></pre></div></p>
+<p><strong>Usage pattern:</strong>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a># When context is getting full:
+<a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a>generate_handoff(project_id=&quot;...&quot;)
+<a id="__codelineno-3-3" name="__codelineno-3-3" href="#__codelineno-3-3"></a># → &quot;data/my-project_handoff.md&quot;
+<a id="__codelineno-3-4" name="__codelineno-3-4" href="#__codelineno-3-4"></a>
+<a id="__codelineno-3-5" name="__codelineno-3-5" href="#__codelineno-3-5"></a># Start a new Claude Code session, then:
+<a id="__codelineno-3-6" name="__codelineno-3-6" href="#__codelineno-3-6"></a># &quot;Read data/my-project_handoff.md and continue from where I left off.&quot;
+</code></pre></div></p>
+<hr />
+<h2 id="project-management">Project Management<a class="headerlink" href="#project-management" title="Permanent link">&para;</a></h2>
+<h3 id="create_project"><code>create_project</code><a class="headerlink" href="#create_project" title="Permanent link">&para;</a></h3>
+<p>Create a new Meridian project. Project names must be unique.</p>
+<table>
+<thead>
+<tr>
+<th>Parameter</th>
+<th>Type</th>
+<th>Required</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>name</code></td>
+<td>string</td>
+<td>✓</td>
+<td>Project name (e.g. <code>"backend-api"</code>)</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Returns:</strong> <code>{"id": "uuid", "name": "backend-api", "created_at": "..."}</code></p>
+<hr />
+<h3 id="list_projects"><code>list_projects</code><a class="headerlink" href="#list_projects" title="Permanent link">&para;</a></h3>
+<p>List all Meridian projects. Use this to find a <code>project_id</code> by name.</p>
+<p>No parameters required.</p>
+<p><strong>Returns:</strong> <code>[{id, name, created_at}]</code> newest first</p>
+<hr />
+<h2 id="worker-sessions">Worker Sessions<a class="headerlink" href="#worker-sessions" title="Permanent link">&para;</a></h2>
+<h3 id="start_worker_session"><code>start_worker_session</code><a class="headerlink" href="#start_worker_session" title="Permanent link">&para;</a></h3>
+<p>Register a worker session and claim its task in one call. Returns a slim <code>worker_context</code> XML block (&lt; 500 tokens) with only what the worker needs. Use for Claude Code subprocess workers spawned by <code>enqueue_claude_task</code>.</p>
+<table>
+<thead>
+<tr>
+<th>Parameter</th>
+<th>Type</th>
+<th>Required</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>project_id</code></td>
+<td>string</td>
+<td>✓</td>
+<td>Project UUID</td>
+</tr>
+<tr>
+<td><code>task_id</code></td>
+<td>string</td>
+<td>—</td>
+<td>Specific task to claim. If omitted, claims the oldest unclaimed pending task.</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Returns:</strong> Slim worker context XML: <code>version_goal</code>, claimed task, <code>repo</code>, <code>test_cmd</code>, <code>commit_pattern</code>, <code>done_when</code></p>
+<hr />
+<h3 id="enqueue_claude_task"><code>enqueue_claude_task</code><a class="headerlink" href="#enqueue_claude_task" title="Permanent link">&para;</a></h3>
+<p>Queue a long-running Claude Code subprocess without blocking this session. Returns immediately with a <code>pending</code> task row; the worker writes its result back when it finishes.</p>
+<table>
+<thead>
+<tr>
+<th>Parameter</th>
+<th>Type</th>
+<th>Required</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>session_id</code></td>
+<td>string</td>
+<td>✓</td>
+<td>Your session ID</td>
+</tr>
+<tr>
+<td><code>project_id</code></td>
+<td>string</td>
+<td>✓</td>
+<td>Project UUID</td>
+</tr>
+<tr>
+<td><code>prompt</code></td>
+<td>string</td>
+<td>✓</td>
+<td>The prompt/task description for the worker</td>
+</tr>
+<tr>
+<td><code>timeout</code></td>
+<td>number</td>
+<td>—</td>
+<td>Seconds before the worker is killed (default: 600). Pass 0 to disable.</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Returns:</strong> Task dict with <code>status: "pending"</code> — poll <code>get_tasks</code> to see when it becomes <code>done</code> or <code>failed</code></p>
+<hr />
+<h2 id="typical-session-pattern">Typical Session Pattern<a class="headerlink" href="#typical-session-pattern" title="Permanent link">&para;</a></h2>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a><span class="c1"># 1. Start session — loads everything in one call</span>
+<a id="__codelineno-4-2" name="__codelineno-4-2" href="#__codelineno-4-2"></a><span class="n">ctx</span> <span class="o">=</span> <span class="n">start_session</span><span class="p">(</span>
+<a id="__codelineno-4-3" name="__codelineno-4-3" href="#__codelineno-4-3"></a>    <span class="n">project_id</span><span class="o">=</span><span class="s2">&quot;...&quot;</span><span class="p">,</span>
+<a id="__codelineno-4-4" name="__codelineno-4-4" href="#__codelineno-4-4"></a>    <span class="n">session_name</span><span class="o">=</span><span class="s2">&quot;auth-refactor&quot;</span><span class="p">,</span>
+<a id="__codelineno-4-5" name="__codelineno-4-5" href="#__codelineno-4-5"></a>    <span class="n">human_id</span><span class="o">=</span><span class="s2">&quot;alice&quot;</span>
+<a id="__codelineno-4-6" name="__codelineno-4-6" href="#__codelineno-4-6"></a><span class="p">)</span>
+<a id="__codelineno-4-7" name="__codelineno-4-7" href="#__codelineno-4-7"></a><span class="n">session_id</span> <span class="o">=</span> <span class="n">ctx</span><span class="p">[</span><span class="s2">&quot;session_id&quot;</span><span class="p">]</span>
+<a id="__codelineno-4-8" name="__codelineno-4-8" href="#__codelineno-4-8"></a>
+<a id="__codelineno-4-9" name="__codelineno-4-9" href="#__codelineno-4-9"></a><span class="c1"># 2. Check what&#39;s pending</span>
+<a id="__codelineno-4-10" name="__codelineno-4-10" href="#__codelineno-4-10"></a><span class="n">items</span> <span class="o">=</span> <span class="n">get_sprint_items</span><span class="p">(</span><span class="n">project_id</span><span class="o">=</span><span class="s2">&quot;...&quot;</span><span class="p">,</span> <span class="n">status</span><span class="o">=</span><span class="s2">&quot;pending&quot;</span><span class="p">)</span>
+<a id="__codelineno-4-11" name="__codelineno-4-11" href="#__codelineno-4-11"></a>
+<a id="__codelineno-4-12" name="__codelineno-4-12" href="#__codelineno-4-12"></a><span class="c1"># 3. Claim a task so nobody else picks it up</span>
+<a id="__codelineno-4-13" name="__codelineno-4-13" href="#__codelineno-4-13"></a><span class="n">claim_task</span><span class="p">(</span><span class="n">project_id</span><span class="o">=</span><span class="s2">&quot;...&quot;</span><span class="p">,</span> <span class="n">task_id</span><span class="o">=</span><span class="n">items</span><span class="p">[</span><span class="mi">0</span><span class="p">][</span><span class="s2">&quot;id&quot;</span><span class="p">],</span> <span class="n">session_id</span><span class="o">=</span><span class="n">session_id</span><span class="p">)</span>
+<a id="__codelineno-4-14" name="__codelineno-4-14" href="#__codelineno-4-14"></a>
+<a id="__codelineno-4-15" name="__codelineno-4-15" href="#__codelineno-4-15"></a><span class="c1"># 4. Work... log progress</span>
+<a id="__codelineno-4-16" name="__codelineno-4-16" href="#__codelineno-4-16"></a><span class="n">log_task</span><span class="p">(</span><span class="n">session_id</span><span class="o">=</span><span class="n">session_id</span><span class="p">,</span> <span class="n">project_id</span><span class="o">=</span><span class="s2">&quot;...&quot;</span><span class="p">,</span>
+<a id="__codelineno-4-17" name="__codelineno-4-17" href="#__codelineno-4-17"></a>  <span class="n">description</span><span class="o">=</span><span class="s2">&quot;Extracted auth module — 847 lines → 3 focused classes&quot;</span><span class="p">,</span>
+<a id="__codelineno-4-18" name="__codelineno-4-18" href="#__codelineno-4-18"></a>  <span class="n">status</span><span class="o">=</span><span class="s2">&quot;done&quot;</span><span class="p">)</span>
+<a id="__codelineno-4-19" name="__codelineno-4-19" href="#__codelineno-4-19"></a>
+<a id="__codelineno-4-20" name="__codelineno-4-20" href="#__codelineno-4-20"></a><span class="c1"># 5. Complete the sprint item</span>
+<a id="__codelineno-4-21" name="__codelineno-4-21" href="#__codelineno-4-21"></a><span class="n">complete_sprint_item</span><span class="p">(</span><span class="n">project_id</span><span class="o">=</span><span class="s2">&quot;...&quot;</span><span class="p">,</span> <span class="n">item_id</span><span class="o">=</span><span class="n">items</span><span class="p">[</span><span class="mi">0</span><span class="p">][</span><span class="s2">&quot;id&quot;</span><span class="p">])</span>
+<a id="__codelineno-4-22" name="__codelineno-4-22" href="#__codelineno-4-22"></a>
+<a id="__codelineno-4-23" name="__codelineno-4-23" href="#__codelineno-4-23"></a><span class="c1"># 6. When context fills up, generate handoff</span>
+<a id="__codelineno-4-24" name="__codelineno-4-24" href="#__codelineno-4-24"></a><span class="n">generate_handoff</span><span class="p">(</span><span class="n">project_id</span><span class="o">=</span><span class="s2">&quot;...&quot;</span><span class="p">)</span>
+</code></pre></div>
+
+
+
+
+
+
+
+
+
+  
+
+
+
+
+                
+              </article>
+            </div>
+          
+          
+<script>var target=document.getElementById(location.hash.slice(1));target&&target.name&&(target.checked=target.name.startsWith("__tabbed_"))</script>
+        </div>
+        
+          <button type="button" class="md-top md-icon" data-md-component="top" hidden>
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M13 20h-2V8l-5.5 5.5-1.42-1.42L12 4.16l7.92 7.92-1.42 1.42L13 8z"/></svg>
+  Back to top
+</button>
+        
+      </main>
+      
+        <footer class="md-footer">
+  
+  <div class="md-footer-meta md-typeset">
+    <div class="md-footer-meta__inner md-grid">
+      <div class="md-copyright">
+  
+  
+    Made with
+    <a href="https://squidfunk.github.io/mkdocs-material/" target="_blank" rel="noopener">
+      Material for MkDocs
+    </a>
+  
+</div>
+      
+        
+<div class="md-social">
+  
+    
+    
+    
+    
+      
+      
+    
+    <a href="https://github.com/meridianmcp/Meridian" target="_blank" rel="noopener" title="github.com" class="md-social__link">
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M173.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6m-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3m44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9M252.8 8C114.1 8 8 113.3 8 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C436.2 457.8 504 362.9 504 252 504 113.3 391.5 8 252.8 8M105.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1m-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7m32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1m-11.4-14.7c-1.6 1-1.6 3.6 0 5.9s4.3 3.3 5.6 2.3c1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2"/></svg>
+    </a>
+  
+    
+    
+    
+    
+    <a href="mailto:hello@usemeridian.us" target="_blank" rel="noopener" title="" class="md-social__link">
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M48 64C21.5 64 0 85.5 0 112c0 15.1 7.1 29.3 19.2 38.4l208 156a48 48 0 0 0 57.6 0l208-156c12.1-9.1 19.2-23.3 19.2-38.4 0-26.5-21.5-48-48-48zM0 196v188c0 35.3 28.7 64 64 64h384c35.3 0 64-28.7 64-64V196L313.6 344.8c-34.1 25.6-81.1 25.6-115.2 0z"/></svg>
+    </a>
+  
+</div>
+      
+    </div>
+  </div>
+</footer>
+      
+    </div>
+    <div class="md-dialog" data-md-component="dialog">
+      <div class="md-dialog__inner md-typeset"></div>
+    </div>
+    
+    
+    
+      
+      
+      <script id="__config" type="application/json">{"annotate": null, "base": "..", "features": ["navigation.tabs", "navigation.sections", "navigation.expand", "navigation.top", "search.suggest", "search.highlight", "content.code.copy", "content.code.annotate"], "search": "../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
+    
+    
+      <script src="../assets/javascripts/bundle.79ae519e.min.js"></script>
+      
+    
+  </body>
+</html>
