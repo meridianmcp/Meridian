@@ -426,9 +426,10 @@ async def lifespan(app: FastAPI):
     app.state.data_dir = str(data_dir)
     app.state.ws_broadcaster = dashboard_module.WebSocketBroadcaster()
 
-    # v2.2 — isolated demo DB from MERIDIAN_DEMO_DB_URL (separate Neon project).
+    # v2.2 — isolated demo DB.
+    # Priority: MERIDIAN_DEMO_DB_URL (separate Neon) → in-memory SQLite fallback.
     # Always wipe-and-reseed on startup so the demo is always fresh.
-    # Falls back to main DB (legacy MERIDIAN_DEMO=true) if no separate URL.
+    # NEVER falls through to production DB.
     demo_db_url = os.environ.get("MERIDIAN_DEMO_DB_URL")
     if demo_db_url:
         try:
@@ -436,15 +437,22 @@ async def lifespan(app: FastAPI):
             app.state.demo_db = demo_db
             await _seed_demo_data(demo_db)
         except Exception:  # noqa: BLE001
-            app.state.demo_db = None
-    else:
-        app.state.demo_db = None
-        # Legacy: MERIDIAN_DEMO=true seeds main DB (dev only, not for production)
-        if os.environ.get("MERIDIAN_DEMO", "").lower() in ("1", "true", "yes"):
+            # Neon demo DB failed — fall back to in-memory so prod is never exposed
             try:
-                await _seed_demo_data(db)
+                demo_db = await db_module.init_db(":memory:")
+                app.state.demo_db = demo_db
+                await _seed_demo_data(demo_db)
             except Exception:  # noqa: BLE001
-                pass
+                app.state.demo_db = None
+    else:
+        # No separate demo URL — always use isolated in-memory SQLite.
+        # This is safe on Fly.io: resets on every deploy (demo stays fresh).
+        try:
+            demo_db = await db_module.init_db(":memory:")
+            app.state.demo_db = demo_db
+            await _seed_demo_data(demo_db)
+        except Exception:  # noqa: BLE001
+            app.state.demo_db = None
 
     # v0.4.2 — periodic auto-summary task. Interval comes from env so
     # tests can run it on a sub-second cadence; default is ten minutes.
