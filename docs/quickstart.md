@@ -19,7 +19,7 @@ Get Meridian running and connected to Claude Code in under 10 minutes.
     [pixi](https://pixi.sh) is the fastest way to install Meridian with all dependencies locked.
 
     ```bash
-    git clone https://github.com/ajc3xc/Meridian
+    git clone https://github.com/meridianmcp/Meridian
     cd Meridian
     pixi install
     ```
@@ -33,7 +33,7 @@ Get Meridian running and connected to Claude Code in under 10 minutes.
 === "pip"
 
     ```bash
-    git clone https://github.com/ajc3xc/Meridian
+    git clone https://github.com/meridianmcp/Meridian
     cd Meridian
     pip install -e ".[full]"
     python -m meridian
@@ -43,7 +43,7 @@ Get Meridian running and connected to Claude Code in under 10 minutes.
 === "Docker Compose"
 
     ```bash
-    git clone https://github.com/ajc3xc/Meridian
+    git clone https://github.com/meridianmcp/Meridian
     cd Meridian
     docker compose up
     # → Meridian running on http://localhost:7878

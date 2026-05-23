@@ -2,8 +2,8 @@
 
 **Shared memory for your AI sessions.**
 
-[![GitHub](https://img.shields.io/github/stars/ajc3xc/Meridian?style=social)](https://github.com/ajc3xc/Meridian)
-[![License](https://img.shields.io/badge/license-MSL--2.0-blue)](https://github.com/ajc3xc/Meridian/blob/main/LICENSE)
+[![GitHub](https://img.shields.io/github/stars/meridianmcp/Meridian?style=social)](https://github.com/meridianmcp/Meridian)
+[![License](https://img.shields.io/badge/license-MSL--2.0-blue)](https://github.com/meridianmcp/Meridian/blob/main/LICENSE)
 
 ---
 
@@ -71,7 +71,7 @@ For **hosted tier** (usemeridian.us), Meridian runs in the cloud and each worksp
 
 === "pixi (recommended)"
     ```bash
-    git clone https://github.com/ajc3xc/Meridian
+    git clone https://github.com/meridianmcp/Meridian
     cd Meridian
     pixi install
     pixi run start
@@ -79,7 +79,7 @@ For **hosted tier** (usemeridian.us), Meridian runs in the cloud and each worksp
 
 === "pip"
     ```bash
-    git clone https://github.com/ajc3xc/Meridian
+    git clone https://github.com/meridianmcp/Meridian
     cd Meridian
     pip install -e .
     python -m meridian
@@ -87,7 +87,7 @@ For **hosted tier** (usemeridian.us), Meridian runs in the cloud and each worksp
 
 === "Docker"
     ```bash
-    git clone https://github.com/ajc3xc/Meridian
+    git clone https://github.com/meridianmcp/Meridian
     cd Meridian
     docker compose up
     ```

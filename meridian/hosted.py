@@ -679,7 +679,7 @@ async def send_welcome_email(
 <pre>{mcp_snippet}</pre>
 <p><strong>Keep your token private.</strong> It grants full access to your Meridian projects.</p>
 <p>Dashboard: <a href="{base}/dashboard">{base}/dashboard</a></p>
-<p>Docs: <a href="https://ajc3xc.github.io/Meridian/">ajc3xc.github.io/Meridian</a></p>
+<p>Docs: <a href="https://docs.usemeridian.us">docs.usemeridian.us</a></p>
 <p>Questions? Reply to this email or contact <a href="mailto:hello@usemeridian.us">hello@usemeridian.us</a>.</p>"""
 
     async with httpx.AsyncClient(timeout=15) as http:

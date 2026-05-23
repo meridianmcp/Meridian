@@ -14,7 +14,7 @@ The simplest production-ready setup. Persists data to a local volume.
 ### Setup
 
 ```bash
-git clone https://github.com/ajc3xc/Meridian
+git clone https://github.com/meridianmcp/Meridian
 cd Meridian
 ```
 
@@ -68,7 +68,7 @@ docker compose down && docker compose up -d
 Best for local development and testing.
 
 ```bash
-git clone https://github.com/ajc3xc/Meridian
+git clone https://github.com/meridianmcp/Meridian
 cd Meridian
 pixi install
 pixi run start
@@ -89,7 +89,7 @@ pixi run dev
 For environments where pixi isn't available.
 
 ```bash
-git clone https://github.com/ajc3xc/Meridian
+git clone https://github.com/meridianmcp/Meridian
 cd Meridian
 python -m venv .venv
 source .venv/bin/activate   # Windows: .venv\Scripts\activate

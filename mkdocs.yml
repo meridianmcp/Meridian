@@ -1,8 +1,8 @@
 site_name: Meridian
 site_description: Shared memory for your AI sessions — MCP server for Claude, Cursor, Windsurf
-site_url: https://ajc3xc.github.io/Meridian/
-repo_url: https://github.com/ajc3xc/Meridian
-repo_name: ajc3xc/Meridian
+site_url: https://docs.usemeridian.us
+repo_url: https://github.com/meridianmcp/Meridian
+repo_name: meridianmcp/Meridian
 edit_uri: edit/main/docs/
 
 theme:
@@ -58,7 +58,7 @@ markdown_extensions:
 extra:
   social:
     - icon: fontawesome/brands/github
-      link: https://github.com/ajc3xc/Meridian
+      link: https://github.com/meridianmcp/Meridian
     - icon: fontawesome/solid/envelope
       link: mailto:hello@usemeridian.us
   analytics:

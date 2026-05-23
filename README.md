@@ -1,7 +1,7 @@
 # Meridian
 
 [![License: MSL-2.0](https://img.shields.io/badge/license-MSL--2.0-blue)](LICENSE)
-[![Docs](https://img.shields.io/badge/docs-ajc3xc.github.io%2FMeridian-6c8fff)](https://ajc3xc.github.io/Meridian/)
+[![Docs](https://img.shields.io/badge/docs-docs.usemeridian.us-6c8fff)](https://docs.usemeridian.us)
 [![Fly.io](https://img.shields.io/badge/hosted-usemeridian.us-a78bfa)](https://usemeridian.us)
 [![Neon](https://img.shields.io/badge/DB-Neon_Postgres-00e599)](https://neon.tech)
 
@@ -32,13 +32,13 @@ from a compressed handoff.
 
 ### Option A — single executable (Windows, no Python required)
 
-Download `meridian.exe` from [Releases](https://github.com/ajc3xc/Meridian/releases).
+Download `meridian.exe` from [Releases](https://github.com/meridianmcp/Meridian/releases).
 Double-click. Dashboard opens at `http://localhost:7878`.
 
 ### Option B — Docker (no Python required)
 
 ```bash
-git clone https://github.com/ajc3xc/Meridian
+git clone https://github.com/meridianmcp/Meridian
 cd Meridian
 docker compose up
 ```
@@ -49,7 +49,7 @@ Dashboard at `http://localhost:7878`. Data persists in `./data/`.
 
 ```bash
 # Requires pixi — https://prefix.dev
-git clone https://github.com/ajc3xc/Meridian
+git clone https://github.com/meridianmcp/Meridian
 cd Meridian
 pixi run start       # dashboard at http://localhost:7878
 ```
@@ -162,7 +162,7 @@ Questions: [hello@usemeridian.us](mailto:hello@usemeridian.us)
 
 ## Contributors
 
-[![Contributors](https://contrib.rocks/image?repo=ajc3xc/Meridian)](https://github.com/ajc3xc/Meridian/graphs/contributors)
+[![Contributors](https://contrib.rocks/image?repo=meridianmcp/Meridian)](https://github.com/meridianmcp/Meridian/graphs/contributors)
 
 ## License
 
