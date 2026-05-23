@@ -11,7 +11,26 @@
       "Bash(git add *)",
       "Bash(git commit -m ' *)",
       "Bash(git push *)",
-      "mcp__meridian__get_goal"
+      "mcp__meridian__get_goal",
+      "mcp__meridian__set_sprint",
+      "PowerShell(Get-Process | Where-Object { $_.Name -eq \"pytest\" } | Measure-Object | Select-Object Count)",
+      "Bash(python -m pytest tests/ -x -q --tb=short)",
+      "Bash(cat \"/mnt/c/Users/13144/AppData/Local/Temp/claude/C--Users-13144-Documents-Meridian-repository/c65a8946-b4b3-4486-9bf3-f7c1e3e917d6/tasks/bndp9qg21.output\" 2>&1 | tail -10)",
+      "Bash(PowerShell -Command \"Get-Content 'C:\\\\Users\\\\13144\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\C--Users-13144-Documents-Meridian-repository\\\\c65a8946-b4b3-4486-9bf3-f7c1e3e917d6\\\\tasks\\\\bndp9qg21.output'\")",
+      "Bash(PowerShell -Command \"Start-Sleep -Seconds 15; Get-Content 'C:\\\\Users\\\\13144\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\C--Users-13144-Documents-Meridian-repository\\\\c65a8946-b4b3-4486-9bf3-f7c1e3e917d6\\\\tasks\\\\bndp9qg21.output'\")",
+      "Bash(PowerShell -Command \"Get-Content 'C:\\\\Users\\\\13144\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\C--Users-13144-Documents-Meridian-repository\\\\c65a8946-b4b3-4486-9bf3-f7c1e3e917d6\\\\tasks\\\\byzykm7cv.output' | Select-Object -Last 5\")",
+      "Bash(PowerShell -Command \"Get-Content 'C:\\\\Users\\\\13144\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\C--Users-13144-Documents-Meridian-repository\\\\c65a8946-b4b3-4486-9bf3-f7c1e3e917d6\\\\tasks\\\\b7c51vihz.output' | Select-Object -Last 5\")",
+      "Bash(fly deploy *)",
+      "Bash(fly logs *)",
+      "Bash(PowerShell -Command \"Start-Sleep -Seconds 5; Get-Content 'C:\\\\Users\\\\13144\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\C--Users-13144-Documents-Meridian-repository\\\\c65a8946-b4b3-4486-9bf3-f7c1e3e917d6\\\\tasks\\\\ba2m1zsid.output'\")",
+      "Bash(fly ssh *)",
+      "Bash(PowerShell -Command \"Start-Sleep -Seconds 10; Get-Content 'C:\\\\Users\\\\13144\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\C--Users-13144-Documents-Meridian-repository\\\\c65a8946-b4b3-4486-9bf3-f7c1e3e917d6\\\\tasks\\\\bka79n5mk.output'\")",
+      "Bash(PowerShell -Command \"Get-Content 'C:\\\\Users\\\\13144\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\C--Users-13144-Documents-Meridian-repository\\\\c65a8946-b4b3-4486-9bf3-f7c1e3e917d6\\\\tasks\\\\b6biymr6f.output'\")",
+      "Bash(fly status *)",
+      "mcp__meridian__get_sprint_items",
+      "mcp__meridian__register_session",
+      "mcp__meridian__generate_handoff",
+      "Bash(PowerShell -Command \"Get-Content 'C:\\\\Users\\\\13144\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\C--Users-13144-Documents-Meridian-repository\\\\c65a8946-b4b3-4486-9bf3-f7c1e3e917d6\\\\tasks\\\\b8sf22j8g.output' | Select-Object -Last 3\")"
     ]
   }
 }
