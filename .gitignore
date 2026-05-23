@@ -225,3 +225,5 @@ tmp/
 # Internal strategy documents  
 DECISIONS.md  
 ROADMAP.md  
+secrets.env  
+secrets.local.env 
