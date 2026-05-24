@@ -16,6 +16,7 @@ SQL translation rules:
 
 from __future__ import annotations
 
+import asyncio
 import re
 from typing import Any
 
@@ -445,13 +446,31 @@ async def init_pg_db(url: str) -> PostgresConnection:
             "Install it: pip install asyncpg"
         ) from exc
 
-    pool = await asyncpg.create_pool(
-        url,
-        min_size=1,
-        max_size=10,
-        timeout=15.0,          # connection acquisition timeout
-        command_timeout=30.0,  # per-statement timeout
-    )
+    last_exc: Exception | None = None
+    for attempt in range(3):
+        try:
+            pool = await asyncio.wait_for(
+                asyncpg.create_pool(
+                    url,
+                    min_size=1,
+                    max_size=10,
+                    command_timeout=30.0,
+                ),
+                timeout=20.0,
+            )
+            break
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            if attempt < 2:
+                import logging as _l
+                _l.getLogger("meridian.pg").warning(
+                    "Neon cold start — retrying in 5s (attempt %d/3)...", attempt + 1
+                )
+                await asyncio.sleep(5)
+    else:
+        raise RuntimeError(
+            f"Could not connect to Postgres after 3 attempts: {last_exc}"
+        ) from last_exc
     conn = PostgresConnection(pool)
     await conn.executescript(CREATE_TABLES_PG)
     await _migrate_pg_sprint_items_v2(pool)
