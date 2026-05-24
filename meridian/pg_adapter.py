@@ -456,7 +456,14 @@ async def init_pg_db(url: str) -> PostgresConnection:
         min_size=1,
         max_size=10,
         open=False,
-        kwargs={"autocommit": True},
+        reconnect_timeout=30.0,
+        kwargs={
+            "autocommit": True,
+            "keepalives": 1,
+            "keepalives_idle": 30,
+            "keepalives_interval": 10,
+            "keepalives_count": 5,
+        },
     )
     # Open the pool — now safe because SelectorEventLoop is active
     await pool.open(wait=True, timeout=30.0)
