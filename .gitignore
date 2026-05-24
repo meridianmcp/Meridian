@@ -227,3 +227,6 @@ DECISIONS.md
 ROADMAP.md  
 secrets.env  
 secrets.local.env 
+
+meridian.toml
+*.toml
