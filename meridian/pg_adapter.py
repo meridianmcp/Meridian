@@ -33,7 +33,11 @@ def _pg_adapt_sql(sql: str, params: tuple) -> tuple[str, list]:
 
     Returns ``(pg_sql, pg_params_list)``.  Uses %s placeholders (psycopg3).
     """
-    # 1. ? → %s positional placeholders
+    # 1. Escape literal % used in LIKE patterns BEFORE replacing ? → %s
+    #    so LIKE '%foo%' becomes LIKE '%%foo%%' (psycopg3 treats % as placeholder)
+    sql = re.sub(r"'([^']*%[^']*)'", lambda m: "'" + m.group(1).replace("%", "%%") + "'", sql)
+
+    # 2. ? → %s positional placeholders
     sql = re.sub(r"\?", "%s", sql)
 
     # 2. datetime('now', %s || ' minutes') — expire_idle_sessions pattern
