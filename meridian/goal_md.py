@@ -397,6 +397,11 @@ async def watch_goal_md(
         from watchfiles import awatch
     except ImportError:
         return
+    import sys as _sys
+    if _sys.platform == "win32":
+        # watchfiles ReadDirectoryChangesW deadlocks the ProactorEventLoop
+        # on Windows when called from an asyncio task. Skip silently.
+        return
     try:
         async for _ in awatch(str(path.parent)):
             if _meridian_writing:

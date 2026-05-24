@@ -391,7 +391,6 @@ async def lifespan(app: FastAPI):
     """
     try:
         from dotenv import load_dotenv
-
         load_dotenv(override=False)
     except ImportError:
         pass  # dotenv is optional — env can be set by the launcher.
@@ -416,12 +415,12 @@ async def lifespan(app: FastAPI):
     db_url = os.environ.get("MERIDIAN_DB_URL")
     db_path: str | None = None
     if db_url:
-        db = await db_module.init_db(db_url)
+        db = await asyncio.wait_for(db_module.init_db(db_url), timeout=15.0)
     else:
         db_path = os.environ.get("MERIDIAN_DB", DEFAULT_DB_PATH)
         if db_path != ":memory:":
             Path(db_path).parent.mkdir(parents=True, exist_ok=True)
-        db = await db_module.init_db(db_path)
+        db = await asyncio.wait_for(db_module.init_db(db_path), timeout=15.0)
     app.state.db = db
     app.state.data_dir = str(data_dir)
     app.state.ws_broadcaster = dashboard_module.WebSocketBroadcaster()
@@ -431,26 +430,33 @@ async def lifespan(app: FastAPI):
     # Always wipe-and-reseed on startup so the demo is always fresh.
     # NEVER falls through to production DB.
     demo_db_url = os.environ.get("MERIDIAN_DEMO_DB_URL")
-    if demo_db_url:
+
+    async def _init_demo(url: str) -> None:
+        demo_db = await db_module.init_db(url)
+        app.state.demo_db = demo_db
+        await _seed_demo_data(demo_db)
+
+    async def _init_demo_inmemory() -> None:
+        demo_db = await db_module.init_db(":memory:")
+        app.state.demo_db = demo_db
+        await _seed_demo_data(demo_db)
+
+    skip_demo = os.environ.get("MERIDIAN_SKIP_DEMO", "").lower() in ("1", "true", "yes")
+
+    if skip_demo:
+        app.state.demo_db = None
+    elif demo_db_url:
         try:
-            demo_db = await db_module.init_db(demo_db_url)
-            app.state.demo_db = demo_db
-            await _seed_demo_data(demo_db)
+            # 10s timeout — if Neon is slow/down, don't hang startup
+            await asyncio.wait_for(_init_demo(demo_db_url), timeout=10.0)
         except Exception:  # noqa: BLE001
-            # Neon demo DB failed — fall back to in-memory so prod is never exposed
             try:
-                demo_db = await db_module.init_db(":memory:")
-                app.state.demo_db = demo_db
-                await _seed_demo_data(demo_db)
+                await asyncio.wait_for(_init_demo_inmemory(), timeout=5.0)
             except Exception:  # noqa: BLE001
                 app.state.demo_db = None
     else:
-        # No separate demo URL — always use isolated in-memory SQLite.
-        # This is safe on Fly.io: resets on every deploy (demo stays fresh).
         try:
-            demo_db = await db_module.init_db(":memory:")
-            app.state.demo_db = demo_db
-            await _seed_demo_data(demo_db)
+            await asyncio.wait_for(_init_demo_inmemory(), timeout=5.0)
         except Exception:  # noqa: BLE001
             app.state.demo_db = None
 
@@ -501,9 +507,8 @@ async def lifespan(app: FastAPI):
         except Exception:  # noqa: BLE001
             pass
 
-    # v0.6.3 — optional live file-watch (no-op when watchfiles not installed).
-    # Skip in :memory: mode (tests) — watchfiles.awatch blocks the asyncio
-    # ProactorEventLoop on Windows inside the TestClient's anyio portal.
+    # v0.6.3 — optional live file-watch (no-op when watchfiles not installed,
+    # and skipped on Windows due to ProactorEventLoop deadlock with awatch).
     if db_path != ":memory:":
         watch_task = asyncio.create_task(goal_md_module.watch_goal_md(db))
     else:
