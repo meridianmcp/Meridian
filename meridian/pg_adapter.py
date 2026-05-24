@@ -445,7 +445,13 @@ async def init_pg_db(url: str) -> PostgresConnection:
             "Install it: pip install asyncpg"
         ) from exc
 
-    pool = await asyncpg.create_pool(url, min_size=1, max_size=10)
+    pool = await asyncpg.create_pool(
+        url,
+        min_size=1,
+        max_size=10,
+        timeout=15.0,          # connection acquisition timeout
+        command_timeout=30.0,  # per-statement timeout
+    )
     conn = PostgresConnection(pool)
     await conn.executescript(CREATE_TABLES_PG)
     await _migrate_pg_sprint_items_v2(pool)
