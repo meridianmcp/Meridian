@@ -1,6 +1,6 @@
 [workspace]
 name = "meridian"
-version = "1.9.0"
+version = "2.3.0"
 description = "Multi-session Claude coordinator MCP server"
 channels = ["conda-forge"]
 platforms = ["win-64", "linux-64", "osx-arm64", "osx-64"]
