@@ -704,7 +704,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     """Open the database, apply schema, and return the connection.
 
     When ``db_path`` starts with ``postgresql://`` or ``postgres://`` the
-    function opens an asyncpg pool and returns a
+    function opens a psycopg3 connection pool and returns a
     :class:`~meridian.pg_adapter.PostgresConnection` instead of an
     aiosqlite connection.  Both expose the same async cursor API so all
     callers are unaffected.
