@@ -4,30 +4,91 @@ Generated: {{ generated_at }}
 Project: {{ project.name }} ({{ project.id }})
 ---
 
-## Goal State (v{{ goal.version }})
+{% if ai_summary -%}
+## AI Summary
+
+{{ ai_summary }}
+
+{% endif -%}
+
+## L0 — Core Context (~500 tokens, always read)
+
+**North Star:** {{ goal.north_star or "(not set)" }}
+
+{% if pinned_decisions -%}
+**Pinned Decisions ({{ pinned_decisions | length }}):**
+
+{% for d in pinned_decisions -%}
+- **[{{ d.category }}]** {{ d.title }} — {{ d.body }}
+{% endfor %}
+{% else -%}
+_No pinned decisions yet — use `pin_decision` MCP tool to establish the constitution._
+
+{% endif %}
+
+## L1 — Current State (~1500 tokens)
+
+**Sprint:** {{ goal.sprint or "(not set)" }}
+
+**Version Goal (v{{ goal.version }}):**
 
 {{ goal.content }}
 
-## Active Sessions ({{ sessions | length }})
+{% if active_sessions -%}
+**Active Sessions ({{ active_sessions | length }}):**
 
-{% for s in sessions -%}
-- {{ s.name }} — {{ s.status }} — last seen {{ s.last_seen }}
+{% for s in active_sessions -%}
+- {{ s.name }} — {{ s.status }} — last seen {{ s.last_seen }}{% if s.agent_framework and s.agent_framework != 'claude_code' %} [{{ s.agent_framework }}]{% endif %}
 {% endfor %}
+{% endif %}
 
-## Recent Task Log (last {{ tasks | length }} entries)
+{% if pending_sprint_items -%}
+**Pending Sprint Items:**
 
-{% for t in tasks -%}
+{% for it in pending_sprint_items -%}
+- [{{ it.status }}] {{ it.title }}{% if it.item_group %} _({{ it.item_group }})_{% endif %}
+{% endfor %}
+{% endif %}
+
+**Recent Tasks (last {{ l1_tasks | length }}):**
+
+{% for t in l1_tasks -%}
 [{{ t.created_at }}] [{{ t.status | upper }}] {{ session_names[t.session_id] }}: {{ t.description }}
 {% endfor %}
+
+## L2 — History (~5000 tokens, skim if space)
+
+{% if l2_tasks -%}
+**Older Task Log ({{ l2_tasks | length }} entries):**
+
+{% for t in l2_tasks -%}
+[{{ t.created_at }}] [{{ t.status | upper }}] {{ session_names[t.session_id] }}: {{ t.description }}
+{% endfor %}
+{% endif %}
+
+{% if archived_sessions -%}
+**Archived Sessions ({{ archived_sessions | length }}):**
+
+{% for s in archived_sessions[:10] -%}
+- {{ s.name }} — {{ s.status }} — last seen {{ s.last_seen }}
+{% endfor %}
+{% endif %}
+
+{% if decisions_log -%}
+**Append-Only Decisions Log:**
+
+{{ decisions_log }}
+{% endif %}
 
 ## Resume Instructions
 
 You are resuming a Meridian-coordinated session for "{{ project.name }}".
 
-1. Read Goal State above — this is your primary directive
-2. Read Task Log — this shows what has already been done
-3. Call register_session(project_id="{{ project.id }}", session_name="<your-name>")
-4. Call get_goal(project_id="{{ project.id }}") to confirm latest version
-5. Continue from where the task log ends
+1. Read **L0** (Core Context) — north star + pinned decisions = the constitution
+2. Read **L1** (Current State) — sprint + recent tasks = what's in flight
+3. Read **L2** (History) only if context allows
+4. Call `start_session(project_id="{{ project.id }}", session_name="<your-name>")`
+5. Continue from where the L1 task log ends — don't redo done work
 
-Do not redo work already marked done in the task log.
+For coordination protocol details, see the MERIDIAN.md instructions
+auto-injected into `get_goal` / `start_session` responses.

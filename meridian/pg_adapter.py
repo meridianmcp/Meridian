@@ -424,6 +424,38 @@ CREATE TABLE IF NOT EXISTS tenant_environments (
     is_default SMALLINT NOT NULL DEFAULT 0
         CHECK (is_default IN (0,1))
 );
+
+-- v2.4 — decisions_pinned: editable constitution. See db.py for rationale.
+CREATE TABLE IF NOT EXISTS decisions_pinned (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    title TEXT NOT NULL,
+    body TEXT NOT NULL,
+    category TEXT NOT NULL DEFAULT 'TECHNICAL',
+    status TEXT NOT NULL DEFAULT 'active',
+    superseded_by TEXT REFERENCES decisions_pinned(id),
+    created_at TEXT NOT NULL DEFAULT (to_char(now() at time zone 'utc', 'YYYY-MM-DD HH24:MI:SS')),
+    updated_at TEXT NOT NULL DEFAULT (to_char(now() at time zone 'utc', 'YYYY-MM-DD HH24:MI:SS'))
+);
+CREATE INDEX IF NOT EXISTS idx_decisions_pinned_project ON decisions_pinned(project_id, status);
+
+-- v2.4 — hitl_requests: human-in-the-loop coordination queue.
+CREATE TABLE IF NOT EXISTS hitl_requests (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    session_id TEXT REFERENCES sessions(id),
+    question TEXT NOT NULL,
+    context TEXT,
+    urgency TEXT NOT NULL DEFAULT 'normal',
+    status TEXT NOT NULL DEFAULT 'pending',
+    answer TEXT,
+    answered_by TEXT,
+    assigned_to TEXT,
+    created_at TEXT NOT NULL DEFAULT (to_char(now() at time zone 'utc', 'YYYY-MM-DD HH24:MI:SS')),
+    answered_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_hitl_project ON hitl_requests(project_id, status);
+CREATE INDEX IF NOT EXISTS idx_hitl_assigned ON hitl_requests(assigned_to, status);
 """
 
 
@@ -473,7 +505,53 @@ async def init_pg_db(url: str) -> PostgresConnection:
     await _migrate_pg_sprint_items_v2(conn)
     await _migrate_pg_drop_chat_tables(conn)
     await _migrate_pg_goal_field_timestamps(conn)
+    await _migrate_pg_v24_task_tree_and_framework(conn)
+    await _migrate_pg_v24_pinned_decisions_and_hitl(conn)
     return conn
+
+
+async def _migrate_pg_v24_task_tree_and_framework(conn: PostgresConnection) -> None:
+    """v2.4 — task_log.parent_task_id + sessions.agent_framework + projects.project_token."""
+    await conn.executescript(
+        "ALTER TABLE task_log ADD COLUMN IF NOT EXISTS parent_task_id TEXT;"
+        "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS agent_framework TEXT DEFAULT 'claude_code';"
+        "ALTER TABLE projects ADD COLUMN IF NOT EXISTS project_token TEXT"
+    )
+
+
+async def _migrate_pg_v24_pinned_decisions_and_hitl(conn: PostgresConnection) -> None:
+    """v2.4 — decisions_pinned + hitl_requests on existing Postgres DBs.
+    CREATE_TABLES_PG covers fresh DBs; this is the upgrade path."""
+    await conn.executescript(
+        "CREATE TABLE IF NOT EXISTS decisions_pinned ("
+        "    id TEXT PRIMARY KEY,"
+        "    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,"
+        "    title TEXT NOT NULL,"
+        "    body TEXT NOT NULL,"
+        "    category TEXT NOT NULL DEFAULT 'TECHNICAL',"
+        "    status TEXT NOT NULL DEFAULT 'active',"
+        "    superseded_by TEXT REFERENCES decisions_pinned(id),"
+        "    created_at TEXT NOT NULL DEFAULT (to_char(now() at time zone 'utc', 'YYYY-MM-DD HH24:MI:SS')),"
+        "    updated_at TEXT NOT NULL DEFAULT (to_char(now() at time zone 'utc', 'YYYY-MM-DD HH24:MI:SS'))"
+        ");"
+        "CREATE INDEX IF NOT EXISTS idx_decisions_pinned_project ON decisions_pinned(project_id, status);"
+        "CREATE TABLE IF NOT EXISTS hitl_requests ("
+        "    id TEXT PRIMARY KEY,"
+        "    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,"
+        "    session_id TEXT REFERENCES sessions(id),"
+        "    question TEXT NOT NULL,"
+        "    context TEXT,"
+        "    urgency TEXT NOT NULL DEFAULT 'normal',"
+        "    status TEXT NOT NULL DEFAULT 'pending',"
+        "    answer TEXT,"
+        "    answered_by TEXT,"
+        "    assigned_to TEXT,"
+        "    created_at TEXT NOT NULL DEFAULT (to_char(now() at time zone 'utc', 'YYYY-MM-DD HH24:MI:SS')),"
+        "    answered_at TEXT"
+        ");"
+        "CREATE INDEX IF NOT EXISTS idx_hitl_project ON hitl_requests(project_id, status);"
+        "CREATE INDEX IF NOT EXISTS idx_hitl_assigned ON hitl_requests(assigned_to, status)"
+    )
 
 
 async def _migrate_pg_goal_field_timestamps(conn: PostgresConnection) -> None:

@@ -151,10 +151,58 @@ CREATE TABLE IF NOT EXISTS sprint_items (
     notes TEXT
 );
 
+-- v2.4 — decisions_pinned: editable constitution alongside the append-only
+-- decisions log. Pinned decisions are short-lived authoritative statements
+-- ("we're using psycopg3", "pricing tier X is $20") that supersede each
+-- other. The append-only log captures every micro-decision; pinned holds
+-- the current truth. status='superseded' rows keep history; UI filters
+-- to 'active'.
+CREATE TABLE IF NOT EXISTS decisions_pinned (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    title TEXT NOT NULL,
+    body TEXT NOT NULL,
+    category TEXT NOT NULL DEFAULT 'TECHNICAL'
+        CHECK (category IN ('STRATEGIC','COMPETITIVE','TECHNICAL','TACTICAL','BUSINESS','PRODUCT','ARCHITECTURAL')),
+    status TEXT NOT NULL DEFAULT 'active'
+        CHECK (status IN ('active','superseded')),
+    superseded_by TEXT REFERENCES decisions_pinned(id),
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- v2.4 — hitl_requests: human-in-the-loop coordination queue. Sessions
+-- can pause waiting for a human answer (urgency='blocking') or surface a
+-- non-blocking question (urgency='normal'/'high'). assigned_to routes to
+-- a specific human_id; null = broadcast. answered_at + answered_by close
+-- the loop for audit.
+CREATE TABLE IF NOT EXISTS hitl_requests (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    session_id TEXT REFERENCES sessions(id),
+    question TEXT NOT NULL,
+    context TEXT,
+    urgency TEXT NOT NULL DEFAULT 'normal'
+        CHECK (urgency IN ('normal','high','blocking')),
+    status TEXT NOT NULL DEFAULT 'pending'
+        CHECK (status IN ('pending','answered','dismissed')),
+    answer TEXT,
+    answered_by TEXT,
+    assigned_to TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    answered_at TEXT
+);
+
 CREATE INDEX IF NOT EXISTS idx_goal_project
     ON goal_states(project_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_project
     ON sessions(project_id, status);
+CREATE INDEX IF NOT EXISTS idx_decisions_pinned_project
+    ON decisions_pinned(project_id, status);
+CREATE INDEX IF NOT EXISTS idx_hitl_project
+    ON hitl_requests(project_id, status);
+CREATE INDEX IF NOT EXISTS idx_hitl_assigned
+    ON hitl_requests(assigned_to, status);
 CREATE INDEX IF NOT EXISTS idx_tasks_project
     ON task_log(project_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_tasks_session
@@ -403,6 +451,65 @@ async def _migrate_human_identity(db: aiosqlite.Connection) -> None:
     """v0.3.2 — add nullable human-identity columns to legacy DBs."""
     await _migrate_add_column_if_missing(db, "projects", "creator_human_id", "TEXT")
     await _migrate_add_column_if_missing(db, "sessions", "human_id", "TEXT")
+
+
+async def _migrate_v24_task_tree_and_framework(db: aiosqlite.Connection) -> None:
+    """v2.4 — task_log.parent_task_id (task tree for sub-agent work) and
+    sessions.agent_framework (claude_code | cursor | windsurf | langgraph
+    | autogen | openviking | custom). Also projects.project_token for the
+    POST /events webhook intake (framework integrations push events with
+    X-Meridian-Token header)."""
+    await _migrate_add_column_if_missing(db, "task_log", "parent_task_id", "TEXT")
+    await _migrate_add_column_if_missing(
+        db, "sessions", "agent_framework", "TEXT DEFAULT 'claude_code'"
+    )
+    await _migrate_add_column_if_missing(db, "projects", "project_token", "TEXT")
+
+
+async def _migrate_v24_pinned_decisions_and_hitl(db: aiosqlite.Connection) -> None:
+    """v2.4 — decisions_pinned + hitl_requests tables. CREATE_TABLES adds
+    them on fresh DBs; this migration covers existing dev/prod DBs."""
+    await db.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS decisions_pinned (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+            title TEXT NOT NULL,
+            body TEXT NOT NULL,
+            category TEXT NOT NULL DEFAULT 'TECHNICAL'
+                CHECK (category IN ('STRATEGIC','COMPETITIVE','TECHNICAL','TACTICAL','BUSINESS','PRODUCT','ARCHITECTURAL')),
+            status TEXT NOT NULL DEFAULT 'active'
+                CHECK (status IN ('active','superseded')),
+            superseded_by TEXT REFERENCES decisions_pinned(id),
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_decisions_pinned_project
+            ON decisions_pinned(project_id, status);
+
+        CREATE TABLE IF NOT EXISTS hitl_requests (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+            session_id TEXT REFERENCES sessions(id),
+            question TEXT NOT NULL,
+            context TEXT,
+            urgency TEXT NOT NULL DEFAULT 'normal'
+                CHECK (urgency IN ('normal','high','blocking')),
+            status TEXT NOT NULL DEFAULT 'pending'
+                CHECK (status IN ('pending','answered','dismissed')),
+            answer TEXT,
+            answered_by TEXT,
+            assigned_to TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            answered_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_hitl_project
+            ON hitl_requests(project_id, status);
+        CREATE INDEX IF NOT EXISTS idx_hitl_assigned
+            ON hitl_requests(assigned_to, status);
+        """
+    )
+    await db.commit()
 
 
 async def _migrate_goal_field_timestamps(db: aiosqlite.Connection) -> None:
@@ -760,6 +867,8 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_drop_chat_tables(db)
     await _migrate_hosted_tables(db)
     await _migrate_goal_field_timestamps(db)
+    await _migrate_v24_task_tree_and_framework(db)
+    await _migrate_v24_pinned_decisions_and_hitl(db)
     return db
 
 
@@ -1236,6 +1345,7 @@ async def register_session(
     name: str,
     human_id: str | None = None,
     session_type: str = "human",
+    agent_framework: str = "claude_code",
 ) -> dict[str, Any]:
     """Create a session row in 'active' state.
 
@@ -1246,14 +1356,19 @@ async def register_session(
     ``session_type`` (v1.2.0) is ``human`` by default and ``worker`` for
     sessions started via :func:`start_worker_session`. The timeline /
     auto-summary loops use it to distinguish the two kinds.
+
+    ``agent_framework`` (v2.4) labels the originating framework so the
+    Team tab can render badges. One of: claude_code (default), cursor,
+    windsurf, langgraph, autogen, openviking, custom. Free-form string —
+    unknown values render as 'custom' in the UI.
     """
     if session_type not in {"human", "worker"}:
         raise ValueError(f"invalid session_type: {session_type!r}")
     sid = _new_id()
     await db.execute(
-        "INSERT INTO sessions (id, project_id, name, human_id, session_type) "
-        "VALUES (?, ?, ?, ?, ?)",
-        (sid, project_id, name, human_id, session_type),
+        "INSERT INTO sessions (id, project_id, name, human_id, session_type, agent_framework) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (sid, project_id, name, human_id, session_type, agent_framework),
     )
     await db.commit()
     async with db.execute(
@@ -1656,6 +1771,7 @@ async def log_task(
     description: str,
     status: str = "done",
     parent_session_id: str | None = None,
+    parent_task_id: str | None = None,
 ) -> dict[str, Any]:
     """Append a task-log entry and broadcast to live subscribers.
 
@@ -1663,15 +1779,19 @@ async def log_task(
     off by another session — typically when an enqueue_claude_task
     worker logs its result. The timeline + auto-summary use it to
     correlate parent / child sessions.
+
+    ``parent_task_id`` (v2.4) records that this task is a sub-step of
+    another task. Lets the dashboard render multi-agent work as a tree
+    (researcher → fetched 3 sources, writer → drafted reply, etc.).
     """
     if status not in {"pending", "in_progress", "done", "failed", "pending-hitl", "backlog", "future"}:
         raise ValueError(f"invalid task status: {status}")
     tid = _new_id()
     await db.execute(
         "INSERT INTO task_log "
-        "(id, session_id, project_id, description, status, parent_session_id) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
-        (tid, session_id, project_id, description, status, parent_session_id),
+        "(id, session_id, project_id, description, status, parent_session_id, parent_task_id) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (tid, session_id, project_id, description, status, parent_session_id, parent_task_id),
     )
     await update_session_seen(db, session_id)
     await db.commit()
@@ -3265,3 +3385,427 @@ async def get_pool_project_counts(
     if keys:
         return {"projects": row["projects"], "customers": row["customers"]}
     return {"projects": row[0] or 0, "customers": row[1] or 0}
+
+
+# ---------------------------------------------------------------------------
+# v2.4 — Pinned decisions (editable constitution alongside the append-only log)
+# ---------------------------------------------------------------------------
+
+_VALID_DECISION_CATEGORIES = {
+    "STRATEGIC", "COMPETITIVE", "TECHNICAL", "TACTICAL",
+    "BUSINESS", "PRODUCT", "ARCHITECTURAL",
+}
+
+
+async def pin_decision(
+    db: aiosqlite.Connection,
+    project_id: str,
+    title: str,
+    body: str,
+    category: str = "TECHNICAL",
+) -> dict[str, Any]:
+    """Create a new pinned decision row. Returns the inserted row.
+
+    Pinned decisions live alongside the append-only ``projects.decisions``
+    log. Use this for the "current truth" set that supersedes earlier
+    statements (pricing tiers, driver choices, etc). The log captures
+    micro-decisions; this captures the constitution.
+    """
+    if category not in _VALID_DECISION_CATEGORIES:
+        raise ValueError(
+            f"category must be one of {sorted(_VALID_DECISION_CATEGORIES)}; got {category!r}"
+        )
+    did = _new_id()
+    await db.execute(
+        "INSERT INTO decisions_pinned (id, project_id, title, body, category) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (did, project_id, title, body, category),
+    )
+    await db.commit()
+    return (await get_pinned_decision(db, did)) or {"id": did}
+
+
+async def get_pinned_decision(
+    db: aiosqlite.Connection, decision_id: str
+) -> dict[str, Any] | None:
+    async with db.execute(
+        "SELECT * FROM decisions_pinned WHERE id = ?", (decision_id,)
+    ) as cur:
+        row = await cur.fetchone()
+    return _row_to_dict(row)
+
+
+async def get_pinned_decisions(
+    db: aiosqlite.Connection,
+    project_id: str,
+    include_superseded: bool = False,
+) -> list[dict[str, Any]]:
+    """Return all pinned decisions for a project, newest first.
+
+    Defaults to active only — superseded entries stay in history but
+    are filtered out of the live constitution view.
+    """
+    if include_superseded:
+        sql = (
+            "SELECT * FROM decisions_pinned WHERE project_id = ? "
+            "ORDER BY created_at DESC"
+        )
+        args = (project_id,)
+    else:
+        sql = (
+            "SELECT * FROM decisions_pinned WHERE project_id = ? "
+            "AND status = 'active' ORDER BY created_at DESC"
+        )
+        args = (project_id,)
+    async with db.execute(sql, args) as cur:
+        rows = await cur.fetchall()
+    return [_row_to_dict(r) for r in rows if r is not None]  # type: ignore[misc]
+
+
+async def update_pinned_decision(
+    db: aiosqlite.Connection,
+    decision_id: str,
+    *,
+    body: str | None = None,
+    category: str | None = None,
+    title: str | None = None,
+    status: str | None = None,
+    superseded_by: str | None = None,
+) -> dict[str, Any] | None:
+    """Patch any combination of body / category / title / status / superseded_by.
+
+    Use ``status='superseded'`` + ``superseded_by=<new_id>`` to retire a
+    decision while preserving the audit trail. Pass only the fields you
+    intend to change; others stay untouched.
+    """
+    existing = await get_pinned_decision(db, decision_id)
+    if existing is None:
+        return None
+    fields: dict[str, Any] = {}
+    if body is not None:
+        fields["body"] = body
+    if title is not None:
+        fields["title"] = title
+    if category is not None:
+        if category not in _VALID_DECISION_CATEGORIES:
+            raise ValueError(
+                f"category must be one of {sorted(_VALID_DECISION_CATEGORIES)}"
+            )
+        fields["category"] = category
+    if status is not None:
+        if status not in ("active", "superseded"):
+            raise ValueError("status must be 'active' or 'superseded'")
+        fields["status"] = status
+    if superseded_by is not None:
+        fields["superseded_by"] = superseded_by
+    if not fields:
+        return existing
+    from datetime import datetime, timezone
+    fields["updated_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    set_clause = ", ".join(f"{k} = ?" for k in fields)
+    args = list(fields.values()) + [decision_id]
+    await db.execute(
+        f"UPDATE decisions_pinned SET {set_clause} WHERE id = ?", args
+    )
+    await db.commit()
+    return await get_pinned_decision(db, decision_id)
+
+
+async def supersede_pinned_decision(
+    db: aiosqlite.Connection,
+    old_decision_id: str,
+    new_title: str,
+    new_body: str,
+    category: str | None = None,
+) -> dict[str, Any]:
+    """Atomic supersede: create a new active decision and mark the old as superseded.
+
+    Returns the new decision row. The old row keeps the back-link via
+    ``superseded_by`` so the dashboard can render the chain.
+    """
+    old = await get_pinned_decision(db, old_decision_id)
+    if old is None:
+        raise ValueError("decision not found")
+    new = await pin_decision(
+        db,
+        old["project_id"],
+        new_title,
+        new_body,
+        category or old.get("category", "TECHNICAL"),
+    )
+    await update_pinned_decision(
+        db, old_decision_id, status="superseded", superseded_by=new["id"]
+    )
+    return new
+
+
+# ---------------------------------------------------------------------------
+# v2.4 — HITL (human-in-the-loop) request queue
+# ---------------------------------------------------------------------------
+
+_VALID_HITL_URGENCY = {"normal", "high", "blocking"}
+_VALID_HITL_STATUS = {"pending", "answered", "dismissed"}
+
+
+async def request_hitl(
+    db: aiosqlite.Connection,
+    project_id: str,
+    question: str,
+    *,
+    session_id: str | None = None,
+    context: str | None = None,
+    urgency: str = "normal",
+    assigned_to: str | None = None,
+) -> dict[str, Any]:
+    """Create a HITL request. Returns the inserted row.
+
+    Sessions paused on ``urgency='blocking'`` should poll
+    :func:`get_hitl_request` until ``status='answered'`` to receive
+    the human's reply. Non-blocking requests still show up in the
+    dashboard queue — callers can keep working and check later.
+    """
+    if urgency not in _VALID_HITL_URGENCY:
+        raise ValueError(
+            f"urgency must be one of {sorted(_VALID_HITL_URGENCY)}; got {urgency!r}"
+        )
+    hid = _new_id()
+    await db.execute(
+        "INSERT INTO hitl_requests "
+        "(id, project_id, session_id, question, context, urgency, assigned_to) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (hid, project_id, session_id, question, context, urgency, assigned_to),
+    )
+    await db.commit()
+    return (await get_hitl_request(db, hid)) or {"id": hid}
+
+
+async def get_hitl_request(
+    db: aiosqlite.Connection, request_id: str
+) -> dict[str, Any] | None:
+    async with db.execute(
+        "SELECT * FROM hitl_requests WHERE id = ?", (request_id,)
+    ) as cur:
+        row = await cur.fetchone()
+    return _row_to_dict(row)
+
+
+async def list_hitl_requests(
+    db: aiosqlite.Connection,
+    project_id: str | None = None,
+    *,
+    status: str | None = "pending",
+    limit: int = 50,
+) -> list[dict[str, Any]]:
+    """Return HITL requests, newest first.
+
+    ``project_id=None`` returns across all projects — used by the
+    dashboard's top-level HITL panel. ``status=None`` returns every
+    status; default ``'pending'`` shows only the active queue.
+    """
+    if status is not None and status not in _VALID_HITL_STATUS:
+        raise ValueError(
+            f"status must be one of {sorted(_VALID_HITL_STATUS)} or None"
+        )
+    where = []
+    args: list[Any] = []
+    if project_id is not None:
+        where.append("project_id = ?")
+        args.append(project_id)
+    if status is not None:
+        where.append("status = ?")
+        args.append(status)
+    where_clause = (" WHERE " + " AND ".join(where)) if where else ""
+    args.append(limit)
+    sql = (
+        f"SELECT * FROM hitl_requests{where_clause} "
+        "ORDER BY "
+        "  CASE urgency WHEN 'blocking' THEN 0 WHEN 'high' THEN 1 ELSE 2 END, "
+        "  created_at DESC LIMIT ?"
+    )
+    async with db.execute(sql, args) as cur:
+        rows = await cur.fetchall()
+    return [_row_to_dict(r) for r in rows if r is not None]  # type: ignore[misc]
+
+
+async def answer_hitl_request(
+    db: aiosqlite.Connection,
+    request_id: str,
+    answer: str,
+    answered_by: str | None = None,
+) -> dict[str, Any] | None:
+    """Mark a HITL request answered. Sessions polling for the answer pick it up."""
+    from datetime import datetime, timezone
+    now_ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    await db.execute(
+        "UPDATE hitl_requests SET status = 'answered', answer = ?, "
+        "answered_by = ?, answered_at = ? WHERE id = ?",
+        (answer, answered_by, now_ts, request_id),
+    )
+    await db.commit()
+    return await get_hitl_request(db, request_id)
+
+
+async def dismiss_hitl_request(
+    db: aiosqlite.Connection, request_id: str
+) -> dict[str, Any] | None:
+    """Mark a HITL request dismissed (won't-answer). Stays in audit trail."""
+    await db.execute(
+        "UPDATE hitl_requests SET status = 'dismissed' WHERE id = ?",
+        (request_id,),
+    )
+    await db.commit()
+    return await get_hitl_request(db, request_id)
+
+
+# ---------------------------------------------------------------------------
+# v2.4 — Project token for webhook intake (framework integrations)
+# ---------------------------------------------------------------------------
+
+
+async def ensure_project_token(
+    db: aiosqlite.Connection, project_id: str
+) -> str | None:
+    """Return the project's webhook token, minting one if not yet set.
+
+    Returns ``None`` if the project doesn't exist. Tokens are 32 bytes
+    of url-safe base64 (~43 chars). Stored plain — these tokens grant
+    write-access to a single project's task_log only, not to tenants.
+    """
+    project = await get_project(db, project_id)
+    if project is None:
+        return None
+    token = project.get("project_token")
+    if token:
+        return token
+    import secrets
+    token = "pt_" + secrets.token_urlsafe(32)
+    await db.execute(
+        "UPDATE projects SET project_token = ? WHERE id = ?",
+        (token, project_id),
+    )
+    await db.commit()
+    return token
+
+
+async def get_project_by_token(
+    db: aiosqlite.Connection, token: str
+) -> dict[str, Any] | None:
+    """Look up a project by its webhook token (for POST /events auth)."""
+    async with db.execute(
+        "SELECT * FROM projects WHERE project_token = ?", (token,)
+    ) as cur:
+        row = await cur.fetchone()
+    return _row_to_dict(row)
+
+
+# ---------------------------------------------------------------------------
+# v2.4 — Per-human team summary (Team tab data source)
+# ---------------------------------------------------------------------------
+
+
+async def get_team_summary(
+    db: aiosqlite.Connection,
+    project_id: str | None = None,
+    days: int = 1,
+) -> dict[str, Any]:
+    """Aggregate task_log + sessions by human_id over the last N days.
+
+    Returns ``{"period_days": N, "humans": [{"human_id", "tasks_done",
+    "tasks_failed", "tasks_pending", "last_seen", "active_session",
+    "recent": [...]}], "active_count": N}``. Powers the dashboard Team
+    tab — live presence cards, standup digests, swimlane data source.
+    """
+    from datetime import datetime, timezone, timedelta
+    since = (
+        datetime.now(timezone.utc) - timedelta(days=days)
+    ).strftime("%Y-%m-%d %H:%M:%S")
+
+    proj_clause = "AND s.project_id = ?" if project_id else ""
+    proj_args: tuple[Any, ...] = (project_id,) if project_id else ()
+
+    # Pull sessions joined with tasks (over the window) grouped by human_id.
+    sql = f"""
+        SELECT
+            s.human_id as human_id,
+            s.id as session_id,
+            s.name as session_name,
+            s.status as session_status,
+            s.last_seen as last_seen,
+            s.agent_framework as agent_framework,
+            t.id as task_id,
+            t.description as task_description,
+            t.status as task_status,
+            t.created_at as task_created_at
+        FROM sessions s
+        LEFT JOIN task_log t
+            ON t.session_id = s.id AND t.created_at >= ?
+        WHERE s.human_id IS NOT NULL {proj_clause}
+        ORDER BY s.last_seen DESC, t.created_at DESC
+    """
+    async with db.execute(sql, (since, *proj_args)) as cur:
+        rows = await cur.fetchall()
+
+    humans: dict[str, dict[str, Any]] = {}
+    for r in rows:
+        rd = _row_to_dict(r) or {}
+        hid = rd.get("human_id")
+        if not hid:
+            continue
+        bucket = humans.setdefault(
+            hid,
+            {
+                "human_id": hid,
+                "tasks_done": 0,
+                "tasks_failed": 0,
+                "tasks_pending": 0,
+                "last_seen": rd.get("last_seen"),
+                "active_session": rd.get("session_name"),
+                "active_session_id": rd.get("session_id"),
+                "session_status": rd.get("session_status"),
+                "agent_framework": rd.get("agent_framework") or "claude_code",
+                "recent": [],
+            },
+        )
+        # First row per human (sorted by last_seen DESC) already gives us
+        # the most recent session — don't overwrite.
+        status = rd.get("task_status")
+        if status == "done":
+            bucket["tasks_done"] += 1
+        elif status == "failed":
+            bucket["tasks_failed"] += 1
+        elif status in ("pending", "pending-hitl", "in_progress"):
+            bucket["tasks_pending"] += 1
+        desc = rd.get("task_description")
+        if desc and len(bucket["recent"]) < 5:
+            bucket["recent"].append(
+                {
+                    "description": desc,
+                    "status": status,
+                    "created_at": rd.get("task_created_at"),
+                }
+            )
+
+    now_utc = datetime.now(timezone.utc)
+    active_count = 0
+    for h in humans.values():
+        last_seen = h.get("last_seen") or ""
+        try:
+            ls_dt = datetime.fromisoformat(last_seen.replace(" ", "T")).replace(
+                tzinfo=timezone.utc
+            )
+            age = (now_utc - ls_dt).total_seconds()
+            if age < 300:
+                h["presence"] = "active"
+                active_count += 1
+            elif age < 1800:
+                h["presence"] = "recent"
+            else:
+                h["presence"] = "idle"
+        except (ValueError, AttributeError):
+            h["presence"] = "idle"
+
+    return {
+        "period_days": days,
+        "humans": sorted(humans.values(), key=lambda x: x.get("last_seen") or "", reverse=True),
+        "active_count": active_count,
+    }

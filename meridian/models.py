@@ -71,6 +71,14 @@ class SessionRegister(BaseModel):
         default=None,
         description="Optional human owner of this session.",
     )
+    agent_framework: str = Field(
+        default="claude_code",
+        description=(
+            "v2.4 — framework label (claude_code | cursor | windsurf | "
+            "langgraph | autogen | openviking | custom). Surfaces as a badge "
+            "in the Team tab."
+        ),
+    )
 
 
 class TaskCreate(BaseModel):
@@ -80,6 +88,13 @@ class TaskCreate(BaseModel):
     project_id: str
     description: str = Field(..., min_length=1)
     status: Literal["pending", "done", "failed", "pending-hitl", "backlog", "future"] = "done"
+    parent_task_id: str | None = Field(
+        default=None,
+        description=(
+            "v2.4 — when this task is a sub-step of another, point at the "
+            "parent task_log.id. Dashboard renders the tree."
+        ),
+    )
 
 
 class EnqueueTask(BaseModel):
@@ -165,6 +180,7 @@ class Session(BaseModel):
     last_seen: str
     created_at: str
     session_summary: dict | None = None
+    agent_framework: str | None = None  # v2.4
 
 
 class Task(BaseModel):
@@ -175,6 +191,7 @@ class Task(BaseModel):
     project_id: str
     description: str
     status: Literal["pending", "in_progress", "done", "failed", "pending-hitl", "backlog", "future"]
+    parent_task_id: str | None = None  # v2.4
     claimed_by: str | None = None
     claimed_at: str | None = None
     created_at: str

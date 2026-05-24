@@ -525,6 +525,15 @@ async def lifespan(app: FastAPI):
                             )
                 except Exception:  # noqa: BLE001
                     pass
+                # v2.4 — refresh the CLAUDE.md <current_state> block for
+                # every project on each cycle. Local dev only — skipped
+                # on hosted multi-tenant deployments where there is no
+                # repo-root CLAUDE.md to write.
+                if os.environ.get("MERIDIAN_HOSTED", "").lower() not in ("1", "true", "yes"):
+                    try:
+                        await _refresh_claude_md_current_state(db, _REPO_ROOT)
+                    except Exception:  # noqa: BLE001
+                        pass
             except asyncio.CancelledError:
                 break
             except Exception:  # noqa: BLE001 — never let the loop die
@@ -1578,8 +1587,16 @@ async def generate_handoff(
     project = await db_module.get_project(_db(request), project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="project not found")
+    # v2.4 — skip the Haiku ai_summary call when ANTHROPIC_API_KEY is
+    # missing. The generator already falls back gracefully but the
+    # network round-trip on every dashboard click is wasteful when the
+    # key obviously isn't configured. Local devs without ANTHROPIC_API_KEY
+    # get instant handoffs; hosted deploys with the key get summaries.
+    import os as _os
+    skip_summary = not _os.environ.get("ANTHROPIC_API_KEY")
     path, content = await handoff_module.generate_handoff(
-        _db(request), project_id, _data_dir(request)
+        _db(request), project_id, _data_dir(request),
+        skip_ai_summary=skip_summary,
     )
     return {"path": path, "content": content}
 
@@ -1593,7 +1610,9 @@ async def register_session(
     if project is None:
         raise HTTPException(status_code=404, detail="project not found")
     return await db_module.register_session(
-        _db(request), body.project_id, body.name, human_id=body.human_id
+        _db(request), body.project_id, body.name,
+        human_id=body.human_id,
+        agent_framework=body.agent_framework,
     )
 
 
@@ -1648,6 +1667,7 @@ async def create_task(body: TaskCreate, request: Request) -> dict[str, Any]:
         body.project_id,
         body.description,
         body.status,
+        parent_task_id=body.parent_task_id,
     )
 
 
@@ -2134,6 +2154,271 @@ async def get_project_context(
 
 
 # ---------------------------------------------------------------------------
+# v2.4 — Pinned decisions (editable constitution)
+# ---------------------------------------------------------------------------
+
+
+@app.get("/projects/{project_id}/decisions-pinned")
+async def list_pinned_decisions_endpoint(
+    project_id: str, request: Request, include_superseded: bool = False
+) -> list[dict[str, Any]]:
+    """Active pinned decisions for a project (newest first).
+
+    ``?include_superseded=true`` returns the full history. Default
+    filters to ``status='active'`` so the dashboard renders just the
+    live constitution.
+    """
+    project = await db_module.get_project(_db(request), project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="project not found")
+    return await db_module.get_pinned_decisions(
+        _db(request), project_id, include_superseded=include_superseded
+    )
+
+
+@app.post("/projects/{project_id}/decisions-pinned", status_code=201)
+async def create_pinned_decision_endpoint(
+    project_id: str, body: dict[str, Any], request: Request
+) -> dict[str, Any]:
+    """Create a new pinned decision."""
+    project = await db_module.get_project(_db(request), project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="project not found")
+    title = (body.get("title") or "").strip()
+    text = (body.get("body") or "").strip()
+    category = body.get("category", "TECHNICAL")
+    if not title or not text:
+        raise HTTPException(status_code=400, detail="title and body required")
+    try:
+        return await db_module.pin_decision(
+            _db(request), project_id, title, text, category
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.patch("/projects/{project_id}/decisions-pinned/{decision_id}")
+async def update_pinned_decision_endpoint(
+    project_id: str, decision_id: str, body: dict[str, Any], request: Request
+) -> dict[str, Any]:
+    """Patch fields, or supersede (pass new_title + new_body to atomically retire+create)."""
+    db = _db(request)
+    new_title = body.get("new_title")
+    new_body = body.get("new_body")
+    if new_title and new_body:
+        try:
+            return await db_module.supersede_pinned_decision(
+                db, decision_id, new_title, new_body, body.get("category")
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+    result = await db_module.update_pinned_decision(
+        db, decision_id,
+        body=body.get("body"),
+        title=body.get("title"),
+        category=body.get("category"),
+        status=body.get("status"),
+        superseded_by=body.get("superseded_by"),
+    )
+    if result is None:
+        raise HTTPException(status_code=404, detail="decision not found")
+    return result
+
+
+# ---------------------------------------------------------------------------
+# v2.4 — HITL (human-in-the-loop) queue
+# ---------------------------------------------------------------------------
+
+
+@app.get("/hitl")
+async def list_all_hitl(
+    request: Request, status: str = "pending", limit: int = 50
+) -> list[dict[str, Any]]:
+    """Pending HITL requests across all projects (top-level dashboard panel)."""
+    try:
+        return await db_module.list_hitl_requests(
+            _db(request), None,
+            status=status if status != "all" else None,
+            limit=limit,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/projects/{project_id}/hitl")
+async def list_project_hitl(
+    project_id: str, request: Request, status: str = "pending", limit: int = 50
+) -> list[dict[str, Any]]:
+    """HITL requests scoped to a single project."""
+    try:
+        return await db_module.list_hitl_requests(
+            _db(request), project_id,
+            status=status if status != "all" else None,
+            limit=limit,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/projects/{project_id}/hitl", status_code=201)
+async def create_hitl_endpoint(
+    project_id: str, body: dict[str, Any], request: Request
+) -> dict[str, Any]:
+    """Create a HITL request. Sessions paused on blocking should POST then poll
+    GET /hitl/{id} until status='answered'."""
+    project = await db_module.get_project(_db(request), project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="project not found")
+    question = (body.get("question") or "").strip()
+    if not question:
+        raise HTTPException(status_code=400, detail="question required")
+    try:
+        return await db_module.request_hitl(
+            _db(request), project_id, question,
+            session_id=body.get("session_id"),
+            context=body.get("context"),
+            urgency=body.get("urgency", "normal"),
+            assigned_to=body.get("assigned_to"),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/hitl/{request_id}")
+async def get_hitl_endpoint(request_id: str, request: Request) -> dict[str, Any]:
+    """Single HITL request lookup — sessions poll this to get the answer."""
+    r = await db_module.get_hitl_request(_db(request), request_id)
+    if r is None:
+        raise HTTPException(status_code=404, detail="hitl request not found")
+    return r
+
+
+@app.patch("/hitl/{request_id}")
+async def patch_hitl_endpoint(
+    request_id: str, body: dict[str, Any], request: Request
+) -> dict[str, Any]:
+    """Answer or dismiss a HITL request."""
+    db = _db(request)
+    action = (body.get("action") or "answer").lower()
+    if action == "answer":
+        answer = body.get("answer", "").strip()
+        if not answer:
+            raise HTTPException(status_code=400, detail="answer required")
+        result = await db_module.answer_hitl_request(
+            db, request_id, answer, answered_by=body.get("answered_by")
+        )
+    elif action == "dismiss":
+        result = await db_module.dismiss_hitl_request(db, request_id)
+    else:
+        raise HTTPException(status_code=400, detail="action must be 'answer' or 'dismiss'")
+    if result is None:
+        raise HTTPException(status_code=404, detail="hitl request not found")
+    return result
+
+
+# ---------------------------------------------------------------------------
+# v2.4 — Team visibility (per-human swimlane + standup digest data)
+# ---------------------------------------------------------------------------
+
+
+@app.get("/team/summary")
+async def get_team_summary_endpoint(
+    request: Request, project_id: str | None = None, days: int = 1
+) -> dict[str, Any]:
+    """Aggregate task_log + sessions by human_id over the last N days.
+
+    ``project_id`` optional — omit to roll up across all projects.
+    Returns ``{period_days, humans:[...], active_count}``. Used by the
+    Team tab cards, swimlane timeline, and standup digest.
+    """
+    return await db_module.get_team_summary(_db(request), project_id, days)
+
+
+# ---------------------------------------------------------------------------
+# v2.4 — Webhook intake for framework integrations
+# ---------------------------------------------------------------------------
+
+
+@app.post("/projects/{project_id}/events", status_code=201)
+async def post_project_event(
+    project_id: str, body: dict[str, Any], request: Request
+) -> dict[str, Any]:
+    """Normalize a framework event into Meridian's task_log.
+
+    Auth: ``X-Meridian-Token: <project_token>`` header.  The token grants
+    write-access to a single project's task_log only — call
+    ``ensure_project_token`` to mint one (returned by the dashboard's
+    Project settings panel, by GET /projects/{id}/webhook-token).
+
+    Body schema (all optional except description+session_name):
+    ```
+    {
+      "type": "task_completed" | "checkpoint" | "hitl_request" | "session_start",
+      "session_name": "langgraph-researcher",
+      "human_id": "langgraph",
+      "agent_framework": "langgraph",
+      "description": "researcher agent fetched 3 sources",
+      "status": "done",
+      "parent_task_id": null,
+      "metadata": {}
+    }
+    ```
+    """
+    db = _db(request)
+    auth_token = request.headers.get("X-Meridian-Token", "")
+    project_by_token = await db_module.get_project_by_token(db, auth_token) if auth_token else None
+    if project_by_token is None or project_by_token["id"] != project_id:
+        raise HTTPException(status_code=401, detail="invalid or missing X-Meridian-Token")
+
+    event_type = body.get("type") or "task_completed"
+    description = (body.get("description") or "").strip()
+    if not description:
+        raise HTTPException(status_code=400, detail="description required")
+    session_name = body.get("session_name") or f"webhook/{body.get('agent_framework', 'custom')}"
+    human_id = body.get("human_id")
+    framework = body.get("agent_framework") or "custom"
+    status = body.get("status") or "done"
+
+    # Find-or-create a session for this framework/human/name combo so
+    # bursty webhook traffic doesn't create one session per event.
+    sessions = await db_module.get_sessions(db, project_id, active_only=False)
+    target = next(
+        (s for s in sessions if s.get("name") == session_name and s.get("agent_framework") == framework),
+        None,
+    )
+    if target is None:
+        target = await db_module.register_session(
+            db, project_id, session_name,
+            human_id=human_id, agent_framework=framework,
+        )
+
+    if event_type == "hitl_request":
+        return await db_module.request_hitl(
+            db, project_id, description,
+            session_id=target["id"], context=body.get("context"),
+            urgency=body.get("urgency", "normal"),
+            assigned_to=body.get("assigned_to"),
+        )
+
+    task = await db_module.log_task(
+        db, target["id"], project_id, description,
+        status=status, parent_task_id=body.get("parent_task_id"),
+    )
+    return {"task": task, "session_id": target["id"], "event_type": event_type}
+
+
+@app.get("/projects/{project_id}/webhook-token")
+async def get_project_webhook_token(
+    project_id: str, request: Request
+) -> dict[str, Any]:
+    """Mint-and-return the project webhook token. Shown ONCE in the UI."""
+    token = await db_module.ensure_project_token(_db(request), project_id)
+    if token is None:
+        raise HTTPException(status_code=404, detail="project not found")
+    return {"project_id": project_id, "token": token}
+
+
+# ---------------------------------------------------------------------------
 # CLAUDE.md auto-update helper
 # ---------------------------------------------------------------------------
 
@@ -2205,6 +2490,90 @@ async def _regenerate_claude_md(
         claude_md_path.write_text(updated, encoding="utf-8")
     except Exception:
         pass  # never block the caller on a write failure
+
+
+# v2.4 — auto-refresh the <current_state>...</current_state> block. This
+# is the dev-facing target the new CLAUDE.md layout uses (see CLAUDE.md
+# top). Pre-v2.4 the bottom MERIDIAN STATE section was the only target;
+# both are now kept in sync — the bottom section stays for backward compat
+# with sessions reading the legacy marker.
+import re as _re_module
+
+
+async def _refresh_claude_md_current_state(
+    db: aiosqlite.Connection,
+    repo_root: Path,
+) -> None:
+    """Refresh the ``<current_state>...</current_state>`` block in CLAUDE.md.
+
+    The default project is the most-recently-updated one. Body lines:
+    sprint, last updated timestamp, and the 5 most recent task
+    descriptions. The block content is regenerated from scratch every
+    call; surrounding markdown stays untouched.
+
+    Silently no-ops on any I/O error (file missing, permission denied,
+    no projects) so a failing write never blocks the auto-summary loop.
+    """
+    try:
+        from datetime import datetime, timezone
+        claude_md_path = repo_root / "CLAUDE.md"
+        if not claude_md_path.exists():
+            return
+        existing = claude_md_path.read_text(encoding="utf-8")
+        if "<current_state>" not in existing or "</current_state>" not in existing:
+            return
+        projects = await db_module.list_projects(db)
+        if not projects:
+            return
+        # Pick the project with the most recent task — that's the one
+        # the human is actively working on.
+        primary = projects[0]
+        try:
+            best = None
+            best_ts = ""
+            for p in projects:
+                tasks = await db_module.get_tasks(db, p["id"], limit=1)
+                if tasks and tasks[0]["created_at"] > best_ts:
+                    best_ts = tasks[0]["created_at"]
+                    best = p
+            if best is not None:
+                primary = best
+        except Exception:  # noqa: BLE001
+            pass
+
+        goal = await db_module.get_goal(db, primary["id"])
+        tasks = await db_module.get_tasks(db, primary["id"], limit=5)
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+        body_lines = [
+            "<!-- Auto-updated by Meridian. Do not edit manually. -->",
+            f"Project: {primary['name']} ({primary['id'][:8]})",
+            f"Last updated: {now}",
+        ]
+        if goal:
+            if goal.get("sprint"):
+                body_lines.append(f"Sprint: {goal['sprint']}")
+            if goal.get("north_star"):
+                ns = goal["north_star"][:200].replace("\n", " ")
+                body_lines.append(f"North Star: {ns}{'…' if len(goal['north_star']) > 200 else ''}")
+        if tasks:
+            body_lines.append("Recent:")
+            for t in tasks:
+                desc = (t.get("description") or "").replace("\n", " ")[:120]
+                status = (t.get("status") or "?").upper()
+                body_lines.append(f"  - [{status}] {desc}")
+
+        new_block = "<current_state>\n" + "\n".join(body_lines) + "\n</current_state>"
+        updated = _re_module.sub(
+            r"<current_state>[\s\S]*?</current_state>",
+            new_block,
+            existing,
+            count=1,
+        )
+        if updated != existing:
+            claude_md_path.write_text(updated, encoding="utf-8")
+    except Exception:  # noqa: BLE001
+        pass
 
 
 _ROADMAP_AUTO_COMMENT = "<!-- meridian-auto: {version} -->"
@@ -2470,9 +2839,15 @@ async def _expire_and_generate_handoffs(
     """
     result = await db_module.expire_idle_sessions(db)
     generated = False
+    import os as _os
+    _skip = not _os.environ.get("ANTHROPIC_API_KEY")
     for pid in result["project_ids"]:
         try:
-            await handoff_module.generate_handoff(db, pid, data_dir)
+            # v2.4 — auto-generated handoffs from the idle-expire loop
+            # skip the Haiku ai_summary unless the key is set.
+            await handoff_module.generate_handoff(
+                db, pid, data_dir, skip_ai_summary=_skip
+            )
             generated = True
         except Exception:  # noqa: BLE001
             pass
@@ -3091,6 +3466,55 @@ async def _handle_mcp_request(body: dict[str, Any], db: Any, data_dir: str) -> d
                  "project_id": {"type": "string"},
                  "mode": {"type": "string", "enum": ["full", "chat"]}},
                  "required": ["project_id"]}},
+            {"name": "pin_decision", "description":
+                "Create a pinned decision (editable constitution row). Use for the "
+                "current authoritative truth that supersedes earlier statements. "
+                "Category: STRATEGIC, COMPETITIVE, TECHNICAL, TACTICAL, BUSINESS, "
+                "PRODUCT, ARCHITECTURAL.",
+             "inputSchema": {"type": "object", "properties": {
+                 "project_id": {"type": "string"},
+                 "title": {"type": "string"},
+                 "body": {"type": "string"},
+                 "category": {"type": "string"}},
+                 "required": ["project_id", "title", "body"]}},
+            {"name": "update_decision", "description":
+                "Patch a pinned decision. Pass new_title + new_body to atomically "
+                "supersede (creates a new active row, marks old as superseded with "
+                "back-link). Otherwise patches body/title/category/status in place.",
+             "inputSchema": {"type": "object", "properties": {
+                 "decision_id": {"type": "string"},
+                 "new_title": {"type": "string"},
+                 "new_body": {"type": "string"},
+                 "title": {"type": "string"},
+                 "body": {"type": "string"},
+                 "category": {"type": "string"},
+                 "status": {"type": "string"}},
+                 "required": ["decision_id"]}},
+            {"name": "get_pinned_decisions", "description":
+                "List pinned decisions (active only by default, newest first).",
+             "inputSchema": {"type": "object", "properties": {
+                 "project_id": {"type": "string"},
+                 "include_superseded": {"type": "boolean"}},
+                 "required": ["project_id"]}},
+            {"name": "request_hitl", "description":
+                "Surface a question to the human-in-the-loop queue. urgency='blocking' "
+                "means this session pauses until answered (poll get_hitl_request). "
+                "urgency='normal'/'high' lands in the dashboard but doesn't block. "
+                "assigned_to routes to a specific human_id (null = broadcast).",
+             "inputSchema": {"type": "object", "properties": {
+                 "project_id": {"type": "string"},
+                 "question": {"type": "string"},
+                 "session_id": {"type": "string"},
+                 "context": {"type": "string"},
+                 "urgency": {"type": "string", "enum": ["normal", "high", "blocking"]},
+                 "assigned_to": {"type": "string"}},
+                 "required": ["project_id", "question"]}},
+            {"name": "get_hitl_request", "description":
+                "Poll a HITL request for the human's answer. Returns the row including "
+                "status ('pending'|'answered'|'dismissed') and answer text.",
+             "inputSchema": {"type": "object", "properties": {
+                 "request_id": {"type": "string"}},
+                 "required": ["request_id"]}},
         ]
         return _jsonrpc_ok(req_id, {"tools": tools})
 
@@ -3111,11 +3535,17 @@ async def _dispatch_mcp_tool(name: str, args: dict[str, Any], db: Any, data_dir:
     if name == "create_project":
         return await db_module.create_project(db, args["name"])
     if name == "register_session":
-        return await db_module.register_session(db, args["project_id"], args["session_name"],
-                                                  args.get("human_id"))
+        return await db_module.register_session(
+            db, args["project_id"], args["session_name"],
+            args.get("human_id"),
+            agent_framework=args.get("agent_framework", "claude_code"),
+        )
     if name == "start_session":
-        session = await db_module.register_session(db, args["project_id"], args["session_name"],
-                                                     args.get("human_id"))
+        session = await db_module.register_session(
+            db, args["project_id"], args["session_name"],
+            args.get("human_id"),
+            agent_framework=args.get("agent_framework", "claude_code"),
+        )
         goal = await db_module.get_goal(db, args["project_id"])
         tasks = await db_module.get_tasks(db, args["project_id"], limit=10)
         return {"session": session, "goal": goal, "recent_tasks": tasks}
@@ -3127,6 +3557,7 @@ async def _dispatch_mcp_tool(name: str, args: dict[str, Any], db: Any, data_dir:
         return await db_module.log_task(
             db, args["session_id"], args["project_id"],
             args["description"], args.get("status", "done"),
+            parent_task_id=args.get("parent_task_id"),
         )
     if name == "get_tasks":
         return await db_module.get_tasks(db, args["project_id"], args.get("limit", 20))
@@ -3134,6 +3565,47 @@ async def _dispatch_mcp_tool(name: str, args: dict[str, Any], db: Any, data_dir:
         from . import handoff as handoff_module_local
         path, content = await handoff_module_local.generate_handoff(db, args["project_id"], data_dir)
         return {"file_path": path, "content": content}
+    if name == "pin_decision":
+        return await db_module.pin_decision(
+            db, args["project_id"], args["title"], args["body"],
+            args.get("category", "TECHNICAL"),
+        )
+    if name == "update_decision":
+        new_title = args.get("new_title")
+        new_body = args.get("new_body")
+        if new_title and new_body:
+            return await db_module.supersede_pinned_decision(
+                db, args["decision_id"], new_title, new_body, args.get("category"),
+            )
+        result = await db_module.update_pinned_decision(
+            db, args["decision_id"],
+            body=args.get("body"),
+            title=args.get("title"),
+            category=args.get("category"),
+            status=args.get("status"),
+            superseded_by=args.get("superseded_by"),
+        )
+        if result is None:
+            raise ValueError("decision not found")
+        return result
+    if name == "get_pinned_decisions":
+        return await db_module.get_pinned_decisions(
+            db, args["project_id"],
+            include_superseded=bool(args.get("include_superseded", False)),
+        )
+    if name == "request_hitl":
+        return await db_module.request_hitl(
+            db, args["project_id"], args["question"],
+            session_id=args.get("session_id"),
+            context=args.get("context"),
+            urgency=args.get("urgency", "normal"),
+            assigned_to=args.get("assigned_to"),
+        )
+    if name == "get_hitl_request":
+        result = await db_module.get_hitl_request(db, args["request_id"])
+        if result is None:
+            raise ValueError("hitl request not found")
+        return result
     if name == "get_context_block":
         # v2.3 — assemble the same shape as /projects/{id}/context-block but
         # return both the rendered text AND the source dict so MCP clients
@@ -3455,6 +3927,104 @@ def build_mcp_server():
                         },
                     },
                     "required": ["project_id"],
+                },
+            ),
+            Tool(
+                name="pin_decision",
+                description=(
+                    "v2.4 — create a pinned decision (editable constitution). "
+                    "Use for authoritative current truth that supersedes "
+                    "earlier statements. The append-only set_decision log "
+                    "captures every micro-decision; pin_decision holds the "
+                    "live constitution. category: STRATEGIC, COMPETITIVE, "
+                    "TECHNICAL, TACTICAL, BUSINESS, PRODUCT, ARCHITECTURAL."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "project_id": {"type": "string"},
+                        "title": {"type": "string"},
+                        "body": {"type": "string"},
+                        "category": {"type": "string"},
+                    },
+                    "required": ["project_id", "title", "body"],
+                },
+            ),
+            Tool(
+                name="update_decision",
+                description=(
+                    "v2.4 — patch a pinned decision. Pass new_title + new_body "
+                    "to atomically supersede (new active row created, old "
+                    "marked superseded with back-link). Otherwise patches "
+                    "body/title/category/status in place."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "decision_id": {"type": "string"},
+                        "new_title": {"type": "string"},
+                        "new_body": {"type": "string"},
+                        "title": {"type": "string"},
+                        "body": {"type": "string"},
+                        "category": {"type": "string"},
+                        "status": {"type": "string"},
+                    },
+                    "required": ["decision_id"],
+                },
+            ),
+            Tool(
+                name="get_pinned_decisions",
+                description=(
+                    "v2.4 — list pinned decisions for a project (active only "
+                    "by default, newest first). Pass include_superseded=true "
+                    "for the full history."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "project_id": {"type": "string"},
+                        "include_superseded": {"type": "boolean"},
+                    },
+                    "required": ["project_id"],
+                },
+            ),
+            Tool(
+                name="request_hitl",
+                description=(
+                    "v2.4 — surface a question to the human-in-the-loop queue. "
+                    "urgency='blocking' pauses this session until answered "
+                    "(poll get_hitl_request). 'normal' / 'high' land in the "
+                    "dashboard but don't block. assigned_to routes to a "
+                    "specific human_id; null = broadcast."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "project_id": {"type": "string"},
+                        "question": {"type": "string"},
+                        "session_id": {"type": "string"},
+                        "context": {"type": "string"},
+                        "urgency": {
+                            "type": "string",
+                            "enum": ["normal", "high", "blocking"],
+                            "default": "normal",
+                        },
+                        "assigned_to": {"type": "string"},
+                    },
+                    "required": ["project_id", "question"],
+                },
+            ),
+            Tool(
+                name="get_hitl_request",
+                description=(
+                    "v2.4 — poll a HITL request for the human's answer. "
+                    "Returns the row with status ('pending'|'answered'|"
+                    "'dismissed') and answer text."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {"request_id": {"type": "string"}},
+                    "required": ["request_id"],
                 },
             ),
             Tool(
@@ -3930,6 +4500,7 @@ def build_mcp_server():
                     arguments["project_id"],
                     arguments["description"],
                     arguments.get("status", "done"),
+                    parent_task_id=arguments.get("parent_task_id"),
                 )
             elif name == "get_tasks":
                 result = await db_module.get_tasks(
@@ -3950,6 +4521,14 @@ def build_mcp_server():
                 # v2.3 — reuse the dispatch impl so HTTP and stdio share one path.
                 result = await _dispatch_mcp_tool(
                     "get_context_block", arguments, db, state["data_dir"]
+                )
+            elif name in (
+                "pin_decision", "update_decision", "get_pinned_decisions",
+                "request_hitl", "get_hitl_request",
+            ):
+                # v2.4 — share dispatch with HTTP MCP so both surfaces stay in sync.
+                result = await _dispatch_mcp_tool(
+                    name, arguments, db, state["data_dir"]
                 )
             elif name == "enqueue_claude_task":
                 raw_timeout = arguments.get("timeout", 600.0)

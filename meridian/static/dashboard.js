@@ -520,6 +520,7 @@ function buildTabBody(project) {
       <button class="vtab-btn" data-vtab="timeline" title="Activity Timeline">⌬</button>
       <button class="vtab-btn" data-vtab="rewind" title="Rewind — Last X days">↻</button>
       <button class="vtab-btn" data-vtab="queue" title="Work Queue">⚙</button>
+      <button class="vtab-btn" data-vtab="team" title="Team — per-human activity">👥</button>
     </div>
     <div class="vtab-drawer open" id="drawer-${project.id}">
       <div class="drawer-panel active" id="drawer-status-${project.id}">
@@ -577,7 +578,7 @@ function buildTabBody(project) {
         <div class="goal-subtab-strip">
           <button class="goal-subtab-btn active" data-gtab="north-star">🔭 North Star</button>
           <button class="goal-subtab-btn" data-gtab="version-goal">◎ Version Goal</button>
-          <button class="goal-subtab-btn" data-gtab="sprint">⚡ Sprint</button>
+          <button class="goal-subtab-btn" data-gtab="sprint" title="What this session is focused on right now — updated multiple times per day. Not a multi-week scrum sprint.">⚡ Session Focus</button>
           <button class="goal-subtab-btn" data-gtab="decisions">📋 Decisions</button>
         </div>
         <div class="goal-subtab-body">
@@ -604,7 +605,7 @@ function buildTabBody(project) {
             </div>
           </div>
           <div class="goal-subtab-panel" id="gtab-sprint-${project.id}">
-            <div style="color:var(--muted);font-size:10px;margin-bottom:4px">Sprint header:</div>
+            <div style="color:var(--muted);font-size:10px;margin-bottom:4px">Session Focus header:</div>
             <div style="display:flex;gap:6px;margin-bottom:10px;align-items:center">
               <input type="text" id="goal-sprint-${project.id}" placeholder="v1.9.x — description" style="flex:1;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;padding:6px 8px;color:var(--text);font-family:var(--font-mono);font-size:11px;outline:none">
               <button class="secondary" id="save-sprint-${project.id}" style="white-space:nowrap">save</button>
@@ -618,8 +619,19 @@ function buildTabBody(project) {
             </div>
           </div>
           <div class="goal-subtab-panel" id="gtab-decisions-${project.id}">
-            <div style="color:var(--muted);font-size:10px;margin-bottom:8px">Append-only decisions log (newest first). Read-only — log decisions via the <code>set_decision</code> MCP tool.</div>
-            <div id="decisions-table-${project.id}" style="font-family:var(--font-mono);font-size:12px"></div>
+            <div style="margin-bottom:14px">
+              <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+                <div style="color:var(--accent);font-weight:600;font-size:12px">📌 Pinned (Constitution)</div>
+                <button class="secondary" id="add-pinned-decision-${project.id}" style="padding:3px 10px;font-size:10px">+ Pin</button>
+              </div>
+              <div style="color:var(--muted);font-size:10px;margin-bottom:8px">Editable current truth. Use <code>pin_decision</code> MCP tool or <code>update_decision</code> with new_title+new_body to supersede.</div>
+              <div id="pinned-decisions-${project.id}" style="font-family:var(--font-mono);font-size:12px"></div>
+            </div>
+            <details style="margin-top:14px">
+              <summary style="cursor:pointer;color:var(--accent);font-weight:600;font-size:12px;padding:4px 0">📋 History (Append-only log)</summary>
+              <div style="color:var(--muted);font-size:10px;margin:8px 0">Append-only via <code>set_decision</code>. Captures every micro-decision; the constitution above is the live truth.</div>
+              <div id="decisions-table-${project.id}" style="font-family:var(--font-mono);font-size:12px"></div>
+            </details>
           </div>
         </div>
         <div style="flex-shrink:0;padding:8px 14px;border-top:1px solid var(--border)">
@@ -685,6 +697,22 @@ function buildTabBody(project) {
         </div>
         <div style="flex:1;overflow-y:auto" id="queue-body-${project.id}">
           <div class="empty" style="color:var(--muted)">select queue to load</div>
+        </div>
+      </div>
+      <div class="drawer-panel" id="drawer-team-${project.id}">
+        <div class="drawer-header" style="justify-content:space-between">
+          <span>TEAM · ${escapeHtml(project.name)}</span>
+          <span style="display:flex;gap:6px;align-items:center">
+            <select id="team-days-${project.id}" style="background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:2px 4px">
+              <option value="1">last 1d</option>
+              <option value="7" selected>last 7d</option>
+              <option value="30">last 30d</option>
+            </select>
+            <button class="secondary" id="team-refresh-${project.id}" style="padding:2px 8px;font-size:10px">refresh</button>
+          </span>
+        </div>
+        <div style="flex:1;overflow-y:auto;padding:14px;font-family:'IBM Plex Mono',monospace;font-size:11px" id="team-body-${project.id}">
+          <div class="empty" style="color:var(--muted)">loading team summary…</div>
         </div>
       </div>
     </div>
@@ -774,11 +802,12 @@ function buildTabBody(project) {
         if (vtab === 'rewind') initRewindTab(project.id);
         if (vtab === 'queue') loadQueue(project.id);
         if (vtab === 'live') loadLiveTab(project.id);
+        if (vtab === 'team') loadTeamTab(project.id);
       };
     });
   }
 
-  // Goal subtab switching (North Star / Version Goal / Sprint)
+  // Goal subtab switching (North Star / Version Goal / Sprint / Decisions)
   const goalDrawer = document.getElementById(`drawer-goal-${project.id}`);
   if (goalDrawer) {
     goalDrawer.querySelectorAll('.goal-subtab-btn').forEach(btn => {
@@ -788,9 +817,16 @@ function buildTabBody(project) {
         goalDrawer.querySelectorAll('.goal-subtab-panel').forEach(p => {
           p.classList.toggle('active', p.id === `gtab-${gtab}-${project.id}`);
         });
+        // v2.4 — lazy-load pinned decisions when the subtab opens, so first
+        // paint isn't blocked on the extra fetch.
+        if (gtab === 'decisions') loadPinnedDecisions(project.id);
       };
     });
   }
+
+  // v2.4 — wire the [+ Pin] button on the Decisions subtab.
+  const addPinBtn = document.getElementById(`add-pinned-decision-${project.id}`);
+  if (addPinBtn) addPinBtn.onclick = () => addPinnedDecision(project.id);
 
   document.getElementById(`save-goal-${project.id}`).onclick = () => saveGoal(project.id);
   document.getElementById(`save-north-star-${project.id}`).onclick = () => saveNorthStar(project.id);
@@ -1270,10 +1306,17 @@ function renderLiveSessions(projectId, sessions, tasks) {
         + (summary.tasks_completed != null ? ` · ${summary.tasks_completed} tasks` : '')
         + `</div>`
       : '';
+    // v2.4 — framework badge (claude_code / cursor / windsurf / langgraph
+    // / autogen / openviking / custom). Only render when non-default so
+    // the bulk of Claude-driven sessions stay visually quiet.
+    const fw = s.agent_framework || 'claude_code';
+    const fwBadge = (fw && fw !== 'claude_code')
+      ? `<span class="framework-badge" title="framework: ${escapeHtml(fw)}" style="display:inline-block;background:var(--surface-2);color:var(--accent);font-size:9px;font-weight:600;padding:1px 5px;border-radius:3px;margin-left:4px">${escapeHtml(fw)}</span>`
+      : '';
     return `<div class="live-session-row">
       <div class="live-session-head">
         <span class="live-dot">${dot}</span>
-        <span class="live-session-name">${escapeHtml(label)}</span>
+        <span class="live-session-name">${escapeHtml(label)}</span>${fwBadge}
         <span class="live-session-age">${escapeHtml(formatRelativeTime(s.last_seen))}</span>
       </div>
       ${claimedRow}${summaryRow}
@@ -1626,6 +1669,138 @@ function renderTimeline(projectId, data) {
   wrap.innerHTML = `<div class="timeline-log">${rows}</div>`;
 }
 
+const _HUMAN_COLORS = ['#6c8fff', '#a78bfa', '#22d3ee', '#4ade80', '#fbbf24', '#f87171', '#fb923c', '#e879f9'];
+function _colorForHuman(humanId) {
+  /** Stable hash → palette index so each human keeps the same swimlane color. */
+  let h = 0;
+  for (let i = 0; i < (humanId || '').length; i++) h = ((h << 5) - h + humanId.charCodeAt(i)) | 0;
+  return _HUMAN_COLORS[Math.abs(h) % _HUMAN_COLORS.length];
+}
+
+async function loadTeamTab(projectId) {
+  /** v2.4 — Team tab: per-human presence cards + standup digest +
+   * swimlane timeline. Pulls /team/summary?project_id=&days=N once per
+   * load. Re-renders on day-range change or refresh button. */
+  const body = document.getElementById(`team-body-${projectId}`);
+  const daySel = document.getElementById(`team-days-${projectId}`);
+  const refreshBtn = document.getElementById(`team-refresh-${projectId}`);
+  if (!body) return;
+
+  const render = async () => {
+    body.innerHTML = `<div class="empty" style="color:var(--muted)">loading team summary…</div>`;
+    const days = parseInt((daySel && daySel.value) || '7', 10);
+    try {
+      const data = await api(`/team/summary?project_id=${encodeURIComponent(projectId)}&days=${days}`);
+      const humans = data.humans || [];
+      if (humans.length === 0) {
+        body.innerHTML = `<div style="color:var(--muted);padding:10px;text-align:center;border:1px dashed var(--border);border-radius:4px">
+          (no human-attributed activity in the last ${data.period_days}d — set <code>MERIDIAN_HUMAN_ID</code> or pass <code>human_id</code> to register_session)
+        </div>`;
+        return;
+      }
+      // Presence cards.
+      const dotColor = { active: '#4ade80', recent: '#fbbf24', idle: '#6b7280' };
+      const cards = humans.map(h => {
+        const c = _colorForHuman(h.human_id);
+        const dc = dotColor[h.presence] || dotColor.idle;
+        const fw = (h.agent_framework && h.agent_framework !== 'claude_code')
+          ? `<span style="background:var(--surface-2);color:var(--accent);font-size:9px;font-weight:600;padding:1px 5px;border-radius:3px;margin-left:4px">${escapeHtml(h.agent_framework)}</span>`
+          : '';
+        const tasksLine = `${h.tasks_done} done · ${h.tasks_pending} pending${h.tasks_failed ? ' · ' + h.tasks_failed + ' failed' : ''}`;
+        const lastSeen = h.last_seen ? formatRelativeTime(h.last_seen) : 'never';
+        const recent = (h.recent || []).slice(0, 3).map(t => {
+          const s = (t.status || '?').toUpperCase();
+          const desc = (t.description || '').slice(0, 90);
+          return `<div style="color:var(--muted);font-size:10px;padding:1px 0">[${escapeHtml(s)}] ${escapeHtml(desc)}</div>`;
+        }).join('');
+        return `<div style="background:var(--surface-2);border:1px solid var(--border);border-left:3px solid ${c};border-radius:4px;padding:10px 12px;margin-bottom:8px">
+          <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px">
+            <span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${dc}"></span>
+            <span style="color:${c};font-weight:600">${escapeHtml(h.human_id)}</span>${fw}
+            <span style="color:var(--muted);font-size:10px;margin-left:auto">${escapeHtml(lastSeen)}</span>
+          </div>
+          <div style="color:var(--text);font-size:11px;margin-bottom:2px">${escapeHtml(h.active_session || '(no active session)')}</div>
+          <div style="color:var(--accent);font-size:10px;margin-bottom:4px">${escapeHtml(tasksLine)}</div>
+          ${recent}
+        </div>`;
+      }).join('');
+
+      // Swimlane timeline — one row per human, dots colored by task status.
+      const swimlane = _renderSwimlane(humans, days);
+
+      // Standup digest — one line per person with their most recent
+      // descriptions concatenated.
+      const standup = humans.map(h => {
+        const c = _colorForHuman(h.human_id);
+        const last = (h.recent || []).map(t => (t.description || '').slice(0, 60)).slice(0, 4).join('; ');
+        return `<div style="padding:3px 0;border-left:2px solid ${c};padding-left:8px;font-size:11px">
+          <span style="color:${c};font-weight:600">${escapeHtml(h.human_id)}</span> · ${h.tasks_done} done — <span style="color:var(--muted)">${escapeHtml(last) || '—'}</span>
+        </div>`;
+      }).join('');
+
+      body.innerHTML = `
+        <section>
+          <div style="color:var(--accent);font-weight:600;margin-bottom:8px">👥 Live (${data.active_count} active)</div>
+          ${cards}
+        </section>
+        <section style="margin-top:18px">
+          <div style="color:var(--accent);font-weight:600;margin-bottom:8px">📊 Swimlane — last ${data.period_days}d</div>
+          ${swimlane}
+        </section>
+        <section style="margin-top:18px;padding-top:10px;border-top:1px solid var(--border)">
+          <div style="color:var(--accent);font-weight:600;margin-bottom:8px">🗞 Standup digest</div>
+          ${standup}
+        </section>`;
+    } catch (e) {
+      body.innerHTML = `<div style="color:var(--muted)">failed to load team summary: ${escapeHtml(String(e))}</div>`;
+    }
+  };
+
+  if (daySel) daySel.onchange = render;
+  if (refreshBtn) refreshBtn.onclick = render;
+  render();
+}
+
+function _renderSwimlane(humans, days) {
+  /** v2.4 — minimal swimlane: one row per human, dots positioned by
+   * task created_at within the window. Pure CSS / inline SVG — no chart
+   * library dependency. Coarse-resolution is fine for the standup view. */
+  if (!humans.length) return '<div style="color:var(--muted)">no activity</div>';
+  const now = Date.now();
+  const windowMs = days * 86400 * 1000;
+  const start = now - windowMs;
+  const statusColor = {
+    done: '#4ade80', failed: '#f87171', pending: '#fbbf24',
+    'in_progress': '#a78bfa', 'pending-hitl': '#fb923c',
+  };
+  // SVG geometry
+  const rowH = 28;
+  const labelW = 100;
+  const width = 720;
+  const height = humans.length * rowH + 24;
+  const x = (ts) => {
+    try {
+      const t = Date.parse((ts || '').replace(' ', 'T') + 'Z');
+      if (!isFinite(t)) return labelW;
+      return labelW + Math.max(0, Math.min(1, (t - start) / windowMs)) * (width - labelW - 14);
+    } catch (e) { return labelW; }
+  };
+  const rows = humans.map((h, i) => {
+    const y = 14 + i * rowH;
+    const c = _colorForHuman(h.human_id);
+    const dots = (h.recent || []).map(t => {
+      const dc = statusColor[t.status] || '#6b7280';
+      return `<circle cx="${x(t.created_at)}" cy="${y}" r="4" fill="${dc}" stroke="${c}" stroke-width="1">
+        <title>[${(t.status || '?').toUpperCase()}] ${(t.description || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;')}</title>
+      </circle>`;
+    }).join('');
+    return `<line x1="${labelW}" y1="${y}" x2="${width - 8}" y2="${y}" stroke="var(--border)" stroke-dasharray="2,3"/>
+      <text x="${labelW - 6}" y="${y + 4}" text-anchor="end" font-size="10" fill="${c}" font-family="var(--font-mono)">${escapeHtml(h.human_id.slice(0, 14))}</text>
+      ${dots}`;
+  }).join('');
+  return `<div style="overflow-x:auto;background:var(--surface-2);border:1px solid var(--border);border-radius:4px;padding:6px"><svg viewBox="0 0 ${width} ${height}" style="width:100%;min-width:600px;height:${height}px">${rows}</svg></div>`;
+}
+
 async function loadQueue(projectId) {
   /**v1.4.0 — work queue panel. Loads all tasks and segments them into
    * pending / in_progress / done / failed buckets — a Minecraft-hopper view
@@ -1889,6 +2064,8 @@ async function refreshGoal(projectId) {
     // v2.3 — decisions table subtab. goal.decisions is the append-only
     // blob: "[YYYY-MM-DD] text\n\n[YYYY-MM-DD] text\n\n..." (newest first).
     renderDecisionsTable(projectId, goal.decisions || '');
+    // v2.4 — pinned decisions (editable constitution) above the log.
+    loadPinnedDecisions(projectId);
   } catch (e) {
     ta.value = '';
     v.textContent = '(unset)';
@@ -1910,6 +2087,210 @@ function parseDecisionsBlob(blob) {
     if (m) return { date: m[1], text: m[2].trim() };
     return { date: '', text: chunk };
   });
+}
+
+const _DECISION_CATEGORY_COLORS = {
+  STRATEGIC:     '#a78bfa',
+  COMPETITIVE:   '#f87171',
+  TECHNICAL:     '#6c8fff',
+  TACTICAL:      '#fbbf24',
+  BUSINESS:      '#4ade80',
+  PRODUCT:       '#22d3ee',
+  ARCHITECTURAL: '#fb923c',
+};
+
+// ---------------------------------------------------------------------------
+// v2.4 — HITL (human-in-the-loop) queue panel
+// ---------------------------------------------------------------------------
+
+const _HITL_URGENCY_COLOR = {
+  blocking: '#f87171',  // red — session paused, answer now
+  high:     '#fbbf24',  // amber — should answer soon
+  normal:   '#6c8fff',  // blue — nice-to-have
+};
+
+let _hitlPollTimer = null;
+
+function initHitlPanel() {
+  /** v2.4 — boot the HITL polling loop + toggle wire-up. The bar at the
+   * top of <main> auto-shows when there's at least one pending request
+   * across any project. Idle state stays hidden so it doesn't add visual
+   * noise when nothing's waiting. */
+  const toggleBtn = document.getElementById('hitl-toggle-btn');
+  if (toggleBtn) {
+    toggleBtn.onclick = () => {
+      const panel = document.getElementById('hitl-panel');
+      if (!panel) return;
+      const isOpen = panel.style.display !== 'none';
+      panel.style.display = isOpen ? 'none' : 'block';
+      toggleBtn.textContent = isOpen ? 'Open' : 'Close';
+    };
+  }
+  refreshHitl();
+  if (_hitlPollTimer) clearInterval(_hitlPollTimer);
+  // 30s poll — cheap (single SELECT) and gives a "felt-instant" feel for
+  // a paused AI session looking for a human response.
+  _hitlPollTimer = setInterval(refreshHitl, 30_000);
+}
+
+async function refreshHitl() {
+  /** v2.4 — fetch pending HITL requests across all projects + repaint. */
+  const bar = document.getElementById('hitl-bar');
+  const countEl = document.getElementById('hitl-count');
+  const list = document.getElementById('hitl-list');
+  if (!bar || !countEl || !list) return;
+  try {
+    const items = await api('/hitl?status=pending&limit=50');
+    const n = items.length;
+    countEl.textContent = String(n);
+    if (n === 0) {
+      bar.style.display = 'none';
+      document.getElementById('hitl-panel').style.display = 'none';
+      return;
+    }
+    bar.style.display = 'flex';
+    list.innerHTML = items.map(r => {
+      const color = _HITL_URGENCY_COLOR[r.urgency] || _HITL_URGENCY_COLOR.normal;
+      const ts = formatRelativeTime(r.created_at);
+      const ctx = r.context
+        ? `<details style="margin-top:4px"><summary style="cursor:pointer;color:var(--muted);font-size:10px">context</summary><pre style="margin:6px 0 0;padding:6px 8px;background:var(--surface-1);border-radius:3px;font-size:11px;white-space:pre-wrap;word-break:break-word">${escapeHtml(r.context)}</pre></details>`
+        : '';
+      const assigned = r.assigned_to
+        ? `<span style="color:var(--muted);font-size:10px">→ ${escapeHtml(r.assigned_to)}</span>`
+        : '';
+      return `<div data-hitl-id="${escapeHtml(r.id)}" style="border-left:3px solid ${color};background:var(--surface-1);padding:10px 12px;margin-bottom:8px;border-radius:0 4px 4px 0">
+        <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:6px;flex-wrap:wrap">
+          <div style="display:flex;align-items:center;gap:6px;min-width:0;flex:1">
+            <span style="background:${color}22;color:${color};font-size:9px;font-weight:700;letter-spacing:.5px;padding:2px 6px;border-radius:3px">${escapeHtml((r.urgency || 'normal').toUpperCase())}</span>
+            ${assigned}
+            <span style="color:var(--muted);font-size:10px">${escapeHtml(ts)}</span>
+          </div>
+          <div style="display:flex;gap:4px">
+            <button class="secondary hitl-dismiss-btn" data-hitl-id="${escapeHtml(r.id)}" style="padding:2px 8px;font-size:10px">Dismiss</button>
+          </div>
+        </div>
+        <div style="color:var(--text);white-space:pre-wrap;word-break:break-word;line-height:1.5;font-size:12px;margin-bottom:8px">${escapeHtml(r.question || '')}</div>
+        ${ctx}
+        <div style="display:flex;gap:6px;margin-top:8px">
+          <input type="text" class="hitl-answer-input" data-hitl-id="${escapeHtml(r.id)}" placeholder="Type answer and hit Enter…" style="flex:1;background:var(--surface-2);border:1px solid var(--border);border-radius:4px;padding:6px 10px;color:var(--text);font-family:var(--font-mono);font-size:11px;outline:none">
+          <button class="primary hitl-answer-btn" data-hitl-id="${escapeHtml(r.id)}" style="padding:5px 12px;font-size:11px">Answer</button>
+        </div>
+      </div>`;
+    }).join('');
+    list.querySelectorAll('.hitl-answer-btn').forEach(btn => {
+      btn.onclick = () => _hitlAnswer(btn.dataset.hitlId);
+    });
+    list.querySelectorAll('.hitl-dismiss-btn').forEach(btn => {
+      btn.onclick = () => _hitlDismiss(btn.dataset.hitlId);
+    });
+    list.querySelectorAll('.hitl-answer-input').forEach(inp => {
+      inp.onkeydown = (ev) => {
+        if (ev.key === 'Enter') _hitlAnswer(inp.dataset.hitlId);
+      };
+    });
+  } catch (e) {
+    // Silent fail on poll — don't toast every 30s when offline.
+  }
+}
+
+async function _hitlAnswer(id) {
+  const inp = document.querySelector(`.hitl-answer-input[data-hitl-id="${id}"]`);
+  const answer = (inp && inp.value || '').trim();
+  if (!answer) { toast('answer required', true); return; }
+  try {
+    await api(`/hitl/${id}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ action: 'answer', answer }),
+    });
+    toast('HITL answered');
+    refreshHitl();
+  } catch (e) { toast('answer failed: ' + e.message, true); }
+}
+
+async function _hitlDismiss(id) {
+  if (!confirm('Dismiss this HITL request without answering?')) return;
+  try {
+    await api(`/hitl/${id}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ action: 'dismiss' }),
+    });
+    refreshHitl();
+  } catch (e) { toast('dismiss failed: ' + e.message, true); }
+}
+
+async function loadPinnedDecisions(projectId) {
+  /** v2.4 — fetch the active pinned decisions for this project and render
+   * them as colored category cards. The decisions tab also lists the
+   * append-only log below in a collapsible <details>; pinned shows above
+   * because it's the current authoritative truth. */
+  const host = document.getElementById(`pinned-decisions-${projectId}`);
+  if (!host) return;
+  try {
+    const items = await api(`/projects/${projectId}/decisions-pinned`);
+    if (!items || items.length === 0) {
+      host.innerHTML = `<div style="color:var(--muted);padding:10px;text-align:center;border:1px dashed var(--border);border-radius:4px">(no pinned decisions yet — call <code>pin_decision</code> from MCP)</div>`;
+      return;
+    }
+    host.innerHTML = items.map(d => {
+      const cat = d.category || 'TECHNICAL';
+      const color = _DECISION_CATEGORY_COLORS[cat] || _DECISION_CATEGORY_COLORS.TECHNICAL;
+      const dateStr = (d.created_at || '').slice(0, 10);
+      return `<div style="background:var(--surface-2);border:1px solid var(--border);border-left:4px solid ${color};border-radius:4px;padding:10px 12px;margin-bottom:8px">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;gap:8px">
+          <div style="display:flex;align-items:center;gap:8px;min-width:0;flex:1">
+            <span style="display:inline-block;background:${color}22;color:${color};font-size:9px;font-weight:700;letter-spacing:.5px;padding:2px 6px;border-radius:3px;flex-shrink:0">${escapeHtml(cat)}</span>
+            <span style="color:var(--accent);font-weight:600;font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escapeHtml(d.title || '')}</span>
+          </div>
+          <div style="display:flex;gap:6px;flex-shrink:0">
+            <span style="color:var(--muted);font-size:10px">${escapeHtml(dateStr)}</span>
+            <button class="secondary" data-supersede="${escapeHtml(d.id)}" style="padding:1px 6px;font-size:9px">Supersede</button>
+          </div>
+        </div>
+        <div style="color:var(--text);white-space:pre-wrap;word-break:break-word;line-height:1.5;font-size:12px">${escapeHtml(d.body || '')}</div>
+      </div>`;
+    }).join('');
+    host.querySelectorAll('[data-supersede]').forEach(btn => {
+      btn.onclick = () => supersedePinnedDecision(projectId, btn.dataset.supersede);
+    });
+  } catch (e) {
+    host.innerHTML = `<div style="color:var(--muted)">failed to load pinned decisions: ${escapeHtml(String(e))}</div>`;
+  }
+}
+
+async function supersedePinnedDecision(projectId, decisionId) {
+  /** v2.4 — supersede flow: prompt for new title + body, atomic call to
+   * the supersede endpoint (creates new active row, marks old superseded
+   * with back-link). */
+  const newTitle = prompt('New decision title (replaces this one):');
+  if (!newTitle) return;
+  const newBody = prompt('New decision body:');
+  if (!newBody) return;
+  try {
+    await api(`/projects/${projectId}/decisions-pinned/${decisionId}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ new_title: newTitle, new_body: newBody }),
+    });
+    toast('decision superseded');
+    loadPinnedDecisions(projectId);
+  } catch (e) { toast('supersede failed: ' + e.message, true); }
+}
+
+async function addPinnedDecision(projectId) {
+  /** v2.4 — quick-add flow from the [+ Pin] button. */
+  const title = prompt('Decision title:');
+  if (!title) return;
+  const body = prompt('Decision body:');
+  if (!body) return;
+  const category = prompt('Category (STRATEGIC/COMPETITIVE/TECHNICAL/TACTICAL/BUSINESS/PRODUCT/ARCHITECTURAL):', 'TECHNICAL');
+  if (!category) return;
+  try {
+    await api(`/projects/${projectId}/decisions-pinned`, {
+      method: 'POST',
+      body: JSON.stringify({ title, body, category: category.toUpperCase() }),
+    });
+    toast('decision pinned');
+    loadPinnedDecisions(projectId);
+  } catch (e) { toast('pin failed: ' + e.message, true); }
 }
 
 function renderDecisionsTable(projectId, blob) {
@@ -2406,6 +2787,9 @@ async function restoreTabs() {
   // v1.5.x — polling removed. WebSocket pushes task/goal updates; sessions
   // refresh on initial page load + explicit user action only (tab switch,
   // worker start, etc). Idle dropdowns no longer hammer /sessions every 1s.
+
+  // v2.4 — HITL queue: poll for pending requests every 30s + initial load.
+  initHitlPanel();
 
   // v1.7.0 — stop server button
   const stopBtn = document.getElementById('stop-server-btn');

@@ -113,6 +113,7 @@ async def test_log_task_rejects_bad_status(db):
 
 @pytest.mark.asyncio
 async def test_handoff_generates_clean_markdown(db, tmp_path):
+    """v2.4 — handoff renders L0/L1/L2 tiers with sessions + tasks + ai_summary."""
     p = await db_module.create_project(db, "alpha")
     await db_module.set_goal(db, p["id"], "build a thing")
     s1 = await db_module.register_session(db, p["id"], "sess-1")
@@ -120,14 +121,15 @@ async def test_handoff_generates_clean_markdown(db, tmp_path):
     await db_module.log_task(db, s1["id"], p["id"], "did A", "done")
     await db_module.log_task(db, s2["id"], p["id"], "did B", "done")
     path, content = await handoff_module.generate_handoff(
-        db, p["id"], str(tmp_path)
+        db, p["id"], str(tmp_path), skip_ai_summary=True
     )
     assert "MERIDIAN_CONTEXT" in content
-    assert "## Goal State (v1)" in content
+    # v2.4 — tier markers replace the old single "Goal State" header.
+    assert "## L0 — Core Context" in content
+    assert "## L1 — Current State" in content
     assert "build a thing" in content
-    assert "## Active Sessions (2)" in content
+    # v2.4 — both sessions still listed (active + recent).
     assert "sess-1" in content and "sess-2" in content
-    assert "## Recent Task Log" in content
     assert "did A" in content and "did B" in content
     assert "## Resume Instructions" in content
     on_disk = tmp_path / "alpha_handoff.md"
@@ -4966,3 +4968,239 @@ async def test_get_available_pool_project(db):
     # May be None or a different pool project (if others exist with room)
     if found is not None:
         assert found["neon_project_id"] != neon_id or found["customer_count"] < 8
+
+
+# ---------------------------------------------------------------------------
+# v2.4 — decisions_pinned (editable constitution)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_pin_decision_inserts_row(db):
+    """v2.4 — pin_decision creates an active row with the given category."""
+    p = await db_module.create_project(db, "v24-pin")
+    d = await db_module.pin_decision(
+        db, p["id"], "psycopg3 only", "asyncpg has Windows DLL hang", "TECHNICAL"
+    )
+    assert d["title"] == "psycopg3 only"
+    assert d["status"] == "active"
+    assert d["category"] == "TECHNICAL"
+
+
+@pytest.mark.asyncio
+async def test_pin_decision_rejects_invalid_category(db):
+    p = await db_module.create_project(db, "v24-pin-bad")
+    with pytest.raises(ValueError):
+        await db_module.pin_decision(db, p["id"], "t", "b", "INVALID_CATEGORY")
+
+
+@pytest.mark.asyncio
+async def test_get_pinned_decisions_filters_superseded(db):
+    """Default get_pinned_decisions returns active only; flag toggles full history."""
+    p = await db_module.create_project(db, "v24-pin-list")
+    d1 = await db_module.pin_decision(db, p["id"], "first truth", "body1", "TECHNICAL")
+    new = await db_module.supersede_pinned_decision(
+        db, d1["id"], "second truth", "body2", "TECHNICAL"
+    )
+    active = await db_module.get_pinned_decisions(db, p["id"])
+    assert [d["title"] for d in active] == ["second truth"]
+    all_ = await db_module.get_pinned_decisions(db, p["id"], include_superseded=True)
+    titles = {d["title"] for d in all_}
+    assert titles == {"first truth", "second truth"}
+    old = next(d for d in all_ if d["title"] == "first truth")
+    assert old["status"] == "superseded"
+    assert old["superseded_by"] == new["id"]
+
+
+def test_decisions_pinned_http_round_trip(client):
+    """v2.4 — POST then GET then PATCH-supersede via HTTP endpoints."""
+    project = client.post("/projects", json={"name": "v24-pin-http"}).json()
+    # Create
+    r = client.post(
+        f"/projects/{project['id']}/decisions-pinned",
+        json={"title": "ship it", "body": "ship now", "category": "STRATEGIC"},
+    )
+    assert r.status_code == 201
+    d = r.json()
+    # List
+    r = client.get(f"/projects/{project['id']}/decisions-pinned")
+    assert r.status_code == 200
+    assert any(x["title"] == "ship it" for x in r.json())
+    # Supersede
+    r = client.patch(
+        f"/projects/{project['id']}/decisions-pinned/{d['id']}",
+        json={"new_title": "ship later", "new_body": "wait a week"},
+    )
+    assert r.status_code == 200
+    assert r.json()["title"] == "ship later"
+    # Active list now only shows the new one
+    r = client.get(f"/projects/{project['id']}/decisions-pinned")
+    titles = [x["title"] for x in r.json()]
+    assert titles == ["ship later"]
+
+
+# ---------------------------------------------------------------------------
+# v2.4 — HITL queue
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_request_and_answer_hitl(db):
+    """v2.4 — request_hitl + answer_hitl_request round-trip."""
+    p = await db_module.create_project(db, "v24-hitl")
+    s = await db_module.register_session(db, p["id"], "worker")
+    h = await db_module.request_hitl(
+        db, p["id"], "Which approach?", session_id=s["id"],
+        context="Trade-off between A and B.", urgency="blocking",
+    )
+    assert h["status"] == "pending"
+    assert h["urgency"] == "blocking"
+    answered = await db_module.answer_hitl_request(
+        db, h["id"], "Pick A.", answered_by="adam"
+    )
+    assert answered["status"] == "answered"
+    assert answered["answer"] == "Pick A."
+    assert answered["answered_by"] == "adam"
+
+
+@pytest.mark.asyncio
+async def test_list_hitl_orders_blocking_first(db):
+    """v2.4 — blocking urgency sorts ahead of high / normal."""
+    p = await db_module.create_project(db, "v24-hitl-sort")
+    await db_module.request_hitl(db, p["id"], "normal one", urgency="normal")
+    await db_module.request_hitl(db, p["id"], "blocking one", urgency="blocking")
+    await db_module.request_hitl(db, p["id"], "high one", urgency="high")
+    items = await db_module.list_hitl_requests(db, p["id"])
+    assert [it["urgency"] for it in items] == ["blocking", "high", "normal"]
+
+
+def test_hitl_http_endpoints(client):
+    """v2.4 — POST/GET/PATCH HITL via HTTP."""
+    project = client.post("/projects", json={"name": "v24-hitl-http"}).json()
+    # Create
+    r = client.post(
+        f"/projects/{project['id']}/hitl",
+        json={"question": "Approve?", "urgency": "high"},
+    )
+    assert r.status_code == 201
+    h = r.json()
+    # List
+    r = client.get("/hitl")
+    assert r.status_code == 200
+    assert any(x["id"] == h["id"] for x in r.json())
+    # Answer
+    r = client.patch(f"/hitl/{h['id']}", json={"action": "answer", "answer": "yes"})
+    assert r.status_code == 200
+    assert r.json()["status"] == "answered"
+    assert r.json()["answer"] == "yes"
+
+
+# ---------------------------------------------------------------------------
+# v2.4 — Webhook intake
+# ---------------------------------------------------------------------------
+
+
+def test_events_webhook_requires_token(client):
+    """v2.4 — POST /events without X-Meridian-Token returns 401."""
+    project = client.post("/projects", json={"name": "v24-evt"}).json()
+    r = client.post(
+        f"/projects/{project['id']}/events",
+        json={"description": "task X", "agent_framework": "langgraph"},
+    )
+    assert r.status_code == 401
+
+
+def test_events_webhook_normalizes_to_task_log(client):
+    """v2.4 — valid token, event lands in task_log with framework label."""
+    project = client.post("/projects", json={"name": "v24-evt-ok"}).json()
+    # Mint the token.
+    tok = client.get(f"/projects/{project['id']}/webhook-token").json()["token"]
+    r = client.post(
+        f"/projects/{project['id']}/events",
+        json={
+            "type": "task_completed",
+            "session_name": "lg-researcher",
+            "human_id": "langgraph",
+            "agent_framework": "langgraph",
+            "description": "researcher fetched 3 sources",
+            "status": "done",
+        },
+        headers={"X-Meridian-Token": tok},
+    )
+    assert r.status_code == 201
+    body = r.json()
+    assert body["task"]["description"] == "researcher fetched 3 sources"
+    # Session should be registered with the framework label.
+    sessions = client.get(f"/projects/{project['id']}/sessions").json()
+    target = next(s for s in sessions if s["name"] == "lg-researcher")
+    assert target.get("agent_framework") == "langgraph"
+
+
+# ---------------------------------------------------------------------------
+# v2.4 — Team summary
+# ---------------------------------------------------------------------------
+
+
+def test_team_summary_groups_by_human_id(client):
+    """v2.4 — /team/summary groups task_log + sessions by human_id."""
+    project = client.post(
+        "/projects", json={"name": "v24-team", "human_id": "adam"}
+    ).json()
+    # Two sessions, two humans.
+    s_adam = client.post(
+        "/sessions/register",
+        json={"project_id": project["id"], "name": "s-adam", "human_id": "adam"},
+    ).json()
+    s_lg = client.post(
+        "/sessions/register",
+        json={"project_id": project["id"], "name": "s-lg", "human_id": "langgraph"},
+    ).json()
+    # Tasks for each.
+    client.post("/tasks", json={
+        "session_id": s_adam["id"], "project_id": project["id"],
+        "description": "adam did a thing", "status": "done",
+    })
+    client.post("/tasks", json={
+        "session_id": s_lg["id"], "project_id": project["id"],
+        "description": "lg did a thing", "status": "pending",
+    })
+    r = client.get(f"/team/summary?project_id={project['id']}&days=1")
+    assert r.status_code == 200
+    data = r.json()
+    humans = {h["human_id"]: h for h in data["humans"]}
+    assert "adam" in humans and "langgraph" in humans
+    assert humans["adam"]["tasks_done"] >= 1
+    assert humans["langgraph"]["tasks_pending"] >= 1
+
+
+# ---------------------------------------------------------------------------
+# v2.4 — parent_task_id on log_task
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_log_task_records_parent_task_id(db):
+    """v2.4 — parent_task_id flows through to the row so the dashboard can
+    render multi-agent task trees."""
+    p = await db_module.create_project(db, "v24-tree")
+    s = await db_module.register_session(db, p["id"], "orchestrator")
+    parent = await db_module.log_task(db, s["id"], p["id"], "orchestrate", "in_progress")
+    child = await db_module.log_task(
+        db, s["id"], p["id"], "sub-step", "done", parent_task_id=parent["id"]
+    )
+    assert child["parent_task_id"] == parent["id"]
+
+
+# ---------------------------------------------------------------------------
+# v2.4 — agent_framework on sessions
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_register_session_persists_agent_framework(db):
+    """v2.4 — agent_framework label round-trips through register_session."""
+    p = await db_module.create_project(db, "v24-fw")
+    s = await db_module.register_session(
+        db, p["id"], "lg-1", human_id="langgraph", agent_framework="langgraph"
+    )
+    assert s["agent_framework"] == "langgraph"
