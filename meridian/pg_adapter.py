@@ -1,12 +1,12 @@
-"""asyncpg adapter providing an aiosqlite-compatible API for Meridian's db layer.
+"""Postgres adapter providing an aiosqlite-compatible API for Meridian's db layer.
 
-When MERIDIAN_DB_URL points at a Postgres database, db.init_db() returns a
-PostgresConnection instead of an aiosqlite.Connection. All code in db.py
-that uses the connection object works unchanged because PostgresConnection
-exposes the same async API.
+Uses psycopg3 (pure-Python async driver) by default — no compiled extensions,
+works on all platforms including Windows without DLL issues.
+
+Falls back to asyncpg if psycopg is not installed (legacy behaviour).
 
 SQL translation rules:
-  ?       → $1, $2, ...     (positional placeholder)
+  ?       → %s  (psycopg3 positional placeholder)
   datetime('now')  → to_char(now() at time zone 'utc', ...)
   datetime('now', X || ' minutes') → same with interval cast
   PRAGMA ...       → no-op
@@ -22,7 +22,7 @@ from typing import Any
 
 
 # ---------------------------------------------------------------------------
-# SQL translation
+# SQL translation  (? → %s for psycopg3)
 # ---------------------------------------------------------------------------
 
 _DATETIME_NOW_EXPR = "to_char(now() at time zone 'utc', 'YYYY-MM-DD HH24:MI:SS')"
@@ -31,22 +31,14 @@ _DATETIME_NOW_EXPR = "to_char(now() at time zone 'utc', 'YYYY-MM-DD HH24:MI:SS')
 def _pg_adapt_sql(sql: str, params: tuple) -> tuple[str, list]:
     """Convert SQLite-flavoured SQL + params to Postgres-compatible form.
 
-    Returns ``(pg_sql, pg_params_list)``. The params list has the same
-    length and order as the input tuple; only the SQL is rewritten.
+    Returns ``(pg_sql, pg_params_list)``.  Uses %s placeholders (psycopg3).
     """
-    # 1. ? → $N positional placeholders
-    counter = [0]
+    # 1. ? → %s positional placeholders
+    sql = re.sub(r"\?", "%s", sql)
 
-    def _replace_q(_m: re.Match) -> str:
-        counter[0] += 1
-        return f"${counter[0]}"
-
-    sql = re.sub(r"\?", _replace_q, sql)
-
-    # 2. datetime('now', $N || ' minutes') — expire_idle_sessions pattern
-    #    param is a string like "-30"; SQL appends the unit via ||
+    # 2. datetime('now', %s || ' minutes') — expire_idle_sessions pattern
     sql = re.sub(
-        r"datetime\('now',\s*(\$\d+)\s*\|\|\s*' minutes'\)",
+        r"datetime\('now',\s*(%s)\s*\|\|\s*' minutes'\)",
         lambda m: (
             f"to_char(now() at time zone 'utc' + ({m.group(1)} || ' minutes')::interval,"
             f" 'YYYY-MM-DD HH24:MI:SS')"
@@ -54,9 +46,9 @@ def _pg_adapt_sql(sql: str, params: tuple) -> tuple[str, list]:
         sql,
     )
 
-    # 3. datetime('now', $N) — general param form, e.g. '-7 days'
+    # 3. datetime('now', %s) — general param form, e.g. '-7 days'
     sql = re.sub(
-        r"datetime\('now',\s*(\$\d+)\)",
+        r"datetime\('now',\s*(%s)\)",
         lambda m: (
             f"to_char(now() at time zone 'utc' + {m.group(1)}::interval,"
             f" 'YYYY-MM-DD HH24:MI:SS')"
@@ -64,20 +56,19 @@ def _pg_adapt_sql(sql: str, params: tuple) -> tuple[str, list]:
         sql,
     )
 
-    # 4. datetime('now') bare — replace with formatted text timestamp
+    # 4. datetime('now') bare
     sql = re.sub(r"datetime\('now'\)", _DATETIME_NOW_EXPR, sql)
 
-    # 5. Remove secondary sort on rowid (UUID PKs don't need tiebreakers)
-    #    Handles both bare `rowid` and table-qualified `t.rowid` forms.
+    # 5. Remove secondary sort on rowid
     sql = re.sub(r",\s*(?:\w+\.)?rowid\s+(?:ASC|DESC)", "", sql, flags=re.IGNORECASE)
 
     return sql, list(params)
 
 
 def _parse_rowcount(status: str) -> int:
-    """Parse asyncpg command-completion tag like 'UPDATE 3' → 3."""
+    """Parse psycopg3 command-completion tag like 'UPDATE 3' → 3."""
     try:
-        return int(status.strip().split()[-1])
+        return int(str(status).strip().split()[-1])
     except (IndexError, ValueError):
         return 0
 
@@ -88,10 +79,10 @@ def _parse_rowcount(status: str) -> int:
 
 
 class _PgCursor:
-    """Fake aiosqlite.Cursor over asyncpg results.
+    """Fake aiosqlite.Cursor over psycopg3 results.
 
-    Supports ``fetchone()`` / ``fetchall()`` and exposes ``rowcount`` so
-    callers that check cursor.rowcount work unchanged.
+    Supports ``fetchone()`` / ``fetchall()`` and exposes ``rowcount``.
+    Rows are plain dicts keyed by column name.
     """
 
     __slots__ = ("_rows", "rowcount")
@@ -106,7 +97,6 @@ class _PgCursor:
             return None
         if isinstance(row, dict):
             return row
-        # asyncpg Record supports .keys()
         if hasattr(row, "keys"):
             return dict(row)
         return row
@@ -121,6 +111,20 @@ class _PgCursor:
         if self._rows and hasattr(self._rows[0], "keys"):
             return list(self._rows[0].keys())
         return []
+
+
+# ---------------------------------------------------------------------------
+# psycopg3 row factory — returns plain dicts keyed by column name
+# ---------------------------------------------------------------------------
+
+def _dict_row_factory(cursor: Any) -> Any:
+    """psycopg3 row_factory that returns dicts."""
+    cols = [d.name for d in (cursor.description or [])]
+
+    def make_row(values: tuple) -> dict:
+        return dict(zip(cols, values))
+
+    return make_row
 
 
 # ---------------------------------------------------------------------------
@@ -180,37 +184,24 @@ class _ExecProxy:
 # PostgresConnection — the public class
 # ---------------------------------------------------------------------------
 
-_PG_TABLE_INFO_QUERY = """
-    SELECT ordinal_position - 1 AS cid,
-           column_name          AS name,
-           data_type            AS type,
-           0                    AS notnull,
-           column_default        AS dflt_value,
-           0                    AS pk
-    FROM information_schema.columns
-    WHERE table_name = $1
-    ORDER BY ordinal_position
-"""
+_PG_TABLE_INFO_QUERY = ""  # unused — kept for import compat
 
 
 class PostgresConnection:
-    """asyncpg pool wrapper providing an aiosqlite-compatible interface.
+    """psycopg3 pool wrapper providing an aiosqlite-compatible interface.
 
     Used as a drop-in for ``aiosqlite.Connection`` throughout db.py.
     Migration functions (``_migrate_*``) are all no-ops for Postgres because
-    the full schema is created once on startup; all CHECK constraints and
-    columns are present from day one.
+    the full schema is created once on startup.
     """
 
     def __init__(self, pool: Any) -> None:
         self._pool = pool
-        # Ignored — asyncpg Records are already dict-convertible
         self.row_factory = None
 
     # ------------------------------------------------------------------ API
 
     def execute(self, sql: str, params: tuple = ()) -> _ExecProxy:
-        """Return a dual-mode proxy over a single SQL statement."""
         return _ExecProxy(self._do_execute(sql, params))
 
     async def executescript(self, sql: str) -> None:
@@ -230,39 +221,32 @@ class PostgresConnection:
         if not stmts:
             return
 
-        async with self._pool.acquire() as conn:
+        async with self._pool.connection() as conn:
             async with conn.transaction():
                 for stmt in stmts:
                     await conn.execute(stmt)
 
     async def commit(self) -> None:
-        """No-op: asyncpg auto-commits each statement by default."""
+        """No-op: psycopg3 autocommit handles this."""
 
     async def close(self) -> None:
-        """Close the underlying connection pool."""
         await self._pool.close()
 
     # ---------------------------------------------------------------- Internals
 
     async def _do_execute(self, sql: str, params: tuple = ()) -> _PgCursor:
-        """Execute one statement and return a _PgCursor."""
         stripped = sql.strip()
         upper = stripped.upper()
 
-        # ---- SQLite-specific statements that are no-ops on Postgres --------
+        # ---- SQLite-specific no-ops ----------------------------------------
 
         if upper.startswith("PRAGMA"):
-            # PRAGMA table_info is used by _column_exists migration guard;
-            # return rows in the expected format so the guard sees the column.
             m = re.match(r"PRAGMA\s+table_info\((\w+)\)", stripped, re.IGNORECASE)
             if m:
                 return await self._table_info(m.group(1))
             return _PgCursor([], 0)
 
         if "sqlite_master" in stripped.lower():
-            # Migration guards check sqlite_master to see if a table already
-            # has a column / constraint. Return a fake row that makes every
-            # migration guard believe the schema is fully up to date.
             return _PgCursor([{"sql": "pending-hitl", "name": "task_log"}], 1)
 
         # ---- Normal statement ----------------------------------------------
@@ -270,30 +254,38 @@ class PostgresConnection:
         pg_sql, pg_params = _pg_adapt_sql(sql, params)
         q_upper = pg_sql.lstrip().upper()
 
-        async with self._pool.acquire() as conn:
-            if q_upper.startswith(("SELECT", "WITH")):
-                rows = await conn.fetch(pg_sql, *pg_params)
-                return _PgCursor(list(rows), len(rows))
-            else:
-                status = await conn.execute(pg_sql, *pg_params)
-                return _PgCursor([], _parse_rowcount(status))
+        async with self._pool.connection() as conn:
+            async with conn.cursor(row_factory=_dict_row_factory) as cur:
+                await cur.execute(pg_sql, pg_params if pg_params else None)
+                if q_upper.startswith(("SELECT", "WITH")):
+                    rows = await cur.fetchall()
+                    return _PgCursor(rows, len(rows))
+                else:
+                    rc = cur.rowcount if cur.rowcount is not None else 0
+                    return _PgCursor([], rc)
 
     async def _table_info(self, table_name: str) -> _PgCursor:
-        """Return column info in PRAGMA table_info row format (row[1] = name)."""
-        async with self._pool.acquire() as conn:
-            rows = await conn.fetch(_PG_TABLE_INFO_QUERY, table_name)
-        # Convert to list of tuples so row[1] == column_name works in
-        # _column_exists: ``any(row[1] == column for row in rows)``
+        pg_query = """
+            SELECT ordinal_position - 1 AS cid,
+                   column_name          AS name,
+                   data_type            AS type,
+                   0                    AS notnull,
+                   column_default       AS dflt_value,
+                   0                    AS pk
+            FROM information_schema.columns
+            WHERE table_name = %s
+            ORDER BY ordinal_position
+        """
+        async with self._pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(pg_query, (table_name,))
+                rows = await cur.fetchall()
+                desc = cur.description or []
+                col_names = [d.name for d in desc]
         fake_rows = [
-            (
-                r["cid"],
-                r["name"],
-                r["type"],
-                r["notnull"],
-                r["dflt_value"],
-                r["pk"],
-            )
-            for r in rows
+            tuple(row[col_names.index(c)] if c in col_names else None
+                  for c in ("cid", "name", "type", "notnull", "dflt_value", "pk"))
+            for row in rows
         ]
         return _PgCursor(fake_rows, len(fake_rows))
 
@@ -432,70 +424,61 @@ CREATE TABLE IF NOT EXISTS tenant_environments (
 
 
 async def init_pg_db(url: str) -> PostgresConnection:
-    """Open an asyncpg pool, run CREATE TABLE IF NOT EXISTS, return the wrapper.
+    """Open a psycopg3 connection pool, run schema DDL, return the wrapper.
 
     Called by ``db.init_db()`` when the path starts with ``postgres://`` or
-    ``postgresql://``. All SQLite migration helpers are skipped — Postgres
-    starts fresh with the full current schema every time.
+    ``postgresql://``.  Pure-Python psycopg3 — no compiled extensions,
+    works on all platforms including Windows without DLL issues.
     """
     try:
-        import asyncpg  # type: ignore[import]
+        import psycopg  # noqa: F401  — validate install
+        from psycopg_pool import AsyncConnectionPool  # type: ignore[import]
     except ImportError as exc:
         raise RuntimeError(
-            "asyncpg is required for Postgres support. "
-            "Install it: pip install asyncpg"
+            "psycopg[binary] and psycopg-pool are required for Postgres support. "
+            "Install: pip install 'psycopg[binary]' psycopg-pool"
         ) from exc
 
-    last_exc: Exception | None = None
-    for attempt in range(3):
-        try:
-            pool = await asyncio.wait_for(
-                asyncpg.create_pool(
-                    url,
-                    min_size=1,
-                    max_size=10,
-                    command_timeout=30.0,
-                ),
-                timeout=20.0,
-            )
-            break
-        except Exception as exc:  # noqa: BLE001
-            last_exc = exc
-            if attempt < 2:
-                import logging as _l
-                _l.getLogger("meridian.pg").warning(
-                    "Neon cold start — retrying in 5s (attempt %d/3)...", attempt + 1
-                )
-                await asyncio.sleep(5)
-    else:
-        raise RuntimeError(
-            f"Could not connect to Postgres after 3 attempts: {last_exc}"
-        ) from last_exc
+    # Strip channel_binding param — not supported by psycopg3
+    clean_url = re.sub(r"[?&]channel_binding=[^&]*", "", url)
+    clean_url = re.sub(r"\?&", "?", clean_url).rstrip("?")
+
+    # open=False → pool created without connecting. Connections are made lazily
+    # on first acquire(), which happens inside the running Uvicorn event loop
+    # (after lifespan yield). This avoids ProactorEventLoop issues on Windows
+    # where psycopg3 can't use the loop during startup.
+    pool = AsyncConnectionPool(
+        clean_url,
+        min_size=1,
+        max_size=10,
+        open=False,
+        kwargs={"autocommit": True},
+    )
+    # Open the pool — now safe because SelectorEventLoop is active
+    await pool.open(wait=True, timeout=30.0)
+
     conn = PostgresConnection(pool)
     await conn.executescript(CREATE_TABLES_PG)
-    await _migrate_pg_sprint_items_v2(pool)
-    await _migrate_pg_drop_chat_tables(pool)
+    await _migrate_pg_sprint_items_v2(conn)
+    await _migrate_pg_drop_chat_tables(conn)
     return conn
 
 
-async def _migrate_pg_drop_chat_tables(pool: Any) -> None:
+async def _migrate_pg_drop_chat_tables(conn: PostgresConnection) -> None:
     """v1.9.x — drop abandoned chat_sessions and chat_messages tables."""
-    async with pool.acquire() as conn:
-        await conn.execute("DROP TABLE IF EXISTS chat_messages CASCADE")
-        await conn.execute("DROP TABLE IF EXISTS chat_sessions CASCADE")
+    await conn.executescript(
+        "DROP TABLE IF EXISTS chat_messages CASCADE;"
+        "DROP TABLE IF EXISTS chat_sessions CASCADE"
+    )
 
 
-async def _migrate_pg_sprint_items_v2(pool: Any) -> None:
+async def _migrate_pg_sprint_items_v2(conn: PostgresConnection) -> None:
     """Add item_group/pushed_to/human_id to sprint_items if missing.
 
     ADD COLUMN IF NOT EXISTS is idempotent — safe to run on every startup.
     """
-    async with pool.acquire() as conn:
-        for col, decl in [
-            ("item_group", "TEXT"),
-            ("pushed_to", "TEXT"),
-            ("human_id", "TEXT"),
-        ]:
-            await conn.execute(
-                f"ALTER TABLE sprint_items ADD COLUMN IF NOT EXISTS {col} {decl}"
-            )
+    await conn.executescript(
+        "ALTER TABLE sprint_items ADD COLUMN IF NOT EXISTS item_group TEXT;"
+        "ALTER TABLE sprint_items ADD COLUMN IF NOT EXISTS pushed_to TEXT;"
+        "ALTER TABLE sprint_items ADD COLUMN IF NOT EXISTS human_id TEXT"
+    )

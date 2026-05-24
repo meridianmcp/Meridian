@@ -26,6 +26,15 @@ import asyncio
 import os
 import sys
 
+# psycopg3 requires SelectorEventLoop on Windows (ProactorEventLoop not supported).
+# Must be set before any asyncio.run() or uvicorn.run() call.
+if sys.platform == "win32":
+    import selectors
+    # psycopg3 requires SelectorEventLoop — override Windows default ProactorEventLoop
+    asyncio.set_event_loop_policy(asyncio.DefaultEventLoopPolicy())
+    loop = asyncio.SelectorEventLoop(selectors.SelectSelector())
+    asyncio.set_event_loop(loop)
+
 
 def main(argv: list[str] | None = None) -> int:
     """CLI dispatch: HTTP server by default, MCP stdio with ``--mcp``."""
@@ -59,13 +68,29 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     import uvicorn
+    import sys as _sys
 
-    uvicorn.run(
-        "meridian.server:app",
-        host=args.host,
-        port=args.port,
-        reload=False,
-    )
+    if _sys.platform == "win32":
+        # psycopg3 requires SelectorEventLoop. On Windows, asyncio.run()
+        # (used by uvicorn.run()) creates ProactorEventLoop by default.
+        # Bypass asyncio.run() entirely: run uvicorn.Server on our SelectorEventLoop.
+        config = uvicorn.Config(
+            "meridian.server:app",
+            host=args.host,
+            port=args.port,
+            reload=False,
+            loop="none",
+        )
+        server = uvicorn.Server(config)
+        loop = asyncio.get_event_loop()  # SelectorEventLoop set above in module scope
+        loop.run_until_complete(server.serve())
+    else:
+        uvicorn.run(
+            "meridian.server:app",
+            host=args.host,
+            port=args.port,
+            reload=False,
+        )
     return 0
 
 

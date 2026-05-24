@@ -389,6 +389,17 @@ async def lifespan(app: FastAPI):
     rather than at import time so test fixtures can override the env
     without an .env file leaking into them.
     """
+    # psycopg3 requires SelectorEventLoop on Windows.
+    # Uvicorn resets the loop policy in its worker process — patch it here
+    # before any psycopg3 pool creation happens.
+    import sys as _sys
+    if _sys.platform == "win32":
+        import selectors as _sel
+        import asyncio as _aio
+        _loop = _aio.get_event_loop()
+        if not isinstance(_loop, _aio.SelectorEventLoop):
+            _new_loop = _aio.SelectorEventLoop(_sel.SelectSelector())
+            _aio.set_event_loop(_new_loop)
     try:
         from dotenv import load_dotenv
         load_dotenv(override=False)
@@ -415,12 +426,12 @@ async def lifespan(app: FastAPI):
     db_url = os.environ.get("MERIDIAN_DB_URL")
     db_path: str | None = None
     if db_url:
-        db = await asyncio.wait_for(db_module.init_db(db_url), timeout=15.0)
+        db = await db_module.init_db(db_url)
     else:
         db_path = os.environ.get("MERIDIAN_DB", DEFAULT_DB_PATH)
         if db_path != ":memory:":
             Path(db_path).parent.mkdir(parents=True, exist_ok=True)
-        db = await asyncio.wait_for(db_module.init_db(db_path), timeout=15.0)
+        db = await db_module.init_db(db_path)
     app.state.db = db
     app.state.data_dir = str(data_dir)
     app.state.ws_broadcaster = dashboard_module.WebSocketBroadcaster()
