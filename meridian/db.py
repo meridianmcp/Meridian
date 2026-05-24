@@ -405,6 +405,22 @@ async def _migrate_human_identity(db: aiosqlite.Connection) -> None:
     await _migrate_add_column_if_missing(db, "sessions", "human_id", "TEXT")
 
 
+async def _migrate_goal_field_timestamps(db: aiosqlite.Connection) -> None:
+    """v2.3 — per-field updated-at timestamps on goal_states.
+
+    Pre-v2.3 every goal save inserted a new row, so per-field freshness
+    could be walked from row history. v2.3's dedup means sprint-only
+    changes are in-place UPDATEs on the latest row, collapsing the
+    per-field history. Three new nullable columns let us record which
+    field changed when. ``get_goal_field_ages`` reads these; absent
+    values fall back to the row's ``updated_at`` so pre-migration data
+    still renders.
+    """
+    await _migrate_add_column_if_missing(db, "goal_states", "ns_updated_at", "TEXT")
+    await _migrate_add_column_if_missing(db, "goal_states", "content_updated_at", "TEXT")
+    await _migrate_add_column_if_missing(db, "goal_states", "sprint_updated_at", "TEXT")
+
+
 async def _migrate_task_claims(db: aiosqlite.Connection) -> None:
     """v0.3.3 — add ``claimed_by`` / ``claimed_at`` columns for the
     distributed task lock. Both nullable, so ALTER TABLE is safe."""
@@ -743,6 +759,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_sprint_items_v2(db)
     await _migrate_drop_chat_tables(db)
     await _migrate_hosted_tables(db)
+    await _migrate_goal_field_timestamps(db)
     return db
 
 
@@ -1062,6 +1079,18 @@ async def set_goal(
     final_sprint = sprint if sprint is not None else (
         existing.get("sprint") if existing else None
     )
+    # v2.3 — dedup: if the main content didn't change, treat this as a
+    # minor in-place update on the existing row. Prevents the version
+    # counter from spamming when only sprint / north_star changes (every
+    # save would otherwise insert a new row + bump version).
+    if not minor and existing is not None:
+        existing_content = existing.get("content")
+        existing_encoded = (
+            existing_content if isinstance(existing_content, str)
+            else _encode_content(existing_content)
+        )
+        if encoded == existing_encoded:
+            minor = True
     if minor and existing is not None:
         # In-place update — no version bump, no new row.
         # Strict AUTO BLOCKS replace: strip ALL occurrences from both sides,
@@ -1090,27 +1119,76 @@ async def set_goal(
         incoming_parts = incoming_str.split(AUTO_SPLIT, 1)
         if len(incoming_parts) > 1:
             new_auto = AUTO_SPLIT + incoming_parts[1]
-            final_content = base + "\n" + new_auto
+            # v2.3 — use `\n\n` so the resulting layout matches
+            # _AUTO_SECTION_MARKER ("\n\n--- AUTO BLOCKS BELOW ---\n").
+            # Single `\n` here would make append_auto_summary's marker
+            # check miss on the next cycle, producing duplicate auto
+            # sections instead of replacing the old one.
+            final_content = base + "\n\n" + new_auto
         else:
             # No AUTO BLOCKS in incoming — use incoming content as-is (minor
             # update that happens to contain no auto section is fine).
             final_content = incoming_str
 
         final_encoded = _encode_content(final_content)
+        now_ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        # v2.3 — per-field timestamps: bump only the columns whose value
+        # actually changed. Lets get_goal_field_ages report accurate
+        # per-field freshness even when in-place UPDATEs replace what
+        # used to be multi-row history.
+        existing_content_str = existing.get("content")
+        if not isinstance(existing_content_str, str):
+            existing_content_str = _encode_content(existing_content_str)
+        ns_ts = now_ts if final_north_star != existing.get("north_star") else (
+            existing.get("ns_updated_at") or existing.get("updated_at")
+        )
+        content_ts = now_ts if final_encoded != existing_content_str else (
+            existing.get("content_updated_at") or existing.get("updated_at")
+        )
+        sprint_ts = now_ts if final_sprint != existing.get("sprint") else (
+            existing.get("sprint_updated_at") or existing.get("updated_at")
+        )
         await db.execute(
-            "UPDATE goal_states SET content = ?, goal_north_star = ?, goal_sprint = ?, updated_at = ? "
+            "UPDATE goal_states SET content = ?, goal_north_star = ?, goal_sprint = ?, "
+            "updated_at = ?, ns_updated_at = ?, content_updated_at = ?, sprint_updated_at = ? "
             "WHERE id = ?",
-            (final_encoded, final_north_star, final_sprint, datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"), existing["id"]),
+            (final_encoded, final_north_star, final_sprint, now_ts,
+             ns_ts, content_ts, sprint_ts, existing["id"]),
         )
         await db.commit()
     else:
+        from datetime import datetime, timezone
         new_version = 1 if existing is None else int(existing["version"]) + 1
         gid = _new_id()
+        now_ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        # v2.3 — per-field timestamps. For a brand-new row, every field
+        # that has a value is timestamped now; null fields stay null. For
+        # a fresh INSERT-style write where content changed, content_ts is
+        # always now (content is non-null by schema).
+        if existing is not None:
+            existing_content_str = existing.get("content")
+            if not isinstance(existing_content_str, str):
+                existing_content_str = _encode_content(existing_content_str)
+            ns_ts = now_ts if final_north_star != existing.get("north_star") else (
+                existing.get("ns_updated_at") or existing.get("updated_at")
+            )
+            content_ts = now_ts if encoded != existing_content_str else (
+                existing.get("content_updated_at") or existing.get("updated_at")
+            )
+            sprint_ts = now_ts if final_sprint != existing.get("sprint") else (
+                existing.get("sprint_updated_at") or existing.get("updated_at")
+            )
+        else:
+            ns_ts = now_ts if final_north_star else None
+            content_ts = now_ts
+            sprint_ts = now_ts if final_sprint else None
         await db.execute(
             "INSERT INTO goal_states "
-            "(id, project_id, content, version, goal_north_star, goal_sprint) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (gid, project_id, encoded, new_version, final_north_star, final_sprint),
+            "(id, project_id, content, version, goal_north_star, goal_sprint, "
+            "ns_updated_at, content_updated_at, sprint_updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (gid, project_id, encoded, new_version, final_north_star, final_sprint,
+             ns_ts, content_ts, sprint_ts),
         )
         await db.commit()
     goal = await get_goal(db, project_id)
@@ -1412,7 +1490,11 @@ async def append_auto_summary(
     else:
         prefix = content
     new_content = prefix.rstrip() + _AUTO_SECTION_MARKER + summary_block
-    return await set_goal(db, project_id, new_content)
+    # v2.3 — auto-summary must NOT bump the version goal. minor=True does
+    # an in-place UPDATE of the latest row, preserving the human prefix
+    # above AUTO BLOCKS exactly and only swapping the auto section. The
+    # main "version goal" content stays under explicit save-goal control.
+    return await set_goal(db, project_id, new_content, minor=True)
 
 
 async def get_decisions(
@@ -2101,11 +2183,17 @@ async def get_goal_field_ages(
     changed* (or was first set). Returns
     ``{field: {updated_at, age_seconds}}`` with empty / never-set
     fields reported as ``{updated_at: None, age_seconds: None}``.
+
+    v2.3 — prefers the per-field ``ns_updated_at`` /
+    ``content_updated_at`` / ``sprint_updated_at`` columns when set
+    (the latest row carries them). Falls back to history walking when
+    they are NULL (pre-migration rows).
     """
     import time as _time
     now = now if now is not None else _time.time()
     async with db.execute(
-        "SELECT version, goal_north_star, content, goal_sprint, updated_at "
+        "SELECT version, goal_north_star, content, goal_sprint, updated_at, "
+        "ns_updated_at, content_updated_at, sprint_updated_at "
         "FROM goal_states WHERE project_id = ? ORDER BY version ASC",
         (project_id,),
     ) as cur:
@@ -2113,18 +2201,36 @@ async def get_goal_field_ages(
     field_ts: dict[str, str | None] = {
         "north_star": None, "version_goal": None, "sprint": None,
     }
-    prev: dict[str, Any] = {"north_star": "", "version_goal": "", "sprint": ""}
-    for r in rows:
-        row = {
-            "north_star": r["goal_north_star"] or "",
-            "version_goal": (r["content"] or "")
-                if isinstance(r["content"], str) else str(r["content"] or ""),
-            "sprint": r["goal_sprint"] or "",
-        }
-        for field in ("north_star", "version_goal", "sprint"):
-            if row[field] and row[field] != prev[field]:
-                field_ts[field] = r["updated_at"]
-        prev = row
+    # v2.3 preferred path — if the latest row carries per-field
+    # timestamps, use them directly. Cheaper and accurate even when
+    # in-place UPDATEs have collapsed multi-row history.
+    if rows:
+        last = rows[-1]
+        ns_t = last["ns_updated_at"]
+        ct_t = last["content_updated_at"]
+        sp_t = last["sprint_updated_at"]
+        if ns_t and (last["goal_north_star"] or ""):
+            field_ts["north_star"] = ns_t
+        if ct_t and (last["content"] or ""):
+            field_ts["version_goal"] = ct_t
+        if sp_t and (last["goal_sprint"] or ""):
+            field_ts["sprint"] = sp_t
+
+    # Fall back to history walking for any field still unstamped (pre-
+    # v2.3 rows). This preserves backward compat with legacy DBs.
+    if any(v is None for v in field_ts.values()):
+        prev: dict[str, Any] = {"north_star": "", "version_goal": "", "sprint": ""}
+        for r in rows:
+            row = {
+                "north_star": r["goal_north_star"] or "",
+                "version_goal": (r["content"] or "")
+                    if isinstance(r["content"], str) else str(r["content"] or ""),
+                "sprint": r["goal_sprint"] or "",
+            }
+            for field in ("north_star", "version_goal", "sprint"):
+                if field_ts[field] is None and row[field] and row[field] != prev[field]:
+                    field_ts[field] = r["updated_at"]
+            prev = row
 
     from datetime import datetime, timezone
     out: dict[str, dict[str, Any]] = {}

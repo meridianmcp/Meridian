@@ -250,6 +250,16 @@ def _diff_goal_fields(
     return changed
 
 
+def _hosted_mode() -> bool:
+    """v2.3 — GOAL.md ↔ DB sync is dev-tier only. The hosted tier serves
+    many tenants from a single process; reading/writing a repo-root
+    GOAL.md against any of them would corrupt or leak data. Skip every
+    file-touching path when MERIDIAN_HOSTED=true.
+    """
+    import os
+    return os.environ.get("MERIDIAN_HOSTED", "").lower() in ("1", "true", "yes")
+
+
 async def sync_goal_md_to_db(
     db: aiosqlite.Connection,
     path: Path | None = None,
@@ -269,6 +279,8 @@ async def sync_goal_md_to_db(
     or a ``{conflict: True, ...}`` marker on conflict so callers can
     surface it (timeline rerender, dashboard toast).
     """
+    if _hosted_mode():
+        return None
     path = path or default_goal_md_path()
     parsed = read_goal_md(path)
     if parsed is None or not parsed.get("project_name"):
@@ -346,6 +358,8 @@ async def sync_db_to_goal_md(
     missing. Idempotent — safe to call after every set_goal /
     set_north_star / set_sprint.
     """
+    if _hosted_mode():
+        return None
     project = await db_module.get_project(db, project_id)
     if project is None:
         return None
@@ -390,8 +404,12 @@ async def watch_goal_md(
     No-op (graceful) when watchfiles is not installed.
     Skips events triggered by Meridian's own writes to prevent the
     write-loop that generated hundreds of spurious conflict log entries.
+    Also a no-op in hosted mode — there is no single GOAL.md for a
+    multi-tenant deployment.
     """
     global _meridian_writing
+    if _hosted_mode():
+        return
     path = path or default_goal_md_path()
     try:
         from watchfiles import awatch

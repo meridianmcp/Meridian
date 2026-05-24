@@ -54,6 +54,26 @@ async def test_set_goal_versions_increment(db):
 
 
 @pytest.mark.asyncio
+async def test_set_goal_dedup_skips_version_bump_when_content_unchanged(db):
+    """v2.3 — re-setting goal with identical content shouldn't bump version.
+
+    Prevents the goal_states version counter from spamming when only
+    sprint or north_star changes (the auto-summary loop and field-only
+    updates would otherwise create hundreds of near-identical rows).
+    """
+    p = await db_module.create_project(db, "alpha")
+    g1 = await db_module.set_goal(db, p["id"], "ship it")
+    assert g1["version"] == 1
+    # Same content, only sprint changes — should NOT bump version.
+    g2 = await db_module.set_goal(db, p["id"], "ship it", sprint="week 1")
+    assert g2["version"] == 1
+    assert g2["sprint"] == "week 1"
+    # Now content actually changes — version bumps.
+    g3 = await db_module.set_goal(db, p["id"], "ship it harder")
+    assert g3["version"] == 2
+
+
+@pytest.mark.asyncio
 async def test_get_goal_returns_none_when_unset(db):
     p = await db_module.create_project(db, "alpha")
     assert await db_module.get_goal(db, p["id"]) is None
@@ -1867,22 +1887,24 @@ async def test_set_goal_carries_north_star_and_sprint_forward(db):
 
 @pytest.mark.asyncio
 async def test_set_north_star_owner_only(db):
-    """set_north_star updates north_star and increments version."""
+    """set_north_star updates north_star without bumping version when content is unchanged (v2.3 dedup)."""
     p = await db_module.create_project(db, "alpha")
     await db_module.set_goal(db, p["id"], "go")
     updated = await db_module.set_north_star(db, p["id"], "be the best")
     assert updated["north_star"] == "be the best"
-    assert updated["version"] == 2
+    # v2.3: content unchanged → minor in-place update, version stays at 1
+    assert updated["version"] == 1
 
 
 @pytest.mark.asyncio
 async def test_set_sprint_any_member(db):
-    """set_sprint updates sprint and increments version."""
+    """set_sprint updates sprint without bumping version when content is unchanged (v2.3 dedup)."""
     p = await db_module.create_project(db, "alpha")
     await db_module.set_goal(db, p["id"], "go")
     updated = await db_module.set_sprint(db, p["id"], "ship auth this week")
     assert updated["sprint"] == "ship auth this week"
-    assert updated["version"] == 2
+    # v2.3: content unchanged → minor in-place update, version stays at 1
+    assert updated["version"] == 1
 
 
 @pytest.mark.asyncio
@@ -2032,6 +2054,19 @@ def test_dashboard_html_has_three_goal_textareas(client):
     assert "goal-sprint-" in js
     assert "saveNorthStar" in js
     assert "saveSprint" in js
+
+
+def test_dashboard_has_decisions_subtab(client):
+    """v2.3 — dashboard goal area exposes a Decisions subtab + table renderer."""
+    js = client.get("/static/dashboard.js").text
+    # Subtab button must exist.
+    assert 'data-gtab="decisions"' in js
+    # Panel + table host element.
+    assert "gtab-decisions-" in js
+    assert "decisions-table-" in js
+    # Renderer + parser functions must be wired.
+    assert "renderDecisionsTable" in js
+    assert "parseDecisionsBlob" in js
 
 
 # ---------------------------------------------------------------------------
@@ -2509,6 +2544,121 @@ async def test_sync_db_to_goal_md(tmp_path):
     parsed = parse_goal_md(goal_path.read_text())
     assert parsed["north_star"] == "ns content"
     assert parsed["sprint"] == "sp content"
+    await db.close()
+
+
+def test_context_block_full_includes_required_fields(client):
+    """v2.3 — /context-block?mode=full returns the Code Handoff variant."""
+    project = client.post("/projects", json={"name": "ctxblk"}).json()
+    client.post(
+        f"/projects/{project['id']}/goal",
+        json={"content": "ship v1", "north_star": "the big idea", "sprint": "wk-1"},
+    )
+    r = client.get(f"/projects/{project['id']}/context-block?mode=full")
+    assert r.status_code == 200
+    assert r.headers.get("content-type", "").startswith("text/plain")
+    text = r.text
+    assert "PROJECT: ctxblk" in text
+    assert "NORTH STAR: the big idea" in text
+    assert "SPRINT: wk-1" in text
+    assert "VERSION GOAL:" in text
+    assert "TEST: pixi run test" in text
+    assert "start_session" in text
+
+
+def test_context_block_chat_mode_omits_repo_and_version_goal(client):
+    """v2.3 — chat mode trims sessions, repo path, and the verbose version goal."""
+    project = client.post("/projects", json={"name": "ctxchat"}).json()
+    client.post(
+        f"/projects/{project['id']}/goal",
+        json={"content": "long version goal " * 200, "north_star": "ns", "sprint": "sp"},
+    )
+    r = client.get(f"/projects/{project['id']}/context-block?mode=chat")
+    assert r.status_code == 200
+    text = r.text
+    assert "PROJECT: ctxchat" in text
+    # repo path is full-mode only
+    assert "REPO:" not in text
+    # version goal block is full-mode only
+    assert "VERSION GOAL:" not in text
+
+
+def test_context_block_rejects_bad_mode(client):
+    project = client.post("/projects", json={"name": "ctxbad"}).json()
+    r = client.get(f"/projects/{project['id']}/context-block?mode=garbage")
+    assert r.status_code == 400
+
+
+def test_context_block_404_for_unknown_project(client):
+    r = client.get("/projects/does-not-exist/context-block")
+    assert r.status_code == 404
+
+
+def test_meridian_md_built_in_loads():
+    """v2.3 — built-in MERIDIAN.md ships with the package and loads."""
+    from meridian.server import _load_meridian_md
+    content = _load_meridian_md()
+    assert "Meridian Session Instructions" in content
+    assert "log_task" in content
+    assert "generate_handoff" in content
+
+
+def test_meridian_md_project_root_override(tmp_path, monkeypatch):
+    """v2.3 — a project-root MERIDIAN.md wins over the built-in."""
+    from meridian import server as srv
+    # Point the resolver at a fake repo root that has a MERIDIAN.md.
+    fake_root = tmp_path
+    fake_pkg = tmp_path / "meridian"
+    fake_pkg.mkdir()
+    (fake_pkg / "MERIDIAN.md").write_text("BUILT-IN VERSION")
+    (fake_root / "MERIDIAN.md").write_text("PROJECT OVERRIDE WINS")
+
+    # Patch __file__ resolution by monkeypatching Path.parent traversal.
+    import pathlib
+    orig_file = srv.__file__
+    srv.__file__ = str(fake_pkg / "server.py")
+    try:
+        content = srv._load_meridian_md()
+        assert content == "PROJECT OVERRIDE WINS"
+    finally:
+        srv.__file__ = orig_file
+
+
+def test_start_session_endpoint_includes_meridian_instructions(client):
+    """v2.3 — POST /projects/{id}/start-session returns meridian_instructions."""
+    project = client.post("/projects", json={"name": "med-md"}).json()
+    client.post(
+        f"/projects/{project['id']}/goal",
+        json={"content": "ship it"},
+    )
+    r = client.post(
+        f"/projects/{project['id']}/start-session",
+        json={"session_name": "alpha"},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert "meridian_instructions" in body
+    assert "log_task" in body["meridian_instructions"]
+
+
+@pytest.mark.asyncio
+async def test_goal_md_sync_skipped_when_hosted_mode(tmp_path, monkeypatch):
+    """v2.3 — hosted tier never touches GOAL.md (no single tenant repo root)."""
+    from meridian.goal_md import (
+        sync_db_to_goal_md,
+        sync_goal_md_to_db,
+        write_goal_md,
+    )
+    monkeypatch.setenv("MERIDIAN_HOSTED", "true")
+    db = await db_module.init_db(":memory:")
+    proj = await db_module.create_project(db, "hosted-skip")
+    await db_module.set_goal(db, proj["id"], "vg", north_star="ns", sprint="sp")
+    goal_path = tmp_path / "GOAL.md"
+    # write_goal_md still writes (it's a plain util), but sync paths skip.
+    write_goal_md("hosted-skip", "ns2", "vg2", "sp2", path=goal_path)
+    # Both sync directions should no-op in hosted mode.
+    assert await sync_db_to_goal_md(db, proj["id"], path=goal_path) is None
+    assert await sync_goal_md_to_db(db, path=goal_path) is None
     await db.close()
 
 
@@ -3202,17 +3352,24 @@ async def test_sync_goal_md_to_db_no_attribution_when_unchanged(db, tmp_path):
 
 @pytest.mark.asyncio
 async def test_get_goal_field_ages_reflects_field_history(db):
-    """Each field's age tracks the most recent goal_states row where
-    that specific field changed, not the latest goal version."""
+    """Each field's age tracks the most recent change of that specific
+    field, not the latest goal version. v2.3 — uses per-field timestamp
+    columns (ns_updated_at / content_updated_at / sprint_updated_at) so
+    in-place UPDATEs from set_sprint can still report accurate freshness."""
     import time as _t
     p = await db_module.create_project(db, "alpha")
     await db_module.set_goal(
         db, p["id"], "v0-content", north_star="ns0", sprint="sp0"
     )
-    # Pretend the original row landed long ago by backdating
-    # goal_states.updated_at directly.
+    # v2.3 — backdate every timestamp on the row so each field reports
+    # ~40 days old before the fresh sprint update. (Pre-v2.3 only
+    # `updated_at` mattered, but the dedicated per-field columns are
+    # the new source of truth.)
     await db.execute(
-        "UPDATE goal_states SET updated_at = datetime('now','-40 days')"
+        "UPDATE goal_states SET updated_at = datetime('now','-40 days'), "
+        "ns_updated_at = datetime('now','-40 days'), "
+        "content_updated_at = datetime('now','-40 days'), "
+        "sprint_updated_at = datetime('now','-40 days')"
     )
     await db.commit()
     # Fresh sprint update (today). north_star + version_goal stay old.

@@ -465,7 +465,21 @@ async def init_pg_db(url: str) -> PostgresConnection:
     await conn.executescript(CREATE_TABLES_PG)
     await _migrate_pg_sprint_items_v2(conn)
     await _migrate_pg_drop_chat_tables(conn)
+    await _migrate_pg_goal_field_timestamps(conn)
     return conn
+
+
+async def _migrate_pg_goal_field_timestamps(conn: PostgresConnection) -> None:
+    """v2.3 — per-field timestamps on goal_states (Postgres side).
+
+    See ``db._migrate_goal_field_timestamps`` for the rationale.
+    ``ADD COLUMN IF NOT EXISTS`` is idempotent.
+    """
+    await conn.executescript(
+        "ALTER TABLE goal_states ADD COLUMN IF NOT EXISTS ns_updated_at TEXT;"
+        "ALTER TABLE goal_states ADD COLUMN IF NOT EXISTS content_updated_at TEXT;"
+        "ALTER TABLE goal_states ADD COLUMN IF NOT EXISTS sprint_updated_at TEXT"
+    )
 
 
 async def _migrate_pg_drop_chat_tables(conn: PostgresConnection) -> None:

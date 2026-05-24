@@ -34,6 +34,29 @@ def _read_version() -> str:
 
 _VERSION = _read_version()
 
+
+def _load_meridian_md() -> str:
+    """v2.3 — load the MERIDIAN.md session-instructions file.
+
+    Resolution order:
+    1. ``MERIDIAN.md`` at the repo root (project-specific override)
+    2. ``meridian/MERIDIAN.md`` bundled with the package (built-in default)
+    3. Empty string if neither exists.
+
+    Returns the file contents as a string. Cheap to call repeatedly — the
+    file is tiny and the OS page cache makes re-reads nearly free.
+    """
+    pkg_dir = Path(__file__).parent
+    repo_root = pkg_dir.parent
+    for candidate in (repo_root / "MERIDIAN.md", pkg_dir / "MERIDIAN.md"):
+        try:
+            if candidate.exists():
+                return candidate.read_text(encoding="utf-8")
+        except OSError:
+            continue
+    return ""
+
+
 from typing import Any
 
 import aiosqlite
@@ -1965,6 +1988,118 @@ async def put_project_file(
     return {"filename": filename, "size": len(body.content.encode("utf-8"))}
 
 
+def _render_context_block(
+    project: dict,
+    goal: dict | None,
+    sprint_items: list[dict],
+    pending_tasks: list[dict],
+    sessions: list[dict],
+    recent_decisions: list[str],
+    *,
+    mode: str = "full",
+    repo_root: str | None = None,
+) -> str:
+    """v2.3 — render the project context as a single text block.
+
+    ``mode='full'`` produces the Code Handoff variant — everything a fresh
+    Claude Code session needs to continue work without re-deriving state.
+    ``mode='chat'`` produces the shorter "new claude.ai conversation"
+    variant — drops sessions and trims long fields so a paste into a new
+    chat doesn't overflow the first message.
+
+    Returns a plain-text block (no JSON, no markdown fences) suitable for
+    direct clipboard copy + paste.
+    """
+    short_id = project["id"].split("-")[0]
+    lines = [f"PROJECT: {project['name']} ({short_id})"]
+    if goal:
+        if goal.get("north_star"):
+            ns = goal["north_star"]
+            if mode == "chat" and len(ns) > 400:
+                ns = ns[:400].rstrip() + "…"
+            lines.append(f"NORTH STAR: {ns}")
+        if goal.get("sprint"):
+            lines.append(f"SPRINT: {goal['sprint']}")
+        if mode == "full" and goal.get("content"):
+            vg = goal["content"]
+            if isinstance(vg, dict):
+                vg = vg.get("content") or str(vg)
+            if len(vg) > 2000:
+                vg = vg[:2000].rstrip() + "…"
+            lines += ["", "VERSION GOAL:", vg]
+    if sprint_items:
+        lines += ["", "PENDING SPRINT ITEMS:"]
+        for it in sprint_items[:10]:
+            lines.append(f"- [{it.get('status', '?')}] {it.get('title', '')}")
+    if pending_tasks:
+        cap = 10 if mode == "full" else 5
+        lines += ["", f"RECENT TASKS (last {min(len(pending_tasks), cap)}):"]
+        for t in pending_tasks[:cap]:
+            stat = (t.get("status") or "?").upper()
+            desc = t.get("description") or ""
+            if len(desc) > 200:
+                desc = desc[:200].rstrip() + "…"
+            lines.append(f"- [{stat}] {desc}")
+    if mode == "full" and sessions:
+        lines += ["", "ACTIVE SESSIONS:"]
+        for s in sessions[:5]:
+            lines.append(f"- {s.get('name', '?')} ({s.get('status', '?')})")
+    if recent_decisions:
+        lines += ["", "RECENT DECISIONS:"]
+        for d in recent_decisions[-5:]:
+            text = d
+            if len(text) > 240:
+                text = text[:240].rstrip() + "…"
+            lines.append(f"- {text}")
+    if mode == "full":
+        if repo_root:
+            lines += ["", f"REPO: {repo_root}"]
+        lines += ["TEST: pixi run test"]
+    lines += [
+        "",
+        f"To continue: connect to Meridian and call start_session(project_id=\"{project['id']}\", session_name=\"<name>\").",
+    ]
+    return "\n".join(lines)
+
+
+@app.get("/projects/{project_id}/context-block")
+async def get_project_context_block(
+    project_id: str, request: Request, mode: str = "full"
+) -> Response:
+    """v2.3 — plain-text context block suitable for direct clipboard paste.
+
+    Query: ``?mode=full`` (default) or ``?mode=chat`` (shorter).
+    Returns ``text/plain`` — the dashboard "Code Handoff" / "Copy chat
+    context" buttons stream this straight into ``navigator.clipboard``.
+    """
+    if mode not in ("full", "chat"):
+        raise HTTPException(status_code=400, detail="mode must be 'full' or 'chat'")
+    project = await db_module.get_project(_db(request), project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="project not found")
+    goal = await db_module.get_goal(_db(request), project_id)
+    sprint_items = await db_module.get_sprint_items(
+        _db(request), project_id, status="pending"
+    )
+    all_tasks = await db_module.get_tasks(_db(request), project_id, limit=20)
+    pending_tasks = [
+        t for t in all_tasks if t.get("status") in ("pending", "in_progress", "done")
+    ][:10]
+    sessions = await db_module.get_sessions(
+        _db(request), project_id, active_only=True
+    )
+    decisions_raw = (project.get("decisions") or "").strip()
+    recent_decisions = [
+        l.strip() for l in decisions_raw.splitlines() if l.strip()
+    ][-5:]
+    text = _render_context_block(
+        project, goal, sprint_items, pending_tasks, sessions, recent_decisions,
+        mode=mode,
+        repo_root=str(Path.cwd()) if mode == "full" else None,
+    )
+    return Response(content=text, media_type="text/plain; charset=utf-8")
+
+
 @app.get("/projects/{project_id}/context")
 async def get_project_context(
     project_id: str, request: Request
@@ -2434,6 +2569,9 @@ async def _start_session_composite(
     ]
     sprint_items_xml = db_module.build_sprint_items_xml(pending_items)
 
+    # v2.3 — every cold session reads the coordination protocol on entry.
+    meridian_instructions = _load_meridian_md()
+
     return {
         "session_id": session["id"],
         "goal": goal,
@@ -2446,6 +2584,7 @@ async def _start_session_composite(
         "handoff_exists": handoff_exists,
         "handoff_path": handoff_path_str,
         "files": list(_EDITABLE_FILES),
+        "meridian_instructions": meridian_instructions,  # v2.3
     }
 
 
@@ -2943,6 +3082,15 @@ async def _handle_mcp_request(body: dict[str, Any], db: Any, data_dir: str) -> d
                  "project_id": {"type": "string"}, "limit": {"type": "integer"}}, "required": ["project_id"]}},
             {"name": "generate_handoff", "description": "Generate a context handoff file.",
              "inputSchema": {"type": "object", "properties": {"project_id": {"type": "string"}}, "required": ["project_id"]}},
+            {"name": "get_context_block", "description":
+                "Return a compact plain-text project context block (north star, sprint, "
+                "pending sprint items, recent tasks, recent decisions, active sessions). "
+                "mode='full' (default) for Code Handoff into a fresh Claude Code session; "
+                "mode='chat' for a shorter paste into a new claude.ai conversation.",
+             "inputSchema": {"type": "object", "properties": {
+                 "project_id": {"type": "string"},
+                 "mode": {"type": "string", "enum": ["full", "chat"]}},
+                 "required": ["project_id"]}},
         ]
         return _jsonrpc_ok(req_id, {"tools": tools})
 
@@ -2986,6 +3134,33 @@ async def _dispatch_mcp_tool(name: str, args: dict[str, Any], db: Any, data_dir:
         from . import handoff as handoff_module_local
         path, content = await handoff_module_local.generate_handoff(db, args["project_id"], data_dir)
         return {"file_path": path, "content": content}
+    if name == "get_context_block":
+        # v2.3 — assemble the same shape as /projects/{id}/context-block but
+        # return both the rendered text AND the source dict so MCP clients
+        # can choose to render their own variant.
+        project_id = args["project_id"]
+        mode = args.get("mode", "full")
+        project = await db_module.get_project(db, project_id)
+        if project is None:
+            raise ValueError("project not found")
+        goal = await db_module.get_goal(db, project_id)
+        sprint_items = await db_module.get_sprint_items(
+            db, project_id, status="pending"
+        )
+        all_tasks = await db_module.get_tasks(db, project_id, limit=20)
+        pending_tasks = [
+            t for t in all_tasks if t.get("status") in ("pending", "in_progress", "done")
+        ][:10]
+        sessions = await db_module.get_sessions(db, project_id, active_only=True)
+        decisions_raw = (project.get("decisions") or "").strip()
+        recent_decisions = [
+            l.strip() for l in decisions_raw.splitlines() if l.strip()
+        ][-5:]
+        text = _render_context_block(
+            project, goal, sprint_items, pending_tasks, sessions, recent_decisions,
+            mode=mode,
+        )
+        return {"mode": mode, "text": text, "project_id": project_id}
     raise ValueError(f"unknown tool: {name}")
 
 
@@ -3256,6 +3431,29 @@ def build_mcp_server():
                 inputSchema={
                     "type": "object",
                     "properties": {"project_id": {"type": "string"}},
+                    "required": ["project_id"],
+                },
+            ),
+            Tool(
+                name="get_context_block",
+                description=(
+                    "Return a compact plain-text context block — north star, "
+                    "sprint, pending sprint items, recent tasks, recent "
+                    "decisions, active sessions. mode='full' (default) for "
+                    "the Code Handoff variant into a fresh Claude Code "
+                    "session; mode='chat' for a shorter paste into a new "
+                    "claude.ai conversation."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "project_id": {"type": "string"},
+                        "mode": {
+                            "type": "string",
+                            "enum": ["full", "chat"],
+                            "default": "full",
+                        },
+                    },
                     "required": ["project_id"],
                 },
             ),
@@ -3679,6 +3877,13 @@ def build_mcp_server():
                     goal["cache_blocks"] = db_module.build_goal_cache_blocks(
                         goal, project_name, goal["ambient_tasks"]
                     )
+                    # v2.3 — inject MERIDIAN.md session instructions so
+                    # every cold session learns the coordination protocol
+                    # without explicit prompting. Project-root override
+                    # wins over the built-in default.
+                    meridian_md = _load_meridian_md()
+                    if meridian_md:
+                        goal["meridian_instructions"] = meridian_md
                     result = goal
             elif name == "set_goal":
                 result = await db_module.set_goal(
@@ -3741,6 +3946,11 @@ def build_mcp_server():
                     db, arguments["project_id"], state["data_dir"]
                 )
                 result = {"path": path, "content": content}
+            elif name == "get_context_block":
+                # v2.3 — reuse the dispatch impl so HTTP and stdio share one path.
+                result = await _dispatch_mcp_tool(
+                    "get_context_block", arguments, db, state["data_dir"]
+                )
             elif name == "enqueue_claude_task":
                 raw_timeout = arguments.get("timeout", 600.0)
                 # Treat 0 / negative as "no timeout" — Claude jobs can be

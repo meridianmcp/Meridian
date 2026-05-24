@@ -578,6 +578,7 @@ function buildTabBody(project) {
           <button class="goal-subtab-btn active" data-gtab="north-star">🔭 North Star</button>
           <button class="goal-subtab-btn" data-gtab="version-goal">◎ Version Goal</button>
           <button class="goal-subtab-btn" data-gtab="sprint">⚡ Sprint</button>
+          <button class="goal-subtab-btn" data-gtab="decisions">📋 Decisions</button>
         </div>
         <div class="goal-subtab-body">
           <div class="goal-subtab-panel active" id="gtab-north-star-${project.id}">
@@ -615,6 +616,10 @@ function buildTabBody(project) {
               <input type="text" id="sprint-add-input-${project.id}" placeholder="Add task to sprint..." style="flex:1;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;padding:6px 8px;color:var(--text);font-family:var(--font-mono);font-size:11px;outline:none">
               <button class="secondary" id="sprint-add-btn-${project.id}">+ Add</button>
             </div>
+          </div>
+          <div class="goal-subtab-panel" id="gtab-decisions-${project.id}">
+            <div style="color:var(--muted);font-size:10px;margin-bottom:8px">Append-only decisions log (newest first). Read-only — log decisions via the <code>set_decision</code> MCP tool.</div>
+            <div id="decisions-table-${project.id}" style="font-family:var(--font-mono);font-size:12px"></div>
           </div>
         </div>
         <div style="flex-shrink:0;padding:8px 14px;border-top:1px solid var(--border)">
@@ -1425,11 +1430,13 @@ function wireClaudeLaunchPanel(projectId) {
   // Section 3 — Handoff copy + regenerate
   const copyHandoffBtn = document.getElementById(`copy-handoff-${projectId}`);
   if (copyHandoffBtn) copyHandoffBtn.onclick = async () => {
+    // v2.3 — Code Handoff now copies the compact context block (north star,
+    // sprint, pending items, recent tasks, decisions, sessions). The legacy
+    // verbose handoff file is still written via the Regenerate button.
     try {
-      const r = await fetch(`/projects/${projectId}/handoff`, { method: 'POST' });
+      const r = await fetch(`/projects/${projectId}/context-block?mode=full`);
       if (!r.ok) throw new Error(`${r.status}`);
-      const body = await r.json();
-      const text = body.content || '';
+      const text = await r.text();
       if (text) {
         try {
           await navigator.clipboard.writeText(text);
@@ -1461,18 +1468,19 @@ function wireClaudeLaunchPanel(projectId) {
   };
   const copyContextBtn = document.getElementById(`copy-context-${projectId}`);
   if (copyContextBtn) copyContextBtn.onclick = async () => {
+    // v2.3 — fetches the shorter ?mode=chat plain-text context block so
+    // a paste into a new claude.ai chat fits without overflow.
     const orig = copyContextBtn.textContent;
     copyContextBtn.disabled = true;
     copyContextBtn.textContent = 'Loading…';
     try {
-      const r = await fetch(`/projects/${projectId}/context`);
+      const r = await fetch(`/projects/${projectId}/context-block?mode=chat`);
       if (!r.ok) throw new Error(`${r.status}`);
-      const ctx = await r.json();
-      const text = JSON.stringify(ctx, null, 2);
+      const text = await r.text();
       await navigator.clipboard.writeText(text);
       copyContextBtn.textContent = 'Copied ✓';
       setTimeout(() => { copyContextBtn.textContent = orig; }, 2000);
-      toast('context copied to clipboard');
+      toast('chat context copied');
     } catch(e) { toast('copy context failed: ' + e.message, true); }
     finally { copyContextBtn.disabled = false; }
   };
@@ -1878,10 +1886,56 @@ async function refreshGoal(projectId) {
     if (tsNs) tsNs.textContent = updAt ? `· ${updAt}` : '';
     if (tsVg) tsVg.textContent = updAt ? `· ${updAt}` : '';
     if (tsSp) tsSp.textContent = updAt ? `· ${updAt}` : '';
+    // v2.3 — decisions table subtab. goal.decisions is the append-only
+    // blob: "[YYYY-MM-DD] text\n\n[YYYY-MM-DD] text\n\n..." (newest first).
+    renderDecisionsTable(projectId, goal.decisions || '');
   } catch (e) {
     ta.value = '';
     v.textContent = '(unset)';
   }
+}
+
+function parseDecisionsBlob(blob) {
+  /** v2.3 — split the append-only decisions log into [{date, text}] rows.
+   *
+   * Format: "[YYYY-MM-DD] text...\n\n[YYYY-MM-DD] more text...\n\n"
+   * Entries without a bracketed date keep `date: ''` and show their full
+   * text (so legacy / malformed rows are still visible, not dropped).
+   * Newest first — preserves the on-disk ordering.
+   */
+  if (!blob || typeof blob !== 'string') return [];
+  const chunks = blob.split(/\n\s*\n/).map(c => c.trim()).filter(Boolean);
+  return chunks.map(chunk => {
+    const m = chunk.match(/^\[(\d{4}-\d{2}-\d{2})\]\s*(.*)$/s);
+    if (m) return { date: m[1], text: m[2].trim() };
+    return { date: '', text: chunk };
+  });
+}
+
+function renderDecisionsTable(projectId, blob) {
+  /** v2.3 — render the decisions blob as a proper accent-bordered table.
+   *
+   * Read-only: there is no edit affordance here. Decisions are append-only
+   * via the `set_decision` MCP tool. The accent border-left on each row
+   * matches the visual language of recent-tasks and sprint cards.
+   */
+  const host = document.getElementById(`decisions-table-${projectId}`);
+  if (!host) return;
+  const rows = parseDecisionsBlob(blob);
+  if (rows.length === 0) {
+    host.innerHTML = `<div style="color:var(--muted);padding:10px;text-align:center;border:1px dashed var(--border);border-radius:4px">(no decisions logged yet — call <code>set_decision</code> from MCP to record one)</div>`;
+    return;
+  }
+  const html = rows.map(row => {
+    const date = row.date ? escapeHtml(row.date) : '—';
+    // Text may include long single-line decisions; preserve whitespace
+    // (set_decision lets users embed paragraphs) but allow wrap.
+    return `<div style="display:grid;grid-template-columns:96px 1fr;gap:10px;padding:8px 10px;border-left:3px solid var(--accent);background:var(--surface-2);border-radius:0 4px 4px 0;margin-bottom:6px;align-items:start">
+      <div style="color:var(--accent);font-weight:600;white-space:nowrap">${date}</div>
+      <div style="color:var(--text);white-space:pre-wrap;word-break:break-word;line-height:1.5">${escapeHtml(row.text)}</div>
+    </div>`;
+  }).join('');
+  host.innerHTML = html;
 }
 
 function wireGoalPreviewToggle(taEl, previewEl) {
