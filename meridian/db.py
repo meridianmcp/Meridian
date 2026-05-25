@@ -233,9 +233,11 @@ CREATE TABLE IF NOT EXISTS tenants (
     id TEXT PRIMARY KEY,
     email TEXT NOT NULL UNIQUE,
     google_sub TEXT UNIQUE,
+    microsoft_sub TEXT UNIQUE,
     neon_project_id TEXT,
     neon_db_url TEXT,
     stripe_customer_id TEXT,
+    stripe_metered_item_id TEXT,
     plan TEXT NOT NULL DEFAULT 'standard'
         CHECK (plan IN ('standard','pro')),
     pool_project_id TEXT,
@@ -857,6 +859,8 @@ async def _migrate_hosted_tables(db: aiosqlite.Connection) -> None:
         "UPDATE tenants SET plan='standard' WHERE plan IN ('free','team')"
     )
     await _migrate_add_column_if_missing(db, "tenants", "pool_project_id", "TEXT")
+    await _migrate_add_column_if_missing(db, "tenants", "microsoft_sub", "TEXT")
+    await _migrate_add_column_if_missing(db, "tenants", "stripe_metered_item_id", "TEXT")
     await db.commit()
 
 
@@ -3220,29 +3224,35 @@ async def upsert_tenant(
     db: aiosqlite.Connection,
     email: str,
     google_sub: str | None = None,
+    microsoft_sub: str | None = None,
 ) -> dict[str, Any]:
     """Create or update a tenant record by email.
 
-    If the tenant already exists, updates ``google_sub`` if provided and
-    returns the current row.  Returns the tenant dict.
+    Updates provider sub IDs when provided. Returns the tenant dict.
     """
     email = email.strip().lower()
     async with db.execute("SELECT * FROM tenants WHERE email = ?", (email,)) as cur:
         row = await cur.fetchone()
     if row:
         tenant = _row_to_dict(row)
+        updates: list[tuple[str, str]] = []
         if google_sub and tenant.get("google_sub") != google_sub:
+            updates.append(("google_sub", google_sub))
+        if microsoft_sub and tenant.get("microsoft_sub") != microsoft_sub:
+            updates.append(("microsoft_sub", microsoft_sub))
+        for col, val in updates:
             await db.execute(
-                "UPDATE tenants SET google_sub = ? WHERE id = ?",
-                (google_sub, tenant["id"]),
+                f"UPDATE tenants SET {col} = ? WHERE id = ?",  # noqa: S608
+                (val, tenant["id"]),
             )
+            tenant[col] = val
+        if updates:
             await db.commit()
-            tenant["google_sub"] = google_sub
         return tenant
     tid = _new_id()
     await db.execute(
-        "INSERT INTO tenants (id, email, google_sub) VALUES (?, ?, ?)",
-        (tid, email, google_sub),
+        "INSERT INTO tenants (id, email, google_sub, microsoft_sub) VALUES (?, ?, ?, ?)",
+        (tid, email, google_sub, microsoft_sub),
     )
     await db.commit()
     async with db.execute("SELECT * FROM tenants WHERE id = ?", (tid,)) as cur:

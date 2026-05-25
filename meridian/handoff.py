@@ -17,6 +17,7 @@ the field is always populated.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
@@ -105,18 +106,78 @@ async def _generate_ai_summary(
         return fallback
     try:
         import anthropic  # type: ignore[import]
-        client = anthropic.Anthropic(api_key=api_key)
-        resp = client.messages.create(
-            model="claude-haiku-4-5",
-            max_tokens=200,
-            messages=[{"role": "user", "content": prompt}],
+
+        def _sync_call() -> str:
+            client = anthropic.Anthropic(api_key=api_key)
+            resp = client.messages.create(
+                model="claude-haiku-4-5",
+                max_tokens=200,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            return "".join(
+                getattr(block, "text", "") for block in resp.content
+            ).strip()
+
+        loop = asyncio.get_event_loop()
+        text = await asyncio.wait_for(
+            loop.run_in_executor(None, _sync_call),
+            timeout=30.0,
         )
-        text = "".join(
-            getattr(block, "text", "") for block in resp.content
-        ).strip()
         return text or fallback
-    except Exception:  # noqa: BLE001
+    except (asyncio.TimeoutError, Exception):  # noqa: BLE001
         return fallback
+
+
+async def _generate_handoff_l0(
+    db: aiosqlite.Connection,
+    project_id: str,
+    output_dir: str,
+) -> tuple[str, str]:
+    """Emergency L0-only handoff — north star + pinned decisions, nothing else.
+
+    Called as a fallback when ``generate_handoff`` times out or fails. No AI
+    calls, no session summarisation, minimal DB work.
+    """
+    project = await db_module.get_project(db, project_id)
+    name = (project or {}).get("name", project_id)
+    goal = await db_module.get_goal(db, project_id)
+    north_star = (goal or {}).get("north_star") or "(no north star set)"
+    sprint = (goal or {}).get("sprint") or ""
+
+    try:
+        pinned = await db_module.get_pinned_decisions(db, project_id)
+    except Exception:  # noqa: BLE001
+        pinned = []
+
+    lines = [
+        f"# Handoff — {name}",
+        f"_Generated at {datetime.now(timezone.utc).isoformat(timespec='seconds')} (L0 fallback — full handoff timed out)_",
+        "",
+        "## L0 — Core",
+        "",
+        "### North Star",
+        north_star,
+        "",
+    ]
+    if sprint:
+        lines += ["### Sprint", sprint, ""]
+    if pinned:
+        lines += ["### Pinned Decisions"]
+        for d in pinned:
+            lines.append(f"- **{d.get('title', '?')}**: {d.get('body', '')}")
+        lines.append("")
+    lines += [
+        "---",
+        "_Full handoff unavailable (timeout). Run `generate_handoff` again when DB load is lower._",
+    ]
+    content = "\n".join(lines)
+
+    out_dir = Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    slug = _slugify(name)
+    out_path = out_dir / f"{slug}_handoff.md"
+    out_path.write_text(content, encoding="utf-8")
+    return str(out_path.resolve()), content
 
 
 async def generate_handoff(

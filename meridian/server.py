@@ -497,8 +497,10 @@ async def lifespan(app: FastAPI):
     # v0.4.2 — periodic auto-summary task. Interval comes from env so
     # tests can run it on a sub-second cadence; default is ten minutes.
     interval_s = float(os.environ.get("MERIDIAN_AUTO_SUMMARY_INTERVAL", 600))
+    app.state.last_storage_check_ts = 0.0  # epoch seconds
 
     async def _auto_summary_loop() -> None:
+        import time as _time
         while True:
             try:
                 await asyncio.sleep(interval_s)
@@ -525,6 +527,16 @@ async def lifespan(app: FastAPI):
                             )
                 except Exception:  # noqa: BLE001
                     pass
+                # v1.0 — hourly storage overage check (hosted only)
+                if os.environ.get("MERIDIAN_HOSTED", "").lower() in ("1", "true", "yes"):
+                    now_ts = _time.monotonic()
+                    if now_ts - app.state.last_storage_check_ts >= 3600:
+                        app.state.last_storage_check_ts = now_ts
+                        try:
+                            from .hosted import run_storage_overage_check
+                            await run_storage_overage_check(db)
+                        except Exception:  # noqa: BLE001
+                            pass
                 # v2.4 — refresh the CLAUDE.md <current_state> block for
                 # every project on each cycle. Local dev only — skipped
                 # on hosted multi-tenant deployments where there is no
@@ -885,6 +897,20 @@ async def auth_github_callback(request: Request):
     """Handle GitHub OAuth callback — create/update tenant, set session cookie."""
     from .hosted import auth_github_callback as _auth_github_callback
     return await _auth_github_callback(request)
+
+
+@app.get("/auth/microsoft/login")
+async def auth_microsoft_login(request: Request):
+    """Redirect browser to Microsoft OAuth consent page."""
+    from .hosted import auth_microsoft_login as _auth_microsoft_login
+    return await _auth_microsoft_login(request)
+
+
+@app.get("/auth/microsoft/callback")
+async def auth_microsoft_callback(request: Request):
+    """Handle Microsoft OAuth callback — create/update tenant, set session cookie."""
+    from .hosted import auth_microsoft_callback as _auth_microsoft_callback
+    return await _auth_microsoft_callback(request)
 
 
 @app.get("/auth/logout")
@@ -1620,10 +1646,19 @@ async def generate_handoff(
     # get instant handoffs; hosted deploys with the key get summaries.
     import os as _os
     skip_summary = not _os.environ.get("ANTHROPIC_API_KEY")
-    path, content = await handoff_module.generate_handoff(
-        _db(request), project_id, _data_dir(request),
-        skip_ai_summary=skip_summary,
-    )
+    db = _db(request)
+    data_dir = _data_dir(request)
+    try:
+        path, content = await asyncio.wait_for(
+            handoff_module.generate_handoff(
+                db, project_id, data_dir, skip_ai_summary=skip_summary
+            ),
+            timeout=90.0,
+        )
+    except asyncio.TimeoutError:
+        path, content = await handoff_module._generate_handoff_l0(
+            db, project_id, data_dir
+        )
     return {"path": path, "content": content}
 
 
@@ -3309,6 +3344,38 @@ async def list_waitlist(request: Request) -> list[dict[str, Any]]:
 
 
 # ---------------------------------------------------------------------------
+# v1.0 — Stripe Checkout (API-based, plan-aware)
+# ---------------------------------------------------------------------------
+
+
+@app.get("/checkout")
+async def checkout_redirect(request: Request, plan: str = "standard") -> RedirectResponse:
+    """Create a Stripe Checkout Session and redirect to it.
+
+    Requires an active session cookie. ``plan`` must be ``standard`` or ``pro``.
+    Falls back to the payment link if Stripe API is not configured.
+    """
+    from .hosted import create_stripe_checkout_session, get_current_tenant
+
+    if plan not in ("standard", "pro"):
+        raise HTTPException(status_code=400, detail="plan must be standard or pro")
+
+    try:
+        tenant = await get_current_tenant(request)
+    except HTTPException:
+        return RedirectResponse(f"/auth/login?next=/checkout%3Fplan%3D{plan}", status_code=302)
+
+    try:
+        url = await create_stripe_checkout_session(tenant, plan)
+    except RuntimeError:
+        # Stripe not configured — fall back to payment link
+        fallback = os.environ.get("STRIPE_PAYMENT_LINK", "/auth/login")
+        return RedirectResponse(fallback, status_code=302)
+
+    return RedirectResponse(url, status_code=302)
+
+
+# ---------------------------------------------------------------------------
 # v2.0 — Stripe webhook
 # ---------------------------------------------------------------------------
 
@@ -3362,10 +3429,15 @@ async def stripe_webhook(request: Request) -> dict[str, str]:
         return {"status": "no_email"}
 
     db = _db(request)
+    # Resolve plan from checkout metadata (standard or pro); default to standard
+    plan = event_obj.get("metadata", {}).get("plan", "standard")
+    if plan not in ("standard", "pro"):
+        plan = "standard"
+
     tenant = await db_module.upsert_tenant(db, email=email)
     if stripe_customer_id:
         tenant = await db_module.update_tenant(
-            db, tenant["id"], stripe_customer_id=stripe_customer_id, plan="pro"
+            db, tenant["id"], stripe_customer_id=stripe_customer_id, plan=plan
         )
 
     # Capacity check before provisioning
@@ -3669,7 +3741,15 @@ async def _dispatch_mcp_tool(name: str, args: dict[str, Any], db: Any, data_dir:
         return await db_module.get_tasks(db, args["project_id"], args.get("limit", 20))
     if name == "generate_handoff":
         from . import handoff as handoff_module_local
-        path, content = await handoff_module_local.generate_handoff(db, args["project_id"], data_dir)
+        try:
+            path, content = await asyncio.wait_for(
+                handoff_module_local.generate_handoff(db, args["project_id"], data_dir),
+                timeout=90.0,
+            )
+        except asyncio.TimeoutError:
+            path, content = await handoff_module_local._generate_handoff_l0(
+                db, args["project_id"], data_dir
+            )
         return {"file_path": path, "content": content}
     if name == "pin_decision":
         return await db_module.pin_decision(
@@ -4675,9 +4755,17 @@ def build_mcp_server():
                     db, arguments["project_id"], active_only=True
                 )
             elif name == "generate_handoff":
-                path, content = await handoff_module.generate_handoff(
-                    db, arguments["project_id"], state["data_dir"]
-                )
+                try:
+                    path, content = await asyncio.wait_for(
+                        handoff_module.generate_handoff(
+                            db, arguments["project_id"], state["data_dir"]
+                        ),
+                        timeout=90.0,
+                    )
+                except asyncio.TimeoutError:
+                    path, content = await handoff_module._generate_handoff_l0(
+                        db, arguments["project_id"], state["data_dir"]
+                    )
                 result = {"path": path, "content": content}
             elif name == "get_context_block":
                 # v2.3 — reuse the dispatch impl so HTTP and stdio share one path.

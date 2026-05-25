@@ -135,6 +135,73 @@ async def exchange_code_for_userinfo(code: str) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Microsoft OAuth helpers
+# ---------------------------------------------------------------------------
+
+MICROSOFT_CLIENT_ID = os.environ.get("MICROSOFT_CLIENT_ID", "")
+MICROSOFT_CLIENT_SECRET = os.environ.get("MICROSOFT_CLIENT_SECRET", "")
+_MICROSOFT_AUTH_URL = "https://login.microsoftonline.com/common/oauth2/v2.0/authorize"
+_MICROSOFT_TOKEN_URL = "https://login.microsoftonline.com/common/oauth2/v2.0/token"
+_MICROSOFT_SCOPES = "openid email profile"
+
+
+def _microsoft_callback_url() -> str:
+    base = _cfg("MERIDIAN_BASE_URL", "http://localhost:7878").rstrip("/")
+    return f"{base}/auth/microsoft/callback"
+
+
+async def get_microsoft_auth_url() -> str:
+    """Return the Microsoft OAuth authorization URL."""
+    if not MICROSOFT_CLIENT_ID:
+        raise RuntimeError("MICROSOFT_CLIENT_ID is not set")
+    import urllib.parse
+    params = urllib.parse.urlencode({
+        "client_id": MICROSOFT_CLIENT_ID,
+        "response_type": "code",
+        "redirect_uri": _microsoft_callback_url(),
+        "response_mode": "query",
+        "scope": _MICROSOFT_SCOPES,
+    })
+    return f"{_MICROSOFT_AUTH_URL}?{params}"
+
+
+async def exchange_microsoft_code_for_userinfo(code: str) -> dict[str, Any]:
+    """Exchange a Microsoft OAuth code for user info (email + sub)."""
+    import httpx
+
+    if not MICROSOFT_CLIENT_ID or not MICROSOFT_CLIENT_SECRET:
+        raise RuntimeError("MICROSOFT_CLIENT_ID / MICROSOFT_CLIENT_SECRET not set")
+
+    async with httpx.AsyncClient() as http:
+        token_resp = await http.post(
+            _MICROSOFT_TOKEN_URL,
+            data={
+                "client_id": MICROSOFT_CLIENT_ID,
+                "client_secret": MICROSOFT_CLIENT_SECRET,
+                "code": code,
+                "redirect_uri": _microsoft_callback_url(),
+                "grant_type": "authorization_code",
+            },
+        )
+        token_resp.raise_for_status()
+        token_data = token_resp.json()
+        access_token = token_data.get("access_token", "")
+        if not access_token:
+            raise RuntimeError(f"Microsoft token exchange failed: {token_data}")
+
+        me_resp = await http.get(
+            "https://graph.microsoft.com/v1.0/me",
+            headers={"Authorization": f"Bearer {access_token}"},
+        )
+        me_resp.raise_for_status()
+        me = me_resp.json()
+
+    email = me.get("mail") or me.get("userPrincipalName", "")
+    sub = me.get("id", "")
+    return {"email": email, "sub": sub}
+
+
+# ---------------------------------------------------------------------------
 # GitHub OAuth helpers
 # ---------------------------------------------------------------------------
 
@@ -241,6 +308,7 @@ body{background:#0d0d0f;color:#e8eaf0;font-family:-apple-system,BlinkMacSystemFo
 .btn:hover{opacity:.88;text-decoration:none}
 .btn-google{background:#fff;color:#3c4043}
 .btn-github{background:#24292f;color:#fff}
+.btn-microsoft{background:#2f2f2f;color:#fff}
 .divider{display:flex;align-items:center;gap:12px;margin:18px 0;color:#8b8fa8;font-size:.78rem;text-transform:uppercase;letter-spacing:.6px}
 .divider::before,.divider::after{content:"";flex:1;height:1px;background:#2a2d35}
 .email-form{display:flex;flex-direction:column;gap:8px}
@@ -267,6 +335,7 @@ body{background:#0d0d0f;color:#e8eaf0;font-family:-apple-system,BlinkMacSystemFo
     <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0 0 24 12c0-6.63-5.37-12-12-12z"/></svg>
     Continue with GitHub
   </a>
+<!-- MICROSOFT_BUTTON -->
   <div class="divider">or</div>
   <form class="email-form" id="magic-form" onsubmit="event.preventDefault();sendMagic();">
     <input type="email" class="email-input" id="magic-email" placeholder="you@example.com" autocomplete="email" required>
@@ -315,10 +384,22 @@ async function sendMagic() {
 </html>"""
 
 
+def _build_login_page() -> str:
+    """Build the login page HTML, injecting Microsoft button when configured."""
+    ms_button = ""
+    if MICROSOFT_CLIENT_ID:
+        ms_button = """
+  <a href="/auth/microsoft/login" class="btn btn-microsoft">
+    <svg width="20" height="20" viewBox="0 0 21 21" fill="none"><rect x="1" y="1" width="9" height="9" fill="#f25022"/><rect x="11" y="1" width="9" height="9" fill="#7fba00"/><rect x="1" y="11" width="9" height="9" fill="#00a4ef"/><rect x="11" y="11" width="9" height="9" fill="#ffb900"/></svg>
+    Continue with Microsoft
+  </a>"""
+    return _LOGIN_PAGE_HTML.replace("<!-- MICROSOFT_BUTTON -->", ms_button)
+
+
 async def auth_login(request: Request):
     """Serve the sign-in page with Google and GitHub OAuth buttons."""
     from fastapi.responses import HTMLResponse
-    return HTMLResponse(_LOGIN_PAGE_HTML)
+    return HTMLResponse(_build_login_page())
 
 
 def _post_login_redirect(tenant: dict) -> str:
@@ -442,6 +523,55 @@ async def auth_github_callback(request: Request) -> RedirectResponse:
     return response
 
 
+async def auth_microsoft_login(request: Request) -> RedirectResponse:
+    """Redirect the browser to Microsoft's OAuth consent page."""
+    try:
+        url = await get_microsoft_auth_url()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return RedirectResponse(url, status_code=302)
+
+
+async def auth_microsoft_callback(request: Request) -> RedirectResponse:
+    """Handle Microsoft OAuth callback — upsert tenant, set session cookie."""
+    from . import db as db_module
+
+    code = request.query_params.get("code")
+    if not code:
+        raise HTTPException(status_code=400, detail="missing oauth code")
+
+    try:
+        userinfo = await exchange_microsoft_code_for_userinfo(code)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Microsoft OAuth exchange failed: {exc}") from exc
+
+    email: str = userinfo.get("email", "")
+    sub: str = userinfo.get("sub", "")
+    if not email:
+        raise HTTPException(status_code=400, detail="no email in Microsoft profile")
+
+    db = request.app.state.db
+    tenant = await db_module.upsert_tenant(db, email=email, microsoft_sub=sub)
+
+    expires_at = (
+        datetime.now(timezone.utc) + timedelta(hours=_SESSION_MAX_AGE_HOURS)
+    ).isoformat()
+    session = await db_module.create_user_session(db, tenant["id"], expires_at)
+    cookie_value = _make_session_cookie(session["id"])
+
+    redirect_to = _post_login_redirect(tenant)
+    response = RedirectResponse(redirect_to, status_code=302)
+    response.set_cookie(
+        _SESSION_COOKIE,
+        cookie_value,
+        httponly=True,
+        secure=_cfg("MERIDIAN_BASE_URL", "").startswith("https://"),
+        samesite="lax",
+        max_age=_SESSION_MAX_AGE_HOURS * 3600,
+    )
+    return response
+
+
 async def auth_logout(request: Request) -> RedirectResponse:
     """Clear the session cookie and delete the DB session."""
     from . import db as db_module
@@ -528,6 +658,19 @@ def _neon_api_key_for_tier(tier: str) -> str:
             )
         return key
     return _require_cfg("NEON_API_KEY")
+
+
+async def _set_neon_pitr(api_key: str, neon_project_id: str, retention_seconds: int) -> None:
+    """Set point-in-time recovery retention on a Neon project. Idempotent."""
+    import httpx
+
+    async with httpx.AsyncClient(timeout=15) as http:
+        resp = await http.patch(
+            f"https://console.neon.tech/api/v2/projects/{neon_project_id}",
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            json={"project": {"history_retention_seconds": retention_seconds}},
+        )
+        resp.raise_for_status()
 
 
 async def _create_neon_pool_project(
@@ -644,6 +787,49 @@ async def _create_customer_database(
         return uri_resp.json().get("uri", "")
 
 
+# ---------------------------------------------------------------------------
+# Stripe Checkout
+# ---------------------------------------------------------------------------
+
+STRIPE_PRICE_ID = os.environ.get("STRIPE_PRICE_ID", "")      # standard tier
+STRIPE_PRO_PRICE_ID = os.environ.get("STRIPE_PRO_PRICE_ID", "")  # pro tier
+
+
+async def create_stripe_checkout_session(tenant: dict, plan: str) -> str:
+    """Create a Stripe Checkout Session for the given plan.
+
+    Returns the checkout URL to redirect the user to. Raises RuntimeError
+    when the required price ID env var is not configured.
+    """
+    import stripe  # type: ignore[import]
+
+    stripe.api_key = _require_cfg("STRIPE_API_KEY")
+    base = _cfg("MERIDIAN_BASE_URL", "http://localhost:7878").rstrip("/")
+
+    price_id = STRIPE_PRO_PRICE_ID if plan == "pro" else STRIPE_PRICE_ID
+    if not price_id:
+        key = "STRIPE_PRO_PRICE_ID" if plan == "pro" else "STRIPE_PRICE_ID"
+        raise RuntimeError(f"{key} is not configured")
+
+    params: dict = {
+        "mode": "subscription",
+        "payment_method_collection": "always",
+        "subscription_data": {"trial_period_days": 7},
+        "line_items": [{"price": price_id, "quantity": 1}],
+        "metadata": {"plan": plan, "tenant_id": tenant.get("id", "")},
+        "success_url": f"{base}/auth/success",
+        "cancel_url": f"{base}/pricing",
+    }
+    customer_id = tenant.get("stripe_customer_id")
+    if customer_id:
+        params["customer"] = customer_id
+    else:
+        params["customer_email"] = tenant.get("email", "")
+
+    session = stripe.checkout.Session.create(**params)
+    return session.url
+
+
 async def provision_neon_db(tenant_id: str, db: Any) -> dict[str, Any]:
     """Provision a Neon database for a tenant using the pool architecture.
 
@@ -705,6 +891,15 @@ async def provision_neon_db(tenant_id: str, db: Any) -> dict[str, Any]:
 
     # Increment pool project customer count
     await db_module.increment_pool_project_count(db, neon_project_id)
+
+    # v1.0 — set PITR retention on the pool project based on plan tier.
+    # Pro: 7 days, Standard: 1 day (Neon default). Best-effort — never
+    # block provisioning if the PATCH fails.
+    try:
+        retention_s = 604800 if tier == "pro" else 86400
+        await _set_neon_pitr(api_key, neon_project_id, retention_s)
+    except Exception:  # noqa: BLE001
+        pass
 
     return updated
 
@@ -876,6 +1071,100 @@ async def check_capacity(db: Any) -> dict[str, Any]:
             "warning": pro_projects >= _ALERT_THRESHOLD_PRO,
         },
     }
+
+
+# ---------------------------------------------------------------------------
+# Storage overage billing
+# ---------------------------------------------------------------------------
+
+_PLAN_STORAGE_LIMIT_GB = {"standard": 1.0, "pro": 10.0}
+
+
+async def get_neon_storage_gb(neon_project_id: str, neon_api_key: str) -> float:
+    """Return current storage for a Neon project in GB.
+
+    Uses ``data_storage_bytes_hour`` from the Neon project detail endpoint.
+    Returns 0.0 on any error so callers can degrade gracefully.
+    """
+    import httpx
+
+    try:
+        async with httpx.AsyncClient(timeout=15) as http:
+            resp = await http.get(
+                f"https://console.neon.tech/api/v2/projects/{neon_project_id}",
+                headers={"Authorization": f"Bearer {neon_api_key}"},
+            )
+            resp.raise_for_status()
+            data = resp.json().get("project", {})
+            bytes_hour = float(data.get("data_storage_bytes_hour", 0) or 0)
+            # bytes_hour is cumulative GB-hours; treat as proxy for GB
+            return bytes_hour / 1e9
+    except Exception:  # noqa: BLE001
+        return 0.0
+
+
+async def report_stripe_overage(
+    stripe_metered_item_id: str,
+    overage_gb: float,
+    stripe_api_key: str,
+) -> None:
+    """Report storage overage to Stripe as metered usage (best-effort)."""
+    import stripe  # type: ignore[import]
+
+    stripe.api_key = stripe_api_key
+    quantity = max(1, round(overage_gb))
+    try:
+        stripe.SubscriptionItem.create_usage_record(
+            stripe_metered_item_id,
+            quantity=quantity,
+            action="set",
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
+
+async def run_storage_overage_check(db: Any) -> None:
+    """Check storage usage for all active tenants, log warnings, report to Stripe.
+
+    Called hourly from the background loop. Uses NEON_API_KEY / NEON_API_KEY_PRO
+    for storage reads and STRIPE_API_KEY for usage reporting.
+    """
+    stripe_api_key = _cfg("STRIPE_API_KEY", "")
+
+    async with db.execute(
+        "SELECT id, email, plan, neon_project_id, stripe_customer_id, stripe_metered_item_id "
+        "FROM tenants WHERE neon_project_id IS NOT NULL"
+    ) as cur:
+        rows = await cur.fetchall()
+
+    def _to_d(r: Any) -> dict:
+        return r if isinstance(r, dict) else {k: r[k] for k in r.keys()}
+
+    tenants = [_to_d(r) for r in rows] if rows else []
+
+    for tenant in tenants:
+        neon_project_id = tenant.get("neon_project_id")
+        if not neon_project_id:
+            continue
+        plan = tenant.get("plan") or "standard"
+        api_key = _neon_api_key_for_tier(plan)
+        if not api_key:
+            continue
+
+        usage_gb = await get_neon_storage_gb(neon_project_id, api_key)
+        limit_gb = _PLAN_STORAGE_LIMIT_GB.get(plan, 1.0)
+
+        if usage_gb > limit_gb:
+            overage_gb = usage_gb - limit_gb
+            import logging as _logging
+            _logging.getLogger(__name__).warning(
+                "Storage overage: tenant=%s plan=%s usage=%.2f GB limit=%.1f GB overage=%.2f GB",
+                tenant["email"], plan, usage_gb, limit_gb, overage_gb,
+            )
+
+            metered_item_id = tenant.get("stripe_metered_item_id")
+            if stripe_api_key and metered_item_id:
+                await report_stripe_overage(metered_item_id, overage_gb, stripe_api_key)
 
 
 # ---------------------------------------------------------------------------

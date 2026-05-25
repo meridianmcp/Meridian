@@ -17,8 +17,19 @@ SQL translation rules:
 from __future__ import annotations
 
 import asyncio
+import os
 import re
 from typing import Any
+
+
+def _same_pg_host(url_a: str, url_b: str) -> bool:
+    """Return True when two Postgres URLs point to the same host+port."""
+    try:
+        host_a = url_a.split("@", 1)[1].split("/")[0]
+        host_b = url_b.split("@", 1)[1].split("/")[0]
+        return host_a == host_b
+    except IndexError:
+        return url_a == url_b
 
 
 # ---------------------------------------------------------------------------
@@ -298,7 +309,10 @@ class PostgresConnection:
 # Postgres-compatible CREATE TABLE DDL
 # ---------------------------------------------------------------------------
 
-CREATE_TABLES_PG = """
+_TS = "to_char(now() at time zone 'utc', 'YYYY-MM-DD HH24:MI:SS')"
+
+# Tables that go in every Postgres DB — customer DBs and the main auth DB.
+CREATE_TABLES_CORE = f"""
 CREATE TABLE IF NOT EXISTS projects (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL UNIQUE,
@@ -306,7 +320,7 @@ CREATE TABLE IF NOT EXISTS projects (
     goal_mode TEXT NOT NULL DEFAULT 'manual',
     decisions TEXT,
     rewind_token TEXT,
-    created_at TEXT NOT NULL DEFAULT (to_char(now() at time zone 'utc', 'YYYY-MM-DD HH24:MI:SS'))
+    created_at TEXT NOT NULL DEFAULT ({_TS})
 );
 
 CREATE TABLE IF NOT EXISTS goal_states (
@@ -316,8 +330,8 @@ CREATE TABLE IF NOT EXISTS goal_states (
     version INTEGER NOT NULL DEFAULT 1,
     goal_north_star TEXT,
     goal_sprint TEXT,
-    created_at TEXT NOT NULL DEFAULT (to_char(now() at time zone 'utc', 'YYYY-MM-DD HH24:MI:SS')),
-    updated_at TEXT NOT NULL DEFAULT (to_char(now() at time zone 'utc', 'YYYY-MM-DD HH24:MI:SS'))
+    created_at TEXT NOT NULL DEFAULT ({_TS}),
+    updated_at TEXT NOT NULL DEFAULT ({_TS})
 );
 
 CREATE TABLE IF NOT EXISTS sessions (
@@ -327,8 +341,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     human_id TEXT,
     session_type TEXT DEFAULT 'human',
     status TEXT NOT NULL DEFAULT 'active',
-    last_seen TEXT NOT NULL DEFAULT (to_char(now() at time zone 'utc', 'YYYY-MM-DD HH24:MI:SS')),
-    created_at TEXT NOT NULL DEFAULT (to_char(now() at time zone 'utc', 'YYYY-MM-DD HH24:MI:SS')),
+    last_seen TEXT NOT NULL DEFAULT ({_TS}),
+    created_at TEXT NOT NULL DEFAULT ({_TS}),
     session_summary TEXT
 );
 
@@ -342,15 +356,7 @@ CREATE TABLE IF NOT EXISTS task_log (
     claimed_at TEXT,
     parent_session_id TEXT,
     worker_pid INTEGER,
-    created_at TEXT NOT NULL DEFAULT (to_char(now() at time zone 'utc', 'YYYY-MM-DD HH24:MI:SS'))
-);
-
--- v1.9.x — waitlist: pre-launch email capture for hosted tier.
-CREATE TABLE IF NOT EXISTS waitlist (
-    id TEXT PRIMARY KEY,
-    email TEXT NOT NULL UNIQUE,
-    note TEXT,
-    created_at TEXT NOT NULL DEFAULT (to_char(now() at time zone 'utc', 'YYYY-MM-DD HH24:MI:SS'))
+    created_at TEXT NOT NULL DEFAULT ({_TS})
 );
 
 CREATE TABLE IF NOT EXISTS sprint_items (
@@ -362,10 +368,50 @@ CREATE TABLE IF NOT EXISTS sprint_items (
     item_group TEXT,
     pushed_to TEXT,
     human_id TEXT,
-    added_at TEXT NOT NULL DEFAULT (to_char(now() at time zone 'utc', 'YYYY-MM-DD HH24:MI:SS')),
+    added_at TEXT NOT NULL DEFAULT ({_TS}),
     completed_at TEXT,
     task_id TEXT,
     notes TEXT
+);
+
+-- v2.4 — decisions_pinned: editable constitution. See db.py for rationale.
+CREATE TABLE IF NOT EXISTS decisions_pinned (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    title TEXT NOT NULL,
+    body TEXT NOT NULL,
+    category TEXT NOT NULL DEFAULT 'TECHNICAL',
+    status TEXT NOT NULL DEFAULT 'active',
+    superseded_by TEXT REFERENCES decisions_pinned(id),
+    created_at TEXT NOT NULL DEFAULT ({_TS}),
+    updated_at TEXT NOT NULL DEFAULT ({_TS})
+);
+
+-- v2.4 — hitl_requests: human-in-the-loop coordination queue.
+CREATE TABLE IF NOT EXISTS hitl_requests (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    session_id TEXT REFERENCES sessions(id),
+    question TEXT NOT NULL,
+    context TEXT,
+    urgency TEXT NOT NULL DEFAULT 'normal',
+    status TEXT NOT NULL DEFAULT 'pending',
+    answer TEXT,
+    answered_by TEXT,
+    assigned_to TEXT,
+    created_at TEXT NOT NULL DEFAULT ({_TS}),
+    answered_at TEXT
+);
+
+-- v0.9 — project_notes: per-project wiki.
+CREATE TABLE IF NOT EXISTS project_notes (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    title TEXT NOT NULL,
+    body TEXT NOT NULL,
+    tags TEXT,
+    created_at TEXT NOT NULL DEFAULT ({_TS}),
+    updated_at TEXT NOT NULL DEFAULT ({_TS})
 );
 
 CREATE INDEX IF NOT EXISTS idx_goal_project ON goal_states(project_id);
@@ -374,24 +420,44 @@ CREATE INDEX IF NOT EXISTS idx_tasks_project ON task_log(project_id, created_at 
 CREATE INDEX IF NOT EXISTS idx_tasks_session ON task_log(session_id);
 CREATE INDEX IF NOT EXISTS idx_sprint_items_project ON sprint_items(project_id, status);
 CREATE INDEX IF NOT EXISTS idx_sprint_items_version ON sprint_items(project_id, version);
+CREATE INDEX IF NOT EXISTS idx_decisions_pinned_project ON decisions_pinned(project_id, status);
+CREATE INDEX IF NOT EXISTS idx_hitl_project ON hitl_requests(project_id, status);
+CREATE INDEX IF NOT EXISTS idx_hitl_assigned ON hitl_requests(assigned_to, status);
+CREATE INDEX IF NOT EXISTS idx_notes_project ON project_notes(project_id);
+"""
+
+# Tables that go ONLY in the main auth DB (MERIDIAN_DB_URL).
+# Customer DBs provisioned by Neon get only CREATE_TABLES_CORE.
+CREATE_TABLES_HOSTED = f"""
+-- v1.9.x — waitlist: pre-launch email capture for hosted tier.
+CREATE TABLE IF NOT EXISTS waitlist (
+    id TEXT PRIMARY KEY,
+    email TEXT NOT NULL UNIQUE,
+    note TEXT,
+    created_at TEXT NOT NULL DEFAULT ({_TS})
+);
 
 -- v2.0 — hosted tier: tenants, web sessions, API bearer tokens
 CREATE TABLE IF NOT EXISTS tenants (
     id TEXT PRIMARY KEY,
     email TEXT NOT NULL UNIQUE,
     google_sub TEXT UNIQUE,
+    github_sub TEXT UNIQUE,
+    microsoft_sub TEXT UNIQUE,
     neon_project_id TEXT,
     neon_db_url TEXT,
     stripe_customer_id TEXT,
-    plan TEXT NOT NULL DEFAULT 'free',
-    created_at TEXT NOT NULL DEFAULT (to_char(now() at time zone 'utc', 'YYYY-MM-DD HH24:MI:SS'))
+    stripe_metered_item_id TEXT,
+    plan TEXT NOT NULL DEFAULT 'standard',
+    pool_project_id TEXT,
+    created_at TEXT NOT NULL DEFAULT ({_TS})
 );
 
 CREATE TABLE IF NOT EXISTS user_sessions (
     id TEXT PRIMARY KEY,
     tenant_id TEXT NOT NULL REFERENCES tenants(id),
     expires_at TEXT NOT NULL,
-    created_at TEXT NOT NULL DEFAULT (to_char(now() at time zone 'utc', 'YYYY-MM-DD HH24:MI:SS'))
+    created_at TEXT NOT NULL DEFAULT ({_TS})
 );
 
 CREATE TABLE IF NOT EXISTS api_tokens (
@@ -399,7 +465,7 @@ CREATE TABLE IF NOT EXISTS api_tokens (
     tenant_id TEXT NOT NULL REFERENCES tenants(id),
     token_hash TEXT NOT NULL UNIQUE,
     label TEXT,
-    created_at TEXT NOT NULL DEFAULT (to_char(now() at time zone 'utc', 'YYYY-MM-DD HH24:MI:SS'))
+    created_at TEXT NOT NULL DEFAULT ({_TS})
 );
 
 -- v2.1 dark — multi-user roles, not exposed in UI or API at launch
@@ -410,7 +476,7 @@ CREATE TABLE IF NOT EXISTS workspace_members (
     role TEXT NOT NULL DEFAULT 'member'
         CHECK (role IN ('owner','member','viewer')),
     token_hash TEXT,
-    invited_at TEXT NOT NULL DEFAULT (to_char(now() at time zone 'utc', 'YYYY-MM-DD HH24:MI:SS')),
+    invited_at TEXT NOT NULL DEFAULT ({_TS}),
     joined_at TEXT
 );
 
@@ -425,49 +491,14 @@ CREATE TABLE IF NOT EXISTS tenant_environments (
         CHECK (is_default IN (0,1))
 );
 
--- v2.4 — decisions_pinned: editable constitution. See db.py for rationale.
-CREATE TABLE IF NOT EXISTS decisions_pinned (
+-- v2.2 — Neon pool project registry.
+CREATE TABLE IF NOT EXISTS neon_pool_projects (
     id TEXT PRIMARY KEY,
-    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-    title TEXT NOT NULL,
-    body TEXT NOT NULL,
-    category TEXT NOT NULL DEFAULT 'TECHNICAL',
-    status TEXT NOT NULL DEFAULT 'active',
-    superseded_by TEXT REFERENCES decisions_pinned(id),
-    created_at TEXT NOT NULL DEFAULT (to_char(now() at time zone 'utc', 'YYYY-MM-DD HH24:MI:SS')),
-    updated_at TEXT NOT NULL DEFAULT (to_char(now() at time zone 'utc', 'YYYY-MM-DD HH24:MI:SS'))
+    neon_project_id TEXT NOT NULL UNIQUE,
+    tier TEXT NOT NULL DEFAULT 'standard',
+    customer_count INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT ({_TS})
 );
-CREATE INDEX IF NOT EXISTS idx_decisions_pinned_project ON decisions_pinned(project_id, status);
-
--- v2.4 — hitl_requests: human-in-the-loop coordination queue.
-CREATE TABLE IF NOT EXISTS hitl_requests (
-    id TEXT PRIMARY KEY,
-    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-    session_id TEXT REFERENCES sessions(id),
-    question TEXT NOT NULL,
-    context TEXT,
-    urgency TEXT NOT NULL DEFAULT 'normal',
-    status TEXT NOT NULL DEFAULT 'pending',
-    answer TEXT,
-    answered_by TEXT,
-    assigned_to TEXT,
-    created_at TEXT NOT NULL DEFAULT (to_char(now() at time zone 'utc', 'YYYY-MM-DD HH24:MI:SS')),
-    answered_at TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_hitl_project ON hitl_requests(project_id, status);
-CREATE INDEX IF NOT EXISTS idx_hitl_assigned ON hitl_requests(assigned_to, status);
-
--- v0.9 — project_notes: per-project wiki.
-CREATE TABLE IF NOT EXISTS project_notes (
-    id TEXT PRIMARY KEY,
-    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-    title TEXT NOT NULL,
-    body TEXT NOT NULL,
-    tags TEXT,
-    created_at TEXT NOT NULL DEFAULT (to_char(now() at time zone 'utc', 'YYYY-MM-DD HH24:MI:SS')),
-    updated_at TEXT NOT NULL DEFAULT (to_char(now() at time zone 'utc', 'YYYY-MM-DD HH24:MI:SS'))
-);
-CREATE INDEX IF NOT EXISTS idx_notes_project ON project_notes(project_id);
 
 -- v0.9 — magic_link_tokens: email magic-link auth flow.
 CREATE TABLE IF NOT EXISTS magic_link_tokens (
@@ -476,10 +507,13 @@ CREATE TABLE IF NOT EXISTS magic_link_tokens (
     token_hash TEXT NOT NULL UNIQUE,
     used_at TEXT,
     expires_at TEXT NOT NULL,
-    created_at TEXT NOT NULL DEFAULT (to_char(now() at time zone 'utc', 'YYYY-MM-DD HH24:MI:SS'))
+    created_at TEXT NOT NULL DEFAULT ({_TS})
 );
 CREATE INDEX IF NOT EXISTS idx_magic_email ON magic_link_tokens(email, used_at);
 """
+
+# Backward-compat alias — the test suite imports this name directly.
+CREATE_TABLES_PG = CREATE_TABLES_CORE + CREATE_TABLES_HOSTED
 
 
 async def init_pg_db(url: str) -> PostgresConnection:
@@ -524,13 +558,21 @@ async def init_pg_db(url: str) -> PostgresConnection:
     await pool.open(wait=True, timeout=30.0)
 
     conn = PostgresConnection(pool)
-    await conn.executescript(CREATE_TABLES_PG)
+    await conn.executescript(CREATE_TABLES_CORE)
+    # Only create hosted tables (tenants, sessions, billing, etc.) on the
+    # main auth DB. Customer DBs provisioned by Neon get CORE tables only.
+    main_db_url = os.environ.get("MERIDIAN_DB_URL", "")
+    is_main_db = not main_db_url or _same_pg_host(url, main_db_url)
+    if is_main_db:
+        await conn.executescript(CREATE_TABLES_HOSTED)
     await _migrate_pg_sprint_items_v2(conn)
     await _migrate_pg_drop_chat_tables(conn)
     await _migrate_pg_goal_field_timestamps(conn)
     await _migrate_pg_v24_task_tree_and_framework(conn)
     await _migrate_pg_v24_pinned_decisions_and_hitl(conn)
     await _migrate_pg_v09_notes_and_magic_links(conn)
+    if is_main_db:
+        await _migrate_pg_v10_tenant_columns(conn)
     return conn
 
 
@@ -622,6 +664,15 @@ async def _migrate_pg_drop_chat_tables(conn: PostgresConnection) -> None:
     await conn.executescript(
         "DROP TABLE IF EXISTS chat_messages CASCADE;"
         "DROP TABLE IF EXISTS chat_sessions CASCADE"
+    )
+
+
+async def _migrate_pg_v10_tenant_columns(conn: PostgresConnection) -> None:
+    """v1.0 — add microsoft_sub and stripe_metered_item_id to tenants on existing DBs."""
+    await conn.executescript(
+        "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS microsoft_sub TEXT UNIQUE;"
+        "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS stripe_metered_item_id TEXT;"
+        "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS pool_project_id TEXT"
     )
 
 
