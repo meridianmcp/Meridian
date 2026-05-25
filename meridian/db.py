@@ -1200,6 +1200,15 @@ async def set_goal(
         )
         if encoded == existing_encoded:
             minor = True
+        else:
+            # If ONLY the AUTO BLOCKS section changed (human prefix identical),
+            # treat as minor — auto-summary updates must never bump version.
+            _AUTO_SPLIT = "--- AUTO BLOCKS BELOW ---"
+            def _strip_auto(s: Any) -> str:
+                t = s if isinstance(s, str) else (s.get("content", "") if isinstance(s, dict) else str(s or ""))
+                return t.split(_AUTO_SPLIT)[0].rstrip() if _AUTO_SPLIT in t else t.rstrip()
+            if _strip_auto(encoded) == _strip_auto(existing_encoded):
+                minor = True
     if minor and existing is not None:
         # In-place update — no version bump, no new row.
         # Strict AUTO BLOCKS replace: strip ALL occurrences from both sides,

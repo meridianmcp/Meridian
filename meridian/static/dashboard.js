@@ -252,7 +252,9 @@ async function loadProjects() {
   state.projects.forEach(p => {
     const div = document.createElement('div');
     div.className = 'project-item';
-    div.style.cssText = 'display:flex;align-items:center;justify-content:space-between;gap:4px';
+    div.dataset.projectId = p.id;
+    const isOpen = state.tabs.some(t => t.id === p.id);
+    div.style.cssText = `display:flex;align-items:center;justify-content:space-between;gap:4px;${isOpen ? 'background:var(--surface-2);border-radius:4px;padding:2px 4px;' : ''}`;
     const nameSpan = document.createElement('span');
     nameSpan.style.cssText = 'flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap';
     nameSpan.textContent = p.name;
