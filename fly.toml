@@ -11,11 +11,11 @@ primary_region = "iad"
   force_https = true
   auto_stop_machines = "stop"
   auto_start_machines = true
-  min_machines_running = 0
+  min_machines_running = 1
   [http_service.concurrency]
-    type = "connections"
-    hard_limit = 25
-    soft_limit = 20
+    type = "requests"
+    hard_limit = 50
+    soft_limit = 40
 
 [[vm]]
   memory = "512mb"
