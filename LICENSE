@@ -1,4 +1,4 @@
-Meridian Source License 2.0 (MSL-2.0)
+Meridian Source License 1.0 (MSL-1.0)
 Based on the Business Source License 1.1 (BUSL-1.1) with Additional Use Grant
 and additional restrictions specific to Meridian.
 
@@ -23,7 +23,7 @@ PLAIN ENGLISH SUMMARY (not legally binding)
   NEVER:  The above during the Protection Period without a commercial
           license from us.
 
-  LATER:  After 8 years from first public release of each version, that
+  LATER:  After 6 years from first public release of each version, that
           version automatically becomes MIT — no strings attached.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -37,11 +37,11 @@ TERMS AND CONDITIONS
    "Software" means the Meridian source code, binaries, documentation,
    and all associated files distributed under this license.
 
-   "Protection Period" means eight (8) years from the date each version
+   "Protection Period" means six (6) years from the date each version
    of the Software is first publicly distributed. Each version carries
    its own independent Protection Period from its own release date.
 
-   "Change Date" means the date eight (8) years after the first public
+   "Change Date" means the date six (6) years after the first public
    distribution date of a given version of the Software.
 
    "Change License" means the MIT License
@@ -57,10 +57,12 @@ TERMS AND CONDITIONS
    as the data backend for locally-running instances. Connecting to a
    Hosted Database does not by itself constitute hosting the Software.
 
-   "Production Use" means using the Software to operate a service,
-   product, or workflow that generates revenue, handles production
-   workloads for paying customers, or is made available to external
-   third parties — regardless of whether a fee is charged.
+   "Production Use" means making the Software available as a service
+   to external third parties — i.e., offering Meridian or a Competing
+   Product as a hosted or managed service that others connect to.
+   Internal use of the Software within your own organization, including
+   use that generates revenue for your own business, is not Production
+   Use and is explicitly permitted under Section 2.
 
    "Competing Product" means any software, service, or platform that:
    a) provides shared goal state, task queue, and session coordination
@@ -165,5 +167,5 @@ TERMS AND CONDITIONS
 Meridian Source License 2.0 (MSL-2.0)
 Not an OSI-approved open source license.
 Based on the Business Source License 1.1 (BUSL-1.1).
-Protection Period: 8 years per version from first public distribution.
+Protection Period: 6 years per version from first public distribution.
 Change License: MIT License.

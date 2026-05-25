@@ -59,6 +59,15 @@ function _updateConnectionIndicator(cfg) {
   const switcher = document.getElementById('connection-switcher');
   if (!wrap || !label) return;
   wrap.style.display = 'block';
+  // Demo mode: show simplified read-only badge, no switcher
+  if (cfg.demo_mode) {
+    label.textContent = 'demo (sqlite)';
+    dot.style.background = 'var(--accent-green)';
+    wrap.style.cursor = 'default';
+    wrap.title = 'Demo environment — read only';
+    wrap.onclick = null;
+    return;
+  }
   const name = cfg.connection_name || (cfg.db === 'postgres' ? 'postgres' : 'local');
   const dbType = cfg.db || 'sqlite';
   label.textContent = name + ' (' + dbType + ')';
@@ -120,17 +129,20 @@ function _updateConnectionIndicator(cfg) {
           left.appendChild(badge);
         }
         item.appendChild(left);
-        // Delete button (only for non-active named connections)
-        if (!c.active && c.name && c.name !== 'local') {
+        // Delete button for any named non-local connection
+        if (c.name && c.name !== 'local') {
           const del = document.createElement('button');
           del.textContent = '×';
-          del.title = 'Remove connection';
+          del.title = c.active ? 'Remove connection (will switch to local)' : 'Remove connection';
           del.style.cssText = 'background:none;border:none;color:var(--muted);cursor:pointer;font-size:14px;padding:0 2px;line-height:1;flex-shrink:0';
           del.onmouseenter = () => del.style.color = 'var(--status-failed)';
           del.onmouseleave = () => del.style.color = 'var(--muted)';
           del.onclick = async (e) => {
             e.stopPropagation();
-            if (!confirm('Remove connection "' + c.name + '"?')) return;
+            const msg = c.active
+              ? 'Remove active connection "' + c.name + '"? This will switch to local (SQLite). Requires restart.'
+              : 'Remove connection "' + c.name + '"?';
+            if (!confirm(msg)) return;
             try {
               await api('/config/connections/' + encodeURIComponent(c.name), { method: 'DELETE' });
               popup.remove();
@@ -907,24 +919,19 @@ function buildTabBody(project) {
         board.innerHTML = '<div style="color:var(--muted);font-size:10px;padding:4px 0">(no sprint items — use LIVE tab to add)</div>';
         return;
       }
-      // Determine current sprint version from the header field
-      const sprintStr = (state.panels[project.id] || {})._serverSprint || '';
-      const versionMatch = sprintStr.match(/^(v[\w.+-]+)/i);
-      const currentVersion = versionMatch ? versionMatch[1] : null;
+      // Show counts for ALL active items across all versions
       const activeStatuses = new Set(['pending', 'todo', 'in_progress']);
-
-      // Show stats for current sprint version, or all active items
-      const scopeItems = currentVersion
-        ? items.filter(it => it.version === currentVersion)
-        : items.filter(it => activeStatuses.has(it.status));
+      const activeVersions = new Set(items.filter(it => activeStatuses.has(it.status)).map(it => it.version));
+      const scopeItems = items.filter(it =>
+        activeStatuses.has(it.status) || (it.version && activeVersions.has(it.version))
+      );
       const doneCount = scopeItems.filter(i => i.status === 'done' || i.status === 'skipped').length;
       const activeCount = scopeItems.filter(i => activeStatuses.has(i.status)).length;
       const total = scopeItems.length;
       const pct = total > 0 ? Math.round((doneCount / total) * 100) : 0;
       const pctColor = doneCount === 0 ? 'var(--muted)' : doneCount === total ? 'var(--accent-green)' : '#fbbf24';
-      const vLabel = currentVersion ? escapeHtml(currentVersion) : 'all';
       board.innerHTML = `<div style="font-size:10px;color:var(--muted);padding:3px 0;display:flex;align-items:center;gap:8px">
-        <span style="font-weight:600;color:var(--accent)">${vLabel}</span>
+        <span style="font-weight:600;color:var(--accent)">all active</span>
         <span style="color:${pctColor}">${doneCount}/${total} done (${pct}%)</span>
         ${activeCount > 0 ? `<span style="color:var(--accent)">${activeCount} pending</span>` : '<span style="color:var(--accent-green)">✓ complete</span>'}
         <span style="opacity:0.5">· See LIVE tab for full board</span>
@@ -1181,27 +1188,16 @@ function renderSprintProgress(projectId, items) {
     return;
   }
 
-  // Show only current sprint version's items; fall back to all active items across versions.
-  // "current version" comes from the panel's sprint header (e.g. "v1.9.x — description").
-  const panel = state.panels[projectId];
-  const sprintStr = (panel && panel._serverSprint) || '';
-  const versionMatch = sprintStr.match(/^(v[\w.+-]+)/i);
-  const currentVersion = versionMatch ? versionMatch[1] : null;
+  // Show ALL pending items grouped by version — don't filter to current sprint version.
+  // Current sprint string is still used for new-item version defaulting (addSprintItemFromInput).
   const activeStatuses = new Set(['pending', 'todo', 'in_progress']);
 
-  let displayItems;
-  if (currentVersion) {
-    // Prefer current-version items; fall back to active-only if nothing matches
-    const versionItems = items.filter(it => it.version === currentVersion);
-    displayItems = versionItems.length > 0 ? versionItems : items.filter(it => activeStatuses.has(it.status));
-  } else {
-    // No version known — show active items + done items whose version still has active peers
-    const activeVersions = new Set(items.filter(it => activeStatuses.has(it.status)).map(it => it.version));
-    displayItems = items.filter(it =>
-      activeStatuses.has(it.status) || (it.version && activeVersions.has(it.version))
-    );
-    if (displayItems.length === 0) displayItems = items.filter(it => activeStatuses.has(it.status));
-  }
+  // Include active items + done/skipped items from versions that still have active peers.
+  const activeVersions = new Set(items.filter(it => activeStatuses.has(it.status)).map(it => it.version));
+  let displayItems = items.filter(it =>
+    activeStatuses.has(it.status) || (it.version && activeVersions.has(it.version))
+  );
+  if (displayItems.length === 0) displayItems = items.filter(it => activeStatuses.has(it.status));
 
   if (displayItems.length === 0) {
     root.innerHTML = `
@@ -1217,10 +1213,11 @@ function renderSprintProgress(projectId, items) {
     return;
   }
 
-  // Group by item_group; ungrouped first.
+  // Group by version (then item_group within version).
+  const versionOrder = [...new Set(displayItems.map(it => it.version || ''))];
   const groups = new Map();
   displayItems.forEach(it => {
-    const g = it.item_group || '';
+    const g = it.version || '';
     if (!groups.has(g)) groups.set(g, []);
     groups.get(g).push(it);
   });
@@ -2108,17 +2105,32 @@ async function loadTeamTab(projectId) {
         </div>`;
       }).join('');
 
-      // Goal change timestamps for swimlane markers.
+      // Goal change timestamps for swimlane markers — from goal-history for full coverage.
       let goalMarkers = [];
       try {
-        const goal = await api(`/projects/${projectId}/goal`);
         const windowStart = Date.now() - days * 86400 * 1000;
+        const history = await api(`/projects/${projectId}/goal-history`);
+        (history || []).forEach((entry, i) => {
+          const ts = entry.created_at || entry.updated_at;
+          if (ts) {
+            const t = Date.parse((ts || '').replace(' ', 'T') + 'Z');
+            if (isFinite(t) && t >= windowStart) {
+              goalMarkers.push({ts, field: entry.sprint ? 'sprint' : 'goal'});
+            }
+          }
+        });
+        // Also add current field-level update timestamps
+        const goal = await api(`/projects/${projectId}/goal`);
         for (const field of ['content_updated_at', 'ns_updated_at', 'sprint_updated_at']) {
           if (goal[field]) {
             const t = Date.parse((goal[field] || '').replace(' ', 'T') + 'Z');
             if (isFinite(t) && t >= windowStart) goalMarkers.push({ts: goal[field], field});
           }
         }
+        // Dedupe by timestamp proximity (within 60s)
+        goalMarkers = goalMarkers.filter((m, i) => !goalMarkers.slice(0, i).some(p =>
+          Math.abs(Date.parse((m.ts||'').replace(' ','T')+'Z') - Date.parse((p.ts||'').replace(' ','T')+'Z')) < 60000
+        ));
       } catch (_) { /* goal markers optional */ }
 
       // Swimlane timeline — one row per human, dots colored by task status.

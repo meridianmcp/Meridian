@@ -82,20 +82,20 @@ For decisions: use pin_decision MCP tool, which also appends to DECISIONS.md.
 <current_state>
 <!-- Auto-updated by Meridian. Do not edit manually. -->
 Project: meridian-build (5787cc92)
-Last updated: 2026-05-25 06:58 UTC
+Last updated: 2026-05-25 10:48 UTC
 Sprint: v2.1 — demo route + hosted tier polish + pre-launch
 North Star: Meridian is the open-source coordination layer for AI coding sessions — persistent memory, task tracking, and session coordination that your AI tools don't provide.  Core value: "Your AI sessions don'…
 Recent:
-  - [DONE] DECISION: MCP tool responses should use XML tags not raw JSON. Claude Code parses <goal>, <tasks>, <context>, <decisions
-  - [DONE] DECISION: Handoff generation is too manual. generate_handoff should auto-run at session end and write to data/{project_n
-  - [DONE] VERIFIED: No data loss in prod Neon DB. task_log=190, goal_states=430, sessions=47, sprint_items=147. All data intact fr
-  - [DONE] DECISION: TECHNICAL: Corrected Neon capacity model — multiple customers per project.  8 Standard customers share one Neo
-  - [DONE] DECISION: TECHNICAL: Neon capacity model — same account, CU limits per project.  One Neon project per customer. Both Sta
+  - [DONE] DECISION: STRATEGIC: Meridian TAM is broader than Claude Code users. Model-agnostic design means it serves anyone routin
+  - [DONE] DECISION: POSITIONING: Primary customer is Tier 2 developer — knows MCP exists, has tried Desktop Commander, has a 500-l
+  - [DONE] DECISION: MESSAGING: Show HN opener should be the context debt framing — not multi-agent orchestration. Lead with: Claud
+  - [DONE] NOTE: Anthropic IE problem analysis — best model, but dogfooding in a bubble. Anthropic employees are not normal develop
+  - [DONE] NOTE: Codebase context — 14k lines (server.py 5060, db.py 4079, dashboard.js 3673, hosted.py 1447) built in ~7-8 days. P
 </current_state>
 
 ---
 <!-- MERIDIAN STATE — auto-generated, do not edit below -->
-## Current Sprint State  _(auto-updated 2026-05-25 07:17 UTC)_
+## Current Sprint State  _(auto-updated 2026-05-25 14:53 UTC)_
 
 **Key Files:**
 - `meridian/server.py` — FastAPI app + MCP handlers

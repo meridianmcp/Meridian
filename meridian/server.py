@@ -836,6 +836,11 @@ app.mount(
 _templates = Jinja2Templates(directory=_resource_path("meridian/templates"))
 
 
+def _hosted_mode() -> bool:
+    """Return True when running as a hosted service (MERIDIAN_HOSTED=1)."""
+    return os.environ.get("MERIDIAN_HOSTED", "").lower() in ("1", "true", "yes")
+
+
 def _db(request: Request) -> aiosqlite.Connection:
     """Pull the active DB connection off ``app.state``.
 
@@ -3973,7 +3978,10 @@ async def _dispatch_mcp_tool(name: str, args: dict[str, Any], db: Any, data_dir:
         tasks = await db_module.get_tasks(db, args["project_id"], limit=10)
         return {"session": session, "goal": goal, "recent_tasks": tasks}
     if name == "get_goal":
-        return await db_module.get_goal(db, args["project_id"])
+        goal = await db_module.get_goal(db, args["project_id"])
+        if goal and goal.get("decisions") and len(goal["decisions"]) > 3000:
+            goal["decisions"] = goal["decisions"][-3000:]
+        return goal
     if name == "set_goal":
         return await db_module.set_goal(db, args["project_id"], args["content"])
     if name == "log_task":
@@ -4987,9 +4995,9 @@ def build_mcp_server():
                     decisions_raw = await db_module.get_decisions(
                         db, arguments["project_id"]
                     )
-                    # Truncate to last 5000 chars — MCP context has hard limits
-                    if decisions_raw and len(decisions_raw) > 5000:
-                        decisions_raw = decisions_raw[-5000:]
+                    # Truncate to last 3000 chars — MCP context has hard limits
+                    if decisions_raw and len(decisions_raw) > 3000:
+                        decisions_raw = decisions_raw[-3000:]
                     goal["decisions"] = decisions_raw
                     goal["xml"] = db_module.build_goal_xml(
                         goal, project_name, goal["ambient_tasks"], coherence,

@@ -3907,7 +3907,7 @@ async def get_team_summary(
         elif status in ("pending", "pending-hitl", "in_progress"):
             bucket["tasks_pending"] += 1
         desc = rd.get("task_description")
-        if desc and len(bucket["recent"]) < 5:
+        if desc and len(bucket["recent"]) < 100:
             bucket["recent"].append(
                 {
                     "description": desc,
