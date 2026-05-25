@@ -20,9 +20,24 @@ jobs:
   deploy:
     needs: test
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: superfly/flyctl-actions/setup-flyctl@master
       - run: flyctl deploy --remote-only --config fly.toml
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+      - name: Tag deploy
+        run: |
+          VERSION=$(grep '^version' pixi.toml | head -1 | sed 's/.*= *"//' | sed 's/".*//')
+          TIMESTAMP=$(date +%Y%m%d-%H%M)
+          TAG="deploy-${TIMESTAMP}-${VERSION}"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a "$TAG" -m "Deploy $VERSION at $TIMESTAMP"
+          git push origin "$TAG"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
