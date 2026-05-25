@@ -24,7 +24,41 @@ from __future__ import annotations
 import argparse
 import asyncio
 import os
+import signal
+import socket
+import subprocess
 import sys
+
+
+def _kill_port(port: int) -> None:
+    """Kill any process listening on the given port before starting."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        if s.connect_ex(("127.0.0.1", port)) != 0:
+            return  # port is free
+    if sys.platform == "win32":
+        result = subprocess.run(
+            f"netstat -ano | findstr :{port}",
+            shell=True, capture_output=True, text=True,
+        )
+        for line in result.stdout.splitlines():
+            parts = line.split()
+            if parts and parts[-1].isdigit():
+                pid = int(parts[-1])
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                except OSError:
+                    pass
+                break
+    else:
+        result = subprocess.run(
+            ["lsof", "-ti", f":{port}"], capture_output=True, text=True
+        )
+        for pid_str in result.stdout.split():
+            if pid_str.isdigit():
+                try:
+                    os.kill(int(pid_str), signal.SIGTERM)
+                except OSError:
+                    pass
 
 # psycopg3 requires SelectorEventLoop on Windows (ProactorEventLoop not supported).
 # Must be set before any asyncio.run() or uvicorn.run() call.
@@ -72,6 +106,8 @@ def main(argv: list[str] | None = None) -> int:
 
     import uvicorn
     import sys as _sys
+
+    _kill_port(args.port)
 
     if _sys.platform == "win32":
         # psycopg3 requires SelectorEventLoop. On Windows, asyncio.run()

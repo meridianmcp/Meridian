@@ -943,3 +943,113 @@ def test_tasks_list_for_project(client):
     assert r.status_code == 200
     descs = [t["description"] for t in r.json()]
     assert "task A" in descs and "task B" in descs
+
+
+# ---------------------------------------------------------------------------
+# Site password gate + demo cookie exemption (BUG 4 regression tests)
+# ---------------------------------------------------------------------------
+
+
+def _make_gated_client(monkeypatch, tmp_path):
+    """Helper: returns a TestClient with SITE_PASSWORD set."""
+    monkeypatch.setenv("MERIDIAN_DB", ":memory:")
+    monkeypatch.setenv("MERIDIAN_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("MERIDIAN_DB_URL", "")
+    monkeypatch.setenv("MERIDIAN_DEMO_DB_URL", "")
+    monkeypatch.setenv("MERIDIAN_GOAL_MD", str(tmp_path / "GOAL.md"))
+    monkeypatch.setenv("SITE_PASSWORD", "testpass123")
+    from fastapi.testclient import TestClient
+    import importlib
+    import meridian.server as server_module
+    server_module = importlib.reload(server_module)
+    return TestClient(server_module.app)
+
+
+def test_site_password_gate_blocks_without_cookie(monkeypatch, tmp_path):
+    """Requests without the gate cookie receive the password gate HTML."""
+    with _make_gated_client(monkeypatch, tmp_path) as c:
+        r = c.get("/projects")
+        # Gate returns HTML, not JSON
+        assert r.status_code == 200
+        assert "password" in r.text.lower() or "html" in r.headers.get("content-type", "").lower()
+
+
+def test_site_password_gate_exempts_config_endpoint(monkeypatch, tmp_path):
+    """GET /config is always exempt from the site password gate."""
+    with _make_gated_client(monkeypatch, tmp_path) as c:
+        r = c.get("/config")
+        assert r.status_code == 200
+        assert "version" in r.json()
+
+
+def test_site_password_gate_exempts_health_endpoint(monkeypatch, tmp_path):
+    """GET /health is always exempt from the site password gate."""
+    with _make_gated_client(monkeypatch, tmp_path) as c:
+        r = c.get("/health")
+        assert r.status_code == 200
+        assert r.json()["status"] == "ok"
+
+
+def test_site_password_gate_exempts_demo_cookie(monkeypatch, tmp_path):
+    """Requests with meridian_demo cookie bypass the site password gate."""
+    with _make_gated_client(monkeypatch, tmp_path) as c:
+        # Without demo cookie: gate serves HTML password form
+        r_blocked = c.get("/projects")
+        assert "text/html" in r_blocked.headers.get("content-type", "")
+        # With demo cookie: passes gate (may 503 if demo_db not configured — that's OK,
+        # the important thing is we get past the gate, not a password form)
+        c.cookies.set("meridian_demo", "any-value")
+        r_demo = c.get("/projects")
+        # Gate bypassed: response is NOT the password gate HTML
+        assert "text/html" not in r_demo.headers.get("content-type", "") or r_demo.status_code != 200
+
+
+def test_site_password_gate_exempts_static_assets(monkeypatch, tmp_path):
+    """Static files are always exempt from the gate."""
+    with _make_gated_client(monkeypatch, tmp_path) as c:
+        r = c.get("/static/dashboard.css")
+        # 200 or 404 (file may not be in test env), but NOT the gate HTML
+        assert r.status_code in (200, 404)
+        if r.status_code == 200:
+            assert "password" not in r.text.lower()
+
+
+# ---------------------------------------------------------------------------
+# __main__.py port kill helper
+# ---------------------------------------------------------------------------
+
+
+def test_kill_port_noop_when_port_free():
+    """_kill_port does nothing when the port is not in use."""
+    from meridian.__main__ import _kill_port
+    # Port 19999 is almost certainly free — should not raise
+    _kill_port(19999)
+
+
+def test_kill_port_callable():
+    """_kill_port is importable and callable."""
+    from meridian.__main__ import _kill_port
+    assert callable(_kill_port)
+
+
+# ---------------------------------------------------------------------------
+# Dashboard HTML version placeholder
+# ---------------------------------------------------------------------------
+
+
+def test_dashboard_html_has_no_hardcoded_version():
+    """The server-version element must not show a hardcoded v1.9.x."""
+    import pathlib, re
+    html = pathlib.Path("meridian/templates/dashboard.html").read_text(encoding="utf-8")
+    # Extract the server-version element content
+    match = re.search(r'id="server-version"[^>]*>([^<]*)<', html)
+    assert match, "server-version element not found"
+    version_text = match.group(1)
+    assert "v1.9.x" not in version_text, f"Hardcoded v1.9.x in server-version element: {version_text!r}"
+
+
+def test_dashboard_html_version_element_exists():
+    """dashboard.html has the server-version element for dynamic JS population."""
+    import pathlib
+    html = pathlib.Path("meridian/templates/dashboard.html").read_text(encoding="utf-8")
+    assert 'id="server-version"' in html
