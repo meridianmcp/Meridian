@@ -5,7 +5,7 @@ This file supplements the git history as a human-readable attribution record.
 
 | Name | GitHub | Role | First Contribution |
 |------|--------|------|--------------------|
-| Adam Camerer | @adamcamerer | Founder, architect | 2026-05-13 |
+| Adam Camerer | @ajc3xc | Founder, architect | 2026-05-13 |
 
 ---
 
