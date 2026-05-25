@@ -64,7 +64,10 @@ def main(argv: list[str] | None = None) -> int:
         from .server import build_mcp_server
 
         _, run_stdio = build_mcp_server()
-        asyncio.run(run_stdio())
+        # On Windows asyncio.run() creates a new ProactorEventLoop, breaking psycopg3.
+        # Use the SelectorEventLoop we set at module scope instead.
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(run_stdio())
         return 0
 
     import uvicorn
