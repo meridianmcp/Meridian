@@ -614,12 +614,7 @@ function buildTabBody(project) {
               <button class="secondary" id="save-sprint-${project.id}" style="white-space:nowrap">save</button>
               <span class="goal-ts" id="goal-sp-ts-${project.id}" style="font-size:10px;color:var(--muted)"></span>
             </div>
-            <div style="color:var(--muted);font-size:10px;margin-bottom:6px">Session tasks:</div>
             <div id="sprint-board-goal-${project.id}"></div>
-            <div style="display:flex;gap:6px;margin-top:8px">
-              <input type="text" id="sprint-add-input-${project.id}" placeholder="Add task to sprint..." style="flex:1;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;padding:6px 8px;color:var(--text);font-family:var(--font-mono);font-size:11px;outline:none">
-              <button class="secondary" id="sprint-add-btn-${project.id}">+ Add</button>
-            </div>
           </div>
           <div class="goal-subtab-panel" id="gtab-decisions-${project.id}">
             <div style="margin-bottom:14px">
@@ -857,47 +852,39 @@ function buildTabBody(project) {
   document.getElementById(`save-north-star-${project.id}`).onclick = () => saveNorthStar(project.id);
   document.getElementById(`save-sprint-${project.id}`).onclick = () => saveSprint(project.id);
 
-  // Sprint tab board — load and render sprint items
+  // Sprint tab board — compact one-liner showing current sprint progress only.
+  // Full sprint board lives in the LIVE tab. Goal tab just shows the header.
   async function loadSprintBoard() {
     try {
       const items = await api(`/projects/${project.id}/sprint-items`);
       const board = document.getElementById(`sprint-board-goal-${project.id}`);
       if (!board) return;
       if (!items || !items.length) {
-        board.innerHTML = '<div style="color:var(--muted);font-size:10px;padding:4px 0">(no sprint items — add one below)</div>';
+        board.innerHTML = '<div style="color:var(--muted);font-size:10px;padding:4px 0">(no sprint items — use LIVE tab to add)</div>';
         return;
       }
-      // Group by version — current sprint expanded, older collapsed
-      const currentSprint = (state.panels[project.id] || {}).sprint || '';
-      const byVersion = {};
-      items.forEach(it => {
-        const v = it.version || 'unversioned';
-        if (!byVersion[v]) byVersion[v] = [];
-        byVersion[v].push(it);
-      });
-      const versions = Object.keys(byVersion).sort((a, b) => b.localeCompare(a));
-      board.innerHTML = versions.map((v, vi) => {
-        const vItems = byVersion[v];
-        const isCurrentV = vi === 0 || currentSprint.includes(v);
-        const doneCount = vItems.filter(it => it.status === 'done' || it.status === 'skipped').length;
-        const rows = vItems.map(it => {
-          const done = it.status === 'done' || it.status === 'skipped';
-          const color = done ? 'var(--status-done)' : it.status === 'failed' ? 'var(--status-failed)' : 'var(--text)';
-          const strike = done ? 'text-decoration:line-through;opacity:0.4;' : '';
-          return `<div style="display:flex;align-items:flex-start;gap:6px;padding:3px 0;border-bottom:1px solid var(--border)">
-            <span style="font-size:10px;${strike}color:${color};flex:1;word-break:break-word">${escapeHtml(it.title)}</span>
-            ${!done ? `<button onclick="_sprintAction('${project.id}','${it.id}','complete')" title="Done" style="background:none;border:1px solid var(--status-done);color:var(--status-done);border-radius:3px;cursor:pointer;font-size:10px;padding:1px 5px">✓</button>
-            <button onclick="_deleteSprintItem('${project.id}','${it.id}')" title="Delete" style="background:none;border:1px solid var(--status-failed);color:var(--status-failed);border-radius:3px;cursor:pointer;font-size:10px;padding:1px 5px">✗</button>` : ''}
-          </div>`;
-        }).join('');
-        return `<details ${isCurrentV ? 'open' : ''} style="margin-bottom:4px">
-          <summary style="font-size:10px;font-weight:600;color:${isCurrentV ? 'var(--accent)' : 'var(--muted)'};cursor:pointer;padding:3px 0;list-style:none;display:flex;justify-content:space-between;user-select:none">
-            <span>${escapeHtml(v)}</span>
-            <span style="font-weight:400;opacity:0.6">${doneCount}/${vItems.length}</span>
-          </summary>
-          <div style="padding-left:4px">${rows}</div>
-        </details>`;
-      }).join('');
+      // Determine current sprint version from the header field
+      const sprintStr = (state.panels[project.id] || {})._serverSprint || '';
+      const versionMatch = sprintStr.match(/^(v[\d.x+\-]+)/i);
+      const currentVersion = versionMatch ? versionMatch[1] : null;
+      const activeStatuses = new Set(['pending', 'todo', 'in_progress']);
+
+      // Show stats for current sprint version, or all active items
+      const scopeItems = currentVersion
+        ? items.filter(it => it.version === currentVersion)
+        : items.filter(it => activeStatuses.has(it.status));
+      const doneCount = scopeItems.filter(i => i.status === 'done' || i.status === 'skipped').length;
+      const activeCount = scopeItems.filter(i => activeStatuses.has(i.status)).length;
+      const total = scopeItems.length;
+      const pct = total > 0 ? Math.round((doneCount / total) * 100) : 0;
+      const pctColor = doneCount === 0 ? 'var(--muted)' : doneCount === total ? 'var(--accent-green)' : '#fbbf24';
+      const vLabel = currentVersion ? escapeHtml(currentVersion) : 'all';
+      board.innerHTML = `<div style="font-size:10px;color:var(--muted);padding:3px 0;display:flex;align-items:center;gap:8px">
+        <span style="font-weight:600;color:var(--accent)">${vLabel}</span>
+        <span style="color:${pctColor}">${doneCount}/${total} done (${pct}%)</span>
+        ${activeCount > 0 ? `<span style="color:var(--accent)">${activeCount} pending</span>` : '<span style="color:var(--accent-green)">✓ complete</span>'}
+        <span style="opacity:0.5">· See LIVE tab for full board</span>
+      </div>`;
     } catch(e) { console.error('Sprint board load failed:', e); }
   }
   _sprintBoardReloaders[project.id] = loadSprintBoard;
@@ -1150,20 +1137,45 @@ function renderSprintProgress(projectId, items) {
     return;
   }
 
-  // Show pending/in_progress always; show done only if recently completed (same version)
-  // Get current version from sprint header
-  const sprintHeader = document.querySelector(`#live-sprint-progress-${projectId}`)?.closest('.panel')
-    ?.querySelector('.sprint-version')?.textContent || '';
+  // Show only current sprint version's items; fall back to all active items across versions.
+  // "current version" comes from the panel's sprint header (e.g. "v1.9.x — description").
+  const panel = state.panels[projectId];
+  const sprintStr = (panel && panel._serverSprint) || '';
+  const versionMatch = sprintStr.match(/^(v[\d.x+\-]+)/i);
+  const currentVersion = versionMatch ? versionMatch[1] : null;
   const activeStatuses = new Set(['pending', 'todo', 'in_progress']);
-  const visibleItems = items.filter(it =>
-    activeStatuses.has(it.status) ||
-    (it.status === 'done' && it.version && items.some(x => activeStatuses.has(x.status) && x.version === it.version))
-  );
-  const displayItems = visibleItems.length > 0 ? visibleItems : items.filter(it => activeStatuses.has(it.status));
+
+  let displayItems;
+  if (currentVersion) {
+    // Prefer current-version items; fall back to active-only if nothing matches
+    const versionItems = items.filter(it => it.version === currentVersion);
+    displayItems = versionItems.length > 0 ? versionItems : items.filter(it => activeStatuses.has(it.status));
+  } else {
+    // No version known — show active items + done items whose version still has active peers
+    const activeVersions = new Set(items.filter(it => activeStatuses.has(it.status)).map(it => it.version));
+    displayItems = items.filter(it =>
+      activeStatuses.has(it.status) || (it.version && activeVersions.has(it.version))
+    );
+    if (displayItems.length === 0) displayItems = items.filter(it => activeStatuses.has(it.status));
+  }
+
+  if (displayItems.length === 0) {
+    root.innerHTML = `
+      <div class="live-empty" style="color:var(--accent-green)">🎉 Sprint complete! All items done.</div>
+      <div class="sprint-add-row" style="margin-top:6px">
+        <input class="live-add-input" id="sprint-add-input-${projectId}"
+               placeholder="version:title  or  just title" style="flex:1">
+        <button class="secondary sprint-add-btn" data-pid="${escapeHtml(projectId)}"
+                style="margin-left:4px">+ Add</button>
+      </div>`;
+    root.querySelector('.sprint-add-btn').onclick = () => addSprintItemFromInput(projectId);
+    wireSprintAddEnter(projectId, root);
+    return;
+  }
 
   // Group by item_group; ungrouped first.
   const groups = new Map();
-  (displayItems.length > 0 ? displayItems : items).forEach(it => {
+  displayItems.forEach(it => {
     const g = it.item_group || '';
     if (!groups.has(g)) groups.set(g, []);
     groups.get(g).push(it);
@@ -1202,9 +1214,9 @@ function renderSprintProgress(projectId, items) {
     }).join('');
   }
 
-  // Footer: progress bar + add input
-  const total = items.length;
-  const done = items.filter(i => i.status === 'done').length;
+  // Footer: progress bar + add input (count only displayed sprint items)
+  const total = displayItems.length;
+  const done = displayItems.filter(i => i.status === 'done').length;
   const pct = total > 0 ? Math.round((done / total) * 100) : 0;
   // v0.9 — color-code completion: gray (0 done), amber (some), green (all).
   // One CSS variable; no backend change. Communicates "we've started" vs
@@ -1377,7 +1389,7 @@ function renderLiveQueue(projectId, tasks) {
     const eid = `live-expand-${projectId}-${t.id.slice(0, 8)}`;
     const expandMeta = [
       t.session_name ? `session: ${t.session_name}` : '',
-      t.claimed_by   ? `claimed_by: ${t.claimed_by}` : '',
+      t.claimed_by   ? `claimed_by: ${t.claimed_by_human_id || t.claimed_by_session_name || t.claimed_by}` : '',
       t.created_at   ? `created: ${t.created_at}` : '',
       t.claimed_at   ? `claimed: ${t.claimed_at}` : '',
     ].filter(Boolean).join(' · ');

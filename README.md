@@ -94,7 +94,7 @@ Get your bearer token at [usemeridian.us/dashboard](https://usemeridian.us/dashb
 - **MCP tools** — `start_session`, `log_task`, `claim_task`, `set_decision`,
   `pin_decision`, `request_hitl`, `generate_handoff`, plus 10 more.
 - **Tiered handoffs** — L0/L1/L2 compression so a fresh session can resume in seconds.
-- **Webhook intake** — push events from LangGraph / Autogen / OpenViking into the same dashboard.
+- **Webhook intake** — push events from LangGraph / Autogen / custom agents into the same dashboard.
 - **Works everywhere** — Claude Code, Claude Desktop, Cursor, Windsurf, LangGraph, custom.
 
 ## How it works
