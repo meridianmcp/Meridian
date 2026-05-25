@@ -1,16 +1,28 @@
 # ⬡ Meridian
 
-**Shared memory for your AI coding sessions.** Open-source coordination layer
-for Claude / Cursor / Windsurf / LangGraph — persistent task log, pinned
-decisions, human-in-the-loop queue, and tiered handoffs over MCP.
+**Claude Code has no memory between sessions. Meridian fixes that.**
+
+Open-source MCP server for persistent AI session memory — shared task log,
+pinned decisions, human-in-the-loop queue, and tiered handoffs. Works with
+Claude Code, Cursor, Cline, Claude Desktop, or any MCP client.
 
 [![License: MSL-2.0](https://img.shields.io/badge/license-MSL--2.0-blue)](LICENSE)
+[![Tests](https://github.com/meridianmcp/Meridian/actions/workflows/test.yml/badge.svg)](https://github.com/meridianmcp/Meridian/actions/workflows/test.yml)
 [![Docs](https://img.shields.io/badge/docs-docs.usemeridian.us-6c8fff)](https://docs.usemeridian.us)
 [![Hosted](https://img.shields.io/badge/hosted-usemeridian.us-a78bfa)](https://usemeridian.us)
 [![Neon](https://img.shields.io/badge/db-neon%20postgres-00e599)](https://neon.tech)
 
-> Every Claude tab boots blind. Parallel sessions duplicate work. Context fills
-> up mid-task and you lose everything. Meridian fixes all three.
+## Why Meridian
+
+Every AI coding session boots blind. You re-explain the architecture, re-describe
+the constraints, re-list what's been tried. When context fills up mid-task,
+everything is lost. This is context debt — and it compounds.
+
+Meridian gives your sessions shared memory. They see the same task log, the same
+pinned decisions, the same goal state. When context fills up, a new session resumes
+from a compressed handoff in seconds. No copy-paste, no re-explaining from scratch.
+
+---
 
 ---
 

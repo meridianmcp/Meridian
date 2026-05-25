@@ -1053,3 +1053,431 @@ def test_dashboard_html_version_element_exists():
     import pathlib
     html = pathlib.Path("meridian/templates/dashboard.html").read_text(encoding="utf-8")
     assert 'id="server-version"' in html
+
+
+# ---------------------------------------------------------------------------
+# DB-level: project get, list, delete
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_get_project_returns_project(db):
+    """get_project returns the created project by ID."""
+    p = await db_module.create_project(db, "get-proj")
+    fetched = await db_module.get_project(db, p["id"])
+    assert fetched is not None
+    assert fetched["id"] == p["id"]
+    assert fetched["name"] == "get-proj"
+
+
+@pytest.mark.asyncio
+async def test_get_project_returns_none_for_unknown(db):
+    """get_project returns None for unknown ID."""
+    result = await db_module.get_project(db, "nonexistent-uuid-123")
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_list_projects_includes_created(db):
+    """list_projects returns all created projects."""
+    await db_module.create_project(db, "proj-list-a")
+    await db_module.create_project(db, "proj-list-b")
+    projects = await db_module.list_projects(db)
+    names = {p["name"] for p in projects}
+    assert "proj-list-a" in names
+    assert "proj-list-b" in names
+
+
+@pytest.mark.asyncio
+async def test_delete_project_removes_from_list(db):
+    """delete_project removes the project."""
+    p = await db_module.create_project(db, "del-me-proj")
+    await db_module.delete_project(db, p["id"])
+    result = await db_module.get_project(db, p["id"])
+    assert result is None
+
+
+# ---------------------------------------------------------------------------
+# DB-level: get_goal
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_get_goal_returns_none_before_set(db):
+    """get_goal returns None for a project with no goal."""
+    p = await db_module.create_project(db, "no-goal-db-proj")
+    g = await db_module.get_goal(db, p["id"])
+    assert g is None
+
+
+@pytest.mark.asyncio
+async def test_get_goal_returns_content_after_set(db):
+    """get_goal returns content after set_goal."""
+    p = await db_module.create_project(db, "has-goal-db-proj")
+    await db_module.set_goal(db, p["id"], "the goal content")
+    g = await db_module.get_goal(db, p["id"])
+    assert g is not None
+    assert g["content"] == "the goal content"
+
+
+@pytest.mark.asyncio
+async def test_get_goal_includes_north_star_field(db):
+    """get_goal includes north_star field when set."""
+    p = await db_module.create_project(db, "ns-goal-db-proj")
+    await db_module.set_goal(db, p["id"], "content", north_star="Be the best")
+    g = await db_module.get_goal(db, p["id"])
+    assert g["north_star"] == "Be the best"
+
+
+# ---------------------------------------------------------------------------
+# DB-level: update_task, claim_task, release_task
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_update_task_status_to_done(db):
+    """update_task transitions status to done."""
+    p = await db_module.create_project(db, "upd-task-db-proj")
+    s = await db_module.register_session(db, p["id"], "upd-sess")
+    t = await db_module.log_task(db, s["id"], p["id"], "do work", "pending")
+    updated = await db_module.update_task(db, t["id"], status="done")
+    assert updated["status"] == "done"
+
+
+@pytest.mark.asyncio
+async def test_update_task_description_field(db):
+    """update_task can change description."""
+    p = await db_module.create_project(db, "desc-upd-proj")
+    s = await db_module.register_session(db, p["id"], "desc-sess")
+    t = await db_module.log_task(db, s["id"], p["id"], "old desc", "pending")
+    updated = await db_module.update_task(db, t["id"], description="new desc")
+    assert updated["description"] == "new desc"
+
+
+@pytest.mark.asyncio
+async def test_claim_task_marks_in_progress(db):
+    """claim_task sets status to in_progress and stores claimed_by."""
+    p = await db_module.create_project(db, "claim-db-proj")
+    s = await db_module.register_session(db, p["id"], "claim-sess")
+    t = await db_module.log_task(db, s["id"], p["id"], "claimable", "pending")
+    claimed = await db_module.claim_task(db, t["id"], s["id"])
+    assert claimed is not None
+    assert claimed["status"] == "in_progress"
+    assert claimed["claimed_by"] == s["id"]
+
+
+@pytest.mark.asyncio
+async def test_claim_task_returns_none_if_already_claimed(db):
+    """claim_task returns None if the task is already claimed."""
+    p = await db_module.create_project(db, "claim2-db-proj")
+    s1 = await db_module.register_session(db, p["id"], "s1-claim")
+    s2 = await db_module.register_session(db, p["id"], "s2-claim")
+    t = await db_module.log_task(db, s1["id"], p["id"], "exclusive", "pending")
+    await db_module.claim_task(db, t["id"], s1["id"])
+    second = await db_module.claim_task(db, t["id"], s2["id"])
+    assert second is None
+
+
+@pytest.mark.asyncio
+async def test_release_task_returns_true(db):
+    """release_task returns True when the claim is held by the session."""
+    p = await db_module.create_project(db, "rel-db-proj")
+    s = await db_module.register_session(db, p["id"], "rel-sess")
+    t = await db_module.log_task(db, s["id"], p["id"], "to release", "pending")
+    await db_module.claim_task(db, t["id"], s["id"])
+    released = await db_module.release_task(db, t["id"], s["id"])
+    assert released is True
+
+
+# ---------------------------------------------------------------------------
+# DB-level: project notes
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_add_and_get_project_note(db):
+    """add_project_note stores; get_project_notes retrieves it."""
+    p = await db_module.create_project(db, "note-db-proj")
+    note = await db_module.add_project_note(db, p["id"], "My Note", "Note body")
+    assert note["title"] == "My Note"
+    notes = await db_module.get_project_notes(db, p["id"])
+    assert any(n["id"] == note["id"] for n in notes)
+
+
+@pytest.mark.asyncio
+async def test_delete_project_note_returns_true(db):
+    """delete_project_note removes the note and returns True."""
+    p = await db_module.create_project(db, "del-note-db-proj")
+    note = await db_module.add_project_note(db, p["id"], "Gone", "to be deleted")
+    result = await db_module.delete_project_note(db, note["id"])
+    assert result is True
+    notes = await db_module.get_project_notes(db, p["id"])
+    assert not any(n["id"] == note["id"] for n in notes)
+
+
+@pytest.mark.asyncio
+async def test_get_project_notes_empty_for_new_project(db):
+    """get_project_notes returns empty list for a project with no notes."""
+    p = await db_module.create_project(db, "empty-notes-proj")
+    notes = await db_module.get_project_notes(db, p["id"])
+    assert notes == []
+
+
+# ---------------------------------------------------------------------------
+# DB-level: update_pinned_decision
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_update_pinned_decision_body(db):
+    """update_pinned_decision can change the body text."""
+    p = await db_module.create_project(db, "dec-upd-db-proj")
+    d = await db_module.pin_decision(db, p["id"], "Use SQLite", "original body", "TECHNICAL")
+    updated = await db_module.update_pinned_decision(db, d["id"], body="new reason for sqlite")
+    assert updated["body"] == "new reason for sqlite"
+
+
+@pytest.mark.asyncio
+async def test_update_pinned_decision_supersede(db):
+    """update_pinned_decision can mark a decision as superseded."""
+    p = await db_module.create_project(db, "sup-db-proj")
+    d = await db_module.pin_decision(db, p["id"], "Old approach", "body", "TECHNICAL")
+    updated = await db_module.update_pinned_decision(db, d["id"], status="superseded")
+    assert updated["status"] == "superseded"
+
+
+# ---------------------------------------------------------------------------
+# DB-level: get_tasks with limit
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_get_tasks_returns_logged(db):
+    """get_tasks returns all tasks for the project."""
+    p = await db_module.create_project(db, "get-tasks-db-proj")
+    s = await db_module.register_session(db, p["id"], "tasks-sess")
+    await db_module.log_task(db, s["id"], p["id"], "first task", "done")
+    await db_module.log_task(db, s["id"], p["id"], "second task", "pending")
+    tasks = await db_module.get_tasks(db, p["id"], limit=100)
+    descs = {t["description"] for t in tasks}
+    assert "first task" in descs
+    assert "second task" in descs
+
+
+@pytest.mark.asyncio
+async def test_get_tasks_limit_caps_results(db):
+    """get_tasks with limit=3 returns at most 3 tasks."""
+    p = await db_module.create_project(db, "lim-tasks-db-proj")
+    s = await db_module.register_session(db, p["id"], "lim-sess")
+    for i in range(8):
+        await db_module.log_task(db, s["id"], p["id"], f"task-{i}", "done")
+    tasks = await db_module.get_tasks(db, p["id"], limit=3)
+    assert len(tasks) <= 3
+
+
+@pytest.mark.asyncio
+async def test_get_pinned_decisions_returns_all(db):
+    """get_pinned_decisions returns all pinned decisions."""
+    p = await db_module.create_project(db, "multi-dec-db-proj")
+    await db_module.pin_decision(db, p["id"], "Use psycopg3", "no asyncpg", "TECHNICAL")
+    await db_module.pin_decision(db, p["id"], "Ship weekly", "keep cadence", "STRATEGIC")
+    decisions = await db_module.get_pinned_decisions(db, p["id"])
+    assert len(decisions) == 2
+    categories = {d["category"] for d in decisions}
+    assert "TECHNICAL" in categories
+    assert "STRATEGIC" in categories
+
+
+# ---------------------------------------------------------------------------
+# HTTP: project get 404
+# ---------------------------------------------------------------------------
+
+
+def test_project_get_unknown_returns_404(client):
+    """GET /projects/{id} returns 404 for unknown project."""
+    r = client.get("/projects/totally-unknown-id-xyz-abc-zzz")
+    assert r.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# HTTP: decisions-pinned CRUD
+# ---------------------------------------------------------------------------
+
+
+def test_decisions_pinned_list_empty_for_new_project(client):
+    """GET /projects/{id}/decisions-pinned returns empty list."""
+    pid = _make_project(client, "dec-pinned-list")
+    r = client.get(f"/projects/{pid}/decisions-pinned")
+    assert r.status_code == 200
+    assert isinstance(r.json(), list)
+
+
+def test_decisions_pinned_create_and_list(client):
+    """POST /decisions-pinned creates; GET lists it."""
+    pid = _make_project(client, "dec-pinned-create")
+    r = client.post(f"/projects/{pid}/decisions-pinned", json={
+        "title": "Use Postgres", "body": "scales better", "category": "TECHNICAL"
+    })
+    assert r.status_code == 201
+    r2 = client.get(f"/projects/{pid}/decisions-pinned")
+    assert r2.status_code == 200
+    titles = [d["title"] for d in r2.json()]
+    assert "Use Postgres" in titles
+
+
+def test_decisions_pinned_patch_body(client):
+    """PATCH /decisions-pinned/{id} can update the body."""
+    pid = _make_project(client, "dec-patch-proj")
+    d = client.post(f"/projects/{pid}/decisions-pinned", json={
+        "title": "Approach A", "body": "original", "category": "TECHNICAL"
+    }).json()
+    did = d["id"]
+    r = client.patch(f"/projects/{pid}/decisions-pinned/{did}", json={"body": "updated reason"})
+    assert r.status_code == 200
+    assert r.json()["body"] == "updated reason"
+
+
+# ---------------------------------------------------------------------------
+# HTTP: context-block modes
+# ---------------------------------------------------------------------------
+
+
+def test_context_block_mode_chat(client):
+    """GET /context-block?mode=chat returns non-empty text."""
+    pid = _make_project(client, "ctx-chat-proj")
+    client.post(f"/projects/{pid}/goal", json={"content": "chat goal"})
+    r = client.get(f"/projects/{pid}/context-block?mode=chat")
+    assert r.status_code == 200
+    assert r.text
+
+
+def test_context_block_default_mode_returns_200(client):
+    """GET /context-block without mode param returns 200."""
+    pid = _make_project(client, "ctx-default-proj")
+    client.post(f"/projects/{pid}/goal", json={"content": "some goal"})
+    r = client.get(f"/projects/{pid}/context-block")
+    assert r.status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# HTTP: handoff generation
+# ---------------------------------------------------------------------------
+
+
+def test_handoff_generate_returns_content(client):
+    """POST /projects/{id}/handoff generates a handoff with path and content."""
+    pid = _make_project(client, "handoff-http-test")
+    client.post(f"/projects/{pid}/goal", json={"content": "build the thing"})
+    client.post("/sessions/register", json={"project_id": pid, "name": "hf-sess"})
+    r = client.post(f"/projects/{pid}/handoff")
+    assert r.status_code == 200
+    body = r.json()
+    assert "content" in body
+
+
+# ---------------------------------------------------------------------------
+# HTTP: goal includes north_star after set
+# ---------------------------------------------------------------------------
+
+
+def test_goal_get_includes_north_star_http(client):
+    """GET /goal returns north_star after it's set."""
+    pid = _make_project(client, "ns-goal-http-proj")
+    client.post(f"/projects/{pid}/goal", json={"content": "base goal"})
+    client.post(f"/projects/{pid}/goal/north-star", json={"north_star": "Be #1", "human_id": "adam"})
+    r = client.get(f"/projects/{pid}/goal")
+    assert r.status_code == 200
+    assert r.json()["north_star"] == "Be #1"
+
+
+# ---------------------------------------------------------------------------
+# HTTP: claimable tasks endpoint
+# ---------------------------------------------------------------------------
+
+
+def test_claimable_tasks_endpoint(client):
+    """GET /projects/{id}/tasks/claimable returns list."""
+    pid = _make_project(client, "claimable-http-proj")
+    s = client.post("/sessions/register", json={"project_id": pid, "name": "claim-sess"}).json()
+    client.post("/tasks", json={
+        "session_id": s["id"], "project_id": pid,
+        "description": "claimable task", "status": "pending"
+    })
+    r = client.get(f"/projects/{pid}/tasks/claimable")
+    assert r.status_code == 200
+    assert isinstance(r.json(), list)
+
+
+# ---------------------------------------------------------------------------
+# HTTP: rewind endpoint
+# ---------------------------------------------------------------------------
+
+
+def test_rewind_endpoint_returns_response(client):
+    """GET /projects/{id}/rewind returns 200 or 404."""
+    pid = _make_project(client, "rewind-http-test")
+    r = client.get(f"/projects/{pid}/rewind")
+    assert r.status_code in (200, 404)
+
+
+# ---------------------------------------------------------------------------
+# HTTP: tasks with limit query param
+# ---------------------------------------------------------------------------
+
+
+def test_tasks_list_with_limit_param(client):
+    """GET /projects/{id}/tasks?limit=2 returns at most 2 items."""
+    pid = _make_project(client, "limit-tasks-http")
+    s = client.post("/sessions/register", json={"project_id": pid, "name": "lim-sess"}).json()
+    for i in range(5):
+        client.post("/tasks", json={
+            "session_id": s["id"], "project_id": pid,
+            "description": f"task-{i}", "status": "done"
+        })
+    r = client.get(f"/projects/{pid}/tasks?limit=2")
+    assert r.status_code == 200
+    assert len(r.json()) <= 2
+
+
+# ---------------------------------------------------------------------------
+# HTTP: team summary empty
+# ---------------------------------------------------------------------------
+
+
+def test_team_summary_empty_humans_for_new_project(client):
+    """GET /team/summary returns humans=[] for a project with no sessions."""
+    pid = _make_project(client, "empty-team-http-proj")
+    r = client.get(f"/team/summary?project_id={pid}&days=7")
+    assert r.status_code == 200
+    assert r.json()["humans"] == []
+
+
+# ---------------------------------------------------------------------------
+# HTTP: sprint items multiple versions
+# ---------------------------------------------------------------------------
+
+
+def test_sprint_items_multiple_versions_listed(client):
+    """Sprint items from multiple versions are all returned by GET."""
+    pid = _make_project(client, "multi-ver-http-proj")
+    _make_sprint_item(client, pid, "v1 task", "v1.0")
+    _make_sprint_item(client, pid, "v2 task", "v2.0")
+    r = client.get(f"/projects/{pid}/sprint-items")
+    assert r.status_code == 200
+    versions = {i["version"] for i in r.json()}
+    assert "v1.0" in versions and "v2.0" in versions
+
+
+# ---------------------------------------------------------------------------
+# HTTP: sessions list active
+# ---------------------------------------------------------------------------
+
+
+def test_sessions_list_returns_registered(client):
+    """GET /projects/{id}/sessions returns the registered sessions."""
+    pid = _make_project(client, "sess-http-active")
+    client.post("/sessions/register", json={"project_id": pid, "name": "new-sess"})
+    r = client.get(f"/projects/{pid}/sessions")
+    assert r.status_code == 200
+    names = {s["name"] for s in r.json()}
+    assert "new-sess" in names
