@@ -627,7 +627,7 @@ function buildTabBody(project) {
               <div style="color:var(--muted);font-size:10px;margin-bottom:8px">Editable current truth. Use <code>pin_decision</code> MCP tool or <code>update_decision</code> with new_title+new_body to supersede.</div>
               <div id="pinned-decisions-${project.id}" style="font-family:var(--font-mono);font-size:12px"></div>
             </div>
-            <details style="margin-top:14px">
+            <details open style="margin-top:14px">
               <summary style="cursor:pointer;color:var(--accent);font-weight:600;font-size:12px;padding:4px 0">📋 History (Append-only log)</summary>
               <div style="color:var(--muted);font-size:10px;margin:8px 0">Append-only via <code>set_decision</code>. Captures every micro-decision; the constitution above is the live truth.</div>
               <div id="decisions-table-${project.id}" style="font-family:var(--font-mono);font-size:12px"></div>
@@ -679,6 +679,8 @@ function buildTabBody(project) {
             <button class="secondary rewind-day-btn" data-days="14" data-pid="${project.id}" style="padding:2px 8px;font-size:10px">14d</button>
             <button class="secondary rewind-day-btn" data-days="30" data-pid="${project.id}" style="padding:2px 8px;font-size:10px">30d</button>
             <button class="secondary rewind-day-btn" data-days="90" data-pid="${project.id}" style="padding:2px 8px;font-size:10px">90d</button>
+            <button class="secondary rewind-day-btn" data-days="365" data-pid="${project.id}" style="padding:2px 8px;font-size:10px">1y</button>
+            <button class="secondary rewind-day-btn" data-days="3650" data-pid="${project.id}" style="padding:2px 8px;font-size:10px">All</button>
           </span>
         </div>
         <div class="rewind-wrap" id="rewind-wrap-${project.id}" style="flex:1;overflow:auto;padding:14px;font-family:'IBM Plex Mono',monospace;font-size:11px">
@@ -3084,7 +3086,7 @@ function renderRewindSubtabs(projectId, data, history, stats, activeTab) {
   /** Render rewind content split into five subtabs: Activity, Milestones, Sprint, Goals, Charts. */
   const tabs = [
     { id: 'versions', label: '📦 Milestones' },
-    { id: 'sprint',   label: '⚡ Sprint' },
+    { id: 'sprint',   label: '⚡ Tasks' },
     { id: 'goals',    label: '🎯 Goal' },
     { id: 'activity', label: '📋 Activity' },
     { id: 'charts',   label: '📊 Charts' },
