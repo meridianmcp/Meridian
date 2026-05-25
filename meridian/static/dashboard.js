@@ -1911,38 +1911,174 @@ async function loadDocsTab(projectId) {
 async function loadSettingsTab(projectId) {
   const body = document.getElementById(`settings-body-${projectId}`);
   if (!body) return;
-  // Re-render each open so prefs are always fresh (no loaded guard).
   body.innerHTML = '<div style="color:var(--muted);font-size:11px">loading…</div>';
+
   const PREFS = [
     { key: 'hitl',    label: 'HITL — get emailed when a session needs your input' },
     { key: 'stalled', label: 'Session stalled — no heartbeat for 2+ hours' },
     { key: 'storage', label: 'Storage at 80% — before hitting your plan limit' },
     { key: 'sprint',  label: 'Sprint done — all items completed' },
   ];
-  let prefs = {};
-  try {
-    const data = await api('/settings/notifications');
-    prefs = data.prefs || {};
-  } catch (e) {
-    if (String(e).includes('404')) {
-      body.innerHTML = '<div style="color:var(--muted);font-size:11px;padding:8px 0">Email notification settings are only available in hosted mode (usemeridian.us).</div>';
-      return;
-    }
-    body.innerHTML = `<div style="color:var(--error);font-size:11px">Failed to load: ${escapeHtml(String(e))}</div>`;
-    return;
+
+  // Fetch both in parallel; mcp-config 404 = self-hosted (skip section).
+  const [notifResult, mcpResult] = await Promise.allSettled([
+    api('/settings/notifications'),
+    api('/settings/mcp-config'),
+  ]);
+
+  const prefs = (notifResult.status === 'fulfilled') ? (notifResult.value.prefs || {}) : null;
+  const mcpData = (mcpResult.status === 'fulfilled') ? mcpResult.value : null;
+
+  let html = '';
+
+  // MCP config section (hosted mode only)
+  if (mcpData) {
+    const projects = mcpData.projects || [];
+    const baseUrl = mcpData.base_url || 'https://usemeridian.us';
+    const firstPid = projects[0]?.id || '';
+    const clients = [
+      { id: 'claude-desktop', label: 'Claude Desktop', file: '~/.config/Claude/claude_desktop_config.json' },
+      { id: 'claude-code',    label: 'Claude Code',    file: '.mcp.json (project root)' },
+      { id: 'cursor',         label: 'Cursor',         file: '~/.cursor/mcp.json' },
+    ];
+    const projectOpts = projects.map(p =>
+      `<option value="${escapeHtml(p.id)}">${escapeHtml(p.name)}</option>`
+    ).join('');
+
+    html += `<div style="margin-bottom:16px">
+      <div style="color:var(--accent);font-size:10px;letter-spacing:.06em;text-transform:uppercase;margin-bottom:10px;padding-bottom:4px;border-bottom:1px solid var(--border)">MCP client setup</div>
+      <div style="display:flex;gap:8px;align-items:center;margin-bottom:8px;flex-wrap:wrap">
+        <div style="display:flex;gap:0;border:1px solid var(--border);border-radius:3px;overflow:hidden" id="mcp-client-tabs-${projectId}">
+          ${clients.map((c, i) => `<button data-client="${c.id}" style="background:${i===0?'var(--accent)':'var(--surface-1)'};color:${i===0?'#000':'var(--text)'};border:none;padding:3px 10px;font-size:10px;font-family:var(--font-mono);cursor:pointer;white-space:nowrap">${c.label}</button>`).join('')}
+        </div>
+        ${projects.length > 1 ? `<select id="mcp-project-${projectId}" style="background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:3px 6px">${projectOpts}</select>` : ''}
+      </div>
+      <pre id="mcp-config-block-${projectId}" style="background:var(--surface-1);border:1px solid var(--border);border-radius:4px;padding:10px;font-size:10px;font-family:var(--font-mono);color:var(--text);overflow-x:auto;margin:0 0 6px 0;white-space:pre-wrap;word-break:break-all">Generate an API key to see your config</pre>
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+        <button id="mcp-gen-token-${projectId}" class="primary" style="font-size:10px;padding:4px 10px">Generate API key</button>
+        <button id="mcp-copy-btn-${projectId}" class="secondary" style="font-size:10px;padding:4px 10px" disabled>Copy config</button>
+        <span id="mcp-copy-status-${projectId}" style="font-size:10px;color:var(--muted)"></span>
+      </div>
+      <div id="mcp-file-note-${projectId}" style="font-size:10px;color:var(--muted);margin-top:6px"></div>
+    </div>`;
+
+    // Wire after render
+    setTimeout(() => {
+      let activeClient = 'claude-desktop';
+      let currentToken = null;
+      let currentPid = firstPid;
+
+      const configBlock = document.getElementById(`mcp-config-block-${projectId}`);
+      const copyBtn = document.getElementById(`mcp-copy-btn-${projectId}`);
+      const copyStatus = document.getElementById(`mcp-copy-status-${projectId}`);
+      const fileNote = document.getElementById(`mcp-file-note-${projectId}`);
+      const genBtn = document.getElementById(`mcp-gen-token-${projectId}`);
+      const projectSel = document.getElementById(`mcp-project-${projectId}`);
+      const tabsEl = document.getElementById(`mcp-client-tabs-${projectId}`);
+
+      function buildConfig() {
+        if (!currentToken) return null;
+        const cli = clients.find(c => c.id === activeClient) || clients[0];
+        return JSON.stringify({
+          mcpServers: {
+            meridian: {
+              command: 'npx',
+              args: ['-y', 'meridian-mcp@latest'],
+              env: {
+                MERIDIAN_API_KEY: currentToken,
+                MERIDIAN_PROJECT_ID: currentPid,
+                MERIDIAN_BASE_URL: baseUrl,
+              },
+            },
+          },
+        }, null, 2);
+      }
+
+      function renderConfig() {
+        const cli = clients.find(c => c.id === activeClient) || clients[0];
+        const cfg = buildConfig();
+        if (cfg) {
+          configBlock.textContent = cfg;
+          copyBtn.disabled = false;
+          fileNote.textContent = `Save to: ${cli.file}`;
+        } else {
+          configBlock.textContent = 'Generate an API key to see your config';
+          copyBtn.disabled = true;
+          fileNote.textContent = '';
+        }
+      }
+
+      if (tabsEl) {
+        tabsEl.querySelectorAll('button[data-client]').forEach(btn => {
+          btn.onclick = () => {
+            activeClient = btn.dataset.client;
+            tabsEl.querySelectorAll('button[data-client]').forEach(b => {
+              b.style.background = b === btn ? 'var(--accent)' : 'var(--surface-1)';
+              b.style.color = b === btn ? '#000' : 'var(--text)';
+            });
+            renderConfig();
+          };
+        });
+      }
+
+      if (projectSel) {
+        projectSel.onchange = () => { currentPid = projectSel.value; renderConfig(); };
+      }
+
+      if (genBtn) {
+        genBtn.onclick = async () => {
+          genBtn.disabled = true;
+          genBtn.textContent = 'Generating…';
+          try {
+            const tok = await api('/auth/tokens', { method: 'POST', body: JSON.stringify({ label: 'mcp-config' }) });
+            currentToken = tok.token;
+            renderConfig();
+            copyBtn.disabled = false;
+            if (copyStatus) copyStatus.textContent = 'Key generated — save it, it won\'t be shown again.';
+          } catch (e) {
+            if (copyStatus) copyStatus.textContent = `error: ${escapeHtml(String(e))}`;
+          } finally {
+            genBtn.disabled = false;
+            genBtn.textContent = 'Generate new key';
+          }
+        };
+      }
+
+      if (copyBtn) {
+        copyBtn.onclick = async () => {
+          const cfg = buildConfig();
+          if (!cfg) return;
+          try {
+            await navigator.clipboard.writeText(cfg);
+            copyBtn.textContent = 'Copied!';
+            setTimeout(() => { copyBtn.textContent = 'Copy config'; }, 1800);
+          } catch (e) {
+            copyStatus.textContent = 'Copy failed — select and copy manually';
+          }
+        };
+      }
+    }, 0);
   }
-  let html = `<div style="margin-bottom:12px">
-    <div style="color:var(--accent);font-size:10px;letter-spacing:.06em;text-transform:uppercase;margin-bottom:10px;padding-bottom:4px;border-bottom:1px solid var(--border)">Email notifications</div>`;
-  PREFS.forEach(p => {
-    const checked = prefs[p.key] ? 'checked' : '';
-    html += `<label style="display:flex;align-items:center;gap:8px;margin-bottom:8px;cursor:pointer;font-family:var(--font-mono);font-size:11px;color:var(--text)">
-      <input type="checkbox" data-pref="${p.key}" ${checked} style="cursor:pointer">
-      ${escapeHtml(p.label)}
-    </label>`;
-  });
-  html += `<div id="settings-save-status-${projectId}" style="font-size:10px;color:var(--muted);min-height:14px;margin-top:6px"></div>`;
-  html += '</div>';
+
+  // Notifications section
+  if (prefs !== null) {
+    html += `<div style="margin-bottom:12px">
+      <div style="color:var(--accent);font-size:10px;letter-spacing:.06em;text-transform:uppercase;margin-bottom:10px;padding-bottom:4px;border-bottom:1px solid var(--border)">Email notifications</div>`;
+    PREFS.forEach(p => {
+      const checked = prefs[p.key] ? 'checked' : '';
+      html += `<label style="display:flex;align-items:center;gap:8px;margin-bottom:8px;cursor:pointer;font-family:var(--font-mono);font-size:11px;color:var(--text)">
+        <input type="checkbox" data-pref="${p.key}" ${checked} style="cursor:pointer">
+        ${escapeHtml(p.label)}
+      </label>`;
+    });
+    html += `<div id="settings-save-status-${projectId}" style="font-size:10px;color:var(--muted);min-height:14px;margin-top:6px"></div>`;
+    html += '</div>';
+  } else if (!mcpData) {
+    html += '<div style="color:var(--muted);font-size:11px;padding:8px 0">Settings are only available in hosted mode (usemeridian.us).</div>';
+  }
+
   body.innerHTML = html;
+
   body.querySelectorAll('input[data-pref]').forEach(cb => {
     cb.onchange = async () => {
       const statusEl = document.getElementById(`settings-save-status-${projectId}`);

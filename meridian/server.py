@@ -67,7 +67,7 @@ from typing import Any
 
 import aiosqlite
 from fastapi import FastAPI, HTTPException, Request, WebSocket
-from fastapi.responses import HTMLResponse, Response, StreamingResponse
+from fastapi.responses import HTMLResponse, PlainTextResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
@@ -3042,6 +3042,41 @@ async def get_notification_prefs(request: Request) -> dict[str, Any]:
         except Exception:  # noqa: BLE001
             prefs = {}
     return {"prefs": prefs}
+
+
+@app.get("/settings/mcp-config")
+async def get_mcp_config(request: Request) -> dict[str, Any]:
+    """Return project list + base URL for building the MCP client config snippet."""
+    if not _hosted_mode():
+        raise HTTPException(status_code=404)
+    from .hosted import get_current_tenant
+    tenant = await get_current_tenant(request)
+    projects = await db_module.list_projects(_db(request))
+    return {
+        "projects": [{"id": p["id"], "name": p["name"]} for p in projects],
+        "base_url": os.environ.get("MERIDIAN_SERVER_URL", "https://usemeridian.us"),
+        "tenant_id": tenant["id"],
+    }
+
+
+@app.get("/mcp/tools-doc", response_class=PlainTextResponse)
+async def mcp_tools_doc() -> str:
+    """Generate markdown MCP tool reference from the live tool list."""
+    lines = ["# MCP Tool Reference\n", f"_Auto-generated. {len(_MCP_TOOLS_LIST)} tools._\n"]
+    for tool in _MCP_TOOLS_LIST:
+        lines.append(f"\n## `{tool['name']}`\n")
+        lines.append(f"{tool.get('description', '')}\n")
+        props = (tool.get("inputSchema") or {}).get("properties") or {}
+        required = set((tool.get("inputSchema") or {}).get("required") or [])
+        if props:
+            lines.append("\n| Parameter | Type | Required | Description |")
+            lines.append("|-----------|------|----------|-------------|")
+            for k, v in props.items():
+                req = "required" if k in required else "optional"
+                desc = (v.get("description") or "").replace("|", "\\|")
+                lines.append(f"| `{k}` | {v.get('type', 'string')} | {req} | {desc} |")
+        lines.append("")
+    return "\n".join(lines)
 
 
 @app.get("/admin/health")

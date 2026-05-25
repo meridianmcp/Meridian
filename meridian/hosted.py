@@ -890,13 +890,13 @@ async def provision_neon_db(tenant_id: str, db: Any) -> dict[str, Any]:
     if not conn_uri:
         raise RuntimeError(f"Failed to get connection URI for customer database {db_name!r}")
 
-    # Persist on tenant
+    # Persist on tenant — encrypt the connection string at rest.
     updated = await db_module.update_tenant(
         db,
         tenant_id,
         neon_project_id=neon_project_id,
         pool_project_id=pool["id"],
-        neon_db_url=conn_uri,
+        neon_db_url=db_module.encrypt_field(conn_uri),
     )
 
     # Increment pool project customer count

@@ -21,6 +21,47 @@ from typing import Any
 
 import aiosqlite
 
+# ---------------------------------------------------------------------------
+# Transparent field encryption (Fernet, MERIDIAN_ENCRYPTION_KEY env var).
+# enc:<base64> prefix allows zero-downtime migration — plaintext values are
+# returned as-is until overwritten, then automatically encrypted on next write.
+# ---------------------------------------------------------------------------
+
+_FERNET_INSTANCE: Any = None
+
+
+def _fernet() -> Any:
+    global _FERNET_INSTANCE
+    if _FERNET_INSTANCE is None:
+        key = os.environ.get("MERIDIAN_ENCRYPTION_KEY", "")
+        if key:
+            from cryptography.fernet import Fernet  # noqa: PLC0415
+            _FERNET_INSTANCE = Fernet(key.encode() if isinstance(key, str) else key)
+    return _FERNET_INSTANCE
+
+
+def encrypt_field(value: str | None) -> str | None:
+    """Encrypt value; returns ``enc:<base64>`` string. Passthrough when no key."""
+    if not value:
+        return value
+    f = _fernet()
+    if not f:
+        return value
+    return "enc:" + f.encrypt(value.encode()).decode()
+
+
+def decrypt_field(value: str | None) -> str | None:
+    """Decrypt an ``enc:`` prefixed value; plaintext values pass through."""
+    if not value:
+        return value
+    if not value.startswith("enc:"):
+        return value
+    f = _fernet()
+    if not f:
+        return value
+    return f.decrypt(value[4:].encode()).decode()
+
+
 # In-process pub/sub. Subscribers register an asyncio.Queue keyed by
 # project_id; any call to log_task / update_task forwards a serialisable
 # event dict so dashboard WebSockets see MCP-driven activity in real time.
