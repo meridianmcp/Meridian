@@ -417,11 +417,15 @@ def _post_login_redirect(tenant: dict) -> str:
     adding a new provider (magic link, Microsoft, SSO) inherits paywall.
     """
     stripe_id = (tenant or {}).get("stripe_customer_id")
-    if not stripe_id:
-        return "/pricing?signup=1"
+    # Only enforce paywall when Stripe is in live mode (STRIPE_LIVE=true).
+    # In test mode / pre-launch everyone goes straight to dashboard.
+    import os as _os
+    stripe_live = _os.environ.get("STRIPE_LIVE", "").lower() in ("1", "true", "yes")
+    if stripe_live and not stripe_id:
+        return "/#pricing?signup=1"
     plan = (tenant or {}).get("plan") or "standard"
-    if plan in ("cancelled", "expired", "trial_expired"):
-        return "/pricing?reactivate=1"
+    if stripe_live and plan in ("cancelled", "expired", "trial_expired"):
+        return "/#pricing?reactivate=1"
     return _cfg("MERIDIAN_AFTER_LOGIN_URL", "/dashboard")
 
 
