@@ -2322,6 +2322,35 @@ async def push_sprint_item(
     )
 
 
+async def patch_sprint_item(
+    db: aiosqlite.Connection,
+    project_id: str,
+    item_id: str,
+    title: str | None = None,
+    version: str | None = None,
+) -> dict[str, Any] | None:
+    """Update editable fields (title, version) of a sprint item."""
+    fields: list[str] = []
+    values: list[Any] = []
+    if title is not None:
+        fields.append("title = ?")
+        values.append(title)
+    if version is not None:
+        fields.append("version = ?")
+        values.append(version)
+    if not fields:
+        return await get_sprint_item(db, item_id)
+    values.extend([item_id, project_id])
+    cursor = await db.execute(
+        f"UPDATE sprint_items SET {', '.join(fields)} WHERE id = ? AND project_id = ?",
+        values,
+    )
+    await db.commit()
+    if cursor.rowcount == 0:
+        return None
+    return await get_sprint_item(db, item_id)
+
+
 async def get_sprint_items(
     db: aiosqlite.Connection,
     project_id: str,
@@ -3276,7 +3305,7 @@ async def update_tenant(
     **fields: object,
 ) -> dict[str, Any] | None:
     """Update arbitrary columns on a tenant row. Returns updated dict or None."""
-    allowed = {"neon_project_id", "neon_db_url", "stripe_customer_id", "plan", "pool_project_id"}
+    allowed = {"neon_project_id", "neon_db_url", "stripe_customer_id", "plan", "pool_project_id", "stripe_metered_item_id"}
     updates = {k: v for k, v in fields.items() if k in allowed}
     if not updates:
         return await get_tenant_by_id(db, tenant_id)

@@ -82,11 +82,14 @@ function _updateConnectionIndicator(cfg) {
       hdr.style.cssText = 'padding:4px 12px;color:var(--muted);font-size:10px;border-bottom:1px solid var(--border);margin-bottom:4px';
       hdr.textContent = 'Select connection';
       popup.appendChild(hdr);
-      // Connection options
-      // Always include current env connection if not already in list
-      let displayConns = [...(conns || [])];
-      const envConn = {name: cfg.connection_name || (cfg.db === 'postgres' ? 'env (postgres)' : 'local'), type: cfg.db, active: true};
-      if (!displayConns.find(c => c.active)) displayConns.unshift(envConn);
+      // Connection options.
+      // Use cfg.connection_name as truth for which connection is active
+      // (env var overrides can make the toml active flag stale).
+      const activeName = cfg.connection_name || (cfg.db === 'postgres' ? 'env (postgres)' : 'local');
+      let displayConns = (conns || []).map(c => ({...c, active: c.name === activeName}));
+      if (!displayConns.find(c => c.active)) {
+        displayConns.unshift({name: activeName, type: cfg.db, active: true});
+      }
       displayConns.forEach(c => {
         const item = document.createElement('div');
         item.style.cssText = `padding:6px 12px;cursor:pointer;display:flex;align-items:center;gap:8px;justify-content:space-between;${c.active ? 'color:var(--accent)' : 'color:var(--text)'}`;
@@ -1203,6 +1206,8 @@ function renderSprintProgress(projectId, items) {
       const meta = it.pushed_to
         ? `<span class="sprint-item-meta">→ ${escapeHtml(it.pushed_to)}</span>`
         : (it.notes ? `<span class="sprint-item-meta">${escapeHtml(it.notes.slice(0,60))}</span>` : '');
+      const editBtn = `<button class="sprint-btn" title="Edit title/version"
+               onclick="sprintItemEdit('${escapeHtml(projectId)}','${escapeHtml(it.id)}')">✏</button>`;
       const actions = isActive
         ? `<span class="sprint-item-actions">
              <button class="sprint-btn" title="Done"
@@ -1213,9 +1218,11 @@ function renderSprintProgress(projectId, items) {
                onclick="sprintAction('${escapeHtml(projectId)}','${escapeHtml(it.id)}','fail')">✕</button>
              <button class="sprint-btn sprint-btn-push" title="Push to next version"
                onclick="sprintPushPrompt('${escapeHtml(projectId)}','${escapeHtml(it.id)}')">→</button>
+             ${editBtn}
            </span>`
-        : `<span class="sprint-item-actions">${meta}</span>`;
-      return `<div class="sprint-item-row" data-item="${escapeHtml(it.id)}">
+        : `<span class="sprint-item-actions">${meta}${editBtn}</span>`;
+      return `<div class="sprint-item-row" data-item="${escapeHtml(it.id)}"
+        data-title="${escapeHtml(it.title)}" data-version="${escapeHtml(it.version)}">
         <span class="sprint-item-icon" style="color:${color}">${icon}</span>
         <span class="sprint-item-title">${escapeHtml(it.title)}</span>
         <span class="sprint-item-ver">${escapeHtml(it.version)}</span>
@@ -1275,6 +1282,61 @@ async function sprintPushPrompt(projectId, itemId) {
     toast('Sprint item pushed to ' + toVersion);
     await refreshLiveTab(projectId);
   } catch(e) { toast(`Push failed: ${e.message}`, true); }
+}
+
+async function sprintItemEdit(projectId, itemId) {
+  /** Inline-edit title and version of a sprint item. */
+  const row = document.querySelector(`.sprint-item-row[data-item="${CSS.escape(itemId)}"]`);
+  if (!row) return;
+  const curTitle = row.dataset.title || '';
+  const curVersion = row.dataset.version || '';
+  const titleSpan = row.querySelector('.sprint-item-title');
+  const verSpan = row.querySelector('.sprint-item-ver');
+  if (!titleSpan || !verSpan) return;
+  // Already editing?
+  if (row.querySelector('.sprint-edit-input')) return;
+
+  const titleInput = document.createElement('input');
+  titleInput.className = 'sprint-edit-input';
+  titleInput.value = curTitle;
+  titleInput.style.cssText = 'flex:1;min-width:60px;background:var(--surface-1);border:1px solid var(--accent);border-radius:3px;padding:1px 4px;color:var(--text);font-size:12px;font-family:var(--font-mono)';
+
+  const verInput = document.createElement('input');
+  verInput.className = 'sprint-edit-input';
+  verInput.value = curVersion;
+  verInput.style.cssText = 'width:60px;background:var(--surface-1);border:1px solid var(--border);border-radius:3px;padding:1px 4px;color:var(--muted);font-size:10px;font-family:var(--font-mono)';
+
+  titleSpan.replaceWith(titleInput);
+  verSpan.replaceWith(verInput);
+  titleInput.focus();
+  titleInput.select();
+
+  const save = async () => {
+    const newTitle = titleInput.value.trim();
+    const newVersion = verInput.value.trim();
+    if (!newTitle) { cancel(); return; }
+    try {
+      await api(`/projects/${projectId}/sprint-items/${itemId}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ title: newTitle, version: newVersion || undefined }),
+      });
+      await refreshLiveTab(projectId);
+    } catch(e) { toast(`Save failed: ${e.message}`, true); cancel(); }
+  };
+  const cancel = () => {
+    titleInput.replaceWith(titleSpan);
+    verInput.replaceWith(verSpan);
+  };
+  titleInput.onkeydown = verInput.onkeydown = e => {
+    if (e.key === 'Enter') { e.preventDefault(); save(); }
+    if (e.key === 'Escape') cancel();
+  };
+  titleInput.onblur = verInput.onblur = () => {
+    // Small delay so blur from one field to the other doesn't trigger save.
+    setTimeout(() => {
+      if (!row.contains(document.activeElement)) save();
+    }, 150);
+  };
 }
 
 async function addSprintItemFromInput(projectId) {
@@ -1932,8 +1994,21 @@ async function loadTeamTab(projectId) {
         </div>`;
       }).join('');
 
+      // Goal change timestamps for swimlane markers.
+      let goalMarkers = [];
+      try {
+        const goal = await api(`/projects/${projectId}/goal`);
+        const windowStart = Date.now() - days * 86400 * 1000;
+        for (const field of ['content_updated_at', 'ns_updated_at', 'sprint_updated_at']) {
+          if (goal[field]) {
+            const t = Date.parse((goal[field] || '').replace(' ', 'T') + 'Z');
+            if (isFinite(t) && t >= windowStart) goalMarkers.push({ts: goal[field], field});
+          }
+        }
+      } catch (_) { /* goal markers optional */ }
+
       // Swimlane timeline — one row per human, dots colored by task status.
-      const swimlane = _renderSwimlane(humans, days);
+      const swimlane = _renderSwimlane(humans, days, goalMarkers);
 
       // Standup digest — one line per person with their most recent
       // descriptions concatenated.
@@ -1944,6 +2019,25 @@ async function loadTeamTab(projectId) {
           <span style="color:${c};font-weight:600">${escapeHtml(h.human_id)}</span> · ${h.tasks_done} done — <span style="color:var(--muted)">${escapeHtml(last) || '—'}</span>
         </div>`;
       }).join('');
+
+      // Active pinned decisions for standup context.
+      let decisionsHtml = '';
+      try {
+        const pinned = await api(`/projects/${projectId}/decisions-pinned`);
+        if (pinned && pinned.length) {
+          const rows = pinned.slice(0, 8).map(d => {
+            const cat = d.category ? `<span style="font-size:9px;color:var(--muted);margin-left:4px">${escapeHtml(d.category)}</span>` : '';
+            return `<div style="padding:4px 0;border-bottom:1px solid var(--border)">
+              <div style="font-size:11px;font-weight:600;color:var(--text)">${escapeHtml(d.title)}${cat}</div>
+              <div style="font-size:10px;color:var(--muted);margin-top:1px;white-space:pre-wrap">${escapeHtml((d.body || '').slice(0, 160))}</div>
+            </div>`;
+          }).join('');
+          decisionsHtml = `<section style="margin-top:18px;padding-top:10px;border-top:1px solid var(--border)">
+            <div style="color:var(--accent);font-weight:600;margin-bottom:8px">📌 Active decisions (${pinned.length})</div>
+            ${rows}
+          </section>`;
+        }
+      } catch (_) { /* decisions optional */ }
 
       body.innerHTML = `
         <section>
@@ -1957,7 +2051,8 @@ async function loadTeamTab(projectId) {
         <section style="margin-top:18px;padding-top:10px;border-top:1px solid var(--border)">
           <div style="color:var(--accent);font-weight:600;margin-bottom:8px">🗞 Standup digest</div>
           ${standup}
-        </section>`;
+        </section>
+        ${decisionsHtml}`;
     } catch (e) {
       body.innerHTML = `<div style="color:var(--muted)">failed to load team summary: ${escapeHtml(String(e))}</div>`;
     }
@@ -1968,7 +2063,7 @@ async function loadTeamTab(projectId) {
   render();
 }
 
-function _renderSwimlane(humans, days) {
+function _renderSwimlane(humans, days, goalMarkers) {
   /** v2.4 — minimal swimlane: one row per human, dots positioned by
    * task created_at within the window. Pure CSS / inline SVG — no chart
    * library dependency. Coarse-resolution is fine for the standup view. */
@@ -2005,7 +2100,17 @@ function _renderSwimlane(humans, days) {
       <text x="${labelW - 6}" y="${y + 4}" text-anchor="end" font-size="10" fill="${c}" font-family="var(--font-mono)">${escapeHtml(h.human_id.slice(0, 14))}</text>
       ${dots}`;
   }).join('');
-  return `<div style="overflow-x:auto;background:var(--surface-2);border:1px solid var(--border);border-radius:4px;padding:6px"><svg viewBox="0 0 ${width} ${height}" style="width:100%;min-width:600px;height:${height}px">${rows}</svg></div>`;
+  // Goal change markers — vertical dashed lines across all rows.
+  const fieldLabel = {content_updated_at: 'goal', ns_updated_at: 'north star', sprint_updated_at: 'sprint'};
+  const markerLines = (goalMarkers || []).map(m => {
+    const mx = x(m.ts);
+    const label = fieldLabel[m.field] || 'goal';
+    return `<line x1="${mx}" y1="0" x2="${mx}" y2="${height}" stroke="#a78bfa" stroke-dasharray="3,3" stroke-width="1" opacity="0.7">
+      <title>Goal change: ${label}</title>
+    </line>
+    <text x="${mx + 2}" y="9" font-size="8" fill="#a78bfa" font-family="var(--font-mono)" opacity="0.9">${escapeHtml(label)}</text>`;
+  }).join('');
+  return `<div style="overflow-x:auto;background:var(--surface-2);border:1px solid var(--border);border-radius:4px;padding:6px"><svg viewBox="0 0 ${width} ${height}" style="width:100%;min-width:600px;height:${height}px">${markerLines}${rows}</svg></div>`;
 }
 
 async function loadQueue(projectId) {
@@ -2247,6 +2352,8 @@ async function refreshGoal(projectId) {
       }
     }
     v.textContent = `v${goal.version}`;
+    const vState = document.getElementById(`goal-state-${projectId}`);
+    if (vState) vState.textContent = `v${goal.version}`;
     // v0.5.2 — north star and sprint textareas
     // v0.9 — guard against partial responses: only overwrite when the
     // server returned an explicit value (string or null). undefined

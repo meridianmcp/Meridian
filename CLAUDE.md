@@ -71,4 +71,25 @@ DB SCHEMA (key tables):
 
 <current_state>
 <!-- Auto-updated by Meridian. Do not edit manually. -->
+Project: meridian-build (5787cc92)
+Last updated: 2026-05-25 06:00 UTC
+Sprint: v2.1 — demo route + hosted tier polish + pre-launch
+North Star: Meridian is the open-source coordination layer for AI coding sessions — persistent memory, task tracking, and session coordination that your AI tools don't provide.  Core value: "Your AI sessions don'…
+Recent:
+  - [DONE] DECISION: TECHNICAL: Corrected Neon capacity model — multiple customers per project.  8 Standard customers share one Neo
+  - [DONE] DECISION: TECHNICAL: Neon capacity model — same account, CU limits per project.  One Neon project per customer. Both Sta
+  - [DONE] DECISION: TECHNICAL: Neon two-pool architecture for Standard vs Pro tiers.  Standard ($20/mo): provisioned from NEON_API
+  - [DONE] DECISION: TECHNICAL: pro@usemeridian.us email address set up via Cloudflare Email Routing. Forwards to hello@usemeridian.us
+  - [DONE] DECISION: PROCESS: Frontend work — always load /mnt/skills/public/frontend-design/SKILL.md before any UI generation in C
 </current_state>
+
+---
+<!-- MERIDIAN STATE — auto-generated, do not edit below -->
+## Current Sprint State  _(auto-updated 2026-05-25 06:07 UTC)_
+
+**Key Files:**
+- `meridian/server.py` — FastAPI app + MCP handlers
+- `meridian/db.py` — all DB functions (SQLite + Postgres)
+- `meridian/static/dashboard.js` — dashboard UI
+- `tests/test_core.py` — full test suite
+- `data/meridian-build_handoff.md` — session handoff

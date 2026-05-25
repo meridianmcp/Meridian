@@ -795,8 +795,9 @@ async def _create_customer_database(
 # Stripe Checkout
 # ---------------------------------------------------------------------------
 
-STRIPE_PRICE_ID = os.environ.get("STRIPE_PRICE_ID", "")      # standard tier
-STRIPE_PRO_PRICE_ID = os.environ.get("STRIPE_PRO_PRICE_ID", "")  # pro tier
+STRIPE_PRICE_ID = os.environ.get("STRIPE_PRICE_ID", "")            # standard tier
+STRIPE_PRO_PRICE_ID = os.environ.get("STRIPE_PRO_PRICE_ID", "")    # pro tier
+STRIPE_OVERAGE_PRICE_ID = os.environ.get("STRIPE_OVERAGE_PRICE_ID", "")  # metered storage overage
 
 
 async def create_stripe_checkout_session(tenant: dict, plan: str) -> str:
@@ -815,11 +816,16 @@ async def create_stripe_checkout_session(tenant: dict, plan: str) -> str:
         key = "STRIPE_PRO_PRICE_ID" if plan == "pro" else "STRIPE_PRICE_ID"
         raise RuntimeError(f"{key} is not configured")
 
+    line_items: list[dict] = [{"price": price_id, "quantity": 1}]
+    if STRIPE_OVERAGE_PRICE_ID:
+        # Meter-based price — no quantity; Stripe bills via MeterEvents
+        line_items.append({"price": STRIPE_OVERAGE_PRICE_ID})
+
     params: dict = {
         "mode": "subscription",
         "payment_method_collection": "always",
         "subscription_data": {"trial_period_days": 7},
-        "line_items": [{"price": price_id, "quantity": 1}],
+        "line_items": line_items,
         "metadata": {"plan": plan, "tenant_id": tenant.get("id", "")},
         "success_url": f"{base}/auth/success",
         "cancel_url": f"{base}/pricing",
@@ -1108,20 +1114,28 @@ async def get_neon_storage_gb(neon_project_id: str, neon_api_key: str) -> float:
 
 
 async def report_stripe_overage(
-    stripe_metered_item_id: str,
+    stripe_customer_id: str,
     overage_gb: float,
     stripe_api_key: str,
 ) -> None:
-    """Report storage overage to Stripe as metered usage (best-effort)."""
+    """Report storage overage to Stripe via billing meter events (best-effort).
+
+    Uses the v2025 MeterEvent API — event_name matches the meter created
+    in the one-time setup script (storage_overage_gb).  Customer mapping
+    is by_id using the stripe_customer_id payload key.
+    """
     import stripe  # type: ignore[import]
+    from datetime import datetime, timezone as _tz
 
     stripe.api_key = stripe_api_key
-    quantity = max(1, round(overage_gb))
     try:
-        stripe.SubscriptionItem.create_usage_record(
-            stripe_metered_item_id,
-            quantity=quantity,
-            action="set",
+        stripe.billing.MeterEvent.create(
+            event_name="storage_overage_gb",
+            payload={
+                "value": str(round(overage_gb, 3)),
+                "stripe_customer_id": stripe_customer_id,
+            },
+            timestamp=int(datetime.now(_tz.utc).timestamp()),
         )
     except Exception:  # noqa: BLE001
         pass
@@ -1166,9 +1180,9 @@ async def run_storage_overage_check(db: Any) -> None:
                 tenant["email"], plan, usage_gb, limit_gb, overage_gb,
             )
 
-            metered_item_id = tenant.get("stripe_metered_item_id")
-            if stripe_api_key and metered_item_id:
-                await report_stripe_overage(metered_item_id, overage_gb, stripe_api_key)
+            stripe_customer_id = tenant.get("stripe_customer_id")
+            if stripe_api_key and stripe_customer_id:
+                await report_stripe_overage(stripe_customer_id, overage_gb, stripe_api_key)
 
 
 # ---------------------------------------------------------------------------

@@ -4801,10 +4801,14 @@ def test_demo_write_blocked_with_cookie(client):
     assert r.status_code == 403
 
 
-def test_demo_read_allowed_with_cookie(client):
-    """GET with meridian_demo cookie still returns data (read-only, not blocked)."""
+def test_demo_read_returns_503_without_demo_db(client):
+    """GET with meridian_demo cookie but no demo DB configured returns 503.
+
+    The demo guard hard-fails rather than falling through to the production DB
+    — this is intentional security behaviour added in v1.0 (P2 fix).
+    """
     r = client.get("/projects", cookies={"meridian_demo": "1"})
-    assert r.status_code == 200
+    assert r.status_code == 503
 
 
 async def test_dark_tables_exist(db):
@@ -5363,3 +5367,66 @@ async def test_langgraph_checkpointer_put_graceful_failure():
     # Should not raise even though the server isn't running
     result = await cp.put(config, checkpoint, metadata, {})
     assert result == config
+
+
+# ---------------------------------------------------------------------------
+# v1.0 — Stripe metered storage overage (MeterEvent API)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_provision_creates_metered_item(monkeypatch):
+    """create_stripe_checkout_session includes the metered overage price when
+    STRIPE_OVERAGE_PRICE_ID is set — verified by checking the line_items passed
+    to stripe.checkout.Session.create."""
+    from unittest.mock import MagicMock, patch
+    import sys
+    import meridian.hosted as _h
+
+    monkeypatch.setattr(_h, "STRIPE_PRICE_ID", "price_flat_test")
+    monkeypatch.setattr(_h, "STRIPE_OVERAGE_PRICE_ID", "price_overage_test")
+    monkeypatch.setenv("STRIPE_API_KEY", "sk_test_fake")
+
+    fake_session = MagicMock()
+    fake_session.url = "https://checkout.stripe.com/pay/cs_test"
+
+    mock_stripe = MagicMock()
+    mock_stripe.checkout.Session.create.return_value = fake_session
+
+    with patch.dict(sys.modules, {"stripe": mock_stripe}):
+        url = await _h.create_stripe_checkout_session({"id": "t1", "email": "a@b.com"}, "standard")
+
+    assert url == fake_session.url
+    create_call = mock_stripe.checkout.Session.create.call_args
+    kwargs = create_call[1] if create_call[1] else create_call[0][0] if create_call[0] else {}
+    line_items = kwargs.get("line_items", [])
+    price_ids = [li["price"] for li in line_items]
+    assert "price_flat_test" in price_ids
+    assert "price_overage_test" in price_ids
+    assert len(line_items) == 2
+
+
+@pytest.mark.asyncio
+async def test_overage_check_reports_usage(monkeypatch):
+    """report_stripe_overage calls stripe.billing.MeterEvent.create with the
+    correct event_name, customer ID, and GB value."""
+    from unittest.mock import MagicMock, patch
+    import sys
+    import meridian.hosted as _h
+
+    captured: dict = {}
+
+    mock_stripe = MagicMock()
+    mock_stripe.billing.MeterEvent.create.side_effect = lambda **kw: captured.update(kw)
+
+    with patch.dict(sys.modules, {"stripe": mock_stripe}):
+        await _h.report_stripe_overage(
+            stripe_customer_id="cus_abc123",
+            overage_gb=2.5,
+            stripe_api_key="sk_test_fake",
+        )
+
+    assert captured.get("event_name") == "storage_overage_gb"
+    payload = captured.get("payload", {})
+    assert payload.get("stripe_customer_id") == "cus_abc123"
+    assert float(payload.get("value", 0)) == 2.5

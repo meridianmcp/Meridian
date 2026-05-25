@@ -494,6 +494,16 @@ async def lifespan(app: FastAPI):
         except Exception:  # noqa: BLE001
             app.state.demo_db = None
 
+    # Guard: MERIDIAN_DEMO=true requires MERIDIAN_DEMO_DB_URL to prevent
+    # accidental production DB exposure via the demo route.
+    if os.environ.get("MERIDIAN_DEMO", "").lower() in ("1", "true", "yes"):
+        if not os.environ.get("MERIDIAN_DEMO_DB_URL") and not os.environ.get("MERIDIAN_SKIP_DEMO"):
+            import logging as _log
+            _log.getLogger(__name__).warning(
+                "MERIDIAN_DEMO=true but MERIDIAN_DEMO_DB_URL not set — "
+                "using in-memory SQLite demo DB. Set MERIDIAN_DEMO_DB_URL for persistence."
+            )
+
     # v0.4.2 — periodic auto-summary task. Interval comes from env so
     # tests can run it on a sub-second cadence; default is ten minutes.
     interval_s = float(os.environ.get("MERIDIAN_AUTO_SUMMARY_INTERVAL", 600))
@@ -777,6 +787,11 @@ def _db(request: Request) -> aiosqlite.Connection:
         demo_db = getattr(request.app.state, "demo_db", None)
         if demo_db is not None:
             return demo_db
+        # HARD FAIL — never fall through to production DB under demo cookie
+        raise HTTPException(
+            status_code=503,
+            detail="Demo DB not available. Set MERIDIAN_DEMO_DB_URL to enable the demo.",
+        )
     return request.app.state.db
 
 
@@ -801,8 +816,12 @@ async def landing_page(request: Request) -> HTMLResponse:
         if not _check_demo_cookie(request):
             return HTMLResponse(_demo_gate_html())
     stripe_payment_link = os.environ.get("STRIPE_PAYMENT_LINK", "/auth/login")
+    stripe_pro_checkout = "/checkout?plan=pro" if os.environ.get("STRIPE_PRO_PRICE_ID") else ""
     return _templates.TemplateResponse(
-        request, "landing.html", {"stripe_payment_link": stripe_payment_link}
+        request, "landing.html", {
+            "stripe_payment_link": stripe_payment_link,
+            "stripe_pro_checkout": stripe_pro_checkout,
+        }
     )
 
 
@@ -985,6 +1004,12 @@ async def server_config() -> dict[str, Any]:
         "connections": toml_config_module.list_connections(),
         "demo_mode": os.environ.get("MERIDIAN_DEMO", "").lower() in ("1", "true", "yes"),
     }
+
+
+@app.get("/tools")
+async def list_tools_endpoint() -> list[dict[str, Any]]:
+    """Return MCP tool definitions for the dashboard Docs vtab."""
+    return _MCP_TOOLS_LIST
 
 
 @app.get("/projects", response_model=list[Project])
@@ -1514,6 +1539,27 @@ async def delete_sprint_item_endpoint(
         (item_id, project_id),
     )
     await db.commit()
+
+
+@app.patch("/projects/{project_id}/sprint-items/{item_id}")
+async def patch_sprint_item_endpoint(
+    project_id: str, item_id: str, body: dict[str, Any], request: Request
+) -> dict[str, Any]:
+    """Update editable fields (title, version) of a sprint item."""
+    title = body.get("title")
+    if title is not None:
+        title = title.strip()
+        if not title:
+            raise HTTPException(status_code=422, detail="title cannot be empty")
+    version = body.get("version")
+    if version is not None:
+        version = version.strip() or None
+    item = await db_module.patch_sprint_item(
+        _db(request), project_id, item_id, title=title, version=version
+    )
+    if item is None:
+        raise HTTPException(status_code=404, detail="sprint item not found")
+    return item
 
 
 @app.post("/projects/{project_id}/sprint-items/{item_id}/push")
@@ -3440,6 +3486,26 @@ async def stripe_webhook(request: Request) -> dict[str, str]:
             db, tenant["id"], stripe_customer_id=stripe_customer_id, plan=plan
         )
 
+    # Extract metered subscription item ID when overage price is configured.
+    # Best-effort — never block provisioning if this fails.
+    from .hosted import STRIPE_OVERAGE_PRICE_ID as _OVERAGE_PRICE_ID
+    subscription_id = event_obj.get("subscription")
+    if subscription_id and _OVERAGE_PRICE_ID and stripe_customer_id:
+        try:
+            import stripe as _stripe
+            _stripe.api_key = os.environ.get("STRIPE_API_KEY", "")
+            sub = _stripe.Subscription.retrieve(subscription_id)
+            metered_item_id = next(
+                (i.id for i in sub.items.data if i.price.id == _OVERAGE_PRICE_ID),
+                None,
+            )
+            if metered_item_id:
+                await db_module.update_tenant(
+                    db, tenant["id"], stripe_metered_item_id=metered_item_id
+                )
+        except Exception:  # noqa: BLE001
+            pass
+
     # Capacity check before provisioning
     from .hosted import check_capacity, provision_neon_db, send_welcome_email
     try:
@@ -3572,6 +3638,113 @@ def _jsonrpc_err(req_id: Any, code: int, message: str) -> dict[str, Any]:
     return {"jsonrpc": "2.0", "id": req_id, "error": {"code": code, "message": message}}
 
 
+_MCP_TOOLS_LIST: list[dict[str, Any]] = [
+    {"name": "create_project", "description": "Create a new Meridian project.",
+     "inputSchema": {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}},
+    {"name": "register_session", "description": "Register this Claude session. Call at session start.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"}, "session_name": {"type": "string"},
+         "human_id": {"type": "string"}}, "required": ["project_id", "session_name"]}},
+    {"name": "start_session", "description": "Register session and return goal + recent tasks in one call.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"}, "session_name": {"type": "string"},
+         "human_id": {"type": "string"}}, "required": ["project_id", "session_name"]}},
+    {"name": "get_goal", "description": "Read the current goal state.",
+     "inputSchema": {"type": "object", "properties": {"project_id": {"type": "string"}}, "required": ["project_id"]}},
+    {"name": "set_goal", "description": "Set or update the goal state.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"}, "content": {"type": "string"}}, "required": ["project_id", "content"]}},
+    {"name": "log_task", "description": "Log a task this session completed or is working on.",
+     "inputSchema": {"type": "object", "properties": {
+         "session_id": {"type": "string"}, "project_id": {"type": "string"},
+         "description": {"type": "string"}, "status": {"type": "string"}},
+         "required": ["session_id", "project_id", "description"]}},
+    {"name": "get_tasks", "description": "Get recent tasks across all sessions.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"}, "limit": {"type": "integer"}}, "required": ["project_id"]}},
+    {"name": "generate_handoff", "description": "Generate a context handoff file.",
+     "inputSchema": {"type": "object", "properties": {"project_id": {"type": "string"}}, "required": ["project_id"]}},
+    {"name": "get_context_block", "description":
+        "Return a compact plain-text project context block (north star, sprint, "
+        "pending sprint items, recent tasks, recent decisions, active sessions). "
+        "mode='full' (default) for Code Handoff into a fresh Claude Code session; "
+        "mode='chat' for a shorter paste into a new claude.ai conversation.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"},
+         "mode": {"type": "string", "enum": ["full", "chat"]}},
+         "required": ["project_id"]}},
+    {"name": "pin_decision", "description":
+        "Create a pinned decision (editable constitution row). Use for the "
+        "current authoritative truth that supersedes earlier statements. "
+        "Category: STRATEGIC, COMPETITIVE, TECHNICAL, TACTICAL, BUSINESS, "
+        "PRODUCT, ARCHITECTURAL.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"},
+         "title": {"type": "string"},
+         "body": {"type": "string"},
+         "category": {"type": "string"}},
+         "required": ["project_id", "title", "body"]}},
+    {"name": "update_decision", "description":
+        "Patch a pinned decision. Pass new_title + new_body to atomically "
+        "supersede (creates a new active row, marks old as superseded with "
+        "back-link). Otherwise patches body/title/category/status in place.",
+     "inputSchema": {"type": "object", "properties": {
+         "decision_id": {"type": "string"},
+         "new_title": {"type": "string"},
+         "new_body": {"type": "string"},
+         "title": {"type": "string"},
+         "body": {"type": "string"},
+         "category": {"type": "string"},
+         "status": {"type": "string"}},
+         "required": ["decision_id"]}},
+    {"name": "get_pinned_decisions", "description":
+        "List pinned decisions (active only by default, newest first).",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"},
+         "include_superseded": {"type": "boolean"}},
+         "required": ["project_id"]}},
+    {"name": "request_hitl", "description":
+        "Surface a question to the human-in-the-loop queue. urgency='blocking' "
+        "means this session pauses until answered (poll get_hitl_request). "
+        "urgency='normal'/'high' lands in the dashboard but doesn't block. "
+        "assigned_to routes to a specific human_id (null = broadcast).",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"},
+         "question": {"type": "string"},
+         "session_id": {"type": "string"},
+         "context": {"type": "string"},
+         "urgency": {"type": "string", "enum": ["normal", "high", "blocking"]},
+         "assigned_to": {"type": "string"}},
+         "required": ["project_id", "question"]}},
+    {"name": "get_hitl_request", "description":
+        "Poll a HITL request for the human's answer. Returns the row including "
+        "status ('pending'|'answered'|'dismissed') and answer text.",
+     "inputSchema": {"type": "object", "properties": {
+         "request_id": {"type": "string"}},
+         "required": ["request_id"]}},
+    {"name": "add_note", "description":
+        "Add a per-project wiki note (setup, gotcha, howto, env, ...). "
+        "Free-form title/body; comma-separated tags optional.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"},
+         "title": {"type": "string"},
+         "body": {"type": "string"},
+         "tags": {"type": "string"}},
+         "required": ["project_id", "title", "body"]}},
+    {"name": "get_notes", "description":
+        "List project notes (newest first). Optional ?tag substring filter.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"},
+         "tag": {"type": "string"}},
+         "required": ["project_id"]}},
+    {"name": "delete_note", "description":
+        "Hard-delete a project note by id.",
+     "inputSchema": {"type": "object", "properties": {
+         "note_id": {"type": "string"}},
+         "required": ["note_id"]}},
+]
+
+
 async def _handle_mcp_request(body: dict[str, Any], db: Any, data_dir: str) -> dict[str, Any]:
     """Dispatch one JSON-RPC 2.0 MCP request and return the response dict."""
     req_id = body.get("id")
@@ -3589,112 +3762,7 @@ async def _handle_mcp_request(body: dict[str, Any], db: Any, data_dir: str) -> d
         return _jsonrpc_ok(req_id, {})
 
     if method == "tools/list":
-        tools = [
-            {"name": "create_project", "description": "Create a new Meridian project.",
-             "inputSchema": {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}},
-            {"name": "register_session", "description": "Register this Claude session. Call at session start.",
-             "inputSchema": {"type": "object", "properties": {
-                 "project_id": {"type": "string"}, "session_name": {"type": "string"},
-                 "human_id": {"type": "string"}}, "required": ["project_id", "session_name"]}},
-            {"name": "start_session", "description": "Register session and return goal + recent tasks in one call.",
-             "inputSchema": {"type": "object", "properties": {
-                 "project_id": {"type": "string"}, "session_name": {"type": "string"},
-                 "human_id": {"type": "string"}}, "required": ["project_id", "session_name"]}},
-            {"name": "get_goal", "description": "Read the current goal state.",
-             "inputSchema": {"type": "object", "properties": {"project_id": {"type": "string"}}, "required": ["project_id"]}},
-            {"name": "set_goal", "description": "Set or update the goal state.",
-             "inputSchema": {"type": "object", "properties": {
-                 "project_id": {"type": "string"}, "content": {"type": "string"}}, "required": ["project_id", "content"]}},
-            {"name": "log_task", "description": "Log a task this session completed or is working on.",
-             "inputSchema": {"type": "object", "properties": {
-                 "session_id": {"type": "string"}, "project_id": {"type": "string"},
-                 "description": {"type": "string"}, "status": {"type": "string"}},
-                 "required": ["session_id", "project_id", "description"]}},
-            {"name": "get_tasks", "description": "Get recent tasks across all sessions.",
-             "inputSchema": {"type": "object", "properties": {
-                 "project_id": {"type": "string"}, "limit": {"type": "integer"}}, "required": ["project_id"]}},
-            {"name": "generate_handoff", "description": "Generate a context handoff file.",
-             "inputSchema": {"type": "object", "properties": {"project_id": {"type": "string"}}, "required": ["project_id"]}},
-            {"name": "get_context_block", "description":
-                "Return a compact plain-text project context block (north star, sprint, "
-                "pending sprint items, recent tasks, recent decisions, active sessions). "
-                "mode='full' (default) for Code Handoff into a fresh Claude Code session; "
-                "mode='chat' for a shorter paste into a new claude.ai conversation.",
-             "inputSchema": {"type": "object", "properties": {
-                 "project_id": {"type": "string"},
-                 "mode": {"type": "string", "enum": ["full", "chat"]}},
-                 "required": ["project_id"]}},
-            {"name": "pin_decision", "description":
-                "Create a pinned decision (editable constitution row). Use for the "
-                "current authoritative truth that supersedes earlier statements. "
-                "Category: STRATEGIC, COMPETITIVE, TECHNICAL, TACTICAL, BUSINESS, "
-                "PRODUCT, ARCHITECTURAL.",
-             "inputSchema": {"type": "object", "properties": {
-                 "project_id": {"type": "string"},
-                 "title": {"type": "string"},
-                 "body": {"type": "string"},
-                 "category": {"type": "string"}},
-                 "required": ["project_id", "title", "body"]}},
-            {"name": "update_decision", "description":
-                "Patch a pinned decision. Pass new_title + new_body to atomically "
-                "supersede (creates a new active row, marks old as superseded with "
-                "back-link). Otherwise patches body/title/category/status in place.",
-             "inputSchema": {"type": "object", "properties": {
-                 "decision_id": {"type": "string"},
-                 "new_title": {"type": "string"},
-                 "new_body": {"type": "string"},
-                 "title": {"type": "string"},
-                 "body": {"type": "string"},
-                 "category": {"type": "string"},
-                 "status": {"type": "string"}},
-                 "required": ["decision_id"]}},
-            {"name": "get_pinned_decisions", "description":
-                "List pinned decisions (active only by default, newest first).",
-             "inputSchema": {"type": "object", "properties": {
-                 "project_id": {"type": "string"},
-                 "include_superseded": {"type": "boolean"}},
-                 "required": ["project_id"]}},
-            {"name": "request_hitl", "description":
-                "Surface a question to the human-in-the-loop queue. urgency='blocking' "
-                "means this session pauses until answered (poll get_hitl_request). "
-                "urgency='normal'/'high' lands in the dashboard but doesn't block. "
-                "assigned_to routes to a specific human_id (null = broadcast).",
-             "inputSchema": {"type": "object", "properties": {
-                 "project_id": {"type": "string"},
-                 "question": {"type": "string"},
-                 "session_id": {"type": "string"},
-                 "context": {"type": "string"},
-                 "urgency": {"type": "string", "enum": ["normal", "high", "blocking"]},
-                 "assigned_to": {"type": "string"}},
-                 "required": ["project_id", "question"]}},
-            {"name": "get_hitl_request", "description":
-                "Poll a HITL request for the human's answer. Returns the row including "
-                "status ('pending'|'answered'|'dismissed') and answer text.",
-             "inputSchema": {"type": "object", "properties": {
-                 "request_id": {"type": "string"}},
-                 "required": ["request_id"]}},
-            {"name": "add_note", "description":
-                "Add a per-project wiki note (setup, gotcha, howto, env, ...). "
-                "Free-form title/body; comma-separated tags optional.",
-             "inputSchema": {"type": "object", "properties": {
-                 "project_id": {"type": "string"},
-                 "title": {"type": "string"},
-                 "body": {"type": "string"},
-                 "tags": {"type": "string"}},
-                 "required": ["project_id", "title", "body"]}},
-            {"name": "get_notes", "description":
-                "List project notes (newest first). Optional ?tag substring filter.",
-             "inputSchema": {"type": "object", "properties": {
-                 "project_id": {"type": "string"},
-                 "tag": {"type": "string"}},
-                 "required": ["project_id"]}},
-            {"name": "delete_note", "description":
-                "Hard-delete a project note by id.",
-             "inputSchema": {"type": "object", "properties": {
-                 "note_id": {"type": "string"}},
-                 "required": ["note_id"]}},
-        ]
-        return _jsonrpc_ok(req_id, {"tools": tools})
+        return _jsonrpc_ok(req_id, {"tools": _MCP_TOOLS_LIST})
 
     if method == "tools/call":
         name = params.get("name", "")
@@ -4636,8 +4704,16 @@ def build_mcp_server():
                     human_id=arguments.get("human_id"),
                 )
             elif name == "get_goal":
-                goal = await db_module.get_goal(db, arguments["project_id"])
-                if goal is None:
+                _goal_timed_out = False
+                try:
+                    goal = await asyncio.wait_for(
+                        db_module.get_goal(db, arguments["project_id"]),
+                        timeout=30.0,
+                    )
+                except asyncio.TimeoutError:
+                    result = {"error": "timeout", "message": "get_goal timed out. Try get_context_block instead."}
+                    _goal_timed_out = True
+                if not _goal_timed_out and goal is None:
                     # Even an unset goal returns a valid XML skeleton so
                     # cold sessions don't have to special-case 404.
                     project = await db_module.get_project(
@@ -4653,7 +4729,7 @@ def build_mcp_server():
                             None, project_name, []
                         ),
                     }
-                else:
+                elif not _goal_timed_out:
                     # v0.4.2/3 — surface the last five task descriptions
                     # alongside the goal so cold sessions get ambient
                     # context inline with the directive.
@@ -4678,13 +4754,16 @@ def build_mcp_server():
                     coherence = db_module.compute_coherence_warning(field_ages)
                     goal["field_ages"] = field_ages
                     goal["coherence_warning"] = coherence
-                    decisions = await db_module.get_decisions(
+                    decisions_raw = await db_module.get_decisions(
                         db, arguments["project_id"]
                     )
-                    goal["decisions"] = decisions
+                    # Truncate to last 5000 chars — MCP context has hard limits
+                    if decisions_raw and len(decisions_raw) > 5000:
+                        decisions_raw = decisions_raw[-5000:]
+                    goal["decisions"] = decisions_raw
                     goal["xml"] = db_module.build_goal_xml(
                         goal, project_name, goal["ambient_tasks"], coherence,
-                        decisions=decisions,
+                        decisions=decisions_raw,
                     )
                     goal["cache_blocks"] = db_module.build_goal_cache_blocks(
                         goal, project_name, goal["ambient_tasks"]

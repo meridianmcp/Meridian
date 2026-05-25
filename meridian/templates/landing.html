@@ -545,7 +545,11 @@
         <li>Connect your own Postgres DB</li>
       </ul>
       <div class="plan-note">Extra storage: <strong>$0.50 / GB-month</strong> auto-billed via Stripe</div>
+      {% if stripe_pro_checkout %}
+      <a href="{{ stripe_pro_checkout }}" class="plan-cta primary">Get Pro →</a>
+      {% else %}
       <a href="mailto:hello@usemeridian.us?subject=Pro%20waitlist" class="plan-cta secondary">Join waitlist</a>
+      {% endif %}
     </div>
 
   </div>
