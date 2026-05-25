@@ -611,7 +611,7 @@ function buildTabBody(project) {
               <button class="secondary" id="save-sprint-${project.id}" style="white-space:nowrap">save</button>
               <span class="goal-ts" id="goal-sp-ts-${project.id}" style="font-size:10px;color:var(--muted)"></span>
             </div>
-            <div style="color:var(--muted);font-size:10px;margin-bottom:6px">Sprint tasks:</div>
+            <div style="color:var(--muted);font-size:10px;margin-bottom:6px">Session tasks:</div>
             <div id="sprint-board-goal-${project.id}"></div>
             <div style="display:flex;gap:6px;margin-top:8px">
               <input type="text" id="sprint-add-input-${project.id}" placeholder="Add task to sprint..." style="flex:1;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;padding:6px 8px;color:var(--text);font-family:var(--font-mono);font-size:11px;outline:none">
@@ -3112,7 +3112,7 @@ function renderRewindCharts(projectId, stats) {
   return `<div style="padding:8px 0">
     <div style="color:var(--accent);font-weight:600;font-size:11px;margin-bottom:8px">📊 Tasks completed / day (last ${stats.period_days}d)</div>
     <canvas id="chart-tasks-${escapeHtml(projectId)}" style="max-width:100%;max-height:160px"></canvas>
-    <div style="color:var(--accent);font-weight:600;font-size:11px;margin:18px 0 8px">⚡ Sprint completion % by version</div>
+    <div style="color:var(--accent);font-weight:600;font-size:11px;margin:18px 0 8px">⚡ Session task completion % by version</div>
     <canvas id="chart-sprint-${escapeHtml(projectId)}" style="max-width:100%;max-height:120px"></canvas>
   </div>`;
 }
