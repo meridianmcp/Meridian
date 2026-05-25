@@ -98,7 +98,27 @@ function _updateConnectionIndicator(cfg) {
         const dot2 = document.createElement('span');
         dot2.style.cssText = `display:inline-block;width:6px;height:6px;border-radius:50%;flex-shrink:0;background:${c.active ? 'var(--accent)' : 'var(--muted)'}`;
         left.appendChild(dot2);
-        left.appendChild(document.createTextNode(c.name + ' (' + (c.type || 'sqlite') + ')'));
+        // Task 11: show truncated hostname for postgres connections
+        let connLabel = c.name + ' (' + (c.type || 'sqlite') + ')';
+        if (c.url_masked) {
+          try {
+            const hostMatch = c.url_masked.match(/@([^/:?]+)/);
+            if (hostMatch) {
+              const host = hostMatch[1];
+              connLabel += ' — ' + (host.length > 22 ? host.slice(0, 20) + '…' : host);
+            }
+          } catch(_) {}
+        }
+        left.appendChild(document.createTextNode(connLabel));
+        // Task 11: warning badge for non-prod connection names
+        const _nonprod = /\b(dev|test|staging|sandbox)\b/i;
+        if (_nonprod.test(c.name)) {
+          const badge = document.createElement('span');
+          badge.textContent = '⚠';
+          badge.title = 'Non-production connection';
+          badge.style.cssText = 'color:var(--accent-yellow,#f5a623);font-size:11px;flex-shrink:0;margin-left:2px';
+          left.appendChild(badge);
+        }
         item.appendChild(left);
         // Delete button (only for non-active named connections)
         if (!c.active && c.name && c.name !== 'local') {
@@ -528,6 +548,7 @@ function buildTabBody(project) {
       <button class="vtab-btn" data-vtab="team" title="Team — per-human activity">👥</button>
       <button class="vtab-btn" data-vtab="notes" title="Notes — per-project wiki">📝</button>
       <button class="vtab-btn" data-vtab="docs" title="MCP Tool Reference">📖</button>
+      <button class="vtab-btn" data-vtab="settings" title="Notification Settings">🔔</button>
     </div>
     <div class="vtab-drawer open" id="drawer-${project.id}">
       <div class="drawer-panel active" id="drawer-status-${project.id}">
@@ -730,13 +751,22 @@ function buildTabBody(project) {
           <div class="empty" style="color:var(--muted)">loading tools…</div>
         </div>
       </div>
+      <div class="drawer-panel" id="drawer-settings-${project.id}">
+        <div class="drawer-header">
+          <span>SETTINGS · ${escapeHtml(project.name)}</span>
+        </div>
+        <div style="flex:1;overflow-y:auto;padding:14px" id="settings-body-${project.id}">
+          <div class="empty" style="color:var(--muted)">loading…</div>
+        </div>
+      </div>
       <div class="drawer-panel" id="drawer-team-${project.id}">
         <div class="drawer-header" style="justify-content:space-between">
           <span>TEAM · ${escapeHtml(project.name)}</span>
           <span style="display:flex;gap:6px;align-items:center">
             <select id="team-days-${project.id}" style="background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:2px 4px">
               <option value="1">last 1d</option>
-              <option value="7" selected>last 7d</option>
+              <option value="7">last 7d</option>
+              <option value="14" selected>last 14d</option>
               <option value="30">last 30d</option>
             </select>
             <button class="secondary" id="team-refresh-${project.id}" style="padding:2px 8px;font-size:10px">refresh</button>
@@ -836,6 +866,7 @@ function buildTabBody(project) {
         if (vtab === 'team') loadTeamTab(project.id);
         if (vtab === 'notes') loadNotesTab(project.id);
         if (vtab === 'docs') loadDocsTab(project.id);
+        if (vtab === 'settings') loadSettingsTab(project.id);
       };
     });
   }
@@ -878,7 +909,7 @@ function buildTabBody(project) {
       }
       // Determine current sprint version from the header field
       const sprintStr = (state.panels[project.id] || {})._serverSprint || '';
-      const versionMatch = sprintStr.match(/^(v[\d.x+\-]+)/i);
+      const versionMatch = sprintStr.match(/^(v[\w.+-]+)/i);
       const currentVersion = versionMatch ? versionMatch[1] : null;
       const activeStatuses = new Set(['pending', 'todo', 'in_progress']);
 
@@ -1154,7 +1185,7 @@ function renderSprintProgress(projectId, items) {
   // "current version" comes from the panel's sprint header (e.g. "v1.9.x — description").
   const panel = state.panels[projectId];
   const sprintStr = (panel && panel._serverSprint) || '';
-  const versionMatch = sprintStr.match(/^(v[\d.x+\-]+)/i);
+  const versionMatch = sprintStr.match(/^(v[\w.+-]+)/i);
   const currentVersion = versionMatch ? versionMatch[1] : null;
   const activeStatuses = new Set(['pending', 'todo', 'in_progress']);
 
@@ -1208,6 +1239,21 @@ function renderSprintProgress(projectId, items) {
         : (it.notes ? `<span class="sprint-item-meta">${escapeHtml(it.notes.slice(0,60))}</span>` : '');
       const editBtn = `<button class="sprint-btn" title="Edit title/version"
                onclick="sprintItemEdit('${escapeHtml(projectId)}','${escapeHtml(it.id)}')">✏</button>`;
+      const thumbUp = it.feedback_thumb === 1 ? 'color:var(--accent-green)' : 'opacity:0.4';
+      const thumbDn = it.feedback_thumb === -1 ? 'color:var(--status-failed)' : 'opacity:0.4';
+      const feedbackHtml = it.status === 'done'
+        ? `<span class="sprint-item-feedback" style="display:inline-flex;align-items:center;gap:4px;font-size:11px;margin-left:4px">
+             <button title="Good" style="background:none;border:none;cursor:pointer;padding:0 2px;${thumbUp}"
+               onclick="sprintFeedback('${escapeHtml(projectId)}','${escapeHtml(it.id)}',1,event)">👍</button>
+             <button title="Needs rework" style="background:none;border:none;cursor:pointer;padding:0 2px;${thumbDn}"
+               onclick="sprintFeedback('${escapeHtml(projectId)}','${escapeHtml(it.id)}',-1,event)">👎</button>
+             ${it.feedback_note
+               ? `<span style="color:var(--muted);font-size:10px;max-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${escapeHtml(it.feedback_note)}">${escapeHtml(it.feedback_note)}</span>`
+               : `<input style="background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:9px;font-family:var(--font-mono);padding:1px 4px;width:80px" placeholder="note…"
+                     onblur="sprintFeedbackNote('${escapeHtml(projectId)}','${escapeHtml(it.id)}',this.value)"
+                     onkeydown="if(event.key==='Enter'){this.blur()}">`}
+           </span>`
+        : '';
       const actions = isActive
         ? `<span class="sprint-item-actions">
              <button class="sprint-btn" title="Done"
@@ -1220,7 +1266,7 @@ function renderSprintProgress(projectId, items) {
                onclick="sprintPushPrompt('${escapeHtml(projectId)}','${escapeHtml(it.id)}')">→</button>
              ${editBtn}
            </span>`
-        : `<span class="sprint-item-actions">${meta}${editBtn}</span>`;
+        : `<span class="sprint-item-actions">${meta}${editBtn}${feedbackHtml}</span>`;
       return `<div class="sprint-item-row" data-item="${escapeHtml(it.id)}"
         data-title="${escapeHtml(it.title)}" data-version="${escapeHtml(it.version)}">
         <span class="sprint-item-icon" style="color:${color}">${icon}</span>
@@ -1282,6 +1328,24 @@ async function sprintPushPrompt(projectId, itemId) {
     toast('Sprint item pushed to ' + toVersion);
     await refreshLiveTab(projectId);
   } catch(e) { toast(`Push failed: ${e.message}`, true); }
+}
+
+async function sprintFeedback(projectId, itemId, thumb, event) {
+  event && event.stopPropagation();
+  try {
+    await api(`/projects/${projectId}/sprint-items/${itemId}`,
+      { method: 'PATCH', body: JSON.stringify({ feedback_thumb: thumb }) });
+    await refreshLiveTab(projectId);
+  } catch(e) { toast('Feedback failed: ' + e.message, true); }
+}
+
+async function sprintFeedbackNote(projectId, itemId, note) {
+  if (!note || !note.trim()) return;
+  try {
+    await api(`/projects/${projectId}/sprint-items/${itemId}`,
+      { method: 'PATCH', body: JSON.stringify({ feedback_note: note.trim() }) });
+    await refreshLiveTab(projectId);
+  } catch(e) { toast('Note save failed: ' + e.message, true); }
 }
 
 async function sprintItemEdit(projectId, itemId) {
@@ -1354,7 +1418,7 @@ async function addSprintItemFromInput(projectId) {
     // Fall back to the sprint header text as a rough version token.
     const panel = state.panels[projectId];
     const sprint = (panel && panel._serverSprint) || '';
-    const m = sprint.match(/v[\d.x]+/i);
+    const m = sprint.match(/v[\w.+-]+/i);
     version = m ? m[0] : 'current';
     title = val;
   }
@@ -1847,6 +1911,56 @@ async function loadDocsTab(projectId) {
   }
 }
 
+async function loadSettingsTab(projectId) {
+  const body = document.getElementById(`settings-body-${projectId}`);
+  if (!body) return;
+  // Re-render each open so prefs are always fresh (no loaded guard).
+  body.innerHTML = '<div style="color:var(--muted);font-size:11px">loading…</div>';
+  const PREFS = [
+    { key: 'hitl',    label: 'HITL — get emailed when a session needs your input' },
+    { key: 'stalled', label: 'Session stalled — no heartbeat for 2+ hours' },
+    { key: 'storage', label: 'Storage at 80% — before hitting your plan limit' },
+    { key: 'sprint',  label: 'Sprint done — all items completed' },
+  ];
+  let prefs = {};
+  try {
+    const data = await api('/settings/notifications');
+    prefs = data.prefs || {};
+  } catch (e) {
+    if (String(e).includes('404')) {
+      body.innerHTML = '<div style="color:var(--muted);font-size:11px;padding:8px 0">Email notification settings are only available in hosted mode (usemeridian.us).</div>';
+      return;
+    }
+    body.innerHTML = `<div style="color:var(--error);font-size:11px">Failed to load: ${escapeHtml(String(e))}</div>`;
+    return;
+  }
+  let html = `<div style="margin-bottom:12px">
+    <div style="color:var(--accent);font-size:10px;letter-spacing:.06em;text-transform:uppercase;margin-bottom:10px;padding-bottom:4px;border-bottom:1px solid var(--border)">Email notifications</div>`;
+  PREFS.forEach(p => {
+    const checked = prefs[p.key] ? 'checked' : '';
+    html += `<label style="display:flex;align-items:center;gap:8px;margin-bottom:8px;cursor:pointer;font-family:var(--font-mono);font-size:11px;color:var(--text)">
+      <input type="checkbox" data-pref="${p.key}" ${checked} style="cursor:pointer">
+      ${escapeHtml(p.label)}
+    </label>`;
+  });
+  html += `<div id="settings-save-status-${projectId}" style="font-size:10px;color:var(--muted);min-height:14px;margin-top:6px"></div>`;
+  html += '</div>';
+  body.innerHTML = html;
+  body.querySelectorAll('input[data-pref]').forEach(cb => {
+    cb.onchange = async () => {
+      const statusEl = document.getElementById(`settings-save-status-${projectId}`);
+      const payload = {};
+      body.querySelectorAll('input[data-pref]').forEach(c => { payload[c.dataset.pref] = c.checked; });
+      try {
+        await api('/settings/notifications', { method: 'PATCH', body: JSON.stringify(payload) });
+        if (statusEl) { statusEl.textContent = 'saved'; setTimeout(() => { statusEl.textContent = ''; }, 1800); }
+      } catch (e) {
+        if (statusEl) statusEl.textContent = `error: ${escapeHtml(String(e))}`;
+      }
+    };
+  });
+}
+
 function _renderToolEntry(tool) {
   const props = (tool.inputSchema && tool.inputSchema.properties) ? tool.inputSchema.properties : {};
   const required = new Set((tool.inputSchema && tool.inputSchema.required) || []);
@@ -1957,7 +2071,7 @@ async function loadTeamTab(projectId) {
 
   const render = async () => {
     body.innerHTML = `<div class="empty" style="color:var(--muted)">loading team summary…</div>`;
-    const days = parseInt((daySel && daySel.value) || '7', 10);
+    const days = parseInt((daySel && daySel.value) || '14', 10);
     try {
       const data = await api(`/team/summary?project_id=${encodeURIComponent(projectId)}&days=${days}`);
       const humans = data.humans || [];
@@ -2092,7 +2206,7 @@ function _renderSwimlane(humans, days, goalMarkers) {
     const c = _colorForHuman(h.human_id);
     const dots = (h.recent || []).map(t => {
       const dc = statusColor[t.status] || '#6b7280';
-      return `<circle cx="${x(t.created_at)}" cy="${y}" r="4" fill="${dc}" stroke="${c}" stroke-width="1">
+      return `<circle cx="${x(t.created_at)}" cy="${y}" r="6" fill="${dc}" stroke="${c}" stroke-width="1">
         <title>[${(t.status || '?').toUpperCase()}] ${(t.description || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;')}</title>
       </circle>`;
     }).join('');

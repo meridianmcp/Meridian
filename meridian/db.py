@@ -148,7 +148,9 @@ CREATE TABLE IF NOT EXISTS sprint_items (
     added_at TEXT NOT NULL DEFAULT (datetime('now')),
     completed_at TEXT,
     task_id TEXT,
-    notes TEXT
+    notes TEXT,
+    feedback_thumb SMALLINT,
+    feedback_note TEXT
 );
 
 -- v2.4 — decisions_pinned: editable constitution alongside the append-only
@@ -241,6 +243,7 @@ CREATE TABLE IF NOT EXISTS tenants (
     plan TEXT NOT NULL DEFAULT 'standard'
         CHECK (plan IN ('standard','pro')),
     pool_project_id TEXT,
+    notification_prefs TEXT NOT NULL DEFAULT '{}',
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -481,6 +484,19 @@ async def _migrate_v24_task_tree_and_framework(db: aiosqlite.Connection) -> None
         db, "sessions", "agent_framework", "TEXT DEFAULT 'claude_code'"
     )
     await _migrate_add_column_if_missing(db, "projects", "project_token", "TEXT")
+
+
+async def _migrate_v25_feedback_and_notifications(db: aiosqlite.Connection) -> None:
+    """v2.5 — sprint_items feedback columns + tenants notification_prefs."""
+    await _migrate_add_column_if_missing(
+        db, "sprint_items", "feedback_thumb", "SMALLINT"
+    )
+    await _migrate_add_column_if_missing(
+        db, "sprint_items", "feedback_note", "TEXT"
+    )
+    await _migrate_add_column_if_missing(
+        db, "tenants", "notification_prefs", "TEXT NOT NULL DEFAULT '{}'"
+    )
 
 
 async def _migrate_v09_notes_and_magic_links(db: aiosqlite.Connection) -> None:
@@ -921,6 +937,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_v24_task_tree_and_framework(db)
     await _migrate_v24_pinned_decisions_and_hitl(db)
     await _migrate_v09_notes_and_magic_links(db)
+    await _migrate_v25_feedback_and_notifications(db)
     return db
 
 
@@ -2328,8 +2345,10 @@ async def patch_sprint_item(
     item_id: str,
     title: str | None = None,
     version: str | None = None,
+    feedback_thumb: int | None = None,
+    feedback_note: str | None = None,
 ) -> dict[str, Any] | None:
-    """Update editable fields (title, version) of a sprint item."""
+    """Update editable fields (title, version, feedback) of a sprint item."""
     fields: list[str] = []
     values: list[Any] = []
     if title is not None:
@@ -2338,6 +2357,12 @@ async def patch_sprint_item(
     if version is not None:
         fields.append("version = ?")
         values.append(version)
+    if feedback_thumb is not None:
+        fields.append("feedback_thumb = ?")
+        values.append(int(feedback_thumb))
+    if feedback_note is not None:
+        fields.append("feedback_note = ?")
+        values.append(feedback_note)
     if not fields:
         return await get_sprint_item(db, item_id)
     values.extend([item_id, project_id])
@@ -3305,7 +3330,7 @@ async def update_tenant(
     **fields: object,
 ) -> dict[str, Any] | None:
     """Update arbitrary columns on a tenant row. Returns updated dict or None."""
-    allowed = {"neon_project_id", "neon_db_url", "stripe_customer_id", "plan", "pool_project_id", "stripe_metered_item_id"}
+    allowed = {"neon_project_id", "neon_db_url", "stripe_customer_id", "plan", "pool_project_id", "stripe_metered_item_id", "notification_prefs"}
     updates = {k: v for k, v in fields.items() if k in allowed}
     if not updates:
         return await get_tenant_by_id(db, tenant_id)
@@ -3633,6 +3658,16 @@ async def supersede_pinned_decision(
         db, old_decision_id, status="superseded", superseded_by=new["id"]
     )
     return new
+
+
+async def count_decisions(db: aiosqlite.Connection, project_id: str) -> int:
+    """Return number of active pinned decisions for a project."""
+    async with db.execute(
+        "SELECT COUNT(*) FROM decisions_pinned WHERE project_id = ? AND status = 'active'",
+        (project_id,),
+    ) as cur:
+        row = await cur.fetchone()
+    return (row[0] if row else 0) or 0
 
 
 # ---------------------------------------------------------------------------

@@ -403,6 +403,56 @@ async def _seed_demo_data(db) -> None:
 # ---------------------------------------------------------------------------
 
 
+async def _seed_decisions_from_file(db, project_id: str) -> None:
+    """One-time seed: parse DECISIONS.md → decisions_pinned table.
+
+    Only runs when the table is empty for this project. Each ## section
+    becomes one pinned decision. Safe to re-run: noop if rows already exist.
+    """
+    import re as _re
+    count = await db_module.count_decisions(db, project_id)
+    if count > 0:
+        return
+
+    decisions_path = _REPO_ROOT / "DECISIONS.md"
+    if not decisions_path.exists():
+        return
+
+    text = decisions_path.read_text(encoding="utf-8", errors="replace")
+    sections = _re.split(r'\n(?=## )', text)
+
+    seeded = 0
+    for section in sections:
+        section = section.strip()
+        if len(section) < 20 or not section.startswith("## "):
+            continue
+        lines = section.split("\n", 1)
+        # Strip leading "## " from title
+        title = lines[0][3:].strip()[:200]
+        body = lines[1].strip() if len(lines) > 1 else ""
+        if not title:
+            continue
+        # Guess category from title/body keywords
+        cat = "TECHNICAL"
+        low = title.lower() + " " + body[:200].lower()
+        if any(w in low for w in ("competi", "positioning", "market")):
+            cat = "COMPETITIVE"
+        elif any(w in low for w in ("strateg", "princip", "philosophy")):
+            cat = "STRATEGIC"
+        elif any(w in low for w in ("pricing", "billing", "stripe", "revenue", "business")):
+            cat = "BUSINESS"
+        elif any(w in low for w in ("product", "feature", "ux", "ui", "dashboard")):
+            cat = "PRODUCT"
+        try:
+            await db_module.pin_decision(db, project_id, title, body, category=cat)
+            seeded += 1
+        except Exception:  # noqa: BLE001
+            pass
+
+    import logging as _log
+    _log.getLogger(__name__).info("Seeded %d decisions from DECISIONS.md", seeded)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Open the SQLite connection on startup, close it on shutdown.
@@ -563,6 +613,15 @@ async def lifespan(app: FastAPI):
 
     summary_task = asyncio.create_task(_auto_summary_loop())
     app.state.auto_summary_task = summary_task
+
+    # v2.5 — seed decisions_pinned from DECISIONS.md on first run
+    if db_path is None or db_path != ":memory:":
+        try:
+            projects = await db_module.list_projects(db)
+            for _p in projects:
+                await _seed_decisions_from_file(db, _p["id"])
+        except Exception:  # noqa: BLE001
+            pass
 
     # v0.6.3 — GOAL.md startup sync: if the file exists and names a known
     # project, pull its contents into the DB before serving any requests.
@@ -1554,8 +1613,18 @@ async def patch_sprint_item_endpoint(
     version = body.get("version")
     if version is not None:
         version = version.strip() or None
+    feedback_thumb = body.get("feedback_thumb")
+    if feedback_thumb is not None:
+        try:
+            feedback_thumb = int(feedback_thumb)
+            if feedback_thumb not in (-1, 1):
+                raise ValueError
+        except (ValueError, TypeError):
+            raise HTTPException(status_code=422, detail="feedback_thumb must be -1 or 1")
+    feedback_note = body.get("feedback_note")
     item = await db_module.patch_sprint_item(
-        _db(request), project_id, item_id, title=title, version=version
+        _db(request), project_id, item_id, title=title, version=version,
+        feedback_thumb=feedback_thumb, feedback_note=feedback_note,
     )
     if item is None:
         raise HTTPException(status_code=404, detail="sprint item not found")
@@ -1739,6 +1808,18 @@ async def close_session(session_id: str, request: Request) -> dict[str, str]:
     except Exception:
         pass
     await _regenerate_claude_md(_db(request), project_id, _REPO_ROOT)
+    # v2.5 — auto-save handoff on session close so the file is always fresh.
+    async def _auto_save_handoff() -> None:
+        try:
+            await asyncio.wait_for(
+                handoff_module.generate_handoff(
+                    _db(request), project_id, request.app.state.data_dir
+                ),
+                timeout=30.0,
+            )
+        except Exception:  # noqa: BLE001 — never block session close
+            pass
+    asyncio.create_task(_auto_save_handoff())
     return {"status": "closed", "session_id": session_id}
 
 
@@ -2913,6 +2994,92 @@ a{{color:#6c8fff}}
     return HTMLResponse(html)
 
 
+@app.patch("/settings/notifications")
+async def update_notification_prefs(request: Request) -> dict[str, Any]:
+    """v2.5 — save email notification preferences for the authenticated tenant."""
+    if not _hosted_mode():
+        raise HTTPException(status_code=404)
+    from .hosted import get_current_tenant
+    tenant = await get_current_tenant(request)
+    body = await request.json()
+    allowed_prefs = {"hitl", "stalled", "storage", "sprint"}
+    prefs = {k: bool(v) for k, v in body.items() if k in allowed_prefs}
+    await db_module.update_tenant(
+        _db(request), tenant["id"], notification_prefs=json.dumps(prefs)
+    )
+    return {"status": "ok", "prefs": prefs}
+
+
+@app.get("/settings/notifications")
+async def get_notification_prefs(request: Request) -> dict[str, Any]:
+    """v2.5 — return current notification preferences for the authenticated tenant."""
+    if not _hosted_mode():
+        raise HTTPException(status_code=404)
+    from .hosted import get_current_tenant
+    tenant = await get_current_tenant(request)
+    prefs_raw = tenant.get("notification_prefs") or "{}"
+    if isinstance(prefs_raw, dict):
+        prefs = prefs_raw
+    else:
+        try:
+            prefs = json.loads(prefs_raw)
+        except Exception:  # noqa: BLE001
+            prefs = {}
+    return {"prefs": prefs}
+
+
+@app.get("/admin/health")
+async def admin_health_json(request: Request) -> dict[str, Any]:
+    """JSON health check for ops/curl — restricted to ADMIN_EMAIL."""
+    from .hosted import get_current_tenant
+
+    admin_email = os.environ.get("ADMIN_EMAIL", "")
+    try:
+        tenant = await get_current_tenant(request)
+    except HTTPException:
+        raise HTTPException(status_code=403, detail="not authenticated")
+    if admin_email and tenant.get("email") != admin_email:
+        raise HTTPException(status_code=403, detail="admin only")
+
+    db = request.app.state.db
+
+    async def _count(sql: str) -> int:
+        async with db.execute(sql) as cur:
+            row = await cur.fetchone()
+        return (row[0] if row else 0) or 0
+
+    tenants_total = await _count("SELECT COUNT(*) FROM tenants")
+    tenants_pro = await _count("SELECT COUNT(*) FROM tenants WHERE plan='pro'")
+    tasks_today = await _count(
+        "SELECT COUNT(*) FROM task_log WHERE created_at >= date('now')"
+    )
+    sessions_active = await _count(
+        "SELECT COUNT(*) FROM sessions WHERE status='in_progress'"
+    )
+    sprint_pending = await _count(
+        "SELECT COUNT(*) FROM sprint_items WHERE status='pending'"
+    )
+
+    try:
+        version_path = _REPO_ROOT / "pyproject.toml"
+        ver_text = version_path.read_text(encoding="utf-8")
+        import re as _re
+        ver_m = _re.search(r'version\s*=\s*"([^"]+)"', ver_text)
+        version = ver_m.group(1) if ver_m else "unknown"
+    except Exception:  # noqa: BLE001
+        version = "unknown"
+
+    return {
+        "version": version,
+        "tenants_total": tenants_total,
+        "tenants_pro": tenants_pro,
+        "sessions_active": sessions_active,
+        "tasks_today": tasks_today,
+        "sprint_pending": sprint_pending,
+        "hosted_mode": _hosted_mode(),
+    }
+
+
 @app.get("/admin/git-status")
 async def git_status() -> dict[str, Any]:
     """Check if local repo is behind/ahead of remote."""
@@ -3742,6 +3909,16 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
      "inputSchema": {"type": "object", "properties": {
          "note_id": {"type": "string"}},
          "required": ["note_id"]}},
+    {"name": "get_session_brief", "description":
+        "Single-call session orientation — returns sprint focus, pending sprint items, "
+        "recent tasks, any blocking failures, and pending HITL requests in a compact "
+        "XML envelope (<500 tokens). Replaces the start_session + get_context_block "
+        "two-call pattern for worker/automation sessions.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"},
+         "role": {"type": "string", "enum": ["worker", "planner", "review"],
+                  "description": "Controls verbosity. 'worker'=sprint+tasks only, 'planner'=full context."}},
+         "required": ["project_id"]}},
 ]
 
 
@@ -3876,6 +4053,7 @@ async def _dispatch_mcp_tool(name: str, args: dict[str, Any], db: Any, data_dir:
         # v2.3 — assemble the same shape as /projects/{id}/context-block but
         # return both the rendered text AND the source dict so MCP clients
         # can choose to render their own variant.
+        # v2.5 — wrap in semantic XML for better Claude Code parsing.
         project_id = args["project_id"]
         mode = args.get("mode", "full")
         project = await db_module.get_project(db, project_id)
@@ -3898,7 +4076,38 @@ async def _dispatch_mcp_tool(name: str, args: dict[str, Any], db: Any, data_dir:
             project, goal, sprint_items, pending_tasks, sessions, recent_decisions,
             mode=mode,
         )
-        return {"mode": mode, "text": text, "project_id": project_id}
+        xml_text = f'<meridian_context project_id="{project_id}" mode="{mode}">\n{text}\n</meridian_context>'
+        return {"mode": mode, "text": xml_text, "project_id": project_id}
+    if name == "get_session_brief":
+        # v2.5 — single-call orientation, <500 tokens, XML output.
+        project_id = args["project_id"]
+        role = args.get("role", "worker")
+        goal = await db_module.get_goal(db, project_id)
+        tasks = await db_module.get_tasks(db, project_id, limit=5)
+        hitl_rows = await db_module.list_hitl_requests(db, project_id, status="pending")
+        sprint_items = await db_module.get_sprint_items(db, project_id, status="pending")
+        blocking = [t for t in tasks if t.get("status") == "failed"]
+        sprint_str = (goal.get("sprint") or "") if goal else ""
+        tasks_xml = "\n".join(
+            f'  <task status="{t.get("status","?")}">{(t.get("description") or "")[:80]}</task>'
+            for t in tasks
+        )
+        sprint_items_xml = "\n".join(
+            f'  <item version="{it.get("version","")}">{(it.get("title") or "")[:80]}</item>'
+            for it in sprint_items[:5]
+        )
+        hitl_attr = f' count="{len(hitl_rows)}"' if hitl_rows else ""
+        blocking_xml = f'<blocking>{(blocking[0].get("description") or "")[:100]}</blocking>' if blocking else ""
+        brief = (
+            f'<session_brief project_id="{project_id}" role="{role}">\n'
+            f'<sprint>{sprint_str[:200]}</sprint>\n'
+            f'<pending_items>\n{sprint_items_xml}\n</pending_items>\n'
+            f'<last_tasks>\n{tasks_xml}\n</last_tasks>\n'
+            f'{blocking_xml}\n'
+            f'{"<hitl_pending" + hitl_attr + "/>" if hitl_rows else ""}\n'
+            f'</session_brief>'
+        )
+        return {"text": brief, "project_id": project_id, "role": role}
     raise ValueError(f"unknown tool: {name}")
 
 
@@ -4673,6 +4882,27 @@ def build_mcp_server():
                     "required": ["name"],
                 },
             ),
+            Tool(
+                name="get_session_brief",
+                description=(
+                    "Single-call session orientation — sprint focus, pending sprint "
+                    "items, recent tasks, blocking failures, and pending HITL in a "
+                    "compact XML envelope (<500 tokens). Use instead of start_session "
+                    "+ get_context_block for worker/automation sessions."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "project_id": {"type": "string"},
+                        "role": {
+                            "type": "string",
+                            "enum": ["worker", "planner", "review"],
+                            "description": "Context verbosity. worker=sprint+tasks only.",
+                        },
+                    },
+                    "required": ["project_id"],
+                },
+            ),
         ]
 
     @server.call_tool()
@@ -5041,6 +5271,10 @@ def build_mcp_server():
                     result = updated or task
                     # Update CLAUDE.md with current sprint state.
                     await _regenerate_claude_md(db, task["project_id"], _REPO_ROOT)
+            elif name == "get_session_brief":
+                result = await _dispatch_mcp_tool(
+                    "get_session_brief", arguments, db, state["data_dir"]
+                )
             else:
                 result = {"error": f"unknown tool: {name}"}
         except Exception as exc:  # noqa: BLE001 — surface to MCP client

@@ -69,23 +69,33 @@ DB SCHEMA (key tables):
   tenants        — id, email, neon_project_id, neon_db_url, stripe_customer_id, plan
 </architecture>
 
+## Protected Files — append-only, never regenerate
+These files are written by humans and must never be bulk-overwritten by Claude Code:
+- **ROADMAP.md** — append new version sections only. Never rewrite existing content.
+- **DECISIONS.md** — append only via pin_decision tool. Never bulk rewrite.
+- **DEVLOG.md** — append session summaries only. Never rewrite existing entries.
+- **CONTRIBUTORS.md** — add new contributor rows only.
+- **LICENSE** — never touch.
+For sprint/roadmap tracking: use sprint_items DB table, not ROADMAP.md.
+For decisions: use pin_decision MCP tool, which also appends to DECISIONS.md.
+
 <current_state>
 <!-- Auto-updated by Meridian. Do not edit manually. -->
 Project: meridian-build (5787cc92)
-Last updated: 2026-05-25 06:18 UTC
+Last updated: 2026-05-25 06:58 UTC
 Sprint: v2.1 — demo route + hosted tier polish + pre-launch
 North Star: Meridian is the open-source coordination layer for AI coding sessions — persistent memory, task tracking, and session coordination that your AI tools don't provide.  Core value: "Your AI sessions don'…
 Recent:
+  - [DONE] DECISION: MCP tool responses should use XML tags not raw JSON. Claude Code parses <goal>, <tasks>, <context>, <decisions
+  - [DONE] DECISION: Handoff generation is too manual. generate_handoff should auto-run at session end and write to data/{project_n
+  - [DONE] VERIFIED: No data loss in prod Neon DB. task_log=190, goal_states=430, sessions=47, sprint_items=147. All data intact fr
   - [DONE] DECISION: TECHNICAL: Corrected Neon capacity model — multiple customers per project.  8 Standard customers share one Neo
   - [DONE] DECISION: TECHNICAL: Neon capacity model — same account, CU limits per project.  One Neon project per customer. Both Sta
-  - [DONE] DECISION: TECHNICAL: Neon two-pool architecture for Standard vs Pro tiers.  Standard ($20/mo): provisioned from NEON_API
-  - [DONE] DECISION: TECHNICAL: pro@usemeridian.us email address set up via Cloudflare Email Routing. Forwards to hello@usemeridian.us
-  - [DONE] DECISION: PROCESS: Frontend work — always load /mnt/skills/public/frontend-design/SKILL.md before any UI generation in C
 </current_state>
 
 ---
 <!-- MERIDIAN STATE — auto-generated, do not edit below -->
-## Current Sprint State  _(auto-updated 2026-05-25 06:07 UTC)_
+## Current Sprint State  _(auto-updated 2026-05-25 07:17 UTC)_
 
 **Key Files:**
 - `meridian/server.py` — FastAPI app + MCP handlers
