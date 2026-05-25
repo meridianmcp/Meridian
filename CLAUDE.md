@@ -72,7 +72,7 @@ DB SCHEMA (key tables):
 <current_state>
 <!-- Auto-updated by Meridian. Do not edit manually. -->
 Project: meridian-build (5787cc92)
-Last updated: 2026-05-25 06:00 UTC
+Last updated: 2026-05-25 06:18 UTC
 Sprint: v2.1 — demo route + hosted tier polish + pre-launch
 North Star: Meridian is the open-source coordination layer for AI coding sessions — persistent memory, task tracking, and session coordination that your AI tools don't provide.  Core value: "Your AI sessions don'…
 Recent:
