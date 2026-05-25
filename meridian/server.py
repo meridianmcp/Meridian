@@ -739,7 +739,7 @@ async def site_password_gate(request: Request, call_next):
     if not site_pw:
         return await call_next(request)
     path = request.url.path
-    if path in ("/health", "/mcp/health", "/__gate__") or path == "/demo" or path.startswith("/demo/"):
+    if path in ("/health", "/mcp/health", "/__gate__", "/config", "/static") or path.startswith("/static/") or path == "/demo" or path.startswith("/demo/"):
         return await call_next(request)
     from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
     from fastapi.responses import HTMLResponse
