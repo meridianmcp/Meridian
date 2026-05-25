@@ -337,13 +337,13 @@ async def _migrate_task_log_backlog_future(db: aiosqlite.Connection) -> None:
         row = await cur.fetchone()
     if row is None:
         return
-    table_sql = row[0] or ""
+    table_sql = (row["sql"] if isinstance(row, dict) else row[0]) or ""
     if "'backlog'" in table_sql:
         return  # already migrated
     # Introspect exact columns — handles any schema version (4, 8, 10 cols)
     async with db.execute("PRAGMA table_info(task_log)") as _cur:
         _col_rows = list(await _cur.fetchall())
-    _col_names = [r[1] for r in _col_rows]
+    _col_names = [(r["name"] if isinstance(r, dict) else r[1]) for r in _col_rows]
 
     def _make_col_def(r: Any) -> str:
         cid, name, ctype, notnull, dflt, pk = r
@@ -399,7 +399,7 @@ async def _migrate_task_log_hitl(db: aiosqlite.Connection) -> None:
         row = await cur.fetchone()
     if row is None:
         return
-    table_sql = row[0] or ""
+    table_sql = (row["sql"] if isinstance(row, dict) else row[0]) or ""
     if "pending-hitl" in table_sql:
         return  # already migrated
 
@@ -435,7 +435,7 @@ async def _column_exists(
     """Return True if ``column`` already exists on ``table`` in this DB."""
     async with db.execute(f"PRAGMA table_info({table})") as cur:
         rows = await cur.fetchall()
-    return any(row[1] == column for row in rows)
+    return any((row["name"] if isinstance(row, dict) else row[1]) == column for row in rows)
 
 
 async def _migrate_add_column_if_missing(
@@ -622,7 +622,7 @@ async def _migrate_sessions_archived(db: aiosqlite.Connection) -> None:
         row = await cur.fetchone()
     if row is None:
         return
-    if "archived" in (row[0] or ""):
+    if "archived" in ((row["sql"] if isinstance(row, dict) else row[0]) or ""):
         return  # already migrated
 
     # SQLite 3.26+ auto-rewrites FK references in other tables when a table is
@@ -709,7 +709,7 @@ async def _migrate_sprint_items_v2(db: aiosqlite.Connection) -> None:
         row = await cur.fetchone()
     if row is None:
         return  # fresh DB — CREATE_TABLES builds the current schema
-    sql = row[0] or ""
+    sql = (row["sql"] if isinstance(row, dict) else row[0]) or ""
     # Already migrated when all three new columns + 'failed' status are present.
     if ("item_group" in sql and "pushed_to" in sql
             and "human_id" in sql and "'failed'" in sql):
@@ -951,7 +951,7 @@ async def delete_project(db: aiosqlite.Connection, project_id: str) -> None:
         (project_id,),
     ) as cur:
         row = await cur.fetchone()
-        count = int(row[0] if row else 0)  # works for both sqlite Row and asyncpg Record
+        count = int(row["cnt"] if row else 0)
     if count:
         raise ValueError(f"{count} task(s) in_progress — complete or cancel first")
 
