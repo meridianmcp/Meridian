@@ -524,6 +524,7 @@ function buildTabBody(project) {
       <button class="vtab-btn" data-vtab="queue" title="Work Queue">⚙</button>
       <button class="vtab-btn" data-vtab="team" title="Team — per-human activity">👥</button>
       <button class="vtab-btn" data-vtab="notes" title="Notes — per-project wiki">📝</button>
+      <button class="vtab-btn" data-vtab="docs" title="MCP Tool Reference">📖</button>
     </div>
     <div class="vtab-drawer open" id="drawer-${project.id}">
       <div class="drawer-panel active" id="drawer-status-${project.id}">
@@ -718,6 +719,14 @@ function buildTabBody(project) {
           </div>
         </div>
       </div>
+      <div class="drawer-panel" id="drawer-docs-${project.id}">
+        <div class="drawer-header">
+          <span>MCP TOOL REFERENCE</span>
+        </div>
+        <div style="flex:1;overflow-y:auto;padding:14px;font-family:'IBM Plex Mono',monospace;font-size:11px" id="docs-body-${project.id}">
+          <div class="empty" style="color:var(--muted)">loading tools…</div>
+        </div>
+      </div>
       <div class="drawer-panel" id="drawer-team-${project.id}">
         <div class="drawer-header" style="justify-content:space-between">
           <span>TEAM · ${escapeHtml(project.name)}</span>
@@ -823,6 +832,7 @@ function buildTabBody(project) {
         if (vtab === 'live') loadLiveTab(project.id);
         if (vtab === 'team') loadTeamTab(project.id);
         if (vtab === 'notes') loadNotesTab(project.id);
+        if (vtab === 'docs') loadDocsTab(project.id);
       };
     });
   }
@@ -1718,6 +1728,74 @@ function _colorForHuman(humanId) {
   let h = 0;
   for (let i = 0; i < (humanId || '').length; i++) h = ((h << 5) - h + humanId.charCodeAt(i)) | 0;
   return _HUMAN_COLORS[Math.abs(h) % _HUMAN_COLORS.length];
+}
+
+// Tool categories for the Docs vtab grouping
+const _TOOL_CATEGORIES = {
+  goal: ['set_goal', 'get_goal', 'set_north_star', 'set_sprint'],
+  task: ['log_task', 'complete_task', 'fail_sprint_item', 'add_sprint_item', 'get_tasks',
+         'complete_sprint_item', 'skip_sprint_item', 'push_sprint_item', 'get_sprint_items'],
+  session: ['start_session', 'register_session', 'get_sessions', 'start_worker_session',
+             'heartbeat', 'get_context_block', 'claim_task', 'release_task', 'enqueue_claude_task'],
+  hitl: ['request_hitl', 'get_hitl_request'],
+  notes: ['add_note', 'get_notes', 'delete_note'],
+  decisions: ['pin_decision', 'get_pinned_decisions', 'set_decision', 'update_decision'],
+  project: ['create_project', 'list_projects', 'get_project_by_name', 'generate_handoff'],
+};
+const _CATEGORY_LABELS = {
+  goal: 'Goal Tools', task: 'Task & Sprint Tools', session: 'Session Tools',
+  hitl: 'HITL Tools', notes: 'Notes Tools', decisions: 'Decision Tools', project: 'Project Tools',
+};
+
+async function loadDocsTab(projectId) {
+  const body = document.getElementById(`docs-body-${projectId}`);
+  if (!body) return;
+  if (body.dataset.loaded) return;
+  body.dataset.loaded = '1';
+  try {
+    const tools = await api('/tools');
+    if (!tools || !tools.length) { body.innerHTML = '<div class="empty" style="color:var(--muted)">No tools returned.</div>'; return; }
+    // Build lookup
+    const byName = {};
+    tools.forEach(t => { byName[t.name] = t; });
+    // Render by category
+    let html = '';
+    // Determine category for each tool
+    const categorized = new Set();
+    for (const [cat, names] of Object.entries(_TOOL_CATEGORIES)) {
+      const catTools = names.map(n => byName[n]).filter(Boolean);
+      if (!catTools.length) continue;
+      html += `<div style="margin-bottom:18px"><div style="color:var(--accent);font-size:10px;letter-spacing:.06em;text-transform:uppercase;margin-bottom:8px;padding-bottom:4px;border-bottom:1px solid var(--border)">${_CATEGORY_LABELS[cat]}</div>`;
+      catTools.forEach(tool => {
+        categorized.add(tool.name);
+        html += _renderToolEntry(tool);
+      });
+      html += '</div>';
+    }
+    // Catch-all for uncategorized tools
+    const rest = tools.filter(t => !categorized.has(t.name));
+    if (rest.length) {
+      html += `<div style="margin-bottom:18px"><div style="color:var(--accent);font-size:10px;letter-spacing:.06em;text-transform:uppercase;margin-bottom:8px;padding-bottom:4px;border-bottom:1px solid var(--border)">Other</div>`;
+      rest.forEach(tool => { html += _renderToolEntry(tool); });
+      html += '</div>';
+    }
+    body.innerHTML = html;
+  } catch (e) {
+    body.innerHTML = `<div style="color:var(--error)">Failed to load tools: ${escapeHtml(String(e))}</div>`;
+  }
+}
+
+function _renderToolEntry(tool) {
+  const props = (tool.inputSchema && tool.inputSchema.properties) ? tool.inputSchema.properties : {};
+  const required = new Set((tool.inputSchema && tool.inputSchema.required) || []);
+  const params = Object.entries(props).map(([name, schema]) => {
+    const req = required.has(name) ? 'required' : 'optional';
+    const type = schema.type || 'any';
+    const desc = schema.description ? escapeHtml(schema.description) : '';
+    return `<tr><td style="color:var(--text);padding:2px 10px 2px 0">${escapeHtml(name)}</td><td style="color:var(--muted);padding:2px 10px 2px 0">${type}</td><td style="color:var(--muted);padding:2px 10px 2px 0;font-style:italic">${req}</td><td style="color:var(--muted);padding:2px 0">${desc}</td></tr>`;
+  }).join('');
+  const signature = Object.keys(props).map(n => required.has(n) ? n : `${n}?`).join(', ');
+  return `<div style="margin-bottom:12px"><div style="color:var(--text);font-weight:600">${escapeHtml(tool.name)}(<span style="color:var(--muted)">${escapeHtml(signature)}</span>)</div><div style="color:var(--muted);margin:3px 0 4px 0;font-size:10.5px">${escapeHtml(tool.description || '')}</div>${params ? `<table style="font-size:10px;border-collapse:collapse;width:100%">${params}</table>` : ''}</div>`;
 }
 
 async function loadNotesTab(projectId) {

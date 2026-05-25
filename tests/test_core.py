@@ -5309,3 +5309,57 @@ def test_magic_link_verify_404_for_bad_token(client):
     """v0.9 — GET /auth/magic/verify with invalid token rejects."""
     r = client.get("/auth/magic/verify?token=nonexistent")
     assert r.status_code == 401
+
+
+# ---------------------------------------------------------------------------
+# v1.0 — Microsoft OAuth
+# ---------------------------------------------------------------------------
+
+def test_auth_microsoft_login_redirects_when_configured(client, monkeypatch):
+    """GET /auth/microsoft/login redirects to Microsoft when MICROSOFT_CLIENT_ID is set."""
+    monkeypatch.setenv("MICROSOFT_CLIENT_ID", "fake-ms-client-id")
+    import meridian.hosted as _h
+    monkeypatch.setattr(_h, "MICROSOFT_CLIENT_ID", "fake-ms-client-id")
+    r = client.get("/auth/microsoft/login", follow_redirects=False)
+    assert r.status_code == 302
+    assert "login.microsoftonline.com" in r.headers.get("location", "")
+
+
+def test_auth_microsoft_callback_missing_code(client):
+    """GET /auth/microsoft/callback without code param returns 400."""
+    r = client.get("/auth/microsoft/callback", follow_redirects=False)
+    assert r.status_code == 400
+    assert "missing oauth code" in r.json().get("detail", "")
+
+
+# ---------------------------------------------------------------------------
+# v1.0 — MeridianCheckpointer (LangGraph integration)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_langgraph_checkpointer_instantiate():
+    """MeridianCheckpointer can be instantiated without side effects."""
+    from meridian.integrations.langgraph import MeridianCheckpointer
+    cp = MeridianCheckpointer(
+        project_id="test-proj",
+        api_url="http://localhost:7878",
+        api_token="test-token",
+    )
+    assert cp.project_id == "test-proj"
+    assert "Authorization" in cp.headers
+
+
+@pytest.mark.asyncio
+async def test_langgraph_checkpointer_put_graceful_failure():
+    """MeridianCheckpointer.put() swallows network errors (server not running)."""
+    from meridian.integrations.langgraph import MeridianCheckpointer
+    cp = MeridianCheckpointer(
+        project_id="test-proj",
+        api_url="http://localhost:19999",  # nothing listening here
+    )
+    config = {"configurable": {"thread_id": "test-node"}}
+    checkpoint = {"pending_sends": []}
+    metadata = {"step": 1}
+    # Should not raise even though the server isn't running
+    result = await cp.put(config, checkpoint, metadata, {})
+    assert result == config
