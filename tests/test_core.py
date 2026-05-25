@@ -5204,3 +5204,108 @@ async def test_register_session_persists_agent_framework(db):
         db, p["id"], "lg-1", human_id="langgraph", agent_framework="langgraph"
     )
     assert s["agent_framework"] == "langgraph"
+
+
+# ---------------------------------------------------------------------------
+# v0.9 — project_notes
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_add_and_get_project_notes(db):
+    """v0.9 — add_project_note + get_project_notes round-trip + tag filter."""
+    p = await db_module.create_project(db, "v09-notes")
+    await db_module.add_project_note(
+        db, p["id"], "Reset DB", "rm -rf data/", tags="setup,gotcha"
+    )
+    await db_module.add_project_note(
+        db, p["id"], "ANTHROPIC_API_KEY", "Set in .env", tags="env"
+    )
+    all_ = await db_module.get_project_notes(db, p["id"])
+    assert len(all_) == 2
+    setup_only = await db_module.get_project_notes(db, p["id"], tag="setup")
+    assert len(setup_only) == 1
+    assert setup_only[0]["title"] == "Reset DB"
+
+
+def test_project_notes_http_crud(client):
+    """v0.9 — POST/GET/PATCH/DELETE /projects/{id}/notes."""
+    project = client.post("/projects", json={"name": "v09-notes-http"}).json()
+    # Create
+    r = client.post(
+        f"/projects/{project['id']}/notes",
+        json={"title": "Gotcha", "body": "Postgres needs %% not %", "tags": "gotcha"},
+    )
+    assert r.status_code == 201
+    n = r.json()
+    # List
+    r = client.get(f"/projects/{project['id']}/notes")
+    assert r.status_code == 200
+    assert any(x["id"] == n["id"] for x in r.json())
+    # Patch
+    r = client.patch(
+        f"/projects/{project['id']}/notes/{n['id']}",
+        json={"body": "Postgres needs %% not % in LIKE"},
+    )
+    assert r.status_code == 200
+    assert "LIKE" in r.json()["body"]
+    # Delete
+    r = client.delete(f"/projects/{project['id']}/notes/{n['id']}")
+    assert r.status_code == 204
+    r = client.delete(f"/projects/{project['id']}/notes/{n['id']}")
+    assert r.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# v0.9 — Magic link tokens
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_magic_token_round_trip(db):
+    """v0.9 — store_magic_token + consume_magic_token single-use atomicity."""
+    import hashlib as _h
+    from datetime import datetime, timedelta, timezone
+    raw = "magic-secret-123"
+    token_hash = _h.sha256(raw.encode()).hexdigest()
+    expires_at = (
+        datetime.now(timezone.utc) + timedelta(hours=24)
+    ).strftime("%Y-%m-%d %H:%M:%S")
+    await db_module.store_magic_token(db, "alice@example.com", token_hash, expires_at)
+    # First consume succeeds
+    row = await db_module.consume_magic_token(db, token_hash)
+    assert row is not None
+    assert row["email"] == "alice@example.com"
+    # Second consume fails — single-use
+    row2 = await db_module.consume_magic_token(db, token_hash)
+    assert row2 is None
+
+
+@pytest.mark.asyncio
+async def test_magic_token_expired(db):
+    """v0.9 — expired token won't validate."""
+    import hashlib as _h
+    from datetime import datetime, timedelta, timezone
+    raw = "expired-token"
+    token_hash = _h.sha256(raw.encode()).hexdigest()
+    past = (
+        datetime.now(timezone.utc) - timedelta(hours=1)
+    ).strftime("%Y-%m-%d %H:%M:%S")
+    await db_module.store_magic_token(db, "bob@example.com", token_hash, past)
+    row = await db_module.consume_magic_token(db, token_hash)
+    assert row is None
+
+
+def test_magic_link_request_returns_200(client):
+    """v0.9 — POST /auth/magic accepts valid email and returns 200."""
+    # Resend not configured in tests → endpoint still returns 200, surfaces dev_link.
+    r = client.post("/auth/magic", json={"email": "test@example.com"})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["status"] == "ok"
+
+
+def test_magic_link_verify_404_for_bad_token(client):
+    """v0.9 — GET /auth/magic/verify with invalid token rejects."""
+    r = client.get("/auth/magic/verify?token=nonexistent")
+    assert r.status_code == 401

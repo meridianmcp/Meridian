@@ -894,6 +894,32 @@ async def auth_logout(request: Request):
     return await _auth_logout(request)
 
 
+@app.post("/auth/magic")
+async def auth_magic_request(request: Request):
+    """v0.9 — request a magic-link email. Rate-limited.
+
+    Body: ``{"email": "user@example.com"}``. Sends a single-use signed
+    link via Resend. Idempotent within the 24-hour token window — if a
+    valid unused token exists for this email, returns success without
+    sending a duplicate email.
+    """
+    from .hosted import auth_magic_request as _impl
+    return await _impl(request)
+
+
+@app.get("/auth/magic/verify")
+async def auth_magic_verify(request: Request, token: str = ""):
+    """v0.9 — consume a magic-link token, create a session, redirect.
+
+    Single-use: marks ``used_at`` on success so re-clicking the same
+    link doesn't re-authenticate. New tenants flow through the OAuth
+    paywall check — redirected to /pricing?signup=1 if no Stripe
+    subscription yet.
+    """
+    from .hosted import auth_magic_verify as _impl
+    return await _impl(request, token)
+
+
 @app.get("/config")
 async def server_config() -> dict[str, Any]:
     """v0.6.5 — expose runtime configuration to the dashboard.
@@ -2317,6 +2343,66 @@ async def patch_hitl_endpoint(
 
 
 # ---------------------------------------------------------------------------
+# v0.9 — project_notes (per-project wiki)
+# ---------------------------------------------------------------------------
+
+
+@app.get("/projects/{project_id}/notes")
+async def list_project_notes_endpoint(
+    project_id: str, request: Request, tag: str | None = None
+) -> list[dict[str, Any]]:
+    """Project notes (newest first). ``?tag=X`` filters by substring match."""
+    project = await db_module.get_project(_db(request), project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="project not found")
+    return await db_module.get_project_notes(_db(request), project_id, tag=tag)
+
+
+@app.post("/projects/{project_id}/notes", status_code=201)
+async def create_project_note_endpoint(
+    project_id: str, body: dict[str, Any], request: Request
+) -> dict[str, Any]:
+    """Create a new note. Body: {title, body, tags?}."""
+    project = await db_module.get_project(_db(request), project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="project not found")
+    title = (body.get("title") or "").strip()
+    text = (body.get("body") or "").strip()
+    if not title or not text:
+        raise HTTPException(status_code=400, detail="title and body required")
+    return await db_module.add_project_note(
+        _db(request), project_id, title, text, body.get("tags"),
+    )
+
+
+@app.patch("/projects/{project_id}/notes/{note_id}")
+async def update_project_note_endpoint(
+    project_id: str, note_id: str, body: dict[str, Any], request: Request
+) -> dict[str, Any]:
+    """Patch title/body/tags."""
+    result = await db_module.update_project_note(
+        _db(request), note_id,
+        title=body.get("title"),
+        body=body.get("body"),
+        tags=body.get("tags"),
+    )
+    if result is None:
+        raise HTTPException(status_code=404, detail="note not found")
+    return result
+
+
+@app.delete("/projects/{project_id}/notes/{note_id}", status_code=204)
+async def delete_project_note_endpoint(
+    project_id: str, note_id: str, request: Request
+) -> Response:
+    """Hard-delete a note. Returns 204 or 404."""
+    ok = await db_module.delete_project_note(_db(request), note_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="note not found")
+    return Response(status_code=204)
+
+
+# ---------------------------------------------------------------------------
 # v2.4 — Team visibility (per-human swimlane + standup digest data)
 # ---------------------------------------------------------------------------
 
@@ -3515,6 +3601,26 @@ async def _handle_mcp_request(body: dict[str, Any], db: Any, data_dir: str) -> d
              "inputSchema": {"type": "object", "properties": {
                  "request_id": {"type": "string"}},
                  "required": ["request_id"]}},
+            {"name": "add_note", "description":
+                "Add a per-project wiki note (setup, gotcha, howto, env, ...). "
+                "Free-form title/body; comma-separated tags optional.",
+             "inputSchema": {"type": "object", "properties": {
+                 "project_id": {"type": "string"},
+                 "title": {"type": "string"},
+                 "body": {"type": "string"},
+                 "tags": {"type": "string"}},
+                 "required": ["project_id", "title", "body"]}},
+            {"name": "get_notes", "description":
+                "List project notes (newest first). Optional ?tag substring filter.",
+             "inputSchema": {"type": "object", "properties": {
+                 "project_id": {"type": "string"},
+                 "tag": {"type": "string"}},
+                 "required": ["project_id"]}},
+            {"name": "delete_note", "description":
+                "Hard-delete a project note by id.",
+             "inputSchema": {"type": "object", "properties": {
+                 "note_id": {"type": "string"}},
+                 "required": ["note_id"]}},
         ]
         return _jsonrpc_ok(req_id, {"tools": tools})
 
@@ -3606,6 +3712,18 @@ async def _dispatch_mcp_tool(name: str, args: dict[str, Any], db: Any, data_dir:
         if result is None:
             raise ValueError("hitl request not found")
         return result
+    if name == "add_note":
+        return await db_module.add_project_note(
+            db, args["project_id"], args["title"], args["body"],
+            args.get("tags"),
+        )
+    if name == "get_notes":
+        return await db_module.get_project_notes(
+            db, args["project_id"], tag=args.get("tag"),
+        )
+    if name == "delete_note":
+        ok = await db_module.delete_project_note(db, args["note_id"])
+        return {"deleted": ok}
     if name == "get_context_block":
         # v2.3 — assemble the same shape as /projects/{id}/context-block but
         # return both the rendered text AND the source dict so MCP clients
@@ -4025,6 +4143,50 @@ def build_mcp_server():
                     "type": "object",
                     "properties": {"request_id": {"type": "string"}},
                     "required": ["request_id"],
+                },
+            ),
+            Tool(
+                name="add_note",
+                description=(
+                    "v0.9 — add a per-project wiki note. Use for setup steps, "
+                    "gotchas, env var reference, how-tos — anything a future "
+                    "session would want to grep. Tags are comma-separated."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "project_id": {"type": "string"},
+                        "title": {"type": "string"},
+                        "body": {"type": "string"},
+                        "tags": {"type": "string"},
+                    },
+                    "required": ["project_id", "title", "body"],
+                },
+            ),
+            Tool(
+                name="get_notes",
+                description=(
+                    "v0.9 — list project notes (newest first). Optional "
+                    "``tag`` filter matches any comma-separated tag."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "project_id": {"type": "string"},
+                        "tag": {"type": "string"},
+                    },
+                    "required": ["project_id"],
+                },
+            ),
+            Tool(
+                name="delete_note",
+                description=(
+                    "v0.9 — hard-delete a project note by id."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {"note_id": {"type": "string"}},
+                    "required": ["note_id"],
                 },
             ),
             Tool(
@@ -4525,8 +4687,9 @@ def build_mcp_server():
             elif name in (
                 "pin_decision", "update_decision", "get_pinned_decisions",
                 "request_hitl", "get_hitl_request",
+                "add_note", "get_notes", "delete_note",
             ):
-                # v2.4 — share dispatch with HTTP MCP so both surfaces stay in sync.
+                # v2.4/v0.9 — share dispatch with HTTP MCP so both surfaces stay in sync.
                 result = await _dispatch_mcp_tool(
                     name, arguments, db, state["data_dir"]
                 )

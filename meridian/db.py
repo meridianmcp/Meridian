@@ -171,6 +171,19 @@ CREATE TABLE IF NOT EXISTS decisions_pinned (
     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+-- v0.9 — project_notes: per-project wiki for setup, gotchas, env vars,
+-- how-tos. Plain table; no goal hierarchy, no version, no history.
+-- Tags are comma-separated free-form (setup, gotcha, howto, env, ...).
+CREATE TABLE IF NOT EXISTS project_notes (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    title TEXT NOT NULL,
+    body TEXT NOT NULL,
+    tags TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 -- v2.4 — hitl_requests: human-in-the-loop coordination queue. Sessions
 -- can pause waiting for a human answer (urgency='blocking') or surface a
 -- non-blocking question (urgency='normal'/'high'). assigned_to routes to
@@ -203,6 +216,8 @@ CREATE INDEX IF NOT EXISTS idx_hitl_project
     ON hitl_requests(project_id, status);
 CREATE INDEX IF NOT EXISTS idx_hitl_assigned
     ON hitl_requests(assigned_to, status);
+CREATE INDEX IF NOT EXISTS idx_notes_project
+    ON project_notes(project_id);
 CREATE INDEX IF NOT EXISTS idx_tasks_project
     ON task_log(project_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_tasks_session
@@ -464,6 +479,38 @@ async def _migrate_v24_task_tree_and_framework(db: aiosqlite.Connection) -> None
         db, "sessions", "agent_framework", "TEXT DEFAULT 'claude_code'"
     )
     await _migrate_add_column_if_missing(db, "projects", "project_token", "TEXT")
+
+
+async def _migrate_v09_notes_and_magic_links(db: aiosqlite.Connection) -> None:
+    """v0.9 — project_notes (per-project wiki) + magic_link_tokens
+    (email magic-link auth). Both new in v0.9; idempotent CREATE."""
+    await db.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS project_notes (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+            title TEXT NOT NULL,
+            body TEXT NOT NULL,
+            tags TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_notes_project
+            ON project_notes(project_id);
+
+        CREATE TABLE IF NOT EXISTS magic_link_tokens (
+            id TEXT PRIMARY KEY,
+            email TEXT NOT NULL,
+            token_hash TEXT NOT NULL UNIQUE,
+            used_at TEXT,
+            expires_at TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_magic_email
+            ON magic_link_tokens(email, used_at);
+        """
+    )
+    await db.commit()
 
 
 async def _migrate_v24_pinned_decisions_and_hitl(db: aiosqlite.Connection) -> None:
@@ -869,6 +916,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_goal_field_timestamps(db)
     await _migrate_v24_task_tree_and_framework(db)
     await _migrate_v24_pinned_decisions_and_hitl(db)
+    await _migrate_v09_notes_and_magic_links(db)
     return db
 
 
@@ -3818,3 +3866,175 @@ async def get_team_summary(
         "humans": sorted(humans.values(), key=lambda x: x.get("last_seen") or "", reverse=True),
         "active_count": active_count,
     }
+
+
+# ---------------------------------------------------------------------------
+# v0.9 — project_notes: per-project wiki
+# ---------------------------------------------------------------------------
+
+
+async def add_project_note(
+    db: aiosqlite.Connection,
+    project_id: str,
+    title: str,
+    body: str,
+    tags: str | None = None,
+) -> dict[str, Any]:
+    """Insert a project_notes row. tags is comma-separated free-form."""
+    nid = _new_id()
+    await db.execute(
+        "INSERT INTO project_notes (id, project_id, title, body, tags) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (nid, project_id, title, body, tags),
+    )
+    await db.commit()
+    return (await get_project_note(db, nid)) or {"id": nid}
+
+
+async def get_project_note(
+    db: aiosqlite.Connection, note_id: str
+) -> dict[str, Any] | None:
+    async with db.execute(
+        "SELECT * FROM project_notes WHERE id = ?", (note_id,)
+    ) as cur:
+        row = await cur.fetchone()
+    return _row_to_dict(row)
+
+
+async def get_project_notes(
+    db: aiosqlite.Connection,
+    project_id: str,
+    tag: str | None = None,
+) -> list[dict[str, Any]]:
+    """Return notes for a project, newest first. Optional tag filter
+    matches any comma-separated tag (substring match)."""
+    if tag:
+        async with db.execute(
+            "SELECT * FROM project_notes WHERE project_id = ? "
+            "AND tags LIKE ? ORDER BY created_at DESC",
+            (project_id, f"%{tag}%"),
+        ) as cur:
+            rows = await cur.fetchall()
+    else:
+        async with db.execute(
+            "SELECT * FROM project_notes WHERE project_id = ? "
+            "ORDER BY created_at DESC",
+            (project_id,),
+        ) as cur:
+            rows = await cur.fetchall()
+    return [_row_to_dict(r) for r in rows if r is not None]  # type: ignore[misc]
+
+
+async def update_project_note(
+    db: aiosqlite.Connection,
+    note_id: str,
+    *,
+    title: str | None = None,
+    body: str | None = None,
+    tags: str | None = None,
+) -> dict[str, Any] | None:
+    """Patch any combination of title/body/tags. Returns updated row."""
+    existing = await get_project_note(db, note_id)
+    if existing is None:
+        return None
+    fields: dict[str, Any] = {}
+    if title is not None:
+        fields["title"] = title
+    if body is not None:
+        fields["body"] = body
+    if tags is not None:
+        fields["tags"] = tags
+    if not fields:
+        return existing
+    from datetime import datetime, timezone
+    fields["updated_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    set_clause = ", ".join(f"{k} = ?" for k in fields)
+    args = list(fields.values()) + [note_id]
+    await db.execute(
+        f"UPDATE project_notes SET {set_clause} WHERE id = ?", args
+    )
+    await db.commit()
+    return await get_project_note(db, note_id)
+
+
+async def delete_project_note(
+    db: aiosqlite.Connection, note_id: str
+) -> bool:
+    """Hard-delete a note. Returns True if a row was removed."""
+    async with db.execute(
+        "DELETE FROM project_notes WHERE id = ?", (note_id,)
+    ) as cur:
+        rc = cur.rowcount or 0
+    await db.commit()
+    return rc > 0
+
+
+# ---------------------------------------------------------------------------
+# v0.9 — Magic-link email auth tokens
+# ---------------------------------------------------------------------------
+
+
+async def get_active_magic_token(
+    db: aiosqlite.Connection, email: str
+) -> dict[str, Any] | None:
+    """Return the most recent unused, unexpired magic token for an email
+    (or None). Used by the rate-limit gate to avoid sending duplicates
+    when the user clicks the resend button while a valid link is in
+    their inbox."""
+    from datetime import datetime, timezone
+    now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    async with db.execute(
+        "SELECT * FROM magic_link_tokens WHERE email = ? "
+        "AND used_at IS NULL AND expires_at > ? "
+        "ORDER BY created_at DESC LIMIT 1",
+        (email.lower(), now_iso),
+    ) as cur:
+        row = await cur.fetchone()
+    return _row_to_dict(row)
+
+
+async def store_magic_token(
+    db: aiosqlite.Connection,
+    email: str,
+    token_hash: str,
+    expires_at: str,
+) -> dict[str, Any]:
+    """Persist a single-use magic-link token. ``token_hash`` is the
+    sha256 of the raw token; the raw token is shown to the user (in
+    the email) and never stored."""
+    tid = _new_id()
+    await db.execute(
+        "INSERT INTO magic_link_tokens (id, email, token_hash, expires_at) "
+        "VALUES (?, ?, ?, ?)",
+        (tid, email.lower(), token_hash, expires_at),
+    )
+    await db.commit()
+    return {"id": tid, "email": email.lower(), "expires_at": expires_at}
+
+
+async def consume_magic_token(
+    db: aiosqlite.Connection, token_hash: str
+) -> dict[str, Any] | None:
+    """Validate-and-mark-used. Returns the row when fresh; None if the
+    token doesn't exist, was already used, or has expired. Atomic so two
+    concurrent verify clicks can't both succeed."""
+    from datetime import datetime, timezone
+    now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    async with db.execute(
+        "SELECT * FROM magic_link_tokens WHERE token_hash = ?",
+        (token_hash,),
+    ) as cur:
+        row = await cur.fetchone()
+    row_dict = _row_to_dict(row)
+    if row_dict is None:
+        return None
+    if row_dict.get("used_at"):
+        return None
+    if (row_dict.get("expires_at") or "") < now_iso:
+        return None
+    await db.execute(
+        "UPDATE magic_link_tokens SET used_at = ? WHERE id = ? AND used_at IS NULL",
+        (now_iso, row_dict["id"]),
+    )
+    await db.commit()
+    return row_dict

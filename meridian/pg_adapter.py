@@ -456,6 +456,29 @@ CREATE TABLE IF NOT EXISTS hitl_requests (
 );
 CREATE INDEX IF NOT EXISTS idx_hitl_project ON hitl_requests(project_id, status);
 CREATE INDEX IF NOT EXISTS idx_hitl_assigned ON hitl_requests(assigned_to, status);
+
+-- v0.9 — project_notes: per-project wiki.
+CREATE TABLE IF NOT EXISTS project_notes (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    title TEXT NOT NULL,
+    body TEXT NOT NULL,
+    tags TEXT,
+    created_at TEXT NOT NULL DEFAULT (to_char(now() at time zone 'utc', 'YYYY-MM-DD HH24:MI:SS')),
+    updated_at TEXT NOT NULL DEFAULT (to_char(now() at time zone 'utc', 'YYYY-MM-DD HH24:MI:SS'))
+);
+CREATE INDEX IF NOT EXISTS idx_notes_project ON project_notes(project_id);
+
+-- v0.9 — magic_link_tokens: email magic-link auth flow.
+CREATE TABLE IF NOT EXISTS magic_link_tokens (
+    id TEXT PRIMARY KEY,
+    email TEXT NOT NULL,
+    token_hash TEXT NOT NULL UNIQUE,
+    used_at TEXT,
+    expires_at TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (to_char(now() at time zone 'utc', 'YYYY-MM-DD HH24:MI:SS'))
+);
+CREATE INDEX IF NOT EXISTS idx_magic_email ON magic_link_tokens(email, used_at);
 """
 
 
@@ -507,7 +530,34 @@ async def init_pg_db(url: str) -> PostgresConnection:
     await _migrate_pg_goal_field_timestamps(conn)
     await _migrate_pg_v24_task_tree_and_framework(conn)
     await _migrate_pg_v24_pinned_decisions_and_hitl(conn)
+    await _migrate_pg_v09_notes_and_magic_links(conn)
     return conn
+
+
+async def _migrate_pg_v09_notes_and_magic_links(conn: PostgresConnection) -> None:
+    """v0.9 — project_notes + magic_link_tokens on existing Postgres DBs.
+    CREATE_TABLES_PG covers fresh DBs; this is the upgrade path."""
+    await conn.executescript(
+        "CREATE TABLE IF NOT EXISTS project_notes ("
+        "    id TEXT PRIMARY KEY,"
+        "    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,"
+        "    title TEXT NOT NULL,"
+        "    body TEXT NOT NULL,"
+        "    tags TEXT,"
+        "    created_at TEXT NOT NULL DEFAULT (to_char(now() at time zone 'utc', 'YYYY-MM-DD HH24:MI:SS')),"
+        "    updated_at TEXT NOT NULL DEFAULT (to_char(now() at time zone 'utc', 'YYYY-MM-DD HH24:MI:SS'))"
+        ");"
+        "CREATE INDEX IF NOT EXISTS idx_notes_project ON project_notes(project_id);"
+        "CREATE TABLE IF NOT EXISTS magic_link_tokens ("
+        "    id TEXT PRIMARY KEY,"
+        "    email TEXT NOT NULL,"
+        "    token_hash TEXT NOT NULL UNIQUE,"
+        "    used_at TEXT,"
+        "    expires_at TEXT NOT NULL,"
+        "    created_at TEXT NOT NULL DEFAULT (to_char(now() at time zone 'utc', 'YYYY-MM-DD HH24:MI:SS'))"
+        ");"
+        "CREATE INDEX IF NOT EXISTS idx_magic_email ON magic_link_tokens(email, used_at)"
+    )
 
 
 async def _migrate_pg_v24_task_tree_and_framework(conn: PostgresConnection) -> None:

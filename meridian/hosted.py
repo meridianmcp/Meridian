@@ -241,8 +241,16 @@ body{background:#0d0d0f;color:#e8eaf0;font-family:-apple-system,BlinkMacSystemFo
 .btn:hover{opacity:.88;text-decoration:none}
 .btn-google{background:#fff;color:#3c4043}
 .btn-github{background:#24292f;color:#fff}
-.divider{display:flex;align-items:center;gap:12px;margin:8px 0 20px;color:#8b8fa8;font-size:.8rem}
+.divider{display:flex;align-items:center;gap:12px;margin:18px 0;color:#8b8fa8;font-size:.78rem;text-transform:uppercase;letter-spacing:.6px}
 .divider::before,.divider::after{content:"";flex:1;height:1px;background:#2a2d35}
+.email-form{display:flex;flex-direction:column;gap:8px}
+.email-input{width:100%;padding:12px 14px;background:#0d0d0f;border:1px solid #2a2d35;border-radius:8px;color:#e8eaf0;font-size:.95rem;outline:none;font-family:inherit}
+.email-input:focus{border-color:#6c8fff}
+.btn-email{background:#6c8fff;color:#fff;margin-bottom:0}
+.btn-email:disabled{opacity:.6;cursor:wait}
+.email-status{font-size:.82rem;color:#8b8fa8;margin-top:6px;min-height:1em;text-align:center}
+.email-status.ok{color:#4ade80}
+.email-status.err{color:#f87171}
 .footer-note{text-align:center;font-size:.78rem;color:#8b8fa8;margin-top:24px}
 .footer-note a{color:#6c8fff;text-decoration:none}
 </style>
@@ -259,11 +267,50 @@ body{background:#0d0d0f;color:#e8eaf0;font-family:-apple-system,BlinkMacSystemFo
     <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0 0 24 12c0-6.63-5.37-12-12-12z"/></svg>
     Continue with GitHub
   </a>
+  <div class="divider">or</div>
+  <form class="email-form" id="magic-form" onsubmit="event.preventDefault();sendMagic();">
+    <input type="email" class="email-input" id="magic-email" placeholder="you@example.com" autocomplete="email" required>
+    <button type="submit" class="btn btn-email" id="magic-btn">Send sign-in link →</button>
+    <div class="email-status" id="magic-status"></div>
+  </form>
   <div class="footer-note">
     By signing in you agree to our <a href="/terms">Terms of Service</a>
     and <a href="/privacy">Privacy Policy</a>.
   </div>
 </div>
+<script>
+async function sendMagic() {
+  var status = document.getElementById('magic-status');
+  var btn = document.getElementById('magic-btn');
+  var email = (document.getElementById('magic-email').value || '').trim();
+  if (!email) return;
+  status.textContent = '';
+  status.className = 'email-status';
+  btn.disabled = true;
+  btn.textContent = 'Sending…';
+  try {
+    var r = await fetch('/auth/magic', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({email: email}),
+    });
+    if (!r.ok) throw new Error('failed');
+    var j = await r.json();
+    status.className = 'email-status ok';
+    status.textContent = j.message || 'Check your inbox.';
+    if (j.dev_link) {
+      // Local dev convenience — Resend not configured, surface the link.
+      status.innerHTML += '<br><a href="' + j.dev_link + '" style="color:#6c8fff">[dev: open link]</a>';
+    }
+  } catch (e) {
+    status.className = 'email-status err';
+    status.textContent = 'Something went wrong. Try again in a moment.';
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Send sign-in link →';
+  }
+}
+</script>
 </body>
 </html>"""
 
@@ -272,6 +319,29 @@ async def auth_login(request: Request):
     """Serve the sign-in page with Google and GitHub OAuth buttons."""
     from fastapi.responses import HTMLResponse
     return HTMLResponse(_LOGIN_PAGE_HTML)
+
+
+def _post_login_redirect(tenant: dict) -> str:
+    """v0.9 — paywall check shared by Google / GitHub / magic-link auth.
+
+    Returns the target URL for the post-login redirect:
+    * ``/pricing?signup=1`` when the tenant has no Stripe customer
+      (never subscribed → must pay to access the dashboard).
+    * ``/pricing?reactivate=1`` when the tenant once had a customer
+      but is now flagged inactive (subscription cancelled / expired).
+      Conservative: we only flag this when the plan column is explicit.
+    * ``MERIDIAN_AFTER_LOGIN_URL`` (default ``/dashboard``) otherwise.
+
+    Keeps the auth callbacks symmetric — every login flow lands here so
+    adding a new provider (magic link, Microsoft, SSO) inherits paywall.
+    """
+    stripe_id = (tenant or {}).get("stripe_customer_id")
+    if not stripe_id:
+        return "/pricing?signup=1"
+    plan = (tenant or {}).get("plan") or "standard"
+    if plan in ("cancelled", "expired", "trial_expired"):
+        return "/pricing?reactivate=1"
+    return _cfg("MERIDIAN_AFTER_LOGIN_URL", "/dashboard")
 
 
 async def auth_callback(request: Request) -> RedirectResponse:
@@ -301,7 +371,7 @@ async def auth_callback(request: Request) -> RedirectResponse:
     session = await db_module.create_user_session(db, tenant["id"], expires_at)
     cookie_value = _make_session_cookie(session["id"])
 
-    redirect_to = _cfg("MERIDIAN_AFTER_LOGIN_URL", "/dashboard")
+    redirect_to = _post_login_redirect(tenant)
     response = RedirectResponse(redirect_to, status_code=302)
     response.set_cookie(
         _SESSION_COOKIE,
@@ -359,7 +429,7 @@ async def auth_github_callback(request: Request) -> RedirectResponse:
     session = await db_module.create_user_session(db, tenant["id"], expires_at)
     cookie_value = _make_session_cookie(session["id"])
 
-    redirect_to = _cfg("MERIDIAN_AFTER_LOGIN_URL", "/dashboard")
+    redirect_to = _post_login_redirect(tenant)
     response = RedirectResponse(redirect_to, status_code=302)
     response.set_cookie(
         _SESSION_COOKIE,
@@ -905,3 +975,166 @@ async def run_churn_cleanup(db: Any) -> None:
                     )
             except Exception:  # noqa: BLE001
                 pass
+
+
+# ---------------------------------------------------------------------------
+# v0.9 — Email magic-link authentication
+# ---------------------------------------------------------------------------
+
+# Per-email cooldown to stop "click resend N times" abuse. The endpoint-
+# level slowapi limit handles IP-based abuse; this catches single-IP +
+# single-email burst patterns (e.g. user accidentally double-tapping).
+_MAGIC_COOLDOWN_SECONDS = 60
+
+# Token lifetime — long enough that users coming back to their inbox the
+# next day still get a working link, short enough that lost emails don't
+# linger forever.
+_MAGIC_TTL_HOURS = 24
+
+# In-process rate limit fallback when slowapi isn't initialised (tests).
+_magic_last_send: dict[str, float] = {}
+
+
+def _magic_rate_limited(email: str) -> bool:
+    """Return True if this email got a magic link in the last cooldown
+    window. Keeps the in-process cache bounded by pruning stale entries
+    on every call."""
+    import time
+    now = time.time()
+    # Prune entries older than the cooldown so the dict doesn't grow.
+    for k, ts in list(_magic_last_send.items()):
+        if now - ts > _MAGIC_COOLDOWN_SECONDS * 4:
+            _magic_last_send.pop(k, None)
+    last = _magic_last_send.get(email.lower())
+    if last is not None and (now - last) < _MAGIC_COOLDOWN_SECONDS:
+        return True
+    _magic_last_send[email.lower()] = now
+    return False
+
+
+async def auth_magic_request(request: Request):
+    """v0.9 — POST /auth/magic.
+
+    Body: ``{"email": "..."}``. Sends a single-use magic link to the
+    supplied email via Resend. Idempotent within the active-token
+    window: if a valid unused token already exists, returns success
+    without emailing a duplicate (so spam-clicking "resend" doesn't
+    spray the inbox).
+    """
+    import secrets
+    from fastapi.responses import JSONResponse
+    from . import db as db_module
+
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="invalid json body")
+    email = (body.get("email") or "").strip().lower()
+    if not email or "@" not in email or len(email) > 320:
+        raise HTTPException(status_code=400, detail="valid email required")
+
+    if _magic_rate_limited(email):
+        # Always return 200 — don't leak whether the email is registered
+        # or whether they're rate-limited.
+        return JSONResponse(
+            {"status": "ok", "message": "check your inbox"}
+        )
+
+    db = request.app.state.db
+    # If a fresh unused token exists, reuse the side-effect (email is
+    # already in their inbox) — don't insert another row.
+    existing = await db_module.get_active_magic_token(db, email)
+    if existing is not None:
+        return JSONResponse({"status": "ok", "message": "check your inbox"})
+
+    raw = secrets.token_urlsafe(32)
+    token_hash = hashlib.sha256(raw.encode()).hexdigest()
+    expires_at = (
+        datetime.now(timezone.utc) + timedelta(hours=_MAGIC_TTL_HOURS)
+    ).strftime("%Y-%m-%d %H:%M:%S")
+    await db_module.store_magic_token(db, email, token_hash, expires_at)
+
+    base = _cfg("MERIDIAN_BASE_URL", "http://localhost:7878") or "http://localhost:7878"
+    link = f"{base.rstrip('/')}/auth/magic/verify?token={raw}"
+
+    sent = False
+    resend_key = os.environ.get("RESEND_API_KEY", "")
+    if resend_key:
+        try:
+            import resend  # type: ignore[import]
+            resend.api_key = resend_key
+            resend.Emails.send(
+                {
+                    "from": os.environ.get(
+                        "MERIDIAN_FROM_EMAIL",
+                        "Meridian <hello@usemeridian.us>",
+                    ),
+                    "to": [email],
+                    "subject": "Sign in to Meridian",
+                    "html": (
+                        f"<p>Click below to sign in to Meridian:</p>"
+                        f"<p><a href='{link}'>{link}</a></p>"
+                        f"<p>Single-use link. Expires in {_MAGIC_TTL_HOURS} hours.</p>"
+                        f"<p style='color:#888;font-size:12px;margin-top:24px'>"
+                        f"If you didn't request this, you can safely ignore it.</p>"
+                    ),
+                }
+            )
+            sent = True
+        except Exception:  # noqa: BLE001 — never reveal Resend errors
+            sent = False
+
+    payload: dict[str, Any] = {
+        "status": "ok",
+        "message": "check your inbox" if sent else (
+            "magic link generated (email delivery unavailable — check server logs for the URL)"
+        ),
+    }
+    # When Resend isn't configured (local dev), surface the link so the
+    # tester can click through. Never do this in production.
+    if not sent and not resend_key and os.environ.get("MERIDIAN_HOSTED", "").lower() not in ("1", "true", "yes"):
+        payload["dev_link"] = link
+    return JSONResponse(payload)
+
+
+async def auth_magic_verify(request: Request, token: str = ""):
+    """v0.9 — GET /auth/magic/verify?token=xxx.
+
+    Validates the token (single-use, unexpired), upserts the tenant for
+    that email, creates a session, sets the cookie, and redirects via
+    the shared _post_login_redirect — paywall gate applies symmetrically
+    to magic-link sign-ups.
+    """
+    from . import db as db_module
+
+    raw = (token or "").strip()
+    if not raw:
+        raise HTTPException(status_code=400, detail="missing token")
+    token_hash = hashlib.sha256(raw.encode()).hexdigest()
+
+    db = request.app.state.db
+    row = await db_module.consume_magic_token(db, token_hash)
+    if row is None:
+        # Don't reveal whether expired vs used vs nonexistent.
+        raise HTTPException(status_code=401, detail="link expired or already used")
+
+    email = row["email"]
+    tenant = await db_module.upsert_tenant(db, email=email)
+
+    expires_at = (
+        datetime.now(timezone.utc) + timedelta(hours=_SESSION_MAX_AGE_HOURS)
+    ).isoformat()
+    session = await db_module.create_user_session(db, tenant["id"], expires_at)
+    cookie_value = _make_session_cookie(session["id"])
+
+    redirect_to = _post_login_redirect(tenant)
+    response = RedirectResponse(redirect_to, status_code=302)
+    response.set_cookie(
+        _SESSION_COOKIE,
+        cookie_value,
+        httponly=True,
+        secure=_cfg("MERIDIAN_BASE_URL", "").startswith("https://"),
+        samesite="lax",
+        max_age=_SESSION_MAX_AGE_HOURS * 3600,
+    )
+    return response

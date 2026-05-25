@@ -523,6 +523,7 @@ function buildTabBody(project) {
       <button class="vtab-btn" data-vtab="rewind" title="Rewind — Last X days">↻</button>
       <button class="vtab-btn" data-vtab="queue" title="Work Queue">⚙</button>
       <button class="vtab-btn" data-vtab="team" title="Team — per-human activity">👥</button>
+      <button class="vtab-btn" data-vtab="notes" title="Notes — per-project wiki">📝</button>
     </div>
     <div class="vtab-drawer open" id="drawer-${project.id}">
       <div class="drawer-panel active" id="drawer-status-${project.id}">
@@ -703,6 +704,25 @@ function buildTabBody(project) {
           <div class="empty" style="color:var(--muted)">select queue to load</div>
         </div>
       </div>
+      <div class="drawer-panel" id="drawer-notes-${project.id}">
+        <div class="drawer-header" style="justify-content:space-between">
+          <span>NOTES · ${escapeHtml(project.name)}</span>
+          <input type="text" id="notes-tag-${project.id}" placeholder="filter by tag…" style="background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:2px 6px;width:120px">
+        </div>
+        <div style="flex:1;overflow-y:auto;padding:14px;font-family:'IBM Plex Mono',monospace;font-size:12px" id="notes-body-${project.id}">
+          <div class="empty" style="color:var(--muted)">loading notes…</div>
+        </div>
+        <div style="flex-shrink:0;padding:10px 14px;border-top:1px solid var(--border);background:var(--surface-2)">
+          <div style="display:flex;gap:6px;margin-bottom:6px">
+            <input type="text" id="notes-add-title-${project.id}" placeholder="Title" style="flex:1;background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:11px;font-family:var(--font-mono);padding:5px 8px;outline:none">
+            <input type="text" id="notes-add-tags-${project.id}" placeholder="tags (comma-sep)" style="width:140px;background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:11px;font-family:var(--font-mono);padding:5px 8px;outline:none">
+          </div>
+          <textarea id="notes-add-body-${project.id}" placeholder="Body (markdown ok)" rows="3" style="width:100%;background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:11px;font-family:var(--font-mono);padding:6px 8px;outline:none;resize:vertical"></textarea>
+          <div style="display:flex;justify-content:flex-end;margin-top:6px">
+            <button class="primary" id="notes-add-btn-${project.id}" style="padding:4px 12px;font-size:11px">+ Add note</button>
+          </div>
+        </div>
+      </div>
       <div class="drawer-panel" id="drawer-team-${project.id}">
         <div class="drawer-header" style="justify-content:space-between">
           <span>TEAM · ${escapeHtml(project.name)}</span>
@@ -807,6 +827,7 @@ function buildTabBody(project) {
         if (vtab === 'queue') loadQueue(project.id);
         if (vtab === 'live') loadLiveTab(project.id);
         if (vtab === 'team') loadTeamTab(project.id);
+        if (vtab === 'notes') loadNotesTab(project.id);
       };
     });
   }
@@ -1185,8 +1206,14 @@ function renderSprintProgress(projectId, items) {
   const total = items.length;
   const done = items.filter(i => i.status === 'done').length;
   const pct = total > 0 ? Math.round((done / total) * 100) : 0;
+  // v0.9 — color-code completion: gray (0 done), amber (some), green (all).
+  // One CSS variable; no backend change. Communicates "we've started" vs
+  // "we're nearly there" at a glance during standup.
+  const pctColor = (done === 0)
+    ? 'var(--muted)'
+    : (done === total ? 'var(--accent-green)' : '#fbbf24');
   html += `<div class="sprint-footer">
-    <span class="sprint-pct">${done}/${total} · ${pct}%</span>
+    <span class="sprint-pct" style="color:${pctColor};font-weight:600">${done}/${total} · ${pct}%</span>
     <div class="sprint-add-row">
       <input class="live-add-input" id="sprint-add-input-${projectId}"
              placeholder="version:title  or  just title" style="flex:1">
@@ -1681,6 +1708,92 @@ function _colorForHuman(humanId) {
   return _HUMAN_COLORS[Math.abs(h) % _HUMAN_COLORS.length];
 }
 
+async function loadNotesTab(projectId) {
+  /** v0.9 — load + render the per-project notes wiki.
+   *
+   * Plain list (no thread / no goal hierarchy). Title, body, tag pills,
+   * delete button per note. Adds wire to the [+ Add] button at the
+   * bottom of the drawer. Tag filter reloads with `?tag=` substring.
+   */
+  const body = document.getElementById(`notes-body-${projectId}`);
+  const tagFilter = document.getElementById(`notes-tag-${projectId}`);
+  const addTitle = document.getElementById(`notes-add-title-${projectId}`);
+  const addBody = document.getElementById(`notes-add-body-${projectId}`);
+  const addTags = document.getElementById(`notes-add-tags-${projectId}`);
+  const addBtn = document.getElementById(`notes-add-btn-${projectId}`);
+  if (!body) return;
+
+  const render = async () => {
+    body.innerHTML = `<div class="empty" style="color:var(--muted)">loading notes…</div>`;
+    const tag = (tagFilter && tagFilter.value || '').trim();
+    const qs = tag ? `?tag=${encodeURIComponent(tag)}` : '';
+    try {
+      const notes = await api(`/projects/${projectId}/notes${qs}`);
+      if (!notes || notes.length === 0) {
+        body.innerHTML = `<div style="color:var(--muted);padding:10px;text-align:center;border:1px dashed var(--border);border-radius:4px">
+          (no notes yet — use the form below or <code>add_note</code> MCP tool)
+        </div>`;
+        return;
+      }
+      body.innerHTML = notes.map(n => {
+        const tags = (n.tags || '').split(',').map(t => t.trim()).filter(Boolean);
+        const pills = tags.map(t =>
+          `<span style="display:inline-block;background:var(--accent)22;color:var(--accent);font-size:9px;font-weight:600;padding:1px 6px;border-radius:3px;margin-right:4px">${escapeHtml(t)}</span>`
+        ).join('');
+        const dt = (n.created_at || '').slice(0, 10);
+        return `<div style="background:var(--surface-2);border:1px solid var(--border);border-left:3px solid var(--accent);border-radius:0 4px 4px 0;padding:10px 12px;margin-bottom:8px">
+          <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:6px">
+            <div style="display:flex;align-items:center;gap:8px;min-width:0;flex:1">
+              <span style="color:var(--accent);font-weight:600;font-size:12px">${escapeHtml(n.title || '')}</span>
+              <span style="color:var(--muted);font-size:10px">${escapeHtml(dt)}</span>
+            </div>
+            <button class="secondary notes-del-btn" data-note-id="${escapeHtml(n.id)}" style="padding:1px 8px;font-size:10px">Delete</button>
+          </div>
+          <div style="margin-bottom:6px">${pills}</div>
+          <div style="color:var(--text);white-space:pre-wrap;word-break:break-word;line-height:1.5;font-size:12px">${escapeHtml(n.body || '')}</div>
+        </div>`;
+      }).join('');
+      body.querySelectorAll('.notes-del-btn').forEach(btn => {
+        btn.onclick = async () => {
+          if (!confirm('Delete this note?')) return;
+          try {
+            const r = await fetch(`/projects/${projectId}/notes/${btn.dataset.noteId}`, { method: 'DELETE' });
+            if (!r.ok) throw new Error(`${r.status}`);
+            toast('note deleted');
+            render();
+          } catch (e) { toast('delete failed: ' + e.message, true); }
+        };
+      });
+    } catch (e) {
+      body.innerHTML = `<div style="color:var(--muted)">failed to load notes: ${escapeHtml(String(e))}</div>`;
+    }
+  };
+
+  if (tagFilter) {
+    let t = null;
+    tagFilter.oninput = () => { clearTimeout(t); t = setTimeout(render, 250); };
+  }
+  if (addBtn) addBtn.onclick = async () => {
+    const title = (addTitle && addTitle.value || '').trim();
+    const text = (addBody && addBody.value || '').trim();
+    const tags = (addTags && addTags.value || '').trim();
+    if (!title || !text) { toast('title and body required', true); return; }
+    try {
+      await api(`/projects/${projectId}/notes`, {
+        method: 'POST',
+        body: JSON.stringify({ title, body: text, tags: tags || undefined }),
+      });
+      if (addTitle) addTitle.value = '';
+      if (addBody) addBody.value = '';
+      if (addTags) addTags.value = '';
+      toast('note added');
+      render();
+    } catch (e) { toast('add failed: ' + e.message, true); }
+  };
+
+  render();
+}
+
 async function loadTeamTab(projectId) {
   /** v2.4 — Team tab: per-human presence cards + standup digest +
    * swimlane timeline. Pulls /team/summary?project_id=&days=N once per
@@ -2045,10 +2158,13 @@ async function refreshGoal(projectId) {
     }
     v.textContent = `v${goal.version}`;
     // v0.5.2 — north star and sprint textareas
+    // v0.9 — guard against partial responses: only overwrite when the
+    // server returned an explicit value (string or null). undefined
+    // means "field absent from this response" — keep what the user has.
     const nsTA = document.getElementById(`goal-north-star-${projectId}`);
     const spTA = document.getElementById(`goal-sprint-${projectId}`);
-    if (nsTA) nsTA.value = goal.north_star || '';
-    if (spTA) spTA.value = goal.sprint || '';
+    if (nsTA && 'north_star' in goal) nsTA.value = goal.north_star || '';
+    if (spTA && 'sprint' in goal) spTA.value = goal.sprint || '';
     // v0.6.4 — store server values for dirty tracking; clear dirty state
     const p = state.panels[projectId];
     p._serverNorthStar = goal.north_star || '';
