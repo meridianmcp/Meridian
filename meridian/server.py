@@ -24,13 +24,19 @@ from pathlib import Path
 # Version — read from pixi.toml so it never goes stale
 # ---------------------------------------------------------------------------
 def _read_version() -> str:
+    # 1. Explicit env var (set in Dockerfile or fly secrets)
+    v = os.environ.get("MERIDIAN_VERSION", "")
+    if v:
+        return v
+    # 2. pixi.toml at repo root (local dev)
     try:
-        import tomllib  # Python 3.11+
+        import tomllib
         _root = Path(__file__).parent.parent
         with open(_root / "pixi.toml", "rb") as _f:
-            return tomllib.load(_f).get("workspace", {}).get("version", "dev")
+            data = tomllib.load(_f)
+            return data.get("workspace", {}).get("version", "") or data.get("version", "dev")
     except Exception:
-        return "dev"
+        return "1.0.0-beta"
 
 _VERSION = _read_version()
 
@@ -518,7 +524,9 @@ async def lifespan(app: FastAPI):
     async def _init_demo(url: str) -> None:
         demo_db = await db_module.init_db(url)
         app.state.demo_db = demo_db
-        await _seed_demo_data(demo_db)
+        # Skip seeding when using an external Postgres demo DB —
+        # it was seeded manually via scripts/seed_demo.py
+        # Only seed in-memory SQLite fallback
 
     async def _init_demo_inmemory() -> None:
         demo_db = await db_module.init_db(":memory:")
