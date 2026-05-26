@@ -6,6 +6,7 @@ All notable changes to Meridian. Generated from git history via `git-cliff`.
 
 ### Bug Fixes
 
+- Fix: encoding artifacts in terms.html and privacy.html ([04ca0ee](https://github.com/meridianmcp/Meridian/commit/04ca0eebeae2532a2ae80337575a154d7c421b0e))
 - Fix: GitHub OAuth — add github_sub column, fix upsert_tenant to use github_sub not google_sub ([cbdd056](https://github.com/meridianmcp/Meridian/commit/cbdd056605ad59f270d0d4fcbcd474c82e065f64))
 - Fix: exempt /mcp/tools-doc from site password gate so docs workflow fetches real content ([c537d1b](https://github.com/meridianmcp/Meridian/commit/c537d1b82fb39306f4c303b75dae9863dcaaff76))
 - Fix: changelog step use pip install git-cliff not broken Docker action ([de6b988](https://github.com/meridianmcp/Meridian/commit/de6b988ad62e78815378352d20b5b8459f9de155))
