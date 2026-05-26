@@ -776,7 +776,7 @@ async def site_password_gate(request: Request, call_next):
     if not site_pw:
         return await call_next(request)
     path = request.url.path
-    if path in ("/health", "/mcp/health", "/__gate__", "/config", "/static") or path.startswith("/static/") or path == "/demo" or path.startswith("/demo/"):
+    if path in ("/health", "/mcp/health", "/__gate__", "/config", "/static", "/mcp/tools-doc") or path.startswith("/static/") or path == "/demo" or path.startswith("/demo/"):
         return await call_next(request)
     # Demo cookie bypasses site password gate — demo users don't go through __gate__
     if request.cookies.get(_DEMO_CONTEXT_COOKIE):
