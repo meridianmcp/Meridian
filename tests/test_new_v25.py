@@ -1481,3 +1481,95 @@ def test_sessions_list_returns_registered(client):
     assert r.status_code == 200
     names = {s["name"] for s in r.json()}
     assert "new-sess" in names
+
+
+# ---------------------------------------------------------------------------
+# Account: export + delete (self-hosted = 404, db functions work)
+# ---------------------------------------------------------------------------
+
+
+def test_export_my_data_404_self_hosted(client):
+    """/export/my-data returns 404 in self-hosted mode."""
+    r = client.get("/export/my-data")
+    assert r.status_code == 404
+
+
+def test_delete_account_404_self_hosted(client):
+    """/account/delete returns 404 in self-hosted mode."""
+    r = client.post("/account/delete", json={"confirmation": "DELETE"})
+    assert r.status_code == 404
+
+
+@pytest.mark.anyio
+async def test_export_tenant_data_returns_structure():
+    """export_tenant_data returns expected top-level keys."""
+    db = await db_module.init_db(":memory:")
+    proj = await db_module.create_project(db, "export-proj")
+    sess = await db_module.register_session(db, proj["id"], "s")
+    await db_module.log_task(db, sess["id"], proj["id"], "task 1")
+
+    # Create a minimal tenant row
+    import uuid
+    tid = str(uuid.uuid4())
+    await db.execute(
+        "INSERT INTO tenants (id, email, plan) VALUES (?, ?, ?)",
+        (tid, "export@example.com", "standard"),
+    )
+    await db.commit()
+
+    data = await db_module.export_tenant_data(db, tid)
+
+    assert "exported_at" in data
+    assert data["tenant"]["email"] == "export@example.com"
+    assert isinstance(data["api_tokens"], list)
+    assert isinstance(data["workspace_members"], list)
+    assert isinstance(data["projects"], list)
+    # The project we created should appear
+    proj_ids = [p["id"] for p in data["projects"]]
+    assert proj["id"] in proj_ids
+
+
+@pytest.mark.anyio
+async def test_delete_tenant_records_removes_rows():
+    """delete_tenant_records removes user_sessions, api_tokens, workspace_members, and tenant."""
+    db = await db_module.init_db(":memory:")
+    import uuid
+    tid = str(uuid.uuid4())
+    await db.execute(
+        "INSERT INTO tenants (id, email, plan) VALUES (?, ?, ?)",
+        (tid, "del@example.com", "standard"),
+    )
+    # Insert a session and token
+    from datetime import datetime, timezone, timedelta
+    expires = (datetime.now(timezone.utc) + timedelta(days=1)).isoformat()
+    await db.execute(
+        "INSERT INTO user_sessions (id, tenant_id, expires_at) VALUES (?, ?, ?)",
+        (str(uuid.uuid4()), tid, expires),
+    )
+    await db.execute(
+        "INSERT INTO api_tokens (id, tenant_id, token_hash, label) VALUES (?, ?, ?, ?)",
+        (str(uuid.uuid4()), tid, "fakehash", "test"),
+    )
+    await db.commit()
+
+    await db_module.delete_tenant_records(db, tid)
+
+    async with db.execute("SELECT COUNT(*) FROM tenants WHERE id = ?", (tid,)) as cur:
+        row = await cur.fetchone()
+    assert row[0] == 0
+
+    async with db.execute("SELECT COUNT(*) FROM user_sessions WHERE tenant_id = ?", (tid,)) as cur:
+        row = await cur.fetchone()
+    assert row[0] == 0
+
+    async with db.execute("SELECT COUNT(*) FROM api_tokens WHERE tenant_id = ?", (tid,)) as cur:
+        row = await cur.fetchone()
+    assert row[0] == 0
+
+
+def test_dashboard_js_has_export_button():
+    """dashboard.js contains the export download link."""
+    from pathlib import Path
+    js = (Path(__file__).parent.parent / "meridian/static/dashboard.js").read_text(encoding="utf-8")
+    assert "/export/my-data" in js
+    assert "Delete my account" in js

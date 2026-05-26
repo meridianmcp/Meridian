@@ -1568,9 +1568,12 @@ async def add_sprint_item_endpoint(
         )
     group = body.get("group") or body.get("item_group") or None
     human_id = body.get("human_id") or None
+    depends_on = body.get("depends_on") or None
+    failure_mode = body.get("failure_mode") or None
     return await db_module.add_sprint_item(
         _db(request), project_id, version, title,
         group=group, human_id=human_id,
+        depends_on=depends_on, failure_mode=failure_mode,
     )
 
 
@@ -2363,7 +2366,9 @@ async def get_project_context(
     if project is None:
         raise HTTPException(status_code=404, detail="project not found")
     goal = await db_module.get_goal(_db(request), project_id)
-    sprint_items = await db_module.get_sprint_items(_db(request), project_id, status="pending")
+    sprint_items = await db_module.get_sprint_items(
+        _db(request), project_id, status="pending", show_blocked=False
+    )
     all_tasks = await db_module.get_tasks(_db(request), project_id, limit=20)
     pending_tasks = [t for t in all_tasks if t["status"] in ("pending", "in_progress")][:10]
     sessions = await db_module.get_sessions(_db(request), project_id, active_only=True)
@@ -3201,6 +3206,54 @@ async def workspace_remove_member(request: Request, member_id: str) -> None:
     from .hosted import get_current_tenant
     tenant = await get_current_tenant(request)
     await db_module.delete_workspace_member(_db(request), member_id, tenant["id"])
+
+
+@app.get("/export/my-data")
+async def export_my_data(request: Request) -> Response:
+    """GDPR data portability — returns a JSON file of all account data."""
+    if not _hosted_mode():
+        raise HTTPException(status_code=404)
+    from .hosted import get_current_tenant
+    tenant = await get_current_tenant(request)
+    data = await db_module.export_tenant_data(_db(request), tenant["id"])
+    payload = json.dumps(data, indent=2, default=str).encode()
+    email_slug = (tenant.get("email") or "user").split("@")[0][:20]
+    filename = f"meridian-export-{email_slug}.json"
+    return Response(
+        content=payload,
+        media_type="application/json",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@app.post("/account/delete")
+async def delete_account(request: Request) -> Response:
+    """Self-service account deletion. Requires JSON body: {\"confirmation\": \"DELETE\"}."""
+    if not _hosted_mode():
+        raise HTTPException(status_code=404)
+    from .hosted import get_current_tenant, cancel_stripe_subscription, _drop_tenant_neon_database, send_account_deleted_email
+    from fastapi.responses import JSONResponse
+    tenant = await get_current_tenant(request)
+    body = await request.json()
+    if body.get("confirmation") != "DELETE":
+        raise HTTPException(status_code=400, detail="Type DELETE to confirm account deletion.")
+
+    stripe_id = tenant.get("stripe_customer_id")
+    if stripe_id:
+        await cancel_stripe_subscription(stripe_id)
+
+    if tenant.get("neon_project_id"):
+        asyncio.create_task(_drop_tenant_neon_database(tenant))
+
+    email = tenant.get("email", "")
+    await db_module.delete_tenant_records(_db(request), tenant["id"])
+
+    if email:
+        asyncio.create_task(send_account_deleted_email(email))
+
+    resp = JSONResponse({"deleted": True})
+    resp.delete_cookie("meridian_session")
+    return resp
 
 
 @app.get("/settings/mcp-config")
@@ -4918,7 +4971,9 @@ def build_mcp_server():
                     "a new version so the next session sees what's in flight. "
                     "Optional: group items under a named objective with "
                     "'group'; attribute the item to a person with 'human_id'. "
-                    "Returns the new item."
+                    "Use 'depends_on' to block this item until another item "
+                    "finishes; 'failure_mode=stop' stops the chain if the "
+                    "parent fails. Returns the new item."
                 ),
                 inputSchema={
                     "type": "object",
@@ -4936,6 +4991,15 @@ def build_mcp_server():
                         "human_id": {
                             "type": "string",
                             "description": "Optional: person this item is assigned to.",
+                        },
+                        "depends_on": {
+                            "type": "string",
+                            "description": "Sprint item id that must complete before this item is claimable.",
+                        },
+                        "failure_mode": {
+                            "type": "string",
+                            "enum": ["continue", "stop"],
+                            "description": "'stop' blocks this item if the parent fails. Default: 'continue'.",
                         },
                     },
                     "required": ["project_id", "version", "title"],
@@ -5423,6 +5487,8 @@ def build_mcp_server():
                     arguments["title"],
                     group=arguments.get("group"),
                     human_id=arguments.get("human_id"),
+                    depends_on=arguments.get("depends_on"),
+                    failure_mode=arguments.get("failure_mode"),
                 )
             elif name == "complete_sprint_item":
                 item = await db_module.complete_sprint_item(

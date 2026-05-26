@@ -540,6 +540,20 @@ async def _migrate_v25_feedback_and_notifications(db: aiosqlite.Connection) -> N
     )
 
 
+async def _migrate_sprint_item_dependencies(db: aiosqlite.Connection) -> None:
+    """v2.6 — sprint_items dependency tracking.
+
+    depends_on: foreign key to parent sprint item (NULL = no dependency).
+    failure_mode: what to do when depends_on item has failed.
+      'continue' (default) — this item can still be claimed.
+      'stop' — this item is blocked when the parent has failed.
+    """
+    await _migrate_add_column_if_missing(db, "sprint_items", "depends_on", "TEXT")
+    await _migrate_add_column_if_missing(
+        db, "sprint_items", "failure_mode", "TEXT NOT NULL DEFAULT 'continue'"
+    )
+
+
 async def _migrate_v09_notes_and_magic_links(db: aiosqlite.Connection) -> None:
     """v0.9 — project_notes (per-project wiki) + magic_link_tokens
     (email magic-link auth). Both new in v0.9; idempotent CREATE."""
@@ -979,6 +993,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_v24_pinned_decisions_and_hitl(db)
     await _migrate_v09_notes_and_magic_links(db)
     await _migrate_v25_feedback_and_notifications(db)
+    await _migrate_sprint_item_dependencies(db)
     return db
 
 
@@ -2239,19 +2254,28 @@ async def add_sprint_item(
     title: str,
     group: str | None = None,
     human_id: str | None = None,
+    depends_on: str | None = None,
+    failure_mode: str | None = None,
 ) -> dict[str, Any]:
     """Append a new ``todo`` sprint item to a project's checklist.
 
     ``group`` (stored as ``item_group``) lets items be organised under
     named objectives so the dashboard sprint board can render them in
     logical clusters. ``human_id`` attributes the item to a person.
+    ``depends_on`` is the id of a parent sprint item that must be done
+    before this item is surfaced as claimable. ``failure_mode`` controls
+    what happens when the parent has failed: 'continue' (default) allows
+    this item to proceed; 'stop' blocks it.
     """
+    if failure_mode not in (None, "continue", "stop"):
+        raise ValueError("failure_mode must be 'continue' or 'stop'")
     iid = _new_id()
     await db.execute(
         "INSERT INTO sprint_items "
-        "(id, project_id, version, title, item_group, human_id) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
-        (iid, project_id, version, title, group, human_id),
+        "(id, project_id, version, title, item_group, human_id, depends_on, failure_mode) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (iid, project_id, version, title, group, human_id,
+         depends_on, failure_mode or "continue"),
     )
     await db.commit()
     item = await get_sprint_item(db, iid)
@@ -2421,11 +2445,16 @@ async def get_sprint_items(
     db: aiosqlite.Connection,
     project_id: str,
     status: str | None = None,
+    show_blocked: bool = True,
 ) -> list[dict[str, Any]]:
     """List sprint items for a project, oldest first.
 
     ``status`` filter is optional. ``None`` returns everything so the
     dashboard can render the full timeline.
+
+    ``show_blocked=False`` hides items whose ``depends_on`` parent is not
+    yet in a terminal state (done/skipped/failed/pushed), or whose parent
+    has failed while the item has ``failure_mode='stop'``.
     """
     if status is not None:
         if status not in _VALID_SPRINT_STATUSES:
@@ -2446,7 +2475,35 @@ async def get_sprint_items(
         params = (project_id,)
     async with db.execute(query, params) as cur:
         rows = await cur.fetchall()
-    return [_row_to_dict(r) for r in rows]  # type: ignore[misc]
+    items = [_row_to_dict(r) for r in rows]  # type: ignore[misc]
+    if show_blocked:
+        return items
+    # Build status lookup for dependency filtering
+    _terminal = {"done", "skipped", "failed", "pushed"}
+    by_id = {it["id"]: it for it in items}
+    # Fetch any parents not in this result set (e.g. filtered by status)
+    all_statuses: dict[str, str] = {it["id"]: it["status"] for it in items}
+    missing_parents = {
+        it["depends_on"] for it in items
+        if it.get("depends_on") and it["depends_on"] not in all_statuses
+    }
+    for parent_id in missing_parents:
+        parent = await get_sprint_item(db, parent_id)
+        if parent:
+            all_statuses[parent["id"]] = parent["status"]
+    result = []
+    for it in items:
+        pid = it.get("depends_on")
+        if not pid:
+            result.append(it)
+            continue
+        parent_status = all_statuses.get(pid, "")
+        if parent_status not in _terminal:
+            continue  # blocked: parent not finished
+        if parent_status == "failed" and it.get("failure_mode") == "stop":
+            continue  # chain stopped
+        result.append(it)
+    return result
 
 
 async def get_goal_field_ages(
@@ -4250,3 +4307,107 @@ async def delete_workspace_member(
     )
     await db.commit()
     return True
+
+
+# ---------------------------------------------------------------------------
+# GDPR / account management
+# ---------------------------------------------------------------------------
+
+async def export_tenant_data(
+    db: aiosqlite.Connection,
+    tenant_id: str,
+) -> dict[str, Any]:
+    """Collect all data belonging to a tenant as a plain dict for GDPR export."""
+    from datetime import datetime, timezone
+
+    async with db.execute(
+        "SELECT id, email, google_sub, microsoft_sub, plan, created_at FROM tenants WHERE id = ?",
+        (tenant_id,),
+    ) as cur:
+        tenant_row = await cur.fetchone()
+    tenant_data = _row_to_dict(tenant_row) if tenant_row else {}
+
+    async with db.execute(
+        "SELECT id, label, created_at FROM api_tokens WHERE tenant_id = ?",
+        (tenant_id,),
+    ) as cur:
+        tokens = [_row_to_dict(r) for r in await cur.fetchall()]
+
+    async with db.execute(
+        "SELECT id, email, role, invited_at, joined_at FROM workspace_members WHERE tenant_id = ?",
+        (tenant_id,),
+    ) as cur:
+        members = [_row_to_dict(r) for r in await cur.fetchall()]
+
+    async with db.execute(
+        "SELECT id, name, creator_human_id, created_at FROM projects ORDER BY created_at DESC",
+    ) as cur:
+        project_rows = await cur.fetchall()
+
+    projects = []
+    for pr in project_rows:
+        p = _row_to_dict(pr)
+        pid = p["id"]
+
+        async with db.execute(
+            "SELECT content, goal_north_star, goal_sprint, version, updated_at FROM goal_states WHERE project_id = ?",
+            (pid,),
+        ) as cur:
+            goals = [_row_to_dict(r) for r in await cur.fetchall()]
+
+        async with db.execute(
+            "SELECT id, name, human_id, status, created_at FROM sessions WHERE project_id = ? ORDER BY created_at DESC LIMIT 100",
+            (pid,),
+        ) as cur:
+            sessions = [_row_to_dict(r) for r in await cur.fetchall()]
+
+        async with db.execute(
+            "SELECT id, session_id, description, status, created_at FROM task_log WHERE project_id = ? ORDER BY created_at DESC LIMIT 200",
+            (pid,),
+        ) as cur:
+            tasks = [_row_to_dict(r) for r in await cur.fetchall()]
+
+        async with db.execute(
+            "SELECT id, version, title, status, item_group FROM sprint_items WHERE project_id = ?",
+            (pid,),
+        ) as cur:
+            sprint = [_row_to_dict(r) for r in await cur.fetchall()]
+
+        try:
+            async with db.execute(
+                "SELECT id, title, body, tags, created_at FROM project_notes WHERE project_id = ?",
+                (pid,),
+            ) as cur:
+                notes = [_row_to_dict(r) for r in await cur.fetchall()]
+        except Exception:
+            notes = []
+
+        p["goal_states"] = goals
+        p["sessions"] = sessions
+        p["tasks"] = tasks
+        p["sprint_items"] = sprint
+        p["notes"] = notes
+        projects.append(p)
+
+    return {
+        "exported_at": datetime.now(timezone.utc).isoformat(),
+        "tenant": tenant_data,
+        "api_tokens": tokens,
+        "workspace_members": members,
+        "projects": projects,
+    }
+
+
+async def delete_tenant_records(
+    db: aiosqlite.Connection,
+    tenant_id: str,
+) -> None:
+    """Remove all records for a tenant from the main DB. Irreversible."""
+    for stmt, params in [
+        ("DELETE FROM user_sessions WHERE tenant_id = ?", (tenant_id,)),
+        ("DELETE FROM api_tokens WHERE tenant_id = ?", (tenant_id,)),
+        ("DELETE FROM workspace_members WHERE tenant_id = ?", (tenant_id,)),
+        ("DELETE FROM tenants WHERE id = ?", (tenant_id,)),
+    ]:
+        await db.execute(stmt, params)
+    await db.commit()

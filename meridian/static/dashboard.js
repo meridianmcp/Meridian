@@ -2134,6 +2134,44 @@ async function loadSettingsTab(projectId) {
     }, 0);
   }
 
+  // Account section (hosted mode only)
+  if (mcpData) {
+    html += `<div style="margin-bottom:16px">
+      <div style="color:var(--accent);font-size:10px;letter-spacing:.06em;text-transform:uppercase;margin-bottom:10px;padding-bottom:4px;border-bottom:1px solid var(--border)">Account</div>
+      <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:12px">
+        <a href="/export/my-data" download style="background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:4px 10px;text-decoration:none;cursor:pointer">Export my data</a>
+        <span style="font-size:10px;color:var(--muted)">Download a JSON file of all your account data (GDPR).</span>
+      </div>
+      <div style="border:1px solid #7f1d1d;border-radius:4px;padding:10px;background:#1a0a0a">
+        <div style="color:#f87171;font-size:10px;letter-spacing:.06em;text-transform:uppercase;margin-bottom:6px">Danger zone</div>
+        <div style="font-size:10px;color:#9ca3af;margin-bottom:8px">Permanently delete your account, cancel your subscription, and erase all data. Cannot be undone.</div>
+        <button id="delete-account-btn-${projectId}" style="background:#7f1d1d;color:#fca5a5;border:1px solid #991b1b;border-radius:3px;padding:4px 12px;font-size:10px;font-family:var(--font-mono);cursor:pointer">Delete my account</button>
+        <div id="delete-account-status-${projectId}" style="font-size:10px;color:var(--muted);margin-top:5px;min-height:14px"></div>
+      </div>
+    </div>`;
+
+    setTimeout(() => {
+      const deleteBtn = document.getElementById(`delete-account-btn-${projectId}`);
+      const deleteStatus = document.getElementById(`delete-account-status-${projectId}`);
+      if (!deleteBtn) return;
+      deleteBtn.onclick = async () => {
+        const typed = prompt('Export your data first. Then type DELETE to permanently delete your account:');
+        if (typed !== 'DELETE') return;
+        if (!confirm('Final confirmation: your Stripe subscription will be cancelled and all data erased. Continue?')) return;
+        deleteBtn.disabled = true;
+        deleteBtn.textContent = 'Deleting…';
+        try {
+          await api('/account/delete', { method: 'POST', body: JSON.stringify({ confirmation: 'DELETE' }) });
+          window.location.href = '/';
+        } catch(e) {
+          if (deleteStatus) deleteStatus.textContent = `Error: ${escapeHtml(String(e))}`;
+          deleteBtn.disabled = false;
+          deleteBtn.textContent = 'Delete my account';
+        }
+      };
+    }, 0);
+  }
+
   // Notifications section
   if (prefs !== null) {
     html += `<div style="margin-bottom:12px">

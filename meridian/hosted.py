@@ -1033,6 +1033,85 @@ async def send_invite_email(
         resp.raise_for_status()
 
 
+async def cancel_stripe_subscription(stripe_customer_id: str) -> None:
+    """Cancel all active Stripe subscriptions for a customer immediately. Best-effort."""
+    api_key = _cfg("STRIPE_API_KEY", "")
+    if not api_key:
+        return
+    try:
+        import stripe  # type: ignore[import]
+        stripe.api_key = api_key
+        subs = stripe.Subscription.list(customer=stripe_customer_id, status="active", limit=10)
+        for sub in subs.auto_paging_iter():
+            stripe.Subscription.cancel(sub.id)
+    except Exception:
+        pass
+
+
+async def _drop_tenant_neon_database(tenant: dict[str, Any]) -> None:
+    """Drop the customer's database within their pool Neon project. Best-effort."""
+    import httpx
+    neon_project_id = tenant.get("neon_project_id")
+    if not neon_project_id:
+        return
+    plan = tenant.get("plan", "standard")
+    try:
+        api_key = _neon_api_key_for_tier(plan)
+    except RuntimeError:
+        api_key = _cfg("NEON_API_KEY") or ""
+    if not api_key:
+        return
+    email_slug = (tenant.get("email") or "x").split("@")[0][:20].replace(".", "_")
+    tenant_id = tenant.get("id", "")
+    db_name = f"cust_{email_slug}_{tenant_id[:8]}"
+    try:
+        async with httpx.AsyncClient(timeout=15) as http:
+            br = await http.get(
+                f"https://console.neon.tech/api/v2/projects/{neon_project_id}/branches",
+                headers={"Authorization": f"Bearer {api_key}"},
+            )
+            branches = br.json().get("branches", [])
+            branch_id = next((b["id"] for b in branches if b.get("default")), None)
+            if not branch_id and branches:
+                branch_id = branches[0]["id"]
+            if not branch_id:
+                return
+            await http.delete(
+                f"https://console.neon.tech/api/v2/projects/{neon_project_id}/branches/{branch_id}/databases/{db_name}",
+                headers={"Authorization": f"Bearer {api_key}"},
+            )
+    except Exception:
+        pass
+
+
+async def send_account_deleted_email(email: str) -> None:
+    """Send account deletion confirmation via Resend. Silently skips in dev."""
+    api_key = _cfg("RESEND_API_KEY")
+    if not api_key:
+        return
+    from_addr = _cfg("MERIDIAN_FROM_EMAIL", "Meridian <noreply@usemeridian.us>")
+    base = _cfg("MERIDIAN_BASE_URL", "https://usemeridian.us").rstrip("/")
+    try:
+        import httpx
+        async with httpx.AsyncClient(timeout=10) as http:
+            await http.post(
+                "https://api.resend.com/emails",
+                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                json={
+                    "from": from_addr,
+                    "to": [email],
+                    "subject": "Your Meridian account has been deleted",
+                    "html": (
+                        "<p>Your Meridian account and all associated data have been permanently deleted.</p>"
+                        "<p>Thank you for using Meridian. If you'd like to start again, you're always welcome back at "
+                        f'<a href="{base}">{base}</a>.</p>'
+                    ),
+                },
+            )
+    except Exception:
+        pass
+
+
 async def get_tenant_from_bearer(request: Request) -> dict[str, Any]:
     """FastAPI dependency: resolve the tenant from a Bearer token.
 
