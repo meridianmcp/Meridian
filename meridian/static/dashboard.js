@@ -638,6 +638,7 @@ function buildTabBody(project) {
         </div>
         <div class="goal-subtab-body">
           <div class="goal-subtab-panel active" id="gtab-north-star-${project.id}">
+            <div style="color:var(--muted);font-size:10px;margin-bottom:6px">Permanent vision. Set once, change rarely or never.</div>
             <textarea class="goal-area goal-full mono" id="goal-north-star-${project.id}" placeholder="(north star not set — set once, rarely change)"></textarea>
             <div class="goal-actions">
               <button class="primary" id="save-north-star-${project.id}">save north star</button>
@@ -646,6 +647,7 @@ function buildTabBody(project) {
             </div>
           </div>
           <div class="goal-subtab-panel" id="gtab-version-goal-${project.id}">
+            <div style="color:var(--muted);font-size:10px;margin-bottom:6px">Current milestone — what ships this cycle (v1.2, v2.0, etc).</div>
             <div id="goal-title-${project.id}" style="font-family:var(--font-mono);font-size:11px;font-weight:600;color:var(--accent);padding:5px 8px;background:var(--surface-2);border:1px solid var(--border);border-radius:4px 4px 0 0;border-bottom:none;user-select:none;flex-shrink:0" title="Version title (read-only)"></div>
             <div id="goal-shipped-${project.id}" style="display:none;font-family:var(--font-mono);font-size:10px;color:var(--muted);padding:6px 8px;background:var(--surface-2);border:1px solid var(--border);border-top:none;border-bottom:none;white-space:pre-wrap;user-select:none;flex-shrink:0" title="SHIPPED section (read-only — updated by Claude Code)"></div>
             <textarea class="goal-area goal-full mono" id="goal-${project.id}" placeholder="CURRENT FOCUS:" style="border-radius:0 0 4px 4px;font-size:13px"></textarea>
@@ -660,7 +662,7 @@ function buildTabBody(project) {
             </div>
           </div>
           <div class="goal-subtab-panel" id="gtab-sprint-${project.id}">
-            <div style="color:var(--muted);font-size:10px;margin-bottom:4px">Session Focus header:</div>
+            <div style="color:var(--muted);font-size:10px;margin-bottom:4px">What this session is doing right now. Updated frequently — not a multi-week scrum sprint.</div>
             <div style="display:flex;gap:6px;margin-bottom:10px;align-items:center">
               <select id="goal-sprint-select-${project.id}" style="flex:1;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;padding:6px 8px;color:var(--text);font-family:var(--font-mono);font-size:11px;outline:none"><option value="" disabled selected>loading sessions…</option></select>
               <input type="text" id="goal-sprint-${project.id}" placeholder="v1.9.x — description" style="flex:1;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;padding:6px 8px;color:var(--text);font-family:var(--font-mono);font-size:11px;outline:none;display:none">
@@ -1633,6 +1635,35 @@ async function cancelLiveTask(projectId, taskId) {
 }
 
 // v1.5.x — Claude launch control panel. Wires the 4 sections:
+function showCopyPreview(title, content) {
+  const overlay = document.createElement('div');
+  overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.72);z-index:9998;display:flex;align-items:center;justify-content:center';
+  overlay.innerHTML = `<div style="background:var(--surface-1);border:1px solid var(--border);border-radius:6px;padding:20px;width:620px;max-width:92vw;max-height:80vh;display:flex;flex-direction:column;gap:12px;box-shadow:0 8px 32px #0008">
+    <div style="font-family:var(--font-mono);font-size:13px;font-weight:600;color:var(--accent)">${escapeHtml(title)}</div>
+    <textarea style="width:100%;height:300px;font-family:var(--font-mono);font-size:11px;background:#0d1117;color:#e6edf3;border:1px solid var(--border);padding:10px;border-radius:4px;resize:vertical;outline:none">${escapeHtml(content)}</textarea>
+    <div style="display:flex;gap:8px;justify-content:flex-end">
+      <button class="secondary" style="font-size:11px;padding:5px 14px">Cancel</button>
+      <button class="primary" style="font-size:11px;padding:5px 14px">Copy &amp; Close</button>
+    </div>
+  </div>`;
+  document.body.appendChild(overlay);
+  const [cancelBtn, copyBtn] = overlay.querySelectorAll('button');
+  const ta = overlay.querySelector('textarea');
+  const close = () => overlay.remove();
+  cancelBtn.onclick = close;
+  overlay.addEventListener('click', e => { if (e.target === overlay) close(); });
+  copyBtn.onclick = async () => {
+    try {
+      await navigator.clipboard.writeText(ta.value);
+    } catch(_) {
+      ta.select();
+      document.execCommand('copy');
+    }
+    copyBtn.textContent = 'Copied!';
+    setTimeout(close, 700);
+  };
+}
+
 // (1) continue session dropdown + copy resume command
 // (2) start worker → show XML → copy
 // (3) handoff copy + regenerate
@@ -1647,10 +1678,7 @@ function wireClaudeLaunchPanel(projectId) {
     const sessionName = sel && sel.value ? sel.value : '';
     if (!sessionName) { toast('pick a session first', true); return; }
     const cmd = `start_session(project_id="${PROJECT_QUOTE}", session_name="${sessionName.replace(/"/g, '\\"')}", human_id="adam")`;
-    try {
-      await navigator.clipboard.writeText(cmd);
-      toast('resume command copied');
-    } catch(e) { toast('copy failed: ' + e.message, true); }
+    showCopyPreview('Resume Command', cmd);
   };
 
   // Section 2 — Start Worker
@@ -1693,46 +1721,18 @@ function wireClaudeLaunchPanel(projectId) {
   // Section 3 — Handoff copy + regenerate
   const copyHandoffBtn = document.getElementById(`copy-handoff-${projectId}`);
   if (copyHandoffBtn) copyHandoffBtn.onclick = async () => {
-    // v2.3 — Code Handoff now copies the compact context block (north star,
-    // sprint, pending items, recent tasks, decisions, sessions). The legacy
-    // verbose handoff file is still written via the Regenerate button.
     try {
       const r = await fetch(`/projects/${projectId}/context-block?mode=full`);
       if (!r.ok) throw new Error(`${r.status}`);
       const text = await r.text();
       if (text) {
-        try {
-          await navigator.clipboard.writeText(text);
-          toast('handoff copied — paste into Claude');
-        } catch(_) {
-          // Clipboard blocked — show in modal for manual copy
-          const ta = document.createElement('textarea');
-          ta.value = text;
-          ta.style.cssText = 'position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);width:80vw;height:60vh;z-index:9999;font-family:monospace;font-size:11px;background:#1a1a2e;color:#e0e0e0;border:2px solid var(--accent);border-radius:6px;padding:12px';
-          const overlay = document.createElement('div');
-          overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.7);z-index:9998';
-          const closeBtn = document.createElement('button');
-          closeBtn.textContent = 'Close';
-          closeBtn.style.cssText = 'position:fixed;top:calc(50% - 31vh);left:calc(50% + 38vw);z-index:10000;background:var(--accent);border:none;color:white;padding:6px 14px;border-radius:4px;cursor:pointer';
-          document.body.appendChild(overlay);
-          document.body.appendChild(ta);
-          document.body.appendChild(closeBtn);
-          ta.select();
-          const close = () => { overlay.remove(); ta.remove(); closeBtn.remove(); };
-          overlay.onclick = close;
-          closeBtn.onclick = close;
-          toast('Clipboard blocked — select all and copy manually', true);
-        }
-      } else {
-        toast('handoff written: ' + (body.path || 'data/'), false);
+        showCopyPreview('Code Handoff — paste into Claude', text);
+        stampHandoffTs(projectId, new Date());
       }
-      stampHandoffTs(projectId, new Date());
     } catch(e) { toast('handoff failed: ' + e.message, true); }
   };
   const copyContextBtn = document.getElementById(`copy-context-${projectId}`);
   if (copyContextBtn) copyContextBtn.onclick = async () => {
-    // v2.3 — fetches the shorter ?mode=chat plain-text context block so
-    // a paste into a new claude.ai chat fits without overflow.
     const orig = copyContextBtn.textContent;
     copyContextBtn.disabled = true;
     copyContextBtn.textContent = 'Loading…';
@@ -1740,12 +1740,9 @@ function wireClaudeLaunchPanel(projectId) {
       const r = await fetch(`/projects/${projectId}/context-block?mode=chat`);
       if (!r.ok) throw new Error(`${r.status}`);
       const text = await r.text();
-      await navigator.clipboard.writeText(text);
-      copyContextBtn.textContent = 'Copied ✓';
-      setTimeout(() => { copyContextBtn.textContent = orig; }, 2000);
-      toast('chat context copied');
+      showCopyPreview('Chat Context — paste into claude.ai', text);
     } catch(e) { toast('copy context failed: ' + e.message, true); }
-    finally { copyContextBtn.disabled = false; }
+    finally { copyContextBtn.disabled = false; copyContextBtn.textContent = orig; }
   };
 
   const regenBtn = document.getElementById(`regen-handoff-${projectId}`);
