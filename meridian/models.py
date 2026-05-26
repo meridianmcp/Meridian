@@ -181,6 +181,7 @@ class Session(BaseModel):
     created_at: str
     session_summary: dict | None = None
     agent_framework: str | None = None  # v2.4
+    client_type: str | None = None  # v2.6
 
 
 class Task(BaseModel):
@@ -261,6 +262,10 @@ class StartSessionRequest(BaseModel):
     human_id: str | None = Field(
         default=None,
         description="Optional human owner of this session.",
+    )
+    client: str | None = Field(
+        default=None,
+        description="Client app identifier: claude-code, claude-desktop, cursor, other.",
     )
 
 
