@@ -39,11 +39,10 @@ jobs:
         with:
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
-      - name: Generate CHANGELOG.md
-        uses: orhun/git-cliff-action@v3
-        with:
-          config: .cliff.toml
-          args: --output CHANGELOG.md
+      - name: Install git-cliff and generate CHANGELOG
+        run: |
+          pip install git-cliff
+          git cliff --output CHANGELOG.md
       - name: Commit CHANGELOG.md if changed
         run: |
           git config user.name  "github-actions[bot]"
