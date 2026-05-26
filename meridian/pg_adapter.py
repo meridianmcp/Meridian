@@ -262,7 +262,7 @@ class PostgresConnection:
             return _PgCursor([], 0)
 
         if "sqlite_master" in stripped.lower():
-            return _PgCursor([{"sql": "pending-hitl", "name": "task_log"}], 1)
+            return _PgCursor([{"sql": "pending-hitl 'backlog' 'backburner'", "name": "task_log"}], 1)
 
         # ---- Normal statement ----------------------------------------------
 

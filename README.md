@@ -10,7 +10,7 @@ Open-source MCP server for persistent AI session memory — shared task log,
 pinned decisions, human-in-the-loop queue, and tiered handoffs. Works with
 Claude Code, Cursor, Cline, Claude Desktop, or any MCP client.
 
-[![License: MSL-2.0](https://img.shields.io/badge/license-MSL--2.0-blue)](LICENSE)
+[![License: MSL-1.0](https://img.shields.io/badge/license-MSL--1.0-blue)](LICENSE)
 [![Tests](https://github.com/meridianmcp/Meridian/actions/workflows/test.yml/badge.svg)](https://github.com/meridianmcp/Meridian/actions/workflows/test.yml)
 [![Docs](https://img.shields.io/badge/docs-docs.usemeridian.us-6c8fff)](https://docs.usemeridian.us)
 [![Hosted](https://img.shields.io/badge/hosted-usemeridian.us-a78bfa)](https://usemeridian.us)
@@ -153,9 +153,9 @@ sessions, no Meridian server in the cloud.
 
 ## License
 
-[MSL-2.0](LICENSE) — free for local and internal use at any team size. Paid
-license required if you host Meridian as a service for others. Reverts to
-Apache 2.0 after 10 years.
+[MSL-1.0](LICENSE) — free for local and internal use at any team size. Paid
+license required if you host Meridian as a service for others. Converts to
+MIT after 6 years.
 
 For licensing questions: [hello@usemeridian.us](mailto:hello@usemeridian.us)
 

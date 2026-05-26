@@ -266,7 +266,8 @@ async function loadConfig() {
   try {
     const cfg = await api('/config/api-key');
     state.apiKeyConfigured = !!cfg.configured;
-    document.getElementById('api-warn').style.display = cfg.configured ? 'none' : 'block';
+    const hintEl = document.getElementById('mcp-hint');
+    if (hintEl) hintEl.style.display = cfg.configured ? 'none' : 'block';
     const methodEl = document.getElementById('auth-method');
     if (cfg.method === 'oauth') {
       methodEl.textContent = 'Auth: Claude Max OAuth';
@@ -647,7 +648,8 @@ function buildTabBody(project) {
           <div class="goal-subtab-panel" id="gtab-sprint-${project.id}">
             <div style="color:var(--muted);font-size:10px;margin-bottom:4px">Session Focus header:</div>
             <div style="display:flex;gap:6px;margin-bottom:10px;align-items:center">
-              <input type="text" id="goal-sprint-${project.id}" placeholder="v1.9.x — description" style="flex:1;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;padding:6px 8px;color:var(--text);font-family:var(--font-mono);font-size:11px;outline:none">
+              <select id="goal-sprint-select-${project.id}" style="flex:1;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;padding:6px 8px;color:var(--text);font-family:var(--font-mono);font-size:11px;outline:none"><option value="" disabled selected>loading sessions…</option></select>
+              <input type="text" id="goal-sprint-${project.id}" placeholder="v1.9.x — description" style="flex:1;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;padding:6px 8px;color:var(--text);font-family:var(--font-mono);font-size:11px;outline:none;display:none">
               <button class="secondary" id="save-sprint-${project.id}" style="white-space:nowrap">save</button>
               <span class="goal-ts" id="goal-sp-ts-${project.id}" style="font-size:10px;color:var(--muted)"></span>
             </div>
@@ -940,6 +942,34 @@ function buildTabBody(project) {
   }
   _sprintBoardReloaders[project.id] = loadSprintBoard;
   loadSprintBoard();
+
+  // Wire session-focus select+input combo (slight delay lets refreshGoal set inp.value first)
+  setTimeout(async () => {
+    const sel = document.getElementById(`goal-sprint-select-${project.id}`);
+    const inp = document.getElementById(`goal-sprint-${project.id}`);
+    if (!sel || !inp) return;
+    try {
+      const sessions = await api(`/projects/${project.id}/sessions`);
+      const active = (sessions || []).filter(s => s.status !== 'closed' && s.status !== 'archived');
+      const opts = active.map(s => `<option value="${escapeHtml(s.name)}">${escapeHtml(s.name)}</option>`).join('');
+      sel.innerHTML = opts + '<option value="__custom__">Custom…</option>';
+      _sprintSelectSyncers[project.id] = function(val) {
+        if (!sel) return;
+        const match = Array.from(sel.options).find(o => o.value === val && o.value !== '__custom__');
+        if (match) { sel.value = val; inp.style.display = 'none'; }
+        else if (val) { sel.value = '__custom__'; inp.style.display = 'block'; inp.value = val; }
+        else { if (sel.options.length) sel.selectedIndex = 0; inp.style.display = 'none'; }
+      };
+      if (inp.value) _sprintSelectSyncers[project.id](inp.value);
+    } catch (_) {
+      sel.innerHTML = '<option value="__custom__">Custom…</option>';
+      inp.style.display = 'block';
+    }
+    sel.onchange = () => {
+      if (sel.value === '__custom__') { inp.style.display = 'block'; inp.focus(); }
+      else { inp.style.display = 'none'; inp.value = sel.value; }
+    };
+  }, 200);
 
   const sprintAddBtn = document.getElementById(`sprint-add-btn-${project.id}`);
   const sprintAddInput = document.getElementById(`sprint-add-input-${project.id}`);
@@ -2001,6 +2031,24 @@ async function loadSettingsTab(projectId) {
           configBlock.textContent = cfg;
           copyBtn.disabled = false;
           fileNote.textContent = `Save to: ${cli.file}`;
+        } else if (state.serverConfig?.demo_mode) {
+          const demoKey = 'mk_demo_' + 'x'.repeat(16);
+          const demoCfg = JSON.stringify({
+            mcpServers: {
+              meridian: {
+                command: 'npx',
+                args: ['-y', 'meridian-mcp@latest'],
+                env: {
+                  MERIDIAN_API_KEY: demoKey,
+                  MERIDIAN_PROJECT_ID: currentPid || 'your-project-id',
+                  MERIDIAN_BASE_URL: baseUrl,
+                },
+              },
+            },
+          }, null, 2);
+          configBlock.textContent = demoCfg;
+          copyBtn.disabled = false;
+          fileNote.textContent = `Demo key — sign up at usemeridian.us for a real one`;
         } else {
           configBlock.textContent = 'Generate an API key to see your config';
           copyBtn.disabled = true;
@@ -2134,8 +2182,9 @@ async function loadSettingsTab(projectId) {
     }, 0);
   }
 
-  // Account section (hosted mode only)
-  if (mcpData) {
+  // Account section (hosted mode only; hidden in demo mode)
+  const isDemo = !!state.serverConfig?.demo_mode;
+  if (mcpData && !isDemo) {
     html += `<div style="margin-bottom:16px">
       <div style="color:var(--accent);font-size:10px;letter-spacing:.06em;text-transform:uppercase;margin-bottom:10px;padding-bottom:4px;border-bottom:1px solid var(--border)">Account</div>
       <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:12px">
@@ -2520,12 +2569,14 @@ function _renderSwimlane(humans, days, goalMarkers) {
   const windowMs = days * 86400 * 1000;
   const start = now - windowMs;
   const statusColor = {
-    done: '#4ade80', failed: '#f87171', pending: '#fbbf24',
-    'in_progress': '#a78bfa', 'pending-hitl': '#fb923c',
+    done: '#22d3a5', failed: '#ef4444', pending: '#6b7280',
+    'in_progress': '#6c8fff', backburner: '#9ca3af', 'pending-hitl': '#fb923c',
   };
+  // Marker colors: sprint=blue, north-star=amber, content=purple
+  const markerColor = { sprint_updated_at: '#6c8fff', ns_updated_at: '#fbbf24', content_updated_at: '#a78bfa' };
   // SVG geometry
-  const rowH = 28;
-  const labelW = 100;
+  const rowH = 30;
+  const labelW = 110;
   const width = 720;
   const height = humans.length * rowH + 24;
   const x = (ts) => {
@@ -2536,27 +2587,29 @@ function _renderSwimlane(humans, days, goalMarkers) {
     } catch (e) { return labelW; }
   };
   const rows = humans.map((h, i) => {
-    const y = 14 + i * rowH;
+    const y = 16 + i * rowH;
     const c = _colorForHuman(h.human_id);
+    const sublabel = h.active_session ? escapeHtml(h.active_session.slice(0, 18)) : '';
     const dots = (h.recent || []).map(t => {
       const dc = statusColor[t.status] || '#6b7280';
-      return `<circle cx="${x(t.created_at)}" cy="${y}" r="6" fill="${dc}" stroke="${c}" stroke-width="1">
-        <title>[${(t.status || '?').toUpperCase()}] ${(t.description || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;')}</title>
-      </circle>`;
+      const tip = `[${(t.status || '?').toUpperCase()}] ${(t.description || '').slice(0, 60)}`.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;');
+      return `<circle cx="${x(t.created_at)}" cy="${y}" r="7" fill="${dc}" stroke="${c}" stroke-width="1.5"><title>${tip}</title></circle>`;
     }).join('');
+    const subEl = sublabel
+      ? `<text x="${labelW - 6}" y="${y + 11}" text-anchor="end" font-size="8" fill="var(--muted)" font-family="var(--font-mono)" opacity="0.7">${sublabel}</text>`
+      : '';
     return `<line x1="${labelW}" y1="${y}" x2="${width - 8}" y2="${y}" stroke="var(--border)" stroke-dasharray="2,3"/>
-      <text x="${labelW - 6}" y="${y + 4}" text-anchor="end" font-size="10" fill="${c}" font-family="var(--font-mono)">${escapeHtml(h.human_id.slice(0, 14))}</text>
-      ${dots}`;
+      <text x="${labelW - 6}" y="${y + 2}" text-anchor="end" font-size="10" fill="${c}" font-family="var(--font-mono)">${escapeHtml(h.human_id.slice(0, 14))}</text>
+      ${subEl}${dots}`;
   }).join('');
-  // Goal change markers — vertical dashed lines across all rows.
-  const fieldLabel = {content_updated_at: 'goal', ns_updated_at: 'north star', sprint_updated_at: 'sprint'};
+  // Goal change markers — vertical dashed lines; color by field type.
+  const fieldLabel = {content_updated_at: 'goal', ns_updated_at: 'N★', sprint_updated_at: 'sprint'};
   const markerLines = (goalMarkers || []).map(m => {
     const mx = x(m.ts);
     const label = fieldLabel[m.field] || 'goal';
-    return `<line x1="${mx}" y1="0" x2="${mx}" y2="${height}" stroke="#a78bfa" stroke-dasharray="3,3" stroke-width="1" opacity="0.7">
-      <title>Goal change: ${label}</title>
-    </line>
-    <text x="${mx + 2}" y="9" font-size="8" fill="#a78bfa" font-family="var(--font-mono)" opacity="0.9">${escapeHtml(label)}</text>`;
+    const mc = markerColor[m.field] || '#a78bfa';
+    return `<line x1="${mx}" y1="0" x2="${mx}" y2="${height}" stroke="${mc}" stroke-dasharray="3,3" stroke-width="1" opacity="0.7"><title>Goal change: ${label}</title></line>
+    <text x="${mx + 2}" y="9" font-size="8" fill="${mc}" font-family="var(--font-mono)" opacity="0.9">${escapeHtml(label)}</text>`;
   }).join('');
   return `<div style="overflow-x:auto;background:var(--surface-2);border:1px solid var(--border);border-radius:4px;padding:6px"><svg viewBox="0 0 ${width} ${height}" style="width:100%;min-width:600px;height:${height}px">${markerLines}${rows}</svg></div>`;
 }
@@ -2587,6 +2640,7 @@ function renderQueue(tasks) {
   const failed = tasks.filter(t => t.status === 'failed').slice(0, 10);
   const backlog = tasks.filter(t => t.status === 'backlog');
   const future = tasks.filter(t => t.status === 'future');
+  const backburner = tasks.filter(t => t.status === 'backburner');
 
   const sect = (icon, title, items, emptyMsg, showActions) => {
     const rows = items.length
@@ -2625,7 +2679,8 @@ function renderQueue(tasks) {
          sect('✅', 'Recently Done', done, 'no completed tasks', true) +
          (failed.length ? sect('❌', 'Failed', failed, '', true) : '') +
          (backlog.length ? sect('📦', 'Backlog', backlog, '', true) : '') +
-         (future.length ? sect('🔮', 'Future', future, '', false) : '');
+         (future.length ? sect('🔮', 'Future', future, '', false) : '') +
+         (backburner.length ? sect('⏸', 'Backburner', backburner, '', true) : '');
 }
 
 // Global queue action handler — called from inline onclick in renderQueue
@@ -2809,7 +2864,10 @@ async function refreshGoal(projectId) {
     const nsTA = document.getElementById(`goal-north-star-${projectId}`);
     const spTA = document.getElementById(`goal-sprint-${projectId}`);
     if (nsTA && 'north_star' in goal) nsTA.value = goal.north_star || '';
-    if (spTA && 'sprint' in goal) spTA.value = goal.sprint || '';
+    if (spTA && 'sprint' in goal) {
+      spTA.value = goal.sprint || '';
+      if (_sprintSelectSyncers[projectId]) _sprintSelectSyncers[projectId](goal.sprint || '');
+    }
     // v0.6.4 — store server values for dirty tracking; clear dirty state
     const p = state.panels[projectId];
     p._serverNorthStar = goal.north_star || '';
@@ -3606,6 +3664,7 @@ async function restoreTabs() {
 })();
 
 const _sprintBoardReloaders = {};
+const _sprintSelectSyncers = {};
 
 async function _deleteSprintItem(projectId, itemId) {
   if (!confirm('Remove this sprint item?')) return;

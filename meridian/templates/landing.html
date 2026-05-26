@@ -433,7 +433,7 @@
 
 <section>
   <h2>What you get</h2>
-  <p class="section-lede">All six features ship today. Open source, MSL-2.0.</p>
+  <p class="section-lede">All six features ship today. Open source, MSL-1.0.</p>
   <div class="features-grid">
     <div class="feature-item">
       <div class="feature-icon">🎯</div>
@@ -484,12 +484,17 @@
   <div class="self-host">
     <h2>Self-host in 30 seconds</h2>
     <p class="lede">Local SQLite by default. Connect your own Postgres for shared team state. Free forever for personal use.</p>
-    <pre><span class="h"># clone, install (pixi), start the local server</span>
+    <pre><span class="h"># macOS / Linux — install pixi (skip if already installed)</span>
+<span class="c">$</span> curl -fsSL https://pixi.sh/install.sh | bash
+
+<span class="h"># Windows PowerShell</span>
+<span class="h"># iwr -useb https://pixi.sh/install.ps1 | iex</span>
+
 <span class="c">$</span> git clone https://github.com/meridianmcp/Meridian
 <span class="c">$</span> cd Meridian &amp;&amp; pixi install
 <span class="c">$</span> pixi run start
 
-<span class="h"># dashboard → http://localhost:7878</span>
+<span class="h"># dashboard → http://localhost:7878/dashboard</span>
 <span class="h"># MCP endpoint → claude-code, cursor, windsurf all auto-discover via stdio</span></pre>
     <div class="self-host-row">
       <a href="https://github.com/meridianmcp/Meridian" target="_blank" rel="noopener" class="btn btn-secondary">
@@ -540,10 +545,10 @@
         <li>Managed Postgres — 10 GB included</li>
         <li>200 CU-hours compute included</li>
         <li>Up to 50 team members</li>
-        <li>Multiple environments (prod / staging / dev)</li>
-        <li>Priority support · custom subdomain</li>
-        <li>Team swimlane + standup digest</li>
-        <li class="dim">SSO / SAML — when requested</li>
+        <li>Higher compute caps · faster queries</li>
+        <li>Priority support</li>
+        <li>Team swimlane + activity timeline</li>
+        <li>Connect your own Postgres DB</li>
       </ul>
       <div class="plan-note">Overage: <strong>$0.16/CU-hr</strong> · <strong>$0.50/GB-mo</strong> · auto-billed via Stripe</div>
       {% if stripe_pro_payment_link %}
@@ -563,9 +568,9 @@
     <a href="/privacy">Privacy</a>
     <a href="https://docs.usemeridian.us" target="_blank" rel="noopener">Docs</a>
     <a href="https://github.com/meridianmcp/Meridian" target="_blank" rel="noopener">GitHub</a>
-    <a href="https://github.com/meridianmcp/Meridian/blob/main/LICENSE">License · MSL-2.0</a>
+    <a href="https://github.com/meridianmcp/Meridian/blob/main/LICENSE">License · MSL-1.0</a>
   </div>
-  <div>© 2026 Meridian · Open source · MSL-2.0</div>
+  <div>© 2026 Meridian · Open source · MSL-1.0</div>
   <div class="footer-powered">
     Built on
     <svg width="14" height="14" viewBox="0 0 32 32" fill="none"><circle cx="16" cy="16" r="16" fill="#00E599"/><path d="M8 20V12l8 8V12l8 8" stroke="#000" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/></svg>

@@ -3222,11 +3222,23 @@ async def workspace_remove_member(request: Request, member_id: str) -> None:
     await db_module.delete_workspace_member(_db(request), member_id, tenant["id"])
 
 
+def _is_demo_request(request: Request) -> bool:
+    """Return True when the request is in demo mode (env flag or cookie)."""
+    env_demo = os.environ.get("MERIDIAN_DEMO", "").lower() in ("1", "true", "yes")
+    cookie_demo = bool(request.cookies.get(_DEMO_CONTEXT_COOKIE))
+    return env_demo or cookie_demo
+
+
 @app.get("/export/my-data")
 async def export_my_data(request: Request) -> Response:
     """GDPR data portability — returns a JSON file of all account data."""
     if not _hosted_mode():
         raise HTTPException(status_code=404)
+    if _is_demo_request(request):
+        return JSONResponse(
+            {"detail": "Not available in demo mode. Sign up at usemeridian.us"},
+            status_code=403,
+        )
     from .hosted import get_current_tenant
     tenant = await get_current_tenant(request)
     data = await db_module.export_tenant_data(_db(request), tenant["id"])
@@ -3245,6 +3257,11 @@ async def delete_account(request: Request) -> Response:
     """Self-service account deletion. Requires JSON body: {\"confirmation\": \"DELETE\"}."""
     if not _hosted_mode():
         raise HTTPException(status_code=404)
+    if _is_demo_request(request):
+        return JSONResponse(
+            {"detail": "Not available in demo mode. Sign up at usemeridian.us"},
+            status_code=403,
+        )
     from .hosted import get_current_tenant, cancel_stripe_subscription, _drop_tenant_neon_database, send_account_deleted_email
     from fastapi.responses import JSONResponse
     tenant = await get_current_tenant(request)
@@ -4199,7 +4216,7 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
     {"name": "set_goal", "description": "Set or update the goal state.",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"}, "content": {"type": "string"}}, "required": ["project_id", "content"]}},
-    {"name": "log_task", "description": "Log a task this session completed or is working on.",
+    {"name": "log_task", "description": "Log a task this session completed or is working on. Valid statuses: pending, in_progress, done, failed, backlog, future, backburner.",
      "inputSchema": {"type": "object", "properties": {
          "session_id": {"type": "string"}, "project_id": {"type": "string"},
          "description": {"type": "string"}, "status": {"type": "string"}},
