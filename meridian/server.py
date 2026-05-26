@@ -2150,6 +2150,37 @@ async def export_project_pdf(project_id: str, request: Request):
     )
 
 
+@app.get("/onboarding", response_class=HTMLResponse)
+async def onboarding_page(request: Request) -> Any:
+    """Plan selection page for new users after first login."""
+    from .hosted import _SESSION_COOKIE, _read_session_cookie
+    tenant: dict = {}
+    try:
+        cookie_val = request.cookies.get(_SESSION_COOKIE)
+        if cookie_val:
+            session_id = _read_session_cookie(cookie_val)
+            if session_id:
+                db = await _db(request)
+                user_session = await db_module.get_user_session(db, session_id)
+                if user_session:
+                    tenant = await db_module.get_tenant_by_id(db, user_session["tenant_id"]) or {}
+    except Exception:
+        pass
+    standard_link = os.environ.get("STRIPE_PAYMENT_LINK", "#")
+    pro_link = os.environ.get("STRIPE_PRO_PAYMENT_LINK", "#")
+    email = tenant.get("email", "")
+    if email:
+        sep = "&" if "?" in standard_link else "?"
+        standard_link += f"{sep}prefilled_email={email}"
+        sep = "&" if "?" in pro_link else "?"
+        pro_link += f"{sep}prefilled_email={email}"
+    return _templates.TemplateResponse(request, "onboarding.html", {
+        "standard_link": standard_link,
+        "pro_link": pro_link,
+        "email": email,
+    })
+
+
 @app.get("/dashboard", response_class=HTMLResponse)
 async def dashboard_html(request: Request) -> Any:
     """Serve the Meridian dashboard from a Jinja2 template."""
@@ -3100,7 +3131,7 @@ button{width:100%;padding:10px;background:#6c8fff;color:#fff;border:none;border-
 @app.get("/admin", response_class=HTMLResponse)
 async def admin_dashboard(request: Request) -> Any:
     """Admin dashboard — restricted to MERIDIAN_ADMIN_EMAILS + optional password."""
-    from .hosted import get_current_tenant, is_admin, check_admin_password
+    from .hosted import get_current_tenant, is_admin_db, check_admin_password
 
     try:
         tenant = await get_current_tenant(request)
@@ -3110,7 +3141,7 @@ async def admin_dashboard(request: Request) -> Any:
             status_code=302,
         )
 
-    if not is_admin(tenant.get("email", "")):
+    if not await is_admin_db(tenant.get("email", ""), request.app.state.db):
         raise HTTPException(status_code=403, detail="admin access only")
     if not check_admin_password(request):
         from fastapi.responses import RedirectResponse
@@ -3466,12 +3497,12 @@ async def mcp_tools_doc() -> str:
 @app.get("/admin/health")
 async def admin_health_json(request: Request) -> dict[str, Any]:
     """JSON health check for ops/curl — restricted to MERIDIAN_ADMIN_EMAILS."""
-    from .hosted import get_current_tenant, is_admin, check_admin_password
+    from .hosted import get_current_tenant, is_admin_db, check_admin_password
     try:
         tenant = await get_current_tenant(request)
     except HTTPException:
         raise HTTPException(status_code=403, detail="not authenticated")
-    if not is_admin(tenant.get("email", "")):
+    if not await is_admin_db(tenant.get("email", ""), request.app.state.db):
         raise HTTPException(status_code=403, detail="admin only")
     if not check_admin_password(request):
         raise HTTPException(status_code=403, detail="admin password required")
@@ -3639,6 +3670,7 @@ async def _start_session_composite(
     session_name: str,
     data_dir: str,
     human_id: str | None = None,
+    client_type: str | None = None,
 ) -> dict[str, Any]:
     """Register + goal + tasks + sessions + handoff-check in one shot.
 
@@ -3651,7 +3683,7 @@ async def _start_session_composite(
     await db_module.archive_stale_sessions(db, project_id)
 
     session = await db_module.register_session(
-        db, project_id, session_name, human_id=human_id
+        db, project_id, session_name, human_id=human_id, client_type=client_type
     )
 
     goal = await db_module.get_goal(db, project_id)
@@ -4462,12 +4494,14 @@ async def _dispatch_mcp_tool(name: str, args: dict[str, Any], db: Any, data_dir:
             db, args["project_id"], args["session_name"],
             args.get("human_id"),
             agent_framework=args.get("agent_framework", "claude_code"),
+            client_type=args.get("client"),
         )
     if name == "start_session":
         session = await db_module.register_session(
             db, args["project_id"], args["session_name"],
             args.get("human_id"),
             agent_framework=args.get("agent_framework", "claude_code"),
+            client_type=args.get("client"),
         )
         goal = await db_module.get_goal(db, args["project_id"])
         tasks = await db_module.get_tasks(db, args["project_id"], limit=10)
