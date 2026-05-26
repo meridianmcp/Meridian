@@ -1,4 +1,8 @@
-# ⬡ Meridian
+<p align="center">
+  <img src="meridian/static/logo.svg" width="64" height="64" alt="Meridian">
+</p>
+
+# Meridian
 
 **Claude Code has no memory between sessions. Meridian fixes that.**
 

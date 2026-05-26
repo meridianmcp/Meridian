@@ -5,6 +5,7 @@
 - **Site**: https://usemeridian.us
 - **Password**: meridian2026
 - **Demo** (no login required): https://usemeridian.us/demo
+- **Docs**: https://docs.usemeridian.us (password: meridian2026)
 
 ---
 

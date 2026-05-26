@@ -3347,6 +3347,9 @@ async def mcp_tools_doc() -> str:
                 req = "required" if k in required else "optional"
                 desc = (v.get("description") or "").replace("|", "\\|")
                 lines.append(f"| `{k}` | {v.get('type', 'string')} | {req} | {desc} |")
+        example = TOOL_EXAMPLES.get(tool["name"])
+        if example:
+            lines.append(f"\n**Example:**\n```\n{example}\n```")
         lines.append("")
     return "\n".join(lines)
 
@@ -4150,6 +4153,35 @@ def _jsonrpc_ok(req_id: Any, result: Any) -> dict[str, Any]:
 def _jsonrpc_err(req_id: Any, code: int, message: str) -> dict[str, Any]:
     return {"jsonrpc": "2.0", "id": req_id, "error": {"code": code, "message": message}}
 
+
+TOOL_EXAMPLES: dict[str, str] = {
+    "create_project": 'create_project(name="my-app")',
+    "start_session": 'start_session(project_id="abc-123", session_name="feature-x", human_id="alice")',
+    "register_session": 'register_session(project_id="abc-123", session_name="feature-x", human_id="alice")',
+    "log_task": 'log_task(project_id="abc-123", description="Fixed auth bug", status="done")',
+    "get_context_block": 'get_context_block(project_id="abc-123", mode="chat")',
+    "claim_task": 'claim_task(task_id="task-uuid-here")',
+    "complete_task": 'complete_task(task_id="task-uuid-here")',
+    "get_tasks": 'get_tasks(project_id="abc-123")',
+    "get_goal": 'get_goal(project_id="abc-123")',
+    "set_goal": 'set_goal(project_id="abc-123", content="Build a great product")',
+    "set_sprint": 'set_sprint(project_id="abc-123", sprint="v2.0 — auth + dashboard")',
+    "set_north_star": 'set_north_star(project_id="abc-123", north_star="Ship by Q3")',
+    "pin_decision": 'pin_decision(project_id="abc-123", decision="Use psycopg3", rationale="asyncpg has DLL issues on Windows", category="TECHNICAL")',
+    "get_pinned_decisions": 'get_pinned_decisions(project_id="abc-123")',
+    "generate_handoff": 'generate_handoff(project_id="abc-123", session_id="session-uuid")',
+    "get_session_brief": 'get_session_brief(project_id="abc-123")',
+    "request_hitl": 'request_hitl(project_id="abc-123", question="Should we add rate limiting here?", urgency="normal")',
+    "get_hitl_request": 'get_hitl_request(request_id="hitl-uuid")',
+    "add_note": 'add_note(project_id="abc-123", content="Reminder: update env vars before deploy")',
+    "get_notes": 'get_notes(project_id="abc-123")',
+    "add_sprint_item": 'add_sprint_item(project_id="abc-123", title="Add OAuth login", item_group="auth")',
+    "get_sprint_items": 'get_sprint_items(project_id="abc-123")',
+    "complete_sprint_item": 'complete_sprint_item(item_id="item-uuid")',
+    "heartbeat": 'heartbeat(session_id="session-uuid")',
+    "list_projects": 'list_projects()',
+    "get_sessions": 'get_sessions(project_id="abc-123")',
+}
 
 _MCP_TOOLS_LIST: list[dict[str, Any]] = [
     {"name": "create_project", "description": "Create a new Meridian project.",
