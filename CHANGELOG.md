@@ -21,6 +21,7 @@ All notable changes to Meridian. Generated from git history via `git-cliff`.
 
 ### Chores
 
+- Chore: update CHANGELOG ([c08054b](https://github.com/meridianmcp/Meridian/commit/c08054b6b6a8bb2dca0385672dc4f7215b4957bc))
 - Chore: update CHANGELOG ([dac2909](https://github.com/meridianmcp/Meridian/commit/dac29096aef62194b260050d2a8a9d3a61cd4b94))
 
 ### Documentation
@@ -31,6 +32,7 @@ All notable changes to Meridian. Generated from git history via `git-cliff`.
 
 ### Features
 
+- Feat: async _db() with per-tenant Neon DB routing in hosted mode ([0dcf28f](https://github.com/meridianmcp/Meridian/commit/0dcf28f5b8e8a61b18d4406f969bc6a418a42a3e))
 - Feat: overage billing — Neon consumption polling + Stripe meter + throttle ([64a102f](https://github.com/meridianmcp/Meridian/commit/64a102f03226eabe237f15117c4af8ba34e8a535))
 - Feat: dunning flow — payment failure emails + day-15 hard delete (Task 2) ([3d6cb6a](https://github.com/meridianmcp/Meridian/commit/3d6cb6a34a7690db69ff6f075e64e169917bc2b2))
 - Feat: user self-delete + GDPR data export (Task 3) ([dd1bf3d](https://github.com/meridianmcp/Meridian/commit/dd1bf3d1914327c95c0adc701962d836ff96b57c))
@@ -53,6 +55,8 @@ All notable changes to Meridian. Generated from git history via `git-cliff`.
 
 ### Other
 
+- Merge branch 'main' of https://github.com/meridianmcp/Meridian ([2607d70](https://github.com/meridianmcp/Meridian/commit/2607d708f8b824ca4422854bb3f6aaea92bd185e))
+- Merge branch 'dev' ([a86be8a](https://github.com/meridianmcp/Meridian/commit/a86be8ac1b3c081fda13993a57263d52b3d9f945))
 - Merge branch 'dev' ([34c9fe0](https://github.com/meridianmcp/Meridian/commit/34c9fe077bac4d2c10f80e3ce1a5d694db1fa3c0))
 - Merge: take dev CHANGELOG ([1dc3c78](https://github.com/meridianmcp/Meridian/commit/1dc3c78503abd8f0c7f864057de23ea5442a174c))
 - Merge branch 'main' of https://github.com/meridianmcp/Meridian ([9a27f15](https://github.com/meridianmcp/Meridian/commit/9a27f1523e23d918b06109815525e4d978c5254e))
