@@ -19,6 +19,10 @@ All notable changes to Meridian. Generated from git history via `git-cliff`.
 - Fix: skip demo re-seeding when MERIDIAN_DEMO_DB_URL set (Postgres), fix version fallback to 1.0.0-beta ([c7cf3e8](https://github.com/meridianmcp/Meridian/commit/c7cf3e8716dab51d323fad0b81e6eeeb5da9fc2a))
 - Fix: add /__gate__ to demo write allowlist so site password gate works with demo cookie ([694e8c0](https://github.com/meridianmcp/Meridian/commit/694e8c06f628f5d52639df7b9850cb7a0795093e))
 
+### Chores
+
+- Chore: update CHANGELOG ([dac2909](https://github.com/meridianmcp/Meridian/commit/dac29096aef62194b260050d2a8a9d3a61cd4b94))
+
 ### Documentation
 
 - Docs: add CHANGELOG.md generated from git history ([72f0497](https://github.com/meridianmcp/Meridian/commit/72f0497fd1c8f4d738fa7352014788ffdb651e32))
@@ -38,12 +42,20 @@ All notable changes to Meridian. Generated from git history via `git-cliff`.
 
 ### Infrastructure
 
+- Infra: use pixi run git-cliff in changelog CI step ([82d5396](https://github.com/meridianmcp/Meridian/commit/82d5396d2aadcd51a96a0a1d0055416f80c3e536))
+- Infra: add git-cliff to pixi deps, regenerate CHANGELOG.md ([0924a7d](https://github.com/meridianmcp/Meridian/commit/0924a7d47c9054cd550e69a45e03d914c8f26cdb))
 - Infra: lower concurrency to 25 soft/30 hard per machine for safety ([8c25db9](https://github.com/meridianmcp/Meridian/commit/8c25db9f6d3d2a40653145d3b1f7c4a9bd06a40e))
 - Infra: 50 req/machine soft limit, max 40 machines (~2000 concurrent capacity) ([e18de18](https://github.com/meridianmcp/Meridian/commit/e18de18d22ef93370b9073352833421c514b5104))
 - Infra: scale to 200/250 concurrent requests per machine, supports 1-2k concurrent users ([b44bf66](https://github.com/meridianmcp/Meridian/commit/b44bf6603dd9b10c6d23dc94556db62b59253fef))
 - Infra: autoscale min=1 always warm, soft_limit=40 requests triggers new machine ([0354c5d](https://github.com/meridianmcp/Meridian/commit/0354c5d9dd950492f56b543bc992e30a1bdc8831))
 - Ci: trigger deploy to verify FLY_API_TOKEN secret ([617cf1d](https://github.com/meridianmcp/Meridian/commit/617cf1d231159ab8ad14945dc97b85dac51bcbae))
 - Ci: auto-tag every deploy with version + timestamp ([5d1acfb](https://github.com/meridianmcp/Meridian/commit/5d1acfb07b58d612235934ce5c7ee3284ba09821))
+
+### Other
+
+- Merge branch 'dev' ([34c9fe0](https://github.com/meridianmcp/Meridian/commit/34c9fe077bac4d2c10f80e3ce1a5d694db1fa3c0))
+- Merge: take dev CHANGELOG ([1dc3c78](https://github.com/meridianmcp/Meridian/commit/1dc3c78503abd8f0c7f864057de23ea5442a174c))
+- Merge branch 'main' of https://github.com/meridianmcp/Meridian ([9a27f15](https://github.com/meridianmcp/Meridian/commit/9a27f1523e23d918b06109815525e4d978c5254e))
 ## [1.0.0-beta] — 2026-05-25
 
 ### Bug Fixes
