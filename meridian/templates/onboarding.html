@@ -1,0 +1,223 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Meridian — Choose your plan</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⬡</text></svg>">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #0b0c0e;
+    --surface: #14161a;
+    --surface-2: #1c1f25;
+    --border: #2a2d35;
+    --accent: #6c8fff;
+    --accent-2: #a78bfa;
+    --accent-green: #4ade80;
+    --text: #e8eaf0;
+    --text-dim: #b4b7c1;
+    --muted: #8b8fa8;
+    --sans: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    --mono: 'IBM Plex Mono', ui-monospace, Menlo, Consolas, monospace;
+  }
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--sans);
+    font-size: 16px;
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    padding: 32px 16px;
+  }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+
+  .logo {
+    font-family: var(--mono);
+    font-size: 22px;
+    font-weight: 600;
+    color: var(--accent);
+    letter-spacing: -0.5px;
+    margin-bottom: 40px;
+    text-align: center;
+  }
+  .logo span { color: var(--text-dim); font-weight: 400; }
+
+  h1 {
+    font-size: 28px;
+    font-weight: 700;
+    text-align: center;
+    margin-bottom: 8px;
+    color: var(--text);
+  }
+  .subtitle {
+    color: var(--muted);
+    font-size: 15px;
+    text-align: center;
+    margin-bottom: 48px;
+  }
+
+  .plans {
+    display: flex;
+    gap: 20px;
+    max-width: 760px;
+    width: 100%;
+    flex-wrap: wrap;
+    justify-content: center;
+  }
+
+  .plan-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 28px 28px 24px;
+    flex: 1;
+    min-width: 300px;
+    max-width: 360px;
+    display: flex;
+    flex-direction: column;
+    gap: 20px;
+    transition: border-color 0.15s;
+  }
+  .plan-card:hover { border-color: var(--accent); }
+  .plan-card.featured {
+    border-color: var(--accent);
+    background: #131620;
+  }
+
+  .plan-header { display: flex; flex-direction: column; gap: 6px; }
+  .plan-name {
+    font-size: 13px;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--muted);
+  }
+  .plan-card.featured .plan-name { color: var(--accent); }
+  .plan-price {
+    font-size: 36px;
+    font-weight: 700;
+    color: var(--text);
+    line-height: 1;
+  }
+  .plan-price span {
+    font-size: 16px;
+    font-weight: 400;
+    color: var(--muted);
+  }
+  .plan-trial {
+    font-size: 13px;
+    color: var(--accent-green);
+    font-weight: 500;
+  }
+
+  .plan-features {
+    list-style: none;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    flex: 1;
+  }
+  .plan-features li {
+    font-size: 14px;
+    color: var(--text-dim);
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+    line-height: 1.4;
+  }
+  .plan-features li::before {
+    content: '✓';
+    color: var(--accent-green);
+    font-weight: 700;
+    flex-shrink: 0;
+    margin-top: 1px;
+  }
+
+  .btn {
+    display: block;
+    width: 100%;
+    padding: 13px;
+    border-radius: 8px;
+    font-family: var(--sans);
+    font-size: 15px;
+    font-weight: 600;
+    text-align: center;
+    cursor: pointer;
+    text-decoration: none;
+    transition: opacity 0.15s, transform 0.1s;
+  }
+  .btn:hover { opacity: 0.88; transform: translateY(-1px); text-decoration: none; }
+  .btn-primary { background: var(--accent); color: #fff; }
+  .btn-secondary {
+    background: var(--surface-2);
+    color: var(--text);
+    border: 1px solid var(--border);
+  }
+
+  .footer-link {
+    margin-top: 36px;
+    font-size: 13px;
+    color: var(--muted);
+    text-align: center;
+  }
+  .footer-link a { color: var(--text-dim); }
+</style>
+</head>
+<body>
+  <div class="logo">⬡ meridian <span>/ choose your plan</span></div>
+
+  <h1>Choose your plan to get started</h1>
+  <p class="subtitle">7-day free trial on both plans. No credit card charged until trial ends.</p>
+
+  <div class="plans">
+
+    <div class="plan-card">
+      <div class="plan-header">
+        <div class="plan-name">Standard</div>
+        <div class="plan-price">$20<span>/mo</span></div>
+        <div class="plan-trial">7-day free trial</div>
+      </div>
+      <ul class="plan-features">
+        <li>1 Neon Postgres database (0.5 CU, 10 GB)</li>
+        <li>Unlimited projects &amp; sessions</li>
+        <li>MCP server + dashboard</li>
+        <li>Session coordination &amp; task queue</li>
+        <li>Human-in-the-loop (HITL) tooling</li>
+        <li>Goal state &amp; handoff generation</li>
+        <li>Email support</li>
+      </ul>
+      <a href="{{ standard_link }}" class="btn btn-secondary">Start Standard trial</a>
+    </div>
+
+    <div class="plan-card featured">
+      <div class="plan-header">
+        <div class="plan-name">Pro</div>
+        <div class="plan-price">$49<span>/mo</span></div>
+        <div class="plan-trial">7-day free trial</div>
+      </div>
+      <ul class="plan-features">
+        <li>1 Neon Postgres database (2 CU, 50 GB)</li>
+        <li>Everything in Standard</li>
+        <li>Multi-team project support</li>
+        <li>Priority support</li>
+        <li>Higher compute + storage caps</li>
+        <li>Early access to new features</li>
+      </ul>
+      <a href="{{ pro_link }}" class="btn btn-primary">Start Pro trial</a>
+    </div>
+
+  </div>
+
+  <p class="footer-link">Already subscribed? <a href="/auth/login">Sign in →</a></p>
+</body>
+</html>

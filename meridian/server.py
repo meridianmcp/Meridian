@@ -3784,6 +3784,7 @@ async def start_session_endpoint(
         body.session_name,
         _data_dir(request),
         human_id=body.human_id,
+        client_type=body.client,
     )
 
 
@@ -4343,11 +4344,15 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
     {"name": "register_session", "description": "Register this Claude session. Call at session start.",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"}, "session_name": {"type": "string"},
-         "human_id": {"type": "string"}}, "required": ["project_id", "session_name"]}},
+         "human_id": {"type": "string"},
+         "client": {"type": "string", "enum": ["claude-code", "claude-desktop", "cursor", "other"]}},
+         "required": ["project_id", "session_name"]}},
     {"name": "start_session", "description": "Register session and return goal + recent tasks in one call.",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"}, "session_name": {"type": "string"},
-         "human_id": {"type": "string"}}, "required": ["project_id", "session_name"]}},
+         "human_id": {"type": "string"},
+         "client": {"type": "string", "enum": ["claude-code", "claude-desktop", "cursor", "other"]}},
+         "required": ["project_id", "session_name"]}},
     {"name": "get_goal", "description": "Read the current goal state.",
      "inputSchema": {"type": "object", "properties": {"project_id": {"type": "string"}}, "required": ["project_id"]}},
     {"name": "set_goal", "description": "Set or update the goal state.",
@@ -5392,6 +5397,11 @@ def build_mcp_server():
                             "type": "string",
                             "description": "Optional human owner identifier.",
                         },
+                        "client": {
+                            "type": "string",
+                            "enum": ["claude-code", "claude-desktop", "cursor", "other"],
+                            "description": "Client app — used for presence indicators.",
+                        },
                     },
                     "required": ["project_id", "session_name"],
                 },
@@ -5480,6 +5490,7 @@ def build_mcp_server():
                     arguments["project_id"],
                     arguments["session_name"],
                     human_id=arguments.get("human_id"),
+                    client_type=arguments.get("client"),
                 )
             elif name == "get_goal":
                 _goal_timed_out = False
@@ -5701,6 +5712,7 @@ def build_mcp_server():
                     arguments["session_name"],
                     state["data_dir"],
                     human_id=arguments.get("human_id"),
+                    client_type=arguments.get("client"),
                 )
             elif name == "list_projects":
                 result = await db_module.list_projects(db)
@@ -5829,6 +5841,15 @@ def build_mcp_server():
                 result = {"error": f"unknown tool: {name}"}
         except Exception as exc:  # noqa: BLE001 — surface to MCP client
             result = {"error": f"{type(exc).__name__}: {exc}"}
+
+        # Implicit last_seen bump: any tool call that carries a session_id
+        # keeps the session alive without requiring explicit heartbeats.
+        _session_id = arguments.get("session_id")
+        if _session_id and name != "heartbeat":
+            try:
+                await db_module.update_session_seen(db, _session_id)
+            except Exception:
+                pass
 
         return [TextContent(type="text", text=json.dumps(result, default=str))]
 

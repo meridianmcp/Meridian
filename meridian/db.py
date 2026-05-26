@@ -1931,6 +1931,7 @@ async def heartbeat_session(
 
     Optimization: if ``last_seen`` is within 5 minutes (e.g. because a
     tool call already updated it), skip the write — the session is fresh."""
+    from datetime import datetime, timezone
     async with db.execute(
         "SELECT id, last_seen FROM sessions WHERE id = ? AND status != 'closed'",
         (session_id,),
