@@ -2172,6 +2172,80 @@ async function loadSettingsTab(projectId) {
     }, 0);
   }
 
+  // Usage section (hosted mode only)
+  if (mcpData) {
+    html += `<div style="margin-bottom:16px" id="usage-section-${projectId}">
+      <div style="color:var(--accent);font-size:10px;letter-spacing:.06em;text-transform:uppercase;margin-bottom:10px;padding-bottom:4px;border-bottom:1px solid var(--border)">Usage this month</div>
+      <div id="usage-body-${projectId}" style="font-size:10px;color:var(--muted)">loading…</div>
+    </div>`;
+
+    setTimeout(async () => {
+      const usageEl = document.getElementById(`usage-body-${projectId}`);
+      if (!usageEl) return;
+      try {
+        const u = await api('/settings/usage');
+        const c = u.compute || {};
+        const s = u.storage || {};
+
+        function pct(used, limit) { return Math.min(100, limit > 0 ? (used / limit * 100) : 0); }
+        function barColor(p) { return p >= 100 ? '#ef4444' : p >= 80 ? '#f59e0b' : 'var(--accent)'; }
+
+        const cpct = pct(c.used, c.grace);
+        const spct = pct(s.used_gb, s.limit_gb);
+
+        usageEl.innerHTML = `
+          <div style="margin-bottom:10px">
+            <div style="display:flex;justify-content:space-between;margin-bottom:3px">
+              <span style="color:var(--text)">Compute${c.throttled ? ' <span style="color:#ef4444">(throttled)</span>' : ''}</span>
+              <span>${c.used.toFixed(1)} / ${c.limit} CU-hrs <span style="color:var(--muted)">(${c.grace} w/grace)</span></span>
+            </div>
+            <div style="background:var(--surface-1);border-radius:2px;height:5px;overflow:hidden">
+              <div style="background:${barColor(cpct)};width:${cpct}%;height:100%;transition:width .3s"></div>
+            </div>
+          </div>
+          <div style="margin-bottom:12px">
+            <div style="display:flex;justify-content:space-between;margin-bottom:3px">
+              <span style="color:var(--text)">Storage</span>
+              <span>${s.used_gb.toFixed(3)} / ${s.limit_gb} GB</span>
+            </div>
+            <div style="background:var(--surface-1);border-radius:2px;height:5px;overflow:hidden">
+              <div style="background:${barColor(spct)};width:${spct}%;height:100%;transition:width .3s"></div>
+            </div>
+          </div>
+          <div style="display:flex;gap:10px;align-items:flex-end;flex-wrap:wrap">
+            <label style="font-size:10px;color:var(--muted)">
+              Compute overage budget ($USD/mo, 0 = throttle)<br>
+              <input id="compute-cap-${projectId}" type="number" min="0" step="1" value="${c.cap_usd}" style="background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:3px 6px;width:80px;margin-top:3px">
+            </label>
+            <label style="font-size:10px;color:var(--muted)">
+              Storage overage budget ($USD/mo, 0 = block)<br>
+              <input id="storage-cap-${projectId}" type="number" min="0" step="1" value="${s.cap_usd}" style="background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:3px 6px;width:80px;margin-top:3px">
+            </label>
+            <button id="save-caps-${projectId}" class="secondary" style="font-size:10px;padding:4px 10px;align-self:flex-end">Save</button>
+            <span id="caps-status-${projectId}" style="font-size:10px;color:var(--muted);min-height:14px;align-self:flex-end"></span>
+          </div>`;
+
+        const saveBtn = document.getElementById(`save-caps-${projectId}`);
+        const capsStatus = document.getElementById(`caps-status-${projectId}`);
+        if (saveBtn) {
+          saveBtn.onclick = async () => {
+            const cc = parseFloat(document.getElementById(`compute-cap-${projectId}`)?.value || '0');
+            const sc = parseFloat(document.getElementById(`storage-cap-${projectId}`)?.value || '0');
+            saveBtn.disabled = true;
+            try {
+              await api('/settings/usage', { method: 'PATCH', body: JSON.stringify({ compute_cap: cc, storage_cap: sc }) });
+              if (capsStatus) { capsStatus.textContent = 'saved'; setTimeout(() => { capsStatus.textContent = ''; }, 2000); }
+            } catch(e) {
+              if (capsStatus) capsStatus.textContent = `error: ${escapeHtml(String(e))}`;
+            } finally { saveBtn.disabled = false; }
+          };
+        }
+      } catch(e) {
+        if (usageEl) usageEl.textContent = 'Usage data unavailable.';
+      }
+    }, 0);
+  }
+
   // Notifications section
   if (prefs !== null) {
     html += `<div style="margin-bottom:12px">

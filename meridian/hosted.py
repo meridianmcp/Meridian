@@ -1327,6 +1327,272 @@ async def run_storage_overage_check(db: Any) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Compute + storage overage billing
+# ---------------------------------------------------------------------------
+
+PLAN_LIMITS: dict[str, dict[str, float]] = {
+    "standard": {"cu_hours": 50.0,  "grace_cu_hours": 20.0, "storage_gb": 1.0},
+    "pro":      {"cu_hours": 200.0, "grace_cu_hours": 20.0, "storage_gb": 10.0},
+    "free":     {"cu_hours": 10.0,  "grace_cu_hours": 5.0,  "storage_gb": 0.1},
+}
+COMPUTE_OVERAGE_RATE = 0.16   # $/CU-hour
+STORAGE_OVERAGE_RATE = 0.50   # $/GB-month
+
+# Never poll these — infrastructure / demo projects
+EXCLUDED_NEON_PROJECTS: frozenset[str] = frozenset({
+    "muddy-queen-15422822",   # auth / main meridian DB
+    "blue-smoke-62506461",    # seeded demo DB
+})
+
+
+def _admin_emails() -> frozenset[str]:
+    """Return the set of admin email addresses (from env)."""
+    raw = os.environ.get("MERIDIAN_ADMIN_EMAILS", "") or os.environ.get("ADMIN_EMAIL", "")
+    return frozenset(e.strip() for e in raw.split(",") if e.strip())
+
+
+async def _fetch_neon_consumption(
+    project_id: str,
+    api_key: str,
+    from_dt: str,
+    to_dt: str,
+) -> dict[str, Any]:
+    """Fetch raw consumption data from Neon API for a billing window.
+
+    Returns the raw response dict, or {} on any error.
+    Query params ``from`` / ``to`` are ISO 8601 datetime strings.
+    """
+    import httpx
+    try:
+        async with httpx.AsyncClient(timeout=15) as http:
+            resp = await http.get(
+                f"https://console.neon.tech/api/v2/projects/{project_id}/consumption",
+                headers={"Authorization": f"Bearer {api_key}"},
+                params={"from": from_dt, "to": to_dt},
+            )
+            if resp.status_code != 200:
+                return {}
+            return resp.json()
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _parse_consumption_metrics(data: dict[str, Any]) -> dict[str, float]:
+    """Flatten Neon consumption API response into a {metric_name: total} dict.
+
+    Handles the nested: periods[] → consumption[] → metrics[] shape.
+    Sums across all periods and timeframes in the response.
+    """
+    totals: dict[str, float] = {}
+    # Single-project endpoint returns the project object directly;
+    # bulk endpoint wraps in projects[]. Handle both.
+    candidates = data.get("projects", [data])
+    for project in candidates:
+        for period in project.get("periods", []):
+            for timeframe in period.get("consumption", []):
+                for metric in timeframe.get("metrics", []):
+                    name = metric.get("metric_name", "")
+                    value = float(metric.get("value") or 0)
+                    totals[name] = totals.get(name, 0.0) + value
+    return totals
+
+
+def _metrics_to_cu_hours(metrics: dict[str, float]) -> float:
+    """Convert Neon compute_unit_seconds to CU-hours."""
+    return metrics.get("compute_unit_seconds", 0.0) / 3600.0
+
+
+def _metrics_to_storage_gb(metrics: dict[str, float]) -> float:
+    """Convert Neon root_branch_bytes_month to GB-month equivalent."""
+    return metrics.get("root_branch_bytes_month", 0.0) / 1e9
+
+
+async def _set_neon_max_cu(project_id: str, api_key: str, max_cu: float) -> None:
+    """Set Neon project autoscaling max compute units. Best-effort."""
+    import httpx
+    try:
+        async with httpx.AsyncClient(timeout=15) as http:
+            await http.patch(
+                f"https://console.neon.tech/api/v2/projects/{project_id}",
+                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                json={"project": {"autoscaling_limit_max_cu": max_cu}},
+            )
+    except Exception:  # noqa: BLE001
+        pass
+
+
+async def _send_overage_email(
+    email: str,
+    subject: str,
+    html: str,
+) -> None:
+    """Send a single overage/limit notification email. Best-effort."""
+    import httpx
+    api_key = _cfg("RESEND_API_KEY")
+    if not api_key:
+        return
+    from_addr = _cfg("MERIDIAN_FROM_EMAIL", "Meridian <noreply@usemeridian.us>")
+    try:
+        async with httpx.AsyncClient(timeout=10) as http:
+            await http.post(
+                "https://api.resend.com/emails",
+                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                json={"from": from_addr, "to": [email], "subject": subject, "html": html},
+            )
+    except Exception:  # noqa: BLE001
+        pass
+
+
+async def run_overage_check(db: Any) -> None:
+    """Daily job: poll Neon compute + storage usage, send warnings, bill overages.
+
+    Timeline per tenant:
+    - compute < limit         → no action
+    - limit ≤ compute < grace → send one warning email
+    - compute ≥ grace         → if overage cap set: bill via Stripe meter event
+                                else: throttle Neon compute to 0.25 CU max
+    - storage > limit         → bill via Stripe meter event if cap set, else email
+
+    Excluded: EXCLUDED_NEON_PROJECTS, admin emails, tenants with no stripe_customer_id.
+    Reset: columns are reset to 0 each month via overage_reset_at.
+    """
+    from datetime import datetime, timezone as _tz, timedelta as _td
+    from . import db as db_module
+
+    admins = _admin_emails()
+    now = datetime.now(tz=_tz.utc)
+    month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0).isoformat()
+    now_iso = now.isoformat()
+    stripe_api_key = _cfg("STRIPE_API_KEY", "")
+    base = _cfg("MERIDIAN_BASE_URL", "https://usemeridian.us").rstrip("/")
+
+    tenants = await db_module.list_tenants_with_neon(db)
+
+    for tenant in tenants:
+        email = tenant.get("email", "")
+        if email in admins:
+            continue
+
+        neon_project_id = tenant.get("neon_project_id", "")
+        if not neon_project_id or neon_project_id in EXCLUDED_NEON_PROJECTS:
+            continue
+
+        plan = tenant.get("plan") or "standard"
+        limits = PLAN_LIMITS.get(plan, PLAN_LIMITS["free"])
+
+        try:
+            api_key = _neon_api_key_for_tier(plan)
+        except RuntimeError:
+            api_key = _cfg("NEON_API_KEY") or ""
+        if not api_key:
+            continue
+
+        # Monthly reset: if overage_reset_at is from a previous month, zero out
+        reset_at_raw = tenant.get("overage_reset_at") or ""
+        if reset_at_raw:
+            try:
+                last_reset = datetime.fromisoformat(reset_at_raw.replace("Z", "+00:00"))
+                if last_reset.year < now.year or last_reset.month < now.month:
+                    await db_module.update_tenant(
+                        db, tenant["id"],
+                        compute_cu_hours_used=0.0,
+                        storage_gb_used=0.0,
+                        overage_reset_at=now_iso,
+                        compute_throttled_at=None,
+                    )
+            except (ValueError, AttributeError):
+                pass
+
+        # Fetch Neon consumption for current billing month
+        raw = await _fetch_neon_consumption(neon_project_id, api_key, month_start, now_iso)
+        if not raw:
+            continue
+
+        metrics = _parse_consumption_metrics(raw)
+        cu_used = _metrics_to_cu_hours(metrics)
+        gb_used = _metrics_to_storage_gb(metrics)
+
+        # Persist latest usage
+        await db_module.update_tenant(db, tenant["id"],
+            compute_cu_hours_used=round(cu_used, 4),
+            storage_gb_used=round(gb_used, 4),
+        )
+        if not tenant.get("overage_reset_at"):
+            await db_module.update_tenant(db, tenant["id"], overage_reset_at=now_iso)
+
+        cu_limit = limits["cu_hours"]
+        cu_grace = cu_limit + limits["grace_cu_hours"]
+        gb_limit = limits["storage_gb"]
+        stripe_id = tenant.get("stripe_customer_id")
+
+        # --- Compute checks ---
+        if cu_used >= cu_grace:
+            compute_cap = float(tenant.get("compute_overage_cap_usd") or 0)
+            overage_hours = cu_used - cu_limit
+            charge = overage_hours * COMPUTE_OVERAGE_RATE
+
+            if compute_cap > 0 and charge <= compute_cap and stripe_id and stripe_api_key:
+                # Bill via Stripe meter event
+                try:
+                    import stripe as _stripe
+                    _stripe.api_key = stripe_api_key
+                    _stripe.billing.MeterEvent.create(
+                        event_name="compute_overage_cu_hours",
+                        payload={"value": str(round(overage_hours, 4)), "stripe_customer_id": stripe_id},
+                        timestamp=int(now.timestamp()),
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+            elif not tenant.get("compute_throttled_at"):
+                # Throttle compute to 0.25 CU and email
+                await _set_neon_max_cu(neon_project_id, api_key, 0.25)
+                await db_module.update_tenant(db, tenant["id"], compute_throttled_at=now_iso)
+                await _send_overage_email(
+                    email,
+                    subject="Meridian: compute limit reached — sessions throttled",
+                    html=(
+                        f"<p>Your Meridian project has used <strong>{cu_used:.1f} CU-hours</strong> "
+                        f"this month (limit: {cu_limit:.0f} + {limits['grace_cu_hours']:.0f} grace).</p>"
+                        "<p>Compute has been throttled to 0.25 CU until next month or you set an overage budget.</p>"
+                        f"<p><a href='{base}/dashboard'>Set an overage budget →</a></p>"
+                    ),
+                )
+
+        elif cu_used >= cu_limit and not tenant.get("compute_throttled_at"):
+            # Grace period — send one warning
+            remaining = cu_grace - cu_used
+            await _send_overage_email(
+                email,
+                subject="Meridian: compute approaching limit",
+                html=(
+                    f"<p>You've used <strong>{cu_used:.1f} of {cu_limit:.0f} CU-hours</strong> "
+                    f"this month. You have {remaining:.1f} grace hours remaining before throttling.</p>"
+                    f"<p><a href='{base}/dashboard'>Set an overage budget to avoid throttling →</a></p>"
+                ),
+            )
+
+        # --- Storage checks ---
+        if gb_used > gb_limit:
+            storage_cap = float(tenant.get("storage_overage_cap_usd") or 0)
+            overage_gb = gb_used - gb_limit
+            charge = overage_gb * STORAGE_OVERAGE_RATE
+
+            if storage_cap > 0 and charge <= storage_cap and stripe_id and stripe_api_key:
+                await report_stripe_overage(stripe_id, overage_gb, stripe_api_key)
+            else:
+                await _send_overage_email(
+                    email,
+                    subject="Meridian: storage limit exceeded",
+                    html=(
+                        f"<p>Your Meridian storage is at <strong>{gb_used:.2f} GB</strong> "
+                        f"(limit: {gb_limit:.1f} GB, overage: {overage_gb:.2f} GB).</p>"
+                        f"<p>Overage rate is ${STORAGE_OVERAGE_RATE}/GB-month. "
+                        f"<a href='{base}/dashboard'>Set an overage budget →</a></p>"
+                    ),
+                )
+
+
+# ---------------------------------------------------------------------------
 # Churn cleanup
 # ---------------------------------------------------------------------------
 

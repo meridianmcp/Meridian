@@ -610,6 +610,15 @@ async def lifespan(app: FastAPI):
                             await run_dunning_cleanup(db)
                         except Exception:  # noqa: BLE001
                             pass
+                        # Daily at 3am: compute + storage overage check
+                        import time as _time2
+                        _local_hour = _time2.localtime().tm_hour
+                        if _local_hour == 3:
+                            try:
+                                from .hosted import run_overage_check
+                                await run_overage_check(db)
+                            except Exception:  # noqa: BLE001
+                                pass
                 # v2.4 — refresh the CLAUDE.md <current_state> block for
                 # every project on each cycle. Local dev only — skipped
                 # on hosted multi-tenant deployments where there is no
@@ -3274,6 +3283,52 @@ async def get_mcp_config(request: Request) -> dict[str, Any]:
         "base_url": os.environ.get("MERIDIAN_SERVER_URL", "https://usemeridian.us"),
         "tenant_id": tenant["id"],
     }
+
+
+@app.get("/settings/usage")
+async def get_usage_settings(request: Request) -> dict[str, Any]:
+    """Return current compute + storage usage and overage caps for the tenant."""
+    if not _hosted_mode():
+        raise HTTPException(status_code=404)
+    from .hosted import get_current_tenant, PLAN_LIMITS, COMPUTE_OVERAGE_RATE, STORAGE_OVERAGE_RATE
+    tenant = await get_current_tenant(request)
+    plan = tenant.get("plan") or "standard"
+    limits = PLAN_LIMITS.get(plan, PLAN_LIMITS["free"])
+    return {
+        "plan": plan,
+        "compute": {
+            "used": float(tenant.get("compute_cu_hours_used") or 0),
+            "limit": limits["cu_hours"],
+            "grace": limits["cu_hours"] + limits["grace_cu_hours"],
+            "cap_usd": float(tenant.get("compute_overage_cap_usd") or 0),
+            "throttled": bool(tenant.get("compute_throttled_at")),
+            "rate": COMPUTE_OVERAGE_RATE,
+        },
+        "storage": {
+            "used_gb": float(tenant.get("storage_gb_used") or 0),
+            "limit_gb": limits["storage_gb"],
+            "cap_usd": float(tenant.get("storage_overage_cap_usd") or 0),
+            "rate": STORAGE_OVERAGE_RATE,
+        },
+    }
+
+
+@app.patch("/settings/usage")
+async def update_usage_caps(request: Request) -> dict[str, Any]:
+    """Update compute and storage overage spending caps for the tenant."""
+    if not _hosted_mode():
+        raise HTTPException(status_code=404)
+    from .hosted import get_current_tenant
+    tenant = await get_current_tenant(request)
+    body = await request.json()
+    compute_cap = float(body.get("compute_cap") or 0)
+    storage_cap = float(body.get("storage_cap") or 0)
+    await db_module.update_tenant(
+        _db(request), tenant["id"],
+        compute_overage_cap_usd=compute_cap,
+        storage_overage_cap_usd=storage_cap,
+    )
+    return {"status": "ok", "compute_cap": compute_cap, "storage_cap": storage_cap}
 
 
 @app.get("/mcp/tools-doc", response_class=PlainTextResponse)

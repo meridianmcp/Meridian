@@ -1653,3 +1653,112 @@ async def test_get_tenant_by_stripe_customer():
 
     missing = await db_module.get_tenant_by_stripe_customer(db, "cus_nope")
     assert missing is None
+
+
+# ---------------------------------------------------------------------------
+# Overage billing — schema + parsing
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_overage_columns_on_tenant():
+    """compute_overage_cap_usd and related fields can be set/read."""
+    db = await db_module.init_db(":memory:")
+    import uuid
+    tid = str(uuid.uuid4())
+    await db.execute(
+        "INSERT INTO tenants (id, email, plan) VALUES (?, ?, ?)",
+        (tid, "over@example.com", "standard"),
+    )
+    await db.commit()
+    await db_module.update_tenant(
+        db, tid,
+        compute_overage_cap_usd=5.0,
+        storage_overage_cap_usd=2.0,
+        compute_cu_hours_used=30.5,
+        storage_gb_used=0.8,
+    )
+    t = await db_module.get_tenant_by_id(db, tid)
+    assert float(t["compute_overage_cap_usd"]) == 5.0
+    assert float(t["storage_overage_cap_usd"]) == 2.0
+    assert float(t["compute_cu_hours_used"]) == 30.5
+    assert float(t["storage_gb_used"]) == 0.8
+
+
+@pytest.mark.anyio
+async def test_list_tenants_with_neon():
+    """list_tenants_with_neon returns only tenants with neon_project_id."""
+    db = await db_module.init_db(":memory:")
+    import uuid
+    t1 = str(uuid.uuid4())
+    t2 = str(uuid.uuid4())
+    await db.execute("INSERT INTO tenants (id, email, plan) VALUES (?, ?, ?)", (t1, "neon@x.com", "standard"))
+    await db.execute("INSERT INTO tenants (id, email, plan) VALUES (?, ?, ?)", (t2, "noneon@x.com", "standard"))
+    await db.commit()
+    await db_module.update_tenant(db, t1, neon_project_id="proj-abc-123")
+
+    result = await db_module.list_tenants_with_neon(db)
+    ids = [r["id"] for r in result]
+    assert t1 in ids
+    assert t2 not in ids
+
+
+def test_parse_consumption_metrics_sums_correctly():
+    """_parse_consumption_metrics aggregates across periods and timeframes."""
+    from meridian.hosted import _parse_consumption_metrics
+    data = {
+        "periods": [
+            {
+                "consumption": [
+                    {
+                        "metrics": [
+                            {"metric_name": "compute_unit_seconds", "value": 3600},
+                            {"metric_name": "root_branch_bytes_month", "value": 1_000_000_000},
+                        ]
+                    },
+                    {
+                        "metrics": [
+                            {"metric_name": "compute_unit_seconds", "value": 1800},
+                        ]
+                    },
+                ]
+            }
+        ]
+    }
+    m = _parse_consumption_metrics(data)
+    assert m["compute_unit_seconds"] == 5400
+    assert m["root_branch_bytes_month"] == 1_000_000_000
+
+
+def test_metrics_to_cu_hours():
+    """_metrics_to_cu_hours converts compute_unit_seconds to hours."""
+    from meridian.hosted import _metrics_to_cu_hours
+    assert _metrics_to_cu_hours({"compute_unit_seconds": 7200}) == 2.0
+    assert _metrics_to_cu_hours({}) == 0.0
+
+
+def test_metrics_to_storage_gb():
+    """_metrics_to_storage_gb converts bytes_month to GB."""
+    from meridian.hosted import _metrics_to_storage_gb
+    result = _metrics_to_storage_gb({"root_branch_bytes_month": 2_000_000_000})
+    assert abs(result - 2.0) < 0.001
+
+
+def test_settings_usage_404_self_hosted(client):
+    """GET /settings/usage returns 404 in self-hosted mode."""
+    r = client.get("/settings/usage")
+    assert r.status_code == 404
+
+
+def test_settings_usage_patch_404_self_hosted(client):
+    """PATCH /settings/usage returns 404 in self-hosted mode."""
+    r = client.patch("/settings/usage", json={"compute_cap": 5})
+    assert r.status_code == 404
+
+
+def test_dashboard_js_has_usage_section():
+    """dashboard.js contains the usage progress bar section."""
+    from pathlib import Path
+    js = (Path(__file__).parent.parent / "meridian/static/dashboard.js").read_text(encoding="utf-8")
+    assert "/settings/usage" in js
+    assert "CU-hrs" in js

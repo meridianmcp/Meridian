@@ -546,6 +546,16 @@ async def _migrate_dunning_fields(db: aiosqlite.Connection) -> None:
     await _migrate_add_column_if_missing(db, "tenants", "dunning_email_sent", "INTEGER NOT NULL DEFAULT 0")
 
 
+async def _migrate_overage_fields(db: aiosqlite.Connection) -> None:
+    """v2.6 — per-tenant compute + storage overage tracking and caps."""
+    await _migrate_add_column_if_missing(db, "tenants", "compute_overage_cap_usd", "NUMERIC(8,2) DEFAULT 0")
+    await _migrate_add_column_if_missing(db, "tenants", "storage_overage_cap_usd", "NUMERIC(8,2) DEFAULT 0")
+    await _migrate_add_column_if_missing(db, "tenants", "compute_cu_hours_used", "NUMERIC(10,4) DEFAULT 0")
+    await _migrate_add_column_if_missing(db, "tenants", "storage_gb_used", "NUMERIC(10,4) DEFAULT 0")
+    await _migrate_add_column_if_missing(db, "tenants", "overage_reset_at", "TEXT")
+    await _migrate_add_column_if_missing(db, "tenants", "compute_throttled_at", "TEXT")
+
+
 async def _migrate_sprint_item_dependencies(db: aiosqlite.Connection) -> None:
     """v2.6 — sprint_items dependency tracking.
 
@@ -1000,6 +1010,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_v09_notes_and_magic_links(db)
     await _migrate_v25_feedback_and_notifications(db)
     await _migrate_dunning_fields(db)
+    await _migrate_overage_fields(db)
     await _migrate_sprint_item_dependencies(db)
     return db
 
@@ -3435,7 +3446,14 @@ async def update_tenant(
     **fields: object,
 ) -> dict[str, Any] | None:
     """Update arbitrary columns on a tenant row. Returns updated dict or None."""
-    allowed = {"neon_project_id", "neon_db_url", "stripe_customer_id", "plan", "pool_project_id", "stripe_metered_item_id", "notification_prefs", "payment_failed_at", "dunning_email_sent"}
+    allowed = {
+        "neon_project_id", "neon_db_url", "stripe_customer_id", "plan", "pool_project_id",
+        "stripe_metered_item_id", "notification_prefs",
+        "payment_failed_at", "dunning_email_sent",
+        "compute_overage_cap_usd", "storage_overage_cap_usd",
+        "compute_cu_hours_used", "storage_gb_used",
+        "overage_reset_at", "compute_throttled_at",
+    }
     updates = {k: v for k, v in fields.items() if k in allowed}
     if not updates:
         return await get_tenant_by_id(db, tenant_id)
@@ -4330,6 +4348,17 @@ async def get_tenant_by_stripe_customer(
     ) as cur:
         row = await cur.fetchone()
     return _row_to_dict(row)
+
+
+async def list_tenants_with_neon(
+    db: aiosqlite.Connection,
+) -> list[dict[str, Any]]:
+    """Return all tenants that have a provisioned Neon database."""
+    async with db.execute(
+        "SELECT * FROM tenants WHERE neon_project_id IS NOT NULL"
+    ) as cur:
+        rows = await cur.fetchall()
+    return [_row_to_dict(r) for r in rows if r is not None]
 
 
 async def get_tenants_with_payment_failures(
