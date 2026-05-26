@@ -157,16 +157,17 @@ async def seed():
     print(f"  [OK] decisions log ({len(DECISIONS_LOG_ENTRIES)} entries)")
 
     # SESSIONS — alice + bob humans, two claude workers parented to alice/bob
+    # (id, project_id, human_id, name, agent_framework, client_type, created_at, last_seen)
     sessions = [
-        (SID_ALICE,   PROJ_ID, "alice",         "Alice Chen",         "planning",  ts(2),   ts(2)),
-        (SID_BOB,     PROJ_ID, "bob",           "Bob Okafor",         "debugging", ts(1,4), ts(1,2)),
-        (SID_WORKER1, PROJ_ID, "alice",         "Claude (worker 1)",  "worker",    ts(0,6), ts(0,3)),
-        (SID_WORKER2, PROJ_ID, "bob",           "Claude (worker 2)",  "worker",    ts(0,2), ts(0,1)),
+        (SID_ALICE,   PROJ_ID, "alice", "Alice Chen",         "claude_code", "claude-desktop", ts(2),   ts(0,8)),
+        (SID_BOB,     PROJ_ID, "bob",   "Bob Okafor",         "claude_code", "claude-desktop", ts(1,4), ts(0,4)),
+        (SID_WORKER1, PROJ_ID, "alice", "Claude (worker 1)",  "claude_code", "claude-code",    ts(0,6), ts(0,3)),
+        (SID_WORKER2, PROJ_ID, "bob",   "Claude (worker 2)",  "claude_code", "claude-code",    ts(0,2), ts(0,1)),
     ]
     for s in sessions:
         await conn.execute("""
-            INSERT INTO sessions (id, project_id, human_id, name, agent_framework, created_at, last_seen)
-            VALUES (%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (id) DO NOTHING
+            INSERT INTO sessions (id, project_id, human_id, name, agent_framework, client_type, created_at, last_seen)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (id) DO NOTHING
         """, s)
     print("  [OK] sessions")
 

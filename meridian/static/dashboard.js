@@ -2619,6 +2619,7 @@ function _renderSwimlane(humans, days, goalMarkers) {
   const rows = humans.map((h, i) => {
     const y = 16 + i * rowH;
     const c = _colorForHuman(h.human_id);
+    const presenceDotColor = h.presence === 'active' ? '#4ade80' : h.presence === 'recent' ? '#fbbf24' : '#6b7280';
     const sublabel = h.active_session ? escapeHtml(h.active_session.slice(0, 18)) : '';
     const dots = (h.recent || []).map(t => {
       const dc = statusColor[t.status] || '#6b7280';
@@ -2629,6 +2630,7 @@ function _renderSwimlane(humans, days, goalMarkers) {
       ? `<text x="${labelW - 6}" y="${y + 11}" text-anchor="end" font-size="8" fill="var(--muted)" font-family="var(--font-mono)" opacity="0.7">${sublabel}</text>`
       : '';
     return `<line x1="${labelW}" y1="${y}" x2="${width - 8}" y2="${y}" stroke="var(--border)" stroke-dasharray="2,3"/>
+      <circle cx="${labelW - 100}" cy="${y}" r="4" fill="${presenceDotColor}"/>
       <text x="${labelW - 6}" y="${y + 2}" text-anchor="end" font-size="10" fill="${c}" font-family="var(--font-mono)">${escapeHtml(h.human_id.slice(0, 14))}</text>
       ${subEl}${dots}`;
   }).join('');
@@ -3270,28 +3272,62 @@ async function saveSprint(projectId) {
   }
 }
 
+function _sessionPresenceDot(last_seen) {
+  if (!last_seen) return '⚫';
+  const mins = (Date.now() - new Date(last_seen.replace(' ', 'T') + 'Z')) / 60000;
+  if (mins < 6) return '🟢';
+  if (mins < 30) return '🟡';
+  return '⚫';
+}
+
 async function refreshSessions(projectId) {
   const root = document.getElementById(`sessions-${projectId}`);
   if (!root) return;
   try {
     const sessions = await api(`/projects/${projectId}/sessions`);
     populateSessionDropdown(projectId, sessions);
-    root.innerHTML = sessions.map(s => {
-      // v1.4.1 — dim stale sessions: active (<1h) full, idle (1-24h) 70%, old (24h+) 40%
-      let ageMs = 0;
-      try {
-        const ts = s.last_seen ? s.last_seen.replace(' ', 'T') + 'Z' : '';
-        if (ts) ageMs = Date.now() - new Date(ts).getTime();
-      } catch(e) {}
-      const ageH = ageMs / 3_600_000;
-      const opacity = ageH < 1 ? 1 : ageH < 24 ? 0.7 : 0.4;
-      const fontStyle = ageH >= 24 ? 'italic' : 'normal';
-      const label = s.human_id ? `${s.human_id}/${s.name}` : s.name;
-      return `<div class="session-row" style="opacity:${opacity};font-style:${fontStyle}">` +
-        `<span class="name">${escapeHtml(label)}</span>` +
-        `<span class="meta">${escapeHtml(s.status)} · ${escapeHtml(formatRelativeTime(s.last_seen))}</span>` +
+    if (!sessions.length) {
+      root.innerHTML = '<div class="session-row meta">(no active sessions)</div>';
+      return;
+    }
+    // Group by human_id, ungrouped into own bucket
+    const groups = {};
+    const order = [];
+    for (const s of sessions) {
+      const h = s.human_id || '\x00unknown';
+      if (!groups[h]) { groups[h] = []; order.push(h); }
+      groups[h].push(s);
+    }
+    for (const g of Object.values(groups)) {
+      g.sort((a, b) => (b.last_seen || '').localeCompare(a.last_seen || ''));
+    }
+    const rows = order.map(h => {
+      const humanSessions = groups[h];
+      const label = h === '\x00unknown' ? 'unknown' : h;
+      const topDot = _sessionPresenceDot(humanSessions[0]?.last_seen);
+      const header = `<div class="session-row" style="font-weight:600;padding-top:4px">` +
+        `<span class="name">${topDot} ${escapeHtml(label)}</span>` +
+        `<span class="meta">${humanSessions.length} session${humanSessions.length > 1 ? 's' : ''}</span>` +
         `</div>`;
-    }).join('') || '<div class="session-row meta">(no active sessions)</div>';
+      const children = humanSessions.map(s => {
+        let ageMs = 0;
+        try {
+          const ts = s.last_seen ? s.last_seen.replace(' ', 'T') + 'Z' : '';
+          if (ts) ageMs = Date.now() - new Date(ts).getTime();
+        } catch(e) {}
+        const ageH = ageMs / 3_600_000;
+        const opacity = ageH < 1 ? 1 : ageH < 24 ? 0.7 : 0.4;
+        const clientBadge = s.client_type
+          ? `<span style="font-size:9px;color:var(--muted);margin-left:4px">${escapeHtml(s.client_type)}</span>`
+          : '';
+        return `<div class="session-row" style="opacity:${opacity};padding-left:18px;font-size:11px">` +
+          `<span class="name">${escapeHtml(s.name)}${clientBadge}</span>` +
+          `<span class="meta">${escapeHtml(s.status)} · ${escapeHtml(formatRelativeTime(s.last_seen))}</span>` +
+          `</div>`;
+      }).join('');
+      return header + children;
+    }).join('');
+    root.innerHTML = rows;
   } catch(e) {}
 }
 
