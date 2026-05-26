@@ -21,6 +21,7 @@ All notable changes to Meridian. Generated from git history via `git-cliff`.
 
 ### Chores
 
+- Chore: update CHANGELOG ([112bbd9](https://github.com/meridianmcp/Meridian/commit/112bbd9e2e3facc3731d22d49d10d17363f26bf2))
 - Chore: update CHANGELOG ([c08054b](https://github.com/meridianmcp/Meridian/commit/c08054b6b6a8bb2dca0385672dc4f7215b4957bc))
 - Chore: update CHANGELOG ([dac2909](https://github.com/meridianmcp/Meridian/commit/dac29096aef62194b260050d2a8a9d3a61cd4b94))
 
@@ -32,6 +33,9 @@ All notable changes to Meridian. Generated from git history via `git-cliff`.
 
 ### Features
 
+- Feat: onboarding page, session presence indicators, grouped session tree ([f8ff688](https://github.com/meridianmcp/Meridian/commit/f8ff68865d7d98924791780cb3dbe86c02161cea))
+- Feat: client_type tracking, implicit heartbeat on tool calls, onboarding template ([38ee85b](https://github.com/meridianmcp/Meridian/commit/38ee85becad095a4954f0b724b1daf1df9e46f08))
+- Feat: admins DB table + is_admin_db() + MCP config placeholder ([f4429a6](https://github.com/meridianmcp/Meridian/commit/f4429a66e126ffa54a7756fa7beef188ebfeb14c))
 - Feat: async _db() with per-tenant Neon DB routing in hosted mode ([0dcf28f](https://github.com/meridianmcp/Meridian/commit/0dcf28f5b8e8a61b18d4406f969bc6a418a42a3e))
 - Feat: overage billing — Neon consumption polling + Stripe meter + throttle ([64a102f](https://github.com/meridianmcp/Meridian/commit/64a102f03226eabe237f15117c4af8ba34e8a535))
 - Feat: dunning flow — payment failure emails + day-15 hard delete (Task 2) ([3d6cb6a](https://github.com/meridianmcp/Meridian/commit/3d6cb6a34a7690db69ff6f075e64e169917bc2b2))
@@ -55,6 +59,9 @@ All notable changes to Meridian. Generated from git history via `git-cliff`.
 
 ### Other
 
+- Merge branch 'dev' ([d324012](https://github.com/meridianmcp/Meridian/commit/d3240125025cc481b3f3e23c1dbf363eb4a493f7))
+- Merge branch 'dev' ([67d55f7](https://github.com/meridianmcp/Meridian/commit/67d55f734fce8a9cf0578524fcbb56936f159054))
+- Merge branch 'dev' ([be1da95](https://github.com/meridianmcp/Meridian/commit/be1da956777098e2f90b477b7eaf9b7fc246d59a))
 - Merge branch 'main' of https://github.com/meridianmcp/Meridian ([2607d70](https://github.com/meridianmcp/Meridian/commit/2607d708f8b824ca4422854bb3f6aaea92bd185e))
 - Merge branch 'dev' ([a86be8a](https://github.com/meridianmcp/Meridian/commit/a86be8ac1b3c081fda13993a57263d52b3d9f945))
 - Merge branch 'dev' ([34c9fe0](https://github.com/meridianmcp/Meridian/commit/34c9fe077bac4d2c10f80e3ce1a5d694db1fa3c0))
