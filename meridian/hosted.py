@@ -416,6 +416,10 @@ def _post_login_redirect(tenant: dict) -> str:
     Keeps the auth callbacks symmetric — every login flow lands here so
     adding a new provider (magic link, Microsoft, SSO) inherits paywall.
     """
+    # Admin bypass — always go straight to dashboard
+    if is_admin((tenant or {}).get("email", "")):
+        return _cfg("MERIDIAN_AFTER_LOGIN_URL", "/dashboard")
+
     stripe_id = (tenant or {}).get("stripe_customer_id")
     # Only enforce paywall when Stripe is in live mode (STRIPE_LIVE=true).
     # In test mode / pre-launch everyone goes straight to dashboard.
