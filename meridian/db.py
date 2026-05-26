@@ -276,6 +276,7 @@ CREATE TABLE IF NOT EXISTS tenants (
     id TEXT PRIMARY KEY,
     email TEXT NOT NULL UNIQUE,
     google_sub TEXT UNIQUE,
+    github_sub TEXT UNIQUE,
     microsoft_sub TEXT UNIQUE,
     neon_project_id TEXT,
     neon_db_url TEXT,
@@ -603,6 +604,8 @@ async def _migrate_dunning_fields(db: aiosqlite.Connection) -> None:
     """v2.6 — dunning: track when a tenant's payment first failed."""
     await _migrate_add_column_if_missing(db, "tenants", "payment_failed_at", "TEXT")
     await _migrate_add_column_if_missing(db, "tenants", "dunning_email_sent", "INTEGER NOT NULL DEFAULT 0")
+    # v2.7 — add github_sub for GitHub OAuth
+    await _migrate_add_column_if_missing(db, "tenants", "github_sub", "TEXT")
 
 
 async def _migrate_overage_fields(db: aiosqlite.Connection) -> None:
@@ -3454,6 +3457,7 @@ async def upsert_tenant(
     db: aiosqlite.Connection,
     email: str,
     google_sub: str | None = None,
+    github_sub: str | None = None,
     microsoft_sub: str | None = None,
 ) -> dict[str, Any]:
     """Create or update a tenant record by email.
@@ -3468,6 +3472,8 @@ async def upsert_tenant(
         updates: list[tuple[str, str]] = []
         if google_sub and tenant.get("google_sub") != google_sub:
             updates.append(("google_sub", google_sub))
+        if github_sub and tenant.get("github_sub") != github_sub:
+            updates.append(("github_sub", github_sub))
         if microsoft_sub and tenant.get("microsoft_sub") != microsoft_sub:
             updates.append(("microsoft_sub", microsoft_sub))
         for col, val in updates:
@@ -3481,8 +3487,8 @@ async def upsert_tenant(
         return tenant
     tid = _new_id()
     await db.execute(
-        "INSERT INTO tenants (id, email, google_sub, microsoft_sub) VALUES (?, ?, ?, ?)",
-        (tid, email, google_sub, microsoft_sub),
+        "INSERT INTO tenants (id, email, google_sub, github_sub, microsoft_sub) VALUES (?, ?, ?, ?, ?)",
+        (tid, email, google_sub, github_sub, microsoft_sub),
     )
     await db.commit()
     async with db.execute("SELECT * FROM tenants WHERE id = ?", (tid,)) as cur:

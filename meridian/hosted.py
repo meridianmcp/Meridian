@@ -511,7 +511,7 @@ async def auth_github_callback(request: Request) -> RedirectResponse:
         return _Redirect("/auth/email-required?provider=github", status_code=302)
 
     db = request.app.state.db
-    tenant = await db_module.upsert_tenant(db, email=email, google_sub=sub)
+    tenant = await db_module.upsert_tenant(db, email=email, github_sub=sub)
 
     expires_at = (
         datetime.now(timezone.utc) + timedelta(hours=_SESSION_MAX_AGE_HOURS)
