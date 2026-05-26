@@ -45,6 +45,20 @@ async function loadServerConfig() {
       document.body.prepend(b);
       document.body.style.paddingTop = ((parseInt(document.body.style.paddingTop || '0', 10)) + 28) + 'px';
     }
+    // Task 16 — hide destructive admin controls in demo mode
+    if (cfg?.demo_mode) {
+      const selectors = [
+        '#restart-server-btn',
+        '#stop-server-btn',
+        '#banner-restart-btn',
+        '#update-banner',
+        '#delete-account-section',
+        '[data-demo-hide]',
+      ];
+      selectors.forEach(sel => {
+        document.querySelectorAll(sel).forEach(el => { el.style.display = 'none'; });
+      });
+    }
     // v1.9.x — update connection indicator
     _updateConnectionIndicator(cfg);
   } catch (e) { /* offline / older server — ignore */ }
@@ -617,10 +631,10 @@ function buildTabBody(project) {
           </span>
         </div>
         <div class="goal-subtab-strip">
-          <button class="goal-subtab-btn active" data-gtab="north-star">🔭 North Star</button>
-          <button class="goal-subtab-btn" data-gtab="version-goal">◎ Version Goal</button>
+          <button class="goal-subtab-btn active" data-gtab="north-star" title="Permanent product vision. Rarely changes — set once, then keep stable.">🔭 North Star</button>
+          <button class="goal-subtab-btn" data-gtab="version-goal" title="Current milestone — what ships this cycle (v1.2, v2.0, etc).">◎ Version Goal</button>
           <button class="goal-subtab-btn" data-gtab="sprint" title="What this session is focused on right now — updated multiple times per day. Not a multi-week scrum sprint.">⚡ Session Focus</button>
-          <button class="goal-subtab-btn" data-gtab="decisions">📋 Decisions</button>
+          <button class="goal-subtab-btn" data-gtab="decisions" title="Pinned constitution + append-only decisions log.">📋 Decisions</button>
         </div>
         <div class="goal-subtab-body">
           <div class="goal-subtab-panel active" id="gtab-north-star-${project.id}">

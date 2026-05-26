@@ -231,4 +231,6 @@ secrets.local.env
 
 meridian.toml
 *.toml
+!pixi.toml
+!.cliff.toml
 CONNECT.txt

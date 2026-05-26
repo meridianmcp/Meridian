@@ -82,20 +82,20 @@ For decisions: use pin_decision MCP tool, which also appends to DECISIONS.md.
 <current_state>
 <!-- Auto-updated by Meridian. Do not edit manually. -->
 Project: meridian-build (5787cc92)
-Last updated: 2026-05-25 10:48 UTC
-Sprint: v2.1 — demo route + hosted tier polish + pre-launch
+Last updated: 2026-05-26 09:37 UTC
+Sprint: pre-launch — polish sprint: LICENSE fix, chat banner removal, demo fixes, swimlane, backburner status, session focus dropdown, Pro plan card accuracy, one-liner install
 North Star: Meridian is the open-source coordination layer for AI coding sessions — persistent memory, task tracking, and session coordination that your AI tools don't provide.  Core value: "Your AI sessions don'…
 Recent:
-  - [DONE] DECISION: STRATEGIC: Meridian TAM is broader than Claude Code users. Model-agnostic design means it serves anyone routin
-  - [DONE] DECISION: POSITIONING: Primary customer is Tier 2 developer — knows MCP exists, has tried Desktop Commander, has a 500-l
-  - [DONE] DECISION: MESSAGING: Show HN opener should be the context debt framing — not multi-agent orchestration. Lead with: Claud
-  - [DONE] NOTE: Anthropic IE problem analysis — best model, but dogfooding in a bubble. Anthropic employees are not normal develop
-  - [DONE] NOTE: Codebase context — 14k lines (server.py 5060, db.py 4079, dashboard.js 3673, hosted.py 1447) built in ~7-8 days. P
+  - [DONE] Claude Code docs session complete: password gate, pixi install guide, overage details, copyright 2026, logo in nav/READM
+  - [DONE] OBSERVED: Swimlane showing only goal marker, bad colors, claude-worker not associated with alice/bob. Delete my account 
+  - [DONE] DECISION: Install docs use pixi official installers verbatim. Show platform check pattern: if pixi not installed, show c
+  - [DONE] DECISION: Lead install docs with one-liner (curl pixi install + git clone + pixi run start). Three commands, 30 seconds.
+  - [DONE] DOCS HANDOFF WRITTEN: docs.usemeridian.us update handoff (478 lines, 10 tasks). Tasks: (1) JS password gate in MkDocs th
 </current_state>
 
 ---
 <!-- MERIDIAN STATE — auto-generated, do not edit below -->
-## Current Sprint State  _(auto-updated 2026-05-25 14:53 UTC)_
+## Current Sprint State  _(auto-updated 2026-05-26 10:34 UTC)_
 
 **Key Files:**
 - `meridian/server.py` — FastAPI app + MCP handlers

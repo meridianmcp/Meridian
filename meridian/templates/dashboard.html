@@ -11,7 +11,7 @@
 <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
 <!-- Chart.js for activity charts in Rewind subtab. -->
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
-<link rel="stylesheet" href="/static/dashboard.css?v={{ version }}">
+<link rel="stylesheet" href="/static/dashboard.css?v={{ asset_version or version }}">
 </head>
 <body>
 {% if demo_mode %}<div id="demo-banner" style="position:fixed;top:0;left:0;right:0;z-index:10000;background:#7c3aed;color:#fff;padding:8px 16px;font-size:12px;font-family:'IBM Plex Mono',monospace;display:flex;align-items:center;gap:12px">&#x1f9ed; <strong>Demo mode</strong> — read-only. Data resets periodically. &nbsp;<a href="https://usemeridian.us" style="color:#ddd6fe;text-decoration:underline">Get your own instance →</a><span style="margin-left:auto;color:rgba(255,255,255,.6)">usemeridian.us</span></div>{% endif %}
@@ -121,7 +121,7 @@
   </div>
 </div>
 
-<script src="/static/dashboard.js?v={{ version }}"></script>
+<script src="/static/dashboard.js?v={{ asset_version or version }}"></script>
 
 </body>
 </html>

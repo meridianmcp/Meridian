@@ -41,6 +41,29 @@ def _read_version() -> str:
 _VERSION = _read_version()
 
 
+def _read_git_sha() -> str:
+    """Short git SHA for cache-busting static assets — falls back to version on errors."""
+    env_sha = os.environ.get("MERIDIAN_GIT_SHA", "")
+    if env_sha:
+        return env_sha[:12]
+    try:
+        import subprocess
+        out = subprocess.check_output(
+            ["git", "rev-parse", "--short=12", "HEAD"],
+            cwd=Path(__file__).parent.parent,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=2,
+        ).strip()
+        return out or _VERSION
+    except Exception:
+        return _VERSION
+
+
+_GIT_SHA = _read_git_sha()
+_ASSET_VERSION = f"{_VERSION}-{_GIT_SHA}" if _GIT_SHA != _VERSION else _VERSION
+
+
 def _load_meridian_md() -> str:
     """v2.3 — load the MERIDIAN.md session-instructions file.
 
@@ -67,7 +90,7 @@ from typing import Any
 
 import aiosqlite
 from fastapi import FastAPI, HTTPException, Request, WebSocket
-from fastapi.responses import HTMLResponse, PlainTextResponse, Response, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
@@ -2070,7 +2093,11 @@ async def dashboard_html(request: Request) -> Any:
     if os.environ.get("DEMO_PASSWORD"):
         if not _check_demo_cookie(request):
             return HTMLResponse(_demo_gate_html())
-    return _templates.TemplateResponse(request, "dashboard.html", {"version": _VERSION, "demo_mode": False})
+    return _templates.TemplateResponse(
+        request,
+        "dashboard.html",
+        {"version": _VERSION, "asset_version": _ASSET_VERSION, "demo_mode": False},
+    )
 
 
 @app.get("/demo", response_class=HTMLResponse)
@@ -2082,7 +2109,9 @@ async def demo_dashboard(request: Request) -> Any:
     Exempt from SITE_PASSWORD gate so the URL is always public.
     """
     response = _templates.TemplateResponse(
-        request, "dashboard.html", {"version": _VERSION, "demo_mode": True}
+        request,
+        "dashboard.html",
+        {"version": _VERSION, "asset_version": _ASSET_VERSION, "demo_mode": True},
     )
     response.set_cookie(
         _DEMO_CONTEXT_COOKIE,
@@ -3668,23 +3697,29 @@ async def start_session_endpoint(
 
 
 @app.post("/admin/shutdown")
-async def admin_shutdown() -> dict[str, bool]:
+async def admin_shutdown(request: Request) -> Response:
     """v1.7.0 — gracefully stop the server process.
 
     Returns immediately with ``{"ok": True}`` then sends SIGINT to the
     current process after a short delay so the HTTP response has time to
     flush. The dashboard shows a "restart required" message on receipt.
     """
+    if _is_demo_request(request):
+        return JSONResponse(
+            {"detail": "Not available in demo mode. Sign up at usemeridian.us"},
+            status_code=403,
+        )
+
     async def _delayed_shutdown() -> None:
         await asyncio.sleep(0.5)
         os.kill(os.getpid(), signal.SIGINT)
 
     asyncio.create_task(_delayed_shutdown())
-    return {"ok": True}
+    return JSONResponse({"ok": True})
 
 
 @app.post("/admin/restart")
-async def admin_restart() -> dict[str, bool]:
+async def admin_restart(request: Request) -> Response:
     """v1.9.x — restart the server by spawning a new process then shutting down.
 
     Spawns ``pixi run start`` (falling back to the current Python interpreter)
@@ -3692,6 +3727,12 @@ async def admin_restart() -> dict[str, bool]:
     HTTP response flushes first.  The dashboard polls ``/health`` and reloads
     when the new process is ready.
     """
+    if _is_demo_request(request):
+        return JSONResponse(
+            {"detail": "Not available in demo mode. Sign up at usemeridian.us"},
+            status_code=403,
+        )
+
     import subprocess
     import sys
 
@@ -3734,7 +3775,7 @@ async def admin_restart() -> dict[str, bool]:
         os.kill(os.getpid(), signal.SIGINT)
 
     asyncio.create_task(_delayed_restart())
-    return {"ok": True}
+    return JSONResponse({"ok": True})
 
 
 @app.get("/admin/snapshot")

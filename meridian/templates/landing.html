@@ -484,15 +484,15 @@
   <div class="self-host">
     <h2>Self-host in 30 seconds</h2>
     <p class="lede">Local SQLite by default. Connect your own Postgres for shared team state. Free forever for personal use.</p>
-    <pre><span class="h"># macOS / Linux — install pixi (skip if already installed)</span>
+    <pre><span class="h"># macOS / Linux</span>
 <span class="c">$</span> curl -fsSL https://pixi.sh/install.sh | bash
+<span class="c">$</span> git clone https://github.com/meridianmcp/Meridian
+<span class="c">$</span> cd Meridian &amp;&amp; pixi run start
 
 <span class="h"># Windows PowerShell</span>
-<span class="h"># iwr -useb https://pixi.sh/install.ps1 | iex</span>
-
-<span class="c">$</span> git clone https://github.com/meridianmcp/Meridian
-<span class="c">$</span> cd Meridian &amp;&amp; pixi install
-<span class="c">$</span> pixi run start
+<span class="c">&gt;</span> iwr -useb https://pixi.sh/install.ps1 | iex
+<span class="c">&gt;</span> git clone https://github.com/meridianmcp/Meridian
+<span class="c">&gt;</span> cd Meridian; pixi run start
 
 <span class="h"># dashboard → http://localhost:7878/dashboard</span>
 <span class="h"># MCP endpoint → claude-code, cursor, windsurf all auto-discover via stdio</span></pre>
@@ -569,6 +569,7 @@
     <a href="https://docs.usemeridian.us" target="_blank" rel="noopener">Docs</a>
     <a href="https://github.com/meridianmcp/Meridian" target="_blank" rel="noopener">GitHub</a>
     <a href="https://github.com/meridianmcp/Meridian/blob/main/LICENSE">License · MSL-1.0</a>
+    <a href="https://github.com/meridianmcp/Meridian/blob/main/CHANGELOG.md">Changelog</a>
   </div>
   <div>© 2026 Meridian · Open source · MSL-1.0</div>
   <div class="footer-powered">
