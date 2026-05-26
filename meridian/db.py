@@ -142,6 +142,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     name TEXT NOT NULL,
     human_id TEXT,
     session_type TEXT DEFAULT 'human',
+    client_type TEXT,
     status TEXT NOT NULL DEFAULT 'active'
         CHECK (status IN ('active','idle','closed','archived')),
     last_seen TEXT NOT NULL DEFAULT (datetime('now')),
@@ -338,6 +339,16 @@ CREATE TABLE IF NOT EXISTS neon_pool_projects (
         CHECK (tier IN ('standard','pro')),
     customer_count INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- v2.5 — admins: DB-managed admin email list. Replaces MERIDIAN_ADMIN_EMAILS env var.
+-- Env var still works as bootstrap fallback (before DB is available).
+CREATE TABLE IF NOT EXISTS admins (
+    id TEXT PRIMARY KEY,
+    email TEXT NOT NULL UNIQUE,
+    added_by TEXT,
+    added_at TEXT NOT NULL DEFAULT (datetime('now')),
+    notes TEXT
 );
 """
 
@@ -616,6 +627,11 @@ async def _migrate_overage_fields(db: aiosqlite.Connection) -> None:
     await _migrate_add_column_if_missing(db, "tenants", "storage_gb_used", "NUMERIC(10,4) DEFAULT 0")
     await _migrate_add_column_if_missing(db, "tenants", "overage_reset_at", "TEXT")
     await _migrate_add_column_if_missing(db, "tenants", "compute_throttled_at", "TEXT")
+
+
+async def _migrate_v26_client_type(db: aiosqlite.Connection) -> None:
+    """v2.6 — sessions.client_type: claude-code | claude-desktop | cursor | other."""
+    await _migrate_add_column_if_missing(db, "sessions", "client_type", "TEXT")
 
 
 async def _migrate_sprint_item_dependencies(db: aiosqlite.Connection) -> None:
@@ -1075,6 +1091,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_dunning_fields(db)
     await _migrate_overage_fields(db)
     await _migrate_sprint_item_dependencies(db)
+    await _migrate_v26_client_type(db)
     return db
 
 
@@ -1561,6 +1578,7 @@ async def register_session(
     human_id: str | None = None,
     session_type: str = "human",
     agent_framework: str = "claude_code",
+    client_type: str | None = None,
 ) -> dict[str, Any]:
     """Create a session row in 'active' state.
 
@@ -1576,14 +1594,17 @@ async def register_session(
     Team tab can render badges. One of: claude_code (default), cursor,
     windsurf, langgraph, autogen, openviking, custom. Free-form string —
     unknown values render as 'custom' in the UI.
+
+    ``client_type`` (v2.6) identifies the client app: claude-code, claude-desktop,
+    cursor, or other. Optional — used for presence indicators in the dashboard.
     """
     if session_type not in {"human", "worker"}:
         raise ValueError(f"invalid session_type: {session_type!r}")
     sid = _new_id()
     await db.execute(
-        "INSERT INTO sessions (id, project_id, name, human_id, session_type, agent_framework) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
-        (sid, project_id, name, human_id, session_type, agent_framework),
+        "INSERT INTO sessions (id, project_id, name, human_id, session_type, agent_framework, client_type) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (sid, project_id, name, human_id, session_type, agent_framework, client_type),
     )
     await db.commit()
     async with db.execute(
@@ -1906,7 +1927,25 @@ async def heartbeat_session(
     """Touch ``last_seen`` so the idle-expiry sweep leaves this session
     alone. Returns True when the session exists; False otherwise so the
     HTTP layer can 404 cleanly. Used by long-running workers that don't
-    call ``log_task`` often enough to keep the 30 minute TTL fresh."""
+    call ``log_task`` often enough to keep the 30 minute TTL fresh.
+
+    Optimization: if ``last_seen`` is within 5 minutes (e.g. because a
+    tool call already updated it), skip the write — the session is fresh."""
+    async with db.execute(
+        "SELECT id, last_seen FROM sessions WHERE id = ? AND status != 'closed'",
+        (session_id,),
+    ) as cur:
+        row = await cur.fetchone()
+    if not row:
+        return False
+    last_seen = (row["last_seen"] if isinstance(row, dict) else row[1]) or ""
+    try:
+        ls_dt = datetime.fromisoformat(last_seen.replace(" ", "T")).replace(tzinfo=timezone.utc)
+        age_s = (datetime.now(timezone.utc) - ls_dt).total_seconds()
+        if age_s < 300:
+            return True  # fresh from a recent tool call — no-op
+    except (ValueError, AttributeError):
+        pass
     cursor = await db.execute(
         "UPDATE sessions SET last_seen = datetime('now') "
         "WHERE id = ? AND status != 'closed'",

@@ -426,7 +426,7 @@ def _post_login_redirect(tenant: dict) -> str:
     import os as _os
     stripe_live = _os.environ.get("STRIPE_LIVE", "").lower() in ("1", "true", "yes")
     if stripe_live and not stripe_id:
-        return "/#pricing?signup=1"
+        return "/onboarding"
     plan = (tenant or {}).get("plan") or "standard"
     if stripe_live and plan in ("cancelled", "expired", "trial_expired"):
         return "/#pricing?reactivate=1"
@@ -605,12 +605,25 @@ _ADMIN_COOKIE = "meridian_admin"
 
 
 def is_admin(email: str) -> bool:
-    """Return True if email is in the MERIDIAN_ADMIN_EMAILS whitelist."""
+    """Return True if email is in the MERIDIAN_ADMIN_EMAILS whitelist (env var fallback)."""
     whitelist_raw = os.environ.get("MERIDIAN_ADMIN_EMAILS", os.environ.get("ADMIN_EMAIL", ""))
     if not whitelist_raw:
         return False
     admins = {e.strip().lower() for e in whitelist_raw.split(",") if e.strip()}
     return email.lower() in admins
+
+
+async def is_admin_db(email: str, db: Any) -> bool:
+    """Return True if email is in the admins DB table, or the env var fallback."""
+    try:
+        rows = await db.fetchall(
+            "SELECT id FROM admins WHERE email = %s", (email.lower(),)
+        )
+        if rows:
+            return True
+    except Exception:  # noqa: BLE001 — table may not exist on older DBs
+        pass
+    return is_admin(email)
 
 
 def check_admin_password(request: Request) -> bool:

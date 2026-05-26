@@ -2064,9 +2064,25 @@ async function loadSettingsTab(projectId) {
           copyBtn.disabled = false;
           fileNote.textContent = `Demo key — sign up at usemeridian.us for a real one`;
         } else {
-          configBlock.textContent = 'Generate an API key to see your config';
-          copyBtn.disabled = true;
-          fileNote.textContent = '';
+          // Show placeholder config so the structure is immediately visible
+          const placeholderKey = 'mk_live_' + 'x'.repeat(32);
+          const placeholderCfg = JSON.stringify({
+            mcpServers: {
+              meridian: {
+                command: 'npx',
+                args: ['-y', 'meridian-mcp@latest'],
+                env: {
+                  MERIDIAN_API_KEY: placeholderKey,
+                  MERIDIAN_PROJECT_ID: currentPid || 'your-project-id',
+                  MERIDIAN_BASE_URL: baseUrl,
+                },
+              },
+            },
+          }, null, 2);
+          configBlock.textContent = placeholderCfg;
+          copyBtn.disabled = false;
+          fileNote.textContent = `Save to: ${cli.file}`;
+          if (copyStatus) copyStatus.textContent = 'Click "Generate API key" to replace the placeholder with your real key.';
         }
       }
 
@@ -2096,7 +2112,7 @@ async function loadSettingsTab(projectId) {
             currentToken = tok.token;
             renderConfig();
             copyBtn.disabled = false;
-            if (copyStatus) copyStatus.textContent = 'Key generated — save it, it won\'t be shown again.';
+            if (copyStatus) copyStatus.textContent = 'Real key generated — save it, it won\'t be shown again.';
           } catch (e) {
             if (copyStatus) copyStatus.textContent = `error: ${escapeHtml(String(e))}`;
           } finally {

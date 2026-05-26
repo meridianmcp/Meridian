@@ -340,6 +340,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     name TEXT NOT NULL,
     human_id TEXT,
     session_type TEXT DEFAULT 'human',
+    client_type TEXT,
     status TEXT NOT NULL DEFAULT 'active',
     last_seen TEXT NOT NULL DEFAULT ({_TS}),
     created_at TEXT NOT NULL DEFAULT ({_TS}),
@@ -510,6 +511,15 @@ CREATE TABLE IF NOT EXISTS magic_link_tokens (
     created_at TEXT NOT NULL DEFAULT ({_TS})
 );
 CREATE INDEX IF NOT EXISTS idx_magic_email ON magic_link_tokens(email, used_at);
+
+-- v2.5 — admins: DB-managed admin email list. Replaces MERIDIAN_ADMIN_EMAILS env var.
+CREATE TABLE IF NOT EXISTS admins (
+    id TEXT PRIMARY KEY,
+    email TEXT NOT NULL UNIQUE,
+    added_by TEXT,
+    added_at TEXT NOT NULL DEFAULT ({_TS}),
+    notes TEXT
+);
 """
 
 # Backward-compat alias — the test suite imports this name directly.
@@ -569,10 +579,12 @@ async def init_pg_db(url: str) -> PostgresConnection:
     await _migrate_pg_drop_chat_tables(conn)
     await _migrate_pg_goal_field_timestamps(conn)
     await _migrate_pg_v24_task_tree_and_framework(conn)
+    await _migrate_pg_v26_client_type(conn)
     await _migrate_pg_v24_pinned_decisions_and_hitl(conn)
     await _migrate_pg_v09_notes_and_magic_links(conn)
     if is_main_db:
         await _migrate_pg_v10_tenant_columns(conn)
+        await _migrate_pg_v25_admins_table(conn)
     return conn
 
 
@@ -608,6 +620,13 @@ async def _migrate_pg_v24_task_tree_and_framework(conn: PostgresConnection) -> N
         "ALTER TABLE task_log ADD COLUMN IF NOT EXISTS parent_task_id TEXT;"
         "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS agent_framework TEXT DEFAULT 'claude_code';"
         "ALTER TABLE projects ADD COLUMN IF NOT EXISTS project_token TEXT"
+    )
+
+
+async def _migrate_pg_v26_client_type(conn: PostgresConnection) -> None:
+    """v2.6 — sessions.client_type for client app presence indicators."""
+    await conn.executescript(
+        "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS client_type TEXT"
     )
 
 
@@ -686,3 +705,31 @@ async def _migrate_pg_sprint_items_v2(conn: PostgresConnection) -> None:
         "ALTER TABLE sprint_items ADD COLUMN IF NOT EXISTS pushed_to TEXT;"
         "ALTER TABLE sprint_items ADD COLUMN IF NOT EXISTS human_id TEXT"
     )
+
+
+async def _migrate_pg_v25_admins_table(conn: PostgresConnection) -> None:
+    """v2.5 — create admins table and seed known admin emails.
+
+    Idempotent: CREATE IF NOT EXISTS + INSERT ... ON CONFLICT DO NOTHING.
+    """
+    import uuid as _uuid
+    await conn.executescript(
+        f"CREATE TABLE IF NOT EXISTS admins ("
+        f"    id TEXT PRIMARY KEY,"
+        f"    email TEXT NOT NULL UNIQUE,"
+        f"    added_by TEXT,"
+        f"    added_at TEXT NOT NULL DEFAULT ({_TS}),"
+        f"    notes TEXT"
+        f");"
+    )
+    seed_emails = [
+        ("hello@usemeridian.us", "primary owner"),
+        ("hello@usemeridian.us", "secondary account"),
+        ("[admin-redacted]", "team"),
+    ]
+    for email, notes in seed_emails:
+        await conn.execute(
+            "INSERT INTO admins (id, email, added_by, notes) VALUES (%s, %s, %s, %s)"
+            " ON CONFLICT (email) DO NOTHING",
+            (str(_uuid.uuid4()), email, "system", notes),
+        )
