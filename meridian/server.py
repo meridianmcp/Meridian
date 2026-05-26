@@ -889,22 +889,83 @@ def _hosted_mode() -> bool:
     return os.environ.get("MERIDIAN_HOSTED", "").lower() in ("1", "true", "yes")
 
 
-def _db(request: Request) -> aiosqlite.Connection:
-    """Pull the active DB connection off ``app.state``.
+# Per-tenant DB connections cached by tenant_id (opened on first use, never closed).
+_tenant_db_cache: dict[str, Any] = {}
 
-    Returns the demo DB when the meridian_demo cookie is set and a demo DB
-    was initialised from MERIDIAN_DEMO_DB_URL.
+
+async def _open_tenant_db_by_id(request: Request, tenant_id: str) -> Any:
+    """Return the cached DB for tenant_id, opening it if not yet cached."""
+    if tenant_id in _tenant_db_cache:
+        return _tenant_db_cache[tenant_id]
+    from . import db as db_module
+    from .pg_adapter import open_pg_connection
+    auth_db = request.app.state.db
+    tenant = await db_module.get_tenant_by_id(auth_db, tenant_id)
+    if not tenant or not tenant.get("neon_db_url"):
+        return auth_db
+    url = db_module.decrypt_field(tenant["neon_db_url"])
+    if not url:
+        return auth_db
+    conn = await open_pg_connection(url)
+    _tenant_db_cache[tenant_id] = conn
+    return conn
+
+
+async def _db(request: Request) -> Any:
+    """Return the active DB for this request.
+
+    - Demo cookie → demo DB
+    - Hosted mode + session cookie → tenant's own Neon DB (cached)
+    - Hosted mode + Bearer token → tenant's own Neon DB (cached)
+    - Otherwise → app.state.db
     """
+    # Per-request cache so repeated await _db(request) calls within one handler are free.
+    cached = getattr(request.state, "_db_conn", None)
+    if cached is not None:
+        return cached
+
     if request.cookies.get(_DEMO_CONTEXT_COOKIE):
         demo_db = getattr(request.app.state, "demo_db", None)
         if demo_db is not None:
+            request.state._db_conn = demo_db
             return demo_db
         # HARD FAIL — never fall through to production DB under demo cookie
         raise HTTPException(
             status_code=503,
             detail="Demo DB not available. Set MERIDIAN_DEMO_DB_URL to enable the demo.",
         )
-    return request.app.state.db
+
+    if _hosted_mode():
+        from .hosted import _SESSION_COOKIE, _read_session_cookie
+        from . import db as db_module
+
+        # Try session cookie first
+        cookie_val = request.cookies.get(_SESSION_COOKIE)
+        if cookie_val:
+            session_id = _read_session_cookie(cookie_val)
+            if session_id:
+                auth_db = request.app.state.db
+                session = await db_module.get_user_session(auth_db, session_id)
+                if session:
+                    conn = await _open_tenant_db_by_id(request, session["tenant_id"])
+                    request.state._db_conn = conn
+                    return conn
+
+        # Try Bearer token
+        auth_header = request.headers.get("authorization", "")
+        if auth_header.startswith("Bearer "):
+            token = auth_header[7:]
+            token_hash = hashlib.sha256(token.encode()).hexdigest()
+            auth_db = request.app.state.db
+            tenant = await db_module.get_tenant_from_token_hash(auth_db, token_hash)
+            if tenant:
+                conn = await _open_tenant_db_by_id(request, tenant["id"])
+                request.state._db_conn = conn
+                return conn
+
+    conn = request.app.state.db
+    request.state._db_conn = conn
+    return conn
 
 
 def _data_dir(request: Request) -> str:
@@ -1152,7 +1213,7 @@ async def list_tools_endpoint() -> list[dict[str, Any]]:
 @app.get("/projects", response_model=list[Project])
 async def list_projects(request: Request) -> list[dict[str, Any]]:
     """List every project."""
-    return await db_module.list_projects(_db(request))
+    return await db_module.list_projects(await _db(request))
 
 
 @app.post("/projects", response_model=Project, status_code=201)
@@ -1160,20 +1221,20 @@ async def create_project(
     body: ProjectCreate, request: Request
 ) -> dict[str, Any]:
     """Create a new project. 409 if the name is already in use."""
-    existing = await db_module.get_project_by_name(_db(request), body.name)
+    existing = await db_module.get_project_by_name(await _db(request), body.name)
     if existing is not None:
         raise HTTPException(
             status_code=409, detail=f"project '{body.name}' already exists"
         )
     return await db_module.create_project(
-        _db(request), body.name, human_id=body.human_id
+        await _db(request), body.name, human_id=body.human_id
     )
 
 
 @app.get("/setup/needed")
 async def setup_needed(request: Request) -> dict[str, Any]:
     """Returns {needed: true} if no projects exist yet (first-run wizard trigger)."""
-    projects = await db_module.list_projects(_db(request))
+    projects = await db_module.list_projects(await _db(request))
     return {"needed": len(projects) == 0}
 
 
@@ -1184,7 +1245,7 @@ async def get_project_by_name(name: str, request: Request) -> dict[str, Any]:
     Returns the project row plus a brief goal summary so a cold session
     can confirm it found the right project without a second round-trip.
     """
-    db = _db(request)
+    db = await _db(request)
     # Exact match first (most common case).
     project = await db_module.get_project_by_name(db, name)
     if project is None:
@@ -1209,7 +1270,7 @@ async def get_project_by_name(name: str, request: Request) -> dict[str, Any]:
 @app.get("/projects/{project_id}", response_model=Project)
 async def get_project(project_id: str, request: Request) -> dict[str, Any]:
     """Look up a project by id."""
-    project = await db_module.get_project(_db(request), project_id)
+    project = await db_module.get_project(await _db(request), project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="project not found")
     return project
@@ -1223,13 +1284,13 @@ async def rename_project(
     new_name = str(body.get("name") or "").strip()
     if not new_name:
         raise HTTPException(400, "name is required")
-    project = await db_module.get_project(_db(request), project_id)
+    project = await db_module.get_project(await _db(request), project_id)
     if project is None:
         raise HTTPException(404, "project not found")
-    existing = await db_module.get_project_by_name(_db(request), new_name)
+    existing = await db_module.get_project_by_name(await _db(request), new_name)
     if existing and existing["id"] != project_id:
         raise HTTPException(409, f"project '{new_name}' already exists")
-    updated = await db_module.rename_project(_db(request), project_id, new_name)
+    updated = await db_module.rename_project(await _db(request), project_id, new_name)
     db_module.publish_global(
         {"type": "project_renamed", "project_id": project_id, "name": new_name}
     )
@@ -1242,11 +1303,11 @@ async def delete_project(project_id: str, request: Request) -> None:
 
     Returns 409 if any tasks are in_progress, 404 if the project is unknown.
     """
-    project = await db_module.get_project(_db(request), project_id)
+    project = await db_module.get_project(await _db(request), project_id)
     if project is None:
         raise HTTPException(404, "project not found")
     try:
-        await db_module.delete_project(_db(request), project_id)
+        await db_module.delete_project(await _db(request), project_id)
     except ValueError as exc:
         raise HTTPException(409, str(exc)) from exc
 
@@ -1262,13 +1323,13 @@ async def get_goal(project_id: str, request: Request) -> dict[str, Any]:
 
     404 if the project does not exist or the goal hasn't been set yet.
     """
-    project = await db_module.get_project(_db(request), project_id)
+    project = await db_module.get_project(await _db(request), project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="project not found")
-    goal = await db_module.get_goal(_db(request), project_id)
+    goal = await db_module.get_goal(await _db(request), project_id)
     if goal is None:
         raise HTTPException(status_code=404, detail="goal not set")
-    recent = await db_module.get_tasks(_db(request), project_id, limit=5)
+    recent = await db_module.get_tasks(await _db(request), project_id, limit=5)
     goal["ambient_tasks"] = [
         {
             "status": t["status"],
@@ -1281,13 +1342,13 @@ async def get_goal(project_id: str, request: Request) -> dict[str, Any]:
     # can paint green / amber / red dots and so cold sessions see
     # which fields have gone stale before doing anything.
     field_ages = await db_module.get_goal_field_ages(
-        _db(request), project_id
+        await _db(request), project_id
     )
     coherence = db_module.compute_coherence_warning(field_ages)
     goal["field_ages"] = field_ages
     goal["coherence_warning"] = coherence
     # v1.1.4 — append-only decisions log.
-    decisions = await db_module.get_decisions(_db(request), project_id)
+    decisions = await db_module.get_decisions(await _db(request), project_id)
     goal["decisions"] = decisions
     # v0.6.1 — also serve the XML envelope so MCP / cache-aware consumers
     # don't have to re-stitch fields locally. The JSON keys stay for the
@@ -1310,11 +1371,11 @@ async def patch_goal_mode(
     project_id: str, body: GoalModeSet, request: Request
 ) -> dict[str, str]:
     """Switch a project between 'manual' and 'auto' goal modes."""
-    project = await db_module.get_project(_db(request), project_id)
+    project = await db_module.get_project(await _db(request), project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="project not found")
     try:
-        await db_module.set_goal_mode(_db(request), project_id, body.mode)
+        await db_module.set_goal_mode(await _db(request), project_id, body.mode)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
     return {"project_id": project_id, "goal_mode": body.mode}
@@ -1323,10 +1384,10 @@ async def patch_goal_mode(
 @app.get("/projects/{project_id}/goal-mode")
 async def get_goal_mode(project_id: str, request: Request) -> dict[str, str]:
     """Return the current goal mode for a project."""
-    project = await db_module.get_project(_db(request), project_id)
+    project = await db_module.get_project(await _db(request), project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="project not found")
-    mode = await db_module.get_goal_mode(_db(request), project_id)
+    mode = await db_module.get_goal_mode(await _db(request), project_id)
     return {"project_id": project_id, "goal_mode": mode}
 
 
@@ -1342,10 +1403,10 @@ async def set_goal(
     (legacy callers, MCP workers that don't claim an identity) keep
     their old write privilege.
     """
-    project = await db_module.get_project(_db(request), project_id)
+    project = await db_module.get_project(await _db(request), project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="project not found")
-    owner = await db_module.get_project_owner(_db(request), project_id)
+    owner = await db_module.get_project_owner(await _db(request), project_id)
     if owner is not None and body.human_id is not None and body.human_id != owner:
         raise HTTPException(
             status_code=403,
@@ -1358,11 +1419,11 @@ async def set_goal(
             },
         )
     result = await db_module.set_goal(
-        _db(request), project_id, body.content,
+        await _db(request), project_id, body.content,
         north_star=body.north_star, sprint=body.sprint,
         minor=body.minor,
     )
-    await goal_md_module.sync_db_to_goal_md(_db(request), project_id)
+    await goal_md_module.sync_db_to_goal_md(await _db(request), project_id)
     return result
 
 
@@ -1375,10 +1436,10 @@ async def set_north_star(
     Owner-only: requires ``human_id`` matching the project creator.
     Returns the new goal version.
     """
-    project = await db_module.get_project(_db(request), project_id)
+    project = await db_module.get_project(await _db(request), project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="project not found")
-    owner = await db_module.get_project_owner(_db(request), project_id)
+    owner = await db_module.get_project_owner(await _db(request), project_id)
     if owner is not None and body.human_id != owner:
         raise HTTPException(
             status_code=403,
@@ -1389,9 +1450,9 @@ async def set_north_star(
         )
     try:
         result = await db_module.set_north_star(
-            _db(request), project_id, body.north_star
+            await _db(request), project_id, body.north_star
         )
-        await goal_md_module.sync_db_to_goal_md(_db(request), project_id)
+        await goal_md_module.sync_db_to_goal_md(await _db(request), project_id)
         return result
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
@@ -1406,14 +1467,14 @@ async def set_sprint(
     Any team member can update the sprint — no ownership check.
     Returns the new goal version.
     """
-    project = await db_module.get_project(_db(request), project_id)
+    project = await db_module.get_project(await _db(request), project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="project not found")
     try:
         result = await db_module.set_sprint(
-            _db(request), project_id, body.sprint
+            await _db(request), project_id, body.sprint
         )
-        await goal_md_module.sync_db_to_goal_md(_db(request), project_id)
+        await goal_md_module.sync_db_to_goal_md(await _db(request), project_id)
         return result
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
@@ -1430,12 +1491,12 @@ async def start_worker_session_endpoint(
     ``{session_id, task, worker_context}`` or 404 when there's no
     claimable task / the named task doesn't belong to this project.
     """
-    project = await db_module.get_project(_db(request), project_id)
+    project = await db_module.get_project(await _db(request), project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="project not found")
     try:
         return await db_module.start_worker_session(
-            _db(request),
+            await _db(request),
             project_id,
             task_id=(body or {}).get("task_id"),
         )
@@ -1449,13 +1510,13 @@ async def post_decision_endpoint(
 ) -> dict[str, Any]:
     """v1.1.4 — append a decision entry to the project's append-only
     decisions log. Body: ``{text}``."""
-    project = await db_module.get_project(_db(request), project_id)
+    project = await db_module.get_project(await _db(request), project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="project not found")
     text = (body.get("text") or "").strip()
     if not text:
         raise HTTPException(status_code=422, detail="text is required")
-    updated = await db_module.set_decision(_db(request), project_id, text)
+    updated = await db_module.set_decision(await _db(request), project_id, text)
     return {"project_id": project_id, "decisions": updated}
 
 
@@ -1470,10 +1531,10 @@ async def get_timeline_endpoint(
     have been dropped (the LIVE vtab covers active sessions instead).
     Pending/in_progress tasks belong on the LIVE tab, not in history.
     """
-    project = await db_module.get_project(_db(request), project_id)
+    project = await db_module.get_project(await _db(request), project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="project not found")
-    timeline = await db_module.get_timeline(_db(request), project_id)
+    timeline = await db_module.get_timeline(await _db(request), project_id)
     return {
         "tasks": [
             t for t in timeline.get("tasks", [])
@@ -1500,16 +1561,16 @@ async def get_rewind(
     without any other auth (Meridian is local-first; no token = no auth
     required, same as every other endpoint).
     """
-    project = await db_module.get_project(_db(request), project_id)
+    project = await db_module.get_project(await _db(request), project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="project not found")
     if token is not None:
-        stored = await db_module.get_rewind_token(_db(request), project_id)
+        stored = await db_module.get_rewind_token(await _db(request), project_id)
         if not stored or token != stored:
             raise HTTPException(status_code=403, detail="invalid rewind token")
     if days <= 0:
         raise HTTPException(status_code=422, detail="days must be positive")
-    return await db_module.get_rewind_data(_db(request), project_id, days)
+    return await db_module.get_rewind_data(await _db(request), project_id, days)
 
 
 @app.post("/projects/{project_id}/rewind-token")
@@ -1522,10 +1583,10 @@ async def post_rewind_token(
     the same value; teams can publish a link once without it rotating.
     Response: ``{"token": "<uuid4>", "expires": "never"}``.
     """
-    project = await db_module.get_project(_db(request), project_id)
+    project = await db_module.get_project(await _db(request), project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="project not found")
-    token = await db_module.get_or_create_rewind_token(_db(request), project_id)
+    token = await db_module.get_or_create_rewind_token(await _db(request), project_id)
     return {"token": token, "expires": "never"}
 
 
@@ -1539,10 +1600,10 @@ async def get_goal_history(
     only real content changes. Each entry: version, north_star,
     version_goal, sprint, created_at. Used by the Rewind goal subtab.
     """
-    project = await db_module.get_project(_db(request), project_id)
+    project = await db_module.get_project(await _db(request), project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="project not found")
-    return await db_module.get_goal_history(_db(request), project_id)
+    return await db_module.get_goal_history(await _db(request), project_id)
 
 
 @app.get("/projects/{project_id}/stats")
@@ -1554,11 +1615,11 @@ async def get_project_stats(
     Returns tasks/day series and sprint completion % per version.
     ``days`` defaults to 30, max 365.
     """
-    project = await db_module.get_project(_db(request), project_id)
+    project = await db_module.get_project(await _db(request), project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="project not found")
     days = max(1, min(days, 365))
-    return await db_module.get_project_stats(_db(request), project_id, days)
+    return await db_module.get_project_stats(await _db(request), project_id, days)
 
 
 # ---------------------------------------------------------------------------
@@ -1571,12 +1632,12 @@ async def list_sprint_items(
     project_id: str, request: Request, status: str | None = None
 ) -> list[dict[str, Any]]:
     """List sprint items, optionally filtered by status."""
-    project = await db_module.get_project(_db(request), project_id)
+    project = await db_module.get_project(await _db(request), project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="project not found")
     try:
         return await db_module.get_sprint_items(
-            _db(request), project_id, status=status
+            await _db(request), project_id, status=status
         )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
@@ -1594,7 +1655,7 @@ async def add_sprint_item_endpoint(
     ``group`` (alias ``item_group``) groups the item under a named objective
     on the sprint board.
     """
-    project = await db_module.get_project(_db(request), project_id)
+    project = await db_module.get_project(await _db(request), project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="project not found")
     version = (body.get("version") or "").strip()
@@ -1608,7 +1669,7 @@ async def add_sprint_item_endpoint(
     depends_on = body.get("depends_on") or None
     failure_mode = body.get("failure_mode") or None
     return await db_module.add_sprint_item(
-        _db(request), project_id, version, title,
+        await _db(request), project_id, version, title,
         group=group, human_id=human_id,
         depends_on=depends_on, failure_mode=failure_mode,
     )
@@ -1621,7 +1682,7 @@ async def complete_sprint_item_endpoint(
 ) -> dict[str, Any]:
     """Mark a sprint item ``done``. Optional body: ``{task_id}``."""
     item = await db_module.complete_sprint_item(
-        _db(request),
+        await _db(request),
         project_id,
         item_id,
         task_id=(body or {}).get("task_id"),
@@ -1629,7 +1690,7 @@ async def complete_sprint_item_endpoint(
     if item is None:
         raise HTTPException(status_code=404, detail="sprint item not found")
     await _update_roadmap_version_history(
-        _db(request), project_id, item["version"], _REPO_ROOT
+        await _db(request), project_id, item["version"], _REPO_ROOT
     )
     return item
 
@@ -1641,7 +1702,7 @@ async def skip_sprint_item_endpoint(
 ) -> dict[str, Any]:
     """Mark a sprint item ``skipped``. Optional body: ``{reason}``."""
     item = await db_module.skip_sprint_item(
-        _db(request),
+        await _db(request),
         project_id,
         item_id,
         reason=(body or {}).get("reason"),
@@ -1658,7 +1719,7 @@ async def fail_sprint_item_endpoint(
 ) -> dict[str, Any]:
     """Mark a sprint item ``failed``. Optional body: ``{reason}``."""
     item = await db_module.fail_sprint_item(
-        _db(request),
+        await _db(request),
         project_id,
         item_id,
         reason=(body or {}).get("reason"),
@@ -1673,7 +1734,7 @@ async def delete_sprint_item_endpoint(
     project_id: str, item_id: str, request: Request
 ) -> None:
     """Delete a sprint item permanently."""
-    db = _db(request)
+    db = await _db(request)
     await db.execute(
         "DELETE FROM sprint_items WHERE id = ? AND project_id = ?",
         (item_id, project_id),
@@ -1704,7 +1765,7 @@ async def patch_sprint_item_endpoint(
             raise HTTPException(status_code=422, detail="feedback_thumb must be -1 or 1")
     feedback_note = body.get("feedback_note")
     item = await db_module.patch_sprint_item(
-        _db(request), project_id, item_id, title=title, version=version,
+        await _db(request), project_id, item_id, title=title, version=version,
         feedback_thumb=feedback_thumb, feedback_note=feedback_note,
     )
     if item is None:
@@ -1722,7 +1783,7 @@ async def push_sprint_item_endpoint(
         raise HTTPException(status_code=422, detail="to_version is required")
     try:
         item = await db_module.push_sprint_item(
-            _db(request), project_id, item_id, to_version
+            await _db(request), project_id, item_id, to_version
         )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
@@ -1742,12 +1803,12 @@ async def get_sessions(
     Expires stale sessions (last_seen > 30 min ago) before returning so
     the dashboard doesn't accumulate ghost entries indefinitely.
     """
-    project = await db_module.get_project(_db(request), project_id)
+    project = await db_module.get_project(await _db(request), project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="project not found")
-    await _expire_and_generate_handoffs(_db(request), _data_dir(request))
+    await _expire_and_generate_handoffs(await _db(request), _data_dir(request))
     return await db_module.get_sessions(
-        _db(request), project_id, active_only=active_only
+        await _db(request), project_id, active_only=active_only
     )
 
 
@@ -1756,10 +1817,10 @@ async def get_tasks(
     project_id: str, request: Request, limit: int = 20
 ) -> list[dict[str, Any]]:
     """List recent tasks for a project, newest first."""
-    project = await db_module.get_project(_db(request), project_id)
+    project = await db_module.get_project(await _db(request), project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="project not found")
-    return await db_module.get_tasks(_db(request), project_id, limit=limit)
+    return await db_module.get_tasks(await _db(request), project_id, limit=limit)
 
 
 @app.get("/projects/{project_id}/tasks/claimable", response_model=list[Task])
@@ -1771,11 +1832,11 @@ async def get_claimable_tasks(
     Workers poll this endpoint to find work that isn't already locked
     by another session.
     """
-    project = await db_module.get_project(_db(request), project_id)
+    project = await db_module.get_project(await _db(request), project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="project not found")
     return await db_module.get_claimable_tasks(
-        _db(request), project_id, limit=limit
+        await _db(request), project_id, limit=limit
     )
 
 
@@ -1787,14 +1848,14 @@ async def claim_task_endpoint(
 ) -> dict[str, Any]:
     """Atomically claim a pending task. Returns ``claimed=False`` when
     another worker holds the lock — the worker should try the next row."""
-    project = await db_module.get_project(_db(request), project_id)
+    project = await db_module.get_project(await _db(request), project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="project not found")
     claimed = await db_module.claim_task(
-        _db(request), body.task_id, body.session_id
+        await _db(request), body.task_id, body.session_id
     )
     if claimed is None:
-        existing = await db_module.get_task(_db(request), body.task_id)
+        existing = await db_module.get_task(await _db(request), body.task_id)
         return {
             "task_id": body.task_id,
             "claimed": False,
@@ -1813,11 +1874,11 @@ async def release_task_endpoint(
 ) -> dict[str, Any]:
     """Release a previously-claimed task. 404 when no claim is held
     by the given session."""
-    project = await db_module.get_project(_db(request), project_id)
+    project = await db_module.get_project(await _db(request), project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="project not found")
     released = await db_module.release_task(
-        _db(request), body.task_id, body.session_id
+        await _db(request), body.task_id, body.session_id
     )
     if not released:
         raise HTTPException(
@@ -1832,7 +1893,7 @@ async def generate_handoff(
     project_id: str, request: Request
 ) -> dict[str, Any]:
     """Render and write the handoff file for a project."""
-    project = await db_module.get_project(_db(request), project_id)
+    project = await db_module.get_project(await _db(request), project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="project not found")
     # v2.4 — skip the Haiku ai_summary call when ANTHROPIC_API_KEY is
@@ -1842,7 +1903,7 @@ async def generate_handoff(
     # get instant handoffs; hosted deploys with the key get summaries.
     import os as _os
     skip_summary = not _os.environ.get("ANTHROPIC_API_KEY")
-    db = _db(request)
+    db = await _db(request)
     data_dir = _data_dir(request)
     try:
         path, content = await asyncio.wait_for(
@@ -1863,11 +1924,11 @@ async def register_session(
     body: SessionRegister, request: Request
 ) -> dict[str, Any]:
     """Create a session row tied to a project."""
-    project = await db_module.get_project(_db(request), body.project_id)
+    project = await db_module.get_project(await _db(request), body.project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="project not found")
     return await db_module.register_session(
-        _db(request), body.project_id, body.name,
+        await _db(request), body.project_id, body.name,
         human_id=body.human_id,
         agent_framework=body.agent_framework,
     )
@@ -1876,25 +1937,26 @@ async def register_session(
 @app.post("/sessions/{session_id}/close")
 async def close_session(session_id: str, request: Request) -> dict[str, str]:
     """Mark a session closed."""
-    async with _db(request).execute(
+    _req_db = await _db(request)
+    async with _req_db.execute(
         "SELECT id, project_id FROM sessions WHERE id = ?", (session_id,)
     ) as cur:
         row = await cur.fetchone()
     if row is None:
         raise HTTPException(status_code=404, detail="session not found")
     project_id = row["project_id"]
-    await db_module.close_session(_db(request), session_id)
+    await db_module.close_session(_req_db, session_id)
     try:
-        await db_module.summarize_session(_db(request), session_id)
+        await db_module.summarize_session(await _db(request), session_id)
     except Exception:
         pass
-    await _regenerate_claude_md(_db(request), project_id, _REPO_ROOT)
+    await _regenerate_claude_md(await _db(request), project_id, _REPO_ROOT)
     # v2.5 — auto-save handoff on session close so the file is always fresh.
     async def _auto_save_handoff() -> None:
         try:
             await asyncio.wait_for(
                 handoff_module.generate_handoff(
-                    _db(request), project_id, request.app.state.data_dir
+                    await _db(request), project_id, request.app.state.data_dir
                 ),
                 timeout=30.0,
             )
@@ -1912,7 +1974,7 @@ async def heartbeat_session(
     idle sweep. Long-running workers call this every few minutes so
     the 30 minute TTL doesn't expire them while they're still alive.
     404 when the session id is unknown or already closed."""
-    ok = await db_module.heartbeat_session(_db(request), session_id)
+    ok = await db_module.heartbeat_session(await _db(request), session_id)
     if not ok:
         raise HTTPException(status_code=404, detail="session not found")
     return {"status": "ok", "session_id": session_id}
@@ -1921,17 +1983,18 @@ async def heartbeat_session(
 @app.post("/tasks", response_model=Task, status_code=201)
 async def create_task(body: TaskCreate, request: Request) -> dict[str, Any]:
     """Append a task-log entry."""
-    project = await db_module.get_project(_db(request), body.project_id)
+    _req_db = await _db(request)
+    project = await db_module.get_project(_req_db, body.project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="project not found")
-    async with _db(request).execute(
+    async with _req_db.execute(
         "SELECT id FROM sessions WHERE id = ?", (body.session_id,)
     ) as cur:
         row = await cur.fetchone()
     if row is None:
         raise HTTPException(status_code=404, detail="session not found")
     return await db_module.log_task(
-        _db(request),
+        _req_db,
         body.session_id,
         body.project_id,
         body.description,
@@ -1949,12 +2012,12 @@ async def patch_task(
     Used by the dashboard to flip HITL tasks to done/failed when the
     human replies. 404 when the id is unknown, 422 on invalid status.
     """
-    existing = await db_module.get_task(_db(request), task_id)
+    existing = await db_module.get_task(await _db(request), task_id)
     if existing is None:
         raise HTTPException(status_code=404, detail="task not found")
     try:
         updated = await db_module.update_task(
-            _db(request),
+            await _db(request),
             task_id,
             status=body.status,
             description=body.description,
@@ -1969,7 +2032,7 @@ async def patch_task(
 @app.delete("/projects/{project_id}/chat/history", status_code=204)
 async def clear_chat_history(project_id: str, request: Request) -> None:
     """Delete all chat messages and session for a project."""
-    database = _db(request)
+    database = await _db(request)
     await database.execute("DELETE FROM chat_messages WHERE project_id = ?", (project_id,))
     await database.execute("DELETE FROM chat_sessions WHERE project_id = ?", (project_id,))
     await database.commit()
@@ -1987,10 +2050,10 @@ async def get_chat_history(
     The dashboard calls this on tab open to restore conversation history
     across page refreshes. Returns an empty list when no messages exist yet.
     """
-    project = await db_module.get_project(_db(request), project_id)
+    project = await db_module.get_project(await _db(request), project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="project not found")
-    return await db_module.get_chat_history(_db(request), project_id, limit=limit)
+    return await db_module.get_chat_history(await _db(request), project_id, limit=limit)
 
 
 @app.get("/projects/{project_id}/export/pdf")
@@ -2005,7 +2068,7 @@ async def export_project_pdf(project_id: str, request: Request):
     from fpdf import FPDF
     import io
 
-    db = _db(request)
+    db = await _db(request)
     project = await db_module.get_project(db, project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="project not found")
@@ -2151,7 +2214,7 @@ async def dashboard_chat(body: ChatRequest, request: Request):
     stream finishes. A ``chat_sessions`` row is created on first use so
     future CLI ``--resume`` support has a home for the session handle.
     """
-    project = await db_module.get_project(_db(request), body.project_id)
+    project = await db_module.get_project(await _db(request), body.project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="project not found")
 
@@ -2162,7 +2225,7 @@ async def dashboard_chat(body: ChatRequest, request: Request):
         body = body.model_copy(update={"system_prompt": model_hint + "\n\n" + body.system_prompt})
     else:
         body = body.model_copy(update={"system_prompt": model_hint})
-    db = _db(request)
+    db = await _db(request)
     project_id = body.project_id
 
     # Persist the user's message and ensure a chat session exists.
@@ -2238,7 +2301,7 @@ async def list_project_files(
     Files that do not yet exist on disk are still listed so the user can
     create them from the dashboard. 403 is raised if the project is unknown.
     """
-    project = await db_module.get_project(_db(request), project_id)
+    project = await db_module.get_project(await _db(request), project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="project not found")
     return _EDITABLE_FILES
@@ -2253,7 +2316,7 @@ async def get_project_file(
     Returns ``{"filename": ..., "content": ...}`` with an empty string when
     the file does not yet exist. 403 if the filename is not in the allow-list.
     """
-    project = await db_module.get_project(_db(request), project_id)
+    project = await db_module.get_project(await _db(request), project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="project not found")
     if filename not in _EDITABLE_FILES:
@@ -2273,7 +2336,7 @@ async def put_project_file(
     Creates the file if it does not exist. 403 if the filename is not in the
     allow-list. Returns ``{"filename": ..., "size": <bytes>}``.
     """
-    project = await db_module.get_project(_db(request), project_id)
+    project = await db_module.get_project(await _db(request), project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="project not found")
     if filename not in _EDITABLE_FILES:
@@ -2369,19 +2432,19 @@ async def get_project_context_block(
     """
     if mode not in ("full", "chat"):
         raise HTTPException(status_code=400, detail="mode must be 'full' or 'chat'")
-    project = await db_module.get_project(_db(request), project_id)
+    project = await db_module.get_project(await _db(request), project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="project not found")
-    goal = await db_module.get_goal(_db(request), project_id)
+    goal = await db_module.get_goal(await _db(request), project_id)
     sprint_items = await db_module.get_sprint_items(
-        _db(request), project_id, status="pending"
+        await _db(request), project_id, status="pending"
     )
-    all_tasks = await db_module.get_tasks(_db(request), project_id, limit=20)
+    all_tasks = await db_module.get_tasks(await _db(request), project_id, limit=20)
     pending_tasks = [
         t for t in all_tasks if t.get("status") in ("pending", "in_progress", "done")
     ][:10]
     sessions = await db_module.get_sessions(
-        _db(request), project_id, active_only=True
+        await _db(request), project_id, active_only=True
     )
     decisions_raw = (project.get("decisions") or "").strip()
     recent_decisions = [
@@ -2405,16 +2468,16 @@ async def get_project_context(
     Returns: north_star, current_sprint, sprint_items (pending), recent_decisions
     (last 5), pending_tasks (last 10), recent_sessions (last 5), file_map.
     """
-    project = await db_module.get_project(_db(request), project_id)
+    project = await db_module.get_project(await _db(request), project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="project not found")
-    goal = await db_module.get_goal(_db(request), project_id)
+    goal = await db_module.get_goal(await _db(request), project_id)
     sprint_items = await db_module.get_sprint_items(
-        _db(request), project_id, status="pending", show_blocked=False
+        await _db(request), project_id, status="pending", show_blocked=False
     )
-    all_tasks = await db_module.get_tasks(_db(request), project_id, limit=20)
+    all_tasks = await db_module.get_tasks(await _db(request), project_id, limit=20)
     pending_tasks = [t for t in all_tasks if t["status"] in ("pending", "in_progress")][:10]
-    sessions = await db_module.get_sessions(_db(request), project_id, active_only=True)
+    sessions = await db_module.get_sessions(await _db(request), project_id, active_only=True)
     decisions_raw = (project.get("decisions") or "").strip()
     recent_decisions = [l.strip() for l in decisions_raw.splitlines() if l.strip()][-5:]
     return {
@@ -2445,11 +2508,11 @@ async def list_pinned_decisions_endpoint(
     filters to ``status='active'`` so the dashboard renders just the
     live constitution.
     """
-    project = await db_module.get_project(_db(request), project_id)
+    project = await db_module.get_project(await _db(request), project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="project not found")
     return await db_module.get_pinned_decisions(
-        _db(request), project_id, include_superseded=include_superseded
+        await _db(request), project_id, include_superseded=include_superseded
     )
 
 
@@ -2458,7 +2521,7 @@ async def create_pinned_decision_endpoint(
     project_id: str, body: dict[str, Any], request: Request
 ) -> dict[str, Any]:
     """Create a new pinned decision."""
-    project = await db_module.get_project(_db(request), project_id)
+    project = await db_module.get_project(await _db(request), project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="project not found")
     title = (body.get("title") or "").strip()
@@ -2468,7 +2531,7 @@ async def create_pinned_decision_endpoint(
         raise HTTPException(status_code=400, detail="title and body required")
     try:
         return await db_module.pin_decision(
-            _db(request), project_id, title, text, category
+            await _db(request), project_id, title, text, category
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -2479,7 +2542,7 @@ async def update_pinned_decision_endpoint(
     project_id: str, decision_id: str, body: dict[str, Any], request: Request
 ) -> dict[str, Any]:
     """Patch fields, or supersede (pass new_title + new_body to atomically retire+create)."""
-    db = _db(request)
+    db = await _db(request)
     new_title = body.get("new_title")
     new_body = body.get("new_body")
     if new_title and new_body:
@@ -2514,7 +2577,7 @@ async def list_all_hitl(
     """Pending HITL requests across all projects (top-level dashboard panel)."""
     try:
         return await db_module.list_hitl_requests(
-            _db(request), None,
+            await _db(request), None,
             status=status if status != "all" else None,
             limit=limit,
         )
@@ -2529,7 +2592,7 @@ async def list_project_hitl(
     """HITL requests scoped to a single project."""
     try:
         return await db_module.list_hitl_requests(
-            _db(request), project_id,
+            await _db(request), project_id,
             status=status if status != "all" else None,
             limit=limit,
         )
@@ -2543,7 +2606,7 @@ async def create_hitl_endpoint(
 ) -> dict[str, Any]:
     """Create a HITL request. Sessions paused on blocking should POST then poll
     GET /hitl/{id} until status='answered'."""
-    project = await db_module.get_project(_db(request), project_id)
+    project = await db_module.get_project(await _db(request), project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="project not found")
     question = (body.get("question") or "").strip()
@@ -2551,7 +2614,7 @@ async def create_hitl_endpoint(
         raise HTTPException(status_code=400, detail="question required")
     try:
         return await db_module.request_hitl(
-            _db(request), project_id, question,
+            await _db(request), project_id, question,
             session_id=body.get("session_id"),
             context=body.get("context"),
             urgency=body.get("urgency", "normal"),
@@ -2564,7 +2627,7 @@ async def create_hitl_endpoint(
 @app.get("/hitl/{request_id}")
 async def get_hitl_endpoint(request_id: str, request: Request) -> dict[str, Any]:
     """Single HITL request lookup — sessions poll this to get the answer."""
-    r = await db_module.get_hitl_request(_db(request), request_id)
+    r = await db_module.get_hitl_request(await _db(request), request_id)
     if r is None:
         raise HTTPException(status_code=404, detail="hitl request not found")
     return r
@@ -2575,7 +2638,7 @@ async def patch_hitl_endpoint(
     request_id: str, body: dict[str, Any], request: Request
 ) -> dict[str, Any]:
     """Answer or dismiss a HITL request."""
-    db = _db(request)
+    db = await _db(request)
     action = (body.get("action") or "answer").lower()
     if action == "answer":
         answer = body.get("answer", "").strip()
@@ -2603,10 +2666,10 @@ async def list_project_notes_endpoint(
     project_id: str, request: Request, tag: str | None = None
 ) -> list[dict[str, Any]]:
     """Project notes (newest first). ``?tag=X`` filters by substring match."""
-    project = await db_module.get_project(_db(request), project_id)
+    project = await db_module.get_project(await _db(request), project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="project not found")
-    return await db_module.get_project_notes(_db(request), project_id, tag=tag)
+    return await db_module.get_project_notes(await _db(request), project_id, tag=tag)
 
 
 @app.post("/projects/{project_id}/notes", status_code=201)
@@ -2614,7 +2677,7 @@ async def create_project_note_endpoint(
     project_id: str, body: dict[str, Any], request: Request
 ) -> dict[str, Any]:
     """Create a new note. Body: {title, body, tags?}."""
-    project = await db_module.get_project(_db(request), project_id)
+    project = await db_module.get_project(await _db(request), project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="project not found")
     title = (body.get("title") or "").strip()
@@ -2622,7 +2685,7 @@ async def create_project_note_endpoint(
     if not title or not text:
         raise HTTPException(status_code=400, detail="title and body required")
     return await db_module.add_project_note(
-        _db(request), project_id, title, text, body.get("tags"),
+        await _db(request), project_id, title, text, body.get("tags"),
     )
 
 
@@ -2632,7 +2695,7 @@ async def update_project_note_endpoint(
 ) -> dict[str, Any]:
     """Patch title/body/tags."""
     result = await db_module.update_project_note(
-        _db(request), note_id,
+        await _db(request), note_id,
         title=body.get("title"),
         body=body.get("body"),
         tags=body.get("tags"),
@@ -2647,7 +2710,7 @@ async def delete_project_note_endpoint(
     project_id: str, note_id: str, request: Request
 ) -> Response:
     """Hard-delete a note. Returns 204 or 404."""
-    ok = await db_module.delete_project_note(_db(request), note_id)
+    ok = await db_module.delete_project_note(await _db(request), note_id)
     if not ok:
         raise HTTPException(status_code=404, detail="note not found")
     return Response(status_code=204)
@@ -2668,7 +2731,7 @@ async def get_team_summary_endpoint(
     Returns ``{period_days, humans:[...], active_count}``. Used by the
     Team tab cards, swimlane timeline, and standup digest.
     """
-    return await db_module.get_team_summary(_db(request), project_id, days)
+    return await db_module.get_team_summary(await _db(request), project_id, days)
 
 
 # ---------------------------------------------------------------------------
@@ -2701,7 +2764,7 @@ async def post_project_event(
     }
     ```
     """
-    db = _db(request)
+    db = await _db(request)
     auth_token = request.headers.get("X-Meridian-Token", "")
     project_by_token = await db_module.get_project_by_token(db, auth_token) if auth_token else None
     if project_by_token is None or project_by_token["id"] != project_id:
@@ -2749,7 +2812,7 @@ async def get_project_webhook_token(
     project_id: str, request: Request
 ) -> dict[str, Any]:
     """Mint-and-return the project webhook token. Shown ONCE in the UI."""
-    token = await db_module.ensure_project_token(_db(request), project_id)
+    token = await db_module.ensure_project_token(await _db(request), project_id)
     if token is None:
         raise HTTPException(status_code=404, detail="project not found")
     return {"project_id": project_id, "token": token}
@@ -3140,7 +3203,7 @@ async def update_notification_prefs(request: Request) -> dict[str, Any]:
     allowed_prefs = {"hitl", "stalled", "storage", "sprint"}
     prefs = {k: bool(v) for k, v in body.items() if k in allowed_prefs}
     await db_module.update_tenant(
-        _db(request), tenant["id"], notification_prefs=json.dumps(prefs)
+        request.app.state.db, tenant["id"], notification_prefs=json.dumps(prefs)
     )
     return {"status": "ok", "prefs": prefs}
 
@@ -3181,7 +3244,7 @@ async def workspace_invite(request: Request) -> dict[str, Any]:
         raise HTTPException(status_code=422, detail="valid email required")
     if role not in ("member", "viewer"):
         raise HTTPException(status_code=422, detail="role must be member or viewer")
-    db = _db(request)
+    db = request.app.state.db
     limit = _WORKSPACE_MEMBER_LIMITS.get(tenant.get("plan", "standard"), 25)
     count = await db_module.count_workspace_members(db, tenant["id"])
     if count >= limit:
@@ -3207,7 +3270,7 @@ async def workspace_accept(request: Request, token: str = "") -> HTMLResponse:
         return HTMLResponse("<h2>Invalid invite link.</h2><p><a href='/auth/login'>Sign in</a></p>", status_code=400)
     import hashlib
     token_hash = hashlib.sha256(token.encode()).hexdigest()
-    db = _db(request)
+    db = request.app.state.db
     invite = await db_module.get_workspace_invite_by_token_hash(db, token_hash)
     if not invite:
         return HTMLResponse(
@@ -3228,7 +3291,7 @@ async def workspace_list_members(request: Request) -> list[dict[str, Any]]:
         raise HTTPException(status_code=404)
     from .hosted import get_current_tenant
     tenant = await get_current_tenant(request)
-    members = await db_module.list_workspace_members(_db(request), tenant["id"])
+    members = await db_module.list_workspace_members(request.app.state.db, tenant["id"])
     return [
         {
             "id": m["id"],
@@ -3248,7 +3311,7 @@ async def workspace_remove_member(request: Request, member_id: str) -> None:
         raise HTTPException(status_code=404)
     from .hosted import get_current_tenant
     tenant = await get_current_tenant(request)
-    await db_module.delete_workspace_member(_db(request), member_id, tenant["id"])
+    await db_module.delete_workspace_member(request.app.state.db, member_id, tenant["id"])
 
 
 def _is_demo_request(request: Request) -> bool:
@@ -3270,7 +3333,7 @@ async def export_my_data(request: Request) -> Response:
         )
     from .hosted import get_current_tenant
     tenant = await get_current_tenant(request)
-    data = await db_module.export_tenant_data(_db(request), tenant["id"])
+    data = await db_module.export_tenant_data(request.app.state.db, tenant["id"])
     payload = json.dumps(data, indent=2, default=str).encode()
     email_slug = (tenant.get("email") or "user").split("@")[0][:20]
     filename = f"meridian-export-{email_slug}.json"
@@ -3306,7 +3369,7 @@ async def delete_account(request: Request) -> Response:
         asyncio.create_task(_drop_tenant_neon_database(tenant))
 
     email = tenant.get("email", "")
-    await db_module.delete_tenant_records(_db(request), tenant["id"])
+    await db_module.delete_tenant_records(request.app.state.db, tenant["id"])
 
     if email:
         asyncio.create_task(send_account_deleted_email(email))
@@ -3323,7 +3386,7 @@ async def get_mcp_config(request: Request) -> dict[str, Any]:
         raise HTTPException(status_code=404)
     from .hosted import get_current_tenant
     tenant = await get_current_tenant(request)
-    projects = await db_module.list_projects(_db(request))
+    projects = await db_module.list_projects(await _db(request))
     return {
         "projects": [{"id": p["id"], "name": p["name"]} for p in projects],
         "base_url": os.environ.get("MERIDIAN_SERVER_URL", "https://usemeridian.us"),
@@ -3370,7 +3433,7 @@ async def update_usage_caps(request: Request) -> dict[str, Any]:
     compute_cap = float(body.get("compute_cap") or 0)
     storage_cap = float(body.get("storage_cap") or 0)
     await db_module.update_tenant(
-        _db(request), tenant["id"],
+        request.app.state.db, tenant["id"],
         compute_overage_cap_usd=compute_cap,
         storage_overage_cap_usd=storage_cap,
     )
@@ -3499,7 +3562,7 @@ async def git_status() -> dict[str, Any]:
 @app.delete("/tasks/{task_id}", status_code=204)
 async def delete_task(task_id: str, request: Request) -> None:
     """Delete a single task_log entry by ID. Permanent, no undo."""
-    db = _db(request)
+    db = await _db(request)
     await db.execute("DELETE FROM task_log WHERE id = ?", (task_id,))
     await db.commit()
 
@@ -3511,17 +3574,18 @@ async def enqueue_task(body: EnqueueTask, request: Request) -> dict[str, Any]:
     synchronous task creation. The worker runs in the background; poll
     ``GET /projects/{id}/tasks`` to see the result land.
     """
-    project = await db_module.get_project(_db(request), body.project_id)
+    _req_db = await _db(request)
+    project = await db_module.get_project(_req_db, body.project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="project not found")
-    async with _db(request).execute(
+    async with _req_db.execute(
         "SELECT id FROM sessions WHERE id = ?", (body.session_id,)
     ) as cur:
         row = await cur.fetchone()
     if row is None:
         raise HTTPException(status_code=404, detail="session not found")
     return await enqueue_module.enqueue_claude_task(
-        _db(request),
+        _req_db,
         body.session_id,
         body.project_id,
         body.prompt,
@@ -3679,11 +3743,11 @@ async def start_session_endpoint(
     tasks, lists active sessions, and reports whether a handoff file already
     exists on disk. Replaces 4 separate MCP calls at session cold-start.
     """
-    project = await db_module.get_project(_db(request), project_id)
+    project = await db_module.get_project(await _db(request), project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="project not found")
     return await _start_session_composite(
-        _db(request),
+        await _db(request),
         project_id,
         body.session_name,
         _data_dir(request),
@@ -3787,7 +3851,7 @@ async def download_snapshot(request: Request) -> Response:
     database and streams that as a downloadable file.
     """
     headers = {"Content-Disposition": "attachment; filename=meridian-snapshot.db"}
-    db = _db(request)
+    db = await _db(request)
     db_url = os.environ.get("MERIDIAN_DB_URL")
 
     if not db_url:
@@ -3923,7 +3987,7 @@ async def join_waitlist(request: Request) -> dict[str, Any]:
     if not email or "@" not in email:
         raise HTTPException(status_code=422, detail="valid email required")
     note = (body.get("note") or "").strip() or None
-    db = _db(request)
+    db = await _db(request)
     try:
         entry = await db_module.add_waitlist_entry(db, email, note)
     except Exception as exc:
@@ -3936,7 +4000,7 @@ async def join_waitlist(request: Request) -> dict[str, Any]:
 @app.get("/waitlist")
 async def list_waitlist(request: Request) -> list[dict[str, Any]]:
     """GET all waitlist entries, newest first. Admin use only."""
-    db = _db(request)
+    db = request.app.state.db
     return await db_module.get_waitlist(db)
 
 
@@ -4029,7 +4093,7 @@ async def stripe_webhook(request: Request) -> dict[str, str]:
     )
     stripe_customer_id = event_obj.get("customer", "")
 
-    db = _db(request)
+    db = request.app.state.db
 
     # Dunning: payment failed → stamp payment_failed_at and return early.
     if event_type in ("invoice.payment_failed", "customer.subscription.past_due"):
@@ -4171,7 +4235,7 @@ async def create_api_token(request: Request) -> dict[str, Any]:
     except Exception:
         pass
     label = (body.get("label") or "").strip() or None
-    db = _db(request)
+    db = request.app.state.db
     raw_token, token_row = await db_module.create_api_token(db, tenant["id"], label)
     return {
         "token": raw_token,
@@ -4578,7 +4642,7 @@ async def remote_mcp(request: Request) -> Any:
     except Exception:
         return JSONResponse(_jsonrpc_err(None, -32700, "parse error"), status_code=400)
 
-    db = _db(request)
+    db = await _db(request)
     data_dir = _data_dir(request)
 
     if isinstance(body, list):
