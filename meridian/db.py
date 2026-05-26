@@ -4153,3 +4153,100 @@ async def consume_magic_token(
     )
     await db.commit()
     return row_dict
+
+
+# ---------------------------------------------------------------------------
+# Workspace members — team invite flow
+# ---------------------------------------------------------------------------
+
+
+async def create_workspace_invite(
+    db: aiosqlite.Connection,
+    tenant_id: str,
+    email: str,
+    role: str,
+    token_hash: str,
+) -> dict[str, Any]:
+    """Insert a pending workspace member row (joined_at=NULL)."""
+    mid = _new_id()
+    await db.execute(
+        "INSERT INTO workspace_members (id, tenant_id, email, role, token_hash) VALUES (?, ?, ?, ?, ?)",
+        (mid, tenant_id, email, role, token_hash),
+    )
+    await db.commit()
+    async with db.execute("SELECT * FROM workspace_members WHERE id = ?", (mid,)) as cur:
+        row = await cur.fetchone()
+    return _row_to_dict(row)
+
+
+async def get_workspace_invite_by_token_hash(
+    db: aiosqlite.Connection,
+    token_hash: str,
+) -> dict[str, Any] | None:
+    """Return a pending invite by token hash, or None if not found / already accepted."""
+    async with db.execute(
+        "SELECT * FROM workspace_members WHERE token_hash = ? AND joined_at IS NULL",
+        (token_hash,),
+    ) as cur:
+        row = await cur.fetchone()
+    return _row_to_dict(row)
+
+
+async def accept_workspace_invite(
+    db: aiosqlite.Connection,
+    member_id: str,
+) -> dict[str, Any] | None:
+    """Mark an invite as accepted (set joined_at, clear token_hash)."""
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc).isoformat()
+    await db.execute(
+        "UPDATE workspace_members SET joined_at = ?, token_hash = NULL WHERE id = ?",
+        (now, member_id),
+    )
+    await db.commit()
+    async with db.execute("SELECT * FROM workspace_members WHERE id = ?", (member_id,)) as cur:
+        row = await cur.fetchone()
+    return _row_to_dict(row)
+
+
+async def list_workspace_members(
+    db: aiosqlite.Connection,
+    tenant_id: str,
+) -> list[dict[str, Any]]:
+    """Return all workspace members (pending and accepted) for a tenant."""
+    async with db.execute(
+        "SELECT * FROM workspace_members WHERE tenant_id = ? ORDER BY invited_at ASC",
+        (tenant_id,),
+    ) as cur:
+        rows = await cur.fetchall()
+    return [_row_to_dict(r) for r in rows if r is not None]
+
+
+async def count_workspace_members(
+    db: aiosqlite.Connection,
+    tenant_id: str,
+) -> int:
+    """Return the total member count (pending + accepted) for a tenant."""
+    async with db.execute(
+        "SELECT COUNT(*) FROM workspace_members WHERE tenant_id = ?",
+        (tenant_id,),
+    ) as cur:
+        row = await cur.fetchone()
+    if row is None:
+        return 0
+    vals = list(row.values()) if hasattr(row, "values") else list(row)
+    return int(vals[0]) if vals else 0
+
+
+async def delete_workspace_member(
+    db: aiosqlite.Connection,
+    member_id: str,
+    tenant_id: str,
+) -> bool:
+    """Remove a workspace member row. Returns True (no-op on missing row)."""
+    await db.execute(
+        "DELETE FROM workspace_members WHERE id = ? AND tenant_id = ?",
+        (member_id, tenant_id),
+    )
+    await db.commit()
+    return True

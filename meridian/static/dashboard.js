@@ -2060,6 +2060,80 @@ async function loadSettingsTab(projectId) {
     }, 0);
   }
 
+  // Team members section (hosted mode only, uses mcpData as hosted-mode proxy)
+  if (mcpData) {
+    html += `<div style="margin-bottom:16px" id="members-section-${projectId}">
+      <div style="color:var(--accent);font-size:10px;letter-spacing:.06em;text-transform:uppercase;margin-bottom:10px;padding-bottom:4px;border-bottom:1px solid var(--border)">Team members</div>
+      <div id="members-list-${projectId}" style="margin-bottom:10px;font-size:11px;font-family:var(--font-mono)"><div style="color:var(--muted)">loading…</div></div>
+      <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
+        <input id="invite-email-${projectId}" type="email" placeholder="teammate@example.com" style="background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:4px 8px;flex:1;min-width:160px">
+        <select id="invite-role-${projectId}" style="background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:4px 6px">
+          <option value="member">member</option>
+          <option value="viewer">viewer</option>
+        </select>
+        <button id="invite-btn-${projectId}" class="primary" style="font-size:10px;padding:4px 10px">Invite</button>
+      </div>
+      <div id="invite-status-${projectId}" style="font-size:10px;color:var(--muted);margin-top:5px;min-height:14px"></div>
+    </div>`;
+
+    setTimeout(async () => {
+      const listEl = document.getElementById(`members-list-${projectId}`);
+      const inviteBtn = document.getElementById(`invite-btn-${projectId}`);
+      const inviteEmail = document.getElementById(`invite-email-${projectId}`);
+      const inviteRole = document.getElementById(`invite-role-${projectId}`);
+      const inviteStatus = document.getElementById(`invite-status-${projectId}`);
+
+      async function renderMembers() {
+        if (!listEl) return;
+        try {
+          const members = await api('/workspace/members');
+          if (!members || members.length === 0) {
+            listEl.innerHTML = '<div style="color:var(--muted);font-size:10px">No team members yet.</div>';
+            return;
+          }
+          listEl.innerHTML = members.map(m => `
+            <div style="display:flex;justify-content:space-between;align-items:center;padding:4px 0;border-bottom:1px solid var(--border)">
+              <span>${escapeHtml(m.email)} <span style="color:var(--muted)">${m.role}</span>${m.pending ? ' <span style="color:var(--accent-amber);font-size:9px">pending</span>' : ''}</span>
+              <button class="secondary" data-mid="${escapeHtml(m.id)}" style="font-size:9px;padding:2px 7px">×</button>
+            </div>`).join('');
+          listEl.querySelectorAll('button[data-mid]').forEach(btn => {
+            btn.onclick = async () => {
+              if (!confirm('Remove this member?')) return;
+              try {
+                await api(`/workspace/members/${btn.dataset.mid}`, { method: 'DELETE' });
+                renderMembers();
+              } catch(e) { alert('Error: ' + e); }
+            };
+          });
+        } catch(e) {
+          if (listEl) listEl.innerHTML = '<div style="color:var(--muted);font-size:10px">Members only available in hosted mode.</div>';
+        }
+      }
+      renderMembers();
+
+      if (inviteBtn) {
+        inviteBtn.onclick = async () => {
+          const email = (inviteEmail?.value || '').trim();
+          const role = inviteRole?.value || 'member';
+          if (!email) { if (inviteStatus) inviteStatus.textContent = 'Enter an email address.'; return; }
+          inviteBtn.disabled = true;
+          inviteBtn.textContent = 'Sending…';
+          try {
+            await api('/workspace/invite', { method: 'POST', body: JSON.stringify({ email, role }) });
+            if (inviteEmail) inviteEmail.value = '';
+            if (inviteStatus) { inviteStatus.textContent = `Invite sent to ${email}.`; setTimeout(() => { if (inviteStatus) inviteStatus.textContent = ''; }, 3000); }
+            renderMembers();
+          } catch(e) {
+            if (inviteStatus) inviteStatus.textContent = `Error: ${escapeHtml(String(e))}`;
+          } finally {
+            inviteBtn.disabled = false;
+            inviteBtn.textContent = 'Invite';
+          }
+        };
+      }
+    }, 0);
+  }
+
   // Notifications section
   if (prefs !== null) {
     html += `<div style="margin-bottom:12px">

@@ -515,38 +515,39 @@
       <hr class="plan-divider">
       <ul class="plan-features">
         <li>Managed Postgres — 1 GB included</li>
+        <li>50 CU-hours compute included</li>
         <li>Hosted dashboard at usemeridian.us</li>
         <li>Remote MCP endpoint (HTTPS + Bearer)</li>
-        <li>Unlimited projects · unlimited team members</li>
+        <li>Unlimited projects · up to 25 team members</li>
         <li>Google + GitHub + email sign-in</li>
         <li>HITL queue + pinned decisions</li>
         <li>Webhook intake for LangGraph / Autogen</li>
         <li>Connect your own Postgres DB</li>
         <li>Email support</li>
       </ul>
-      <div class="plan-note">Extra storage: <strong>$0.50 / GB-month</strong> auto-billed via Stripe</div>
+      <div class="plan-note">Overage: <strong>$0.16/CU-hr</strong> · <strong>$0.50/GB-mo</strong> · auto-billed via Stripe</div>
       <a href="{{ stripe_payment_link }}" class="plan-cta primary">Start free trial →</a>
     </div>
 
-    <!-- Pro — waitlist -->
+    <!-- Pro -->
     <div class="plan">
       <div class="plan-name">Pro</div>
       <div class="plan-price">$49<small> / mo</small></div>
-      <div class="plan-trial">Waitlist — early access</div>
+      <div class="plan-trial"><span class="ok">7-day free trial</span> · card required</div>
       <hr class="plan-divider">
       <ul class="plan-features">
         <li>Everything in Standard</li>
         <li>Managed Postgres — 10 GB included</li>
-        <li>Higher compute caps · faster queries</li>
+        <li>200 CU-hours compute included</li>
+        <li>Up to 50 team members</li>
         <li>Multiple environments (prod / staging / dev)</li>
         <li>Priority support · custom subdomain</li>
         <li>Team swimlane + standup digest</li>
         <li class="dim">SSO / SAML — when requested</li>
-        <li>Connect your own Postgres DB</li>
       </ul>
-      <div class="plan-note">Extra storage: <strong>$0.50 / GB-month</strong> auto-billed via Stripe</div>
-      {% if stripe_pro_checkout %}
-      <a href="{{ stripe_pro_checkout }}" class="plan-cta primary">Get Pro →</a>
+      <div class="plan-note">Overage: <strong>$0.16/CU-hr</strong> · <strong>$0.50/GB-mo</strong> · auto-billed via Stripe</div>
+      {% if stripe_pro_payment_link %}
+      <a href="{{ stripe_pro_payment_link }}" class="plan-cta primary">Get Pro →</a>
       {% else %}
       <a href="mailto:hello@usemeridian.us?subject=Pro%20waitlist" class="plan-cta secondary">Join waitlist</a>
       {% endif %}

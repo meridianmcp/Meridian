@@ -503,7 +503,8 @@ async def auth_github_callback(request: Request) -> RedirectResponse:
     email: str = userinfo.get("email", "")
     sub: str = userinfo.get("sub", "")  # "github:<id>"
     if not email:
-        raise HTTPException(status_code=400, detail="no email in GitHub profile — ensure your GitHub account has a verified public email")
+        from fastapi.responses import RedirectResponse as _Redirect
+        return _Redirect("/auth/email-required?provider=github", status_code=302)
 
     db = request.app.state.db
     tenant = await db_module.upsert_tenant(db, email=email, google_sub=sub)
@@ -965,6 +966,41 @@ async def send_welcome_email(
                 "from": from_addr,
                 "to": [email],
                 "subject": "Your Meridian API token",
+                "html": html_body,
+            },
+        )
+        resp.raise_for_status()
+
+
+async def send_invite_email(
+    email: str,
+    invite_url: str,
+    inviter_email: str,
+) -> None:
+    """Send a workspace invite email via Resend. Silently skips in dev mode."""
+    import httpx
+
+    api_key = _cfg("RESEND_API_KEY")
+    if not api_key:
+        return
+
+    from_addr = _cfg("MERIDIAN_FROM_EMAIL", "Meridian <noreply@usemeridian.us>")
+    html_body = f"""<h2>You've been invited to Meridian</h2>
+<p><strong>{inviter_email}</strong> invited you to collaborate on Meridian — shared memory for AI coding sessions.</p>
+<p style="margin:24px 0">
+  <a href="{invite_url}" style="background:#6c8fff;color:#fff;padding:12px 24px;text-decoration:none;border-radius:6px;font-weight:700;display:inline-block">Accept invitation →</a>
+</p>
+<p style="color:#8b8fa8;font-size:.9em">Or copy this link: <code>{invite_url}</code></p>
+<p style="color:#8b8fa8;font-size:.9em">This link expires in 7 days. If you didn't expect this, you can ignore it.</p>"""
+
+    async with httpx.AsyncClient(timeout=15) as http:
+        resp = await http.post(
+            "https://api.resend.com/emails",
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            json={
+                "from": from_addr,
+                "to": [email],
+                "subject": f"{inviter_email} invited you to Meridian",
                 "html": html_body,
             },
         )

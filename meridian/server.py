@@ -892,10 +892,12 @@ async def landing_page(request: Request) -> HTMLResponse:
             return HTMLResponse(_demo_gate_html())
     stripe_payment_link = os.environ.get("STRIPE_PAYMENT_LINK", "/auth/login")
     stripe_pro_checkout = "/checkout?plan=pro" if os.environ.get("STRIPE_PRO_PRICE_ID") else ""
+    stripe_pro_payment_link = os.environ.get("STRIPE_PRO_PAYMENT_LINK", stripe_pro_checkout)
     return _templates.TemplateResponse(
         request, "landing.html", {
             "stripe_payment_link": stripe_payment_link,
             "stripe_pro_checkout": stripe_pro_checkout,
+            "stripe_pro_payment_link": stripe_pro_payment_link,
         }
     )
 
@@ -1005,6 +1007,29 @@ async def auth_microsoft_callback(request: Request):
     """Handle Microsoft OAuth callback — create/update tenant, set session cookie."""
     from .hosted import auth_microsoft_callback as _auth_microsoft_callback
     return await _auth_microsoft_callback(request)
+
+
+@app.get("/auth/email-required")
+async def auth_email_required(request: Request) -> HTMLResponse:
+    """Shown when OAuth provider returned no usable email (e.g. GitHub with private email)."""
+    provider = request.query_params.get("provider", "your provider")
+    html = f"""<!DOCTYPE html><html><head><meta charset=utf-8>
+<title>Email required — Meridian</title>
+<style>body{{font-family:system-ui,sans-serif;max-width:480px;margin:80px auto;padding:0 20px;color:#e8eaed;background:#0d1117}}
+h2{{color:#58a6ff}}p{{color:#8b949e;line-height:1.6}}a{{color:#58a6ff}}
+.card{{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:24px;margin-top:24px}}
+</style></head><body>
+<div class="card">
+<h2>Email address required</h2>
+<p>We couldn't get a verified email from {provider}. Meridian needs your email to create your account.</p>
+<p>To fix this:<br>
+&nbsp;&nbsp;1. Go to <a href="https://github.com/settings/emails" target="_blank" rel="noopener">github.com/settings/emails</a><br>
+&nbsp;&nbsp;2. Add and verify a primary email address<br>
+&nbsp;&nbsp;3. <a href="/auth/github/login">Try signing in again</a></p>
+<p>Or <a href="/auth/login">use a magic link</a> to sign in with your email directly.</p>
+</div>
+</body></html>"""
+    return HTMLResponse(html)
 
 
 @app.get("/auth/logout")
@@ -3042,6 +3067,94 @@ async def get_notification_prefs(request: Request) -> dict[str, Any]:
         except Exception:  # noqa: BLE001
             prefs = {}
     return {"prefs": prefs}
+
+
+_WORKSPACE_MEMBER_LIMITS: dict[str, int] = {"standard": 25, "pro": 50}
+
+
+@app.post("/workspace/invite", status_code=201)
+async def workspace_invite(request: Request) -> dict[str, Any]:
+    """Invite a new workspace member. Sends invite email via Resend."""
+    if not _hosted_mode():
+        raise HTTPException(status_code=404)
+    from .hosted import get_current_tenant, send_invite_email
+    import hashlib, secrets as _secrets
+    tenant = await get_current_tenant(request)
+    body = await request.json()
+    email = (body.get("email") or "").strip().lower()
+    role = (body.get("role") or "member").strip()
+    if not email or "@" not in email:
+        raise HTTPException(status_code=422, detail="valid email required")
+    if role not in ("member", "viewer"):
+        raise HTTPException(status_code=422, detail="role must be member or viewer")
+    db = _db(request)
+    limit = _WORKSPACE_MEMBER_LIMITS.get(tenant.get("plan", "standard"), 25)
+    count = await db_module.count_workspace_members(db, tenant["id"])
+    if count >= limit:
+        raise HTTPException(status_code=402, detail=f"Team member limit ({limit}) reached for your plan")
+    raw_token = _secrets.token_urlsafe(32)
+    token_hash = hashlib.sha256(raw_token.encode()).hexdigest()
+    invite = await db_module.create_workspace_invite(db, tenant["id"], email, role, token_hash)
+    base = os.environ.get("MERIDIAN_SERVER_URL", "https://usemeridian.us").rstrip("/")
+    invite_url = f"{base}/workspace/accept?token={raw_token}"
+    try:
+        await send_invite_email(email, invite_url, tenant["email"])
+    except Exception:
+        pass  # email failure doesn't block invite creation
+    return {"id": invite["id"], "email": email, "role": role, "pending": True}
+
+
+@app.get("/workspace/accept")
+async def workspace_accept(request: Request, token: str = "") -> HTMLResponse:
+    """Accept a workspace invite. Marks joined_at and redirects to dashboard."""
+    if not _hosted_mode():
+        raise HTTPException(status_code=404)
+    if not token:
+        return HTMLResponse("<h2>Invalid invite link.</h2><p><a href='/auth/login'>Sign in</a></p>", status_code=400)
+    import hashlib
+    token_hash = hashlib.sha256(token.encode()).hexdigest()
+    db = _db(request)
+    invite = await db_module.get_workspace_invite_by_token_hash(db, token_hash)
+    if not invite:
+        return HTMLResponse(
+            "<h2>Invite not found or already used.</h2><p><a href='/auth/login'>Sign in to Meridian</a></p>",
+            status_code=404,
+        )
+    await db_module.accept_workspace_invite(db, invite["id"])
+    # Ensure a tenant account exists for the invited email
+    await db_module.upsert_tenant(db, email=invite["email"])
+    from fastapi.responses import RedirectResponse as _Redir
+    return _Redir("/auth/login", status_code=302)
+
+
+@app.get("/workspace/members")
+async def workspace_list_members(request: Request) -> list[dict[str, Any]]:
+    """List all workspace members (pending and accepted) for the current tenant."""
+    if not _hosted_mode():
+        raise HTTPException(status_code=404)
+    from .hosted import get_current_tenant
+    tenant = await get_current_tenant(request)
+    members = await db_module.list_workspace_members(_db(request), tenant["id"])
+    return [
+        {
+            "id": m["id"],
+            "email": m["email"],
+            "role": m["role"],
+            "joined_at": m.get("joined_at"),
+            "pending": m.get("joined_at") is None,
+        }
+        for m in members
+    ]
+
+
+@app.delete("/workspace/members/{member_id}", status_code=204)
+async def workspace_remove_member(request: Request, member_id: str) -> None:
+    """Remove a workspace member or revoke a pending invite."""
+    if not _hosted_mode():
+        raise HTTPException(status_code=404)
+    from .hosted import get_current_tenant
+    tenant = await get_current_tenant(request)
+    await db_module.delete_workspace_member(_db(request), member_id, tenant["id"])
 
 
 @app.get("/settings/mcp-config")
