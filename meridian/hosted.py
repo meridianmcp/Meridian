@@ -1426,6 +1426,126 @@ async def run_churn_cleanup(db: Any) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Dunning flow — payment failure → warnings → hard delete
+# ---------------------------------------------------------------------------
+
+async def run_dunning_cleanup(db: Any) -> None:
+    """Warn failing-payment tenants on day 3 and day 7; hard delete on day 15.
+
+    Timeline (from payment_failed_at):
+      day 0  — Stripe fires invoice.payment_failed → payment_failed_at stamped
+      day 3  — first warning email  (dunning_email_sent = 1)
+      day 7  — final warning email  (dunning_email_sent = 2)
+      day 15 — cancel Stripe, delete all tenant data
+
+    Idempotent: dunning_email_sent tracks which emails have been sent.
+    A successful payment (invoice.paid) clears payment_failed_at and resets.
+    """
+    from datetime import datetime, timezone as _tz, timedelta as _td
+    import httpx
+
+    from . import db as db_module
+
+    now = datetime.now(tz=_tz.utc)
+    resend_key = _cfg("RESEND_API_KEY")
+    from_addr = _cfg("MERIDIAN_FROM_EMAIL", "Meridian <noreply@usemeridian.us>")
+    base = _cfg("MERIDIAN_BASE_URL", "https://usemeridian.us").rstrip("/")
+
+    tenants = await db_module.get_tenants_with_payment_failures(db)
+
+    for tenant in tenants:
+        raw_ts = tenant.get("payment_failed_at") or ""
+        if not raw_ts:
+            continue
+        try:
+            failed_at = datetime.fromisoformat(raw_ts.replace("Z", "+00:00"))
+        except (ValueError, AttributeError):
+            continue
+
+        days = (now - failed_at).days
+        email = tenant.get("email", "")
+        sent = int(tenant.get("dunning_email_sent") or 0)
+        tenant_id = tenant["id"]
+
+        if days >= 15:
+            # Hard delete — cancel Stripe, wipe data, send confirmation
+            stripe_id = tenant.get("stripe_customer_id")
+            if stripe_id:
+                await cancel_stripe_subscription(stripe_id)
+            if tenant.get("neon_project_id"):
+                await _drop_tenant_neon_database(tenant)
+            await db_module.delete_tenant_records(db, tenant_id)
+            if email:
+                try:
+                    async with httpx.AsyncClient(timeout=10) as http:
+                        await http.post(
+                            "https://api.resend.com/emails",
+                            headers={"Authorization": f"Bearer {resend_key}", "Content-Type": "application/json"},
+                            json={
+                                "from": from_addr,
+                                "to": [email],
+                                "subject": "Your Meridian account has been closed",
+                                "html": (
+                                    "<p>Your Meridian account has been closed due to a billing issue. "
+                                    "All data has been permanently deleted.</p>"
+                                    f"<p>To start a new account: <a href='{base}/auth/login'>{base}</a></p>"
+                                ),
+                            },
+                        )
+                except Exception:  # noqa: BLE001
+                    pass
+
+        elif days >= 7 and sent < 2 and resend_key:
+            # Day 7 — final warning
+            try:
+                async with httpx.AsyncClient(timeout=10) as http:
+                    await http.post(
+                        "https://api.resend.com/emails",
+                        headers={"Authorization": f"Bearer {resend_key}", "Content-Type": "application/json"},
+                        json={
+                            "from": from_addr,
+                            "to": [email],
+                            "subject": "Action required: Meridian payment failed — account closes in 8 days",
+                            "html": (
+                                "<p><strong>Your Meridian payment has failed.</strong> "
+                                "Your account and all data will be permanently deleted in 8 days "
+                                "unless your payment method is updated.</p>"
+                                f"<p><a href='{base}/auth/login'>Update payment →</a></p>"
+                                "<p>If you no longer want your account, no action needed — "
+                                "it will be automatically closed.</p>"
+                            ),
+                        },
+                    )
+                await db_module.update_tenant(db, tenant_id, dunning_email_sent=2)
+            except Exception:  # noqa: BLE001
+                pass
+
+        elif days >= 3 and sent < 1 and resend_key:
+            # Day 3 — first warning
+            try:
+                async with httpx.AsyncClient(timeout=10) as http:
+                    await http.post(
+                        "https://api.resend.com/emails",
+                        headers={"Authorization": f"Bearer {resend_key}", "Content-Type": "application/json"},
+                        json={
+                            "from": from_addr,
+                            "to": [email],
+                            "subject": "Meridian payment failed — please update your billing info",
+                            "html": (
+                                "<p>We couldn't process your Meridian payment. "
+                                "Please update your billing information to keep your account active.</p>"
+                                f"<p><a href='{base}/auth/login'>Update payment →</a></p>"
+                                "<p>Your account and data are safe for now. "
+                                "If we can't collect payment within 12 days, your account will be closed.</p>"
+                            ),
+                        },
+                    )
+                await db_module.update_tenant(db, tenant_id, dunning_email_sent=1)
+            except Exception:  # noqa: BLE001
+                pass
+
+
+# ---------------------------------------------------------------------------
 # v0.9 — Email magic-link authentication
 # ---------------------------------------------------------------------------
 

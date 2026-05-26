@@ -1573,3 +1573,83 @@ def test_dashboard_js_has_export_button():
     js = (Path(__file__).parent.parent / "meridian/static/dashboard.js").read_text(encoding="utf-8")
     assert "/export/my-data" in js
     assert "Delete my account" in js
+
+
+# ---------------------------------------------------------------------------
+# Dunning flow
+# ---------------------------------------------------------------------------
+
+
+def test_stripe_webhook_payment_failed_ignored_without_customer(client):
+    """invoice.payment_failed with no customer ID returns dunning_started (no-op)."""
+    r = client.post("/webhooks/stripe", json={
+        "type": "invoice.payment_failed",
+        "data": {"object": {"customer": "", "customer_email": "x@x.com"}},
+    })
+    assert r.status_code == 200
+    assert r.json()["status"] == "dunning_started"
+
+
+def test_stripe_webhook_past_due_returns_dunning_started(client):
+    """customer.subscription.past_due is handled and returns dunning_started."""
+    r = client.post("/webhooks/stripe", json={
+        "type": "customer.subscription.past_due",
+        "data": {"object": {"customer": "cus_test_abc", "customer_email": "x@x.com"}},
+    })
+    assert r.status_code == 200
+    assert r.json()["status"] == "dunning_started"
+
+
+def test_stripe_webhook_unknown_event_ignored(client):
+    """Unknown Stripe event types return ignored."""
+    r = client.post("/webhooks/stripe", json={
+        "type": "customer.subscription.deleted",
+        "data": {"object": {}},
+    })
+    assert r.status_code == 200
+    assert r.json()["status"] == "ignored"
+
+
+@pytest.mark.anyio
+async def test_dunning_fields_on_tenant_update():
+    """payment_failed_at and dunning_email_sent can be set via update_tenant."""
+    db = await db_module.init_db(":memory:")
+    import uuid
+    tid = str(uuid.uuid4())
+    from datetime import datetime, timezone
+    ts = datetime.now(timezone.utc).isoformat()
+    await db.execute(
+        "INSERT INTO tenants (id, email, plan) VALUES (?, ?, ?)",
+        (tid, "dunning@example.com", "standard"),
+    )
+    await db.commit()
+
+    await db_module.update_tenant(db, tid, payment_failed_at=ts, dunning_email_sent=0)
+    tenants = await db_module.get_tenants_with_payment_failures(db)
+    assert any(t["id"] == tid for t in tenants)
+
+    # Recovery: clear payment_failed_at
+    await db_module.update_tenant(db, tid, payment_failed_at=None, dunning_email_sent=0)
+    tenants = await db_module.get_tenants_with_payment_failures(db)
+    assert not any(t["id"] == tid for t in tenants)
+
+
+@pytest.mark.anyio
+async def test_get_tenant_by_stripe_customer():
+    """get_tenant_by_stripe_customer looks up by stripe_customer_id."""
+    db = await db_module.init_db(":memory:")
+    import uuid
+    tid = str(uuid.uuid4())
+    await db.execute(
+        "INSERT INTO tenants (id, email, plan) VALUES (?, ?, ?)",
+        (tid, "stripe@example.com", "standard"),
+    )
+    await db.commit()
+    await db_module.update_tenant(db, tid, stripe_customer_id="cus_test_999")
+
+    found = await db_module.get_tenant_by_stripe_customer(db, "cus_test_999")
+    assert found is not None
+    assert found["email"] == "stripe@example.com"
+
+    missing = await db_module.get_tenant_by_stripe_customer(db, "cus_nope")
+    assert missing is None

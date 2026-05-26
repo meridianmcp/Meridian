@@ -605,6 +605,11 @@ async def lifespan(app: FastAPI):
                             await run_storage_overage_check(db)
                         except Exception:  # noqa: BLE001
                             pass
+                        try:
+                            from .hosted import run_dunning_cleanup
+                            await run_dunning_cleanup(db)
+                        except Exception:  # noqa: BLE001
+                            pass
                 # v2.4 — refresh the CLAUDE.md <current_state> block for
                 # every project on each cycle. Local dev only — skipped
                 # on hosted multi-tenant deployments where there is no
@@ -3890,7 +3895,14 @@ async def stripe_webhook(request: Request) -> dict[str, str]:
         raise HTTPException(status_code=400, detail="invalid JSON") from exc
 
     event_type = event.get("type", "")
-    if event_type not in ("checkout.session.completed", "invoice.paid", "customer.subscription.created"):
+    _HANDLED = {
+        "checkout.session.completed",
+        "invoice.paid",
+        "customer.subscription.created",
+        "invoice.payment_failed",
+        "customer.subscription.past_due",
+    }
+    if event_type not in _HANDLED:
         return {"status": "ignored"}
 
     event_obj = event.get("data", {}).get("object", {})
@@ -3901,10 +3913,21 @@ async def stripe_webhook(request: Request) -> dict[str, str]:
     )
     stripe_customer_id = event_obj.get("customer", "")
 
+    db = _db(request)
+
+    # Dunning: payment failed → stamp payment_failed_at and return early.
+    if event_type in ("invoice.payment_failed", "customer.subscription.past_due"):
+        if stripe_customer_id:
+            tenant = await db_module.get_tenant_by_stripe_customer(db, stripe_customer_id)
+            if tenant and not tenant.get("payment_failed_at"):
+                from datetime import datetime, timezone as _tz
+                ts = datetime.now(_tz.utc).isoformat()
+                await db_module.update_tenant(db, tenant["id"], payment_failed_at=ts, dunning_email_sent=0)
+        return {"status": "dunning_started"}
+
     if not email:
         return {"status": "no_email"}
 
-    db = _db(request)
     # Resolve plan from checkout metadata (standard or pro); default to standard
     plan = event_obj.get("metadata", {}).get("plan", "standard")
     if plan not in ("standard", "pro"):
@@ -3915,6 +3938,11 @@ async def stripe_webhook(request: Request) -> dict[str, str]:
         tenant = await db_module.update_tenant(
             db, tenant["id"], stripe_customer_id=stripe_customer_id, plan=plan
         )
+        # Payment recovered — clear any dunning state
+        if tenant and tenant.get("payment_failed_at"):
+            tenant = await db_module.update_tenant(
+                db, tenant["id"], payment_failed_at=None, dunning_email_sent=0
+            )
 
     # Extract metered subscription item ID when overage price is configured.
     # Best-effort — never block provisioning if this fails.

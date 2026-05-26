@@ -540,6 +540,12 @@ async def _migrate_v25_feedback_and_notifications(db: aiosqlite.Connection) -> N
     )
 
 
+async def _migrate_dunning_fields(db: aiosqlite.Connection) -> None:
+    """v2.6 — dunning: track when a tenant's payment first failed."""
+    await _migrate_add_column_if_missing(db, "tenants", "payment_failed_at", "TEXT")
+    await _migrate_add_column_if_missing(db, "tenants", "dunning_email_sent", "INTEGER NOT NULL DEFAULT 0")
+
+
 async def _migrate_sprint_item_dependencies(db: aiosqlite.Connection) -> None:
     """v2.6 — sprint_items dependency tracking.
 
@@ -993,6 +999,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_v24_pinned_decisions_and_hitl(db)
     await _migrate_v09_notes_and_magic_links(db)
     await _migrate_v25_feedback_and_notifications(db)
+    await _migrate_dunning_fields(db)
     await _migrate_sprint_item_dependencies(db)
     return db
 
@@ -3428,7 +3435,7 @@ async def update_tenant(
     **fields: object,
 ) -> dict[str, Any] | None:
     """Update arbitrary columns on a tenant row. Returns updated dict or None."""
-    allowed = {"neon_project_id", "neon_db_url", "stripe_customer_id", "plan", "pool_project_id", "stripe_metered_item_id", "notification_prefs"}
+    allowed = {"neon_project_id", "neon_db_url", "stripe_customer_id", "plan", "pool_project_id", "stripe_metered_item_id", "notification_prefs", "payment_failed_at", "dunning_email_sent"}
     updates = {k: v for k, v in fields.items() if k in allowed}
     if not updates:
         return await get_tenant_by_id(db, tenant_id)
@@ -4307,6 +4314,33 @@ async def delete_workspace_member(
     )
     await db.commit()
     return True
+
+
+# ---------------------------------------------------------------------------
+# Dunning helpers
+# ---------------------------------------------------------------------------
+
+async def get_tenant_by_stripe_customer(
+    db: aiosqlite.Connection,
+    stripe_customer_id: str,
+) -> dict[str, Any] | None:
+    """Return tenant by stripe_customer_id, or None."""
+    async with db.execute(
+        "SELECT * FROM tenants WHERE stripe_customer_id = ?", (stripe_customer_id,)
+    ) as cur:
+        row = await cur.fetchone()
+    return _row_to_dict(row)
+
+
+async def get_tenants_with_payment_failures(
+    db: aiosqlite.Connection,
+) -> list[dict[str, Any]]:
+    """Return all tenants currently in dunning (payment_failed_at IS NOT NULL)."""
+    async with db.execute(
+        "SELECT * FROM tenants WHERE payment_failed_at IS NOT NULL"
+    ) as cur:
+        rows = await cur.fetchall()
+    return [_row_to_dict(r) for r in rows if r is not None]
 
 
 # ---------------------------------------------------------------------------
