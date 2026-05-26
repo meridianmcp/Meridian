@@ -594,6 +594,32 @@ async def auth_logout(request: Request) -> RedirectResponse:
 
 
 # ---------------------------------------------------------------------------
+# Admin helpers
+# ---------------------------------------------------------------------------
+
+_ADMIN_COOKIE = "meridian_admin"
+
+
+def is_admin(email: str) -> bool:
+    """Return True if email is in the MERIDIAN_ADMIN_EMAILS whitelist."""
+    whitelist_raw = os.environ.get("MERIDIAN_ADMIN_EMAILS", os.environ.get("ADMIN_EMAIL", ""))
+    if not whitelist_raw:
+        return False
+    admins = {e.strip().lower() for e in whitelist_raw.split(",") if e.strip()}
+    return email.lower() in admins
+
+
+def check_admin_password(request: Request) -> bool:
+    """Return True if the admin password cookie matches MERIDIAN_ADMIN_PASSWORD."""
+    import secrets
+    pwd = os.environ.get("MERIDIAN_ADMIN_PASSWORD", "")
+    if not pwd:
+        return True  # no password set — open (still protected by email whitelist)
+    cookie_val = request.cookies.get(_ADMIN_COOKIE, "")
+    return bool(cookie_val) and secrets.compare_digest(cookie_val, pwd)
+
+
+# ---------------------------------------------------------------------------
 # FastAPI dependencies
 # ---------------------------------------------------------------------------
 

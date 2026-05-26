@@ -2936,17 +2936,60 @@ async def ws_project(ws: WebSocket, project_id: str) -> None:
 
 
 
+@app.get("/admin/login", response_class=HTMLResponse)
+async def admin_login_page() -> HTMLResponse:
+    """Admin password gate for the /admin panel."""
+    html = """<!DOCTYPE html><html><head><meta charset=utf-8>
+<title>Admin login — Meridian</title>
+<style>body{font-family:system-ui,sans-serif;background:#0d1117;color:#e8eaed;display:grid;place-items:center;min-height:100vh;margin:0}
+form{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:32px;width:320px}
+h2{margin:0 0 20px;font-size:1.1rem}
+input{width:100%;padding:10px;background:#0d1117;border:1px solid #30363d;border-radius:4px;color:#e8eaed;font-size:.95rem;box-sizing:border-box;margin-bottom:12px}
+button{width:100%;padding:10px;background:#6c8fff;color:#fff;border:none;border-radius:4px;font-weight:700;cursor:pointer;font-size:.95rem}
+</style></head><body>
+<form method="post" action="/admin/login">
+<h2>⬡ Admin access</h2>
+<input type="password" name="password" placeholder="Admin password" autofocus autocomplete="current-password">
+<button type="submit">Enter</button>
+</form></body></html>"""
+    return HTMLResponse(html)
+
+
+@app.post("/admin/login")
+async def admin_login_post(request: Request) -> Any:
+    """Validate admin password and set signed cookie."""
+    from fastapi.responses import RedirectResponse
+    form = await request.form()
+    password = str(form.get("password", ""))
+    expected = os.environ.get("MERIDIAN_ADMIN_PASSWORD", "")
+    if not expected:
+        return RedirectResponse("/admin", status_code=303)
+    import secrets
+    if not secrets.compare_digest(password, expected):
+        return HTMLResponse("""<!DOCTYPE html><html><head><meta charset=utf-8>
+<title>Admin login — Meridian</title>
+<style>body{font-family:system-ui,sans-serif;background:#0d1117;color:#e8eaed;display:grid;place-items:center;min-height:100vh;margin:0}
+form{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:32px;width:320px}
+h2{margin:0 0 8px;font-size:1.1rem}p.err{color:#f85149;margin:0 0 12px;font-size:.9rem}
+input{width:100%;padding:10px;background:#0d1117;border:1px solid #30363d;border-radius:4px;color:#e8eaed;font-size:.95rem;box-sizing:border-box;margin-bottom:12px}
+button{width:100%;padding:10px;background:#6c8fff;color:#fff;border:none;border-radius:4px;font-weight:700;cursor:pointer;font-size:.95rem}
+</style></head><body><form method="post" action="/admin/login">
+<h2>⬡ Admin access</h2><p class="err">Incorrect password</p>
+<input type="password" name="password" placeholder="Admin password" autofocus>
+<button type="submit">Enter</button></form></body></html>""", status_code=401)
+    response = RedirectResponse("/admin", status_code=303)
+    response.set_cookie(
+        "meridian_admin", expected,
+        httponly=True, samesite="strict",
+        secure=os.environ.get("MERIDIAN_SERVER_URL", "").startswith("https://"),
+    )
+    return response
+
+
 @app.get("/admin", response_class=HTMLResponse)
 async def admin_dashboard(request: Request) -> Any:
-    """Admin dashboard — restricted to ADMIN_EMAIL via Google OAuth.
-
-    Shows active tenants, churn stats, Neon usage, recent signups, and
-    payment failures.  Returns 403 if the authenticated tenant is not the
-    admin email.
-    """
-    from .hosted import get_current_tenant
-
-    admin_email = os.environ.get("ADMIN_EMAIL", "")
+    """Admin dashboard — restricted to MERIDIAN_ADMIN_EMAILS + optional password."""
+    from .hosted import get_current_tenant, is_admin, check_admin_password
 
     try:
         tenant = await get_current_tenant(request)
@@ -2956,8 +2999,11 @@ async def admin_dashboard(request: Request) -> Any:
             status_code=302,
         )
 
-    if admin_email and tenant.get("email") != admin_email:
+    if not is_admin(tenant.get("email", "")):
         raise HTTPException(status_code=403, detail="admin access only")
+    if not check_admin_password(request):
+        from fastapi.responses import RedirectResponse
+        return RedirectResponse("/admin/login", status_code=302)
 
     db = request.app.state.db
 
@@ -3194,16 +3240,16 @@ async def mcp_tools_doc() -> str:
 
 @app.get("/admin/health")
 async def admin_health_json(request: Request) -> dict[str, Any]:
-    """JSON health check for ops/curl — restricted to ADMIN_EMAIL."""
-    from .hosted import get_current_tenant
-
-    admin_email = os.environ.get("ADMIN_EMAIL", "")
+    """JSON health check for ops/curl — restricted to MERIDIAN_ADMIN_EMAILS."""
+    from .hosted import get_current_tenant, is_admin, check_admin_password
     try:
         tenant = await get_current_tenant(request)
     except HTTPException:
         raise HTTPException(status_code=403, detail="not authenticated")
-    if admin_email and tenant.get("email") != admin_email:
+    if not is_admin(tenant.get("email", "")):
         raise HTTPException(status_code=403, detail="admin only")
+    if not check_admin_password(request):
+        raise HTTPException(status_code=403, detail="admin password required")
 
     db = request.app.state.db
 
