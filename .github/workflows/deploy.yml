@@ -39,10 +39,12 @@ jobs:
         with:
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
-      - name: Install git-cliff and generate CHANGELOG
-        run: |
-          pip install git-cliff
-          git cliff --output CHANGELOG.md
+      - uses: prefix-dev/setup-pixi@v0.8.1
+        with:
+          pixi-version: latest
+          cache: false
+      - name: Generate CHANGELOG
+        run: pixi run git-cliff --output CHANGELOG.md
       - name: Commit CHANGELOG.md if changed
         run: |
           git config user.name  "github-actions[bot]"
