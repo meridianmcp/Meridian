@@ -10,6 +10,27 @@ const state = {
   serverConfig: { server_url: '', host: '', port: 0, version: '' },
 };
 
+function isDemoMode() {
+  return !!state.serverConfig?.demo_mode || window.location.pathname.startsWith('/demo');
+}
+
+const STORAGE_KEY = (k) => (isDemoMode() ? 'meridian_demo_' : 'meridian_') + k.replace(/^meridian[._]/, '');
+
+function hideDemoAdminControls() {
+  const selectors = [
+    '#restart-server-btn',
+    '#stop-server-btn',
+    '#banner-restart-btn',
+    '#git-check-btn',
+    '#update-banner',
+    '#delete-account-section',
+    '[data-demo-hide]',
+  ];
+  selectors.forEach(sel => {
+    document.querySelectorAll(sel).forEach(el => { el.style.display = 'none'; });
+  });
+}
+
 function toast(msg, isError=false) {
   const el = document.getElementById('toast');
   el.textContent = msg;
@@ -46,19 +67,7 @@ async function loadServerConfig() {
       document.body.style.paddingTop = ((parseInt(document.body.style.paddingTop || '0', 10)) + 28) + 'px';
     }
     // Task 16 — hide destructive admin controls in demo mode
-    if (cfg?.demo_mode) {
-      const selectors = [
-        '#restart-server-btn',
-        '#stop-server-btn',
-        '#banner-restart-btn',
-        '#update-banner',
-        '#delete-account-section',
-        '[data-demo-hide]',
-      ];
-      selectors.forEach(sel => {
-        document.querySelectorAll(sel).forEach(el => { el.style.display = 'none'; });
-      });
-    }
+    if (cfg?.demo_mode) hideDemoAdminControls();
     // v1.9.x — update connection indicator
     _updateConnectionIndicator(cfg);
   } catch (e) { /* offline / older server — ignore */ }
@@ -233,6 +242,10 @@ function _updateConnectionIndicator(cfg) {
 
 // v1.9.x — POST /admin/restart then poll /health until up, then reload.
 async function checkGitStatus() {
+  if (isDemoMode()) {
+    hideDemoAdminControls();
+    return;
+  }
   const btn = document.getElementById('git-check-btn');
   if (btn) { btn.textContent = 'checking…'; btn.style.color = 'var(--muted)'; }
   try {
@@ -393,7 +406,7 @@ function closeTab(id) {
 
 function saveTabs() {
   try {
-    localStorage.setItem(TABS_KEY, JSON.stringify(state.tabs.map(t => t.id)));
+    localStorage.setItem(STORAGE_KEY(TABS_KEY), JSON.stringify(state.tabs.map(t => t.id)));
   } catch(e) {}
 }
 
@@ -548,7 +561,7 @@ function activateTab(id) {
   const empty = document.querySelector('.tab-bodies > .empty');
   if (empty) empty.remove();
   // Persist active project so a refresh reopens to the same tab.
-  try { localStorage.setItem(ACTIVE_PROJECT_KEY, id); } catch(e) {}
+  try { localStorage.setItem(STORAGE_KEY(ACTIVE_PROJECT_KEY), id); } catch(e) {}
   // Keep the sidebar dropdown in sync with whichever tab the user is on.
   const switcher = document.getElementById('project-switcher');
   if (switcher) switcher.value = id;
@@ -871,7 +884,7 @@ function buildTabBody(project) {
   // persists across reloads. activeVtab tracks which drawer panel is open.
   let initialMode = 'api';
   try {
-    const saved = localStorage.getItem('meridian.chatMode');
+    const saved = localStorage.getItem(STORAGE_KEY('meridian.chatMode'));
     if (saved === 'api' || saved === 'cli') initialMode = saved;
   } catch(e) {}
   state.panels[project.id] = {
@@ -1034,14 +1047,14 @@ function buildTabBody(project) {
   const modelSel = document.getElementById(`model-select-${project.id}`);
   if (modelSel) {
     const VALID_MODELS = ['claude-sonnet-4-6','claude-opus-4-6','claude-opus-4-7','claude-haiku-4-5-20251001'];
-    let savedModel = localStorage.getItem('meridian.chatModel') || 'claude-sonnet-4-6';
+    let savedModel = localStorage.getItem(STORAGE_KEY('meridian.chatModel')) || 'claude-sonnet-4-6';
     if (!VALID_MODELS.includes(savedModel)) savedModel = 'claude-sonnet-4-6';
     modelSel.value = savedModel;
     if (state.panels[project.id]) state.panels[project.id].chatModel = savedModel;
     modelSel.onchange = () => {
       const m = modelSel.value;
       if (state.panels[project.id]) state.panels[project.id].chatModel = m;
-      localStorage.setItem('meridian.chatModel', m);
+      localStorage.setItem(STORAGE_KEY('meridian.chatModel'), m);
       toast('model: ' + m);
     };
   }
@@ -1081,7 +1094,7 @@ function buildTabBody(project) {
       btn.onclick = () => {
         const mode = btn.dataset.mode;
         state.panels[project.id].chatMode = mode;
-        try { localStorage.setItem('meridian.chatMode', mode); } catch(e) {}
+        try { localStorage.setItem(STORAGE_KEY('meridian.chatMode'), mode); } catch(e) {}
         modeRoot.querySelectorAll('.mode-btn').forEach(b => {
           b.classList.toggle('active', b.dataset.mode === mode);
         });
@@ -1153,7 +1166,7 @@ function scheduleLiveRefresh(projectId) {
 
 function initLiveAutoRefresh(projectId) {
   const s = liveRefreshState[projectId] || (liveRefreshState[projectId] = {});
-  const stored = localStorage.getItem('meridian.liveAutoRefresh');
+  const stored = localStorage.getItem(STORAGE_KEY('meridian.liveAutoRefresh'));
   s.enabled = stored === null ? true : stored === 'true';
   const btn = document.getElementById(`live-auto-btn-${projectId}`);
   if (btn) {
@@ -1161,7 +1174,7 @@ function initLiveAutoRefresh(projectId) {
     btn.style.opacity = s.enabled ? '1' : '0.4';
     btn.onclick = () => {
       s.enabled = !s.enabled;
-      localStorage.setItem('meridian.liveAutoRefresh', String(s.enabled));
+      localStorage.setItem(STORAGE_KEY('meridian.liveAutoRefresh'), String(s.enabled));
       btn.textContent = s.enabled ? '↻ Auto' : '↻ Off';
       btn.style.opacity = s.enabled ? '1' : '0.4';
       if (s.enabled) scheduleLiveRefresh(projectId);
@@ -3627,6 +3640,10 @@ function connectWs(projectId) {
 
 function handleWsEvent(projectId, event) {
   if (event.type === 'update_available') {
+    if (isDemoMode()) {
+      hideDemoAdminControls();
+      return;
+    }
     const banner = document.getElementById('update-banner');
     if (banner) banner.style.display = 'block';
     return;
@@ -3789,7 +3806,7 @@ document.getElementById('new-project-btn').onclick = async () => {
 
 async function restoreTabs() {
   let saved = [];
-  try { saved = JSON.parse(localStorage.getItem(TABS_KEY) || '[]'); } catch(e){}
+  try { saved = JSON.parse(localStorage.getItem(STORAGE_KEY(TABS_KEY)) || '[]'); } catch(e){}
   for (const id of saved) {
     const p = state.projects.find(x => x.id === id);
     if (p) openTab(p);
@@ -3798,7 +3815,7 @@ async function restoreTabs() {
   // or — failing that — the first project in the list.
   if (state.tabs.length === 0 && state.projects.length > 0) {
     let preferred = null;
-    try { preferred = localStorage.getItem(ACTIVE_PROJECT_KEY); } catch(e) {}
+    try { preferred = localStorage.getItem(STORAGE_KEY(ACTIVE_PROJECT_KEY)); } catch(e) {}
     const fallback = state.projects.find(p => p.id === preferred) || state.projects[0];
     if (fallback) openTab(fallback);
   }
@@ -3812,6 +3829,7 @@ async function restoreTabs() {
   }
   await loadConfig();
   await loadProjects();
+  if (isDemoMode()) hideDemoAdminControls();
   // v0.6.6 — EZ first-run wizard: if no projects exist, show the overlay
   if (state.projects.length === 0) {
     document.getElementById('ez-wizard').style.display = 'flex';
