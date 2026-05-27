@@ -6,6 +6,7 @@ All notable changes to Meridian. Generated from git history via `git-cliff`.
 
 ### Bug Fixes
 
+- Fix: add backburner to all status Literal types in models.py and db.py — was causing 500 on any endpoint returning tasks ([48dd6f1](https://github.com/meridianmcp/Meridian/commit/48dd6f1ece3ca1297df6603a017a80fde10b8968))
 - Fix: encoding artifacts in terms.html and privacy.html ([04ca0ee](https://github.com/meridianmcp/Meridian/commit/04ca0eebeae2532a2ae80337575a154d7c421b0e))
 - Fix: GitHub OAuth — add github_sub column, fix upsert_tenant to use github_sub not google_sub ([cbdd056](https://github.com/meridianmcp/Meridian/commit/cbdd056605ad59f270d0d4fcbcd474c82e065f64))
 - Fix: exempt /mcp/tools-doc from site password gate so docs workflow fetches real content ([c537d1b](https://github.com/meridianmcp/Meridian/commit/c537d1b82fb39306f4c303b75dae9863dcaaff76))
@@ -21,6 +22,7 @@ All notable changes to Meridian. Generated from git history via `git-cliff`.
 
 ### Chores
 
+- Chore: update CHANGELOG ([6278980](https://github.com/meridianmcp/Meridian/commit/627898090a19bf3d98f632136a7d67df1abf610d))
 - Chore: update CHANGELOG ([9f2e1aa](https://github.com/meridianmcp/Meridian/commit/9f2e1aafb43b90cb59867aa5ce01d7f90978a9fe))
 - Chore: update CHANGELOG ([2e81d7f](https://github.com/meridianmcp/Meridian/commit/2e81d7fa952bf73b9c300f1bdbcac309752ec0cf))
 - Chore: update CHANGELOG ([112bbd9](https://github.com/meridianmcp/Meridian/commit/112bbd9e2e3facc3731d22d49d10d17363f26bf2))
@@ -63,6 +65,8 @@ All notable changes to Meridian. Generated from git history via `git-cliff`.
 
 ### Other
 
+- Merge branch 'main' of https://github.com/meridianmcp/Meridian ([b182b0d](https://github.com/meridianmcp/Meridian/commit/b182b0dee9db22a9ae1f8dc94bd0a3f8c3fb4d5c))
+- Merge branch 'dev' ([c007e0f](https://github.com/meridianmcp/Meridian/commit/c007e0f5b0c052d55dbddfa65da0bdd4bfd686f6))
 - Merge branch 'dev' ([324868a](https://github.com/meridianmcp/Meridian/commit/324868a5672296a3d26f624cd9e4018d9d325668))
 - Merge branch 'main' of https://github.com/meridianmcp/Meridian ([c1b1de1](https://github.com/meridianmcp/Meridian/commit/c1b1de1434420fbcf1ccad22c17fc7978174961d))
 - Merge branch 'dev' ([897100f](https://github.com/meridianmcp/Meridian/commit/897100f817a1e3db9fd161e871eb57d3dc405460))
