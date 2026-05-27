@@ -17,6 +17,7 @@ Project ID: 5787cc92-ba7d-4788-b17c-28ab7938b839
 ALWAYS:
 - Run `pixi run test` before and after any change. Target: 350+ passing.
 - Call `log_task` after every meaningful action via Meridian MCP.
+- Call `complete_sprint_item(item_id, project_id)` for EVERY sprint item worked on — never skip this.
 - Call `set_decision` for any architectural or irreversible choice.
 - Call `generate_handoff` before ending a session.
 - Read dashboard.js + dashboard.css before touching any UI.
@@ -82,7 +83,7 @@ For decisions: use pin_decision MCP tool, which also appends to DECISIONS.md.
 <current_state>
 <!-- Auto-updated by Meridian. Do not edit manually. -->
 Project: meridian-build (5787cc92)
-Last updated: 2026-05-26 09:37 UTC
+Last updated: 2026-05-27 04:21 UTC
 Sprint: pre-launch — polish sprint: LICENSE fix, chat banner removal, demo fixes, swimlane, backburner status, session focus dropdown, Pro plan card accuracy, one-liner install
 North Star: Meridian is the open-source coordination layer for AI coding sessions — persistent memory, task tracking, and session coordination that your AI tools don't provide.  Core value: "Your AI sessions don'…
 Recent:
@@ -95,7 +96,7 @@ Recent:
 
 ---
 <!-- MERIDIAN STATE — auto-generated, do not edit below -->
-## Current Sprint State  _(auto-updated 2026-05-26 10:34 UTC)_
+## Current Sprint State  _(auto-updated 2026-05-27 04:05 UTC)_
 
 **Key Files:**
 - `meridian/server.py` — FastAPI app + MCP handlers
