@@ -354,6 +354,34 @@
     font-size: .76rem; opacity: .65;
   }
 
+  .waitlist-form {
+    display: flex; gap: .5rem; margin-top: .25rem;
+  }
+  .waitlist-form input[type="email"] {
+    flex: 1; padding: .7rem .9rem; border-radius: var(--r);
+    background: var(--surface); border: 1px solid var(--border-light);
+    color: var(--text); font-family: var(--mono); font-size: .85rem;
+    outline: none; min-width: 0;
+  }
+  .waitlist-form input[type="email"]:focus { border-color: var(--accent); }
+  .waitlist-form button {
+    padding: .7rem 1rem; border-radius: var(--r);
+    background: var(--accent); color: #fff; border: none;
+    font-family: var(--mono); font-size: .85rem; font-weight: 700;
+    cursor: pointer; white-space: nowrap;
+  }
+  .waitlist-form button:hover { background: #5577ee; }
+  .waitlist-msg {
+    font-size: .8rem; color: var(--muted); margin-top: .5rem;
+    font-family: var(--mono); min-height: 1.2em;
+  }
+  .waitlist-msg.ok { color: var(--ok); }
+  .waitlist-launch-note {
+    font-size: .78rem; color: var(--muted); text-align: center;
+    margin-top: .4rem; font-family: var(--mono);
+  }
+  .waitlist-launch-note a { color: var(--muted); text-decoration: underline; }
+
   @media (max-width: 640px) {
     nav { padding: .8rem 1.2rem; }
     .nav-links { gap: .9rem; font-size: .82rem; }
@@ -531,7 +559,12 @@
         <li>Email support</li>
       </ul>
       <div class="plan-note">Overage: <strong>$0.16/CU-hr</strong> · <strong>$0.50/GB-mo</strong> · auto-billed via Stripe</div>
-      <a href="{{ stripe_payment_link }}" class="plan-cta primary">Start free trial →</a>
+      <form class="waitlist-form" data-plan="standard" onsubmit="submitWaitlist(event, this)">
+        <input type="email" placeholder="your@email.com" required>
+        <button type="submit">Notify me →</button>
+      </form>
+      <div class="waitlist-msg"></div>
+      <p class="waitlist-launch-note">Hosted launch coming soon · <a href="{{ stripe_payment_link }}">Sign up early</a></p>
     </div>
 
     <!-- Pro -->
@@ -551,10 +584,15 @@
         <li>Connect your own Postgres DB</li>
       </ul>
       <div class="plan-note">Overage: <strong>$0.16/CU-hr</strong> · <strong>$0.50/GB-mo</strong> · auto-billed via Stripe</div>
+      <form class="waitlist-form" data-plan="pro" onsubmit="submitWaitlist(event, this)">
+        <input type="email" placeholder="your@email.com" required>
+        <button type="submit">Notify me →</button>
+      </form>
+      <div class="waitlist-msg"></div>
       {% if stripe_pro_payment_link %}
-      <a href="{{ stripe_pro_payment_link }}" class="plan-cta primary">Get Pro →</a>
+      <p class="waitlist-launch-note">Hosted launch coming soon · <a href="{{ stripe_pro_payment_link }}">Sign up early</a></p>
       {% else %}
-      <a href="mailto:hello@usemeridian.us?subject=Pro%20waitlist" class="plan-cta secondary">Join waitlist</a>
+      <p class="waitlist-launch-note">Hosted launch coming soon</p>
       {% endif %}
     </div>
 
@@ -579,5 +617,34 @@
   </div>
 </footer>
 
+<script>
+async function submitWaitlist(e, form) {
+  e.preventDefault();
+  const email = form.querySelector('input[type="email"]').value.trim();
+  const plan = form.dataset.plan || 'standard';
+  const msg = form.nextElementSibling;
+  msg.textContent = 'Adding you…';
+  msg.className = 'waitlist-msg';
+  try {
+    const r = await fetch('/waitlist', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({email, plan, source: 'landing'})
+    });
+    if (r.ok) {
+      msg.textContent = "You're on the list. We'll email you when we launch.";
+      msg.className = 'waitlist-msg ok';
+      form.querySelector('input').value = '';
+    } else if (r.status === 409) {
+      msg.textContent = "You're already on the list!";
+      msg.className = 'waitlist-msg ok';
+    } else {
+      msg.textContent = 'Something went wrong — try again.';
+    }
+  } catch {
+    msg.textContent = 'Network error — try again.';
+  }
+}
+</script>
 </body>
 </html>

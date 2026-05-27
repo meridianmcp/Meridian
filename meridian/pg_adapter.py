@@ -580,6 +580,7 @@ async def init_pg_db(url: str) -> PostgresConnection:
     await _migrate_pg_goal_field_timestamps(conn)
     await _migrate_pg_v24_task_tree_and_framework(conn)
     await _migrate_pg_v26_client_type(conn)
+    await _migrate_pg_v27_pg_trgm(conn)
     await _migrate_pg_v24_pinned_decisions_and_hitl(conn)
     await _migrate_pg_v09_notes_and_magic_links(conn)
     if is_main_db:
@@ -627,6 +628,17 @@ async def _migrate_pg_v26_client_type(conn: PostgresConnection) -> None:
     """v2.6 — sessions.client_type for client app presence indicators."""
     await conn.executescript(
         "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS client_type TEXT"
+    )
+
+
+async def _migrate_pg_v27_pg_trgm(conn: PostgresConnection) -> None:
+    """v2.7 — enable pg_trgm extension for fast trigram-based task search.
+    CREATE EXTENSION is idempotent (IF NOT EXISTS). Adds GIN index on
+    task_log.description so similarity() queries stay fast at scale."""
+    await conn.executescript(
+        "CREATE EXTENSION IF NOT EXISTS pg_trgm;"
+        "CREATE INDEX IF NOT EXISTS idx_task_log_desc_trgm "
+        "ON task_log USING gin(description gin_trgm_ops)"
     )
 
 

@@ -1762,3 +1762,67 @@ def test_dashboard_js_has_usage_section():
     js = (Path(__file__).parent.parent / "meridian/static/dashboard.js").read_text(encoding="utf-8")
     assert "/settings/usage" in js
     assert "CU-hrs" in js
+
+
+# ---------------------------------------------------------------------------
+# search_tasks — LIKE-based (SQLite) and MCP dispatch
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_search_tasks_like_returns_matches(db):
+    """search_tasks returns tasks whose descriptions match the query."""
+    p = await db_module.create_project(db, "search-test")
+    s = await db_module.register_session(db, p["id"], "s1")
+    await db_module.log_task(db, s["id"], p["id"], "Fix auth bug in login flow", "done")
+    await db_module.log_task(db, s["id"], p["id"], "Add rate limiting middleware", "done")
+    await db_module.log_task(db, s["id"], p["id"], "Refactor database connection pool", "done")
+    results = await db_module.search_tasks(db, p["id"], "rate limiting")
+    assert len(results) >= 1
+    assert any("rate" in r["description"].lower() for r in results)
+
+
+@pytest.mark.asyncio
+async def test_search_tasks_no_results(db):
+    """search_tasks returns empty list when nothing matches."""
+    p = await db_module.create_project(db, "search-empty")
+    s = await db_module.register_session(db, p["id"], "s1")
+    await db_module.log_task(db, s["id"], p["id"], "Fix login", "done")
+    results = await db_module.search_tasks(db, p["id"], "xyznonexistentterm")
+    assert results == []
+
+
+@pytest.mark.asyncio
+async def test_search_tasks_respects_limit(db):
+    """search_tasks limit parameter caps the results."""
+    p = await db_module.create_project(db, "search-limit")
+    s = await db_module.register_session(db, p["id"], "s1")
+    for i in range(10):
+        await db_module.log_task(db, s["id"], p["id"], f"Fix bug number {i} in auth", "done")
+    results = await db_module.search_tasks(db, p["id"], "Fix bug", limit=3)
+    assert len(results) <= 3
+
+
+def test_search_tasks_http_endpoint(client):
+    """GET /projects/{id}/tasks/search?q=... returns matching tasks."""
+    pid = client.post("/projects", json={"name": "search-http"}).json()["id"]
+    sid = client.post(
+        "/sessions/register", json={"project_id": pid, "name": "s1"}
+    ).json()["id"]
+    client.post("/tasks", json={
+        "session_id": sid, "project_id": pid,
+        "description": "Implement Redis rate limiting", "status": "done"
+    })
+    r = client.get(f"/projects/{pid}/tasks/search?q=rate+limiting")
+    assert r.status_code == 200
+    body = r.json()
+    assert isinstance(body, list)
+    assert any("rate" in t["description"].lower() for t in body)
+
+
+def test_search_tasks_http_empty_query(client):
+    """GET /projects/{id}/tasks/search with no q returns empty list."""
+    pid = client.post("/projects", json={"name": "search-empty-q"}).json()["id"]
+    r = client.get(f"/projects/{pid}/tasks/search")
+    assert r.status_code == 200
+    assert r.json() == []
