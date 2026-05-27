@@ -23,6 +23,7 @@ All notable changes to Meridian. Generated from git history via `git-cliff`.
 
 ### Chores
 
+- Chore: update CHANGELOG ([1fc5de2](https://github.com/meridianmcp/Meridian/commit/1fc5de26068cc588ef2222318b31915fb9a19758))
 - Chore: update CHANGELOG ([3c0b84f](https://github.com/meridianmcp/Meridian/commit/3c0b84fa9c5cb4b1c1c8047ae1217d52f1baf423))
 - Chore: update CHANGELOG ([904115b](https://github.com/meridianmcp/Meridian/commit/904115be4cbfcca941fbb707edfdd95852d64ccb))
 - Chore: update CHANGELOG ([fd0bba3](https://github.com/meridianmcp/Meridian/commit/fd0bba36925e21579210a8a641724005358eaf94))
@@ -45,6 +46,7 @@ All notable changes to Meridian. Generated from git history via `git-cliff`.
 
 ### Features
 
+- Feat: sprint fixes — generate_handoff dynamic /goal, claim_task depends_on enforcement, start_session stale release ([c2be8b6](https://github.com/meridianmcp/Meridian/commit/c2be8b659aea93ec7ba1c0a37233497d99cee389))
 - Feat: add Codex CLI to landing.html works-with list ([d44dd7b](https://github.com/meridianmcp/Meridian/commit/d44dd7b7f454b285232debf815b556a8939a4065))
 - Feat: Codex CLI MCP setup in Settings tab — STDIO/HTTP config blocks + /goal template with copy buttons ([3ac9bc5](https://github.com/meridianmcp/Meridian/commit/3ac9bc52321d3df7d63d9f779905f3211e772477))
 - Feat: dashboard fixes — swimlane legend, chart legends, NS auto-resize, task search UI, AI consolidation, demo cookie fix ([892ee83](https://github.com/meridianmcp/Meridian/commit/892ee8392963bd5b9a41c6a74d81bd5daecea306))
@@ -79,6 +81,7 @@ All notable changes to Meridian. Generated from git history via `git-cliff`.
 
 ### Other
 
+- Merge branch 'dev' ([599929a](https://github.com/meridianmcp/Meridian/commit/599929a85e07303f95e7b86f4d5ccd51d703c025))
 - Merge branch 'main' of https://github.com/meridianmcp/Meridian ([619d8c8](https://github.com/meridianmcp/Meridian/commit/619d8c8ec772207352a99af77919aab8f5f87e3d))
 - Merge branch 'dev' ([2ea2bd6](https://github.com/meridianmcp/Meridian/commit/2ea2bd6ff5a5aa148ffafec378bb3b9e656fecf2))
 - Merge remote-tracking branch 'origin/main' ([718fe46](https://github.com/meridianmcp/Meridian/commit/718fe469a93401ea88e1a91a351f431f4fcdc6b7))
