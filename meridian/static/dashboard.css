@@ -634,10 +634,10 @@ input[type=text] {
   position: absolute; inset: 0; padding: 12px 14px; gap: 8px; overflow-y: auto;
 }
 .goal-subtab-panel.active { display: flex; }
-/* version goal: textarea grows with content, no individual scrollbars */
+/* version goal + north star: textareas grow with content, no scrollbars */
 .goal-area.goal-full {
-  min-height: 200px; resize: vertical; flex-shrink: 0;
-  overflow-y: visible; height: auto;
+  min-height: 80px; resize: none; flex-shrink: 0;
+  overflow-y: hidden; height: auto;
 }
 
 /* v1.4.1 — sidebar is always visible on desktop; hamburger only on mobile */

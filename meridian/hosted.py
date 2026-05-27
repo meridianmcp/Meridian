@@ -467,6 +467,7 @@ async def auth_callback(request: Request) -> RedirectResponse:
         samesite="lax",
         max_age=_SESSION_MAX_AGE_HOURS * 3600,
     )
+    response.delete_cookie("meridian_demo")
     return response
 
 
@@ -526,6 +527,7 @@ async def auth_github_callback(request: Request) -> RedirectResponse:
         samesite="lax",
         max_age=_SESSION_MAX_AGE_HOURS * 3600,
     )
+    response.delete_cookie("meridian_demo")
     return response
 
 
@@ -575,6 +577,7 @@ async def auth_microsoft_callback(request: Request) -> RedirectResponse:
         samesite="lax",
         max_age=_SESSION_MAX_AGE_HOURS * 3600,
     )
+    response.delete_cookie("meridian_demo")
     return response
 
 
@@ -591,6 +594,7 @@ async def auth_logout(request: Request) -> RedirectResponse:
 
     response = RedirectResponse("/", status_code=302)
     response.delete_cookie(_SESSION_COOKIE)
+    response.delete_cookie("meridian_demo")
     return response
 
 
@@ -1985,4 +1989,5 @@ async def auth_magic_verify(request: Request, token: str = ""):
         samesite="lax",
         max_age=_SESSION_MAX_AGE_HOURS * 3600,
     )
+    response.delete_cookie("meridian_demo")
     return response

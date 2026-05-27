@@ -675,7 +675,10 @@ function buildTabBody(project) {
             <div style="margin-bottom:14px">
               <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
                 <div style="color:var(--accent);font-weight:600;font-size:12px">📌 Pinned (Constitution)</div>
-                <button class="secondary" id="add-pinned-decision-${project.id}" style="padding:3px 10px;font-size:10px">+ Pin</button>
+                <div style="display:flex;gap:6px">
+                  <button class="secondary" id="consolidate-decisions-${project.id}" style="padding:3px 10px;font-size:10px" title="Use AI to deduplicate and merge decisions">✨ Consolidate</button>
+                  <button class="secondary" id="add-pinned-decision-${project.id}" style="padding:3px 10px;font-size:10px">+ Pin</button>
+                </div>
               </div>
               <div style="color:var(--muted);font-size:10px;margin-bottom:8px">Editable current truth. Use <code>pin_decision</code> MCP tool or <code>update_decision</code> with new_title+new_body to supersede.</div>
               <div id="pinned-decisions-${project.id}" style="font-family:var(--font-mono);font-size:12px"></div>
@@ -749,6 +752,11 @@ function buildTabBody(project) {
         <div class="drawer-header" style="justify-content:space-between">
           <span>QUEUE · ${escapeHtml(project.name)}</span>
           <button class="secondary" id="queue-refresh-${project.id}" style="padding:2px 8px;font-size:10px">refresh</button>
+        </div>
+        <div style="padding:8px 14px 0;flex-shrink:0">
+          <input type="text" id="task-search-${project.id}" placeholder="Search tasks…"
+            style="width:100%;padding:5px 10px;background:var(--surface-2);border:1px solid var(--border);
+            color:var(--text);border-radius:4px;font-family:var(--font-mono);font-size:11px;outline:none">
         </div>
         <div style="flex:1;overflow-y:auto" id="queue-body-${project.id}">
           <div class="empty" style="color:var(--muted)">select queue to load</div>
@@ -918,9 +926,11 @@ function buildTabBody(project) {
     });
   }
 
-  // v2.4 — wire the [+ Pin] button on the Decisions subtab.
+  // v2.4 — wire the [+ Pin] and [Consolidate] buttons on the Decisions subtab.
   const addPinBtn = document.getElementById(`add-pinned-decision-${project.id}`);
   if (addPinBtn) addPinBtn.onclick = () => addPinnedDecision(project.id);
+  const consolidateBtn = document.getElementById(`consolidate-decisions-${project.id}`);
+  if (consolidateBtn) consolidateBtn.onclick = () => consolidateDecisions(project.id);
 
   document.getElementById(`save-goal-${project.id}`).onclick = () => saveGoal(project.id);
   document.getElementById(`save-north-star-${project.id}`).onclick = () => saveNorthStar(project.id);
@@ -1048,6 +1058,8 @@ function buildTabBody(project) {
   document.getElementById(`goal-north-star-${project.id}`).addEventListener('input', function() {
     const p = state.panels[project.id];
     this.classList.toggle('dirty', this.value !== (p._serverNorthStar || ''));
+    this.style.height = 'auto';
+    this.style.height = this.scrollHeight + 'px';
   });
   document.getElementById(`goal-sprint-${project.id}`).addEventListener('input', function() {
     const p = state.panels[project.id];
@@ -2631,16 +2643,35 @@ function _renderSwimlane(humans, days, goalMarkers) {
       <text x="${labelW - 6}" y="${y + 2}" text-anchor="end" font-size="10" fill="${c}" font-family="var(--font-mono)">${escapeHtml(h.human_id.slice(0, 14))}</text>
       ${subEl}${dots}`;
   }).join('');
-  // Goal change markers — vertical dashed lines; color by field type.
+  // Goal change markers — vertical dashed lines with staggered date labels to prevent overlap.
   const fieldLabel = {content_updated_at: 'goal', ns_updated_at: 'N★', sprint_updated_at: 'sprint'};
-  const markerLines = (goalMarkers || []).map(m => {
+  const sorted = [...(goalMarkers || [])].sort((a, b) =>
+    Date.parse((a.ts||'').replace(' ','T')+'Z') - Date.parse((b.ts||'').replace(' ','T')+'Z')
+  );
+  const markerLines = sorted.map((m, i) => {
     const mx = x(m.ts);
     const label = fieldLabel[m.field] || 'goal';
     const mc = markerColor[m.field] || '#a78bfa';
-    return `<line x1="${mx}" y1="0" x2="${mx}" y2="${height}" stroke="${mc}" stroke-dasharray="3,3" stroke-width="1" opacity="0.7"><title>Goal change: ${label}</title></line>
-    <text x="${mx + 2}" y="9" font-size="8" fill="${mc}" font-family="var(--font-mono)" opacity="0.9">${escapeHtml(label)}</text>`;
+    const dateStr = (m.ts || '').slice(5, 10); // MM-DD
+    // Stagger labels: alternate y=9 / y=19 for adjacent markers within 40px
+    const prev = sorted[i - 1];
+    const prevX = prev ? x(prev.ts) : -999;
+    const labelY = Math.abs(mx - prevX) < 40 ? 19 : 9;
+    return `<line x1="${mx}" y1="0" x2="${mx}" y2="${height}" stroke="${mc}" stroke-dasharray="3,3" stroke-width="1" opacity="0.7"><title>Goal change: ${label} (${dateStr})</title></line>
+    <text x="${mx + 2}" y="${labelY}" font-size="8" fill="${mc}" font-family="var(--font-mono)" opacity="0.9">${escapeHtml(label)} ${escapeHtml(dateStr)}</text>`;
   }).join('');
-  return `<div style="overflow-x:auto;background:var(--surface-2);border:1px solid var(--border);border-radius:4px;padding:6px"><svg viewBox="0 0 ${width} ${height}" style="width:100%;min-width:600px;height:${height}px">${markerLines}${rows}</svg></div>`;
+  // Legend row below the SVG
+  const legend = `<div style="display:flex;gap:14px;padding:6px 0 2px;font-size:10px;font-family:var(--font-mono);color:var(--muted);flex-wrap:wrap">
+    <span><svg width="10" height="10"><circle cx="5" cy="5" r="4" fill="#4ade80"/></svg> active session</span>
+    <span><svg width="10" height="10"><circle cx="5" cy="5" r="4" fill="#fbbf24"/></svg> recent (1hr)</span>
+    <span><svg width="10" height="10"><circle cx="5" cy="5" r="4" fill="#6b7280"/></svg> idle</span>
+    <span><svg width="18" height="10"><line x1="0" y1="5" x2="18" y2="5" stroke="#a78bfa" stroke-dasharray="3,2" stroke-width="1.5"/></svg> goal change</span>
+    <span><svg width="18" height="10"><line x1="0" y1="5" x2="18" y2="5" stroke="#6c8fff" stroke-dasharray="3,2" stroke-width="1.5"/></svg> sprint change</span>
+  </div>`;
+  return `<div style="overflow-x:auto;background:var(--surface-2);border:1px solid var(--border);border-radius:4px;padding:6px">
+    <svg viewBox="0 0 ${width} ${height}" style="width:100%;min-width:600px;height:${height}px">${markerLines}${rows}</svg>
+    ${legend}
+  </div>`;
 }
 
 async function loadQueue(projectId) {
@@ -2656,6 +2687,25 @@ async function loadQueue(projectId) {
     body.innerHTML = renderQueue(tasks);
     const refreshBtn = document.getElementById(`queue-refresh-${projectId}`);
     if (refreshBtn) refreshBtn.onclick = () => loadQueue(projectId);
+    // Wire search input (debounced 300ms)
+    const searchInput = document.getElementById(`task-search-${projectId}`);
+    if (searchInput && !searchInput._wired) {
+      searchInput._wired = true;
+      let _searchTimer = null;
+      searchInput.addEventListener('input', function() {
+        clearTimeout(_searchTimer);
+        const q = this.value.trim();
+        _searchTimer = setTimeout(async () => {
+          if (!q) { body.innerHTML = renderQueue(tasks); return; }
+          try {
+            const results = await api(`/projects/${projectId}/tasks/search?q=${encodeURIComponent(q)}&limit=50`);
+            body.innerHTML = results.length
+              ? renderQueue(results)
+              : `<div class="empty" style="color:var(--muted)">no tasks matching "${escapeHtml(q)}"</div>`;
+          } catch (e) { body.innerHTML = `<div class="empty">search failed: ${escapeHtml(e.message)}</div>`; }
+        }, 300);
+      });
+    }
   } catch (e) {
     body.innerHTML = `<div class="empty">queue failed: ${escapeHtml(e.message)}</div>`;
   }
@@ -2892,7 +2942,11 @@ async function refreshGoal(projectId) {
     // means "field absent from this response" — keep what the user has.
     const nsTA = document.getElementById(`goal-north-star-${projectId}`);
     const spTA = document.getElementById(`goal-sprint-${projectId}`);
-    if (nsTA && 'north_star' in goal) nsTA.value = goal.north_star || '';
+    if (nsTA && 'north_star' in goal) {
+      nsTA.value = goal.north_star || '';
+      nsTA.style.height = 'auto';
+      nsTA.style.height = nsTA.scrollHeight + 'px';
+    }
     if (spTA && 'sprint' in goal) {
       spTA.value = goal.sprint || '';
       if (_sprintSelectSyncers[projectId]) _sprintSelectSyncers[projectId](goal.sprint || '');
@@ -3143,6 +3197,100 @@ async function addPinnedDecision(projectId) {
     toast('decision pinned');
     loadPinnedDecisions(projectId);
   } catch (e) { toast('pin failed: ' + e.message, true); }
+}
+
+async function consolidateDecisions(projectId) {
+  /** v2.8 — AI consolidation flow for pinned decisions.
+   * Shows API key + model modal → calls /decisions/consolidate → shows preview
+   * → on confirm calls /decisions-pinned/replace-all. */
+  // Step 1: API key + model input modal
+  const overlay = document.createElement('div');
+  overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.72);z-index:9998;display:flex;align-items:center;justify-content:center';
+  overlay.innerHTML = `
+    <div style="background:var(--surface-1);border:1px solid var(--border);border-radius:6px;padding:20px;width:480px;max-width:92vw;display:flex;flex-direction:column;gap:12px;box-shadow:0 8px 32px #0008">
+      <div style="font-weight:600;font-size:13px;color:var(--accent)">✨ AI Decision Consolidation</div>
+      <div style="font-size:11px;color:var(--muted)">Sends your pinned decisions to an LLM to deduplicate and merge. Preview before applying. API key is never stored.</div>
+      <div>
+        <div style="font-size:10px;color:var(--muted);margin-bottom:4px;font-family:var(--font-mono)">MODEL</div>
+        <select id="_consolidate-model" style="width:100%;padding:6px 8px;background:var(--surface-2);border:1px solid var(--border);color:var(--text);border-radius:4px;font-family:var(--font-mono);font-size:11px">
+          <option value="claude-haiku-4-5-20251001">Claude Haiku 4.5 (fast, cheap)</option>
+          <option value="claude-sonnet-4-6">Claude Sonnet 4.6 (better)</option>
+          <option value="gpt-4o-mini">GPT-4o mini</option>
+          <option value="gpt-4o">GPT-4o</option>
+          <option value="deepseek-chat">DeepSeek Chat</option>
+        </select>
+      </div>
+      <div>
+        <div style="font-size:10px;color:var(--muted);margin-bottom:4px;font-family:var(--font-mono)">API KEY</div>
+        <input id="_consolidate-key" type="password" placeholder="sk-ant-... / sk-... / sk-..." style="width:100%;padding:6px 8px;background:var(--surface-2);border:1px solid var(--border);color:var(--text);border-radius:4px;font-family:var(--font-mono);font-size:11px;outline:none">
+      </div>
+      <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:4px">
+        <button class="secondary" id="_consolidate-cancel" style="padding:5px 14px;font-size:11px">Cancel</button>
+        <button class="primary" id="_consolidate-run" style="padding:5px 14px;font-size:11px">Consolidate →</button>
+      </div>
+    </div>`;
+  document.body.appendChild(overlay);
+  overlay.addEventListener('click', e => { if (e.target === overlay) overlay.remove(); });
+  document.getElementById('_consolidate-cancel').onclick = () => overlay.remove();
+
+  document.getElementById('_consolidate-run').onclick = async () => {
+    const apiKey = document.getElementById('_consolidate-key').value.trim();
+    const model = document.getElementById('_consolidate-model').value;
+    if (!apiKey) { toast('API key required', true); return; }
+    const runBtn = document.getElementById('_consolidate-run');
+    runBtn.textContent = 'Working…'; runBtn.disabled = true;
+    try {
+      const result = await api(`/projects/${projectId}/decisions/consolidate`, {
+        method: 'POST',
+        body: JSON.stringify({ api_key: apiKey, model }),
+      });
+      overlay.remove();
+      // Step 2: Preview modal
+      const consolidated = result.consolidated || [];
+      const previewOverlay = document.createElement('div');
+      previewOverlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.72);z-index:9999;display:flex;align-items:center;justify-content:center';
+      const previewHtml = consolidated.map(d => {
+        const cat = (d.category || 'TECHNICAL').toUpperCase();
+        const color = _DECISION_CATEGORY_COLORS[cat] || _DECISION_CATEGORY_COLORS.TECHNICAL;
+        return `<div style="background:var(--surface-2);border-left:4px solid ${color};border-radius:4px;padding:8px 10px;margin-bottom:8px">
+          <div style="display:flex;gap:8px;align-items:center;margin-bottom:4px">
+            <span style="background:${color}22;color:${color};font-size:9px;font-weight:700;padding:1px 5px;border-radius:3px">${escapeHtml(cat)}</span>
+            <span style="color:var(--accent);font-weight:600;font-size:12px">${escapeHtml(d.title || '')}</span>
+          </div>
+          <div style="color:var(--text);font-size:11px;white-space:pre-wrap">${escapeHtml(d.body || '')}</div>
+        </div>`;
+      }).join('');
+      previewOverlay.innerHTML = `
+        <div style="background:var(--surface-1);border:1px solid var(--border);border-radius:6px;padding:20px;width:620px;max-width:92vw;max-height:80vh;display:flex;flex-direction:column;gap:12px;box-shadow:0 8px 32px #0008">
+          <div style="font-weight:600;font-size:13px;color:var(--accent)">Preview — ${consolidated.length} decisions (was ${result.original_count})</div>
+          <div style="flex:1;overflow-y:auto;font-family:var(--font-mono)">${previewHtml}</div>
+          <div style="color:var(--muted);font-size:10px">This will supersede all ${result.original_count} existing decisions and create ${consolidated.length} new ones.</div>
+          <div style="display:flex;gap:8px;justify-content:flex-end">
+            <button class="secondary" id="_preview-cancel" style="padding:5px 14px;font-size:11px">Cancel</button>
+            <button class="primary" id="_preview-apply" style="padding:5px 14px;font-size:11px">Apply →</button>
+          </div>
+        </div>`;
+      document.body.appendChild(previewOverlay);
+      previewOverlay.addEventListener('click', e => { if (e.target === previewOverlay) previewOverlay.remove(); });
+      document.getElementById('_preview-cancel').onclick = () => previewOverlay.remove();
+      document.getElementById('_preview-apply').onclick = async () => {
+        const applyBtn = document.getElementById('_preview-apply');
+        applyBtn.textContent = 'Applying…'; applyBtn.disabled = true;
+        try {
+          await api(`/projects/${projectId}/decisions-pinned/replace-all`, {
+            method: 'POST',
+            body: JSON.stringify({ decisions: consolidated }),
+          });
+          previewOverlay.remove();
+          toast(`Consolidated: ${consolidated.length} decisions applied`);
+          loadPinnedDecisions(projectId);
+        } catch (e) { toast('Apply failed: ' + e.message, true); applyBtn.textContent = 'Apply →'; applyBtn.disabled = false; }
+      };
+    } catch (e) {
+      runBtn.textContent = 'Consolidate →'; runBtn.disabled = false;
+      toast('Consolidation failed: ' + e.message, true);
+    }
+  };
 }
 
 function renderDecisionsTable(projectId, blob) {
@@ -3994,11 +4142,18 @@ function renderRewindCharts(projectId, stats) {
   if (!stats) {
     return '<div style="padding:14px;color:var(--muted);font-size:11px">Charts unavailable — stats endpoint not reachable.</div>';
   }
+  const legendStyle = 'display:flex;gap:14px;margin-top:6px;font-size:10px;color:var(--muted);font-family:var(--font-mono)';
+  const swatch = (color) => `<span style="display:inline-block;width:12px;height:12px;background:${color};border-radius:2px;margin-right:4px;vertical-align:middle"></span>`;
   return `<div style="padding:8px 0">
     <div style="color:var(--accent);font-weight:600;font-size:11px;margin-bottom:8px">📊 Tasks completed / day (last ${stats.period_days}d)</div>
     <canvas id="chart-tasks-${escapeHtml(projectId)}" style="max-width:100%;max-height:160px"></canvas>
+    <div style="${legendStyle}"><span>${swatch('rgba(96,165,250,0.7)')}Tasks completed</span></div>
     <div style="color:var(--accent);font-weight:600;font-size:11px;margin:18px 0 8px">⚡ Session task completion % by version</div>
     <canvas id="chart-sprint-${escapeHtml(projectId)}" style="max-width:100%;max-height:120px"></canvas>
+    <div style="${legendStyle}">
+      <span>${swatch('rgba(52,211,153,0.7)')}100% done</span>
+      <span>${swatch('rgba(96,165,250,0.7)')}Partial</span>
+    </div>
   </div>`;
 }
 
