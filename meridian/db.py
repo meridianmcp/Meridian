@@ -158,6 +158,7 @@ CREATE TABLE IF NOT EXISTS task_log (
         CHECK (status IN ('pending','in_progress','done','failed','pending-hitl','backlog','future','backburner')),
     claimed_by TEXT,
     claimed_at TEXT,
+    sprint_item_id TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -749,6 +750,13 @@ async def _migrate_task_claims(db: aiosqlite.Connection) -> None:
     await _migrate_add_column_if_missing(db, "task_log", "claimed_at", "TEXT")
 
 
+async def _migrate_task_sprint_link(db: aiosqlite.Connection) -> None:
+    """v2.6 — link task_log rows back to their sprint item when applicable."""
+    await _migrate_add_column_if_missing(
+        db, "task_log", "sprint_item_id", "TEXT"
+    )
+
+
 async def _migrate_session_type(db: aiosqlite.Connection) -> None:
     """v1.2.0 — distinguish human vs worker sessions.
 
@@ -1071,6 +1079,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_task_log_backburner(db)
     await _migrate_human_identity(db)
     await _migrate_task_claims(db)
+    await _migrate_task_sprint_link(db)
     await _migrate_decisions(db)
     await _migrate_session_type(db)
     await _migrate_session_summary(db)
@@ -1978,15 +1987,33 @@ async def archive_stale_sessions(
     """
     from datetime import datetime, timedelta, timezone
     cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
-    # Release in_progress tasks claimed by sessions about to be archived.
-    await db.execute(
-        "UPDATE task_log SET status = 'pending', claimed_by = NULL, claimed_at = NULL "
+    async with db.execute(
+        "SELECT id, sprint_item_id FROM task_log "
         "WHERE claimed_by IN ("
         "  SELECT id FROM sessions "
         "  WHERE project_id = ? AND status NOT IN ('closed', 'archived') AND last_seen < ?"
         ") AND status = 'in_progress'",
         (project_id, cutoff),
-    )
+    ) as cur:
+        stale_rows = await cur.fetchall()
+    stale_task_ids = [row["id"] for row in stale_rows]
+    linked_item_ids = [
+        row["sprint_item_id"] for row in stale_rows if row["sprint_item_id"]
+    ]
+    if stale_task_ids:
+        placeholders = ", ".join("?" for _ in stale_task_ids)
+        await db.execute(
+            f"UPDATE task_log SET status = 'pending', claimed_by = NULL, claimed_at = NULL "
+            f"WHERE id IN ({placeholders})",
+            tuple(stale_task_ids),
+        )
+    if linked_item_ids:
+        placeholders = ", ".join("?" for _ in linked_item_ids)
+        await db.execute(
+            f"UPDATE sprint_items SET status = 'pending', completed_at = NULL "
+            f"WHERE id IN ({placeholders}) AND status = 'in_progress'",
+            tuple(linked_item_ids),
+        )
     cursor = await db.execute(
         "UPDATE sessions SET status = 'archived' "
         "WHERE project_id = ? "
@@ -2027,6 +2054,7 @@ async def log_task(
     status: str = "done",
     parent_session_id: str | None = None,
     parent_task_id: str | None = None,
+    sprint_item_id: str | None = None,
 ) -> dict[str, Any]:
     """Append a task-log entry and broadcast to live subscribers.
 
@@ -2044,9 +2072,18 @@ async def log_task(
     tid = _new_id()
     await db.execute(
         "INSERT INTO task_log "
-        "(id, session_id, project_id, description, status, parent_session_id, parent_task_id) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (tid, session_id, project_id, description, status, parent_session_id, parent_task_id),
+        "(id, session_id, project_id, description, status, parent_session_id, parent_task_id, sprint_item_id) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            tid,
+            session_id,
+            project_id,
+            description,
+            status,
+            parent_session_id,
+            parent_task_id,
+            sprint_item_id,
+        ),
     )
     await update_session_seen(db, session_id)
     await db.commit()
@@ -2244,6 +2281,85 @@ async def claim_task(
     return updated
 
 
+async def get_open_task_for_sprint_item(
+    db: aiosqlite.Connection, sprint_item_id: str
+) -> dict[str, Any] | None:
+    """Return the current pending/in-progress task row for a sprint item."""
+    async with db.execute(
+        "SELECT * FROM task_log WHERE sprint_item_id = ? "
+        "AND status IN ('pending', 'in_progress') "
+        "ORDER BY CASE WHEN status = 'in_progress' THEN 0 ELSE 1 END, "
+        "created_at DESC, id DESC LIMIT 1",
+        (sprint_item_id,),
+    ) as cur:
+        row = await cur.fetchone()
+    return _row_to_dict(row)
+
+
+async def get_blocking_dependency_for_sprint_item(
+    db: aiosqlite.Connection, sprint_item_id: str
+) -> dict[str, Any] | None:
+    """Return the unmet parent sprint item that blocks a claim, if any."""
+    item = await get_sprint_item(db, sprint_item_id)
+    if item is None:
+        return None
+    parent_id = item.get("depends_on")
+    if not parent_id:
+        return None
+    parent = await get_sprint_item(db, parent_id)
+    if parent is None:
+        return {"id": parent_id, "title": "(missing sprint item)", "status": "missing"}
+    if parent.get("status") != "done":
+        return parent
+    return None
+
+
+async def release_stale_task_claims(
+    db: aiosqlite.Connection,
+    project_id: str,
+    *,
+    exclude_session_id: str | None = None,
+    max_age_hours: int = 2,
+) -> int:
+    """Release stale claimed tasks older than ``max_age_hours`` for a project."""
+    from datetime import datetime, timedelta, timezone
+
+    cutoff = (
+        datetime.now(timezone.utc) - timedelta(hours=max_age_hours)
+    ).strftime("%Y-%m-%d %H:%M:%S")
+    query = (
+        "SELECT id, sprint_item_id FROM task_log "
+        "WHERE project_id = ? AND status = 'in_progress' "
+        "AND claimed_by IS NOT NULL AND claimed_at IS NOT NULL "
+        "AND claimed_at < ?"
+    )
+    params: list[Any] = [project_id, cutoff]
+    if exclude_session_id is not None:
+        query += " AND claimed_by != ?"
+        params.append(exclude_session_id)
+    async with db.execute(query, tuple(params)) as cur:
+        rows = await cur.fetchall()
+    task_ids = [row["id"] for row in rows]
+    if not task_ids:
+        return 0
+    linked_item_ids = [row["sprint_item_id"] for row in rows if row["sprint_item_id"]]
+    placeholders = ", ".join("?" for _ in task_ids)
+    await db.execute(
+        f"UPDATE task_log SET status = 'pending', claimed_by = NULL, claimed_at = NULL "
+        f"WHERE id IN ({placeholders})",
+        tuple(task_ids),
+    )
+    if linked_item_ids:
+        placeholders = ", ".join("?" for _ in linked_item_ids)
+        await db.execute(
+            f"UPDATE sprint_items SET status = 'pending', completed_at = NULL "
+            f"WHERE id IN ({placeholders}) AND status = 'in_progress'",
+            tuple(linked_item_ids),
+        )
+    await db.commit()
+    return len(task_ids)
+
+
 async def release_task(
     db: aiosqlite.Connection, task_id: str, session_id: str
 ) -> bool:
@@ -2253,7 +2369,7 @@ async def release_task(
     by that session (someone else's claim is left untouched).
     """
     cursor = await db.execute(
-        "UPDATE task_log SET claimed_by = NULL, claimed_at = NULL "
+        "UPDATE task_log SET status = 'pending', claimed_by = NULL, claimed_at = NULL "
         "WHERE id = ? AND claimed_by = ?",
         (task_id, session_id),
     )
@@ -2261,6 +2377,14 @@ async def release_task(
     if cursor.rowcount == 0:
         return False
     updated = await get_task(db, task_id)
+    if updated is not None and updated.get("sprint_item_id"):
+        await db.execute(
+            "UPDATE sprint_items SET status = 'pending', completed_at = NULL "
+            "WHERE id = ? AND status = 'in_progress'",
+            (updated["sprint_item_id"],),
+        )
+        await db.commit()
+        updated = await get_task(db, task_id)
     if updated is not None:
         _publish_task("task_updated", updated)
     return True

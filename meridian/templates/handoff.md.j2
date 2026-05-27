@@ -46,7 +46,10 @@ _No pinned decisions yet — use `pin_decision` MCP tool to establish the consti
 **Pending Sprint Items:**
 
 {% for it in pending_sprint_items -%}
-- [{{ it.status }}] {{ it.title }}{% if it.item_group %} _({{ it.item_group }})_{% endif %}
+{{ loop.index }}. [{{ it.status }}] {{ it.title }}{% if it.item_group %} _({{ it.item_group }})_{% endif %}{% if it.version %} — version {{ it.version }}{% endif %}
+{% if it.depends_on %}   Depends on item {{ it.dependency_position or "?" }} (`{{ it.depends_on }}`){% if it.dependency_title %}: {{ it.dependency_title }}{% endif %}{% if it.dependency_status %} — currently {{ it.dependency_status }}{% endif %}
+{% else %}   Depends on: none
+{% endif %}
 {% endfor %}
 {% endif %}
 
@@ -79,6 +82,16 @@ _No pinned decisions yet — use `pin_decision` MCP tool to establish the consti
 
 {{ decisions_log }}
 {% endif %}
+
+## Quick Start
+
+Start a fresh Meridian session:
+
+`start_session(project_id="{{ project.id }}", session_name="<your-name>")`
+
+Claude Code `/goal` template:
+
+`{{ quick_start_goal }}`
 
 ## Resume Instructions
 

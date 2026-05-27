@@ -131,11 +131,30 @@ async def test_handoff_generates_clean_markdown(db, tmp_path):
     # v2.4 — both sessions still listed (active + recent).
     assert "sess-1" in content and "sess-2" in content
     assert "did A" in content and "did B" in content
+    assert "## Quick Start" in content
+    assert "/goal Complete pending sprint items in dependency order." in content
     assert "## Resume Instructions" in content
     on_disk = tmp_path / "alpha_handoff.md"
     assert on_disk.exists()
     assert on_disk.read_text(encoding="utf-8") == content
     assert str(on_disk.resolve()) == path
+
+
+@pytest.mark.asyncio
+async def test_handoff_lists_pending_sprint_items_in_dependency_order(db, tmp_path):
+    p = await db_module.create_project(db, "alpha-queue")
+    await db_module.set_goal(db, p["id"], "ship the queue")
+    first = await db_module.add_sprint_item(db, p["id"], "v1", "First fix")
+    await db_module.add_sprint_item(
+        db, p["id"], "v1", "Second fix", depends_on=first["id"]
+    )
+    _, content = await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True
+    )
+    assert "1. [pending] First fix" in content
+    assert "2. [pending] Second fix" in content
+    assert f"Depends on item 1 (`{first['id']}`): First fix" in content
+    assert f'start_session(project_id="{p["id"]}", session_name="<your-name>")' in content
 
 
 # ---------------------------------------------------------------------------
@@ -1292,6 +1311,7 @@ async def test_release_task_succeeds_for_owner(db):
     assert released is True
     fresh = await db_module.get_task(db, t["id"])
     assert fresh is not None
+    assert fresh["status"] == "pending"
     assert fresh["claimed_by"] is None
     assert fresh["claimed_at"] is None
 
@@ -2207,6 +2227,103 @@ def test_start_session_recent_tasks_capped_at_10(client):
     assert len(body["recent_tasks"]) == 10
     # Newest first — task-14 must lead.
     assert body["recent_tasks"][0]["description"] == "task-14"
+
+
+def test_start_session_releases_stale_claims_older_than_two_hours(client):
+    from datetime import datetime, timedelta, timezone
+
+    project = client.post("/projects", json={"name": "stale-claims"}).json()
+    stale_sess = client.post(
+        "/sessions/register",
+        json={"project_id": project["id"], "name": "old-worker"},
+    ).json()
+    task = client.post(
+        "/tasks",
+        json={
+            "session_id": stale_sess["id"],
+            "project_id": project["id"],
+            "description": "resume me",
+            "status": "pending",
+        },
+    ).json()
+    claim = client.post(
+        f"/projects/{project['id']}/tasks/claim",
+        json={"task_id": task["id"], "session_id": stale_sess["id"]},
+    ).json()
+    assert claim["claimed"] is True
+
+    cutoff = (
+        datetime.now(timezone.utc) - timedelta(hours=3)
+    ).strftime("%Y-%m-%d %H:%M:%S")
+    db = client.app.state.db
+    asyncio.run(
+        db.execute(
+            "UPDATE task_log SET claimed_at = ? WHERE id = ?",
+            (cutoff, task["id"]),
+        )
+    )
+    asyncio.run(db.commit())
+
+    r = client.post(
+        f"/projects/{project['id']}/start-session",
+        json={"session_name": "new-worker"},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["recent_tasks"][0]["description"].startswith("Auto-released 1 stale claim")
+
+    fresh = asyncio.run(db_module.get_task(db, task["id"]))
+    assert fresh is not None
+    assert fresh["status"] == "pending"
+    assert fresh["claimed_by"] is None
+
+
+def test_claim_task_rejects_blocked_sprint_item_dependencies(client):
+    project = client.post("/projects", json={"name": "dep-claim"}).json()
+    sess = client.post(
+        "/sessions/register",
+        json={"project_id": project["id"], "name": "worker"},
+    ).json()
+    parent = client.post(
+        f"/projects/{project['id']}/sprint-items",
+        json={"version": "v1", "title": "Parent item"},
+    ).json()
+    child = client.post(
+        f"/projects/{project['id']}/sprint-items",
+        json={
+            "version": "v1",
+            "title": "Child item",
+            "depends_on": parent["id"],
+        },
+    ).json()
+
+    blocked = client.post(
+        f"/projects/{project['id']}/tasks/claim",
+        json={"task_id": child["id"], "session_id": sess["id"]},
+    )
+    assert blocked.status_code == 200
+    blocked_body = blocked.json()
+    assert blocked_body["claimed"] is False
+    assert blocked_body["error"] == "dependency_not_met"
+    assert blocked_body["blocking_item_id"] == parent["id"]
+    assert blocked_body["blocking_item_title"] == "Parent item"
+
+    client.post(
+        f"/projects/{project['id']}/sprint-items/{parent['id']}/complete",
+        json={},
+    )
+    claimed = client.post(
+        f"/projects/{project['id']}/tasks/claim",
+        json={"task_id": child["id"], "session_id": sess["id"]},
+    )
+    assert claimed.status_code == 200
+    claimed_body = claimed.json()
+    assert claimed_body["claimed"] is True
+    assert claimed_body["sprint_item_id"] == child["id"]
+
+    sprint_items = client.get(f"/projects/{project['id']}/sprint-items").json()
+    child_fresh = next(it for it in sprint_items if it["id"] == child["id"])
+    assert child_fresh["status"] == "in_progress"
 
 
 def test_start_session_handoff_exists_reflects_disk_reality(client, tmp_path):
