@@ -22,6 +22,7 @@ All notable changes to Meridian. Generated from git history via `git-cliff`.
 
 ### Chores
 
+- Chore: update CHANGELOG ([9a53038](https://github.com/meridianmcp/Meridian/commit/9a53038758ca1f009128f343c09f4ad2d1cda023))
 - Chore: update CHANGELOG ([3b07d80](https://github.com/meridianmcp/Meridian/commit/3b07d804c44a207f53c1d461b4f68e6716e589c4))
 - Chore: update CHANGELOG ([7e8e018](https://github.com/meridianmcp/Meridian/commit/7e8e0183df7e2e472e3b079789a8562c1971af45))
 - Chore: update CHANGELOG ([6278980](https://github.com/meridianmcp/Meridian/commit/627898090a19bf3d98f632136a7d67df1abf610d))
@@ -39,6 +40,7 @@ All notable changes to Meridian. Generated from git history via `git-cliff`.
 
 ### Features
 
+- Feat: dashboard fixes — swimlane legend, chart legends, NS auto-resize, task search UI, AI consolidation, demo cookie fix ([892ee83](https://github.com/meridianmcp/Meridian/commit/892ee8392963bd5b9a41c6a74d81bd5daecea306))
 - Feat: add open_pg_connection to pg_adapter for standalone scripts ([f605df7](https://github.com/meridianmcp/Meridian/commit/f605df71fd84f9a475b48dda61a5df5dc8eec791))
 - Feat: handoff v3 — sign-in/up copy, alpha bump, pg v28 migration, waitlist gate ([3ec4ca9](https://github.com/meridianmcp/Meridian/commit/3ec4ca994771132f14acddd9b67bf9a9c737fe38))
 - Feat: waitlist landing swap, search_tasks MCP tool, auto_capture, pg_trgm ([886261a](https://github.com/meridianmcp/Meridian/commit/886261a84582331e1fdaf953274ea7472057f59a))
@@ -70,6 +72,8 @@ All notable changes to Meridian. Generated from git history via `git-cliff`.
 
 ### Other
 
+- Merge branch 'main' of https://github.com/meridianmcp/Meridian ([f4f7a3c](https://github.com/meridianmcp/Meridian/commit/f4f7a3ca3325b522aa2ce39daba6849e5cfd9dd2))
+- Merge branch 'dev' ([587a604](https://github.com/meridianmcp/Meridian/commit/587a604784b4a267863a2fddbd971a90da1fe804))
 - Merge branch 'dev' ([4cd9784](https://github.com/meridianmcp/Meridian/commit/4cd97847d00de49719c92fc8fd7b4aadbace7829))
 - Merge branch 'main' of https://github.com/meridianmcp/Meridian ([08b0ab0](https://github.com/meridianmcp/Meridian/commit/08b0ab021b0033cc817eb12e18879da0f6a2be9d))
 - Merge branch 'dev' ([1fd2565](https://github.com/meridianmcp/Meridian/commit/1fd256569d4638ffbaa6a945f801fdd0d92a1881))
