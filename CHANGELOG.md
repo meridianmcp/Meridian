@@ -6,6 +6,7 @@ All notable changes to Meridian. Generated from git history via `git-cliff`.
 
 ### Bug Fixes
 
+- Fix: isolate demo dashboard state ([b8a0dbc](https://github.com/meridianmcp/Meridian/commit/b8a0dbcefea08b8d155cc6f790f09c41ebcfd33f))
 - Fix: add backburner to all status Literal types in models.py and db.py — was causing 500 on any endpoint returning tasks ([48dd6f1](https://github.com/meridianmcp/Meridian/commit/48dd6f1ece3ca1297df6603a017a80fde10b8968))
 - Fix: encoding artifacts in terms.html and privacy.html ([04ca0ee](https://github.com/meridianmcp/Meridian/commit/04ca0eebeae2532a2ae80337575a154d7c421b0e))
 - Fix: GitHub OAuth — add github_sub column, fix upsert_tenant to use github_sub not google_sub ([cbdd056](https://github.com/meridianmcp/Meridian/commit/cbdd056605ad59f270d0d4fcbcd474c82e065f64))
@@ -22,6 +23,7 @@ All notable changes to Meridian. Generated from git history via `git-cliff`.
 
 ### Chores
 
+- Chore: update CHANGELOG ([904115b](https://github.com/meridianmcp/Meridian/commit/904115be4cbfcca941fbb707edfdd95852d64ccb))
 - Chore: update CHANGELOG ([fd0bba3](https://github.com/meridianmcp/Meridian/commit/fd0bba36925e21579210a8a641724005358eaf94))
 - Chore: add complete_sprint_item as mandatory rule in CLAUDE.md ([d950491](https://github.com/meridianmcp/Meridian/commit/d9504918b101d29de518c43405c91425e2deb932))
 - Chore: update CHANGELOG ([9a53038](https://github.com/meridianmcp/Meridian/commit/9a53038758ca1f009128f343c09f4ad2d1cda023))
@@ -74,6 +76,8 @@ All notable changes to Meridian. Generated from git history via `git-cliff`.
 
 ### Other
 
+- Merge remote-tracking branch 'origin/main' ([718fe46](https://github.com/meridianmcp/Meridian/commit/718fe469a93401ea88e1a91a351f431f4fcdc6b7))
+- Merge branch 'dev' ([92bcc0f](https://github.com/meridianmcp/Meridian/commit/92bcc0fe459c6bf910845e2d8b7387b7938433ff))
 - Merge branch 'main' of https://github.com/meridianmcp/Meridian ([24179cb](https://github.com/meridianmcp/Meridian/commit/24179cb3f6b0afd93e83b1fe9c74b755e2a32ee4))
 - Merge branch 'dev' ([e817e60](https://github.com/meridianmcp/Meridian/commit/e817e604ea224abed8c15263c8865d7e9dceab64))
 - Merge branch 'main' of https://github.com/meridianmcp/Meridian ([f4f7a3c](https://github.com/meridianmcp/Meridian/commit/f4f7a3ca3325b522aa2ce39daba6849e5cfd9dd2))
