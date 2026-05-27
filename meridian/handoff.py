@@ -51,6 +51,42 @@ def _format_content(content) -> str:
     return json.dumps(content, indent=2)
 
 
+def _prepare_pending_sprint_items(
+    items: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Topologically order pending sprint items and annotate dependencies."""
+    by_id = {item["id"]: {**item} for item in items}
+    ordered: list[dict[str, Any]] = []
+    visiting: set[str] = set()
+    visited: set[str] = set()
+
+    def visit(item_id: str) -> None:
+        if item_id in visited or item_id in visiting:
+            return
+        visiting.add(item_id)
+        item = by_id[item_id]
+        parent_id = item.get("depends_on")
+        if parent_id and parent_id in by_id:
+            visit(parent_id)
+        visiting.remove(item_id)
+        visited.add(item_id)
+        ordered.append(item)
+
+    for item in items:
+        visit(item["id"])
+
+    position_by_id = {item["id"]: idx + 1 for idx, item in enumerate(ordered)}
+    for item in ordered:
+        parent_id = item.get("depends_on")
+        parent = by_id.get(parent_id) if parent_id else None
+        item["dependency_title"] = parent.get("title") if parent else None
+        item["dependency_status"] = parent.get("status") if parent else None
+        item["dependency_position"] = (
+            position_by_id.get(parent_id) if parent_id else None
+        )
+    return ordered
+
+
 async def _generate_ai_summary(
     recent_tasks: list[dict[str, Any]],
     sprint: str | None,
@@ -235,6 +271,7 @@ async def generate_handoff(
         it for it in sprint_items_all
         if it.get("status") in ("todo", "pending", "in_progress")
     ]
+    pending_sprint_items = _prepare_pending_sprint_items(pending_sprint_items)
     decisions_log = (project.get("decisions") or "").strip()
 
     # Split tasks into L1 (last 10) and L2 (older).
@@ -272,6 +309,16 @@ async def generate_handoff(
         pending_sprint_items=pending_sprint_items,
         decisions_log=decisions_log,
         ai_summary=ai_summary,
+        quick_start_goal=(
+            "/goal Complete pending sprint items in dependency order. "
+            "Done when: (1) generate_handoff output includes a ## Quick Start "
+            "section with a /goal invocation template, (2) claim_task rejects "
+            "claims where depends_on item is not done, (3) start_session "
+            "auto-releases stale claims older than 2 hours, (4) pixi run test "
+            "passes 524+, (5) all pending sprint items for this run are marked "
+            "complete via complete_sprint_item(), (6) generate_handoff() is "
+            "called at the end. Stop after 40 turns or if HITL triggered."
+        ),
     )
 
     out_dir = Path(output_dir)

@@ -193,6 +193,7 @@ class Task(BaseModel):
     description: str
     status: Literal["pending", "in_progress", "done", "failed", "pending-hitl", "backlog", "future", "backburner"]
     parent_task_id: str | None = None  # v2.4
+    sprint_item_id: str | None = None  # v2.6
     claimed_by: str | None = None
     claimed_at: str | None = None
     created_at: str
@@ -216,6 +217,10 @@ class ClaimTaskResponse(BaseModel):
     task_id: str
     claimed: bool
     claimed_by: str | None = None
+    sprint_item_id: str | None = None
+    error: str | None = None
+    blocking_item_id: str | None = None
+    blocking_item_title: str | None = None
 
 
 class HandoffResult(BaseModel):

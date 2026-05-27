@@ -1850,6 +1850,81 @@ async def get_claimable_tasks(
     )
 
 
+async def _claim_task_result(
+    db: aiosqlite.Connection,
+    project_id: str,
+    task_or_item_id: str,
+    session_id: str,
+) -> dict[str, Any]:
+    """Claim a task row, resolving sprint-item ids when provided."""
+    sprint_item = await db_module.get_sprint_item(db, task_or_item_id)
+    task = None
+    sprint_item_id: str | None = None
+    if sprint_item is not None and sprint_item.get("project_id") == project_id:
+        sprint_item_id = sprint_item["id"]
+    else:
+        task = await db_module.get_task(db, task_or_item_id)
+        if task is None or task.get("project_id") != project_id:
+            task = None
+        elif task.get("sprint_item_id"):
+            sprint_item_id = task["sprint_item_id"]
+            sprint_item = await db_module.get_sprint_item(db, sprint_item_id)
+
+    if sprint_item_id:
+        blocking = await db_module.get_blocking_dependency_for_sprint_item(
+            db, sprint_item_id
+        )
+        if blocking is not None:
+            return {
+                "task_id": task["id"] if task else task_or_item_id,
+                "claimed": False,
+                "claimed_by": task["claimed_by"] if task else None,
+                "sprint_item_id": sprint_item_id,
+                "error": "dependency_not_met",
+                "blocking_item_id": blocking["id"],
+                "blocking_item_title": blocking.get("title"),
+            }
+        if task is None:
+            task = await db_module.get_open_task_for_sprint_item(db, sprint_item_id)
+        if task is None:
+            assert sprint_item is not None
+            task = await db_module.log_task(
+                db,
+                session_id,
+                project_id,
+                sprint_item["title"],
+                "pending",
+                sprint_item_id=sprint_item_id,
+            )
+    elif task is None:
+        return {
+            "task_id": task_or_item_id,
+            "claimed": False,
+            "claimed_by": None,
+        }
+
+    claimed = await db_module.claim_task(db, task["id"], session_id)
+    if claimed is None:
+        existing = await db_module.get_task(db, task["id"])
+        return {
+            "task_id": task["id"],
+            "claimed": False,
+            "claimed_by": existing["claimed_by"] if existing else None,
+            "sprint_item_id": sprint_item_id,
+        }
+    if sprint_item_id and sprint_item is not None and sprint_item.get("status") in (
+        "pending",
+        "todo",
+    ):
+        await db_module.start_sprint_item(db, project_id, sprint_item_id)
+    return {
+        "task_id": claimed["id"],
+        "claimed": True,
+        "claimed_by": claimed["claimed_by"],
+        "sprint_item_id": sprint_item_id,
+    }
+
+
 @app.post(
     "/projects/{project_id}/tasks/claim", response_model=ClaimTaskResponse
 )
@@ -1861,21 +1936,9 @@ async def claim_task_endpoint(
     project = await db_module.get_project(await _db(request), project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="project not found")
-    claimed = await db_module.claim_task(
-        await _db(request), body.task_id, body.session_id
+    return await _claim_task_result(
+        await _db(request), project_id, body.task_id, body.session_id
     )
-    if claimed is None:
-        existing = await db_module.get_task(await _db(request), body.task_id)
-        return {
-            "task_id": body.task_id,
-            "claimed": False,
-            "claimed_by": existing["claimed_by"] if existing else None,
-        }
-    return {
-        "task_id": body.task_id,
-        "claimed": True,
-        "claimed_by": claimed["claimed_by"],
-    }
 
 
 @app.post("/projects/{project_id}/tasks/release")
@@ -3807,6 +3870,21 @@ async def _start_session_composite(
     session = await db_module.register_session(
         db, project_id, session_name, human_id=human_id, client_type=client_type
     )
+    released_stale_claims = await db_module.release_stale_task_claims(
+        db,
+        project_id,
+        exclude_session_id=session["id"],
+        max_age_hours=2,
+    )
+    if released_stale_claims:
+        noun = "claim" if released_stale_claims == 1 else "claims"
+        await db_module.log_task(
+            db,
+            session["id"],
+            project_id,
+            f"Auto-released {released_stale_claims} stale {noun} older than 2 hours from previous sessions.",
+            "done",
+        )
 
     goal = await db_module.get_goal(db, project_id)
     if goal is not None:
@@ -5863,28 +5941,12 @@ def build_mcp_server():
                     timeout=timeout,
                 )
             elif name == "claim_task":
-                claimed = await db_module.claim_task(
+                result = await _claim_task_result(
                     db,
+                    arguments["project_id"],
                     arguments["task_id"],
                     arguments["session_id"],
                 )
-                if claimed is None:
-                    existing = await db_module.get_task(
-                        db, arguments["task_id"]
-                    )
-                    result = {
-                        "task_id": arguments["task_id"],
-                        "claimed": False,
-                        "claimed_by": (
-                            existing["claimed_by"] if existing else None
-                        ),
-                    }
-                else:
-                    result = {
-                        "task_id": arguments["task_id"],
-                        "claimed": True,
-                        "claimed_by": claimed["claimed_by"],
-                    }
             elif name == "release_task":
                 released = await db_module.release_task(
                     db,

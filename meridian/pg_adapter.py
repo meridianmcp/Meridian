@@ -356,6 +356,7 @@ CREATE TABLE IF NOT EXISTS task_log (
     claimed_by TEXT,
     claimed_at TEXT,
     parent_session_id TEXT,
+    sprint_item_id TEXT,
     worker_pid INTEGER,
     created_at TEXT NOT NULL DEFAULT ({_TS})
 );
@@ -608,6 +609,7 @@ async def init_pg_db(url: str) -> PostgresConnection:
     await _migrate_pg_drop_chat_tables(conn)
     await _migrate_pg_goal_field_timestamps(conn)
     await _migrate_pg_v24_task_tree_and_framework(conn)
+    await _migrate_pg_task_sprint_link(conn)
     await _migrate_pg_v26_client_type(conn)
     await _migrate_pg_v27_pg_trgm(conn)
     await _migrate_pg_v24_pinned_decisions_and_hitl(conn)
@@ -651,6 +653,13 @@ async def _migrate_pg_v24_task_tree_and_framework(conn: PostgresConnection) -> N
         "ALTER TABLE task_log ADD COLUMN IF NOT EXISTS parent_task_id TEXT;"
         "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS agent_framework TEXT DEFAULT 'claude_code';"
         "ALTER TABLE projects ADD COLUMN IF NOT EXISTS project_token TEXT"
+    )
+
+
+async def _migrate_pg_task_sprint_link(conn: PostgresConnection) -> None:
+    """v2.6 â€” link task_log rows back to their sprint item when applicable."""
+    await conn.executescript(
+        "ALTER TABLE task_log ADD COLUMN IF NOT EXISTS sprint_item_id TEXT"
     )
 
 
