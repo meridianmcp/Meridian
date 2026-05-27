@@ -319,6 +319,7 @@ CREATE TABLE IF NOT EXISTS projects (
     creator_human_id TEXT,
     goal_mode TEXT NOT NULL DEFAULT 'manual',
     decisions TEXT,
+    max_pinned_decisions INTEGER NOT NULL DEFAULT 20,
     rewind_token TEXT,
     created_at TEXT NOT NULL DEFAULT ({_TS})
 );
@@ -609,6 +610,7 @@ async def init_pg_db(url: str) -> PostgresConnection:
     await _migrate_pg_drop_chat_tables(conn)
     await _migrate_pg_goal_field_timestamps(conn)
     await _migrate_pg_v24_task_tree_and_framework(conn)
+    await _migrate_pg_project_settings(conn)
     await _migrate_pg_task_sprint_link(conn)
     await _migrate_pg_v26_client_type(conn)
     await _migrate_pg_v27_pg_trgm(conn)
@@ -653,6 +655,13 @@ async def _migrate_pg_v24_task_tree_and_framework(conn: PostgresConnection) -> N
         "ALTER TABLE task_log ADD COLUMN IF NOT EXISTS parent_task_id TEXT;"
         "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS agent_framework TEXT DEFAULT 'claude_code';"
         "ALTER TABLE projects ADD COLUMN IF NOT EXISTS project_token TEXT"
+    )
+
+
+async def _migrate_pg_project_settings(conn: PostgresConnection) -> None:
+    """v2.6.1 — add per-project settings columns."""
+    await conn.executescript(
+        "ALTER TABLE projects ADD COLUMN IF NOT EXISTS max_pinned_decisions INTEGER NOT NULL DEFAULT 20"
     )
 
 

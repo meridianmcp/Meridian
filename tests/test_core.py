@@ -6,6 +6,7 @@ import asyncio
 import json
 import os
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -13,6 +14,7 @@ from meridian import dashboard as dashboard_module
 from meridian import db as db_module
 from meridian import enqueue as enqueue_module
 from meridian import handoff as handoff_module
+from meridian import server as server_module
 
 
 # ---------------------------------------------------------------------------
@@ -39,6 +41,25 @@ async def test_get_project_by_name_and_list(db):
     assert by_name["name"] == "beta"
     all_projects = await db_module.list_projects(db)
     assert {p["name"] for p in all_projects} == {"alpha", "beta"}
+
+
+@pytest.mark.asyncio
+async def test_get_and_update_project_settings(db):
+    p = await db_module.create_project(db, "alpha")
+    settings = await db_module.get_project_settings(db, p["id"])
+    assert settings == {
+        "project_id": p["id"],
+        "max_pinned_decisions": 20,
+    }
+    updated = await db_module.update_project_settings(
+        db,
+        p["id"],
+        max_pinned_decisions=30,
+    )
+    assert updated == {
+        "project_id": p["id"],
+        "max_pinned_decisions": 30,
+    }
 
 
 @pytest.mark.asyncio
@@ -132,7 +153,8 @@ async def test_handoff_generates_clean_markdown(db, tmp_path):
     assert "sess-1" in content and "sess-2" in content
     assert "did A" in content and "did B" in content
     assert "## Quick Start" in content
-    assert "/goal Complete pending sprint items in dependency order." in content
+    assert "/goal Verify remaining work is complete." in content
+    assert "pixi run test passes 524+" in content
     assert "## Resume Instructions" in content
     on_disk = tmp_path / "alpha_handoff.md"
     assert on_disk.exists()
@@ -145,7 +167,7 @@ async def test_handoff_lists_pending_sprint_items_in_dependency_order(db, tmp_pa
     p = await db_module.create_project(db, "alpha-queue")
     await db_module.set_goal(db, p["id"], "ship the queue")
     first = await db_module.add_sprint_item(db, p["id"], "v1", "First fix")
-    await db_module.add_sprint_item(
+    second = await db_module.add_sprint_item(
         db, p["id"], "v1", "Second fix", depends_on=first["id"]
     )
     _, content = await handoff_module.generate_handoff(
@@ -155,6 +177,69 @@ async def test_handoff_lists_pending_sprint_items_in_dependency_order(db, tmp_pa
     assert "2. [pending] Second fix" in content
     assert f"Depends on item 1 (`{first['id']}`): First fix" in content
     assert f'start_session(project_id="{p["id"]}", session_name="<your-name>")' in content
+    assert (
+        f"/goal Complete sprint items: {first['id']}, {second['id']}."
+        in content
+    )
+    assert "complete_sprint_item()" in content
+
+
+@pytest.mark.asyncio
+async def test_handoff_includes_strategic_notes(db, tmp_path):
+    p = await db_module.create_project(db, "alpha-strategy")
+    await db_module.set_goal(db, p["id"], "ship with context")
+    await db_module.add_project_note(
+        db,
+        p["id"],
+        "Competitive Landscape",
+        "Meridian competes on coordination, not benchmark memory scores.",
+        "competitive,strategy",
+    )
+    await db_module.add_project_note(
+        db,
+        p["id"],
+        "Infra Note",
+        "This should stay out of L0 strategic notes.",
+        "technical",
+    )
+    _, content = await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True
+    )
+    assert "Strategic Notes (1)" in content
+    assert "Competitive Landscape" in content
+    assert "coordination, not benchmark memory scores" in content
+    assert "Infra Note" not in content
+
+
+@pytest.mark.asyncio
+async def test_handoff_delta_mode_reports_recent_changes(db, tmp_path):
+    p = await db_module.create_project(db, "alpha-delta")
+    await db_module.set_goal(db, p["id"], "ship incremental work")
+    first = await db_module.add_sprint_item(db, p["id"], "v1", "First fix")
+    second = await db_module.add_sprint_item(
+        db, p["id"], "v1", "Second fix", depends_on=first["id"]
+    )
+    await handoff_module.generate_handoff(
+        db,
+        p["id"],
+        str(tmp_path),
+        skip_ai_summary=True,
+        mode="full",
+        session_id="sess-delta",
+    )
+    await db_module.complete_sprint_item(db, p["id"], first["id"])
+    _, content = await handoff_module.generate_handoff(
+        db,
+        p["id"],
+        str(tmp_path),
+        skip_ai_summary=True,
+        mode="delta",
+        session_id="sess-delta",
+    )
+    assert "# Session Update — alpha-delta" in content
+    assert f"- {first['id']} — First fix" in content
+    assert f"- {second['id']} [pending] Second fix" in content
+    assert f"/goal Complete sprint items: {second['id']}." in content
 
 
 # ---------------------------------------------------------------------------
@@ -186,6 +271,26 @@ def test_duplicate_project_returns_409(client):
 def test_get_unknown_project_returns_404(client):
     r = client.get("/projects/does-not-exist")
     assert r.status_code == 404
+
+
+def test_project_settings_http_round_trip(client):
+    project = client.post("/projects", json={"name": "alpha-settings"}).json()
+    r = client.get(f"/projects/{project['id']}/settings")
+    assert r.status_code == 200
+    assert r.json() == {
+        "project_id": project["id"],
+        "max_pinned_decisions": 20,
+    }
+
+    r = client.patch(
+        f"/projects/{project['id']}/settings",
+        json={"max_pinned_decisions": 30},
+    )
+    assert r.status_code == 200
+    assert r.json() == {
+        "project_id": project["id"],
+        "max_pinned_decisions": 30,
+    }
 
 
 def test_goal_round_trip_and_versioning(client):
@@ -429,6 +534,49 @@ def test_handoff_endpoint(client):
     assert "ship it" in body["content"]
     assert "step 1" in body["content"]
     assert body["path"].endswith("alpha_handoff.md")
+
+
+def test_handoff_endpoint_auto_switches_repeat_session_to_delta(client):
+    project = client.post("/projects", json={"name": "alpha-delta-http"}).json()
+    parent = client.post(
+        f"/projects/{project['id']}/sprint-items",
+        json={"version": "v1", "title": "Parent item"},
+    ).json()
+    child = client.post(
+        f"/projects/{project['id']}/sprint-items",
+        json={"version": "v1", "title": "Child item", "depends_on": parent["id"]},
+    ).json()
+
+    first = client.post(
+        f"/projects/{project['id']}/handoff",
+        json={"session_id": "sess-http-delta"},
+    )
+    assert first.status_code == 200
+    assert first.json()["mode"] == "full"
+
+    client.post(
+        f"/projects/{project['id']}/sprint-items/{parent['id']}/complete",
+        json={},
+    )
+    second = client.post(
+        f"/projects/{project['id']}/handoff",
+        json={"session_id": "sess-http-delta"},
+    )
+    assert second.status_code == 200
+    body = second.json()
+    assert body["mode"] == "delta"
+    assert "# Session Update — alpha-delta-http" in body["content"]
+    assert f"- {parent['id']} — Parent item" in body["content"]
+    assert f"- {child['id']} [pending] Child item" in body["content"]
+
+
+@pytest.mark.asyncio
+async def test_docs_mcp_tools_matches_live_tool_doc():
+    expected = await server_module.mcp_tools_doc()
+    actual = (
+        Path(__file__).resolve().parents[1] / "docs" / "mcp-tools.md"
+    ).read_text(encoding="utf-8")
+    assert actual.rstrip() == expected.rstrip()
 
 
 # ---------------------------------------------------------------------------
@@ -4156,6 +4304,12 @@ def test_work_queue_vtab_in_dashboard(client):
     assert "queue-body-" in js, (
         "v1.4.0: queue-body element id missing from dashboard.js"
     )
+    assert "/sprint-items" in js, (
+        "queue should read sprint items so pending work reflects the sprint board"
+    )
+    assert "RECENT_DONE_LIMIT = 25" in js, (
+        "recently done queue section should keep 25 items instead of 10"
+    )
 
 
 def test_vtab_drawer_always_visible(client):
@@ -5158,6 +5312,46 @@ def test_decisions_pinned_http_round_trip(client):
     r = client.get(f"/projects/{project['id']}/decisions-pinned")
     titles = [x["title"] for x in r.json()]
     assert titles == ["ship later"]
+
+
+def test_decisions_pinned_archive_oldest_http(client):
+    project = client.post("/projects", json={"name": "v24-pin-archive"}).json()
+    created = []
+    for title in ("oldest", "middle", "newest"):
+        r = client.post(
+            f"/projects/{project['id']}/decisions-pinned",
+            json={"title": title, "body": f"{title} body", "category": "TECHNICAL"},
+        )
+        assert r.status_code == 201
+        created.append(r.json())
+    db = client.app.state.db
+    asyncio.run(
+        db.execute(
+            "UPDATE decisions_pinned SET created_at = ? WHERE id = ?",
+            ("2026-01-01 00:00:01", created[0]["id"]),
+        )
+    )
+    asyncio.run(
+        db.execute(
+            "UPDATE decisions_pinned SET created_at = ? WHERE id = ?",
+            ("2026-01-01 00:00:02", created[1]["id"]),
+        )
+    )
+    asyncio.run(
+        db.execute(
+            "UPDATE decisions_pinned SET created_at = ? WHERE id = ?",
+            ("2026-01-01 00:00:03", created[2]["id"]),
+        )
+    )
+    asyncio.run(db.commit())
+    r = client.post(
+        f"/projects/{project['id']}/decisions-pinned/archive-oldest",
+        json={"count": 2},
+    )
+    assert r.status_code == 200
+    assert r.json()["archived"] == 2
+    remaining = client.get(f"/projects/{project['id']}/decisions-pinned").json()
+    assert [row["title"] for row in remaining] == ["newest"]
 
 
 # ---------------------------------------------------------------------------

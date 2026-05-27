@@ -113,6 +113,8 @@ from .models import (
     HandoffResult,
     Project,
     ProjectCreate,
+    ProjectSettings,
+    ProjectSettingsPatch,
     Session,
     SessionRegister,
     SetNorthStarRequest,
@@ -781,6 +783,22 @@ async def site_password_gate(request: Request, call_next):
     # Demo cookie bypasses site password gate — demo users don't go through __gate__
     if request.cookies.get(_DEMO_CONTEXT_COOKIE):
         return await call_next(request)
+    if _hosted_mode():
+        from .hosted import _SESSION_COOKIE, _read_session_cookie
+        from . import db as db_module
+        auth_db = request.app.state.db
+        cookie_val = request.cookies.get(_SESSION_COOKIE, "")
+        if cookie_val:
+            session_id = _read_session_cookie(cookie_val)
+            if session_id and await db_module.get_user_session(auth_db, session_id):
+                return await call_next(request)
+        auth_header = request.headers.get("authorization", "")
+        if auth_header.startswith("Bearer "):
+            import hashlib
+
+            token_hash = hashlib.sha256(auth_header[7:].encode()).hexdigest()
+            if await db_module.get_tenant_from_token_hash(auth_db, token_hash):
+                return await call_next(request)
     from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
     from fastapi.responses import HTMLResponse
     secret = os.environ.get("SESSION_SECRET", "fallback")
@@ -901,11 +919,19 @@ async def _open_tenant_db_by_id(request: Request, tenant_id: str) -> Any:
     from .pg_adapter import open_pg_connection
     auth_db = request.app.state.db
     tenant = await db_module.get_tenant_by_id(auth_db, tenant_id)
-    if not tenant or not tenant.get("neon_db_url"):
-        return auth_db
+    if not tenant:
+        raise HTTPException(status_code=401, detail="tenant not found")
+    if not tenant.get("neon_db_url"):
+        raise HTTPException(
+            status_code=503,
+            detail="tenant database not provisioned",
+        )
     url = db_module.decrypt_field(tenant["neon_db_url"])
     if not url:
-        return auth_db
+        raise HTTPException(
+            status_code=503,
+            detail="tenant database credentials unavailable",
+        )
     conn = await open_pg_connection(url)
     _tenant_db_cache[tenant_id] = conn
     return conn
@@ -1274,6 +1300,30 @@ async def get_project(project_id: str, request: Request) -> dict[str, Any]:
     if project is None:
         raise HTTPException(status_code=404, detail="project not found")
     return project
+
+
+@app.get("/projects/{project_id}/settings", response_model=ProjectSettings)
+async def get_project_settings(project_id: str, request: Request) -> dict[str, Any]:
+    """Return persisted per-project dashboard settings."""
+    settings = await db_module.get_project_settings(await _db(request), project_id)
+    if settings is None:
+        raise HTTPException(status_code=404, detail="project not found")
+    return settings
+
+
+@app.patch("/projects/{project_id}/settings", response_model=ProjectSettings)
+async def patch_project_settings(
+    project_id: str, body: ProjectSettingsPatch, request: Request
+) -> dict[str, Any]:
+    """Update persisted per-project dashboard settings."""
+    settings = await db_module.update_project_settings(
+        await _db(request),
+        project_id,
+        max_pinned_decisions=body.max_pinned_decisions,
+    )
+    if settings is None:
+        raise HTTPException(status_code=404, detail="project not found")
+    return settings
 
 
 @app.post("/projects/{project_id}/rename")
@@ -1975,13 +2025,29 @@ async def generate_handoff(
     # key obviously isn't configured. Local devs without ANTHROPIC_API_KEY
     # get instant handoffs; hosted deploys with the key get summaries.
     import os as _os
+    try:
+        body = await request.json()
+        if not isinstance(body, dict):
+            body = {}
+    except Exception:
+        body = {}
+    session_id = body.get("session_id")
+    mode = handoff_module.resolve_handoff_mode(
+        body.get("mode"),
+        session_id if isinstance(session_id, str) else None,
+    )
     skip_summary = not _os.environ.get("ANTHROPIC_API_KEY")
     db = await _db(request)
     data_dir = _data_dir(request)
     try:
         path, content = await asyncio.wait_for(
             handoff_module.generate_handoff(
-                db, project_id, data_dir, skip_ai_summary=skip_summary
+                db,
+                project_id,
+                data_dir,
+                skip_ai_summary=skip_summary,
+                mode=mode,
+                session_id=session_id if isinstance(session_id, str) else None,
             ),
             timeout=90.0,
         )
@@ -1989,7 +2055,8 @@ async def generate_handoff(
         path, content = await handoff_module._generate_handoff_l0(
             db, project_id, data_dir
         )
-    return {"path": path, "content": content}
+        mode = "full"
+    return {"path": path, "content": content, "mode": mode}
 
 
 @app.post("/sessions/register", response_model=Session, status_code=201)
@@ -2705,6 +2772,31 @@ async def replace_all_pinned_decisions(
             )
         created.append(row)
     return created
+
+
+@app.post("/projects/{project_id}/decisions-pinned/archive-oldest")
+async def archive_oldest_pinned_decisions(
+    project_id: str, body: dict[str, Any], request: Request
+) -> dict[str, Any]:
+    """Archive the oldest active pinned decisions without creating replacements."""
+    raw_count = body.get("count", 1)
+    try:
+        count = max(1, int(raw_count))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="count must be an integer") from None
+    db = await _db(request)
+    decisions = await db_module.get_pinned_decisions(db, project_id)
+    if not decisions:
+        return {"archived": 0}
+    to_archive = sorted(
+        decisions,
+        key=lambda d: ((d.get("created_at") or ""), (d.get("id") or "")),
+    )[:count]
+    for decision in to_archive:
+        await db_module.update_pinned_decision(
+            db, decision["id"], status="superseded"
+        )
+    return {"archived": len(to_archive)}
 
 
 @app.post("/projects/{project_id}/decisions/consolidate")
@@ -4559,7 +4651,7 @@ TOOL_EXAMPLES: dict[str, str] = {
     "create_project": 'create_project(name="my-app")',
     "start_session": 'start_session(project_id="abc-123", session_name="feature-x", human_id="alice")',
     "register_session": 'register_session(project_id="abc-123", session_name="feature-x", human_id="alice")',
-    "log_task": 'log_task(project_id="abc-123", description="Fixed auth bug", status="done")',
+    "log_task": 'log_task(session_id="session-uuid", project_id="abc-123", description="Fixed auth bug", status="done")',
     "get_context_block": 'get_context_block(project_id="abc-123", mode="chat")',
     "claim_task": 'claim_task(task_id="task-uuid-here")',
     "complete_task": 'complete_task(task_id="task-uuid-here")',
@@ -4569,13 +4661,13 @@ TOOL_EXAMPLES: dict[str, str] = {
     "set_goal": 'set_goal(project_id="abc-123", content="Build a great product")',
     "set_sprint": 'set_sprint(project_id="abc-123", sprint="v2.0 — auth + dashboard")',
     "set_north_star": 'set_north_star(project_id="abc-123", north_star="Ship by Q3")',
-    "pin_decision": 'pin_decision(project_id="abc-123", decision="Use psycopg3", rationale="asyncpg has DLL issues on Windows", category="TECHNICAL")',
+    "pin_decision": 'pin_decision(project_id="abc-123", title="Use psycopg3", body="asyncpg has DLL issues on Windows", category="TECHNICAL")',
     "get_pinned_decisions": 'get_pinned_decisions(project_id="abc-123")',
-    "generate_handoff": 'generate_handoff(project_id="abc-123", session_id="session-uuid")',
+    "generate_handoff": 'generate_handoff(project_id="abc-123", mode="delta", session_id="session-uuid")',
     "get_session_brief": 'get_session_brief(project_id="abc-123")',
     "request_hitl": 'request_hitl(project_id="abc-123", question="Should we add rate limiting here?", urgency="normal")',
     "get_hitl_request": 'get_hitl_request(request_id="hitl-uuid")',
-    "add_note": 'add_note(project_id="abc-123", content="Reminder: update env vars before deploy")',
+    "add_note": 'add_note(project_id="abc-123", title="Deploy note", body="Reminder: update env vars before deploy", tags="ops,deploy")',
     "get_notes": 'get_notes(project_id="abc-123")',
     "add_sprint_item": 'add_sprint_item(project_id="abc-123", title="Add OAuth login", item_group="auth")',
     "get_sprint_items": 'get_sprint_items(project_id="abc-123")',
@@ -4617,8 +4709,12 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"}, "query": {"type": "string"}, "limit": {"type": "integer"}},
          "required": ["project_id", "query"]}},
-    {"name": "generate_handoff", "description": "Generate a context handoff file.",
-     "inputSchema": {"type": "object", "properties": {"project_id": {"type": "string"}}, "required": ["project_id"]}},
+    {"name": "generate_handoff", "description": "Generate a context handoff file. mode='full' writes the complete L0/L1/L2 handoff; mode='delta' returns a compact session update with completed items, pending items, and the next /goal string.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"},
+         "mode": {"type": "string", "enum": ["full", "delta"]},
+         "session_id": {"type": "string", "description": "Optional session id for auto-delta on repeated calls in the same session."}},
+         "required": ["project_id"]}},
     {"name": "get_context_block", "description":
         "Return a compact plain-text project context block (north star, sprint, "
         "pending sprint items, recent tasks, recent decisions, active sessions). "
@@ -4783,16 +4879,30 @@ async def _dispatch_mcp_tool(name: str, args: dict[str, Any], db: Any, data_dir:
         )
     if name == "generate_handoff":
         from . import handoff as handoff_module_local
+        session_id = args.get("session_id")
+        if not isinstance(session_id, str):
+            session_id = None
+        mode = handoff_module_local.resolve_handoff_mode(
+            args.get("mode"),
+            session_id,
+        )
         try:
             path, content = await asyncio.wait_for(
-                handoff_module_local.generate_handoff(db, args["project_id"], data_dir),
+                handoff_module_local.generate_handoff(
+                    db,
+                    args["project_id"],
+                    data_dir,
+                    mode=mode,
+                    session_id=session_id,
+                ),
                 timeout=90.0,
             )
         except asyncio.TimeoutError:
             path, content = await handoff_module_local._generate_handoff_l0(
                 db, args["project_id"], data_dir
             )
-        return {"file_path": path, "content": content}
+            mode = "full"
+        return {"file_path": path, "content": content, "mode": mode}
     if name == "pin_decision":
         return await db_module.pin_decision(
             db, args["project_id"], args["title"], args["body"],
@@ -5186,13 +5296,27 @@ def build_mcp_server():
                 name="generate_handoff",
                 description=(
                     "Generate a context handoff file. Call when context is "
-                    "filling up or before ending a session. A new session "
-                    "can read this file to resume with full context. "
-                    "Returns file path and rendered content."
+                    "filling up or before ending a session. mode='full' "
+                    "writes the complete L0/L1/L2 handoff. mode='delta' "
+                    "returns a compact session update with completed items, "
+                    "remaining pending items, and the next /goal string."
                 ),
                 inputSchema={
                     "type": "object",
-                    "properties": {"project_id": {"type": "string"}},
+                    "properties": {
+                        "project_id": {"type": "string"},
+                        "mode": {
+                            "type": "string",
+                            "enum": ["full", "delta"],
+                        },
+                        "session_id": {
+                            "type": "string",
+                            "description": (
+                                "Optional session id for auto-delta on repeat "
+                                "calls in the same chat."
+                            ),
+                        },
+                    },
                     "required": ["project_id"],
                 },
             ),
@@ -5896,10 +6020,21 @@ def build_mcp_server():
                     db, arguments["project_id"], active_only=True
                 )
             elif name == "generate_handoff":
+                session_id = arguments.get("session_id")
+                if not isinstance(session_id, str):
+                    session_id = None
+                mode = handoff_module.resolve_handoff_mode(
+                    arguments.get("mode"),
+                    session_id,
+                )
                 try:
                     path, content = await asyncio.wait_for(
                         handoff_module.generate_handoff(
-                            db, arguments["project_id"], state["data_dir"]
+                            db,
+                            arguments["project_id"],
+                            state["data_dir"],
+                            mode=mode,
+                            session_id=session_id,
                         ),
                         timeout=90.0,
                     )
@@ -5907,7 +6042,8 @@ def build_mcp_server():
                     path, content = await handoff_module._generate_handoff_l0(
                         db, arguments["project_id"], state["data_dir"]
                     )
-                result = {"path": path, "content": content}
+                    mode = "full"
+                result = {"path": path, "content": content, "mode": mode}
             elif name == "get_context_block":
                 # v2.3 — reuse the dispatch impl so HTTP and stdio share one path.
                 result = await _dispatch_mcp_tool(

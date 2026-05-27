@@ -15,6 +15,51 @@ function isDemoMode() {
 }
 
 const STORAGE_KEY = (k) => (isDemoMode() ? 'meridian_demo_' : 'meridian_') + k.replace(/^meridian[._]/, '');
+const RECENT_DONE_LIMIT = 25;
+const NORTH_STAR_MIN_HEIGHT_PX = 180;
+const DEFAULT_MAX_PINNED_DECISIONS = 20;
+
+function getPanelState(projectId) {
+  state.panels[projectId] = state.panels[projectId] || {};
+  return state.panels[projectId];
+}
+
+function autosizeGoalField(el, minPx = NORTH_STAR_MIN_HEIGHT_PX) {
+  if (!el) return;
+  el.style.height = '0px';
+  el.style.height = `${Math.max(el.scrollHeight, minPx)}px`;
+}
+
+function getConstitutionLimit(projectId) {
+  const panel = getPanelState(projectId);
+  const parsed = parseInt(String(panel._projectSettings?.max_pinned_decisions || ''), 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_MAX_PINNED_DECISIONS;
+}
+
+async function loadProjectSettings(projectId, opts={}) {
+  const panel = getPanelState(projectId);
+  if (!opts.force && panel._projectSettings) return panel._projectSettings;
+  if (!opts.force && panel._projectSettingsPromise) return panel._projectSettingsPromise;
+  panel._projectSettingsPromise = api(`/projects/${projectId}/settings`)
+    .then((settings) => {
+      panel._projectSettings = settings || { project_id: projectId, max_pinned_decisions: DEFAULT_MAX_PINNED_DECISIONS };
+      return panel._projectSettings;
+    })
+    .finally(() => {
+      panel._projectSettingsPromise = null;
+    });
+  return panel._projectSettingsPromise;
+}
+
+async function saveProjectSettings(projectId, patch) {
+  const panel = getPanelState(projectId);
+  const settings = await api(`/projects/${projectId}/settings`, {
+    method: 'PATCH',
+    body: JSON.stringify(patch || {}),
+  });
+  panel._projectSettings = settings || { project_id: projectId, max_pinned_decisions: DEFAULT_MAX_PINNED_DECISIONS };
+  return panel._projectSettings;
+}
 
 function hideDemoAdminControls() {
   const selectors = [
@@ -309,8 +354,16 @@ async function loadConfig() {
 }
 
 async function loadProjects() {
-  state.projects = await api('/projects');
   const list = document.getElementById('project-list');
+  try {
+    state.projects = await api('/projects');
+  } catch (e) {
+    state.projects = [];
+    if (list) {
+      list.innerHTML = `<div class="empty" style="color:var(--status-failed);padding:6px 4px">projects failed: ${escapeHtml(e.message)}</div>`;
+    }
+    return;
+  }
   list.innerHTML = '';
   state.projects.forEach(p => {
     const div = document.createElement('div');
@@ -694,6 +747,7 @@ function buildTabBody(project) {
                 </div>
               </div>
               <div style="color:var(--muted);font-size:10px;margin-bottom:8px">Editable current truth. Use <code>pin_decision</code> MCP tool or <code>update_decision</code> with new_title+new_body to supersede.</div>
+              <div id="constitution-warning-${project.id}" style="margin-bottom:8px"></div>
               <div id="pinned-decisions-${project.id}" style="font-family:var(--font-mono);font-size:12px"></div>
             </div>
             <details open style="margin-top:14px">
@@ -835,21 +889,21 @@ function buildTabBody(project) {
       </div>
       <div class="claude-launch-body">
         <div class="claude-section" data-section="continue">
-          <div class="claude-section-label">Resume Claude Code session</div>
+          <div class="claude-section-label">Resume Claude Code session (<code>start_session</code> + <code>get_context_block</code>)</div>
           <select class="claude-session-select" id="continue-session-${project.id}">
             <option value="">(no sessions yet)</option>
           </select>
-          <button class="primary claude-section-btn" id="copy-resume-${project.id}">Copy resume command</button>
-          <p class="claude-hint">Paste into Claude Code to continue a previous session</p>
+          <button class="primary claude-section-btn" id="copy-resume-${project.id}" title="MCP flow: start_session() + get_context_block()">Copy resume MCP commands</button>
+          <p class="claude-hint">Uses <code>start_session()</code> to reopen the session and <code>get_context_block()</code> to reload the working context.</p>
         </div>
         <hr class="claude-divider">
         <div class="claude-section" data-section="worker">
-          <div class="claude-section-label">Start Claude Code worker</div>
-          <button class="primary claude-section-btn" id="start-worker-${project.id}">Claim &amp; start worker</button>
+          <div class="claude-section-label">Start Claude Code worker (<code>start_worker_session</code> + claim)</div>
+          <button class="primary claude-section-btn" id="start-worker-${project.id}" title="MCP: start_worker_session() claims the next task and returns worker context">Claim &amp; start worker</button>
           <div class="claude-worker-result" id="worker-result-${project.id}" style="display:none">
             <pre class="claude-worker-xml" id="worker-xml-${project.id}"></pre>
-            <button class="secondary claude-section-btn" id="copy-worker-${project.id}">Copy worker context</button>
-            <p class="claude-hint">Paste into a new Claude Code terminal to start a worker</p>
+            <button class="secondary claude-section-btn" id="copy-worker-${project.id}" title="Copy the worker_context returned by start_worker_session()">Copy worker context</button>
+            <p class="claude-hint">Uses <code>start_worker_session()</code> to claim the next task and produce a worker-ready context block.</p>
           </div>
           <div class="claude-worker-empty" id="worker-empty-${project.id}" style="display:none">
             <p class="claude-hint">No pending tasks — add one to the queue first.</p>
@@ -857,13 +911,13 @@ function buildTabBody(project) {
         </div>
         <hr class="claude-divider">
         <div class="claude-section" data-section="handoff">
-          <div class="claude-section-label">Claude Code handoff</div>
+          <div class="claude-section-label">Claude Code handoff (<code>generate_handoff</code>)</div>
           <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
-            <button class="primary claude-section-btn" id="copy-handoff-${project.id}">Code Handoff</button>
-            <button class="secondary claude-section-btn" id="regen-handoff-${project.id}">Regenerate</button>
+            <button class="primary claude-section-btn" id="copy-handoff-${project.id}" title="MCP: generate_handoff() and copy the rendered markdown">Copy generate_handoff() output</button>
+            <button class="secondary claude-section-btn" id="regen-handoff-${project.id}" title="Regenerate the on-disk handoff markdown via generate_handoff()">Regenerate</button>
             <span class="claude-handoff-ts" id="handoff-ts-${project.id}" style="font-size:10px;color:var(--muted)"></span>
           </div>
-          <p class="claude-hint">Copy and paste into Claude Code to resume with full context</p>
+          <p class="claude-hint">Runs <code>generate_handoff()</code> and copies the rendered markdown for a fresh Claude Code chat.</p>
         </div>
         <hr class="claude-divider">
         <div class="claude-section claude-section-narrow" data-section="open">
@@ -1071,13 +1125,13 @@ function buildTabBody(project) {
   document.getElementById(`goal-north-star-${project.id}`).addEventListener('input', function() {
     const p = state.panels[project.id];
     this.classList.toggle('dirty', this.value !== (p._serverNorthStar || ''));
-    this.style.height = 'auto';
-    this.style.height = this.scrollHeight + 'px';
+    autosizeGoalField(this);
   });
   document.getElementById(`goal-sprint-${project.id}`).addEventListener('input', function() {
     const p = state.panels[project.id];
     this.classList.toggle('dirty', this.value !== (p._serverSprint || ''));
   });
+  autosizeGoalField(document.getElementById(`goal-north-star-${project.id}`));
   // v1.1.0 — chat input + mode toggle removed. Defensive wireups for
   // anyone running an older bundle: only attach if the elements exist.
   const chatSendBtn = document.getElementById(`chat-send-${project.id}`);
@@ -1702,8 +1756,8 @@ function wireClaudeLaunchPanel(projectId) {
     const sel = document.getElementById(`continue-session-${projectId}`);
     const sessionName = sel && sel.value ? sel.value : '';
     if (!sessionName) { toast('pick a session first', true); return; }
-    const cmd = `start_session(project_id="${PROJECT_QUOTE}", session_name="${sessionName.replace(/"/g, '\\"')}", human_id="adam")`;
-    showCopyPreview('Resume Command', cmd);
+    const cmd = `start_session(project_id="${PROJECT_QUOTE}", session_name="${sessionName.replace(/"/g, '\\"')}", human_id="adam")\nget_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
+    showCopyPreview('Resume MCP Flow', cmd);
   };
 
   // Section 2 — Start Worker
@@ -1747,11 +1801,12 @@ function wireClaudeLaunchPanel(projectId) {
   const copyHandoffBtn = document.getElementById(`copy-handoff-${projectId}`);
   if (copyHandoffBtn) copyHandoffBtn.onclick = async () => {
     try {
-      const r = await fetch(`/projects/${projectId}/context-block?mode=full`);
+      const r = await fetch(`/projects/${projectId}/handoff`, { method: 'POST' });
       if (!r.ok) throw new Error(`${r.status}`);
-      const text = await r.text();
+      const payload = await r.json();
+      const text = payload.content || '';
       if (text) {
-        showCopyPreview('Code Handoff — paste into Claude', text);
+        showCopyPreview('generate_handoff() Output', text);
         stampHandoffTs(projectId, new Date());
       }
     } catch(e) { toast('handoff failed: ' + e.message, true); }
@@ -1987,13 +2042,17 @@ async function loadSettingsTab(projectId) {
   ];
 
   // Fetch both in parallel; mcp-config 404 = self-hosted (skip section).
-  const [notifResult, mcpResult] = await Promise.allSettled([
+  const [notifResult, mcpResult, settingsResult] = await Promise.allSettled([
     api('/settings/notifications'),
     api('/settings/mcp-config'),
+    loadProjectSettings(projectId),
   ]);
 
   const prefs = (notifResult.status === 'fulfilled') ? (notifResult.value.prefs || {}) : null;
   const mcpData = (mcpResult.status === 'fulfilled') ? mcpResult.value : null;
+  const projectSettings = (settingsResult.status === 'fulfilled')
+    ? settingsResult.value
+    : { project_id: projectId, max_pinned_decisions: DEFAULT_MAX_PINNED_DECISIONS };
 
   let html = '';
 
@@ -2212,6 +2271,43 @@ async function loadSettingsTab(projectId) {
       _codexCopySetup(`codex-copy-goal-${projectId}`, goalText);
     }, 0);
   }
+
+  html += `<div style="margin-bottom:16px">
+    <div style="color:var(--accent);font-size:10px;letter-spacing:.06em;text-transform:uppercase;margin-bottom:10px;padding-bottom:4px;border-bottom:1px solid var(--border)">Constitution</div>
+    <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+      <label style="font-size:10px;color:var(--muted)">
+        Max pinned decisions warning threshold<br>
+        <select id="constitution-max-${projectId}" style="margin-top:4px;background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:4px 8px">
+          <option value="10">10</option>
+          <option value="20">20</option>
+          <option value="30">30</option>
+          <option value="40">40</option>
+        </select>
+      </label>
+      <span id="constitution-max-status-${projectId}" style="font-size:10px;color:var(--muted)">Warning updates the Decisions tab banner and archive suggestion.</span>
+    </div>
+  </div>`;
+
+  setTimeout(() => {
+    const sel = document.getElementById(`constitution-max-${projectId}`);
+    const status = document.getElementById(`constitution-max-status-${projectId}`);
+    if (!sel) return;
+    sel.value = String(projectSettings.max_pinned_decisions || DEFAULT_MAX_PINNED_DECISIONS);
+    sel.onchange = async () => {
+      const nextLimit = Math.max(1, parseInt(String(sel.value || DEFAULT_MAX_PINNED_DECISIONS), 10) || DEFAULT_MAX_PINNED_DECISIONS);
+      sel.disabled = true;
+      try {
+        const saved = await saveProjectSettings(projectId, { max_pinned_decisions: nextLimit });
+        sel.value = String(saved.max_pinned_decisions || DEFAULT_MAX_PINNED_DECISIONS);
+        if (status) status.textContent = `Warning threshold saved at ${saved.max_pinned_decisions}.`;
+        renderConstitutionWarning(projectId);
+      } catch (e) {
+        if (status) status.textContent = `Save failed: ${String(e)}`;
+      } finally {
+        sel.disabled = false;
+      }
+    };
+  }, 0);
 
   // Team members section (hosted mode only, uses mcpData as hosted-mode proxy)
   if (mcpData) {
@@ -2749,8 +2845,14 @@ async function loadQueue(projectId) {
   if (!body) return;
   body.innerHTML = '<div class="empty" style="color:var(--muted)">loading…</div>';
   try {
-    const tasks = await api(`/projects/${projectId}/tasks?limit=100`);
-    body.innerHTML = renderQueue(tasks);
+    const [tasks, sprintItems] = await Promise.all([
+      api(`/projects/${projectId}/tasks?limit=150`),
+      api(`/projects/${projectId}/sprint-items`),
+    ]);
+    const activeSprintItems = (sprintItems || []).filter(it =>
+      ['pending', 'todo', 'in_progress'].includes(it.status)
+    );
+    body.innerHTML = renderQueue(tasks, activeSprintItems);
     const refreshBtn = document.getElementById(`queue-refresh-${projectId}`);
     if (refreshBtn) refreshBtn.onclick = () => loadQueue(projectId);
     // Wire search input (debounced 300ms)
@@ -2762,11 +2864,15 @@ async function loadQueue(projectId) {
         clearTimeout(_searchTimer);
         const q = this.value.trim();
         _searchTimer = setTimeout(async () => {
-          if (!q) { body.innerHTML = renderQueue(tasks); return; }
+          if (!q) { body.innerHTML = renderQueue(tasks, activeSprintItems); return; }
           try {
+            const filteredSprintItems = activeSprintItems.filter(it => {
+              const haystack = `${it.id} ${it.title} ${it.version || ''}`.toLowerCase();
+              return haystack.includes(q.toLowerCase());
+            });
             const results = await api(`/projects/${projectId}/tasks/search?q=${encodeURIComponent(q)}&limit=50`);
-            body.innerHTML = results.length
-              ? renderQueue(results)
+            body.innerHTML = (results.length || filteredSprintItems.length)
+              ? renderQueue(results, filteredSprintItems)
               : `<div class="empty" style="color:var(--muted)">no tasks matching "${escapeHtml(q)}"</div>`;
           } catch (e) { body.innerHTML = `<div class="empty">search failed: ${escapeHtml(e.message)}</div>`; }
         }, 300);
@@ -2777,12 +2883,18 @@ async function loadQueue(projectId) {
   }
 }
 
-function renderQueue(tasks) {
+function renderQueue(tasks, sprintItems = []) {
   /**Segment tasks into pipeline stages and render each as a collapsible section. */
-  const pending = tasks.filter(t => t.status === 'pending');
-  const inProg = tasks.filter(t => t.status === 'in_progress');
-  const done = tasks.filter(t => t.status === 'done').slice(0, 10);
-  const failed = tasks.filter(t => t.status === 'failed').slice(0, 10);
+  const queueItems = (sprintItems || []).map(it => ({
+    ...it,
+    kind: 'sprint_item',
+    description: it.title || '',
+    created_at: it.added_at || '',
+  }));
+  const pending = queueItems.filter(t => t.status === 'pending' || t.status === 'todo');
+  const inProg = queueItems.filter(t => t.status === 'in_progress');
+  const done = tasks.filter(t => t.status === 'done').slice(0, RECENT_DONE_LIMIT);
+  const failed = tasks.filter(t => t.status === 'failed').slice(0, RECENT_DONE_LIMIT);
   const backlog = tasks.filter(t => t.status === 'backlog');
   const future = tasks.filter(t => t.status === 'future');
   const backburner = tasks.filter(t => t.status === 'backburner');
@@ -2790,27 +2902,39 @@ function renderQueue(tasks) {
   const sect = (icon, title, items, emptyMsg, showActions) => {
     const rows = items.length
       ? items.map(t => {
+          const isSprintItem = t.kind === 'sprint_item';
           const who = t.human_id || t.session_name || '';
           const sessLine = '';
-          const tsLine = t.created_at
-            ? `<span class="queue-item-ts">${escapeHtml((who ? who + ' · ' : '') + formatRelativeTime(t.created_at))}</span>` : '';
+          const tsSource = t.created_at || t.added_at || '';
+          const tsLine = tsSource
+            ? `<span class="queue-item-ts">${escapeHtml((who ? who + ' · ' : '') + formatRelativeTime(tsSource))}</span>` : '';
           const eid = `queue-expand-${t.id.slice(0, 8)}`;
-          const expandMeta = [
-            t.human_id     ? `human: ${t.human_id}` : '',
-            t.session_name ? `session: ${t.session_name}` : '',
-            t.claimed_by   ? `claimed_by: ${t.claimed_by_human_id || t.claimed_by_session_name || t.claimed_by}` : '',
-            t.created_at   ? `created: ${t.created_at}` : '',
-            t.claimed_at   ? `claimed: ${t.claimed_at}` : '',
-          ].filter(Boolean).join(' · ');
+          const expandMeta = isSprintItem
+            ? [
+                t.version ? `version: ${t.version}` : '',
+                t.item_group ? `group: ${t.item_group}` : '',
+                t.human_id ? `human: ${t.human_id}` : '',
+                t.depends_on ? `depends_on: ${t.depends_on}` : '',
+                t.added_at ? `added: ${t.added_at}` : '',
+                t.notes ? `notes: ${t.notes}` : '',
+              ].filter(Boolean).join(' · ')
+            : [
+                t.human_id     ? `human: ${t.human_id}` : '',
+                t.session_name ? `session: ${t.session_name}` : '',
+                t.claimed_by   ? `claimed_by: ${t.claimed_by_human_id || t.claimed_by_session_name || t.claimed_by}` : '',
+                t.created_at   ? `created: ${t.created_at}` : '',
+                t.claimed_at   ? `claimed: ${t.claimed_at}` : '',
+              ].filter(Boolean).join(' · ');
           const actions = showActions ? `<div style="display:flex;gap:4px;margin-top:4px" onclick="event.stopPropagation()">
             ${t.status === 'pending' ? `<button onclick="_queueAction('${escapeHtml(t.id)}','backlog')" style="background:none;border:1px solid var(--border);color:var(--muted);font-size:9px;padding:2px 6px;border-radius:3px;cursor:pointer;font-family:var(--font-mono)" title="Push to backlog">📦 backlog</button>` : ''}
             ${t.status === 'pending' ? `<button onclick="_queueAction('${escapeHtml(t.id)}','done')" style="background:none;border:1px solid var(--status-done);color:var(--status-done);font-size:9px;padding:2px 6px;border-radius:3px;cursor:pointer;font-family:var(--font-mono)" title="Mark done">✓ done</button>` : ''}
             <button onclick="_queueAction('${escapeHtml(t.id)}','delete')" style="background:none;border:1px solid var(--border);color:var(--status-failed);font-size:9px;padding:2px 6px;border-radius:3px;cursor:pointer;font-family:var(--font-mono)" title="Delete task">✕ delete</button>
           </div>` : '';
+          const safeActions = isSprintItem ? '' : actions;
           return `<div class="queue-item" style="cursor:pointer" onclick="toggleExpand('${eid}')">
             ${escapeHtml((t.description || '').slice(0, 120))}${sessLine}${tsLine}
             <span class="expand-arrow" style="font-size:9px;color:var(--muted);margin-left:4px">▶</span>
-            <div id="${eid}" style="display:none;margin-top:4px;font-size:10px;color:var(--muted);white-space:pre-wrap;word-break:break-word">${escapeHtml(t.description || '')}${expandMeta ? '\n' + escapeHtml(expandMeta) : ''}${actions}</div>
+            <div id="${eid}" style="display:none;margin-top:4px;font-size:10px;color:var(--muted);white-space:pre-wrap;word-break:break-word">${escapeHtml(t.description || '')}${expandMeta ? '\n' + escapeHtml(expandMeta) : ''}${safeActions}</div>
           </div>`;
         }).join('')
       : `<div class="queue-empty">${emptyMsg}</div>`;
@@ -3010,8 +3134,7 @@ async function refreshGoal(projectId) {
     const spTA = document.getElementById(`goal-sprint-${projectId}`);
     if (nsTA && 'north_star' in goal) {
       nsTA.value = goal.north_star || '';
-      nsTA.style.height = 'auto';
-      nsTA.style.height = nsTA.scrollHeight + 'px';
+      autosizeGoalField(nsTA);
     }
     if (spTA && 'sprint' in goal) {
       spTA.value = goal.sprint || '';
@@ -3070,6 +3193,49 @@ const _DECISION_CATEGORY_COLORS = {
   PRODUCT:       '#22d3ee',
   ARCHITECTURAL: '#fb923c',
 };
+
+function renderConstitutionWarning(projectId) {
+  const host = document.getElementById(`constitution-warning-${projectId}`);
+  if (!host) return;
+  const items = state.panels[projectId]?._pinnedDecisions || [];
+  const count = items.length;
+  if (!count) {
+    host.innerHTML = '';
+    return;
+  }
+  const limit = getConstitutionLimit(projectId);
+  const warn = count >= limit;
+  const archiveCount = Math.max(1, count - limit + 1);
+  const border = warn ? '#f59e0b' : 'var(--border)';
+  const fg = warn ? '#fbbf24' : 'var(--muted)';
+  const tone = warn
+    ? `Constitution has ${count} items — consider consolidating.`
+    : `Constitution: ${count}/${limit} pinned decisions.`;
+  host.innerHTML = `
+    <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;background:var(--surface-2);border:1px solid ${border};border-radius:4px;padding:8px 10px">
+      <div style="font-size:10px;color:${fg}">${escapeHtml(tone)}</div>
+      <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
+        ${warn ? `<button class="secondary" id="constitution-archive-${projectId}" style="padding:2px 8px;font-size:10px">Archive oldest ${archiveCount}</button>` : ''}
+        <button class="secondary" id="constitution-consolidate-${projectId}" style="padding:2px 8px;font-size:10px">Consolidate now</button>
+      </div>
+    </div>`;
+  const consolidateBtn = document.getElementById(`constitution-consolidate-${projectId}`);
+  if (consolidateBtn) consolidateBtn.onclick = () => consolidateDecisions(projectId);
+  const archiveBtn = document.getElementById(`constitution-archive-${projectId}`);
+  if (archiveBtn) {
+    archiveBtn.onclick = async () => {
+      if (!confirm(`Archive the oldest ${archiveCount} pinned decisions?`)) return;
+      try {
+        await api(`/projects/${projectId}/decisions-pinned/archive-oldest`, {
+          method: 'POST',
+          body: JSON.stringify({ count: archiveCount }),
+        });
+        toast(`Archived ${archiveCount} pinned decision${archiveCount === 1 ? '' : 's'}`);
+        loadPinnedDecisions(projectId);
+      } catch (e) { toast('archive failed: ' + e.message, true); }
+    };
+  }
+}
 
 // ---------------------------------------------------------------------------
 // v2.4 — HITL (human-in-the-loop) queue panel
@@ -3198,7 +3364,10 @@ async function loadPinnedDecisions(projectId) {
   const host = document.getElementById(`pinned-decisions-${projectId}`);
   if (!host) return;
   try {
+    await loadProjectSettings(projectId);
     const items = await api(`/projects/${projectId}/decisions-pinned`);
+    getPanelState(projectId)._pinnedDecisions = items || [];
+    renderConstitutionWarning(projectId);
     if (!items || items.length === 0) {
       host.innerHTML = `<div style="color:var(--muted);padding:10px;text-align:center;border:1px dashed var(--border);border-radius:4px">(no pinned decisions yet — call <code>pin_decision</code> from MCP)</div>`;
       return;
@@ -3225,6 +3394,8 @@ async function loadPinnedDecisions(projectId) {
       btn.onclick = () => supersedePinnedDecision(projectId, btn.dataset.supersede);
     });
   } catch (e) {
+    if (state.panels[projectId]) state.panels[projectId]._pinnedDecisions = [];
+    renderConstitutionWarning(projectId);
     host.innerHTML = `<div style="color:var(--muted)">failed to load pinned decisions: ${escapeHtml(String(e))}</div>`;
   }
 }

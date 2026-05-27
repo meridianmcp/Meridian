@@ -30,7 +30,14 @@
       "mcp__meridian__get_sprint_items",
       "mcp__meridian__register_session",
       "mcp__meridian__generate_handoff",
-      "Bash(PowerShell -Command \"Get-Content 'C:\\\\Users\\\\13144\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\C--Users-13144-Documents-Meridian-repository\\\\c65a8946-b4b3-4486-9bf3-f7c1e3e917d6\\\\tasks\\\\b8sf22j8g.output' | Select-Object -Last 3\")"
+      "Bash(PowerShell -Command \"Get-Content 'C:\\\\Users\\\\13144\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\C--Users-13144-Documents-Meridian-repository\\\\c65a8946-b4b3-4486-9bf3-f7c1e3e917d6\\\\tasks\\\\b8sf22j8g.output' | Select-Object -Last 3\")",
+      "Bash(python -c \"from meridian.hosted import _google_redirect_uri; print\\(_google_redirect_uri\\(\\)\\)\")",
+      "Bash(gh run *)",
+      "Bash(git checkout *)",
+      "Bash(git merge *)",
+      "Bash(git stash *)",
+      "mcp__Neon__run_sql",
+      "Bash(python3 -c ' *)"
     ]
   }
 }
