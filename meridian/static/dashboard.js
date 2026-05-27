@@ -2160,6 +2160,59 @@ async function loadSettingsTab(projectId) {
     }, 0);
   }
 
+  // Codex CLI section — always shown (works self-hosted via HTTP or STDIO)
+  {
+    const serverUrl = (state.serverConfig?.server_url || 'http://localhost:7878').replace(/\/$/, '');
+    const mcpHttpUrl = `${serverUrl}/mcp`;
+    const rawTomlPath = state.serverConfig?.toml_path || '';
+    const cwd = rawTomlPath
+      ? rawTomlPath.replace(/[/\\]meridian\.toml$/i, '').replace(/\\/g, '/')
+      : '/path/to/your/meridian';
+    const isDemo = !!state.serverConfig?.demo_mode;
+    const displayPid = isDemo ? 'your-project-id' : projectId;
+
+    const stdioText = `[[mcp_servers]]\nname = "meridian"\ncommand = "pixi"\nargs = ["run", "python", "-m", "meridian", "--mcp"]\ncwd = "${cwd.replace(/"/g, '\\"')}"`;
+    const httpText = `[[mcp_servers]]\nname = "meridian"\nurl = "${mcpHttpUrl}"\ntype = "http"`;
+    const goalText = `/goal Complete pending sprint items in order. Done when all items\nmarked complete via complete_sprint_item(), pixi run test passes\n524+, generate_handoff() called. Stop after 40 turns or HITL.\n\nproject_id = "${displayPid}"`;
+
+    html += `<div style="margin-bottom:16px">
+      <div style="color:var(--accent);font-size:10px;letter-spacing:.06em;text-transform:uppercase;margin-bottom:10px;padding-bottom:4px;border-bottom:1px solid var(--border)">Codex CLI setup</div>
+      <div style="font-size:10px;color:var(--muted);margin-bottom:10px">Add to <code>~/.codex/config.toml</code> — or run <code>codex mcp add meridian ${escapeHtml(mcpHttpUrl)}</code></div>
+      <div style="font-size:10px;font-weight:600;color:var(--text);margin-bottom:4px">Option A — STDIO (local, recommended)</div>
+      <pre id="codex-stdio-${escapeHtml(projectId)}" style="background:var(--surface-1);border:1px solid var(--border);border-radius:4px;padding:10px;font-size:10px;font-family:var(--font-mono);color:var(--text);overflow-x:auto;margin:0 0 6px 0;white-space:pre-wrap;word-break:break-all"></pre>
+      <button class="secondary" id="codex-copy-stdio-${escapeHtml(projectId)}" style="font-size:10px;padding:4px 10px;margin-bottom:12px">Copy</button>
+      <div style="font-size:10px;font-weight:600;color:var(--text);margin-bottom:4px;margin-top:8px">Option B — HTTP (when Meridian server is running)</div>
+      <pre id="codex-http-${escapeHtml(projectId)}" style="background:var(--surface-1);border:1px solid var(--border);border-radius:4px;padding:10px;font-size:10px;font-family:var(--font-mono);color:var(--text);overflow-x:auto;margin:0 0 6px 0;white-space:pre-wrap;word-break:break-all"></pre>
+      <button class="secondary" id="codex-copy-http-${escapeHtml(projectId)}" style="font-size:10px;padding:4px 10px;margin-bottom:12px">Copy</button>
+      <div style="font-size:10px;font-weight:600;color:var(--text);margin-bottom:4px;margin-top:8px">/goal template</div>
+      <pre id="codex-goal-${escapeHtml(projectId)}" style="background:var(--surface-1);border:1px solid var(--border);border-radius:4px;padding:10px;font-size:10px;font-family:var(--font-mono);color:var(--text);overflow-x:auto;margin:0 0 6px 0;white-space:pre-wrap;word-break:break-all"></pre>
+      <button class="secondary" id="codex-copy-goal-${escapeHtml(projectId)}" style="font-size:10px;padding:4px 10px">Copy</button>
+    </div>`;
+
+    setTimeout(() => {
+      const stdioEl = document.getElementById(`codex-stdio-${projectId}`);
+      const httpEl = document.getElementById(`codex-http-${projectId}`);
+      const goalEl = document.getElementById(`codex-goal-${projectId}`);
+      if (stdioEl) stdioEl.textContent = stdioText;
+      if (httpEl) httpEl.textContent = httpText;
+      if (goalEl) goalEl.textContent = goalText;
+      function _codexCopySetup(btnId, text) {
+        const btn = document.getElementById(btnId);
+        if (!btn) return;
+        btn.onclick = async () => {
+          try {
+            await navigator.clipboard.writeText(text);
+            btn.textContent = 'Copied!';
+            setTimeout(() => { btn.textContent = 'Copy'; }, 1800);
+          } catch(e) { btn.textContent = 'Select and copy manually'; }
+        };
+      }
+      _codexCopySetup(`codex-copy-stdio-${projectId}`, stdioText);
+      _codexCopySetup(`codex-copy-http-${projectId}`, httpText);
+      _codexCopySetup(`codex-copy-goal-${projectId}`, goalText);
+    }, 0);
+  }
+
   // Team members section (hosted mode only, uses mcpData as hosted-mode proxy)
   if (mcpData) {
     html += `<div style="margin-bottom:16px" id="members-section-${projectId}">
