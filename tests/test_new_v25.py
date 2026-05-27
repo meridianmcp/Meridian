@@ -3,6 +3,8 @@ MCP responses, auth routes, team summary, and dashboard.js markers."""
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 from meridian import db as db_module
@@ -1002,6 +1004,25 @@ def test_site_password_gate_exempts_demo_cookie(monkeypatch, tmp_path):
         r_demo = c.get("/projects")
         # Gate bypassed: response is NOT the password gate HTML
         assert "text/html" not in r_demo.headers.get("content-type", "") or r_demo.status_code != 200
+
+
+def test_site_password_gate_exempts_valid_hosted_session(monkeypatch, tmp_path):
+    """Hosted users with a valid meridian_session cookie bypass the preview gate."""
+    monkeypatch.setenv("MERIDIAN_HOSTED", "1")
+    monkeypatch.setenv("MERIDIAN_SESSION_SECRET", "test-secret")
+    with _make_gated_client(monkeypatch, tmp_path) as c:
+        from meridian import db as db_module
+        from meridian.hosted import _make_session_cookie
+
+        db = c.app.state.db
+        tenant = asyncio.run(db_module.upsert_tenant(db, "alice@example.com"))
+        session = asyncio.run(
+            db_module.create_user_session(db, tenant["id"], "2099-01-01 00:00:00")
+        )
+        c.cookies.set("meridian_session", _make_session_cookie(session["id"]))
+        r = c.get("/projects")
+        assert r.status_code in (200, 503)
+        assert "text/html" not in r.headers.get("content-type", "")
 
 
 def test_site_password_gate_exempts_static_assets(monkeypatch, tmp_path):

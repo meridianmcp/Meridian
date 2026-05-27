@@ -36,6 +36,9 @@ _env = Environment(
     autoescape=select_autoescape(disabled_extensions=("md", "j2")),
     keep_trailing_newline=True,
 )
+_DEFAULT_GOAL_TEST_FLOOR = 524
+_STRATEGIC_NOTE_TAGS = {"planning", "strategy", "competitive", "acquisition"}
+_SESSION_HANDOFF_STATE: dict[str, str] = {}
 
 
 def _slugify(name: str) -> str:
@@ -85,6 +88,113 @@ def _prepare_pending_sprint_items(
             position_by_id.get(parent_id) if parent_id else None
         )
     return ordered
+
+
+def _build_quick_start_goal(
+    pending_sprint_items: list[dict[str, Any]],
+    *,
+    test_floor: int = _DEFAULT_GOAL_TEST_FLOOR,
+) -> str:
+    """Build the handoff /goal template from the live pending sprint item ids."""
+    item_ids = [item["id"] for item in pending_sprint_items if item.get("id")]
+    if not item_ids:
+        return (
+            "/goal Verify remaining work is complete. Done when pixi run test "
+            f"passes {test_floor}+, and generate_handoff() is called at the "
+            "end. Stop after 40 turns or if HITL triggered."
+        )
+    return (
+        f"/goal Complete sprint items: {', '.join(item_ids)}. "
+        "Done when all listed sprint items are marked complete via "
+        f"complete_sprint_item(), pixi run test passes {test_floor}+, and "
+        "generate_handoff() is called at the end. Stop after 40 turns or if "
+        "HITL triggered."
+    )
+
+
+def resolve_handoff_mode(
+    requested_mode: str | None,
+    session_id: str | None = None,
+) -> str:
+    """Resolve the public handoff mode, auto-switching repeat sessions to delta."""
+    if requested_mode in {"full", "delta"}:
+        return requested_mode
+    if session_id and session_id in _SESSION_HANDOFF_STATE:
+        return "delta"
+    return "full"
+
+
+def _note_tags(note: dict[str, Any]) -> set[str]:
+    raw = str(note.get("tags") or "")
+    return {
+        tag.strip().lower()
+        for tag in raw.split(",")
+        if tag.strip()
+    }
+
+
+def _select_strategic_notes(
+    notes: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Keep only notes that help a restarted planning chat."""
+    selected = []
+    for note in notes:
+        if _note_tags(note) & _STRATEGIC_NOTE_TAGS:
+            selected.append(note)
+    return selected
+
+
+def _completed_after(
+    completed_at: str | None,
+    since_ts: str | None,
+) -> bool:
+    if not completed_at:
+        return False
+    if not since_ts:
+        return True
+    def _parse(ts: str) -> datetime:
+        normalized = ts.strip().replace("T", " ")
+        if normalized.endswith("Z"):
+            normalized = normalized[:-1]
+        if "+" in normalized:
+            normalized = normalized.split("+", 1)[0].strip()
+        if "." in normalized:
+            return datetime.strptime(normalized, "%Y-%m-%d %H:%M:%S.%f")
+        return datetime.strptime(normalized, "%Y-%m-%d %H:%M:%S")
+
+    return _parse(completed_at) >= _parse(since_ts)
+
+
+def _render_delta_handoff(
+    project: dict[str, Any],
+    *,
+    generated_at: str,
+    completed_items: list[dict[str, Any]],
+    pending_sprint_items: list[dict[str, Any]],
+    quick_start_goal: str,
+) -> str:
+    """Return a compact handoff for back-to-back goal runs in one session."""
+    lines = [
+        f"# Session Update — {project['name']}",
+        f"_Generated at {generated_at} (delta mode)_",
+        "",
+        "Completed since last handoff:",
+    ]
+    if completed_items:
+        for item in completed_items:
+            lines.append(f"- {item['id']} — {item['title']}")
+    else:
+        lines.append("- none")
+    lines += ["", "Pending:"]
+    if pending_sprint_items:
+        for item in pending_sprint_items:
+            lines.append(
+                f"- {item['id']} [{item['status']}] {item['title']}"
+            )
+    else:
+        lines.append("- none")
+    lines += ["", "Next:", quick_start_goal]
+    return "\n".join(lines) + "\n"
 
 
 async def _generate_ai_summary(
@@ -223,6 +333,8 @@ async def generate_handoff(
     *,
     summarizer: object | None = None,
     skip_ai_summary: bool = False,
+    mode: str = "full",
+    session_id: str | None = None,
 ) -> tuple[str, str]:
     """Fetch all state, render the L0/L1/L2 template, write the file, return both.
 
@@ -236,6 +348,8 @@ async def generate_handoff(
     project = await db_module.get_project(db, project_id)
     if project is None:
         raise ValueError(f"project not found: {project_id}")
+    if mode not in {"full", "delta"}:
+        raise ValueError("mode must be 'full' or 'delta'")
 
     goal = await db_module.get_goal(db, project_id)
     if goal is None:
@@ -266,6 +380,8 @@ async def generate_handoff(
 
     # v2.4 — L0/L1/L2 data sources
     pinned_decisions = await db_module.get_pinned_decisions(db, project_id)
+    project_notes = await db_module.get_project_notes(db, project_id)
+    strategic_notes = _select_strategic_notes(project_notes)
     sprint_items_all = await db_module.get_sprint_items(db, project_id)
     pending_sprint_items = [
         it for it in sprint_items_all
@@ -273,6 +389,10 @@ async def generate_handoff(
     ]
     pending_sprint_items = _prepare_pending_sprint_items(pending_sprint_items)
     decisions_log = (project.get("decisions") or "").strip()
+    now_utc = datetime.now(timezone.utc)
+    generated_at = now_utc.isoformat(timespec="seconds")
+    state_ts = now_utc.strftime("%Y-%m-%d %H:%M:%S")
+    quick_start_goal = _build_quick_start_goal(pending_sprint_items)
 
     # Split tasks into L1 (last 10) and L2 (older).
     l1_tasks = tasks[:10]
@@ -293,36 +413,45 @@ async def generate_handoff(
             l1_tasks, goal.get("sprint"), summarizer=summarizer
         )
 
-    template = _env.get_template("handoff.md.j2")
-    content = template.render(
-        generated_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        project=project,
-        goal=goal,
-        sessions=sessions,
-        active_sessions=active_sessions,
-        archived_sessions=archived_sessions,
-        tasks=tasks,
-        l1_tasks=l1_tasks,
-        l2_tasks=l2_tasks,
-        session_names=session_names,
-        pinned_decisions=pinned_decisions,
-        pending_sprint_items=pending_sprint_items,
-        decisions_log=decisions_log,
-        ai_summary=ai_summary,
-        quick_start_goal=(
-            "/goal Complete pending sprint items in dependency order. "
-            "Done when: (1) generate_handoff output includes a ## Quick Start "
-            "section with a /goal invocation template, (2) claim_task rejects "
-            "claims where depends_on item is not done, (3) start_session "
-            "auto-releases stale claims older than 2 hours, (4) pixi run test "
-            "passes 524+, (5) all pending sprint items for this run are marked "
-            "complete via complete_sprint_item(), (6) generate_handoff() is "
-            "called at the end. Stop after 40 turns or if HITL triggered."
-        ),
-    )
+    if mode == "delta":
+        since_ts = _SESSION_HANDOFF_STATE.get(session_id, None) if session_id else None
+        completed_items = [
+            item for item in sprint_items_all
+            if item.get("status") in {"done", "skipped", "failed", "pushed"}
+            and _completed_after(item.get("completed_at"), since_ts)
+        ]
+        content = _render_delta_handoff(
+            project,
+            generated_at=generated_at,
+            completed_items=completed_items,
+            pending_sprint_items=pending_sprint_items,
+            quick_start_goal=quick_start_goal,
+        )
+    else:
+        template = _env.get_template("handoff.md.j2")
+        content = template.render(
+            generated_at=generated_at,
+            project=project,
+            goal=goal,
+            sessions=sessions,
+            active_sessions=active_sessions,
+            archived_sessions=archived_sessions,
+            tasks=tasks,
+            l1_tasks=l1_tasks,
+            l2_tasks=l2_tasks,
+            session_names=session_names,
+            pinned_decisions=pinned_decisions,
+            strategic_notes=strategic_notes,
+            pending_sprint_items=pending_sprint_items,
+            decisions_log=decisions_log,
+            ai_summary=ai_summary,
+            quick_start_goal=quick_start_goal,
+        )
 
     out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / f"{_slugify(project['name'])}_handoff.md"
     out_path.write_text(content, encoding="utf-8")
+    if session_id:
+        _SESSION_HANDOFF_STATE[session_id] = state_ts
     return str(out_path.resolve()), content

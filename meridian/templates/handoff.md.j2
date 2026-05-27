@@ -26,6 +26,15 @@ _No pinned decisions yet — use `pin_decision` MCP tool to establish the consti
 
 {% endif %}
 
+{% if strategic_notes -%}
+**Strategic Notes ({{ strategic_notes | length }}):**
+
+{% for note in strategic_notes -%}
+- **{{ note.title }}**{% if note.tags %} _[{{ note.tags }}]_{% endif %} — {{ note.body }}
+{% endfor %}
+
+{% endif %}
+
 ## L1 — Current State (~1500 tokens)
 
 **Sprint:** {{ goal.sprint or "(not set)" }}

@@ -83,20 +83,20 @@ For decisions: use pin_decision MCP tool, which also appends to DECISIONS.md.
 <current_state>
 <!-- Auto-updated by Meridian. Do not edit manually. -->
 Project: meridian-build (5787cc92)
-Last updated: 2026-05-27 04:21 UTC
+Last updated: 2026-05-27 06:55 UTC
 Sprint: pre-launch — polish sprint: LICENSE fix, chat banner removal, demo fixes, swimlane, backburner status, session focus dropdown, Pro plan card accuracy, one-liner install
 North Star: Meridian is the open-source coordination layer for AI coding sessions — persistent memory, task tracking, and session coordination that your AI tools don't provide.  Core value: "Your AI sessions don'…
 Recent:
+  - [DONE] Validation/release: ran pixi run test across task boundaries and final main merge (524 passed, 10 skipped); committed b8
+  - [DONE] Task 1: hid restart, stop, banner restart, update banner, and check updates controls in demo mode; guarded update_availa
+  - [DONE] Task 2: isolated demo vs real dashboard localStorage state with meridian_demo_/meridian_ prefixes for tabs, active proje
+  - [DONE] Task 3: verified requested version surfaces were already 1.0.0-alpha and updated Fly MERIDIAN_VERSION secret for meridia
   - [DONE] Claude Code docs session complete: password gate, pixi install guide, overage details, copyright 2026, logo in nav/READM
-  - [DONE] OBSERVED: Swimlane showing only goal marker, bad colors, claude-worker not associated with alice/bob. Delete my account 
-  - [DONE] DECISION: Install docs use pixi official installers verbatim. Show platform check pattern: if pixi not installed, show c
-  - [DONE] DECISION: Lead install docs with one-liner (curl pixi install + git clone + pixi run start). Three commands, 30 seconds.
-  - [DONE] DOCS HANDOFF WRITTEN: docs.usemeridian.us update handoff (478 lines, 10 tasks). Tasks: (1) JS password gate in MkDocs th
 </current_state>
 
 ---
 <!-- MERIDIAN STATE — auto-generated, do not edit below -->
-## Current Sprint State  _(auto-updated 2026-05-27 04:05 UTC)_
+## Current Sprint State  _(auto-updated 2026-05-27 06:57 UTC)_
 
 **Key Files:**
 - `meridian/server.py` — FastAPI app + MCP handlers

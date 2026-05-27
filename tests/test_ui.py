@@ -275,6 +275,9 @@ def test_dashboard_claude_tab_has_session_controls(client):
     assert "start_session(project_id=" in js, (
         "resume command template (start_session call) must be embedded in JS"
     )
+    assert 'get_context_block(project_id="' in js, (
+        "resume flow should mention get_context_block for reloading context"
+    )
     # Section 2 — worker session
     assert "start-worker-" in js, "start worker button missing"
     assert "copy-worker-" in js, "copy worker context button missing"
@@ -284,6 +287,7 @@ def test_dashboard_claude_tab_has_session_controls(client):
     assert "copy-handoff-" in js, "copy handoff button missing"
     assert "regen-handoff-" in js, "regenerate handoff button missing"
     assert "Regenerated" in js, "regenerated confirmation message missing"
+    assert "/handoff" in js, "handoff controls should call the generate_handoff endpoint"
     # Section 4 — open in Claude (narrow secondary)
     assert "open-in-claude-" in js, "open in Claude button missing"
     assert "claude.ai" in js, "claude.ai destination missing"
@@ -292,6 +296,10 @@ def test_dashboard_claude_tab_has_session_controls(client):
     assert "resume" in text or "session" in text
     assert "worker" in text
     assert "handoff" in text
+    assert "constitution-warning-" in js, "decisions tab should expose a constitution warning host"
+    assert "/projects/${projectId}/settings" in js, (
+        "dashboard should load persisted per-project settings"
+    )
 
 
 def test_dashboard_open_in_claude_not_dominant(client):

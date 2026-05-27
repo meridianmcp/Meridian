@@ -122,6 +122,7 @@ CREATE TABLE IF NOT EXISTS projects (
     goal_mode TEXT NOT NULL DEFAULT 'manual'
         CHECK (goal_mode IN ('manual', 'auto')),
     decisions TEXT,
+    max_pinned_decisions INTEGER NOT NULL DEFAULT 20,
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -828,6 +829,16 @@ async def _migrate_rewind_token(db: aiosqlite.Connection) -> None:
     await _migrate_add_column_if_missing(db, "projects", "rewind_token", "TEXT")
 
 
+async def _migrate_project_settings(db: aiosqlite.Connection) -> None:
+    """v2.6.1 — add per-project settings columns."""
+    await _migrate_add_column_if_missing(
+        db,
+        "projects",
+        "max_pinned_decisions",
+        "INTEGER NOT NULL DEFAULT 20",
+    )
+
+
 async def _migrate_sessions_archived(db: aiosqlite.Connection) -> None:
     """v1.8.x — add 'archived' to the sessions CHECK constraint.
 
@@ -1088,6 +1099,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_goal_hierarchy(db)
     await _migrate_worker_pid(db)
     await _migrate_rewind_token(db)
+    await _migrate_project_settings(db)
     await _migrate_sessions_archived(db)
     await _migrate_sprint_items_v2(db)
     await _migrate_drop_chat_tables(db)
@@ -1167,6 +1179,43 @@ async def rename_project(
     )
     await db.commit()
     return await get_project(db, project_id)
+
+
+async def get_project_settings(
+    db: aiosqlite.Connection, project_id: str
+) -> dict[str, Any] | None:
+    """Return the persisted settings for a project."""
+    async with db.execute(
+        "SELECT id, max_pinned_decisions FROM projects WHERE id = ?",
+        (project_id,),
+    ) as cur:
+        row = await cur.fetchone()
+    if row is None:
+        return None
+    data = _row_to_dict(row) or {}
+    return {
+        "project_id": data["id"],
+        "max_pinned_decisions": int(data.get("max_pinned_decisions") or 20),
+    }
+
+
+async def update_project_settings(
+    db: aiosqlite.Connection,
+    project_id: str,
+    *,
+    max_pinned_decisions: int | None = None,
+) -> dict[str, Any] | None:
+    """Persist project settings and return the updated values."""
+    project = await get_project(db, project_id)
+    if project is None:
+        return None
+    if max_pinned_decisions is not None:
+        await db.execute(
+            "UPDATE projects SET max_pinned_decisions = ? WHERE id = ?",
+            (int(max_pinned_decisions), project_id),
+        )
+        await db.commit()
+    return await get_project_settings(db, project_id)
 
 
 async def delete_project(db: aiosqlite.Connection, project_id: str) -> None:

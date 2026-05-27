@@ -124,6 +124,24 @@ class Project(BaseModel):
     created_at: str
 
 
+class ProjectSettings(BaseModel):
+    """Persisted per-project settings shown in the dashboard."""
+
+    project_id: str
+    max_pinned_decisions: int = Field(
+        default=20,
+        ge=1,
+        le=200,
+        description="Warn when the live constitution reaches this many items.",
+    )
+
+
+class ProjectSettingsPatch(BaseModel):
+    """Body for PATCH /projects/{id}/settings."""
+
+    max_pinned_decisions: int | None = Field(default=None, ge=1, le=200)
+
+
 class GoalState(BaseModel):
     """A goal-state row. Content is decoded back to its original form
     (dict if it was stored as JSON, str otherwise).
@@ -228,6 +246,7 @@ class HandoffResult(BaseModel):
 
     path: str
     content: str
+    mode: str | None = None
 
 
 class TaskUpdate(BaseModel):
