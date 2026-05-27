@@ -36,7 +36,7 @@ def _read_version() -> str:
             data = tomllib.load(_f)
             return data.get("workspace", {}).get("version", "") or data.get("version", "dev")
     except Exception:
-        return "1.0.0-beta"
+        return "1.0.0-alpha"
 
 _VERSION = _read_version()
 
@@ -4055,6 +4055,46 @@ async def list_waitlist(request: Request) -> list[dict[str, Any]]:
     """GET all waitlist entries, newest first. Admin use only."""
     db = request.app.state.db
     return await db_module.get_waitlist(db)
+
+
+@app.get("/waitlist-pending")
+async def waitlist_pending(request: Request) -> HTMLResponse:
+    """Landing page for non-admin users who sign in during pre-launch."""
+    html = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>You're on the waitlist — Meridian</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:#0d0d0f;color:#e8eaf0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+  min-height:100vh;display:flex;align-items:center;justify-content:center}
+.card{background:#16181c;border:1px solid #2a2d35;border-radius:12px;padding:44px 40px;
+  max-width:480px;width:100%;margin:20px;text-align:center}
+.logo{font-size:1.3rem;font-weight:700;color:#e8eaf0;margin-bottom:24px}
+.logo span{color:#6c8fff}
+h1{font-size:1.5rem;font-weight:700;margin-bottom:12px}
+p{color:#8b8fa8;font-size:.9rem;line-height:1.6;margin-bottom:16px}
+.badge{display:inline-block;background:#1e2029;border:1px solid #2a2d35;border-radius:20px;
+  padding:6px 16px;font-size:.8rem;color:#6c8fff;margin-bottom:24px}
+a{color:#6c8fff;text-decoration:none}
+a:hover{text-decoration:underline}
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="logo">⬡ <span>Meridian</span></div>
+  <div class="badge">✓ You're on the list</div>
+  <h1>Thanks for signing up!</h1>
+  <p>Meridian is in early access. We'll email you when your account is ready.</p>
+  <p>In the meantime, you can <a href="https://github.com/meridianmcp/Meridian" target="_blank">star the repo</a>
+     or <a href="https://docs.usemeridian.us" target="_blank">read the docs</a>.</p>
+  <p style="margin-top:24px;font-size:.78rem"><a href="/auth/logout">sign out</a></p>
+</div>
+</body>
+</html>"""
+    return HTMLResponse(html)
 
 
 # ---------------------------------------------------------------------------
