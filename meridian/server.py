@@ -1823,6 +1823,16 @@ async def get_tasks(
     return await db_module.get_tasks(await _db(request), project_id, limit=limit)
 
 
+@app.get("/projects/{project_id}/tasks/search")
+async def search_tasks_http(
+    project_id: str, request: Request, q: str = "", limit: int = 5
+) -> list[dict[str, Any]]:
+    """GET /projects/{id}/tasks/search?q=...&limit=5 — text search over task descriptions."""
+    if not q:
+        return []
+    return await db_module.search_tasks(await _db(request), project_id, q, limit)
+
+
 @app.get("/projects/{project_id}/tasks/claimable", response_model=list[Task])
 async def get_claimable_tasks(
     project_id: str, request: Request, limit: int = 20
@@ -1948,6 +1958,10 @@ async def close_session(session_id: str, request: Request) -> dict[str, str]:
     await db_module.close_session(_req_db, session_id)
     try:
         await db_module.summarize_session(await _db(request), session_id)
+    except Exception:
+        pass
+    try:
+        await db_module.auto_capture_session(await _db(request), project_id, session_id)
     except Exception:
         pass
     await _regenerate_claude_md(await _db(request), project_id, _REPO_ROOT)
@@ -4019,7 +4033,13 @@ async def join_waitlist(request: Request) -> dict[str, Any]:
     email = (body.get("email") or "").strip()
     if not email or "@" not in email:
         raise HTTPException(status_code=422, detail="valid email required")
-    note = (body.get("note") or "").strip() or None
+    plan = (body.get("plan") or "standard").strip()
+    source = (body.get("source") or "landing").strip()
+    note_parts = []
+    if body.get("note"):
+        note_parts.append(body["note"].strip())
+    note_parts.append(f"plan:{plan} source:{source}")
+    note = " ".join(note_parts) if note_parts else None
     db = await _db(request)
     try:
         entry = await db_module.add_waitlist_entry(db, email, note)
@@ -4318,6 +4338,7 @@ TOOL_EXAMPLES: dict[str, str] = {
     "claim_task": 'claim_task(task_id="task-uuid-here")',
     "complete_task": 'complete_task(task_id="task-uuid-here")',
     "get_tasks": 'get_tasks(project_id="abc-123")',
+    "search_tasks": 'search_tasks(project_id="abc-123", query="rate limiting bug")',
     "get_goal": 'get_goal(project_id="abc-123")',
     "set_goal": 'set_goal(project_id="abc-123", content="Build a great product")',
     "set_sprint": 'set_sprint(project_id="abc-123", sprint="v2.0 — auth + dashboard")',
@@ -4366,6 +4387,10 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
     {"name": "get_tasks", "description": "Get recent tasks across all sessions.",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"}, "limit": {"type": "integer"}}, "required": ["project_id"]}},
+    {"name": "search_tasks", "description": "Search tasks by keyword or natural-language query. Uses trigram similarity on Postgres, LIKE on SQLite. Returns top matches with similarity score.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"}, "query": {"type": "string"}, "limit": {"type": "integer"}},
+         "required": ["project_id", "query"]}},
     {"name": "generate_handoff", "description": "Generate a context handoff file.",
      "inputSchema": {"type": "object", "properties": {"project_id": {"type": "string"}}, "required": ["project_id"]}},
     {"name": "get_context_block", "description":
@@ -4526,6 +4551,10 @@ async def _dispatch_mcp_tool(name: str, args: dict[str, Any], db: Any, data_dir:
         )
     if name == "get_tasks":
         return await db_module.get_tasks(db, args["project_id"], args.get("limit", 20))
+    if name == "search_tasks":
+        return await db_module.search_tasks(
+            db, args["project_id"], args["query"], args.get("limit", 5)
+        )
     if name == "generate_handoff":
         from . import handoff as handoff_module_local
         try:
@@ -4896,6 +4925,24 @@ def build_mcp_server():
                         "limit": {"type": "integer", "default": 20},
                     },
                     "required": ["project_id"],
+                },
+            ),
+            Tool(
+                name="search_tasks",
+                description=(
+                    "Search past tasks by keyword or phrase. Uses trigram "
+                    "similarity on Postgres, LIKE on SQLite. Returns top "
+                    "matches with a similarity score so you can find related "
+                    "work done by any session."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "project_id": {"type": "string"},
+                        "query": {"type": "string"},
+                        "limit": {"type": "integer", "default": 5},
+                    },
+                    "required": ["project_id", "query"],
                 },
             ),
             Tool(
