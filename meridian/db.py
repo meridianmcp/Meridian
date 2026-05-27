@@ -2039,7 +2039,7 @@ async def log_task(
     another task. Lets the dashboard render multi-agent work as a tree
     (researcher → fetched 3 sources, writer → drafted reply, etc.).
     """
-    if status not in {"pending", "in_progress", "done", "failed", "pending-hitl", "backlog", "future"}:
+    if status not in {"pending", "in_progress", "done", "failed", "pending-hitl", "backlog", "future", "backburner"}:
         raise ValueError(f"invalid task status: {status}")
     tid = _new_id()
     await db.execute(
@@ -2164,6 +2164,51 @@ async def get_tasks(
         "ORDER BY t.created_at DESC, t.rowid DESC LIMIT ?",
         (project_id, limit),
     ) as cur:
+        rows = await cur.fetchall()
+    return [_row_to_dict(r) for r in rows]  # type: ignore[misc]
+
+
+async def search_tasks(
+    db: Any,
+    project_id: str,
+    query: str,
+    limit: int = 5,
+) -> list[dict[str, Any]]:
+    """Full-text task search.
+
+    Postgres: uses pg_trgm similarity() — no ML model required, fast on the
+    GIN index added by _migrate_pg_v27_pg_trgm. Falls back to ILIKE when
+    the query is too short for trigrams (< 3 chars).
+
+    SQLite: simple LIKE wildcard match on description.
+
+    Returns [{id, description, status, created_at, similarity, session_name}].
+    """
+    like_pat = f"%{query}%"
+    is_pg = hasattr(db, "_pool")
+    if is_pg:
+        sql = (
+            "SELECT t.id, t.description, t.status, t.created_at, "
+            "s.name AS session_name, "
+            "COALESCE(similarity(t.description, ?), 0.0) AS similarity "
+            "FROM task_log t "
+            "LEFT JOIN sessions s ON s.id = t.session_id "
+            "WHERE t.project_id = ? "
+            "AND (similarity(t.description, ?) > 0.05 OR t.description ILIKE ?) "
+            "ORDER BY similarity DESC, t.created_at DESC LIMIT ?"
+        )
+        params: tuple = (query, project_id, query, like_pat, limit)
+    else:
+        sql = (
+            "SELECT t.id, t.description, t.status, t.created_at, "
+            "s.name AS session_name, 1.0 AS similarity "
+            "FROM task_log t "
+            "LEFT JOIN sessions s ON s.id = t.session_id "
+            "WHERE t.project_id = ? AND t.description LIKE ? "
+            "ORDER BY t.created_at DESC LIMIT ?"
+        )
+        params = (project_id, like_pat, limit)
+    async with db.execute(sql, params) as cur:
         rows = await cur.fetchall()
     return [_row_to_dict(r) for r in rows]  # type: ignore[misc]
 
@@ -3057,6 +3102,53 @@ async def summarize_session(
     )
     await db.commit()
     return summary
+
+
+async def auto_capture_session(
+    db: aiosqlite.Connection, project_id: str, session_id: str
+) -> None:
+    """Rule-based session end capture: bucket done tasks into Fixed/Added/Changed
+    and save as a project note tagged 'auto-capture'. No-op for sessions with
+    fewer than 2 done tasks so trivial sessions don't generate noise."""
+    from datetime import datetime, timezone
+
+    async with db.execute(
+        "SELECT description FROM task_log "
+        "WHERE session_id = ? AND status = 'done' "
+        "ORDER BY created_at DESC",
+        (session_id,),
+    ) as cur:
+        rows = await cur.fetchall()
+    tasks = [_row_to_dict(r) for r in rows]
+    if len(tasks) < 2:
+        return
+
+    categories: dict[str, list[str]] = {
+        "Fixed": [
+            t["description"] for t in tasks
+            if any(w in t["description"].lower() for w in ["fix", "bug", "error", "broken"])
+        ],
+        "Added": [
+            t["description"] for t in tasks
+            if any(w in t["description"].lower() for w in ["add", "feat", "new", "implement"])
+        ],
+        "Changed": [
+            t["description"] for t in tasks
+            if any(w in t["description"].lower() for w in ["update", "change", "refactor", "improve"])
+        ],
+    }
+    date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    lines = [f"Auto-capture {date_str}"]
+    for label, items in categories.items():
+        if items:
+            lines.append(f"\n{label}:")
+            for desc in items[:5]:
+                lines.append(f"  - {desc[:100]}")
+    if len(lines) <= 1:
+        return
+    await add_project_note(
+        db, project_id, f"Session summary ({date_str})", "\n".join(lines), tags="auto-capture"
+    )
 
 
 # ---------------------------------------------------------------------------
