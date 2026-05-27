@@ -22,6 +22,7 @@ All notable changes to Meridian. Generated from git history via `git-cliff`.
 
 ### Chores
 
+- Chore: update CHANGELOG ([7e8e018](https://github.com/meridianmcp/Meridian/commit/7e8e0183df7e2e472e3b079789a8562c1971af45))
 - Chore: update CHANGELOG ([6278980](https://github.com/meridianmcp/Meridian/commit/627898090a19bf3d98f632136a7d67df1abf610d))
 - Chore: update CHANGELOG ([9f2e1aa](https://github.com/meridianmcp/Meridian/commit/9f2e1aafb43b90cb59867aa5ce01d7f90978a9fe))
 - Chore: update CHANGELOG ([2e81d7f](https://github.com/meridianmcp/Meridian/commit/2e81d7fa952bf73b9c300f1bdbcac309752ec0cf))
@@ -37,6 +38,7 @@ All notable changes to Meridian. Generated from git history via `git-cliff`.
 
 ### Features
 
+- Feat: waitlist landing swap, search_tasks MCP tool, auto_capture, pg_trgm ([886261a](https://github.com/meridianmcp/Meridian/commit/886261a84582331e1fdaf953274ea7472057f59a))
 - Feat: replace hex logo with compass SVG across dashboard and landing ([27f64fb](https://github.com/meridianmcp/Meridian/commit/27f64fbe1e29fc28d9db935bf72734de0994c1bb))
 - Feat: copy preview modal + goal field hints (Task 6 + 7) ([c621485](https://github.com/meridianmcp/Meridian/commit/c6214852e89c7455d32f72fb16678da368d8cbd9))
 - Feat: onboarding page, session presence indicators, grouped session tree ([f8ff688](https://github.com/meridianmcp/Meridian/commit/f8ff68865d7d98924791780cb3dbe86c02161cea))
@@ -65,6 +67,8 @@ All notable changes to Meridian. Generated from git history via `git-cliff`.
 
 ### Other
 
+- Merge branch 'main' of https://github.com/meridianmcp/Meridian ([08b0ab0](https://github.com/meridianmcp/Meridian/commit/08b0ab021b0033cc817eb12e18879da0f6a2be9d))
+- Merge branch 'dev' ([1fd2565](https://github.com/meridianmcp/Meridian/commit/1fd256569d4638ffbaa6a945f801fdd0d92a1881))
 - Merge branch 'main' of https://github.com/meridianmcp/Meridian ([b182b0d](https://github.com/meridianmcp/Meridian/commit/b182b0dee9db22a9ae1f8dc94bd0a3f8c3fb4d5c))
 - Merge branch 'dev' ([c007e0f](https://github.com/meridianmcp/Meridian/commit/c007e0f5b0c052d55dbddfa65da0bdd4bfd686f6))
 - Merge branch 'dev' ([324868a](https://github.com/meridianmcp/Meridian/commit/324868a5672296a3d26f624cd9e4018d9d325668))
