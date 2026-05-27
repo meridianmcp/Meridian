@@ -22,6 +22,8 @@ All notable changes to Meridian. Generated from git history via `git-cliff`.
 
 ### Chores
 
+- Chore: update CHANGELOG ([fd0bba3](https://github.com/meridianmcp/Meridian/commit/fd0bba36925e21579210a8a641724005358eaf94))
+- Chore: add complete_sprint_item as mandatory rule in CLAUDE.md ([d950491](https://github.com/meridianmcp/Meridian/commit/d9504918b101d29de518c43405c91425e2deb932))
 - Chore: update CHANGELOG ([9a53038](https://github.com/meridianmcp/Meridian/commit/9a53038758ca1f009128f343c09f4ad2d1cda023))
 - Chore: update CHANGELOG ([3b07d80](https://github.com/meridianmcp/Meridian/commit/3b07d804c44a207f53c1d461b4f68e6716e589c4))
 - Chore: update CHANGELOG ([7e8e018](https://github.com/meridianmcp/Meridian/commit/7e8e0183df7e2e472e3b079789a8562c1971af45))
@@ -72,6 +74,8 @@ All notable changes to Meridian. Generated from git history via `git-cliff`.
 
 ### Other
 
+- Merge branch 'main' of https://github.com/meridianmcp/Meridian ([24179cb](https://github.com/meridianmcp/Meridian/commit/24179cb3f6b0afd93e83b1fe9c74b755e2a32ee4))
+- Merge branch 'dev' ([e817e60](https://github.com/meridianmcp/Meridian/commit/e817e604ea224abed8c15263c8865d7e9dceab64))
 - Merge branch 'main' of https://github.com/meridianmcp/Meridian ([f4f7a3c](https://github.com/meridianmcp/Meridian/commit/f4f7a3ca3325b522aa2ce39daba6849e5cfd9dd2))
 - Merge branch 'dev' ([587a604](https://github.com/meridianmcp/Meridian/commit/587a604784b4a267863a2fddbd971a90da1fe804))
 - Merge branch 'dev' ([4cd9784](https://github.com/meridianmcp/Meridian/commit/4cd97847d00de49719c92fc8fd7b4aadbace7829))
