@@ -526,6 +526,35 @@ CREATE TABLE IF NOT EXISTS admins (
 CREATE_TABLES_PG = CREATE_TABLES_CORE + CREATE_TABLES_HOSTED
 
 
+async def open_pg_connection(url: str) -> PostgresConnection:
+    """Open a raw psycopg3 connection pool without running any migrations.
+
+    Used by standalone scripts (set_tenant_db.py, etc.) that need direct
+    DB access but don't want to apply the full migration chain.
+    """
+    try:
+        import psycopg  # noqa: F401
+        from psycopg_pool import AsyncConnectionPool  # type: ignore[import]
+    except ImportError as exc:
+        raise RuntimeError(
+            "psycopg[binary] and psycopg-pool are required. "
+            "Install: pip install 'psycopg[binary]' psycopg-pool"
+        ) from exc
+
+    clean_url = re.sub(r"[?&]channel_binding=[^&]*", "", url)
+    clean_url = re.sub(r"\?&", "?", clean_url).rstrip("?")
+
+    pool = AsyncConnectionPool(
+        clean_url,
+        min_size=1,
+        max_size=3,
+        open=False,
+        kwargs={"autocommit": True},
+    )
+    await pool.open(wait=True, timeout=30.0)
+    return PostgresConnection(pool)
+
+
 async def init_pg_db(url: str) -> PostgresConnection:
     """Open a psycopg3 connection pool, run schema DDL, return the wrapper.
 
@@ -586,6 +615,7 @@ async def init_pg_db(url: str) -> PostgresConnection:
     if is_main_db:
         await _migrate_pg_v10_tenant_columns(conn)
         await _migrate_pg_v25_admins_table(conn)
+        await _migrate_pg_v28_dunning_and_github_sub(conn)
     return conn
 
 
@@ -716,6 +746,26 @@ async def _migrate_pg_sprint_items_v2(conn: PostgresConnection) -> None:
         "ALTER TABLE sprint_items ADD COLUMN IF NOT EXISTS item_group TEXT;"
         "ALTER TABLE sprint_items ADD COLUMN IF NOT EXISTS pushed_to TEXT;"
         "ALTER TABLE sprint_items ADD COLUMN IF NOT EXISTS human_id TEXT"
+    )
+
+
+async def _migrate_pg_v28_dunning_and_github_sub(conn: PostgresConnection) -> None:
+    """v2.8 — dunning fields + github_sub + overage tracking on tenants.
+
+    These columns exist in CREATE_TABLES_HOSTED for new DBs but were added
+    after initial prod deployment, so existing DBs need this migration.
+    ADD COLUMN IF NOT EXISTS is idempotent — safe to run on every startup.
+    """
+    await conn.executescript(
+        "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS github_sub TEXT UNIQUE;"
+        "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS payment_failed_at TEXT;"
+        "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS dunning_email_sent INTEGER NOT NULL DEFAULT 0;"
+        "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS compute_overage_cap_usd NUMERIC(8,2) DEFAULT 0;"
+        "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS storage_overage_cap_usd NUMERIC(8,2) DEFAULT 0;"
+        "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS compute_cu_hours_used NUMERIC(10,4) DEFAULT 0;"
+        "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS storage_gb_used NUMERIC(10,4) DEFAULT 0;"
+        "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS overage_reset_at TEXT;"
+        "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS compute_throttled_at TEXT"
     )
 
 

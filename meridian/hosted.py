@@ -291,7 +291,7 @@ _LOGIN_PAGE_HTML = """<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>Sign in — Meridian</title>
+<title>Sign in or create an account — Meridian</title>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
@@ -326,7 +326,7 @@ body{background:#0d0d0f;color:#e8eaf0;font-family:-apple-system,BlinkMacSystemFo
 <body>
 <div class="card">
   <div class="logo">⬡ <span>Meridian</span></div>
-  <div class="subtitle">Sign in to your workspace</div>
+  <div class="subtitle">Sign in or create an account</div>
   <a href="/auth/google/login" class="btn btn-google">
     <svg width="20" height="20" viewBox="0 0 48 48"><path fill="#EA4335" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"/><path fill="#4285F4" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"/><path fill="#FBBC05" d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z"/><path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"/></svg>
     Continue with Google
@@ -339,7 +339,7 @@ body{background:#0d0d0f;color:#e8eaf0;font-family:-apple-system,BlinkMacSystemFo
   <div class="divider">or</div>
   <form class="email-form" id="magic-form" onsubmit="event.preventDefault();sendMagic();">
     <input type="email" class="email-input" id="magic-email" placeholder="you@example.com" autocomplete="email" required>
-    <button type="submit" class="btn btn-email" id="magic-btn">Send sign-in link →</button>
+    <button type="submit" class="btn btn-email" id="magic-btn">Send magic link →</button>
     <div class="email-status" id="magic-status"></div>
   </form>
   <div class="footer-note">
@@ -402,16 +402,13 @@ async def auth_login(request: Request):
     return HTMLResponse(_build_login_page())
 
 
-def _post_login_redirect(tenant: dict) -> str:
+async def _post_login_redirect(tenant: dict, db=None) -> str:
     """v0.9 — paywall check shared by Google / GitHub / magic-link auth.
 
     Returns the target URL for the post-login redirect:
-    * ``/pricing?signup=1`` when the tenant has no Stripe customer
-      (never subscribed → must pay to access the dashboard).
-    * ``/pricing?reactivate=1`` when the tenant once had a customer
-      but is now flagged inactive (subscription cancelled / expired).
-      Conservative: we only flag this when the plan column is explicit.
-    * ``MERIDIAN_AFTER_LOGIN_URL`` (default ``/dashboard``) otherwise.
+    * ``/waitlist-pending`` for non-admin users (pre-launch gate).
+      Auto-adds the email to the waitlist table on first visit.
+    * ``MERIDIAN_AFTER_LOGIN_URL`` (default ``/dashboard``) for admins.
 
     Keeps the auth callbacks symmetric — every login flow lands here so
     adding a new provider (magic link, Microsoft, SSO) inherits paywall.
@@ -420,17 +417,17 @@ def _post_login_redirect(tenant: dict) -> str:
     if is_admin((tenant or {}).get("email", "")):
         return _cfg("MERIDIAN_AFTER_LOGIN_URL", "/dashboard")
 
-    stripe_id = (tenant or {}).get("stripe_customer_id")
-    # Only enforce paywall when Stripe is in live mode (STRIPE_LIVE=true).
-    # In test mode / pre-launch everyone goes straight to dashboard.
-    import os as _os
-    stripe_live = _os.environ.get("STRIPE_LIVE", "").lower() in ("1", "true", "yes")
-    if stripe_live and not stripe_id:
-        return "/onboarding"
-    plan = (tenant or {}).get("plan") or "standard"
-    if stripe_live and plan in ("cancelled", "expired", "trial_expired"):
-        return "/#pricing?reactivate=1"
-    return _cfg("MERIDIAN_AFTER_LOGIN_URL", "/dashboard")
+    # Pre-launch: non-admin users are held at waitlist-pending.
+    # Auto-add to waitlist table so admins can see who signed up.
+    if db is not None:
+        from . import db as db_module
+        email = (tenant or {}).get("email", "")
+        if email:
+            try:
+                await db_module.add_waitlist_entry(db, email, note="auto:login")
+            except Exception:
+                pass  # already on waitlist or DB error — not fatal
+    return "/waitlist-pending"
 
 
 async def auth_callback(request: Request) -> RedirectResponse:
@@ -460,7 +457,7 @@ async def auth_callback(request: Request) -> RedirectResponse:
     session = await db_module.create_user_session(db, tenant["id"], expires_at)
     cookie_value = _make_session_cookie(session["id"])
 
-    redirect_to = _post_login_redirect(tenant)
+    redirect_to = await _post_login_redirect(tenant, db)
     response = RedirectResponse(redirect_to, status_code=302)
     response.set_cookie(
         _SESSION_COOKIE,
@@ -519,7 +516,7 @@ async def auth_github_callback(request: Request) -> RedirectResponse:
     session = await db_module.create_user_session(db, tenant["id"], expires_at)
     cookie_value = _make_session_cookie(session["id"])
 
-    redirect_to = _post_login_redirect(tenant)
+    redirect_to = await _post_login_redirect(tenant, db)
     response = RedirectResponse(redirect_to, status_code=302)
     response.set_cookie(
         _SESSION_COOKIE,
@@ -568,7 +565,7 @@ async def auth_microsoft_callback(request: Request) -> RedirectResponse:
     session = await db_module.create_user_session(db, tenant["id"], expires_at)
     cookie_value = _make_session_cookie(session["id"])
 
-    redirect_to = _post_login_redirect(tenant)
+    redirect_to = await _post_login_redirect(tenant, db)
     response = RedirectResponse(redirect_to, status_code=302)
     response.set_cookie(
         _SESSION_COOKIE,
@@ -1978,7 +1975,7 @@ async def auth_magic_verify(request: Request, token: str = ""):
     session = await db_module.create_user_session(db, tenant["id"], expires_at)
     cookie_value = _make_session_cookie(session["id"])
 
-    redirect_to = _post_login_redirect(tenant)
+    redirect_to = await _post_login_redirect(tenant, db)
     response = RedirectResponse(redirect_to, status_code=302)
     response.set_cookie(
         _SESSION_COOKIE,
