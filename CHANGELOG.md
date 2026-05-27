@@ -21,6 +21,7 @@ All notable changes to Meridian. Generated from git history via `git-cliff`.
 
 ### Chores
 
+- Chore: update CHANGELOG ([9f2e1aa](https://github.com/meridianmcp/Meridian/commit/9f2e1aafb43b90cb59867aa5ce01d7f90978a9fe))
 - Chore: update CHANGELOG ([2e81d7f](https://github.com/meridianmcp/Meridian/commit/2e81d7fa952bf73b9c300f1bdbcac309752ec0cf))
 - Chore: update CHANGELOG ([112bbd9](https://github.com/meridianmcp/Meridian/commit/112bbd9e2e3facc3731d22d49d10d17363f26bf2))
 - Chore: update CHANGELOG ([c08054b](https://github.com/meridianmcp/Meridian/commit/c08054b6b6a8bb2dca0385672dc4f7215b4957bc))
@@ -34,6 +35,7 @@ All notable changes to Meridian. Generated from git history via `git-cliff`.
 
 ### Features
 
+- Feat: replace hex logo with compass SVG across dashboard and landing ([27f64fb](https://github.com/meridianmcp/Meridian/commit/27f64fbe1e29fc28d9db935bf72734de0994c1bb))
 - Feat: copy preview modal + goal field hints (Task 6 + 7) ([c621485](https://github.com/meridianmcp/Meridian/commit/c6214852e89c7455d32f72fb16678da368d8cbd9))
 - Feat: onboarding page, session presence indicators, grouped session tree ([f8ff688](https://github.com/meridianmcp/Meridian/commit/f8ff68865d7d98924791780cb3dbe86c02161cea))
 - Feat: client_type tracking, implicit heartbeat on tool calls, onboarding template ([38ee85b](https://github.com/meridianmcp/Meridian/commit/38ee85becad095a4954f0b724b1daf1df9e46f08))
@@ -61,6 +63,7 @@ All notable changes to Meridian. Generated from git history via `git-cliff`.
 
 ### Other
 
+- Merge branch 'dev' ([324868a](https://github.com/meridianmcp/Meridian/commit/324868a5672296a3d26f624cd9e4018d9d325668))
 - Merge branch 'main' of https://github.com/meridianmcp/Meridian ([c1b1de1](https://github.com/meridianmcp/Meridian/commit/c1b1de1434420fbcf1ccad22c17fc7978174961d))
 - Merge branch 'dev' ([897100f](https://github.com/meridianmcp/Meridian/commit/897100f817a1e3db9fd161e871eb57d3dc405460))
 - Merge branch 'dev' ([d324012](https://github.com/meridianmcp/Meridian/commit/d3240125025cc481b3f3e23c1dbf363eb4a493f7))
