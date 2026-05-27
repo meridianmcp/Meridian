@@ -526,6 +526,35 @@ CREATE TABLE IF NOT EXISTS admins (
 CREATE_TABLES_PG = CREATE_TABLES_CORE + CREATE_TABLES_HOSTED
 
 
+async def open_pg_connection(url: str) -> PostgresConnection:
+    """Open a raw psycopg3 connection pool without running any migrations.
+
+    Used by standalone scripts (set_tenant_db.py, etc.) that need direct
+    DB access but don't want to apply the full migration chain.
+    """
+    try:
+        import psycopg  # noqa: F401
+        from psycopg_pool import AsyncConnectionPool  # type: ignore[import]
+    except ImportError as exc:
+        raise RuntimeError(
+            "psycopg[binary] and psycopg-pool are required. "
+            "Install: pip install 'psycopg[binary]' psycopg-pool"
+        ) from exc
+
+    clean_url = re.sub(r"[?&]channel_binding=[^&]*", "", url)
+    clean_url = re.sub(r"\?&", "?", clean_url).rstrip("?")
+
+    pool = AsyncConnectionPool(
+        clean_url,
+        min_size=1,
+        max_size=3,
+        open=False,
+        kwargs={"autocommit": True},
+    )
+    await pool.open(wait=True, timeout=30.0)
+    return PostgresConnection(pool)
+
+
 async def init_pg_db(url: str) -> PostgresConnection:
     """Open a psycopg3 connection pool, run schema DDL, return the wrapper.
 
