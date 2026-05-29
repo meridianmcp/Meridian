@@ -3,6 +3,7 @@ name: Deploy to Fly.io
 on:
   push:
     branches: [main]
+    tags: ['v*.*.*']
   workflow_dispatch:
 
 env:
@@ -19,18 +20,35 @@ jobs:
           cache: false
       - run: pixi run test
 
-  deploy:
+  # Every push to main deploys to the preview app (costs nothing idle).
+  # Human verifies preview before promoting to production.
+  deploy-preview:
     needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: superfly/flyctl-actions/setup-flyctl@master
-      - run: flyctl deploy --remote-only --config fly.toml
+      - run: flyctl deploy --remote-only --config fly-preview.toml
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN_PREVIEW }}
+
+  # Production deploy only on manual dispatch or version tag push.
+  # Uses canary strategy so a bad deploy hits 1 machine before rolling out.
+  deploy:
+    needs: test
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: superfly/flyctl-actions/setup-flyctl@master
+      - run: flyctl deploy --remote-only --config fly.toml --strategy=canary
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
 
   changelog:
-    needs: deploy
+    needs: deploy-preview
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:
       contents: write

@@ -223,11 +223,14 @@ commit.py
 
 tmp/
   
-# Internal strategy documents  
-DECISIONS.md  
-ROADMAP.md  
-secrets.env  
-secrets.local.env 
+# Internal strategy documents
+DECISIONS.md
+ROADMAP.md
+secrets.env
+secrets.local.env
+# Session handoff files contain internal strategy — never commit
+data/meridian-build_handoff.md
+data/chinampa_churchill.md
 
 meridian.toml
 *.toml

@@ -32,6 +32,9 @@ NEVER:
 - Push to main directly — push to dev, merge to main to deploy.
 - Use `asyncio.run()` on Windows — use `uvicorn.Server` + `loop.run_until_complete()`.
 - Import watchfiles on Windows — deadlocks ProactorEventLoop.
+- Write sensitive business strategy to any committed file — no pricing psychology, conversion tactics,
+  strategic exit valuations, degraded hardware framing, or internal competitive analysis in DEVLOG.md,
+  ROADMAP.md, GOAL.md, DECISIONS.md, CHANGELOG.md or any .md in the public repo.
 </rules>
 
 <architecture>
@@ -83,7 +86,7 @@ For decisions: use pin_decision MCP tool, which also appends to DECISIONS.md.
 <current_state>
 <!-- Auto-updated by Meridian. Do not edit manually. -->
 Project: meridian-build (5787cc92)
-Last updated: 2026-05-27 06:55 UTC
+Last updated: 2026-05-27 16:47 UTC
 Sprint: pre-launch — polish sprint: LICENSE fix, chat banner removal, demo fixes, swimlane, backburner status, session focus dropdown, Pro plan card accuracy, one-liner install
 North Star: Meridian is the open-source coordination layer for AI coding sessions — persistent memory, task tracking, and session coordination that your AI tools don't provide.  Core value: "Your AI sessions don'…
 Recent:
@@ -96,7 +99,7 @@ Recent:
 
 ---
 <!-- MERIDIAN STATE — auto-generated, do not edit below -->
-## Current Sprint State  _(auto-updated 2026-05-27 06:57 UTC)_
+## Current Sprint State  _(auto-updated 2026-05-29 07:41 UTC)_
 
 **Key Files:**
 - `meridian/server.py` — FastAPI app + MCP handlers

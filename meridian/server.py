@@ -1080,6 +1080,39 @@ async def privacy_page(request: Request) -> HTMLResponse:
     return _templates.TemplateResponse(request, "privacy.html")
 
 
+@app.get("/pricing", response_class=HTMLResponse)
+async def pricing_page(request: Request) -> HTMLResponse:
+    """Pricing page — Free / Solo / Team tiers with waitlist forms when hosted launch is pending."""
+    solo_link = os.environ.get("STRIPE_PAYMENT_LINK", "/auth/login?signup=1")
+    team_link = os.environ.get("STRIPE_PRO_PAYMENT_LINK", "/auth/login?signup=1")
+    waitlist_mode = not bool(os.environ.get("STRIPE_PAYMENT_LINK"))
+    email = ""
+    try:
+        from .hosted import _SESSION_COOKIE, _read_session_cookie
+        cookie_val = request.cookies.get(_SESSION_COOKIE)
+        if cookie_val:
+            session_id = _read_session_cookie(cookie_val)
+            if session_id:
+                db = await _db(request)
+                user_session = await db_module.get_user_session(db, session_id)
+                if user_session:
+                    tenant = await db_module.get_tenant_by_id(db, user_session["tenant_id"]) or {}
+                    email = tenant.get("email", "")
+                    if email and not waitlist_mode:
+                        sep = "&" if "?" in solo_link else "?"
+                        solo_link += f"{sep}prefilled_email={email}"
+                        sep = "&" if "?" in team_link else "?"
+                        team_link += f"{sep}prefilled_email={email}"
+    except Exception:
+        pass
+    return _templates.TemplateResponse(request, "pricing.html", {
+        "solo_link": solo_link,
+        "team_link": team_link,
+        "waitlist_mode": waitlist_mode,
+        "email": email,
+    })
+
+
 # ---------------------------------------------------------------------------
 # v2.0 — Google OAuth routes
 # ---------------------------------------------------------------------------

@@ -38,7 +38,17 @@ other's task log, and resume from a compressed handoff when context fills up.
 Hosted tier at **[usemeridian.us](https://usemeridian.us)** — $20/mo, 7-day free trial.
 Self-host the same product for free.
 
-## Quickstart — local install
+## Quickstart — binary (no Python required)
+
+Download the single-file binary for your platform, double-click (or run from terminal), and the dashboard opens at `http://localhost:7878`.
+
+| Platform | Download |
+|---|---|
+| Windows | [meridian.exe](https://github.com/meridianmcp/Meridian/releases/latest/download/meridian.exe) |
+| macOS (Apple Silicon) | [meridian-mac-arm64](https://github.com/meridianmcp/Meridian/releases/latest/download/meridian-mac-arm64) |
+| macOS (Intel) | [meridian-mac-x86](https://github.com/meridianmcp/Meridian/releases/latest/download/meridian-mac-x86) |
+
+## Quickstart — from source
 
 **Linux / macOS:**
 ```bash
