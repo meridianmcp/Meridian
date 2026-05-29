@@ -36,6 +36,7 @@ from ._deps import (
     _open_tenant_db_by_id,
     _db,
     _data_dir,
+    _is_demo_request,
 )
 
 
@@ -726,12 +727,14 @@ app = FastAPI(
 # Routers — extracted route modules (routes/ package)
 # Include these BEFORE middleware so route matching is registered correctly.
 # ---------------------------------------------------------------------------
-from .routes.notes import router as _notes_router          # noqa: E402
-from .routes.hitl import router as _hitl_router            # noqa: E402
-from .routes.sprint import router as _sprint_router        # noqa: E402
-from .routes.sessions import router as _sessions_router    # noqa: E402
-from .routes.tasks import router as _tasks_router          # noqa: E402
-from .routes.decisions import router as _decisions_router  # noqa: E402
+from .routes.notes import router as _notes_router            # noqa: E402
+from .routes.hitl import router as _hitl_router              # noqa: E402
+from .routes.sprint import router as _sprint_router          # noqa: E402
+from .routes.sessions import router as _sessions_router      # noqa: E402
+from .routes.tasks import router as _tasks_router            # noqa: E402
+from .routes.decisions import router as _decisions_router    # noqa: E402
+from .routes.handoff import router as _handoff_router        # noqa: E402
+from .routes.admin import router as _admin_router            # noqa: E402
 
 app.include_router(_notes_router)
 app.include_router(_hitl_router)
@@ -739,6 +742,8 @@ app.include_router(_sprint_router)
 app.include_router(_sessions_router)
 app.include_router(_tasks_router)
 app.include_router(_decisions_router)
+app.include_router(_handoff_router)
+app.include_router(_admin_router)
 
 # ---------------------------------------------------------------------------
 # Password gate middleware
@@ -1621,52 +1626,7 @@ async def get_sessions(
 # Tasks + claim/release routes → meridian/routes/tasks.py
 
 
-@app.post("/projects/{project_id}/handoff", response_model=HandoffResult)
-async def generate_handoff(
-    project_id: str, request: Request
-) -> dict[str, Any]:
-    """Render and write the handoff file for a project."""
-    project = await db_module.get_project(await _db(request), project_id)
-    if project is None:
-        raise HTTPException(status_code=404, detail="project not found")
-    # v2.4 — skip the Haiku ai_summary call when ANTHROPIC_API_KEY is
-    # missing. The generator already falls back gracefully but the
-    # network round-trip on every dashboard click is wasteful when the
-    # key obviously isn't configured. Local devs without ANTHROPIC_API_KEY
-    # get instant handoffs; hosted deploys with the key get summaries.
-    import os as _os
-    try:
-        body = await request.json()
-        if not isinstance(body, dict):
-            body = {}
-    except Exception:
-        body = {}
-    session_id = body.get("session_id")
-    mode = handoff_module.resolve_handoff_mode(
-        body.get("mode"),
-        session_id if isinstance(session_id, str) else None,
-    )
-    skip_summary = not _os.environ.get("ANTHROPIC_API_KEY")
-    db = await _db(request)
-    data_dir = _data_dir(request)
-    try:
-        path, content = await asyncio.wait_for(
-            handoff_module.generate_handoff(
-                db,
-                project_id,
-                data_dir,
-                skip_ai_summary=skip_summary,
-                mode=mode,
-                session_id=session_id if isinstance(session_id, str) else None,
-            ),
-            timeout=90.0,
-        )
-    except asyncio.TimeoutError:
-        path, content = await handoff_module._generate_handoff_l0(
-            db, project_id, data_dir
-        )
-        mode = "full"
-    return {"path": path, "content": content, "mode": mode}
+# Handoff route → meridian/routes/handoff.py
 
 
 # Session lifecycle routes → meridian/routes/sessions.py
@@ -2998,100 +2958,7 @@ async def mcp_tools_doc() -> str:
         lines.pop()
     return "\n".join(lines)
 
-@app.get("/admin/health")
-async def admin_health_json(request: Request) -> dict[str, Any]:
-    """JSON health check for ops/curl — restricted to MERIDIAN_ADMIN_EMAILS."""
-    from .hosted import get_current_tenant, is_admin_db, check_admin_password
-    try:
-        tenant = await get_current_tenant(request)
-    except HTTPException:
-        raise HTTPException(status_code=403, detail="not authenticated")
-    if not await is_admin_db(tenant.get("email", ""), request.app.state.db):
-        raise HTTPException(status_code=403, detail="admin only")
-    if not check_admin_password(request):
-        raise HTTPException(status_code=403, detail="admin password required")
-
-    db = request.app.state.db
-
-    async def _count(sql: str) -> int:
-        async with db.execute(sql) as cur:
-            row = await cur.fetchone()
-        return (row[0] if row else 0) or 0
-
-    tenants_total = await _count("SELECT COUNT(*) FROM tenants")
-    tenants_pro = await _count("SELECT COUNT(*) FROM tenants WHERE plan='pro'")
-    tasks_today = await _count(
-        "SELECT COUNT(*) FROM task_log WHERE created_at >= date('now')"
-    )
-    sessions_active = await _count(
-        "SELECT COUNT(*) FROM sessions WHERE status='in_progress'"
-    )
-    sprint_pending = await _count(
-        "SELECT COUNT(*) FROM sprint_items WHERE status='pending'"
-    )
-
-    try:
-        version_path = _REPO_ROOT / "pyproject.toml"
-        ver_text = version_path.read_text(encoding="utf-8")
-        import re as _re
-        ver_m = _re.search(r'version\s*=\s*"([^"]+)"', ver_text)
-        version = ver_m.group(1) if ver_m else "unknown"
-    except Exception:  # noqa: BLE001
-        version = "unknown"
-
-    return {
-        "version": version,
-        "tenants_total": tenants_total,
-        "tenants_pro": tenants_pro,
-        "sessions_active": sessions_active,
-        "tasks_today": tasks_today,
-        "sprint_pending": sprint_pending,
-        "hosted_mode": _hosted_mode(),
-    }
-
-
-@app.get("/admin/git-status")
-async def git_status() -> dict[str, Any]:
-    """Check if local repo is behind/ahead of remote."""
-    import subprocess as sp
-    try:
-        cwd = str(Path(__file__).parent.parent)
-        # Fetch without merging
-        sp.run(["git", "fetch", "origin"], cwd=cwd, capture_output=True, timeout=10)
-        # Count commits behind/ahead
-        result = sp.run(
-            ["git", "rev-list", "--left-right", "--count", "HEAD...@{upstream}"],
-            cwd=cwd, capture_output=True, text=True, timeout=5
-        )
-        if result.returncode == 0:
-            parts = result.stdout.strip().split()
-            ahead = int(parts[0]) if parts else 0
-            behind = int(parts[1]) if len(parts) > 1 else 0
-        else:
-            ahead, behind = 0, 0
-        # Get current branch
-        branch = sp.run(
-            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
-            cwd=cwd, capture_output=True, text=True
-        ).stdout.strip()
-        # Get latest local + remote commit hashes
-        local_hash = sp.run(
-            ["git", "rev-parse", "--short", "HEAD"],
-            cwd=cwd, capture_output=True, text=True
-        ).stdout.strip()
-        remote_hash = sp.run(
-            ["git", "rev-parse", "--short", "@{upstream}"],
-            cwd=cwd, capture_output=True, text=True
-        ).stdout.strip()
-        return {
-            "ok": True, "branch": branch,
-            "ahead": ahead, "behind": behind,
-            "local_hash": local_hash, "remote_hash": remote_hash,
-            "up_to_date": behind == 0,
-            "warning": f"{behind} commit(s) behind origin/{branch}" if behind > 0 else None,
-        }
-    except Exception as e:
-        return {"ok": False, "error": str(e), "behind": 0, "ahead": 0}
+# /admin/health, /admin/git-status → meridian/routes/admin.py
 
 
 # DELETE /tasks/{task_id} → meridian/routes/tasks.py
@@ -3307,144 +3174,10 @@ async def start_session_endpoint(
 # ---------------------------------------------------------------------------
 
 
-@app.post("/admin/shutdown")
-async def admin_shutdown(request: Request) -> Response:
-    """v1.7.0 — gracefully stop the server process.
-
-    Returns immediately with ``{"ok": True}`` then sends SIGINT to the
-    current process after a short delay so the HTTP response has time to
-    flush. The dashboard shows a "restart required" message on receipt.
-    """
-    if _is_demo_request(request):
-        return JSONResponse(
-            {"detail": "Not available in demo mode. Sign up at usemeridian.us"},
-            status_code=403,
-        )
-
-    async def _delayed_shutdown() -> None:
-        await asyncio.sleep(0.5)
-        os.kill(os.getpid(), signal.SIGINT)
-
-    asyncio.create_task(_delayed_shutdown())
-    return JSONResponse({"ok": True})
+# /admin/shutdown + /admin/restart → meridian/routes/admin.py
 
 
-@app.post("/admin/restart")
-async def admin_restart(request: Request) -> Response:
-    """v1.9.x — restart the server by spawning a new process then shutting down.
-
-    Spawns ``pixi run start`` (falling back to the current Python interpreter)
-    in the repo root, then sends SIGINT to itself after a short delay so the
-    HTTP response flushes first.  The dashboard polls ``/health`` and reloads
-    when the new process is ready.
-    """
-    if _is_demo_request(request):
-        return JSONResponse(
-            {"detail": "Not available in demo mode. Sign up at usemeridian.us"},
-            status_code=403,
-        )
-
-    import subprocess
-    import sys
-
-    async def _delayed_restart() -> None:
-        await asyncio.sleep(0.5)
-        # Kill self first so the port is freed before new process starts
-        cwd = str(Path(__file__).parent.parent)
-
-        async def _spawn_after_death() -> None:
-            # Wait for port to free up then spawn new process
-            import time
-            time.sleep(2.0)
-            try:
-                kwargs: dict[str, Any] = {"cwd": cwd}
-                if os.name == "nt":
-                    kwargs["creationflags"] = subprocess.CREATE_NEW_CONSOLE  # type: ignore[attr-defined]
-                subprocess.Popen(["pixi", "run", "start"], **kwargs)  # noqa: S603
-            except FileNotFoundError:
-                subprocess.Popen(  # noqa: S603
-                    [sys.executable, "-m", "meridian"],
-                    cwd=cwd,
-                    env={**os.environ},
-                )
-
-        # Spawn a detached helper that will restart after we die
-        # Use python directly + clean env to avoid PATH nesting on repeated restarts
-        python_exe = sys.executable
-        spawn_script = (
-            f"import time, subprocess, os; time.sleep(2); "
-            f"env = {{k: v for k, v in os.environ.items()}}; "
-            f"env['CONDA_SHLVL'] = '1'; "
-            f"[env.pop(k, None) for k in list(env) if k.startswith('CONDA_ENV_SHLVL_')]; "
-            f"subprocess.Popen([{python_exe!r}, '-m', 'meridian'], cwd={cwd!r}, env=env)"
-        )
-        subprocess.Popen(  # noqa: S603
-            [sys.executable, "-c", spawn_script],
-            cwd=cwd,
-        )
-        await asyncio.sleep(0.5)
-        os.kill(os.getpid(), signal.SIGINT)
-
-    asyncio.create_task(_delayed_restart())
-    return JSONResponse({"ok": True})
-
-
-@app.get("/admin/snapshot")
-async def download_snapshot(request: Request) -> Response:
-    """v1.9.x — download the current DB as a SQLite file.
-
-    For a SQLite backend, streams the ``.db`` file directly.
-    For a Postgres backend, exports all tables into a fresh in-memory SQLite
-    database and streams that as a downloadable file.
-    """
-    headers = {"Content-Disposition": "attachment; filename=meridian-snapshot.db"}
-    db = await _db(request)
-    db_url = os.environ.get("MERIDIAN_DB_URL")
-
-    if not db_url:
-        # SQLite — serve the file directly.
-        db_path = os.environ.get("MERIDIAN_DB", DEFAULT_DB_PATH)
-        if db_path == ":memory:":
-            raise HTTPException(400, "Cannot snapshot in-memory database")
-        try:
-            data = Path(db_path).read_bytes()
-        except OSError as exc:
-            raise HTTPException(500, f"Could not read DB file: {exc}") from exc
-        return Response(content=data, media_type="application/x-sqlite3", headers=headers)
-
-    # Postgres — export to a fresh in-memory SQLite then return its bytes.
-    import tempfile
-
-    tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
-    tmp.close()
-    try:
-        async with aiosqlite.connect(tmp.name) as sdb:
-            await db_module.init_db(tmp.name)  # create schema
-            tables = [
-                "projects", "goal_states", "sessions", "sessions_archived",
-                "task_log", "sprint_items", "chat_sessions", "chat_messages",
-            ]
-            for table in tables:
-                try:
-                    rows = await db.execute_fetchall(f"SELECT * FROM {table}")  # type: ignore[attr-defined]
-                    if rows:
-                        cols = list(rows[0].keys())
-                        placeholders = ",".join("?" * len(cols))
-                        sql = (
-                            f"INSERT OR IGNORE INTO {table} "
-                            f"({','.join(cols)}) VALUES ({placeholders})"
-                        )
-                        await sdb.executemany(sql, [list(r.values()) for r in rows])
-                except Exception:  # noqa: BLE001 — skip missing tables
-                    pass
-            await sdb.commit()
-        data = Path(tmp.name).read_bytes()
-    finally:
-        try:
-            Path(tmp.name).unlink()
-        except OSError:
-            pass
-    return Response(content=data, media_type="application/x-sqlite3", headers=headers)
+# /admin/snapshot → meridian/routes/admin.py
 
 
 @app.post("/config/connections")

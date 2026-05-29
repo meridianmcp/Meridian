@@ -198,3 +198,14 @@ async def _db(request: Request) -> Any:
 def _data_dir(request: Request) -> str:
     """Pull the active data directory off app.state."""
     return request.app.state.data_dir
+
+
+# ---------------------------------------------------------------------------
+# Demo request detection
+# ---------------------------------------------------------------------------
+
+def _is_demo_request(request: Request) -> bool:
+    """Return True when the request is in demo mode (env flag or cookie)."""
+    env_demo = os.environ.get("MERIDIAN_DEMO", "").lower() in ("1", "true", "yes")
+    cookie_demo = bool(request.cookies.get(_DEMO_CONTEXT_COOKIE))
+    return env_demo or cookie_demo
