@@ -1,44 +1,19 @@
 # MCP Tool Reference
 
-_Auto-generated. 19 tools._
+Meridian exposes **19 tools** over MCP. They fall into two usage patterns:
+
+**Planner sessions** (claude.ai, planning work) — `start_session` · `pin_decision` · `update_decision` · `add_note` · `get_context_block` · `generate_handoff`
+
+**Executor sessions** (Claude Code, Cursor, automated workers) — `start_session` · `log_task` · `request_hitl` · `get_session_brief` · `generate_handoff`
+
+---
+
+## Starting a session
 
 
-## `create_project`
+### `start_session`
 
-Create a new Meridian project.
-
-
-| Parameter | Type | Required | Description |
-|-----------|------|----------|-------------|
-| `name` | string | required |  |
-
-**Example:**
-```
-create_project(name="my-app")
-```
-
-
-## `register_session`
-
-Register this Claude session. Call at session start.
-
-
-| Parameter | Type | Required | Description |
-|-----------|------|----------|-------------|
-| `project_id` | string | required |  |
-| `session_name` | string | required |  |
-| `human_id` | string | optional |  |
-| `client` | string | optional |  |
-
-**Example:**
-```
-register_session(project_id="abc-123", session_name="feature-x", human_id="alice")
-```
-
-
-## `start_session`
-
-Register session and return goal + recent tasks in one call.
+Register a session and get the full project context (goal, sprint, recent tasks, decisions) in one call. **Use this instead of `register_session`.**
 
 
 | Parameter | Type | Required | Description |
@@ -53,41 +28,34 @@ Register session and return goal + recent tasks in one call.
 start_session(project_id="abc-123", session_name="feature-x", human_id="alice")
 ```
 
-
-## `get_goal`
-
-Read the current goal state.
+---
 
 
-| Parameter | Type | Required | Description |
-|-----------|------|----------|-------------|
-| `project_id` | string | required |  |
+### `get_session_brief`
 
-**Example:**
-```
-get_goal(project_id="abc-123")
-```
-
-
-## `set_goal`
-
-Set or update the goal state.
+Compact session orientation (<500 tokens). Returns sprint focus, pending items, recent tasks, blocking failures, and open HITL requests. Ideal for worker/automation sessions that don't need the full context.
 
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `project_id` | string | required |  |
-| `content` | string | required |  |
+| `role` | string | optional | Controls verbosity. 'worker'=sprint+tasks only, 'planner'=full context. |
 
 **Example:**
 ```
-set_goal(project_id="abc-123", content="Build a great product")
+get_session_brief(project_id="abc-123")
 ```
 
+---
 
-## `log_task`
+## Tasks
 
-Log a task this session completed or is working on. Valid statuses: pending, in_progress, done, failed, backlog, future, backburner.
+
+### `log_task`
+
+Log what this session did, is doing, or failed at. Call frequently — this is the primary signal in the timeline and handoffs.
+
+Valid statuses: `pending` · `in_progress` · `done` · `failed` · `backlog` · `future` · `backburner`
 
 
 | Parameter | Type | Required | Description |
@@ -102,8 +70,10 @@ Log a task this session completed or is working on. Valid statuses: pending, in_
 log_task(session_id="session-uuid", project_id="abc-123", description="Fixed auth bug", status="done")
 ```
 
+---
 
-## `get_tasks`
+
+### `get_tasks`
 
 Get recent tasks across all sessions.
 
@@ -118,8 +88,10 @@ Get recent tasks across all sessions.
 get_tasks(project_id="abc-123")
 ```
 
+---
 
-## `search_tasks`
+
+### `search_tasks`
 
 Search tasks by keyword or natural-language query. Uses trigram similarity on Postgres, LIKE on SQLite. Returns top matches with similarity score.
 
@@ -135,43 +107,53 @@ Search tasks by keyword or natural-language query. Uses trigram similarity on Po
 search_tasks(project_id="abc-123", query="rate limiting bug")
 ```
 
+---
 
-## `generate_handoff`
-
-Generate a context handoff file. mode='full' writes the complete L0/L1/L2 handoff; mode='delta' returns a compact session update with completed items, pending items, and the next /goal string.
-
-
-| Parameter | Type | Required | Description |
-|-----------|------|----------|-------------|
-| `project_id` | string | required |  |
-| `mode` | string | optional |  |
-| `session_id` | string | optional | Optional session id for auto-delta on repeated calls in the same session. |
-
-**Example:**
-```
-generate_handoff(project_id="abc-123", mode="delta", session_id="session-uuid")
-```
+## Goal & sprint
 
 
-## `get_context_block`
+### `get_goal`
 
-Return a compact plain-text project context block (north star, sprint, pending sprint items, recent tasks, recent decisions, active sessions). mode='full' (default) for Code Handoff into a fresh Claude Code session; mode='chat' for a shorter paste into a new claude.ai conversation.
+Read the current goal state.
 
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `project_id` | string | required |  |
-| `mode` | string | optional |  |
 
 **Example:**
 ```
-get_context_block(project_id="abc-123", mode="chat")
+get_goal(project_id="abc-123")
 ```
 
+---
 
-## `pin_decision`
 
-Create a pinned decision (editable constitution row). Use for the current authoritative truth that supersedes earlier statements. Category: STRATEGIC, COMPETITIVE, TECHNICAL, TACTICAL, BUSINESS, PRODUCT, ARCHITECTURAL.
+### `set_goal`
+
+Set or update the goal state.
+
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `project_id` | string | required |  |
+| `content` | string | required |  |
+
+**Example:**
+```
+set_goal(project_id="abc-123", content="Build a great product")
+```
+
+---
+
+## Decisions
+
+
+### `pin_decision`
+
+Record an authoritative decision that supersedes earlier statements. Pinned decisions appear in every session's context block.
+
+Categories: `STRATEGIC` · `COMPETITIVE` · `TECHNICAL` · `TACTICAL` · `BUSINESS` · `PRODUCT` · `ARCHITECTURAL`
 
 
 | Parameter | Type | Required | Description |
@@ -186,10 +168,12 @@ Create a pinned decision (editable constitution row). Use for the current author
 pin_decision(project_id="abc-123", title="Use psycopg3", body="asyncpg has DLL issues on Windows", category="TECHNICAL")
 ```
 
+---
 
-## `update_decision`
 
-Patch a pinned decision. Pass new_title + new_body to atomically supersede (creates a new active row, marks old as superseded with back-link). Otherwise patches body/title/category/status in place.
+### `update_decision`
+
+Patch a pinned decision. Pass `new_title` + `new_body` to atomically supersede (creates a new row, marks old as superseded). Otherwise patches in place.
 
 
 | Parameter | Type | Required | Description |
@@ -202,8 +186,10 @@ Patch a pinned decision. Pass new_title + new_body to atomically supersede (crea
 | `category` | string | optional |  |
 | `status` | string | optional |  |
 
+---
 
-## `get_pinned_decisions`
+
+### `get_pinned_decisions`
 
 List pinned decisions (active only by default, newest first).
 
@@ -218,10 +204,14 @@ List pinned decisions (active only by default, newest first).
 get_pinned_decisions(project_id="abc-123")
 ```
 
+---
 
-## `request_hitl`
+## Human-in-the-loop (HITL)
 
-Surface a question to the human-in-the-loop queue. urgency='blocking' means this session pauses until answered (poll get_hitl_request). urgency='normal'/'high' lands in the dashboard but doesn't block. assigned_to routes to a specific human_id (null = broadcast).
+
+### `request_hitl`
+
+Surface a question to the human queue. `urgency='blocking'` pauses the session until answered — poll `get_hitl_request` to resume. `normal`/`high` land in the dashboard without blocking.
 
 
 | Parameter | Type | Required | Description |
@@ -238,10 +228,12 @@ Surface a question to the human-in-the-loop queue. urgency='blocking' means this
 request_hitl(project_id="abc-123", question="Should we add rate limiting here?", urgency="normal")
 ```
 
+---
 
-## `get_hitl_request`
 
-Poll a HITL request for the human's answer. Returns the row including status ('pending'|'answered'|'dismissed') and answer text.
+### `get_hitl_request`
+
+Poll a HITL request for the human's answer. Returns the row including `status` (`pending`/`answered`/`dismissed`) and `answer` text.
 
 
 | Parameter | Type | Required | Description |
@@ -253,10 +245,53 @@ Poll a HITL request for the human's answer. Returns the row including status ('p
 get_hitl_request(request_id="hitl-uuid")
 ```
 
+---
 
-## `add_note`
+## Handoff & context
 
-Add a per-project wiki note (setup, gotcha, howto, env, ...). Free-form title/body; comma-separated tags optional.
+
+### `generate_handoff`
+
+Generate a context handoff document. `mode='full'` writes the complete L0/L1/L2 handoff. `mode='delta'` returns a compact session summary with completed items, pending items, and the next `/goal` string.
+
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `project_id` | string | required |  |
+| `mode` | string | optional |  |
+| `session_id` | string | optional | Optional session id for auto-delta on repeated calls in the same session. |
+
+**Example:**
+```
+generate_handoff(project_id="abc-123", mode="delta", session_id="session-uuid")
+```
+
+---
+
+
+### `get_context_block`
+
+Return a compact plain-text context block (north star, sprint, pending sprint items, recent tasks, recent decisions, active sessions). Use `mode='full'` to paste into a fresh Claude Code session; `mode='chat'` for a shorter paste into claude.ai.
+
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `project_id` | string | required |  |
+| `mode` | string | optional |  |
+
+**Example:**
+```
+get_context_block(project_id="abc-123", mode="chat")
+```
+
+---
+
+## Notes
+
+
+### `add_note`
+
+Add a per-project wiki note. Use for setup instructions, gotchas, environment details, how-tos.
 
 
 | Parameter | Type | Required | Description |
@@ -271,10 +306,12 @@ Add a per-project wiki note (setup, gotcha, howto, env, ...). Free-form title/bo
 add_note(project_id="abc-123", title="Deploy note", body="Reminder: update env vars before deploy", tags="ops,deploy")
 ```
 
+---
 
-## `get_notes`
 
-List project notes (newest first). Optional ?tag substring filter.
+### `get_notes`
+
+List project notes (newest first). Filter by tag substring.
 
 
 | Parameter | Type | Required | Description |
@@ -287,8 +324,10 @@ List project notes (newest first). Optional ?tag substring filter.
 get_notes(project_id="abc-123")
 ```
 
+---
 
-## `delete_note`
+
+### `delete_note`
 
 Hard-delete a project note by id.
 
@@ -297,19 +336,44 @@ Hard-delete a project note by id.
 |-----------|------|----------|-------------|
 | `note_id` | string | required |  |
 
+---
 
-## `get_session_brief`
+## Projects
 
-Single-call session orientation — returns sprint focus, pending sprint items, recent tasks, any blocking failures, and pending HITL requests in a compact XML envelope (<500 tokens). Replaces the start_session + get_context_block two-call pattern for worker/automation sessions.
+
+### `create_project`
+
+Create a new Meridian project.
+
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `name` | string | required |  |
+
+**Example:**
+```
+create_project(name="my-app")
+```
+
+---
+
+## Legacy
+
+
+### `register_session`
+
+!!! note "Deprecated"
+    Use `start_session` instead — it registers the session **and** returns goal + context in one call.
 
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `project_id` | string | required |  |
-| `role` | string | optional | Controls verbosity. 'worker'=sprint+tasks only, 'planner'=full context. |
+| `session_name` | string | required |  |
+| `human_id` | string | optional |  |
+| `client` | string | optional |  |
 
 **Example:**
 ```
-get_session_brief(project_id="abc-123")
+register_session(project_id="abc-123", session_name="feature-x", human_id="alice")
 ```
-

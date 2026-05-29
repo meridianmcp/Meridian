@@ -3783,26 +3783,97 @@ async def update_usage_caps(request: Request) -> dict[str, Any]:
 
 @app.get("/mcp/tools-doc", response_class=PlainTextResponse)
 async def mcp_tools_doc() -> str:
-    """Generate markdown MCP tool reference from the live tool list."""
-    lines = ["# MCP Tool Reference\n", f"_Auto-generated. {len(_MCP_TOOLS_LIST)} tools._\n"]
-    for tool in _MCP_TOOLS_LIST:
-        lines.append(f"\n## `{tool['name']}`\n")
-        lines.append(f"{tool.get('description', '')}\n")
+    """Generate organized markdown MCP tool reference."""
+    tool_map = {t["name"]: t for t in _MCP_TOOLS_LIST}
+
+    def _render_tool(name: str, override_desc: str | None = None) -> list[str]:
+        tool = tool_map.get(name)
+        if not tool:
+            return []
+        out = [f"\n### `{name}`\n"]
+        desc = override_desc or tool.get("description", "")
+        out.append(f"{desc}\n")
         props = (tool.get("inputSchema") or {}).get("properties") or {}
         required = set((tool.get("inputSchema") or {}).get("required") or [])
         if props:
-            lines.append("\n| Parameter | Type | Required | Description |")
-            lines.append("|-----------|------|----------|-------------|")
+            out.append("\n| Parameter | Type | Required | Description |")
+            out.append("|-----------|------|----------|-------------|")
             for k, v in props.items():
                 req = "required" if k in required else "optional"
-                desc = (v.get("description") or "").replace("|", "\\|")
-                lines.append(f"| `{k}` | {v.get('type', 'string')} | {req} | {desc} |")
-        example = TOOL_EXAMPLES.get(tool["name"])
+                desc_col = (v.get("description") or "").replace("|", "\\|")
+                out.append(f"| `{k}` | {v.get('type', 'string')} | {req} | {desc_col} |")
+        example = TOOL_EXAMPLES.get(name)
         if example:
-            lines.append(f"\n**Example:**\n```\n{example}\n```")
-        lines.append("")
-    return "\n".join(lines)
+            out.append(f"\n**Example:**\n```\n{example}\n```")
+        out.append("")
+        out.append("---")
+        out.append("")
+        return out
 
+    n = len(_MCP_TOOLS_LIST)
+    lines: list[str] = [
+        "# MCP Tool Reference\n",
+        f"Meridian exposes **{n} tools** over MCP. They fall into two usage patterns:\n",
+        "**Planner sessions** (claude.ai, planning work) — `start_session` · `pin_decision` · `update_decision` · `add_note` · `get_context_block` · `generate_handoff`\n",
+        "**Executor sessions** (Claude Code, Cursor, automated workers) — `start_session` · `log_task` · `request_hitl` · `get_session_brief` · `generate_handoff`\n",
+        "---\n",
+        "## Starting a session\n",
+    ]
+    lines += _render_tool("start_session",
+        "Register a session and get the full project context (goal, sprint, recent tasks, decisions) in one call. "
+        "**Use this instead of `register_session`.**")
+    lines += _render_tool("get_session_brief",
+        "Compact session orientation (<500 tokens). Returns sprint focus, pending items, recent tasks, blocking "
+        "failures, and open HITL requests. Ideal for worker/automation sessions that don't need the full context.")
+    lines += ["## Tasks\n"]
+    lines += _render_tool("log_task",
+        "Log what this session did, is doing, or failed at. Call frequently — this is the primary signal in the "
+        "timeline and handoffs.\n\n"
+        "Valid statuses: `pending` · `in_progress` · `done` · `failed` · `backlog` · `future` · `backburner`")
+    lines += _render_tool("get_tasks")
+    lines += _render_tool("search_tasks")
+    lines += ["## Goal & sprint\n"]
+    lines += _render_tool("get_goal")
+    lines += _render_tool("set_goal")
+    lines += ["## Decisions\n"]
+    lines += _render_tool("pin_decision",
+        "Record an authoritative decision that supersedes earlier statements. Pinned decisions appear in every "
+        "session's context block.\n\n"
+        "Categories: `STRATEGIC` · `COMPETITIVE` · `TECHNICAL` · `TACTICAL` · `BUSINESS` · `PRODUCT` · `ARCHITECTURAL`")
+    lines += _render_tool("update_decision",
+        "Patch a pinned decision. Pass `new_title` + `new_body` to atomically supersede (creates a new row, marks "
+        "old as superseded). Otherwise patches in place.")
+    lines += _render_tool("get_pinned_decisions")
+    lines += ["## Human-in-the-loop (HITL)\n"]
+    lines += _render_tool("request_hitl",
+        "Surface a question to the human queue. `urgency='blocking'` pauses the session until answered — poll "
+        "`get_hitl_request` to resume. `normal`/`high` land in the dashboard without blocking.")
+    lines += _render_tool("get_hitl_request",
+        "Poll a HITL request for the human's answer. Returns the row including `status` "
+        "(`pending`/`answered`/`dismissed`) and `answer` text.")
+    lines += ["## Handoff & context\n"]
+    lines += _render_tool("generate_handoff",
+        "Generate a context handoff document. `mode='full'` writes the complete L0/L1/L2 handoff. `mode='delta'` "
+        "returns a compact session summary with completed items, pending items, and the next `/goal` string.")
+    lines += _render_tool("get_context_block",
+        "Return a compact plain-text context block (north star, sprint, pending sprint items, recent tasks, recent "
+        "decisions, active sessions). Use `mode='full'` to paste into a fresh Claude Code session; `mode='chat'` "
+        "for a shorter paste into claude.ai.")
+    lines += ["## Notes\n"]
+    lines += _render_tool("add_note",
+        "Add a per-project wiki note. Use for setup instructions, gotchas, environment details, how-tos.")
+    lines += _render_tool("get_notes", "List project notes (newest first). Filter by tag substring.")
+    lines += _render_tool("delete_note")
+    lines += ["## Projects\n"]
+    lines += _render_tool("create_project")
+    lines += ["## Legacy\n"]
+    lines += _render_tool("register_session",
+        "!!! note \"Deprecated\"\n    Use `start_session` instead — it registers the session **and** returns "
+        "goal + context in one call.")
+    # strip trailing ---
+    while lines and lines[-1] in ("---", ""):
+        lines.pop()
+    return "\n".join(lines)
 
 @app.get("/admin/health")
 async def admin_health_json(request: Request) -> dict[str, Any]:
