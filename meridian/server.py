@@ -726,11 +726,15 @@ app = FastAPI(
 # Routers — extracted route modules (routes/ package)
 # Include these BEFORE middleware so route matching is registered correctly.
 # ---------------------------------------------------------------------------
-from .routes.notes import router as _notes_router  # noqa: E402
-from .routes.hitl import router as _hitl_router    # noqa: E402
+from .routes.notes import router as _notes_router      # noqa: E402
+from .routes.hitl import router as _hitl_router        # noqa: E402
+from .routes.sprint import router as _sprint_router    # noqa: E402
+from .routes.sessions import router as _sessions_router  # noqa: E402
 
 app.include_router(_notes_router)
 app.include_router(_hitl_router)
+app.include_router(_sprint_router)
+app.include_router(_sessions_router)
 
 # ---------------------------------------------------------------------------
 # Password gate middleware
@@ -1587,174 +1591,7 @@ async def get_project_stats(
     return await db_module.get_project_stats(await _db(request), project_id, days)
 
 
-# ---------------------------------------------------------------------------
-# Sprint items (v1.1) — checklist alongside the free-text sprint field.
-# ---------------------------------------------------------------------------
-
-
-@app.get("/projects/{project_id}/sprint-items")
-async def list_sprint_items(
-    project_id: str, request: Request, status: str | None = None
-) -> list[dict[str, Any]]:
-    """List sprint items, optionally filtered by status."""
-    project = await db_module.get_project(await _db(request), project_id)
-    if project is None:
-        raise HTTPException(status_code=404, detail="project not found")
-    try:
-        return await db_module.get_sprint_items(
-            await _db(request), project_id, status=status
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=422, detail=str(exc))
-
-
-@app.post(
-    "/projects/{project_id}/sprint-items", status_code=201
-)
-async def add_sprint_item_endpoint(
-    project_id: str, body: dict[str, Any], request: Request
-) -> dict[str, Any]:
-    """Append a todo sprint item.
-
-    Body: ``{version, title, group?, human_id?}``.
-    ``group`` (alias ``item_group``) groups the item under a named objective
-    on the sprint board.
-    """
-    project = await db_module.get_project(await _db(request), project_id)
-    if project is None:
-        raise HTTPException(status_code=404, detail="project not found")
-    version = (body.get("version") or "").strip()
-    title = (body.get("title") or "").strip()
-    if not version or not title:
-        raise HTTPException(
-            status_code=422, detail="version and title are required"
-        )
-    group = body.get("group") or body.get("item_group") or None
-    human_id = body.get("human_id") or None
-    depends_on = body.get("depends_on") or None
-    failure_mode = body.get("failure_mode") or None
-    return await db_module.add_sprint_item(
-        await _db(request), project_id, version, title,
-        group=group, human_id=human_id,
-        depends_on=depends_on, failure_mode=failure_mode,
-    )
-
-
-@app.post("/projects/{project_id}/sprint-items/{item_id}/complete")
-async def complete_sprint_item_endpoint(
-    project_id: str, item_id: str, request: Request,
-    body: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    """Mark a sprint item ``done``. Optional body: ``{task_id}``."""
-    item = await db_module.complete_sprint_item(
-        await _db(request),
-        project_id,
-        item_id,
-        task_id=(body or {}).get("task_id"),
-    )
-    if item is None:
-        raise HTTPException(status_code=404, detail="sprint item not found")
-    await _update_roadmap_version_history(
-        await _db(request), project_id, item["version"], _REPO_ROOT
-    )
-    return item
-
-
-@app.post("/projects/{project_id}/sprint-items/{item_id}/skip")
-async def skip_sprint_item_endpoint(
-    project_id: str, item_id: str, request: Request,
-    body: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    """Mark a sprint item ``skipped``. Optional body: ``{reason}``."""
-    item = await db_module.skip_sprint_item(
-        await _db(request),
-        project_id,
-        item_id,
-        reason=(body or {}).get("reason"),
-    )
-    if item is None:
-        raise HTTPException(status_code=404, detail="sprint item not found")
-    return item
-
-
-@app.post("/projects/{project_id}/sprint-items/{item_id}/fail")
-async def fail_sprint_item_endpoint(
-    project_id: str, item_id: str, request: Request,
-    body: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    """Mark a sprint item ``failed``. Optional body: ``{reason}``."""
-    item = await db_module.fail_sprint_item(
-        await _db(request),
-        project_id,
-        item_id,
-        reason=(body or {}).get("reason"),
-    )
-    if item is None:
-        raise HTTPException(status_code=404, detail="sprint item not found")
-    return item
-
-
-@app.delete("/projects/{project_id}/sprint-items/{item_id}", status_code=204)
-async def delete_sprint_item_endpoint(
-    project_id: str, item_id: str, request: Request
-) -> None:
-    """Delete a sprint item permanently."""
-    db = await _db(request)
-    await db.execute(
-        "DELETE FROM sprint_items WHERE id = ? AND project_id = ?",
-        (item_id, project_id),
-    )
-    await db.commit()
-
-
-@app.patch("/projects/{project_id}/sprint-items/{item_id}")
-async def patch_sprint_item_endpoint(
-    project_id: str, item_id: str, body: dict[str, Any], request: Request
-) -> dict[str, Any]:
-    """Update editable fields (title, version) of a sprint item."""
-    title = body.get("title")
-    if title is not None:
-        title = title.strip()
-        if not title:
-            raise HTTPException(status_code=422, detail="title cannot be empty")
-    version = body.get("version")
-    if version is not None:
-        version = version.strip() or None
-    feedback_thumb = body.get("feedback_thumb")
-    if feedback_thumb is not None:
-        try:
-            feedback_thumb = int(feedback_thumb)
-            if feedback_thumb not in (-1, 1):
-                raise ValueError
-        except (ValueError, TypeError):
-            raise HTTPException(status_code=422, detail="feedback_thumb must be -1 or 1")
-    feedback_note = body.get("feedback_note")
-    item = await db_module.patch_sprint_item(
-        await _db(request), project_id, item_id, title=title, version=version,
-        feedback_thumb=feedback_thumb, feedback_note=feedback_note,
-    )
-    if item is None:
-        raise HTTPException(status_code=404, detail="sprint item not found")
-    return item
-
-
-@app.post("/projects/{project_id}/sprint-items/{item_id}/push")
-async def push_sprint_item_endpoint(
-    project_id: str, item_id: str, body: dict[str, Any], request: Request
-) -> dict[str, Any]:
-    """Push a sprint item to a future version. Body: ``{to_version}``."""
-    to_version = (body.get("to_version") or "").strip()
-    if not to_version:
-        raise HTTPException(status_code=422, detail="to_version is required")
-    try:
-        item = await db_module.push_sprint_item(
-            await _db(request), project_id, item_id, to_version
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=422, detail=str(exc))
-    if item is None:
-        raise HTTPException(status_code=404, detail="sprint item not found")
-    return item
+# Sprint item routes → meridian/routes/sprint.py
 
 
 @app.get("/projects/{project_id}/sessions", response_model=list[Session])
@@ -1974,69 +1811,7 @@ async def generate_handoff(
     return {"path": path, "content": content, "mode": mode}
 
 
-@app.post("/sessions/register", response_model=Session, status_code=201)
-async def register_session(
-    body: SessionRegister, request: Request
-) -> dict[str, Any]:
-    """Create a session row tied to a project."""
-    project = await db_module.get_project(await _db(request), body.project_id)
-    if project is None:
-        raise HTTPException(status_code=404, detail="project not found")
-    return await db_module.register_session(
-        await _db(request), body.project_id, body.name,
-        human_id=body.human_id,
-        agent_framework=body.agent_framework,
-    )
-
-
-@app.post("/sessions/{session_id}/close")
-async def close_session(session_id: str, request: Request) -> dict[str, str]:
-    """Mark a session closed."""
-    _req_db = await _db(request)
-    async with _req_db.execute(
-        "SELECT id, project_id FROM sessions WHERE id = ?", (session_id,)
-    ) as cur:
-        row = await cur.fetchone()
-    if row is None:
-        raise HTTPException(status_code=404, detail="session not found")
-    project_id = row["project_id"]
-    await db_module.close_session(_req_db, session_id)
-    try:
-        await db_module.summarize_session(await _db(request), session_id)
-    except Exception:
-        pass
-    try:
-        await db_module.auto_capture_session(await _db(request), project_id, session_id)
-    except Exception:
-        pass
-    await _regenerate_claude_md(await _db(request), project_id, _REPO_ROOT)
-    # v2.5 — auto-save handoff on session close so the file is always fresh.
-    async def _auto_save_handoff() -> None:
-        try:
-            await asyncio.wait_for(
-                handoff_module.generate_handoff(
-                    await _db(request), project_id, request.app.state.data_dir
-                ),
-                timeout=30.0,
-            )
-        except Exception:  # noqa: BLE001 — never block session close
-            pass
-    asyncio.create_task(_auto_save_handoff())
-    return {"status": "closed", "session_id": session_id}
-
-
-@app.post("/sessions/{session_id}/heartbeat")
-async def heartbeat_session(
-    session_id: str, request: Request
-) -> dict[str, str]:
-    """v0.5.1 — touch ``last_seen`` to keep this session out of the
-    idle sweep. Long-running workers call this every few minutes so
-    the 30 minute TTL doesn't expire them while they're still alive.
-    404 when the session id is unknown or already closed."""
-    ok = await db_module.heartbeat_session(await _db(request), session_id)
-    if not ok:
-        raise HTTPException(status_code=404, detail="session not found")
-    return {"status": "ok", "session_id": session_id}
+# Session lifecycle routes → meridian/routes/sessions.py
 
 
 @app.post("/tasks", response_model=Task, status_code=201)
