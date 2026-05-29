@@ -21,47 +21,22 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
-# Version — read from pixi.toml so it never goes stale
+# Shared helpers (templates, _db, _hosted_mode, etc.) live in _deps.py so
+# that routes/ modules can import them without circular-importing server.py.
 # ---------------------------------------------------------------------------
-def _read_version() -> str:
-    # 1. Explicit env var (set in Dockerfile or fly secrets)
-    v = os.environ.get("MERIDIAN_VERSION", "")
-    if v:
-        return v
-    # 2. pixi.toml at repo root (local dev)
-    try:
-        import tomllib
-        _root = Path(__file__).parent.parent
-        with open(_root / "pixi.toml", "rb") as _f:
-            data = tomllib.load(_f)
-            return data.get("workspace", {}).get("version", "") or data.get("version", "dev")
-    except Exception:
-        return "1.0.0-alpha"
-
-_VERSION = _read_version()
-
-
-def _read_git_sha() -> str:
-    """Short git SHA for cache-busting static assets — falls back to version on errors."""
-    env_sha = os.environ.get("MERIDIAN_GIT_SHA", "")
-    if env_sha:
-        return env_sha[:12]
-    try:
-        import subprocess
-        out = subprocess.check_output(
-            ["git", "rev-parse", "--short=12", "HEAD"],
-            cwd=Path(__file__).parent.parent,
-            stderr=subprocess.DEVNULL,
-            text=True,
-            timeout=2,
-        ).strip()
-        return out or _VERSION
-    except Exception:
-        return _VERSION
-
-
-_GIT_SHA = _read_git_sha()
-_ASSET_VERSION = f"{_VERSION}-{_GIT_SHA}" if _GIT_SHA != _VERSION else _VERSION
+from ._deps import (
+    _VERSION,
+    _ASSET_VERSION,
+    _GIT_SHA,
+    _resource_path,
+    _templates,
+    _hosted_mode,
+    _DEMO_CONTEXT_COOKIE,
+    _tenant_db_cache,
+    _open_tenant_db_by_id,
+    _db,
+    _data_dir,
+)
 
 
 def _load_meridian_md() -> str:
@@ -748,6 +723,16 @@ app = FastAPI(
 )
 
 # ---------------------------------------------------------------------------
+# Routers — extracted route modules (routes/ package)
+# Include these BEFORE middleware so route matching is registered correctly.
+# ---------------------------------------------------------------------------
+from .routes.notes import router as _notes_router  # noqa: E402
+from .routes.hitl import router as _hitl_router    # noqa: E402
+
+app.include_router(_notes_router)
+app.include_router(_hitl_router)
+
+# ---------------------------------------------------------------------------
 # Password gate middleware
 # ---------------------------------------------------------------------------
 _GATE_COOKIE = "meridian_site_access"
@@ -883,135 +868,17 @@ async def _demo_read_only_middleware(request: Request, call_next):
 # v1.0.2 — Static files + Jinja2 templates
 # ---------------------------------------------------------------------------
 
-
-def _resource_path(relative: str) -> str:
-    """Resolve a resource path relative to the package root.
-
-    Works in dev (relative to repo) and in frozen PyInstaller exe.
-    In a frozen exe, ``sys._MEIPASS`` is the temp directory where PyInstaller
-    unpacks the bundle; in development it falls back to the repo root
-    (two levels above this file's directory).
-    """
-    import sys
-    base = getattr(sys, "_MEIPASS", Path(__file__).parent.parent)
-    return str(Path(base) / relative)
-
-
 app.mount(
     "/static",
     StaticFiles(directory=_resource_path("meridian/static")),
     name="static",
 )
-_templates = Jinja2Templates(directory=_resource_path("meridian/templates"))
-
-
-def _hosted_mode() -> bool:
-    """Return True when running as a hosted service (MERIDIAN_HOSTED=1)."""
-    return os.environ.get("MERIDIAN_HOSTED", "").lower() in ("1", "true", "yes")
-
 
 # Per-tenant DB connections cached by tenant_id (opened on first use, never closed).
-_tenant_db_cache: dict[str, Any] = {}
+# The dict lives in _deps.py; the import above brings it into this namespace.
 
 
-async def _open_tenant_db_by_id(request: Request, tenant_id: str) -> Any:
-    """Return the cached DB for tenant_id, opening it if not yet cached.
-
-    URL resolution order:
-      1. tenant.neon_db_url from auth DB (encrypted, normal path)
-      2. MERIDIAN_AUTH_DB env var — Fly secret set for the admin tenant's
-         personal project DB (ep-mute-hall).  Used when neon_db_url is not
-         yet written to the tenant row (e.g. manual provisioning workflow).
-    """
-    if tenant_id in _tenant_db_cache:
-        return _tenant_db_cache[tenant_id]
-    from . import db as db_module
-    from .pg_adapter import open_pg_connection
-    auth_db = request.app.state.db
-    tenant = await db_module.get_tenant_by_id(auth_db, tenant_id)
-    if not tenant:
-        raise HTTPException(status_code=401, detail="tenant not found")
-
-    url: str | None = None
-
-    # Primary: encrypted neon_db_url in the tenant row
-    if tenant.get("neon_db_url"):
-        url = db_module.decrypt_field(tenant["neon_db_url"]) or None
-
-    # Fallback: MERIDIAN_AUTH_DB env var (admin tenant, manually provisioned)
-    if not url:
-        url = os.environ.get("MERIDIAN_AUTH_DB") or None
-
-    if not url:
-        raise HTTPException(
-            status_code=503,
-            detail="tenant database not provisioned — set MERIDIAN_AUTH_DB or run set_tenant_db.py",
-        )
-    conn = await open_pg_connection(url)
-    _tenant_db_cache[tenant_id] = conn
-    return conn
-
-
-async def _db(request: Request) -> Any:
-    """Return the active DB for this request.
-
-    - Demo cookie → demo DB
-    - Hosted mode + session cookie → tenant's own Neon DB (cached)
-    - Hosted mode + Bearer token → tenant's own Neon DB (cached)
-    - Otherwise → app.state.db
-    """
-    # Per-request cache so repeated await _db(request) calls within one handler are free.
-    cached = getattr(request.state, "_db_conn", None)
-    if cached is not None:
-        return cached
-
-    if request.cookies.get(_DEMO_CONTEXT_COOKIE):
-        demo_db = getattr(request.app.state, "demo_db", None)
-        if demo_db is not None:
-            request.state._db_conn = demo_db
-            return demo_db
-        # HARD FAIL — never fall through to production DB under demo cookie
-        raise HTTPException(
-            status_code=503,
-            detail="Demo DB not available. Set MERIDIAN_DEMO_DB_URL to enable the demo.",
-        )
-
-    if _hosted_mode():
-        from .hosted import _SESSION_COOKIE, _read_session_cookie
-        from . import db as db_module
-
-        # Try session cookie first
-        cookie_val = request.cookies.get(_SESSION_COOKIE)
-        if cookie_val:
-            session_id = _read_session_cookie(cookie_val)
-            if session_id:
-                auth_db = request.app.state.db
-                session = await db_module.get_user_session(auth_db, session_id)
-                if session:
-                    conn = await _open_tenant_db_by_id(request, session["tenant_id"])
-                    request.state._db_conn = conn
-                    return conn
-
-        # Try Bearer token
-        auth_header = request.headers.get("authorization", "")
-        if auth_header.startswith("Bearer "):
-            token = auth_header[7:]
-            token_hash = hashlib.sha256(token.encode()).hexdigest()
-            auth_db = request.app.state.db
-            tenant = await db_module.get_tenant_from_token_hash(auth_db, token_hash)
-            if tenant:
-                conn = await _open_tenant_db_by_id(request, tenant["id"])
-                request.state._db_conn = conn
-                return conn
-
-    conn = request.app.state.db
-    request.state._db_conn = conn
-    return conn
-
-
-def _data_dir(request: Request) -> str:
-    """Pull the active data directory off ``app.state``."""
-    return request.app.state.data_dir
+# _open_tenant_db_by_id, _db, _data_dir — imported from ._deps above.
 
 
 # ---------------------------------------------------------------------------
@@ -2926,150 +2793,8 @@ async def consolidate_decisions_ai(
 # ---------------------------------------------------------------------------
 
 
-@app.get("/hitl")
-async def list_all_hitl(
-    request: Request, status: str = "pending", limit: int = 50
-) -> list[dict[str, Any]]:
-    """Pending HITL requests across all projects (top-level dashboard panel)."""
-    try:
-        return await db_module.list_hitl_requests(
-            await _db(request), None,
-            status=status if status != "all" else None,
-            limit=limit,
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-
-@app.get("/projects/{project_id}/hitl")
-async def list_project_hitl(
-    project_id: str, request: Request, status: str = "pending", limit: int = 50
-) -> list[dict[str, Any]]:
-    """HITL requests scoped to a single project."""
-    try:
-        return await db_module.list_hitl_requests(
-            await _db(request), project_id,
-            status=status if status != "all" else None,
-            limit=limit,
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-
-@app.post("/projects/{project_id}/hitl", status_code=201)
-async def create_hitl_endpoint(
-    project_id: str, body: dict[str, Any], request: Request
-) -> dict[str, Any]:
-    """Create a HITL request. Sessions paused on blocking should POST then poll
-    GET /hitl/{id} until status='answered'."""
-    project = await db_module.get_project(await _db(request), project_id)
-    if project is None:
-        raise HTTPException(status_code=404, detail="project not found")
-    question = (body.get("question") or "").strip()
-    if not question:
-        raise HTTPException(status_code=400, detail="question required")
-    try:
-        return await db_module.request_hitl(
-            await _db(request), project_id, question,
-            session_id=body.get("session_id"),
-            context=body.get("context"),
-            urgency=body.get("urgency", "normal"),
-            assigned_to=body.get("assigned_to"),
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-
-@app.get("/hitl/{request_id}")
-async def get_hitl_endpoint(request_id: str, request: Request) -> dict[str, Any]:
-    """Single HITL request lookup — sessions poll this to get the answer."""
-    r = await db_module.get_hitl_request(await _db(request), request_id)
-    if r is None:
-        raise HTTPException(status_code=404, detail="hitl request not found")
-    return r
-
-
-@app.patch("/hitl/{request_id}")
-async def patch_hitl_endpoint(
-    request_id: str, body: dict[str, Any], request: Request
-) -> dict[str, Any]:
-    """Answer or dismiss a HITL request."""
-    db = await _db(request)
-    action = (body.get("action") or "answer").lower()
-    if action == "answer":
-        answer = body.get("answer", "").strip()
-        if not answer:
-            raise HTTPException(status_code=400, detail="answer required")
-        result = await db_module.answer_hitl_request(
-            db, request_id, answer, answered_by=body.get("answered_by")
-        )
-    elif action == "dismiss":
-        result = await db_module.dismiss_hitl_request(db, request_id)
-    else:
-        raise HTTPException(status_code=400, detail="action must be 'answer' or 'dismiss'")
-    if result is None:
-        raise HTTPException(status_code=404, detail="hitl request not found")
-    return result
-
-
-# ---------------------------------------------------------------------------
-# v0.9 — project_notes (per-project wiki)
-# ---------------------------------------------------------------------------
-
-
-@app.get("/projects/{project_id}/notes")
-async def list_project_notes_endpoint(
-    project_id: str, request: Request, tag: str | None = None
-) -> list[dict[str, Any]]:
-    """Project notes (newest first). ``?tag=X`` filters by substring match."""
-    project = await db_module.get_project(await _db(request), project_id)
-    if project is None:
-        raise HTTPException(status_code=404, detail="project not found")
-    return await db_module.get_project_notes(await _db(request), project_id, tag=tag)
-
-
-@app.post("/projects/{project_id}/notes", status_code=201)
-async def create_project_note_endpoint(
-    project_id: str, body: dict[str, Any], request: Request
-) -> dict[str, Any]:
-    """Create a new note. Body: {title, body, tags?}."""
-    project = await db_module.get_project(await _db(request), project_id)
-    if project is None:
-        raise HTTPException(status_code=404, detail="project not found")
-    title = (body.get("title") or "").strip()
-    text = (body.get("body") or "").strip()
-    if not title or not text:
-        raise HTTPException(status_code=400, detail="title and body required")
-    return await db_module.add_project_note(
-        await _db(request), project_id, title, text, body.get("tags"),
-    )
-
-
-@app.patch("/projects/{project_id}/notes/{note_id}")
-async def update_project_note_endpoint(
-    project_id: str, note_id: str, body: dict[str, Any], request: Request
-) -> dict[str, Any]:
-    """Patch title/body/tags."""
-    result = await db_module.update_project_note(
-        await _db(request), note_id,
-        title=body.get("title"),
-        body=body.get("body"),
-        tags=body.get("tags"),
-    )
-    if result is None:
-        raise HTTPException(status_code=404, detail="note not found")
-    return result
-
-
-@app.delete("/projects/{project_id}/notes/{note_id}", status_code=204)
-async def delete_project_note_endpoint(
-    project_id: str, note_id: str, request: Request
-) -> Response:
-    """Hard-delete a note. Returns 204 or 404."""
-    ok = await db_module.delete_project_note(await _db(request), note_id)
-    if not ok:
-        raise HTTPException(status_code=404, detail="note not found")
-    return Response(status_code=204)
+# HITL routes → meridian/routes/hitl.py
+# Notes routes → meridian/routes/notes.py
 
 
 # ---------------------------------------------------------------------------
