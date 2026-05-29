@@ -1074,7 +1074,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     The caller owns the returned connection and is responsible for closing it.
     """
     if db_path.startswith(("postgresql://", "postgres://")):
-        from .pg_adapter import init_pg_db  # local import keeps SQLite path fast
+        from ..pg_adapter import init_pg_db  # local import keeps SQLite path fast
 
         return await init_pg_db(db_path)  # type: ignore[return-value]
 
