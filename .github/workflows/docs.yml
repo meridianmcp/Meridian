@@ -35,4 +35,4 @@ jobs:
       - name: Build and deploy docs
         run: |
           echo "docs.usemeridian.us" > docs/CNAME
-          mkdocs gh-deploy --force --clean --verbose --remote-name https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/meridianmcp/meridian-docs.git
+          mkdocs gh-deploy --force --clean --verbose --remote-name https://x-access-token:${{ secrets.DOCS_DEPLOY_TOKEN }}@github.com/meridianmcp/meridian-docs.git
