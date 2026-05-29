@@ -23,6 +23,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -36,6 +37,7 @@ jobs:
         env:
           DOCS_TOKEN: ${{ secrets.DOCS_DEPLOY_TOKEN }}
         run: |
-          git config --global url."https://x-access-token:${DOCS_TOKEN}@github.com/meridianmcp/".insteadOf "https://github.com/meridianmcp/"
+          git config --global credential.helper store
+          printf "https://x-access-token:%s@github.com\n" "$DOCS_TOKEN" > ~/.git-credentials
           echo "docs.usemeridian.us" > docs/CNAME
           mkdocs gh-deploy --force --clean --verbose --remote-name https://github.com/meridianmcp/meridian-docs.git
