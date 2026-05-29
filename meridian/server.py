@@ -1,4 +1,4 @@
-"""FastAPI HTTP server and MCP stdio server for Meridian.
+﻿"""FastAPI HTTP server and MCP stdio server for Meridian.
 
 This module exposes two surfaces backed by the same async SQLite database:
 
@@ -726,15 +726,19 @@ app = FastAPI(
 # Routers — extracted route modules (routes/ package)
 # Include these BEFORE middleware so route matching is registered correctly.
 # ---------------------------------------------------------------------------
-from .routes.notes import router as _notes_router      # noqa: E402
-from .routes.hitl import router as _hitl_router        # noqa: E402
-from .routes.sprint import router as _sprint_router    # noqa: E402
-from .routes.sessions import router as _sessions_router  # noqa: E402
+from .routes.notes import router as _notes_router          # noqa: E402
+from .routes.hitl import router as _hitl_router            # noqa: E402
+from .routes.sprint import router as _sprint_router        # noqa: E402
+from .routes.sessions import router as _sessions_router    # noqa: E402
+from .routes.tasks import router as _tasks_router          # noqa: E402
+from .routes.decisions import router as _decisions_router  # noqa: E402
 
 app.include_router(_notes_router)
 app.include_router(_hitl_router)
 app.include_router(_sprint_router)
 app.include_router(_sessions_router)
+app.include_router(_tasks_router)
+app.include_router(_decisions_router)
 
 # ---------------------------------------------------------------------------
 # Password gate middleware
@@ -1614,153 +1618,7 @@ async def get_sessions(
     )
 
 
-@app.get("/projects/{project_id}/tasks", response_model=list[Task])
-async def get_tasks(
-    project_id: str, request: Request, limit: int = 20
-) -> list[dict[str, Any]]:
-    """List recent tasks for a project, newest first."""
-    project = await db_module.get_project(await _db(request), project_id)
-    if project is None:
-        raise HTTPException(status_code=404, detail="project not found")
-    return await db_module.get_tasks(await _db(request), project_id, limit=limit)
-
-
-@app.get("/projects/{project_id}/tasks/search")
-async def search_tasks_http(
-    project_id: str, request: Request, q: str = "", limit: int = 5
-) -> list[dict[str, Any]]:
-    """GET /projects/{id}/tasks/search?q=...&limit=5 — text search over task descriptions."""
-    if not q:
-        return []
-    return await db_module.search_tasks(await _db(request), project_id, q, limit)
-
-
-@app.get("/projects/{project_id}/tasks/claimable", response_model=list[Task])
-async def get_claimable_tasks(
-    project_id: str, request: Request, limit: int = 20
-) -> list[dict[str, Any]]:
-    """List unclaimed pending tasks for a project (v0.3.3).
-
-    Workers poll this endpoint to find work that isn't already locked
-    by another session.
-    """
-    project = await db_module.get_project(await _db(request), project_id)
-    if project is None:
-        raise HTTPException(status_code=404, detail="project not found")
-    return await db_module.get_claimable_tasks(
-        await _db(request), project_id, limit=limit
-    )
-
-
-async def _claim_task_result(
-    db: aiosqlite.Connection,
-    project_id: str,
-    task_or_item_id: str,
-    session_id: str,
-) -> dict[str, Any]:
-    """Claim a task row, resolving sprint-item ids when provided."""
-    sprint_item = await db_module.get_sprint_item(db, task_or_item_id)
-    task = None
-    sprint_item_id: str | None = None
-    if sprint_item is not None and sprint_item.get("project_id") == project_id:
-        sprint_item_id = sprint_item["id"]
-    else:
-        task = await db_module.get_task(db, task_or_item_id)
-        if task is None or task.get("project_id") != project_id:
-            task = None
-        elif task.get("sprint_item_id"):
-            sprint_item_id = task["sprint_item_id"]
-            sprint_item = await db_module.get_sprint_item(db, sprint_item_id)
-
-    if sprint_item_id:
-        blocking = await db_module.get_blocking_dependency_for_sprint_item(
-            db, sprint_item_id
-        )
-        if blocking is not None:
-            return {
-                "task_id": task["id"] if task else task_or_item_id,
-                "claimed": False,
-                "claimed_by": task["claimed_by"] if task else None,
-                "sprint_item_id": sprint_item_id,
-                "error": "dependency_not_met",
-                "blocking_item_id": blocking["id"],
-                "blocking_item_title": blocking.get("title"),
-            }
-        if task is None:
-            task = await db_module.get_open_task_for_sprint_item(db, sprint_item_id)
-        if task is None:
-            assert sprint_item is not None
-            task = await db_module.log_task(
-                db,
-                session_id,
-                project_id,
-                sprint_item["title"],
-                "pending",
-                sprint_item_id=sprint_item_id,
-            )
-    elif task is None:
-        return {
-            "task_id": task_or_item_id,
-            "claimed": False,
-            "claimed_by": None,
-        }
-
-    claimed = await db_module.claim_task(db, task["id"], session_id)
-    if claimed is None:
-        existing = await db_module.get_task(db, task["id"])
-        return {
-            "task_id": task["id"],
-            "claimed": False,
-            "claimed_by": existing["claimed_by"] if existing else None,
-            "sprint_item_id": sprint_item_id,
-        }
-    if sprint_item_id and sprint_item is not None and sprint_item.get("status") in (
-        "pending",
-        "todo",
-    ):
-        await db_module.start_sprint_item(db, project_id, sprint_item_id)
-    return {
-        "task_id": claimed["id"],
-        "claimed": True,
-        "claimed_by": claimed["claimed_by"],
-        "sprint_item_id": sprint_item_id,
-    }
-
-
-@app.post(
-    "/projects/{project_id}/tasks/claim", response_model=ClaimTaskResponse
-)
-async def claim_task_endpoint(
-    project_id: str, body: ClaimTaskRequest, request: Request
-) -> dict[str, Any]:
-    """Atomically claim a pending task. Returns ``claimed=False`` when
-    another worker holds the lock — the worker should try the next row."""
-    project = await db_module.get_project(await _db(request), project_id)
-    if project is None:
-        raise HTTPException(status_code=404, detail="project not found")
-    return await _claim_task_result(
-        await _db(request), project_id, body.task_id, body.session_id
-    )
-
-
-@app.post("/projects/{project_id}/tasks/release")
-async def release_task_endpoint(
-    project_id: str, body: ClaimTaskRequest, request: Request
-) -> dict[str, Any]:
-    """Release a previously-claimed task. 404 when no claim is held
-    by the given session."""
-    project = await db_module.get_project(await _db(request), project_id)
-    if project is None:
-        raise HTTPException(status_code=404, detail="project not found")
-    released = await db_module.release_task(
-        await _db(request), body.task_id, body.session_id
-    )
-    if not released:
-        raise HTTPException(
-            status_code=404,
-            detail="task not claimed by this session",
-        )
-    return {"task_id": body.task_id, "released": True}
+# Tasks + claim/release routes → meridian/routes/tasks.py
 
 
 @app.post("/projects/{project_id}/handoff", response_model=HandoffResult)
@@ -1814,53 +1672,7 @@ async def generate_handoff(
 # Session lifecycle routes → meridian/routes/sessions.py
 
 
-@app.post("/tasks", response_model=Task, status_code=201)
-async def create_task(body: TaskCreate, request: Request) -> dict[str, Any]:
-    """Append a task-log entry."""
-    _req_db = await _db(request)
-    project = await db_module.get_project(_req_db, body.project_id)
-    if project is None:
-        raise HTTPException(status_code=404, detail="project not found")
-    async with _req_db.execute(
-        "SELECT id FROM sessions WHERE id = ?", (body.session_id,)
-    ) as cur:
-        row = await cur.fetchone()
-    if row is None:
-        raise HTTPException(status_code=404, detail="session not found")
-    return await db_module.log_task(
-        _req_db,
-        body.session_id,
-        body.project_id,
-        body.description,
-        body.status,
-        parent_task_id=body.parent_task_id,
-    )
-
-
-@app.patch("/tasks/{task_id}", response_model=Task)
-async def patch_task(
-    task_id: str, body: TaskUpdate, request: Request
-) -> dict[str, Any]:
-    """Update a task's status and/or description in place.
-
-    Used by the dashboard to flip HITL tasks to done/failed when the
-    human replies. 404 when the id is unknown, 422 on invalid status.
-    """
-    existing = await db_module.get_task(await _db(request), task_id)
-    if existing is None:
-        raise HTTPException(status_code=404, detail="task not found")
-    try:
-        updated = await db_module.update_task(
-            await _db(request),
-            task_id,
-            status=body.status,
-            description=body.description,
-            project_id=existing["project_id"],
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=422, detail=str(exc))
-    assert updated is not None
-    return updated
+# /tasks POST + PATCH → meridian/routes/tasks.py
 
 
 @app.delete("/projects/{project_id}/chat/history", status_code=204)
@@ -2358,211 +2170,7 @@ async def get_project_context(
     }
 
 
-# ---------------------------------------------------------------------------
-# v2.4 — Pinned decisions (editable constitution)
-# ---------------------------------------------------------------------------
-
-
-@app.get("/projects/{project_id}/decisions-pinned")
-async def list_pinned_decisions_endpoint(
-    project_id: str, request: Request, include_superseded: bool = False
-) -> list[dict[str, Any]]:
-    """Active pinned decisions for a project (newest first).
-
-    ``?include_superseded=true`` returns the full history. Default
-    filters to ``status='active'`` so the dashboard renders just the
-    live constitution.
-    """
-    project = await db_module.get_project(await _db(request), project_id)
-    if project is None:
-        raise HTTPException(status_code=404, detail="project not found")
-    return await db_module.get_pinned_decisions(
-        await _db(request), project_id, include_superseded=include_superseded
-    )
-
-
-@app.post("/projects/{project_id}/decisions-pinned", status_code=201)
-async def create_pinned_decision_endpoint(
-    project_id: str, body: dict[str, Any], request: Request
-) -> dict[str, Any]:
-    """Create a new pinned decision."""
-    project = await db_module.get_project(await _db(request), project_id)
-    if project is None:
-        raise HTTPException(status_code=404, detail="project not found")
-    title = (body.get("title") or "").strip()
-    text = (body.get("body") or "").strip()
-    category = body.get("category", "TECHNICAL")
-    if not title or not text:
-        raise HTTPException(status_code=400, detail="title and body required")
-    try:
-        return await db_module.pin_decision(
-            await _db(request), project_id, title, text, category
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-
-@app.patch("/projects/{project_id}/decisions-pinned/{decision_id}")
-async def update_pinned_decision_endpoint(
-    project_id: str, decision_id: str, body: dict[str, Any], request: Request
-) -> dict[str, Any]:
-    """Patch fields, or supersede (pass new_title + new_body to atomically retire+create)."""
-    db = await _db(request)
-    new_title = body.get("new_title")
-    new_body = body.get("new_body")
-    if new_title and new_body:
-        try:
-            return await db_module.supersede_pinned_decision(
-                db, decision_id, new_title, new_body, body.get("category")
-            )
-        except ValueError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
-    result = await db_module.update_pinned_decision(
-        db, decision_id,
-        body=body.get("body"),
-        title=body.get("title"),
-        category=body.get("category"),
-        status=body.get("status"),
-        superseded_by=body.get("superseded_by"),
-    )
-    if result is None:
-        raise HTTPException(status_code=404, detail="decision not found")
-    return result
-
-
-@app.post("/projects/{project_id}/decisions-pinned/replace-all", status_code=201)
-async def replace_all_pinned_decisions(
-    project_id: str, body: dict[str, Any], request: Request
-) -> list[dict[str, Any]]:
-    """Atomically replace all active pinned decisions with a new set.
-
-    Used by the AI consolidation flow: mark all existing active decisions as
-    superseded, then create the new consolidated set.
-    """
-    decisions = body.get("decisions", [])
-    if not decisions:
-        raise HTTPException(status_code=400, detail="decisions list required")
-    db = await _db(request)
-    existing = await db_module.get_pinned_decisions(db, project_id)
-    for d in existing:
-        await db_module.update_pinned_decision(db, d["id"], status="superseded")
-    created = []
-    for dec in decisions:
-        cat = dec.get("category", "TECHNICAL")
-        try:
-            row = await db_module.pin_decision(
-                db, project_id,
-                title=dec.get("title", "Decision"),
-                body=dec.get("body", ""),
-                category=cat,
-            )
-        except ValueError:
-            row = await db_module.pin_decision(
-                db, project_id, dec.get("title", "Decision"), dec.get("body", ""), "TECHNICAL"
-            )
-        created.append(row)
-    return created
-
-
-@app.post("/projects/{project_id}/decisions-pinned/archive-oldest")
-async def archive_oldest_pinned_decisions(
-    project_id: str, body: dict[str, Any], request: Request
-) -> dict[str, Any]:
-    """Archive the oldest active pinned decisions without creating replacements."""
-    raw_count = body.get("count", 1)
-    try:
-        count = max(1, int(raw_count))
-    except (TypeError, ValueError):
-        raise HTTPException(status_code=400, detail="count must be an integer") from None
-    db = await _db(request)
-    decisions = await db_module.get_pinned_decisions(db, project_id)
-    if not decisions:
-        return {"archived": 0}
-    to_archive = sorted(
-        decisions,
-        key=lambda d: ((d.get("created_at") or ""), (d.get("id") or "")),
-    )[:count]
-    for decision in to_archive:
-        await db_module.update_pinned_decision(
-            db, decision["id"], status="superseded"
-        )
-    return {"archived": len(to_archive)}
-
-
-@app.post("/projects/{project_id}/decisions/consolidate")
-async def consolidate_decisions_ai(
-    project_id: str, body: dict[str, Any], request: Request
-) -> dict[str, Any]:
-    """Call an external LLM to deduplicate and consolidate pinned decisions.
-
-    The API key is used only for this request and never stored.
-    Returns a preview ``{consolidated: [{title, category, body}]}`` for the
-    user to review before applying via ``replace-all``.
-    """
-    import json as _json
-    import httpx as _httpx
-
-    api_key = (body.get("api_key") or "").strip()
-    model = body.get("model") or "claude-haiku-4-5-20251001"
-    if not api_key:
-        raise HTTPException(status_code=400, detail="api_key required")
-    db = await _db(request)
-    decisions = await db_module.get_pinned_decisions(db, project_id)
-    if not decisions:
-        raise HTTPException(status_code=400, detail="no pinned decisions to consolidate")
-
-    decisions_text = "\n\n".join(
-        f"[{d.get('category', 'TECHNICAL')}] {d.get('title', '')}\n{d.get('body', '')}"
-        for d in decisions
-    )
-    prompt = (
-        "You are a technical decision consolidator. The following are pinned architectural decisions "
-        "for a software project. Some may be duplicates or overlap.\n\n"
-        "Your task:\n"
-        "1. Deduplicate: merge decisions that cover the same topic into one\n"
-        "2. Keep all genuinely distinct decisions intact\n"
-        "3. Preserve category labels (STRATEGIC, TECHNICAL, PRODUCT, BUSINESS, COMPETITIVE, ARCHITECTURAL, TACTICAL)\n"
-        "4. Keep each decision concise (1-3 paragraphs max)\n\n"
-        'Return ONLY valid JSON in this exact format, no other text:\n'
-        '{"decisions": [{"title": "...", "category": "TECHNICAL", "body": "..."}]}\n\n'
-        f"Decisions to consolidate:\n{decisions_text}"
-    )
-    try:
-        async with _httpx.AsyncClient(timeout=60.0) as client:
-            if model.startswith("claude"):
-                r = await client.post(
-                    "https://api.anthropic.com/v1/messages",
-                    headers={
-                        "x-api-key": api_key,
-                        "anthropic-version": "2023-06-01",
-                        "content-type": "application/json",
-                    },
-                    json={"model": model, "max_tokens": 4096,
-                          "messages": [{"role": "user", "content": prompt}]},
-                )
-                r.raise_for_status()
-                text = r.json()["content"][0]["text"]
-            else:
-                base_url = (body.get("base_url") or "https://api.openai.com").rstrip("/")
-                r = await client.post(
-                    f"{base_url}/v1/chat/completions",
-                    headers={"Authorization": f"Bearer {api_key}", "content-type": "application/json"},
-                    json={"model": model, "messages": [{"role": "user", "content": prompt}]},
-                )
-                r.raise_for_status()
-                text = r.json()["choices"][0]["message"]["content"]
-
-        if "```" in text:
-            parts = text.split("```")
-            text = parts[1][4:] if parts[1].startswith("json") else parts[1]
-        consolidated = _json.loads(text.strip()).get("decisions", [])
-        return {"consolidated": consolidated, "original_count": len(decisions)}
-    except _httpx.HTTPStatusError as exc:
-        raise HTTPException(status_code=502, detail=f"AI API error {exc.response.status_code}: {exc.response.text[:200]}") from exc
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"AI API error: {exc}") from exc
-
-
+# Decisions routes → meridian/routes/decisions.py
 # ---------------------------------------------------------------------------
 # v2.4 — HITL (human-in-the-loop) queue
 # ---------------------------------------------------------------------------
@@ -3486,12 +3094,7 @@ async def git_status() -> dict[str, Any]:
         return {"ok": False, "error": str(e), "behind": 0, "ahead": 0}
 
 
-@app.delete("/tasks/{task_id}", status_code=204)
-async def delete_task(task_id: str, request: Request) -> None:
-    """Delete a single task_log entry by ID. Permanent, no undo."""
-    db = await _db(request)
-    await db.execute("DELETE FROM task_log WHERE id = ?", (task_id,))
-    await db.commit()
+# DELETE /tasks/{task_id} → meridian/routes/tasks.py
 
 @app.post("/tasks/enqueue", response_model=Task, status_code=202)
 async def enqueue_task(body: EnqueueTask, request: Request) -> dict[str, Any]:
