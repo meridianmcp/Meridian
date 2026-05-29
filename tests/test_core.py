@@ -5106,7 +5106,7 @@ def test_landing_page_footer_uses_meridian_email(client):
     r = client.get("/")
     assert r.status_code == 200
     assert "hello@usemeridian.us" in r.text
-    assert "hello@usemeridian.us" not in r.text
+    assert "ajc3xc@" not in r.text  # no personal emails in landing page
 
 
 # ---------------------------------------------------------------------------

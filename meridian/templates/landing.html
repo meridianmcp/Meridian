@@ -255,6 +255,9 @@
   .self-host .self-host-row {
     display: flex; gap: .8rem; flex-wrap: wrap;
   }
+  .self-host-alt {
+    color: var(--muted); font-size: 13px; margin: 16px 0 8px;
+  }
 
   /* Pricing */
   .pricing-grid {
@@ -524,7 +527,19 @@
 
 <span class="h"># dashboard → http://localhost:7878/dashboard</span>
 <span class="h"># MCP endpoint → claude-code, cursor, windsurf all auto-discover via stdio</span></pre>
+    <p class="self-host-alt">Or download a single binary — no Python, no git clone:</p>
     <div class="self-host-row">
+      <a href="https://github.com/meridianmcp/Meridian/releases/latest/download/meridian.exe" class="btn btn-secondary">
+        ↓ Windows (.exe)
+      </a>
+      <a href="https://github.com/meridianmcp/Meridian/releases/latest/download/meridian-mac-arm64" class="btn btn-secondary">
+        ↓ macOS (Apple Silicon)
+      </a>
+      <a href="https://github.com/meridianmcp/Meridian/releases/latest/download/meridian-mac-x86" class="btn btn-secondary">
+        ↓ macOS (Intel)
+      </a>
+    </div>
+    <div class="self-host-row" style="margin-top:12px">
       <a href="https://github.com/meridianmcp/Meridian" target="_blank" rel="noopener" class="btn btn-secondary">
         ★ Star on GitHub
       </a>
