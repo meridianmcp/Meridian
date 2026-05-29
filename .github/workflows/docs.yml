@@ -33,6 +33,10 @@ jobs:
         run: pip install mkdocs-material
 
       - name: Build and deploy docs
+        env:
+          DOCS_TOKEN: ${{ secrets.DOCS_DEPLOY_TOKEN }}
         run: |
+          git config --global credential.helper 'store --file /tmp/git-creds'
+          echo "https://x-access-token:${DOCS_TOKEN}@github.com" > /tmp/git-creds
           echo "docs.usemeridian.us" > docs/CNAME
-          mkdocs gh-deploy --force --clean --verbose --remote-name https://x-access-token:${{ secrets.DOCS_DEPLOY_TOKEN }}@github.com/meridianmcp/meridian-docs.git
+          mkdocs gh-deploy --force --clean --verbose --remote-name https://github.com/meridianmcp/meridian-docs.git
