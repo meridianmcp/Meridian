@@ -36,7 +36,6 @@ jobs:
         env:
           DOCS_TOKEN: ${{ secrets.DOCS_DEPLOY_TOKEN }}
         run: |
-          git config --global credential.helper 'store --file /tmp/git-creds'
-          echo "https://x-access-token:${DOCS_TOKEN}@github.com" > /tmp/git-creds
+          git config --global url."https://x-access-token:${DOCS_TOKEN}@github.com/meridianmcp/".insteadOf "https://github.com/meridianmcp/"
           echo "docs.usemeridian.us" > docs/CNAME
           mkdocs gh-deploy --force --clean --verbose --remote-name https://github.com/meridianmcp/meridian-docs.git
