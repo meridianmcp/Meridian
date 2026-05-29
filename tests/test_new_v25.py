@@ -964,6 +964,10 @@ def _make_gated_client(monkeypatch, tmp_path):
     import importlib
     import meridian.server as server_module
     server_module = importlib.reload(server_module)
+    # Blank live-DB fallback env vars AFTER reload (reload re-reads .env).
+    # These must never point at real DBs during unit tests.
+    monkeypatch.setenv("MERIDIAN_AUTH_DB", "")
+    monkeypatch.setenv("MERIDIAN_STANDARD_KEY", "")
     return TestClient(server_module.app)
 
 

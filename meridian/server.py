@@ -541,10 +541,13 @@ async def lifespan(app: FastAPI):
     app.state.ws_broadcaster = dashboard_module.WebSocketBroadcaster()
 
     # v2.2 — isolated demo DB.
-    # Priority: MERIDIAN_DEMO_DB_URL (separate Neon) → in-memory SQLite fallback.
-    # Always wipe-and-reseed on startup so the demo is always fresh.
+    # Priority: MERIDIAN_DEMO_DB_URL → MERIDIAN_STANDARD_KEY (legacy secret
+    # name on the hosted Fly app) → in-memory SQLite fallback.
     # NEVER falls through to production DB.
-    demo_db_url = os.environ.get("MERIDIAN_DEMO_DB_URL")
+    demo_db_url = (
+        os.environ.get("MERIDIAN_DEMO_DB_URL")
+        or os.environ.get("MERIDIAN_STANDARD_KEY")
+    )
 
     async def _init_demo(url: str) -> None:
         demo_db = await db_module.init_db(url)
@@ -912,7 +915,14 @@ _tenant_db_cache: dict[str, Any] = {}
 
 
 async def _open_tenant_db_by_id(request: Request, tenant_id: str) -> Any:
-    """Return the cached DB for tenant_id, opening it if not yet cached."""
+    """Return the cached DB for tenant_id, opening it if not yet cached.
+
+    URL resolution order:
+      1. tenant.neon_db_url from auth DB (encrypted, normal path)
+      2. MERIDIAN_AUTH_DB env var — Fly secret set for the admin tenant's
+         personal project DB (ep-mute-hall).  Used when neon_db_url is not
+         yet written to the tenant row (e.g. manual provisioning workflow).
+    """
     if tenant_id in _tenant_db_cache:
         return _tenant_db_cache[tenant_id]
     from . import db as db_module
@@ -921,16 +931,21 @@ async def _open_tenant_db_by_id(request: Request, tenant_id: str) -> Any:
     tenant = await db_module.get_tenant_by_id(auth_db, tenant_id)
     if not tenant:
         raise HTTPException(status_code=401, detail="tenant not found")
-    if not tenant.get("neon_db_url"):
-        raise HTTPException(
-            status_code=503,
-            detail="tenant database not provisioned",
-        )
-    url = db_module.decrypt_field(tenant["neon_db_url"])
+
+    url: str | None = None
+
+    # Primary: encrypted neon_db_url in the tenant row
+    if tenant.get("neon_db_url"):
+        url = db_module.decrypt_field(tenant["neon_db_url"]) or None
+
+    # Fallback: MERIDIAN_AUTH_DB env var (admin tenant, manually provisioned)
+    if not url:
+        url = os.environ.get("MERIDIAN_AUTH_DB") or None
+
     if not url:
         raise HTTPException(
             status_code=503,
-            detail="tenant database credentials unavailable",
+            detail="tenant database not provisioned — set MERIDIAN_AUTH_DB or run set_tenant_db.py",
         )
     conn = await open_pg_connection(url)
     _tenant_db_cache[tenant_id] = conn

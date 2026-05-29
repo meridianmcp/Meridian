@@ -4055,7 +4055,8 @@ async function restoreTabs() {
   await loadProjects();
   if (isDemoMode()) hideDemoAdminControls();
   // v0.6.6 — EZ first-run wizard: if no projects exist, show the overlay
-  if (state.projects.length === 0) {
+  // Skip in demo mode — demo DB always has projects seeded.
+  if (state.projects.length === 0 && !isDemoMode()) {
     document.getElementById('ez-wizard').style.display = 'flex';
     return; // don't restore tabs until wizard completes
   }
