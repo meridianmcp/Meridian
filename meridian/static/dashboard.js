@@ -694,12 +694,12 @@ function buildTabBody(project) {
     <div class="vtab-strip" id="vtab-strip-${project.id}">
       <button class="vtab-btn active" data-vtab="status" title="Status &amp; Sessions">≡</button>
       <button class="vtab-btn" data-vtab="live" title="Live — right-now view">⚡</button>
-      <button class="vtab-btn" data-vtab="goal" title="Goal State">◎</button>
-      <button class="vtab-btn" data-vtab="files" title="Files">⊞</button>
-      <button class="vtab-btn" data-vtab="devlog" title="Dev Log">≋</button>
-      <button class="vtab-btn" data-vtab="timeline" title="Activity Timeline">⌬</button>
+      <button class="vtab-btn" data-vtab="goal" title="Goal State">🎯</button>
+      <button class="vtab-btn" data-vtab="files" title="Files">📁</button>
+      <button class="vtab-btn" data-vtab="devlog" title="Dev Log">📓</button>
+      <button class="vtab-btn" data-vtab="timeline" title="Activity Timeline">📅</button>
       <button class="vtab-btn" data-vtab="rewind" title="Rewind — Last X days">↻</button>
-      <button class="vtab-btn" data-vtab="queue" title="Work Queue">⚙</button>
+      <button class="vtab-btn" data-vtab="queue" title="Work Queue">🪖</button>
       <button class="vtab-btn" data-vtab="team" title="Team — per-human activity">👥</button>
       <button class="vtab-btn" data-vtab="notes" title="Notes — per-project wiki">📝</button>
       <button class="vtab-btn" data-vtab="docs" title="MCP Tool Reference">📖</button>
@@ -760,7 +760,7 @@ function buildTabBody(project) {
         </div>
         <div class="goal-subtab-strip">
           <button class="goal-subtab-btn active" data-gtab="north-star" title="Permanent product vision. Rarely changes — set once, then keep stable.">🔭 North Star</button>
-          <button class="goal-subtab-btn" data-gtab="version-goal" title="Current milestone — what ships this cycle (v1.2, v2.0, etc).">◎ Version Goal</button>
+          <button class="goal-subtab-btn" data-gtab="version-goal" title="Current milestone — what ships this cycle (v1.2, v2.0, etc).">🎯 Version Goal</button>
           <button class="goal-subtab-btn" data-gtab="sprint" title="What this session is focused on right now — updated multiple times per day. Not a multi-week scrum sprint.">⚡ Session Focus</button>
           <button class="goal-subtab-btn" data-gtab="decisions" title="Pinned constitution + append-only decisions log.">📋 Decisions</button>
         </div>
