@@ -201,11 +201,7 @@ async def _seed_demo_data(db) -> None:
     # ---- Project 1: backend-api-v2 ----
     api = await db_module.create_project(db, "backend-api-v2")
 
-    await db_module.set_north_star(
-        db, api["id"],
-        "Achieve 99.9% uptime and <200ms p95 latency for all API endpoints. "
-        "Every service is observable, every failure is recoverable.",
-    )
+    # set_goal must come before set_north_star — north_star requires an existing goal row
     await db_module.set_goal(
         db, api["id"],
         "BACKEND API v2 REFACTOR\n\n"
@@ -224,6 +220,11 @@ async def _seed_demo_data(db) -> None:
         "tests/integration/ — full suite\n"
         "docs/openapi.yaml — auto-generated spec",
         minor=False,
+    )
+    await db_module.set_north_star(
+        db, api["id"],
+        "Achieve 99.9% uptime and <200ms p95 latency for all API endpoints. "
+        "Every service is observable, every failure is recoverable.",
     )
     await db_module.set_sprint(
         db, api["id"],
@@ -288,7 +289,7 @@ async def _seed_demo_data(db) -> None:
         item_id = str(__import__("uuid").uuid4())
         try:
             await db.execute(
-                "INSERT INTO sprint_items (id, project_id, title, version, status, created_at) "
+                "INSERT INTO sprint_items (id, project_id, title, version, status, added_at) "
                 "VALUES (?, ?, ?, ?, ?, datetime('now'))",
                 (item_id, api["id"], title, version, status_val),
             )
@@ -320,11 +321,7 @@ async def _seed_demo_data(db) -> None:
     # ---- Project 2: data-pipeline ----
     pipe = await db_module.create_project(db, "data-pipeline")
 
-    await db_module.set_north_star(
-        db, pipe["id"],
-        "Process 10M events/day with <5 min end-to-end latency, "
-        "zero data loss, and full lineage tracking for compliance.",
-    )
+    # set_goal before set_north_star — north_star requires an existing goal row
     await db_module.set_goal(
         db, pipe["id"],
         "DATA PIPELINE ETL v1.4\n\n"
@@ -343,6 +340,11 @@ async def _seed_demo_data(db) -> None:
         "consumers/ — Kafka consumer workers\n"
         "tests/ — Great Expectations suites",
         minor=False,
+    )
+    await db_module.set_north_star(
+        db, pipe["id"],
+        "Process 10M events/day with <5 min end-to-end latency, "
+        "zero data loss, and full lineage tracking for compliance.",
     )
     await db_module.set_sprint(
         db, pipe["id"],
@@ -394,7 +396,7 @@ async def _seed_demo_data(db) -> None:
         item_id = str(__import__("uuid").uuid4())
         try:
             await db.execute(
-                "INSERT INTO sprint_items (id, project_id, title, version, status, created_at) "
+                "INSERT INTO sprint_items (id, project_id, title, version, status, added_at) "
                 "VALUES (?, ?, ?, ?, ?, datetime('now'))",
                 (item_id, pipe["id"], title, version, status_val),
             )
@@ -4103,11 +4105,14 @@ async def _dispatch_mcp_tool(name: str, args: dict[str, Any], db: Any, data_dir:
             f'/goal Complete sprint items: {", ".join(it["id"] for it in pending_items[:8])}. '
             f"Done when complete_sprint_item()\'d, tests pass, generate_handoff called."
         ) if pending_items else "/goal Continue work — all sprint items done."
+        # 04f03ee4 — include start_session one-liner so next session can resume immediately
+        start_fresh = f'start_session(project_id="{project_id}", session_name="describe-what-youre-doing")'
         return {
             "summary": content,
             "pending_count": len(pending_items),
             "pending_ids": ids_str,
             "next_goal": next_goal,
+            "start_fresh": start_fresh,
         }
     if name == "request_hitl":
         return await db_module.request_hitl(

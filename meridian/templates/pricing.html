@@ -78,7 +78,7 @@
   .plans {
     display: flex;
     gap: 20px;
-    max-width: 960px;
+    max-width: 1200px;
     margin: 0 auto;
     padding: 0 20px;
     flex-wrap: wrap;
@@ -324,9 +324,37 @@
     <a href="/auth/login?signup=1" class="plan-cta secondary">Start free →</a>
   </div>
 
-  <!-- Solo -->
+  <!-- Trial (eb1a607a) -->
   <div class="plan-card featured">
-    <div class="plan-badge">Most popular</div>
+    <div class="plan-badge">Recommended</div>
+    <div class="plan-name">Try Solo Free</div>
+    <div class="plan-price">$0<small> / 7 days</small></div>
+    <div class="plan-subtitle"><span class="ok">Full Solo experience</span> · no card required</div>
+    <hr class="plan-divider">
+    <ul class="plan-features">
+      <li>Dedicated Neon Postgres DB</li>
+      <li>Unlimited projects + sessions</li>
+      <li>No shared-hardware limits</li>
+      <li>All 21 MCP tools</li>
+      <li>HITL queue + pinned decisions</li>
+      <li>Auto-checkpoint hooks</li>
+    </ul>
+    <div class="plan-limits">
+      Trial ends after 7 days · upgrade to keep your data · no card charged at signup
+    </div>
+    {% if waitlist_mode %}
+    <form class="waitlist-form" data-plan="trial" onsubmit="submitWaitlist(event, this)">
+      <input type="email" placeholder="your@email.com" required>
+      <button type="submit">Start 7-day trial →</button>
+    </form>
+    <div class="waitlist-msg"></div>
+    {% else %}
+    <a href="/auth/login?plan=trial" class="plan-cta primary">Start 7-day trial →</a>
+    {% endif %}
+  </div>
+
+  <!-- Solo -->
+  <div class="plan-card">
     <div class="plan-name">Solo</div>
     <div class="plan-price">$20<small> / mo</small></div>
     <div class="plan-subtitle">Dedicated DB · permanent</div>

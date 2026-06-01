@@ -175,7 +175,10 @@ def _render_delta_handoff(
     quick_start_goal: str,
 ) -> str:
     """Return a compact handoff for back-to-back goal runs in one session."""
+    # 04f03ee4 — one-liner start instruction at very top of delta output
     lines = [
+        f"To start fresh: start_session(project_id=\"{project['id']}\", session_name=\"describe-what-youre-doing\")",
+        "",
         f"# Session Update — {project['name']}",
         f"_Generated at {generated_at} (delta mode)_",
         "",

@@ -5798,3 +5798,39 @@ async def test_overage_check_reports_usage(monkeypatch):
     payload = captured.get("payload", {})
     assert payload.get("stripe_customer_id") == "cus_abc123"
     assert float(payload.get("value", 0)) == 2.5
+
+
+# ---------------------------------------------------------------------------
+# a0cc3503 — /demo DB integration test
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_demo_loads_correct_db(db):
+    """_seed_demo_data populates backend-api-v2 project with sessions and sprint items.
+
+    Uses the `db` fixture (in-memory SQLite) directly to avoid TestClient
+    lifespan async-timeout issues.  The seeding logic is the same code that
+    runs on the live /demo route — this test verifies it produces the expected
+    demo content that HN visitors see.
+    """
+    from meridian.server import _seed_demo_data
+
+    await _seed_demo_data(db)
+
+    # Projects — must contain backend-api-v2
+    projects = await db_module.list_projects(db)
+    project_names = [p["name"] for p in projects]
+    assert "backend-api-v2" in project_names, (
+        f"backend-api-v2 not found in seeded projects: {project_names}"
+    )
+
+    api_project = next(p for p in projects if p["name"] == "backend-api-v2")
+
+    # Sessions — at least 1
+    sessions = await db_module.get_sessions(db, api_project["id"])
+    assert len(sessions) >= 1, "Expected at least 1 session for backend-api-v2"
+
+    # Sprint items — at least 1
+    sprint_items = await db_module.get_sprint_items(db, api_project["id"])
+    assert len(sprint_items) >= 1, "Expected at least 1 sprint item for backend-api-v2"

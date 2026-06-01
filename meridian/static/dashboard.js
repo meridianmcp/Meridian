@@ -127,8 +127,8 @@ async function loadServerConfig() {
 }
 
 function _renderPlanBadge(me) {
-  const planColors = { free: '#6b7280', standard: '#2563eb', pro: '#7c3aed' };
-  const planLabels = { free: 'Free', standard: 'Solo', pro: 'Pro' };
+  const planColors = { free: '#6b7280', trial: '#059669', standard: '#2563eb', pro: '#7c3aed' };
+  const planLabels = { free: 'Free', trial: 'Trial', standard: 'Solo', pro: 'Pro' };
   const plan = me.plan || 'free';
   // Plan badge near version string
   const verEl = document.getElementById('server-version');
@@ -142,22 +142,41 @@ function _renderPlanBadge(me) {
   }
   // Expiry warning banner at ≤25 days remaining
   const days = me.days_remaining;
-  if (plan === 'free' && days !== null && days !== undefined && days <= 25 && !document.getElementById('expiry-banner')) {
+  const isExpiring = (plan === 'free' || plan === 'trial') && days !== null && days !== undefined && days <= 25;
+  if (isExpiring && !document.getElementById('expiry-banner')) {
     const b = document.createElement('div');
     b.id = 'expiry-banner';
     const urgent = days <= 5;
+    const label = plan === 'trial' ? 'Trial' : 'Free tier';
+    const upgradeMsg = plan === 'trial' ? 'Add a card to keep your data →' : 'Upgrade →';
     b.style = `position:fixed;top:0;left:0;right:0;z-index:9998;background:${urgent ? '#dc2626' : '#d97706'};color:#fff;text-align:center;padding:5px 12px;font-size:12px;font-family:inherit;letter-spacing:0.02em`;
-    b.innerHTML = `Free tier expires in <strong>${days} day${days !== 1 ? 's' : ''}</strong>. <a href="/pricing" style="color:#fff;text-decoration:underline">Upgrade →</a>`;
+    b.innerHTML = `${label} expires in <strong>${days} day${days !== 1 ? 's' : ''}</strong>. <a href="/pricing" style="color:#fff;text-decoration:underline">${upgradeMsg}</a>`;
     document.body.prepend(b);
     document.body.style.paddingTop = ((parseInt(document.body.style.paddingTop || '0', 10)) + 28) + 'px';
   }
   if (me.expired && !document.getElementById('expired-banner')) {
     const b = document.createElement('div');
     b.id = 'expired-banner';
+    const expLabel = plan === 'trial' ? 'Trial expired' : 'Free tier expired';
     b.style = 'position:fixed;top:0;left:0;right:0;z-index:9998;background:#dc2626;color:#fff;text-align:center;padding:5px 12px;font-size:12px;font-family:inherit;letter-spacing:0.02em';
-    b.innerHTML = `Free tier expired. <a href="/pricing" style="color:#fff;text-decoration:underline">Upgrade to continue →</a>`;
+    b.innerHTML = `${expLabel}. <a href="/pricing" style="color:#fff;text-decoration:underline">Upgrade to continue →</a>`;
     document.body.prepend(b);
     document.body.style.paddingTop = ((parseInt(document.body.style.paddingTop || '0', 10)) + 28) + 'px';
+  }
+  // b75c1649 — sign out link in sidebar footer (hosted/authenticated users only)
+  if (!document.getElementById('signout-link')) {
+    const footer = document.querySelector('.sidebar-footer');
+    if (footer) {
+      const link = document.createElement('a');
+      link.id = 'signout-link';
+      link.href = '/auth/logout';
+      link.textContent = 'sign out';
+      link.title = me.email ? `Signed in as ${me.email}` : 'Sign out';
+      link.style = 'display:block;margin-top:8px;font-size:10px;color:var(--muted);font-family:var(--font-mono);text-align:center;text-decoration:none;opacity:0.7';
+      link.onmouseenter = () => { link.style.opacity = '1'; link.style.color = 'var(--text)'; };
+      link.onmouseleave = () => { link.style.opacity = '0.7'; link.style.color = 'var(--muted)'; };
+      footer.appendChild(link);
+    }
   }
 }
 

@@ -74,9 +74,13 @@ def run_checks(base_url: str) -> int:
         f"status={code}, has 'meridian'={'meridian' in body.lower()}",
     ))
 
-    # 3. Demo page loads
+    # 3. Demo page loads with seeded content
     code, body = get(f"{base}/demo")
-    results.append(check("GET /demo → 200", code == 200, f"got {code}"))
+    results.append(check(
+        "GET /demo → 200 (dashboard HTML)",
+        code == 200 and "Meridian Dashboard" in body,
+        f"status={code}, has dashboard={'Meridian Dashboard' in body}",
+    ))
 
     # 4. Pricing page
     code, body = get(f"{base}/pricing")

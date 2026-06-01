@@ -4,6 +4,17 @@ Generated: {{ generated_at }}
 Project: {{ project.name }} ({{ project.id }})
 ---
 
+## Start a New Session
+
+**Claude Code / Cursor / Codex:**
+```
+start_session(project_id="{{ project.id }}", session_name="describe-what-youre-doing")
+```
+
+**Claude.ai / planning chat:** Paste this file into a new chat to restore full context.
+
+---
+
 {% if ai_summary -%}
 ## AI Summary
 
