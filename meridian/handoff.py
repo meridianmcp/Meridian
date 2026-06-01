@@ -170,6 +170,7 @@ def _render_delta_handoff(
     *,
     generated_at: str,
     completed_items: list[dict[str, Any]],
+    in_progress_items: list[dict[str, Any]],
     pending_sprint_items: list[dict[str, Any]],
     quick_start_goal: str,
 ) -> str:
@@ -178,8 +179,17 @@ def _render_delta_handoff(
         f"# Session Update — {project['name']}",
         f"_Generated at {generated_at} (delta mode)_",
         "",
-        "Completed since last handoff:",
     ]
+    # "Currently running:" — claimed in_progress items shown first so the
+    # planning chat immediately knows what's active without scrolling.
+    if in_progress_items:
+        lines.append("Currently running:")
+        for item in in_progress_items:
+            claimed = item.get("claimed_by") or ""
+            suffix = f" (claimed by {claimed})" if claimed else ""
+            lines.append(f"- {item['id']} — {item['title']}{suffix}")
+        lines.append("")
+    lines.append("Completed since last handoff:")
     if completed_items:
         for item in completed_items:
             lines.append(f"- {item['id']} — {item['title']}")
@@ -383,9 +393,16 @@ async def generate_handoff(
     project_notes = await db_module.get_project_notes(db, project_id)
     strategic_notes = _select_strategic_notes(project_notes)
     sprint_items_all = await db_module.get_sprint_items(db, project_id)
+    # Separate genuinely pending from actively-claimed in_progress items so:
+    # (1) quick_start_goal only names items that haven't been claimed yet, and
+    # (2) the delta output surfaces "Currently running:" at the top.
+    in_progress_items = [
+        it for it in sprint_items_all
+        if it.get("status") == "in_progress"
+    ]
     pending_sprint_items = [
         it for it in sprint_items_all
-        if it.get("status") in ("todo", "pending", "in_progress")
+        if it.get("status") in ("todo", "pending")
     ]
     pending_sprint_items = _prepare_pending_sprint_items(pending_sprint_items)
     decisions_log = (project.get("decisions") or "").strip()
@@ -424,6 +441,7 @@ async def generate_handoff(
             project,
             generated_at=generated_at,
             completed_items=completed_items,
+            in_progress_items=in_progress_items,
             pending_sprint_items=pending_sprint_items,
             quick_start_goal=quick_start_goal,
         )

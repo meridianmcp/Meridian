@@ -544,8 +544,8 @@ async def lifespan(app: FastAPI):
         app.state.demo_db = None
     elif demo_db_url:
         try:
-            # 10s timeout — if Neon is slow/down, don't hang startup
-            await asyncio.wait_for(_init_demo(demo_db_url), timeout=10.0)
+            # 30s timeout — Neon cold-start can take ~15-20s; 30s gives it room
+            await asyncio.wait_for(_init_demo(demo_db_url), timeout=30.0)
         except Exception:  # noqa: BLE001
             try:
                 await asyncio.wait_for(_init_demo_inmemory(), timeout=5.0)
