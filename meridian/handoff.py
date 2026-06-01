@@ -117,7 +117,7 @@ def resolve_handoff_mode(
     session_id: str | None = None,
 ) -> str:
     """Resolve the public handoff mode, auto-switching repeat sessions to delta."""
-    if requested_mode in {"full", "delta"}:
+    if requested_mode in {"full", "delta", "planner"}:
         return requested_mode
     if session_id and session_id in _SESSION_HANDOFF_STATE:
         return "delta"
@@ -361,8 +361,10 @@ async def generate_handoff(
     project = await db_module.get_project(db, project_id)
     if project is None:
         raise ValueError(f"project not found: {project_id}")
+    if mode == "planner":
+        return await _generate_planner_handoff(db, project_id, output_dir)
     if mode not in {"full", "delta"}:
-        raise ValueError("mode must be 'full' or 'delta'")
+        raise ValueError("mode must be 'full', 'delta', or 'planner'")
 
     goal = await db_module.get_goal(db, project_id)
     if goal is None:
@@ -475,4 +477,97 @@ async def generate_handoff(
     out_path.write_text(content, encoding="utf-8")
     if session_id:
         _SESSION_HANDOFF_STATE[session_id] = state_ts
+    return str(out_path.resolve()), content
+
+
+async def _generate_planner_handoff(
+    db: object,
+    project_id: str,
+    output_dir: str,
+) -> tuple[str, str]:
+    """Planner-optimised handoff — strategic context for a claude.ai planning chat.
+
+    Includes: north star, pinned decisions, strategic notes, open HITL queue,
+    pending sprint items, recent tasks. Excludes mechanical executor details
+    (file paths, test commands, repo path) — those are for Claude Code, not the
+    planning chat.
+
+    Returns ``(path, content)`` like the full handoff.
+    """
+    from datetime import datetime, timezone  # noqa: PLC0415
+
+    project = await db_module.get_project(db, project_id)
+    goal = await db_module.get_goal(db, project_id)
+    pinned = await db_module.get_pinned_decisions(db, project_id)
+    notes = await db_module.get_project_notes(db, project_id)
+    strategic = _select_strategic_notes(notes)
+    pending_items = await db_module.get_sprint_items(db, project_id, status="pending")
+    tasks = await db_module.get_tasks(db, project_id, limit=10)
+    hitl = await db_module.list_hitl_requests(db, project_id, status="pending")
+
+    north_star = (goal or {}).get("north_star") or (goal or {}).get("goal_north_star") or ""
+    sprint = (goal or {}).get("sprint") or (goal or {}).get("goal_sprint") or ""
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+    lines = [
+        f"# Meridian Planner Handoff — {project['name']}",
+        f"_Generated {now}_",
+        "",
+        "## North Star",
+        north_star or "(not set)",
+        "",
+        "## Current Sprint Focus",
+        sprint or "(not set)",
+        "",
+    ]
+
+    if pinned:
+        lines += ["## Pinned Decisions (Constitution)", ""]
+        for d in pinned:
+            cat = d.get("category", "")
+            lines.append(f"- **[{cat}]** {d.get('title', '')} — {(d.get('body') or '')[:200]}")
+        lines.append("")
+
+    if strategic:
+        lines += ["## Strategic Notes", ""]
+        for n in strategic[:8]:
+            lines.append(f"- **{n.get('title', '')}** — {(n.get('body') or '')[:150]}")
+        lines.append("")
+
+    if hitl:
+        lines += [f"## Open HITL Requests ({len(hitl)} pending)", ""]
+        for h in hitl:
+            urg = h.get("urgency", "normal")
+            lines.append(f"- [{urg.upper()}] `{h['id'][:8]}` — {h.get('question', '')}")
+        lines.append("")
+
+    if pending_items:
+        alpha = [i for i in pending_items if i.get("version") != "post-launch"]
+        lines += [f"## Pending Sprint Items ({len(alpha)} alpha-launch)", ""]
+        for it in alpha[:20]:
+            lines.append(f"- `{it['id'][:8]}` {it.get('title', '')[:100]}")
+        lines.append("")
+
+    if tasks:
+        lines += ["## Recent Tasks (last 10)", ""]
+        for t in tasks[:10]:
+            ts = (t.get("created_at") or "")[:10]
+            status = t.get("status", "?")
+            lines.append(f"- [{status.upper()}] {ts} — {(t.get('description') or '')[:100]}")
+        lines.append("")
+
+    lines += [
+        "## Start a Planning Session",
+        "",
+        f'```',
+        f'start_session(project_id="{project_id}", session_name="planning-session")',
+        f'```',
+        "",
+    ]
+
+    content = "\n".join(lines)
+    out_dir = Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / f"{_slugify(project['name'])}_planner_handoff.md"
+    out_path.write_text(content, encoding="utf-8")
     return str(out_path.resolve()), content

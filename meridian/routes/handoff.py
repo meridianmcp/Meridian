@@ -15,6 +15,34 @@ from ..models import HandoffResult
 router = APIRouter()
 
 
+@router.get("/projects/{project_id}/handoff/planner")
+async def planner_handoff_endpoint(
+    project_id: str, request: Request
+) -> dict[str, Any]:
+    """GET the planner-optimised handoff for a project.
+
+    Returns strategic context (north star, decisions, notes, open HITLs,
+    pending sprint items, recent tasks) as plain markdown. Intended for
+    pasting into a claude.ai planning chat — excludes mechanical executor
+    details like file paths and test commands.
+    """
+    project = await db_module.get_project(await _db(request), project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="project not found")
+    db = await _db(request)
+    data_dir = _data_dir(request)
+    try:
+        path, content = await asyncio.wait_for(
+            handoff_module.generate_handoff(
+                db, project_id, data_dir, mode="planner"
+            ),
+            timeout=30.0,
+        )
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail="planner handoff timed out")
+    return {"path": path, "content": content, "mode": "planner"}
+
+
 @router.post("/projects/{project_id}/handoff", response_model=HandoffResult)
 async def generate_handoff_endpoint(
     project_id: str, request: Request

@@ -1,0 +1,48 @@
+{
+  "dxt_version": "0.1",
+  "name": "Meridian (Hosted)",
+  "version": "1.0.0",
+  "description": "Meridian coordination layer for AI sessions — persistent memory, task tracking, and HITL. Hosted at usemeridian.us.",
+  "author": "Meridian",
+  "homepage": "https://usemeridian.us",
+  "repository": "https://github.com/meridianmcp/Meridian",
+  "server": {
+    "type": "stdio",
+    "command": "npx",
+    "args": ["-y", "mcp-remote", "https://usemeridian.us/mcp"],
+    "env": {
+      "BEARER_TOKEN": "${MERIDIAN_API_KEY}"
+    }
+  },
+  "user_config": {
+    "MERIDIAN_API_KEY": {
+      "type": "string",
+      "title": "Meridian API Key",
+      "description": "Your Meridian Bearer token. Get one at https://usemeridian.us/settings after signing in.",
+      "sensitive": true,
+      "required": true
+    }
+  },
+  "tools": [
+    {
+      "name": "start_session",
+      "description": "Start a coordinated Meridian session — returns goal, recent tasks, and active sessions."
+    },
+    {
+      "name": "log_task",
+      "description": "Log what you just completed or are working on."
+    },
+    {
+      "name": "request_hitl",
+      "description": "Surface a question to the human-in-the-loop queue."
+    },
+    {
+      "name": "generate_handoff",
+      "description": "Generate a context handoff for the next session."
+    },
+    {
+      "name": "checkpoint",
+      "description": "Save progress mid-session and get the next /goal string."
+    }
+  ]
+}

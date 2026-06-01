@@ -35,8 +35,9 @@ from a compressed handoff in seconds. No copy-paste, no re-explaining from scrat
 A local MCP server every AI session connects to. They share goal state, see each
 other's task log, and resume from a compressed handoff when context fills up.
 
-Hosted tier at **[usemeridian.us](https://usemeridian.us)** — $20/mo, 7-day free trial.
-Self-host the same product for free.
+**Two ways to run Meridian:**
+- **Self-host** — free forever, any team size. Clone and run in 2 commands.
+- **Hosted** at [usemeridian.us](https://usemeridian.us) — 30 days free (no card), then $20/mo Solo.
 
 ## Quickstart — binary (no Python required)
 
@@ -113,23 +114,28 @@ git clone --recurse-submodules https://github.com/meridianmcp/Meridian
 2. Click **Load unpacked** and select `extensions/claude-mcp`
 3. Click the extension icon and set the URL to `http://localhost:7878/mcp`
 
-All 19 Meridian tools (`checkpoint`, `log_task`, `pin_decision`, etc.) are now available directly in claude.ai planning chat. No copy-pasting session output.
+All 27 Meridian tools (`checkpoint`, `log_task`, `pin_decision`, etc.) are now available directly in claude.ai planning chat. No copy-pasting session output.
 
 ### Hosted tier (no install)
 
+Sign in at [usemeridian.us](https://usemeridian.us) → Settings → MCP client setup → Generate API key → Copy config.
+
+Or manually:
 ```json
 {
   "mcpServers": {
     "meridian": {
       "command": "npx",
       "args": ["-y", "mcp-remote", "https://usemeridian.us/mcp"],
-      "env": {"BEARER_TOKEN": "sk_meridian_..."}
+      "env": {"BEARER_TOKEN": "sk_meridian_YOUR_KEY_HERE"}
     }
   }
 }
 ```
 
-Get your bearer token at [usemeridian.us/dashboard](https://usemeridian.us/dashboard) after sign-in.
+**Claude Desktop** users can install [meridian-hosted.dxt](https://github.com/meridianmcp/Meridian/releases/latest/download/meridian-hosted.dxt) directly (one-click, no config needed).
+
+Get your API key at [usemeridian.us/settings](https://usemeridian.us/settings) after sign-in. Free tier: 30 days, no card, full features.
 
 ## What you get
 

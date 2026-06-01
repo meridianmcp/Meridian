@@ -3960,7 +3960,7 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
     {"name": "generate_handoff", "description": "Generate a context handoff file. mode='full' writes the complete L0/L1/L2 handoff; mode='delta' returns a compact session update with completed items, pending items, and the next /goal string.",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"},
-         "mode": {"type": "string", "enum": ["full", "delta"]},
+         "mode": {"type": "string", "enum": ["full", "delta", "planner"]},
          "session_id": {"type": "string", "description": "Optional session id for auto-delta on repeated calls in the same session."}},
          "required": ["project_id"]}},
     {"name": "get_context_block", "description":

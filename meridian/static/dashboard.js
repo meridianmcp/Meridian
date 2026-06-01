@@ -968,6 +968,16 @@ function buildTabBody(project) {
         <span class="server-version-pill" id="server-version"></span>
       </div>
       <div class="claude-launch-body">
+        <div class="claude-section" data-section="start">
+          <div class="claude-section-label">Start a new session</div>
+          <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
+            <button class="primary claude-section-btn" id="copy-start-code-${project.id}" title="Copies start_session() command for Claude Code">Claude Code ⬡</button>
+            <button class="secondary claude-section-btn" id="copy-start-chat-${project.id}" title="Copies context for claude.ai planning chat">Planning Chat ✦</button>
+            <button class="secondary claude-section-btn" id="btn-setup-hooks-${project.id}" title="Auto-wire SessionStart + Stop hooks for your AI tools" style="font-size:10px">⚡ Setup Hooks</button>
+          </div>
+          <p class="claude-hint">Claude Code: pastes <code>start_session()</code> command. Planning chat: pastes handoff context. Hooks: opens setup instructions.</p>
+        </div>
+        <hr class="claude-divider">
         <div class="claude-section" data-section="continue">
           <div class="claude-section-label">Resume Claude Code session (<code>start_session</code> + <code>get_context_block</code>)</div>
           <select class="claude-session-select" id="continue-session-${project.id}">
@@ -1831,6 +1841,40 @@ function showCopyPreview(title, content) {
 function wireClaudeLaunchPanel(projectId) {
   const PROJECT_QUOTE = projectId.replace(/"/g, '\\"');
 
+  // Section 0 — "Start a Session" copy buttons + Auto-setup hooks
+  const copyStartCodeBtn = document.getElementById(`copy-start-code-${projectId}`);
+  if (copyStartCodeBtn) copyStartCodeBtn.onclick = () => {
+    const cmd = `start_session(project_id="${PROJECT_QUOTE}", session_name="describe-what-youre-doing", human_id="adam")`;
+    showCopyPreview('Start Claude Code Session', cmd);
+  };
+
+  const copyStartChatBtn = document.getElementById(`copy-start-chat-${projectId}`);
+  if (copyStartChatBtn) copyStartChatBtn.onclick = async () => {
+    const orig = copyStartChatBtn.textContent;
+    copyStartChatBtn.disabled = true;
+    copyStartChatBtn.textContent = 'Loading…';
+    try {
+      const r = await fetch(`/projects/${projectId}/handoff`, { method: 'POST' });
+      if (!r.ok) throw new Error(`${r.status}`);
+      const payload = await r.json();
+      const text = payload.content || '';
+      showCopyPreview('Planning Chat Handoff — paste into claude.ai', text);
+    } catch(e) { toast('handoff failed: ' + e.message, true); }
+    finally { copyStartChatBtn.disabled = false; copyStartChatBtn.textContent = orig; }
+  };
+
+  const setupHooksBtn = document.getElementById(`btn-setup-hooks-${projectId}`);
+  if (setupHooksBtn) setupHooksBtn.onclick = () => {
+    const baseUrl = window.location.origin;
+    const instructions = `Auto-setup Meridian hooks for your AI tools:\n\n` +
+      `macOS / Linux / WSL:\n  curl -fsSL ${baseUrl}/hooks.sh | bash\n\n` +
+      `Windows PowerShell:\n  irm ${baseUrl}/hooks.ps1 | iex\n\n` +
+      `These scripts detect Claude Code and Codex, then wire SessionStart + Stop\n` +
+      `hooks pointing to ${baseUrl}/hooks/ with your project_id.\n\n` +
+      `Project ID: ${projectId}`;
+    showCopyPreview('⚡ Setup Hooks', instructions);
+  };
+
   // Section 1 — Copy resume command
   const copyResumeBtn = document.getElementById(`copy-resume-${projectId}`);
   if (copyResumeBtn) copyResumeBtn.onclick = async () => {
@@ -2184,17 +2228,12 @@ async function loadSettingsTab(projectId) {
 
       function buildConfig() {
         if (!currentToken) return null;
-        const cli = clients.find(c => c.id === activeClient) || clients[0];
         return JSON.stringify({
           mcpServers: {
             meridian: {
               command: 'npx',
-              args: ['-y', 'meridian-mcp@latest'],
-              env: {
-                MERIDIAN_API_KEY: currentToken,
-                MERIDIAN_PROJECT_ID: currentPid,
-                MERIDIAN_BASE_URL: baseUrl,
-              },
+              args: ['-y', 'mcp-remote', `${baseUrl}/mcp`],
+              env: { BEARER_TOKEN: currentToken },
             },
           },
         }, null, 2);
@@ -2208,36 +2247,28 @@ async function loadSettingsTab(projectId) {
           copyBtn.disabled = false;
           fileNote.textContent = `Save to: ${cli.file}`;
         } else if (state.serverConfig?.demo_mode) {
-          const demoKey = 'mk_demo_' + 'x'.repeat(16);
+          const demoKey = 'sk_meridian_demo_' + 'x'.repeat(24);
           const demoCfg = JSON.stringify({
             mcpServers: {
               meridian: {
                 command: 'npx',
-                args: ['-y', 'meridian-mcp@latest'],
-                env: {
-                  MERIDIAN_API_KEY: demoKey,
-                  MERIDIAN_PROJECT_ID: currentPid || 'your-project-id',
-                  MERIDIAN_BASE_URL: baseUrl,
-                },
+                args: ['-y', 'mcp-remote', `${baseUrl}/mcp`],
+                env: { BEARER_TOKEN: demoKey },
               },
             },
           }, null, 2);
           configBlock.textContent = demoCfg;
           copyBtn.disabled = false;
-          fileNote.textContent = `Demo key — sign up at usemeridian.us for a real one`;
+          fileNote.textContent = `Demo key — sign up at ${baseUrl} for a real one`;
         } else {
           // Show placeholder config so the structure is immediately visible
-          const placeholderKey = 'mk_live_' + 'x'.repeat(32);
+          const placeholderKey = 'sk_meridian_' + 'x'.repeat(32);
           const placeholderCfg = JSON.stringify({
             mcpServers: {
               meridian: {
                 command: 'npx',
-                args: ['-y', 'meridian-mcp@latest'],
-                env: {
-                  MERIDIAN_API_KEY: placeholderKey,
-                  MERIDIAN_PROJECT_ID: currentPid || 'your-project-id',
-                  MERIDIAN_BASE_URL: baseUrl,
-                },
+                args: ['-y', 'mcp-remote', `${baseUrl}/mcp`],
+                env: { BEARER_TOKEN: placeholderKey },
               },
             },
           }, null, 2);
@@ -4052,6 +4083,22 @@ function handleWsEvent(projectId, event) {
     if (proj) { proj.name = event.name; loadProjects(); }
     return;
   }
+  // v2.6 — sprint item / goal / session events broadcast live from server
+  if (event.type === 'sprint_item_updated') {
+    const panel = state.panels[projectId];
+    if (panel && panel.activeVtab === 'queue') loadQueue(projectId);
+    scheduleLiveRefresh(projectId);
+    return;
+  }
+  if (event.type === 'goal_updated') {
+    refreshGoal(projectId);
+    return;
+  }
+  if (event.type === 'session_started') {
+    scheduleLiveRefresh(projectId);
+    return;
+  }
+
   const cache = state.panels[projectId].taskCache;
   if (event.type === 'task_created') {
     cache.unshift(event.task);

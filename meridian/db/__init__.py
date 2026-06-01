@@ -114,6 +114,23 @@ def _publish_task(event_type: str, task: dict[str, Any]) -> None:
         except asyncio.QueueFull:
             pass
 
+
+def _publish_project_event(project_id: str, event_type: str, payload: dict[str, Any]) -> None:
+    """Fan-out a project-scoped event (not necessarily task-shaped) to WS subscribers.
+
+    Used for sprint item status changes, goal updates, and session start events
+    so the dashboard refreshes in real-time without polling.
+    """
+    listeners = _TASK_LISTENERS.get(project_id)
+    if not listeners:
+        return
+    event = {"type": event_type, "project_id": project_id, **payload}
+    for q in list(listeners):
+        try:
+            q.put_nowait(event)
+        except asyncio.QueueFull:
+            pass
+
 CREATE_TABLES = """
 CREATE TABLE IF NOT EXISTS projects (
     id TEXT PRIMARY KEY,
@@ -1723,6 +1740,8 @@ async def set_goal(
         await db.commit()
     goal = await get_goal(db, project_id)
     assert goal is not None
+    # Broadcast to dashboard WebSocket subscribers so the goal panel refreshes live.
+    _publish_project_event(project_id, "goal_updated", {"version": goal.get("version")})
     return goal
 
 
@@ -1802,6 +1821,10 @@ async def register_session(
         row = await cur.fetchone()
     session = _row_to_dict(row)
     assert session is not None
+    # Broadcast to dashboard WebSocket subscribers so the session list refreshes live.
+    _publish_project_event(project_id, "session_started", {
+        "session_id": sid, "session_name": name, "human_id": human_id,
+    })
     return session
 
 
@@ -2806,7 +2829,10 @@ async def _update_sprint_item_status(
     await db.commit()
     if cursor.rowcount == 0:
         return None
-    return await get_sprint_item(db, item_id)
+    result = await get_sprint_item(db, item_id)
+    # Broadcast to dashboard WebSocket subscribers so the sprint board refreshes live.
+    _publish_project_event(project_id, "sprint_item_updated", {"item_id": item_id, "status": status})
+    return result
 
 
 async def complete_sprint_item(
