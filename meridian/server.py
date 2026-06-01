@@ -3963,6 +3963,53 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "role": {"type": "string", "enum": ["worker", "planner", "review"],
                   "description": "Controls verbosity. 'worker'=sprint+tasks only, 'planner'=full context."}},
          "required": ["project_id"]}},
+    {"name": "list_hitl_requests", "description":
+        "List HITL requests for a project without needing UUIDs. Returns pending queue "
+        "by default; pass status='all' to see answered/dismissed items too. "
+        "Essential for planning chat to see what needs a human decision.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"},
+         "status": {"type": "string",
+                    "description": "Filter: 'pending' (default), 'answered', 'dismissed', or 'all'."},
+         "limit": {"type": "integer", "description": "Max results, default 50."}},
+         "required": ["project_id"]}},
+    {"name": "answer_hitl", "description":
+        "Answer a pending HITL request programmatically. Marks it answered so "
+        "the waiting session can resume. Use list_hitl_requests to find request IDs.",
+     "inputSchema": {"type": "object", "properties": {
+         "request_id": {"type": "string"},
+         "answer": {"type": "string"},
+         "answered_by": {"type": "string", "description": "Optional human_id of the answerer."}},
+         "required": ["request_id", "answer"]}},
+    {"name": "dismiss_hitl", "description":
+        "Dismiss a HITL request (won't-answer / no longer relevant). "
+        "Stays in audit trail. Use list_hitl_requests to find request IDs.",
+     "inputSchema": {"type": "object", "properties": {
+         "request_id": {"type": "string"}},
+         "required": ["request_id"]}},
+    {"name": "list_sessions", "description":
+        "List active sessions for a project. Useful for planning chat to see "
+        "what's currently running before filing new sprint items.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"},
+         "status": {"type": "string",
+                    "description": "Filter by status: 'active' (default), or 'all' for all sessions."}},
+         "required": ["project_id"]}},
+    {"name": "add_sprint_note", "description":
+        "Add an ephemeral note to the current session's scratch pad. "
+        "Use for constraints, blockers, working assumptions valid only this session. "
+        "Notes are auto-deleted when the session closes.",
+     "inputSchema": {"type": "object", "properties": {
+         "session_id": {"type": "string"},
+         "title": {"type": "string"},
+         "body": {"type": "string"}},
+         "required": ["session_id", "title", "body"]}},
+    {"name": "get_sprint_notes", "description":
+        "Get all ephemeral scratch-pad notes for the current session. "
+        "Shown at the top of session briefs so every cold start sees active constraints.",
+     "inputSchema": {"type": "object", "properties": {
+         "session_id": {"type": "string"}},
+         "required": ["session_id"]}},
 ]
 
 
@@ -4179,10 +4226,42 @@ async def _dispatch_mcp_tool(name: str, args: dict[str, Any], db: Any, data_dir:
         )
         xml_text = f'<meridian_context project_id="{project_id}" mode="{mode}">\n{text}\n</meridian_context>'
         return {"mode": mode, "text": xml_text, "project_id": project_id}
+    if name == "list_hitl_requests":
+        status_filter = args.get("status", "pending")
+        if status_filter == "all":
+            status_filter = None
+        return await db_module.list_hitl_requests(
+            db, args["project_id"],
+            status=status_filter,
+            limit=args.get("limit", 50),
+        )
+    if name == "answer_hitl":
+        result = await db_module.answer_hitl_request(
+            db, args["request_id"], args["answer"],
+            answered_by=args.get("answered_by"),
+        )
+        if result is None:
+            raise ValueError("hitl request not found")
+        return result
+    if name == "dismiss_hitl":
+        result = await db_module.dismiss_hitl_request(db, args["request_id"])
+        if result is None:
+            raise ValueError("hitl request not found")
+        return result
+    if name == "list_sessions":
+        active_only = args.get("status", "active") != "all"
+        return await db_module.get_sessions(db, args["project_id"], active_only=active_only)
+    if name == "add_sprint_note":
+        return await db_module.add_session_note(
+            db, args["session_id"], args["title"], args["body"]
+        )
+    if name == "get_sprint_notes":
+        return await db_module.get_session_notes(db, args["session_id"])
     if name == "get_session_brief":
         # v2.5 — single-call orientation, <500 tokens, XML output.
         project_id = args["project_id"]
         role = args.get("role", "worker")
+        session_id_for_notes = args.get("session_id")
         goal = await db_module.get_goal(db, project_id)
         tasks = await db_module.get_tasks(db, project_id, limit=5)
         hitl_rows = await db_module.list_hitl_requests(db, project_id, status="pending")
@@ -4199,8 +4278,21 @@ async def _dispatch_mcp_tool(name: str, args: dict[str, Any], db: Any, data_dir:
         )
         hitl_attr = f' count="{len(hitl_rows)}"' if hitl_rows else ""
         blocking_xml = f'<blocking>{(blocking[0].get("description") or "")[:100]}</blocking>' if blocking else ""
+        # v2.6 — include session scratch-pad notes at top of brief
+        notes_xml = ""
+        if session_id_for_notes:
+            try:
+                session_notes = await db_module.get_session_notes(db, session_id_for_notes)
+                if session_notes:
+                    notes_xml = "<session_notes>\n" + "\n".join(
+                        f'  <note title="{n.get("title","")}">{(n.get("body") or "")[:120]}</note>'
+                        for n in session_notes
+                    ) + "\n</session_notes>\n"
+            except Exception:
+                pass
         brief = (
             f'<session_brief project_id="{project_id}" role="{role}">\n'
+            f'{notes_xml}'
             f'<sprint>{sprint_str[:200]}</sprint>\n'
             f'<pending_items>\n{sprint_items_xml}\n</pending_items>\n'
             f'<last_tasks>\n{tasks_xml}\n</last_tasks>\n'

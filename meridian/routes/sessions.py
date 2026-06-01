@@ -42,6 +42,10 @@ async def close_session(session_id: str, request: Request) -> dict[str, str]:
     project_id = row["project_id"]
     await db_module.close_session(_req_db, session_id)
     try:
+        await db_module.delete_session_notes(await _db(request), session_id)
+    except Exception:
+        pass
+    try:
         await db_module.summarize_session(await _db(request), session_id)
     except Exception:
         pass

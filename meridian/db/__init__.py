@@ -353,6 +353,16 @@ CREATE TABLE IF NOT EXISTS admins (
     added_at TEXT NOT NULL DEFAULT (datetime('now')),
     notes TEXT
 );
+
+-- v2.6 — session_notes: ephemeral per-session scratch pad.
+-- Auto-deleted when session closes. Exposed via add_sprint_note / get_sprint_notes MCP tools.
+CREATE TABLE IF NOT EXISTS session_notes (
+    id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    title TEXT NOT NULL,
+    body TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
 """
 
 
@@ -1152,6 +1162,20 @@ async def _migrate_hosted_tables(db: aiosqlite.Connection) -> None:
     await db.commit()
 
 
+async def _migrate_session_notes(db: aiosqlite.Connection) -> None:
+    """v2.6 — create session_notes table if not present. Idempotent."""
+    await db.execute(
+        """CREATE TABLE IF NOT EXISTS session_notes (
+            id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+            title TEXT NOT NULL,
+            body TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )"""
+    )
+    await db.commit()
+
+
 async def init_hosted_tables(db: aiosqlite.Connection) -> None:
     """Ensure hosted-tier tables exist on the given connection.
 
@@ -1219,6 +1243,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_v26_client_type(db)
     await _migrate_decisions_free_category(db)
     await _migrate_tenants_free_plan(db)
+    await _migrate_session_notes(db)
     return db
 
 
@@ -4962,3 +4987,54 @@ async def delete_tenant_records(
     ]:
         await db.execute(stmt, params)
     await db.commit()
+
+
+# ---------------------------------------------------------------------------
+# v2.6 — Session-scoped ephemeral notes (sprint scratch pad)
+# ---------------------------------------------------------------------------
+
+
+async def add_session_note(
+    db: aiosqlite.Connection,
+    session_id: str,
+    title: str,
+    body: str,
+) -> dict[str, Any]:
+    """Add an ephemeral note scoped to a session. Auto-deleted on session close."""
+    nid = _new_id()
+    await db.execute(
+        "INSERT INTO session_notes (id, session_id, title, body) VALUES (?, ?, ?, ?)",
+        (nid, session_id, title, body),
+    )
+    await db.commit()
+    async with db.execute(
+        "SELECT * FROM session_notes WHERE id = ?", (nid,)
+    ) as cur:
+        row = await cur.fetchone()
+    return _row_to_dict(row)  # type: ignore[return-value]
+
+
+async def get_session_notes(
+    db: aiosqlite.Connection,
+    session_id: str,
+) -> list[dict[str, Any]]:
+    """Return all notes for a session, newest first."""
+    async with db.execute(
+        "SELECT * FROM session_notes WHERE session_id = ? ORDER BY created_at DESC",
+        (session_id,),
+    ) as cur:
+        rows = await cur.fetchall()
+    return [_row_to_dict(r) for r in rows if r is not None]  # type: ignore[misc]
+
+
+async def delete_session_notes(
+    db: aiosqlite.Connection,
+    session_id: str,
+) -> int:
+    """Delete all notes for a session. Called on session close."""
+    async with db.execute(
+        "DELETE FROM session_notes WHERE session_id = ?", (session_id,)
+    ) as cur:
+        count = cur.rowcount if cur.rowcount is not None else 0
+    await db.commit()
+    return count

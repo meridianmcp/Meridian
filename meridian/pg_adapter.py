@@ -480,6 +480,16 @@ CREATE INDEX IF NOT EXISTS idx_decisions_pinned_project ON decisions_pinned(proj
 CREATE INDEX IF NOT EXISTS idx_hitl_project ON hitl_requests(project_id, status);
 CREATE INDEX IF NOT EXISTS idx_hitl_assigned ON hitl_requests(assigned_to, status);
 CREATE INDEX IF NOT EXISTS idx_notes_project ON project_notes(project_id);
+
+-- v2.6 — session_notes: ephemeral per-session scratch pad.
+CREATE TABLE IF NOT EXISTS session_notes (
+    id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    title TEXT NOT NULL,
+    body TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT ({_TS})
+);
+CREATE INDEX IF NOT EXISTS idx_session_notes_session ON session_notes(session_id);
 """
 
 # Tables that go ONLY in the main auth DB (MERIDIAN_DB_URL).
