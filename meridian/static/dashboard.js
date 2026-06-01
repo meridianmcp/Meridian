@@ -702,6 +702,7 @@ function buildTabBody(project) {
       <button class="vtab-btn" data-vtab="queue" title="Work Queue">🪖</button>
       <button class="vtab-btn" data-vtab="team" title="Team — per-human activity">👥</button>
       <button class="vtab-btn" data-vtab="notes" title="Notes — per-project wiki">📝</button>
+      <button class="vtab-btn" data-vtab="hitl" title="HITL — Human-in-the-Loop queue">❓</button>
       <button class="vtab-btn" data-vtab="docs" title="MCP Tool Reference">📖</button>
       <button class="vtab-btn" data-vtab="settings" title="Notification Settings">🔔</button>
     </div>
@@ -910,6 +911,23 @@ function buildTabBody(project) {
           </div>
         </div>
       </div>
+      <div class="drawer-panel" id="drawer-hitl-${project.id}">
+        <div class="drawer-header" style="justify-content:space-between">
+          <span>HITL QUEUE · ${escapeHtml(project.name)}</span>
+          <div style="display:flex;gap:6px;align-items:center">
+            <select id="hitl-status-filter-${project.id}" style="background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:2px 6px">
+              <option value="pending">pending</option>
+              <option value="all">all</option>
+              <option value="answered">answered</option>
+              <option value="dismissed">dismissed</option>
+            </select>
+            <button class="secondary" id="hitl-refresh-${project.id}" style="padding:2px 8px;font-size:10px">refresh</button>
+          </div>
+        </div>
+        <div style="flex:1;overflow-y:auto;padding:14px;font-family:'IBM Plex Mono',monospace;font-size:12px" id="hitl-body-${project.id}">
+          <div class="empty" style="color:var(--muted)">loading HITL queue…</div>
+        </div>
+      </div>
       <div class="drawer-panel" id="drawer-docs-${project.id}">
         <div class="drawer-header">
           <span>MCP TOOL REFERENCE</span>
@@ -1032,6 +1050,7 @@ function buildTabBody(project) {
         if (vtab === 'live') loadLiveTab(project.id);
         if (vtab === 'team') loadTeamTab(project.id);
         if (vtab === 'notes') loadNotesTab(project.id);
+        if (vtab === 'hitl') loadHitlTab(project.id);
         if (vtab === 'docs') loadDocsTab(project.id);
         if (vtab === 'settings') loadSettingsTab(project.id);
       };
@@ -2688,6 +2707,92 @@ async function loadNotesTab(projectId) {
     } catch (e) { toast('add failed: ' + e.message, true); }
   };
 
+  render();
+}
+
+async function loadHitlTab(projectId) {
+  const body = document.getElementById(`hitl-body-${projectId}`);
+  const statusFilter = document.getElementById(`hitl-status-filter-${projectId}`);
+  const refreshBtn = document.getElementById(`hitl-refresh-${projectId}`);
+  if (!body) return;
+
+  const urgencyColor = { blocking: 'var(--red,#e05252)', high: 'var(--yellow,#d4a017)', normal: 'var(--muted)' };
+  const statusBadge = { pending: '#f59e0b', answered: '#22c55e', dismissed: 'var(--muted)' };
+
+  const render = async () => {
+    body.innerHTML = `<div class="empty" style="color:var(--muted)">loading…</div>`;
+    const status = (statusFilter && statusFilter.value) || 'pending';
+    const qs = status === 'all' ? '?status=all' : `?status=${status}`;
+    try {
+      const rows = await api(`/projects/${projectId}/hitl${qs}&limit=50`);
+      if (!rows || rows.length === 0) {
+        body.innerHTML = `<div style="color:var(--muted);padding:12px;text-align:center;border:1px dashed var(--border);border-radius:4px">
+          ${status === 'pending' ? 'No pending HITL requests — queue is clear ✓' : 'No items found'}
+        </div>`;
+        return;
+      }
+      const pending = rows.filter(r => r.status === 'pending');
+      const resolved = rows.filter(r => r.status !== 'pending');
+      const renderCard = (r) => {
+        const urg = r.urgency || 'normal';
+        const st = r.status || 'pending';
+        const dt = (r.created_at || '').slice(0, 16).replace('T', ' ');
+        const answerHtml = r.answer ? `<div style="margin-top:8px;padding:6px 8px;background:var(--surface-1);border-radius:3px;border-left:3px solid #22c55e;color:var(--text);font-size:11px"><b>Answer:</b> ${escapeHtml(r.answer)}</div>` : '';
+        const ctxHtml = r.context ? `<div style="margin-top:6px;color:var(--muted);font-size:11px;font-style:italic">${escapeHtml(r.context.slice(0, 200))}</div>` : '';
+        const actionBtns = st === 'pending' ? `
+          <div style="display:flex;gap:6px;margin-top:8px;align-items:center">
+            <input type="text" placeholder="Answer…" id="hitl-ans-${r.id}" style="flex:1;background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:11px;font-family:var(--font-mono);padding:4px 8px;outline:none">
+            <button class="primary hitl-answer-btn" data-hitl-id="${escapeHtml(r.id)}" style="padding:3px 10px;font-size:10px">Answer</button>
+            <button class="secondary hitl-dismiss-btn" data-hitl-id="${escapeHtml(r.id)}" style="padding:3px 10px;font-size:10px">Dismiss</button>
+          </div>` : '';
+        return `<div style="background:var(--surface-2);border:1px solid var(--border);border-left:3px solid ${urgencyColor[urg] || 'var(--accent)'};border-radius:0 4px 4px 0;padding:10px 12px;margin-bottom:8px">
+          <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px;margin-bottom:4px">
+            <div style="font-weight:600;font-size:12px;color:var(--text)">${escapeHtml(r.question || '')}</div>
+            <div style="display:flex;gap:4px;flex-shrink:0">
+              <span style="font-size:9px;font-weight:600;background:${urgencyColor[urg] || 'var(--accent)'}22;color:${urgencyColor[urg] || 'var(--accent)'};padding:1px 6px;border-radius:3px">${escapeHtml(urg)}</span>
+              <span style="font-size:9px;font-weight:600;background:${statusBadge[st] || 'var(--muted)'}22;color:${statusBadge[st] || 'var(--muted)'};padding:1px 6px;border-radius:3px">${escapeHtml(st)}</span>
+            </div>
+          </div>
+          <div style="color:var(--muted);font-size:10px">${escapeHtml(dt)}${r.assigned_to ? ' · @' + escapeHtml(r.assigned_to) : ''}</div>
+          ${ctxHtml}${answerHtml}${actionBtns}
+        </div>`;
+      };
+      let html = pending.map(renderCard).join('');
+      if (resolved.length > 0) {
+        html += `<div style="color:var(--muted);font-size:10px;margin:12px 0 6px;border-top:1px solid var(--border);padding-top:8px">RESOLVED (${resolved.length})</div>`;
+        html += resolved.map(renderCard).join('');
+      }
+      body.innerHTML = html;
+      body.querySelectorAll('.hitl-answer-btn').forEach(btn => {
+        btn.onclick = async () => {
+          const id = btn.dataset.hitlId;
+          const inp = document.getElementById(`hitl-ans-${id}`);
+          const answer = (inp && inp.value || '').trim();
+          if (!answer) { toast('answer required', true); return; }
+          try {
+            await api(`/hitl/${id}`, { method: 'PATCH', body: JSON.stringify({ action: 'answer', answer }) });
+            toast('answered ✓');
+            render();
+          } catch (e) { toast('failed: ' + e.message, true); }
+        };
+      });
+      body.querySelectorAll('.hitl-dismiss-btn').forEach(btn => {
+        btn.onclick = async () => {
+          if (!confirm('Dismiss this HITL request?')) return;
+          try {
+            await api(`/hitl/${btn.dataset.hitlId}`, { method: 'PATCH', body: JSON.stringify({ action: 'dismiss' }) });
+            toast('dismissed');
+            render();
+          } catch (e) { toast('failed: ' + e.message, true); }
+        };
+      });
+    } catch (e) {
+      body.innerHTML = `<div style="color:var(--muted)">failed to load HITL queue: ${escapeHtml(String(e))}</div>`;
+    }
+  };
+
+  if (statusFilter) statusFilter.onchange = render;
+  if (refreshBtn) refreshBtn.onclick = render;
   render();
 }
 

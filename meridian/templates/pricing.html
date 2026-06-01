@@ -306,51 +306,22 @@
   <div class="plan-card">
     <div class="plan-name">Free</div>
     <div class="plan-price">$0<small> / mo</small></div>
-    <div class="plan-subtitle"><span class="ok">30 days</span> · no card required</div>
+    <div class="plan-subtitle"><span class="ok">No card required</span> · 30-day expiry</div>
     <hr class="plan-divider">
     <ul class="plan-features">
       <li>Hosted dashboard at usemeridian.us</li>
       <li>Remote MCP endpoint (HTTPS)</li>
+      <li>All 27 MCP tools — no feature blocking</li>
+      <li>HITL queue + pinned decisions</li>
       <li>1 project · 1 concurrent session</li>
       <li>Google + GitHub + email sign-in</li>
-      <li>HITL queue + pinned decisions</li>
-      <li>Full Meridian feature set</li>
-      <li class="dim">Shared hardware (slower queries)</li>
+      <li class="dim">Shared hardware (0.5 CU pool)</li>
     </ul>
     <div class="plan-limits">
-      Shared Neon pool · 0.5 CU max · 10 CU-hr/mo included<br>
-      Expires after 30 days of inactivity
+      Shared Neon pool · 0.5 CU max · 10 CU-hr/mo<br>
+      Expires after 30 days of inactivity · no card ever required
     </div>
-    <a href="/auth/login?signup=1" class="plan-cta secondary">Start free →</a>
-  </div>
-
-  <!-- Trial (eb1a607a) -->
-  <div class="plan-card featured">
-    <div class="plan-badge">Recommended</div>
-    <div class="plan-name">Try Solo Free</div>
-    <div class="plan-price">$0<small> / 7 days</small></div>
-    <div class="plan-subtitle"><span class="ok">Full Solo experience</span> · no card required</div>
-    <hr class="plan-divider">
-    <ul class="plan-features">
-      <li>Dedicated Neon Postgres DB</li>
-      <li>Unlimited projects + sessions</li>
-      <li>No shared-hardware limits</li>
-      <li>All 21 MCP tools</li>
-      <li>HITL queue + pinned decisions</li>
-      <li>Auto-checkpoint hooks</li>
-    </ul>
-    <div class="plan-limits">
-      Trial ends after 7 days · upgrade to keep your data · no card charged at signup
-    </div>
-    {% if waitlist_mode %}
-    <form class="waitlist-form" data-plan="trial" onsubmit="submitWaitlist(event, this)">
-      <input type="email" placeholder="your@email.com" required>
-      <button type="submit">Start 7-day trial →</button>
-    </form>
-    <div class="waitlist-msg"></div>
-    {% else %}
-    <a href="/auth/login?plan=trial" class="plan-cta primary">Start 7-day trial →</a>
-    {% endif %}
+    <a href="/auth/login" class="plan-cta primary">Start free →</a>
   </div>
 
   <!-- Solo -->

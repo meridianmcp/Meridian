@@ -12,6 +12,7 @@ This module exposes two surfaces backed by the same async SQLite database:
 from __future__ import annotations
 
 import hashlib
+import html as html_module
 import json
 import asyncio
 import os
@@ -3467,6 +3468,13 @@ async def join_waitlist(request: Request) -> dict[str, Any]:
         if "UNIQUE" in str(exc) or "unique" in str(exc):
             raise HTTPException(status_code=409, detail="email already on waitlist")
         raise
+    # Fire-and-forget confirmation email — never block the response
+    if _hosted_mode():
+        try:
+            from .hosted import send_waitlist_confirmation_email  # noqa: PLC0415
+            asyncio.create_task(send_waitlist_confirmation_email(email))
+        except Exception:
+            pass
     return entry
 
 
@@ -3475,6 +3483,102 @@ async def list_waitlist(request: Request) -> list[dict[str, Any]]:
     """GET all waitlist entries, newest first. Admin use only."""
     db = request.app.state.db
     return await db_module.get_waitlist(db)
+
+
+@app.get("/admin/waitlist", response_class=HTMLResponse)
+async def admin_waitlist_page(request: Request) -> HTMLResponse:
+    """Admin waitlist management page — shows signups, tenant stats, approve/delete buttons."""
+    from .hosted import get_current_tenant, is_admin_db  # noqa: PLC0415
+
+    try:
+        tenant = await get_current_tenant(request)
+    except HTTPException:
+        return HTMLResponse("<h1>403</h1><p>Not authenticated.</p>", status_code=403)
+    if not await is_admin_db(tenant.get("email", ""), request.app.state.db):
+        return HTMLResponse("<h1>403</h1><p>Admin only.</p>", status_code=403)
+
+    db = request.app.state.db
+    entries = await db_module.get_waitlist(db)
+
+    async def _count(sql: str) -> int:
+        async with db.execute(sql) as cur:
+            row = await cur.fetchone()
+        return (row[0] if row else 0) or 0
+
+    total_tenants = await _count("SELECT COUNT(*) FROM tenants")
+    free_tenants = await _count("SELECT COUNT(*) FROM tenants WHERE plan='free'")
+    paid_tenants = await _count("SELECT COUNT(*) FROM tenants WHERE plan NOT IN ('free','') AND plan IS NOT NULL")
+
+    rows_html = "".join(
+        f"""<tr>
+          <td style="padding:6px 10px;border-bottom:1px solid #2a2d35">{html_module.escape(e.get("email",""))}</td>
+          <td style="padding:6px 10px;border-bottom:1px solid #2a2d35;color:#8b8fa8;font-size:11px">{html_module.escape((e.get("created_at") or "")[:16])}</td>
+          <td style="padding:6px 10px;border-bottom:1px solid #2a2d35;color:#8b8fa8;font-size:11px">{html_module.escape(e.get("note") or "")}</td>
+          <td style="padding:6px 10px;border-bottom:1px solid #2a2d35">
+            <button onclick="delWL('{html_module.escape(e.get('id',''))}',this)" style="background:#2a0f0f;border:1px solid #5a1a1a;color:#e05252;border-radius:3px;padding:2px 8px;font-size:10px;cursor:pointer">Delete</button>
+          </td>
+        </tr>"""
+        for e in entries
+    ) or "<tr><td colspan='4' style='padding:16px;text-align:center;color:#8b8fa8'>No waitlist entries.</td></tr>"
+
+    html = f"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Admin — Waitlist — Meridian</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+*{{box-sizing:border-box;margin:0;padding:0}}
+body{{background:#0d0d0f;color:#e8eaf0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;padding:32px 24px}}
+h1{{font-size:1.4rem;margin-bottom:8px}}nav a{{color:#6c8fff;text-decoration:none;font-size:13px;margin-right:16px}}
+.stats{{display:flex;gap:16px;margin:20px 0}}
+.stat{{background:#16181c;border:1px solid #2a2d35;border-radius:8px;padding:12px 18px;min-width:120px}}
+.stat .n{{font-size:1.6rem;font-weight:700;color:#6c8fff}}.stat .l{{font-size:11px;color:#8b8fa8;margin-top:2px}}
+table{{width:100%;border-collapse:collapse;background:#16181c;border:1px solid #2a2d35;border-radius:8px;overflow:hidden;margin-top:16px}}
+th{{padding:8px 10px;text-align:left;background:#1e2029;font-size:11px;color:#8b8fa8;border-bottom:1px solid #2a2d35}}
+tr:hover td{{background:#1a1c23}}
+</style>
+</head>
+<body>
+<nav><a href="/dashboard">← Dashboard</a> <a href="/admin/health">Health</a></nav>
+<h1 style="margin-top:16px">Waitlist Management</h1>
+<p style="color:#8b8fa8;font-size:13px;margin-top:4px">{len(entries)} total signup{"s" if len(entries)!=1 else ""}</p>
+<div class="stats">
+  <div class="stat"><div class="n">{len(entries)}</div><div class="l">Waitlist</div></div>
+  <div class="stat"><div class="n">{total_tenants}</div><div class="l">Total Tenants</div></div>
+  <div class="stat"><div class="n">{free_tenants}</div><div class="l">Free Plan</div></div>
+  <div class="stat"><div class="n">{paid_tenants}</div><div class="l">Paid Plan</div></div>
+</div>
+<table>
+<thead><tr><th>Email</th><th>Signed Up</th><th>Note</th><th>Action</th></tr></thead>
+<tbody id="wl-body">{rows_html}</tbody>
+</table>
+<script>
+async function delWL(id, btn) {{
+  if (!confirm('Delete this waitlist entry?')) return;
+  const r = await fetch('/admin/waitlist/' + id, {{method:'DELETE'}});
+  if (r.ok) {{ btn.closest('tr').remove(); }} else {{ alert('Failed: ' + r.status); }}
+}}
+</script>
+</body></html>"""
+    return HTMLResponse(html)
+
+
+@app.delete("/admin/waitlist/{entry_id}")
+async def admin_delete_waitlist_entry(entry_id: str, request: Request) -> dict[str, Any]:
+    """Delete a waitlist entry by id. Admin only."""
+    from .hosted import get_current_tenant, is_admin_db  # noqa: PLC0415
+
+    try:
+        tenant = await get_current_tenant(request)
+    except HTTPException:
+        raise HTTPException(status_code=403, detail="not authenticated")
+    if not await is_admin_db(tenant.get("email", ""), request.app.state.db):
+        raise HTTPException(status_code=403, detail="admin only")
+    db = request.app.state.db
+    await db.execute("DELETE FROM waitlist WHERE id = ?", (entry_id,))
+    await db.commit()
+    return {"deleted": True, "id": entry_id}
 
 
 @app.get("/waitlist-pending")
