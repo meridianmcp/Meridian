@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""MCP tool smoke test — db68159c.
+"""MCP tool smoke test -- db68159c.
 
 Calls all 27 tools via the HTTP /mcp endpoint against a running Meridian server.
 Each tool is called with minimal valid args. Verifies non-error response.
@@ -73,7 +73,7 @@ def get_result(resp: dict[str, Any]) -> Any:
 
 def check(label: str, ok: bool, detail: str = "") -> bool:
     status = PASS if ok else FAIL
-    print(f"  [{status}] {label}" + (f" — {detail}" if detail else ""))
+    print(f"  [{status}] {label}" + (f" -- {detail}" if detail else ""))
     return ok
 
 
@@ -91,7 +91,7 @@ def main() -> int:
     decision_id = None
     sprint_note_session_id = None
 
-    print(f"\nMCP tool smoke test (27 tools) — {mcp_url}\n")
+    print(f"\nMCP tool smoke test (27 tools) -- {mcp_url}\n")
 
     # Initialize
     init_payload = json.dumps({"jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {"protocolVersion": "2024-11-05", "clientInfo": {"name": "smoke-test", "version": "1.0"}, "capabilities": {}}}).encode()
@@ -112,7 +112,7 @@ def main() -> int:
         failures += 1
 
     if not project_id:
-        print("  Cannot proceed without project_id — aborting\n")
+        print("  Cannot proceed without project_id -- aborting\n")
         return 1
 
     # 2. start_session

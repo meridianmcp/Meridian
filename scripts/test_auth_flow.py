@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Auth flow tests — 56e04df2.
+"""Auth flow tests -- 56e04df2.
 
 Uses Playwright (headless Chrome) to test auth pages against live/local site.
 Falls back to urllib checks if Playwright is not installed.
@@ -47,7 +47,7 @@ def post(url: str, data: dict, timeout: int = 15) -> tuple[int, str]:
 
 def check(label: str, ok: bool, detail: str = "") -> bool:
     status = PASS if ok else FAIL
-    print(f"  [{status}] {label}" + (f" — {detail}" if detail else ""))
+    print(f"  [{status}] {label}" + (f" -- {detail}" if detail else ""))
     return ok
 
 
@@ -58,13 +58,13 @@ def run_urllib_checks(base: str) -> int:
     # 1. /auth/login loads, shows OAuth buttons
     code, body = get(f"{base}/auth/login")
     ok = code == 200 and ("Google" in body or "GitHub" in body or "Sign in" in body)
-    if not check("/auth/login → 200 + sign-in options", ok, f"code={code}"):
+    if not check("/auth/login -> 200 + sign-in options", ok, f"code={code}"):
         failures += 1
 
-    # 2. /dashboard without auth → redirect to /auth/login (not 500)
+    # 2. /dashboard without auth -> redirect to /auth/login (not 500)
     code, body = get(f"{base}/dashboard")
     ok = code not in (500, -1)
-    if not check("/dashboard without auth → not 500", ok, f"code={code}"):
+    if not check("/dashboard without auth -> not 500", ok, f"code={code}"):
         failures += 1
 
     # 3. /demo loads without auth
@@ -76,20 +76,20 @@ def run_urllib_checks(base: str) -> int:
     # 4. /pricing loads, shows 3 plan cards (Free, Solo, Team)
     code, body = get(f"{base}/pricing")
     ok = code == 200 and "Free" in body and "Solo" in body and "Team" in body
-    if not check("/pricing → 200 + Free/Solo/Team cards", ok, f"code={code}"):
+    if not check("/pricing -> 200 + Free/Solo/Team cards", ok, f"code={code}"):
         failures += 1
 
     # 5. /waitlist-pending loads (not 500)
     code, body = get(f"{base}/waitlist-pending")
     ok = code not in (500, -1)
-    if not check("/waitlist-pending → not 500", ok, f"code={code}"):
+    if not check("/waitlist-pending -> not 500", ok, f"code={code}"):
         failures += 1
 
-    # 6. POST /waitlist with real email → 201 or 409
+    # 6. POST /waitlist with real email -> 201 or 409
     test_email = f"test-auth-check-{uuid.uuid4().hex[:8]}@meridian-test.invalid"
     code, body = post(f"{base}/waitlist", {"email": test_email})
     ok = code in (201, 409)
-    if not check("POST /waitlist → 201 or 409", ok, f"code={code}"):
+    if not check("POST /waitlist -> 201 or 409", ok, f"code={code}"):
         failures += 1
 
     # 7. SITE_PASSWORD not set (page loads without password prompt)
@@ -106,7 +106,7 @@ def run_playwright_checks(base: str) -> int:
     try:
         from playwright.sync_api import sync_playwright  # type: ignore[import]
     except ImportError:
-        print(f"  [{SKIP}] Playwright not installed — run: pip install playwright && playwright install chromium")
+        print(f"  [{SKIP}] Playwright not installed -- run: pip install playwright && playwright install chromium")
         return 0
 
     failures = 0
@@ -141,7 +141,7 @@ def main() -> int:
     args = parser.parse_args()
 
     base = args.url.rstrip("/")
-    print(f"\nAuth flow tests — {base}\n")
+    print(f"\nAuth flow tests -- {base}\n")
 
     failures = run_urllib_checks(base)
     if args.playwright:

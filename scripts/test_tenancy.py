@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tenancy stress test — ceb8966f.
+"""Tenancy stress test -- ceb8966f.
 
 Verifies free-tier and plan-level limits against a running Meridian instance.
 Creates fake tenant accounts via direct DB insert (no OAuth), tests the API,
@@ -9,7 +9,7 @@ Usage:
     pixi run python scripts/test_tenancy.py [--url http://localhost:7878] [--db data/meridian.db]
 
 Exit code: 0 if all ran assertions pass, 1 if any fail.
-SKIP items are not counted as failures — they document unimplemented enforcement.
+SKIP items are not counted as failures -- they document unimplemented enforcement.
 """
 
 from __future__ import annotations
@@ -69,17 +69,17 @@ _skipped: list[str] = []
 
 def passed(name: str, detail: str = "") -> None:
     _results.append((name, True, detail))
-    print(f"  [PASS] {name}" + (f" — {detail}" if detail else ""))
+    print(f"  [PASS] {name}" + (f" -- {detail}" if detail else ""))
 
 
 def failed(name: str, detail: str = "") -> None:
     _results.append((name, False, detail))
-    print(f"  [FAIL] {name}" + (f" — {detail}" if detail else ""))
+    print(f"  [FAIL] {name}" + (f" -- {detail}" if detail else ""))
 
 
 def skip(name: str, reason: str = "") -> None:
     _skipped.append(name)
-    print(f"  [SKIP] {name}" + (f" — {reason}" if reason else ""))
+    print(f"  [SKIP] {name}" + (f" -- {reason}" if reason else ""))
 
 
 def assert_eq(name: str, actual, expected, detail: str = "") -> bool:
@@ -87,7 +87,7 @@ def assert_eq(name: str, actual, expected, detail: str = "") -> bool:
     if ok:
         passed(name, detail or f"got {actual!r}")
     else:
-        failed(name, f"expected {expected!r}, got {actual!r}" + (f" — {detail}" if detail else ""))
+        failed(name, f"expected {expected!r}, got {actual!r}" + (f" -- {detail}" if detail else ""))
     return ok
 
 
@@ -101,7 +101,7 @@ def assert_in(name: str, needle, haystack, detail: str = "") -> bool:
 
 
 # ---------------------------------------------------------------------------
-# DB helpers — direct SQLite insert (no OAuth)
+# DB helpers -- direct SQLite insert (no OAuth)
 # ---------------------------------------------------------------------------
 
 async def _direct_insert_tenant(
@@ -114,7 +114,7 @@ async def _direct_insert_tenant(
     try:
         import aiosqlite
     except ImportError:
-        print("ERROR: aiosqlite not installed — run: pixi run python -c 'import aiosqlite'")
+        print("ERROR: aiosqlite not installed -- run: pixi run python -c 'import aiosqlite'")
         sys.exit(1)
 
     tid = str(uuid.uuid4())
@@ -196,18 +196,18 @@ async def _get_project_count_for_email(db_path: str, email: str) -> int:
 # ---------------------------------------------------------------------------
 
 async def test_free_tier_project_limit(base: str, db_path: str) -> None:
-    """(1) Free tier: 1 project OK, 2nd project → 403."""
-    print("\n[Suite] Free tier — project limit")
+    """(1) Free tier: 1 project OK, 2nd project -> 403."""
+    print("\n[Suite] Free tier -- project limit")
 
     # Non-hosted local mode doesn't enforce tenant limits via HTTP
     # (no session cookie = no tenant lookup). Skip if not in hosted mode.
     code, body = get(f"{base}/me")
     if code == 200 and isinstance(body, dict) and not body:
-        # Anonymous / non-hosted — the 1-project limit is only enforced
+        # Anonymous / non-hosted -- the 1-project limit is only enforced
         # for authenticated hosted tenants. Test via direct check.
         skip(
             "Free tier 1-project limit (HTTP)",
-            "non-hosted mode — limit only enforced for hosted OAuth sessions",
+            "non-hosted mode -- limit only enforced for hosted OAuth sessions",
         )
         return
 
@@ -215,18 +215,18 @@ async def test_free_tier_project_limit(base: str, db_path: str) -> None:
     # Direct DB test: verify the limit code path exists in server.py.
     skip(
         "Free tier 1-project limit (hosted HTTP)",
-        "requires hosted session cookie — see test_v2_hosted.py for HTTP coverage",
+        "requires hosted session cookie -- see test_v2_hosted.py for HTTP coverage",
     )
 
 
 async def test_free_tier_project_limit_direct(base: str, db_path: str) -> None:
     """Verify the free tier project limit enforcement via direct inspection."""
-    print("\n[Suite] Free tier — project limit (direct code verification)")
+    print("\n[Suite] Free tier -- project limit (direct code verification)")
 
     # Check the constraint is documented in the live server by looking at
     # the MCP tools-doc output and verifying the create_project tool exists.
     code, body = get(f"{base}/mcp/tools-doc")
-    if assert_eq("GET /mcp/tools-doc → 200", code, 200):
+    if assert_eq("GET /mcp/tools-doc -> 200", code, 200):
         assert_in(
             "create_project tool documented",
             "create_project",
@@ -235,25 +235,25 @@ async def test_free_tier_project_limit_direct(base: str, db_path: str) -> None:
 
     # Verify the /me endpoint is functional
     code, body = get(f"{base}/me")
-    assert_eq("GET /me → 200 (returns empty dict for anonymous)", code, 200)
+    assert_eq("GET /me -> 200 (returns empty dict for anonymous)", code, 200)
     if isinstance(body, dict) and not body:
-        passed("GET /me returns {} for anonymous (correct — no tenant)", f"body={body!r}")
+        passed("GET /me returns {} for anonymous (correct -- no tenant)", f"body={body!r}")
 
 
 async def test_free_tier_expiry(base: str, db_path: str) -> None:
-    """(2) Free tier 30-day expiry: expired account → account_expired error."""
-    print("\n[Suite] Free tier — 30-day expiry")
+    """(2) Free tier 30-day expiry: expired account -> account_expired error."""
+    print("\n[Suite] Free tier -- 30-day expiry")
 
     skip(
-        "Expired account → account_expired API error",
-        "TODO: expiry enforcement not yet implemented in API layer — "
+        "Expired account -> account_expired API error",
+        "TODO: expiry enforcement not yet implemented in API layer -- "
         "tracked as post-launch hardening; expiry IS computed in GET /me",
     )
 
 
 async def test_free_tier_concurrent_session(base: str, db_path: str) -> None:
     """(3) Free tier concurrent session: session A ok, session B rejected."""
-    print("\n[Suite] Free tier — 1 concurrent session limit")
+    print("\n[Suite] Free tier -- 1 concurrent session limit")
 
     skip(
         "Concurrent session limit for free tier",
@@ -266,7 +266,7 @@ async def test_trial_tier(base: str, db_path: str) -> None:
     print("\n[Suite] Trial tier")
 
     if not Path(db_path).exists():
-        skip("Trial tier tests", f"DB not found at {db_path} — run against local instance")
+        skip("Trial tier tests", f"DB not found at {db_path} -- run against local instance")
         return
 
     email = f"test-trial-{uuid.uuid4().hex[:8]}@meridian-test.invalid"
@@ -277,10 +277,10 @@ async def test_trial_tier(base: str, db_path: str) -> None:
 
     # The day-5 banner logic lives in dashboard.js (frontend) and /me (backend).
     # We verify the /me endpoint correctly computes days_remaining for this tenant.
-    # (Full HTTP test requires hosted session cookie — skipped for non-hosted.)
+    # (Full HTTP test requires hosted session cookie -- skipped for non-hosted.)
     skip(
         "Trial day-5 banner via /me (HTTP)",
-        "requires hosted session cookie — banner logic verified in JS unit tests",
+        "requires hosted session cookie -- banner logic verified in JS unit tests",
     )
 
 
@@ -297,7 +297,7 @@ async def test_solo_tier(base: str, db_path: str) -> None:
     passed("Solo tenant created in DB", f"email={email}")
     skip(
         "Solo unlimited projects (HTTP)",
-        "requires hosted session cookie — project limit bypass is in create_project route",
+        "requires hosted session cookie -- project limit bypass is in create_project route",
     )
 
 
@@ -307,7 +307,7 @@ async def test_near_storage_limit(base: str, db_path: str) -> None:
 
     skip(
         "Near-storage-limit read-only enforcement",
-        "TODO: storage enforcement not yet implemented — "
+        "TODO: storage enforcement not yet implemented -- "
         "storage_gb_used column tracked but not enforced at API layer",
     )
 
@@ -330,7 +330,7 @@ async def test_cleanup(db_path: str) -> None:
 
 async def run(base_url: str, db_path: str) -> int:
     base = base_url.rstrip("/")
-    print(f"\nMeridian tenancy stress test → {base}\n")
+    print(f"\nMeridian tenancy stress test -> {base}\n")
     print(f"DB: {db_path}\n")
     t0 = time.time()
 
@@ -359,12 +359,12 @@ async def run(base_url: str, db_path: str) -> int:
     if n_fail == 0:
         print("  ALL ASSERTIONS GREEN")
         if n_skip:
-            print(f"  {n_skip} items SKIPPED (unimplemented enforcement — see TODO comments)")
+            print(f"  {n_skip} items SKIPPED (unimplemented enforcement -- see TODO comments)")
     else:
-        print(f"  {n_fail} FAILED — fix before shipping")
+        print(f"  {n_fail} FAILED -- fix before shipping")
         for name, ok, detail in _results:
             if not ok:
-                print(f"    ✗ {name}: {detail}")
+                print(f"    X {name}: {detail}")
     print(f"{'='*50}\n")
 
     return 1 if n_fail > 0 else 0

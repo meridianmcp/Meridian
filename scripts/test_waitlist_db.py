@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Waitlist DB integrity check — 0fe7544c.
+"""Waitlist DB integrity check -- 0fe7544c.
 
 Verifies the waitlist table against the live auth DB.
 Run the morning of HN launch to confirm the list is clean and ready.
@@ -25,7 +25,7 @@ EMAIL_RE = re.compile(r"^[^@]+@[^@]+\.[^@]+$")
 
 def check(label: str, ok: bool, detail: str = "") -> bool:
     status = PASS if ok else FAIL
-    print(f"  [{status}] {label}" + (f" — {detail}" if detail else ""))
+    print(f"  [{status}] {label}" + (f" -- {detail}" if detail else ""))
     return ok
 
 
@@ -38,19 +38,19 @@ async def main() -> int:
     db_path = os.environ.get("MERIDIAN_DB", args.db)
 
     if db_path.startswith(("postgresql://", "postgres://")):
-        print("Postgres DB — using psycopg3 via meridian pg_adapter")
+        print("Postgres DB -- using psycopg3 via meridian pg_adapter")
         from meridian.pg_adapter import open_pg_connection  # noqa: PLC0415
         db = await open_pg_connection(db_path)
     else:
         if not Path(db_path).exists():
-            print(f"\n[{SKIP}] DB not found at {db_path} — skipping (run `pixi run start` first)\n")
+            print(f"\n[{SKIP}] DB not found at {db_path} -- skipping (run `pixi run start` first)\n")
             return 0
         import aiosqlite  # noqa: PLC0415
         db = await aiosqlite.connect(db_path)
         db.row_factory = aiosqlite.Row
 
     failures = 0
-    print(f"\nWaitlist DB integrity check — {db_path}\n")
+    print(f"\nWaitlist DB integrity check -- {db_path}\n")
 
     # 1. Count total waitlist rows
     async with db.execute("SELECT COUNT(*) FROM waitlist") as cur:

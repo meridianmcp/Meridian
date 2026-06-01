@@ -1,4 +1,4 @@
-# Byte-compiled / optimized / DLL files
+﻿# Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
 *$py.class
@@ -228,11 +228,11 @@ DECISIONS.md
 ROADMAP.md
 secrets.env
 secrets.local.env
-# Session handoff files contain internal strategy — never commit
+# Session handoff files contain internal strategy â€” never commit
 data/meridian-build_handoff.md
 data/chinampa_churchill.md
 
-# Local dev overrides — never commit credentials
+# Local dev overrides â€” never commit credentials
 .env.local
 CLAUDE.local.md
 
@@ -242,5 +242,6 @@ meridian.toml
 !.cliff.toml
 CONNECT.txt
 
-# Local integration test artifacts
-tests/integration/
+# Local integration test artifacts (results only)
+tests/integration/results.txt
+

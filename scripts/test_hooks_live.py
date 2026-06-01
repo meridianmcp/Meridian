@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Hook endpoints + installer script validation — df3d6b90 + 2137cefb.
+"""Hook endpoints + installer script validation -- df3d6b90 + 2137cefb.
 
 Tests:
 1. POST /hooks/session-start against live URL
@@ -45,7 +45,7 @@ def post(url: str, data: dict, timeout: int = 15) -> tuple[int, str]:
 
 def check(label: str, ok: bool, detail: str = "") -> bool:
     status = PASS if ok else FAIL
-    print(f"  [{status}] {label}" + (f" — {detail}" if detail else ""))
+    print(f"  [{status}] {label}" + (f" -- {detail}" if detail else ""))
     return ok
 
 
@@ -60,7 +60,7 @@ def main() -> int:
     pid = args.project_id
     failures = 0
 
-    print(f"\nHook endpoint + installer validation — {base}\n")
+    print(f"\nHook endpoint + installer validation -- {base}\n")
 
     # ---- Live endpoint checks --------------------------------------------------
     if args.skip_live:
@@ -79,13 +79,13 @@ def main() -> int:
         except Exception:
             ok = False
             detail = f"code={code}, JSON parse failed: {body[:100]}"
-        if not check("POST /hooks/session-start → 200 + additionalContext", ok, detail):
+        if not check("POST /hooks/session-start -> 200 + additionalContext", ok, detail):
             failures += 1
 
         # 2. POST /hooks/stop
         code, body = post(f"{base}/hooks/stop", {"project_id": pid})
         ok = code == 200
-        if not check("POST /hooks/stop → 200", ok, f"got {code}"):
+        if not check("POST /hooks/stop -> 200", ok, f"got {code}"):
             failures += 1
 
     # ---- hooks.sh checks -------------------------------------------------------

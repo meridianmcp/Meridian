@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Launch morning script — e38a3888.
+"""Launch morning script -- e38a3888.
 
 Run this the morning of HN launch. Unsets SITE_PASSWORD, waits for
 the machine to restart, then verifies all key endpoints are healthy.
@@ -16,8 +16,8 @@ import time
 import urllib.error
 import urllib.request
 
-PASS = "\033[32m✓\033[0m"
-FAIL = "\033[31m✗\033[0m"
+PASS = "\033[32mOK\033[0m"
+FAIL = "\033[31mX\033[0m"
 
 BASE_URL = "https://usemeridian.us"
 
@@ -78,7 +78,7 @@ def main() -> int:
     print(f"\n[3/6] Checking {base}/health...")
     ok, detail = check_url(f"{base}/health")
     status = PASS if ok else FAIL
-    print(f"  [{status}] /health — {detail}")
+    print(f"  [{status}] /health -- {detail}")
     if not ok:
         failures += 1
 
@@ -86,7 +86,7 @@ def main() -> int:
     print(f"\n[4/6] Checking {base}/demo...")
     ok, detail = check_url(f"{base}/demo", expected_text="backend-api-v2")
     status = PASS if ok else FAIL
-    print(f"  [{status}] /demo — {detail}")
+    print(f"  [{status}] /demo -- {detail}")
     if not ok:
         failures += 1
 
@@ -94,7 +94,7 @@ def main() -> int:
     print(f"\n[5/6] Checking {base}/pricing...")
     ok, detail = check_url(f"{base}/pricing", expected_text="Free")
     status = PASS if ok else FAIL
-    print(f"  [{status}] /pricing — {detail}")
+    print(f"  [{status}] /pricing -- {detail}")
     if not ok:
         failures += 1
 
@@ -102,18 +102,18 @@ def main() -> int:
     print(f"\n[6/6] Checking {base}/auth/login...")
     ok, detail = check_url(f"{base}/auth/login")
     status = PASS if ok else FAIL
-    print(f"  [{status}] /auth/login — {detail}")
+    print(f"  [{status}] /auth/login -- {detail}")
     if not ok:
         failures += 1
 
     print("\n" + "=" * 55)
     if failures == 0:
-        print(f"  [{PASS}] Site is live and healthy — ready to post.")
+        print(f"  [{PASS}] Site is live and healthy -- ready to post.")
         print("\n  HN post template: SHOW_HN.md")
         print("  Post time: 9-10am ET from home IP")
         print("  Upvote once immediately after posting")
     else:
-        print(f"  [{FAIL}] {failures} check(s) FAILED — do NOT post until fixed.")
+        print(f"  [{FAIL}] {failures} check(s) FAILED -- do NOT post until fixed.")
     print("=" * 55 + "\n")
 
     return 0 if failures == 0 else 1
