@@ -232,6 +232,10 @@ secrets.local.env
 data/meridian-build_handoff.md
 data/chinampa_churchill.md
 
+# Local dev overrides — never commit credentials
+.env.local
+CLAUDE.local.md
+
 meridian.toml
 *.toml
 !pixi.toml

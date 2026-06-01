@@ -1,62 +1,97 @@
-# CONTRIBUTING
+# Contributing to Meridian
 
-## Before you contribute
+Thanks for looking. Meridian is built with Meridian — every sprint item in this repo was tracked via its own MCP tools. If you contribute, you can do the same.
 
-Read OWNERSHIP.md. By submitting a pull request or commit to this repository
-you acknowledge that:
+## Local setup
 
-1. Your contribution is your original work.
-2. You grant joint ownership of your contribution to the existing project owners
-   as described in OWNERSHIP.md.
-3. You have read and agree to the LICENSE (MSL-1.0) — no commercial use without
-   written permission from Adam Camerer.
+**Requirements:** Python 3.11–3.12, [pixi](https://pixi.sh)
 
-Add yourself to CONTRIBUTORS.md in your first PR.
+```bash
+git clone https://github.com/meridianmcp/Meridian
+cd Meridian
+cp .env.local.example .env.local   # fill in test credentials (optional)
+pixi run start                      # installs deps, starts server at localhost:7878
+```
 
-## Session startup protocol
-
-Every Claude Code session working on this project MUST:
-
-1. Run `pixi run start` to ensure Meridian is running at localhost:7878
-2. Call `register_session(project_id, session_name, human_id="yourname")`
-3. Call `get_goal(project_id)` — read before touching any code
-4. Call `log_task` frequently — keep other sessions informed
-5. Call `generate_handoff` before ending if context is filling up
-
-**Project ID:** `5787cc92-ba7d-4788-b17c-28ab7938b839`
-
-## Code standards
-
-- **Surgical edits only** — never rewrite whole files
-- `pixi run test` must pass (all tests green) before every commit
-- `dashboard.py` is large — find/replace only, never read and rewrite the whole file
-- Commit after every logical unit: `git commit -m "feat: vX.Y.Z — description"`
-
-## Pull request process
-
-1. Open a PR against `main`
-2. All tests must pass
-3. At least one review from Adam Camerer required to merge
-4. Reference the relevant task log entry from Meridian in the PR description
-
-## What goes where
-
-| File | Purpose |
-|------|---------|
-| `meridian/db.py` | SQLite schema and async database functions |
-| `meridian/server.py` | FastAPI REST endpoints + MCP tool handlers |
-| `meridian/dashboard.py` | Single-file dashboard HTML + JS + SSE chat |
-| `meridian/models.py` | Pydantic v2 request/response models |
-| `meridian/enqueue.py` | Async worker subprocess lifecycle |
-| `meridian/handoff.py` | Handoff file generation |
-| `tests/test_core.py` | Full test suite |
-| `ROADMAP.md` | Version plan — check before starting new work |
-| `DEVLOG.md` | Incident log — read before debugging |
+Open `http://localhost:7878` — you should see the dashboard.
 
 ## Running tests
 
 ```bash
-pixi run test
+pixi run test          # full suite (535+ expected)
+pixi run test -k foo   # single test filter
 ```
 
-All tests must pass before committing. No exceptions.
+All tests must pass before pushing. No exceptions.
+
+## Dev rules
+
+- **Push to `dev`, not `main`.** `main` triggers a production deploy. Work on a feature branch or push to `dev` and PR.
+- **Read before editing.** Key files are large. Always `Read` the relevant file before making changes.
+- **Surgical edits.** Don't rewrite whole files — find the exact location and edit just what needs changing.
+- **Commit often.** One logical unit per commit. Format: `feat: description` / `fix: description`.
+- **pixi run test passes** before every push. If you break tests, fix them before pushing.
+
+## psycopg3 rules (non-negotiable)
+
+The DB layer uses psycopg3, not asyncpg or sqlite3 directly. These rules prevent silent bugs:
+
+| Rule | Correct | Wrong |
+|------|---------|-------|
+| Placeholders | `%s` | `?` |
+| LIKE patterns | `%%foo%%` | `%foo%` |
+| Pool usage | `async with self._pool.connection() as conn:` | don't hold connections manually |
+| Fetch result | `row["col_name"]` | `row[0]` |
+| Commit | never call `conn.commit()` — autocommit=True | `await conn.commit()` |
+
+Violations cause silent data corruption or crashes on Postgres. The adapter converts `?` → `%s` for SQLite compatibility but not the reverse.
+
+## Key files
+
+| File | What it is |
+|------|------------|
+| `meridian/server.py` | FastAPI app, all HTTP routes, MCP tool dispatch |
+| `meridian/db/__init__.py` | All DB operations, SQLite + Postgres compatible |
+| `meridian/pg_adapter.py` | psycopg3 pool wrapper — read before writing SQL |
+| `meridian/hosted.py` | OAuth, Stripe, tenant routing |
+| `meridian/routes/decisions.py` | Decisions CRUD — example of route module pattern |
+| `meridian/static/dashboard.js` | All frontend JS — single file |
+| `meridian/static/dashboard.css` | CSS variables + component styles |
+| `meridian/handoff.py` | Handoff generation (L0/L1/L2) |
+| `tests/test_core.py` | Full test suite (~540 tests) |
+
+## Adding a new MCP tool
+
+1. **Add the tool definition** to `_MCP_TOOLS_LIST` in `meridian/server.py` — name, description, inputSchema.
+2. **Add an example** to `TOOL_EXAMPLES` dict in `server.py`.
+3. **Add the handler** in the `if name == "..."` dispatch block (search for `if name == "pin_decision"` to find the pattern).
+4. **Add a DB function** in `meridian/db/__init__.py` if needed.
+5. **Write tests** in `tests/test_core.py` — at minimum one HTTP round-trip test and one MCP dispatch test.
+6. **Regenerate the docs**: `pixi run python -c "import asyncio; from meridian import server as s; open('docs/mcp-tools.md','w').write(asyncio.run(s.mcp_tools_doc()))"`
+
+The test `test_docs_mcp_tools_matches_live_tool_doc` will fail if you add a tool without regenerating docs.
+
+## Dogfood your contributions
+
+Meridian tracks its own development. If you're making a significant contribution:
+
+```python
+# In Claude Code / Cursor connected to a Meridian MCP server:
+start_session(project_id="<your_project_id>", session_name="feature-x")
+log_task(session_id="...", project_id="...", description="Implemented X")
+checkpoint(session_id="...", project_id="...")
+```
+
+You don't have to use the Meridian project's own MCP server — spin up your own local instance and use it to track your PR work. It's the best way to understand the product.
+
+## What makes a good PR
+
+- Fixes one thing or adds one coherent feature
+- Has tests (existing or new)
+- Doesn't break the test suite
+- Includes a description of what you tested and how
+- References any related issue or sprint item if applicable
+
+## Questions
+
+Open a GitHub issue. Or post in the HN thread — I check it.

@@ -1,105 +1,105 @@
-# CLAUDE.md — Meridian Project
+# CLAUDE.md — Meridian User Template
 
-<context>
-Meridian is a production SaaS product at v2.3, live at usemeridian.us.
-It is an open-source MCP server + dashboard that gives AI coding sessions
-shared persistent memory, task coordination, and human-in-the-loop tooling.
+This file is read by Claude Code at session start. Copy it to your project root and
+fill in your `project_id` to get Meridian session coordination automatically.
 
-This is NOT a demo or prototype. It is a real product with real infrastructure.
-DO NOT scaffold, stub, or simplify. Write production-quality code only.
+---
 
-Repo: C:\Users\13144\Documents\Meridian\repository
-Live: https://usemeridian.us
-Project ID: 5787cc92-ba7d-4788-b17c-28ab7938b839
-</context>
+## Connect to Meridian
 
-<rules>
-ALWAYS:
-- Run `pixi run test` before and after any change. Target: 350+ passing.
-- Call `log_task` after every meaningful action via Meridian MCP.
-- Call `complete_sprint_item(item_id, project_id)` for EVERY sprint item worked on — never skip this.
-- Call `set_decision` for any architectural or irreversible choice.
-- Call `generate_handoff` before ending a session.
-- Read dashboard.js + dashboard.css before touching any UI.
-- Read db.py before touching any DB schema or queries.
-- Read pg_adapter.py before writing any SQL — psycopg3 uses %s not ?.
+```json
+{
+  "mcpServers": {
+    "meridian": {
+      "command": "pixi",
+      "args": ["run", "python", "-m", "meridian", "--mcp"],
+      "cwd": "/path/to/Meridian"
+    }
+  }
+}
+```
 
-NEVER:
-- Use asyncpg — replaced by psycopg3 entirely.
-- Use `? ` placeholders in SQL — use `%s` (adapter converts ? → %s automatically).
-- Write literal `%` in SQL LIKE patterns — write `%%` (adapter handles quoted strings).
-- Touch .env or meridian.toml — contain live credentials.
-- Push to main directly — push to dev, merge to main to deploy.
-- Use `asyncio.run()` on Windows — use `uvicorn.Server` + `loop.run_until_complete()`.
-- Import watchfiles on Windows — deadlocks ProactorEventLoop.
-- Write sensitive business strategy to any committed file — no pricing psychology, conversion tactics,
-  strategic exit valuations, degraded hardware framing, or internal competitive analysis in DEVLOG.md,
-  ROADMAP.md, GOAL.md, DECISIONS.md, CHANGELOG.md or any .md in the public repo.
-</rules>
+Or use the hosted tier (no install):
+```json
+{
+  "mcpServers": {
+    "meridian": {
+      "command": "npx",
+      "args": ["-y", "mcp-remote", "https://usemeridian.us/mcp"],
+      "env": { "BEARER_TOKEN": "sk_meridian_YOUR_TOKEN" }
+    }
+  }
+}
+```
 
-<architecture>
-STACK:
-- Python 3.12, FastAPI, psycopg3 (Postgres) + aiosqlite (SQLite fallback)
-- Uvicorn with SelectorEventLoop on Windows (see __main__.py)
-- pixi for env management, pytest for tests
-- Fly.io hosting, Neon Postgres, Resend email, Stripe billing
+---
 
-KEY FILES (read before editing):
-  meridian/server.py       — FastAPI app, lifespan, ALL routes, MCP tools
-  meridian/db.py           — ALL DB operations, SQLite + Postgres compatible
-  meridian/pg_adapter.py   — psycopg3 adapter (recently rewritten, careful)
-  meridian/hosted.py       — Auth (Google/GitHub OAuth), Stripe, Neon provisioning
-  meridian/goal_md.py      — GOAL.md bidirectional sync (skip on win32)
-  meridian/__main__.py     — Entry point, Windows SelectorEventLoop fix
-  meridian/static/dashboard.js  — ALL frontend, single file
-  meridian/static/dashboard.css — CSS variables, component styles
-  meridian/MERIDIAN.md     — Auto-injected session instructions
+## Your project ID
 
-PSYCOPG3 RULES (non-negotiable):
-  - Pool: `async with self._pool.connection() as conn:`
-  - Cursor: `async with conn.cursor() as cur:`
-  - Execute: `await cur.execute(sql, params or None)`
-  - Fetch: `rows = await cur.fetchall()` → list of dicts
-  - autocommit=True — never call conn.commit()
-  - LIKE patterns: `%%` not `%` for literal percent
+```
+PROJECT_ID=your-project-id-here
+```
 
-DB SCHEMA (key tables):
-  projects       — id, name, decisions (TEXT blob), rewind_token
-  goal_states    — id, project_id, content, north_star, sprint, version,
-                   ns_updated_at, content_updated_at, sprint_updated_at
-  sessions       — id, project_id, name, human_id, status, last_seen
-  task_log       — id, session_id, project_id, description, status, created_at
-  sprint_items   — id, project_id, version, title, status, item_group
-  tenants        — id, email, neon_project_id, neon_db_url, stripe_customer_id, plan
-</architecture>
+Get your project ID from the Meridian dashboard at `http://localhost:7878` after
+running `create_project(name="your-project")`.
 
-## Protected Files — append-only, never regenerate
-These files are written by humans and must never be bulk-overwritten by Claude Code:
-- **ROADMAP.md** — append new version sections only. Never rewrite existing content.
-- **DECISIONS.md** — append only via pin_decision tool. Never bulk rewrite.
-- **DEVLOG.md** — append session summaries only. Never rewrite existing entries.
-- **CONTRIBUTORS.md** — add new contributor rows only.
-- **LICENSE** — never touch.
-For sprint/roadmap tracking: use sprint_items DB table, not ROADMAP.md.
-For decisions: use pin_decision MCP tool, which also appends to DECISIONS.md.
+---
 
-<current_state>
-<!-- Auto-updated by Meridian. Do not edit manually. -->
-Project: meridian-build (5787cc92)
-Last updated: 2026-05-27 16:47 UTC
-Sprint: pre-launch — polish sprint: LICENSE fix, chat banner removal, demo fixes, swimlane, backburner status, session focus dropdown, Pro plan card accuracy, one-liner install
-North Star: Meridian is the open-source coordination layer for AI coding sessions — persistent memory, task tracking, and session coordination that your AI tools don't provide.  Core value: "Your AI sessions don'…
-Recent:
-  - [DONE] Validation/release: ran pixi run test across task boundaries and final main merge (524 passed, 10 skipped); committed b8
-  - [DONE] Task 1: hid restart, stop, banner restart, update banner, and check updates controls in demo mode; guarded update_availa
-  - [DONE] Task 2: isolated demo vs real dashboard localStorage state with meridian_demo_/meridian_ prefixes for tabs, active proje
-  - [DONE] Task 3: verified requested version surfaces were already 1.0.0-alpha and updated Fly MERIDIAN_VERSION secret for meridia
-  - [DONE] Claude Code docs session complete: password gate, pixi install guide, overage details, copyright 2026, logo in nav/READM
-</current_state>
+## Session rules
+
+ALWAYS at session start:
+- Call `start_session(project_id="PROJECT_ID", session_name="describe-what-youre-doing")`
+- This returns the goal, recent tasks, pending sprint items, and active sessions in one call.
+
+ALWAYS during work:
+- Call `log_task(session_id, project_id, description)` after completing meaningful work.
+- Call `pin_decision(project_id, title, body, category)` for any architectural choice.
+- Call `request_hitl(project_id, question)` when you need a human decision before continuing.
+
+ALWAYS before ending:
+- Call `checkpoint(session_id, project_id)` — snapshots progress, generates delta handoff, returns next `/goal` string.
+
+---
+
+## The 5 tools you use 90% of the time
+
+| Tool | When | Example |
+|------|------|---------|
+| `start_session` | First thing, every session | `start_session(project_id="abc", session_name="auth-refactor")` |
+| `log_task` | After finishing anything meaningful | `log_task(session_id, project_id, "Fixed OAuth redirect bug")` |
+| `checkpoint` | Before context fills, before ending | `checkpoint(session_id, project_id)` |
+| `pin_decision` | Architectural choices | `pin_decision(project_id, "Use psycopg3", "asyncpg has DLL issues on Windows", "TECHNICAL")` |
+| `request_hitl` | Blocking questions for a human | `request_hitl(project_id, "Should we rate-limit per IP or per token?")` |
+
+---
+
+## Auto-checkpoint with hooks
+
+Wire Claude Code to checkpoint automatically on every session end:
+
+```bash
+# Mac/Linux
+curl -fsSL https://usemeridian.us/hooks.sh | bash
+
+# Windows
+irm https://usemeridian.us/hooks.ps1 | iex
+```
+
+Prompts for your Meridian URL and project ID, then writes `SessionStart` and `Stop`
+hooks to `~/.claude/settings.json`. From that point on, every session auto-injects
+your project context on start and snapshots progress on end.
+
+---
+
+## Docs
+
+- Full MCP tool reference: `http://localhost:7878/mcp/tools-doc`
+- Quick reference: `http://localhost:7878/mcp/quickstart`
+- Web docs: https://docs.usemeridian.us
 
 ---
 <!-- MERIDIAN STATE — auto-generated, do not edit below -->
-## Current Sprint State  _(auto-updated 2026-05-29 09:37 UTC)_
+## Current Sprint State  _(auto-updated 2026-06-01 07:27 UTC)_
 
 **Key Files:**
 - `meridian/server.py` — FastAPI app + MCP handlers

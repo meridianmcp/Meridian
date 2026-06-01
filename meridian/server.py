@@ -780,7 +780,7 @@ async def site_password_gate(request: Request, call_next):
     if not site_pw:
         return await call_next(request)
     path = request.url.path
-    if path in ("/health", "/mcp/health", "/__gate__", "/config", "/static", "/mcp/tools-doc") or path.startswith("/static/") or path == "/demo" or path.startswith("/demo/"):
+    if path in ("/health", "/mcp/health", "/__gate__", "/config", "/static", "/mcp/tools-doc", "/mcp/quickstart") or path.startswith("/static/") or path == "/demo" or path.startswith("/demo/"):
         return await call_next(request)
     # Demo cookie bypasses site password gate — demo users don't go through __gate__
     if request.cookies.get(_DEMO_CONTEXT_COOKIE):
@@ -2902,6 +2902,48 @@ async def update_usage_caps(request: Request) -> dict[str, Any]:
     return {"status": "ok", "compute_cap": compute_cap, "storage_cap": storage_cap}
 
 
+@app.get("/mcp/quickstart", response_class=PlainTextResponse)
+async def mcp_quickstart() -> str:
+    """One-page MCP quick reference — the 5 tools you use 90% of the time.
+
+    Returns plain text cheat sheet, suitable for pasting into a new chat session
+    or displaying in the dashboard Settings tab.
+    """
+    return """\
+# Meridian MCP — Quick Reference
+
+The 5 tools you use 90% of the time:
+
+| Tool | One-liner | Example |
+|------|-----------|---------|
+| start_session | Register session, get full project context | start_session(project_id="abc-123", session_name="feature-x") |
+| log_task | Record completed work | log_task(session_id="sid", project_id="abc-123", description="Fixed OAuth redirect") |
+| checkpoint | Snapshot: auto-capture + delta handoff + next /goal | checkpoint(session_id="sid", project_id="abc-123") |
+| pin_decision | Add to live constitution | pin_decision(project_id="abc-123", title="Use psycopg3", body="asyncpg has DLL issues on Windows", category="TECHNICAL") |
+| request_hitl | Surface blocking question to human | request_hitl(project_id="abc-123", question="Rate-limit per IP or per token?", urgency="blocking") |
+
+## Session lifecycle
+
+  start_session()       ← always first
+  log_task()            ← after any meaningful work
+  pin_decision()        ← for architectural choices
+  request_hitl()        ← when you need a human call
+  checkpoint()          ← before ending / before context fills
+
+## Auto-hooks (recommended)
+
+Wire Claude Code / Codex to call these automatically:
+
+  Mac/Linux:  curl -fsSL https://usemeridian.us/hooks.sh | bash
+  Windows:    irm https://usemeridian.us/hooks.ps1 | iex
+
+## Full tool reference
+
+  GET /mcp/tools-doc     — complete markdown reference (21 tools)
+  https://docs.usemeridian.us
+"""
+
+
 @app.get("/mcp/tools-doc", response_class=PlainTextResponse)
 async def mcp_tools_doc() -> str:
     """Generate organized markdown MCP tool reference."""
@@ -2938,6 +2980,16 @@ async def mcp_tools_doc() -> str:
         "**Planner sessions** (claude.ai, planning work) — `start_session` · `pin_decision` · `update_decision` · `add_note` · `get_context_block` · `generate_handoff`\n",
         "**Executor sessions** (Claude Code, Cursor, automated workers) — `start_session` · `log_task` · `request_hitl` · `get_session_brief` · `generate_handoff`\n",
         "---\n",
+        "## Quick Reference — 5 tools you use 90% of the time\n",
+        "| Tool | One-liner | Example call |\n",
+        "|------|-----------|-------------|\n",
+        "| `start_session` | Register session, get full project context | `start_session(project_id=\"abc-123\", session_name=\"feature-x\", human_id=\"alice\")` |\n",
+        "| `log_task` | Record completed work to the shared task log | `log_task(session_id=\"sid\", project_id=\"abc-123\", description=\"Wired OAuth redirect\")` |\n",
+        "| `checkpoint` | Snapshot progress: auto-capture + delta handoff + next /goal | `checkpoint(session_id=\"sid\", project_id=\"abc-123\")` |\n",
+        "| `pin_decision` | Add an architectural decision to the live constitution | `pin_decision(project_id=\"abc-123\", title=\"Use psycopg3\", body=\"asyncpg has DLL issues on Windows\", category=\"TECHNICAL\")` |\n",
+        "| `request_hitl` | Surface a blocking question to the human queue | `request_hitl(project_id=\"abc-123\", question=\"Should we rate-limit per IP or per token?\", urgency=\"blocking\")` |\n",
+        "\n> **Tip:** Use `checkpoint()` instead of `generate_handoff()` when ending a session — it also runs `auto_capture` and returns the next `/goal` string.\n",
+        "\n---\n",
         "## Starting a session\n",
     ]
     lines += _render_tool("start_session",

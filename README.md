@@ -146,6 +146,33 @@ Point `MERIDIAN_DB_URL` at a shared Postgres (Neon free tier works great). Every
 teammate runs their own local Meridian against the same DB — instant shared
 sessions, no Meridian server in the cloud.
 
+## Auto-checkpoint with hooks
+
+One command wires Claude Code and Codex to Meridian. Every session start injects
+your project context automatically. Every session end snapshots completed work and
+writes a delta handoff.
+
+**Mac/Linux:**
+```bash
+curl -fsSL https://usemeridian.us/hooks.sh | bash
+```
+
+**Windows:**
+```powershell
+irm https://usemeridian.us/hooks.ps1 | iex
+```
+
+Prompts for your Meridian server URL (default `http://localhost:7878`) and your
+project ID. Writes to `~/.claude/settings.json` (Claude Code) or
+`~/.codex/config.toml` (Codex). After setup, every session automatically:
+
+1. **On start** — calls `POST /hooks/session-start` → injects goal, sprint items,
+   recent tasks, and pinned decisions into the session context via `additionalContext`.
+2. **On stop** — calls `POST /hooks/stop` → runs `auto_capture` and writes a delta
+   handoff so the next session resumes from where this one ended.
+
+No more manual `start_session()` calls. No lost work when context fills.
+
 ## Hosted tier
 
 | | Standard | Pro |
