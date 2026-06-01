@@ -494,6 +494,7 @@ CREATE TABLE IF NOT EXISTS waitlist (
 );
 
 -- v2.0 — hosted tier: tenants, web sessions, API bearer tokens
+-- v2.9 — free tier: trial_started_at + inactivity_expires_at
 CREATE TABLE IF NOT EXISTS tenants (
     id TEXT PRIMARY KEY,
     email TEXT NOT NULL UNIQUE,
@@ -504,8 +505,10 @@ CREATE TABLE IF NOT EXISTS tenants (
     neon_db_url TEXT,
     stripe_customer_id TEXT,
     stripe_metered_item_id TEXT,
-    plan TEXT NOT NULL DEFAULT 'standard',
+    plan TEXT NOT NULL DEFAULT 'free',
     pool_project_id TEXT,
+    trial_started_at TEXT,
+    inactivity_expires_at TEXT,
     created_at TEXT NOT NULL DEFAULT ({_TS})
 );
 
@@ -686,6 +689,7 @@ async def init_pg_db(url: str) -> PostgresConnection:
         await _migrate_pg_v10_tenant_columns(conn)
         await _migrate_pg_v25_admins_table(conn)
         await _migrate_pg_v28_dunning_and_github_sub(conn)
+        await _migrate_pg_v29_free_tier_columns(conn)
     return conn
 
 
@@ -850,6 +854,18 @@ async def _migrate_pg_v28_dunning_and_github_sub(conn: PostgresConnection) -> No
         "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS storage_gb_used NUMERIC(10,4) DEFAULT 0;"
         "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS overage_reset_at TEXT;"
         "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS compute_throttled_at TEXT"
+    )
+
+
+async def _migrate_pg_v29_free_tier_columns(conn: PostgresConnection) -> None:
+    """v2.9 — free tier columns on tenants.
+
+    trial_started_at + inactivity_expires_at support the 30-day free tier.
+    ADD COLUMN IF NOT EXISTS is idempotent — safe to run on every startup.
+    """
+    await conn.executescript(
+        "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS trial_started_at TEXT;"
+        "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS inactivity_expires_at TEXT"
     )
 
 

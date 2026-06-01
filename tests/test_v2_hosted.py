@@ -57,7 +57,9 @@ def test_upsert_tenant_creates_row():
     t = _run(_run_inner())
     assert t["email"] == "alice@example.com"
     assert t["id"] is not None
-    assert t["plan"] == "standard"
+    assert t["plan"] == "free"
+    assert t["trial_started_at"] is not None
+    assert t["inactivity_expires_at"] is not None
 
 
 def test_upsert_tenant_idempotent():

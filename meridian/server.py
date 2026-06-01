@@ -37,6 +37,7 @@ from ._deps import (
     _db,
     _data_dir,
     _is_demo_request,
+    _get_tenant_from_request,
 )
 
 
@@ -1164,6 +1165,35 @@ async def list_tools_endpoint() -> list[dict[str, Any]]:
     return _MCP_TOOLS_LIST
 
 
+@app.get("/me")
+async def me_endpoint(request: Request) -> dict[str, Any]:
+    """Return the current user's plan info. Returns {} for anonymous/self-hosted."""
+    tenant = await _get_tenant_from_request(request)
+    if tenant is None:
+        return {}
+    from datetime import datetime, timezone
+    plan = tenant.get("plan") or "standard"
+    expires_raw = tenant.get("inactivity_expires_at")
+    days_remaining: int | None = None
+    expired = False
+    if expires_raw:
+        try:
+            expires_dt = datetime.strptime(expires_raw, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+            delta = expires_dt - datetime.now(timezone.utc)
+            days_remaining = max(0, delta.days)
+            expired = delta.total_seconds() <= 0
+        except ValueError:
+            pass
+    return {
+        "plan": plan,
+        "email": tenant.get("email", ""),
+        "trial_started_at": tenant.get("trial_started_at"),
+        "inactivity_expires_at": expires_raw,
+        "days_remaining": days_remaining,
+        "expired": expired,
+    }
+
+
 @app.get("/projects", response_model=list[Project])
 async def list_projects(request: Request) -> list[dict[str, Any]]:
     """List every project."""
@@ -1180,6 +1210,14 @@ async def create_project(
         raise HTTPException(
             status_code=409, detail=f"project '{body.name}' already exists"
         )
+    tenant = await _get_tenant_from_request(request)
+    if tenant and tenant.get("plan") == "free":
+        existing_projects = await db_module.list_projects(await _db(request))
+        if len(existing_projects) >= 1:
+            raise HTTPException(
+                status_code=403,
+                detail="Free tier is limited to 1 project. Upgrade to Solo ($20/mo) for unlimited projects.",
+            )
     return await db_module.create_project(
         await _db(request), body.name, human_id=body.human_id
     )

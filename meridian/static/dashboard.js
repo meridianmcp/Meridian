@@ -116,6 +116,49 @@ async function loadServerConfig() {
     // v1.9.x — update connection indicator
     _updateConnectionIndicator(cfg);
   } catch (e) { /* offline / older server — ignore */ }
+  // v2.9 — plan badge + expiry banner for hosted users
+  try {
+    const me = await api('/me');
+    if (me && me.plan) {
+      state.tenantPlan = me.plan;
+      _renderPlanBadge(me);
+    }
+  } catch (e) { /* not hosted or not logged in */ }
+}
+
+function _renderPlanBadge(me) {
+  const planColors = { free: '#6b7280', standard: '#2563eb', pro: '#7c3aed' };
+  const planLabels = { free: 'Free', standard: 'Solo', pro: 'Pro' };
+  const plan = me.plan || 'free';
+  // Plan badge near version string
+  const verEl = document.getElementById('server-version');
+  if (verEl && !document.getElementById('plan-badge')) {
+    const badge = document.createElement('span');
+    badge.id = 'plan-badge';
+    badge.title = `${planLabels[plan] || plan} plan`;
+    badge.style = `margin-left:6px;padding:2px 7px;border-radius:10px;font-size:10px;font-weight:700;letter-spacing:0.04em;background:${planColors[plan] || '#6b7280'}22;color:${planColors[plan] || '#6b7280'};border:1px solid ${planColors[plan] || '#6b7280'}44;vertical-align:middle;text-transform:uppercase`;
+    badge.textContent = planLabels[plan] || plan;
+    verEl.parentNode.insertBefore(badge, verEl.nextSibling);
+  }
+  // Expiry warning banner at ≤25 days remaining
+  const days = me.days_remaining;
+  if (plan === 'free' && days !== null && days !== undefined && days <= 25 && !document.getElementById('expiry-banner')) {
+    const b = document.createElement('div');
+    b.id = 'expiry-banner';
+    const urgent = days <= 5;
+    b.style = `position:fixed;top:0;left:0;right:0;z-index:9998;background:${urgent ? '#dc2626' : '#d97706'};color:#fff;text-align:center;padding:5px 12px;font-size:12px;font-family:inherit;letter-spacing:0.02em`;
+    b.innerHTML = `Free tier expires in <strong>${days} day${days !== 1 ? 's' : ''}</strong>. <a href="/pricing" style="color:#fff;text-decoration:underline">Upgrade →</a>`;
+    document.body.prepend(b);
+    document.body.style.paddingTop = ((parseInt(document.body.style.paddingTop || '0', 10)) + 28) + 'px';
+  }
+  if (me.expired && !document.getElementById('expired-banner')) {
+    const b = document.createElement('div');
+    b.id = 'expired-banner';
+    b.style = 'position:fixed;top:0;left:0;right:0;z-index:9998;background:#dc2626;color:#fff;text-align:center;padding:5px 12px;font-size:12px;font-family:inherit;letter-spacing:0.02em';
+    b.innerHTML = `Free tier expired. <a href="/pricing" style="color:#fff;text-decoration:underline">Upgrade to continue →</a>`;
+    document.body.prepend(b);
+    document.body.style.paddingTop = ((parseInt(document.body.style.paddingTop || '0', 10)) + 28) + 'px';
+  }
 }
 
 // v1.9.x — show active DB connection in sidebar footer

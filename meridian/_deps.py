@@ -192,6 +192,47 @@ async def _db(request: Request) -> Any:
 
 
 # ---------------------------------------------------------------------------
+# Tenant identity helper
+# ---------------------------------------------------------------------------
+
+
+async def _get_tenant_from_request(request: Request) -> "dict | None":
+    """Return the tenant record from the auth DB for this request, or None.
+
+    Returns None in self-hosted (non-hosted) mode, demo mode, or when the
+    request carries no valid auth credential. Callers use this to check plan
+    limits without coupling every route to tenant-aware logic.
+    """
+    import hashlib as _hashlib
+
+    if not _hosted_mode():
+        return None
+    if request.cookies.get(_DEMO_CONTEXT_COOKIE):
+        return None
+
+    from .hosted import _SESSION_COOKIE, _read_session_cookie
+    from . import db as db_module
+
+    auth_db = request.app.state.db
+
+    cookie_val = request.cookies.get(_SESSION_COOKIE)
+    if cookie_val:
+        session_id = _read_session_cookie(cookie_val)
+        if session_id:
+            session = await db_module.get_user_session(auth_db, session_id)
+            if session:
+                return await db_module.get_tenant_by_id(auth_db, session["tenant_id"])
+
+    auth_header = request.headers.get("authorization", "")
+    if auth_header.startswith("Bearer "):
+        token = auth_header[7:]
+        token_hash = _hashlib.sha256(token.encode()).hexdigest()
+        return await db_module.get_tenant_from_token_hash(auth_db, token_hash)
+
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Data directory helper
 # ---------------------------------------------------------------------------
 

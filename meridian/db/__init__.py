@@ -274,6 +274,7 @@ CREATE INDEX IF NOT EXISTS idx_sprint_items_version
 
 -- v2.0 — hosted tier: tenants, web sessions, API bearer tokens
 -- v2.2 — plan updated to standard/pro (was free/pro/team)
+-- v2.9 — free tier re-introduced as default plan for new signups
 CREATE TABLE IF NOT EXISTS tenants (
     id TEXT PRIMARY KEY,
     email TEXT NOT NULL UNIQUE,
@@ -284,10 +285,11 @@ CREATE TABLE IF NOT EXISTS tenants (
     neon_db_url TEXT,
     stripe_customer_id TEXT,
     stripe_metered_item_id TEXT,
-    plan TEXT NOT NULL DEFAULT 'standard'
-        CHECK (plan IN ('standard','pro')),
+    plan TEXT NOT NULL DEFAULT 'free',
     pool_project_id TEXT,
     notification_prefs TEXT NOT NULL DEFAULT '{}',
+    trial_started_at TEXT,
+    inactivity_expires_at TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -837,6 +839,65 @@ async def _migrate_project_settings(db: aiosqlite.Connection) -> None:
     )
 
 
+async def _migrate_tenants_free_plan(db: aiosqlite.Connection) -> None:
+    """v2.9 — expand tenants.plan to allow 'free' and add trial/expiry columns.
+
+    The old plan CHECK constraint restricted values to 'standard'|'pro'.
+    SQLite can't ALTER a CHECK, so rebuild the table if constrained.
+    Also adds trial_started_at + inactivity_expires_at for the free tier.
+    """
+    async with db.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='tenants'"
+    ) as cur:
+        row = await cur.fetchone()
+    if row is None:
+        return
+    ddl = (row["sql"] if isinstance(row, dict) else row[0]) or ""
+    needs_rebuild = "CHECK (plan IN" in ddl
+    if needs_rebuild:
+        await db.execute("PRAGMA foreign_keys = OFF")
+        await db.executescript(
+            """
+            CREATE TABLE tenants_new (
+                id TEXT PRIMARY KEY,
+                email TEXT NOT NULL UNIQUE,
+                google_sub TEXT UNIQUE,
+                github_sub TEXT UNIQUE,
+                microsoft_sub TEXT UNIQUE,
+                neon_project_id TEXT,
+                neon_db_url TEXT,
+                stripe_customer_id TEXT,
+                stripe_metered_item_id TEXT,
+                plan TEXT NOT NULL DEFAULT 'free',
+                pool_project_id TEXT,
+                notification_prefs TEXT NOT NULL DEFAULT '{}',
+                trial_started_at TEXT,
+                inactivity_expires_at TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            INSERT INTO tenants_new (
+                id, email, google_sub, github_sub, microsoft_sub,
+                neon_project_id, neon_db_url, stripe_customer_id,
+                stripe_metered_item_id, plan, pool_project_id,
+                notification_prefs, created_at
+            )
+            SELECT
+                id, email, google_sub, github_sub, microsoft_sub,
+                neon_project_id, neon_db_url, stripe_customer_id,
+                stripe_metered_item_id, plan, pool_project_id,
+                COALESCE(notification_prefs, '{}'), created_at
+            FROM tenants;
+            DROP TABLE tenants;
+            ALTER TABLE tenants_new RENAME TO tenants;
+            """
+        )
+        await db.execute("PRAGMA foreign_keys = ON")
+        await db.commit()
+    # Idempotently add new columns (safe even after rebuild)
+    await _migrate_add_column_if_missing(db, "tenants", "trial_started_at", "TEXT")
+    await _migrate_add_column_if_missing(db, "tenants", "inactivity_expires_at", "TEXT")
+
+
 async def _migrate_decisions_free_category(db: aiosqlite.Connection) -> None:
     """v2.9 — drop the hard category CHECK constraint on decisions_pinned.
 
@@ -1157,6 +1218,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_sprint_item_dependencies(db)
     await _migrate_v26_client_type(db)
     await _migrate_decisions_free_category(db)
+    await _migrate_tenants_free_plan(db)
     return db
 
 
@@ -3834,10 +3896,14 @@ async def upsert_tenant(
         if updates:
             await db.commit()
         return tenant
+    from datetime import datetime, timezone, timedelta
     tid = _new_id()
+    now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    expires_str = (datetime.now(timezone.utc) + timedelta(days=30)).strftime("%Y-%m-%d %H:%M:%S")
     await db.execute(
-        "INSERT INTO tenants (id, email, google_sub, github_sub, microsoft_sub) VALUES (?, ?, ?, ?, ?)",
-        (tid, email, google_sub, github_sub, microsoft_sub),
+        "INSERT INTO tenants (id, email, google_sub, github_sub, microsoft_sub, "
+        "plan, trial_started_at, inactivity_expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (tid, email, google_sub, github_sub, microsoft_sub, "free", now_str, expires_str),
     )
     await db.commit()
     async with db.execute("SELECT * FROM tenants WHERE id = ?", (tid,)) as cur:
@@ -3868,6 +3934,7 @@ async def update_tenant(
         "compute_overage_cap_usd", "storage_overage_cap_usd",
         "compute_cu_hours_used", "storage_gb_used",
         "overage_reset_at", "compute_throttled_at",
+        "trial_started_at", "inactivity_expires_at",
     }
     updates = {k: v for k, v in fields.items() if k in allowed}
     if not updates:
