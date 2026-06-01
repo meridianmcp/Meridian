@@ -101,6 +101,20 @@ Add the same `mcpServers` block to:
 
 Restart Claude Desktop. New chats have Meridian tools.
 
+### claude.ai web (recommended for planning chat)
+
+Use [dnakov/claude-mcp](https://github.com/dnakov/claude-mcp) — included as a submodule — to bridge claude.ai to your local Meridian server:
+
+```bash
+git clone --recurse-submodules https://github.com/meridianmcp/Meridian
+```
+
+1. Open `chrome://extensions` and enable **Developer mode**
+2. Click **Load unpacked** and select `extensions/claude-mcp`
+3. Click the extension icon and set the URL to `http://localhost:7878/mcp`
+
+All 19 Meridian tools (`checkpoint`, `log_task`, `pin_decision`, etc.) are now available directly in claude.ai planning chat. No copy-pasting session output.
+
 ### Hosted tier (no install)
 
 ```json
