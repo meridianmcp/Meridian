@@ -40,13 +40,17 @@ Self-host the same product for free.
 
 ## Quickstart — binary (no Python required)
 
-Download the single-file binary for your platform, double-click (or run from terminal), and the dashboard opens at `http://localhost:7878`.
+Download the single-file binary for your platform, double-click (or run from terminal), and the dashboard opens automatically.
 
-| Platform | Download |
-|---|---|
-| Windows | [meridian.exe](https://github.com/meridianmcp/Meridian/releases/latest/download/meridian.exe) |
-| macOS (Apple Silicon) | [meridian-mac-arm64](https://github.com/meridianmcp/Meridian/releases/latest/download/meridian-mac-arm64) |
-| macOS (Intel) | [meridian-mac-x86](https://github.com/meridianmcp/Meridian/releases/latest/download/meridian-mac-x86) |
+> **Binary users skip `install.sh` entirely.** Just download, run, and wire hooks once with `hooks.sh` / `hooks.ps1`. No Python, no pixi, no git clone.
+
+| Platform | Download | Default port |
+|---|---|---|
+| Windows | [meridian.exe](https://github.com/meridianmcp/Meridian/releases/latest/download/meridian.exe) | 7700 |
+| macOS (Apple Silicon) | [meridian-mac-arm64](https://github.com/meridianmcp/Meridian/releases/latest/download/meridian-mac-arm64) | 7700 |
+| macOS (Intel) | [meridian-mac-x86](https://github.com/meridianmcp/Meridian/releases/latest/download/meridian-mac-x86) | 7700 |
+
+Data is stored in `~/.meridian/meridian.db`. Set `MERIDIAN_PORT` to change the port.
 
 ## Quickstart — from source
 

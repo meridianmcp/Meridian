@@ -26,10 +26,14 @@ def _set_frozen_defaults() -> None:
 
 
 def _open_browser(port: int, delay: float = 1.5) -> None:
-    """Open the dashboard in the default browser after a short delay."""
+    """Open the dashboard in the default browser after a short delay.
+
+    Opens /dashboard (where the first-run setup wizard lives) rather than
+    the landing page so binary users go straight into the app.
+    """
     def _open():
         time.sleep(delay)
-        webbrowser.open(f"http://localhost:{port}")
+        webbrowser.open(f"http://localhost:{port}/dashboard")
     t = threading.Thread(target=_open, daemon=True)
     t.start()
 

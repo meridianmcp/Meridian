@@ -1840,6 +1840,17 @@ async def dashboard_html(request: Request) -> Any:
     )
 
 
+@app.get("/setup", response_class=HTMLResponse)
+async def setup_redirect(request: Request) -> Any:
+    """b6c9f20d — First-run setup alias for binary users.
+
+    Redirects to /dashboard where the first-run wizard (ez-wizard modal)
+    automatically detects no existing projects and walks the user through
+    creating their first project and connecting an MCP client.
+    """
+    return RedirectResponse(url="/dashboard", status_code=302)
+
+
 @app.get("/demo", response_class=HTMLResponse)
 async def demo_dashboard(request: Request) -> Any:
     """Public read-only demo dashboard backed by MERIDIAN_DEMO_DB_URL.
