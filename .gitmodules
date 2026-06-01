@@ -1,0 +1,3 @@
+[submodule "extensions/claude-mcp"]
+	path = extensions/claude-mcp
+	url = https://github.com/dnakov/claude-mcp
