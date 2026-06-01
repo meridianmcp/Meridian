@@ -241,3 +241,6 @@ meridian.toml
 !pixi.toml
 !.cliff.toml
 CONNECT.txt
+
+# Local integration test artifacts
+tests/integration/
