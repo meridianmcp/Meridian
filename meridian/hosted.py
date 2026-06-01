@@ -869,7 +869,7 @@ async def create_stripe_checkout_session(tenant: dict, plan: str) -> str:
     params: dict = {
         "mode": "subscription",
         "payment_method_collection": "always",
-        "subscription_data": {"trial_period_days": 7},
+        "subscription_data": {},
         "line_items": line_items,
         "metadata": {"plan": plan, "tenant_id": tenant.get("id", "")},
         "success_url": f"{base}/auth/success",
