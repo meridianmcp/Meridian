@@ -208,8 +208,7 @@ CREATE TABLE IF NOT EXISTS decisions_pinned (
     project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
     title TEXT NOT NULL,
     body TEXT NOT NULL,
-    category TEXT NOT NULL DEFAULT 'TECHNICAL'
-        CHECK (category IN ('STRATEGIC','COMPETITIVE','TECHNICAL','TACTICAL','BUSINESS','PRODUCT','ARCHITECTURAL')),
+    category TEXT NOT NULL DEFAULT 'TECHNICAL',
     status TEXT NOT NULL DEFAULT 'active'
         CHECK (status IN ('active','superseded')),
     superseded_by TEXT REFERENCES decisions_pinned(id),
@@ -692,8 +691,7 @@ async def _migrate_v24_pinned_decisions_and_hitl(db: aiosqlite.Connection) -> No
             project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
             title TEXT NOT NULL,
             body TEXT NOT NULL,
-            category TEXT NOT NULL DEFAULT 'TECHNICAL'
-                CHECK (category IN ('STRATEGIC','COMPETITIVE','TECHNICAL','TACTICAL','BUSINESS','PRODUCT','ARCHITECTURAL')),
+            category TEXT NOT NULL DEFAULT 'TECHNICAL',
             status TEXT NOT NULL DEFAULT 'active'
                 CHECK (status IN ('active','superseded')),
             superseded_by TEXT REFERENCES decisions_pinned(id),
@@ -837,6 +835,51 @@ async def _migrate_project_settings(db: aiosqlite.Connection) -> None:
         "max_pinned_decisions",
         "INTEGER NOT NULL DEFAULT 20",
     )
+
+
+async def _migrate_decisions_free_category(db: aiosqlite.Connection) -> None:
+    """v2.9 — drop the hard category CHECK constraint on decisions_pinned.
+
+    Category is now free-text (any string); the old enum was too rigid.
+    SQLite can't DROP a CHECK constraint, so rebuild the table in place.
+    No-op when the constraint is already absent.
+    """
+    async with db.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='decisions_pinned'"
+    ) as cur:
+        row = await cur.fetchone()
+    if row is None:
+        return
+    ddl = (row["sql"] if isinstance(row, dict) else row[0]) or ""
+    if "CHECK (category IN" not in ddl:
+        return  # already migrated or freshly created without constraint
+    await db.execute("PRAGMA foreign_keys = OFF")
+    await db.executescript(
+        """
+        CREATE TABLE decisions_pinned_new (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+            title TEXT NOT NULL,
+            body TEXT NOT NULL,
+            category TEXT NOT NULL DEFAULT 'TECHNICAL',
+            status TEXT NOT NULL DEFAULT 'active'
+                CHECK (status IN ('active','superseded')),
+            superseded_by TEXT REFERENCES decisions_pinned_new(id),
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        INSERT INTO decisions_pinned_new
+            SELECT id, project_id, title, body, category, status,
+                   superseded_by, created_at, updated_at
+            FROM decisions_pinned;
+        DROP TABLE decisions_pinned;
+        ALTER TABLE decisions_pinned_new RENAME TO decisions_pinned;
+        CREATE INDEX IF NOT EXISTS idx_decisions_pinned_project
+            ON decisions_pinned(project_id, status);
+        """
+    )
+    await db.execute("PRAGMA foreign_keys = ON")
+    await db.commit()
 
 
 async def _migrate_sessions_archived(db: aiosqlite.Connection) -> None:
@@ -1113,6 +1156,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_overage_fields(db)
     await _migrate_sprint_item_dependencies(db)
     await _migrate_v26_client_type(db)
+    await _migrate_decisions_free_category(db)
     return db
 
 
@@ -4006,7 +4050,7 @@ async def get_pool_project_counts(
 # v2.4 — Pinned decisions (editable constitution alongside the append-only log)
 # ---------------------------------------------------------------------------
 
-_VALID_DECISION_CATEGORIES = {
+_SUGGESTED_DECISION_CATEGORIES = {
     "STRATEGIC", "COMPETITIVE", "TECHNICAL", "TACTICAL",
     "BUSINESS", "PRODUCT", "ARCHITECTURAL",
 }
@@ -4025,11 +4069,10 @@ async def pin_decision(
     log. Use this for the "current truth" set that supersedes earlier
     statements (pricing tiers, driver choices, etc). The log captures
     micro-decisions; this captures the constitution.
+
+    category is free-text; suggested values: STRATEGIC, COMPETITIVE, TECHNICAL,
+    TACTICAL, BUSINESS, PRODUCT, ARCHITECTURAL.
     """
-    if category not in _VALID_DECISION_CATEGORIES:
-        raise ValueError(
-            f"category must be one of {sorted(_VALID_DECISION_CATEGORIES)}; got {category!r}"
-        )
     did = _new_id()
     await db.execute(
         "INSERT INTO decisions_pinned (id, project_id, title, body, category) "
@@ -4102,10 +4145,6 @@ async def update_pinned_decision(
     if title is not None:
         fields["title"] = title
     if category is not None:
-        if category not in _VALID_DECISION_CATEGORIES:
-            raise ValueError(
-                f"category must be one of {sorted(_VALID_DECISION_CATEGORIES)}"
-            )
         fields["category"] = category
     if status is not None:
         if status not in ("active", "superseded"):
@@ -4162,6 +4201,17 @@ async def count_decisions(db: aiosqlite.Connection, project_id: str) -> int:
     ) as cur:
         row = await cur.fetchone()
     return (row[0] if row else 0) or 0
+
+
+async def delete_pinned_decision(
+    db: aiosqlite.Connection, decision_id: str
+) -> bool:
+    """Hard-delete a pinned decision by id. Returns True if deleted, False if not found."""
+    cur = await db.execute(
+        "DELETE FROM decisions_pinned WHERE id = ?", (decision_id,)
+    )
+    await db.commit()
+    return cur.rowcount > 0
 
 
 # ---------------------------------------------------------------------------

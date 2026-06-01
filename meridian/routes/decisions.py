@@ -69,6 +69,16 @@ async def update_pinned_decision_endpoint(
     return result
 
 
+@router.delete("/projects/{project_id}/decisions-pinned/{decision_id}", status_code=204)
+async def delete_pinned_decision_endpoint(
+    project_id: str, decision_id: str, request: Request
+) -> None:
+    """Hard-delete a pinned decision. Use update (status=superseded) to archive instead."""
+    deleted = await db_module.delete_pinned_decision(await _db(request), decision_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="decision not found")
+
+
 @router.post("/projects/{project_id}/decisions-pinned/replace-all", status_code=201)
 async def replace_all_pinned_decisions(
     project_id: str, body: dict[str, Any], request: Request

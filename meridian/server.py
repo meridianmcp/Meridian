@@ -3180,6 +3180,90 @@ async def start_session_endpoint(
 # /admin/snapshot → meridian/routes/admin.py
 
 
+# ---------------------------------------------------------------------------
+# Hooks — Claude Code / Codex session lifecycle endpoints (alpha, no auth)
+# ---------------------------------------------------------------------------
+
+
+@app.post("/hooks/session-start")
+async def hooks_session_start(body: dict[str, Any], request: Request) -> dict[str, Any]:
+    """Claude Code / Codex SessionStart hook.
+
+    Accepts {project_id, session_name?}. Calls start_session() and returns
+    {hookSpecificOutput: {additionalContext: "..."}} so Claude Code injects
+    the project context into the agent's initial context window automatically.
+
+    No auth required for alpha/localhost. Hosted tier adds token auth in beta.
+    """
+    project_id = (body.get("project_id") or "").strip()
+    if not project_id:
+        from fastapi.responses import JSONResponse
+        return JSONResponse(status_code=400, content={"error": "project_id required"})
+    session_name = (body.get("session_name") or "hook-session").strip()
+    db = await _db(request)
+    project = await db_module.get_project(db, project_id)
+    if project is None:
+        from fastapi.responses import JSONResponse
+        return JSONResponse(status_code=404, content={"error": "project not found"})
+    result = await _start_session_composite(
+        db, project_id, session_name, _data_dir(request),
+        human_id=body.get("human_id"),
+        client_type="hook",
+    )
+    goal = result.get("goal") or {}
+    sprint_items = await db_module.get_sprint_items(db, project_id, status="pending")
+    recent = result.get("recent_tasks") or []
+    lines = [f"PROJECT: {project['name']} ({project_id[:8]})"]
+    if goal.get("north_star"):
+        lines.append(f"NORTH STAR: {goal['north_star'][:300]}")
+    if goal.get("sprint"):
+        lines.append(f"SPRINT: {goal['sprint'][:300]}")
+    if sprint_items:
+        lines.append(f"\nPENDING SPRINT ITEMS ({len(sprint_items)}):")
+        for it in sprint_items[:8]:
+            lines.append(f"- {it.get('id', '')[:8]} {it.get('title', '')[:120]}")
+    if recent:
+        lines.append("\nRECENT TASKS:")
+        for t in recent[:5]:
+            lines.append(f"- [{t.get('status','?').upper()}] {str(t.get('description',''))[:120]}")
+    lines.append(f"\nSESSION ID: {result.get('session_id', '')}")
+    additional_context = "\n".join(lines)
+    return {"hookSpecificOutput": {"additionalContext": additional_context}}
+
+
+@app.post("/hooks/stop")
+async def hooks_stop(body: dict[str, Any], request: Request) -> dict[str, Any]:
+    """Claude Code / Codex Stop hook.
+
+    Accepts {project_id, session_id?}. Fires auto_capture + delta handoff
+    and returns immediately. Fire-and-forget — the agent does not wait for
+    this to complete before exiting.
+
+    No auth required for alpha/localhost. Hosted tier adds token auth in beta.
+    """
+    project_id = (body.get("project_id") or "").strip()
+    session_id = (body.get("session_id") or "").strip() or None
+    if not project_id:
+        return {"ok": False, "error": "project_id required"}
+    db = await _db(request)
+    if session_id:
+        try:
+            await db_module.auto_capture_session(db, project_id, session_id)
+        except Exception:  # noqa: BLE001
+            pass
+    try:
+        from . import handoff as handoff_module_local
+        await asyncio.wait_for(
+            handoff_module_local.generate_handoff(
+                db, project_id, _data_dir(request), mode="delta", session_id=session_id
+            ),
+            timeout=20.0,
+        )
+    except Exception:  # noqa: BLE001
+        pass
+    return {"ok": True}
+
+
 @app.post("/config/connections")
 async def save_connection(body: dict[str, Any]) -> dict[str, Any]:
     """v1.9.x — save a new connection profile to meridian.toml.
@@ -3620,6 +3704,8 @@ TOOL_EXAMPLES: dict[str, str] = {
     "get_pinned_decisions": 'get_pinned_decisions(project_id="abc-123")',
     "generate_handoff": 'generate_handoff(project_id="abc-123", mode="delta", session_id="session-uuid")',
     "get_session_brief": 'get_session_brief(project_id="abc-123")',
+    "delete_decision": 'delete_decision(decision_id="decision-uuid")',
+    "checkpoint": 'checkpoint(session_id="session-uuid", project_id="abc-123")',
     "request_hitl": 'request_hitl(project_id="abc-123", question="Should we add rate limiting here?", urgency="normal")',
     "get_hitl_request": 'get_hitl_request(request_id="hitl-uuid")',
     "add_note": 'add_note(project_id="abc-123", title="Deploy note", body="Reminder: update env vars before deploy", tags="ops,deploy")',
@@ -3682,8 +3768,8 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
     {"name": "pin_decision", "description":
         "Create a pinned decision (editable constitution row). Use for the "
         "current authoritative truth that supersedes earlier statements. "
-        "Category: STRATEGIC, COMPETITIVE, TECHNICAL, TACTICAL, BUSINESS, "
-        "PRODUCT, ARCHITECTURAL.",
+        "category is free-text; suggested values: STRATEGIC, COMPETITIVE, "
+        "TECHNICAL, TACTICAL, BUSINESS, PRODUCT, ARCHITECTURAL.",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"},
          "title": {"type": "string"},
@@ -3709,6 +3795,22 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "project_id": {"type": "string"},
          "include_superseded": {"type": "boolean"}},
          "required": ["project_id"]}},
+    {"name": "delete_decision", "description":
+        "Hard-delete a pinned decision by id. Use when something was filed by mistake or "
+        "is a duplicate. For retiring a valid but superseded decision, use update_decision "
+        "(status=superseded) instead to preserve the audit trail.",
+     "inputSchema": {"type": "object", "properties": {
+         "decision_id": {"type": "string"}},
+         "required": ["decision_id"]}},
+    {"name": "checkpoint", "description":
+        "Save progress mid-session. Runs auto_capture (buckets done tasks into a note), "
+        "generates a delta handoff, and returns a compact summary with what was done, "
+        "what's pending, and the suggested next /goal string. Call before context fills "
+        "up or before ending a session.",
+     "inputSchema": {"type": "object", "properties": {
+         "session_id": {"type": "string"},
+         "project_id": {"type": "string"}},
+         "required": ["session_id", "project_id"]}},
     {"name": "request_hitl", "description":
         "Surface a question to the human-in-the-loop queue. urgency='blocking' "
         "means this session pauses until answered (poll get_hitl_request). "
@@ -3886,6 +3988,37 @@ async def _dispatch_mcp_tool(name: str, args: dict[str, Any], db: Any, data_dir:
             db, args["project_id"],
             include_superseded=bool(args.get("include_superseded", False)),
         )
+    if name == "delete_decision":
+        deleted = await db_module.delete_pinned_decision(db, args["decision_id"])
+        if not deleted:
+            raise ValueError("decision not found")
+        return {"deleted": True, "decision_id": args["decision_id"]}
+    if name == "checkpoint":
+        session_id = args["session_id"]
+        project_id = args["project_id"]
+        await db_module.auto_capture_session(db, project_id, session_id)
+        from . import handoff as handoff_module_local
+        try:
+            _, content = await asyncio.wait_for(
+                handoff_module_local.generate_handoff(
+                    db, project_id, data_dir, mode="delta", session_id=session_id
+                ),
+                timeout=30.0,
+            )
+        except asyncio.TimeoutError:
+            content = "delta handoff timed out"
+        pending_items = await db_module.get_sprint_items(db, project_id, status="pending")
+        ids_str = ", ".join(it["id"][:8] for it in pending_items[:8])
+        next_goal = (
+            f'/goal Complete sprint items: {", ".join(it["id"] for it in pending_items[:8])}. '
+            f"Done when complete_sprint_item()\'d, tests pass, generate_handoff called."
+        ) if pending_items else "/goal Continue work — all sprint items done."
+        return {
+            "summary": content,
+            "pending_count": len(pending_items),
+            "pending_ids": ids_str,
+            "next_goal": next_goal,
+        }
     if name == "request_hitl":
         return await db_module.request_hitl(
             db, args["project_id"], args["question"],

@@ -1,6 +1,6 @@
 # MCP Tool Reference
 
-Meridian exposes **19 tools** over MCP. They fall into two usage patterns:
+Meridian exposes **21 tools** over MCP. They fall into two usage patterns:
 
 **Planner sessions** (claude.ai, planning work) — `start_session` · `pin_decision` · `update_decision` · `add_note` · `get_context_block` · `generate_handoff`
 

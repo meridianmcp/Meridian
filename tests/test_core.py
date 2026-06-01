@@ -5263,10 +5263,10 @@ async def test_pin_decision_inserts_row(db):
 
 
 @pytest.mark.asyncio
-async def test_pin_decision_rejects_invalid_category(db):
-    p = await db_module.create_project(db, "v24-pin-bad")
-    with pytest.raises(ValueError):
-        await db_module.pin_decision(db, p["id"], "t", "b", "INVALID_CATEGORY")
+async def test_pin_decision_accepts_custom_category(db):
+    p = await db_module.create_project(db, "v24-pin-custom-cat")
+    d = await db_module.pin_decision(db, p["id"], "t", "b", "CUSTOM_CATEGORY")
+    assert d["category"] == "CUSTOM_CATEGORY"
 
 
 @pytest.mark.asyncio
@@ -5352,6 +5352,63 @@ def test_decisions_pinned_archive_oldest_http(client):
     assert r.json()["archived"] == 2
     remaining = client.get(f"/projects/{project['id']}/decisions-pinned").json()
     assert [row["title"] for row in remaining] == ["newest"]
+
+
+def test_delete_pinned_decision_http(client):
+    """DELETE /projects/{pid}/decisions-pinned/{did} hard-deletes the row."""
+    project = client.post("/projects", json={"name": "v29-pin-del-http"}).json()
+    r = client.post(
+        f"/projects/{project['id']}/decisions-pinned",
+        json={"title": "to delete", "body": "temp", "category": "TECHNICAL"},
+    )
+    assert r.status_code == 201
+    did = r.json()["id"]
+    # Hard delete
+    r = client.delete(f"/projects/{project['id']}/decisions-pinned/{did}")
+    assert r.status_code == 204
+    # Gone from list
+    remaining = client.get(f"/projects/{project['id']}/decisions-pinned").json()
+    assert not any(d["id"] == did for d in remaining)
+    # 404 on second attempt
+    r = client.delete(f"/projects/{project['id']}/decisions-pinned/{did}")
+    assert r.status_code == 404
+
+
+def test_hooks_session_start_and_stop(client):
+    """POST /hooks/session-start returns hookSpecificOutput; /hooks/stop returns ok."""
+    project = client.post("/projects", json={"name": "v29-hooks-test"}).json()
+    r = client.post("/hooks/session-start", json={"project_id": project["id"]})
+    assert r.status_code == 200
+    body = r.json()
+    assert "hookSpecificOutput" in body
+    assert "additionalContext" in body["hookSpecificOutput"]
+    assert project["name"] in body["hookSpecificOutput"]["additionalContext"]
+    # Stop hook — uses session_id from start result
+    additional = body["hookSpecificOutput"]["additionalContext"]
+    session_id = None
+    for line in additional.splitlines():
+        if line.startswith("SESSION ID:"):
+            session_id = line.split(":", 1)[1].strip()
+            break
+    r = client.post("/hooks/stop", json={"project_id": project["id"], "session_id": session_id})
+    assert r.status_code == 200
+    assert r.json()["ok"] is True
+
+
+def test_hooks_session_start_missing_project_id(client):
+    r = client.post("/hooks/session-start", json={})
+    assert r.status_code == 400
+
+
+def test_pin_decision_custom_category_http(client):
+    """Custom free-text category is accepted."""
+    project = client.post("/projects", json={"name": "v29-custom-cat-http"}).json()
+    r = client.post(
+        f"/projects/{project['id']}/decisions-pinned",
+        json={"title": "my dec", "body": "body", "category": "MY_CUSTOM_CAT"},
+    )
+    assert r.status_code == 201
+    assert r.json()["category"] == "MY_CUSTOM_CAT"
 
 
 # ---------------------------------------------------------------------------
