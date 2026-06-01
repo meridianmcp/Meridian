@@ -5834,3 +5834,103 @@ async def test_demo_loads_correct_db(db):
     # Sprint items — at least 1
     sprint_items = await db_module.get_sprint_items(db, api_project["id"])
     assert len(sprint_items) >= 1, "Expected at least 1 sprint item for backend-api-v2"
+
+
+# ---------------------------------------------------------------------------
+# v2.6 — new MCP tools: list_hitl_requests, list_sessions, answer_hitl,
+#         dismiss_hitl, add_sprint_note, get_sprint_notes
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_list_hitl_requests_mcp_tool(db):
+    """list_hitl_requests returns pending queue without needing UUIDs."""
+    project = await db_module.create_project(db, "hitl-list-test")
+    pid = project["id"]
+    session = await db_module.register_session(db, pid, "s1")
+    sid = session["id"]
+
+    await db_module.request_hitl(db, pid, "question A", session_id=sid, urgency="blocking")
+    await db_module.request_hitl(db, pid, "question B", session_id=sid)
+
+    rows = await db_module.list_hitl_requests(db, pid, status="pending")
+    assert len(rows) == 2
+    assert rows[0]["urgency"] == "blocking"  # sorted by urgency first
+
+    rows_all = await db_module.list_hitl_requests(db, pid, status=None)
+    assert len(rows_all) == 2
+
+
+@pytest.mark.asyncio
+async def test_answer_hitl_and_dismiss_hitl(db):
+    """answer_hitl and dismiss_hitl mark requests correctly."""
+    project = await db_module.create_project(db, "hitl-answer-test")
+    pid = project["id"]
+    session = await db_module.register_session(db, pid, "s1")
+    sid = session["id"]
+
+    r1 = await db_module.request_hitl(db, pid, "answer me", session_id=sid)
+    r2 = await db_module.request_hitl(db, pid, "dismiss me", session_id=sid)
+
+    answered = await db_module.answer_hitl_request(db, r1["id"], "the answer", answered_by="adam")
+    assert answered["status"] == "answered"
+    assert answered["answer"] == "the answer"
+
+    dismissed = await db_module.dismiss_hitl_request(db, r2["id"])
+    assert dismissed["status"] == "dismissed"
+
+    pending = await db_module.list_hitl_requests(db, pid, status="pending")
+    assert len(pending) == 0
+
+
+@pytest.mark.asyncio
+async def test_add_and_get_sprint_notes(db):
+    """add_session_note / get_session_notes round-trip correctly."""
+    project = await db_module.create_project(db, "sprint-notes-test")
+    pid = project["id"]
+    session = await db_module.register_session(db, pid, "executor-1")
+    sid = session["id"]
+
+    n1 = await db_module.add_session_note(db, sid, "Don't touch hosted.py", "Neon pool at 7/8")
+    n2 = await db_module.add_session_note(db, sid, "Blocker", "Waiting on Adam HITL")
+
+    notes = await db_module.get_session_notes(db, sid)
+    assert len(notes) == 2
+    titles = {n["title"] for n in notes}
+    assert "Don't touch hosted.py" in titles
+    assert "Blocker" in titles
+
+    # Auto-delete on session close
+    await db_module.delete_session_notes(db, sid)
+    notes_after = await db_module.get_session_notes(db, sid)
+    assert len(notes_after) == 0
+
+
+@pytest.mark.asyncio
+async def test_list_sessions_db(db):
+    """get_sessions returns active sessions for a project."""
+    project = await db_module.create_project(db, "list-sessions-test")
+    pid = project["id"]
+
+    s1 = await db_module.register_session(db, pid, "session-alpha")
+    s2 = await db_module.register_session(db, pid, "session-beta")
+
+    active = await db_module.get_sessions(db, pid, active_only=True)
+    names = {s["name"] for s in active}
+    assert "session-alpha" in names
+    assert "session-beta" in names
+
+    await db_module.close_session(db, s1["id"])
+    still_active = await db_module.get_sessions(db, pid, active_only=True)
+    still_names = {s["name"] for s in still_active}
+    assert "session-alpha" not in still_names
+    assert "session-beta" in still_names
+
+
+def test_new_mcp_tools_in_tools_list():
+    """All 6 new MCP tools appear in _MCP_TOOLS_LIST."""
+    import meridian.server as server_module
+    tools = {t["name"] for t in server_module._MCP_TOOLS_LIST}
+    new_tools = {"list_hitl_requests", "answer_hitl", "dismiss_hitl", "list_sessions", "add_sprint_note", "get_sprint_notes"}
+    missing = new_tools - tools
+    assert not missing, f"Missing MCP tools: {missing}"
