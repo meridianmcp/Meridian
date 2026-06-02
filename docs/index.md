@@ -11,7 +11,7 @@
 
 Every AI coding session starts completely fresh. Open Claude Code in two terminals and they have absolutely no idea what the other is doing. Hit the context limit mid-task and your entire working memory evaporates. Run parallel sessions and they step on each other — duplicate work, conflicting edits, no coordination.
 
-This isn't a Claude problem. It's a fundamental limitation of stateless sessions. And it gets worse as you use AI more.
+This isn't a Claude problem. It's a fundamental limitation of stateless sessions. And it gets worse with every wasted token.
 
 ## The Solution
 
