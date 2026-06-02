@@ -32,6 +32,19 @@ All tests must pass before pushing. No exceptions.
 - **Commit often.** One logical unit per commit. Format: `feat: description` / `fix: description`.
 - **pixi run test passes** before every push. If you break tests, fix them before pushing.
 
+## Tagging and CI conventions
+
+Meridian has two separate tag patterns with different CI effects:
+
+| Tag pattern | Example | What it triggers |
+|-------------|---------|-----------------|
+| Exact semver `vX.Y.Z` | `v1.2.0` | Tests → deploy-preview → **production deploy** + **binary builds** (Windows / Linux / mac-arm64) + GitHub Release |
+| Pre-release suffix | `v1.2.0-alpha`, `v1.2.0-rc1` | Tests → deploy-preview only — **no binary builds, no GitHub Release** |
+
+**Use pre-release tags for CI/deploy-only pushes.** Binary builds on Windows runners are slow (~10–15 min). Burning a build slot for a one-line config fix is wasteful. Reserve bare `vX.Y.Z` tags for actual user-facing releases.
+
+Binary builds can also be triggered manually via GitHub Actions → **Build & Release Binaries** → Run workflow.
+
 ## psycopg3 rules (non-negotiable)
 
 The DB layer uses psycopg3, not asyncpg or sqlite3 directly. These rules prevent silent bugs:
