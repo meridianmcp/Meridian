@@ -34,7 +34,6 @@ resend = ">=0.7"
 bcrypt = ">=4.0"
 slowapi = ">=0.1"
 mkdocs-material = ">=9.5"
-mcp-text-editor = ">=1.2"
 
 [tasks]
 start = { cmd = "python -m meridian", env = { MERIDIAN_CLAUDE_CLI = "cmd /c C:/Users/13144/AppData/Roaming/npm/claude.cmd -p" } }
@@ -59,5 +58,5 @@ test-tenancy = "python scripts/test_tenancy.py"
 launch = "python scripts/launch_morning.py"
 install-companions = "npm install -g repomix && echo Companions installed"
 mcp = "python -m meridian --mcp"
-text-editor-mcp = "python -m mcp_text_editor"
+text-editor-mcp = "uvx mcp-text-editor"
 repomix-mcp = "npx repomix --mcp"
