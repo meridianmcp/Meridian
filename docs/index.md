@@ -20,9 +20,13 @@ Every AI coding session starts completely fresh. Open Claude Code in two termina
 
 This isn't a Claude problem. It's a fundamental limitation of stateless sessions. And it gets worse with every wasted token.
 
+<img src="screenshots/landing_problems.png" alt="Meridian landing page — the problem" style="max-width:100%;border-radius:8px;margin:12px 0">
+
 ## The Solution
 
 Meridian is a local MCP server that gives all your Claude sessions a **shared persistent brain**.
+
+<img src="screenshots/landing_hero.png" alt="Meridian dashboard — hero" style="max-width:100%;border-radius:8px;margin:12px 0">
 
 Every session that connects to Meridian can:
 
@@ -32,6 +36,8 @@ Every session that connects to Meridian can:
 - **Generate instant handoffs** — compressed context files that resume a new session in seconds
 
 When the context window fills up, you can generate a handoff and start fresh. The new session will then read the file and pick up exactly where you left off -- no re-explaining required.
+
+<img src="screenshots/landing_features.png" alt="Meridian features" style="max-width:100%;border-radius:8px;margin:12px 0">
 
 ## Key Features
 
@@ -106,6 +112,14 @@ Two deployment modes — pick the one that fits you.
 ```
 
 Zero local install — sign in at [usemeridian.us](https://usemeridian.us), copy your API token, add to MCP config.
+
+## Dashboard
+
+<img src="screenshots/demo_sessions.png" alt="Meridian dashboard — sessions view" style="max-width:100%;border-radius:8px;margin:8px 0">
+<img src="screenshots/demo_queue.png" alt="Meridian dashboard — queue tab" style="max-width:100%;border-radius:8px;margin:8px 0">
+<img src="screenshots/demo_hitl.png" alt="Meridian dashboard — HITL queue" style="max-width:100%;border-radius:8px;margin:8px 0">
+<img src="screenshots/pricing.png" alt="Meridian pricing" style="max-width:100%;border-radius:8px;margin:8px 0">
+<img src="screenshots/install_mcp.png" alt="Meridian MCP install guide" style="max-width:100%;border-radius:8px;margin:8px 0">
 
 ## Quick Install
 
