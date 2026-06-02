@@ -149,6 +149,11 @@ async function loadServerConfig() {
     // v1.9.x — update connection indicator
     _updateConnectionIndicator(cfg);
   } catch (e) { /* offline / older server — ignore */ }
+  // Show demo overlay whenever on /demo path (regardless of MERIDIAN_DEMO env var)
+  if (window.location.pathname.startsWith('/demo')) {
+    hideDemoAdminControls();
+    showDemoOnboardingOverlay();
+  }
   // v2.9 — plan badge + expiry banner for hosted users
   try {
     const me = await api('/me');
