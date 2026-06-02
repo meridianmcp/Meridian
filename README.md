@@ -135,6 +135,8 @@ Or manually:
 
 **Claude Desktop** users can install [meridian-hosted.dxt](https://github.com/meridianmcp/Meridian/releases/latest/download/meridian-hosted.dxt) directly (one-click, no config needed).
 
+**claude.ai (browser)** users: install the [dnakov/claude-mcp](https://github.com/dnakov/claude-mcp) Chrome extension, then visit [usemeridian.us/install-mcp](https://usemeridian.us/install-mcp) for a step-by-step setup guide with one-click copy buttons.
+
 Get your API key at [usemeridian.us/settings](https://usemeridian.us/settings) after sign-in. Free tier: 30 days, no card, full features.
 
 ## What you get
