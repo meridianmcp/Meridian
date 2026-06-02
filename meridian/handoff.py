@@ -117,11 +117,49 @@ def resolve_handoff_mode(
     session_id: str | None = None,
 ) -> str:
     """Resolve the public handoff mode, auto-switching repeat sessions to delta."""
-    if requested_mode in {"full", "delta", "planner"}:
+    if requested_mode in {"full", "delta", "planner", "starter"}:
         return requested_mode
     if session_id and session_id in _SESSION_HANDOFF_STATE:
         return "delta"
     return "full"
+
+
+def _render_starter_handoff(
+    project: dict[str, Any],
+    *,
+    completed_items: list[dict[str, Any]],
+    pending_items: list[dict[str, Any]],
+    quick_start_goal: str,
+) -> str:
+    """Return a ≤20-line starter block for pasting into a fresh session.
+
+    Designed for /compact restart: gives the minimal context needed to call
+    start_session() and know what to work on next.
+    """
+    pid = project["id"]
+    name = project["name"]
+    lines = [
+        f"project_id: {pid}",
+        f'start: start_session(project_id="{pid}", session_name="describe-what-youre-doing")',
+        "",
+        f"# Meridian — {name}",
+    ]
+    # Last 5 completed (titles only — one line)
+    if completed_items:
+        titles = [it["title"].split(".")[0].strip()[:60] for it in completed_items[:5]]
+        extra = f" (+{len(completed_items) - 5} more)" if len(completed_items) > 5 else ""
+        lines += [f"Done: {', '.join(titles)}{extra}", ""]
+    else:
+        lines += ["Done: (none)", ""]
+    # Top 3 pending items with IDs
+    lines.append("# Pending")
+    for i, it in enumerate(pending_items[:3], 1):
+        short_title = it["title"].strip()[:80]
+        lines.append(f"{i}. [{it['id'][:8]}] {short_title}")
+    if not pending_items:
+        lines.append("(none)")
+    lines += ["", quick_start_goal]
+    return "\n".join(lines) + "\n"
 
 
 def _note_tags(note: dict[str, Any]) -> set[str]:
@@ -363,8 +401,10 @@ async def generate_handoff(
         raise ValueError(f"project not found: {project_id}")
     if mode == "planner":
         return await _generate_planner_handoff(db, project_id, output_dir)
+    if mode == "starter":
+        return await _generate_starter_handoff(db, project, output_dir)
     if mode not in {"full", "delta"}:
-        raise ValueError("mode must be 'full', 'delta', or 'planner'")
+        raise ValueError("mode must be 'full', 'delta', 'planner', or 'starter'")
 
     goal = await db_module.get_goal(db, project_id)
     if goal is None:
@@ -569,5 +609,44 @@ async def _generate_planner_handoff(
     out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / f"{_slugify(project['name'])}_planner_handoff.md"
+    out_path.write_text(content, encoding="utf-8")
+    return str(out_path.resolve()), content
+
+
+async def _generate_starter_handoff(
+    db: object,
+    project: dict[str, Any],
+    output_dir: str,
+) -> tuple[str, str]:
+    """Compact ≤20-line starter block for paste-after-/compact or cold start.
+
+    Contains only the essentials: project_id, start_session command,
+    last 5 completed sprint items (titles), top 3 pending items with IDs,
+    and a ready-to-paste /goal string.  No decisions, no north star, no
+    file paths — just enough to orient and execute.
+    """
+    project_id = project["id"]
+    sprint_items_all = await db_module.get_sprint_items(db, project_id)
+    completed = [
+        it for it in sprint_items_all
+        if it.get("status") in {"done", "skipped", "failed", "pushed"}
+    ]
+    # Most-recently completed first
+    completed.sort(key=lambda it: (it.get("completed_at") or ""), reverse=True)
+    pending = [
+        it for it in sprint_items_all
+        if it.get("status") in {"pending", "todo"}
+    ]
+    pending = _prepare_pending_sprint_items(pending)
+    quick_start_goal = _build_quick_start_goal(pending)
+    content = _render_starter_handoff(
+        project,
+        completed_items=completed,
+        pending_items=pending,
+        quick_start_goal=quick_start_goal,
+    )
+    out_dir = Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / f"{_slugify(project['name'])}_starter.md"
     out_path.write_text(content, encoding="utf-8")
     return str(out_path.resolve()), content

@@ -3988,10 +3988,15 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"}, "query": {"type": "string"}, "limit": {"type": "integer"}},
          "required": ["project_id", "query"]}},
-    {"name": "generate_handoff", "description": "Generate a context handoff file. mode='full' writes the complete L0/L1/L2 handoff; mode='delta' returns a compact session update with completed items, pending items, and the next /goal string.",
+    {"name": "generate_handoff", "description":
+        "Generate a context handoff. mode='full' writes the complete L0/L1/L2 handoff; "
+        "mode='delta' returns a compact session update (completed + pending + /goal); "
+        "mode='starter' returns a ≤20-line block for paste-after-/compact or cold start — "
+        "project_id, start_session command, last 5 completed titles, top 3 pending IDs, /goal; "
+        "mode='planner' returns strategic context for a claude.ai planning chat.",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"},
-         "mode": {"type": "string", "enum": ["full", "delta", "planner"]},
+         "mode": {"type": "string", "enum": ["full", "delta", "planner", "starter"]},
          "session_id": {"type": "string", "description": "Optional session id for auto-delta on repeated calls in the same session."}},
          "required": ["project_id"]}},
     {"name": "get_context_block", "description":
@@ -4845,7 +4850,11 @@ def build_mcp_server():
                     "filling up or before ending a session. mode='full' "
                     "writes the complete L0/L1/L2 handoff. mode='delta' "
                     "returns a compact session update with completed items, "
-                    "remaining pending items, and the next /goal string."
+                    "remaining pending items, and the next /goal string. "
+                    "mode='starter' returns a ≤20-line paste-after-/compact "
+                    "block: project_id, start_session command, last 5 done, "
+                    "top 3 pending IDs, and a /goal string. "
+                    "mode='planner' gives strategic context for claude.ai."
                 ),
                 inputSchema={
                     "type": "object",
@@ -4853,7 +4862,7 @@ def build_mcp_server():
                         "project_id": {"type": "string"},
                         "mode": {
                             "type": "string",
-                            "enum": ["full", "delta"],
+                            "enum": ["full", "delta", "planner", "starter"],
                         },
                         "session_id": {
                             "type": "string",

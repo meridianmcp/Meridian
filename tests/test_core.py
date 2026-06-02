@@ -242,6 +242,24 @@ async def test_handoff_delta_mode_reports_recent_changes(db, tmp_path):
     assert f"/goal Complete sprint items: {second['id']}." in content
 
 
+async def test_handoff_starter_mode(db, tmp_path):
+    """generate_handoff(mode='starter') returns compact ≤20-line block."""
+    p = await db_module.create_project(db, "alpha-starter")
+    await db_module.set_goal(db, p["id"], "ship starter mode")
+    it1 = await db_module.add_sprint_item(db, p["id"], "v1", "First item")
+    it2 = await db_module.add_sprint_item(db, p["id"], "v1", "Second item")
+    await db_module.complete_sprint_item(db, p["id"], it1["id"])
+    _, content = await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="starter"
+    )
+    lines = [l for l in content.splitlines() if l]
+    assert len(lines) <= 20, f"starter mode must be ≤20 non-empty lines, got {len(lines)}"
+    assert f'project_id: {p["id"]}' in content
+    assert 'start_session' in content
+    assert it2["id"][:8] in content   # pending item ID appears
+    assert "/goal" in content
+
+
 # ---------------------------------------------------------------------------
 # FastAPI endpoints
 # ---------------------------------------------------------------------------

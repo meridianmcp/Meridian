@@ -1,5 +1,7 @@
 # Meridian — Start Here
 <!-- WEDGE HANDOFF v1 — paste this into any new session to boot context -->
+<!-- If context is large: run /compact first, then paste the remainder. -->
+<!-- For a minimal cold-start: generate_handoff(project_id="...", mode="starter") -->
 
 **If you are Claude Code or Codex (executor):**
 Read `data/meridian-build_handoff.md` in full, then call:
