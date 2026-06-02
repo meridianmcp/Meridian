@@ -3291,23 +3291,33 @@ async function loadMilestones(projectId) {
   if (!el) return;
   try {
     const all = await api(`/projects/${projectId}/sprint-items`);
-    const milestones = (all || []).filter(i => i.milestone_type === 'milestone');
+    // Show explicit milestone items + any done/failed/skipped/pushed sprint items
+    const doneStatuses = new Set(['done', 'skipped', 'failed', 'pushed']);
+    const milestones = (all || []).filter(i =>
+      i.milestone_type === 'milestone' || doneStatuses.has(i.status)
+    ).sort((a, b) => {
+      // Done items first, then by completed_at desc
+      const aTs = a.completed_at || a.added_at || '';
+      const bTs = b.completed_at || b.added_at || '';
+      return bTs.localeCompare(aTs);
+    });
     if (!milestones.length) { el.style.display = 'none'; return; }
-    const statusIcon = s => s === 'done' ? '✓' : s === 'failed' ? '✗' : s === 'in_progress' ? '▶' : '◦';
-    const statusColor = s => s === 'done' ? 'var(--success,#2a2)' : s === 'failed' ? 'var(--danger,#e05)' : s === 'in_progress' ? 'var(--accent)' : 'var(--muted)';
+    const statusIcon = s => s === 'done' ? '✓' : s === 'failed' ? '✗' : s === 'pushed' ? '→' : s === 'skipped' ? '—' : s === 'in_progress' ? '▶' : '◦';
+    const statusColor = s => s === 'done' ? 'var(--accent-green,#34d399)' : s === 'failed' ? '#e05' : s === 'pushed' ? 'var(--accent)' : s === 'in_progress' ? 'var(--accent)' : 'var(--muted)';
     el.innerHTML = `
-      <div style="font-size:9px;font-weight:700;color:var(--muted);letter-spacing:.07em;text-transform:uppercase;margin-bottom:6px">Milestones</div>
+      <div style="font-size:9px;font-weight:700;color:var(--muted);letter-spacing:.07em;text-transform:uppercase;margin-bottom:6px">Completed (${milestones.length})</div>
       <div style="display:flex;flex-wrap:wrap;gap:6px">
-        ${milestones.map(m => {
+        ${milestones.slice(0, 20).map(m => {
           const date = (m.completed_at || m.added_at || '').slice(0, 10);
           const ic = statusIcon(m.status);
           const col = statusColor(m.status);
-          return `<div style="display:flex;align-items:center;gap:4px;border:1px solid var(--border);border-radius:3px;padding:3px 7px;background:var(--surface-1)">
+          return `<div style="display:flex;align-items:center;gap:4px;border:1px solid var(--border);border-radius:3px;padding:3px 7px;background:var(--surface-1);opacity:${m.status === 'done' ? 1 : 0.7}">
             <span style="color:${col};font-size:11px">${ic}</span>
-            <span style="font-family:var(--font-mono);font-size:10px;color:var(--text)">${escapeHtml(m.title.slice(0, 40))}</span>
+            <span style="font-family:var(--font-mono);font-size:10px;color:var(--text)">${escapeHtml((m.title || '').slice(0, 40))}</span>
             ${date ? `<span style="font-size:9px;color:var(--muted)">${escapeHtml(date)}</span>` : ''}
           </div>`;
         }).join('')}
+        ${milestones.length > 20 ? `<span style="font-size:10px;color:var(--muted);padding:3px 4px">+${milestones.length - 20} more</span>` : ''}
       </div>`;
     el.style.display = 'block';
   } catch (_) {
@@ -5252,7 +5262,17 @@ function _rewindSec(icon, title, items, render) {
 
 function renderRewindActivity(projectId, data) {
   /** Activity subtab: sessions + decisions + task stats. */
-  const sessions = _rewindSec('🧠', 'Sessions', data.session_summaries, s =>
+  // Deduplicate sessions: same name may appear multiple times if registered
+  // multiple times. Keep highest done-count entry per session name.
+  const sessByName = new Map();
+  (data.session_summaries || []).forEach(s => {
+    const prev = sessByName.get(s.session_name);
+    if (!prev || (s.tasks_completed || 0) > (prev.tasks_completed || 0)) {
+      sessByName.set(s.session_name, s);
+    }
+  });
+  const dedupedSessions = [...sessByName.values()];
+  const sessions = _rewindSec('🧠', 'Sessions', dedupedSessions, s =>
     `<div style="padding:3px 0;border-left:2px solid var(--border);padding-left:8px;margin-bottom:4px">
       <div style="color:var(--accent)">${escapeHtml(s.session_name)} <span style="color:var(--muted);font-size:10px">· ${s.tasks_completed} done</span></div>
       <div style="color:var(--muted);font-size:10px">${escapeHtml(s.summary || '')}</div>
