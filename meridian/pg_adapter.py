@@ -314,18 +314,40 @@ class PostgresConnection:
         pool's max_idle/max_lifetime settings minimise exposure, but if a
         stale connection slips through we catch OperationalError here and
         retry once with a fresh connection from the pool.
+
+        On AdminShutdown/OperationalError we explicitly close the borrowed
+        connection before retrying.  psycopg_pool detects the broken state
+        automatically, but closing it eagerly ensures the pool opens a fresh
+        connection immediately rather than first trying to reuse the dead one.
         """
+        conn = None
         try:
-            async with self._pool.connection() as conn:
-                async with conn.cursor(row_factory=_dict_row_factory) as cur:
-                    await cur.execute(pg_sql, pg_params if pg_params else None)
-                    if q_upper.startswith(("SELECT", "WITH")):
-                        rows = await cur.fetchall()
-                        return _PgCursor(rows, len(rows))
-                    else:
-                        rc = cur.rowcount if cur.rowcount is not None else 0
-                        return _PgCursor([], rc)
+            conn = await self._pool.getconn()
+            async with conn.cursor(row_factory=_dict_row_factory) as cur:
+                await cur.execute(pg_sql, pg_params if pg_params else None)
+                if q_upper.startswith(("SELECT", "WITH")):
+                    rows = await cur.fetchall()
+                    result = _PgCursor(rows, len(rows))
+                else:
+                    rc = cur.rowcount if cur.rowcount is not None else 0
+                    result = _PgCursor([], rc)
+            await self._pool.putconn(conn)
+            return result
         except Exception as exc:  # noqa: BLE001
+            # On transient errors, close the stale connection explicitly so
+            # the pool creates a fresh one on the next acquire rather than
+            # handing out the same broken connection again.
+            if conn is not None and _is_transient_pg_error(exc):
+                try:
+                    await conn.close()
+                except Exception:  # noqa: BLE001
+                    pass
+                conn = None
+            elif conn is not None:
+                try:
+                    await self._pool.putconn(conn)
+                except Exception:  # noqa: BLE001
+                    pass
             # Retry once on connection-level errors (AdminShutdown, broken pipe,
             # closed connection) that indicate a stale pool connection.
             if _attempt == 0 and _is_transient_pg_error(exc):
@@ -595,10 +617,17 @@ CREATE_TABLES_PG = CREATE_TABLES_CORE + CREATE_TABLES_HOSTED
 
 
 async def open_pg_connection(url: str) -> PostgresConnection:
-    """Open a raw psycopg3 connection pool without running any migrations.
+    """Open a psycopg3 connection pool with Neon scale-to-zero resilience.
 
-    Used by standalone scripts (set_tenant_db.py, etc.) that need direct
-    DB access but don't want to apply the full migration chain.
+    Used by _deps._open_tenant_db_by_id for per-tenant Postgres DBs and by
+    standalone scripts (set_tenant_db.py, etc.) that need direct DB access
+    without running the full migration chain.
+
+    Neon resilience settings match init_pg_db — see that function for
+    rationale.  min_size=0 is critical: it lets the pool release all
+    connections when idle so Neon can hibernate cleanly, rather than keeping
+    one connection alive that will receive AdminShutdown after the 5-min
+    idle-shutdown boundary.
     """
     try:
         import psycopg  # noqa: F401
@@ -614,10 +643,19 @@ async def open_pg_connection(url: str) -> PostgresConnection:
 
     pool = AsyncConnectionPool(
         clean_url,
-        min_size=1,
-        max_size=3,
+        min_size=0,          # allow all connections to close on idle (Neon hibernation)
+        max_size=5,
         open=False,
-        kwargs={"autocommit": True},
+        max_idle=60.0,       # proactively close before Neon's 5-min idle-shutdown
+        max_lifetime=240.0,  # recycle before Neon's 300 s idle-timeout boundary
+        reconnect_timeout=30.0,
+        kwargs={
+            "autocommit": True,
+            "keepalives": 1,
+            "keepalives_idle": 30,
+            "keepalives_interval": 10,
+            "keepalives_count": 5,
+        },
     )
     await pool.open(wait=True, timeout=30.0)
     return PostgresConnection(pool)

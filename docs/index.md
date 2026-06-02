@@ -196,6 +196,31 @@ These MCP servers pair with Meridian to give your AI agents codebase context and
 | [Desktop Commander](https://github.com/wonderwhy-er/DesktopCommanderMCP) | Terminal, process management, file system | Already in submodule |
 
 
+## Screenshots
+
+The Meridian dashboard runs in your browser at `localhost:7878`. All data stays on your machine (or your dedicated Neon DB on the hosted tier).
+
+<div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin:16px 0">
+  <div>
+    <p><strong>Dashboard — project overview</strong></p>
+    <img src="screenshots/01_dashboard.png" alt="Meridian dashboard" style="border-radius:6px;border:1px solid #2a2d35;width:100%">
+  </div>
+  <div>
+    <p><strong>Live sessions tab</strong></p>
+    <img src="screenshots/02_live_tab.png" alt="Live sessions" style="border-radius:6px;border:1px solid #2a2d35;width:100%">
+  </div>
+  <div>
+    <p><strong>Goal + sprint board</strong></p>
+    <img src="screenshots/03_goal_tab.png" alt="Goal tab" style="border-radius:6px;border:1px solid #2a2d35;width:100%">
+  </div>
+  <div>
+    <p><strong>Queue — task log</strong></p>
+    <img src="screenshots/04_queue_tab.png" alt="Queue tab" style="border-radius:6px;border:1px solid #2a2d35;width:100%">
+  </div>
+</div>
+
+Try the live demo at [usemeridian.us/demo](https://usemeridian.us/demo) — no sign-in needed.
+
 ## Hosted Tier
 
 Don't want to run your own server? [usemeridian.us](https://usemeridian.us) is a hosted version — sign in with Google or GitHub, get a managed Neon Postgres database, and connect over HTTPS.

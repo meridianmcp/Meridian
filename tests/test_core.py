@@ -242,6 +242,24 @@ async def test_handoff_delta_mode_reports_recent_changes(db, tmp_path):
     assert f"/goal Complete sprint items: {second['id']}." in content
 
 
+async def test_handoff_starter_mode(db, tmp_path):
+    """generate_handoff(mode='starter') returns compact ≤20-line block."""
+    p = await db_module.create_project(db, "alpha-starter")
+    await db_module.set_goal(db, p["id"], "ship starter mode")
+    it1 = await db_module.add_sprint_item(db, p["id"], "v1", "First item")
+    it2 = await db_module.add_sprint_item(db, p["id"], "v1", "Second item")
+    await db_module.complete_sprint_item(db, p["id"], it1["id"])
+    _, content = await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="starter"
+    )
+    lines = [l for l in content.splitlines() if l]
+    assert len(lines) <= 20, f"starter mode must be ≤20 non-empty lines, got {len(lines)}"
+    assert f'project_id: {p["id"]}' in content
+    assert 'start_session' in content
+    assert it2["id"][:8] in content   # pending item ID appears
+    assert "/goal" in content
+
+
 # ---------------------------------------------------------------------------
 # FastAPI endpoints
 # ---------------------------------------------------------------------------
@@ -5279,6 +5297,16 @@ def test_landing_page_has_try_demo_link(client):
     assert "/demo" in r.text
 
 
+def test_install_mcp_page(client):
+    """GET /install-mcp returns 200 with copy-ready SSE URL and no-cache headers."""
+    r = client.get("/install-mcp")
+    assert r.status_code == 200
+    assert "/mcp/sse" in r.text
+    assert "meridian" in r.text.lower()
+    cc = r.headers.get("cache-control", "")
+    assert "no-cache" in cc
+
+
 def test_landing_page_footer_uses_meridian_email(client):
     """Landing page footer contact uses hello@usemeridian.us, not personal email."""
     r = client.get("/")
@@ -5370,6 +5398,25 @@ def test_landing_page_nav_has_docs_link(client):
     assert r.status_code == 200
     # Docs link should be present
     assert "Docs" in r.text
+
+
+def test_landing_page_cache_control(client):
+    """/ returns Cache-Control: no-cache, no-store so Cloudflare doesn't serve stale HTML."""
+    r = client.get("/")
+    assert r.status_code == 200
+    cc = r.headers.get("cache-control", "")
+    assert "no-cache" in cc
+    assert "no-store" in cc
+
+
+def test_demo_cache_control(client):
+    """/demo returns Cache-Control: no-cache, no-store."""
+    r = client.get("/demo")
+    assert r.status_code in (200, 503)
+    if r.status_code == 200:
+        cc = r.headers.get("cache-control", "")
+        assert "no-cache" in cc
+        assert "no-store" in cc
 
 
 async def test_neon_pool_projects_table_exists(db):

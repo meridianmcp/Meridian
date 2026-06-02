@@ -926,6 +926,7 @@ function buildTabBody(project) {
           <button class="secondary" id="queue-refresh-${project.id}" style="padding:2px 8px;font-size:10px">refresh</button>
         </div>
         <div id="live-session-${project.id}" style="display:none;flex-shrink:0;border-bottom:1px solid var(--border);background:var(--surface-2);padding:8px 14px 10px"></div>
+        <div id="recent-sessions-${project.id}" style="display:none;flex-shrink:0;border-bottom:1px solid var(--border);background:var(--surface-2);padding:8px 14px 8px"></div>
         <div style="padding:8px 14px 0;flex-shrink:0">
           <input type="text" id="task-search-${project.id}" placeholder="Search tasks…"
             style="width:100%;padding:5px 10px;background:var(--surface-2);border:1px solid var(--border);
@@ -1102,6 +1103,7 @@ function buildTabBody(project) {
         if (vtab === 'queue') {
           loadQueue(project.id);
           updateLiveFeed(project.id);
+          loadRecentSessions(project.id);
           // 5s live-feed poll while queue tab is visible — cleared on tab switch
           clearInterval(p._liveFeedInterval);
           p._liveFeedInterval = setInterval(() => {
@@ -2256,6 +2258,15 @@ async function loadSettingsTab(projectId) {
 
   let html = '';
 
+  // "Connect claude.ai browser" card — always shown regardless of hosted/self-hosted
+  html += `<div style="margin-bottom:14px;padding:10px 12px;border:1px solid var(--border);border-radius:6px;background:var(--surface-2);display:flex;justify-content:space-between;align-items:center;gap:8px">
+    <div>
+      <div style="font-weight:600;font-size:11px;color:var(--text);margin-bottom:2px">Connect claude.ai browser</div>
+      <div style="font-size:10px;color:var(--muted)">Use Meridian directly in claude.ai — no install needed</div>
+    </div>
+    <a href="/install-mcp" target="_blank" style="white-space:nowrap;padding:4px 10px;background:var(--accent);color:#fff;border-radius:4px;font-size:10px;font-weight:600;text-decoration:none">Setup guide →</a>
+  </div>`;
+
   // MCP config section (hosted mode only)
   if (mcpData) {
     const projects = mcpData.projects || [];
@@ -2271,7 +2282,10 @@ async function loadSettingsTab(projectId) {
     ).join('');
 
     html += `<div style="margin-bottom:16px">
-      <div style="color:var(--accent);font-size:10px;letter-spacing:.06em;text-transform:uppercase;margin-bottom:10px;padding-bottom:4px;border-bottom:1px solid var(--border)">MCP client setup</div>
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;padding-bottom:4px;border-bottom:1px solid var(--border)">
+        <div style="color:var(--accent);font-size:10px;letter-spacing:.06em;text-transform:uppercase">MCP client setup</div>
+        <a href="/install-mcp" target="_blank" style="font-size:10px;color:var(--muted);text-decoration:none" title="Full setup guide">setup guide →</a>
+      </div>
       <div style="display:flex;gap:8px;align-items:center;margin-bottom:8px;flex-wrap:wrap">
         <div style="display:flex;gap:0;border:1px solid var(--border);border-radius:3px;overflow:hidden" id="mcp-client-tabs-${projectId}">
           ${clients.map((c, i) => `<button data-client="${c.id}" style="background:${i===0?'var(--accent)':'var(--surface-1)'};color:${i===0?'#000':'var(--text)'};border:none;padding:3px 10px;font-size:10px;font-family:var(--font-mono);cursor:pointer;white-space:nowrap">${c.label}</button>`).join('')}
@@ -3149,6 +3163,51 @@ async function updateLiveFeed(projectId) {
       </div>`;
     el.style.display = 'block';
   } catch(e) {
+    el.style.display = 'none';
+  }
+}
+
+async function loadRecentSessions(projectId) {
+  /** fa595ad8 — Recent Sessions panel: 24h feed of completed checkpoint() calls.
+   * Each card: session name, tasks done, one-line summary, Resume button copies /goal. */
+  const el = document.getElementById(`recent-sessions-${projectId}`);
+  if (!el) return;
+  try {
+    const notes = await api(`/projects/${projectId}/notes?tag=checkpoint`);
+    if (!notes || !notes.length) { el.style.display = 'none'; return; }
+    const checkpoints = notes
+      .map(r => { try { return Object.assign(JSON.parse(r.body), { created_at: r.created_at }); } catch { return null; } })
+      .filter(Boolean)
+      .slice(0, 5);
+    if (!checkpoints.length) { el.style.display = 'none'; return; }
+    el.innerHTML = `
+      <div style="font-size:9px;font-weight:700;color:var(--muted);letter-spacing:.07em;text-transform:uppercase;margin-bottom:6px">Recent Sessions</div>
+      ${checkpoints.map(c => {
+        const dt = (c.created_at || '').slice(0, 16).replace('T', ' ');
+        const name = escapeHtml(c.session_name || (c.session_id || '').slice(0, 8) || 'session');
+        const done = c.items_done || 0;
+        const line = escapeHtml((c.summary_line || '').slice(0, 90));
+        const safeGoal = escapeHtml(c.next_goal || '');
+        return `<div style="border:1px solid var(--border);border-radius:3px;padding:5px 8px;margin-bottom:4px;background:var(--surface-1)">
+          <div style="display:flex;justify-content:space-between;align-items:center;gap:6px">
+            <span style="font-weight:600;font-size:10px;color:var(--text);font-family:var(--font-mono);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${name}</span>
+            <div style="display:flex;gap:4px;align-items:center;flex-shrink:0">
+              <span style="font-size:9px;color:var(--muted)">${done} done · ${dt}</span>
+              <button class="secondary resume-goal-btn" data-goal="${safeGoal}"
+                style="padding:1px 6px;font-size:9px" title="Copy /goal to clipboard">Resume</button>
+            </div>
+          </div>
+          ${line ? `<div style="font-size:9px;color:var(--muted);margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${line}</div>` : ''}
+        </div>`;
+      }).join('')}`;
+    el.querySelectorAll('.resume-goal-btn').forEach(btn => {
+      btn.onclick = () => {
+        const goal = btn.dataset.goal || '';
+        navigator.clipboard.writeText(goal).then(() => toast('Copied /goal to clipboard')).catch(() => toast('copy failed', true));
+      };
+    });
+    el.style.display = 'block';
+  } catch (_) {
     el.style.display = 'none';
   }
 }

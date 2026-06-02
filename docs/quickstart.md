@@ -156,6 +156,8 @@ All 20+ Meridian MCP tools become available in claude.ai. Planning chat sessions
 
 !!! tip
     For the hosted tier, use `https://usemeridian.us/mcp/sse` instead of localhost.
+    Or visit [usemeridian.us/install-mcp](https://usemeridian.us/install-mcp) for a step-by-step
+    setup guide with one-click copy buttons for both local and hosted configs.
 
 ---
 

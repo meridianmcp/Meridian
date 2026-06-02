@@ -916,13 +916,15 @@ async def landing_page(request: Request) -> HTMLResponse:
     stripe_payment_link = os.environ.get("STRIPE_PAYMENT_LINK", "/auth/login")
     stripe_pro_checkout = "/checkout?plan=pro" if os.environ.get("STRIPE_PRO_PRICE_ID") else ""
     stripe_pro_payment_link = os.environ.get("STRIPE_PRO_PAYMENT_LINK", stripe_pro_checkout)
-    return _templates.TemplateResponse(
+    resp = _templates.TemplateResponse(
         request, "landing.html", {
             "stripe_payment_link": stripe_payment_link,
             "stripe_pro_checkout": stripe_pro_checkout,
             "stripe_pro_payment_link": stripe_pro_payment_link,
         }
     )
+    resp.headers["Cache-Control"] = "no-cache, no-store"
+    return resp
 
 
 @app.post("/demo-auth")
@@ -1010,6 +1012,19 @@ async def pricing_page(request: Request) -> HTMLResponse:
         "waitlist_mode": waitlist_mode,
         "email": email,
     })
+
+
+@app.get("/install-mcp", response_class=HTMLResponse)
+async def install_mcp_page(request: Request) -> HTMLResponse:
+    """Onboarding page: step-by-step guide to connect Claude to Meridian via MCP.
+
+    Shows copy-ready Name + URL fields for both local and hosted configs.
+    Token generation calls POST /auth/tokens client-side.
+    Linked from README, docs quickstart, and dashboard Settings tab.
+    """
+    resp = _templates.TemplateResponse(request, "install_mcp.html", {})
+    resp.headers["Cache-Control"] = "no-cache, no-store"
+    return resp
 
 
 # ---------------------------------------------------------------------------
@@ -1883,6 +1898,7 @@ async def demo_dashboard(request: Request) -> Any:
         httponly=True,
         samesite="lax",
     )
+    response.headers["Cache-Control"] = "no-cache, no-store"
     return response
 
 
@@ -3972,10 +3988,15 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"}, "query": {"type": "string"}, "limit": {"type": "integer"}},
          "required": ["project_id", "query"]}},
-    {"name": "generate_handoff", "description": "Generate a context handoff file. mode='full' writes the complete L0/L1/L2 handoff; mode='delta' returns a compact session update with completed items, pending items, and the next /goal string.",
+    {"name": "generate_handoff", "description":
+        "Generate a context handoff. mode='full' writes the complete L0/L1/L2 handoff; "
+        "mode='delta' returns a compact session update (completed + pending + /goal); "
+        "mode='starter' returns a ≤20-line block for paste-after-/compact or cold start — "
+        "project_id, start_session command, last 5 completed titles, top 3 pending IDs, /goal; "
+        "mode='planner' returns strategic context for a claude.ai planning chat.",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"},
-         "mode": {"type": "string", "enum": ["full", "delta", "planner"]},
+         "mode": {"type": "string", "enum": ["full", "delta", "planner", "starter"]},
          "session_id": {"type": "string", "description": "Optional session id for auto-delta on repeated calls in the same session."}},
          "required": ["project_id"]}},
     {"name": "get_context_block", "description":
@@ -4284,6 +4305,37 @@ async def _dispatch_mcp_tool(name: str, args: dict[str, Any], db: Any, data_dir:
         ) if pending_items else "/goal Continue work — all sprint items done."
         # 04f03ee4 — include start_session one-liner so next session can resume immediately
         start_fresh = f'start_session(project_id="{project_id}", session_name="describe-what-youre-doing")'
+        # fa595ad8 — store snapshot for Recent Sessions dashboard panel (non-fatal)
+        try:
+            import json as _json
+            async with db.execute(
+                "SELECT name FROM sessions WHERE id = ?", (session_id,)
+            ) as _sc:
+                _sr = await _sc.fetchone()
+            _session_name = (_sr["name"] if _sr else None) or session_id[:8]
+            async with db.execute(
+                "SELECT COUNT(*) AS n FROM task_log "
+                "WHERE session_id = ? AND status = 'done'",
+                (session_id,),
+            ) as _tc:
+                _tr = await _tc.fetchone()
+            _items_done = int(_tr["n"]) if _tr else 0
+            _summary_line = (content or "").split("\n")[0][:140]
+            await db_module.add_project_note(
+                db, project_id,
+                title=f"checkpoint:{session_id[:8]}",
+                body=_json.dumps({
+                    "session_id": session_id,
+                    "session_name": _session_name,
+                    "items_done": _items_done,
+                    "summary_line": _summary_line,
+                    "next_goal": next_goal,
+                    "start_fresh": start_fresh,
+                }),
+                tags="checkpoint",
+            )
+        except Exception:
+            pass  # non-fatal — checkpoint still returns normally
         return {
             "summary": content,
             "pending_count": len(pending_items),
@@ -4798,7 +4850,11 @@ def build_mcp_server():
                     "filling up or before ending a session. mode='full' "
                     "writes the complete L0/L1/L2 handoff. mode='delta' "
                     "returns a compact session update with completed items, "
-                    "remaining pending items, and the next /goal string."
+                    "remaining pending items, and the next /goal string. "
+                    "mode='starter' returns a ≤20-line paste-after-/compact "
+                    "block: project_id, start_session command, last 5 done, "
+                    "top 3 pending IDs, and a /goal string. "
+                    "mode='planner' gives strategic context for claude.ai."
                 ),
                 inputSchema={
                     "type": "object",
@@ -4806,7 +4862,7 @@ def build_mcp_server():
                         "project_id": {"type": "string"},
                         "mode": {
                             "type": "string",
-                            "enum": ["full", "delta"],
+                            "enum": ["full", "delta", "planner", "starter"],
                         },
                         "session_id": {
                             "type": "string",
