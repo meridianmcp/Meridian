@@ -926,6 +926,10 @@ function buildTabBody(project) {
             <button class="secondary rewind-day-btn" data-days="3650" data-pid="${project.id}" style="padding:2px 8px;font-size:10px">All</button>
           </span>
         </div>
+        <div style="flex-shrink:0;padding:6px 14px;border-bottom:1px solid var(--border)">
+          <input type="text" id="rewind-search-${project.id}" placeholder="Search tasks, notes, decisions…"
+            style="width:100%;padding:5px 10px;background:var(--surface-2);border:1px solid var(--border);border-radius:4px;font-family:var(--font-mono);font-size:11px;color:var(--text);outline:none;box-sizing:border-box">
+        </div>
         <div class="rewind-wrap" id="rewind-wrap-${project.id}" style="flex:1;overflow:auto;padding:14px;font-family:'IBM Plex Mono',monospace;font-size:11px">
           <div class="empty" style="color:var(--muted)">pick a window above</div>
         </div>
@@ -5087,6 +5091,30 @@ function initRewindTab(projectId) {
   });
   const shareBtn = document.getElementById(`rewind-share-${projectId}`);
   if (shareBtn) shareBtn.onclick = () => copyRewindLink(projectId);
+  // Search bar — debounced 350ms, shows results in rewind-wrap
+  const searchInp = document.getElementById(`rewind-search-${projectId}`);
+  if (searchInp && !searchInp._wired) {
+    searchInp._wired = true;
+    const wrap = document.getElementById(`rewind-wrap-${projectId}`);
+    let _st = null;
+    searchInp.addEventListener('input', function() {
+      clearTimeout(_st);
+      const q = this.value.trim();
+      _st = setTimeout(async () => {
+        if (!q) {
+          if (p.rewindDays) loadRewindTab(projectId, p.rewindDays);
+          else { if (wrap) wrap.innerHTML = '<div class="empty" style="color:var(--muted)">pick a window above</div>'; }
+          return;
+        }
+        if (!wrap) return;
+        wrap.innerHTML = '<div class="empty" style="color:var(--muted)">searching…</div>';
+        try {
+          const results = await api(`/projects/${projectId}/search?q=${encodeURIComponent(q)}&limit=15`);
+          wrap.innerHTML = renderSearchResults(q, results);
+        } catch (e) { wrap.innerHTML = `<div class="empty">search failed: ${escapeHtml(e.message)}</div>`; }
+      }, 350);
+    });
+  }
   // Default to the 7-day view on first open.
   loadRewindTab(projectId, 7);
 }
