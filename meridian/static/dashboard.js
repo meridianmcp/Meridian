@@ -26,7 +26,8 @@ function getPanelState(projectId) {
 
 function autosizeGoalField(el, minPx = NORTH_STAR_MIN_HEIGHT_PX) {
   if (!el) return;
-  el.style.height = '0px';
+  // Use 'auto' not '0px' — avoids the collapse flash before recalculating scrollHeight (97bfb153)
+  el.style.height = 'auto';
   el.style.height = `${Math.max(el.scrollHeight, minPx)}px`;
 }
 
@@ -809,7 +810,7 @@ function buildTabBody(project) {
         <div class="goal-subtab-body">
           <div class="goal-subtab-panel active" id="gtab-north-star-${project.id}">
             <div style="color:var(--muted);font-size:10px;margin-bottom:6px">Permanent vision. Set once, change rarely or never.</div>
-            <textarea class="goal-area goal-full mono" id="goal-north-star-${project.id}" placeholder="(north star not set — set once, rarely change)"></textarea>
+            <textarea class="goal-area goal-full mono" id="goal-north-star-${project.id}" placeholder="(north star not set — set once, rarely change)" style="overflow-y:hidden;min-height:0"></textarea>
             <div class="goal-actions">
               <button class="primary" id="save-north-star-${project.id}">save north star</button>
               <span class="goal-ts" id="goal-ns-ts-${project.id}"></span>
