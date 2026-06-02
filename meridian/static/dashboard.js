@@ -2258,6 +2258,15 @@ async function loadSettingsTab(projectId) {
 
   let html = '';
 
+  // "Connect claude.ai browser" card — always shown regardless of hosted/self-hosted
+  html += `<div style="margin-bottom:14px;padding:10px 12px;border:1px solid var(--border);border-radius:6px;background:var(--surface-2);display:flex;justify-content:space-between;align-items:center;gap:8px">
+    <div>
+      <div style="font-weight:600;font-size:11px;color:var(--text);margin-bottom:2px">Connect claude.ai browser</div>
+      <div style="font-size:10px;color:var(--muted)">Use Meridian directly in claude.ai — no install needed</div>
+    </div>
+    <a href="/install-mcp" target="_blank" style="white-space:nowrap;padding:4px 10px;background:var(--accent);color:#fff;border-radius:4px;font-size:10px;font-weight:600;text-decoration:none">Setup guide →</a>
+  </div>`;
+
   // MCP config section (hosted mode only)
   if (mcpData) {
     const projects = mcpData.projects || [];
