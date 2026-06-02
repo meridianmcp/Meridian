@@ -1641,6 +1641,25 @@ function renderSprintProgress(projectId, items) {
               style="margin-left:4px">+ Add</button>
     </div>
   </div>`;
+
+  // Backburner section — pushed/post-launch items collapsed by default
+  const pushedItems = items.filter(it => it.status === 'pushed');
+  if (pushedItems.length > 0) {
+    html += `<details style="margin-top:8px;border:1px solid var(--border);border-radius:4px;background:var(--surface-1)">
+      <summary style="cursor:pointer;padding:6px 10px;font-family:var(--font-mono);font-size:10px;color:var(--muted);letter-spacing:.05em;user-select:none;list-style:none;display:flex;align-items:center;gap:6px">
+        <span>⏸</span><span>Backburner (${pushedItems.length} pushed)</span>
+      </summary>
+      <div style="padding:4px 10px 8px">
+        ${pushedItems.map(it => `<div style="display:flex;align-items:center;gap:6px;padding:3px 0;border-top:1px solid var(--border)">
+          <span style="color:var(--muted);font-size:10px;flex-shrink:0">→</span>
+          <span style="font-family:var(--font-mono);font-size:10px;color:var(--muted);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${escapeHtml(it.title)}">${escapeHtml(it.title)}</span>
+          ${it.pushed_to ? `<span style="font-size:9px;color:var(--accent);background:var(--accent)1a;border:1px solid var(--accent)33;border-radius:3px;padding:0 5px;flex-shrink:0;font-family:var(--font-mono)">${escapeHtml(it.pushed_to)}</span>` : ''}
+          ${it.version ? `<span style="font-size:9px;color:var(--muted);flex-shrink:0">${escapeHtml(it.version)}</span>` : ''}
+        </div>`).join('')}
+      </div>
+    </details>`;
+  }
+
   root.innerHTML = html;
   root.querySelector('.sprint-add-btn').onclick =
     () => addSprintItemFromInput(projectId);
