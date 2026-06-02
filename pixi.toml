@@ -61,5 +61,6 @@ starter = "python scripts/starter_handoff.py"
 install-companions = "npm install -g repomix && pixi run install-browsers && echo Companions installed"
 install-browsers = "playwright install chromium"
 mcp = "python -m meridian --mcp"
+executor = "python scripts/run_executor.py"
 text-editor-mcp = { cmd = "pixi run python -m mcp_text_editor", cwd = "extensions/mcp-text-editor" }
 repomix-mcp = "npx repomix --mcp"
