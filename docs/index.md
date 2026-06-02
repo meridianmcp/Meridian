@@ -24,7 +24,7 @@ Every session that connects to Meridian can:
 - **See every other session's work** — no duplicate effort
 - **Generate instant handoffs** — compressed context files that resume a new session in seconds
 
-When the context window fills up, you can generate a handoff and start fresh. The new session reads the file and picks up exactly where you left off — no re-explaining.
+When the context window fills up, you can generate a handoff and start fresh. The new session will then read the file and pick up exactly where you left off -- no re-explaining required.
 
 ## Architecture
 
