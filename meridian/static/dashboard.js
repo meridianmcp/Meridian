@@ -744,7 +744,7 @@ function buildTabBody(project) {
       <button class="vtab-btn" data-vtab="queue" title="Work Queue">🪖</button>
       <button class="vtab-btn" data-vtab="team" title="Team — per-human activity">👥</button>
       <button class="vtab-btn" data-vtab="notes" title="Notes — per-project wiki">📝</button>
-      <button class="vtab-btn" data-vtab="hitl" title="HITL — Human-in-the-Loop queue">❓</button>
+      <button class="vtab-btn" data-vtab="hitl" title="HITL — Human-in-the-Loop queue" style="position:relative">❓<span class="hitl-vtab-badge" data-pid="${project.id}" style="display:none;position:absolute;top:2px;right:2px;background:#f87171;color:#fff;font-size:8px;font-weight:700;padding:0 3px;border-radius:6px;line-height:14px;pointer-events:none">0</span></button>
       <button class="vtab-btn" data-vtab="docs" title="MCP Tool Reference">📖</button>
       <button class="vtab-btn" data-vtab="settings" title="Notification Settings">🔔</button>
     </div>
@@ -3834,6 +3834,23 @@ const _HITL_URGENCY_COLOR = {
 
 let _hitlPollTimer = null;
 
+function _hitlBadgeClick() {
+  /** Click handler for the hitl-count badge in the top bar — switches the
+   * active project to the HITL vtab and opens the panel. */
+  const pid = state.activeTab;
+  if (pid) {
+    const hitlBtn = document.querySelector(`#vtab-strip-${pid} [data-vtab="hitl"]`);
+    if (hitlBtn) hitlBtn.click();
+  }
+  // Also open the inline panel if currently closed
+  const panel = document.getElementById('hitl-panel');
+  const toggleBtn = document.getElementById('hitl-toggle-btn');
+  if (panel && panel.style.display === 'none') {
+    panel.style.display = 'block';
+    if (toggleBtn) toggleBtn.textContent = 'Close';
+  }
+}
+
 function initHitlPanel() {
   /** v2.4 — boot the HITL polling loop + toggle wire-up. The bar at the
    * top of <main> auto-shows when there's at least one pending request
@@ -3866,6 +3883,11 @@ async function refreshHitl() {
     const items = await api('/hitl?status=pending&limit=50');
     const n = items.length;
     countEl.textContent = String(n);
+    // Sync per-project vtab badges
+    document.querySelectorAll('.hitl-vtab-badge').forEach(badge => {
+      badge.textContent = String(n);
+      badge.style.display = n > 0 ? 'inline-block' : 'none';
+    });
     if (n === 0) {
       bar.style.display = 'none';
       document.getElementById('hitl-panel').style.display = 'none';
