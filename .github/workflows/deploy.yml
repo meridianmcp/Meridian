@@ -18,6 +18,8 @@ jobs:
         with:
           pixi-version: latest
           cache: false
+      - run: pixi install
+      - run: pixi run python -m playwright install chromium --with-deps
       - run: pixi run test
 
   # Every push to main AND manual dispatch deploys to the preview app.
