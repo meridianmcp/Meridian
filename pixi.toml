@@ -34,6 +34,7 @@ resend = ">=0.7"
 bcrypt = ">=4.0"
 slowapi = ">=0.1"
 mkdocs-material = ">=9.5"
+playwright = ">=1.40"
 
 [tasks]
 start = { cmd = "python -m meridian", env = { MERIDIAN_CLAUDE_CLI = "cmd /c C:/Users/13144/AppData/Roaming/npm/claude.cmd -p" } }
@@ -56,7 +57,8 @@ test-hooks-live = "python scripts/test_hooks_live.py"
 test-mcp-tools = "python scripts/test_mcp_tools.py"
 test-tenancy = "python scripts/test_tenancy.py"
 launch = "python scripts/launch_morning.py"
-install-companions = "npm install -g repomix && echo Companions installed"
+install-companions = "npm install -g repomix && pixi run install-browsers && echo Companions installed"
+install-browsers = "playwright install chromium"
 mcp = "python -m meridian --mcp"
-text-editor-mcp = "uvx mcp-text-editor"
+text-editor-mcp = { cmd = "pixi run python -m mcp_text_editor", cwd = "extensions/mcp-text-editor" }
 repomix-mcp = "npx repomix --mcp"

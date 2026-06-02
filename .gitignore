@@ -245,3 +245,4 @@ CONNECT.txt
 # Local integration test artifacts (results only)
 tests/integration/results.txt
 
+extensions/mcp-text-editor/.pixi/
