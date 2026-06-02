@@ -2204,65 +2204,156 @@ async function loadTimeline(projectId) {
 function renderTimeline(projectId, data) {
   const wrap = document.getElementById(`timeline-wrap-${projectId}`);
   if (!wrap) return;
-  const { tasks = [], sessions = [], goal_events = [] } = data || {};
-  if (!sessions.length && !tasks.length && !goal_events.length) {
+  const { tasks = [], goal_events = [] } = data || {};
+
+  if (!tasks.length && !goal_events.length) {
     wrap.innerHTML = `<div class="timeline-empty">no activity yet — log a task to see it here</div>`;
     return;
   }
-  const isAbs = !!(state.panels[projectId] && state.panels[projectId]._timelineAbsolute);
-  const fmtTs = (ts) => {
-    if (!ts) return '';
-    const iso = ts.includes('T') ? ts : ts.replace(' ', 'T') + 'Z';
-    return isAbs
-      ? new Date(iso).toISOString().replace('T', ' ').slice(0, 16)
-      : formatRelativeTime(ts);
+
+  // Destroy any previous vis instance to avoid duplicate timelines
+  const p = state.panels[projectId];
+  if (p && p._visTimeline) {
+    try { p._visTimeline.destroy(); } catch (_) {}
+    p._visTimeline = null;
+  }
+
+  // Fall back to log view if vis-timeline not loaded
+  if (typeof vis === 'undefined' || !vis.Timeline) {
+    _renderTimelineLog(projectId, data);
+    return;
+  }
+
+  // Parse SQLite timestamp ("YYYY-MM-DD HH:MM:SS") as UTC Date
+  const parseTs = ts => {
+    if (!ts) return null;
+    try {
+      return new Date(ts.includes('T') ? ts : ts.replace(' ', 'T') + 'Z');
+    } catch (_) { return null; }
   };
 
-  // Build a unified event list; sort newest first.
-  const events = [];
+  // Build groups — one per unique session name; plus a "goal" row
+  const sessionNames = [...new Set(tasks.map(t => t.session_name || '(unknown)'))];
+  const groupsArr = sessionNames.map((name, i) => ({
+    id: `s:${name}`,
+    content: `<span style="font-family:var(--font-mono);font-size:10px;color:var(--muted)">${escapeHtml(name.slice(0, 24))}</span>`,
+  }));
+  if (goal_events.length) {
+    groupsArr.push({
+      id: 'goal',
+      content: `<span style="font-family:var(--font-mono);font-size:10px;color:var(--accent)">goal</span>`,
+    });
+  }
+
+  // Build task items
+  const items = [];
+  let itemId = 1;
   tasks.forEach(t => {
-    const icon = { done: '✅', failed: '❌', pending: '⏳', in_progress: '🔄' }[t.status] || '•';
-    events.push({
-      ts: t.created_at,
-      actor: t.session_name || '(unknown)',
-      desc: `${icon} ${t.description.slice(0, 100)}`,
+    const start = parseTs(t.created_at);
+    if (!start) return;
+    const isDone = t.status === 'done';
+    const bg = isDone ? '#34d39922' : '#f871711a';
+    const border = isDone ? '#34d399' : '#f87171';
+    const title = escapeHtml((t.description || '').slice(0, 80));
+    items.push({
+      id: itemId++,
+      group: `s:${t.session_name || '(unknown)'}`,
+      content: `<span style="font-size:9px;font-family:var(--font-mono);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;display:block;max-width:140px" title="${title}">${isDone ? '✓' : '✗'} ${title}</span>`,
+      start,
+      style: `background:${bg};border-color:${border};color:var(--text);border-radius:3px;padding:1px 4px`,
     });
   });
-  sessions.forEach(s => {
-    const label = s.human_id ? `${s.human_id}/${s.name}` : s.name;
-    events.push({
-      ts: s.registered_at || s.last_seen || '',
-      actor: label,
-      desc: `🟢 session ${s.status || 'registered'}`,
-    });
-  });
-  // Collapse goal events — show only latest per field per hour
+
+  // Collapse goal events — one per field per hour
   const goalByField = new Map();
   goal_events.forEach(g => {
-    // Skip version_goal events that are ONLY an AUTO BLOCKS update (minor=True writes)
-    // These are identified by new_summary starting with AUTO SUMMARY or containing only auto-block content
     if (g.field === 'version_goal') {
       const summary = (g.new_summary || '');
       if (summary.startsWith('[AUTO SUMMARY') || summary.startsWith('- [DONE]') || summary.startsWith('- [PENDING]')) return;
     }
-    const key = g.field + (g.updated_at || '').slice(0, 13); // group by field+hour
+    const key = g.field + (g.updated_at || '').slice(0, 13);
     if (!goalByField.has(key) || g.version > (goalByField.get(key).version || 0)) {
       goalByField.set(key, g);
     }
   });
   goalByField.forEach(g => {
-    events.push({ ts: g.updated_at || '', actor: 'goal', desc: `📋 ${g.field} → v${g.version}` });
+    const start = parseTs(g.updated_at);
+    if (!start) return;
+    items.push({
+      id: itemId++,
+      group: 'goal',
+      content: `<span style="font-size:9px;font-family:var(--font-mono)" title="${escapeHtml(g.field)} v${g.version}">${escapeHtml(g.field.replace('_updated_at','').replace('_',' '))} v${g.version}</span>`,
+      start,
+      style: 'background:#6c8fff22;border-color:#6c8fff;color:var(--text);border-radius:3px;padding:1px 4px',
+    });
   });
-  events.sort((a, b) => (b.ts || '').localeCompare(a.ts || ''));
 
-  const rows = events.map(e =>
-    `<div class="timeline-log-entry">` +
-    `<span class="timeline-log-ts">${escapeHtml(fmtTs(e.ts))}</span>` +
-    `<span class="timeline-log-actor">${escapeHtml(e.actor)}</span>` +
-    `<span class="timeline-log-desc">${escapeHtml(e.desc)}</span>` +
-    `</div>`
-  ).join('');
-  wrap.innerHTML = `<div class="timeline-log">${rows}</div>`;
+  // Create vis container
+  wrap.innerHTML = '';
+  const container = document.createElement('div');
+  container.style.cssText = 'height:100%;min-height:300px;background:transparent';
+  wrap.appendChild(container);
+
+  const options = {
+    stack: false,
+    orientation: 'top',
+    showCurrentTime: false,
+    zoomable: true,
+    moveable: true,
+    selectable: false,
+    groupOrder: 'id',
+    margin: { item: { horizontal: 2, vertical: 2 } },
+    locale: 'en',
+    xss: { disabled: true },
+  };
+
+  try {
+    const groups = new vis.DataSet(groupsArr);
+    const itemsDs = new vis.DataSet(items);
+    const timeline = new vis.Timeline(container, itemsDs, groups, options);
+
+    // Dark-mode style overrides for vis elements
+    const styleId = `vis-dark-${projectId}`;
+    if (!document.getElementById(styleId)) {
+      const s = document.createElement('style');
+      s.id = styleId;
+      s.textContent = `.vis-timeline{background:transparent;border-color:var(--border)!important}.vis-time-axis .vis-text{color:var(--muted)!important;font-family:var(--font-mono);font-size:10px}.vis-label{background:var(--surface)!important;border-color:var(--border)!important}.vis-panel.vis-center{border-color:var(--border)!important}.vis-panel.vis-left{border-color:var(--border)!important}.vis-item{border-width:1px}`;
+      document.head.appendChild(s);
+    }
+
+    if (p) p._visTimeline = timeline;
+  } catch (err) {
+    console.warn('vis-timeline init failed, falling back to log:', err);
+    _renderTimelineLog(projectId, data);
+  }
+}
+
+function _renderTimelineLog(projectId, data) {
+  /** Fallback text log when vis-timeline isn't available. */
+  const wrap = document.getElementById(`timeline-wrap-${projectId}`);
+  if (!wrap) return;
+  const { tasks = [], goal_events = [] } = data || {};
+  const isAbs = !!(state.panels[projectId] && state.panels[projectId]._timelineAbsolute);
+  const fmtTs = ts => {
+    if (!ts) return '';
+    const iso = ts.includes('T') ? ts : ts.replace(' ', 'T') + 'Z';
+    return isAbs ? new Date(iso).toISOString().replace('T',' ').slice(0,16) : formatRelativeTime(ts);
+  };
+  const events = [];
+  tasks.forEach(t => {
+    const icon = { done: '✅', failed: '❌' }[t.status] || '•';
+    events.push({ ts: t.created_at, actor: t.session_name || '(unknown)', desc: `${icon} ${(t.description || '').slice(0, 100)}` });
+  });
+  const goalByField = new Map();
+  goal_events.forEach(g => {
+    const key = g.field + (g.updated_at || '').slice(0, 13);
+    if (!goalByField.has(key) || g.version > (goalByField.get(key).version || 0)) goalByField.set(key, g);
+  });
+  goalByField.forEach(g => events.push({ ts: g.updated_at || '', actor: 'goal', desc: `📋 ${g.field} → v${g.version}` }));
+  events.sort((a, b) => (b.ts || '').localeCompare(a.ts || ''));
+  wrap.innerHTML = `<div class="timeline-log">${events.map(e =>
+    `<div class="timeline-log-entry"><span class="timeline-log-ts">${escapeHtml(fmtTs(e.ts))}</span><span class="timeline-log-actor">${escapeHtml(e.actor)}</span><span class="timeline-log-desc">${escapeHtml(e.desc)}</span></div>`
+  ).join('')}</div>`;
 }
 
 const _HUMAN_COLORS = ['#6c8fff', '#a78bfa', '#22d3ee', '#4ade80', '#fbbf24', '#f87171', '#fb923c', '#e879f9'];
