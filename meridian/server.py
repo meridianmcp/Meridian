@@ -855,7 +855,7 @@ except ImportError:
 # v2.0-fixes — Demo read-only middleware (MERIDIAN_DEMO=true)
 # ---------------------------------------------------------------------------
 
-_DEMO_WRITE_ALLOWLIST = {"/demo-auth", "/waitlist", "/auth/magic", "/auth/login", "/auth/logout", "/__gate__"}
+_DEMO_WRITE_ALLOWLIST = {"/demo-auth", "/waitlist", "/auth/magic", "/auth/login", "/auth/logout", "/__gate__", "/sessions/worker", "/mcp"}
 _DEMO_CONTEXT_COOKIE = "meridian_demo"
 
 
