@@ -664,7 +664,7 @@ async def init_pg_db(url: str) -> PostgresConnection:
         max_size=10,
         open=False,
         max_idle=60.0,
-        max_lifetime=300.0,
+        max_lifetime=240.0,  # recycle before Neon 300s idle timeout
         reconnect_timeout=30.0,
         kwargs={
             "autocommit": True,
