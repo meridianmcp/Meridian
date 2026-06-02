@@ -2,13 +2,6 @@
 
 Get Meridian running and connected to Claude Code in under 10 minutes.
 
-<div style="border:2px dashed #4a90d9;border-radius:8px;padding:20px 24px;margin:20px 0;text-align:center;background:rgba(74,144,217,0.05)">
-  📹 <strong>Getting started in 3 minutes</strong> — video coming soon<br>
-  <span style="font-size:0.85em;color:#888">Drop the YouTube URL below when ready</span>
-  <!-- REPLACE WITH ACTUAL YOUTUBE URL BEFORE LAUNCH -->
-  <!-- <iframe width="560" height="315" src="https://www.youtube.com/embed/VIDEO_ID" title="Meridian quickstart" frameborder="0" allowfullscreen style="max-width:100%"></iframe> -->
-</div>
-
 ---
 
 ## Prerequisites
