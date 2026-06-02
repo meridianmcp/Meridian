@@ -41,31 +41,64 @@ When the context window fills up, you can generate a handoff and start fresh. Th
 
 ## Architecture
 
+Two deployment modes — pick the one that fits you.
+
+### Self-hosted (free)
+
 ```
-┌─────────────────────────────────────────────────────────┐
-│                     Your machine                        │
-│                                                         │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  │
-│  │ Claude Code  │  │  Claude      │  │   Cursor /   │  │
-│  │  terminal 1  │  │  Desktop     │  │  Windsurf    │  │
-│  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘  │
-│         │                 │                 │           │
-│         └─────────────────┴─────────────────┘           │
-│                           │ MCP stdio                    │
-│                    ┌──────▼───────┐                     │
-│                    │   Meridian   │                     │
-│                    │  MCP Server  │                     │
-│                    │  :7878       │                     │
-│                    └──────┬───────┘                     │
-│                           │                             │
-│                    ┌──────▼───────┐                     │
-│                    │  SQLite DB   │  ← or Postgres      │
-│                    │  meridian.db │     (Neon / any)    │
-│                    └──────────────┘                     │
-└─────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────┐
+│                        Your machine                         │
+│                                                             │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────┐ │
+│  │ Claude Code │  │   Cursor /  │  │  Claude Desktop     │ │
+│  │  (any term) │  │  Windsurf   │  │  (via .dxt install) │ │
+│  └──────┬──────┘  └──────┬──────┘  └──────────┬──────────┘ │
+│         │                │                    │            │
+│         └────────────────┴────────────────────┘            │
+│                          │ MCP stdio (local)               │
+│                   ┌──────▼──────┐                          │
+│                   │  Meridian   │  ← pixi run start        │
+│                   │ MCP Server  │    or binary .exe / mac  │
+│                   │   :7878     │                          │
+│                   └──────┬──────┘                          │
+│                          │                                 │
+│            ┌─────────────┴──────────────┐                  │
+│            ▼                            ▼                  │
+│   ┌────────────────┐        ┌─────────────────────┐        │
+│   │   SQLite DB    │   or   │  Postgres (Neon /   │        │
+│   │  meridian.db   │        │  any compatible DB) │        │
+│   └────────────────┘        └─────────────────────┘        │
+│                                                             │
+│  Features: persistent memory · task log · sprint board     │
+│            HITL queue · handoff · hooks auto-checkpoint     │
+└─────────────────────────────────────────────────────────────┘
 ```
 
-For **hosted tier** (usemeridian.us), Meridian runs in the cloud and each workspace gets an isolated Neon Postgres database. Your Claude sessions connect over HTTPS with a bearer token — zero local install required.
+### Hosted tier (usemeridian.us)
+
+```
+┌──────────────────────┐         ┌───────────────────────────┐
+│     Your machine     │         │    usemeridian.us cloud   │
+│                      │         │                           │
+│  ┌────────────────┐  │  HTTPS  │  ┌─────────────────────┐  │
+│  │  Claude Code   │  │ Bearer  │  │  Meridian Cloud     │  │
+│  │  Cursor        ├──┼────────►│  │  MCP Server         │  │
+│  │  Claude.ai     │  │  token  │  └──────────┬──────────┘  │
+│  └────────────────┘  │         │             │             │
+│                      │         │  ┌──────────▼──────────┐  │
+│  ┌────────────────┐  │         │  │ Isolated Neon       │  │
+│  │  Dashboard     │◄─┼────────►│  │ Postgres DB         │  │
+│  │  (browser)     │  │         │  │ (per workspace)     │  │
+│  └────────────────┘  │         │  └─────────────────────┘  │
+└──────────────────────┘         │                           │
+                                 │  Features: same as self-  │
+                                 │  hosted + zero install,   │
+                                 │  managed DB, team URLs,   │
+                                 │  SLA, SSO (enterprise)    │
+                                 └───────────────────────────┘
+```
+
+Zero local install — sign in at [usemeridian.us](https://usemeridian.us), copy your API token, add to MCP config.
 
 ## Quick Install
 

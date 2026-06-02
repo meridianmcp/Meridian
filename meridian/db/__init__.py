@@ -14,12 +14,15 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import uuid
 from pathlib import Path
 from typing import Any
 
 import aiosqlite
+
+_log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Transparent field encryption (Fernet, MERIDIAN_ENCRYPTION_KEY env var).
@@ -122,6 +125,11 @@ def _publish_project_event(project_id: str, event_type: str, payload: dict[str, 
     so the dashboard refreshes in real-time without polling.
     """
     listeners = _TASK_LISTENERS.get(project_id)
+    n_listeners = len(listeners) if listeners else 0
+    _log.debug(
+        "WS broadcast: type=%s project=%s listeners=%d",
+        event_type, project_id[:8], n_listeners,
+    )
     if not listeners:
         return
     event = {"type": event_type, "project_id": project_id, **payload}
@@ -129,7 +137,7 @@ def _publish_project_event(project_id: str, event_type: str, payload: dict[str, 
         try:
             q.put_nowait(event)
         except asyncio.QueueFull:
-            pass
+            _log.warning("WS broadcast queue full for project %s — event dropped", project_id[:8])
 
 CREATE_TABLES = """
 CREATE TABLE IF NOT EXISTS projects (

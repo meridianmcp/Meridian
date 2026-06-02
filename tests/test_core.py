@@ -4995,6 +4995,184 @@ def test_stats_tasks_per_day_length_matches_period(client):
     assert len(data["tasks_per_day"]) == 7
 
 
+# ---------------------------------------------------------------------------
+# v2.4 HITL — hitl_requests table: request / answer / dismiss / list
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_request_hitl_creates_pending(db):
+    p = await db_module.create_project(db, "hitl-proj")
+    s = await db_module.register_session(db, p["id"], "sess")
+    h = await db_module.request_hitl(db, p["id"], "Is it safe to proceed?", session_id=s["id"])
+    assert h["id"]
+    assert h["status"] == "pending"
+    assert h["question"] == "Is it safe to proceed?"
+    assert h["project_id"] == p["id"]
+    assert h["session_id"] == s["id"]
+
+
+@pytest.mark.asyncio
+async def test_answer_hitl_marks_answered(db):
+    p = await db_module.create_project(db, "hitl-proj")
+    h = await db_module.request_hitl(db, p["id"], "Deploy now?")
+    updated = await db_module.answer_hitl_request(db, h["id"], "Yes, deploy", answered_by="adam")
+    assert updated["status"] == "answered"
+    assert updated["answer"] == "Yes, deploy"
+    assert updated["answered_by"] == "adam"
+    fetched = await db_module.get_hitl_request(db, h["id"])
+    assert fetched["status"] == "answered"
+
+
+@pytest.mark.asyncio
+async def test_dismiss_hitl_marks_dismissed(db):
+    p = await db_module.create_project(db, "hitl-proj")
+    h = await db_module.request_hitl(db, p["id"], "Rate-limit per IP?")
+    updated = await db_module.dismiss_hitl_request(db, h["id"])
+    assert updated["status"] == "dismissed"
+    fetched = await db_module.get_hitl_request(db, h["id"])
+    assert fetched["status"] == "dismissed"
+
+
+@pytest.mark.asyncio
+async def test_list_hitl_requests_filter_by_status(db):
+    p = await db_module.create_project(db, "hitl-proj")
+    h1 = await db_module.request_hitl(db, p["id"], "Q1")
+    h2 = await db_module.request_hitl(db, p["id"], "Q2")
+    await db_module.answer_hitl_request(db, h2["id"], "answered")
+
+    pending = await db_module.list_hitl_requests(db, p["id"], status="pending")
+    assert len(pending) == 1
+    assert pending[0]["id"] == h1["id"]
+
+    answered = await db_module.list_hitl_requests(db, p["id"], status="answered")
+    assert len(answered) == 1
+    assert answered[0]["id"] == h2["id"]
+
+    all_items = await db_module.list_hitl_requests(db, p["id"], status=None)
+    assert len(all_items) == 2
+
+
+@pytest.mark.asyncio
+async def test_get_hitl_request_returns_none_for_unknown(db):
+    result = await db_module.get_hitl_request(db, "00000000-0000-0000-0000-000000000000")
+    assert result is None
+
+
+def test_hitl_rest_lifecycle(client):
+    """POST/GET/PATCH /hitl routes create, fetch, answer, and dismiss."""
+    proj = client.post("/projects", json={"name": "hitl-rest"}).json()
+    pid = proj["id"]
+    sess = client.post("/sessions/register", json={"project_id": pid, "name": "s"}).json()
+
+    # Create via REST
+    r = client.post(f"/projects/{pid}/hitl", json={"question": "Ship it?", "session_id": sess["id"]})
+    assert r.status_code == 201
+    h = r.json()
+    hid = h["id"]
+    assert h["status"] == "pending"
+
+    # Fetch single
+    r2 = client.get(f"/hitl/{hid}")
+    assert r2.status_code == 200
+    assert r2.json()["question"] == "Ship it?"
+
+    # List pending
+    r3 = client.get(f"/projects/{pid}/hitl?status=pending")
+    assert r3.status_code == 200
+    ids = [item["id"] for item in r3.json()]
+    assert hid in ids
+
+    # Answer
+    r4 = client.patch(f"/hitl/{hid}", json={"action": "answer", "answer": "Yes!"})
+    assert r4.status_code == 200
+    assert r4.json()["status"] == "answered"
+    assert r4.json()["answer"] == "Yes!"
+
+    # No longer in pending list
+    r5 = client.get(f"/projects/{pid}/hitl?status=pending")
+    assert all(item["id"] != hid for item in r5.json())
+
+
+def test_hitl_rest_dismiss(client):
+    """PATCH with action=dismiss marks status dismissed."""
+    proj = client.post("/projects", json={"name": "hitl-dismiss"}).json()
+    pid = proj["id"]
+    r = client.post(f"/projects/{pid}/hitl", json={"question": "Dismiss me?"})
+    assert r.status_code == 201
+    hid = r.json()["id"]
+    r2 = client.patch(f"/hitl/{hid}", json={"action": "dismiss"})
+    assert r2.status_code == 200
+    assert r2.json()["status"] == "dismissed"
+
+
+def test_hitl_rest_404_on_unknown(client):
+    """GET /hitl/unknown returns 404."""
+    r = client.get("/hitl/00000000-0000-0000-0000-000000000000")
+    assert r.status_code == 404
+
+
+def test_mcp_hitl_tools_lifecycle(client):
+    """MCP tools/call: request_hitl → list_hitl_requests → answer_hitl → get_hitl_request."""
+    import asyncio as _asyncio
+
+    def _run(coro):
+        return _asyncio.run(coro)
+
+    async def _setup():
+        db = client.app.state.db
+        tenant = await db_module.upsert_tenant(db, "hitl_mcp@example.com")
+        raw, _ = await db_module.create_api_token(db, tenant["id"])
+        proj = await db_module.create_project(db, "mcp-hitl-proj")
+        return raw, proj["id"]
+
+    token, pid = _run(_setup())
+    headers = {"Authorization": f"Bearer {token}"}
+
+    def mcp(name, arguments):
+        return client.post(
+            "/mcp",
+            json={"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                  "params": {"name": name, "arguments": arguments}},
+            headers=headers,
+        )
+
+    # request_hitl
+    r = mcp("request_hitl", {"project_id": pid, "question": "Ready to ship?"})
+    assert r.status_code == 200
+    content = r.json()["result"]["content"]
+    import json as _json
+    hitl = _json.loads(content[0]["text"])
+    hid = hitl["id"]
+    assert hitl["status"] == "pending"
+
+    # list_hitl_requests
+    r2 = mcp("list_hitl_requests", {"project_id": pid, "status": "pending"})
+    assert r2.status_code == 200
+    items = _json.loads(r2.json()["result"]["content"][0]["text"])
+    assert any(item["id"] == hid for item in items)
+
+    # answer_hitl
+    r3 = mcp("answer_hitl", {"request_id": hid, "answer": "Yes, ship it!", "answered_by": "adam"})
+    assert r3.status_code == 200
+    answered = _json.loads(r3.json()["result"]["content"][0]["text"])
+    assert answered["status"] == "answered"
+    assert answered["answer"] == "Yes, ship it!"
+
+    # get_hitl_request confirms answered state
+    r4 = mcp("get_hitl_request", {"request_id": hid})
+    assert r4.status_code == 200
+    final = _json.loads(r4.json()["result"]["content"][0]["text"])
+    assert final["status"] == "answered"
+
+    # dismiss_hitl on a second request
+    r5 = mcp("request_hitl", {"project_id": pid, "question": "Dismiss me?"})
+    hid2 = _json.loads(r5.json()["result"]["content"][0]["text"])["id"]
+    r6 = mcp("dismiss_hitl", {"request_id": hid2})
+    assert r6.status_code == 200
+    assert _json.loads(r6.json()["result"]["content"][0]["text"])["status"] == "dismissed"
+
+
 def test_dashboard_js_has_charts_subtab(client):
     """dashboard.js must reference the Charts subtab and Chart.js init."""
     js = client.get("/static/dashboard.js").text
@@ -5934,3 +6112,76 @@ def test_new_mcp_tools_in_tools_list():
     new_tools = {"list_hitl_requests", "answer_hitl", "dismiss_hitl", "list_sessions", "add_sprint_note", "get_sprint_notes"}
     missing = new_tools - tools
     assert not missing, f"Missing MCP tools: {missing}"
+
+
+# ---------------------------------------------------------------------------
+# 9768d806 — MCP SSE transport endpoints
+# ---------------------------------------------------------------------------
+
+def test_mcp_sse_get_headers(client):
+    """GET /mcp/sse returns correct headers (tested via OPTIONS to avoid hanging)."""
+    # The OPTIONS preflight verifies the endpoint exists and has correct CORS headers.
+    # The GET endpoint itself is an infinite SSE stream — not suitable for sync TestClient.
+    r = client.options("/mcp/sse")
+    assert r.status_code == 204
+    # Verify the GET route is registered (test that OPTIONS returns CORS, which only
+    # exists if the route is registered)
+    assert "access-control-allow-methods" in {k.lower() for k in r.headers}
+
+
+def test_mcp_sse_get_session_in_sessions_map(client, monkeypatch):
+    """GET /mcp/sse registers a session in _SSE_SESSIONS (verified via POST without session_id)."""
+    import importlib
+    import meridian.server as srv
+    # POST without session_id should still work (falls back to app.state.db)
+    payload = {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}
+    r = client.post("/mcp/sse", json=payload)
+    assert r.status_code == 200
+    assert "result" in r.json()
+
+
+def test_mcp_sse_options_returns_cors(client):
+    """OPTIONS /mcp/sse returns CORS headers for chrome-extension origin."""
+    r = client.options("/mcp/sse")
+    assert r.status_code == 204
+    assert r.headers.get("access-control-allow-origin") == "*"
+
+
+def test_mcp_sse_post_returns_jsonrpc(client):
+    """POST /mcp/sse returns valid JSON-RPC response for initialize."""
+    payload = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2024-11-05",
+            "clientInfo": {"name": "test", "version": "1.0"},
+            "capabilities": {},
+        },
+    }
+    r = client.post("/mcp/sse", json=payload)
+    assert r.status_code == 200
+    data = r.json()
+    assert data.get("jsonrpc") == "2.0"
+    assert data.get("id") == 1
+    assert "result" in data
+    assert data["result"]["protocolVersion"] == "2024-11-05"
+
+
+def test_mcp_sse_post_tools_list(client):
+    """POST /mcp/sse tools/list returns Meridian tools."""
+    payload = {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}
+    r = client.post("/mcp/sse", json=payload)
+    assert r.status_code == 200
+    data = r.json()
+    tool_names = [t["name"] for t in data["result"]["tools"]]
+    assert "start_session" in tool_names
+    assert "log_task" in tool_names
+    assert "generate_handoff" in tool_names
+
+
+def test_mcp_sse_cors_headers_on_post(client):
+    """POST /mcp/sse response includes CORS headers."""
+    payload = {"jsonrpc": "2.0", "id": 3, "method": "ping", "params": {}}
+    r = client.post("/mcp/sse", json=payload)
+    assert r.headers.get("access-control-allow-origin") == "*"

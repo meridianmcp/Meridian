@@ -98,6 +98,31 @@ async def get_tasks(
     return await db_module.get_tasks(await _db(request), project_id, limit=limit)
 
 
+@router.get("/projects/{project_id}/sessions/{session_id}/tasks/live")
+async def get_session_tasks_live(
+    project_id: str,
+    session_id: str,
+    request: Request,
+    limit: int = 5,
+) -> list[dict[str, Any]]:
+    """Return the last N task_log rows for a session — live Queue feed.
+
+    Used by the dashboard's "Currently Running" section to show what a
+    running Claude Code session is doing in real-time (polling every 5s).
+    """
+    db = await _db(request)
+    async with db.execute(
+        "SELECT t.*, s.name AS session_name, s.human_id AS human_id "
+        "FROM task_log t "
+        "LEFT JOIN sessions s ON s.id = t.session_id "
+        "WHERE t.project_id = ? AND t.session_id = ? "
+        "ORDER BY t.created_at DESC, t.rowid DESC LIMIT ?",
+        (project_id, session_id, limit),
+    ) as cur:
+        rows = await cur.fetchall()
+    return [dict(r) for r in rows]
+
+
 @router.get("/projects/{project_id}/tasks/search")
 async def search_tasks_http(
     project_id: str, request: Request, q: str = "", limit: int = 5

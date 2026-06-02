@@ -783,7 +783,7 @@ async def site_password_gate(request: Request, call_next):
     if not site_pw:
         return await call_next(request)
     path = request.url.path
-    if path in ("/health", "/mcp/health", "/__gate__", "/config", "/static", "/mcp/tools-doc", "/mcp/quickstart") or path.startswith("/static/") or path == "/demo" or path.startswith("/demo/"):
+    if path in ("/health", "/mcp/health", "/__gate__", "/config", "/static", "/mcp/tools-doc", "/mcp/quickstart", "/mcp/sse") or path.startswith("/static/") or path == "/demo" or path.startswith("/demo/"):
         return await call_next(request)
     # Demo cookie bypasses site password gate — demo users don't go through __gate__
     if request.cookies.get(_DEMO_CONTEXT_COOKIE):
@@ -855,7 +855,7 @@ except ImportError:
 # v2.0-fixes — Demo read-only middleware (MERIDIAN_DEMO=true)
 # ---------------------------------------------------------------------------
 
-_DEMO_WRITE_ALLOWLIST = {"/demo-auth", "/waitlist", "/auth/magic", "/auth/login", "/auth/logout", "/__gate__"}
+_DEMO_WRITE_ALLOWLIST = {"/demo-auth", "/waitlist", "/auth/magic", "/auth/login", "/auth/logout", "/__gate__", "/mcp/sse"}
 _DEMO_CONTEXT_COOKIE = "meridian_demo"
 
 
@@ -1144,6 +1144,16 @@ async def server_config() -> dict[str, Any]:
     default_url = f"http://{host}:{port}"
     server_url = os.environ.get("MERIDIAN_SERVER_URL", default_url)
     _, conn_name = toml_config_module.get_active_db_url()
+    # Parse hostname from MERIDIAN_DB_URL for the connection label (1f92d344)
+    import re as _re_cfg
+    _raw_db_url = os.environ.get("MERIDIAN_DB_URL", "")
+    _db_host = ""
+    if _raw_db_url:
+        _m = _re_cfg.search(r"@([^/:?]+)", _raw_db_url)
+        if _m:
+            _db_host = _m.group(1)
+            if len(_db_host) > 22:
+                _db_host = _db_host[:20] + "…"
     return {
         "server_url": server_url,
         "host": host,
@@ -1154,6 +1164,7 @@ async def server_config() -> dict[str, Any]:
             else "memory" if os.environ.get("MERIDIAN_DB") == ":memory:"
             else "sqlite"
         ),
+        "db_host": _db_host,
         "toml_exists": toml_config_module.toml_exists(),
         "toml_path": str(toml_config_module._toml_path() or (Path.cwd() / "meridian.toml")),
         "connection_name": conn_name,
@@ -4414,6 +4425,100 @@ async def _dispatch_mcp_tool(name: str, args: dict[str, Any], db: Any, data_dir:
 
 _MCP_RATE_LIMIT = "100/minute"
 
+# ---------------------------------------------------------------------------
+# 9768d806 — MCP SSE transport (for dnakov/claude-mcp Chrome extension)
+# ---------------------------------------------------------------------------
+# Protocol: GET /mcp/sse opens an SSE stream, receives "endpoint" event with
+# the POST URL. Client POSTs JSON-RPC to POST /mcp/sse?session_id=<uuid> and
+# reads the JSON response directly from the HTTP response body.
+
+_SSE_SESSIONS: dict[str, dict[str, Any]] = {}  # session_id → {db, queue}
+
+_SSE_CORS_HEADERS = {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Headers": "Content-Type, Authorization",
+    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+    "Cache-Control": "no-cache, no-store",
+    "X-Accel-Buffering": "no",
+}
+
+
+@app.options("/mcp/sse")
+async def mcp_sse_options(request: Request) -> Response:
+    """CORS preflight for chrome-extension:// origin."""
+    return Response(status_code=204, headers=_SSE_CORS_HEADERS)
+
+
+@app.get("/mcp/sse")
+async def mcp_sse_get(request: Request) -> StreamingResponse:
+    """MCP SSE transport GET — opens event stream for dnakov/claude-mcp.
+
+    Sends ``event: endpoint`` with POST URL, then heartbeats every 15 s.
+    No strict auth required: uses the same _db() resolver (Bearer / cookie /
+    local fallback) so both local and hosted-tier clients work.
+    """
+    import uuid as _uuid
+    import anyio as _anyio
+
+    db = await _db(request)
+    data_dir = _data_dir(request)
+
+    # Reuse session_id on reconnect if client sends one and it's valid
+    requested_sid = request.query_params.get("session_id")
+    if requested_sid and requested_sid in _SSE_SESSIONS:
+        session_id = requested_sid
+        _SSE_SESSIONS[session_id]["db"] = db
+    else:
+        session_id = str(_uuid.uuid4())
+        _SSE_SESSIONS[session_id] = {"db": db, "data_dir": data_dir}
+
+    endpoint_path = f"/mcp/sse?session_id={session_id}"
+
+    async def _stream():
+        try:
+            yield f"event: endpoint\ndata: {endpoint_path}\n\n"
+            # Heartbeat loop — exit when client disconnects
+            while True:
+                if await request.is_disconnected():
+                    break
+                yield ": heartbeat\n\n"
+                await _anyio.sleep(15)
+        finally:
+            _SSE_SESSIONS.pop(session_id, None)
+
+    return StreamingResponse(
+        _stream(),
+        media_type="text/event-stream",
+        headers=_SSE_CORS_HEADERS,
+    )
+
+
+@app.post("/mcp/sse")
+async def mcp_sse_post(request: Request) -> Any:
+    """MCP SSE transport POST — JSON-RPC handler for dnakov/claude-mcp.
+
+    Client POSTs a JSON-RPC 2.0 message; response is returned as JSON in the
+    HTTP response body (extension reads it directly, not via the SSE stream).
+    """
+    from fastapi.responses import JSONResponse as _JSONResp
+
+    session_id = request.query_params.get("session_id", "")
+    sess = _SSE_SESSIONS.get(session_id)
+    db = sess["db"] if sess else await _db(request)
+    data_dir = sess["data_dir"] if sess else _data_dir(request)
+
+    try:
+        body = await request.json()
+    except Exception:
+        return _JSONResp(_jsonrpc_err(None, -32700, "parse error"), status_code=400, headers=_SSE_CORS_HEADERS)
+
+    if isinstance(body, list):
+        results = [await _handle_mcp_request(item, db, data_dir) for item in body]
+        return _JSONResp(results, headers=_SSE_CORS_HEADERS)
+
+    result = await _handle_mcp_request(body, db, data_dir)
+    return _JSONResp(result, headers=_SSE_CORS_HEADERS)
+
 
 @app.post("/mcp")
 async def remote_mcp(request: Request) -> Any:
@@ -4833,6 +4938,82 @@ def build_mcp_server():
                     "type": "object",
                     "properties": {"request_id": {"type": "string"}},
                     "required": ["request_id"],
+                },
+            ),
+            Tool(
+                name="list_hitl_requests",
+                description=(
+                    "v2.4 — list HITL requests for a project without needing "
+                    "UUIDs. Returns pending queue by default; pass status='all' "
+                    "to see answered/dismissed items too. Use before answer_hitl "
+                    "or dismiss_hitl to find request IDs."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "project_id": {"type": "string"},
+                        "status": {
+                            "type": "string",
+                            "description": "Filter: 'pending' (default), 'answered', 'dismissed', or 'all'.",
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "description": "Max results, default 50.",
+                        },
+                    },
+                    "required": ["project_id"],
+                },
+            ),
+            Tool(
+                name="answer_hitl",
+                description=(
+                    "v2.4 — answer a pending HITL request so the waiting "
+                    "session can resume. Use list_hitl_requests to find "
+                    "request IDs."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "request_id": {"type": "string"},
+                        "answer": {"type": "string"},
+                        "answered_by": {
+                            "type": "string",
+                            "description": "Optional human_id of the answerer.",
+                        },
+                    },
+                    "required": ["request_id", "answer"],
+                },
+            ),
+            Tool(
+                name="dismiss_hitl",
+                description=(
+                    "v2.4 — dismiss a HITL request (won't-answer / no longer "
+                    "relevant). Stays in audit trail. Use list_hitl_requests "
+                    "to find request IDs."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {"request_id": {"type": "string"}},
+                    "required": ["request_id"],
+                },
+            ),
+            Tool(
+                name="list_sessions",
+                description=(
+                    "v2.4 — list active sessions for a project. Useful to see "
+                    "what's currently running before filing new sprint items. "
+                    "Pass status='all' to include closed sessions."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "project_id": {"type": "string"},
+                        "status": {
+                            "type": "string",
+                            "description": "Filter: 'active' (default) or 'all'.",
+                        },
+                    },
+                    "required": ["project_id"],
                 },
             ),
             Tool(
@@ -5446,6 +5627,8 @@ def build_mcp_server():
             elif name in (
                 "pin_decision", "update_decision", "get_pinned_decisions",
                 "request_hitl", "get_hitl_request",
+                "list_hitl_requests", "answer_hitl", "dismiss_hitl",
+                "list_sessions",
                 "add_note", "get_notes", "delete_note",
             ):
                 # v2.4/v0.9 — share dispatch with HTTP MCP so both surfaces stay in sync.
