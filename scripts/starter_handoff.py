@@ -42,7 +42,7 @@ async def main(project_id: str | None) -> None:
                 sys.exit(1)
         else:
             # Pick the first project
-            projects = await db_module.get_projects(db)
+            projects = await db_module.list_projects(db)
             if not projects:
                 print("ERROR: no projects found", file=sys.stderr)
                 sys.exit(1)
