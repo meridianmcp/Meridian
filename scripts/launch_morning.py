@@ -2,10 +2,10 @@
 """Launch morning script -- e38a3888.
 
 Run this the morning of HN launch. Unsets SITE_PASSWORD, waits for
-the machine to restart, then verifies all key endpoints are healthy.
+the machine to restart, then runs the full 12-check playtester flow.
 
 Usage:
-    pixi run python scripts/launch_morning.py [--app meridian-hosted] [--dry-run]
+    pixi run launch [--app meridian-hosted] [--url https://usemeridian.us] [--dry-run]
 """
 from __future__ import annotations
 
@@ -13,110 +13,91 @@ import argparse
 import subprocess
 import sys
 import time
-import urllib.error
-import urllib.request
+from pathlib import Path
 
-PASS = "\033[32mOK\033[0m"
-FAIL = "\033[31mX\033[0m"
+GREEN = "\033[32m"
+RED = "\033[31m"
+BOLD = "\033[1m"
+RESET = "\033[0m"
 
 BASE_URL = "https://usemeridian.us"
+SCRIPTS_DIR = Path(__file__).parent
 
 
-def check_url(url: str, expected_text: str | None = None, timeout: int = 20) -> tuple[bool, str]:
-    try:
-        with urllib.request.urlopen(url, timeout=timeout) as r:
-            body = r.read().decode()
-            if expected_text and expected_text not in body:
-                return False, f"missing '{expected_text}' in response"
-            return True, f"HTTP {r.status}"
-    except urllib.error.HTTPError as e:
-        return False, f"HTTP {e.code}"
-    except Exception as exc:
-        return False, str(exc)
+def step(n: int, total: int, msg: str) -> None:
+    print(f"\n[{n}/{total}] {msg}")
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Meridian HN launch morning checklist")
     parser.add_argument("--app", default="meridian-hosted", help="Fly app name")
     parser.add_argument("--url", default=BASE_URL, help="Base URL to check")
-    parser.add_argument("--dry-run", action="store_true", help="Skip flyctl commands")
+    parser.add_argument("--dry-run", action="store_true", help="Skip flyctl + wait")
     args = parser.parse_args()
 
     base = args.url.rstrip("/")
-    failures = 0
 
-    print("\n" + "=" * 55)
-    print("  Meridian HN Launch Morning Checklist")
-    print("=" * 55 + "\n")
+    print("\n" + "=" * 60)
+    print(f"  {BOLD}Meridian HN Launch Morning Checklist{RESET}")
+    print("=" * 60)
 
-    # Step 1: Unset SITE_PASSWORD
+    # ── Step 1: Unset SITE_PASSWORD ──────────────────────────────────────────
+    step(1, 3, f"Unsetting SITE_PASSWORD on {args.app}...")
     if args.dry_run:
-        print(f"[DRY-RUN] Would run: flyctl secrets unset SITE_PASSWORD --app {args.app}")
+        print(f"  [DRY-RUN] flyctl secrets unset SITE_PASSWORD --app {args.app}")
     else:
-        print(f"[1/6] Unsetting SITE_PASSWORD on {args.app}...")
         result = subprocess.run(
             ["flyctl", "secrets", "unset", "SITE_PASSWORD", "--app", args.app],
-            capture_output=True, text=True, timeout=60,
+            capture_output=True,
+            text=True,
+            timeout=60,
         )
         if result.returncode == 0:
-            print(f"  [{PASS}] SITE_PASSWORD unset")
+            print(f"  [{GREEN}OK{RESET}] SITE_PASSWORD unset")
         else:
-            print(f"  [{FAIL}] flyctl failed: {result.stderr.strip()[:200]}")
-            print("  Continuing with checks anyway...")
+            stderr = result.stderr.strip()[:200]
+            print(f"  [{RED}WARN{RESET}] flyctl returned non-zero: {stderr}")
+            print("  Continuing with smoke tests regardless...")
 
-    # Step 2: Wait for restart
-    if not args.dry_run:
-        print("\n[2/6] Waiting 30s for machine to restart...")
-        for i in range(30, 0, -5):
-            print(f"  {i}s remaining...", end="\r")
-            time.sleep(5)
-        print("  Done waiting.          ")
+    # ── Step 2: Wait for restart ──────────────────────────────────────────────
+    step(2, 3, "Waiting 10s for machine to restart...")
+    if args.dry_run:
+        print("  [DRY-RUN] Skipping wait")
     else:
-        print("[DRY-RUN] Skipping 30s wait")
+        for remaining in range(10, 0, -1):
+            print(f"  {remaining}s...", end="\r", flush=True)
+            time.sleep(1)
+        print("  Done.      ")
 
-    # Step 3: Health check
-    print(f"\n[3/6] Checking {base}/health...")
-    ok, detail = check_url(f"{base}/health")
-    status = PASS if ok else FAIL
-    print(f"  [{status}] /health -- {detail}")
-    if not ok:
-        failures += 1
+    # ── Step 3: 12-check playtester smoke test ────────────────────────────────
+    step(3, 3, f"Running 12-check smoke test against {base}...")
+    print()
 
-    # Step 4: Demo check
-    print(f"\n[4/6] Checking {base}/demo...")
-    ok, detail = check_url(f"{base}/demo", expected_text="backend-api-v2")
-    status = PASS if ok else FAIL
-    print(f"  [{status}] /demo -- {detail}")
-    if not ok:
-        failures += 1
+    playtester = SCRIPTS_DIR / "test_playtester_flow.py"
+    result = subprocess.run(
+        [sys.executable, str(playtester), "--url", base],
+        text=True,
+        timeout=120,
+    )
+    passed = result.returncode == 0
 
-    # Step 5: Pricing check
-    print(f"\n[5/6] Checking {base}/pricing...")
-    ok, detail = check_url(f"{base}/pricing", expected_text="Free")
-    status = PASS if ok else FAIL
-    print(f"  [{status}] /pricing -- {detail}")
-    if not ok:
-        failures += 1
-
-    # Step 6: Auth login check
-    print(f"\n[6/6] Checking {base}/auth/login...")
-    ok, detail = check_url(f"{base}/auth/login")
-    status = PASS if ok else FAIL
-    print(f"  [{status}] /auth/login -- {detail}")
-    if not ok:
-        failures += 1
-
-    print("\n" + "=" * 55)
-    if failures == 0:
-        print(f"  [{PASS}] Site is live and healthy -- ready to post.")
-        print("\n  HN post template: SHOW_HN.md")
+    # ── Result banner ─────────────────────────────────────────────────────────
+    print("\n" + "=" * 60)
+    if passed:
+        print(f"\n  {BOLD}{GREEN}██████████████████████████████████{RESET}")
+        print(f"  {BOLD}{GREEN}   GO — SITE IS LIVE AND HEALTHY   {RESET}")
+        print(f"  {BOLD}{GREEN}██████████████████████████████████{RESET}\n")
+        print(f"  Post Show HN now → {BOLD}news.ycombinator.com/submit{RESET}")
         print("  Post time: 9-10am ET from home IP")
         print("  Upvote once immediately after posting")
     else:
-        print(f"  [{FAIL}] {failures} check(s) FAILED -- do NOT post until fixed.")
-    print("=" * 55 + "\n")
+        print(f"\n  {BOLD}{RED}████████████████████████████████████{RESET}")
+        print(f"  {BOLD}{RED}  NO-GO — CHECKS FAILED, DO NOT POST  {RESET}")
+        print(f"  {BOLD}{RED}████████████████████████████████████{RESET}\n")
+        print("  Fix the failing checks above before posting.")
+    print("=" * 60 + "\n")
 
-    return 0 if failures == 0 else 1
+    return 0 if passed else 1
 
 
 if __name__ == "__main__":
