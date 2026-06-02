@@ -855,7 +855,7 @@ except ImportError:
 # v2.0-fixes — Demo read-only middleware (MERIDIAN_DEMO=true)
 # ---------------------------------------------------------------------------
 
-_DEMO_WRITE_ALLOWLIST = {"/demo-auth", "/waitlist", "/auth/magic", "/auth/login", "/auth/logout", "/__gate__", "/sessions/worker", "/mcp"}
+_DEMO_WRITE_ALLOWLIST = {"/demo-auth", "/waitlist", "/auth/magic", "/auth/login", "/auth/logout", "/__gate__"}
 _DEMO_CONTEXT_COOKIE = "meridian_demo"
 
 
@@ -3612,8 +3612,12 @@ a:hover{text-decoration:underline}
   <div class="badge">✓ You're on the list</div>
   <h1>Thanks for signing up!</h1>
   <p>Meridian is in early access. We'll email you when your account is ready.</p>
-  <p>In the meantime, you can <a href="https://github.com/meridianmcp/Meridian" target="_blank">star the repo</a>
-     or <a href="https://docs.usemeridian.us" target="_blank">read the docs</a>.</p>
+  <p>In the meantime, explore the live demo or read the docs.</p>
+  <div style="display:flex;gap:10px;justify-content:center;margin-top:20px;flex-wrap:wrap">
+    <a href="/" style="display:inline-block;background:#1a1c23;border:1px solid #2a2d35;border-radius:8px;padding:9px 18px;color:#e8eaf0;font-size:.85rem;text-decoration:none">← Back to home</a>
+    <a href="/demo" style="display:inline-block;background:#7c3aed;border:none;border-radius:8px;padding:9px 18px;color:#fff;font-size:.85rem;text-decoration:none">→ Try the live demo</a>
+    <a href="https://docs.usemeridian.us" target="_blank" style="display:inline-block;background:#1a1c23;border:1px solid #2a2d35;border-radius:8px;padding:9px 18px;color:#e8eaf0;font-size:.85rem;text-decoration:none">Read the docs</a>
+  </div>
   <p style="margin-top:24px;font-size:.78rem"><a href="/auth/logout">sign out</a></p>
 </div>
 </body>
