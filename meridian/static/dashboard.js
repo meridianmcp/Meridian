@@ -4373,8 +4373,9 @@ async function refreshSessions(projectId) {
 
 async function refreshTasks(projectId) {
   try {
-    const tasks = await api(`/projects/${projectId}/tasks?limit=50`);
+    const tasks = await api(`/projects/${projectId}/tasks?limit=100`);
     state.panels[projectId].taskCache = tasks;
+    state.panels[projectId].taskOffset = tasks.length;
     renderTasks(projectId);
   } catch(e) {}
 }
@@ -4390,6 +4391,41 @@ function renderTasks(projectId) {
   hitlRoot.innerHTML = hitl.map(t => renderHitlRow(projectId, t)).join('');
   hitl.forEach(t => wireHitlRow(projectId, t));
   root.innerHTML = tasks.map(t => renderTaskRow(t)).join('');
+  // Pagination: show "Load more" button if we got a full page
+  const existingBtn = document.getElementById(`devlog-load-more-${projectId}`);
+  if (existingBtn) existingBtn.remove();
+  if (tasks.length === 100) {
+    const btn = document.createElement('button');
+    btn.id = `devlog-load-more-${projectId}`;
+    btn.className = 'secondary';
+    btn.style = 'width:100%;margin-top:8px;padding:5px;font-size:11px;font-family:var(--font-mono)';
+    btn.textContent = 'Load 100 more ↓';
+    btn.onclick = () => _loadMoreTasks(projectId, btn);
+    root.parentElement.appendChild(btn);
+  }
+}
+
+async function _loadMoreTasks(projectId, btn) {
+  const p = state.panels[projectId];
+  const offset = p.taskOffset || 0;
+  btn.disabled = true;
+  btn.textContent = 'loading…';
+  try {
+    const more = await api(`/projects/${projectId}/tasks?limit=100&offset=${offset}`);
+    p.taskCache = [...(p.taskCache || []), ...more];
+    p.taskOffset = offset + more.length;
+    const root = document.getElementById(`tasks-${projectId}`);
+    if (root) root.innerHTML += more.map(t => renderTaskRow(t)).join('');
+    if (more.length < 100) {
+      btn.remove();
+    } else {
+      btn.disabled = false;
+      btn.textContent = 'Load 100 more ↓';
+    }
+  } catch(e) {
+    btn.disabled = false;
+    btn.textContent = 'Load 100 more ↓ (retry)';
+  }
 }
 
 function renderTaskRow(t) {
