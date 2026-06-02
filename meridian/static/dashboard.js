@@ -85,9 +85,17 @@ function toast(msg, isError=false) {
   toast._t = setTimeout(() => el.classList.remove('show'), 2600);
 }
 
+function showDemoReadonlyToast() {
+  toast('Read-only demo — sign in for full access', true);
+}
+
 async function api(path, opts={}) {
   const r = await fetch(path, { headers: {'Content-Type': 'application/json'}, ...opts });
   if (!r.ok) {
+    if (r.status === 403 && isDemoMode()) {
+      showDemoReadonlyToast();
+      throw new Error('demo_readonly');
+    }
     const text = await r.text();
     throw new Error(`${r.status}: ${text}`);
   }
@@ -107,9 +115,21 @@ async function loadServerConfig() {
       const b = document.createElement('div');
       b.id = 'demo-mode-banner';
       b.style = 'position:fixed;top:0;left:0;right:0;z-index:9999;background:#7c3aed;color:#fff;text-align:center;padding:5px 12px;font-size:12px;font-family:inherit;letter-spacing:0.02em';
-      b.textContent = 'Preview mode — read only';
+      b.innerHTML = 'Preview mode — read only · <a href="/auth/login" style="color:#fff;text-decoration:underline;font-weight:600">Sign in for full access →</a>';
       document.body.prepend(b);
       document.body.style.paddingTop = ((parseInt(document.body.style.paddingTop || '0', 10)) + 28) + 'px';
+      // First-load hint: bottom-right callout, shown once
+      if (!localStorage.getItem('meridian_demo_hint')) {
+        localStorage.setItem('meridian_demo_hint', '1');
+        setTimeout(() => {
+          const tip = document.createElement('div');
+          tip.id = 'demo-first-hint';
+          tip.style = 'position:fixed;bottom:24px;right:24px;z-index:10000;background:#1e2029;border:1px solid #7c3aed55;border-radius:10px;color:#e8eaf0;padding:14px 16px;font-size:12px;font-family:inherit;max-width:280px;box-shadow:0 8px 32px rgba(0,0,0,0.5);line-height:1.6';
+          tip.innerHTML = '<strong>👆 Click a session on the left to explore.</strong><br>This is read-only — <a href="/auth/login" style="color:#6c8fff;text-decoration:underline">sign in</a> to create your own.<br><button onclick="document.getElementById(\'demo-first-hint\').remove()" style="margin-top:10px;background:#7c3aed;border:none;color:#fff;padding:4px 12px;border-radius:4px;cursor:pointer;font-size:11px;font-family:inherit">Got it</button>';
+          document.body.appendChild(tip);
+          setTimeout(() => { if (tip.parentElement) tip.remove(); }, 12000);
+        }, 1500);
+      }
     }
     // Task 16 — hide destructive admin controls in demo mode
     if (cfg?.demo_mode) hideDemoAdminControls();
@@ -1874,6 +1894,22 @@ function wireClaudeLaunchPanel(projectId) {
       `Project ID: ${projectId}`;
     showCopyPreview('⚡ Setup Hooks', instructions);
   };
+
+  // Demo mode: replace write-action buttons with sign-in prompt, then stop wiring
+  if (isDemoMode()) {
+    [
+      copyStartChatBtn,
+      document.getElementById(`copy-resume-${projectId}`),
+      document.getElementById(`start-worker-${projectId}`),
+      document.getElementById(`copy-handoff-${projectId}`),
+      document.getElementById(`regen-handoff-${projectId}`),
+    ].forEach(btn => {
+      if (!btn) return;
+      btn.title = 'Sign in to use';
+      btn.onclick = showDemoReadonlyToast;
+    });
+    return;
+  }
 
   // Section 1 — Copy resume command
   const copyResumeBtn = document.getElementById(`copy-resume-${projectId}`);
