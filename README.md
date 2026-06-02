@@ -1,56 +1,63 @@
-<!-- mcp-name: io.github.meridianmcp/meridian -->
+<!-- mcp-name: io.github.ajc3xc/meridian -->
 <p align="center">
-  <img src="meridian/static/logo.svg" width="64" height="64" alt="Meridian">
+  <img src="meridian/static/logo.svg" width="72" height="72" alt="Meridian">
 </p>
 
-# Meridian
+<h1 align="center">Meridian</h1>
 
-**Claude Code has no memory between sessions. Meridian fixes that.**
+<p align="center"><strong>Claude Code has no memory between sessions. Meridian fixes that.</strong></p>
 
-Open-source MCP server for persistent AI session memory — shared task log,
-pinned decisions, human-in-the-loop queue, and tiered handoffs. Works with
-Claude Code, Cursor, Cline, Claude Desktop, or any MCP client.
+<p align="center">
+  Open-source MCP server for persistent AI session memory — shared task log,<br>
+  pinned decisions, human-in-the-loop queue, and tiered handoffs.<br>
+  Works with Claude Code, Cursor, Cline, Claude Desktop, or any MCP client.
+</p>
 
-[![License: MSL-1.0](https://img.shields.io/badge/license-MSL--1.0-blue)](LICENSE)
-[![Tests](https://github.com/meridianmcp/Meridian/actions/workflows/test.yml/badge.svg)](https://github.com/meridianmcp/Meridian/actions/workflows/test.yml)
-[![Docs](https://img.shields.io/badge/docs-docs.usemeridian.us-6c8fff)](https://docs.usemeridian.us)
-[![Hosted](https://img.shields.io/badge/hosted-usemeridian.us-a78bfa)](https://usemeridian.us)
-[![Neon](https://img.shields.io/badge/db-neon%20postgres-00e599)](https://neon.tech)
+<p align="center">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MSL--1.0-blue" alt="License: MSL-1.0"></a>
+  <a href="https://github.com/meridianmcp/Meridian/actions/workflows/test.yml"><img src="https://github.com/meridianmcp/Meridian/actions/workflows/test.yml/badge.svg" alt="Tests"></a>
+  <a href="https://docs.usemeridian.us"><img src="https://img.shields.io/badge/docs-docs.usemeridian.us-6c8fff" alt="Docs"></a>
+  <a href="https://usemeridian.us"><img src="https://img.shields.io/badge/hosted-usemeridian.us-a78bfa" alt="Hosted"></a>
+  <a href="https://github.com/meridianmcp/Meridian/releases/latest"><img src="https://img.shields.io/github/v/release/meridianmcp/Meridian?color=00d4aa&label=latest" alt="Latest release"></a>
+  <a href="https://github.com/meridianmcp/Meridian/stargazers"><img src="https://img.shields.io/github/stars/meridianmcp/Meridian?style=social" alt="GitHub Stars"></a>
+</p>
+
+---
 
 ## Why Meridian
 
 Every AI coding session boots blind. You re-explain the architecture, re-describe
 the constraints, re-list what's been tried. When context fills up mid-task,
-everything is lost. This is context debt — and it compounds.
+everything is lost. This is **context debt** — and it compounds.
 
 Meridian gives your sessions shared memory. They see the same task log, the same
 pinned decisions, the same goal state. When context fills up, a new session resumes
 from a compressed handoff in seconds. No copy-paste, no re-explaining from scratch.
 
----
+### Meridian vs. the alternatives
+
+|  | Meridian | CLAUDE.md | Mem0 / Zep | Anthropic Managed Agents |
+|---|---|---|---|---|
+| Persistent task log | ✓ | ✗ | ✗ | partial |
+| Pinned decisions (editable) | ✓ | manual | ✗ | ✗ |
+| Human-in-the-loop queue | ✓ | ✗ | ✗ | raw hook only |
+| Atomic task claiming (parallel agents) | ✓ | ✗ | ✗ | ✗ |
+| Self-hosted, data you own | ✓ | ✓ | ✗ | ✗ |
+| Model-agnostic | ✓ | ✓ | ✓ | Claude only |
+| Sprint board + swimlane timeline | ✓ | ✗ | ✗ | ✗ |
+| Free forever | ✓ | ✓ | freemium | pay-per-session |
 
 ---
-
-## What it is, in 30 seconds
-
-A local MCP server every AI session connects to. They share goal state, see each
-other's task log, and resume from a compressed handoff when context fills up.
-
-**Two ways to run Meridian:**
-- **Self-host** — free forever, any team size. Clone and run in 2 commands.
-- **Hosted** at [usemeridian.us](https://usemeridian.us) — 30 days free (no card), then $20/mo Solo.
 
 ## Quickstart — binary (no Python required)
 
-Download the single-file binary for your platform, double-click (or run from terminal), and the dashboard opens automatically.
+Download, double-click, done. Dashboard opens automatically at `http://localhost:7700`.
 
-> **Binary users skip `install.sh` entirely.** Just download, run, and wire hooks once with `hooks.sh` / `hooks.ps1`. No Python, no pixi, no git clone.
-
-| Platform | Download | Default port |
-|---|---|---|
-| Windows | [meridian.exe](https://github.com/meridianmcp/Meridian/releases/latest/download/meridian.exe) | 7700 |
-| macOS (Apple Silicon) | [meridian-mac-arm64](https://github.com/meridianmcp/Meridian/releases/latest/download/meridian-mac-arm64) | 7700 |
-| macOS (Intel) | [meridian-mac-x86](https://github.com/meridianmcp/Meridian/releases/latest/download/meridian-mac-x86) | 7700 |
+| Platform | Download |
+|---|---|
+| Windows | [meridian.exe](https://github.com/meridianmcp/Meridian/releases/latest/download/meridian.exe) |
+| macOS (Apple Silicon) | [meridian-mac-arm64](https://github.com/meridianmcp/Meridian/releases/latest/download/meridian-mac-arm64) |
+| Linux | [meridian-linux](https://github.com/meridianmcp/Meridian/releases/latest/download/meridian-linux) |
 
 Data is stored in `~/.meridian/meridian.db`. Set `MERIDIAN_PORT` to change the port.
 
@@ -72,7 +79,9 @@ cd Meridian
 pixi run start
 ```
 
-Dashboard opens at **http://localhost:7878**. Data persists in `./data/meridian.db`.
+Dashboard opens at **http://localhost:7878**.
+
+---
 
 ## Wire it into your AI client
 
@@ -101,27 +110,24 @@ Add the same `mcpServers` block to:
 - Windows: `%APPDATA%\Claude\claude_desktop_config.json`
 - macOS: `~/Library/Application Support/Claude/claude_desktop_config.json`
 
-Restart Claude Desktop. New chats have Meridian tools.
+### claude.ai web (planning chat)
 
-### claude.ai web (recommended for planning chat)
-
-Use [dnakov/claude-mcp](https://github.com/dnakov/claude-mcp) — included as a submodule — to bridge claude.ai to your local Meridian server:
+Use [dnakov/claude-mcp](https://github.com/dnakov/claude-mcp) — included as a submodule:
 
 ```bash
 git clone --recurse-submodules https://github.com/meridianmcp/Meridian
 ```
 
-1. Open `chrome://extensions` and enable **Developer mode**
-2. Click **Load unpacked** and select `extensions/claude-mcp`
-3. Click the extension icon and set the URL to `http://localhost:7878/mcp`
+1. Open `chrome://extensions` → enable **Developer mode**
+2. **Load unpacked** → select `extensions/claude-mcp`
+3. Set the URL to `http://localhost:7878/mcp`
 
-All 27 Meridian tools (`checkpoint`, `log_task`, `pin_decision`, etc.) are now available directly in claude.ai planning chat. No copy-pasting session output.
+All Meridian tools are now available directly in claude.ai planning chat.
 
 ### Hosted tier (no install)
 
-Sign in at [usemeridian.us](https://usemeridian.us) → Settings → MCP client setup → Generate API key → Copy config.
+Sign in at [usemeridian.us](https://usemeridian.us) → Settings → Copy MCP config.
 
-Or manually:
 ```json
 {
   "mcpServers": {
@@ -134,94 +140,83 @@ Or manually:
 }
 ```
 
-**Claude Desktop** users can install [meridian-hosted.dxt](https://github.com/meridianmcp/Meridian/releases/latest/download/meridian-hosted.dxt) directly (one-click, no config needed).
+**Claude Desktop** users: install [meridian-hosted.dxt](https://github.com/meridianmcp/Meridian/releases/latest/download/meridian-hosted.dxt) — one click, no config.
 
-**claude.ai (browser)** users: install the [dnakov/claude-mcp](https://github.com/dnakov/claude-mcp) Chrome extension, then visit [usemeridian.us/install-mcp](https://usemeridian.us/install-mcp) for a step-by-step setup guide with one-click copy buttons.
-
-Get your API key at [usemeridian.us/settings](https://usemeridian.us/settings) after sign-in. Free tier: 30 days, no card, full features.
+---
 
 ## What you get
 
-- **Dashboard** at `http://localhost:7878` — sessions, tasks, sprint board,
-  swimlane timeline, HITL queue, pinned decisions.
-- **MCP tools** — `start_session`, `log_task`, `claim_task`, `set_decision`,
-  `pin_decision`, `request_hitl`, `generate_handoff`, plus 10 more.
-- **Tiered handoffs** — L0/L1/L2 compression so a fresh session can resume in seconds.
-- **Webhook intake** — push events from LangGraph / Autogen / custom agents into the same dashboard.
-- **Works everywhere** — Claude Code, Claude Desktop, Cursor, Windsurf, LangGraph, custom.
+- **Dashboard** — sessions, tasks, sprint board, swimlane timeline, HITL queue, decisions
+- **MCP tools** — `start_session`, `log_task`, `claim_task`, `pin_decision`, `request_hitl`, `generate_handoff`, and more
+- **Tiered handoffs** — L0/L1/L2 compression so a fresh session resumes in seconds
+- **Webhook intake** — push events from LangGraph / AutoGen / custom agents
+- **Auto-checkpoint hooks** — every session start injects context; every end snapshots work
 
 ## How it works
 
 ```
-> start_session(project_id="meridian", session_name="feature-x")
-  ✓ session registered · sprint loaded · 12 active tasks
-
-> get_tasks(project_id="meridian", limit=5)
-  [DONE]    backend / wire decisions_pinned table
-  [PENDING] frontend / add notes vtab (claimed by session-2)
+> start_session(project_id="my-app", session_name="auth-refactor")
+  ✓ session registered · sprint loaded · 8 pending tasks
 
 > claim_task(task_id="a1f3...")
-  ✓ claimed — other sessions skip this one
+  ✓ claimed — parallel sessions skip this one automatically
+
+> request_hitl(project_id="my-app", question="Redis or Postgres for session tokens?")
+  ✓ queued — you get pinged, answer in dashboard, session resumes
 ```
-
-State lives in `data/meridian.db` (SQLite) or a Postgres URL via `MERIDIAN_DB_URL`.
-No cloud required for local use.
-
-## Team coordination
-
-Point `MERIDIAN_DB_URL` at a shared Postgres (Neon free tier works great). Every
-teammate runs their own local Meridian against the same DB — instant shared
-sessions, no Meridian server in the cloud.
 
 ## Auto-checkpoint with hooks
 
-One command wires Claude Code and Codex to Meridian. Every session start injects
-your project context automatically. Every session end snapshots completed work and
-writes a delta handoff.
+One command wires Claude Code and Codex to Meridian permanently.
 
 **Mac/Linux:**
 ```bash
 curl -fsSL https://usemeridian.us/hooks.sh | bash
 ```
-
 **Windows:**
 ```powershell
 irm https://usemeridian.us/hooks.ps1 | iex
 ```
 
-Prompts for your Meridian server URL (default `http://localhost:7878`) and your
-project ID. Writes to `~/.claude/settings.json` (Claude Code) or
-`~/.codex/config.toml` (Codex). After setup, every session automatically:
+After setup, every session automatically injects your project context on start and checkpoints on end.
 
-1. **On start** — calls `POST /hooks/session-start` → injects goal, sprint items,
-   recent tasks, and pinned decisions into the session context via `additionalContext`.
-2. **On stop** — calls `POST /hooks/stop` → runs `auto_capture` and writes a delta
-   handoff so the next session resumes from where this one ended.
-
-No more manual `start_session()` calls. No lost work when context fills.
+---
 
 ## Hosted tier
 
-| | Standard | Pro |
-|---|---|---|
-| **Price** | $20/mo | $49/mo (waitlist) |
-| **Storage** | 1 GB included | 10 GB included |
-| **Compute** | 2 CU · 100 hrs/mo | 4 CU · 300 hrs/mo |
-| **Environments** | 1 | prod / staging / dev |
-| **Bring your own Postgres** | ✓ | ✓ |
-| **OAuth + email magic link** | ✓ | ✓ |
-| **Extra storage** | $0.50 / GB-month | $0.50 / GB-month |
-| **Support** | Email | Priority |
+Try free for 30 days — no card required, full features.
 
-7-day free trial on Standard. Card required, no charge until day 8.
+|  | **Free** | **Standard** | **Pro** |
+|---|---|---|---|
+| **Price** | Free · 30 days | $20 / mo | $49 / mo |
+| **Card required** | No | Yes | Yes |
+| **Storage** | Shared pool | 1 GB | 10 GB |
+| **Compute** | 0.5 CU shared | 50 CU-hrs / mo | 200 CU-hrs / mo |
+| **Projects** | 1 | Unlimited | Unlimited |
+| **Concurrent sessions** | 1 | Unlimited | Unlimited |
+| **Team members** | — | 25 | 50 |
+| **Bring your own Postgres** | ✓ | ✓ | ✓ |
+| **OAuth + magic link** | ✓ | ✓ | ✓ |
+| **Support** | — | Email | Priority |
+
+Overage: $0.16 / CU-hr · $0.50 / GB-month · billed via Stripe.
+Self-hosted is always free — no limits, no expiry.
+
+---
+
+## Star History
+
+[![Star History Chart](https://api.star-history.com/svg?repos=meridianmcp/Meridian&type=Date)](https://star-history.com/#meridianmcp/Meridian&Date)
+
+---
 
 ## License
 
 [MSL-1.0](LICENSE) — free for local and internal use at any team size. Paid
-license required if you host Meridian as a service for others. Converts to
+license required only if you host Meridian as a service for others. Converts to
 MIT after 6 years.
 
-For licensing questions: [hello@usemeridian.us](mailto:hello@usemeridian.us)
+Questions: [hello@usemeridian.us](mailto:hello@usemeridian.us)
 
 ## Contributors
 
