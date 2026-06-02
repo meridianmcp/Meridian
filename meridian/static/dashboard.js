@@ -238,7 +238,10 @@ function _updateConnectionIndicator(cfg) {
   }
   const name = cfg.connection_name || (cfg.db === 'postgres' ? 'postgres' : 'local');
   const dbType = cfg.db || 'sqlite';
-  label.textContent = name + ' (' + dbType + ')';
+  // 1f92d344: show hostname for env postgres connections
+  let connLabelText = name + ' (' + dbType + ')';
+  if (cfg.db_host) connLabelText += ': ' + cfg.db_host;
+  label.textContent = connLabelText;
   dot.style.background = dbType === 'postgres' ? 'var(--accent)' : 'var(--accent-green)';
   // Make indicator clickable to show connection popup
   const conns = cfg.connections || [];

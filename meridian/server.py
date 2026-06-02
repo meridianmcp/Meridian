@@ -1144,6 +1144,16 @@ async def server_config() -> dict[str, Any]:
     default_url = f"http://{host}:{port}"
     server_url = os.environ.get("MERIDIAN_SERVER_URL", default_url)
     _, conn_name = toml_config_module.get_active_db_url()
+    # Parse hostname from MERIDIAN_DB_URL for the connection label (1f92d344)
+    import re as _re_cfg
+    _raw_db_url = os.environ.get("MERIDIAN_DB_URL", "")
+    _db_host = ""
+    if _raw_db_url:
+        _m = _re_cfg.search(r"@([^/:?]+)", _raw_db_url)
+        if _m:
+            _db_host = _m.group(1)
+            if len(_db_host) > 22:
+                _db_host = _db_host[:20] + "…"
     return {
         "server_url": server_url,
         "host": host,
@@ -1154,6 +1164,7 @@ async def server_config() -> dict[str, Any]:
             else "memory" if os.environ.get("MERIDIAN_DB") == ":memory:"
             else "sqlite"
         ),
+        "db_host": _db_host,
         "toml_exists": toml_config_module.toml_exists(),
         "toml_path": str(toml_config_module._toml_path() or (Path.cwd() / "meridian.toml")),
         "connection_name": conn_name,
