@@ -4664,6 +4664,76 @@ _MCP_RATE_LIMIT = "100/minute"
 
 _SSE_SESSIONS: dict[str, dict[str, Any]] = {}  # session_id → {db, queue}
 
+
+# ── Minimal OAuth 2.0 for claude.ai custom connector ──────────────────────────
+import secrets as _sec, hashlib as _hs, base64 as _b64, time as _tm
+from urllib.parse import urlencode as _ue
+from fastapi.responses import RedirectResponse as _RR
+
+_oa_clients: dict = {}   # client_id -> {secret, redirect_uris}
+_oa_codes: dict = {}     # code -> {client_id, redirect_uri, challenge, exp}
+_oa_tokens: dict = {}    # token -> {client_id, exp}
+
+
+@app.get("/.well-known/oauth-authorization-server")
+async def _oauth_meta(request: Request):
+    b = str(request.base_url).rstrip("/")
+    return _JSONResp({"issuer": b, "authorization_endpoint": f"{b}/oauth/authorize",
+        "token_endpoint": f"{b}/oauth/token", "registration_endpoint": f"{b}/oauth/register",
+        "scopes_supported": ["mcp"], "response_types_supported": ["code"],
+        "grant_types_supported": ["authorization_code"],
+        "code_challenge_methods_supported": ["S256"],
+        "token_endpoint_auth_methods_supported": ["client_secret_post", "none"]})
+
+
+@app.post("/oauth/register")
+async def _oauth_reg(request: Request):
+    d = await request.json()
+    cid, cs = _sec.token_urlsafe(16), _sec.token_urlsafe(32)
+    _oa_clients[cid] = {"secret": cs, "redirect_uris": d.get("redirect_uris", [])}
+    return _JSONResp({"client_id": cid, "client_secret": cs,
+        "redirect_uris": d.get("redirect_uris", []),
+        "grant_types": ["authorization_code"],
+        "token_endpoint_auth_method": "client_secret_post"}, status_code=201)
+
+
+@app.get("/oauth/authorize")
+async def _oauth_auth(request: Request):
+    """Auto-approve — personal/local server, no consent page needed."""
+    p = dict(request.query_params)
+    code = _sec.token_urlsafe(32)
+    _oa_codes[code] = {"client_id": p.get("client_id", ""),
+        "redirect_uri": p.get("redirect_uri", ""),
+        "challenge": p.get("code_challenge"),
+        "method": p.get("code_challenge_method", "S256"),
+        "exp": _tm.time() + 600}
+    qs = _ue({"code": code, "state": p.get("state", "")})
+    return _RR(f"{p.get('redirect_uri', '')}?{qs}")
+
+
+@app.post("/oauth/token")
+async def _oauth_token(request: Request):
+    ct = request.headers.get("content-type", "")
+    d = dict(await request.json() if "json" in ct else await request.form())
+    if d.get("grant_type") != "authorization_code":
+        return _JSONResp({"error": "unsupported_grant_type"}, status_code=400)
+    code = d.get("code", "")
+    if code not in _oa_codes:
+        return _JSONResp({"error": "invalid_grant"}, status_code=400)
+    cd = _oa_codes.pop(code)
+    if _tm.time() > cd["exp"]:
+        return _JSONResp({"error": "invalid_grant"}, status_code=400)
+    v = d.get("code_verifier")
+    if cd.get("challenge") and v:
+        ch = _b64.urlsafe_b64encode(_hs.sha256(v.encode()).digest()).decode().rstrip("=")
+        if ch != cd["challenge"]:
+            return _JSONResp({"error": "invalid_grant"}, status_code=400)
+    tok = _sec.token_urlsafe(32)
+    _oa_tokens[tok] = {"client_id": cd["client_id"], "exp": _tm.time() + 86400 * 90}
+    return _JSONResp({"access_token": tok, "token_type": "bearer", "expires_in": 86400 * 90})
+
+# ── End OAuth ──────────────────────────────────────────────────────────────────
+
 _SSE_CORS_HEADERS = {
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Headers": "Content-Type, Authorization",
