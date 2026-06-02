@@ -26,6 +26,19 @@ Every session that connects to Meridian can:
 
 When the context window fills up, you can generate a handoff and start fresh. The new session will then read the file and pick up exactly where you left off -- no re-explaining required.
 
+## Key Features
+
+| Feature | What it does |
+|---------|-------------|
+| `start_session` | Register this session, load full context in one call |
+| `get_goal` | Read the shared north star, sprint, and version goal |
+| `log_task` | Log progress — all sessions see it instantly |
+| `claim_task` | Lock a task so two sessions can't double-work it |
+| `generate_handoff` | Compress full context into a resumable file |
+| `get_sprint_items` | See the sprint board — what's todo, in progress, done |
+| `set_goal` | Update the shared goal — all sessions align instantly |
+| `get_sessions` | See all active sessions and their last activity |
+
 ## Architecture
 
 ```
@@ -53,19 +66,6 @@ When the context window fills up, you can generate a handoff and start fresh. Th
 ```
 
 For **hosted tier** (usemeridian.us), Meridian runs in the cloud and each workspace gets an isolated Neon Postgres database. Your Claude sessions connect over HTTPS with a bearer token — zero local install required.
-
-## Key Features
-
-| Feature | What it does |
-|---------|-------------|
-| `start_session` | Register this session, load full context in one call |
-| `get_goal` | Read the shared north star, sprint, and version goal |
-| `log_task` | Log progress — all sessions see it instantly |
-| `claim_task` | Lock a task so two sessions can't double-work it |
-| `generate_handoff` | Compress full context into a resumable file |
-| `get_sprint_items` | See the sprint board — what's todo, in progress, done |
-| `set_goal` | Update the shared goal — all sessions align instantly |
-| `get_sessions` | See all active sessions and their last activity |
 
 ## Quick Install
 
