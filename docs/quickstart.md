@@ -6,37 +6,70 @@ Get Meridian running and connected to Claude Code in under 10 minutes.
 
 ## Prerequisites
 
-- **Python 3.11+** (check: `python --version`)
-- One of: pixi, pip, or Docker
 - A Claude Code, Claude Desktop, Cursor, or Windsurf installation
+- No Python required for binary installs (Windows/Linux/macOS tabs below)
 
 ---
 
 ## Step 1 — Install Meridian
 
-=== "pixi (recommended)"
+=== "Windows .exe"
 
-    [pixi](https://pixi.sh) is the fastest way to install Meridian with all dependencies locked.
+    Download the latest binary from the [Releases page](https://github.com/meridianmcp/Meridian/releases/latest).
+
+    Look for `meridian.exe` under **Assets**.
+
+    1. Download `meridian.exe`
+    2. Double-click to run — Windows Firewall may prompt, click **Allow**
+    3. Your browser opens automatically at **http://localhost:7878**
+
+    !!! tip
+        To run from a specific folder (for data persistence), open a terminal and run:
+        ```
+        meridian.exe
+        ```
+
+=== "Linux binary"
+
+    Download the latest binary from the [Releases page](https://github.com/meridianmcp/Meridian/releases/latest).
+
+    Look for `meridian-linux-amd64` under **Assets**.
+
+    ```bash
+    # Download (replace X.Y.Z with the latest version)
+    curl -Lo meridian https://github.com/meridianmcp/Meridian/releases/latest/download/meridian-linux-amd64
+    chmod +x meridian
+    ./meridian
+    # → Meridian running on http://127.0.0.1:7878
+    ```
+
+=== "macOS arm64"
+
+    Download the latest binary from the [Releases page](https://github.com/meridianmcp/Meridian/releases/latest).
+
+    Look for `meridian-macos-arm64` under **Assets**.
+
+    ```bash
+    # Download (replace X.Y.Z with the latest version)
+    curl -Lo meridian https://github.com/meridianmcp/Meridian/releases/latest/download/meridian-macos-arm64
+    chmod +x meridian
+    # macOS may quarantine the binary — remove the quarantine flag:
+    xattr -d com.apple.quarantine meridian 2>/dev/null || true
+    ./meridian
+    # → Meridian running on http://127.0.0.1:7878
+    ```
+
+=== "pixi (from source)"
+
+    [pixi](https://pixi.sh) installs all dependencies in a locked environment. Best for contributors or power users.
+
+    **Requires Python 3.11+**
 
     ```bash
     git clone https://github.com/meridianmcp/Meridian
     cd Meridian
     pixi install
-    ```
-
-    Start the server:
-    ```bash
     pixi run start
-    # → Meridian running on http://127.0.0.1:7878
-    ```
-
-=== "pip"
-
-    ```bash
-    git clone https://github.com/meridianmcp/Meridian
-    cd Meridian
-    pip install -e ".[full]"
-    python -m meridian
     # → Meridian running on http://127.0.0.1:7878
     ```
 
@@ -54,7 +87,7 @@ Get Meridian running and connected to Claude Code in under 10 minutes.
 Confirm it's running:
 ```bash
 curl http://localhost:7878/health
-# → {"status": "ok", "version": "1.9.0", "db": "sqlite"}
+# → {"status": "ok", "version": "...", "db": "sqlite"}
 ```
 
 Open the dashboard: **http://localhost:7878**
@@ -214,7 +247,7 @@ get_tasks(project_id="...", limit=20)
 
 ### MCP tools not showing up in Claude Code
 
-1. Make sure the Meridian server is running (`pixi run start`)
+1. Make sure the Meridian server is running (`./meridian` or `pixi run start`)
 2. Verify the `cwd` path in your `.mcp.json` is correct and uses absolute path
 3. Restart Claude Code after editing `.mcp.json`
 4. Check Claude Code's MCP panel (⚙️ → MCP) for error messages
@@ -222,7 +255,10 @@ get_tasks(project_id="...", limit=20)
 ### Server won't start — port already in use
 
 ```bash
-# Change the port
+# Change the port (binary)
+MERIDIAN_PORT=7879 ./meridian
+
+# Change the port (pixi)
 MERIDIAN_PORT=7879 pixi run start
 ```
 

@@ -13,7 +13,7 @@ your AI clients over HTTPS in minutes.
 | | Standard | Pro |
 |--|--|--|
 | **Price** | $20/mo | $49/mo (waitlist) |
-| **Trial** | 7-day free, card required | — |
+| **Free tier** | 30 days, no card required | — |
 | **Neon project** | 1 per workspace | 1 per workspace |
 | **Max databases** | 10 | 50 |
 | **Max compute** | 2 CU | 4 CU |
@@ -34,8 +34,8 @@ and skip the managed DB — same price, full control of your data.
 ## Sign Up Flow
 
 1. **Visit [usemeridian.us](https://usemeridian.us)** and click "Get Started"
-2. **Enter payment** — Stripe handles billing, 7-day trial starts immediately
-3. **Sign in** — click the link in your welcome email, or go to `/auth/login`
+2. **Sign in** — Google or GitHub OAuth, no password required
+3. **Check your welcome email** — contains your bearer token and MCP config snippet
 4. **Choose Google or GitHub** — sign in with either, no passwords
 5. **Check your email** — welcome email contains your bearer token and MCP config snippet
 

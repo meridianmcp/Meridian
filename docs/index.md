@@ -51,57 +51,38 @@ Two deployment modes — pick the one that fits you.
 
 ### Self-hosted (free)
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│                        Your machine                         │
-│                                                             │
-│  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────┐ │
-│  │ Claude Code │  │   Cursor /  │  │  Claude Desktop     │ │
-│  │  (any term) │  │  Windsurf   │  │  (via .dxt install) │ │
-│  └──────┬──────┘  └──────┬──────┘  └──────────┬──────────┘ │
-│         │                │                    │            │
-│         └────────────────┴────────────────────┘            │
-│                          │ MCP stdio (local)               │
-│                   ┌──────▼──────┐                          │
-│                   │  Meridian   │  ← pixi run start        │
-│                   │ MCP Server  │    or binary .exe / mac  │
-│                   │   :7878     │                          │
-│                   └──────┬──────┘                          │
-│                          │                                 │
-│            ┌─────────────┴──────────────┐                  │
-│            ▼                            ▼                  │
-│   ┌────────────────┐        ┌─────────────────────┐        │
-│   │   SQLite DB    │   or   │  Postgres (Neon /   │        │
-│   │  meridian.db   │        │  any compatible DB) │        │
-│   └────────────────┘        └─────────────────────┘        │
-│                                                             │
-│  Features: persistent memory · task log · sprint board     │
-│            HITL queue · handoff · hooks auto-checkpoint     │
-└─────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TD
+    CC["Claude Code<br/>(any terminal)"]
+    CU["Cursor /<br/>Windsurf"]
+    CD["Claude Desktop"]
+
+    CC & CU & CD -->|"MCP stdio (local)"| MS
+
+    subgraph YM["Your machine"]
+        MS["Meridian Server :7878<br/>(binary or pixi run start)"]
+        MS --> SQ["SQLite<br/>meridian.db"]
+        MS --> PG["Postgres<br/>(Neon or self-hosted)"]
+    end
 ```
 
 ### Hosted tier (usemeridian.us)
 
-```
-┌──────────────────────┐         ┌───────────────────────────┐
-│     Your machine     │         │    usemeridian.us cloud   │
-│                      │         │                           │
-│  ┌────────────────┐  │  HTTPS  │  ┌─────────────────────┐  │
-│  │  Claude Code   │  │ Bearer  │  │  Meridian Cloud     │  │
-│  │  Cursor        ├──┼────────►│  │  MCP Server         │  │
-│  │  Claude.ai     │  │  token  │  └──────────┬──────────┘  │
-│  └────────────────┘  │         │             │             │
-│                      │         │  ┌──────────▼──────────┐  │
-│  ┌────────────────┐  │         │  │ Isolated Neon       │  │
-│  │  Dashboard     │◄─┼────────►│  │ Postgres DB         │  │
-│  │  (browser)     │  │         │  │ (per workspace)     │  │
-│  └────────────────┘  │         │  └─────────────────────┘  │
-└──────────────────────┘         │                           │
-                                 │  Features: same as self-  │
-                                 │  hosted + zero install,   │
-                                 │  managed DB, team URLs,   │
-                                 │  SLA, SSO (enterprise)    │
-                                 └───────────────────────────┘
+```mermaid
+flowchart LR
+    subgraph YM["Your machine"]
+        CC["Claude Code / Cursor<br/>Claude.ai"]
+        DB["Dashboard<br/>(browser)"]
+    end
+
+    subgraph Cloud["usemeridian.us"]
+        MS["Meridian Cloud<br/>MCP Server"]
+        ND["Isolated Neon<br/>Postgres DB<br/>(per workspace)"]
+        MS --> ND
+    end
+
+    CC -->|"HTTPS / Bearer token"| MS
+    DB <-->|"HTTPS"| MS
 ```
 
 Zero local install — sign in at [usemeridian.us](https://usemeridian.us), copy your API token, add to MCP config.
@@ -281,6 +262,6 @@ Try the live demo at [usemeridian.us/demo](https://usemeridian.us/demo) — no s
 
 Don't want to run your own server? [usemeridian.us](https://usemeridian.us) is a hosted version — sign in with Google or GitHub, get a managed Neon Postgres database, and connect over HTTPS.
 
-**$20/month** — 7-day free trial, no commitment.
+**Standard $20/month · Pro $49/month** — 30-day free tier, no card required.
 
 → [Hosted tier guide](hosted.md)
