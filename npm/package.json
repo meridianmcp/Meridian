@@ -1,6 +1,7 @@
 {
-  "name": "meridian-mcp",
-  "version": "1.0.0",
+  "name": "@meridianmcp/mcp",
+  "mcpName": "io.github.ajc3xc/meridian",
+  "version": "1.0.1",
   "description": "Persistent memory, task coordination, and HITL queue for AI coding sessions. MCP server for Claude Code, Cursor, Windsurf, Codex CLI.",
   "keywords": ["mcp", "claude", "cursor", "windsurf", "ai", "session", "coordination", "hitl"],
   "homepage": "https://usemeridian.us",
