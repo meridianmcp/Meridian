@@ -46,5 +46,18 @@ pixi run launch             # launch morning: unset SITE_PASSWORD + health check
 
 Run `pixi install` once. Run `pixi run install-companions` once for repomix.
 
+## Using claude.ai (browser) via dnakov/claude-mcp extension
+
+The extension uses SSE transport (not stdio). Point it at the SSE endpoint:
+
+```
+URL: http://localhost:7878/mcp/sse
+```
+
+In the extension popup: add server, set URL to `http://localhost:7878/mcp/sse`, leave command/args empty.
+The extension auto-discovers all Meridian MCP tools via the SSE handshake.
+
+For hosted tier (usemeridian.us), use: `https://usemeridian.us/mcp/sse` with your API token.
+
 ---
 *Meridian · meridian-build · 5787cc92 · START_HERE.md is the wedge; data/meridian-build_handoff.md is the full context.*
