@@ -10,34 +10,32 @@ your AI clients over HTTPS in minutes.
 
 ## Pricing
 
-| | Standard | Pro |
-|--|--|--|
-| **Price** | $20/mo | $49/mo (waitlist) |
-| **Trial** | 7-day free, card required | — |
-| **Neon project** | 1 per workspace | 1 per workspace |
-| **Max databases** | 10 | 50 |
-| **Max compute** | 2 CU | 4 CU |
-| **Storage** | 0.5 GB | 5 GB |
-| **Compute hours/mo** | 100 CU-hrs | 300 CU-hrs |
-| **Meridian projects** | Unlimited | Unlimited |
-| **Team members** | Unlimited | Unlimited |
-| **Environments** | 1 (production) | Multiple (prod/staging/dev) |
-| **Support** | Email | Priority email |
-| **BYODB** | ✓ | ✓ |
-| **Custom subdomain** | — | ✓ |
+**Try free for 30 days — no card required.**
 
-**BYODB** (Bring Your Own Database): paste your own Neon connection string at signup
-and skip the managed DB — same price, full control of your data.
+| | **Free** | **Standard** | **Pro** |
+|--|--|--|--|
+| **Price** | Free · 30 days | $20 / mo | $49 / mo |
+| **Card required** | No | Yes | Yes |
+| **Storage** | Shared pool | 1 GB | 10 GB |
+| **Compute** | 0.5 CU shared | 50 CU-hrs / mo | 200 CU-hrs / mo |
+| **Projects** | 1 | Unlimited | Unlimited |
+| **Concurrent sessions** | 1 | Unlimited | Unlimited |
+| **Team members** | — | 25 | 50 |
+| **BYODB** | ✓ | ✓ | ✓ |
+| **OAuth + magic link** | ✓ | ✓ | ✓ |
+| **Support** | — | Email | Priority |
+
+Overage: $0.16 / CU-hr · $0.50 / GB-month · billed via Stripe.
+Self-hosted is always free — no limits, no expiry, [see self-hosting guide](self-hosting.md).
 
 ---
 
 ## Sign Up Flow
 
 1. **Visit [usemeridian.us](https://usemeridian.us)** and click "Get Started"
-2. **Enter payment** — Stripe handles billing, 7-day trial starts immediately
-3. **Sign in** — click the link in your welcome email, or go to `/auth/login`
-4. **Choose Google or GitHub** — sign in with either, no passwords
-5. **Check your email** — welcome email contains your bearer token and MCP config snippet
+2. **Sign in** with Google or GitHub — no passwords, no card for free tier
+3. **Check your email** — welcome email contains your bearer token and MCP config snippet
+4. **Upgrade anytime** via Settings → Billing when you're ready for dedicated compute
 
 ---
 
