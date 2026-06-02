@@ -792,6 +792,21 @@ function buildTabBody(project) {
               <input type="text" class="live-add-input" id="live-add-input-${project.id}" placeholder="+ Add task… (Enter to submit)">
             </div>
           </div>
+          <hr class="live-divider">
+          <div class="live-section">
+            <div class="live-section-label" style="display:flex;justify-content:space-between;align-items:center">
+              <span>Add to run</span>
+              <button class="secondary" id="add-to-run-toggle-${project.id}" style="padding:1px 8px;font-size:9px">+ Expand</button>
+            </div>
+            <div id="add-to-run-area-${project.id}" style="display:none;margin-top:6px">
+              <textarea id="add-to-run-text-${project.id}" rows="3" placeholder="Describe what to add to the active session's goal…"
+                style="width:100%;background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:11px;font-family:var(--font-mono);padding:5px 8px;resize:vertical;outline:none"></textarea>
+              <div style="display:flex;justify-content:flex-end;gap:6px;margin-top:4px">
+                <button class="secondary" id="add-to-run-cancel-${project.id}" style="padding:2px 8px;font-size:10px">Cancel</button>
+                <button class="primary" id="add-to-run-submit-${project.id}" data-project="${escapeHtml(project.id)}" style="padding:2px 10px;font-size:10px">→ Send to run</button>
+              </div>
+            </div>
+          </div>
         </div>
       </div>
       <div class="drawer-panel" id="drawer-goal-${project.id}">
@@ -1420,6 +1435,52 @@ async function loadLiveTab(projectId) {
         if (ok) input.value = '';
       });
     });
+
+    // Wire "Add to run →" toggle
+    const addToggle = document.getElementById(`add-to-run-toggle-${projectId}`);
+    const addArea = document.getElementById(`add-to-run-area-${projectId}`);
+    const addCancel = document.getElementById(`add-to-run-cancel-${projectId}`);
+    const addSubmit = document.getElementById(`add-to-run-submit-${projectId}`);
+    const addText = document.getElementById(`add-to-run-text-${projectId}`);
+    if (addToggle && addArea) {
+      addToggle.onclick = () => {
+        const open = addArea.style.display !== 'none';
+        addArea.style.display = open ? 'none' : 'block';
+        addToggle.textContent = open ? '+ Expand' : '− Collapse';
+        if (!open && addText) addText.focus();
+      };
+    }
+    if (addCancel && addArea) {
+      addCancel.onclick = () => {
+        addArea.style.display = 'none';
+        addToggle.textContent = '+ Expand';
+        if (addText) addText.value = '';
+      };
+    }
+    if (addSubmit) {
+      addSubmit.onclick = async () => {
+        const text = (addText && addText.value || '').trim();
+        if (!text) { toast('Enter text first', true); return; }
+        const pid = addSubmit.dataset.project;
+        // Find the first active session to attach the HITL request to
+        try {
+          const sessions = await api(`/projects/${pid}/sessions?active_only=true`);
+          const activeSid = sessions && sessions[0] && sessions[0].id;
+          await api(`/projects/${pid}/hitl-requests`, {
+            method: 'POST',
+            body: JSON.stringify({
+              question: `Add to current goal: ${text}`,
+              urgency: 'high',
+              session_id: activeSid || undefined,
+            }),
+          });
+          toast('Sent to active session HITL queue');
+          if (addText) addText.value = '';
+          addArea.style.display = 'none';
+          addToggle.textContent = '+ Expand';
+        } catch (e) { toast('Failed: ' + e.message, true); }
+      };
+    }
     panel.liveWired = true;
   }
   await refreshLiveTab(projectId);
@@ -3341,32 +3402,69 @@ async function loadQueue(projectId) {
     body.innerHTML = renderQueue(tasks, activeSprintItems);
     const refreshBtn = document.getElementById(`queue-refresh-${projectId}`);
     if (refreshBtn) refreshBtn.onclick = () => loadQueue(projectId);
-    // Wire search input (debounced 300ms)
+    // Wire search input (debounced 300ms) — universal search across all tables
     const searchInput = document.getElementById(`task-search-${projectId}`);
-    if (searchInput && !searchInput._wired) {
-      searchInput._wired = true;
-      let _searchTimer = null;
-      searchInput.addEventListener('input', function() {
-        clearTimeout(_searchTimer);
-        const q = this.value.trim();
-        _searchTimer = setTimeout(async () => {
-          if (!q) { body.innerHTML = renderQueue(tasks, activeSprintItems); return; }
-          try {
-            const filteredSprintItems = activeSprintItems.filter(it => {
-              const haystack = `${it.id} ${it.title} ${it.version || ''}`.toLowerCase();
-              return haystack.includes(q.toLowerCase());
-            });
-            const results = await api(`/projects/${projectId}/tasks/search?q=${encodeURIComponent(q)}&limit=50`);
-            body.innerHTML = (results.length || filteredSprintItems.length)
-              ? renderQueue(results, filteredSprintItems)
-              : `<div class="empty" style="color:var(--muted)">no tasks matching "${escapeHtml(q)}"</div>`;
-          } catch (e) { body.innerHTML = `<div class="empty">search failed: ${escapeHtml(e.message)}</div>`; }
-        }, 300);
-      });
+    if (searchInput) {
+      searchInput.placeholder = 'Search tasks, notes, decisions…';
+      if (!searchInput._wired) {
+        searchInput._wired = true;
+        let _searchTimer = null;
+        searchInput.addEventListener('input', function() {
+          clearTimeout(_searchTimer);
+          const q = this.value.trim();
+          _searchTimer = setTimeout(async () => {
+            if (!q) { body.innerHTML = renderQueue(tasks, activeSprintItems); return; }
+            try {
+              const results = await api(`/projects/${projectId}/search?q=${encodeURIComponent(q)}&limit=10`);
+              body.innerHTML = renderSearchResults(q, results);
+            } catch (e) { body.innerHTML = `<div class="empty">search failed: ${escapeHtml(e.message)}</div>`; }
+          }, 300);
+        });
+      }
     }
   } catch (e) {
     body.innerHTML = `<div class="empty">queue failed: ${escapeHtml(e.message)}</div>`;
   }
+}
+
+function renderSearchResults(query, results) {
+  /** Render universal search results grouped by type. */
+  if (!results || results.total === 0) {
+    return `<div class="empty" style="color:var(--muted);padding:12px 14px">No results for "${escapeHtml(query)}"</div>`;
+  }
+  const section = (label, items, renderFn) => {
+    if (!items || !items.length) return '';
+    return `<div style="padding:10px 14px 0">
+      <div style="font-size:9px;font-weight:700;color:var(--muted);letter-spacing:.07em;text-transform:uppercase;margin-bottom:6px">${label}</div>
+      ${items.map(renderFn).join('')}
+    </div>`;
+  };
+  const taskRow = t => `<div style="border:1px solid var(--border);border-radius:3px;padding:5px 8px;margin-bottom:4px;background:var(--surface-2)">
+    <div style="display:flex;justify-content:space-between;gap:6px">
+      <span style="font-size:11px;color:var(--text);font-family:var(--font-mono);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escapeHtml((t.description || '').slice(0, 100))}</span>
+      <span style="font-size:9px;color:var(--muted);flex-shrink:0">${escapeHtml(t.status || '')}</span>
+    </div>
+  </div>`;
+  const noteRow = n => `<div style="border:1px solid var(--border);border-left:3px solid var(--accent);border-radius:0 3px 3px 0;padding:5px 8px;margin-bottom:4px;background:var(--surface-2)">
+    <div style="font-size:11px;font-weight:600;color:var(--accent)">${escapeHtml((n.title || '').slice(0, 80))}</div>
+    <div style="font-size:10px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${escapeHtml((n.body || '').slice(0, 80))}</div>
+  </div>`;
+  const decisionRow = d => `<div style="border:1px solid var(--border);border-left:3px solid var(--warning,#fa0);border-radius:0 3px 3px 0;padding:5px 8px;margin-bottom:4px;background:var(--surface-2)">
+    <div style="font-size:11px;font-weight:600;color:var(--text)">${escapeHtml((d.title || '').slice(0, 80))}</div>
+    <div style="font-size:10px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${escapeHtml((d.body || '').slice(0, 80))}</div>
+  </div>`;
+  const sprintRow = s => `<div style="border:1px solid var(--border);border-radius:3px;padding:5px 8px;margin-bottom:4px;background:var(--surface-2)">
+    <div style="display:flex;justify-content:space-between;gap:6px">
+      <span style="font-size:11px;color:var(--text);font-family:var(--font-mono);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escapeHtml((s.title || '').slice(0, 100))}</span>
+      <span style="font-size:9px;color:var(--muted);flex-shrink:0">${escapeHtml(s.version || '')} · ${escapeHtml(s.status || '')}</span>
+    </div>
+  </div>`;
+  return `<div style="padding-bottom:10px">
+    ${section('Tasks', results.tasks, taskRow)}
+    ${section('Notes', results.notes, noteRow)}
+    ${section('Decisions', results.decisions, decisionRow)}
+    ${section('Sprint Items', results.sprint_items, sprintRow)}
+  </div>`;
 }
 
 function renderQueue(tasks, sprintItems = []) {

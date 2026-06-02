@@ -2326,6 +2326,23 @@ async def get_project_webhook_token(
 # ---------------------------------------------------------------------------
 
 
+@app.get("/projects/{project_id}/search")
+async def search_project_all(
+    project_id: str,
+    request: Request,
+    q: str = "",
+    limit: int = 10,
+) -> dict[str, Any]:
+    """Universal search across tasks, notes, decisions, and sprint items."""
+    db = await _db(request)
+    project = await db_module.get_project(db, project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="project not found")
+    if not q.strip():
+        return {"query": q, "tasks": [], "notes": [], "decisions": [], "sprint_items": [], "total": 0}
+    return await db_module.search_all(db, project_id, q.strip(), limit=limit)
+
+
 @app.get("/projects/{project_id}/runs")
 async def get_project_runs(
     project_id: str,
@@ -4207,6 +4224,15 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
      "inputSchema": {"type": "object", "properties": {
          "session_id": {"type": "string"}},
          "required": ["session_id"]}},
+    {"name": "search_all", "description":
+        "Universal search across all project content: tasks, notes, pinned decisions, "
+        "and sprint items. Uses LIKE matching (SQLite) or ILIKE (Postgres). "
+        "Returns grouped results: {tasks, notes, decisions, sprint_items, total}.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"},
+         "query": {"type": "string"},
+         "limit": {"type": "integer", "description": "Max results per type (default 10)."}},
+         "required": ["project_id", "query"]}},
 ]
 
 
@@ -4520,6 +4546,11 @@ async def _dispatch_mcp_tool(name: str, args: dict[str, Any], db: Any, data_dir:
             "task_count": run["task_count"],
             "transcript": run["transcript"],
         }
+    if name == "search_all":
+        return await db_module.search_all(
+            db, args["project_id"], args["query"],
+            limit=args.get("limit", 10),
+        )
     if name == "get_session_brief":
         # v2.5 — single-call orientation, <500 tokens, XML output.
         project_id = args["project_id"]

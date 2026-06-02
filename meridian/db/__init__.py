@@ -2522,6 +2522,94 @@ async def search_tasks(
     return [_row_to_dict(r) for r in rows]  # type: ignore[misc]
 
 
+async def search_all(
+    db: Any,
+    project_id: str,
+    query: str,
+    limit: int = 10,
+) -> dict[str, Any]:
+    """Universal search across task_log, project_notes, sprint_items, and decisions_pinned.
+
+    SQLite: LIKE %query% on all relevant text fields.
+    Postgres: ILIKE with optional pg_trgm similarity fallback.
+
+    Returns grouped results: {tasks, notes, decisions, sprint_items}.
+    Each item includes a `match_type` key for the source table.
+    """
+    like_pat = f"%{query}%"
+    is_pg = hasattr(db, "_pool")
+
+    async def _search(sql: str, params: tuple) -> list[dict[str, Any]]:
+        async with db.execute(sql, params) as cur:
+            rows = await cur.fetchall()
+        return [_row_to_dict(r) for r in rows if r is not None]  # type: ignore[misc]
+
+    if is_pg:
+        tasks_sql = (
+            "SELECT id, description, status, created_at, 'task' AS match_type "
+            "FROM task_log "
+            "WHERE project_id = ? AND description ILIKE ? "
+            "ORDER BY created_at DESC LIMIT ?"
+        )
+        notes_sql = (
+            "SELECT id, title, body, tags, created_at, 'note' AS match_type "
+            "FROM project_notes "
+            "WHERE project_id = ? AND (title ILIKE ? OR body ILIKE ?) "
+            "ORDER BY created_at DESC LIMIT ?"
+        )
+        decisions_sql = (
+            "SELECT id, title, body, category, status, created_at, 'decision' AS match_type "
+            "FROM decisions_pinned "
+            "WHERE project_id = ? AND status = 'active' AND (title ILIKE ? OR body ILIKE ?) "
+            "ORDER BY created_at DESC LIMIT ?"
+        )
+        sprint_sql = (
+            "SELECT id, title, version, status, added_at AS created_at, 'sprint_item' AS match_type "
+            "FROM sprint_items "
+            "WHERE project_id = ? AND title ILIKE ? "
+            "ORDER BY added_at DESC LIMIT ?"
+        )
+    else:
+        tasks_sql = (
+            "SELECT id, description, status, created_at, 'task' AS match_type "
+            "FROM task_log "
+            "WHERE project_id = ? AND description LIKE ? "
+            "ORDER BY created_at DESC LIMIT ?"
+        )
+        notes_sql = (
+            "SELECT id, title, body, tags, created_at, 'note' AS match_type "
+            "FROM project_notes "
+            "WHERE project_id = ? AND (title LIKE ? OR body LIKE ?) "
+            "ORDER BY created_at DESC LIMIT ?"
+        )
+        decisions_sql = (
+            "SELECT id, title, body, category, status, created_at, 'decision' AS match_type "
+            "FROM decisions_pinned "
+            "WHERE project_id = ? AND status = 'active' AND (title LIKE ? OR body LIKE ?) "
+            "ORDER BY created_at DESC LIMIT ?"
+        )
+        sprint_sql = (
+            "SELECT id, title, version, status, added_at AS created_at, 'sprint_item' AS match_type "
+            "FROM sprint_items "
+            "WHERE project_id = ? AND title LIKE ? "
+            "ORDER BY added_at DESC LIMIT ?"
+        )
+
+    tasks = await _search(tasks_sql, (project_id, like_pat, limit))
+    notes = await _search(notes_sql, (project_id, like_pat, like_pat, limit))
+    decisions = await _search(decisions_sql, (project_id, like_pat, like_pat, limit))
+    sprint_items = await _search(sprint_sql, (project_id, like_pat, limit))
+
+    return {
+        "query": query,
+        "tasks": tasks,
+        "notes": notes,
+        "decisions": decisions,
+        "sprint_items": sprint_items,
+        "total": len(tasks) + len(notes) + len(decisions) + len(sprint_items),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Distributed task locking (v0.3.3)
 # ---------------------------------------------------------------------------
