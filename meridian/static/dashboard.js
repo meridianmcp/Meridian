@@ -834,7 +834,7 @@ function buildTabBody(project) {
           </div>
           <div class="goal-subtab-panel" id="gtab-version-goal-${project.id}">
             <div style="color:var(--muted);font-size:10px;margin-bottom:6px">Current milestone — what ships this cycle (v1.2, v2.0, etc).</div>
-            <div id="goal-title-${project.id}" style="font-family:var(--font-mono);font-size:11px;font-weight:600;color:var(--accent);padding:5px 8px;background:var(--surface-2);border:1px solid var(--border);border-radius:4px 4px 0 0;border-bottom:none;user-select:none;flex-shrink:0" title="Version title (read-only)"></div>
+            <div id="goal-title-${project.id}" style="font-family:var(--font-mono);font-size:11px;font-weight:600;color:var(--accent);padding:5px 8px;background:var(--surface-2);border:1px solid var(--border);border-radius:4px 4px 0 0;border-bottom:none;user-select:none;flex-shrink:0;white-space:pre-wrap;overflow:visible" title="Version title (read-only)"></div>
             <div id="goal-shipped-${project.id}" style="display:none;font-family:var(--font-mono);font-size:10px;color:var(--muted);padding:6px 8px;background:var(--surface-2);border:1px solid var(--border);border-top:none;border-bottom:none;white-space:pre-wrap;user-select:none;flex-shrink:0" title="SHIPPED section (read-only — updated by Claude Code)"></div>
             <textarea class="goal-area goal-full mono" id="goal-${project.id}" placeholder="CURRENT FOCUS:" style="border-radius:0 0 4px 4px;font-size:13px"></textarea>
             <div class="goal-actions" style="flex-shrink:0">
@@ -850,8 +850,8 @@ function buildTabBody(project) {
           <div class="goal-subtab-panel" id="gtab-sprint-${project.id}">
             <div style="color:var(--muted);font-size:10px;margin-bottom:4px">What this session is doing right now. Updated frequently — not a multi-week scrum sprint.</div>
             <div style="display:flex;gap:6px;margin-bottom:10px;align-items:center">
-              <select id="goal-sprint-select-${project.id}" style="flex:1;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;padding:6px 8px;color:var(--text);font-family:var(--font-mono);font-size:11px;outline:none"><option value="" disabled selected>loading sessions…</option></select>
-              <input type="text" id="goal-sprint-${project.id}" placeholder="v1.9.x — description" style="flex:1;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;padding:6px 8px;color:var(--text);font-family:var(--font-mono);font-size:11px;outline:none;display:none">
+              <select id="goal-sprint-select-${project.id}" style="flex:1;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;padding:6px 8px;color:var(--muted);font-family:var(--font-mono);font-size:11px;outline:none"><option value="" disabled selected>loading sessions…</option></select>
+              <input type="text" id="goal-sprint-${project.id}" placeholder="v1.0.x — description" style="flex:1;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;padding:6px 8px;color:var(--muted);font-family:var(--font-mono);font-size:11px;outline:none;display:none">
               <button class="secondary" id="save-sprint-${project.id}" style="white-space:nowrap">save</button>
               <span class="goal-ts" id="goal-sp-ts-${project.id}" style="font-size:10px;color:var(--muted)"></span>
             </div>
@@ -1526,7 +1526,7 @@ function renderSprintProgress(projectId, items) {
       <div class="live-empty">No sprint items. Add one below.</div>
       <div class="sprint-add-row" style="margin-top:6px">
         <input class="live-add-input" id="sprint-add-input-${projectId}"
-               placeholder="version:title (e.g. v1.9:My item)">
+               placeholder="version:title (e.g. v1.0:My item)">
         <button class="secondary sprint-add-btn" data-pid="${escapeHtml(projectId)}"
                 style="margin-left:4px">+ Add</button>
       </div>`;
@@ -3693,6 +3693,7 @@ async function refreshGoal(projectId) {
       if (shippedEl) shippedEl.style.display = 'none';
       ta.value = body;
     }
+    autosizeGoalField(ta);
 
     const autoBlocksEl = document.getElementById(`goal-autoblocks-${projectId}`);
     if (autoBlocksEl) {
