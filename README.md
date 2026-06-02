@@ -1,3 +1,4 @@
+<!-- mcp-name: io.github.meridianmcp/meridian -->
 <p align="center">
   <img src="meridian/static/logo.svg" width="64" height="64" alt="Meridian">
 </p>

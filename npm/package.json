@@ -1,0 +1,17 @@
+{
+  "name": "meridian-mcp",
+  "version": "1.0.0",
+  "description": "Persistent memory, task coordination, and HITL queue for AI coding sessions. MCP server for Claude Code, Cursor, Windsurf, Codex CLI.",
+  "keywords": ["mcp", "claude", "cursor", "windsurf", "ai", "session", "coordination", "hitl"],
+  "homepage": "https://usemeridian.us",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/meridianmcp/Meridian.git"
+  },
+  "license": "FSL-1.1-MIT",
+  "bin": {
+    "meridian-mcp": "./bin/meridian-mcp.js"
+  },
+  "engines": { "node": ">=18" },
+  "files": ["bin/", "README.md"]
+}
