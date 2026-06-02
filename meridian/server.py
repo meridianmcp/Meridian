@@ -1321,6 +1321,48 @@ async def patch_project_settings(
     return settings
 
 
+@app.get("/projects/{project_id}/ntfy")
+async def get_project_ntfy(project_id: str, request: Request) -> dict[str, Any]:
+    """Return the ntfy push URL configured for this project."""
+    project = await db_module.get_project(await _db(request), project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="project not found")
+    url = await db_module.get_project_ntfy_url(await _db(request), project_id)
+    return {"ntfy_url": url or ""}
+
+
+@app.patch("/projects/{project_id}/ntfy")
+async def set_project_ntfy(
+    project_id: str, body: dict[str, Any], request: Request
+) -> dict[str, Any]:
+    """Save (or clear) the ntfy push URL for this project."""
+    project = await db_module.get_project(await _db(request), project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="project not found")
+    ntfy_url = str(body.get("ntfy_url") or "").strip() or None
+    await db_module.set_project_ntfy_url(await _db(request), project_id, ntfy_url)
+    return {"ntfy_url": ntfy_url or ""}
+
+
+async def _notify_project(
+    db: Any, project_id: str, title: str, body_text: str
+) -> None:
+    """Best-effort ntfy push for a project. Silently ignores errors."""
+    try:
+        ntfy_url = await db_module.get_project_ntfy_url(db, project_id)
+        if not ntfy_url:
+            return
+        import httpx as _httpx
+        async with _httpx.AsyncClient(timeout=5.0) as client:
+            await client.post(
+                ntfy_url,
+                content=body_text.encode(),
+                headers={"Title": title, "Priority": "high"},
+            )
+    except Exception:  # noqa: BLE001
+        pass  # never let notifications crash the main flow
+
+
 @app.post("/projects/{project_id}/rename")
 async def rename_project(
     project_id: str, body: dict[str, Any], request: Request
@@ -4427,13 +4469,20 @@ async def _dispatch_mcp_tool(name: str, args: dict[str, Any], db: Any, data_dir:
             "start_fresh": start_fresh,
         }
     if name == "request_hitl":
-        return await db_module.request_hitl(
+        result = await db_module.request_hitl(
             db, args["project_id"], args["question"],
             session_id=args.get("session_id"),
             context=args.get("context"),
             urgency=args.get("urgency", "normal"),
             assigned_to=args.get("assigned_to"),
         )
+        # Notify via ntfy if configured — best-effort, non-blocking
+        await _notify_project(
+            db, args["project_id"],
+            f"HITL [{args.get('urgency','normal').upper()}]",
+            f"{args['question'][:200]}",
+        )
+        return result
     if name == "get_hitl_request":
         result = await db_module.get_hitl_request(db, args["request_id"])
         if result is None:
@@ -4532,6 +4581,12 @@ async def _dispatch_mcp_tool(name: str, args: dict[str, Any], db: Any, data_dir:
         )
         if item is None:
             raise ValueError("sprint item not found")
+        # Notify via ntfy if configured — best-effort
+        await _notify_project(
+            db, args["project_id"],
+            "Sprint item done ✓",
+            f"{(item.get('title') or '')[:200]}",
+        )
         return item
     if name == "get_run_transcript":
         run = await db_module.get_executor_run_by_session(db, args.get("session_id", ""))

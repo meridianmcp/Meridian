@@ -692,6 +692,16 @@ async def _migrate_v26_client_type(db: aiosqlite.Connection) -> None:
     await _migrate_add_column_if_missing(db, "sessions", "client_type", "TEXT")
 
 
+async def _migrate_ntfy_notifications(db: aiosqlite.Connection) -> None:
+    """v1.0.1 — projects.ntfy_url: optional ntfy push notification endpoint.
+
+    Stores the ntfy server URL + topic (e.g. https://ntfy.sh/my-topic) so
+    the server can push HITL and sprint-complete notifications without email.
+    Works for self-hosted (SQLite) and hosted (Postgres via the pg_adapter).
+    """
+    await _migrate_add_column_if_missing(db, "projects", "ntfy_url", "TEXT")
+
+
 async def _migrate_sprint_item_dependencies(db: aiosqlite.Connection) -> None:
     """v2.6 — sprint_items dependency tracking.
 
@@ -1322,6 +1332,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_session_notes(db)
     await _migrate_executor_runs(db)
     await _migrate_milestone_type(db)
+    await _migrate_ntfy_notifications(db)
     return db
 
 
@@ -1425,6 +1436,30 @@ async def update_project_settings(
         )
         await db.commit()
     return await get_project_settings(db, project_id)
+
+
+async def get_project_ntfy_url(
+    db: aiosqlite.Connection, project_id: str
+) -> str | None:
+    """Return the ntfy URL for a project, or None if not set."""
+    async with db.execute(
+        "SELECT ntfy_url FROM projects WHERE id = ?", (project_id,)
+    ) as cur:
+        row = await cur.fetchone()
+    if row is None:
+        return None
+    return row["ntfy_url"] or None
+
+
+async def set_project_ntfy_url(
+    db: aiosqlite.Connection, project_id: str, ntfy_url: str | None
+) -> None:
+    """Save (or clear) the ntfy URL for a project."""
+    await db.execute(
+        "UPDATE projects SET ntfy_url = ? WHERE id = ?",
+        (ntfy_url or None, project_id),
+    )
+    await db.commit()
 
 
 async def delete_project(db: aiosqlite.Connection, project_id: str) -> None:

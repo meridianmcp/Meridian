@@ -2432,10 +2432,11 @@ async function loadSettingsTab(projectId) {
   ];
 
   // Fetch both in parallel; mcp-config 404 = self-hosted (skip section).
-  const [notifResult, mcpResult, settingsResult] = await Promise.allSettled([
+  const [notifResult, mcpResult, settingsResult, ntfyResult] = await Promise.allSettled([
     api('/settings/notifications'),
     api('/settings/mcp-config'),
     loadProjectSettings(projectId),
+    api(`/projects/${projectId}/ntfy`),
   ]);
 
   const prefs = (notifResult.status === 'fulfilled') ? (notifResult.value.prefs || {}) : null;
@@ -2885,6 +2886,23 @@ async function loadSettingsTab(projectId) {
     }, 0);
   }
 
+  // ntfy push notifications card — works for self-hosted + hosted
+  const ntfyData = (ntfyResult.status === 'fulfilled') ? ntfyResult.value : null;
+  const ntfyUrl = ntfyData ? (ntfyData.ntfy_url || '') : '';
+  html += `<div style="margin-bottom:14px;padding:10px 12px;border:1px solid var(--border);border-radius:6px;background:var(--surface-2)">
+    <div style="font-weight:600;font-size:11px;color:var(--text);margin-bottom:4px">Push notifications via ntfy</div>
+    <div style="font-size:10px;color:var(--muted);margin-bottom:8px">Paste an <a href="https://ntfy.sh" target="_blank" style="color:var(--accent)">ntfy.sh</a> topic URL (or self-hosted) to receive push alerts for HITL requests and sprint completions. No account required.</div>
+    <div style="display:flex;gap:6px;align-items:center">
+      <input type="text" id="ntfy-url-${projectId}"
+        value="${escapeHtml(ntfyUrl)}"
+        placeholder="https://ntfy.sh/my-topic"
+        style="flex:1;padding:5px 8px;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;color:var(--text);font-family:var(--font-mono);font-size:11px;outline:none">
+      <button class="secondary" id="ntfy-save-${projectId}" style="padding:4px 10px;font-size:10px">Save</button>
+      <span id="ntfy-status-${projectId}" style="font-size:10px;color:var(--muted);min-width:40px"></span>
+    </div>
+    <div style="font-size:9px;color:var(--muted);margin-top:4px">Install the <strong>ntfy</strong> app on iOS/Android/desktop. Create a topic, paste the URL above. Self-hosted ntfy = data stays on your infra.</div>
+  </div>`;
+
   // Notifications section
   if (prefs !== null) {
     html += `<div style="margin-bottom:12px">
@@ -2903,6 +2921,22 @@ async function loadSettingsTab(projectId) {
   }
 
   body.innerHTML = html;
+
+  // Wire ntfy save button
+  const ntfySaveBtn = document.getElementById(`ntfy-save-${projectId}`);
+  if (ntfySaveBtn) {
+    ntfySaveBtn.onclick = async () => {
+      const inp = document.getElementById(`ntfy-url-${projectId}`);
+      const statusEl = document.getElementById(`ntfy-status-${projectId}`);
+      const url = (inp ? inp.value.trim() : '') || null;
+      try {
+        await api(`/projects/${projectId}/ntfy`, { method: 'PATCH', body: JSON.stringify({ ntfy_url: url }) });
+        if (statusEl) { statusEl.textContent = 'saved'; setTimeout(() => { statusEl.textContent = ''; }, 2000); }
+      } catch (e) {
+        if (statusEl) statusEl.textContent = 'error';
+      }
+    };
+  }
 
   body.querySelectorAll('input[data-pref]').forEach(cb => {
     cb.onchange = async () => {
