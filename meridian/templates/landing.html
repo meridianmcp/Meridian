@@ -671,6 +671,73 @@ irm https://usemeridian.us/hooks.ps1 | iex</pre>
   </div>
 </section>
 
+<section id="faq">
+  <h2>FAQ</h2>
+  <div style="max-width:680px;margin:0 auto">
+
+    <details style="border:1px solid var(--border,#2d3f55);border-radius:6px;padding:0;margin-bottom:10px;background:var(--surface-1,#0d1829)">
+      <summary style="cursor:pointer;padding:14px 18px;font-weight:600;font-size:14px;list-style:none;display:flex;justify-content:space-between;align-items:center">
+        Does Meridian staff read my code or workflows?
+        <span style="font-size:18px;color:var(--muted,#8b9cba);flex-shrink:0;margin-left:12px">+</span>
+      </summary>
+      <div style="padding:0 18px 14px;color:var(--muted,#8b9cba);font-size:14px;line-height:1.7">
+        <strong>Self-hosted:</strong> your data never leaves your machine — we have zero access. <strong>Hosted tier:</strong> your project data lives in an isolated Neon database. Meridian staff cannot read it. The HITL queue means <em>you</em> are the human reviewer, not us.
+      </div>
+    </details>
+
+    <details style="border:1px solid var(--border,#2d3f55);border-radius:6px;padding:0;margin-bottom:10px;background:var(--surface-1,#0d1829)">
+      <summary style="cursor:pointer;padding:14px 18px;font-weight:600;font-size:14px;list-style:none;display:flex;justify-content:space-between;align-items:center">
+        How is this different from CLAUDE.md?
+        <span style="font-size:18px;color:var(--muted,#8b9cba);flex-shrink:0;margin-left:12px">+</span>
+      </summary>
+      <div style="padding:0 18px 14px;color:var(--muted,#8b9cba);font-size:14px;line-height:1.7">
+        <code>CLAUDE.md</code> is static context — good for standing instructions, bad for tracking state. Meridian is live: sessions read and write to a shared DB in real time, coordinate sprint items atomically, queue HITL requests, and generate handoffs across context resets.
+      </div>
+    </details>
+
+    <details style="border:1px solid var(--border,#2d3f55);border-radius:6px;padding:0;margin-bottom:10px;background:var(--surface-1,#0d1829)">
+      <summary style="cursor:pointer;padding:14px 18px;font-weight:600;font-size:14px;list-style:none;display:flex;justify-content:space-between;align-items:center">
+        Does it work with Cursor, Windsurf, or other clients?
+        <span style="font-size:18px;color:var(--muted,#8b9cba);flex-shrink:0;margin-left:12px">+</span>
+      </summary>
+      <div style="padding:0 18px 14px;color:var(--muted,#8b9cba);font-size:14px;line-height:1.7">
+        Yes. Meridian is a standard MCP server. Any MCP-compatible client works — Cursor, Windsurf, Claude Desktop, Claude Code, LangGraph agents. The coordination layer is model-agnostic.
+      </div>
+    </details>
+
+    <details style="border:1px solid var(--border,#2d3f55);border-radius:6px;padding:0;margin-bottom:10px;background:var(--surface-1,#0d1829)">
+      <summary style="cursor:pointer;padding:14px 18px;font-weight:600;font-size:14px;list-style:none;display:flex;justify-content:space-between;align-items:center">
+        Is there a free version?
+        <span style="font-size:18px;color:var(--muted,#8b9cba);flex-shrink:0;margin-left:12px">+</span>
+      </summary>
+      <div style="padding:0 18px 14px;color:var(--muted,#8b9cba);font-size:14px;line-height:1.7">
+        Self-hosted is free forever — no seat limits, no time limit, full features. The hosted tier (usemeridian.us) has a 30-day free period with no card required. After that: Standard $20/mo or Pro $49/mo.
+      </div>
+    </details>
+
+    <details style="border:1px solid var(--border,#2d3f55);border-radius:6px;padding:0;margin-bottom:10px;background:var(--surface-1,#0d1829)">
+      <summary style="cursor:pointer;padding:14px 18px;font-weight:600;font-size:14px;list-style:none;display:flex;justify-content:space-between;align-items:center">
+        What is MCP?
+        <span style="font-size:18px;color:var(--muted,#8b9cba);flex-shrink:0;margin-left:12px">+</span>
+      </summary>
+      <div style="padding:0 18px 14px;color:var(--muted,#8b9cba);font-size:14px;line-height:1.7">
+        MCP (Model Context Protocol) is an open standard for connecting AI models to external tools. Think of it like a plugin system: Meridian registers tools (<code>start_session</code>, <code>log_task</code>, <code>generate_handoff</code>, etc.) and any compatible AI client can call them as built-in capabilities.
+      </div>
+    </details>
+
+    <details style="border:1px solid var(--border,#2d3f55);border-radius:6px;padding:0;margin-bottom:10px;background:var(--surface-1,#0d1829)">
+      <summary style="cursor:pointer;padding:14px 18px;font-weight:600;font-size:14px;list-style:none;display:flex;justify-content:space-between;align-items:center">
+        Do I need a Claude Max or Pro subscription?
+        <span style="font-size:18px;color:var(--muted,#8b9cba);flex-shrink:0;margin-left:12px">+</span>
+      </summary>
+      <div style="padding:0 18px 14px;color:var(--muted,#8b9cba);font-size:14px;line-height:1.7">
+        No. Meridian works with any Claude plan, including the free tier. It also works with Cursor, Windsurf, and local models that support MCP. Your AI subscription is independent of Meridian.
+      </div>
+    </details>
+
+  </div>
+</section>
+
 <footer>
   <div class="footer-links">
     <a href="mailto:hello@usemeridian.us">hello@usemeridian.us</a>

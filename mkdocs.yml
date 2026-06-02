@@ -41,6 +41,7 @@ nav:
   - Hosted (usemeridian.us): hosted.md
   - Self-Hosting: self-hosting.md
   - API Reference: api-reference.md
+  - FAQ: faq.md
 
 markdown_extensions:
   - admonition
