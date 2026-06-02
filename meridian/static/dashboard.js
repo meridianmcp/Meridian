@@ -86,7 +86,30 @@ function toast(msg, isError=false) {
 }
 
 function showDemoReadonlyToast() {
-  toast('Read-only demo — sign in for full access', true);
+  const el = document.getElementById('toast');
+  el.innerHTML = 'Read-only demo — <a href="/auth/login" style="color:#fff;font-weight:600;text-decoration:underline">sign in for full access →</a>';
+  el.classList.add('error', 'show');
+  clearTimeout(toast._t);
+  toast._t = setTimeout(() => el.classList.remove('show'), 3200);
+}
+
+function showDemoOnboardingOverlay() {
+  if (document.getElementById('demo-onboarding-overlay')) return;
+  const overlay = document.createElement('div');
+  overlay.id = 'demo-onboarding-overlay';
+  overlay.style = 'position:fixed;inset:0;z-index:20000;background:rgba(0,0,0,0.72);display:flex;align-items:center;justify-content:center;padding:16px';
+  overlay.innerHTML = `<div style="background:#1e2029;border:1px solid #7c3aed66;border-radius:14px;padding:28px 32px;max-width:400px;width:100%;box-shadow:0 12px 48px rgba(0,0,0,0.7);position:relative;font-family:inherit">
+  <button onclick="document.getElementById('demo-onboarding-overlay').remove()" style="position:absolute;top:12px;right:14px;background:none;border:none;color:#8b8fa8;font-size:18px;cursor:pointer;line-height:1;padding:4px" title="Dismiss">×</button>
+  <h3 style="color:#e8eaf0;margin:0 0 16px;font-size:1.05rem;font-weight:700">Welcome to the Meridian demo</h3>
+  <ol style="color:#c4c6d4;font-size:.88rem;line-height:1.85;padding-left:1.3em;margin:0 0 20px">
+    <li>This is a live demo coordinating a real multi-session build. It’s read-only.</li>
+    <li>Click any session on the left to explore.</li>
+    <li>Write actions are disabled — <a href="/auth/login" style="color:#6c8fff;text-decoration:underline">sign in to create your own project</a>.</li>
+  </ol>
+  <button onclick="document.getElementById('demo-onboarding-overlay').remove()" style="background:#7c3aed;border:none;border-radius:7px;color:#fff;padding:8px 22px;cursor:pointer;font-size:.88rem;font-family:inherit;width:100%">Got it — explore the demo</button>
+</div>`;
+  overlay.addEventListener('click', (e) => { if (e.target === overlay) overlay.remove(); });
+  document.body.appendChild(overlay);
 }
 
 async function api(path, opts={}) {
@@ -118,18 +141,8 @@ async function loadServerConfig() {
       b.innerHTML = 'Preview mode — read only · <a href="/auth/login" style="color:#fff;text-decoration:underline;font-weight:600">Sign in for full access →</a>';
       document.body.prepend(b);
       document.body.style.paddingTop = ((parseInt(document.body.style.paddingTop || '0', 10)) + 28) + 'px';
-      // First-load hint: bottom-right callout, shown once
-      if (!localStorage.getItem('meridian_demo_hint')) {
-        localStorage.setItem('meridian_demo_hint', '1');
-        setTimeout(() => {
-          const tip = document.createElement('div');
-          tip.id = 'demo-first-hint';
-          tip.style = 'position:fixed;bottom:24px;right:24px;z-index:10000;background:#1e2029;border:1px solid #7c3aed55;border-radius:10px;color:#e8eaf0;padding:14px 16px;font-size:12px;font-family:inherit;max-width:280px;box-shadow:0 8px 32px rgba(0,0,0,0.5);line-height:1.6';
-          tip.innerHTML = '<strong>👆 Click a session on the left to explore.</strong><br>This is read-only — <a href="/auth/login" style="color:#6c8fff;text-decoration:underline">sign in</a> to create your own.<br><button onclick="document.getElementById(\'demo-first-hint\').remove()" style="margin-top:10px;background:#7c3aed;border:none;color:#fff;padding:4px 12px;border-radius:4px;cursor:pointer;font-size:11px;font-family:inherit">Got it</button>';
-          document.body.appendChild(tip);
-          setTimeout(() => { if (tip.parentElement) tip.remove(); }, 12000);
-        }, 1500);
-      }
+      // Demo onboarding overlay — shown every visit, no localStorage
+      showDemoOnboardingOverlay();
     }
     // Task 16 — hide destructive admin controls in demo mode
     if (cfg?.demo_mode) hideDemoAdminControls();
@@ -1200,6 +1213,8 @@ function buildTabBody(project) {
   // the chat surface still mounted keep working.
   const clearChatBtn = document.getElementById(`clear-chat-${project.id}`);
   if (clearChatBtn) clearChatBtn.onclick = async () => {
+    if (isDemoMode()) { showDemoReadonlyToast(); return; }
+    if (isDemoMode()) { showDemoReadonlyToast(); return; }
     if (!confirm('Clear chat history for this project?')) return;
     try {
       await fetch(`/projects/${project.id}/chat/history`, { method: 'DELETE' });
@@ -1895,7 +1910,7 @@ function wireClaudeLaunchPanel(projectId) {
     showCopyPreview('⚡ Setup Hooks', instructions);
   };
 
-  // Demo mode: replace write-action buttons with sign-in prompt, then stop wiring
+  // Demo mode: disable write-action buttons with tooltip, show toast on click
   if (isDemoMode()) {
     [
       copyStartChatBtn,
@@ -1906,7 +1921,9 @@ function wireClaudeLaunchPanel(projectId) {
     ].forEach(btn => {
       if (!btn) return;
       btn.title = 'Sign in to use';
-      btn.onclick = showDemoReadonlyToast;
+      btn.style.opacity = '0.45';
+      btn.style.cursor = 'not-allowed';
+      btn.onclick = (e) => { e.preventDefault(); showDemoReadonlyToast(); };
     });
     return;
   }
@@ -1924,6 +1941,7 @@ function wireClaudeLaunchPanel(projectId) {
   // Section 2 — Start Worker
   const startWorkerBtn = document.getElementById(`start-worker-${projectId}`);
   if (startWorkerBtn) startWorkerBtn.onclick = async () => {
+    if (isDemoMode()) { showDemoReadonlyToast(); return; }
     const resultEl = document.getElementById(`worker-result-${projectId}`);
     const emptyEl = document.getElementById(`worker-empty-${projectId}`);
     const xmlEl = document.getElementById(`worker-xml-${projectId}`);
