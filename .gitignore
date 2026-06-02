@@ -226,6 +226,8 @@ tmp/
 # Internal strategy documents
 DECISIONS.md
 ROADMAP.md
+# GOAL.md syncs bidirectionally with the DB — contains internal strategy, never commit
+GOAL.md
 secrets.env
 secrets.local.env
 # Session handoff files contain internal strategy â€” never commit
