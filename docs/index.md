@@ -108,6 +108,61 @@ Then add to your Claude Code `.mcp.json`:
 
 → [Full quickstart guide](quickstart.md)
 
+## Power Tools (Recommended Companions)
+
+These MCP servers pair with Meridian to give your AI agents codebase context and safe file editing. Add them alongside Meridian in your MCP config:
+
+=== "Claude Code (.mcp.json)"
+    ```json
+    {
+      "mcpServers": {
+        "meridian": {
+          "command": "pixi",
+          "args": ["run", "python", "-m", "meridian", "--mcp"],
+          "cwd": "/path/to/Meridian"
+        },
+        "text-editor": {
+          "command": "uvx",
+          "args": ["mcp-text-editor"]
+        },
+        "repomix": {
+          "command": "npx",
+          "args": ["-y", "repomix", "--mcp"]
+        }
+      }
+    }
+    ```
+
+=== "Claude Desktop"
+    ```json
+    {
+      "mcpServers": {
+        "meridian": {
+          "command": "pixi",
+          "args": ["run", "python", "-m", "meridian", "--mcp"],
+          "cwd": "/path/to/Meridian"
+        },
+        "text-editor": {
+          "command": "uvx",
+          "args": ["mcp-text-editor"]
+        },
+        "repomix": {
+          "command": "npx",
+          "args": ["-y", "repomix", "--mcp"]
+        }
+      }
+    }
+    ```
+
+**What each adds:**
+
+| Tool | What it does | Install |
+|------|-------------|---------|
+| [mcp-text-editor](https://github.com/tumf/mcp-text-editor) | Safe line-oriented file patching with conflict detection | `uvx mcp-text-editor` |
+| [Repomix](https://repomix.com) | Packs your entire codebase into AI-friendly context | `npx repomix --mcp` |
+| [Desktop Commander](https://github.com/wonderwhy-er/DesktopCommanderMCP) | Terminal, process management, file system | Already in submodule |
+
+
 ## Hosted Tier
 
 Don't want to run your own server? [usemeridian.us](https://usemeridian.us) is a hosted version — sign in with Google or GitHub, get a managed Neon Postgres database, and connect over HTTPS.
