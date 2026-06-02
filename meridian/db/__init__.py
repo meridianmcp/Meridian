@@ -219,7 +219,8 @@ CREATE TABLE IF NOT EXISTS sprint_items (
     task_id TEXT,
     notes TEXT,
     feedback_thumb SMALLINT,
-    feedback_note TEXT
+    feedback_note TEXT,
+    milestone_type TEXT NOT NULL DEFAULT 'task'
 );
 
 -- v2.4 — decisions_pinned: editable constitution alongside the append-only
@@ -388,6 +389,25 @@ CREATE TABLE IF NOT EXISTS session_notes (
     body TEXT NOT NULL,
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
+
+-- v3.0 — executor_runs: one row per Claude Code / worker session execution.
+-- transcript accumulates task descriptions as the session logs work;
+-- finalized on session close with ended_at + task_count.
+CREATE TABLE IF NOT EXISTS executor_runs (
+    id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    started_at TEXT NOT NULL DEFAULT (datetime('now')),
+    ended_at TEXT,
+    status TEXT NOT NULL DEFAULT 'running'
+        CHECK (status IN ('running','done','failed')),
+    transcript TEXT NOT NULL DEFAULT '',
+    task_count INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_executor_runs_session
+    ON executor_runs(session_id);
+CREATE INDEX IF NOT EXISTS idx_executor_runs_project
+    ON executor_runs(project_id, started_at DESC);
 """
 
 
@@ -1201,6 +1221,37 @@ async def _migrate_session_notes(db: aiosqlite.Connection) -> None:
     await db.commit()
 
 
+async def _migrate_milestone_type(db: aiosqlite.Connection) -> None:
+    """v3.0 — add milestone_type to sprint_items. Idempotent."""
+    await _migrate_add_column_if_missing(
+        db, "sprint_items", "milestone_type", "TEXT NOT NULL DEFAULT 'task'"
+    )
+
+
+async def _migrate_executor_runs(db: aiosqlite.Connection) -> None:
+    """v3.0 — create executor_runs table if not present. Idempotent."""
+    await db.execute(
+        """CREATE TABLE IF NOT EXISTS executor_runs (
+            id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+            project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+            started_at TEXT NOT NULL DEFAULT (datetime('now')),
+            ended_at TEXT,
+            status TEXT NOT NULL DEFAULT 'running',
+            transcript TEXT NOT NULL DEFAULT '',
+            task_count INTEGER NOT NULL DEFAULT 0
+        )"""
+    )
+    await db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_executor_runs_session ON executor_runs(session_id)"
+    )
+    await db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_executor_runs_project "
+        "ON executor_runs(project_id, started_at DESC)"
+    )
+    await db.commit()
+
+
 async def init_hosted_tables(db: aiosqlite.Connection) -> None:
     """Ensure hosted-tier tables exist on the given connection.
 
@@ -1269,6 +1320,8 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_decisions_free_category(db)
     await _migrate_tenants_free_plan(db)
     await _migrate_session_notes(db)
+    await _migrate_executor_runs(db)
+    await _migrate_milestone_type(db)
     return db
 
 
@@ -2177,12 +2230,16 @@ async def heartbeat_session(
 
 
 async def close_session(db: aiosqlite.Connection, session_id: str) -> None:
-    """Mark a session as closed."""
+    """Mark a session as closed and finalize its executor_run."""
     await db.execute(
         "UPDATE sessions SET status = 'closed' WHERE id = ?",
         (session_id,),
     )
     await db.commit()
+    try:
+        await finalize_executor_run(db, session_id, status="done")
+    except Exception:
+        pass
 
 
 async def archive_stale_sessions(
@@ -2305,6 +2362,10 @@ async def log_task(
     task = _row_to_dict(row)
     assert task is not None
     _publish_task("task_created", task)
+    try:
+        await append_executor_run_transcript(db, session_id, description)
+    except Exception:
+        pass
     return task
 
 
@@ -2757,6 +2818,7 @@ async def add_sprint_item(
     human_id: str | None = None,
     depends_on: str | None = None,
     failure_mode: str | None = None,
+    milestone_type: str = "task",
 ) -> dict[str, Any]:
     """Append a new ``todo`` sprint item to a project's checklist.
 
@@ -2767,16 +2829,20 @@ async def add_sprint_item(
     before this item is surfaced as claimable. ``failure_mode`` controls
     what happens when the parent has failed: 'continue' (default) allows
     this item to proceed; 'stop' blocks it.
+    ``milestone_type`` is 'task' (default) or 'milestone' — milestones
+    render as vertical timeline markers in the sprint swimlane.
     """
     if failure_mode not in (None, "continue", "stop"):
         raise ValueError("failure_mode must be 'continue' or 'stop'")
+    if milestone_type not in ("task", "milestone"):
+        raise ValueError("milestone_type must be 'task' or 'milestone'")
     iid = _new_id()
     await db.execute(
         "INSERT INTO sprint_items "
-        "(id, project_id, version, title, item_group, human_id, depends_on, failure_mode) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        "(id, project_id, version, title, item_group, human_id, depends_on, failure_mode, milestone_type) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (iid, project_id, version, title, group, human_id,
-         depends_on, failure_mode or "continue"),
+         depends_on, failure_mode or "continue", milestone_type),
     )
     await db.commit()
     item = await get_sprint_item(db, iid)
@@ -4486,6 +4552,122 @@ async def ensure_project_token(
     )
     await db.commit()
     return token
+
+
+# ---------------------------------------------------------------------------
+# v3.0 — Executor runs: one row per session execution, with transcript
+# ---------------------------------------------------------------------------
+
+
+async def create_executor_run(
+    db: aiosqlite.Connection,
+    session_id: str,
+    project_id: str,
+) -> dict[str, Any]:
+    """Create a new executor_run row for a session. Called at session start."""
+    rid = _new_id()
+    await db.execute(
+        "INSERT INTO executor_runs (id, session_id, project_id) VALUES (?, ?, ?)",
+        (rid, session_id, project_id),
+    )
+    await db.commit()
+    async with db.execute("SELECT * FROM executor_runs WHERE id = ?", (rid,)) as cur:
+        row = await cur.fetchone()
+    return _row_to_dict(row)  # type: ignore[return-value]
+
+
+async def _get_active_run_id(
+    db: aiosqlite.Connection, session_id: str
+) -> str | None:
+    """Return the id of the active (running) executor_run for a session, if any."""
+    async with db.execute(
+        "SELECT id FROM executor_runs WHERE session_id = ? AND status = 'running' "
+        "ORDER BY started_at DESC LIMIT 1",
+        (session_id,),
+    ) as cur:
+        row = await cur.fetchone()
+    if row is None:
+        return None
+    return row["id"] if isinstance(row, dict) else row[0]
+
+
+async def append_executor_run_transcript(
+    db: aiosqlite.Connection,
+    session_id: str,
+    entry: str,
+) -> None:
+    """Append a line to the running executor_run's transcript. No-op if no active run."""
+    run_id = await _get_active_run_id(db, session_id)
+    if run_id is None:
+        return
+    from datetime import datetime, timezone
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    line = f"[{ts}] {entry}\n"
+    await db.execute(
+        "UPDATE executor_runs SET transcript = transcript || ?, task_count = task_count + 1 "
+        "WHERE id = ?",
+        (line, run_id),
+    )
+    await db.commit()
+
+
+async def finalize_executor_run(
+    db: aiosqlite.Connection,
+    session_id: str,
+    status: str = "done",
+) -> None:
+    """Mark the active executor_run for a session as finished."""
+    run_id = await _get_active_run_id(db, session_id)
+    if run_id is None:
+        return
+    from datetime import datetime, timezone
+    now_ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    await db.execute(
+        "UPDATE executor_runs SET status = ?, ended_at = ? WHERE id = ?",
+        (status, now_ts, run_id),
+    )
+    await db.commit()
+
+
+async def get_executor_runs(
+    db: aiosqlite.Connection,
+    project_id: str,
+    limit: int = 20,
+) -> list[dict[str, Any]]:
+    """List executor_runs for a project, newest first."""
+    async with db.execute(
+        "SELECT * FROM executor_runs WHERE project_id = ? "
+        "ORDER BY started_at DESC LIMIT ?",
+        (project_id, limit),
+    ) as cur:
+        rows = await cur.fetchall()
+    return [_row_to_dict(r) for r in rows if r is not None]  # type: ignore[misc]
+
+
+async def get_executor_run(
+    db: aiosqlite.Connection,
+    run_id: str,
+) -> dict[str, Any] | None:
+    """Return a single executor_run by id."""
+    async with db.execute(
+        "SELECT * FROM executor_runs WHERE id = ?", (run_id,)
+    ) as cur:
+        row = await cur.fetchone()
+    return _row_to_dict(row)
+
+
+async def get_executor_run_by_session(
+    db: aiosqlite.Connection,
+    session_id: str,
+) -> dict[str, Any] | None:
+    """Return the most recent executor_run for a session (any status)."""
+    async with db.execute(
+        "SELECT * FROM executor_runs WHERE session_id = ? "
+        "ORDER BY started_at DESC LIMIT 1",
+        (session_id,),
+    ) as cur:
+        row = await cur.fetchone()
+    return _row_to_dict(row)
 
 
 async def get_project_by_token(

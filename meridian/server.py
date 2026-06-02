@@ -2322,6 +2322,52 @@ async def get_project_webhook_token(
 
 
 # ---------------------------------------------------------------------------
+# v3.0 — Executor runs
+# ---------------------------------------------------------------------------
+
+
+@app.get("/projects/{project_id}/runs")
+async def get_project_runs(
+    project_id: str,
+    request: Request,
+    limit: int = 20,
+) -> list[dict[str, Any]]:
+    """List executor_runs for a project, newest first."""
+    db = await _db(request)
+    project = await db_module.get_project(db, project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="project not found")
+    runs = await db_module.get_executor_runs(db, project_id, limit=limit)
+    for run in runs:
+        if run.get("started_at") and run.get("ended_at"):
+            from datetime import datetime
+            try:
+                fmt = "%Y-%m-%d %H:%M:%S"
+                start = datetime.strptime(run["started_at"], fmt)
+                end = datetime.strptime(run["ended_at"], fmt)
+                run["duration_s"] = int((end - start).total_seconds())
+            except Exception:
+                run["duration_s"] = None
+        else:
+            run["duration_s"] = None
+    return runs
+
+
+@app.get("/projects/{project_id}/runs/{run_id}")
+async def get_project_run(
+    project_id: str,
+    run_id: str,
+    request: Request,
+) -> dict[str, Any]:
+    """Return a single executor_run with full transcript."""
+    db = await _db(request)
+    run = await db_module.get_executor_run(db, run_id)
+    if run is None or run.get("project_id") != project_id:
+        raise HTTPException(status_code=404, detail="run not found")
+    return run
+
+
+# ---------------------------------------------------------------------------
 # CLAUDE.md auto-update helper
 # ---------------------------------------------------------------------------
 
@@ -3182,6 +3228,10 @@ async def _start_session_composite(
     session = await db_module.register_session(
         db, project_id, session_name, human_id=human_id, client_type=client_type
     )
+    try:
+        await db_module.create_executor_run(db, session["id"], project_id)
+    except Exception:
+        pass
     released_stale_claims = await db_module.release_stale_task_claims(
         db,
         project_id,
@@ -4150,6 +4200,13 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
      "inputSchema": {"type": "object", "properties": {
          "session_id": {"type": "string"}},
          "required": ["session_id"]}},
+    {"name": "get_run_transcript", "description":
+        "Return the full transcript of the executor_run for the given session. "
+        "The transcript accumulates every log_task description logged during the run, "
+        "with timestamps. Useful for post-session review or handoff.",
+     "inputSchema": {"type": "object", "properties": {
+         "session_id": {"type": "string"}},
+         "required": ["session_id"]}},
 ]
 
 
@@ -4428,6 +4485,41 @@ async def _dispatch_mcp_tool(name: str, args: dict[str, Any], db: Any, data_dir:
         )
     if name == "get_sprint_notes":
         return await db_module.get_session_notes(db, args["session_id"])
+    if name == "add_sprint_item":
+        return await db_module.add_sprint_item(
+            db, args["project_id"], args["version"], args["title"],
+            group=args.get("group"),
+            human_id=args.get("human_id"),
+            depends_on=args.get("depends_on"),
+            failure_mode=args.get("failure_mode"),
+            milestone_type=args.get("milestone_type", "task"),
+        )
+    if name == "get_sprint_items":
+        return await db_module.get_sprint_items(
+            db, args["project_id"],
+            status=args.get("status"),
+        )
+    if name == "complete_sprint_item":
+        item = await db_module.complete_sprint_item(
+            db, args["project_id"], args["item_id"],
+            task_id=args.get("task_id"),
+        )
+        if item is None:
+            raise ValueError("sprint item not found")
+        return item
+    if name == "get_run_transcript":
+        run = await db_module.get_executor_run_by_session(db, args.get("session_id", ""))
+        if run is None:
+            return {"error": "no run found for session"}
+        return {
+            "run_id": run["id"],
+            "session_id": run["session_id"],
+            "started_at": run["started_at"],
+            "ended_at": run.get("ended_at"),
+            "status": run["status"],
+            "task_count": run["task_count"],
+            "transcript": run["transcript"],
+        }
     if name == "get_session_brief":
         # v2.5 — single-call orientation, <500 tokens, XML output.
         project_id = args["project_id"]
@@ -5305,6 +5397,11 @@ def build_mcp_server():
                             "enum": ["continue", "stop"],
                             "description": "'stop' blocks this item if the parent fails. Default: 'continue'.",
                         },
+                        "milestone_type": {
+                            "type": "string",
+                            "enum": ["task", "milestone"],
+                            "description": "'milestone' renders as a timeline marker. Default: 'task'.",
+                        },
                     },
                     "required": ["project_id", "version", "title"],
                 },
@@ -5798,6 +5895,7 @@ def build_mcp_server():
                     human_id=arguments.get("human_id"),
                     depends_on=arguments.get("depends_on"),
                     failure_mode=arguments.get("failure_mode"),
+                    milestone_type=arguments.get("milestone_type", "task"),
                 )
             elif name == "complete_sprint_item":
                 item = await db_module.complete_sprint_item(
@@ -5863,6 +5961,21 @@ def build_mcp_server():
                 result = await _dispatch_mcp_tool(
                     "get_session_brief", arguments, db, state["data_dir"]
                 )
+            elif name == "get_run_transcript":
+                session_id_arg = arguments.get("session_id", "")
+                run = await db_module.get_executor_run_by_session(db, session_id_arg)
+                if run is None:
+                    result = {"error": "no run found for session"}
+                else:
+                    result = {
+                        "run_id": run["id"],
+                        "session_id": run["session_id"],
+                        "started_at": run["started_at"],
+                        "ended_at": run.get("ended_at"),
+                        "status": run["status"],
+                        "task_count": run["task_count"],
+                        "transcript": run["transcript"],
+                    }
             else:
                 result = {"error": f"unknown tool: {name}"}
         except Exception as exc:  # noqa: BLE001 — surface to MCP client

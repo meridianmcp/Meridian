@@ -449,7 +449,8 @@ CREATE TABLE IF NOT EXISTS sprint_items (
     added_at TEXT NOT NULL DEFAULT ({_TS}),
     completed_at TEXT,
     task_id TEXT,
-    notes TEXT
+    notes TEXT,
+    milestone_type TEXT NOT NULL DEFAULT 'task'
 );
 
 -- v2.4 — decisions_pinned: editable constitution. See db.py for rationale.
@@ -512,6 +513,20 @@ CREATE TABLE IF NOT EXISTS session_notes (
     created_at TEXT NOT NULL DEFAULT ({_TS})
 );
 CREATE INDEX IF NOT EXISTS idx_session_notes_session ON session_notes(session_id);
+
+-- v3.0 — executor_runs: one row per Claude Code / worker session execution.
+CREATE TABLE IF NOT EXISTS executor_runs (
+    id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    started_at TEXT NOT NULL DEFAULT ({_TS}),
+    ended_at TEXT,
+    status TEXT NOT NULL DEFAULT 'running',
+    transcript TEXT NOT NULL DEFAULT '',
+    task_count INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_executor_runs_session ON executor_runs(session_id);
+CREATE INDEX IF NOT EXISTS idx_executor_runs_project ON executor_runs(project_id, started_at DESC);
 """
 
 # Tables that go ONLY in the main auth DB (MERIDIAN_DB_URL).

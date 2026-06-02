@@ -927,6 +927,7 @@ function buildTabBody(project) {
         </div>
         <div id="live-session-${project.id}" style="display:none;flex-shrink:0;border-bottom:1px solid var(--border);background:var(--surface-2);padding:8px 14px 10px"></div>
         <div id="recent-sessions-${project.id}" style="display:none;flex-shrink:0;border-bottom:1px solid var(--border);background:var(--surface-2);padding:8px 14px 8px"></div>
+        <div id="milestones-strip-${project.id}" style="display:none;flex-shrink:0;border-bottom:1px solid var(--border);background:var(--surface-2);padding:6px 14px 8px"></div>
         <div style="padding:8px 14px 0;flex-shrink:0">
           <input type="text" id="task-search-${project.id}" placeholder="Search tasks…"
             style="width:100%;padding:5px 10px;background:var(--surface-2);border:1px solid var(--border);
@@ -934,6 +935,16 @@ function buildTabBody(project) {
         </div>
         <div style="flex:1;overflow-y:auto" id="queue-body-${project.id}">
           <div class="empty" style="color:var(--muted)">select queue to load</div>
+        </div>
+        <div id="recent-runs-${project.id}" style="flex-shrink:0;border-top:1px solid var(--border);background:var(--surface-2)">
+          <div style="display:flex;justify-content:space-between;align-items:center;padding:6px 14px;cursor:pointer"
+               id="recent-runs-toggle-${project.id}">
+            <span style="font-family:var(--font-mono);font-size:10px;color:var(--muted);letter-spacing:0.05em">RECENT RUNS</span>
+            <span id="recent-runs-chevron-${project.id}" style="font-size:10px;color:var(--muted)">▲</span>
+          </div>
+          <div id="recent-runs-body-${project.id}" style="padding:0 14px 8px;font-family:var(--font-mono);font-size:11px;max-height:220px;overflow-y:auto">
+            <div style="color:var(--muted)">loading…</div>
+          </div>
         </div>
       </div>
       <div class="drawer-panel" id="drawer-notes-${project.id}">
@@ -1104,6 +1115,8 @@ function buildTabBody(project) {
           loadQueue(project.id);
           updateLiveFeed(project.id);
           loadRecentSessions(project.id);
+          loadRecentRuns(project.id);
+          loadMilestones(project.id);
           // 5s live-feed poll while queue tab is visible — cleared on tab switch
           clearInterval(p._liveFeedInterval);
           p._liveFeedInterval = setInterval(() => {
@@ -2786,7 +2799,7 @@ async function loadNotesTab(projectId) {
             <button class="secondary notes-del-btn" data-note-id="${escapeHtml(n.id)}" style="padding:1px 8px;font-size:10px">Delete</button>
           </div>
           <div style="margin-bottom:6px">${pills}</div>
-          <div style="color:var(--text);white-space:pre-wrap;word-break:break-word;line-height:1.5;font-size:12px">${escapeHtml(n.body || '')}</div>
+          <div class="note-body-md" style="color:var(--text);line-height:1.5;font-size:12px">${typeof marked !== 'undefined' ? marked.parse(n.body || '') : escapeHtml(n.body || '')}</div>
         </div>`;
       }).join('');
       body.querySelectorAll('.notes-del-btn').forEach(btn => {
@@ -3209,6 +3222,103 @@ async function loadRecentSessions(projectId) {
     el.style.display = 'block';
   } catch (_) {
     el.style.display = 'none';
+  }
+}
+
+async function loadMilestones(projectId) {
+  const el = document.getElementById(`milestones-strip-${projectId}`);
+  if (!el) return;
+  try {
+    const all = await api(`/projects/${projectId}/sprint-items`);
+    const milestones = (all || []).filter(i => i.milestone_type === 'milestone');
+    if (!milestones.length) { el.style.display = 'none'; return; }
+    const statusIcon = s => s === 'done' ? '✓' : s === 'failed' ? '✗' : s === 'in_progress' ? '▶' : '◦';
+    const statusColor = s => s === 'done' ? 'var(--success,#2a2)' : s === 'failed' ? 'var(--danger,#e05)' : s === 'in_progress' ? 'var(--accent)' : 'var(--muted)';
+    el.innerHTML = `
+      <div style="font-size:9px;font-weight:700;color:var(--muted);letter-spacing:.07em;text-transform:uppercase;margin-bottom:6px">Milestones</div>
+      <div style="display:flex;flex-wrap:wrap;gap:6px">
+        ${milestones.map(m => {
+          const date = (m.completed_at || m.added_at || '').slice(0, 10);
+          const ic = statusIcon(m.status);
+          const col = statusColor(m.status);
+          return `<div style="display:flex;align-items:center;gap:4px;border:1px solid var(--border);border-radius:3px;padding:3px 7px;background:var(--surface-1)">
+            <span style="color:${col};font-size:11px">${ic}</span>
+            <span style="font-family:var(--font-mono);font-size:10px;color:var(--text)">${escapeHtml(m.title.slice(0, 40))}</span>
+            ${date ? `<span style="font-size:9px;color:var(--muted)">${escapeHtml(date)}</span>` : ''}
+          </div>`;
+        }).join('')}
+      </div>`;
+    el.style.display = 'block';
+  } catch (_) {
+    el.style.display = 'none';
+  }
+}
+
+async function loadRecentRuns(projectId) {
+  const body = document.getElementById(`recent-runs-body-${projectId}`);
+  const toggle = document.getElementById(`recent-runs-toggle-${projectId}`);
+  const chevron = document.getElementById(`recent-runs-chevron-${projectId}`);
+  if (!body) return;
+
+  // Toggle collapse
+  let collapsed = false;
+  if (toggle) {
+    toggle.onclick = () => {
+      collapsed = !collapsed;
+      body.style.display = collapsed ? 'none' : '';
+      if (chevron) chevron.textContent = collapsed ? '▼' : '▲';
+    };
+  }
+
+  try {
+    const runs = await api(`/projects/${projectId}/runs?limit=10`);
+    if (!runs || !runs.length) {
+      body.innerHTML = '<div style="color:var(--muted);font-size:10px">No runs yet.</div>';
+      return;
+    }
+    body.innerHTML = runs.map(run => {
+      const sid = (run.session_id || '').slice(0, 8);
+      const ts = (run.started_at || '').slice(0, 16).replace('T', ' ');
+      const dur = run.duration_s != null
+        ? (run.duration_s < 60 ? `${run.duration_s}s` : `${Math.round(run.duration_s / 60)}m`)
+        : (run.status === 'running' ? 'live' : '—');
+      const cnt = run.task_count || 0;
+      const statusColor = run.status === 'running' ? 'var(--accent)' : run.status === 'failed' ? 'var(--danger,#e05)' : 'var(--muted)';
+      const dots = run.status === 'running' ? ' ·' : '';
+      return `<div class="run-row" data-run-id="${escapeHtml(run.id)}" data-project-id="${escapeHtml(projectId)}"
+          style="border:1px solid var(--border);border-radius:3px;padding:5px 8px;margin-bottom:4px;background:var(--surface-1);cursor:pointer">
+        <div style="display:flex;justify-content:space-between;align-items:center;gap:6px">
+          <span style="font-size:10px;color:var(--text);font-family:var(--font-mono)">${escapeHtml(sid)}${dots}</span>
+          <span style="font-size:9px;color:var(--muted)">${cnt} tasks · ${dur} · ${ts}</span>
+          <span style="font-size:9px;color:${statusColor}">${run.status}</span>
+        </div>
+        <div class="run-transcript-${escapeHtml(run.id)}" style="display:none;margin-top:6px;padding:6px 8px;background:var(--surface-2);border-radius:3px;font-size:10px;white-space:pre-wrap;max-height:200px;overflow-y:auto;color:var(--muted)"></div>
+      </div>`;
+    }).join('');
+
+    body.querySelectorAll('.run-row').forEach(row => {
+      row.addEventListener('click', async () => {
+        const runId = row.dataset.runId;
+        const pid = row.dataset.projectId;
+        const transcript = row.querySelector(`.run-transcript-${runId}`);
+        if (!transcript) return;
+        if (transcript.style.display !== 'none') {
+          transcript.style.display = 'none';
+          return;
+        }
+        if (!transcript.textContent.trim()) {
+          try {
+            const full = await api(`/projects/${pid}/runs/${runId}`);
+            transcript.textContent = full.transcript || '(empty)';
+          } catch {
+            transcript.textContent = 'failed to load';
+          }
+        }
+        transcript.style.display = 'block';
+      });
+    });
+  } catch (_) {
+    body.innerHTML = '<div style="color:var(--muted);font-size:10px">Could not load runs.</div>';
   }
 }
 
@@ -3752,20 +3862,71 @@ async function loadPinnedDecisions(projectId) {
       const cat = d.category || 'TECHNICAL';
       const color = _DECISION_CATEGORY_COLORS[cat] || _DECISION_CATEGORY_COLORS.TECHNICAL;
       const dateStr = (d.created_at || '').slice(0, 10);
-      return `<div style="background:var(--surface-2);border:1px solid var(--border);border-left:4px solid ${color};border-radius:4px;padding:10px 12px;margin-bottom:8px">
+      return `<div data-decision-card="${escapeHtml(d.id)}" style="background:var(--surface-2);border:1px solid var(--border);border-left:4px solid ${color};border-radius:4px;padding:10px 12px;margin-bottom:8px">
         <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;gap:8px">
           <div style="display:flex;align-items:center;gap:8px;min-width:0;flex:1">
             <span style="display:inline-block;background:${color}22;color:${color};font-size:9px;font-weight:700;letter-spacing:.5px;padding:2px 6px;border-radius:3px;flex-shrink:0">${escapeHtml(cat)}</span>
-            <span style="color:var(--accent);font-weight:600;font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escapeHtml(d.title || '')}</span>
+            <span class="decision-title-view" data-id="${escapeHtml(d.id)}" title="Click to edit title" style="color:var(--accent);font-weight:600;font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;cursor:pointer">${escapeHtml(d.title || '')}</span>
           </div>
-          <div style="display:flex;gap:6px;flex-shrink:0">
+          <div style="display:flex;gap:6px;flex-shrink:0;align-items:center">
             <span style="color:var(--muted);font-size:10px">${escapeHtml(dateStr)}</span>
             <button class="secondary" data-supersede="${escapeHtml(d.id)}" style="padding:1px 6px;font-size:9px">Supersede</button>
           </div>
         </div>
-        <div style="color:var(--text);white-space:pre-wrap;word-break:break-word;line-height:1.5;font-size:12px">${escapeHtml(d.body || '')}</div>
+        <div class="decision-body-view" data-id="${escapeHtml(d.id)}" title="Click to edit" style="color:var(--text);white-space:pre-wrap;word-break:break-word;line-height:1.5;font-size:12px;cursor:pointer">${escapeHtml(d.body || '')}</div>
+        <div class="decision-edit-area" data-id="${escapeHtml(d.id)}" style="display:none;margin-top:6px">
+          <input type="text" class="decision-edit-title" data-id="${escapeHtml(d.id)}"
+            value="${escapeHtml(d.title || '')}"
+            style="width:100%;padding:4px 6px;background:var(--surface-1);border:1px solid var(--accent);border-radius:3px;color:var(--text);font-size:12px;font-family:var(--font-mono);outline:none;margin-bottom:4px">
+          <textarea class="decision-edit-body" data-id="${escapeHtml(d.id)}" rows="4"
+            style="width:100%;padding:4px 6px;background:var(--surface-1);border:1px solid var(--accent);border-radius:3px;color:var(--text);font-size:12px;font-family:var(--font-mono);resize:vertical;outline:none">${escapeHtml(d.body || '')}</textarea>
+          <div style="display:flex;gap:6px;justify-content:flex-end;margin-top:4px">
+            <button class="secondary decision-edit-cancel" data-id="${escapeHtml(d.id)}" style="padding:2px 8px;font-size:10px">Cancel</button>
+            <button class="primary decision-edit-save" data-id="${escapeHtml(d.id)}" data-project="${escapeHtml(projectId)}" style="padding:2px 8px;font-size:10px">Save</button>
+          </div>
+        </div>
       </div>`;
     }).join('');
+
+    const showEdit = (id) => {
+      const card = host.querySelector(`[data-decision-card="${id}"]`);
+      if (!card) return;
+      card.querySelector('.decision-body-view').style.display = 'none';
+      card.querySelector('.decision-title-view').style.display = 'none';
+      card.querySelector('.decision-edit-area').style.display = 'block';
+    };
+    const hideEdit = (id) => {
+      const card = host.querySelector(`[data-decision-card="${id}"]`);
+      if (!card) return;
+      card.querySelector('.decision-body-view').style.display = '';
+      card.querySelector('.decision-title-view').style.display = '';
+      card.querySelector('.decision-edit-area').style.display = 'none';
+    };
+
+    host.querySelectorAll('.decision-body-view, .decision-title-view').forEach(el => {
+      el.onclick = () => showEdit(el.dataset.id);
+    });
+    host.querySelectorAll('.decision-edit-cancel').forEach(btn => {
+      btn.onclick = () => hideEdit(btn.dataset.id);
+    });
+    host.querySelectorAll('.decision-edit-save').forEach(btn => {
+      btn.onclick = async () => {
+        const id = btn.dataset.id;
+        const pid = btn.dataset.project;
+        const card = host.querySelector(`[data-decision-card="${id}"]`);
+        const newTitle = card.querySelector('.decision-edit-title').value.trim();
+        const newBody = card.querySelector('.decision-edit-body').value.trim();
+        if (!newTitle || !newBody) return toast('title and body required', true);
+        try {
+          await api(`/projects/${pid}/decisions-pinned/${id}`, {
+            method: 'PATCH',
+            body: JSON.stringify({ title: newTitle, body: newBody }),
+          });
+          toast('decision saved');
+          loadPinnedDecisions(pid);
+        } catch (e) { toast('save failed: ' + e.message, true); }
+      };
+    });
     host.querySelectorAll('[data-supersede]').forEach(btn => {
       btn.onclick = () => supersedePinnedDecision(projectId, btn.dataset.supersede);
     });
