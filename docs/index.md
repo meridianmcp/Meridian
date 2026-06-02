@@ -5,6 +5,13 @@
 [![GitHub](https://img.shields.io/github/stars/meridianmcp/Meridian?style=social)](https://github.com/meridianmcp/Meridian)
 [![License](https://img.shields.io/badge/license-MSL--2.0-blue)](https://github.com/meridianmcp/Meridian/blob/main/LICENSE)
 
+<div style="border:2px dashed #4a90d9;border-radius:8px;padding:20px 24px;margin:20px 0;text-align:center;background:rgba(74,144,217,0.05)">
+  📹 <strong>What is Meridian? (90 sec)</strong> — video coming soon<br>
+  <span style="font-size:0.85em;color:#888">Drop the YouTube URL below when ready</span>
+  <!-- REPLACE WITH ACTUAL YOUTUBE URL BEFORE LAUNCH -->
+  <!-- <iframe width="560" height="315" src="https://www.youtube.com/embed/VIDEO_ID" title="What is Meridian?" frameborder="0" allowfullscreen style="max-width:100%"></iframe> -->
+</div>
+
 ---
 
 ## The Problem
@@ -143,9 +150,13 @@ Then add to your Claude Code `.mcp.json`:
 
 ## Power Tools (Recommended Companions)
 
-These MCP servers pair with Meridian to give your AI agents codebase context and safe file editing. Add them alongside Meridian in your MCP config:
+These MCP servers pair with Meridian to give your AI agents codebase context and safe file editing.
 
-=== "Claude Code (.mcp.json)"
+**Same JSON format everywhere — only the file path changes.**
+
+=== "Claude Code"
+    **File:** `.mcp.json` at project root (project-scoped), or `~/.config/claude/mcp.json` (global)
+
     ```json
     {
       "mcpServers": {
@@ -154,19 +165,18 @@ These MCP servers pair with Meridian to give your AI agents codebase context and
           "args": ["run", "python", "-m", "meridian", "--mcp"],
           "cwd": "/path/to/Meridian"
         },
-        "text-editor": {
-          "command": "uvx",
-          "args": ["mcp-text-editor"]
-        },
-        "repomix": {
-          "command": "npx",
-          "args": ["-y", "repomix", "--mcp"]
-        }
+        "text-editor": { "command": "uvx", "args": ["mcp-text-editor"] },
+        "repomix": { "command": "npx", "args": ["-y", "repomix", "--mcp"] }
       }
     }
     ```
 
 === "Claude Desktop"
+    **File:**
+
+    - **macOS:** `~/Library/Application Support/Claude/claude_desktop_config.json`
+    - **Windows:** `%APPDATA%\Claude\claude_desktop_config.json`
+
     ```json
     {
       "mcpServers": {
@@ -175,17 +185,56 @@ These MCP servers pair with Meridian to give your AI agents codebase context and
           "args": ["run", "python", "-m", "meridian", "--mcp"],
           "cwd": "/path/to/Meridian"
         },
-        "text-editor": {
-          "command": "uvx",
-          "args": ["mcp-text-editor"]
-        },
-        "repomix": {
-          "command": "npx",
-          "args": ["-y", "repomix", "--mcp"]
-        }
+        "text-editor": { "command": "uvx", "args": ["mcp-text-editor"] },
+        "repomix": { "command": "npx", "args": ["-y", "repomix", "--mcp"] }
       }
     }
     ```
+
+=== "Cursor"
+    **File:** `.cursor/mcp.json` at project root
+
+    ```json
+    {
+      "mcpServers": {
+        "meridian": {
+          "command": "pixi",
+          "args": ["run", "python", "-m", "meridian", "--mcp"],
+          "cwd": "/path/to/Meridian"
+        },
+        "text-editor": { "command": "uvx", "args": ["mcp-text-editor"] },
+        "repomix": { "command": "npx", "args": ["-y", "repomix", "--mcp"] }
+      }
+    }
+    ```
+
+=== "Windsurf"
+    **File:** `~/.codeium/windsurf/mcp_config.json`
+
+    ```json
+    {
+      "mcpServers": {
+        "meridian": {
+          "command": "pixi",
+          "args": ["run", "python", "-m", "meridian", "--mcp"],
+          "cwd": "/path/to/Meridian"
+        },
+        "text-editor": { "command": "uvx", "args": ["mcp-text-editor"] },
+        "repomix": { "command": "npx", "args": ["-y", "repomix", "--mcp"] }
+      }
+    }
+    ```
+
+=== "claude.ai (browser)"
+    Uses SSE transport — no JSON config file needed. Install the [dnakov/claude-mcp](https://github.com/dnakov/claude-mcp) Chrome extension, then:
+
+    1. Click the extension icon → **Add server**
+    2. **Name:** `meridian`
+    3. **URL:** `http://localhost:7878/mcp/sse`
+
+    The extension discovers all Meridian tools via the SSE handshake. For the hosted tier, use `https://usemeridian.us/mcp/sse` with your API token.
+
+    → [Full setup guide](https://usemeridian.us/install-mcp)
 
 **What each adds:**
 
