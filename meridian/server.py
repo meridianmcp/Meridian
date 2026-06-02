@@ -1014,6 +1014,19 @@ async def pricing_page(request: Request) -> HTMLResponse:
     })
 
 
+@app.get("/install-mcp", response_class=HTMLResponse)
+async def install_mcp_page(request: Request) -> HTMLResponse:
+    """Onboarding page: step-by-step guide to connect Claude to Meridian via MCP.
+
+    Shows copy-ready Name + URL fields for both local and hosted configs.
+    Token generation calls POST /auth/tokens client-side.
+    Linked from README, docs quickstart, and dashboard Settings tab.
+    """
+    resp = _templates.TemplateResponse(request, "install_mcp.html", {})
+    resp.headers["Cache-Control"] = "no-cache, no-store"
+    return resp
+
+
 # ---------------------------------------------------------------------------
 # v2.0 — Google OAuth routes
 # ---------------------------------------------------------------------------

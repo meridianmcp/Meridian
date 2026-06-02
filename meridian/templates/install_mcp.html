@@ -1,0 +1,305 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Connect Claude to Meridian</title>
+<link rel="icon" href="/static/logo.svg" type="image/svg+xml">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #0b0c0e;
+    --surface: #14161a;
+    --surface-2: #1c1f25;
+    --border: #2a2d35;
+    --border-light: #3a3d48;
+    --accent: #6c8fff;
+    --accent-green: #4ade80;
+    --text: #e8eaf0;
+    --text-dim: #b4b7c1;
+    --muted: #8b8fa8;
+    --sans: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    --mono: 'IBM Plex Mono', ui-monospace, Menlo, Consolas, monospace;
+  }
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--sans);
+    font-size: 16px;
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+    min-height: 100vh;
+    padding: 0 0 80px;
+  }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  nav {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 16px 40px; border-bottom: 1px solid var(--border);
+    background: var(--surface);
+  }
+  .nav-logo { display: flex; align-items: center; gap: 10px; font-weight: 700; font-size: 18px; color: var(--text); }
+  .nav-logo img { width: 28px; height: 28px; }
+  .nav-links { display: flex; gap: 24px; align-items: center; font-size: 14px; }
+  .main { max-width: 760px; margin: 0 auto; padding: 60px 24px 0; }
+  h1 { font-size: 2rem; font-weight: 700; margin-bottom: 10px; }
+  .subtitle { color: var(--text-dim); font-size: 1.05rem; margin-bottom: 48px; }
+  .steps { display: flex; gap: 0; margin-bottom: 48px; }
+  .step { flex: 1; text-align: center; position: relative; }
+  .step:not(:last-child)::after {
+    content: ''; position: absolute; top: 18px; left: 60%; right: -10%;
+    height: 1px; background: var(--border);
+  }
+  .step-num {
+    width: 36px; height: 36px; border-radius: 50%; background: var(--accent);
+    color: #fff; font-weight: 700; font-size: 14px;
+    display: flex; align-items: center; justify-content: center;
+    margin: 0 auto 8px;
+  }
+  .step-label { font-size: 13px; color: var(--text-dim); }
+  .section { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 28px 32px; margin-bottom: 24px; }
+  .section-title { font-size: 1.1rem; font-weight: 700; margin-bottom: 4px; display: flex; align-items: center; gap: 8px; }
+  .badge { font-size: 11px; background: var(--accent)22; color: var(--accent); padding: 2px 8px; border-radius: 20px; font-weight: 600; }
+  .badge-hosted { background: #22c55e22; color: #22c55e; }
+  .section-sub { color: var(--muted); font-size: 13px; margin-bottom: 20px; }
+  .field-row { display: flex; gap: 10px; align-items: center; margin-bottom: 12px; }
+  .field-label { width: 56px; font-size: 12px; color: var(--muted); flex-shrink: 0; font-weight: 600; text-transform: uppercase; letter-spacing: .05em; }
+  .field-val {
+    flex: 1; background: var(--surface-2); border: 1px solid var(--border);
+    border-radius: 6px; padding: 8px 12px;
+    font-family: var(--mono); font-size: 13px; color: var(--text);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .copy-btn {
+    padding: 7px 14px; background: var(--accent); color: #fff; border: none;
+    border-radius: 6px; font-size: 12px; font-weight: 600; cursor: pointer;
+    white-space: nowrap; transition: background .15s;
+  }
+  .copy-btn:hover { background: #8ba5ff; }
+  .copy-btn.copied { background: #22c55e; }
+  .token-section { margin-top: 16px; padding-top: 16px; border-top: 1px solid var(--border); }
+  .token-section .section-sub { margin-bottom: 12px; }
+  .token-display {
+    background: var(--surface-2); border: 1px solid var(--accent)44;
+    border-radius: 6px; padding: 10px 14px; font-family: var(--mono);
+    font-size: 12px; color: var(--accent); word-break: break-all;
+    margin-bottom: 10px; display: none;
+  }
+  .gen-btn {
+    padding: 8px 18px; background: transparent; color: var(--accent);
+    border: 1px solid var(--accent)55; border-radius: 6px; font-size: 13px;
+    font-weight: 600; cursor: pointer; transition: all .15s;
+  }
+  .gen-btn:hover { background: var(--accent)15; }
+  .info-box {
+    background: var(--surface-2); border: 1px solid var(--border);
+    border-radius: 8px; padding: 16px 20px; margin-top: 32px;
+    font-size: 13px; color: var(--text-dim); line-height: 1.7;
+  }
+  .info-box strong { color: var(--text); }
+  .ext-link {
+    display: inline-flex; align-items: center; gap: 6px;
+    background: var(--surface-2); border: 1px solid var(--border);
+    border-radius: 6px; padding: 8px 16px; font-size: 13px;
+    color: var(--text); font-weight: 500; margin-bottom: 20px;
+    transition: border-color .15s;
+  }
+  .ext-link:hover { border-color: var(--accent); text-decoration: none; }
+  .divider { display: flex; align-items: center; gap: 12px; margin: 32px 0 24px; }
+  .divider::before, .divider::after { content: ''; flex: 1; height: 1px; background: var(--border); }
+  .divider span { font-size: 12px; color: var(--muted); white-space: nowrap; font-weight: 600; text-transform: uppercase; letter-spacing: .06em; }
+  #toast {
+    position: fixed; bottom: 24px; right: 24px;
+    background: #22c55e; color: #fff; border-radius: 6px;
+    padding: 10px 18px; font-size: 13px; font-weight: 600;
+    display: none; z-index: 9999;
+  }
+</style>
+</head>
+<body>
+<nav>
+  <a href="/" class="nav-logo" style="text-decoration:none">
+    <img src="/static/logo.svg" alt="Meridian">
+    <span>Meridian</span>
+  </a>
+  <div class="nav-links">
+    <a href="/dashboard">Dashboard</a>
+    <a href="https://docs.usemeridian.us" target="_blank">Docs</a>
+    <a href="/auth/login">Sign in</a>
+  </div>
+</nav>
+
+<main class="main">
+  <h1>Connect Claude to Meridian</h1>
+  <p class="subtitle">Add Meridian as an MCP server so Claude can track your sessions, decisions, and tasks.</p>
+
+  <div class="steps">
+    <div class="step">
+      <div class="step-num">1</div>
+      <div class="step-label">Install extension</div>
+    </div>
+    <div class="step">
+      <div class="step-num">2</div>
+      <div class="step-label">Add server</div>
+    </div>
+    <div class="step">
+      <div class="step-num">3</div>
+      <div class="step-label">Start using</div>
+    </div>
+  </div>
+
+  <!-- Step 1: Install extension -->
+  <div style="margin-bottom:24px">
+    <div style="font-size:13px;color:var(--muted);font-weight:600;text-transform:uppercase;letter-spacing:.06em;margin-bottom:10px">Step 1 — Install the MCP extension</div>
+    <a class="ext-link" href="https://github.com/dnakov/claude-mcp" target="_blank">
+      <span>🔌</span>
+      <span>dnakov/claude-mcp — Chrome extension for claude.ai</span>
+      <span style="margin-left:auto;font-size:11px;color:var(--muted)">GitHub →</span>
+    </a>
+    <p style="font-size:13px;color:var(--text-dim)">
+      The extension adds MCP server support to <strong style="color:var(--text)">claude.ai</strong> in your browser.
+      After installing: click the puzzle icon in Chrome, then the Meridian extension icon to open the popup.
+      Use <strong style="color:var(--text)">Claude Desktop</strong>? Skip this step — it has MCP built in.
+    </p>
+  </div>
+
+  <!-- Step 2: Local config -->
+  <div style="font-size:13px;color:var(--muted);font-weight:600;text-transform:uppercase;letter-spacing:.06em;margin-bottom:10px">Step 2 — Add server config</div>
+
+  <div class="section">
+    <div class="section-title">
+      Local install
+      <span class="badge">Free · Self-hosted</span>
+    </div>
+    <p class="section-sub">Running Meridian locally on <code style="font-family:var(--mono);font-size:12px;color:var(--accent)">localhost:7878</code>? Use this config.</p>
+    <div class="field-row">
+      <div class="field-label">Name</div>
+      <div class="field-val" id="local-name">meridian</div>
+      <button class="copy-btn" onclick="copyField('local-name', this)">Copy</button>
+    </div>
+    <div class="field-row">
+      <div class="field-label">URL</div>
+      <div class="field-val" id="local-url">http://localhost:7878/mcp/sse</div>
+      <button class="copy-btn" onclick="copyField('local-url', this)">Copy</button>
+    </div>
+    <div style="margin-top:12px;font-size:12px;color:var(--muted)">
+      No token needed for local installs — Meridian trusts localhost by default.
+    </div>
+  </div>
+
+  <div class="divider"><span>or use the hosted tier</span></div>
+
+  <div class="section">
+    <div class="section-title">
+      Hosted tier
+      <span class="badge badge-hosted">usemeridian.us</span>
+    </div>
+    <p class="section-sub">Zero install — Meridian runs in the cloud. Paste these into the extension popup.</p>
+    <div class="field-row">
+      <div class="field-label">Name</div>
+      <div class="field-val" id="hosted-name">meridian</div>
+      <button class="copy-btn" onclick="copyField('hosted-name', this)">Copy</button>
+    </div>
+    <div class="field-row">
+      <div class="field-label">URL</div>
+      <div class="field-val" id="hosted-url">https://usemeridian.us/mcp/sse</div>
+      <button class="copy-btn" onclick="copyField('hosted-url', this)">Copy</button>
+    </div>
+
+    <div class="token-section">
+      <p class="section-sub">The hosted server requires an API token (Bearer auth). Generate one below — it's shown only once.</p>
+      <div id="token-display" class="token-display"></div>
+      <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+        <button class="gen-btn" id="gen-btn" onclick="generateToken()">Generate API token</button>
+        <button class="copy-btn" id="token-copy-btn" style="display:none" onclick="copyToken()">Copy token</button>
+        <span id="token-note" style="font-size:12px;color:var(--muted);display:none">⚠ Save this — it won't be shown again.</span>
+      </div>
+      <div id="login-hint" style="margin-top:10px;font-size:12px;color:var(--muted);display:none">
+        <a href="/auth/login">Sign in</a> first to generate a token.
+      </div>
+    </div>
+  </div>
+
+  <!-- Step 3 hint -->
+  <div class="info-box">
+    <strong>Step 3 — Start using</strong><br>
+    After adding the server, open a new conversation on claude.ai.
+    The extension auto-discovers all Meridian tools. Call
+    <code style="font-family:var(--mono);color:var(--accent)">start_session(project_id="...", session_name="...")</code>
+    to begin — Meridian returns your sprint state, pending tasks, and open HITLs in one call.<br><br>
+    <strong>Claude Desktop:</strong> Add to <code style="font-family:var(--mono);color:var(--accent)">claude_desktop_config.json</code>:
+    <pre style="margin-top:8px;background:var(--bg);border:1px solid var(--border);border-radius:4px;padding:10px;font-family:var(--mono);font-size:11px;overflow-x:auto;color:var(--text-dim)">
+{
+  "mcpServers": {
+    "meridian": {
+      "command": "pixi",
+      "args": ["run", "mcp"],
+      "cwd": "/path/to/Meridian"
+    }
+  }
+}</pre>
+    <div style="margin-top:12px">
+      <a href="https://docs.usemeridian.us" target="_blank">Full setup docs →</a>
+      &nbsp;·&nbsp;
+      <a href="https://github.com/meridianmcp/Meridian" target="_blank">GitHub →</a>
+    </div>
+  </div>
+</main>
+
+<div id="toast">Copied!</div>
+
+<script>
+function copyField(id, btn) {
+  const val = document.getElementById(id).textContent.trim();
+  navigator.clipboard.writeText(val).then(() => {
+    const orig = btn.textContent;
+    btn.textContent = 'Copied!';
+    btn.classList.add('copied');
+    setTimeout(() => { btn.textContent = orig; btn.classList.remove('copied'); }, 1800);
+  });
+}
+
+let _generatedToken = '';
+async function generateToken() {
+  const btn = document.getElementById('gen-btn');
+  const loginHint = document.getElementById('login-hint');
+  btn.disabled = true;
+  btn.textContent = 'Generating…';
+  try {
+    const r = await fetch('/auth/tokens', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ label: 'claude-mcp' }) });
+    if (r.status === 401) {
+      loginHint.style.display = 'block';
+      btn.textContent = 'Generate API token';
+      btn.disabled = false;
+      return;
+    }
+    if (!r.ok) throw new Error('request failed');
+    const data = await r.json();
+    _generatedToken = data.token || '';
+    const disp = document.getElementById('token-display');
+    disp.textContent = _generatedToken;
+    disp.style.display = 'block';
+    document.getElementById('token-copy-btn').style.display = 'inline-block';
+    document.getElementById('token-note').style.display = 'inline';
+    btn.style.display = 'none';
+    loginHint.style.display = 'none';
+  } catch (e) {
+    btn.textContent = 'Error — try again';
+    btn.disabled = false;
+  }
+}
+
+function copyToken() {
+  if (!_generatedToken) return;
+  navigator.clipboard.writeText(_generatedToken).then(() => {
+    const t = document.getElementById('toast');
+    t.style.display = 'block';
+    setTimeout(() => { t.style.display = 'none'; }, 2000);
+  });
+}
+</script>
+</body>
+</html>

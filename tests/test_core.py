@@ -5279,6 +5279,16 @@ def test_landing_page_has_try_demo_link(client):
     assert "/demo" in r.text
 
 
+def test_install_mcp_page(client):
+    """GET /install-mcp returns 200 with copy-ready SSE URL and no-cache headers."""
+    r = client.get("/install-mcp")
+    assert r.status_code == 200
+    assert "/mcp/sse" in r.text
+    assert "meridian" in r.text.lower()
+    cc = r.headers.get("cache-control", "")
+    assert "no-cache" in cc
+
+
 def test_landing_page_footer_uses_meridian_email(client):
     """Landing page footer contact uses hello@usemeridian.us, not personal email."""
     r = client.get("/")
