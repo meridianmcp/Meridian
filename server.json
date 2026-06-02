@@ -1,36 +1,24 @@
 {
-  "$schema": "https://registry.modelcontextprotocol.io/schema/v0/server.json",
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.meridianmcp/meridian",
-  "description": "Persistent memory, task coordination, and human-in-the-loop queue for AI coding sessions. Coordinates Claude Code, Cursor, Windsurf, and Codex CLI sessions across machines.",
-  "version": "1.0.0",
-  "license": "FSL-1.1-MIT",
-  "homepage": "https://usemeridian.us",
+  "description": "Persistent memory, task coordination, and human-in-the-loop queue for AI coding sessions. Works with Claude Code, Cursor, Windsurf, Codex CLI, and any MCP client.",
   "repository": {
-    "type": "git",
-    "url": "https://github.com/meridianmcp/Meridian.git"
+    "url": "https://github.com/meridianmcp/Meridian",
+    "source": "github"
   },
-  "categories": ["productivity", "developer-tools"],
-  "tags": ["session-management", "coordination", "handoff", "hitl", "claude-code", "cursor", "windsurf"],
-  "installations": {
-    "npm": {
-      "type": "npm",
-      "command": "npx",
-      "args": ["-y", "meridian-mcp"],
-      "package": "meridian-mcp",
-      "description": "Run via npx — no install needed"
-    },
-    "docker": {
-      "type": "stdio",
-      "command": "pixi",
-      "args": ["run", "python", "-m", "meridian", "--mcp"],
-      "description": "Run from source via pixi"
+  "version": "1.0.0",
+  "packages": [
+    {
+      "registryType": "npm",
+      "identifier": "meridian-mcp",
+      "version": "1.0.0",
+      "transport": { "type": "stdio" }
     }
-  },
+  ],
   "remotes": [
     {
       "transportType": "sse",
-      "url": "https://usemeridian.us/mcp/sse",
-      "description": "Hosted SSE endpoint — no install required"
+      "url": "https://usemeridian.us/mcp/sse"
     }
   ]
 }
