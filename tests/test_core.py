@@ -5372,6 +5372,25 @@ def test_landing_page_nav_has_docs_link(client):
     assert "Docs" in r.text
 
 
+def test_landing_page_cache_control(client):
+    """/ returns Cache-Control: no-cache, no-store so Cloudflare doesn't serve stale HTML."""
+    r = client.get("/")
+    assert r.status_code == 200
+    cc = r.headers.get("cache-control", "")
+    assert "no-cache" in cc
+    assert "no-store" in cc
+
+
+def test_demo_cache_control(client):
+    """/demo returns Cache-Control: no-cache, no-store."""
+    r = client.get("/demo")
+    assert r.status_code in (200, 503)
+    if r.status_code == 200:
+        cc = r.headers.get("cache-control", "")
+        assert "no-cache" in cc
+        assert "no-store" in cc
+
+
 async def test_neon_pool_projects_table_exists(db):
     """neon_pool_projects table must exist after init_db."""
     async with db.execute(

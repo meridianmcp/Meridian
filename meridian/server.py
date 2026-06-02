@@ -916,13 +916,15 @@ async def landing_page(request: Request) -> HTMLResponse:
     stripe_payment_link = os.environ.get("STRIPE_PAYMENT_LINK", "/auth/login")
     stripe_pro_checkout = "/checkout?plan=pro" if os.environ.get("STRIPE_PRO_PRICE_ID") else ""
     stripe_pro_payment_link = os.environ.get("STRIPE_PRO_PAYMENT_LINK", stripe_pro_checkout)
-    return _templates.TemplateResponse(
+    resp = _templates.TemplateResponse(
         request, "landing.html", {
             "stripe_payment_link": stripe_payment_link,
             "stripe_pro_checkout": stripe_pro_checkout,
             "stripe_pro_payment_link": stripe_pro_payment_link,
         }
     )
+    resp.headers["Cache-Control"] = "no-cache, no-store"
+    return resp
 
 
 @app.post("/demo-auth")
@@ -1883,6 +1885,7 @@ async def demo_dashboard(request: Request) -> Any:
         httponly=True,
         samesite="lax",
     )
+    response.headers["Cache-Control"] = "no-cache, no-store"
     return response
 
 
@@ -4284,6 +4287,37 @@ async def _dispatch_mcp_tool(name: str, args: dict[str, Any], db: Any, data_dir:
         ) if pending_items else "/goal Continue work — all sprint items done."
         # 04f03ee4 — include start_session one-liner so next session can resume immediately
         start_fresh = f'start_session(project_id="{project_id}", session_name="describe-what-youre-doing")'
+        # fa595ad8 — store snapshot for Recent Sessions dashboard panel (non-fatal)
+        try:
+            import json as _json
+            async with db.execute(
+                "SELECT name FROM sessions WHERE id = ?", (session_id,)
+            ) as _sc:
+                _sr = await _sc.fetchone()
+            _session_name = (_sr["name"] if _sr else None) or session_id[:8]
+            async with db.execute(
+                "SELECT COUNT(*) AS n FROM task_log "
+                "WHERE session_id = ? AND status = 'done'",
+                (session_id,),
+            ) as _tc:
+                _tr = await _tc.fetchone()
+            _items_done = int(_tr["n"]) if _tr else 0
+            _summary_line = (content or "").split("\n")[0][:140]
+            await db_module.add_project_note(
+                db, project_id,
+                title=f"checkpoint:{session_id[:8]}",
+                body=_json.dumps({
+                    "session_id": session_id,
+                    "session_name": _session_name,
+                    "items_done": _items_done,
+                    "summary_line": _summary_line,
+                    "next_goal": next_goal,
+                    "start_fresh": start_fresh,
+                }),
+                tags="checkpoint",
+            )
+        except Exception:
+            pass  # non-fatal — checkpoint still returns normally
         return {
             "summary": content,
             "pending_count": len(pending_items),
