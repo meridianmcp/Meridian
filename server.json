@@ -1,23 +1,23 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
-  "name": "io.github.meridianmcp/meridian",
-  "description": "Persistent memory, task coordination, and human-in-the-loop queue for AI coding sessions. Works with Claude Code, Cursor, Windsurf, Codex CLI, and any MCP client.",
+  "name": "io.github.ajc3xc/meridian",
+  "description": "Persistent memory, task coordination, and HITL queue for AI coding sessions.",
   "repository": {
     "url": "https://github.com/meridianmcp/Meridian",
     "source": "github"
   },
-  "version": "1.0.0",
+  "version": "1.0.1",
   "packages": [
     {
       "registryType": "npm",
-      "identifier": "meridian-mcp",
-      "version": "1.0.0",
+      "identifier": "@meridianmcp/mcp",
+      "version": "1.0.1",
       "transport": { "type": "stdio" }
     }
   ],
   "remotes": [
     {
-      "transportType": "sse",
+      "type": "sse",
       "url": "https://usemeridian.us/mcp/sse"
     }
   ]
