@@ -925,6 +925,7 @@ function buildTabBody(project) {
           <span>QUEUE · ${escapeHtml(project.name)}</span>
           <button class="secondary" id="queue-refresh-${project.id}" style="padding:2px 8px;font-size:10px">refresh</button>
         </div>
+        <div id="live-session-${project.id}" style="display:none;flex-shrink:0;border-bottom:1px solid var(--border);background:var(--surface-2);padding:8px 14px 10px"></div>
         <div style="padding:8px 14px 0;flex-shrink:0">
           <input type="text" id="task-search-${project.id}" placeholder="Search tasks…"
             style="width:100%;padding:5px 10px;background:var(--surface-2);border:1px solid var(--border);
@@ -1098,7 +1099,18 @@ function buildTabBody(project) {
         if (vtab === 'devlog') refreshTasks(project.id);
         if (vtab === 'timeline') loadTimeline(project.id);
         if (vtab === 'rewind') initRewindTab(project.id);
-        if (vtab === 'queue') loadQueue(project.id);
+        if (vtab === 'queue') {
+          loadQueue(project.id);
+          updateLiveFeed(project.id);
+          // 5s live-feed poll while queue tab is visible — cleared on tab switch
+          clearInterval(p._liveFeedInterval);
+          p._liveFeedInterval = setInterval(() => {
+            if (p.activeVtab === 'queue') updateLiveFeed(project.id);
+            else clearInterval(p._liveFeedInterval);
+          }, 5000);
+        } else {
+          clearInterval(p._liveFeedInterval);
+        }
         if (vtab === 'live') loadLiveTab(project.id);
         if (vtab === 'team') loadTeamTab(project.id);
         if (vtab === 'notes') loadNotesTab(project.id);
@@ -3097,6 +3109,50 @@ function _renderSwimlane(humans, days, goalMarkers) {
   </div>`;
 }
 
+async function updateLiveFeed(projectId) {
+  /**v2.3 — live "Currently Running" section at top of Queue tab.
+   * Shows active session name + started_at + last 5 task_log entries.
+   * Collapses when no active session exists. Polls every 5s. */
+  const el = document.getElementById(`live-session-${projectId}`);
+  if (!el) return;
+  try {
+    const sessions = await api(`/projects/${projectId}/sessions?active_only=true`);
+    const active = sessions && sessions.filter(s => s.status === 'active');
+    if (!active || active.length === 0) {
+      el.style.display = 'none';
+      return;
+    }
+    const sess = active[0];
+    const tasks = await api(`/projects/${projectId}/sessions/${sess.id}/tasks/live?limit=5`).catch(() => []);
+    const elapsed = sess.last_seen
+      ? Math.round((Date.now() - new Date(sess.last_seen + 'Z').getTime()) / 60000)
+      : null;
+    const elapsedStr = elapsed !== null ? (elapsed < 2 ? 'just now' : `${elapsed}m ago`) : '';
+    const taskRows = (tasks || []).map(t => {
+      const icon = t.status === 'done' ? '✓' : t.status === 'failed' ? '✗' : t.status === 'in_progress' ? '▶' : '·';
+      const color = t.status === 'done' ? 'var(--status-done)' : t.status === 'failed' ? 'var(--status-failed)' : t.status === 'in_progress' ? 'var(--accent)' : 'var(--muted)';
+      const desc = (t.description || '').length > 80 ? t.description.slice(0, 80) + '…' : t.description;
+      return `<div style="display:flex;gap:6px;align-items:baseline;padding:1px 0">
+        <span style="color:${color};font-size:10px;flex-shrink:0">${icon}</span>
+        <span style="color:var(--text);font-size:10px;word-break:break-word">${escapeHtml(desc || '')}</span>
+      </div>`;
+    }).join('');
+    el.innerHTML = `
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
+        <span style="font-size:9px;letter-spacing:.08em;text-transform:uppercase;color:var(--accent);font-weight:600;background:var(--accent)1a;border:1px solid var(--accent)44;border-radius:3px;padding:1px 5px">● LIVE</span>
+        <span style="font-size:11px;font-weight:600;color:var(--text);font-family:var(--font-mono)">${escapeHtml(sess.name || 'unnamed session')}</span>
+        ${sess.human_id ? `<span style="font-size:10px;color:var(--muted)">${escapeHtml(sess.human_id)}</span>` : ''}
+        ${elapsedStr ? `<span style="font-size:10px;color:var(--muted);margin-left:auto">${elapsedStr}</span>` : ''}
+      </div>
+      <div style="font-family:var(--font-mono)">
+        ${taskRows || '<div style="color:var(--muted);font-size:10px">no recent tasks</div>'}
+      </div>`;
+    el.style.display = 'block';
+  } catch(e) {
+    el.style.display = 'none';
+  }
+}
+
 async function loadQueue(projectId) {
   /**v1.4.0 — work queue panel. Loads all tasks and segments them into
    * pending / in_progress / done / failed buckets — a Minecraft-hopper view
@@ -4173,9 +4229,13 @@ function handleWsEvent(projectId, event) {
   renderTasks(projectId);
   // A goal change is often triggered by a HITL reply — re-pull.
   refreshGoal(projectId);
+  // v2.3 — refresh live feed on task events when queue tab is visible.
+  const panel = state.panels[projectId];
+  if (panel && panel.activeVtab === 'queue' && (event.type === 'task_created' || event.type === 'task_updated')) {
+    updateLiveFeed(projectId);
+  }
   // v1.6.x — keep the LIVE tab fresh when it's the visible panel.
   // v1.7.0 — throttle WS bursts via scheduleLiveRefresh (10s floor).
-  const panel = state.panels[projectId];
   if (panel && panel.activeVtab === 'live') {
     scheduleLiveRefresh(projectId);
   }
