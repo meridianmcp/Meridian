@@ -4061,6 +4061,43 @@ async function loadPinnedDecisions(projectId) {
     host.querySelectorAll('[data-supersede]').forEach(btn => {
       btn.onclick = () => supersedePinnedDecision(projectId, btn.dataset.supersede);
     });
+
+    // Superseded section — collapsible <details> below active cards
+    let supersededEl = document.getElementById(`superseded-decisions-${projectId}`);
+    if (!supersededEl) {
+      supersededEl = document.createElement('div');
+      supersededEl.id = `superseded-decisions-${projectId}`;
+      host.parentElement.insertBefore(supersededEl, host.nextSibling);
+    }
+    try {
+      const all = await api(`/projects/${projectId}/decisions-pinned?include_superseded=true`);
+      const superseded = (all || []).filter(d => d.status === 'superseded');
+      if (superseded.length > 0) {
+        supersededEl.innerHTML = `<details style="margin-top:8px;margin-bottom:6px">
+          <summary style="cursor:pointer;color:var(--muted);font-size:10px;font-family:var(--font-mono);letter-spacing:.05em;user-select:none">
+            Superseded (${superseded.length})
+          </summary>
+          <div style="margin-top:6px">
+            ${superseded.map(d => {
+              const cat = d.category || 'TECHNICAL';
+              const color = _DECISION_CATEGORY_COLORS[cat] || _DECISION_CATEGORY_COLORS.TECHNICAL;
+              const dateStr = (d.created_at || '').slice(0, 10);
+              return `<div style="background:var(--surface-1);border:1px solid var(--border);border-left:4px solid ${color}55;border-radius:4px;padding:8px 12px;margin-bottom:6px;opacity:0.6">
+                <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px">
+                  <span style="display:inline-block;background:${color}11;color:${color}88;font-size:9px;font-weight:700;padding:1px 5px;border-radius:3px">${escapeHtml(cat)}</span>
+                  <span style="color:var(--muted);font-weight:600;font-size:11px;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escapeHtml(d.title || '')}</span>
+                  <span style="color:var(--muted);font-size:9px;flex-shrink:0">${escapeHtml(dateStr)}</span>
+                  <span style="background:var(--surface-2);color:var(--muted);font-size:8px;font-weight:700;padding:1px 5px;border-radius:3px;letter-spacing:.04em;flex-shrink:0">SUPERSEDED</span>
+                </div>
+                <div style="color:var(--muted);font-size:11px;white-space:pre-wrap;word-break:break-word;line-height:1.5">${escapeHtml((d.body || '').slice(0, 200))}</div>
+              </div>`;
+            }).join('')}
+          </div>
+        </details>`;
+      } else {
+        supersededEl.innerHTML = '';
+      }
+    } catch (_) { /* non-fatal — superseded section is optional */ }
   } catch (e) {
     if (state.panels[projectId]) state.panels[projectId]._pinnedDecisions = [];
     renderConstitutionWarning(projectId);
