@@ -1,0 +1,27 @@
+{
+  "manifest_version": 3,
+  "name": "Meridian Checkpoint",
+  "version": "1.0.0",
+  "description": "Auto-checkpoint Meridian when you type 'checkpoint' in claude.ai or on a timer.",
+  "permissions": ["storage", "alarms"],
+  "host_permissions": ["https://claude.ai/*", "http://localhost:*/*", "https://*.usemeridian.us/*"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://claude.ai/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Meridian Checkpoint"
+  },
+  "icons": {
+    "16": "icon16.png",
+    "48": "icon48.png",
+    "128": "icon128.png"
+  }
+}

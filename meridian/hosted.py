@@ -869,7 +869,7 @@ async def create_stripe_checkout_session(tenant: dict, plan: str) -> str:
     params: dict = {
         "mode": "subscription",
         "payment_method_collection": "always",
-        "subscription_data": {"trial_period_days": 7},
+        "subscription_data": {},
         "line_items": line_items,
         "metadata": {"plan": plan, "tenant_id": tenant.get("id", "")},
         "success_url": f"{base}/auth/success",
@@ -1014,6 +1014,47 @@ async def send_welcome_email(
             },
         )
         resp.raise_for_status()
+
+
+async def send_waitlist_confirmation_email(email: str) -> None:
+    """Send a confirmation email to a new waitlist signup via Resend.
+
+    Silently skips if RESEND_API_KEY is not set (dev mode).
+    """
+    import httpx
+
+    api_key = _cfg("RESEND_API_KEY")
+    if not api_key:
+        return
+
+    from_addr = _cfg("MERIDIAN_FROM_EMAIL", "Meridian <noreply@usemeridian.us>")
+    base = _cfg("MERIDIAN_BASE_URL", "https://usemeridian.us").rstrip("/")
+
+    html_body = f"""<h2>You're on the Meridian waitlist</h2>
+<p>Thanks for signing up! We'll reach out when your hosted account is ready.</p>
+<p>While you wait:</p>
+<ul>
+  <li>Try the <a href="{base}/demo">live demo</a> — no account needed</li>
+  <li>Self-host Meridian in 2 commands: <code>git clone https://github.com/meridianmcp/Meridian && cd Meridian && pixi run start</code></li>
+  <li>Star us on <a href="https://github.com/meridianmcp/Meridian">GitHub</a></li>
+</ul>
+<p>Questions? Reply to this email or open a <a href="https://github.com/meridianmcp/Meridian/issues">GitHub issue</a>.</p>"""
+
+    async with httpx.AsyncClient(timeout=15) as http:
+        try:
+            resp = await http.post(
+                "https://api.resend.com/emails",
+                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                json={
+                    "from": from_addr,
+                    "to": [email],
+                    "subject": "You're on the Meridian waitlist",
+                    "html": html_body,
+                },
+            )
+            resp.raise_for_status()
+        except Exception:
+            pass  # never block the waitlist endpoint on email failure
 
 
 async def send_invite_email(

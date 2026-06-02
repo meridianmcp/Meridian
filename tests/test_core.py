@@ -5263,10 +5263,10 @@ async def test_pin_decision_inserts_row(db):
 
 
 @pytest.mark.asyncio
-async def test_pin_decision_rejects_invalid_category(db):
-    p = await db_module.create_project(db, "v24-pin-bad")
-    with pytest.raises(ValueError):
-        await db_module.pin_decision(db, p["id"], "t", "b", "INVALID_CATEGORY")
+async def test_pin_decision_accepts_custom_category(db):
+    p = await db_module.create_project(db, "v24-pin-custom-cat")
+    d = await db_module.pin_decision(db, p["id"], "t", "b", "CUSTOM_CATEGORY")
+    assert d["category"] == "CUSTOM_CATEGORY"
 
 
 @pytest.mark.asyncio
@@ -5352,6 +5352,63 @@ def test_decisions_pinned_archive_oldest_http(client):
     assert r.json()["archived"] == 2
     remaining = client.get(f"/projects/{project['id']}/decisions-pinned").json()
     assert [row["title"] for row in remaining] == ["newest"]
+
+
+def test_delete_pinned_decision_http(client):
+    """DELETE /projects/{pid}/decisions-pinned/{did} hard-deletes the row."""
+    project = client.post("/projects", json={"name": "v29-pin-del-http"}).json()
+    r = client.post(
+        f"/projects/{project['id']}/decisions-pinned",
+        json={"title": "to delete", "body": "temp", "category": "TECHNICAL"},
+    )
+    assert r.status_code == 201
+    did = r.json()["id"]
+    # Hard delete
+    r = client.delete(f"/projects/{project['id']}/decisions-pinned/{did}")
+    assert r.status_code == 204
+    # Gone from list
+    remaining = client.get(f"/projects/{project['id']}/decisions-pinned").json()
+    assert not any(d["id"] == did for d in remaining)
+    # 404 on second attempt
+    r = client.delete(f"/projects/{project['id']}/decisions-pinned/{did}")
+    assert r.status_code == 404
+
+
+def test_hooks_session_start_and_stop(client):
+    """POST /hooks/session-start returns hookSpecificOutput; /hooks/stop returns ok."""
+    project = client.post("/projects", json={"name": "v29-hooks-test"}).json()
+    r = client.post("/hooks/session-start", json={"project_id": project["id"]})
+    assert r.status_code == 200
+    body = r.json()
+    assert "hookSpecificOutput" in body
+    assert "additionalContext" in body["hookSpecificOutput"]
+    assert project["name"] in body["hookSpecificOutput"]["additionalContext"]
+    # Stop hook — uses session_id from start result
+    additional = body["hookSpecificOutput"]["additionalContext"]
+    session_id = None
+    for line in additional.splitlines():
+        if line.startswith("SESSION ID:"):
+            session_id = line.split(":", 1)[1].strip()
+            break
+    r = client.post("/hooks/stop", json={"project_id": project["id"], "session_id": session_id})
+    assert r.status_code == 200
+    assert r.json()["ok"] is True
+
+
+def test_hooks_session_start_missing_project_id(client):
+    r = client.post("/hooks/session-start", json={})
+    assert r.status_code == 400
+
+
+def test_pin_decision_custom_category_http(client):
+    """Custom free-text category is accepted."""
+    project = client.post("/projects", json={"name": "v29-custom-cat-http"}).json()
+    r = client.post(
+        f"/projects/{project['id']}/decisions-pinned",
+        json={"title": "my dec", "body": "body", "category": "MY_CUSTOM_CAT"},
+    )
+    assert r.status_code == 201
+    assert r.json()["category"] == "MY_CUSTOM_CAT"
 
 
 # ---------------------------------------------------------------------------
@@ -5741,3 +5798,139 @@ async def test_overage_check_reports_usage(monkeypatch):
     payload = captured.get("payload", {})
     assert payload.get("stripe_customer_id") == "cus_abc123"
     assert float(payload.get("value", 0)) == 2.5
+
+
+# ---------------------------------------------------------------------------
+# a0cc3503 — /demo DB integration test
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_demo_loads_correct_db(db):
+    """_seed_demo_data populates backend-api-v2 project with sessions and sprint items.
+
+    Uses the `db` fixture (in-memory SQLite) directly to avoid TestClient
+    lifespan async-timeout issues.  The seeding logic is the same code that
+    runs on the live /demo route — this test verifies it produces the expected
+    demo content that HN visitors see.
+    """
+    from meridian.server import _seed_demo_data
+
+    await _seed_demo_data(db)
+
+    # Projects — must contain backend-api-v2
+    projects = await db_module.list_projects(db)
+    project_names = [p["name"] for p in projects]
+    assert "backend-api-v2" in project_names, (
+        f"backend-api-v2 not found in seeded projects: {project_names}"
+    )
+
+    api_project = next(p for p in projects if p["name"] == "backend-api-v2")
+
+    # Sessions — at least 1
+    sessions = await db_module.get_sessions(db, api_project["id"])
+    assert len(sessions) >= 1, "Expected at least 1 session for backend-api-v2"
+
+    # Sprint items — at least 1
+    sprint_items = await db_module.get_sprint_items(db, api_project["id"])
+    assert len(sprint_items) >= 1, "Expected at least 1 sprint item for backend-api-v2"
+
+
+# ---------------------------------------------------------------------------
+# v2.6 — new MCP tools: list_hitl_requests, list_sessions, answer_hitl,
+#         dismiss_hitl, add_sprint_note, get_sprint_notes
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_list_hitl_requests_mcp_tool(db):
+    """list_hitl_requests returns pending queue without needing UUIDs."""
+    project = await db_module.create_project(db, "hitl-list-test")
+    pid = project["id"]
+    session = await db_module.register_session(db, pid, "s1")
+    sid = session["id"]
+
+    await db_module.request_hitl(db, pid, "question A", session_id=sid, urgency="blocking")
+    await db_module.request_hitl(db, pid, "question B", session_id=sid)
+
+    rows = await db_module.list_hitl_requests(db, pid, status="pending")
+    assert len(rows) == 2
+    assert rows[0]["urgency"] == "blocking"  # sorted by urgency first
+
+    rows_all = await db_module.list_hitl_requests(db, pid, status=None)
+    assert len(rows_all) == 2
+
+
+@pytest.mark.asyncio
+async def test_answer_hitl_and_dismiss_hitl(db):
+    """answer_hitl and dismiss_hitl mark requests correctly."""
+    project = await db_module.create_project(db, "hitl-answer-test")
+    pid = project["id"]
+    session = await db_module.register_session(db, pid, "s1")
+    sid = session["id"]
+
+    r1 = await db_module.request_hitl(db, pid, "answer me", session_id=sid)
+    r2 = await db_module.request_hitl(db, pid, "dismiss me", session_id=sid)
+
+    answered = await db_module.answer_hitl_request(db, r1["id"], "the answer", answered_by="adam")
+    assert answered["status"] == "answered"
+    assert answered["answer"] == "the answer"
+
+    dismissed = await db_module.dismiss_hitl_request(db, r2["id"])
+    assert dismissed["status"] == "dismissed"
+
+    pending = await db_module.list_hitl_requests(db, pid, status="pending")
+    assert len(pending) == 0
+
+
+@pytest.mark.asyncio
+async def test_add_and_get_sprint_notes(db):
+    """add_session_note / get_session_notes round-trip correctly."""
+    project = await db_module.create_project(db, "sprint-notes-test")
+    pid = project["id"]
+    session = await db_module.register_session(db, pid, "executor-1")
+    sid = session["id"]
+
+    n1 = await db_module.add_session_note(db, sid, "Don't touch hosted.py", "Neon pool at 7/8")
+    n2 = await db_module.add_session_note(db, sid, "Blocker", "Waiting on Adam HITL")
+
+    notes = await db_module.get_session_notes(db, sid)
+    assert len(notes) == 2
+    titles = {n["title"] for n in notes}
+    assert "Don't touch hosted.py" in titles
+    assert "Blocker" in titles
+
+    # Auto-delete on session close
+    await db_module.delete_session_notes(db, sid)
+    notes_after = await db_module.get_session_notes(db, sid)
+    assert len(notes_after) == 0
+
+
+@pytest.mark.asyncio
+async def test_list_sessions_db(db):
+    """get_sessions returns active sessions for a project."""
+    project = await db_module.create_project(db, "list-sessions-test")
+    pid = project["id"]
+
+    s1 = await db_module.register_session(db, pid, "session-alpha")
+    s2 = await db_module.register_session(db, pid, "session-beta")
+
+    active = await db_module.get_sessions(db, pid, active_only=True)
+    names = {s["name"] for s in active}
+    assert "session-alpha" in names
+    assert "session-beta" in names
+
+    await db_module.close_session(db, s1["id"])
+    still_active = await db_module.get_sessions(db, pid, active_only=True)
+    still_names = {s["name"] for s in still_active}
+    assert "session-alpha" not in still_names
+    assert "session-beta" in still_names
+
+
+def test_new_mcp_tools_in_tools_list():
+    """All 6 new MCP tools appear in _MCP_TOOLS_LIST."""
+    import meridian.server as server_module
+    tools = {t["name"] for t in server_module._MCP_TOOLS_LIST}
+    new_tools = {"list_hitl_requests", "answer_hitl", "dismiss_hitl", "list_sessions", "add_sprint_note", "get_sprint_notes"}
+    missing = new_tools - tools
+    assert not missing, f"Missing MCP tools: {missing}"

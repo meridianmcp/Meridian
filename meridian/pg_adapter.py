@@ -22,6 +22,40 @@ import re
 from typing import Any
 
 
+def _is_transient_pg_error(exc: Exception) -> bool:
+    """Return True for connection-level errors that are safe to retry once.
+
+    Catches Neon AdminShutdown (idle scale-to-zero) and generic broken-pipe /
+    closed-connection errors.  Import is deferred so the module stays importable
+    even without psycopg installed (SQLite-only mode).
+    """
+    msg = str(exc).lower()
+    transient_phrases = (
+        "adminshutdown",
+        "server closed the connection",
+        "connection is closed",
+        "ssl connection has been closed",
+        "broken pipe",
+        "connection reset",
+        "consuming input failed",
+    )
+    if any(p in msg for p in transient_phrases):
+        return True
+    try:
+        import psycopg.errors as _pe  # type: ignore[import]
+        if isinstance(exc, (_pe.AdminShutdown, _pe.ConnectionDoesNotExist)):
+            return True
+    except ImportError:
+        pass
+    try:
+        import psycopg  # type: ignore[import]
+        if isinstance(exc, psycopg.OperationalError):
+            return True
+    except ImportError:
+        pass
+    return False
+
+
 def _same_pg_host(url_a: str, url_b: str) -> bool:
     """Return True when two Postgres URLs point to the same host+port."""
     try:
@@ -269,15 +303,34 @@ class PostgresConnection:
         pg_sql, pg_params = _pg_adapt_sql(sql, params)
         q_upper = pg_sql.lstrip().upper()
 
-        async with self._pool.connection() as conn:
-            async with conn.cursor(row_factory=_dict_row_factory) as cur:
-                await cur.execute(pg_sql, pg_params if pg_params else None)
-                if q_upper.startswith(("SELECT", "WITH")):
-                    rows = await cur.fetchall()
-                    return _PgCursor(rows, len(rows))
-                else:
-                    rc = cur.rowcount if cur.rowcount is not None else 0
-                    return _PgCursor([], rc)
+        return await self._execute_with_retry(pg_sql, pg_params, q_upper)
+
+    async def _execute_with_retry(
+        self, pg_sql: str, pg_params: list, q_upper: str, _attempt: int = 0
+    ) -> _PgCursor:
+        """Execute pg_sql with a single retry on transient connection errors.
+
+        Neon scale-to-zero fires an AdminShutdown on idle connections.  The
+        pool's max_idle/max_lifetime settings minimise exposure, but if a
+        stale connection slips through we catch OperationalError here and
+        retry once with a fresh connection from the pool.
+        """
+        try:
+            async with self._pool.connection() as conn:
+                async with conn.cursor(row_factory=_dict_row_factory) as cur:
+                    await cur.execute(pg_sql, pg_params if pg_params else None)
+                    if q_upper.startswith(("SELECT", "WITH")):
+                        rows = await cur.fetchall()
+                        return _PgCursor(rows, len(rows))
+                    else:
+                        rc = cur.rowcount if cur.rowcount is not None else 0
+                        return _PgCursor([], rc)
+        except Exception as exc:  # noqa: BLE001
+            # Retry once on connection-level errors (AdminShutdown, broken pipe,
+            # closed connection) that indicate a stale pool connection.
+            if _attempt == 0 and _is_transient_pg_error(exc):
+                return await self._execute_with_retry(pg_sql, pg_params, q_upper, 1)
+            raise
 
     async def _table_info(self, table_name: str) -> _PgCursor:
         pg_query = """
@@ -427,6 +480,16 @@ CREATE INDEX IF NOT EXISTS idx_decisions_pinned_project ON decisions_pinned(proj
 CREATE INDEX IF NOT EXISTS idx_hitl_project ON hitl_requests(project_id, status);
 CREATE INDEX IF NOT EXISTS idx_hitl_assigned ON hitl_requests(assigned_to, status);
 CREATE INDEX IF NOT EXISTS idx_notes_project ON project_notes(project_id);
+
+-- v2.6 — session_notes: ephemeral per-session scratch pad.
+CREATE TABLE IF NOT EXISTS session_notes (
+    id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    title TEXT NOT NULL,
+    body TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT ({_TS})
+);
+CREATE INDEX IF NOT EXISTS idx_session_notes_session ON session_notes(session_id);
 """
 
 # Tables that go ONLY in the main auth DB (MERIDIAN_DB_URL).
@@ -441,6 +504,7 @@ CREATE TABLE IF NOT EXISTS waitlist (
 );
 
 -- v2.0 — hosted tier: tenants, web sessions, API bearer tokens
+-- v2.9 — free tier: trial_started_at + inactivity_expires_at
 CREATE TABLE IF NOT EXISTS tenants (
     id TEXT PRIMARY KEY,
     email TEXT NOT NULL UNIQUE,
@@ -451,8 +515,10 @@ CREATE TABLE IF NOT EXISTS tenants (
     neon_db_url TEXT,
     stripe_customer_id TEXT,
     stripe_metered_item_id TEXT,
-    plan TEXT NOT NULL DEFAULT 'standard',
+    plan TEXT NOT NULL DEFAULT 'free',
     pool_project_id TEXT,
+    trial_started_at TEXT,
+    inactivity_expires_at TEXT,
     created_at TEXT NOT NULL DEFAULT ({_TS})
 );
 
@@ -581,11 +647,24 @@ async def init_pg_db(url: str) -> PostgresConnection:
     # on first acquire(), which happens inside the running Uvicorn event loop
     # (after lifespan yield). This avoids ProactorEventLoop issues on Windows
     # where psycopg3 can't use the loop during startup.
+    #
+    # Neon scale-to-zero resilience:
+    #   min_size=0   — allow all connections to close when idle so Neon can
+    #                  hibernate without the pool keeping a connection alive.
+    #   max_idle=60  — proactively close connections idle >60 s before Neon's
+    #                  default 5-min idle-shutdown fires (avoids AdminShutdown
+    #                  on the first request after the server has been quiet).
+    #   max_lifetime=300 — recycle any connection older than 5 min; Neon may
+    #                  silently drop backends at its idle timeout boundary.
+    #   reconnect_timeout=30 — if a borrowed connection fails, the pool
+    #                  retries establishing a fresh one for up to 30 s.
     pool = AsyncConnectionPool(
         clean_url,
-        min_size=1,
+        min_size=0,
         max_size=10,
         open=False,
+        max_idle=60.0,
+        max_lifetime=240.0,  # recycle before Neon 300s idle timeout
         reconnect_timeout=30.0,
         kwargs={
             "autocommit": True,
@@ -620,6 +699,7 @@ async def init_pg_db(url: str) -> PostgresConnection:
         await _migrate_pg_v10_tenant_columns(conn)
         await _migrate_pg_v25_admins_table(conn)
         await _migrate_pg_v28_dunning_and_github_sub(conn)
+        await _migrate_pg_v29_free_tier_columns(conn)
     return conn
 
 
@@ -784,6 +864,18 @@ async def _migrate_pg_v28_dunning_and_github_sub(conn: PostgresConnection) -> No
         "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS storage_gb_used NUMERIC(10,4) DEFAULT 0;"
         "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS overage_reset_at TEXT;"
         "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS compute_throttled_at TEXT"
+    )
+
+
+async def _migrate_pg_v29_free_tier_columns(conn: PostgresConnection) -> None:
+    """v2.9 — free tier columns on tenants.
+
+    trial_started_at + inactivity_expires_at support the 30-day free tier.
+    ADD COLUMN IF NOT EXISTS is idempotent — safe to run on every startup.
+    """
+    await conn.executescript(
+        "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS trial_started_at TEXT;"
+        "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS inactivity_expires_at TEXT"
     )
 
 

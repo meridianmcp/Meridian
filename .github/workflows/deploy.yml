@@ -20,11 +20,11 @@ jobs:
           cache: false
       - run: pixi run test
 
-  # Every push to main deploys to the preview app (costs nothing idle).
+  # Every push to main AND manual dispatch deploys to the preview app.
   # Human verifies preview before promoting to production.
   deploy-preview:
     needs: test
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

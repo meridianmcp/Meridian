@@ -1,10 +1,32 @@
 # MCP Tool Reference
 
-Meridian exposes **19 tools** over MCP. They fall into two usage patterns:
+Meridian exposes **27 tools** over MCP. They fall into two usage patterns:
 
 **Planner sessions** (claude.ai, planning work) — `start_session` · `pin_decision` · `update_decision` · `add_note` · `get_context_block` · `generate_handoff`
 
 **Executor sessions** (Claude Code, Cursor, automated workers) — `start_session` · `log_task` · `request_hitl` · `get_session_brief` · `generate_handoff`
+
+---
+
+## Quick Reference — 5 tools you use 90% of the time
+
+| Tool | One-liner | Example call |
+
+|------|-----------|-------------|
+
+| `start_session` | Register session, get full project context | `start_session(project_id="abc-123", session_name="feature-x", human_id="alice")` |
+
+| `log_task` | Record completed work to the shared task log | `log_task(session_id="sid", project_id="abc-123", description="Wired OAuth redirect")` |
+
+| `checkpoint` | Snapshot progress: auto-capture + delta handoff + next /goal | `checkpoint(session_id="sid", project_id="abc-123")` |
+
+| `pin_decision` | Add an architectural decision to the live constitution | `pin_decision(project_id="abc-123", title="Use psycopg3", body="asyncpg has DLL issues on Windows", category="TECHNICAL")` |
+
+| `request_hitl` | Surface a blocking question to the human queue | `request_hitl(project_id="abc-123", question="Should we rate-limit per IP or per token?", urgency="blocking")` |
+
+
+> **Tip:** Use `checkpoint()` instead of `generate_handoff()` when ending a session — it also runs `auto_capture` and returns the next `/goal` string.
+
 
 ---
 

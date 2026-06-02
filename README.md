@@ -35,18 +35,23 @@ from a compressed handoff in seconds. No copy-paste, no re-explaining from scrat
 A local MCP server every AI session connects to. They share goal state, see each
 other's task log, and resume from a compressed handoff when context fills up.
 
-Hosted tier at **[usemeridian.us](https://usemeridian.us)** — $20/mo, 7-day free trial.
-Self-host the same product for free.
+**Two ways to run Meridian:**
+- **Self-host** — free forever, any team size. Clone and run in 2 commands.
+- **Hosted** at [usemeridian.us](https://usemeridian.us) — 30 days free (no card), then $20/mo Solo.
 
 ## Quickstart — binary (no Python required)
 
-Download the single-file binary for your platform, double-click (or run from terminal), and the dashboard opens at `http://localhost:7878`.
+Download the single-file binary for your platform, double-click (or run from terminal), and the dashboard opens automatically.
 
-| Platform | Download |
-|---|---|
-| Windows | [meridian.exe](https://github.com/meridianmcp/Meridian/releases/latest/download/meridian.exe) |
-| macOS (Apple Silicon) | [meridian-mac-arm64](https://github.com/meridianmcp/Meridian/releases/latest/download/meridian-mac-arm64) |
-| macOS (Intel) | [meridian-mac-x86](https://github.com/meridianmcp/Meridian/releases/latest/download/meridian-mac-x86) |
+> **Binary users skip `install.sh` entirely.** Just download, run, and wire hooks once with `hooks.sh` / `hooks.ps1`. No Python, no pixi, no git clone.
+
+| Platform | Download | Default port |
+|---|---|---|
+| Windows | [meridian.exe](https://github.com/meridianmcp/Meridian/releases/latest/download/meridian.exe) | 7700 |
+| macOS (Apple Silicon) | [meridian-mac-arm64](https://github.com/meridianmcp/Meridian/releases/latest/download/meridian-mac-arm64) | 7700 |
+| macOS (Intel) | [meridian-mac-x86](https://github.com/meridianmcp/Meridian/releases/latest/download/meridian-mac-x86) | 7700 |
+
+Data is stored in `~/.meridian/meridian.db`. Set `MERIDIAN_PORT` to change the port.
 
 ## Quickstart — from source
 
@@ -97,21 +102,40 @@ Add the same `mcpServers` block to:
 
 Restart Claude Desktop. New chats have Meridian tools.
 
+### claude.ai web (recommended for planning chat)
+
+Use [dnakov/claude-mcp](https://github.com/dnakov/claude-mcp) — included as a submodule — to bridge claude.ai to your local Meridian server:
+
+```bash
+git clone --recurse-submodules https://github.com/meridianmcp/Meridian
+```
+
+1. Open `chrome://extensions` and enable **Developer mode**
+2. Click **Load unpacked** and select `extensions/claude-mcp`
+3. Click the extension icon and set the URL to `http://localhost:7878/mcp`
+
+All 27 Meridian tools (`checkpoint`, `log_task`, `pin_decision`, etc.) are now available directly in claude.ai planning chat. No copy-pasting session output.
+
 ### Hosted tier (no install)
 
+Sign in at [usemeridian.us](https://usemeridian.us) → Settings → MCP client setup → Generate API key → Copy config.
+
+Or manually:
 ```json
 {
   "mcpServers": {
     "meridian": {
       "command": "npx",
       "args": ["-y", "mcp-remote", "https://usemeridian.us/mcp"],
-      "env": {"BEARER_TOKEN": "sk_meridian_..."}
+      "env": {"BEARER_TOKEN": "sk_meridian_YOUR_KEY_HERE"}
     }
   }
 }
 ```
 
-Get your bearer token at [usemeridian.us/dashboard](https://usemeridian.us/dashboard) after sign-in.
+**Claude Desktop** users can install [meridian-hosted.dxt](https://github.com/meridianmcp/Meridian/releases/latest/download/meridian-hosted.dxt) directly (one-click, no config needed).
+
+Get your API key at [usemeridian.us/settings](https://usemeridian.us/settings) after sign-in. Free tier: 30 days, no card, full features.
 
 ## What you get
 
@@ -145,6 +169,33 @@ No cloud required for local use.
 Point `MERIDIAN_DB_URL` at a shared Postgres (Neon free tier works great). Every
 teammate runs their own local Meridian against the same DB — instant shared
 sessions, no Meridian server in the cloud.
+
+## Auto-checkpoint with hooks
+
+One command wires Claude Code and Codex to Meridian. Every session start injects
+your project context automatically. Every session end snapshots completed work and
+writes a delta handoff.
+
+**Mac/Linux:**
+```bash
+curl -fsSL https://usemeridian.us/hooks.sh | bash
+```
+
+**Windows:**
+```powershell
+irm https://usemeridian.us/hooks.ps1 | iex
+```
+
+Prompts for your Meridian server URL (default `http://localhost:7878`) and your
+project ID. Writes to `~/.claude/settings.json` (Claude Code) or
+`~/.codex/config.toml` (Codex). After setup, every session automatically:
+
+1. **On start** — calls `POST /hooks/session-start` → injects goal, sprint items,
+   recent tasks, and pinned decisions into the session context via `additionalContext`.
+2. **On stop** — calls `POST /hooks/stop` → runs `auto_capture` and writes a delta
+   handoff so the next session resumes from where this one ended.
+
+No more manual `start_session()` calls. No lost work when context fills.
 
 ## Hosted tier
 

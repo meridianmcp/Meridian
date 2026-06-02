@@ -1,0 +1,30 @@
+{
+  "dxt_version": "0.1",
+  "name": "Meridian (Local)",
+  "version": "1.0.0",
+  "description": "Meridian coordination layer for AI sessions — self-hosted. Requires Meridian running locally at http://localhost:7878.",
+  "author": "Meridian",
+  "homepage": "https://usemeridian.us",
+  "repository": "https://github.com/meridianmcp/Meridian",
+  "server": {
+    "type": "stdio",
+    "command": "pixi",
+    "args": ["run", "python", "-m", "meridian", "--mcp"],
+    "cwd": "${MERIDIAN_REPO_PATH}"
+  },
+  "user_config": {
+    "MERIDIAN_REPO_PATH": {
+      "type": "string",
+      "title": "Meridian Repository Path",
+      "description": "Absolute path to your cloned Meridian repository (e.g. /Users/you/Meridian or C:\\Users\\you\\Meridian).",
+      "required": true
+    }
+  },
+  "tools": [
+    { "name": "start_session", "description": "Start a coordinated Meridian session." },
+    { "name": "log_task", "description": "Log what you just completed or are working on." },
+    { "name": "request_hitl", "description": "Surface a question to the human-in-the-loop queue." },
+    { "name": "generate_handoff", "description": "Generate a context handoff for the next session." },
+    { "name": "checkpoint", "description": "Save progress mid-session." }
+  ]
+}

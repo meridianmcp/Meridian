@@ -114,6 +114,23 @@ def _publish_task(event_type: str, task: dict[str, Any]) -> None:
         except asyncio.QueueFull:
             pass
 
+
+def _publish_project_event(project_id: str, event_type: str, payload: dict[str, Any]) -> None:
+    """Fan-out a project-scoped event (not necessarily task-shaped) to WS subscribers.
+
+    Used for sprint item status changes, goal updates, and session start events
+    so the dashboard refreshes in real-time without polling.
+    """
+    listeners = _TASK_LISTENERS.get(project_id)
+    if not listeners:
+        return
+    event = {"type": event_type, "project_id": project_id, **payload}
+    for q in list(listeners):
+        try:
+            q.put_nowait(event)
+        except asyncio.QueueFull:
+            pass
+
 CREATE_TABLES = """
 CREATE TABLE IF NOT EXISTS projects (
     id TEXT PRIMARY KEY,
@@ -208,8 +225,7 @@ CREATE TABLE IF NOT EXISTS decisions_pinned (
     project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
     title TEXT NOT NULL,
     body TEXT NOT NULL,
-    category TEXT NOT NULL DEFAULT 'TECHNICAL'
-        CHECK (category IN ('STRATEGIC','COMPETITIVE','TECHNICAL','TACTICAL','BUSINESS','PRODUCT','ARCHITECTURAL')),
+    category TEXT NOT NULL DEFAULT 'TECHNICAL',
     status TEXT NOT NULL DEFAULT 'active'
         CHECK (status IN ('active','superseded')),
     superseded_by TEXT REFERENCES decisions_pinned(id),
@@ -275,6 +291,7 @@ CREATE INDEX IF NOT EXISTS idx_sprint_items_version
 
 -- v2.0 — hosted tier: tenants, web sessions, API bearer tokens
 -- v2.2 — plan updated to standard/pro (was free/pro/team)
+-- v2.9 — free tier re-introduced as default plan for new signups
 CREATE TABLE IF NOT EXISTS tenants (
     id TEXT PRIMARY KEY,
     email TEXT NOT NULL UNIQUE,
@@ -285,10 +302,11 @@ CREATE TABLE IF NOT EXISTS tenants (
     neon_db_url TEXT,
     stripe_customer_id TEXT,
     stripe_metered_item_id TEXT,
-    plan TEXT NOT NULL DEFAULT 'standard'
-        CHECK (plan IN ('standard','pro')),
+    plan TEXT NOT NULL DEFAULT 'free',
     pool_project_id TEXT,
     notification_prefs TEXT NOT NULL DEFAULT '{}',
+    trial_started_at TEXT,
+    inactivity_expires_at TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -351,6 +369,16 @@ CREATE TABLE IF NOT EXISTS admins (
     added_by TEXT,
     added_at TEXT NOT NULL DEFAULT (datetime('now')),
     notes TEXT
+);
+
+-- v2.6 — session_notes: ephemeral per-session scratch pad.
+-- Auto-deleted when session closes. Exposed via add_sprint_note / get_sprint_notes MCP tools.
+CREATE TABLE IF NOT EXISTS session_notes (
+    id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    title TEXT NOT NULL,
+    body TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 """
 
@@ -692,8 +720,7 @@ async def _migrate_v24_pinned_decisions_and_hitl(db: aiosqlite.Connection) -> No
             project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
             title TEXT NOT NULL,
             body TEXT NOT NULL,
-            category TEXT NOT NULL DEFAULT 'TECHNICAL'
-                CHECK (category IN ('STRATEGIC','COMPETITIVE','TECHNICAL','TACTICAL','BUSINESS','PRODUCT','ARCHITECTURAL')),
+            category TEXT NOT NULL DEFAULT 'TECHNICAL',
             status TEXT NOT NULL DEFAULT 'active'
                 CHECK (status IN ('active','superseded')),
             superseded_by TEXT REFERENCES decisions_pinned(id),
@@ -837,6 +864,110 @@ async def _migrate_project_settings(db: aiosqlite.Connection) -> None:
         "max_pinned_decisions",
         "INTEGER NOT NULL DEFAULT 20",
     )
+
+
+async def _migrate_tenants_free_plan(db: aiosqlite.Connection) -> None:
+    """v2.9 — expand tenants.plan to allow 'free' and add trial/expiry columns.
+
+    The old plan CHECK constraint restricted values to 'standard'|'pro'.
+    SQLite can't ALTER a CHECK, so rebuild the table if constrained.
+    Also adds trial_started_at + inactivity_expires_at for the free tier.
+    """
+    async with db.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='tenants'"
+    ) as cur:
+        row = await cur.fetchone()
+    if row is None:
+        return
+    ddl = (row["sql"] if isinstance(row, dict) else row[0]) or ""
+    needs_rebuild = "CHECK (plan IN" in ddl
+    if needs_rebuild:
+        await db.execute("PRAGMA foreign_keys = OFF")
+        await db.executescript(
+            """
+            CREATE TABLE tenants_new (
+                id TEXT PRIMARY KEY,
+                email TEXT NOT NULL UNIQUE,
+                google_sub TEXT UNIQUE,
+                github_sub TEXT UNIQUE,
+                microsoft_sub TEXT UNIQUE,
+                neon_project_id TEXT,
+                neon_db_url TEXT,
+                stripe_customer_id TEXT,
+                stripe_metered_item_id TEXT,
+                plan TEXT NOT NULL DEFAULT 'free',
+                pool_project_id TEXT,
+                notification_prefs TEXT NOT NULL DEFAULT '{}',
+                trial_started_at TEXT,
+                inactivity_expires_at TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            INSERT INTO tenants_new (
+                id, email, google_sub, github_sub, microsoft_sub,
+                neon_project_id, neon_db_url, stripe_customer_id,
+                stripe_metered_item_id, plan, pool_project_id,
+                notification_prefs, created_at
+            )
+            SELECT
+                id, email, google_sub, github_sub, microsoft_sub,
+                neon_project_id, neon_db_url, stripe_customer_id,
+                stripe_metered_item_id, plan, pool_project_id,
+                COALESCE(notification_prefs, '{}'), created_at
+            FROM tenants;
+            DROP TABLE tenants;
+            ALTER TABLE tenants_new RENAME TO tenants;
+            """
+        )
+        await db.execute("PRAGMA foreign_keys = ON")
+        await db.commit()
+    # Idempotently add new columns (safe even after rebuild)
+    await _migrate_add_column_if_missing(db, "tenants", "trial_started_at", "TEXT")
+    await _migrate_add_column_if_missing(db, "tenants", "inactivity_expires_at", "TEXT")
+
+
+async def _migrate_decisions_free_category(db: aiosqlite.Connection) -> None:
+    """v2.9 — drop the hard category CHECK constraint on decisions_pinned.
+
+    Category is now free-text (any string); the old enum was too rigid.
+    SQLite can't DROP a CHECK constraint, so rebuild the table in place.
+    No-op when the constraint is already absent.
+    """
+    async with db.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='decisions_pinned'"
+    ) as cur:
+        row = await cur.fetchone()
+    if row is None:
+        return
+    ddl = (row["sql"] if isinstance(row, dict) else row[0]) or ""
+    if "CHECK (category IN" not in ddl:
+        return  # already migrated or freshly created without constraint
+    await db.execute("PRAGMA foreign_keys = OFF")
+    await db.executescript(
+        """
+        CREATE TABLE decisions_pinned_new (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+            title TEXT NOT NULL,
+            body TEXT NOT NULL,
+            category TEXT NOT NULL DEFAULT 'TECHNICAL',
+            status TEXT NOT NULL DEFAULT 'active'
+                CHECK (status IN ('active','superseded')),
+            superseded_by TEXT REFERENCES decisions_pinned_new(id),
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        INSERT INTO decisions_pinned_new
+            SELECT id, project_id, title, body, category, status,
+                   superseded_by, created_at, updated_at
+            FROM decisions_pinned;
+        DROP TABLE decisions_pinned;
+        ALTER TABLE decisions_pinned_new RENAME TO decisions_pinned;
+        CREATE INDEX IF NOT EXISTS idx_decisions_pinned_project
+            ON decisions_pinned(project_id, status);
+        """
+    )
+    await db.execute("PRAGMA foreign_keys = ON")
+    await db.commit()
 
 
 async def _migrate_sessions_archived(db: aiosqlite.Connection) -> None:
@@ -1048,6 +1179,20 @@ async def _migrate_hosted_tables(db: aiosqlite.Connection) -> None:
     await db.commit()
 
 
+async def _migrate_session_notes(db: aiosqlite.Connection) -> None:
+    """v2.6 — create session_notes table if not present. Idempotent."""
+    await db.execute(
+        """CREATE TABLE IF NOT EXISTS session_notes (
+            id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+            title TEXT NOT NULL,
+            body TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )"""
+    )
+    await db.commit()
+
+
 async def init_hosted_tables(db: aiosqlite.Connection) -> None:
     """Ensure hosted-tier tables exist on the given connection.
 
@@ -1074,7 +1219,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     The caller owns the returned connection and is responsible for closing it.
     """
     if db_path.startswith(("postgresql://", "postgres://")):
-        from .pg_adapter import init_pg_db  # local import keeps SQLite path fast
+        from ..pg_adapter import init_pg_db  # local import keeps SQLite path fast
 
         return await init_pg_db(db_path)  # type: ignore[return-value]
 
@@ -1113,6 +1258,9 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_overage_fields(db)
     await _migrate_sprint_item_dependencies(db)
     await _migrate_v26_client_type(db)
+    await _migrate_decisions_free_category(db)
+    await _migrate_tenants_free_plan(db)
+    await _migrate_session_notes(db)
     return db
 
 
@@ -1592,6 +1740,8 @@ async def set_goal(
         await db.commit()
     goal = await get_goal(db, project_id)
     assert goal is not None
+    # Broadcast to dashboard WebSocket subscribers so the goal panel refreshes live.
+    _publish_project_event(project_id, "goal_updated", {"version": goal.get("version")})
     return goal
 
 
@@ -1671,6 +1821,10 @@ async def register_session(
         row = await cur.fetchone()
     session = _row_to_dict(row)
     assert session is not None
+    # Broadcast to dashboard WebSocket subscribers so the session list refreshes live.
+    _publish_project_event(project_id, "session_started", {
+        "session_id": sid, "session_name": name, "human_id": human_id,
+    })
     return session
 
 
@@ -2675,7 +2829,10 @@ async def _update_sprint_item_status(
     await db.commit()
     if cursor.rowcount == 0:
         return None
-    return await get_sprint_item(db, item_id)
+    result = await get_sprint_item(db, item_id)
+    # Broadcast to dashboard WebSocket subscribers so the sprint board refreshes live.
+    _publish_project_event(project_id, "sprint_item_updated", {"item_id": item_id, "status": status})
+    return result
 
 
 async def complete_sprint_item(
@@ -3790,10 +3947,14 @@ async def upsert_tenant(
         if updates:
             await db.commit()
         return tenant
+    from datetime import datetime, timezone, timedelta
     tid = _new_id()
+    now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    expires_str = (datetime.now(timezone.utc) + timedelta(days=30)).strftime("%Y-%m-%d %H:%M:%S")
     await db.execute(
-        "INSERT INTO tenants (id, email, google_sub, github_sub, microsoft_sub) VALUES (?, ?, ?, ?, ?)",
-        (tid, email, google_sub, github_sub, microsoft_sub),
+        "INSERT INTO tenants (id, email, google_sub, github_sub, microsoft_sub, "
+        "plan, trial_started_at, inactivity_expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (tid, email, google_sub, github_sub, microsoft_sub, "free", now_str, expires_str),
     )
     await db.commit()
     async with db.execute("SELECT * FROM tenants WHERE id = ?", (tid,)) as cur:
@@ -3824,6 +3985,7 @@ async def update_tenant(
         "compute_overage_cap_usd", "storage_overage_cap_usd",
         "compute_cu_hours_used", "storage_gb_used",
         "overage_reset_at", "compute_throttled_at",
+        "trial_started_at", "inactivity_expires_at",
     }
     updates = {k: v for k, v in fields.items() if k in allowed}
     if not updates:
@@ -4006,7 +4168,7 @@ async def get_pool_project_counts(
 # v2.4 — Pinned decisions (editable constitution alongside the append-only log)
 # ---------------------------------------------------------------------------
 
-_VALID_DECISION_CATEGORIES = {
+_SUGGESTED_DECISION_CATEGORIES = {
     "STRATEGIC", "COMPETITIVE", "TECHNICAL", "TACTICAL",
     "BUSINESS", "PRODUCT", "ARCHITECTURAL",
 }
@@ -4025,11 +4187,10 @@ async def pin_decision(
     log. Use this for the "current truth" set that supersedes earlier
     statements (pricing tiers, driver choices, etc). The log captures
     micro-decisions; this captures the constitution.
+
+    category is free-text; suggested values: STRATEGIC, COMPETITIVE, TECHNICAL,
+    TACTICAL, BUSINESS, PRODUCT, ARCHITECTURAL.
     """
-    if category not in _VALID_DECISION_CATEGORIES:
-        raise ValueError(
-            f"category must be one of {sorted(_VALID_DECISION_CATEGORIES)}; got {category!r}"
-        )
     did = _new_id()
     await db.execute(
         "INSERT INTO decisions_pinned (id, project_id, title, body, category) "
@@ -4102,10 +4263,6 @@ async def update_pinned_decision(
     if title is not None:
         fields["title"] = title
     if category is not None:
-        if category not in _VALID_DECISION_CATEGORIES:
-            raise ValueError(
-                f"category must be one of {sorted(_VALID_DECISION_CATEGORIES)}"
-            )
         fields["category"] = category
     if status is not None:
         if status not in ("active", "superseded"):
@@ -4162,6 +4319,17 @@ async def count_decisions(db: aiosqlite.Connection, project_id: str) -> int:
     ) as cur:
         row = await cur.fetchone()
     return (row[0] if row else 0) or 0
+
+
+async def delete_pinned_decision(
+    db: aiosqlite.Connection, decision_id: str
+) -> bool:
+    """Hard-delete a pinned decision by id. Returns True if deleted, False if not found."""
+    cur = await db.execute(
+        "DELETE FROM decisions_pinned WHERE id = ?", (decision_id,)
+    )
+    await db.commit()
+    return cur.rowcount > 0
 
 
 # ---------------------------------------------------------------------------
@@ -4845,3 +5013,54 @@ async def delete_tenant_records(
     ]:
         await db.execute(stmt, params)
     await db.commit()
+
+
+# ---------------------------------------------------------------------------
+# v2.6 — Session-scoped ephemeral notes (sprint scratch pad)
+# ---------------------------------------------------------------------------
+
+
+async def add_session_note(
+    db: aiosqlite.Connection,
+    session_id: str,
+    title: str,
+    body: str,
+) -> dict[str, Any]:
+    """Add an ephemeral note scoped to a session. Auto-deleted on session close."""
+    nid = _new_id()
+    await db.execute(
+        "INSERT INTO session_notes (id, session_id, title, body) VALUES (?, ?, ?, ?)",
+        (nid, session_id, title, body),
+    )
+    await db.commit()
+    async with db.execute(
+        "SELECT * FROM session_notes WHERE id = ?", (nid,)
+    ) as cur:
+        row = await cur.fetchone()
+    return _row_to_dict(row)  # type: ignore[return-value]
+
+
+async def get_session_notes(
+    db: aiosqlite.Connection,
+    session_id: str,
+) -> list[dict[str, Any]]:
+    """Return all notes for a session, newest first."""
+    async with db.execute(
+        "SELECT * FROM session_notes WHERE session_id = ? ORDER BY created_at DESC",
+        (session_id,),
+    ) as cur:
+        rows = await cur.fetchall()
+    return [_row_to_dict(r) for r in rows if r is not None]  # type: ignore[misc]
+
+
+async def delete_session_notes(
+    db: aiosqlite.Connection,
+    session_id: str,
+) -> int:
+    """Delete all notes for a session. Called on session close."""
+    async with db.execute(
+        "DELETE FROM session_notes WHERE session_id = ?", (session_id,)
+    ) as cur:
+        count = cur.rowcount if cur.rowcount is not None else 0
+    await db.commit()
+    return count

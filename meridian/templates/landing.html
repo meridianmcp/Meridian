@@ -412,9 +412,10 @@
   <h1>Your AI sessions finally <span class="accent">remember each other</span></h1>
   <p class="lede">Persistent memory, task coordination, and a human-in-the-loop queue for every Claude / Cursor / Windsurf session. Open source. Local-first. MCP-native.</p>
   <div class="cta-row">
-    <a href="/auth/login" class="btn btn-primary">start free trial →</a>
+    <a href="/auth/login" class="btn btn-primary">start free — no card →</a>
     <a href="/demo" class="btn btn-secondary">live demo</a>
   </div>
+  <p style="font-size:12px;color:var(--muted,#8b9cba);margin-top:8px;margin-bottom:0">Free tier: 1 project · 30 days · no credit card required · self-host for free, forever</p>
 
   <div class="terminal">
     <div class="terminal-head">
@@ -507,6 +508,51 @@
         <h4>Works with every client</h4>
         <p>Claude Code, Codex CLI, Claude Desktop, Cursor, Windsurf, LangGraph webhook — any MCP client, any OS.</p>
       </div>
+    </div>
+  </div>
+</section>
+
+<section id="hooks">
+  <h2>One command. Auto-checkpoint every session.</h2>
+  <p class="section-lede">Wire Claude Code and Codex to Meridian in 30 seconds. SessionStart injects your project context automatically. Stop fires a delta checkpoint before the session closes. Zero manual calls.</p>
+  <div class="features-grid" style="grid-template-columns:1fr 1fr;gap:1.5rem;margin-bottom:1.5rem">
+    <div class="feature-item" style="flex-direction:column;align-items:flex-start">
+      <div style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.08em;margin-bottom:8px">Mac / Linux</div>
+      <pre style="background:var(--surface-1);border:1px solid var(--border);border-radius:6px;padding:14px 16px;font-size:13px;color:var(--text);font-family:'IBM Plex Mono',monospace;margin:0;width:100%;overflow:auto"><span style="color:var(--muted)"># one-liner install</span>
+curl -fsSL https://usemeridian.us/hooks.sh | bash</pre>
+    </div>
+    <div class="feature-item" style="flex-direction:column;align-items:flex-start">
+      <div style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.08em;margin-bottom:8px">Windows PowerShell</div>
+      <pre style="background:var(--surface-1);border:1px solid var(--border);border-radius:6px;padding:14px 16px;font-size:13px;color:var(--text);font-family:'IBM Plex Mono',monospace;margin:0;width:100%;overflow:auto"><span style="color:var(--muted)"># one-liner install</span>
+irm https://usemeridian.us/hooks.ps1 | iex</pre>
+    </div>
+  </div>
+  <div style="display:flex;gap:2rem;flex-wrap:wrap;margin-top:1rem">
+    <div style="flex:1;min-width:200px">
+      <div style="font-weight:600;margin-bottom:4px">SessionStart hook</div>
+      <p style="font-size:13px;color:var(--muted)">Injects your project state (goal, sprint, recent tasks, pinned decisions) into every new Claude Code / Codex session automatically.</p>
+    </div>
+    <div style="flex:1;min-width:200px">
+      <div style="font-weight:600;margin-bottom:4px">Stop hook</div>
+      <p style="font-size:13px;color:var(--muted)">Before the session closes: buckets completed tasks into an auto-capture note and writes a delta handoff so the next session can resume in seconds.</p>
+    </div>
+  </div>
+</section>
+
+<section id="planning-chat">
+  <h2>Use Meridian from claude.ai</h2>
+  <p class="section-lede">Get all 19 Meridian tools directly in your claude.ai planning chat — no copy-pasting session output.</p>
+  <div class="self-host" style="max-width:860px">
+    <p class="lede">Install the <a href="https://github.com/dnakov/claude-mcp" target="_blank">claude-mcp</a> browser extension (included as a submodule):</p>
+    <pre><span class="h"># Clone with submodules</span>
+<span class="c">$</span> git clone --recurse-submodules https://github.com/meridianmcp/Meridian
+
+<span class="h"># Chrome: Extensions → Developer mode → Load unpacked → extensions/claude-mcp</span>
+<span class="h"># Set URL to http://localhost:7878/mcp in the extension popup</span>
+<span class="h"># All 19 Meridian tools now available in claude.ai planning chat</span></pre>
+    <div class="self-host-row">
+      <a href="https://github.com/dnakov/claude-mcp" class="btn btn-secondary" target="_blank">↗ dnakov/claude-mcp</a>
+      <a href="https://docs.usemeridian.us" class="btn btn-secondary">Docs</a>
     </div>
   </div>
 </section>

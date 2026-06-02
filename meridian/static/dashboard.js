@@ -116,6 +116,68 @@ async function loadServerConfig() {
     // v1.9.x — update connection indicator
     _updateConnectionIndicator(cfg);
   } catch (e) { /* offline / older server — ignore */ }
+  // v2.9 — plan badge + expiry banner for hosted users
+  try {
+    const me = await api('/me');
+    if (me && me.plan) {
+      state.tenantPlan = me.plan;
+      _renderPlanBadge(me);
+    }
+  } catch (e) { /* not hosted or not logged in */ }
+}
+
+function _renderPlanBadge(me) {
+  const planColors = { free: '#6b7280', trial: '#059669', standard: '#2563eb', pro: '#7c3aed' };
+  const planLabels = { free: 'Free', trial: 'Trial', standard: 'Solo', pro: 'Pro' };
+  const plan = me.plan || 'free';
+  // Plan badge near version string
+  const verEl = document.getElementById('server-version');
+  if (verEl && !document.getElementById('plan-badge')) {
+    const badge = document.createElement('span');
+    badge.id = 'plan-badge';
+    badge.title = `${planLabels[plan] || plan} plan`;
+    badge.style = `margin-left:6px;padding:2px 7px;border-radius:10px;font-size:10px;font-weight:700;letter-spacing:0.04em;background:${planColors[plan] || '#6b7280'}22;color:${planColors[plan] || '#6b7280'};border:1px solid ${planColors[plan] || '#6b7280'}44;vertical-align:middle;text-transform:uppercase`;
+    badge.textContent = planLabels[plan] || plan;
+    verEl.parentNode.insertBefore(badge, verEl.nextSibling);
+  }
+  // Expiry warning banner at ≤25 days remaining
+  const days = me.days_remaining;
+  const isExpiring = (plan === 'free' || plan === 'trial') && days !== null && days !== undefined && days <= 25;
+  if (isExpiring && !document.getElementById('expiry-banner')) {
+    const b = document.createElement('div');
+    b.id = 'expiry-banner';
+    const urgent = days <= 5;
+    const label = plan === 'trial' ? 'Trial' : 'Free tier';
+    const upgradeMsg = plan === 'trial' ? 'Add a card to keep your data →' : 'Upgrade →';
+    b.style = `position:fixed;top:0;left:0;right:0;z-index:9998;background:${urgent ? '#dc2626' : '#d97706'};color:#fff;text-align:center;padding:5px 12px;font-size:12px;font-family:inherit;letter-spacing:0.02em`;
+    b.innerHTML = `${label} expires in <strong>${days} day${days !== 1 ? 's' : ''}</strong>. <a href="/pricing" style="color:#fff;text-decoration:underline">${upgradeMsg}</a>`;
+    document.body.prepend(b);
+    document.body.style.paddingTop = ((parseInt(document.body.style.paddingTop || '0', 10)) + 28) + 'px';
+  }
+  if (me.expired && !document.getElementById('expired-banner')) {
+    const b = document.createElement('div');
+    b.id = 'expired-banner';
+    const expLabel = plan === 'trial' ? 'Trial expired' : 'Free tier expired';
+    b.style = 'position:fixed;top:0;left:0;right:0;z-index:9998;background:#dc2626;color:#fff;text-align:center;padding:5px 12px;font-size:12px;font-family:inherit;letter-spacing:0.02em';
+    b.innerHTML = `${expLabel}. <a href="/pricing" style="color:#fff;text-decoration:underline">Upgrade to continue →</a>`;
+    document.body.prepend(b);
+    document.body.style.paddingTop = ((parseInt(document.body.style.paddingTop || '0', 10)) + 28) + 'px';
+  }
+  // b75c1649 — sign out link in sidebar footer (hosted/authenticated users only)
+  if (!document.getElementById('signout-link')) {
+    const footer = document.querySelector('.sidebar-footer');
+    if (footer) {
+      const link = document.createElement('a');
+      link.id = 'signout-link';
+      link.href = '/auth/logout';
+      link.textContent = 'sign out';
+      link.title = me.email ? `Signed in as ${me.email}` : 'Sign out';
+      link.style = 'display:block;margin-top:8px;font-size:10px;color:var(--muted);font-family:var(--font-mono);text-align:center;text-decoration:none;opacity:0.7';
+      link.onmouseenter = () => { link.style.opacity = '1'; link.style.color = 'var(--text)'; };
+      link.onmouseleave = () => { link.style.opacity = '0.7'; link.style.color = 'var(--muted)'; };
+      footer.appendChild(link);
+    }
+  }
 }
 
 // v1.9.x — show active DB connection in sidebar footer
@@ -632,14 +694,15 @@ function buildTabBody(project) {
     <div class="vtab-strip" id="vtab-strip-${project.id}">
       <button class="vtab-btn active" data-vtab="status" title="Status &amp; Sessions">≡</button>
       <button class="vtab-btn" data-vtab="live" title="Live — right-now view">⚡</button>
-      <button class="vtab-btn" data-vtab="goal" title="Goal State">◎</button>
-      <button class="vtab-btn" data-vtab="files" title="Files">⊞</button>
-      <button class="vtab-btn" data-vtab="devlog" title="Dev Log">≋</button>
-      <button class="vtab-btn" data-vtab="timeline" title="Activity Timeline">⌬</button>
+      <button class="vtab-btn" data-vtab="goal" title="Goal State">🎯</button>
+      <button class="vtab-btn" data-vtab="files" title="Files">📁</button>
+      <button class="vtab-btn" data-vtab="devlog" title="Dev Log">📓</button>
+      <button class="vtab-btn" data-vtab="timeline" title="Activity Timeline">📅</button>
       <button class="vtab-btn" data-vtab="rewind" title="Rewind — Last X days">↻</button>
-      <button class="vtab-btn" data-vtab="queue" title="Work Queue">⚙</button>
+      <button class="vtab-btn" data-vtab="queue" title="Work Queue">🪖</button>
       <button class="vtab-btn" data-vtab="team" title="Team — per-human activity">👥</button>
       <button class="vtab-btn" data-vtab="notes" title="Notes — per-project wiki">📝</button>
+      <button class="vtab-btn" data-vtab="hitl" title="HITL — Human-in-the-Loop queue">❓</button>
       <button class="vtab-btn" data-vtab="docs" title="MCP Tool Reference">📖</button>
       <button class="vtab-btn" data-vtab="settings" title="Notification Settings">🔔</button>
     </div>
@@ -698,7 +761,7 @@ function buildTabBody(project) {
         </div>
         <div class="goal-subtab-strip">
           <button class="goal-subtab-btn active" data-gtab="north-star" title="Permanent product vision. Rarely changes — set once, then keep stable.">🔭 North Star</button>
-          <button class="goal-subtab-btn" data-gtab="version-goal" title="Current milestone — what ships this cycle (v1.2, v2.0, etc).">◎ Version Goal</button>
+          <button class="goal-subtab-btn" data-gtab="version-goal" title="Current milestone — what ships this cycle (v1.2, v2.0, etc).">🎯 Version Goal</button>
           <button class="goal-subtab-btn" data-gtab="sprint" title="What this session is focused on right now — updated multiple times per day. Not a multi-week scrum sprint.">⚡ Session Focus</button>
           <button class="goal-subtab-btn" data-gtab="decisions" title="Pinned constitution + append-only decisions log.">📋 Decisions</button>
         </div>
@@ -848,6 +911,23 @@ function buildTabBody(project) {
           </div>
         </div>
       </div>
+      <div class="drawer-panel" id="drawer-hitl-${project.id}">
+        <div class="drawer-header" style="justify-content:space-between">
+          <span>HITL QUEUE · ${escapeHtml(project.name)}</span>
+          <div style="display:flex;gap:6px;align-items:center">
+            <select id="hitl-status-filter-${project.id}" style="background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:2px 6px">
+              <option value="pending">pending</option>
+              <option value="all">all</option>
+              <option value="answered">answered</option>
+              <option value="dismissed">dismissed</option>
+            </select>
+            <button class="secondary" id="hitl-refresh-${project.id}" style="padding:2px 8px;font-size:10px">refresh</button>
+          </div>
+        </div>
+        <div style="flex:1;overflow-y:auto;padding:14px;font-family:'IBM Plex Mono',monospace;font-size:12px" id="hitl-body-${project.id}">
+          <div class="empty" style="color:var(--muted)">loading HITL queue…</div>
+        </div>
+      </div>
       <div class="drawer-panel" id="drawer-docs-${project.id}">
         <div class="drawer-header">
           <span>MCP TOOL REFERENCE</span>
@@ -888,6 +968,16 @@ function buildTabBody(project) {
         <span class="server-version-pill" id="server-version"></span>
       </div>
       <div class="claude-launch-body">
+        <div class="claude-section" data-section="start">
+          <div class="claude-section-label">Start a new session</div>
+          <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
+            <button class="primary claude-section-btn" id="copy-start-code-${project.id}" title="Copies start_session() command for Claude Code">Claude Code ⬡</button>
+            <button class="secondary claude-section-btn" id="copy-start-chat-${project.id}" title="Copies context for claude.ai planning chat">Planning Chat ✦</button>
+            <button class="secondary claude-section-btn" id="btn-setup-hooks-${project.id}" title="Auto-wire SessionStart + Stop hooks for your AI tools" style="font-size:10px">⚡ Setup Hooks</button>
+          </div>
+          <p class="claude-hint">Claude Code: pastes <code>start_session()</code> command. Planning chat: pastes handoff context. Hooks: opens setup instructions.</p>
+        </div>
+        <hr class="claude-divider">
         <div class="claude-section" data-section="continue">
           <div class="claude-section-label">Resume Claude Code session (<code>start_session</code> + <code>get_context_block</code>)</div>
           <select class="claude-session-select" id="continue-session-${project.id}">
@@ -970,6 +1060,7 @@ function buildTabBody(project) {
         if (vtab === 'live') loadLiveTab(project.id);
         if (vtab === 'team') loadTeamTab(project.id);
         if (vtab === 'notes') loadNotesTab(project.id);
+        if (vtab === 'hitl') loadHitlTab(project.id);
         if (vtab === 'docs') loadDocsTab(project.id);
         if (vtab === 'settings') loadSettingsTab(project.id);
       };
@@ -1750,6 +1841,40 @@ function showCopyPreview(title, content) {
 function wireClaudeLaunchPanel(projectId) {
   const PROJECT_QUOTE = projectId.replace(/"/g, '\\"');
 
+  // Section 0 — "Start a Session" copy buttons + Auto-setup hooks
+  const copyStartCodeBtn = document.getElementById(`copy-start-code-${projectId}`);
+  if (copyStartCodeBtn) copyStartCodeBtn.onclick = () => {
+    const cmd = `start_session(project_id="${PROJECT_QUOTE}", session_name="describe-what-youre-doing", human_id="adam")`;
+    showCopyPreview('Start Claude Code Session', cmd);
+  };
+
+  const copyStartChatBtn = document.getElementById(`copy-start-chat-${projectId}`);
+  if (copyStartChatBtn) copyStartChatBtn.onclick = async () => {
+    const orig = copyStartChatBtn.textContent;
+    copyStartChatBtn.disabled = true;
+    copyStartChatBtn.textContent = 'Loading…';
+    try {
+      const r = await fetch(`/projects/${projectId}/handoff`, { method: 'POST' });
+      if (!r.ok) throw new Error(`${r.status}`);
+      const payload = await r.json();
+      const text = payload.content || '';
+      showCopyPreview('Planning Chat Handoff — paste into claude.ai', text);
+    } catch(e) { toast('handoff failed: ' + e.message, true); }
+    finally { copyStartChatBtn.disabled = false; copyStartChatBtn.textContent = orig; }
+  };
+
+  const setupHooksBtn = document.getElementById(`btn-setup-hooks-${projectId}`);
+  if (setupHooksBtn) setupHooksBtn.onclick = () => {
+    const baseUrl = window.location.origin;
+    const instructions = `Auto-setup Meridian hooks for your AI tools:\n\n` +
+      `macOS / Linux / WSL:\n  curl -fsSL ${baseUrl}/hooks.sh | bash\n\n` +
+      `Windows PowerShell:\n  irm ${baseUrl}/hooks.ps1 | iex\n\n` +
+      `These scripts detect Claude Code and Codex, then wire SessionStart + Stop\n` +
+      `hooks pointing to ${baseUrl}/hooks/ with your project_id.\n\n` +
+      `Project ID: ${projectId}`;
+    showCopyPreview('⚡ Setup Hooks', instructions);
+  };
+
   // Section 1 — Copy resume command
   const copyResumeBtn = document.getElementById(`copy-resume-${projectId}`);
   if (copyResumeBtn) copyResumeBtn.onclick = async () => {
@@ -2103,17 +2228,12 @@ async function loadSettingsTab(projectId) {
 
       function buildConfig() {
         if (!currentToken) return null;
-        const cli = clients.find(c => c.id === activeClient) || clients[0];
         return JSON.stringify({
           mcpServers: {
             meridian: {
               command: 'npx',
-              args: ['-y', 'meridian-mcp@latest'],
-              env: {
-                MERIDIAN_API_KEY: currentToken,
-                MERIDIAN_PROJECT_ID: currentPid,
-                MERIDIAN_BASE_URL: baseUrl,
-              },
+              args: ['-y', 'mcp-remote', `${baseUrl}/mcp`],
+              env: { BEARER_TOKEN: currentToken },
             },
           },
         }, null, 2);
@@ -2127,36 +2247,28 @@ async function loadSettingsTab(projectId) {
           copyBtn.disabled = false;
           fileNote.textContent = `Save to: ${cli.file}`;
         } else if (state.serverConfig?.demo_mode) {
-          const demoKey = 'mk_demo_' + 'x'.repeat(16);
+          const demoKey = 'sk_meridian_demo_' + 'x'.repeat(24);
           const demoCfg = JSON.stringify({
             mcpServers: {
               meridian: {
                 command: 'npx',
-                args: ['-y', 'meridian-mcp@latest'],
-                env: {
-                  MERIDIAN_API_KEY: demoKey,
-                  MERIDIAN_PROJECT_ID: currentPid || 'your-project-id',
-                  MERIDIAN_BASE_URL: baseUrl,
-                },
+                args: ['-y', 'mcp-remote', `${baseUrl}/mcp`],
+                env: { BEARER_TOKEN: demoKey },
               },
             },
           }, null, 2);
           configBlock.textContent = demoCfg;
           copyBtn.disabled = false;
-          fileNote.textContent = `Demo key — sign up at usemeridian.us for a real one`;
+          fileNote.textContent = `Demo key — sign up at ${baseUrl} for a real one`;
         } else {
           // Show placeholder config so the structure is immediately visible
-          const placeholderKey = 'mk_live_' + 'x'.repeat(32);
+          const placeholderKey = 'sk_meridian_' + 'x'.repeat(32);
           const placeholderCfg = JSON.stringify({
             mcpServers: {
               meridian: {
                 command: 'npx',
-                args: ['-y', 'meridian-mcp@latest'],
-                env: {
-                  MERIDIAN_API_KEY: placeholderKey,
-                  MERIDIAN_PROJECT_ID: currentPid || 'your-project-id',
-                  MERIDIAN_BASE_URL: baseUrl,
-                },
+                args: ['-y', 'mcp-remote', `${baseUrl}/mcp`],
+                env: { BEARER_TOKEN: placeholderKey },
               },
             },
           }, null, 2);
@@ -2626,6 +2738,92 @@ async function loadNotesTab(projectId) {
     } catch (e) { toast('add failed: ' + e.message, true); }
   };
 
+  render();
+}
+
+async function loadHitlTab(projectId) {
+  const body = document.getElementById(`hitl-body-${projectId}`);
+  const statusFilter = document.getElementById(`hitl-status-filter-${projectId}`);
+  const refreshBtn = document.getElementById(`hitl-refresh-${projectId}`);
+  if (!body) return;
+
+  const urgencyColor = { blocking: 'var(--red,#e05252)', high: 'var(--yellow,#d4a017)', normal: 'var(--muted)' };
+  const statusBadge = { pending: '#f59e0b', answered: '#22c55e', dismissed: 'var(--muted)' };
+
+  const render = async () => {
+    body.innerHTML = `<div class="empty" style="color:var(--muted)">loading…</div>`;
+    const status = (statusFilter && statusFilter.value) || 'pending';
+    const qs = status === 'all' ? '?status=all' : `?status=${status}`;
+    try {
+      const rows = await api(`/projects/${projectId}/hitl${qs}&limit=50`);
+      if (!rows || rows.length === 0) {
+        body.innerHTML = `<div style="color:var(--muted);padding:12px;text-align:center;border:1px dashed var(--border);border-radius:4px">
+          ${status === 'pending' ? 'No pending HITL requests — queue is clear ✓' : 'No items found'}
+        </div>`;
+        return;
+      }
+      const pending = rows.filter(r => r.status === 'pending');
+      const resolved = rows.filter(r => r.status !== 'pending');
+      const renderCard = (r) => {
+        const urg = r.urgency || 'normal';
+        const st = r.status || 'pending';
+        const dt = (r.created_at || '').slice(0, 16).replace('T', ' ');
+        const answerHtml = r.answer ? `<div style="margin-top:8px;padding:6px 8px;background:var(--surface-1);border-radius:3px;border-left:3px solid #22c55e;color:var(--text);font-size:11px"><b>Answer:</b> ${escapeHtml(r.answer)}</div>` : '';
+        const ctxHtml = r.context ? `<div style="margin-top:6px;color:var(--muted);font-size:11px;font-style:italic">${escapeHtml(r.context.slice(0, 200))}</div>` : '';
+        const actionBtns = st === 'pending' ? `
+          <div style="display:flex;gap:6px;margin-top:8px;align-items:center">
+            <input type="text" placeholder="Answer…" id="hitl-ans-${r.id}" style="flex:1;background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:11px;font-family:var(--font-mono);padding:4px 8px;outline:none">
+            <button class="primary hitl-answer-btn" data-hitl-id="${escapeHtml(r.id)}" style="padding:3px 10px;font-size:10px">Answer</button>
+            <button class="secondary hitl-dismiss-btn" data-hitl-id="${escapeHtml(r.id)}" style="padding:3px 10px;font-size:10px">Dismiss</button>
+          </div>` : '';
+        return `<div style="background:var(--surface-2);border:1px solid var(--border);border-left:3px solid ${urgencyColor[urg] || 'var(--accent)'};border-radius:0 4px 4px 0;padding:10px 12px;margin-bottom:8px">
+          <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px;margin-bottom:4px">
+            <div style="font-weight:600;font-size:12px;color:var(--text)">${escapeHtml(r.question || '')}</div>
+            <div style="display:flex;gap:4px;flex-shrink:0">
+              <span style="font-size:9px;font-weight:600;background:${urgencyColor[urg] || 'var(--accent)'}22;color:${urgencyColor[urg] || 'var(--accent)'};padding:1px 6px;border-radius:3px">${escapeHtml(urg)}</span>
+              <span style="font-size:9px;font-weight:600;background:${statusBadge[st] || 'var(--muted)'}22;color:${statusBadge[st] || 'var(--muted)'};padding:1px 6px;border-radius:3px">${escapeHtml(st)}</span>
+            </div>
+          </div>
+          <div style="color:var(--muted);font-size:10px">${escapeHtml(dt)}${r.assigned_to ? ' · @' + escapeHtml(r.assigned_to) : ''}</div>
+          ${ctxHtml}${answerHtml}${actionBtns}
+        </div>`;
+      };
+      let html = pending.map(renderCard).join('');
+      if (resolved.length > 0) {
+        html += `<div style="color:var(--muted);font-size:10px;margin:12px 0 6px;border-top:1px solid var(--border);padding-top:8px">RESOLVED (${resolved.length})</div>`;
+        html += resolved.map(renderCard).join('');
+      }
+      body.innerHTML = html;
+      body.querySelectorAll('.hitl-answer-btn').forEach(btn => {
+        btn.onclick = async () => {
+          const id = btn.dataset.hitlId;
+          const inp = document.getElementById(`hitl-ans-${id}`);
+          const answer = (inp && inp.value || '').trim();
+          if (!answer) { toast('answer required', true); return; }
+          try {
+            await api(`/hitl/${id}`, { method: 'PATCH', body: JSON.stringify({ action: 'answer', answer }) });
+            toast('answered ✓');
+            render();
+          } catch (e) { toast('failed: ' + e.message, true); }
+        };
+      });
+      body.querySelectorAll('.hitl-dismiss-btn').forEach(btn => {
+        btn.onclick = async () => {
+          if (!confirm('Dismiss this HITL request?')) return;
+          try {
+            await api(`/hitl/${btn.dataset.hitlId}`, { method: 'PATCH', body: JSON.stringify({ action: 'dismiss' }) });
+            toast('dismissed');
+            render();
+          } catch (e) { toast('failed: ' + e.message, true); }
+        };
+      });
+    } catch (e) {
+      body.innerHTML = `<div style="color:var(--muted)">failed to load HITL queue: ${escapeHtml(String(e))}</div>`;
+    }
+  };
+
+  if (statusFilter) statusFilter.onchange = render;
+  if (refreshBtn) refreshBtn.onclick = render;
   render();
 }
 
@@ -3885,6 +4083,22 @@ function handleWsEvent(projectId, event) {
     if (proj) { proj.name = event.name; loadProjects(); }
     return;
   }
+  // v2.6 — sprint item / goal / session events broadcast live from server
+  if (event.type === 'sprint_item_updated') {
+    const panel = state.panels[projectId];
+    if (panel && panel.activeVtab === 'queue') loadQueue(projectId);
+    scheduleLiveRefresh(projectId);
+    return;
+  }
+  if (event.type === 'goal_updated') {
+    refreshGoal(projectId);
+    return;
+  }
+  if (event.type === 'session_started') {
+    scheduleLiveRefresh(projectId);
+    return;
+  }
+
   const cache = state.panels[projectId].taskCache;
   if (event.type === 'task_created') {
     cache.unshift(event.task);
@@ -4055,7 +4269,8 @@ async function restoreTabs() {
   await loadProjects();
   if (isDemoMode()) hideDemoAdminControls();
   // v0.6.6 — EZ first-run wizard: if no projects exist, show the overlay
-  if (state.projects.length === 0) {
+  // Skip in demo mode — demo DB always has projects seeded.
+  if (state.projects.length === 0 && !isDemoMode()) {
     document.getElementById('ez-wizard').style.display = 'flex';
     return; // don't restore tabs until wizard completes
   }

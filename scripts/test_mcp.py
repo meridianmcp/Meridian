@@ -9,7 +9,7 @@ sequence. Prints PASS/FAIL per tool and exits non-zero if any tool fails.
 
 The MCP server uses whatever DB path ``MERIDIAN_DB`` points at. Set it to
 a throwaway file if you don't want the test to mingle with your real
-state — the script does so by default.
+state -- the script does so by default.
 """
 
 from __future__ import annotations
@@ -49,7 +49,7 @@ async def _run() -> int:
     def _record(label: str, ok: bool, detail: str = "") -> None:
         nonlocal failures
         status = "PASS" if ok else "FAIL"
-        print(f"  [{status}] {label}{(' — ' + detail) if detail else ''}")
+        print(f"  [{status}] {label}{(' -- ' + detail) if detail else ''}")
         if not ok:
             failures += 1
 
