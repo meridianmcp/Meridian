@@ -4767,6 +4767,16 @@ def build_mcp_server():
                 os.environ.get("MERIDIAN_DATA_DIR", str(DEFAULT_DATA_DIR))
             )
             data_dir.mkdir(parents=True, exist_ok=True)
+            # v1.9.x — read meridian.toml connection profiles (same logic as lifespan).
+            # Without this the MCP server always falls back to local SQLite even when
+            # the toml says use Postgres.
+            _db_override = os.environ.get("MERIDIAN_DB", DEFAULT_DB_PATH)
+            if _db_override != ":memory:":
+                _toml_url, _toml_conn_name = toml_config_module.get_toml_db_url()
+                if _toml_url:
+                    os.environ["MERIDIAN_DB_URL"] = _toml_url
+                elif _toml_conn_name is not None:
+                    os.environ.pop("MERIDIAN_DB_URL", None)
             db_url = os.environ.get("MERIDIAN_DB_URL")
             if db_url:
                 state["db"] = await db_module.init_db(db_url)
