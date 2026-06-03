@@ -96,12 +96,15 @@ def _callback_url() -> str:
     return f"{base}/auth/callback"
 
 
-async def get_google_auth_url() -> str:
+async def get_google_auth_url(next_url: str = "") -> str:
     """Return the Google OAuth authorization URL to redirect the user to."""
+    import base64 as _b64
     client = _oauth_client()
+    state_val = _b64.urlsafe_b64encode(next_url.encode()).decode() if next_url else ""
     url, _state = client.create_authorization_url(
         "https://accounts.google.com/o/oauth2/v2/auth",
         access_type="online",
+        state=state_val or None,
     )
     return url
 
@@ -402,19 +405,22 @@ async def auth_login(request: Request):
     return HTMLResponse(_build_login_page())
 
 
-async def _post_login_redirect(tenant: dict, db=None) -> str:
+async def _post_login_redirect(tenant: dict, db=None, next_url: str = "") -> str:
     """v0.9 — paywall check shared by Google / GitHub / magic-link auth.
 
     Returns the target URL for the post-login redirect:
     * ``/waitlist-pending`` for non-admin users (pre-launch gate).
       Auto-adds the email to the waitlist table on first visit.
+    * ``next_url`` if provided and safe (e.g. /oauth/authorize?... from MCP connector flow).
     * ``MERIDIAN_AFTER_LOGIN_URL`` (default ``/dashboard``) for admins.
 
     Keeps the auth callbacks symmetric — every login flow lands here so
     adding a new provider (magic link, Microsoft, SSO) inherits paywall.
     """
-    # Admin bypass — always go straight to dashboard
+    # Admin bypass — respect next_url if present and safe, else dashboard
     if is_admin((tenant or {}).get("email", "")):
+        if next_url and next_url.startswith("/") and not next_url.startswith("//"):
+            return next_url
         return _cfg("MERIDIAN_AFTER_LOGIN_URL", "/dashboard")
 
     # Pre-launch: non-admin users are held at waitlist-pending.
@@ -463,7 +469,18 @@ async def auth_callback(request: Request) -> RedirectResponse:
     session = await db_module.create_user_session(db, tenant["id"], expires_at)
     cookie_value = _make_session_cookie(session["id"])
 
-    redirect_to = await _post_login_redirect(tenant, db)
+    import base64 as _b64
+    _raw_state = request.query_params.get("state", "")
+    _next_url = ""
+    if _raw_state:
+        try:
+            _next_url = _b64.urlsafe_b64decode(_raw_state + "==").decode()
+        except Exception:
+            _next_url = ""
+    # Safety: only allow local paths
+    if not (_next_url.startswith("/") and not _next_url.startswith("//")):
+        _next_url = ""
+    redirect_to = await _post_login_redirect(tenant, db, next_url=_next_url)
     response = RedirectResponse(redirect_to, status_code=302)
     response.set_cookie(
         _SESSION_COOKIE,
@@ -479,8 +496,9 @@ async def auth_callback(request: Request) -> RedirectResponse:
 
 async def auth_google_login(request: Request) -> RedirectResponse:
     """Redirect the browser directly to Google's OAuth consent page."""
+    next_url = request.query_params.get("next", "")
     try:
-        url = await get_google_auth_url()
+        url = await get_google_auth_url(next_url=next_url)
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     return RedirectResponse(url, status_code=302)
