@@ -74,6 +74,11 @@ from fastapi.templating import Jinja2Templates
 
 from . import dashboard as dashboard_module
 from . import db as db_module
+from .executor_config import (
+    build_executor_config_block,
+    executor_config_for_output,
+    normalize_executor_config,
+)
 from . import goal_md as goal_md_module
 from . import enqueue as enqueue_module
 from . import handoff as handoff_module
@@ -987,7 +992,8 @@ async def pricing_page(request: Request) -> HTMLResponse:
     """Pricing page — Free / Solo / Team tiers with waitlist forms when hosted launch is pending."""
     solo_link = os.environ.get("STRIPE_PAYMENT_LINK", "/auth/login?signup=1")
     team_link = os.environ.get("STRIPE_PRO_PAYMENT_LINK", "/auth/login?signup=1")
-    waitlist_mode = not bool(os.environ.get("STRIPE_PAYMENT_LINK"))
+    launch_open = bool(os.environ.get("MERIDIAN_LAUNCH_OPEN"))
+    waitlist_mode = not launch_open and not bool(os.environ.get("STRIPE_PAYMENT_LINK"))
     email = ""
     try:
         from .hosted import _SESSION_COOKIE, _read_session_cookie
@@ -1312,10 +1318,16 @@ async def patch_project_settings(
     project_id: str, body: ProjectSettingsPatch, request: Request
 ) -> dict[str, Any]:
     """Update persisted per-project dashboard settings."""
+    executor_config_dict = (
+        normalize_executor_config(body.executor_config.model_dump(exclude_none=True))
+        if body.executor_config is not None
+        else None
+    )
     settings = await db_module.update_project_settings(
         await _db(request),
         project_id,
         max_pinned_decisions=body.max_pinned_decisions,
+        executor_config=executor_config_dict,
     )
     if settings is None:
         raise HTTPException(status_code=404, detail="project not found")
@@ -2027,7 +2039,7 @@ async def dashboard_html(request: Request) -> Any:
             is_admin = await is_admin_db(tenant.get("email", ""), request.app.state.db)
         except HTTPException:
             is_admin = False
-    return _templates.TemplateResponse(
+    response = _templates.TemplateResponse(
         request,
         "dashboard.html",
         {
@@ -2038,6 +2050,10 @@ async def dashboard_html(request: Request) -> Any:
             "is_admin": is_admin,
         },
     )
+    # Always clear the demo context cookie so /demo → /dashboard doesn't
+    # leave the user stuck in read-only demo mode.
+    response.delete_cookie(_DEMO_CONTEXT_COOKIE)
+    return response
 
 
 @app.get("/setup", response_class=HTMLResponse)
@@ -3404,6 +3420,47 @@ async def _expire_and_generate_handoffs(
 # ---------------------------------------------------------------------------
 
 
+async def _load_executor_session_context(
+    db: aiosqlite.Connection,
+    project_id: str,
+) -> tuple[dict[str, Any], str]:
+    """Return normalized executor config plus the injected context block."""
+    settings = await db_module.get_project_settings(db, project_id)
+    raw_config = (settings or {}).get("executor_config") if settings else None
+    return executor_config_for_output(raw_config), build_executor_config_block(raw_config)
+
+
+async def _idle_until_session_done(
+    db: aiosqlite.Connection,
+    session_id: str,
+    *,
+    poll_seconds: int = 30,
+) -> dict[str, Any]:
+    """Poll every 30 seconds until the target session is closed/archived."""
+    while True:
+        async with db.execute(
+            "SELECT id, status, project_id, name, human_id, last_seen "
+            "FROM sessions WHERE id = ?",
+            (session_id,),
+        ) as cur:
+            row = await cur.fetchone()
+        if row is None:
+            return {"session_id": session_id, "done": True, "status": "missing"}
+        session = row if isinstance(row, dict) else {k: row[k] for k in row.keys()}
+        status_val = session.get("status") or "missing"
+        if status_val in {"closed", "archived"}:
+            return {
+                "session_id": session_id,
+                "done": True,
+                "status": status_val,
+                "project_id": session.get("project_id"),
+                "name": session.get("name"),
+                "human_id": session.get("human_id"),
+                "last_seen": session.get("last_seen"),
+            }
+        await asyncio.sleep(max(1, poll_seconds))
+
+
 async def _start_session_composite(
     db: aiosqlite.Connection,
     project_id: str,
@@ -3411,6 +3468,7 @@ async def _start_session_composite(
     data_dir: str,
     human_id: str | None = None,
     client_type: str | None = None,
+    role: str | None = None,
 ) -> dict[str, Any]:
     """Register + goal + tasks + sessions + handoff-check in one shot.
 
@@ -3421,6 +3479,10 @@ async def _start_session_composite(
     # v1.8.x — archive sessions silent for 7+ days so they don't crowd
     # the active list seen by new sessions.
     await db_module.archive_stale_sessions(db, project_id)
+    try:
+        await db_module.expire_file_locks(db)
+    except Exception:
+        pass
 
     session = await db_module.register_session(
         db, project_id, session_name, human_id=human_id, client_type=client_type
@@ -3508,7 +3570,20 @@ async def _start_session_composite(
     # v2.3 — every cold session reads the coordination protocol on entry.
     meridian_instructions = _load_meridian_md()
 
-    return {
+    # v3.1 — executor sessions get their project-level config injected so they
+    # can use repo_path, test_cmd, etc. without manual lookup.
+    executor_config: dict[str, Any] | None = None
+    executor_context: str | None = None
+    if role == "executor":
+        try:
+            executor_config, executor_context = await _load_executor_session_context(
+                db, project_id
+            )
+        except Exception:
+            executor_config = executor_config_for_output({})
+            executor_context = build_executor_config_block({})
+
+    payload: dict[str, Any] = {
         "session_id": session["id"],
         "goal": goal,
         "goal_xml": goal_xml,  # v0.6.1 — always present
@@ -3522,6 +3597,11 @@ async def _start_session_composite(
         "files": list(_EDITABLE_FILES),
         "meridian_instructions": meridian_instructions,  # v2.3
     }
+    if executor_config is not None:
+        payload["executor_config"] = executor_config
+        payload["executor_context"] = executor_context
+        payload["role"] = "executor"
+    return payload
 
 
 @app.post("/projects/{project_id}/start-session")
@@ -3544,6 +3624,7 @@ async def start_session_endpoint(
         _data_dir(request),
         human_id=body.human_id,
         client_type=body.client,
+        role=body.role,
     )
 
 
@@ -4763,6 +4844,30 @@ async def _dispatch_mcp_tool(name: str, args: dict[str, Any], db: Any, data_dir:
             "task_count": run["task_count"],
             "transcript": run["transcript"],
         }
+    if name == "set_executor_config":
+        cfg_fields = {
+            k: args[k]
+            for k in ("repo_path", "env_file", "test_cmd", "test_min",
+                      "deploy_cmd", "shell_type", "branch")
+            if k in args
+        }
+        return await db_module.set_executor_config(db, args["project_id"], cfg_fields)
+    if name == "claim_file":
+        return await db_module.claim_file(db, args["file_path"], args["session_id"])
+    if name == "release_file":
+        released = await db_module.release_file(db, args["file_path"], args["session_id"])
+        return {"released": released, "file_path": args["file_path"]}
+    if name == "idle_until_session_done":
+        watching = args["watching_session_id"]
+        async with db.execute(
+            "SELECT status FROM sessions WHERE id = ?", (watching,)
+        ) as _cur:
+            _row = await _cur.fetchone()
+        if _row is None:
+            return {"done": True, "status": "not_found", "suggested_wait_seconds": 0}
+        _status = (_row["status"] if isinstance(_row, dict) else _row[0]) or "active"
+        _done = _status in ("closed", "archived")
+        return {"done": _done, "status": _status, "suggested_wait_seconds": 0 if _done else 30}
     if name == "search_all":
         return await db_module.search_all(
             db, args["project_id"], args["query"],
@@ -5435,6 +5540,77 @@ def build_mcp_server():
                         "sprint": {"type": "string"},
                     },
                     "required": ["project_id", "sprint"],
+                },
+            ),
+            Tool(
+                name="set_executor_config",
+                description=(
+                    "Store per-project executor defaults (repo_path, test_cmd, "
+                    "deploy_cmd, etc.) so executor sessions auto-load them via "
+                    "start_session(role='executor'). Set once; all executors "
+                    "inherit automatically."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "project_id": {"type": "string"},
+                        "repo_path": {"type": "string", "description": "Absolute path to the repo root."},
+                        "env_file": {"type": "string", "description": "Path to .env file for the executor."},
+                        "test_cmd": {"type": "string", "description": "Command to run the test suite."},
+                        "test_min": {"type": "integer", "description": "Minimum passing test count."},
+                        "deploy_cmd": {"type": "string", "description": "Command to deploy (e.g. git push)."},
+                        "shell_type": {"type": "string", "description": "Shell to use: bash, powershell, cmd."},
+                        "branch": {"type": "string", "description": "Default working branch."},
+                    },
+                    "required": ["project_id"],
+                },
+            ),
+            Tool(
+                name="claim_file",
+                description=(
+                    "Claim exclusive edit rights on a file path for this session. "
+                    "Returns {claimed: true} on success or {claimed: false, holder_session_id} "
+                    "when another session holds the lock. Locks auto-expire after 2 hours. "
+                    "Always release_file() when done editing."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "session_id": {"type": "string"},
+                        "file_path": {"type": "string", "description": "Repo-relative or absolute file path."},
+                    },
+                    "required": ["session_id", "file_path"],
+                },
+            ),
+            Tool(
+                name="release_file",
+                description=(
+                    "Release a file lock held by this session. "
+                    "Silently succeeds if the lock was already released or expired."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "session_id": {"type": "string"},
+                        "file_path": {"type": "string"},
+                    },
+                    "required": ["session_id", "file_path"],
+                },
+            ),
+            Tool(
+                name="idle_until_session_done",
+                description=(
+                    "Check whether a specific session has finished. "
+                    "Use when you need to wait for another session to complete before editing "
+                    "a shared file. Returns {done: true/false, status, suggested_wait_seconds}. "
+                    "Poll with the suggested delay until done=true."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "watching_session_id": {"type": "string", "description": "The session ID to watch."},
+                    },
+                    "required": ["watching_session_id"],
                 },
             ),
             Tool(
@@ -6298,6 +6474,51 @@ def build_mcp_server():
                     )
                 except ValueError as exc:
                     result = {"error": str(exc)}
+            elif name == "set_executor_config":
+                cfg_fields = {
+                    k: arguments[k]
+                    for k in ("repo_path", "env_file", "test_cmd", "test_min",
+                              "deploy_cmd", "shell_type", "branch")
+                    if k in arguments
+                }
+                try:
+                    result = await db_module.set_executor_config(
+                        db, arguments["project_id"], cfg_fields
+                    )
+                except ValueError as exc:
+                    result = {"error": str(exc)}
+            elif name == "claim_file":
+                try:
+                    result = await db_module.claim_file(
+                        db,
+                        arguments["file_path"],
+                        arguments["session_id"],
+                    )
+                except ValueError as exc:
+                    result = {"error": str(exc)}
+            elif name == "release_file":
+                released = await db_module.release_file(
+                    db,
+                    arguments["file_path"],
+                    arguments["session_id"],
+                )
+                result = {"released": released, "file_path": arguments["file_path"]}
+            elif name == "idle_until_session_done":
+                watching = arguments["watching_session_id"]
+                async with db.execute(
+                    "SELECT status FROM sessions WHERE id = ?", (watching,)
+                ) as _cur:
+                    _row = await _cur.fetchone()
+                if _row is None:
+                    result = {"done": True, "status": "not_found", "suggested_wait_seconds": 0}
+                else:
+                    _status = (_row["status"] if isinstance(_row, dict) else _row[0]) or "active"
+                    _done = _status in ("closed", "archived")
+                    result = {
+                        "done": _done,
+                        "status": _status,
+                        "suggested_wait_seconds": 0 if _done else 30,
+                    }
             elif name == "log_task":
                 result = await db_module.log_task(
                     db,

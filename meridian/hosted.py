@@ -423,6 +423,13 @@ async def _post_login_redirect(tenant: dict, db=None, next_url: str = "") -> str
             return next_url
         return _cfg("MERIDIAN_AFTER_LOGIN_URL", "/dashboard")
 
+    # MERIDIAN_LAUNCH_OPEN=true: skip waitlist gate, send all users to dashboard.
+    # Free tier is auto-provisioned at OAuth signup (see auth_callback).
+    if _cfg("MERIDIAN_LAUNCH_OPEN"):
+        if next_url and next_url.startswith("/") and not next_url.startswith("//"):
+            return next_url
+        return _cfg("MERIDIAN_AFTER_LOGIN_URL", "/dashboard")
+
     # Pre-launch: non-admin users are held at waitlist-pending.
     # Auto-add to waitlist table so admins can see who signed up.
     if db is not None:

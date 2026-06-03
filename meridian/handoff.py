@@ -29,6 +29,7 @@ import aiosqlite
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 
 from . import db as db_module
+from .executor_config import build_executor_config_block, has_executor_config
 
 _TEMPLATE_DIR = Path(__file__).parent / "templates"
 _env = Environment(
@@ -639,12 +640,16 @@ async def _generate_starter_handoff(
     ]
     pending = _prepare_pending_sprint_items(pending)
     quick_start_goal = _build_quick_start_goal(pending)
+    settings = await db_module.get_project_settings(db, project_id)
+    executor_config = (settings or {}).get("executor_config") if settings else None
     content = _render_starter_handoff(
         project,
         completed_items=completed,
         pending_items=pending,
         quick_start_goal=quick_start_goal,
     )
+    if has_executor_config(executor_config):
+        content = f"{build_executor_config_block(executor_config)}\n\n{content}"
     out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / f"{_slugify(project['name'])}_starter.md"

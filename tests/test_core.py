@@ -49,19 +49,15 @@ async def test_get_project_by_name_and_list(db):
 async def test_get_and_update_project_settings(db):
     p = await db_module.create_project(db, "alpha")
     settings = await db_module.get_project_settings(db, p["id"])
-    assert settings == {
-        "project_id": p["id"],
-        "max_pinned_decisions": 20,
-    }
+    assert settings["project_id"] == p["id"]
+    assert settings["max_pinned_decisions"] == 20
     updated = await db_module.update_project_settings(
         db,
         p["id"],
         max_pinned_decisions=30,
     )
-    assert updated == {
-        "project_id": p["id"],
-        "max_pinned_decisions": 30,
-    }
+    assert updated["project_id"] == p["id"]
+    assert updated["max_pinned_decisions"] == 30
 
 
 @pytest.mark.asyncio
@@ -297,20 +293,18 @@ def test_project_settings_http_round_trip(client):
     project = client.post("/projects", json={"name": "alpha-settings"}).json()
     r = client.get(f"/projects/{project['id']}/settings")
     assert r.status_code == 200
-    assert r.json() == {
-        "project_id": project["id"],
-        "max_pinned_decisions": 20,
-    }
+    data = r.json()
+    assert data["project_id"] == project["id"]
+    assert data["max_pinned_decisions"] == 20
 
     r = client.patch(
         f"/projects/{project['id']}/settings",
         json={"max_pinned_decisions": 30},
     )
     assert r.status_code == 200
-    assert r.json() == {
-        "project_id": project["id"],
-        "max_pinned_decisions": 30,
-    }
+    data = r.json()
+    assert data["project_id"] == project["id"]
+    assert data["max_pinned_decisions"] == 30
 
 
 def test_goal_round_trip_and_versioning(client):
@@ -5297,6 +5291,19 @@ def test_dashboard_no_demo_banner(client):
     assert r.status_code == 200
     assert "demo-banner" not in r.text
     assert "MERIDIAN_DEMO_MODE = false" in r.text
+
+
+def test_dashboard_clears_demo_cookie(client):
+    """GET /dashboard must expire the demo context cookie to prevent bleed-through."""
+    # Simulate a browser that visited /demo first
+    r = client.get("/dashboard", cookies={"meridian_demo": "1"})
+    assert r.status_code == 200
+    # Must render as real dashboard, not demo mode
+    assert "MERIDIAN_DEMO_MODE = false" in r.text
+    # Response must include a Set-Cookie that expires the demo cookie (max-age=0)
+    set_cookie = r.headers.get("set-cookie", "")
+    assert "meridian_demo" in set_cookie
+    assert "max-age=0" in set_cookie.lower()
 
 
 def test_terms_page_returns_200(client):
