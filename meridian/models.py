@@ -124,6 +124,18 @@ class Project(BaseModel):
     created_at: str
 
 
+class ExecutorConfig(BaseModel):
+    """Per-project executor defaults injected into executor sessions."""
+
+    repo_path: str | None = None
+    env_file: str | None = None
+    test_cmd: str | None = None
+    test_min: int | None = Field(default=None, ge=0)
+    deploy_cmd: str | None = None
+    shell_type: str | None = None
+    branch: str | None = None
+
+
 class ProjectSettings(BaseModel):
     """Persisted per-project settings shown in the dashboard."""
 
@@ -134,12 +146,14 @@ class ProjectSettings(BaseModel):
         le=200,
         description="Warn when the live constitution reaches this many items.",
     )
+    executor_config: ExecutorConfig = Field(default_factory=ExecutorConfig)
 
 
 class ProjectSettingsPatch(BaseModel):
     """Body for PATCH /projects/{id}/settings."""
 
     max_pinned_decisions: int | None = Field(default=None, ge=1, le=200)
+    executor_config: ExecutorConfig | None = None
 
 
 class GoalState(BaseModel):
@@ -290,6 +304,10 @@ class StartSessionRequest(BaseModel):
     client: str | None = Field(
         default=None,
         description="Client app identifier: claude-code, claude-desktop, cursor, other.",
+    )
+    role: str | None = Field(
+        default=None,
+        description="Optional session role. Use 'executor' to inject executor_config.",
     )
 
 

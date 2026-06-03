@@ -396,6 +396,7 @@ CREATE TABLE IF NOT EXISTS projects (
     decisions TEXT,
     ntfy_url TEXT,
     max_pinned_decisions INTEGER NOT NULL DEFAULT 20,
+    executor_config TEXT,
     rewind_token TEXT,
     created_at TEXT NOT NULL DEFAULT ({_TS})
 );
@@ -528,6 +529,16 @@ CREATE TABLE IF NOT EXISTS executor_runs (
 );
 CREATE INDEX IF NOT EXISTS idx_executor_runs_session ON executor_runs(session_id);
 CREATE INDEX IF NOT EXISTS idx_executor_runs_project ON executor_runs(project_id, started_at DESC);
+
+CREATE TABLE IF NOT EXISTS file_locks (
+    id TEXT PRIMARY KEY,
+    file_path TEXT NOT NULL UNIQUE,
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    claimed_at TEXT NOT NULL DEFAULT ({_TS}),
+    expires_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_file_locks_session ON file_locks(session_id);
+CREATE INDEX IF NOT EXISTS idx_file_locks_expires ON file_locks(expires_at);
 """
 
 # Tables that go ONLY in the main auth DB (MERIDIAN_DB_URL).
@@ -752,6 +763,7 @@ async def init_pg_db(url: str) -> PostgresConnection:
     await _migrate_pg_goal_field_timestamps(conn)
     await _migrate_pg_v24_task_tree_and_framework(conn)
     await _migrate_pg_project_settings(conn)
+    await _migrate_pg_file_locks(conn)
     await _migrate_pg_task_sprint_link(conn)
     await _migrate_pg_v26_client_type(conn)
     await _migrate_pg_v27_pg_trgm(conn)
@@ -829,7 +841,23 @@ async def _migrate_pg_project_settings(conn: PostgresConnection) -> None:
     """v2.6.1 — add per-project settings columns and notification target."""
     await conn.executescript(
         "ALTER TABLE projects ADD COLUMN IF NOT EXISTS max_pinned_decisions INTEGER NOT NULL DEFAULT 20;"
+        "ALTER TABLE projects ADD COLUMN IF NOT EXISTS executor_config TEXT;"
         "ALTER TABLE projects ADD COLUMN IF NOT EXISTS ntfy_url TEXT"
+    )
+
+
+async def _migrate_pg_file_locks(conn: PostgresConnection) -> None:
+    """v3.1 — create file_locks table on existing Postgres DBs."""
+    await conn.executescript(
+        "CREATE TABLE IF NOT EXISTS file_locks ("
+        "    id TEXT PRIMARY KEY,"
+        "    file_path TEXT NOT NULL UNIQUE,"
+        "    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,"
+        f"    claimed_at TEXT NOT NULL DEFAULT ({_TS}),"
+        "    expires_at TEXT NOT NULL"
+        ");"
+        "CREATE INDEX IF NOT EXISTS idx_file_locks_session ON file_locks(session_id);"
+        "CREATE INDEX IF NOT EXISTS idx_file_locks_expires ON file_locks(expires_at)"
     )
 
 

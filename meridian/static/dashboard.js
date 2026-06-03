@@ -979,7 +979,10 @@ function buildTabBody(project) {
           </div>
           <hr class="live-divider">
           <div class="live-section">
-            <div class="live-section-label">Queue</div>
+            <div class="live-section-label" style="display:flex;justify-content:space-between;align-items:center">
+              <span>Queue</span>
+              <button class="secondary" id="new-sprint-btn-${project.id}" style="padding:1px 8px;font-size:9px" title="Start a new sprint">+ New Sprint</button>
+            </div>
             <div class="live-queue" id="live-queue-${project.id}">
               <div class="live-empty">Queue is empty. Add a task above.</div>
             </div>
@@ -1106,6 +1109,26 @@ function buildTabBody(project) {
             <button class="secondary" id="timeline-axis-${project.id}" title="Toggle relative/absolute time" style="padding:2px 8px;font-size:10px">relative</button>
             <button class="secondary" id="timeline-refresh-${project.id}" title="Refresh" style="padding:2px 8px;font-size:10px">refresh</button>
           </span>
+        </div>
+        <div style="padding:4px 14px 4px;font-size:10px;color:var(--muted);border-bottom:1px solid var(--border);flex-shrink:0;display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+          <span>Session activity across time — each row is one AI session, each bar is one task.</span>
+          <span style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+            <span><span style="color:#34d399">■</span> done</span>
+            <span><span style="color:#f87171">■</span> pending/failed</span>
+            <span><span style="color:#6c8fff">■</span> sprint</span>
+            <span><span style="color:#fbbf24">■</span> north star</span>
+            <span><span style="color:#a78bfa">■</span> goal</span>
+          </span>
+        </div>
+        <div style="padding:5px 14px;display:flex;gap:6px;align-items:center;flex-wrap:wrap;border-bottom:1px solid var(--border);flex-shrink:0">
+          <label style="font-size:10px;color:var(--muted)">From</label>
+          <input type="date" id="timeline-from-${project.id}" style="font-size:10px;background:var(--surface-2);color:var(--text);border:1px solid var(--border);border-radius:3px;padding:1px 4px;outline:none">
+          <label style="font-size:10px;color:var(--muted)">To</label>
+          <input type="date" id="timeline-to-${project.id}" style="font-size:10px;background:var(--surface-2);color:var(--text);border:1px solid var(--border);border-radius:3px;padding:1px 4px;outline:none">
+          <button class="secondary" id="timeline-r7d-${project.id}" style="padding:1px 7px;font-size:10px">7d</button>
+          <button class="secondary" id="timeline-r30d-${project.id}" style="padding:1px 7px;font-size:10px">30d</button>
+          <button class="secondary" id="timeline-rall-${project.id}" style="padding:1px 7px;font-size:10px">All</button>
+          <span id="timeline-range-err-${project.id}" style="color:#f87171;font-size:10px;display:none"></span>
         </div>
         <div class="timeline-wrap" id="timeline-wrap-${project.id}" style="flex:1;overflow:auto;padding:14px"></div>
       </div>
@@ -1680,6 +1703,45 @@ async function loadLiveTab(projectId) {
         } catch (e) { toast('Failed: ' + e.message, true); }
       };
     }
+    // Wire "New Sprint" button → modal → POST /projects/{id}/goal/sprint
+    const newSprintBtn = document.getElementById(`new-sprint-btn-${projectId}`);
+    if (newSprintBtn) {
+      newSprintBtn.onclick = () => {
+        const overlay = document.createElement('div');
+        overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.72);z-index:9999;display:flex;align-items:center;justify-content:center';
+        overlay.innerHTML = `
+          <div style="background:var(--surface-1);border:1px solid var(--border);border-radius:8px;padding:22px 24px;min-width:320px;max-width:460px;width:90%;box-shadow:0 8px 32px #0008">
+            <div style="font-size:13px;font-weight:600;color:var(--text);margin-bottom:12px">New Sprint</div>
+            <input id="_new-sprint-input" type="text" placeholder="e.g. v1.1 — auth + billing" autofocus
+              style="width:100%;background:var(--surface-2);border:1px solid var(--border);border-radius:4px;color:var(--text);font-size:12px;font-family:var(--font-mono);padding:6px 10px;outline:none;box-sizing:border-box">
+            <div id="_new-sprint-err" style="color:#f87171;font-size:10px;margin-top:4px;display:none"></div>
+            <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:14px">
+              <button class="secondary" id="_new-sprint-cancel" style="padding:4px 12px;font-size:11px">Cancel</button>
+              <button class="primary" id="_new-sprint-submit" style="padding:4px 12px;font-size:11px">Set Sprint</button>
+            </div>
+          </div>`;
+        document.body.appendChild(overlay);
+        const inp = overlay.querySelector('#_new-sprint-input');
+        const errEl = overlay.querySelector('#_new-sprint-err');
+        const close = () => overlay.remove();
+        overlay.querySelector('#_new-sprint-cancel').onclick = close;
+        overlay.onclick = (e) => { if (e.target === overlay) close(); };
+        const submit = async () => {
+          const name = (inp.value || '').trim();
+          if (!name) { errEl.textContent = 'Sprint name is required'; errEl.style.display = ''; return; }
+          try {
+            overlay.querySelector('#_new-sprint-submit').disabled = true;
+            await api(`/projects/${projectId}/goal/sprint`, { method: 'POST', body: JSON.stringify({ sprint: name }) });
+            toast(`Sprint set: ${name}`);
+            close();
+          } catch (e) { errEl.textContent = e.message || 'Failed'; errEl.style.display = ''; overlay.querySelector('#_new-sprint-submit').disabled = false; }
+        };
+        overlay.querySelector('#_new-sprint-submit').onclick = submit;
+        inp.addEventListener('keydown', (e) => { if (e.key === 'Enter') submit(); if (e.key === 'Escape') close(); });
+        setTimeout(() => inp.focus(), 50);
+      };
+    }
+
     panel.liveWired = true;
   }
   await refreshLiveTab(projectId);
@@ -2440,6 +2502,20 @@ function renderTimeline(projectId, data) {
     });
   }
 
+  // Precompute per-session stats for rich item tooltips
+  const sessionStats = new Map();
+  tasks.forEach(t => {
+    const key = t.session_name || '(unknown)';
+    if (!sessionStats.has(key)) sessionStats.set(key, { count: 0, minDate: null, maxDate: null });
+    const s = sessionStats.get(key);
+    s.count++;
+    const d = parseTs(t.created_at);
+    if (d) {
+      if (!s.minDate || d < s.minDate) s.minDate = d;
+      if (!s.maxDate || d > s.maxDate) s.maxDate = d;
+    }
+  });
+
   // Build task items
   const items = [];
   let itemId = 1;
@@ -2449,13 +2525,22 @@ function renderTimeline(projectId, data) {
     const isDone = t.status === 'done';
     const bg = isDone ? '#34d39922' : '#f871711a';
     const border = isDone ? '#34d399' : '#f87171';
-    const title = escapeHtml((t.description || '').slice(0, 80));
+    const label = `${isDone ? '✓' : '✗'} ${(t.description || '').slice(0, 60)}`;
+    const stats = sessionStats.get(t.session_name || '(unknown)') || {};
+    const dateRange = stats.minDate && stats.maxDate
+      ? `${stats.minDate.toISOString().slice(0,10)} → ${stats.maxDate.toISOString().slice(0,10)}`
+      : '';
+    const tooltip = `Session: ${t.session_name || '(unknown)'}\nStatus: ${t.status || '?'}\nSession tasks: ${stats.count || 1}\nActivity: ${dateRange}\n\n${(t.description || '').slice(0, 200)}`;
     items.push({
       id: itemId++,
       group: `s:${t.session_name || '(unknown)'}`,
-      content: `<span style="font-size:9px;font-family:var(--font-mono);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;display:block;max-width:140px" title="${title}">${isDone ? '✓' : '✗'} ${title}</span>`,
+      // Single text layer: display:block forces the span to fill the item width so
+      // overflow:hidden + text-overflow:ellipsis clip at the item boundary instead
+      // of spilling over adjacent items.
+      content: `<span style="font-size:9px;font-family:var(--font-mono);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;display:block;line-height:1.4">${escapeHtml(label)}</span>`,
+      title: tooltip,
       start,
-      style: `background:${bg};border-color:${border};color:var(--text);border-radius:3px;padding:1px 4px`,
+      style: `background:${bg};border-color:${border};color:var(--text);border-radius:3px;padding:1px 4px;overflow:hidden`,
     });
   });
 
@@ -2485,9 +2570,10 @@ function renderTimeline(projectId, data) {
     items.push({
       id: itemId++,
       group: 'goal',
-      content: `<span style="font-size:9px;font-family:var(--font-mono)" title="${escapeHtml(g.field)} v${g.version}">${escapeHtml(lbl)} v${g.version}</span>`,
+      content: `<span style="font-size:9px;font-family:var(--font-mono);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;display:block;line-height:1.4">${escapeHtml(lbl)} v${g.version}</span>`,
+      title: `${escapeHtml(g.field)} v${g.version}`,
       start,
-      style: `background:${mc}22;border-color:${mc};color:var(--text);border-radius:3px;padding:1px 4px`,
+      style: `background:${mc}22;border-color:${mc};color:var(--text);border-radius:3px;padding:1px 4px;overflow:hidden`,
     });
   });
 
@@ -2520,11 +2606,73 @@ function renderTimeline(projectId, data) {
     if (!document.getElementById(styleId)) {
       const s = document.createElement('style');
       s.id = styleId;
-      s.textContent = `.vis-timeline{background:transparent;border-color:var(--border)!important}.vis-time-axis .vis-text{color:var(--muted)!important;font-family:var(--font-mono);font-size:10px}.vis-label{background:var(--surface)!important;border-color:var(--border)!important}.vis-panel.vis-center{border-color:var(--border)!important}.vis-panel.vis-left{border-color:var(--border)!important}.vis-item{border-width:1px}`;
+      s.textContent = `.vis-timeline{background:transparent;border-color:var(--border)!important}.vis-time-axis .vis-text{color:var(--muted)!important;font-family:var(--font-mono);font-size:10px}.vis-label{background:var(--surface)!important;border-color:var(--border)!important}.vis-panel.vis-center{border-color:var(--border)!important}.vis-panel.vis-left{border-color:var(--border)!important}.vis-item{border-width:1px;overflow:hidden!important}.vis-item-content{overflow:hidden!important;max-width:100%!important;display:block!important}.vis-item-overflow{overflow:hidden!important}`;
       document.head.appendChild(s);
     }
 
     if (p) p._visTimeline = timeline;
+
+    // Wire date range picker
+    const tlRangeKey = `meridian_tl_range_${projectId}`;
+    const fromInput = document.getElementById(`timeline-from-${projectId}`);
+    const toInput   = document.getElementById(`timeline-to-${projectId}`);
+    const errEl     = document.getElementById(`timeline-range-err-${projectId}`);
+
+    const applyRange = () => {
+      const fv = fromInput ? fromInput.value : '';
+      const tv = toInput ? toInput.value : '';
+      const from = fv ? new Date(fv) : null;
+      const to   = tv ? new Date(tv + 'T23:59:59Z') : null;
+      if (from && to && from >= to) {
+        if (errEl) { errEl.textContent = 'From must be before To'; errEl.style.display = ''; }
+        return;
+      }
+      if (errEl) errEl.style.display = 'none';
+      if (from && to) {
+        try { localStorage.setItem(tlRangeKey, JSON.stringify({ from: fv, to: tv })); } catch (_) {}
+        try { timeline.setWindow(from, to); } catch (_) {}
+      } else {
+        try { localStorage.removeItem(tlRangeKey); } catch (_) {}
+        try { timeline.fit(); } catch (_) {}
+      }
+    };
+
+    // Restore saved range
+    const savedRange = (() => { try { return JSON.parse(localStorage.getItem(tlRangeKey) || 'null'); } catch (_) { return null; } })();
+    if (savedRange && fromInput && toInput) {
+      fromInput.value = savedRange.from || '';
+      toInput.value   = savedRange.to   || '';
+      if (savedRange.from && savedRange.to) {
+        try { timeline.setWindow(new Date(savedRange.from), new Date(savedRange.to + 'T23:59:59Z')); } catch (_) {}
+      }
+    }
+
+    if (fromInput) fromInput.addEventListener('change', applyRange);
+    if (toInput)   toInput.addEventListener('change',   applyRange);
+
+    const nowD = new Date();
+    const todayStr = nowD.toISOString().slice(0, 10);
+    const r7Btn  = document.getElementById(`timeline-r7d-${projectId}`);
+    const r30Btn = document.getElementById(`timeline-r30d-${projectId}`);
+    const rAllBtn = document.getElementById(`timeline-rall-${projectId}`);
+    if (r7Btn) r7Btn.onclick = () => {
+      if (fromInput) fromInput.value = new Date(nowD - 7 * 86400000).toISOString().slice(0, 10);
+      if (toInput) toInput.value = todayStr;
+      applyRange();
+    };
+    if (r30Btn) r30Btn.onclick = () => {
+      if (fromInput) fromInput.value = new Date(nowD - 30 * 86400000).toISOString().slice(0, 10);
+      if (toInput) toInput.value = todayStr;
+      applyRange();
+    };
+    if (rAllBtn) rAllBtn.onclick = () => {
+      if (fromInput) fromInput.value = '';
+      if (toInput)   toInput.value   = '';
+      if (errEl) errEl.style.display = 'none';
+      try { localStorage.removeItem(tlRangeKey); } catch (_) {}
+      try { timeline.fit(); } catch (_) {}
+    };
+
   } catch (err) {
     console.warn('vis-timeline init failed, falling back to log:', err);
     _renderTimelineLog(projectId, data);

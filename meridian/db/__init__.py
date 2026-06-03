@@ -148,6 +148,7 @@ CREATE TABLE IF NOT EXISTS projects (
         CHECK (goal_mode IN ('manual', 'auto')),
     decisions TEXT,
     max_pinned_decisions INTEGER NOT NULL DEFAULT 20,
+    executor_config TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -373,7 +374,7 @@ CREATE TABLE IF NOT EXISTS neon_pool_projects (
     id TEXT PRIMARY KEY,
     neon_project_id TEXT NOT NULL UNIQUE,
     tier TEXT NOT NULL DEFAULT 'standard'
-        CHECK (tier IN ('standard','pro')),
+        CHECK (tier IN ('free','standard','pro')),
     customer_count INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
@@ -416,6 +417,18 @@ CREATE INDEX IF NOT EXISTS idx_executor_runs_session
     ON executor_runs(session_id);
 CREATE INDEX IF NOT EXISTS idx_executor_runs_project
     ON executor_runs(project_id, started_at DESC);
+
+CREATE TABLE IF NOT EXISTS file_locks (
+    id TEXT PRIMARY KEY,
+    file_path TEXT NOT NULL UNIQUE,
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    claimed_at TEXT NOT NULL DEFAULT (datetime('now')),
+    expires_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_file_locks_session
+    ON file_locks(session_id);
+CREATE INDEX IF NOT EXISTS idx_file_locks_expires
+    ON file_locks(expires_at);
 """
 
 
@@ -910,6 +923,47 @@ async def _migrate_project_settings(db: aiosqlite.Connection) -> None:
         "max_pinned_decisions",
         "INTEGER NOT NULL DEFAULT 20",
     )
+    await _migrate_add_column_if_missing(
+        db,
+        "projects",
+        "executor_config",
+        "TEXT",
+    )
+
+
+async def _migrate_neon_pool_projects_free_tier(db: aiosqlite.Connection) -> None:
+    """v3.1 — widen ``neon_pool_projects.tier`` to include ``free``."""
+    async with db.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='neon_pool_projects'"
+    ) as cur:
+        row = await cur.fetchone()
+    if row is None:
+        return
+    ddl = (row["sql"] if isinstance(row, dict) else row[0]) or ""
+    if "'free'" in ddl or '"free"' in ddl:
+        return
+    await db.execute("PRAGMA foreign_keys = OFF")
+    await db.executescript(
+        """
+        CREATE TABLE neon_pool_projects_new (
+            id TEXT PRIMARY KEY,
+            neon_project_id TEXT NOT NULL UNIQUE,
+            tier TEXT NOT NULL DEFAULT 'standard'
+                CHECK (tier IN ('free','standard','pro')),
+            customer_count INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        INSERT INTO neon_pool_projects_new (id, neon_project_id, tier, customer_count, created_at)
+            SELECT id, neon_project_id, tier, customer_count, created_at
+            FROM neon_pool_projects;
+        DROP TABLE neon_pool_projects;
+        ALTER TABLE neon_pool_projects_new RENAME TO neon_pool_projects;
+        CREATE INDEX IF NOT EXISTS idx_neon_pool_projects_tier
+            ON neon_pool_projects(tier, customer_count);
+        """
+    )
+    await db.execute("PRAGMA foreign_keys = ON")
+    await db.commit()
 
 
 async def _migrate_tenants_free_plan(db: aiosqlite.Connection) -> None:
@@ -1278,6 +1332,26 @@ async def _migrate_executor_runs(db: aiosqlite.Connection) -> None:
     await db.commit()
 
 
+async def _migrate_file_locks(db: aiosqlite.Connection) -> None:
+    """v3.1 — add file_locks table for cross-session edit coordination."""
+    await db.execute(
+        """CREATE TABLE IF NOT EXISTS file_locks (
+            id TEXT PRIMARY KEY,
+            file_path TEXT NOT NULL UNIQUE,
+            session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+            claimed_at TEXT NOT NULL DEFAULT (datetime('now')),
+            expires_at TEXT NOT NULL
+        )"""
+    )
+    await db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_file_locks_session ON file_locks(session_id)"
+    )
+    await db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_file_locks_expires ON file_locks(expires_at)"
+    )
+    await db.commit()
+
+
 async def init_hosted_tables(db: aiosqlite.Connection) -> None:
     """Ensure hosted-tier tables exist on the given connection.
 
@@ -1330,6 +1404,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_worker_pid(db)
     await _migrate_rewind_token(db)
     await _migrate_project_settings(db)
+    await _migrate_neon_pool_projects_free_tier(db)
     await _migrate_sessions_archived(db)
     await _migrate_sprint_items_v2(db)
     await _migrate_drop_chat_tables(db)
@@ -1347,6 +1422,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_tenants_free_plan(db)
     await _migrate_session_notes(db)
     await _migrate_executor_runs(db)
+    await _migrate_file_locks(db)
     await _migrate_milestone_type(db)
     await _migrate_ntfy_notifications(db)
     return db
@@ -1453,16 +1529,22 @@ async def get_project_settings(
 ) -> dict[str, Any] | None:
     """Return the persisted settings for a project."""
     async with db.execute(
-        "SELECT id, max_pinned_decisions FROM projects WHERE id = ?",
+        "SELECT id, max_pinned_decisions, executor_config FROM projects WHERE id = ?",
         (project_id,),
     ) as cur:
         row = await cur.fetchone()
     if row is None:
         return None
     data = _row_to_dict(row) or {}
+    raw_executor_config = data.get("executor_config")
+    try:
+        executor_config = json.loads(raw_executor_config) if raw_executor_config else {}
+    except (TypeError, ValueError):
+        executor_config = {}
     return {
         "project_id": data["id"],
         "max_pinned_decisions": int(data.get("max_pinned_decisions") or 20),
+        "executor_config": executor_config,
     }
 
 
@@ -1471,18 +1553,56 @@ async def update_project_settings(
     project_id: str,
     *,
     max_pinned_decisions: int | None = None,
+    executor_config: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     """Persist project settings and return the updated values."""
     project = await get_project(db, project_id)
     if project is None:
         return None
+    updates: list[str] = []
+    params: list[Any] = []
     if max_pinned_decisions is not None:
+        updates.append("max_pinned_decisions = ?")
+        params.append(int(max_pinned_decisions))
+    if executor_config is not None:
+        updates.append("executor_config = ?")
+        params.append(json.dumps(executor_config))
+    if updates:
+        params.append(project_id)
         await db.execute(
-            "UPDATE projects SET max_pinned_decisions = ? WHERE id = ?",
-            (int(max_pinned_decisions), project_id),
+            f"UPDATE projects SET {', '.join(updates)} WHERE id = ?",
+            tuple(params),
         )
         await db.commit()
     return await get_project_settings(db, project_id)
+
+
+async def get_executor_config(
+    db: aiosqlite.Connection, project_id: str
+) -> dict[str, Any]:
+    """Return the persisted executor_config payload for a project."""
+    settings = await get_project_settings(db, project_id)
+    if settings is None:
+        raise ValueError(f"unknown project: {project_id}")
+    cfg = settings.get("executor_config") or {}
+    return cfg if isinstance(cfg, dict) else {}
+
+
+async def set_executor_config(
+    db: aiosqlite.Connection,
+    project_id: str,
+    executor_config: dict[str, Any],
+) -> dict[str, Any]:
+    """Persist and return the per-project executor configuration."""
+    settings = await update_project_settings(
+        db,
+        project_id,
+        executor_config=executor_config,
+    )
+    if settings is None:
+        raise ValueError(f"unknown project: {project_id}")
+    cfg = settings.get("executor_config") or {}
+    return cfg if isinstance(cfg, dict) else {}
 
 
 async def get_project_ntfy_url(
@@ -2317,6 +2437,7 @@ async def close_session(db: aiosqlite.Connection, session_id: str) -> None:
         "UPDATE sessions SET status = 'closed' WHERE id = ?",
         (session_id,),
     )
+    await release_file_locks_for_session(db, session_id)
     await db.commit()
     try:
         await finalize_executor_run(db, session_id, status="done")
@@ -4388,6 +4509,21 @@ async def increment_pool_project_count(
     await db.commit()
 
 
+async def decrement_pool_project_count(
+    db: aiosqlite.Connection,
+    neon_project_id: str,
+) -> None:
+    """Decrement customer_count after removing a customer database."""
+    await db.execute(
+        "UPDATE neon_pool_projects "
+        "SET customer_count = CASE "
+        "WHEN customer_count > 0 THEN customer_count - 1 ELSE 0 END "
+        "WHERE neon_project_id = ?",
+        (neon_project_id,),
+    )
+    await db.commit()
+
+
 async def get_pool_project_counts(
     db: aiosqlite.Connection,
     tier: str = "standard",
@@ -4407,6 +4543,109 @@ async def get_pool_project_counts(
     if keys:
         return {"projects": row["projects"], "customers": row["customers"]}
     return {"projects": row[0] or 0, "customers": row[1] or 0}
+
+
+# ---------------------------------------------------------------------------
+# v3.1 — file lock coordination
+# ---------------------------------------------------------------------------
+
+_FILE_LOCK_TTL_HOURS = 2
+
+
+async def expire_file_locks(db: aiosqlite.Connection) -> int:
+    """Delete expired file locks and return how many rows were cleared."""
+    cursor = await db.execute(
+        "DELETE FROM file_locks WHERE expires_at <= datetime('now')"
+    )
+    await db.commit()
+    return cursor.rowcount
+
+
+async def claim_file(
+    db: aiosqlite.Connection,
+    file_path: str,
+    session_id: str,
+    *,
+    ttl_hours: int = _FILE_LOCK_TTL_HOURS,
+) -> dict[str, Any]:
+    """Claim a file path for a session, auto-releasing expired locks first."""
+    normalized = (file_path or "").strip()
+    if not normalized:
+        raise ValueError("file_path is required")
+    await expire_file_locks(db)
+    async with db.execute(
+        "SELECT * FROM file_locks WHERE file_path = ?",
+        (normalized,),
+    ) as cur:
+        existing_row = await cur.fetchone()
+    existing = _row_to_dict(existing_row)
+    if existing and existing.get("session_id") != session_id:
+        return {
+            "claimed": False,
+            "file_path": normalized,
+            "session_id": session_id,
+            "holder_session_id": existing.get("session_id"),
+            "claimed_at": existing.get("claimed_at"),
+            "expires_at": existing.get("expires_at"),
+        }
+
+    if existing and existing.get("session_id") == session_id:
+        await db.execute(
+            "UPDATE file_locks SET claimed_at = datetime('now'), "
+            "expires_at = datetime('now', ? || ' hours') "
+            "WHERE id = ?",
+            (str(ttl_hours), existing["id"]),
+        )
+    else:
+        await db.execute(
+            "INSERT INTO file_locks (id, file_path, session_id, claimed_at, expires_at) "
+            "VALUES (?, ?, ?, datetime('now'), datetime('now', ? || ' hours'))",
+            (_new_id(), normalized, session_id, str(ttl_hours)),
+        )
+    await db.commit()
+    async with db.execute(
+        "SELECT * FROM file_locks WHERE file_path = ?",
+        (normalized,),
+    ) as cur:
+        row = await cur.fetchone()
+    lock = _row_to_dict(row) or {}
+    return {
+        "claimed": True,
+        "file_path": normalized,
+        "session_id": lock.get("session_id"),
+        "claimed_at": lock.get("claimed_at"),
+        "expires_at": lock.get("expires_at"),
+    }
+
+
+async def release_file(
+    db: aiosqlite.Connection,
+    file_path: str,
+    session_id: str,
+) -> bool:
+    """Release a file lock only when it is owned by ``session_id``."""
+    normalized = (file_path or "").strip()
+    if not normalized:
+        return False
+    cursor = await db.execute(
+        "DELETE FROM file_locks WHERE file_path = ? AND session_id = ?",
+        (normalized, session_id),
+    )
+    await db.commit()
+    return cursor.rowcount > 0
+
+
+async def release_file_locks_for_session(
+    db: aiosqlite.Connection,
+    session_id: str,
+) -> int:
+    """Release every file lock held by a session."""
+    cursor = await db.execute(
+        "DELETE FROM file_locks WHERE session_id = ?",
+        (session_id,),
+    )
+    await db.commit()
+    return cursor.rowcount
 
 
 # ---------------------------------------------------------------------------
