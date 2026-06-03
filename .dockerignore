@@ -6,3 +6,23 @@ __pycache__/
 .venv/
 *.sqlite3
 tmp/
+logs/
+
+# Not needed in the container
+.git/
+.github/
+docs/
+tests/
+extensions/
+npm/
+scripts/
+site/
+*.spec
+*.bat
+*.log
+
+# Dev tools
+.ruff_cache/
+.pytest_cache/
+.mypy_cache/
+node_modules/
