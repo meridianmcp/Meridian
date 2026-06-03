@@ -6,6 +6,8 @@ import asyncio
 import json
 import os
 import sys
+import time
+import uuid
 from pathlib import Path
 
 import pytest
@@ -4569,6 +4571,16 @@ def test_pg_create_tables_has_sprint_item_group_columns():
     assert "human_id" in sprint_block
 
 
+def test_pg_create_tables_has_ntfy_url_column():
+    """CREATE_TABLES_PG projects must include ntfy_url for Neon notifications."""
+    from meridian.pg_adapter import CREATE_TABLES_PG
+
+    project_block_start = CREATE_TABLES_PG.index("CREATE TABLE IF NOT EXISTS projects")
+    project_block_end = CREATE_TABLES_PG.index(");", project_block_start)
+    project_block = CREATE_TABLES_PG[project_block_start:project_block_end]
+    assert "ntfy_url TEXT" in project_block
+
+
 def test_rewind_milestones_tab_label(client):
     """Rewind Versions subtab is now labelled 'Milestones' in dashboard.js."""
     js = client.get("/static/dashboard.js").text
@@ -6236,19 +6248,19 @@ def test_mcp_sse_cors_headers_on_post(client):
 
 
 @pytest.mark.asyncio
-async def test_get_set_project_notify_url(db):
-    """get_project_ntfy_url / set_project_ntfy_url round-trips correctly."""
-    p = await db_module.create_project(db, "notif-project-1")
+async def test_get_set_project_notify_url(anydb):
+    """get_project_ntfy_url / set_project_ntfy_url round-trip on every DB backend."""
+    p = await db_module.create_project(anydb, "notif-project-1")
     # Initially None
-    url = await db_module.get_project_ntfy_url(db, p["id"])
+    url = await db_module.get_project_ntfy_url(anydb, p["id"])
     assert url is None
     # Set an ntfy URL
-    await db_module.set_project_ntfy_url(db, p["id"], "https://ntfy.sh/test-topic")
-    url = await db_module.get_project_ntfy_url(db, p["id"])
+    await db_module.set_project_ntfy_url(anydb, p["id"], "https://ntfy.sh/test-topic")
+    url = await db_module.get_project_ntfy_url(anydb, p["id"])
     assert url == "https://ntfy.sh/test-topic"
     # Clear it
-    await db_module.set_project_ntfy_url(db, p["id"], None)
-    url = await db_module.get_project_ntfy_url(db, p["id"])
+    await db_module.set_project_ntfy_url(anydb, p["id"], None)
+    url = await db_module.get_project_ntfy_url(anydb, p["id"])
     assert url is None
 
 
@@ -6322,6 +6334,49 @@ async def test_dispatch_notification_webhook(monkeypatch):
     assert body["body"] == "All items completed"
     assert body["event"] == "sprint_done"
     assert body["source"] == "meridian"
+
+
+@pytest.mark.asyncio
+async def test_dispatch_notification_email_via_resend(monkeypatch):
+    """_dispatch_notification routes email targets through Resend."""
+    from meridian.server import _dispatch_notification
+    import httpx
+
+    calls = []
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            pass
+
+        async def post(self, url, **kwargs):
+            calls.append({"url": url, "kwargs": kwargs})
+
+            class FakeResp:
+                status_code = 200
+
+            return FakeResp()
+
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: FakeClient())
+    monkeypatch.setenv("RESEND_API_KEY", "resend-test-key")
+    monkeypatch.setenv("MERIDIAN_BASE_URL", "https://usemeridian.us")
+
+    await _dispatch_notification(
+        "user@example.com",
+        "HITL needed",
+        "Please review",
+        event="hitl",
+    )
+    assert len(calls) == 1
+    assert calls[0]["url"] == "https://api.resend.com/emails"
+    headers = calls[0]["kwargs"]["headers"]
+    payload = calls[0]["kwargs"]["json"]
+    assert headers["Authorization"] == "Bearer resend-test-key"
+    assert payload["to"] == ["user@example.com"]
+    assert payload["subject"] == "[Meridian] HITL needed"
+    assert payload["text"] == "Please review"
 
 
 @pytest.mark.asyncio
@@ -6409,3 +6464,65 @@ def test_notify_test_endpoint_no_url(client):
     r2 = client.post(f"/projects/{pid}/notify/test")
     assert r2.status_code == 400
     assert "No notify URL" in r2.json().get("detail", "")
+
+
+def test_notify_test_endpoint_delivers_ntfy_message_via_postgres(tmp_path, monkeypatch):
+    """Postgres-backed /notify/test publishes a real ntfy.sh message."""
+    test_db_url = os.environ.get("TEST_DATABASE_URL")
+    if not test_db_url:
+        pytest.skip("TEST_DATABASE_URL not set - skipping Postgres ntfy e2e test")
+
+    monkeypatch.setenv("MERIDIAN_DB_URL", test_db_url)
+    monkeypatch.setenv("MERIDIAN_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("MERIDIAN_DEMO_DB_URL", "")
+    monkeypatch.setenv("MERIDIAN_SKIP_DEMO", "1")
+    monkeypatch.setenv("MERIDIAN_GOAL_MD", str(tmp_path / "GOAL.md"))
+
+    import importlib
+
+    import httpx
+    from fastapi.testclient import TestClient
+
+    server_mod = importlib.reload(server_module)
+    topic = f"meridian-e2e-{uuid.uuid4().hex[:12]}"
+    project_name = f"ntfy-e2e-{uuid.uuid4().hex[:8]}"
+    notify_url = f"https://ntfy.sh/{topic}"
+
+    with TestClient(server_mod.app) as client:
+        create_resp = client.post("/projects", json={"name": project_name})
+        assert create_resp.status_code in (200, 201)
+        project_id = create_resp.json()["id"]
+
+        patch_resp = client.patch(
+            f"/projects/{project_id}/ntfy",
+            json={"notify_url": notify_url},
+        )
+        assert patch_resp.status_code == 200
+
+        test_resp = client.post(f"/projects/{project_id}/notify/test")
+        assert test_resp.status_code == 200
+        assert test_resp.json()["notify_url"] == notify_url
+
+    deadline = time.time() + 20
+    while time.time() < deadline:
+        poll_resp = httpx.get(
+            f"https://ntfy.sh/{topic}/json",
+            params={"poll": "1", "since": "2m"},
+            timeout=10.0,
+        )
+        assert poll_resp.status_code == 200
+        messages = [
+            json.loads(line)
+            for line in poll_resp.text.splitlines()
+            if line.strip().startswith("{")
+        ]
+        if any(msg.get("title") == "Meridian test notification" for msg in messages):
+            assert any(
+                "notifications are working" in str(msg.get("message", "")).lower()
+                for msg in messages
+                if msg.get("title") == "Meridian test notification"
+            )
+            return
+        time.sleep(1)
+
+    pytest.fail("Timed out waiting for ntfy.sh test notification")
