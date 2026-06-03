@@ -100,9 +100,16 @@ jobs:
           git fetch origin
           git checkout main
           # Use regular merge (not ff-only) so CHANGELOG commits on main don't block.
-          # --no-edit avoids any editor prompt on the merge commit message.
           git merge --no-ff --no-edit origin/dev -m "ci: merge dev → main (auto)"
           git push origin main
+
+      - name: Trigger production deploy
+        # GITHUB_TOKEN pushes don't re-trigger workflows — dispatch manually.
+        # This fires the deploy job in the same workflow file via workflow_dispatch.
+        run: |
+          gh workflow run deploy.yml --ref main
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   # ─── 5. Production deploy (main branch push or tag or manual) ────────────────
   # Triggered by the merge above (main push) or explicit workflow_dispatch / tag.
