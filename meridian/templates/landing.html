@@ -608,15 +608,35 @@ irm https://usemeridian.us/hooks.ps1 | iex</pre>
 </section>
 
 <section id="pricing">
-  <h2>Hosted tier</h2>
-  <p class="section-lede">Skip the install. Managed Postgres. No charge until the hosted tier officially launches.</p>
+  <h2>Pricing</h2>
+  <p class="section-lede">Start free — self-host forever, or try the hosted tier for 30 days with no credit card.</p>
   <div class="pricing-grid">
 
-    <!-- Standard — primary -->
+    <!-- Free / self-hosted -->
     <div class="plan">
+      <div class="plan-name">Free</div>
+      <div class="plan-price">$0<small> / forever</small></div>
+      <div class="plan-trial"><span class="ok">available now</span> · no card required</div>
+      <hr class="plan-divider">
+      <ul class="plan-features">
+        <li>Full self-hosted install (binary or pixi)</li>
+        <li>SQLite DB — all data on your machine</li>
+        <li>Unlimited projects, sessions, tasks</li>
+        <li>All MCP tools included</li>
+        <li>Dashboard at localhost:7878</li>
+        <li>HITL queue + pinned decisions</li>
+        <li>Works with Claude Code, Cursor, Windsurf</li>
+        <li>Open source (MSL-1.0 → MIT in 8 years)</li>
+      </ul>
+      <div class="plan-note">Self-hosted is free forever for personal and internal use.</div>
+      <a href="https://github.com/meridianmcp/Meridian" class="plan-cta secondary" target="_blank" rel="noopener">★ Get on GitHub →</a>
+    </div>
+
+    <!-- Standard — primary -->
+    <div class="plan featured">
       <div class="plan-name">Standard</div>
       <div class="plan-price">$20<small> / mo</small></div>
-      <div class="plan-trial"><span class="ok">waitlist</span> · launches soon</div>
+      <div class="plan-trial"><span class="ok">30-day free trial</span> · no card required</div>
       <hr class="plan-divider">
       <ul class="plan-features">
         <li>Managed Postgres — 1 GB included</li>
@@ -631,19 +651,14 @@ irm https://usemeridian.us/hooks.ps1 | iex</pre>
         <li>Email support</li>
       </ul>
       <div class="plan-note">Overage: <strong>$0.16/CU-hr</strong> · <strong>$0.50/GB-mo</strong> · auto-billed via Stripe</div>
-      <form class="waitlist-form" data-plan="standard" onsubmit="submitWaitlist(event, this)">
-        <input type="email" placeholder="your@email.com" required>
-        <button type="submit">Notify me →</button>
-      </form>
-      <div class="waitlist-msg"></div>
-      <p class="waitlist-launch-note">Hosted launch coming soon · <a href="{{ stripe_payment_link }}">Sign up early</a></p>
+      <a href="/auth/login" class="plan-cta primary">Start free trial →</a>
     </div>
 
     <!-- Pro -->
     <div class="plan">
       <div class="plan-name">Pro</div>
       <div class="plan-price">$49<small> / mo</small></div>
-      <div class="plan-trial"><span class="ok">waitlist</span> · launches soon</div>
+      <div class="plan-trial"><span class="ok">30-day free trial</span> · no card required</div>
       <hr class="plan-divider">
       <ul class="plan-features">
         <li>Everything in Standard</li>
@@ -656,16 +671,7 @@ irm https://usemeridian.us/hooks.ps1 | iex</pre>
         <li>Connect your own Postgres DB</li>
       </ul>
       <div class="plan-note">Overage: <strong>$0.16/CU-hr</strong> · <strong>$0.50/GB-mo</strong> · auto-billed via Stripe</div>
-      <form class="waitlist-form" data-plan="pro" onsubmit="submitWaitlist(event, this)">
-        <input type="email" placeholder="your@email.com" required>
-        <button type="submit">Notify me →</button>
-      </form>
-      <div class="waitlist-msg"></div>
-      {% if stripe_pro_payment_link %}
-      <p class="waitlist-launch-note">Hosted launch coming soon · <a href="{{ stripe_pro_payment_link }}">Sign up early</a></p>
-      {% else %}
-      <p class="waitlist-launch-note">Hosted launch coming soon</p>
-      {% endif %}
+      <a href="/auth/login" class="plan-cta secondary">Start free trial →</a>
     </div>
 
   </div>

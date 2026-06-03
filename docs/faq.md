@@ -104,3 +104,25 @@ Meridian is open-source (MSL-1.0), built to solve the coordination problem in lo
 ### Is there a hosted option for teams?
 
 Yes — [usemeridian.us](https://usemeridian.us). Standard is $20/month, Pro is $49/month. Both include a 30-day free tier with no card required. You get a managed Postgres database, hosted dashboard, and remote MCP endpoint — zero install on your end.
+
+### Can I use Meridian from claude.ai without installing anything?
+
+Yes. The [dnakov/claude-mcp](https://github.com/dnakov/claude-mcp) Chrome extension connects claude.ai to any MCP server via SSE. For the hosted tier:
+
+1. Sign in at [usemeridian.us](https://usemeridian.us)
+2. Install the extension → Add server → URL: `https://usemeridian.us/mcp`
+3. An auth popup appears — sign in and the connection completes automatically
+
+For self-hosted: start `pixi run start` locally, then use `http://localhost:7878/mcp` as the URL. No auth popup needed.
+
+→ [Full browser connector guide](browser-connector.md)
+
+### What does the 30-day free trial include?
+
+The hosted free trial gives you full access to the Standard tier — managed Postgres, hosted dashboard, remote MCP endpoint, HITL queue, and all MCP tools. No credit card is required to start. After 30 days of inactivity the account expires; active accounts stay on the trial until you choose to subscribe.
+
+The self-hosted tier is free forever with no time limit.
+
+### Can I export my data before the trial expires?
+
+Yes. Dashboard → Settings → Export → download your full SQLite snapshot. This includes all projects, sessions, tasks, decisions, and notes. You can import it into a self-hosted Meridian instance or keep it as a backup.
