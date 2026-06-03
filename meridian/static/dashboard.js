@@ -95,22 +95,142 @@ function showDemoReadonlyToast() {
 }
 
 function showDemoOnboardingOverlay() {
-  if (document.getElementById('demo-onboarding-overlay')) return;
-  const overlay = document.createElement('div');
-  overlay.id = 'demo-onboarding-overlay';
-  overlay.style = 'position:fixed;inset:0;z-index:20000;background:rgba(0,0,0,0.72);display:flex;align-items:center;justify-content:center;padding:16px';
+  if (document.getElementById(‘demo-onboarding-overlay’)) return;
+  const overlay = document.createElement(‘div’);
+  overlay.id = ‘demo-onboarding-overlay’;
+  overlay.style = ‘position:fixed;inset:0;z-index:20000;background:rgba(0,0,0,0.72);display:flex;align-items:center;justify-content:center;padding:16px’;
   overlay.innerHTML = `<div style="background:#1e2029;border:1px solid #7c3aed66;border-radius:14px;padding:28px 32px;max-width:400px;width:100%;box-shadow:0 12px 48px rgba(0,0,0,0.7);position:relative;font-family:inherit">
-  <button onclick="document.getElementById('demo-onboarding-overlay').remove()" style="position:absolute;top:12px;right:14px;background:none;border:none;color:#8b8fa8;font-size:18px;cursor:pointer;line-height:1;padding:4px" title="Dismiss">×</button>
+  <button onclick="document.getElementById(‘demo-onboarding-overlay’).remove()" style="position:absolute;top:12px;right:14px;background:none;border:none;color:#8b8fa8;font-size:18px;cursor:pointer;line-height:1;padding:4px" title="Dismiss">×</button>
   <h3 style="color:#e8eaf0;margin:0 0 16px;font-size:1.05rem;font-weight:700">Welcome to the Meridian demo</h3>
   <ol style="color:#c4c6d4;font-size:.88rem;line-height:1.85;padding-left:1.3em;margin:0 0 20px">
     <li>This is a live demo coordinating a real multi-session build. It’s read-only.</li>
     <li>Click any session on the left to explore.</li>
     <li>Write actions are disabled — <a href="/auth/login" style="color:#6c8fff;text-decoration:underline">sign in to create your own project</a>.</li>
   </ol>
-  <button onclick="document.getElementById('demo-onboarding-overlay').remove()" style="background:#7c3aed;border:none;border-radius:7px;color:#fff;padding:8px 22px;cursor:pointer;font-size:.88rem;font-family:inherit;width:100%">Got it — explore the demo</button>
+  <div style="display:flex;gap:8px">
+    <button onclick="document.getElementById(‘demo-onboarding-overlay’).remove()" style="background:#2a2d35;border:none;border-radius:7px;color:#8b8fa8;padding:8px 16px;cursor:pointer;font-size:.85rem;font-family:inherit;flex:0 0 auto">Skip</button>
+    <button onclick="document.getElementById(‘demo-onboarding-overlay’).remove();startDemoTour(0)" style="background:#7c3aed;border:none;border-radius:7px;color:#fff;padding:8px 22px;cursor:pointer;font-size:.88rem;font-family:inherit;flex:1">Got it — show me around →</button>
+  </div>
 </div>`;
-  overlay.addEventListener('click', (e) => { if (e.target === overlay) overlay.remove(); });
+  overlay.addEventListener(‘click’, (e) => { if (e.target === overlay) overlay.remove(); });
   document.body.appendChild(overlay);
+}
+
+// ---------------------------------------------------------------------------
+// Demo guided tour — step-by-step tooltip walkthrough
+// ---------------------------------------------------------------------------
+const _DEMO_TOUR_STEPS = [
+  {
+    target: () => document.querySelector(‘.session-list, .sidebar-sessions, [data-tour="sessions"], .sidebar’),
+    title: ‘AI coding sessions’,
+    body: ‘Each row is one Claude Code run. Multiple sessions can work in parallel on the same project — no collisions.’,
+    position: ‘right’,
+    action: null,
+  },
+  {
+    target: () => document.querySelector(‘.task-row, .task-item, .task-list-item, #task-list > *:first-child, [data-task-id]’),
+    title: ‘Task log’,
+    body: ‘Every meaningful action is logged here in real time — tool calls, decisions, bugs found. Full audit trail.’,
+    position: ‘right’,
+    action: null,
+  },
+  {
+    target: () => document.querySelector(‘[data-vtab="queue"], button[onclick*="queue"], .vtab-btn’),
+    title: ‘Work queue’,
+    body: ‘Pending tasks claimed atomically — parallel Claude sessions grab work without stepping on each other.’,
+    position: ‘bottom’,
+    action: () => {
+      const btn = document.querySelector(‘[data-vtab="queue"]’) || document.querySelector(‘button[onclick*="queue"]’);
+      if (btn) btn.click();
+    },
+  },
+  {
+    target: () => document.querySelector(‘[data-vtab="timeline"], button[onclick*="timeline"]’),
+    title: ‘Swimlane timeline’,
+    body: ‘See all sessions running in parallel — when each ran, what changed, how long each task took.’,
+    position: ‘bottom’,
+    action: () => {
+      const btn = document.querySelector(‘[data-vtab="timeline"]’) || document.querySelector(‘button[onclick*="timeline"]’);
+      if (btn) btn.click();
+    },
+  },
+  {
+    target: () => null,  // centered finish step
+    title: ‘You\’re all set’,
+    body: ‘Explore any project or session. When you\’re ready to coordinate your own AI sessions — sign in and create a project.’,
+    position: ‘center’,
+    action: null,
+  },
+];
+
+function startDemoTour(step) {
+  // Clean up any previous tooltip
+  document.getElementById(‘demo-tour-tooltip’)?.remove();
+  document.getElementById(‘demo-tour-highlight’)?.remove();
+
+  if (step >= _DEMO_TOUR_STEPS.length) return;
+  const s = _DEMO_TOUR_STEPS[step];
+
+  // Run optional DOM side-effect (e.g. click a tab) before showing tooltip
+  try { if (s.action) s.action(); } catch(e) {}
+
+  const isLast = step === _DEMO_TOUR_STEPS.length - 1;
+  const targetEl = s.target ? s.target() : null;
+
+  // Highlight ring around target element
+  if (targetEl) {
+    const rect = targetEl.getBoundingClientRect();
+    const ring = document.createElement(‘div’);
+    ring.id = ‘demo-tour-highlight’;
+    ring.style.cssText = `position:fixed;z-index:29998;pointer-events:none;
+      top:${rect.top - 4}px;left:${rect.left - 4}px;
+      width:${rect.width + 8}px;height:${rect.height + 8}px;
+      border:2px solid #7c3aed;border-radius:8px;
+      box-shadow:0 0 0 4000px rgba(0,0,0,0.45);`;
+    document.body.appendChild(ring);
+  }
+
+  // Tooltip card
+  const tip = document.createElement(‘div’);
+  tip.id = ‘demo-tour-tooltip’;
+  const stepLabel = `${step + 1} / ${_DEMO_TOUR_STEPS.length}`;
+  tip.innerHTML = `
+    <div style="font-size:.7rem;color:#6c8fff;font-weight:600;margin-bottom:6px;letter-spacing:.3px">${stepLabel}</div>
+    <div style="font-size:.9rem;font-weight:700;color:#e8eaf0;margin-bottom:8px">${s.title}</div>
+    <div style="font-size:.83rem;color:#c4c6d4;line-height:1.6;margin-bottom:16px">${s.body}</div>
+    <div style="display:flex;gap:8px;justify-content:flex-end">
+      <button id="demo-tour-skip" style="background:none;border:none;color:#6b7280;cursor:pointer;font-size:.8rem;padding:4px 8px;font-family:inherit">End tour</button>
+      <button id="demo-tour-next" style="background:#7c3aed;border:none;border-radius:6px;color:#fff;cursor:pointer;font-size:.82rem;padding:6px 16px;font-family:inherit">
+        ${isLast ? ‘Done’ : ‘Next →’}
+      </button>
+    </div>`;
+  tip.style.cssText = `position:fixed;z-index:30000;background:#1e2029;border:1px solid #7c3aed88;
+    border-radius:10px;padding:16px 18px;width:260px;
+    box-shadow:0 8px 32px rgba(0,0,0,0.6);font-family:inherit;`;
+
+  // Position tooltip relative to target or center
+  if (!targetEl || s.position === ‘center’) {
+    tip.style.top = ‘50%’;
+    tip.style.left = ‘50%’;
+    tip.style.transform = ‘translate(-50%, -50%)’;
+  } else {
+    const rect = targetEl.getBoundingClientRect();
+    const PAD = 12;
+    if (s.position === ‘right’) {
+      tip.style.top = `${Math.min(rect.top, window.innerHeight - 200)}px`;
+      tip.style.left = `${rect.right + PAD}px`;
+    } else {  // bottom
+      tip.style.top = `${rect.bottom + PAD}px`;
+      tip.style.left = `${Math.max(8, Math.min(rect.left, window.innerWidth - 280))}px`;
+    }
+  }
+
+  document.body.appendChild(tip);
+  document.getElementById(‘demo-tour-next’).onclick = () => startDemoTour(step + 1);
+  document.getElementById(‘demo-tour-skip’).onclick = () => {
+    document.getElementById(‘demo-tour-tooltip’)?.remove();
+    document.getElementById(‘demo-tour-highlight’)?.remove();
+  };
 }
 
 async function api(path, opts={}) {
