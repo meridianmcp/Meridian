@@ -765,6 +765,31 @@ async def init_pg_db(url: str) -> PostgresConnection:
     return conn
 
 
+async def get_project_ntfy_url(
+    db: PostgresConnection, project_id: str
+) -> str | None:
+    """Return the ntfy URL for a Postgres-backed project, or None if unset."""
+    async with db.execute(
+        "SELECT ntfy_url FROM projects WHERE id = ?",
+        (project_id,),
+    ) as cur:
+        row = await cur.fetchone()
+    if row is None:
+        return None
+    return row["ntfy_url"] or None
+
+
+async def set_project_ntfy_url(
+    db: PostgresConnection, project_id: str, ntfy_url: str | None
+) -> None:
+    """Persist or clear the ntfy URL on a Postgres-backed project."""
+    await db.execute(
+        "UPDATE projects SET ntfy_url = ? WHERE id = ?",
+        (ntfy_url or None, project_id),
+    )
+    await db.commit()
+
+
 async def _migrate_pg_v09_notes_and_magic_links(conn: PostgresConnection) -> None:
     """v0.9 — project_notes + magic_link_tokens on existing Postgres DBs.
     CREATE_TABLES_PG covers fresh DBs; this is the upgrade path."""
