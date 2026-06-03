@@ -307,6 +307,67 @@ def test_project_settings_http_round_trip(client):
     assert data["max_pinned_decisions"] == 30
 
 
+def test_executor_config_round_trip(client):
+    project = client.post("/projects", json={"name": "exec-cfg-test"}).json()
+    # Save executor config
+    r = client.patch(
+        f"/projects/{project['id']}/settings",
+        json={"executor_config": {"test_cmd": "pixi run test", "test_min": 600, "branch": "dev"}},
+    )
+    assert r.status_code == 200
+    data = r.json()
+    assert data["executor_config"]["test_cmd"] == "pixi run test"
+    assert data["executor_config"]["test_min"] == 600
+    assert data["executor_config"]["branch"] == "dev"
+
+    # Verify persisted on GET
+    r = client.get(f"/projects/{project['id']}/settings")
+    assert r.json()["executor_config"]["test_cmd"] == "pixi run test"
+
+
+def test_file_lock_round_trip(client):
+    import asyncio as _asyncio
+    import json as _json
+
+    def _run(coro):
+        loop = _asyncio.new_event_loop()
+        try:
+            return loop.run_until_complete(coro)
+        finally:
+            loop.close()
+
+    async def _setup():
+        db = client.app.state.db
+        tenant = await db_module.upsert_tenant(db, "filelock@example.com")
+        raw, _ = await db_module.create_api_token(db, tenant["id"])
+        proj = await db_module.create_project(db, "file-lock-test")
+        sess = await db_module.register_session(db, proj["id"], "locker")
+        return raw, proj["id"], sess["id"]
+
+    token, pid, sid = _run(_setup())
+    headers = {"Authorization": f"Bearer {token}"}
+
+    def mcp(name, arguments):
+        return client.post(
+            "/mcp",
+            json={"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                  "params": {"name": name, "arguments": arguments}},
+            headers=headers,
+        )
+
+    # Claim a file
+    r = mcp("claim_file", {"session_id": sid, "file_path": "src/foo.py"})
+    assert r.status_code == 200
+    result = _json.loads(r.json()["result"]["content"][0]["text"])
+    assert result.get("claimed") is True
+
+    # Release it
+    r = mcp("release_file", {"session_id": sid, "file_path": "src/foo.py"})
+    assert r.status_code == 200
+    result = _json.loads(r.json()["result"]["content"][0]["text"])
+    assert result.get("released") is True
+
+
 def test_goal_round_trip_and_versioning(client):
     project = client.post("/projects", json={"name": "alpha"}).json()
     r = client.get(f"/projects/{project['id']}/goal")
