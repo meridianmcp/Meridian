@@ -223,6 +223,10 @@ commit.py
 
 tmp/
 logs/
+tmp/create_tunnel.py
+tmp/config_tunnel.py
+data/oauth_tokens.json
+start_meridian.bat
 
 # Internal strategy documents
 DECISIONS.md

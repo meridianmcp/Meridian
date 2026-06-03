@@ -29,6 +29,9 @@ theme:
 extra_css:
   - stylesheets/extra.css
 
+extra_javascript:
+  - https://cdn.jsdelivr.net/npm/mermaid/dist/mermaid.min.js
+
 nav:
   - Home: index.md
   - Getting Started:
@@ -38,11 +41,16 @@ nav:
   - Hosted (usemeridian.us): hosted.md
   - Self-Hosting: self-hosting.md
   - API Reference: api-reference.md
+  - FAQ: faq.md
 
 markdown_extensions:
   - admonition
   - pymdownx.details
-  - pymdownx.superfences
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
   - pymdownx.highlight:
       anchor_linenums: true
   - pymdownx.inlinehilite

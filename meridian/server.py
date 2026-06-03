@@ -1321,6 +1321,48 @@ async def patch_project_settings(
     return settings
 
 
+@app.get("/projects/{project_id}/ntfy")
+async def get_project_ntfy(project_id: str, request: Request) -> dict[str, Any]:
+    """Return the ntfy push URL configured for this project."""
+    project = await db_module.get_project(await _db(request), project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="project not found")
+    url = await db_module.get_project_ntfy_url(await _db(request), project_id)
+    return {"ntfy_url": url or ""}
+
+
+@app.patch("/projects/{project_id}/ntfy")
+async def set_project_ntfy(
+    project_id: str, body: dict[str, Any], request: Request
+) -> dict[str, Any]:
+    """Save (or clear) the ntfy push URL for this project."""
+    project = await db_module.get_project(await _db(request), project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="project not found")
+    ntfy_url = str(body.get("ntfy_url") or "").strip() or None
+    await db_module.set_project_ntfy_url(await _db(request), project_id, ntfy_url)
+    return {"ntfy_url": ntfy_url or ""}
+
+
+async def _notify_project(
+    db: Any, project_id: str, title: str, body_text: str
+) -> None:
+    """Best-effort ntfy push for a project. Silently ignores errors."""
+    try:
+        ntfy_url = await db_module.get_project_ntfy_url(db, project_id)
+        if not ntfy_url:
+            return
+        import httpx as _httpx
+        async with _httpx.AsyncClient(timeout=5.0) as client:
+            await client.post(
+                ntfy_url,
+                content=body_text.encode(),
+                headers={"Title": title, "Priority": "high"},
+            )
+    except Exception:  # noqa: BLE001
+        pass  # never let notifications crash the main flow
+
+
 @app.post("/projects/{project_id}/rename")
 async def rename_project(
     project_id: str, body: dict[str, Any], request: Request
@@ -4427,13 +4469,20 @@ async def _dispatch_mcp_tool(name: str, args: dict[str, Any], db: Any, data_dir:
             "start_fresh": start_fresh,
         }
     if name == "request_hitl":
-        return await db_module.request_hitl(
+        result = await db_module.request_hitl(
             db, args["project_id"], args["question"],
             session_id=args.get("session_id"),
             context=args.get("context"),
             urgency=args.get("urgency", "normal"),
             assigned_to=args.get("assigned_to"),
         )
+        # Notify via ntfy if configured — best-effort, non-blocking
+        await _notify_project(
+            db, args["project_id"],
+            f"HITL [{args.get('urgency','normal').upper()}]",
+            f"{args['question'][:200]}",
+        )
+        return result
     if name == "get_hitl_request":
         result = await db_module.get_hitl_request(db, args["request_id"])
         if result is None:
@@ -4532,6 +4581,12 @@ async def _dispatch_mcp_tool(name: str, args: dict[str, Any], db: Any, data_dir:
         )
         if item is None:
             raise ValueError("sprint item not found")
+        # Notify via ntfy if configured — best-effort
+        await _notify_project(
+            db, args["project_id"],
+            "Sprint item done ✓",
+            f"{(item.get('title') or '')[:200]}",
+        )
         return item
     if name == "get_run_transcript":
         run = await db_module.get_executor_run_by_session(db, args.get("session_id", ""))
@@ -4608,6 +4663,132 @@ _MCP_RATE_LIMIT = "100/minute"
 # reads the JSON response directly from the HTTP response body.
 
 _SSE_SESSIONS: dict[str, dict[str, Any]] = {}  # session_id → {db, queue}
+
+# ── OAuth 2.0 for claude.ai custom connector ──────────────────────────────
+import secrets as _sec, hashlib as _hs, base64 as _b64, time as _tm, json as _json
+from urllib.parse import urlencode as _ue
+from fastapi.responses import RedirectResponse as _RR
+
+_oa_clients: dict = {}
+_oa_codes: dict = {}
+
+# Tokens persisted to disk so they survive server restarts
+_OA_TOKEN_FILE = DEFAULT_DATA_DIR / "oauth_tokens.json"
+
+def _load_oa_tokens() -> dict:
+    try:
+        if _OA_TOKEN_FILE.exists():
+            data = _json.loads(_OA_TOKEN_FILE.read_text())
+            now = _tm.time()
+            return {k: v for k, v in data.items() if v.get("exp", 0) > now}
+    except Exception:
+        pass
+    return {}
+
+def _save_oa_tokens(tokens: dict) -> None:
+    try:
+        _OA_TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
+        _OA_TOKEN_FILE.write_text(_json.dumps(tokens))
+    except Exception:
+        pass
+
+_oa_tokens: dict = _load_oa_tokens()
+
+
+@app.get("/.well-known/oauth-authorization-server")
+async def _oauth_meta(request: Request):
+    b = str(request.base_url).rstrip("/")
+    return JSONResponse({"issuer": b,
+        "authorization_endpoint": f"{b}/oauth/authorize",
+        "token_endpoint": f"{b}/oauth/token",
+        "registration_endpoint": f"{b}/oauth/register",
+        "scopes_supported": ["mcp"],
+        "response_types_supported": ["code"],
+        "grant_types_supported": ["authorization_code"],
+        "code_challenge_methods_supported": ["S256"],
+        "token_endpoint_auth_methods_supported": ["client_secret_post", "none"]})
+
+
+@app.post("/oauth/register")
+async def _oauth_reg(request: Request):
+    d = await request.json()
+    cid, cs = _sec.token_urlsafe(16), _sec.token_urlsafe(32)
+    _oa_clients[cid] = {"secret": cs, "redirect_uris": d.get("redirect_uris", [])}
+    return JSONResponse({"client_id": cid, "client_secret": cs,
+        "redirect_uris": d.get("redirect_uris", []),
+        "grant_types": ["authorization_code"],
+        "token_endpoint_auth_method": "client_secret_post"}, status_code=201)
+
+
+@app.get("/oauth/authorize")
+async def _oauth_auth(request: Request):
+    p = dict(request.query_params)
+    # ── Session cookie guard (hosted mode only) ─────────────────────────────
+    # Prevents unauthenticated callers from obtaining MCP access tokens.
+    # Local / self-hosted installs skip this guard (_hosted_mode() is False).
+    if _hosted_mode():
+        authed = False
+        from .hosted import _SESSION_COOKIE, _read_session_cookie
+        auth_db = request.app.state.db
+        cookie_val = request.cookies.get(_SESSION_COOKIE, "")
+        if cookie_val:
+            sid = _read_session_cookie(cookie_val)
+            if sid and await db_module.get_user_session(auth_db, sid):
+                authed = True
+        if not authed:
+            # Also accept a bearer token (API-key flow)
+            auth_header = request.headers.get("authorization", "")
+            if auth_header.startswith("Bearer "):
+                tok_hash = hashlib.sha256(auth_header[7:].encode()).hexdigest()
+                if await db_module.get_tenant_from_token_hash(auth_db, tok_hash):
+                    authed = True
+        if not authed:
+            from urllib.parse import quote as _q
+            orig_qs = str(request.url.query)
+            next_path = f"/oauth/authorize?{orig_qs}" if orig_qs else "/oauth/authorize"
+            return _RR(f"/auth/login?next={_q(next_path)}")
+    # ── Auto-approve ────────────────────────────────────────────────────────
+    code = _sec.token_urlsafe(32)
+    _oa_codes[code] = {"client_id": p.get("client_id", ""),
+        "redirect_uri": p.get("redirect_uri", ""),
+        "challenge": p.get("code_challenge"),
+        "exp": _tm.time() + 600}
+    qs = _ue({"code": code, "state": p.get("state", "")})
+    return _RR(f"{p.get('redirect_uri', '')}?{qs}")
+
+
+@app.post("/oauth/token")
+async def _oauth_token(request: Request):
+    ct = request.headers.get("content-type", "")
+    d = dict(await request.json() if "json" in ct else await request.form())
+    if d.get("grant_type") != "authorization_code":
+        return JSONResponse({"error": "unsupported_grant_type"}, status_code=400)
+    code = d.get("code", "")
+    if code not in _oa_codes:
+        return JSONResponse({"error": "invalid_grant"}, status_code=400)
+    cd = _oa_codes.pop(code)
+    if _tm.time() > cd["exp"]:
+        return JSONResponse({"error": "invalid_grant"}, status_code=400)
+    v = d.get("code_verifier")
+    if cd.get("challenge") and v:
+        ch = _b64.urlsafe_b64encode(_hs.sha256(v.encode()).digest()).decode().rstrip("=")
+        if ch != cd["challenge"]:
+            return JSONResponse({"error": "invalid_grant"}, status_code=400)
+    tok = _sec.token_urlsafe(32)
+    _oa_tokens[tok] = {"client_id": cd["client_id"], "exp": _tm.time() + 86400 * 90}
+    _save_oa_tokens(_oa_tokens)
+    return JSONResponse({"access_token": tok, "token_type": "bearer", "expires_in": 86400 * 90})
+
+
+@app.get("/mcp")
+async def _mcp_get(request: Request):
+    accept = request.headers.get("accept", "")
+    if "text/event-stream" in accept:
+        return _RR("/mcp/sse")
+    return JSONResponse({"name": "meridian", "version": "1.0", "transport": "http+sse"})
+
+# ── End OAuth ──────────────────────────────────────────────────────────────
+
 
 _SSE_CORS_HEADERS = {
     "Access-Control-Allow-Origin": "*",
@@ -4712,7 +4893,24 @@ async def remote_mcp(request: Request) -> Any:
         except Exception:
             pass  # rate limiting is best-effort; don't block on errors
 
-    # Bearer auth required
+    # Check local OAuth tokens first (claude.ai connector via tunnel)
+    _auth = request.headers.get("authorization", "")
+    _bearer = _auth.removeprefix("Bearer ").strip()
+    if _bearer and _bearer in _oa_tokens:
+        _td = _oa_tokens[_bearer]
+        if _tm.time() > _td.get("exp", 0):
+            return JSONResponse({"error": "token_expired"}, status_code=401)
+        try:
+            _body = await request.json()
+        except Exception:
+            return JSONResponse(_jsonrpc_err(None, -32700, "parse error"), status_code=400)
+        _mdb = request.app.state.db
+        _mdd = request.app.state.data_dir
+        if isinstance(_body, list):
+            return JSONResponse([await _handle_mcp_request(i, _mdb, _mdd) for i in _body])
+        return JSONResponse(await _handle_mcp_request(_body, _mdb, _mdd))
+
+    # Bearer auth required (hosted tenant path)
     tenant = await get_tenant_from_bearer(request)  # raises 401 if invalid
 
     try:

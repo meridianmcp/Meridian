@@ -89,13 +89,13 @@ async def _claim_task_result(
 
 @router.get("/projects/{project_id}/tasks", response_model=list[Task])
 async def get_tasks(
-    project_id: str, request: Request, limit: int = 20
+    project_id: str, request: Request, limit: int = 20, offset: int = 0
 ) -> list[dict[str, Any]]:
-    """List recent tasks for a project, newest first."""
+    """List recent tasks for a project, newest first. Supports pagination via limit/offset."""
     project = await db_module.get_project(await _db(request), project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="project not found")
-    return await db_module.get_tasks(await _db(request), project_id, limit=limit)
+    return await db_module.get_tasks(await _db(request), project_id, limit=limit, offset=offset)
 
 
 @router.get("/projects/{project_id}/sessions/{session_id}/tasks/live")

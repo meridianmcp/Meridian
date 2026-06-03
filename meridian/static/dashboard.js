@@ -744,7 +744,7 @@ function buildTabBody(project) {
       <button class="vtab-btn" data-vtab="queue" title="Work Queue">🪖</button>
       <button class="vtab-btn" data-vtab="team" title="Team — per-human activity">👥</button>
       <button class="vtab-btn" data-vtab="notes" title="Notes — per-project wiki">📝</button>
-      <button class="vtab-btn" data-vtab="hitl" title="HITL — Human-in-the-Loop queue">❓</button>
+      <button class="vtab-btn" data-vtab="hitl" title="HITL — Human-in-the-Loop queue" style="position:relative">❓<span class="hitl-vtab-badge" data-pid="${project.id}" style="display:none;position:absolute;top:2px;right:2px;background:#f87171;color:#fff;font-size:8px;font-weight:700;padding:0 3px;border-radius:6px;line-height:14px;pointer-events:none">0</span></button>
       <button class="vtab-btn" data-vtab="docs" title="MCP Tool Reference">📖</button>
       <button class="vtab-btn" data-vtab="settings" title="Notification Settings">🔔</button>
     </div>
@@ -834,7 +834,7 @@ function buildTabBody(project) {
           </div>
           <div class="goal-subtab-panel" id="gtab-version-goal-${project.id}">
             <div style="color:var(--muted);font-size:10px;margin-bottom:6px">Current milestone — what ships this cycle (v1.2, v2.0, etc).</div>
-            <div id="goal-title-${project.id}" style="font-family:var(--font-mono);font-size:11px;font-weight:600;color:var(--accent);padding:5px 8px;background:var(--surface-2);border:1px solid var(--border);border-radius:4px 4px 0 0;border-bottom:none;user-select:none;flex-shrink:0" title="Version title (read-only)"></div>
+            <div id="goal-title-${project.id}" style="font-family:var(--font-mono);font-size:11px;font-weight:600;color:var(--accent);padding:5px 8px;background:var(--surface-2);border:1px solid var(--border);border-radius:4px 4px 0 0;border-bottom:none;user-select:none;flex-shrink:0;white-space:pre-wrap;overflow:visible" title="Version title (read-only)"></div>
             <div id="goal-shipped-${project.id}" style="display:none;font-family:var(--font-mono);font-size:10px;color:var(--muted);padding:6px 8px;background:var(--surface-2);border:1px solid var(--border);border-top:none;border-bottom:none;white-space:pre-wrap;user-select:none;flex-shrink:0" title="SHIPPED section (read-only — updated by Claude Code)"></div>
             <textarea class="goal-area goal-full mono" id="goal-${project.id}" placeholder="CURRENT FOCUS:" style="border-radius:0 0 4px 4px;font-size:13px"></textarea>
             <div class="goal-actions" style="flex-shrink:0">
@@ -850,8 +850,8 @@ function buildTabBody(project) {
           <div class="goal-subtab-panel" id="gtab-sprint-${project.id}">
             <div style="color:var(--muted);font-size:10px;margin-bottom:4px">What this session is doing right now. Updated frequently — not a multi-week scrum sprint.</div>
             <div style="display:flex;gap:6px;margin-bottom:10px;align-items:center">
-              <select id="goal-sprint-select-${project.id}" style="flex:1;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;padding:6px 8px;color:var(--text);font-family:var(--font-mono);font-size:11px;outline:none"><option value="" disabled selected>loading sessions…</option></select>
-              <input type="text" id="goal-sprint-${project.id}" placeholder="v1.9.x — description" style="flex:1;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;padding:6px 8px;color:var(--text);font-family:var(--font-mono);font-size:11px;outline:none;display:none">
+              <select id="goal-sprint-select-${project.id}" style="flex:1;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;padding:6px 8px;color:var(--muted);font-family:var(--font-mono);font-size:11px;outline:none"><option value="" disabled selected>loading sessions…</option></select>
+              <input type="text" id="goal-sprint-${project.id}" placeholder="v1.0.x — description" style="flex:1;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;padding:6px 8px;color:var(--muted);font-family:var(--font-mono);font-size:11px;outline:none;display:none">
               <button class="secondary" id="save-sprint-${project.id}" style="white-space:nowrap">save</button>
               <span class="goal-ts" id="goal-sp-ts-${project.id}" style="font-size:10px;color:var(--muted)"></span>
             </div>
@@ -925,6 +925,10 @@ function buildTabBody(project) {
             <button class="secondary rewind-day-btn" data-days="365" data-pid="${project.id}" style="padding:2px 8px;font-size:10px">1y</button>
             <button class="secondary rewind-day-btn" data-days="3650" data-pid="${project.id}" style="padding:2px 8px;font-size:10px">All</button>
           </span>
+        </div>
+        <div style="flex-shrink:0;padding:6px 14px;border-bottom:1px solid var(--border)">
+          <input type="text" id="rewind-search-${project.id}" placeholder="Search tasks, notes, decisions…"
+            style="width:100%;padding:5px 10px;background:var(--surface-2);border:1px solid var(--border);border-radius:4px;font-family:var(--font-mono);font-size:11px;color:var(--text);outline:none;box-sizing:border-box">
         </div>
         <div class="rewind-wrap" id="rewind-wrap-${project.id}" style="flex:1;overflow:auto;padding:14px;font-family:'IBM Plex Mono',monospace;font-size:11px">
           <div class="empty" style="color:var(--muted)">pick a window above</div>
@@ -1526,7 +1530,7 @@ function renderSprintProgress(projectId, items) {
       <div class="live-empty">No sprint items. Add one below.</div>
       <div class="sprint-add-row" style="margin-top:6px">
         <input class="live-add-input" id="sprint-add-input-${projectId}"
-               placeholder="version:title (e.g. v1.9:My item)">
+               placeholder="version:title (e.g. v1.0:My item)">
         <button class="secondary sprint-add-btn" data-pid="${escapeHtml(projectId)}"
                 style="margin-left:4px">+ Add</button>
       </div>`;
@@ -1641,6 +1645,25 @@ function renderSprintProgress(projectId, items) {
               style="margin-left:4px">+ Add</button>
     </div>
   </div>`;
+
+  // Backburner section — pushed/post-launch items collapsed by default
+  const pushedItems = items.filter(it => it.status === 'pushed');
+  if (pushedItems.length > 0) {
+    html += `<details style="margin-top:8px;border:1px solid var(--border);border-radius:4px;background:var(--surface-1)">
+      <summary style="cursor:pointer;padding:6px 10px;font-family:var(--font-mono);font-size:10px;color:var(--muted);letter-spacing:.05em;user-select:none;list-style:none;display:flex;align-items:center;gap:6px">
+        <span>⏸</span><span>Backburner (${pushedItems.length} pushed)</span>
+      </summary>
+      <div style="padding:4px 10px 8px">
+        ${pushedItems.map(it => `<div style="display:flex;align-items:center;gap:6px;padding:3px 0;border-top:1px solid var(--border)">
+          <span style="color:var(--muted);font-size:10px;flex-shrink:0">→</span>
+          <span style="font-family:var(--font-mono);font-size:10px;color:var(--muted);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${escapeHtml(it.title)}">${escapeHtml(it.title)}</span>
+          ${it.pushed_to ? `<span style="font-size:9px;color:var(--accent);background:var(--accent)1a;border:1px solid var(--accent)33;border-radius:3px;padding:0 5px;flex-shrink:0;font-family:var(--font-mono)">${escapeHtml(it.pushed_to)}</span>` : ''}
+          ${it.version ? `<span style="font-size:9px;color:var(--muted);flex-shrink:0">${escapeHtml(it.version)}</span>` : ''}
+        </div>`).join('')}
+      </div>
+    </details>`;
+  }
+
   root.innerHTML = html;
   root.querySelector('.sprint-add-btn').onclick =
     () => addSprintItemFromInput(projectId);
@@ -2181,65 +2204,156 @@ async function loadTimeline(projectId) {
 function renderTimeline(projectId, data) {
   const wrap = document.getElementById(`timeline-wrap-${projectId}`);
   if (!wrap) return;
-  const { tasks = [], sessions = [], goal_events = [] } = data || {};
-  if (!sessions.length && !tasks.length && !goal_events.length) {
+  const { tasks = [], goal_events = [] } = data || {};
+
+  if (!tasks.length && !goal_events.length) {
     wrap.innerHTML = `<div class="timeline-empty">no activity yet — log a task to see it here</div>`;
     return;
   }
-  const isAbs = !!(state.panels[projectId] && state.panels[projectId]._timelineAbsolute);
-  const fmtTs = (ts) => {
-    if (!ts) return '';
-    const iso = ts.includes('T') ? ts : ts.replace(' ', 'T') + 'Z';
-    return isAbs
-      ? new Date(iso).toISOString().replace('T', ' ').slice(0, 16)
-      : formatRelativeTime(ts);
+
+  // Destroy any previous vis instance to avoid duplicate timelines
+  const p = state.panels[projectId];
+  if (p && p._visTimeline) {
+    try { p._visTimeline.destroy(); } catch (_) {}
+    p._visTimeline = null;
+  }
+
+  // Fall back to log view if vis-timeline not loaded
+  if (typeof vis === 'undefined' || !vis.Timeline) {
+    _renderTimelineLog(projectId, data);
+    return;
+  }
+
+  // Parse SQLite timestamp ("YYYY-MM-DD HH:MM:SS") as UTC Date
+  const parseTs = ts => {
+    if (!ts) return null;
+    try {
+      return new Date(ts.includes('T') ? ts : ts.replace(' ', 'T') + 'Z');
+    } catch (_) { return null; }
   };
 
-  // Build a unified event list; sort newest first.
-  const events = [];
+  // Build groups — one per unique session name; plus a "goal" row
+  const sessionNames = [...new Set(tasks.map(t => t.session_name || '(unknown)'))];
+  const groupsArr = sessionNames.map((name, i) => ({
+    id: `s:${name}`,
+    content: `<span style="font-family:var(--font-mono);font-size:10px;color:var(--muted)">${escapeHtml(name.slice(0, 24))}</span>`,
+  }));
+  if (goal_events.length) {
+    groupsArr.push({
+      id: 'goal',
+      content: `<span style="font-family:var(--font-mono);font-size:10px;color:var(--accent)">goal</span>`,
+    });
+  }
+
+  // Build task items
+  const items = [];
+  let itemId = 1;
   tasks.forEach(t => {
-    const icon = { done: '✅', failed: '❌', pending: '⏳', in_progress: '🔄' }[t.status] || '•';
-    events.push({
-      ts: t.created_at,
-      actor: t.session_name || '(unknown)',
-      desc: `${icon} ${t.description.slice(0, 100)}`,
+    const start = parseTs(t.created_at);
+    if (!start) return;
+    const isDone = t.status === 'done';
+    const bg = isDone ? '#34d39922' : '#f871711a';
+    const border = isDone ? '#34d399' : '#f87171';
+    const title = escapeHtml((t.description || '').slice(0, 80));
+    items.push({
+      id: itemId++,
+      group: `s:${t.session_name || '(unknown)'}`,
+      content: `<span style="font-size:9px;font-family:var(--font-mono);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;display:block;max-width:140px" title="${title}">${isDone ? '✓' : '✗'} ${title}</span>`,
+      start,
+      style: `background:${bg};border-color:${border};color:var(--text);border-radius:3px;padding:1px 4px`,
     });
   });
-  sessions.forEach(s => {
-    const label = s.human_id ? `${s.human_id}/${s.name}` : s.name;
-    events.push({
-      ts: s.registered_at || s.last_seen || '',
-      actor: label,
-      desc: `🟢 session ${s.status || 'registered'}`,
-    });
-  });
-  // Collapse goal events — show only latest per field per hour
+
+  // Collapse goal events — one per field per hour
   const goalByField = new Map();
   goal_events.forEach(g => {
-    // Skip version_goal events that are ONLY an AUTO BLOCKS update (minor=True writes)
-    // These are identified by new_summary starting with AUTO SUMMARY or containing only auto-block content
     if (g.field === 'version_goal') {
       const summary = (g.new_summary || '');
       if (summary.startsWith('[AUTO SUMMARY') || summary.startsWith('- [DONE]') || summary.startsWith('- [PENDING]')) return;
     }
-    const key = g.field + (g.updated_at || '').slice(0, 13); // group by field+hour
+    const key = g.field + (g.updated_at || '').slice(0, 13);
     if (!goalByField.has(key) || g.version > (goalByField.get(key).version || 0)) {
       goalByField.set(key, g);
     }
   });
   goalByField.forEach(g => {
-    events.push({ ts: g.updated_at || '', actor: 'goal', desc: `📋 ${g.field} → v${g.version}` });
+    const start = parseTs(g.updated_at);
+    if (!start) return;
+    items.push({
+      id: itemId++,
+      group: 'goal',
+      content: `<span style="font-size:9px;font-family:var(--font-mono)" title="${escapeHtml(g.field)} v${g.version}">${escapeHtml(g.field.replace('_updated_at','').replace('_',' '))} v${g.version}</span>`,
+      start,
+      style: 'background:#6c8fff22;border-color:#6c8fff;color:var(--text);border-radius:3px;padding:1px 4px',
+    });
   });
-  events.sort((a, b) => (b.ts || '').localeCompare(a.ts || ''));
 
-  const rows = events.map(e =>
-    `<div class="timeline-log-entry">` +
-    `<span class="timeline-log-ts">${escapeHtml(fmtTs(e.ts))}</span>` +
-    `<span class="timeline-log-actor">${escapeHtml(e.actor)}</span>` +
-    `<span class="timeline-log-desc">${escapeHtml(e.desc)}</span>` +
-    `</div>`
-  ).join('');
-  wrap.innerHTML = `<div class="timeline-log">${rows}</div>`;
+  // Create vis container
+  wrap.innerHTML = '';
+  const container = document.createElement('div');
+  container.style.cssText = 'height:100%;min-height:300px;background:transparent';
+  wrap.appendChild(container);
+
+  const options = {
+    stack: false,
+    orientation: 'top',
+    showCurrentTime: false,
+    zoomable: true,
+    moveable: true,
+    selectable: false,
+    groupOrder: 'id',
+    margin: { item: { horizontal: 2, vertical: 2 } },
+    locale: 'en',
+    xss: { disabled: true },
+  };
+
+  try {
+    const groups = new vis.DataSet(groupsArr);
+    const itemsDs = new vis.DataSet(items);
+    const timeline = new vis.Timeline(container, itemsDs, groups, options);
+
+    // Dark-mode style overrides for vis elements
+    const styleId = `vis-dark-${projectId}`;
+    if (!document.getElementById(styleId)) {
+      const s = document.createElement('style');
+      s.id = styleId;
+      s.textContent = `.vis-timeline{background:transparent;border-color:var(--border)!important}.vis-time-axis .vis-text{color:var(--muted)!important;font-family:var(--font-mono);font-size:10px}.vis-label{background:var(--surface)!important;border-color:var(--border)!important}.vis-panel.vis-center{border-color:var(--border)!important}.vis-panel.vis-left{border-color:var(--border)!important}.vis-item{border-width:1px}`;
+      document.head.appendChild(s);
+    }
+
+    if (p) p._visTimeline = timeline;
+  } catch (err) {
+    console.warn('vis-timeline init failed, falling back to log:', err);
+    _renderTimelineLog(projectId, data);
+  }
+}
+
+function _renderTimelineLog(projectId, data) {
+  /** Fallback text log when vis-timeline isn't available. */
+  const wrap = document.getElementById(`timeline-wrap-${projectId}`);
+  if (!wrap) return;
+  const { tasks = [], goal_events = [] } = data || {};
+  const isAbs = !!(state.panels[projectId] && state.panels[projectId]._timelineAbsolute);
+  const fmtTs = ts => {
+    if (!ts) return '';
+    const iso = ts.includes('T') ? ts : ts.replace(' ', 'T') + 'Z';
+    return isAbs ? new Date(iso).toISOString().replace('T',' ').slice(0,16) : formatRelativeTime(ts);
+  };
+  const events = [];
+  tasks.forEach(t => {
+    const icon = { done: '✅', failed: '❌' }[t.status] || '•';
+    events.push({ ts: t.created_at, actor: t.session_name || '(unknown)', desc: `${icon} ${(t.description || '').slice(0, 100)}` });
+  });
+  const goalByField = new Map();
+  goal_events.forEach(g => {
+    const key = g.field + (g.updated_at || '').slice(0, 13);
+    if (!goalByField.has(key) || g.version > (goalByField.get(key).version || 0)) goalByField.set(key, g);
+  });
+  goalByField.forEach(g => events.push({ ts: g.updated_at || '', actor: 'goal', desc: `📋 ${g.field} → v${g.version}` }));
+  events.sort((a, b) => (b.ts || '').localeCompare(a.ts || ''));
+  wrap.innerHTML = `<div class="timeline-log">${events.map(e =>
+    `<div class="timeline-log-entry"><span class="timeline-log-ts">${escapeHtml(fmtTs(e.ts))}</span><span class="timeline-log-actor">${escapeHtml(e.actor)}</span><span class="timeline-log-desc">${escapeHtml(e.desc)}</span></div>`
+  ).join('')}</div>`;
 }
 
 const _HUMAN_COLORS = ['#6c8fff', '#a78bfa', '#22d3ee', '#4ade80', '#fbbf24', '#f87171', '#fb923c', '#e879f9'];
@@ -2318,10 +2432,11 @@ async function loadSettingsTab(projectId) {
   ];
 
   // Fetch both in parallel; mcp-config 404 = self-hosted (skip section).
-  const [notifResult, mcpResult, settingsResult] = await Promise.allSettled([
+  const [notifResult, mcpResult, settingsResult, ntfyResult] = await Promise.allSettled([
     api('/settings/notifications'),
     api('/settings/mcp-config'),
     loadProjectSettings(projectId),
+    api(`/projects/${projectId}/ntfy`),
   ]);
 
   const prefs = (notifResult.status === 'fulfilled') ? (notifResult.value.prefs || {}) : null;
@@ -2771,6 +2886,23 @@ async function loadSettingsTab(projectId) {
     }, 0);
   }
 
+  // ntfy push notifications card — works for self-hosted + hosted
+  const ntfyData = (ntfyResult.status === 'fulfilled') ? ntfyResult.value : null;
+  const ntfyUrl = ntfyData ? (ntfyData.ntfy_url || '') : '';
+  html += `<div style="margin-bottom:14px;padding:10px 12px;border:1px solid var(--border);border-radius:6px;background:var(--surface-2)">
+    <div style="font-weight:600;font-size:11px;color:var(--text);margin-bottom:4px">Push notifications via ntfy</div>
+    <div style="font-size:10px;color:var(--muted);margin-bottom:8px">Paste an <a href="https://ntfy.sh" target="_blank" style="color:var(--accent)">ntfy.sh</a> topic URL (or self-hosted) to receive push alerts for HITL requests and sprint completions. No account required.</div>
+    <div style="display:flex;gap:6px;align-items:center">
+      <input type="text" id="ntfy-url-${projectId}"
+        value="${escapeHtml(ntfyUrl)}"
+        placeholder="https://ntfy.sh/my-topic"
+        style="flex:1;padding:5px 8px;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;color:var(--text);font-family:var(--font-mono);font-size:11px;outline:none">
+      <button class="secondary" id="ntfy-save-${projectId}" style="padding:4px 10px;font-size:10px">Save</button>
+      <span id="ntfy-status-${projectId}" style="font-size:10px;color:var(--muted);min-width:40px"></span>
+    </div>
+    <div style="font-size:9px;color:var(--muted);margin-top:4px">Install the <strong>ntfy</strong> app on iOS/Android/desktop. Create a topic, paste the URL above. Self-hosted ntfy = data stays on your infra.</div>
+  </div>`;
+
   // Notifications section
   if (prefs !== null) {
     html += `<div style="margin-bottom:12px">
@@ -2789,6 +2921,22 @@ async function loadSettingsTab(projectId) {
   }
 
   body.innerHTML = html;
+
+  // Wire ntfy save button
+  const ntfySaveBtn = document.getElementById(`ntfy-save-${projectId}`);
+  if (ntfySaveBtn) {
+    ntfySaveBtn.onclick = async () => {
+      const inp = document.getElementById(`ntfy-url-${projectId}`);
+      const statusEl = document.getElementById(`ntfy-status-${projectId}`);
+      const url = (inp ? inp.value.trim() : '') || null;
+      try {
+        await api(`/projects/${projectId}/ntfy`, { method: 'PATCH', body: JSON.stringify({ ntfy_url: url }) });
+        if (statusEl) { statusEl.textContent = 'saved'; setTimeout(() => { statusEl.textContent = ''; }, 2000); }
+      } catch (e) {
+        if (statusEl) statusEl.textContent = 'error';
+      }
+    };
+  }
 
   body.querySelectorAll('input[data-pref]').forEach(cb => {
     cb.onchange = async () => {
@@ -3291,23 +3439,33 @@ async function loadMilestones(projectId) {
   if (!el) return;
   try {
     const all = await api(`/projects/${projectId}/sprint-items`);
-    const milestones = (all || []).filter(i => i.milestone_type === 'milestone');
+    // Show explicit milestone items + any done/failed/skipped/pushed sprint items
+    const doneStatuses = new Set(['done', 'skipped', 'failed', 'pushed']);
+    const milestones = (all || []).filter(i =>
+      i.milestone_type === 'milestone' || doneStatuses.has(i.status)
+    ).sort((a, b) => {
+      // Done items first, then by completed_at desc
+      const aTs = a.completed_at || a.added_at || '';
+      const bTs = b.completed_at || b.added_at || '';
+      return bTs.localeCompare(aTs);
+    });
     if (!milestones.length) { el.style.display = 'none'; return; }
-    const statusIcon = s => s === 'done' ? '✓' : s === 'failed' ? '✗' : s === 'in_progress' ? '▶' : '◦';
-    const statusColor = s => s === 'done' ? 'var(--success,#2a2)' : s === 'failed' ? 'var(--danger,#e05)' : s === 'in_progress' ? 'var(--accent)' : 'var(--muted)';
+    const statusIcon = s => s === 'done' ? '✓' : s === 'failed' ? '✗' : s === 'pushed' ? '→' : s === 'skipped' ? '—' : s === 'in_progress' ? '▶' : '◦';
+    const statusColor = s => s === 'done' ? 'var(--accent-green,#34d399)' : s === 'failed' ? '#e05' : s === 'pushed' ? 'var(--accent)' : s === 'in_progress' ? 'var(--accent)' : 'var(--muted)';
     el.innerHTML = `
-      <div style="font-size:9px;font-weight:700;color:var(--muted);letter-spacing:.07em;text-transform:uppercase;margin-bottom:6px">Milestones</div>
+      <div style="font-size:9px;font-weight:700;color:var(--muted);letter-spacing:.07em;text-transform:uppercase;margin-bottom:6px">Completed (${milestones.length})</div>
       <div style="display:flex;flex-wrap:wrap;gap:6px">
-        ${milestones.map(m => {
+        ${milestones.slice(0, 20).map(m => {
           const date = (m.completed_at || m.added_at || '').slice(0, 10);
           const ic = statusIcon(m.status);
           const col = statusColor(m.status);
-          return `<div style="display:flex;align-items:center;gap:4px;border:1px solid var(--border);border-radius:3px;padding:3px 7px;background:var(--surface-1)">
+          return `<div style="display:flex;align-items:center;gap:4px;border:1px solid var(--border);border-radius:3px;padding:3px 7px;background:var(--surface-1);opacity:${m.status === 'done' ? 1 : 0.7}">
             <span style="color:${col};font-size:11px">${ic}</span>
-            <span style="font-family:var(--font-mono);font-size:10px;color:var(--text)">${escapeHtml(m.title.slice(0, 40))}</span>
+            <span style="font-family:var(--font-mono);font-size:10px;color:var(--text)">${escapeHtml((m.title || '').slice(0, 40))}</span>
             ${date ? `<span style="font-size:9px;color:var(--muted)">${escapeHtml(date)}</span>` : ''}
           </div>`;
         }).join('')}
+        ${milestones.length > 20 ? `<span style="font-size:10px;color:var(--muted);padding:3px 4px">+${milestones.length - 20} more</span>` : ''}
       </div>`;
     el.style.display = 'block';
   } catch (_) {
@@ -3693,6 +3851,7 @@ async function refreshGoal(projectId) {
       if (shippedEl) shippedEl.style.display = 'none';
       ta.value = body;
     }
+    autosizeGoalField(ta);
 
     const autoBlocksEl = document.getElementById(`goal-autoblocks-${projectId}`);
     if (autoBlocksEl) {
@@ -3833,6 +3992,23 @@ const _HITL_URGENCY_COLOR = {
 
 let _hitlPollTimer = null;
 
+function _hitlBadgeClick() {
+  /** Click handler for the hitl-count badge in the top bar — switches the
+   * active project to the HITL vtab and opens the panel. */
+  const pid = state.activeTab;
+  if (pid) {
+    const hitlBtn = document.querySelector(`#vtab-strip-${pid} [data-vtab="hitl"]`);
+    if (hitlBtn) hitlBtn.click();
+  }
+  // Also open the inline panel if currently closed
+  const panel = document.getElementById('hitl-panel');
+  const toggleBtn = document.getElementById('hitl-toggle-btn');
+  if (panel && panel.style.display === 'none') {
+    panel.style.display = 'block';
+    if (toggleBtn) toggleBtn.textContent = 'Close';
+  }
+}
+
 function initHitlPanel() {
   /** v2.4 — boot the HITL polling loop + toggle wire-up. The bar at the
    * top of <main> auto-shows when there's at least one pending request
@@ -3865,6 +4041,11 @@ async function refreshHitl() {
     const items = await api('/hitl?status=pending&limit=50');
     const n = items.length;
     countEl.textContent = String(n);
+    // Sync per-project vtab badges
+    document.querySelectorAll('.hitl-vtab-badge').forEach(badge => {
+      badge.textContent = String(n);
+      badge.style.display = n > 0 ? 'inline-block' : 'none';
+    });
     if (n === 0) {
       bar.style.display = 'none';
       document.getElementById('hitl-panel').style.display = 'none';
@@ -4028,6 +4209,43 @@ async function loadPinnedDecisions(projectId) {
     host.querySelectorAll('[data-supersede]').forEach(btn => {
       btn.onclick = () => supersedePinnedDecision(projectId, btn.dataset.supersede);
     });
+
+    // Superseded section — collapsible <details> below active cards
+    let supersededEl = document.getElementById(`superseded-decisions-${projectId}`);
+    if (!supersededEl) {
+      supersededEl = document.createElement('div');
+      supersededEl.id = `superseded-decisions-${projectId}`;
+      host.parentElement.insertBefore(supersededEl, host.nextSibling);
+    }
+    try {
+      const all = await api(`/projects/${projectId}/decisions-pinned?include_superseded=true`);
+      const superseded = (all || []).filter(d => d.status === 'superseded');
+      if (superseded.length > 0) {
+        supersededEl.innerHTML = `<details style="margin-top:8px;margin-bottom:6px">
+          <summary style="cursor:pointer;color:var(--muted);font-size:10px;font-family:var(--font-mono);letter-spacing:.05em;user-select:none">
+            Superseded (${superseded.length})
+          </summary>
+          <div style="margin-top:6px">
+            ${superseded.map(d => {
+              const cat = d.category || 'TECHNICAL';
+              const color = _DECISION_CATEGORY_COLORS[cat] || _DECISION_CATEGORY_COLORS.TECHNICAL;
+              const dateStr = (d.created_at || '').slice(0, 10);
+              return `<div style="background:var(--surface-1);border:1px solid var(--border);border-left:4px solid ${color}55;border-radius:4px;padding:8px 12px;margin-bottom:6px;opacity:0.6">
+                <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px">
+                  <span style="display:inline-block;background:${color}11;color:${color}88;font-size:9px;font-weight:700;padding:1px 5px;border-radius:3px">${escapeHtml(cat)}</span>
+                  <span style="color:var(--muted);font-weight:600;font-size:11px;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escapeHtml(d.title || '')}</span>
+                  <span style="color:var(--muted);font-size:9px;flex-shrink:0">${escapeHtml(dateStr)}</span>
+                  <span style="background:var(--surface-2);color:var(--muted);font-size:8px;font-weight:700;padding:1px 5px;border-radius:3px;letter-spacing:.04em;flex-shrink:0">SUPERSEDED</span>
+                </div>
+                <div style="color:var(--muted);font-size:11px;white-space:pre-wrap;word-break:break-word;line-height:1.5">${escapeHtml((d.body || '').slice(0, 200))}</div>
+              </div>`;
+            }).join('')}
+          </div>
+        </details>`;
+      } else {
+        supersededEl.innerHTML = '';
+      }
+    } catch (_) { /* non-fatal — superseded section is optional */ }
   } catch (e) {
     if (state.panels[projectId]) state.panels[projectId]._pinnedDecisions = [];
     renderConstitutionWarning(projectId);
@@ -4350,8 +4568,9 @@ async function refreshSessions(projectId) {
 
 async function refreshTasks(projectId) {
   try {
-    const tasks = await api(`/projects/${projectId}/tasks?limit=50`);
+    const tasks = await api(`/projects/${projectId}/tasks?limit=100`);
     state.panels[projectId].taskCache = tasks;
+    state.panels[projectId].taskOffset = tasks.length;
     renderTasks(projectId);
   } catch(e) {}
 }
@@ -4367,6 +4586,41 @@ function renderTasks(projectId) {
   hitlRoot.innerHTML = hitl.map(t => renderHitlRow(projectId, t)).join('');
   hitl.forEach(t => wireHitlRow(projectId, t));
   root.innerHTML = tasks.map(t => renderTaskRow(t)).join('');
+  // Pagination: show "Load more" button if we got a full page
+  const existingBtn = document.getElementById(`devlog-load-more-${projectId}`);
+  if (existingBtn) existingBtn.remove();
+  if (tasks.length === 100) {
+    const btn = document.createElement('button');
+    btn.id = `devlog-load-more-${projectId}`;
+    btn.className = 'secondary';
+    btn.style = 'width:100%;margin-top:8px;padding:5px;font-size:11px;font-family:var(--font-mono)';
+    btn.textContent = 'Load 100 more ↓';
+    btn.onclick = () => _loadMoreTasks(projectId, btn);
+    root.parentElement.appendChild(btn);
+  }
+}
+
+async function _loadMoreTasks(projectId, btn) {
+  const p = state.panels[projectId];
+  const offset = p.taskOffset || 0;
+  btn.disabled = true;
+  btn.textContent = 'loading…';
+  try {
+    const more = await api(`/projects/${projectId}/tasks?limit=100&offset=${offset}`);
+    p.taskCache = [...(p.taskCache || []), ...more];
+    p.taskOffset = offset + more.length;
+    const root = document.getElementById(`tasks-${projectId}`);
+    if (root) root.innerHTML += more.map(t => renderTaskRow(t)).join('');
+    if (more.length < 100) {
+      btn.remove();
+    } else {
+      btn.disabled = false;
+      btn.textContent = 'Load 100 more ↓';
+    }
+  } catch(e) {
+    btn.disabled = false;
+    btn.textContent = 'Load 100 more ↓ (retry)';
+  }
 }
 
 function renderTaskRow(t) {
@@ -4962,6 +5216,30 @@ function initRewindTab(projectId) {
   });
   const shareBtn = document.getElementById(`rewind-share-${projectId}`);
   if (shareBtn) shareBtn.onclick = () => copyRewindLink(projectId);
+  // Search bar — debounced 350ms, shows results in rewind-wrap
+  const searchInp = document.getElementById(`rewind-search-${projectId}`);
+  if (searchInp && !searchInp._wired) {
+    searchInp._wired = true;
+    const wrap = document.getElementById(`rewind-wrap-${projectId}`);
+    let _st = null;
+    searchInp.addEventListener('input', function() {
+      clearTimeout(_st);
+      const q = this.value.trim();
+      _st = setTimeout(async () => {
+        if (!q) {
+          if (p.rewindDays) loadRewindTab(projectId, p.rewindDays);
+          else { if (wrap) wrap.innerHTML = '<div class="empty" style="color:var(--muted)">pick a window above</div>'; }
+          return;
+        }
+        if (!wrap) return;
+        wrap.innerHTML = '<div class="empty" style="color:var(--muted)">searching…</div>';
+        try {
+          const results = await api(`/projects/${projectId}/search?q=${encodeURIComponent(q)}&limit=15`);
+          wrap.innerHTML = renderSearchResults(q, results);
+        } catch (e) { wrap.innerHTML = `<div class="empty">search failed: ${escapeHtml(e.message)}</div>`; }
+      }, 350);
+    });
+  }
   // Default to the 7-day view on first open.
   loadRewindTab(projectId, 7);
 }
@@ -5193,7 +5471,17 @@ function _rewindSec(icon, title, items, render) {
 
 function renderRewindActivity(projectId, data) {
   /** Activity subtab: sessions + decisions + task stats. */
-  const sessions = _rewindSec('🧠', 'Sessions', data.session_summaries, s =>
+  // Deduplicate sessions: same name may appear multiple times if registered
+  // multiple times. Keep highest done-count entry per session name.
+  const sessByName = new Map();
+  (data.session_summaries || []).forEach(s => {
+    const prev = sessByName.get(s.session_name);
+    if (!prev || (s.tasks_completed || 0) > (prev.tasks_completed || 0)) {
+      sessByName.set(s.session_name, s);
+    }
+  });
+  const dedupedSessions = [...sessByName.values()];
+  const sessions = _rewindSec('🧠', 'Sessions', dedupedSessions, s =>
     `<div style="padding:3px 0;border-left:2px solid var(--border);padding-left:8px;margin-bottom:4px">
       <div style="color:var(--accent)">${escapeHtml(s.session_name)} <span style="color:var(--muted);font-size:10px">· ${s.tasks_completed} done</span></div>
       <div style="color:var(--muted);font-size:10px">${escapeHtml(s.summary || '')}</div>

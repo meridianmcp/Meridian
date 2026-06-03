@@ -11,6 +11,9 @@
 <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
 <!-- Chart.js for activity charts in Rewind subtab. -->
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
+<!-- vis-timeline for the Timeline swimlane. -->
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/vis-timeline/7.7.3/vis-timeline-graph2d.min.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/vis-timeline/7.7.3/vis-timeline-graph2d.min.js"></script>
 <link rel="stylesheet" href="/static/dashboard.css?v={{ asset_version or version }}">
 </head>
 <body>
@@ -62,7 +65,7 @@
     <div id="hitl-bar" style="display:none;background:linear-gradient(90deg,#fbbf2422,#f8717122);border-bottom:1px solid var(--border);padding:6px 14px;font-family:var(--font-mono);font-size:11px;align-items:center;gap:10px;flex-shrink:0;flex-wrap:wrap">
       <span style="color:#fbbf24">⚠</span>
       <strong>HITL queue</strong>
-      <span id="hitl-count" style="background:#f87171;color:#fff;padding:1px 7px;border-radius:8px;font-size:10px;font-weight:700">0</span>
+      <span id="hitl-count" style="background:#f87171;color:#fff;padding:1px 7px;border-radius:8px;font-size:10px;font-weight:700;cursor:pointer;text-decoration:underline" onclick="_hitlBadgeClick()" title="Click to open HITL queue">0</span>
       <button id="hitl-toggle-btn" class="secondary" style="margin-left:auto;padding:2px 10px;font-size:10px">Open</button>
     </div>
     <div id="hitl-panel" style="display:none;background:var(--surface-2);border-bottom:1px solid var(--border);padding:12px 14px;max-height:40vh;overflow-y:auto;flex-shrink:0">
