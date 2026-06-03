@@ -3208,7 +3208,8 @@ async def mcp_quickstart() -> str:
     Returns plain text cheat sheet, suitable for pasting into a new chat session
     or displaying in the dashboard Settings tab.
     """
-    return """\
+    tool_count = len(_MCP_TOOLS_LIST)
+    return f"""\
 # Meridian MCP — Quick Reference
 
 The 5 tools you use 90% of the time:
@@ -3239,7 +3240,7 @@ Wire Claude Code / Codex to call these automatically:
 
 ## Full tool reference
 
-  GET /mcp/tools-doc     — complete markdown reference (21 tools)
+  GET /mcp/tools-doc     — complete markdown reference ({tool_count} tools)
   https://docs.usemeridian.us
 """
 
@@ -3308,6 +3309,16 @@ async def mcp_tools_doc() -> str:
     lines += ["## Goal & sprint\n"]
     lines += _render_tool("get_goal")
     lines += _render_tool("set_goal")
+    lines += ["## Executor config & file coordination\n"]
+    lines += _render_tool("set_executor_config",
+        "Store project-level executor defaults so worker sessions start with repo path, env file, test command, "
+        "deploy command, shell, branch, and the injected credentials rule.")
+    lines += _render_tool("claim_file",
+        "Claim exclusive edit rights on a file path for this session. Locks auto-expire after 2 hours.")
+    lines += _render_tool("release_file",
+        "Release a file lock held by this session when you're done editing.")
+    lines += _render_tool("idle_until_session_done",
+        "Wait on another session before touching a shared file. The tool polls every 30 seconds until the watched session is done.")
     lines += ["## Decisions\n"]
     lines += _render_tool("pin_decision",
         "Record an authoritative decision that supersedes earlier statements. Pinned decisions appear in every "
@@ -4254,7 +4265,7 @@ def _jsonrpc_err(req_id: Any, code: int, message: str) -> dict[str, Any]:
 
 TOOL_EXAMPLES: dict[str, str] = {
     "create_project": 'create_project(name="my-app")',
-    "start_session": 'start_session(project_id="abc-123", session_name="feature-x", human_id="alice")',
+    "start_session": 'start_session(project_id="abc-123", session_name="feature-x", human_id="alice", role="executor")',
     "register_session": 'register_session(project_id="abc-123", session_name="feature-x", human_id="alice")',
     "log_task": 'log_task(session_id="session-uuid", project_id="abc-123", description="Fixed auth bug", status="done")',
     "get_context_block": 'get_context_block(project_id="abc-123", mode="chat")',
@@ -4282,6 +4293,10 @@ TOOL_EXAMPLES: dict[str, str] = {
     "heartbeat": 'heartbeat(session_id="session-uuid")',
     "list_projects": 'list_projects()',
     "get_sessions": 'get_sessions(project_id="abc-123")',
+    "set_executor_config": 'set_executor_config(project_id="abc-123", repo_path="/repo", env_file="/repo/.env", test_cmd="pixi run test", test_min=619, deploy_cmd="git push", shell_type="powershell", branch="dev")',
+    "claim_file": 'claim_file(session_id="session-uuid", file_path="meridian/server.py")',
+    "release_file": 'release_file(session_id="session-uuid", file_path="meridian/server.py")',
+    "idle_until_session_done": 'idle_until_session_done(watching_session_id="session-uuid")',
 }
 
 _MCP_TOOLS_LIST: list[dict[str, Any]] = [
@@ -4297,7 +4312,8 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
      "inputSchema": {"type": "object", "properties": {
           "project_id": {"type": "string"}, "session_name": {"type": "string"},
           "human_id": {"type": "string"},
-          "client": {"type": "string", "enum": ["claude-code", "claude-desktop", "cursor", "other"]}},
+          "client": {"type": "string", "enum": ["claude-code", "claude-desktop", "cursor", "other"]},
+          "role": {"type": "string", "enum": ["executor"], "description": "Pass 'executor' to inject executor_config and credentials guidance."}},
           "required": ["project_id", "session_name"]}},
     {"name": "list_projects", "description":
         "Call first when project_id is unknown. Returns [{id, name, sprint, created_at}] newest first.",
@@ -4502,6 +4518,37 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "query": {"type": "string"},
          "limit": {"type": "integer", "description": "Max results per type (default 10)."}},
          "required": ["project_id", "query"]}},
+    {"name": "set_executor_config", "description":
+        "Store per-project executor defaults (repo_path, env_file, test_cmd, test_min, deploy_cmd, shell_type, branch). "
+        "Executor sessions auto-load these when start_session(role='executor') is used. "
+        "Credentials rule is always injected separately: read secrets from env_file only, never remote shell.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"},
+         "repo_path": {"type": "string"},
+         "env_file": {"type": "string"},
+         "test_cmd": {"type": "string"},
+         "test_min": {"type": "integer"},
+         "deploy_cmd": {"type": "string"},
+         "shell_type": {"type": "string"},
+         "branch": {"type": "string"}},
+         "required": ["project_id"]}},
+    {"name": "claim_file", "description":
+        "Claim exclusive edit rights on a file path for this session. Locks auto-expire after 2 hours.",
+     "inputSchema": {"type": "object", "properties": {
+         "session_id": {"type": "string"},
+         "file_path": {"type": "string"}},
+         "required": ["session_id", "file_path"]}},
+    {"name": "release_file", "description":
+        "Release a file lock held by this session.",
+     "inputSchema": {"type": "object", "properties": {
+         "session_id": {"type": "string"},
+         "file_path": {"type": "string"}},
+         "required": ["session_id", "file_path"]}},
+    {"name": "idle_until_session_done", "description":
+        "Poll every 30 seconds until another session is closed or archived. Use this when you need to wait before editing a locked file.",
+     "inputSchema": {"type": "object", "properties": {
+         "watching_session_id": {"type": "string"}},
+         "required": ["watching_session_id"]}},
 ]
 
 
@@ -4548,15 +4595,15 @@ async def _dispatch_mcp_tool(name: str, args: dict[str, Any], db: Any, data_dir:
             client_type=args.get("client"),
         )
     if name == "start_session":
-        session = await db_module.register_session(
-            db, args["project_id"], args["session_name"],
-            args.get("human_id"),
-            agent_framework=args.get("agent_framework", "claude_code"),
+        return await _start_session_composite(
+            db,
+            args["project_id"],
+            args["session_name"],
+            data_dir,
+            human_id=args.get("human_id"),
             client_type=args.get("client"),
+            role=args.get("role"),
         )
-        goal = await db_module.get_goal(db, args["project_id"])
-        tasks = await db_module.get_tasks(db, args["project_id"], limit=10)
-        return {"session": session, "goal": goal, "recent_tasks": tasks}
     if name == "list_projects":
         return await db_module.list_project_summaries(db)
     if name == "get_project_by_name":
@@ -4858,16 +4905,7 @@ async def _dispatch_mcp_tool(name: str, args: dict[str, Any], db: Any, data_dir:
         released = await db_module.release_file(db, args["file_path"], args["session_id"])
         return {"released": released, "file_path": args["file_path"]}
     if name == "idle_until_session_done":
-        watching = args["watching_session_id"]
-        async with db.execute(
-            "SELECT status FROM sessions WHERE id = ?", (watching,)
-        ) as _cur:
-            _row = await _cur.fetchone()
-        if _row is None:
-            return {"done": True, "status": "not_found", "suggested_wait_seconds": 0}
-        _status = (_row["status"] if isinstance(_row, dict) else _row[0]) or "active"
-        _done = _status in ("closed", "archived")
-        return {"done": _done, "status": _status, "suggested_wait_seconds": 0 if _done else 30}
+        return await _idle_until_session_done(db, args["watching_session_id"])
     if name == "search_all":
         return await db_module.search_all(
             db, args["project_id"], args["query"],
@@ -6277,6 +6315,11 @@ def build_mcp_server():
                             "enum": ["claude-code", "claude-desktop", "cursor", "other"],
                             "description": "Client app — used for presence indicators.",
                         },
+                        "role": {
+                            "type": "string",
+                            "enum": ["executor"],
+                            "description": "Pass 'executor' to inject executor_config and credentials guidance.",
+                        },
                     },
                     "required": ["project_id", "session_name"],
                 },
@@ -6504,21 +6547,10 @@ def build_mcp_server():
                 )
                 result = {"released": released, "file_path": arguments["file_path"]}
             elif name == "idle_until_session_done":
-                watching = arguments["watching_session_id"]
-                async with db.execute(
-                    "SELECT status FROM sessions WHERE id = ?", (watching,)
-                ) as _cur:
-                    _row = await _cur.fetchone()
-                if _row is None:
-                    result = {"done": True, "status": "not_found", "suggested_wait_seconds": 0}
-                else:
-                    _status = (_row["status"] if isinstance(_row, dict) else _row[0]) or "active"
-                    _done = _status in ("closed", "archived")
-                    result = {
-                        "done": _done,
-                        "status": _status,
-                        "suggested_wait_seconds": 0 if _done else 30,
-                    }
+                result = await _idle_until_session_done(
+                    db,
+                    arguments["watching_session_id"],
+                )
             elif name == "log_task":
                 result = await db_module.log_task(
                     db,
@@ -6627,6 +6659,7 @@ def build_mcp_server():
                     state["data_dir"],
                     human_id=arguments.get("human_id"),
                     client_type=arguments.get("client"),
+                    role=arguments.get("role"),
                 )
             elif name == "list_projects":
                 result = await db_module.list_project_summaries(db)

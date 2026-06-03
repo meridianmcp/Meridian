@@ -15,6 +15,10 @@ for "what has been decided, claimed, and shipped."
   A clean handoff lets a fresh session resume without re-deriving everything.
 - **`claim_task`** before starting work on something a parallel session might pick up.
   **`release_task`** if you bail — don't leave it claimed.
+- **`claim_file(session_id, file_path)`** before editing shared files when parallel
+  sessions are active. **`release_file(session_id, file_path)`** when done.
+  Use **`idle_until_session_done(watching_session_id)`** to wait before taking
+  over a file another session holds. Locks auto-expire after 2 hours.
 
 ## ON SESSION START
 

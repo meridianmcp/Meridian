@@ -1,6 +1,6 @@
 # MCP Tool Reference
 
-Meridian exposes **31 tools** over MCP. They fall into two usage patterns:
+Meridian exposes **35 tools** over MCP. They fall into two usage patterns:
 
 **Planner sessions** (claude.ai, planning work) — `start_session` · `pin_decision` · `update_decision` · `add_note` · `get_context_block` · `generate_handoff`
 
@@ -44,10 +44,11 @@ Register a session and get the full project context (goal, sprint, recent tasks,
 | `session_name` | string | required |  |
 | `human_id` | string | optional |  |
 | `client` | string | optional |  |
+| `role` | string | optional | Pass 'executor' to inject executor_config and credentials guidance. |
 
 **Example:**
 ```
-start_session(project_id="abc-123", session_name="feature-x", human_id="alice")
+start_session(project_id="abc-123", session_name="feature-x", human_id="alice", role="executor")
 ```
 
 ---
@@ -164,6 +165,85 @@ Set or update the goal state.
 **Example:**
 ```
 set_goal(project_id="abc-123", content="Build a great product")
+```
+
+---
+
+## Executor config & file coordination
+
+
+### `set_executor_config`
+
+Store project-level executor defaults so worker sessions start with repo path, env file, test command, deploy command, shell, branch, and the injected credentials rule.
+
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `project_id` | string | required |  |
+| `repo_path` | string | optional |  |
+| `env_file` | string | optional |  |
+| `test_cmd` | string | optional |  |
+| `test_min` | integer | optional |  |
+| `deploy_cmd` | string | optional |  |
+| `shell_type` | string | optional |  |
+| `branch` | string | optional |  |
+
+**Example:**
+```
+set_executor_config(project_id="abc-123", repo_path="/repo", env_file="/repo/.env", test_cmd="pixi run test", test_min=619, deploy_cmd="git push", shell_type="powershell", branch="dev")
+```
+
+---
+
+
+### `claim_file`
+
+Claim exclusive edit rights on a file path for this session. Locks auto-expire after 2 hours.
+
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `session_id` | string | required |  |
+| `file_path` | string | required |  |
+
+**Example:**
+```
+claim_file(session_id="session-uuid", file_path="meridian/server.py")
+```
+
+---
+
+
+### `release_file`
+
+Release a file lock held by this session when you're done editing.
+
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `session_id` | string | required |  |
+| `file_path` | string | required |  |
+
+**Example:**
+```
+release_file(session_id="session-uuid", file_path="meridian/server.py")
+```
+
+---
+
+
+### `idle_until_session_done`
+
+Wait on another session before touching a shared file. The tool polls every 30 seconds until the watched session is done.
+
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `watching_session_id` | string | required |  |
+
+**Example:**
+```
+idle_until_session_done(watching_session_id="session-uuid")
 ```
 
 ---

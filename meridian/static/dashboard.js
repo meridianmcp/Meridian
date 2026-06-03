@@ -3050,6 +3050,52 @@ async function loadSettingsTab(projectId) {
     };
   }, 0);
 
+  // Executor Config section
+  const execCfg = (projectSettings && projectSettings.executor_config) || {};
+  html += `<div style="margin-bottom:16px" id="executor-config-section-${projectId}">
+    <div style="color:var(--accent);font-size:10px;letter-spacing:.06em;text-transform:uppercase;margin-bottom:10px;padding-bottom:4px;border-bottom:1px solid var(--border)">Executor Config</div>
+    <div style="font-size:10px;color:var(--muted);margin-bottom:8px">Per-project defaults injected into executor sessions via <code>start_session(role="executor")</code>. Set once; all executors inherit automatically.</div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px 12px">
+      <label style="font-size:10px;color:var(--muted)">repo_path<br><input id="exec-repo_path-${projectId}" type="text" placeholder="Abs path to repo root" style="width:100%;background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:3px 6px;margin-top:2px" value="${escapeHtml(String(execCfg.repo_path || ''))}"></label>
+      <label style="font-size:10px;color:var(--muted)">env_file<br><input id="exec-env_file-${projectId}" type="text" placeholder=".env file path" style="width:100%;background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:3px 6px;margin-top:2px" value="${escapeHtml(String(execCfg.env_file || ''))}"></label>
+      <label style="font-size:10px;color:var(--muted)">test_cmd<br><input id="exec-test_cmd-${projectId}" type="text" placeholder="pixi run test" style="width:100%;background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:3px 6px;margin-top:2px" value="${escapeHtml(String(execCfg.test_cmd || ''))}"></label>
+      <label style="font-size:10px;color:var(--muted)">test_min<br><input id="exec-test_min-${projectId}" type="number" placeholder="Min passing tests" style="width:100%;background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:3px 6px;margin-top:2px" value="${escapeHtml(String(execCfg.test_min != null ? execCfg.test_min : ''))}"></label>
+      <label style="font-size:10px;color:var(--muted)">deploy_cmd<br><input id="exec-deploy_cmd-${projectId}" type="text" placeholder="git push / fly deploy" style="width:100%;background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:3px 6px;margin-top:2px" value="${escapeHtml(String(execCfg.deploy_cmd || ''))}"></label>
+      <label style="font-size:10px;color:var(--muted)">branch<br><input id="exec-branch-${projectId}" type="text" placeholder="dev" style="width:100%;background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:3px 6px;margin-top:2px" value="${escapeHtml(String(execCfg.branch || ''))}"></label>
+    </div>
+    <div style="margin-top:8px;display:flex;gap:8px;align-items:center">
+      <button id="exec-save-${projectId}" class="primary" style="font-size:10px;padding:3px 10px">Save</button>
+      <span id="exec-status-${projectId}" style="font-size:10px;color:var(--muted);min-height:14px"></span>
+    </div>
+  </div>`;
+
+  setTimeout(() => {
+    const saveBtn = document.getElementById(`exec-save-${projectId}`);
+    const statusEl = document.getElementById(`exec-status-${projectId}`);
+    if (!saveBtn) return;
+    saveBtn.onclick = async () => {
+      saveBtn.disabled = true;
+      const fields = ['repo_path', 'env_file', 'test_cmd', 'deploy_cmd', 'branch'];
+      const cfg = {};
+      for (const f of fields) {
+        const val = (document.getElementById(`exec-${f}-${projectId}`)?.value || '').trim();
+        if (val) cfg[f] = val;
+      }
+      const minEl = document.getElementById(`exec-test_min-${projectId}`);
+      const minVal = minEl ? parseInt(minEl.value || '', 10) : NaN;
+      if (!isNaN(minVal) && minVal > 0) cfg.test_min = minVal;
+      try {
+        await saveProjectSettings(projectId, { executor_config: cfg });
+        if (statusEl) statusEl.textContent = 'Saved.';
+        setTimeout(() => { if (statusEl) statusEl.textContent = ''; }, 2000);
+      } catch (e) {
+        if (statusEl) statusEl.textContent = `Save failed: ${String(e)}`;
+      } finally {
+        saveBtn.disabled = false;
+      }
+    };
+  }, 0);
+
   // Team members section (hosted mode only, uses mcpData as hosted-mode proxy)
   if (mcpData) {
     html += `<div style="margin-bottom:16px" id="members-section-${projectId}">
