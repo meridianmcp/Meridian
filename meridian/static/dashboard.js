@@ -18,6 +18,10 @@ function isHostedMode() {
   return !!window.MERIDIAN_HOSTED;
 }
 
+function isHostedAdmin() {
+  return isHostedMode() && !!window.MERIDIAN_IS_ADMIN;
+}
+
 function hideHostedAdminControls() {
   // Hide ALL server-management controls — Restart/Stop kill the shared Fly machine
   // and must never be reachable from usemeridian.us.
@@ -29,16 +33,19 @@ function hideHostedAdminControls() {
     document.querySelectorAll(sel).forEach(el => { el.style.display = 'none'; });
   });
 
-  // Hide connection switcher / profile selector — hosted users have one managed DB,
-  // switching connections would break tenant isolation.
   const connInd = document.getElementById('connection-indicator');
-  if (connInd) connInd.style.display = 'none';
-  // Also kill any open connection popup
-  document.querySelectorAll('.conn-popup').forEach(p => p.remove());
+  if (!isHostedAdmin()) {
+    // Hide connection switcher / profile selector for normal hosted users —
+    // switching connections would break tenant isolation.
+    if (connInd) connInd.style.display = 'none';
+    document.querySelectorAll('.conn-popup').forEach(p => p.remove());
+  } else {
+    document.querySelectorAll('.hosted-label').forEach(el => el.remove());
+  }
 
-  // Replace connection area with a static "usemeridian.us" label
+  // Replace connection area with a static "usemeridian.us" label for non-admins.
   const footer = document.querySelector('.sidebar-footer');
-  if (footer && !footer.querySelector('.hosted-label')) {
+  if (!isHostedAdmin() && footer && !footer.querySelector('.hosted-label')) {
     const lbl = document.createElement('div');
     lbl.className = 'hosted-label';
     lbl.style.cssText = 'font-size:10px;color:var(--accent-green);font-family:\'IBM Plex Mono\',monospace;padding:4px 6px;border:1px solid var(--accent-green)44;border-radius:3px;opacity:0.8;letter-spacing:.03em';
@@ -406,9 +413,9 @@ function _renderPlanBadge(me) {
 // v1.9.x — show active DB connection in sidebar footer
 function _updateConnectionIndicator(cfg) {
   if (!cfg) return;
-  // Never show the connection switcher on usemeridian.us — it exposes local DB controls
-  // that are meaningless (and dangerous) in hosted mode.
-  if (isHostedMode()) return;
+  // Hosted non-admin users stay on the managed DB. Hosted admins keep the
+  // full selector so they can inspect auth/demo/local connections.
+  if (isHostedMode() && !isHostedAdmin()) return;
   const wrap = document.getElementById('connection-indicator');
   const label = document.getElementById('connection-label');
   const dot = document.getElementById('connection-dot');
@@ -5878,4 +5885,3 @@ async function copyRewindLink(projectId) {
     toast('share failed: ' + e.message);
   }
 }
-

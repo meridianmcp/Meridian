@@ -574,6 +574,14 @@ CREATE TABLE IF NOT EXISTS api_tokens (
     created_at TEXT NOT NULL DEFAULT ({_TS})
 );
 
+CREATE TABLE IF NOT EXISTS oauth_tokens (
+    token_hash TEXT PRIMARY KEY,
+    tenant_id TEXT REFERENCES tenants(id),
+    client_id TEXT,
+    exp BIGINT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
 -- v2.1 dark — multi-user roles, not exposed in UI or API at launch
 CREATE TABLE IF NOT EXISTS workspace_members (
     id TEXT PRIMARY KEY,

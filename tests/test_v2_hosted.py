@@ -37,10 +37,10 @@ def _make_test_db():
 # ---------------------------------------------------------------------------
 
 def test_tenant_tables_exist_in_schema():
-    """CREATE_TABLES must define tenants, user_sessions, api_tokens."""
+    """CREATE_TABLES must define tenants, user_sessions, token tables."""
     from meridian.db import CREATE_TABLES
 
-    for table in ("tenants", "user_sessions", "api_tokens"):
+    for table in ("tenants", "user_sessions", "api_tokens", "oauth_tokens"):
         assert table in CREATE_TABLES, f"CREATE_TABLES missing {table!r}"
 
 
@@ -305,6 +305,42 @@ def test_remote_mcp_initialize_with_valid_token(client):
     assert body["result"]["protocolVersion"] == "2024-11-05"
 
 
+def test_remote_mcp_initialize_with_valid_oauth_token_from_db(client):
+    """POST /mcp accepts OAuth bearer tokens reloaded from the auth DB."""
+    from meridian import server as server_module
+
+    async def _setup():
+        db = client.app.state.db
+        raw_token = "oauth-db-token"
+        token_hash = hashlib.sha256(raw_token.encode()).hexdigest()
+        await db.execute(
+            "INSERT INTO oauth_tokens (token_hash, tenant_id, client_id, exp) VALUES (?, ?, ?, ?)",
+            (token_hash, None, "claude-ai", int(time.time()) + 3600),
+        )
+        await db.commit()
+        server_module._oa_tokens.clear()
+        return raw_token, token_hash
+
+    raw_token, token_hash = _run(_setup())
+
+    r = client.post(
+        "/mcp",
+        json={
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": {},
+            },
+        },
+        headers={"Authorization": f"Bearer {raw_token}"},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["result"]["protocolVersion"] == "2024-11-05"
+    assert token_hash in server_module._oa_tokens
+
+
 def test_remote_mcp_tools_list_returns_8_tools(client):
     """POST /mcp tools/list returns at least 8 tools."""
     from meridian import db as db_module
@@ -326,7 +362,7 @@ def test_remote_mcp_tools_list_returns_8_tools(client):
     tools = r.json()["result"]["tools"]
     names = {t["name"] for t in tools}
     assert len(tools) >= 8
-    for expected in ("create_project", "register_session", "log_task", "generate_handoff"):
+    for expected in ("create_project", "register_session", "log_task", "generate_handoff", "list_projects", "get_project_by_name"):
         assert expected in names
 
 
@@ -357,6 +393,54 @@ def test_remote_mcp_tools_call_create_project(client):
     result = r.json()["result"]
     content = json.loads(result["content"][0]["text"])
     assert content["name"] == "mcp-remote-proj-v2"
+
+
+def test_remote_mcp_project_discovery_tools_return_sprint(client):
+    """list_projects and get_project_by_name expose project discovery fields."""
+    from meridian import db as db_module
+
+    async def _setup():
+        db = client.app.state.db
+        tenant = await db_module.upsert_tenant(db, "mcp_discovery@example.com")
+        raw, _ = await db_module.create_api_token(db, tenant["id"], label="mcp-discovery")
+        project = await db_module.create_project(db, "meridian-build")
+        await db_module.set_goal(db, project["id"], "browser hardening", sprint="v1.0.4")
+        return raw, project
+
+    raw_token, project = _run(_setup())
+
+    list_resp = client.post(
+        "/mcp",
+        json={
+            "jsonrpc": "2.0", "id": 10, "method": "tools/call",
+            "params": {"name": "list_projects", "arguments": {}},
+        },
+        headers={"Authorization": f"Bearer {raw_token}"},
+    )
+    assert list_resp.status_code == 200
+    list_payload = json.loads(list_resp.json()["result"]["content"][0]["text"])
+    assert any(
+        item["id"] == project["id"]
+        and item["name"] == "meridian-build"
+        and item["sprint"] == "v1.0.4"
+        for item in list_payload
+    )
+
+    by_name_resp = client.post(
+        "/mcp",
+        json={
+            "jsonrpc": "2.0", "id": 11, "method": "tools/call",
+            "params": {"name": "get_project_by_name", "arguments": {"name": "meridian"}},
+        },
+        headers={"Authorization": f"Bearer {raw_token}"},
+    )
+    assert by_name_resp.status_code == 200
+    by_name_payload = json.loads(by_name_resp.json()["result"]["content"][0]["text"])
+    assert by_name_payload == {
+        "id": project["id"],
+        "name": "meridian-build",
+        "sprint": "v1.0.4",
+    }
 
 
 # ---------------------------------------------------------------------------

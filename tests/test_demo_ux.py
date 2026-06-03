@@ -222,6 +222,11 @@ def test_demo_write_button_shows_friendly_toast(client):
             conn_modal = page.query_selector("#conn-setup-modal")
             if conn_modal and conn_modal.is_visible():
                 page.keyboard.press("Escape")
+                page.wait_for_timeout(150)
+                if conn_modal.is_visible():
+                    close_btn = page.query_selector("#conn-setup-modal button[title='Close (Esc)']")
+                    if close_btn:
+                        close_btn.click()
                 page.wait_for_timeout(300)
 
             # Dismiss demo onboarding overlay if present
