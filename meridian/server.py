@@ -4665,13 +4665,34 @@ _MCP_RATE_LIMIT = "100/minute"
 _SSE_SESSIONS: dict[str, dict[str, Any]] = {}  # session_id → {db, queue}
 
 # ── OAuth 2.0 for claude.ai custom connector ──────────────────────────────
-import secrets as _sec, hashlib as _hs, base64 as _b64, time as _tm
+import secrets as _sec, hashlib as _hs, base64 as _b64, time as _tm, json as _json
 from urllib.parse import urlencode as _ue
 from fastapi.responses import RedirectResponse as _RR
 
 _oa_clients: dict = {}
 _oa_codes: dict = {}
-_oa_tokens: dict = {}
+
+# Tokens persisted to disk so they survive server restarts
+_OA_TOKEN_FILE = DEFAULT_DATA_DIR / "oauth_tokens.json"
+
+def _load_oa_tokens() -> dict:
+    try:
+        if _OA_TOKEN_FILE.exists():
+            data = _json.loads(_OA_TOKEN_FILE.read_text())
+            now = _tm.time()
+            return {k: v for k, v in data.items() if v.get("exp", 0) > now}
+    except Exception:
+        pass
+    return {}
+
+def _save_oa_tokens(tokens: dict) -> None:
+    try:
+        _OA_TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
+        _OA_TOKEN_FILE.write_text(_json.dumps(tokens))
+    except Exception:
+        pass
+
+_oa_tokens: dict = _load_oa_tokens()
 
 
 @app.get("/.well-known/oauth-authorization-server")
@@ -4730,6 +4751,7 @@ async def _oauth_token(request: Request):
             return JSONResponse({"error": "invalid_grant"}, status_code=400)
     tok = _sec.token_urlsafe(32)
     _oa_tokens[tok] = {"client_id": cd["client_id"], "exp": _tm.time() + 86400 * 90}
+    _save_oa_tokens(_oa_tokens)
     return JSONResponse({"access_token": tok, "token_type": "bearer", "expires_in": 86400 * 90})
 
 
@@ -4857,8 +4879,8 @@ async def remote_mcp(request: Request) -> Any:
             _body = await request.json()
         except Exception:
             return JSONResponse(_jsonrpc_err(None, -32700, "parse error"), status_code=400)
-        _mdb = await _ensure_mcp_db()
-        _mdd = str(DEFAULT_DATA_DIR)
+        _mdb = request.app.state.db
+        _mdd = request.app.state.data_dir
         if isinstance(_body, list):
             return JSONResponse([await _handle_mcp_request(i, _mdb, _mdd) for i in _body])
         return JSONResponse(await _handle_mcp_request(_body, _mdb, _mdd))
