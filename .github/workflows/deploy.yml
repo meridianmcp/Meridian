@@ -49,30 +49,33 @@ jobs:
     if: github.ref == 'refs/heads/dev'
     runs-on: ubuntu-latest
     steps:
-      - name: Wait for preview to wake
-        run: sleep 15
-
-      - name: Health check
+      - name: Wait for preview to boot (retry /health up to 90s)
         run: |
-          STATUS=$(curl -s -o /dev/null -w "%{http_code}" https://meridian-preview.fly.dev/health)
-          echo "Health: $STATUS"
-          [ "$STATUS" = "200" ] || (echo "FAIL: /health returned $STATUS" && exit 1)
+          BASE="https://meridian-preview.fly.dev"
+          echo "Waiting for /health..."
+          for i in $(seq 1 18); do
+            STATUS=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" "$BASE/health" || echo "000")
+            echo "Attempt $i: $STATUS"
+            [ "$STATUS" = "200" ] && break
+            [ "$i" = "18" ] && (echo "FAIL: /health never returned 200" && exit 1)
+            sleep 5
+          done
 
       - name: Landing page loads
         run: |
-          STATUS=$(curl -s -o /dev/null -w "%{http_code}" https://meridian-preview.fly.dev/)
+          STATUS=$(curl -s --max-time 15 -o /dev/null -w "%{http_code}" https://meridian-preview.fly.dev/)
           echo "Landing: $STATUS"
           [ "$STATUS" = "200" ] || (echo "FAIL: / returned $STATUS" && exit 1)
 
       - name: Demo page loads
         run: |
-          STATUS=$(curl -s -o /dev/null -w "%{http_code}" https://meridian-preview.fly.dev/demo)
+          STATUS=$(curl -s --max-time 15 -o /dev/null -w "%{http_code}" https://meridian-preview.fly.dev/demo)
           echo "Demo: $STATUS"
           [ "$STATUS" = "200" ] || (echo "FAIL: /demo returned $STATUS" && exit 1)
 
       - name: MCP tools/list responds
         run: |
-          RESP=$(curl -s -X POST https://meridian-preview.fly.dev/mcp/sse \
+          RESP=$(curl -s --max-time 15 -X POST https://meridian-preview.fly.dev/mcp/sse \
             -H 'Content-Type: application/json' \
             -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}')
           echo "$RESP" | grep -q '"start_session"' || (echo "FAIL: MCP tools missing start_session" && exit 1)
