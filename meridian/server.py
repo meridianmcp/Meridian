@@ -4723,6 +4723,31 @@ async def _oauth_reg(request: Request):
 @app.get("/oauth/authorize")
 async def _oauth_auth(request: Request):
     p = dict(request.query_params)
+    # ── Session cookie guard (hosted mode only) ─────────────────────────────
+    # Prevents unauthenticated callers from obtaining MCP access tokens.
+    # Local / self-hosted installs skip this guard (_hosted_mode() is False).
+    if _hosted_mode():
+        authed = False
+        from .hosted import _SESSION_COOKIE, _read_session_cookie
+        auth_db = request.app.state.db
+        cookie_val = request.cookies.get(_SESSION_COOKIE, "")
+        if cookie_val:
+            sid = _read_session_cookie(cookie_val)
+            if sid and await db_module.get_user_session(auth_db, sid):
+                authed = True
+        if not authed:
+            # Also accept a bearer token (API-key flow)
+            auth_header = request.headers.get("authorization", "")
+            if auth_header.startswith("Bearer "):
+                tok_hash = hashlib.sha256(auth_header[7:].encode()).hexdigest()
+                if await db_module.get_tenant_from_token_hash(auth_db, tok_hash):
+                    authed = True
+        if not authed:
+            from urllib.parse import quote as _q
+            orig_qs = str(request.url.query)
+            next_path = f"/oauth/authorize?{orig_qs}" if orig_qs else "/oauth/authorize"
+            return _RR(f"/auth/login?next={_q(next_path)}")
+    # ── Auto-approve ────────────────────────────────────────────────────────
     code = _sec.token_urlsafe(32)
     _oa_codes[code] = {"client_id": p.get("client_id", ""),
         "redirect_uri": p.get("redirect_uri", ""),
