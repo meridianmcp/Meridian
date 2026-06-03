@@ -4581,6 +4581,53 @@ def test_pg_create_tables_has_ntfy_url_column():
     assert "ntfy_url TEXT" in project_block
 
 
+@pytest.mark.asyncio
+async def test_pg_adapter_ntfy_helpers_issue_expected_queries():
+    """pg_adapter exposes ntfy helpers for direct Postgres callers."""
+    from meridian import pg_adapter as pg_module
+
+    class _SelectProxy:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def fetchone(self):
+            return {"ntfy_url": "https://ntfy.sh/test-topic"}
+
+    class _UpdateProxy:
+        def __await__(self):
+            async def _done():
+                return None
+
+            return _done().__await__()
+
+    class FakeDB:
+        def __init__(self):
+            self.calls = []
+            self.committed = False
+
+        def execute(self, sql, params=()):
+            self.calls.append((sql, params))
+            if sql.startswith("SELECT"):
+                return _SelectProxy()
+            return _UpdateProxy()
+
+        async def commit(self):
+            self.committed = True
+
+    db = FakeDB()
+    url = await pg_module.get_project_ntfy_url(db, "proj-123")
+    assert url == "https://ntfy.sh/test-topic"
+    await pg_module.set_project_ntfy_url(db, "proj-123", "https://ntfy.sh/new-topic")
+    assert db.calls == [
+        ("SELECT ntfy_url FROM projects WHERE id = ?", ("proj-123",)),
+        ("UPDATE projects SET ntfy_url = ? WHERE id = ?", ("https://ntfy.sh/new-topic", "proj-123")),
+    ]
+    assert db.committed is True
+
+
 def test_rewind_milestones_tab_label(client):
     """Rewind Versions subtab is now labelled 'Milestones' in dashboard.js."""
     js = client.get("/static/dashboard.js").text
