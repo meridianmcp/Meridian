@@ -100,6 +100,10 @@ def client(tmp_path, monkeypatch):
     # connect to Neon and seed demo data during tests (would hang on every
     # client fixture if a .env file with a real demo URL is present).
     monkeypatch.setenv("MERIDIAN_DEMO_DB_URL", "")
+    # Skip the in-memory demo DB fallback so tests that send the demo cookie
+    # get a proper 503 (security guard) rather than routing to an unexpected
+    # in-memory DB.  Tests that need demo data should use the demo_client fixture.
+    monkeypatch.setenv("MERIDIAN_SKIP_DEMO", "1")
     # v0.6.3 — redirect GOAL.md into the same temp dir so test
     # writebacks don't touch the repo's real file.
     monkeypatch.setenv("MERIDIAN_GOAL_MD", str(tmp_path / "GOAL.md"))

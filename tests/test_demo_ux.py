@@ -217,7 +217,14 @@ def test_demo_write_button_shows_friendly_toast(client):
             page.goto("http://127.0.0.1:17880/demo", wait_until="domcontentloaded")
             page.wait_for_timeout(2000)
 
-            # Dismiss overlay first
+            # Dismiss connection-setup modal if present (appears on CI where no
+            # meridian.toml exists — the modal intercepts all pointer events).
+            conn_modal = page.query_selector("#conn-setup-modal")
+            if conn_modal and conn_modal.is_visible():
+                page.keyboard.press("Escape")
+                page.wait_for_timeout(300)
+
+            # Dismiss demo onboarding overlay if present
             overlay_btn = page.query_selector("#demo-onboarding-overlay button")
             if overlay_btn:
                 overlay_btn.click()
