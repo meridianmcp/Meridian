@@ -394,6 +394,7 @@ CREATE TABLE IF NOT EXISTS projects (
     creator_human_id TEXT,
     goal_mode TEXT NOT NULL DEFAULT 'manual',
     decisions TEXT,
+    ntfy_url TEXT,
     max_pinned_decisions INTEGER NOT NULL DEFAULT 20,
     rewind_token TEXT,
     created_at TEXT NOT NULL DEFAULT ({_TS})
@@ -800,9 +801,10 @@ async def _migrate_pg_v24_task_tree_and_framework(conn: PostgresConnection) -> N
 
 
 async def _migrate_pg_project_settings(conn: PostgresConnection) -> None:
-    """v2.6.1 — add per-project settings columns."""
+    """v2.6.1 — add per-project settings columns and notification target."""
     await conn.executescript(
-        "ALTER TABLE projects ADD COLUMN IF NOT EXISTS max_pinned_decisions INTEGER NOT NULL DEFAULT 20"
+        "ALTER TABLE projects ADD COLUMN IF NOT EXISTS max_pinned_decisions INTEGER NOT NULL DEFAULT 20;"
+        "ALTER TABLE projects ADD COLUMN IF NOT EXISTS ntfy_url TEXT"
     )
 
 
