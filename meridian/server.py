@@ -4873,10 +4873,23 @@ async def _oauth_auth(request: Request):
             next_path = f"/oauth/authorize?{orig_qs}" if orig_qs else "/oauth/authorize"
             return _RR(f"/auth/login?next={_q(next_path)}")
     # ── Auto-approve ────────────────────────────────────────────────────────
+    # In hosted mode, capture the tenant_id from the session so MCP requests
+    # can be routed to the correct per-tenant project DB.
+    _tenant_id: str | None = None
+    if _hosted_mode():
+        from .hosted import _SESSION_COOKIE, _read_session_cookie
+        _cookie = request.cookies.get(_SESSION_COOKIE, "")
+        _sid = _read_session_cookie(_cookie) if _cookie else None
+        if _sid:
+            _sess = await db_module.get_user_session(request.app.state.db, _sid)
+            if _sess:
+                _tenant_id = _sess.get("tenant_id")
+
     code = _sec.token_urlsafe(32)
     _oa_codes[code] = {"client_id": p.get("client_id", ""),
         "redirect_uri": p.get("redirect_uri", ""),
         "challenge": p.get("code_challenge"),
+        "tenant_id": _tenant_id,
         "exp": _tm.time() + 600}
     qs = _ue({"code": code, "state": p.get("state", "")})
     return _RR(f"{p.get('redirect_uri', '')}?{qs}")
@@ -4900,7 +4913,11 @@ async def _oauth_token(request: Request):
         if ch != cd["challenge"]:
             return JSONResponse({"error": "invalid_grant"}, status_code=400)
     tok = _sec.token_urlsafe(32)
-    _oa_tokens[tok] = {"client_id": cd["client_id"], "exp": _tm.time() + 86400 * 90}
+    _oa_tokens[tok] = {
+        "client_id": cd["client_id"],
+        "exp": _tm.time() + 86400 * 90,
+        "tenant_id": cd.get("tenant_id"),  # propagate for per-tenant DB routing
+    }
     _save_oa_tokens(_oa_tokens)
     return JSONResponse({"access_token": tok, "token_type": "bearer", "expires_in": 86400 * 90})
 
@@ -5018,7 +5035,7 @@ async def remote_mcp(request: Request) -> Any:
         except Exception:
             pass  # rate limiting is best-effort; don't block on errors
 
-    # Check local OAuth tokens first (claude.ai connector via tunnel)
+    # Check local OAuth tokens first (claude.ai connector via tunnel or hosted OAuth)
     _auth = request.headers.get("authorization", "")
     _bearer = _auth.removeprefix("Bearer ").strip()
     if _bearer and _bearer in _oa_tokens:
@@ -5029,7 +5046,16 @@ async def remote_mcp(request: Request) -> Any:
             _body = await request.json()
         except Exception:
             return JSONResponse(_jsonrpc_err(None, -32700, "parse error"), status_code=400)
+        # In hosted mode, route to the tenant's project DB (not the shared auth DB).
+        # tenant_id is stored in _oa_tokens when the OAuth flow ran in hosted mode.
         _mdb = request.app.state.db
+        _oa_tenant_id = _td.get("tenant_id")
+        if _oa_tenant_id and _hosted_mode():
+            try:
+                from ._deps import _open_tenant_db_by_id
+                _mdb = await _open_tenant_db_by_id(request, _oa_tenant_id)
+            except Exception:
+                pass  # fall back to auth DB — better than 500
         _mdd = request.app.state.data_dir
         if isinstance(_body, list):
             return JSONResponse([await _handle_mcp_request(i, _mdb, _mdd) for i in _body])
