@@ -14,6 +14,36 @@ function isDemoMode() {
   return !!state.serverConfig?.demo_mode || window.location.pathname.startsWith('/demo');
 }
 
+function isHostedMode() {
+  return !!window.MERIDIAN_HOSTED;
+}
+
+function hideHostedAdminControls() {
+  // Hide server-management controls that are irrelevant on usemeridian.us
+  const toHide = ['#restart-server-btn', '#stop-server-btn', '#banner-restart-btn', '#git-check-btn'];
+  toHide.forEach(sel => {
+    document.querySelectorAll(sel).forEach(el => { el.style.display = 'none'; });
+  });
+
+  // Hide connection switcher / profile selector — hosted users have one managed DB
+  const connInd = document.getElementById('connection-indicator');
+  if (connInd) connInd.style.display = 'none';
+
+  // Replace with static "usemeridian.us" label in sidebar footer
+  const footer = document.querySelector('.sidebar-footer');
+  if (footer && !footer.querySelector('.hosted-label')) {
+    const lbl = document.createElement('div');
+    lbl.className = 'hosted-label';
+    lbl.style.cssText = 'font-size:10px;color:var(--accent-green);font-family:\'IBM Plex Mono\',monospace;padding:4px 6px;border:1px solid var(--accent-green);border-radius:3px;opacity:0.7';
+    lbl.textContent = '⬡ usemeridian.us';
+    footer.prepend(lbl);
+  }
+
+  // Rename "advanced setup ↗" → "Close" in first-run wizard
+  const advLink = document.getElementById('ez-advanced-link');
+  if (advLink) advLink.textContent = 'Close';
+}
+
 const STORAGE_KEY = (k) => (isDemoMode() ? 'meridian_demo_' : 'meridian_') + k.replace(/^meridian[._]/, '');
 const RECENT_DONE_LIMIT = 25;
 const NORTH_STAR_MIN_HEIGHT_PX = 180;
@@ -542,6 +572,7 @@ async function checkGitStatus() {
     hideDemoAdminControls();
     return;
   }
+  if (isHostedMode()) return;
   const btn = document.getElementById('git-check-btn');
   if (btn) { btn.textContent = 'checking…'; btn.style.color = 'var(--muted)'; }
   try {
@@ -5217,6 +5248,7 @@ async function restoreTabs() {
   await loadConfig();
   await loadProjects();
   if (isDemoMode()) hideDemoAdminControls();
+  if (isHostedMode()) hideHostedAdminControls();
   // v0.6.6 — EZ first-run wizard: if no projects exist, show the overlay
   // Skip in demo mode — demo DB always has projects seeded.
   if (state.projects.length === 0 && !isDemoMode()) {

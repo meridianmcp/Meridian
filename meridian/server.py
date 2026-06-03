@@ -2020,7 +2020,12 @@ async def dashboard_html(request: Request) -> Any:
     return _templates.TemplateResponse(
         request,
         "dashboard.html",
-        {"version": _VERSION, "asset_version": _ASSET_VERSION, "demo_mode": False},
+        {
+            "version": _VERSION,
+            "asset_version": _ASSET_VERSION,
+            "demo_mode": False,
+            "hosted_mode": os.environ.get("MERIDIAN_HOSTED", "").lower() in ("1", "true", "yes"),
+        },
     )
 
 
@@ -2046,7 +2051,7 @@ async def demo_dashboard(request: Request) -> Any:
     response = _templates.TemplateResponse(
         request,
         "dashboard.html",
-        {"version": _VERSION, "asset_version": _ASSET_VERSION, "demo_mode": True},
+        {"version": _VERSION, "asset_version": _ASSET_VERSION, "demo_mode": True, "hosted_mode": False},
     )
     response.set_cookie(
         _DEMO_CONTEXT_COOKIE,

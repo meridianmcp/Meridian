@@ -98,8 +98,15 @@ your project context on start and snapshots progress on end.
 - Web docs: https://docs.usemeridian.us
 
 ---
+## Executor rules (Meridian project only)
+
+- **End every session**: `git checkout main && git merge dev && git push origin main` — pushes to main which triggers the GitHub Actions deploy.
+- **Set sprint name**: Use `PATCH /projects/{id}/goal` with body `{"sprint": "name"}` directly (or the `set_sprint` MCP tool). Do NOT use `set_goal` for sprint-only updates.
+- **Handoff**: Call `get_context_block(project_id)` for the handoff context block. Do NOT read from `data/meridian-build_handoff.md` — that file is local-only and not reliable across sessions.
+
+---
 <!-- MERIDIAN STATE — auto-generated, do not edit below -->
-## Current Sprint State  _(auto-updated 2026-06-03 03:32 UTC)_
+## Current Sprint State  _(auto-updated 2026-06-03 17:20 UTC)_
 
 **Key Files:**
 - `meridian/server.py` — FastAPI app + MCP handlers
