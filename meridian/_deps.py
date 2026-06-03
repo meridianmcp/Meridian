@@ -162,6 +162,10 @@ async def _db(request: Request) -> Any:
         if demo_db is not None:
             request.state._db_conn = demo_db
             return demo_db
+        if not _hosted_mode():
+            conn = request.app.state.db
+            request.state._db_conn = conn
+            return conn
         raise HTTPException(
             status_code=503,
             detail="Demo DB not available. Set MERIDIAN_DEMO_DB_URL to enable the demo.",

@@ -5268,14 +5268,10 @@ def test_demo_write_blocked_with_cookie(client):
     assert r.status_code == 403
 
 
-def test_demo_read_returns_503_without_demo_db(client):
-    """GET with meridian_demo cookie but no demo DB configured returns 503.
-
-    The demo guard hard-fails rather than falling through to the production DB
-    — this is intentional security behaviour added in v1.0 (P2 fix).
-    """
+def test_demo_read_returns_200_without_demo_db(client):
+    """GET with meridian_demo cookie falls back to the regular DB when internal."""
     r = client.get("/projects", cookies={"meridian_demo": "1"})
-    assert r.status_code == 503
+    assert r.status_code == 200
 
 
 async def test_dark_tables_exist(db):

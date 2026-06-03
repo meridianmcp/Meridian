@@ -519,6 +519,7 @@ async def lifespan(app: FastAPI):
     app.state.db = db
     app.state.data_dir = str(data_dir)
     app.state.ws_broadcaster = dashboard_module.WebSocketBroadcaster()
+    await _hydrate_oauth_cache(db)
 
     # v2.2 — isolated demo DB.
     # Priority: MERIDIAN_DEMO_DB_URL → MERIDIAN_STANDARD_KEY (legacy secret
@@ -2017,6 +2018,15 @@ async def dashboard_html(request: Request) -> Any:
     if os.environ.get("DEMO_PASSWORD"):
         if not _check_demo_cookie(request):
             return HTMLResponse(_demo_gate_html())
+    is_admin = False
+    if _hosted_mode():
+        from .hosted import get_current_tenant, is_admin_db
+
+        try:
+            tenant = await get_current_tenant(request)
+            is_admin = await is_admin_db(tenant.get("email", ""), request.app.state.db)
+        except HTTPException:
+            is_admin = False
     return _templates.TemplateResponse(
         request,
         "dashboard.html",
@@ -2025,6 +2035,7 @@ async def dashboard_html(request: Request) -> Any:
             "asset_version": _ASSET_VERSION,
             "demo_mode": False,
             "hosted_mode": os.environ.get("MERIDIAN_HOSTED", "").lower() in ("1", "true", "yes"),
+            "is_admin": is_admin,
         },
     )
 
@@ -2051,7 +2062,13 @@ async def demo_dashboard(request: Request) -> Any:
     response = _templates.TemplateResponse(
         request,
         "dashboard.html",
-        {"version": _VERSION, "asset_version": _ASSET_VERSION, "demo_mode": True, "hosted_mode": False},
+        {
+            "version": _VERSION,
+            "asset_version": _ASSET_VERSION,
+            "demo_mode": True,
+            "hosted_mode": False,
+            "is_admin": False,
+        },
     )
     response.set_cookie(
         _DEMO_CONTEXT_COOKIE,
@@ -3190,6 +3207,7 @@ The 5 tools you use 90% of the time:
 
 ## Session lifecycle
 
+  list_projects()        ← first, if you don't know the project_id
   start_session()       ← always first
   log_task()            ← after any meaningful work
   pin_decision()        ← for architectural choices
@@ -4196,10 +4214,18 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "required": ["project_id", "session_name"]}},
     {"name": "start_session", "description": "Register session and return goal + recent tasks in one call.",
      "inputSchema": {"type": "object", "properties": {
-         "project_id": {"type": "string"}, "session_name": {"type": "string"},
-         "human_id": {"type": "string"},
-         "client": {"type": "string", "enum": ["claude-code", "claude-desktop", "cursor", "other"]}},
-         "required": ["project_id", "session_name"]}},
+          "project_id": {"type": "string"}, "session_name": {"type": "string"},
+          "human_id": {"type": "string"},
+          "client": {"type": "string", "enum": ["claude-code", "claude-desktop", "cursor", "other"]}},
+          "required": ["project_id", "session_name"]}},
+    {"name": "list_projects", "description":
+        "Call first when project_id is unknown. Returns [{id, name, sprint, created_at}] newest first.",
+     "inputSchema": {"type": "object", "properties": {}}},
+    {"name": "get_project_by_name", "description":
+        "Look up a project by name (case-insensitive substring match). Returns the first hit with id, name, and sprint.",
+     "inputSchema": {"type": "object", "properties": {
+         "name": {"type": "string"}},
+         "required": ["name"]}},
     {"name": "get_goal", "description": "Read the current goal state.",
      "inputSchema": {"type": "object", "properties": {"project_id": {"type": "string"}}, "required": ["project_id"]}},
     {"name": "set_goal", "description": "Set or update the goal state.",
@@ -4450,6 +4476,17 @@ async def _dispatch_mcp_tool(name: str, args: dict[str, Any], db: Any, data_dir:
         goal = await db_module.get_goal(db, args["project_id"])
         tasks = await db_module.get_tasks(db, args["project_id"], limit=10)
         return {"session": session, "goal": goal, "recent_tasks": tasks}
+    if name == "list_projects":
+        return await db_module.list_project_summaries(db)
+    if name == "get_project_by_name":
+        project = await db_module.get_project_by_name(db, args["name"])
+        if project is None:
+            raise ValueError(f"no project found matching '{args['name']}'")
+        return {
+            "id": project["id"],
+            "name": project["name"],
+            "sprint": project.get("sprint"),
+        }
     if name == "get_goal":
         goal = await db_module.get_goal(db, args["project_id"])
         if goal and goal.get("decisions") and len(goal["decisions"]) > 3000:
@@ -4797,27 +4834,153 @@ from fastapi.responses import RedirectResponse as _RR
 _oa_clients: dict = {}
 _oa_codes: dict = {}
 
-# Tokens persisted to disk so they survive server restarts
+# Tokens persisted to disk in local mode for backwards compatibility.
 _OA_TOKEN_FILE = DEFAULT_DATA_DIR / "oauth_tokens.json"
 
-def _load_oa_tokens() -> dict:
+def _oauth_token_hash(token: str) -> str:
+    return _hs.sha256(token.encode()).hexdigest()
+
+
+def _normalize_oa_tokens(tokens: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    now = int(_tm.time())
+    normalized: dict[str, dict[str, Any]] = {}
+    for raw_key, raw_value in (tokens or {}).items():
+        if not isinstance(raw_value, dict):
+            continue
+        try:
+            exp = int(raw_value.get("exp", 0))
+        except (TypeError, ValueError):
+            continue
+        if exp <= now:
+            continue
+        token_hash = (
+            raw_key
+            if isinstance(raw_key, str)
+            and len(raw_key) == 64
+            and all(c in "0123456789abcdef" for c in raw_key.lower())
+            else _oauth_token_hash(str(raw_key))
+        )
+        normalized[token_hash] = {
+            "tenant_id": raw_value.get("tenant_id"),
+            "client_id": raw_value.get("client_id"),
+            "exp": exp,
+        }
+    return normalized
+
+
+def _load_oa_tokens_file() -> dict[str, dict[str, Any]]:
     try:
         if _OA_TOKEN_FILE.exists():
             data = _json.loads(_OA_TOKEN_FILE.read_text())
-            now = _tm.time()
-            return {k: v for k, v in data.items() if v.get("exp", 0) > now}
+            return _normalize_oa_tokens(data)
     except Exception:
         pass
     return {}
 
 def _save_oa_tokens(tokens: dict) -> None:
+    if _hosted_mode():
+        return
     try:
         _OA_TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
         _OA_TOKEN_FILE.write_text(_json.dumps(tokens))
     except Exception:
         pass
 
-_oa_tokens: dict = _load_oa_tokens()
+async def _ensure_oauth_token_table(db: Any) -> None:
+    await db.execute(
+        """CREATE TABLE IF NOT EXISTS oauth_tokens (
+            token_hash TEXT PRIMARY KEY,
+            tenant_id TEXT,
+            client_id TEXT,
+            exp BIGINT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )"""
+    )
+    await db.commit()
+
+
+async def _upsert_oauth_token(
+    db: Any,
+    token_hash: str,
+    *,
+    tenant_id: str | None,
+    client_id: str,
+    exp: int,
+) -> None:
+    await db.execute(
+        "INSERT INTO oauth_tokens (token_hash, tenant_id, client_id, exp) "
+        "VALUES (?, ?, ?, ?) "
+        "ON CONFLICT(token_hash) DO UPDATE SET "
+        "tenant_id = excluded.tenant_id, "
+        "client_id = excluded.client_id, "
+        "exp = excluded.exp",
+        (token_hash, tenant_id, client_id, exp),
+    )
+    await db.commit()
+
+
+async def _get_oauth_token_from_db(
+    db: Any,
+    token_hash: str,
+) -> dict[str, Any] | None:
+    async with db.execute(
+        "SELECT token_hash, tenant_id, client_id, exp "
+        "FROM oauth_tokens WHERE token_hash = ? AND exp > ?",
+        (token_hash, int(_tm.time())),
+    ) as cur:
+        row = await cur.fetchone()
+    if row is None:
+        return None
+    return {
+        "tenant_id": row["tenant_id"],
+        "client_id": row["client_id"],
+        "exp": int(row["exp"]),
+    }
+
+
+async def _load_oauth_tokens_from_db(db: Any) -> dict[str, dict[str, Any]]:
+    async with db.execute(
+        "SELECT token_hash, tenant_id, client_id, exp "
+        "FROM oauth_tokens WHERE exp > ?",
+        (int(_tm.time()),),
+    ) as cur:
+        rows = await cur.fetchall()
+    return {
+        row["token_hash"]: {
+            "tenant_id": row["tenant_id"],
+            "client_id": row["client_id"],
+            "exp": int(row["exp"]),
+        }
+        for row in rows
+    }
+
+
+async def _hydrate_oauth_cache(auth_db: Any) -> None:
+    global _oa_tokens
+
+    await _ensure_oauth_token_table(auth_db)
+    _oa_tokens = await _load_oauth_tokens_from_db(auth_db)
+
+    if _hosted_mode():
+        return
+
+    legacy_tokens = _load_oa_tokens_file()
+    if not legacy_tokens:
+        return
+
+    _oa_tokens.update(legacy_tokens)
+    for token_hash, token_data in legacy_tokens.items():
+        await _upsert_oauth_token(
+            auth_db,
+            token_hash,
+            tenant_id=token_data.get("tenant_id"),
+            client_id=str(token_data.get("client_id") or ""),
+            exp=int(token_data.get("exp", 0)),
+        )
+    _save_oa_tokens(_oa_tokens)
+
+
+_oa_tokens: dict[str, dict[str, Any]] = {}
 
 
 @app.get("/.well-known/oauth-authorization-server")
@@ -4913,11 +5076,20 @@ async def _oauth_token(request: Request):
         if ch != cd["challenge"]:
             return JSONResponse({"error": "invalid_grant"}, status_code=400)
     tok = _sec.token_urlsafe(32)
-    _oa_tokens[tok] = {
+    tok_hash = _oauth_token_hash(tok)
+    tok_data = {
         "client_id": cd["client_id"],
-        "exp": _tm.time() + 86400 * 90,
+        "exp": int(_tm.time() + 86400 * 90),
         "tenant_id": cd.get("tenant_id"),  # propagate for per-tenant DB routing
     }
+    _oa_tokens[tok_hash] = tok_data
+    await _upsert_oauth_token(
+        request.app.state.db,
+        tok_hash,
+        tenant_id=tok_data.get("tenant_id"),
+        client_id=tok_data["client_id"],
+        exp=tok_data["exp"],
+    )
     _save_oa_tokens(_oa_tokens)
     return JSONResponse({"access_token": tok, "token_type": "bearer", "expires_in": 86400 * 90})
 
@@ -5022,11 +5194,10 @@ async def mcp_sse_post(request: Request) -> Any:
 async def remote_mcp(request: Request) -> Any:
     """Remote MCP endpoint — JSON-RPC 2.0 over HTTP.
 
-    Requires ``Authorization: Bearer sk_meridian_...`` header.
+    Accepts OAuth bearer tokens and Meridian API keys over the same endpoint.
     Rate-limited to 100 requests/minute per IP.
     Accepts a single JSON-RPC 2.0 message or a batch (list).
     """
-    from .hosted import get_tenant_from_bearer
     from fastapi.responses import JSONResponse
 
     if _limiter is not None:
@@ -5038,9 +5209,15 @@ async def remote_mcp(request: Request) -> Any:
     # Check local OAuth tokens first (claude.ai connector via tunnel or hosted OAuth)
     _auth = request.headers.get("authorization", "")
     _bearer = _auth.removeprefix("Bearer ").strip()
-    if _bearer and _bearer in _oa_tokens:
-        _td = _oa_tokens[_bearer]
+    _bearer_hash = _oauth_token_hash(_bearer) if _bearer else ""
+    _td = _oa_tokens.get(_bearer_hash) if _bearer_hash else None
+    if _td is None and _bearer_hash:
+        _td = await _get_oauth_token_from_db(request.app.state.db, _bearer_hash)
+        if _td is not None:
+            _oa_tokens[_bearer_hash] = _td
+    if _td is not None:
         if _tm.time() > _td.get("exp", 0):
+            _oa_tokens.pop(_bearer_hash, None)
             return JSONResponse({"error": "token_expired"}, status_code=401)
         try:
             _body = await request.json()
@@ -5061,8 +5238,14 @@ async def remote_mcp(request: Request) -> Any:
             return JSONResponse([await _handle_mcp_request(i, _mdb, _mdd) for i in _body])
         return JSONResponse(await _handle_mcp_request(_body, _mdb, _mdd))
 
-    # Bearer auth required (hosted tenant path)
-    tenant = await get_tenant_from_bearer(request)  # raises 401 if invalid
+    tenant = None
+    if _bearer_hash:
+        tenant = await db_module.get_tenant_from_token_hash(request.app.state.db, _bearer_hash)
+    if tenant is None:
+        from .hosted import get_tenant_from_bearer
+
+        # Bearer auth required (hosted tenant path)
+        tenant = await get_tenant_from_bearer(request)  # raises 401 if invalid
 
     try:
         body = await request.json()
@@ -5898,7 +6081,8 @@ def build_mcp_server():
                     "Single call to start a coordinated session. Registers "
                     "you, reads goal + ambient context, shows recent work, "
                     "lists active sessions, and tells you where the handoff "
-                    "file is. Call this INSTEAD of register_session + "
+                    "file is. If project_id is unknown, call list_projects() "
+                    "first. Call this INSTEAD of register_session + "
                     "get_goal + get_tasks separately. Returns: session_id, "
                     "goal (with ambient_tasks), recent_tasks (last 10), "
                     "active_sessions, handoff_exists, handoff_path, files."
@@ -5924,22 +6108,18 @@ def build_mcp_server():
             Tool(
                 name="list_projects",
                 description=(
-                    "List all Meridian projects with their names and ids. "
-                    "No parameters required. Use this when you don't know "
-                    "the project_id — find the project by name, then pass "
-                    "its id to register_session or start_session. Returns "
-                    "[{id, name, created_at}] newest first."
+                    "Call first when project_id is unknown. Returns the "
+                    "current tenant's projects as [{id, name, sprint, "
+                    "created_at}] newest first."
                 ),
                 inputSchema={"type": "object", "properties": {}},
             ),
             Tool(
                 name="get_project_by_name",
                 description=(
-                    "Look up a project by name (case-insensitive, substring "
-                    "match). Returns the project id plus a brief goal "
-                    "summary. Use this for cold starts when you know the "
-                    "project name but not the UUID: call this first, then "
-                    "pass the returned id to start_session."
+                    "Look up a project by name (case-insensitive substring "
+                    "match). Returns the first hit with id, name, and sprint. "
+                    "Use this when you know the project name but not the UUID."
                 ),
                 inputSchema={
                     "type": "object",
@@ -6228,30 +6408,19 @@ def build_mcp_server():
                     client_type=arguments.get("client"),
                 )
             elif name == "list_projects":
-                result = await db_module.list_projects(db)
+                result = await db_module.list_project_summaries(db)
             elif name == "get_project_by_name":
                 name_arg = arguments["name"]
                 project = await db_module.get_project_by_name(db, name_arg)
-                if project is None:
-                    all_projects = await db_module.list_projects(db)
-                    lower = name_arg.lower()
-                    matches = [
-                        p for p in all_projects
-                        if lower in p["name"].lower()
-                    ]
-                    project = matches[0] if matches else None
                 if project is None:
                     result = {
                         "error": f"no project found matching '{name_arg}'"
                     }
                 else:
-                    goal = await db_module.get_goal(db, project["id"])
                     result = {
-                        "project": project,
-                        "goal_version": goal["version"] if goal else None,
-                        "goal_summary": (
-                            str(goal["content"])[:200] if goal else None
-                        ),
+                        "id": project["id"],
+                        "name": project["name"],
+                        "sprint": project.get("sprint"),
                     }
             elif name == "start_worker_session":
                 try:

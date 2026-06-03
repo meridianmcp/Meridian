@@ -334,6 +334,14 @@ CREATE TABLE IF NOT EXISTS api_tokens (
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+CREATE TABLE IF NOT EXISTS oauth_tokens (
+    token_hash TEXT PRIMARY KEY,
+    tenant_id TEXT REFERENCES tenants(id),
+    client_id TEXT,
+    exp BIGINT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 -- v2.1 dark — multi-user roles, not exposed in UI or API at launch
 CREATE TABLE IF NOT EXISTS workspace_members (
     id TEXT PRIMARY KEY,
@@ -1198,6 +1206,14 @@ async def _migrate_hosted_tables(db: aiosqlite.Connection) -> None:
             created_at TEXT NOT NULL DEFAULT (datetime('now'))
         );
 
+        CREATE TABLE IF NOT EXISTS oauth_tokens (
+            token_hash TEXT PRIMARY KEY,
+            tenant_id TEXT REFERENCES tenants(id),
+            client_id TEXT,
+            exp BIGINT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+
         CREATE TABLE IF NOT EXISTS neon_pool_projects (
             id TEXT PRIMARY KEY,
             neon_project_id TEXT NOT NULL UNIQUE,
@@ -1372,18 +1388,49 @@ async def get_project(
 async def get_project_by_name(
     db: aiosqlite.Connection, name: str
 ) -> dict[str, Any] | None:
-    """Look up a project by its unique name."""
+    """Look up a project by name using exact, then fuzzy case-insensitive match."""
     async with db.execute(
-        "SELECT * FROM projects WHERE name = ?", (name,)
+        "SELECT p.*, gs.goal_sprint AS sprint "
+        "FROM projects p "
+        "LEFT JOIN goal_states gs ON gs.project_id = p.id "
+        "WHERE p.name = ? "
+        "ORDER BY gs.version DESC "
+        "LIMIT 1",
+        (name,),
     ) as cur:
         row = await cur.fetchone()
+    if row is None:
+        async with db.execute(
+            "SELECT p.*, gs.goal_sprint AS sprint "
+            "FROM projects p "
+            "LEFT JOIN goal_states gs ON gs.project_id = p.id "
+            "WHERE LOWER(p.name) LIKE ? "
+            "ORDER BY p.created_at DESC, gs.version DESC "
+            "LIMIT 1",
+            (f"%{name.lower()}%",),
+        ) as cur:
+            row = await cur.fetchone()
     return _row_to_dict(row)
 
 
 async def list_projects(db: aiosqlite.Connection) -> list[dict[str, Any]]:
-    """Return every project, newest first."""
+    """Return every project row, newest first."""
     async with db.execute(
         "SELECT * FROM projects ORDER BY created_at DESC"
+    ) as cur:
+        rows = await cur.fetchall()
+    return [_row_to_dict(r) for r in rows]  # type: ignore[misc]
+
+
+async def list_project_summaries(db: aiosqlite.Connection) -> list[dict[str, Any]]:
+    """Return project discovery summaries with sprint metadata, newest first."""
+    async with db.execute(
+        "SELECT p.id, p.name, gs.goal_sprint AS sprint, p.created_at "
+        "FROM projects p "
+        "LEFT JOIN goal_states gs "
+        "ON gs.project_id = p.id "
+        "AND gs.version = (SELECT MAX(version) FROM goal_states WHERE project_id = p.id) "
+        "ORDER BY p.created_at DESC"
     ) as cur:
         rows = await cur.fetchall()
     return [_row_to_dict(r) for r in rows]  # type: ignore[misc]
