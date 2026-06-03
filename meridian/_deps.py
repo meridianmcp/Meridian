@@ -123,6 +123,14 @@ async def _open_tenant_db_by_id(request: Request, tenant_id: str) -> Any:
     if not url:
         url = os.environ.get("MERIDIAN_AUTH_DB") or None
     if not url:
+        # Fallback for is_internal admin accounts that have no dedicated DB:
+        # use app.state.db (the auth DB) so the dashboard is never blank.
+        # This handles the case where an admin signs in at usemeridian.us but
+        # their neon_db_url isn't provisioned yet.
+        if tenant.get("is_internal"):
+            conn = auth_db
+            _tenant_db_cache[tenant_id] = conn
+            return conn
         raise HTTPException(
             status_code=503,
             detail="tenant database not provisioned — set MERIDIAN_AUTH_DB or run set_tenant_db.py",

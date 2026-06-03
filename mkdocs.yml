@@ -39,6 +39,7 @@ nav:
     - Configuration: configuration.md
   - MCP Tools: mcp-tools.md
   - Hosted (usemeridian.us): hosted.md
+  - Browser connector (claude.ai): browser-connector.md
   - Self-Hosting: self-hosting.md
   - API Reference: api-reference.md
   - FAQ: faq.md
