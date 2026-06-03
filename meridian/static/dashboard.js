@@ -19,27 +19,34 @@ function isHostedMode() {
 }
 
 function hideHostedAdminControls() {
-  // Hide server-management controls that are irrelevant on usemeridian.us
-  const toHide = ['#restart-server-btn', '#stop-server-btn', '#banner-restart-btn', '#git-check-btn'];
+  // Hide ALL server-management controls — Restart/Stop kill the shared Fly machine
+  // and must never be reachable from usemeridian.us.
+  const toHide = [
+    '#restart-server-btn', '#stop-server-btn', '#banner-restart-btn',
+    '#git-check-btn', '#update-banner',   // check-updates and update banner
+  ];
   toHide.forEach(sel => {
     document.querySelectorAll(sel).forEach(el => { el.style.display = 'none'; });
   });
 
-  // Hide connection switcher / profile selector — hosted users have one managed DB
+  // Hide connection switcher / profile selector — hosted users have one managed DB,
+  // switching connections would break tenant isolation.
   const connInd = document.getElementById('connection-indicator');
   if (connInd) connInd.style.display = 'none';
+  // Also kill any open connection popup
+  document.querySelectorAll('.conn-popup').forEach(p => p.remove());
 
-  // Replace with static "usemeridian.us" label in sidebar footer
+  // Replace connection area with a static "usemeridian.us" label
   const footer = document.querySelector('.sidebar-footer');
   if (footer && !footer.querySelector('.hosted-label')) {
     const lbl = document.createElement('div');
     lbl.className = 'hosted-label';
-    lbl.style.cssText = 'font-size:10px;color:var(--accent-green);font-family:\'IBM Plex Mono\',monospace;padding:4px 6px;border:1px solid var(--accent-green);border-radius:3px;opacity:0.7';
+    lbl.style.cssText = 'font-size:10px;color:var(--accent-green);font-family:\'IBM Plex Mono\',monospace;padding:4px 6px;border:1px solid var(--accent-green)44;border-radius:3px;opacity:0.8;letter-spacing:.03em';
     lbl.textContent = '⬡ usemeridian.us';
     footer.prepend(lbl);
   }
 
-  // Rename "advanced setup ↗" → "Close" in first-run wizard
+  // Rename "advanced setup ↗" → "Close" in first-run wizard (no local config on hosted)
   const advLink = document.getElementById('ez-advanced-link');
   if (advLink) advLink.textContent = 'Close';
 }
@@ -399,6 +406,9 @@ function _renderPlanBadge(me) {
 // v1.9.x — show active DB connection in sidebar footer
 function _updateConnectionIndicator(cfg) {
   if (!cfg) return;
+  // Never show the connection switcher on usemeridian.us — it exposes local DB controls
+  // that are meaningless (and dangerous) in hosted mode.
+  if (isHostedMode()) return;
   const wrap = document.getElementById('connection-indicator');
   const label = document.getElementById('connection-label');
   const dot = document.getElementById('connection-dot');
@@ -5263,31 +5273,32 @@ async function restoreTabs() {
   // v2.4 — HITL queue: poll for pending requests every 30s + initial load.
   initHitlPanel();
 
-  // v1.7.0 — stop server button
-  const stopBtn = document.getElementById('stop-server-btn');
-  if (stopBtn) {
-    stopBtn.onclick = async () => {
-      if (!confirm('Stop the Meridian server? You will need to run `pixi run start` to restart.')) return;
-      try {
-        await api('/admin/shutdown', { method: 'POST' });
-        stopBtn.textContent = 'Stopped — run pixi run start';
-        stopBtn.disabled = true;
-        // Hide restart button — server is stopped, restart is impossible
-        const restartBtn = document.getElementById('restart-server-btn');
-        if (restartBtn) restartBtn.style.display = 'none';
-      } catch(e) {
-        toast('Shutdown request sent.', false);
-      }
-    };
-  }
+  // v1.7.0 — stop server button (self-hosted only — never wired on usemeridian.us)
+  if (!isHostedMode()) {
+    const stopBtn = document.getElementById('stop-server-btn');
+    if (stopBtn) {
+      stopBtn.onclick = async () => {
+        if (!confirm('Stop the Meridian server? You will need to run `pixi run start` to restart.')) return;
+        try {
+          await api('/admin/shutdown', { method: 'POST' });
+          stopBtn.textContent = 'Stopped — run pixi run start';
+          stopBtn.disabled = true;
+          const restartBtn = document.getElementById('restart-server-btn');
+          if (restartBtn) restartBtn.style.display = 'none';
+        } catch(e) {
+          toast('Shutdown request sent.', false);
+        }
+      };
+    }
 
-  // v1.9.x — restart button in sidebar footer
-  const restartBtn = document.getElementById('restart-server-btn');
-  if (restartBtn) {
-    restartBtn.onclick = async () => {
-      if (!confirm('Restart the Meridian server?')) return;
-      await _doRestart();
-    };
+    // v1.9.x — restart button in sidebar footer (self-hosted only)
+    const restartBtn = document.getElementById('restart-server-btn');
+    if (restartBtn) {
+      restartBtn.onclick = async () => {
+        if (!confirm('Restart the Meridian server?')) return;
+        await _doRestart();
+      };
+    }
   }
 
   // v1.9.x — restart button in update banner
