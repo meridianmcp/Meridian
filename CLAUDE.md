@@ -100,13 +100,15 @@ your project context on start and snapshots progress on end.
 ---
 ## Executor rules (Meridian project only)
 
-- **End every session**: `git checkout main && git merge dev && git push origin main` — pushes to main which triggers the GitHub Actions deploy.
+- **Before every push**: Run `pixi run test` locally first. CI is a safety net — not the first check. Never push broken code.
+- **End every session**: Push to `dev` — CI auto-runs tests, deploys to `meridian-preview`, smoke tests preview, then merges `dev → main` and deploys to prod automatically if green. Do NOT manually merge dev→main.
 - **Set sprint name**: Use `PATCH /projects/{id}/goal` with body `{"sprint": "name"}` directly (or the `set_sprint` MCP tool). Do NOT use `set_goal` for sprint-only updates.
 - **Handoff**: Call `get_context_block(project_id)` for the handoff context block. Do NOT read from `data/meridian-build_handoff.md` — that file is local-only and not reliable across sessions.
+- **Staging pipeline**: `dev push → test → deploy preview → smoke test → merge main → prod`. Rollback fires automatically if prod /health returns non-200 after deploy.
 
 ---
 <!-- MERIDIAN STATE — auto-generated, do not edit below -->
-## Current Sprint State  _(auto-updated 2026-06-03 17:20 UTC)_
+## Current Sprint State  _(auto-updated 2026-06-03 17:31 UTC)_
 
 **Key Files:**
 - `meridian/server.py` — FastAPI app + MCP handlers

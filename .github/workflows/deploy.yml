@@ -1,8 +1,15 @@
 name: Deploy to Fly.io
 
+# Pipeline: dev push → test → preview → smoke → merge main → prod (with rollback)
+# Production deploys ONLY happen when:
+#   (a) dev branch smoke tests pass and auto-merge fires, OR
+#   (b) a version tag is pushed, OR
+#   (c) manual workflow_dispatch
+# NEVER deploy prod directly from a dev push — always go through preview first.
+
 on:
   push:
-    branches: [main]
+    branches: [dev, main]
     tags: ['v*.*.*']
   workflow_dispatch:
 
@@ -10,6 +17,7 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
+  # ─── 1. Tests ───────────────────────────────────────────────────────────────
   test:
     runs-on: ubuntu-latest
     steps:
@@ -22,35 +30,145 @@ jobs:
       - run: pixi run python -m playwright install chromium --with-deps
       - run: pixi run test
 
-  # Every push to main AND manual dispatch deploys to the preview app.
-  # Human verifies preview before promoting to production.
+  # ─── 2. Preview deploy (dev branch only) ────────────────────────────────────
   deploy-preview:
     needs: test
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
+    if: github.ref == 'refs/heads/dev'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: superfly/flyctl-actions/setup-flyctl@master
-      - run: flyctl deploy --remote-only --config fly-preview.toml
+      - name: Deploy to meridian-preview
+        run: flyctl deploy --remote-only --config fly-preview.toml
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN_PREVIEW }}
 
-  # Production deploy only on manual dispatch or version tag push.
-  # Uses canary strategy so a bad deploy hits 1 machine before rolling out.
+  # ─── 3. Smoke tests against preview ─────────────────────────────────────────
+  smoke-preview:
+    needs: deploy-preview
+    if: github.ref == 'refs/heads/dev'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Wait for preview to boot (retry /health up to 90s)
+        run: |
+          BASE="https://meridian-preview.fly.dev"
+          echo "Waiting for /health..."
+          for i in $(seq 1 18); do
+            STATUS=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" "$BASE/health" || echo "000")
+            echo "Attempt $i: $STATUS"
+            [ "$STATUS" = "200" ] && break
+            [ "$i" = "18" ] && (echo "FAIL: /health never returned 200" && exit 1)
+            sleep 5
+          done
+
+      - name: Landing page loads
+        run: |
+          STATUS=$(curl -s --max-time 15 -o /dev/null -w "%{http_code}" https://meridian-preview.fly.dev/)
+          echo "Landing: $STATUS"
+          [ "$STATUS" = "200" ] || (echo "FAIL: / returned $STATUS" && exit 1)
+
+      - name: Demo page loads
+        run: |
+          STATUS=$(curl -s --max-time 15 -o /dev/null -w "%{http_code}" https://meridian-preview.fly.dev/demo)
+          echo "Demo: $STATUS"
+          [ "$STATUS" = "200" ] || (echo "FAIL: /demo returned $STATUS" && exit 1)
+
+      - name: MCP tools/list responds
+        run: |
+          RESP=$(curl -s --max-time 15 -X POST https://meridian-preview.fly.dev/mcp/sse \
+            -H 'Content-Type: application/json' \
+            -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}')
+          echo "$RESP" | grep -q '"start_session"' || (echo "FAIL: MCP tools missing start_session" && exit 1)
+          echo "MCP tools OK"
+
+  # ─── 4. Merge dev → main once smoke tests pass ───────────────────────────────
+  merge-to-main:
+    needs: smoke-preview
+    if: github.ref == 'refs/heads/dev'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Merge dev → main
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git fetch origin
+          git checkout main
+          # Use regular merge (not ff-only) so CHANGELOG commits on main don't block.
+          # --no-edit avoids any editor prompt on the merge commit message.
+          git merge --no-ff --no-edit origin/dev -m "ci: merge dev → main (auto)"
+          git push origin main
+
+  # ─── 5. Production deploy (main branch push or tag or manual) ────────────────
+  # Triggered by the merge above (main push) or explicit workflow_dispatch / tag.
+  # Canary strategy: 1 machine takes traffic first — if unhealthy, Fly rolls back.
   deploy:
     needs: test
-    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v')
+    if: >
+      (github.ref == 'refs/heads/main' &&
+       github.event_name == 'push' &&
+       github.actor == 'github-actions[bot]') ||
+      github.event_name == 'workflow_dispatch' ||
+      startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
+    outputs:
+      deployed_version: ${{ steps.deploy.outputs.deployed_version }}
     steps:
       - uses: actions/checkout@v4
       - uses: superfly/flyctl-actions/setup-flyctl@master
-      - run: flyctl deploy --remote-only --config fly.toml --strategy=canary
+
+      - name: Record pre-deploy image
+        id: pre_deploy
+        run: |
+          IMAGE=$(flyctl image show --app meridian-hosted --json 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('ref',''))" || echo "")
+          echo "image=$IMAGE" >> $GITHUB_OUTPUT
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
 
+      - name: Deploy to production (canary)
+        id: deploy
+        run: |
+          flyctl deploy --remote-only --config fly.toml --strategy=canary
+          echo "deployed_version=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+
+      - name: Post-deploy smoke test
+        id: smoke
+        run: |
+          sleep 20
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" https://usemeridian.us/health)
+          echo "Health: $STATUS"
+          [ "$STATUS" = "200" ] || (echo "FAIL: prod /health returned $STATUS" && exit 1)
+        continue-on-error: true
+
+      - name: Rollback on smoke failure
+        if: steps.smoke.outcome == 'failure'
+        run: |
+          echo "Smoke test failed — rolling back to previous image"
+          PREV="${{ steps.pre_deploy.outputs.image }}"
+          if [ -n "$PREV" ]; then
+            flyctl deploy --image "$PREV" --app meridian-hosted --strategy=immediate
+          else
+            echo "No previous image recorded — manual rollback required"
+            exit 1
+          fi
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+
+      - name: Fail job if smoke test failed (after rollback attempt)
+        if: steps.smoke.outcome == 'failure'
+        run: exit 1
+
+  # ─── 6. CHANGELOG (after prod deploy on main) ────────────────────────────────
   changelog:
-    needs: deploy-preview
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: deploy
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     runs-on: ubuntu-latest
     permissions:
       contents: write
