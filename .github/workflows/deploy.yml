@@ -97,9 +97,11 @@ jobs:
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git fetch origin main
+          git fetch origin
           git checkout main
-          git merge --ff-only origin/dev
+          # Use regular merge (not ff-only) so CHANGELOG commits on main don't block.
+          # --no-edit avoids any editor prompt on the merge commit message.
+          git merge --no-ff --no-edit origin/dev -m "ci: merge dev → main (auto)"
           git push origin main
 
   # ─── 5. Production deploy (main branch push or tag or manual) ────────────────
