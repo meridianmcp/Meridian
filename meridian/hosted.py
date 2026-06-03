@@ -451,6 +451,12 @@ async def auth_callback(request: Request) -> RedirectResponse:
     db = request.app.state.db
     tenant = await db_module.upsert_tenant(db, email=email, google_sub=sub)
 
+    # Provision a Neon DB in the background for new tenants who don't have one yet.
+    # Admin accounts and already-provisioned accounts are no-ops inside provision_neon_db.
+    if not tenant.get("neon_project_id") and not tenant.get("neon_db_url"):
+        import asyncio as _asyncio
+        _asyncio.create_task(_provision_tenant_background(tenant["id"], db))
+
     expires_at = (
         datetime.now(timezone.utc) + timedelta(hours=_SESSION_MAX_AGE_HOURS)
     ).isoformat()
@@ -510,6 +516,11 @@ async def auth_github_callback(request: Request) -> RedirectResponse:
 
     db = request.app.state.db
     tenant = await db_module.upsert_tenant(db, email=email, github_sub=sub)
+
+    # Provision a Neon DB in the background for new tenants who don't have one yet.
+    if not tenant.get("neon_project_id") and not tenant.get("neon_db_url"):
+        import asyncio as _asyncio
+        _asyncio.create_task(_provision_tenant_background(tenant["id"], db))
 
     expires_at = (
         datetime.now(timezone.utc) + timedelta(hours=_SESSION_MAX_AGE_HOURS)
@@ -885,6 +896,21 @@ async def create_stripe_checkout_session(tenant: dict, plan: str) -> str:
     return session.url
 
 
+async def _provision_tenant_background(tenant_id: str, db: Any) -> None:
+    """Best-effort background provisioning called from OAuth callbacks.
+
+    Silently swallows errors — login must never fail due to provisioning issues.
+    Logs failures at WARNING level for ops visibility.
+    """
+    import logging as _logging
+    try:
+        await provision_neon_db(tenant_id, db)
+    except Exception as exc:  # noqa: BLE001
+        _logging.getLogger(__name__).warning(
+            "Background Neon provisioning failed for tenant %s: %s", tenant_id, exc
+        )
+
+
 async def provision_neon_db(tenant_id: str, db: Any) -> dict[str, Any]:
     """Provision a Neon database for a tenant using the pool architecture.
 
@@ -909,21 +935,26 @@ async def provision_neon_db(tenant_id: str, db: Any) -> dict[str, Any]:
     if tenant.get("neon_project_id"):
         return tenant  # already provisioned
 
-    tier = tenant.get("plan", "standard")
-    api_key = _neon_api_key_for_tier(tier)
+    if tenant.get("plan") == "admin":
+        return tenant  # admin accounts use manually-assigned DBs, never auto-provisioned
+
+    tier = tenant.get("plan") or "standard"
+    # Treat free-tier as standard for pool allocation (same API key, smaller quota pool)
+    pool_tier = "free" if tier == "free" else tier
+    api_key = _neon_api_key_for_tier("standard" if tier == "free" else tier)
 
     # Capacity check
     await check_capacity(db)
 
     # Find or create a pool project with room
     pool = await db_module.get_available_pool_project(
-        db, tier=tier, max_customers=_MAX_CUSTOMERS_PER_PROJECT
+        db, tier=pool_tier, max_customers=_MAX_CUSTOMERS_PER_PROJECT
     )
 
     if pool is None:
         # All existing pool projects are full — create a new one
-        neon_project_id, _first_conn_uri = await _create_neon_pool_project(api_key, tier)
-        pool = await db_module.register_pool_project(db, neon_project_id, tier)
+        neon_project_id, _first_conn_uri = await _create_neon_pool_project(api_key, pool_tier)
+        pool = await db_module.register_pool_project(db, neon_project_id, pool_tier)
     else:
         neon_project_id = pool["neon_project_id"]
 

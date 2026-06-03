@@ -5211,11 +5211,11 @@ def test_dashboard_html_has_chartjs(client):
 # ---------------------------------------------------------------------------
 
 def test_demo_route_returns_200(client):
-    """GET /demo returns 200 and the dashboard HTML."""
+    """GET /demo returns 200 and the demo dashboard HTML."""
     r = client.get("/demo")
     assert r.status_code == 200
     assert "text/html" in r.headers["content-type"]
-    assert "Meridian Dashboard" in r.text
+    assert "Meridian Demo" in r.text
 
 
 def test_demo_route_sets_cookie(client):
