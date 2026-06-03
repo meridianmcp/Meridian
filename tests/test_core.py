@@ -6232,3 +6232,184 @@ def test_mcp_sse_cors_headers_on_post(client):
     payload = {"jsonrpc": "2.0", "id": 3, "method": "ping", "params": {}}
     r = client.post("/mcp/sse", json=payload)
     assert r.headers.get("access-control-allow-origin") == "*"
+
+
+# ---------------------------------------------------------------------------
+# Generalised notification system (sprint items 102853be, 2fae3acf, 36032131)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_get_set_project_notify_url(db):
+    """get_project_ntfy_url / set_project_ntfy_url round-trips correctly."""
+    p = await db_module.create_project(db, "notif-project-1")
+    # Initially None
+    url = await db_module.get_project_ntfy_url(db, p["id"])
+    assert url is None
+    # Set an ntfy URL
+    await db_module.set_project_ntfy_url(db, p["id"], "https://ntfy.sh/test-topic")
+    url = await db_module.get_project_ntfy_url(db, p["id"])
+    assert url == "https://ntfy.sh/test-topic"
+    # Clear it
+    await db_module.set_project_ntfy_url(db, p["id"], None)
+    url = await db_module.get_project_ntfy_url(db, p["id"])
+    assert url is None
+
+
+@pytest.mark.asyncio
+async def test_dispatch_notification_ntfy(monkeypatch):
+    """_dispatch_notification routes ntfy.sh URLs with special headers."""
+    from meridian.server import _dispatch_notification
+    import httpx
+
+    calls = []
+
+    async def fake_post(url, **kwargs):
+        calls.append({"url": url, "kwargs": kwargs})
+        class FakeResp:
+            status_code = 200
+        return FakeResp()
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *a):
+            pass
+        async def post(self, url, **kwargs):
+            return await fake_post(url, **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: FakeClient())
+
+    await _dispatch_notification(
+        "https://ntfy.sh/my-topic",
+        "Test title",
+        "Test body",
+        event="test",
+    )
+    assert len(calls) == 1
+    headers = calls[0]["kwargs"].get("headers", {})
+    assert headers.get("Title") == "Test title"
+    assert headers.get("Tags") == "test"
+    assert "Priority" in headers
+
+
+@pytest.mark.asyncio
+async def test_dispatch_notification_webhook(monkeypatch):
+    """_dispatch_notification sends JSON to generic webhook URLs."""
+    from meridian.server import _dispatch_notification
+    import httpx
+
+    calls = []
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *a):
+            pass
+        async def post(self, url, **kwargs):
+            calls.append({"url": url, "json": kwargs.get("json")})
+            class FakeResp:
+                status_code = 200
+            return FakeResp()
+
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: FakeClient())
+
+    await _dispatch_notification(
+        "https://hooks.slack.com/services/T00000000/B00000000/XXXX",
+        "Sprint done",
+        "All items completed",
+        event="sprint_done",
+    )
+    assert len(calls) == 1
+    body = calls[0]["json"]
+    assert body["title"] == "Sprint done"
+    assert body["body"] == "All items completed"
+    assert body["event"] == "sprint_done"
+    assert body["source"] == "meridian"
+
+
+@pytest.mark.asyncio
+async def test_dispatch_notification_email_skips_without_resend_key(monkeypatch):
+    """_dispatch_notification silently skips email when RESEND_API_KEY is not set."""
+    from meridian.server import _dispatch_notification
+    import httpx
+
+    calls = []
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *a):
+            pass
+        async def post(self, url, **kwargs):
+            calls.append(url)
+            class FakeResp:
+                status_code = 200
+            return FakeResp()
+
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: FakeClient())
+    monkeypatch.delenv("RESEND_API_KEY", raising=False)
+
+    # Should not call httpx at all (no API key = skip)
+    await _dispatch_notification(
+        "user@example.com",
+        "HITL needed",
+        "Please review",
+        event="hitl",
+    )
+    assert calls == []
+
+
+def test_notify_url_get_endpoint(client):
+    """GET /projects/{id}/ntfy returns notify_url field."""
+    r = client.post("/projects", json={"name": "notif-test-get"})
+    assert r.status_code in (200, 201)
+    pid = r.json()["id"]
+    r2 = client.get(f"/projects/{pid}/ntfy")
+    assert r2.status_code == 200
+    data = r2.json()
+    assert "ntfy_url" in data or "notify_url" in data
+
+
+def test_notify_url_patch_and_get(client, monkeypatch):
+    """PATCH /projects/{id}/ntfy saves URL; GET returns it.
+    Mocks httpx so no real network call is made for the welcome notification."""
+    import httpx
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *a):
+            pass
+        async def post(self, url, **kwargs):
+            class FakeResp:
+                status_code = 200
+            return FakeResp()
+
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: FakeClient())
+
+    r = client.post("/projects", json={"name": "notif-test-patch"})
+    assert r.status_code in (200, 201)
+    pid = r.json()["id"]
+
+    # Save a URL via the canonical notify_url key
+    r2 = client.patch(f"/projects/{pid}/ntfy", json={"notify_url": "https://ntfy.sh/test-123"})
+    assert r2.status_code == 200
+    assert r2.json().get("notify_url") == "https://ntfy.sh/test-123" or \
+           r2.json().get("ntfy_url") == "https://ntfy.sh/test-123"
+
+    # Confirm it's persisted
+    r3 = client.get(f"/projects/{pid}/ntfy")
+    assert r3.status_code == 200
+    saved = r3.json().get("notify_url") or r3.json().get("ntfy_url")
+    assert saved == "https://ntfy.sh/test-123"
+
+
+def test_notify_test_endpoint_no_url(client):
+    """POST /projects/{id}/notify/test returns 400 when no URL is configured."""
+    r = client.post("/projects", json={"name": "notif-test-endpoint"})
+    assert r.status_code in (200, 201)
+    pid = r.json()["id"]
+    r2 = client.post(f"/projects/{pid}/notify/test")
+    assert r2.status_code == 400
+    assert "No notify URL" in r2.json().get("detail", "")

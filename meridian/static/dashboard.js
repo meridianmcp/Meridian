@@ -160,6 +160,7 @@ async function loadServerConfig() {
     const me = await api('/me');
     if (me && me.plan) {
       state.tenantPlan = me.plan;
+      state.tenantEmail = me.email || '';
       _renderPlanBadge(me);
     }
   } catch (e) { /* not hosted or not logged in */ }
@@ -2886,21 +2887,32 @@ async function loadSettingsTab(projectId) {
     }, 0);
   }
 
-  // ntfy push notifications card — works for self-hosted + hosted
+  // Notifications card — generalised: ntfy, webhook, or email
   const ntfyData = (ntfyResult.status === 'fulfilled') ? ntfyResult.value : null;
-  const ntfyUrl = ntfyData ? (ntfyData.ntfy_url || '') : '';
+  // prefer notify_url key, fall back to ntfy_url for older servers
+  const savedNotifyUrl = ntfyData ? (ntfyData.notify_url || ntfyData.ntfy_url || '') : '';
+  // pre-fill with OAuth email for hosted users if no URL is saved yet
+  const defaultNotifyUrl = savedNotifyUrl || (state.tenantEmail ? state.tenantEmail : '');
   html += `<div style="margin-bottom:14px;padding:10px 12px;border:1px solid var(--border);border-radius:6px;background:var(--surface-2)">
-    <div style="font-weight:600;font-size:11px;color:var(--text);margin-bottom:4px">Push notifications via ntfy</div>
-    <div style="font-size:10px;color:var(--muted);margin-bottom:8px">Paste an <a href="https://ntfy.sh" target="_blank" style="color:var(--accent)">ntfy.sh</a> topic URL (or self-hosted) to receive push alerts for HITL requests and sprint completions. No account required.</div>
-    <div style="display:flex;gap:6px;align-items:center">
+    <div style="font-weight:600;font-size:11px;color:var(--text);margin-bottom:4px">Notifications</div>
+    <div style="font-size:10px;color:var(--muted);margin-bottom:8px">
+      Paste an <a href="https://ntfy.sh" target="_blank" style="color:var(--accent)">ntfy.sh</a> topic URL, a Slack/Discord webhook URL, or your email address.
+      Alerts fire on HITL requests and sprint completions. No account needed for ntfy.
+    </div>
+    <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
       <input type="text" id="ntfy-url-${projectId}"
-        value="${escapeHtml(ntfyUrl)}"
-        placeholder="https://ntfy.sh/my-topic"
-        style="flex:1;padding:5px 8px;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;color:var(--text);font-family:var(--font-mono);font-size:11px;outline:none">
+        value="${escapeHtml(defaultNotifyUrl)}"
+        placeholder="https://ntfy.sh/my-topic  ·  https://hooks.slack.com/…  ·  you@email.com"
+        style="flex:1;min-width:200px;padding:5px 8px;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;color:var(--text);font-family:var(--font-mono);font-size:11px;outline:none">
       <button class="secondary" id="ntfy-save-${projectId}" style="padding:4px 10px;font-size:10px">Save</button>
+      <button class="secondary" id="ntfy-test-${projectId}" style="padding:4px 10px;font-size:10px" title="Send a test notification to verify your URL">Test</button>
       <span id="ntfy-status-${projectId}" style="font-size:10px;color:var(--muted);min-width:40px"></span>
     </div>
-    <div style="font-size:9px;color:var(--muted);margin-top:4px">Install the <strong>ntfy</strong> app on iOS/Android/desktop. Create a topic, paste the URL above. Self-hosted ntfy = data stays on your infra.</div>
+    <div style="font-size:9px;color:var(--muted);margin-top:4px">
+      <strong>ntfy:</strong> install the ntfy app on iOS/Android/desktop, create a topic, paste the URL above.
+      <strong>Email:</strong> enter your email — Meridian sends via Resend (hosted only).
+      <strong>Webhook:</strong> any <code>https://</code> URL receives a JSON POST.
+    </div>
   </div>`;
 
   // Notifications section
@@ -2922,7 +2934,7 @@ async function loadSettingsTab(projectId) {
 
   body.innerHTML = html;
 
-  // Wire ntfy save button
+  // Wire notification Save button
   const ntfySaveBtn = document.getElementById(`ntfy-save-${projectId}`);
   if (ntfySaveBtn) {
     ntfySaveBtn.onclick = async () => {
@@ -2930,10 +2942,31 @@ async function loadSettingsTab(projectId) {
       const statusEl = document.getElementById(`ntfy-status-${projectId}`);
       const url = (inp ? inp.value.trim() : '') || null;
       try {
-        await api(`/projects/${projectId}/ntfy`, { method: 'PATCH', body: JSON.stringify({ ntfy_url: url }) });
+        // send notify_url (canonical) and ntfy_url (legacy compat) — server accepts both
+        await api(`/projects/${projectId}/ntfy`, {
+          method: 'PATCH',
+          body: JSON.stringify({ notify_url: url, ntfy_url: url }),
+        });
         if (statusEl) { statusEl.textContent = 'saved'; setTimeout(() => { statusEl.textContent = ''; }, 2000); }
       } catch (e) {
         if (statusEl) statusEl.textContent = 'error';
+      }
+    };
+  }
+
+  // Wire notification Test button
+  const ntfyTestBtn = document.getElementById(`ntfy-test-${projectId}`);
+  if (ntfyTestBtn) {
+    ntfyTestBtn.onclick = async () => {
+      const statusEl = document.getElementById(`ntfy-status-${projectId}`);
+      ntfyTestBtn.disabled = true;
+      try {
+        await api(`/projects/${projectId}/notify/test`, { method: 'POST', body: '{}' });
+        if (statusEl) { statusEl.textContent = 'sent!'; setTimeout(() => { statusEl.textContent = ''; }, 3000); }
+      } catch (e) {
+        if (statusEl) statusEl.textContent = e.message?.includes('400') ? 'save a URL first' : 'error';
+      } finally {
+        ntfyTestBtn.disabled = false;
       }
     };
   }
