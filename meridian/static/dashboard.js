@@ -160,6 +160,7 @@ async function loadServerConfig() {
     const me = await api('/me');
     if (me && me.plan) {
       state.tenantPlan = me.plan;
+      state.tenantEmail = me.email || '';
       _renderPlanBadge(me);
     }
   } catch (e) { /* not hosted or not logged in */ }
@@ -2276,15 +2277,23 @@ function renderTimeline(projectId, data) {
       goalByField.set(key, g);
     }
   });
+  const _goalFieldColor = {
+    sprint_updated_at: '#6c8fff', ns_updated_at: '#fbbf24', content_updated_at: '#a78bfa',
+  };
+  const _goalFieldShort = {
+    sprint_updated_at: 'sprint', ns_updated_at: 'N★', content_updated_at: 'goal',
+  };
   goalByField.forEach(g => {
     const start = parseTs(g.updated_at);
     if (!start) return;
+    const mc  = _goalFieldColor[g.field] || '#a78bfa';
+    const lbl = _goalFieldShort[g.field] || g.field.replace('_updated_at','').replace('_',' ');
     items.push({
       id: itemId++,
       group: 'goal',
-      content: `<span style="font-size:9px;font-family:var(--font-mono)" title="${escapeHtml(g.field)} v${g.version}">${escapeHtml(g.field.replace('_updated_at','').replace('_',' '))} v${g.version}</span>`,
+      content: `<span style="font-size:9px;font-family:var(--font-mono)" title="${escapeHtml(g.field)} v${g.version}">${escapeHtml(lbl)} v${g.version}</span>`,
       start,
-      style: 'background:#6c8fff22;border-color:#6c8fff;color:var(--text);border-radius:3px;padding:1px 4px',
+      style: `background:${mc}22;border-color:${mc};color:var(--text);border-radius:3px;padding:1px 4px`,
     });
   });
 
@@ -2886,21 +2895,32 @@ async function loadSettingsTab(projectId) {
     }, 0);
   }
 
-  // ntfy push notifications card — works for self-hosted + hosted
+  // Notifications card — generalised: ntfy, webhook, or email
   const ntfyData = (ntfyResult.status === 'fulfilled') ? ntfyResult.value : null;
-  const ntfyUrl = ntfyData ? (ntfyData.ntfy_url || '') : '';
+  // prefer notify_url key, fall back to ntfy_url for older servers
+  const savedNotifyUrl = ntfyData ? (ntfyData.notify_url || ntfyData.ntfy_url || '') : '';
+  // pre-fill with OAuth email for hosted users if no URL is saved yet
+  const defaultNotifyUrl = savedNotifyUrl || (state.tenantEmail ? state.tenantEmail : '');
   html += `<div style="margin-bottom:14px;padding:10px 12px;border:1px solid var(--border);border-radius:6px;background:var(--surface-2)">
-    <div style="font-weight:600;font-size:11px;color:var(--text);margin-bottom:4px">Push notifications via ntfy</div>
-    <div style="font-size:10px;color:var(--muted);margin-bottom:8px">Paste an <a href="https://ntfy.sh" target="_blank" style="color:var(--accent)">ntfy.sh</a> topic URL (or self-hosted) to receive push alerts for HITL requests and sprint completions. No account required.</div>
-    <div style="display:flex;gap:6px;align-items:center">
+    <div style="font-weight:600;font-size:11px;color:var(--text);margin-bottom:4px">Notifications</div>
+    <div style="font-size:10px;color:var(--muted);margin-bottom:8px">
+      Paste an <a href="https://ntfy.sh" target="_blank" style="color:var(--accent)">ntfy.sh</a> topic URL, a Slack/Discord webhook URL, or your email address.
+      Alerts fire on HITL requests and sprint completions. No account needed for ntfy.
+    </div>
+    <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
       <input type="text" id="ntfy-url-${projectId}"
-        value="${escapeHtml(ntfyUrl)}"
-        placeholder="https://ntfy.sh/my-topic"
-        style="flex:1;padding:5px 8px;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;color:var(--text);font-family:var(--font-mono);font-size:11px;outline:none">
+        value="${escapeHtml(defaultNotifyUrl)}"
+        placeholder="https://ntfy.sh/my-topic  ·  https://hooks.slack.com/…  ·  you@email.com"
+        style="flex:1;min-width:200px;padding:5px 8px;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;color:var(--text);font-family:var(--font-mono);font-size:11px;outline:none">
       <button class="secondary" id="ntfy-save-${projectId}" style="padding:4px 10px;font-size:10px">Save</button>
+      <button class="secondary" id="ntfy-test-${projectId}" style="padding:4px 10px;font-size:10px" title="Send a test notification to verify your URL">Test</button>
       <span id="ntfy-status-${projectId}" style="font-size:10px;color:var(--muted);min-width:40px"></span>
     </div>
-    <div style="font-size:9px;color:var(--muted);margin-top:4px">Install the <strong>ntfy</strong> app on iOS/Android/desktop. Create a topic, paste the URL above. Self-hosted ntfy = data stays on your infra.</div>
+    <div style="font-size:9px;color:var(--muted);margin-top:4px">
+      <strong>ntfy:</strong> install the ntfy app on iOS/Android/desktop, create a topic, paste the URL above.
+      <strong>Email:</strong> enter your email — Meridian sends via Resend (hosted only).
+      <strong>Webhook:</strong> any <code>https://</code> URL receives a JSON POST.
+    </div>
   </div>`;
 
   // Notifications section
@@ -2922,7 +2942,7 @@ async function loadSettingsTab(projectId) {
 
   body.innerHTML = html;
 
-  // Wire ntfy save button
+  // Wire notification Save button
   const ntfySaveBtn = document.getElementById(`ntfy-save-${projectId}`);
   if (ntfySaveBtn) {
     ntfySaveBtn.onclick = async () => {
@@ -2930,10 +2950,31 @@ async function loadSettingsTab(projectId) {
       const statusEl = document.getElementById(`ntfy-status-${projectId}`);
       const url = (inp ? inp.value.trim() : '') || null;
       try {
-        await api(`/projects/${projectId}/ntfy`, { method: 'PATCH', body: JSON.stringify({ ntfy_url: url }) });
+        // send notify_url (canonical) and ntfy_url (legacy compat) — server accepts both
+        await api(`/projects/${projectId}/ntfy`, {
+          method: 'PATCH',
+          body: JSON.stringify({ notify_url: url, ntfy_url: url }),
+        });
         if (statusEl) { statusEl.textContent = 'saved'; setTimeout(() => { statusEl.textContent = ''; }, 2000); }
       } catch (e) {
         if (statusEl) statusEl.textContent = 'error';
+      }
+    };
+  }
+
+  // Wire notification Test button
+  const ntfyTestBtn = document.getElementById(`ntfy-test-${projectId}`);
+  if (ntfyTestBtn) {
+    ntfyTestBtn.onclick = async () => {
+      const statusEl = document.getElementById(`ntfy-status-${projectId}`);
+      ntfyTestBtn.disabled = true;
+      try {
+        await api(`/projects/${projectId}/notify/test`, { method: 'POST', body: '{}' });
+        if (statusEl) { statusEl.textContent = 'sent!'; setTimeout(() => { statusEl.textContent = ''; }, 3000); }
+      } catch (e) {
+        if (statusEl) statusEl.textContent = e.message?.includes('400') ? 'save a URL first' : 'error';
+      } finally {
+        ntfyTestBtn.disabled = false;
       }
     };
   }
@@ -3186,31 +3227,46 @@ async function loadTeamTab(projectId) {
         </div>`;
       }).join('');
 
-      // Goal change timestamps for swimlane markers — from goal-history for full coverage.
+      // Goal/sprint/north-star change markers — from goal-history, sorted oldest→newest.
+      // Compare adjacent entries to detect *which* field changed, so each marker
+      // gets the correct colour (sprint=blue, north-star=amber, content=purple).
       let goalMarkers = [];
       try {
         const windowStart = Date.now() - days * 86400 * 1000;
         const history = await api(`/projects/${projectId}/goal-history`);
-        (history || []).forEach((entry, i) => {
-          const ts = entry.created_at || entry.updated_at;
-          if (ts) {
-            const t = Date.parse((ts || '').replace(' ', 'T') + 'Z');
-            if (isFinite(t) && t >= windowStart) {
-              goalMarkers.push({ts, field: entry.sprint ? 'sprint' : 'goal'});
-            }
+        // Sort oldest → newest so we can diff against the previous entry
+        const sorted = [...(history || [])].sort((a, b) =>
+          Date.parse((a.created_at||'').replace(' ','T')+'Z') -
+          Date.parse((b.created_at||'').replace(' ','T')+'Z')
+        );
+        sorted.forEach((entry, i) => {
+          const ts = entry.created_at;
+          if (!ts) return;
+          const t = Date.parse(ts.replace(' ','T') + 'Z');
+          if (!isFinite(t) || t < windowStart) return;
+          const prev = sorted[i - 1];
+          if (!prev) {
+            // Oldest visible entry — mark as goal content change
+            goalMarkers.push({ ts, field: 'content_updated_at', label: '' });
+            return;
+          }
+          // Push a marker for each field that changed
+          if ((entry.sprint || '') !== (prev.sprint || '')) {
+            goalMarkers.push({ ts, field: 'sprint_updated_at',
+              label: (entry.sprint || '').split(/[\n—]/)[0].trim().slice(0, 22) });
+          }
+          if ((entry.north_star || '') !== (prev.north_star || '')) {
+            goalMarkers.push({ ts, field: 'ns_updated_at', label: '' });
+          }
+          if ((entry.version_goal || '') !== (prev.version_goal || '')) {
+            goalMarkers.push({ ts, field: 'content_updated_at', label: '' });
           }
         });
-        // Also add current field-level update timestamps
-        const goal = await api(`/projects/${projectId}/goal`);
-        for (const field of ['content_updated_at', 'ns_updated_at', 'sprint_updated_at']) {
-          if (goal[field]) {
-            const t = Date.parse((goal[field] || '').replace(' ', 'T') + 'Z');
-            if (isFinite(t) && t >= windowStart) goalMarkers.push({ts: goal[field], field});
-          }
-        }
-        // Dedupe by timestamp proximity (within 60s)
+        // Dedupe by timestamp proximity (within 60 s) and same field
         goalMarkers = goalMarkers.filter((m, i) => !goalMarkers.slice(0, i).some(p =>
-          Math.abs(Date.parse((m.ts||'').replace(' ','T')+'Z') - Date.parse((p.ts||'').replace(' ','T')+'Z')) < 60000
+          p.field === m.field &&
+          Math.abs(Date.parse((m.ts||'').replace(' ','T')+'Z') -
+                   Date.parse((p.ts||'').replace(' ','T')+'Z')) < 60000
         ));
       } catch (_) { /* goal markers optional */ }
 
@@ -3271,76 +3327,128 @@ async function loadTeamTab(projectId) {
 }
 
 function _renderSwimlane(humans, days, goalMarkers) {
-  /** v2.4 — minimal swimlane: one row per human, dots positioned by
-   * task created_at within the window. Pure CSS / inline SVG — no chart
-   * library dependency. Coarse-resolution is fine for the standup view. */
+  /** v1.1 — swimlane: one row per human, task dots positioned on a shared time axis.
+   * Pure CSS / inline SVG — no library dependency. Markers show sprint/goal changes. */
   if (!humans.length) return '<div style="color:var(--muted)">no activity</div>';
   const now = Date.now();
   const windowMs = days * 86400 * 1000;
   const start = now - windowMs;
+
+  // Task dot fill colours — large enough to be readable at a glance
   const statusColor = {
-    done: '#22d3a5', failed: '#ef4444', pending: '#6b7280',
-    'in_progress': '#6c8fff', backburner: '#9ca3af', 'pending-hitl': '#fb923c',
+    done:           '#22d3a5',   // green
+    failed:         '#ef4444',   // red
+    in_progress:    '#6c8fff',   // blue
+    pending:        '#9ca3af',   // grey
+    backburner:     '#6b7280',   // dim grey
+    'pending-hitl': '#fb923c',   // amber-orange
   };
-  // Marker colors: sprint=blue, north-star=amber, content=purple
-  const markerColor = { sprint_updated_at: '#6c8fff', ns_updated_at: '#fbbf24', content_updated_at: '#a78bfa' };
+  // Vertical marker colours: sprint=blue, north-star=amber, goal-content=purple
+  const markerColor = {
+    sprint_updated_at:  '#6c8fff',
+    ns_updated_at:      '#fbbf24',
+    content_updated_at: '#a78bfa',
+  };
+  const fieldLabel = {
+    content_updated_at: 'goal',
+    ns_updated_at:      'N★',
+    sprint_updated_at:  'sprint',
+  };
+
   // SVG geometry
-  const rowH = 30;
-  const labelW = 110;
-  const width = 720;
-  const height = humans.length * rowH + 24;
-  const x = (ts) => {
+  const rowH    = 36;   // taller rows for bigger dots
+  const labelW  = 120;
+  const width   = 740;
+  const dotR    = 9;    // larger dots for visibility
+  const height  = humans.length * rowH + 28;
+
+  const xPos = ts => {
     try {
       const t = Date.parse((ts || '').replace(' ', 'T') + 'Z');
       if (!isFinite(t)) return labelW;
-      return labelW + Math.max(0, Math.min(1, (t - start) / windowMs)) * (width - labelW - 14);
-    } catch (e) { return labelW; }
+      return labelW + Math.max(0, Math.min(1, (t - start) / windowMs)) * (width - labelW - 16);
+    } catch (_) { return labelW; }
   };
+
+  // Session rows
   const rows = humans.map((h, i) => {
-    const y = 16 + i * rowH;
-    const c = _colorForHuman(h.human_id);
-    const presenceDotColor = h.presence === 'active' ? '#4ade80' : h.presence === 'recent' ? '#fbbf24' : '#6b7280';
-    const sublabel = h.active_session ? escapeHtml(h.active_session.slice(0, 18)) : '';
+    const cy     = 18 + i * rowH;
+    const lineY  = cy;
+    const hColor = _colorForHuman(h.human_id);
+    const presenceColor = h.presence === 'active' ? '#4ade80' : h.presence === 'recent' ? '#fbbf24' : '#6b7280';
+
+    // Worker sessions: detect "claude-worker" pattern and show parent hint
+    const isWorker = (h.human_id || '').includes('worker') || (h.human_id || '').includes('codex');
+    const displayName = escapeHtml((h.human_id || '').slice(0, 16));
+    const subLabel = h.active_session
+      ? escapeHtml(h.active_session.slice(0, 20))
+      : (isWorker ? 'worker' : '');
+
+    // Task dots — coloured by status
     const dots = (h.recent || []).map(t => {
-      const dc = statusColor[t.status] || '#6b7280';
-      const tip = `[${(t.status || '?').toUpperCase()}] ${(t.description || '').slice(0, 60)}`.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;');
-      return `<circle cx="${x(t.created_at)}" cy="${y}" r="7" fill="${dc}" stroke="${c}" stroke-width="1.5"><title>${tip}</title></circle>`;
+      const dc  = statusColor[t.status] || '#6b7280';
+      const tip = `[${(t.status || '?').toUpperCase()}] ${(t.description || '').slice(0, 80)}`
+                    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;');
+      return `<circle cx="${xPos(t.created_at)}" cy="${cy}" r="${dotR}" fill="${dc}" stroke="${hColor}" stroke-width="1.5" opacity="0.9"><title>${tip}</title></circle>`;
     }).join('');
-    const subEl = sublabel
-      ? `<text x="${labelW - 6}" y="${y + 11}" text-anchor="end" font-size="8" fill="var(--muted)" font-family="var(--font-mono)" opacity="0.7">${sublabel}</text>`
+
+    const subEl = subLabel
+      ? `<text x="${labelW - 7}" y="${cy + 12}" text-anchor="end" font-size="8" fill="var(--muted)" font-family="var(--font-mono)" opacity="0.75">${subLabel}</text>`
       : '';
-    return `<line x1="${labelW}" y1="${y}" x2="${width - 8}" y2="${y}" stroke="var(--border)" stroke-dasharray="2,3"/>
-      <circle cx="${labelW - 100}" cy="${y}" r="4" fill="${presenceDotColor}"/>
-      <text x="${labelW - 6}" y="${y + 2}" text-anchor="end" font-size="10" fill="${c}" font-family="var(--font-mono)">${escapeHtml(h.human_id.slice(0, 14))}</text>
+
+    return `
+      <line x1="${labelW}" y1="${lineY}" x2="${width - 8}" y2="${lineY}" stroke="var(--border)" stroke-dasharray="2,4"/>
+      <circle cx="${labelW - 108}" cy="${cy}" r="4" fill="${presenceColor}"/>
+      <text x="${labelW - 8}" y="${cy + 4}" text-anchor="end" font-size="10" fill="${hColor}" font-family="var(--font-mono)" font-weight="600">${displayName}</text>
       ${subEl}${dots}`;
   }).join('');
-  // Goal change markers — vertical dashed lines with staggered date labels to prevent overlap.
-  const fieldLabel = {content_updated_at: 'goal', ns_updated_at: 'N★', sprint_updated_at: 'sprint'};
-  const sorted = [...(goalMarkers || [])].sort((a, b) =>
+
+  // Vertical marker lines — one per sprint/goal/north-star change
+  const sortedMarkers = [...(goalMarkers || [])].sort((a, b) =>
     Date.parse((a.ts||'').replace(' ','T')+'Z') - Date.parse((b.ts||'').replace(' ','T')+'Z')
   );
-  const markerLines = sorted.map((m, i) => {
-    const mx = x(m.ts);
-    const label = fieldLabel[m.field] || 'goal';
-    const mc = markerColor[m.field] || '#a78bfa';
+  const markerLines = sortedMarkers.map((m, i) => {
+    const mx    = xPos(m.ts);
+    const fld   = fieldLabel[m.field] || 'goal';
+    const mc    = markerColor[m.field] || '#a78bfa';
     const dateStr = (m.ts || '').slice(5, 10); // MM-DD
-    // Stagger labels: alternate y=9 / y=19 for adjacent markers within 40px
-    const prev = sorted[i - 1];
-    const prevX = prev ? x(prev.ts) : -999;
-    const labelY = Math.abs(mx - prevX) < 40 ? 19 : 9;
-    return `<line x1="${mx}" y1="0" x2="${mx}" y2="${height}" stroke="${mc}" stroke-dasharray="3,3" stroke-width="1" opacity="0.7"><title>Goal change: ${label} (${dateStr})</title></line>
-    <text x="${mx + 2}" y="${labelY}" font-size="8" fill="${mc}" font-family="var(--font-mono)" opacity="0.9">${escapeHtml(label)} ${escapeHtml(dateStr)}</text>`;
+    // Show sprint name if present, else just the field label + date
+    const nameStr = m.label ? escapeHtml(m.label) : '';
+    const lineText = nameStr ? `${fld}: ${nameStr}` : `${fld} ${dateStr}`;
+    // Stagger label rows to avoid overlap between adjacent markers
+    const prev  = sortedMarkers[i - 1];
+    const prevX = prev ? xPos(prev.ts) : -9999;
+    const labelY = Math.abs(mx - prevX) < 50 ? 19 : 9;
+    const tip   = `${fld} change (${dateStr})${nameStr ? ': ' + nameStr : ''}`;
+    return `<line x1="${mx}" y1="0" x2="${mx}" y2="${height}" stroke="${mc}" stroke-dasharray="3,3" stroke-width="1.2" opacity="0.75"><title>${escapeHtml(tip)}</title></line>
+      <text x="${mx + 3}" y="${labelY}" font-size="8" fill="${mc}" font-family="var(--font-mono)" opacity="0.9">${escapeHtml(lineText.slice(0, 22))}</text>`;
   }).join('');
-  // Legend row below the SVG
+
+  // Time axis ticks (every day)
+  const tickCount = Math.min(days, 14);
+  const ticks = Array.from({length: tickCount + 1}, (_, i) => {
+    const tickMs  = start + (i / tickCount) * windowMs;
+    const tickX   = labelW + (i / tickCount) * (width - labelW - 16);
+    const d       = new Date(tickMs);
+    const lbl     = `${d.getUTCMonth()+1}/${d.getUTCDate()}`;
+    return `<line x1="${tickX}" y1="${height - 10}" x2="${tickX}" y2="${height}" stroke="var(--border)" stroke-width="1"/>
+      <text x="${tickX}" y="${height + 10}" font-size="8" fill="var(--muted)" font-family="var(--font-mono)" text-anchor="middle">${escapeHtml(lbl)}</text>`;
+  }).join('');
+
+  // Legend
   const legend = `<div style="display:flex;gap:14px;padding:6px 0 2px;font-size:10px;font-family:var(--font-mono);color:var(--muted);flex-wrap:wrap">
-    <span><svg width="10" height="10"><circle cx="5" cy="5" r="4" fill="#4ade80"/></svg> active session</span>
-    <span><svg width="10" height="10"><circle cx="5" cy="5" r="4" fill="#fbbf24"/></svg> recent (1hr)</span>
-    <span><svg width="10" height="10"><circle cx="5" cy="5" r="4" fill="#6b7280"/></svg> idle</span>
-    <span><svg width="18" height="10"><line x1="0" y1="5" x2="18" y2="5" stroke="#a78bfa" stroke-dasharray="3,2" stroke-width="1.5"/></svg> goal change</span>
-    <span><svg width="18" height="10"><line x1="0" y1="5" x2="18" y2="5" stroke="#6c8fff" stroke-dasharray="3,2" stroke-width="1.5"/></svg> sprint change</span>
+    <span><svg width="10" height="10"><circle cx="5" cy="5" r="4" fill="#22d3a5"/></svg> done</span>
+    <span><svg width="10" height="10"><circle cx="5" cy="5" r="4" fill="#ef4444"/></svg> failed</span>
+    <span><svg width="10" height="10"><circle cx="5" cy="5" r="4" fill="#6c8fff"/></svg> in progress</span>
+    <span><svg width="10" height="10"><circle cx="5" cy="5" r="4" fill="#9ca3af"/></svg> pending</span>
+    <span style="margin-left:8px"><svg width="18" height="10"><line x1="0" y1="5" x2="18" y2="5" stroke="#a78bfa" stroke-dasharray="3,2" stroke-width="1.5"/></svg> goal</span>
+    <span><svg width="18" height="10"><line x1="0" y1="5" x2="18" y2="5" stroke="#6c8fff" stroke-dasharray="3,2" stroke-width="1.5"/></svg> sprint</span>
+    <span><svg width="18" height="10"><line x1="0" y1="5" x2="18" y2="5" stroke="#fbbf24" stroke-dasharray="3,2" stroke-width="1.5"/></svg> north★</span>
   </div>`;
-  return `<div style="overflow-x:auto;background:var(--surface-2);border:1px solid var(--border);border-radius:4px;padding:6px">
-    <svg viewBox="0 0 ${width} ${height}" style="width:100%;min-width:600px;height:${height}px">${markerLines}${rows}</svg>
+
+  const svgHeight = height + 14; // add space for axis labels
+  return `<div style="overflow-x:auto;background:var(--surface-2);border:1px solid var(--border);border-radius:6px;padding:8px 6px 4px">
+    <svg viewBox="0 0 ${width} ${svgHeight}" style="width:100%;min-width:560px;height:${svgHeight}px;display:block">${markerLines}${rows}${ticks}</svg>
     ${legend}
   </div>`;
 }

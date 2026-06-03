@@ -1335,30 +1335,145 @@ async def get_project_ntfy(project_id: str, request: Request) -> dict[str, Any]:
 async def set_project_ntfy(
     project_id: str, body: dict[str, Any], request: Request
 ) -> dict[str, Any]:
-    """Save (or clear) the ntfy push URL for this project."""
+    """Save (or clear) the notify URL for this project.
+
+    Accepts ``notify_url`` (preferred) or ``ntfy_url`` (legacy) key.
+    After saving a non-empty URL, fires a welcome notification so ntfy.sh
+    topics are created on first publish (avoids 404 on first real alert).
+    """
     project = await db_module.get_project(await _db(request), project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="project not found")
-    ntfy_url = str(body.get("ntfy_url") or "").strip() or None
-    await db_module.set_project_ntfy_url(await _db(request), project_id, ntfy_url)
-    return {"ntfy_url": ntfy_url or ""}
+    # Accept both the new canonical key and the legacy key for backwards compat
+    notify_url = (
+        str(body.get("notify_url") or body.get("ntfy_url") or "").strip() or None
+    )
+    db = await _db(request)
+    await db_module.set_project_ntfy_url(db, project_id, notify_url)
+    if notify_url:
+        # Fire a welcome notification immediately so ntfy.sh creates the topic
+        # (topics are auto-created on first publish; GET before any publish = 404)
+        await _notify_project(
+            db, project_id,
+            "Meridian — notifications active",
+            "You will receive alerts here for HITL requests and sprint completions.",
+            event="setup",
+        )
+    return {"ntfy_url": notify_url or "", "notify_url": notify_url or ""}
+
+
+@app.post("/projects/{project_id}/notify/test")
+async def test_project_notification(
+    project_id: str, request: Request
+) -> dict[str, Any]:
+    """Send a test notification to verify the configured notify URL."""
+    project = await db_module.get_project(await _db(request), project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="project not found")
+    db = await _db(request)
+    notify_url = await db_module.get_project_ntfy_url(db, project_id)
+    if not notify_url:
+        raise HTTPException(status_code=400, detail="No notify URL configured for this project")
+    await _dispatch_notification(
+        notify_url,
+        "Meridian test notification",
+        "Test from the Meridian dashboard. If you see this, notifications are working!",
+        event="test",
+    )
+    return {"ok": True, "notify_url": notify_url}
+
+
+async def _send_email_notification(to_email: str, subject: str, body_text: str) -> None:
+    """Send a notification email via Resend. Silently skips if RESEND_API_KEY is not set."""
+    import httpx as _httpx
+
+    api_key = os.environ.get("RESEND_API_KEY", "")
+    if not api_key:
+        return  # dev mode — skip
+    base = os.environ.get("MERIDIAN_BASE_URL", "https://usemeridian.us").rstrip("/")
+    from_addr = os.environ.get("MERIDIAN_FROM_EMAIL", "Meridian <noreply@usemeridian.us>")
+    html_body = (
+        f"<p>{body_text}</p>"
+        f"<p><a href='{base}/dashboard'>Open Meridian dashboard →</a></p>"
+        f"<hr style='border:none;border-top:1px solid #e5e7eb;margin:16px 0'>"
+        f"<p style='color:#9ca3af;font-size:12px'>You're receiving this because you configured "
+        f"<code>{to_email}</code> as your Meridian notification address. "
+        f"<a href='{base}/dashboard'>Update in Settings →</a></p>"
+    )
+    async with _httpx.AsyncClient(timeout=10.0) as client:
+        await client.post(
+            "https://api.resend.com/emails",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "from": from_addr,
+                "to": [to_email],
+                "subject": subject,
+                "text": body_text,
+                "html": html_body,
+            },
+        )
+
+
+async def _dispatch_notification(
+    notify_url: str, title: str, body_text: str, event: str = "notification"
+) -> None:
+    """Route a notification based on the URL format.
+
+    Routing rules:
+    - Contains ``@`` and no ``/``: treat as email → send via Resend.
+    - Contains ``ntfy.sh`` or starts with ``ntfy://``: POST ntfy-style
+      (body = plain text, Title/Priority/Tags headers).
+    - Anything else (``https://…``): POST JSON webhook (Slack, Discord,
+      custom webhooks all understand ``{"title": …, "body": …}``).
+
+    Raises on error — callers that want best-effort should catch.
+    """
+    import httpx as _httpx
+
+    url = notify_url.strip()
+    if not url:
+        return
+
+    # Email address — no slashes, has @
+    if "@" in url and "/" not in url:
+        subject = f"[Meridian] {title}"
+        await _send_email_notification(url, subject, body_text)
+        return
+
+    async with _httpx.AsyncClient(timeout=5.0) as client:
+        if "ntfy.sh" in url or url.startswith("ntfy://"):
+            # ntfy protocol: body = plain text, special headers carry metadata
+            await client.post(
+                url,
+                content=body_text.encode(),
+                headers={"Title": title, "Priority": "high", "Tags": event},
+            )
+        else:
+            # Generic webhook: POST JSON (compatible with Slack incoming webhooks,
+            # Discord webhooks via {content: …}, and custom HTTP receivers)
+            await client.post(
+                url,
+                json={
+                    "title": title,
+                    "body": body_text,
+                    "event": event,
+                    "source": "meridian",
+                },
+            )
 
 
 async def _notify_project(
-    db: Any, project_id: str, title: str, body_text: str
+    db: Any, project_id: str, title: str, body_text: str, event: str = "notification"
 ) -> None:
-    """Best-effort ntfy push for a project. Silently ignores errors."""
+    """Best-effort notification for a project.  Silently ignores all errors."""
     try:
-        ntfy_url = await db_module.get_project_ntfy_url(db, project_id)
-        if not ntfy_url:
+        notify_url = await db_module.get_project_ntfy_url(db, project_id)
+        if not notify_url:
             return
-        import httpx as _httpx
-        async with _httpx.AsyncClient(timeout=5.0) as client:
-            await client.post(
-                ntfy_url,
-                content=body_text.encode(),
-                headers={"Title": title, "Priority": "high"},
-            )
+        await _dispatch_notification(notify_url, title, body_text, event)
     except Exception:  # noqa: BLE001
         pass  # never let notifications crash the main flow
 
@@ -4476,11 +4591,15 @@ async def _dispatch_mcp_tool(name: str, args: dict[str, Any], db: Any, data_dir:
             urgency=args.get("urgency", "normal"),
             assigned_to=args.get("assigned_to"),
         )
-        # Notify via ntfy if configured — best-effort, non-blocking
+        # Notify via configured notify_url — best-effort, non-blocking
+        _hitl_urgency = args.get("urgency", "normal").upper()
+        _hitl_q = args["question"][:200]
+        _hitl_base = os.environ.get("MERIDIAN_BASE_URL", "https://usemeridian.us").rstrip("/")
         await _notify_project(
             db, args["project_id"],
-            f"HITL [{args.get('urgency','normal').upper()}]",
-            f"{args['question'][:200]}",
+            f"[Meridian] Action needed ({_hitl_urgency})",
+            f"{_hitl_q}\n\nAnswer at: {_hitl_base}/dashboard",
+            event="hitl",
         )
         return result
     if name == "get_hitl_request":
@@ -4581,11 +4700,12 @@ async def _dispatch_mcp_tool(name: str, args: dict[str, Any], db: Any, data_dir:
         )
         if item is None:
             raise ValueError("sprint item not found")
-        # Notify via ntfy if configured — best-effort
+        # Notify via configured notify_url — best-effort
         await _notify_project(
             db, args["project_id"],
-            "Sprint item done ✓",
+            "[Meridian] Sprint item done ✓",
             f"{(item.get('title') or '')[:200]}",
+            event="sprint_done",
         )
         return item
     if name == "get_run_transcript":
