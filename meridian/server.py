@@ -3646,9 +3646,9 @@ async def mcp_tools_doc() -> str:
         "!!! note \"Deprecated\"\n    Use `start_session` instead — it registers the session **and** returns "
         "goal + context in one call.")
     # strip trailing ---
-    while lines and lines[-1] in ("---", ""):
+    while lines and lines[-1].strip() in ("---", ""):
         lines.pop()
-    return "\n".join(lines)
+    return "\n".join(part.rstrip("\n") for part in lines).rstrip() + "\n"
 
 # /admin/health, /admin/git-status → meridian/routes/admin.py
 
@@ -3780,6 +3780,7 @@ async def _start_session_composite(
     """
     # v1.8.x — archive sessions silent for 7+ days so they don't crowd
     # the active list seen by new sessions.
+    await db_module.archive_empty_sessions(db)
     await db_module.archive_stale_sessions(db, project_id)
     try:
         await db_module.expire_file_locks(db)
@@ -4272,6 +4273,14 @@ async def admin_delete_waitlist_entry(entry_id: str, request: Request) -> dict[s
 @app.get("/waitlist-pending")
 async def waitlist_pending(request: Request) -> HTMLResponse:
     """Landing page for non-admin users who sign in during pre-launch."""
+    message = (request.query_params.get("message") or "").strip()
+    badge = "Early access is full" if message else "✓ You're on the list"
+    heading = "You're on the waitlist" if message else "Thanks for signing up!"
+    body = (
+        message
+        if message
+        else "Meridian is in early access. We'll email you when your account is ready."
+    )
     html = """<!doctype html>
 <html lang="en">
 <head>
@@ -4297,9 +4306,9 @@ a:hover{text-decoration:underline}
 <body>
 <div class="card">
   <div class="logo">⬡ <span>Meridian</span></div>
-  <div class="badge">✓ You're on the list</div>
-  <h1>Thanks for signing up!</h1>
-  <p>Meridian is in early access. We'll email you when your account is ready.</p>
+  <div class="badge">__BADGE__</div>
+  <h1>__HEADING__</h1>
+  <p>__BODY__</p>
   <p>In the meantime, explore the live demo or read the docs.</p>
   <div style="display:flex;gap:10px;justify-content:center;margin-top:20px;flex-wrap:wrap">
     <a href="/" style="display:inline-block;background:#1a1c23;border:1px solid #2a2d35;border-radius:8px;padding:9px 18px;color:#e8eaf0;font-size:.85rem;text-decoration:none">← Back to home</a>
@@ -4310,6 +4319,11 @@ a:hover{text-decoration:underline}
 </div>
 </body>
 </html>"""
+    html = (
+        html.replace("__BADGE__", badge)
+        .replace("__HEADING__", heading)
+        .replace("__BODY__", body)
+    )
     return HTMLResponse(html)
 
 
@@ -5452,6 +5466,7 @@ _oa_tokens: dict[str, dict[str, Any]] = {}
 async def _oauth_meta(request: Request):
     b = str(request.base_url).rstrip("/")
     return JSONResponse({"issuer": b,
+        "client_name": "Meridian", "logo_uri": "https://usemeridian.us/static/logo.svg",
         "authorization_endpoint": f"{b}/oauth/authorize",
         "token_endpoint": f"{b}/oauth/token",
         "registration_endpoint": f"{b}/oauth/register",

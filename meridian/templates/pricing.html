@@ -81,7 +81,7 @@
     max-width: 1200px;
     margin: 0 auto;
     padding: 0 20px;
-    flex-wrap: wrap;
+    flex-wrap: nowrap;
     justify-content: center;
   }
 
@@ -96,6 +96,10 @@
     display: flex;
     flex-direction: column;
   }
+  @media (max-width: 900px) {
+    .plans { flex-wrap: wrap; }
+  }
+
   .plan-card.featured {
     border-color: var(--accent);
     background: #141828;
@@ -318,15 +322,15 @@
       <li class="dim">Shared hardware (0.5 CU pool)</li>
     </ul>
     <div class="plan-limits">
-      Shared Neon pool · 0.5 CU max · 10 CU-hr/mo<br>
+      Shared Neon pool · 0.5 CU max · 10 CU-hrs total<br>
       Expires after 30 days of inactivity · no card ever required
     </div>
     <a href="/auth/login" class="plan-cta primary">Start free →</a>
   </div>
 
-  <!-- Solo -->
+  <!-- Standard -->
   <div class="plan-card">
-    <div class="plan-name">Solo</div>
+    <div class="plan-name">Standard</div>
     <div class="plan-price">$20<small> / mo</small></div>
     <div class="plan-subtitle">Dedicated DB · permanent</div>
     <hr class="plan-divider">
@@ -335,35 +339,37 @@
       <li>Dedicated Neon Postgres DB</li>
       <li>Unlimited projects + sessions</li>
       <li>No inactivity expiry</li>
-      <li>4 CU compute · 2 GB storage included</li>
+      <li>2 CU compute included</li>
+      <li>50 CU-hrs / month included</li>
+      <li>Up to 20 team members</li>
       <li>Priority query performance</li>
     </ul>
     <div class="plan-limits">
       Overage: $0.16/CU-hr · $0.50/GB-mo · auto-billed via Stripe
     </div>
     {% if waitlist_mode %}
-    <form class="waitlist-form" data-plan="solo" onsubmit="submitWaitlist(event, this)">
+    <form class="waitlist-form" data-plan="standard" onsubmit="submitWaitlist(event, this)">
       <input type="email" placeholder="your@email.com" required>
       <button type="submit">Join waitlist →</button>
     </form>
     <div class="waitlist-msg"></div>
     {% else %}
-    <a href="{{ solo_link }}" class="plan-cta primary">Get Solo →</a>
+    <a href="{{ solo_link }}" class="plan-cta primary">Get Standard →</a>
     {% endif %}
   </div>
 
-  <!-- Team -->
+  <!-- Pro -->
   <div class="plan-card">
-    <div class="plan-name">Team</div>
+    <div class="plan-name">Pro</div>
     <div class="plan-price">$49<small> / mo</small></div>
-    <div class="plan-subtitle">Team workspace · API access</div>
+    <div class="plan-subtitle">Higher throughput · API access</div>
     <hr class="plan-divider">
     <ul class="plan-features">
-      <li>Everything in Solo</li>
-      <li>Up to 25 team members</li>
+      <li>Everything in Standard</li>
       <li>API tokens for CI/CD</li>
       <li>SQLite export / data portability</li>
-      <li>50 CU-hr / 10 GB included</li>
+      <li>4 CU compute included</li>
+      <li>200 CU-hrs / month included</li>
       <li>Team swimlane + activity timeline</li>
       <li>Email support</li>
     </ul>
