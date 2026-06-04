@@ -115,6 +115,17 @@ function hideDemoAdminControls() {
     '#update-banner',
     '#delete-account-section',
     '[data-demo-hide]',
+    // Settings: hide write controls entirely in demo
+    '[id^="ntfy-url-"]',
+    '[id^="ntfy-save-"]',
+    '[id^="ntfy-test-"]',
+    '[id^="ntfy-status-"]',
+    '[id^="mcp-gen-token-"]',
+    '[id^="invite-email-"]',
+    '[id^="invite-role-"]',
+    '[id^="invite-btn-"]',
+    // Files tab: hide Edit subtab, show Preview only
+    '[id^="file-mode-edit-"]',
   ];
   selectors.forEach(sel => {
     document.querySelectorAll(sel).forEach(el => { el.style.display = 'none'; });
@@ -949,12 +960,14 @@ function buildTabBody(project) {
           <span>STATUS · ${escapeHtml(project.name)}</span>
           <span class="ws-dot" id="ws-${project.id}"></span>
         </div>
-        <div class="section">
-          <h3>Active Sessions</h3>
-          <div class="sessions-list" id="sessions-${project.id}"></div>
+        <div style="flex:1;overflow-y:auto">
+          <div class="section">
+            <h3>Active Sessions</h3>
+            <div class="sessions-list" id="sessions-${project.id}"></div>
+          </div>
+          <div class="hitl-banner" id="hitl-banner-${project.id}" style="display:none">HITL queue</div>
+          <div id="hitl-queue-${project.id}"></div>
         </div>
-        <div class="hitl-banner" id="hitl-banner-${project.id}" style="display:none">HITL queue</div>
-        <div id="hitl-queue-${project.id}"></div>
       </div>
       <div class="drawer-panel" id="drawer-live-${project.id}">
         <div class="drawer-header" style="justify-content:space-between">
@@ -1009,7 +1022,10 @@ function buildTabBody(project) {
       </div>
       <div class="drawer-panel" id="drawer-goal-${project.id}">
         <div class="drawer-header" style="justify-content:space-between">
-          <span>GOAL · ${escapeHtml(project.name)}</span>
+          <span style="display:flex;flex-direction:column;gap:1px">
+            <span>GOAL · ${escapeHtml(project.name)}</span>
+            <span style="font-size:9px;letter-spacing:0;text-transform:none;font-weight:400;opacity:0.7">Share your project context with AI sessions — north star, sprint, version goal</span>
+          </span>
           <span style="display:flex;gap:6px;align-items:center">
             <span class="goal-version" id="goal-version-${project.id}"></span>
           </span>
@@ -1159,7 +1175,10 @@ function buildTabBody(project) {
       </div>
       <div class="drawer-panel" id="drawer-queue-${project.id}">
         <div class="drawer-header" style="justify-content:space-between">
-          <span>QUEUE · ${escapeHtml(project.name)}</span>
+          <span style="display:flex;flex-direction:column;gap:1px">
+            <span>QUEUE · ${escapeHtml(project.name)}</span>
+            <span style="font-size:9px;letter-spacing:0;text-transform:none;font-weight:400;opacity:0.7">Work items — claimed atomically so parallel sessions never collide</span>
+          </span>
           <button class="secondary" id="queue-refresh-${project.id}" style="padding:2px 8px;font-size:10px">refresh</button>
         </div>
         <div id="live-session-${project.id}" style="display:none;flex-shrink:0;border-bottom:1px solid var(--border);background:var(--surface-2);padding:8px 14px 10px"></div>
@@ -1186,7 +1205,10 @@ function buildTabBody(project) {
       </div>
       <div class="drawer-panel" id="drawer-notes-${project.id}">
         <div class="drawer-header" style="justify-content:space-between">
-          <span>NOTES · ${escapeHtml(project.name)}</span>
+          <span style="display:flex;flex-direction:column;gap:1px">
+            <span>NOTES · ${escapeHtml(project.name)}</span>
+            <span style="font-size:9px;letter-spacing:0;text-transform:none;font-weight:400;opacity:0.7">Persistent notes readable by your team and AI sessions</span>
+          </span>
           <input type="text" id="notes-tag-${project.id}" placeholder="filter by tag…" style="background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:2px 6px;width:120px">
         </div>
         <div style="flex:1;overflow-y:auto;padding:14px;font-family:'IBM Plex Mono',monospace;font-size:12px" id="notes-body-${project.id}">
@@ -1205,7 +1227,10 @@ function buildTabBody(project) {
       </div>
       <div class="drawer-panel" id="drawer-hitl-${project.id}">
         <div class="drawer-header" style="justify-content:space-between">
-          <span>HITL QUEUE · ${escapeHtml(project.name)}</span>
+          <span style="display:flex;flex-direction:column;gap:1px">
+            <span>YOUR TURN · ${escapeHtml(project.name)}</span>
+            <span style="font-size:9px;letter-spacing:0;text-transform:none;font-weight:400;opacity:0.7">Blocking questions from your AI agents that need a human decision</span>
+          </span>
           <div style="display:flex;gap:6px;align-items:center">
             <select id="hitl-status-filter-${project.id}" style="background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:2px 6px">
               <option value="pending">pending</option>
@@ -1238,7 +1263,10 @@ function buildTabBody(project) {
       </div>
       <div class="drawer-panel" id="drawer-team-${project.id}">
         <div class="drawer-header" style="justify-content:space-between">
-          <span>TEAM · ${escapeHtml(project.name)}</span>
+          <span style="display:flex;flex-direction:column;gap:1px">
+            <span>TEAM · ${escapeHtml(project.name)}</span>
+            <span style="font-size:9px;letter-spacing:0;text-transform:none;font-weight:400;opacity:0.7">Manage project members and access</span>
+          </span>
           <span style="display:flex;gap:6px;align-items:center">
             <select id="team-days-${project.id}" style="background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:2px 4px">
               <option value="1">last 1d</option>
@@ -3311,6 +3339,7 @@ async function loadSettingsTab(projectId) {
   }
 
   body.innerHTML = html;
+  if (isDemoMode()) hideDemoAdminControls();
 
   // Wire notification Save button
   const ntfySaveBtn = document.getElementById(`ntfy-save-${projectId}`);
@@ -4119,7 +4148,8 @@ function renderQueue(tasks, sprintItems = []) {
   const future = tasks.filter(t => t.status === 'future');
   const backburner = tasks.filter(t => t.status === 'backburner');
 
-  const sect = (icon, title, items, emptyMsg, showActions) => {
+  const sect = (icon, title, items, emptyMsg, showActions, collapsedByDefault = false) => {
+    const sectBodyId = `queue-sect-${title.replace(/\W/g,'').toLowerCase()}-${projectId.slice(0,6)}`;
     const rows = items.length
       ? items.map(t => {
           const isSprintItem = t.kind === 'sprint_item';
@@ -4158,18 +4188,22 @@ function renderQueue(tasks, sprintItems = []) {
           </div>`;
         }).join('')
       : `<div class="queue-empty">${emptyMsg}</div>`;
+    const headerStyle = collapsedByDefault ? 'cursor:pointer;user-select:none' : '';
+    const headerClick = collapsedByDefault ? `onclick="toggleExpand('${sectBodyId}')"` : '';
+    const chevron = collapsedByDefault ? `<span class="expand-arrow" style="font-size:9px;margin-left:4px">▶</span>` : '';
     return `<div class="queue-section">` +
-      `<div class="queue-section-header">${icon} ${title} <span style="color:var(--accent)">(${items.length})</span></div>` +
-      rows + `</div>`;
+      `<div class="queue-section-header" style="${headerStyle}" ${headerClick}>${icon} ${title} <span style="color:var(--accent)">(${items.length})</span>${chevron}</div>` +
+      (collapsedByDefault ? `<div id="${sectBodyId}" style="display:none">${rows}</div>` : rows) +
+      `</div>`;
   };
 
-  return sect('⏳', 'Pending', pending, 'no pending tasks', true) +
+  return (backburner.length ? sect('⏸', 'Backburner', backburner, '', true, true) : '') +
+         sect('⏳', 'Pending', pending, 'no pending tasks', true) +
          sect('🔄', 'In Progress', inProg, 'nothing running', false) +
          sect('✅', 'Recently Done', done, 'no completed tasks', true) +
          (failed.length ? sect('❌', 'Failed', failed, '', true) : '') +
          (backlog.length ? sect('📦', 'Backlog', backlog, '', true) : '') +
-         (future.length ? sect('🔮', 'Future', future, '', false) : '') +
-         (backburner.length ? sect('⏸', 'Backburner', backburner, '', true) : '');
+         (future.length ? sect('🔮', 'Future', future, '', false) : '');
 }
 
 // Global queue action handler — called from inline onclick in renderQueue

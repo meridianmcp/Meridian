@@ -15,6 +15,7 @@ your AI clients over HTTPS in minutes.
 | | **Free** | **Standard** | **Pro** |
 |--|--|--|--|
 | **Price** | Free · 30 days | $20 / mo | $49 / mo |
+| **Status** | Live | Live | Coming soon · [join waitlist](mailto:hello@usemeridian.us?subject=Pro%20waitlist) |
 | **Card required** | No | Yes | Yes |
 | **Storage** | Shared pool | 1 GB | 10 GB |
 | **Compute** | 0.5 CU shared | 50 CU-hrs / mo | 200 CU-hrs / mo |

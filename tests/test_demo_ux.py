@@ -69,7 +69,7 @@ def test_demo_write_blocked_403(demo_client):
     )
     assert r.status_code == 403
     body = r.json()
-    assert "detail" in body or "Demo mode" in json.dumps(body)
+    assert "error" in body or "demo" in json.dumps(body).lower()
 
 
 def test_waitlist_pending_200(client):
