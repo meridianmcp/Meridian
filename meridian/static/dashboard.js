@@ -2805,6 +2805,54 @@ async function loadSettingsTab(projectId) {
   const projectSettings = (settingsResult.status === 'fulfilled')
     ? settingsResult.value
     : { project_id: projectId, max_pinned_decisions: DEFAULT_MAX_PINNED_DECISIONS };
+  const hooksBaseUrl = ((mcpData && mcpData.base_url) || window.location.origin || state.serverConfig?.server_url || 'http://localhost:7878').replace(/\/$/, '');
+
+  function buildHookCurlHeaders(token) {
+    const headers = [];
+    if (token) headers.push(`-H 'Authorization: Bearer ${token}'`);
+    headers.push(`-H 'Content-Type: application/json'`);
+    return headers.join(' ');
+  }
+
+  function buildHookCurlCommand(path, token) {
+    const cmd = `curl -s -X POST ${buildHookCurlHeaders(token)} -d '{"project_id":"${projectId}"}' ${hooksBaseUrl}/hooks/${path}`;
+    if (path === 'session-start') return `${cmd} | jq -r '.hookSpecificOutput.additionalContext // empty'`;
+    return cmd;
+  }
+
+  function buildHookPowerShellCommand(path, token) {
+    const headerClause = token ? ` -Headers @{ Authorization = 'Bearer ${token}' }` : '';
+    const bodyJson = `{"project_id":"${projectId}"}`;
+    if (path === 'session-start') {
+      return `powershell -NoProfile -NonInteractive -Command "try { $r = Invoke-WebRequest -Method POST -Uri '${hooksBaseUrl}/hooks/session-start'${headerClause} -ContentType 'application/json' -Body '${bodyJson}' -UseBasicParsing; $r.Content } catch { '{}' }"`;
+    }
+    return `powershell -NoProfile -NonInteractive -Command "try { Invoke-WebRequest -Method POST -Uri '${hooksBaseUrl}/hooks/stop'${headerClause} -ContentType 'application/json' -Body '${bodyJson}' -UseBasicParsing | Out-Null } catch { }"`;
+  }
+
+  function buildClaudeHookSnippet(platform, token) {
+    const start = platform === 'windows'
+      ? buildHookPowerShellCommand('session-start', token)
+      : buildHookCurlCommand('session-start', token);
+    const stop = platform === 'windows'
+      ? buildHookPowerShellCommand('stop', token)
+      : buildHookCurlCommand('stop', token);
+    return JSON.stringify({
+      hooks: {
+        SessionStart: [{ type: 'command', command: start }],
+        Stop: [{ type: 'command', command: stop }],
+      },
+    }, null, 2);
+  }
+
+  function buildCodexHookSnippet(platform, token) {
+    const start = platform === 'windows'
+      ? buildHookPowerShellCommand('session-start', token)
+      : buildHookCurlCommand('session-start', token);
+    const stop = platform === 'windows'
+      ? buildHookPowerShellCommand('stop', token)
+      : buildHookCurlCommand('stop', token);
+    return `[mcp_servers.meridian]\ntype = "http"\nurl = "${hooksBaseUrl}/mcp"\n\n[hooks]\nsession_start = ${JSON.stringify(start)}\nstop = ${JSON.stringify(stop)}`;
+  }
 
   let html = '';
 
@@ -2812,10 +2860,58 @@ async function loadSettingsTab(projectId) {
   html += `<div style="margin-bottom:14px;padding:10px 12px;border:1px solid var(--border);border-radius:6px;background:var(--surface-2);display:flex;justify-content:space-between;align-items:center;gap:8px">
     <div>
       <div style="font-weight:600;font-size:11px;color:var(--text);margin-bottom:2px">Connect claude.ai browser</div>
-      <div style="font-size:10px;color:var(--muted)">Use Meridian directly in claude.ai — no install needed</div>
+      <div style="font-size:10px;color:var(--muted)">Use Meridian directly in claude.ai - no install needed</div>
     </div>
     <a href="/install-mcp" target="_blank" style="white-space:nowrap;padding:4px 10px;background:var(--accent);color:#fff;border-radius:4px;font-size:10px;font-weight:600;text-decoration:none">Setup guide →</a>
   </div>`;
+
+  html += `<details style="margin-bottom:16px;border:1px solid var(--border);border-radius:6px;background:var(--surface-2)">
+    <summary style="cursor:pointer;list-style:none;padding:10px 12px;display:flex;justify-content:space-between;align-items:center;gap:8px">
+      <span style="font-weight:600;font-size:11px;color:var(--text)">Auto-checkpoint hooks</span>
+      <span style="font-size:10px;color:var(--muted)">Claude Code + Codex</span>
+    </summary>
+    <div style="padding:0 12px 12px">
+      <div style="font-size:10px;color:var(--muted);margin-bottom:10px">Install once, then SessionStart + Stop can auto-start and auto-checkpoint into Meridian for this project.</div>
+      <div style="display:grid;gap:10px;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));margin-bottom:10px">
+        <div>
+          <div style="font-size:10px;font-weight:600;color:var(--text);margin-bottom:4px">macOS / Linux / WSL</div>
+          <pre id="hooks-install-unix-${projectId}" style="background:var(--surface-1);border:1px solid var(--border);border-radius:4px;padding:10px;font-size:10px;font-family:var(--font-mono);color:var(--text);overflow-x:auto;margin:0 0 6px 0;white-space:pre-wrap;word-break:break-all"></pre>
+          <button class="secondary" id="hooks-copy-install-unix-${projectId}" style="font-size:10px;padding:4px 10px">Copy</button>
+        </div>
+        <div>
+          <div style="font-size:10px;font-weight:600;color:var(--text);margin-bottom:4px">Windows PowerShell</div>
+          <pre id="hooks-install-windows-${projectId}" style="background:var(--surface-1);border:1px solid var(--border);border-radius:4px;padding:10px;font-size:10px;font-family:var(--font-mono);color:var(--text);overflow-x:auto;margin:0 0 6px 0;white-space:pre-wrap;word-break:break-all"></pre>
+          <button class="secondary" id="hooks-copy-install-windows-${projectId}" style="font-size:10px;padding:4px 10px">Copy</button>
+        </div>
+      </div>
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:10px">
+        ${mcpData ? `<button id="hooks-gen-token-${projectId}" class="primary" style="font-size:10px;padding:4px 10px">Generate API key</button>` : ''}
+        <span id="hooks-token-status-${projectId}" style="font-size:10px;color:var(--muted)">${mcpData ? 'Generate an API key to replace the placeholder token in the hosted snippets below.' : 'Local mode - no Bearer token needed.'}</span>
+      </div>
+      <details style="margin-bottom:10px;border:1px solid var(--border);border-radius:4px;background:var(--surface-1)">
+        <summary style="cursor:pointer;padding:8px 10px;font-size:10px;font-weight:600;color:var(--text)">Windows manual config</summary>
+        <div style="padding:0 10px 10px">
+          <div style="font-size:10px;font-weight:600;color:var(--text);margin:8px 0 4px">Claude Code - <code>~/.claude/settings.json</code></div>
+          <pre id="hooks-win-claude-${projectId}" style="background:var(--surface-2);border:1px solid var(--border);border-radius:4px;padding:10px;font-size:10px;font-family:var(--font-mono);color:var(--text);overflow-x:auto;margin:0 0 6px 0;white-space:pre-wrap;word-break:break-all"></pre>
+          <button class="secondary" id="hooks-copy-win-claude-${projectId}" style="font-size:10px;padding:4px 10px;margin-bottom:10px">Copy</button>
+          <div style="font-size:10px;font-weight:600;color:var(--text);margin:0 0 4px">Codex - <code>~/.codex/config.toml</code></div>
+          <pre id="hooks-win-codex-${projectId}" style="background:var(--surface-2);border:1px solid var(--border);border-radius:4px;padding:10px;font-size:10px;font-family:var(--font-mono);color:var(--text);overflow-x:auto;margin:0 0 6px 0;white-space:pre-wrap;word-break:break-all"></pre>
+          <button class="secondary" id="hooks-copy-win-codex-${projectId}" style="font-size:10px;padding:4px 10px">Copy</button>
+        </div>
+      </details>
+      <details style="border:1px solid var(--border);border-radius:4px;background:var(--surface-1)">
+        <summary style="cursor:pointer;padding:8px 10px;font-size:10px;font-weight:600;color:var(--text)">macOS / Linux manual config</summary>
+        <div style="padding:0 10px 10px">
+          <div style="font-size:10px;font-weight:600;color:var(--text);margin:8px 0 4px">Claude Code - <code>~/.claude/settings.json</code></div>
+          <pre id="hooks-unix-claude-${projectId}" style="background:var(--surface-2);border:1px solid var(--border);border-radius:4px;padding:10px;font-size:10px;font-family:var(--font-mono);color:var(--text);overflow-x:auto;margin:0 0 6px 0;white-space:pre-wrap;word-break:break-all"></pre>
+          <button class="secondary" id="hooks-copy-unix-claude-${projectId}" style="font-size:10px;padding:4px 10px;margin-bottom:10px">Copy</button>
+          <div style="font-size:10px;font-weight:600;color:var(--text);margin:0 0 4px">Codex - <code>~/.codex/config.toml</code></div>
+          <pre id="hooks-unix-codex-${projectId}" style="background:var(--surface-2);border:1px solid var(--border);border-radius:4px;padding:10px;font-size:10px;font-family:var(--font-mono);color:var(--text);overflow-x:auto;margin:0 0 6px 0;white-space:pre-wrap;word-break:break-all"></pre>
+          <button class="secondary" id="hooks-copy-unix-codex-${projectId}" style="font-size:10px;padding:4px 10px">Copy</button>
+        </div>
+      </details>
+    </div>
+  </details>`;
 
   // MCP config section (hosted mode only)
   if (mcpData) {
@@ -2981,8 +3077,8 @@ async function loadSettingsTab(projectId) {
     const isDemo = !!state.serverConfig?.demo_mode;
     const displayPid = isDemo ? 'your-project-id' : projectId;
 
-    const stdioText = `[[mcp_servers]]\nname = "meridian"\ncommand = "pixi"\nargs = ["run", "python", "-m", "meridian", "--mcp"]\ncwd = "${cwd.replace(/"/g, '\\"')}"`;
-    const httpText = `[[mcp_servers]]\nname = "meridian"\nurl = "${mcpHttpUrl}"\ntype = "http"`;
+    const stdioText = `[mcp_servers.meridian]\ntype = "stdio"\ncommand = "pixi"\nargs = ["run", "python", "-m", "meridian", "--mcp"]\ncwd = "${cwd.replace(/"/g, '\\"')}"`;
+    const httpText = `[mcp_servers.meridian]\ntype = "http"\nurl = "${mcpHttpUrl}"`;
     const goalText = `/goal Complete pending sprint items in order. Done when all items\nmarked complete via complete_sprint_item(), pixi run test passes\n524+, generate_handoff() called. Stop after 40 turns or HITL.\n\nproject_id = "${displayPid}"`;
 
     html += `<div style="margin-bottom:16px">
@@ -3340,6 +3436,84 @@ async function loadSettingsTab(projectId) {
 
   body.innerHTML = html;
   if (isDemoMode()) hideDemoAdminControls();
+
+  setTimeout(() => {
+    const hostedPlaceholderToken = mcpData ? ('sk_meridian_' + 'x'.repeat(32)) : '';
+    let hooksToken = null;
+
+    const renderHooks = () => {
+      const activeToken = hooksToken || hostedPlaceholderToken;
+      const installUnix = `curl -fsSL ${hooksBaseUrl}/hooks.sh | bash`;
+      const installWindows = `irm ${hooksBaseUrl}/hooks.ps1 | iex`;
+      const snippets = {
+        [`hooks-install-unix-${projectId}`]: installUnix,
+        [`hooks-install-windows-${projectId}`]: installWindows,
+        [`hooks-win-claude-${projectId}`]: buildClaudeHookSnippet('windows', activeToken),
+        [`hooks-win-codex-${projectId}`]: buildCodexHookSnippet('windows', activeToken),
+        [`hooks-unix-claude-${projectId}`]: buildClaudeHookSnippet('unix', activeToken),
+        [`hooks-unix-codex-${projectId}`]: buildCodexHookSnippet('unix', activeToken),
+      };
+      Object.entries(snippets).forEach(([id, text]) => {
+        const el = document.getElementById(id);
+        if (el) el.textContent = text;
+      });
+      const statusEl = document.getElementById(`hooks-token-status-${projectId}`);
+      if (statusEl) {
+        if (hooksToken) {
+          statusEl.textContent = 'Real API key generated - hosted snippets are prefilled for this user and project.';
+        } else if (mcpData) {
+          statusEl.textContent = 'Generate an API key to replace the placeholder token in the hosted snippets below.';
+        } else {
+          statusEl.textContent = 'Local mode - no Bearer token needed.';
+        }
+      }
+    };
+
+    const wireCopy = (buttonId, targetId) => {
+      const btn = document.getElementById(buttonId);
+      const target = document.getElementById(targetId);
+      if (!btn || !target) return;
+      btn.onclick = async () => {
+        try {
+          await navigator.clipboard.writeText(target.textContent || '');
+          btn.textContent = 'Copied!';
+          setTimeout(() => { btn.textContent = 'Copy'; }, 1800);
+        } catch (e) {
+          btn.textContent = 'Select and copy manually';
+        }
+      };
+    };
+
+    [
+      ['hooks-copy-install-unix-' + projectId, 'hooks-install-unix-' + projectId],
+      ['hooks-copy-install-windows-' + projectId, 'hooks-install-windows-' + projectId],
+      ['hooks-copy-win-claude-' + projectId, 'hooks-win-claude-' + projectId],
+      ['hooks-copy-win-codex-' + projectId, 'hooks-win-codex-' + projectId],
+      ['hooks-copy-unix-claude-' + projectId, 'hooks-unix-claude-' + projectId],
+      ['hooks-copy-unix-codex-' + projectId, 'hooks-unix-codex-' + projectId],
+    ].forEach(([buttonId, targetId]) => wireCopy(buttonId, targetId));
+
+    const genBtn = document.getElementById(`hooks-gen-token-${projectId}`);
+    if (genBtn) {
+      genBtn.onclick = async () => {
+        genBtn.disabled = true;
+        genBtn.textContent = 'Generating...';
+        try {
+          const tok = await api('/auth/tokens', { method: 'POST', body: JSON.stringify({ label: 'hooks-config' }) });
+          hooksToken = tok.token;
+          renderHooks();
+        } catch (e) {
+          const statusEl = document.getElementById(`hooks-token-status-${projectId}`);
+          if (statusEl) statusEl.textContent = `error: ${escapeHtml(String(e))}`;
+        } finally {
+          genBtn.disabled = false;
+          genBtn.textContent = hooksToken ? 'Generate new key' : 'Generate API key';
+        }
+      };
+    }
+
+    renderHooks();
+  }, 0);
 
   // Wire notification Save button
   const ntfySaveBtn = document.getElementById(`ntfy-save-${projectId}`);

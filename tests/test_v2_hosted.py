@@ -32,6 +32,24 @@ def _make_test_db():
     return _inner
 
 
+def _make_hosted_client(monkeypatch, tmp_path):
+    """Hosted-mode TestClient backed by an in-memory auth DB."""
+    monkeypatch.setenv("MERIDIAN_HOSTED", "true")
+    monkeypatch.setenv("MERIDIAN_DB", ":memory:")
+    monkeypatch.setenv("MERIDIAN_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("MERIDIAN_DB_URL", "")
+    monkeypatch.setenv("MERIDIAN_DEMO_DB_URL", "")
+    monkeypatch.setenv("MERIDIAN_SKIP_DEMO", "1")
+    monkeypatch.setenv("MERIDIAN_GOAL_MD", str(tmp_path / "GOAL.md"))
+
+    import importlib
+    from fastapi.testclient import TestClient
+    import meridian.server as server_module
+
+    server_module = importlib.reload(server_module)
+    return TestClient(server_module.app)
+
+
 # ---------------------------------------------------------------------------
 # Tenant tables
 # ---------------------------------------------------------------------------
@@ -274,6 +292,65 @@ def test_remote_mcp_invalid_token_returns_401(client):
         headers={"Authorization": "Bearer sk_meridian_totallyinvalid"},
     )
     assert r.status_code == 401
+
+
+def test_hooks_invalid_bearer_returns_401_in_hosted_mode(monkeypatch, tmp_path):
+    """Hook endpoints must reject invalid Bearer tokens instead of falling back."""
+    from meridian import db as db_module
+
+    with _make_hosted_client(monkeypatch, tmp_path) as client:
+        _run(db_module.create_project(client.app.state.db, "hosted-hooks-invalid"))
+        r = client.post(
+            "/hooks/session-start",
+            json={"project_id": "does-not-matter"},
+            headers={"Authorization": "Bearer sk_meridian_totallyinvalid"},
+        )
+        assert r.status_code == 401
+        assert "invalid API token" in r.text
+
+        r = client.post(
+            "/hooks/stop",
+            json={"project_id": "does-not-matter"},
+            headers={"Authorization": "Bearer sk_meridian_totallyinvalid"},
+        )
+        assert r.status_code == 401
+        assert "invalid API token" in r.text
+
+
+def test_hooks_accept_valid_bearer_for_internal_tenant(monkeypatch, tmp_path):
+    """Valid Bearer auth should allow hosted hooks to resolve the tenant DB."""
+    from meridian import db as db_module
+    import meridian.server as server_module
+
+    async def _setup(db):
+        tenant = await db_module.upsert_tenant(db, "hooks-hosted@example.com")
+        raw_token, _ = await db_module.create_api_token(db, tenant["id"], label="hooks-test")
+        project = await db_module.create_project(db, "hosted-hooks-valid")
+        return raw_token, project
+
+    with _make_hosted_client(monkeypatch, tmp_path) as client:
+        async def _open_same_db(_request, _tenant_id):
+            return client.app.state.db
+
+        monkeypatch.setattr(server_module, "_open_tenant_db_by_id", _open_same_db)
+        raw_token, project = _run(_setup(client.app.state.db))
+        start_resp = client.post(
+            "/hooks/session-start",
+            json={"project_id": project["id"], "session_name": "hook-test"},
+            headers={"Authorization": f"Bearer {raw_token}"},
+        )
+        assert start_resp.status_code == 200
+        body = start_resp.json()
+        assert "hookSpecificOutput" in body
+        assert project["name"] in body["hookSpecificOutput"]["additionalContext"]
+
+        stop_resp = client.post(
+            "/hooks/stop",
+            json={"project_id": project["id"]},
+            headers={"Authorization": f"Bearer {raw_token}"},
+        )
+        assert stop_resp.status_code == 200
+        assert stop_resp.json()["ok"] is True
 
 
 def test_remote_mcp_initialize_with_valid_token(client):
