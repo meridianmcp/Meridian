@@ -130,6 +130,12 @@ function hideDemoAdminControls() {
     '[id^="invite-email-"]',
     '[id^="invite-role-"]',
     '[id^="invite-btn-"]',
+    '[id^="github-pat-"]',
+    '[id^="github-repo-"]',
+    '[id^="github-branch-"]',
+    '[id^="github-connect-btn-"]',
+    '[id^="github-disconnect-btn-"]',
+    '[id^="github-test-btn-"]',
     // Files tab: hide Edit subtab, show Preview only
     '[id^="file-mode-edit-"]',
   ];
@@ -410,6 +416,16 @@ function _renderPlanBadge(me) {
     document.body.prepend(b);
     document.body.style.paddingTop = ((parseInt(document.body.style.paddingTop || '0', 10)) + 28) + 'px';
   }
+  // GitHub onboarding banner — show once to hosted users who haven't connected a repo
+  if (me.github_connected === false && !isDemoMode() && !document.getElementById('github-onboarding-banner') && !sessionStorage.getItem('github-banner-dismissed')) {
+    const b = document.createElement('div');
+    b.id = 'github-onboarding-banner';
+    b.style = 'position:fixed;top:0;left:0;right:0;z-index:9997;background:#7c3aed;color:#fff;text-align:center;padding:5px 12px;font-size:12px;font-family:inherit;display:flex;align-items:center;justify-content:center;gap:10px';
+    b.innerHTML = `<span>Connect your GitHub repo — give your AI sessions live code access, no extra installs needed.</span><a href="#settings" onclick="document.querySelector('.vtab-btn[data-vtab=settings]')?.click()" style="color:#fff;text-decoration:underline;white-space:nowrap">Connect now →</a><button onclick="sessionStorage.setItem('github-banner-dismissed','1');this.closest('#github-onboarding-banner').remove();document.body.style.paddingTop=Math.max(0,parseInt(document.body.style.paddingTop||'0',10)-28)+'px'" style="background:none;border:none;color:rgba(255,255,255,0.7);font-size:16px;cursor:pointer;padding:0 0 0 6px;line-height:1" title="Dismiss">×</button>`;
+    document.body.prepend(b);
+    document.body.style.paddingTop = ((parseInt(document.body.style.paddingTop || '0', 10)) + 28) + 'px';
+  }
+
   // b75c1649 — sign out link in sidebar footer (hosted/authenticated users only)
   if (!document.getElementById('signout-link')) {
     const footer = document.querySelector('.sidebar-footer');
@@ -2798,11 +2814,12 @@ async function loadSettingsTab(projectId) {
   ];
 
   // Fetch both in parallel; mcp-config 404 = self-hosted (skip section).
-  const [notifResult, mcpResult, settingsResult, ntfyResult] = await Promise.allSettled([
+  const [notifResult, mcpResult, settingsResult, ntfyResult, ghResult] = await Promise.allSettled([
     api('/settings/notifications'),
     api('/settings/mcp-config'),
     loadProjectSettings(projectId),
     api(`/projects/${projectId}/ntfy`),
+    api(`/projects/${projectId}/github/status`),
   ]);
 
   const prefs = (notifResult.status === 'fulfilled') ? (notifResult.value.prefs || {}) : null;
@@ -2810,6 +2827,7 @@ async function loadSettingsTab(projectId) {
   const projectSettings = (settingsResult.status === 'fulfilled')
     ? settingsResult.value
     : { project_id: projectId, max_pinned_decisions: DEFAULT_MAX_PINNED_DECISIONS };
+  const ghData = (ghResult.status === 'fulfilled') ? ghResult.value : null;
   const hooksBaseUrl = ((mcpData && mcpData.base_url) || window.location.origin || state.serverConfig?.server_url || 'http://localhost:7878').replace(/\/$/, '');
 
   function buildHookCurlHeaders(token) {
@@ -3394,6 +3412,56 @@ async function loadSettingsTab(projectId) {
     }, 0);
   }
 
+  // GitHub integration card (hosted only)
+  if (mcpData) {
+    const ghConnected = ghData && ghData.connected;
+    const ghRepo = (ghData && ghData.repo) || '';
+    const ghBranch = (ghData && ghData.branch) || 'main';
+    html += `<div style="margin-bottom:14px;padding:10px 12px;border:1px solid var(--border);border-radius:6px;background:var(--surface-2)" id="github-card-${projectId}">
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px">
+        <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor" style="color:var(--text);flex-shrink:0"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+        <span style="font-weight:600;font-size:11px;color:var(--text)">GitHub</span>
+        ${ghConnected ? `<span style="font-size:9px;padding:2px 6px;background:var(--success,#22c55e);color:#fff;border-radius:10px;font-weight:600">Connected</span>` : ''}
+      </div>
+      <div style="font-size:10px;color:var(--muted);margin-bottom:8px">
+        Connect your repo once — your AI sessions can then read files, search code, and check git log without any extra setup.
+        ${!ghConnected ? `<a href="https://github.com/settings/tokens/new?scopes=repo&description=Meridian" target="_blank" style="color:var(--accent);margin-left:4px">Create a PAT →</a>` : ''}
+      </div>
+      ${ghConnected ? `
+        <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+          <div style="font-family:var(--font-mono);font-size:11px;color:var(--text)">${escapeHtml(ghRepo)}</div>
+          <div style="font-size:10px;color:var(--muted)">branch: ${escapeHtml(ghBranch)}</div>
+          <button class="secondary" id="github-test-btn-${projectId}" style="padding:3px 8px;font-size:10px">Test</button>
+          <button class="secondary" id="github-disconnect-btn-${projectId}" style="padding:3px 8px;font-size:10px;color:var(--danger,#ef4444)">Disconnect</button>
+          <span id="github-status-${projectId}" style="font-size:10px;color:var(--muted)"></span>
+        </div>
+      ` : `
+        <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:flex-end">
+          <div style="display:flex;flex-direction:column;gap:3px;flex:2;min-width:140px">
+            <label style="font-size:9px;color:var(--muted)">Personal Access Token</label>
+            <input type="password" id="github-pat-${projectId}" placeholder="ghp_…"
+              style="padding:5px 8px;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;color:var(--text);font-family:var(--font-mono);font-size:11px;outline:none">
+          </div>
+          <div style="display:flex;flex-direction:column;gap:3px;flex:2;min-width:120px">
+            <label style="font-size:9px;color:var(--muted)">Repository (owner/repo)</label>
+            <input type="text" id="github-repo-${projectId}" placeholder="acme/myapp"
+              style="padding:5px 8px;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;color:var(--text);font-family:var(--font-mono);font-size:11px;outline:none">
+          </div>
+          <div style="display:flex;flex-direction:column;gap:3px;flex:1;min-width:80px">
+            <label style="font-size:9px;color:var(--muted)">Branch</label>
+            <input type="text" id="github-branch-${projectId}" value="main" placeholder="main"
+              style="padding:5px 8px;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;color:var(--text);font-family:var(--font-mono);font-size:11px;outline:none">
+          </div>
+          <div style="display:flex;flex-direction:column;gap:3px">
+            <label style="font-size:9px;color:transparent">_</label>
+            <button class="primary" id="github-connect-btn-${projectId}" style="padding:5px 12px;font-size:11px">Connect</button>
+          </div>
+        </div>
+        <span id="github-status-${projectId}" style="font-size:10px;color:var(--muted);display:block;margin-top:4px"></span>
+      `}
+    </div>`;
+  }
+
   // Notifications card — generalised: ntfy, webhook, or email
   const ntfyData = (ntfyResult.status === 'fulfilled') ? ntfyResult.value : null;
   // prefer notify_url key, fall back to ntfy_url for older servers
@@ -3570,6 +3638,68 @@ async function loadSettingsTab(projectId) {
       }
     };
   });
+
+  // Wire GitHub connect button
+  const ghConnectBtn = document.getElementById(`github-connect-btn-${projectId}`);
+  if (ghConnectBtn) {
+    ghConnectBtn.onclick = async () => {
+      const statusEl = document.getElementById(`github-status-${projectId}`);
+      const pat = (document.getElementById(`github-pat-${projectId}`)?.value || '').trim();
+      const repo = (document.getElementById(`github-repo-${projectId}`)?.value || '').trim();
+      const branch = (document.getElementById(`github-branch-${projectId}`)?.value || 'main').trim();
+      if (!pat || !repo) {
+        if (statusEl) statusEl.textContent = 'PAT and repo are required';
+        return;
+      }
+      ghConnectBtn.disabled = true;
+      ghConnectBtn.textContent = 'Connecting…';
+      if (statusEl) statusEl.textContent = '';
+      try {
+        await api(`/projects/${projectId}/github/connect`, {
+          method: 'POST',
+          body: JSON.stringify({ pat, repo, branch }),
+        });
+        loadSettingsTab(projectId);
+      } catch (e) {
+        if (statusEl) statusEl.textContent = e.message || 'Connection failed';
+        ghConnectBtn.disabled = false;
+        ghConnectBtn.textContent = 'Connect';
+      }
+    };
+  }
+
+  // Wire GitHub disconnect button
+  const ghDisconnectBtn = document.getElementById(`github-disconnect-btn-${projectId}`);
+  if (ghDisconnectBtn) {
+    ghDisconnectBtn.onclick = async () => {
+      const statusEl = document.getElementById(`github-status-${projectId}`);
+      ghDisconnectBtn.disabled = true;
+      try {
+        await api(`/projects/${projectId}/github/disconnect`, { method: 'DELETE' });
+        loadSettingsTab(projectId);
+      } catch (e) {
+        if (statusEl) statusEl.textContent = 'error disconnecting';
+        ghDisconnectBtn.disabled = false;
+      }
+    };
+  }
+
+  // Wire GitHub test button
+  const ghTestBtn = document.getElementById(`github-test-btn-${projectId}`);
+  if (ghTestBtn) {
+    ghTestBtn.onclick = async () => {
+      const statusEl = document.getElementById(`github-status-${projectId}`);
+      ghTestBtn.disabled = true;
+      try {
+        const st = await api(`/projects/${projectId}/github/status`);
+        if (statusEl) { statusEl.textContent = st.connected ? '✓ connected' : 'not connected'; setTimeout(() => { statusEl.textContent = ''; }, 3000); }
+      } catch (e) {
+        if (statusEl) statusEl.textContent = 'error';
+      } finally {
+        ghTestBtn.disabled = false;
+      }
+    };
+  }
 }
 
 function _renderToolEntry(tool) {

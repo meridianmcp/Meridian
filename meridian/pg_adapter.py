@@ -554,6 +554,7 @@ CREATE TABLE IF NOT EXISTS waitlist (
 
 -- v2.0 — hosted tier: tenants, web sessions, API bearer tokens
 -- v2.9 — free tier: trial_started_at + inactivity_expires_at
+-- v3.1 — github_pat/repo/branch for GitHub MCP tools
 CREATE TABLE IF NOT EXISTS tenants (
     id TEXT PRIMARY KEY,
     email TEXT NOT NULL UNIQUE,
@@ -568,6 +569,9 @@ CREATE TABLE IF NOT EXISTS tenants (
     pool_project_id TEXT,
     trial_started_at TEXT,
     inactivity_expires_at TEXT,
+    github_pat TEXT,
+    github_repo TEXT,
+    github_branch TEXT,
     created_at TEXT NOT NULL DEFAULT ({_TS})
 );
 
@@ -774,6 +778,7 @@ async def init_pg_db(url: str) -> PostgresConnection:
         await _migrate_pg_v25_admins_table(conn)
         await _migrate_pg_v28_dunning_and_github_sub(conn)
         await _migrate_pg_v29_free_tier_columns(conn)
+        await _migrate_pg_v31_github_integration(conn)
     return conn
 
 
@@ -992,6 +997,18 @@ async def _migrate_pg_v29_free_tier_columns(conn: PostgresConnection) -> None:
     await conn.executescript(
         "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS trial_started_at TEXT;"
         "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS inactivity_expires_at TEXT"
+    )
+
+
+async def _migrate_pg_v31_github_integration(conn: PostgresConnection) -> None:
+    """v3.1 — per-tenant GitHub PAT and repo for the GitHub MCP tools.
+
+    ADD COLUMN IF NOT EXISTS is idempotent — safe to run on every startup.
+    """
+    await conn.executescript(
+        "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS github_pat TEXT;"
+        "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS github_repo TEXT;"
+        "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS github_branch TEXT"
     )
 
 
