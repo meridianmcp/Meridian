@@ -1,4 +1,13 @@
-# Connecting claude.ai in the browser
+# Connecting Meridian from browser AI clients
+
+Use Meridian from browser-based AI clients without giving up the shared session memory, sprint board, or HITL queue. The setup path depends on the client:
+
+- **claude.ai** uses a browser extension that bridges your tab to an MCP server over SSE
+- **ChatGPT** uses a custom connector backed by a remote MCP server
+
+---
+
+## claude.ai
 
 Use Meridian directly inside claude.ai — no local install, no terminal. The [dnakov/claude-mcp](https://github.com/dnakov/claude-mcp) Chrome extension bridges the gap between your browser tab and any MCP server via SSE.
 
@@ -38,6 +47,24 @@ pixi run start
 
 !!! note "No auth popup for self-hosted"
     The auth popup only appears for the hosted tier at usemeridian.us. Self-hosted connections go directly to your local server with no additional login step.
+
+---
+
+## ChatGPT
+
+ChatGPT connects to Meridian as a **custom connector** backed by a **remote MCP server**. Hosted Meridian is the easiest path because it already exposes a public MCP endpoint.
+
+1. Open Meridian at [usemeridian.us](https://usemeridian.us) if you want the hosted path.
+2. In ChatGPT, add Meridian as a custom connector and use the remote MCP URL: `https://usemeridian.us/mcp`
+3. Complete the authorization flow if ChatGPT prompts for sign-in or approval.
+
+!!! note "Remote MCP only"
+    ChatGPT connects to remote MCP servers. A local URL such as `http://localhost:7878/mcp` will not connect directly from ChatGPT. If you are self-hosting Meridian, put it behind a secure public URL or tunnel first.
+
+Depending on your ChatGPT plan or workspace, you may need developer mode enabled or admin approval before custom connectors are available. OpenAI updates those requirements over time, so check the latest guidance here:
+
+- [Apps in ChatGPT](https://help.openai.com/en/articles/11487775-connectors-in-chatgpt)
+- [Developer mode and MCP apps in ChatGPT](https://help.openai.com/en/articles/12584461-developer-mode-apps-and-full-mcp-connectors-in-chatgpt-beta)
 
 ---
 

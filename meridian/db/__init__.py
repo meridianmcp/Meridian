@@ -2496,6 +2496,26 @@ async def archive_stale_sessions(
     return cursor.rowcount
 
 
+async def archive_empty_sessions(
+    db: aiosqlite.Connection, days: int = 7
+) -> int:
+    """Archive sessions older than *days* that never logged any tasks."""
+    from datetime import datetime, timedelta, timezone
+
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).strftime(
+        "%Y-%m-%d %H:%M:%S"
+    )
+    cursor = await db.execute(
+        "UPDATE sessions SET status = 'archived' "
+        "WHERE created_at < ? "
+        "AND status != 'active' "
+        "AND id NOT IN (SELECT DISTINCT session_id FROM task_log)",
+        (cutoff,),
+    )
+    await db.commit()
+    return cursor.rowcount
+
+
 async def get_sessions(
     db: aiosqlite.Connection,
     project_id: str,
@@ -4449,6 +4469,28 @@ async def get_tenant_from_token_hash(
     ) as cur:
         row = await cur.fetchone()
     return _row_to_dict(row)
+
+
+async def count_tenants_by_plan(
+    db: aiosqlite.Connection,
+    plan: str,
+    *,
+    provisioned_only: bool = False,
+) -> int:
+    """Count tenant rows for a plan, optionally limiting to provisioned rows."""
+    query = "SELECT COUNT(*) AS n FROM tenants WHERE plan = ?"
+    if provisioned_only:
+        query += " AND (neon_project_id IS NOT NULL OR neon_db_url IS NOT NULL)"
+    async with db.execute(query, (plan,)) as cur:
+        row = await cur.fetchone()
+    if row is None:
+        return 0
+    if isinstance(row, dict):
+        return int(row.get("n", 0) or 0)
+    keys = row.keys() if hasattr(row, "keys") else []
+    if keys:
+        return int(row["n"] or 0)
+    return int(row[0] or 0)
 
 
 # ---------------------------------------------------------------------------

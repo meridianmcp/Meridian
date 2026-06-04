@@ -423,9 +423,36 @@ async def _post_login_redirect(tenant: dict, db=None, next_url: str = "") -> str
             return next_url
         return _cfg("MERIDIAN_AFTER_LOGIN_URL", "/dashboard")
 
-    # MERIDIAN_LAUNCH_OPEN=true: skip waitlist gate, send all users to dashboard.
-    # Free tier is auto-provisioned at OAuth signup (see auth_callback).
+    # MERIDIAN_LAUNCH_OPEN=true: admit the first N free-tier users directly.
+    # Returning tenants keep access even after the launch cap is reached.
     if _cfg("MERIDIAN_LAUNCH_OPEN"):
+        if db is not None:
+            from . import db as db_module
+
+            free_cap = int(_cfg("MERIDIAN_FREE_LAUNCH_CAP", "15") or "15")
+            has_slot = bool(
+                (tenant or {}).get("neon_project_id")
+                or (tenant or {}).get("neon_db_url")
+                or (tenant or {}).get("plan") in {"standard", "pro", "admin"}
+            )
+            if not has_slot:
+                free_count = await db_module.count_tenants_by_plan(
+                    db, "free", provisioned_only=True
+                )
+                if free_count >= free_cap:
+                    email = (tenant or {}).get("email", "")
+                    if email:
+                        try:
+                            await db_module.add_waitlist_entry(
+                                db, email, note="auto:launch-full"
+                            )
+                        except Exception:
+                            pass
+                    return "/waitlist-pending?message=Early%20access%20is%20full"
+                try:
+                    tenant = await provision_neon_db(tenant["id"], db)
+                except Exception:
+                    pass
         if next_url and next_url.startswith("/") and not next_url.startswith("//"):
             return next_url
         return _cfg("MERIDIAN_AFTER_LOGIN_URL", "/dashboard")

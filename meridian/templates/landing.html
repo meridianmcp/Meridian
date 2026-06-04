@@ -261,10 +261,10 @@
 
   /* Pricing */
   .pricing-grid {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(290px, 1fr));
+    display: flex;
+    flex-wrap: nowrap;
     gap: 1.4rem;
-    max-width: 760px;
+    max-width: 1100px;
     margin: 0 auto;
   }
   .plan {
@@ -272,6 +272,8 @@
     border-radius: var(--r-lg);
     padding: 2rem 1.8rem;
     display: flex; flex-direction: column;
+    flex: 1 1 0;
+    min-width: 0;
   }
   .plan-name {
     font-family: var(--mono);
@@ -391,6 +393,10 @@
     section { padding: 3rem 1.2rem; }
     .hero { padding: 4rem 1.2rem 2rem; }
     .terminal-body { font-size: .72rem; padding: .9rem 1rem; }
+  }
+  @media (max-width: 900px) {
+    .pricing-grid { flex-wrap: wrap; }
+    .plan { min-width: 280px; }
   }
 </style>
 </head>
@@ -616,21 +622,21 @@ irm https://usemeridian.us/hooks.ps1 | iex</pre>
     <!-- Free / self-hosted -->
     <div class="plan">
       <div class="plan-name">Free</div>
-      <div class="plan-price">$0<small> / forever</small></div>
+      <div class="plan-price">$0<small> / mo</small></div>
       <div class="plan-trial"><span class="ok">available now</span> · no card required</div>
       <hr class="plan-divider">
       <ul class="plan-features">
-        <li>Full self-hosted install (binary or pixi)</li>
-        <li>SQLite DB — all data on your machine</li>
-        <li>Unlimited projects, sessions, tasks</li>
-        <li>All MCP tools included</li>
-        <li>Dashboard at localhost:7878</li>
+        <li>Hosted dashboard at usemeridian.us</li>
+        <li>Remote MCP endpoint (HTTPS + Bearer)</li>
+        <li>1 project · 1 concurrent session</li>
+        <li>Google + GitHub + email sign-in</li>
+        <li>0.5 CU shared compute</li>
+        <li>10 CU-hours total included</li>
         <li>HITL queue + pinned decisions</li>
-        <li>Works with Claude Code, Cursor, Windsurf</li>
-        <li>Open source (MSL-1.0 → MIT in 8 years)</li>
+        <li>Self-hosting still stays free forever</li>
       </ul>
-      <div class="plan-note">Self-hosted is free forever for personal and internal use.</div>
-      <a href="https://github.com/meridianmcp/Meridian" class="plan-cta secondary" target="_blank" rel="noopener">★ Get on GitHub →</a>
+      <div class="plan-note">Hosted free tier expires after inactivity. Self-hosted Meridian remains free forever.</div>
+      <a href="/auth/login" class="plan-cta secondary">Start free →</a>
     </div>
 
     <!-- Standard — primary -->
@@ -640,11 +646,12 @@ irm https://usemeridian.us/hooks.ps1 | iex</pre>
       <div class="plan-trial"><span class="ok">30-day free trial</span> · no card required</div>
       <hr class="plan-divider">
       <ul class="plan-features">
-        <li>Managed Postgres — 1 GB included</li>
-        <li>50 CU-hours compute included</li>
+        <li>Managed Postgres workspace DB</li>
+        <li>2 CU compute included</li>
+        <li>50 CU-hours / month included</li>
         <li>Hosted dashboard at usemeridian.us</li>
         <li>Remote MCP endpoint (HTTPS + Bearer)</li>
-        <li>Unlimited projects · up to 25 team members</li>
+        <li>Unlimited projects · up to 20 members</li>
         <li>Google + GitHub + email sign-in</li>
         <li>HITL queue + pinned decisions</li>
         <li>Webhook intake for LangGraph / Autogen</li>
@@ -664,8 +671,8 @@ irm https://usemeridian.us/hooks.ps1 | iex</pre>
       <ul class="plan-features">
         <li>Everything in Standard</li>
         <li>Managed Postgres — 10 GB included</li>
-        <li>200 CU-hours compute included</li>
-        <li>Up to 50 team members</li>
+        <li>4 CU compute included</li>
+        <li>200 CU-hours / month included</li>
         <li>Higher compute caps · faster queries</li>
         <li>Priority support</li>
         <li>Team swimlane + activity timeline</li>
@@ -689,7 +696,7 @@ irm https://usemeridian.us/hooks.ps1 | iex</pre>
         <span style="font-size:18px;color:var(--muted,#8b9cba);flex-shrink:0;margin-left:12px">+</span>
       </summary>
       <div style="padding:0 18px 14px;color:var(--muted,#8b9cba);font-size:14px;line-height:1.7">
-        <strong>Self-hosted:</strong> your data never leaves your machine — we have zero access. <strong>Hosted tier:</strong> your project data lives in an isolated Neon database. Meridian staff cannot read it. The HITL queue means <em>you</em> are the human reviewer, not us.
+        <strong>Self-hosted:</strong> your data never leaves your machine — we have zero access. <strong>Hosted tier:</strong> your project data lives in an isolated Neon database. Meridian staff do not access your data. The HITL queue means <em>you</em> are the human reviewer, not us.
       </div>
     </details>
 

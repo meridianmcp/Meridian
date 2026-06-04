@@ -10,7 +10,7 @@ Answers to common questions about Meridian.
 
 No. For **self-hosted** installs, your data never leaves your machine — we have no access whatsoever. The server runs on localhost, your DB is a local SQLite file, and there are no telemetry calls home.
 
-For the **hosted tier** (usemeridian.us), your data lives in an isolated Neon Postgres database provisioned for your workspace. Meridian staff cannot read your project data. The HITL queue means *you* are the human who reviews and approves agent decisions — not us.
+For the **hosted tier** (usemeridian.us), your data lives in an isolated Neon Postgres database provisioned for your workspace. Meridian staff do not access your project data. The HITL queue means *you* are the human who reviews and approves agent decisions — not us.
 
 ### What happens to my data if I cancel hosted?
 
@@ -31,9 +31,11 @@ You have 28 days after cancellation before your database is deleted. We'll email
 
 Meridian is live state: sessions read and write to a shared DB in real time. Think of `CLAUDE.md` as a README and Meridian as the project management layer on top.
 
-### Does it work with Cursor, Windsurf, or other clients (not Claude)?
+### What AI clients can connect to Meridian?
 
-Yes. Meridian exposes a standard [MCP server](https://spec.modelcontextprotocol.io). Any MCP-compatible client works — Cursor, Windsurf, Claude Desktop, Claude Code, LangGraph agents, AutoGen. The coordination layer is model-agnostic.
+Meridian exposes a standard [MCP server](https://spec.modelcontextprotocol.io). Cursor, Windsurf, Claude Desktop, Claude Code, LangGraph agents, AutoGen, and other MCP-compatible clients can connect directly. Browser-based clients work too: claude.ai can connect through an MCP browser extension, and ChatGPT can connect to a remote MCP server as a custom connector.
+
+→ [Browser connector guide](browser-connector.md)
 
 ### Can I use local models (Ollama, LM Studio, etc.)?
 
@@ -104,18 +106,6 @@ Meridian is open-source (MSL-1.0), built to solve the coordination problem in lo
 ### Is there a hosted option for teams?
 
 Yes — [usemeridian.us](https://usemeridian.us). Standard is $20/month, Pro is $49/month. Both include a 30-day free tier with no card required. You get a managed Postgres database, hosted dashboard, and remote MCP endpoint — zero install on your end.
-
-### Can I use Meridian from claude.ai without installing anything?
-
-Yes. The [dnakov/claude-mcp](https://github.com/dnakov/claude-mcp) Chrome extension connects claude.ai to any MCP server via SSE. For the hosted tier:
-
-1. Sign in at [usemeridian.us](https://usemeridian.us)
-2. Install the extension → Add server → URL: `https://usemeridian.us/mcp`
-3. An auth popup appears — sign in and the connection completes automatically
-
-For self-hosted: start `pixi run start` locally, then use `http://localhost:7878/mcp` as the URL. No auth popup needed.
-
-→ [Full browser connector guide](browser-connector.md)
 
 ### What does the 30-day free trial include?
 

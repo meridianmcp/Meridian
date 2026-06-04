@@ -89,11 +89,13 @@ Zero local install — sign in at [usemeridian.us](https://usemeridian.us), copy
 
 ## Dashboard
 
-<img src="screenshots/demo_sessions.png" alt="Meridian dashboard — sessions view" style="max-width:100%;border-radius:8px;margin:8px 0">
-<img src="screenshots/demo_queue.png" alt="Meridian dashboard — queue tab" style="max-width:100%;border-radius:8px;margin:8px 0">
-<img src="screenshots/demo_hitl.png" alt="Meridian dashboard — HITL queue" style="max-width:100%;border-radius:8px;margin:8px 0">
-<img src="screenshots/pricing.png" alt="Meridian pricing" style="max-width:100%;border-radius:8px;margin:8px 0">
-<img src="screenshots/install_mcp.png" alt="Meridian MCP install guide" style="max-width:100%;border-radius:8px;margin:8px 0">
+<img src="screenshots/01_dashboard.png" alt="Meridian dashboard overview" style="max-width:100%;border-radius:8px;margin:8px 0">
+<img src="screenshots/02_live_tab.png" alt="Meridian dashboard live tab" style="max-width:100%;border-radius:8px;margin:8px 0">
+<img src="screenshots/04_queue_tab.png" alt="Meridian dashboard queue tab" style="max-width:100%;border-radius:8px;margin:8px 0">
+<img src="screenshots/06_files_tab.png" alt="Meridian dashboard files tab" style="max-width:100%;border-radius:8px;margin:8px 0">
+
+!!! info "HITL, in plain English"
+    HITL means "human in the loop." When an AI session hits a risky choice or needs approval, it can pause and put a question in Meridian's queue so a person can answer it before work continues.
 
 ## Quick Install
 

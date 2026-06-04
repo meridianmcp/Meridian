@@ -59,13 +59,19 @@ function hideHostedAdminControls() {
 }
 
 const STORAGE_KEY = (k) => (isDemoMode() ? 'meridian_demo_' : 'meridian_') + k.replace(/^meridian[._]/, '');
-const RECENT_DONE_LIMIT = 25;
+const QUEUE_DONE_PAGE_SIZE = 10;
 const NORTH_STAR_MIN_HEIGHT_PX = 180;
 const DEFAULT_MAX_PINNED_DECISIONS = 20;
 
 function getPanelState(projectId) {
   state.panels[projectId] = state.panels[projectId] || {};
   return state.panels[projectId];
+}
+
+function syncSidebarActiveProject() {
+  document.querySelectorAll('.project-item').forEach(item => {
+    item.classList.toggle('active', item.dataset.projectId === state.activeTab);
+  });
 }
 
 function autosizeGoalField(el, minPx = NORTH_STAR_MIN_HEIGHT_PX) {
@@ -677,10 +683,9 @@ async function loadProjects() {
   list.innerHTML = '';
   state.projects.forEach(p => {
     const div = document.createElement('div');
-    div.className = 'project-item';
+    div.className = 'project-item' + (state.activeTab === p.id ? ' active' : '');
     div.dataset.projectId = p.id;
-    const isOpen = state.tabs.some(t => t.id === p.id);
-    div.style.cssText = `display:flex;align-items:center;justify-content:space-between;gap:4px;${isOpen ? 'background:var(--surface-2);border-radius:4px;padding:2px 4px;' : ''}`;
+    div.style.cssText = 'display:flex;align-items:center;justify-content:space-between;gap:4px;';
     const nameSpan = document.createElement('span');
     nameSpan.style.cssText = 'flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap';
     nameSpan.textContent = p.name;
@@ -716,6 +721,7 @@ async function loadProjects() {
     });
     if (previous && state.projects.some(p => p.id === previous)) switcher.value = previous;
   }
+  syncSidebarActiveProject();
 }
 
 function escapeHtml(s) {
@@ -765,6 +771,7 @@ function closeTab(id) {
     if (next) activateTab(next.id);
     else document.getElementById('tab-bodies').innerHTML = '<div class="empty">no project open — pick one on the left</div>';
   }
+  syncSidebarActiveProject();
 }
 
 function saveTabs() {
@@ -917,6 +924,7 @@ async function _deleteProject(t) {
 function activateTab(id) {
   state.activeTab = id;
   renderTabs();
+  syncSidebarActiveProject();
   document.querySelectorAll('.tab-body').forEach(el => el.classList.remove('active'));
   const body = document.getElementById(`tab-body-${id}`);
   if (body) body.classList.add('active');
@@ -1182,8 +1190,6 @@ function buildTabBody(project) {
           <button class="secondary" id="queue-refresh-${project.id}" style="padding:2px 8px;font-size:10px">refresh</button>
         </div>
         <div id="live-session-${project.id}" style="display:none;flex-shrink:0;border-bottom:1px solid var(--border);background:var(--surface-2);padding:8px 14px 10px"></div>
-        <div id="recent-sessions-${project.id}" style="display:none;flex-shrink:0;border-bottom:1px solid var(--border);background:var(--surface-2);padding:8px 14px 8px"></div>
-        <div id="milestones-strip-${project.id}" style="display:none;flex-shrink:0;border-bottom:1px solid var(--border);background:var(--surface-2);padding:6px 14px 8px"></div>
         <div style="padding:8px 14px 0;flex-shrink:0">
           <input type="text" id="task-search-${project.id}" placeholder="Search tasks…"
             style="width:100%;padding:5px 10px;background:var(--surface-2);border:1px solid var(--border);
@@ -1192,6 +1198,7 @@ function buildTabBody(project) {
         <div style="flex:1;overflow-y:auto" id="queue-body-${project.id}">
           <div class="empty" style="color:var(--muted)">select queue to load</div>
         </div>
+        <div id="recent-sessions-${project.id}" style="display:none;flex-shrink:0;border-top:1px solid var(--border);background:var(--surface-2);padding:8px 14px 8px"></div>
         <div id="recent-runs-${project.id}" style="flex-shrink:0;border-top:1px solid var(--border);background:var(--surface-2)">
           <div style="display:flex;justify-content:space-between;align-items:center;padding:6px 14px;cursor:pointer"
                id="recent-runs-toggle-${project.id}">
@@ -1379,9 +1386,7 @@ function buildTabBody(project) {
         if (vtab === 'queue') {
           loadQueue(project.id);
           updateLiveFeed(project.id);
-          loadRecentSessions(project.id);
           loadRecentRuns(project.id);
-          loadMilestones(project.id);
           // 5s live-feed poll while queue tab is visible — cleared on tab switch
           clearInterval(p._liveFeedInterval);
           p._liveFeedInterval = setInterval(() => {
@@ -4032,14 +4037,17 @@ async function updateLiveFeed(projectId) {
    * Collapses when no active session exists. Polls every 5s. */
   const el = document.getElementById(`live-session-${projectId}`);
   if (!el) return;
+  const panel = getPanelState(projectId);
   try {
     const sessions = await api(`/projects/${projectId}/sessions?active_only=true`);
     const active = sessions && sessions.filter(s => s.status === 'active');
     if (!active || active.length === 0) {
+      panel.liveSessionId = null;
       el.style.display = 'none';
       return;
     }
     const sess = active[0];
+    panel.liveSessionId = sess.id;
     const tasks = await api(`/projects/${projectId}/sessions/${sess.id}/tasks/live?limit=5`).catch(() => []);
     const elapsed = sess.last_seen
       ? Math.round((Date.now() - new Date(sess.last_seen + 'Z').getTime()) / 60000)
@@ -4066,47 +4074,52 @@ async function updateLiveFeed(projectId) {
       </div>`;
     el.style.display = 'block';
   } catch(e) {
+    panel.liveSessionId = null;
     el.style.display = 'none';
   }
 }
 
-async function loadRecentSessions(projectId) {
-  /** fa595ad8 — Recent Sessions panel: 24h feed of completed checkpoint() calls.
-   * Each card: session name, tasks done, one-line summary, Resume button copies /goal. */
+async function loadRecentSessions(projectId, sessions = null) {
+  /** Recent Sessions list for non-live sessions with a copyable start_session(). */
   const el = document.getElementById(`recent-sessions-${projectId}`);
   if (!el) return;
   try {
-    const notes = await api(`/projects/${projectId}/notes?tag=checkpoint`);
-    if (!notes || !notes.length) { el.style.display = 'none'; return; }
-    const checkpoints = notes
-      .map(r => { try { return Object.assign(JSON.parse(r.body), { created_at: r.created_at }); } catch { return null; } })
-      .filter(Boolean)
+    const panel = getPanelState(projectId);
+    const allSessions = Array.isArray(sessions)
+      ? sessions
+      : await api(`/projects/${projectId}/sessions?active_only=false`);
+    const recent = (allSessions || [])
+      .filter(s => s.id !== panel.liveSessionId && s.status !== 'active')
+      .sort((a, b) => String(b.last_seen || b.created_at || '').localeCompare(String(a.last_seen || a.created_at || '')))
       .slice(0, 5);
-    if (!checkpoints.length) { el.style.display = 'none'; return; }
+    if (!recent.length) { el.style.display = 'none'; return; }
     el.innerHTML = `
       <div style="font-size:9px;font-weight:700;color:var(--muted);letter-spacing:.07em;text-transform:uppercase;margin-bottom:6px">Recent Sessions</div>
-      ${checkpoints.map(c => {
-        const dt = (c.created_at || '').slice(0, 16).replace('T', ' ');
-        const name = escapeHtml(c.session_name || (c.session_id || '').slice(0, 8) || 'session');
-        const done = c.items_done || 0;
-        const line = escapeHtml((c.summary_line || '').slice(0, 90));
-        const safeGoal = escapeHtml(c.next_goal || '');
+      ${recent.map(s => {
+        const seenAt = s.last_seen || s.created_at || '';
+        const dt = seenAt ? formatRelativeTime(seenAt) : '';
+        const name = escapeHtml(s.name || s.id || 'session');
+        const status = s.status === 'idle' ? 'idle' : s.status === 'closed' ? 'done' : (s.status || 'session');
+        const summary = escapeHtml((s.session_summary || '').slice(0, 90));
+        const humanClause = s.human_id ? `, human_id="${String(s.human_id).replace(/"/g, '\\"')}"` : '';
+        const cmd = `start_session(project_id="${projectId}", session_name="${String(s.name || 'resume-session').replace(/"/g, '\\"')}"${humanClause})`;
+        const safeCmd = escapeHtml(cmd);
         return `<div style="border:1px solid var(--border);border-radius:3px;padding:5px 8px;margin-bottom:4px;background:var(--surface-1)">
           <div style="display:flex;justify-content:space-between;align-items:center;gap:6px">
             <span style="font-weight:600;font-size:10px;color:var(--text);font-family:var(--font-mono);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${name}</span>
             <div style="display:flex;gap:4px;align-items:center;flex-shrink:0">
-              <span style="font-size:9px;color:var(--muted)">${done} done · ${dt}</span>
-              <button class="secondary resume-goal-btn" data-goal="${safeGoal}"
-                style="padding:1px 6px;font-size:9px" title="Copy /goal to clipboard">Resume</button>
+              <span style="font-size:9px;color:var(--muted)">${escapeHtml(status)}${dt ? ` · ${escapeHtml(dt)}` : ''}</span>
+              <button class="secondary resume-session-btn" data-cmd="${safeCmd}"
+                style="padding:1px 6px;font-size:9px" title="Copy start_session() to clipboard">Resume</button>
             </div>
           </div>
-          ${line ? `<div style="font-size:9px;color:var(--muted);margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${line}</div>` : ''}
+          ${summary ? `<div style="font-size:9px;color:var(--muted);margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${summary}</div>` : ''}
         </div>`;
       }).join('')}`;
-    el.querySelectorAll('.resume-goal-btn').forEach(btn => {
+    el.querySelectorAll('.resume-session-btn').forEach(btn => {
       btn.onclick = () => {
-        const goal = btn.dataset.goal || '';
-        navigator.clipboard.writeText(goal).then(() => toast('Copied /goal to clipboard')).catch(() => toast('copy failed', true));
+        const cmd = btn.dataset.cmd || '';
+        navigator.clipboard.writeText(cmd).then(() => toast('Copied start_session() to clipboard')).catch(() => toast('copy failed', true));
       };
     });
     el.style.display = 'block';
@@ -4223,28 +4236,41 @@ async function loadRecentRuns(projectId) {
 }
 
 async function loadQueue(projectId) {
-  /**v1.4.0 — work queue panel. Loads all tasks and segments them into
-   * pending / in_progress / done / failed buckets — a Minecraft-hopper view
-   * of the task flow: items arrive pending, get claimed in_progress, complete
-   * to done or fail. Newest entries appear first within each bucket. */
+  /** Sprint queue panel sourced from sprint_items, not task_log history. */
   const body = document.getElementById(`queue-body-${projectId}`);
   if (!body) return;
+  const panel = getPanelState(projectId);
+  if (!panel.queueDoneLimit) panel.queueDoneLimit = QUEUE_DONE_PAGE_SIZE;
   body.innerHTML = '<div class="empty" style="color:var(--muted)">loading…</div>';
   try {
-    const [tasks, sprintItems] = await Promise.all([
-      api(`/projects/${projectId}/tasks?limit=150`),
+    const [sessions, sprintItems] = await Promise.all([
+      api(`/projects/${projectId}/sessions?active_only=false`).catch(() => []),
       api(`/projects/${projectId}/sprint-items`),
     ]);
-    const activeSprintItems = (sprintItems || []).filter(it =>
-      ['pending', 'todo', 'in_progress'].includes(it.status)
-    );
-    body.innerHTML = renderQueue(tasks, activeSprintItems);
+    const liveSession = (sessions || []).find(s => s.status === 'active');
+    panel.liveSessionId = liveSession ? liveSession.id : null;
+    panel.queueSprintItems = sprintItems || [];
+
+    const renderCurrentQueue = () => {
+      body.innerHTML = renderQueue(projectId, panel.queueSprintItems || []);
+      const moreBtn = document.getElementById(`queue-done-more-${projectId}`);
+      if (moreBtn) {
+        moreBtn.onclick = () => {
+          panel.queueDoneLimit = (panel.queueDoneLimit || QUEUE_DONE_PAGE_SIZE) + QUEUE_DONE_PAGE_SIZE;
+          renderCurrentQueue();
+        };
+      }
+    };
+
+    renderCurrentQueue();
+    loadRecentSessions(projectId, sessions || []);
+
     const refreshBtn = document.getElementById(`queue-refresh-${projectId}`);
     if (refreshBtn) refreshBtn.onclick = () => loadQueue(projectId);
     // Wire search input (debounced 300ms) — universal search across all tables
     const searchInput = document.getElementById(`task-search-${projectId}`);
     if (searchInput) {
-      searchInput.placeholder = 'Search tasks, notes, decisions…';
+      searchInput.placeholder = 'Search sprint items, notes, decisions…';
       if (!searchInput._wired) {
         searchInput._wired = true;
         let _searchTimer = null;
@@ -4252,7 +4278,7 @@ async function loadQueue(projectId) {
           clearTimeout(_searchTimer);
           const q = this.value.trim();
           _searchTimer = setTimeout(async () => {
-            if (!q) { body.innerHTML = renderQueue(tasks, activeSprintItems); return; }
+            if (!q) { renderCurrentQueue(); return; }
             try {
               const results = await api(`/projects/${projectId}/search?q=${encodeURIComponent(q)}&limit=10`);
               body.innerHTML = renderSearchResults(q, results);
@@ -4306,78 +4332,93 @@ function renderSearchResults(query, results) {
   </div>`;
 }
 
-function renderQueue(tasks, sprintItems = []) {
-  /**Segment tasks into pipeline stages and render each as a collapsible section. */
-  const queueItems = (sprintItems || []).map(it => ({
-    ...it,
-    kind: 'sprint_item',
-    description: it.title || '',
-    created_at: it.added_at || '',
-  }));
-  const pending = queueItems.filter(t => t.status === 'pending' || t.status === 'todo');
-  const inProg = queueItems.filter(t => t.status === 'in_progress');
-  const done = tasks.filter(t => t.status === 'done').slice(0, RECENT_DONE_LIMIT);
-  const failed = tasks.filter(t => t.status === 'failed').slice(0, RECENT_DONE_LIMIT);
-  const backlog = tasks.filter(t => t.status === 'backlog');
-  const future = tasks.filter(t => t.status === 'future');
-  const backburner = tasks.filter(t => t.status === 'backburner');
+function renderQueue(projectId, sprintItems = []) {
+  /** Render the 4-group sprint board for the Queue tab.
+   * Legacy task_log statuses like 'future' still belong in Dev Log, not here. */
+  const panel = getPanelState(projectId);
+  const doneLimit = panel.queueDoneLimit || QUEUE_DONE_PAGE_SIZE;
+  const items = (sprintItems || []).slice();
+  const sortByNewest = (a, b) =>
+    String(b.completed_at || b.added_at || '').localeCompare(String(a.completed_at || a.added_at || ''));
 
-  const sect = (icon, title, items, emptyMsg, showActions, collapsedByDefault = false) => {
-    const sectBodyId = `queue-sect-${title.replace(/\W/g,'').toLowerCase()}-${projectId.slice(0,6)}`;
-    const rows = items.length
-      ? items.map(t => {
-          const isSprintItem = t.kind === 'sprint_item';
-          const who = t.human_id || t.session_name || '';
-          const sessLine = '';
-          const tsSource = t.created_at || t.added_at || '';
-          const tsLine = tsSource
-            ? `<span class="queue-item-ts">${escapeHtml((who ? who + ' · ' : '') + formatRelativeTime(tsSource))}</span>` : '';
-          const eid = `queue-expand-${t.id.slice(0, 8)}`;
-          const expandMeta = isSprintItem
-            ? [
-                t.version ? `version: ${t.version}` : '',
-                t.item_group ? `group: ${t.item_group}` : '',
-                t.human_id ? `human: ${t.human_id}` : '',
-                t.depends_on ? `depends_on: ${t.depends_on}` : '',
-                t.added_at ? `added: ${t.added_at}` : '',
-                t.notes ? `notes: ${t.notes}` : '',
-              ].filter(Boolean).join(' · ')
-            : [
-                t.human_id     ? `human: ${t.human_id}` : '',
-                t.session_name ? `session: ${t.session_name}` : '',
-                t.claimed_by   ? `claimed_by: ${t.claimed_by_human_id || t.claimed_by_session_name || t.claimed_by}` : '',
-                t.created_at   ? `created: ${t.created_at}` : '',
-                t.claimed_at   ? `claimed: ${t.claimed_at}` : '',
-              ].filter(Boolean).join(' · ');
-          const actions = showActions ? `<div style="display:flex;gap:4px;margin-top:4px" onclick="event.stopPropagation()">
-            ${t.status === 'pending' ? `<button onclick="_queueAction('${escapeHtml(t.id)}','backlog')" style="background:none;border:1px solid var(--border);color:var(--muted);font-size:9px;padding:2px 6px;border-radius:3px;cursor:pointer;font-family:var(--font-mono)" title="Push to backlog">📦 backlog</button>` : ''}
-            ${t.status === 'pending' ? `<button onclick="_queueAction('${escapeHtml(t.id)}','done')" style="background:none;border:1px solid var(--status-done);color:var(--status-done);font-size:9px;padding:2px 6px;border-radius:3px;cursor:pointer;font-family:var(--font-mono)" title="Mark done">✓ done</button>` : ''}
-            <button onclick="_queueAction('${escapeHtml(t.id)}','delete')" style="background:none;border:1px solid var(--border);color:var(--status-failed);font-size:9px;padding:2px 6px;border-radius:3px;cursor:pointer;font-family:var(--font-mono)" title="Delete task">✕ delete</button>
-          </div>` : '';
-          const safeActions = isSprintItem ? '' : actions;
-          return `<div class="queue-item" style="cursor:pointer" onclick="toggleExpand('${eid}')">
-            ${escapeHtml((t.description || '').slice(0, 120))}${sessLine}${tsLine}
-            <span class="expand-arrow" style="font-size:9px;color:var(--muted);margin-left:4px">▶</span>
-            <div id="${eid}" style="display:none;margin-top:4px;font-size:10px;color:var(--muted);white-space:pre-wrap;word-break:break-word">${escapeHtml(t.description || '')}${expandMeta ? '\n' + escapeHtml(expandMeta) : ''}${safeActions}</div>
-          </div>`;
-        }).join('')
-      : `<div class="queue-empty">${emptyMsg}</div>`;
-    const headerStyle = collapsedByDefault ? 'cursor:pointer;user-select:none' : '';
-    const headerClick = collapsedByDefault ? `onclick="toggleExpand('${sectBodyId}')"` : '';
-    const chevron = collapsedByDefault ? `<span class="expand-arrow" style="font-size:9px;margin-left:4px">▶</span>` : '';
-    return `<div class="queue-section">` +
-      `<div class="queue-section-header" style="${headerStyle}" ${headerClick}>${icon} ${title} <span style="color:var(--accent)">(${items.length})</span>${chevron}</div>` +
-      (collapsedByDefault ? `<div id="${sectBodyId}" style="display:none">${rows}</div>` : rows) +
-      `</div>`;
+  const backburner = items
+    .filter(it => ['pushed', 'failed', 'skipped'].includes(it.status))
+    .sort(sortByNewest);
+  const pending = items
+    .filter(it => it.status === 'pending' || it.status === 'todo')
+    .sort(sortByNewest);
+  const inProgress = items
+    .filter(it => it.status === 'in_progress')
+    .sort(sortByNewest);
+  const doneAll = items
+    .filter(it => it.status === 'done')
+    .sort(sortByNewest);
+  const done = doneAll.slice(0, doneLimit);
+
+  const renderItem = (it) => {
+    const version = it.version ? `<span style="font-size:9px;color:var(--accent);background:var(--accent)1a;border:1px solid var(--accent)33;border-radius:999px;padding:1px 6px;font-family:var(--font-mono)">${escapeHtml(it.version)}</span>` : '';
+    const pushedTo = it.pushed_to ? `<span style="font-size:9px;color:var(--muted)">→ ${escapeHtml(it.pushed_to)}</span>` : '';
+    const tsSource = it.completed_at || it.added_at || '';
+    const meta = [
+      it.item_group ? `group: ${it.item_group}` : '',
+      it.human_id ? `human: ${it.human_id}` : '',
+      it.depends_on ? `depends_on: ${it.depends_on}` : '',
+      tsSource ? formatRelativeTime(tsSource) : '',
+    ].filter(Boolean).join(' · ');
+    const canAct = ['pending', 'todo', 'in_progress'].includes(it.status);
+    const actions = canAct ? `
+      <div style="display:flex;gap:4px;align-items:center;flex-shrink:0">
+        <button class="secondary" style="padding:1px 6px;font-size:9px" title="Mark done"
+          onclick="sprintAction('${escapeHtml(projectId)}','${escapeHtml(it.id)}','complete')">✓</button>
+        <button class="secondary" style="padding:1px 6px;font-size:9px" title="Skip"
+          onclick="sprintAction('${escapeHtml(projectId)}','${escapeHtml(it.id)}','skip')">—</button>
+        <button class="secondary" style="padding:1px 6px;font-size:9px" title="Fail"
+          onclick="sprintAction('${escapeHtml(projectId)}','${escapeHtml(it.id)}','fail')">✕</button>
+        <button class="secondary" style="padding:1px 6px;font-size:9px" title="Push to next version"
+          onclick="sprintPushPrompt('${escapeHtml(projectId)}','${escapeHtml(it.id)}')">→</button>
+      </div>` : '';
+    return `<div class="queue-item">
+      <div style="display:flex;justify-content:space-between;gap:8px;align-items:flex-start">
+        <div style="min-width:0;flex:1">
+          <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
+            ${version}
+            <span style="color:var(--text);font-weight:600;min-width:0;overflow:hidden;text-overflow:ellipsis">${escapeHtml(it.title || '')}</span>
+            ${pushedTo}
+          </div>
+          ${meta ? `<div class="queue-item-ts" style="margin-left:0;margin-top:3px">${escapeHtml(meta)}</div>` : ''}
+          ${it.notes ? `<div style="margin-top:4px;font-size:10px;color:var(--muted);white-space:pre-wrap;word-break:break-word">${escapeHtml(it.notes)}</div>` : ''}
+        </div>
+        ${actions}
+      </div>
+    </div>`;
   };
 
-  return (backburner.length ? sect('⏸', 'Backburner', backburner, '', true, true) : '') +
-         sect('⏳', 'Pending', pending, 'no pending tasks', true) +
-         sect('🔄', 'In Progress', inProg, 'nothing running', false) +
-         sect('✅', 'Recently Done', done, 'no completed tasks', true) +
-         (failed.length ? sect('❌', 'Failed', failed, '', true) : '') +
-         (backlog.length ? sect('📦', 'Backlog', backlog, '', true) : '') +
-         (future.length ? sect('🔮', 'Future', future, '', false) : '');
+  const section = (icon, title, rows, emptyMsg, opts = {}) => {
+    const openAttr = opts.collapsed ? '' : ' open';
+    const footer = opts.footer || '';
+    return `<details class="queue-section"${openAttr}>
+      <summary class="queue-section-header">${icon} ${title} <span style="color:var(--accent)">(${rows.length})</span></summary>
+      <div style="margin-top:8px">
+        ${rows.length ? rows.map(renderItem).join('') : `<div class="queue-empty">${emptyMsg}</div>`}
+        ${footer}
+      </div>
+    </details>`;
+  };
+
+  const doneFooter = doneAll.length > done.length
+    ? `<div style="padding-top:6px">
+        <button class="secondary" id="queue-done-more-${projectId}" style="padding:3px 10px;font-size:10px">
+          Load more (${done.length}/${doneAll.length})
+        </button>
+      </div>`
+    : '';
+
+  return [
+    section('⏸', 'Backburner', backburner, 'no backburner items', { collapsed: true }),
+    section('⏳', 'Pending', pending, 'no pending sprint items'),
+    section('🔄', 'In Progress', inProgress, 'nothing in progress'),
+    section('✅', 'Done', done, 'no completed sprint items', { footer: doneFooter }),
+  ].join('');
 }
 
 // Global queue action handler — called from inline onclick in renderQueue
@@ -5472,6 +5513,8 @@ function handleWsEvent(projectId, event) {
     return;
   }
   if (event.type === 'session_started') {
+    const panel = state.panels[projectId];
+    if (panel && panel.activeVtab === 'queue') loadQueue(projectId);
     scheduleLiveRefresh(projectId);
     return;
   }

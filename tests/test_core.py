@@ -1215,6 +1215,43 @@ async def test_archive_stale_sessions_leaves_recent_sessions(db):
     assert still_active["status"] == "active"
 
 
+@pytest.mark.asyncio
+async def test_archive_empty_sessions_marks_old_taskless_sessions(db):
+    """Old sessions with no task_log rows are archived during cleanup."""
+    p = await db_module.create_project(db, "alpha-empty")
+    s = await db_module.register_session(db, p["id"], "empty")
+    await db.execute(
+        "UPDATE sessions SET status = 'idle', created_at = datetime('now', '-8 days') WHERE id = ?",
+        (s["id"],),
+    )
+    await db.commit()
+
+    count = await db_module.archive_empty_sessions(db)
+    assert count >= 1
+
+    sessions = await db_module.get_sessions(db, p["id"], active_only=False)
+    archived = next(x for x in sessions if x["id"] == s["id"])
+    assert archived["status"] == "archived"
+
+
+@pytest.mark.asyncio
+async def test_archive_empty_sessions_keeps_sessions_with_tasks(db):
+    """Old sessions with task_log rows are not archived by empty-session cleanup."""
+    p = await db_module.create_project(db, "alpha-not-empty")
+    s = await db_module.register_session(db, p["id"], "worked")
+    await db_module.log_task(db, s["id"], p["id"], "did work", "done")
+    await db.execute(
+        "UPDATE sessions SET status = 'idle', created_at = datetime('now', '-8 days') WHERE id = ?",
+        (s["id"],),
+    )
+    await db.commit()
+
+    await db_module.archive_empty_sessions(db)
+    sessions = await db_module.get_sessions(db, p["id"], active_only=False)
+    kept = next(x for x in sessions if x["id"] == s["id"])
+    assert kept["status"] == "idle"
+
+
 @pytest.mark.skip(reason="chat_messages table dropped v1.9.x")
 def test_chat_history_endpoint_empty(client):
     """GET /projects/{id}/chat/history returns [] when no messages exist."""
@@ -2499,6 +2536,33 @@ def test_start_session_releases_stale_claims_older_than_two_hours(client):
     assert fresh is not None
     assert fresh["status"] == "pending"
     assert fresh["claimed_by"] is None
+
+
+def test_start_session_archives_old_empty_sessions(client):
+    """start_session runs empty-session cleanup before returning context."""
+    project = client.post("/projects", json={"name": "empty-cleanup"}).json()
+    stale = client.post(
+        "/sessions/register",
+        json={"project_id": project["id"], "name": "stale-empty"},
+    ).json()
+    db = client.app.state.db
+    asyncio.run(
+        db.execute(
+            "UPDATE sessions SET status = 'idle', created_at = datetime('now', '-8 days') WHERE id = ?",
+            (stale["id"],),
+        )
+    )
+    asyncio.run(db.commit())
+
+    r = client.post(
+        f"/projects/{project['id']}/start-session",
+        json={"session_name": "new-worker"},
+    )
+    assert r.status_code == 200
+
+    sessions = asyncio.run(db_module.get_sessions(db, project["id"], active_only=False))
+    refreshed = next(x for x in sessions if x["id"] == stale["id"])
+    assert refreshed["status"] == "archived"
 
 
 def test_claim_task_rejects_blocked_sprint_item_dependencies(client):
@@ -4365,7 +4429,7 @@ def test_timeline_tasks_newest_first(client):
 
 
 def test_work_queue_vtab_in_dashboard(client):
-    """Dashboard JS exposes a 'queue' vtab and loadQueue function (v1.4.0)."""
+    """Dashboard JS restores the 4-group sprint queue with paged done items."""
     js = client.get("/static/dashboard.js").text
     assert 'data-vtab="queue"' in js, (
         "v1.4.0: queue vtab button missing from buildTabBody"
@@ -4382,8 +4446,38 @@ def test_work_queue_vtab_in_dashboard(client):
     assert "/sprint-items" in js, (
         "queue should read sprint items so pending work reflects the sprint board"
     )
-    assert "RECENT_DONE_LIMIT = 25" in js, (
-        "recently done queue section should keep 25 items instead of 10"
+    assert "QUEUE_DONE_PAGE_SIZE = 10" in js, (
+        "done queue section should page sprint items 10 at a time"
+    )
+    assert "Backburner" in js and "Pending" in js and "In Progress" in js and "Done" in js, (
+        "queue should render the restored 4-group sprint board"
+    )
+    assert "queue-done-more-" in js, (
+        "done sprint items should expose a load-more control"
+    )
+    assert "Recent Sessions" in js, (
+        "queue should keep a recent sessions section below the sprint board"
+    )
+    assert "s.id !== panel.liveSessionId && s.status !== 'active'" in js, (
+        "live session should stay out of the Recent Sessions list"
+    )
+    assert 'start_session(project_id="' in js, (
+        "resume button should copy a start_session() snippet"
+    )
+
+
+def test_project_sidebar_active_state_in_dashboard(client):
+    """Selected projects keep a persistent active highlight in the sidebar."""
+    js = client.get("/static/dashboard.js").text
+    css = client.get("/static/dashboard.css").text
+    assert "syncSidebarActiveProject" in js, (
+        "dashboard.js should resync active sidebar state when tabs change"
+    )
+    assert "classList.toggle('active', item.dataset.projectId === state.activeTab)" in js, (
+        "sidebar project rows should toggle an active class for the selected project"
+    )
+    assert ".project-item.active" in css, (
+        "dashboard.css should style the active project state"
     )
 
 
@@ -5498,6 +5592,64 @@ def test_auth_callback_missing_code(client):
     assert "missing oauth code" in r.json().get("detail", "")
 
 
+@pytest.mark.asyncio
+async def test_post_login_redirect_launch_open_provisions_when_capacity_available(
+    db, monkeypatch
+):
+    from meridian import hosted as hosted_module
+
+    tenant = await db_module.upsert_tenant(db, "launch-free@example.com")
+    seen: dict[str, str] = {}
+
+    async def fake_provision(tenant_id, _db):
+        seen["tenant_id"] = tenant_id
+        await db_module.update_tenant(
+            _db,
+            tenant_id,
+            neon_project_id="neon-free-1",
+            neon_db_url="encrypted-url",
+        )
+        return await db_module.get_tenant_by_id(_db, tenant_id)
+
+    monkeypatch.setenv("MERIDIAN_LAUNCH_OPEN", "true")
+    monkeypatch.delenv("MERIDIAN_FREE_LAUNCH_CAP", raising=False)
+    monkeypatch.setattr(hosted_module, "provision_neon_db", fake_provision)
+
+    dest = await hosted_module._post_login_redirect(tenant, db)
+    assert dest == "/dashboard"
+    assert seen["tenant_id"] == tenant["id"]
+
+
+@pytest.mark.asyncio
+async def test_post_login_redirect_launch_open_waitlists_when_capacity_full(
+    db, monkeypatch
+):
+    from meridian import hosted as hosted_module
+
+    for i in range(15):
+        tenant = await db_module.upsert_tenant(db, f"filled-{i}@example.com")
+        await db_module.update_tenant(
+            db,
+            tenant["id"],
+            neon_project_id=f"neon-{i}",
+            neon_db_url=f"enc-{i}",
+        )
+    new_tenant = await db_module.upsert_tenant(db, "latecomer@example.com")
+
+    async def fail_if_called(*_args, **_kwargs):
+        raise AssertionError("provision_neon_db should not run when free launch is full")
+
+    monkeypatch.setenv("MERIDIAN_LAUNCH_OPEN", "true")
+    monkeypatch.delenv("MERIDIAN_FREE_LAUNCH_CAP", raising=False)
+    monkeypatch.setattr(hosted_module, "provision_neon_db", fail_if_called)
+
+    dest = await hosted_module._post_login_redirect(new_tenant, db)
+    assert dest == "/waitlist-pending?message=Early%20access%20is%20full"
+
+    waitlist = await db_module.get_waitlist(db)
+    assert any(row["email"] == "latecomer@example.com" for row in waitlist)
+
+
 def test_landing_page_has_pricing_section(client):
     """Landing page has pricing cards (Standard and Pro)."""
     r = client.get("/")
@@ -5521,6 +5673,22 @@ def test_landing_page_nav_has_docs_link(client):
     assert r.status_code == 200
     # Docs link should be present
     assert "Docs" in r.text
+
+
+def test_waitlist_pending_accepts_custom_capacity_message(client):
+    """/waitlist-pending can explain when launch capacity is full."""
+    r = client.get("/waitlist-pending?message=Early%20access%20is%20full")
+    assert r.status_code == 200
+    assert "Early access is full" in r.text
+
+
+def test_oauth_metadata_includes_meridian_branding(client):
+    """OAuth metadata advertises Meridian branding for connector UIs."""
+    r = client.get("/.well-known/oauth-authorization-server")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["client_name"] == "Meridian"
+    assert body["logo_uri"] == "https://usemeridian.us/static/logo.svg"
 
 
 def test_landing_page_cache_control(client):
