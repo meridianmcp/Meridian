@@ -12,7 +12,8 @@ your AI clients over HTTPS in minutes.
 
 | | Standard | Pro |
 |--|--|--|
-| **Price** | $20/mo | $49/mo (waitlist) |
+| **Price** | $20/mo | $49/mo |
+| **Status** | Live | Coming soon · [join waitlist](mailto:hello@usemeridian.us?subject=Pro%20waitlist) |
 | **Free tier** | 30 days, no card required | — |
 | **Neon project** | 1 per workspace | 1 per workspace |
 | **Max databases** | 10 | 50 |

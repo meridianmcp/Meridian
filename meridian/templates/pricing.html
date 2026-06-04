@@ -370,15 +370,8 @@
     <div class="plan-limits">
       Overage: $0.16/CU-hr · $0.50/GB-mo · auto-billed via Stripe
     </div>
-    {% if waitlist_mode %}
-    <form class="waitlist-form" data-plan="team" onsubmit="submitWaitlist(event, this)">
-      <input type="email" placeholder="your@email.com" required>
-      <button type="submit">Join waitlist →</button>
-    </form>
-    <div class="waitlist-msg"></div>
-    {% else %}
-    <a href="{{ team_link }}" class="plan-cta secondary">Get Team →</a>
-    {% endif %}
+    <a href="mailto:hello@usemeridian.us?subject=Pro%20waitlist" class="plan-cta secondary">Join waitlist →</a>
+    <div style="font-size:11px;color:var(--muted);margin-top:6px;text-align:center">Coming soon</div>
   </div>
 
 </div>

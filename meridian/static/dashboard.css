@@ -140,7 +140,7 @@ html, body {
   display: flex; flex-direction: column; overflow: hidden;
 }
 
-.drawer-panel { display: none; flex-direction: column; flex: 1; overflow: hidden; }
+.drawer-panel { display: none; flex-direction: column; flex: 1; overflow: hidden; min-height: 0; }
 .drawer-panel.active { display: flex; }
 .drawer-header {
   padding: 10px 14px; border-bottom: 1px solid var(--border);
@@ -517,7 +517,7 @@ input[type=text] {
   background: var(--surface-2); border: 1px solid var(--border);
   border-radius: 6px; padding: 12px 14px; min-height: 120px;
   color: var(--text); font-family: 'IBM Plex Sans', sans-serif;
-  line-height: 1.55; overflow-y: auto;
+  line-height: 1.55; overflow-y: auto; overflow-x: auto; word-break: break-word;
 }
 .goal-preview h1, .goal-preview h2, .goal-preview h3 {
   margin-top: 0.6em; color: var(--accent);
