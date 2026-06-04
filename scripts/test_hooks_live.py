@@ -31,9 +31,12 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 PROJECT_ID = "5787cc92-ba7d-4788-b17c-28ab7938b839"
 
 
-def post(url: str, data: dict, timeout: int = 15) -> tuple[int, str]:
+def post(url: str, data: dict, timeout: int = 15, token: str | None = None) -> tuple[int, str]:
     raw = json.dumps(data).encode()
-    req = urllib.request.Request(url, data=raw, headers={"Content-Type": "application/json"}, method="POST")
+    headers = {"Content-Type": "application/json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    req = urllib.request.Request(url, data=raw, headers=headers, method="POST")
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
             return r.status, r.read().decode()
@@ -53,6 +56,7 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--url", default="https://usemeridian.us")
     parser.add_argument("--project-id", default=PROJECT_ID)
+    parser.add_argument("--token", default="", help="Optional Bearer token for hosted hook checks")
     parser.add_argument("--skip-live", action="store_true", help="Skip live HTTP checks")
     args = parser.parse_args()
 
@@ -67,7 +71,11 @@ def main() -> int:
         print(f"  [{SKIP}] Live endpoint checks (--skip-live)")
     else:
         # 1. POST /hooks/session-start
-        code, body = post(f"{base}/hooks/session-start", {"project_id": pid, "session_name": "hook-test"})
+        code, body = post(
+            f"{base}/hooks/session-start",
+            {"project_id": pid, "session_name": "hook-test"},
+            token=args.token or None,
+        )
         try:
             resp = json.loads(body)
             has_context = (
@@ -83,7 +91,11 @@ def main() -> int:
             failures += 1
 
         # 2. POST /hooks/stop
-        code, body = post(f"{base}/hooks/stop", {"project_id": pid})
+        code, body = post(
+            f"{base}/hooks/stop",
+            {"project_id": pid},
+            token=args.token or None,
+        )
         ok = code == 200
         if not check("POST /hooks/stop -> 200", ok, f"got {code}"):
             failures += 1
@@ -103,6 +115,14 @@ def main() -> int:
         ok = has_session_start and has_stop
         if not check("hooks.sh contains SessionStart + Stop references", ok,
                      f"SessionStart={has_session_start}, Stop={has_stop}"):
+            failures += 1
+
+        ok = "--token" in content and "Authorization: Bearer" in content
+        if not check("hooks.sh supports optional Bearer token injection", ok):
+            failures += 1
+
+        ok = "[mcp_servers.meridian]" in content and "[hooks]" in content
+        if not check("hooks.sh writes Codex config.toml hook format", ok):
             failures += 1
 
         # Verify JSON structure that would be written is parseable
@@ -147,6 +167,18 @@ def main() -> int:
         # Verify it writes to ~/.claude/settings.json
         ok = "settings.json" in content
         if not check("hooks.ps1 targets ~/.claude/settings.json", ok):
+            failures += 1
+
+        ok = "Invoke-WebRequest" in content and "curl -s -X POST" not in content
+        if not check("hooks.ps1 uses Invoke-WebRequest hook commands", ok):
+            failures += 1
+
+        ok = "--token" in content and "Authorization = 'Bearer" in content
+        if not check("hooks.ps1 supports optional Bearer token injection", ok):
+            failures += 1
+
+        ok = "config.toml" in content and "[hooks]" in content and "[mcp_servers.meridian]" in content
+        if not check("hooks.ps1 writes Codex config.toml hook format", ok):
             failures += 1
 
     # ---- Claude Code expected hook JSON shape -----------------------------------

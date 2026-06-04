@@ -3942,8 +3942,35 @@ async def start_session_endpoint(
 
 
 # ---------------------------------------------------------------------------
-# Hooks — Claude Code / Codex session lifecycle endpoints (alpha, no auth)
+# Hooks - Claude Code / Codex session lifecycle endpoints
 # ---------------------------------------------------------------------------
+
+
+async def _resolve_hook_db(request: Request) -> Any:
+    """Resolve the DB for hook routes.
+
+    If the request carries an explicit Bearer token, always use that tenant and
+    fail fast on invalid tokens instead of silently falling back to the shared
+    auth/local DB. If no Bearer token is present, preserve the normal _db()
+    behavior so browser-session and self-hosted flows keep working unchanged.
+    """
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer "):
+        return await _db(request)
+
+    raw_token = auth_header[len("Bearer "):].strip()
+    if not raw_token:
+        raise HTTPException(status_code=401, detail="Bearer token required")
+
+    token_hash = hashlib.sha256(raw_token.encode()).hexdigest()
+    auth_db = request.app.state.db
+    tenant = await db_module.get_tenant_from_token_hash(auth_db, token_hash)
+    if tenant is None:
+        raise HTTPException(status_code=401, detail="invalid API token")
+
+    conn = await _open_tenant_db_by_id(request, tenant["id"])
+    request.state._db_conn = conn
+    return conn
 
 
 @app.post("/hooks/session-start")
@@ -3954,14 +3981,16 @@ async def hooks_session_start(body: dict[str, Any], request: Request) -> dict[st
     {hookSpecificOutput: {additionalContext: "..."}} so Claude Code injects
     the project context into the agent's initial context window automatically.
 
-    No auth required for alpha/localhost. Hosted tier adds token auth in beta.
+    Hosted callers can authenticate with Authorization: Bearer sk_meridian_...
+    to route directly to their tenant DB. Local/browser-session behavior is
+    unchanged when no Bearer token is supplied.
     """
     project_id = (body.get("project_id") or "").strip()
     if not project_id:
         from fastapi.responses import JSONResponse
         return JSONResponse(status_code=400, content={"error": "project_id required"})
     session_name = (body.get("session_name") or "hook-session").strip()
-    db = await _db(request)
+    db = await _resolve_hook_db(request)
     project = await db_module.get_project(db, project_id)
     if project is None:
         from fastapi.responses import JSONResponse
@@ -4000,13 +4029,15 @@ async def hooks_stop(body: dict[str, Any], request: Request) -> dict[str, Any]:
     and returns immediately. Fire-and-forget — the agent does not wait for
     this to complete before exiting.
 
-    No auth required for alpha/localhost. Hosted tier adds token auth in beta.
+    Hosted callers can authenticate with Authorization: Bearer sk_meridian_...
+    to route directly to their tenant DB. Local/browser-session behavior is
+    unchanged when no Bearer token is supplied.
     """
     project_id = (body.get("project_id") or "").strip()
     session_id = (body.get("session_id") or "").strip() or None
     if not project_id:
         return {"ok": False, "error": "project_id required"}
-    db = await _db(request)
+    db = await _resolve_hook_db(request)
     if session_id:
         try:
             await db_module.auto_capture_session(db, project_id, session_id)
