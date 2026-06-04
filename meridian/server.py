@@ -3492,6 +3492,88 @@ async def update_usage_caps(request: Request) -> dict[str, Any]:
     return {"status": "ok", "compute_cap": compute_cap, "storage_cap": storage_cap}
 
 
+# ---------------------------------------------------------------------------
+# GitHub integration endpoints (hosted-tier only)
+# ---------------------------------------------------------------------------
+
+@app.post("/projects/{project_id}/github/connect")
+async def github_connect(project_id: str, request: Request) -> dict[str, Any]:
+    """Validate a GitHub PAT and store it encrypted on the tenant."""
+    if not _hosted_mode():
+        raise HTTPException(status_code=404)
+    import httpx as _httpx
+    tenant = await _get_tenant_from_request(request)
+    if tenant is None:
+        raise HTTPException(status_code=401, detail="not authenticated")
+    body = await request.json()
+    pat = (body.get("pat") or "").strip()
+    repo = (body.get("repo") or "").strip()
+    branch = (body.get("branch") or "main").strip()
+    if not pat:
+        raise HTTPException(status_code=422, detail="pat is required")
+    if not repo or "/" not in repo:
+        raise HTTPException(status_code=422, detail="repo must be owner/repo format")
+    # Validate PAT against GitHub API
+    try:
+        async with _httpx.AsyncClient(timeout=10.0) as http:
+            r = await http.get(
+                "https://api.github.com/user",
+                headers={"Authorization": f"token {pat}", "Accept": "application/vnd.github+json"},
+            )
+        if r.status_code == 401:
+            raise HTTPException(status_code=422, detail="GitHub PAT is invalid or expired")
+        if r.status_code != 200:
+            raise HTTPException(status_code=422, detail=f"GitHub API error: {r.status_code}")
+        gh_user = r.json().get("login", "")
+    except _httpx.RequestError as exc:
+        raise HTTPException(status_code=502, detail=f"Could not reach GitHub: {exc}") from exc
+    await db_module.update_tenant(
+        request.app.state.db, tenant["id"],
+        github_pat=db_module.encrypt_field(pat),
+        github_repo=repo,
+        github_branch=branch,
+    )
+    return {"connected": True, "repo": repo, "branch": branch, "github_user": gh_user}
+
+
+@app.get("/projects/{project_id}/github/status")
+async def github_status(project_id: str, request: Request) -> dict[str, Any]:
+    """Return the tenant's current GitHub connection status."""
+    if not _hosted_mode():
+        raise HTTPException(status_code=404)
+    tenant = await _get_tenant_from_request(request)
+    if tenant is None:
+        raise HTTPException(status_code=401, detail="not authenticated")
+    # Re-fetch from auth DB to get latest values
+    fresh = await db_module.get_tenant_by_id(request.app.state.db, tenant["id"])
+    if not fresh:
+        raise HTTPException(status_code=404, detail="tenant not found")
+    connected = bool(fresh.get("github_pat"))
+    return {
+        "connected": connected,
+        "repo": fresh.get("github_repo") or "",
+        "branch": fresh.get("github_branch") or "main",
+        "last_verified": None,
+    }
+
+
+@app.delete("/projects/{project_id}/github/disconnect", status_code=200)
+async def github_disconnect(project_id: str, request: Request) -> dict[str, Any]:
+    """Clear the tenant's stored GitHub credentials."""
+    if not _hosted_mode():
+        raise HTTPException(status_code=404)
+    tenant = await _get_tenant_from_request(request)
+    if tenant is None:
+        raise HTTPException(status_code=401, detail="not authenticated")
+    await db_module.update_tenant(
+        request.app.state.db, tenant["id"],
+        github_pat=None,
+        github_repo=None,
+        github_branch=None,
+    )
+    return {"disconnected": True}
+
+
 @app.get("/mcp/quickstart", response_class=PlainTextResponse)
 async def mcp_quickstart() -> str:
     """One-page MCP quick reference — the 5 tools you use 90% of the time.
@@ -4580,7 +4662,9 @@ async def get_me(request: Request) -> dict[str, Any]:
         pass
     if tenant is None:
         tenant = await get_tenant_from_bearer(request)
-    return {k: v for k, v in tenant.items() if k not in ("neon_db_url",)}
+    safe = {k: v for k, v in tenant.items() if k not in ("neon_db_url", "github_pat")}
+    safe["github_connected"] = bool(tenant.get("github_pat"))
+    return safe
 
 
 # ---------------------------------------------------------------------------
@@ -4887,8 +4971,179 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "required": ["watching_session_id"]}},
 ]
 
+# ---------------------------------------------------------------------------
+# GitHub MCP tools — injected per-tenant when github_pat is set
+# ---------------------------------------------------------------------------
 
-async def _handle_mcp_request(body: dict[str, Any], db: Any, data_dir: str) -> dict[str, Any]:
+_GITHUB_TOOL_NAMES = frozenset({"read_file", "list_files", "search_code", "git_log", "get_commit"})
+
+
+def _github_tools_for_tenant(tenant: dict) -> list[dict[str, Any]]:
+    """Return the 5 GitHub tool defs if the tenant has a GitHub PAT set."""
+    if not db_module.decrypt_field(tenant.get("github_pat")):
+        return []
+    return [
+        {
+            "name": "read_file",
+            "description": "Read a file from the connected GitHub repository. Returns decoded UTF-8 content.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "File path relative to repo root (e.g. src/main.py)"},
+                    "ref": {"type": "string", "description": "Branch, tag, or commit SHA (default: configured branch)"},
+                },
+                "required": ["path"],
+            },
+        },
+        {
+            "name": "list_files",
+            "description": "List all files in the connected GitHub repository (recursive tree).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Subdirectory to list (default: repo root)"},
+                },
+            },
+        },
+        {
+            "name": "search_code",
+            "description": "Search code in the connected GitHub repository using GitHub code search.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Search query string (GitHub code search syntax)"},
+                },
+                "required": ["query"],
+            },
+        },
+        {
+            "name": "git_log",
+            "description": "Return recent commits from the connected GitHub repository.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "limit": {"type": "integer", "description": "Number of commits to return (default: 10, max: 50)"},
+                },
+            },
+        },
+        {
+            "name": "get_commit",
+            "description": "Return details for a specific commit from the connected GitHub repository.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "sha": {"type": "string", "description": "Full or short commit SHA"},
+                },
+                "required": ["sha"],
+            },
+        },
+    ]
+
+
+async def _dispatch_github_tool(name: str, args: dict[str, Any], tenant: dict) -> Any:
+    """Dispatch a GitHub MCP tool call using the tenant's stored PAT."""
+    import httpx as _httpx
+    import base64 as _b64
+    pat = db_module.decrypt_field(tenant.get("github_pat"))
+    repo = tenant.get("github_repo") or ""
+    branch = tenant.get("github_branch") or "main"
+    if not pat or not repo:
+        return {"error": "GitHub not connected — use POST /projects/{id}/github/connect"}
+    gh_headers = {"Authorization": f"token {pat}", "Accept": "application/vnd.github+json"}
+    async with _httpx.AsyncClient(timeout=15.0) as http:
+        if name == "read_file":
+            path = args.get("path", "")
+            ref = args.get("ref") or branch
+            r = await http.get(
+                f"https://api.github.com/repos/{repo}/contents/{path}",
+                headers=gh_headers,
+                params={"ref": ref},
+            )
+            if r.status_code == 404:
+                return {"error": f"File not found: {path}"}
+            r.raise_for_status()
+            data = r.json()
+            if isinstance(data, list):
+                return {"entries": [{"name": e["name"], "type": e["type"], "path": e["path"]} for e in data]}
+            content_b64 = data.get("content", "")
+            content = _b64.b64decode(content_b64).decode("utf-8", errors="replace")
+            return {"path": data["path"], "sha": data["sha"], "size": data["size"], "content": content}
+
+        if name == "list_files":
+            path = args.get("path") or ""
+            r = await http.get(
+                f"https://api.github.com/repos/{repo}/git/trees/HEAD",
+                headers=gh_headers,
+                params={"recursive": "1"},
+            )
+            r.raise_for_status()
+            tree = r.json().get("tree", [])
+            files = [e["path"] for e in tree if e.get("type") == "blob"]
+            if path:
+                files = [f for f in files if f.startswith(path)]
+            return {"repo": repo, "count": len(files), "files": files}
+
+        if name == "search_code":
+            query = args.get("query", "")
+            r = await http.get(
+                "https://api.github.com/search/code",
+                headers=gh_headers,
+                params={"q": f"{query} repo:{repo}"},
+            )
+            r.raise_for_status()
+            items = r.json().get("items", [])
+            return {
+                "total_count": r.json().get("total_count", 0),
+                "items": [{"path": i["path"], "sha": i["sha"], "url": i.get("html_url", "")} for i in items[:20]],
+            }
+
+        if name == "git_log":
+            limit = min(int(args.get("limit") or 10), 50)
+            r = await http.get(
+                f"https://api.github.com/repos/{repo}/commits",
+                headers=gh_headers,
+                params={"per_page": str(limit)},
+            )
+            r.raise_for_status()
+            commits = r.json()
+            return {
+                "commits": [
+                    {
+                        "sha": c["sha"][:12],
+                        "message": c["commit"]["message"].split("\n")[0],
+                        "author": c["commit"]["author"]["name"],
+                        "date": c["commit"]["author"]["date"],
+                    }
+                    for c in commits
+                ]
+            }
+
+        if name == "get_commit":
+            sha = args.get("sha", "")
+            r = await http.get(
+                f"https://api.github.com/repos/{repo}/commits/{sha}",
+                headers=gh_headers,
+            )
+            if r.status_code == 404:
+                return {"error": f"Commit not found: {sha}"}
+            r.raise_for_status()
+            c = r.json()
+            files = [{"filename": f["filename"], "status": f["status"], "additions": f.get("additions", 0), "deletions": f.get("deletions", 0)} for f in c.get("files", [])[:50]]
+            return {
+                "sha": c["sha"],
+                "message": c["commit"]["message"],
+                "author": c["commit"]["author"]["name"],
+                "date": c["commit"]["author"]["date"],
+                "files_changed": len(c.get("files", [])),
+                "files": files,
+            }
+
+    return {"error": f"Unknown GitHub tool: {name}"}
+
+
+async def _handle_mcp_request(
+    body: dict[str, Any], db: Any, data_dir: str, tenant: dict[str, Any] | None = None
+) -> dict[str, Any]:
     """Dispatch one JSON-RPC 2.0 MCP request and return the response dict."""
     req_id = body.get("id")
     method = body.get("method", "")
@@ -4905,13 +5160,19 @@ async def _handle_mcp_request(body: dict[str, Any], db: Any, data_dir: str) -> d
         return _jsonrpc_ok(req_id, {})
 
     if method == "tools/list":
-        return _jsonrpc_ok(req_id, {"tools": _MCP_TOOLS_LIST})
+        tools = list(_MCP_TOOLS_LIST)
+        if tenant:
+            tools = tools + _github_tools_for_tenant(tenant)
+        return _jsonrpc_ok(req_id, {"tools": tools})
 
     if method == "tools/call":
         name = params.get("name", "")
         args = params.get("arguments") or {}
         try:
-            result = await _dispatch_mcp_tool(name, args, db, data_dir)
+            if name in _GITHUB_TOOL_NAMES and tenant:
+                result = await _dispatch_github_tool(name, args, tenant)
+            else:
+                result = await _dispatch_mcp_tool(name, args, db, data_dir)
             return _jsonrpc_ok(req_id, {"content": [{"type": "text", "text": json.dumps(result)}]})
         except Exception as exc:
             return _jsonrpc_err(req_id, -32603, str(exc))
@@ -5714,9 +5975,12 @@ async def remote_mcp(request: Request) -> Any:
             except Exception:
                 pass  # fall back to auth DB — better than 500
         _mdd = request.app.state.data_dir
+        _oa_tenant = None
+        if _oa_tenant_id and _hosted_mode():
+            _oa_tenant = await db_module.get_tenant_by_id(request.app.state.db, _oa_tenant_id)
         if isinstance(_body, list):
-            return JSONResponse([await _handle_mcp_request(i, _mdb, _mdd) for i in _body])
-        return JSONResponse(await _handle_mcp_request(_body, _mdb, _mdd))
+            return JSONResponse([await _handle_mcp_request(i, _mdb, _mdd, tenant=_oa_tenant) for i in _body])
+        return JSONResponse(await _handle_mcp_request(_body, _mdb, _mdd, tenant=_oa_tenant))
 
     tenant = None
     if _bearer_hash:
@@ -5736,10 +6000,10 @@ async def remote_mcp(request: Request) -> Any:
     data_dir = _data_dir(request)
 
     if isinstance(body, list):
-        results = [await _handle_mcp_request(item, db, data_dir) for item in body]
+        results = [await _handle_mcp_request(item, db, data_dir, tenant=tenant) for item in body]
         return JSONResponse(results)
 
-    result = await _handle_mcp_request(body, db, data_dir)
+    result = await _handle_mcp_request(body, db, data_dir, tenant=tenant)
     return JSONResponse(result)
 
 

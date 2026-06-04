@@ -6809,3 +6809,265 @@ def test_notify_test_endpoint_delivers_ntfy_message_via_postgres(tmp_path, monke
         time.sleep(1)
 
     pytest.fail("Timed out waiting for ntfy.sh test notification")
+
+
+# ---------------------------------------------------------------------------
+# GitHub integration tests
+# ---------------------------------------------------------------------------
+
+
+def _github_client(tmp_path, monkeypatch):
+    """Return a TestClient with MERIDIAN_HOSTED=1 and an in-memory DB."""
+    import importlib
+
+    monkeypatch.setenv("MERIDIAN_DB", ":memory:")
+    monkeypatch.setenv("MERIDIAN_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("MERIDIAN_DB_URL", "")
+    monkeypatch.setenv("MERIDIAN_DEMO_DB_URL", "")
+    monkeypatch.setenv("MERIDIAN_SKIP_DEMO", "1")
+    monkeypatch.setenv("MERIDIAN_GOAL_MD", str(tmp_path / "GOAL.md"))
+    monkeypatch.setenv("MERIDIAN_HOSTED", "1")
+    from fastapi.testclient import TestClient
+
+    mod = importlib.reload(server_module)
+    return mod, TestClient(mod.app)
+
+
+def test_github_connect_validates_pat(tmp_path, monkeypatch):
+    """POST /projects/{id}/github/connect returns 422 when PAT is missing."""
+    import asyncio as _asyncio
+
+    mod, client = _github_client(tmp_path, monkeypatch)
+
+    with client:
+        async def _setup():
+            db = client.app.state.db
+            tenant = await db_module.upsert_tenant(db, "gh_connect@example.com")
+            raw, _ = await db_module.create_api_token(db, tenant["id"])
+            proj = await db_module.create_project(db, "gh-proj")
+            return raw, proj["id"]
+
+        token, pid = _asyncio.run(_setup())
+
+        # Missing PAT
+        r = client.post(
+            f"/projects/{pid}/github/connect",
+            json={"repo": "owner/repo"},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert r.status_code == 422
+
+        # Missing repo
+        r = client.post(
+            f"/projects/{pid}/github/connect",
+            json={"pat": "ghp_test"},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert r.status_code == 422
+
+        # Bad repo format (no slash)
+        r = client.post(
+            f"/projects/{pid}/github/connect",
+            json={"pat": "ghp_test", "repo": "noslash"},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert r.status_code == 422
+
+
+def test_github_connect_stores_and_status(tmp_path, monkeypatch):
+    """POST connect stores credentials; GET status returns connected=True."""
+    import asyncio as _asyncio
+
+    class _MockAsyncClient:
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *a):
+            pass
+        async def get(self, url, **kw):
+            class R:
+                status_code = 200
+                def json(self):
+                    return {"login": "testuser"}
+            return R()
+
+    monkeypatch.setattr("httpx.AsyncClient", lambda **kw: _MockAsyncClient())
+
+    mod, client = _github_client(tmp_path, monkeypatch)
+
+    with client:
+        async def _setup():
+            db = client.app.state.db
+            tenant = await db_module.upsert_tenant(db, "gh_status@example.com")
+            raw, _ = await db_module.create_api_token(db, tenant["id"])
+            proj = await db_module.create_project(db, "gh-status-proj")
+            return raw, proj["id"]
+
+        token, pid = _asyncio.run(_setup())
+
+        r = client.post(
+            f"/projects/{pid}/github/connect",
+            json={"pat": "ghp_testtoken123", "repo": "owner/myrepo", "branch": "develop"},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert r.status_code == 200
+        data = r.json()
+        assert data["connected"] is True
+        assert data["repo"] == "owner/myrepo"
+        assert data["branch"] == "develop"
+
+        r = client.get(
+            f"/projects/{pid}/github/status",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert r.status_code == 200
+        st = r.json()
+        assert st["connected"] is True
+        assert st["repo"] == "owner/myrepo"
+        assert st["branch"] == "develop"
+
+
+def test_github_disconnect_clears_credentials(tmp_path, monkeypatch):
+    """DELETE /disconnect clears github_pat; status returns connected=False."""
+    import asyncio as _asyncio
+
+    class _MockAsyncClient:
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *a):
+            pass
+        async def get(self, url, **kw):
+            class R:
+                status_code = 200
+                def json(self):
+                    return {"login": "u"}
+            return R()
+
+    monkeypatch.setattr("httpx.AsyncClient", lambda **kw: _MockAsyncClient())
+
+    mod, client = _github_client(tmp_path, monkeypatch)
+
+    with client:
+        async def _setup():
+            db = client.app.state.db
+            tenant = await db_module.upsert_tenant(db, "gh_disc@example.com")
+            raw, _ = await db_module.create_api_token(db, tenant["id"])
+            proj = await db_module.create_project(db, "gh-disc-proj")
+            return raw, proj["id"]
+
+        token, pid = _asyncio.run(_setup())
+
+        # Connect first
+        client.post(
+            f"/projects/{pid}/github/connect",
+            json={"pat": "ghp_test", "repo": "a/b"},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        # Verify connected
+        assert client.get(
+            f"/projects/{pid}/github/status",
+            headers={"Authorization": f"Bearer {token}"},
+        ).json()["connected"] is True
+
+        # Disconnect
+        r = client.delete(
+            f"/projects/{pid}/github/disconnect",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert r.status_code == 200
+        assert r.json()["disconnected"] is True
+
+        # Verify disconnected
+        st = client.get(
+            f"/projects/{pid}/github/status",
+            headers={"Authorization": f"Bearer {token}"},
+        ).json()
+        assert st["connected"] is False
+
+
+def test_mcp_tools_list_includes_github_tools_when_connected(tmp_path, monkeypatch):
+    """MCP tools/list returns 5 extra GitHub tools when tenant has github_pat."""
+    import asyncio as _asyncio
+
+    class _MockAsyncClient:
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *a):
+            pass
+        async def get(self, url, **kw):
+            class R:
+                status_code = 200
+                def json(self):
+                    return {"login": "u"}
+            return R()
+
+    monkeypatch.setattr("httpx.AsyncClient", lambda **kw: _MockAsyncClient())
+
+    mod, client = _github_client(tmp_path, monkeypatch)
+
+    with client:
+        async def _setup():
+            db = client.app.state.db
+            tenant = await db_module.upsert_tenant(db, "gh_tools@example.com")
+            raw, _ = await db_module.create_api_token(db, tenant["id"])
+            proj = await db_module.create_project(db, "gh-tools-proj")
+            return raw, proj["id"]
+
+        token, pid = _asyncio.run(_setup())
+
+        # Before connecting: GitHub tools absent
+        r = client.post(
+            "/mcp",
+            json={"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert r.status_code == 200
+        tool_names_before = {t["name"] for t in r.json()["result"]["tools"]}
+        assert "read_file" not in tool_names_before
+        assert "git_log" not in tool_names_before
+
+        # Connect GitHub
+        client.post(
+            f"/projects/{pid}/github/connect",
+            json={"pat": "ghp_test", "repo": "a/b"},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+
+        # After connecting: GitHub tools present
+        r = client.post(
+            "/mcp",
+            json={"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert r.status_code == 200
+        tool_names_after = {t["name"] for t in r.json()["result"]["tools"]}
+        assert "read_file" in tool_names_after
+        assert "list_files" in tool_names_after
+        assert "search_code" in tool_names_after
+        assert "git_log" in tool_names_after
+        assert "get_commit" in tool_names_after
+
+
+def test_mcp_tools_list_no_github_tools_when_disconnected(tmp_path, monkeypatch):
+    """MCP tools/list omits GitHub tools when tenant has no github_pat."""
+    import asyncio as _asyncio
+
+    mod, client = _github_client(tmp_path, monkeypatch)
+
+    with client:
+        async def _setup():
+            db = client.app.state.db
+            tenant = await db_module.upsert_tenant(db, "gh_notools@example.com")
+            raw, _ = await db_module.create_api_token(db, tenant["id"])
+            return raw
+
+        token = _asyncio.run(_setup())
+
+        r = client.post(
+            "/mcp",
+            json={"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert r.status_code == 200
+        tool_names = {t["name"] for t in r.json()["result"]["tools"]}
+        assert "read_file" not in tool_names
+        assert "git_log" not in tool_names

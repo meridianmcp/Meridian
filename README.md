@@ -146,6 +146,8 @@ Get your API key at [usemeridian.us/settings](https://usemeridian.us/settings) a
   swimlane timeline, HITL queue, pinned decisions.
 - **MCP tools** — `start_session`, `log_task`, `claim_task`, `set_decision`,
   `pin_decision`, `request_hitl`, `generate_handoff`, plus 10 more.
+- **GitHub hub** (hosted) — connect your repo once in Settings; sessions get `read_file`,
+  `list_files`, `search_code`, `git_log`, `get_commit` injected automatically. No extra install.
 - **Tiered handoffs** — L0/L1/L2 compression so a fresh session can resume in seconds.
 - **Webhook intake** — push events from LangGraph / Autogen / custom agents into the same dashboard.
 - **Works everywhere** — Claude Code, Claude Desktop, Cursor, Windsurf, LangGraph, custom.

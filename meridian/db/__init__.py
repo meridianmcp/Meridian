@@ -723,6 +723,18 @@ async def _migrate_ntfy_notifications(db: aiosqlite.Connection) -> None:
     await _migrate_add_column_if_missing(db, "projects", "ntfy_url", "TEXT")
 
 
+async def _migrate_github_integration(db: aiosqlite.Connection) -> None:
+    """v3.1 — per-tenant GitHub PAT and repo for the GitHub MCP tools.
+
+    github_pat stores the encrypted personal access token.
+    github_repo stores owner/repo (e.g. "acme/myapp").
+    github_branch stores the default branch (default: "main").
+    """
+    await _migrate_add_column_if_missing(db, "tenants", "github_pat", "TEXT")
+    await _migrate_add_column_if_missing(db, "tenants", "github_repo", "TEXT")
+    await _migrate_add_column_if_missing(db, "tenants", "github_branch", "TEXT")
+
+
 async def _migrate_sprint_item_dependencies(db: aiosqlite.Connection) -> None:
     """v2.6 — sprint_items dependency tracking.
 
@@ -1284,6 +1296,7 @@ async def _migrate_hosted_tables(db: aiosqlite.Connection) -> None:
     await _migrate_add_column_if_missing(db, "tenants", "pool_project_id", "TEXT")
     await _migrate_add_column_if_missing(db, "tenants", "microsoft_sub", "TEXT")
     await _migrate_add_column_if_missing(db, "tenants", "stripe_metered_item_id", "TEXT")
+    await _migrate_github_integration(db)
     await db.commit()
 
 
@@ -1425,6 +1438,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_file_locks(db)
     await _migrate_milestone_type(db)
     await _migrate_ntfy_notifications(db)
+    await _migrate_github_integration(db)
     return db
 
 
@@ -4372,6 +4386,7 @@ async def update_tenant(
         "compute_cu_hours_used", "storage_gb_used",
         "overage_reset_at", "compute_throttled_at",
         "trial_started_at", "inactivity_expires_at",
+        "github_pat", "github_repo", "github_branch",
     }
     updates = {k: v for k, v in fields.items() if k in allowed}
     if not updates:
