@@ -5636,6 +5636,15 @@ async def _ensure_oauth_token_table(db: Any) -> None:
             created_at TEXT NOT NULL DEFAULT (datetime('now'))
         )"""
     )
+    await db.execute(
+        """CREATE TABLE IF NOT EXISTS oauth_clients (
+            client_id TEXT PRIMARY KEY,
+            client_secret TEXT NOT NULL,
+            redirect_uris TEXT NOT NULL DEFAULT '[]',
+            client_name TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )"""
+    )
     await db.commit()
 
 
@@ -5696,10 +5705,24 @@ async def _load_oauth_tokens_from_db(db: Any) -> dict[str, dict[str, Any]]:
 
 
 async def _hydrate_oauth_cache(auth_db: Any) -> None:
-    global _oa_tokens
+    global _oa_tokens, _oa_clients
 
     await _ensure_oauth_token_table(auth_db)
     _oa_tokens = await _load_oauth_tokens_from_db(auth_db)
+    # Load persisted OAuth client registrations (DCR)
+    try:
+        import json as _json
+        async with auth_db.execute("SELECT client_id, client_secret, redirect_uris FROM oauth_clients") as cur:
+            rows = await cur.fetchall()
+        for row in rows:
+            _oa_clients[row["client_id"]] = {
+                "secret": row["client_secret"],
+                "redirect_uris": _json.loads(row["redirect_uris"] or "[]")
+            }
+        if rows:
+            print(f"[oauth] loaded {len(rows)} persisted client registrations")
+    except Exception:
+        pass
 
     if _hosted_mode():
         return
@@ -5742,9 +5765,22 @@ async def _oauth_meta(request: Request):
 async def _oauth_reg(request: Request):
     d = await request.json()
     cid, cs = _sec.token_urlsafe(16), _sec.token_urlsafe(32)
-    _oa_clients[cid] = {"secret": cs, "redirect_uris": d.get("redirect_uris", [])}
+    redirect_uris = d.get("redirect_uris", [])
+    client_name = d.get("client_name", "")
+    _oa_clients[cid] = {"secret": cs, "redirect_uris": redirect_uris}
+    # Persist to DB so registrations survive restarts
+    try:
+        import json as _json
+        auth_db = request.app.state.db
+        await auth_db.execute(
+            "INSERT OR REPLACE INTO oauth_clients (client_id, client_secret, redirect_uris, client_name) VALUES (?, ?, ?, ?)",
+            (cid, cs, _json.dumps(redirect_uris), client_name)
+        )
+        await auth_db.commit()
+    except Exception:
+        pass  # in-memory fallback still works
     return JSONResponse({"client_id": cid, "client_secret": cs,
-        "redirect_uris": d.get("redirect_uris", []),
+        "redirect_uris": redirect_uris,
         "grant_types": ["authorization_code"],
         "token_endpoint_auth_method": "client_secret_post"}, status_code=201)
 
