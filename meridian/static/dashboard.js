@@ -1850,9 +1850,9 @@ function renderSprintProgress(projectId, items) {
       const feedbackHtml = it.status === 'done'
         ? `<span class="sprint-item-feedback" style="display:inline-flex;align-items:center;gap:4px;font-size:11px;margin-left:4px">
              <button title="Good" style="background:none;border:none;cursor:pointer;padding:0 2px;${thumbUp}"
-               onclick="sprintFeedback('${escapeHtml(projectId)}','${escapeHtml(it.id)}',1,event)">👍</button>
+               onclick="sprintFeedback('${escapeHtml(projectId)}','${escapeHtml(it.id)}',1,${it.feedback_thumb == null ? 'null' : it.feedback_thumb},event)">👍</button>
              <button title="Needs rework" style="background:none;border:none;cursor:pointer;padding:0 2px;${thumbDn}"
-               onclick="sprintFeedback('${escapeHtml(projectId)}','${escapeHtml(it.id)}',-1,event)">👎</button>
+               onclick="sprintFeedback('${escapeHtml(projectId)}','${escapeHtml(it.id)}',-1,${it.feedback_thumb == null ? 'null' : it.feedback_thumb},event)">👎</button>
              ${it.feedback_note
                ? `<span style="color:var(--muted);font-size:10px;max-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${escapeHtml(it.feedback_note)}">${escapeHtml(it.feedback_note)}</span>`
                : `<input style="background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:9px;font-family:var(--font-mono);padding:1px 4px;width:80px" placeholder="note…"
@@ -1955,11 +1955,12 @@ async function sprintPushPrompt(projectId, itemId) {
   } catch(e) { toast(`Push failed: ${e.message}`, true); }
 }
 
-async function sprintFeedback(projectId, itemId, thumb, event) {
+async function sprintFeedback(projectId, itemId, thumb, currentThumb, event) {
   event && event.stopPropagation();
+  const newThumb = currentThumb === thumb ? null : thumb;
   try {
     await api(`/projects/${projectId}/sprint-items/${itemId}`,
-      { method: 'PATCH', body: JSON.stringify({ feedback_thumb: thumb }) });
+      { method: 'PATCH', body: JSON.stringify({ feedback_thumb: newThumb }) });
     await refreshLiveTab(projectId);
   } catch(e) { toast('Feedback failed: ' + e.message, true); }
 }
@@ -2448,12 +2449,7 @@ async function loadTimeline(projectId) {
   }
   renderTimeline(projectId, data);
   const axisBtn = document.getElementById(`timeline-axis-${projectId}`);
-  if (axisBtn) axisBtn.onclick = () => {
-    const p = state.panels[projectId];
-    p._timelineAbsolute = !p._timelineAbsolute;
-    axisBtn.textContent = p._timelineAbsolute ? 'absolute' : 'relative';
-    renderTimeline(projectId, data);
-  };
+  if (axisBtn) axisBtn.style.display = 'none';
   const refreshBtn = document.getElementById(`timeline-refresh-${projectId}`);
   if (refreshBtn) refreshBtn.onclick = () => loadTimeline(projectId);
 }
@@ -2468,215 +2464,201 @@ function renderTimeline(projectId, data) {
     return;
   }
 
-  // Destroy any previous vis instance to avoid duplicate timelines
   const p = state.panels[projectId];
-  if (p && p._visTimeline) {
-    try { p._visTimeline.destroy(); } catch (_) {}
-    p._visTimeline = null;
+  if (p && p._echart) {
+    try { p._echart.dispose(); } catch (_) {}
+    p._echart = null;
   }
 
-  // Fall back to log view if vis-timeline not loaded
-  if (typeof vis === 'undefined' || !vis.Timeline) {
+  if (typeof echarts === 'undefined') {
     _renderTimelineLog(projectId, data);
     return;
   }
 
-  // Parse SQLite timestamp ("YYYY-MM-DD HH:MM:SS") as UTC Date
   const parseTs = ts => {
     if (!ts) return null;
-    try {
-      return new Date(ts.includes('T') ? ts : ts.replace(' ', 'T') + 'Z');
-    } catch (_) { return null; }
+    try { return new Date(ts.includes('T') ? ts : ts.replace(' ', 'T') + 'Z'); } catch (_) { return null; }
   };
 
-  // Build groups — one per unique session name; plus a "goal" row
   const sessionNames = [...new Set(tasks.map(t => t.session_name || '(unknown)'))];
-  const groupsArr = sessionNames.map((name, i) => ({
-    id: `s:${name}`,
-    content: `<span style="font-family:var(--font-mono);font-size:10px;color:var(--muted)">${escapeHtml(name.slice(0, 24))}</span>`,
-  }));
-  if (goal_events.length) {
-    groupsArr.push({
-      id: 'goal',
-      content: `<span style="font-family:var(--font-mono);font-size:10px;color:var(--accent)">goal</span>`,
-    });
-  }
+  const yCategories = [...sessionNames, 'goal'];
 
-  // Precompute per-session stats for rich item tooltips
-  const sessionStats = new Map();
+  const STATUS_COLOR = { done: '#34d399', failed: '#f87171', in_progress: '#6c8fff', pending: '#9ca3af' };
+
+  const byStatus = {};
   tasks.forEach(t => {
-    const key = t.session_name || '(unknown)';
-    if (!sessionStats.has(key)) sessionStats.set(key, { count: 0, minDate: null, maxDate: null });
-    const s = sessionStats.get(key);
-    s.count++;
     const d = parseTs(t.created_at);
-    if (d) {
-      if (!s.minDate || d < s.minDate) s.minDate = d;
-      if (!s.maxDate || d > s.maxDate) s.maxDate = d;
-    }
-  });
-
-  // Build task items
-  const items = [];
-  let itemId = 1;
-  tasks.forEach(t => {
-    const start = parseTs(t.created_at);
-    if (!start) return;
-    const isDone = t.status === 'done';
-    const bg = isDone ? '#34d39922' : '#f871711a';
-    const border = isDone ? '#34d399' : '#f87171';
-    const label = `${isDone ? '✓' : '✗'} ${(t.description || '').slice(0, 60)}`;
-    const stats = sessionStats.get(t.session_name || '(unknown)') || {};
-    const dateRange = stats.minDate && stats.maxDate
-      ? `${stats.minDate.toISOString().slice(0,10)} → ${stats.maxDate.toISOString().slice(0,10)}`
-      : '';
-    const tooltip = `Session: ${t.session_name || '(unknown)'}\nStatus: ${t.status || '?'}\nSession tasks: ${stats.count || 1}\nActivity: ${dateRange}\n\n${(t.description || '').slice(0, 200)}`;
-    items.push({
-      id: itemId++,
-      group: `s:${t.session_name || '(unknown)'}`,
-      // Single text layer: display:block forces the span to fill the item width so
-      // overflow:hidden + text-overflow:ellipsis clip at the item boundary instead
-      // of spilling over adjacent items.
-      content: `<span style="font-size:9px;font-family:var(--font-mono);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;display:block;line-height:1.4">${escapeHtml(label)}</span>`,
-      title: tooltip,
-      start,
-      style: `background:${bg};border-color:${border};color:var(--text);border-radius:3px;padding:1px 4px;overflow:hidden`,
+    if (!d) return;
+    const st = t.status || 'pending';
+    if (!byStatus[st]) byStatus[st] = [];
+    byStatus[st].push({
+      value: [d.getTime(), t.session_name || '(unknown)'],
+      desc: (t.description || '').slice(0, 120),
+      sess: t.session_name || '(unknown)',
+      ts: t.created_at,
+      status: st,
     });
   });
 
-  // Collapse goal events — one per field per hour
-  const goalByField = new Map();
+  const series = Object.entries(byStatus).map(([st, pts]) => ({
+    name: st,
+    type: 'scatter',
+    symbol: 'rect',
+    symbolSize: [36, 10],
+    itemStyle: { color: STATUS_COLOR[st] || '#6b7280', opacity: 0.85 },
+    emphasis: { scale: 1.4, itemStyle: { opacity: 1 } },
+    data: pts,
+  }));
+
+  const goalByKey = new Map();
   goal_events.forEach(g => {
     if (g.field === 'version_goal') {
-      const summary = (g.new_summary || '');
-      if (summary.startsWith('[AUTO SUMMARY') || summary.startsWith('- [DONE]') || summary.startsWith('- [PENDING]')) return;
+      const s = g.new_summary || '';
+      if (s.startsWith('[AUTO SUMMARY') || s.startsWith('- [DONE]') || s.startsWith('- [PENDING]')) return;
     }
     const key = g.field + (g.updated_at || '').slice(0, 13);
-    if (!goalByField.has(key) || g.version > (goalByField.get(key).version || 0)) {
-      goalByField.set(key, g);
-    }
-  });
-  const _goalFieldColor = {
-    sprint_updated_at: '#6c8fff', ns_updated_at: '#fbbf24', content_updated_at: '#a78bfa',
-  };
-  const _goalFieldShort = {
-    sprint_updated_at: 'sprint', ns_updated_at: 'N★', content_updated_at: 'goal',
-  };
-  goalByField.forEach(g => {
-    const start = parseTs(g.updated_at);
-    if (!start) return;
-    const mc  = _goalFieldColor[g.field] || '#a78bfa';
-    const lbl = _goalFieldShort[g.field] || g.field.replace('_updated_at','').replace('_',' ');
-    items.push({
-      id: itemId++,
-      group: 'goal',
-      content: `<span style="font-size:9px;font-family:var(--font-mono);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;display:block;line-height:1.4">${escapeHtml(lbl)} v${g.version}</span>`,
-      title: `${escapeHtml(g.field)} v${g.version}`,
-      start,
-      style: `background:${mc}22;border-color:${mc};color:var(--text);border-radius:3px;padding:1px 4px;overflow:hidden`,
-    });
+    if (!goalByKey.has(key) || g.version > (goalByKey.get(key).version || 0)) goalByKey.set(key, g);
   });
 
-  // Create vis container
+  const GOAL_COLOR = { sprint_updated_at: '#6c8fff', ns_updated_at: '#fbbf24', content_updated_at: '#a78bfa' };
+  const goalPts = [];
+  const markLineData = [];
+  goalByKey.forEach(g => {
+    const d = parseTs(g.updated_at);
+    if (!d) return;
+    const color = GOAL_COLOR[g.field] || '#a78bfa';
+    const lbl = g.field.replace('_updated_at', '').replace('_', ' ');
+    const ms = d.getTime();
+    goalPts.push({ value: [ms, 'goal'], field: lbl, version: g.version, ts: g.updated_at, itemStyle: { color } });
+    markLineData.push({ xAxis: ms, lineStyle: { color, type: 'dashed', width: 1, opacity: 0.5 }, label: { show: false } });
+  });
+
+  if (goalPts.length) {
+    series.push({
+      name: 'goal',
+      type: 'scatter',
+      symbol: 'diamond',
+      symbolSize: 9,
+      data: goalPts,
+      markLine: { silent: true, symbol: 'none', data: markLineData },
+    });
+  }
+
   wrap.innerHTML = '';
   const container = document.createElement('div');
-  container.style.cssText = 'height:100%;min-height:300px;background:transparent';
+  container.style.cssText = 'width:100%;height:100%;min-height:300px';
   wrap.appendChild(container);
 
-  const options = {
-    stack: false,
-    orientation: 'top',
-    showCurrentTime: false,
-    zoomable: true,
-    moveable: true,
-    selectable: false,
-    groupOrder: 'id',
-    margin: { item: { horizontal: 2, vertical: 2 } },
-    locale: 'en',
-    xss: { disabled: true },
+  const chart = echarts.init(container, null, { renderer: 'canvas' });
+
+  chart.setOption({
+    backgroundColor: 'transparent',
+    animation: false,
+    tooltip: {
+      trigger: 'item',
+      backgroundColor: '#0d1b2e',
+      borderColor: '#1e3a5f',
+      textStyle: { color: '#c7d5ef', fontSize: 11, fontFamily: 'IBM Plex Mono' },
+      formatter: params => {
+        const d = params.data;
+        if (d.field) return `<b>${escapeHtml(d.field)}</b> v${d.version}<br><span style="color:#8b9cba;font-size:9px">${escapeHtml(d.ts || '')}</span>`;
+        return `<b>${escapeHtml(d.sess)}</b><br><span style="color:${STATUS_COLOR[d.status] || '#9ca3af'}">${escapeHtml(d.status)}</span> · <span style="color:#8b9cba;font-size:9px">${escapeHtml(d.ts || '')}</span><br><span style="color:#c7d5ef">${escapeHtml(d.desc)}</span>`;
+      },
+    },
+    legend: {
+      top: 0, right: 0,
+      textStyle: { color: '#8b9cba', fontSize: 10, fontFamily: 'IBM Plex Mono' },
+      itemWidth: 10, itemHeight: 8,
+    },
+    grid: { top: 26, right: 12, bottom: 26, left: 8, containLabel: true },
+    xAxis: {
+      type: 'time',
+      axisLabel: { color: '#8b9cba', fontFamily: 'IBM Plex Mono', fontSize: 9, hideOverlap: true },
+      splitLine: { lineStyle: { color: '#1e2d4a' } },
+      axisLine: { lineStyle: { color: '#1e2d4a' } },
+    },
+    yAxis: {
+      type: 'category',
+      data: yCategories,
+      inverse: true,
+      axisLabel: {
+        color: '#8b9cba', fontFamily: 'IBM Plex Mono', fontSize: 9,
+        formatter: v => v.length > 22 ? v.slice(0, 21) + '…' : v,
+        width: 148, overflow: 'truncate',
+      },
+      splitLine: { lineStyle: { color: '#1e2d4a55' } },
+      axisLine: { lineStyle: { color: '#1e2d4a' } },
+    },
+    series,
+    dataZoom: [{ type: 'inside', xAxisIndex: 0 }],
+  });
+
+  if (p) p._echart = chart;
+
+  const tlRangeKey = `meridian_tl_range_${projectId}`;
+  const fromInput = document.getElementById(`timeline-from-${projectId}`);
+  const toInput   = document.getElementById(`timeline-to-${projectId}`);
+  const errEl     = document.getElementById(`timeline-range-err-${projectId}`);
+
+  const setZoom = (from, to) => {
+    if (from || to) {
+      try { chart.dispatchAction({ type: 'dataZoom', dataZoomIndex: 0, startValue: from ? from.getTime() : undefined, endValue: to ? to.getTime() : undefined }); } catch (_) {}
+    } else {
+      try { chart.dispatchAction({ type: 'dataZoom', dataZoomIndex: 0, start: 0, end: 100 }); } catch (_) {}
+    }
   };
 
-  try {
-    const groups = new vis.DataSet(groupsArr);
-    const itemsDs = new vis.DataSet(items);
-    const timeline = new vis.Timeline(container, itemsDs, groups, options);
-
-    // Dark-mode style overrides for vis elements
-    const styleId = `vis-dark-${projectId}`;
-    if (!document.getElementById(styleId)) {
-      const s = document.createElement('style');
-      s.id = styleId;
-      s.textContent = `.vis-timeline{background:transparent;border-color:var(--border)!important}.vis-time-axis .vis-text{color:var(--muted)!important;font-family:var(--font-mono);font-size:10px}.vis-label{background:var(--surface)!important;border-color:var(--border)!important}.vis-panel.vis-center{border-color:var(--border)!important}.vis-panel.vis-left{border-color:var(--border)!important}.vis-item{border-width:1px;overflow:hidden!important}.vis-item-content{overflow:hidden!important;max-width:100%!important;display:block!important}.vis-item-overflow{overflow:hidden!important}`;
-      document.head.appendChild(s);
+  const applyRange = () => {
+    const fv = fromInput ? fromInput.value : '';
+    const tv = toInput ? toInput.value : '';
+    const from = fv ? new Date(fv) : null;
+    const to   = tv ? new Date(tv + 'T23:59:59Z') : null;
+    if (from && to && from >= to) {
+      if (errEl) { errEl.textContent = 'From must be before To'; errEl.style.display = ''; }
+      return;
     }
+    if (errEl) errEl.style.display = 'none';
+    try {
+      if (fv || tv) { localStorage.setItem(tlRangeKey, JSON.stringify({ from: fv, to: tv })); }
+      else          { localStorage.removeItem(tlRangeKey); }
+    } catch (_) {}
+    setZoom(from, to);
+  };
 
-    if (p) p._visTimeline = timeline;
-
-    // Wire date range picker
-    const tlRangeKey = `meridian_tl_range_${projectId}`;
-    const fromInput = document.getElementById(`timeline-from-${projectId}`);
-    const toInput   = document.getElementById(`timeline-to-${projectId}`);
-    const errEl     = document.getElementById(`timeline-range-err-${projectId}`);
-
-    const applyRange = () => {
-      const fv = fromInput ? fromInput.value : '';
-      const tv = toInput ? toInput.value : '';
-      const from = fv ? new Date(fv) : null;
-      const to   = tv ? new Date(tv + 'T23:59:59Z') : null;
-      if (from && to && from >= to) {
-        if (errEl) { errEl.textContent = 'From must be before To'; errEl.style.display = ''; }
-        return;
-      }
-      if (errEl) errEl.style.display = 'none';
-      if (from && to) {
-        try { localStorage.setItem(tlRangeKey, JSON.stringify({ from: fv, to: tv })); } catch (_) {}
-        try { timeline.setWindow(from, to); } catch (_) {}
-      } else {
-        try { localStorage.removeItem(tlRangeKey); } catch (_) {}
-        try { timeline.fit(); } catch (_) {}
-      }
-    };
-
-    // Restore saved range
-    const savedRange = (() => { try { return JSON.parse(localStorage.getItem(tlRangeKey) || 'null'); } catch (_) { return null; } })();
-    if (savedRange && fromInput && toInput) {
-      fromInput.value = savedRange.from || '';
-      toInput.value   = savedRange.to   || '';
-      if (savedRange.from && savedRange.to) {
-        try { timeline.setWindow(new Date(savedRange.from), new Date(savedRange.to + 'T23:59:59Z')); } catch (_) {}
-      }
-    }
-
-    if (fromInput) fromInput.addEventListener('change', applyRange);
-    if (toInput)   toInput.addEventListener('change',   applyRange);
-
-    const nowD = new Date();
-    const todayStr = nowD.toISOString().slice(0, 10);
-    const r7Btn  = document.getElementById(`timeline-r7d-${projectId}`);
-    const r30Btn = document.getElementById(`timeline-r30d-${projectId}`);
-    const rAllBtn = document.getElementById(`timeline-rall-${projectId}`);
-    if (r7Btn) r7Btn.onclick = () => {
-      if (fromInput) fromInput.value = new Date(nowD - 7 * 86400000).toISOString().slice(0, 10);
-      if (toInput) toInput.value = todayStr;
-      applyRange();
-    };
-    if (r30Btn) r30Btn.onclick = () => {
-      if (fromInput) fromInput.value = new Date(nowD - 30 * 86400000).toISOString().slice(0, 10);
-      if (toInput) toInput.value = todayStr;
-      applyRange();
-    };
-    if (rAllBtn) rAllBtn.onclick = () => {
-      if (fromInput) fromInput.value = '';
-      if (toInput)   toInput.value   = '';
-      if (errEl) errEl.style.display = 'none';
-      try { localStorage.removeItem(tlRangeKey); } catch (_) {}
-      try { timeline.fit(); } catch (_) {}
-    };
-
-  } catch (err) {
-    console.warn('vis-timeline init failed, falling back to log:', err);
-    _renderTimelineLog(projectId, data);
+  const savedRange = (() => { try { return JSON.parse(localStorage.getItem(tlRangeKey) || 'null'); } catch (_) { return null; } })();
+  if (savedRange && fromInput && toInput) {
+    fromInput.value = savedRange.from || '';
+    toInput.value   = savedRange.to   || '';
+    if (savedRange.from && savedRange.to) setZoom(new Date(savedRange.from), new Date(savedRange.to + 'T23:59:59Z'));
   }
+
+  if (fromInput) fromInput.addEventListener('change', applyRange);
+  if (toInput)   toInput.addEventListener('change',   applyRange);
+
+  const nowD = new Date();
+  const todayStr = nowD.toISOString().slice(0, 10);
+  const r7Btn  = document.getElementById(`timeline-r7d-${projectId}`);
+  const r30Btn = document.getElementById(`timeline-r30d-${projectId}`);
+  const rAllBtn = document.getElementById(`timeline-rall-${projectId}`);
+  if (r7Btn) r7Btn.onclick = () => {
+    if (fromInput) fromInput.value = new Date(nowD - 7 * 86400000).toISOString().slice(0, 10);
+    if (toInput) toInput.value = todayStr;
+    applyRange();
+  };
+  if (r30Btn) r30Btn.onclick = () => {
+    if (fromInput) fromInput.value = new Date(nowD - 30 * 86400000).toISOString().slice(0, 10);
+    if (toInput) toInput.value = todayStr;
+    applyRange();
+  };
+  if (rAllBtn) rAllBtn.onclick = () => {
+    if (fromInput) fromInput.value = '';
+    if (toInput)   toInput.value   = '';
+    if (errEl) errEl.style.display = 'none';
+    try { localStorage.removeItem(tlRangeKey); } catch (_) {}
+    setZoom(null, null);
+  };
+
+  try { new ResizeObserver(() => { try { chart.resize(); } catch (_) {} }).observe(container); } catch (_) {}
 }
 
 function _renderTimelineLog(projectId, data) {
