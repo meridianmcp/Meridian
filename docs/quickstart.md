@@ -176,21 +176,18 @@ Add to `~/.codeium/windsurf/mcp_config.json`:
 }
 ```
 
-### claude.ai web (browser)
+### Browser clients (Claude and ChatGPT)
 
-Use the [dnakov/claude-mcp](https://github.com/dnakov/claude-mcp) Chrome extension to connect claude.ai to your local Meridian server via SSE.
+For **hosted Meridian**, no extension is required:
 
-1. Install the extension (load unpacked from `extensions/claude-mcp/dist-chrome/`, or install from source)
-2. Click the extension icon → **Add server**
-3. Set the URL to `http://localhost:7878/mcp/sse`
-4. Leave command/args empty — the extension auto-discovers all tools via the SSE handshake
+1. Open Claude **Customize > Connectors** or ChatGPT **Settings > Apps**
+2. Add `https://usemeridian.us/mcp`
+3. Complete the OAuth prompt
 
-All 20+ Meridian MCP tools become available in claude.ai. Planning chat sessions can call `start_session`, `generate_handoff`, `get_sprint_items`, etc.
+For **self-hosted localhost** browser access, use a local Claude SSE bridge or
+put Meridian behind a public HTTPS URL first.
 
-!!! tip
-    For the hosted tier, use `https://usemeridian.us/mcp/sse` instead of localhost.
-    Or visit [usemeridian.us/install-mcp](https://usemeridian.us/install-mcp) for a step-by-step
-    setup guide with one-click copy buttons for both local and hosted configs.
+See the full guide here: [Browser Connector](browser-connector.md)
 
 ---
 

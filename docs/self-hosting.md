@@ -1,125 +1,123 @@
 # Self-Hosting
 
-Run Meridian on your own infrastructure. Choose the setup that fits your team.
+Run Meridian on your own infrastructure. Choose the path that matches how much
+control you want versus how much setup you are willing to do.
 
-→ [Getting Started](quickstart.md)
+-> [Getting Started](quickstart.md)
 
 ---
 
-## Option 1: Docker Compose (Recommended)
+## Choose a setup path
 
-The simplest production-ready setup. Persists data to a local volume.
+=== "Binary Install"
 
-### Prerequisites
-- Docker and Docker Compose v2
+    The fastest path for local or small-team usage. No Python required.
 
-### Setup
+    **Windows**
 
-```bash
-git clone https://github.com/meridianmcp/Meridian
-cd Meridian
-```
+    1. Download [`meridian.exe`](https://github.com/meridianmcp/Meridian/releases/latest/download/meridian.exe)
+    2. Double-click to run
+    3. Meridian opens your browser at `http://localhost:7878`
 
-Start the server:
-```bash
-docker compose up -d
-```
+    **macOS (Apple Silicon)**
 
-Verify it's running:
+    ```bash
+    curl -Lo meridian https://github.com/meridianmcp/Meridian/releases/latest/download/meridian-mac-arm64
+    chmod +x meridian
+    xattr -d com.apple.quarantine meridian 2>/dev/null || true
+    ./meridian
+    ```
+
+    **Linux**
+
+    ```bash
+    curl -Lo meridian https://github.com/meridianmcp/Meridian/releases/latest/download/meridian-linux-x86_64
+    chmod +x meridian
+    ./meridian
+    ```
+
+=== "Docker"
+
+    Use the published Docker Hub image when you want a clean containerized setup.
+
+    ```bash
+    docker pull meridianmcp/meridian:latest
+    docker run --rm -p 7878:7878 --env-file .env \
+      -v "$(pwd)/data:/app/data" \
+      meridianmcp/meridian:latest
+    ```
+
+    If you prefer source-based Compose:
+
+    ```bash
+    git clone https://github.com/meridianmcp/Meridian
+    cd Meridian
+    docker compose up -d
+    ```
+
+    By default, SQLite data is persisted in `./data/meridian.db`.
+
+=== "pixi"
+
+    Best for contributors and active development.
+
+    ```bash
+    git clone https://github.com/meridianmcp/Meridian
+    cd Meridian
+    pixi install
+    pixi run start
+    ```
+
+    For hot reload:
+
+    ```bash
+    pixi run dev
+    ```
+
+=== "pip"
+
+    Use this when `pixi` is not available.
+
+    ```bash
+    git clone https://github.com/meridianmcp/Meridian
+    cd Meridian
+    python -m venv .venv
+    source .venv/bin/activate   # Windows: .venv\\Scripts\\activate
+    pip install -e ".[full]"
+    python -m meridian
+    ```
+
+Confirm the server is healthy:
+
 ```bash
 curl http://localhost:7878/health
-# → {"status": "ok", "version": "1.9.0", "db": "sqlite"}
+# -> {"status": "ok", "version": "...", "db": "sqlite"}
 ```
 
 The dashboard is at **http://localhost:7878**.
 
-### Data persistence
-
-By default, the SQLite database is stored at `./data/meridian.db` via a volume mount.
-
-```yaml
-# docker-compose.yml (relevant section)
-volumes:
-  - ./data:/app/data
-```
-
-### Environment variables
-
-Create `.env` in the project root:
-
-```bash
-# Optional: use Postgres instead of SQLite
-# MERIDIAN_DB_URL=postgresql://user:pass@host/dbname
-
-# Set a secure session secret
-SESSION_SECRET=your-long-random-secret-here
-
-# Optional: password gate for preview deployments
-# SITE_PASSWORD=preview-password
-```
-
-Restart after changing `.env`:
-```bash
-docker compose down && docker compose up -d
-```
-
 ---
 
-## Option 2: pixi run start (Development)
+## Postgres setup with Neon
 
-Best for local development and testing.
+Neon is a good default when you want a hosted Postgres backend for a self-hosted
+Meridian server.
 
-```bash
-git clone https://github.com/meridianmcp/Meridian
-cd Meridian
-pixi install
-pixi run start
-```
-
-The server starts on `http://127.0.0.1:7878`.
-
-For hot-reload during development:
-```bash
-pixi run dev
-# Uses uvicorn --reload, watches meridian/ for changes
-```
-
----
-
-## Option 3: Manual pip Install
-
-For environments where pixi isn't available.
-
-```bash
-git clone https://github.com/meridianmcp/Meridian
-cd Meridian
-python -m venv .venv
-source .venv/bin/activate   # Windows: .venv\Scripts\activate
-pip install -e ".[full]"
-python -m meridian
-```
-
----
-
-## Postgres Setup with Neon (Free)
-
-Neon has a generous free tier — sufficient for personal use and small teams.
-
-1. Create a free account at [neon.tech](https://neon.tech)
-2. Create a new project
-3. Copy the connection string from the Neon dashboard
-4. Set the env var:
+1. Create a project at [neon.tech](https://neon.tech)
+2. Copy the Postgres connection string
+3. Set `MERIDIAN_DB_URL`
+4. Start Meridian normally
 
 ```bash
 export MERIDIAN_DB_URL="postgresql://neondb_owner:...@ep-xxx.us-east-2.aws.neon.tech/neondb?sslmode=require"
 pixi run start
 ```
 
-Meridian auto-detects Postgres from the URL prefix and uses `asyncpg` instead of `aiosqlite`.
+Meridian auto-detects Postgres from the URL prefix and switches to `asyncpg`.
 
 ---
 
-## Environment Variables
+## Environment variables
 
 See the full [Configuration Reference](configuration.md).
 
@@ -127,14 +125,47 @@ Key variables for self-hosting:
 
 | Variable | What to set |
 |----------|-------------|
-| `SESSION_SECRET` | Long random string — used to sign session cookies |
-| `APP_URL` | Your public URL (e.g. `https://meridian.yourdomain.com`) |
-| `MERIDIAN_DB_URL` | Postgres URL (optional — SQLite is fine for small teams) |
-| `SITE_PASSWORD` | One-time password gate for private previews |
+| `SESSION_SECRET` | Long random string used to sign session cookies |
+| `APP_URL` | Public base URL such as `https://meridian.yourdomain.com` |
+| `MERIDIAN_DB_URL` | Optional Postgres URL; SQLite is fine for smaller installs |
+| `SITE_PASSWORD` | Optional password gate for preview deployments |
+
+Example `.env`:
+
+```bash
+SESSION_SECRET=replace-me
+# APP_URL=https://meridian.example.com
+# MERIDIAN_DB_URL=postgresql://user:pass@host/dbname
+# SITE_PASSWORD=preview-password
+```
 
 ---
 
-## Reverse Proxy Setup
+## Expose localhost for browser clients
+
+Claude remote connectors and ChatGPT custom apps need a **public HTTPS** MCP
+endpoint. If you are running Meridian on `localhost`, a quick test path is a
+Cloudflare Tunnel:
+
+```bash
+cloudflared tunnel --url http://localhost:7878
+```
+
+Cloudflare prints a temporary public URL such as `https://random-name.trycloudflare.com`.
+Use that host plus `/mcp` in Claude or ChatGPT:
+
+```text
+https://random-name.trycloudflare.com/mcp
+```
+
+!!! note
+    This is great for demos and short-lived testing. For a stable setup, put
+    Meridian behind your own domain and reverse proxy, then set `APP_URL`
+    accordingly.
+
+---
+
+## Reverse proxy setup
 
 ### nginx
 
@@ -161,14 +192,14 @@ server {
         proxy_set_header   X-Real-IP $remote_addr;
         proxy_set_header   X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header   X-Forwarded-Proto $scheme;
-        proxy_read_timeout 3600s;   # needed for WebSocket connections
+        proxy_read_timeout 3600s;
     }
 }
 ```
 
 !!! important "WebSocket support"
-    Meridian uses WebSockets for the live dashboard. The `Upgrade` and `Connection`
-    headers are required — don't remove them.
+    Meridian uses WebSockets for the live dashboard. Keep the `Upgrade` and
+    `Connection` headers in place.
 
 ### Caddy
 
@@ -182,7 +213,7 @@ meridian.yourdomain.com {
 }
 ```
 
-Caddy handles SSL automatically via Let's Encrypt.
+Caddy handles TLS automatically.
 
 ---
 
@@ -191,15 +222,15 @@ Caddy handles SSL automatically via Let's Encrypt.
 ```bash
 cd Meridian
 git pull origin main
-pixi install        # or: docker compose build
+pixi install        # or: docker pull meridianmcp/meridian:latest
 pixi run start      # or: docker compose up -d
 ```
 
-Meridian runs all database migrations automatically on startup — no manual SQL needed.
+Meridian runs database migrations automatically on startup.
 
 ---
 
-## Backup and Restore
+## Backup and restore
 
 ### SQLite
 
@@ -211,47 +242,41 @@ cp data/meridian.db "data/meridian-$(date +%Y%m%d).db"
 cp data/meridian-20260101.db data/meridian.db
 ```
 
-For automated backups:
+Automated daily backup example:
+
 ```bash
-# Add to crontab — daily backup, keep last 7
 0 2 * * * cp /path/to/Meridian/data/meridian.db \
   /backups/meridian-$(date +%Y%m%d).db && \
   find /backups -name "meridian-*.db" -mtime +7 -delete
 ```
 
-### Postgres (Neon)
-
-Neon handles backups automatically with point-in-time recovery. Manual backup:
+### Postgres
 
 ```bash
 pg_dump "$MERIDIAN_DB_URL" -Fc -f meridian-backup-$(date +%Y%m%d).dump
-# Restore:
 pg_restore -d "$MERIDIAN_DB_URL" meridian-backup-20260101.dump
 ```
 
 ---
 
-## Running Multiple Instances
+## Running multiple instances
 
-!!! warning "SQLite doesn't support multiple writers"
-    If you need multiple Meridian instances (for load balancing or HA),
-    use Postgres. SQLite will work with multiple readers but not concurrent writers.
-
-### With Postgres + multiple instances
+!!! warning "SQLite does not support multiple writers"
+    If you need multiple Meridian instances for HA or load balancing, move to
+    Postgres first.
 
 ```yaml
-# docker-compose.yml with 2 instances
 services:
   meridian-1:
-    build: .
+    image: meridianmcp/meridian:latest
     ports: ["7878:7878"]
     environment:
       - MERIDIAN_DB_URL=postgresql://...
   meridian-2:
-    build: .
+    image: meridianmcp/meridian:latest
     ports: ["7879:7878"]
     environment:
       - MERIDIAN_DB_URL=postgresql://...
 ```
 
-Use nginx upstream to load balance between them.
+Put nginx or Caddy in front once you scale past a single instance.

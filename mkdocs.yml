@@ -34,13 +34,12 @@ extra_javascript:
 
 nav:
   - Home: index.md
-  - Getting Started:
-    - Quickstart: quickstart.md
-    - Configuration: configuration.md
+  - Quick Start: quickstart.md
+  - Browser Connector: browser-connector.md
   - MCP Tools: mcp-tools.md
   - Hosted (usemeridian.us): hosted.md
-  - Browser connector (claude.ai): browser-connector.md
   - Self-Hosting: self-hosting.md
+  - Configuration: configuration.md
   - API Reference: api-reference.md
   - FAQ: faq.md
 

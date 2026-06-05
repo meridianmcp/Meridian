@@ -1290,17 +1290,18 @@ function buildTabBody(project) {
             style="width:100%;padding:5px 10px;background:var(--surface-2);border:1px solid var(--border);
             color:var(--text);border-radius:4px;font-family:var(--font-mono);font-size:11px;outline:none">
         </div>
-        <div class="queue-scroll" style="flex:1;min-height:0;overflow-y:auto" id="queue-body-${project.id}">
+        <div class="queue-scroll" style="flex:1;min-height:0;overflow-y:auto" id="queue-scroll-${project.id}">
+          <div id="queue-body-${project.id}">
           <div class="empty" style="color:var(--muted)">select queue to load</div>
         </div>
-        <div id="recent-sessions-${project.id}" style="display:none;flex-shrink:0;border-top:1px solid var(--border);background:var(--surface-2);padding:8px 14px 8px"></div>
-        <div id="recent-runs-${project.id}" style="flex-shrink:0;border-top:1px solid var(--border);background:var(--surface-2)">
+        <div id="recent-sessions-${project.id}" style="display:none;border-top:1px solid var(--border);background:var(--surface-2);padding:8px 14px 8px"></div>
+        <div id="recent-runs-${project.id}" style="border-top:1px solid var(--border);background:var(--surface-2)">
           <div style="display:flex;justify-content:space-between;align-items:center;padding:6px 14px;cursor:pointer"
                id="recent-runs-toggle-${project.id}">
             <span style="font-family:var(--font-mono);font-size:10px;color:var(--muted);letter-spacing:0.05em">RECENT RUNS</span>
             <span id="recent-runs-chevron-${project.id}" style="font-size:10px;color:var(--muted)">▲</span>
           </div>
-          <div id="recent-runs-body-${project.id}" style="padding:0 14px 8px;font-family:var(--font-mono);font-size:11px;max-height:220px;overflow-y:auto">
+          <div id="recent-runs-body-${project.id}" style="padding:0 14px 8px;font-family:var(--font-mono);font-size:11px">
             <div style="color:var(--muted)">loading…</div>
           </div>
         </div>
@@ -3182,8 +3183,48 @@ async function loadSettingsTab(projectId) {
   const ghSelectedBranch = ghData?.branch || ghRepoMap[ghSelectedRepo]?.default_branch || 'main';
   const ghUsername = ghData?.github_user || ghData?.login || '';
   const ghAvatarUrl = ghData?.avatar_url || '';
-  const ghRepoOptions = (ghRepos.length ? ghRepos : (ghSelectedRepo ? [{ full_name: ghSelectedRepo }] : []))
-    .map(repo => `<option value="${escapeHtml(repo.full_name || '')}"></option>`)
+  const ghRepoChoices = ghRepos.length
+    ? ghRepos
+    : (ghSelectedRepo
+      ? [{
+          full_name: ghSelectedRepo,
+          name: ghSelectedRepo.split('/').slice(-1)[0] || ghSelectedRepo,
+          owner: ghSelectedRepo.includes('/') ? ghSelectedRepo.split('/')[0] : '',
+        }]
+      : []);
+  const repoGroups = new Map();
+  ghRepoChoices.forEach(repo => {
+    const fullName = repo.full_name || '';
+    if (!fullName) return;
+    const owner = repo.owner || (fullName.includes('/') ? fullName.split('/')[0] : 'other');
+    if (!repoGroups.has(owner)) repoGroups.set(owner, []);
+    repoGroups.get(owner).push(repo);
+  });
+  const ghRepoOptions = Array.from(repoGroups.keys())
+    .sort((a, b) => {
+      const aPersonal = !!ghUsername && a.toLowerCase() === ghUsername.toLowerCase();
+      const bPersonal = !!ghUsername && b.toLowerCase() === ghUsername.toLowerCase();
+      if (aPersonal !== bPersonal) return aPersonal ? -1 : 1;
+      const aMeridian = a.toLowerCase() === 'meridianmcp';
+      const bMeridian = b.toLowerCase() === 'meridianmcp';
+      if (aMeridian !== bMeridian) return aMeridian ? -1 : 1;
+      return a.localeCompare(b);
+    })
+    .map(owner => {
+      const label = (!!ghUsername && owner.toLowerCase() === ghUsername.toLowerCase())
+        ? `Personal (@${owner})`
+        : `${owner} repos`;
+      const options = (repoGroups.get(owner) || [])
+        .slice()
+        .sort((a, b) => String(a.name || a.full_name || '').localeCompare(String(b.name || b.full_name || '')))
+        .map(repo => {
+          const fullName = repo.full_name || '';
+          const repoName = repo.name || (fullName.includes('/') ? fullName.split('/').slice(-1)[0] : fullName);
+          return `<option value="${escapeHtml(fullName)}" ${fullName === ghSelectedRepo ? 'selected' : ''}>${escapeHtml(repoName)}</option>`;
+        })
+        .join('');
+      return `<optgroup label="${escapeHtml(label)}">${options}</optgroup>`;
+    })
     .join('');
   const hooksBaseUrl = ((mcpData && mcpData.base_url) || window.location.origin || state.serverConfig?.server_url || 'http://localhost:7878').replace(/\/$/, '');
 
@@ -3239,10 +3280,10 @@ async function loadSettingsTab(projectId) {
   // "Connect claude.ai browser" card — always shown regardless of hosted/self-hosted
   html += `<div style="margin-bottom:14px;padding:10px 12px;border:1px solid var(--border);border-radius:6px;background:var(--surface-2);display:flex;justify-content:space-between;align-items:center;gap:8px">
     <div>
-      <div style="font-weight:600;font-size:11px;color:var(--text);margin-bottom:2px">Connect claude.ai browser</div>
-      <div style="font-size:10px;color:var(--muted)">Use Meridian directly in claude.ai - no install needed</div>
+      <div style="font-weight:600;font-size:11px;color:var(--text);margin-bottom:2px">Browser connector</div>
+      <div style="font-size:10px;color:var(--muted)">Use Meridian directly in Claude or ChatGPT - hosted MCP, no extension required</div>
     </div>
-    <a href="/install-mcp" target="_blank" style="white-space:nowrap;padding:4px 10px;background:var(--accent);color:#fff;border-radius:4px;font-size:10px;font-weight:600;text-decoration:none">Setup guide →</a>
+    <a href="https://docs.usemeridian.us/browser-connector/" target="_blank" style="white-space:nowrap;padding:4px 10px;background:var(--accent);color:#fff;border-radius:4px;font-size:10px;font-weight:600;text-decoration:none">Setup guide →</a>
   </div>`;
 
   if (mcpData) {
@@ -3274,11 +3315,11 @@ async function loadSettingsTab(projectId) {
       <div style="display:grid;grid-template-columns:minmax(220px,1.4fr) minmax(110px,0.6fr) auto;gap:8px;align-items:end">
         <label style="display:flex;flex-direction:column;gap:3px;min-width:0">
           <span style="font-size:9px;color:var(--muted)">Repo</span>
-          <input type="search" id="github-repo-${projectId}" list="github-repos-${projectId}" value="${escapeHtml(ghSelectedRepo)}" placeholder="Search repos"
+          <select id="github-repo-${projectId}"
             style="padding:5px 8px;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;color:var(--text);font-family:var(--font-mono);font-size:11px;outline:none">
-          <datalist id="github-repos-${projectId}">
             ${ghRepoOptions}
-          </datalist>
+          </select>
+          <span style="font-size:9px;color:var(--muted)">Grouped by owner so personal and org repos stay separate.</span>
         </label>
         <label style="display:flex;flex-direction:column;gap:3px;min-width:0">
           <span style="font-size:9px;color:var(--muted)">Branch</span>
@@ -3361,7 +3402,7 @@ async function loadSettingsTab(projectId) {
     html += `<div style="margin-bottom:16px">
       <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;padding-bottom:4px;border-bottom:1px solid var(--border)">
         <div style="color:var(--accent);font-size:10px;letter-spacing:.06em;text-transform:uppercase">MCP client setup</div>
-        <a href="/install-mcp" target="_blank" style="font-size:10px;color:var(--muted);text-decoration:none" title="Full setup guide">setup guide →</a>
+        <a href="https://docs.usemeridian.us/browser-connector/" target="_blank" style="font-size:10px;color:var(--muted);text-decoration:none" title="Full setup guide">setup guide →</a>
       </div>
       <div style="display:flex;gap:8px;align-items:center;margin-bottom:8px;flex-wrap:wrap">
         <div style="display:flex;gap:0;border:1px solid var(--border);border-radius:3px;overflow:hidden" id="mcp-client-tabs-${projectId}">
@@ -4084,6 +4125,27 @@ async function loadSettingsTab(projectId) {
     };
   }
 
+  const ghRepoSelect = document.getElementById(`github-repo-${projectId}`);
+  const ghBranchInput = document.getElementById(`github-branch-${projectId}`);
+  if (ghRepoSelect && ghBranchInput) {
+    ghBranchInput.dataset.autoFill = ghBranchInput.value.trim() === ghSelectedBranch ? '1' : '0';
+    ghBranchInput.addEventListener('input', () => {
+      ghBranchInput.dataset.autoFill = '0';
+    });
+    ghRepoSelect.addEventListener('change', () => {
+      const selectedRepo = ghRepoSelect.value;
+      const nextDefault = ghRepoMap[selectedRepo]?.default_branch;
+      const currentDefault = ghRepoMap[ghSelectedRepo]?.default_branch || 'main';
+      if (!nextDefault) return;
+      if (!ghBranchInput.value.trim() ||
+          ghBranchInput.value.trim() === currentDefault ||
+          ghBranchInput.dataset.autoFill === '1') {
+        ghBranchInput.value = nextDefault;
+        ghBranchInput.dataset.autoFill = '1';
+      }
+    });
+  }
+
   // Wire GitHub test button
   const ghTestBtn = document.getElementById(`github-test-btn-${projectId}`);
   if (ghTestBtn) {
@@ -4616,7 +4678,7 @@ async function loadRecentRuns(projectId) {
           <span style="font-size:9px;color:var(--muted)">${cnt} tasks · ${dur} · ${ts}</span>
           <span style="font-size:9px;color:${statusColor}">${run.status}</span>
         </div>
-        <div class="run-transcript-${escapeHtml(run.id)}" style="display:none;margin-top:6px;padding:6px 8px;background:var(--surface-2);border-radius:3px;font-size:10px;white-space:pre-wrap;max-height:200px;overflow-y:auto;color:var(--muted)"></div>
+        <div class="run-transcript-${escapeHtml(run.id)}" style="display:none;margin-top:6px;padding:6px 8px;background:var(--surface-2);border-radius:3px;font-size:10px;white-space:pre-wrap;color:var(--muted)"></div>
       </div>`;
     }).join('');
 

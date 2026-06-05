@@ -222,16 +222,17 @@ These MCP servers pair with Meridian to give your AI agents codebase context and
     }
     ```
 
-=== "claude.ai (browser)"
-    Uses SSE transport — no JSON config file needed. Install the [dnakov/claude-mcp](https://github.com/dnakov/claude-mcp) Chrome extension, then:
+=== "Browser clients"
+    Hosted Meridian works directly in Claude and ChatGPT without an extension.
 
-    1. Click the extension icon → **Add server**
-    2. **Name:** `meridian`
-    3. **URL:** `http://localhost:7878/mcp/sse`
+    1. Open Claude **Customize > Connectors** or ChatGPT **Settings > Apps**
+    2. Add `https://usemeridian.us/mcp`
+    3. Complete OAuth in the browser
 
-    The extension discovers all Meridian tools via the SSE handshake. For the hosted tier, use `https://usemeridian.us/mcp/sse` with your API token.
+    For self-hosted localhost setups, use a local Claude SSE bridge or expose
+    Meridian on a public HTTPS URL first.
 
-    → [Full setup guide](https://usemeridian.us/install-mcp)
+    -> [Full browser connector guide](browser-connector.md)
 
 **What each adds:**
 
