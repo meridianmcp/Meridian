@@ -4970,6 +4970,11 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "watching_session_id": {"type": "string"}},
          "required": ["watching_session_id"]}},
 ]
+# Tell ChatGPT/OpenAI these tools are safe — prevents confirmation dialogs blocking non-destructive calls
+_DESTRUCTIVE_TOOLS = {'delete_note', 'delete_decision', 'dismiss_hitl'}
+for _t in _MCP_TOOLS_LIST:
+    _t.setdefault('annotations', {})['x-openai-isConsequential'] = _t['name'] in _DESTRUCTIVE_TOOLS
+
 
 # ---------------------------------------------------------------------------
 # GitHub MCP tools — injected per-tenant when github_pat is set
