@@ -17,13 +17,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sqlite3
 import sys
 from pathlib import Path
 
 ROOT = Path(__file__).parent.parent
 DEFAULT_DB = ROOT / "data" / "meridian.db"
-MERIDIAN_BUILD_PROJECT = "5787cc92-ba7d-4788-b17c-28ab7938b839"
+DEFAULT_PROJECT_ID = os.environ.get("MERIDIAN_BUILD_PROJECT", "")
 
 
 def _db(db_path: Path) -> sqlite3.Connection:
@@ -167,7 +168,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--db", default=str(DEFAULT_DB),
                         help="Path to SQLite DB (default: data/meridian.db)")
-    parser.add_argument("--project-id", default=MERIDIAN_BUILD_PROJECT,
+    parser.add_argument("--project-id", default=DEFAULT_PROJECT_ID,
                         help="Project ID to generate files for")
     parser.add_argument("--dry-run", action="store_true",
                         help="Print output instead of writing files")
@@ -178,6 +179,9 @@ def main() -> None:
     db_path = Path(args.db)
     if not db_path.exists():
         print(f"DB not found at {db_path}. Use --db to specify a path.", file=sys.stderr)
+        sys.exit(1)
+    if not args.project_id:
+        print("Project ID required. Pass --project-id or set MERIDIAN_BUILD_PROJECT.", file=sys.stderr)
         sys.exit(1)
 
     conn = _db(db_path)

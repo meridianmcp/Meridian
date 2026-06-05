@@ -8,7 +8,7 @@ Usage:
     pixi run executor --goal "Fix the auth bug in server.py"
     pixi run executor --goal "$(cat my_goal.txt)"
     echo "Fix the auth bug" | pixi run executor
-    pixi run executor --goal "..." --project 5787cc92-... --interval 60
+    pixi run executor --goal "..." --project YOUR_PROJECT_ID --interval 60
 
 Environment variables:
     MERIDIAN_CLAUDE_CLI   Override the claude CLI argv prefix (shell-split).

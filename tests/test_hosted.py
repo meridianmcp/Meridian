@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 
 import pytest
 
@@ -268,6 +269,134 @@ async def test_get_available_pool_project(db):
     found = await get_available_pool_project(db, tier="standard", max_customers=8)
     if found is not None:
         assert found["neon_project_id"] != neon_id or found["customer_count"] < 8
+
+
+@pytest.mark.asyncio
+async def test_open_tenant_db_falls_back_to_auth_db_when_decrypt_fails(monkeypatch):
+    from cryptography.fernet import InvalidToken
+
+    import meridian._deps as deps_module
+    import meridian.pg_adapter as pg_adapter
+
+    deps_module._tenant_db_cache.clear()
+
+    async def fake_get_tenant_by_id(_db, tenant_id):
+        return {"id": tenant_id, "neon_db_url": "enc:not-valid"}
+
+    def fake_decrypt_field(_value):
+        raise InvalidToken()
+
+    async def fake_init_pg_db(url):
+        return {"opened_url": url}
+
+    monkeypatch.setattr(db_module, "get_tenant_by_id", fake_get_tenant_by_id)
+    monkeypatch.setattr(db_module, "decrypt_field", fake_decrypt_field)
+    monkeypatch.setattr(pg_adapter, "init_pg_db", fake_init_pg_db)
+    monkeypatch.setenv("MERIDIAN_AUTH_DB", "postgresql://fallback-db")
+
+    request = SimpleNamespace(
+        app=SimpleNamespace(state=SimpleNamespace(db="auth-db")),
+        state=SimpleNamespace(),
+    )
+
+    conn = await deps_module._open_tenant_db_by_id(request, "tenant-1")
+    assert conn == {"opened_url": "postgresql://fallback-db"}
+
+
+@pytest.mark.asyncio
+async def test_create_neon_pool_project_omits_suspend_timeout(monkeypatch):
+    import httpx
+
+    import meridian.hosted as hosted_module
+
+    seen: dict[str, object] = {}
+
+    class FakeResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "project": {"id": "neon-proj-1"},
+                "connection_uris": [{"connection_uri": "postgresql://tenant-db"}],
+            }
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def post(self, url, headers=None, json=None):
+            seen["url"] = url
+            seen["json"] = json
+            return FakeResponse()
+
+    monkeypatch.setattr(httpx, "AsyncClient", lambda timeout=30: FakeClient())
+
+    neon_project_id, conn_uri = await hosted_module._create_neon_pool_project("key", "free")
+    assert neon_project_id == "neon-proj-1"
+    assert conn_uri == "postgresql://tenant-db"
+    endpoint_settings = seen["json"]["project"]["default_endpoint_settings"]
+    assert "suspend_timeout_seconds" not in endpoint_settings
+
+
+@pytest.mark.asyncio
+async def test_create_customer_database_retries_locked_and_uses_role_name(monkeypatch):
+    import httpx
+
+    import meridian.hosted as hosted_module
+
+    seen: dict[str, object] = {"post_calls": 0, "uri_url": ""}
+
+    class FakeResponse:
+        def __init__(self, status_code=200, payload=None):
+            self.status_code = status_code
+            self._payload = payload or {}
+
+        def raise_for_status(self):
+            if self.status_code >= 400 and self.status_code != 409:
+                raise httpx.HTTPStatusError(
+                    "error",
+                    request=httpx.Request("GET", "https://example.test"),
+                    response=httpx.Response(self.status_code),
+                )
+
+        def json(self):
+            return self._payload
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def get(self, url, headers=None):
+            if url.endswith("/branches"):
+                return FakeResponse(payload={"branches": [{"id": "br-1", "primary": True}]})
+            seen["uri_url"] = url
+            return FakeResponse(payload={"uri": "postgresql://tenant-db"})
+
+        async def post(self, url, headers=None, json=None):
+            seen["post_calls"] += 1
+            if seen["post_calls"] == 1:
+                return FakeResponse(status_code=423)
+            return FakeResponse(status_code=409)
+
+    async def fake_sleep(_seconds):
+        return None
+
+    monkeypatch.setattr(httpx, "AsyncClient", lambda timeout=15: FakeClient())
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+
+    uri = await hosted_module._create_customer_database("key", "neon-proj-1", "cust_demo")
+    assert uri == "postgresql://tenant-db"
+    assert seen["post_calls"] == 2
+    assert "branch_id=br-1" in seen["uri_url"]
+    assert "database_name=cust_demo" in seen["uri_url"]
+    assert "role_name=neondb_owner" in seen["uri_url"]
 
 
 @pytest.mark.asyncio

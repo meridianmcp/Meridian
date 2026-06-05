@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
 import urllib.error
@@ -28,7 +29,7 @@ FAIL = "\033[31mFAIL\033[0m"
 SKIP = "\033[33mSKIP\033[0m"
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-PROJECT_ID = "5787cc92-ba7d-4788-b17c-28ab7938b839"
+DEFAULT_PROJECT_ID = os.environ.get("MERIDIAN_PROJECT_ID", "")
 
 
 def post(url: str, data: dict, timeout: int = 15, token: str | None = None) -> tuple[int, str]:
@@ -55,7 +56,7 @@ def check(label: str, ok: bool, detail: str = "") -> bool:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--url", default="https://usemeridian.us")
-    parser.add_argument("--project-id", default=PROJECT_ID)
+    parser.add_argument("--project-id", default=DEFAULT_PROJECT_ID)
     parser.add_argument("--token", default="", help="Optional Bearer token for hosted hook checks")
     parser.add_argument("--skip-live", action="store_true", help="Skip live HTTP checks")
     args = parser.parse_args()
@@ -63,6 +64,10 @@ def main() -> int:
     base = args.url.rstrip("/")
     pid = args.project_id
     failures = 0
+
+    if not pid:
+        print("ERROR: pass --project-id or set MERIDIAN_PROJECT_ID", file=sys.stderr)
+        return 1
 
     print(f"\nHook endpoint + installer validation -- {base}\n")
 
