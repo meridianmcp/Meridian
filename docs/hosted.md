@@ -10,33 +10,28 @@ your AI clients over HTTPS in minutes.
 
 ## Pricing
 
-**Try free for 30 days — no card required.**
-
-| | **Free** | **Standard** | **Pro** |
+| | Free | Standard | Pro |
 |--|--|--|--|
-| **Price** | Free · 30 days | $20 / mo | $49 / mo |
+| **Price** | $0 | $20/mo | Waitlist |
 | **Status** | Live | Live | Coming soon · [join waitlist](mailto:hello@usemeridian.us?subject=Pro%20waitlist) |
-| **Card required** | No | Yes | Yes |
-| **Storage** | Shared pool | 1 GB | 10 GB |
-| **Compute** | 0.5 CU shared | 50 CU-hrs / mo | 200 CU-hrs / mo |
-| **Projects** | 1 | Unlimited | Unlimited |
-| **Concurrent sessions** | 1 | Unlimited | Unlimited |
-| **Team members** | — | 25 | 50 |
-| **BYODB** | ✓ | ✓ | ✓ |
-| **OAuth + magic link** | ✓ | ✓ | ✓ |
-| **Support** | — | Email | Priority |
+| **Compute** | 0.5 CU | 2 CU | 4 CU |
+| **Compute hours/mo** | 10 CU-hrs total | 50 CU-hrs/mo | 300 CU-hrs |
+| **Team members** | 1 | 20 | Unlimited |
 
-Overage: $0.16 / CU-hr · $0.50 / GB-month · billed via Stripe.
-Self-hosted is always free — no limits, no expiry, [see self-hosting guide](self-hosting.md).
+**BYODB** (Bring Your Own Database): paste your own Neon connection string at signup
+and skip the managed DB — same price, full control of your data.
+
+Free and Standard include the managed Postgres database, hosted dashboard, and remote MCP endpoint. Pro is waitlist-only.
 
 ---
 
 ## Sign Up Flow
 
 1. **Visit [usemeridian.us](https://usemeridian.us)** and click "Get Started"
-2. **Sign in** with Google or GitHub — no passwords, no card for free tier
-3. **Check your email** — welcome email contains your bearer token and MCP config snippet
-4. **Upgrade anytime** via Settings → Billing when you're ready for dedicated compute
+2. **Sign in** — Google or GitHub OAuth, no password required
+3. **Check your welcome email** — contains your bearer token and MCP config snippet
+4. **Choose Google or GitHub** — sign in with either, no passwords
+5. **Open your dashboard** — use the dashboard link in the welcome email to land in Meridian
 
 ---
 

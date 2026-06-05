@@ -1,9 +1,16 @@
 # MCP Tool Reference
-Meridian exposes **39 tools** over MCP. They fall into two usage patterns:
-**Planner sessions** (claude.ai, planning work) — `start_session` · `pin_decision` · `update_decision` · `add_note` · `get_context_block` · `generate_handoff`
-**Executor sessions** (Claude Code, Cursor, automated workers) — `start_session` · `log_task` · `request_hitl` · `get_session_brief` · `generate_handoff`
+
+Meridian exposes **39 tools** over MCP.
+
+They fall into two usage patterns:
+
+- **Planner sessions** (claude.ai, planning work) - `start_session` · `pin_decision` · `update_decision` · `add_note` · `get_context_block` · `generate_handoff`
+- **Executor sessions** (Claude Code, Cursor, automated workers) - `start_session` · `log_task` · `request_hitl` · `get_session_brief` · `generate_handoff`
+
 ---
-## Quick Reference — 5 tools you use 90% of the time
+
+## Quick Reference - 5 tools you use 90% of the time
+
 | Tool | One-liner | Example call |
 |------|-----------|-------------|
 | `start_session` | Register session, get full project context | `start_session(project_id="abc-123", session_name="feature-x", human_id="alice")` |

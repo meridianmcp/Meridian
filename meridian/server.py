@@ -302,6 +302,11 @@ async def _seed_demo_data(db) -> None:
             )
         except Exception:  # noqa: BLE001
             pass
+    for title, body, tags in [
+        ("Release checklist", "Run the load test, verify rate-limit headers, and keep the v1 deprecation notice ready.", "release,qa"),
+        ("API docs", "OpenAPI docs are at /docs; keep examples in sync with the latest auth keys and pagination changes.", "docs,api"),
+    ]:
+        await db_module.add_project_note(db, api["id"], title, body, tags)
     try:
         await db.commit()
     except Exception:  # noqa: BLE001
@@ -409,6 +414,11 @@ async def _seed_demo_data(db) -> None:
             )
         except Exception:  # noqa: BLE001
             pass
+    for title, body, tags in [
+        ("Incident drill", "If DLQ growth spikes, check schema compatibility first, then consumer lag.", "ops,dlq"),
+        ("Pipeline checklist", "Keep Flink windows at 5 minutes and watch PII masking before the next pilot.", "etl,quality"),
+    ]:
+        await db_module.add_project_note(db, pipe["id"], title, body, tags)
     try:
         await db.commit()
     except Exception:  # noqa: BLE001
@@ -2320,7 +2330,7 @@ _DEMO_FILE_CONTENT: dict[str, dict[str, str]] = {
         "AGENTS.md": """\
 # backend-api-v2 — Agent Session Instructions
 
-## Connect to Meridian
+## Start a session
 
 Run `start_session(project_id="...", session_name="describe-what-youre-doing")` at session start.
 This returns your sprint items, active sessions, and goal in one call.
@@ -2385,10 +2395,10 @@ URL versioning (/v1/) confirmed. Reviewed Bob's rate limiter PR.
 Redis connection pool leak on exception path — fixed.
 """,
         "CLAUDE.md": """\
-# backend-api-v2 — Claude Session Instructions
+# backend-api-v2 — Session Instructions
 
-## Meridian project ID
-`PROJECT_ID=25946a49-2dc1-4c9f-bff7-e18827b391c7`
+## Project ID
+`PROJECT_ID=<project-id>`
 
 ## Stack
 Python 3.12, FastAPI, psycopg3 (asyncpg removed), Redis, Alembic migrations.
@@ -2452,7 +2462,7 @@ Cursor (created_at + id) is stable under concurrent writes. Default 20, max 100.
         "AGENTS.md": """\
 # data-pipeline — Agent Session Instructions
 
-## Connect to Meridian
+## Start a session
 
 Run `start_session(project_id="...", session_name="describe-what-youre-doing")` at session start.
 
@@ -2520,10 +2530,10 @@ Stress test: 10k bad events injected, all landed in DLQ, zero main pipeline impa
 **Maya** — Schema Registry deployed. All 8 sources registered with Avro schemas. FORWARD_TRANSITIVE policy set.
 """,
         "CLAUDE.md": """\
-# data-pipeline — Claude Session Instructions
+# data-pipeline — Session Instructions
 
-## Meridian project ID
-`PROJECT_ID=<see-dashboard>`
+## Project ID
+`PROJECT_ID=<project-id>`
 
 ## Stack
 Apache Kafka (3-broker, k8s), Confluent Schema Registry (Avro),
@@ -3848,11 +3858,18 @@ async def mcp_tools_doc() -> str:
     n = len(_MCP_TOOLS_LIST)
     lines: list[str] = [
         "# MCP Tool Reference\n",
-        f"Meridian exposes **{n} tools** over MCP. They fall into two usage patterns:\n",
-        "**Planner sessions** (claude.ai, planning work) — `start_session` · `pin_decision` · `update_decision` · `add_note` · `get_context_block` · `generate_handoff`\n",
-        "**Executor sessions** (Claude Code, Cursor, automated workers) — `start_session` · `log_task` · `request_hitl` · `get_session_brief` · `generate_handoff`\n",
+        "\n",
+        f"Meridian exposes **{n} tools** over MCP.\n",
+        "\n",
+        "They fall into two usage patterns:\n",
+        "\n",
+        "- **Planner sessions** (claude.ai, planning work) - `start_session` · `pin_decision` · `update_decision` · `add_note` · `get_context_block` · `generate_handoff`\n",
+        "- **Executor sessions** (Claude Code, Cursor, automated workers) - `start_session` · `log_task` · `request_hitl` · `get_session_brief` · `generate_handoff`\n",
+        "\n",
         "---\n",
-        "## Quick Reference — 5 tools you use 90% of the time\n",
+        "\n",
+        "## Quick Reference - 5 tools you use 90% of the time\n",
+        "\n",
         "| Tool | One-liner | Example call |\n",
         "|------|-----------|-------------|\n",
         "| `start_session` | Register session, get full project context | `start_session(project_id=\"abc-123\", session_name=\"feature-x\", human_id=\"alice\")` |\n",
