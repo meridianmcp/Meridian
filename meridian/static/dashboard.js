@@ -3638,7 +3638,17 @@ async function loadSettingsTab(projectId) {
         await api(`/projects/${projectId}/notify/test`, { method: 'POST', body: '{}' });
         if (statusEl) { statusEl.textContent = 'sent!'; setTimeout(() => { statusEl.textContent = ''; }, 3000); }
       } catch (e) {
-        if (statusEl) statusEl.textContent = e.message?.includes('400') ? 'save a URL first' : 'error';
+        if (statusEl) {
+          const raw = String(e?.message || e || '');
+          let msg = raw.replace(/^\d+:\s*/, '');
+          try {
+            const parsed = JSON.parse(msg);
+            msg = parsed.detail || parsed.message || parsed.error || msg;
+          } catch (_err) {
+            // Keep the plain text message when the server did not return JSON.
+          }
+          statusEl.textContent = msg.includes('No notify URL configured') ? 'save a URL first' : msg;
+        }
       } finally {
         ntfyTestBtn.disabled = false;
       }
