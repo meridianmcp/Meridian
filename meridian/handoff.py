@@ -378,6 +378,31 @@ async def _generate_handoff_l0(
     return str(out_path.resolve()), content
 
 
+def _render_workspace_handoff_block(
+    decisions: list[dict], notes: list[dict]
+) -> str:
+    """v3.1 — render workspace-level decisions + notes as a markdown block,
+    prepended to every project's handoff. Empty string when nothing to show."""
+    if not decisions and not notes:
+        return ""
+    lines = ["## Workspace (applies to all projects)", ""]
+    if decisions:
+        lines.append("### Decisions")
+        for d in decisions[:10]:
+            cat = (d.get("category") or "").strip()
+            prefix = f"**[{cat}]** " if cat else ""
+            lines.append(f"- {prefix}{d.get('title', '')} — {(d.get('body') or '')[:300]}")
+        lines.append("")
+    if notes:
+        lines.append("### Notes")
+        for n in notes[:10]:
+            tags = (n.get("tags") or "").strip()
+            suffix = f" _({tags})_" if tags else ""
+            lines.append(f"- **{n.get('title', '')}** — {(n.get('body') or '')[:300]}{suffix}")
+        lines.append("")
+    return "\n".join(lines).rstrip()
+
+
 async def generate_handoff(
     db: aiosqlite.Connection,
     project_id: str,
@@ -438,6 +463,9 @@ async def generate_handoff(
     pinned_decisions = await db_module.get_pinned_decisions(db, project_id)
     project_notes = await db_module.get_project_notes(db, project_id)
     strategic_notes = _select_strategic_notes(project_notes)
+    # v3.1 — workspace decisions + notes apply across all projects.
+    workspace_decisions = await db_module.get_workspace_decisions(db)
+    workspace_notes = await db_module.get_workspace_notes(db)
     sprint_items_all = await db_module.get_sprint_items(db, project_id)
     # Separate genuinely pending from actively-claimed in_progress items so:
     # (1) quick_start_goal only names items that haven't been claimed yet, and
@@ -511,6 +539,12 @@ async def generate_handoff(
             ai_summary=ai_summary,
             quick_start_goal=quick_start_goal,
         )
+
+    ws_block = _render_workspace_handoff_block(
+        workspace_decisions, workspace_notes
+    )
+    if ws_block:
+        content = f"{ws_block}\n\n{content}"
 
     out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)

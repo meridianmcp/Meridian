@@ -2654,6 +2654,29 @@ async def put_project_file(
     return {"filename": filename, "size": len(body.content.encode("utf-8"))}
 
 
+def _render_workspace_block(
+    decisions: list[dict], notes: list[dict]
+) -> str:
+    """v3.1 — render workspace-level decisions + notes as a compact text block.
+
+    Workspace decisions/notes are tenant-global (above any single project), so
+    they are prepended to every project's context block + handoff. Returns an
+    empty string when there is nothing to show, so callers can skip the join.
+    """
+    if not decisions and not notes:
+        return ""
+    lines = ["WORKSPACE (applies to all projects):"]
+    for d in decisions[:10]:
+        cat = (d.get("category") or "").strip()
+        prefix = f"[{cat}] " if cat else ""
+        lines.append(f"  • DECISION {prefix}{d.get('title', '')}: {d.get('body', '')}")
+    for n in notes[:10]:
+        tags = (n.get("tags") or "").strip()
+        suffix = f" ({tags})" if tags else ""
+        lines.append(f"  • NOTE {n.get('title', '')}: {n.get('body', '')}{suffix}")
+    return "\n".join(lines)
+
+
 def _render_context_block(
     project: dict,
     goal: dict | None,
@@ -5205,8 +5228,9 @@ async def _dispatch_mcp_tool(
         # 04f03ee4 — include start_session one-liner so next session can resume immediately
         start_fresh = f'start_session(project_id="{project_id}", session_name="describe-what-youre-doing")'
         # fa595ad8 — store snapshot for Recent Sessions dashboard panel (non-fatal)
+        # v3.1 — snapshot now lives on sessions.checkpoint_data, not a checkpoint:* note.
         try:
-            import json as _json
+            from datetime import datetime as _ckpt_dt, timezone as _ckpt_tz
             async with db.execute(
                 "SELECT name FROM sessions WHERE id = ?", (session_id,)
             ) as _sc:
@@ -5220,18 +5244,19 @@ async def _dispatch_mcp_tool(
                 _tr = await _tc.fetchone()
             _items_done = int(_tr["n"]) if _tr else 0
             _summary_line = (content or "").split("\n")[0][:140]
-            await db_module.add_project_note(
-                db, project_id,
-                title=f"checkpoint:{session_id[:8]}",
-                body=_json.dumps({
+            await db_module.set_session_checkpoint(
+                db, session_id,
+                {
                     "session_id": session_id,
                     "session_name": _session_name,
                     "items_done": _items_done,
                     "summary_line": _summary_line,
                     "next_goal": next_goal,
                     "start_fresh": start_fresh,
-                }),
-                tags="checkpoint",
+                    "checkpointed_at": _ckpt_dt.now(_ckpt_tz.utc).strftime(
+                        "%Y-%m-%d %H:%M:%S"
+                    ),
+                },
             )
         except Exception:
             pass  # non-fatal — checkpoint still returns normally
@@ -5280,6 +5305,21 @@ async def _dispatch_mcp_tool(
     if name == "delete_note":
         ok = await db_module.delete_project_note(db, args["note_id"])
         return {"deleted": ok}
+    if name == "add_workspace_note":
+        return await db_module.add_workspace_note(
+            db, args["title"], args["body"], args.get("tags"),
+        )
+    if name == "get_workspace_notes":
+        return await db_module.get_workspace_notes(db, tag=args.get("tag"))
+    if name == "pin_workspace_decision":
+        return await db_module.pin_workspace_decision(
+            db, args["title"], args["body"],
+            category=args.get("category", "TECHNICAL"),
+        )
+    if name == "get_workspace_decisions":
+        return await db_module.get_workspace_decisions(
+            db, include_superseded=args.get("include_superseded", False),
+        )
     if name == "get_context_block":
         # v2.3 — assemble the same shape as /projects/{id}/context-block but
         # return both the rendered text AND the source dict so MCP clients
@@ -5307,6 +5347,13 @@ async def _dispatch_mcp_tool(
             project, goal, sprint_items, pending_tasks, sessions, recent_decisions,
             mode=mode,
         )
+        # v3.1 — workspace decisions + notes apply across all projects; surface
+        # them at the very top so a fresh session sees org-wide truth first.
+        ws_decisions = await db_module.get_workspace_decisions(db)
+        ws_notes = await db_module.get_workspace_notes(db)
+        ws_block = _render_workspace_block(ws_decisions, ws_notes)
+        if ws_block:
+            text = f"{ws_block}\n\n{text}"
         xml_text = f'<meridian_context project_id="{project_id}" mode="{mode}">\n{text}\n</meridian_context>'
         return {"mode": mode, "text": xml_text, "project_id": project_id}
     if name == "list_hitl_requests":
@@ -6532,6 +6579,68 @@ def build_mcp_server():
                 },
             ),
             Tool(
+                name="add_workspace_note",
+                description=(
+                    "v3.1 — add a workspace-level note that applies across ALL "
+                    "projects (onboarding, shared conventions, cross-cutting "
+                    "infra). Injected at the top of every project's context "
+                    "block + handoff. Tags are comma-separated."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "title": {"type": "string"},
+                        "body": {"type": "string"},
+                        "tags": {"type": "string"},
+                    },
+                    "required": ["title", "body"],
+                },
+            ),
+            Tool(
+                name="get_workspace_notes",
+                description=(
+                    "v3.1 — list workspace-level notes (newest first). "
+                    "Optional ``tag`` substring filter."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {"tag": {"type": "string"}},
+                    "required": [],
+                },
+            ),
+            Tool(
+                name="pin_workspace_decision",
+                description=(
+                    "v3.1 — pin a workspace-level decision that applies across "
+                    "ALL projects (shared architecture, org-wide standards). "
+                    "Injected at the top of every project's context block + "
+                    "handoff. category is free-text."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "title": {"type": "string"},
+                        "body": {"type": "string"},
+                        "category": {"type": "string"},
+                    },
+                    "required": ["title", "body"],
+                },
+            ),
+            Tool(
+                name="get_workspace_decisions",
+                description=(
+                    "v3.1 — list workspace-level pinned decisions (active "
+                    "only by default, newest first)."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "include_superseded": {"type": "boolean"},
+                    },
+                    "required": [],
+                },
+            ),
+            Tool(
                 name="enqueue_claude_task",
                 description=(
                     "PAID-TIER. Queue a long-running Claude Code subprocess "
@@ -7142,6 +7251,8 @@ def build_mcp_server():
                 "list_hitl_requests", "answer_hitl", "dismiss_hitl",
                 "list_sessions",
                 "add_note", "get_notes", "delete_note",
+                "add_workspace_note", "get_workspace_notes",
+                "pin_workspace_decision", "get_workspace_decisions",
             ):
                 # v2.4/v0.9 — share dispatch with HTTP MCP so both surfaces stay in sync.
                 result = await _dispatch_mcp_tool(

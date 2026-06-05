@@ -173,6 +173,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     status TEXT NOT NULL DEFAULT 'active'
         CHECK (status IN ('active','idle','closed','archived')),
     last_seen TEXT NOT NULL DEFAULT (datetime('now')),
+    checkpoint_data TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -429,6 +430,33 @@ CREATE INDEX IF NOT EXISTS idx_file_locks_session
     ON file_locks(session_id);
 CREATE INDEX IF NOT EXISTS idx_file_locks_expires
     ON file_locks(expires_at);
+
+-- v3.1 — workspace layer: tenant-global notes + decisions that live above
+-- individual projects. Unlike project_notes / decisions_pinned (keyed by
+-- project_id), these belong to the workspace as a whole (one workspace per
+-- Meridian instance / hosted tenant DB) and are injected at the top of every
+-- project's context block + handoff. Tags are comma-separated free-form.
+CREATE TABLE IF NOT EXISTS workspace_notes (
+    id TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    body TEXT NOT NULL,
+    tags TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS workspace_decisions (
+    id TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    body TEXT NOT NULL,
+    category TEXT NOT NULL DEFAULT 'TECHNICAL',
+    status TEXT NOT NULL DEFAULT 'active'
+        CHECK (status IN ('active','superseded')),
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_workspace_notes_created
+    ON workspace_notes(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_workspace_decisions_status
+    ON workspace_decisions(status, created_at DESC);
 """
 
 
@@ -1365,6 +1393,50 @@ async def _migrate_file_locks(db: aiosqlite.Connection) -> None:
     await db.commit()
 
 
+async def _migrate_workspace_layer(db: aiosqlite.Connection) -> None:
+    """v3.1 — workspace_notes + workspace_decisions tables (tenant-global,
+    above projects). Idempotent."""
+    await db.execute(
+        """CREATE TABLE IF NOT EXISTS workspace_notes (
+            id TEXT PRIMARY KEY,
+            title TEXT NOT NULL,
+            body TEXT NOT NULL,
+            tags TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )"""
+    )
+    await db.execute(
+        """CREATE TABLE IF NOT EXISTS workspace_decisions (
+            id TEXT PRIMARY KEY,
+            title TEXT NOT NULL,
+            body TEXT NOT NULL,
+            category TEXT NOT NULL DEFAULT 'TECHNICAL',
+            status TEXT NOT NULL DEFAULT 'active',
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )"""
+    )
+    await db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_workspace_notes_created "
+        "ON workspace_notes(created_at DESC)"
+    )
+    await db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_workspace_decisions_status "
+        "ON workspace_decisions(status, created_at DESC)"
+    )
+    await db.commit()
+
+
+async def _migrate_checkpoint_data(db: aiosqlite.Connection) -> None:
+    """v3.1 — add sessions.checkpoint_data for per-session checkpoint snapshots
+    (replaces the old checkpoint: project_notes hack). Idempotent. Also clears
+    the legacy checkpoint:* notes now superseded by the column."""
+    await _migrate_add_column_if_missing(db, "sessions", "checkpoint_data", "TEXT")
+    await db.execute(
+        "DELETE FROM project_notes WHERE title LIKE ?", ("checkpoint:%",)
+    )
+    await db.commit()
+
+
 async def init_hosted_tables(db: aiosqlite.Connection) -> None:
     """Ensure hosted-tier tables exist on the given connection.
 
@@ -1439,6 +1511,8 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_milestone_type(db)
     await _migrate_ntfy_notifications(db)
     await _migrate_github_integration(db)
+    await _migrate_workspace_layer(db)
+    await _migrate_checkpoint_data(db)
     return db
 
 
@@ -5360,6 +5434,154 @@ async def delete_project_note(
         rc = cur.rowcount or 0
     await db.commit()
     return rc > 0
+
+
+# ---------------------------------------------------------------------------
+# v3.1 — workspace layer: tenant-global notes + decisions above projects
+# ---------------------------------------------------------------------------
+
+
+async def add_workspace_note(
+    db: aiosqlite.Connection,
+    title: str,
+    body: str,
+    tags: str | None = None,
+) -> dict[str, Any]:
+    """Insert a workspace_notes row. tags is comma-separated free-form.
+    Workspace notes belong to the whole workspace, not a single project."""
+    nid = _new_id()
+    await db.execute(
+        "INSERT INTO workspace_notes (id, title, body, tags) "
+        "VALUES (?, ?, ?, ?)",
+        (nid, title, body, tags),
+    )
+    await db.commit()
+    async with db.execute(
+        "SELECT * FROM workspace_notes WHERE id = ?", (nid,)
+    ) as cur:
+        row = await cur.fetchone()
+    return _row_to_dict(row) or {"id": nid}
+
+
+async def get_workspace_notes(
+    db: aiosqlite.Connection,
+    tag: str | None = None,
+) -> list[dict[str, Any]]:
+    """Return workspace notes, newest first. Optional tag substring filter."""
+    if tag:
+        async with db.execute(
+            "SELECT * FROM workspace_notes WHERE tags LIKE ? "
+            "ORDER BY created_at DESC",
+            (f"%{tag}%",),
+        ) as cur:
+            rows = await cur.fetchall()
+    else:
+        async with db.execute(
+            "SELECT * FROM workspace_notes ORDER BY created_at DESC",
+        ) as cur:
+            rows = await cur.fetchall()
+    return [_row_to_dict(r) for r in rows if r is not None]  # type: ignore[misc]
+
+
+async def delete_workspace_note(
+    db: aiosqlite.Connection, note_id: str
+) -> bool:
+    """Hard-delete a workspace note. Returns True if a row was removed."""
+    async with db.execute(
+        "DELETE FROM workspace_notes WHERE id = ?", (note_id,)
+    ) as cur:
+        rc = cur.rowcount or 0
+    await db.commit()
+    return rc > 0
+
+
+async def pin_workspace_decision(
+    db: aiosqlite.Connection,
+    title: str,
+    body: str,
+    category: str = "TECHNICAL",
+) -> dict[str, Any]:
+    """Create a workspace-level pinned decision. category is free-text
+    (STRATEGIC, TECHNICAL, PRODUCT, ...)."""
+    did = _new_id()
+    await db.execute(
+        "INSERT INTO workspace_decisions (id, title, body, category) "
+        "VALUES (?, ?, ?, ?)",
+        (did, title, body, category),
+    )
+    await db.commit()
+    async with db.execute(
+        "SELECT * FROM workspace_decisions WHERE id = ?", (did,)
+    ) as cur:
+        row = await cur.fetchone()
+    return _row_to_dict(row) or {"id": did}
+
+
+async def get_workspace_decisions(
+    db: aiosqlite.Connection,
+    include_superseded: bool = False,
+) -> list[dict[str, Any]]:
+    """Return workspace decisions, newest first. Active only by default."""
+    if include_superseded:
+        sql = "SELECT * FROM workspace_decisions ORDER BY created_at DESC"
+    else:
+        sql = (
+            "SELECT * FROM workspace_decisions WHERE status = 'active' "
+            "ORDER BY created_at DESC"
+        )
+    async with db.execute(sql) as cur:
+        rows = await cur.fetchall()
+    return [_row_to_dict(r) for r in rows if r is not None]  # type: ignore[misc]
+
+
+async def delete_workspace_decision(
+    db: aiosqlite.Connection, decision_id: str
+) -> bool:
+    """Hard-delete a workspace decision. Returns True if a row was removed."""
+    async with db.execute(
+        "DELETE FROM workspace_decisions WHERE id = ?", (decision_id,)
+    ) as cur:
+        rc = cur.rowcount or 0
+    await db.commit()
+    return rc > 0
+
+
+# ---------------------------------------------------------------------------
+# v3.1 — per-session checkpoint snapshots (sessions.checkpoint_data)
+# ---------------------------------------------------------------------------
+
+
+async def set_session_checkpoint(
+    db: aiosqlite.Connection, session_id: str, data: dict[str, Any]
+) -> None:
+    """Store a checkpoint snapshot on the session row as JSON text.
+    Replaces the legacy checkpoint:* project_notes hack."""
+    await db.execute(
+        "UPDATE sessions SET checkpoint_data = ? WHERE id = ?",
+        (json.dumps(data), session_id),
+    )
+    await db.commit()
+
+
+async def get_session_checkpoint(
+    db: aiosqlite.Connection, session_id: str
+) -> dict[str, Any] | None:
+    """Return the latest checkpoint snapshot for a session, or None."""
+    async with db.execute(
+        "SELECT checkpoint_data FROM sessions WHERE id = ?", (session_id,)
+    ) as cur:
+        row = await cur.fetchone()
+    if row is None:
+        return None
+    raw = row["checkpoint_data"]
+    if not raw:
+        return None
+    if isinstance(raw, dict):  # Postgres may return parsed JSON
+        return raw
+    try:
+        return json.loads(raw)
+    except (ValueError, TypeError):
+        return None
 
 
 # ---------------------------------------------------------------------------
