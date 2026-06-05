@@ -303,6 +303,22 @@ async def test_open_tenant_db_falls_back_to_auth_db_when_decrypt_fails(monkeypat
     assert conn == {"opened_url": "postgresql://fallback-db"}
 
 
+def test_strip_unsupported_pg_query_params_preserves_sslmode():
+    import meridian.pg_adapter as pg_adapter
+
+    url = (
+        "postgresql://user:pass@ep-bitter-art-ajwunt4h-pooler.c-3.us-east-2.aws.neon.tech/"
+        "cust_dradamawsome_48a1bd68?channel_binding=require&sslmode=require"
+    )
+
+    cleaned = pg_adapter._strip_unsupported_pg_query_params(url)
+
+    assert cleaned == (
+        "postgresql://user:pass@ep-bitter-art-ajwunt4h-pooler.c-3.us-east-2.aws.neon.tech/"
+        "cust_dradamawsome_48a1bd68?sslmode=require"
+    )
+
+
 @pytest.mark.asyncio
 async def test_create_neon_pool_project_omits_suspend_timeout(monkeypatch):
     import httpx

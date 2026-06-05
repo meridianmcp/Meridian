@@ -20,6 +20,7 @@ import asyncio
 import os
 import re
 from typing import Any
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 
 def _is_transient_pg_error(exc: Exception) -> bool:
@@ -64,6 +65,27 @@ def _same_pg_host(url_a: str, url_b: str) -> bool:
         return host_a == host_b
     except IndexError:
         return url_a == url_b
+
+
+def _strip_unsupported_pg_query_params(url: str) -> str:
+    """Remove query params unsupported by psycopg without corrupting the URL."""
+    parsed = urlsplit(url)
+    if not parsed.query:
+        return url
+    filtered = [
+        (key, value)
+        for key, value in parse_qsl(parsed.query, keep_blank_values=True)
+        if key != "channel_binding"
+    ]
+    return urlunsplit(
+        (
+            parsed.scheme,
+            parsed.netloc,
+            parsed.path,
+            urlencode(filtered, doseq=True),
+            parsed.fragment,
+        )
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -697,8 +719,7 @@ async def open_pg_connection(url: str) -> PostgresConnection:
             "Install: pip install 'psycopg[binary]' psycopg-pool"
         ) from exc
 
-    clean_url = re.sub(r"[?&]channel_binding=[^&]*", "", url)
-    clean_url = re.sub(r"\?&", "?", clean_url).rstrip("?")
+    clean_url = _strip_unsupported_pg_query_params(url)
 
     pool = AsyncConnectionPool(
         clean_url,
@@ -737,8 +758,7 @@ async def init_pg_db(url: str) -> PostgresConnection:
         ) from exc
 
     # Strip channel_binding param — not supported by psycopg3
-    clean_url = re.sub(r"[?&]channel_binding=[^&]*", "", url)
-    clean_url = re.sub(r"\?&", "?", clean_url).rstrip("?")
+    clean_url = _strip_unsupported_pg_query_params(url)
 
     # open=False → pool created without connecting. Connections are made lazily
     # on first acquire(), which happens inside the running Uvicorn event loop
