@@ -3,7 +3,7 @@
 Use Meridian from browser-based AI clients without giving up the shared session memory, sprint board, or HITL queue. The setup path depends on the client:
 
 - **claude.ai** uses a browser extension that bridges your tab to an MCP server over SSE
-- **ChatGPT** uses a custom connector backed by a remote MCP server
+- **ChatGPT** uses a custom connector backed by a remote MCP server; no Chrome extension is required
 
 ---
 
@@ -11,8 +11,12 @@ Use Meridian from browser-based AI clients without giving up the shared session 
 
 Use Meridian directly inside claude.ai — no local install, no terminal. The [dnakov/claude-mcp](https://github.com/dnakov/claude-mcp) Chrome extension bridges the gap between your browser tab and any MCP server via SSE.
 
----
 
+## Video walkthrough
+
+<iframe width="100%" height="400" src="https://www.youtube.com/embed/q1kZZH6LZK0" frameborder="0" allowfullscreen></iframe>
+
+---
 ## Quick start (hosted tier)
 
 1. **Install the extension** — [dnakov/claude-mcp on GitHub](https://github.com/dnakov/claude-mcp). Install the Chrome extension from the repository's releases page.
@@ -52,11 +56,19 @@ pixi run start
 
 ## ChatGPT
 
-ChatGPT connects to Meridian as a **custom connector** backed by a **remote MCP server**. Hosted Meridian is the easiest path because it already exposes a public MCP endpoint.
+ChatGPT connects to Meridian as a **custom connector** backed by a **remote MCP server**. Hosted Meridian is the easiest path because it already exposes a public MCP endpoint, and you do not need the claude.ai Chrome extension for this flow.
 
-1. Open Meridian at [usemeridian.us](https://usemeridian.us) if you want the hosted path.
-2. In ChatGPT, add Meridian as a custom connector and use the remote MCP URL: `https://usemeridian.us/mcp`
-3. Complete the authorization flow if ChatGPT prompts for sign-in or approval.
+### Setup
+
+1. Open ChatGPT and sign in.
+2. Enable Developer mode or custom connectors if your workspace requires it.
+3. Add Meridian as a custom connector and set the MCP URL to `https://usemeridian.us/mcp`.
+4. Complete the authorization flow if ChatGPT prompts for sign-in or approval.
+
+
+### Video walkthrough
+
+<iframe width="100%" height="400" src="https://www.youtube.com/embed/H8sEAE5_Y5c" frameborder="0" allowfullscreen></iframe>
 
 !!! note "Remote MCP only"
     ChatGPT connects to remote MCP servers. A local URL such as `http://localhost:7878/mcp` will not connect directly from ChatGPT. If you are self-hosting Meridian, put it behind a secure public URL or tunnel first.
