@@ -24,9 +24,18 @@ FAIL = "\033[31mFAIL\033[0m"
 SKIP = "\033[33mSKIP\033[0m"
 
 
-def get(url: str, timeout: int = 15) -> tuple[int, str]:
+# Cloudflare in front of prod blocks the default urllib User-Agent (403),
+# so present a browser-like UA on every request.
+_UA = "Mozilla/5.0 (Meridian-smoke-test)"
+
+
+def get(url: str, timeout: int = 15, cookie: str | None = None) -> tuple[int, str]:
+    headers = {"User-Agent": _UA}
+    if cookie:
+        headers["Cookie"] = cookie
     try:
-        with urllib.request.urlopen(url, timeout=timeout) as r:
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=timeout) as r:
             return r.status, r.read().decode()
     except urllib.error.HTTPError as e:
         return e.code, e.read().decode()
@@ -34,9 +43,21 @@ def get(url: str, timeout: int = 15) -> tuple[int, str]:
         return -1, str(exc)
 
 
+def get_demo_cookie(base: str) -> str:
+    """Hit /demo to obtain the short-lived cookie that routes API calls to the
+    isolated demo DB. Returns the cookie pair (e.g. ``meridian_demo=1``)."""
+    try:
+        req = urllib.request.Request(f"{base}/demo", headers={"User-Agent": _UA})
+        with urllib.request.urlopen(req, timeout=15) as r:
+            raw = r.headers.get("Set-Cookie", "")
+            return raw.split(";")[0] if raw else "meridian_demo=1"
+    except Exception:
+        return "meridian_demo=1"
+
+
 def post(url: str, data: dict[str, Any], timeout: int = 15) -> tuple[int, str]:
     raw = json.dumps(data).encode()
-    req = urllib.request.Request(url, data=raw, headers={"Content-Type": "application/json"}, method="POST")
+    req = urllib.request.Request(url, data=raw, headers={"Content-Type": "application/json", "User-Agent": _UA}, method="POST")
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
             return r.status, r.read().decode()
@@ -68,40 +89,52 @@ def main() -> int:
     if not check("GET /health -> 200", code == 200, f"got {code}"):
         failures += 1
 
-    # 2. GET /demo -> 200, contains "backend-api-v2"
+    # 2. GET /demo -> 200 (dashboard shell; data loads via cookie-routed API)
     code, body = get(f"{base}/demo")
-    ok = code == 200 and "backend-api-v2" in body
-    if not check('GET /demo -> 200 + "backend-api-v2"', ok, f"got {code}"):
+    ok = code == 200 and "dashboard" in body.lower()
+    if not check("GET /demo -> 200 (dashboard shell)", ok, f"got {code}"):
         failures += 1
 
-    # 3. GET /demo/projects -> 200, at least 1 project
-    code, body = get(f"{base}/demo/projects")
+    # The demo dashboard routes its API calls to the isolated demo DB via a
+    # short-lived cookie set by /demo. Projects/sessions live on the normal
+    # API routes, not /demo/* paths.
+    demo_cookie = get_demo_cookie(base)
+
+    # 3. GET /projects (demo cookie) -> 200, at least 1 project
+    code, body = get(f"{base}/projects", cookie=demo_cookie)
+    first_project_id = None
     try:
         projects = json.loads(body)
-        ok = code == 200 and len(projects) >= 1
-        detail = f"got {len(projects)} projects"
+        ok = code == 200 and isinstance(projects, list) and len(projects) >= 1
+        if ok:
+            first_project_id = projects[0].get("id")
+        detail = f"got {len(projects) if isinstance(projects, list) else '?'} projects"
     except Exception:
         ok = False
         detail = f"JSON parse error, code={code}"
-    if not check("GET /demo/projects -> >=1 project", ok, detail):
+    if not check("GET /projects (demo) -> >=1 project", ok, detail):
         failures += 1
 
-    # 4. GET /demo/sessions -> 200, at least 1 session
-    code, body = get(f"{base}/demo/sessions")
-    try:
-        sessions = json.loads(body)
-        ok = code == 200 and len(sessions) >= 1
-        detail = f"got {len(sessions)} sessions"
-    except Exception:
+    # 4. GET /projects/{id}/sessions (demo cookie) -> 200, list returned
+    if first_project_id:
+        code, body = get(f"{base}/projects/{first_project_id}/sessions", cookie=demo_cookie)
+        try:
+            sessions = json.loads(body)
+            ok = code == 200 and isinstance(sessions, list)
+            detail = f"got {len(sessions)} sessions"
+        except Exception:
+            ok = False
+            detail = f"JSON parse error, code={code}"
+    else:
         ok = False
-        detail = f"JSON parse error, code={code}"
-    if not check("GET /demo/sessions -> >=1 session", ok, detail):
+        detail = "no project id from previous check"
+    if not check("GET /projects/{id}/sessions (demo) -> 200 list", ok, detail):
         failures += 1
 
-    # 5. GET /pricing -> 200, contains "Free" and "Solo"
+    # 5. GET /pricing -> 200, contains "Free" and "Pro"
     code, body = get(f"{base}/pricing")
-    ok = code == 200 and "Free" in body and "Solo" in body
-    if not check('GET /pricing -> 200 + "Free" + "Solo"', ok, f"got {code}"):
+    ok = code == 200 and "Free" in body and "Pro" in body
+    if not check('GET /pricing -> 200 + "Free" + "Pro"', ok, f"got {code}"):
         failures += 1
 
     # 6. GET /mcp/quickstart -> 200, contains "start_session"

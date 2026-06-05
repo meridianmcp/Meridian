@@ -58,7 +58,12 @@ def test_auth_github_callback_missing_code(client):
 
 
 def test_auth_github_repo_connect_redirects_to_repo_callback(tmp_path, monkeypatch):
-    """GET /auth/github/repo-connect uses the dedicated repo callback URL."""
+    """GET /auth/github/repo-connect uses the single registered callback URL.
+
+    Only one callback URL is registered on the GitHub OAuth app
+    (/auth/github/callback); the state=repo: prefix distinguishes the
+    repo-connect flow from login. See workspace rule — never change this
+    to /auth/github/repo-callback."""
     monkeypatch.setenv("GITHUB_CLIENT_ID", "Ov23liFakeId")
     monkeypatch.setenv("MERIDIAN_SESSION_SECRET", "test-session-secret")
     mod, client = _github_client(tmp_path, monkeypatch)
@@ -83,12 +88,13 @@ def test_auth_github_repo_connect_redirects_to_repo_callback(tmp_path, monkeypat
         assert r.status_code == 302
         location = r.headers["location"]
         assert "redirect_uri=" in location
-        assert "%2Fauth%2Fgithub%2Frepo-callback" in location
+        assert "%2Fauth%2Fgithub%2Fcallback" in location
+        assert "%2Fauth%2Fgithub%2Frepo-callback" not in location
         assert "state=repo%3Aproj-123" in location
 
 
 def test_exchange_github_repo_code_uses_repo_callback(monkeypatch):
-    """Repo token exchange must send GitHub the repo-specific callback URL."""
+    """Repo token exchange must send GitHub the single registered callback URL."""
     seen: dict[str, str] = {}
 
     async def fake_exchange(code, redirect_uri):
@@ -106,7 +112,7 @@ def test_exchange_github_repo_code_uses_repo_callback(monkeypatch):
     data = asyncio.run(hosted_module.exchange_github_repo_code_for_connection("oauth-code"))
     assert data["access_token"] == "access-token"
     assert seen["code"] == "oauth-code"
-    assert seen["redirect_uri"] == "https://usemeridian.us/auth/github/repo-callback"
+    assert seen["redirect_uri"] == "https://usemeridian.us/auth/github/callback"
 
 
 def test_github_connect_validates_pat(tmp_path, monkeypatch):

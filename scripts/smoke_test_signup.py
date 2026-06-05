@@ -21,6 +21,11 @@ import urllib.request
 import uuid
 
 
+# Cloudflare in front of prod blocks the default urllib User-Agent (403),
+# so present a browser-like UA on every request.
+_UA = "Mozilla/5.0 (Meridian-smoke-test)"
+
+
 def check(name: str, passed: bool, detail: str = "") -> bool:
     status = "PASS" if passed else "FAIL"
     line = f"  [{status}] {name}"
@@ -36,7 +41,7 @@ def post(url: str, body: dict, timeout: int = 15) -> tuple[int, str]:
     req = urllib.request.Request(
         url,
         data=data,
-        headers={"Content-Type": "application/json"},
+        headers={"Content-Type": "application/json", "User-Agent": _UA},
         method="POST",
     )
     try:
@@ -51,7 +56,8 @@ def post(url: str, body: dict, timeout: int = 15) -> tuple[int, str]:
 def get(url: str, timeout: int = 10) -> tuple[int, str]:
     """Return (status_code, body). Returns (-1, error_msg) on network error."""
     try:
-        with urllib.request.urlopen(url, timeout=timeout) as resp:
+        req = urllib.request.Request(url, headers={"User-Agent": _UA})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
             return resp.status, resp.read().decode("utf-8", errors="replace")
     except urllib.error.HTTPError as exc:
         return exc.code, exc.read().decode("utf-8", errors="replace")

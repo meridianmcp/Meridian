@@ -20,6 +20,11 @@ COPY . .
 
 EXPOSE 8000
 
+# Cache-bust query param for static assets. git is not installed in this
+# image, so the SHA is baked in at build time by the deploy pipeline.
+ARG MERIDIAN_GIT_SHA=""
+ENV MERIDIAN_GIT_SHA=$MERIDIAN_GIT_SHA
+
 ENV MERIDIAN_DB=/app/data/meridian.db
 
 # Startup: enforce Postgres when running on Fly
