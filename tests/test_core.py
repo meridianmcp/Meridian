@@ -6828,8 +6828,16 @@ def _github_client(tmp_path, monkeypatch):
     monkeypatch.setenv("MERIDIAN_GOAL_MD", str(tmp_path / "GOAL.md"))
     monkeypatch.setenv("MERIDIAN_HOSTED", "1")
     from fastapi.testclient import TestClient
+    from meridian import _deps as deps_module
 
     mod = importlib.reload(server_module)
+    deps_module._tenant_db_cache.clear()
+
+    async def _use_auth_db(request, tenant_id):
+        return request.app.state.db
+
+    monkeypatch.setattr(deps_module, "_open_tenant_db_by_id", _use_auth_db)
+    monkeypatch.setattr(mod, "_open_tenant_db_by_id", _use_auth_db)
     return mod, TestClient(mod.app)
 
 
