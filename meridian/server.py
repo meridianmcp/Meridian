@@ -15,6 +15,7 @@ import hashlib
 import html as html_module
 import json
 import asyncio
+import math
 import os
 import re
 import signal
@@ -598,6 +599,12 @@ async def lifespan(app: FastAPI):
             try:
                 await asyncio.sleep(interval_s)
                 await db_module.run_auto_summary_cycle(db)
+                # Archive sessions silent for 24h+ so dead runs drop out of the
+                # active list and release any in_progress tasks they were holding.
+                try:
+                    await db_module.expire_inactive_sessions(db)
+                except Exception:  # noqa: BLE001
+                    pass
                 # v1.0.1 — PID watchdog: mark orphaned in_progress tasks as failed
                 try:
                     stale = await db_module.get_in_progress_tasks_with_pid(db)
@@ -1223,6 +1230,7 @@ async def server_config() -> dict[str, Any]:
         "connection_name": conn_name,
         "connections": toml_config_module.list_connections(),
         "demo_mode": os.environ.get("MERIDIAN_DEMO", "").lower() in ("1", "true", "yes"),
+        "stripe_payment_link": os.environ.get("STRIPE_PAYMENT_LINK", "/pricing"),
     }
 
 
@@ -3587,21 +3595,29 @@ async def get_usage_settings(request: Request) -> dict[str, Any]:
     tenant = await get_current_tenant(request)
     plan = tenant.get("plan") or "standard"
     limits = PLAN_LIMITS.get(plan, PLAN_LIMITS["free"])
+    unlimited = math.isinf(limits["cu_hours"])
+    # float('inf') is not valid JSON for the browser's JSON.parse — emit null + a flag.
+    cu_limit = None if math.isinf(limits["cu_hours"]) else limits["cu_hours"]
+    cu_grace = None if unlimited else limits["cu_hours"] + limits["grace_cu_hours"]
+    gb_limit = None if math.isinf(limits["storage_gb"]) else limits["storage_gb"]
     return {
         "plan": plan,
+        "unlimited": unlimited,
         "compute": {
             "used": float(tenant.get("compute_cu_hours_used") or 0),
-            "limit": limits["cu_hours"],
-            "grace": limits["cu_hours"] + limits["grace_cu_hours"],
+            "limit": cu_limit,
+            "grace": cu_grace,
             "cap_usd": float(tenant.get("compute_overage_cap_usd") or 0),
             "throttled": bool(tenant.get("compute_throttled_at")),
             "rate": COMPUTE_OVERAGE_RATE,
+            "unlimited": unlimited,
         },
         "storage": {
             "used_gb": float(tenant.get("storage_gb_used") or 0),
-            "limit_gb": limits["storage_gb"],
+            "limit_gb": gb_limit,
             "cap_usd": float(tenant.get("storage_overage_cap_usd") or 0),
             "rate": STORAGE_OVERAGE_RATE,
+            "unlimited": unlimited,
         },
     }
 

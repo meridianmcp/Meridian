@@ -220,6 +220,31 @@ def test_patch_notification_prefs_returns_404_in_non_hosted_mode(client):
     assert r.status_code == 404
 
 
+def test_patch_notification_prefs_persists_in_hosted_mode(monkeypatch, tmp_path):
+    """PATCH /settings/notifications stores prefs for an authenticated tenant."""
+    monkeypatch.setenv("MERIDIAN_HOSTED", "1")
+    monkeypatch.setenv("MERIDIAN_SESSION_SECRET", "test-secret")
+    with _make_gated_client(monkeypatch, tmp_path) as c:
+        from meridian.hosted import _make_session_cookie
+
+        db = c.app.state.db
+        tenant = asyncio.run(db_module.upsert_tenant(db, "notify@example.com"))
+        session = asyncio.run(
+            db_module.create_user_session(db, tenant["id"], "2099-01-01 00:00:00")
+        )
+        c.cookies.set("meridian_session", _make_session_cookie(session["id"]))
+
+        r = c.patch("/settings/notifications", json={"hitl": False, "sprint": False})
+        assert r.status_code == 200, r.text
+        assert r.json()["prefs"]["hitl"] is False
+        assert r.json()["prefs"]["sprint"] is False
+
+        r2 = c.get("/settings/notifications")
+        assert r2.status_code == 200, r2.text
+        assert r2.json()["prefs"]["hitl"] is False
+        assert r2.json()["prefs"]["storage"] is True
+
+
 # ---------------------------------------------------------------------------
 # Admin health endpoint
 # ---------------------------------------------------------------------------

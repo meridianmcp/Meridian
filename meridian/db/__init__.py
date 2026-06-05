@@ -3197,6 +3197,62 @@ async def expire_idle_sessions(
     return {"count": cursor.rowcount, "project_ids": affected_project_ids}
 
 
+async def expire_inactive_sessions(
+    db: aiosqlite.Connection, max_age_hours: int = 24
+) -> dict[str, Any]:
+    """Archive sessions whose ``last_seen`` is older than *max_age_hours*.
+
+    A session that hasn't checked in for a day is treated as dead: it is moved
+    to 'archived' (so it drops out of the dashboard's active list) and any
+    'in_progress' tasks it held — plus their linked sprint_items — are released
+    back to 'pending' so another worker can claim them. Runs globally across all
+    projects, unlike the per-project :func:`archive_stale_sessions`. Only
+    'active' and 'idle' rows are touched. Returns ``{"count", "project_ids"}``.
+    """
+    from datetime import datetime, timedelta, timezone
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=max_age_hours)).strftime(
+        "%Y-%m-%d %H:%M:%S"
+    )
+    async with db.execute(
+        "SELECT DISTINCT project_id FROM sessions "
+        "WHERE status IN ('active', 'idle') AND last_seen < ?",
+        (cutoff,),
+    ) as cur:
+        affected_project_ids = [row["project_id"] for row in await cur.fetchall()]
+
+    async with db.execute(
+        "SELECT id, sprint_item_id FROM task_log "
+        "WHERE claimed_by IN ("
+        "  SELECT id FROM sessions WHERE status IN ('active', 'idle') AND last_seen < ?"
+        ") AND status = 'in_progress'",
+        (cutoff,),
+    ) as cur:
+        stale_rows = await cur.fetchall()
+    stale_task_ids = [row["id"] for row in stale_rows]
+    linked_item_ids = [row["sprint_item_id"] for row in stale_rows if row["sprint_item_id"]]
+    if stale_task_ids:
+        placeholders = ", ".join("?" for _ in stale_task_ids)
+        await db.execute(
+            f"UPDATE task_log SET status = 'pending', claimed_by = NULL, claimed_at = NULL "
+            f"WHERE id IN ({placeholders})",
+            tuple(stale_task_ids),
+        )
+    if linked_item_ids:
+        placeholders = ", ".join("?" for _ in linked_item_ids)
+        await db.execute(
+            f"UPDATE sprint_items SET status = 'pending', completed_at = NULL "
+            f"WHERE id IN ({placeholders}) AND status = 'in_progress'",
+            tuple(linked_item_ids),
+        )
+    cursor = await db.execute(
+        "UPDATE sessions SET status = 'archived' "
+        "WHERE status IN ('active', 'idle') AND last_seen < ?",
+        (cutoff,),
+    )
+    await db.commit()
+    return {"count": cursor.rowcount, "project_ids": affected_project_ids}
+
+
 # ---------------------------------------------------------------------------
 # Sprint items (v1.1) — machine-trackable checklist alongside the
 # free-text sprint field. Fixes the "sprint drift" problem where items

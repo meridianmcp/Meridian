@@ -1641,6 +1641,7 @@ async def run_storage_overage_check(db: Any) -> None:
 # ---------------------------------------------------------------------------
 
 PLAN_LIMITS: dict[str, dict[str, float]] = {
+    "admin":    {"cu_hours": float("inf"), "grace_cu_hours": float("inf"), "storage_gb": float("inf")},
     "standard": {"cu_hours": 50.0,  "grace_cu_hours": 20.0, "storage_gb": 1.0},
     "pro":      {"cu_hours": 200.0, "grace_cu_hours": 20.0, "storage_gb": 10.0},
     "free":     {"cu_hours": 10.0,  "grace_cu_hours": 5.0,  "storage_gb": 0.1},

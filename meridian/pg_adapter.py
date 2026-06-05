@@ -475,6 +475,8 @@ CREATE TABLE IF NOT EXISTS sprint_items (
     completed_at TEXT,
     task_id TEXT,
     notes TEXT,
+    feedback_thumb SMALLINT,
+    feedback_note TEXT,
     milestone_type TEXT NOT NULL DEFAULT 'task'
 );
 
@@ -614,6 +616,7 @@ CREATE TABLE IF NOT EXISTS tenants (
     github_pat TEXT,
     github_repo TEXT,
     github_branch TEXT,
+    notification_prefs TEXT NOT NULL DEFAULT '{{}}',
     created_at TEXT NOT NULL DEFAULT ({_TS})
 );
 
@@ -803,6 +806,7 @@ async def init_pg_db(url: str) -> PostgresConnection:
     if is_main_db:
         await conn.executescript(CREATE_TABLES_HOSTED)
     await _migrate_pg_sprint_items_v2(conn)
+    await _migrate_pg_v25_sprint_feedback(conn)
     await _migrate_pg_drop_chat_tables(conn)
     await _migrate_pg_goal_field_timestamps(conn)
     await _migrate_pg_v24_task_tree_and_framework(conn)
@@ -820,6 +824,7 @@ async def init_pg_db(url: str) -> PostgresConnection:
         await _migrate_pg_v28_dunning_and_github_sub(conn)
         await _migrate_pg_v29_free_tier_columns(conn)
         await _migrate_pg_v31_github_integration(conn)
+        await _migrate_pg_v25_notification_prefs(conn)
     return conn
 
 
@@ -1036,6 +1041,19 @@ async def _migrate_pg_sprint_items_v2(conn: PostgresConnection) -> None:
     )
 
 
+async def _migrate_pg_v25_sprint_feedback(conn: PostgresConnection) -> None:
+    """v2.5 — sprint_items thumbs-up/down feedback columns.
+
+    Mirrors db._migrate_v25_feedback_and_notifications for Postgres. Neither
+    CREATE_TABLES_PG nor any prior migration added these, so existing AND fresh
+    Postgres DBs both need them. ADD COLUMN IF NOT EXISTS is idempotent.
+    """
+    await conn.executescript(
+        "ALTER TABLE sprint_items ADD COLUMN IF NOT EXISTS feedback_thumb SMALLINT;"
+        "ALTER TABLE sprint_items ADD COLUMN IF NOT EXISTS feedback_note TEXT"
+    )
+
+
 async def _migrate_pg_v28_dunning_and_github_sub(conn: PostgresConnection) -> None:
     """v2.8 — dunning fields + github_sub + overage tracking on tenants.
 
@@ -1077,6 +1095,19 @@ async def _migrate_pg_v31_github_integration(conn: PostgresConnection) -> None:
         "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS github_pat TEXT;"
         "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS github_repo TEXT;"
         "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS github_branch TEXT"
+    )
+
+
+async def _migrate_pg_v25_notification_prefs(conn: PostgresConnection) -> None:
+    """v2.5 — tenants.notification_prefs for email notification settings.
+
+    Mirrors db._migrate_v25_feedback_and_notifications for Postgres. Missing
+    from CREATE_TABLES_HOSTED, so PATCH /settings/notifications 500s on every
+    hosted DB until this runs. ADD COLUMN IF NOT EXISTS is idempotent.
+    """
+    await conn.executescript(
+        "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS "
+        "notification_prefs TEXT NOT NULL DEFAULT '{}'"
     )
 
 
