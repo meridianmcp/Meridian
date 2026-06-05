@@ -217,7 +217,7 @@ def _github_callback_url() -> str:
 def _github_repo_callback_url() -> str:
     """Return the absolute callback URL for the GitHub repo-connect flow."""
     base = _cfg("MERIDIAN_BASE_URL", "http://localhost:7878").rstrip("/")
-    return f"{base}/auth/github/repo-callback"
+    return f"{base}/auth/github/callback"
 
 
 async def get_github_auth_url(
@@ -633,7 +633,13 @@ async def auth_github_login(request: Request) -> RedirectResponse:
 
 
 async def auth_github_callback(request: Request) -> RedirectResponse:
-    """Handle GitHub OAuth callback — upsert tenant, set session cookie."""
+    """Handle GitHub OAuth callback — upsert tenant, set session cookie.
+    Also handles repo-connect flow when state starts with 'repo:'."""
+    # Delegate to repo-connect handler if this is a repo OAuth flow
+    state = request.query_params.get("state", "")
+    if state.startswith("repo:"):
+        return await auth_github_repo_callback(request)
+
     from . import db as db_module
 
     code = request.query_params.get("code")
@@ -691,7 +697,7 @@ async def auth_github_repo_connect(request: Request) -> RedirectResponse:
     try:
         url = await get_github_auth_url(
             scope="repo",
-            state=project_id,
+            state=f"repo:{project_id}",
             redirect_uri=_github_repo_callback_url(),
         )
     except RuntimeError as exc:
@@ -704,7 +710,8 @@ async def auth_github_repo_callback(request: Request) -> RedirectResponse:
     from . import db as db_module
 
     code = request.query_params.get("code", "").strip()
-    project_id = request.query_params.get("state", "").strip()
+    _state = request.query_params.get("state", "").strip()
+    project_id = _state.removeprefix("repo:") if _state.startswith("repo:") else _state
     if not code:
         raise HTTPException(status_code=400, detail="missing oauth code")
     if not project_id:
@@ -973,7 +980,6 @@ async def _create_neon_pool_project(
             "default_endpoint_settings": {
                 "autoscaling_limit_min_cu": 0.25,
                 "autoscaling_limit_max_cu": autoscaling_limit_max_cu,
-                "suspend_timeout_seconds": 300,  # scale to zero after 5 min
             },
             "quota": quota,
         }
@@ -1011,6 +1017,7 @@ async def _create_customer_database(
 
     Returns the connection URI for the new database.
     """
+    import asyncio as _asyncio
     import httpx
 
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
@@ -1033,18 +1040,27 @@ async def _create_customer_database(
 
     # Create the database
     async with httpx.AsyncClient(timeout=15) as http:
-        resp = await http.post(
-            f"https://console.neon.tech/api/v2/projects/{neon_project_id}/branches/{branch_id}/databases",
-            headers=headers,
-            json={"database": {"name": db_name, "owner_name": "neondb_owner"}},
-        )
-        resp.raise_for_status()
+        resp = None
+        for attempt in range(10):
+            resp = await http.post(
+                f"https://console.neon.tech/api/v2/projects/{neon_project_id}/branches/{branch_id}/databases",
+                headers=headers,
+                json={"database": {"name": db_name, "owner_name": "neondb_owner"}},
+            )
+            if resp.status_code == 409:
+                break
+            if resp.status_code != 423:
+                break
+            await _asyncio.sleep(2)
+        assert resp is not None
+        if resp.status_code != 409:
+            resp.raise_for_status()
 
     # Return connection URI for this database
     async with httpx.AsyncClient(timeout=15) as http:
         uri_resp = await http.get(
             f"https://console.neon.tech/api/v2/projects/{neon_project_id}/connection_uri"
-            f"?database_name={db_name}",
+            f"?branch_id={branch_id}&database_name={db_name}&role_name=neondb_owner",
             headers={"Authorization": f"Bearer {api_key}"},
         )
         uri_resp.raise_for_status()
