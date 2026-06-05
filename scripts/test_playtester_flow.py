@@ -18,18 +18,23 @@ Checks:
   9. /health returns 200
   10. /mcp/quickstart returns start_session reference
   11. GitHub OAuth redirect works (/auth/github -> GitHub)
-  12. dradamawsome@gmail.com tenant has neon_db_url set
+  12. Optional tenant DB check when --tenant-email is provided
   13. Neon reconnect: idle 30s then /health still 200
 """
 import sys, os, asyncio, time
 sys.stdout.reconfigure(encoding='utf-8', errors='replace')
 
 BASE_URL = "https://usemeridian.us"
+TENANT_EMAIL = os.environ.get("MERIDIAN_PLAYTEST_TENANT_EMAIL", "").strip()
 for arg in sys.argv[1:]:
     if arg.startswith("--url="):
         BASE_URL = arg.split("=", 1)[1]
+    elif arg.startswith("--tenant-email="):
+        TENANT_EMAIL = arg.split("=", 1)[1].strip()
     elif arg == "--url" and len(sys.argv) > sys.argv.index(arg) + 1:
         BASE_URL = sys.argv[sys.argv.index(arg) + 1]
+    elif arg == "--tenant-email" and len(sys.argv) > sys.argv.index(arg) + 1:
+        TENANT_EMAIL = sys.argv[sys.argv.index(arg) + 1].strip()
 
 import httpx
 
@@ -99,12 +104,12 @@ async def run():
               f"status={r.status_code}")
 
         # 11. GitHub OAuth redirect
-        r = await c.get(f"{BASE_URL}/auth/github", follow_redirects=False)
+        r = await c.get(f"{BASE_URL}/auth/github/login", follow_redirects=False)
         goes_to_github = "github.com" in r.headers.get("location", "")
-        check("/auth/github redirects to GitHub", r.status_code in (302, 307) and goes_to_github,
+        check("/auth/github/login redirects to GitHub", r.status_code in (302, 307) and goes_to_github,
               f"status={r.status_code}, location={r.headers.get('location','')[:60]}")
 
-    # 12. DB check: dradamawsome has neon_db_url
+    # 12. Optional DB check for a specific tenant
     try:
         import importlib.util, base64, binascii
         env_path = os.path.join(os.path.dirname(__file__), '..', '.env')
@@ -116,19 +121,21 @@ async def run():
                     k, v = line.split('=', 1)
                     env[k.strip()] = v.strip()
         DB_URL = env.get('MERIDIAN_AUTH_DB', '')
-        if DB_URL:
+        if DB_URL and TENANT_EMAIL:
             import psycopg, psycopg.rows
             async with await psycopg.AsyncConnection.connect(DB_URL, autocommit=True) as conn:
                 async with conn.cursor(row_factory=psycopg.rows.dict_row) as cur:
                     await cur.execute(
                         "SELECT neon_db_url IS NOT NULL as has_db, plan FROM tenants WHERE email=%s",
-                        ('dradamawsome@gmail.com',))
+                        (TENANT_EMAIL,))
                     row = await cur.fetchone()
                     if row:
-                        check("dradamawsome@gmail.com has DB configured",
+                        check(f"{TENANT_EMAIL} has DB configured",
                               row['has_db'], f"plan={row['plan']}")
                     else:
-                        check("dradamawsome@gmail.com exists in DB", False, "NOT FOUND")
+                        check(f"{TENANT_EMAIL} exists in DB", False, "NOT FOUND")
+        elif not TENANT_EMAIL:
+            check("Tenant DB check skipped", True, "set --tenant-email to enable")
     except Exception as e:
         check("DB check", False, str(e)[:60])
 

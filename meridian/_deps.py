@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 import sys
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -76,6 +77,7 @@ def _resource_path(relative: str) -> str:
 # ---------------------------------------------------------------------------
 
 _templates = Jinja2Templates(directory=_resource_path("meridian/templates"))
+_log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -111,7 +113,7 @@ async def _open_tenant_db_by_id(request: Request, tenant_id: str) -> Any:
     if tenant_id in _tenant_db_cache:
         return _tenant_db_cache[tenant_id]
     from . import db as db_module
-    from .pg_adapter import open_pg_connection
+    from .pg_adapter import init_pg_db
     auth_db = request.app.state.db
     tenant = await db_module.get_tenant_by_id(auth_db, tenant_id)
     if not tenant:
@@ -119,7 +121,14 @@ async def _open_tenant_db_by_id(request: Request, tenant_id: str) -> Any:
 
     url: str | None = None
     if tenant.get("neon_db_url"):
-        url = db_module.decrypt_field(tenant["neon_db_url"]) or None
+        try:
+            url = db_module.decrypt_field(tenant["neon_db_url"]) or None
+        except Exception:
+            _log.warning(
+                "Failed to decrypt neon_db_url for tenant %s; falling back to MERIDIAN_AUTH_DB",
+                tenant_id,
+            )
+            url = None
     if not url:
         url = os.environ.get("MERIDIAN_AUTH_DB") or None
     if not url:
@@ -135,7 +144,7 @@ async def _open_tenant_db_by_id(request: Request, tenant_id: str) -> Any:
             status_code=503,
             detail="tenant database not provisioned — set MERIDIAN_AUTH_DB or run set_tenant_db.py",
         )
-    conn = await open_pg_connection(url)
+    conn = await init_pg_db(url)
     _tenant_db_cache[tenant_id] = conn
     return conn
 

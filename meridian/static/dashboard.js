@@ -994,7 +994,7 @@ function buildTabBody(project) {
       <button class="vtab-btn" data-vtab="notes" title="Notes — per-project wiki">📝</button>
       <button class="vtab-btn" data-vtab="hitl" title="HITL — Human-in-the-Loop queue" style="position:relative">❓<span class="hitl-vtab-badge" data-pid="${project.id}" style="display:none;position:absolute;top:2px;right:2px;background:#f87171;color:#fff;font-size:8px;font-weight:700;padding:0 3px;border-radius:6px;line-height:14px;pointer-events:none">0</span></button>
       <button class="vtab-btn" data-vtab="docs" title="MCP Tool Reference">📖</button>
-      <button class="vtab-btn" data-vtab="settings" title="Notification Settings">🔔</button>
+      <button class="vtab-btn" data-vtab="settings" title="Notification Settings">⚙</button>
     </div>
     <div class="vtab-drawer open" id="drawer-${project.id}">
       <div class="drawer-panel active" id="drawer-status-${project.id}">

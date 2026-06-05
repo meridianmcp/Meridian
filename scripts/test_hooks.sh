@@ -12,11 +12,16 @@
 set -euo pipefail
 
 MERIDIAN_URL="${1:-http://localhost:7878}"
-PROJECT_ID="${2:-5787cc92-ba7d-4788-b17c-28ab7938b839}"
+PROJECT_ID="${2:-${MERIDIAN_PROJECT_ID:-}}"
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PASS="\033[32mPASS\033[0m"
 FAIL="\033[31mFAIL\033[0m"
 FAILURES=0
+
+if [ -z "$PROJECT_ID" ]; then
+  echo "Set MERIDIAN_PROJECT_ID or pass a project ID as the second argument." >&2
+  exit 1
+fi
 
 echo ""
 echo "hooks.sh WSL/bash end-to-end test"
