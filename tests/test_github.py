@@ -18,7 +18,7 @@ def _github_client(tmp_path, monkeypatch):
     monkeypatch.setenv("MERIDIAN_DEMO_DB_URL", "")
     monkeypatch.setenv("MERIDIAN_SKIP_DEMO", "1")
     monkeypatch.setenv("MERIDIAN_GOAL_MD", str(tmp_path / "GOAL.md"))
-    monkeypatch.setenv("MERIDIAN_HOSTED", "1")
+    monkeypatch.setenv("MERIDIAN_HOSTED", "true")
     from fastapi.testclient import TestClient
     from meridian import _deps as deps_module
 
