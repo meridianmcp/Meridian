@@ -6447,6 +6447,45 @@ def test_notify_test_endpoint_no_url(client):
     assert "No notify URL" in r2.json().get("detail", "")
 
 
+def test_notification_error_surfaces_to_test_endpoint(client, monkeypatch):
+    """POST /projects/{id}/notify/test returns the Resend failure body."""
+    import httpx
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            pass
+
+        async def post(self, url, **kwargs):
+            class FakeResp:
+                status_code = 422
+
+                def json(self):
+                    return {"message": "Domain not verified"}
+
+                text = '{"message":"Domain not verified"}'
+
+            return FakeResp()
+
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: FakeClient())
+    monkeypatch.setenv("RESEND_API_KEY", "resend-test-key")
+
+    r = client.post("/projects", json={"name": "notif-test-email-error"})
+    assert r.status_code in (200, 201)
+    pid = r.json()["id"]
+    patch_resp = client.patch(
+        f"/projects/{pid}/ntfy",
+        json={"notify_url": "user@example.com"},
+    )
+    assert patch_resp.status_code == 200
+
+    test_resp = client.post(f"/projects/{pid}/notify/test")
+    assert test_resp.status_code == 422
+    assert "Domain not verified" in test_resp.json().get("detail", "")
+
+
 def test_notify_test_endpoint_delivers_ntfy_message_via_postgres(tmp_path, monkeypatch):
     """Postgres-backed /notify/test publishes a real ntfy.sh message."""
     test_db_url = os.environ.get("TEST_DATABASE_URL")

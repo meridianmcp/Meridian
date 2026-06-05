@@ -100,6 +100,67 @@ def test_mcp_hitl_tools_lifecycle(client):
     assert _json.loads(r.json()["result"]["content"][0]["text"])["status"] == "dismissed"
 
 
+def test_notification_email_sends_on_hitl(client, monkeypatch):
+    """request_hitl should send an email notification when notify_url is an address."""
+    import json as _json
+    import httpx
+
+    calls: list[dict[str, object]] = []
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            pass
+
+        async def post(self, url, **kwargs):
+            calls.append({"url": url, "kwargs": kwargs})
+
+            class FakeResp:
+                status_code = 200
+
+            return FakeResp()
+
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: FakeClient())
+    monkeypatch.setenv("RESEND_API_KEY", "resend-test-key")
+
+    async def _setup():
+        db = client.app.state.db
+        tenant = await db_module.upsert_tenant(db, "hitl-email@example.com")
+        raw, _ = await db_module.create_api_token(db, tenant["id"])
+        proj = await db_module.create_project(db, "hitl-email-proj")
+        await db_module.set_project_ntfy_url(db, proj["id"], "notify@example.com")
+        return raw, proj["id"]
+
+    token, pid = asyncio.run(_setup())
+    headers = {"Authorization": f"Bearer {token}"}
+
+    r = client.post(
+        "/mcp",
+        json={
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "request_hitl",
+                "arguments": {"project_id": pid, "question": "Ready to ship?"},
+            },
+        },
+        headers=headers,
+    )
+    assert r.status_code == 200
+    hitl = _json.loads(r.json()["result"]["content"][0]["text"])
+    assert hitl["status"] == "pending"
+
+    assert calls, "expected Resend to receive an email request"
+    payload = calls[0]["kwargs"]["json"]
+    assert calls[0]["url"] == "https://api.resend.com/emails"
+    assert payload["to"] == ["notify@example.com"]
+    assert payload["subject"] == "[Meridian] Action needed (NORMAL)"
+    assert "Ready to ship?" in payload["text"]
+
+
 @pytest.mark.asyncio
 async def test_post_login_redirect_launch_open_provisions_when_capacity_available(
     db, monkeypatch

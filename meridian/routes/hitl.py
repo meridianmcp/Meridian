@@ -1,11 +1,12 @@
 """Human-in-the-loop (HITL) routes — extracted from server.py."""
 from __future__ import annotations
 
+import os
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
 
-from .._deps import _db
+from .._deps import _db, _get_tenant_from_request
 from .. import db as db_module
 
 router = APIRouter()
@@ -47,15 +48,16 @@ async def create_hitl_endpoint(
 ) -> dict[str, Any]:
     """Create a HITL request. Sessions paused on blocking should POST then poll
     GET /hitl/{id} until status='answered'."""
-    project = await db_module.get_project(await _db(request), project_id)
+    db = await _db(request)
+    project = await db_module.get_project(db, project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="project not found")
     question = (body.get("question") or "").strip()
     if not question:
         raise HTTPException(status_code=400, detail="question required")
     try:
-        return await db_module.request_hitl(
-            await _db(request), project_id, question,
+        result = await db_module.request_hitl(
+            db, project_id, question,
             session_id=body.get("session_id"),
             context=body.get("context"),
             urgency=body.get("urgency", "normal"),
@@ -63,6 +65,24 @@ async def create_hitl_endpoint(
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    try:
+        from meridian.server import _maybe_notify  # noqa: PLC0415
+
+        tenant = await _get_tenant_from_request(request)
+        urgency = str(body.get("urgency", "normal")).upper()
+        base = os.environ.get("MERIDIAN_BASE_URL", "https://usemeridian.us").rstrip("/")
+        await _maybe_notify(
+            db,
+            project_id,
+            f"Action needed ({urgency})",
+            f"{question[:200]}\n\nAnswer at: {base}/dashboard",
+            event="hitl",
+            tenant=tenant,
+            pref_key="hitl",
+        )
+    except Exception:  # noqa: BLE001
+        pass
+    return result
 
 
 @router.get("/hitl/{request_id}")

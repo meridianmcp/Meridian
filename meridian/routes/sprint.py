@@ -5,7 +5,7 @@ from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
 
-from .._deps import _db
+from .._deps import _db, _get_tenant_from_request
 from .. import db as db_module
 
 router = APIRouter()
@@ -56,8 +56,9 @@ async def complete_sprint_item_endpoint(
     body: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Mark a sprint item ``done``. Optional body: ``{task_id}``."""
+    db = await _db(request)
     item = await db_module.complete_sprint_item(
-        await _db(request), project_id, item_id,
+        db, project_id, item_id,
         task_id=(body or {}).get("task_id"),
     )
     if item is None:
@@ -66,8 +67,26 @@ async def complete_sprint_item_endpoint(
     try:
         from meridian.server import _update_roadmap_version_history, _REPO_ROOT  # noqa: PLC0415
         await _update_roadmap_version_history(
-            await _db(request), project_id, item["version"], _REPO_ROOT
+            db, project_id, item["version"], _REPO_ROOT
         )
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        active_statuses = {"pending", "todo", "in_progress"}
+        remaining = await db_module.get_sprint_items(db, project_id)
+        if not any((row.get("status") or "") in active_statuses for row in remaining):
+            from meridian.server import _maybe_notify  # noqa: PLC0415
+
+            tenant = await _get_tenant_from_request(request)
+            await _maybe_notify(
+                db,
+                project_id,
+                "Sprint done ✓",
+                "All sprint items are complete.",
+                event="sprint_done",
+                tenant=tenant,
+                pref_key="sprint",
+            )
     except Exception:  # noqa: BLE001
         pass
     return item

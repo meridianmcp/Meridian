@@ -1375,7 +1375,7 @@ async def set_project_ntfy(
         # (topics are auto-created on first publish; GET before any publish = 404)
         await _notify_project(
             db, project_id,
-            "Meridian — notifications active",
+            "Notifications active",
             "You will receive alerts here for HITL requests and sprint completions.",
             event="setup",
         )
@@ -1404,7 +1404,12 @@ async def test_project_notification(
 
 
 async def _send_email_notification(to_email: str, subject: str, body_text: str) -> None:
-    """Send a notification email via Resend. Silently skips if RESEND_API_KEY is not set."""
+    """Send a notification email via Resend.
+
+    Silently skips if ``RESEND_API_KEY`` is not set. Raises ``HTTPException``
+    with Resend's response body when the API rejects the request so callers
+    like ``/notify/test`` can surface the real failure reason.
+    """
     import httpx as _httpx
 
     api_key = os.environ.get("RESEND_API_KEY", "")
@@ -1421,20 +1426,85 @@ async def _send_email_notification(to_email: str, subject: str, body_text: str) 
         f"<a href='{base}/dashboard'>Update in Settings →</a></p>"
     )
     async with _httpx.AsyncClient(timeout=10.0) as client:
-        await client.post(
-            "https://api.resend.com/emails",
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "from": from_addr,
-                "to": [to_email],
-                "subject": subject,
-                "text": body_text,
-                "html": html_body,
-            },
-        )
+        try:
+            resp = await client.post(
+                "https://api.resend.com/emails",
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "from": from_addr,
+                    "to": [to_email],
+                    "subject": subject,
+                    "text": body_text,
+                    "html": html_body,
+                },
+            )
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(status_code=502, detail=f"Resend request failed: {exc}") from exc
+        if resp.status_code < 200 or resp.status_code >= 300:
+            raise HTTPException(status_code=resp.status_code, detail=_response_error_detail(resp))
+
+
+def _response_error_detail(resp: Any) -> str:
+    """Best-effort extraction of a useful error message from an HTTP response."""
+    try:
+        payload = resp.json()
+    except Exception:  # noqa: BLE001
+        payload = None
+    if isinstance(payload, dict):
+        for key in ("detail", "message", "error"):
+            value = payload.get(key)
+            if isinstance(value, dict):
+                value = value.get("detail") or value.get("message") or value.get("error")
+            if value:
+                return str(value)
+        return json.dumps(payload, ensure_ascii=False)
+    if payload is not None:
+        return str(payload)
+    text = getattr(resp, "text", "")
+    if isinstance(text, str) and text.strip():
+        return text.strip()
+    return f"request failed with status {getattr(resp, 'status_code', 'unknown')}"
+
+
+_NOTIFICATION_PREF_DEFAULTS: dict[str, bool] = {
+    "hitl": True,
+    "stalled": True,
+    "storage": True,
+    "sprint": True,
+}
+
+
+def _notification_prefs_from_raw(raw: Any) -> dict[str, bool]:
+    """Normalize notification prefs to a complete {pref: bool} mapping."""
+    prefs = dict(_NOTIFICATION_PREF_DEFAULTS)
+    if isinstance(raw, dict):
+        payload = raw
+    else:
+        try:
+            payload = json.loads(raw or "{}")
+        except Exception:  # noqa: BLE001
+            payload = {}
+    if isinstance(payload, dict):
+        for key in _NOTIFICATION_PREF_DEFAULTS:
+            if key in payload:
+                prefs[key] = bool(payload[key])
+    return prefs
+
+
+def _notification_pref_enabled(
+    tenant: dict[str, Any] | None,
+    pref_key: str | None,
+) -> bool:
+    """Return True when the given preference is enabled or unset."""
+    if pref_key is None:
+        return True
+    if tenant is None:
+        return True
+    prefs = _notification_prefs_from_raw(tenant.get("notification_prefs"))
+    return bool(prefs.get(pref_key, True))
 
 
 async def _dispatch_notification(
@@ -1466,7 +1536,7 @@ async def _dispatch_notification(
     async with _httpx.AsyncClient(timeout=5.0) as client:
         if "ntfy.sh" in url or url.startswith("ntfy://"):
             # ntfy protocol: body = plain text, special headers carry metadata
-            await client.post(
+            resp = await client.post(
                 url,
                 content=body_text.encode(),
                 headers={"Title": title, "Priority": "high", "Tags": event},
@@ -1474,7 +1544,7 @@ async def _dispatch_notification(
         else:
             # Generic webhook: POST JSON (compatible with Slack incoming webhooks,
             # Discord webhooks via {content: …}, and custom HTTP receivers)
-            await client.post(
+            resp = await client.post(
                 url,
                 json={
                     "title": title,
@@ -1483,6 +1553,8 @@ async def _dispatch_notification(
                     "source": "meridian",
                 },
             )
+        if resp.status_code < 200 or resp.status_code >= 300:
+            raise HTTPException(status_code=resp.status_code, detail=_response_error_detail(resp))
 
 
 async def _notify_project(
@@ -1496,6 +1568,25 @@ async def _notify_project(
         await _dispatch_notification(notify_url, title, body_text, event)
     except Exception:  # noqa: BLE001
         pass  # never let notifications crash the main flow
+
+
+async def _maybe_notify(
+    db: Any,
+    project_id: str,
+    title: str,
+    body_text: str,
+    event: str = "notification",
+    *,
+    tenant: dict[str, Any] | None = None,
+    pref_key: str | None = None,
+) -> None:
+    """Send a project notification when the tenant has the event enabled."""
+    try:
+        if not _notification_pref_enabled(tenant, pref_key):
+            return
+        await _notify_project(db, project_id, title, body_text, event)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 @app.post("/projects/{project_id}/rename")
@@ -3253,8 +3344,7 @@ async def update_notification_prefs(request: Request) -> dict[str, Any]:
     from .hosted import get_current_tenant
     tenant = await get_current_tenant(request)
     body = await request.json()
-    allowed_prefs = {"hitl", "stalled", "storage", "sprint"}
-    prefs = {k: bool(v) for k, v in body.items() if k in allowed_prefs}
+    prefs = _notification_prefs_from_raw(body)
     await db_module.update_tenant(
         request.app.state.db, tenant["id"], notification_prefs=json.dumps(prefs)
     )
@@ -3268,14 +3358,7 @@ async def get_notification_prefs(request: Request) -> dict[str, Any]:
         raise HTTPException(status_code=404)
     from .hosted import get_current_tenant
     tenant = await get_current_tenant(request)
-    prefs_raw = tenant.get("notification_prefs") or "{}"
-    if isinstance(prefs_raw, dict):
-        prefs = prefs_raw
-    else:
-        try:
-            prefs = json.loads(prefs_raw)
-        except Exception:  # noqa: BLE001
-            prefs = {}
+    prefs = _notification_prefs_from_raw(tenant.get("notification_prefs"))
     return {"prefs": prefs}
 
 
@@ -4885,7 +4968,7 @@ async def _handle_mcp_request(
             if name in _GITHUB_TOOL_NAMES and tenant:
                 result = await _dispatch_github_tool(name, args, tenant)
             else:
-                result = await _dispatch_mcp_tool(name, args, db, data_dir)
+                result = await _dispatch_mcp_tool(name, args, db, data_dir, tenant=tenant)
             return _jsonrpc_ok(req_id, {"content": [{"type": "text", "text": json.dumps(result)}]})
         except Exception as exc:
             return _jsonrpc_err(req_id, -32603, str(exc))
@@ -4893,7 +4976,13 @@ async def _handle_mcp_request(
     return _jsonrpc_err(req_id, -32601, f"method not found: {method}")
 
 
-async def _dispatch_mcp_tool(name: str, args: dict[str, Any], db: Any, data_dir: str) -> Any:
+async def _dispatch_mcp_tool(
+    name: str,
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None = None,
+) -> Any:
     """Route a tools/call to the appropriate db_module function."""
     if name == "create_project":
         return await db_module.create_project(db, args["name"])
@@ -5075,11 +5164,13 @@ async def _dispatch_mcp_tool(name: str, args: dict[str, Any], db: Any, data_dir:
         _hitl_urgency = args.get("urgency", "normal").upper()
         _hitl_q = args["question"][:200]
         _hitl_base = os.environ.get("MERIDIAN_BASE_URL", "https://usemeridian.us").rstrip("/")
-        await _notify_project(
+        await _maybe_notify(
             db, args["project_id"],
-            f"[Meridian] Action needed ({_hitl_urgency})",
+            f"Action needed ({_hitl_urgency})",
             f"{_hitl_q}\n\nAnswer at: {_hitl_base}/dashboard",
             event="hitl",
+            tenant=tenant,
+            pref_key="hitl",
         )
         return result
     if name == "get_hitl_request":
@@ -5180,13 +5271,18 @@ async def _dispatch_mcp_tool(name: str, args: dict[str, Any], db: Any, data_dir:
         )
         if item is None:
             raise ValueError("sprint item not found")
-        # Notify via configured notify_url — best-effort
-        await _notify_project(
-            db, args["project_id"],
-            "[Meridian] Sprint item done ✓",
-            f"{(item.get('title') or '')[:200]}",
-            event="sprint_done",
-        )
+        # Notify only when the sprint is fully complete.
+        active_statuses = {"pending", "todo", "in_progress"}
+        remaining_items = await db_module.get_sprint_items(db, args["project_id"])
+        if not any((it.get("status") or "") in active_statuses for it in remaining_items):
+            await _maybe_notify(
+                db, args["project_id"],
+                "Sprint done ✓",
+                "All sprint items are complete.",
+                event="sprint_done",
+                tenant=tenant,
+                pref_key="sprint",
+            )
         return item
     if name == "get_run_transcript":
         run = await db_module.get_executor_run_by_session(db, args.get("session_id", ""))
