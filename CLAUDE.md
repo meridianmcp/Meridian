@@ -111,9 +111,7 @@ your project context on start and snapshots progress on end.
 
 ---
 <!-- MERIDIAN STATE — auto-generated, do not edit below -->
-## Current Sprint State  _(auto-updated 2026-06-05 05:50 UTC)_
-
-LICENSE: MSL-1.0 (FSL-based). Free for local/internal use. Paid for hosting as a service. 5yr → MIT.
+## Current Sprint State  _(auto-updated 2026-06-05 12:08 UTC)_
 
 **Key Files:**
 - `meridian/server.py` — FastAPI app + MCP handlers

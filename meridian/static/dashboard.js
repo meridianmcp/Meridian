@@ -3689,7 +3689,7 @@ async function loadSettingsTab(projectId) {
   const savedNotifyUrl = ntfyData ? (ntfyData.notify_url || ntfyData.ntfy_url || '') : '';
   // pre-fill with OAuth email for hosted users if no URL is saved yet
   const defaultNotifyUrl = savedNotifyUrl || (state.tenantEmail ? state.tenantEmail : '');
-  html += `<div style="margin-bottom:14px;padding:10px 12px;border:1px solid var(--border);border-radius:6px;background:var(--surface-2)">
+  html += `<div data-demo-hide style="margin-bottom:14px;padding:10px 12px;border:1px solid var(--border);border-radius:6px;background:var(--surface-2)">
     <div style="font-weight:600;font-size:11px;color:var(--text);margin-bottom:4px">Notifications</div>
     <div style="font-size:10px;color:var(--muted);margin-bottom:8px">
       Paste an <a href="https://ntfy.sh" target="_blank" style="color:var(--accent)">ntfy.sh</a> topic URL, a Slack/Discord webhook URL, or your email address.
@@ -4953,6 +4953,8 @@ async function refreshGoal(projectId) {
     const p = state.panels[projectId];
     p._serverNorthStar = goal.north_star || '';
     p._serverSprint = goal.sprint || '';
+    const nsLock = document.getElementById(`goal-ns-lock-${projectId}`);
+    if (nsLock) nsLock.textContent = goal.north_star ? 'locked' : 'unlocked';
     p._lastSaved = text;
     if (nsTA) { nsTA.classList.remove('dirty'); }
     if (spTA) { spTA.classList.remove('dirty'); }
@@ -5542,6 +5544,13 @@ async function saveNorthStar(projectId) {
   if (!ta) return;
   const val = ta.value.trim();
   if (!val) return;
+  const saved = state.panels[projectId]?._serverNorthStar || '';
+  if (saved && val !== saved && !confirm('North star is intended to be stable. Save changes?')) {
+    ta.value = saved;
+    autosizeGoalField(ta);
+    ta.classList.remove('dirty');
+    return;
+  }
   try {
     const humanInput = document.getElementById('new-project-human');
     const humanId = humanInput ? humanInput.value.trim() : '';
@@ -6108,6 +6117,16 @@ async function restoreTabs() {
   }
   _checkGitStatus();
   setInterval(_checkGitStatus, 60000);
+  const workspaceEntry = document.getElementById('workspace-entry');
+  if (workspaceEntry) {
+    workspaceEntry.onclick = () => {
+      const targetId = state.activeTab || state.projects[0]?.id;
+      const project = state.projects.find(p => p.id === targetId);
+      if (!project) return;
+      if (!document.getElementById(`tab-body-${targetId}`)) openTab(project);
+      document.querySelector(`#vtab-strip-${targetId} [data-vtab="settings"]`)?.click();
+    };
+  }
 })();
 
 const _sprintBoardReloaders = {};

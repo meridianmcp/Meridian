@@ -2,6 +2,8 @@
 
 Run Meridian on your own infrastructure. Choose the setup that fits your team.
 
+→ [Getting Started](quickstart.md)
+
 ---
 
 ## Option 1: Docker Compose (Recommended)

@@ -10,25 +10,18 @@ your AI clients over HTTPS in minutes.
 
 ## Pricing
 
-| | Standard | Pro |
-|--|--|--|
-| **Price** | $20/mo | $49/mo |
-| **Status** | Live | Coming soon · [join waitlist](mailto:hello@usemeridian.us?subject=Pro%20waitlist) |
-| **Free tier** | 30 days, no card required | — |
-| **Neon project** | 1 per workspace | 1 per workspace |
-| **Max databases** | 10 | 50 |
-| **Max compute** | 2 CU | 4 CU |
-| **Storage** | 0.5 GB | 5 GB |
-| **Compute hours/mo** | 100 CU-hrs | 300 CU-hrs |
-| **Meridian projects** | Unlimited | Unlimited |
-| **Team members** | Unlimited | Unlimited |
-| **Environments** | 1 (production) | Multiple (prod/staging/dev) |
-| **Support** | Email | Priority email |
-| **BYODB** | ✓ | ✓ |
-| **Custom subdomain** | — | ✓ |
+| | Free | Standard | Pro |
+|--|--|--|--|
+| **Price** | $0 | $20/mo | Waitlist |
+| **Status** | Live | Live | Coming soon · [join waitlist](mailto:hello@usemeridian.us?subject=Pro%20waitlist) |
+| **Compute** | 0.5 CU | 2 CU | 4 CU |
+| **Compute hours/mo** | 10 CU-hrs total | 50 CU-hrs/mo | 300 CU-hrs |
+| **Team members** | 1 | 20 | Unlimited |
 
 **BYODB** (Bring Your Own Database): paste your own Neon connection string at signup
 and skip the managed DB — same price, full control of your data.
+
+Free and Standard include the managed Postgres database, hosted dashboard, and remote MCP endpoint. Pro is waitlist-only.
 
 ---
 
@@ -38,7 +31,7 @@ and skip the managed DB — same price, full control of your data.
 2. **Sign in** — Google or GitHub OAuth, no password required
 3. **Check your welcome email** — contains your bearer token and MCP config snippet
 4. **Choose Google or GitHub** — sign in with either, no passwords
-5. **Check your email** — welcome email contains your bearer token and MCP config snippet
+5. **Open your dashboard** — use the dashboard link in the welcome email to land in Meridian
 
 ---
 

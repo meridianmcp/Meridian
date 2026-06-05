@@ -33,7 +33,7 @@ Meridian is live state: sessions read and write to a shared DB in real time. Thi
 
 ### What AI clients can connect to Meridian?
 
-Meridian exposes a standard [MCP server](https://spec.modelcontextprotocol.io). Cursor, Windsurf, Claude Desktop, Claude Code, LangGraph agents, AutoGen, and other MCP-compatible clients can connect directly. Browser-based clients work too: claude.ai can connect through an MCP browser extension, and ChatGPT can connect to a remote MCP server as a custom connector.
+Meridian exposes a standard [MCP server](https://spec.modelcontextprotocol.io). Cursor, Windsurf, Claude Desktop, Claude Code, LangGraph agents, AutoGen, and other MCP-compatible clients can connect directly. Browser-based clients work too: claude.ai can connect through an MCP browser extension, and ChatGPT can connect through Developer mode as a remote MCP custom connector with no Chrome extension required.
 
 → [Browser connector guide](browser-connector.md)
 
@@ -71,7 +71,7 @@ For hosted Postgres (Neon), the first query after scale-to-zero takes ~300ms for
 
 ### Does the license allow commercial use?
 
-**MSL-1.0** (based on BUSL) is free for any internal use — including commercial projects. You pay only if you host Meridian as a service for others (i.e., resell it). The license converts to MIT automatically after 6 years. Most developers and teams will never pay anything.
+**MSL-1.0** (based on BUSL) is free for any internal use — including commercial projects. You pay only if you host Meridian as a service for others (i.e., resell it). The license converts to MIT automatically after 5 years. Most developers and teams will never pay anything.
 
 ---
 
@@ -105,11 +105,11 @@ Meridian is open-source (MSL-1.0), built to solve the coordination problem in lo
 
 ### Is there a hosted option for teams?
 
-Yes — [usemeridian.us](https://usemeridian.us). Standard is $20/month, Pro is $49/month. Both include a 30-day free tier with no card required. You get a managed Postgres database, hosted dashboard, and remote MCP endpoint — zero install on your end.
+Yes — [usemeridian.us](https://usemeridian.us). Free is $0 with 0.5 CU / 10 CU-hrs total, Standard is $20/month with 2 CU / 50 CU-hrs/month and up to 20 members, and Pro is waitlist-only. You get a managed Postgres database, hosted dashboard, and remote MCP endpoint — zero install on your end.
 
-### What does the 30-day free trial include?
+### What does the free tier include?
 
-The hosted free trial gives you full access to the Standard tier — managed Postgres, hosted dashboard, remote MCP endpoint, HITL queue, and all MCP tools. No credit card is required to start. After 30 days of inactivity the account expires; active accounts stay on the trial until you choose to subscribe.
+The free tier gives you the hosted dashboard, remote MCP endpoint, HITL queue, and access to the core MCP tools with a 0.5 CU / 10 CU-hrs total allowance. No credit card is required to start. If you outgrow it, Standard adds 2 CU / 50 CU-hrs/month and 20-member workspaces.
 
 The self-hosted tier is free forever with no time limit.
 
