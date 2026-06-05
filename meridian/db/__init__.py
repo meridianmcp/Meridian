@@ -3706,10 +3706,53 @@ async def get_timeline(
                     })
         prev = row
 
+    # Per-day contribution counts for the heatmap calendar. Aggregated in
+    # Python from task_rows so the math is identical on SQLite and Postgres
+    # (no DATE()/array_agg dialect differences). Date key = first 10 chars
+    # of the stored UTC timestamp ("YYYY-MM-DD HH:MM:SS" → "YYYY-MM-DD").
+    by_day: dict[str, dict[str, Any]] = {}
+    for r in task_rows:
+        ts = r["created_at"] or ""
+        day = ts[:10]
+        if len(day) != 10:
+            continue
+        human = r["human_id"] or "(unknown)"
+        bucket = by_day.get(day)
+        if bucket is None:
+            bucket = {"date": day, "count": 0, "humans": {}, "_sess": {}}
+            by_day[day] = bucket
+        bucket["count"] += 1
+        bucket["humans"][human] = bucket["humans"].get(human, 0) + 1
+        sid = r["session_id"] or "(none)"
+        se = bucket["_sess"].get(sid)
+        if se is None:
+            se = {
+                "session_id": r["session_id"],
+                "name": r["session_name"] or "(unknown)",
+                "human": human,
+                "count": 0,
+            }
+            bucket["_sess"][sid] = se
+        se["count"] += 1
+    daily_counts = []
+    for day in sorted(by_day):
+        b = by_day[day]
+        day_sessions = sorted(
+            b["_sess"].values(), key=lambda s: (-s["count"], s["name"])
+        )
+        daily_counts.append({
+            "date": b["date"],
+            "count": b["count"],
+            "sessions": day_sessions,
+            "session_count": len(day_sessions),
+            "humans": b["humans"],
+        })
+
     return {
         "tasks": tasks,
         "sessions": sessions,
         "goal_events": goal_events,
+        "daily_counts": daily_counts,
     }
 
 

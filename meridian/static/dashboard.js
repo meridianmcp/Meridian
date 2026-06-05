@@ -2532,15 +2532,202 @@ function renderTimeline(projectId, data) {
   }
 
   const p = state.panels[projectId];
-  if (p && p._echart) {
-    try { p._echart.dispose(); } catch (_) {}
-    p._echart = null;
-  }
+  if (p && p._echart) { try { p._echart.dispose(); } catch (_) {} p._echart = null; }
+  if (p && p._heatchart) { try { p._heatchart.dispose(); } catch (_) {} p._heatchart = null; }
 
   if (typeof echarts === 'undefined') {
     _renderTimelineLog(projectId, data);
     return;
   }
+
+  // [Heatmap] [Detail] sub-tabs. Heatmap (contribution calendar) is the
+  // default primary view; Detail holds the per-session ECharts gantt.
+  wrap.innerHTML = `
+    <div class="tl-subtabs">
+      <button class="tl-subtab active" data-sub="heatmap">Heatmap</button>
+      <button class="tl-subtab" data-sub="detail">Detail</button>
+    </div>
+    <div class="tl-pane active" id="tl-pane-heatmap-${projectId}"></div>
+    <div class="tl-pane" id="tl-pane-detail-${projectId}" style="display:none"></div>`;
+  const heatPane = document.getElementById(`tl-pane-heatmap-${projectId}`);
+  const detailPane = document.getElementById(`tl-pane-detail-${projectId}`);
+
+  _renderTimelineHeatmap(projectId, data, heatPane);
+  _renderTimelineGantt(projectId, data, detailPane);
+
+  wrap.querySelectorAll('.tl-subtab').forEach(btn => {
+    btn.onclick = () => {
+      const sub = btn.dataset.sub;
+      wrap.querySelectorAll('.tl-subtab').forEach(b => b.classList.toggle('active', b === btn));
+      heatPane.style.display = sub === 'heatmap' ? '' : 'none';
+      detailPane.style.display = sub === 'detail' ? '' : 'none';
+      // ECharts can't measure a display:none container, so resize on reveal.
+      if (sub === 'heatmap' && p && p._heatchart) { try { p._heatchart.resize(); } catch (_) {} }
+      if (sub === 'detail' && p && p._echart) { try { p._echart.resize(); } catch (_) {} }
+    };
+  });
+}
+
+function _renderTimelineHeatmap(projectId, data, paneEl) {
+  /** Contribution calendar — one colored square per day, intensity by task
+   * count. Multi-human projects get one calendar row per human_id. Click a
+   * day to expand the sessions that contributed that day. */
+  if (!paneEl) return;
+  const daily = (data && data.daily_counts) || [];
+  if (!daily.length) {
+    paneEl.innerHTML = `<div class="timeline-empty">no activity yet — log a task to see it here</div>`;
+    return;
+  }
+
+  const cssVar = (name, fallback) => {
+    const v = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+    return v || fallback;
+  };
+  const emptyColor = cssVar('--surface-2', '#1a2740');
+
+  // Distinct humans across all days; sorted so layout is stable.
+  const humanSet = new Set();
+  daily.forEach(d => Object.keys(d.humans || {}).forEach(h => humanSet.add(h)));
+  let humans = [...humanSet].sort();
+  const multi = humans.length > 1;
+  if (!multi) humans = ['__all__'];
+
+  const dates = daily.map(d => d.date).sort();
+  const rangeStart = dates[0];
+  const rangeEnd = dates[dates.length - 1];
+
+  // Per (human,day) detail so clicking a cell can show sessions for the
+  // right calendar row even in multi-human projects.
+  const detailByHumanDay = {};
+  daily.forEach(d => {
+    (d.sessions || []).forEach(s => {
+      const h = multi ? (s.human || '(unknown)') : '__all__';
+      const key = `${h}|${d.date}`;
+      (detailByHumanDay[key] = detailByHumanDay[key] || []).push(s);
+    });
+  });
+
+  const CELL = 14;
+  const CAL_TOP = 28;
+  const CAL_H = CELL * 7 + 34;   // 7 weekday rows + month/label gutters
+  const ROW_GAP = 18;
+  const rowH = CAL_H + ROW_GAP;
+  const totalH = CAL_TOP + humans.length * rowH + 28;
+
+  const calendars = [];
+  const series = [];
+  const titles = [];
+  humans.forEach((h, i) => {
+    const top = CAL_TOP + i * rowH;
+    calendars.push({
+      top: top,
+      left: multi ? 120 : 40,
+      right: 12,
+      cellSize: [CELL, CELL],
+      range: rangeStart === rangeEnd ? rangeStart : [rangeStart, rangeEnd],
+      splitLine: { show: true, lineStyle: { color: '#1e2d4a' } },
+      itemStyle: { color: emptyColor, borderColor: '#0d1b2e', borderWidth: 1 },
+      yearLabel: { show: false },
+      monthLabel: { color: '#8b9cba', fontFamily: 'IBM Plex Mono', fontSize: 9 },
+      dayLabel: { color: '#8b9cba', fontFamily: 'IBM Plex Mono', fontSize: 8, firstDay: 1 },
+    });
+    if (multi) {
+      titles.push({
+        text: h.length > 16 ? h.slice(0, 15) + '…' : h,
+        left: 6,
+        top: top + CAL_H / 2 - 6,
+        textStyle: { color: _colorForHuman(h === '(unknown)' ? '' : h), fontFamily: 'IBM Plex Mono', fontSize: 10, fontWeight: 'bold' },
+      });
+    }
+    const pts = daily.map(d => {
+      const count = multi ? (d.humans && d.humans[h]) || 0 : d.count;
+      const dayDetail = detailByHumanDay[`${h}|${d.date}`] || [];
+      const scount = new Set(dayDetail.map(s => s.session_id)).size;
+      return { value: [d.date, count], scount: scount, human: h };
+    }).filter(pt => pt.value[1] > 0);
+    series.push({
+      type: 'heatmap',
+      coordinateSystem: 'calendar',
+      calendarIndex: i,
+      data: pts,
+    });
+  });
+
+  paneEl.innerHTML = '';
+  const container = document.createElement('div');
+  container.style.cssText = `width:100%;height:${totalH}px;min-height:${totalH}px`;
+  paneEl.appendChild(container);
+  const detailBox = document.createElement('div');
+  detailBox.className = 'tl-heat-detail';
+  detailBox.style.cssText = 'padding:8px 4px 4px;font-size:11px;color:var(--muted)';
+  detailBox.textContent = 'Click a day to see the sessions that contributed.';
+  paneEl.appendChild(detailBox);
+
+  const chart = echarts.init(container, null, { renderer: 'canvas' });
+  chart.setOption({
+    backgroundColor: 'transparent',
+    animation: false,
+    title: titles,
+    tooltip: {
+      trigger: 'item',
+      backgroundColor: '#0d1b2e',
+      borderColor: '#1e3a5f',
+      textStyle: { color: '#c7d5ef', fontSize: 11, fontFamily: 'IBM Plex Mono' },
+      formatter: params => {
+        const d = params.data;
+        if (!d || !d.value) return '';
+        const date = d.value[0], count = d.value[1];
+        return `<b>${escapeHtml(date)}</b> — ${count} task${count === 1 ? '' : 's'} across ${d.scount} session${d.scount === 1 ? '' : 's'}`;
+      },
+    },
+    visualMap: {
+      type: 'piecewise',
+      show: true,
+      orient: 'horizontal',
+      left: 'center',
+      bottom: 0,
+      itemWidth: 11, itemHeight: 11,
+      textStyle: { color: '#8b9cba', fontSize: 9, fontFamily: 'IBM Plex Mono' },
+      pieces: [
+        { min: 1, max: 2, color: '#4ade80', label: '1–2' },
+        { min: 3, max: 5, color: '#22c55e', label: '3–5' },
+        { min: 6, color: '#16a34a', label: '6+' },
+      ],
+    },
+    calendar: calendars,
+    series: series,
+  });
+
+  const renderDetail = (human, date) => {
+    const list = detailByHumanDay[`${human}|${date}`] || [];
+    if (!list.length) {
+      detailBox.innerHTML = `<span style="color:var(--muted)">${escapeHtml(date)} — no sessions</span>`;
+      return;
+    }
+    const total = list.reduce((a, s) => a + s.count, 0);
+    const rows = list.map(s =>
+      `<div class="tl-heat-sess"><span class="tl-heat-sess-name">${escapeHtml(s.name || '(unknown)')}</span>` +
+      `<span class="tl-heat-sess-count">${s.count} task${s.count === 1 ? '' : 's'}</span></div>`
+    ).join('');
+    detailBox.innerHTML =
+      `<div class="tl-heat-detail-head">${escapeHtml(date)} · ${total} task${total === 1 ? '' : 's'} · ${list.length} session${list.length === 1 ? '' : 's'}</div>${rows}`;
+  };
+
+  chart.on('click', params => {
+    if (params.componentType !== 'series' || !params.data || !params.data.value) return;
+    renderDetail(params.data.human, params.data.value[0]);
+  });
+
+  const pnl = state.panels[projectId];
+  if (pnl) pnl._heatchart = chart;
+  try { new ResizeObserver(() => { try { chart.resize(); } catch (_) {} }).observe(container); } catch (_) {}
+}
+
+function _renderTimelineGantt(projectId, data, paneEl) {
+  /** Per-session ECharts gantt — the secondary "Detail" timeline view. */
+  if (!paneEl) return;
+  const p = state.panels[projectId];
+  const { tasks = [], goal_events = [] } = data || {};
 
   const parseTs = ts => {
     if (!ts) return null;
@@ -2611,10 +2798,10 @@ function renderTimeline(projectId, data) {
     });
   }
 
-  wrap.innerHTML = '';
+  paneEl.innerHTML = '';
   const container = document.createElement('div');
   container.style.cssText = 'width:100%;height:100%;min-height:300px';
-  wrap.appendChild(container);
+  paneEl.appendChild(container);
 
   const chart = echarts.init(container, null, { renderer: 'canvas' });
 
@@ -2626,6 +2813,12 @@ function renderTimeline(projectId, data) {
       backgroundColor: '#0d1b2e',
       borderColor: '#1e3a5f',
       textStyle: { color: '#c7d5ef', fontSize: 11, fontFamily: 'IBM Plex Mono' },
+      confine: true,
+      position: (point, params, dom, rect, size) => {
+        const x = point[0], y = point[1];
+        const containerWidth = (size && size.viewSize && size.viewSize[0]) || 0;
+        return x > containerWidth * 0.6 ? [x - 300, y] : [x + 20, y];
+      },
       formatter: params => {
         const d = params.data;
         if (d.field) return `<b>${escapeHtml(d.field)}</b> v${d.version}<br><span style="color:#8b9cba;font-size:9px">${escapeHtml(d.ts || '')}</span>`;

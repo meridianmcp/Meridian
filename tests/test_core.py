@@ -4124,6 +4124,114 @@ async def test_timeline_carries_session_summary(db):
     assert sessions[s["id"]]["session_type"] == "human"
 
 
+@pytest.mark.asyncio
+async def test_timeline_daily_counts_single_human(db):
+    """daily_counts aggregates one bucket per day with task + session totals."""
+    p = await db_module.create_project(db, "alpha")
+    s = await db_module.register_session(db, p["id"], "sess-a", human_id="adam")
+    for i in range(4):
+        await db_module.log_task(db, s["id"], p["id"], f"task {i}", "done")
+
+    timeline = await db_module.get_timeline(db, p["id"])
+    daily = timeline["daily_counts"]
+    assert len(daily) == 1
+    day = daily[0]
+    assert day["count"] == 4
+    assert day["session_count"] == 1
+    assert day["humans"] == {"adam": 4}
+    assert day["sessions"][0]["name"] == "sess-a"
+    assert day["sessions"][0]["count"] == 4
+    assert day["sessions"][0]["human"] == "adam"
+
+
+@pytest.mark.asyncio
+async def test_timeline_daily_counts_multi_human(db):
+    """Per-day humans breakdown splits task counts by human_id."""
+    p = await db_module.create_project(db, "alpha")
+    s1 = await db_module.register_session(db, p["id"], "sess-a", human_id="adam")
+    s2 = await db_module.register_session(db, p["id"], "sess-b", human_id="bri")
+    for i in range(3):
+        await db_module.log_task(db, s1["id"], p["id"], f"a {i}", "done")
+    for i in range(2):
+        await db_module.log_task(db, s2["id"], p["id"], f"b {i}", "done")
+
+    timeline = await db_module.get_timeline(db, p["id"])
+    daily = timeline["daily_counts"]
+    assert len(daily) == 1
+    day = daily[0]
+    assert day["count"] == 5
+    assert day["session_count"] == 2
+    assert day["humans"] == {"adam": 3, "bri": 2}
+    # sessions sorted by descending task count
+    assert [se["count"] for se in day["sessions"]] == [3, 2]
+
+
+@pytest.mark.asyncio
+async def test_timeline_daily_counts_empty(db):
+    """No tasks → empty daily_counts list (not missing key)."""
+    p = await db_module.create_project(db, "alpha")
+    timeline = await db_module.get_timeline(db, p["id"])
+    assert timeline["daily_counts"] == []
+
+
+def test_timeline_endpoint_exposes_daily_counts(client):
+    """The /timeline route surfaces daily_counts for the heatmap."""
+    p = client.post("/projects", json={"name": "alpha-tl"}).json()
+    resp = client.get(f"/projects/{p['id']}/timeline")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert "daily_counts" in body
+    assert isinstance(body["daily_counts"], list)
+
+
+@pytest.mark.asyncio
+async def test_timeline_daily_counts_multi_day(db):
+    """Tasks on different days produce separate buckets, sorted by date."""
+    p = await db_module.create_project(db, "alpha")
+    s = await db_module.register_session(db, p["id"], "sess-a", human_id="adam")
+    t1 = await db_module.log_task(db, s["id"], p["id"], "old", "done")
+    await db_module.log_task(db, s["id"], p["id"], "new", "done")
+    # Backdate the first task to a prior day.
+    await db.execute(
+        "UPDATE task_log SET created_at = ? WHERE id = ?",
+        ("2026-01-01 09:00:00", t1["id"]),
+    )
+    await db.commit()
+
+    timeline = await db_module.get_timeline(db, p["id"])
+    daily = timeline["daily_counts"]
+    assert len(daily) == 2
+    # ascending by date
+    assert daily[0]["date"] == "2026-01-01"
+    assert daily[0]["count"] == 1
+    assert daily[1]["count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_timeline_daily_counts_unknown_human(db):
+    """A session with no human_id buckets under '(unknown)'."""
+    p = await db_module.create_project(db, "alpha")
+    s = await db_module.register_session(db, p["id"], "sess-a")
+    await db_module.log_task(db, s["id"], p["id"], "task", "done")
+
+    timeline = await db_module.get_timeline(db, p["id"])
+    day = timeline["daily_counts"][0]
+    assert day["humans"] == {"(unknown)": 1}
+    assert day["sessions"][0]["human"] == "(unknown)"
+
+
+@pytest.mark.asyncio
+async def test_timeline_daily_counts_counts_all_statuses(db):
+    """Heatmap counts every logged task, not just done/failed."""
+    p = await db_module.create_project(db, "alpha")
+    s = await db_module.register_session(db, p["id"], "sess-a", human_id="adam")
+    await db_module.log_task(db, s["id"], p["id"], "done one", "done")
+    await db_module.log_task(db, s["id"], p["id"], "pending one", "pending")
+
+    timeline = await db_module.get_timeline(db, p["id"])
+    assert timeline["daily_counts"][0]["count"] == 2
+
+
 def test_session_summary_schema_shape():
     """The JSON schema we hand to haiku has the four expected keys."""
     schema = db_module.SESSION_SUMMARY_SCHEMA
