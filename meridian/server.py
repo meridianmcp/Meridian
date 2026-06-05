@@ -4970,10 +4970,25 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "watching_session_id": {"type": "string"}},
          "required": ["watching_session_id"]}},
 ]
-# Tell ChatGPT/OpenAI these tools are safe — prevents confirmation dialogs blocking non-destructive calls
+# Correct MCP spec annotations — tells ChatGPT/Claude how to treat each tool
+# Defaults are pessimistic (destructiveHint=true, openWorldHint=true) so we must be explicit
+_READ_ONLY_TOOLS = {
+    'list_projects', 'get_project_by_name', 'get_goal', 'get_notes',
+    'get_pinned_decisions', 'get_tasks', 'search_tasks', 'search_all',
+    'get_session_brief', 'get_context_block', 'get_hitl_request',
+    'list_hitl_requests', 'list_sessions', 'get_sprint_notes',
+    'get_run_transcript', 'idle_until_session_done', 'generate_handoff',
+}
 _DESTRUCTIVE_TOOLS = {'delete_note', 'delete_decision', 'dismiss_hitl'}
 for _t in _MCP_TOOLS_LIST:
-    _t.setdefault('annotations', {})['x-openai-isConsequential'] = _t['name'] in _DESTRUCTIVE_TOOLS
+    _is_ro = _t['name'] in _READ_ONLY_TOOLS
+    _is_dest = _t['name'] in _DESTRUCTIVE_TOOLS
+    _t['annotations'] = {
+        'readOnlyHint': _is_ro,
+        'destructiveHint': _is_dest,
+        'openWorldHint': False,   # tools only talk to Meridian's own server
+        'idempotentHint': _is_ro, # read-only tools are safe to retry
+    }
 
 
 # ---------------------------------------------------------------------------
