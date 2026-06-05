@@ -217,7 +217,7 @@ def _github_callback_url() -> str:
 def _github_repo_callback_url() -> str:
     """Return the absolute callback URL for the GitHub repo-connect flow."""
     base = _cfg("MERIDIAN_BASE_URL", "http://localhost:7878").rstrip("/")
-    return f"{base}/auth/github/callback"
+    return f"{base}/auth/github/repo-callback"
 
 
 async def get_github_auth_url(

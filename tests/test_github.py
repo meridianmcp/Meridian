@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 
 from meridian import db as db_module
+from meridian import hosted as hosted_module
 from meridian import server as server_module
 
 
@@ -54,6 +55,58 @@ def test_auth_github_callback_missing_code(client):
     r = client.get("/auth/github/callback", follow_redirects=False)
     assert r.status_code == 400
     assert "missing oauth code" in r.json().get("detail", "")
+
+
+def test_auth_github_repo_connect_redirects_to_repo_callback(tmp_path, monkeypatch):
+    """GET /auth/github/repo-connect uses the dedicated repo callback URL."""
+    monkeypatch.setenv("GITHUB_CLIENT_ID", "Ov23liFakeId")
+    monkeypatch.setenv("MERIDIAN_SESSION_SECRET", "test-session-secret")
+    mod, client = _github_client(tmp_path, monkeypatch)
+
+    with client:
+        async def _setup():
+            db = client.app.state.db
+            tenant = await db_module.upsert_tenant(db, "gh_repo_connect@example.com")
+            session = await db_module.create_user_session(
+                db,
+                tenant["id"],
+                "2099-01-01T00:00:00+00:00",
+            )
+            return hosted_module._make_session_cookie(session["id"])
+
+        cookie = asyncio.run(_setup())
+        r = client.get(
+            "/auth/github/repo-connect?project_id=proj-123",
+            cookies={hosted_module._SESSION_COOKIE: cookie},
+            follow_redirects=False,
+        )
+        assert r.status_code == 302
+        location = r.headers["location"]
+        assert "redirect_uri=" in location
+        assert "%2Fauth%2Fgithub%2Frepo-callback" in location
+        assert "state=repo%3Aproj-123" in location
+
+
+def test_exchange_github_repo_code_uses_repo_callback(monkeypatch):
+    """Repo token exchange must send GitHub the repo-specific callback URL."""
+    seen: dict[str, str] = {}
+
+    async def fake_exchange(code, redirect_uri):
+        seen["code"] = code
+        seen["redirect_uri"] = redirect_uri
+        return "access-token"
+
+    async def fake_snapshot(_access_token):
+        return {"login": "octocat", "name": "Octo Cat", "avatar_url": "", "repos": []}
+
+    monkeypatch.setattr(hosted_module, "_exchange_github_code_for_token", fake_exchange)
+    monkeypatch.setattr(hosted_module, "_github_user_snapshot", fake_snapshot)
+    monkeypatch.setenv("MERIDIAN_BASE_URL", "https://usemeridian.us")
+
+    data = asyncio.run(hosted_module.exchange_github_repo_code_for_connection("oauth-code"))
+    assert data["access_token"] == "access-token"
+    assert seen["code"] == "oauth-code"
+    assert seen["redirect_uri"] == "https://usemeridian.us/auth/github/repo-callback"
 
 
 def test_github_connect_validates_pat(tmp_path, monkeypatch):
