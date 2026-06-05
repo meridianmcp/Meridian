@@ -1173,6 +1173,62 @@ async def test_archive_stale_sessions_leaves_recent_sessions(db):
 
 
 @pytest.mark.asyncio
+async def test_expire_inactive_sessions_archives_after_24h(db):
+    """Sessions unseen for 24h+ are archived globally across all projects."""
+    p = await db_module.create_project(db, "alpha")
+    dead = await db_module.register_session(db, p["id"], "dead")
+    fresh = await db_module.register_session(db, p["id"], "fresh")
+    await db.execute(
+        "UPDATE sessions SET last_seen = datetime('now', '-25 hours') WHERE id = ?",
+        (dead["id"],),
+    )
+    await db.commit()
+    result = await db_module.expire_inactive_sessions(db, max_age_hours=24)
+    assert result["count"] == 1
+    assert p["id"] in result["project_ids"]
+    sessions = await db_module.get_sessions(db, p["id"], active_only=False)
+    by_id = {s["id"]: s for s in sessions}
+    assert by_id[dead["id"]]["status"] == "archived"
+    assert by_id[fresh["id"]]["status"] == "active"
+
+
+@pytest.mark.asyncio
+async def test_expire_inactive_sessions_releases_in_progress_tasks(db):
+    """Archiving a dead session releases its in_progress tasks back to pending."""
+    p = await db_module.create_project(db, "alpha")
+    s = await db_module.register_session(db, p["id"], "dead")
+    t = await db_module.log_task(db, s["id"], p["id"], "claimed work")
+    await db.execute(
+        "UPDATE task_log SET status = 'in_progress', claimed_by = ? WHERE id = ?",
+        (s["id"], t["id"]),
+    )
+    await db.execute(
+        "UPDATE sessions SET last_seen = datetime('now', '-25 hours') WHERE id = ?",
+        (s["id"],),
+    )
+    await db.commit()
+    await db_module.expire_inactive_sessions(db, max_age_hours=24)
+    async with db.execute(
+        "SELECT status, claimed_by FROM task_log WHERE id = ?", (t["id"],)
+    ) as cur:
+        row = await cur.fetchone()
+    assert row["status"] == "pending"
+    assert row["claimed_by"] is None
+
+
+@pytest.mark.asyncio
+async def test_expire_inactive_sessions_leaves_recent_sessions(db):
+    """Sessions seen within 24h must not be archived."""
+    p = await db_module.create_project(db, "alpha")
+    s = await db_module.register_session(db, p["id"], "fresh")
+    result = await db_module.expire_inactive_sessions(db, max_age_hours=24)
+    assert result["count"] == 0
+    sessions = await db_module.get_sessions(db, p["id"], active_only=False)
+    still_active = next(x for x in sessions if x["id"] == s["id"])
+    assert still_active["status"] == "active"
+
+
+@pytest.mark.asyncio
 async def test_archive_empty_sessions_marks_old_taskless_sessions(db):
     """Old sessions with no task_log rows are archived during cleanup."""
     p = await db_module.create_project(db, "alpha-empty")

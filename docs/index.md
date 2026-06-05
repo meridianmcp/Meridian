@@ -81,8 +81,11 @@ flowchart LR
         MS --> ND
     end
 
+    GH["GitHub Repository<br/>(your code)"]
+
     CC -->|"HTTPS / Bearer token"| MS
     DB <-->|"HTTPS"| MS
+    MS -->|"PAT (commits, PRs)"| GH
 ```
 
 Zero local install — sign in at [usemeridian.us](https://usemeridian.us), copy your API token, add to MCP config.

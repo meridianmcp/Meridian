@@ -709,6 +709,16 @@ irm https://usemeridian.us/hooks.ps1 | iex</pre>
 
     <details style="border:1px solid var(--border,#2d3f55);border-radius:6px;padding:0;margin-bottom:10px;background:var(--surface-1,#0d1829)">
       <summary style="cursor:pointer;padding:14px 18px;font-weight:600;font-size:14px;list-style:none;display:flex;justify-content:space-between;align-items:center">
+        How is my data encrypted?
+        <span style="font-size:18px;color:var(--muted,#8b9cba);flex-shrink:0;margin-left:12px">+</span>
+      </summary>
+      <div style="padding:0 18px 14px;color:var(--muted,#8b9cba);font-size:14px;line-height:1.7">
+        On the hosted tier, each workspace gets its own <strong>isolated Neon Postgres database</strong> — your data is never co-mingled with other tenants. Sensitive credentials (your Neon connection string, GitHub access tokens) are <strong>encrypted at rest</strong> with <a href="https://cryptography.io/en/latest/fernet/" target="_blank" rel="noopener" style="color:var(--accent,#5b8def)">Fernet</a> symmetric encryption (AES-128-CBC with HMAC-SHA256 authentication). API tokens are stored only as SHA-256 hashes — we can't recover a raw token. All traffic is encrypted in transit over HTTPS/TLS.
+      </div>
+    </details>
+
+    <details style="border:1px solid var(--border,#2d3f55);border-radius:6px;padding:0;margin-bottom:10px;background:var(--surface-1,#0d1829)">
+      <summary style="cursor:pointer;padding:14px 18px;font-weight:600;font-size:14px;list-style:none;display:flex;justify-content:space-between;align-items:center">
         How is this different from CLAUDE.md?
         <span style="font-size:18px;color:var(--muted,#8b9cba);flex-shrink:0;margin-left:12px">+</span>
       </summary>

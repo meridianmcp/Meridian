@@ -58,6 +58,17 @@ function hideHostedAdminControls() {
   if (advLink) advLink.textContent = 'Close';
 }
 
+function showLocalServerControls() {
+  // Server-management buttons are display:none by default in the template so they
+  // never flash on hosted/demo loads. Reveal them only once we've confirmed this
+  // is a local, non-demo self-hosted instance.
+  if (isHostedMode() || isDemoMode()) return;
+  ['#git-check-btn', '#restart-server-btn', '#stop-server-btn'].forEach(sel => {
+    const el = document.querySelector(sel);
+    if (el) el.style.display = '';
+  });
+}
+
 const STORAGE_KEY = (k) => (isDemoMode() ? 'meridian_demo_' : 'meridian_') + k.replace(/^meridian[._]/, '');
 const QUEUE_DONE_PAGE_SIZE = 10;
 const NORTH_STAR_MIN_HEIGHT_PX = 180;
@@ -253,6 +264,16 @@ const _DEMO_TOUR_STEPS = [
     },
   },
   {
+    target: () => document.querySelector('[data-vtab="goal"], button[onclick*="goal"]'),
+    title: 'Shared goal state',
+    body: 'The north star, current sprint, and pinned decisions every session reads on startup — so parallel runs stay aligned on one plan.',
+    position: 'bottom',
+    action: () => {
+      const btn = document.querySelector('[data-vtab="goal"]') || document.querySelector('button[onclick*="goal"]');
+      if (btn) btn.click();
+    },
+  },
+  {
     target: () => null,  // centered finish step
     title: 'You\'re all set',
     body: 'Explore any project or session. When you\'re ready to coordinate your own AI sessions — sign in and create a project.',
@@ -399,6 +420,18 @@ function _renderPlanBadge(me) {
     badge.textContent = planLabels[plan] || plan;
     verEl.parentNode.insertBefore(badge, verEl.nextSibling);
   }
+  // Persistent upgrade nudge for free-tier users (shown regardless of days left).
+  if (plan === 'free' && !me.expired && !isDemoMode() && !document.getElementById('upgrade-banner')) {
+    const upgradeUrl = state.serverConfig?.stripe_payment_link || '/pricing';
+    const b = document.createElement('div');
+    b.id = 'upgrade-banner';
+    b.style = 'position:fixed;top:0;left:0;right:0;z-index:9996;background:#2563eb;color:#fff;text-align:center;padding:5px 12px;font-size:12px;font-family:inherit;letter-spacing:0.02em;display:flex;align-items:center;justify-content:center;gap:10px';
+    b.innerHTML = `<span>Upgrade to Standard — 8× faster, dedicated DB</span><a href="${escapeHtml(upgradeUrl)}" style="background:#fff;color:#2563eb;font-weight:700;text-decoration:none;padding:2px 10px;border-radius:4px;white-space:nowrap">$20/mo →</a><button onclick="sessionStorage.setItem('upgrade-banner-dismissed','1');this.closest('#upgrade-banner').remove();document.body.style.paddingTop=Math.max(0,parseInt(document.body.style.paddingTop||'0',10)-28)+'px'" style="background:none;border:none;color:rgba(255,255,255,0.7);font-size:16px;cursor:pointer;padding:0 0 0 6px;line-height:1" title="Dismiss">×</button>`;
+    if (!sessionStorage.getItem('upgrade-banner-dismissed')) {
+      document.body.prepend(b);
+      document.body.style.paddingTop = ((parseInt(document.body.style.paddingTop || '0', 10)) + 28) + 'px';
+    }
+  }
   // Expiry warning banner at ≤25 days remaining
   const days = me.days_remaining;
   const isExpiring = (plan === 'free' || plan === 'trial') && days !== null && days !== undefined && days <= 25;
@@ -512,11 +545,15 @@ function _updateConnectionIndicator(cfg) {
       // Use cfg.connection_name as truth for which connection is active
       // (env var overrides can make the toml active flag stale).
       const hosted = isHostedMode();
+      // Hosted admins (operators) get the full local-style connection manager —
+      // switcher for every connection type, delete buttons, "+ Add connection...",
+      // and the toml path. Normal hosted users get the restricted postgres-only view.
+      const adminFull = !hosted || isHostedAdmin();
       const activeName = cfg.connection_name || (cfg.db === 'postgres' ? 'env (postgres)' : 'local');
       let displayConns = (conns || []).map(c => ({...c, active: c.name === activeName}));
-      if (hosted) {
-        // Hosted admins manage the env postgres only — local/sqlite connections
-        // would break tenant isolation, so hide them from the switcher.
+      if (hosted && !isHostedAdmin()) {
+        // Normal hosted users manage the env postgres only — local/sqlite
+        // connections would break tenant isolation, so hide them from the switcher.
         displayConns = displayConns.filter(c => (c.type || 'sqlite') === 'postgres');
       }
       if (!displayConns.find(c => c.active)) {
@@ -552,9 +589,10 @@ function _updateConnectionIndicator(cfg) {
           left.appendChild(badge);
         }
         item.appendChild(left);
-        // Delete button for any named non-local connection (never on hosted —
-        // removing the managed postgres would orphan every tenant).
-        if (c.name && c.name !== 'local' && !hosted) {
+        // Delete button for any named non-local connection. Normal hosted users
+        // can't delete (removing the managed postgres would orphan every tenant);
+        // admins manage connections fully.
+        if (c.name && c.name !== 'local' && adminFull) {
           const del = document.createElement('button');
           del.textContent = '×';
           del.title = c.active ? 'Remove connection (will switch to local)' : 'Remove connection';
@@ -600,8 +638,8 @@ function _updateConnectionIndicator(cfg) {
         popup.appendChild(item);
       });
       // "+ Add connection..." and the toml path are local-config affordances —
-      // hidden on hosted where there is no per-machine meridian.toml to edit.
-      if (!hosted) {
+      // hidden for normal hosted users, shown to admins managing the server.
+      if (adminFull) {
         const addItem = document.createElement('div');
         addItem.style.cssText = 'padding:6px 12px;cursor:pointer;color:var(--muted);border-top:1px solid var(--border);margin-top:4px';
         addItem.textContent = '+ Add connection...';
@@ -611,7 +649,7 @@ function _updateConnectionIndicator(cfg) {
         popup.appendChild(addItem);
       }
       // Config file path at bottom
-      if (cfg.toml_path && !hosted) {
+      if (cfg.toml_path && adminFull) {
         const pathRow = document.createElement('div');
         pathRow.style.cssText = 'padding:4px 12px 6px;color:var(--muted);font-size:9px;border-top:1px solid var(--border);margin-top:2px;word-break:break-all';
         pathRow.textContent = '📄 ' + cfg.toml_path;
@@ -2591,6 +2629,31 @@ function renderTimeline(projectId, data) {
   });
 }
 
+function _heatmapPieces(maxScale) {
+  // Six-bucket green→red ramp scaled proportionally to maxScale so projects
+  // with very different activity levels stay legible.
+  const colors = ['#bbf7d0', '#4ade80', '#16a34a', '#ca8a04', '#ea580c', '#dc2626'];
+  const n = colors.length;
+  const pieces = [];
+  let lo = 1;
+  for (let i = 0; i < n; i++) {
+    if (i === n - 1) {
+      pieces.push({ min: lo, color: colors[i], label: `${lo}+` });
+      break;
+    }
+    const hi = Math.max(lo, Math.round((maxScale * (i + 1)) / n));
+    pieces.push({ min: lo, max: hi, color: colors[i], label: lo === hi ? `${lo}` : `${lo}–${hi}` });
+    lo = hi + 1;
+  }
+  return pieces;
+}
+
+function _heatmapMaxFor(projectId) {
+  const raw = parseInt(localStorage.getItem(`meridian_heatmap_max_${projectId}`), 10);
+  if (!Number.isFinite(raw)) return 25;
+  return Math.min(100, Math.max(10, raw));
+}
+
 function _renderTimelineHeatmap(projectId, data, paneEl) {
   /** Contribution calendar — one colored square per day, intensity by task
    * count. Multi-human projects get one calendar row per human_id. Click a
@@ -2680,6 +2743,28 @@ function _renderTimelineHeatmap(projectId, data, paneEl) {
   });
 
   paneEl.innerHTML = '';
+  let scaleMax = _heatmapMaxFor(projectId);
+
+  const ctrl = document.createElement('div');
+  ctrl.style.cssText = 'display:flex;align-items:center;gap:8px;justify-content:flex-end;padding:0 4px 6px;font-size:11px;color:var(--muted);font-family:IBM Plex Mono,monospace';
+  const ctrlLabel = document.createElement('label');
+  ctrlLabel.textContent = 'Scale max';
+  ctrlLabel.style.cssText = 'cursor:default';
+  const slider = document.createElement('input');
+  slider.type = 'range';
+  slider.min = '10'; slider.max = '100'; slider.step = '5';
+  slider.value = String(scaleMax);
+  slider.style.cssText = 'width:120px;accent-color:#16a34a;cursor:pointer';
+  const valOut = document.createElement('span');
+  valOut.textContent = String(scaleMax);
+  valOut.style.cssText = 'min-width:24px;text-align:right;color:var(--text)';
+  ctrlLabel.setAttribute('for', `heatscale-${projectId}`);
+  slider.id = `heatscale-${projectId}`;
+  ctrl.appendChild(ctrlLabel);
+  ctrl.appendChild(slider);
+  ctrl.appendChild(valOut);
+  paneEl.appendChild(ctrl);
+
   const container = document.createElement('div');
   container.style.cssText = `width:100%;height:${totalH}px;min-height:${totalH}px`;
   paneEl.appendChild(container);
@@ -2714,14 +2799,7 @@ function _renderTimelineHeatmap(projectId, data, paneEl) {
       bottom: 0,
       itemWidth: 11, itemHeight: 11,
       textStyle: { color: '#8b9cba', fontSize: 9, fontFamily: 'IBM Plex Mono' },
-      pieces: [
-        { min: 1, max: 2, color: '#bbf7d0', label: '1–2' },
-        { min: 3, max: 5, color: '#4ade80', label: '3–5' },
-        { min: 6, max: 9, color: '#16a34a', label: '6–9' },
-        { min: 10, max: 14, color: '#ca8a04', label: '10–14' },
-        { min: 15, max: 19, color: '#ea580c', label: '15–19' },
-        { min: 20, color: '#dc2626', label: '20+' },
-      ],
+      pieces: _heatmapPieces(scaleMax),
     },
     calendar: calendars,
     series: series,
@@ -2745,6 +2823,13 @@ function _renderTimelineHeatmap(projectId, data, paneEl) {
   chart.on('click', params => {
     if (params.componentType !== 'series' || !params.data || !params.data.value) return;
     renderDetail(params.data.human, params.data.value[0]);
+  });
+
+  slider.addEventListener('input', () => {
+    scaleMax = Math.min(100, Math.max(10, parseInt(slider.value, 10) || 25));
+    valOut.textContent = String(scaleMax);
+    localStorage.setItem(`meridian_heatmap_max_${projectId}`, String(scaleMax));
+    chart.setOption({ visualMap: { pieces: _heatmapPieces(scaleMax) } });
   });
 
   const pnl = state.panels[projectId];
@@ -3041,6 +3126,27 @@ async function loadDocsTab(projectId) {
   } catch (e) {
     body.innerHTML = `<div style="color:var(--error)">Failed to load tools: ${escapeHtml(String(e))}</div>`;
   }
+}
+
+// Turn a bare ntfy topic name ("my-alerts") into a full URL. Leaves real URLs,
+// email addresses, and anything containing a slash untouched.
+function normalizeNotifyTarget(raw) {
+  const v = (raw || '').trim();
+  if (!v) return '';
+  if (v.includes('://') || v.includes('@') || v.includes('/')) return v;
+  return `https://ntfy.sh/${v}`;
+}
+
+// Suggest a hard-to-guess ntfy topic: {project-slug}-{6 random chars}.
+function suggestNtfyTopic(projectId) {
+  const proj = (state.projects || []).find(p => p.id === projectId);
+  const slug = (proj?.name || 'meridian')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 24) || 'meridian';
+  const rand = Math.random().toString(36).slice(2, 8);
+  return `${slug}-${rand}`;
 }
 
 async function loadSettingsTab(projectId) {
@@ -3643,7 +3749,7 @@ async function loadSettingsTab(projectId) {
   // Usage section (hosted mode only)
   if (mcpData) {
     html += `<div style="margin-bottom:16px" id="usage-section-${projectId}">
-      <div style="color:var(--accent);font-size:10px;letter-spacing:.06em;text-transform:uppercase;margin-bottom:10px;padding-bottom:4px;border-bottom:1px solid var(--border)">Usage this month</div>
+      <div id="usage-header-${projectId}" style="color:var(--accent);font-size:10px;letter-spacing:.06em;text-transform:uppercase;margin-bottom:10px;padding-bottom:4px;border-bottom:1px solid var(--border)">Usage this month</div>
       <div id="usage-body-${projectId}" style="font-size:10px;color:var(--muted)">loading…</div>
     </div>`;
 
@@ -3654,9 +3760,31 @@ async function loadSettingsTab(projectId) {
         const u = await api('/settings/usage');
         const c = u.compute || {};
         const s = u.storage || {};
+        const unlimited = !!u.unlimited;
+
+        // Header reflects the plan: free tier is a one-time 30-day trial, not monthly.
+        const headerEl = document.getElementById(`usage-header-${projectId}`);
+        if (headerEl) {
+          if (u.plan === 'free') headerEl.textContent = 'Trial usage';
+          else if (unlimited) headerEl.textContent = 'Usage';
+          else headerEl.textContent = 'Usage this month';
+        }
 
         function pct(used, limit) { return Math.min(100, limit > 0 ? (used / limit * 100) : 0); }
         function barColor(p) { return p >= 100 ? '#ef4444' : p >= 80 ? '#f59e0b' : 'var(--accent)'; }
+
+        if (unlimited) {
+          usageEl.innerHTML = `
+            <div style="margin-bottom:10px;display:flex;justify-content:space-between">
+              <span style="color:var(--text)">Compute</span>
+              <span>${c.used.toFixed(1)} CU-hrs <span style="color:var(--accent)">· Unlimited</span></span>
+            </div>
+            <div style="margin-bottom:4px;display:flex;justify-content:space-between">
+              <span style="color:var(--text)">Storage</span>
+              <span>${s.used_gb.toFixed(3)} GB <span style="color:var(--accent)">· Unlimited</span></span>
+            </div>`;
+          return;
+        }
 
         const cpct = pct(c.used, c.grace);
         const spct = pct(s.used_gb, s.limit_gb);
@@ -3729,14 +3857,14 @@ async function loadSettingsTab(projectId) {
     <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
       <input type="text" id="ntfy-url-${projectId}"
         value="${escapeHtml(defaultNotifyUrl)}"
-        placeholder="https://ntfy.sh/my-topic  ·  https://hooks.slack.com/…  ·  you@email.com"
+        placeholder="${escapeHtml(suggestNtfyTopic(projectId))}  ·  https://hooks.slack.com/…  ·  you@email.com"
         style="flex:1;min-width:200px;padding:5px 8px;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;color:var(--text);font-family:var(--font-mono);font-size:11px;outline:none">
       <button class="secondary" id="ntfy-save-${projectId}" style="padding:4px 10px;font-size:10px">Save</button>
       <button class="secondary" id="ntfy-test-${projectId}" style="padding:4px 10px;font-size:10px" title="Send a test notification to verify your URL">Test</button>
       <span id="ntfy-status-${projectId}" style="font-size:10px;color:var(--muted);min-width:40px"></span>
     </div>
     <div style="font-size:9px;color:var(--muted);margin-top:4px">
-      <strong>ntfy:</strong> install the ntfy app on iOS/Android/desktop, create a topic, paste the URL above.
+      <strong>ntfy:</strong> install the ntfy app on iOS/Android/desktop, then enter just a topic name (we add <code>https://ntfy.sh/</code> for you) or paste a full URL.
       <strong>Email:</strong> enter your email — Meridian sends via Resend (hosted only).
       <strong>Webhook:</strong> any <code>https://</code> URL receives a JSON POST.
     </div>
@@ -3846,7 +3974,9 @@ async function loadSettingsTab(projectId) {
     ntfySaveBtn.onclick = async () => {
       const inp = document.getElementById(`ntfy-url-${projectId}`);
       const statusEl = document.getElementById(`ntfy-status-${projectId}`);
-      const url = (inp ? inp.value.trim() : '') || null;
+      const url = normalizeNotifyTarget(inp ? inp.value : '') || null;
+      // Reflect the normalized value back so the user sees the full URL we saved.
+      if (inp && url) inp.value = url;
       try {
         // send notify_url (canonical) and ntfy_url (legacy compat) — server accepts both
         await api(`/projects/${projectId}/ntfy`, {
@@ -6072,6 +6202,7 @@ async function restoreTabs() {
   await loadProjects();
   if (isDemoMode()) hideDemoAdminControls();
   if (isHostedMode()) hideHostedAdminControls();
+  showLocalServerControls();
   // v0.6.6 — EZ first-run wizard: if no projects exist, show the overlay
   // Skip in demo mode — demo DB always has projects seeded.
   if (state.projects.length === 0 && !isDemoMode()) {
