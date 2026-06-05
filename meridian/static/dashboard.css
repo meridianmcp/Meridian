@@ -369,6 +369,13 @@ input[type=text] {
 }
 .tl-heat-sess-count { color: var(--muted); flex-shrink: 0; }
 
+.timeline-tooltip { max-width: 320px; white-space: pre-wrap; word-break: break-word; }
+.timeline-tooltip-desc {
+  display: block; margin-top: 4px;
+  max-height: 200px; overflow-y: auto;
+  white-space: pre-wrap; word-break: break-word;
+}
+
 .live-body {
   flex: 1; display: flex; flex-direction: column;
   overflow-y: auto; padding: 14px; gap: 14px;
@@ -601,6 +608,17 @@ input[type=text] {
 .timeline-log-desc { color: var(--text); }
 
 /* v1.4.0 — work queue panel */
+/* The queue body is the single scroll container for the tab. min-height:0 on
+   the inline style lets this flex child shrink below content height so it
+   scrolls instead of pushing the recent-runs / recent-sessions panels. */
+.queue-scroll { scrollbar-width: thin; scrollbar-color: var(--border) transparent; }
+.queue-scroll::-webkit-scrollbar { width: 10px; }
+.queue-scroll::-webkit-scrollbar-track { background: transparent; }
+.queue-scroll::-webkit-scrollbar-thumb {
+  background: var(--border); border-radius: 5px;
+  border: 2px solid var(--bg);
+}
+.queue-scroll::-webkit-scrollbar-thumb:hover { background: var(--muted); }
 .queue-section { padding: 0; border-bottom: 1px solid var(--border); }
 .queue-section-header {
   font-size: 10px; letter-spacing: 0.06em; text-transform: uppercase;

@@ -127,12 +127,30 @@ async def admin_shutdown(request: Request) -> Response:
 
 @router.post("/admin/restart")
 async def admin_restart(request: Request) -> Response:
-    """Restart the server by spawning a new process then shutting down."""
+    """Restart the server by spawning a new process then shutting down.
+
+    Requires an explicit ``{"confirm": true}`` body — a restart kills every
+    active session on the machine (a real hazard on shared Fly machines), so an
+    unconfirmed call returns a warning instead of restarting.
+    """
     if _is_demo_request(request):
         return JSONResponse(
             {"detail": "Not available in demo mode. Sign up at usemeridian.us"},
             status_code=403,
         )
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not (isinstance(body, dict) and body.get("confirm") is True):
+        return JSONResponse(
+            {
+                "warning": "Restarting will disconnect all active sessions on this machine. Confirm?",
+                "requires_confirm": True,
+            }
+        )
+
     import subprocess
     import sys
 

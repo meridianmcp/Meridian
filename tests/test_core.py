@@ -4679,11 +4679,18 @@ def test_config_connections_save_postgres(client, tmp_path, monkeypatch):
     assert r.json()["ok"] is True
 
 
-def test_admin_restart_returns_ok(client):
-    """POST /admin/restart returns {ok: true} immediately."""
+def test_admin_restart_requires_confirm(client):
+    """POST /admin/restart without {confirm: true} returns a warning, not a restart.
+
+    A restart disconnects every active session on the machine, so it must be
+    explicitly confirmed before the server tears itself down.
+    """
     r = client.post("/admin/restart")
     assert r.status_code == 200
-    assert r.json()["ok"] is True
+    body = r.json()
+    assert body.get("requires_confirm") is True
+    assert "ok" not in body
+    assert "disconnect all active sessions" in body.get("warning", "")
 
 
 def test_admin_snapshot_memory_db_returns_400(client):

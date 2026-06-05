@@ -511,8 +511,14 @@ function _updateConnectionIndicator(cfg) {
       // Connection options.
       // Use cfg.connection_name as truth for which connection is active
       // (env var overrides can make the toml active flag stale).
+      const hosted = isHostedMode();
       const activeName = cfg.connection_name || (cfg.db === 'postgres' ? 'env (postgres)' : 'local');
       let displayConns = (conns || []).map(c => ({...c, active: c.name === activeName}));
+      if (hosted) {
+        // Hosted admins manage the env postgres only — local/sqlite connections
+        // would break tenant isolation, so hide them from the switcher.
+        displayConns = displayConns.filter(c => (c.type || 'sqlite') === 'postgres');
+      }
       if (!displayConns.find(c => c.active)) {
         displayConns.unshift({name: activeName, type: cfg.db, active: true});
       }
@@ -546,8 +552,9 @@ function _updateConnectionIndicator(cfg) {
           left.appendChild(badge);
         }
         item.appendChild(left);
-        // Delete button for any named non-local connection
-        if (c.name && c.name !== 'local') {
+        // Delete button for any named non-local connection (never on hosted —
+        // removing the managed postgres would orphan every tenant).
+        if (c.name && c.name !== 'local' && !hosted) {
           const del = document.createElement('button');
           del.textContent = '×';
           del.title = c.active ? 'Remove connection (will switch to local)' : 'Remove connection';
@@ -592,15 +599,19 @@ function _updateConnectionIndicator(cfg) {
         };
         popup.appendChild(item);
       });
-      const addItem = document.createElement('div');
-      addItem.style.cssText = 'padding:6px 12px;cursor:pointer;color:var(--muted);border-top:1px solid var(--border);margin-top:4px';
-      addItem.textContent = '+ Add connection...';
-      addItem.onmouseenter = () => addItem.style.color = 'var(--text)';
-      addItem.onmouseleave = () => addItem.style.color = 'var(--muted)';
-      addItem.onclick = () => { popup.remove(); document.getElementById('conn-setup-modal').style.display = 'flex'; };
-      popup.appendChild(addItem);
+      // "+ Add connection..." and the toml path are local-config affordances —
+      // hidden on hosted where there is no per-machine meridian.toml to edit.
+      if (!hosted) {
+        const addItem = document.createElement('div');
+        addItem.style.cssText = 'padding:6px 12px;cursor:pointer;color:var(--muted);border-top:1px solid var(--border);margin-top:4px';
+        addItem.textContent = '+ Add connection...';
+        addItem.onmouseenter = () => addItem.style.color = 'var(--text)';
+        addItem.onmouseleave = () => addItem.style.color = 'var(--muted)';
+        addItem.onclick = () => { popup.remove(); document.getElementById('conn-setup-modal').style.display = 'flex'; };
+        popup.appendChild(addItem);
+      }
       // Config file path at bottom
-      if (cfg.toml_path) {
+      if (cfg.toml_path && !hosted) {
         const pathRow = document.createElement('div');
         pathRow.style.cssText = 'padding:4px 12px 6px;color:var(--muted);font-size:9px;border-top:1px solid var(--border);margin-top:2px;word-break:break-all';
         pathRow.textContent = '📄 ' + cfg.toml_path;
@@ -663,8 +674,20 @@ async function checkGitStatus() {
   }
 }
 
-async function _doRestart() {
-  try { await fetch('/admin/restart', { method: 'POST' }); } catch(_) { /* expected */ }
+async function _doRestart(confirmFirst = true) {
+  if (confirmFirst &&
+      !confirm('This will restart the server and disconnect all active sessions on this machine. Are you sure?')) {
+    return;
+  }
+  // confirm:true tells the server we acknowledge the all-sessions disconnect;
+  // without it /admin/restart returns a requires_confirm warning instead.
+  try {
+    await fetch('/admin/restart', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ confirm: true }),
+    });
+  } catch(_) { /* expected */ }
   // Replace any existing restart button text
   document.querySelectorAll('#restart-server-btn, #banner-restart-btn').forEach(b => {
     b.textContent = 'Restarting…'; b.disabled = true;
@@ -1229,7 +1252,7 @@ function buildTabBody(project) {
             style="width:100%;padding:5px 10px;background:var(--surface-2);border:1px solid var(--border);
             color:var(--text);border-radius:4px;font-family:var(--font-mono);font-size:11px;outline:none">
         </div>
-        <div style="flex:1;overflow-y:auto" id="queue-body-${project.id}">
+        <div class="queue-scroll" style="flex:1;min-height:0;overflow-y:auto" id="queue-body-${project.id}">
           <div class="empty" style="color:var(--muted)">select queue to load</div>
         </div>
         <div id="recent-sessions-${project.id}" style="display:none;flex-shrink:0;border-top:1px solid var(--border);background:var(--surface-2);padding:8px 14px 8px"></div>
@@ -2584,6 +2607,9 @@ function _renderTimelineHeatmap(projectId, data, paneEl) {
     return v || fallback;
   };
   const emptyColor = cssVar('--surface-2', '#1a2740');
+  const borderCol = cssVar('--border', '#232830');
+  const textPrimary = cssVar('--text', '#d8dde6');
+  const textMuted = cssVar('--muted', '#9ba5b5');
 
   // Distinct humans across all days; sorted so layout is stable.
   const humanSet = new Set();
@@ -2625,11 +2651,11 @@ function _renderTimelineHeatmap(projectId, data, paneEl) {
       right: 12,
       cellSize: [CELL, CELL],
       range: rangeStart === rangeEnd ? rangeStart : [rangeStart, rangeEnd],
-      splitLine: { show: true, lineStyle: { color: '#1e2d4a' } },
+      splitLine: { show: true, lineStyle: { color: borderCol, type: 'dashed', width: 1 } },
       itemStyle: { color: emptyColor, borderColor: '#0d1b2e', borderWidth: 1 },
       yearLabel: { show: false },
-      monthLabel: { color: '#8b9cba', fontFamily: 'IBM Plex Mono', fontSize: 9 },
-      dayLabel: { color: '#8b9cba', fontFamily: 'IBM Plex Mono', fontSize: 8, firstDay: 1 },
+      monthLabel: { color: textPrimary, fontFamily: 'IBM Plex Mono', fontSize: 13, fontWeight: 'bold' },
+      dayLabel: { color: textMuted, fontFamily: 'IBM Plex Mono', fontSize: 10, firstDay: 1 },
     });
     if (multi) {
       titles.push({
@@ -2689,9 +2715,12 @@ function _renderTimelineHeatmap(projectId, data, paneEl) {
       itemWidth: 11, itemHeight: 11,
       textStyle: { color: '#8b9cba', fontSize: 9, fontFamily: 'IBM Plex Mono' },
       pieces: [
-        { min: 1, max: 2, color: '#4ade80', label: '1–2' },
-        { min: 3, max: 5, color: '#22c55e', label: '3–5' },
-        { min: 6, color: '#16a34a', label: '6+' },
+        { min: 1, max: 2, color: '#bbf7d0', label: '1–2' },
+        { min: 3, max: 5, color: '#4ade80', label: '3–5' },
+        { min: 6, max: 9, color: '#16a34a', label: '6–9' },
+        { min: 10, max: 14, color: '#ca8a04', label: '10–14' },
+        { min: 15, max: 19, color: '#ea580c', label: '15–19' },
+        { min: 20, color: '#dc2626', label: '20+' },
       ],
     },
     calendar: calendars,
@@ -2747,7 +2776,7 @@ function _renderTimelineGantt(projectId, data, paneEl) {
     if (!byStatus[st]) byStatus[st] = [];
     byStatus[st].push({
       value: [d.getTime(), t.session_name || '(unknown)'],
-      desc: (t.description || '').slice(0, 120),
+      desc: t.description || '',
       sess: t.session_name || '(unknown)',
       ts: t.created_at,
       status: st,
@@ -2814,6 +2843,8 @@ function _renderTimelineGantt(projectId, data, paneEl) {
       borderColor: '#1e3a5f',
       textStyle: { color: '#c7d5ef', fontSize: 11, fontFamily: 'IBM Plex Mono' },
       confine: true,
+      className: 'timeline-tooltip',
+      extraCssText: 'max-width:340px;white-space:normal;',
       position: (point, params, dom, rect, size) => {
         const x = point[0], y = point[1];
         const containerWidth = (size && size.viewSize && size.viewSize[0]) || 0;
@@ -2822,7 +2853,7 @@ function _renderTimelineGantt(projectId, data, paneEl) {
       formatter: params => {
         const d = params.data;
         if (d.field) return `<b>${escapeHtml(d.field)}</b> v${d.version}<br><span style="color:#8b9cba;font-size:9px">${escapeHtml(d.ts || '')}</span>`;
-        return `<b>${escapeHtml(d.sess)}</b><br><span style="color:${STATUS_COLOR[d.status] || '#9ca3af'}">${escapeHtml(d.status)}</span> · <span style="color:#8b9cba;font-size:9px">${escapeHtml(d.ts || '')}</span><br><span style="color:#c7d5ef">${escapeHtml(d.desc)}</span>`;
+        return `<b>${escapeHtml(d.sess)}</b><br><span style="color:${STATUS_COLOR[d.status] || '#9ca3af'}">${escapeHtml(d.status)}</span> · <span style="color:#8b9cba;font-size:9px">${escapeHtml(d.ts || '')}</span><br><span class="timeline-tooltip-desc" style="color:#c7d5ef">${escapeHtml(d.desc)}</span>`;
       },
     },
     legend: {
@@ -6091,7 +6122,6 @@ async function restoreTabs() {
     const restartBtn = document.getElementById('restart-server-btn');
     if (restartBtn) {
       restartBtn.onclick = async () => {
-        if (!confirm('Restart the Meridian server?')) return;
         await _doRestart();
       };
     }
@@ -6258,7 +6288,7 @@ document.getElementById('ez-advanced-link').onclick = (e) => {
       });
       modal.style.display = 'none';
       toast('Saved — restarting…');
-      await _doRestart();
+      await _doRestart(false);
     } catch(e) {
       showErr('Failed: ' + e.message);
       sqliteSave.textContent = 'Save & Restart →'; sqliteSave.disabled = false;
@@ -6288,7 +6318,7 @@ document.getElementById('ez-advanced-link').onclick = (e) => {
       });
       modal.style.display = 'none';
       toast('Saved — restarting…');
-      await _doRestart();
+      await _doRestart(false);
     } catch(e) {
       showErr('Failed: ' + e.message);
       pgSave.textContent = 'Save & Restart →'; pgSave.disabled = false;
