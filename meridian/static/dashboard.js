@@ -62,6 +62,7 @@ const STORAGE_KEY = (k) => (isDemoMode() ? 'meridian_demo_' : 'meridian_') + k.r
 const QUEUE_DONE_PAGE_SIZE = 10;
 const NORTH_STAR_MIN_HEIGHT_PX = 180;
 const DEFAULT_MAX_PINNED_DECISIONS = 20;
+const GITHUB_OCTICON_PATH = 'M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z';
 
 function getPanelState(projectId) {
   state.panels[projectId] = state.panels[projectId] || {};
@@ -79,6 +80,10 @@ function autosizeGoalField(el, minPx = NORTH_STAR_MIN_HEIGHT_PX) {
   // Use 'auto' not '0px' — avoids the collapse flash before recalculating scrollHeight (97bfb153)
   el.style.height = 'auto';
   el.style.height = `${Math.max(el.scrollHeight, minPx)}px`;
+}
+
+function githubIconSvg(size = 12, color = 'currentColor') {
+  return `<svg width="${size}" height="${size}" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true" focusable="false" style="color:${color};flex-shrink:0"><path d="${GITHUB_OCTICON_PATH}"></path></svg>`;
 }
 
 function getConstitutionLimit(projectId) {
@@ -375,6 +380,7 @@ async function loadServerConfig() {
       state.tenantPlan = me.plan;
       state.tenantEmail = me.email || '';
       _renderPlanBadge(me);
+      updateGitHubConnectionIndicator(me);
     }
   } catch (e) { /* not hosted or not logged in */ }
 }
@@ -444,6 +450,18 @@ function _renderPlanBadge(me) {
 }
 
 // v1.9.x — show active DB connection in sidebar footer
+function updateGitHubConnectionIndicator(source) {
+  const badge = document.getElementById('connection-github');
+  if (!badge || !source) return;
+  const connected = !!(source.github_connected ?? source.connected);
+  const repo = source.github_repo || source.repo || '';
+  const branch = source.github_branch || source.branch || 'main';
+  badge.style.display = connected ? 'inline-flex' : 'none';
+  badge.title = connected
+    ? (repo ? `GitHub repo connected: ${repo} (${branch})` : 'GitHub repo connected')
+    : 'GitHub repo not connected';
+}
+
 function _updateConnectionIndicator(cfg) {
   if (!cfg) return;
   // Hosted non-admin users stay on the managed DB. Hosted admins keep the
@@ -454,7 +472,7 @@ function _updateConnectionIndicator(cfg) {
   const dot = document.getElementById('connection-dot');
   const switcher = document.getElementById('connection-switcher');
   if (!wrap || !label) return;
-  wrap.style.display = 'block';
+  wrap.style.display = 'inline-flex';
   // Demo mode: show simplified read-only badge, no switcher
   if (cfg.demo_mode) {
     label.textContent = 'demo (sqlite)';
@@ -3414,23 +3432,21 @@ async function loadSettingsTab(projectId) {
 
   // GitHub integration card (hosted only)
   if (mcpData) {
-    const ghConnected = ghData && ghData.connected;
+    const ghConnected = !!(ghData && ghData.connected);
     const ghRepo = (ghData && ghData.repo) || '';
     const ghBranch = (ghData && ghData.branch) || 'main';
     html += `<div style="margin-bottom:14px;padding:10px 12px;border:1px solid var(--border);border-radius:6px;background:var(--surface-2)" id="github-card-${projectId}">
       <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px">
-        <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor" style="color:var(--text);flex-shrink:0"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
-        <span style="font-weight:600;font-size:11px;color:var(--text)">GitHub</span>
+        ${githubIconSvg(14, 'var(--text)')}
+        <span style="font-weight:600;font-size:11px;color:var(--text)">Connect GitHub repo</span>
         ${ghConnected ? `<span style="font-size:9px;padding:2px 6px;background:var(--success,#22c55e);color:#fff;border-radius:10px;font-weight:600">Connected</span>` : ''}
       </div>
-      <div style="font-size:10px;color:var(--muted);margin-bottom:8px">
-        Connect your repo once — your AI sessions can then read files, search code, and check git log without any extra setup.
-        ${!ghConnected ? `<a href="https://github.com/settings/tokens/new?scopes=repo&description=Meridian" target="_blank" style="color:var(--accent);margin-left:4px">Create a PAT →</a>` : ''}
-      </div>
+      <div style="font-size:10px;color:var(--muted);margin-bottom:8px">Give your AI planner read access to your codebase — no extra installs</div>
       ${ghConnected ? `
-        <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
-          <div style="font-family:var(--font-mono);font-size:11px;color:var(--text)">${escapeHtml(ghRepo)}</div>
-          <div style="font-size:10px;color:var(--muted)">branch: ${escapeHtml(ghBranch)}</div>
+        <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:8px">
+          <span style="font-size:11px;color:var(--text);font-weight:600">✓ Connected: ${escapeHtml(ghRepo)} (${escapeHtml(ghBranch)})</span>
+        </div>
+        <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
           <button class="secondary" id="github-test-btn-${projectId}" style="padding:3px 8px;font-size:10px">Test</button>
           <button class="secondary" id="github-disconnect-btn-${projectId}" style="padding:3px 8px;font-size:10px;color:var(--danger,#ef4444)">Disconnect</button>
           <span id="github-status-${projectId}" style="font-size:10px;color:var(--muted)"></span>
@@ -3438,13 +3454,13 @@ async function loadSettingsTab(projectId) {
       ` : `
         <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:flex-end">
           <div style="display:flex;flex-direction:column;gap:3px;flex:2;min-width:140px">
-            <label style="font-size:9px;color:var(--muted)">Personal Access Token</label>
-            <input type="password" id="github-pat-${projectId}" placeholder="ghp_…"
+            <label style="font-size:9px;color:var(--muted)">PAT</label>
+            <input type="password" id="github-pat-${projectId}" placeholder="ghp_..."
               style="padding:5px 8px;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;color:var(--text);font-family:var(--font-mono);font-size:11px;outline:none">
           </div>
           <div style="display:flex;flex-direction:column;gap:3px;flex:2;min-width:120px">
-            <label style="font-size:9px;color:var(--muted)">Repository (owner/repo)</label>
-            <input type="text" id="github-repo-${projectId}" placeholder="acme/myapp"
+            <label style="font-size:9px;color:var(--muted)">Repo</label>
+            <input type="text" id="github-repo-${projectId}" placeholder="owner/repo"
               style="padding:5px 8px;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;color:var(--text);font-family:var(--font-mono);font-size:11px;outline:none">
           </div>
           <div style="display:flex;flex-direction:column;gap:3px;flex:1;min-width:80px">
@@ -3456,6 +3472,10 @@ async function loadSettingsTab(projectId) {
             <label style="font-size:9px;color:transparent">_</label>
             <button class="primary" id="github-connect-btn-${projectId}" style="padding:5px 12px;font-size:11px">Connect</button>
           </div>
+        </div>
+        <div style="font-size:9px;color:var(--muted);margin-top:6px">
+          <a href="https://github.com/settings/tokens" target="_blank" rel="noopener" style="color:var(--accent);text-decoration:none">Create a PAT → github.com/settings/tokens</a>
+          <span style="color:var(--muted)">(needs repo read scope)</span>
         </div>
         <span id="github-status-${projectId}" style="font-size:10px;color:var(--muted);display:block;margin-top:4px"></span>
       `}
