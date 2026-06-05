@@ -172,6 +172,12 @@ def test_dashboard_has_timeline_tab(soup, js):
     )
 
 
+def test_dashboard_js_has_github_connect_card(js):
+    """dashboard.js includes the GitHub connect card in Settings."""
+    assert "github/connect" in js
+    assert "Connect GitHub repo" in js
+
+
 def test_dashboard_goal_tab_has_no_preview_toggle(js):
     """Goal textareas must NOT have the edit/preview chip toggle (Bug 5).
 
