@@ -569,12 +569,26 @@ input[type=text] {
 .timeline-log-desc { color: var(--text); }
 
 /* v1.4.0 — work queue panel */
-.queue-section { padding: 10px 14px; border-bottom: 1px solid var(--border); }
+.queue-section { padding: 0; border-bottom: 1px solid var(--border); }
 .queue-section-header {
   font-size: 10px; letter-spacing: 0.06em; text-transform: uppercase;
   color: var(--muted); font-family: 'IBM Plex Mono', monospace;
-  margin-bottom: 6px; display: flex; gap: 6px; align-items: center;
+  display: flex; justify-content: space-between; align-items: center;
+  gap: 10px; padding: 10px 14px; cursor: pointer; user-select: none;
 }
+.queue-section-header:hover { background: var(--hover); }
+.queue-section-header:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: -1px;
+}
+.queue-section-header-label { display: inline-flex; align-items: center; gap: 6px; }
+.queue-section-count { color: var(--accent); }
+.queue-section-chevron { color: var(--muted); font-size: 10px; transition: transform .15s ease; }
+.queue-section[data-collapsed="false"] .queue-section-chevron { transform: rotate(90deg); }
+.queue-section-body { overflow: hidden; height: auto; transition: height .18s ease; }
+.queue-section[data-collapsed="true"] .queue-section-body { height: 0px; }
+.queue-section-body-inner { padding: 0 14px 10px; }
+.queue-section-body-inner > .queue-empty { margin-top: 2px; }
 .queue-item {
   padding: 5px 8px; background: var(--surface-2);
   border: 1px solid var(--border); border-radius: 4px;

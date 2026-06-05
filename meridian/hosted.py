@@ -214,27 +214,41 @@ def _github_callback_url() -> str:
     return f"{base}/auth/github/callback"
 
 
-async def get_github_auth_url() -> str:
+def _github_repo_callback_url() -> str:
+    """Return the absolute callback URL for the GitHub repo-connect flow."""
+    base = _cfg("MERIDIAN_BASE_URL", "http://localhost:7878").rstrip("/")
+    return f"{base}/auth/github/repo-callback"
+
+
+async def get_github_auth_url(
+    scope: str = "user:email",
+    *,
+    state: str = "",
+    redirect_uri: str | None = None,
+) -> str:
     """Return the GitHub OAuth authorization URL."""
+    from urllib.parse import urlencode
+
     client_id = _require_cfg("GITHUB_CLIENT_ID")
-    callback = _github_callback_url()
-    return (
-        f"https://github.com/login/oauth/authorize"
-        f"?client_id={client_id}"
-        f"&redirect_uri={callback}"
-        f"&scope=user:email"
-    )
+    callback = (redirect_uri or _github_callback_url()).rstrip("/")
+    params: list[tuple[str, str]] = [
+        ("scope", scope),
+        ("client_id", client_id),
+        ("redirect_uri", callback),
+    ]
+    if state:
+        params.append(("state", state))
+    return f"https://github.com/login/oauth/authorize?{urlencode(params)}"
 
 
-async def exchange_github_code_for_userinfo(code: str) -> dict[str, Any]:
-    """Exchange a GitHub OAuth code for user info (email + login)."""
+async def _exchange_github_code_for_token(code: str, redirect_uri: str) -> str:
+    """Exchange a GitHub OAuth code for an access token."""
     import httpx
 
     client_id = _require_cfg("GITHUB_CLIENT_ID")
     client_secret = _require_cfg("GITHUB_CLIENT_SECRET")
 
     async with httpx.AsyncClient() as http:
-        # Exchange code for access token
         token_resp = await http.post(
             "https://github.com/login/oauth/access_token",
             headers={"Accept": "application/json"},
@@ -242,48 +256,119 @@ async def exchange_github_code_for_userinfo(code: str) -> dict[str, Any]:
                 "client_id": client_id,
                 "client_secret": client_secret,
                 "code": code,
-                "redirect_uri": _github_callback_url(),
+                "redirect_uri": redirect_uri,
             },
         )
-        token_resp.raise_for_status()
+        if token_resp.status_code >= 400:
+            raise RuntimeError(
+                f"GitHub token exchange failed ({token_resp.status_code}): {token_resp.text}"
+            )
         token_data = token_resp.json()
         access_token = token_data.get("access_token", "")
         if not access_token:
             raise RuntimeError(f"GitHub token exchange failed: {token_data}")
 
-        auth_header = {"Authorization": f"Bearer {access_token}"}
+    return access_token
 
-        # Get user profile (login, id, name)
-        user_resp = await http.get(
-            "https://api.github.com/user",
-            headers={**auth_header, "Accept": "application/vnd.github+json"},
-        )
-        user_resp.raise_for_status()
+
+async def _github_user_snapshot(access_token: str) -> dict[str, Any]:
+    """Return the current GitHub profile plus accessible repos."""
+    import httpx
+
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "Meridian",
+    }
+
+    async with httpx.AsyncClient(timeout=15.0) as http:
+        user_resp = await http.get("https://api.github.com/user", headers=headers)
+        if user_resp.status_code >= 400:
+            raise RuntimeError(
+                f"GitHub user lookup failed ({user_resp.status_code}): {user_resp.text}"
+            )
         user_data = user_resp.json()
 
-        # Get primary verified email (user.email may be null if private)
         email = user_data.get("email")
         if not email:
-            emails_resp = await http.get(
-                "https://api.github.com/user/emails",
-                headers={**auth_header, "Accept": "application/vnd.github+json"},
-            )
-            emails_resp.raise_for_status()
-            emails = emails_resp.json()
-            # Pick the primary verified email
-            for e in emails:
-                if e.get("primary") and e.get("verified"):
-                    email = e["email"]
-                    break
-            if not email and emails:
-                email = emails[0].get("email", "")
+            emails_resp = await http.get("https://api.github.com/user/emails", headers=headers)
+            if emails_resp.status_code < 400:
+                emails = emails_resp.json() or []
+                if not isinstance(emails, list):
+                    emails = []
+                for e in emails:
+                    if e.get("primary") and e.get("verified"):
+                        email = e.get("email", "")
+                        break
+                if not email and emails:
+                    email = emails[0].get("email", "")
 
-        return {
-            "email": email,
-            "sub": f"github:{user_data.get('id', '')}",
-            "login": user_data.get("login", ""),
-            "name": user_data.get("name") or user_data.get("login", ""),
-        }
+        repos: list[dict[str, Any]] = []
+        page = 1
+        while True:
+            repos_resp = await http.get(
+                "https://api.github.com/user/repos",
+                headers=headers,
+                params={"sort": "updated", "per_page": "100", "page": str(page)},
+            )
+            if repos_resp.status_code >= 400:
+                raise RuntimeError(
+                    f"GitHub repo listing failed ({repos_resp.status_code}): {repos_resp.text}"
+                )
+            batch = repos_resp.json() or []
+            if not isinstance(batch, list):
+                break
+            for repo in batch:
+                owner = (repo.get("owner") or {}).get("login", "")
+                name = repo.get("name", "")
+                full_name = repo.get("full_name") or (f"{owner}/{name}" if owner and name else name)
+                repos.append({
+                    "full_name": full_name,
+                    "name": name,
+                    "owner": owner,
+                    "html_url": repo.get("html_url", ""),
+                    "default_branch": repo.get("default_branch") or "main",
+                    "private": bool(repo.get("private")),
+                    "updated_at": repo.get("updated_at", ""),
+                })
+            if len(batch) < 100:
+                break
+            page += 1
+
+    return {
+        "email": email,
+        "sub": f"github:{user_data.get('id', '')}",
+        "login": user_data.get("login", ""),
+        "name": user_data.get("name") or user_data.get("login", ""),
+        "avatar_url": user_data.get("avatar_url", ""),
+        "repos": repos,
+    }
+
+
+async def exchange_github_code_for_userinfo(code: str) -> dict[str, Any]:
+    """Exchange a GitHub OAuth code for user info (email + login)."""
+    access_token = await _exchange_github_code_for_token(code, _github_callback_url())
+    snapshot = await _github_user_snapshot(access_token)
+    return {
+        "email": snapshot.get("email", ""),
+        "sub": snapshot.get("sub", ""),
+        "login": snapshot.get("login", ""),
+        "name": snapshot.get("name", ""),
+        "avatar_url": snapshot.get("avatar_url", ""),
+    }
+
+
+async def exchange_github_repo_code_for_connection(code: str) -> dict[str, Any]:
+    """Exchange a GitHub OAuth code for repo-connect data."""
+    access_token = await _exchange_github_code_for_token(code, _github_repo_callback_url())
+    snapshot = await _github_user_snapshot(access_token)
+    return {
+        "access_token": access_token,
+        "login": snapshot.get("login", ""),
+        "name": snapshot.get("name", ""),
+        "avatar_url": snapshot.get("avatar_url", ""),
+        "repos": snapshot.get("repos", []),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -592,6 +677,73 @@ async def auth_github_callback(request: Request) -> RedirectResponse:
     )
     response.delete_cookie("meridian_demo")
     return response
+
+
+async def auth_github_repo_connect(request: Request) -> RedirectResponse:
+    """Redirect the browser to GitHub's repo-connect OAuth consent page."""
+    project_id = request.query_params.get("project_id", "").strip()
+    if not project_id:
+        raise HTTPException(status_code=400, detail="project_id is required")
+    try:
+        await get_current_tenant(request)
+    except HTTPException:
+        return RedirectResponse("/auth/login", status_code=302)
+    try:
+        url = await get_github_auth_url(
+            scope="repo",
+            state=project_id,
+            redirect_uri=_github_repo_callback_url(),
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return RedirectResponse(url, status_code=302)
+
+
+async def auth_github_repo_callback(request: Request) -> RedirectResponse:
+    """Handle GitHub repo-connect callback and store the tenant token."""
+    from . import db as db_module
+
+    code = request.query_params.get("code", "").strip()
+    project_id = request.query_params.get("state", "").strip()
+    if not code:
+        raise HTTPException(status_code=400, detail="missing oauth code")
+    if not project_id:
+        raise HTTPException(status_code=400, detail="missing project_id state")
+
+    try:
+        tenant = await get_current_tenant(request)
+    except HTTPException as exc:
+        raise HTTPException(status_code=401, detail="not authenticated") from exc
+
+    try:
+        connection = await exchange_github_repo_code_for_connection(code)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"GitHub OAuth exchange failed: {exc}") from exc
+
+    access_token = connection.get("access_token", "")
+    repos = connection.get("repos") or []
+    selected_repo = (tenant.get("github_repo") or "").strip()
+    selected_branch = (tenant.get("github_branch") or "main").strip()
+    repo_lookup = {repo.get("full_name", ""): repo for repo in repos if repo.get("full_name")}
+    if selected_repo and selected_repo in repo_lookup:
+        selected_branch = (selected_branch or repo_lookup[selected_repo].get("default_branch") or "main").strip()
+    elif repos:
+        first_repo = repos[0]
+        selected_repo = (first_repo.get("full_name") or "").strip()
+        selected_branch = (first_repo.get("default_branch") or "main").strip()
+
+    await db_module.update_tenant(
+        request.app.state.db,
+        tenant["id"],
+        github_pat=db_module.encrypt_field(access_token),
+        github_repo=selected_repo or None,
+        github_branch=selected_branch or "main",
+    )
+
+    return RedirectResponse(
+        f"/dashboard?project_id={project_id}&tab=settings",
+        status_code=302,
+    )
 
 
 async def auth_microsoft_login(request: Request) -> RedirectResponse:
