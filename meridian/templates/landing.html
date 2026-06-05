@@ -1,9 +1,9 @@
-<!doctype html>
+﻿<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Meridian — Shared memory for your AI coding sessions</title>
+<title>Meridian â€” Shared memory for your AI coding sessions</title>
 <meta name="description" content="Open-source coordination layer for AI coding sessions. Persistent memory, task tracking, and HITL queue. Local-first or hosted.">
 <link rel="icon" href="/static/logo.svg" type="image/svg+xml">
 <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -308,10 +308,10 @@
     font-family: var(--mono);
   }
   .plan-features li::before {
-    content: "→"; color: var(--accent); flex-shrink: 0; font-weight: 700;
+    content: "â†’"; color: var(--accent); flex-shrink: 0; font-weight: 700;
   }
   .plan-features li.dim { color: var(--muted); }
-  .plan-features li.dim::before { content: "—"; color: var(--border-light); }
+  .plan-features li.dim::before { content: "â€”"; color: var(--border-light); }
   .plan-note {
     font-size: .78rem; color: var(--muted);
     padding: .6rem .8rem; background: var(--surface-2);
@@ -414,36 +414,36 @@
 </nav>
 
 <section class="hero">
-  <div class="hero-badge">⚡ Open Alpha · v1.0.0-alpha</div>
+  <div class="hero-badge">âš¡ Open Alpha Â· v1.0.0-alpha</div>
   <h1>Your AI sessions finally <span class="accent">remember each other</span></h1>
   <p class="lede">Persistent memory, task coordination, and a human-in-the-loop queue for every Claude / Cursor / Windsurf session. Open source. Local-first. MCP-native.</p>
   <div class="cta-row">
-    <a href="/auth/login" class="btn btn-primary">start free — no card →</a>
+    <a href="/auth/login" class="btn btn-primary">start free â€” no card â†’</a>
     <a href="/demo" class="btn btn-secondary">live demo</a>
-    <a href="https://github.com/meridianmcp/Meridian" target="_blank" rel="noopener" class="btn btn-secondary">★ Star on GitHub</a>
+    <a href="https://github.com/meridianmcp/Meridian" target="_blank" rel="noopener" class="btn btn-secondary">â˜… Star on GitHub</a>
   </div>
-  <p style="font-size:12px;color:var(--muted,#8b9cba);margin-top:8px;margin-bottom:0">Free tier: 1 project · 30 days · no credit card required · self-host for free, forever</p>
+  <p style="font-size:12px;color:var(--muted,#8b9cba);margin-top:8px;margin-bottom:0">Free tier: 1 project Â· 30 days Â· no credit card required Â· self-host for free, forever</p>
 
   <div class="terminal">
     <div class="terminal-head">
       <span class="terminal-dot r"></span>
       <span class="terminal-dot y"></span>
       <span class="terminal-dot g"></span>
-      <span class="terminal-title">claude — meridian-mcp</span>
+      <span class="terminal-title">claude â€” meridian-mcp</span>
     </div>
     <div class="terminal-body">
 <span class="term-comment"># Cold session boots, joins the shared project state</span>
 <span class="term-prompt">&gt;</span> <span class="term-fn">start_session</span>(project_id=<span class="term-str">"meridian-build"</span>, session_name=<span class="term-str">"feature-x"</span>)
-<span class="term-out">  ✓ <span class="ok">session registered</span> · sprint loaded · 12 active tasks · 3 pinned decisions</span>
+<span class="term-out">  âœ“ <span class="ok">session registered</span> Â· sprint loaded Â· 12 active tasks Â· 3 pinned decisions</span>
 
 <span class="term-comment"># Sees what the other sessions have been doing</span>
 <span class="term-prompt">&gt;</span> <span class="term-fn">get_tasks</span>(project_id=<span class="term-str">"meridian-build"</span>, limit=<span class="term-str">5</span>)
 <span class="term-out">  [DONE]    backend / Wire decisions_pinned table</span>
 <span class="term-out">  [PENDING] frontend / Add Notes vtab (claimed by session-2)</span>
 
-<span class="term-comment"># Claims its own work atomically — no collisions</span>
+<span class="term-comment"># Claims its own work atomically â€” no collisions</span>
 <span class="term-prompt">&gt;</span> <span class="term-fn">claim_task</span>(task_id=<span class="term-str">"a1f3..."</span>)
-<span class="term-out">  ✓ <span class="ok">claimed</span> — other sessions skip this one</span>
+<span class="term-out">  âœ“ <span class="ok">claimed</span> â€” other sessions skip this one</span>
     </div>
   </div>
 </section>
@@ -453,17 +453,17 @@
   <p class="section-lede">Your AI tools don't talk to each other. Meridian is the layer that fixes it.</p>
   <div class="problems-grid">
     <div class="problem-card">
-      <div class="problem-num">01 — ISOLATION</div>
+      <div class="problem-num">01 â€” ISOLATION</div>
       <h3>Sessions don't know about each other</h3>
       <p>Every Claude tab boots blind. Run two in parallel and they duplicate work, contradict each other, and step on the same files.</p>
     </div>
     <div class="problem-card">
-      <div class="problem-num">02 — AMNESIA</div>
+      <div class="problem-num">02 â€” AMNESIA</div>
       <h3>Context fills up and dies</h3>
       <p>Hit the token limit mid-task and the whole working state evaporates. Re-explaining what you've already shipped is a tax on every session.</p>
     </div>
     <div class="problem-card">
-      <div class="problem-num">03 — NO HANDOFFS</div>
+      <div class="problem-num">03 â€” NO HANDOFFS</div>
       <h3>Resume is a copy-paste mess</h3>
       <p>Starting a fresh session means digging through git history, scrolling chat logs, and praying you remembered the latest decisions.</p>
     </div>
@@ -475,53 +475,53 @@
   <p class="section-lede">All seven features ship today. Open source, MSL-1.0.</p>
   <div class="features-grid">
     <div class="feature-item">
-      <div class="feature-icon">🎯</div>
+      <div class="feature-icon">ðŸŽ¯</div>
       <div>
         <h4>Shared goal state</h4>
-        <p>North star, version goal, session focus — every tab reads the same. One save, everyone aligns.</p>
+        <p>North star, version goal, session focus â€” every tab reads the same. One save, everyone aligns.</p>
       </div>
     </div>
     <div class="feature-item">
-      <div class="feature-icon">📋</div>
+      <div class="feature-icon">ðŸ“‹</div>
       <div>
         <h4>Live task log + claims</h4>
         <p><code>claim_task</code> locks work atomically. No two sessions pick up the same task twice.</p>
       </div>
     </div>
     <div class="feature-item">
-      <div class="feature-icon">🤝</div>
+      <div class="feature-icon">ðŸ¤</div>
       <div>
         <h4>HITL queue</h4>
-        <p style="font-size:.8rem;color:var(--text-dim);margin-bottom:.25rem">When your AI gets stuck, it pauses and asks you — not us.</p>
-        <p>Sessions surface coordination questions to a single dashboard panel. Autonomous until it needs you — then back to work.</p>
+        <p style="font-size:.8rem;color:var(--text-dim);margin-bottom:.25rem">When your AI gets stuck, it pauses and asks you â€” not us.</p>
+        <p>Sessions surface coordination questions to a single dashboard panel. Autonomous until it needs you â€” then back to work.</p>
       </div>
     </div>
     <div class="feature-item">
-      <div class="feature-icon">🗂</div>
+      <div class="feature-icon">ðŸ—‚</div>
       <div>
         <h4>Pinned decisions</h4>
         <p>Editable constitution alongside the append-only log. The "current truth" cold sessions need before doing anything.</p>
       </div>
     </div>
     <div class="feature-item">
-      <div class="feature-icon">🔄</div>
+      <div class="feature-icon">ðŸ”„</div>
       <div>
         <h4>Tiered handoffs</h4>
         <p>L0/L1/L2 compression. <code>generate_handoff</code> writes a file a fresh session can paste and resume in seconds.</p>
       </div>
     </div>
     <div class="feature-item">
-      <div class="feature-icon">🧭</div>
+      <div class="feature-icon">ðŸ§­</div>
       <div>
         <h4>Works with every client</h4>
-        <p>Claude Code, Codex CLI, Claude Desktop, Cursor, Windsurf, LangGraph webhook — any MCP client, any OS.</p>
+        <p>Claude Code, Codex CLI, Claude Desktop, Cursor, Windsurf, LangGraph webhook â€” any MCP client, any OS.</p>
       </div>
     </div>
     <div class="feature-item">
-      <div class="feature-icon">🐙</div>
+      <div class="feature-icon">ðŸ™</div>
       <div>
         <h4>GitHub hub (hosted)</h4>
-        <p>Connect your repo once in Settings. Planning sessions get <code>read_file</code>, <code>search_code</code>, <code>git_log</code> and more — no Copilot, no extra connector, no local install.</p>
+        <p>Connect your repo once in Settings. Planning sessions get <code>read_file</code>, <code>search_code</code>, <code>git_log</code> and more â€” no Copilot, no extra connector, no local install.</p>
       </div>
     </div>
   </div>
@@ -555,19 +555,35 @@ irm https://usemeridian.us/hooks.ps1 | iex</pre>
 </section>
 
 <section id="planning-chat">
-  <h2>Use Meridian from claude.ai</h2>
-  <p class="section-lede">Get all 20+ Meridian tools directly in your claude.ai planning chat — no copy-pasting session output.</p>
+  <h2>Use Meridian from Claude or ChatGPT</h2>
+  <p class="section-lede">Hosted Meridian plugs straight into browser AI clients over MCP. No extension, no localhost tunnel, no copy-paste loop.</p>
   <div class="self-host" style="max-width:860px">
-    <p class="lede">Install the <a href="https://github.com/dnakov/claude-mcp" target="_blank">claude-mcp</a> browser extension (included as a submodule):</p>
-    <pre><span class="h"># Clone with submodules</span>
-<span class="c">$</span> git clone --recurse-submodules https://github.com/meridianmcp/Meridian
-
-<span class="h"># Chrome: Extensions → Developer mode → Load unpacked → extensions/claude-mcp</span>
-<span class="h"># Set URL to http://localhost:7878/mcp/sse in the extension popup</span>
-<span class="h"># All 20+ Meridian tools now available in claude.ai planning chat</span></pre>
+    <p class="lede">Use the same hosted MCP URL in both clients:</p>
+    <pre><span class="h"># Claude: Customize -> Connectors -> Add custom connector</span>
+<span class="h"># ChatGPT: Settings -> Apps -> New App</span>
+<span class="h"># MCP URL -> https://usemeridian.us/mcp</span>
+<span class="h"># OAuth finishes in the browser -> tools appear in chat</span></pre>
+    <div style="display:grid;gap:12px;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));margin:14px 0">
+      <div style="border:1px solid var(--border);border-radius:8px;padding:14px;background:var(--surface-1)">
+        <div style="font-weight:600;margin-bottom:6px">Claude</div>
+        <div style="color:var(--muted);font-size:13px">Add Meridian as a custom connector, approve OAuth, then use the full sprint-planning toolset directly in chat.</div>
+      </div>
+      <div style="border:1px solid var(--border);border-radius:8px;padding:14px;background:var(--surface-1)">
+        <div style="font-weight:600;margin-bottom:6px">ChatGPT</div>
+        <div style="color:var(--muted);font-size:13px">Add Meridian from Settings -> Apps, connect the hosted MCP endpoint, and use the same shared-session memory from your planning thread.</div>
+      </div>
+    </div>
+    <details style="margin-bottom:12px">
+      <summary style="cursor:pointer;color:var(--muted)">Self-hosted only: local browser bridge</summary>
+      <div style="margin-top:10px">
+        <pre><span class="h"># Local Claude bridge only</span>
+<span class="h"># Chrome extension / SSE bridge URL -> http://localhost:7878/mcp/sse</span>
+<span class="h"># For remote browser MCP, expose a public HTTPS URL first</span></pre>
+      </div>
+    </details>
     <div class="self-host-row">
-      <a href="/install-mcp" class="btn btn-primary">Step-by-step setup guide →</a>
-      <a href="https://github.com/dnakov/claude-mcp" class="btn btn-secondary" target="_blank">↗ dnakov/claude-mcp</a>
+      <a href="https://docs.usemeridian.us/browser-connector/" class="btn btn-primary">Browser connector guide -></a>
+      <a href="https://usemeridian.us/mcp" class="btn btn-secondary" target="_blank" rel="noopener">Hosted MCP URL</a>
       <a href="https://docs.usemeridian.us" class="btn btn-secondary">Docs</a>
     </div>
   </div>
@@ -587,55 +603,55 @@ irm https://usemeridian.us/hooks.ps1 | iex</pre>
 <span class="c">&gt;</span> git clone https://github.com/meridianmcp/Meridian
 <span class="c">&gt;</span> cd Meridian; pixi run start
 
-<span class="h"># dashboard → http://localhost:7878/dashboard</span>
-<span class="h"># MCP endpoint → claude-code, cursor, windsurf all auto-discover via stdio</span></pre>
-    <p class="self-host-alt">Or download a single binary — no Python, no git clone:</p>
+<span class="h"># dashboard â†’ http://localhost:7878/dashboard</span>
+<span class="h"># MCP endpoint â†’ claude-code, cursor, windsurf all auto-discover via stdio</span></pre>
+    <p class="self-host-alt">Or download a single binary â€” no Python, no git clone:</p>
     <div class="self-host-row">
       <a href="https://github.com/meridianmcp/Meridian/releases/latest/download/meridian.exe" class="btn btn-secondary">
-        ↓ Windows (.exe)
+        â†“ Windows (.exe)
       </a>
       <a href="https://github.com/meridianmcp/Meridian/releases/latest/download/meridian-mac-arm64" class="btn btn-secondary">
-        ↓ macOS (Apple Silicon)
+        â†“ macOS (Apple Silicon)
       </a>
       <a href="https://github.com/meridianmcp/Meridian/releases/latest/download/meridian-mac-x86" class="btn btn-secondary">
-        ↓ macOS (Intel)
+        â†“ macOS (Intel)
       </a>
       <a href="https://github.com/meridianmcp/Meridian/releases/latest/download/meridian-linux-x86_64" class="btn btn-secondary">
-        ↓ Linux (x86_64)
+        â†“ Linux (x86_64)
       </a>
       <a href="https://usemeridian.us/download/meridian-hosted.dxt" class="btn btn-secondary">
-        ↓ Claude Desktop (.dxt)
+        â†“ Claude Desktop (.dxt)
       </a>
     </div>
     <div class="self-host-row" style="margin-top:12px">
       <a href="https://github.com/meridianmcp/Meridian" target="_blank" rel="noopener" class="btn btn-secondary">
-        ★ Star on GitHub
+        â˜… Star on GitHub
       </a>
       <a href="https://docs.usemeridian.us" target="_blank" rel="noopener" class="btn btn-secondary">
-        Read the docs →
+        Read the docs â†’
       </a>
     </div>
     <p class="self-host-alt" style="margin-top:16px">
-      No install? Use Meridian directly from <a href="/install-mcp">claude.ai in your browser →</a>
+      No install? Use Meridian directly from <a href="https://docs.usemeridian.us/browser-connector/">Claude or ChatGPT in your browser -></a>
     </p>
   </div>
 </section>
 
 <section id="pricing">
   <h2>Pricing</h2>
-  <p class="section-lede">Start free — self-host forever, or try the hosted tier for 30 days with no credit card.</p>
+  <p class="section-lede">Start free â€” self-host forever, or try the hosted tier for 30 days with no credit card.</p>
   <div class="pricing-grid">
 
     <!-- Free / self-hosted -->
     <div class="plan">
       <div class="plan-name">Free</div>
       <div class="plan-price">$0<small> / mo</small></div>
-      <div class="plan-trial"><span class="ok">available now</span> · no card required</div>
+      <div class="plan-trial"><span class="ok">available now</span> Â· no card required</div>
       <hr class="plan-divider">
       <ul class="plan-features">
         <li>Hosted dashboard at usemeridian.us</li>
         <li>Remote MCP endpoint (HTTPS + Bearer)</li>
-        <li>1 project · 1 concurrent session</li>
+        <li>1 project Â· 1 concurrent session</li>
         <li>Google + GitHub + email sign-in</li>
         <li>0.5 CU shared compute</li>
         <li>10 CU-hours total included</li>
@@ -643,14 +659,14 @@ irm https://usemeridian.us/hooks.ps1 | iex</pre>
         <li>Self-hosting still stays free forever</li>
       </ul>
       <div class="plan-note">Hosted free tier expires after inactivity. Self-hosted Meridian remains free forever.</div>
-      <a href="/auth/login" class="plan-cta secondary">Start free →</a>
+      <a href="/auth/login" class="plan-cta secondary">Start free â†’</a>
     </div>
 
-    <!-- Standard — primary -->
+    <!-- Standard â€” primary -->
     <div class="plan featured">
       <div class="plan-name">Standard</div>
       <div class="plan-price">$20<small> / mo</small></div>
-      <div class="plan-trial"><span class="ok">30-day free trial</span> · no card required</div>
+      <div class="plan-trial"><span class="ok">30-day free trial</span> Â· no card required</div>
       <hr class="plan-divider">
       <ul class="plan-features">
         <li>Managed Postgres workspace DB</li>
@@ -658,35 +674,35 @@ irm https://usemeridian.us/hooks.ps1 | iex</pre>
         <li>50 CU-hours / month included</li>
         <li>Hosted dashboard at usemeridian.us</li>
         <li>Remote MCP endpoint (HTTPS + Bearer)</li>
-        <li>Unlimited projects · up to 20 members</li>
+        <li>Unlimited projects Â· up to 20 members</li>
         <li>Google + GitHub + email sign-in</li>
         <li>HITL queue + pinned decisions</li>
         <li>Webhook intake for LangGraph / Autogen</li>
         <li>Connect your own Postgres DB</li>
         <li>Email support</li>
       </ul>
-      <div class="plan-note">Overage: <strong>$0.16/CU-hr</strong> · <strong>$0.50/GB-mo</strong> · auto-billed via Stripe</div>
-      <a href="/auth/login" class="plan-cta primary">Start free trial →</a>
+      <div class="plan-note">Overage: <strong>$0.16/CU-hr</strong> Â· <strong>$0.50/GB-mo</strong> Â· auto-billed via Stripe</div>
+      <a href="/auth/login" class="plan-cta primary">Start free trial â†’</a>
     </div>
 
     <!-- Pro -->
     <div class="plan">
       <div class="plan-name">Pro</div>
       <div class="plan-price">$49<small> / mo</small></div>
-      <div class="plan-trial"><span class="ok">30-day free trial</span> · no card required</div>
+      <div class="plan-trial"><span class="ok">30-day free trial</span> Â· no card required</div>
       <hr class="plan-divider">
       <ul class="plan-features">
         <li>Everything in Standard</li>
-        <li>Managed Postgres — 10 GB included</li>
+        <li>Managed Postgres â€” 10 GB included</li>
         <li>4 CU compute included</li>
         <li>200 CU-hours / month included</li>
-        <li>Higher compute caps · faster queries</li>
+        <li>Higher compute caps Â· faster queries</li>
         <li>Priority support</li>
         <li>Team swimlane + activity timeline</li>
         <li>Connect your own Postgres DB</li>
       </ul>
-      <div class="plan-note">Overage: <strong>$0.16/CU-hr</strong> · <strong>$0.50/GB-mo</strong> · auto-billed via Stripe</div>
-      <a href="mailto:hello@usemeridian.us?subject=Pro%20waitlist" class="plan-cta secondary">Join waitlist →</a>
+      <div class="plan-note">Overage: <strong>$0.16/CU-hr</strong> Â· <strong>$0.50/GB-mo</strong> Â· auto-billed via Stripe</div>
+      <a href="mailto:hello@usemeridian.us?subject=Pro%20waitlist" class="plan-cta secondary">Join waitlist â†’</a>
       <div style="font-size:12px;color:var(--muted,#8b9cba);margin-top:6px;text-align:center">Coming soon</div>
     </div>
 
@@ -703,7 +719,7 @@ irm https://usemeridian.us/hooks.ps1 | iex</pre>
         <span style="font-size:18px;color:var(--muted,#8b9cba);flex-shrink:0;margin-left:12px">+</span>
       </summary>
       <div style="padding:0 18px 14px;color:var(--muted,#8b9cba);font-size:14px;line-height:1.7">
-        <strong>Self-hosted:</strong> your data never leaves your machine — we have zero access. <strong>Hosted tier:</strong> your project data lives in an isolated Neon database. Meridian staff do not access your data. The HITL queue means <em>you</em> are the human reviewer, not us.
+        <strong>Self-hosted:</strong> your data never leaves your machine â€” we have zero access. <strong>Hosted tier:</strong> your project data lives in an isolated Neon database. Meridian staff do not access your data. The HITL queue means <em>you</em> are the human reviewer, not us.
       </div>
     </details>
 
@@ -713,7 +729,7 @@ irm https://usemeridian.us/hooks.ps1 | iex</pre>
         <span style="font-size:18px;color:var(--muted,#8b9cba);flex-shrink:0;margin-left:12px">+</span>
       </summary>
       <div style="padding:0 18px 14px;color:var(--muted,#8b9cba);font-size:14px;line-height:1.7">
-        On the hosted tier, each workspace gets its own <strong>isolated Neon Postgres database</strong> — your data is never co-mingled with other tenants. Sensitive credentials (your Neon connection string, GitHub access tokens) are <strong>encrypted at rest</strong> with <a href="https://cryptography.io/en/latest/fernet/" target="_blank" rel="noopener" style="color:var(--accent,#5b8def)">Fernet</a> symmetric encryption (AES-128-CBC with HMAC-SHA256 authentication). API tokens are stored only as SHA-256 hashes — we can't recover a raw token. All traffic is encrypted in transit over HTTPS/TLS.
+        On the hosted tier, each workspace gets its own <strong>isolated Neon Postgres database</strong> â€” your data is never co-mingled with other tenants. Sensitive credentials (your Neon connection string, GitHub access tokens) are <strong>encrypted at rest</strong> with <a href="https://cryptography.io/en/latest/fernet/" target="_blank" rel="noopener" style="color:var(--accent,#5b8def)">Fernet</a> symmetric encryption (AES-128-CBC with HMAC-SHA256 authentication). API tokens are stored only as SHA-256 hashes â€” we can't recover a raw token. All traffic is encrypted in transit over HTTPS/TLS.
       </div>
     </details>
 
@@ -723,7 +739,7 @@ irm https://usemeridian.us/hooks.ps1 | iex</pre>
         <span style="font-size:18px;color:var(--muted,#8b9cba);flex-shrink:0;margin-left:12px">+</span>
       </summary>
       <div style="padding:0 18px 14px;color:var(--muted,#8b9cba);font-size:14px;line-height:1.7">
-        <code>CLAUDE.md</code> is static context — good for standing instructions, bad for tracking state. Meridian is live: sessions read and write to a shared DB in real time, coordinate sprint items atomically, queue HITL requests, and generate handoffs across context resets.
+        <code>CLAUDE.md</code> is static context â€” good for standing instructions, bad for tracking state. Meridian is live: sessions read and write to a shared DB in real time, coordinate sprint items atomically, queue HITL requests, and generate handoffs across context resets.
       </div>
     </details>
 
@@ -733,7 +749,7 @@ irm https://usemeridian.us/hooks.ps1 | iex</pre>
         <span style="font-size:18px;color:var(--muted,#8b9cba);flex-shrink:0;margin-left:12px">+</span>
       </summary>
       <div style="padding:0 18px 14px;color:var(--muted,#8b9cba);font-size:14px;line-height:1.7">
-        Yes. Meridian is a standard MCP server. Any MCP-compatible client works — Cursor, Windsurf, Claude Desktop, Claude Code, LangGraph agents. The coordination layer is model-agnostic.
+        Yes. Meridian is a standard MCP server. Any MCP-compatible client works â€” Cursor, Windsurf, Claude Desktop, Claude Code, LangGraph agents. The coordination layer is model-agnostic.
       </div>
     </details>
 
@@ -743,7 +759,7 @@ irm https://usemeridian.us/hooks.ps1 | iex</pre>
         <span style="font-size:18px;color:var(--muted,#8b9cba);flex-shrink:0;margin-left:12px">+</span>
       </summary>
       <div style="padding:0 18px 14px;color:var(--muted,#8b9cba);font-size:14px;line-height:1.7">
-        Self-hosted is free forever — no seat limits, no time limit, full features. The hosted tier (usemeridian.us) has a 30-day free period with no card required. After that: Standard $20/mo or Pro $49/mo.
+        Self-hosted is free forever â€” no seat limits, no time limit, full features. The hosted tier (usemeridian.us) has a 30-day free period with no card required. After that: Standard $20/mo or Pro $49/mo.
       </div>
     </details>
 
@@ -777,14 +793,14 @@ irm https://usemeridian.us/hooks.ps1 | iex</pre>
     <a href="/privacy">Privacy</a>
     <a href="https://docs.usemeridian.us" target="_blank" rel="noopener">Docs</a>
     <a href="https://github.com/meridianmcp/Meridian" target="_blank" rel="noopener">GitHub</a>
-    <a href="https://github.com/meridianmcp/Meridian/blob/main/LICENSE">License · MSL-1.0</a>
+    <a href="https://github.com/meridianmcp/Meridian/blob/main/LICENSE">License Â· MSL-1.0</a>
     <a href="https://github.com/meridianmcp/Meridian/blob/main/CHANGELOG.md">Changelog</a>
   </div>
-  <div>© 2026 Meridian · Open source · MSL-1.0</div>
+  <div>Â© 2026 Meridian Â· Open source Â· MSL-1.0</div>
   <div class="footer-powered">
     Built on
     <svg width="14" height="14" viewBox="0 0 32 32" fill="none"><circle cx="16" cy="16" r="16" fill="#00E599"/><path d="M8 20V12l8 8V12l8 8" stroke="#000" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
-    Neon Postgres · Deployed on Fly.io
+    Neon Postgres Â· Deployed on Fly.io
   </div>
 </footer>
 
@@ -794,7 +810,7 @@ async function submitWaitlist(e, form) {
   const email = form.querySelector('input[type="email"]').value.trim();
   const plan = form.dataset.plan || 'standard';
   const msg = form.nextElementSibling;
-  msg.textContent = 'Adding you…';
+  msg.textContent = 'Adding youâ€¦';
   msg.className = 'waitlist-msg';
   try {
     const r = await fetch('/waitlist', {
@@ -810,12 +826,13 @@ async function submitWaitlist(e, form) {
       msg.textContent = "You're already on the list!";
       msg.className = 'waitlist-msg ok';
     } else {
-      msg.textContent = 'Something went wrong — try again.';
+      msg.textContent = 'Something went wrong â€” try again.';
     }
   } catch {
-    msg.textContent = 'Network error — try again.';
+    msg.textContent = 'Network error â€” try again.';
   }
 }
 </script>
 </body>
 </html>
+
