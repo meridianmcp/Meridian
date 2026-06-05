@@ -548,3 +548,51 @@ def test_pyproject_toml_has_hosted_deps():
     content = (Path(__file__).parent.parent / "pyproject.toml").read_text()
     for dep in ("authlib", "itsdangerous", "resend", "bcrypt", "slowapi"):
         assert dep in content, f"pyproject.toml missing {dep}"
+
+
+# ---------------------------------------------------------------------------
+# Free-tier project limit (the 2nd-project-403 guarantee from QA item 95ed26d2)
+# ---------------------------------------------------------------------------
+
+def test_free_tier_second_project_returns_403(monkeypatch, tmp_path):
+    """A free-plan tenant may create one project; the second returns 403.
+
+    Exercises the real POST /projects route end-to-end for an authenticated
+    free tenant. The tenant's project DB is the in-memory auth DB, injected
+    via the production _tenant_db_cache seam so no Neon project is needed.
+    """
+    from meridian import db as db_module
+    from meridian import _deps
+    from meridian import hosted as hosted_module
+
+    client = _make_hosted_client(monkeypatch, tmp_path)
+
+    with client:
+        db = client.app.state.db
+
+        async def _setup():
+            tenant = await db_module.upsert_tenant(db, "qa-free@meridian-test.invalid")
+            session = await db_module.create_user_session(
+                db, tenant["id"], "2099-01-01T00:00:00+00:00"
+            )
+            return tenant, session
+
+        tenant, session = _run(_setup())
+        assert tenant["plan"] == "free"
+
+        # Route the tenant's project DB to the in-memory auth DB.
+        _deps._tenant_db_cache[tenant["id"]] = db
+        try:
+            client.cookies.set(
+                hosted_module._SESSION_COOKIE,
+                hosted_module._make_session_cookie(session["id"]),
+            )
+
+            r1 = client.post("/projects", json={"name": "first-project"})
+            assert r1.status_code == 201, r1.text
+
+            r2 = client.post("/projects", json={"name": "second-project"})
+            assert r2.status_code == 403, r2.text
+            assert "Free tier" in r2.json()["detail"]
+        finally:
+            _deps._tenant_db_cache.pop(tenant["id"], None)

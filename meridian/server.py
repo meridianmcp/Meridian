@@ -915,9 +915,24 @@ async def _demo_read_only_middleware(request: Request, call_next):
 # v1.0.2 — Static files + Jinja2 templates
 # ---------------------------------------------------------------------------
 
+class _NoCacheStaticFiles(StaticFiles):
+    """StaticFiles that disables browser caching.
+
+    Assets are cache-busted via the ?v={asset_version} query param, but a
+    stale dashboard.js/css cached without revalidation defeats that. Forcing
+    no-cache makes the browser revalidate every load, so a deploy is picked
+    up immediately.
+    """
+
+    def file_response(self, *args, **kwargs):
+        resp = super().file_response(*args, **kwargs)
+        resp.headers["Cache-Control"] = "no-cache, must-revalidate"
+        return resp
+
+
 app.mount(
     "/static",
-    StaticFiles(directory=_resource_path("meridian/static")),
+    _NoCacheStaticFiles(directory=_resource_path("meridian/static")),
     name="static",
 )
 
