@@ -5428,24 +5428,12 @@ def test_landing_page_footer_uses_meridian_email(client):
     assert "ajc3xc@" not in r.text  # no personal emails in landing page
 
 
-# ---------------------------------------------------------------------------
-# GitHub OAuth tests
-# ---------------------------------------------------------------------------
-
 def test_auth_login_page_has_google_button(client):
     """GET /auth/login shows Google OAuth button."""
     r = client.get("/auth/login", follow_redirects=False)
     assert r.status_code == 200
     assert "Google" in r.text
     assert "/auth/google/login" in r.text
-
-
-def test_auth_login_page_has_github_button(client):
-    """GET /auth/login shows GitHub OAuth button."""
-    r = client.get("/auth/login", follow_redirects=False)
-    assert r.status_code == 200
-    assert "GitHub" in r.text
-    assert "/auth/github/login" in r.text
 
 
 def test_auth_login_page_returns_html(client):
@@ -5463,22 +5451,6 @@ def test_auth_google_login_redirects_when_configured(client, monkeypatch):
     r = client.get("/auth/google/login", follow_redirects=False)
     # Should redirect to Google (302) or return 503 if oauth client setup fails
     assert r.status_code in (302, 503)
-
-
-def test_auth_github_login_redirects_when_configured(client, monkeypatch):
-    """GET /auth/github/login redirects to GitHub when GITHUB_CLIENT_ID is set."""
-    import os
-    monkeypatch.setenv("GITHUB_CLIENT_ID", "Ov23liFakeId")
-    r = client.get("/auth/github/login", follow_redirects=False)
-    # Should redirect to GitHub (302) or 503 if key missing
-    assert r.status_code in (302, 503)
-
-
-def test_auth_github_callback_missing_code(client):
-    """GET /auth/github/callback without code param returns 400."""
-    r = client.get("/auth/github/callback", follow_redirects=False)
-    assert r.status_code == 400
-    assert "missing oauth code" in r.json().get("detail", "")
 
 
 def test_auth_callback_missing_code(client):

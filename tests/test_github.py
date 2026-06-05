@@ -33,6 +33,29 @@ def _github_client(tmp_path, monkeypatch):
     return mod, TestClient(mod.app)
 
 
+def test_auth_login_page_has_github_button(client):
+    """GET /auth/login shows GitHub OAuth button."""
+    r = client.get("/auth/login", follow_redirects=False)
+    assert r.status_code == 200
+    assert "GitHub" in r.text
+    assert "/auth/github/login" in r.text
+
+
+def test_auth_github_login_redirects_when_configured(client, monkeypatch):
+    """GET /auth/github/login redirects to GitHub when GITHUB_CLIENT_ID is set."""
+    monkeypatch.setenv("GITHUB_CLIENT_ID", "Ov23liFakeId")
+    r = client.get("/auth/github/login", follow_redirects=False)
+    # Should redirect to GitHub (302) or 503 if key missing
+    assert r.status_code in (302, 503)
+
+
+def test_auth_github_callback_missing_code(client):
+    """GET /auth/github/callback without code param returns 400."""
+    r = client.get("/auth/github/callback", follow_redirects=False)
+    assert r.status_code == 400
+    assert "missing oauth code" in r.json().get("detail", "")
+
+
 def test_github_connect_validates_pat(tmp_path, monkeypatch):
     """POST /projects/{id}/github/connect returns 422 when PAT is missing."""
     mod, client = _github_client(tmp_path, monkeypatch)
