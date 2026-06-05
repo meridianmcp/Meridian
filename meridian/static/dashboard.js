@@ -135,10 +135,10 @@ function hideDemoAdminControls() {
     '[id^="invite-email-"]',
     '[id^="invite-role-"]',
     '[id^="invite-btn-"]',
-    '[id^="github-pat-"]',
     '[id^="github-repo-"]',
     '[id^="github-branch-"]',
     '[id^="github-connect-btn-"]',
+    '[id^="github-save-btn-"]',
     '[id^="github-disconnect-btn-"]',
     '[id^="github-test-btn-"]',
     // Files tab: hide Edit subtab, show Preview only
@@ -244,7 +244,7 @@ const _DEMO_TOUR_STEPS = [
   },
   {
     target: () => document.querySelector('[data-vtab="timeline"], button[onclick*="timeline"]'),
-    title: 'Swimlane timeline',
+    title: 'Activity timeline',
     body: 'See all sessions running in parallel — when each ran, what changed, how long each task took.',
     position: 'bottom',
     action: () => {
@@ -2501,7 +2501,7 @@ function populateSessionDropdown(projectId, sessions) {
   if (prev && sorted.some(s => s.name === prev)) sel.value = prev;
 }
 
-// v1.1.1 — Activity Timeline. Load /timeline, lay out a swimlane
+// v1.1.1 — Activity Timeline. Load /timeline, render task history
 // per session, paint task pills positioned on a shared time axis.
 async function loadTimeline(projectId) {
   const wrap = document.getElementById(`timeline-wrap-${projectId}`);
@@ -2758,7 +2758,7 @@ function _renderTimelineLog(projectId, data) {
 
 const _HUMAN_COLORS = ['#6c8fff', '#a78bfa', '#22d3ee', '#4ade80', '#fbbf24', '#f87171', '#fb923c', '#e879f9'];
 function _colorForHuman(humanId) {
-  /** Stable hash → palette index so each human keeps the same swimlane color. */
+  /** Stable hash → palette index so each human keeps the same activity color. */
   let h = 0;
   for (let i = 0; i < (humanId || '').length; i++) h = ((h << 5) - h + humanId.charCodeAt(i)) | 0;
   return _HUMAN_COLORS[Math.abs(h) % _HUMAN_COLORS.length];
@@ -2846,6 +2846,15 @@ async function loadSettingsTab(projectId) {
     ? settingsResult.value
     : { project_id: projectId, max_pinned_decisions: DEFAULT_MAX_PINNED_DECISIONS };
   const ghData = (ghResult.status === 'fulfilled') ? ghResult.value : null;
+  const ghRepos = Array.isArray(ghData?.repos) ? ghData.repos : [];
+  const ghRepoMap = Object.fromEntries(ghRepos.map(repo => [repo.full_name, repo]));
+  const ghSelectedRepo = ghData?.repo || ghRepos[0]?.full_name || '';
+  const ghSelectedBranch = ghData?.branch || ghRepoMap[ghSelectedRepo]?.default_branch || 'main';
+  const ghUsername = ghData?.github_user || ghData?.login || '';
+  const ghAvatarUrl = ghData?.avatar_url || '';
+  const ghRepoOptions = (ghRepos.length ? ghRepos : (ghSelectedRepo ? [{ full_name: ghSelectedRepo }] : []))
+    .map(repo => `<option value="${escapeHtml(repo.full_name || '')}"></option>`)
+    .join('');
   const hooksBaseUrl = ((mcpData && mcpData.base_url) || window.location.origin || state.serverConfig?.server_url || 'http://localhost:7878').replace(/\/$/, '');
 
   function buildHookCurlHeaders(token) {
@@ -2906,6 +2915,57 @@ async function loadSettingsTab(projectId) {
     <a href="/install-mcp" target="_blank" style="white-space:nowrap;padding:4px 10px;background:var(--accent);color:#fff;border-radius:4px;font-size:10px;font-weight:600;text-decoration:none">Setup guide →</a>
   </div>`;
 
+  if (mcpData) {
+  html += `<div style="margin-bottom:14px;padding:10px 12px;border:1px solid var(--border);border-radius:6px;background:var(--surface-2)" id="github-card-${projectId}">
+    <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:8px;flex-wrap:wrap">
+      <div style="display:flex;align-items:center;gap:8px;min-width:0">
+        ${githubIconSvg(14, 'var(--text)')}
+        <div style="min-width:0">
+          <div style="font-weight:600;font-size:11px;color:var(--text)">Connect GitHub repo</div>
+          <div style="font-size:10px;color:var(--muted)">Connect your account and pick the repo your sessions should read from.</div>
+        </div>
+      </div>
+      ${ghData?.connected ? `
+        <div style="display:flex;align-items:center;gap:6px">
+          <button class="secondary" id="github-test-btn-${projectId}" style="padding:3px 8px;font-size:10px">Test</button>
+          <button class="secondary" id="github-disconnect-btn-${projectId}" style="padding:3px 8px;font-size:10px;color:var(--danger,#ef4444)">Disconnect</button>
+          <span id="github-status-${projectId}" style="font-size:10px;color:var(--muted)"></span>
+        </div>
+      ` : ''}
+    </div>
+    ${ghData?.connected ? `
+      <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:10px">
+        <img src="${escapeHtml(ghAvatarUrl || 'https://github.com/github.png?size=48')}" alt="" style="width:26px;height:26px;border-radius:50%;object-fit:cover;border:1px solid var(--border);background:var(--surface-1)">
+        <div style="min-width:0;flex:1">
+          <div style="font-size:11px;font-weight:700;color:var(--text)">${ghUsername ? '@' + escapeHtml(ghUsername) : 'GitHub connected'}</div>
+          <div style="font-size:9px;color:var(--muted)">${ghRepos.length ? `${ghRepos.length} accessible repos` : 'Fetching repo access…'}</div>
+        </div>
+      </div>
+      <div style="display:grid;grid-template-columns:minmax(220px,1.4fr) minmax(110px,0.6fr) auto;gap:8px;align-items:end">
+        <label style="display:flex;flex-direction:column;gap:3px;min-width:0">
+          <span style="font-size:9px;color:var(--muted)">Repo</span>
+          <input type="search" id="github-repo-${projectId}" list="github-repos-${projectId}" value="${escapeHtml(ghSelectedRepo)}" placeholder="Search repos"
+            style="padding:5px 8px;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;color:var(--text);font-family:var(--font-mono);font-size:11px;outline:none">
+          <datalist id="github-repos-${projectId}">
+            ${ghRepoOptions}
+          </datalist>
+        </label>
+        <label style="display:flex;flex-direction:column;gap:3px;min-width:0">
+          <span style="font-size:9px;color:var(--muted)">Branch</span>
+          <input type="text" id="github-branch-${projectId}" value="${escapeHtml(ghSelectedBranch)}" placeholder="main"
+            style="padding:5px 8px;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;color:var(--text);font-family:var(--font-mono);font-size:11px;outline:none">
+        </label>
+        <button class="primary" id="github-save-btn-${projectId}" style="padding:5px 12px;font-size:11px">Save repo</button>
+      </div>
+    ` : `
+      <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap">
+        <div style="font-size:10px;color:var(--muted)">Use GitHub OAuth to connect once. Meridian stores an encrypted token and pulls your repo list automatically.</div>
+        <button class="primary" id="github-connect-btn-${projectId}" style="padding:5px 12px;font-size:11px">Connect with GitHub</button>
+      </div>
+    `}
+  </div>`;
+  }
+
   html += `<details style="margin-bottom:16px;border:1px solid var(--border);border-radius:6px;background:var(--surface-2)">
     <summary style="cursor:pointer;list-style:none;padding:10px 12px;display:flex;justify-content:space-between;align-items:center;gap:8px">
       <span style="font-weight:600;font-size:11px;color:var(--text)">Auto-checkpoint hooks</span>
@@ -2955,7 +3015,7 @@ async function loadSettingsTab(projectId) {
   </details>`;
 
   // MCP config section (hosted mode only)
-  if (mcpData) {
+  if (false && mcpData) {
     const projects = mcpData.projects || [];
     const baseUrl = mcpData.base_url || 'https://usemeridian.us';
     const firstPid = projects[0]?.id || '';
@@ -3430,58 +3490,6 @@ async function loadSettingsTab(projectId) {
     }, 0);
   }
 
-  // GitHub integration card (hosted only)
-  if (mcpData) {
-    const ghConnected = !!(ghData && ghData.connected);
-    const ghRepo = (ghData && ghData.repo) || '';
-    const ghBranch = (ghData && ghData.branch) || 'main';
-    html += `<div style="margin-bottom:14px;padding:10px 12px;border:1px solid var(--border);border-radius:6px;background:var(--surface-2)" id="github-card-${projectId}">
-      <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px">
-        ${githubIconSvg(14, 'var(--text)')}
-        <span style="font-weight:600;font-size:11px;color:var(--text)">Connect GitHub repo</span>
-        ${ghConnected ? `<span style="font-size:9px;padding:2px 6px;background:var(--success,#22c55e);color:#fff;border-radius:10px;font-weight:600">Connected</span>` : ''}
-      </div>
-      <div style="font-size:10px;color:var(--muted);margin-bottom:8px">Give your AI planner read access to your codebase — no extra installs</div>
-      ${ghConnected ? `
-        <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:8px">
-          <span style="font-size:11px;color:var(--text);font-weight:600">✓ Connected: ${escapeHtml(ghRepo)} (${escapeHtml(ghBranch)})</span>
-        </div>
-        <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
-          <button class="secondary" id="github-test-btn-${projectId}" style="padding:3px 8px;font-size:10px">Test</button>
-          <button class="secondary" id="github-disconnect-btn-${projectId}" style="padding:3px 8px;font-size:10px;color:var(--danger,#ef4444)">Disconnect</button>
-          <span id="github-status-${projectId}" style="font-size:10px;color:var(--muted)"></span>
-        </div>
-      ` : `
-        <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:flex-end">
-          <div style="display:flex;flex-direction:column;gap:3px;flex:2;min-width:140px">
-            <label style="font-size:9px;color:var(--muted)">PAT</label>
-            <input type="password" id="github-pat-${projectId}" placeholder="ghp_..."
-              style="padding:5px 8px;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;color:var(--text);font-family:var(--font-mono);font-size:11px;outline:none">
-          </div>
-          <div style="display:flex;flex-direction:column;gap:3px;flex:2;min-width:120px">
-            <label style="font-size:9px;color:var(--muted)">Repo</label>
-            <input type="text" id="github-repo-${projectId}" placeholder="owner/repo"
-              style="padding:5px 8px;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;color:var(--text);font-family:var(--font-mono);font-size:11px;outline:none">
-          </div>
-          <div style="display:flex;flex-direction:column;gap:3px;flex:1;min-width:80px">
-            <label style="font-size:9px;color:var(--muted)">Branch</label>
-            <input type="text" id="github-branch-${projectId}" value="main" placeholder="main"
-              style="padding:5px 8px;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;color:var(--text);font-family:var(--font-mono);font-size:11px;outline:none">
-          </div>
-          <div style="display:flex;flex-direction:column;gap:3px">
-            <label style="font-size:9px;color:transparent">_</label>
-            <button class="primary" id="github-connect-btn-${projectId}" style="padding:5px 12px;font-size:11px">Connect</button>
-          </div>
-        </div>
-        <div style="font-size:9px;color:var(--muted);margin-top:6px">
-          <a href="https://github.com/settings/tokens" target="_blank" rel="noopener" style="color:var(--accent);text-decoration:none">Create a PAT → github.com/settings/tokens</a>
-          <span style="color:var(--muted)">(needs repo read scope)</span>
-        </div>
-        <span id="github-status-${projectId}" style="font-size:10px;color:var(--muted);display:block;margin-top:4px"></span>
-      `}
-    </div>`;
-  }
-
   // Notifications card — generalised: ntfy, webhook, or email
   const ntfyData = (ntfyResult.status === 'fulfilled') ? ntfyResult.value : null;
   // prefer notify_url key, fall back to ntfy_url for older servers
@@ -3669,31 +3677,39 @@ async function loadSettingsTab(projectId) {
     };
   });
 
-  // Wire GitHub connect button
+  // Wire GitHub OAuth connect button
   const ghConnectBtn = document.getElementById(`github-connect-btn-${projectId}`);
   if (ghConnectBtn) {
-    ghConnectBtn.onclick = async () => {
+    ghConnectBtn.onclick = () => {
+      window.location.href = `/auth/github/repo-connect?project_id=${encodeURIComponent(projectId)}`;
+    };
+  }
+
+  // Wire GitHub repo save button (repo + branch only; token is already stored)
+  const ghSaveBtn = document.getElementById(`github-save-btn-${projectId}`);
+  if (ghSaveBtn) {
+    ghSaveBtn.onclick = async () => {
       const statusEl = document.getElementById(`github-status-${projectId}`);
-      const pat = (document.getElementById(`github-pat-${projectId}`)?.value || '').trim();
       const repo = (document.getElementById(`github-repo-${projectId}`)?.value || '').trim();
       const branch = (document.getElementById(`github-branch-${projectId}`)?.value || 'main').trim();
-      if (!pat || !repo) {
-        if (statusEl) statusEl.textContent = 'PAT and repo are required';
+      if (!repo) {
+        if (statusEl) statusEl.textContent = 'repo is required';
         return;
       }
-      ghConnectBtn.disabled = true;
-      ghConnectBtn.textContent = 'Connecting…';
+      ghSaveBtn.disabled = true;
+      ghSaveBtn.textContent = 'Saving…';
       if (statusEl) statusEl.textContent = '';
       try {
         await api(`/projects/${projectId}/github/connect`, {
           method: 'POST',
-          body: JSON.stringify({ pat, repo, branch }),
+          body: JSON.stringify({ repo, branch }),
         });
         loadSettingsTab(projectId);
       } catch (e) {
-        if (statusEl) statusEl.textContent = e.message || 'Connection failed';
-        ghConnectBtn.disabled = false;
-        ghConnectBtn.textContent = 'Connect';
+        if (statusEl) statusEl.textContent = e.message || 'Save failed';
+      } finally {
+        ghSaveBtn.disabled = false;
+        ghSaveBtn.textContent = 'Save repo';
       }
     };
   }
@@ -3722,7 +3738,12 @@ async function loadSettingsTab(projectId) {
       ghTestBtn.disabled = true;
       try {
         const st = await api(`/projects/${projectId}/github/status`);
-        if (statusEl) { statusEl.textContent = st.connected ? '✓ connected' : 'not connected'; setTimeout(() => { statusEl.textContent = ''; }, 3000); }
+        if (statusEl) {
+          statusEl.textContent = st.connected
+            ? (st.github_user ? `@${st.github_user}` : 'connected')
+            : 'not connected';
+          setTimeout(() => { statusEl.textContent = ''; }, 3000);
+        }
       } catch (e) {
         if (statusEl) statusEl.textContent = 'error';
       } finally {
@@ -3766,13 +3787,21 @@ async function loadNotesTab(projectId) {
     const qs = tag ? `?tag=${encodeURIComponent(tag)}` : '';
     try {
       const notes = await api(`/projects/${projectId}/notes${qs}`);
-      if (!notes || notes.length === 0) {
+      const visibleNotes = (notes || []).filter(n => {
+        const title = String(n.title || '').trim().toLowerCase();
+        const tags = String(n.tags || '')
+          .split(',')
+          .map(t => t.trim().toLowerCase())
+          .filter(Boolean);
+        return !title.startsWith('checkpoint:') && !tags.includes('checkpoint');
+      });
+      if (!visibleNotes.length) {
         body.innerHTML = `<div style="color:var(--muted);padding:10px;text-align:center;border:1px dashed var(--border);border-radius:4px">
           (no notes yet — use the form below or <code>add_note</code> MCP tool)
         </div>`;
         return;
       }
-      body.innerHTML = notes.map(n => {
+      body.innerHTML = visibleNotes.map(n => {
         const tags = (n.tags || '').split(',').map(t => t.trim()).filter(Boolean);
         const pills = tags.map(t =>
           `<span style="display:inline-block;background:var(--accent)22;color:var(--accent);font-size:9px;font-weight:600;padding:1px 6px;border-radius:3px;margin-right:4px">${escapeHtml(t)}</span>`
@@ -3919,7 +3948,7 @@ async function loadHitlTab(projectId) {
 
 async function loadTeamTab(projectId) {
   /** v2.4 — Team tab: per-human presence cards + standup digest +
-   * swimlane timeline. Pulls /team/summary?project_id=&days=N once per
+   * activity summary. Pulls /team/summary?project_id=&days=N once per
    * load. Re-renders on day-range change or refresh button. */
   const body = document.getElementById(`team-body-${projectId}`);
   const daySel = document.getElementById(`team-days-${projectId}`);
@@ -4008,8 +4037,7 @@ async function loadTeamTab(projectId) {
         ));
       } catch (_) { /* goal markers optional */ }
 
-      // Swimlane timeline — one row per human, dots colored by task status.
-      const swimlane = _renderSwimlane(humans, days, goalMarkers);
+      // Activity timeline — one row per human, dots colored by task status.
 
       // Standup digest — one line per person with their most recent
       // descriptions concatenated.
@@ -4045,10 +4073,6 @@ async function loadTeamTab(projectId) {
           <div style="color:var(--accent);font-weight:600;margin-bottom:8px">👥 Live (${data.active_count} active)</div>
           ${cards}
         </section>
-        <section style="margin-top:18px">
-          <div style="color:var(--accent);font-weight:600;margin-bottom:8px">📊 Swimlane — last ${data.period_days}d</div>
-          ${swimlane}
-        </section>
         <section style="margin-top:18px;padding-top:10px;border-top:1px solid var(--border)">
           <div style="color:var(--accent);font-weight:600;margin-bottom:8px">🗞 Standup digest</div>
           ${standup}
@@ -4062,133 +4086,6 @@ async function loadTeamTab(projectId) {
   if (daySel) daySel.onchange = render;
   if (refreshBtn) refreshBtn.onclick = render;
   render();
-}
-
-function _renderSwimlane(humans, days, goalMarkers) {
-  /** v1.1 — swimlane: one row per human, task dots positioned on a shared time axis.
-   * Pure CSS / inline SVG — no library dependency. Markers show sprint/goal changes. */
-  if (!humans.length) return '<div style="color:var(--muted)">no activity</div>';
-  const now = Date.now();
-  const windowMs = days * 86400 * 1000;
-  const start = now - windowMs;
-
-  // Task dot fill colours — large enough to be readable at a glance
-  const statusColor = {
-    done:           '#22d3a5',   // green
-    failed:         '#ef4444',   // red
-    in_progress:    '#6c8fff',   // blue
-    pending:        '#9ca3af',   // grey
-    backburner:     '#6b7280',   // dim grey
-    'pending-hitl': '#fb923c',   // amber-orange
-  };
-  // Vertical marker colours: sprint=blue, north-star=amber, goal-content=purple
-  const markerColor = {
-    sprint_updated_at:  '#6c8fff',
-    ns_updated_at:      '#fbbf24',
-    content_updated_at: '#a78bfa',
-  };
-  const fieldLabel = {
-    content_updated_at: 'goal',
-    ns_updated_at:      'N★',
-    sprint_updated_at:  'sprint',
-  };
-
-  // SVG geometry
-  const rowH    = 36;   // taller rows for bigger dots
-  const labelW  = 120;
-  const width   = 740;
-  const dotR    = 9;    // larger dots for visibility
-  const height  = humans.length * rowH + 28;
-
-  const xPos = ts => {
-    try {
-      const t = Date.parse((ts || '').replace(' ', 'T') + 'Z');
-      if (!isFinite(t)) return labelW;
-      return labelW + Math.max(0, Math.min(1, (t - start) / windowMs)) * (width - labelW - 16);
-    } catch (_) { return labelW; }
-  };
-
-  // Session rows
-  const rows = humans.map((h, i) => {
-    const cy     = 18 + i * rowH;
-    const lineY  = cy;
-    const hColor = _colorForHuman(h.human_id);
-    const presenceColor = h.presence === 'active' ? '#4ade80' : h.presence === 'recent' ? '#fbbf24' : '#6b7280';
-
-    // Worker sessions: detect "claude-worker" pattern and show parent hint
-    const isWorker = (h.human_id || '').includes('worker') || (h.human_id || '').includes('codex');
-    const displayName = escapeHtml((h.human_id || '').slice(0, 16));
-    const subLabel = h.active_session
-      ? escapeHtml(h.active_session.slice(0, 20))
-      : (isWorker ? 'worker' : '');
-
-    // Task dots — coloured by status
-    const dots = (h.recent || []).map(t => {
-      const dc  = statusColor[t.status] || '#6b7280';
-      const tip = `[${(t.status || '?').toUpperCase()}] ${(t.description || '').slice(0, 80)}`
-                    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;');
-      return `<circle cx="${xPos(t.created_at)}" cy="${cy}" r="${dotR}" fill="${dc}" stroke="${hColor}" stroke-width="1.5" opacity="0.9"><title>${tip}</title></circle>`;
-    }).join('');
-
-    const subEl = subLabel
-      ? `<text x="${labelW - 7}" y="${cy + 12}" text-anchor="end" font-size="8" fill="var(--muted)" font-family="var(--font-mono)" opacity="0.75">${subLabel}</text>`
-      : '';
-
-    return `
-      <line x1="${labelW}" y1="${lineY}" x2="${width - 8}" y2="${lineY}" stroke="var(--border)" stroke-dasharray="2,4"/>
-      <circle cx="${labelW - 108}" cy="${cy}" r="4" fill="${presenceColor}"/>
-      <text x="${labelW - 8}" y="${cy + 4}" text-anchor="end" font-size="10" fill="${hColor}" font-family="var(--font-mono)" font-weight="600">${displayName}</text>
-      ${subEl}${dots}`;
-  }).join('');
-
-  // Vertical marker lines — one per sprint/goal/north-star change
-  const sortedMarkers = [...(goalMarkers || [])].sort((a, b) =>
-    Date.parse((a.ts||'').replace(' ','T')+'Z') - Date.parse((b.ts||'').replace(' ','T')+'Z')
-  );
-  const markerLines = sortedMarkers.map((m, i) => {
-    const mx    = xPos(m.ts);
-    const fld   = fieldLabel[m.field] || 'goal';
-    const mc    = markerColor[m.field] || '#a78bfa';
-    const dateStr = (m.ts || '').slice(5, 10); // MM-DD
-    // Show sprint name if present, else just the field label + date
-    const nameStr = m.label ? escapeHtml(m.label) : '';
-    const lineText = nameStr ? `${fld}: ${nameStr}` : `${fld} ${dateStr}`;
-    // Stagger label rows to avoid overlap between adjacent markers
-    const prev  = sortedMarkers[i - 1];
-    const prevX = prev ? xPos(prev.ts) : -9999;
-    const labelY = Math.abs(mx - prevX) < 50 ? 19 : 9;
-    const tip   = `${fld} change (${dateStr})${nameStr ? ': ' + nameStr : ''}`;
-    return `<line x1="${mx}" y1="0" x2="${mx}" y2="${height}" stroke="${mc}" stroke-dasharray="3,3" stroke-width="1.2" opacity="0.75"><title>${escapeHtml(tip)}</title></line>
-      <text x="${mx + 3}" y="${labelY}" font-size="8" fill="${mc}" font-family="var(--font-mono)" opacity="0.9">${escapeHtml(lineText.slice(0, 22))}</text>`;
-  }).join('');
-
-  // Time axis ticks (every day)
-  const tickCount = Math.min(days, 14);
-  const ticks = Array.from({length: tickCount + 1}, (_, i) => {
-    const tickMs  = start + (i / tickCount) * windowMs;
-    const tickX   = labelW + (i / tickCount) * (width - labelW - 16);
-    const d       = new Date(tickMs);
-    const lbl     = `${d.getUTCMonth()+1}/${d.getUTCDate()}`;
-    return `<line x1="${tickX}" y1="${height - 10}" x2="${tickX}" y2="${height}" stroke="var(--border)" stroke-width="1"/>
-      <text x="${tickX}" y="${height + 10}" font-size="8" fill="var(--muted)" font-family="var(--font-mono)" text-anchor="middle">${escapeHtml(lbl)}</text>`;
-  }).join('');
-
-  // Legend
-  const legend = `<div style="display:flex;gap:14px;padding:6px 0 2px;font-size:10px;font-family:var(--font-mono);color:var(--muted);flex-wrap:wrap">
-    <span><svg width="10" height="10"><circle cx="5" cy="5" r="4" fill="#22d3a5"/></svg> done</span>
-    <span><svg width="10" height="10"><circle cx="5" cy="5" r="4" fill="#ef4444"/></svg> failed</span>
-    <span><svg width="10" height="10"><circle cx="5" cy="5" r="4" fill="#6c8fff"/></svg> in progress</span>
-    <span><svg width="10" height="10"><circle cx="5" cy="5" r="4" fill="#9ca3af"/></svg> pending</span>
-    <span style="margin-left:8px"><svg width="18" height="10"><line x1="0" y1="5" x2="18" y2="5" stroke="#a78bfa" stroke-dasharray="3,2" stroke-width="1.5"/></svg> goal</span>
-    <span><svg width="18" height="10"><line x1="0" y1="5" x2="18" y2="5" stroke="#6c8fff" stroke-dasharray="3,2" stroke-width="1.5"/></svg> sprint</span>
-    <span><svg width="18" height="10"><line x1="0" y1="5" x2="18" y2="5" stroke="#fbbf24" stroke-dasharray="3,2" stroke-width="1.5"/></svg> north★</span>
-  </div>`;
-
-  const svgHeight = height + 14; // add space for axis labels
-  return `<div style="overflow-x:auto;background:var(--surface-2);border:1px solid var(--border);border-radius:6px;padding:8px 6px 4px">
-    <svg viewBox="0 0 ${width} ${svgHeight}" style="width:100%;min-width:560px;height:${svgHeight}px;display:block">${markerLines}${rows}${ticks}</svg>
-    ${legend}
-  </div>`;
 }
 
 async function updateLiveFeed(projectId) {
@@ -4413,6 +4310,7 @@ async function loadQueue(projectId) {
 
     const renderCurrentQueue = () => {
       body.innerHTML = renderQueue(projectId, panel.queueSprintItems || []);
+      wireQueueSectionToggles(projectId);
       const moreBtn = document.getElementById(`queue-done-more-${projectId}`);
       if (moreBtn) {
         moreBtn.onclick = () => {
@@ -4493,22 +4391,32 @@ function renderSearchResults(query, results) {
 }
 
 function renderQueue(projectId, sprintItems = []) {
-  /** Render the 4-group sprint board for the Queue tab.
+  /** Render the 5-group sprint board for the Queue tab.
    * Legacy task_log statuses like 'future' still belong in Dev Log, not here. */
   const panel = getPanelState(projectId);
+  const sectionState = panel.queueSectionState || (panel.queueSectionState = {
+    backburner: true,
+    pending: false,
+    in_progress: false,
+    done: true,
+    failed: true,
+  });
   const doneLimit = panel.queueDoneLimit || QUEUE_DONE_PAGE_SIZE;
   const items = (sprintItems || []).slice();
   const sortByNewest = (a, b) =>
     String(b.completed_at || b.added_at || '').localeCompare(String(a.completed_at || a.added_at || ''));
 
   const backburner = items
-    .filter(it => ['pushed', 'failed', 'skipped'].includes(it.status))
+    .filter(it => ['pushed', 'skipped'].includes(it.status))
     .sort(sortByNewest);
   const pending = items
     .filter(it => it.status === 'pending' || it.status === 'todo')
     .sort(sortByNewest);
   const inProgress = items
     .filter(it => it.status === 'in_progress')
+    .sort(sortByNewest);
+  const failed = items
+    .filter(it => it.status === 'failed')
     .sort(sortByNewest);
   const doneAll = items
     .filter(it => it.status === 'done')
@@ -4554,15 +4462,21 @@ function renderQueue(projectId, sprintItems = []) {
   };
 
   const section = (icon, title, rows, emptyMsg, opts = {}) => {
-    const openAttr = opts.collapsed ? '' : ' open';
+    const key = opts.key || '';
+    const collapsed = key ? (sectionState[key] ?? !!opts.collapsed) : !!opts.collapsed;
     const footer = opts.footer || '';
-    return `<details class="queue-section"${openAttr}>
-      <summary class="queue-section-header">${icon} ${title} <span style="color:var(--accent)">(${rows.length})</span></summary>
-      <div style="margin-top:8px">
-        ${rows.length ? rows.map(renderItem).join('') : `<div class="queue-empty">${emptyMsg}</div>`}
-        ${footer}
+    return `<div class="queue-section" data-section="${escapeHtml(key)}" data-collapsed="${collapsed ? 'true' : 'false'}">
+      <div class="queue-section-header" role="button" tabindex="0" aria-expanded="${collapsed ? 'false' : 'true'}" data-section-key="${escapeHtml(key)}">
+        <span class="queue-section-header-label">${icon} ${title} <span class="queue-section-count">(${rows.length})</span></span>
+        <span class="queue-section-chevron" aria-hidden="true">▶</span>
       </div>
-    </details>`;
+      <div class="queue-section-body">
+        <div class="queue-section-body-inner">
+          ${rows.length ? rows.map(renderItem).join('') : `<div class="queue-empty">${emptyMsg}</div>`}
+          ${footer}
+        </div>
+      </div>
+    </div>`;
   };
 
   const doneFooter = doneAll.length > done.length
@@ -4574,11 +4488,83 @@ function renderQueue(projectId, sprintItems = []) {
     : '';
 
   return [
-    section('⏸', 'Backburner', backburner, 'no backburner items', { collapsed: true }),
-    section('⏳', 'Pending', pending, 'no pending sprint items'),
-    section('🔄', 'In Progress', inProgress, 'nothing in progress'),
-    section('✅', 'Done', done, 'no completed sprint items', { footer: doneFooter }),
+    section('⏸', 'Backburner', backburner, 'no backburner items', { key: 'backburner', collapsed: true }),
+    section('⏳', 'Pending', pending, 'no pending sprint items', { key: 'pending' }),
+    section('🔄', 'In Progress', inProgress, 'nothing in progress', { key: 'in_progress' }),
+    section('✅', 'Done', done, 'no completed sprint items', { key: 'done', collapsed: true, footer: doneFooter }),
+    section('✕', 'Failed', failed, 'no failed sprint items', { key: 'failed', collapsed: true }),
   ].join('');
+}
+
+function wireQueueSectionToggles(projectId) {
+  const body = document.getElementById(`queue-body-${projectId}`);
+  if (!body) return;
+  const panel = getPanelState(projectId);
+  const sectionState = panel.queueSectionState || (panel.queueSectionState = {
+    backburner: true,
+    pending: false,
+    in_progress: false,
+    done: true,
+    failed: true,
+  });
+
+  body.querySelectorAll('.queue-section').forEach(section => {
+    const header = section.querySelector('.queue-section-header');
+    const sectionBody = section.querySelector('.queue-section-body');
+    const key = section.dataset.section || header?.dataset.sectionKey || '';
+    if (!header || !sectionBody || !key) return;
+
+    const applyState = (collapsed, animate) => {
+      section.dataset.collapsed = collapsed ? 'true' : 'false';
+      header.setAttribute('aria-expanded', String(!collapsed));
+      sectionBody.setAttribute('aria-hidden', String(collapsed));
+      sectionState[key] = collapsed;
+
+      if (sectionBody._queueTransitionEnd) {
+        sectionBody.removeEventListener('transitionend', sectionBody._queueTransitionEnd);
+        sectionBody._queueTransitionEnd = null;
+      }
+
+      if (!animate) {
+        sectionBody.style.height = collapsed ? '0px' : 'auto';
+        return;
+      }
+
+      if (collapsed) {
+        const currentHeight = sectionBody.getBoundingClientRect().height;
+        sectionBody.style.height = `${currentHeight}px`;
+        sectionBody.offsetHeight;
+        sectionBody.style.height = '0px';
+      } else {
+        sectionBody.style.height = '0px';
+        sectionBody.offsetHeight;
+        const targetHeight = sectionBody.scrollHeight;
+        sectionBody.style.height = `${targetHeight}px`;
+        const onEnd = (ev) => {
+          if (ev.target !== sectionBody || ev.propertyName !== 'height') return;
+          if (section.dataset.collapsed !== 'true') sectionBody.style.height = 'auto';
+          sectionBody.removeEventListener('transitionend', onEnd);
+          sectionBody._queueTransitionEnd = null;
+        };
+        sectionBody._queueTransitionEnd = onEnd;
+        sectionBody.addEventListener('transitionend', onEnd);
+      }
+    };
+
+    if (!header._queueWired) {
+      header._queueWired = true;
+      const toggle = () => applyState(section.dataset.collapsed !== 'true', true);
+      header.onclick = toggle;
+      header.onkeydown = (e) => {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          toggle();
+        }
+      };
+    }
+
+    applyState(section.dataset.collapsed === 'true', false);
+  });
 }
 
 // Global queue action handler — called from inline onclick in renderQueue
@@ -5860,6 +5846,20 @@ async function restoreTabs() {
     return; // don't restore tabs until wizard completes
   }
   await restoreTabs();
+  const dashboardParams = new URLSearchParams(window.location.search);
+  const requestedProjectId = dashboardParams.get('project_id') || '';
+  const requestedTab = dashboardParams.get('tab') || '';
+  if (requestedProjectId) {
+    const requestedProject = state.projects.find(p => p.id === requestedProjectId);
+    if (requestedProject) {
+      openTab(requestedProject);
+      if (requestedTab && requestedTab !== 'status') {
+        setTimeout(() => {
+          document.querySelector(`#vtab-strip-${requestedProject.id} .vtab-btn[data-vtab="${requestedTab}"]`)?.click();
+        }, 0);
+      }
+    }
+  }
   // v1.5.x — polling removed. WebSocket pushes task/goal updates; sessions
   // refresh on initial page load + explicit user action only (tab switch,
   // worker start, etc). Idle dropdowns no longer hammer /sessions every 1s.

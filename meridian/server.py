@@ -492,7 +492,7 @@ async def lifespan(app: FastAPI):
             _aio.set_event_loop(_new_loop)
     try:
         from dotenv import load_dotenv
-        load_dotenv(override=False)
+        load_dotenv(dotenv_path=Path(__file__).resolve().parent.parent / ".env", override=False)
     except ImportError:
         pass  # dotenv is optional — env can be set by the launcher.
 
@@ -1078,6 +1078,20 @@ async def auth_github_callback(request: Request):
     """Handle GitHub OAuth callback — create/update tenant, set session cookie."""
     from .hosted import auth_github_callback as _auth_github_callback
     return await _auth_github_callback(request)
+
+
+@app.get("/auth/github/repo-connect")
+async def auth_github_repo_connect(request: Request):
+    """Redirect browser to GitHub OAuth for repo connection."""
+    from .hosted import auth_github_repo_connect as _auth_github_repo_connect
+    return await _auth_github_repo_connect(request)
+
+
+@app.get("/auth/github/repo-callback")
+async def auth_github_repo_callback(request: Request):
+    """Handle GitHub repo-connect callback and store repo access."""
+    from .hosted import auth_github_repo_callback as _auth_github_repo_callback
+    return await _auth_github_repo_callback(request)
 
 
 @app.get("/auth/microsoft/login")
@@ -3582,42 +3596,64 @@ async def update_usage_caps(request: Request) -> dict[str, Any]:
 
 @app.post("/projects/{project_id}/github/connect")
 async def github_connect(project_id: str, request: Request) -> dict[str, Any]:
-    """Validate a GitHub PAT and store it encrypted on the tenant."""
+    """Connect or update the tenant's GitHub repo settings."""
     if not _hosted_mode():
         raise HTTPException(status_code=404)
     import httpx as _httpx
+    from .hosted import _github_user_snapshot as _github_snapshot
     tenant = await _get_tenant_from_request(request)
     if tenant is None:
         raise HTTPException(status_code=401, detail="not authenticated")
     body = await request.json()
-    pat = (body.get("pat") or "").strip()
+    pat = (body.get("pat") or body.get("token") or body.get("access_token") or "").strip()
     repo = (body.get("repo") or "").strip()
     branch = (body.get("branch") or "main").strip()
-    if not pat:
-        raise HTTPException(status_code=422, detail="pat is required")
     if not repo or "/" not in repo:
         raise HTTPException(status_code=422, detail="repo must be owner/repo format")
-    # Validate PAT against GitHub API
+    fresh = await db_module.get_tenant_by_id(request.app.state.db, tenant["id"])
+    stored_pat = db_module.decrypt_field((fresh or {}).get("github_pat"))
+    validate_pat = pat or stored_pat or ""
+    github_user = ""
+    avatar_url = ""
+    repos: list[dict[str, Any]] = []
     try:
-        async with _httpx.AsyncClient(timeout=10.0) as http:
-            r = await http.get(
-                "https://api.github.com/user",
-                headers={"Authorization": f"token {pat}", "Accept": "application/vnd.github+json"},
-            )
-        if r.status_code == 401:
-            raise HTTPException(status_code=422, detail="GitHub PAT is invalid or expired")
-        if r.status_code != 200:
-            raise HTTPException(status_code=422, detail=f"GitHub API error: {r.status_code}")
-        gh_user = r.json().get("login", "")
+        if validate_pat:
+            snapshot = await _github_snapshot(validate_pat)
+            github_user = snapshot.get("login", "")
+            avatar_url = snapshot.get("avatar_url", "")
+            repos = snapshot.get("repos") or []
+            if repo and repos:
+                repo_lookup = {r.get("full_name", ""): r for r in repos if r.get("full_name")}
+                if repo not in repo_lookup:
+                    repo = repos[0].get("full_name", repo)
+                    branch = repos[0].get("default_branch") or branch
+                elif branch == "main" and repo_lookup[repo].get("default_branch"):
+                    branch = repo_lookup[repo].get("default_branch") or branch
+        elif not stored_pat:
+            raise HTTPException(status_code=422, detail="GitHub is not connected")
     except _httpx.RequestError as exc:
         raise HTTPException(status_code=502, detail=f"Could not reach GitHub: {exc}") from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    update_fields: dict[str, Any] = {
+        "github_repo": repo,
+        "github_branch": branch,
+    }
+    if pat:
+        update_fields["github_pat"] = db_module.encrypt_field(pat)
     await db_module.update_tenant(
         request.app.state.db, tenant["id"],
-        github_pat=db_module.encrypt_field(pat),
-        github_repo=repo,
-        github_branch=branch,
+        **update_fields,
     )
-    return {"connected": True, "repo": repo, "branch": branch, "github_user": gh_user}
+    return {
+        "connected": True,
+        "repo": repo,
+        "branch": branch,
+        "github_user": github_user,
+        "avatar_url": avatar_url,
+        "repos": repos,
+    }
 
 
 @app.get("/projects/{project_id}/github/status")
@@ -3625,6 +3661,7 @@ async def github_status(project_id: str, request: Request) -> dict[str, Any]:
     """Return the tenant's current GitHub connection status."""
     if not _hosted_mode():
         raise HTTPException(status_code=404)
+    from .hosted import _github_user_snapshot as _github_snapshot
     tenant = await _get_tenant_from_request(request)
     if tenant is None:
         raise HTTPException(status_code=401, detail="not authenticated")
@@ -3632,11 +3669,24 @@ async def github_status(project_id: str, request: Request) -> dict[str, Any]:
     fresh = await db_module.get_tenant_by_id(request.app.state.db, tenant["id"])
     if not fresh:
         raise HTTPException(status_code=404, detail="tenant not found")
-    connected = bool(fresh.get("github_pat"))
+    token = db_module.decrypt_field(fresh.get("github_pat"))
+    snapshot: dict[str, Any] | None = None
+    if token:
+        try:
+            snapshot = await _github_snapshot(token)
+        except Exception:
+            snapshot = None
+    repos = (snapshot or {}).get("repos") or []
+    selected_repo = fresh.get("github_repo") or ""
+    if selected_repo and repos and not any(r.get("full_name") == selected_repo for r in repos):
+        repos = [{"full_name": selected_repo, "name": selected_repo.split("/")[-1], "owner": selected_repo.split("/")[0] if "/" in selected_repo else "", "html_url": "", "default_branch": fresh.get("github_branch") or "main", "private": False, "updated_at": ""}] + repos
     return {
-        "connected": connected,
-        "repo": fresh.get("github_repo") or "",
+        "connected": bool(token),
+        "repo": selected_repo,
         "branch": fresh.get("github_branch") or "main",
+        "github_user": (snapshot or {}).get("login", ""),
+        "avatar_url": (snapshot or {}).get("avatar_url", ""),
+        "repos": repos,
         "last_verified": None,
     }
 
@@ -3655,7 +3705,47 @@ async def github_disconnect(project_id: str, request: Request) -> dict[str, Any]
         github_repo=None,
         github_branch=None,
     )
+    _GITHUB_REPOS_CACHE.pop(tenant["id"], None)
     return {"disconnected": True}
+
+
+# Per-tenant in-memory cache of the accessible GitHub repo list. Avoids hitting
+# the GitHub API on every dropdown render; refreshed lazily after 24h or on demand.
+_GITHUB_REPOS_CACHE: dict[str, dict[str, Any]] = {}
+_GITHUB_REPOS_TTL_SECONDS = 24 * 3600
+
+
+@app.get("/projects/{project_id}/github/repos")
+async def github_repos(project_id: str, request: Request) -> dict[str, Any]:
+    """Return the tenant's accessible GitHub repos for the connect dropdown.
+
+    Cached in-memory for 24h per tenant; pass ?refresh=1 to force a re-fetch.
+    """
+    if not _hosted_mode():
+        raise HTTPException(status_code=404)
+    import time as _time
+    from .hosted import _github_user_snapshot as _github_snapshot
+    tenant = await _get_tenant_from_request(request)
+    if tenant is None:
+        raise HTTPException(status_code=401, detail="not authenticated")
+    fresh = await db_module.get_tenant_by_id(request.app.state.db, tenant["id"])
+    token = db_module.decrypt_field((fresh or {}).get("github_pat"))
+    if not token:
+        return {"connected": False, "repos": [], "synced_at": None}
+    force = request.query_params.get("refresh") in ("1", "true", "yes")
+    now = _time.time()
+    cached = _GITHUB_REPOS_CACHE.get(tenant["id"])
+    if cached and not force and (now - cached["fetched_at"]) < _GITHUB_REPOS_TTL_SECONDS:
+        return {"connected": True, "repos": cached["repos"], "synced_at": cached["fetched_at"], "cached": True}
+    try:
+        snapshot = await _github_snapshot(token)
+    except Exception as exc:
+        if cached:
+            return {"connected": True, "repos": cached["repos"], "synced_at": cached["fetched_at"], "cached": True, "stale": True}
+        raise HTTPException(status_code=502, detail=f"GitHub repo fetch failed: {exc}") from exc
+    repos = snapshot.get("repos") or []
+    _GITHUB_REPOS_CACHE[tenant["id"]] = {"repos": repos, "fetched_at": now}
+    return {"connected": True, "repos": repos, "synced_at": now, "cached": False}
 
 
 @app.get("/mcp/quickstart", response_class=PlainTextResponse)
@@ -5881,7 +5971,7 @@ def build_mcp_server():
             try:
                 from dotenv import load_dotenv
 
-                load_dotenv(override=False)
+                load_dotenv(dotenv_path=Path(__file__).resolve().parent.parent / ".env", override=False)
             except ImportError:
                 pass
             data_dir = Path(
