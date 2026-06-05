@@ -29,6 +29,10 @@ _TOOL_EXAMPLES: dict[str, str] = {
     "get_hitl_request": 'get_hitl_request(request_id="hitl-uuid")',
     "add_note": 'add_note(project_id="abc-123", title="Deploy note", body="Reminder: update env vars before deploy", tags="ops,deploy")',
     "get_notes": 'get_notes(project_id="abc-123")',
+    "add_workspace_note": 'add_workspace_note(title="Onboarding", body="All repos use pixi", tags="setup")',
+    "get_workspace_notes": 'get_workspace_notes(tag="setup")',
+    "pin_workspace_decision": 'pin_workspace_decision(title="Monorepo", body="One repo for all services", category="ARCHITECTURAL")',
+    "get_workspace_decisions": 'get_workspace_decisions()',
     "add_sprint_item": 'add_sprint_item(project_id="abc-123", title="Add OAuth login", item_group="auth")',
     "get_sprint_items": 'get_sprint_items(project_id="abc-123")',
     "complete_sprint_item": 'complete_sprint_item(item_id="item-uuid")',
@@ -188,6 +192,36 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
      "inputSchema": {"type": "object", "properties": {
          "note_id": {"type": "string"}},
          "required": ["note_id"]}},
+    {"name": "add_workspace_note", "description":
+        "Add a workspace-level wiki note that applies across ALL projects in this "
+        "workspace (onboarding, cross-cutting conventions, shared infra). Unlike "
+        "add_note, it is not tied to a project and is injected at the top of every "
+        "project's context block + handoff. Comma-separated tags optional.",
+     "inputSchema": {"type": "object", "properties": {
+         "title": {"type": "string"},
+         "body": {"type": "string"},
+         "tags": {"type": "string"}},
+         "required": ["title", "body"]}},
+    {"name": "get_workspace_notes", "description":
+        "List workspace-level notes (newest first). Optional ?tag substring filter.",
+     "inputSchema": {"type": "object", "properties": {
+         "tag": {"type": "string"}},
+         "required": []}},
+    {"name": "pin_workspace_decision", "description":
+        "Pin a workspace-level decision that applies across ALL projects (shared "
+        "architecture, org-wide standards). Injected at the top of every project's "
+        "context block + handoff. category is free-text (STRATEGIC, TECHNICAL, "
+        "ARCHITECTURAL, PRODUCT, ...).",
+     "inputSchema": {"type": "object", "properties": {
+         "title": {"type": "string"},
+         "body": {"type": "string"},
+         "category": {"type": "string"}},
+         "required": ["title", "body"]}},
+    {"name": "get_workspace_decisions", "description":
+        "List workspace-level pinned decisions (active only by default, newest first).",
+     "inputSchema": {"type": "object", "properties": {
+         "include_superseded": {"type": "boolean"}},
+         "required": []}},
     {"name": "get_session_brief", "description":
         "Single-call session orientation - returns sprint focus, pending sprint items, "
         "recent tasks, any blocking failures, and pending HITL requests in a compact "
@@ -300,6 +334,7 @@ _READ_ONLY_TOOLS = {
     "get_session_brief", "get_context_block", "get_hitl_request",
     "list_hitl_requests", "list_sessions", "get_sprint_notes",
     "get_run_transcript", "idle_until_session_done", "generate_handoff",
+    "get_workspace_notes", "get_workspace_decisions",
 }
 _DESTRUCTIVE_TOOLS = {"delete_note", "delete_decision", "dismiss_hitl"}
 

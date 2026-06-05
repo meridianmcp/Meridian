@@ -422,7 +422,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     status TEXT NOT NULL DEFAULT 'active',
     last_seen TEXT NOT NULL DEFAULT ({_TS}),
     created_at TEXT NOT NULL DEFAULT ({_TS}),
-    session_summary TEXT
+    session_summary TEXT,
+    checkpoint_data TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_log (
@@ -539,6 +540,25 @@ CREATE TABLE IF NOT EXISTS file_locks (
 );
 CREATE INDEX IF NOT EXISTS idx_file_locks_session ON file_locks(session_id);
 CREATE INDEX IF NOT EXISTS idx_file_locks_expires ON file_locks(expires_at);
+
+-- v3.1 — workspace layer: tenant-global notes + decisions above projects.
+CREATE TABLE IF NOT EXISTS workspace_notes (
+    id TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    body TEXT NOT NULL,
+    tags TEXT,
+    created_at TEXT NOT NULL DEFAULT ({_TS})
+);
+CREATE TABLE IF NOT EXISTS workspace_decisions (
+    id TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    body TEXT NOT NULL,
+    category TEXT NOT NULL DEFAULT 'TECHNICAL',
+    status TEXT NOT NULL DEFAULT 'active',
+    created_at TEXT NOT NULL DEFAULT ({_TS})
+);
+CREATE INDEX IF NOT EXISTS idx_workspace_notes_created ON workspace_notes(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_workspace_decisions_status ON workspace_decisions(status, created_at DESC);
 """
 
 # Tables that go ONLY in the main auth DB (MERIDIAN_DB_URL).
@@ -773,6 +793,7 @@ async def init_pg_db(url: str) -> PostgresConnection:
     await _migrate_pg_v27_pg_trgm(conn)
     await _migrate_pg_v24_pinned_decisions_and_hitl(conn)
     await _migrate_pg_v09_notes_and_magic_links(conn)
+    await _migrate_pg_v32_workspace_and_checkpoint(conn)
     if is_main_db:
         await _migrate_pg_v10_tenant_columns(conn)
         await _migrate_pg_v25_admins_table(conn)
@@ -830,6 +851,33 @@ async def _migrate_pg_v09_notes_and_magic_links(conn: PostgresConnection) -> Non
         "    created_at TEXT NOT NULL DEFAULT (to_char(now() at time zone 'utc', 'YYYY-MM-DD HH24:MI:SS'))"
         ");"
         "CREATE INDEX IF NOT EXISTS idx_magic_email ON magic_link_tokens(email, used_at)"
+    )
+
+
+async def _migrate_pg_v32_workspace_and_checkpoint(conn: PostgresConnection) -> None:
+    """v3.1 — workspace_notes + workspace_decisions tables and
+    sessions.checkpoint_data column on existing Postgres DBs. CREATE_TABLES_CORE
+    covers fresh DBs; this is the upgrade path. Runs on every DB (core)."""
+    await conn.executescript(
+        "CREATE TABLE IF NOT EXISTS workspace_notes ("
+        "    id TEXT PRIMARY KEY,"
+        "    title TEXT NOT NULL,"
+        "    body TEXT NOT NULL,"
+        "    tags TEXT,"
+        "    created_at TEXT NOT NULL DEFAULT (to_char(now() at time zone 'utc', 'YYYY-MM-DD HH24:MI:SS'))"
+        ");"
+        "CREATE TABLE IF NOT EXISTS workspace_decisions ("
+        "    id TEXT PRIMARY KEY,"
+        "    title TEXT NOT NULL,"
+        "    body TEXT NOT NULL,"
+        "    category TEXT NOT NULL DEFAULT 'TECHNICAL',"
+        "    status TEXT NOT NULL DEFAULT 'active',"
+        "    created_at TEXT NOT NULL DEFAULT (to_char(now() at time zone 'utc', 'YYYY-MM-DD HH24:MI:SS'))"
+        ");"
+        "CREATE INDEX IF NOT EXISTS idx_workspace_notes_created ON workspace_notes(created_at DESC);"
+        "CREATE INDEX IF NOT EXISTS idx_workspace_decisions_status ON workspace_decisions(status, created_at DESC);"
+        "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS checkpoint_data TEXT;"
+        "DELETE FROM project_notes WHERE title LIKE 'checkpoint:%'"
     )
 
 
