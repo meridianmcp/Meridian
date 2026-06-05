@@ -13,13 +13,13 @@ Every AI coding session starts completely fresh. Open Claude Code in two termina
 
 This isn't a Claude problem. It's a fundamental limitation of stateless sessions. And it gets worse with every wasted token.
 
-<img src="screenshots/landing_problems.png" alt="Meridian landing page — the problem" style="max-width:100%;border-radius:8px;margin:12px 0">
+<img src="screenshots/01_dashboard.png" alt="Meridian landing page — the problem" style="max-width:100%;border-radius:8px;margin:12px 0">
 
 ## The Solution
 
 Meridian is a local MCP server that gives all your Claude sessions a **shared persistent brain**.
 
-<img src="screenshots/landing_hero.png" alt="Meridian dashboard — hero" style="max-width:100%;border-radius:8px;margin:12px 0">
+<img src="screenshots/dashboard.png" alt="Meridian dashboard — hero" style="max-width:100%;border-radius:8px;margin:12px 0">
 
 Every session that connects to Meridian can:
 
@@ -30,7 +30,7 @@ Every session that connects to Meridian can:
 
 When the context window fills up, you can generate a handoff and start fresh. The new session will then read the file and pick up exactly where you left off -- no re-explaining required.
 
-<img src="screenshots/landing_features.png" alt="Meridian features" style="max-width:100%;border-radius:8px;margin:12px 0">
+<img src="screenshots/05b_charts_tab.png" alt="Meridian features" style="max-width:100%;border-radius:8px;margin:12px 0">
 
 ## Key Features
 
@@ -88,6 +88,10 @@ flowchart LR
 Zero local install — sign in at [usemeridian.us](https://usemeridian.us), copy your API token, add to MCP config.
 
 ## Dashboard
+
+### Video walkthrough
+
+<iframe width="100%" height="400" src="https://www.youtube.com/embed/A6VCWdo983A" frameborder="0" allowfullscreen></iframe>
 
 <img src="screenshots/01_dashboard.png" alt="Meridian dashboard overview" style="max-width:100%;border-radius:8px;margin:8px 0">
 <img src="screenshots/02_live_tab.png" alt="Meridian dashboard live tab" style="max-width:100%;border-radius:8px;margin:8px 0">
@@ -264,6 +268,6 @@ Try the live demo at [usemeridian.us/demo](https://usemeridian.us/demo) — no s
 
 Don't want to run your own server? [usemeridian.us](https://usemeridian.us) is a hosted version — sign in with Google or GitHub, get a managed Neon Postgres database, and connect over HTTPS.
 
-**Standard $20/month · Pro $49/month** — 30-day free tier, no card required.
+**Free $0 · Standard $20/month · Pro waitlist** — Free includes 0.5 CU / 10 CU-hrs total; Standard includes 2 CU / 50 CU-hrs/month and up to 20 members.
 
 → [Hosted tier guide](hosted.md)

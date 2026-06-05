@@ -14,7 +14,7 @@ Use Meridian directly inside claude.ai — no local install, no terminal. The [d
 
 ## Video walkthrough
 
-<iframe width="100%" height="400" src="https://www.youtube.com/embed/q1kZZH6LZK0" frameborder="0" allowfullscreen></iframe>
+<iframe width="100%" height="400" src="https://www.youtube.com/embed/dxX1Nwi72lI" frameborder="0" allowfullscreen></iframe>
 
 ---
 ## Quick start (hosted tier)
@@ -68,7 +68,7 @@ ChatGPT connects to Meridian as a **custom connector** backed by a **remote MCP 
 
 ### Video walkthrough
 
-<iframe width="100%" height="400" src="https://www.youtube.com/embed/H8sEAE5_Y5c" frameborder="0" allowfullscreen></iframe>
+<iframe width="100%" height="400" src="https://www.youtube.com/embed/U5pUUpOy5H4" frameborder="0" allowfullscreen></iframe>
 
 !!! note "Remote MCP only"
     ChatGPT connects to remote MCP servers. A local URL such as `http://localhost:7878/mcp` will not connect directly from ChatGPT. If you are self-hosting Meridian, put it behind a secure public URL or tunnel first.
