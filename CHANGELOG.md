@@ -6,6 +6,8 @@ All notable changes to Meridian. Generated from git history via `git-cliff`.
 
 ### Bug Fixes
 
+- Fix: isolate demo dashboard state ([b8a0dbc](https://github.com/meridianmcp/Meridian/commit/b8a0dbcefea08b8d155cc6f790f09c41ebcfd33f))
+- Fix: add backburner to all status Literal types in models.py and db.py — was causing 500 on any endpoint returning tasks ([48dd6f1](https://github.com/meridianmcp/Meridian/commit/48dd6f1ece3ca1297df6603a017a80fde10b8968))
 - Fix: encoding artifacts in terms.html and privacy.html ([04ca0ee](https://github.com/meridianmcp/Meridian/commit/04ca0eebeae2532a2ae80337575a154d7c421b0e))
 - Fix: GitHub OAuth — add github_sub column, fix upsert_tenant to use github_sub not google_sub ([cbdd056](https://github.com/meridianmcp/Meridian/commit/cbdd056605ad59f270d0d4fcbcd474c82e065f64))
 - Fix: exempt /mcp/tools-doc from site password gate so docs workflow fetches real content ([c537d1b](https://github.com/meridianmcp/Meridian/commit/c537d1b82fb39306f4c303b75dae9863dcaaff76))
@@ -19,6 +21,23 @@ All notable changes to Meridian. Generated from git history via `git-cliff`.
 - Fix: skip demo re-seeding when MERIDIAN_DEMO_DB_URL set (Postgres), fix version fallback to 1.0.0-beta ([c7cf3e8](https://github.com/meridianmcp/Meridian/commit/c7cf3e8716dab51d323fad0b81e6eeeb5da9fc2a))
 - Fix: add /__gate__ to demo write allowlist so site password gate works with demo cookie ([694e8c0](https://github.com/meridianmcp/Meridian/commit/694e8c06f628f5d52639df7b9850cb7a0795093e))
 
+### Chores
+
+- Chore: update CHANGELOG ([1fc5de2](https://github.com/meridianmcp/Meridian/commit/1fc5de26068cc588ef2222318b31915fb9a19758))
+- Chore: update CHANGELOG ([3c0b84f](https://github.com/meridianmcp/Meridian/commit/3c0b84fa9c5cb4b1c1c8047ae1217d52f1baf423))
+- Chore: update CHANGELOG ([904115b](https://github.com/meridianmcp/Meridian/commit/904115be4cbfcca941fbb707edfdd95852d64ccb))
+- Chore: update CHANGELOG ([fd0bba3](https://github.com/meridianmcp/Meridian/commit/fd0bba36925e21579210a8a641724005358eaf94))
+- Chore: add complete_sprint_item as mandatory rule in CLAUDE.md ([d950491](https://github.com/meridianmcp/Meridian/commit/d9504918b101d29de518c43405c91425e2deb932))
+- Chore: update CHANGELOG ([9a53038](https://github.com/meridianmcp/Meridian/commit/9a53038758ca1f009128f343c09f4ad2d1cda023))
+- Chore: update CHANGELOG ([3b07d80](https://github.com/meridianmcp/Meridian/commit/3b07d804c44a207f53c1d461b4f68e6716e589c4))
+- Chore: update CHANGELOG ([7e8e018](https://github.com/meridianmcp/Meridian/commit/7e8e0183df7e2e472e3b079789a8562c1971af45))
+- Chore: update CHANGELOG ([6278980](https://github.com/meridianmcp/Meridian/commit/627898090a19bf3d98f632136a7d67df1abf610d))
+- Chore: update CHANGELOG ([9f2e1aa](https://github.com/meridianmcp/Meridian/commit/9f2e1aafb43b90cb59867aa5ce01d7f90978a9fe))
+- Chore: update CHANGELOG ([2e81d7f](https://github.com/meridianmcp/Meridian/commit/2e81d7fa952bf73b9c300f1bdbcac309752ec0cf))
+- Chore: update CHANGELOG ([112bbd9](https://github.com/meridianmcp/Meridian/commit/112bbd9e2e3facc3731d22d49d10d17363f26bf2))
+- Chore: update CHANGELOG ([c08054b](https://github.com/meridianmcp/Meridian/commit/c08054b6b6a8bb2dca0385672dc4f7215b4957bc))
+- Chore: update CHANGELOG ([dac2909](https://github.com/meridianmcp/Meridian/commit/dac29096aef62194b260050d2a8a9d3a61cd4b94))
+
 ### Documentation
 
 - Docs: add CHANGELOG.md generated from git history ([72f0497](https://github.com/meridianmcp/Meridian/commit/72f0497fd1c8f4d738fa7352014788ffdb651e32))
@@ -27,6 +46,19 @@ All notable changes to Meridian. Generated from git history via `git-cliff`.
 
 ### Features
 
+- Feat: sprint fixes — generate_handoff dynamic /goal, claim_task depends_on enforcement, start_session stale release ([c2be8b6](https://github.com/meridianmcp/Meridian/commit/c2be8b659aea93ec7ba1c0a37233497d99cee389))
+- Feat: add Codex CLI to landing.html works-with list ([d44dd7b](https://github.com/meridianmcp/Meridian/commit/d44dd7b7f454b285232debf815b556a8939a4065))
+- Feat: Codex CLI MCP setup in Settings tab — STDIO/HTTP config blocks + /goal template with copy buttons ([3ac9bc5](https://github.com/meridianmcp/Meridian/commit/3ac9bc52321d3df7d63d9f779905f3211e772477))
+- Feat: dashboard fixes — swimlane legend, chart legends, NS auto-resize, task search UI, AI consolidation, demo cookie fix ([892ee83](https://github.com/meridianmcp/Meridian/commit/892ee8392963bd5b9a41c6a74d81bd5daecea306))
+- Feat: add open_pg_connection to pg_adapter for standalone scripts ([f605df7](https://github.com/meridianmcp/Meridian/commit/f605df71fd84f9a475b48dda61a5df5dc8eec791))
+- Feat: handoff v3 — sign-in/up copy, alpha bump, pg v28 migration, waitlist gate ([3ec4ca9](https://github.com/meridianmcp/Meridian/commit/3ec4ca994771132f14acddd9b67bf9a9c737fe38))
+- Feat: waitlist landing swap, search_tasks MCP tool, auto_capture, pg_trgm ([886261a](https://github.com/meridianmcp/Meridian/commit/886261a84582331e1fdaf953274ea7472057f59a))
+- Feat: replace hex logo with compass SVG across dashboard and landing ([27f64fb](https://github.com/meridianmcp/Meridian/commit/27f64fbe1e29fc28d9db935bf72734de0994c1bb))
+- Feat: copy preview modal + goal field hints (Task 6 + 7) ([c621485](https://github.com/meridianmcp/Meridian/commit/c6214852e89c7455d32f72fb16678da368d8cbd9))
+- Feat: onboarding page, session presence indicators, grouped session tree ([f8ff688](https://github.com/meridianmcp/Meridian/commit/f8ff68865d7d98924791780cb3dbe86c02161cea))
+- Feat: client_type tracking, implicit heartbeat on tool calls, onboarding template ([38ee85b](https://github.com/meridianmcp/Meridian/commit/38ee85becad095a4954f0b724b1daf1df9e46f08))
+- Feat: admins DB table + is_admin_db() + MCP config placeholder ([f4429a6](https://github.com/meridianmcp/Meridian/commit/f4429a66e126ffa54a7756fa7beef188ebfeb14c))
+- Feat: async _db() with per-tenant Neon DB routing in hosted mode ([0dcf28f](https://github.com/meridianmcp/Meridian/commit/0dcf28f5b8e8a61b18d4406f969bc6a418a42a3e))
 - Feat: overage billing — Neon consumption polling + Stripe meter + throttle ([64a102f](https://github.com/meridianmcp/Meridian/commit/64a102f03226eabe237f15117c4af8ba34e8a535))
 - Feat: dunning flow — payment failure emails + day-15 hard delete (Task 2) ([3d6cb6a](https://github.com/meridianmcp/Meridian/commit/3d6cb6a34a7690db69ff6f075e64e169917bc2b2))
 - Feat: user self-delete + GDPR data export (Task 3) ([dd1bf3d](https://github.com/meridianmcp/Meridian/commit/dd1bf3d1914327c95c0adc701962d836ff96b57c))
@@ -38,12 +70,42 @@ All notable changes to Meridian. Generated from git history via `git-cliff`.
 
 ### Infrastructure
 
+- Infra: use pixi run git-cliff in changelog CI step ([82d5396](https://github.com/meridianmcp/Meridian/commit/82d5396d2aadcd51a96a0a1d0055416f80c3e536))
+- Infra: add git-cliff to pixi deps, regenerate CHANGELOG.md ([0924a7d](https://github.com/meridianmcp/Meridian/commit/0924a7d47c9054cd550e69a45e03d914c8f26cdb))
 - Infra: lower concurrency to 25 soft/30 hard per machine for safety ([8c25db9](https://github.com/meridianmcp/Meridian/commit/8c25db9f6d3d2a40653145d3b1f7c4a9bd06a40e))
 - Infra: 50 req/machine soft limit, max 40 machines (~2000 concurrent capacity) ([e18de18](https://github.com/meridianmcp/Meridian/commit/e18de18d22ef93370b9073352833421c514b5104))
 - Infra: scale to 200/250 concurrent requests per machine, supports 1-2k concurrent users ([b44bf66](https://github.com/meridianmcp/Meridian/commit/b44bf6603dd9b10c6d23dc94556db62b59253fef))
 - Infra: autoscale min=1 always warm, soft_limit=40 requests triggers new machine ([0354c5d](https://github.com/meridianmcp/Meridian/commit/0354c5d9dd950492f56b543bc992e30a1bdc8831))
 - Ci: trigger deploy to verify FLY_API_TOKEN secret ([617cf1d](https://github.com/meridianmcp/Meridian/commit/617cf1d231159ab8ad14945dc97b85dac51bcbae))
 - Ci: auto-tag every deploy with version + timestamp ([5d1acfb](https://github.com/meridianmcp/Meridian/commit/5d1acfb07b58d612235934ce5c7ee3284ba09821))
+
+### Other
+
+- Merge branch 'dev' ([599929a](https://github.com/meridianmcp/Meridian/commit/599929a85e07303f95e7b86f4d5ccd51d703c025))
+- Merge branch 'main' of https://github.com/meridianmcp/Meridian ([619d8c8](https://github.com/meridianmcp/Meridian/commit/619d8c8ec772207352a99af77919aab8f5f87e3d))
+- Merge branch 'dev' ([2ea2bd6](https://github.com/meridianmcp/Meridian/commit/2ea2bd6ff5a5aa148ffafec378bb3b9e656fecf2))
+- Merge remote-tracking branch 'origin/main' ([718fe46](https://github.com/meridianmcp/Meridian/commit/718fe469a93401ea88e1a91a351f431f4fcdc6b7))
+- Merge branch 'dev' ([92bcc0f](https://github.com/meridianmcp/Meridian/commit/92bcc0fe459c6bf910845e2d8b7387b7938433ff))
+- Merge branch 'main' of https://github.com/meridianmcp/Meridian ([24179cb](https://github.com/meridianmcp/Meridian/commit/24179cb3f6b0afd93e83b1fe9c74b755e2a32ee4))
+- Merge branch 'dev' ([e817e60](https://github.com/meridianmcp/Meridian/commit/e817e604ea224abed8c15263c8865d7e9dceab64))
+- Merge branch 'main' of https://github.com/meridianmcp/Meridian ([f4f7a3c](https://github.com/meridianmcp/Meridian/commit/f4f7a3ca3325b522aa2ce39daba6849e5cfd9dd2))
+- Merge branch 'dev' ([587a604](https://github.com/meridianmcp/Meridian/commit/587a604784b4a267863a2fddbd971a90da1fe804))
+- Merge branch 'dev' ([4cd9784](https://github.com/meridianmcp/Meridian/commit/4cd97847d00de49719c92fc8fd7b4aadbace7829))
+- Merge branch 'main' of https://github.com/meridianmcp/Meridian ([08b0ab0](https://github.com/meridianmcp/Meridian/commit/08b0ab021b0033cc817eb12e18879da0f6a2be9d))
+- Merge branch 'dev' ([1fd2565](https://github.com/meridianmcp/Meridian/commit/1fd256569d4638ffbaa6a945f801fdd0d92a1881))
+- Merge branch 'main' of https://github.com/meridianmcp/Meridian ([b182b0d](https://github.com/meridianmcp/Meridian/commit/b182b0dee9db22a9ae1f8dc94bd0a3f8c3fb4d5c))
+- Merge branch 'dev' ([c007e0f](https://github.com/meridianmcp/Meridian/commit/c007e0f5b0c052d55dbddfa65da0bdd4bfd686f6))
+- Merge branch 'dev' ([324868a](https://github.com/meridianmcp/Meridian/commit/324868a5672296a3d26f624cd9e4018d9d325668))
+- Merge branch 'main' of https://github.com/meridianmcp/Meridian ([c1b1de1](https://github.com/meridianmcp/Meridian/commit/c1b1de1434420fbcf1ccad22c17fc7978174961d))
+- Merge branch 'dev' ([897100f](https://github.com/meridianmcp/Meridian/commit/897100f817a1e3db9fd161e871eb57d3dc405460))
+- Merge branch 'dev' ([d324012](https://github.com/meridianmcp/Meridian/commit/d3240125025cc481b3f3e23c1dbf363eb4a493f7))
+- Merge branch 'dev' ([67d55f7](https://github.com/meridianmcp/Meridian/commit/67d55f734fce8a9cf0578524fcbb56936f159054))
+- Merge branch 'dev' ([be1da95](https://github.com/meridianmcp/Meridian/commit/be1da956777098e2f90b477b7eaf9b7fc246d59a))
+- Merge branch 'main' of https://github.com/meridianmcp/Meridian ([2607d70](https://github.com/meridianmcp/Meridian/commit/2607d708f8b824ca4422854bb3f6aaea92bd185e))
+- Merge branch 'dev' ([a86be8a](https://github.com/meridianmcp/Meridian/commit/a86be8ac1b3c081fda13993a57263d52b3d9f945))
+- Merge branch 'dev' ([34c9fe0](https://github.com/meridianmcp/Meridian/commit/34c9fe077bac4d2c10f80e3ce1a5d694db1fa3c0))
+- Merge: take dev CHANGELOG ([1dc3c78](https://github.com/meridianmcp/Meridian/commit/1dc3c78503abd8f0c7f864057de23ea5442a174c))
+- Merge branch 'main' of https://github.com/meridianmcp/Meridian ([9a27f15](https://github.com/meridianmcp/Meridian/commit/9a27f1523e23d918b06109815525e4d978c5254e))
 ## [1.0.0-beta] — 2026-05-25
 
 ### Bug Fixes

@@ -26,6 +26,24 @@ jobs:
           name: meridian-windows
           path: dist/meridian.exe
 
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: prefix-dev/setup-pixi@v0.8.1
+        with:
+          pixi-version: latest
+          cache: false
+      - name: Build Linux executable
+        run: pixi run build-exe
+      - name: Stage artifact
+        run: cp dist/meridian dist/meridian-linux
+      - name: Upload Linux artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: meridian-linux
+          path: dist/meridian-linux
+
   build-mac-arm64:
     runs-on: macos-14
     steps:
@@ -44,26 +62,8 @@ jobs:
           name: meridian-mac-arm64
           path: dist/meridian-mac-arm64
 
-  build-mac-x86:
-    runs-on: macos-13
-    steps:
-      - uses: actions/checkout@v4
-      - uses: prefix-dev/setup-pixi@v0.8.1
-        with:
-          pixi-version: latest
-          cache: false
-      - name: Build macOS x86 executable
-        run: pixi run build-exe
-      - name: Stage artifact
-        run: cp dist/meridian dist/meridian-mac-x86
-      - name: Upload macOS x86 artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: meridian-mac-x86
-          path: dist/meridian-mac-x86
-
   release:
-    needs: [build-windows, build-mac-arm64, build-mac-x86]
+    needs: [build-windows, build-linux, build-mac-arm64]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -78,6 +78,6 @@ jobs:
         with:
           files: |
             dist-artifacts/meridian-windows/meridian.exe
+            dist-artifacts/meridian-linux/meridian-linux
             dist-artifacts/meridian-mac-arm64/meridian-mac-arm64
-            dist-artifacts/meridian-mac-x86/meridian-mac-x86
           generate_release_notes: true

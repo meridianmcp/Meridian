@@ -30,7 +30,10 @@
 <button id="sidebar-toggle" title="Toggle sidebar" onclick="document.querySelector('.sidebar').classList.toggle('mobile-open')">☰</button>
 <div class="app">
   <aside class="sidebar">
-    <div class="sidebar-header">MERIDIAN<small id="server-version">v...</small></div>
+    <a href="https://usemeridian.us" target="_blank" rel="noopener" class="sidebar-header" title="usemeridian.us" style="text-decoration:none;display:flex;align-items:center;gap:8px">
+      <img src="/static/logo.svg" alt="Meridian" style="height:18px;width:18px;flex-shrink:0">
+      MERIDIAN<small id="server-version">v...</small>
+    </a>
     <div id="mcp-hint" style="display:none;margin:6px 10px 0;padding:5px 10px;background:rgba(108,143,255,0.07);border:1px solid rgba(108,143,255,0.2);border-radius:4px;color:var(--muted);font-size:10px">Connect via MCP → Settings for your config</div>
     <div id="auth-method" style="margin:6px 10px 0;padding:5px 10px;background:rgba(0,212,170,0.08);border:1px solid rgba(0,212,170,0.25);border-radius:4px;color:var(--accent-green);font-size:10px;display:none"></div>
     <button id="workspace-entry" type="button" title="Open workspace settings" style="margin:8px 8px 6px;padding:8px 10px;border:1px solid var(--border);border-radius:4px;background:var(--surface-2);color:var(--text);font-family:'IBM Plex Mono',monospace;font-size:11px;cursor:pointer;display:flex;justify-content:space-between;align-items:center">Workspace <span style="color:var(--muted)">settings</span></button>
