@@ -149,6 +149,7 @@ CREATE TABLE IF NOT EXISTS projects (
     decisions TEXT,
     max_pinned_decisions INTEGER NOT NULL DEFAULT 20,
     executor_config TEXT,
+    hitl_auto_answer INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -459,6 +460,17 @@ CREATE INDEX IF NOT EXISTS idx_workspace_notes_created
     ON workspace_notes(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_workspace_decisions_status
     ON workspace_decisions(status, created_at DESC);
+
+-- v3.4 — workspace-level settings: tenant-global defaults that every project
+-- session can read at startup (e.g. a default HITL auto-answer posture, a
+-- default sprint label). Singleton row (id='singleton') per workspace DB, same
+-- one-workspace-per-DB model as workspace_notes / workspace_decisions.
+CREATE TABLE IF NOT EXISTS workspace_settings (
+    id TEXT PRIMARY KEY DEFAULT 'singleton',
+    hitl_auto_answer_default INTEGER NOT NULL DEFAULT 0,
+    sprint_name_default TEXT,
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
 """
 
 
@@ -728,6 +740,29 @@ async def _migrate_v33_hitl_kind_payload(db: aiosqlite.Connection) -> None:
         db, "hitl_requests", "kind", "TEXT NOT NULL DEFAULT 'question'"
     )
     await _migrate_add_column_if_missing(db, "hitl_requests", "payload", "TEXT")
+
+
+async def _migrate_v34_hitl_auto_answer(db: aiosqlite.Connection) -> None:
+    """v3.4 — projects.hitl_auto_answer: when on, request_hitl auto-resolves
+    immediately (first option, answered_by='auto') so trusted projects never
+    block on the HITL queue. Auto-answered rows stay in the queue for audit."""
+    await _migrate_add_column_if_missing(
+        db, "projects", "hitl_auto_answer", "INTEGER NOT NULL DEFAULT 0"
+    )
+
+
+async def _migrate_v34_workspace_settings(db: aiosqlite.Connection) -> None:
+    """v3.4 — workspace_settings singleton table (tenant-global defaults).
+    CREATE_TABLES covers fresh DBs; this is the upgrade path for existing ones."""
+    await db.executescript(
+        "CREATE TABLE IF NOT EXISTS workspace_settings ("
+        "    id TEXT PRIMARY KEY DEFAULT 'singleton',"
+        "    hitl_auto_answer_default INTEGER NOT NULL DEFAULT 0,"
+        "    sprint_name_default TEXT,"
+        "    updated_at TEXT NOT NULL DEFAULT (datetime('now'))"
+        ");"
+    )
+    await db.commit()
 
 
 async def _migrate_dunning_fields(db: aiosqlite.Connection) -> None:
@@ -1526,6 +1561,8 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_workspace_layer(db)
     await _migrate_checkpoint_data(db)
     await _migrate_v33_hitl_kind_payload(db)
+    await _migrate_v34_hitl_auto_answer(db)
+    await _migrate_v34_workspace_settings(db)
     return db
 
 
@@ -1630,7 +1667,8 @@ async def get_project_settings(
 ) -> dict[str, Any] | None:
     """Return the persisted settings for a project."""
     async with db.execute(
-        "SELECT id, max_pinned_decisions, executor_config FROM projects WHERE id = ?",
+        "SELECT id, max_pinned_decisions, executor_config, hitl_auto_answer "
+        "FROM projects WHERE id = ?",
         (project_id,),
     ) as cur:
         row = await cur.fetchone()
@@ -1646,6 +1684,7 @@ async def get_project_settings(
         "project_id": data["id"],
         "max_pinned_decisions": int(data.get("max_pinned_decisions") or 20),
         "executor_config": executor_config,
+        "hitl_auto_answer": bool(data.get("hitl_auto_answer")),
     }
 
 
@@ -1655,6 +1694,7 @@ async def update_project_settings(
     *,
     max_pinned_decisions: int | None = None,
     executor_config: dict[str, Any] | None = None,
+    hitl_auto_answer: bool | None = None,
 ) -> dict[str, Any] | None:
     """Persist project settings and return the updated values."""
     project = await get_project(db, project_id)
@@ -1668,6 +1708,9 @@ async def update_project_settings(
     if executor_config is not None:
         updates.append("executor_config = ?")
         params.append(json.dumps(executor_config))
+    if hitl_auto_answer is not None:
+        updates.append("hitl_auto_answer = ?")
+        params.append(1 if hitl_auto_answer else 0)
     if updates:
         params.append(project_id)
         await db.execute(
@@ -1736,7 +1779,7 @@ async def delete_project(db: aiosqlite.Connection, project_id: str) -> None:
     Raises ``ValueError`` if any tasks are currently ``in_progress`` so
     callers can surface a warning before proceeding.  The delete is
     unconditional for all other data (goal_states, sessions, task_log,
-    sprint_items, chat sessions/messages).
+    sprint_items).
     """
     async with db.execute(
         "SELECT COUNT(*) as cnt FROM task_log "
@@ -1749,14 +1792,7 @@ async def delete_project(db: aiosqlite.Connection, project_id: str) -> None:
         raise ValueError(f"{count} task(s) in_progress — complete or cancel first")
 
     # Cascade delete child rows first, then the project itself.
-    # chat_messages has no project_id — delete via chat_sessions FK.
     for stmt, params in [
-        (
-            "DELETE FROM chat_messages WHERE session_id IN "
-            "(SELECT id FROM chat_sessions WHERE project_id = ?)",
-            (project_id,),
-        ),
-        ("DELETE FROM chat_sessions WHERE project_id = ?", (project_id,)),
         ("DELETE FROM sprint_items WHERE project_id = ?", (project_id,)),
         ("DELETE FROM task_log WHERE project_id = ?", (project_id,)),
         ("DELETE FROM sessions WHERE project_id = ?", (project_id,)),
@@ -3088,92 +3124,6 @@ async def get_claimable_tasks(
         "SELECT * FROM task_log WHERE project_id = ? "
         "AND status = 'pending' AND claimed_by IS NULL "
         "ORDER BY created_at ASC, rowid ASC LIMIT ?",
-        (project_id, limit),
-    ) as cur:
-        rows = await cur.fetchall()
-    return [_row_to_dict(r) for r in rows]  # type: ignore[misc]
-
-
-# ---------------------------------------------------------------------------
-# Chat persistence (v0.3.0)
-# ---------------------------------------------------------------------------
-
-
-async def get_or_create_chat_session(
-    db: aiosqlite.Connection, project_id: str
-) -> dict[str, Any]:
-    """Return the existing chat session for a project, or create one.
-
-    Each project has at most one active chat session row; subsequent calls
-    return the same row. The ``cli_session_id`` column is populated later
-    by :func:`update_chat_session_cli_id` once the CLI emits its session
-    handle.
-    """
-    async with db.execute(
-        "SELECT * FROM chat_sessions WHERE project_id = ? "
-        "ORDER BY created_at DESC LIMIT 1",
-        (project_id,),
-    ) as cur:
-        row = await cur.fetchone()
-    if row is not None:
-        result = _row_to_dict(row)
-        assert result is not None
-        return result
-    sid = _new_id()
-    await db.execute(
-        "INSERT INTO chat_sessions (id, project_id) VALUES (?, ?)",
-        (sid, project_id),
-    )
-    await db.commit()
-    async with db.execute(
-        "SELECT * FROM chat_sessions WHERE id = ?", (sid,)
-    ) as cur:
-        row = await cur.fetchone()
-    result = _row_to_dict(row)
-    assert result is not None
-    return result
-
-
-async def update_chat_session_cli_id(
-    db: aiosqlite.Connection, project_id: str, cli_session_id: str
-) -> None:
-    """Store the claude CLI session ID so the next message can ``--resume``."""
-    await db.execute(
-        "UPDATE chat_sessions SET cli_session_id = ? WHERE project_id = ?",
-        (cli_session_id, project_id),
-    )
-    await db.commit()
-
-
-async def save_chat_message(
-    db: aiosqlite.Connection, project_id: str, role: str, content: str
-) -> dict[str, Any]:
-    """Persist one chat turn (user or assistant) for a project."""
-    if role not in {"user", "assistant"}:
-        raise ValueError(f"invalid chat message role: {role!r}")
-    mid = _new_id()
-    await db.execute(
-        "INSERT INTO chat_messages (id, project_id, role, content) "
-        "VALUES (?, ?, ?, ?)",
-        (mid, project_id, role, content),
-    )
-    await db.commit()
-    async with db.execute(
-        "SELECT * FROM chat_messages WHERE id = ?", (mid,)
-    ) as cur:
-        row = await cur.fetchone()
-    result = _row_to_dict(row)
-    assert result is not None
-    return result
-
-
-async def get_chat_history(
-    db: aiosqlite.Connection, project_id: str, limit: int = 50
-) -> list[dict[str, Any]]:
-    """Return chat messages for a project in chronological order (oldest first)."""
-    async with db.execute(
-        "SELECT * FROM chat_messages WHERE project_id = ? "
-        "ORDER BY created_at DESC, rowid DESC LIMIT ?",
         (project_id, limit),
     ) as cur:
         rows = await cur.fetchall()
@@ -5100,7 +5050,46 @@ async def request_hitl(
          kind, payload),
     )
     await db.commit()
+    # v3.4 — per-project auto-answer. When the project trusts the agent, a
+    # plain question is resolved immediately (first option / generic ack) so the
+    # session never blocks. md_section_update diffs stay human-gated — auto
+    # approving a file write would defeat the diff-approval safeguard. The row
+    # stays in the queue (status='answered', answered_by='auto') for audit.
+    if kind == "question" and await _project_hitl_auto_answer(db, project_id):
+        auto = _auto_hitl_answer(payload)
+        answered = await answer_hitl_request(db, hid, auto, answered_by="auto")
+        if answered is not None:
+            return answered
     return (await get_hitl_request(db, hid)) or {"id": hid}
+
+
+async def _project_hitl_auto_answer(
+    db: aiosqlite.Connection, project_id: str
+) -> bool:
+    """True when the project has the per-project HITL auto-answer toggle on."""
+    async with db.execute(
+        "SELECT hitl_auto_answer FROM projects WHERE id = ?", (project_id,)
+    ) as cur:
+        row = await cur.fetchone()
+    if row is None:
+        return False
+    data = _row_to_dict(row) or {}
+    return bool(data.get("hitl_auto_answer"))
+
+
+def _auto_hitl_answer(payload: str | None) -> str:
+    """Derive the auto-answer string. v1 heuristic: if the payload carries a
+    non-empty ``options`` list, pick the first option; otherwise a generic ack."""
+    if payload:
+        try:
+            parsed = json.loads(payload)
+        except (TypeError, ValueError):
+            parsed = None
+        if isinstance(parsed, dict):
+            options = parsed.get("options")
+            if isinstance(options, list) and options:
+                return str(options[0])
+    return "[auto-answered]"
 
 
 async def get_hitl_request(
@@ -5660,6 +5649,68 @@ async def delete_workspace_decision(
         rc = cur.rowcount or 0
     await db.commit()
     return rc > 0
+
+
+_WORKSPACE_SETTINGS_ID = "singleton"
+
+
+async def get_workspace_settings(db: aiosqlite.Connection) -> dict[str, Any]:
+    """Return the workspace-level settings (tenant-global defaults).
+
+    Always returns a dict — defaults when no row has been written yet — so
+    callers never have to None-check. One singleton row per workspace DB.
+    """
+    async with db.execute(
+        "SELECT hitl_auto_answer_default, sprint_name_default, updated_at "
+        "FROM workspace_settings WHERE id = ?",
+        (_WORKSPACE_SETTINGS_ID,),
+    ) as cur:
+        row = await cur.fetchone()
+    data = _row_to_dict(row) or {}
+    return {
+        "hitl_auto_answer_default": bool(data.get("hitl_auto_answer_default")),
+        "sprint_name_default": data.get("sprint_name_default"),
+        "updated_at": data.get("updated_at"),
+    }
+
+
+async def update_workspace_settings(
+    db: aiosqlite.Connection,
+    *,
+    hitl_auto_answer_default: bool | None = None,
+    sprint_name_default: str | None = None,
+) -> dict[str, Any]:
+    """Upsert the workspace settings singleton and return the new values.
+
+    Only the fields passed (non-None) are changed. ``sprint_name_default=""``
+    explicitly clears the label.
+    """
+    # Ensure the singleton row exists before updating individual fields.
+    await db.execute(
+        "INSERT INTO workspace_settings (id) VALUES (?) "
+        "ON CONFLICT(id) DO NOTHING",
+        (_WORKSPACE_SETTINGS_ID,),
+    )
+    updates: list[str] = []
+    params: list[Any] = []
+    if hitl_auto_answer_default is not None:
+        updates.append("hitl_auto_answer_default = ?")
+        params.append(1 if hitl_auto_answer_default else 0)
+    if sprint_name_default is not None:
+        updates.append("sprint_name_default = ?")
+        params.append(sprint_name_default or None)
+    if updates:
+        from datetime import datetime, timezone
+        now_ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        updates.append("updated_at = ?")
+        params.append(now_ts)
+        params.append(_WORKSPACE_SETTINGS_ID)
+        await db.execute(
+            f"UPDATE workspace_settings SET {', '.join(updates)} WHERE id = ?",
+            tuple(params),
+        )
+    await db.commit()
+    return await get_workspace_settings(db)
 
 
 # ---------------------------------------------------------------------------

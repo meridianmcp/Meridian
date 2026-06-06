@@ -87,8 +87,6 @@ from . import toml_config as toml_config_module
 from . import md_anchors as md_anchors_module
 from . import git_md as git_md_module
 from .models import (
-    ChatHistoryItem,
-    ChatRequest,
     ClaimTaskRequest,
     ClaimTaskResponse,
     EnqueueTask,
@@ -536,6 +534,9 @@ async def lifespan(app: FastAPI):
             Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         db = await db_module.init_db(db_path)
     app.state.db = db
+    # True when the main DB is a remote/Postgres backend (env URL or toml conn).
+    # The demo DB resolver fails closed against this so /demo never serves real data.
+    app.state.db_is_remote = bool(db_url)
     app.state.data_dir = str(data_dir)
     app.state.ws_broadcaster = dashboard_module.WebSocketBroadcaster()
     await _hydrate_oauth_cache(db)
@@ -765,6 +766,7 @@ from .routes.tasks import router as _tasks_router            # noqa: E402
 from .routes.decisions import router as _decisions_router    # noqa: E402
 from .routes.handoff import router as _handoff_router        # noqa: E402
 from .routes.admin import router as _admin_router            # noqa: E402
+from .routes.workspace import router as _workspace_router    # noqa: E402
 
 app.include_router(_notes_router)
 app.include_router(_hitl_router)
@@ -774,6 +776,7 @@ app.include_router(_tasks_router)
 app.include_router(_decisions_router)
 app.include_router(_handoff_router)
 app.include_router(_admin_router)
+app.include_router(_workspace_router)
 
 # ---------------------------------------------------------------------------
 # Password gate middleware
@@ -1199,7 +1202,7 @@ async def auth_magic_verify(request: Request, token: str = ""):
 
 
 @app.get("/config")
-async def server_config() -> dict[str, Any]:
+async def server_config(request: Request) -> dict[str, Any]:
     """v0.6.5 — expose runtime configuration to the dashboard.
 
     Allows the frontend to be location-agnostic: it reads the server URL
@@ -1220,6 +1223,25 @@ async def server_config() -> dict[str, Any]:
     port = int(os.environ.get("MERIDIAN_PORT", "7878"))
     default_url = f"http://{host}:{port}"
     server_url = os.environ.get("MERIDIAN_SERVER_URL", default_url)
+    # Demo requests reflect the cookie, not just the env flag — otherwise a /demo
+    # visitor on a self-host gets the real connection switcher + project list
+    # (split-brain). When in demo mode, never expose the host's connection config.
+    is_demo = _is_demo_request(request)
+    if is_demo:
+        return {
+            "server_url": server_url,
+            "host": host,
+            "port": port,
+            "version": _VERSION,
+            "db": "demo",
+            "db_host": "",
+            "toml_exists": False,
+            "toml_path": "",
+            "connection_name": "demo",
+            "connections": [],
+            "demo_mode": True,
+            "stripe_payment_link": os.environ.get("STRIPE_PAYMENT_LINK", "/pricing"),
+        }
     _, conn_name = toml_config_module.get_active_db_url()
     # Parse hostname from MERIDIAN_DB_URL for the connection label (1f92d344)
     import re as _re_cfg
@@ -1246,7 +1268,7 @@ async def server_config() -> dict[str, Any]:
         "toml_path": str(toml_config_module._toml_path() or (Path.cwd() / "meridian.toml")),
         "connection_name": conn_name,
         "connections": toml_config_module.list_connections(),
-        "demo_mode": os.environ.get("MERIDIAN_DEMO", "").lower() in ("1", "true", "yes"),
+        "demo_mode": False,
         "stripe_payment_link": os.environ.get("STRIPE_PAYMENT_LINK", "/pricing"),
     }
 
@@ -1384,6 +1406,7 @@ async def patch_project_settings(
         project_id,
         max_pinned_decisions=body.max_pinned_decisions,
         executor_config=executor_config_dict,
+        hitl_auto_answer=body.hitl_auto_answer,
     )
     if settings is None:
         raise HTTPException(status_code=404, detail="project not found")
@@ -2195,33 +2218,6 @@ async def get_sessions(
 # /tasks POST + PATCH → meridian/routes/tasks.py
 
 
-@app.delete("/projects/{project_id}/chat/history", status_code=204)
-async def clear_chat_history(project_id: str, request: Request) -> None:
-    """Delete all chat messages and session for a project."""
-    database = await _db(request)
-    await database.execute("DELETE FROM chat_messages WHERE project_id = ?", (project_id,))
-    await database.execute("DELETE FROM chat_sessions WHERE project_id = ?", (project_id,))
-    await database.commit()
-
-
-@app.get(
-    "/projects/{project_id}/chat/history",
-    response_model=list[ChatHistoryItem],
-)
-async def get_chat_history(
-    project_id: str, request: Request, limit: int = 50
-) -> list[dict[str, Any]]:
-    """Return persisted chat messages for a project (oldest first).
-
-    The dashboard calls this on tab open to restore conversation history
-    across page refreshes. Returns an empty list when no messages exist yet.
-    """
-    project = await db_module.get_project(await _db(request), project_id)
-    if project is None:
-        raise HTTPException(status_code=404, detail="project not found")
-    return await db_module.get_chat_history(await _db(request), project_id, limit=limit)
-
-
 @app.get("/projects/{project_id}/export/pdf")
 async def export_project_pdf(project_id: str, request: Request):
     """Generate a tamper-evident IP attribution PDF for the project.
@@ -2430,90 +2426,6 @@ async def api_key_status() -> dict:
     _, method = dashboard_module.get_auth_token()
     return {"configured": method is not None, "method": method}
 
-
-@app.post("/dashboard/chat")
-async def dashboard_chat(body: ChatRequest, request: Request):
-    """Proxy a streaming Claude chat call as Server-Sent Events.
-
-    The default backend (``mode="cli"``) spawns the ``claude`` CLI
-    binary so the conversation draws from the user's Max-plan
-    allowance via the OAuth token already on disk. Set ``mode="api"``
-    in the request body to use the metered Anthropic API directly.
-
-    Each text chunk is forwarded as a ``data: {"delta": "..."}`` line;
-    the stream terminates with ``data: [DONE]``.
-
-    Persistence: the user message is saved to ``chat_messages`` before
-    streaming begins; the complete assistant reply is appended after the
-    stream finishes. A ``chat_sessions`` row is created on first use so
-    future CLI ``--resume`` support has a home for the session handle.
-    """
-    project = await db_module.get_project(await _db(request), body.project_id)
-    if project is None:
-        raise HTTPException(status_code=404, detail="project not found")
-
-    messages = [m.model_dump() for m in body.messages]
-    # Inject model identity into system prompt so the model knows its version
-    model_hint = f"You are {body.model} running in the Meridian dashboard."
-    if body.system_prompt:
-        body = body.model_copy(update={"system_prompt": model_hint + "\n\n" + body.system_prompt})
-    else:
-        body = body.model_copy(update={"system_prompt": model_hint})
-    db = await _db(request)
-    project_id = body.project_id
-
-    # Persist the user's message and ensure a chat session exists.
-    if messages and messages[-1].get("role") == "user":
-        await db_module.save_chat_message(db, project_id, "user", messages[-1]["content"])
-    chat_session = await db_module.get_or_create_chat_session(db, project_id)
-
-    # Select the streaming backend.
-    if body.mode == "cli":
-        # v0.4.1 — if the CLI session id is known from a previous turn
-        # pass it as --resume so the conversation continues; capture
-        # whatever id the CLI emits on this turn for the next one.
-        resume_id = chat_session.get("cli_session_id") if chat_session else None
-
-        async def _save_session_id(new_id: str) -> None:
-            await db_module.update_chat_session_cli_id(db, project_id, new_id)
-
-        raw_stream = dashboard_module.stream_claude_cli_chat(
-            messages=messages,
-            system_prompt=body.system_prompt,
-            model=body.model,
-            max_tokens=body.max_tokens,
-            resume_session_id=resume_id,
-            on_session_id=_save_session_id,
-        )
-    else:
-        raw_stream = dashboard_module.stream_anthropic_chat(
-            messages=messages,
-            system_prompt=body.system_prompt,
-            model=body.model,
-            max_tokens=body.max_tokens,
-        )
-
-    async def _saving_stream():
-        """Yield every SSE chunk and save the full assistant reply at the end."""
-        acc: list[str] = []
-        async for chunk in raw_stream:
-            yield chunk
-            # Each chunk is one complete SSE event: b"data: {...}\n\n" or b"data: [DONE]\n\n"
-            if chunk != b"data: [DONE]\n\n" and chunk.startswith(b"data: "):
-                try:
-                    payload = json.loads(chunk[6:].decode("utf-8").strip())
-                    if "delta" in payload:
-                        acc.append(payload["delta"])
-                except Exception:  # noqa: BLE001
-                    pass
-        full_text = "".join(acc).strip()
-        if full_text:
-            try:
-                await db_module.save_chat_message(db, project_id, "assistant", full_text)
-            except Exception:  # noqa: BLE001
-                pass
-
-    return StreamingResponse(_saving_stream(), media_type="text/event-stream")
 
 
 # ---------------------------------------------------------------------------
@@ -4378,6 +4290,16 @@ async def _start_session_composite(
     # v2.3 — every cold session reads the coordination protocol on entry.
     meridian_instructions = _load_meridian_md()
 
+    # v3.4 — inject workspace-level decisions + notes so a cold executor sees
+    # tenant-global conventions on entry without a separate get_context_block
+    # round-trip. Same source + renderer as get_context_block.
+    try:
+        ws_decisions = await db_module.get_workspace_decisions(db)
+        ws_notes = await db_module.get_workspace_notes(db)
+        workspace_context = _render_workspace_block(ws_decisions, ws_notes)
+    except Exception:
+        workspace_context = ""
+
     # v3.1 — executor sessions get their project-level config injected so they
     # can use repo_path, test_cmd, etc. without manual lookup.
     executor_config: dict[str, Any] | None = None
@@ -4404,6 +4326,7 @@ async def _start_session_composite(
         "handoff_path": handoff_path_str,
         "files": list(_EDITABLE_FILES),
         "meridian_instructions": meridian_instructions,  # v2.3
+        "workspace_context": workspace_context,  # v3.4 — tenant-global block
     }
     if executor_config is not None:
         payload["executor_config"] = executor_config
@@ -5505,18 +5428,20 @@ async def _dispatch_mcp_tool(
             urgency=args.get("urgency", "normal"),
             assigned_to=args.get("assigned_to"),
         )
-        # Notify via configured notify_url — best-effort, non-blocking
-        _hitl_urgency = args.get("urgency", "normal").upper()
-        _hitl_q = args["question"][:200]
-        _hitl_base = os.environ.get("MERIDIAN_BASE_URL", "https://usemeridian.us").rstrip("/")
-        await _maybe_notify(
-            db, args["project_id"],
-            f"Action needed ({_hitl_urgency})",
-            f"{_hitl_q}\n\nAnswer at: {_hitl_base}/dashboard",
-            event="hitl",
-            tenant=tenant,
-            pref_key="hitl",
-        )
+        # v3.4 — auto-answered requests need no human; skip the notification.
+        if result.get("answered_by") != "auto":
+            # Notify via configured notify_url — best-effort, non-blocking
+            _hitl_urgency = args.get("urgency", "normal").upper()
+            _hitl_q = args["question"][:200]
+            _hitl_base = os.environ.get("MERIDIAN_BASE_URL", "https://usemeridian.us").rstrip("/")
+            await _maybe_notify(
+                db, args["project_id"],
+                f"Action needed ({_hitl_urgency})",
+                f"{_hitl_q}\n\nAnswer at: {_hitl_base}/dashboard",
+                event="hitl",
+                tenant=tenant,
+                pref_key="hitl",
+            )
         return result
     if name == "get_hitl_request":
         result = await db_module.get_hitl_request(db, args["request_id"])
@@ -5553,6 +5478,14 @@ async def _dispatch_mcp_tool(
     if name == "get_workspace_decisions":
         return await db_module.get_workspace_decisions(
             db, include_superseded=args.get("include_superseded", False),
+        )
+    if name == "get_workspace_settings":
+        return await db_module.get_workspace_settings(db)
+    if name == "update_workspace_settings":
+        return await db_module.update_workspace_settings(
+            db,
+            hitl_auto_answer_default=args.get("hitl_auto_answer_default"),
+            sprint_name_default=args.get("sprint_name_default"),
         )
     if name == "get_context_block":
         # v2.3 — assemble the same shape as /projects/{id}/context-block but

@@ -33,6 +33,8 @@ _TOOL_EXAMPLES: dict[str, str] = {
     "get_workspace_notes": 'get_workspace_notes(tag="setup")',
     "pin_workspace_decision": 'pin_workspace_decision(title="Monorepo", body="One repo for all services", category="ARCHITECTURAL")',
     "get_workspace_decisions": 'get_workspace_decisions()',
+    "get_workspace_settings": 'get_workspace_settings()',
+    "update_workspace_settings": 'update_workspace_settings(hitl_auto_answer_default=True, sprint_name_default="june-sprint")',
     "add_sprint_item": 'add_sprint_item(project_id="abc-123", title="Add OAuth login", item_group="auth")',
     "get_sprint_items": 'get_sprint_items(project_id="abc-123")',
     "complete_sprint_item": 'complete_sprint_item(item_id="item-uuid")',
@@ -225,6 +227,20 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
      "inputSchema": {"type": "object", "properties": {
          "include_superseded": {"type": "boolean"}},
          "required": []}},
+    {"name": "get_workspace_settings", "description":
+        "Read workspace-global default settings (applies across ALL projects in this "
+        "workspace): hitl_auto_answer_default and sprint_name_default. Returns the "
+        "singleton settings row.",
+     "inputSchema": {"type": "object", "properties": {},
+         "required": []}},
+    {"name": "update_workspace_settings", "description":
+        "Update workspace-global default settings. Pass only the fields you want to "
+        "change. hitl_auto_answer_default (bool) seeds new projects' HITL auto-answer "
+        "behaviour; sprint_name_default (string) is the default sprint name.",
+     "inputSchema": {"type": "object", "properties": {
+         "hitl_auto_answer_default": {"type": "boolean"},
+         "sprint_name_default": {"type": "string"}},
+         "required": []}},
     {"name": "get_session_brief", "description":
         "Single-call session orientation - returns sprint focus, pending sprint items, "
         "recent tasks, any blocking failures, and pending HITL requests in a compact "
@@ -353,7 +369,7 @@ _READ_ONLY_TOOLS = {
     "get_session_brief", "get_context_block", "get_hitl_request",
     "list_hitl_requests", "list_sessions", "get_sprint_notes",
     "get_run_transcript", "idle_until_session_done", "generate_handoff",
-    "get_workspace_notes", "get_workspace_decisions",
+    "get_workspace_notes", "get_workspace_decisions", "get_workspace_settings",
 }
 _DESTRUCTIVE_TOOLS = {"delete_note", "delete_decision", "dismiss_hitl"}
 

@@ -147,6 +147,11 @@ class ProjectSettings(BaseModel):
         description="Warn when the live constitution reaches this many items.",
     )
     executor_config: ExecutorConfig = Field(default_factory=ExecutorConfig)
+    hitl_auto_answer: bool = Field(
+        default=False,
+        description="When true, request_hitl auto-resolves immediately (first "
+        "option, answered_by='auto') instead of blocking the session.",
+    )
 
 
 class ProjectSettingsPatch(BaseModel):
@@ -154,6 +159,7 @@ class ProjectSettingsPatch(BaseModel):
 
     max_pinned_decisions: int | None = Field(default=None, ge=1, le=200)
     executor_config: ExecutorConfig | None = None
+    hitl_auto_answer: bool | None = None
 
 
 class GoalState(BaseModel):
@@ -270,23 +276,6 @@ class TaskUpdate(BaseModel):
     description: str | None = None
 
 
-class ChatMessage(BaseModel):
-    """One turn in the dashboard chat history."""
-
-    role: Literal["user", "assistant"]
-    content: str
-
-
-class ChatHistoryItem(BaseModel):
-    """A persisted chat message row returned by GET /projects/{id}/chat/history."""
-
-    id: str
-    project_id: str
-    role: Literal["user", "assistant"]
-    content: str
-    created_at: str
-
-
 class FileContent(BaseModel):
     """Body for PUT /projects/{id}/files/{filename}."""
 
@@ -311,22 +300,3 @@ class StartSessionRequest(BaseModel):
     )
 
 
-class ChatRequest(BaseModel):
-    """Body for POST /dashboard/chat.
-
-    ``mode`` selects the backend:
-
-    * ``"cli"`` (default) — shell out to the ``claude`` CLI binary,
-      which uses the OAuth token from ``~/.claude/.credentials.json``
-      and draws from the user's Max-plan allowance. No API credits.
-    * ``"api"`` — call ``api.anthropic.com`` directly via the official
-      Anthropic SDK. Bills metered API credits and needs
-      ``ANTHROPIC_API_KEY`` (or an OAuth token usable as a bearer).
-    """
-
-    project_id: str
-    messages: list[ChatMessage]
-    system_prompt: str | None = None
-    model: str = "claude-sonnet-4-6"
-    max_tokens: int = 4096
-    mode: Literal["cli", "api"] = "cli"

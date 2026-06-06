@@ -667,7 +667,6 @@ def test_dashboard_html_served(client):
     # v1.0.2: JS moved to static file — check JS for WebSocket wiring
     js = client.get("/static/dashboard.js").text
     assert "/ws/" in js  # WebSocket wiring present
-    assert "/dashboard/chat" in js  # chat proxy hook present
 
 
 def test_config_api_key_unset(client, monkeypatch):
@@ -733,177 +732,6 @@ def test_patch_task_flips_status(client):
 
 def test_patch_task_404(client):
     r = client.patch("/tasks/no-such-id", json={"status": "done"})
-    assert r.status_code == 404
-
-
-@pytest.mark.skip(reason="chat feature removed v1.1.0; chat_sessions table dropped v1.9.x")
-def test_dashboard_chat_streams_sse_api_mode(client, monkeypatch):
-    """API mode dispatches to the Anthropic SDK proxy. We stub the
-    generator so the test doesn't need a real Anthropic key.
-    """
-    async def fake_stream(messages, system_prompt, model, max_tokens, **_kwargs):
-        yield b'data: {"delta": "hello "}\n\n'
-        yield b'data: {"delta": "world"}\n\n'
-        yield b"data: [DONE]\n\n"
-
-    monkeypatch.setattr(
-        dashboard_module, "stream_anthropic_chat", fake_stream
-    )
-
-    project = client.post("/projects", json={"name": "alpha"}).json()
-    r = client.post(
-        "/dashboard/chat",
-        json={
-            "project_id": project["id"],
-            "messages": [{"role": "user", "content": "hi"}],
-            "mode": "api",
-        },
-    )
-    assert r.status_code == 200
-    assert "text/event-stream" in r.headers["content-type"]
-    body = r.text
-    assert "hello " in body
-    assert "world" in body
-    assert "[DONE]" in body
-
-
-@pytest.mark.skip(reason="chat feature removed v1.1.0; chat_sessions table dropped v1.9.x")
-def test_dashboard_chat_defaults_to_cli_mode(client, monkeypatch):
-    """A request with no ``mode`` field must dispatch to the CLI
-    streamer, not the API one. We stub *both* so the test fails loudly
-    if the dispatch picks the wrong backend.
-    """
-    cli_calls: list[str] = []
-    api_calls: list[str] = []
-
-    async def fake_cli(messages, system_prompt, model, max_tokens, **_kwargs):
-        cli_calls.append("called")
-        yield b'data: {"delta": "via cli"}\n\n'
-        yield b"data: [DONE]\n\n"
-
-    async def fake_api(messages, system_prompt, model, max_tokens, **_kwargs):
-        api_calls.append("called")
-        yield b'data: {"delta": "via api"}\n\n'
-        yield b"data: [DONE]\n\n"
-
-    monkeypatch.setattr(dashboard_module, "stream_claude_cli_chat", fake_cli)
-    monkeypatch.setattr(dashboard_module, "stream_anthropic_chat", fake_api)
-
-    project = client.post("/projects", json={"name": "alpha"}).json()
-    r = client.post(
-        "/dashboard/chat",
-        json={
-            "project_id": project["id"],
-            "messages": [{"role": "user", "content": "hi"}],
-        },
-    )
-    assert r.status_code == 200
-    assert "via cli" in r.text
-    assert "via api" not in r.text
-    assert cli_calls == ["called"]
-    assert api_calls == []
-
-
-def test_stream_claude_cli_chat_emits_stdout_as_sse(monkeypatch):
-    """End-to-end: with a Python stub as the worker command, the CLI
-    streamer should spawn the subprocess and forward stdout chunks as
-    ``data: {"delta": "..."}`` SSE lines, terminating with ``[DONE]``.
-    """
-    monkeypatch.setenv(
-        "MERIDIAN_CLAUDE_CLI",
-        f'"{sys.executable}" -c "import sys; sys.stdout.write(sys.argv[1])"',
-    )
-
-    async def run() -> bytes:
-        chunks: list[bytes] = []
-        async for chunk in dashboard_module.stream_claude_cli_chat(
-            messages=[{"role": "user", "content": "ping"}],
-            system_prompt=None,
-            model="claude-sonnet-4-20250514",
-            max_tokens=4096,
-        ):
-            chunks.append(chunk)
-        return b"".join(chunks)
-
-    body = asyncio.run(run())
-    text = body.decode("utf-8")
-    assert "ping" in text  # echoed by the stub
-    assert "data: [DONE]" in text
-
-
-def test_stream_claude_cli_chat_reports_missing_binary(monkeypatch):
-    """If the CLI is not installed (or MERIDIAN_CLAUDE_CLI points at a
-    bogus binary), the streamer must surface a clean error event
-    rather than crashing the request."""
-    monkeypatch.setenv(
-        "MERIDIAN_CLAUDE_CLI", "definitely-not-a-real-binary-7878"
-    )
-
-    async def run() -> bytes:
-        chunks: list[bytes] = []
-        async for chunk in dashboard_module.stream_claude_cli_chat(
-            messages=[{"role": "user", "content": "ping"}],
-            system_prompt=None,
-            model="claude-sonnet-4-20250514",
-            max_tokens=4096,
-        ):
-            chunks.append(chunk)
-        return b"".join(chunks)
-
-    body = asyncio.run(run()).decode("utf-8")
-    assert '"error"' in body
-    assert "data: [DONE]" in body
-
-
-def test_stream_claude_cli_chat_rejects_empty_prompt(monkeypatch):
-    """Empty messages + no system prompt must short-circuit with a
-    structured error rather than spawning the worker with an empty
-    argument."""
-    monkeypatch.setenv(
-        "MERIDIAN_CLAUDE_CLI",
-        f'"{sys.executable}" -c "import sys; sys.stdout.write(\'should not run\')"',
-    )
-
-    async def run() -> bytes:
-        chunks: list[bytes] = []
-        async for chunk in dashboard_module.stream_claude_cli_chat(
-            messages=[], system_prompt=None, model="x", max_tokens=4096
-        ):
-            chunks.append(chunk)
-        return b"".join(chunks)
-
-    body = asyncio.run(run()).decode("utf-8")
-    assert "empty prompt" in body
-    assert "should not run" not in body
-    assert "data: [DONE]" in body
-
-
-def test_format_cli_prompt_includes_system_and_history():
-    """Round-trip the prompt formatter: System block first, then each
-    turn in order. Hardening against accidental layout changes."""
-    out = dashboard_module._format_cli_prompt(
-        messages=[
-            {"role": "user", "content": "what is meridian?"},
-            {"role": "assistant", "content": "a coordination server"},
-            {"role": "user", "content": "and the goal field?"},
-        ],
-        system_prompt="be concise",
-    )
-    assert out.startswith("System:\nbe concise")
-    assert "User:\nwhat is meridian?" in out
-    assert "Assistant:\na coordination server" in out
-    # The most recent user turn lives at the end so claude -p answers it.
-    assert out.rstrip().endswith("User:\nand the goal field?")
-
-
-def test_dashboard_chat_unknown_project_404(client):
-    r = client.post(
-        "/dashboard/chat",
-        json={
-            "project_id": "no-such-project",
-            "messages": [{"role": "user", "content": "hi"}],
-        },
-    )
     assert r.status_code == 404
 
 
@@ -1030,67 +858,8 @@ def test_migration_rebuilds_old_check_constraint(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# v0.3.0: chat persistence, session TTL
+# Session TTL
 # ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-@pytest.mark.skip(reason="chat_sessions table dropped v1.9.x")
-async def test_get_or_create_chat_session_idempotent(db):
-    """Two calls for the same project return the same session row."""
-    p = await db_module.create_project(db, "alpha")
-    sess1 = await db_module.get_or_create_chat_session(db, p["id"])
-    sess2 = await db_module.get_or_create_chat_session(db, p["id"])
-    assert sess1["id"] == sess2["id"]
-    assert sess1["project_id"] == p["id"]
-    assert sess1["cli_session_id"] is None
-
-
-@pytest.mark.asyncio
-@pytest.mark.skip(reason="chat_sessions table dropped v1.9.x")
-async def test_update_chat_session_cli_id(db):
-    """cli_session_id can be written after the row is created."""
-    p = await db_module.create_project(db, "alpha")
-    await db_module.get_or_create_chat_session(db, p["id"])
-    await db_module.update_chat_session_cli_id(db, p["id"], "cli-abc-123")
-    sess = await db_module.get_or_create_chat_session(db, p["id"])
-    assert sess["cli_session_id"] == "cli-abc-123"
-
-
-@pytest.mark.asyncio
-@pytest.mark.skip(reason="chat feature removed in v1.1.0")
-async def test_save_and_retrieve_chat_messages(db):
-    """Messages are persisted and returned oldest-first."""
-    p = await db_module.create_project(db, "alpha")
-    await db_module.save_chat_message(db, p["id"], "user", "hello")
-    await db_module.save_chat_message(db, p["id"], "assistant", "world")
-    await db_module.save_chat_message(db, p["id"], "user", "again")
-    history = await db_module.get_chat_history(db, p["id"])
-    assert len(history) == 3
-    assert history[0]["role"] == "user"
-    assert history[0]["content"] == "hello"
-    assert history[1]["role"] == "assistant"
-    assert history[2]["content"] == "again"
-
-
-@pytest.mark.asyncio
-async def test_save_chat_message_rejects_bad_role(db):
-    p = await db_module.create_project(db, "alpha")
-    with pytest.raises(ValueError):
-        await db_module.save_chat_message(db, p["id"], "system", "boom")
-
-
-@pytest.mark.asyncio
-@pytest.mark.skip(reason="chat feature removed in v1.1.0")
-async def test_get_chat_history_respects_limit(db):
-    p = await db_module.create_project(db, "alpha")
-    for i in range(10):
-        await db_module.save_chat_message(db, p["id"], "user", f"msg{i}")
-    history = await db_module.get_chat_history(db, p["id"], limit=4)
-    # limit=4 returns 4 oldest messages
-    assert len(history) == 4
-    assert history[0]["content"] == "msg0"
-    assert history[3]["content"] == "msg3"
 
 
 @pytest.mark.asyncio
@@ -1263,48 +1032,6 @@ async def test_archive_empty_sessions_keeps_sessions_with_tasks(db):
     sessions = await db_module.get_sessions(db, p["id"], active_only=False)
     kept = next(x for x in sessions if x["id"] == s["id"])
     assert kept["status"] == "idle"
-
-
-@pytest.mark.skip(reason="chat_messages table dropped v1.9.x")
-def test_chat_history_endpoint_empty(client):
-    """GET /projects/{id}/chat/history returns [] when no messages exist."""
-    project = client.post("/projects", json={"name": "alpha"}).json()
-    r = client.get(f"/projects/{project['id']}/chat/history")
-    assert r.status_code == 200
-    assert r.json() == []
-
-
-@pytest.mark.skip(reason="chat_messages table dropped v1.9.x")
-def test_chat_history_endpoint_returns_messages(client, monkeypatch):
-    """After a chat round-trip the history endpoint reflects saved messages."""
-    async def fake_cli(messages, system_prompt, model, max_tokens, **_kwargs):
-        yield b'data: {"delta": "hi there"}\n\n'
-        yield b"data: [DONE]\n\n"
-
-    monkeypatch.setattr(dashboard_module, "stream_claude_cli_chat", fake_cli)
-
-    project = client.post("/projects", json={"name": "alpha"}).json()
-    client.post(
-        "/dashboard/chat",
-        json={
-            "project_id": project["id"],
-            "messages": [{"role": "user", "content": "hello"}],
-            "mode": "cli",
-        },
-    )
-    r = client.get(f"/projects/{project['id']}/chat/history")
-    assert r.status_code == 200
-    msgs = r.json()
-    # User message persisted before streaming.
-    assert any(m["role"] == "user" and m["content"] == "hello" for m in msgs)
-    # Assistant response persisted after streaming.
-    assert any(m["role"] == "assistant" and "hi there" in m["content"] for m in msgs)
-
-
-@pytest.mark.skip(reason="chat_messages table dropped v1.9.x")
-def test_chat_history_endpoint_404_for_unknown_project(client):
-    r = client.get("/projects/no-such-project/chat/history")
-    assert r.status_code == 404
 
 
 def test_sessions_endpoint_expires_stale_sessions(client):
@@ -1737,106 +1464,6 @@ def test_get_projects_returns_list_with_creator(client):
     by_name = {p["name"]: p for p in r.json()}
     assert by_name["alpha"]["creator_human_id"] == "adam"
     assert by_name["beta"]["creator_human_id"] is None
-
-
-# ---------------------------------------------------------------------------
-# v0.4.1 — --resume for true multi-turn CLI chat
-# ---------------------------------------------------------------------------
-
-
-def test_cli_streamer_passes_resume_flag_when_id_given(monkeypatch):
-    """When ``resume_session_id`` is set the streamer must spawn the
-    worker with ``--resume <id>`` ahead of the prompt. We swap the
-    worker for a Python stub that dumps its argv and we assert against
-    that."""
-    monkeypatch.setenv(
-        "MERIDIAN_CLAUDE_CLI",
-        f'"{sys.executable}" -c "import sys; print(sys.argv)"',
-    )
-
-    async def run() -> str:
-        chunks: list[bytes] = []
-        async for chunk in dashboard_module.stream_claude_cli_chat(
-            messages=[{"role": "user", "content": "hi"}],
-            system_prompt=None,
-            model="claude-sonnet-4-6",
-            max_tokens=4096,
-            resume_session_id="abc-123-resume-uuid",
-        ):
-            chunks.append(chunk)
-        return b"".join(chunks).decode("utf-8")
-
-    body = asyncio.run(run())
-    assert "--resume" in body
-    assert "abc-123-resume-uuid" in body
-
-
-def test_cli_streamer_captures_session_id_into_callback(monkeypatch):
-    """When the worker emits ``Session ID: <uuid>`` the streamer must
-    pass that uuid to ``on_session_id`` exactly once. Sub-second
-    capture is the whole point of the v0.4.1 plumbing."""
-    monkeypatch.setenv(
-        "MERIDIAN_CLAUDE_CLI",
-        f'"{sys.executable}" -c "import sys; sys.stdout.write(\'Session ID: ' \
-        f'abcdef01-2345-6789-abcd-ef0123456789\nhello\n\')"',
-    )
-
-    captured: list[str] = []
-
-    async def on_id(new_id: str) -> None:
-        captured.append(new_id)
-
-    async def run() -> None:
-        async for _ in dashboard_module.stream_claude_cli_chat(
-            messages=[{"role": "user", "content": "hi"}],
-            system_prompt=None,
-            model="claude-sonnet-4-6",
-            max_tokens=4096,
-            on_session_id=on_id,
-        ):
-            pass
-
-    asyncio.run(run())
-    assert captured == ["abcdef01-2345-6789-abcd-ef0123456789"]
-
-
-def test_cli_streamer_gracefully_no_ops_when_no_session_id_present(monkeypatch):
-    """If the CLI output never contains the marker the callback must
-    not fire. Otherwise older CLI versions would crash with bad data."""
-    monkeypatch.setenv(
-        "MERIDIAN_CLAUDE_CLI",
-        f'"{sys.executable}" -c "import sys; sys.stdout.write(\'just chat\')"',
-    )
-
-    captured: list[str] = []
-
-    async def on_id(new_id: str) -> None:
-        captured.append(new_id)
-
-    async def run() -> None:
-        async for _ in dashboard_module.stream_claude_cli_chat(
-            messages=[{"role": "user", "content": "hi"}],
-            system_prompt=None,
-            model="claude-sonnet-4-6",
-            max_tokens=4096,
-            on_session_id=on_id,
-        ):
-            pass
-
-    asyncio.run(run())
-    assert captured == []
-
-
-@pytest.mark.asyncio
-@pytest.mark.skip(reason="chat_sessions table dropped v1.9.x")
-async def test_update_chat_session_cli_id_persists(db):
-    """The helper writes the captured CLI session uuid into the
-    chat_sessions row so the next /dashboard/chat call can ``--resume``."""
-    p = await db_module.create_project(db, "alpha")
-    await db_module.get_or_create_chat_session(db, p["id"])
-    await db_module.update_chat_session_cli_id(db, p["id"], "uuid-1")
-    fresh = await db_module.get_or_create_chat_session(db, p["id"])
-    assert fresh["cli_session_id"] == "uuid-1"
 
 
 # ---------------------------------------------------------------------------
@@ -3955,6 +3582,107 @@ def test_start_session_includes_decisions(client):
     assert "fpdf2" in body["goal_xml"]
 
 
+# ---------------------------------------------------------------------------
+# v3.4 — workspace context injection + workspace settings
+# ---------------------------------------------------------------------------
+
+
+def test_start_session_includes_workspace_context(client):
+    """A workspace-level decision must surface in start-session output so a
+    cold executor sees tenant-global truth without a separate call."""
+    client.post(
+        "/workspace/decisions",
+        json={"title": "Monorepo", "body": "one repo for all services",
+              "category": "ARCHITECTURAL"},
+    )
+    project = client.post("/projects", json={"name": "ws-ctx"}).json()
+    r = client.post(
+        f"/projects/{project['id']}/start-session",
+        json={"session_name": "alpha"},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert "workspace_context" in body
+    assert "Monorepo" in body["workspace_context"]
+    assert "one repo for all services" in body["workspace_context"]
+
+
+def test_start_session_workspace_context_empty_when_none(client):
+    """No workspace decisions/notes → workspace_context is an empty string,
+    not missing — callers can render unconditionally."""
+    project = client.post("/projects", json={"name": "ws-empty"}).json()
+    body = client.post(
+        f"/projects/{project['id']}/start-session",
+        json={"session_name": "alpha"},
+    ).json()
+    assert body.get("workspace_context") == ""
+
+
+def test_workspace_notes_crud_http(client):
+    """Workspace notes round-trip through the HTTP routes the dashboard uses."""
+    created = client.post(
+        "/workspace/notes",
+        json={"title": "Onboarding", "body": "all repos use pixi", "tags": "setup"},
+    )
+    assert created.status_code == 201
+    note_id = created.json()["id"]
+    listed = client.get("/workspace/notes").json()
+    assert any(n["id"] == note_id for n in listed)
+    assert client.delete(f"/workspace/notes/{note_id}").status_code == 204
+    assert all(n["id"] != note_id for n in client.get("/workspace/notes").json())
+
+
+def test_workspace_decisions_crud_http(client):
+    """Workspace decisions round-trip through the HTTP routes."""
+    created = client.post(
+        "/workspace/decisions",
+        json={"title": "Use psycopg3", "body": "asyncpg has DLL issues",
+              "category": "TECHNICAL"},
+    )
+    assert created.status_code == 201
+    did = created.json()["id"]
+    listed = client.get("/workspace/decisions").json()
+    assert any(d["id"] == did for d in listed)
+    assert client.delete(f"/workspace/decisions/{did}").status_code == 204
+
+
+def test_workspace_settings_roundtrip_http(client):
+    """Workspace settings GET returns defaults; PATCH persists changes."""
+    initial = client.get("/workspace/settings").json()
+    assert initial["hitl_auto_answer_default"] is False
+    assert initial["sprint_name_default"] is None
+    patched = client.patch(
+        "/workspace/settings",
+        json={"hitl_auto_answer_default": True, "sprint_name_default": "june"},
+    ).json()
+    assert patched["hitl_auto_answer_default"] is True
+    assert patched["sprint_name_default"] == "june"
+    # Persisted across a fresh GET.
+    again = client.get("/workspace/settings").json()
+    assert again["hitl_auto_answer_default"] is True
+    assert again["sprint_name_default"] == "june"
+
+
+def test_workspace_settings_partial_patch_preserves_other_field(client):
+    """Patching one field must not clobber the other."""
+    client.patch(
+        "/workspace/settings",
+        json={"hitl_auto_answer_default": True, "sprint_name_default": "keep-me"},
+    )
+    client.patch("/workspace/settings", json={"hitl_auto_answer_default": False})
+    final = client.get("/workspace/settings").json()
+    assert final["hitl_auto_answer_default"] is False
+    assert final["sprint_name_default"] == "keep-me"
+
+
+@pytest.mark.asyncio
+async def test_workspace_settings_db_defaults(db):
+    """get_workspace_settings returns a usable dict even with no row written."""
+    settings = await db_module.get_workspace_settings(db)
+    assert settings["hitl_auto_answer_default"] is False
+    assert settings["sprint_name_default"] is None
+
+
 def test_build_goal_xml_omits_decisions_when_empty():
     """No <decisions> tag when there's nothing to show — worker
     sessions in v1.2.0 will pass decisions=None for the same reason."""
@@ -5364,6 +5092,78 @@ async def test_request_hitl_creates_pending(db):
     assert h["question"] == "Is it safe to proceed?"
     assert h["project_id"] == p["id"]
     assert h["session_id"] == s["id"]
+
+
+@pytest.mark.asyncio
+async def test_request_hitl_auto_answer_resolves_immediately(db):
+    """v3.4 — when a project has hitl_auto_answer on, request_hitl resolves the
+    request immediately (answered_by='auto') so the session never blocks."""
+    p = await db_module.create_project(db, "hitl-auto-proj")
+    await db_module.update_project_settings(db, p["id"], hitl_auto_answer=True)
+    h = await db_module.request_hitl(
+        db, p["id"], "Ship it?", urgency="blocking"
+    )
+    assert h["status"] == "answered"
+    assert h["answered_by"] == "auto"
+    assert h["answer"] == "[auto-answered]"
+    assert h["answered_at"]
+    # Still in the queue for audit — a session polling sees it resolved.
+    fetched = await db_module.get_hitl_request(db, h["id"])
+    assert fetched["status"] == "answered"
+
+
+@pytest.mark.asyncio
+async def test_request_hitl_manual_mode_unchanged(db):
+    """v3.4 — default projects (auto-answer off) still create pending requests."""
+    p = await db_module.create_project(db, "hitl-manual-proj")
+    h = await db_module.request_hitl(db, p["id"], "Deploy now?", urgency="blocking")
+    assert h["status"] == "pending"
+    assert h.get("answered_by") in (None, "")
+    assert h.get("answer") in (None, "")
+
+
+@pytest.mark.asyncio
+async def test_request_hitl_auto_answer_picks_first_option(db):
+    """v3.4 — when the payload carries an options list, auto-answer picks the
+    first option rather than the generic acknowledgement."""
+    import json as _json
+    p = await db_module.create_project(db, "hitl-opts-proj")
+    await db_module.update_project_settings(db, p["id"], hitl_auto_answer=True)
+    payload = _json.dumps({"options": ["per-IP", "per-token"]})
+    h = await db_module.request_hitl(
+        db, p["id"], "Rate-limit strategy?", payload=payload
+    )
+    assert h["status"] == "answered"
+    assert h["answered_by"] == "auto"
+    assert h["answer"] == "per-IP"
+
+
+@pytest.mark.asyncio
+async def test_request_hitl_md_section_update_not_auto_answered(db):
+    """v3.4 — md_section_update diff approvals stay human-gated even when
+    auto-answer is on; auto-approving a file write would defeat the safeguard."""
+    p = await db_module.create_project(db, "hitl-md-proj")
+    await db_module.update_project_settings(db, p["id"], hitl_auto_answer=True)
+    h = await db_module.request_hitl(
+        db, p["id"], "Apply this DEVLOG section?",
+        kind="md_section_update", payload='{"file": "DEVLOG.md"}',
+    )
+    assert h["status"] == "pending"
+    assert h.get("answered_by") in (None, "")
+
+
+@pytest.mark.asyncio
+async def test_project_settings_roundtrip_hitl_auto_answer(db):
+    """v3.4 — hitl_auto_answer persists through get/update_project_settings."""
+    p = await db_module.create_project(db, "hitl-settings-proj")
+    settings = await db_module.get_project_settings(db, p["id"])
+    assert settings["hitl_auto_answer"] is False
+    updated = await db_module.update_project_settings(
+        db, p["id"], hitl_auto_answer=True
+    )
+    assert updated["hitl_auto_answer"] is True
+    reread = await db_module.get_project_settings(db, p["id"])
+    assert reread["hitl_auto_answer"] is True
 
 
 @pytest.mark.asyncio
