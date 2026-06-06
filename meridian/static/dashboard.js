@@ -642,15 +642,16 @@ function _updateConnectionIndicator(cfg) {
       // Use cfg.connection_name as truth for which connection is active
       // (env var overrides can make the toml active flag stale).
       const hosted = isHostedMode();
-      // Hosted admins (operators) get the full local-style connection manager —
-      // switcher for every connection type, delete buttons, "+ Add connection...",
-      // and the toml path. Normal hosted users get the restricted postgres-only view.
+      // On hosted (admin or not), only show postgres connections — local/sqlite
+      // connections are useless on Fly (ephemeral FS, no toml on the machine).
+      // Self-hosted (non-hosted) admins see everything including local.
       const adminFull = !hosted || isHostedAdmin();
       const activeName = cfg.connection_name || (cfg.db === 'postgres' ? 'env (postgres)' : 'local');
       let displayConns = (conns || []).map(c => ({...c, active: c.name === activeName}));
-      if (hosted && !isHostedAdmin()) {
-        // Normal hosted users manage the env postgres only — local/sqlite
-        // connections would break tenant isolation, so hide them from the switcher.
+      if (hosted) {
+        // Both normal hosted users and hosted admins only see postgres connections.
+        // Local/sqlite options would break tenant isolation or are simply not
+        // meaningful on a hosted server.
         displayConns = displayConns.filter(c => (c.type || 'sqlite') === 'postgres');
       }
       if (!displayConns.find(c => c.active)) {
@@ -752,8 +753,8 @@ function _updateConnectionIndicator(cfg) {
         addItem.onclick = () => { popup.remove(); document.getElementById('conn-setup-modal').style.display = 'flex'; };
         popup.appendChild(addItem);
       }
-      // Config file path at bottom
-      if (cfg.toml_path && adminFull) {
+      // Config file path at bottom — only for local self-host (path is meaningless on hosted)
+      if (cfg.toml_path && adminFull && !hosted) {
         const pathRow = document.createElement('div');
         pathRow.style.cssText = 'padding:4px 12px 6px;color:var(--muted);font-size:9px;border-top:1px solid var(--border);margin-top:2px;word-break:break-all';
         pathRow.textContent = '📄 ' + cfg.toml_path;
