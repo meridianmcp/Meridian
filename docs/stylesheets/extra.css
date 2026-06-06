@@ -4,3 +4,21 @@
   --md-primary-fg-color--dark: #5577ee;
   --md-accent-fg-color: #a78bfa;
 }
+
+/* Lift the three pages new users need first. */
+.md-tabs__link[href$="quickstart/"],
+.md-tabs__link[href$="browser-connector/"],
+.md-tabs__link[href$="mcp-tools/"],
+.md-nav__link[href$="quickstart/"],
+.md-nav__link[href$="browser-connector/"],
+.md-nav__link[href$="mcp-tools/"] {
+  font-weight: 700;
+  color: var(--md-primary-fg-color--light);
+}
+
+.md-nav__link[href$="quickstart/"] .md-ellipsis,
+.md-nav__link[href$="browser-connector/"] .md-ellipsis,
+.md-nav__link[href$="mcp-tools/"] .md-ellipsis {
+  font-size: 0.95rem;
+  letter-spacing: 0.01em;
+}

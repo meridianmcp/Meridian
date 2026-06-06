@@ -84,6 +84,8 @@ from . import goal_md as goal_md_module
 from . import enqueue as enqueue_module
 from . import handoff as handoff_module
 from . import toml_config as toml_config_module
+from . import md_anchors as md_anchors_module
+from . import git_md as git_md_module
 from .models import (
     ChatHistoryItem,
     ChatRequest,
@@ -1615,6 +1617,181 @@ async def _notify_project(
         await _dispatch_notification(notify_url, title, body_text, event)
     except Exception:  # noqa: BLE001
         pass  # never let notifications crash the main flow
+
+
+async def _on_hitl_answered(
+    db: Any, request_row: dict[str, Any], *, approved: bool
+) -> dict[str, Any]:
+    """Side-effect for an answered/dismissed HITL request.
+
+    For ``kind='md_section_update'`` that was approved, apply the proposed
+    markdown section replacement and record the touched file (committed later at
+    checkpoint via :func:`_finalize_session_md`). Never raises — any failure is
+    returned as ``apply_error`` so the answer itself still succeeds. Legacy
+    ``'question'`` requests are a no-op.
+    """
+    if (request_row or {}).get("kind") != "md_section_update":
+        return {}
+    if not approved:
+        return {"applied": False, "reason": "rejected"}
+    raw = request_row.get("payload")
+    try:
+        payload = json.loads(raw) if raw else {}
+    except (ValueError, TypeError):
+        return {"applied": False, "apply_error": "payload is not valid JSON"}
+    file = payload.get("file")
+    anchor = payload.get("anchor")
+    content = payload.get("content")
+    base_hash = payload.get("base_hash")
+    if not file or not anchor or content is None:
+        return {"applied": False, "apply_error": "payload missing file/anchor/content"}
+    if base_hash is not None:
+        current = md_anchors_module.anchor_content_hash(file, anchor)
+        if current is not None and current != base_hash:
+            return {"applied": False, "apply_error": "section changed since proposal; re-draft"}
+    try:
+        path = await md_anchors_module.apply_replace(file, anchor, content)
+    except md_anchors_module.AnchorError as exc:
+        return {"applied": False, "apply_error": str(exc)}
+    except Exception as exc:  # noqa: BLE001 — never crash the answer flow
+        return {"applied": False, "apply_error": f"write failed: {exc}"}
+    if path is None:
+        return {"applied": False, "reason": "no-op-or-hosted"}
+    return {"applied": True, "file": file, "anchor": anchor}
+
+
+async def _answer_hitl_and_apply(
+    db: Any,
+    request_id: str,
+    answer: str,
+    *,
+    answered_by: str | None = None,
+    approved: bool = True,
+) -> dict[str, Any] | None:
+    """The ONLY correct way to answer a HITL request — stores the answer then
+    runs :func:`_on_hitl_answered`. Both the ``answer_hitl`` MCP tool and the
+    route ``PATCH /hitl/{id}`` funnel through here so an ``md_section_update`` is
+    applied exactly once. Returns the (possibly enriched) row, or ``None`` when
+    the request was not found.
+    """
+    row = await db_module.answer_hitl_request(
+        db, request_id, answer, answered_by=answered_by
+    )
+    if row is None:
+        return None
+    extra = await _on_hitl_answered(db, row, approved=approved)
+    return {**row, **extra}
+
+
+def _md_ts() -> str:
+    from datetime import datetime, timezone  # noqa: PLC0415
+
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
+def _md_one_line(text: str, limit: int = 200) -> str:
+    """Collapse a multi-line decision/note body to a single trimmed line."""
+    flat = " ".join((text or "").split())
+    return flat if len(flat) <= limit else flat[:limit].rstrip() + "…"
+
+
+def _md_normalize_tags(tags: Any) -> list[str]:
+    if not tags:
+        return []
+    items = tags if isinstance(tags, (list, tuple)) else str(tags).split(",")
+    return [str(t).strip().lower() for t in items if str(t).strip()]
+
+
+async def _append_decision_to_md(title: str, body: str, category: str) -> None:
+    """Best-effort append of a pinned decision to DECISIONS.md's decisions-log
+    anchor. The committable-category guard lives in ``apply_append`` (passed the
+    category), so STRATEGIC/COMPETITIVE/BUSINESS decisions are skipped and never
+    reach the committed repo. Never raises."""
+    try:
+        line = (
+            f"- {_md_ts()} **{(category or '').strip().upper()}** — "
+            f"{title.strip()}: {_md_one_line(body)}"
+        )
+        await md_anchors_module.apply_append(
+            "DECISIONS.md", "decisions-log", line, category=category,
+        )
+    except Exception:  # noqa: BLE001 — auto-append must never break the tool
+        pass
+
+
+async def _append_note_to_roadmap(
+    title: str, body: str, tags: Any, category: str | None
+) -> None:
+    """Best-effort append of a roadmap-tagged note to ROADMAP.md's roadmap-notes
+    anchor. Requires the 'roadmap' tag AND an explicit committable category —
+    notes carry no category column, so the default is fail-closed. Never raises."""
+    try:
+        if "roadmap" not in _md_normalize_tags(tags):
+            return
+        if not md_anchors_module.is_committable_category(category):
+            return
+        line = f"- {_md_ts()} {title.strip()}: {_md_one_line(body)}"
+        await md_anchors_module.apply_append(
+            "ROADMAP.md", "roadmap-notes", line, category=category,
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
+
+async def _build_devlog_line(
+    db: Any, project_id: str, session_id: str | None
+) -> str | None:
+    """One-line DEVLOG summary for a session from its done tasks. ``None`` when
+    the session logged no done work (keeps trivial sessions out of the log)."""
+    if not session_id:
+        return None
+    name = session_id[:8]
+    try:
+        for s in await db_module.get_sessions(db, project_id, active_only=False):
+            if s.get("id") == session_id:
+                name = s.get("name") or name
+                break
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        async with db.execute(
+            "SELECT description FROM task_log WHERE session_id = ? "
+            "AND status = 'done' ORDER BY created_at DESC",
+            (session_id,),
+        ) as cur:
+            rows = await cur.fetchall()
+    except Exception:  # noqa: BLE001
+        rows = []
+    descs = [r["description"] for r in rows if r and r["description"]]
+    if not descs:
+        return None
+    extra = f" (+{len(descs) - 1} more)" if len(descs) > 1 else ""
+    return f"- {_md_ts()} **{name}** — {_md_one_line(descs[0], 120)}{extra}"
+
+
+async def _finalize_session_md(
+    db: Any, project_id: str, session_id: str | None
+) -> None:
+    """At checkpoint / session-end: append a DEVLOG line and commit any markdown
+    the session touched (decisions, roadmap notes, approved section updates) in a
+    single pathspec-scoped commit. Best-effort; never raises, never blocks the
+    checkpoint. No-ops in hosted mode (md_anchors + git_md self-skip)."""
+    try:
+        line = await _build_devlog_line(db, project_id, session_id)
+        if line:
+            await md_anchors_module.apply_append("DEVLOG.md", "devlog", line)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        touched = md_anchors_module.drain_touched()
+        if touched:
+            await git_md_module.commit_touched_md(
+                touched,
+                f"docs: meridian auto-update {_md_ts()}",
+                cwd=md_anchors_module.md_root(),
+            )
+    except Exception:  # noqa: BLE001
+        pass
 
 
 async def _maybe_notify(
@@ -4372,6 +4549,7 @@ async def hooks_stop(body: dict[str, Any], request: Request) -> dict[str, Any]:
             await db_module.auto_capture_session(db, project_id, session_id)
         except Exception:  # noqa: BLE001
             pass
+        await _finalize_session_md(db, project_id, session_id)
     try:
         from . import handoff as handoff_module_local
         await asyncio.wait_for(
@@ -5222,10 +5400,12 @@ async def _dispatch_mcp_tool(
             mode = "full"
         return {"file_path": path, "content": content, "mode": mode}
     if name == "pin_decision":
-        return await db_module.pin_decision(
-            db, args["project_id"], args["title"], args["body"],
-            args.get("category", "TECHNICAL"),
+        category = args.get("category", "TECHNICAL")
+        result = await db_module.pin_decision(
+            db, args["project_id"], args["title"], args["body"], category,
         )
+        await _append_decision_to_md(args["title"], args["body"], category)
+        return result
     if name == "update_decision":
         new_title = args.get("new_title")
         new_body = args.get("new_body")
@@ -5258,6 +5438,7 @@ async def _dispatch_mcp_tool(
         session_id = args["session_id"]
         project_id = args["project_id"]
         await db_module.auto_capture_session(db, project_id, session_id)
+        await _finalize_session_md(db, project_id, session_id)
         from . import handoff as handoff_module_local
         try:
             _, content = await asyncio.wait_for(
@@ -5343,10 +5524,14 @@ async def _dispatch_mcp_tool(
             raise ValueError("hitl request not found")
         return result
     if name == "add_note":
-        return await db_module.add_project_note(
+        result = await db_module.add_project_note(
             db, args["project_id"], args["title"], args["body"],
             args.get("tags"),
         )
+        await _append_note_to_roadmap(
+            args["title"], args["body"], args.get("tags"), args.get("category"),
+        )
+        return result
     if name == "get_notes":
         return await db_module.get_project_notes(
             db, args["project_id"], tag=args.get("tag"),
@@ -5415,18 +5600,46 @@ async def _dispatch_mcp_tool(
             limit=args.get("limit", 50),
         )
     if name == "answer_hitl":
-        result = await db_module.answer_hitl_request(
+        result = await _answer_hitl_and_apply(
             db, args["request_id"], args["answer"],
-            answered_by=args.get("answered_by"),
+            answered_by=args.get("answered_by"), approved=True,
         )
         if result is None:
             raise ValueError("hitl request not found")
         return result
     if name == "dismiss_hitl":
         result = await db_module.dismiss_hitl_request(db, args["request_id"])
+        if result is not None:
+            await _on_hitl_answered(db, result, approved=False)
         if result is None:
             raise ValueError("hitl request not found")
         return result
+    if name == "update_md_section":
+        md_file = args["file"]
+        anchor = args["anchor"]
+        content = args["content"]
+        # Raises ValueError for non-replace anchors / unknown files / README.
+        md_anchors_module.assert_replace_target(md_file, anchor)
+        diff = md_anchors_module.build_diff(md_file, anchor, content)
+        payload = json.dumps({
+            "file": md_file,
+            "anchor": anchor,
+            "content": content,
+            "base_hash": md_anchors_module.anchor_content_hash(md_file, anchor),
+            "diff": diff,
+        })
+        return await db_module.request_hitl(
+            db, args["project_id"],
+            question=f"Approve update to {md_file} § {anchor}?",
+            session_id=args.get("session_id"),
+            context=(
+                f"Proposed section replacement for {md_file} (anchor: {anchor}). "
+                "Review the diff in the dashboard, then Approve or Reject."
+            ),
+            urgency=args.get("urgency", "normal"),
+            kind="md_section_update",
+            payload=payload,
+        )
     if name == "list_sessions":
         active_only = args.get("status", "active") != "all"
         return await db_module.get_sessions(db, args["project_id"], active_only=active_only)
@@ -6565,6 +6778,40 @@ def build_mcp_server():
                 },
             ),
             Tool(
+                name="update_md_section",
+                description=(
+                    "v3.3 — propose a replacement for an anchored section of an "
+                    "agent template doc (CLAUDE.md or AGENTS.md). Does NOT write "
+                    "the file directly: it creates a human-in-the-loop request "
+                    "with a diff preview; a human approves it in the dashboard, "
+                    "then Meridian replaces that section and stages it for the "
+                    "next checkpoint commit. 'anchor' is the section name between "
+                    "the MERIDIAN:ANCHOR:START/END comments. (ROADMAP/DECISIONS/"
+                    "DEVLOG are append-only and not replaceable.)"
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "project_id": {"type": "string"},
+                        "file": {
+                            "type": "string",
+                            "description": "CLAUDE.md | AGENTS.md",
+                        },
+                        "anchor": {"type": "string"},
+                        "content": {
+                            "type": "string",
+                            "description": "Full proposed body for the section.",
+                        },
+                        "session_id": {"type": "string"},
+                        "urgency": {
+                            "type": "string",
+                            "enum": ["normal", "high", "blocking"],
+                        },
+                    },
+                    "required": ["project_id", "file", "anchor", "content"],
+                },
+            ),
+            Tool(
                 name="list_sessions",
                 description=(
                     "v2.4 — list active sessions for a project. Useful to see "
@@ -7298,6 +7545,7 @@ def build_mcp_server():
                 "pin_decision", "update_decision", "get_pinned_decisions",
                 "request_hitl", "get_hitl_request",
                 "list_hitl_requests", "answer_hitl", "dismiss_hitl",
+                "update_md_section",
                 "list_sessions",
                 "add_note", "get_notes", "delete_note",
                 "add_workspace_note", "get_workspace_notes",

@@ -105,11 +105,20 @@ async def patch_hitl_endpoint(
         answer = body.get("answer", "").strip()
         if not answer:
             raise HTTPException(status_code=400, detail="answer required")
-        result = await db_module.answer_hitl_request(
-            db, request_id, answer, answered_by=body.get("answered_by")
+        # Funnel through the server chokepoint so an approved md_section_update
+        # HITL actually writes its file (same single path as the MCP tool).
+        from meridian.server import _answer_hitl_and_apply  # noqa: PLC0415
+
+        result = await _answer_hitl_and_apply(
+            db, request_id, answer,
+            answered_by=body.get("answered_by"), approved=True,
         )
     elif action == "dismiss":
         result = await db_module.dismiss_hitl_request(db, request_id)
+        if result is not None:
+            from meridian.server import _on_hitl_answered  # noqa: PLC0415
+
+            await _on_hitl_answered(db, result, approved=False)
     else:
         raise HTTPException(status_code=400, detail="action must be 'answer' or 'dismiss'")
     if result is None:

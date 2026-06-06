@@ -174,12 +174,15 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "required": ["request_id"]}},
     {"name": "add_note", "description":
         "Add a per-project wiki note (setup, gotcha, howto, env, ...). "
-        "Free-form title/body; comma-separated tags optional.",
+        "Free-form title/body; comma-separated tags optional. Tag a note "
+        "'roadmap' AND pass a committable category (TECHNICAL/ARCHITECTURAL/"
+        "PRODUCT) to also append it to ROADMAP.md's roadmap-notes anchor.",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"},
          "title": {"type": "string"},
          "body": {"type": "string"},
-         "tags": {"type": "string"}},
+         "tags": {"type": "string"},
+         "category": {"type": "string"}},
          "required": ["project_id", "title", "body"]}},
     {"name": "get_notes", "description":
         "List project notes (newest first). Optional ?tag substring filter.",
@@ -326,6 +329,22 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
      "inputSchema": {"type": "object", "properties": {
          "watching_session_id": {"type": "string"}},
          "required": ["watching_session_id"]}},
+    {"name": "update_md_section", "description":
+        "Propose a replacement for an anchored section of an agent template doc "
+        "(CLAUDE.md or AGENTS.md). Does NOT write the file directly — it creates a "
+        "human-in-the-loop request carrying a diff preview. A human approves it in "
+        "the dashboard, then Meridian replaces that section and stages the file "
+        "for the next checkpoint commit. 'anchor' is the section name between the "
+        "MERIDIAN:ANCHOR:START/END comments. (ROADMAP/DECISIONS/DEVLOG are "
+        "append-only and not replaceable.)",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"},
+         "file": {"type": "string", "description": "CLAUDE.md | AGENTS.md"},
+         "anchor": {"type": "string"},
+         "content": {"type": "string", "description": "Full proposed body for the section."},
+         "session_id": {"type": "string"},
+         "urgency": {"type": "string", "enum": ["normal", "high", "blocking"]}},
+         "required": ["project_id", "file", "anchor", "content"]}},
 ]
 
 _READ_ONLY_TOOLS = {

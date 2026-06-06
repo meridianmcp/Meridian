@@ -172,6 +172,9 @@ function hideDemoAdminControls() {
     '[id^="add-sprint-"]',
     '[id^="mark-done-"]',
     '[id^="claim-task-"]',
+    // HITL markdown section-update approval (writes + commits a doc) — demo-gated
+    '.hitl-approve-btn',
+    '.hitl-reject-btn',
   ];
   writeBtnSelectors.forEach(sel => {
     document.querySelectorAll(sel).forEach(btn => {
@@ -1290,17 +1293,18 @@ function buildTabBody(project) {
             style="width:100%;padding:5px 10px;background:var(--surface-2);border:1px solid var(--border);
             color:var(--text);border-radius:4px;font-family:var(--font-mono);font-size:11px;outline:none">
         </div>
-        <div class="queue-scroll" style="flex:1;min-height:0;overflow-y:auto" id="queue-body-${project.id}">
+        <div class="queue-scroll" style="flex:1;min-height:0;overflow-y:auto" id="queue-scroll-${project.id}">
+          <div id="queue-body-${project.id}">
           <div class="empty" style="color:var(--muted)">select queue to load</div>
         </div>
-        <div id="recent-sessions-${project.id}" style="display:none;flex-shrink:0;border-top:1px solid var(--border);background:var(--surface-2);padding:8px 14px 8px"></div>
-        <div id="recent-runs-${project.id}" style="flex-shrink:0;border-top:1px solid var(--border);background:var(--surface-2)">
+        <div id="recent-sessions-${project.id}" style="display:none;border-top:1px solid var(--border);background:var(--surface-2);padding:8px 14px 8px"></div>
+        <div id="recent-runs-${project.id}" style="border-top:1px solid var(--border);background:var(--surface-2)">
           <div style="display:flex;justify-content:space-between;align-items:center;padding:6px 14px;cursor:pointer"
                id="recent-runs-toggle-${project.id}">
             <span style="font-family:var(--font-mono);font-size:10px;color:var(--muted);letter-spacing:0.05em">RECENT RUNS</span>
             <span id="recent-runs-chevron-${project.id}" style="font-size:10px;color:var(--muted)">▲</span>
           </div>
-          <div id="recent-runs-body-${project.id}" style="padding:0 14px 8px;font-family:var(--font-mono);font-size:11px;max-height:220px;overflow-y:auto">
+          <div id="recent-runs-body-${project.id}" style="padding:0 14px 8px;font-family:var(--font-mono);font-size:11px">
             <div style="color:var(--muted)">loading…</div>
           </div>
         </div>
@@ -3182,8 +3186,48 @@ async function loadSettingsTab(projectId) {
   const ghSelectedBranch = ghData?.branch || ghRepoMap[ghSelectedRepo]?.default_branch || 'main';
   const ghUsername = ghData?.github_user || ghData?.login || '';
   const ghAvatarUrl = ghData?.avatar_url || '';
-  const ghRepoOptions = (ghRepos.length ? ghRepos : (ghSelectedRepo ? [{ full_name: ghSelectedRepo }] : []))
-    .map(repo => `<option value="${escapeHtml(repo.full_name || '')}"></option>`)
+  const ghRepoChoices = ghRepos.length
+    ? ghRepos
+    : (ghSelectedRepo
+      ? [{
+          full_name: ghSelectedRepo,
+          name: ghSelectedRepo.split('/').slice(-1)[0] || ghSelectedRepo,
+          owner: ghSelectedRepo.includes('/') ? ghSelectedRepo.split('/')[0] : '',
+        }]
+      : []);
+  const repoGroups = new Map();
+  ghRepoChoices.forEach(repo => {
+    const fullName = repo.full_name || '';
+    if (!fullName) return;
+    const owner = repo.owner || (fullName.includes('/') ? fullName.split('/')[0] : 'other');
+    if (!repoGroups.has(owner)) repoGroups.set(owner, []);
+    repoGroups.get(owner).push(repo);
+  });
+  const ghRepoOptions = Array.from(repoGroups.keys())
+    .sort((a, b) => {
+      const aPersonal = !!ghUsername && a.toLowerCase() === ghUsername.toLowerCase();
+      const bPersonal = !!ghUsername && b.toLowerCase() === ghUsername.toLowerCase();
+      if (aPersonal !== bPersonal) return aPersonal ? -1 : 1;
+      const aMeridian = a.toLowerCase() === 'meridianmcp';
+      const bMeridian = b.toLowerCase() === 'meridianmcp';
+      if (aMeridian !== bMeridian) return aMeridian ? -1 : 1;
+      return a.localeCompare(b);
+    })
+    .map(owner => {
+      const label = (!!ghUsername && owner.toLowerCase() === ghUsername.toLowerCase())
+        ? `Personal (@${owner})`
+        : `${owner} repos`;
+      const options = (repoGroups.get(owner) || [])
+        .slice()
+        .sort((a, b) => String(a.name || a.full_name || '').localeCompare(String(b.name || b.full_name || '')))
+        .map(repo => {
+          const fullName = repo.full_name || '';
+          const repoName = repo.name || (fullName.includes('/') ? fullName.split('/').slice(-1)[0] : fullName);
+          return `<option value="${escapeHtml(fullName)}" ${fullName === ghSelectedRepo ? 'selected' : ''}>${escapeHtml(repoName)}</option>`;
+        })
+        .join('');
+      return `<optgroup label="${escapeHtml(label)}">${options}</optgroup>`;
+    })
     .join('');
   const hooksBaseUrl = ((mcpData && mcpData.base_url) || window.location.origin || state.serverConfig?.server_url || 'http://localhost:7878').replace(/\/$/, '');
 
@@ -3239,10 +3283,10 @@ async function loadSettingsTab(projectId) {
   // "Connect claude.ai browser" card — always shown regardless of hosted/self-hosted
   html += `<div style="margin-bottom:14px;padding:10px 12px;border:1px solid var(--border);border-radius:6px;background:var(--surface-2);display:flex;justify-content:space-between;align-items:center;gap:8px">
     <div>
-      <div style="font-weight:600;font-size:11px;color:var(--text);margin-bottom:2px">Connect claude.ai browser</div>
-      <div style="font-size:10px;color:var(--muted)">Use Meridian directly in claude.ai - no install needed</div>
+      <div style="font-weight:600;font-size:11px;color:var(--text);margin-bottom:2px">Browser connector</div>
+      <div style="font-size:10px;color:var(--muted)">Use Meridian directly in Claude or ChatGPT - hosted MCP, no extension required</div>
     </div>
-    <a href="/install-mcp" target="_blank" style="white-space:nowrap;padding:4px 10px;background:var(--accent);color:#fff;border-radius:4px;font-size:10px;font-weight:600;text-decoration:none">Setup guide →</a>
+    <a href="https://docs.usemeridian.us/browser-connector/" target="_blank" style="white-space:nowrap;padding:4px 10px;background:var(--accent);color:#fff;border-radius:4px;font-size:10px;font-weight:600;text-decoration:none">Setup guide →</a>
   </div>`;
 
   if (mcpData) {
@@ -3274,11 +3318,11 @@ async function loadSettingsTab(projectId) {
       <div style="display:grid;grid-template-columns:minmax(220px,1.4fr) minmax(110px,0.6fr) auto;gap:8px;align-items:end">
         <label style="display:flex;flex-direction:column;gap:3px;min-width:0">
           <span style="font-size:9px;color:var(--muted)">Repo</span>
-          <input type="search" id="github-repo-${projectId}" list="github-repos-${projectId}" value="${escapeHtml(ghSelectedRepo)}" placeholder="Search repos"
+          <select id="github-repo-${projectId}"
             style="padding:5px 8px;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;color:var(--text);font-family:var(--font-mono);font-size:11px;outline:none">
-          <datalist id="github-repos-${projectId}">
             ${ghRepoOptions}
-          </datalist>
+          </select>
+          <span style="font-size:9px;color:var(--muted)">Grouped by owner so personal and org repos stay separate.</span>
         </label>
         <label style="display:flex;flex-direction:column;gap:3px;min-width:0">
           <span style="font-size:9px;color:var(--muted)">Branch</span>
@@ -3361,7 +3405,7 @@ async function loadSettingsTab(projectId) {
     html += `<div style="margin-bottom:16px">
       <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;padding-bottom:4px;border-bottom:1px solid var(--border)">
         <div style="color:var(--accent);font-size:10px;letter-spacing:.06em;text-transform:uppercase">MCP client setup</div>
-        <a href="/install-mcp" target="_blank" style="font-size:10px;color:var(--muted);text-decoration:none" title="Full setup guide">setup guide →</a>
+        <a href="https://docs.usemeridian.us/browser-connector/" target="_blank" style="font-size:10px;color:var(--muted);text-decoration:none" title="Full setup guide">setup guide →</a>
       </div>
       <div style="display:flex;gap:8px;align-items:center;margin-bottom:8px;flex-wrap:wrap">
         <div style="display:flex;gap:0;border:1px solid var(--border);border-radius:3px;overflow:hidden" id="mcp-client-tabs-${projectId}">
@@ -4084,6 +4128,27 @@ async function loadSettingsTab(projectId) {
     };
   }
 
+  const ghRepoSelect = document.getElementById(`github-repo-${projectId}`);
+  const ghBranchInput = document.getElementById(`github-branch-${projectId}`);
+  if (ghRepoSelect && ghBranchInput) {
+    ghBranchInput.dataset.autoFill = ghBranchInput.value.trim() === ghSelectedBranch ? '1' : '0';
+    ghBranchInput.addEventListener('input', () => {
+      ghBranchInput.dataset.autoFill = '0';
+    });
+    ghRepoSelect.addEventListener('change', () => {
+      const selectedRepo = ghRepoSelect.value;
+      const nextDefault = ghRepoMap[selectedRepo]?.default_branch;
+      const currentDefault = ghRepoMap[ghSelectedRepo]?.default_branch || 'main';
+      if (!nextDefault) return;
+      if (!ghBranchInput.value.trim() ||
+          ghBranchInput.value.trim() === currentDefault ||
+          ghBranchInput.dataset.autoFill === '1') {
+        ghBranchInput.value = nextDefault;
+        ghBranchInput.dataset.autoFill = '1';
+      }
+    });
+  }
+
   // Wire GitHub test button
   const ghTestBtn = document.getElementById(`github-test-btn-${projectId}`);
   if (ghTestBtn) {
@@ -4237,18 +4302,44 @@ async function loadHitlTab(projectId) {
       }
       const pending = rows.filter(r => r.status === 'pending');
       const resolved = rows.filter(r => r.status !== 'pending');
+      const renderDiff = (diffText) => {
+        const lines = String(diffText || '').split('\n').map(ln => {
+          let color = 'var(--text)';
+          if (ln.startsWith('+++') || ln.startsWith('---')) color = 'var(--muted)';
+          else if (ln.startsWith('+')) color = '#22c55e';
+          else if (ln.startsWith('-')) color = '#e05252';
+          else if (ln.startsWith('@@')) color = '#38bdf8';
+          return `<span style="color:${color};display:block;white-space:pre-wrap">${escapeHtml(ln)}</span>`;
+        });
+        return `<pre style="margin-top:8px;padding:8px;background:var(--surface-1);border:1px solid var(--border);border-radius:3px;font-size:10px;font-family:var(--font-mono);max-height:260px;overflow:auto">${lines.join('')}</pre>`;
+      };
       const renderCard = (r) => {
         const urg = r.urgency || 'normal';
         const st = r.status || 'pending';
         const dt = (r.created_at || '').slice(0, 16).replace('T', ' ');
+        const isMd = r.kind === 'md_section_update';
+        let pl = null;
+        if (isMd && r.payload) { try { pl = JSON.parse(r.payload); } catch (e) { pl = null; } }
+        const mdMeta = (isMd && pl) ? `<div style="margin-top:6px;font-size:10px;color:var(--accent)"><b>${escapeHtml(pl.file || '')}</b> § ${escapeHtml(pl.anchor || '')}</div>` : '';
+        const diffHtml = (isMd && pl && pl.diff) ? renderDiff(pl.diff) : '';
         const answerHtml = r.answer ? `<div style="margin-top:8px;padding:6px 8px;background:var(--surface-1);border-radius:3px;border-left:3px solid #22c55e;color:var(--text);font-size:11px"><b>Answer:</b> ${escapeHtml(r.answer)}</div>` : '';
+        const applyErr = r.apply_error ? `<div style="margin-top:6px;color:#e05252;font-size:10px"><b>Not applied:</b> ${escapeHtml(r.apply_error)}</div>` : '';
         const ctxHtml = r.context ? `<div style="margin-top:6px;color:var(--muted);font-size:11px;font-style:italic">${escapeHtml(r.context.slice(0, 200))}</div>` : '';
-        const actionBtns = st === 'pending' ? `
+        let actionBtns = '';
+        if (st === 'pending' && isMd) {
+          actionBtns = `
+          <div style="display:flex;gap:6px;margin-top:8px;align-items:center">
+            <button class="primary hitl-approve-btn" data-hitl-id="${escapeHtml(r.id)}" style="padding:3px 12px;font-size:10px">Approve &amp; write</button>
+            <button class="secondary hitl-reject-btn" data-hitl-id="${escapeHtml(r.id)}" style="padding:3px 10px;font-size:10px">Reject</button>
+          </div>`;
+        } else if (st === 'pending') {
+          actionBtns = `
           <div style="display:flex;gap:6px;margin-top:8px;align-items:center">
             <input type="text" placeholder="Answer…" id="hitl-ans-${r.id}" style="flex:1;background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:11px;font-family:var(--font-mono);padding:4px 8px;outline:none">
             <button class="primary hitl-answer-btn" data-hitl-id="${escapeHtml(r.id)}" style="padding:3px 10px;font-size:10px">Answer</button>
             <button class="secondary hitl-dismiss-btn" data-hitl-id="${escapeHtml(r.id)}" style="padding:3px 10px;font-size:10px">Dismiss</button>
-          </div>` : '';
+          </div>`;
+        }
         return `<div style="background:var(--surface-2);border:1px solid var(--border);border-left:3px solid ${urgencyColor[urg] || 'var(--accent)'};border-radius:0 4px 4px 0;padding:10px 12px;margin-bottom:8px">
           <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px;margin-bottom:4px">
             <div style="font-weight:600;font-size:12px;color:var(--text)">${escapeHtml(r.question || '')}</div>
@@ -4258,7 +4349,7 @@ async function loadHitlTab(projectId) {
             </div>
           </div>
           <div style="color:var(--muted);font-size:10px">${escapeHtml(dt)}${r.assigned_to ? ' · @' + escapeHtml(r.assigned_to) : ''}</div>
-          ${ctxHtml}${answerHtml}${actionBtns}
+          ${mdMeta}${ctxHtml}${diffHtml}${answerHtml}${applyErr}${actionBtns}
         </div>`;
       };
       let html = pending.map(renderCard).join('');
@@ -4286,6 +4377,27 @@ async function loadHitlTab(projectId) {
           try {
             await api(`/hitl/${btn.dataset.hitlId}`, { method: 'PATCH', body: JSON.stringify({ action: 'dismiss' }) });
             toast('dismissed');
+            render();
+          } catch (e) { toast('failed: ' + e.message, true); }
+        };
+      });
+      body.querySelectorAll('.hitl-approve-btn').forEach(btn => {
+        btn.onclick = async () => {
+          if (!confirm('Approve and write this markdown change? It will be committed at the next checkpoint.')) return;
+          try {
+            const res = await api(`/hitl/${btn.dataset.hitlId}`, { method: 'PATCH', body: JSON.stringify({ action: 'answer', answer: 'approved' }) });
+            if (res && res.applied === false) toast('not applied: ' + (res.apply_error || 'see card'), true);
+            else toast('approved ✓ — section written, staged for checkpoint');
+            render();
+          } catch (e) { toast('failed: ' + e.message, true); }
+        };
+      });
+      body.querySelectorAll('.hitl-reject-btn').forEach(btn => {
+        btn.onclick = async () => {
+          if (!confirm('Reject this proposed change?')) return;
+          try {
+            await api(`/hitl/${btn.dataset.hitlId}`, { method: 'PATCH', body: JSON.stringify({ action: 'dismiss' }) });
+            toast('rejected');
             render();
           } catch (e) { toast('failed: ' + e.message, true); }
         };
@@ -4616,7 +4728,7 @@ async function loadRecentRuns(projectId) {
           <span style="font-size:9px;color:var(--muted)">${cnt} tasks · ${dur} · ${ts}</span>
           <span style="font-size:9px;color:${statusColor}">${run.status}</span>
         </div>
-        <div class="run-transcript-${escapeHtml(run.id)}" style="display:none;margin-top:6px;padding:6px 8px;background:var(--surface-2);border-radius:3px;font-size:10px;white-space:pre-wrap;max-height:200px;overflow-y:auto;color:var(--muted)"></div>
+        <div class="run-transcript-${escapeHtml(run.id)}" style="display:none;margin-top:6px;padding:6px 8px;background:var(--surface-2);border-radius:3px;font-size:10px;white-space:pre-wrap;color:var(--muted)"></div>
       </div>`;
     }).join('');
 

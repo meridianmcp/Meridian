@@ -1,115 +1,132 @@
-# Connecting Meridian from browser AI clients
+# Browser Connector
 
-Use Meridian from browser-based AI clients without giving up the shared session memory, sprint board, or HITL queue. The setup path depends on the client:
+Use Meridian from browser-based AI clients without giving up the shared session
+memory, sprint board, or HITL queue.
 
-- **claude.ai** can connect directly to hosted Meridian with native connectors; use an SSE bridge only for self-hosted local servers
-- **ChatGPT** uses a custom connector backed by a remote MCP server; no Chrome extension is required
+- **Claude** can connect directly to hosted Meridian with a remote MCP connector.
+- **ChatGPT** now surfaces these integrations under **Settings > Apps**.
+- **Self-hosted localhost** setups still need a bridge or a public URL.
 
 ---
 
-## claude.ai
+## Hosted browser clients
 
-Use Meridian directly inside claude.ai. Hosted Meridian uses Claude's native connectors flow, so there is no local install, no terminal, and no browser extension required. If you are self-hosting Meridian on `localhost`, use an SSE bridge to expose that local server to claude.ai.
+Hosted Meridian is the simplest path for both Claude and ChatGPT:
 
-## Video walkthrough
+1. Sign in to [usemeridian.us](https://usemeridian.us).
+2. Add Meridian with the public MCP URL: `https://usemeridian.us/mcp`
+3. Approve the OAuth popup.
+4. Start using Meridian tools in chat.
+
+### Claude
+
+In Claude, go to **Customize > Connectors** (or **Settings > Connectors** in
+some layouts), choose **Add custom connector**, then paste:
+
+- **Name:** `Meridian`
+- **URL:** `https://usemeridian.us/mcp`
+
+![Claude custom connector dialog](screenshots/browser-connector-claude-add.jpg)
+*Claude custom connector modal with the hosted Meridian MCP URL prefilled.*
+
+![Claude connector tool permissions](screenshots/browser-connector-claude-tools.jpg)
+*Claude showing Meridian connected and exposing the shared-session toolset.*
+
+#### Claude video walkthrough
 
 <iframe width="100%" height="400" src="https://www.youtube.com/embed/dxX1Nwi72lI" frameborder="0" allowfullscreen></iframe>
 
+### ChatGPT
+
+In ChatGPT, open **Settings > Apps**, choose **New App**, then add Meridian's
+public MCP endpoint:
+
+- **Name:** `Meridian`
+- **Server URL:** `https://usemeridian.us/mcp`
+
+![ChatGPT new app dialog](screenshots/browser-connector-chatgpt-add.jpg)
+*ChatGPT's "New App" flow pointed at the hosted Meridian MCP endpoint.*
+
+![ChatGPT connected Meridian app](screenshots/browser-connector-chatgpt-connected.jpg)
+*ChatGPT with Meridian connected under Settings > Apps.*
+
+#### ChatGPT video walkthrough
+
+<iframe width="100%" height="400" src="https://www.youtube.com/embed/U5pUUpOy5H4" frameborder="0" allowfullscreen></iframe>
+
+!!! note "Current ChatGPT naming"
+    OpenAI now calls these integrations **Apps**. Older docs and screenshots may
+    still say "connectors" or "custom connectors", but the Meridian MCP URL is
+    still the same: `https://usemeridian.us/mcp`.
+
 ---
 
-## Quick start (hosted tier)
+## Self-hosted local browser clients
 
-1. **Sign in to Meridian** - Go to [usemeridian.us](https://usemeridian.us) and sign in with Google or GitHub.
+Hosted browser clients talk to a public MCP endpoint. If you are running
+Meridian on `localhost`, you have two paths:
 
-2. **Open claude.ai connectors** - In claude.ai, go to **Settings** -> **Connectors** -> **Add custom**.
+- **Claude + Chrome/Chromium:** use a local SSE bridge.
+- **Claude or ChatGPT with remote MCP:** expose Meridian on a public HTTPS URL
+  and use `/mcp`.
 
-3. **Add Meridian** - Paste the hosted MCP server details:
-    - **Name:** `meridian`
-    - **URL:** `https://usemeridian.us/mcp`
+<details>
+<summary>Self-hosted only: local Claude bridge for localhost</summary>
 
-4. **Authorize** - Claude opens Meridian's OAuth flow. Approve the connection and sign in if prompted.
-
-5. **Start chatting** - Meridian tools (`start_session`, `log_task`, `generate_handoff`, etc.) are now available in your claude.ai chat.
-
----
-
-## Quick start (self-hosted)
-
-1. Start your local Meridian server:
+1. Start Meridian locally:
 
 ```bash
 pixi run start
 # or: python -m meridian
 ```
 
-2. In claude.ai, use a browser-based SSE bridge for your local server:
+2. Install a browser bridge such as
+   [dnakov/claude-mcp](https://github.com/dnakov/claude-mcp).
+3. Add your local SSE endpoint:
 
-<details>
-<summary>Self-hosted only: install the Chrome extension bridge</summary>
+   - **Name:** `Meridian (local)`
+   - **URL:** `http://localhost:7878/mcp/sse`
 
-- Install [dnakov/claude-mcp](https://github.com/dnakov/claude-mcp) from the project's releases page.
-- Open the extension and choose **Add server**.
-- Add your local Meridian instance:
-  - **Name:** `meridian`
-  - **URL:** `http://localhost:7878/mcp`
+4. Open Claude and enable the connector for the conversation.
 
 </details>
 
-3. Open claude.ai. The bridge discovers all tools via the SSE handshake.
-
-!!! note "No auth popup for self-hosted"
-    The auth popup only appears for the hosted tier at usemeridian.us. Self-hosted connections go directly to your local server with no additional login step.
-
----
-
-## ChatGPT
-
-ChatGPT connects to Meridian as a **custom connector** backed by a **remote MCP server**. Hosted Meridian is the easiest path because it already exposes a public MCP endpoint, and you do not need any browser extension for this flow.
-
-### Setup
-
-1. Open ChatGPT and sign in.
-2. Enable Developer mode or custom connectors if your workspace requires it.
-3. Add Meridian as a custom connector and set the MCP URL to `https://usemeridian.us/mcp`.
-4. Complete the authorization flow if ChatGPT prompts for sign-in or approval.
-
-### Video walkthrough
-
-<iframe width="100%" height="400" src="https://www.youtube.com/embed/U5pUUpOy5H4" frameborder="0" allowfullscreen></iframe>
-
-!!! note "Remote MCP only"
-    ChatGPT connects to remote MCP servers. A local URL such as `http://localhost:7878/mcp` will not connect directly from ChatGPT. If you are self-hosting Meridian, put it behind a secure public URL or tunnel first.
-
-Depending on your ChatGPT plan or workspace, you may need developer mode enabled or admin approval before custom connectors are available. OpenAI updates those requirements over time, so check the latest guidance here:
-
-- [Apps in ChatGPT](https://help.openai.com/en/articles/11487775-connectors-in-chatgpt)
-- [Developer mode and MCP apps in ChatGPT](https://help.openai.com/en/articles/12584461-developer-mode-apps-and-full-mcp-connectors-in-chatgpt-beta)
+!!! note "Public URL required for remote MCP"
+    Claude remote custom connectors and ChatGPT custom apps do **not** connect
+    directly to `http://localhost`. If you want browser clients to reach your
+    self-hosted server without a local bridge, expose Meridian on HTTPS first
+    and use `https://your-host/mcp`.
 
 ---
 
 ## Troubleshooting
 
-**"No tools loaded" / connection hangs**
+**"No tools loaded" or the connector hangs**
 
-- Make sure Meridian is running (`pixi run start` locally, or check your hosted account is active)
-- For hosted: reconnect from claude.ai **Settings** -> **Connectors** and confirm the URL is `https://usemeridian.us/mcp`
-- For self-hosted: verify the browser extension is installed and pointing at `http://localhost:7878/mcp`
+- Make sure Meridian is running.
+- For hosted, reconnect and confirm the URL is `https://usemeridian.us/mcp`.
+- For self-hosted localhost bridges, confirm the extension points to
+  `http://localhost:7878/mcp/sse`.
+- For public self-hosted URLs, confirm `https://your-host/mcp` is reachable
+  from outside your network.
 
-**Auth popup doesn't close**
+**Auth popup does not close**
 
-- Complete the Meridian OAuth flow in the popup, then return to claude.ai
-- If it still hangs, reconnect Meridian from **Settings** -> **Connectors**
+- Finish the Meridian OAuth flow, then return to Claude or ChatGPT.
+- If it still hangs, disconnect Meridian and add it again.
 
 **Tools appear but calls fail**
 
-- For self-hosted: check the extension logs for 401 / 403 errors
-- For hosted: your API token may need to be regenerated (Settings -> API token)
+- For hosted, regenerate your API token if your account was recently reset.
+- For self-hosted public URLs, verify your reverse proxy forwards `/mcp` cleanly.
+- For localhost bridges, check the extension logs for 401 / 403 errors.
 
 ---
 
 ## What you get
 
-Once connected, claude.ai has access to all Meridian MCP tools:
+Once connected, browser clients can call the same core Meridian tools as your
+desktop agent:
 
 | Tool | What it does |
 |------|-------------|
@@ -124,16 +141,8 @@ Once connected, claude.ai has access to all Meridian MCP tools:
 
 ---
 
-## FAQ
+## Reference links
 
-**Does this work on Firefox?**
-
-Hosted Meridian works anywhere claude.ai supports native connectors. The optional dnakov/claude-mcp bridge for self-hosted local servers is Chrome/Chromium only.
-
-**Can I use a different MCP extension?**
-
-For self-hosted local Meridian, any browser extension that supports the [MCP SSE transport](https://spec.modelcontextprotocol.io) will work. The URL to add is `http://localhost:7878/mcp`.
-
-**Is my data safe?**
-
-For the hosted tier, all MCP calls go over HTTPS to your isolated Neon Postgres database. The claude.ai tab never has direct access to your DB - all operations go through the Meridian API layer.
+- [Anthropic: custom connectors via remote MCP](https://support.claude.com/en/articles/11175166-get-started-with-custom-connectors-using-remote-mcp)
+- [OpenAI: Apps in ChatGPT](https://help.openai.com/en/articles/11487775-apps-in-chatgpt)
+- [OpenAI: Developer mode and MCP apps](https://help.openai.com/en/articles/12584461-developer-mode-and-full-mcp-connectors-in-chatgpt-beta)

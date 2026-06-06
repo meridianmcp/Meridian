@@ -608,9 +608,9 @@ input[type=text] {
 .timeline-log-desc { color: var(--text); }
 
 /* v1.4.0 — work queue panel */
-/* The queue body is the single scroll container for the tab. min-height:0 on
-   the inline style lets this flex child shrink below content height so it
-   scrolls instead of pushing the recent-runs / recent-sessions panels. */
+/* The queue-scroll wrapper is the single scroll container for the tab.
+   min-height:0 on the inline style lets this flex child shrink below content
+   height so the entire queue column scrolls as one surface. */
 .queue-scroll { scrollbar-width: thin; scrollbar-color: var(--border) transparent; }
 .queue-scroll::-webkit-scrollbar { width: 10px; }
 .queue-scroll::-webkit-scrollbar-track { background: transparent; }

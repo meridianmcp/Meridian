@@ -38,9 +38,16 @@ async def create_pinned_decision_endpoint(
     if not title or not text:
         raise HTTPException(status_code=400, detail="title and body required")
     try:
-        return await db_module.pin_decision(await _db(request), project_id, title, text, category)
+        result = await db_module.pin_decision(await _db(request), project_id, title, text, category)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    try:
+        from meridian.server import _append_decision_to_md  # noqa: PLC0415
+
+        await _append_decision_to_md(title, text, category)
+    except Exception:  # noqa: BLE001
+        pass
+    return result
 
 
 @router.patch("/projects/{project_id}/decisions-pinned/{decision_id}")
