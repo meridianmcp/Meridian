@@ -34,7 +34,7 @@ some layouts), choose **Add custom connector**, then paste:
 
 #### Claude video walkthrough
 
-<iframe width="100%" height="400" src="https://www.youtube.com/embed/dxX1Nwi72lI" frameborder="0" allowfullscreen></iframe>
+<iframe width="100%" height="400" src="https://www.youtube.com/embed/jJqUhqBVEyE" frameborder="0" allowfullscreen></iframe>
 
 ### ChatGPT
 
@@ -52,12 +52,38 @@ public MCP endpoint:
 
 #### ChatGPT video walkthrough
 
-<iframe width="100%" height="400" src="https://www.youtube.com/embed/U5pUUpOy5H4" frameborder="0" allowfullscreen></iframe>
+<iframe width="100%" height="400" src="https://www.youtube.com/embed/toNRFzWbqPI" frameborder="0" allowfullscreen></iframe>
 
 !!! note "Current ChatGPT naming"
     OpenAI now calls these integrations **Apps**. Older docs and screenshots may
     still say "connectors" or "custom connectors", but the Meridian MCP URL is
     still the same: `https://usemeridian.us/mcp`.
+
+### Claude Desktop
+
+Connect Meridian to Claude Desktop via MCP configuration:
+
+1. Open **Claude Desktop** settings.
+2. Click **Developer**, then **Edit Config**.
+3. Add the Meridian server block to your `mcpServers`.
+4. Restart Claude Desktop.
+
+#### Claude Desktop video walkthrough
+
+*Video walkthrough coming soon.*
+
+### Codex / Windsurf
+
+Connect Meridian to Codex or Windsurf via MCP server settings:
+
+1. Open **Codex Settings** (or **Windsurf Settings**).
+2. Click **MCP Servers**, then **Add Server**.
+3. Choose **Streamable HTTP**.
+4. Name it `Meridian` and paste the URL: `https://usemeridian.us/mcp`.
+
+#### Codex / Windsurf video walkthrough
+
+*Video walkthrough coming soon.*
 
 ---
 
