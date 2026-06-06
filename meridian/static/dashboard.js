@@ -80,6 +80,141 @@ function getPanelState(projectId) {
   return state.panels[projectId];
 }
 
+function _summarizeApiErrorText(raw) {
+  if (raw === undefined || raw === null) return 'Request failed before data could load.';
+  let summary = raw;
+  if (typeof raw === 'string') {
+    try {
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed === 'object') {
+        summary = parsed.detail || parsed.error || parsed.message || raw;
+      }
+    } catch (_) {
+      summary = raw;
+    }
+  }
+  return String(summary)
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 240) || 'Request failed before data could load.';
+}
+
+function _projectLoadErrorInfo(path, error) {
+  const status = Number.isFinite(Number(error?.status))
+    ? Number(error.status)
+    : (String(error?.message || '').match(/^(\d{3})\s*:/) ? parseInt(String(error.message).match(/^(\d{3})\s*:/)[1], 10) : null);
+  const rawText = error?.responseText || error?.message || String(error || 'Request failed');
+  return {
+    endpoint: path,
+    status,
+    summary: _summarizeApiErrorText(rawText),
+    at: Date.now(),
+  };
+}
+
+function wireProjectLoadRetry(container, projectId) {
+  container?.querySelectorAll('[data-project-retry]').forEach((btn) => {
+    btn.onclick = () => retryProjectSurface(projectId);
+  });
+}
+
+function renderProjectLoadError(projectId, title, path, error) {
+  const info = _projectLoadErrorInfo(path, error);
+  const statusLabel = info.status ? `HTTP ${info.status}` : 'Request failed';
+  return `
+    <div class="project-load-error">
+      <div class="project-load-error__title">${escapeHtml(title)}</div>
+      <div class="project-load-error__meta">${escapeHtml(statusLabel)} · <code>${escapeHtml(info.endpoint)}</code></div>
+      <div class="project-load-error__body">${escapeHtml(info.summary)}</div>
+      <div class="project-load-error__actions">
+        <button class="secondary" data-project-retry="1" style="padding:4px 10px;font-size:10px">Retry failed loads</button>
+      </div>
+    </div>
+  `;
+}
+
+function recordProjectLoadError(projectId, path, error) {
+  const panel = getPanelState(projectId);
+  panel.loadErrors = panel.loadErrors || {};
+  const info = _projectLoadErrorInfo(path, error);
+  panel.loadErrors[path] = info;
+  renderProjectLoadAlert(projectId);
+  return info;
+}
+
+function clearProjectLoadError(projectId, path) {
+  const panel = getPanelState(projectId);
+  if (!panel.loadErrors || !panel.loadErrors[path]) return;
+  delete panel.loadErrors[path];
+  renderProjectLoadAlert(projectId);
+}
+
+function renderProjectLoadAlert(projectId) {
+  const host = document.getElementById(`project-fetch-alert-${projectId}`);
+  if (!host) return;
+  const panel = getPanelState(projectId);
+  const errors = Object.values(panel.loadErrors || {}).sort((a, b) => b.at - a.at);
+  if (!errors.length) {
+    host.style.display = 'none';
+    host.innerHTML = '';
+    return;
+  }
+  const visible = errors.slice(0, 3);
+  const statusText = visible.length === 1
+    ? 'A backing request failed, so part of this panel may be incomplete.'
+    : 'Multiple backing requests failed, so part of this panel may be incomplete.';
+  const moreText = errors.length > visible.length
+    ? `<div class="project-fetch-alert__meta">+${errors.length - visible.length} more failing request${errors.length - visible.length === 1 ? '' : 's'} hidden.</div>`
+    : '';
+  host.style.display = 'block';
+  host.innerHTML = `
+    <div class="project-fetch-alert__title">Project data failed to load</div>
+    <div class="project-fetch-alert__summary">${escapeHtml(statusText)}</div>
+    <div class="project-fetch-alert__list">
+      ${visible.map((info) => {
+        const statusLabel = info.status ? `HTTP ${info.status}` : 'Request failed';
+        return `
+          <div class="project-fetch-alert__item">
+            <div class="project-fetch-alert__endpoint"><code>${escapeHtml(info.endpoint)}</code></div>
+            <div class="project-fetch-alert__meta">${escapeHtml(statusLabel)} · ${escapeHtml(info.summary)}</div>
+          </div>
+        `;
+      }).join('')}
+    </div>
+    ${moreText}
+    <div class="project-fetch-alert__actions">
+      <button class="secondary" id="project-fetch-retry-${projectId}" style="padding:4px 10px;font-size:10px">Retry failed loads</button>
+    </div>
+  `;
+  const retryBtn = document.getElementById(`project-fetch-retry-${projectId}`);
+  if (retryBtn) retryBtn.onclick = () => retryProjectSurface(projectId);
+}
+
+async function retryProjectSurface(projectId) {
+  const panel = getPanelState(projectId);
+  await Promise.allSettled([
+    refreshGoal(projectId),
+    refreshSessions(projectId),
+    refreshTasks(projectId),
+  ]);
+  const activeVtab = panel.activeVtab || 'status';
+  if (activeVtab === 'live') await refreshLiveTab(projectId);
+  if (activeVtab === 'files') await loadFilesTab(projectId);
+  if (activeVtab === 'timeline') await loadTimeline(projectId);
+  if (activeVtab === 'rewind') await loadRewindTab(projectId, panel.rewindDays || 7);
+  if (activeVtab === 'queue') {
+    await loadQueue(projectId);
+    await updateLiveFeed(projectId);
+    await loadRecentRuns(projectId);
+  }
+  if (activeVtab === 'team') await loadTeamTab(projectId);
+  if (activeVtab === 'notes') await loadNotesTab(projectId);
+  if (activeVtab === 'hitl') await loadHitlTab(projectId);
+  if (activeVtab === 'docs') await loadDocsTab(projectId);
+  if (activeVtab === 'settings') await loadSettingsTab(projectId);
+}
+
 function syncSidebarActiveProject() {
   document.querySelectorAll('.project-item').forEach(item => {
     item.classList.toggle('active', item.dataset.projectId === state.activeTab);
@@ -107,7 +242,7 @@ async function loadProjectSettings(projectId, opts={}) {
   const panel = getPanelState(projectId);
   if (!opts.force && panel._projectSettings) return panel._projectSettings;
   if (!opts.force && panel._projectSettingsPromise) return panel._projectSettingsPromise;
-  panel._projectSettingsPromise = api(`/projects/${projectId}/settings`)
+  panel._projectSettingsPromise = projectApi(projectId, `/projects/${projectId}/settings`)
     .then((settings) => {
       panel._projectSettings = settings || { project_id: projectId, max_pinned_decisions: DEFAULT_MAX_PINNED_DECISIONS };
       return panel._projectSettings;
@@ -456,9 +591,24 @@ async function api(path, opts={}) {
       throw new Error('demo_readonly');
     }
     const text = await r.text();
-    throw new Error(`${r.status}: ${text}`);
+    const err = new Error(`${r.status}: ${text}`);
+    err.status = r.status;
+    err.endpoint = path;
+    err.responseText = text;
+    throw err;
   }
   return r.status === 204 ? null : r.json();
+}
+
+async function projectApi(projectId, path, opts={}) {
+  try {
+    const data = await api(path, opts);
+    clearProjectLoadError(projectId, path);
+    return data;
+  } catch (e) {
+    recordProjectLoadError(projectId, path, e);
+    throw e;
+  }
 }
 
 async function loadServerConfig() {
@@ -1167,6 +1317,7 @@ function buildTabBody(project) {
       <button class="vtab-btn" data-vtab="settings" title="Notification Settings">⚙</button>
     </div>
     <div class="vtab-drawer open" id="drawer-${project.id}">
+      <div class="project-fetch-alert" id="project-fetch-alert-${project.id}"></div>
       <div class="drawer-panel active" id="drawer-status-${project.id}">
         <div class="drawer-header">
           <span>STATUS · ${escapeHtml(project.name)}</span>
@@ -1415,6 +1566,7 @@ function buildTabBody(project) {
           </div>
         </div>
       </div>
+      </div>
       <div class="drawer-panel" id="drawer-notes-${project.id}">
         <div class="drawer-header" style="justify-content:space-between">
           <span style="display:flex;flex-direction:column;gap:1px">
@@ -1561,6 +1713,7 @@ function buildTabBody(project) {
   state.panels[project.id] = {
     ws: null, taskCache: [], goalRaw: null, goalIsJson: false,
     activeVtab: 'status',
+    loadErrors: {},
   };
 
   // Vtab drawer toggle — same tab again collapses; different tab switches.
@@ -1636,8 +1789,9 @@ function buildTabBody(project) {
   // Sprint tab board — compact one-liner showing current sprint progress only.
   // Full sprint board lives in the LIVE tab. Goal tab just shows the header.
   async function loadSprintBoard() {
+    const sprintItemsPath = `/projects/${project.id}/sprint-items`;
     try {
-      const items = await api(`/projects/${project.id}/sprint-items`);
+      const items = await projectApi(project.id, sprintItemsPath);
       const board = document.getElementById(`sprint-board-goal-${project.id}`);
       if (!board) return;
       if (!items || !items.length) {
@@ -1661,7 +1815,12 @@ function buildTabBody(project) {
         ${activeCount > 0 ? `<span style="color:var(--accent)">${activeCount} pending</span>` : '<span style="color:var(--accent-green)">✓ complete</span>'}
         <span style="opacity:0.5">· See LIVE tab for full board</span>
       </div>`;
-    } catch(e) { console.error('Sprint board load failed:', e); }
+    } catch(e) {
+      const board = document.getElementById(`sprint-board-goal-${project.id}`);
+      if (!board) return;
+      board.innerHTML = renderProjectLoadError(project.id, 'Sprint board unavailable', sprintItemsPath, e);
+      wireProjectLoadRetry(board, project.id);
+    }
   }
   _sprintBoardReloaders[project.id] = loadSprintBoard;
   loadSprintBoard();
@@ -1672,7 +1831,7 @@ function buildTabBody(project) {
     const inp = document.getElementById(`goal-sprint-${project.id}`);
     if (!sel || !inp) return;
     try {
-      const sessions = await api(`/projects/${project.id}/sessions`);
+      const sessions = await projectApi(project.id, `/projects/${project.id}/sessions`);
       const active = (sessions || []).filter(s => s.status !== 'closed' && s.status !== 'archived');
       const opts = active.map(s => `<option value="${escapeHtml(s.name)}">${escapeHtml(s.name)}</option>`).join('');
       sel.innerHTML = opts + '<option value="__custom__">Custom…</option>';
@@ -1911,15 +2070,47 @@ async function loadLiveTab(projectId) {
 async function refreshLiveTab(projectId) {
   /** Fetch fresh sessions + tasks + sprint items and repaint all Live sections. */
   try {
-    const [sessions, tasks, sprintItems] = await Promise.all([
-      api(`/projects/${projectId}/sessions?active_only=false`).catch(() => []),
-      api(`/projects/${projectId}/tasks?limit=200`).catch(() => []),
-      api(`/projects/${projectId}/sprint-items`).catch(() => []),
+  const sessionsPath = `/projects/${projectId}/sessions?active_only=false`;
+    const tasksPath = `/projects/${projectId}/tasks?limit=200`;
+    const sprintItemsPath = `/projects/${projectId}/sprint-items`;
+    const [sessionsResult, tasksResult, sprintItemsResult] = await Promise.allSettled([
+      projectApi(projectId, sessionsPath),
+      projectApi(projectId, tasksPath),
+      projectApi(projectId, sprintItemsPath),
     ]);
-    renderSprintProgress(projectId, sprintItems || []);
-    renderLiveSessions(projectId, sessions || [], tasks || []);
-    renderLiveQueue(projectId, tasks || []);
-    cacheMostRecentSession(projectId, sessions || []);
+
+    if (sprintItemsResult.status === 'fulfilled') {
+      renderSprintProgress(projectId, sprintItemsResult.value || []);
+    } else {
+      const sprintRoot = document.getElementById(`live-sprint-progress-${projectId}`);
+      if (sprintRoot) {
+        sprintRoot.innerHTML = renderProjectLoadError(projectId, 'Sprint progress unavailable', sprintItemsPath, sprintItemsResult.reason);
+        wireProjectLoadRetry(sprintRoot, projectId);
+      }
+    }
+
+    if (sessionsResult.status === 'fulfilled' && tasksResult.status === 'fulfilled') {
+      renderLiveSessions(projectId, sessionsResult.value || [], tasksResult.value || []);
+      cacheMostRecentSession(projectId, sessionsResult.value || []);
+    } else {
+      const sessionsRoot = document.getElementById(`live-sessions-${projectId}`);
+      if (sessionsRoot) {
+        const liveError = sessionsResult.status === 'rejected' ? sessionsResult.reason : tasksResult.reason;
+        const livePath = sessionsResult.status === 'rejected' ? sessionsPath : tasksPath;
+        sessionsRoot.innerHTML = renderProjectLoadError(projectId, 'Live sessions unavailable', livePath, liveError);
+        wireProjectLoadRetry(sessionsRoot, projectId);
+      }
+    }
+
+    if (tasksResult.status === 'fulfilled') {
+      renderLiveQueue(projectId, tasksResult.value || []);
+    } else {
+      const queueRoot = document.getElementById(`live-queue-${projectId}`);
+      if (queueRoot) {
+        queueRoot.innerHTML = renderProjectLoadError(projectId, 'Live queue unavailable', tasksPath, tasksResult.reason);
+        wireProjectLoadRetry(queueRoot, projectId);
+      }
+    }
   } catch(e) { /* ignore — WS will retry on next event */ }
 }
 
@@ -4417,7 +4608,7 @@ async function loadNotesTab(projectId) {
     const tag = (tagFilter && tagFilter.value || '').trim();
     const qs = tag ? `?tag=${encodeURIComponent(tag)}` : '';
     try {
-      const notes = await api(`/projects/${projectId}/notes${qs}`);
+      const notes = await projectApi(projectId, `/projects/${projectId}/notes${qs}`);
       const visibleNotes = (notes || []).filter(n => {
         const title = String(n.title || '').trim().toLowerCase();
         const tags = String(n.tags || '')
@@ -4462,7 +4653,8 @@ async function loadNotesTab(projectId) {
         };
       });
     } catch (e) {
-      body.innerHTML = `<div style="color:var(--muted)">failed to load notes: ${escapeHtml(String(e))}</div>`;
+      body.innerHTML = renderProjectLoadError(projectId, 'Notes unavailable', `/projects/${projectId}/notes${qs}`, e);
+      wireProjectLoadRetry(body, projectId);
     }
   };
 
@@ -4638,7 +4830,7 @@ async function loadTeamTab(projectId) {
     body.innerHTML = `<div class="empty" style="color:var(--muted)">loading team summary…</div>`;
     const days = parseInt((daySel && daySel.value) || '14', 10);
     try {
-      const data = await api(`/team/summary?project_id=${encodeURIComponent(projectId)}&days=${days}`);
+      const data = await projectApi(projectId, `/team/summary?project_id=${encodeURIComponent(projectId)}&days=${days}`);
       const humans = data.humans || [];
       if (humans.length === 0) {
         body.innerHTML = `<div style="color:var(--muted);padding:10px;text-align:center;border:1px dashed var(--border);border-radius:4px">
@@ -4758,7 +4950,8 @@ async function loadTeamTab(projectId) {
         </section>
         ${decisionsHtml}`;
     } catch (e) {
-      body.innerHTML = `<div style="color:var(--muted)">failed to load team summary: ${escapeHtml(String(e))}</div>`;
+      body.innerHTML = renderProjectLoadError(projectId, 'Team summary unavailable', `/team/summary?project_id=${encodeURIComponent(projectId)}&days=${days}`, e);
+      wireProjectLoadRetry(body, projectId);
     }
   };
 
@@ -4980,8 +5173,8 @@ async function loadQueue(projectId) {
   body.innerHTML = '<div class="empty" style="color:var(--muted)">loading…</div>';
   try {
     const [sessions, sprintItems] = await Promise.all([
-      api(`/projects/${projectId}/sessions?active_only=false`).catch(() => []),
-      api(`/projects/${projectId}/sprint-items`),
+      projectApi(projectId, `/projects/${projectId}/sessions?active_only=false`).catch(() => []),
+      projectApi(projectId, `/projects/${projectId}/sprint-items`),
     ]);
     const liveSession = (sessions || []).find(s => s.status === 'active');
     panel.liveSessionId = liveSession ? liveSession.id : null;
@@ -5025,7 +5218,8 @@ async function loadQueue(projectId) {
       }
     }
   } catch (e) {
-    body.innerHTML = `<div class="empty">queue failed: ${escapeHtml(e.message)}</div>`;
+    body.innerHTML = renderProjectLoadError(projectId, 'Queue unavailable', `/projects/${projectId}/sprint-items`, e);
+    wireProjectLoadRetry(body, projectId);
   }
 }
 
@@ -5364,8 +5558,9 @@ async function refreshGoal(projectId) {
   const ta = document.getElementById(`goal-${projectId}`);
   const v = document.getElementById(`goal-version-${projectId}`);
   if (!ta) return;
+  const goalPath = `/projects/${projectId}/goal`;
   try {
-    const goal = await api(`/projects/${projectId}/goal`);
+    const goal = await projectApi(projectId, goalPath);
     state.panels[projectId].goalRaw = goal.content;
     let text;
     if (typeof goal.content === 'string') {
@@ -5460,7 +5655,10 @@ async function refreshGoal(projectId) {
     loadPinnedDecisions(projectId);
   } catch (e) {
     ta.value = '';
-    v.textContent = '(unset)';
+    ta.placeholder = 'Goal state failed to load.';
+    v.textContent = '(load failed)';
+    const titleEl = document.getElementById(`goal-title-${projectId}`);
+    if (titleEl) titleEl.textContent = 'Goal state unavailable';
   }
 }
 
@@ -6079,8 +6277,9 @@ function _sessionPresenceDot(last_seen) {
 async function refreshSessions(projectId) {
   const root = document.getElementById(`sessions-${projectId}`);
   if (!root) return;
+  const sessionsPath = `/projects/${projectId}/sessions`;
   try {
-    const sessions = await api(`/projects/${projectId}/sessions`);
+    const sessions = await projectApi(projectId, sessionsPath);
     populateSessionDropdown(projectId, sessions);
     if (!sessions.length) {
       root.innerHTML = '<div class="session-row meta">(no active sessions)</div>';
@@ -6124,16 +6323,30 @@ async function refreshSessions(projectId) {
       return header + children;
     }).join('');
     root.innerHTML = rows;
-  } catch(e) {}
+  } catch(e) {
+    root.innerHTML = renderProjectLoadError(projectId, 'Sessions unavailable', sessionsPath, e);
+    wireProjectLoadRetry(root, projectId);
+  }
 }
 
 async function refreshTasks(projectId) {
+  const tasksPath = `/projects/${projectId}/tasks?limit=100`;
   try {
-    const tasks = await api(`/projects/${projectId}/tasks?limit=100`);
+    const tasks = await projectApi(projectId, tasksPath);
     state.panels[projectId].taskCache = tasks;
     state.panels[projectId].taskOffset = tasks.length;
     renderTasks(projectId);
-  } catch(e) {}
+  } catch(e) {
+    const root = document.getElementById(`tasks-${projectId}`);
+    const hitlRoot = document.getElementById(`hitl-queue-${projectId}`);
+    const banner = document.getElementById(`hitl-banner-${projectId}`);
+    if (banner) banner.style.display = 'none';
+    if (hitlRoot) hitlRoot.innerHTML = '';
+    if (root) {
+      root.innerHTML = renderProjectLoadError(projectId, 'Task log unavailable', tasksPath, e);
+      wireProjectLoadRetry(root, projectId);
+    }
+  }
 }
 
 function renderTasks(projectId) {
