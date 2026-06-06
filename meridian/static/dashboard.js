@@ -172,6 +172,9 @@ function hideDemoAdminControls() {
     '[id^="add-sprint-"]',
     '[id^="mark-done-"]',
     '[id^="claim-task-"]',
+    // HITL markdown section-update approval (writes + commits a doc) — demo-gated
+    '.hitl-approve-btn',
+    '.hitl-reject-btn',
   ];
   writeBtnSelectors.forEach(sel => {
     document.querySelectorAll(sel).forEach(btn => {
@@ -4299,18 +4302,44 @@ async function loadHitlTab(projectId) {
       }
       const pending = rows.filter(r => r.status === 'pending');
       const resolved = rows.filter(r => r.status !== 'pending');
+      const renderDiff = (diffText) => {
+        const lines = String(diffText || '').split('\n').map(ln => {
+          let color = 'var(--text)';
+          if (ln.startsWith('+++') || ln.startsWith('---')) color = 'var(--muted)';
+          else if (ln.startsWith('+')) color = '#22c55e';
+          else if (ln.startsWith('-')) color = '#e05252';
+          else if (ln.startsWith('@@')) color = '#38bdf8';
+          return `<span style="color:${color};display:block;white-space:pre-wrap">${escapeHtml(ln)}</span>`;
+        });
+        return `<pre style="margin-top:8px;padding:8px;background:var(--surface-1);border:1px solid var(--border);border-radius:3px;font-size:10px;font-family:var(--font-mono);max-height:260px;overflow:auto">${lines.join('')}</pre>`;
+      };
       const renderCard = (r) => {
         const urg = r.urgency || 'normal';
         const st = r.status || 'pending';
         const dt = (r.created_at || '').slice(0, 16).replace('T', ' ');
+        const isMd = r.kind === 'md_section_update';
+        let pl = null;
+        if (isMd && r.payload) { try { pl = JSON.parse(r.payload); } catch (e) { pl = null; } }
+        const mdMeta = (isMd && pl) ? `<div style="margin-top:6px;font-size:10px;color:var(--accent)"><b>${escapeHtml(pl.file || '')}</b> § ${escapeHtml(pl.anchor || '')}</div>` : '';
+        const diffHtml = (isMd && pl && pl.diff) ? renderDiff(pl.diff) : '';
         const answerHtml = r.answer ? `<div style="margin-top:8px;padding:6px 8px;background:var(--surface-1);border-radius:3px;border-left:3px solid #22c55e;color:var(--text);font-size:11px"><b>Answer:</b> ${escapeHtml(r.answer)}</div>` : '';
+        const applyErr = r.apply_error ? `<div style="margin-top:6px;color:#e05252;font-size:10px"><b>Not applied:</b> ${escapeHtml(r.apply_error)}</div>` : '';
         const ctxHtml = r.context ? `<div style="margin-top:6px;color:var(--muted);font-size:11px;font-style:italic">${escapeHtml(r.context.slice(0, 200))}</div>` : '';
-        const actionBtns = st === 'pending' ? `
+        let actionBtns = '';
+        if (st === 'pending' && isMd) {
+          actionBtns = `
+          <div style="display:flex;gap:6px;margin-top:8px;align-items:center">
+            <button class="primary hitl-approve-btn" data-hitl-id="${escapeHtml(r.id)}" style="padding:3px 12px;font-size:10px">Approve &amp; write</button>
+            <button class="secondary hitl-reject-btn" data-hitl-id="${escapeHtml(r.id)}" style="padding:3px 10px;font-size:10px">Reject</button>
+          </div>`;
+        } else if (st === 'pending') {
+          actionBtns = `
           <div style="display:flex;gap:6px;margin-top:8px;align-items:center">
             <input type="text" placeholder="Answer…" id="hitl-ans-${r.id}" style="flex:1;background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:11px;font-family:var(--font-mono);padding:4px 8px;outline:none">
             <button class="primary hitl-answer-btn" data-hitl-id="${escapeHtml(r.id)}" style="padding:3px 10px;font-size:10px">Answer</button>
             <button class="secondary hitl-dismiss-btn" data-hitl-id="${escapeHtml(r.id)}" style="padding:3px 10px;font-size:10px">Dismiss</button>
-          </div>` : '';
+          </div>`;
+        }
         return `<div style="background:var(--surface-2);border:1px solid var(--border);border-left:3px solid ${urgencyColor[urg] || 'var(--accent)'};border-radius:0 4px 4px 0;padding:10px 12px;margin-bottom:8px">
           <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px;margin-bottom:4px">
             <div style="font-weight:600;font-size:12px;color:var(--text)">${escapeHtml(r.question || '')}</div>
@@ -4320,7 +4349,7 @@ async function loadHitlTab(projectId) {
             </div>
           </div>
           <div style="color:var(--muted);font-size:10px">${escapeHtml(dt)}${r.assigned_to ? ' · @' + escapeHtml(r.assigned_to) : ''}</div>
-          ${ctxHtml}${answerHtml}${actionBtns}
+          ${mdMeta}${ctxHtml}${diffHtml}${answerHtml}${applyErr}${actionBtns}
         </div>`;
       };
       let html = pending.map(renderCard).join('');
@@ -4348,6 +4377,27 @@ async function loadHitlTab(projectId) {
           try {
             await api(`/hitl/${btn.dataset.hitlId}`, { method: 'PATCH', body: JSON.stringify({ action: 'dismiss' }) });
             toast('dismissed');
+            render();
+          } catch (e) { toast('failed: ' + e.message, true); }
+        };
+      });
+      body.querySelectorAll('.hitl-approve-btn').forEach(btn => {
+        btn.onclick = async () => {
+          if (!confirm('Approve and write this markdown change? It will be committed at the next checkpoint.')) return;
+          try {
+            const res = await api(`/hitl/${btn.dataset.hitlId}`, { method: 'PATCH', body: JSON.stringify({ action: 'answer', answer: 'approved' }) });
+            if (res && res.applied === false) toast('not applied: ' + (res.apply_error || 'see card'), true);
+            else toast('approved ✓ — section written, staged for checkpoint');
+            render();
+          } catch (e) { toast('failed: ' + e.message, true); }
+        };
+      });
+      body.querySelectorAll('.hitl-reject-btn').forEach(btn => {
+        btn.onclick = async () => {
+          if (!confirm('Reject this proposed change?')) return;
+          try {
+            await api(`/hitl/${btn.dataset.hitlId}`, { method: 'PATCH', body: JSON.stringify({ action: 'dismiss' }) });
+            toast('rejected');
             render();
           } catch (e) { toast('failed: ' + e.message, true); }
         };

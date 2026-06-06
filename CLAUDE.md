@@ -110,8 +110,15 @@ your project context on start and snapshots progress on end.
 - **Demo write protection**: Adding a new write endpoint requires NO demo exception — the middleware in `server.py` handles it globally. When adding a new write UI element, add it to the `hideDemoAdminControls()` selector list in `dashboard.js`.
 
 ---
+## Meridian-managed notes
+
+<!-- Agent-proposed via update_md_section, human-approved via the dashboard HITL queue. -->
+<!-- MERIDIAN:ANCHOR:START:claude-body -->
+<!-- MERIDIAN:ANCHOR:END:claude-body -->
+
+---
 <!-- MERIDIAN STATE — auto-generated, do not edit below -->
-## Current Sprint State  _(auto-updated 2026-06-05 19:18 UTC)_
+## Current Sprint State  _(auto-updated 2026-06-06 03:37 UTC)_
 
 **Key Files:**
 - `meridian/server.py` — FastAPI app + MCP handlers

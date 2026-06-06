@@ -1,6 +1,6 @@
 # MCP Tool Reference
 
-Meridian exposes **39 tools** over MCP.
+Meridian exposes **40 tools** over MCP.
 
 They fall into two usage patterns:
 
@@ -348,6 +348,7 @@ Add a per-project wiki note. Use for setup instructions, gotchas, environment de
 | `title` | string | required |  |
 | `body` | string | required |  |
 | `tags` | string | optional |  |
+| `category` | string | optional |  |
 
 **Example:**
 ```

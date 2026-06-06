@@ -276,7 +276,9 @@ CREATE TABLE IF NOT EXISTS hitl_requests (
     answered_by TEXT,
     assigned_to TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
-    answered_at TEXT
+    answered_at TEXT,
+    kind TEXT NOT NULL DEFAULT 'question',
+    payload TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_goal_project
@@ -716,6 +718,16 @@ async def _migrate_v25_feedback_and_notifications(db: aiosqlite.Connection) -> N
     await _migrate_add_column_if_missing(
         db, "tenants", "notification_prefs", "TEXT NOT NULL DEFAULT '{}'"
     )
+
+
+async def _migrate_v33_hitl_kind_payload(db: aiosqlite.Connection) -> None:
+    """v3.3 — hitl_requests.kind discriminates a normal 'question' from an
+    'md_section_update' (a proposed markdown section replacement); payload is a
+    JSON blob carrying {file, anchor, content, base_hash, diff} for the latter."""
+    await _migrate_add_column_if_missing(
+        db, "hitl_requests", "kind", "TEXT NOT NULL DEFAULT 'question'"
+    )
+    await _migrate_add_column_if_missing(db, "hitl_requests", "payload", "TEXT")
 
 
 async def _migrate_dunning_fields(db: aiosqlite.Connection) -> None:
@@ -1513,6 +1525,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_github_integration(db)
     await _migrate_workspace_layer(db)
     await _migrate_checkpoint_data(db)
+    await _migrate_v33_hitl_kind_payload(db)
     return db
 
 
@@ -5063,6 +5076,8 @@ async def request_hitl(
     context: str | None = None,
     urgency: str = "normal",
     assigned_to: str | None = None,
+    kind: str = "question",
+    payload: str | None = None,
 ) -> dict[str, Any]:
     """Create a HITL request. Returns the inserted row.
 
@@ -5078,9 +5093,11 @@ async def request_hitl(
     hid = _new_id()
     await db.execute(
         "INSERT INTO hitl_requests "
-        "(id, project_id, session_id, question, context, urgency, assigned_to) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (hid, project_id, session_id, question, context, urgency, assigned_to),
+        "(id, project_id, session_id, question, context, urgency, assigned_to, "
+        "kind, payload) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (hid, project_id, session_id, question, context, urgency, assigned_to,
+         kind, payload),
     )
     await db.commit()
     return (await get_hitl_request(db, hid)) or {"id": hid}

@@ -81,3 +81,11 @@ project context on start and checkpoints on end.
 - Full MCP tool reference: `http://localhost:7878/mcp/tools-doc`
 - Quick reference: `http://localhost:7878/mcp/quickstart`
 - Web docs: https://docs.usemeridian.us
+
+---
+## Meridian-managed notes
+
+<!-- Agent-proposed via update_md_section, human-approved via the dashboard HITL queue. -->
+<!-- MERIDIAN:ANCHOR:START:agents-body -->
+<!-- MERIDIAN:ANCHOR:END:agents-body -->
+

@@ -506,7 +506,9 @@ CREATE TABLE IF NOT EXISTS hitl_requests (
     answered_by TEXT,
     assigned_to TEXT,
     created_at TEXT NOT NULL DEFAULT ({_TS}),
-    answered_at TEXT
+    answered_at TEXT,
+    kind TEXT NOT NULL DEFAULT 'question',
+    payload TEXT
 );
 
 -- v0.9 — project_notes: per-project wiki.
@@ -818,6 +820,7 @@ async def init_pg_db(url: str) -> PostgresConnection:
     await _migrate_pg_v24_pinned_decisions_and_hitl(conn)
     await _migrate_pg_v09_notes_and_magic_links(conn)
     await _migrate_pg_v32_workspace_and_checkpoint(conn)
+    await _migrate_pg_v33_hitl_kind_payload(conn)
     if is_main_db:
         await _migrate_pg_v10_tenant_columns(conn)
         await _migrate_pg_v25_admins_table(conn)
@@ -996,6 +999,20 @@ async def _migrate_pg_v24_pinned_decisions_and_hitl(conn: PostgresConnection) ->
         ");"
         "CREATE INDEX IF NOT EXISTS idx_hitl_project ON hitl_requests(project_id, status);"
         "CREATE INDEX IF NOT EXISTS idx_hitl_assigned ON hitl_requests(assigned_to, status)"
+    )
+
+
+async def _migrate_pg_v33_hitl_kind_payload(conn: PostgresConnection) -> None:
+    """v3.3 — hitl_requests.kind + payload for the markdown section-update flow.
+
+    Must run on ALL DBs (incl. Neon-provisioned customer DBs), not just the main
+    auth DB — hitl_requests lives on every project DB. ADD COLUMN IF NOT EXISTS
+    is idempotent; mirrors db._migrate_v33_hitl_kind_payload.
+    """
+    await conn.executescript(
+        "ALTER TABLE hitl_requests ADD COLUMN IF NOT EXISTS "
+        "kind TEXT NOT NULL DEFAULT 'question';"
+        "ALTER TABLE hitl_requests ADD COLUMN IF NOT EXISTS payload TEXT"
     )
 
 

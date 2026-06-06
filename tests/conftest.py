@@ -107,6 +107,10 @@ def client(tmp_path, monkeypatch):
     # v0.6.3 — redirect GOAL.md into the same temp dir so test
     # writebacks don't touch the repo's real file.
     monkeypatch.setenv("MERIDIAN_GOAL_MD", str(tmp_path / "GOAL.md"))
+    # v3.3 — redirect the markdown-anchor root into the temp dir so DEVLOG/
+    # DECISIONS/ROADMAP/CLAUDE/AGENTS auto-updates (and the checkpoint git
+    # commit) never touch — or commit — the real repo docs during tests.
+    monkeypatch.setenv("MERIDIAN_MD_ROOT", str(tmp_path))
 
     # Import after env vars are set so the module sees them.
     from fastapi.testclient import TestClient
