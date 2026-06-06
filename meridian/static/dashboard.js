@@ -5902,6 +5902,7 @@ async function loadPinnedDecisions(projectId) {
           <div style="display:flex;gap:6px;flex-shrink:0;align-items:center">
             <span style="color:var(--muted);font-size:10px">${escapeHtml(dateStr)}</span>
             <button class="secondary" data-supersede="${escapeHtml(d.id)}" style="padding:1px 6px;font-size:9px">Supersede</button>
+            <button class="secondary" data-delete-decision="${escapeHtml(d.id)}" title="Delete this decision permanently (use Supersede to archive instead)" style="padding:1px 6px;font-size:12px;line-height:1;color:var(--muted)">&times;</button>
           </div>
         </div>
         <div class="decision-body-view" data-id="${escapeHtml(d.id)}" title="Click to edit" style="color:var(--text);white-space:pre-wrap;word-break:break-word;line-height:1.5;font-size:12px;cursor:pointer">${escapeHtml(d.body || '')}</div>
@@ -5960,6 +5961,17 @@ async function loadPinnedDecisions(projectId) {
     });
     host.querySelectorAll('[data-supersede]').forEach(btn => {
       btn.onclick = () => supersedePinnedDecision(projectId, btn.dataset.supersede);
+    });
+    host.querySelectorAll('[data-delete-decision]').forEach(btn => {
+      btn.onclick = async () => {
+        const id = btn.dataset.deleteDecision;
+        if (!confirm('Permanently delete this pinned decision? This cannot be undone.\n\n(To archive it while keeping the audit trail, use Supersede instead.)')) return;
+        try {
+          await api(`/projects/${projectId}/decisions-pinned/${id}`, { method: 'DELETE' });
+          toast('decision deleted');
+          loadPinnedDecisions(projectId);
+        } catch (e) { toast('delete failed: ' + e.message, true); }
+      };
     });
 
     // Superseded section — collapsible <details> below active cards
