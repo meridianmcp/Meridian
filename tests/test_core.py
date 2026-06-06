@@ -4633,6 +4633,38 @@ async def test_pg_adapter_ntfy_helpers_issue_expected_queries():
     assert db.committed is True
 
 
+def test_cached_plan_error_is_retryable():
+    """A stale prepared-plan error must be classified transient so the pool
+    retries with a fresh connection.
+
+    Regression guard for the blank-dashboard-panel bug: an ALTER TABLE migration
+    (e.g. v3.4 hitl_auto_answer) invalidates cached prepared plans on pooled
+    Postgres connections. The next query 500s with
+    'cached plan must not change result type', which blanked the project panel
+    because /projects/{id}/sessions failed. _is_transient_pg_error must treat it
+    as retryable so the stale connection is dropped and the statement re-parsed.
+    """
+    from meridian.pg_adapter import _is_transient_pg_error
+
+    err = Exception(
+        "cached plan must not change result type"
+    )
+    assert _is_transient_pg_error(err) is True
+    # A genuinely fatal error must still be non-retryable.
+    assert _is_transient_pg_error(Exception("syntax error at or near")) is False
+
+
+def test_pg_pool_disables_prepared_statements():
+    """Both Postgres pools set prepare_threshold=None so a cached plan can never
+    be tied to a table's result shape — the durable fix for the cached-plan bug.
+    """
+    import inspect
+    from meridian import pg_adapter as pg_module
+
+    src = inspect.getsource(pg_module)
+    assert src.count('"prepare_threshold": None') >= 2
+
+
 def test_rewind_milestones_tab_label(client):
     """Rewind Versions subtab is now labelled 'Milestones' in dashboard.js."""
     js = client.get("/static/dashboard.js").text

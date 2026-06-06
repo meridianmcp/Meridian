@@ -37,7 +37,10 @@
       "Bash(git merge *)",
       "Bash(git stash *)",
       "mcp__Neon__run_sql",
-      "Bash(python3 -c ' *)"
+      "Bash(python3 -c ' *)",
+      "Bash(python -c ' *)",
+      "Bash(powershell -Command ' *)",
+      "Bash(gh workflow *)"
     ]
   }
 }

@@ -30,7 +30,7 @@ from datetime import datetime
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
-# Claude CLI resolution — mirrors meridian/dashboard.py:_default_claude_cli_argv
+# Claude CLI resolution — resolves the `claude` binary across platforms.
 # ---------------------------------------------------------------------------
 
 def _claude_argv() -> list[str]:

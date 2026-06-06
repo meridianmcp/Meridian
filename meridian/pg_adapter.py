@@ -39,6 +39,10 @@ def _is_transient_pg_error(exc: Exception) -> bool:
         "broken pipe",
         "connection reset",
         "consuming input failed",
+        # A pooled connection's cached prepared plan was invalidated by DDL
+        # (e.g. ALTER TABLE ADD COLUMN run by a migration). The retry closes the
+        # stale connection so a fresh one re-prepares the statement.
+        "cached plan must not change result type",
     )
     if any(p in msg for p in transient_phrases):
         return True
@@ -745,6 +749,11 @@ async def open_pg_connection(url: str) -> PostgresConnection:
         reconnect_timeout=30.0,
         kwargs={
             "autocommit": True,
+            # Disable server-side prepared statements. A cached plan tied to a
+            # table's result shape breaks ("cached plan must not change result
+            # type") when a migration alters that table while pooled connections
+            # hold the stale plan. We re-parse per execute instead.
+            "prepare_threshold": None,
             "keepalives": 1,
             "keepalives_idle": 30,
             "keepalives_interval": 10,
@@ -799,6 +808,11 @@ async def init_pg_db(url: str) -> PostgresConnection:
         reconnect_timeout=30.0,
         kwargs={
             "autocommit": True,
+            # Disable server-side prepared statements. A cached plan tied to a
+            # table's result shape breaks ("cached plan must not change result
+            # type") when a migration alters that table while pooled connections
+            # hold the stale plan. We re-parse per execute instead.
+            "prepare_threshold": None,
             "keepalives": 1,
             "keepalives_idle": 30,
             "keepalives_interval": 10,

@@ -201,7 +201,7 @@ async def download_snapshot(request: Request) -> Response:
             await db_module.init_db(tmp.name)
             tables = [
                 "projects", "goal_states", "sessions", "sessions_archived",
-                "task_log", "sprint_items", "chat_sessions", "chat_messages",
+                "task_log", "sprint_items",
             ]
             for table in tables:
                 try:

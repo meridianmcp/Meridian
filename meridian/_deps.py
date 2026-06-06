@@ -171,14 +171,22 @@ async def _db(request: Request) -> Any:
         if demo_db is not None:
             request.state._db_conn = demo_db
             return demo_db
-        if not _hosted_mode():
-            conn = request.app.state.db
-            request.state._db_conn = conn
-            return conn
-        raise HTTPException(
-            status_code=503,
-            detail="Demo DB not available. Set MERIDIAN_DEMO_DB_URL to enable the demo.",
-        )
+        # demo_db is not configured. FAIL CLOSED: never fall through to the main
+        # DB if it could hold real data. A remote/hosted backend always counts as
+        # real data; only a pure-local SQLite self-host may serve its own DB under
+        # the demo cookie. db_is_remote is set at startup; default to the env var
+        # so we still fail closed if the attribute is somehow absent.
+        db_is_remote = getattr(request.app.state, "db_is_remote", None)
+        if db_is_remote is None:
+            db_is_remote = bool(os.environ.get("MERIDIAN_DB_URL"))
+        if _hosted_mode() or db_is_remote:
+            raise HTTPException(
+                status_code=503,
+                detail="Demo DB not configured (set MERIDIAN_DEMO_DB_URL).",
+            )
+        conn = request.app.state.db
+        request.state._db_conn = conn
+        return conn
 
     if _hosted_mode():
         from .hosted import _SESSION_COOKIE, _read_session_cookie
