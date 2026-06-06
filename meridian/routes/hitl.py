@@ -65,6 +65,9 @@ async def create_hitl_endpoint(
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    # v3.4 — auto-answered requests need no human; skip the notification.
+    if result.get("answered_by") == "auto":
+        return result
     try:
         from meridian.server import _maybe_notify  # noqa: PLC0415
 

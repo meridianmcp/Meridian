@@ -4,7 +4,7 @@ const state = {
   projects: [],
   tabs: [], // [{id, project}]
   activeTab: null,
-  panels: {}, // tabId -> { ws, taskCache, sessionName, chatHistory, goalRaw, goalIsJson }
+  panels: {}, // tabId -> { ws, taskCache, sessionName, goalRaw, goalIsJson }
   apiKeyConfigured: false,
   // v0.6.5 — server runtime config fetched from /config on startup.
   serverConfig: { server_url: '', host: '', port: 0, version: '' },
@@ -154,6 +154,10 @@ function hideDemoAdminControls() {
     '[id^="github-test-btn-"]',
     // Files tab: hide Edit subtab, show Preview only
     '[id^="file-mode-edit-"]',
+    // Workspace settings: hide write controls entirely in demo (v3.4)
+    '#ws-settings-save',
+    '#ws-dec-title', '#ws-dec-body', '#ws-dec-add',
+    '#ws-note-title', '#ws-note-body', '#ws-note-add',
   ];
   selectors.forEach(sel => {
     document.querySelectorAll(sel).forEach(el => { el.style.display = 'none'; });
@@ -208,6 +212,10 @@ function showDemoReadonlyToast() {
 
 function showDemoOnboardingOverlay() {
   if (document.getElementById('demo-onboarding-overlay')) return;
+  // Once the visitor has finished the tour, never auto-show onboarding again.
+  if (_demoTourDone()) return;
+  const resuming = _demoTourSavedStep() > 0;
+  const ctaLabel = resuming ? 'Resume tour →' : 'Got it — show me around →';
   const overlay = document.createElement('div');
   overlay.id = 'demo-onboarding-overlay';
   overlay.style = 'position:fixed;inset:0;z-index:20000;background:rgba(0,0,0,0.72);display:flex;align-items:center;justify-content:center;padding:16px';
@@ -221,7 +229,7 @@ function showDemoOnboardingOverlay() {
   </ol>
   <div style="display:flex;gap:8px">
     <button onclick="document.getElementById('demo-onboarding-overlay').remove()" style="background:#2a2d35;border:none;border-radius:7px;color:#8b8fa8;padding:8px 16px;cursor:pointer;font-size:.85rem;font-family:inherit;flex:0 0 auto">Skip</button>
-    <button onclick="document.getElementById('demo-onboarding-overlay').remove();startDemoTour(0)" style="background:#7c3aed;border:none;border-radius:7px;color:#fff;padding:8px 22px;cursor:pointer;font-size:.88rem;font-family:inherit;flex:1">Got it — show me around →</button>
+    <button onclick="document.getElementById('demo-onboarding-overlay').remove();resumeDemoTour()" style="background:#7c3aed;border:none;border-radius:7px;color:#fff;padding:8px 22px;cursor:pointer;font-size:.88rem;font-family:inherit;flex:1">${ctaLabel}</button>
   </div>
 </div>`;
   overlay.addEventListener('click', (e) => { if (e.target === overlay) overlay.remove(); });
@@ -231,73 +239,143 @@ function showDemoOnboardingOverlay() {
 // ---------------------------------------------------------------------------
 // Demo guided tour — step-by-step tooltip walkthrough
 // ---------------------------------------------------------------------------
+// Data-driven tab/subtab tree. Each step optionally opens a main vtab (and a
+// goal subtab) on the active project so the tip lands on the surface it
+// describes. position is relative to the highlighted element.
 const _DEMO_TOUR_STEPS = [
   {
+    vtab: null,
     target: () => document.querySelector('.session-list, .sidebar-sessions, [data-tour="sessions"], .sidebar'),
     title: 'AI coding sessions',
-    body: 'Each row is one Claude Code run. Multiple sessions can work in parallel on the same project — no collisions.',
+    body: 'Each row is one Claude Code run. Multiple sessions work in parallel on the same project — no collisions.',
     position: 'right',
-    action: null,
   },
   {
-    target: () => document.querySelector('.task-row, .task-item, .task-list-item, #task-list > *:first-child, [data-task-id]'),
-    title: 'Task log',
-    body: 'Every meaningful action is logged here in real time — tool calls, decisions, bugs found. Full audit trail.',
-    position: 'right',
-    action: null,
-  },
-  {
-    target: () => document.querySelector('[data-vtab="queue"], button[onclick*="queue"], .vtab-btn'),
-    title: 'Work queue',
-    body: 'Pending tasks claimed atomically — parallel Claude sessions grab work without stepping on each other.',
+    vtab: 'status',
+    title: 'Status & sessions',
+    body: 'The default panel: live session status and the task log. Every meaningful action a session takes shows up here in real time.',
     position: 'bottom',
-    action: () => {
-      const btn = document.querySelector('[data-vtab="queue"]') || document.querySelector('button[onclick*="queue"]');
-      if (btn) btn.click();
-    },
   },
   {
-    target: () => document.querySelector('[data-vtab="timeline"], button[onclick*="timeline"]'),
-    title: 'Activity timeline',
-    body: 'See all sessions running in parallel — when each ran, what changed, how long each task took.',
+    vtab: 'live',
+    title: 'Live view',
+    body: 'A right-now feed of what every active session is doing this second — tool calls, file claims, and progress as they happen.',
     position: 'bottom',
-    action: () => {
-      const btn = document.querySelector('[data-vtab="timeline"]') || document.querySelector('button[onclick*="timeline"]');
-      if (btn) btn.click();
-    },
   },
   {
-    target: () => document.querySelector('[data-vtab="goal"], button[onclick*="goal"]'),
+    vtab: 'goal',
+    gtab: 'north-star',
     title: 'Shared goal state',
-    body: 'The north star, current sprint, and pinned decisions every session reads on startup — so parallel runs stay aligned on one plan.',
+    body: 'The north star and version goal every session reads on startup — so parallel runs stay aligned on one plan.',
     position: 'bottom',
-    action: () => {
-      const btn = document.querySelector('[data-vtab="goal"]') || document.querySelector('button[onclick*="goal"]');
-      if (btn) btn.click();
-    },
   },
   {
+    vtab: 'goal',
+    gtab: 'decisions',
+    title: 'Pinned decisions',
+    body: 'An append-only constitution of architectural calls. New sessions inherit them automatically instead of relitigating settled choices.',
+    position: 'bottom',
+  },
+  {
+    vtab: 'queue',
+    title: 'Work queue',
+    body: 'Pending tasks claimed atomically — parallel sessions grab work without stepping on each other.',
+    position: 'bottom',
+  },
+  {
+    vtab: 'timeline',
+    title: 'Activity timeline',
+    body: 'Every session laid out over time — when each ran, what changed, and how long each task took.',
+    position: 'bottom',
+  },
+  {
+    vtab: 'files',
+    title: 'Files',
+    body: 'File claims and previews. Sessions lock the files they are editing so two runs never clobber the same file.',
+    position: 'bottom',
+  },
+  {
+    vtab: 'hitl',
+    title: 'Human-in-the-loop',
+    body: 'When a session needs a human decision it parks the question here and waits — you answer, it resumes. No silent guessing.',
+    position: 'bottom',
+  },
+  {
+    vtab: 'notes',
+    title: 'Project notes',
+    body: 'A shared per-project wiki every session can read and append to — context that outlives any single run.',
+    position: 'bottom',
+  },
+  {
+    vtab: 'settings',
+    title: 'Settings',
+    body: 'Notifications, hooks, and integrations. In your own project this is where you wire Meridian into your AI tools.',
+    position: 'bottom',
+  },
+  {
+    vtab: null,
     target: () => null,  // centered finish step
     title: 'You\'re all set',
     body: 'Explore any project or session. When you\'re ready to coordinate your own AI sessions — sign in and create a project.',
     position: 'center',
-    action: null,
   },
 ];
 
-function startDemoTour(step) {
-  // Clean up any previous tooltip
+// --- Tour persistence (per-demo localStorage; never auto-shown once finished) -
+function _demoTourDone() {
+  try { return localStorage.getItem(STORAGE_KEY('tour.done')) === '1'; } catch(e) { return false; }
+}
+function _demoTourSavedStep() {
+  try { return parseInt(localStorage.getItem(STORAGE_KEY('tour.step')) || '0', 10) || 0; } catch(e) { return 0; }
+}
+function _demoTourSaveStep(step) {
+  try { localStorage.setItem(STORAGE_KEY('tour.step'), String(step)); } catch(e) {}
+}
+function _demoTourMarkDone() {
+  try {
+    localStorage.setItem(STORAGE_KEY('tour.done'), '1');
+    localStorage.removeItem(STORAGE_KEY('tour.step'));
+  } catch(e) {}
+}
+function _demoTourClose() {
   document.getElementById('demo-tour-tooltip')?.remove();
   document.getElementById('demo-tour-highlight')?.remove();
+}
 
-  if (step >= _DEMO_TOUR_STEPS.length) return;
+// Open a main vtab (and optional goal subtab) on the active project so the
+// step's tip lands on the right surface. No-op if the panel isn't mounted yet.
+function _tourActivateVtab(vtab, gtab) {
+  const pid = state.activeTab;
+  if (!pid || !vtab) return;
+  const btn = document.querySelector(`#vtab-strip-${pid} .vtab-btn[data-vtab="${vtab}"]`);
+  if (btn) btn.click();
+  if (gtab) {
+    const gbtn = document.querySelector(`#drawer-goal-${pid} .goal-subtab-btn[data-gtab="${gtab}"]`);
+    if (gbtn) gbtn.click();
+  }
+}
+
+function startDemoTour(step) {
+  _demoTourClose();
+
+  if (step < 0) step = 0;
+  if (step >= _DEMO_TOUR_STEPS.length) { _demoTourMarkDone(); return; }
+  // Persist progress so closing the tooltip / reopening the demo resumes here.
+  _demoTourSaveStep(step);
   const s = _DEMO_TOUR_STEPS[step];
 
-  // Run optional DOM side-effect (e.g. click a tab) before showing tooltip
-  try { if (s.action) s.action(); } catch(e) {}
+  // Surface the tab/subtab this step describes, then let it render before
+  // measuring the highlight target.
+  try { _tourActivateVtab(s.vtab, s.gtab); } catch(e) {}
 
   const isLast = step === _DEMO_TOUR_STEPS.length - 1;
-  const targetEl = s.target ? s.target() : null;
+  let targetEl = null;
+  if (s.target) {
+    targetEl = s.target();
+  } else if (s.vtab) {
+    const pid = state.activeTab;
+    targetEl = pid ? document.querySelector(`#vtab-strip-${pid} .vtab-btn[data-vtab="${s.vtab}"]`) : null;
+  }
 
   // Highlight ring around target element
   if (targetEl) {
@@ -320,14 +398,16 @@ function startDemoTour(step) {
     <div style="font-size:.7rem;color:#6c8fff;font-weight:600;margin-bottom:6px;letter-spacing:.3px">${stepLabel}</div>
     <div style="font-size:.9rem;font-weight:700;color:#e8eaf0;margin-bottom:8px">${s.title}</div>
     <div style="font-size:.83rem;color:#c4c6d4;line-height:1.6;margin-bottom:16px">${s.body}</div>
-    <div style="display:flex;gap:8px;justify-content:flex-end">
-      <button id="demo-tour-skip" style="background:none;border:none;color:#6b7280;cursor:pointer;font-size:.8rem;padding:4px 8px;font-family:inherit">End tour</button>
+    <div style="display:flex;gap:8px;align-items:center">
+      <button id="demo-tour-finish" style="background:none;border:none;color:#6b7280;cursor:pointer;font-size:.78rem;padding:4px 6px;font-family:inherit;text-decoration:underline">Finish tutorial</button>
+      <div style="flex:1"></div>
+      ${step > 0 ? '<button id="demo-tour-back" style="background:none;border:1px solid #3a3d48;border-radius:6px;color:#c4c6d4;cursor:pointer;font-size:.8rem;padding:6px 12px;font-family:inherit">← Back</button>' : ''}
       <button id="demo-tour-next" style="background:#7c3aed;border:none;border-radius:6px;color:#fff;cursor:pointer;font-size:.82rem;padding:6px 16px;font-family:inherit">
         ${isLast ? 'Done' : 'Next →'}
       </button>
     </div>`;
   tip.style.cssText = `position:fixed;z-index:30000;background:#1e2029;border:1px solid #7c3aed88;
-    border-radius:10px;padding:16px 18px;width:260px;
+    border-radius:10px;padding:16px 18px;width:268px;
     box-shadow:0 8px 32px rgba(0,0,0,0.6);font-family:inherit;`;
 
   // Position tooltip relative to target or center
@@ -342,17 +422,30 @@ function startDemoTour(step) {
       tip.style.top = `${Math.min(rect.top, window.innerHeight - 200)}px`;
       tip.style.left = `${rect.right + PAD}px`;
     } else {  // bottom
-      tip.style.top = `${rect.bottom + PAD}px`;
-      tip.style.left = `${Math.max(8, Math.min(rect.left, window.innerWidth - 280))}px`;
+      tip.style.top = `${Math.min(rect.bottom + PAD, window.innerHeight - 200)}px`;
+      tip.style.left = `${Math.max(8, Math.min(rect.left, window.innerWidth - 288))}px`;
     }
   }
 
   document.body.appendChild(tip);
-  document.getElementById('demo-tour-next').onclick = () => startDemoTour(step + 1);
-  document.getElementById('demo-tour-skip').onclick = () => {
-    document.getElementById('demo-tour-tooltip')?.remove();
-    document.getElementById('demo-tour-highlight')?.remove();
+  // Next on the last step marks the tour done (never auto-shown again).
+  document.getElementById('demo-tour-next').onclick = () => {
+    if (isLast) { _demoTourClose(); _demoTourMarkDone(); }
+    else startDemoTour(step + 1);
   };
+  const backBtn = document.getElementById('demo-tour-back');
+  if (backBtn) backBtn.onclick = () => startDemoTour(step - 1);
+  // Explicit Finish: mark done so the tour never auto-shows again.
+  document.getElementById('demo-tour-finish').onclick = () => {
+    _demoTourClose();
+    _demoTourMarkDone();
+  };
+}
+
+// Resume the tour at the saved step (or step 0). Does nothing if finished.
+function resumeDemoTour() {
+  if (_demoTourDone()) return;
+  startDemoTour(_demoTourSavedStep());
 }
 
 async function api(path, opts={}) {
@@ -384,7 +477,8 @@ async function loadServerConfig() {
       b.innerHTML = 'Preview mode — read only · <a href="/auth/login" style="color:#fff;text-decoration:underline;font-weight:600">Sign in for full access →</a>';
       document.body.prepend(b);
       document.body.style.paddingTop = ((parseInt(document.body.style.paddingTop || '0', 10)) + 28) + 'px';
-      // Demo onboarding overlay — shown every visit, no localStorage
+      // Demo onboarding overlay — self-guards once the tour is finished
+      // (localStorage), and its CTA resumes the tour at the saved step.
       showDemoOnboardingOverlay();
     }
     // Task 16 — hide destructive admin controls in demo mode
@@ -625,11 +719,18 @@ function _updateConnectionIndicator(cfg) {
             await api('/config/connections', { method: 'POST', body: JSON.stringify({ name: c.name, activate: true }) });
             await loadServerConfig();
             // Show restart banner — DB connection change needs restart
-            const banner = document.getElementById('update-banner');
-            const bannerSpan = banner?.querySelector('span');
-            if (banner) {
-              banner.style.display = 'block';
-              if (bannerSpan) bannerSpan.textContent = '\u26A0\uFE0F Connection changed to ' + c.name + ' \u2014 restart to apply';
+            // On hosted the restart button is hidden (a restart kills the
+            // shared Fly machine), so don't advertise "restart to apply" \u2014
+            // just confirm the change was saved for the next deploy/restart.
+            if (isHostedMode()) {
+              toast('Connection saved as "' + c.name + '" \u2014 applies on next server restart');
+            } else {
+              const banner = document.getElementById('update-banner');
+              const bannerSpan = banner?.querySelector('span');
+              if (banner) {
+                banner.style.display = 'block';
+                if (bannerSpan) bannerSpan.textContent = '\u26A0\uFE0F Connection changed to ' + c.name + ' \u2014 restart to apply';
+              }
             }
             // Update indicator immediately
             const dot = document.getElementById('connection-dot');
@@ -675,7 +776,11 @@ function _updateConnectionIndicator(cfg) {
           method: 'POST',
           body: JSON.stringify({ name: sel, type: conn.type || 'sqlite', activate: true }),
         });
-        if (conn.type === 'postgres') {
+        if (isHostedMode()) {
+          // Never restart the shared machine from a hosted instance — the
+          // connection is saved and applies on the next server restart/deploy.
+          toast('Connection saved as "' + sel + '" — applies on next server restart');
+        } else if (conn.type === 'postgres') {
           toast('Switching to ' + sel + ' — restarting…');
           await _doRestart();
         } else {
@@ -1439,7 +1544,8 @@ function buildTabBody(project) {
         <div class="claude-section claude-section-narrow" data-section="open">
           <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
             <a class="claude-cta-secondary-btn" id="open-in-claude-${project.id}"
-               href="https://claude.ai/new" target="_blank" rel="noopener">New Chat →</a>
+               href="https://claude.ai/new" target="_blank" rel="noopener"
+               title="Open in Claude">New Chat →</a>
             <button class="secondary claude-section-btn" id="copy-context-${project.id}" style="font-size:11px">Copy chat context</button>
           </div>
           <p class="claude-hint">Open a new Claude.ai chat, paste the context to get up to speed</p>
@@ -1450,16 +1556,10 @@ function buildTabBody(project) {
   `;
   root.appendChild(body);
 
-  // Per-tab state. chatMode restored from localStorage so the user's choice
-  // persists across reloads. activeVtab tracks which drawer panel is open.
-  let initialMode = 'api';
-  try {
-    const saved = localStorage.getItem(STORAGE_KEY('meridian.chatMode'));
-    if (saved === 'api' || saved === 'cli') initialMode = saved;
-  } catch(e) {}
+  // Per-tab state. activeVtab tracks which drawer panel is open.
   state.panels[project.id] = {
     ws: null, taskCache: [], goalRaw: null, goalIsJson: false,
-    chatHistory: [], chatMode: initialMode, activeVtab: 'status',
+    activeVtab: 'status',
   };
 
   // Vtab drawer toggle — same tab again collapses; different tab switches.
@@ -1613,36 +1713,6 @@ function buildTabBody(project) {
   // task summaries to goal content; that role is now covered by the timeline
   // + session summaries + task log. Manual is the only mode worth exposing.
 
-  // v1.1.0 — chat panel removed in favour of "Open in Claude". The
-  // wireups below guard for null elements so older deployments with
-  // the chat surface still mounted keep working.
-  const clearChatBtn = document.getElementById(`clear-chat-${project.id}`);
-  if (clearChatBtn) clearChatBtn.onclick = async () => {
-    if (isDemoMode()) { showDemoReadonlyToast(); return; }
-    if (isDemoMode()) { showDemoReadonlyToast(); return; }
-    if (!confirm('Clear chat history for this project?')) return;
-    try {
-      await fetch(`/projects/${project.id}/chat/history`, { method: 'DELETE' });
-      const history = document.getElementById(`chat-${project.id}`);
-      if (history) history.innerHTML = '';
-      if (state.panels[project.id]) state.panels[project.id].chatHistory = [];
-      toast('chat cleared');
-    } catch(e) { toast('clear failed: ' + e.message, true); }
-  };
-  const modelSel = document.getElementById(`model-select-${project.id}`);
-  if (modelSel) {
-    const VALID_MODELS = ['claude-sonnet-4-6','claude-opus-4-6','claude-opus-4-7','claude-haiku-4-5-20251001'];
-    let savedModel = localStorage.getItem(STORAGE_KEY('meridian.chatModel')) || 'claude-sonnet-4-6';
-    if (!VALID_MODELS.includes(savedModel)) savedModel = 'claude-sonnet-4-6';
-    modelSel.value = savedModel;
-    if (state.panels[project.id]) state.panels[project.id].chatModel = savedModel;
-    modelSel.onchange = () => {
-      const m = modelSel.value;
-      if (state.panels[project.id]) state.panels[project.id].chatModel = m;
-      localStorage.setItem(STORAGE_KEY('meridian.chatModel'), m);
-      toast('model: ' + m);
-    };
-  }
   // v1.5.x — Claude launch control panel (4 sections).
   wireClaudeLaunchPanel(project.id);
   document.getElementById(`goal-${project.id}`).addEventListener('blur', () => saveGoal(project.id));
@@ -1663,32 +1733,6 @@ function buildTabBody(project) {
     this.classList.toggle('dirty', this.value !== (p._serverSprint || ''));
   });
   autosizeGoalField(document.getElementById(`goal-north-star-${project.id}`));
-  // v1.1.0 — chat input + mode toggle removed. Defensive wireups for
-  // anyone running an older bundle: only attach if the elements exist.
-  const chatSendBtn = document.getElementById(`chat-send-${project.id}`);
-  if (chatSendBtn) chatSendBtn.onclick = () => sendChat(project.id);
-  const input = document.getElementById(`chat-input-${project.id}`);
-  if (input) input.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendChat(project.id); }
-  });
-  const modeRoot = document.getElementById(`chat-mode-${project.id}`);
-  if (modeRoot) {
-    modeRoot.querySelectorAll('.mode-btn').forEach(btn => {
-      if (btn.dataset.mode === initialMode) btn.classList.add('active');
-      else btn.classList.remove('active');
-      btn.onclick = () => {
-        const mode = btn.dataset.mode;
-        state.panels[project.id].chatMode = mode;
-        try { localStorage.setItem(STORAGE_KEY('meridian.chatMode'), mode); } catch(e) {}
-        modeRoot.querySelectorAll('.mode-btn').forEach(b => {
-          b.classList.toggle('active', b.dataset.mode === mode);
-        });
-        toast(mode === 'cli'
-          ? 'CLI mode — uses Max plan, no API credits'
-          : 'API mode — bills metered API credits');
-      };
-    });
-  }
 
   // Files tab: back button returns to browse view; save button persists edits.
   const fileBackBtn = document.getElementById(`file-back-${project.id}`);
@@ -1702,23 +1746,6 @@ function buildTabBody(project) {
   if (fileSaveBtn) fileSaveBtn.onclick = () => saveFile(project.id);
 
   refreshTab(project.id);
-
-  // Restore persisted chat history so conversations survive page refresh.
-  (async () => {
-    try {
-      const history = await api(`/projects/${project.id}/chat/history`);
-      if (history && history.length) {
-        const chatDiv = document.getElementById(`chat-${project.id}`);
-        const panel = state.panels[project.id];
-        if (chatDiv && panel) {
-          history.forEach(msg => {
-            appendChatMessage(chatDiv, msg.role, msg.content);
-            panel.chatHistory.push({ role: msg.role, content: msg.content });
-          });
-        }
-      }
-    } catch(e) { /* no history yet or endpoint not reachable */ }
-  })();
 
   connectWs(project.id);
 }
@@ -2424,6 +2451,7 @@ function wireClaudeLaunchPanel(projectId) {
   if (isDemoMode()) {
     [
       copyStartChatBtn,
+      setupHooksBtn,
       document.getElementById(`copy-resume-${projectId}`),
       document.getElementById(`start-worker-${projectId}`),
       document.getElementById(`copy-handoff-${projectId}`),
@@ -3631,6 +3659,40 @@ async function loadSettingsTab(projectId) {
     };
   }, 0);
 
+  // Human-in-the-loop section — per-project auto-answer toggle (v3.4)
+  const hitlAuto = !!(projectSettings && projectSettings.hitl_auto_answer);
+  html += `<div style="margin-bottom:16px">
+    <div style="color:var(--accent);font-size:10px;letter-spacing:.06em;text-transform:uppercase;margin-bottom:10px;padding-bottom:4px;border-bottom:1px solid var(--border)">Human-in-the-loop</div>
+    <label style="display:flex;gap:8px;align-items:flex-start;font-size:11px;color:var(--text);cursor:pointer">
+      <input type="checkbox" id="hitl-auto-${projectId}" ${hitlAuto ? 'checked' : ''} style="margin-top:2px">
+      <span>Auto-answer HITL requests<br>
+        <span style="font-size:9px;color:var(--muted)">When on, Meridian picks the first option automatically — no interruption. Review auto-answered requests in the Queue tab.</span>
+      </span>
+    </label>
+    <div id="hitl-auto-status-${projectId}" style="font-size:10px;color:var(--muted);margin-top:4px;min-height:13px"></div>
+  </div>`;
+
+  setTimeout(() => {
+    const cb = document.getElementById(`hitl-auto-${projectId}`);
+    const status = document.getElementById(`hitl-auto-status-${projectId}`);
+    if (!cb) return;
+    cb.onchange = async () => {
+      cb.disabled = true;
+      try {
+        const saved = await saveProjectSettings(projectId, { hitl_auto_answer: cb.checked });
+        cb.checked = !!saved.hitl_auto_answer;
+        if (status) status.textContent = saved.hitl_auto_answer
+          ? 'Auto-answer ON — new requests resolve immediately.'
+          : 'Auto-answer OFF — requests wait for a human.';
+      } catch (e) {
+        cb.checked = !cb.checked;
+        if (status) status.textContent = `Save failed: ${String(e)}`;
+      } finally {
+        cb.disabled = false;
+      }
+    };
+  }, 0);
+
   // Executor Config section
   const execCfg = (projectSettings && projectSettings.executor_config) || {};
   html += `<div style="margin-bottom:16px" id="executor-config-section-${projectId}">
@@ -3674,6 +3736,155 @@ async function loadSettingsTab(projectId) {
       } finally {
         saveBtn.disabled = false;
       }
+    };
+  }, 0);
+
+  // Workspace section — tenant-global notes, decisions, defaults (v3.4).
+  // Applies across ALL projects; injected at the top of every context block.
+  html += `<div style="margin-bottom:16px" id="workspace-section-${projectId}">
+    <div style="color:var(--accent);font-size:10px;letter-spacing:.06em;text-transform:uppercase;margin-bottom:10px;padding-bottom:4px;border-bottom:1px solid var(--border)">Workspace</div>
+    <div style="font-size:10px;color:var(--muted);margin-bottom:10px">Applies across <strong>all projects</strong> in this workspace. Notes and decisions here are injected at the top of every project's context block.</div>
+
+    <div style="margin-bottom:12px">
+      <div style="font-size:10px;color:var(--text);margin-bottom:4px">Default settings</div>
+      <label style="display:flex;gap:8px;align-items:flex-start;font-size:11px;color:var(--text);cursor:pointer;margin-bottom:6px">
+        <input type="checkbox" id="ws-hitl-default" style="margin-top:2px">
+        <span>Auto-answer HITL by default<br>
+          <span style="font-size:9px;color:var(--muted)">Suggested default for new projects' HITL auto-answer toggle.</span>
+        </span>
+      </label>
+      <label style="font-size:10px;color:var(--muted);display:block">Default sprint name<br>
+        <input id="ws-sprint-default" type="text" placeholder="e.g. june-sprint" style="width:100%;max-width:240px;background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:3px 6px;margin-top:2px">
+      </label>
+      <div style="margin-top:8px;display:flex;gap:8px;align-items:center">
+        <button id="ws-settings-save" class="primary" style="font-size:10px;padding:3px 10px">Save defaults</button>
+        <span id="ws-settings-status" style="font-size:10px;color:var(--muted);min-height:14px"></span>
+      </div>
+    </div>
+
+    <div style="margin-bottom:12px">
+      <div style="font-size:10px;color:var(--text);margin-bottom:4px">Workspace decisions</div>
+      <div id="ws-decisions-list" style="font-size:10px;font-family:var(--font-mono);margin-bottom:6px"><div style="color:var(--muted)">loading…</div></div>
+      <div style="display:flex;gap:6px;flex-wrap:wrap">
+        <input id="ws-dec-title" type="text" placeholder="Title" style="background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:4px 8px;flex:1;min-width:120px">
+        <input id="ws-dec-body" type="text" placeholder="Body" style="background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:4px 8px;flex:2;min-width:160px">
+        <button id="ws-dec-add" class="primary" style="font-size:10px;padding:4px 10px">Pin</button>
+      </div>
+    </div>
+
+    <div>
+      <div style="font-size:10px;color:var(--text);margin-bottom:4px">Workspace notes</div>
+      <div id="ws-notes-list" style="font-size:10px;font-family:var(--font-mono);margin-bottom:6px"><div style="color:var(--muted)">loading…</div></div>
+      <div style="display:flex;gap:6px;flex-wrap:wrap">
+        <input id="ws-note-title" type="text" placeholder="Title" style="background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:4px 8px;flex:1;min-width:120px">
+        <input id="ws-note-body" type="text" placeholder="Body" style="background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:4px 8px;flex:2;min-width:160px">
+        <button id="ws-note-add" class="primary" style="font-size:10px;padding:4px 10px">Add</button>
+      </div>
+    </div>
+  </div>`;
+
+  setTimeout(() => {
+    // --- Settings defaults ---
+    const hitlCb = document.getElementById('ws-hitl-default');
+    const sprintIn = document.getElementById('ws-sprint-default');
+    const saveBtn = document.getElementById('ws-settings-save');
+    const saveStatus = document.getElementById('ws-settings-status');
+    (async () => {
+      try {
+        const s = await api('/workspace/settings');
+        if (hitlCb) hitlCb.checked = !!s.hitl_auto_answer_default;
+        if (sprintIn) sprintIn.value = s.sprint_name_default || '';
+      } catch (e) { /* defaults shown */ }
+    })();
+    if (saveBtn) saveBtn.onclick = async () => {
+      saveBtn.disabled = true;
+      try {
+        await api('/workspace/settings', {
+          method: 'PATCH',
+          body: JSON.stringify({
+            hitl_auto_answer_default: !!(hitlCb && hitlCb.checked),
+            sprint_name_default: (sprintIn && sprintIn.value.trim()) || '',
+          }),
+        });
+        if (saveStatus) saveStatus.textContent = 'Saved.';
+        setTimeout(() => { if (saveStatus) saveStatus.textContent = ''; }, 2000);
+      } catch (e) {
+        if (saveStatus) saveStatus.textContent = `Save failed: ${String(e)}`;
+      } finally {
+        saveBtn.disabled = false;
+      }
+    };
+
+    // --- Decisions ---
+    const decList = document.getElementById('ws-decisions-list');
+    async function renderWsDecisions() {
+      if (!decList) return;
+      try {
+        const items = await api('/workspace/decisions');
+        decList.innerHTML = (items && items.length)
+          ? items.map(d => `<div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px;padding:4px 0;border-bottom:1px solid var(--border)">
+              <span><span style="color:var(--accent)">${escapeHtml(d.category || 'TECHNICAL')}</span> ${escapeHtml(d.title || '')}: <span style="color:var(--muted)">${escapeHtml(d.body || '')}</span></span>
+              <button class="secondary" data-did="${escapeHtml(d.id)}" style="font-size:9px;padding:2px 7px">×</button>
+            </div>`).join('')
+          : '<div style="color:var(--muted)">No workspace decisions yet.</div>';
+        decList.querySelectorAll('button[data-did]').forEach(btn => {
+          btn.onclick = async () => {
+            if (!confirm('Delete this workspace decision?')) return;
+            try { await api(`/workspace/decisions/${btn.dataset.did}`, { method: 'DELETE' }); renderWsDecisions(); }
+            catch (e) { alert('Error: ' + e); }
+          };
+        });
+      } catch (e) { decList.innerHTML = '<div style="color:var(--muted)">Failed to load.</div>'; }
+    }
+    renderWsDecisions();
+    const decAdd = document.getElementById('ws-dec-add');
+    if (decAdd) decAdd.onclick = async () => {
+      const title = (document.getElementById('ws-dec-title')?.value || '').trim();
+      const body = (document.getElementById('ws-dec-body')?.value || '').trim();
+      if (!title || !body) return;
+      decAdd.disabled = true;
+      try {
+        await api('/workspace/decisions', { method: 'POST', body: JSON.stringify({ title, body }) });
+        document.getElementById('ws-dec-title').value = '';
+        document.getElementById('ws-dec-body').value = '';
+        renderWsDecisions();
+      } catch (e) { alert('Error: ' + e); } finally { decAdd.disabled = false; }
+    };
+
+    // --- Notes ---
+    const noteList = document.getElementById('ws-notes-list');
+    async function renderWsNotes() {
+      if (!noteList) return;
+      try {
+        const items = await api('/workspace/notes');
+        noteList.innerHTML = (items && items.length)
+          ? items.map(n => `<div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px;padding:4px 0;border-bottom:1px solid var(--border)">
+              <span>${escapeHtml(n.title || '')}: <span style="color:var(--muted)">${escapeHtml(n.body || '')}</span>${n.tags ? ` <span style="color:var(--accent);font-size:9px">${escapeHtml(n.tags)}</span>` : ''}</span>
+              <button class="secondary" data-nid="${escapeHtml(n.id)}" style="font-size:9px;padding:2px 7px">×</button>
+            </div>`).join('')
+          : '<div style="color:var(--muted)">No workspace notes yet.</div>';
+        noteList.querySelectorAll('button[data-nid]').forEach(btn => {
+          btn.onclick = async () => {
+            if (!confirm('Delete this workspace note?')) return;
+            try { await api(`/workspace/notes/${btn.dataset.nid}`, { method: 'DELETE' }); renderWsNotes(); }
+            catch (e) { alert('Error: ' + e); }
+          };
+        });
+      } catch (e) { noteList.innerHTML = '<div style="color:var(--muted)">Failed to load.</div>'; }
+    }
+    renderWsNotes();
+    const noteAdd = document.getElementById('ws-note-add');
+    if (noteAdd) noteAdd.onclick = async () => {
+      const title = (document.getElementById('ws-note-title')?.value || '').trim();
+      const body = (document.getElementById('ws-note-body')?.value || '').trim();
+      if (!title || !body) return;
+      noteAdd.disabled = true;
+      try {
+        await api('/workspace/notes', { method: 'POST', body: JSON.stringify({ title, body }) });
+        document.getElementById('ws-note-title').value = '';
+        document.getElementById('ws-note-body').value = '';
+        renderWsNotes();
+      } catch (e) { alert('Error: ' + e); } finally { noteAdd.disabled = false; }
     };
   }, 0);
 
@@ -4344,6 +4555,7 @@ async function loadHitlTab(projectId) {
           <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px;margin-bottom:4px">
             <div style="font-weight:600;font-size:12px;color:var(--text)">${escapeHtml(r.question || '')}</div>
             <div style="display:flex;gap:4px;flex-shrink:0">
+              ${r.answered_by === 'auto' ? `<span title="Auto-answered — no human reviewed this" style="font-size:9px;font-weight:600;background:var(--accent)22;color:var(--accent);padding:1px 6px;border-radius:3px">auto</span>` : ''}
               <span style="font-size:9px;font-weight:600;background:${urgencyColor[urg] || 'var(--accent)'}22;color:${urgencyColor[urg] || 'var(--accent)'};padding:1px 6px;border-radius:3px">${escapeHtml(urg)}</span>
               <span style="font-size:9px;font-weight:600;background:${statusBadge[st] || 'var(--muted)'}22;color:${statusBadge[st] || 'var(--muted)'};padding:1px 6px;border-radius:3px">${escapeHtml(st)}</span>
             </div>
@@ -6161,99 +6373,6 @@ function handleWsEvent(projectId, event) {
   if (panel && panel.activeVtab === 'live') {
     scheduleLiveRefresh(projectId);
   }
-}
-
-async function sendChat(projectId) {
-  const input = document.getElementById(`chat-input-${projectId}`);
-  const text = input.value.trim();
-  if (!text) return;
-  const panel = state.panels[projectId];
-  const mode = (panel && panel.chatMode) || 'cli';
-  // CLI mode uses the claude binary's own auth; only API mode needs
-  // ANTHROPIC_API_KEY / OAuth wired into the Anthropic SDK.
-  if (mode === 'api' && !state.apiKeyConfigured) {
-    toast('No auth configured — set ANTHROPIC_API_KEY or switch to CLI mode', true);
-    return;
-  }
-  input.value = '';
-  panel.chatHistory.push({ role: 'user', content: text });
-  const history = document.getElementById(`chat-${projectId}`);
-  appendChatMessage(history, 'user', text);
-
-  // Build the system prompt from current goal + last 20 tasks so the
-  // model has shared context, but don't show it in the UI.
-  let systemPrompt = `You are assisting on a Meridian project.`;
-  try {
-    const goal = await api(`/projects/${projectId}/goal`).catch(() => null);
-    if (goal) systemPrompt += `\n\n# Goal (v${goal.version})\n${typeof goal.content === 'string' ? goal.content : JSON.stringify(goal.content, null, 2)}`;
-  } catch(e) {}
-  try {
-    const tasks = await api(`/projects/${projectId}/tasks?limit=20`);
-    if (tasks.length) {
-      systemPrompt += `\n\n# Recent task log (newest first)\n` + tasks.map(t => `[${t.status}] ${t.description}`).join('\n');
-    }
-  } catch(e) {}
-
-  const assistantNode = appendChatMessage(history, 'assistant', '');
-  try {
-    const resp = await fetch('/dashboard/chat', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({
-        project_id: projectId,
-        messages: panel.chatHistory,
-        system_prompt: systemPrompt,
-        mode: mode,
-        model: (panel && panel.chatModel) || 'claude-sonnet-4-6',
-      }),
-    });
-    if (!resp.ok || !resp.body) {
-      assistantNode.textContent = `error: ${resp.status}`;
-      assistantNode.classList.add('error');
-      return;
-    }
-    const reader = resp.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = '';
-    let acc = '';
-    while (true) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-      let idx;
-      while ((idx = buffer.indexOf('\n\n')) >= 0) {
-        const chunk = buffer.slice(0, idx);
-        buffer = buffer.slice(idx + 2);
-        const line = chunk.split('\n').find(l => l.startsWith('data:'));
-        if (!line) continue;
-        const payload = line.slice(5).trim();
-        if (payload === '[DONE]') break;
-        try {
-          const obj = JSON.parse(payload);
-          if (obj.error) {
-            const is429 = /rate.?limit/i.test(obj.error) && obj.error.includes('429');
-            acc += is429
-              ? '\n\n⚠️ Rate limited — wait ~60s then retry, or switch to Haiku model'
-              : `\n\n⚠️ API error: ${obj.error}`;
-          } else if (obj.delta) { acc += obj.delta; }
-          assistantNode.textContent = acc;
-          history.scrollTop = history.scrollHeight;
-        } catch(e){}
-      }
-    }
-    panel.chatHistory.push({ role: 'assistant', content: acc });
-  } catch(e) {
-    assistantNode.textContent = 'error: ' + e.message;
-  }
-}
-
-function appendChatMessage(history, role, text) {
-  const node = document.createElement('div');
-  node.className = 'msg ' + role;
-  node.textContent = text;
-  history.appendChild(node);
-  history.scrollTop = history.scrollHeight;
-  return node;
 }
 
 document.getElementById('new-project-btn').onclick = async () => {

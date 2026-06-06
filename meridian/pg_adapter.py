@@ -420,6 +420,7 @@ CREATE TABLE IF NOT EXISTS projects (
     max_pinned_decisions INTEGER NOT NULL DEFAULT 20,
     executor_config TEXT,
     rewind_token TEXT,
+    hitl_auto_answer INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL DEFAULT ({_TS})
 );
 
@@ -585,6 +586,14 @@ CREATE TABLE IF NOT EXISTS workspace_decisions (
 );
 CREATE INDEX IF NOT EXISTS idx_workspace_notes_created ON workspace_notes(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_workspace_decisions_status ON workspace_decisions(status, created_at DESC);
+
+-- v3.4 — workspace-level settings singleton (tenant-global defaults).
+CREATE TABLE IF NOT EXISTS workspace_settings (
+    id TEXT PRIMARY KEY DEFAULT 'singleton',
+    hitl_auto_answer_default INTEGER NOT NULL DEFAULT 0,
+    sprint_name_default TEXT,
+    updated_at TEXT NOT NULL DEFAULT ({_TS})
+);
 """
 
 # Tables that go ONLY in the main auth DB (MERIDIAN_DB_URL).
@@ -821,6 +830,8 @@ async def init_pg_db(url: str) -> PostgresConnection:
     await _migrate_pg_v09_notes_and_magic_links(conn)
     await _migrate_pg_v32_workspace_and_checkpoint(conn)
     await _migrate_pg_v33_hitl_kind_payload(conn)
+    await _migrate_pg_v34_hitl_auto_answer(conn)
+    await _migrate_pg_v34_workspace_settings(conn)
     if is_main_db:
         await _migrate_pg_v10_tenant_columns(conn)
         await _migrate_pg_v25_admins_table(conn)
@@ -1013,6 +1024,29 @@ async def _migrate_pg_v33_hitl_kind_payload(conn: PostgresConnection) -> None:
         "ALTER TABLE hitl_requests ADD COLUMN IF NOT EXISTS "
         "kind TEXT NOT NULL DEFAULT 'question';"
         "ALTER TABLE hitl_requests ADD COLUMN IF NOT EXISTS payload TEXT"
+    )
+
+
+async def _migrate_pg_v34_hitl_auto_answer(conn: PostgresConnection) -> None:
+    """v3.4 — projects.hitl_auto_answer per-project toggle. Mirrors
+    db._migrate_v34_hitl_auto_answer. Idempotent ADD COLUMN IF NOT EXISTS."""
+    await conn.executescript(
+        "ALTER TABLE projects ADD COLUMN IF NOT EXISTS "
+        "hitl_auto_answer INTEGER NOT NULL DEFAULT 0"
+    )
+
+
+async def _migrate_pg_v34_workspace_settings(conn: PostgresConnection) -> None:
+    """v3.4 — workspace_settings singleton table on existing Postgres DBs.
+    Runs on ALL DBs (lives on every workspace DB). Mirrors
+    db._migrate_v34_workspace_settings."""
+    await conn.executescript(
+        "CREATE TABLE IF NOT EXISTS workspace_settings ("
+        "    id TEXT PRIMARY KEY DEFAULT 'singleton',"
+        "    hitl_auto_answer_default INTEGER NOT NULL DEFAULT 0,"
+        "    sprint_name_default TEXT,"
+        f"    updated_at TEXT NOT NULL DEFAULT ({_TS})"
+        ")"
     )
 
 
