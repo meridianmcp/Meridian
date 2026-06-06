@@ -72,6 +72,80 @@ def test_demo_write_blocked_403(demo_client):
     assert "error" in body or "demo" in json.dumps(body).lower()
 
 
+# ---------------------------------------------------------------------------
+# Phase 2 — demo isolation: fail-closed _db() + /config demo gating
+# ---------------------------------------------------------------------------
+
+
+def test_demo_db_fails_closed_on_remote_backend(client):
+    """A demo cookie on a remote backend with no demo_db must 503, never leak.
+
+    Regression: /demo on a hosted/Postgres self-host previously fell through to
+    app.state.db (real tenant data). _db() now fails closed unless the backend
+    is a pure-local SQLite self-host.
+    """
+    app = client.app
+    prev_remote = getattr(app.state, "db_is_remote", None)
+    prev_demo = getattr(app.state, "demo_db", None)
+    app.state.db_is_remote = True
+    app.state.demo_db = None
+    try:
+        client.cookies.set("meridian_demo", "1")
+        r = client.get("/projects")
+        assert r.status_code == 503, r.text
+        assert "demo" in r.text.lower()
+    finally:
+        client.cookies.delete("meridian_demo")
+        app.state.db_is_remote = prev_remote
+        app.state.demo_db = prev_demo
+
+
+def test_config_demo_mode_reflects_cookie(client):
+    """/config must reflect the demo cookie, not just the env flag.
+
+    A /demo visitor on a self-host must never see the host's real connection
+    switcher or toml path (split-brain leak).
+    """
+    client.cookies.set("meridian_demo", "1")
+    try:
+        r = client.get("/config")
+        assert r.status_code == 200, r.text
+        cfg = r.json()
+        assert cfg["demo_mode"] is True
+        assert cfg["db"] == "demo"
+        assert cfg["connections"] == []
+        assert cfg["toml_path"] == ""
+        assert cfg["toml_exists"] is False
+    finally:
+        client.cookies.delete("meridian_demo")
+
+
+def test_config_no_cookie_is_not_demo(client):
+    """Without the demo cookie, /config reports demo_mode False (no false-positive)."""
+    r = client.get("/config")
+    assert r.status_code == 200, r.text
+    assert r.json()["demo_mode"] is False
+
+
+def test_demo_gates_setup_hooks_and_planning_chat(client):
+    """Phase 3: in demo mode the Setup Hooks and Planning Chat buttons are
+    disabled with a sign-in toast, alongside the other write actions."""
+    js = client.get("/static/dashboard.js").text
+    # Both buttons must be present in the demo-disable block (the list that
+    # rewires onclick to showDemoReadonlyToast()).
+    assert "setupHooksBtn," in js
+    assert "copyStartChatBtn," in js
+
+
+def test_hosted_connection_switch_does_not_restart_server(client):
+    """Phase 3: hosted instances must never trigger a full-server restart when
+    switching DB connections — that would kill the shared Fly machine."""
+    js = client.get("/static/dashboard.js").text
+    assert "applies on next server restart" in js
+    # The hosted branch must guard the _doRestart() call in the switcher.
+    assert "if (isHostedMode()) {" in js
+
+
 def test_waitlist_pending_200(client):
     """GET /waitlist-pending loads without error."""
     r = client.get("/waitlist-pending")
@@ -246,6 +320,163 @@ def test_demo_write_button_shows_friendly_toast(client):
                     assert "403" not in toast_text, f"Raw 403 shown in toast: {toast_text!r}"
                     assert "Read-only" in toast_text or "sign in" in toast_text.lower(), \
                         f"Expected friendly message, got: {toast_text!r}"
+
+            browser.close()
+        finally:
+            server.should_exit = True
+
+
+@pytestmark_playwright
+def test_panels_render_without_pageerror(client):
+    """Playwright: /dashboard and /demo render a non-empty main panel, throw
+    zero uncaught JS errors, and never 5xx on the panel's data requests.
+
+    Guards the blank-panel regression. The real defect was not a JS throw but a
+    server-side 500 on /projects/{id}/sessions ('cached plan must not change
+    result type' after an ALTER TABLE migration), which left the panel blank
+    because its sessions/status data never loaded. This asserts both the panel
+    container is populated AND that its backing requests succeed.
+    """
+    import threading
+    import time
+    import urllib.request
+    import uvicorn
+    from meridian import server as server_module
+
+    with sync_playwright() as p:
+        config = uvicorn.Config(server_module.app, host="127.0.0.1", port=17881, log_level="error")
+        server = uvicorn.Server(config)
+        thread = threading.Thread(target=server.run, daemon=True)
+        thread.start()
+        time.sleep(1.5)
+
+        # Seed a project against the *live* server so /dashboard renders an
+        # active project panel rather than the first-run wizard. The uvicorn
+        # server runs its own lifespan and owns a separate in-memory DB from
+        # the TestClient, so the row must be created over HTTP, not via client.
+        urllib.request.urlopen(
+            urllib.request.Request(
+                "http://127.0.0.1:17881/projects",
+                data=b'{"name": "panel-render"}',
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            ),
+            timeout=8,
+        )
+
+        try:
+            browser = p.chromium.launch()
+            for path in ("/dashboard", "/demo"):
+                errors: list[str] = []
+                server_errors: list[str] = []
+                page = browser.new_page()
+                page.on("pageerror", lambda e, _errs=errors: _errs.append(str(e)))
+                page.on(
+                    "response",
+                    lambda r, _errs=server_errors: _errs.append(f"{r.status} {r.url}")
+                    if r.status >= 500
+                    else None,
+                )
+                page.goto(f"http://127.0.0.1:17881{path}", wait_until="domcontentloaded")
+                page.wait_for_timeout(2500)
+                # Dismiss overlays/modals so they don't mask the panel.
+                for sel in ("#demo-onboarding-overlay", "#conn-setup-modal"):
+                    page.evaluate(
+                        f"() => {{ const e = document.querySelector('{sel}'); if (e) e.remove(); }}"
+                    )
+                page.wait_for_timeout(200)
+
+                assert not errors, f"{path} threw uncaught JS errors: {errors}"
+                assert not server_errors, \
+                    f"{path} backing requests 5xx'd (would blank the panel): {server_errors}"
+
+                body_len = page.evaluate("() => document.body.innerHTML.length")
+                assert body_len > 5000, f"{path} body suspiciously small: {body_len}"
+
+                # When a project panel is present (always on /dashboard, where we
+                # seeded a project) its default 'status' drawer must render content.
+                # /demo has no seeded project under MERIDIAN_SKIP_DEMO, so only
+                # enforce the drawer check when a panel actually rendered.
+                pid = page.evaluate(
+                    "() => { const el = document.querySelector('[id^=\"vtab-strip-\"]');"
+                    " return el ? el.id.replace('vtab-strip-','') : null; }"
+                )
+                if path == "/dashboard":
+                    assert pid, f"{path}: no active project panel found"
+                if pid:
+                    body_inner = page.evaluate(
+                        f"() => {{ const b = document.querySelector('#tab-body-{pid}');"
+                        f" return b ? b.innerHTML.trim().length : -1; }}"
+                    )
+                    assert body_inner > 100, \
+                        f"{path}: main panel container blank (len={body_inner})"
+                    drawer_len = page.evaluate(
+                        f"() => {{ const d = document.querySelector('#drawer-status-{pid}');"
+                        f" return d ? d.innerHTML.trim().length : -1; }}"
+                    )
+                    assert drawer_len > 2, f"{path}: status drawer blank (len={drawer_len})"
+                page.close()
+            browser.close()
+        finally:
+            server.should_exit = True
+
+
+@pytestmark_playwright
+def test_demo_tour_persists_and_finishes(client):
+    """Phase 4: the rebuilt demo tour persists progress across reloads and,
+    once 'Finish tutorial' is clicked, is never auto-shown again."""
+    import threading
+    import time
+    import uvicorn
+    from meridian import server as server_module
+
+    with sync_playwright() as p:
+        config = uvicorn.Config(server_module.app, host="127.0.0.1", port=17882, log_level="error")
+        server = uvicorn.Server(config)
+        thread = threading.Thread(target=server.run, daemon=True)
+        thread.start()
+        time.sleep(1.5)
+
+        try:
+            browser = p.chromium.launch()
+            page = browser.new_page()
+            page.goto("http://127.0.0.1:17882/demo", wait_until="domcontentloaded")
+            page.wait_for_timeout(1500)
+
+            # Start the tour from step 0 (dismiss the onboarding overlay first).
+            page.evaluate(
+                "() => { document.getElementById('demo-onboarding-overlay')?.remove(); startDemoTour(0); }"
+            )
+            page.wait_for_timeout(300)
+            assert page.query_selector("#demo-tour-tooltip"), "tour tooltip did not render"
+
+            # Advancing persists progress to localStorage.
+            page.click("#demo-tour-next")
+            page.wait_for_timeout(200)
+            step = page.evaluate("() => localStorage.getItem('meridian_demo_tour.step')")
+            assert step == "1", f"expected saved step 1, got {step!r}"
+
+            # Reload + resume picks up at the saved step (label '2 / N').
+            page.reload(wait_until="domcontentloaded")
+            page.wait_for_timeout(1200)
+            page.evaluate(
+                "() => { document.getElementById('demo-onboarding-overlay')?.remove(); resumeDemoTour(); }"
+            )
+            page.wait_for_timeout(300)
+            label = page.evaluate(
+                "() => document.querySelector('#demo-tour-tooltip div')?.textContent || ''"
+            )
+            assert label.strip().startswith("2 /"), f"tour did not resume at step 2: {label!r}"
+
+            # Finish marks the tour done; resuming must not reopen it.
+            page.click("#demo-tour-finish")
+            page.wait_for_timeout(200)
+            done = page.evaluate("() => localStorage.getItem('meridian_demo_tour.done')")
+            assert done == "1", f"finish did not set done flag: {done!r}"
+            page.evaluate("() => resumeDemoTour()")
+            page.wait_for_timeout(200)
+            assert page.query_selector("#demo-tour-tooltip") is None, \
+                "tour re-opened after Finish was clicked"
 
             browser.close()
         finally:

@@ -76,7 +76,7 @@ async def anydb(request):
             pytest.skip("TEST_DATABASE_URL not set — skipping Postgres variant")
         conn = await db_module.init_db(url)
         for table in (
-            "chat_messages", "chat_sessions", "sprint_items",
+            "sprint_items",
             "task_log", "sessions", "goal_states", "projects",
         ):
             await conn.execute(f"DELETE FROM {table}")
