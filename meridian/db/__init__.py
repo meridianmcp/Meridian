@@ -1673,7 +1673,7 @@ async def _migrate_tenants_is_internal(db: aiosqlite.Connection) -> None:
     # Backfill known internal emails. Idempotent.
     for email in sorted(_internal_emails()):
         await db.execute(
-            "UPDATE tenants SET is_internal = true WHERE LOWER(email) = ?",
+            "UPDATE tenants SET is_internal = 1 WHERE LOWER(email) = ?",
             (email,),
         )
     await db.commit()

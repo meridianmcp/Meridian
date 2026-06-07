@@ -926,10 +926,31 @@ async def _migrate_pg_tenants_is_internal(conn: PostgresConnection) -> None:
     await conn.executescript(
         "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS is_internal INTEGER NOT NULL DEFAULT 0"
     )
+    # Legacy databases created the column as BOOLEAN. Normalize to INTEGER so
+    # the backfill below (and every is_internal = 1 caller) is type-correct on
+    # every DB. boolean::integer yields 0/1.
+    async with conn.execute(
+        "SELECT data_type FROM information_schema.columns "
+        "WHERE table_name = 'tenants' AND column_name = 'is_internal'",
+        None,
+    ) as cur:
+        col = await cur.fetchone()
+    if col and col["data_type"] == "boolean":
+        await conn.execute(
+            "ALTER TABLE tenants ALTER COLUMN is_internal DROP DEFAULT", None
+        )
+        await conn.execute(
+            "ALTER TABLE tenants ALTER COLUMN is_internal TYPE INTEGER "
+            "USING (is_internal::integer)",
+            None,
+        )
+        await conn.execute(
+            "ALTER TABLE tenants ALTER COLUMN is_internal SET DEFAULT 0", None
+        )
     # Backfill known internal emails.
     for email in sorted(db_module._internal_emails()):
         await conn.execute(
-            "UPDATE tenants SET is_internal = true WHERE LOWER(email) = ?",
+            "UPDATE tenants SET is_internal = 1 WHERE LOWER(email) = ?",
             (email,),
         )
 
