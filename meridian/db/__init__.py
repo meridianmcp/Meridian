@@ -150,6 +150,7 @@ CREATE TABLE IF NOT EXISTS projects (
     max_pinned_decisions INTEGER NOT NULL DEFAULT 20,
     executor_config TEXT,
     hitl_auto_answer INTEGER NOT NULL DEFAULT 0,
+    icon TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -1563,7 +1564,13 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_v33_hitl_kind_payload(db)
     await _migrate_v34_hitl_auto_answer(db)
     await _migrate_v34_workspace_settings(db)
+    await _migrate_project_icon(db)
     return db
+
+
+async def _migrate_project_icon(db: aiosqlite.Connection) -> None:
+    """G4.17 — single-emoji icon on projects for sidebar/tab rendering."""
+    await _migrate_add_column_if_missing(db, "projects", "icon", "TEXT")
 
 
 async def create_project(

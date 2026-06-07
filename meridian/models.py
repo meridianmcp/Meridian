@@ -121,6 +121,7 @@ class Project(BaseModel):
     id: str
     name: str
     creator_human_id: str | None = None
+    icon: str | None = None
     created_at: str
 
 

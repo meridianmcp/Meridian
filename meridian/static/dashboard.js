@@ -1207,6 +1207,14 @@ function _makeTabEl(t) {
   div.dataset.tabId = t.id;
   div.onclick = () => activateTab(t.id);
 
+  // G4.17 — icon (single emoji) renders before the name.
+  if (t.project.icon) {
+    const iconSpan = document.createElement('span');
+    iconSpan.textContent = t.project.icon;
+    iconSpan.style.cssText = 'margin-right:5px;font-size:1.05em';
+    div.appendChild(iconSpan);
+  }
+
   const nameSpan = document.createElement('span');
   nameSpan.textContent = t.project.name;
   div.appendChild(nameSpan);
@@ -1261,6 +1269,32 @@ function _openTabMenu(t, anchor) {
   document.body.appendChild(menu);
   const dismiss = () => { menu.remove(); document.removeEventListener('click', dismiss); };
   setTimeout(() => document.addEventListener('click', dismiss), 0);
+}
+
+async function _setProjectIcon(t) {
+  /** G4.17 — quick prompt-based emoji picker. Paste one emoji or leave
+   * blank to clear. Image uploads are intentionally NOT supported here —
+   * see the v1.0.1 backlog note for "project image upload". */
+  const current = t.project.icon || '';
+  const next = window.prompt(
+    `Paste a single emoji to use as the project icon (or leave blank to clear).\n\nCurrent: ${current || '(none)'}`,
+    current,
+  );
+  if (next === null) return;  // cancelled
+  const icon = next.trim() ? next.trim().slice(0, 8) : null;
+  try {
+    const updated = await api(`/projects/${t.id}/icon`, {
+      method: 'PATCH', body: JSON.stringify({ icon }),
+    });
+    t.project = { ...t.project, icon: updated.icon || null };
+    // Update in-place: tabs (header + sidebar), project switcher.
+    const proj = state.projects.find(p => p.id === t.id);
+    if (proj) proj.icon = updated.icon || null;
+    renderTabs();
+    toast(icon ? `Icon set to ${icon}` : 'Icon cleared');
+  } catch (e) {
+    toast('Update failed: ' + e.message, true);
+  }
 }
 
 async function _renameProject(t) {

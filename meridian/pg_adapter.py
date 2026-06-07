@@ -425,6 +425,7 @@ CREATE TABLE IF NOT EXISTS projects (
     executor_config TEXT,
     rewind_token TEXT,
     hitl_auto_answer INTEGER NOT NULL DEFAULT 0,
+    icon TEXT,
     created_at TEXT NOT NULL DEFAULT ({_TS})
 );
 
@@ -846,6 +847,7 @@ async def init_pg_db(url: str) -> PostgresConnection:
     await _migrate_pg_v33_hitl_kind_payload(conn)
     await _migrate_pg_v34_hitl_auto_answer(conn)
     await _migrate_pg_v34_workspace_settings(conn)
+    await _migrate_pg_project_icon(conn)
     if is_main_db:
         await _migrate_pg_v10_tenant_columns(conn)
         await _migrate_pg_v25_admins_table(conn)
@@ -1061,6 +1063,13 @@ async def _migrate_pg_v34_workspace_settings(conn: PostgresConnection) -> None:
         "    sprint_name_default TEXT,"
         f"    updated_at TEXT NOT NULL DEFAULT ({_TS})"
         ")"
+    )
+
+
+async def _migrate_pg_project_icon(conn: PostgresConnection) -> None:
+    """G4.17 — projects.icon (single-emoji column for sidebar/tab rendering)."""
+    await conn.executescript(
+        "ALTER TABLE projects ADD COLUMN IF NOT EXISTS icon TEXT"
     )
 
 

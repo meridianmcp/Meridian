@@ -1961,6 +1961,38 @@ async def _maybe_notify(
         pass
 
 
+@app.patch("/projects/{project_id}/icon")
+async def set_project_icon(
+    project_id: str, body: dict[str, Any], request: Request
+) -> dict[str, Any]:
+    """G4.17 — set or clear the single-emoji icon for a project.
+
+    Body: ``{"icon": "🎯"}`` or ``{"icon": null}``. Stored as the user-provided
+    string capped to a short length (typical emoji is 1-4 codepoints); the
+    frontend never expects more than ~8 chars. Wider validation lives in
+    the UI picker.
+    """
+    project = await db_module.get_project(await _db(request), project_id)
+    if project is None:
+        raise HTTPException(404, "project not found")
+    raw = body.get("icon")
+    icon: str | None
+    if raw is None:
+        icon = None
+    else:
+        icon = str(raw).strip()[:8] or None
+    db = await _db(request)
+    await db.execute(
+        "UPDATE projects SET icon = ? WHERE id = ?",
+        (icon, project_id),
+    )
+    await db.commit()
+    db_module.publish_global(
+        {"type": "project_icon_changed", "project_id": project_id, "icon": icon}
+    )
+    return await db_module.get_project(db, project_id)
+
+
 @app.post("/projects/{project_id}/rename")
 async def rename_project(
     project_id: str, body: dict[str, Any], request: Request

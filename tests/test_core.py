@@ -5617,6 +5617,27 @@ def test_landing_page_charset_and_emoji_survival(client):
         assert moji not in body, f"mojibake sequence {moji!r} present in landing page"
 
 
+def test_project_icon_patch_round_trip(client):
+    """G4.17 — PATCH /projects/{pid}/icon stores the emoji and clears it."""
+    p = client.post("/projects", json={"name": "g417-icon"}).json()
+    r = client.patch(f"/projects/{p['id']}/icon", json={"icon": "🎯"})
+    assert r.status_code == 200
+    assert r.json()["icon"] == "🎯"
+
+    r = client.get("/projects").json()
+    found = next(x for x in r if x["id"] == p["id"])
+    assert found["icon"] == "🎯"
+
+    r = client.patch(f"/projects/{p['id']}/icon", json={"icon": None})
+    assert r.status_code == 200
+    assert r.json()["icon"] is None
+
+    # Long input is truncated to 8 chars at the model boundary.
+    r = client.patch(f"/projects/{p['id']}/icon", json={"icon": "x" * 50})
+    assert r.status_code == 200
+    assert len(r.json()["icon"]) <= 8
+
+
 def test_safety_limits_module_thresholds_have_sensible_defaults():
     """G4.15 — defaults are guard-rails, not quotas."""
     from meridian import limits
