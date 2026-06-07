@@ -1208,17 +1208,30 @@ async def provision_neon_db(tenant_id: str, db: Any) -> dict[str, Any]:
     # Capacity check
     await check_capacity(db)
 
-    # Find or create a pool project with room
-    pool = await db_module.get_available_pool_project(
+    # Item 38 — atomic claim+increment to avoid the overprovisioning race
+    # where two concurrent signups both pick a pool with 7/8 slots and bump
+    # it to 9/8. claim_pool_project_slot returns the row already-incremented.
+    pool = await db_module.claim_pool_project_slot(
         db, tier=pool_tier, max_customers=_MAX_CUSTOMERS_PER_PROJECT
     )
 
     if pool is None:
-        # All existing pool projects are full — create a new one
+        # All existing pool projects are full (or all last-slot races lost).
+        # Create a new one and claim a slot from it. claim() on the fresh pool
+        # is still atomic, so even if a sibling signup raced to create another
+        # new pool, both claims succeed harmlessly.
         neon_project_id, _first_conn_uri = await _create_neon_pool_project(api_key, pool_tier)
-        pool = await db_module.register_pool_project(db, neon_project_id, pool_tier)
-    else:
-        neon_project_id = pool["neon_project_id"]
+        await db_module.register_pool_project(db, neon_project_id, pool_tier)
+        pool = await db_module.claim_pool_project_slot(
+            db, tier=pool_tier, max_customers=_MAX_CUSTOMERS_PER_PROJECT
+        )
+        if pool is None:  # extremely unlikely — fresh pool with cap-1 capacity
+            raise RuntimeError(
+                "newly-registered pool project had no claimable slot "
+                "(check _MAX_CUSTOMERS_PER_PROJECT > 0)"
+            )
+
+    neon_project_id = pool["neon_project_id"]
 
     # Create a customer-specific database inside the pool project
     email_slug = tenant["email"].split("@")[0][:20].replace(".", "_")
@@ -1226,6 +1239,8 @@ async def provision_neon_db(tenant_id: str, db: Any) -> dict[str, Any]:
     conn_uri = await _create_customer_database(api_key, neon_project_id, db_name)
 
     if not conn_uri:
+        # Roll back the claim we made so the slot isn't leaked.
+        await db_module.decrement_pool_project_count(db, neon_project_id)
         raise RuntimeError(f"Failed to get connection URI for customer database {db_name!r}")
 
     # Persist on tenant — encrypt the connection string at rest.
@@ -1236,9 +1251,6 @@ async def provision_neon_db(tenant_id: str, db: Any) -> dict[str, Any]:
         pool_project_id=pool["id"],
         neon_db_url=db_module.encrypt_field(conn_uri),
     )
-
-    # Increment pool project customer count
-    await db_module.increment_pool_project_count(db, neon_project_id)
 
     # v1.0 — set PITR retention on the pool project based on plan tier.
     # Pro: 7 days, Standard: 1 day (Neon default). Best-effort — never

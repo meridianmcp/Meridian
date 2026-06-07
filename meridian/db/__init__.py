@@ -4806,13 +4806,56 @@ async def increment_pool_project_count(
     db: aiosqlite.Connection,
     neon_project_id: str,
 ) -> None:
-    """Increment customer_count on a pool project after assigning a new customer."""
+    """Increment customer_count on a pool project after assigning a new customer.
+
+    Prefer :func:`claim_pool_project_slot` for race-free atomic claim+increment.
+    This helper is kept for backfill / fix-up scripts that aren't on the
+    signup hot path.
+    """
     await db.execute(
         "UPDATE neon_pool_projects SET customer_count = customer_count + 1 "
         "WHERE neon_project_id = ?",
         (neon_project_id,),
     )
     await db.commit()
+
+
+async def claim_pool_project_slot(
+    db: aiosqlite.Connection,
+    tier: str = "standard",
+    max_customers: int = 8,
+) -> dict[str, Any] | None:
+    """Item 38 — atomically reserve a slot in an available pool project.
+
+    Replaces the read/then/write race in ``get_available_pool_project`` +
+    ``increment_pool_project_count``: two concurrent signups previously could
+    both see the same pool with 7/8 slots, both proceed, both increment, and
+    leave the pool at 9/8 — overprovisioned past the soft cap.
+
+    The single UPDATE-with-subquery is atomic on SQLite (statement-level) and
+    safe on Postgres MVCC because the *outer* ``customer_count < ?`` re-check
+    runs against the locked row, so the second concurrent UPDATE harmlessly
+    no-ops once T1 has bumped the count to the cap.
+
+    Returns the updated pool project row (with the post-increment count), or
+    ``None`` if no pool has room — caller should create a new pool project
+    and try again.
+    """
+    async with db.execute(
+        "UPDATE neon_pool_projects "
+        "SET customer_count = customer_count + 1 "
+        "WHERE id = ("
+        "  SELECT id FROM neon_pool_projects "
+        "  WHERE tier = ? AND customer_count < ? "
+        "  ORDER BY customer_count DESC LIMIT 1"
+        ") "
+        "AND customer_count < ? "
+        "RETURNING *",
+        (tier, max_customers, max_customers),
+    ) as cur:
+        row = await cur.fetchone()
+    await db.commit()
+    return _row_to_dict(row) if row else None
 
 
 async def decrement_pool_project_count(
