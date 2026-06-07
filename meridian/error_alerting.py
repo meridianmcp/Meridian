@@ -80,9 +80,7 @@ async def record_5xx(route: str, tenant: str | None, status: int) -> None:
         }
         if _dispatch_hook is not None:
             try:
-                result = _dispatch_hook(payload)
-                if asyncio.iscoroutine(result):
-                    asyncio.create_task(result)
+                _dispatch_hook(payload)
             except Exception:  # noqa: BLE001
                 logger.warning("5xx alert hook raised", exc_info=True)
         else:
