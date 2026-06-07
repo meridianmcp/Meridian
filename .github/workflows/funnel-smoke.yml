@@ -1,0 +1,52 @@
+name: Nightly funnel smoke
+
+# Item 40 — walk the prod acquisition funnel (landing → pricing → demo →
+# waitlist → install-mcp) every night and page the admin if any stage breaks,
+# so silent conversion regressions surface overnight instead of via a user.
+
+on:
+  schedule:
+    # 08:00 UTC daily (~midnight–03:00 US). Cron runs against main's workflow.
+    - cron: '0 8 * * *'
+  workflow_dispatch:
+    inputs:
+      url:
+        description: 'Base URL to smoke (default: prod)'
+        required: false
+        default: 'https://usemeridian.us'
+        type: string
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  funnel:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run funnel smoke
+        id: smoke
+        run: |
+          URL="${{ github.event.inputs.url || 'https://usemeridian.us' }}"
+          python scripts/funnel_smoke.py --url "$URL"
+
+      - name: Page admin on failure (ntfy)
+        if: failure() && steps.smoke.outcome == 'failure'
+        run: |
+          NTFY="${{ secrets.MERIDIAN_ADMIN_NTFY_URL }}"
+          if [ -z "$NTFY" ]; then
+            echo "MERIDIAN_ADMIN_NTFY_URL not set — relying on GitHub's native failure email."
+            exit 0
+          fi
+          case "$NTFY" in
+            *://*) TARGET="$NTFY" ;;
+            *)     TARGET="https://ntfy.sh/${NTFY#/}" ;;
+          esac
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          curl -s --max-time 10 \
+            -H "Title: [Meridian] Nightly funnel smoke FAILED" \
+            -H "Priority: high" \
+            -H "Tags: warning,meridian-funnel" \
+            -d "A conversion funnel stage broke on prod. Run: $RUN_URL" \
+            "$TARGET" || echo "ntfy post failed (non-fatal)"
