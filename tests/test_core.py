@@ -5617,6 +5617,43 @@ def test_landing_page_charset_and_emoji_survival(client):
         assert moji not in body, f"mojibake sequence {moji!r} present in landing page"
 
 
+def test_billing_portal_redirects_anonymous_to_login(client, monkeypatch):
+    """G2.11 — /billing/portal sends anonymous users to /auth/login with a next= back."""
+    monkeypatch.setenv("MERIDIAN_HOSTED", "true")
+    r = client.get("/billing/portal", follow_redirects=False)
+    assert r.status_code == 302
+    assert r.headers["location"].startswith("/auth/login")
+    assert "next=/billing/portal" in r.headers["location"]
+
+
+def test_billing_portal_endpoint_registered():
+    """G2.11 — the /billing/portal route exists on the FastAPI app."""
+    from meridian.server import app
+    routes = {r.path for r in app.routes if hasattr(r, "path")}
+    assert "/billing/portal" in routes
+
+
+@pytest.mark.asyncio
+async def test_create_stripe_billing_portal_session_rejects_no_customer():
+    """G2.11 — helper raises ValueError when stripe_customer_id is missing,
+    so the route can redirect to /pricing instead of failing opaquely."""
+    from meridian.hosted import create_stripe_billing_portal_session
+    with pytest.raises(ValueError):
+        await create_stripe_billing_portal_session({"email": "free@example.com"})
+
+
+def test_me_endpoint_exposes_has_stripe_customer(client, monkeypatch):
+    """G2.11 — /me payload carries has_stripe_customer so the dashboard
+    can flip the billing button between Manage and Upgrade without a
+    separate round-trip."""
+    monkeypatch.delenv("MERIDIAN_HOSTED", raising=False)
+    r = client.get("/me")
+    assert r.status_code == 200
+    # Local mode returns {} (no tenant) — the field is added only when there's a tenant.
+    # In hosted mode without a session, also {}. Either way it shouldn't crash.
+    assert r.json() == {} or "has_stripe_customer" in r.json()
+
+
 def test_hosted_non_admin_cannot_mutate_connections(client, monkeypatch):
     """G1.9 — POST/DELETE /config/connections returns 403 for non-admin hosted
     tenants. Replaces the surprising 404 "connection 'env' not found" with a

@@ -1116,6 +1116,30 @@ async def create_stripe_checkout_session(tenant: dict, plan: str) -> str:
     return session.url
 
 
+async def create_stripe_billing_portal_session(tenant: dict) -> str:
+    """G2.11 — open a Stripe Customer Portal session for an existing subscriber.
+
+    The portal lets the customer update card, change plan, view invoices,
+    and cancel. Returns the portal URL to redirect to. Raises ValueError
+    if the tenant has no stripe_customer_id; callers should route those
+    users to /pricing for first subscription instead. Raises RuntimeError
+    if STRIPE_API_KEY is not configured.
+    """
+    customer_id = tenant.get("stripe_customer_id")
+    if not customer_id:
+        raise ValueError("tenant has no stripe_customer_id — send to /pricing")
+
+    import stripe  # type: ignore[import]  # noqa: PLC0415
+
+    stripe.api_key = _require_cfg("STRIPE_API_KEY")
+    base = _cfg("MERIDIAN_BASE_URL", "http://localhost:7878").rstrip("/")
+    session = stripe.billing_portal.Session.create(
+        customer=customer_id,
+        return_url=f"{base}/dashboard",
+    )
+    return session.url
+
+
 async def _provision_tenant_background(tenant_id: str, db: Any) -> None:
     """Best-effort background provisioning called from OAuth callbacks.
 

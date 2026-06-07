@@ -667,13 +667,27 @@ function _renderPlanBadge(me) {
     badge.textContent = planLabels[plan] || plan;
     verEl.parentNode.insertBefore(badge, verEl.nextSibling);
   }
+  // G2.11 — Billing button. With a Stripe customer → "Manage" opens the
+  // Stripe Customer Portal; without one (free/trial that never paid) →
+  // "Upgrade" routes to /pricing.
+  const planBadge = document.getElementById('plan-badge');
+  if (planBadge && !document.getElementById('billing-link')) {
+    const hasStripe = !!me.has_stripe_customer;
+    const link = document.createElement('a');
+    link.id = 'billing-link';
+    link.href = hasStripe ? '/billing/portal' : '/pricing';
+    link.textContent = hasStripe ? 'Manage' : 'Upgrade';
+    link.title = hasStripe ? 'Open Stripe billing portal' : 'See plans and upgrade';
+    link.style = 'margin-left:6px;padding:2px 7px;border-radius:10px;font-size:10px;font-weight:600;letter-spacing:0.03em;background:transparent;color:var(--accent);border:1px solid var(--accent)55;vertical-align:middle;text-decoration:none;cursor:pointer';
+    planBadge.parentNode.insertBefore(link, planBadge.nextSibling);
+  }
   // Persistent upgrade nudge for free-tier users (shown regardless of days left).
   if (plan === 'free' && !me.expired && !isDemoMode() && !document.getElementById('upgrade-banner')) {
     const upgradeUrl = state.serverConfig?.stripe_payment_link || '/pricing';
     const b = document.createElement('div');
     b.id = 'upgrade-banner';
     b.style = 'position:fixed;top:0;left:0;right:0;z-index:9996;background:#2563eb;color:#fff;text-align:center;padding:5px 12px;font-size:12px;font-family:inherit;letter-spacing:0.02em;display:flex;align-items:center;justify-content:center;gap:10px';
-    b.innerHTML = `<span>Upgrade to Standard — 8× faster, dedicated DB</span><a href="${escapeHtml(upgradeUrl)}" style="background:#fff;color:#2563eb;font-weight:700;text-decoration:none;padding:2px 10px;border-radius:4px;white-space:nowrap">$20/mo →</a><button onclick="sessionStorage.setItem('upgrade-banner-dismissed','1');this.closest('#upgrade-banner').remove();document.body.style.paddingTop=Math.max(0,parseInt(document.body.style.paddingTop||'0',10)-28)+'px'" style="background:none;border:none;color:rgba(255,255,255,0.7);font-size:16px;cursor:pointer;padding:0 0 0 6px;line-height:1" title="Dismiss">×</button>`;
+    b.innerHTML = `<span>Upgrade to Standard — 4× faster, dedicated DB</span><a href="${escapeHtml(upgradeUrl)}" style="background:#fff;color:#2563eb;font-weight:700;text-decoration:none;padding:2px 10px;border-radius:4px;white-space:nowrap">$20/mo →</a><button onclick="sessionStorage.setItem('upgrade-banner-dismissed','1');this.closest('#upgrade-banner').remove();document.body.style.paddingTop=Math.max(0,parseInt(document.body.style.paddingTop||'0',10)-28)+'px'" style="background:none;border:none;color:rgba(255,255,255,0.7);font-size:16px;cursor:pointer;padding:0 0 0 6px;line-height:1" title="Dismiss">×</button>`;
     if (!sessionStorage.getItem('upgrade-banner-dismissed')) {
       document.body.prepend(b);
       document.body.style.paddingTop = ((parseInt(document.body.style.paddingTop || '0', 10)) + 28) + 'px';

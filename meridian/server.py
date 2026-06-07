@@ -1305,6 +1305,9 @@ async def me_endpoint(request: Request) -> dict[str, Any]:
         "inactivity_expires_at": expires_raw,
         "days_remaining": days_remaining,
         "expired": expired,
+        # G2.11 — tells the dashboard whether to render "Manage billing"
+        # (true → opens Stripe portal) or "Upgrade" (false → /pricing).
+        "has_stripe_customer": bool(tenant.get("stripe_customer_id")),
     }
 
 
@@ -4855,6 +4858,34 @@ a:hover{text-decoration:underline}
 # ---------------------------------------------------------------------------
 # v1.0 — Stripe Checkout (API-based, plan-aware)
 # ---------------------------------------------------------------------------
+
+
+@app.get("/billing/portal")
+async def billing_portal_redirect(request: Request):
+    """G2.11 — open a Stripe Customer Portal session for the signed-in tenant.
+
+    Routes to /pricing when the tenant has no stripe_customer_id (free tier
+    or trial), to /auth/login when not signed in, and to the Stripe-hosted
+    portal otherwise.
+    """
+    from fastapi.responses import RedirectResponse  # noqa: PLC0415
+    from .hosted import create_stripe_billing_portal_session, get_current_tenant  # noqa: PLC0415
+
+    try:
+        tenant = await get_current_tenant(request)
+    except HTTPException:
+        return RedirectResponse("/auth/login?next=/billing/portal", status_code=302)
+
+    try:
+        url = await create_stripe_billing_portal_session(tenant)
+    except ValueError:
+        # No stripe_customer_id yet — direct the user to subscribe instead.
+        return RedirectResponse("/pricing", status_code=302)
+    except RuntimeError:
+        # Stripe not configured (local dev) — fall through to pricing.
+        return RedirectResponse("/pricing", status_code=302)
+
+    return RedirectResponse(url, status_code=302)
 
 
 @app.get("/checkout")
