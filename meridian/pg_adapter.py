@@ -929,7 +929,7 @@ async def _migrate_pg_tenants_is_internal(conn: PostgresConnection) -> None:
     # Backfill known internal emails.
     for email in sorted(db_module._internal_emails()):
         await conn.execute(
-            "UPDATE tenants SET is_internal = 1 WHERE LOWER(email) = ?",
+            "UPDATE tenants SET is_internal = true WHERE LOWER(email) = ?",
             (email,),
         )
 
