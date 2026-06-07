@@ -49,7 +49,7 @@ function hideHostedAdminControls() {
     const lbl = document.createElement('div');
     lbl.className = 'hosted-label';
     lbl.style.cssText = 'font-size:10px;color:var(--accent-green);font-family:\'IBM Plex Mono\',monospace;padding:4px 6px;border:1px solid var(--accent-green)44;border-radius:3px;opacity:0.8;letter-spacing:.03em';
-    lbl.textContent = '⬡ usemeridian.us';
+    lbl.textContent = '🧭 usemeridian.us';
     footer.prepend(lbl);
   }
 
@@ -1316,7 +1316,7 @@ function buildTabBody(project) {
       <button class="vtab-btn" data-vtab="devlog" title="Dev Log">📓</button>
       <button class="vtab-btn" data-vtab="timeline" title="Activity Timeline">📅</button>
       <button class="vtab-btn" data-vtab="rewind" title="Rewind — Last X days">↻</button>
-      <button class="vtab-btn" data-vtab="queue" title="Work Queue">🪖</button>
+      <button class="vtab-btn" data-vtab="queue" title="Work Queue">👷</button>
       <button class="vtab-btn" data-vtab="team" title="Team — per-human activity">👥</button>
       <button class="vtab-btn" data-vtab="notes" title="Notes — per-project wiki" style="position:relative">📝<span class="notes-vtab-badge vtab-count-badge muted" data-pid="${project.id}" style="display:none;position:absolute;top:2px;right:2px;background:var(--surface-3,#2a2f3a);color:var(--muted);font-size:8px;font-weight:700;padding:0 3px;border-radius:6px;line-height:14px;pointer-events:none">0</span></button>
       <button class="vtab-btn" data-vtab="hitl" title="HITL — Human-in-the-Loop queue" style="position:relative">❓<span class="hitl-vtab-badge vtab-count-badge" data-pid="${project.id}" style="display:none;position:absolute;top:2px;right:2px;background:#f87171;color:#fff;font-size:8px;font-weight:700;padding:0 3px;border-radius:6px;line-height:14px;pointer-events:none">0</span></button>
