@@ -29,7 +29,7 @@ logger = logging.getLogger(__name__)
 
 _5xx_events: deque[tuple[float, str, str | None, int]] = deque()
 _lock = asyncio.Lock()
-_last_alert_ts: float = 0.0
+_last_alert_ts: float = -1e9  # Far in the past so first alert always fires
 
 # Test hook — replaced by tests to capture alert dispatches without HTTP I/O.
 _dispatch_hook: Callable[[dict[str, Any]], Any] | None = None
@@ -172,7 +172,7 @@ def _reset_for_tests() -> None:
     """Test hook — clear the rolling window + cooldown timestamp."""
     global _last_alert_ts, _dispatch_hook
     _5xx_events.clear()
-    _last_alert_ts = 0.0
+    _last_alert_ts = -1e9  # Far in the past so first alert always fires
     _dispatch_hook = None
 
 
