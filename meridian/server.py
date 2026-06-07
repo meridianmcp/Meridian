@@ -4389,6 +4389,42 @@ async def _idle_until_session_done(
         await asyncio.sleep(max(1, poll_seconds))
 
 
+async def _find_continuation_session(
+    db: aiosqlite.Connection,
+    project_id: str,
+    session_name: str,
+    max_idle_minutes: int = 5,
+) -> dict[str, Any] | None:
+    """G8.34 — Look for an active session with this name whose last heartbeat
+    is within ``max_idle_minutes`` minutes. Returns the session row or None.
+
+    Matching keys: project_id + session_name (NOT the MCP-Session-Id header,
+    because ChatGPT regenerates that per call so it can never identify a
+    continuation). The session name is the logical handle the client picked
+    at startup; re-registering with the same name is the resume signal.
+    """
+    from datetime import datetime, timezone, timedelta
+    sessions = await db_module.get_sessions(db, project_id, active_only=True)
+    if not sessions:
+        return None
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=max_idle_minutes)
+    for s in sessions:
+        if (s.get("name") or "") != session_name:
+            continue
+        last_seen_raw = s.get("last_seen") or ""
+        if not last_seen_raw:
+            continue
+        try:
+            seen = datetime.strptime(last_seen_raw, "%Y-%m-%d %H:%M:%S").replace(
+                tzinfo=timezone.utc,
+            )
+        except ValueError:
+            continue
+        if seen >= cutoff:
+            return s
+    return None
+
+
 async def _start_session_composite(
     db: aiosqlite.Connection,
     project_id: str,
@@ -4397,13 +4433,33 @@ async def _start_session_composite(
     human_id: str | None = None,
     client_type: str | None = None,
     role: str | None = None,
+    source: str | None = None,
 ) -> dict[str, Any]:
     """Register + goal + tasks + sessions + handoff-check in one shot.
 
     Replaces the four-call cold-start sequence (register_session, get_goal,
     get_tasks, check handoff file) with a single call that returns everything
     a new session needs before touching anything.
+
+    G8.34 — If a session with the same ``session_name`` is still active and
+    pinged a heartbeat within the last 5 minutes, return a compact
+    continuation block (no new registration, no goal-block flood). Keyed on
+    (project_id, session_name); NEVER on Mcp-Session-Id since ChatGPT
+    regenerates that header per tool call.
     """
+    existing = await _find_continuation_session(db, project_id, session_name)
+    if existing is not None:
+        # Compact resume block — caller already has the heavy context.
+        recent = await db_module.get_tasks(db, project_id, limit=10)
+        return {
+            "continuation": True,
+            "session": existing,
+            "source": source,
+            "recent_tasks": recent,
+            "note": "Resumed existing session (last_seen within 5 min). "
+                    "Call start_session(source='startup') after a real cold boot "
+                    "to get the full orientation block.",
+        }
     # v1.8.x — archive sessions silent for 7+ days so they don't crowd
     # the active list seen by new sessions.
     await db_module.archive_empty_sessions(db)
@@ -4565,6 +4621,7 @@ async def start_session_endpoint(
         human_id=body.human_id,
         client_type=body.client,
         role=body.role,
+        source=body.source,
     )
 
 

@@ -5618,6 +5618,58 @@ def test_landing_page_charset_and_emoji_survival(client):
 
 
 @pytest.mark.asyncio
+async def test_start_session_returns_continuation_for_fresh_repeat():
+    """G8.34 — re-calling start_session for the same session_name within the
+    idle window returns a continuation block, not a brand-new registration."""
+    from meridian.server import _start_session_composite
+    db = await db_module.init_db(":memory:")
+    try:
+        p = await db_module.create_project(db, "g834-proj")
+        first = await _start_session_composite(
+            db, p["id"], "feature-x", "/tmp", source="startup",
+        )
+        assert "continuation" not in first
+        first_sid = first["session_id"]
+        # Immediate re-call — the prior session's last_seen is fresh.
+        second = await _start_session_composite(
+            db, p["id"], "feature-x", "/tmp", source="resume",
+        )
+        assert second.get("continuation") is True
+        assert second["source"] == "resume"
+        assert second["session"]["id"] == first_sid
+        assert "recent_tasks" in second
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_start_session_skips_continuation_for_stale_session():
+    """G8.34 — when last_seen is older than the idle window, fall through to
+    a fresh registration. The MCP-Session-Id header is never consulted."""
+    from meridian.server import _start_session_composite
+    db = await db_module.init_db(":memory:")
+    try:
+        p = await db_module.create_project(db, "g834-stale")
+        first = await _start_session_composite(
+            db, p["id"], "feature-y", "/tmp",
+        )
+        first_sid = first["session_id"]
+        # Backdate last_seen by 10 minutes.
+        await db.execute(
+            "UPDATE sessions SET last_seen = datetime('now', '-10 minutes') WHERE id = ?",
+            (first_sid,),
+        )
+        await db.commit()
+        second = await _start_session_composite(
+            db, p["id"], "feature-y", "/tmp",
+        )
+        assert second.get("continuation") is not True
+        assert second["session_id"] != first_sid
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
 async def test_workspace_member_accepted_for_email_finds_accepted_only():
     """G5.22 — the helper used by OAuth callbacks to skip Neon provisioning
     for invitees must only consider ACCEPTED memberships, not pending ones."""

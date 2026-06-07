@@ -299,5 +299,15 @@ class StartSessionRequest(BaseModel):
         default=None,
         description="Optional session role. Use 'executor' to inject executor_config.",
     )
+    source: str | None = Field(
+        default=None,
+        description=(
+            "G8.34 — Optional hint about why start_session was called: "
+            "'startup' (fresh client boot), 'resume' (cleared chat / continued "
+            "work), 'clear' (user wiped context), or 'compact' (context window "
+            "ran out, fresh process). SessionStart hooks forward this so the "
+            "server can return a continuation block instead of a full reset."
+        ),
+    )
 
 
