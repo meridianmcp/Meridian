@@ -4555,8 +4555,27 @@ async def hooks_stop(body: dict[str, Any], request: Request) -> dict[str, Any]:
     return {"ok": True}
 
 
+async def _block_non_admin_connection_writes(request: Request) -> None:
+    """G1.9 — connection profiles live in the hosted server's meridian.toml.
+    Non-admin tenants must not be able to mutate them. Returns 403 cleanly
+    instead of the surprising 404 when, e.g., the dashboard tried to
+    activate a connection name that doesn't exist in the toml at all.
+    """
+    if not _hosted_mode():
+        return
+    from .hosted import get_current_tenant, is_admin_db  # noqa: PLC0415
+    try:
+        tenant = await get_current_tenant(request)
+    except HTTPException:
+        raise HTTPException(403, "Sign in to manage connections")
+    if not await is_admin_db(tenant.get("email", ""), request.app.state.db):
+        raise HTTPException(
+            403, "Connection profiles are admin-only on the hosted service"
+        )
+
+
 @app.post("/config/connections")
-async def save_connection(body: dict[str, Any]) -> dict[str, Any]:
+async def save_connection(body: dict[str, Any], request: Request) -> dict[str, Any]:
     """v1.9.x — save a new connection profile to meridian.toml.
 
     Body fields:
@@ -4564,7 +4583,11 @@ async def save_connection(body: dict[str, Any]) -> dict[str, Any]:
       * ``type``      — "sqlite" or "postgres"
       * ``url``       — Postgres URL (required when type == "postgres")
       * ``activate``  — if true, set as the active connection (default true)
+
+    Hosted non-admin tenants get 403; the dashboard hides the picker for
+    them too, but this is the canonical defense.
     """
+    await _block_non_admin_connection_writes(request)
     name = str(body.get("name", "local")).strip()
     conn_type = body.get("type")  # optional — if omitted, reuse existing
     url = str(body.get("url", "")).strip()
@@ -4606,8 +4629,12 @@ async def save_connection(body: dict[str, Any]) -> dict[str, Any]:
 
 
 @app.delete("/config/connections/{name}")
-async def delete_connection(name: str) -> dict[str, Any]:
-    """v1.9.x — remove a named connection profile from meridian.toml."""
+async def delete_connection(name: str, request: Request) -> dict[str, Any]:
+    """v1.9.x — remove a named connection profile from meridian.toml.
+
+    Hosted non-admin tenants get 403 (see _block_non_admin_connection_writes).
+    """
+    await _block_non_admin_connection_writes(request)
     data = toml_config_module.load_toml() or {}
     connections: dict[str, dict[str, str]] = {
         cname: dict(ccfg)

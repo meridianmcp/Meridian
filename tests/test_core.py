@@ -5617,6 +5617,35 @@ def test_landing_page_charset_and_emoji_survival(client):
         assert moji not in body, f"mojibake sequence {moji!r} present in landing page"
 
 
+def test_hosted_non_admin_cannot_mutate_connections(client, monkeypatch):
+    """G1.9 — POST/DELETE /config/connections returns 403 for non-admin hosted
+    tenants. Replaces the surprising 404 "connection 'env' not found" with a
+    clear permission error and matches the read-only dashboard UI."""
+    monkeypatch.setenv("MERIDIAN_HOSTED", "true")
+    monkeypatch.delenv("MERIDIAN_ADMIN_EMAILS", raising=False)
+    monkeypatch.delenv("ADMIN_EMAIL", raising=False)
+    # No session cookie → get_current_tenant raises 401 → guard maps to 403.
+    r = client.post("/config/connections", json={"name": "neon-prod", "activate": True})
+    assert r.status_code == 403
+    assert "admin" in r.json().get("detail", "").lower() or \
+           "sign in" in r.json().get("detail", "").lower()
+    r = client.delete("/config/connections/neon-prod")
+    assert r.status_code == 403
+
+
+def test_local_mode_connections_endpoint_unchanged(client, monkeypatch):
+    """G1.9 — the guard is hosted-only; self-hosted local installs still
+    accept the POST/DELETE flow without auth (single-user trust model)."""
+    monkeypatch.delenv("MERIDIAN_HOSTED", raising=False)
+    r = client.post(
+        "/config/connections",
+        json={"name": "local-test", "type": "sqlite", "activate": False},
+    )
+    # In local mode we should NOT get 403. Success or some other status,
+    # depending on whether toml writes are mocked, but not 403.
+    assert r.status_code != 403
+
+
 def test_canonicalize_notify_target_strips_ntfy_prefix():
     """G1.7 — ntfy URLs collapse to topic-only; emails/webhooks pass through."""
     from meridian.server import _canonicalize_notify_target
