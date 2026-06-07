@@ -368,9 +368,24 @@ def test_panels_render_without_pageerror(client):
             browser = p.chromium.launch()
             for path in ("/dashboard", "/demo"):
                 errors: list[str] = []
+                console_errors: list[str] = []
+                request_failed: list[str] = []
                 server_errors: list[str] = []
                 page = browser.new_page()
                 page.on("pageerror", lambda e, _errs=errors: _errs.append(str(e)))
+                page.on(
+                    "console",
+                    lambda msg, _errs=console_errors: _errs.append(msg.text)
+                    if msg.type == "error"
+                    and "ERR_INSUFFICIENT_RESOURCES" not in msg.text
+                    else None,
+                )
+                page.on(
+                    "requestfailed",
+                    lambda req, _errs=request_failed: _errs.append(
+                        f"{req.method} {req.url} -> {req.failure}"
+                    ),
+                )
                 page.on(
                     "response",
                     lambda r, _errs=server_errors: _errs.append(f"{r.status} {r.url}")
@@ -387,6 +402,8 @@ def test_panels_render_without_pageerror(client):
                 page.wait_for_timeout(200)
 
                 assert not errors, f"{path} threw uncaught JS errors: {errors}"
+                assert not console_errors, f"{path} logged console errors: {console_errors}"
+                assert not request_failed, f"{path} had failed requests: {request_failed}"
                 assert not server_errors, \
                     f"{path} backing requests 5xx'd (would blank the panel): {server_errors}"
 
@@ -416,6 +433,73 @@ def test_panels_render_without_pageerror(client):
                     )
                     assert drawer_len > 2, f"{path}: status drawer blank (len={drawer_len})"
                 page.close()
+            browser.close()
+        finally:
+            server.should_exit = True
+
+
+@pytestmark_playwright
+def test_dashboard_shows_visible_error_when_sessions_request_fails(client):
+    """Playwright: a failed sessions fetch must surface a visible retryable error."""
+    import json as _json
+    import threading
+    import time
+    import urllib.request
+    import uvicorn
+    from meridian import server as server_module
+
+    with sync_playwright() as p:
+        config = uvicorn.Config(server_module.app, host="127.0.0.1", port=17883, log_level="error")
+        server = uvicorn.Server(config)
+        thread = threading.Thread(target=server.run, daemon=True)
+        thread.start()
+        time.sleep(1.5)
+
+        req = urllib.request.Request(
+            "http://127.0.0.1:17883/projects",
+            data=b'{"name": "panel-error"}',
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            project = _json.loads(resp.read().decode("utf-8"))
+        pid = project["id"]
+
+        try:
+            browser = p.chromium.launch()
+            page = browser.new_page()
+            page.route(
+                "**/projects/*/sessions*",
+                lambda route: route.fulfill(
+                    status=500,
+                    content_type="application/json",
+                    body=_json.dumps({"detail": "cached plan must not change result type"}),
+                ),
+            )
+            page.goto(
+                f"http://127.0.0.1:17883/dashboard?project_id={pid}",
+                wait_until="domcontentloaded",
+            )
+            page.wait_for_timeout(2500)
+
+            alert = page.locator(f"#project-fetch-alert-{pid}")
+            assert alert.is_visible(), "project fetch alert should be visible on sessions failure"
+            alert_text = alert.inner_text()
+            assert "project data failed to load" in alert_text.lower()
+            assert "/sessions" in alert_text
+            assert "HTTP 500" in alert_text
+            assert "cached plan must not change result type" in alert_text
+
+            sessions_panel = page.locator(f"#sessions-{pid}")
+            sessions_text = sessions_panel.inner_text()
+            assert "sessions unavailable" in sessions_text.lower()
+            assert "retry failed loads" in sessions_text.lower()
+
+            body_inner = page.evaluate(
+                f"() => {{ const b = document.querySelector('#tab-body-{pid}');"
+                f" return b ? b.innerHTML.trim().length : -1; }}"
+            )
+            assert body_inner > 100, "tab body should stay rendered even when sessions fails"
             browser.close()
         finally:
             server.should_exit = True

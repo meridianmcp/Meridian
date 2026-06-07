@@ -4633,6 +4633,22 @@ async def test_pg_adapter_ntfy_helpers_issue_expected_queries():
     assert db.committed is True
 
 
+def test_pg_adapter_translates_datetime_interval_units():
+    """Postgres SQL translation must handle datetime('now', ? || ' hours') forms."""
+    from meridian.pg_adapter import _pg_adapt_sql
+
+    sql, params = _pg_adapt_sql(
+        "UPDATE file_locks SET claimed_at = datetime('now'), "
+        "expires_at = datetime('now', ? || ' hours') WHERE id = ?",
+        ("2", "lock-123"),
+    )
+
+    assert "datetime('now'" not in sql
+    assert "::interval" in sql
+    assert "hours" in sql
+    assert params == ["2", "lock-123"]
+
+
 def test_cached_plan_error_is_retryable():
     """A stale prepared-plan error must be classified transient so the pool
     retries with a fresh connection.
@@ -4652,6 +4668,69 @@ def test_cached_plan_error_is_retryable():
     assert _is_transient_pg_error(err) is True
     # A genuinely fatal error must still be non-retryable.
     assert _is_transient_pg_error(Exception("syntax error at or near")) is False
+
+
+@pytest.mark.asyncio
+async def test_pg_retry_closes_stale_connection_on_cached_plan_error():
+    """A cached-plan failure should close the stale pooled connection and retry once."""
+    from meridian.pg_adapter import PostgresConnection
+
+    class FakeCursor:
+        def __init__(self, conn):
+            self._conn = conn
+            self.rowcount = 1
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def execute(self, sql, params):
+            self._conn.executed.append((sql, params))
+            if self._conn.failure is not None:
+                raise self._conn.failure
+
+        async def fetchall(self):
+            return self._conn.rows
+
+    class FakeConn:
+        def __init__(self, rows=None, failure=None):
+            self.rows = rows or []
+            self.failure = failure
+            self.closed = False
+            self.executed = []
+
+        def cursor(self, row_factory=None):
+            return FakeCursor(self)
+
+        async def close(self):
+            self.closed = True
+
+    class FakePool:
+        def __init__(self, conns):
+            self._conns = list(conns)
+            self.returned = []
+
+        async def getconn(self):
+            return self._conns.pop(0)
+
+        async def putconn(self, conn):
+            self.returned.append(conn)
+
+    stale = FakeConn(failure=Exception("cached plan must not change result type"))
+    fresh = FakeConn(rows=[{"id": "ok"}])
+    pool = FakePool([stale, fresh])
+    db = PostgresConnection(pool)
+
+    cur = await db._execute_with_retry("SELECT 1", [], "SELECT")
+
+    assert await cur.fetchall() == [{"id": "ok"}]
+    assert stale.closed is True
+    assert stale not in pool.returned
+    assert fresh in pool.returned
+    assert stale.executed == [("SELECT 1", None)]
+    assert fresh.executed == [("SELECT 1", None)]
 
 
 def test_pg_pool_disables_prepared_statements():
@@ -6549,5 +6628,3 @@ def test_notify_test_endpoint_delivers_ntfy_message_via_postgres(tmp_path, monke
         time.sleep(1)
 
     pytest.fail("Timed out waiting for ntfy.sh test notification")
-
-

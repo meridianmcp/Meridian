@@ -8,7 +8,7 @@ Falls back to asyncpg if psycopg is not installed (legacy behaviour).
 SQL translation rules:
   ?       → %s  (psycopg3 positional placeholder)
   datetime('now')  → to_char(now() at time zone 'utc', ...)
-  datetime('now', X || ' minutes') → same with interval cast
+  datetime('now', X || ' minutes') / 'hours' / 'days' → same with interval cast
   PRAGMA ...       → no-op
   rowid            → removed from ORDER BY (UUID PKs don't need it)
   sqlite_master    → fake result that passes all migration guards
@@ -111,11 +111,11 @@ def _pg_adapt_sql(sql: str, params: tuple) -> tuple[str, list]:
     # 2. ? → %s positional placeholders
     sql = re.sub(r"\?", "%s", sql)
 
-    # 2. datetime('now', %s || ' minutes') — expire_idle_sessions pattern
+    # 2. datetime('now', %s || ' minutes') / 'hours' / 'days' — interval forms
     sql = re.sub(
-        r"datetime\('now',\s*(%s)\s*\|\|\s*' minutes'\)",
+        r"datetime\('now',\s*(%s)\s*\|\|\s*'([^']+)'\)",
         lambda m: (
-            f"to_char(now() at time zone 'utc' + ({m.group(1)} || ' minutes')::interval,"
+            f"to_char(now() at time zone 'utc' + ({m.group(1)} || '{m.group(2)}')::interval,"
             f" 'YYYY-MM-DD HH24:MI:SS')"
         ),
         sql,
