@@ -1260,6 +1260,7 @@ function _openTabMenu(t, anchor) {
   uuidDiv.textContent = t.id;
   menu.appendChild(uuidDiv);
   menuItem('\u270f Rename', () => _renameProject(t));
+  menuItem('\ud83c\udfa8 Change icon\u2026', () => _setProjectIcon(t));
   menuItem('\u2b07 Download DB', () => window.open('/admin/snapshot', '_blank'));
   menuItem('🗑 Delete project…', () => _deleteProject(t));
 
