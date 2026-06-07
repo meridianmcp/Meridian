@@ -37,6 +37,10 @@ async def create_pinned_decision_endpoint(
     category = body.get("category", "TECHNICAL")
     if not title or not text:
         raise HTTPException(status_code=400, detail="title and body required")
+    # G4.15 — safety limit
+    from .. import limits as _limits  # noqa: PLC0415
+    existing = await db_module.get_pinned_decisions(await _db(request), project_id)
+    _limits.check_decisions_per_project(len(existing))
     try:
         result = await db_module.pin_decision(await _db(request), project_id, title, text, category)
     except ValueError as exc:

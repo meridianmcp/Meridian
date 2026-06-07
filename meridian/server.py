@@ -880,6 +880,24 @@ except ImportError:
     _RATE_LIMIT = "60/minute"
 
 
+# G4.15 — Safety-limit exception → 429
+from . import limits as _limits_module  # noqa: E402, PLC0415
+
+
+@app.exception_handler(_limits_module.LimitExceeded)
+async def _limit_exceeded_handler(request: Request, exc: _limits_module.LimitExceeded):  # noqa: ARG001
+    from fastapi.responses import JSONResponse  # noqa: PLC0415
+    return JSONResponse(
+        status_code=429,
+        content={
+            "detail": str(exc),
+            "kind": exc.kind,
+            "limit": exc.limit,
+            "current": exc.current,
+        },
+    )
+
+
 # ---------------------------------------------------------------------------
 # v2.0-fixes — Demo read-only middleware (MERIDIAN_DEMO=true)
 # ---------------------------------------------------------------------------
@@ -887,6 +905,37 @@ except ImportError:
 _DEMO_WRITE_ALLOWLIST = {"/__gate__", "/mcp/sse"}
 _DEMO_WRITE_ALLOWLIST_PREFIXES = ("/auth/", "/demo", "/waitlist", "/health")
 _DEMO_CONTEXT_COOKIE = "meridian_demo"
+
+
+@app.middleware("http")
+async def _body_size_guard_middleware(request: Request, call_next):
+    """G4.15 — reject requests with bodies past the safety threshold before
+    they reach a handler. Trusts Content-Length when present; this is the
+    standard cheap fast-fail, with the actual body-stream cutoff handled by
+    Starlette / uvicorn at a much higher absolute cap.
+    """
+    if request.method in ("POST", "PUT", "PATCH"):
+        cl = request.headers.get("content-length")
+        if cl is not None:
+            try:
+                size = int(cl)
+            except ValueError:
+                size = -1
+            if size > 0:
+                try:
+                    _limits_module.check_body_bytes(size)
+                except _limits_module.LimitExceeded as exc:
+                    from fastapi.responses import JSONResponse  # noqa: PLC0415
+                    return JSONResponse(
+                        status_code=429,
+                        content={
+                            "detail": str(exc),
+                            "kind": exc.kind,
+                            "limit": exc.limit,
+                            "current": exc.current,
+                        },
+                    )
+    return await call_next(request)
 
 
 @app.middleware("http")
@@ -1335,6 +1384,10 @@ async def create_project(
                 status_code=403,
                 detail="Free tier is limited to 1 project. Upgrade to Solo ($20/mo) for unlimited projects.",
             )
+    # G4.15 — safety limit: projects per tenant
+    from . import limits as _limits  # noqa: PLC0415
+    all_projects = await db_module.list_projects(await _db(request))
+    _limits.check_projects_per_tenant(len(all_projects))
     return await db_module.create_project(
         await _db(request), body.name, human_id=body.human_id
     )

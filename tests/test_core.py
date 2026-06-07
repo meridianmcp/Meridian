@@ -5617,6 +5617,70 @@ def test_landing_page_charset_and_emoji_survival(client):
         assert moji not in body, f"mojibake sequence {moji!r} present in landing page"
 
 
+def test_safety_limits_module_thresholds_have_sensible_defaults():
+    """G4.15 — defaults are guard-rails, not quotas."""
+    from meridian import limits
+    assert limits.PROJECTS_PER_TENANT == 1_000
+    assert limits.SPRINT_ITEMS_PER_PROJECT == 50_000
+    assert limits.NOTES_PER_PROJECT == 100_000
+    assert limits.DECISIONS_PER_PROJECT == 10_000
+    assert limits.SESSIONS_PER_PROJECT == 100_000
+    assert limits.TASKS_PER_PROJECT == 1_000_000
+    assert limits.OPEN_HITL_PER_PROJECT == 1_000
+    assert limits.BODY_BYTES == 100_000
+
+
+def test_safety_limits_env_override(monkeypatch):
+    """G4.15 — environment overrides take effect at module load. Tests can
+    also monkeypatch the module attribute for in-process scenarios."""
+    from meridian import limits
+    monkeypatch.setattr(limits, "NOTES_PER_PROJECT", 2)
+    try:
+        limits.check_notes_per_project(0)
+        limits.check_notes_per_project(1)
+    except limits.LimitExceeded:
+        raise AssertionError("limit should not trip below threshold")
+    with pytest.raises(limits.LimitExceeded):
+        limits.check_notes_per_project(2)
+
+
+def test_safety_limit_returns_429_on_note_create(client, monkeypatch):
+    """G4.15 — a notes count past the limit returns 429 with the canonical
+    Safety message rather than 500 or silent success."""
+    from meridian import limits
+    monkeypatch.setattr(limits, "NOTES_PER_PROJECT", 1)
+    p = client.post("/projects", json={"name": "g415-note-cap"}).json()
+    r = client.post(
+        f"/projects/{p['id']}/notes",
+        json={"title": "n1", "body": "first"},
+    )
+    assert r.status_code == 201
+    r = client.post(
+        f"/projects/{p['id']}/notes",
+        json={"title": "n2", "body": "second"},
+    )
+    assert r.status_code == 429
+    j = r.json()
+    assert j.get("kind") == "notes_per_project"
+    assert "Safety limit reached" in j.get("detail", "")
+    assert "hello@usemeridian.us" in j.get("detail", "")
+
+
+def test_safety_limit_body_size_middleware_429(client, monkeypatch):
+    """G4.15 — Content-Length past the body cap is rejected before any handler runs."""
+    from meridian import limits
+    monkeypatch.setattr(limits, "BODY_BYTES", 100)
+    # 500-byte body, content-length declared honestly
+    payload = "x" * 500
+    r = client.post(
+        "/projects",
+        content=payload,
+        headers={"Content-Type": "application/json", "Content-Length": "500"},
+    )
+    assert r.status_code == 429
+    assert "body_bytes" in r.json().get("kind", "")
+
+
 def test_billing_portal_redirects_anonymous_to_login(client, monkeypatch):
     """G2.11 — /billing/portal sends anonymous users to /auth/login with a next= back."""
     monkeypatch.setenv("MERIDIAN_HOSTED", "true")

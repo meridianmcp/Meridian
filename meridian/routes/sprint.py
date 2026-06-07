@@ -43,6 +43,10 @@ async def add_sprint_item_endpoint(
     human_id = body.get("human_id") or None
     depends_on = body.get("depends_on") or None
     failure_mode = body.get("failure_mode") or None
+    # G4.15 — safety limit
+    from .. import limits as _limits  # noqa: PLC0415
+    existing = await db_module.get_sprint_items(await _db(request), project_id)
+    _limits.check_sprint_items_per_project(len(existing))
     return await db_module.add_sprint_item(
         await _db(request), project_id, version, title,
         group=group, human_id=human_id,
