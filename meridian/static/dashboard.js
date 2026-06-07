@@ -5592,6 +5592,22 @@ window._queueAction = async function(taskId, action) {
   } catch(e) { toast('Action failed: ' + e.message, true); }
 };
 
+function _rewriteRepoImages(container, projectId) {
+  /** G7.32 — rewrite repo-relative <img src> in a markdown preview to route
+   * through /projects/{pid}/repo-image, which uses the tenant's PAT to
+   * fetch raw.githubusercontent.com. Absolute URLs and data URIs pass
+   * through unchanged. Limits noted in the server endpoint docstring. */
+  if (!container || !projectId) return;
+  container.querySelectorAll('img').forEach((img) => {
+    const src = img.getAttribute('src') || '';
+    if (!src) return;
+    if (/^https?:\/\//i.test(src) || src.startsWith('data:') || src.startsWith('/')) return;
+    const path = src.replace(/^\.\//, '');
+    img.setAttribute('src', `/projects/${projectId}/repo-image?path=${encodeURIComponent(path)}`);
+    img.setAttribute('loading', 'lazy');
+  });
+}
+
 async function loadFilesTab(projectId) {
   /**Load the list of editable files from the server and render them as
    * clickable items in the files drawer panel. */
@@ -5638,6 +5654,7 @@ async function openFileEditor(projectId, filename) {
       const md = data.content || '';
       const html = (typeof marked !== 'undefined') ? marked.parse(md) : escapeHtml(md);
       previewDiv.innerHTML = html;
+      _rewriteRepoImages(previewDiv, projectId);
       previewDiv.style.display = '';
     }
     contentEl.style.display = 'none';
@@ -5651,6 +5668,7 @@ async function openFileEditor(projectId, filename) {
             const md = contentEl.value || '';
             const html = (typeof marked !== 'undefined') ? marked.parse(md) : escapeHtml(md);
             previewDiv.innerHTML = html;
+            _rewriteRepoImages(previewDiv, projectId);
             contentEl.style.display = 'none';
             previewDiv.style.display = '';
           } else {

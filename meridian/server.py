@@ -4002,6 +4002,58 @@ async def github_status(project_id: str, request: Request) -> dict[str, Any]:
     }
 
 
+@app.get("/projects/{project_id}/repo-image")
+async def repo_image_proxy(project_id: str, request: Request, path: str = ""):
+    """G7.32 — proxy a repo-relative image through the project's GitHub PAT.
+
+    Used by markdown preview to render images that live in the connected
+    repo (e.g. ``![](docs/screenshots/foo.png)``) without exposing the PAT
+    to the browser. Returns the raw bytes with the upstream Content-Type.
+
+    Limits:
+     - Hosted-only (PAT lives on the tenant).
+     - Path is normalized to disallow ``..``; absolute URLs are rejected.
+     - Falls back to 404 when the project isn't connected to a repo.
+     - 1 MB response cap (oversized images are 413).
+    """
+    if not _hosted_mode():
+        raise HTTPException(404)
+    tenant = await _get_tenant_from_request(request)
+    if tenant is None:
+        raise HTTPException(401, "not authenticated")
+    fresh = await db_module.get_tenant_by_id(request.app.state.db, tenant["id"])
+    repo = (fresh or {}).get("github_repo") or ""
+    branch = (fresh or {}).get("github_branch") or "main"
+    pat = db_module.decrypt_field((fresh or {}).get("github_pat")) if fresh else None
+    if not repo or not pat:
+        raise HTTPException(404, "no repo connected")
+    clean = path.strip().lstrip("/")
+    if not clean or ".." in clean.split("/") or "://" in clean:
+        raise HTTPException(400, "invalid path")
+    if "/" not in repo:
+        raise HTTPException(400, "repo not owner/name")
+    owner, repo_name = repo.split("/", 1)
+    raw_url = f"https://raw.githubusercontent.com/{owner}/{repo_name}/{branch}/{clean}"
+    import httpx  # noqa: PLC0415
+    try:
+        async with httpx.AsyncClient(timeout=10) as http:
+            r = await http.get(raw_url, headers={"Authorization": f"Bearer {pat}"})
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(502, f"upstream fetch failed: {exc}") from exc
+    if r.status_code == 404:
+        raise HTTPException(404, "file not found in repo")
+    if r.status_code >= 400:
+        raise HTTPException(r.status_code, "upstream error")
+    body = r.content
+    if len(body) > 1_000_000:
+        raise HTTPException(413, "image too large")
+    return Response(
+        content=body,
+        media_type=r.headers.get("content-type", "application/octet-stream"),
+        headers={"Cache-Control": "private, max-age=60"},
+    )
+
+
 @app.delete("/projects/{project_id}/github/disconnect", status_code=200)
 async def github_disconnect(project_id: str, request: Request) -> dict[str, Any]:
     """Clear the tenant's stored GitHub credentials."""
