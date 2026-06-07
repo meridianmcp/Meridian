@@ -475,6 +475,7 @@ CREATE TABLE IF NOT EXISTS workspace_settings (
     id TEXT PRIMARY KEY DEFAULT 'singleton',
     hitl_auto_answer_default INTEGER NOT NULL DEFAULT 0,
     sprint_name_default TEXT,
+    display_name TEXT,
     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 """
@@ -769,6 +770,10 @@ async def _migrate_v34_workspace_settings(db: aiosqlite.Connection) -> None:
         ");"
     )
     await db.commit()
+    # v2.8 — display_name: tenant-global identity applied to hook/Codex sessions
+    # that don't pass an explicit human_id, so their activity is attributed to a
+    # person on the timeline instead of "(unknown)".
+    await _migrate_add_column_if_missing(db, "workspace_settings", "display_name", "TEXT")
 
 
 async def _migrate_dunning_fields(db: aiosqlite.Connection) -> None:
@@ -5861,7 +5866,7 @@ async def get_workspace_settings(db: aiosqlite.Connection) -> dict[str, Any]:
     callers never have to None-check. One singleton row per workspace DB.
     """
     async with db.execute(
-        "SELECT hitl_auto_answer_default, sprint_name_default, updated_at "
+        "SELECT hitl_auto_answer_default, sprint_name_default, display_name, updated_at "
         "FROM workspace_settings WHERE id = ?",
         (_WORKSPACE_SETTINGS_ID,),
     ) as cur:
@@ -5870,6 +5875,7 @@ async def get_workspace_settings(db: aiosqlite.Connection) -> dict[str, Any]:
     return {
         "hitl_auto_answer_default": bool(data.get("hitl_auto_answer_default")),
         "sprint_name_default": data.get("sprint_name_default"),
+        "display_name": data.get("display_name"),
         "updated_at": data.get("updated_at"),
     }
 
@@ -5879,11 +5885,12 @@ async def update_workspace_settings(
     *,
     hitl_auto_answer_default: bool | None = None,
     sprint_name_default: str | None = None,
+    display_name: str | None = None,
 ) -> dict[str, Any]:
     """Upsert the workspace settings singleton and return the new values.
 
     Only the fields passed (non-None) are changed. ``sprint_name_default=""``
-    explicitly clears the label.
+    or ``display_name=""`` explicitly clears that label.
     """
     # Ensure the singleton row exists before updating individual fields.
     await db.execute(
@@ -5899,6 +5906,9 @@ async def update_workspace_settings(
     if sprint_name_default is not None:
         updates.append("sprint_name_default = ?")
         params.append(sprint_name_default or None)
+    if display_name is not None:
+        updates.append("display_name = ?")
+        params.append(display_name.strip() or None)
     if updates:
         from datetime import datetime, timezone
         now_ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
@@ -6186,6 +6196,44 @@ async def delete_workspace_member(
     )
     await db.commit()
     return True
+
+
+async def update_workspace_member(
+    db: aiosqlite.Connection,
+    member_id: str,
+    tenant_id: str,
+    *,
+    role: str | None = None,
+    github_access: str | None = None,
+) -> dict[str, Any] | None:
+    """v2.8 — update a member's role and/or github_access (admin-only edit).
+
+    Only the fields passed (non-None) are changed. Scoped by tenant_id so a
+    caller can never touch another workspace's rows. Returns the updated row,
+    or None when no member matched.
+    """
+    updates: list[str] = []
+    params: list[Any] = []
+    if role is not None:
+        updates.append("role = ?")
+        params.append(role)
+    if github_access is not None:
+        updates.append("github_access = ?")
+        params.append(github_access)
+    if updates:
+        params.extend([member_id, tenant_id])
+        await db.execute(
+            f"UPDATE workspace_members SET {', '.join(updates)} "
+            "WHERE id = ? AND tenant_id = ?",
+            tuple(params),
+        )
+        await db.commit()
+    async with db.execute(
+        "SELECT * FROM workspace_members WHERE id = ? AND tenant_id = ?",
+        (member_id, tenant_id),
+    ) as cur:
+        row = await cur.fetchone()
+    return _row_to_dict(row)
 
 
 # ---------------------------------------------------------------------------

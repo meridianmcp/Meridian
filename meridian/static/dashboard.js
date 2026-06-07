@@ -693,6 +693,7 @@ async function loadServerConfig() {
       state.tenantPlan = me.plan;
       state.tenantEmail = me.email || '';
       state.tenantHasStripe = !!me.has_stripe_customer;
+      state.tenantIsInternal = !!me.is_internal;
       _renderPlanBadge(me);
       updateGitHubConnectionIndicator(me);
       _armAccountSwitchWatch(me.email || '');
@@ -717,16 +718,21 @@ function _renderPlanBadge(me) {
   // G2.11 — Billing button. With a Stripe customer → "Manage" opens the
   // Stripe Customer Portal; without one (free/trial that never paid) →
   // "Upgrade" routes to /pricing.
+  // Admin / internal staff plans have nothing to upgrade — only show a
+  // billing affordance when there's a real Stripe customer to manage.
+  const noUpgrade = plan === 'admin' || !!me.is_internal;
   const planBadge = document.getElementById('plan-badge');
   if (planBadge && !document.getElementById('billing-link')) {
     const hasStripe = !!me.has_stripe_customer;
-    const link = document.createElement('a');
-    link.id = 'billing-link';
-    link.href = hasStripe ? '/billing/portal' : '/pricing';
-    link.textContent = hasStripe ? 'Manage' : 'Upgrade';
-    link.title = hasStripe ? 'Open Stripe billing portal' : 'See plans and upgrade';
-    link.style = 'margin-left:6px;padding:2px 7px;border-radius:10px;font-size:10px;font-weight:600;letter-spacing:0.03em;background:transparent;color:var(--accent);border:1px solid var(--accent)55;vertical-align:middle;text-decoration:none;cursor:pointer';
-    planBadge.parentNode.insertBefore(link, planBadge.nextSibling);
+    if (hasStripe || !noUpgrade) {
+      const link = document.createElement('a');
+      link.id = 'billing-link';
+      link.href = hasStripe ? '/billing/portal' : '/pricing';
+      link.textContent = hasStripe ? 'Manage' : 'Upgrade';
+      link.title = hasStripe ? 'Open Stripe billing portal' : 'See plans and upgrade';
+      link.style = 'margin-left:6px;padding:2px 7px;border-radius:10px;font-size:10px;font-weight:600;letter-spacing:0.03em;background:transparent;color:var(--accent);border:1px solid var(--accent)55;vertical-align:middle;text-decoration:none;cursor:pointer';
+      planBadge.parentNode.insertBefore(link, planBadge.nextSibling);
+    }
   }
   // Persistent upgrade nudge for free-tier users (shown regardless of days left).
   if (plan === 'free' && !me.expired && !isDemoMode() && !document.getElementById('upgrade-banner')) {
@@ -3138,6 +3144,21 @@ function _renderTimelineHeatmap(projectId, data, paneEl) {
         coordinateSystem: 'calendar',
         calendarIndex: i,
         data: pts,
+        // Stamp the day-of-month (dark) onto cells that had activity, so the
+        // calendar reads as a calendar — empty days carry no label since pts
+        // only includes count > 0.
+        label: {
+          show: true,
+          color: '#0b1220',
+          fontFamily: 'IBM Plex Mono',
+          fontSize: 8,
+          formatter: (p) => {
+            const v = p.value && p.value[0];
+            if (!v) return '';
+            const dd = parseInt(String(v).slice(8, 10), 10);
+            return Number.isFinite(dd) ? String(dd) : '';
+          },
+        },
       });
     });
     const totalH = CAL_TOP + rowKeys.length * rowH + 28;
@@ -3156,36 +3177,82 @@ function _renderTimelineHeatmap(projectId, data, paneEl) {
   if (allPeople.length > 1 || allClients.length > 1) {
     const bar = document.createElement('div');
     bar.className = 'tl-filter-bar';
-    bar.style.cssText = 'display:flex;flex-wrap:wrap;align-items:center;gap:5px;padding:0 4px 8px;font-size:10px;font-family:IBM Plex Mono,monospace;color:var(--muted)';
+    bar.style.cssText = 'display:flex;flex-wrap:wrap;align-items:center;gap:8px;padding:0 4px 8px;font-size:10px;font-family:IBM Plex Mono,monospace;color:var(--muted)';
     paneEl.appendChild(bar);
-    const mkChip = (text, active, fn) => {
-      const c = document.createElement('button');
-      c.textContent = text;
-      c.style.cssText = `padding:1px 8px;border-radius:10px;cursor:pointer;font-size:10px;font-family:inherit;border:1px solid var(--border);background:${active ? 'var(--accent)22' : 'transparent'};color:${active ? 'var(--accent)' : 'var(--muted)'}`;
-      c.onclick = fn;
-      return c;
-    };
+
+    // Toggle a value in a selection set, persisting to localStorage. '__all__'
+    // resets to everything; emptying a set also falls back to everything so the
+    // calendar can never blank out.
     const toggle = (sel, all, key, x) => {
       if (x === '__all__') sel = new Set(all);
       else { sel.has(x) ? sel.delete(x) : sel.add(x); if (!sel.size) sel = new Set(all); }
       localStorage.setItem(selKey(key), JSON.stringify([...sel]));
       return sel;
     };
-    const rebuildBar = () => {
-      bar.innerHTML = '';
-      if (allPeople.length > 1) {
-        const lab = document.createElement('span'); lab.textContent = 'People:'; lab.style.cssText = 'opacity:0.8'; bar.appendChild(lab);
-        bar.appendChild(mkChip('All', selPeople.size === allPeople.length, () => { selPeople = toggle(selPeople, allPeople, 'people', '__all__'); rebuildBar(); applyFilters(); }));
-        allPeople.forEach(p => bar.appendChild(mkChip(p.length > 18 ? p.slice(0, 17) + '…' : p, selPeople.has(p), () => { selPeople = toggle(selPeople, allPeople, 'people', p); rebuildBar(); applyFilters(); })));
-      }
-      if (allClients.length > 1) {
-        if (allPeople.length > 1) { const sep = document.createElement('span'); sep.textContent = '·'; sep.style.cssText = 'opacity:0.4;margin:0 3px'; bar.appendChild(sep); }
-        const lab = document.createElement('span'); lab.textContent = 'Client:'; lab.style.cssText = 'opacity:0.8'; bar.appendChild(lab);
-        bar.appendChild(mkChip('All', selClients.size === allClients.length, () => { selClients = toggle(selClients, allClients, 'clients', '__all__'); rebuildBar(); applyFilters(); }));
-        allClients.forEach(c => bar.appendChild(mkChip(c, selClients.has(c), () => { selClients = toggle(selClients, allClients, 'clients', c); rebuildBar(); applyFilters(); })));
-      }
+
+    const closeAllPanels = () => bar.querySelectorAll('[data-tl-panel]').forEach(p => { p.style.display = 'none'; });
+
+    // Compact multi-select dropdown — a long roster collapses to one chip
+    // instead of overflowing the row off-screen. The menu scrolls; selected
+    // rows are highlighted blue/white.
+    const mkDropdown = (labelText, all, getSel, setSel, key) => {
+      const wrap = document.createElement('div');
+      wrap.style.cssText = 'position:relative;display:inline-block';
+      const btn = document.createElement('button');
+      btn.style.cssText = 'display:inline-flex;align-items:center;gap:6px;padding:3px 10px;border-radius:6px;cursor:pointer;font-size:10px;font-family:inherit;border:1px solid var(--border);background:var(--surface-2);color:var(--text)';
+      const panel = document.createElement('div');
+      panel.setAttribute('data-tl-panel', '1');
+      panel.style.cssText = 'position:absolute;z-index:30;top:calc(100% + 4px);left:0;min-width:170px;max-height:240px;overflow-y:auto;background:var(--surface-1);border:1px solid var(--border);border-radius:6px;padding:4px;box-shadow:0 6px 20px rgba(0,0,0,0.4);display:none';
+      const sync = () => {
+        const sel = getSel();
+        const total = all.length;
+        const allSel = sel.size === total;
+        btn.textContent = '';
+        const cap = document.createElement('span');
+        cap.textContent = `${labelText}: ${allSel ? 'All' : sel.size + '/' + total}`;
+        const caret = document.createElement('span');
+        caret.textContent = '▾'; caret.style.cssText = 'opacity:0.6';
+        btn.appendChild(cap); btn.appendChild(caret);
+        panel.innerHTML = '';
+        const mkRow = (text, value, active) => {
+          const row = document.createElement('div');
+          row.textContent = text;
+          row.title = text;
+          row.style.cssText = `padding:4px 8px;border-radius:4px;cursor:pointer;white-space:nowrap;font-size:10px;margin-bottom:1px;background:${active ? '#2563eb' : 'transparent'};color:${active ? '#fff' : 'var(--text)'}`;
+          row.onmouseenter = () => { if (!active) row.style.background = 'var(--surface-2)'; };
+          row.onmouseleave = () => { if (!active) row.style.background = 'transparent'; };
+          row.onclick = (e) => {
+            e.stopPropagation();
+            setSel(toggle(getSel(), all, key, value));
+            sync();
+            applyFilters();
+          };
+          return row;
+        };
+        panel.appendChild(mkRow('All', '__all__', allSel));
+        all.forEach(x => panel.appendChild(mkRow(x.length > 30 ? x.slice(0, 29) + '…' : x, x, sel.has(x))));
+      };
+      btn.onclick = (e) => {
+        e.stopPropagation();
+        const willOpen = panel.style.display === 'none';
+        closeAllPanels();
+        panel.style.display = willOpen ? 'block' : 'none';
+      };
+      sync();
+      wrap.appendChild(btn);
+      wrap.appendChild(panel);
+      return wrap;
     };
-    rebuildBar();
+
+    if (allPeople.length > 1) {
+      bar.appendChild(mkDropdown('People', allPeople, () => selPeople, (s) => { selPeople = s; }, 'people'));
+    }
+    if (allClients.length > 1) {
+      bar.appendChild(mkDropdown('Client', allClients, () => selClients, (s) => { selClients = s; }, 'clients'));
+    }
+    // Any click elsewhere in the timeline pane closes open menus. paneEl is
+    // recreated each render, so this listener doesn't accumulate.
+    paneEl.addEventListener('click', closeAllPanels);
   }
 
   const ctrl = document.createElement('div');
@@ -3595,6 +3662,19 @@ function normalizeNotifyTarget(raw) {
   return `https://ntfy.sh/${v}`;
 }
 
+// Inverse of normalizeNotifyTarget for display: strip the implied ntfy.sh
+// prefix so the field shows just the topic ("the prefix is added for you").
+// Emails and non-ntfy webhooks pass through untouched.
+function displayNotifyTarget(raw) {
+  const v = (raw || '').trim();
+  if (!v) return '';
+  const lower = v.toLowerCase();
+  for (const prefix of ['https://ntfy.sh/', 'http://ntfy.sh/', 'ntfy.sh/']) {
+    if (lower.startsWith(prefix)) return v.slice(prefix.length).replace(/\/+$/, '');
+  }
+  return v;
+}
+
 // G1.7 — Suggest the project slug as the ntfy topic. The server will
 // suffix with -2/-3/… if another project in this DB already uses it,
 // so we no longer need a client-side random tail. Note: ntfy topics
@@ -3744,8 +3824,15 @@ async function loadSettingsTab(projectId) {
   if (state.tenantEmail) {
     const plan = state.tenantPlan || 'free';
     const hasStripe = !!state.tenantHasStripe;
+    // Admin / internal plans have nothing to upgrade — only surface a billing
+    // button when there's a real Stripe customer to manage.
+    const noUpgrade = plan === 'admin' || !!state.tenantIsInternal;
+    const showBilling = hasStripe || !noUpgrade;
     const billingLabel = hasStripe ? 'Manage billing' : 'Upgrade';
     const billingHref = hasStripe ? '/billing/portal' : '/pricing';
+    const billingBtn = showBilling
+      ? `<a href="${billingHref}" class="primary" style="padding:4px 10px;font-size:10px;text-decoration:none;background:var(--accent);color:#001020;border-radius:4px;font-weight:600">${escapeHtml(billingLabel)}</a>`
+      : '';
     html += `<div data-demo-hide style="margin-bottom:14px;padding:10px 12px;border:1px solid var(--border);border-radius:6px;background:var(--surface-2)">
       <div style="font-weight:600;font-size:11px;color:var(--text);margin-bottom:6px">Account</div>
       <div style="font-size:10px;color:var(--muted);line-height:1.7">
@@ -3753,7 +3840,7 @@ async function loadSettingsTab(projectId) {
         <div>Plan: <span style="color:var(--text);text-transform:capitalize">${escapeHtml(plan)}</span></div>
       </div>
       <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:8px">
-        <a href="${billingHref}" class="primary" style="padding:4px 10px;font-size:10px;text-decoration:none;background:var(--accent);color:#001020;border-radius:4px;font-weight:600">${escapeHtml(billingLabel)}</a>
+        ${billingBtn}
         <a href="/auth/logout" class="secondary" style="padding:4px 10px;font-size:10px;text-decoration:none;background:var(--surface-1);color:var(--text);border:1px solid var(--border);border-radius:4px">Sign out</a>
         <button id="account-delete-${projectId}" class="secondary" style="padding:4px 10px;font-size:10px;background:var(--surface-1);color:#f87171;border:1px solid #f8717155;border-radius:4px;cursor:pointer">Delete account…</button>
       </div>
@@ -3806,8 +3893,10 @@ async function loadSettingsTab(projectId) {
         </label>
         <label style="display:flex;flex-direction:column;gap:3px;min-width:0">
           <span style="font-size:9px;color:var(--muted)">Branch</span>
-          <input type="text" id="github-branch-${projectId}" value="${escapeHtml(ghSelectedBranch)}" placeholder="main"
+          <select id="github-branch-${projectId}"
             style="padding:5px 8px;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;color:var(--text);font-family:var(--font-mono);font-size:11px;outline:none">
+            <option value="${escapeHtml(ghSelectedBranch)}" selected>${escapeHtml(ghSelectedBranch)}</option>
+          </select>
         </label>
         <button class="primary" id="github-save-btn-${projectId}" style="padding:5px 12px;font-size:11px">Save repo</button>
       </div>
@@ -4219,6 +4308,10 @@ async function loadSettingsTab(projectId) {
       <label style="font-size:10px;color:var(--muted);display:block">Default sprint name<br>
         <input id="ws-sprint-default" type="text" placeholder="e.g. june-sprint" style="width:100%;max-width:240px;background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:3px 6px;margin-top:2px">
       </label>
+      <label style="font-size:10px;color:var(--muted);display:block;margin-top:6px">Your display name<br>
+        <input id="ws-display-name" type="text" placeholder="e.g. Adam" style="width:100%;max-width:240px;background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:3px 6px;margin-top:2px">
+        <span style="display:block;font-size:9px;color:var(--muted);margin-top:2px">Used to attribute Claude/Codex hook sessions to you on the activity timeline when they don't set a name.</span>
+      </label>
       <div style="margin-top:8px;display:flex;gap:8px;align-items:center">
         <button id="ws-settings-save" class="primary" style="font-size:10px;padding:3px 10px">Save defaults</button>
         <span id="ws-settings-status" style="font-size:10px;color:var(--muted);min-height:14px"></span>
@@ -4250,6 +4343,7 @@ async function loadSettingsTab(projectId) {
     // --- Settings defaults ---
     const hitlCb = document.getElementById('ws-hitl-default');
     const sprintIn = document.getElementById('ws-sprint-default');
+    const displayIn = document.getElementById('ws-display-name');
     const saveBtn = document.getElementById('ws-settings-save');
     const saveStatus = document.getElementById('ws-settings-status');
     (async () => {
@@ -4257,6 +4351,7 @@ async function loadSettingsTab(projectId) {
         const s = await api('/workspace/settings');
         if (hitlCb) hitlCb.checked = !!s.hitl_auto_answer_default;
         if (sprintIn) sprintIn.value = s.sprint_name_default || '';
+        if (displayIn) displayIn.value = s.display_name || '';
       } catch (e) { /* defaults shown */ }
     })();
     if (saveBtn) saveBtn.onclick = async () => {
@@ -4267,6 +4362,7 @@ async function loadSettingsTab(projectId) {
           body: JSON.stringify({
             hitl_auto_answer_default: !!(hitlCb && hitlCb.checked),
             sprint_name_default: (sprintIn && sprintIn.value.trim()) || '',
+            display_name: (displayIn && displayIn.value.trim()) || '',
           }),
         });
         if (saveStatus) saveStatus.textContent = 'Saved.';
@@ -4359,7 +4455,8 @@ async function loadSettingsTab(projectId) {
       <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
         <input id="invite-email-${projectId}" type="email" placeholder="teammate@example.com" style="background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:4px 8px;flex:1;min-width:160px">
         <select id="invite-role-${projectId}" style="background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:4px 6px">
-          <option value="member">member</option>
+          <option value="admin">admin</option>
+          <option value="member" selected>member</option>
           <option value="viewer">viewer</option>
         </select>
         <button id="invite-btn-${projectId}" class="primary" style="font-size:10px;padding:4px 10px">Invite</button>
@@ -4382,11 +4479,35 @@ async function loadSettingsTab(projectId) {
             listEl.innerHTML = '<div style="color:var(--muted);font-size:10px">No team members yet.</div>';
             return;
           }
-          listEl.innerHTML = members.map(m => `
-            <div style="display:flex;justify-content:space-between;align-items:center;padding:4px 0;border-bottom:1px solid var(--border)">
-              <span>${escapeHtml(m.email)} <span style="color:var(--muted)">${m.role}</span>${m.pending ? ' <span style="color:var(--accent-amber);font-size:9px">pending</span>' : ''}</span>
-              <button class="secondary" data-mid="${escapeHtml(m.id)}" style="font-size:9px;padding:2px 7px">×</button>
-            </div>`).join('');
+          const ROLE_CHOICES = ['admin', 'member', 'viewer'];
+          listEl.innerHTML = members.map(m => {
+            const opts = ROLE_CHOICES.map(r => `<option value="${r}" ${m.role === r ? 'selected' : ''}>${r}</option>`).join('');
+            return `
+            <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;padding:4px 0;border-bottom:1px solid var(--border)">
+              <span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escapeHtml(m.email)}${m.pending ? ' <span style="color:var(--accent-amber);font-size:9px">pending</span>' : ''}</span>
+              <select class="member-role-select" data-mid="${escapeHtml(m.id)}" title="Change role" style="background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:2px 5px">${opts}</select>
+              <button class="secondary" data-mid="${escapeHtml(m.id)}" title="Remove member" style="font-size:9px;padding:2px 7px">×</button>
+            </div>`;
+          }).join('');
+          listEl.querySelectorAll('select.member-role-select').forEach(sel => {
+            sel.dataset.prev = sel.value;
+            sel.onchange = async () => {
+              const newRole = sel.value;
+              sel.disabled = true;
+              try {
+                await api(`/workspace/members/${sel.dataset.mid}`, {
+                  method: 'PATCH', body: JSON.stringify({ role: newRole }),
+                });
+                sel.dataset.prev = newRole;
+                if (inviteStatus) { inviteStatus.textContent = `Role updated to ${newRole}.`; setTimeout(() => { if (inviteStatus) inviteStatus.textContent = ''; }, 2500); }
+              } catch (e) {
+                sel.value = sel.dataset.prev;  // revert when the server rejects (e.g. 403)
+                if (inviteStatus) inviteStatus.textContent = `Error: ${escapeHtml(String(e))}`;
+              } finally {
+                sel.disabled = false;
+              }
+            };
+          });
           listEl.querySelectorAll('button[data-mid]').forEach(btn => {
             btn.onclick = async () => {
               if (!confirm('Remove this member?')) return;
@@ -4564,8 +4685,9 @@ async function loadSettingsTab(projectId) {
   const ntfyData = (ntfyResult.status === 'fulfilled') ? ntfyResult.value : null;
   // prefer notify_url key, fall back to ntfy_url for older servers
   const savedNotifyUrl = ntfyData ? (ntfyData.notify_url || ntfyData.ntfy_url || '') : '';
-  // pre-fill with OAuth email for hosted users if no URL is saved yet
-  const defaultNotifyUrl = savedNotifyUrl || (state.tenantEmail ? state.tenantEmail : '');
+  // pre-fill with OAuth email for hosted users if no URL is saved yet. ntfy
+  // targets show topic-only (the https://ntfy.sh/ prefix is implied).
+  const defaultNotifyUrl = displayNotifyTarget(savedNotifyUrl) || (state.tenantEmail ? state.tenantEmail : '');
   html += `<div data-demo-hide style="margin-bottom:14px;padding:10px 12px;border:1px solid var(--border);border-radius:6px;background:var(--surface-2)">
     <div style="font-weight:600;font-size:11px;color:var(--text);margin-bottom:4px">Notifications</div>
     <div style="font-size:10px;color:var(--muted);margin-bottom:8px">
@@ -4733,10 +4855,11 @@ async function loadSettingsTab(projectId) {
           body: JSON.stringify({ notify_url: raw, ntfy_url: raw }),
         });
         const savedVal = saved && (saved.notify_url || saved.ntfy_url || '');
-        if (inp) inp.value = savedVal || '';
+        const shownVal = displayNotifyTarget(savedVal || '');
+        if (inp) inp.value = shownVal || '';
         if (statusEl) {
-          statusEl.textContent = savedVal && raw && savedVal.toLowerCase() !== String(raw).toLowerCase()
-            ? `saved as ${savedVal}`
+          statusEl.textContent = shownVal && raw && shownVal.toLowerCase() !== displayNotifyTarget(String(raw)).toLowerCase()
+            ? `saved as ${shownVal}`
             : 'saved';
           setTimeout(() => { statusEl.textContent = ''; }, 2400);
         }
@@ -4840,25 +4963,35 @@ async function loadSettingsTab(projectId) {
     };
   }
 
+  // GH-1 — Branch is a dropdown populated from the repo's live branch list
+  // (server falls back to common defaults if GitHub is unreachable). Refetches
+  // whenever the selected repo changes, keeping the saved branch selected.
   const ghRepoSelect = document.getElementById(`github-repo-${projectId}`);
-  const ghBranchInput = document.getElementById(`github-branch-${projectId}`);
-  if (ghRepoSelect && ghBranchInput) {
-    ghBranchInput.dataset.autoFill = ghBranchInput.value.trim() === ghSelectedBranch ? '1' : '0';
-    ghBranchInput.addEventListener('input', () => {
-      ghBranchInput.dataset.autoFill = '0';
-    });
-    ghRepoSelect.addEventListener('change', () => {
-      const selectedRepo = ghRepoSelect.value;
-      const nextDefault = ghRepoMap[selectedRepo]?.default_branch;
-      const currentDefault = ghRepoMap[ghSelectedRepo]?.default_branch || 'main';
-      if (!nextDefault) return;
-      if (!ghBranchInput.value.trim() ||
-          ghBranchInput.value.trim() === currentDefault ||
-          ghBranchInput.dataset.autoFill === '1') {
-        ghBranchInput.value = nextDefault;
-        ghBranchInput.dataset.autoFill = '1';
+  const ghBranchSelect = document.getElementById(`github-branch-${projectId}`);
+  if (ghBranchSelect) {
+    const fillBranches = async (repo, preferred) => {
+      const fallback = preferred || ghSelectedBranch || 'main';
+      try {
+        const res = await api(`/projects/${projectId}/github/branches?repo=${encodeURIComponent(repo || '')}`);
+        let branches = Array.isArray(res && res.branches) ? res.branches.slice() : [];
+        const want = preferred || (res && res.default_branch) || fallback;
+        if (want && !branches.includes(want)) branches.unshift(want);
+        if (!branches.length) branches = [fallback];
+        ghBranchSelect.innerHTML = branches.map(b =>
+          `<option value="${escapeHtml(b)}" ${b === want ? 'selected' : ''}>${escapeHtml(b)}</option>`
+        ).join('');
+      } catch (e) {
+        // Leave the current single-option select in place on failure.
       }
-    });
+    };
+    fillBranches(ghSelectedRepo, ghSelectedBranch);
+    if (ghRepoSelect) {
+      ghRepoSelect.addEventListener('change', () => {
+        const selectedRepo = ghRepoSelect.value;
+        const nextDefault = ghRepoMap[selectedRepo] && ghRepoMap[selectedRepo].default_branch;
+        fillBranches(selectedRepo, nextDefault);
+      });
+    }
   }
 
   // Wire GitHub test button

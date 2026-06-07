@@ -5853,6 +5853,69 @@ async def test_g519_rbac_migration_is_idempotent_and_widens_check():
 
 
 @pytest.mark.asyncio
+async def test_v28_update_workspace_member_role_and_scoping():
+    """v2.8 — update_workspace_member changes role/github_access, is scoped by
+    tenant_id, and returns None for a non-matching member."""
+    db = await db_module.init_db(":memory:")
+    try:
+        await db.execute(
+            "INSERT INTO tenants (id, email) VALUES (?, ?)",
+            ("t-own", "own@example.com"),
+        )
+        await db.execute(
+            "INSERT INTO workspace_members "
+            "(id, tenant_id, email, role, github_access, token_hash) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            ("m-1", "t-own", "m@example.com", "viewer", "none", "tok"),
+        )
+        await db.commit()
+        # Promote viewer → admin with an explicit github_access cap.
+        updated = await db_module.update_workspace_member(
+            db, "m-1", "t-own", role="admin", github_access="write",
+        )
+        assert updated is not None
+        assert updated["role"] == "admin"
+        assert updated["github_access"] == "write"
+        # Partial update: change only github_access, role stays put.
+        updated = await db_module.update_workspace_member(
+            db, "m-1", "t-own", github_access="read",
+        )
+        assert updated["role"] == "admin"
+        assert updated["github_access"] == "read"
+        # Wrong tenant → no row matches → None, and the row is untouched.
+        assert await db_module.update_workspace_member(
+            db, "m-1", "t-other", role="viewer",
+        ) is None
+        async with db.execute(
+            "SELECT role FROM workspace_members WHERE id = 'm-1'"
+        ) as cur:
+            row = await cur.fetchone()
+        assert row["role"] == "admin"
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_v28_workspace_settings_display_name_roundtrip():
+    """v2.8 — display_name persists through update/get and clears on empty."""
+    db = await db_module.init_db(":memory:")
+    try:
+        assert (await db_module.get_workspace_settings(db))["display_name"] is None
+        saved = await db_module.update_workspace_settings(db, display_name="Adam")
+        assert saved["display_name"] == "Adam"
+        # Untouched on an unrelated patch.
+        saved = await db_module.update_workspace_settings(
+            db, hitl_auto_answer_default=True,
+        )
+        assert saved["display_name"] == "Adam"
+        # Empty string clears it back to NULL.
+        saved = await db_module.update_workspace_settings(db, display_name="")
+        assert saved["display_name"] is None
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
 async def test_g210_is_internal_backfill_and_churn_cleanup_skip():
     """G2.10 — the migrator backfills is_internal=1 for the four known
     internal emails, and run_churn_cleanup never touches an internal

@@ -345,6 +345,46 @@ async def _github_user_snapshot(access_token: str) -> dict[str, Any]:
     }
 
 
+async def _github_repo_branches(access_token: str, repo: str) -> list[str]:
+    """v2.8 — return the branch names for ``owner/repo`` (paged, up to 300).
+
+    Used by the dashboard Branch dropdown so users pick an existing branch
+    instead of typing one. Raises ``RuntimeError`` on a GitHub error so the
+    caller can fall back to a static default list.
+    """
+    import httpx
+
+    if not repo or "/" not in repo:
+        raise RuntimeError("repo must be owner/repo format")
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "Meridian",
+    }
+    branches: list[str] = []
+    async with httpx.AsyncClient(timeout=15.0) as http:
+        for page in range(1, 4):  # cap at 3 pages (300 branches)
+            resp = await http.get(
+                f"https://api.github.com/repos/{repo}/branches",
+                headers=headers,
+                params={"per_page": "100", "page": str(page)},
+            )
+            if resp.status_code >= 400:
+                raise RuntimeError(
+                    f"GitHub branch listing failed ({resp.status_code}): {resp.text}"
+                )
+            batch = resp.json() or []
+            if not isinstance(batch, list):
+                break
+            for b in batch:
+                name = b.get("name") if isinstance(b, dict) else None
+                if name:
+                    branches.append(name)
+            if len(batch) < 100:
+                break
+    return branches
+
+
 async def exchange_github_code_for_userinfo(code: str) -> dict[str, Any]:
     """Exchange a GitHub OAuth code for user info (email + login)."""
     access_token = await _exchange_github_code_for_token(code, _github_callback_url())

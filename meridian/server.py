@@ -3911,11 +3911,64 @@ async def workspace_list_members(request: Request) -> list[dict[str, Any]]:
             "id": m["id"],
             "email": m["email"],
             "role": m["role"],
+            "github_access": m.get("github_access"),
             "joined_at": m.get("joined_at"),
             "pending": m.get("joined_at") is None,
         }
         for m in members
     ]
+
+
+@app.patch("/workspace/members/{member_id}")
+async def workspace_update_member(request: Request, member_id: str) -> dict[str, Any]:
+    """v2.8 — change a workspace member's role (and github_access cap).
+
+    Admin+ only (PERM_INVITE, same gate as add/remove). When ``role`` changes
+    without an explicit ``github_access``, the cap is reset to that role's
+    default so a promotion/demotion carries sane repo access automatically.
+    """
+    if not _hosted_mode():
+        raise HTTPException(status_code=404)
+    from .hosted import get_current_tenant
+    from .roles import (  # noqa: PLC0415
+        VALID_ROLES, VALID_GITHUB_ACCESS,
+        default_github_access_for_role, ROLE_OWNER, PERM_INVITE,
+    )
+    tenant = await get_current_tenant(request)
+    await _require_workspace_perm(request, tenant, PERM_INVITE)
+    body = await request.json()
+    role = (body.get("role") or "").strip() or None
+    github_access = (body.get("github_access") or "").strip().lower() or None
+    if role is not None and role not in VALID_ROLES:
+        raise HTTPException(
+            status_code=422, detail=f"role must be one of {sorted(VALID_ROLES)}",
+        )
+    # Promoting an invitee to full owner is a billing/ownership transfer, not a
+    # role edit — block it here so the implicit tenant owner stays singular.
+    if role == ROLE_OWNER:
+        raise HTTPException(status_code=422, detail="cannot assign the owner role")
+    if github_access is not None and github_access not in VALID_GITHUB_ACCESS:
+        raise HTTPException(
+            status_code=422,
+            detail=f"github_access must be one of {sorted(VALID_GITHUB_ACCESS)}",
+        )
+    if role is not None and github_access is None:
+        github_access = default_github_access_for_role(role)
+    if role is None and github_access is None:
+        raise HTTPException(status_code=422, detail="role or github_access required")
+    updated = await db_module.update_workspace_member(
+        request.app.state.db, member_id, tenant["id"],
+        role=role, github_access=github_access,
+    )
+    if updated is None:
+        raise HTTPException(status_code=404, detail="member not found")
+    return {
+        "id": updated["id"],
+        "email": updated["email"],
+        "role": updated["role"],
+        "github_access": updated.get("github_access"),
+        "pending": updated.get("joined_at") is None,
+    }
 
 
 @app.delete("/workspace/members/{member_id}", status_code=204)
@@ -4274,6 +4327,48 @@ async def github_repos(project_id: str, request: Request) -> dict[str, Any]:
     repos = snapshot.get("repos") or []
     _GITHUB_REPOS_CACHE[tenant["id"]] = {"repos": repos, "fetched_at": now}
     return {"connected": True, "repos": repos, "synced_at": now, "cached": False}
+
+
+# Common branch names we offer as a fallback when the live GitHub list is
+# unavailable (e.g. the API is unreachable). The repo's current/default branch
+# is always merged in by the caller so the saved value never disappears.
+_FALLBACK_BRANCHES = ("main", "master", "dev", "develop", "gh-pages")
+
+
+@app.get("/projects/{project_id}/github/branches")
+async def github_branches(project_id: str, request: Request) -> dict[str, Any]:
+    """v2.8 — list the branches of a repo so the Branch field can be a dropdown.
+
+    Query: ``?repo=owner/name`` (defaults to the tenant's connected repo).
+    Falls back to a static list of common branches if GitHub can't be reached,
+    so the dropdown always has sensible options.
+    """
+    if not _hosted_mode():
+        raise HTTPException(status_code=404)
+    from .hosted import _github_repo_branches
+    tenant = await _get_tenant_from_request(request)
+    if tenant is None:
+        raise HTTPException(status_code=401, detail="not authenticated")
+    fresh = await db_module.get_tenant_by_id(request.app.state.db, tenant["id"])
+    repo = (request.query_params.get("repo") or (fresh or {}).get("github_repo") or "").strip()
+    default_branch = (fresh or {}).get("github_branch") or "main"
+    token = db_module.decrypt_field((fresh or {}).get("github_pat")) if fresh else None
+    branches: list[str] = []
+    source = "fallback"
+    if token and repo and "/" in repo:
+        try:
+            branches = await _github_repo_branches(token, repo)
+            source = "github"
+        except Exception:  # noqa: BLE001
+            branches = []
+    if not branches:
+        # Merge the saved branch + common defaults, preserving order, no dupes.
+        seen: set[str] = set()
+        for b in (default_branch, *_FALLBACK_BRANCHES):
+            if b and b not in seen:
+                seen.add(b)
+                branches.append(b)
+    return {"repo": repo, "branches": branches, "default_branch": default_branch, "source": source}
 
 
 @app.get("/mcp/quickstart", response_class=PlainTextResponse)
@@ -4855,9 +4950,19 @@ async def hooks_session_start(body: dict[str, Any], request: Request) -> dict[st
     if project is None:
         from fastapi.responses import JSONResponse
         return JSONResponse(status_code=404, content={"error": "project not found"})
+    # v2.8 — Codex/Claude hook sessions rarely pass a human_id, so they land on
+    # the timeline as "(unknown)". Fall back to the workspace display name the
+    # user set in Settings so their automated sessions are attributed to them.
+    human_id = body.get("human_id")
+    if not human_id:
+        try:
+            ws = await db_module.get_workspace_settings(db)
+            human_id = (ws.get("display_name") or "").strip() or None
+        except Exception:  # noqa: BLE001
+            human_id = None
     result = await _start_session_composite(
         db, project_id, session_name, _data_dir(request),
-        human_id=body.get("human_id"),
+        human_id=human_id,
         client_type="hook",
     )
     goal = result.get("goal") or {}
