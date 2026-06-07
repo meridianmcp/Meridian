@@ -193,6 +193,18 @@ html, body {
   align-items: center;
   flex-wrap: wrap;
 }
+
+/* G1.5 — caret indicator for collapsible disclosures (matches the
+   ▶/▼ pattern used elsewhere in the dashboard). The browser default
+   triangle is hidden via list-style:none + summary::-webkit-details-marker
+   so the inline span is the only indicator. */
+.meridian-disclosure > summary {
+  list-style: none;
+}
+.meridian-disclosure > summary::-webkit-details-marker { display: none; }
+.meridian-disclosure[open] > summary .meridian-caret {
+  transform: rotate(90deg);
+}
 .project-load-error {
   margin-top: 6px;
   padding: 10px;

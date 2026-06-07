@@ -3567,10 +3567,13 @@ async function loadSettingsTab(projectId) {
   </div>`;
   }
 
-  html += `<details style="margin-bottom:16px;border:1px solid var(--border);border-radius:6px;background:var(--surface-2)">
+  html += `<details class="meridian-disclosure" style="margin-bottom:16px;border:1px solid var(--border);border-radius:6px;background:var(--surface-2)">
     <summary style="cursor:pointer;list-style:none;padding:10px 12px;display:flex;justify-content:space-between;align-items:center;gap:8px">
-      <span style="font-weight:600;font-size:11px;color:var(--text)">Auto-checkpoint hooks</span>
-      <span style="font-size:10px;color:var(--muted)">Claude Code + Codex</span>
+      <span style="display:flex;align-items:center;gap:8px;flex:1;min-width:0">
+        <span class="meridian-caret" style="display:inline-block;font-size:10px;color:var(--muted);transition:transform 120ms ease;flex-shrink:0">▶</span>
+        <span style="font-weight:600;font-size:11px;color:var(--text)">Auto-checkpoint hooks</span>
+      </span>
+      <span style="font-size:10px;color:var(--muted);flex-shrink:0">Claude Code + Codex</span>
     </summary>
     <div style="padding:0 12px 12px">
       <div style="font-size:10px;color:var(--muted);margin-bottom:10px">Install once, then SessionStart + Stop can auto-start and auto-checkpoint into Meridian for this project.</div>
