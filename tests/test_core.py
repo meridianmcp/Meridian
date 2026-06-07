@@ -370,6 +370,20 @@ def test_session_and_task_round_trip(client):
     assert any(s["id"] == sess["id"] for s in r.json())
 
 
+def test_task_model_serializes_skipped_status():
+    """Regression: GET /projects/{id}/tasks must serialize task_log rows with
+    status 'skipped'. Postgres task_log has no CHECK constraint, so historical
+    rows can carry 'skipped'; the Task response model previously omitted it from
+    its Literal and 500'd the whole endpoint with a ResponseValidationError."""
+    from meridian.models import Task
+
+    t = Task(
+        id="t1", session_id="s1", project_id="p1",
+        description="x", status="skipped", created_at="2026-01-01T00:00:00Z",
+    )
+    assert t.status == "skipped"
+
+
 def test_task_for_unknown_project_returns_404(client):
     r = client.post(
         "/tasks",

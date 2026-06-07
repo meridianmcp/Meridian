@@ -230,7 +230,10 @@ class Task(BaseModel):
     session_id: str
     project_id: str
     description: str
-    status: Literal["pending", "in_progress", "done", "failed", "pending-hitl", "backlog", "future", "backburner"]
+    # 'skipped' is read-tolerated here (not a settable write status): Postgres
+    # task_log has no CHECK constraint, so historical rows can carry it and the
+    # GET /projects/{id}/tasks response must serialize them without 500ing.
+    status: Literal["pending", "in_progress", "done", "failed", "pending-hitl", "backlog", "future", "backburner", "skipped"]
     parent_task_id: str | None = None  # v2.4
     sprint_item_id: str | None = None  # v2.6
     claimed_by: str | None = None

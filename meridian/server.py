@@ -4972,6 +4972,12 @@ async def save_connection(body: dict[str, Any], request: Request) -> dict[str, A
         if conn_type == "postgres":
             new_cfg["url"] = url
         connections[name] = new_cfg
+    elif name == "env":
+        # "env" is the synthetic connection backed by MERIDIAN_DB_URL (hosted).
+        # It is never written to meridian.toml and is already the active DB, so
+        # re-selecting it (clicking the active connection in the picker) is a
+        # no-op rather than a 404.
+        return {"ok": True, "connection_name": "env", "restart_required": False}
     elif name not in connections and name != "local":
         raise HTTPException(404, f"connection '{name}' not found in meridian.toml")
 

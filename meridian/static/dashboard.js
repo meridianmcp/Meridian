@@ -64,21 +64,34 @@ function hideHostedAdminControls() {
 }
 
 function ensureSignOutLink(emailHint) {
-  if (document.getElementById('signout-link')) {
-    if (emailHint) {
-      const existing = document.getElementById('signout-link');
-      existing.title = `Signed in as ${emailHint}`;
-    }
-    return;
-  }
   const footer = document.querySelector('.sidebar-footer');
   if (!footer) return;
+  // Visible "signed in as {email}" line — rendered once /me resolves the email.
+  // Lets users confirm which account they're on (and spot a stale session before
+  // it 404s their way through another account's workspace).
+  if (emailHint) {
+    let who = document.getElementById('signed-in-as');
+    if (!who) {
+      who = document.createElement('div');
+      who.id = 'signed-in-as';
+      who.style = 'margin-top:8px;font-size:10px;color:var(--muted);font-family:var(--font-mono);text-align:center;opacity:0.75;word-break:break-all;line-height:1.3';
+      const existingLink = document.getElementById('signout-link');
+      if (existingLink) footer.insertBefore(who, existingLink);
+      else footer.appendChild(who);
+    }
+    who.textContent = `signed in as ${emailHint}`;
+    who.title = emailHint;
+  }
+  if (document.getElementById('signout-link')) {
+    if (emailHint) document.getElementById('signout-link').title = `Signed in as ${emailHint}`;
+    return;
+  }
   const link = document.createElement('a');
   link.id = 'signout-link';
   link.href = '/auth/logout';
   link.textContent = 'sign out';
   link.title = emailHint ? `Signed in as ${emailHint}` : 'Sign out';
-  link.style = 'display:block;margin-top:8px;font-size:10px;color:var(--muted);font-family:var(--font-mono);text-align:center;text-decoration:none;opacity:0.7';
+  link.style = 'display:block;margin-top:4px;font-size:10px;color:var(--muted);font-family:var(--font-mono);text-align:center;text-decoration:none;opacity:0.7';
   link.onmouseenter = () => { link.style.opacity = '1'; link.style.color = 'var(--text)'; };
   link.onmouseleave = () => { link.style.opacity = '0.7'; link.style.color = 'var(--muted)'; };
   footer.appendChild(link);
@@ -896,6 +909,7 @@ function _updateConnectionIndicator(cfg) {
         item.onclick = async (e) => {
           if (e.target.tagName === 'BUTTON') return; // don't activate on delete click
           popup.remove();
+          if (c.active) return; // already active — nothing to switch (avoids 404 on the synthetic "env" connection)
           try {
             await api('/config/connections', { method: 'POST', body: JSON.stringify({ name: c.name, activate: true }) });
             await loadServerConfig();
