@@ -5498,6 +5498,14 @@ def test_landing_page_has_try_demo_link(client):
     assert "/demo" in r.text
 
 
+def test_landing_page_has_solution_dashboard_shot(client):
+    """G6.27 — landing page shows the real dashboard screenshot, not a mockup."""
+    r = client.get("/")
+    assert r.status_code == 200
+    assert "/static/the-solution-dashboard-card.png" in r.text
+    assert "solution-shot" in r.text
+
+
 def test_install_mcp_page(client):
     """GET /install-mcp returns 200 with copy-ready SSE URL and no-cache headers."""
     r = client.get("/install-mcp")
