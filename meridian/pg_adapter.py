@@ -280,9 +280,17 @@ class PostgresConnection:
         return _ExecProxy(self._do_execute(sql, params))
 
     async def executescript(self, sql: str) -> None:
-        """Run multiple semicolon-separated statements (skipping PRAGMAs)."""
+        """Run multiple semicolon-separated statements (skipping PRAGMAs).
+
+        Strips ``-- ...`` line comments before splitting so a ``;`` inside a
+        comment doesn't chop a statement mid-line (regression caught by the
+        G5.19 workspace_members comment that contained a literal ``;``).
+        """
+        decommented = "\n".join(
+            line.split("--", 1)[0] for line in sql.splitlines()
+        )
         stmts: list[str] = []
-        for raw in sql.split(";"):
+        for raw in decommented.split(";"):
             s = raw.strip()
             if not s:
                 continue
@@ -660,13 +668,17 @@ CREATE TABLE IF NOT EXISTS oauth_tokens (
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- v2.1 dark — multi-user roles, not exposed in UI or API at launch
+-- v2.1 dark — multi-user roles
+-- G5.19/G5.20 — role widened to include 'admin'; github_access caps
+-- repo-touching MCP tools. App layer (meridian.roles) is the source of
+-- truth for valid values; DB-level CHECK kept on github_access only.
 CREATE TABLE IF NOT EXISTS workspace_members (
     id TEXT PRIMARY KEY,
     tenant_id TEXT NOT NULL REFERENCES tenants(id),
     email TEXT NOT NULL,
-    role TEXT NOT NULL DEFAULT 'member'
-        CHECK (role IN ('owner','member','viewer')),
+    role TEXT NOT NULL DEFAULT 'member',
+    github_access TEXT NOT NULL DEFAULT 'read'
+        CHECK (github_access IN ('none','read','write')),
     token_hash TEXT,
     invited_at TEXT NOT NULL DEFAULT ({_TS}),
     joined_at TEXT
@@ -857,7 +869,52 @@ async def init_pg_db(url: str) -> PostgresConnection:
         await _migrate_pg_v31_github_integration(conn)
         await _migrate_pg_v25_notification_prefs(conn)
         await _migrate_pg_tenants_is_internal(conn)
+        await _migrate_pg_workspace_members_rbac(conn)
     return conn
+
+
+async def _migrate_pg_workspace_members_rbac(conn: PostgresConnection) -> None:
+    """G5.19 / G5.20 — drop the legacy role CHECK (which excluded 'admin')
+    and add github_access. Idempotent.
+
+    On Postgres 11+ ADD COLUMN with a DEFAULT and DROP CONSTRAINT IF
+    EXISTS are both online-safe — no table rewrite, no long lock.
+    """
+    await conn.executescript(
+        "ALTER TABLE workspace_members "
+        "ADD COLUMN IF NOT EXISTS github_access TEXT NOT NULL DEFAULT 'read'"
+    )
+    # Drop the legacy CHECK on role if present. The constraint name is
+    # auto-generated; we look it up via pg_constraint.
+    try:
+        await conn.execute(
+            "DO $$ "
+            "DECLARE c text; "
+            "BEGIN "
+            "  SELECT conname INTO c FROM pg_constraint "
+            "   WHERE conrelid = 'workspace_members'::regclass "
+            "     AND contype = 'c' "
+            "     AND pg_get_constraintdef(oid) LIKE '%role%owner%member%viewer%' "
+            "   LIMIT 1; "
+            "  IF c IS NOT NULL THEN "
+            "    EXECUTE 'ALTER TABLE workspace_members DROP CONSTRAINT ' || quote_ident(c); "
+            "  END IF; "
+            "END $$",
+            None,
+        )
+    except Exception:  # noqa: BLE001 — best-effort; new installs already lack it
+        pass
+    # Add the github_access CHECK (idempotent — ignore failure if
+    # constraint already exists).
+    try:
+        await conn.execute(
+            "ALTER TABLE workspace_members ADD CONSTRAINT "
+            "workspace_members_github_access_chk "
+            "CHECK (github_access IN ('none','read','write'))",
+            None,
+        )
+    except Exception:  # noqa: BLE001
+        pass
 
 
 async def _migrate_pg_tenants_is_internal(conn: PostgresConnection) -> None:

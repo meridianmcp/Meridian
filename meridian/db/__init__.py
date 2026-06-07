@@ -350,12 +350,16 @@ CREATE TABLE IF NOT EXISTS oauth_tokens (
 );
 
 -- v2.1 dark — multi-user roles, not exposed in UI or API at launch
+-- G5.19/G5.20 — role widened to include 'admin'; github_access caps
+-- repo-touching MCP tools per invitee. App layer (meridian.roles) is the
+-- source of truth for valid values; no DB-level CHECK so adding a future
+-- role doesn't require a table rebuild on every SQLite install.
 CREATE TABLE IF NOT EXISTS workspace_members (
     id TEXT PRIMARY KEY,
     tenant_id TEXT NOT NULL REFERENCES tenants(id),
     email TEXT NOT NULL,
-    role TEXT NOT NULL DEFAULT 'member'
-        CHECK (role IN ('owner','member','viewer')),
+    role TEXT NOT NULL DEFAULT 'member',
+    github_access TEXT NOT NULL DEFAULT 'read',
     token_hash TEXT,
     invited_at TEXT NOT NULL DEFAULT (datetime('now')),
     joined_at TEXT
@@ -1567,7 +1571,71 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_v34_workspace_settings(db)
     await _migrate_project_icon(db)
     await _migrate_tenants_is_internal(db)
+    await _migrate_workspace_members_rbac(db)
     return db
+
+
+async def _migrate_workspace_members_rbac(db: aiosqlite.Connection) -> None:
+    """G5.19 / G5.20 — widen workspace_members.role to allow 'admin' and add
+    github_access. Idempotent.
+
+    Strategy:
+     - Add github_access column if missing (default 'read').
+     - Drop the legacy CHECK constraint on role by rebuilding the table
+       if and only if it's present. Existing rows preserve their role
+       and pick up github_access defaulted by current role.
+    """
+    # github_access — new column, simple ADD COLUMN.
+    await _migrate_add_column_if_missing(
+        db, "workspace_members", "github_access",
+        "TEXT NOT NULL DEFAULT 'read'",
+    )
+
+    # Detect the legacy CHECK by inspecting the table SQL. If it has the
+    # ('owner','member','viewer') tuple, rebuild without CHECK.
+    async with db.execute(
+        "SELECT sql FROM sqlite_master "
+        "WHERE type='table' AND name='workspace_members'"
+    ) as cur:
+        row = await cur.fetchone()
+    sql = (row["sql"] if row else "") or ""
+    if "'owner','member','viewer'" not in sql:
+        return  # already widened or never had the CHECK
+
+    # Rebuild. We pull a stable snapshot, drop, recreate, restore.
+    async with db.execute("SELECT * FROM workspace_members") as cur:
+        existing = await cur.fetchall()
+    columns = [d[0] for d in cur.description] if cur.description else []
+    await db.execute("DROP TABLE workspace_members")
+    await db.execute(
+        "CREATE TABLE workspace_members ("
+        "  id TEXT PRIMARY KEY,"
+        "  tenant_id TEXT NOT NULL REFERENCES tenants(id),"
+        "  email TEXT NOT NULL,"
+        "  role TEXT NOT NULL DEFAULT 'member',"
+        "  github_access TEXT NOT NULL DEFAULT 'read',"
+        "  token_hash TEXT,"
+        "  invited_at TEXT NOT NULL DEFAULT (datetime('now')),"
+        "  joined_at TEXT"
+        ")"
+    )
+    for r in existing:
+        d = {k: r[k] for k in columns}
+        await db.execute(
+            "INSERT INTO workspace_members "
+            "(id, tenant_id, email, role, github_access, token_hash, "
+            " invited_at, joined_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                d.get("id"), d.get("tenant_id"), d.get("email"),
+                d.get("role") or "member",
+                d.get("github_access") or "read",
+                d.get("token_hash"),
+                d.get("invited_at"),
+                d.get("joined_at"),
+            ),
+        )
+    await db.commit()
 
 
 async def _migrate_project_icon(db: aiosqlite.Connection) -> None:
@@ -5878,12 +5946,23 @@ async def create_workspace_invite(
     email: str,
     role: str,
     token_hash: str,
+    *,
+    github_access: str | None = None,
 ) -> dict[str, Any]:
-    """Insert a pending workspace member row (joined_at=NULL)."""
+    """Insert a pending workspace member row (joined_at=NULL).
+
+    G5.20 — ``github_access`` caps repo-touching MCP tools for this invitee.
+    Defaults from role when omitted (viewer→none, member→read, admin/owner→write).
+    """
+    from .. import roles as _roles  # noqa: PLC0415
     mid = _new_id()
+    if github_access is None:
+        github_access = _roles.default_github_access_for_role(role)
     await db.execute(
-        "INSERT INTO workspace_members (id, tenant_id, email, role, token_hash) VALUES (?, ?, ?, ?, ?)",
-        (mid, tenant_id, email, role, token_hash),
+        "INSERT INTO workspace_members "
+        "(id, tenant_id, email, role, github_access, token_hash) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (mid, tenant_id, email, role, github_access, token_hash),
     )
     await db.commit()
     async with db.execute("SELECT * FROM workspace_members WHERE id = ?", (mid,)) as cur:
@@ -5919,6 +5998,44 @@ async def accept_workspace_invite(
     async with db.execute("SELECT * FROM workspace_members WHERE id = ?", (member_id,)) as cur:
         row = await cur.fetchone()
     return _row_to_dict(row)
+
+
+async def resolve_member_role(
+    db: aiosqlite.Connection,
+    tenant_id: str,
+    email: str,
+) -> tuple[str, str] | None:
+    """G5.19 / G5.20 — return ``(role, github_access)`` for the given user
+    in the given tenant's workspace.
+
+    Order:
+     1. If ``email`` matches the tenant row's own email → ('owner','write').
+     2. Else if an accepted workspace_members row exists for this
+        (tenant_id, email) → use the row's role + github_access.
+     3. Else → None (caller should treat as 403 / not a member).
+    """
+    e = (email or "").strip().lower()
+    if not e:
+        return None
+    async with db.execute(
+        "SELECT email FROM tenants WHERE id = ?", (tenant_id,),
+    ) as cur:
+        tenant_row = await cur.fetchone()
+    if tenant_row and (str(tenant_row["email"]).lower() == e):
+        return ("owner", "write")
+    async with db.execute(
+        "SELECT role, github_access FROM workspace_members "
+        "WHERE tenant_id = ? AND LOWER(email) = ? AND joined_at IS NOT NULL "
+        "ORDER BY joined_at DESC LIMIT 1",
+        (tenant_id, e),
+    ) as cur:
+        row = await cur.fetchone()
+    if row is None:
+        return None
+    return (
+        (row["role"] or "member"),
+        (row["github_access"] or "read"),
+    )
 
 
 async def workspace_member_accepted_for_email(

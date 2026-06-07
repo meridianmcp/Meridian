@@ -5623,6 +5623,121 @@ def test_landing_page_charset_and_emoji_survival(client):
         assert moji not in body, f"mojibake sequence {moji!r} present in landing page"
 
 
+def test_g519_roles_map_grants_expected_permissions():
+    """G5.19 — ROLE_PERMS map: owner has everything; admin has invite/
+    settings/HITL but NOT billing/delete; member has read+write only;
+    viewer has read only."""
+    from meridian import roles
+    assert roles.has_perm("owner",  roles.PERM_DELETE_TENANT)
+    assert roles.has_perm("owner",  roles.PERM_BILLING)
+    assert roles.has_perm("admin",  roles.PERM_INVITE)
+    assert roles.has_perm("admin",  roles.PERM_HITL_ANSWER)
+    assert not roles.has_perm("admin",  roles.PERM_BILLING)
+    assert not roles.has_perm("admin",  roles.PERM_DELETE_TENANT)
+    assert roles.has_perm("member", roles.PERM_WRITE)
+    assert not roles.has_perm("member", roles.PERM_INVITE)
+    assert not roles.has_perm("member", roles.PERM_HITL_ANSWER)
+    assert roles.has_perm("viewer", roles.PERM_READ)
+    assert not roles.has_perm("viewer", roles.PERM_WRITE)
+    assert not roles.has_perm("nope",   roles.PERM_READ)
+    assert not roles.has_perm(None,     roles.PERM_READ)
+
+
+def test_g520_github_access_caps_gh_tool_dispatch():
+    """G5.20 — can_github: write→all, read→read-only tools, none→nothing."""
+    from meridian import roles
+    assert roles.can_github("write", "read_file")
+    assert roles.can_github("write", "commit")
+    assert roles.can_github("read",  "read_file")
+    assert roles.can_github("read",  "search_code")
+    assert not roles.can_github("read",  "commit")
+    assert not roles.can_github("none",  "read_file")
+    assert not roles.can_github(None,    "read_file")
+    # Defaults from role
+    assert roles.default_github_access_for_role("owner")  == "write"
+    assert roles.default_github_access_for_role("admin")  == "write"
+    assert roles.default_github_access_for_role("member") == "read"
+    assert roles.default_github_access_for_role("viewer") == "none"
+
+
+@pytest.mark.asyncio
+async def test_g519_resolve_member_role_owner_vs_invitee():
+    """G5.19 — resolve_member_role returns ('owner','write') for the tenant
+    email itself, the stored (role, github_access) tuple for an accepted
+    invitee, and None for unknown / pending invitees."""
+    from datetime import datetime, timezone
+    db = await db_module.init_db(":memory:")
+    try:
+        await db.execute(
+            "INSERT INTO tenants (id, email) VALUES (?, ?)",
+            ("t-owner", "owner@example.com"),
+        )
+        # Accepted admin invitee
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        await db.execute(
+            "INSERT INTO workspace_members "
+            "(id, tenant_id, email, role, github_access, token_hash, joined_at) "
+            "VALUES (?, ?, ?, ?, ?, NULL, ?)",
+            ("m-admin", "t-owner", "admin@example.com", "admin", "write", now),
+        )
+        # Pending viewer invitee
+        await db.execute(
+            "INSERT INTO workspace_members "
+            "(id, tenant_id, email, role, github_access, token_hash, joined_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, NULL)",
+            ("m-viewer", "t-owner", "viewer@example.com", "viewer", "none", "tok"),
+        )
+        await db.commit()
+        assert await db_module.resolve_member_role(
+            db, "t-owner", "OWNER@example.com"
+        ) == ("owner", "write")
+        assert await db_module.resolve_member_role(
+            db, "t-owner", "admin@example.com"
+        ) == ("admin", "write")
+        # Pending invitee → None (not joined yet)
+        assert await db_module.resolve_member_role(
+            db, "t-owner", "viewer@example.com"
+        ) is None
+        # Unknown email → None
+        assert await db_module.resolve_member_role(
+            db, "t-owner", "stranger@example.com"
+        ) is None
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_g519_rbac_migration_is_idempotent_and_widens_check():
+    """G5.19 — migration is idempotent: running it twice is a no-op, and
+    after running it once, 'admin' role inserts succeed (the legacy
+    CHECK that excluded admin has been dropped)."""
+    db = await db_module.init_db(":memory:")
+    try:
+        # Migration ran during init_db; running again is safe.
+        await db_module._migrate_workspace_members_rbac(db)
+        await db_module._migrate_workspace_members_rbac(db)
+        # Admin insert succeeds — legacy CHECK constraint is gone.
+        await db.execute(
+            "INSERT INTO tenants (id, email) VALUES (?, ?)",
+            ("t-r", "r@example.com"),
+        )
+        await db.execute(
+            "INSERT INTO workspace_members "
+            "(id, tenant_id, email, role, github_access, token_hash) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            ("m-a", "t-r", "a@example.com", "admin", "write", "tok2"),
+        )
+        await db.commit()
+        async with db.execute(
+            "SELECT role, github_access FROM workspace_members WHERE id = 'm-a'"
+        ) as cur:
+            row = await cur.fetchone()
+        assert row["role"] == "admin"
+        assert row["github_access"] == "write"
+    finally:
+        await db.close()
+
+
 @pytest.mark.asyncio
 async def test_g210_is_internal_backfill_and_churn_cleanup_skip():
     """G2.10 — the migrator backfills is_internal=1 for the four known

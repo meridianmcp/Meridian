@@ -3716,6 +3716,34 @@ async def get_notification_prefs(request: Request) -> dict[str, Any]:
 _WORKSPACE_MEMBER_LIMITS: dict[str, int] = {"standard": 25, "pro": 50}
 
 
+async def _require_workspace_perm(
+    request: Request, tenant: dict[str, Any], perm: str,
+) -> str:
+    """G5.19 — Resolve the calling user's role in the tenant's workspace
+    and 403 if they lack ``perm``. Returns the resolved role on success.
+
+    The tenant owner (email matches tenant.email) implicitly has every
+    permission. For invitees, ROLE_PERMS gates the action.
+    """
+    from .hosted import get_current_tenant as _get_ct  # noqa: PLC0415
+    from .roles import has_perm  # noqa: PLC0415
+    try:
+        caller = await _get_ct(request)
+    except HTTPException:
+        raise HTTPException(403, "Sign in required")
+    caller_email = caller.get("email", "")
+    resolved = await db_module.resolve_member_role(
+        request.app.state.db, tenant["id"], caller_email,
+    )
+    role = resolved[0] if resolved else None
+    if not has_perm(role, perm):
+        raise HTTPException(
+            403,
+            f"Workspace role '{role or 'none'}' lacks permission '{perm}'",
+        )
+    return role  # type: ignore[return-value]
+
+
 @app.post("/workspace/invite", status_code=201)
 async def workspace_invite(request: Request) -> dict[str, Any]:
     """Invite a new workspace member. Sends invite email via Resend."""
@@ -3724,13 +3752,31 @@ async def workspace_invite(request: Request) -> dict[str, Any]:
     from .hosted import get_current_tenant, send_invite_email
     import hashlib, secrets as _secrets
     tenant = await get_current_tenant(request)
+    # G5.19 — admin+ can invite. Tenant owners always pass; admin invitees
+    # pass; member/viewer get 403.
+    from .roles import (  # noqa: PLC0415
+        VALID_ROLES, VALID_GITHUB_ACCESS,
+        default_github_access_for_role, PERM_INVITE,
+    )
+    await _require_workspace_perm(request, tenant, PERM_INVITE)
     body = await request.json()
     email = (body.get("email") or "").strip().lower()
     role = (body.get("role") or "member").strip()
     if not email or "@" not in email:
         raise HTTPException(status_code=422, detail="valid email required")
-    if role not in ("member", "viewer"):
-        raise HTTPException(status_code=422, detail="role must be member or viewer")
+    if role not in VALID_ROLES:
+        raise HTTPException(
+            status_code=422,
+            detail=f"role must be one of {sorted(VALID_ROLES)}",
+        )
+    github_access = (body.get("github_access") or "").strip().lower()
+    if github_access and github_access not in VALID_GITHUB_ACCESS:
+        raise HTTPException(
+            status_code=422,
+            detail=f"github_access must be one of {sorted(VALID_GITHUB_ACCESS)}",
+        )
+    if not github_access:
+        github_access = default_github_access_for_role(role)
     db = request.app.state.db
     limit = _WORKSPACE_MEMBER_LIMITS.get(tenant.get("plan", "standard"), 25)
     count = await db_module.count_workspace_members(db, tenant["id"])
@@ -3738,7 +3784,9 @@ async def workspace_invite(request: Request) -> dict[str, Any]:
         raise HTTPException(status_code=402, detail=f"Team member limit ({limit}) reached for your plan")
     raw_token = _secrets.token_urlsafe(32)
     token_hash = hashlib.sha256(raw_token.encode()).hexdigest()
-    invite = await db_module.create_workspace_invite(db, tenant["id"], email, role, token_hash)
+    invite = await db_module.create_workspace_invite(
+        db, tenant["id"], email, role, token_hash, github_access=github_access,
+    )
     base = os.environ.get("MERIDIAN_SERVER_URL", "https://usemeridian.us").rstrip("/")
     invite_url = f"{base}/workspace/accept?token={raw_token}"
     try:
@@ -3842,8 +3890,12 @@ async def delete_account(request: Request) -> Response:
             status_code=403,
         )
     from .hosted import get_current_tenant, cancel_stripe_subscription, _drop_tenant_neon_database, send_account_deleted_email
+    from .roles import PERM_DELETE_TENANT  # noqa: PLC0415
     from fastapi.responses import JSONResponse
     tenant = await get_current_tenant(request)
+    # G5.19 — only the tenant owner can delete the account. Admin
+    # invitees are explicitly excluded by ROLE_PERMS.
+    await _require_workspace_perm(request, tenant, PERM_DELETE_TENANT)
     body = await request.json()
     if body.get("confirmation") != "DELETE":
         raise HTTPException(status_code=400, detail="Type DELETE to confirm account deletion.")
