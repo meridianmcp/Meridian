@@ -6921,6 +6921,9 @@ document.getElementById('ez-advanced-link').onclick = (e) => {
   });
 
   window._showConnSetupIfNeeded = (cfg) => {
+    // G3.13 — demo mode never sets up its own connection; suppressing the
+    // wizard there avoids a confusing modal on /demo with the seeded repo.
+    if (typeof isDemoMode === 'function' && isDemoMode()) return;
     if (!cfg?.toml_exists && cfg?.db !== 'postgres') modal.style.display = 'flex';
     // Show config file path
     const pathEl = document.getElementById('conn-toml-path');

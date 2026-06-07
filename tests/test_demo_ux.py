@@ -506,6 +506,41 @@ def test_dashboard_shows_visible_error_when_sessions_request_fails(client):
 
 
 @pytestmark_playwright
+def test_demo_never_opens_connection_setup_modal(client):
+    """G3.13 — /demo runs against the seeded demo DB and must never trigger
+    the local-server connection-setup wizard. _showConnSetupIfNeeded bails
+    out early in demo mode."""
+    import threading
+    import time
+    import uvicorn
+    from meridian import server as server_module
+
+    with sync_playwright() as p:
+        config = uvicorn.Config(server_module.app, host="127.0.0.1", port=17889, log_level="error")
+        server = uvicorn.Server(config)
+        thread = threading.Thread(target=server.run, daemon=True)
+        thread.start()
+        time.sleep(1.5)
+        try:
+            browser = p.chromium.launch()
+            page = browser.new_page()
+            page.goto("http://127.0.0.1:17889/demo", wait_until="domcontentloaded")
+            page.wait_for_timeout(2200)
+            modal = page.locator("#conn-setup-modal")
+            assert modal.count() == 1, "conn-setup-modal element must exist in markup"
+            # Modal might be in the DOM but must NOT be displayed.
+            displayed = page.evaluate(
+                "() => { const m = document.getElementById('conn-setup-modal');"
+                " return m ? window.getComputedStyle(m).display : 'missing'; }"
+            )
+            assert displayed in ("none", ""), \
+                f"conn-setup-modal should stay hidden on /demo, got display={displayed!r}"
+            browser.close()
+        finally:
+            server.should_exit = True
+
+
+@pytestmark_playwright
 def test_demo_tour_persists_and_finishes(client):
     """Phase 4: the rebuilt demo tour persists progress across reloads and,
     once 'Finish tutorial' is clicked, is never auto-shown again."""
