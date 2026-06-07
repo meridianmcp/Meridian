@@ -647,6 +647,7 @@ async function loadServerConfig() {
     if (me && me.plan) {
       state.tenantPlan = me.plan;
       state.tenantEmail = me.email || '';
+      state.tenantHasStripe = !!me.has_stripe_customer;
       _renderPlanBadge(me);
       updateGitHubConnectionIndicator(me);
     }
@@ -3559,6 +3560,29 @@ async function loadSettingsTab(projectId) {
 
   let html = '';
 
+  // G4.18 — Account section (hosted only). Shows email, plan, optional
+  // workspace memberships, plus links for Manage billing (G2.11),
+  // Sign out, and Delete account. Members-of and sign-out-everywhere
+  // ride on existing endpoints; both are no-ops outside hosted mode.
+  if (state.tenantEmail) {
+    const plan = state.tenantPlan || 'free';
+    const hasStripe = !!state.tenantHasStripe;
+    const billingLabel = hasStripe ? 'Manage billing' : 'Upgrade';
+    const billingHref = hasStripe ? '/billing/portal' : '/pricing';
+    html += `<div data-demo-hide style="margin-bottom:14px;padding:10px 12px;border:1px solid var(--border);border-radius:6px;background:var(--surface-2)">
+      <div style="font-weight:600;font-size:11px;color:var(--text);margin-bottom:6px">Account</div>
+      <div style="font-size:10px;color:var(--muted);line-height:1.7">
+        <div>Email: <span style="color:var(--text)">${escapeHtml(state.tenantEmail)}</span></div>
+        <div>Plan: <span style="color:var(--text);text-transform:capitalize">${escapeHtml(plan)}</span></div>
+      </div>
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:8px">
+        <a href="${billingHref}" class="primary" style="padding:4px 10px;font-size:10px;text-decoration:none;background:var(--accent);color:#001020;border-radius:4px;font-weight:600">${escapeHtml(billingLabel)}</a>
+        <a href="/auth/logout" class="secondary" style="padding:4px 10px;font-size:10px;text-decoration:none;background:var(--surface-1);color:var(--text);border:1px solid var(--border);border-radius:4px">Sign out</a>
+        <button id="account-delete-${projectId}" class="secondary" style="padding:4px 10px;font-size:10px;background:var(--surface-1);color:#f87171;border:1px solid #f8717155;border-radius:4px;cursor:pointer">Delete account…</button>
+      </div>
+    </div>`;
+  }
+
   // "Connect claude.ai browser" card — always shown regardless of hosted/self-hosted
   html += `<div style="margin-bottom:14px;padding:10px 12px;border:1px solid var(--border);border-radius:6px;background:var(--surface-2);display:flex;justify-content:space-between;align-items:center;gap:8px">
     <div>
@@ -4406,6 +4430,36 @@ async function loadSettingsTab(projectId) {
 
   body.innerHTML = html;
   if (isDemoMode()) hideDemoAdminControls();
+
+  // G4.18 — Delete account confirmation flow. Demands typing DELETE in a
+  // prompt so a misclick can't nuke the tenant. Sends to /account/delete
+  // (hosted-only endpoint); on success redirects to /.
+  const deleteBtn = document.getElementById(`account-delete-${projectId}`);
+  if (deleteBtn) {
+    deleteBtn.onclick = async () => {
+      const typed = window.prompt(
+        "This permanently deletes your account, projects, and data. "
+        + "Stripe subscription is canceled and the Neon DB is dropped.\n\n"
+        + "Type DELETE to confirm.",
+      );
+      if (typed !== "DELETE") {
+        if (typed !== null) toast('Account NOT deleted (confirmation did not match).');
+        return;
+      }
+      deleteBtn.disabled = true;
+      try {
+        await api('/account/delete', {
+          method: 'POST',
+          body: JSON.stringify({ confirmation: 'DELETE' }),
+        });
+        toast('Account deleted. Signing out…');
+        setTimeout(() => { window.location.href = '/'; }, 1200);
+      } catch (e) {
+        toast('Delete failed: ' + e.message, true);
+        deleteBtn.disabled = false;
+      }
+    };
+  }
 
   setTimeout(() => {
     const hostedPlaceholderToken = mcpData ? ('sk_meridian_' + 'x'.repeat(32)) : '';
