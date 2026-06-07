@@ -3829,12 +3829,7 @@ async function loadSettingsTab(projectId) {
     <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
       <label style="font-size:10px;color:var(--muted)">
         Max pinned decisions warning threshold<br>
-        <select id="constitution-max-${projectId}" style="margin-top:4px;background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:4px 8px">
-          <option value="10">10</option>
-          <option value="20">20</option>
-          <option value="30">30</option>
-          <option value="40">40</option>
-        </select>
+        <input type="number" id="constitution-max-${projectId}" min="1" max="500" step="1" inputmode="numeric" style="margin-top:4px;background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:4px 8px;width:80px">
       </label>
       <span id="constitution-max-status-${projectId}" style="font-size:10px;color:var(--muted)">Warning updates the Decisions tab banner and archive suggestion.</span>
     </div>
@@ -3845,8 +3840,14 @@ async function loadSettingsTab(projectId) {
     const status = document.getElementById(`constitution-max-status-${projectId}`);
     if (!sel) return;
     sel.value = String(projectSettings.max_pinned_decisions || DEFAULT_MAX_PINNED_DECISIONS);
-    sel.onchange = async () => {
-      const nextLimit = Math.max(1, parseInt(String(sel.value || DEFAULT_MAX_PINNED_DECISIONS), 10) || DEFAULT_MAX_PINNED_DECISIONS);
+    const commit = async () => {
+      // G1.6 — validate: integer, clamp to [1, 500]. Empty / NaN falls
+      // back to the default so the user can never persist a garbage value.
+      const raw = parseInt(String(sel.value || ''), 10);
+      const nextLimit = Number.isFinite(raw)
+        ? Math.min(500, Math.max(1, raw))
+        : DEFAULT_MAX_PINNED_DECISIONS;
+      sel.value = String(nextLimit);
       sel.disabled = true;
       try {
         const saved = await saveProjectSettings(projectId, { max_pinned_decisions: nextLimit });
@@ -3859,6 +3860,13 @@ async function loadSettingsTab(projectId) {
         sel.disabled = false;
       }
     };
+    // Save on blur and on Enter — match the calm-typing UX of free-text
+    // fields elsewhere (saving on every keystroke would thrash the server).
+    sel.addEventListener('change', commit);
+    sel.addEventListener('blur', commit);
+    sel.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') { e.preventDefault(); sel.blur(); }
+    });
   }, 0);
 
   // Human-in-the-loop section — per-project auto-answer toggle (v3.4)
