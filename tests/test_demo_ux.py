@@ -541,6 +541,75 @@ def test_demo_never_opens_connection_setup_modal(client):
 
 
 @pytestmark_playwright
+def test_free_tier_signout_visible_on_hosted_dashboard(client, monkeypatch):
+    """Item 42 — free-tier /dashboard must show the sign-out control.
+
+    Regression. Previously the sign-out link was created only inside
+    _renderPlanBadge(me), which runs only when /me returns a plan. Anywhere
+    /me returned {} or errored, the link never appeared — the bug surfaced on
+    free tier. Fix: ensureSignOutLink() is called from hideHostedAdminControls,
+    which runs unconditionally for any hosted user at init.
+
+    This test boots the server with MERIDIAN_HOSTED=true but no auth cookie, so
+    /me returns {}. The sign-out link must still render and be visible.
+    """
+    import threading
+    import time
+    import uvicorn
+    from meridian import server as server_module
+    from playwright.sync_api import sync_playwright
+
+    monkeypatch.setenv("MERIDIAN_HOSTED", "true")
+
+    with sync_playwright() as p:
+        config = uvicorn.Config(server_module.app, host="127.0.0.1", port=17884, log_level="error")
+        server = uvicorn.Server(config)
+        thread = threading.Thread(target=server.run, daemon=True)
+        thread.start()
+        time.sleep(1.5)
+
+        try:
+            browser = p.chromium.launch()
+            page = browser.new_page()
+            page.goto("http://127.0.0.1:17884/dashboard", wait_until="domcontentloaded")
+            page.wait_for_timeout(2500)  # let loadServerConfig + /me + init finish
+
+            # Remove modals/wizards that can mask the sidebar footer.
+            for sel in ("#conn-setup-modal", "#demo-onboarding-overlay", "#ez-wizard"):
+                page.evaluate(
+                    f"() => {{ const e = document.querySelector('{sel}'); if (e) e.remove(); }}"
+                )
+            page.wait_for_timeout(150)
+
+            # The dashboard must be running in hosted mode for this test to be
+            # meaningful — otherwise hideHostedAdminControls never fires.
+            hosted_flag = page.evaluate("() => !!window.MERIDIAN_HOSTED")
+            assert hosted_flag, (
+                "test setup error: window.MERIDIAN_HOSTED is false — "
+                "MERIDIAN_HOSTED env var didn't reach the running server"
+            )
+
+            signout = page.query_selector("#signout-link")
+            assert signout is not None, (
+                "Item 42 regression: #signout-link missing from /dashboard for a "
+                "hosted user without an auth cookie (the free-tier path). "
+                "ensureSignOutLink() must be called from hideHostedAdminControls "
+                "so the link appears even when /me returns {}."
+            )
+            assert signout.is_visible(), (
+                "Item 42 regression: #signout-link is in the DOM but not visible"
+            )
+            href = signout.get_attribute("href")
+            assert href == "/auth/logout", (
+                f"Item 42: signout-link href must be /auth/logout, got {href!r}"
+            )
+
+            browser.close()
+        finally:
+            server.should_exit = True
+
+
+@pytestmark_playwright
 def test_demo_tour_persists_and_finishes(client):
     """Phase 4: the rebuilt demo tour persists progress across reloads and,
     once 'Finish tutorial' is clicked, is never auto-shown again."""

@@ -53,9 +53,35 @@ function hideHostedAdminControls() {
     footer.prepend(lbl);
   }
 
+  // Sign-out link in sidebar-footer for all hosted users (free tier + admin).
+  // Lives here (not in _renderPlanBadge) so it appears even when /me fails or
+  // returns {} — the free-tier signout-missing bug fix.
+  ensureSignOutLink();
+
   // Rename "advanced setup ↗" → "Close" in first-run wizard (no local config on hosted)
   const advLink = document.getElementById('ez-advanced-link');
   if (advLink) advLink.textContent = 'Close';
+}
+
+function ensureSignOutLink(emailHint) {
+  if (document.getElementById('signout-link')) {
+    if (emailHint) {
+      const existing = document.getElementById('signout-link');
+      existing.title = `Signed in as ${emailHint}`;
+    }
+    return;
+  }
+  const footer = document.querySelector('.sidebar-footer');
+  if (!footer) return;
+  const link = document.createElement('a');
+  link.id = 'signout-link';
+  link.href = '/auth/logout';
+  link.textContent = 'sign out';
+  link.title = emailHint ? `Signed in as ${emailHint}` : 'Sign out';
+  link.style = 'display:block;margin-top:8px;font-size:10px;color:var(--muted);font-family:var(--font-mono);text-align:center;text-decoration:none;opacity:0.7';
+  link.onmouseenter = () => { link.style.opacity = '1'; link.style.color = 'var(--text)'; };
+  link.onmouseleave = () => { link.style.opacity = '0.7'; link.style.color = 'var(--muted)'; };
+  footer.appendChild(link);
 }
 
 function showLocalServerControls() {
@@ -727,21 +753,10 @@ function _renderPlanBadge(me) {
     document.body.style.paddingTop = ((parseInt(document.body.style.paddingTop || '0', 10)) + 28) + 'px';
   }
 
-  // b75c1649 — sign out link in sidebar footer (hosted/authenticated users only)
-  if (!document.getElementById('signout-link')) {
-    const footer = document.querySelector('.sidebar-footer');
-    if (footer) {
-      const link = document.createElement('a');
-      link.id = 'signout-link';
-      link.href = '/auth/logout';
-      link.textContent = 'sign out';
-      link.title = me.email ? `Signed in as ${me.email}` : 'Sign out';
-      link.style = 'display:block;margin-top:8px;font-size:10px;color:var(--muted);font-family:var(--font-mono);text-align:center;text-decoration:none;opacity:0.7';
-      link.onmouseenter = () => { link.style.opacity = '1'; link.style.color = 'var(--text)'; };
-      link.onmouseleave = () => { link.style.opacity = '0.7'; link.style.color = 'var(--muted)'; };
-      footer.appendChild(link);
-    }
-  }
+  // Sign-out link is created earlier in hideHostedAdminControls() so it
+  // appears for all hosted users (incl. free tier) even before /me returns.
+  // Here we just enrich the tooltip with the signed-in email if available.
+  ensureSignOutLink(me.email);
 }
 
 // v1.9.x — show active DB connection in sidebar footer
