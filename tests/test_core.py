@@ -5601,6 +5601,21 @@ def test_demo_cache_control(client):
         assert "no-cache" in cc
         assert "no-store" in cc
 
+
+def test_landing_page_charset_and_emoji_survival(client):
+    """Regression for the cc3eeb9 mojibake incident: served bytes must decode as UTF-8
+    and known emoji must survive intact. If this fails, the template was likely
+    re-saved with cp1252 interpretation of UTF-8 bytes."""
+    r = client.get("/")
+    assert r.status_code == 200
+    ctype = r.headers.get("content-type", "").lower()
+    assert "charset=utf-8" in ctype, f"missing charset=utf-8: {ctype!r}"
+    body = r.content.decode("utf-8")
+    for marker in ("🎯", "📋", "🧭", "🐙", "—", "→", "⚡"):
+        assert marker in body, f"emoji {marker!r} missing — landing.html may have re-encoded"
+    for moji in ("ðŸ", "â€”", "â€“", "â†’", "âœ", "âš¡"):
+        assert moji not in body, f"mojibake sequence {moji!r} present in landing page"
+
 # v2.4 — decisions_pinned (editable constitution)
 # ---------------------------------------------------------------------------
 

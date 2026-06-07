@@ -236,11 +236,11 @@ ROADMAP.md
 GOAL.md
 secrets.env
 secrets.local.env
-# Session handoff files contain internal strategy â€” never commit
+# Session handoff files contain internal strategy — never commit
 data/meridian-build_handoff.md
 data/chinampa_churchill.md
 
-# Local dev overrides â€” never commit credentials
+# Local dev overrides — never commit credentials
 .env.local
 CLAUDE.local.md
 
