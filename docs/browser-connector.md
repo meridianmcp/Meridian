@@ -34,7 +34,10 @@ some layouts), choose **Add custom connector**, then paste:
 
 #### Claude video walkthrough
 
-<iframe width="100%" height="400" src="https://www.youtube.com/embed/jJqUhqBVEyE" frameborder="0" allowfullscreen></iframe>
+<video controls preload="metadata" width="100%" style="max-width:900px;border-radius:8px;margin:8px 0">
+  <source src="/videos/meridian-claude-demo.mp4" type="video/mp4">
+  Your browser does not support embedded video. <a href="/videos/meridian-claude-demo.mp4">Download the walkthrough</a>.
+</video>
 
 ### ChatGPT
 
@@ -52,7 +55,10 @@ public MCP endpoint:
 
 #### ChatGPT video walkthrough
 
-<iframe width="100%" height="400" src="https://www.youtube.com/embed/toNRFzWbqPI" frameborder="0" allowfullscreen></iframe>
+<video controls preload="metadata" width="100%" style="max-width:900px;border-radius:8px;margin:8px 0">
+  <source src="/videos/meridian-chatgpt-demo.mp4" type="video/mp4">
+  Your browser does not support embedded video. <a href="/videos/meridian-chatgpt-demo.mp4">Download the walkthrough</a>.
+</video>
 
 !!! note "Current ChatGPT naming"
     OpenAI now calls these integrations **Apps**. Older docs and screenshots may

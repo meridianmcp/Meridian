@@ -3,7 +3,9 @@ __pycache__/
 *.py[codz]
 *$py.class
 data/
-videos/
+# Source video assets (large, regenerable). Anchored to repo root so the
+# committed, published copies under docs/videos/ are NOT ignored.
+/videos/
 
 # C extensions
 *.so
@@ -254,4 +256,4 @@ CONNECT.txt
 tests/integration/results.txt
 
 extensions/mcp-text-editor/.pixi/
-videos/  
+/videos/

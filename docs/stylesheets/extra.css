@@ -5,10 +5,25 @@
   --md-accent-fg-color: #a78bfa;
 }
 
-/* Lift the three pages new users need first. */
+/* Lift the three pages new users need first.
+   Top tab bar sits on the blue primary background — the old light-blue made
+   these read as washed-out grey. Make them near-black + bold so they stand out
+   with strong contrast. (The sidebar nav below sits on the dark slate surface,
+   so those keep a light treatment to stay legible.) */
 .md-tabs__link[href$="quickstart/"],
 .md-tabs__link[href$="browser-connector/"],
-.md-tabs__link[href$="mcp-tools/"],
+.md-tabs__link[href$="mcp-tools/"] {
+  font-weight: 800;
+  color: #0b1020;
+  opacity: 1;
+}
+.md-tabs__link[href$="quickstart/"]:hover,
+.md-tabs__link[href$="browser-connector/"]:hover,
+.md-tabs__link[href$="mcp-tools/"]:hover {
+  color: #000;
+}
+
+/* Same three pages in the (dark) sidebar nav: keep them light + bold. */
 .md-nav__link[href$="quickstart/"],
 .md-nav__link[href$="browser-connector/"],
 .md-nav__link[href$="mcp-tools/"] {

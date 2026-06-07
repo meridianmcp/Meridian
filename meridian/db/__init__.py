@@ -6281,9 +6281,19 @@ async def get_tenants_with_payment_failures(
 async def export_tenant_data(
     db: aiosqlite.Connection,
     tenant_id: str,
+    project_db: aiosqlite.Connection | None = None,
 ) -> dict[str, Any]:
-    """Collect all data belonging to a tenant as a plain dict for GDPR export."""
+    """Collect all data belonging to a tenant as a plain dict for GDPR export.
+
+    Account-level rows (tenant, api_tokens, workspace_members) live in the auth
+    DB (``db``). In hosted mode the tenant's *project* data lives in a separate
+    per-tenant Neon DB — pass it as ``project_db`` so the export actually
+    contains the projects. When omitted (self-hosted, single DB) the project
+    data is read from ``db`` like before.
+    """
     from datetime import datetime, timezone
+
+    pdb = project_db if project_db is not None else db
 
     async with db.execute(
         "SELECT id, email, google_sub, microsoft_sub, plan, created_at FROM tenants WHERE id = ?",
@@ -6299,13 +6309,13 @@ async def export_tenant_data(
         tokens = [_row_to_dict(r) for r in await cur.fetchall()]
 
     async with db.execute(
-        "SELECT id, email, role, invited_at, joined_at FROM workspace_members WHERE tenant_id = ?",
+        "SELECT id, email, role, github_access, invited_at, joined_at FROM workspace_members WHERE tenant_id = ?",
         (tenant_id,),
     ) as cur:
         members = [_row_to_dict(r) for r in await cur.fetchall()]
 
-    async with db.execute(
-        "SELECT id, name, creator_human_id, created_at FROM projects ORDER BY created_at DESC",
+    async with pdb.execute(
+        "SELECT id, name, creator_human_id, decisions, created_at FROM projects ORDER BY created_at DESC",
     ) as cur:
         project_rows = await cur.fetchall()
 
@@ -6314,32 +6324,32 @@ async def export_tenant_data(
         p = _row_to_dict(pr)
         pid = p["id"]
 
-        async with db.execute(
+        async with pdb.execute(
             "SELECT content, goal_north_star, goal_sprint, version, updated_at FROM goal_states WHERE project_id = ?",
             (pid,),
         ) as cur:
             goals = [_row_to_dict(r) for r in await cur.fetchall()]
 
-        async with db.execute(
-            "SELECT id, name, human_id, status, created_at FROM sessions WHERE project_id = ? ORDER BY created_at DESC LIMIT 100",
+        async with pdb.execute(
+            "SELECT id, name, human_id, status, session_summary, created_at FROM sessions WHERE project_id = ? ORDER BY created_at DESC LIMIT 500",
             (pid,),
         ) as cur:
             sessions = [_row_to_dict(r) for r in await cur.fetchall()]
 
-        async with db.execute(
-            "SELECT id, session_id, description, status, created_at FROM task_log WHERE project_id = ? ORDER BY created_at DESC LIMIT 200",
+        async with pdb.execute(
+            "SELECT id, session_id, description, status, created_at FROM task_log WHERE project_id = ? ORDER BY created_at DESC LIMIT 2000",
             (pid,),
         ) as cur:
             tasks = [_row_to_dict(r) for r in await cur.fetchall()]
 
-        async with db.execute(
-            "SELECT id, version, title, status, item_group FROM sprint_items WHERE project_id = ?",
+        async with pdb.execute(
+            "SELECT id, version, title, status, item_group, added_at FROM sprint_items WHERE project_id = ?",
             (pid,),
         ) as cur:
             sprint = [_row_to_dict(r) for r in await cur.fetchall()]
 
         try:
-            async with db.execute(
+            async with pdb.execute(
                 "SELECT id, title, body, tags, created_at FROM project_notes WHERE project_id = ?",
                 (pid,),
             ) as cur:
@@ -6347,18 +6357,40 @@ async def export_tenant_data(
         except Exception:
             notes = []
 
+        try:
+            async with pdb.execute(
+                "SELECT id, question, urgency, status, answer, created_at FROM hitl_requests WHERE project_id = ? ORDER BY created_at DESC LIMIT 500",
+                (pid,),
+            ) as cur:
+                hitl = [_row_to_dict(r) for r in await cur.fetchall()]
+        except Exception:
+            hitl = []
+
         p["goal_states"] = goals
         p["sessions"] = sessions
         p["tasks"] = tasks
         p["sprint_items"] = sprint
         p["notes"] = notes
+        p["hitl_requests"] = hitl
         projects.append(p)
+
+    # Workspace-global notes/decisions live in the project DB too.
+    try:
+        ws_notes = await get_workspace_notes(pdb)
+    except Exception:
+        ws_notes = []
+    try:
+        ws_decisions = await get_workspace_decisions(pdb)
+    except Exception:
+        ws_decisions = []
 
     return {
         "exported_at": datetime.now(timezone.utc).isoformat(),
         "tenant": tenant_data,
         "api_tokens": tokens,
         "workspace_members": members,
+        "workspace_notes": ws_notes,
+        "workspace_decisions": ws_decisions,
         "projects": projects,
     }
 

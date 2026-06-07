@@ -95,12 +95,32 @@ function ensureSignOutLink(emailHint) {
   const link = document.createElement('a');
   link.id = 'signout-link';
   link.href = '/auth/logout';
-  link.textContent = 'sign out';
+  link.textContent = 'Sign out';
   link.title = emailHint ? `Signed in as ${emailHint}` : 'Sign out';
-  link.style = 'display:block;margin-top:4px;font-size:10px;color:var(--muted);font-family:var(--font-mono);text-align:center;text-decoration:none;opacity:0.7';
-  link.onmouseenter = () => { link.style.opacity = '1'; link.style.color = 'var(--text)'; };
-  link.onmouseleave = () => { link.style.opacity = '0.7'; link.style.color = 'var(--muted)'; };
+  // Visible button-style affordance — the faint text version was easy to miss
+  // on free-tier accounts.
+  link.style = 'display:block;margin-top:8px;padding:6px 10px;font-size:11px;color:var(--text);font-family:var(--font-mono);text-align:center;text-decoration:none;background:var(--surface-1);border:1px solid var(--border);border-radius:5px;opacity:1';
+  link.onmouseenter = () => { link.style.borderColor = 'var(--accent)'; link.style.color = 'var(--accent)'; };
+  link.onmouseleave = () => { link.style.borderColor = 'var(--border)'; link.style.color = 'var(--text)'; };
   footer.appendChild(link);
+}
+
+// A persistent "Take the tour" affordance in the sidebar footer so users —
+// including paid users on their own dashboard — can (re)play the guided
+// walkthrough anytime, not just on first demo visit.
+function ensureTourButton() {
+  const footer = document.querySelector('.sidebar-footer');
+  if (!footer || document.getElementById('tour-launch-btn')) return;
+  const btn = document.createElement('button');
+  btn.id = 'tour-launch-btn';
+  btn.type = 'button';
+  btn.textContent = '🧭 Take the tour';
+  btn.title = 'Replay the guided dashboard walkthrough';
+  btn.style = 'display:block;width:100%;margin-top:8px;padding:6px 10px;font-size:11px;color:var(--text);font-family:var(--font-mono);text-align:center;background:var(--surface-1);border:1px solid var(--border);border-radius:5px;cursor:pointer';
+  btn.onmouseenter = () => { btn.style.borderColor = 'var(--accent)'; btn.style.color = 'var(--accent)'; };
+  btn.onmouseleave = () => { btn.style.borderColor = 'var(--border)'; btn.style.color = 'var(--text)'; };
+  btn.onclick = () => { try { startDemoTour(0); } catch (e) {} };
+  footer.appendChild(btn);
 }
 
 function showLocalServerControls() {
@@ -399,17 +419,17 @@ function showDemoOnboardingOverlay() {
   const overlay = document.createElement('div');
   overlay.id = 'demo-onboarding-overlay';
   overlay.style = 'position:fixed;inset:0;z-index:20000;background:rgba(0,0,0,0.72);display:flex;align-items:center;justify-content:center;padding:16px';
-  overlay.innerHTML = `<div style="background:#1e2029;border:1px solid #7c3aed66;border-radius:14px;padding:28px 32px;max-width:400px;width:100%;box-shadow:0 12px 48px rgba(0,0,0,0.7);position:relative;font-family:inherit">
-  <button onclick="document.getElementById('demo-onboarding-overlay').remove()" style="position:absolute;top:12px;right:14px;background:none;border:none;color:#8b8fa8;font-size:18px;cursor:pointer;line-height:1;padding:4px" title="Dismiss">×</button>
-  <h3 style="color:#e8eaf0;margin:0 0 16px;font-size:1.05rem;font-weight:700">Welcome to the Meridian demo</h3>
-  <ol style="color:#c4c6d4;font-size:.88rem;line-height:1.85;padding-left:1.3em;margin:0 0 20px">
+  overlay.innerHTML = `<div style="background:#1e2029;border:1px solid #7c3aed66;border-radius:14px;padding:32px 36px;max-width:480px;width:100%;box-shadow:0 12px 48px rgba(0,0,0,0.7);position:relative;font-family:inherit">
+  <button onclick="document.getElementById('demo-onboarding-overlay').remove()" style="position:absolute;top:12px;right:14px;background:none;border:none;color:#8b8fa8;font-size:22px;cursor:pointer;line-height:1;padding:4px" title="Dismiss">×</button>
+  <h3 style="color:#e8eaf0;margin:0 0 18px;font-size:1.35rem;font-weight:700">Welcome to the Meridian demo</h3>
+  <ol style="color:#c4c6d4;font-size:1.02rem;line-height:1.85;padding-left:1.3em;margin:0 0 24px">
     <li>This is a live demo coordinating a real multi-session build. It's read-only.</li>
     <li>Click any session on the left to explore.</li>
     <li>Write actions are disabled — <a href="/auth/login" style="color:#6c8fff;text-decoration:underline">sign in to create your own project</a>.</li>
   </ol>
   <div style="display:flex;gap:8px">
-    <button onclick="document.getElementById('demo-onboarding-overlay').remove()" style="background:#2a2d35;border:none;border-radius:7px;color:#8b8fa8;padding:8px 16px;cursor:pointer;font-size:.85rem;font-family:inherit;flex:0 0 auto">Skip</button>
-    <button onclick="document.getElementById('demo-onboarding-overlay').remove();resumeDemoTour()" style="background:#7c3aed;border:none;border-radius:7px;color:#fff;padding:8px 22px;cursor:pointer;font-size:.88rem;font-family:inherit;flex:1">${ctaLabel}</button>
+    <button onclick="document.getElementById('demo-onboarding-overlay').remove()" style="background:#2a2d35;border:none;border-radius:7px;color:#8b8fa8;padding:10px 18px;cursor:pointer;font-size:.98rem;font-family:inherit;flex:0 0 auto">Skip</button>
+    <button onclick="document.getElementById('demo-onboarding-overlay').remove();resumeDemoTour()" style="background:#7c3aed;border:none;border-radius:7px;color:#fff;padding:10px 24px;cursor:pointer;font-size:1.02rem;font-family:inherit;flex:1">${ctaLabel}</button>
   </div>
 </div>`;
   overlay.addEventListener('click', (e) => { if (e.target === overlay) overlay.remove(); });
@@ -575,19 +595,19 @@ function startDemoTour(step) {
   tip.id = 'demo-tour-tooltip';
   const stepLabel = `${step + 1} / ${_DEMO_TOUR_STEPS.length}`;
   tip.innerHTML = `
-    <div style="font-size:.7rem;color:#6c8fff;font-weight:600;margin-bottom:6px;letter-spacing:.3px">${stepLabel}</div>
-    <div style="font-size:.9rem;font-weight:700;color:#e8eaf0;margin-bottom:8px">${s.title}</div>
-    <div style="font-size:.83rem;color:#c4c6d4;line-height:1.6;margin-bottom:16px">${s.body}</div>
+    <div style="font-size:.82rem;color:#6c8fff;font-weight:600;margin-bottom:8px;letter-spacing:.3px">${stepLabel}</div>
+    <div style="font-size:1.12rem;font-weight:700;color:#e8eaf0;margin-bottom:10px">${s.title}</div>
+    <div style="font-size:.98rem;color:#c4c6d4;line-height:1.65;margin-bottom:18px">${s.body}</div>
     <div style="display:flex;gap:8px;align-items:center">
-      <button id="demo-tour-finish" style="background:none;border:none;color:#6b7280;cursor:pointer;font-size:.78rem;padding:4px 6px;font-family:inherit;text-decoration:underline">Finish tutorial</button>
+      <button id="demo-tour-finish" style="background:none;border:none;color:#6b7280;cursor:pointer;font-size:.86rem;padding:4px 6px;font-family:inherit;text-decoration:underline">Finish tutorial</button>
       <div style="flex:1"></div>
-      ${step > 0 ? '<button id="demo-tour-back" style="background:none;border:1px solid #3a3d48;border-radius:6px;color:#c4c6d4;cursor:pointer;font-size:.8rem;padding:6px 12px;font-family:inherit">← Back</button>' : ''}
-      <button id="demo-tour-next" style="background:#7c3aed;border:none;border-radius:6px;color:#fff;cursor:pointer;font-size:.82rem;padding:6px 16px;font-family:inherit">
+      ${step > 0 ? '<button id="demo-tour-back" style="background:none;border:1px solid #3a3d48;border-radius:6px;color:#c4c6d4;cursor:pointer;font-size:.9rem;padding:7px 13px;font-family:inherit">← Back</button>' : ''}
+      <button id="demo-tour-next" style="background:#7c3aed;border:none;border-radius:6px;color:#fff;cursor:pointer;font-size:.92rem;padding:7px 18px;font-family:inherit">
         ${isLast ? 'Done' : 'Next →'}
       </button>
     </div>`;
   tip.style.cssText = `position:fixed;z-index:30000;background:#1e2029;border:1px solid #7c3aed88;
-    border-radius:10px;padding:16px 18px;width:268px;
+    border-radius:10px;padding:18px 22px;width:330px;max-width:calc(100vw - 24px);
     box-shadow:0 8px 32px rgba(0,0,0,0.6);font-family:inherit;`;
 
   // Position tooltip relative to target or center
@@ -603,7 +623,7 @@ function startDemoTour(step) {
       tip.style.left = `${rect.right + PAD}px`;
     } else {  // bottom
       tip.style.top = `${Math.min(rect.bottom + PAD, window.innerHeight - 200)}px`;
-      tip.style.left = `${Math.max(8, Math.min(rect.left, window.innerWidth - 288))}px`;
+      tip.style.left = `${Math.max(8, Math.min(rect.left, window.innerWidth - 342))}px`;
     }
   }
 
@@ -645,12 +665,26 @@ async function api(path, opts={}) {
   return r.status === 204 ? null : r.json();
 }
 
+const _staleProjectsHandled = new Set();
+
 async function projectApi(projectId, path, opts={}) {
   try {
     const data = await api(path, opts);
     clearProjectLoadError(projectId, path);
     return data;
   } catch (e) {
+    // Self-heal stale tabs: a "project not found" 404 for a project that isn't
+    // in the current account's project list means the signed-in account changed
+    // (often in another tab). Close the orphaned tab and prompt a refresh once,
+    // instead of spamming every panel with 404s until the user reloads.
+    if (e && e.status === 404 && /project not found/i.test(e.responseText || '')
+        && !(state.projects || []).some(p => p.id === projectId)
+        && !_staleProjectsHandled.has(projectId)) {
+      _staleProjectsHandled.add(projectId);
+      try { closeTab(projectId); } catch (_) {}
+      try { _checkAccountSwitch(); } catch (_) {}
+      throw e;
+    }
     recordProjectLoadError(projectId, path, e);
     throw e;
   }
@@ -694,6 +728,9 @@ async function loadServerConfig() {
       state.tenantEmail = me.email || '';
       state.tenantHasStripe = !!me.has_stripe_customer;
       state.tenantIsInternal = !!me.is_internal;
+      state.tenantDaysRemaining = me.days_remaining;
+      state.tenantExpired = !!me.expired;
+      state.tenantExpiresAt = me.inactivity_expires_at || null;
       _renderPlanBadge(me);
       updateGitHubConnectionIndicator(me);
       _armAccountSwitchWatch(me.email || '');
@@ -3079,7 +3116,7 @@ function _renderTimelineHeatmap(projectId, data, paneEl) {
   let selClients = loadSel('clients', allClients);
   const clientOK = (s) => selClients.size === allClients.length || selClients.has(s.client || '(none)');
 
-  const CELL = 14;
+  const CELL = 16;
   const CAL_TOP = 28;
   const CAL_H = CELL * 7 + 34;   // 7 weekday rows + month/label gutters
   const ROW_GAP = 18;
@@ -3151,7 +3188,8 @@ function _renderTimelineHeatmap(projectId, data, paneEl) {
           show: true,
           color: '#0b1220',
           fontFamily: 'IBM Plex Mono',
-          fontSize: 8,
+          fontSize: 10,
+          fontWeight: 'bold',
           formatter: (p) => {
             const v = p.value && p.value[0];
             if (!v) return '';
@@ -3833,14 +3871,33 @@ async function loadSettingsTab(projectId) {
     const billingBtn = showBilling
       ? `<a href="${billingHref}" class="primary" style="padding:4px 10px;font-size:10px;text-decoration:none;background:var(--accent);color:#001020;border-radius:4px;font-weight:600">${escapeHtml(billingLabel)}</a>`
       : '';
+    // Trial / free-tier expiry line + resubscribe affordance. Only relevant to
+    // plans with an inactivity expiry (free / trial); admin/internal/paid skip it.
+    const days = state.tenantDaysRemaining;
+    const expiresAt = state.tenantExpiresAt;
+    const isTrialish = (plan === 'free' || plan === 'trial') && !state.tenantIsInternal;
+    let expiryLine = '';
+    let resubBtn = '';
+    if (isTrialish && (expiresAt || days != null || state.tenantExpired)) {
+      const dateStr = expiresAt ? String(expiresAt).slice(0, 10) : '';
+      if (state.tenantExpired) {
+        expiryLine = `<div style="color:#f87171">${plan === 'trial' ? 'Trial' : 'Free tier'} expired${dateStr ? ` on ${escapeHtml(dateStr)}` : ''}.</div>`;
+      } else {
+        const dleft = (days != null) ? `${days} day${days === 1 ? '' : 's'} left` : '';
+        expiryLine = `<div>${plan === 'trial' ? 'Trial' : 'Free tier'} expires${dateStr ? ` on <span style="color:var(--text)">${escapeHtml(dateStr)}</span>` : ''}${dleft ? ` <span style="color:var(--muted)">(${dleft})</span>` : ''}.</div>`;
+      }
+      const payLink = state.serverConfig?.stripe_payment_link || '/pricing';
+      resubBtn = `<a href="${escapeHtml(payLink)}" class="primary" style="padding:4px 10px;font-size:10px;text-decoration:none;background:var(--accent);color:#001020;border-radius:4px;font-weight:600">${state.tenantExpired ? 'Resubscribe' : 'Upgrade to Standard'}</a>`;
+    }
     html += `<div data-demo-hide style="margin-bottom:14px;padding:10px 12px;border:1px solid var(--border);border-radius:6px;background:var(--surface-2)">
       <div style="font-weight:600;font-size:11px;color:var(--text);margin-bottom:6px">Account</div>
       <div style="font-size:10px;color:var(--muted);line-height:1.7">
         <div>Email: <span style="color:var(--text)">${escapeHtml(state.tenantEmail)}</span></div>
         <div>Plan: <span style="color:var(--text);text-transform:capitalize">${escapeHtml(plan)}</span></div>
+        ${expiryLine}
       </div>
       <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:8px">
-        ${billingBtn}
+        ${resubBtn || billingBtn}
         <a href="/auth/logout" class="secondary" style="padding:4px 10px;font-size:10px;text-decoration:none;background:var(--surface-1);color:var(--text);border:1px solid var(--border);border-radius:4px">Sign out</a>
         <button id="account-delete-${projectId}" class="secondary" style="padding:4px 10px;font-size:10px;background:var(--surface-1);color:#f87171;border:1px solid #f8717155;border-radius:4px;cursor:pointer">Delete account…</button>
       </div>
@@ -4703,10 +4760,10 @@ async function loadSettingsTab(projectId) {
       <button class="secondary" id="ntfy-test-${projectId}" style="padding:4px 10px;font-size:10px" title="Send a test notification to verify your URL">Test</button>
       <span id="ntfy-status-${projectId}" style="font-size:10px;color:var(--muted);min-width:40px"></span>
     </div>
-    <div style="font-size:9px;color:var(--muted);margin-top:4px">
-      <strong>ntfy:</strong> install the ntfy app on iOS/Android/desktop, then enter just a topic name (we add <code>https://ntfy.sh/</code> for you) or paste a full URL.
-      <strong>Email:</strong> enter your email — Meridian sends via Resend (hosted only).
-      <strong>Webhook:</strong> any <code>https://</code> URL receives a JSON POST.
+    <div style="font-size:9px;color:var(--muted);margin-top:4px;line-height:1.6">
+      <strong>ntfy</strong> — install the ntfy app (iOS / Android / desktop), pick any topic name, and type it here. The <code>https://ntfy.sh/</code> prefix is added for you.<br>
+      <strong>Email</strong> — enter your address to get alerts by email (hosted only).<br>
+      <strong>Webhook</strong> — paste any <code>https://</code> URL (Slack, Discord, or your own) to receive a JSON POST.
     </div>
   </div>`;
 
@@ -7162,6 +7219,7 @@ async function restoreTabs() {
   if (isDemoMode()) hideDemoAdminControls();
   if (isHostedMode()) hideHostedAdminControls();
   showLocalServerControls();
+  ensureTourButton();
   // v0.6.6 — EZ first-run wizard: if no projects exist, show the overlay
   // Skip in demo mode — demo DB always has projects seeded.
   if (state.projects.length === 0 && !isDemoMode()) {

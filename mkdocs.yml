@@ -5,6 +5,12 @@ repo_url: https://github.com/meridianmcp/Meridian
 repo_name: meridianmcp/Meridian
 edit_uri: edit/main/docs/
 
+# Internal operator runbooks live in docs/ for convenience but must NOT be
+# published — they describe hosted-infra capacity strategy and provisioning.
+exclude_docs: |
+  fly-scaling.md
+  backup-runbook.md
+
 theme:
   name: material
   palette:

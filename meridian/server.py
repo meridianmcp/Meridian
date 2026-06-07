@@ -4000,7 +4000,12 @@ async def export_my_data(request: Request) -> Response:
         )
     from .hosted import get_current_tenant
     tenant = await get_current_tenant(request)
-    data = await db_module.export_tenant_data(request.app.state.db, tenant["id"])
+    # Account rows (tenant/tokens/members) live in the auth DB; the tenant's
+    # project data lives in its own per-tenant DB. Pass both so the export
+    # actually contains projects (hosted mode previously exported empty arrays).
+    data = await db_module.export_tenant_data(
+        request.app.state.db, tenant["id"], project_db=await _db(request),
+    )
     payload = json.dumps(data, indent=2, default=str).encode()
     email_slug = (tenant.get("email") or "user").split("@")[0][:20]
     filename = f"meridian-export-{email_slug}.json"
