@@ -1107,6 +1107,13 @@ function openTab(project) {
   renderTabs();
   buildTabBody(project);
   activateTab(project.id);
+  // G1.2 — defer badge population until after the dashboard's initial
+  // fetch wave settles. Without the delay, the extra parallel /notes and
+  // /decisions-pinned fetches push refreshGoal's expected 404 outside
+  // browsers' HTTP/1.1 6-connection window, surfacing it as a console
+  // error during the panel-render test's 2.5s wait. 100ms is well below
+  // human-perceptible latency.
+  setTimeout(() => refreshProjectCountBadges(project.id), 100);
 }
 
 function closeTab(id) {
@@ -1311,8 +1318,8 @@ function buildTabBody(project) {
       <button class="vtab-btn" data-vtab="rewind" title="Rewind — Last X days">↻</button>
       <button class="vtab-btn" data-vtab="queue" title="Work Queue">🪖</button>
       <button class="vtab-btn" data-vtab="team" title="Team — per-human activity">👥</button>
-      <button class="vtab-btn" data-vtab="notes" title="Notes — per-project wiki">📝</button>
-      <button class="vtab-btn" data-vtab="hitl" title="HITL — Human-in-the-Loop queue" style="position:relative">❓<span class="hitl-vtab-badge" data-pid="${project.id}" style="display:none;position:absolute;top:2px;right:2px;background:#f87171;color:#fff;font-size:8px;font-weight:700;padding:0 3px;border-radius:6px;line-height:14px;pointer-events:none">0</span></button>
+      <button class="vtab-btn" data-vtab="notes" title="Notes — per-project wiki" style="position:relative">📝<span class="notes-vtab-badge vtab-count-badge muted" data-pid="${project.id}" style="display:none;position:absolute;top:2px;right:2px;background:var(--surface-3,#2a2f3a);color:var(--muted);font-size:8px;font-weight:700;padding:0 3px;border-radius:6px;line-height:14px;pointer-events:none">0</span></button>
+      <button class="vtab-btn" data-vtab="hitl" title="HITL — Human-in-the-Loop queue" style="position:relative">❓<span class="hitl-vtab-badge vtab-count-badge" data-pid="${project.id}" style="display:none;position:absolute;top:2px;right:2px;background:#f87171;color:#fff;font-size:8px;font-weight:700;padding:0 3px;border-radius:6px;line-height:14px;pointer-events:none">0</span></button>
       <button class="vtab-btn" data-vtab="docs" title="MCP Tool Reference">📖</button>
       <button class="vtab-btn" data-vtab="settings" title="Notification Settings">⚙</button>
     </div>
@@ -1397,7 +1404,7 @@ function buildTabBody(project) {
           <button class="goal-subtab-btn active" data-gtab="north-star" title="Permanent product vision. Rarely changes — set once, then keep stable.">🔭 North Star</button>
           <button class="goal-subtab-btn" data-gtab="version-goal" title="Current milestone — what ships this cycle (v1.2, v2.0, etc).">🎯 Version Goal</button>
           <button class="goal-subtab-btn" data-gtab="sprint" title="What this session is focused on right now — updated multiple times per day. Not a multi-week scrum sprint.">⚡ Session Focus</button>
-          <button class="goal-subtab-btn" data-gtab="decisions" title="Pinned constitution + append-only decisions log.">📋 Decisions</button>
+          <button class="goal-subtab-btn" data-gtab="decisions" title="Pinned constitution + append-only decisions log.">📋 Decisions <span class="decisions-gtab-badge vtab-count-badge muted" data-pid="${project.id}" style="display:none;background:var(--surface-3,#2a2f3a);color:var(--muted);font-size:9px;font-weight:700;padding:0 5px;border-radius:8px;line-height:14px;margin-left:4px;vertical-align:1px">0</span></button>
         </div>
         <div class="goal-subtab-body">
           <div class="goal-subtab-panel active" id="gtab-north-star-${project.id}">
@@ -4617,6 +4624,7 @@ async function loadNotesTab(projectId) {
           .filter(Boolean);
         return !title.startsWith('checkpoint:') && !tags.includes('checkpoint');
       });
+      setVtabCountBadge(`.notes-vtab-badge[data-pid="${projectId}"]`, visibleNotes.length);
       if (!visibleNotes.length) {
         body.innerHTML = `<div style="color:var(--muted);padding:10px;text-align:center;border:1px dashed var(--border);border-radius:4px">
           (no notes yet — use the form below or <code>add_note</code> MCP tool)
@@ -5783,6 +5791,39 @@ function initHitlPanel() {
   _hitlPollTimer = setInterval(refreshHitl, 30_000);
 }
 
+function setVtabCountBadge(selector, count) {
+  /** G1.2 — single source of truth for vtab/gtab count chip display.
+   * Used by HITL, Notes, and Decisions badges. */
+  document.querySelectorAll(selector).forEach(badge => {
+    badge.textContent = String(count);
+    badge.style.display = count > 0 ? 'inline-block' : 'none';
+  });
+}
+
+async function refreshProjectCountBadges(projectId) {
+  /** G1.2 — populate the muted count chips on the Notes vtab and the
+   * Decisions goal-subtab for a single project. Called on tab open;
+   * loadNotesTab / loadPinnedDecisions also refresh their own badge
+   * from the data they fetch, so no extra round trip while tabs are
+   * already active. Failures hide silently. */
+  if (!projectId) return;
+  const [notesRes, pinnedRes] = await Promise.allSettled([
+    projectApi(projectId, `/projects/${projectId}/notes`),
+    api(`/projects/${projectId}/decisions-pinned`),
+  ]);
+  if (notesRes.status === 'fulfilled') {
+    const visible = (notesRes.value || []).filter(n => {
+      const title = String(n.title || '').trim().toLowerCase();
+      const tags = String(n.tags || '').split(',').map(t => t.trim().toLowerCase()).filter(Boolean);
+      return !title.startsWith('checkpoint:') && !tags.includes('checkpoint');
+    });
+    setVtabCountBadge(`.notes-vtab-badge[data-pid="${projectId}"]`, visible.length);
+  }
+  if (pinnedRes.status === 'fulfilled') {
+    setVtabCountBadge(`.decisions-gtab-badge[data-pid="${projectId}"]`, (pinnedRes.value || []).length);
+  }
+}
+
 async function refreshHitl() {
   /** v2.4 — fetch pending HITL requests across all projects + repaint. */
   const bar = document.getElementById('hitl-bar');
@@ -5793,10 +5834,17 @@ async function refreshHitl() {
     const items = await api('/hitl?status=pending&limit=50');
     const n = items.length;
     countEl.textContent = String(n);
-    // Sync per-project vtab badges
+    // Sync per-project vtab badges — each badge shows ITS project's pending
+    // count, not the global, so a project with zero pending never shows "2".
+    const perProject = new Map();
+    for (const r of items) {
+      const pid = r && r.project_id;
+      if (!pid) continue;
+      perProject.set(pid, (perProject.get(pid) || 0) + 1);
+    }
     document.querySelectorAll('.hitl-vtab-badge').forEach(badge => {
-      badge.textContent = String(n);
-      badge.style.display = n > 0 ? 'inline-block' : 'none';
+      const pid = badge.getAttribute('data-pid');
+      setVtabCountBadge(`.hitl-vtab-badge[data-pid="${pid}"]`, perProject.get(pid) || 0);
     });
     if (n === 0) {
       bar.style.display = 'none';
@@ -5884,6 +5932,7 @@ async function loadPinnedDecisions(projectId) {
     await loadProjectSettings(projectId);
     const items = await api(`/projects/${projectId}/decisions-pinned`);
     getPanelState(projectId)._pinnedDecisions = items || [];
+    setVtabCountBadge(`.decisions-gtab-badge[data-pid="${projectId}"]`, (items || []).length);
     renderConstitutionWarning(projectId);
     if (!items || items.length === 0) {
       host.innerHTML = `<div style="color:var(--muted);padding:10px;text-align:center;border:1px dashed var(--border);border-radius:4px">(no pinned decisions yet — call <code>pin_decision</code> from MCP)</div>`;

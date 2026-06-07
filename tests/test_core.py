@@ -5616,6 +5616,28 @@ def test_landing_page_charset_and_emoji_survival(client):
     for moji in ("ðŸ", "â€”", "â€“", "â†’", "âœ", "âš¡"):
         assert moji not in body, f"mojibake sequence {moji!r} present in landing page"
 
+
+def test_global_hitl_endpoint_returns_project_id_per_row(client):
+    """G1.2 — the global /hitl endpoint must include project_id on each row
+    so the dashboard can group pending counts per-project. Without this,
+    every project vtab badge gets the same global total (the symptom
+    that surfaced: HITL badge shows 2 while THIS project's queue is empty)."""
+    p1 = client.post("/projects", json={"name": "g12-p1"}).json()
+    p2 = client.post("/projects", json={"name": "g12-p2"}).json()
+    r = client.post(f"/projects/{p2['id']}/hitl", json={"question": "p2 q1"})
+    assert r.status_code == 201
+    r = client.post(f"/projects/{p2['id']}/hitl", json={"question": "p2 q2"})
+    assert r.status_code == 201
+
+    rows = client.get("/hitl?status=pending&limit=50").json()
+    assert isinstance(rows, list)
+    pids = [r.get("project_id") for r in rows]
+    assert all(pid for pid in pids), f"every HITL row needs project_id, got {pids!r}"
+    grouped = {pid: pids.count(pid) for pid in set(pids)}
+    assert grouped.get(p2["id"]) == 2
+    assert grouped.get(p1["id"], 0) == 0
+
+
 # v2.4 — decisions_pinned (editable constitution)
 # ---------------------------------------------------------------------------
 
