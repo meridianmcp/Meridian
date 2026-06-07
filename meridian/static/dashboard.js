@@ -5043,14 +5043,14 @@ async function loadRecentSessions(projectId, sessions = null) {
         const safeCmd = escapeHtml(cmd);
         return `<div style="border:1px solid var(--border);border-radius:3px;padding:5px 8px;margin-bottom:4px;background:var(--surface-1)">
           <div style="display:flex;justify-content:space-between;align-items:center;gap:6px">
-            <span style="font-weight:600;font-size:10px;color:var(--text);font-family:var(--font-mono);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${name}</span>
+            <span style="font-weight:600;font-size:10px;color:var(--text);font-family:var(--font-mono);overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${escapeHtml(s.name || '')}">${name}</span>
             <div style="display:flex;gap:4px;align-items:center;flex-shrink:0">
               <span style="font-size:9px;color:var(--muted)">${escapeHtml(status)}${dt ? ` · ${escapeHtml(dt)}` : ''}</span>
               <button class="secondary resume-session-btn" data-cmd="${safeCmd}"
                 style="padding:1px 6px;font-size:9px" title="Copy start_session() to clipboard">Resume</button>
             </div>
           </div>
-          ${summary ? `<div style="font-size:9px;color:var(--muted);margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${summary}</div>` : ''}
+          ${summary ? `<div style="font-size:9px;color:var(--muted);margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="${escapeHtml(s.summary || s.last_summary || '')}">${summary}</div>` : ''}
         </div>`;
       }).join('')}`;
     el.querySelectorAll('.resume-session-btn').forEach(btn => {
@@ -5245,21 +5245,21 @@ function renderSearchResults(query, results) {
   };
   const taskRow = t => `<div style="border:1px solid var(--border);border-radius:3px;padding:5px 8px;margin-bottom:4px;background:var(--surface-2)">
     <div style="display:flex;justify-content:space-between;gap:6px">
-      <span style="font-size:11px;color:var(--text);font-family:var(--font-mono);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escapeHtml((t.description || '').slice(0, 100))}</span>
+      <span style="font-size:11px;color:var(--text);font-family:var(--font-mono);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${escapeHtml(t.description || '')}">${escapeHtml((t.description || '').slice(0, 100))}</span>
       <span style="font-size:9px;color:var(--muted);flex-shrink:0">${escapeHtml(t.status || '')}</span>
     </div>
   </div>`;
-  const noteRow = n => `<div style="border:1px solid var(--border);border-left:3px solid var(--accent);border-radius:0 3px 3px 0;padding:5px 8px;margin-bottom:4px;background:var(--surface-2)">
-    <div style="font-size:11px;font-weight:600;color:var(--accent)">${escapeHtml((n.title || '').slice(0, 80))}</div>
+  const noteRow = n => `<div style="border:1px solid var(--border);border-left:3px solid var(--accent);border-radius:0 3px 3px 0;padding:5px 8px;margin-bottom:4px;background:var(--surface-2)" title="${escapeHtml(n.body || '')}">
+    <div style="font-size:11px;font-weight:600;color:var(--accent)" title="${escapeHtml(n.title || '')}">${escapeHtml((n.title || '').slice(0, 80))}</div>
     <div style="font-size:10px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${escapeHtml((n.body || '').slice(0, 80))}</div>
   </div>`;
-  const decisionRow = d => `<div style="border:1px solid var(--border);border-left:3px solid var(--warning,#fa0);border-radius:0 3px 3px 0;padding:5px 8px;margin-bottom:4px;background:var(--surface-2)">
-    <div style="font-size:11px;font-weight:600;color:var(--text)">${escapeHtml((d.title || '').slice(0, 80))}</div>
+  const decisionRow = d => `<div style="border:1px solid var(--border);border-left:3px solid var(--warning,#fa0);border-radius:0 3px 3px 0;padding:5px 8px;margin-bottom:4px;background:var(--surface-2)" title="${escapeHtml(d.body || '')}">
+    <div style="font-size:11px;font-weight:600;color:var(--text)" title="${escapeHtml(d.title || '')}">${escapeHtml((d.title || '').slice(0, 80))}</div>
     <div style="font-size:10px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${escapeHtml((d.body || '').slice(0, 80))}</div>
   </div>`;
   const sprintRow = s => `<div style="border:1px solid var(--border);border-radius:3px;padding:5px 8px;margin-bottom:4px;background:var(--surface-2)">
     <div style="display:flex;justify-content:space-between;gap:6px">
-      <span style="font-size:11px;color:var(--text);font-family:var(--font-mono);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escapeHtml((s.title || '').slice(0, 100))}</span>
+      <span style="font-size:11px;color:var(--text);font-family:var(--font-mono);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${escapeHtml(s.title || '')}">${escapeHtml((s.title || '').slice(0, 100))}</span>
       <span style="font-size:9px;color:var(--muted);flex-shrink:0">${escapeHtml(s.version || '')} · ${escapeHtml(s.status || '')}</span>
     </div>
   </div>`;
@@ -6046,7 +6046,7 @@ async function loadPinnedDecisions(projectId) {
               return `<div style="background:var(--surface-1);border:1px solid var(--border);border-left:4px solid ${color}55;border-radius:4px;padding:8px 12px;margin-bottom:6px;opacity:0.6">
                 <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px">
                   <span style="display:inline-block;background:${color}11;color:${color}88;font-size:9px;font-weight:700;padding:1px 5px;border-radius:3px">${escapeHtml(cat)}</span>
-                  <span style="color:var(--muted);font-weight:600;font-size:11px;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escapeHtml(d.title || '')}</span>
+                  <span style="color:var(--muted);font-weight:600;font-size:11px;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${escapeHtml(d.title || '')}">${escapeHtml(d.title || '')}</span>
                   <span style="color:var(--muted);font-size:9px;flex-shrink:0">${escapeHtml(dateStr)}</span>
                   <span style="background:var(--surface-2);color:var(--muted);font-size:8px;font-weight:700;padding:1px 5px;border-radius:3px;letter-spacing:.04em;flex-shrink:0">SUPERSEDED</span>
                 </div>
@@ -7303,7 +7303,7 @@ function renderRewindGoals(projectId, data, history) {
       const raw = (v.version_goal || v.north_star || '').replace(/\s+/g, ' ').trim();
       const snippet = raw.length > 80 ? raw.slice(0, 79) + '…' : raw;
       return `<div style="border-left:2px solid var(--border);padding-left:8px;margin-bottom:4px">
-        <div style="cursor:pointer;user-select:none" onclick="toggleExpand('${id}')">
+        <div style="cursor:pointer;user-select:none" onclick="toggleExpand('${id}')" title="${escapeHtml(raw)}">
           <span style="color:var(--accent)">v${v.version}</span>
           <span style="color:var(--muted);font-size:10px"> · ${escapeHtml(v.created_at || '')}</span>
           <span> ${escapeHtml(snippet)}</span>
