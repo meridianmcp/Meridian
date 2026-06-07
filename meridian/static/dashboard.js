@@ -33,6 +33,12 @@ function hideHostedAdminControls() {
     document.querySelectorAll(sel).forEach(el => { el.style.display = 'none'; });
   });
 
+  // The server-controls row (restart/stop/check-updates) is entirely empty on
+  // hosted — every child is hidden above. Collapse the row itself so it doesn't
+  // leave a gap that pushes the account block to the bottom of the footer.
+  const ctrlRow = document.getElementById('server-controls-row');
+  if (ctrlRow) ctrlRow.style.display = 'none';
+
   const connInd = document.getElementById('connection-indicator');
   if (!isHostedAdmin()) {
     // Hide connection switcher / profile selector for normal hosted users —
@@ -689,6 +695,7 @@ async function loadServerConfig() {
       state.tenantHasStripe = !!me.has_stripe_customer;
       _renderPlanBadge(me);
       updateGitHubConnectionIndicator(me);
+      _armAccountSwitchWatch(me.email || '');
     }
   } catch (e) { /* not hosted or not logged in */ }
 }
@@ -770,6 +777,52 @@ function _renderPlanBadge(me) {
   // appears for all hosted users (incl. free tier) even before /me returns.
   // Here we just enrich the tooltip with the signed-in email if available.
   ensureSignOutLink(me.email);
+}
+
+// Detect when the active session belongs to a different account than the one
+// this page loaded as (e.g. the user signed into another account in a second
+// tab). Re-auth replaces the session cookie underneath the loaded page, so its
+// in-flight API calls would start 404ing against the wrong workspace. Rather
+// than let that happen silently, watch /me and prompt a refresh.
+function _armAccountSwitchWatch(loadedEmail) {
+  if (!isHostedMode()) return;
+  if (state._acctWatchArmed) return;
+  state._acctWatchArmed = true;
+  state.loadedAccountEmail = loadedEmail || '';
+  // Re-check when the tab regains focus (the common case: switch account in
+  // another tab, then come back) and on a slow interval as a backstop.
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') _checkAccountSwitch();
+  });
+  setInterval(_checkAccountSwitch, 60000);
+}
+
+async function _checkAccountSwitch() {
+  if (document.getElementById('account-switch-banner')) return; // already shown
+  let me;
+  try {
+    me = await api('/me');
+  } catch (_) {
+    return; // network blip or logged out entirely — don't false-alarm
+  }
+  const now = (me && me.email) || '';
+  const base = state.loadedAccountEmail || '';
+  if (now && base && now !== base) _showAccountSwitchBanner(now);
+}
+
+function _showAccountSwitchBanner(newEmail) {
+  if (document.getElementById('account-switch-banner')) return;
+  const b = document.createElement('div');
+  b.id = 'account-switch-banner';
+  b.style = 'position:fixed;top:0;left:0;right:0;z-index:10000;background:#b45309;color:#fff;text-align:center;padding:6px 12px;font-size:12px;font-family:inherit;letter-spacing:0.02em;display:flex;align-items:center;justify-content:center;gap:12px';
+  b.innerHTML =
+    `<span>You're now signed in as <strong>${escapeHtml(newEmail)}</strong> in another tab. ` +
+    `Refresh to load this account.</span>` +
+    `<button id="account-switch-refresh" style="background:#fff;color:#b45309;font-weight:700;border:none;text-decoration:none;padding:2px 12px;border-radius:4px;white-space:nowrap;cursor:pointer">Refresh</button>`;
+  document.body.prepend(b);
+  document.body.style.paddingTop = ((parseInt(document.body.style.paddingTop || '0', 10)) + 30) + 'px';
+  const btn = document.getElementById('account-switch-refresh');
+  if (btn) btn.onclick = () => location.reload();
 }
 
 // v1.9.x — show active DB connection in sidebar footer
@@ -2984,76 +3037,156 @@ function _renderTimelineHeatmap(projectId, data, paneEl) {
   const textPrimary = cssVar('--text', '#d8dde6');
   const textMuted = cssVar('--muted', '#9ba5b5');
 
-  // Distinct humans across all days; sorted so layout is stable.
-  const humanSet = new Set();
-  daily.forEach(d => Object.keys(d.humans || {}).forEach(h => humanSet.add(h)));
-  let humans = [...humanSet].sort();
-  const multi = humans.length > 1;
-  if (!multi) humans = ['__all__'];
+  // Canonical people + client apps drive the filter chips (items 30/31). Fall
+  // back to deriving them from the per-day session entries if the backend
+  // didn't send the top-level lists.
+  let allPeople = (data.people && data.people.slice()) || [];
+  let allClients = (data.clients && data.clients.slice()) || [];
+  if (!allPeople.length || !allClients.length) {
+    const ps = new Set(), cs = new Set();
+    daily.forEach(d => (d.sessions || []).forEach(s => {
+      ps.add(s.person || s.human || '(unknown)');
+      cs.add(s.client || '(none)');
+    }));
+    if (!allPeople.length) allPeople = [...ps].sort();
+    if (!allClients.length) allClients = [...cs].sort();
+  }
 
   const dates = daily.map(d => d.date).sort();
   const rangeStart = dates[0];
   const rangeEnd = dates[dates.length - 1];
 
-  // Per (human,day) detail so clicking a cell can show sessions for the
-  // right calendar row even in multi-human projects.
-  const detailByHumanDay = {};
-  daily.forEach(d => {
-    (d.sessions || []).forEach(s => {
-      const h = multi ? (s.human || '(unknown)') : '__all__';
-      const key = `${h}|${d.date}`;
-      (detailByHumanDay[key] = detailByHumanDay[key] || []).push(s);
-    });
-  });
+  // Filter selection, persisted per project. A stale/empty selection falls
+  // back to "all" so it can never blank the calendar.
+  const selKey = (k) => `meridian_tl_${k}_${projectId}`;
+  const loadSel = (k, all) => {
+    try {
+      const raw = JSON.parse(localStorage.getItem(selKey(k)) || 'null');
+      if (Array.isArray(raw)) {
+        const keep = raw.filter(x => all.includes(x));
+        if (keep.length) return new Set(keep);
+      }
+    } catch (_) {}
+    return new Set(all);
+  };
+  let selPeople = loadSel('people', allPeople);
+  let selClients = loadSel('clients', allClients);
+  const clientOK = (s) => selClients.size === allClients.length || selClients.has(s.client || '(none)');
 
   const CELL = 14;
   const CAL_TOP = 28;
   const CAL_H = CELL * 7 + 34;   // 7 weekday rows + month/label gutters
   const ROW_GAP = 18;
   const rowH = CAL_H + ROW_GAP;
-  const totalH = CAL_TOP + humans.length * rowH + 28;
 
-  const calendars = [];
-  const series = [];
-  const titles = [];
-  humans.forEach((h, i) => {
-    const top = CAL_TOP + i * rowH;
-    calendars.push({
-      top: top,
-      left: multi ? 120 : 40,
-      right: 12,
-      cellSize: [CELL, CELL],
-      range: rangeStart === rangeEnd ? rangeStart : [rangeStart, rangeEnd],
-      splitLine: { show: true, lineStyle: { color: borderCol, type: 'dashed', width: 1 } },
-      itemStyle: { color: emptyColor, borderColor: '#0d1b2e', borderWidth: 1 },
-      yearLabel: { show: false },
-      monthLabel: { color: textPrimary, fontFamily: 'IBM Plex Mono', fontSize: 13, fontWeight: 'bold' },
-      dayLabel: { color: textMuted, fontFamily: 'IBM Plex Mono', fontSize: 10, firstDay: 1 },
-    });
-    if (multi) {
-      titles.push({
-        text: h.length > 16 ? h.slice(0, 15) + '…' : h,
-        left: 6,
-        top: top + CAL_H / 2 - 6,
-        textStyle: { color: _colorForHuman(h === '(unknown)' ? '' : h), fontFamily: 'IBM Plex Mono', fontSize: 10, fontWeight: 'bold' },
+  // Per (rowKey,day) detail so clicking a cell shows that row's sessions.
+  let detailByPersonDay = {};
+
+  // Recompute calendars/series/titles for the current person+client selection.
+  // One calendar row per selected person; a single selected person (or a
+  // single-person project) renders one unlabeled calendar.
+  function computeView() {
+    let rows = allPeople.filter(p => selPeople.has(p));
+    if (!rows.length) rows = allPeople.slice();
+    const multi = rows.length > 1;
+    const rowKeys = multi ? rows : ['__all__'];
+
+    detailByPersonDay = {};
+    const countByKeyDay = {};
+    daily.forEach(d => {
+      (d.sessions || []).forEach(s => {
+        if (!clientOK(s)) return;
+        const person = s.person || s.human || '(unknown)';
+        if (!selPeople.has(person)) return;
+        const key = multi ? person : '__all__';
+        countByKeyDay[`${key}|${d.date}`] = (countByKeyDay[`${key}|${d.date}`] || 0) + s.count;
+        (detailByPersonDay[`${key}|${d.date}`] = detailByPersonDay[`${key}|${d.date}`] || []).push(s);
       });
-    }
-    const pts = daily.map(d => {
-      const count = multi ? (d.humans && d.humans[h]) || 0 : d.count;
-      const dayDetail = detailByHumanDay[`${h}|${d.date}`] || [];
-      const scount = new Set(dayDetail.map(s => s.session_id)).size;
-      return { value: [d.date, count], scount: scount, human: h };
-    }).filter(pt => pt.value[1] > 0);
-    series.push({
-      type: 'heatmap',
-      coordinateSystem: 'calendar',
-      calendarIndex: i,
-      data: pts,
     });
-  });
+
+    const calendars = [], series = [], titles = [];
+    rowKeys.forEach((rk, i) => {
+      const top = CAL_TOP + i * rowH;
+      calendars.push({
+        top: top,
+        left: multi ? 120 : 40,
+        right: 12,
+        cellSize: [CELL, CELL],
+        range: rangeStart === rangeEnd ? rangeStart : [rangeStart, rangeEnd],
+        splitLine: { show: true, lineStyle: { color: borderCol, type: 'dashed', width: 1 } },
+        itemStyle: { color: emptyColor, borderColor: '#0d1b2e', borderWidth: 1 },
+        yearLabel: { show: false },
+        monthLabel: { color: textPrimary, fontFamily: 'IBM Plex Mono', fontSize: 13, fontWeight: 'bold' },
+        dayLabel: { color: textMuted, fontFamily: 'IBM Plex Mono', fontSize: 10, firstDay: 1 },
+      });
+      if (multi) {
+        titles.push({
+          text: rk.length > 16 ? rk.slice(0, 15) + '…' : rk,
+          left: 6,
+          top: top + CAL_H / 2 - 6,
+          textStyle: { color: _colorForHuman(rk === '(unknown)' ? '' : rk), fontFamily: 'IBM Plex Mono', fontSize: 10, fontWeight: 'bold' },
+        });
+      }
+      const pts = daily.map(d => {
+        const count = countByKeyDay[`${rk}|${d.date}`] || 0;
+        const dayDetail = detailByPersonDay[`${rk}|${d.date}`] || [];
+        const scount = new Set(dayDetail.map(s => s.session_id)).size;
+        return { value: [d.date, count], scount: scount, person: rk };
+      }).filter(pt => pt.value[1] > 0);
+      series.push({
+        type: 'heatmap',
+        coordinateSystem: 'calendar',
+        calendarIndex: i,
+        data: pts,
+      });
+    });
+    const totalH = CAL_TOP + rowKeys.length * rowH + 28;
+    return { calendars, series, titles, totalH };
+  }
+
+  let { calendars, series, titles, totalH } = computeView();
 
   paneEl.innerHTML = '';
   let scaleMax = _heatmapMaxFor(projectId);
+
+  // Person + client filter chips. Hidden when there's nothing to filter
+  // (single person, single client). applyFilters is reassigned after the chart
+  // is created; the chip handlers close over it.
+  let applyFilters = () => {};
+  if (allPeople.length > 1 || allClients.length > 1) {
+    const bar = document.createElement('div');
+    bar.className = 'tl-filter-bar';
+    bar.style.cssText = 'display:flex;flex-wrap:wrap;align-items:center;gap:5px;padding:0 4px 8px;font-size:10px;font-family:IBM Plex Mono,monospace;color:var(--muted)';
+    paneEl.appendChild(bar);
+    const mkChip = (text, active, fn) => {
+      const c = document.createElement('button');
+      c.textContent = text;
+      c.style.cssText = `padding:1px 8px;border-radius:10px;cursor:pointer;font-size:10px;font-family:inherit;border:1px solid var(--border);background:${active ? 'var(--accent)22' : 'transparent'};color:${active ? 'var(--accent)' : 'var(--muted)'}`;
+      c.onclick = fn;
+      return c;
+    };
+    const toggle = (sel, all, key, x) => {
+      if (x === '__all__') sel = new Set(all);
+      else { sel.has(x) ? sel.delete(x) : sel.add(x); if (!sel.size) sel = new Set(all); }
+      localStorage.setItem(selKey(key), JSON.stringify([...sel]));
+      return sel;
+    };
+    const rebuildBar = () => {
+      bar.innerHTML = '';
+      if (allPeople.length > 1) {
+        const lab = document.createElement('span'); lab.textContent = 'People:'; lab.style.cssText = 'opacity:0.8'; bar.appendChild(lab);
+        bar.appendChild(mkChip('All', selPeople.size === allPeople.length, () => { selPeople = toggle(selPeople, allPeople, 'people', '__all__'); rebuildBar(); applyFilters(); }));
+        allPeople.forEach(p => bar.appendChild(mkChip(p.length > 18 ? p.slice(0, 17) + '…' : p, selPeople.has(p), () => { selPeople = toggle(selPeople, allPeople, 'people', p); rebuildBar(); applyFilters(); })));
+      }
+      if (allClients.length > 1) {
+        if (allPeople.length > 1) { const sep = document.createElement('span'); sep.textContent = '·'; sep.style.cssText = 'opacity:0.4;margin:0 3px'; bar.appendChild(sep); }
+        const lab = document.createElement('span'); lab.textContent = 'Client:'; lab.style.cssText = 'opacity:0.8'; bar.appendChild(lab);
+        bar.appendChild(mkChip('All', selClients.size === allClients.length, () => { selClients = toggle(selClients, allClients, 'clients', '__all__'); rebuildBar(); applyFilters(); }));
+        allClients.forEach(c => bar.appendChild(mkChip(c, selClients.has(c), () => { selClients = toggle(selClients, allClients, 'clients', c); rebuildBar(); applyFilters(); })));
+      }
+    };
+    rebuildBar();
+  }
 
   const ctrl = document.createElement('div');
   ctrl.style.cssText = 'display:flex;align-items:center;gap:8px;justify-content:flex-end;padding:0 4px 6px;font-size:11px;color:var(--muted);font-family:IBM Plex Mono,monospace';
@@ -3115,24 +3248,27 @@ function _renderTimelineHeatmap(projectId, data, paneEl) {
     series: series,
   });
 
-  const renderDetail = (human, date) => {
-    const list = detailByHumanDay[`${human}|${date}`] || [];
+  const renderDetail = (person, date) => {
+    const list = detailByPersonDay[`${person}|${date}`] || [];
     if (!list.length) {
       detailBox.innerHTML = `<span style="color:var(--muted)">${escapeHtml(date)} — no sessions</span>`;
       return;
     }
     const total = list.reduce((a, s) => a + s.count, 0);
-    const rows = list.map(s =>
-      `<div class="tl-heat-sess"><span class="tl-heat-sess-name">${escapeHtml(s.name || '(unknown)')}</span>` +
-      `<span class="tl-heat-sess-count">${s.count} task${s.count === 1 ? '' : 's'}</span></div>`
-    ).join('');
+    const rows = list.map(s => {
+      const cli = s.client && s.client !== '(none)'
+        ? `<span class="tl-heat-sess-client">${escapeHtml(s.client)}</span>` : '';
+      return `<div class="tl-heat-sess"><span class="tl-heat-sess-name">${escapeHtml(s.name || '(unknown)')}</span>` +
+        cli +
+        `<span class="tl-heat-sess-count">${s.count} task${s.count === 1 ? '' : 's'}</span></div>`;
+    }).join('');
     detailBox.innerHTML =
-      `<div class="tl-heat-detail-head">${escapeHtml(date)} · ${total} task${total === 1 ? '' : 's'} · ${list.length} session${list.length === 1 ? '' : 's'}</div>${rows}`;
+      `<div class="tl-heat-detail-head">${escapeHtml(person)} · ${escapeHtml(date)} · ${total} task${total === 1 ? '' : 's'} · ${list.length} session${list.length === 1 ? '' : 's'}</div>${rows}`;
   };
 
   chart.on('click', params => {
     if (params.componentType !== 'series' || !params.data || !params.data.value) return;
-    renderDetail(params.data.human, params.data.value[0]);
+    renderDetail(params.data.person, params.data.value[0]);
   });
 
   slider.addEventListener('input', () => {
@@ -3144,6 +3280,18 @@ function _renderTimelineHeatmap(projectId, data, paneEl) {
 
   const pnl = state.panels[projectId];
   if (pnl) pnl._heatchart = chart;
+
+  applyFilters = () => {
+    ({ calendars, series, titles, totalH } = computeView());
+    container.style.height = `${totalH}px`;
+    container.style.minHeight = `${totalH}px`;
+    chart.setOption(
+      { title: titles, calendar: calendars, series: series },
+      { replaceMerge: ['calendar', 'series', 'title'] }
+    );
+    try { chart.resize(); } catch (_) {}
+  };
+
   try { new ResizeObserver(() => { try { chart.resize(); } catch (_) {} }).observe(container); } catch (_) {}
 }
 

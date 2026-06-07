@@ -2371,6 +2371,8 @@ async def get_timeline_endpoint(
         "sessions": [],
         "goal_events": timeline.get("goal_events", []),
         "daily_counts": timeline.get("daily_counts", []),
+        "people": timeline.get("people", []),
+        "clients": timeline.get("clients", []),
     }
 
 

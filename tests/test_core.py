@@ -4050,6 +4050,84 @@ async def test_timeline_daily_counts_counts_all_statuses(db):
     assert timeline["daily_counts"][0]["count"] == 2
 
 
+def test_canonical_person_aliases():
+    """Known human_id aliases collapse to one canonical identity; emails pass
+    through lowercased; blanks map to (unknown)."""
+    cp = db_module.canonical_person
+    assert cp("adam") == "adam"
+    assert cp("Adam Camerer") == "adam"
+    assert cp("AdamCamerer") == "adam"
+    assert cp("Adam Camerer (executor)") == "adam"
+    # Emails are canonical as-is (lowercased), never aliased.
+    assert cp("Ada@Example.com") == "ada@example.com"
+    # Empty / unknown sentinels.
+    assert cp(None) == "(unknown)"
+    assert cp("") == "(unknown)"
+    assert cp("  ") == "(unknown)"
+    assert cp("(unknown)") == "(unknown)"
+    assert cp("none") == "(unknown)"
+    # An unknown free-text id is preserved (lowercased), not dropped.
+    assert cp("Bri") == "bri"
+
+
+@pytest.mark.asyncio
+async def test_timeline_exposes_people_and_clients(db):
+    """get_timeline returns top-level canonical people + client lists for the
+    filter chips (items 30/31)."""
+    p = await db_module.create_project(db, "alpha")
+    s1 = await db_module.register_session(
+        db, p["id"], "sess-a", human_id="Adam Camerer", client_type="claude-code"
+    )
+    s2 = await db_module.register_session(
+        db, p["id"], "sess-b", human_id="bri", client_type="cursor"
+    )
+    await db_module.log_task(db, s1["id"], p["id"], "a", "done")
+    await db_module.log_task(db, s2["id"], p["id"], "b", "done")
+
+    timeline = await db_module.get_timeline(db, p["id"])
+    # "Adam Camerer" collapses to "adam"; people sorted.
+    assert timeline["people"] == ["adam", "bri"]
+    assert timeline["clients"] == ["claude-code", "cursor"]
+
+
+@pytest.mark.asyncio
+async def test_timeline_daily_sessions_carry_person_and_client(db):
+    """Per-day session entries expose canonical person + client app so the
+    frontend can filter without re-deriving identity."""
+    p = await db_module.create_project(db, "alpha")
+    s = await db_module.register_session(
+        db, p["id"], "sess-a", human_id="Adam Camerer", client_type="claude-code"
+    )
+    await db_module.log_task(db, s["id"], p["id"], "task", "done")
+
+    timeline = await db_module.get_timeline(db, p["id"])
+    se = timeline["daily_counts"][0]["sessions"][0]
+    assert se["person"] == "adam"
+    assert se["client"] == "claude-code"
+    # daily bucket also carries a canonical people breakdown.
+    assert timeline["daily_counts"][0]["people"] == {"adam": 1}
+
+
+@pytest.mark.asyncio
+async def test_timeline_client_defaults_to_none(db):
+    """A session with no client_type reports client '(none)'."""
+    p = await db_module.create_project(db, "alpha")
+    s = await db_module.register_session(db, p["id"], "sess-a", human_id="adam")
+    await db_module.log_task(db, s["id"], p["id"], "task", "done")
+
+    timeline = await db_module.get_timeline(db, p["id"])
+    assert timeline["clients"] == ["(none)"]
+    assert timeline["daily_counts"][0]["sessions"][0]["client"] == "(none)"
+
+
+def test_timeline_endpoint_exposes_people_and_clients(client):
+    """The /timeline route surfaces people + clients lists."""
+    p = client.post("/projects", json={"name": "alpha-pc"}).json()
+    body = client.get(f"/projects/{p['id']}/timeline").json()
+    assert "people" in body and isinstance(body["people"], list)
+    assert "clients" in body and isinstance(body["clients"], list)
+
+
 def test_session_summary_schema_shape():
     """The JSON schema we hand to haiku has the four expected keys."""
     schema = db_module.SESSION_SUMMARY_SCHEMA

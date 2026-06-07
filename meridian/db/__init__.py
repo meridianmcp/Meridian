@@ -3735,6 +3735,35 @@ def compute_coherence_warning(
     }
 
 
+#: Free-text human_id aliases that refer to the same person. Collapsed to a
+#: single canonical identity so the timeline shows one calendar row per person
+#: instead of one per spelling. Keys are lowercased; extend as new aliases show
+#: up. (item 30 — identity unification.)
+_PERSON_ALIASES: dict[str, str] = {
+    "adam camerer": "adam",
+    "adamcamerer": "adam",
+    "adam camerer (executor)": "adam",
+}
+
+
+def canonical_person(human_id: str | None) -> str:
+    """Map a free-text ``human_id`` to a stable canonical identity.
+
+    Emails are already canonical (lowercased). Other values are lowercased,
+    trimmed, and run through :data:`_PERSON_ALIASES`. Empty / "(unknown)"
+    values collapse to a single ``"(unknown)"`` bucket.
+    """
+    if not human_id:
+        return "(unknown)"
+    raw = human_id.strip()
+    if not raw or raw.lower() in ("(unknown)", "unknown", "none"):
+        return "(unknown)"
+    key = raw.lower()
+    if "@" in key:
+        return key
+    return _PERSON_ALIASES.get(key, key)
+
+
 async def get_timeline(
     db: aiosqlite.Connection, project_id: str
 ) -> dict[str, Any]:
@@ -3752,7 +3781,8 @@ async def get_timeline(
     """
     async with db.execute(
         "SELECT t.id, t.created_at, t.status, t.description, "
-        "       t.session_id, s.name AS session_name, s.human_id "
+        "       t.session_id, s.name AS session_name, s.human_id, "
+        "       s.client_type "
         "FROM task_log t LEFT JOIN sessions s ON s.id = t.session_id "
         "WHERE t.project_id = ? "
         "ORDER BY t.created_at DESC, t.rowid DESC",
@@ -3768,6 +3798,8 @@ async def get_timeline(
             "session_id": r["session_id"],
             "session_name": r["session_name"] or "(unknown)",
             "human_id": r["human_id"],
+            "person": canonical_person(r["human_id"]),
+            "client": r["client_type"] or "(none)",
         }
         for r in task_rows
     ]
@@ -3843,18 +3875,25 @@ async def get_timeline(
     # (no DATE()/array_agg dialect differences). Date key = first 10 chars
     # of the stored UTC timestamp ("YYYY-MM-DD HH:MM:SS" → "YYYY-MM-DD").
     by_day: dict[str, dict[str, Any]] = {}
+    people_set: set[str] = set()
+    clients_set: set[str] = set()
     for r in task_rows:
         ts = r["created_at"] or ""
         day = ts[:10]
         if len(day) != 10:
             continue
         human = r["human_id"] or "(unknown)"
+        person = canonical_person(r["human_id"])
+        client = r["client_type"] or "(none)"
+        people_set.add(person)
+        clients_set.add(client)
         bucket = by_day.get(day)
         if bucket is None:
-            bucket = {"date": day, "count": 0, "humans": {}, "_sess": {}}
+            bucket = {"date": day, "count": 0, "humans": {}, "people": {}, "_sess": {}}
             by_day[day] = bucket
         bucket["count"] += 1
         bucket["humans"][human] = bucket["humans"].get(human, 0) + 1
+        bucket["people"][person] = bucket["people"].get(person, 0) + 1
         sid = r["session_id"] or "(none)"
         se = bucket["_sess"].get(sid)
         if se is None:
@@ -3862,6 +3901,8 @@ async def get_timeline(
                 "session_id": r["session_id"],
                 "name": r["session_name"] or "(unknown)",
                 "human": human,
+                "person": person,
+                "client": client,
                 "count": 0,
             }
             bucket["_sess"][sid] = se
@@ -3878,6 +3919,7 @@ async def get_timeline(
             "sessions": day_sessions,
             "session_count": len(day_sessions),
             "humans": b["humans"],
+            "people": b["people"],
         })
 
     return {
@@ -3885,6 +3927,8 @@ async def get_timeline(
         "sessions": sessions,
         "goal_events": goal_events,
         "daily_counts": daily_counts,
+        "people": sorted(people_set),
+        "clients": sorted(clients_set),
     }
 
 
