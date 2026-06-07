@@ -932,20 +932,20 @@ async def _migrate_pg_tenants_is_internal(conn: PostgresConnection) -> None:
     async with conn.execute(
         "SELECT data_type FROM information_schema.columns "
         "WHERE table_name = 'tenants' AND column_name = 'is_internal'",
-        None,
+        (),
     ) as cur:
         col = await cur.fetchone()
     if col and col["data_type"] == "boolean":
         await conn.execute(
-            "ALTER TABLE tenants ALTER COLUMN is_internal DROP DEFAULT", None
+            "ALTER TABLE tenants ALTER COLUMN is_internal DROP DEFAULT", ()
         )
         await conn.execute(
             "ALTER TABLE tenants ALTER COLUMN is_internal TYPE INTEGER "
             "USING (is_internal::integer)",
-            None,
+            (),
         )
         await conn.execute(
-            "ALTER TABLE tenants ALTER COLUMN is_internal SET DEFAULT 0", None
+            "ALTER TABLE tenants ALTER COLUMN is_internal SET DEFAULT 0", ()
         )
     # Backfill known internal emails.
     for email in sorted(db_module._internal_emails()):
