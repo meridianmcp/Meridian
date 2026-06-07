@@ -22,3 +22,24 @@
   font-size: 0.95rem;
   letter-spacing: 0.01em;
 }
+
+/* G6.23 — Nav link colors. Default mkdocs-material on slate is a muted
+   grey that's hard to scan; bump to a warm off-white. Active link goes
+   to pure white with the accent underline; hover gets a distinct
+   semi-bright treatment so the click target is obvious. */
+.md-tabs__link,
+.md-nav__link {
+  color: #f4ede0; /* warm off-white */
+}
+.md-tabs__link:hover,
+.md-nav__link:hover {
+  color: #ffe7c0; /* warmer, brighter on hover */
+}
+.md-tabs__link--active,
+.md-nav__item--active > .md-nav__link,
+.md-nav__link--active {
+  color: #ffffff;
+}
+.md-tabs__link--active {
+  border-bottom: 2px solid var(--md-accent-fg-color);
+}
