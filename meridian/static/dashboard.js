@@ -3368,7 +3368,11 @@ function normalizeNotifyTarget(raw) {
   return `https://ntfy.sh/${v}`;
 }
 
-// Suggest a hard-to-guess ntfy topic: {project-slug}-{6 random chars}.
+// G1.7 — Suggest the project slug as the ntfy topic. The server will
+// suffix with -2/-3/… if another project in this DB already uses it,
+// so we no longer need a client-side random tail. Note: ntfy topics
+// are publicly subscribable, so a guessable topic = anyone can listen.
+// Users who want stronger privacy can paste a longer, custom value.
 function suggestNtfyTopic(projectId) {
   const proj = (state.projects || []).find(p => p.id === projectId);
   const slug = (proj?.name || 'meridian')
@@ -3376,8 +3380,7 @@ function suggestNtfyTopic(projectId) {
     .replace(/[^a-z0-9]+/g, '-')
     .replace(/^-+|-+$/g, '')
     .slice(0, 24) || 'meridian';
-  const rand = Math.random().toString(36).slice(2, 8);
-  return `${slug}-${rand}`;
+  return slug;
 }
 
 async function loadSettingsTab(projectId) {
@@ -4439,16 +4442,24 @@ async function loadSettingsTab(projectId) {
     ntfySaveBtn.onclick = async () => {
       const inp = document.getElementById(`ntfy-url-${projectId}`);
       const statusEl = document.getElementById(`ntfy-status-${projectId}`);
-      const url = normalizeNotifyTarget(inp ? inp.value : '') || null;
-      // Reflect the normalized value back so the user sees the full URL we saved.
-      if (inp && url) inp.value = url;
+      // G1.7 — send the raw user input; the server canonicalizes ntfy
+      // entries to topic-only and suffixes for per-DB uniqueness. The
+      // response carries the saved value, which we reflect back into
+      // the field so the user sees what we actually stored.
+      const raw = (inp ? inp.value : '').trim() || null;
       try {
-        // send notify_url (canonical) and ntfy_url (legacy compat) — server accepts both
-        await api(`/projects/${projectId}/ntfy`, {
+        const saved = await api(`/projects/${projectId}/ntfy`, {
           method: 'PATCH',
-          body: JSON.stringify({ notify_url: url, ntfy_url: url }),
+          body: JSON.stringify({ notify_url: raw, ntfy_url: raw }),
         });
-        if (statusEl) { statusEl.textContent = 'saved'; setTimeout(() => { statusEl.textContent = ''; }, 2000); }
+        const savedVal = saved && (saved.notify_url || saved.ntfy_url || '');
+        if (inp) inp.value = savedVal || '';
+        if (statusEl) {
+          statusEl.textContent = savedVal && raw && savedVal.toLowerCase() !== String(raw).toLowerCase()
+            ? `saved as ${savedVal}`
+            : 'saved';
+          setTimeout(() => { statusEl.textContent = ''; }, 2400);
+        }
       } catch (e) {
         if (statusEl) statusEl.textContent = 'error';
       }

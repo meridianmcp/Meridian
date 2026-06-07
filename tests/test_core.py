@@ -5617,6 +5617,38 @@ def test_landing_page_charset_and_emoji_survival(client):
         assert moji not in body, f"mojibake sequence {moji!r} present in landing page"
 
 
+def test_canonicalize_notify_target_strips_ntfy_prefix():
+    """G1.7 — ntfy URLs collapse to topic-only; emails/webhooks pass through."""
+    from meridian.server import _canonicalize_notify_target
+
+    assert _canonicalize_notify_target("https://ntfy.sh/foo") == "foo"
+    assert _canonicalize_notify_target("https://ntfy.sh/foo/") == "foo"
+    assert _canonicalize_notify_target("ntfy.sh/foo") == "foo"
+    assert _canonicalize_notify_target("  foo  ") == "foo"
+    assert _canonicalize_notify_target("you@example.com") == "you@example.com"
+    assert _canonicalize_notify_target("https://hooks.slack.com/x/y") == "https://hooks.slack.com/x/y"
+    assert _canonicalize_notify_target("") is None
+    assert _canonicalize_notify_target(None) is None
+
+
+def test_patch_ntfy_canonicalizes_and_uniquifies(client):
+    """G1.7 — PATCH stores the topic only and suffixes -2 on collision."""
+    p1 = client.post("/projects", json={"name": "g17-p1"}).json()
+    p2 = client.post("/projects", json={"name": "g17-p2"}).json()
+
+    r = client.patch(f"/projects/{p1['id']}/ntfy", json={"notify_url": "https://ntfy.sh/sweep-alerts"})
+    assert r.status_code == 200
+    assert r.json()["notify_url"] == "sweep-alerts"
+
+    r = client.patch(f"/projects/{p2['id']}/ntfy", json={"notify_url": "sweep-alerts"})
+    assert r.status_code == 200
+    assert r.json()["notify_url"] == "sweep-alerts-2"
+
+    # Emails pass through unchanged
+    r = client.patch(f"/projects/{p1['id']}/ntfy", json={"notify_url": "ops@example.com"})
+    assert r.json()["notify_url"] == "ops@example.com"
+
+
 def test_global_hitl_endpoint_returns_project_id_per_row(client):
     """G1.2 — the global /hitl endpoint must include project_id on each row
     so the dashboard can group pending counts per-project. Without this,
@@ -6543,17 +6575,18 @@ def test_notify_url_patch_and_get(client, monkeypatch):
     assert r.status_code in (200, 201)
     pid = r.json()["id"]
 
-    # Save a URL via the canonical notify_url key
+    # Save a URL via the canonical notify_url key. As of G1.7, ntfy URLs are
+    # canonicalized to topic-only on save; the response echoes the stored form.
     r2 = client.patch(f"/projects/{pid}/ntfy", json={"notify_url": "https://ntfy.sh/test-123"})
     assert r2.status_code == 200
-    assert r2.json().get("notify_url") == "https://ntfy.sh/test-123" or \
-           r2.json().get("ntfy_url") == "https://ntfy.sh/test-123"
+    assert r2.json().get("notify_url") == "test-123" or \
+           r2.json().get("ntfy_url") == "test-123"
 
     # Confirm it's persisted
     r3 = client.get(f"/projects/{pid}/ntfy")
     assert r3.status_code == 200
     saved = r3.json().get("notify_url") or r3.json().get("ntfy_url")
-    assert saved == "https://ntfy.sh/test-123"
+    assert saved == "test-123"
 
 
 def test_notify_test_endpoint_no_url(client):

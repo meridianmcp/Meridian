@@ -1423,6 +1423,63 @@ async def get_project_ntfy(project_id: str, request: Request) -> dict[str, Any]:
     return {"ntfy_url": url or ""}
 
 
+def _canonicalize_notify_target(raw: str | None) -> str | None:
+    """G1.7 — normalize the notify target so ntfy entries are stored as the
+    topic path segment only, while emails and webhooks pass through.
+
+    Examples:
+      "https://ntfy.sh/foo"   -> "foo"
+      "https://ntfy.sh/foo/"  -> "foo"
+      "ntfy.sh/foo"           -> "foo"
+      "foo"                   -> "foo"
+      "you@example.com"       -> "you@example.com"
+      "https://hooks.slack.com/services/abc" -> "https://hooks.slack.com/services/abc"
+      ""                      -> None
+    """
+    if not raw:
+        return None
+    val = str(raw).strip()
+    if not val:
+        return None
+    # Email → pass through.
+    if "@" in val and "://" not in val:
+        return val
+    lower = val.lower()
+    for prefix in ("https://ntfy.sh/", "http://ntfy.sh/", "ntfy.sh/"):
+        if lower.startswith(prefix):
+            topic = val[len(prefix):].strip().strip("/")
+            return topic or None
+    # Any other URL with a scheme → webhook, pass through.
+    if "://" in val:
+        return val
+    # Bare token, no slashes → treat as ntfy topic.
+    return val.strip("/") or None
+
+
+async def _ensure_unique_ntfy_topic(
+    db: Any, project_id: str, topic: str
+) -> str:
+    """G1.7 — make sure ``topic`` is not already in use by another project in
+    this DB. Suffix with -2, -3, … until free. Returns the topic actually
+    used. Pure topic strings only; webhooks/emails skip this check upstream.
+    """
+    projects = await db_module.list_projects(db)
+    in_use = {
+        str(p.get("ntfy_url") or "").strip().lower()
+        for p in projects
+        if p.get("id") != project_id and p.get("ntfy_url")
+    }
+    base = topic
+    candidate = base
+    n = 2
+    while candidate.lower() in in_use:
+        candidate = f"{base}-{n}"
+        n += 1
+        if n > 999:
+            break
+    return candidate
+
+
 @app.patch("/projects/{project_id}/ntfy")
 async def set_project_ntfy(
     project_id: str, body: dict[str, Any], request: Request
@@ -1430,17 +1487,24 @@ async def set_project_ntfy(
     """Save (or clear) the notify URL for this project.
 
     Accepts ``notify_url`` (preferred) or ``ntfy_url`` (legacy) key.
-    After saving a non-empty URL, fires a welcome notification so ntfy.sh
-    topics are created on first publish (avoids 404 on first real alert).
+    ntfy entries are canonicalized to the topic path segment only and
+    suffixed with -2/-3/… if another project in this DB already uses
+    the same topic. Emails and non-ntfy webhooks pass through verbatim.
+
+    After saving a non-empty value, fires a welcome notification so
+    ntfy.sh topics are created on first publish (avoids 404 on first
+    real alert).
     """
     project = await db_module.get_project(await _db(request), project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="project not found")
     # Accept both the new canonical key and the legacy key for backwards compat
-    notify_url = (
-        str(body.get("notify_url") or body.get("ntfy_url") or "").strip() or None
-    )
+    raw_value = str(body.get("notify_url") or body.get("ntfy_url") or "").strip() or None
+    notify_url = _canonicalize_notify_target(raw_value)
     db = await _db(request)
+    if notify_url and "://" not in notify_url and "@" not in notify_url:
+        # bare topic → enforce per-DB uniqueness
+        notify_url = await _ensure_unique_ntfy_topic(db, project_id, notify_url)
     await db_module.set_project_ntfy_url(db, project_id, notify_url)
     if notify_url:
         # Fire a welcome notification immediately so ntfy.sh creates the topic
@@ -1637,6 +1701,11 @@ async def _notify_project(
         notify_url = await db_module.get_project_ntfy_url(db, project_id)
         if not notify_url:
             return
+        # G1.7 — stored ntfy values are topic-only; reconstruct the full URL
+        # at dispatch time. Anything else (email / non-ntfy webhook) is
+        # already in its dispatchable form.
+        if "://" not in notify_url and "@" not in notify_url:
+            notify_url = f"https://ntfy.sh/{notify_url}"
         await _dispatch_notification(notify_url, title, body_text, event)
     except Exception:  # noqa: BLE001
         pass  # never let notifications crash the main flow
