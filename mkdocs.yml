@@ -40,6 +40,7 @@ nav:
   - Hosted (usemeridian.us): hosted.md
   - Self-Hosting: self-hosting.md
   - Configuration: configuration.md
+  - Safety Limits: safety-limits.md
   - API Reference: api-reference.md
   - FAQ: faq.md
 
