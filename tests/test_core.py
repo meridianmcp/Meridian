@@ -1800,7 +1800,13 @@ def test_dashboard_html_has_relative_time_helper(client):
 
 def test_dashboard_auth_gate_in_hosted_mode(client, monkeypatch):
     """Hosted mode: unauthenticated /dashboard must redirect to /auth/login."""
+    from meridian import hosted as hosted_module
     monkeypatch.setenv("MERIDIAN_HOSTED", "true")
+    # Mock get_current_tenant to raise HTTPException (simulating missing auth)
+    async def mock_get_current_tenant(request):
+        from fastapi import HTTPException
+        raise HTTPException(status_code=401)
+    monkeypatch.setattr(hosted_module, "get_current_tenant", mock_get_current_tenant)
     r = client.get("/dashboard", follow_redirects=False)
     assert r.status_code == 302
     assert r.headers["location"] == "/auth/login"

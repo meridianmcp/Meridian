@@ -550,16 +550,24 @@ def test_free_tier_signout_visible_on_hosted_dashboard(client, monkeypatch):
     free tier. Fix: ensureSignOutLink() is called from hideHostedAdminControls,
     which runs unconditionally for any hosted user at init.
 
-    This test boots the server with MERIDIAN_HOSTED=true but no auth cookie, so
-    /me returns {}. The sign-out link must still render and be visible.
+    This test boots the server with MERIDIAN_HOSTED=true and a session cookie
+    so /me returns {}. The sign-out link must still render and be visible.
     """
     import threading
     import time
     import uvicorn
     from meridian import server as server_module
+    from meridian import hosted as hosted_module
     from playwright.sync_api import sync_playwright
 
     monkeypatch.setenv("MERIDIAN_HOSTED", "true")
+
+    # Mock get_current_tenant to accept the request and return a free-tier tenant
+    # so /me returns {} (no plan).
+    async def mock_get_current_tenant(request):
+        return {"email": "test@example.com", "id": "test-tenant-id"}
+
+    monkeypatch.setattr(hosted_module, "get_current_tenant", mock_get_current_tenant)
 
     with sync_playwright() as p:
         config = uvicorn.Config(server_module.app, host="127.0.0.1", port=17884, log_level="error")
