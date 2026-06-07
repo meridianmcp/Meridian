@@ -938,6 +938,61 @@ async def _body_size_guard_middleware(request: Request, call_next):
     return await call_next(request)
 
 
+def _tenant_marker_from_request(request: Request) -> str | None:
+    """Item 39 — lightweight tenant identifier for error context.
+
+    Returns a truncated cookie/token marker. No DB lookup — the alerting path
+    must stay synchronous-cheap so it never blocks request flow on Postgres.
+    """
+    cookie = request.cookies.get("meridian_session", "")
+    if cookie:
+        return f"session:{cookie[:12]}"
+    auth = request.headers.get("authorization", "")
+    if auth.startswith("Bearer "):
+        return f"token:{auth[7:19]}"
+    return None
+
+
+@app.middleware("http")
+async def _error_tracking_middleware(request: Request, call_next):
+    """Item 39 — log unhandled exceptions and feed the 5xx counter.
+
+    Wraps every request:
+      - If the route handler raises, log route+tenant+traceback, record the
+        synthetic 500 for the rolling window, and return a clean 500 envelope.
+      - If the response status >= 500, record it.
+
+    The recording is async-safe but the alert dispatch itself is fired off
+    via ``asyncio.create_task`` inside ``record_5xx`` so the response is never
+    delayed by ntfy/Resend I/O.
+    """
+    from . import error_alerting as _ea  # noqa: PLC0415
+    tenant = _tenant_marker_from_request(request)
+    route = request.url.path or "/"
+    try:
+        response = await call_next(request)
+    except Exception as exc:  # noqa: BLE001
+        import logging as _log  # noqa: PLC0415
+        import traceback as _tb  # noqa: PLC0415
+        _log.getLogger(__name__).error(
+            "unhandled %s on %s %s (tenant=%s)\n%s",
+            type(exc).__name__,
+            request.method,
+            route,
+            tenant,
+            _tb.format_exc(),
+        )
+        await _ea.record_5xx(route, tenant, 500)
+        from fastapi.responses import JSONResponse  # noqa: PLC0415
+        return JSONResponse(
+            status_code=500,
+            content={"error": "Internal server error"},
+        )
+    if response.status_code >= 500:
+        await _ea.record_5xx(route, tenant, response.status_code)
+    return response
+
+
 @app.middleware("http")
 async def _demo_read_only_middleware(request: Request, call_next):
     """Block all mutating requests when MERIDIAN_DEMO=true or demo cookie set.
@@ -963,6 +1018,28 @@ async def _demo_read_only_middleware(request: Request, call_next):
             media_type="application/json",
         )
     return await call_next(request)
+
+
+# ---------------------------------------------------------------------------
+# Item 39 — error alerting test endpoint
+# ---------------------------------------------------------------------------
+
+
+@app.get("/admin/__error_test")
+async def trigger_test_error(kind: str = "exception") -> Any:
+    """Force an error response to exercise the 5xx counter + admin alerting.
+
+    Gated by ``MERIDIAN_ENABLE_ERROR_TEST=1`` so it only exists on preview /
+    staging — never on prod. ``kind=exception`` (default) raises an unhandled
+    Exception so the middleware logs the traceback and synthesizes a 500.
+    ``kind=500`` returns a raw HTTPException(500) so the middleware records
+    the response status without going through the exception path.
+    """
+    if os.environ.get("MERIDIAN_ENABLE_ERROR_TEST", "").lower() not in ("1", "true", "yes"):
+        raise HTTPException(status_code=404)
+    if kind == "500":
+        raise HTTPException(status_code=500, detail="forced 500 for alert drill")
+    raise RuntimeError("forced unhandled exception for alert drill")
 
 
 # ---------------------------------------------------------------------------
@@ -2548,7 +2625,7 @@ async def dashboard_html(request: Request) -> Any:
             tenant = await get_current_tenant(request)
             is_admin = await is_admin_db(tenant.get("email", ""), request.app.state.db)
         except HTTPException:
-            is_admin = False
+            return RedirectResponse(url="/auth/login", status_code=302)
     response = _templates.TemplateResponse(
         request,
         "dashboard.html",

@@ -1798,6 +1798,14 @@ def test_dashboard_html_has_relative_time_helper(client):
     assert "formatRelativeTime" in js
 
 
+def test_dashboard_auth_gate_in_hosted_mode(client, monkeypatch):
+    """Hosted mode: unauthenticated /dashboard must redirect to /auth/login."""
+    monkeypatch.setenv("MERIDIAN_HOSTED", "true")
+    r = client.get("/dashboard", follow_redirects=False)
+    assert r.status_code == 302
+    assert r.headers["location"] == "/auth/login"
+
+
 # ---------------------------------------------------------------------------
 # v0.5.2 — structured goal hierarchy (north_star / version_goal / sprint)
 # ---------------------------------------------------------------------------
