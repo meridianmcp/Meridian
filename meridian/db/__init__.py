@@ -5883,6 +5883,26 @@ async def accept_workspace_invite(
     return _row_to_dict(row)
 
 
+async def workspace_member_accepted_for_email(
+    db: aiosqlite.Connection,
+    email: str,
+) -> dict[str, Any] | None:
+    """G5.22 — return an accepted workspace membership for ``email`` (joined,
+    not pending), or None. Used by the OAuth callback to skip auto-Neon
+    provisioning for invitees who already belong to someone else's workspace."""
+    e = (email or "").strip().lower()
+    if not e:
+        return None
+    async with db.execute(
+        "SELECT * FROM workspace_members "
+        "WHERE LOWER(email) = ? AND joined_at IS NOT NULL "
+        "ORDER BY joined_at DESC LIMIT 1",
+        (e,),
+    ) as cur:
+        row = await cur.fetchone()
+    return _row_to_dict(row)
+
+
 async def list_workspace_members(
     db: aiosqlite.Connection,
     tenant_id: str,

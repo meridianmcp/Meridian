@@ -5617,6 +5617,45 @@ def test_landing_page_charset_and_emoji_survival(client):
         assert moji not in body, f"mojibake sequence {moji!r} present in landing page"
 
 
+@pytest.mark.asyncio
+async def test_workspace_member_accepted_for_email_finds_accepted_only():
+    """G5.22 — the helper used by OAuth callbacks to skip Neon provisioning
+    for invitees must only consider ACCEPTED memberships, not pending ones."""
+    from datetime import datetime, timezone
+    import hashlib
+    db = await db_module.init_db(":memory:")
+    try:
+        # No row at all → None
+        assert await db_module.workspace_member_accepted_for_email(db, "x@x.com") is None
+        # Need a real tenant row to satisfy the workspace_members FK.
+        await db.execute(
+            "INSERT INTO tenants (id, email) VALUES (?, ?)",
+            ("tenant-owner", "owner@example.com"),
+        )
+        await db.commit()
+        # Invite pending (no joined_at)
+        await db.execute(
+            "INSERT INTO workspace_members (id, tenant_id, email, role, token_hash) "
+            "VALUES (?, ?, ?, ?, ?)",
+            ("m1", "tenant-owner", "invitee@example.com", "member",
+             hashlib.sha256(b"tok").hexdigest()),
+        )
+        await db.commit()
+        assert await db_module.workspace_member_accepted_for_email(db, "invitee@example.com") is None
+        # Mark accepted
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        await db.execute(
+            "UPDATE workspace_members SET joined_at = ?, token_hash = NULL WHERE id = ?",
+            (now, "m1"),
+        )
+        await db.commit()
+        got = await db_module.workspace_member_accepted_for_email(db, "INVITEE@EXAMPLE.COM")
+        assert got is not None
+        assert got["email"] == "invitee@example.com"
+    finally:
+        await db.close()
+
+
 def test_project_icon_patch_round_trip(client):
     """G4.17 — PATCH /projects/{pid}/icon stores the emoji and clears it."""
     p = client.post("/projects", json={"name": "g417-icon"}).json()

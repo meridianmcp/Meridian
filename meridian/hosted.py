@@ -521,15 +521,25 @@ async def _post_login_redirect(tenant: dict, db=None, next_url: str = "") -> str
                 or (tenant or {}).get("plan") in {"standard", "pro", "admin"}
             )
             if not has_slot:
+                # G5.22 — invitees who already accepted an invite into another
+                # tenant's workspace inherit that workspace's DB; don't burn a
+                # pool slot for them and don't waitlist them.
+                tenant_email = (tenant or {}).get("email", "")
+                existing_membership = await db_module.workspace_member_accepted_for_email(
+                    db, tenant_email,
+                )
+                if existing_membership is not None:
+                    if next_url and next_url.startswith("/") and not next_url.startswith("//"):
+                        return next_url
+                    return _cfg("MERIDIAN_AFTER_LOGIN_URL", "/dashboard")
                 free_count = await db_module.count_tenants_by_plan(
                     db, "free", provisioned_only=True
                 )
                 if free_count >= free_cap:
-                    email = (tenant or {}).get("email", "")
-                    if email:
+                    if tenant_email:
                         try:
                             await db_module.add_waitlist_entry(
-                                db, email, note="auto:launch-full"
+                                db, tenant_email, note="auto:launch-full"
                             )
                         except Exception:
                             pass
@@ -576,11 +586,16 @@ async def auth_callback(request: Request) -> RedirectResponse:
     db = request.app.state.db
     tenant = await db_module.upsert_tenant(db, email=email, google_sub=sub)
 
-    # Provision a Neon DB in the background for new tenants who don't have one yet.
-    # Admin accounts and already-provisioned accounts are no-ops inside provision_neon_db.
+    # G5.22 — Skip auto-provisioning a Neon DB when the user has already
+    # accepted an invite to someone else's workspace. Provisioning then
+    # would burn a pool slot for a tenant that will only ever read from
+    # the inviter's DB. Admin accounts and already-provisioned tenants
+    # are also no-ops inside provision_neon_db.
     if not tenant.get("neon_project_id") and not tenant.get("neon_db_url"):
-        import asyncio as _asyncio
-        _asyncio.create_task(_provision_tenant_background(tenant["id"], db))
+        existing_membership = await db_module.workspace_member_accepted_for_email(db, email)
+        if existing_membership is None:
+            import asyncio as _asyncio
+            _asyncio.create_task(_provision_tenant_background(tenant["id"], db))
 
     expires_at = (
         datetime.now(timezone.utc) + timedelta(hours=_SESSION_MAX_AGE_HOURS)
@@ -660,10 +675,13 @@ async def auth_github_callback(request: Request) -> RedirectResponse:
     db = request.app.state.db
     tenant = await db_module.upsert_tenant(db, email=email, github_sub=sub)
 
-    # Provision a Neon DB in the background for new tenants who don't have one yet.
+    # G5.22 — same invite-aware skip as the Google callback. See the comment
+    # in auth_callback for details.
     if not tenant.get("neon_project_id") and not tenant.get("neon_db_url"):
-        import asyncio as _asyncio
-        _asyncio.create_task(_provision_tenant_background(tenant["id"], db))
+        existing_membership = await db_module.workspace_member_accepted_for_email(db, email)
+        if existing_membership is None:
+            import asyncio as _asyncio
+            _asyncio.create_task(_provision_tenant_background(tenant["id"], db))
 
     expires_at = (
         datetime.now(timezone.utc) + timedelta(hours=_SESSION_MAX_AGE_HOURS)
