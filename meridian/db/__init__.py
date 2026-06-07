@@ -322,6 +322,7 @@ CREATE TABLE IF NOT EXISTS tenants (
     notification_prefs TEXT NOT NULL DEFAULT '{}',
     trial_started_at TEXT,
     inactivity_expires_at TEXT,
+    is_internal INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -1565,12 +1566,49 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_v34_hitl_auto_answer(db)
     await _migrate_v34_workspace_settings(db)
     await _migrate_project_icon(db)
+    await _migrate_tenants_is_internal(db)
     return db
 
 
 async def _migrate_project_icon(db: aiosqlite.Connection) -> None:
     """G4.17 — single-emoji icon on projects for sidebar/tab rendering."""
     await _migrate_add_column_if_missing(db, "projects", "icon", "TEXT")
+
+
+# G2.10 — Set of email addresses considered "internal" for lifecycle
+# purposes. The migrator backfills these to is_internal=true after the
+# column is added. New entries can also be added via env var
+# MERIDIAN_INTERNAL_EMAILS (comma-separated).
+_INTERNAL_EMAILS_DEFAULT = frozenset({
+    "ajc123private@gmail.com",
+    "dradamawsome@gmail.com",
+    "ajc123shopping@gmail.com",
+    "termh4@umsystem.edu",
+})
+
+
+def _internal_emails() -> frozenset[str]:
+    import os
+    extra = os.environ.get("MERIDIAN_INTERNAL_EMAILS", "")
+    extras = {e.strip().lower() for e in extra.split(",") if e.strip()}
+    return _INTERNAL_EMAILS_DEFAULT | extras
+
+
+async def _migrate_tenants_is_internal(db: aiosqlite.Connection) -> None:
+    """G2.10 — Add tenants.is_internal flag and backfill known internal
+    emails. is_internal tenants are excluded from churn/dunning/overage/
+    free-expiry warnings and deletion. Idempotent.
+    """
+    await _migrate_add_column_if_missing(
+        db, "tenants", "is_internal", "INTEGER NOT NULL DEFAULT 0"
+    )
+    # Backfill known internal emails. Idempotent.
+    for email in sorted(_internal_emails()):
+        await db.execute(
+            "UPDATE tenants SET is_internal = 1 WHERE LOWER(email) = ?",
+            (email,),
+        )
+    await db.commit()
 
 
 async def create_project(

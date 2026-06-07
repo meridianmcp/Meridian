@@ -1347,6 +1347,12 @@ async def me_endpoint(request: Request) -> dict[str, Any]:
             expired = delta.total_seconds() <= 0
         except ValueError:
             pass
+    # G2.10 — internal tenants never see the "expired" / "days remaining"
+    # banner. The lifecycle jobs already skip them, but a positive UX cue
+    # is cleaner than leaving the expired flag set with no consequence.
+    if tenant.get("is_internal"):
+        expired = False
+        days_remaining = None
     return {
         "plan": plan,
         "email": tenant.get("email", ""),
@@ -1357,6 +1363,9 @@ async def me_endpoint(request: Request) -> dict[str, Any]:
         # G2.11 — tells the dashboard whether to render "Manage billing"
         # (true → opens Stripe portal) or "Upgrade" (false → /pricing).
         "has_stripe_customer": bool(tenant.get("stripe_customer_id")),
+        # G2.10 — internal marker, used by the dashboard to suppress
+        # the upgrade banner and similar nag UI for staff accounts.
+        "is_internal": bool(tenant.get("is_internal")),
     }
 
 

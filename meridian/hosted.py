@@ -1643,7 +1643,7 @@ async def run_storage_overage_check(db: Any) -> None:
     stripe_api_key = _cfg("STRIPE_API_KEY", "")
 
     async with db.execute(
-        "SELECT id, email, plan, neon_project_id, stripe_customer_id, stripe_metered_item_id "
+        "SELECT id, email, plan, neon_project_id, stripe_customer_id, stripe_metered_item_id, is_internal "
         "FROM tenants WHERE neon_project_id IS NOT NULL"
     ) as cur:
         rows = await cur.fetchall()
@@ -1654,6 +1654,9 @@ async def run_storage_overage_check(db: Any) -> None:
     tenants = [_to_d(r) for r in rows] if rows else []
 
     for tenant in tenants:
+        # G2.10 — internal tenants are never charged for storage overage.
+        if tenant.get("is_internal"):
+            continue
         neon_project_id = tenant.get("neon_project_id")
         if not neon_project_id:
             continue
@@ -1826,6 +1829,10 @@ async def run_overage_check(db: Any) -> None:
         if email in admins:
             continue
 
+        # G2.10 — internal tenants are never billed for overage or warned.
+        if tenant.get("is_internal"):
+            continue
+
         neon_project_id = tenant.get("neon_project_id", "")
         if not neon_project_id or neon_project_id in EXCLUDED_NEON_PROJECTS:
             continue
@@ -1965,9 +1972,11 @@ async def run_churn_cleanup(db: Any) -> None:
     base = _cfg("MERIDIAN_BASE_URL", "https://usemeridian.us").rstrip("/")
 
     # Churned = had a Neon project but no active Stripe customer (payment lapsed)
+    # G2.10 — internal tenants are never churned.
     async with db.execute(
         "SELECT id, email, neon_project_id, pool_project_id, created_at FROM tenants "
-        "WHERE stripe_customer_id IS NULL AND neon_project_id IS NOT NULL"
+        "WHERE stripe_customer_id IS NULL AND neon_project_id IS NOT NULL "
+        "AND (is_internal IS NULL OR is_internal = 0)"
     ) as cur:
         rows = await cur.fetchall()
     def _to_d(r: Any) -> dict[str, Any]:
@@ -2073,6 +2082,9 @@ async def run_dunning_cleanup(db: Any) -> None:
     tenants = await db_module.get_tenants_with_payment_failures(db)
 
     for tenant in tenants:
+        # G2.10 — internal tenants are never sent dunning warnings.
+        if tenant.get("is_internal"):
+            continue
         raw_ts = tenant.get("payment_failed_at") or ""
         if not raw_ts:
             continue

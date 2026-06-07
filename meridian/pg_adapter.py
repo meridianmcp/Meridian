@@ -633,6 +633,7 @@ CREATE TABLE IF NOT EXISTS tenants (
     github_repo TEXT,
     github_branch TEXT,
     notification_prefs TEXT NOT NULL DEFAULT '{{}}',
+    is_internal INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL DEFAULT ({_TS})
 );
 
@@ -855,7 +856,25 @@ async def init_pg_db(url: str) -> PostgresConnection:
         await _migrate_pg_v29_free_tier_columns(conn)
         await _migrate_pg_v31_github_integration(conn)
         await _migrate_pg_v25_notification_prefs(conn)
+        await _migrate_pg_tenants_is_internal(conn)
     return conn
+
+
+async def _migrate_pg_tenants_is_internal(conn: PostgresConnection) -> None:
+    """G2.10 — tenants.is_internal column + backfill known internal emails.
+    Postgres mirror of db._migrate_tenants_is_internal. Online-safe ADD
+    COLUMN (default 0, no table rewrite on PG 11+). Idempotent.
+    """
+    from . import db as db_module  # noqa: PLC0415
+    await conn.executescript(
+        "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS is_internal INTEGER NOT NULL DEFAULT 0"
+    )
+    # Backfill known internal emails.
+    for email in sorted(db_module._internal_emails()):
+        await conn.execute(
+            "UPDATE tenants SET is_internal = 1 WHERE LOWER(email) = ?",
+            (email,),
+        )
 
 
 async def get_project_ntfy_url(
