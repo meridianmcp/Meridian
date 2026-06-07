@@ -328,7 +328,13 @@ def test_executor_config_round_trip(client):
 def test_goal_round_trip_and_versioning(client):
     project = client.post("/projects", json={"name": "alpha"}).json()
     r = client.get(f"/projects/{project['id']}/goal")
-    assert r.status_code == 404  # unset goal
+    # G9 — unset goal returns 200 with empty fields (was 404). Browsers
+    # log fetch 4xx to console, which broke the panel-render Playwright
+    # test on every fresh-project initial render.
+    assert r.status_code == 200
+    body = r.json()
+    assert body["content"] == ""
+    assert body["version"] == 0
     r = client.post(
         f"/projects/{project['id']}/goal", json={"content": "go"}
     )

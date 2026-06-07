@@ -2038,14 +2038,39 @@ async def get_goal(project_id: str, request: Request) -> dict[str, Any]:
     created_at}`` dicts. Cold sessions can render the directive *and*
     last activity from a single MCP call.
 
-    404 if the project does not exist or the goal hasn't been set yet.
+    G8.34/G9 — Returns 200 with an empty stub when the project exists
+    but no goal has been set yet (previously 404). The 404-as-empty
+    semantics produced a console error on the dashboard's initial
+    render for every fresh project, which made the panel-render
+    Playwright test flake by environment. Browsers can't tell the
+    difference between "field is empty" and "fetch threw 4xx", so
+    the only honest answer is 200 with empty fields. Returns 404 still
+    when the project itself does not exist.
     """
     project = await db_module.get_project(await _db(request), project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="project not found")
     goal = await db_module.get_goal(await _db(request), project_id)
     if goal is None:
-        raise HTTPException(status_code=404, detail="goal not set")
+        recent = await db_module.get_tasks(await _db(request), project_id, limit=5)
+        return {
+            "id": "",
+            "project_id": project_id,
+            "content": "",
+            "version": 0,
+            "created_at": "",
+            "updated_at": "",
+            "ambient_tasks": [
+                {
+                    "status": t["status"],
+                    "description": t["description"],
+                    "created_at": t["created_at"],
+                }
+                for t in recent
+            ],
+            "north_star": None,
+            "sprint": None,
+        }
     recent = await db_module.get_tasks(await _db(request), project_id, limit=5)
     goal["ambient_tasks"] = [
         {
