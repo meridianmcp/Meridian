@@ -3908,6 +3908,34 @@ async def workspace_invite(request: Request) -> dict[str, Any]:
     return {"id": invite["id"], "email": email, "role": role, "pending": True}
 
 
+@app.post("/workspace/invite/{member_id}/resend", status_code=200)
+async def workspace_invite_resend(request: Request, member_id: str) -> dict[str, Any]:
+    """Resend invite email for a pending workspace member."""
+    if not _hosted_mode():
+        raise HTTPException(status_code=404)
+    from .hosted import get_current_tenant, send_invite_email
+    import hashlib, secrets as _secrets
+    tenant = await get_current_tenant(request)
+    from .roles import PERM_INVITE  # noqa: PLC0415
+    await _require_workspace_perm(request, tenant, PERM_INVITE)
+    db = request.app.state.db
+    member = await db_module.get_workspace_member_by_id(db, member_id, tenant["id"])
+    if not member:
+        raise HTTPException(status_code=404, detail="Member not found")
+    if member.get("joined_at") is not None:
+        raise HTTPException(status_code=409, detail="Invite already accepted")
+    raw_token = _secrets.token_urlsafe(32)
+    token_hash = hashlib.sha256(raw_token.encode()).hexdigest()
+    await db_module.refresh_workspace_invite_token(db, member_id, tenant["id"], token_hash)
+    base = os.environ.get("MERIDIAN_SERVER_URL", "https://usemeridian.us").rstrip("/")
+    invite_url = f"{base}/workspace/accept?token={raw_token}"
+    try:
+        await send_invite_email(member["email"], invite_url, tenant["email"])
+    except Exception:
+        pass
+    return {"id": member_id, "email": member["email"], "resent": True}
+
+
 @app.get("/workspace/accept")
 async def workspace_accept(request: Request, token: str = "") -> HTMLResponse:
     """Accept a workspace invite. Marks joined_at and redirects to dashboard."""
@@ -3928,7 +3956,16 @@ async def workspace_accept(request: Request, token: str = "") -> HTMLResponse:
     # Ensure a tenant account exists for the invited email
     await db_module.upsert_tenant(db, email=invite["email"])
     from fastapi.responses import RedirectResponse as _Redir
-    return _Redir("/auth/login", status_code=302)
+    # Send authenticated users straight to the dashboard so the workspace
+    # switcher re-renders immediately with the new workspace. Unauthenticated
+    # users go to the login page first.
+    from .hosted import get_current_tenant as _get_cur_tenant  # noqa: PLC0415
+    try:
+        await _get_cur_tenant(request)
+        dest = "/dashboard"
+    except Exception:
+        dest = "/auth/login"
+    return _Redir(dest, status_code=302)
 
 
 @app.get("/workspace/members")

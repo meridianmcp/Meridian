@@ -6164,6 +6164,37 @@ async def workspace_member_accepted_for_email(
     return _row_to_dict(row)
 
 
+async def get_workspace_member_by_id(
+    db: aiosqlite.Connection,
+    member_id: str,
+    tenant_id: str,
+) -> dict[str, Any] | None:
+    """Return a single workspace_members row scoped to tenant_id."""
+    async with db.execute(
+        "SELECT * FROM workspace_members WHERE id = ? AND tenant_id = ?",
+        (member_id, tenant_id),
+    ) as cur:
+        row = await cur.fetchone()
+    return _row_to_dict(row)
+
+
+async def refresh_workspace_invite_token(
+    db: aiosqlite.Connection,
+    member_id: str,
+    tenant_id: str,
+    token_hash: str,
+) -> dict[str, Any] | None:
+    """Replace the invite token for a pending member row."""
+    await db.execute(
+        "UPDATE workspace_members SET token_hash = ? WHERE id = ? AND tenant_id = ? AND joined_at IS NULL",
+        (token_hash, member_id, tenant_id),
+    )
+    await db.commit()
+    async with db.execute("SELECT * FROM workspace_members WHERE id = ?", (member_id,)) as cur:
+        row = await cur.fetchone()
+    return _row_to_dict(row)
+
+
 async def list_workspace_members(
     db: aiosqlite.Connection,
     tenant_id: str,

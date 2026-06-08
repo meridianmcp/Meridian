@@ -4629,8 +4629,8 @@ async function loadSettingsTab(projectId) {
             const opts = ROLE_CHOICES.map(r => `<option value="${r}" ${m.role === r ? 'selected' : ''}>${r}</option>`).join('');
             return `
             <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;padding:4px 0;border-bottom:1px solid var(--border)">
-              <span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escapeHtml(m.email)}${m.pending ? ' <span style="color:var(--accent-amber);font-size:9px">pending</span>' : ''}</span>
-              <select class="member-role-select" data-mid="${escapeHtml(m.id)}" title="Change role" style="background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:2px 5px">${opts}</select>
+              <span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escapeHtml(m.email)}${m.pending ? ' <span style="color:var(--accent);font-size:9px;font-weight:600">Invited</span>' : ''}</span>
+              ${m.pending ? `<button class="resend-invite-btn secondary" data-mid="${escapeHtml(m.id)}" title="Resend invite" style="font-size:9px;padding:2px 7px">Resend</button>` : `<select class="member-role-select" data-mid="${escapeHtml(m.id)}" title="Change role" style="background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:2px 5px">${opts}</select>`}
               <button class="secondary" data-mid="${escapeHtml(m.id)}" title="Remove member" style="font-size:9px;padding:2px 7px">×</button>
             </div>`;
           }).join('');
@@ -4653,7 +4653,23 @@ async function loadSettingsTab(projectId) {
               }
             };
           });
-          listEl.querySelectorAll('button[data-mid]').forEach(btn => {
+          listEl.querySelectorAll('button.resend-invite-btn').forEach(btn => {
+            btn.onclick = async () => {
+              btn.disabled = true;
+              btn.textContent = '…';
+              try {
+                await api(`/workspace/invite/${btn.dataset.mid}/resend`, { method: 'POST' });
+                btn.textContent = 'Sent';
+                if (inviteStatus) { inviteStatus.textContent = 'Invite resent.'; setTimeout(() => { if (inviteStatus) inviteStatus.textContent = ''; }, 2500); }
+              } catch(e) {
+                btn.textContent = 'Resend';
+                if (inviteStatus) inviteStatus.textContent = `Error: ${escapeHtml(String(e))}`;
+              } finally {
+                btn.disabled = false;
+              }
+            };
+          });
+          listEl.querySelectorAll('button[data-mid]:not(.resend-invite-btn)').forEach(btn => {
             btn.onclick = async () => {
               if (!confirm('Remove this member?')) return;
               try {

@@ -915,6 +915,16 @@ async def _migrate_pg_workspace_members_rbac(conn: PostgresConnection) -> None:
         )
     except Exception:  # noqa: BLE001
         pass
+    # Ensure invited_at and joined_at exist — they may be absent on
+    # instances created before the column was added to the DDL.
+    await conn.executescript(
+        "ALTER TABLE workspace_members "
+        f"ADD COLUMN IF NOT EXISTS invited_at TEXT NOT NULL DEFAULT ({_TS})"
+    )
+    await conn.executescript(
+        "ALTER TABLE workspace_members "
+        "ADD COLUMN IF NOT EXISTS joined_at TEXT"
+    )
 
 
 async def _migrate_pg_tenants_is_internal(conn: PostgresConnection) -> None:
