@@ -115,7 +115,11 @@ Meridian on `localhost`, you have two paths:
   and use `/mcp`.
 
 <details>
-<summary>Self-hosted only: local Claude bridge for localhost</summary>
+<summary>Self-hosted localhost (requires bridge or public URL)</summary>
+
+Self-hosted Meridian on localhost has two options:
+
+**Option 1: Local SSE bridge** (for Chrome/Chromium users):
 
 1. Start Meridian locally:
 
@@ -124,14 +128,18 @@ pixi run start
 # or: python -m meridian
 ```
 
-2. Install a browser bridge such as
-   [dnakov/claude-mcp](https://github.com/dnakov/claude-mcp).
+2. Install [dnakov/claude-mcp](https://github.com/dnakov/claude-mcp) browser bridge.
 3. Add your local SSE endpoint:
 
    - **Name:** `Meridian (local)`
    - **URL:** `http://localhost:7878/mcp/sse`
 
-4. Open Claude and enable the connector for the conversation.
+**Option 2: Public HTTPS URL** (recommended for all clients):
+
+Expose Meridian on HTTPS (e.g., via Cloudflare Tunnel or ngrok) and use the remote MCP endpoint without any bridge:
+
+- **Name:** `Meridian`
+- **URL:** `https://your-public-domain/mcp`
 
 </details>
 

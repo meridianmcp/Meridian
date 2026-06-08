@@ -841,9 +841,21 @@ function _renderPlanBadge(me) {
       document.body.style.paddingTop = ((parseInt(document.body.style.paddingTop || '0', 10)) + 28) + 'px';
     }
   }
-  // Expiry warning banner at ≤25 days remaining
+  // Free trial days remaining banner for free-tier users
   const days = me.days_remaining;
-  const isExpiring = (plan === 'free' || plan === 'trial') && days !== null && days !== undefined && days <= 25;
+  const isFreeOrTrial = (plan === 'free' || plan === 'trial');
+  if (isFreeOrTrial && days !== null && days !== undefined && days > 0 && !document.getElementById('trial-banner')) {
+    const b = document.createElement('div');
+    b.id = 'trial-banner';
+    const label = _PLAN_LABELS[plan] || plan;
+    const daysLeft = Math.max(0, days);
+    b.style = `position:fixed;top:0;left:0;right:0;z-index:9997;background:linear-gradient(90deg,#059669,#059669);color:#fff;text-align:center;padding:5px 12px;font-size:12px;font-family:inherit;letter-spacing:0.02em`;
+    b.innerHTML = `${label}: <strong>${daysLeft} day${daysLeft !== 1 ? 's' : ''}</strong> remaining. <a href="/pricing" style="color:#fff;text-decoration:underline;font-weight:600">Upgrade now →</a>`;
+    document.body.prepend(b);
+    document.body.style.paddingTop = ((parseInt(document.body.style.paddingTop || '0', 10)) + 28) + 'px';
+  }
+  // Expiry warning banner at ≤25 days remaining
+  const isExpiring = isFreeOrTrial && days !== null && days !== undefined && days <= 25;
   if (isExpiring && !document.getElementById('expiry-banner')) {
     const b = document.createElement('div');
     b.id = 'expiry-banner';
