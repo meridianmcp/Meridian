@@ -257,5 +257,9 @@ CONNECT.txt
 # Local integration test artifacts (results only)
 tests/integration/results.txt
 
+# Launch artifacts — internal research and coordination, not for public repo
+launch/subreddit_research.md
+launch/launch_checklist.md
+
 extensions/mcp-text-editor/.pixi/
 /videos/

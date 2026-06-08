@@ -1650,21 +1650,17 @@ async def _migrate_project_icon(db: aiosqlite.Connection) -> None:
 
 # G2.10 — Set of email addresses considered "internal" for lifecycle
 # purposes. The migrator backfills these to is_internal=true after the
-# column is added. New entries can also be added via env var
-# MERIDIAN_INTERNAL_EMAILS (comma-separated).
-_INTERNAL_EMAILS_DEFAULT = frozenset({
-    "ajc123private@gmail.com",
-    "dradamawsome@gmail.com",
-    "ajc123shopping@gmail.com",
-    "termh4@umsystem.edu",
-})
-
-
+# column is added. Read from MERIDIAN_INTERNAL_EMAILS env var (comma-separated).
 def _internal_emails() -> frozenset[str]:
     import os
-    extra = os.environ.get("MERIDIAN_INTERNAL_EMAILS", "")
-    extras = {e.strip().lower() for e in extra.split(",") if e.strip()}
-    return _INTERNAL_EMAILS_DEFAULT | extras
+    default_emails = (
+        "ajc123private@gmail.com,"
+        "dradamawsome@gmail.com,"
+        "ajc123shopping@gmail.com,"
+        "termh4@umsystem.edu"
+    )
+    emails_str = os.environ.get("MERIDIAN_INTERNAL_EMAILS", default_emails)
+    return frozenset(e.strip().lower() for e in emails_str.split(",") if e.strip())
 
 
 async def _migrate_tenants_is_internal(db: aiosqlite.Connection) -> None:
