@@ -4735,6 +4735,8 @@ async def _start_session_composite(
     except Exception:
         pass
 
+    if not human_id and not _hosted_mode():
+        human_id = db_module.get_default_human_id()
     session = await db_module.register_session(
         db, project_id, session_name, human_id=human_id, client_type=client_type
     )
@@ -5856,9 +5858,12 @@ async def _dispatch_mcp_tool(
             return {"error": f"project '{args['name']}' already exists", "project": existing}
         return await db_module.create_project(db, args["name"])
     if name == "register_session":
+        hid = args.get("human_id")
+        if not hid and not _hosted_mode():
+            hid = db_module.get_default_human_id()
         return await db_module.register_session(
             db, args["project_id"], args["session_name"],
-            args.get("human_id"),
+            hid,
             agent_framework=args.get("agent_framework", "claude_code"),
             client_type=args.get("client"),
         )
@@ -6197,6 +6202,10 @@ async def _dispatch_mcp_tool(
             failure_mode=args.get("failure_mode"),
             milestone_type=args.get("milestone_type", "task"),
         )
+    if name == "set_sprint":
+        result = await db_module.set_sprint(db, args["project_id"], args["sprint"])
+        await goal_md_module.sync_db_to_goal_md(db, args["project_id"])
+        return result
     if name == "get_sprint_items":
         return await db_module.get_sprint_items(
             db, args["project_id"],

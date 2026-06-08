@@ -26,6 +26,7 @@ html, body {
   background: var(--surface);
   border-right: 1px solid var(--border);
   display: flex; flex-direction: column;
+  overflow: hidden;
 }
 .sidebar-header {
   padding: 14px 16px; border-bottom: 1px solid var(--border);
@@ -334,6 +335,7 @@ input[type=text] {
 }
 
 .sessions-list { display: flex; flex-direction: column; gap: 4px; }
+#project-list { flex: 1; overflow-y: auto; min-height: 0; }
 .session-row {
   padding: 4px 8px; background: var(--surface-2); border-radius: 4px;
   font-family: 'IBM Plex Mono', monospace; font-size: 12px;

@@ -4753,19 +4753,32 @@ async function loadSettingsTab(projectId) {
   // pre-fill with OAuth email for hosted users if no URL is saved yet. ntfy
   // targets show topic-only (the https://ntfy.sh/ prefix is implied).
   const defaultNotifyUrl = displayNotifyTarget(savedNotifyUrl) || (state.tenantEmail ? state.tenantEmail : '');
+  // ntfy security warning: shown once until user acknowledges via localStorage.
+  let ntfyWarnAcknowledged = false;
+  try { ntfyWarnAcknowledged = localStorage.getItem(STORAGE_KEY('ntfy.warn.dismissed')) === '1'; } catch(e) {}
+  const ntfyInputDisabled = ntfyWarnAcknowledged ? '' : 'disabled';
+  const ntfyWarnDisplay = ntfyWarnAcknowledged ? 'display:none' : '';
   html += `<div data-demo-hide style="margin-bottom:14px;padding:10px 12px;border:1px solid var(--border);border-radius:6px;background:var(--surface-2)">
     <div style="font-weight:600;font-size:11px;color:var(--text);margin-bottom:4px">Notifications</div>
     <div style="font-size:10px;color:var(--muted);margin-bottom:8px">
       Paste an <a href="https://ntfy.sh" target="_blank" style="color:var(--accent)">ntfy.sh</a> topic URL, a Slack/Discord webhook URL, or your email address.
       Alerts fire on HITL requests and sprint completions. No account needed for ntfy.
     </div>
+    <div id="ntfy-warn-${projectId}" style="margin-bottom:8px;padding:8px 10px;border:1px solid #f59e0b88;border-radius:5px;background:#f59e0b11;font-size:10px;color:#f59e0b;line-height:1.5;${ntfyWarnDisplay}">
+      <strong>⚠ Security notice:</strong> ntfy.sh topics are public — anyone who knows your topic name can subscribe and read your alerts. Use a long, random topic name (e.g. <code>my-project-a7f3k2</code>) or self-host ntfy for privacy. Slack/Discord webhooks and email are private alternatives.<br>
+      <label style="display:flex;align-items:center;gap:6px;margin-top:6px;cursor:pointer;color:var(--text)">
+        <input type="checkbox" id="ntfy-warn-ack-${projectId}" style="cursor:pointer;accent-color:#f59e0b">
+        I understand my ntfy topic is public
+      </label>
+    </div>
     <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
       <input type="text" id="ntfy-url-${projectId}"
         value="${escapeHtml(defaultNotifyUrl)}"
         placeholder="${escapeHtml(suggestNtfyTopic(projectId))}  ·  https://hooks.slack.com/…  ·  you@email.com"
-        style="flex:1;min-width:200px;padding:5px 8px;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;color:var(--text);font-family:var(--font-mono);font-size:11px;outline:none">
-      <button class="secondary" id="ntfy-save-${projectId}" style="padding:4px 10px;font-size:10px">Save</button>
-      <button class="secondary" id="ntfy-test-${projectId}" style="padding:4px 10px;font-size:10px" title="Send a test notification to verify your URL">Test</button>
+        ${ntfyInputDisabled}
+        style="flex:1;min-width:200px;padding:5px 8px;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;color:var(--text);font-family:var(--font-mono);font-size:11px;outline:none;opacity:${ntfyWarnAcknowledged ? '1' : '0.4'}">
+      <button class="secondary" id="ntfy-save-${projectId}" ${ntfyInputDisabled} style="padding:4px 10px;font-size:10px;opacity:${ntfyWarnAcknowledged ? '1' : '0.4'}">Save</button>
+      <button class="secondary" id="ntfy-test-${projectId}" ${ntfyInputDisabled} style="padding:4px 10px;font-size:10px;opacity:${ntfyWarnAcknowledged ? '1' : '0.4'}" title="Send a test notification to verify your URL">Test</button>
       <span id="ntfy-status-${projectId}" style="font-size:10px;color:var(--muted);min-width:40px"></span>
     </div>
     <div style="font-size:9px;color:var(--muted);margin-top:4px;line-height:1.6">
@@ -4958,6 +4971,21 @@ async function loadSettingsTab(projectId) {
       } finally {
         ntfyTestBtn.disabled = false;
       }
+    };
+  }
+
+  // Wire ntfy security warning acknowledgement checkbox
+  const ntfyWarnAckCb = document.getElementById(`ntfy-warn-ack-${projectId}`);
+  if (ntfyWarnAckCb) {
+    ntfyWarnAckCb.onchange = () => {
+      if (!ntfyWarnAckCb.checked) return;
+      try { localStorage.setItem(STORAGE_KEY('ntfy.warn.dismissed'), '1'); } catch(e) {}
+      const warnEl = document.getElementById(`ntfy-warn-${projectId}`);
+      if (warnEl) warnEl.style.display = 'none';
+      const inp = document.getElementById(`ntfy-url-${projectId}`);
+      const saveBtn = document.getElementById(`ntfy-save-${projectId}`);
+      const testBtn = document.getElementById(`ntfy-test-${projectId}`);
+      [inp, saveBtn, testBtn].forEach(el => { if (el) { el.disabled = false; el.style.opacity = '1'; } });
     };
   }
 

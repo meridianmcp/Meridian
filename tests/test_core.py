@@ -7385,3 +7385,71 @@ def test_mcp_create_project_duplicate_returns_error(client):
     d2 = r2.json()
     text = d2.get("result", {}).get("content", [{}])[0].get("text", "")
     assert "already exists" in text, f"expected 'already exists' error, got: {text}"
+
+
+# ---------------------------------------------------------------------------
+# Sprint tools in _MCP_TOOLS_LIST + _dispatch_mcp_tool (hosted /mcp route)
+# ---------------------------------------------------------------------------
+
+def test_sprint_tools_in_mcp_tools_list():
+    """set_sprint, add_sprint_item, complete_sprint_item, get_sprint_items appear in _MCP_TOOLS_LIST."""
+    from meridian.mcp_tools import _MCP_TOOLS_LIST
+    names = {t["name"] for t in _MCP_TOOLS_LIST}
+    missing = {"set_sprint", "add_sprint_item", "complete_sprint_item", "get_sprint_items"} - names
+    assert not missing, f"Missing from _MCP_TOOLS_LIST: {missing}"
+
+
+def test_get_sprint_items_is_read_only():
+    from meridian.mcp_tools import _MCP_TOOLS_LIST
+    tool = next(t for t in _MCP_TOOLS_LIST if t["name"] == "get_sprint_items")
+    assert tool["annotations"]["readOnlyHint"] is True
+
+
+@pytest.mark.asyncio
+async def test_dispatch_mcp_tool_set_sprint(db):
+    """set_sprint via _dispatch_mcp_tool updates the sprint field."""
+    import meridian.server as srv
+    p = await db_module.create_project(db, "sprint-dispatch-test")
+    await db_module.set_goal(db, p["id"], "initial goal")
+    result = await srv._dispatch_mcp_tool(
+        "set_sprint", {"project_id": p["id"], "sprint": "week-1-auth"}, db, "/tmp"
+    )
+    assert result["sprint"] == "week-1-auth"
+
+
+@pytest.mark.asyncio
+async def test_dispatch_mcp_tool_sprint_items_round_trip(db):
+    """add_sprint_item / get_sprint_items / complete_sprint_item via _dispatch_mcp_tool."""
+    import meridian.server as srv
+    p = await db_module.create_project(db, "sprint-dispatch-items-test")
+
+    added = await srv._dispatch_mcp_tool(
+        "add_sprint_item",
+        {"project_id": p["id"], "version": "v1", "title": "Ship login"},
+        db, "/tmp",
+    )
+    assert added["title"] == "Ship login"
+    item_id = added["id"]
+
+    items = await srv._dispatch_mcp_tool(
+        "get_sprint_items", {"project_id": p["id"]}, db, "/tmp"
+    )
+    assert any(it["id"] == item_id for it in items)
+
+    done = await srv._dispatch_mcp_tool(
+        "complete_sprint_item",
+        {"project_id": p["id"], "item_id": item_id},
+        db, "/tmp",
+    )
+    assert done["status"] == "done"
+
+
+def test_sprint_tools_via_mcp_sse_tools_list(client):
+    """tools/list on /mcp/sse includes the 4 sprint tools."""
+    r = client.post("/mcp/sse", json={
+        "jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}
+    })
+    assert r.status_code == 200
+    names = {t["name"] for t in r.json()["result"]["tools"]}
+    missing = {"set_sprint", "add_sprint_item", "complete_sprint_item", "get_sprint_items"} - names
+    assert not missing, f"Missing from tools/list: {missing}"

@@ -11,6 +11,8 @@ data/
 *.so
 CONNECT.txt
 
+jcshm_*
+
 # Distribution / packaging
 .Python
 build/

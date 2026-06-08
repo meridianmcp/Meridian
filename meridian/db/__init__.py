@@ -4651,8 +4651,9 @@ async def upsert_tenant(
     expires_str = (datetime.now(timezone.utc) + timedelta(days=30)).strftime("%Y-%m-%d %H:%M:%S")
     await db.execute(
         "INSERT INTO tenants (id, email, google_sub, github_sub, microsoft_sub, "
-        "plan, trial_started_at, inactivity_expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        (tid, email, google_sub, github_sub, microsoft_sub, "free", now_str, expires_str),
+        "plan, trial_started_at, inactivity_expires_at, notification_prefs) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (tid, email, google_sub, github_sub, microsoft_sub, "free", now_str, expires_str,
+         '{"storage":true,"sprint":true}'),
     )
     await db.commit()
     async with db.execute("SELECT * FROM tenants WHERE id = ?", (tid,)) as cur:

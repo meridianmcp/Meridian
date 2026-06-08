@@ -268,6 +268,21 @@
   .self-host-alt {
     color: var(--muted); font-size: 13px; margin: 16px 0 8px;
   }
+  .arch-diagram {
+    display: flex; align-items: center; gap: 12px;
+    margin: 1.5rem 0; flex-wrap: wrap;
+  }
+  .arch-col { display: flex; flex-direction: column; gap: 8px; }
+  .arch-arrows { font-size: 1.4rem; color: var(--muted); align-self: center; }
+  .arch-box {
+    padding: 10px 18px; border-radius: 8px; font-size: 13px;
+    font-family: 'IBM Plex Mono', monospace; text-align: center;
+    border: 1px solid; line-height: 1.4;
+  }
+  .arch-box span { font-size: 11px; opacity: .7; display: block; }
+  .arch-client { border-color: #6c8fff44; background: #6c8fff11; color: #6c8fff; }
+  .arch-server { border-color: #7c3aed66; background: #7c3aed11; color: #a78bfa; min-width: 120px; }
+  .arch-state  { border-color: #00d4aa44; background: #00d4aa11; color: #00d4aa; }
 
   /* Pricing */
   .pricing-grid {
@@ -597,6 +612,21 @@ irm https://usemeridian.us/hooks.ps1 | iex</pre>
   <div class="self-host">
     <h2>Self-host in 30 seconds</h2>
     <p class="lede">Local SQLite by default. Connect your own Postgres for shared team state. Free forever for personal use.</p>
+    <div class="arch-diagram">
+      <div class="arch-col">
+        <div class="arch-box arch-client">Claude Code<br><span>session 1</span></div>
+        <div class="arch-box arch-client">Claude Code<br><span>session 2</span></div>
+        <div class="arch-box arch-client">Claude Code<br><span>session 3</span></div>
+      </div>
+      <div class="arch-arrows">→</div>
+      <div class="arch-col">
+        <div class="arch-box arch-server">Meridian<br><span>MCP server</span></div>
+      </div>
+      <div class="arch-arrows">→</div>
+      <div class="arch-col">
+        <div class="arch-box arch-state">Shared<br><span>state</span></div>
+      </div>
+    </div>
     <pre><span class="h"># macOS / Linux</span>
 <span class="c">$</span> curl -fsSL https://pixi.sh/install.sh | bash
 <span class="c">$</span> git clone https://github.com/meridianmcp/Meridian

@@ -209,6 +209,24 @@ get_goal(project_id="<your-project-id>")
     Open the Meridian dashboard at http://localhost:7878, select your project,
     and copy the ID from the URL or project settings.
 
+!!! tip "Set `MERIDIAN_HUMAN_ID` to identify yourself"
+    Meridian attributes sessions and tasks to a human so the dashboard can group
+    work per person. Set this env var before starting the server (or add it to
+    your `.env` file):
+
+    ```bash
+    export MERIDIAN_HUMAN_ID=alice   # macOS / Linux
+    set MERIDIAN_HUMAN_ID=alice      # Windows cmd
+    $env:MERIDIAN_HUMAN_ID="alice"   # PowerShell
+    ```
+
+    If omitted, Meridian falls back to `$USER` / `$USERNAME` / hostname.  
+    You can also pass it explicitly per session:
+
+    ```
+    start_session(project_id="...", session_name="...", human_id="alice")
+    ```
+
 ---
 
 ## Step 5 — Use Meridian in your workflow
