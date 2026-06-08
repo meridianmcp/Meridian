@@ -1360,6 +1360,7 @@ async def server_config(request: Request) -> dict[str, Any]:
             "port": port,
             "version": _VERSION,
             "db": "demo",
+            "demo_db": "postgres" if os.environ.get("MERIDIAN_DEMO_DB_URL") else "sqlite",
             "db_host": "",
             "toml_exists": False,
             "toml_path": "",
@@ -5850,6 +5851,9 @@ async def _dispatch_mcp_tool(
 ) -> Any:
     """Route a tools/call to the appropriate db_module function."""
     if name == "create_project":
+        existing = await db_module.get_project_by_name(db, args["name"])
+        if existing is not None:
+            return {"error": f"project '{args['name']}' already exists", "project": existing}
         return await db_module.create_project(db, args["name"])
     if name == "register_session":
         return await db_module.register_session(

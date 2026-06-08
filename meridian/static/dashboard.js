@@ -1,5 +1,6 @@
 const TABS_KEY = 'meridian.openTabs';
 const ACTIVE_PROJECT_KEY = 'meridian.activeProject';
+const _PLAN_LABELS = { solo: 'Standard', free: 'Free Trial', standard: 'Standard', pro: 'Pro', trial: 'Trial' };
 const state = {
   projects: [],
   tabs: [], // [{id, project}]
@@ -717,6 +718,9 @@ async function loadServerConfig() {
   } catch (e) { /* offline / older server — ignore */ }
   // Show demo overlay whenever on /demo path (regardless of MERIDIAN_DEMO env var)
   if (window.location.pathname.startsWith('/demo')) {
+    // Clear stale project IDs from prior logins so /demo never 404s on a stale project.
+    try { localStorage.removeItem(STORAGE_KEY(TABS_KEY)); } catch(e) {}
+    try { localStorage.removeItem(STORAGE_KEY(ACTIVE_PROJECT_KEY)); } catch(e) {}
     hideDemoAdminControls();
     showDemoOnboardingOverlay();
   }
@@ -740,7 +744,7 @@ async function loadServerConfig() {
 
 function _renderPlanBadge(me) {
   const planColors = { free: '#6b7280', trial: '#059669', standard: '#2563eb', pro: '#7c3aed' };
-  const planLabels = { free: 'Free', trial: 'Trial', standard: 'Solo', pro: 'Pro' };
+  const planLabels = _PLAN_LABELS;
   const plan = me.plan || 'free';
   // Plan badge near version string
   const verEl = document.getElementById('server-version');
@@ -790,7 +794,7 @@ function _renderPlanBadge(me) {
     const b = document.createElement('div');
     b.id = 'expiry-banner';
     const urgent = days <= 5;
-    const label = plan === 'trial' ? 'Trial' : 'Free tier';
+    const label = _PLAN_LABELS[plan] || plan;
     const upgradeMsg = plan === 'trial' ? 'Add a card to keep your data →' : 'Upgrade →';
     b.style = `position:fixed;top:0;left:0;right:0;z-index:9998;background:${urgent ? '#dc2626' : '#d97706'};color:#fff;text-align:center;padding:5px 12px;font-size:12px;font-family:inherit;letter-spacing:0.02em`;
     b.innerHTML = `${label} expires in <strong>${days} day${days !== 1 ? 's' : ''}</strong>. <a href="/pricing" style="color:#fff;text-decoration:underline">${upgradeMsg}</a>`;
@@ -800,7 +804,7 @@ function _renderPlanBadge(me) {
   if (me.expired && !document.getElementById('expired-banner')) {
     const b = document.createElement('div');
     b.id = 'expired-banner';
-    const expLabel = plan === 'trial' ? 'Trial expired' : 'Free tier expired';
+    const expLabel = (_PLAN_LABELS[plan] || plan) + ' expired';
     b.style = 'position:fixed;top:0;left:0;right:0;z-index:9998;background:#dc2626;color:#fff;text-align:center;padding:5px 12px;font-size:12px;font-family:inherit;letter-spacing:0.02em';
     b.innerHTML = `${expLabel}. <a href="/pricing" style="color:#fff;text-decoration:underline">Upgrade to continue →</a>`;
     document.body.prepend(b);
@@ -894,7 +898,7 @@ function _updateConnectionIndicator(cfg) {
   wrap.style.display = 'inline-flex';
   // Demo mode: show simplified read-only badge, no switcher
   if (cfg.demo_mode) {
-    label.textContent = 'demo (sqlite)';
+    label.textContent = 'demo (' + (cfg.demo_db || 'sqlite') + ')';
     dot.style.background = 'var(--accent-green)';
     wrap.style.cursor = 'default';
     wrap.title = 'Demo environment — read only';
@@ -1441,10 +1445,14 @@ async function _renameProject(t) {
 }
 
 async function _deleteProject(t) {
-  const confirmed = window.confirm(
-    `Delete "${t.project.name}"?\n\nThis will permanently delete all sessions, tasks, and goal history. Cannot be undone.`
+  const typed = window.prompt(
+    `Delete "${t.project.name}"?\n\nThis will permanently delete all sessions, tasks, and goal history. Cannot be undone.\n\nType the project name to confirm:`
   );
-  if (!confirmed) return;
+  if (typed === null) return;
+  if (typed.trim() !== t.project.name) {
+    toast('Project name did not match — delete cancelled.', true);
+    return;
+  }
   try {
     await api(`/projects/${t.id}`, { method: 'DELETE' });
     closeTab(t.id);
@@ -3881,10 +3889,10 @@ async function loadSettingsTab(projectId) {
     if (isTrialish && (expiresAt || days != null || state.tenantExpired)) {
       const dateStr = expiresAt ? String(expiresAt).slice(0, 10) : '';
       if (state.tenantExpired) {
-        expiryLine = `<div style="color:#f87171">${plan === 'trial' ? 'Trial' : 'Free tier'} expired${dateStr ? ` on ${escapeHtml(dateStr)}` : ''}.</div>`;
+        expiryLine = `<div style="color:#f87171">${_PLAN_LABELS[plan] || plan} expired${dateStr ? ` on ${escapeHtml(dateStr)}` : ''}.</div>`;
       } else {
         const dleft = (days != null) ? `${days} day${days === 1 ? '' : 's'} left` : '';
-        expiryLine = `<div>${plan === 'trial' ? 'Trial' : 'Free tier'} expires${dateStr ? ` on <span style="color:var(--text)">${escapeHtml(dateStr)}</span>` : ''}${dleft ? ` <span style="color:var(--muted)">(${dleft})</span>` : ''}.</div>`;
+        expiryLine = `<div>${_PLAN_LABELS[plan] || plan} expires${dateStr ? ` on <span style="color:var(--text)">${escapeHtml(dateStr)}</span>` : ''}${dleft ? ` <span style="color:var(--muted)">(${dleft})</span>` : ''}.</div>`;
       }
       const payLink = state.serverConfig?.stripe_payment_link || '/pricing';
       resubBtn = `<a href="${escapeHtml(payLink)}" class="primary" style="padding:4px 10px;font-size:10px;text-decoration:none;background:var(--accent);color:#001020;border-radius:4px;font-weight:600">${state.tenantExpired ? 'Resubscribe' : 'Upgrade to Standard'}</a>`;
@@ -3893,7 +3901,7 @@ async function loadSettingsTab(projectId) {
       <div style="font-weight:600;font-size:11px;color:var(--text);margin-bottom:6px">Account</div>
       <div style="font-size:10px;color:var(--muted);line-height:1.7">
         <div>Email: <span style="color:var(--text)">${escapeHtml(state.tenantEmail)}</span></div>
-        <div>Plan: <span style="color:var(--text);text-transform:capitalize">${escapeHtml(plan)}</span></div>
+        <div>Plan: <span style="color:var(--text)">${escapeHtml(_PLAN_LABELS[plan] || plan)}</span></div>
         ${expiryLine}
       </div>
       <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:8px">

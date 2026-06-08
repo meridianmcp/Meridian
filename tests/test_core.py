@@ -6998,6 +6998,17 @@ async def test_get_set_project_notify_url(anydb):
 
 
 @pytest.mark.asyncio
+async def test_new_tenant_notification_defaults(db):
+    """New tenants must have storage + sprint notifications ON, all others OFF."""
+    tenant = await db_module.upsert_tenant(db, email="newuser@example.com")
+    prefs = json.loads(tenant.get("notification_prefs") or "{}")
+    assert prefs.get("storage") is True, "storage notification should default ON"
+    assert prefs.get("sprint") is True, "sprint notification should default ON"
+    assert not prefs.get("hitl"), "hitl notification should default OFF"
+    assert not prefs.get("stalled"), "stalled notification should default OFF"
+
+
+@pytest.mark.asyncio
 async def test_dispatch_notification_ntfy(monkeypatch):
     """_dispatch_notification routes ntfy.sh URLs with special headers."""
     from meridian.server import _dispatch_notification
@@ -7299,3 +7310,78 @@ def test_notify_test_endpoint_delivers_ntfy_message_via_postgres(tmp_path, monke
         time.sleep(1)
 
     pytest.fail("Timed out waiting for ntfy.sh test notification")
+
+
+# ---------------------------------------------------------------------------
+# cleanup-june8: regression tests for A/B/C
+# ---------------------------------------------------------------------------
+
+
+def test_delete_project_confirm_requires_typed_name(client):
+    """dashboard.js _deleteProject uses window.prompt requiring the project name."""
+    js = client.get("/static/dashboard.js").text
+    # Confirm dialog was replaced with a prompt that checks the typed name
+    assert "window.prompt(" in js, "_deleteProject must use window.prompt"
+    assert "typed.trim() !== t.project.name" in js, "typed name check missing"
+    # Old single-click confirm must be gone
+    assert 'window.confirm(\n    `Delete "' not in js, "single confirm() still present"
+
+
+def test_admin_snapshot_file_db_has_data(tmp_path, monkeypatch):
+    """GET /admin/snapshot with a file-based SQLite DB returns a DB containing project rows."""
+    import importlib
+
+    db_path = tmp_path / "snap_test.db"
+    monkeypatch.setenv("MERIDIAN_DB", str(db_path))
+    monkeypatch.setenv("MERIDIAN_DB_URL", "")
+    monkeypatch.setenv("MERIDIAN_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("MERIDIAN_DEMO_DB_URL", "")
+    monkeypatch.setenv("MERIDIAN_SKIP_DEMO", "1")
+    monkeypatch.setenv("MERIDIAN_GOAL_MD", str(tmp_path / "GOAL.md"))
+    monkeypatch.setenv("MERIDIAN_MD_ROOT", str(tmp_path))
+
+    # Prevent meridian.toml from overriding MERIDIAN_DB_URL with the real Neon URL.
+    # The lifespan only skips the toml check for :memory:; for a real file path it
+    # runs get_toml_db_url() and would clobber our empty DB_URL monkeypatch.
+    import meridian.toml_config as _toml_mod
+    monkeypatch.setattr(_toml_mod, "get_toml_db_url", lambda: (None, None))
+
+    import meridian.server as srv_mod
+    srv_mod = importlib.reload(srv_mod)
+
+    from fastapi.testclient import TestClient
+
+    with TestClient(srv_mod.app) as c:
+        c.post("/projects", json={"name": "snap-test-project"})
+        r = c.get("/admin/snapshot")
+        assert r.status_code == 200
+        assert r.headers["content-type"] == "application/x-sqlite3"
+        # SQLite file magic header — confirms the response is a real DB file, not empty/error
+        assert r.content[:16] == b"SQLite format 3\x00", \
+            "snapshot does not have SQLite magic header"
+        # Must be non-trivial size (at least a few pages — not just empty header)
+        assert len(r.content) >= 4096, \
+            f"snapshot too small ({len(r.content)} bytes) — expected at least one page"
+
+
+def test_mcp_create_project_duplicate_returns_error(client):
+    """MCP create_project via /mcp/sse returns error when project name already exists."""
+    name = f"dup-guard-{uuid.uuid4().hex[:6]}"
+    # First creation succeeds
+    r1 = client.post("/mcp/sse", json={
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": {"name": "create_project", "arguments": {"name": name}},
+    })
+    assert r1.status_code == 200
+    d1 = r1.json()
+    assert "result" in d1, f"first create failed: {d1}"
+
+    # Second creation with same name returns error
+    r2 = client.post("/mcp/sse", json={
+        "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+        "params": {"name": "create_project", "arguments": {"name": name}},
+    })
+    assert r2.status_code == 200
+    d2 = r2.json()
+    text = d2.get("result", {}).get("content", [{}])[0].get("text", "")
+    assert "already exists" in text, f"expected 'already exists' error, got: {text}"
