@@ -12,6 +12,9 @@ data/
 CONNECT.txt
 
 jcshm_*
+**/reddit_*
+hn_*.md
+reddit*
 
 # Distribution / packaging
 .Python
@@ -234,6 +237,7 @@ data/oauth_tokens.json
 start_meridian.bat
 
 # Internal strategy documents
+launch/
 DECISIONS.md
 ROADMAP.md
 # GOAL.md syncs bidirectionally with the DB — contains internal strategy, never commit
