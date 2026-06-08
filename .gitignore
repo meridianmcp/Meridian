@@ -3,11 +3,18 @@ __pycache__/
 *.py[codz]
 *$py.class
 data/
-videos/
+# Source video assets (large, regenerable). Anchored to repo root so the
+# committed, published copies under docs/videos/ are NOT ignored.
+/videos/
 
 # C extensions
 *.so
 CONNECT.txt
+
+jcshm_*
+**/reddit_*
+hn_*.md
+reddit*
 
 # Distribution / packaging
 .Python
@@ -230,17 +237,18 @@ data/oauth_tokens.json
 start_meridian.bat
 
 # Internal strategy documents
+launch/
 DECISIONS.md
 ROADMAP.md
 # GOAL.md syncs bidirectionally with the DB — contains internal strategy, never commit
 GOAL.md
 secrets.env
 secrets.local.env
-# Session handoff files contain internal strategy â€” never commit
+# Session handoff files contain internal strategy — never commit
 data/meridian-build_handoff.md
 data/chinampa_churchill.md
 
-# Local dev overrides â€” never commit credentials
+# Local dev overrides — never commit credentials
 .env.local
 CLAUDE.local.md
 
@@ -253,5 +261,9 @@ CONNECT.txt
 # Local integration test artifacts (results only)
 tests/integration/results.txt
 
+# Launch artifacts — internal research and coordination, not for public repo
+launch/subreddit_research.md
+launch/launch_checklist.md
+
 extensions/mcp-text-editor/.pixi/
-videos/  
+/videos/

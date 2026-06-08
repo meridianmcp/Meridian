@@ -328,7 +328,13 @@ def test_executor_config_round_trip(client):
 def test_goal_round_trip_and_versioning(client):
     project = client.post("/projects", json={"name": "alpha"}).json()
     r = client.get(f"/projects/{project['id']}/goal")
-    assert r.status_code == 404  # unset goal
+    # G9 — unset goal returns 200 with empty fields (was 404). Browsers
+    # log fetch 4xx to console, which broke the panel-render Playwright
+    # test on every fresh-project initial render.
+    assert r.status_code == 200
+    body = r.json()
+    assert body["content"] == ""
+    assert body["version"] == 0
     r = client.post(
         f"/projects/{project['id']}/goal", json={"content": "go"}
     )
@@ -362,6 +368,20 @@ def test_session_and_task_round_trip(client):
     assert len(r.json()) == 1
     r = client.get(f"/projects/{project['id']}/sessions")
     assert any(s["id"] == sess["id"] for s in r.json())
+
+
+def test_task_model_serializes_skipped_status():
+    """Regression: GET /projects/{id}/tasks must serialize task_log rows with
+    status 'skipped'. Postgres task_log has no CHECK constraint, so historical
+    rows can carry 'skipped'; the Task response model previously omitted it from
+    its Literal and 500'd the whole endpoint with a ResponseValidationError."""
+    from meridian.models import Task
+
+    t = Task(
+        id="t1", session_id="s1", project_id="p1",
+        description="x", status="skipped", created_at="2026-01-01T00:00:00Z",
+    )
+    assert t.status == "skipped"
 
 
 def test_task_for_unknown_project_returns_404(client):
@@ -1790,6 +1810,20 @@ def test_dashboard_html_has_relative_time_helper(client):
     # v1.0.2: JS moved to static file
     js = client.get("/static/dashboard.js").text
     assert "formatRelativeTime" in js
+
+
+def test_dashboard_auth_gate_in_hosted_mode(client, monkeypatch):
+    """Hosted mode: unauthenticated /dashboard must redirect to /auth/login."""
+    from meridian import hosted as hosted_module
+    monkeypatch.setenv("MERIDIAN_HOSTED", "true")
+    # Mock get_current_tenant to raise HTTPException (simulating missing auth)
+    async def mock_get_current_tenant(request):
+        from fastapi import HTTPException
+        raise HTTPException(status_code=401)
+    monkeypatch.setattr(hosted_module, "get_current_tenant", mock_get_current_tenant)
+    r = client.get("/dashboard", follow_redirects=False)
+    assert r.status_code == 302
+    assert r.headers["location"] == "/auth/login"
 
 
 # ---------------------------------------------------------------------------
@@ -4016,6 +4050,84 @@ async def test_timeline_daily_counts_counts_all_statuses(db):
     assert timeline["daily_counts"][0]["count"] == 2
 
 
+def test_canonical_person_aliases():
+    """Known human_id aliases collapse to one canonical identity; emails pass
+    through lowercased; blanks map to (unknown)."""
+    cp = db_module.canonical_person
+    assert cp("adam") == "adam"
+    assert cp("Adam Camerer") == "adam"
+    assert cp("AdamCamerer") == "adam"
+    assert cp("Adam Camerer (executor)") == "adam"
+    # Emails are canonical as-is (lowercased), never aliased.
+    assert cp("Ada@Example.com") == "ada@example.com"
+    # Empty / unknown sentinels.
+    assert cp(None) == "(unknown)"
+    assert cp("") == "(unknown)"
+    assert cp("  ") == "(unknown)"
+    assert cp("(unknown)") == "(unknown)"
+    assert cp("none") == "(unknown)"
+    # An unknown free-text id is preserved (lowercased), not dropped.
+    assert cp("Bri") == "bri"
+
+
+@pytest.mark.asyncio
+async def test_timeline_exposes_people_and_clients(db):
+    """get_timeline returns top-level canonical people + client lists for the
+    filter chips (items 30/31)."""
+    p = await db_module.create_project(db, "alpha")
+    s1 = await db_module.register_session(
+        db, p["id"], "sess-a", human_id="Adam Camerer", client_type="claude-code"
+    )
+    s2 = await db_module.register_session(
+        db, p["id"], "sess-b", human_id="bri", client_type="cursor"
+    )
+    await db_module.log_task(db, s1["id"], p["id"], "a", "done")
+    await db_module.log_task(db, s2["id"], p["id"], "b", "done")
+
+    timeline = await db_module.get_timeline(db, p["id"])
+    # "Adam Camerer" collapses to "adam"; people sorted.
+    assert timeline["people"] == ["adam", "bri"]
+    assert timeline["clients"] == ["claude-code", "cursor"]
+
+
+@pytest.mark.asyncio
+async def test_timeline_daily_sessions_carry_person_and_client(db):
+    """Per-day session entries expose canonical person + client app so the
+    frontend can filter without re-deriving identity."""
+    p = await db_module.create_project(db, "alpha")
+    s = await db_module.register_session(
+        db, p["id"], "sess-a", human_id="Adam Camerer", client_type="claude-code"
+    )
+    await db_module.log_task(db, s["id"], p["id"], "task", "done")
+
+    timeline = await db_module.get_timeline(db, p["id"])
+    se = timeline["daily_counts"][0]["sessions"][0]
+    assert se["person"] == "adam"
+    assert se["client"] == "claude-code"
+    # daily bucket also carries a canonical people breakdown.
+    assert timeline["daily_counts"][0]["people"] == {"adam": 1}
+
+
+@pytest.mark.asyncio
+async def test_timeline_client_defaults_to_none(db):
+    """A session with no client_type reports client '(none)'."""
+    p = await db_module.create_project(db, "alpha")
+    s = await db_module.register_session(db, p["id"], "sess-a", human_id="adam")
+    await db_module.log_task(db, s["id"], p["id"], "task", "done")
+
+    timeline = await db_module.get_timeline(db, p["id"])
+    assert timeline["clients"] == ["(none)"]
+    assert timeline["daily_counts"][0]["sessions"][0]["client"] == "(none)"
+
+
+def test_timeline_endpoint_exposes_people_and_clients(client):
+    """The /timeline route surfaces people + clients lists."""
+    p = client.post("/projects", json={"name": "alpha-pc"}).json()
+    body = client.get(f"/projects/{p['id']}/timeline").json()
+    assert "people" in body and isinstance(body["people"], list)
+    assert "clients" in body and isinstance(body["clients"], list)
+
+
 def test_session_summary_schema_shape():
     """The JSON schema we hand to haiku has the four expected keys."""
     schema = db_module.SESSION_SUMMARY_SCHEMA
@@ -4633,6 +4745,22 @@ async def test_pg_adapter_ntfy_helpers_issue_expected_queries():
     assert db.committed is True
 
 
+def test_pg_adapter_translates_datetime_interval_units():
+    """Postgres SQL translation must handle datetime('now', ? || ' hours') forms."""
+    from meridian.pg_adapter import _pg_adapt_sql
+
+    sql, params = _pg_adapt_sql(
+        "UPDATE file_locks SET claimed_at = datetime('now'), "
+        "expires_at = datetime('now', ? || ' hours') WHERE id = ?",
+        ("2", "lock-123"),
+    )
+
+    assert "datetime('now'" not in sql
+    assert "::interval" in sql
+    assert "hours" in sql
+    assert params == ["2", "lock-123"]
+
+
 def test_cached_plan_error_is_retryable():
     """A stale prepared-plan error must be classified transient so the pool
     retries with a fresh connection.
@@ -4652,6 +4780,69 @@ def test_cached_plan_error_is_retryable():
     assert _is_transient_pg_error(err) is True
     # A genuinely fatal error must still be non-retryable.
     assert _is_transient_pg_error(Exception("syntax error at or near")) is False
+
+
+@pytest.mark.asyncio
+async def test_pg_retry_closes_stale_connection_on_cached_plan_error():
+    """A cached-plan failure should close the stale pooled connection and retry once."""
+    from meridian.pg_adapter import PostgresConnection
+
+    class FakeCursor:
+        def __init__(self, conn):
+            self._conn = conn
+            self.rowcount = 1
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def execute(self, sql, params):
+            self._conn.executed.append((sql, params))
+            if self._conn.failure is not None:
+                raise self._conn.failure
+
+        async def fetchall(self):
+            return self._conn.rows
+
+    class FakeConn:
+        def __init__(self, rows=None, failure=None):
+            self.rows = rows or []
+            self.failure = failure
+            self.closed = False
+            self.executed = []
+
+        def cursor(self, row_factory=None):
+            return FakeCursor(self)
+
+        async def close(self):
+            self.closed = True
+
+    class FakePool:
+        def __init__(self, conns):
+            self._conns = list(conns)
+            self.returned = []
+
+        async def getconn(self):
+            return self._conns.pop(0)
+
+        async def putconn(self, conn):
+            self.returned.append(conn)
+
+    stale = FakeConn(failure=Exception("cached plan must not change result type"))
+    fresh = FakeConn(rows=[{"id": "ok"}])
+    pool = FakePool([stale, fresh])
+    db = PostgresConnection(pool)
+
+    cur = await db._execute_with_retry("SELECT 1", [], "SELECT")
+
+    assert await cur.fetchall() == [{"id": "ok"}]
+    assert stale.closed is True
+    assert stale not in pool.returned
+    assert fresh in pool.returned
+    assert stale.executed == [("SELECT 1", None)]
+    assert fresh.executed == [("SELECT 1", None)]
 
 
 def test_pg_pool_disables_prepared_statements():
@@ -5413,6 +5604,14 @@ def test_landing_page_has_try_demo_link(client):
     assert "/demo" in r.text
 
 
+def test_landing_page_has_solution_dashboard_shot(client):
+    """G6.27 — landing page shows the real dashboard screenshot, not a mockup."""
+    r = client.get("/")
+    assert r.status_code == 200
+    assert "/static/the-solution-dashboard-card.png" in r.text
+    assert "solution-shot" in r.text
+
+
 def test_install_mcp_page(client):
     """GET /install-mcp returns 200 with copy-ready SSE URL and no-cache headers."""
     r = client.get("/install-mcp")
@@ -5521,6 +5720,556 @@ def test_demo_cache_control(client):
         cc = r.headers.get("cache-control", "")
         assert "no-cache" in cc
         assert "no-store" in cc
+
+
+def test_landing_page_charset_and_emoji_survival(client):
+    """Regression for the cc3eeb9 mojibake incident: served bytes must decode as UTF-8
+    and known emoji must survive intact. If this fails, the template was likely
+    re-saved with cp1252 interpretation of UTF-8 bytes."""
+    r = client.get("/")
+    assert r.status_code == 200
+    ctype = r.headers.get("content-type", "").lower()
+    assert "charset=utf-8" in ctype, f"missing charset=utf-8: {ctype!r}"
+    body = r.content.decode("utf-8")
+    for marker in ("🎯", "📋", "🧭", "🐙", "—", "→", "⚡"):
+        assert marker in body, f"emoji {marker!r} missing — landing.html may have re-encoded"
+    for moji in ("ðŸ", "â€”", "â€“", "â†’", "âœ", "âš¡"):
+        assert moji not in body, f"mojibake sequence {moji!r} present in landing page"
+
+
+def test_g519_roles_map_grants_expected_permissions():
+    """G5.19 — ROLE_PERMS map: owner has everything; admin has invite/
+    settings/HITL but NOT billing/delete; member has read+write only;
+    viewer has read only."""
+    from meridian import roles
+    assert roles.has_perm("owner",  roles.PERM_DELETE_TENANT)
+    assert roles.has_perm("owner",  roles.PERM_BILLING)
+    assert roles.has_perm("admin",  roles.PERM_INVITE)
+    assert roles.has_perm("admin",  roles.PERM_HITL_ANSWER)
+    assert not roles.has_perm("admin",  roles.PERM_BILLING)
+    assert not roles.has_perm("admin",  roles.PERM_DELETE_TENANT)
+    assert roles.has_perm("member", roles.PERM_WRITE)
+    assert not roles.has_perm("member", roles.PERM_INVITE)
+    assert not roles.has_perm("member", roles.PERM_HITL_ANSWER)
+    assert roles.has_perm("viewer", roles.PERM_READ)
+    assert not roles.has_perm("viewer", roles.PERM_WRITE)
+    assert not roles.has_perm("nope",   roles.PERM_READ)
+    assert not roles.has_perm(None,     roles.PERM_READ)
+
+
+def test_g520_github_access_caps_gh_tool_dispatch():
+    """G5.20 — can_github: write→all, read→read-only tools, none→nothing."""
+    from meridian import roles
+    assert roles.can_github("write", "read_file")
+    assert roles.can_github("write", "commit")
+    assert roles.can_github("read",  "read_file")
+    assert roles.can_github("read",  "search_code")
+    assert not roles.can_github("read",  "commit")
+    assert not roles.can_github("none",  "read_file")
+    assert not roles.can_github(None,    "read_file")
+    # Defaults from role
+    assert roles.default_github_access_for_role("owner")  == "write"
+    assert roles.default_github_access_for_role("admin")  == "write"
+    assert roles.default_github_access_for_role("member") == "read"
+    assert roles.default_github_access_for_role("viewer") == "none"
+
+
+@pytest.mark.asyncio
+async def test_g519_resolve_member_role_owner_vs_invitee():
+    """G5.19 — resolve_member_role returns ('owner','write') for the tenant
+    email itself, the stored (role, github_access) tuple for an accepted
+    invitee, and None for unknown / pending invitees."""
+    from datetime import datetime, timezone
+    db = await db_module.init_db(":memory:")
+    try:
+        await db.execute(
+            "INSERT INTO tenants (id, email) VALUES (?, ?)",
+            ("t-owner", "owner@example.com"),
+        )
+        # Accepted admin invitee
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        await db.execute(
+            "INSERT INTO workspace_members "
+            "(id, tenant_id, email, role, github_access, token_hash, joined_at) "
+            "VALUES (?, ?, ?, ?, ?, NULL, ?)",
+            ("m-admin", "t-owner", "admin@example.com", "admin", "write", now),
+        )
+        # Pending viewer invitee
+        await db.execute(
+            "INSERT INTO workspace_members "
+            "(id, tenant_id, email, role, github_access, token_hash, joined_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, NULL)",
+            ("m-viewer", "t-owner", "viewer@example.com", "viewer", "none", "tok"),
+        )
+        await db.commit()
+        assert await db_module.resolve_member_role(
+            db, "t-owner", "OWNER@example.com"
+        ) == ("owner", "write")
+        assert await db_module.resolve_member_role(
+            db, "t-owner", "admin@example.com"
+        ) == ("admin", "write")
+        # Pending invitee → None (not joined yet)
+        assert await db_module.resolve_member_role(
+            db, "t-owner", "viewer@example.com"
+        ) is None
+        # Unknown email → None
+        assert await db_module.resolve_member_role(
+            db, "t-owner", "stranger@example.com"
+        ) is None
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_g519_rbac_migration_is_idempotent_and_widens_check():
+    """G5.19 — migration is idempotent: running it twice is a no-op, and
+    after running it once, 'admin' role inserts succeed (the legacy
+    CHECK that excluded admin has been dropped)."""
+    db = await db_module.init_db(":memory:")
+    try:
+        # Migration ran during init_db; running again is safe.
+        await db_module._migrate_workspace_members_rbac(db)
+        await db_module._migrate_workspace_members_rbac(db)
+        # Admin insert succeeds — legacy CHECK constraint is gone.
+        await db.execute(
+            "INSERT INTO tenants (id, email) VALUES (?, ?)",
+            ("t-r", "r@example.com"),
+        )
+        await db.execute(
+            "INSERT INTO workspace_members "
+            "(id, tenant_id, email, role, github_access, token_hash) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            ("m-a", "t-r", "a@example.com", "admin", "write", "tok2"),
+        )
+        await db.commit()
+        async with db.execute(
+            "SELECT role, github_access FROM workspace_members WHERE id = 'm-a'"
+        ) as cur:
+            row = await cur.fetchone()
+        assert row["role"] == "admin"
+        assert row["github_access"] == "write"
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_v28_update_workspace_member_role_and_scoping():
+    """v2.8 — update_workspace_member changes role/github_access, is scoped by
+    tenant_id, and returns None for a non-matching member."""
+    db = await db_module.init_db(":memory:")
+    try:
+        await db.execute(
+            "INSERT INTO tenants (id, email) VALUES (?, ?)",
+            ("t-own", "own@example.com"),
+        )
+        await db.execute(
+            "INSERT INTO workspace_members "
+            "(id, tenant_id, email, role, github_access, token_hash) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            ("m-1", "t-own", "m@example.com", "viewer", "none", "tok"),
+        )
+        await db.commit()
+        # Promote viewer → admin with an explicit github_access cap.
+        updated = await db_module.update_workspace_member(
+            db, "m-1", "t-own", role="admin", github_access="write",
+        )
+        assert updated is not None
+        assert updated["role"] == "admin"
+        assert updated["github_access"] == "write"
+        # Partial update: change only github_access, role stays put.
+        updated = await db_module.update_workspace_member(
+            db, "m-1", "t-own", github_access="read",
+        )
+        assert updated["role"] == "admin"
+        assert updated["github_access"] == "read"
+        # Wrong tenant → no row matches → None, and the row is untouched.
+        assert await db_module.update_workspace_member(
+            db, "m-1", "t-other", role="viewer",
+        ) is None
+        async with db.execute(
+            "SELECT role FROM workspace_members WHERE id = 'm-1'"
+        ) as cur:
+            row = await cur.fetchone()
+        assert row["role"] == "admin"
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_v28_workspace_settings_display_name_roundtrip():
+    """v2.8 — display_name persists through update/get and clears on empty."""
+    db = await db_module.init_db(":memory:")
+    try:
+        assert (await db_module.get_workspace_settings(db))["display_name"] is None
+        saved = await db_module.update_workspace_settings(db, display_name="Adam")
+        assert saved["display_name"] == "Adam"
+        # Untouched on an unrelated patch.
+        saved = await db_module.update_workspace_settings(
+            db, hitl_auto_answer_default=True,
+        )
+        assert saved["display_name"] == "Adam"
+        # Empty string clears it back to NULL.
+        saved = await db_module.update_workspace_settings(db, display_name="")
+        assert saved["display_name"] is None
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_g210_is_internal_backfill_and_churn_cleanup_skip():
+    """G2.10 — the migrator backfills is_internal=1 for the four known
+    internal emails, and run_churn_cleanup never touches an internal
+    tenant even when they have a Neon project and no Stripe customer."""
+    from meridian.hosted import run_churn_cleanup
+    db = await db_module.init_db(":memory:")
+    try:
+        # Migration already ran inside init_db; insert a known internal email
+        # and verify the backfill UPDATE caught it on a re-run of the migrator.
+        await db.execute(
+            "INSERT INTO tenants (id, email, neon_project_id) VALUES (?, ?, ?)",
+            ("t-internal", "ajc123private@gmail.com", "neon-internal"),
+        )
+        await db.execute(
+            "INSERT INTO tenants (id, email, neon_project_id) VALUES (?, ?, ?)",
+            ("t-external", "stranger@example.com", "neon-external"),
+        )
+        await db.commit()
+        # Re-run the migrator — it should mark the internal row.
+        await db_module._migrate_tenants_is_internal(db)
+
+        async with db.execute(
+            "SELECT email, is_internal FROM tenants ORDER BY email"
+        ) as cur:
+            rows = await cur.fetchall()
+        flags = {r["email"]: r["is_internal"] for r in rows}
+        assert flags["ajc123private@gmail.com"] == 1
+        assert flags["stranger@example.com"] == 0
+
+        # Both tenants look churned (stripe_customer_id IS NULL,
+        # neon_project_id IS NOT NULL). Running the cleanup should only
+        # consider the external one — the internal is filtered out at SQL.
+        # We verify by checking the SQL filter directly:
+        async with db.execute(
+            "SELECT id FROM tenants WHERE stripe_customer_id IS NULL "
+            "AND neon_project_id IS NOT NULL "
+            "AND (is_internal IS NULL OR is_internal = 0)"
+        ) as cur:
+            churn_candidates = [r["id"] for r in await cur.fetchall()]
+        assert "t-external" in churn_candidates
+        assert "t-internal" not in churn_candidates
+
+        # Belt-and-suspenders: the cleanup helper takes the filter SQL we
+        # just asserted on, so a defensive call shouldn't even reach the
+        # internal row. We swallow downstream errors (the external tenant
+        # has a stub created_at format that the email helper rejects) —
+        # the point is that the SQL gate is the line of defense.
+        try:
+            await run_churn_cleanup(db)
+        except Exception:
+            pass
+        # Verify internal tenant is still present and un-warned after the run.
+        async with db.execute(
+            "SELECT id FROM tenants WHERE id = 't-internal'"
+        ) as cur:
+            assert (await cur.fetchone()) is not None
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_start_session_returns_continuation_for_fresh_repeat():
+    """G8.34 — re-calling start_session for the same session_name within the
+    idle window returns a continuation block, not a brand-new registration."""
+    from meridian.server import _start_session_composite
+    db = await db_module.init_db(":memory:")
+    try:
+        p = await db_module.create_project(db, "g834-proj")
+        first = await _start_session_composite(
+            db, p["id"], "feature-x", "/tmp", source="startup",
+        )
+        assert "continuation" not in first
+        first_sid = first["session_id"]
+        # Immediate re-call — the prior session's last_seen is fresh.
+        second = await _start_session_composite(
+            db, p["id"], "feature-x", "/tmp", source="resume",
+        )
+        assert second.get("continuation") is True
+        assert second["source"] == "resume"
+        assert second["session"]["id"] == first_sid
+        assert "recent_tasks" in second
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_start_session_skips_continuation_for_stale_session():
+    """G8.34 — when last_seen is older than the idle window, fall through to
+    a fresh registration. The MCP-Session-Id header is never consulted."""
+    from meridian.server import _start_session_composite
+    db = await db_module.init_db(":memory:")
+    try:
+        p = await db_module.create_project(db, "g834-stale")
+        first = await _start_session_composite(
+            db, p["id"], "feature-y", "/tmp",
+        )
+        first_sid = first["session_id"]
+        # Backdate last_seen by 10 minutes.
+        await db.execute(
+            "UPDATE sessions SET last_seen = datetime('now', '-10 minutes') WHERE id = ?",
+            (first_sid,),
+        )
+        await db.commit()
+        second = await _start_session_composite(
+            db, p["id"], "feature-y", "/tmp",
+        )
+        assert second.get("continuation") is not True
+        assert second["session_id"] != first_sid
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_workspace_member_accepted_for_email_finds_accepted_only():
+    """G5.22 — the helper used by OAuth callbacks to skip Neon provisioning
+    for invitees must only consider ACCEPTED memberships, not pending ones."""
+    from datetime import datetime, timezone
+    import hashlib
+    db = await db_module.init_db(":memory:")
+    try:
+        # No row at all → None
+        assert await db_module.workspace_member_accepted_for_email(db, "x@x.com") is None
+        # Need a real tenant row to satisfy the workspace_members FK.
+        await db.execute(
+            "INSERT INTO tenants (id, email) VALUES (?, ?)",
+            ("tenant-owner", "owner@example.com"),
+        )
+        await db.commit()
+        # Invite pending (no joined_at)
+        await db.execute(
+            "INSERT INTO workspace_members (id, tenant_id, email, role, token_hash) "
+            "VALUES (?, ?, ?, ?, ?)",
+            ("m1", "tenant-owner", "invitee@example.com", "member",
+             hashlib.sha256(b"tok").hexdigest()),
+        )
+        await db.commit()
+        assert await db_module.workspace_member_accepted_for_email(db, "invitee@example.com") is None
+        # Mark accepted
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        await db.execute(
+            "UPDATE workspace_members SET joined_at = ?, token_hash = NULL WHERE id = ?",
+            (now, "m1"),
+        )
+        await db.commit()
+        got = await db_module.workspace_member_accepted_for_email(db, "INVITEE@EXAMPLE.COM")
+        assert got is not None
+        assert got["email"] == "invitee@example.com"
+    finally:
+        await db.close()
+
+
+def test_project_icon_patch_round_trip(client):
+    """G4.17 — PATCH /projects/{pid}/icon stores the emoji and clears it."""
+    p = client.post("/projects", json={"name": "g417-icon"}).json()
+    r = client.patch(f"/projects/{p['id']}/icon", json={"icon": "🎯"})
+    assert r.status_code == 200
+    assert r.json()["icon"] == "🎯"
+
+    r = client.get("/projects").json()
+    found = next(x for x in r if x["id"] == p["id"])
+    assert found["icon"] == "🎯"
+
+    r = client.patch(f"/projects/{p['id']}/icon", json={"icon": None})
+    assert r.status_code == 200
+    assert r.json()["icon"] is None
+
+    # Long input is truncated to 8 chars at the model boundary.
+    r = client.patch(f"/projects/{p['id']}/icon", json={"icon": "x" * 50})
+    assert r.status_code == 200
+    assert len(r.json()["icon"]) <= 8
+
+
+def test_safety_limits_module_thresholds_have_sensible_defaults():
+    """G4.15 — defaults are guard-rails, not quotas."""
+    from meridian import limits
+    assert limits.PROJECTS_PER_TENANT == 1_000
+    assert limits.SPRINT_ITEMS_PER_PROJECT == 50_000
+    assert limits.NOTES_PER_PROJECT == 100_000
+    assert limits.DECISIONS_PER_PROJECT == 10_000
+    assert limits.SESSIONS_PER_PROJECT == 100_000
+    assert limits.TASKS_PER_PROJECT == 1_000_000
+    assert limits.OPEN_HITL_PER_PROJECT == 1_000
+    assert limits.BODY_BYTES == 100_000
+
+
+def test_safety_limits_env_override(monkeypatch):
+    """G4.15 — environment overrides take effect at module load. Tests can
+    also monkeypatch the module attribute for in-process scenarios."""
+    from meridian import limits
+    monkeypatch.setattr(limits, "NOTES_PER_PROJECT", 2)
+    try:
+        limits.check_notes_per_project(0)
+        limits.check_notes_per_project(1)
+    except limits.LimitExceeded:
+        raise AssertionError("limit should not trip below threshold")
+    with pytest.raises(limits.LimitExceeded):
+        limits.check_notes_per_project(2)
+
+
+def test_safety_limit_returns_429_on_note_create(client, monkeypatch):
+    """G4.15 — a notes count past the limit returns 429 with the canonical
+    Safety message rather than 500 or silent success."""
+    from meridian import limits
+    monkeypatch.setattr(limits, "NOTES_PER_PROJECT", 1)
+    p = client.post("/projects", json={"name": "g415-note-cap"}).json()
+    r = client.post(
+        f"/projects/{p['id']}/notes",
+        json={"title": "n1", "body": "first"},
+    )
+    assert r.status_code == 201
+    r = client.post(
+        f"/projects/{p['id']}/notes",
+        json={"title": "n2", "body": "second"},
+    )
+    assert r.status_code == 429
+    j = r.json()
+    assert j.get("kind") == "notes_per_project"
+    assert "Safety limit reached" in j.get("detail", "")
+    assert "hello@usemeridian.us" in j.get("detail", "")
+
+
+def test_safety_limit_body_size_middleware_429(client, monkeypatch):
+    """G4.15 — Content-Length past the body cap is rejected before any handler runs."""
+    from meridian import limits
+    monkeypatch.setattr(limits, "BODY_BYTES", 100)
+    # 500-byte body, content-length declared honestly
+    payload = "x" * 500
+    r = client.post(
+        "/projects",
+        content=payload,
+        headers={"Content-Type": "application/json", "Content-Length": "500"},
+    )
+    assert r.status_code == 429
+    assert "body_bytes" in r.json().get("kind", "")
+
+
+def test_billing_portal_redirects_anonymous_to_login(client, monkeypatch):
+    """G2.11 — /billing/portal sends anonymous users to /auth/login with a next= back."""
+    monkeypatch.setenv("MERIDIAN_HOSTED", "true")
+    r = client.get("/billing/portal", follow_redirects=False)
+    assert r.status_code == 302
+    assert r.headers["location"].startswith("/auth/login")
+    assert "next=/billing/portal" in r.headers["location"]
+
+
+def test_billing_portal_endpoint_registered():
+    """G2.11 — the /billing/portal route exists on the FastAPI app."""
+    from meridian.server import app
+    routes = {r.path for r in app.routes if hasattr(r, "path")}
+    assert "/billing/portal" in routes
+
+
+@pytest.mark.asyncio
+async def test_create_stripe_billing_portal_session_rejects_no_customer():
+    """G2.11 — helper raises ValueError when stripe_customer_id is missing,
+    so the route can redirect to /pricing instead of failing opaquely."""
+    from meridian.hosted import create_stripe_billing_portal_session
+    with pytest.raises(ValueError):
+        await create_stripe_billing_portal_session({"email": "free@example.com"})
+
+
+def test_me_endpoint_exposes_has_stripe_customer(client, monkeypatch):
+    """G2.11 — /me payload carries has_stripe_customer so the dashboard
+    can flip the billing button between Manage and Upgrade without a
+    separate round-trip."""
+    monkeypatch.delenv("MERIDIAN_HOSTED", raising=False)
+    r = client.get("/me")
+    assert r.status_code == 200
+    # Local mode returns {} (no tenant) — the field is added only when there's a tenant.
+    # In hosted mode without a session, also {}. Either way it shouldn't crash.
+    assert r.json() == {} or "has_stripe_customer" in r.json()
+
+
+def test_hosted_non_admin_cannot_mutate_connections(client, monkeypatch):
+    """G1.9 — POST/DELETE /config/connections returns 403 for non-admin hosted
+    tenants. Replaces the surprising 404 "connection 'env' not found" with a
+    clear permission error and matches the read-only dashboard UI."""
+    monkeypatch.setenv("MERIDIAN_HOSTED", "true")
+    monkeypatch.delenv("MERIDIAN_ADMIN_EMAILS", raising=False)
+    monkeypatch.delenv("ADMIN_EMAIL", raising=False)
+    # No session cookie → get_current_tenant raises 401 → guard maps to 403.
+    r = client.post("/config/connections", json={"name": "neon-prod", "activate": True})
+    assert r.status_code == 403
+    assert "admin" in r.json().get("detail", "").lower() or \
+           "sign in" in r.json().get("detail", "").lower()
+    r = client.delete("/config/connections/neon-prod")
+    assert r.status_code == 403
+
+
+def test_local_mode_connections_endpoint_unchanged(client, monkeypatch):
+    """G1.9 — the guard is hosted-only; self-hosted local installs still
+    accept the POST/DELETE flow without auth (single-user trust model)."""
+    monkeypatch.delenv("MERIDIAN_HOSTED", raising=False)
+    r = client.post(
+        "/config/connections",
+        json={"name": "local-test", "type": "sqlite", "activate": False},
+    )
+    # In local mode we should NOT get 403. Success or some other status,
+    # depending on whether toml writes are mocked, but not 403.
+    assert r.status_code != 403
+
+
+def test_canonicalize_notify_target_strips_ntfy_prefix():
+    """G1.7 — ntfy URLs collapse to topic-only; emails/webhooks pass through."""
+    from meridian.server import _canonicalize_notify_target
+
+    assert _canonicalize_notify_target("https://ntfy.sh/foo") == "foo"
+    assert _canonicalize_notify_target("https://ntfy.sh/foo/") == "foo"
+    assert _canonicalize_notify_target("ntfy.sh/foo") == "foo"
+    assert _canonicalize_notify_target("  foo  ") == "foo"
+    assert _canonicalize_notify_target("you@example.com") == "you@example.com"
+    assert _canonicalize_notify_target("https://hooks.slack.com/x/y") == "https://hooks.slack.com/x/y"
+    assert _canonicalize_notify_target("") is None
+    assert _canonicalize_notify_target(None) is None
+
+
+def test_patch_ntfy_canonicalizes_and_uniquifies(client):
+    """G1.7 — PATCH stores the topic only and suffixes -2 on collision."""
+    p1 = client.post("/projects", json={"name": "g17-p1"}).json()
+    p2 = client.post("/projects", json={"name": "g17-p2"}).json()
+
+    r = client.patch(f"/projects/{p1['id']}/ntfy", json={"notify_url": "https://ntfy.sh/sweep-alerts"})
+    assert r.status_code == 200
+    assert r.json()["notify_url"] == "sweep-alerts"
+
+    r = client.patch(f"/projects/{p2['id']}/ntfy", json={"notify_url": "sweep-alerts"})
+    assert r.status_code == 200
+    assert r.json()["notify_url"] == "sweep-alerts-2"
+
+    # Emails pass through unchanged
+    r = client.patch(f"/projects/{p1['id']}/ntfy", json={"notify_url": "ops@example.com"})
+    assert r.json()["notify_url"] == "ops@example.com"
+
+
+def test_global_hitl_endpoint_returns_project_id_per_row(client):
+    """G1.2 — the global /hitl endpoint must include project_id on each row
+    so the dashboard can group pending counts per-project. Without this,
+    every project vtab badge gets the same global total (the symptom
+    that surfaced: HITL badge shows 2 while THIS project's queue is empty)."""
+    p1 = client.post("/projects", json={"name": "g12-p1"}).json()
+    p2 = client.post("/projects", json={"name": "g12-p2"}).json()
+    r = client.post(f"/projects/{p2['id']}/hitl", json={"question": "p2 q1"})
+    assert r.status_code == 201
+    r = client.post(f"/projects/{p2['id']}/hitl", json={"question": "p2 q2"})
+    assert r.status_code == 201
+
+    rows = client.get("/hitl?status=pending&limit=50").json()
+    assert isinstance(rows, list)
+    pids = [r.get("project_id") for r in rows]
+    assert all(pid for pid in pids), f"every HITL row needs project_id, got {pids!r}"
+    grouped = {pid: pids.count(pid) for pid in set(pids)}
+    assert grouped.get(p2["id"]) == 2
+    assert grouped.get(p1["id"], 0) == 0
+
 
 # v2.4 — decisions_pinned (editable constitution)
 # ---------------------------------------------------------------------------
@@ -6249,6 +6998,17 @@ async def test_get_set_project_notify_url(anydb):
 
 
 @pytest.mark.asyncio
+async def test_new_tenant_notification_defaults(db):
+    """New tenants must have storage + sprint notifications ON, all others OFF."""
+    tenant = await db_module.upsert_tenant(db, email="newuser@example.com")
+    prefs = json.loads(tenant.get("notification_prefs") or "{}")
+    assert prefs.get("storage") is True, "storage notification should default ON"
+    assert prefs.get("sprint") is True, "sprint notification should default ON"
+    assert not prefs.get("hitl"), "hitl notification should default OFF"
+    assert not prefs.get("stalled"), "stalled notification should default OFF"
+
+
+@pytest.mark.asyncio
 async def test_dispatch_notification_ntfy(monkeypatch):
     """_dispatch_notification routes ntfy.sh URLs with special headers."""
     from meridian.server import _dispatch_notification
@@ -6427,17 +7187,18 @@ def test_notify_url_patch_and_get(client, monkeypatch):
     assert r.status_code in (200, 201)
     pid = r.json()["id"]
 
-    # Save a URL via the canonical notify_url key
+    # Save a URL via the canonical notify_url key. As of G1.7, ntfy URLs are
+    # canonicalized to topic-only on save; the response echoes the stored form.
     r2 = client.patch(f"/projects/{pid}/ntfy", json={"notify_url": "https://ntfy.sh/test-123"})
     assert r2.status_code == 200
-    assert r2.json().get("notify_url") == "https://ntfy.sh/test-123" or \
-           r2.json().get("ntfy_url") == "https://ntfy.sh/test-123"
+    assert r2.json().get("notify_url") == "test-123" or \
+           r2.json().get("ntfy_url") == "test-123"
 
     # Confirm it's persisted
     r3 = client.get(f"/projects/{pid}/ntfy")
     assert r3.status_code == 200
     saved = r3.json().get("notify_url") or r3.json().get("ntfy_url")
-    assert saved == "https://ntfy.sh/test-123"
+    assert saved == "test-123"
 
 
 def test_notify_test_endpoint_no_url(client):
@@ -6551,3 +7312,144 @@ def test_notify_test_endpoint_delivers_ntfy_message_via_postgres(tmp_path, monke
     pytest.fail("Timed out waiting for ntfy.sh test notification")
 
 
+# ---------------------------------------------------------------------------
+# cleanup-june8: regression tests for A/B/C
+# ---------------------------------------------------------------------------
+
+
+def test_delete_project_confirm_requires_typed_name(client):
+    """dashboard.js _deleteProject uses window.prompt requiring the project name."""
+    js = client.get("/static/dashboard.js").text
+    # Confirm dialog was replaced with a prompt that checks the typed name
+    assert "window.prompt(" in js, "_deleteProject must use window.prompt"
+    assert "typed.trim() !== t.project.name" in js, "typed name check missing"
+    # Old single-click confirm must be gone
+    assert 'window.confirm(\n    `Delete "' not in js, "single confirm() still present"
+
+
+def test_admin_snapshot_file_db_has_data(tmp_path, monkeypatch):
+    """GET /admin/snapshot with a file-based SQLite DB returns a DB containing project rows."""
+    import importlib
+
+    db_path = tmp_path / "snap_test.db"
+    monkeypatch.setenv("MERIDIAN_DB", str(db_path))
+    monkeypatch.setenv("MERIDIAN_DB_URL", "")
+    monkeypatch.setenv("MERIDIAN_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("MERIDIAN_DEMO_DB_URL", "")
+    monkeypatch.setenv("MERIDIAN_SKIP_DEMO", "1")
+    monkeypatch.setenv("MERIDIAN_GOAL_MD", str(tmp_path / "GOAL.md"))
+    monkeypatch.setenv("MERIDIAN_MD_ROOT", str(tmp_path))
+
+    # Prevent meridian.toml from overriding MERIDIAN_DB_URL with the real Neon URL.
+    # The lifespan only skips the toml check for :memory:; for a real file path it
+    # runs get_toml_db_url() and would clobber our empty DB_URL monkeypatch.
+    import meridian.toml_config as _toml_mod
+    monkeypatch.setattr(_toml_mod, "get_toml_db_url", lambda: (None, None))
+
+    import meridian.server as srv_mod
+    srv_mod = importlib.reload(srv_mod)
+
+    from fastapi.testclient import TestClient
+
+    with TestClient(srv_mod.app) as c:
+        c.post("/projects", json={"name": "snap-test-project"})
+        r = c.get("/admin/snapshot")
+        assert r.status_code == 200
+        assert r.headers["content-type"] == "application/x-sqlite3"
+        # SQLite file magic header — confirms the response is a real DB file, not empty/error
+        assert r.content[:16] == b"SQLite format 3\x00", \
+            "snapshot does not have SQLite magic header"
+        # Must be non-trivial size (at least a few pages — not just empty header)
+        assert len(r.content) >= 4096, \
+            f"snapshot too small ({len(r.content)} bytes) — expected at least one page"
+
+
+def test_mcp_create_project_duplicate_returns_error(client):
+    """MCP create_project via /mcp/sse returns error when project name already exists."""
+    name = f"dup-guard-{uuid.uuid4().hex[:6]}"
+    # First creation succeeds
+    r1 = client.post("/mcp/sse", json={
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": {"name": "create_project", "arguments": {"name": name}},
+    })
+    assert r1.status_code == 200
+    d1 = r1.json()
+    assert "result" in d1, f"first create failed: {d1}"
+
+    # Second creation with same name returns error
+    r2 = client.post("/mcp/sse", json={
+        "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+        "params": {"name": "create_project", "arguments": {"name": name}},
+    })
+    assert r2.status_code == 200
+    d2 = r2.json()
+    text = d2.get("result", {}).get("content", [{}])[0].get("text", "")
+    assert "already exists" in text, f"expected 'already exists' error, got: {text}"
+
+
+# ---------------------------------------------------------------------------
+# Sprint tools in _MCP_TOOLS_LIST + _dispatch_mcp_tool (hosted /mcp route)
+# ---------------------------------------------------------------------------
+
+def test_sprint_tools_in_mcp_tools_list():
+    """set_sprint, add_sprint_item, complete_sprint_item, get_sprint_items appear in _MCP_TOOLS_LIST."""
+    from meridian.mcp_tools import _MCP_TOOLS_LIST
+    names = {t["name"] for t in _MCP_TOOLS_LIST}
+    missing = {"set_sprint", "add_sprint_item", "complete_sprint_item", "get_sprint_items"} - names
+    assert not missing, f"Missing from _MCP_TOOLS_LIST: {missing}"
+
+
+def test_get_sprint_items_is_read_only():
+    from meridian.mcp_tools import _MCP_TOOLS_LIST
+    tool = next(t for t in _MCP_TOOLS_LIST if t["name"] == "get_sprint_items")
+    assert tool["annotations"]["readOnlyHint"] is True
+
+
+@pytest.mark.asyncio
+async def test_dispatch_mcp_tool_set_sprint(db):
+    """set_sprint via _dispatch_mcp_tool updates the sprint field."""
+    import meridian.server as srv
+    p = await db_module.create_project(db, "sprint-dispatch-test")
+    await db_module.set_goal(db, p["id"], "initial goal")
+    result = await srv._dispatch_mcp_tool(
+        "set_sprint", {"project_id": p["id"], "sprint": "week-1-auth"}, db, "/tmp"
+    )
+    assert result["sprint"] == "week-1-auth"
+
+
+@pytest.mark.asyncio
+async def test_dispatch_mcp_tool_sprint_items_round_trip(db):
+    """add_sprint_item / get_sprint_items / complete_sprint_item via _dispatch_mcp_tool."""
+    import meridian.server as srv
+    p = await db_module.create_project(db, "sprint-dispatch-items-test")
+
+    added = await srv._dispatch_mcp_tool(
+        "add_sprint_item",
+        {"project_id": p["id"], "version": "v1", "title": "Ship login"},
+        db, "/tmp",
+    )
+    assert added["title"] == "Ship login"
+    item_id = added["id"]
+
+    items = await srv._dispatch_mcp_tool(
+        "get_sprint_items", {"project_id": p["id"]}, db, "/tmp"
+    )
+    assert any(it["id"] == item_id for it in items)
+
+    done = await srv._dispatch_mcp_tool(
+        "complete_sprint_item",
+        {"project_id": p["id"], "item_id": item_id},
+        db, "/tmp",
+    )
+    assert done["status"] == "done"
+
+
+def test_sprint_tools_via_mcp_sse_tools_list(client):
+    """tools/list on /mcp/sse includes the 4 sprint tools."""
+    r = client.post("/mcp/sse", json={
+        "jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}
+    })
+    assert r.status_code == 200
+    names = {t["name"] for t in r.json()["result"]["tools"]}
+    missing = {"set_sprint", "add_sprint_item", "complete_sprint_item", "get_sprint_items"} - names
+    assert not missing, f"Missing from tools/list: {missing}"

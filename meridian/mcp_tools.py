@@ -298,6 +298,48 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
      "inputSchema": {"type": "object", "properties": {
          "session_id": {"type": "string"}},
          "required": ["session_id"]}},
+    {"name": "set_sprint", "description":
+        "Update only the sprint — the short-term focus that changes each session or week. "
+        "Any team member can call this; no ownership check.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"},
+         "sprint": {"type": "string"}},
+         "required": ["project_id", "sprint"]}},
+    {"name": "add_sprint_item", "description":
+        "Append a todo item to the project's sprint checklist. Use when starting work on a "
+        "new version so the next session sees what's in flight. Optional: group items under "
+        "a named objective with 'group'; attribute to a person with 'human_id'. "
+        "Use 'depends_on' to block until another item finishes.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"},
+         "version": {"type": "string"},
+         "title": {"type": "string"},
+         "group": {"type": "string", "description": "Optional objective name for grouping."},
+         "human_id": {"type": "string", "description": "Optional: person this item is assigned to."},
+         "depends_on": {"type": "string", "description": "Sprint item id that must complete first."},
+         "failure_mode": {"type": "string", "enum": ["continue", "stop"],
+                          "description": "'stop' blocks this item if the parent fails."},
+         "milestone_type": {"type": "string", "enum": ["task", "milestone"],
+                            "description": "'milestone' renders as a timeline marker."}},
+         "required": ["project_id", "version", "title"]}},
+    {"name": "complete_sprint_item", "description":
+        "Mark a sprint item done. Pass task_id to link the task that shipped it.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"},
+         "item_id": {"type": "string"},
+         "task_id": {"type": "string"}},
+         "required": ["project_id", "item_id"]}},
+    {"name": "get_sprint_items", "description":
+        "List sprint items for a project. Optional status filter "
+        "(todo|pending|in_progress|done|failed|skipped|pushed). "
+        "Cold sessions read this to know what's still owed.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"},
+         "status": {"type": "string",
+                    "enum": ["pending", "todo", "in_progress", "done",
+                             "failed", "skipped", "pushed"],
+                    "description": "Filter by status."}},
+         "required": ["project_id"]}},
     {"name": "get_run_transcript", "description":
         "Return the full transcript of the executor_run for the given session. "
         "The transcript accumulates every log_task description logged during the run, "
@@ -370,6 +412,7 @@ _READ_ONLY_TOOLS = {
     "list_hitl_requests", "list_sessions", "get_sprint_notes",
     "get_run_transcript", "idle_until_session_done", "generate_handoff",
     "get_workspace_notes", "get_workspace_decisions", "get_workspace_settings",
+    "get_sprint_items",
 }
 _DESTRUCTIVE_TOOLS = {"delete_note", "delete_decision", "dismiss_hitl"}
 

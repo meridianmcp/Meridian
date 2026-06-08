@@ -113,7 +113,9 @@ export MERIDIAN_DB_URL="postgresql://neondb_owner:...@ep-xxx.us-east-2.aws.neon.
 pixi run start
 ```
 
-Meridian auto-detects Postgres from the URL prefix and switches to `asyncpg`.
+Meridian auto-detects Postgres from the URL prefix and switches to `psycopg3`
+(the connection pool, autocommit, and adapter translation live in
+`meridian/pg_adapter.py`; SQLite remains the default for local installs).
 
 ---
 

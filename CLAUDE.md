@@ -105,7 +105,7 @@ your project context on start and snapshots progress on end.
 - **End every session**: If tests pass, merge `dev → main` and push `main` to trigger deploy. Do not end the session with work stranded only on `dev`.
 - **Set sprint name**: Use `PATCH /projects/{id}/goal` with body `{"sprint": "name"}` directly (or the `set_sprint` MCP tool). Do NOT use `set_goal` for sprint-only updates.
 - **Handoff**: Use `get_context_block(project_id)` for the handoff context block. Do NOT read from `data/meridian-build_handoff.md` — that file is local-only and not reliable across sessions.
-- **Project discovery**: Use `list_projects()` when the project ID is unknown. Never create a project just to get a working ID.
+- **Project discovery**: Use `list_projects()` when the project ID is unknown. Never call `create_project()` without explicit human instruction — use `list_projects()` to find existing projects first. Never create a project just to get a working ID.
 - **Staging pipeline**: `dev push → test → deploy preview → smoke test → merge main → prod`. Rollback fires automatically if prod /health returns non-200 after deploy.
 - **Demo write protection**: Adding a new write endpoint requires NO demo exception — the middleware in `server.py` handles it globally. When adding a new write UI element, add it to the `hideDemoAdminControls()` selector list in `dashboard.js`.
 
@@ -118,7 +118,7 @@ your project context on start and snapshots progress on end.
 
 ---
 <!-- MERIDIAN STATE — auto-generated, do not edit below -->
-## Current Sprint State  _(auto-updated 2026-06-06 06:03 UTC)_
+## Current Sprint State  _(auto-updated 2026-06-08 16:52 UTC)_
 
 **Key Files:**
 - `meridian/server.py` — FastAPI app + MCP handlers

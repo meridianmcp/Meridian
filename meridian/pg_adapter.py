@@ -8,7 +8,7 @@ Falls back to asyncpg if psycopg is not installed (legacy behaviour).
 SQL translation rules:
   ?       → %s  (psycopg3 positional placeholder)
   datetime('now')  → to_char(now() at time zone 'utc', ...)
-  datetime('now', X || ' minutes') → same with interval cast
+  datetime('now', X || ' minutes') / 'hours' / 'days' → same with interval cast
   PRAGMA ...       → no-op
   rowid            → removed from ORDER BY (UUID PKs don't need it)
   sqlite_master    → fake result that passes all migration guards
@@ -111,11 +111,11 @@ def _pg_adapt_sql(sql: str, params: tuple) -> tuple[str, list]:
     # 2. ? → %s positional placeholders
     sql = re.sub(r"\?", "%s", sql)
 
-    # 2. datetime('now', %s || ' minutes') — expire_idle_sessions pattern
+    # 2. datetime('now', %s || ' minutes') / 'hours' / 'days' — interval forms
     sql = re.sub(
-        r"datetime\('now',\s*(%s)\s*\|\|\s*' minutes'\)",
+        r"datetime\('now',\s*(%s)\s*\|\|\s*'([^']+)'\)",
         lambda m: (
-            f"to_char(now() at time zone 'utc' + ({m.group(1)} || ' minutes')::interval,"
+            f"to_char(now() at time zone 'utc' + ({m.group(1)} || '{m.group(2)}')::interval,"
             f" 'YYYY-MM-DD HH24:MI:SS')"
         ),
         sql,
@@ -280,9 +280,17 @@ class PostgresConnection:
         return _ExecProxy(self._do_execute(sql, params))
 
     async def executescript(self, sql: str) -> None:
-        """Run multiple semicolon-separated statements (skipping PRAGMAs)."""
+        """Run multiple semicolon-separated statements (skipping PRAGMAs).
+
+        Strips ``-- ...`` line comments before splitting so a ``;`` inside a
+        comment doesn't chop a statement mid-line (regression caught by the
+        G5.19 workspace_members comment that contained a literal ``;``).
+        """
+        decommented = "\n".join(
+            line.split("--", 1)[0] for line in sql.splitlines()
+        )
         stmts: list[str] = []
-        for raw in sql.split(";"):
+        for raw in decommented.split(";"):
             s = raw.strip()
             if not s:
                 continue
@@ -425,6 +433,7 @@ CREATE TABLE IF NOT EXISTS projects (
     executor_config TEXT,
     rewind_token TEXT,
     hitl_auto_answer INTEGER NOT NULL DEFAULT 0,
+    icon TEXT,
     created_at TEXT NOT NULL DEFAULT ({_TS})
 );
 
@@ -632,6 +641,7 @@ CREATE TABLE IF NOT EXISTS tenants (
     github_repo TEXT,
     github_branch TEXT,
     notification_prefs TEXT NOT NULL DEFAULT '{{}}',
+    is_internal INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL DEFAULT ({_TS})
 );
 
@@ -658,13 +668,17 @@ CREATE TABLE IF NOT EXISTS oauth_tokens (
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- v2.1 dark — multi-user roles, not exposed in UI or API at launch
+-- v2.1 dark — multi-user roles
+-- G5.19/G5.20 — role widened to include 'admin'; github_access caps
+-- repo-touching MCP tools. App layer (meridian.roles) is the source of
+-- truth for valid values; DB-level CHECK kept on github_access only.
 CREATE TABLE IF NOT EXISTS workspace_members (
     id TEXT PRIMARY KEY,
     tenant_id TEXT NOT NULL REFERENCES tenants(id),
     email TEXT NOT NULL,
-    role TEXT NOT NULL DEFAULT 'member'
-        CHECK (role IN ('owner','member','viewer')),
+    role TEXT NOT NULL DEFAULT 'member',
+    github_access TEXT NOT NULL DEFAULT 'read'
+        CHECK (github_access IN ('none','read','write')),
     token_hash TEXT,
     invited_at TEXT NOT NULL DEFAULT ({_TS}),
     joined_at TEXT
@@ -846,6 +860,7 @@ async def init_pg_db(url: str) -> PostgresConnection:
     await _migrate_pg_v33_hitl_kind_payload(conn)
     await _migrate_pg_v34_hitl_auto_answer(conn)
     await _migrate_pg_v34_workspace_settings(conn)
+    await _migrate_pg_project_icon(conn)
     if is_main_db:
         await _migrate_pg_v10_tenant_columns(conn)
         await _migrate_pg_v25_admins_table(conn)
@@ -853,7 +868,101 @@ async def init_pg_db(url: str) -> PostgresConnection:
         await _migrate_pg_v29_free_tier_columns(conn)
         await _migrate_pg_v31_github_integration(conn)
         await _migrate_pg_v25_notification_prefs(conn)
+        await _migrate_pg_tenants_is_internal(conn)
+        await _migrate_pg_workspace_members_rbac(conn)
     return conn
+
+
+async def _migrate_pg_workspace_members_rbac(conn: PostgresConnection) -> None:
+    """G5.19 / G5.20 — drop the legacy role CHECK (which excluded 'admin')
+    and add github_access. Idempotent.
+
+    On Postgres 11+ ADD COLUMN with a DEFAULT and DROP CONSTRAINT IF
+    EXISTS are both online-safe — no table rewrite, no long lock.
+    """
+    await conn.executescript(
+        "ALTER TABLE workspace_members "
+        "ADD COLUMN IF NOT EXISTS github_access TEXT NOT NULL DEFAULT 'read'"
+    )
+    # Drop the legacy CHECK on role if present. The constraint name is
+    # auto-generated; we look it up via pg_constraint.
+    try:
+        await conn.execute(
+            "DO $$ "
+            "DECLARE c text; "
+            "BEGIN "
+            "  SELECT conname INTO c FROM pg_constraint "
+            "   WHERE conrelid = 'workspace_members'::regclass "
+            "     AND contype = 'c' "
+            "     AND pg_get_constraintdef(oid) LIKE '%role%owner%member%viewer%' "
+            "   LIMIT 1; "
+            "  IF c IS NOT NULL THEN "
+            "    EXECUTE 'ALTER TABLE workspace_members DROP CONSTRAINT ' || quote_ident(c); "
+            "  END IF; "
+            "END $$",
+            None,
+        )
+    except Exception:  # noqa: BLE001 — best-effort; new installs already lack it
+        pass
+    # Add the github_access CHECK (idempotent — ignore failure if
+    # constraint already exists).
+    try:
+        await conn.execute(
+            "ALTER TABLE workspace_members ADD CONSTRAINT "
+            "workspace_members_github_access_chk "
+            "CHECK (github_access IN ('none','read','write'))",
+            None,
+        )
+    except Exception:  # noqa: BLE001
+        pass
+    # Ensure invited_at and joined_at exist — they may be absent on
+    # instances created before the column was added to the DDL.
+    await conn.executescript(
+        "ALTER TABLE workspace_members "
+        f"ADD COLUMN IF NOT EXISTS invited_at TEXT NOT NULL DEFAULT ({_TS})"
+    )
+    await conn.executescript(
+        "ALTER TABLE workspace_members "
+        "ADD COLUMN IF NOT EXISTS joined_at TEXT"
+    )
+
+
+async def _migrate_pg_tenants_is_internal(conn: PostgresConnection) -> None:
+    """G2.10 — tenants.is_internal column + backfill known internal emails.
+    Postgres mirror of db._migrate_tenants_is_internal. Online-safe ADD
+    COLUMN (default 0, no table rewrite on PG 11+). Idempotent.
+    """
+    from . import db as db_module  # noqa: PLC0415
+    await conn.executescript(
+        "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS is_internal INTEGER NOT NULL DEFAULT 0"
+    )
+    # Legacy databases created the column as BOOLEAN. Normalize to INTEGER so
+    # the backfill below (and every is_internal = 1 caller) is type-correct on
+    # every DB. boolean::integer yields 0/1.
+    async with conn.execute(
+        "SELECT data_type FROM information_schema.columns "
+        "WHERE table_name = 'tenants' AND column_name = 'is_internal'",
+        (),
+    ) as cur:
+        col = await cur.fetchone()
+    if col and col["data_type"] == "boolean":
+        await conn.execute(
+            "ALTER TABLE tenants ALTER COLUMN is_internal DROP DEFAULT", ()
+        )
+        await conn.execute(
+            "ALTER TABLE tenants ALTER COLUMN is_internal TYPE INTEGER "
+            "USING (is_internal::integer)",
+            (),
+        )
+        await conn.execute(
+            "ALTER TABLE tenants ALTER COLUMN is_internal SET DEFAULT 0", ()
+        )
+    # Backfill known internal emails.
+    for email in sorted(db_module._internal_emails()):
+        await conn.execute(
+            "UPDATE tenants SET is_internal = 1 WHERE LOWER(email) = ?",
+            (email,),
+        )
 
 
 async def get_project_ntfy_url(
@@ -1061,6 +1170,13 @@ async def _migrate_pg_v34_workspace_settings(conn: PostgresConnection) -> None:
         "    sprint_name_default TEXT,"
         f"    updated_at TEXT NOT NULL DEFAULT ({_TS})"
         ")"
+    )
+
+
+async def _migrate_pg_project_icon(conn: PostgresConnection) -> None:
+    """G4.17 — projects.icon (single-emoji column for sidebar/tab rendering)."""
+    await conn.executescript(
+        "ALTER TABLE projects ADD COLUMN IF NOT EXISTS icon TEXT"
     )
 
 

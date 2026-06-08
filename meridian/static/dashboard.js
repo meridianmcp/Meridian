@@ -1,5 +1,6 @@
 const TABS_KEY = 'meridian.openTabs';
 const ACTIVE_PROJECT_KEY = 'meridian.activeProject';
+const _PLAN_LABELS = { solo: 'Standard', free: 'Free Trial', standard: 'Standard', pro: 'Pro', trial: 'Trial' };
 const state = {
   projects: [],
   tabs: [], // [{id, project}]
@@ -8,6 +9,8 @@ const state = {
   apiKeyConfigured: false,
   // v0.6.5 — server runtime config fetched from /config on startup.
   serverConfig: { server_url: '', host: '', port: 0, version: '' },
+  // workspace switcher — tenant_id of the currently active workspace (null = own)
+  activeWorkspaceTenantId: null,
 };
 
 function isDemoMode() {
@@ -33,6 +36,12 @@ function hideHostedAdminControls() {
     document.querySelectorAll(sel).forEach(el => { el.style.display = 'none'; });
   });
 
+  // The server-controls row (restart/stop/check-updates) is entirely empty on
+  // hosted — every child is hidden above. Collapse the row itself so it doesn't
+  // leave a gap that pushes the account block to the bottom of the footer.
+  const ctrlRow = document.getElementById('server-controls-row');
+  if (ctrlRow) ctrlRow.style.display = 'none';
+
   const connInd = document.getElementById('connection-indicator');
   if (!isHostedAdmin()) {
     // Hide connection switcher / profile selector for normal hosted users —
@@ -49,13 +58,120 @@ function hideHostedAdminControls() {
     const lbl = document.createElement('div');
     lbl.className = 'hosted-label';
     lbl.style.cssText = 'font-size:10px;color:var(--accent-green);font-family:\'IBM Plex Mono\',monospace;padding:4px 6px;border:1px solid var(--accent-green)44;border-radius:3px;opacity:0.8;letter-spacing:.03em';
-    lbl.textContent = '⬡ usemeridian.us';
+    lbl.textContent = '🧭 usemeridian.us';
     footer.prepend(lbl);
   }
+
+  // Sign-out link in sidebar-footer for all hosted users (free tier + admin).
+  // Lives here (not in _renderPlanBadge) so it appears even when /me fails or
+  // returns {} — the free-tier signout-missing bug fix.
+  ensureSignOutLink();
 
   // Rename "advanced setup ↗" → "Close" in first-run wizard (no local config on hosted)
   const advLink = document.getElementById('ez-advanced-link');
   if (advLink) advLink.textContent = 'Close';
+}
+
+function ensureSignOutLink(emailHint) {
+  const footer = document.querySelector('.sidebar-footer');
+  if (!footer) return;
+  // Visible "signed in as {email}" line — rendered once /me resolves the email.
+  // Lets users confirm which account they're on (and spot a stale session before
+  // it 404s their way through another account's workspace).
+  if (emailHint) {
+    let who = document.getElementById('signed-in-as');
+    if (!who) {
+      who = document.createElement('div');
+      who.id = 'signed-in-as';
+      who.style = 'margin-top:8px;font-size:10px;color:var(--muted);font-family:var(--font-mono);text-align:center;opacity:0.75;word-break:break-all;line-height:1.3';
+      const existingLink = document.getElementById('signout-link');
+      if (existingLink) footer.insertBefore(who, existingLink);
+      else footer.appendChild(who);
+    }
+    who.textContent = `signed in as ${emailHint}`;
+    who.title = emailHint;
+  }
+  if (document.getElementById('signout-link')) {
+    if (emailHint) document.getElementById('signout-link').title = `Signed in as ${emailHint}`;
+    return;
+  }
+  const link = document.createElement('a');
+  link.id = 'signout-link';
+  link.href = '/auth/logout';
+  link.textContent = 'Sign out';
+  link.title = emailHint ? `Signed in as ${emailHint}` : 'Sign out';
+  // Visible button-style affordance — the faint text version was easy to miss
+  // on free-tier accounts.
+  link.style = 'display:block;margin-top:8px;padding:6px 10px;font-size:11px;color:var(--text);font-family:var(--font-mono);text-align:center;text-decoration:none;background:var(--surface-1);border:1px solid var(--border);border-radius:5px;opacity:1';
+  link.onmouseenter = () => { link.style.borderColor = 'var(--accent)'; link.style.color = 'var(--accent)'; };
+  link.onmouseleave = () => { link.style.borderColor = 'var(--border)'; link.style.color = 'var(--text)'; };
+  footer.appendChild(link);
+}
+
+// Workspace switcher: shown in sidebar-footer when the user belongs to more
+// than one workspace (their own + accepted invites).
+async function ensureWorkspaceSwitcher() {
+  const footer = document.querySelector('.sidebar-footer');
+  if (!footer || document.getElementById('workspace-switcher')) return;
+  let workspaces;
+  try { workspaces = await fetch('/me/workspaces').then(r => r.ok ? r.json() : null); }
+  catch (_) { return; }
+  if (!workspaces || workspaces.length < 2) return;
+
+  const wrap = document.createElement('div');
+  wrap.id = 'workspace-switcher';
+  wrap.style.cssText = 'margin-top:8px';
+
+  const label = document.createElement('div');
+  label.style.cssText = 'font-size:9px;color:var(--muted);font-family:var(--font-mono);text-transform:uppercase;letter-spacing:.04em;margin-bottom:3px;opacity:.7';
+  label.textContent = 'workspace';
+
+  const sel = document.createElement('select');
+  sel.style.cssText = 'width:100%;font-size:11px;font-family:var(--font-mono);background:var(--surface-1);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:4px 6px;cursor:pointer;outline:none';
+  workspaces.forEach(ws => {
+    const opt = document.createElement('option');
+    opt.value = ws.tenant_id;
+    opt.textContent = ws.is_own ? 'My workspace' : ws.owner_email;
+    if (!state.activeWorkspaceTenantId && ws.is_own) opt.selected = true;
+    if (state.activeWorkspaceTenantId === ws.tenant_id) opt.selected = true;
+    sel.appendChild(opt);
+  });
+
+  sel.onchange = async () => {
+    const chosen = sel.value;
+    const own = workspaces.find(w => w.is_own);
+    state.activeWorkspaceTenantId = (own && chosen === own.tenant_id) ? null : chosen;
+    // Close all open tabs — they belong to the old workspace.
+    [...state.tabs].forEach(t => { try { closeTab(t.id); } catch (_) {} });
+    await loadProjects();
+    // Show which workspace is active.
+    const active = workspaces.find(w => w.tenant_id === chosen);
+    sel.title = active ? (active.is_own ? 'My workspace' : `${active.owner_email} (${active.role})`) : '';
+  };
+
+  wrap.appendChild(label);
+  wrap.appendChild(sel);
+  const existingLabel = footer.querySelector('.hosted-label');
+  if (existingLabel) footer.insertBefore(wrap, existingLabel);
+  else footer.prepend(wrap);
+}
+
+// A persistent "Take the tour" affordance in the sidebar footer so users —
+// including paid users on their own dashboard — can (re)play the guided
+// walkthrough anytime, not just on first demo visit.
+function ensureTourButton() {
+  const footer = document.querySelector('.sidebar-footer');
+  if (!footer || document.getElementById('tour-launch-btn')) return;
+  const btn = document.createElement('button');
+  btn.id = 'tour-launch-btn';
+  btn.type = 'button';
+  btn.textContent = '🧭 Take the tour';
+  btn.title = 'Replay the guided dashboard walkthrough';
+  btn.style = 'display:block;width:100%;margin-top:8px;padding:6px 10px;font-size:11px;color:var(--text);font-family:var(--font-mono);text-align:center;background:var(--surface-1);border:1px solid var(--border);border-radius:5px;cursor:pointer';
+  btn.onmouseenter = () => { btn.style.borderColor = 'var(--accent)'; btn.style.color = 'var(--accent)'; };
+  btn.onmouseleave = () => { btn.style.borderColor = 'var(--border)'; btn.style.color = 'var(--text)'; };
+  btn.onclick = () => { try { startDemoTour(0); } catch (e) {} };
+  footer.appendChild(btn);
 }
 
 function showLocalServerControls() {
@@ -78,6 +194,141 @@ const GITHUB_OCTICON_PATH = 'M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4
 function getPanelState(projectId) {
   state.panels[projectId] = state.panels[projectId] || {};
   return state.panels[projectId];
+}
+
+function _summarizeApiErrorText(raw) {
+  if (raw === undefined || raw === null) return 'Request failed before data could load.';
+  let summary = raw;
+  if (typeof raw === 'string') {
+    try {
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed === 'object') {
+        summary = parsed.detail || parsed.error || parsed.message || raw;
+      }
+    } catch (_) {
+      summary = raw;
+    }
+  }
+  return String(summary)
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 240) || 'Request failed before data could load.';
+}
+
+function _projectLoadErrorInfo(path, error) {
+  const status = Number.isFinite(Number(error?.status))
+    ? Number(error.status)
+    : (String(error?.message || '').match(/^(\d{3})\s*:/) ? parseInt(String(error.message).match(/^(\d{3})\s*:/)[1], 10) : null);
+  const rawText = error?.responseText || error?.message || String(error || 'Request failed');
+  return {
+    endpoint: path,
+    status,
+    summary: _summarizeApiErrorText(rawText),
+    at: Date.now(),
+  };
+}
+
+function wireProjectLoadRetry(container, projectId) {
+  container?.querySelectorAll('[data-project-retry]').forEach((btn) => {
+    btn.onclick = () => retryProjectSurface(projectId);
+  });
+}
+
+function renderProjectLoadError(projectId, title, path, error) {
+  const info = _projectLoadErrorInfo(path, error);
+  const statusLabel = info.status ? `HTTP ${info.status}` : 'Request failed';
+  return `
+    <div class="project-load-error">
+      <div class="project-load-error__title">${escapeHtml(title)}</div>
+      <div class="project-load-error__meta">${escapeHtml(statusLabel)} · <code>${escapeHtml(info.endpoint)}</code></div>
+      <div class="project-load-error__body">${escapeHtml(info.summary)}</div>
+      <div class="project-load-error__actions">
+        <button class="secondary" data-project-retry="1" style="padding:4px 10px;font-size:10px">Retry failed loads</button>
+      </div>
+    </div>
+  `;
+}
+
+function recordProjectLoadError(projectId, path, error) {
+  const panel = getPanelState(projectId);
+  panel.loadErrors = panel.loadErrors || {};
+  const info = _projectLoadErrorInfo(path, error);
+  panel.loadErrors[path] = info;
+  renderProjectLoadAlert(projectId);
+  return info;
+}
+
+function clearProjectLoadError(projectId, path) {
+  const panel = getPanelState(projectId);
+  if (!panel.loadErrors || !panel.loadErrors[path]) return;
+  delete panel.loadErrors[path];
+  renderProjectLoadAlert(projectId);
+}
+
+function renderProjectLoadAlert(projectId) {
+  const host = document.getElementById(`project-fetch-alert-${projectId}`);
+  if (!host) return;
+  const panel = getPanelState(projectId);
+  const errors = Object.values(panel.loadErrors || {}).sort((a, b) => b.at - a.at);
+  if (!errors.length) {
+    host.style.display = 'none';
+    host.innerHTML = '';
+    return;
+  }
+  const visible = errors.slice(0, 3);
+  const statusText = visible.length === 1
+    ? 'A backing request failed, so part of this panel may be incomplete.'
+    : 'Multiple backing requests failed, so part of this panel may be incomplete.';
+  const moreText = errors.length > visible.length
+    ? `<div class="project-fetch-alert__meta">+${errors.length - visible.length} more failing request${errors.length - visible.length === 1 ? '' : 's'} hidden.</div>`
+    : '';
+  host.style.display = 'block';
+  host.innerHTML = `
+    <div class="project-fetch-alert__title">Project data failed to load</div>
+    <div class="project-fetch-alert__summary">${escapeHtml(statusText)}</div>
+    <div class="project-fetch-alert__list">
+      ${visible.map((info) => {
+        const statusLabel = info.status ? `HTTP ${info.status}` : 'Request failed';
+        return `
+          <div class="project-fetch-alert__item">
+            <div class="project-fetch-alert__endpoint"><code>${escapeHtml(info.endpoint)}</code></div>
+            <div class="project-fetch-alert__meta">${escapeHtml(statusLabel)} · ${escapeHtml(info.summary)}</div>
+          </div>
+        `;
+      }).join('')}
+    </div>
+    ${moreText}
+    <div class="project-fetch-alert__actions">
+      <button class="secondary" id="project-fetch-retry-${projectId}" style="padding:4px 10px;font-size:10px">Retry failed loads</button>
+    </div>
+  `;
+  const retryBtn = document.getElementById(`project-fetch-retry-${projectId}`);
+  if (retryBtn) retryBtn.onclick = () => retryProjectSurface(projectId);
+}
+
+async function retryProjectSurface(projectId) {
+  const panel = getPanelState(projectId);
+  await Promise.allSettled([
+    refreshGoal(projectId),
+    refreshSessions(projectId),
+    refreshTasks(projectId),
+  ]);
+  const activeVtab = panel.activeVtab || 'status';
+  if (activeVtab === 'live') await refreshLiveTab(projectId);
+  if (activeVtab === 'files') await loadFilesTab(projectId);
+  if (activeVtab === 'timeline') await loadTimeline(projectId);
+  if (activeVtab === 'rewind') await loadRewindTab(projectId, panel.rewindDays || 7);
+  if (activeVtab === 'queue') {
+    await loadQueue(projectId);
+    await updateLiveFeed(projectId);
+    await loadRecentRuns(projectId);
+  }
+  if (activeVtab === 'team') await loadTeamTab(projectId);
+  if (activeVtab === 'notes') await loadNotesTab(projectId);
+  if (activeVtab === 'hitl') await loadHitlTab(projectId);
+  if (activeVtab === 'docs') await loadDocsTab(projectId);
+  if (activeVtab === 'settings') await loadSettingsTab(projectId);
 }
 
 function syncSidebarActiveProject() {
@@ -107,7 +358,7 @@ async function loadProjectSettings(projectId, opts={}) {
   const panel = getPanelState(projectId);
   if (!opts.force && panel._projectSettings) return panel._projectSettings;
   if (!opts.force && panel._projectSettingsPromise) return panel._projectSettingsPromise;
-  panel._projectSettingsPromise = api(`/projects/${projectId}/settings`)
+  panel._projectSettingsPromise = projectApi(projectId, `/projects/${projectId}/settings`)
     .then((settings) => {
       panel._projectSettings = settings || { project_id: projectId, max_pinned_decisions: DEFAULT_MAX_PINNED_DECISIONS };
       return panel._projectSettings;
@@ -219,17 +470,17 @@ function showDemoOnboardingOverlay() {
   const overlay = document.createElement('div');
   overlay.id = 'demo-onboarding-overlay';
   overlay.style = 'position:fixed;inset:0;z-index:20000;background:rgba(0,0,0,0.72);display:flex;align-items:center;justify-content:center;padding:16px';
-  overlay.innerHTML = `<div style="background:#1e2029;border:1px solid #7c3aed66;border-radius:14px;padding:28px 32px;max-width:400px;width:100%;box-shadow:0 12px 48px rgba(0,0,0,0.7);position:relative;font-family:inherit">
-  <button onclick="document.getElementById('demo-onboarding-overlay').remove()" style="position:absolute;top:12px;right:14px;background:none;border:none;color:#8b8fa8;font-size:18px;cursor:pointer;line-height:1;padding:4px" title="Dismiss">×</button>
-  <h3 style="color:#e8eaf0;margin:0 0 16px;font-size:1.05rem;font-weight:700">Welcome to the Meridian demo</h3>
-  <ol style="color:#c4c6d4;font-size:.88rem;line-height:1.85;padding-left:1.3em;margin:0 0 20px">
+  overlay.innerHTML = `<div style="background:#1e2029;border:1px solid #7c3aed66;border-radius:14px;padding:32px 36px;max-width:480px;width:100%;box-shadow:0 12px 48px rgba(0,0,0,0.7);position:relative;font-family:inherit">
+  <button onclick="document.getElementById('demo-onboarding-overlay').remove()" style="position:absolute;top:12px;right:14px;background:none;border:none;color:#8b8fa8;font-size:22px;cursor:pointer;line-height:1;padding:4px" title="Dismiss">×</button>
+  <h3 style="color:#e8eaf0;margin:0 0 18px;font-size:1.35rem;font-weight:700">Welcome to the Meridian demo</h3>
+  <ol style="color:#c4c6d4;font-size:1.02rem;line-height:1.85;padding-left:1.3em;margin:0 0 24px">
     <li>This is a live demo coordinating a real multi-session build. It's read-only.</li>
     <li>Click any session on the left to explore.</li>
     <li>Write actions are disabled — <a href="/auth/login" style="color:#6c8fff;text-decoration:underline">sign in to create your own project</a>.</li>
   </ol>
   <div style="display:flex;gap:8px">
-    <button onclick="document.getElementById('demo-onboarding-overlay').remove()" style="background:#2a2d35;border:none;border-radius:7px;color:#8b8fa8;padding:8px 16px;cursor:pointer;font-size:.85rem;font-family:inherit;flex:0 0 auto">Skip</button>
-    <button onclick="document.getElementById('demo-onboarding-overlay').remove();resumeDemoTour()" style="background:#7c3aed;border:none;border-radius:7px;color:#fff;padding:8px 22px;cursor:pointer;font-size:.88rem;font-family:inherit;flex:1">${ctaLabel}</button>
+    <button onclick="document.getElementById('demo-onboarding-overlay').remove()" style="background:#2a2d35;border:none;border-radius:7px;color:#8b8fa8;padding:10px 18px;cursor:pointer;font-size:.98rem;font-family:inherit;flex:0 0 auto">Skip</button>
+    <button onclick="document.getElementById('demo-onboarding-overlay').remove();resumeDemoTour()" style="background:#7c3aed;border:none;border-radius:7px;color:#fff;padding:10px 24px;cursor:pointer;font-size:1.02rem;font-family:inherit;flex:1">${ctaLabel}</button>
   </div>
 </div>`;
   overlay.addEventListener('click', (e) => { if (e.target === overlay) overlay.remove(); });
@@ -395,19 +646,19 @@ function startDemoTour(step) {
   tip.id = 'demo-tour-tooltip';
   const stepLabel = `${step + 1} / ${_DEMO_TOUR_STEPS.length}`;
   tip.innerHTML = `
-    <div style="font-size:.7rem;color:#6c8fff;font-weight:600;margin-bottom:6px;letter-spacing:.3px">${stepLabel}</div>
-    <div style="font-size:.9rem;font-weight:700;color:#e8eaf0;margin-bottom:8px">${s.title}</div>
-    <div style="font-size:.83rem;color:#c4c6d4;line-height:1.6;margin-bottom:16px">${s.body}</div>
+    <div style="font-size:.82rem;color:#6c8fff;font-weight:600;margin-bottom:8px;letter-spacing:.3px">${stepLabel}</div>
+    <div style="font-size:1.12rem;font-weight:700;color:#e8eaf0;margin-bottom:10px">${s.title}</div>
+    <div style="font-size:.98rem;color:#c4c6d4;line-height:1.65;margin-bottom:18px">${s.body}</div>
     <div style="display:flex;gap:8px;align-items:center">
-      <button id="demo-tour-finish" style="background:none;border:none;color:#6b7280;cursor:pointer;font-size:.78rem;padding:4px 6px;font-family:inherit;text-decoration:underline">Finish tutorial</button>
+      <button id="demo-tour-finish" style="background:none;border:none;color:#6b7280;cursor:pointer;font-size:.86rem;padding:4px 6px;font-family:inherit;text-decoration:underline">Finish tutorial</button>
       <div style="flex:1"></div>
-      ${step > 0 ? '<button id="demo-tour-back" style="background:none;border:1px solid #3a3d48;border-radius:6px;color:#c4c6d4;cursor:pointer;font-size:.8rem;padding:6px 12px;font-family:inherit">← Back</button>' : ''}
-      <button id="demo-tour-next" style="background:#7c3aed;border:none;border-radius:6px;color:#fff;cursor:pointer;font-size:.82rem;padding:6px 16px;font-family:inherit">
+      ${step > 0 ? '<button id="demo-tour-back" style="background:none;border:1px solid #3a3d48;border-radius:6px;color:#c4c6d4;cursor:pointer;font-size:.9rem;padding:7px 13px;font-family:inherit">← Back</button>' : ''}
+      <button id="demo-tour-next" style="background:#7c3aed;border:none;border-radius:6px;color:#fff;cursor:pointer;font-size:.92rem;padding:7px 18px;font-family:inherit">
         ${isLast ? 'Done' : 'Next →'}
       </button>
     </div>`;
   tip.style.cssText = `position:fixed;z-index:30000;background:#1e2029;border:1px solid #7c3aed88;
-    border-radius:10px;padding:16px 18px;width:268px;
+    border-radius:10px;padding:18px 22px;width:330px;max-width:calc(100vw - 24px);
     box-shadow:0 8px 32px rgba(0,0,0,0.6);font-family:inherit;`;
 
   // Position tooltip relative to target or center
@@ -423,7 +674,7 @@ function startDemoTour(step) {
       tip.style.left = `${rect.right + PAD}px`;
     } else {  // bottom
       tip.style.top = `${Math.min(rect.bottom + PAD, window.innerHeight - 200)}px`;
-      tip.style.left = `${Math.max(8, Math.min(rect.left, window.innerWidth - 288))}px`;
+      tip.style.left = `${Math.max(8, Math.min(rect.left, window.innerWidth - 342))}px`;
     }
   }
 
@@ -449,16 +700,49 @@ function resumeDemoTour() {
 }
 
 async function api(path, opts={}) {
-  const r = await fetch(path, { headers: {'Content-Type': 'application/json'}, ...opts });
+  const headers = {'Content-Type': 'application/json'};
+  if (state.activeWorkspaceTenantId) {
+    headers['X-Workspace-Tenant-Id'] = state.activeWorkspaceTenantId;
+  }
+  const r = await fetch(path, { headers, ...opts });
   if (!r.ok) {
     if (r.status === 403 && isDemoMode()) {
       showDemoReadonlyToast();
       throw new Error('demo_readonly');
     }
     const text = await r.text();
-    throw new Error(`${r.status}: ${text}`);
+    const err = new Error(`${r.status}: ${text}`);
+    err.status = r.status;
+    err.endpoint = path;
+    err.responseText = text;
+    throw err;
   }
   return r.status === 204 ? null : r.json();
+}
+
+const _staleProjectsHandled = new Set();
+
+async function projectApi(projectId, path, opts={}) {
+  try {
+    const data = await api(path, opts);
+    clearProjectLoadError(projectId, path);
+    return data;
+  } catch (e) {
+    // Self-heal stale tabs: a "project not found" 404 for a project that isn't
+    // in the current account's project list means the signed-in account changed
+    // (often in another tab). Close the orphaned tab and prompt a refresh once,
+    // instead of spamming every panel with 404s until the user reloads.
+    if (e && e.status === 404 && /project not found/i.test(e.responseText || '')
+        && !(state.projects || []).some(p => p.id === projectId)
+        && !_staleProjectsHandled.has(projectId)) {
+      _staleProjectsHandled.add(projectId);
+      try { closeTab(projectId); } catch (_) {}
+      try { _checkAccountSwitch(); } catch (_) {}
+      throw e;
+    }
+    recordProjectLoadError(projectId, path, e);
+    throw e;
+  }
 }
 
 async function loadServerConfig() {
@@ -473,13 +757,16 @@ async function loadServerConfig() {
     if (cfg?.demo_mode && !document.getElementById('demo-mode-banner')) {
       const b = document.createElement('div');
       b.id = 'demo-mode-banner';
-      b.style = 'position:fixed;top:0;left:0;right:0;z-index:9999;background:#7c3aed;color:#fff;text-align:center;padding:5px 12px;font-size:12px;font-family:inherit;letter-spacing:0.02em';
-      b.innerHTML = 'Preview mode — read only · <a href="/auth/login" style="color:#fff;text-decoration:underline;font-weight:600">Sign in for full access →</a>';
+      b.style = 'position:fixed;top:0;left:0;right:0;z-index:9999;background:#7c3aed;color:#fff;text-align:center;padding:4px 12px;font-size:11px;font-family:inherit;letter-spacing:0.02em';
+      b.innerHTML = 'Preview mode — read only · <a href="/auth/login" style="color:#fff;text-decoration:underline;font-weight:600">Sign in →</a>';
       document.body.prepend(b);
-      document.body.style.paddingTop = ((parseInt(document.body.style.paddingTop || '0', 10)) + 28) + 'px';
+      document.body.style.paddingTop = ((parseInt(document.body.style.paddingTop || '0', 10)) + 22) + 'px';
       // Demo onboarding overlay — self-guards once the tour is finished
       // (localStorage), and its CTA resumes the tour at the saved step.
-      showDemoOnboardingOverlay();
+      // Auto-start the demo tour instead of showing overlay
+      if (!_demoTourDone()) {
+        resumeDemoTour();
+      }
     }
     // Task 16 — hide destructive admin controls in demo mode
     if (cfg?.demo_mode) hideDemoAdminControls();
@@ -488,6 +775,9 @@ async function loadServerConfig() {
   } catch (e) { /* offline / older server — ignore */ }
   // Show demo overlay whenever on /demo path (regardless of MERIDIAN_DEMO env var)
   if (window.location.pathname.startsWith('/demo')) {
+    // Clear stale project IDs from prior logins so /demo never 404s on a stale project.
+    try { localStorage.removeItem(STORAGE_KEY(TABS_KEY)); } catch(e) {}
+    try { localStorage.removeItem(STORAGE_KEY(ACTIVE_PROJECT_KEY)); } catch(e) {}
     hideDemoAdminControls();
     showDemoOnboardingOverlay();
   }
@@ -497,15 +787,21 @@ async function loadServerConfig() {
     if (me && me.plan) {
       state.tenantPlan = me.plan;
       state.tenantEmail = me.email || '';
+      state.tenantHasStripe = !!me.has_stripe_customer;
+      state.tenantIsInternal = !!me.is_internal;
+      state.tenantDaysRemaining = me.days_remaining;
+      state.tenantExpired = !!me.expired;
+      state.tenantExpiresAt = me.inactivity_expires_at || null;
       _renderPlanBadge(me);
       updateGitHubConnectionIndicator(me);
+      _armAccountSwitchWatch(me.email || '');
     }
   } catch (e) { /* not hosted or not logged in */ }
 }
 
 function _renderPlanBadge(me) {
   const planColors = { free: '#6b7280', trial: '#059669', standard: '#2563eb', pro: '#7c3aed' };
-  const planLabels = { free: 'Free', trial: 'Trial', standard: 'Solo', pro: 'Pro' };
+  const planLabels = _PLAN_LABELS;
   const plan = me.plan || 'free';
   // Plan badge near version string
   const verEl = document.getElementById('server-version');
@@ -517,26 +813,57 @@ function _renderPlanBadge(me) {
     badge.textContent = planLabels[plan] || plan;
     verEl.parentNode.insertBefore(badge, verEl.nextSibling);
   }
+  // G2.11 — Billing button. With a Stripe customer → "Manage" opens the
+  // Stripe Customer Portal; without one (free/trial that never paid) →
+  // "Upgrade" routes to /pricing.
+  // Admin / internal staff plans have nothing to upgrade — only show a
+  // billing affordance when there's a real Stripe customer to manage.
+  const noUpgrade = plan === 'admin' || !!me.is_internal;
+  const planBadge = document.getElementById('plan-badge');
+  if (planBadge && !document.getElementById('billing-link')) {
+    const hasStripe = !!me.has_stripe_customer;
+    if (hasStripe || !noUpgrade) {
+      const link = document.createElement('a');
+      link.id = 'billing-link';
+      link.href = hasStripe ? '/billing/portal' : '/pricing';
+      link.textContent = hasStripe ? 'Manage' : 'Upgrade';
+      link.title = hasStripe ? 'Open Stripe billing portal' : 'See plans and upgrade';
+      link.style = 'margin-left:6px;padding:2px 7px;border-radius:10px;font-size:10px;font-weight:600;letter-spacing:0.03em;background:transparent;color:var(--accent);border:1px solid var(--accent)55;vertical-align:middle;text-decoration:none;cursor:pointer';
+      planBadge.parentNode.insertBefore(link, planBadge.nextSibling);
+    }
+  }
   // Persistent upgrade nudge for free-tier users (shown regardless of days left).
   if (plan === 'free' && !me.expired && !isDemoMode() && !document.getElementById('upgrade-banner')) {
     const upgradeUrl = state.serverConfig?.stripe_payment_link || '/pricing';
     const b = document.createElement('div');
     b.id = 'upgrade-banner';
     b.style = 'position:fixed;top:0;left:0;right:0;z-index:9996;background:#2563eb;color:#fff;text-align:center;padding:5px 12px;font-size:12px;font-family:inherit;letter-spacing:0.02em;display:flex;align-items:center;justify-content:center;gap:10px';
-    b.innerHTML = `<span>Upgrade to Standard — 8× faster, dedicated DB</span><a href="${escapeHtml(upgradeUrl)}" style="background:#fff;color:#2563eb;font-weight:700;text-decoration:none;padding:2px 10px;border-radius:4px;white-space:nowrap">$20/mo →</a><button onclick="sessionStorage.setItem('upgrade-banner-dismissed','1');this.closest('#upgrade-banner').remove();document.body.style.paddingTop=Math.max(0,parseInt(document.body.style.paddingTop||'0',10)-28)+'px'" style="background:none;border:none;color:rgba(255,255,255,0.7);font-size:16px;cursor:pointer;padding:0 0 0 6px;line-height:1" title="Dismiss">×</button>`;
+    b.innerHTML = `<span>Upgrade to Standard — 4× faster, dedicated DB</span><a href="${escapeHtml(upgradeUrl)}" style="background:#fff;color:#2563eb;font-weight:700;text-decoration:none;padding:2px 10px;border-radius:4px;white-space:nowrap">$20/mo →</a><button onclick="sessionStorage.setItem('upgrade-banner-dismissed','1');this.closest('#upgrade-banner').remove();document.body.style.paddingTop=Math.max(0,parseInt(document.body.style.paddingTop||'0',10)-28)+'px'" style="background:none;border:none;color:rgba(255,255,255,0.7);font-size:16px;cursor:pointer;padding:0 0 0 6px;line-height:1" title="Dismiss">×</button>`;
     if (!sessionStorage.getItem('upgrade-banner-dismissed')) {
       document.body.prepend(b);
       document.body.style.paddingTop = ((parseInt(document.body.style.paddingTop || '0', 10)) + 28) + 'px';
     }
   }
-  // Expiry warning banner at ≤25 days remaining
+  // Free trial days remaining banner for free-tier users
   const days = me.days_remaining;
-  const isExpiring = (plan === 'free' || plan === 'trial') && days !== null && days !== undefined && days <= 25;
+  const isFreeOrTrial = (plan === 'free' || plan === 'trial');
+  if (isFreeOrTrial && days !== null && days !== undefined && days > 0 && !document.getElementById('trial-banner')) {
+    const b = document.createElement('div');
+    b.id = 'trial-banner';
+    const label = _PLAN_LABELS[plan] || plan;
+    const daysLeft = Math.max(0, days);
+    b.style = `position:fixed;top:0;left:0;right:0;z-index:9997;background:linear-gradient(90deg,#059669,#059669);color:#fff;text-align:center;padding:5px 12px;font-size:12px;font-family:inherit;letter-spacing:0.02em`;
+    b.innerHTML = `${label}: <strong>${daysLeft} day${daysLeft !== 1 ? 's' : ''}</strong> remaining. <a href="/pricing" style="color:#fff;text-decoration:underline;font-weight:600">Upgrade now →</a>`;
+    document.body.prepend(b);
+    document.body.style.paddingTop = ((parseInt(document.body.style.paddingTop || '0', 10)) + 28) + 'px';
+  }
+  // Expiry warning banner at ≤25 days remaining
+  const isExpiring = isFreeOrTrial && days !== null && days !== undefined && days <= 25;
   if (isExpiring && !document.getElementById('expiry-banner')) {
     const b = document.createElement('div');
     b.id = 'expiry-banner';
     const urgent = days <= 5;
-    const label = plan === 'trial' ? 'Trial' : 'Free tier';
+    const label = _PLAN_LABELS[plan] || plan;
     const upgradeMsg = plan === 'trial' ? 'Add a card to keep your data →' : 'Upgrade →';
     b.style = `position:fixed;top:0;left:0;right:0;z-index:9998;background:${urgent ? '#dc2626' : '#d97706'};color:#fff;text-align:center;padding:5px 12px;font-size:12px;font-family:inherit;letter-spacing:0.02em`;
     b.innerHTML = `${label} expires in <strong>${days} day${days !== 1 ? 's' : ''}</strong>. <a href="/pricing" style="color:#fff;text-decoration:underline">${upgradeMsg}</a>`;
@@ -546,7 +873,7 @@ function _renderPlanBadge(me) {
   if (me.expired && !document.getElementById('expired-banner')) {
     const b = document.createElement('div');
     b.id = 'expired-banner';
-    const expLabel = plan === 'trial' ? 'Trial expired' : 'Free tier expired';
+    const expLabel = (_PLAN_LABELS[plan] || plan) + ' expired';
     b.style = 'position:fixed;top:0;left:0;right:0;z-index:9998;background:#dc2626;color:#fff;text-align:center;padding:5px 12px;font-size:12px;font-family:inherit;letter-spacing:0.02em';
     b.innerHTML = `${expLabel}. <a href="/pricing" style="color:#fff;text-decoration:underline">Upgrade to continue →</a>`;
     document.body.prepend(b);
@@ -562,21 +889,58 @@ function _renderPlanBadge(me) {
     document.body.style.paddingTop = ((parseInt(document.body.style.paddingTop || '0', 10)) + 28) + 'px';
   }
 
-  // b75c1649 — sign out link in sidebar footer (hosted/authenticated users only)
-  if (!document.getElementById('signout-link')) {
-    const footer = document.querySelector('.sidebar-footer');
-    if (footer) {
-      const link = document.createElement('a');
-      link.id = 'signout-link';
-      link.href = '/auth/logout';
-      link.textContent = 'sign out';
-      link.title = me.email ? `Signed in as ${me.email}` : 'Sign out';
-      link.style = 'display:block;margin-top:8px;font-size:10px;color:var(--muted);font-family:var(--font-mono);text-align:center;text-decoration:none;opacity:0.7';
-      link.onmouseenter = () => { link.style.opacity = '1'; link.style.color = 'var(--text)'; };
-      link.onmouseleave = () => { link.style.opacity = '0.7'; link.style.color = 'var(--muted)'; };
-      footer.appendChild(link);
-    }
+  // Sign-out link is created earlier in hideHostedAdminControls() so it
+  // appears for all hosted users (incl. free tier) even before /me returns.
+  // Here we just enrich the tooltip with the signed-in email if available.
+  ensureSignOutLink(me.email);
+  // Show workspace switcher if the user belongs to more than one workspace.
+  ensureWorkspaceSwitcher();
+}
+
+// Detect when the active session belongs to a different account than the one
+// this page loaded as (e.g. the user signed into another account in a second
+// tab). Re-auth replaces the session cookie underneath the loaded page, so its
+// in-flight API calls would start 404ing against the wrong workspace. Rather
+// than let that happen silently, watch /me and prompt a refresh.
+function _armAccountSwitchWatch(loadedEmail) {
+  if (!isHostedMode()) return;
+  if (state._acctWatchArmed) return;
+  state._acctWatchArmed = true;
+  state.loadedAccountEmail = loadedEmail || '';
+  // Re-check when the tab regains focus (the common case: switch account in
+  // another tab, then come back) and on a slow interval as a backstop.
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') _checkAccountSwitch();
+  });
+  setInterval(_checkAccountSwitch, 60000);
+}
+
+async function _checkAccountSwitch() {
+  if (document.getElementById('account-switch-banner')) return; // already shown
+  let me;
+  try {
+    me = await api('/me');
+  } catch (_) {
+    return; // network blip or logged out entirely — don't false-alarm
   }
+  const now = (me && me.email) || '';
+  const base = state.loadedAccountEmail || '';
+  if (now && base && now !== base) _showAccountSwitchBanner(now);
+}
+
+function _showAccountSwitchBanner(newEmail) {
+  if (document.getElementById('account-switch-banner')) return;
+  const b = document.createElement('div');
+  b.id = 'account-switch-banner';
+  b.style = 'position:fixed;top:0;left:0;right:0;z-index:10000;background:#b45309;color:#fff;text-align:center;padding:6px 12px;font-size:12px;font-family:inherit;letter-spacing:0.02em;display:flex;align-items:center;justify-content:center;gap:12px';
+  b.innerHTML =
+    `<span>You're now signed in as <strong>${escapeHtml(newEmail)}</strong> in another tab. ` +
+    `Refresh to load this account.</span>` +
+    `<button id="account-switch-refresh" style="background:#fff;color:#b45309;font-weight:700;border:none;text-decoration:none;padding:2px 12px;border-radius:4px;white-space:nowrap;cursor:pointer">Refresh</button>`;
+  document.body.prepend(b);
+  document.body.style.paddingTop = ((parseInt(document.body.style.paddingTop || '0', 10)) + 30) + 'px';
+  const btn = document.getElementById('account-switch-refresh');
+  if (btn) btn.onclick = () => location.reload();
 }
 
 // v1.9.x — show active DB connection in sidebar footer
@@ -605,7 +969,7 @@ function _updateConnectionIndicator(cfg) {
   wrap.style.display = 'inline-flex';
   // Demo mode: show simplified read-only badge, no switcher
   if (cfg.demo_mode) {
-    label.textContent = 'demo (sqlite)';
+    label.textContent = 'demo (' + (cfg.demo_db || 'sqlite') + ')';
     dot.style.background = 'var(--accent-green)';
     wrap.style.cursor = 'default';
     wrap.title = 'Demo environment — read only';
@@ -716,6 +1080,7 @@ function _updateConnectionIndicator(cfg) {
         item.onclick = async (e) => {
           if (e.target.tagName === 'BUTTON') return; // don't activate on delete click
           popup.remove();
+          if (c.active) return; // already active — nothing to switch (avoids 404 on the synthetic "env" connection)
           try {
             await api('/config/connections', { method: 'POST', body: JSON.stringify({ name: c.name, activate: true }) });
             await loadServerConfig();
@@ -957,6 +1322,13 @@ function openTab(project) {
   renderTabs();
   buildTabBody(project);
   activateTab(project.id);
+  // G1.2 — defer badge population until after the dashboard's initial
+  // fetch wave settles. Without the delay, the extra parallel /notes and
+  // /decisions-pinned fetches push refreshGoal's expected 404 outside
+  // browsers' HTTP/1.1 6-connection window, surfacing it as a console
+  // error during the panel-render test's 2.5s wait. 100ms is well below
+  // human-perceptible latency.
+  setTimeout(() => refreshProjectCountBadges(project.id), 100);
 }
 
 function closeTab(id) {
@@ -1036,6 +1408,14 @@ function _makeTabEl(t) {
   div.dataset.tabId = t.id;
   div.onclick = () => activateTab(t.id);
 
+  // G4.17 — icon (single emoji) renders before the name.
+  if (t.project.icon) {
+    const iconSpan = document.createElement('span');
+    iconSpan.textContent = t.project.icon;
+    iconSpan.style.cssText = 'margin-right:5px;font-size:1.05em';
+    div.appendChild(iconSpan);
+  }
+
   const nameSpan = document.createElement('span');
   nameSpan.textContent = t.project.name;
   div.appendChild(nameSpan);
@@ -1081,6 +1461,7 @@ function _openTabMenu(t, anchor) {
   uuidDiv.textContent = t.id;
   menu.appendChild(uuidDiv);
   menuItem('\u270f Rename', () => _renameProject(t));
+  menuItem('\ud83c\udfa8 Change icon\u2026', () => _setProjectIcon(t));
   menuItem('\u2b07 Download DB', () => window.open('/admin/snapshot', '_blank'));
   menuItem('🗑 Delete project…', () => _deleteProject(t));
 
@@ -1090,6 +1471,32 @@ function _openTabMenu(t, anchor) {
   document.body.appendChild(menu);
   const dismiss = () => { menu.remove(); document.removeEventListener('click', dismiss); };
   setTimeout(() => document.addEventListener('click', dismiss), 0);
+}
+
+async function _setProjectIcon(t) {
+  /** G4.17 — quick prompt-based emoji picker. Paste one emoji or leave
+   * blank to clear. Image uploads are intentionally NOT supported here —
+   * see the v1.0.1 backlog note for "project image upload". */
+  const current = t.project.icon || '';
+  const next = window.prompt(
+    `Paste a single emoji to use as the project icon (or leave blank to clear).\n\nCurrent: ${current || '(none)'}`,
+    current,
+  );
+  if (next === null) return;  // cancelled
+  const icon = next.trim() ? next.trim().slice(0, 8) : null;
+  try {
+    const updated = await api(`/projects/${t.id}/icon`, {
+      method: 'PATCH', body: JSON.stringify({ icon }),
+    });
+    t.project = { ...t.project, icon: updated.icon || null };
+    // Update in-place: tabs (header + sidebar), project switcher.
+    const proj = state.projects.find(p => p.id === t.id);
+    if (proj) proj.icon = updated.icon || null;
+    renderTabs();
+    toast(icon ? `Icon set to ${icon}` : 'Icon cleared');
+  } catch (e) {
+    toast('Update failed: ' + e.message, true);
+  }
 }
 
 async function _renameProject(t) {
@@ -1109,10 +1516,14 @@ async function _renameProject(t) {
 }
 
 async function _deleteProject(t) {
-  const confirmed = window.confirm(
-    `Delete "${t.project.name}"?\n\nThis will permanently delete all sessions, tasks, and goal history. Cannot be undone.`
+  const typed = window.prompt(
+    `Delete "${t.project.name}"?\n\nThis will permanently delete all sessions, tasks, and goal history. Cannot be undone.\n\nType the project name to confirm:`
   );
-  if (!confirmed) return;
+  if (typed === null) return;
+  if (typed.trim() !== t.project.name) {
+    toast('Project name did not match — delete cancelled.', true);
+    return;
+  }
   try {
     await api(`/projects/${t.id}`, { method: 'DELETE' });
     closeTab(t.id);
@@ -1159,14 +1570,15 @@ function buildTabBody(project) {
       <button class="vtab-btn" data-vtab="devlog" title="Dev Log">📓</button>
       <button class="vtab-btn" data-vtab="timeline" title="Activity Timeline">📅</button>
       <button class="vtab-btn" data-vtab="rewind" title="Rewind — Last X days">↻</button>
-      <button class="vtab-btn" data-vtab="queue" title="Work Queue">🪖</button>
+      <button class="vtab-btn" data-vtab="queue" title="Work Queue">👷</button>
       <button class="vtab-btn" data-vtab="team" title="Team — per-human activity">👥</button>
-      <button class="vtab-btn" data-vtab="notes" title="Notes — per-project wiki">📝</button>
-      <button class="vtab-btn" data-vtab="hitl" title="HITL — Human-in-the-Loop queue" style="position:relative">❓<span class="hitl-vtab-badge" data-pid="${project.id}" style="display:none;position:absolute;top:2px;right:2px;background:#f87171;color:#fff;font-size:8px;font-weight:700;padding:0 3px;border-radius:6px;line-height:14px;pointer-events:none">0</span></button>
+      <button class="vtab-btn" data-vtab="notes" title="Notes — per-project wiki" style="position:relative">📝<span class="notes-vtab-badge vtab-count-badge muted" data-pid="${project.id}" style="display:none;position:absolute;top:2px;right:2px;background:var(--surface-3,#2a2f3a);color:var(--muted);font-size:8px;font-weight:700;padding:0 3px;border-radius:6px;line-height:14px;pointer-events:none">0</span></button>
+      <button class="vtab-btn" data-vtab="hitl" title="HITL — Human-in-the-Loop queue" style="position:relative">❓<span class="hitl-vtab-badge vtab-count-badge" data-pid="${project.id}" style="display:none;position:absolute;top:2px;right:2px;background:#f87171;color:#fff;font-size:8px;font-weight:700;padding:0 3px;border-radius:6px;line-height:14px;pointer-events:none">0</span></button>
       <button class="vtab-btn" data-vtab="docs" title="MCP Tool Reference">📖</button>
       <button class="vtab-btn" data-vtab="settings" title="Notification Settings">⚙</button>
     </div>
     <div class="vtab-drawer open" id="drawer-${project.id}">
+      <div class="project-fetch-alert" id="project-fetch-alert-${project.id}"></div>
       <div class="drawer-panel active" id="drawer-status-${project.id}">
         <div class="drawer-header">
           <span>STATUS · ${escapeHtml(project.name)}</span>
@@ -1246,7 +1658,7 @@ function buildTabBody(project) {
           <button class="goal-subtab-btn active" data-gtab="north-star" title="Permanent product vision. Rarely changes — set once, then keep stable.">🔭 North Star</button>
           <button class="goal-subtab-btn" data-gtab="version-goal" title="Current milestone — what ships this cycle (v1.2, v2.0, etc).">🎯 Version Goal</button>
           <button class="goal-subtab-btn" data-gtab="sprint" title="What this session is focused on right now — updated multiple times per day. Not a multi-week scrum sprint.">⚡ Session Focus</button>
-          <button class="goal-subtab-btn" data-gtab="decisions" title="Pinned constitution + append-only decisions log.">📋 Decisions</button>
+          <button class="goal-subtab-btn" data-gtab="decisions" title="Pinned constitution + append-only decisions log.">📋 Decisions <span class="decisions-gtab-badge vtab-count-badge muted" data-pid="${project.id}" style="display:none;background:var(--surface-3,#2a2f3a);color:var(--muted);font-size:9px;font-weight:700;padding:0 5px;border-radius:8px;line-height:14px;margin-left:4px;vertical-align:1px">0</span></button>
         </div>
         <div class="goal-subtab-body">
           <div class="goal-subtab-panel active" id="gtab-north-star-${project.id}">
@@ -1415,6 +1827,7 @@ function buildTabBody(project) {
           </div>
         </div>
       </div>
+      </div>
       <div class="drawer-panel" id="drawer-notes-${project.id}">
         <div class="drawer-header" style="justify-content:space-between">
           <span style="display:flex;flex-direction:column;gap:1px">
@@ -1561,6 +1974,7 @@ function buildTabBody(project) {
   state.panels[project.id] = {
     ws: null, taskCache: [], goalRaw: null, goalIsJson: false,
     activeVtab: 'status',
+    loadErrors: {},
   };
 
   // Vtab drawer toggle — same tab again collapses; different tab switches.
@@ -1636,8 +2050,9 @@ function buildTabBody(project) {
   // Sprint tab board — compact one-liner showing current sprint progress only.
   // Full sprint board lives in the LIVE tab. Goal tab just shows the header.
   async function loadSprintBoard() {
+    const sprintItemsPath = `/projects/${project.id}/sprint-items`;
     try {
-      const items = await api(`/projects/${project.id}/sprint-items`);
+      const items = await projectApi(project.id, sprintItemsPath);
       const board = document.getElementById(`sprint-board-goal-${project.id}`);
       if (!board) return;
       if (!items || !items.length) {
@@ -1661,7 +2076,12 @@ function buildTabBody(project) {
         ${activeCount > 0 ? `<span style="color:var(--accent)">${activeCount} pending</span>` : '<span style="color:var(--accent-green)">✓ complete</span>'}
         <span style="opacity:0.5">· See LIVE tab for full board</span>
       </div>`;
-    } catch(e) { console.error('Sprint board load failed:', e); }
+    } catch(e) {
+      const board = document.getElementById(`sprint-board-goal-${project.id}`);
+      if (!board) return;
+      board.innerHTML = renderProjectLoadError(project.id, 'Sprint board unavailable', sprintItemsPath, e);
+      wireProjectLoadRetry(board, project.id);
+    }
   }
   _sprintBoardReloaders[project.id] = loadSprintBoard;
   loadSprintBoard();
@@ -1672,7 +2092,7 @@ function buildTabBody(project) {
     const inp = document.getElementById(`goal-sprint-${project.id}`);
     if (!sel || !inp) return;
     try {
-      const sessions = await api(`/projects/${project.id}/sessions`);
+      const sessions = await projectApi(project.id, `/projects/${project.id}/sessions`);
       const active = (sessions || []).filter(s => s.status !== 'closed' && s.status !== 'archived');
       const opts = active.map(s => `<option value="${escapeHtml(s.name)}">${escapeHtml(s.name)}</option>`).join('');
       sel.innerHTML = opts + '<option value="__custom__">Custom…</option>';
@@ -1911,15 +2331,47 @@ async function loadLiveTab(projectId) {
 async function refreshLiveTab(projectId) {
   /** Fetch fresh sessions + tasks + sprint items and repaint all Live sections. */
   try {
-    const [sessions, tasks, sprintItems] = await Promise.all([
-      api(`/projects/${projectId}/sessions?active_only=false`).catch(() => []),
-      api(`/projects/${projectId}/tasks?limit=200`).catch(() => []),
-      api(`/projects/${projectId}/sprint-items`).catch(() => []),
+  const sessionsPath = `/projects/${projectId}/sessions?active_only=false`;
+    const tasksPath = `/projects/${projectId}/tasks?limit=200`;
+    const sprintItemsPath = `/projects/${projectId}/sprint-items`;
+    const [sessionsResult, tasksResult, sprintItemsResult] = await Promise.allSettled([
+      projectApi(projectId, sessionsPath),
+      projectApi(projectId, tasksPath),
+      projectApi(projectId, sprintItemsPath),
     ]);
-    renderSprintProgress(projectId, sprintItems || []);
-    renderLiveSessions(projectId, sessions || [], tasks || []);
-    renderLiveQueue(projectId, tasks || []);
-    cacheMostRecentSession(projectId, sessions || []);
+
+    if (sprintItemsResult.status === 'fulfilled') {
+      renderSprintProgress(projectId, sprintItemsResult.value || []);
+    } else {
+      const sprintRoot = document.getElementById(`live-sprint-progress-${projectId}`);
+      if (sprintRoot) {
+        sprintRoot.innerHTML = renderProjectLoadError(projectId, 'Sprint progress unavailable', sprintItemsPath, sprintItemsResult.reason);
+        wireProjectLoadRetry(sprintRoot, projectId);
+      }
+    }
+
+    if (sessionsResult.status === 'fulfilled' && tasksResult.status === 'fulfilled') {
+      renderLiveSessions(projectId, sessionsResult.value || [], tasksResult.value || []);
+      cacheMostRecentSession(projectId, sessionsResult.value || []);
+    } else {
+      const sessionsRoot = document.getElementById(`live-sessions-${projectId}`);
+      if (sessionsRoot) {
+        const liveError = sessionsResult.status === 'rejected' ? sessionsResult.reason : tasksResult.reason;
+        const livePath = sessionsResult.status === 'rejected' ? sessionsPath : tasksPath;
+        sessionsRoot.innerHTML = renderProjectLoadError(projectId, 'Live sessions unavailable', livePath, liveError);
+        wireProjectLoadRetry(sessionsRoot, projectId);
+      }
+    }
+
+    if (tasksResult.status === 'fulfilled') {
+      renderLiveQueue(projectId, tasksResult.value || []);
+    } else {
+      const queueRoot = document.getElementById(`live-queue-${projectId}`);
+      if (queueRoot) {
+        queueRoot.innerHTML = renderProjectLoadError(projectId, 'Live queue unavailable', tasksPath, tasksResult.reason);
+        wireProjectLoadRetry(queueRoot, projectId);
+      }
+    }
   } catch(e) { /* ignore — WS will retry on next event */ }
 }
 
@@ -2707,76 +3159,218 @@ function _renderTimelineHeatmap(projectId, data, paneEl) {
   const textPrimary = cssVar('--text', '#d8dde6');
   const textMuted = cssVar('--muted', '#9ba5b5');
 
-  // Distinct humans across all days; sorted so layout is stable.
-  const humanSet = new Set();
-  daily.forEach(d => Object.keys(d.humans || {}).forEach(h => humanSet.add(h)));
-  let humans = [...humanSet].sort();
-  const multi = humans.length > 1;
-  if (!multi) humans = ['__all__'];
+  // Canonical people + client apps drive the filter chips (items 30/31). Fall
+  // back to deriving them from the per-day session entries if the backend
+  // didn't send the top-level lists.
+  let allPeople = (data.people && data.people.slice()) || [];
+  let allClients = (data.clients && data.clients.slice()) || [];
+  if (!allPeople.length || !allClients.length) {
+    const ps = new Set(), cs = new Set();
+    daily.forEach(d => (d.sessions || []).forEach(s => {
+      ps.add(s.person || s.human || '(unknown)');
+      cs.add(s.client || '(none)');
+    }));
+    if (!allPeople.length) allPeople = [...ps].sort();
+    if (!allClients.length) allClients = [...cs].sort();
+  }
 
   const dates = daily.map(d => d.date).sort();
   const rangeStart = dates[0];
   const rangeEnd = dates[dates.length - 1];
 
-  // Per (human,day) detail so clicking a cell can show sessions for the
-  // right calendar row even in multi-human projects.
-  const detailByHumanDay = {};
-  daily.forEach(d => {
-    (d.sessions || []).forEach(s => {
-      const h = multi ? (s.human || '(unknown)') : '__all__';
-      const key = `${h}|${d.date}`;
-      (detailByHumanDay[key] = detailByHumanDay[key] || []).push(s);
-    });
-  });
+  // Filter selection, persisted per project. A stale/empty selection falls
+  // back to "all" so it can never blank the calendar.
+  const selKey = (k) => `meridian_tl_${k}_${projectId}`;
+  const loadSel = (k, all) => {
+    try {
+      const raw = JSON.parse(localStorage.getItem(selKey(k)) || 'null');
+      if (Array.isArray(raw)) {
+        const keep = raw.filter(x => all.includes(x));
+        if (keep.length) return new Set(keep);
+      }
+    } catch (_) {}
+    return new Set(all);
+  };
+  let selPeople = loadSel('people', allPeople);
+  let selClients = loadSel('clients', allClients);
+  const clientOK = (s) => selClients.size === allClients.length || selClients.has(s.client || '(none)');
 
-  const CELL = 14;
+  const CELL = 16;
   const CAL_TOP = 28;
   const CAL_H = CELL * 7 + 34;   // 7 weekday rows + month/label gutters
   const ROW_GAP = 18;
   const rowH = CAL_H + ROW_GAP;
-  const totalH = CAL_TOP + humans.length * rowH + 28;
 
-  const calendars = [];
-  const series = [];
-  const titles = [];
-  humans.forEach((h, i) => {
-    const top = CAL_TOP + i * rowH;
-    calendars.push({
-      top: top,
-      left: multi ? 120 : 40,
-      right: 12,
-      cellSize: [CELL, CELL],
-      range: rangeStart === rangeEnd ? rangeStart : [rangeStart, rangeEnd],
-      splitLine: { show: true, lineStyle: { color: borderCol, type: 'dashed', width: 1 } },
-      itemStyle: { color: emptyColor, borderColor: '#0d1b2e', borderWidth: 1 },
-      yearLabel: { show: false },
-      monthLabel: { color: textPrimary, fontFamily: 'IBM Plex Mono', fontSize: 13, fontWeight: 'bold' },
-      dayLabel: { color: textMuted, fontFamily: 'IBM Plex Mono', fontSize: 10, firstDay: 1 },
-    });
-    if (multi) {
-      titles.push({
-        text: h.length > 16 ? h.slice(0, 15) + '…' : h,
-        left: 6,
-        top: top + CAL_H / 2 - 6,
-        textStyle: { color: _colorForHuman(h === '(unknown)' ? '' : h), fontFamily: 'IBM Plex Mono', fontSize: 10, fontWeight: 'bold' },
+  // Per (rowKey,day) detail so clicking a cell shows that row's sessions.
+  let detailByPersonDay = {};
+
+  // Recompute calendars/series/titles for the current person+client selection.
+  // One calendar row per selected person; a single selected person (or a
+  // single-person project) renders one unlabeled calendar.
+  function computeView() {
+    let rows = allPeople.filter(p => selPeople.has(p));
+    if (!rows.length) rows = allPeople.slice();
+    const multi = rows.length > 1;
+    const rowKeys = multi ? rows : ['__all__'];
+
+    detailByPersonDay = {};
+    const countByKeyDay = {};
+    daily.forEach(d => {
+      (d.sessions || []).forEach(s => {
+        if (!clientOK(s)) return;
+        const person = s.person || s.human || '(unknown)';
+        if (!selPeople.has(person)) return;
+        const key = multi ? person : '__all__';
+        countByKeyDay[`${key}|${d.date}`] = (countByKeyDay[`${key}|${d.date}`] || 0) + s.count;
+        (detailByPersonDay[`${key}|${d.date}`] = detailByPersonDay[`${key}|${d.date}`] || []).push(s);
       });
-    }
-    const pts = daily.map(d => {
-      const count = multi ? (d.humans && d.humans[h]) || 0 : d.count;
-      const dayDetail = detailByHumanDay[`${h}|${d.date}`] || [];
-      const scount = new Set(dayDetail.map(s => s.session_id)).size;
-      return { value: [d.date, count], scount: scount, human: h };
-    }).filter(pt => pt.value[1] > 0);
-    series.push({
-      type: 'heatmap',
-      coordinateSystem: 'calendar',
-      calendarIndex: i,
-      data: pts,
     });
-  });
+
+    const calendars = [], series = [], titles = [];
+    rowKeys.forEach((rk, i) => {
+      const top = CAL_TOP + i * rowH;
+      calendars.push({
+        top: top,
+        left: multi ? 120 : 40,
+        right: 12,
+        cellSize: [CELL, CELL],
+        range: rangeStart === rangeEnd ? rangeStart : [rangeStart, rangeEnd],
+        splitLine: { show: true, lineStyle: { color: borderCol, type: 'dashed', width: 1 } },
+        itemStyle: { color: emptyColor, borderColor: '#0d1b2e', borderWidth: 1 },
+        yearLabel: { show: false },
+        monthLabel: { color: textPrimary, fontFamily: 'IBM Plex Mono', fontSize: 13, fontWeight: 'bold' },
+        dayLabel: { color: textMuted, fontFamily: 'IBM Plex Mono', fontSize: 10, firstDay: 1 },
+      });
+      if (multi) {
+        titles.push({
+          text: rk.length > 16 ? rk.slice(0, 15) + '…' : rk,
+          left: 6,
+          top: top + CAL_H / 2 - 6,
+          textStyle: { color: _colorForHuman(rk === '(unknown)' ? '' : rk), fontFamily: 'IBM Plex Mono', fontSize: 10, fontWeight: 'bold' },
+        });
+      }
+      const pts = daily.map(d => {
+        const count = countByKeyDay[`${rk}|${d.date}`] || 0;
+        const dayDetail = detailByPersonDay[`${rk}|${d.date}`] || [];
+        const scount = new Set(dayDetail.map(s => s.session_id)).size;
+        return { value: [d.date, count], scount: scount, person: rk };
+      }).filter(pt => pt.value[1] > 0);
+      series.push({
+        type: 'heatmap',
+        coordinateSystem: 'calendar',
+        calendarIndex: i,
+        data: pts,
+        // Stamp the day-of-month (dark) onto cells that had activity, so the
+        // calendar reads as a calendar — empty days carry no label since pts
+        // only includes count > 0.
+        label: {
+          show: true,
+          color: '#0b1220',
+          fontFamily: 'IBM Plex Mono',
+          fontSize: 10,
+          fontWeight: 'bold',
+          formatter: (p) => {
+            const v = p.value && p.value[0];
+            if (!v) return '';
+            const dd = parseInt(String(v).slice(8, 10), 10);
+            return Number.isFinite(dd) ? String(dd) : '';
+          },
+        },
+      });
+    });
+    const totalH = CAL_TOP + rowKeys.length * rowH + 28;
+    return { calendars, series, titles, totalH };
+  }
+
+  let { calendars, series, titles, totalH } = computeView();
 
   paneEl.innerHTML = '';
   let scaleMax = _heatmapMaxFor(projectId);
+
+  // Person + client filter chips. Hidden when there's nothing to filter
+  // (single person, single client). applyFilters is reassigned after the chart
+  // is created; the chip handlers close over it.
+  let applyFilters = () => {};
+  if (allPeople.length > 1 || allClients.length > 1) {
+    const bar = document.createElement('div');
+    bar.className = 'tl-filter-bar';
+    bar.style.cssText = 'display:flex;flex-wrap:wrap;align-items:center;gap:8px;padding:0 4px 8px;font-size:10px;font-family:IBM Plex Mono,monospace;color:var(--muted)';
+    paneEl.appendChild(bar);
+
+    // Toggle a value in a selection set, persisting to localStorage. '__all__'
+    // resets to everything; emptying a set also falls back to everything so the
+    // calendar can never blank out.
+    const toggle = (sel, all, key, x) => {
+      if (x === '__all__') sel = new Set(all);
+      else { sel.has(x) ? sel.delete(x) : sel.add(x); if (!sel.size) sel = new Set(all); }
+      localStorage.setItem(selKey(key), JSON.stringify([...sel]));
+      return sel;
+    };
+
+    const closeAllPanels = () => bar.querySelectorAll('[data-tl-panel]').forEach(p => { p.style.display = 'none'; });
+
+    // Compact multi-select dropdown — a long roster collapses to one chip
+    // instead of overflowing the row off-screen. The menu scrolls; selected
+    // rows are highlighted blue/white.
+    const mkDropdown = (labelText, all, getSel, setSel, key) => {
+      const wrap = document.createElement('div');
+      wrap.style.cssText = 'position:relative;display:inline-block';
+      const btn = document.createElement('button');
+      btn.style.cssText = 'display:inline-flex;align-items:center;gap:6px;padding:3px 10px;border-radius:6px;cursor:pointer;font-size:10px;font-family:inherit;border:1px solid var(--border);background:var(--surface-2);color:var(--text)';
+      const panel = document.createElement('div');
+      panel.setAttribute('data-tl-panel', '1');
+      panel.style.cssText = 'position:absolute;z-index:30;top:calc(100% + 4px);left:0;min-width:170px;max-height:240px;overflow-y:auto;background:var(--surface-1);border:1px solid var(--border);border-radius:6px;padding:4px;box-shadow:0 6px 20px rgba(0,0,0,0.4);display:none';
+      const sync = () => {
+        const sel = getSel();
+        const total = all.length;
+        const allSel = sel.size === total;
+        btn.textContent = '';
+        const cap = document.createElement('span');
+        cap.textContent = `${labelText}: ${allSel ? 'All' : sel.size + '/' + total}`;
+        const caret = document.createElement('span');
+        caret.textContent = '▾'; caret.style.cssText = 'opacity:0.6';
+        btn.appendChild(cap); btn.appendChild(caret);
+        panel.innerHTML = '';
+        const mkRow = (text, value, active) => {
+          const row = document.createElement('div');
+          row.textContent = text;
+          row.title = text;
+          row.style.cssText = `padding:4px 8px;border-radius:4px;cursor:pointer;white-space:nowrap;font-size:10px;margin-bottom:1px;background:${active ? '#2563eb' : 'transparent'};color:${active ? '#fff' : 'var(--text)'}`;
+          row.onmouseenter = () => { if (!active) row.style.background = 'var(--surface-2)'; };
+          row.onmouseleave = () => { if (!active) row.style.background = 'transparent'; };
+          row.onclick = (e) => {
+            e.stopPropagation();
+            setSel(toggle(getSel(), all, key, value));
+            sync();
+            applyFilters();
+          };
+          return row;
+        };
+        panel.appendChild(mkRow('All', '__all__', allSel));
+        all.forEach(x => panel.appendChild(mkRow(x.length > 30 ? x.slice(0, 29) + '…' : x, x, sel.has(x))));
+      };
+      btn.onclick = (e) => {
+        e.stopPropagation();
+        const willOpen = panel.style.display === 'none';
+        closeAllPanels();
+        panel.style.display = willOpen ? 'block' : 'none';
+      };
+      sync();
+      wrap.appendChild(btn);
+      wrap.appendChild(panel);
+      return wrap;
+    };
+
+    if (allPeople.length > 1) {
+      bar.appendChild(mkDropdown('People', allPeople, () => selPeople, (s) => { selPeople = s; }, 'people'));
+    }
+    if (allClients.length > 1) {
+      bar.appendChild(mkDropdown('Client', allClients, () => selClients, (s) => { selClients = s; }, 'clients'));
+    }
+    // Any click elsewhere in the timeline pane closes open menus. paneEl is
+    // recreated each render, so this listener doesn't accumulate.
+    paneEl.addEventListener('click', closeAllPanels);
+  }
 
   const ctrl = document.createElement('div');
   ctrl.style.cssText = 'display:flex;align-items:center;gap:8px;justify-content:flex-end;padding:0 4px 6px;font-size:11px;color:var(--muted);font-family:IBM Plex Mono,monospace';
@@ -2838,24 +3432,27 @@ function _renderTimelineHeatmap(projectId, data, paneEl) {
     series: series,
   });
 
-  const renderDetail = (human, date) => {
-    const list = detailByHumanDay[`${human}|${date}`] || [];
+  const renderDetail = (person, date) => {
+    const list = detailByPersonDay[`${person}|${date}`] || [];
     if (!list.length) {
       detailBox.innerHTML = `<span style="color:var(--muted)">${escapeHtml(date)} — no sessions</span>`;
       return;
     }
     const total = list.reduce((a, s) => a + s.count, 0);
-    const rows = list.map(s =>
-      `<div class="tl-heat-sess"><span class="tl-heat-sess-name">${escapeHtml(s.name || '(unknown)')}</span>` +
-      `<span class="tl-heat-sess-count">${s.count} task${s.count === 1 ? '' : 's'}</span></div>`
-    ).join('');
+    const rows = list.map(s => {
+      const cli = s.client && s.client !== '(none)'
+        ? `<span class="tl-heat-sess-client">${escapeHtml(s.client)}</span>` : '';
+      return `<div class="tl-heat-sess"><span class="tl-heat-sess-name">${escapeHtml(s.name || '(unknown)')}</span>` +
+        cli +
+        `<span class="tl-heat-sess-count">${s.count} task${s.count === 1 ? '' : 's'}</span></div>`;
+    }).join('');
     detailBox.innerHTML =
-      `<div class="tl-heat-detail-head">${escapeHtml(date)} · ${total} task${total === 1 ? '' : 's'} · ${list.length} session${list.length === 1 ? '' : 's'}</div>${rows}`;
+      `<div class="tl-heat-detail-head">${escapeHtml(person)} · ${escapeHtml(date)} · ${total} task${total === 1 ? '' : 's'} · ${list.length} session${list.length === 1 ? '' : 's'}</div>${rows}`;
   };
 
   chart.on('click', params => {
     if (params.componentType !== 'series' || !params.data || !params.data.value) return;
-    renderDetail(params.data.human, params.data.value[0]);
+    renderDetail(params.data.person, params.data.value[0]);
   });
 
   slider.addEventListener('input', () => {
@@ -2867,6 +3464,18 @@ function _renderTimelineHeatmap(projectId, data, paneEl) {
 
   const pnl = state.panels[projectId];
   if (pnl) pnl._heatchart = chart;
+
+  applyFilters = () => {
+    ({ calendars, series, titles, totalH } = computeView());
+    container.style.height = `${totalH}px`;
+    container.style.minHeight = `${totalH}px`;
+    chart.setOption(
+      { title: titles, calendar: calendars, series: series },
+      { replaceMerge: ['calendar', 'series', 'title'] }
+    );
+    try { chart.resize(); } catch (_) {}
+  };
+
   try { new ResizeObserver(() => { try { chart.resize(); } catch (_) {} }).observe(container); } catch (_) {}
 }
 
@@ -3170,7 +3779,24 @@ function normalizeNotifyTarget(raw) {
   return `https://ntfy.sh/${v}`;
 }
 
-// Suggest a hard-to-guess ntfy topic: {project-slug}-{6 random chars}.
+// Inverse of normalizeNotifyTarget for display: strip the implied ntfy.sh
+// prefix so the field shows just the topic ("the prefix is added for you").
+// Emails and non-ntfy webhooks pass through untouched.
+function displayNotifyTarget(raw) {
+  const v = (raw || '').trim();
+  if (!v) return '';
+  const lower = v.toLowerCase();
+  for (const prefix of ['https://ntfy.sh/', 'http://ntfy.sh/', 'ntfy.sh/']) {
+    if (lower.startsWith(prefix)) return v.slice(prefix.length).replace(/\/+$/, '');
+  }
+  return v;
+}
+
+// G1.7 — Suggest the project slug as the ntfy topic. The server will
+// suffix with -2/-3/… if another project in this DB already uses it,
+// so we no longer need a client-side random tail. Note: ntfy topics
+// are publicly subscribable, so a guessable topic = anyone can listen.
+// Users who want stronger privacy can paste a longer, custom value.
 function suggestNtfyTopic(projectId) {
   const proj = (state.projects || []).find(p => p.id === projectId);
   const slug = (proj?.name || 'meridian')
@@ -3178,8 +3804,7 @@ function suggestNtfyTopic(projectId) {
     .replace(/[^a-z0-9]+/g, '-')
     .replace(/^-+|-+$/g, '')
     .slice(0, 24) || 'meridian';
-  const rand = Math.random().toString(36).slice(2, 8);
-  return `${slug}-${rand}`;
+  return slug;
 }
 
 async function loadSettingsTab(projectId) {
@@ -3309,13 +3934,71 @@ async function loadSettingsTab(projectId) {
 
   let html = '';
 
+  // G4.18 — Account section (hosted only). Shows email, plan, optional
+  // workspace memberships, plus links for Manage billing (G2.11),
+  // Sign out, and Delete account. Members-of and sign-out-everywhere
+  // ride on existing endpoints; both are no-ops outside hosted mode.
+  if (state.tenantEmail) {
+    const plan = state.tenantPlan || 'free';
+    const hasStripe = !!state.tenantHasStripe;
+    // Admin / internal plans have nothing to upgrade — only surface a billing
+    // button when there's a real Stripe customer to manage.
+    const noUpgrade = plan === 'admin' || !!state.tenantIsInternal;
+    const showBilling = hasStripe || !noUpgrade;
+    const billingLabel = hasStripe ? 'Manage billing' : 'Upgrade';
+    const billingHref = hasStripe ? '/billing/portal' : '/pricing';
+    const billingBtn = showBilling
+      ? `<a href="${billingHref}" class="primary" style="padding:4px 10px;font-size:10px;text-decoration:none;background:var(--accent);color:#001020;border-radius:4px;font-weight:600">${escapeHtml(billingLabel)}</a>`
+      : '';
+    // Trial / free-tier expiry line + resubscribe affordance. Only relevant to
+    // plans with an inactivity expiry (free / trial); admin/internal/paid skip it.
+    const days = state.tenantDaysRemaining;
+    const expiresAt = state.tenantExpiresAt;
+    const isTrialish = (plan === 'free' || plan === 'trial') && !state.tenantIsInternal;
+    let expiryLine = '';
+    let resubBtn = '';
+    if (isTrialish && (expiresAt || days != null || state.tenantExpired)) {
+      const dateStr = expiresAt ? String(expiresAt).slice(0, 10) : '';
+      if (state.tenantExpired) {
+        expiryLine = `<div style="color:#f87171">${_PLAN_LABELS[plan] || plan} expired${dateStr ? ` on ${escapeHtml(dateStr)}` : ''}.</div>`;
+      } else {
+        const dleft = (days != null) ? `${days} day${days === 1 ? '' : 's'} left` : '';
+        expiryLine = `<div>${_PLAN_LABELS[plan] || plan} expires${dateStr ? ` on <span style="color:var(--text)">${escapeHtml(dateStr)}</span>` : ''}${dleft ? ` <span style="color:var(--muted)">(${dleft})</span>` : ''}.</div>`;
+      }
+      const payLink = state.serverConfig?.stripe_payment_link || '/pricing';
+      resubBtn = `<a href="${escapeHtml(payLink)}" class="primary" style="padding:4px 10px;font-size:10px;text-decoration:none;background:var(--accent);color:#001020;border-radius:4px;font-weight:600">${state.tenantExpired ? 'Resubscribe' : 'Upgrade to Standard'}</a>`;
+    }
+    html += `<div data-demo-hide style="margin-bottom:14px;padding:10px 12px;border:1px solid var(--border);border-radius:6px;background:var(--surface-2)">
+      <div style="font-weight:600;font-size:11px;color:var(--text);margin-bottom:6px">Account</div>
+      <div style="font-size:10px;color:var(--muted);line-height:1.7">
+        <div>Email: <span style="color:var(--text)">${escapeHtml(state.tenantEmail)}</span></div>
+        <div>Plan: <span style="color:var(--text)">${escapeHtml(_PLAN_LABELS[plan] || plan)}</span></div>
+        ${expiryLine}
+      </div>
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:8px">
+        ${resubBtn || billingBtn}
+        <a href="/auth/logout" class="secondary" style="padding:4px 10px;font-size:10px;text-decoration:none;background:var(--surface-1);color:var(--text);border:1px solid var(--border);border-radius:4px">Sign out</a>
+        <button id="account-delete-${projectId}" class="secondary" style="padding:4px 10px;font-size:10px;background:var(--surface-1);color:#f87171;border:1px solid #f8717155;border-radius:4px;cursor:pointer">Delete account…</button>
+      </div>
+    </div>`;
+  }
+
   // "Connect claude.ai browser" card — always shown regardless of hosted/self-hosted
-  html += `<div style="margin-bottom:14px;padding:10px 12px;border:1px solid var(--border);border-radius:6px;background:var(--surface-2);display:flex;justify-content:space-between;align-items:center;gap:8px">
-    <div>
-      <div style="font-weight:600;font-size:11px;color:var(--text);margin-bottom:2px">Browser connector</div>
-      <div style="font-size:10px;color:var(--muted)">Use Meridian directly in Claude or ChatGPT - hosted MCP, no extension required</div>
+  const browserConnectorAccountNote = isHostedMode() ? `
+    <div style="margin-top:6px;font-size:10px;color:var(--muted)">
+      The browser connector uses whichever Meridian account is logged in at usemeridian.us in this
+      browser tab. To use a different account, sign out and sign back in before reconnecting.
+      <a href="/auth/logout?next=/auth/login" style="color:var(--accent);text-decoration:none;white-space:nowrap">Switch Meridian account →</a>
+    </div>` : '';
+  html += `<div style="margin-bottom:14px;padding:10px 12px;border:1px solid var(--border);border-radius:6px;background:var(--surface-2)">
+    <div style="display:flex;justify-content:space-between;align-items:center;gap:8px">
+      <div>
+        <div style="font-weight:600;font-size:11px;color:var(--text);margin-bottom:2px">Browser connector</div>
+        <div style="font-size:10px;color:var(--muted)">Use Meridian directly in Claude or ChatGPT - hosted MCP, no extension required</div>
+      </div>
+      <a href="https://docs.usemeridian.us/browser-connector/" target="_blank" style="white-space:nowrap;padding:4px 10px;background:var(--accent);color:#fff;border-radius:4px;font-size:10px;font-weight:600;text-decoration:none">Setup guide →</a>
     </div>
-    <a href="https://docs.usemeridian.us/browser-connector/" target="_blank" style="white-space:nowrap;padding:4px 10px;background:var(--accent);color:#fff;border-radius:4px;font-size:10px;font-weight:600;text-decoration:none">Setup guide →</a>
+    ${browserConnectorAccountNote}
   </div>`;
 
   if (mcpData) {
@@ -3355,8 +4038,10 @@ async function loadSettingsTab(projectId) {
         </label>
         <label style="display:flex;flex-direction:column;gap:3px;min-width:0">
           <span style="font-size:9px;color:var(--muted)">Branch</span>
-          <input type="text" id="github-branch-${projectId}" value="${escapeHtml(ghSelectedBranch)}" placeholder="main"
+          <select id="github-branch-${projectId}"
             style="padding:5px 8px;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;color:var(--text);font-family:var(--font-mono);font-size:11px;outline:none">
+            <option value="${escapeHtml(ghSelectedBranch)}" selected>${escapeHtml(ghSelectedBranch)}</option>
+          </select>
         </label>
         <button class="primary" id="github-save-btn-${projectId}" style="padding:5px 12px;font-size:11px">Save repo</button>
       </div>
@@ -3369,10 +4054,13 @@ async function loadSettingsTab(projectId) {
   </div>`;
   }
 
-  html += `<details style="margin-bottom:16px;border:1px solid var(--border);border-radius:6px;background:var(--surface-2)">
+  html += `<details class="meridian-disclosure" style="margin-bottom:16px;border:1px solid var(--border);border-radius:6px;background:var(--surface-2)">
     <summary style="cursor:pointer;list-style:none;padding:10px 12px;display:flex;justify-content:space-between;align-items:center;gap:8px">
-      <span style="font-weight:600;font-size:11px;color:var(--text)">Auto-checkpoint hooks</span>
-      <span style="font-size:10px;color:var(--muted)">Claude Code + Codex</span>
+      <span style="display:flex;align-items:center;gap:8px;flex:1;min-width:0">
+        <span class="meridian-caret" style="display:inline-block;font-size:10px;color:var(--muted);transition:transform 120ms ease;flex-shrink:0">▶</span>
+        <span style="font-weight:600;font-size:11px;color:var(--text)">Auto-checkpoint hooks</span>
+      </span>
+      <span style="font-size:10px;color:var(--muted);flex-shrink:0">Claude Code + Codex</span>
     </summary>
     <div style="padding:0 12px 12px">
       <div style="font-size:10px;color:var(--muted);margin-bottom:10px">Install once, then SessionStart + Stop can auto-start and auto-checkpoint into Meridian for this project.</div>
@@ -3628,12 +4316,7 @@ async function loadSettingsTab(projectId) {
     <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
       <label style="font-size:10px;color:var(--muted)">
         Max pinned decisions warning threshold<br>
-        <select id="constitution-max-${projectId}" style="margin-top:4px;background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:4px 8px">
-          <option value="10">10</option>
-          <option value="20">20</option>
-          <option value="30">30</option>
-          <option value="40">40</option>
-        </select>
+        <input type="number" id="constitution-max-${projectId}" min="1" max="500" step="1" inputmode="numeric" style="margin-top:4px;background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:4px 8px;width:80px">
       </label>
       <span id="constitution-max-status-${projectId}" style="font-size:10px;color:var(--muted)">Warning updates the Decisions tab banner and archive suggestion.</span>
     </div>
@@ -3644,8 +4327,14 @@ async function loadSettingsTab(projectId) {
     const status = document.getElementById(`constitution-max-status-${projectId}`);
     if (!sel) return;
     sel.value = String(projectSettings.max_pinned_decisions || DEFAULT_MAX_PINNED_DECISIONS);
-    sel.onchange = async () => {
-      const nextLimit = Math.max(1, parseInt(String(sel.value || DEFAULT_MAX_PINNED_DECISIONS), 10) || DEFAULT_MAX_PINNED_DECISIONS);
+    const commit = async () => {
+      // G1.6 — validate: integer, clamp to [1, 500]. Empty / NaN falls
+      // back to the default so the user can never persist a garbage value.
+      const raw = parseInt(String(sel.value || ''), 10);
+      const nextLimit = Number.isFinite(raw)
+        ? Math.min(500, Math.max(1, raw))
+        : DEFAULT_MAX_PINNED_DECISIONS;
+      sel.value = String(nextLimit);
       sel.disabled = true;
       try {
         const saved = await saveProjectSettings(projectId, { max_pinned_decisions: nextLimit });
@@ -3658,6 +4347,13 @@ async function loadSettingsTab(projectId) {
         sel.disabled = false;
       }
     };
+    // Save on blur and on Enter — match the calm-typing UX of free-text
+    // fields elsewhere (saving on every keystroke would thrash the server).
+    sel.addEventListener('change', commit);
+    sel.addEventListener('blur', commit);
+    sel.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') { e.preventDefault(); sel.blur(); }
+    });
   }, 0);
 
   // Human-in-the-loop section — per-project auto-answer toggle (v3.4)
@@ -3757,6 +4453,10 @@ async function loadSettingsTab(projectId) {
       <label style="font-size:10px;color:var(--muted);display:block">Default sprint name<br>
         <input id="ws-sprint-default" type="text" placeholder="e.g. june-sprint" style="width:100%;max-width:240px;background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:3px 6px;margin-top:2px">
       </label>
+      <label style="font-size:10px;color:var(--muted);display:block;margin-top:6px">Your display name<br>
+        <input id="ws-display-name" type="text" placeholder="e.g. Adam" style="width:100%;max-width:240px;background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:3px 6px;margin-top:2px">
+        <span style="display:block;font-size:9px;color:var(--muted);margin-top:2px">Used to attribute Claude/Codex hook sessions to you on the activity timeline when they don't set a name.</span>
+      </label>
       <div style="margin-top:8px;display:flex;gap:8px;align-items:center">
         <button id="ws-settings-save" class="primary" style="font-size:10px;padding:3px 10px">Save defaults</button>
         <span id="ws-settings-status" style="font-size:10px;color:var(--muted);min-height:14px"></span>
@@ -3788,6 +4488,7 @@ async function loadSettingsTab(projectId) {
     // --- Settings defaults ---
     const hitlCb = document.getElementById('ws-hitl-default');
     const sprintIn = document.getElementById('ws-sprint-default');
+    const displayIn = document.getElementById('ws-display-name');
     const saveBtn = document.getElementById('ws-settings-save');
     const saveStatus = document.getElementById('ws-settings-status');
     (async () => {
@@ -3795,6 +4496,7 @@ async function loadSettingsTab(projectId) {
         const s = await api('/workspace/settings');
         if (hitlCb) hitlCb.checked = !!s.hitl_auto_answer_default;
         if (sprintIn) sprintIn.value = s.sprint_name_default || '';
+        if (displayIn) displayIn.value = s.display_name || '';
       } catch (e) { /* defaults shown */ }
     })();
     if (saveBtn) saveBtn.onclick = async () => {
@@ -3805,6 +4507,7 @@ async function loadSettingsTab(projectId) {
           body: JSON.stringify({
             hitl_auto_answer_default: !!(hitlCb && hitlCb.checked),
             sprint_name_default: (sprintIn && sprintIn.value.trim()) || '',
+            display_name: (displayIn && displayIn.value.trim()) || '',
           }),
         });
         if (saveStatus) saveStatus.textContent = 'Saved.';
@@ -3897,7 +4600,8 @@ async function loadSettingsTab(projectId) {
       <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
         <input id="invite-email-${projectId}" type="email" placeholder="teammate@example.com" style="background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:4px 8px;flex:1;min-width:160px">
         <select id="invite-role-${projectId}" style="background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:4px 6px">
-          <option value="member">member</option>
+          <option value="admin">admin</option>
+          <option value="member" selected>member</option>
           <option value="viewer">viewer</option>
         </select>
         <button id="invite-btn-${projectId}" class="primary" style="font-size:10px;padding:4px 10px">Invite</button>
@@ -3920,12 +4624,52 @@ async function loadSettingsTab(projectId) {
             listEl.innerHTML = '<div style="color:var(--muted);font-size:10px">No team members yet.</div>';
             return;
           }
-          listEl.innerHTML = members.map(m => `
-            <div style="display:flex;justify-content:space-between;align-items:center;padding:4px 0;border-bottom:1px solid var(--border)">
-              <span>${escapeHtml(m.email)} <span style="color:var(--muted)">${m.role}</span>${m.pending ? ' <span style="color:var(--accent-amber);font-size:9px">pending</span>' : ''}</span>
-              <button class="secondary" data-mid="${escapeHtml(m.id)}" style="font-size:9px;padding:2px 7px">×</button>
-            </div>`).join('');
-          listEl.querySelectorAll('button[data-mid]').forEach(btn => {
+          const ROLE_CHOICES = ['admin', 'member', 'viewer'];
+          listEl.innerHTML = members.map(m => {
+            const opts = ROLE_CHOICES.map(r => `<option value="${r}" ${m.role === r ? 'selected' : ''}>${r}</option>`).join('');
+            return `
+            <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;padding:4px 0;border-bottom:1px solid var(--border)">
+              <span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escapeHtml(m.email)}${m.pending ? ' <span style="color:var(--accent);font-size:9px;font-weight:600">Invited</span>' : ''}</span>
+              ${m.pending ? `<button class="resend-invite-btn secondary" data-mid="${escapeHtml(m.id)}" title="Resend invite" style="font-size:9px;padding:2px 7px">Resend</button>` : `<select class="member-role-select" data-mid="${escapeHtml(m.id)}" title="Change role" style="background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:2px 5px">${opts}</select>`}
+              <button class="secondary" data-mid="${escapeHtml(m.id)}" title="Remove member" style="font-size:9px;padding:2px 7px">×</button>
+            </div>`;
+          }).join('');
+          listEl.querySelectorAll('select.member-role-select').forEach(sel => {
+            sel.dataset.prev = sel.value;
+            sel.onchange = async () => {
+              const newRole = sel.value;
+              sel.disabled = true;
+              try {
+                await api(`/workspace/members/${sel.dataset.mid}`, {
+                  method: 'PATCH', body: JSON.stringify({ role: newRole }),
+                });
+                sel.dataset.prev = newRole;
+                if (inviteStatus) { inviteStatus.textContent = `Role updated to ${newRole}.`; setTimeout(() => { if (inviteStatus) inviteStatus.textContent = ''; }, 2500); }
+              } catch (e) {
+                sel.value = sel.dataset.prev;  // revert when the server rejects (e.g. 403)
+                if (inviteStatus) inviteStatus.textContent = `Error: ${escapeHtml(String(e))}`;
+              } finally {
+                sel.disabled = false;
+              }
+            };
+          });
+          listEl.querySelectorAll('button.resend-invite-btn').forEach(btn => {
+            btn.onclick = async () => {
+              btn.disabled = true;
+              btn.textContent = '…';
+              try {
+                await api(`/workspace/invite/${btn.dataset.mid}/resend`, { method: 'POST' });
+                btn.textContent = 'Sent';
+                if (inviteStatus) { inviteStatus.textContent = 'Invite resent.'; setTimeout(() => { if (inviteStatus) inviteStatus.textContent = ''; }, 2500); }
+              } catch(e) {
+                btn.textContent = 'Resend';
+                if (inviteStatus) inviteStatus.textContent = `Error: ${escapeHtml(String(e))}`;
+              } finally {
+                btn.disabled = false;
+              }
+            };
+          });
+          listEl.querySelectorAll('button[data-mid]:not(.resend-invite-btn)').forEach(btn => {
             btn.onclick = async () => {
               if (!confirm('Remove this member?')) return;
               try {
@@ -4033,7 +4777,7 @@ async function loadSettingsTab(projectId) {
           usageEl.innerHTML = `
             <div style="margin-bottom:10px;display:flex;justify-content:space-between">
               <span style="color:var(--text)">Compute</span>
-              <span>${c.used.toFixed(1)} CU-hrs <span style="color:var(--accent)">· Unlimited</span></span>
+              <span>${c.used.toFixed(2)} CU-hrs <span style="color:var(--accent)">· Unlimited</span></span>
             </div>
             <div style="margin-bottom:4px;display:flex;justify-content:space-between">
               <span style="color:var(--text)">Storage</span>
@@ -4049,7 +4793,7 @@ async function loadSettingsTab(projectId) {
           <div style="margin-bottom:10px">
             <div style="display:flex;justify-content:space-between;margin-bottom:3px">
               <span style="color:var(--text)">Compute${c.throttled ? ' <span style="color:#ef4444">(throttled)</span>' : ''}</span>
-              <span>${c.used.toFixed(1)} / ${c.limit} CU-hrs <span style="color:var(--muted)">(${c.grace} w/grace)</span></span>
+              <span>${c.used.toFixed(2)} / ${c.limit} CU-hrs <span style="color:var(--muted)">(${c.grace} w/grace)</span></span>
             </div>
             <div style="background:var(--surface-1);border-radius:2px;height:5px;overflow:hidden">
               <div style="background:${barColor(cpct)};width:${cpct}%;height:100%;transition:width .3s"></div>
@@ -4102,27 +4846,41 @@ async function loadSettingsTab(projectId) {
   const ntfyData = (ntfyResult.status === 'fulfilled') ? ntfyResult.value : null;
   // prefer notify_url key, fall back to ntfy_url for older servers
   const savedNotifyUrl = ntfyData ? (ntfyData.notify_url || ntfyData.ntfy_url || '') : '';
-  // pre-fill with OAuth email for hosted users if no URL is saved yet
-  const defaultNotifyUrl = savedNotifyUrl || (state.tenantEmail ? state.tenantEmail : '');
+  // pre-fill with OAuth email for hosted users if no URL is saved yet. ntfy
+  // targets show topic-only (the https://ntfy.sh/ prefix is implied).
+  const defaultNotifyUrl = displayNotifyTarget(savedNotifyUrl) || (state.tenantEmail ? state.tenantEmail : '');
+  // ntfy security warning: shown once until user acknowledges via localStorage.
+  let ntfyWarnAcknowledged = false;
+  try { ntfyWarnAcknowledged = localStorage.getItem(STORAGE_KEY('ntfy.warn.dismissed')) === '1'; } catch(e) {}
+  const ntfyInputDisabled = ntfyWarnAcknowledged ? '' : 'disabled';
+  const ntfyWarnDisplay = ntfyWarnAcknowledged ? 'display:none' : '';
   html += `<div data-demo-hide style="margin-bottom:14px;padding:10px 12px;border:1px solid var(--border);border-radius:6px;background:var(--surface-2)">
     <div style="font-weight:600;font-size:11px;color:var(--text);margin-bottom:4px">Notifications</div>
     <div style="font-size:10px;color:var(--muted);margin-bottom:8px">
       Paste an <a href="https://ntfy.sh" target="_blank" style="color:var(--accent)">ntfy.sh</a> topic URL, a Slack/Discord webhook URL, or your email address.
       Alerts fire on HITL requests and sprint completions. No account needed for ntfy.
     </div>
+    <div id="ntfy-warn-${projectId}" style="margin-bottom:8px;padding:8px 10px;border:1px solid #f59e0b88;border-radius:5px;background:#f59e0b11;font-size:10px;color:#f59e0b;line-height:1.5;${ntfyWarnDisplay}">
+      <strong>⚠ Security notice:</strong> ntfy.sh topics are public — anyone who knows your topic name can subscribe and read your alerts. Use a long, random topic name (e.g. <code>my-project-a7f3k2</code>) or self-host ntfy for privacy. Slack/Discord webhooks and email are private alternatives.<br>
+      <label style="display:flex;align-items:center;gap:6px;margin-top:6px;cursor:pointer;color:var(--text)">
+        <input type="checkbox" id="ntfy-warn-ack-${projectId}" style="cursor:pointer;accent-color:#f59e0b">
+        I understand my ntfy topic is public
+      </label>
+    </div>
     <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
       <input type="text" id="ntfy-url-${projectId}"
         value="${escapeHtml(defaultNotifyUrl)}"
         placeholder="${escapeHtml(suggestNtfyTopic(projectId))}  ·  https://hooks.slack.com/…  ·  you@email.com"
-        style="flex:1;min-width:200px;padding:5px 8px;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;color:var(--text);font-family:var(--font-mono);font-size:11px;outline:none">
-      <button class="secondary" id="ntfy-save-${projectId}" style="padding:4px 10px;font-size:10px">Save</button>
-      <button class="secondary" id="ntfy-test-${projectId}" style="padding:4px 10px;font-size:10px" title="Send a test notification to verify your URL">Test</button>
+        ${ntfyInputDisabled}
+        style="flex:1;min-width:200px;padding:5px 8px;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;color:var(--text);font-family:var(--font-mono);font-size:11px;outline:none;opacity:${ntfyWarnAcknowledged ? '1' : '0.4'}">
+      <button class="secondary" id="ntfy-save-${projectId}" ${ntfyInputDisabled} style="padding:4px 10px;font-size:10px;opacity:${ntfyWarnAcknowledged ? '1' : '0.4'}">Save</button>
+      <button class="secondary" id="ntfy-test-${projectId}" ${ntfyInputDisabled} style="padding:4px 10px;font-size:10px;opacity:${ntfyWarnAcknowledged ? '1' : '0.4'}" title="Send a test notification to verify your URL">Test</button>
       <span id="ntfy-status-${projectId}" style="font-size:10px;color:var(--muted);min-width:40px"></span>
     </div>
-    <div style="font-size:9px;color:var(--muted);margin-top:4px">
-      <strong>ntfy:</strong> install the ntfy app on iOS/Android/desktop, then enter just a topic name (we add <code>https://ntfy.sh/</code> for you) or paste a full URL.
-      <strong>Email:</strong> enter your email — Meridian sends via Resend (hosted only).
-      <strong>Webhook:</strong> any <code>https://</code> URL receives a JSON POST.
+    <div style="font-size:9px;color:var(--muted);margin-top:4px;line-height:1.6">
+      <strong>ntfy</strong> — install the ntfy app (iOS / Android / desktop), pick any topic name, and type it here. The <code>https://ntfy.sh/</code> prefix is added for you.<br>
+      <strong>Email</strong> — enter your address to get alerts by email (hosted only).<br>
+      <strong>Webhook</strong> — paste any <code>https://</code> URL (Slack, Discord, or your own) to receive a JSON POST.
     </div>
   </div>`;
 
@@ -4145,6 +4903,36 @@ async function loadSettingsTab(projectId) {
 
   body.innerHTML = html;
   if (isDemoMode()) hideDemoAdminControls();
+
+  // G4.18 — Delete account confirmation flow. Demands typing DELETE in a
+  // prompt so a misclick can't nuke the tenant. Sends to /account/delete
+  // (hosted-only endpoint); on success redirects to /.
+  const deleteBtn = document.getElementById(`account-delete-${projectId}`);
+  if (deleteBtn) {
+    deleteBtn.onclick = async () => {
+      const typed = window.prompt(
+        "This permanently deletes your account, projects, and data. "
+        + "Stripe subscription is canceled and the Neon DB is dropped.\n\n"
+        + "Type DELETE to confirm.",
+      );
+      if (typed !== "DELETE") {
+        if (typed !== null) toast('Account NOT deleted (confirmation did not match).');
+        return;
+      }
+      deleteBtn.disabled = true;
+      try {
+        await api('/account/delete', {
+          method: 'POST',
+          body: JSON.stringify({ confirmation: 'DELETE' }),
+        });
+        toast('Account deleted. Signing out…');
+        setTimeout(() => { window.location.href = '/'; }, 1200);
+      } catch (e) {
+        toast('Delete failed: ' + e.message, true);
+        deleteBtn.disabled = false;
+      }
+    };
+  }
 
   setTimeout(() => {
     const hostedPlaceholderToken = mcpData ? ('sk_meridian_' + 'x'.repeat(32)) : '';
@@ -4230,16 +5018,25 @@ async function loadSettingsTab(projectId) {
     ntfySaveBtn.onclick = async () => {
       const inp = document.getElementById(`ntfy-url-${projectId}`);
       const statusEl = document.getElementById(`ntfy-status-${projectId}`);
-      const url = normalizeNotifyTarget(inp ? inp.value : '') || null;
-      // Reflect the normalized value back so the user sees the full URL we saved.
-      if (inp && url) inp.value = url;
+      // G1.7 — send the raw user input; the server canonicalizes ntfy
+      // entries to topic-only and suffixes for per-DB uniqueness. The
+      // response carries the saved value, which we reflect back into
+      // the field so the user sees what we actually stored.
+      const raw = (inp ? inp.value : '').trim() || null;
       try {
-        // send notify_url (canonical) and ntfy_url (legacy compat) — server accepts both
-        await api(`/projects/${projectId}/ntfy`, {
+        const saved = await api(`/projects/${projectId}/ntfy`, {
           method: 'PATCH',
-          body: JSON.stringify({ notify_url: url, ntfy_url: url }),
+          body: JSON.stringify({ notify_url: raw, ntfy_url: raw }),
         });
-        if (statusEl) { statusEl.textContent = 'saved'; setTimeout(() => { statusEl.textContent = ''; }, 2000); }
+        const savedVal = saved && (saved.notify_url || saved.ntfy_url || '');
+        const shownVal = displayNotifyTarget(savedVal || '');
+        if (inp) inp.value = shownVal || '';
+        if (statusEl) {
+          statusEl.textContent = shownVal && raw && shownVal.toLowerCase() !== displayNotifyTarget(String(raw)).toLowerCase()
+            ? `saved as ${shownVal}`
+            : 'saved';
+          setTimeout(() => { statusEl.textContent = ''; }, 2400);
+        }
       } catch (e) {
         if (statusEl) statusEl.textContent = 'error';
       }
@@ -4270,6 +5067,21 @@ async function loadSettingsTab(projectId) {
       } finally {
         ntfyTestBtn.disabled = false;
       }
+    };
+  }
+
+  // Wire ntfy security warning acknowledgement checkbox
+  const ntfyWarnAckCb = document.getElementById(`ntfy-warn-ack-${projectId}`);
+  if (ntfyWarnAckCb) {
+    ntfyWarnAckCb.onchange = () => {
+      if (!ntfyWarnAckCb.checked) return;
+      try { localStorage.setItem(STORAGE_KEY('ntfy.warn.dismissed'), '1'); } catch(e) {}
+      const warnEl = document.getElementById(`ntfy-warn-${projectId}`);
+      if (warnEl) warnEl.style.display = 'none';
+      const inp = document.getElementById(`ntfy-url-${projectId}`);
+      const saveBtn = document.getElementById(`ntfy-save-${projectId}`);
+      const testBtn = document.getElementById(`ntfy-test-${projectId}`);
+      [inp, saveBtn, testBtn].forEach(el => { if (el) { el.disabled = false; el.style.opacity = '1'; } });
     };
   }
 
@@ -4340,25 +5152,35 @@ async function loadSettingsTab(projectId) {
     };
   }
 
+  // GH-1 — Branch is a dropdown populated from the repo's live branch list
+  // (server falls back to common defaults if GitHub is unreachable). Refetches
+  // whenever the selected repo changes, keeping the saved branch selected.
   const ghRepoSelect = document.getElementById(`github-repo-${projectId}`);
-  const ghBranchInput = document.getElementById(`github-branch-${projectId}`);
-  if (ghRepoSelect && ghBranchInput) {
-    ghBranchInput.dataset.autoFill = ghBranchInput.value.trim() === ghSelectedBranch ? '1' : '0';
-    ghBranchInput.addEventListener('input', () => {
-      ghBranchInput.dataset.autoFill = '0';
-    });
-    ghRepoSelect.addEventListener('change', () => {
-      const selectedRepo = ghRepoSelect.value;
-      const nextDefault = ghRepoMap[selectedRepo]?.default_branch;
-      const currentDefault = ghRepoMap[ghSelectedRepo]?.default_branch || 'main';
-      if (!nextDefault) return;
-      if (!ghBranchInput.value.trim() ||
-          ghBranchInput.value.trim() === currentDefault ||
-          ghBranchInput.dataset.autoFill === '1') {
-        ghBranchInput.value = nextDefault;
-        ghBranchInput.dataset.autoFill = '1';
+  const ghBranchSelect = document.getElementById(`github-branch-${projectId}`);
+  if (ghBranchSelect) {
+    const fillBranches = async (repo, preferred) => {
+      const fallback = preferred || ghSelectedBranch || 'main';
+      try {
+        const res = await api(`/projects/${projectId}/github/branches?repo=${encodeURIComponent(repo || '')}`);
+        let branches = Array.isArray(res && res.branches) ? res.branches.slice() : [];
+        const want = preferred || (res && res.default_branch) || fallback;
+        if (want && !branches.includes(want)) branches.unshift(want);
+        if (!branches.length) branches = [fallback];
+        ghBranchSelect.innerHTML = branches.map(b =>
+          `<option value="${escapeHtml(b)}" ${b === want ? 'selected' : ''}>${escapeHtml(b)}</option>`
+        ).join('');
+      } catch (e) {
+        // Leave the current single-option select in place on failure.
       }
-    });
+    };
+    fillBranches(ghSelectedRepo, ghSelectedBranch);
+    if (ghRepoSelect) {
+      ghRepoSelect.addEventListener('change', () => {
+        const selectedRepo = ghRepoSelect.value;
+        const nextDefault = ghRepoMap[selectedRepo] && ghRepoMap[selectedRepo].default_branch;
+        fillBranches(selectedRepo, nextDefault);
+      });
+    }
   }
 
   // Wire GitHub test button
@@ -4417,7 +5239,7 @@ async function loadNotesTab(projectId) {
     const tag = (tagFilter && tagFilter.value || '').trim();
     const qs = tag ? `?tag=${encodeURIComponent(tag)}` : '';
     try {
-      const notes = await api(`/projects/${projectId}/notes${qs}`);
+      const notes = await projectApi(projectId, `/projects/${projectId}/notes${qs}`);
       const visibleNotes = (notes || []).filter(n => {
         const title = String(n.title || '').trim().toLowerCase();
         const tags = String(n.tags || '')
@@ -4426,6 +5248,7 @@ async function loadNotesTab(projectId) {
           .filter(Boolean);
         return !title.startsWith('checkpoint:') && !tags.includes('checkpoint');
       });
+      setVtabCountBadge(`.notes-vtab-badge[data-pid="${projectId}"]`, visibleNotes.length);
       if (!visibleNotes.length) {
         body.innerHTML = `<div style="color:var(--muted);padding:10px;text-align:center;border:1px dashed var(--border);border-radius:4px">
           (no notes yet — use the form below or <code>add_note</code> MCP tool)
@@ -4462,7 +5285,8 @@ async function loadNotesTab(projectId) {
         };
       });
     } catch (e) {
-      body.innerHTML = `<div style="color:var(--muted)">failed to load notes: ${escapeHtml(String(e))}</div>`;
+      body.innerHTML = renderProjectLoadError(projectId, 'Notes unavailable', `/projects/${projectId}/notes${qs}`, e);
+      wireProjectLoadRetry(body, projectId);
     }
   };
 
@@ -4638,7 +5462,7 @@ async function loadTeamTab(projectId) {
     body.innerHTML = `<div class="empty" style="color:var(--muted)">loading team summary…</div>`;
     const days = parseInt((daySel && daySel.value) || '14', 10);
     try {
-      const data = await api(`/team/summary?project_id=${encodeURIComponent(projectId)}&days=${days}`);
+      const data = await projectApi(projectId, `/team/summary?project_id=${encodeURIComponent(projectId)}&days=${days}`);
       const humans = data.humans || [];
       if (humans.length === 0) {
         body.innerHTML = `<div style="color:var(--muted);padding:10px;text-align:center;border:1px dashed var(--border);border-radius:4px">
@@ -4758,7 +5582,8 @@ async function loadTeamTab(projectId) {
         </section>
         ${decisionsHtml}`;
     } catch (e) {
-      body.innerHTML = `<div style="color:var(--muted)">failed to load team summary: ${escapeHtml(String(e))}</div>`;
+      body.innerHTML = renderProjectLoadError(projectId, 'Team summary unavailable', `/team/summary?project_id=${encodeURIComponent(projectId)}&days=${days}`, e);
+      wireProjectLoadRetry(body, projectId);
     }
   };
 
@@ -4842,14 +5667,14 @@ async function loadRecentSessions(projectId, sessions = null) {
         const safeCmd = escapeHtml(cmd);
         return `<div style="border:1px solid var(--border);border-radius:3px;padding:5px 8px;margin-bottom:4px;background:var(--surface-1)">
           <div style="display:flex;justify-content:space-between;align-items:center;gap:6px">
-            <span style="font-weight:600;font-size:10px;color:var(--text);font-family:var(--font-mono);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${name}</span>
+            <span style="font-weight:600;font-size:10px;color:var(--text);font-family:var(--font-mono);overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${escapeHtml(s.name || '')}">${name}</span>
             <div style="display:flex;gap:4px;align-items:center;flex-shrink:0">
               <span style="font-size:9px;color:var(--muted)">${escapeHtml(status)}${dt ? ` · ${escapeHtml(dt)}` : ''}</span>
               <button class="secondary resume-session-btn" data-cmd="${safeCmd}"
                 style="padding:1px 6px;font-size:9px" title="Copy start_session() to clipboard">Resume</button>
             </div>
           </div>
-          ${summary ? `<div style="font-size:9px;color:var(--muted);margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${summary}</div>` : ''}
+          ${summary ? `<div style="font-size:9px;color:var(--muted);margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="${escapeHtml(s.summary || s.last_summary || '')}">${summary}</div>` : ''}
         </div>`;
       }).join('')}`;
     el.querySelectorAll('.resume-session-btn').forEach(btn => {
@@ -4980,8 +5805,8 @@ async function loadQueue(projectId) {
   body.innerHTML = '<div class="empty" style="color:var(--muted)">loading…</div>';
   try {
     const [sessions, sprintItems] = await Promise.all([
-      api(`/projects/${projectId}/sessions?active_only=false`).catch(() => []),
-      api(`/projects/${projectId}/sprint-items`),
+      projectApi(projectId, `/projects/${projectId}/sessions?active_only=false`).catch(() => []),
+      projectApi(projectId, `/projects/${projectId}/sprint-items`),
     ]);
     const liveSession = (sessions || []).find(s => s.status === 'active');
     panel.liveSessionId = liveSession ? liveSession.id : null;
@@ -5025,7 +5850,8 @@ async function loadQueue(projectId) {
       }
     }
   } catch (e) {
-    body.innerHTML = `<div class="empty">queue failed: ${escapeHtml(e.message)}</div>`;
+    body.innerHTML = renderProjectLoadError(projectId, 'Queue unavailable', `/projects/${projectId}/sprint-items`, e);
+    wireProjectLoadRetry(body, projectId);
   }
 }
 
@@ -5043,21 +5869,21 @@ function renderSearchResults(query, results) {
   };
   const taskRow = t => `<div style="border:1px solid var(--border);border-radius:3px;padding:5px 8px;margin-bottom:4px;background:var(--surface-2)">
     <div style="display:flex;justify-content:space-between;gap:6px">
-      <span style="font-size:11px;color:var(--text);font-family:var(--font-mono);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escapeHtml((t.description || '').slice(0, 100))}</span>
+      <span style="font-size:11px;color:var(--text);font-family:var(--font-mono);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${escapeHtml(t.description || '')}">${escapeHtml((t.description || '').slice(0, 100))}</span>
       <span style="font-size:9px;color:var(--muted);flex-shrink:0">${escapeHtml(t.status || '')}</span>
     </div>
   </div>`;
-  const noteRow = n => `<div style="border:1px solid var(--border);border-left:3px solid var(--accent);border-radius:0 3px 3px 0;padding:5px 8px;margin-bottom:4px;background:var(--surface-2)">
-    <div style="font-size:11px;font-weight:600;color:var(--accent)">${escapeHtml((n.title || '').slice(0, 80))}</div>
+  const noteRow = n => `<div style="border:1px solid var(--border);border-left:3px solid var(--accent);border-radius:0 3px 3px 0;padding:5px 8px;margin-bottom:4px;background:var(--surface-2)" title="${escapeHtml(n.body || '')}">
+    <div style="font-size:11px;font-weight:600;color:var(--accent)" title="${escapeHtml(n.title || '')}">${escapeHtml((n.title || '').slice(0, 80))}</div>
     <div style="font-size:10px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${escapeHtml((n.body || '').slice(0, 80))}</div>
   </div>`;
-  const decisionRow = d => `<div style="border:1px solid var(--border);border-left:3px solid var(--warning,#fa0);border-radius:0 3px 3px 0;padding:5px 8px;margin-bottom:4px;background:var(--surface-2)">
-    <div style="font-size:11px;font-weight:600;color:var(--text)">${escapeHtml((d.title || '').slice(0, 80))}</div>
+  const decisionRow = d => `<div style="border:1px solid var(--border);border-left:3px solid var(--warning,#fa0);border-radius:0 3px 3px 0;padding:5px 8px;margin-bottom:4px;background:var(--surface-2)" title="${escapeHtml(d.body || '')}">
+    <div style="font-size:11px;font-weight:600;color:var(--text)" title="${escapeHtml(d.title || '')}">${escapeHtml((d.title || '').slice(0, 80))}</div>
     <div style="font-size:10px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${escapeHtml((d.body || '').slice(0, 80))}</div>
   </div>`;
   const sprintRow = s => `<div style="border:1px solid var(--border);border-radius:3px;padding:5px 8px;margin-bottom:4px;background:var(--surface-2)">
     <div style="display:flex;justify-content:space-between;gap:6px">
-      <span style="font-size:11px;color:var(--text);font-family:var(--font-mono);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escapeHtml((s.title || '').slice(0, 100))}</span>
+      <span style="font-size:11px;color:var(--text);font-family:var(--font-mono);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${escapeHtml(s.title || '')}">${escapeHtml((s.title || '').slice(0, 100))}</span>
       <span style="font-size:9px;color:var(--muted);flex-shrink:0">${escapeHtml(s.version || '')} · ${escapeHtml(s.status || '')}</span>
     </div>
   </div>`;
@@ -5265,6 +6091,22 @@ window._queueAction = async function(taskId, action) {
   } catch(e) { toast('Action failed: ' + e.message, true); }
 };
 
+function _rewriteRepoImages(container, projectId) {
+  /** G7.32 — rewrite repo-relative <img src> in a markdown preview to route
+   * through /projects/{pid}/repo-image, which uses the tenant's PAT to
+   * fetch raw.githubusercontent.com. Absolute URLs and data URIs pass
+   * through unchanged. Limits noted in the server endpoint docstring. */
+  if (!container || !projectId) return;
+  container.querySelectorAll('img').forEach((img) => {
+    const src = img.getAttribute('src') || '';
+    if (!src) return;
+    if (/^https?:\/\//i.test(src) || src.startsWith('data:') || src.startsWith('/')) return;
+    const path = src.replace(/^\.\//, '');
+    img.setAttribute('src', `/projects/${projectId}/repo-image?path=${encodeURIComponent(path)}`);
+    img.setAttribute('loading', 'lazy');
+  });
+}
+
 async function loadFilesTab(projectId) {
   /**Load the list of editable files from the server and render them as
    * clickable items in the files drawer panel. */
@@ -5311,6 +6153,7 @@ async function openFileEditor(projectId, filename) {
       const md = data.content || '';
       const html = (typeof marked !== 'undefined') ? marked.parse(md) : escapeHtml(md);
       previewDiv.innerHTML = html;
+      _rewriteRepoImages(previewDiv, projectId);
       previewDiv.style.display = '';
     }
     contentEl.style.display = 'none';
@@ -5324,6 +6167,7 @@ async function openFileEditor(projectId, filename) {
             const md = contentEl.value || '';
             const html = (typeof marked !== 'undefined') ? marked.parse(md) : escapeHtml(md);
             previewDiv.innerHTML = html;
+            _rewriteRepoImages(previewDiv, projectId);
             contentEl.style.display = 'none';
             previewDiv.style.display = '';
           } else {
@@ -5364,8 +6208,9 @@ async function refreshGoal(projectId) {
   const ta = document.getElementById(`goal-${projectId}`);
   const v = document.getElementById(`goal-version-${projectId}`);
   if (!ta) return;
+  const goalPath = `/projects/${projectId}/goal`;
   try {
-    const goal = await api(`/projects/${projectId}/goal`);
+    const goal = await projectApi(projectId, goalPath);
     state.panels[projectId].goalRaw = goal.content;
     let text;
     if (typeof goal.content === 'string') {
@@ -5460,7 +6305,10 @@ async function refreshGoal(projectId) {
     loadPinnedDecisions(projectId);
   } catch (e) {
     ta.value = '';
-    v.textContent = '(unset)';
+    ta.placeholder = 'Goal state failed to load.';
+    v.textContent = '(load failed)';
+    const titleEl = document.getElementById(`goal-title-${projectId}`);
+    if (titleEl) titleEl.textContent = 'Goal state unavailable';
   }
 }
 
@@ -5585,6 +6433,39 @@ function initHitlPanel() {
   _hitlPollTimer = setInterval(refreshHitl, 30_000);
 }
 
+function setVtabCountBadge(selector, count) {
+  /** G1.2 — single source of truth for vtab/gtab count chip display.
+   * Used by HITL, Notes, and Decisions badges. */
+  document.querySelectorAll(selector).forEach(badge => {
+    badge.textContent = String(count);
+    badge.style.display = count > 0 ? 'inline-block' : 'none';
+  });
+}
+
+async function refreshProjectCountBadges(projectId) {
+  /** G1.2 — populate the muted count chips on the Notes vtab and the
+   * Decisions goal-subtab for a single project. Called on tab open;
+   * loadNotesTab / loadPinnedDecisions also refresh their own badge
+   * from the data they fetch, so no extra round trip while tabs are
+   * already active. Failures hide silently. */
+  if (!projectId) return;
+  const [notesRes, pinnedRes] = await Promise.allSettled([
+    projectApi(projectId, `/projects/${projectId}/notes`),
+    api(`/projects/${projectId}/decisions-pinned`),
+  ]);
+  if (notesRes.status === 'fulfilled') {
+    const visible = (notesRes.value || []).filter(n => {
+      const title = String(n.title || '').trim().toLowerCase();
+      const tags = String(n.tags || '').split(',').map(t => t.trim().toLowerCase()).filter(Boolean);
+      return !title.startsWith('checkpoint:') && !tags.includes('checkpoint');
+    });
+    setVtabCountBadge(`.notes-vtab-badge[data-pid="${projectId}"]`, visible.length);
+  }
+  if (pinnedRes.status === 'fulfilled') {
+    setVtabCountBadge(`.decisions-gtab-badge[data-pid="${projectId}"]`, (pinnedRes.value || []).length);
+  }
+}
+
 async function refreshHitl() {
   /** v2.4 — fetch pending HITL requests across all projects + repaint. */
   const bar = document.getElementById('hitl-bar');
@@ -5595,10 +6476,17 @@ async function refreshHitl() {
     const items = await api('/hitl?status=pending&limit=50');
     const n = items.length;
     countEl.textContent = String(n);
-    // Sync per-project vtab badges
+    // Sync per-project vtab badges — each badge shows ITS project's pending
+    // count, not the global, so a project with zero pending never shows "2".
+    const perProject = new Map();
+    for (const r of items) {
+      const pid = r && r.project_id;
+      if (!pid) continue;
+      perProject.set(pid, (perProject.get(pid) || 0) + 1);
+    }
     document.querySelectorAll('.hitl-vtab-badge').forEach(badge => {
-      badge.textContent = String(n);
-      badge.style.display = n > 0 ? 'inline-block' : 'none';
+      const pid = badge.getAttribute('data-pid');
+      setVtabCountBadge(`.hitl-vtab-badge[data-pid="${pid}"]`, perProject.get(pid) || 0);
     });
     if (n === 0) {
       bar.style.display = 'none';
@@ -5686,6 +6574,7 @@ async function loadPinnedDecisions(projectId) {
     await loadProjectSettings(projectId);
     const items = await api(`/projects/${projectId}/decisions-pinned`);
     getPanelState(projectId)._pinnedDecisions = items || [];
+    setVtabCountBadge(`.decisions-gtab-badge[data-pid="${projectId}"]`, (items || []).length);
     renderConstitutionWarning(projectId);
     if (!items || items.length === 0) {
       host.innerHTML = `<div style="color:var(--muted);padding:10px;text-align:center;border:1px dashed var(--border);border-radius:4px">(no pinned decisions yet — call <code>pin_decision</code> from MCP)</div>`;
@@ -5704,6 +6593,7 @@ async function loadPinnedDecisions(projectId) {
           <div style="display:flex;gap:6px;flex-shrink:0;align-items:center">
             <span style="color:var(--muted);font-size:10px">${escapeHtml(dateStr)}</span>
             <button class="secondary" data-supersede="${escapeHtml(d.id)}" style="padding:1px 6px;font-size:9px">Supersede</button>
+            <button class="secondary" data-delete-decision="${escapeHtml(d.id)}" title="Delete this decision permanently (use Supersede to archive instead)" style="padding:1px 6px;font-size:12px;line-height:1;color:var(--muted)">&times;</button>
           </div>
         </div>
         <div class="decision-body-view" data-id="${escapeHtml(d.id)}" title="Click to edit" style="color:var(--text);white-space:pre-wrap;word-break:break-word;line-height:1.5;font-size:12px;cursor:pointer">${escapeHtml(d.body || '')}</div>
@@ -5763,6 +6653,17 @@ async function loadPinnedDecisions(projectId) {
     host.querySelectorAll('[data-supersede]').forEach(btn => {
       btn.onclick = () => supersedePinnedDecision(projectId, btn.dataset.supersede);
     });
+    host.querySelectorAll('[data-delete-decision]').forEach(btn => {
+      btn.onclick = async () => {
+        const id = btn.dataset.deleteDecision;
+        if (!confirm('Permanently delete this pinned decision? This cannot be undone.\n\n(To archive it while keeping the audit trail, use Supersede instead.)')) return;
+        try {
+          await api(`/projects/${projectId}/decisions-pinned/${id}`, { method: 'DELETE' });
+          toast('decision deleted');
+          loadPinnedDecisions(projectId);
+        } catch (e) { toast('delete failed: ' + e.message, true); }
+      };
+    });
 
     // Superseded section — collapsible <details> below active cards
     let supersededEl = document.getElementById(`superseded-decisions-${projectId}`);
@@ -5787,7 +6688,7 @@ async function loadPinnedDecisions(projectId) {
               return `<div style="background:var(--surface-1);border:1px solid var(--border);border-left:4px solid ${color}55;border-radius:4px;padding:8px 12px;margin-bottom:6px;opacity:0.6">
                 <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px">
                   <span style="display:inline-block;background:${color}11;color:${color}88;font-size:9px;font-weight:700;padding:1px 5px;border-radius:3px">${escapeHtml(cat)}</span>
-                  <span style="color:var(--muted);font-weight:600;font-size:11px;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escapeHtml(d.title || '')}</span>
+                  <span style="color:var(--muted);font-weight:600;font-size:11px;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${escapeHtml(d.title || '')}">${escapeHtml(d.title || '')}</span>
                   <span style="color:var(--muted);font-size:9px;flex-shrink:0">${escapeHtml(dateStr)}</span>
                   <span style="background:var(--surface-2);color:var(--muted);font-size:8px;font-weight:700;padding:1px 5px;border-radius:3px;letter-spacing:.04em;flex-shrink:0">SUPERSEDED</span>
                 </div>
@@ -6079,8 +6980,9 @@ function _sessionPresenceDot(last_seen) {
 async function refreshSessions(projectId) {
   const root = document.getElementById(`sessions-${projectId}`);
   if (!root) return;
+  const sessionsPath = `/projects/${projectId}/sessions`;
   try {
-    const sessions = await api(`/projects/${projectId}/sessions`);
+    const sessions = await projectApi(projectId, sessionsPath);
     populateSessionDropdown(projectId, sessions);
     if (!sessions.length) {
       root.innerHTML = '<div class="session-row meta">(no active sessions)</div>';
@@ -6124,16 +7026,30 @@ async function refreshSessions(projectId) {
       return header + children;
     }).join('');
     root.innerHTML = rows;
-  } catch(e) {}
+  } catch(e) {
+    root.innerHTML = renderProjectLoadError(projectId, 'Sessions unavailable', sessionsPath, e);
+    wireProjectLoadRetry(root, projectId);
+  }
 }
 
 async function refreshTasks(projectId) {
+  const tasksPath = `/projects/${projectId}/tasks?limit=100`;
   try {
-    const tasks = await api(`/projects/${projectId}/tasks?limit=100`);
+    const tasks = await projectApi(projectId, tasksPath);
     state.panels[projectId].taskCache = tasks;
     state.panels[projectId].taskOffset = tasks.length;
     renderTasks(projectId);
-  } catch(e) {}
+  } catch(e) {
+    const root = document.getElementById(`tasks-${projectId}`);
+    const hitlRoot = document.getElementById(`hitl-queue-${projectId}`);
+    const banner = document.getElementById(`hitl-banner-${projectId}`);
+    if (banner) banner.style.display = 'none';
+    if (hitlRoot) hitlRoot.innerHTML = '';
+    if (root) {
+      root.innerHTML = renderProjectLoadError(projectId, 'Task log unavailable', tasksPath, e);
+      wireProjectLoadRetry(root, projectId);
+    }
+  }
 }
 
 function renderTasks(projectId) {
@@ -6435,6 +7351,7 @@ async function restoreTabs() {
   if (isDemoMode()) hideDemoAdminControls();
   if (isHostedMode()) hideHostedAdminControls();
   showLocalServerControls();
+  ensureTourButton();
   // v0.6.6 — EZ first-run wizard: if no projects exist, show the overlay
   // Skip in demo mode — demo DB always has projects seeded.
   if (state.projects.length === 0 && !isDemoMode()) {
@@ -6611,6 +7528,9 @@ document.getElementById('ez-advanced-link').onclick = (e) => {
   });
 
   window._showConnSetupIfNeeded = (cfg) => {
+    // G3.13 — demo mode never sets up its own connection; suppressing the
+    // wizard there avoids a confusing modal on /demo with the seeded repo.
+    if (typeof isDemoMode === 'function' && isDemoMode()) return;
     if (!cfg?.toml_exists && cfg?.db !== 'postgres') modal.style.display = 'flex';
     // Show config file path
     const pathEl = document.getElementById('conn-toml-path');
@@ -7029,7 +7949,7 @@ function renderRewindGoals(projectId, data, history) {
       const raw = (v.version_goal || v.north_star || '').replace(/\s+/g, ' ').trim();
       const snippet = raw.length > 80 ? raw.slice(0, 79) + '…' : raw;
       return `<div style="border-left:2px solid var(--border);padding-left:8px;margin-bottom:4px">
-        <div style="cursor:pointer;user-select:none" onclick="toggleExpand('${id}')">
+        <div style="cursor:pointer;user-select:none" onclick="toggleExpand('${id}')" title="${escapeHtml(raw)}">
           <span style="color:var(--accent)">v${v.version}</span>
           <span style="color:var(--muted);font-size:10px"> · ${escapeHtml(v.created_at || '')}</span>
           <span> ${escapeHtml(snippet)}</span>
