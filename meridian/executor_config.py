@@ -12,6 +12,7 @@ EXECUTOR_CONFIG_KEYS = (
     "deploy_cmd",
     "shell_type",
     "branch",
+    "context_threshold",
 )
 
 EXECUTOR_CREDENTIALS_RULE = (
@@ -60,6 +61,7 @@ def build_executor_config_block(raw: dict[str, Any] | None) -> str:
         "deploy_cmd": "deploy_cmd",
         "shell_type": "shell_type",
         "branch": "branch",
+        "context_threshold": "context_threshold (turns before warning)",
         "credentials_rule": "credentials_rule",
     }
     lines = ["# Executor Config"]
@@ -71,6 +73,7 @@ def build_executor_config_block(raw: dict[str, Any] | None) -> str:
         "deploy_cmd",
         "shell_type",
         "branch",
+        "context_threshold",
         "credentials_rule",
     ):
         value = config.get(key)
