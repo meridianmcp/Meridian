@@ -46,6 +46,12 @@ jobs:
           key: playwright-${{ runner.os }}-${{ hashFiles('pixi.lock') }}
           restore-keys: playwright-${{ runner.os }}-
       - run: pixi install
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('pixi.lock') }}
+          restore-keys: playwright-${{ runner.os }}-
       - run: pixi run python -m playwright install chromium --with-deps
       - run: pixi run python -m pytest --ignore=tests/test_demo_ux.py -x -q
 
@@ -64,6 +70,12 @@ jobs:
           path: ~/.cache/ms-playwright
           key: playwright-${{ runner.os }}-${{ hashFiles('pixi.lock') }}
       - run: pixi install
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('pixi.lock') }}
+          restore-keys: playwright-${{ runner.os }}-
       - run: pixi run python -m playwright install chromium --with-deps
       - run: pixi run python -m pytest tests/test_demo_ux.py -x -q
 
@@ -244,3 +256,5 @@ jobs:
             git commit -m "chore: update CHANGELOG"
             git push origin HEAD:main
           fi
+
+

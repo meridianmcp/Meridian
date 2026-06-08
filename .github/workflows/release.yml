@@ -101,3 +101,4 @@ jobs:
             dist-artifacts/meridian-mac-arm64/meridian-mac-arm64
             dist-artifacts/meridian-mac-x86_64/meridian-mac-x86_64
           generate_release_notes: true
+
