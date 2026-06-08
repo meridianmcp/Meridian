@@ -1447,6 +1447,38 @@ async def me_endpoint(request: Request) -> dict[str, Any]:
     }
 
 
+@app.get("/me/workspaces")
+async def me_workspaces(request: Request) -> list[dict[str, Any]]:
+    """Return all workspaces the current user belongs to.
+
+    Always includes the user's own workspace as the first entry (is_own=true).
+    Followed by any workspaces they've accepted an invite to.
+    Returns [] in self-hosted mode.
+    """
+    tenant = await _get_tenant_from_request(request)
+    if tenant is None:
+        return []
+    own = {
+        "tenant_id": tenant["id"],
+        "owner_email": tenant.get("email", ""),
+        "role": "owner",
+        "is_own": True,
+    }
+    invited = await db_module.get_workspaces_for_email(
+        request.app.state.db, tenant.get("email", "")
+    )
+    result = [own]
+    for m in invited:
+        if m.get("tenant_id") != tenant["id"]:
+            result.append({
+                "tenant_id": m["tenant_id"],
+                "owner_email": m.get("owner_email", ""),
+                "role": m.get("role", "member"),
+                "is_own": False,
+            })
+    return result
+
+
 @app.get("/projects", response_model=list[Project])
 async def list_projects(request: Request) -> list[dict[str, Any]]:
     """List every project."""

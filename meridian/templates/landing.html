@@ -281,6 +281,7 @@
   }
   .arch-box span { font-size: 11px; opacity: .7; display: block; }
   .arch-client { border-color: #6c8fff44; background: #6c8fff11; color: #6c8fff; }
+  .arch-relay  { border-color: #f5a62366; background: #f5a62311; color: #f5a623; min-width: 100px; }
   .arch-server { border-color: #7c3aed66; background: #7c3aed11; color: #a78bfa; min-width: 120px; }
   .arch-state  { border-color: #00d4aa44; background: #00d4aa11; color: #00d4aa; }
 
@@ -606,6 +607,25 @@ irm https://usemeridian.us/hooks.ps1 | iex</pre>
       <a href="https://docs.usemeridian.us" class="btn btn-secondary">Docs</a>
     </div>
   </div>
+  <div class="self-host" style="max-width:860px;margin-top:2rem">
+    <p class="lede" style="margin-bottom:1rem">On the hosted tier, two client layers both connect to the same Meridian Cloud MCP Server:</p>
+    <div class="arch-diagram" style="flex-wrap:nowrap;overflow-x:auto">
+      <div class="arch-col">
+        <div class="arch-box arch-client" style="margin-bottom:6px">Chat<br><span>ChatGPT, Claude.ai</span></div>
+        <div style="font-size:11px;color:var(--muted);text-align:center;margin-bottom:6px">browser MCP</div>
+        <div class="arch-box arch-client">Executor<br><span>Claude Code, Codex, Cursor</span></div>
+        <div style="font-size:11px;color:var(--muted);text-align:center;margin-top:6px">HTTPS + Bearer token</div>
+      </div>
+      <div class="arch-arrows">→</div>
+      <div class="arch-col">
+        <div class="arch-box arch-server">Meridian Cloud<br><span>MCP Server</span></div>
+      </div>
+      <div class="arch-arrows">→</div>
+      <div class="arch-col">
+        <div class="arch-box arch-state">Neon Postgres<br><span>isolated per workspace</span></div>
+      </div>
+    </div>
+  </div>
 </section>
 
 <section>
@@ -614,17 +634,21 @@ irm https://usemeridian.us/hooks.ps1 | iex</pre>
     <p class="lede">Local SQLite by default. Connect your own Postgres for shared team state. Free forever for personal use.</p>
     <div class="arch-diagram">
       <div class="arch-col">
-        <div class="arch-box arch-client">Claude Code<br><span>session 1</span></div>
-        <div class="arch-box arch-client">Claude Code<br><span>session 2</span></div>
-        <div class="arch-box arch-client">Claude Code<br><span>session 3</span></div>
+        <div class="arch-box arch-client">Claude Code<br><span>any terminal</span></div>
+        <div class="arch-box arch-client">Cursor / Windsurf<br><span>IDE</span></div>
+        <div class="arch-box arch-client">Claude Desktop<br><span>desktop app</span></div>
       </div>
       <div class="arch-arrows">→</div>
       <div class="arch-col">
-        <div class="arch-box arch-server">Meridian<br><span>MCP server</span></div>
+        <div class="arch-box arch-relay">MCP stdio<br><span>local</span></div>
       </div>
       <div class="arch-arrows">→</div>
       <div class="arch-col">
-        <div class="arch-box arch-state">Shared<br><span>state</span></div>
+        <div class="arch-box arch-server">Meridian Server<br><span>:7878</span></div>
+      </div>
+      <div class="arch-arrows">→</div>
+      <div class="arch-col">
+        <div class="arch-box arch-state">SQLite meridian.db<br><span>or Postgres</span></div>
       </div>
     </div>
     <pre><span class="h"># macOS / Linux</span>

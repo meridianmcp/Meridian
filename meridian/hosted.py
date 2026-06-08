@@ -862,8 +862,13 @@ async def auth_microsoft_callback(request: Request) -> RedirectResponse:
 
 
 async def auth_logout(request: Request) -> RedirectResponse:
-    """Clear the session cookie and delete the DB session."""
+    """Clear the session cookie and delete the DB session.
+
+    Supports an optional ``?next=<relative-path>`` query param to redirect
+    somewhere other than / after sign-out (e.g. /auth/login for account switching).
+    """
     from . import db as db_module
+    from urllib.parse import urlsplit
 
     cookie_val = request.cookies.get(_SESSION_COOKIE)
     if cookie_val:
@@ -872,7 +877,14 @@ async def auth_logout(request: Request) -> RedirectResponse:
             db = request.app.state.db
             await db_module.delete_user_session(db, session_id)
 
-    response = RedirectResponse("/", status_code=302)
+    # Only allow relative redirects (no scheme/netloc) to prevent open-redirect.
+    next_path = request.query_params.get("next", "")
+    parsed = urlsplit(next_path)
+    if parsed.scheme or parsed.netloc:
+        next_path = "/"
+    redirect_to = next_path or "/"
+
+    response = RedirectResponse(redirect_to, status_code=302)
     response.delete_cookie(_SESSION_COOKIE)
     response.delete_cookie("meridian_demo")
     return response

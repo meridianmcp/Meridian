@@ -9,6 +9,8 @@ const state = {
   apiKeyConfigured: false,
   // v0.6.5 — server runtime config fetched from /config on startup.
   serverConfig: { server_url: '', host: '', port: 0, version: '' },
+  // workspace switcher — tenant_id of the currently active workspace (null = own)
+  activeWorkspaceTenantId: null,
 };
 
 function isDemoMode() {
@@ -104,6 +106,54 @@ function ensureSignOutLink(emailHint) {
   link.onmouseenter = () => { link.style.borderColor = 'var(--accent)'; link.style.color = 'var(--accent)'; };
   link.onmouseleave = () => { link.style.borderColor = 'var(--border)'; link.style.color = 'var(--text)'; };
   footer.appendChild(link);
+}
+
+// Workspace switcher: shown in sidebar-footer when the user belongs to more
+// than one workspace (their own + accepted invites).
+async function ensureWorkspaceSwitcher() {
+  const footer = document.querySelector('.sidebar-footer');
+  if (!footer || document.getElementById('workspace-switcher')) return;
+  let workspaces;
+  try { workspaces = await fetch('/me/workspaces').then(r => r.ok ? r.json() : null); }
+  catch (_) { return; }
+  if (!workspaces || workspaces.length < 2) return;
+
+  const wrap = document.createElement('div');
+  wrap.id = 'workspace-switcher';
+  wrap.style.cssText = 'margin-top:8px';
+
+  const label = document.createElement('div');
+  label.style.cssText = 'font-size:9px;color:var(--muted);font-family:var(--font-mono);text-transform:uppercase;letter-spacing:.04em;margin-bottom:3px;opacity:.7';
+  label.textContent = 'workspace';
+
+  const sel = document.createElement('select');
+  sel.style.cssText = 'width:100%;font-size:11px;font-family:var(--font-mono);background:var(--surface-1);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:4px 6px;cursor:pointer;outline:none';
+  workspaces.forEach(ws => {
+    const opt = document.createElement('option');
+    opt.value = ws.tenant_id;
+    opt.textContent = ws.is_own ? 'My workspace' : ws.owner_email;
+    if (!state.activeWorkspaceTenantId && ws.is_own) opt.selected = true;
+    if (state.activeWorkspaceTenantId === ws.tenant_id) opt.selected = true;
+    sel.appendChild(opt);
+  });
+
+  sel.onchange = async () => {
+    const chosen = sel.value;
+    const own = workspaces.find(w => w.is_own);
+    state.activeWorkspaceTenantId = (own && chosen === own.tenant_id) ? null : chosen;
+    // Close all open tabs — they belong to the old workspace.
+    [...state.tabs].forEach(t => { try { closeTab(t.id); } catch (_) {} });
+    await loadProjects();
+    // Show which workspace is active.
+    const active = workspaces.find(w => w.tenant_id === chosen);
+    sel.title = active ? (active.is_own ? 'My workspace' : `${active.owner_email} (${active.role})`) : '';
+  };
+
+  wrap.appendChild(label);
+  wrap.appendChild(sel);
+  const existingLabel = footer.querySelector('.hosted-label');
+  if (existingLabel) footer.insertBefore(wrap, existingLabel);
+  else footer.prepend(wrap);
 }
 
 // A persistent "Take the tour" affordance in the sidebar footer so users —
@@ -650,7 +700,11 @@ function resumeDemoTour() {
 }
 
 async function api(path, opts={}) {
-  const r = await fetch(path, { headers: {'Content-Type': 'application/json'}, ...opts });
+  const headers = {'Content-Type': 'application/json'};
+  if (state.activeWorkspaceTenantId) {
+    headers['X-Workspace-Tenant-Id'] = state.activeWorkspaceTenantId;
+  }
+  const r = await fetch(path, { headers, ...opts });
   if (!r.ok) {
     if (r.status === 403 && isDemoMode()) {
       showDemoReadonlyToast();
@@ -824,6 +878,8 @@ function _renderPlanBadge(me) {
   // appears for all hosted users (incl. free tier) even before /me returns.
   // Here we just enrich the tooltip with the signed-in email if available.
   ensureSignOutLink(me.email);
+  // Show workspace switcher if the user belongs to more than one workspace.
+  ensureWorkspaceSwitcher();
 }
 
 // Detect when the active session belongs to a different account than the one
@@ -3913,12 +3969,21 @@ async function loadSettingsTab(projectId) {
   }
 
   // "Connect claude.ai browser" card — always shown regardless of hosted/self-hosted
-  html += `<div style="margin-bottom:14px;padding:10px 12px;border:1px solid var(--border);border-radius:6px;background:var(--surface-2);display:flex;justify-content:space-between;align-items:center;gap:8px">
-    <div>
-      <div style="font-weight:600;font-size:11px;color:var(--text);margin-bottom:2px">Browser connector</div>
-      <div style="font-size:10px;color:var(--muted)">Use Meridian directly in Claude or ChatGPT - hosted MCP, no extension required</div>
+  const browserConnectorAccountNote = isHostedMode() ? `
+    <div style="margin-top:6px;font-size:10px;color:var(--muted)">
+      The browser connector uses whichever Meridian account is logged in at usemeridian.us in this
+      browser tab. To use a different account, sign out and sign back in before reconnecting.
+      <a href="/auth/logout?next=/auth/login" style="color:var(--accent);text-decoration:none;white-space:nowrap">Switch Meridian account →</a>
+    </div>` : '';
+  html += `<div style="margin-bottom:14px;padding:10px 12px;border:1px solid var(--border);border-radius:6px;background:var(--surface-2)">
+    <div style="display:flex;justify-content:space-between;align-items:center;gap:8px">
+      <div>
+        <div style="font-weight:600;font-size:11px;color:var(--text);margin-bottom:2px">Browser connector</div>
+        <div style="font-size:10px;color:var(--muted)">Use Meridian directly in Claude or ChatGPT - hosted MCP, no extension required</div>
+      </div>
+      <a href="https://docs.usemeridian.us/browser-connector/" target="_blank" style="white-space:nowrap;padding:4px 10px;background:var(--accent);color:#fff;border-radius:4px;font-size:10px;font-weight:600;text-decoration:none">Setup guide →</a>
     </div>
-    <a href="https://docs.usemeridian.us/browser-connector/" target="_blank" style="white-space:nowrap;padding:4px 10px;background:var(--accent);color:#fff;border-radius:4px;font-size:10px;font-weight:600;text-decoration:none">Setup guide →</a>
+    ${browserConnectorAccountNote}
   </div>`;
 
   if (mcpData) {
@@ -4681,7 +4746,7 @@ async function loadSettingsTab(projectId) {
           usageEl.innerHTML = `
             <div style="margin-bottom:10px;display:flex;justify-content:space-between">
               <span style="color:var(--text)">Compute</span>
-              <span>${c.used.toFixed(1)} CU-hrs <span style="color:var(--accent)">· Unlimited</span></span>
+              <span>${c.used.toFixed(2)} CU-hrs <span style="color:var(--accent)">· Unlimited</span></span>
             </div>
             <div style="margin-bottom:4px;display:flex;justify-content:space-between">
               <span style="color:var(--text)">Storage</span>
@@ -4697,7 +4762,7 @@ async function loadSettingsTab(projectId) {
           <div style="margin-bottom:10px">
             <div style="display:flex;justify-content:space-between;margin-bottom:3px">
               <span style="color:var(--text)">Compute${c.throttled ? ' <span style="color:#ef4444">(throttled)</span>' : ''}</span>
-              <span>${c.used.toFixed(1)} / ${c.limit} CU-hrs <span style="color:var(--muted)">(${c.grace} w/grace)</span></span>
+              <span>${c.used.toFixed(2)} / ${c.limit} CU-hrs <span style="color:var(--muted)">(${c.grace} w/grace)</span></span>
             </div>
             <div style="background:var(--surface-1);border-radius:2px;height:5px;overflow:hidden">
               <div style="background:${barColor(cpct)};width:${cpct}%;height:100%;transition:width .3s"></div>

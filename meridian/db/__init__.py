@@ -6237,6 +6237,30 @@ async def update_workspace_member(
     return _row_to_dict(row)
 
 
+async def get_workspaces_for_email(
+    db: aiosqlite.Connection,
+    email: str,
+) -> list[dict[str, Any]]:
+    """Return workspaces the email has been invited to (accepted rows only).
+
+    Each row: {tenant_id, owner_email, role, github_access}.
+    Used to populate the workspace-switcher dropdown.
+    """
+    e = (email or "").strip().lower()
+    if not e:
+        return []
+    async with db.execute(
+        "SELECT wm.tenant_id, wm.role, wm.github_access, t.email AS owner_email "
+        "FROM workspace_members wm "
+        "JOIN tenants t ON t.id = wm.tenant_id "
+        "WHERE LOWER(wm.email) = ? AND wm.joined_at IS NOT NULL "
+        "ORDER BY wm.invited_at ASC",
+        (e,),
+    ) as cur:
+        rows = await cur.fetchall()
+    return [_row_to_dict(r) for r in rows if r is not None]
+
+
 # ---------------------------------------------------------------------------
 # Dunning helpers
 # ---------------------------------------------------------------------------

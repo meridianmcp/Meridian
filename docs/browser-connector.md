@@ -18,6 +18,18 @@ Hosted Meridian is the simplest path for both Claude and ChatGPT:
 3. Approve the OAuth popup.
 4. Start using Meridian tools in chat.
 
+!!! note "Which Meridian account does the browser connector use?"
+    The browser MCP connector uses whichever Meridian account is currently
+    **logged in at usemeridian.us** in that browser tab. If you want to connect
+    as a different account (e.g. to demo from a guest account):
+
+    1. Open [usemeridian.us/auth/logout](https://usemeridian.us/auth/logout) to sign out.
+    2. Sign in as the desired account.
+    3. Reconnect the MCP connector in Claude or ChatGPT.
+
+    You can also click **Switch Meridian account** in the dashboard Settings tab to
+    sign out and return to the login page in one step.
+
 ### Claude
 
 In Claude, go to **Customize > Connectors** (or **Settings > Connectors** in
