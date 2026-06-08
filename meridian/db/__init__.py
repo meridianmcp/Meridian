@@ -478,6 +478,18 @@ CREATE TABLE IF NOT EXISTS workspace_settings (
     display_name TEXT,
     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
+CREATE TABLE IF NOT EXISTS feedback (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+    type TEXT NOT NULL,
+    message TEXT NOT NULL,
+    email TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_feedback_tenant
+    ON feedback(tenant_id);
+CREATE INDEX IF NOT EXISTS idx_feedback_created
+    ON feedback(created_at);
 """
 
 
@@ -6480,3 +6492,20 @@ async def delete_session_notes(
         count = cur.rowcount if cur.rowcount is not None else 0
     await db.commit()
     return count
+
+
+async def add_feedback(
+    db: aiosqlite.Connection,
+    tenant_id: str,
+    type: str,
+    message: str,
+    email: str = None,
+) -> str:
+    """Save user feedback to the feedback table."""
+    feedback_id = str(uuid.uuid4())
+    await db.execute(
+        "INSERT INTO feedback (id, tenant_id, type, message, email) VALUES (?, ?, ?, ?, ?)",
+        (feedback_id, tenant_id, type, message, email),
+    )
+    await db.commit()
+    return feedback_id

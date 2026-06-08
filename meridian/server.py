@@ -6755,6 +6755,31 @@ async def mcp_sse_post(request: Request) -> Any:
     return _JSONResp(result, headers=_SSE_CORS_HEADERS)
 
 
+@app.post("/feedback", status_code=201)
+async def submit_feedback(request: Request) -> dict[str, str]:
+    """Submit user feedback. Requires JSON body: {\"type\": \"...\", \"message\": \"...\", \"email\": \"...\"}."""
+    if not _hosted_mode():
+        raise HTTPException(status_code=404)
+    if _is_demo_request(request):
+        return {"id": "demo"}
+    from .hosted import get_current_tenant
+    tenant = await get_current_tenant(request)
+    if not tenant:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    body = await request.json()
+    feedback_type = body.get("type", "general")
+    message = body.get("message", "")
+    email = body.get("email", tenant.get("email"))
+
+    if not message:
+        raise HTTPException(status_code=400, detail="Message is required")
+
+    db = await _db(request)
+    feedback_id = await db_module.add_feedback(db, tenant["id"], feedback_type, message, email)
+    return {"id": feedback_id}
+
+
 @app.post("/mcp")
 async def remote_mcp(request: Request) -> Any:
     """Remote MCP endpoint — JSON-RPC 2.0 over HTTP.
