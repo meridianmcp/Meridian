@@ -12,6 +12,19 @@ on:
     branches: [dev, main]
     tags: ['v*.*.*']
   workflow_dispatch:
+    # G9.36 — Prod-freeze: dev pushes auto-deploy to PREVIEW only.
+    # Promotion to prod requires the operator to run this workflow
+    # manually with promote=yes (or use the Actions UI button).
+    # Same merge+dispatch path as before, just gated.
+    inputs:
+      promote:
+        description: 'Set to "yes" to merge dev → main and roll prod. Anything else = no-op.'
+        required: false
+        default: 'no'
+        type: choice
+        options:
+          - 'no'
+          - 'yes'
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -25,10 +38,34 @@ jobs:
       - uses: prefix-dev/setup-pixi@v0.8.1
         with:
           pixi-version: latest
-          cache: false
+          cache: true
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('pixi.lock') }}
+          restore-keys: playwright-${{ runner.os }}-
       - run: pixi install
       - run: pixi run python -m playwright install chromium --with-deps
-      - run: pixi run test
+      - run: pixi run python -m pytest --ignore=tests/test_demo_ux.py -x -q
+
+  playwright-tests:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: prefix-dev/setup-pixi@v0.8.1
+        with:
+          pixi-version: latest
+          cache: true
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('pixi.lock') }}
+      - run: pixi install
+      - run: pixi run python -m playwright install chromium --with-deps
+      - run: pixi run python -m pytest tests/test_demo_ux.py -x -q
 
   # ─── 2. Preview deploy (dev branch only) ────────────────────────────────────
   deploy-preview:
@@ -81,10 +118,17 @@ jobs:
           echo "$RESP" | grep -q '"start_session"' || (echo "FAIL: MCP tools missing start_session" && exit 1)
           echo "MCP tools OK"
 
-  # ─── 4. Merge dev → main once smoke tests pass ───────────────────────────────
+  # ─── 4. Merge dev → main on operator-gated promotion (G9.36) ─────────────────
+  # Pre-launch the merge-to-main job auto-fired on any successful dev push,
+  # which auto-deployed prod. Now this only runs when an operator triggers
+  # the workflow with promote=yes (Actions UI → "Run workflow" → promote=yes,
+  # or `gh workflow run deploy.yml --ref dev -f promote=yes`).
   merge-to-main:
     needs: smoke-preview
-    if: github.ref == 'refs/heads/dev'
+    if: >
+      github.event_name == 'workflow_dispatch' &&
+      inputs.promote == 'yes' &&
+      github.ref == 'refs/heads/dev'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -188,7 +232,7 @@ jobs:
       - uses: prefix-dev/setup-pixi@v0.8.1
         with:
           pixi-version: latest
-          cache: false
+          cache: true
       - name: Generate CHANGELOG
         run: pixi run git-cliff --output CHANGELOG.md
       - name: Commit CHANGELOG.md if changed

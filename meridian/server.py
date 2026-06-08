@@ -69,7 +69,7 @@ from typing import Any
 
 import aiosqlite
 from fastapi import FastAPI, HTTPException, Request, WebSocket
-from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Response, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
@@ -880,6 +880,24 @@ except ImportError:
     _RATE_LIMIT = "60/minute"
 
 
+# G4.15 — Safety-limit exception → 429
+from . import limits as _limits_module  # noqa: E402, PLC0415
+
+
+@app.exception_handler(_limits_module.LimitExceeded)
+async def _limit_exceeded_handler(request: Request, exc: _limits_module.LimitExceeded):  # noqa: ARG001
+    from fastapi.responses import JSONResponse  # noqa: PLC0415
+    return JSONResponse(
+        status_code=429,
+        content={
+            "detail": str(exc),
+            "kind": exc.kind,
+            "limit": exc.limit,
+            "current": exc.current,
+        },
+    )
+
+
 # ---------------------------------------------------------------------------
 # v2.0-fixes — Demo read-only middleware (MERIDIAN_DEMO=true)
 # ---------------------------------------------------------------------------
@@ -887,6 +905,92 @@ except ImportError:
 _DEMO_WRITE_ALLOWLIST = {"/__gate__", "/mcp/sse"}
 _DEMO_WRITE_ALLOWLIST_PREFIXES = ("/auth/", "/demo", "/waitlist", "/health")
 _DEMO_CONTEXT_COOKIE = "meridian_demo"
+
+
+@app.middleware("http")
+async def _body_size_guard_middleware(request: Request, call_next):
+    """G4.15 — reject requests with bodies past the safety threshold before
+    they reach a handler. Trusts Content-Length when present; this is the
+    standard cheap fast-fail, with the actual body-stream cutoff handled by
+    Starlette / uvicorn at a much higher absolute cap.
+    """
+    if request.method in ("POST", "PUT", "PATCH"):
+        cl = request.headers.get("content-length")
+        if cl is not None:
+            try:
+                size = int(cl)
+            except ValueError:
+                size = -1
+            if size > 0:
+                try:
+                    _limits_module.check_body_bytes(size)
+                except _limits_module.LimitExceeded as exc:
+                    from fastapi.responses import JSONResponse  # noqa: PLC0415
+                    return JSONResponse(
+                        status_code=429,
+                        content={
+                            "detail": str(exc),
+                            "kind": exc.kind,
+                            "limit": exc.limit,
+                            "current": exc.current,
+                        },
+                    )
+    return await call_next(request)
+
+
+def _tenant_marker_from_request(request: Request) -> str | None:
+    """Item 39 — lightweight tenant identifier for error context.
+
+    Returns a truncated cookie/token marker. No DB lookup — the alerting path
+    must stay synchronous-cheap so it never blocks request flow on Postgres.
+    """
+    cookie = request.cookies.get("meridian_session", "")
+    if cookie:
+        return f"session:{cookie[:12]}"
+    auth = request.headers.get("authorization", "")
+    if auth.startswith("Bearer "):
+        return f"token:{auth[7:19]}"
+    return None
+
+
+@app.middleware("http")
+async def _error_tracking_middleware(request: Request, call_next):
+    """Item 39 — log unhandled exceptions and feed the 5xx counter.
+
+    Wraps every request:
+      - If the route handler raises, log route+tenant+traceback, record the
+        synthetic 500 for the rolling window, and return a clean 500 envelope.
+      - If the response status >= 500, record it.
+
+    The recording is async-safe but the alert dispatch itself is fired off
+    via ``asyncio.create_task`` inside ``record_5xx`` so the response is never
+    delayed by ntfy/Resend I/O.
+    """
+    from . import error_alerting as _ea  # noqa: PLC0415
+    tenant = _tenant_marker_from_request(request)
+    route = request.url.path or "/"
+    try:
+        response = await call_next(request)
+    except Exception as exc:  # noqa: BLE001
+        import logging as _log  # noqa: PLC0415
+        import traceback as _tb  # noqa: PLC0415
+        _log.getLogger(__name__).error(
+            "unhandled %s on %s %s (tenant=%s)\n%s",
+            type(exc).__name__,
+            request.method,
+            route,
+            tenant,
+            _tb.format_exc(),
+        )
+        await _ea.record_5xx(route, tenant, 500)
+        from fastapi.responses import JSONResponse  # noqa: PLC0415
+        return JSONResponse(
+            status_code=500,
+            content={"error": "Internal server error"},
+        )
+    if response.status_code >= 500:
+        await _ea.record_5xx(route, tenant, response.status_code)
+    return response
 
 
 @app.middleware("http")
@@ -914,6 +1018,28 @@ async def _demo_read_only_middleware(request: Request, call_next):
             media_type="application/json",
         )
     return await call_next(request)
+
+
+# ---------------------------------------------------------------------------
+# Item 39 — error alerting test endpoint
+# ---------------------------------------------------------------------------
+
+
+@app.get("/admin/__error_test")
+async def trigger_test_error(kind: str = "exception") -> Any:
+    """Force an error response to exercise the 5xx counter + admin alerting.
+
+    Gated by ``MERIDIAN_ENABLE_ERROR_TEST=1`` so it only exists on preview /
+    staging — never on prod. ``kind=exception`` (default) raises an unhandled
+    Exception so the middleware logs the traceback and synthesizes a 500.
+    ``kind=500`` returns a raw HTTPException(500) so the middleware records
+    the response status without going through the exception path.
+    """
+    if os.environ.get("MERIDIAN_ENABLE_ERROR_TEST", "").lower() not in ("1", "true", "yes"):
+        raise HTTPException(status_code=404)
+    if kind == "500":
+        raise HTTPException(status_code=500, detail="forced 500 for alert drill")
+    raise RuntimeError("forced unhandled exception for alert drill")
 
 
 # ---------------------------------------------------------------------------
@@ -1234,6 +1360,7 @@ async def server_config(request: Request) -> dict[str, Any]:
             "port": port,
             "version": _VERSION,
             "db": "demo",
+            "demo_db": "postgres" if os.environ.get("MERIDIAN_DEMO_DB_URL") else "sqlite",
             "db_host": "",
             "toml_exists": False,
             "toml_path": "",
@@ -1298,6 +1425,12 @@ async def me_endpoint(request: Request) -> dict[str, Any]:
             expired = delta.total_seconds() <= 0
         except ValueError:
             pass
+    # G2.10 — internal tenants never see the "expired" / "days remaining"
+    # banner. The lifecycle jobs already skip them, but a positive UX cue
+    # is cleaner than leaving the expired flag set with no consequence.
+    if tenant.get("is_internal"):
+        expired = False
+        days_remaining = None
     return {
         "plan": plan,
         "email": tenant.get("email", ""),
@@ -1305,7 +1438,45 @@ async def me_endpoint(request: Request) -> dict[str, Any]:
         "inactivity_expires_at": expires_raw,
         "days_remaining": days_remaining,
         "expired": expired,
+        # G2.11 — tells the dashboard whether to render "Manage billing"
+        # (true → opens Stripe portal) or "Upgrade" (false → /pricing).
+        "has_stripe_customer": bool(tenant.get("stripe_customer_id")),
+        # G2.10 — internal marker, used by the dashboard to suppress
+        # the upgrade banner and similar nag UI for staff accounts.
+        "is_internal": bool(tenant.get("is_internal")),
     }
+
+
+@app.get("/me/workspaces")
+async def me_workspaces(request: Request) -> list[dict[str, Any]]:
+    """Return all workspaces the current user belongs to.
+
+    Always includes the user's own workspace as the first entry (is_own=true).
+    Followed by any workspaces they've accepted an invite to.
+    Returns [] in self-hosted mode.
+    """
+    tenant = await _get_tenant_from_request(request)
+    if tenant is None:
+        return []
+    own = {
+        "tenant_id": tenant["id"],
+        "owner_email": tenant.get("email", ""),
+        "role": "owner",
+        "is_own": True,
+    }
+    invited = await db_module.get_workspaces_for_email(
+        request.app.state.db, tenant.get("email", "")
+    )
+    result = [own]
+    for m in invited:
+        if m.get("tenant_id") != tenant["id"]:
+            result.append({
+                "tenant_id": m["tenant_id"],
+                "owner_email": m.get("owner_email", ""),
+                "role": m.get("role", "member"),
+                "is_own": False,
+            })
+    return result
 
 
 @app.get("/projects", response_model=list[Project])
@@ -1332,6 +1503,10 @@ async def create_project(
                 status_code=403,
                 detail="Free tier is limited to 1 project. Upgrade to Solo ($20/mo) for unlimited projects.",
             )
+    # G4.15 — safety limit: projects per tenant
+    from . import limits as _limits  # noqa: PLC0415
+    all_projects = await db_module.list_projects(await _db(request))
+    _limits.check_projects_per_tenant(len(all_projects))
     return await db_module.create_project(
         await _db(request), body.name, human_id=body.human_id
     )
@@ -1423,6 +1598,63 @@ async def get_project_ntfy(project_id: str, request: Request) -> dict[str, Any]:
     return {"ntfy_url": url or ""}
 
 
+def _canonicalize_notify_target(raw: str | None) -> str | None:
+    """G1.7 — normalize the notify target so ntfy entries are stored as the
+    topic path segment only, while emails and webhooks pass through.
+
+    Examples:
+      "https://ntfy.sh/foo"   -> "foo"
+      "https://ntfy.sh/foo/"  -> "foo"
+      "ntfy.sh/foo"           -> "foo"
+      "foo"                   -> "foo"
+      "you@example.com"       -> "you@example.com"
+      "https://hooks.slack.com/services/abc" -> "https://hooks.slack.com/services/abc"
+      ""                      -> None
+    """
+    if not raw:
+        return None
+    val = str(raw).strip()
+    if not val:
+        return None
+    # Email → pass through.
+    if "@" in val and "://" not in val:
+        return val
+    lower = val.lower()
+    for prefix in ("https://ntfy.sh/", "http://ntfy.sh/", "ntfy.sh/"):
+        if lower.startswith(prefix):
+            topic = val[len(prefix):].strip().strip("/")
+            return topic or None
+    # Any other URL with a scheme → webhook, pass through.
+    if "://" in val:
+        return val
+    # Bare token, no slashes → treat as ntfy topic.
+    return val.strip("/") or None
+
+
+async def _ensure_unique_ntfy_topic(
+    db: Any, project_id: str, topic: str
+) -> str:
+    """G1.7 — make sure ``topic`` is not already in use by another project in
+    this DB. Suffix with -2, -3, … until free. Returns the topic actually
+    used. Pure topic strings only; webhooks/emails skip this check upstream.
+    """
+    projects = await db_module.list_projects(db)
+    in_use = {
+        str(p.get("ntfy_url") or "").strip().lower()
+        for p in projects
+        if p.get("id") != project_id and p.get("ntfy_url")
+    }
+    base = topic
+    candidate = base
+    n = 2
+    while candidate.lower() in in_use:
+        candidate = f"{base}-{n}"
+        n += 1
+        if n > 999:
+            break
+    return candidate
+
+
 @app.patch("/projects/{project_id}/ntfy")
 async def set_project_ntfy(
     project_id: str, body: dict[str, Any], request: Request
@@ -1430,17 +1662,24 @@ async def set_project_ntfy(
     """Save (or clear) the notify URL for this project.
 
     Accepts ``notify_url`` (preferred) or ``ntfy_url`` (legacy) key.
-    After saving a non-empty URL, fires a welcome notification so ntfy.sh
-    topics are created on first publish (avoids 404 on first real alert).
+    ntfy entries are canonicalized to the topic path segment only and
+    suffixed with -2/-3/… if another project in this DB already uses
+    the same topic. Emails and non-ntfy webhooks pass through verbatim.
+
+    After saving a non-empty value, fires a welcome notification so
+    ntfy.sh topics are created on first publish (avoids 404 on first
+    real alert).
     """
     project = await db_module.get_project(await _db(request), project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="project not found")
     # Accept both the new canonical key and the legacy key for backwards compat
-    notify_url = (
-        str(body.get("notify_url") or body.get("ntfy_url") or "").strip() or None
-    )
+    raw_value = str(body.get("notify_url") or body.get("ntfy_url") or "").strip() or None
+    notify_url = _canonicalize_notify_target(raw_value)
     db = await _db(request)
+    if notify_url and "://" not in notify_url and "@" not in notify_url:
+        # bare topic → enforce per-DB uniqueness
+        notify_url = await _ensure_unique_ntfy_topic(db, project_id, notify_url)
     await db_module.set_project_ntfy_url(db, project_id, notify_url)
     if notify_url:
         # Fire a welcome notification immediately so ntfy.sh creates the topic
@@ -1637,6 +1876,11 @@ async def _notify_project(
         notify_url = await db_module.get_project_ntfy_url(db, project_id)
         if not notify_url:
             return
+        # G1.7 — stored ntfy values are topic-only; reconstruct the full URL
+        # at dispatch time. Anything else (email / non-ntfy webhook) is
+        # already in its dispatchable form.
+        if "://" not in notify_url and "@" not in notify_url:
+            notify_url = f"https://ntfy.sh/{notify_url}"
         await _dispatch_notification(notify_url, title, body_text, event)
     except Exception:  # noqa: BLE001
         pass  # never let notifications crash the main flow
@@ -1836,6 +2080,38 @@ async def _maybe_notify(
         pass
 
 
+@app.patch("/projects/{project_id}/icon")
+async def set_project_icon(
+    project_id: str, body: dict[str, Any], request: Request
+) -> dict[str, Any]:
+    """G4.17 — set or clear the single-emoji icon for a project.
+
+    Body: ``{"icon": "🎯"}`` or ``{"icon": null}``. Stored as the user-provided
+    string capped to a short length (typical emoji is 1-4 codepoints); the
+    frontend never expects more than ~8 chars. Wider validation lives in
+    the UI picker.
+    """
+    project = await db_module.get_project(await _db(request), project_id)
+    if project is None:
+        raise HTTPException(404, "project not found")
+    raw = body.get("icon")
+    icon: str | None
+    if raw is None:
+        icon = None
+    else:
+        icon = str(raw).strip()[:8] or None
+    db = await _db(request)
+    await db.execute(
+        "UPDATE projects SET icon = ? WHERE id = ?",
+        (icon, project_id),
+    )
+    await db.commit()
+    db_module.publish_global(
+        {"type": "project_icon_changed", "project_id": project_id, "icon": icon}
+    )
+    return await db_module.get_project(db, project_id)
+
+
 @app.post("/projects/{project_id}/rename")
 async def rename_project(
     project_id: str, body: dict[str, Any], request: Request
@@ -1881,14 +2157,39 @@ async def get_goal(project_id: str, request: Request) -> dict[str, Any]:
     created_at}`` dicts. Cold sessions can render the directive *and*
     last activity from a single MCP call.
 
-    404 if the project does not exist or the goal hasn't been set yet.
+    G8.34/G9 — Returns 200 with an empty stub when the project exists
+    but no goal has been set yet (previously 404). The 404-as-empty
+    semantics produced a console error on the dashboard's initial
+    render for every fresh project, which made the panel-render
+    Playwright test flake by environment. Browsers can't tell the
+    difference between "field is empty" and "fetch threw 4xx", so
+    the only honest answer is 200 with empty fields. Returns 404 still
+    when the project itself does not exist.
     """
     project = await db_module.get_project(await _db(request), project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="project not found")
     goal = await db_module.get_goal(await _db(request), project_id)
     if goal is None:
-        raise HTTPException(status_code=404, detail="goal not set")
+        recent = await db_module.get_tasks(await _db(request), project_id, limit=5)
+        return {
+            "id": "",
+            "project_id": project_id,
+            "content": "",
+            "version": 0,
+            "created_at": "",
+            "updated_at": "",
+            "ambient_tasks": [
+                {
+                    "status": t["status"],
+                    "description": t["description"],
+                    "created_at": t["created_at"],
+                }
+                for t in recent
+            ],
+            "north_star": None,
+            "sprint": None,
+        }
     recent = await db_module.get_tasks(await _db(request), project_id, limit=5)
     goal["ambient_tasks"] = [
         {
@@ -2103,6 +2404,8 @@ async def get_timeline_endpoint(
         "sessions": [],
         "goal_events": timeline.get("goal_events", []),
         "daily_counts": timeline.get("daily_counts", []),
+        "people": timeline.get("people", []),
+        "clients": timeline.get("clients", []),
     }
 
 
@@ -2357,7 +2660,7 @@ async def dashboard_html(request: Request) -> Any:
             tenant = await get_current_tenant(request)
             is_admin = await is_admin_db(tenant.get("email", ""), request.app.state.db)
         except HTTPException:
-            is_admin = False
+            return RedirectResponse(url="/auth/login", status_code=302)
     response = _templates.TemplateResponse(
         request,
         "dashboard.html",
@@ -3525,6 +3828,34 @@ async def get_notification_prefs(request: Request) -> dict[str, Any]:
 _WORKSPACE_MEMBER_LIMITS: dict[str, int] = {"standard": 25, "pro": 50}
 
 
+async def _require_workspace_perm(
+    request: Request, tenant: dict[str, Any], perm: str,
+) -> str:
+    """G5.19 — Resolve the calling user's role in the tenant's workspace
+    and 403 if they lack ``perm``. Returns the resolved role on success.
+
+    The tenant owner (email matches tenant.email) implicitly has every
+    permission. For invitees, ROLE_PERMS gates the action.
+    """
+    from .hosted import get_current_tenant as _get_ct  # noqa: PLC0415
+    from .roles import has_perm  # noqa: PLC0415
+    try:
+        caller = await _get_ct(request)
+    except HTTPException:
+        raise HTTPException(403, "Sign in required")
+    caller_email = caller.get("email", "")
+    resolved = await db_module.resolve_member_role(
+        request.app.state.db, tenant["id"], caller_email,
+    )
+    role = resolved[0] if resolved else None
+    if not has_perm(role, perm):
+        raise HTTPException(
+            403,
+            f"Workspace role '{role or 'none'}' lacks permission '{perm}'",
+        )
+    return role  # type: ignore[return-value]
+
+
 @app.post("/workspace/invite", status_code=201)
 async def workspace_invite(request: Request) -> dict[str, Any]:
     """Invite a new workspace member. Sends invite email via Resend."""
@@ -3533,13 +3864,31 @@ async def workspace_invite(request: Request) -> dict[str, Any]:
     from .hosted import get_current_tenant, send_invite_email
     import hashlib, secrets as _secrets
     tenant = await get_current_tenant(request)
+    # G5.19 — admin+ can invite. Tenant owners always pass; admin invitees
+    # pass; member/viewer get 403.
+    from .roles import (  # noqa: PLC0415
+        VALID_ROLES, VALID_GITHUB_ACCESS,
+        default_github_access_for_role, PERM_INVITE,
+    )
+    await _require_workspace_perm(request, tenant, PERM_INVITE)
     body = await request.json()
     email = (body.get("email") or "").strip().lower()
     role = (body.get("role") or "member").strip()
     if not email or "@" not in email:
         raise HTTPException(status_code=422, detail="valid email required")
-    if role not in ("member", "viewer"):
-        raise HTTPException(status_code=422, detail="role must be member or viewer")
+    if role not in VALID_ROLES:
+        raise HTTPException(
+            status_code=422,
+            detail=f"role must be one of {sorted(VALID_ROLES)}",
+        )
+    github_access = (body.get("github_access") or "").strip().lower()
+    if github_access and github_access not in VALID_GITHUB_ACCESS:
+        raise HTTPException(
+            status_code=422,
+            detail=f"github_access must be one of {sorted(VALID_GITHUB_ACCESS)}",
+        )
+    if not github_access:
+        github_access = default_github_access_for_role(role)
     db = request.app.state.db
     limit = _WORKSPACE_MEMBER_LIMITS.get(tenant.get("plan", "standard"), 25)
     count = await db_module.count_workspace_members(db, tenant["id"])
@@ -3547,7 +3896,9 @@ async def workspace_invite(request: Request) -> dict[str, Any]:
         raise HTTPException(status_code=402, detail=f"Team member limit ({limit}) reached for your plan")
     raw_token = _secrets.token_urlsafe(32)
     token_hash = hashlib.sha256(raw_token.encode()).hexdigest()
-    invite = await db_module.create_workspace_invite(db, tenant["id"], email, role, token_hash)
+    invite = await db_module.create_workspace_invite(
+        db, tenant["id"], email, role, token_hash, github_access=github_access,
+    )
     base = os.environ.get("MERIDIAN_SERVER_URL", "https://usemeridian.us").rstrip("/")
     invite_url = f"{base}/workspace/accept?token={raw_token}"
     try:
@@ -3593,11 +3944,64 @@ async def workspace_list_members(request: Request) -> list[dict[str, Any]]:
             "id": m["id"],
             "email": m["email"],
             "role": m["role"],
+            "github_access": m.get("github_access"),
             "joined_at": m.get("joined_at"),
             "pending": m.get("joined_at") is None,
         }
         for m in members
     ]
+
+
+@app.patch("/workspace/members/{member_id}")
+async def workspace_update_member(request: Request, member_id: str) -> dict[str, Any]:
+    """v2.8 — change a workspace member's role (and github_access cap).
+
+    Admin+ only (PERM_INVITE, same gate as add/remove). When ``role`` changes
+    without an explicit ``github_access``, the cap is reset to that role's
+    default so a promotion/demotion carries sane repo access automatically.
+    """
+    if not _hosted_mode():
+        raise HTTPException(status_code=404)
+    from .hosted import get_current_tenant
+    from .roles import (  # noqa: PLC0415
+        VALID_ROLES, VALID_GITHUB_ACCESS,
+        default_github_access_for_role, ROLE_OWNER, PERM_INVITE,
+    )
+    tenant = await get_current_tenant(request)
+    await _require_workspace_perm(request, tenant, PERM_INVITE)
+    body = await request.json()
+    role = (body.get("role") or "").strip() or None
+    github_access = (body.get("github_access") or "").strip().lower() or None
+    if role is not None and role not in VALID_ROLES:
+        raise HTTPException(
+            status_code=422, detail=f"role must be one of {sorted(VALID_ROLES)}",
+        )
+    # Promoting an invitee to full owner is a billing/ownership transfer, not a
+    # role edit — block it here so the implicit tenant owner stays singular.
+    if role == ROLE_OWNER:
+        raise HTTPException(status_code=422, detail="cannot assign the owner role")
+    if github_access is not None and github_access not in VALID_GITHUB_ACCESS:
+        raise HTTPException(
+            status_code=422,
+            detail=f"github_access must be one of {sorted(VALID_GITHUB_ACCESS)}",
+        )
+    if role is not None and github_access is None:
+        github_access = default_github_access_for_role(role)
+    if role is None and github_access is None:
+        raise HTTPException(status_code=422, detail="role or github_access required")
+    updated = await db_module.update_workspace_member(
+        request.app.state.db, member_id, tenant["id"],
+        role=role, github_access=github_access,
+    )
+    if updated is None:
+        raise HTTPException(status_code=404, detail="member not found")
+    return {
+        "id": updated["id"],
+        "email": updated["email"],
+        "role": updated["role"],
+        "github_access": updated.get("github_access"),
+        "pending": updated.get("joined_at") is None,
+    }
 
 
 @app.delete("/workspace/members/{member_id}", status_code=204)
@@ -3629,7 +4033,12 @@ async def export_my_data(request: Request) -> Response:
         )
     from .hosted import get_current_tenant
     tenant = await get_current_tenant(request)
-    data = await db_module.export_tenant_data(request.app.state.db, tenant["id"])
+    # Account rows (tenant/tokens/members) live in the auth DB; the tenant's
+    # project data lives in its own per-tenant DB. Pass both so the export
+    # actually contains projects (hosted mode previously exported empty arrays).
+    data = await db_module.export_tenant_data(
+        request.app.state.db, tenant["id"], project_db=await _db(request),
+    )
     payload = json.dumps(data, indent=2, default=str).encode()
     email_slug = (tenant.get("email") or "user").split("@")[0][:20]
     filename = f"meridian-export-{email_slug}.json"
@@ -3651,8 +4060,12 @@ async def delete_account(request: Request) -> Response:
             status_code=403,
         )
     from .hosted import get_current_tenant, cancel_stripe_subscription, _drop_tenant_neon_database, send_account_deleted_email
+    from .roles import PERM_DELETE_TENANT  # noqa: PLC0415
     from fastapi.responses import JSONResponse
     tenant = await get_current_tenant(request)
+    # G5.19 — only the tenant owner can delete the account. Admin
+    # invitees are explicitly excluded by ROLE_PERMS.
+    await _require_workspace_perm(request, tenant, PERM_DELETE_TENANT)
     body = await request.json()
     if body.get("confirmation") != "DELETE":
         raise HTTPException(status_code=400, detail="Type DELETE to confirm account deletion.")
@@ -3845,6 +4258,58 @@ async def github_status(project_id: str, request: Request) -> dict[str, Any]:
     }
 
 
+@app.get("/projects/{project_id}/repo-image")
+async def repo_image_proxy(project_id: str, request: Request, path: str = ""):
+    """G7.32 — proxy a repo-relative image through the project's GitHub PAT.
+
+    Used by markdown preview to render images that live in the connected
+    repo (e.g. ``![](docs/screenshots/foo.png)``) without exposing the PAT
+    to the browser. Returns the raw bytes with the upstream Content-Type.
+
+    Limits:
+     - Hosted-only (PAT lives on the tenant).
+     - Path is normalized to disallow ``..``; absolute URLs are rejected.
+     - Falls back to 404 when the project isn't connected to a repo.
+     - 1 MB response cap (oversized images are 413).
+    """
+    if not _hosted_mode():
+        raise HTTPException(404)
+    tenant = await _get_tenant_from_request(request)
+    if tenant is None:
+        raise HTTPException(401, "not authenticated")
+    fresh = await db_module.get_tenant_by_id(request.app.state.db, tenant["id"])
+    repo = (fresh or {}).get("github_repo") or ""
+    branch = (fresh or {}).get("github_branch") or "main"
+    pat = db_module.decrypt_field((fresh or {}).get("github_pat")) if fresh else None
+    if not repo or not pat:
+        raise HTTPException(404, "no repo connected")
+    clean = path.strip().lstrip("/")
+    if not clean or ".." in clean.split("/") or "://" in clean:
+        raise HTTPException(400, "invalid path")
+    if "/" not in repo:
+        raise HTTPException(400, "repo not owner/name")
+    owner, repo_name = repo.split("/", 1)
+    raw_url = f"https://raw.githubusercontent.com/{owner}/{repo_name}/{branch}/{clean}"
+    import httpx  # noqa: PLC0415
+    try:
+        async with httpx.AsyncClient(timeout=10) as http:
+            r = await http.get(raw_url, headers={"Authorization": f"Bearer {pat}"})
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(502, f"upstream fetch failed: {exc}") from exc
+    if r.status_code == 404:
+        raise HTTPException(404, "file not found in repo")
+    if r.status_code >= 400:
+        raise HTTPException(r.status_code, "upstream error")
+    body = r.content
+    if len(body) > 1_000_000:
+        raise HTTPException(413, "image too large")
+    return Response(
+        content=body,
+        media_type=r.headers.get("content-type", "application/octet-stream"),
+        headers={"Cache-Control": "private, max-age=60"},
+    )
+
+
 @app.delete("/projects/{project_id}/github/disconnect", status_code=200)
 async def github_disconnect(project_id: str, request: Request) -> dict[str, Any]:
     """Clear the tenant's stored GitHub credentials."""
@@ -3900,6 +4365,48 @@ async def github_repos(project_id: str, request: Request) -> dict[str, Any]:
     repos = snapshot.get("repos") or []
     _GITHUB_REPOS_CACHE[tenant["id"]] = {"repos": repos, "fetched_at": now}
     return {"connected": True, "repos": repos, "synced_at": now, "cached": False}
+
+
+# Common branch names we offer as a fallback when the live GitHub list is
+# unavailable (e.g. the API is unreachable). The repo's current/default branch
+# is always merged in by the caller so the saved value never disappears.
+_FALLBACK_BRANCHES = ("main", "master", "dev", "develop", "gh-pages")
+
+
+@app.get("/projects/{project_id}/github/branches")
+async def github_branches(project_id: str, request: Request) -> dict[str, Any]:
+    """v2.8 — list the branches of a repo so the Branch field can be a dropdown.
+
+    Query: ``?repo=owner/name`` (defaults to the tenant's connected repo).
+    Falls back to a static list of common branches if GitHub can't be reached,
+    so the dropdown always has sensible options.
+    """
+    if not _hosted_mode():
+        raise HTTPException(status_code=404)
+    from .hosted import _github_repo_branches
+    tenant = await _get_tenant_from_request(request)
+    if tenant is None:
+        raise HTTPException(status_code=401, detail="not authenticated")
+    fresh = await db_module.get_tenant_by_id(request.app.state.db, tenant["id"])
+    repo = (request.query_params.get("repo") or (fresh or {}).get("github_repo") or "").strip()
+    default_branch = (fresh or {}).get("github_branch") or "main"
+    token = db_module.decrypt_field((fresh or {}).get("github_pat")) if fresh else None
+    branches: list[str] = []
+    source = "fallback"
+    if token and repo and "/" in repo:
+        try:
+            branches = await _github_repo_branches(token, repo)
+            source = "github"
+        except Exception:  # noqa: BLE001
+            branches = []
+    if not branches:
+        # Merge the saved branch + common defaults, preserving order, no dupes.
+        seen: set[str] = set()
+        for b in (default_branch, *_FALLBACK_BRANCHES):
+            if b and b not in seen:
+                seen.add(b)
+                branches.append(b)
+    return {"repo": repo, "branches": branches, "default_branch": default_branch, "source": source}
 
 
 @app.get("/mcp/quickstart", response_class=PlainTextResponse)
@@ -4180,6 +4687,42 @@ async def _idle_until_session_done(
         await asyncio.sleep(max(1, poll_seconds))
 
 
+async def _find_continuation_session(
+    db: aiosqlite.Connection,
+    project_id: str,
+    session_name: str,
+    max_idle_minutes: int = 5,
+) -> dict[str, Any] | None:
+    """G8.34 — Look for an active session with this name whose last heartbeat
+    is within ``max_idle_minutes`` minutes. Returns the session row or None.
+
+    Matching keys: project_id + session_name (NOT the MCP-Session-Id header,
+    because ChatGPT regenerates that per call so it can never identify a
+    continuation). The session name is the logical handle the client picked
+    at startup; re-registering with the same name is the resume signal.
+    """
+    from datetime import datetime, timezone, timedelta
+    sessions = await db_module.get_sessions(db, project_id, active_only=True)
+    if not sessions:
+        return None
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=max_idle_minutes)
+    for s in sessions:
+        if (s.get("name") or "") != session_name:
+            continue
+        last_seen_raw = s.get("last_seen") or ""
+        if not last_seen_raw:
+            continue
+        try:
+            seen = datetime.strptime(last_seen_raw, "%Y-%m-%d %H:%M:%S").replace(
+                tzinfo=timezone.utc,
+            )
+        except ValueError:
+            continue
+        if seen >= cutoff:
+            return s
+    return None
+
+
 async def _start_session_composite(
     db: aiosqlite.Connection,
     project_id: str,
@@ -4188,13 +4731,33 @@ async def _start_session_composite(
     human_id: str | None = None,
     client_type: str | None = None,
     role: str | None = None,
+    source: str | None = None,
 ) -> dict[str, Any]:
     """Register + goal + tasks + sessions + handoff-check in one shot.
 
     Replaces the four-call cold-start sequence (register_session, get_goal,
     get_tasks, check handoff file) with a single call that returns everything
     a new session needs before touching anything.
+
+    G8.34 — If a session with the same ``session_name`` is still active and
+    pinged a heartbeat within the last 5 minutes, return a compact
+    continuation block (no new registration, no goal-block flood). Keyed on
+    (project_id, session_name); NEVER on Mcp-Session-Id since ChatGPT
+    regenerates that header per tool call.
     """
+    existing = await _find_continuation_session(db, project_id, session_name)
+    if existing is not None:
+        # Compact resume block — caller already has the heavy context.
+        recent = await db_module.get_tasks(db, project_id, limit=10)
+        return {
+            "continuation": True,
+            "session": existing,
+            "source": source,
+            "recent_tasks": recent,
+            "note": "Resumed existing session (last_seen within 5 min). "
+                    "Call start_session(source='startup') after a real cold boot "
+                    "to get the full orientation block.",
+        }
     # v1.8.x — archive sessions silent for 7+ days so they don't crowd
     # the active list seen by new sessions.
     await db_module.archive_empty_sessions(db)
@@ -4204,6 +4767,8 @@ async def _start_session_composite(
     except Exception:
         pass
 
+    if not human_id and not _hosted_mode():
+        human_id = db_module.get_default_human_id()
     session = await db_module.register_session(
         db, project_id, session_name, human_id=human_id, client_type=client_type
     )
@@ -4356,6 +4921,7 @@ async def start_session_endpoint(
         human_id=body.human_id,
         client_type=body.client,
         role=body.role,
+        source=body.source,
     )
 
 
@@ -4424,9 +4990,19 @@ async def hooks_session_start(body: dict[str, Any], request: Request) -> dict[st
     if project is None:
         from fastapi.responses import JSONResponse
         return JSONResponse(status_code=404, content={"error": "project not found"})
+    # v2.8 — Codex/Claude hook sessions rarely pass a human_id, so they land on
+    # the timeline as "(unknown)". Fall back to the workspace display name the
+    # user set in Settings so their automated sessions are attributed to them.
+    human_id = body.get("human_id")
+    if not human_id:
+        try:
+            ws = await db_module.get_workspace_settings(db)
+            human_id = (ws.get("display_name") or "").strip() or None
+        except Exception:  # noqa: BLE001
+            human_id = None
     result = await _start_session_composite(
         db, project_id, session_name, _data_dir(request),
-        human_id=body.get("human_id"),
+        human_id=human_id,
         client_type="hook",
     )
     goal = result.get("goal") or {}
@@ -4486,8 +5062,27 @@ async def hooks_stop(body: dict[str, Any], request: Request) -> dict[str, Any]:
     return {"ok": True}
 
 
+async def _block_non_admin_connection_writes(request: Request) -> None:
+    """G1.9 — connection profiles live in the hosted server's meridian.toml.
+    Non-admin tenants must not be able to mutate them. Returns 403 cleanly
+    instead of the surprising 404 when, e.g., the dashboard tried to
+    activate a connection name that doesn't exist in the toml at all.
+    """
+    if not _hosted_mode():
+        return
+    from .hosted import get_current_tenant, is_admin_db  # noqa: PLC0415
+    try:
+        tenant = await get_current_tenant(request)
+    except HTTPException:
+        raise HTTPException(403, "Sign in to manage connections")
+    if not await is_admin_db(tenant.get("email", ""), request.app.state.db):
+        raise HTTPException(
+            403, "Connection profiles are admin-only on the hosted service"
+        )
+
+
 @app.post("/config/connections")
-async def save_connection(body: dict[str, Any]) -> dict[str, Any]:
+async def save_connection(body: dict[str, Any], request: Request) -> dict[str, Any]:
     """v1.9.x — save a new connection profile to meridian.toml.
 
     Body fields:
@@ -4495,7 +5090,11 @@ async def save_connection(body: dict[str, Any]) -> dict[str, Any]:
       * ``type``      — "sqlite" or "postgres"
       * ``url``       — Postgres URL (required when type == "postgres")
       * ``activate``  — if true, set as the active connection (default true)
+
+    Hosted non-admin tenants get 403; the dashboard hides the picker for
+    them too, but this is the canonical defense.
     """
+    await _block_non_admin_connection_writes(request)
     name = str(body.get("name", "local")).strip()
     conn_type = body.get("type")  # optional — if omitted, reuse existing
     url = str(body.get("url", "")).strip()
@@ -4520,6 +5119,12 @@ async def save_connection(body: dict[str, Any]) -> dict[str, Any]:
         if conn_type == "postgres":
             new_cfg["url"] = url
         connections[name] = new_cfg
+    elif name == "env":
+        # "env" is the synthetic connection backed by MERIDIAN_DB_URL (hosted).
+        # It is never written to meridian.toml and is already the active DB, so
+        # re-selecting it (clicking the active connection in the picker) is a
+        # no-op rather than a 404.
+        return {"ok": True, "connection_name": "env", "restart_required": False}
     elif name not in connections and name != "local":
         raise HTTPException(404, f"connection '{name}' not found in meridian.toml")
 
@@ -4537,8 +5142,12 @@ async def save_connection(body: dict[str, Any]) -> dict[str, Any]:
 
 
 @app.delete("/config/connections/{name}")
-async def delete_connection(name: str) -> dict[str, Any]:
-    """v1.9.x — remove a named connection profile from meridian.toml."""
+async def delete_connection(name: str, request: Request) -> dict[str, Any]:
+    """v1.9.x — remove a named connection profile from meridian.toml.
+
+    Hosted non-admin tenants get 403 (see _block_non_admin_connection_writes).
+    """
+    await _block_non_admin_connection_writes(request)
     data = toml_config_module.load_toml() or {}
     connections: dict[str, dict[str, str]] = {
         cname: dict(ccfg)
@@ -4759,6 +5368,34 @@ a:hover{text-decoration:underline}
 # ---------------------------------------------------------------------------
 # v1.0 — Stripe Checkout (API-based, plan-aware)
 # ---------------------------------------------------------------------------
+
+
+@app.get("/billing/portal")
+async def billing_portal_redirect(request: Request):
+    """G2.11 — open a Stripe Customer Portal session for the signed-in tenant.
+
+    Routes to /pricing when the tenant has no stripe_customer_id (free tier
+    or trial), to /auth/login when not signed in, and to the Stripe-hosted
+    portal otherwise.
+    """
+    from fastapi.responses import RedirectResponse  # noqa: PLC0415
+    from .hosted import create_stripe_billing_portal_session, get_current_tenant  # noqa: PLC0415
+
+    try:
+        tenant = await get_current_tenant(request)
+    except HTTPException:
+        return RedirectResponse("/auth/login?next=/billing/portal", status_code=302)
+
+    try:
+        url = await create_stripe_billing_portal_session(tenant)
+    except ValueError:
+        # No stripe_customer_id yet — direct the user to subscribe instead.
+        return RedirectResponse("/pricing", status_code=302)
+    except RuntimeError:
+        # Stripe not configured (local dev) — fall through to pricing.
+        return RedirectResponse("/pricing", status_code=302)
+
+    return RedirectResponse(url, status_code=302)
 
 
 @app.get("/checkout")
@@ -5248,11 +5885,17 @@ async def _dispatch_mcp_tool(
 ) -> Any:
     """Route a tools/call to the appropriate db_module function."""
     if name == "create_project":
+        existing = await db_module.get_project_by_name(db, args["name"])
+        if existing is not None:
+            return {"error": f"project '{args['name']}' already exists", "project": existing}
         return await db_module.create_project(db, args["name"])
     if name == "register_session":
+        hid = args.get("human_id")
+        if not hid and not _hosted_mode():
+            hid = db_module.get_default_human_id()
         return await db_module.register_session(
             db, args["project_id"], args["session_name"],
-            args.get("human_id"),
+            hid,
             agent_framework=args.get("agent_framework", "claude_code"),
             client_type=args.get("client"),
         )
@@ -5591,6 +6234,10 @@ async def _dispatch_mcp_tool(
             failure_mode=args.get("failure_mode"),
             milestone_type=args.get("milestone_type", "task"),
         )
+    if name == "set_sprint":
+        result = await db_module.set_sprint(db, args["project_id"], args["sprint"])
+        await goal_md_module.sync_db_to_goal_md(db, args["project_id"])
+        return result
     if name == "get_sprint_items":
         return await db_module.get_sprint_items(
             db, args["project_id"],
@@ -6106,6 +6753,31 @@ async def mcp_sse_post(request: Request) -> Any:
 
     result = await _handle_mcp_request(body, db, data_dir)
     return _JSONResp(result, headers=_SSE_CORS_HEADERS)
+
+
+@app.post("/feedback", status_code=201)
+async def submit_feedback(request: Request) -> dict[str, str]:
+    """Submit user feedback. Requires JSON body: {\"type\": \"...\", \"message\": \"...\", \"email\": \"...\"}."""
+    if not _hosted_mode():
+        raise HTTPException(status_code=404)
+    if _is_demo_request(request):
+        return {"id": "demo"}
+    from .hosted import get_current_tenant
+    tenant = await get_current_tenant(request)
+    if not tenant:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    body = await request.json()
+    feedback_type = body.get("type", "general")
+    message = body.get("message", "")
+    email = body.get("email", tenant.get("email"))
+
+    if not message:
+        raise HTTPException(status_code=400, detail="Message is required")
+
+    db = await _db(request)
+    feedback_id = await db_module.add_feedback(db, tenant["id"], feedback_type, message, email)
+    return {"id": feedback_id}
 
 
 @app.post("/mcp")

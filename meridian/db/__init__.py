@@ -150,6 +150,7 @@ CREATE TABLE IF NOT EXISTS projects (
     max_pinned_decisions INTEGER NOT NULL DEFAULT 20,
     executor_config TEXT,
     hitl_auto_answer INTEGER NOT NULL DEFAULT 0,
+    icon TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -321,6 +322,7 @@ CREATE TABLE IF NOT EXISTS tenants (
     notification_prefs TEXT NOT NULL DEFAULT '{}',
     trial_started_at TEXT,
     inactivity_expires_at TEXT,
+    is_internal INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -348,12 +350,16 @@ CREATE TABLE IF NOT EXISTS oauth_tokens (
 );
 
 -- v2.1 dark — multi-user roles, not exposed in UI or API at launch
+-- G5.19/G5.20 — role widened to include 'admin'; github_access caps
+-- repo-touching MCP tools per invitee. App layer (meridian.roles) is the
+-- source of truth for valid values; no DB-level CHECK so adding a future
+-- role doesn't require a table rebuild on every SQLite install.
 CREATE TABLE IF NOT EXISTS workspace_members (
     id TEXT PRIMARY KEY,
     tenant_id TEXT NOT NULL REFERENCES tenants(id),
     email TEXT NOT NULL,
-    role TEXT NOT NULL DEFAULT 'member'
-        CHECK (role IN ('owner','member','viewer')),
+    role TEXT NOT NULL DEFAULT 'member',
+    github_access TEXT NOT NULL DEFAULT 'read',
     token_hash TEXT,
     invited_at TEXT NOT NULL DEFAULT (datetime('now')),
     joined_at TEXT
@@ -469,8 +475,21 @@ CREATE TABLE IF NOT EXISTS workspace_settings (
     id TEXT PRIMARY KEY DEFAULT 'singleton',
     hitl_auto_answer_default INTEGER NOT NULL DEFAULT 0,
     sprint_name_default TEXT,
+    display_name TEXT,
     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
+CREATE TABLE IF NOT EXISTS feedback (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+    type TEXT NOT NULL,
+    message TEXT NOT NULL,
+    email TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_feedback_tenant
+    ON feedback(tenant_id);
+CREATE INDEX IF NOT EXISTS idx_feedback_created
+    ON feedback(created_at);
 """
 
 
@@ -763,6 +782,10 @@ async def _migrate_v34_workspace_settings(db: aiosqlite.Connection) -> None:
         ");"
     )
     await db.commit()
+    # v2.8 — display_name: tenant-global identity applied to hook/Codex sessions
+    # that don't pass an explicit human_id, so their activity is attributed to a
+    # person on the timeline instead of "(unknown)".
+    await _migrate_add_column_if_missing(db, "workspace_settings", "display_name", "TEXT")
 
 
 async def _migrate_dunning_fields(db: aiosqlite.Connection) -> None:
@@ -1563,7 +1586,110 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_v33_hitl_kind_payload(db)
     await _migrate_v34_hitl_auto_answer(db)
     await _migrate_v34_workspace_settings(db)
+    await _migrate_project_icon(db)
+    await _migrate_tenants_is_internal(db)
+    await _migrate_workspace_members_rbac(db)
     return db
+
+
+async def _migrate_workspace_members_rbac(db: aiosqlite.Connection) -> None:
+    """G5.19 / G5.20 — widen workspace_members.role to allow 'admin' and add
+    github_access. Idempotent.
+
+    Strategy:
+     - Add github_access column if missing (default 'read').
+     - Drop the legacy CHECK constraint on role by rebuilding the table
+       if and only if it's present. Existing rows preserve their role
+       and pick up github_access defaulted by current role.
+    """
+    # github_access — new column, simple ADD COLUMN.
+    await _migrate_add_column_if_missing(
+        db, "workspace_members", "github_access",
+        "TEXT NOT NULL DEFAULT 'read'",
+    )
+
+    # Detect the legacy CHECK by inspecting the table SQL. If it has the
+    # ('owner','member','viewer') tuple, rebuild without CHECK.
+    async with db.execute(
+        "SELECT sql FROM sqlite_master "
+        "WHERE type='table' AND name='workspace_members'"
+    ) as cur:
+        row = await cur.fetchone()
+    sql = (row["sql"] if row else "") or ""
+    if "'owner','member','viewer'" not in sql:
+        return  # already widened or never had the CHECK
+
+    # Rebuild. We pull a stable snapshot, drop, recreate, restore.
+    async with db.execute("SELECT * FROM workspace_members") as cur:
+        existing = await cur.fetchall()
+    columns = [d[0] for d in cur.description] if cur.description else []
+    await db.execute("DROP TABLE workspace_members")
+    await db.execute(
+        "CREATE TABLE workspace_members ("
+        "  id TEXT PRIMARY KEY,"
+        "  tenant_id TEXT NOT NULL REFERENCES tenants(id),"
+        "  email TEXT NOT NULL,"
+        "  role TEXT NOT NULL DEFAULT 'member',"
+        "  github_access TEXT NOT NULL DEFAULT 'read',"
+        "  token_hash TEXT,"
+        "  invited_at TEXT NOT NULL DEFAULT (datetime('now')),"
+        "  joined_at TEXT"
+        ")"
+    )
+    for r in existing:
+        d = {k: r[k] for k in columns}
+        await db.execute(
+            "INSERT INTO workspace_members "
+            "(id, tenant_id, email, role, github_access, token_hash, "
+            " invited_at, joined_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                d.get("id"), d.get("tenant_id"), d.get("email"),
+                d.get("role") or "member",
+                d.get("github_access") or "read",
+                d.get("token_hash"),
+                d.get("invited_at"),
+                d.get("joined_at"),
+            ),
+        )
+    await db.commit()
+
+
+async def _migrate_project_icon(db: aiosqlite.Connection) -> None:
+    """G4.17 — single-emoji icon on projects for sidebar/tab rendering."""
+    await _migrate_add_column_if_missing(db, "projects", "icon", "TEXT")
+
+
+# G2.10 — Set of email addresses considered "internal" for lifecycle
+# purposes. The migrator backfills these to is_internal=true after the
+# column is added. Read from MERIDIAN_INTERNAL_EMAILS env var (comma-separated).
+def _internal_emails() -> frozenset[str]:
+    import os
+    default_emails = (
+        "ajc123private@gmail.com,"
+        "dradamawsome@gmail.com,"
+        "ajc123shopping@gmail.com,"
+        "termh4@umsystem.edu"
+    )
+    emails_str = os.environ.get("MERIDIAN_INTERNAL_EMAILS", default_emails)
+    return frozenset(e.strip().lower() for e in emails_str.split(",") if e.strip())
+
+
+async def _migrate_tenants_is_internal(db: aiosqlite.Connection) -> None:
+    """G2.10 — Add tenants.is_internal flag and backfill known internal
+    emails. is_internal tenants are excluded from churn/dunning/overage/
+    free-expiry warnings and deletion. Idempotent.
+    """
+    await _migrate_add_column_if_missing(
+        db, "tenants", "is_internal", "INTEGER NOT NULL DEFAULT 0"
+    )
+    # Backfill known internal emails. Idempotent.
+    for email in sorted(_internal_emails()):
+        await db.execute(
+            "UPDATE tenants SET is_internal = 1 WHERE LOWER(email) = ?",
+            (email,),
+        )
+    await db.commit()
 
 
 async def create_project(
@@ -3622,6 +3748,35 @@ def compute_coherence_warning(
     }
 
 
+#: Free-text human_id aliases that refer to the same person. Collapsed to a
+#: single canonical identity so the timeline shows one calendar row per person
+#: instead of one per spelling. Keys are lowercased; extend as new aliases show
+#: up. (item 30 — identity unification.)
+_PERSON_ALIASES: dict[str, str] = {
+    "adam camerer": "adam",
+    "adamcamerer": "adam",
+    "adam camerer (executor)": "adam",
+}
+
+
+def canonical_person(human_id: str | None) -> str:
+    """Map a free-text ``human_id`` to a stable canonical identity.
+
+    Emails are already canonical (lowercased). Other values are lowercased,
+    trimmed, and run through :data:`_PERSON_ALIASES`. Empty / "(unknown)"
+    values collapse to a single ``"(unknown)"`` bucket.
+    """
+    if not human_id:
+        return "(unknown)"
+    raw = human_id.strip()
+    if not raw or raw.lower() in ("(unknown)", "unknown", "none"):
+        return "(unknown)"
+    key = raw.lower()
+    if "@" in key:
+        return key
+    return _PERSON_ALIASES.get(key, key)
+
+
 async def get_timeline(
     db: aiosqlite.Connection, project_id: str
 ) -> dict[str, Any]:
@@ -3639,7 +3794,8 @@ async def get_timeline(
     """
     async with db.execute(
         "SELECT t.id, t.created_at, t.status, t.description, "
-        "       t.session_id, s.name AS session_name, s.human_id "
+        "       t.session_id, s.name AS session_name, s.human_id, "
+        "       s.client_type "
         "FROM task_log t LEFT JOIN sessions s ON s.id = t.session_id "
         "WHERE t.project_id = ? "
         "ORDER BY t.created_at DESC, t.rowid DESC",
@@ -3655,6 +3811,8 @@ async def get_timeline(
             "session_id": r["session_id"],
             "session_name": r["session_name"] or "(unknown)",
             "human_id": r["human_id"],
+            "person": canonical_person(r["human_id"]),
+            "client": r["client_type"] or "(none)",
         }
         for r in task_rows
     ]
@@ -3730,18 +3888,25 @@ async def get_timeline(
     # (no DATE()/array_agg dialect differences). Date key = first 10 chars
     # of the stored UTC timestamp ("YYYY-MM-DD HH:MM:SS" → "YYYY-MM-DD").
     by_day: dict[str, dict[str, Any]] = {}
+    people_set: set[str] = set()
+    clients_set: set[str] = set()
     for r in task_rows:
         ts = r["created_at"] or ""
         day = ts[:10]
         if len(day) != 10:
             continue
         human = r["human_id"] or "(unknown)"
+        person = canonical_person(r["human_id"])
+        client = r["client_type"] or "(none)"
+        people_set.add(person)
+        clients_set.add(client)
         bucket = by_day.get(day)
         if bucket is None:
-            bucket = {"date": day, "count": 0, "humans": {}, "_sess": {}}
+            bucket = {"date": day, "count": 0, "humans": {}, "people": {}, "_sess": {}}
             by_day[day] = bucket
         bucket["count"] += 1
         bucket["humans"][human] = bucket["humans"].get(human, 0) + 1
+        bucket["people"][person] = bucket["people"].get(person, 0) + 1
         sid = r["session_id"] or "(none)"
         se = bucket["_sess"].get(sid)
         if se is None:
@@ -3749,6 +3914,8 @@ async def get_timeline(
                 "session_id": r["session_id"],
                 "name": r["session_name"] or "(unknown)",
                 "human": human,
+                "person": person,
+                "client": client,
                 "count": 0,
             }
             bucket["_sess"][sid] = se
@@ -3765,6 +3932,7 @@ async def get_timeline(
             "sessions": day_sessions,
             "session_count": len(day_sessions),
             "humans": b["humans"],
+            "people": b["people"],
         })
 
     return {
@@ -3772,6 +3940,8 @@ async def get_timeline(
         "sessions": sessions,
         "goal_events": goal_events,
         "daily_counts": daily_counts,
+        "people": sorted(people_set),
+        "clients": sorted(clients_set),
     }
 
 
@@ -4489,8 +4659,9 @@ async def upsert_tenant(
     expires_str = (datetime.now(timezone.utc) + timedelta(days=30)).strftime("%Y-%m-%d %H:%M:%S")
     await db.execute(
         "INSERT INTO tenants (id, email, google_sub, github_sub, microsoft_sub, "
-        "plan, trial_started_at, inactivity_expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        (tid, email, google_sub, github_sub, microsoft_sub, "free", now_str, expires_str),
+        "plan, trial_started_at, inactivity_expires_at, notification_prefs) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (tid, email, google_sub, github_sub, microsoft_sub, "free", now_str, expires_str,
+         '{"storage":true,"sprint":true}'),
     )
     await db.commit()
     async with db.execute("SELECT * FROM tenants WHERE id = ?", (tid,)) as cur:
@@ -4693,13 +4864,56 @@ async def increment_pool_project_count(
     db: aiosqlite.Connection,
     neon_project_id: str,
 ) -> None:
-    """Increment customer_count on a pool project after assigning a new customer."""
+    """Increment customer_count on a pool project after assigning a new customer.
+
+    Prefer :func:`claim_pool_project_slot` for race-free atomic claim+increment.
+    This helper is kept for backfill / fix-up scripts that aren't on the
+    signup hot path.
+    """
     await db.execute(
         "UPDATE neon_pool_projects SET customer_count = customer_count + 1 "
         "WHERE neon_project_id = ?",
         (neon_project_id,),
     )
     await db.commit()
+
+
+async def claim_pool_project_slot(
+    db: aiosqlite.Connection,
+    tier: str = "standard",
+    max_customers: int = 8,
+) -> dict[str, Any] | None:
+    """Item 38 — atomically reserve a slot in an available pool project.
+
+    Replaces the read/then/write race in ``get_available_pool_project`` +
+    ``increment_pool_project_count``: two concurrent signups previously could
+    both see the same pool with 7/8 slots, both proceed, both increment, and
+    leave the pool at 9/8 — overprovisioned past the soft cap.
+
+    The single UPDATE-with-subquery is atomic on SQLite (statement-level) and
+    safe on Postgres MVCC because the *outer* ``customer_count < ?`` re-check
+    runs against the locked row, so the second concurrent UPDATE harmlessly
+    no-ops once T1 has bumped the count to the cap.
+
+    Returns the updated pool project row (with the post-increment count), or
+    ``None`` if no pool has room — caller should create a new pool project
+    and try again.
+    """
+    async with db.execute(
+        "UPDATE neon_pool_projects "
+        "SET customer_count = customer_count + 1 "
+        "WHERE id = ("
+        "  SELECT id FROM neon_pool_projects "
+        "  WHERE tier = ? AND customer_count < ? "
+        "  ORDER BY customer_count DESC LIMIT 1"
+        ") "
+        "AND customer_count < ? "
+        "RETURNING *",
+        (tier, max_customers, max_customers),
+    ) as cur:
+        row = await cur.fetchone()
+    await db.commit()
+    return _row_to_dict(row) if row else None
 
 
 async def decrement_pool_project_count(
@@ -5661,7 +5875,7 @@ async def get_workspace_settings(db: aiosqlite.Connection) -> dict[str, Any]:
     callers never have to None-check. One singleton row per workspace DB.
     """
     async with db.execute(
-        "SELECT hitl_auto_answer_default, sprint_name_default, updated_at "
+        "SELECT hitl_auto_answer_default, sprint_name_default, display_name, updated_at "
         "FROM workspace_settings WHERE id = ?",
         (_WORKSPACE_SETTINGS_ID,),
     ) as cur:
@@ -5670,6 +5884,7 @@ async def get_workspace_settings(db: aiosqlite.Connection) -> dict[str, Any]:
     return {
         "hitl_auto_answer_default": bool(data.get("hitl_auto_answer_default")),
         "sprint_name_default": data.get("sprint_name_default"),
+        "display_name": data.get("display_name"),
         "updated_at": data.get("updated_at"),
     }
 
@@ -5679,11 +5894,12 @@ async def update_workspace_settings(
     *,
     hitl_auto_answer_default: bool | None = None,
     sprint_name_default: str | None = None,
+    display_name: str | None = None,
 ) -> dict[str, Any]:
     """Upsert the workspace settings singleton and return the new values.
 
     Only the fields passed (non-None) are changed. ``sprint_name_default=""``
-    explicitly clears the label.
+    or ``display_name=""`` explicitly clears that label.
     """
     # Ensure the singleton row exists before updating individual fields.
     await db.execute(
@@ -5699,6 +5915,9 @@ async def update_workspace_settings(
     if sprint_name_default is not None:
         updates.append("sprint_name_default = ?")
         params.append(sprint_name_default or None)
+    if display_name is not None:
+        updates.append("display_name = ?")
+        params.append(display_name.strip() or None)
     if updates:
         from datetime import datetime, timezone
         now_ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
@@ -5833,12 +6052,23 @@ async def create_workspace_invite(
     email: str,
     role: str,
     token_hash: str,
+    *,
+    github_access: str | None = None,
 ) -> dict[str, Any]:
-    """Insert a pending workspace member row (joined_at=NULL)."""
+    """Insert a pending workspace member row (joined_at=NULL).
+
+    G5.20 — ``github_access`` caps repo-touching MCP tools for this invitee.
+    Defaults from role when omitted (viewer→none, member→read, admin/owner→write).
+    """
+    from .. import roles as _roles  # noqa: PLC0415
     mid = _new_id()
+    if github_access is None:
+        github_access = _roles.default_github_access_for_role(role)
     await db.execute(
-        "INSERT INTO workspace_members (id, tenant_id, email, role, token_hash) VALUES (?, ?, ?, ?, ?)",
-        (mid, tenant_id, email, role, token_hash),
+        "INSERT INTO workspace_members "
+        "(id, tenant_id, email, role, github_access, token_hash) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (mid, tenant_id, email, role, github_access, token_hash),
     )
     await db.commit()
     async with db.execute("SELECT * FROM workspace_members WHERE id = ?", (mid,)) as cur:
@@ -5872,6 +6102,64 @@ async def accept_workspace_invite(
     )
     await db.commit()
     async with db.execute("SELECT * FROM workspace_members WHERE id = ?", (member_id,)) as cur:
+        row = await cur.fetchone()
+    return _row_to_dict(row)
+
+
+async def resolve_member_role(
+    db: aiosqlite.Connection,
+    tenant_id: str,
+    email: str,
+) -> tuple[str, str] | None:
+    """G5.19 / G5.20 — return ``(role, github_access)`` for the given user
+    in the given tenant's workspace.
+
+    Order:
+     1. If ``email`` matches the tenant row's own email → ('owner','write').
+     2. Else if an accepted workspace_members row exists for this
+        (tenant_id, email) → use the row's role + github_access.
+     3. Else → None (caller should treat as 403 / not a member).
+    """
+    e = (email or "").strip().lower()
+    if not e:
+        return None
+    async with db.execute(
+        "SELECT email FROM tenants WHERE id = ?", (tenant_id,),
+    ) as cur:
+        tenant_row = await cur.fetchone()
+    if tenant_row and (str(tenant_row["email"]).lower() == e):
+        return ("owner", "write")
+    async with db.execute(
+        "SELECT role, github_access FROM workspace_members "
+        "WHERE tenant_id = ? AND LOWER(email) = ? AND joined_at IS NOT NULL "
+        "ORDER BY joined_at DESC LIMIT 1",
+        (tenant_id, e),
+    ) as cur:
+        row = await cur.fetchone()
+    if row is None:
+        return None
+    return (
+        (row["role"] or "member"),
+        (row["github_access"] or "read"),
+    )
+
+
+async def workspace_member_accepted_for_email(
+    db: aiosqlite.Connection,
+    email: str,
+) -> dict[str, Any] | None:
+    """G5.22 — return an accepted workspace membership for ``email`` (joined,
+    not pending), or None. Used by the OAuth callback to skip auto-Neon
+    provisioning for invitees who already belong to someone else's workspace."""
+    e = (email or "").strip().lower()
+    if not e:
+        return None
+    async with db.execute(
+        "SELECT * FROM workspace_members "
+        "WHERE LOWER(email) = ? AND joined_at IS NOT NULL "
+        "ORDER BY joined_at DESC LIMIT 1",
+        (e,),
+    ) as cur:
         row = await cur.fetchone()
     return _row_to_dict(row)
 
@@ -5919,6 +6207,68 @@ async def delete_workspace_member(
     return True
 
 
+async def update_workspace_member(
+    db: aiosqlite.Connection,
+    member_id: str,
+    tenant_id: str,
+    *,
+    role: str | None = None,
+    github_access: str | None = None,
+) -> dict[str, Any] | None:
+    """v2.8 — update a member's role and/or github_access (admin-only edit).
+
+    Only the fields passed (non-None) are changed. Scoped by tenant_id so a
+    caller can never touch another workspace's rows. Returns the updated row,
+    or None when no member matched.
+    """
+    updates: list[str] = []
+    params: list[Any] = []
+    if role is not None:
+        updates.append("role = ?")
+        params.append(role)
+    if github_access is not None:
+        updates.append("github_access = ?")
+        params.append(github_access)
+    if updates:
+        params.extend([member_id, tenant_id])
+        await db.execute(
+            f"UPDATE workspace_members SET {', '.join(updates)} "
+            "WHERE id = ? AND tenant_id = ?",
+            tuple(params),
+        )
+        await db.commit()
+    async with db.execute(
+        "SELECT * FROM workspace_members WHERE id = ? AND tenant_id = ?",
+        (member_id, tenant_id),
+    ) as cur:
+        row = await cur.fetchone()
+    return _row_to_dict(row)
+
+
+async def get_workspaces_for_email(
+    db: aiosqlite.Connection,
+    email: str,
+) -> list[dict[str, Any]]:
+    """Return workspaces the email has been invited to (accepted rows only).
+
+    Each row: {tenant_id, owner_email, role, github_access}.
+    Used to populate the workspace-switcher dropdown.
+    """
+    e = (email or "").strip().lower()
+    if not e:
+        return []
+    async with db.execute(
+        "SELECT wm.tenant_id, wm.role, wm.github_access, t.email AS owner_email "
+        "FROM workspace_members wm "
+        "JOIN tenants t ON t.id = wm.tenant_id "
+        "WHERE LOWER(wm.email) = ? AND wm.joined_at IS NOT NULL "
+        "ORDER BY wm.invited_at ASC",
+        (e,),
+    ) as cur:
+        rows = await cur.fetchall()
+    return [_row_to_dict(r) for r in rows if r is not None]
+
+
 # ---------------------------------------------------------------------------
 # Dunning helpers
 # ---------------------------------------------------------------------------
@@ -5964,9 +6314,19 @@ async def get_tenants_with_payment_failures(
 async def export_tenant_data(
     db: aiosqlite.Connection,
     tenant_id: str,
+    project_db: aiosqlite.Connection | None = None,
 ) -> dict[str, Any]:
-    """Collect all data belonging to a tenant as a plain dict for GDPR export."""
+    """Collect all data belonging to a tenant as a plain dict for GDPR export.
+
+    Account-level rows (tenant, api_tokens, workspace_members) live in the auth
+    DB (``db``). In hosted mode the tenant's *project* data lives in a separate
+    per-tenant Neon DB — pass it as ``project_db`` so the export actually
+    contains the projects. When omitted (self-hosted, single DB) the project
+    data is read from ``db`` like before.
+    """
     from datetime import datetime, timezone
+
+    pdb = project_db if project_db is not None else db
 
     async with db.execute(
         "SELECT id, email, google_sub, microsoft_sub, plan, created_at FROM tenants WHERE id = ?",
@@ -5982,13 +6342,13 @@ async def export_tenant_data(
         tokens = [_row_to_dict(r) for r in await cur.fetchall()]
 
     async with db.execute(
-        "SELECT id, email, role, invited_at, joined_at FROM workspace_members WHERE tenant_id = ?",
+        "SELECT id, email, role, github_access, invited_at, joined_at FROM workspace_members WHERE tenant_id = ?",
         (tenant_id,),
     ) as cur:
         members = [_row_to_dict(r) for r in await cur.fetchall()]
 
-    async with db.execute(
-        "SELECT id, name, creator_human_id, created_at FROM projects ORDER BY created_at DESC",
+    async with pdb.execute(
+        "SELECT id, name, creator_human_id, decisions, created_at FROM projects ORDER BY created_at DESC",
     ) as cur:
         project_rows = await cur.fetchall()
 
@@ -5997,32 +6357,32 @@ async def export_tenant_data(
         p = _row_to_dict(pr)
         pid = p["id"]
 
-        async with db.execute(
+        async with pdb.execute(
             "SELECT content, goal_north_star, goal_sprint, version, updated_at FROM goal_states WHERE project_id = ?",
             (pid,),
         ) as cur:
             goals = [_row_to_dict(r) for r in await cur.fetchall()]
 
-        async with db.execute(
-            "SELECT id, name, human_id, status, created_at FROM sessions WHERE project_id = ? ORDER BY created_at DESC LIMIT 100",
+        async with pdb.execute(
+            "SELECT id, name, human_id, status, session_summary, created_at FROM sessions WHERE project_id = ? ORDER BY created_at DESC LIMIT 500",
             (pid,),
         ) as cur:
             sessions = [_row_to_dict(r) for r in await cur.fetchall()]
 
-        async with db.execute(
-            "SELECT id, session_id, description, status, created_at FROM task_log WHERE project_id = ? ORDER BY created_at DESC LIMIT 200",
+        async with pdb.execute(
+            "SELECT id, session_id, description, status, created_at FROM task_log WHERE project_id = ? ORDER BY created_at DESC LIMIT 2000",
             (pid,),
         ) as cur:
             tasks = [_row_to_dict(r) for r in await cur.fetchall()]
 
-        async with db.execute(
-            "SELECT id, version, title, status, item_group FROM sprint_items WHERE project_id = ?",
+        async with pdb.execute(
+            "SELECT id, version, title, status, item_group, added_at FROM sprint_items WHERE project_id = ?",
             (pid,),
         ) as cur:
             sprint = [_row_to_dict(r) for r in await cur.fetchall()]
 
         try:
-            async with db.execute(
+            async with pdb.execute(
                 "SELECT id, title, body, tags, created_at FROM project_notes WHERE project_id = ?",
                 (pid,),
             ) as cur:
@@ -6030,18 +6390,40 @@ async def export_tenant_data(
         except Exception:
             notes = []
 
+        try:
+            async with pdb.execute(
+                "SELECT id, question, urgency, status, answer, created_at FROM hitl_requests WHERE project_id = ? ORDER BY created_at DESC LIMIT 500",
+                (pid,),
+            ) as cur:
+                hitl = [_row_to_dict(r) for r in await cur.fetchall()]
+        except Exception:
+            hitl = []
+
         p["goal_states"] = goals
         p["sessions"] = sessions
         p["tasks"] = tasks
         p["sprint_items"] = sprint
         p["notes"] = notes
+        p["hitl_requests"] = hitl
         projects.append(p)
+
+    # Workspace-global notes/decisions live in the project DB too.
+    try:
+        ws_notes = await get_workspace_notes(pdb)
+    except Exception:
+        ws_notes = []
+    try:
+        ws_decisions = await get_workspace_decisions(pdb)
+    except Exception:
+        ws_decisions = []
 
     return {
         "exported_at": datetime.now(timezone.utc).isoformat(),
         "tenant": tenant_data,
         "api_tokens": tokens,
         "workspace_members": members,
+        "workspace_notes": ws_notes,
+        "workspace_decisions": ws_decisions,
         "projects": projects,
     }
 
@@ -6110,3 +6492,20 @@ async def delete_session_notes(
         count = cur.rowcount if cur.rowcount is not None else 0
     await db.commit()
     return count
+
+
+async def add_feedback(
+    db: aiosqlite.Connection,
+    tenant_id: str,
+    type: str,
+    message: str,
+    email: str = None,
+) -> str:
+    """Save user feedback to the feedback table."""
+    feedback_id = str(uuid.uuid4())
+    await db.execute(
+        "INSERT INTO feedback (id, tenant_id, type, message, email) VALUES (?, ?, ?, ?, ?)",
+        (feedback_id, tenant_id, type, message, email),
+    )
+    await db.commit()
+    return feedback_id

@@ -94,7 +94,10 @@ Zero local install — sign in at [usemeridian.us](https://usemeridian.us), copy
 
 ### Video walkthrough
 
-<iframe width="100%" height="400" src="https://www.youtube.com/embed/bJLo_1D7T8o" frameborder="0" allowfullscreen></iframe>
+<video controls preload="metadata" width="100%" style="max-width:900px;border-radius:8px;margin:8px 0">
+  <source src="/videos/meridian-using-demo.mp4" type="video/mp4">
+  Your browser does not support embedded video. <a href="/videos/meridian-using-demo.mp4">Download the walkthrough</a>.
+</video>
 
 <img src="screenshots/01_dashboard.png" alt="Meridian dashboard overview" style="max-width:100%;border-radius:8px;margin:8px 0">
 <img src="screenshots/02_live_tab.png" alt="Meridian dashboard live tab" style="max-width:100%;border-radius:8px;margin:8px 0">

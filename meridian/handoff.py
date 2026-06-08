@@ -118,7 +118,7 @@ def resolve_handoff_mode(
     session_id: str | None = None,
 ) -> str:
     """Resolve the public handoff mode, auto-switching repeat sessions to delta."""
-    if requested_mode in {"full", "delta", "planner", "starter"}:
+    if requested_mode in {"full", "delta", "planner", "starter", "compact"}:
         return requested_mode
     if session_id and session_id in _SESSION_HANDOFF_STATE:
         return "delta"
@@ -427,10 +427,10 @@ async def generate_handoff(
         raise ValueError(f"project not found: {project_id}")
     if mode == "planner":
         return await _generate_planner_handoff(db, project_id, output_dir)
-    if mode == "starter":
+    if mode in {"starter", "compact"}:
         return await _generate_starter_handoff(db, project, output_dir)
     if mode not in {"full", "delta"}:
-        raise ValueError("mode must be 'full', 'delta', 'planner', or 'starter'")
+        raise ValueError("mode must be 'full', 'delta', 'planner', 'starter', or 'compact'")
 
     goal = await db_module.get_goal(db, project_id)
     if goal is None:

@@ -5,6 +5,12 @@ repo_url: https://github.com/meridianmcp/Meridian
 repo_name: meridianmcp/Meridian
 edit_uri: edit/main/docs/
 
+# Internal operator runbooks live in docs/ for convenience but must NOT be
+# published — they describe hosted-infra capacity strategy and provisioning.
+exclude_docs: |
+  fly-scaling.md
+  backup-runbook.md
+
 theme:
   name: material
   palette:
@@ -13,6 +19,7 @@ theme:
     accent: custom
   features:
     - navigation.tabs
+    - navigation.tabs.sticky
     - navigation.sections
     - navigation.expand
     - navigation.top
@@ -39,7 +46,9 @@ nav:
   - MCP Tools: mcp-tools.md
   - Hosted (usemeridian.us): hosted.md
   - Self-Hosting: self-hosting.md
+  - Team Self-Hosting: team-self-hosting.md
   - Configuration: configuration.md
+  - Safety Limits: safety-limits.md
   - API Reference: api-reference.md
   - FAQ: faq.md
 

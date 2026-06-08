@@ -104,4 +104,5 @@ async def update_workspace_settings_endpoint(
         await _db(request),
         hitl_auto_answer_default=body.get("hitl_auto_answer_default"),
         sprint_name_default=body.get("sprint_name_default"),
+        display_name=body.get("display_name"),
     )

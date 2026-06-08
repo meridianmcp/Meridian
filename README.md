@@ -38,7 +38,7 @@ other's task log, and resume from a compressed handoff when context fills up.
 
 **Two ways to run Meridian:**
 - **Self-host** — free forever, any team size. Clone and run in 2 commands.
-- **Hosted** at [usemeridian.us](https://usemeridian.us) — 30 days free (no card), then $20/mo Solo.
+- **Hosted** at [usemeridian.us](https://usemeridian.us) — 30 days free (no card), then $20/mo Standard.
 
 ## Quickstart — binary (no Python required)
 
@@ -115,7 +115,7 @@ git clone --recurse-submodules https://github.com/meridianmcp/Meridian
 2. Click **Load unpacked** and select `extensions/claude-mcp`
 3. Click the extension icon and set the URL to `http://localhost:7878/mcp`
 
-All 27 Meridian tools (`checkpoint`, `log_task`, `pin_decision`, etc.) are now available directly in claude.ai planning chat. No copy-pasting session output.
+All 39 Meridian tools (`checkpoint`, `log_task`, `pin_decision`, etc.) are now available directly in claude.ai planning chat. No copy-pasting session output.
 
 ### Hosted tier (no install)
 
@@ -215,7 +215,7 @@ No more manual `start_session()` calls. No lost work when context fills.
 | **Extra storage** | $0.50 / GB-month | $0.50 / GB-month |
 | **Support** | Email | Priority |
 
-7-day free trial on Standard. Card required, no charge until day 8.
+30-day free trial on Standard. Card required, no charge until day 31.
 
 ## License
 

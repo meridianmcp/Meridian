@@ -121,6 +121,7 @@ class Project(BaseModel):
     id: str
     name: str
     creator_human_id: str | None = None
+    icon: str | None = None
     created_at: str
 
 
@@ -229,7 +230,10 @@ class Task(BaseModel):
     session_id: str
     project_id: str
     description: str
-    status: Literal["pending", "in_progress", "done", "failed", "pending-hitl", "backlog", "future", "backburner"]
+    # 'skipped' is read-tolerated here (not a settable write status): Postgres
+    # task_log has no CHECK constraint, so historical rows can carry it and the
+    # GET /projects/{id}/tasks response must serialize them without 500ing.
+    status: Literal["pending", "in_progress", "done", "failed", "pending-hitl", "backlog", "future", "backburner", "skipped"]
     parent_task_id: str | None = None  # v2.4
     sprint_item_id: str | None = None  # v2.6
     claimed_by: str | None = None
@@ -297,6 +301,16 @@ class StartSessionRequest(BaseModel):
     role: str | None = Field(
         default=None,
         description="Optional session role. Use 'executor' to inject executor_config.",
+    )
+    source: str | None = Field(
+        default=None,
+        description=(
+            "G8.34 — Optional hint about why start_session was called: "
+            "'startup' (fresh client boot), 'resume' (cleared chat / continued "
+            "work), 'clear' (user wiped context), or 'compact' (context window "
+            "ran out, fresh process). SessionStart hooks forward this so the "
+            "server can return a continuation block instead of a full reset."
+        ),
     )
 
 

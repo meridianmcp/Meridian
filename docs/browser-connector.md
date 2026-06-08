@@ -18,6 +18,18 @@ Hosted Meridian is the simplest path for both Claude and ChatGPT:
 3. Approve the OAuth popup.
 4. Start using Meridian tools in chat.
 
+!!! note "Which Meridian account does the browser connector use?"
+    The browser MCP connector uses whichever Meridian account is currently
+    **logged in at usemeridian.us** in that browser tab. If you want to connect
+    as a different account (e.g. to demo from a guest account):
+
+    1. Open [usemeridian.us/auth/logout](https://usemeridian.us/auth/logout) to sign out.
+    2. Sign in as the desired account.
+    3. Reconnect the MCP connector in Claude or ChatGPT.
+
+    You can also click **Switch Meridian account** in the dashboard Settings tab to
+    sign out and return to the login page in one step.
+
 ### Claude
 
 In Claude, go to **Customize > Connectors** (or **Settings > Connectors** in
@@ -34,7 +46,10 @@ some layouts), choose **Add custom connector**, then paste:
 
 #### Claude video walkthrough
 
-<iframe width="100%" height="400" src="https://www.youtube.com/embed/jJqUhqBVEyE" frameborder="0" allowfullscreen></iframe>
+<video controls preload="metadata" width="100%" style="max-width:900px;border-radius:8px;margin:8px 0">
+  <source src="/videos/meridian-claude-demo.mp4" type="video/mp4">
+  Your browser does not support embedded video. <a href="/videos/meridian-claude-demo.mp4">Download the walkthrough</a>.
+</video>
 
 ### ChatGPT
 
@@ -52,7 +67,10 @@ public MCP endpoint:
 
 #### ChatGPT video walkthrough
 
-<iframe width="100%" height="400" src="https://www.youtube.com/embed/toNRFzWbqPI" frameborder="0" allowfullscreen></iframe>
+<video controls preload="metadata" width="100%" style="max-width:900px;border-radius:8px;margin:8px 0">
+  <source src="/videos/meridian-chatgpt-demo.mp4" type="video/mp4">
+  Your browser does not support embedded video. <a href="/videos/meridian-chatgpt-demo.mp4">Download the walkthrough</a>.
+</video>
 
 !!! note "Current ChatGPT naming"
     OpenAI now calls these integrations **Apps**. Older docs and screenshots may
@@ -97,7 +115,11 @@ Meridian on `localhost`, you have two paths:
   and use `/mcp`.
 
 <details>
-<summary>Self-hosted only: local Claude bridge for localhost</summary>
+<summary>Self-hosted localhost (requires bridge or public URL)</summary>
+
+Self-hosted Meridian on localhost has two options:
+
+**Option 1: Local SSE bridge** (for Chrome/Chromium users):
 
 1. Start Meridian locally:
 
@@ -106,14 +128,18 @@ pixi run start
 # or: python -m meridian
 ```
 
-2. Install a browser bridge such as
-   [dnakov/claude-mcp](https://github.com/dnakov/claude-mcp).
+2. Install [dnakov/claude-mcp](https://github.com/dnakov/claude-mcp) browser bridge.
 3. Add your local SSE endpoint:
 
    - **Name:** `Meridian (local)`
    - **URL:** `http://localhost:7878/mcp/sse`
 
-4. Open Claude and enable the connector for the conversation.
+**Option 2: Public HTTPS URL** (recommended for all clients):
+
+Expose Meridian on HTTPS (e.g., via Cloudflare Tunnel or ngrok) and use the remote MCP endpoint without any bridge:
+
+- **Name:** `Meridian`
+- **URL:** `https://your-public-domain/mcp`
 
 </details>
 

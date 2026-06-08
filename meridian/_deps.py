@@ -192,6 +192,8 @@ async def _db(request: Request) -> Any:
         from .hosted import _SESSION_COOKIE, _read_session_cookie
         from . import db as db_module
 
+        current_tenant_id: str | None = None
+
         cookie_val = request.cookies.get(_SESSION_COOKIE)
         if cookie_val:
             session_id = _read_session_cookie(cookie_val)
@@ -199,21 +201,37 @@ async def _db(request: Request) -> Any:
                 auth_db = request.app.state.db
                 session = await db_module.get_user_session(auth_db, session_id)
                 if session:
-                    conn = await _open_tenant_db_by_id(request, session["tenant_id"])
-                    request.state._db_conn = conn
-                    return conn
+                    current_tenant_id = session["tenant_id"]
 
-        auth_header = request.headers.get("authorization", "")
-        if auth_header.startswith("Bearer "):
-            token = auth_header[7:]
-            token_hash = _hashlib.sha256(token.encode()).hexdigest()
-            auth_db = request.app.state.db
-            from . import db as db_module
-            tenant = await db_module.get_tenant_from_token_hash(auth_db, token_hash)
-            if tenant:
-                conn = await _open_tenant_db_by_id(request, tenant["id"])
-                request.state._db_conn = conn
-                return conn
+        if current_tenant_id is None:
+            auth_header = request.headers.get("authorization", "")
+            if auth_header.startswith("Bearer "):
+                token = auth_header[7:]
+                token_hash = _hashlib.sha256(token.encode()).hexdigest()
+                auth_db = request.app.state.db
+                tenant = await db_module.get_tenant_from_token_hash(auth_db, token_hash)
+                if tenant:
+                    current_tenant_id = tenant["id"]
+
+        if current_tenant_id is not None:
+            # Workspace switching: honour X-Workspace-Tenant-Id if the current
+            # user is an accepted member of the requested workspace.
+            ws_header = request.headers.get("x-workspace-tenant-id", "").strip()
+            if ws_header and ws_header != current_tenant_id:
+                auth_db = request.app.state.db
+                current_tenant = await db_module.get_tenant_by_id(auth_db, current_tenant_id)
+                if current_tenant:
+                    memberships = await db_module.get_workspaces_for_email(
+                        auth_db, current_tenant.get("email", "")
+                    )
+                    if any(m["tenant_id"] == ws_header for m in memberships):
+                        conn = await _open_tenant_db_by_id(request, ws_header)
+                        request.state._db_conn = conn
+                        return conn
+
+            conn = await _open_tenant_db_by_id(request, current_tenant_id)
+            request.state._db_conn = conn
+            return conn
 
     conn = request.app.state.db
     request.state._db_conn = conn

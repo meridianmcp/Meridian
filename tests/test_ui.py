@@ -178,6 +178,38 @@ def test_dashboard_js_has_github_connect_card(js):
     assert "Connect GitHub repo" in js
 
 
+def test_signout_link_created_unconditionally_for_hosted_users(js):
+    """Item 42 — Free-tier sign-out regression.
+
+    The sign-out link in .sidebar-footer must be added by hideHostedAdminControls()
+    so it appears for ALL hosted users (free + admin), not gated behind /me
+    returning a plan. Previously the link creation lived only inside
+    _renderPlanBadge(me); if /me errored or returned {} for any reason, the
+    link never appeared — the bug the user reported on free tier.
+    """
+    assert "function ensureSignOutLink" in js, (
+        "ensureSignOutLink() helper missing — sign-out link creation must be "
+        "factored out of _renderPlanBadge so hideHostedAdminControls can call it."
+    )
+    # hideHostedAdminControls runs unconditionally for hosted users at init,
+    # so calling ensureSignOutLink from there guarantees free-tier coverage.
+    hosted_fn_start = js.index("function hideHostedAdminControls")
+    hosted_fn_end = js.index("\nfunction ", hosted_fn_start + 1)
+    hosted_fn_body = js[hosted_fn_start:hosted_fn_end]
+    assert "ensureSignOutLink()" in hosted_fn_body, (
+        "hideHostedAdminControls() must call ensureSignOutLink() so the link "
+        "appears for free-tier users without waiting on /me."
+    )
+    # The link still gets enriched with the signed-in email when /me returns.
+    plan_badge_start = js.index("function _renderPlanBadge")
+    plan_badge_end = js.index("\nfunction ", plan_badge_start + 1)
+    plan_badge_body = js[plan_badge_start:plan_badge_end]
+    assert "ensureSignOutLink(me.email)" in plan_badge_body, (
+        "_renderPlanBadge must still call ensureSignOutLink(me.email) to update "
+        "the tooltip with the signed-in email when /me succeeds."
+    )
+
+
 def test_dashboard_goal_tab_has_no_preview_toggle(js):
     """Goal textareas must NOT have the edit/preview chip toggle (Bug 5).
 

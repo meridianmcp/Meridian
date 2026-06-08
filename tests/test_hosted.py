@@ -250,6 +250,84 @@ async def test_pool_project_register_and_count(db):
 
 
 @pytest.mark.asyncio
+async def test_claim_pool_project_slot_atomic_under_concurrent_claims(db):
+    """Item 38 — race regression: 50 concurrent claims against a pool with
+    a single open slot must not overprovision past the cap.
+
+    Before claim_pool_project_slot the signup hot path read get_available
+    and later increment as two statements, letting concurrent claims both
+    see 7/8 and both bump to 8/8 — leaving a 9/8 row in production. The
+    atomic UPDATE with the outer ``customer_count < cap`` recheck ensures
+    only one claim wins per slot.
+    """
+    import asyncio
+    import uuid
+
+    from meridian.db import (
+        claim_pool_project_slot,
+        register_pool_project,
+    )
+
+    cap = 8
+    pool = await register_pool_project(db, f"neon-race-{uuid.uuid4().hex[:8]}", "standard")
+    pool_id = pool["id"]
+    # Saturate the pool to cap-1 so only one slot remains.
+    await db.execute(
+        "UPDATE neon_pool_projects SET customer_count = ? WHERE id = ?",
+        (cap - 1, pool_id),
+    )
+    await db.commit()
+
+    # Fire 50 concurrent claims. Exactly one must succeed.
+    results = await asyncio.gather(
+        *(claim_pool_project_slot(db, tier="standard", max_customers=cap) for _ in range(50))
+    )
+
+    successes = [r for r in results if r is not None]
+    failures = [r for r in results if r is None]
+
+    assert len(successes) == 1, (
+        f"expected exactly 1 claim to win the last slot, got {len(successes)}"
+    )
+    assert len(failures) == 49, (
+        f"expected 49 claims to lose, got {len(failures)}"
+    )
+
+    # The pool customer_count must equal the cap — not cap+N — proving the
+    # outer WHERE guard prevented overprovisioning.
+    async with db.execute(
+        "SELECT customer_count FROM neon_pool_projects WHERE id = ?",
+        (pool_id,),
+    ) as cur:
+        row = await cur.fetchone()
+    final_count = row["customer_count"] if hasattr(row, "keys") else row[0]
+    assert final_count == cap, (
+        f"pool overprovisioned: customer_count={final_count}, cap={cap}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_claim_pool_project_slot_returns_none_when_all_full(db):
+    """claim returns None when every pool of the tier is at cap, so the
+    caller knows to register a fresh pool."""
+    import uuid
+
+    from meridian.db import claim_pool_project_slot, register_pool_project
+
+    cap = 4
+    for _ in range(3):
+        pool = await register_pool_project(db, f"neon-full-{uuid.uuid4().hex[:8]}", "standard")
+        await db.execute(
+            "UPDATE neon_pool_projects SET customer_count = ? WHERE id = ?",
+            (cap, pool["id"]),
+        )
+    await db.commit()
+
+    result = await claim_pool_project_slot(db, tier="standard", max_customers=cap)
+    assert result is None, f"expected None when all pools full, got {result}"
+
+
+@pytest.mark.asyncio
 async def test_get_available_pool_project(db):
     """get_available_pool_project returns project with room or None."""
     import uuid

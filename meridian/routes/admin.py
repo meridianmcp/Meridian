@@ -205,7 +205,8 @@ async def download_snapshot(request: Request) -> Response:
             ]
             for table in tables:
                 try:
-                    rows = await db.execute_fetchall(f"SELECT * FROM {table}")  # type: ignore[attr-defined]
+                    cur = await db.execute(f"SELECT * FROM {table}")
+                    rows = await cur.fetchall()
                     if rows:
                         cols = list(rows[0].keys())
                         placeholders = ",".join("?" * len(cols))

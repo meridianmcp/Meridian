@@ -368,9 +368,24 @@ def test_panels_render_without_pageerror(client):
             browser = p.chromium.launch()
             for path in ("/dashboard", "/demo"):
                 errors: list[str] = []
+                console_errors: list[str] = []
+                request_failed: list[str] = []
                 server_errors: list[str] = []
                 page = browser.new_page()
                 page.on("pageerror", lambda e, _errs=errors: _errs.append(str(e)))
+                page.on(
+                    "console",
+                    lambda msg, _errs=console_errors: _errs.append(msg.text)
+                    if msg.type == "error"
+                    and "ERR_INSUFFICIENT_RESOURCES" not in msg.text
+                    else None,
+                )
+                page.on(
+                    "requestfailed",
+                    lambda req, _errs=request_failed: _errs.append(
+                        f"{req.method} {req.url} -> {req.failure}"
+                    ),
+                )
                 page.on(
                     "response",
                     lambda r, _errs=server_errors: _errs.append(f"{r.status} {r.url}")
@@ -387,6 +402,8 @@ def test_panels_render_without_pageerror(client):
                 page.wait_for_timeout(200)
 
                 assert not errors, f"{path} threw uncaught JS errors: {errors}"
+                assert not console_errors, f"{path} logged console errors: {console_errors}"
+                assert not request_failed, f"{path} had failed requests: {request_failed}"
                 assert not server_errors, \
                     f"{path} backing requests 5xx'd (would blank the panel): {server_errors}"
 
@@ -416,6 +433,185 @@ def test_panels_render_without_pageerror(client):
                     )
                     assert drawer_len > 2, f"{path}: status drawer blank (len={drawer_len})"
                 page.close()
+            browser.close()
+        finally:
+            server.should_exit = True
+
+
+@pytestmark_playwright
+def test_dashboard_shows_visible_error_when_sessions_request_fails(client):
+    """Playwright: a failed sessions fetch must surface a visible retryable error."""
+    import json as _json
+    import threading
+    import time
+    import urllib.request
+    import uvicorn
+    from meridian import server as server_module
+
+    with sync_playwright() as p:
+        config = uvicorn.Config(server_module.app, host="127.0.0.1", port=17883, log_level="error")
+        server = uvicorn.Server(config)
+        thread = threading.Thread(target=server.run, daemon=True)
+        thread.start()
+        time.sleep(1.5)
+
+        req = urllib.request.Request(
+            "http://127.0.0.1:17883/projects",
+            data=b'{"name": "panel-error"}',
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            project = _json.loads(resp.read().decode("utf-8"))
+        pid = project["id"]
+
+        try:
+            browser = p.chromium.launch()
+            page = browser.new_page()
+            page.route(
+                "**/projects/*/sessions*",
+                lambda route: route.fulfill(
+                    status=500,
+                    content_type="application/json",
+                    body=_json.dumps({"detail": "cached plan must not change result type"}),
+                ),
+            )
+            page.goto(
+                f"http://127.0.0.1:17883/dashboard?project_id={pid}",
+                wait_until="domcontentloaded",
+            )
+            page.wait_for_timeout(2500)
+
+            alert = page.locator(f"#project-fetch-alert-{pid}")
+            assert alert.is_visible(), "project fetch alert should be visible on sessions failure"
+            alert_text = alert.inner_text()
+            assert "project data failed to load" in alert_text.lower()
+            assert "/sessions" in alert_text
+            assert "HTTP 500" in alert_text
+            assert "cached plan must not change result type" in alert_text
+
+            sessions_panel = page.locator(f"#sessions-{pid}")
+            sessions_text = sessions_panel.inner_text()
+            assert "sessions unavailable" in sessions_text.lower()
+            assert "retry failed loads" in sessions_text.lower()
+
+            body_inner = page.evaluate(
+                f"() => {{ const b = document.querySelector('#tab-body-{pid}');"
+                f" return b ? b.innerHTML.trim().length : -1; }}"
+            )
+            assert body_inner > 100, "tab body should stay rendered even when sessions fails"
+            browser.close()
+        finally:
+            server.should_exit = True
+
+
+@pytestmark_playwright
+def test_demo_never_opens_connection_setup_modal(client):
+    """G3.13 — /demo runs against the seeded demo DB and must never trigger
+    the local-server connection-setup wizard. _showConnSetupIfNeeded bails
+    out early in demo mode."""
+    import threading
+    import time
+    import uvicorn
+    from meridian import server as server_module
+
+    with sync_playwright() as p:
+        config = uvicorn.Config(server_module.app, host="127.0.0.1", port=17889, log_level="error")
+        server = uvicorn.Server(config)
+        thread = threading.Thread(target=server.run, daemon=True)
+        thread.start()
+        time.sleep(1.5)
+        try:
+            browser = p.chromium.launch()
+            page = browser.new_page()
+            page.goto("http://127.0.0.1:17889/demo", wait_until="domcontentloaded")
+            page.wait_for_timeout(2200)
+            modal = page.locator("#conn-setup-modal")
+            assert modal.count() == 1, "conn-setup-modal element must exist in markup"
+            # Modal might be in the DOM but must NOT be displayed.
+            displayed = page.evaluate(
+                "() => { const m = document.getElementById('conn-setup-modal');"
+                " return m ? window.getComputedStyle(m).display : 'missing'; }"
+            )
+            assert displayed in ("none", ""), \
+                f"conn-setup-modal should stay hidden on /demo, got display={displayed!r}"
+            browser.close()
+        finally:
+            server.should_exit = True
+
+
+@pytestmark_playwright
+def test_free_tier_signout_visible_on_hosted_dashboard(client, monkeypatch):
+    """Item 42 — free-tier /dashboard must show the sign-out control.
+
+    Regression. Previously the sign-out link was created only inside
+    _renderPlanBadge(me), which runs only when /me returns a plan. Anywhere
+    /me returned {} or errored, the link never appeared — the bug surfaced on
+    free tier. Fix: ensureSignOutLink() is called from hideHostedAdminControls,
+    which runs unconditionally for any hosted user at init.
+
+    This test boots the server with MERIDIAN_HOSTED=true and a session cookie
+    so /me returns {}. The sign-out link must still render and be visible.
+    """
+    import threading
+    import time
+    import uvicorn
+    from meridian import server as server_module
+    from meridian import hosted as hosted_module
+    from playwright.sync_api import sync_playwright
+
+    monkeypatch.setenv("MERIDIAN_HOSTED", "true")
+
+    # Mock get_current_tenant to accept the request and return a free-tier tenant
+    # so /me returns {} (no plan).
+    async def mock_get_current_tenant(request):
+        return {"email": "test@example.com", "id": "test-tenant-id"}
+
+    monkeypatch.setattr(hosted_module, "get_current_tenant", mock_get_current_tenant)
+
+    with sync_playwright() as p:
+        config = uvicorn.Config(server_module.app, host="127.0.0.1", port=17884, log_level="error")
+        server = uvicorn.Server(config)
+        thread = threading.Thread(target=server.run, daemon=True)
+        thread.start()
+        time.sleep(1.5)
+
+        try:
+            browser = p.chromium.launch()
+            page = browser.new_page()
+            page.goto("http://127.0.0.1:17884/dashboard", wait_until="domcontentloaded")
+            page.wait_for_timeout(2500)  # let loadServerConfig + /me + init finish
+
+            # Remove modals/wizards that can mask the sidebar footer.
+            for sel in ("#conn-setup-modal", "#demo-onboarding-overlay", "#ez-wizard"):
+                page.evaluate(
+                    f"() => {{ const e = document.querySelector('{sel}'); if (e) e.remove(); }}"
+                )
+            page.wait_for_timeout(150)
+
+            # The dashboard must be running in hosted mode for this test to be
+            # meaningful — otherwise hideHostedAdminControls never fires.
+            hosted_flag = page.evaluate("() => !!window.MERIDIAN_HOSTED")
+            assert hosted_flag, (
+                "test setup error: window.MERIDIAN_HOSTED is false — "
+                "MERIDIAN_HOSTED env var didn't reach the running server"
+            )
+
+            signout = page.query_selector("#signout-link")
+            assert signout is not None, (
+                "Item 42 regression: #signout-link missing from /dashboard for a "
+                "hosted user without an auth cookie (the free-tier path). "
+                "ensureSignOutLink() must be called from hideHostedAdminControls "
+                "so the link appears even when /me returns {}."
+            )
+            assert signout.is_visible(), (
+                "Item 42 regression: #signout-link is in the DOM but not visible"
+            )
+            href = signout.get_attribute("href")
+            assert href == "/auth/logout", (
+                f"Item 42: signout-link href must be /auth/logout, got {href!r}"
+            )
+
             browser.close()
         finally:
             server.should_exit = True

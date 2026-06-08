@@ -35,6 +35,10 @@ async def create_project_note_endpoint(
     text = (body.get("body") or "").strip()
     if not title or not text:
         raise HTTPException(status_code=400, detail="title and body required")
+    # G4.15 — safety limit
+    from .. import limits as _limits  # noqa: PLC0415
+    existing = await db_module.get_project_notes(await _db(request), project_id)
+    _limits.check_notes_per_project(len(existing))
     return await db_module.add_project_note(
         await _db(request), project_id, title, text, body.get("tags"),
     )

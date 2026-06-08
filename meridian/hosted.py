@@ -345,6 +345,46 @@ async def _github_user_snapshot(access_token: str) -> dict[str, Any]:
     }
 
 
+async def _github_repo_branches(access_token: str, repo: str) -> list[str]:
+    """v2.8 — return the branch names for ``owner/repo`` (paged, up to 300).
+
+    Used by the dashboard Branch dropdown so users pick an existing branch
+    instead of typing one. Raises ``RuntimeError`` on a GitHub error so the
+    caller can fall back to a static default list.
+    """
+    import httpx
+
+    if not repo or "/" not in repo:
+        raise RuntimeError("repo must be owner/repo format")
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "Meridian",
+    }
+    branches: list[str] = []
+    async with httpx.AsyncClient(timeout=15.0) as http:
+        for page in range(1, 4):  # cap at 3 pages (300 branches)
+            resp = await http.get(
+                f"https://api.github.com/repos/{repo}/branches",
+                headers=headers,
+                params={"per_page": "100", "page": str(page)},
+            )
+            if resp.status_code >= 400:
+                raise RuntimeError(
+                    f"GitHub branch listing failed ({resp.status_code}): {resp.text}"
+                )
+            batch = resp.json() or []
+            if not isinstance(batch, list):
+                break
+            for b in batch:
+                name = b.get("name") if isinstance(b, dict) else None
+                if name:
+                    branches.append(name)
+            if len(batch) < 100:
+                break
+    return branches
+
+
 async def exchange_github_code_for_userinfo(code: str) -> dict[str, Any]:
     """Exchange a GitHub OAuth code for user info (email + login)."""
     access_token = await _exchange_github_code_for_token(code, _github_callback_url())
@@ -413,7 +453,7 @@ body{background:#0d0d0f;color:#e8eaf0;font-family:-apple-system,BlinkMacSystemFo
 </head>
 <body>
 <div class="card">
-  <div class="logo">⬡ <span>Meridian</span></div>
+  <div class="logo">🧭 <span>Meridian</span></div>
   <div class="subtitle">Sign in or create an account</div>
   <a href="/auth/google/login" class="btn btn-google">
     <svg width="20" height="20" viewBox="0 0 48 48"><path fill="#EA4335" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"/><path fill="#4285F4" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"/><path fill="#FBBC05" d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z"/><path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"/></svg>
@@ -521,15 +561,25 @@ async def _post_login_redirect(tenant: dict, db=None, next_url: str = "") -> str
                 or (tenant or {}).get("plan") in {"standard", "pro", "admin"}
             )
             if not has_slot:
+                # G5.22 — invitees who already accepted an invite into another
+                # tenant's workspace inherit that workspace's DB; don't burn a
+                # pool slot for them and don't waitlist them.
+                tenant_email = (tenant or {}).get("email", "")
+                existing_membership = await db_module.workspace_member_accepted_for_email(
+                    db, tenant_email,
+                )
+                if existing_membership is not None:
+                    if next_url and next_url.startswith("/") and not next_url.startswith("//"):
+                        return next_url
+                    return _cfg("MERIDIAN_AFTER_LOGIN_URL", "/dashboard")
                 free_count = await db_module.count_tenants_by_plan(
                     db, "free", provisioned_only=True
                 )
                 if free_count >= free_cap:
-                    email = (tenant or {}).get("email", "")
-                    if email:
+                    if tenant_email:
                         try:
                             await db_module.add_waitlist_entry(
-                                db, email, note="auto:launch-full"
+                                db, tenant_email, note="auto:launch-full"
                             )
                         except Exception:
                             pass
@@ -576,11 +626,16 @@ async def auth_callback(request: Request) -> RedirectResponse:
     db = request.app.state.db
     tenant = await db_module.upsert_tenant(db, email=email, google_sub=sub)
 
-    # Provision a Neon DB in the background for new tenants who don't have one yet.
-    # Admin accounts and already-provisioned accounts are no-ops inside provision_neon_db.
+    # G5.22 — Skip auto-provisioning a Neon DB when the user has already
+    # accepted an invite to someone else's workspace. Provisioning then
+    # would burn a pool slot for a tenant that will only ever read from
+    # the inviter's DB. Admin accounts and already-provisioned tenants
+    # are also no-ops inside provision_neon_db.
     if not tenant.get("neon_project_id") and not tenant.get("neon_db_url"):
-        import asyncio as _asyncio
-        _asyncio.create_task(_provision_tenant_background(tenant["id"], db))
+        existing_membership = await db_module.workspace_member_accepted_for_email(db, email)
+        if existing_membership is None:
+            import asyncio as _asyncio
+            _asyncio.create_task(_provision_tenant_background(tenant["id"], db))
 
     expires_at = (
         datetime.now(timezone.utc) + timedelta(hours=_SESSION_MAX_AGE_HOURS)
@@ -660,10 +715,13 @@ async def auth_github_callback(request: Request) -> RedirectResponse:
     db = request.app.state.db
     tenant = await db_module.upsert_tenant(db, email=email, github_sub=sub)
 
-    # Provision a Neon DB in the background for new tenants who don't have one yet.
+    # G5.22 — same invite-aware skip as the Google callback. See the comment
+    # in auth_callback for details.
     if not tenant.get("neon_project_id") and not tenant.get("neon_db_url"):
-        import asyncio as _asyncio
-        _asyncio.create_task(_provision_tenant_background(tenant["id"], db))
+        existing_membership = await db_module.workspace_member_accepted_for_email(db, email)
+        if existing_membership is None:
+            import asyncio as _asyncio
+            _asyncio.create_task(_provision_tenant_background(tenant["id"], db))
 
     expires_at = (
         datetime.now(timezone.utc) + timedelta(hours=_SESSION_MAX_AGE_HOURS)
@@ -804,8 +862,13 @@ async def auth_microsoft_callback(request: Request) -> RedirectResponse:
 
 
 async def auth_logout(request: Request) -> RedirectResponse:
-    """Clear the session cookie and delete the DB session."""
+    """Clear the session cookie and delete the DB session.
+
+    Supports an optional ``?next=<relative-path>`` query param to redirect
+    somewhere other than / after sign-out (e.g. /auth/login for account switching).
+    """
     from . import db as db_module
+    from urllib.parse import urlsplit
 
     cookie_val = request.cookies.get(_SESSION_COOKIE)
     if cookie_val:
@@ -814,7 +877,14 @@ async def auth_logout(request: Request) -> RedirectResponse:
             db = request.app.state.db
             await db_module.delete_user_session(db, session_id)
 
-    response = RedirectResponse("/", status_code=302)
+    # Only allow relative redirects (no scheme/netloc) to prevent open-redirect.
+    next_path = request.query_params.get("next", "")
+    parsed = urlsplit(next_path)
+    if parsed.scheme or parsed.netloc:
+        next_path = "/"
+    redirect_to = next_path or "/"
+
+    response = RedirectResponse(redirect_to, status_code=302)
     response.delete_cookie(_SESSION_COOKIE)
     response.delete_cookie("meridian_demo")
     return response
@@ -1116,6 +1186,30 @@ async def create_stripe_checkout_session(tenant: dict, plan: str) -> str:
     return session.url
 
 
+async def create_stripe_billing_portal_session(tenant: dict) -> str:
+    """G2.11 — open a Stripe Customer Portal session for an existing subscriber.
+
+    The portal lets the customer update card, change plan, view invoices,
+    and cancel. Returns the portal URL to redirect to. Raises ValueError
+    if the tenant has no stripe_customer_id; callers should route those
+    users to /pricing for first subscription instead. Raises RuntimeError
+    if STRIPE_API_KEY is not configured.
+    """
+    customer_id = tenant.get("stripe_customer_id")
+    if not customer_id:
+        raise ValueError("tenant has no stripe_customer_id — send to /pricing")
+
+    import stripe  # type: ignore[import]  # noqa: PLC0415
+
+    stripe.api_key = _require_cfg("STRIPE_API_KEY")
+    base = _cfg("MERIDIAN_BASE_URL", "http://localhost:7878").rstrip("/")
+    session = stripe.billing_portal.Session.create(
+        customer=customer_id,
+        return_url=f"{base}/dashboard",
+    )
+    return session.url
+
+
 async def _provision_tenant_background(tenant_id: str, db: Any) -> None:
     """Best-effort background provisioning called from OAuth callbacks.
 
@@ -1166,17 +1260,30 @@ async def provision_neon_db(tenant_id: str, db: Any) -> dict[str, Any]:
     # Capacity check
     await check_capacity(db)
 
-    # Find or create a pool project with room
-    pool = await db_module.get_available_pool_project(
+    # Item 38 — atomic claim+increment to avoid the overprovisioning race
+    # where two concurrent signups both pick a pool with 7/8 slots and bump
+    # it to 9/8. claim_pool_project_slot returns the row already-incremented.
+    pool = await db_module.claim_pool_project_slot(
         db, tier=pool_tier, max_customers=_MAX_CUSTOMERS_PER_PROJECT
     )
 
     if pool is None:
-        # All existing pool projects are full — create a new one
+        # All existing pool projects are full (or all last-slot races lost).
+        # Create a new one and claim a slot from it. claim() on the fresh pool
+        # is still atomic, so even if a sibling signup raced to create another
+        # new pool, both claims succeed harmlessly.
         neon_project_id, _first_conn_uri = await _create_neon_pool_project(api_key, pool_tier)
-        pool = await db_module.register_pool_project(db, neon_project_id, pool_tier)
-    else:
-        neon_project_id = pool["neon_project_id"]
+        await db_module.register_pool_project(db, neon_project_id, pool_tier)
+        pool = await db_module.claim_pool_project_slot(
+            db, tier=pool_tier, max_customers=_MAX_CUSTOMERS_PER_PROJECT
+        )
+        if pool is None:  # extremely unlikely — fresh pool with cap-1 capacity
+            raise RuntimeError(
+                "newly-registered pool project had no claimable slot "
+                "(check _MAX_CUSTOMERS_PER_PROJECT > 0)"
+            )
+
+    neon_project_id = pool["neon_project_id"]
 
     # Create a customer-specific database inside the pool project
     email_slug = tenant["email"].split("@")[0][:20].replace(".", "_")
@@ -1184,6 +1291,8 @@ async def provision_neon_db(tenant_id: str, db: Any) -> dict[str, Any]:
     conn_uri = await _create_customer_database(api_key, neon_project_id, db_name)
 
     if not conn_uri:
+        # Roll back the claim we made so the slot isn't leaked.
+        await db_module.decrement_pool_project_count(db, neon_project_id)
         raise RuntimeError(f"Failed to get connection URI for customer database {db_name!r}")
 
     # Persist on tenant — encrypt the connection string at rest.
@@ -1194,9 +1303,6 @@ async def provision_neon_db(tenant_id: str, db: Any) -> dict[str, Any]:
         pool_project_id=pool["id"],
         neon_db_url=db_module.encrypt_field(conn_uri),
     )
-
-    # Increment pool project customer count
-    await db_module.increment_pool_project_count(db, neon_project_id)
 
     # v1.0 — set PITR retention on the pool project based on plan tier.
     # Pro: 7 days, Standard: 1 day (Neon default). Best-effort — never
@@ -1601,7 +1707,7 @@ async def run_storage_overage_check(db: Any) -> None:
     stripe_api_key = _cfg("STRIPE_API_KEY", "")
 
     async with db.execute(
-        "SELECT id, email, plan, neon_project_id, stripe_customer_id, stripe_metered_item_id "
+        "SELECT id, email, plan, neon_project_id, stripe_customer_id, stripe_metered_item_id, is_internal "
         "FROM tenants WHERE neon_project_id IS NOT NULL"
     ) as cur:
         rows = await cur.fetchall()
@@ -1612,6 +1718,9 @@ async def run_storage_overage_check(db: Any) -> None:
     tenants = [_to_d(r) for r in rows] if rows else []
 
     for tenant in tenants:
+        # G2.10 — internal tenants are never charged for storage overage.
+        if tenant.get("is_internal"):
+            continue
         neon_project_id = tenant.get("neon_project_id")
         if not neon_project_id:
             continue
@@ -1784,6 +1893,10 @@ async def run_overage_check(db: Any) -> None:
         if email in admins:
             continue
 
+        # G2.10 — internal tenants are never billed for overage or warned.
+        if tenant.get("is_internal"):
+            continue
+
         neon_project_id = tenant.get("neon_project_id", "")
         if not neon_project_id or neon_project_id in EXCLUDED_NEON_PROJECTS:
             continue
@@ -1923,9 +2036,11 @@ async def run_churn_cleanup(db: Any) -> None:
     base = _cfg("MERIDIAN_BASE_URL", "https://usemeridian.us").rstrip("/")
 
     # Churned = had a Neon project but no active Stripe customer (payment lapsed)
+    # G2.10 — internal tenants are never churned.
     async with db.execute(
         "SELECT id, email, neon_project_id, pool_project_id, created_at FROM tenants "
-        "WHERE stripe_customer_id IS NULL AND neon_project_id IS NOT NULL"
+        "WHERE stripe_customer_id IS NULL AND neon_project_id IS NOT NULL "
+        "AND (is_internal IS NULL OR is_internal = 0)"
     ) as cur:
         rows = await cur.fetchall()
     def _to_d(r: Any) -> dict[str, Any]:
@@ -2031,6 +2146,9 @@ async def run_dunning_cleanup(db: Any) -> None:
     tenants = await db_module.get_tenants_with_payment_failures(db)
 
     for tenant in tenants:
+        # G2.10 — internal tenants are never sent dunning warnings.
+        if tenant.get("is_internal"):
+            continue
         raw_ts = tenant.get("payment_failed_at") or ""
         if not raw_ts:
             continue
