@@ -1,4 +1,5 @@
 .env
+meridian.toml
 .pixi/
 data/
 __pycache__/
