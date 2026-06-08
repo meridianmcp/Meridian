@@ -757,13 +757,16 @@ async function loadServerConfig() {
     if (cfg?.demo_mode && !document.getElementById('demo-mode-banner')) {
       const b = document.createElement('div');
       b.id = 'demo-mode-banner';
-      b.style = 'position:fixed;top:0;left:0;right:0;z-index:9999;background:#7c3aed;color:#fff;text-align:center;padding:5px 12px;font-size:12px;font-family:inherit;letter-spacing:0.02em';
-      b.innerHTML = 'Preview mode — read only · <a href="/auth/login" style="color:#fff;text-decoration:underline;font-weight:600">Sign in for full access →</a>';
+      b.style = 'position:fixed;top:0;left:0;right:0;z-index:9999;background:#7c3aed;color:#fff;text-align:center;padding:4px 12px;font-size:11px;font-family:inherit;letter-spacing:0.02em';
+      b.innerHTML = 'Preview mode — read only · <a href="/auth/login" style="color:#fff;text-decoration:underline;font-weight:600">Sign in →</a>';
       document.body.prepend(b);
-      document.body.style.paddingTop = ((parseInt(document.body.style.paddingTop || '0', 10)) + 28) + 'px';
+      document.body.style.paddingTop = ((parseInt(document.body.style.paddingTop || '0', 10)) + 22) + 'px';
       // Demo onboarding overlay — self-guards once the tour is finished
       // (localStorage), and its CTA resumes the tour at the saved step.
-      showDemoOnboardingOverlay();
+      // Auto-start the demo tour instead of showing overlay
+      if (!_demoTourDone()) {
+        resumeDemoTour();
+      }
     }
     // Task 16 — hide destructive admin controls in demo mode
     if (cfg?.demo_mode) hideDemoAdminControls();
