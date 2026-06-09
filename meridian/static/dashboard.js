@@ -224,6 +224,78 @@ function ensureTourButton() {
   footer.appendChild(btn);
 }
 
+// Small, unobtrusive "Send feedback" affordance in the sidebar footer. Tagged
+// data-demo-hide so the demo's hideDemoAdminControls() sweep removes it (it
+// POSTs to a write endpoint). Opens a lightweight modal — bug/feature/other.
+function ensureFeedbackButton() {
+  // The /feedback endpoint is hosted-only (404 otherwise) — don't show a
+  // button that would fail on self-hosted instances.
+  if (!isHostedMode()) return;
+  const footer = document.querySelector('.sidebar-footer');
+  if (!footer || document.getElementById('feedback-launch-btn')) return;
+  const btn = document.createElement('button');
+  btn.id = 'feedback-launch-btn';
+  btn.type = 'button';
+  btn.setAttribute('data-demo-hide', '');
+  btn.textContent = '💬 Send feedback';
+  btn.title = 'Report a bug or request a feature';
+  btn.style = 'display:block;width:100%;margin-top:6px;padding:5px 10px;font-size:10px;color:var(--muted);font-family:var(--font-mono);text-align:center;background:transparent;border:1px solid var(--border);border-radius:5px;cursor:pointer';
+  btn.onmouseenter = () => { btn.style.borderColor = 'var(--accent)'; btn.style.color = 'var(--accent)'; };
+  btn.onmouseleave = () => { btn.style.borderColor = 'var(--border)'; btn.style.color = 'var(--muted)'; };
+  btn.onclick = () => { try { showFeedbackModal(); } catch (e) {} };
+  footer.appendChild(btn);
+}
+
+function showFeedbackModal() {
+  if (document.getElementById('feedback-modal')) return;
+  const overlay = document.createElement('div');
+  overlay.id = 'feedback-modal';
+  overlay.style.cssText = 'position:fixed;inset:0;z-index:10000;background:rgba(0,0,0,.55);display:flex;align-items:center;justify-content:center';
+  const box = document.createElement('div');
+  box.style.cssText = 'background:var(--surface-0);border:1px solid var(--border);border-radius:8px;padding:24px 28px;width:440px;max-width:94vw;display:flex;flex-direction:column;gap:12px';
+  box.innerHTML = `
+    <div style="font-weight:700;font-size:14px">Send feedback</div>
+    <label style="font-size:11px;color:var(--muted)">Type
+      <select id="feedback-type" style="display:block;width:100%;margin-top:4px;font-size:12px;font-family:var(--font-mono);background:var(--surface-1);color:var(--text);border:1px solid var(--border);border-radius:5px;padding:6px 8px">
+        <option value="bug">Bug</option>
+        <option value="feature">Feature request</option>
+        <option value="other">Other</option>
+      </select>
+    </label>
+    <label style="font-size:11px;color:var(--muted)">Message
+      <textarea id="feedback-message" rows="4" placeholder="What's on your mind?" style="display:block;width:100%;margin-top:4px;box-sizing:border-box;font-size:12px;font-family:inherit;background:var(--surface-1);color:var(--text);border:1px solid var(--border);border-radius:5px;padding:7px 10px;resize:vertical"></textarea>
+    </label>
+    <label style="font-size:11px;color:var(--muted)">Email (optional)
+      <input id="feedback-email" type="email" placeholder="you@example.com" style="display:block;width:100%;margin-top:4px;box-sizing:border-box;font-size:12px;font-family:var(--font-mono);background:var(--surface-1);color:var(--text);border:1px solid var(--border);border-radius:5px;padding:6px 10px">
+    </label>
+    <div id="feedback-status" style="font-size:11px;min-height:16px;color:var(--muted)"></div>
+    <div style="display:flex;gap:8px;justify-content:flex-end">
+      <button id="feedback-cancel" class="secondary" style="font-size:12px">Cancel</button>
+      <button id="feedback-send" style="font-size:12px">Send</button>
+    </div>`;
+  overlay.appendChild(box);
+  document.body.appendChild(overlay);
+  const statusEl = box.querySelector('#feedback-status');
+  box.querySelector('#feedback-cancel').onclick = () => overlay.remove();
+  overlay.onclick = e => { if (e.target === overlay) overlay.remove(); };
+  box.querySelector('#feedback-send').onclick = async () => {
+    const type = box.querySelector('#feedback-type').value;
+    const message = box.querySelector('#feedback-message').value.trim();
+    const email = box.querySelector('#feedback-email').value.trim();
+    if (!message) { statusEl.textContent = 'Enter a message.'; statusEl.style.color = 'var(--danger,#dc2626)'; return; }
+    statusEl.textContent = 'Sending…'; statusEl.style.color = 'var(--muted)';
+    try {
+      await api('/feedback', { method: 'POST', body: JSON.stringify({ type, message, email }) });
+      statusEl.textContent = 'Thanks! Feedback sent.'; statusEl.style.color = '#059669';
+      setTimeout(() => overlay.remove(), 900);
+    } catch (e) {
+      statusEl.textContent = e.message || 'Could not send — please try again.';
+      statusEl.style.color = 'var(--danger,#dc2626)';
+    }
+  };
+  box.querySelector('#feedback-message').focus();
+}
+
 function showLocalServerControls() {
   // Server-management buttons are display:none by default in the template so they
   // never flash on hosted/demo loads. Reveal them only once we've confirmed this
@@ -7419,6 +7491,7 @@ async function restoreTabs() {
   if (isHostedMode()) hideHostedAdminControls();
   showLocalServerControls();
   ensureTourButton();
+  ensureFeedbackButton();
   // v0.6.6 — EZ first-run wizard: if no projects exist, show the overlay
   // Skip in demo mode — demo DB always has projects seeded.
   if (state.projects.length === 0 && !isDemoMode()) {
