@@ -607,6 +607,27 @@ input[type=text] {
   border: 1px solid var(--border); border-radius: 4px;
   font-family: 'IBM Plex Mono', monospace; font-size: 12px;
 }
+
+/* Global select/dropdown styling — dark bg, white text, consistent across all dropdowns */
+select {
+  background: #1a1a1a;
+  color: #f0f0f0;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 5px 8px;
+  font-family: inherit;
+  font-size: 12px;
+  cursor: pointer;
+  appearance: auto;
+}
+select:focus {
+  outline: 1px solid var(--accent, #a8ff78);
+  border-color: var(--accent, #a8ff78);
+}
+select option {
+  background: #1a1a1a;
+  color: #f0f0f0;
+}
 .claude-worker-result { display: flex; flex-direction: column; gap: 8px; }
 .claude-worker-xml {
   background: var(--surface-2); border: 1px solid var(--border);
