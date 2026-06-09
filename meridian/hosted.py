@@ -153,19 +153,22 @@ def _microsoft_callback_url() -> str:
     return f"{base}/auth/microsoft/callback"
 
 
-async def get_microsoft_auth_url() -> str:
+async def get_microsoft_auth_url(next_url: str = "") -> str:
     """Return the Microsoft OAuth authorization URL."""
     if not MICROSOFT_CLIENT_ID:
         raise RuntimeError("MICROSOFT_CLIENT_ID is not set")
     import urllib.parse
-    params = urllib.parse.urlencode({
+    import base64 as _b64
+    params: dict = {
         "client_id": MICROSOFT_CLIENT_ID,
         "response_type": "code",
         "redirect_uri": _microsoft_callback_url(),
         "response_mode": "query",
         "scope": _MICROSOFT_SCOPES,
-    })
-    return f"{_MICROSOFT_AUTH_URL}?{params}"
+    }
+    if next_url:
+        params["state"] = f"next:{_b64.urlsafe_b64encode(next_url.encode()).decode()}"
+    return f"{_MICROSOFT_AUTH_URL}?{urllib.parse.urlencode(params)}"
 
 
 async def exchange_microsoft_code_for_userinfo(code: str) -> dict[str, Any]:
@@ -512,22 +515,34 @@ async function sendMagic() {
 </html>"""
 
 
-def _build_login_page() -> str:
-    """Build the login page HTML, injecting Microsoft button when configured."""
+def _build_login_page(next_url: str = "") -> str:
+    """Build the login page HTML, injecting next_url into login button hrefs."""
+    from urllib.parse import quote as _q
+    next_qs = f"?next={_q(next_url)}" if next_url else ""
+    page = _LOGIN_PAGE_HTML.replace(
+        'href="/auth/google/login"',
+        f'href="/auth/google/login{next_qs}"',
+    ).replace(
+        'href="/auth/github/login"',
+        f'href="/auth/github/login{next_qs}"',
+    )
     ms_button = ""
     if MICROSOFT_CLIENT_ID:
-        ms_button = """
-  <a href="/auth/microsoft/login" class="btn btn-microsoft">
+        ms_button = f"""
+  <a href="/auth/microsoft/login{next_qs}" class="btn btn-microsoft">
     <svg width="20" height="20" viewBox="0 0 21 21" fill="none"><rect x="1" y="1" width="9" height="9" fill="#f25022"/><rect x="11" y="1" width="9" height="9" fill="#7fba00"/><rect x="1" y="11" width="9" height="9" fill="#00a4ef"/><rect x="11" y="11" width="9" height="9" fill="#ffb900"/></svg>
     Continue with Microsoft
   </a>"""
-    return _LOGIN_PAGE_HTML.replace("<!-- MICROSOFT_BUTTON -->", ms_button)
+    return page.replace("<!-- MICROSOFT_BUTTON -->", ms_button)
 
 
 async def auth_login(request: Request):
     """Serve the sign-in page with Google and GitHub OAuth buttons."""
     from fastapi.responses import HTMLResponse
-    return HTMLResponse(_build_login_page())
+    next_url = request.query_params.get("next", "")
+    if not (next_url.startswith("/") and not next_url.startswith("//")):
+        next_url = ""
+    return HTMLResponse(_build_login_page(next_url=next_url))
 
 
 async def _post_login_redirect(tenant: dict, db=None, next_url: str = "") -> str:
@@ -680,8 +695,13 @@ async def auth_google_login(request: Request) -> RedirectResponse:
 
 async def auth_github_login(request: Request) -> RedirectResponse:
     """Redirect the browser to GitHub's OAuth consent page."""
+    import base64 as _b64
+    next_url = request.query_params.get("next", "")
+    if not (next_url.startswith("/") and not next_url.startswith("//")):
+        next_url = ""
+    state = f"next:{_b64.urlsafe_b64encode(next_url.encode()).decode()}" if next_url else ""
     try:
-        url = await get_github_auth_url()
+        url = await get_github_auth_url(state=state)
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     return RedirectResponse(url, status_code=302)
@@ -696,6 +716,17 @@ async def auth_github_callback(request: Request) -> RedirectResponse:
         return await auth_github_repo_callback(request)
 
     from . import db as db_module
+
+    # Extract next_url from state (set by auth_github_login when ?next= was present)
+    import base64 as _b64
+    _next_url = ""
+    if state.startswith("next:"):
+        try:
+            _next_url = _b64.urlsafe_b64decode(state[5:] + "==").decode()
+        except Exception:
+            _next_url = ""
+    if not (_next_url.startswith("/") and not _next_url.startswith("//")):
+        _next_url = ""
 
     code = request.query_params.get("code")
     if not code:
@@ -729,7 +760,7 @@ async def auth_github_callback(request: Request) -> RedirectResponse:
     session = await db_module.create_user_session(db, tenant["id"], expires_at)
     cookie_value = _make_session_cookie(session["id"])
 
-    redirect_to = await _post_login_redirect(tenant, db)
+    redirect_to = await _post_login_redirect(tenant, db, next_url=_next_url)
     response = RedirectResponse(redirect_to, status_code=302)
     response.set_cookie(
         _SESSION_COOKIE,
@@ -813,8 +844,11 @@ async def auth_github_repo_callback(request: Request) -> RedirectResponse:
 
 async def auth_microsoft_login(request: Request) -> RedirectResponse:
     """Redirect the browser to Microsoft's OAuth consent page."""
+    next_url = request.query_params.get("next", "")
+    if not (next_url.startswith("/") and not next_url.startswith("//")):
+        next_url = ""
     try:
-        url = await get_microsoft_auth_url()
+        url = await get_microsoft_auth_url(next_url=next_url)
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     return RedirectResponse(url, status_code=302)
@@ -823,6 +857,18 @@ async def auth_microsoft_login(request: Request) -> RedirectResponse:
 async def auth_microsoft_callback(request: Request) -> RedirectResponse:
     """Handle Microsoft OAuth callback — upsert tenant, set session cookie."""
     from . import db as db_module
+
+    # Extract next_url from state (set by auth_microsoft_login when ?next= was present)
+    import base64 as _b64
+    _ms_state = request.query_params.get("state", "")
+    _next_url = ""
+    if _ms_state.startswith("next:"):
+        try:
+            _next_url = _b64.urlsafe_b64decode(_ms_state[5:] + "==").decode()
+        except Exception:
+            _next_url = ""
+    if not (_next_url.startswith("/") and not _next_url.startswith("//")):
+        _next_url = ""
 
     code = request.query_params.get("code")
     if not code:
@@ -847,7 +893,7 @@ async def auth_microsoft_callback(request: Request) -> RedirectResponse:
     session = await db_module.create_user_session(db, tenant["id"], expires_at)
     cookie_value = _make_session_cookie(session["id"])
 
-    redirect_to = await _post_login_redirect(tenant, db)
+    redirect_to = await _post_login_redirect(tenant, db, next_url=_next_url)
     response = RedirectResponse(redirect_to, status_code=302)
     response.set_cookie(
         _SESSION_COOKIE,
