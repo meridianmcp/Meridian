@@ -239,6 +239,7 @@ const STORAGE_KEY = (k) => (isDemoMode() ? 'meridian_demo_' : 'meridian_') + k.r
 const QUEUE_DONE_PAGE_SIZE = 10;
 const NORTH_STAR_MIN_HEIGHT_PX = 180;
 const DEFAULT_MAX_PINNED_DECISIONS = 20;
+const DEFAULT_CONTEXT_THRESHOLD = 40;
 const GITHUB_OCTICON_PATH = 'M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z';
 
 function getPanelState(projectId) {
@@ -4456,6 +4457,11 @@ async function loadSettingsTab(projectId) {
       <label style="font-size:10px;color:var(--muted)">deploy_cmd<br><input id="exec-deploy_cmd-${projectId}" type="text" placeholder="git push / fly deploy" style="width:100%;background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:3px 6px;margin-top:2px" value="${escapeHtml(String(execCfg.deploy_cmd || ''))}"></label>
       <label style="font-size:10px;color:var(--muted)">branch<br><input id="exec-branch-${projectId}" type="text" placeholder="dev" style="width:100%;background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:3px 6px;margin-top:2px" value="${escapeHtml(String(execCfg.branch || ''))}"></label>
     </div>
+    <label style="display:block;font-size:10px;color:var(--muted);margin-top:10px">
+      Checkpoint after <span id="exec-context_threshold-val-${projectId}" style="color:var(--text);font-family:var(--font-mono)">${escapeHtml(String(execCfg.context_threshold || DEFAULT_CONTEXT_THRESHOLD))}</span> turns
+      <input id="exec-context_threshold-${projectId}" type="range" min="10" max="100" step="5" value="${escapeHtml(String(execCfg.context_threshold || DEFAULT_CONTEXT_THRESHOLD))}" style="width:100%;max-width:320px;margin-top:4px;display:block">
+      <span style="font-size:9px;color:var(--muted)">When a session passes this many turns, <code>get_context_block</code> nudges it to checkpoint.</span>
+    </label>
     <div style="margin-top:8px;display:flex;gap:8px;align-items:center">
       <button id="exec-save-${projectId}" class="primary" style="font-size:10px;padding:3px 10px">Save</button>
       <span id="exec-status-${projectId}" style="font-size:10px;color:var(--muted);min-height:14px"></span>
@@ -4466,6 +4472,12 @@ async function loadSettingsTab(projectId) {
     const saveBtn = document.getElementById(`exec-save-${projectId}`);
     const statusEl = document.getElementById(`exec-status-${projectId}`);
     if (!saveBtn) return;
+    // Live-update the slider's value label as the user drags.
+    const ctxSlider = document.getElementById(`exec-context_threshold-${projectId}`);
+    const ctxVal = document.getElementById(`exec-context_threshold-val-${projectId}`);
+    if (ctxSlider && ctxVal) {
+      ctxSlider.addEventListener('input', () => { ctxVal.textContent = ctxSlider.value; });
+    }
     saveBtn.onclick = async () => {
       saveBtn.disabled = true;
       const fields = ['repo_path', 'env_file', 'test_cmd', 'deploy_cmd', 'branch'];
@@ -4477,6 +4489,8 @@ async function loadSettingsTab(projectId) {
       const minEl = document.getElementById(`exec-test_min-${projectId}`);
       const minVal = minEl ? parseInt(minEl.value || '', 10) : NaN;
       if (!isNaN(minVal) && minVal > 0) cfg.test_min = minVal;
+      const ctxRaw = ctxSlider ? parseInt(ctxSlider.value || '', 10) : NaN;
+      if (!isNaN(ctxRaw)) cfg.context_threshold = Math.min(100, Math.max(10, ctxRaw));
       try {
         await saveProjectSettings(projectId, { executor_config: cfg });
         if (statusEl) statusEl.textContent = 'Saved.';
