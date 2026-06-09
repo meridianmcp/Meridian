@@ -904,6 +904,42 @@ async def _limit_exceeded_handler(request: Request, exc: _limits_module.LimitExc
 
 
 # ---------------------------------------------------------------------------
+# X-Request-ID middleware + global exception handler
+# ---------------------------------------------------------------------------
+
+import uuid as _uuid
+import logging as _logging
+
+_req_id_logger = _logging.getLogger("meridian.server")
+
+
+@app.middleware("http")
+async def _request_id_middleware(request: Request, call_next):
+    """Attach a uuid4 X-Request-ID to every response and request state."""
+    req_id = str(_uuid.uuid4())
+    request.state.request_id = req_id
+    response = await call_next(request)
+    response.headers["X-Request-ID"] = req_id
+    return response
+
+
+@app.exception_handler(Exception)
+async def _global_exception_handler(request: Request, exc: Exception):
+    req_id = getattr(request.state, "request_id", "unknown")
+    _req_id_logger.exception(
+        "unhandled exception on %s %s (request_id=%s)",
+        request.method,
+        request.url.path,
+        req_id,
+        exc_info=exc,
+    )
+    return JSONResponse(
+        status_code=500,
+        content={"error": "internal server error", "request_id": req_id},
+    )
+
+
+# ---------------------------------------------------------------------------
 # v2.0-fixes — Demo read-only middleware (MERIDIAN_DEMO=true)
 # ---------------------------------------------------------------------------
 
