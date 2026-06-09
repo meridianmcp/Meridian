@@ -1123,6 +1123,29 @@ async def landing_page(request: Request) -> HTMLResponse:
     return resp
 
 
+@app.get("/robots.txt", response_class=PlainTextResponse)
+async def robots_txt() -> str:
+    return "User-agent: *\nAllow: /\nSitemap: https://usemeridian.us/sitemap.xml"
+
+
+@app.get("/sitemap.xml")
+async def sitemap_xml() -> Response:
+    today = "2026-06-09"
+    urls = ["/", "/demo", "/pricing", "/install-mcp"]
+    items = "\n".join(
+        f"  <url><loc>https://usemeridian.us{u}</loc>"
+        f"<lastmod>{today}</lastmod><changefreq>weekly</changefreq></url>"
+        for u in urls
+    )
+    xml = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n'
+        f"{items}\n"
+        "</urlset>"
+    )
+    return Response(content=xml, media_type="application/xml")
+
+
 @app.post("/demo-auth")
 async def demo_auth_post(request: Request):
     """Validate demo password and set a signed access cookie.
