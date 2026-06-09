@@ -6858,8 +6858,13 @@ async def submit_feedback(request: Request) -> dict[str, str]:
     if not message:
         raise HTTPException(status_code=400, detail="Message is required")
 
-    db = await _db(request)
-    feedback_id = await db_module.add_feedback(db, tenant["id"], feedback_type, message, email)
+    # Validate email format if provided
+    if email and ("@" not in email or "." not in email.split("@")[-1]):
+        raise HTTPException(status_code=400, detail="Invalid email address")
+
+    # Feedback goes in the auth DB (not project DB) — tenants table is there
+    auth_db = request.app.state.db
+    feedback_id = await db_module.add_feedback(auth_db, tenant["id"], feedback_type, message, email)
     return {"id": feedback_id}
 
 
