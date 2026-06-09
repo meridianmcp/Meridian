@@ -532,7 +532,7 @@ function showFeedbackModal() {
 
     </label>
 
-    <label style="font-size:11px;color:var(--muted)">Email (optional)
+    <label style="font-size:11px;color:var(--muted)">Email
 
       <input id="feedback-email" type="email" placeholder="you@example.com" style="display:block;width:100%;margin-top:4px;box-sizing:border-box;font-size:12px;font-family:var(--font-mono);background:var(--surface-1);color:var(--text);border:1px solid var(--border);border-radius:5px;padding:6px 10px">
 
@@ -567,6 +567,7 @@ function showFeedbackModal() {
     const email = box.querySelector('#feedback-email').value.trim();
 
     if (!message) { statusEl.textContent = 'Enter a message.'; statusEl.style.color = 'var(--danger,#dc2626)'; return; }
+    if (!email || !email.includes('@')) { statusEl.textContent = 'Enter a valid email.'; statusEl.style.color = 'var(--danger,#dc2626)'; return; }
 
     statusEl.textContent = 'Sending…'; statusEl.style.color = 'var(--muted)';
 
