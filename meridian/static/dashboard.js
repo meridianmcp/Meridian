@@ -7924,8 +7924,7 @@ async function loadSettingsTab(projectId) {
   if (!body) return;
 
   body.innerHTML = '<div style="color:var(--muted);font-size:11px">loading…</div>';
-  // Catch-all so settings never silently stays on loading
-  const _settingsGuard = (async () => {
+
 
   const PREFS = [
 
@@ -10825,8 +10824,6 @@ function _renderToolEntry(tool) {
 
   return `<div style="margin-bottom:12px"><div style="color:var(--text);font-weight:600">${escapeHtml(tool.name)}(<span style="color:var(--muted)">${escapeHtml(signature)}</span>)</div><div style="color:var(--muted);margin:3px 0 4px 0;font-size:10.5px">${escapeHtml(tool.description || '')}</div>${params ? `<table style="font-size:10px;border-collapse:collapse;width:100%">${params}</table>` : ''}</div>`;
 
-  })();
-  _settingsGuard.catch(e => { body.innerHTML = `<div style="color:var(--danger,#dc2626);padding:10px;font-size:11px">Settings error: ${escapeHtml(String(e))}</div>`; console.error('settings error', e); });
 }
 
 
