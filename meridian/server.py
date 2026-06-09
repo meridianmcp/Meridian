@@ -7096,12 +7096,37 @@ async def submit_feedback(request: Request) -> dict[str, str]:
     return {"id": feedback_id}
 
 
+# ---------------------------------------------------------------------------
+# Per-token rate limiting for /mcp POST
+# ---------------------------------------------------------------------------
+
+import time as _mcp_time
+
+# {token_hash: (count, window_start_epoch_seconds)}
+_mcp_rate_counters: dict[str, tuple[int, float]] = {}
+_MCP_RATE_WINDOW = 60  # seconds
+
+
+def _mcp_rate_check(token_hash: str, limit: int) -> bool:
+    """Return True (= rate limited) if the token has exceeded limit calls/min."""
+    now = _mcp_time.monotonic()
+    count, window_start = _mcp_rate_counters.get(token_hash, (0, now))
+    if now - window_start >= _MCP_RATE_WINDOW:
+        # New window
+        _mcp_rate_counters[token_hash] = (1, now)
+        return False
+    if count >= limit:
+        return True
+    _mcp_rate_counters[token_hash] = (count + 1, window_start)
+    return False
+
+
 @app.post("/mcp")
 async def remote_mcp(request: Request) -> Any:
     """Remote MCP endpoint — JSON-RPC 2.0 over HTTP.
 
     Accepts OAuth bearer tokens and Meridian API keys over the same endpoint.
-    Rate-limited to 100 requests/minute per IP.
+    Rate-limited: 600 req/min per authenticated token, 60 req/min for free tier.
     Accepts a single JSON-RPC 2.0 message or a batch (list).
     """
     from fastapi.responses import JSONResponse
@@ -7169,6 +7194,16 @@ async def remote_mcp(request: Request) -> Any:
                     f' resource_metadata="{_base}/.well-known/oauth-authorization-server"'
                 ),
             },
+        )
+
+    # Per-token rate limiting: 60/min for free tier, 600/min for others.
+    _plan = (tenant.get("plan") or "free").lower()
+    _rate_limit = 60 if _plan == "free" else 600
+    if _mcp_rate_check(_bearer_hash, _rate_limit):
+        return JSONResponse(
+            {"detail": f"rate limit exceeded ({_rate_limit} req/min)"},
+            status_code=429,
+            headers={"Retry-After": "60"},
         )
 
     try:
