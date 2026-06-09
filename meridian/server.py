@@ -940,6 +940,47 @@ async def _global_exception_handler(request: Request, exc: Exception):
 
 
 # ---------------------------------------------------------------------------
+# Custom 404 / 500 error pages
+# ---------------------------------------------------------------------------
+
+_ERROR_PAGE_STYLE = (
+    "body{background:#0b0c0e;color:#fff;font-family:'IBM Plex Mono',ui-monospace,"
+    "'Cascadia Code','Fira Mono',monospace;min-height:100vh;display:flex;"
+    "align-items:center;justify-content:center;margin:0}"
+    ".card{text-align:center}"
+    "h1{font-size:3rem;margin:0 0 0.5rem}"
+    "p{color:#aaa;margin:0 0 1.5rem}"
+    "a{color:#6c8fff;text-decoration:none}"
+    "a:hover{text-decoration:underline}"
+)
+
+
+def _error_page(code: int, message: str) -> HTMLResponse:
+    html = (
+        "<!doctype html><html lang='en'><head>"
+        "<meta charset='utf-8'>"
+        f"<title>{code}</title>"
+        f"<style>{_ERROR_PAGE_STYLE}</style>"
+        "</head><body><div class='card'>"
+        f"<h1>{code}</h1>"
+        f"<p>{message}</p>"
+        "<a href='/'>&#8592; back to home</a>"
+        "</div></body></html>"
+    )
+    return HTMLResponse(content=html, status_code=code)
+
+
+@app.exception_handler(404)
+async def _404_handler(request: Request, exc: Exception) -> HTMLResponse:  # noqa: ARG001
+    return _error_page(404, "not found")
+
+
+@app.exception_handler(500)
+async def _500_handler(request: Request, exc: Exception) -> HTMLResponse:  # noqa: ARG001
+    return _error_page(500, "something went wrong")
+
+
+# ---------------------------------------------------------------------------
 # v2.0-fixes — Demo read-only middleware (MERIDIAN_DEMO=true)
 # ---------------------------------------------------------------------------
 
