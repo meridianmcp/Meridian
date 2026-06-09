@@ -8879,7 +8879,7 @@ async function loadSettingsTab(projectId) {
 
       ${isHostedMode() ? `<div style="margin-bottom:16px;padding:12px;background:var(--surface-1);border:1px solid var(--accent,#a8ff78)44;border-radius:6px">
         <div style="font-size:11px;font-weight:700;color:var(--text);margin-bottom:6px">Claude Code (Hosted)</div>
-        <div style="font-size:10px;color:var(--muted);margin-bottom:8px">Save as <code>.mcp.json</code> in your project root. Get your key from <a href="/settings#api-tokens" style="color:var(--accent,#a8ff78)">Settings → API tokens</a>.</div>
+        <div style="font-size:10px;color:var(--muted);margin-bottom:8px">Save as <code>.mcp.json</code> in your project root. Get your key from <a href="#" onclick="document.querySelector('[data-vtab=settings]')?.click();return false;" style="color:var(--accent,#a8ff78)">Settings → Browser connector → Generate API key</a>.</div>
         <pre id="hosted-mcp-json-${escapeHtml(projectId)}" style="background:var(--surface-0);border:1px solid var(--border);border-radius:4px;padding:10px;font-size:10px;font-family:var(--font-mono);color:var(--text);overflow-x:auto;margin:0 0 6px 0;white-space:pre-wrap;word-break:break-all"></pre>
         <button class="secondary" id="copy-hosted-mcp-json-${escapeHtml(projectId)}" style="font-size:10px;padding:4px 10px">Copy .mcp.json</button>
         ${mcpData && mcpData.github_repo ? `<button id="push-mcp-template-${escapeHtml(projectId)}" class="secondary" style="font-size:10px;padding:4px 10px;margin-left:4px" title="Push template.mcp.json to ${escapeHtml(mcpData.github_repo || '')}">Push to repo ↗</button>` : ""}
