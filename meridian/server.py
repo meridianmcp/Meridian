@@ -4420,9 +4420,11 @@ async def push_mcp_template(project_id: str, request: Request) -> dict[str, Any]
     template_content = json.dumps({
         "mcpServers": {
             "meridian": {
-                "command": "npx",
-                "args": ["-y", "mcp-remote", "https://usemeridian.us/mcp"],
-                "env": {"BEARER_TOKEN": "sk_meridian_YOUR_KEY_HERE"}
+                "type": "http",
+                "url": "https://usemeridian.us/mcp",
+                "headers": {
+                    "Authorization": "Bearer sk_meridian_YOUR_KEY_HERE"
+                }
             }
         }
     }, indent=2)

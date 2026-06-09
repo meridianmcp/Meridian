@@ -8862,12 +8862,13 @@ async function loadSettingsTab(projectId) {
     const goalText = `/goal Complete pending sprint items in order. Done when all items\nmarked complete via complete_sprint_item(), pixi run test passes\n524+, generate_handoff() called. Stop after 40 turns or HITL.\n\nproject_id = "${displayPid}"`;
 
     // Hosted .mcp.json for Claude Code
+    const _mcpUrl = (state.serverConfig?.base_url || "https://usemeridian.us") + "/mcp";
     const hostedMcpJson = JSON.stringify({
       mcpServers: {
         meridian: {
-          command: "npx",
-          args: ["-y", "mcp-remote", state.serverConfig?.base_url || "https://usemeridian.us" + "/mcp"],
-          env: { BEARER_TOKEN: currentToken || "sk_meridian_YOUR_KEY_HERE" }
+          type: "http",
+          url: _mcpUrl,
+          headers: { Authorization: `Bearer ${currentToken || "sk_meridian_YOUR_KEY_HERE"}` }
         }
       }
     }, null, 2);
