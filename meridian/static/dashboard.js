@@ -1073,6 +1073,14 @@ function hideDemoAdminControls() {
 
     '#connect-db-save',
 
+    // Easy-setup + goal template write controls (settings tab)
+
+    '[id^="exec-ez-save-"]',
+
+    '[id^="codex-save-goal-"]',
+
+    '[id^="codex-regen-goal-"]',
+
   ];
 
   selectors.forEach(sel => {
@@ -8277,6 +8285,167 @@ async function loadSettingsTab(projectId) {
 
 
 
+  // Hosted easy-setup: hooks + mini executor shown by default; everything else in collapsible Advanced.
+  if (isHostedMode()) {
+    const _ezCfg = (projectSettings && projectSettings.executor_config) || {};
+    const _advKey = `meridian.settings.adv.${projectId}`;
+    let _advOpen = false;
+    try { _advOpen = localStorage.getItem(_advKey) === '1'; } catch(e) {}
+
+    html += `<details class="meridian-disclosure" style="margin-bottom:16px;border:1px solid var(--border);border-radius:6px;background:var(--surface-2)">
+
+    <summary style="cursor:pointer;list-style:none;padding:10px 12px;display:flex;justify-content:space-between;align-items:center;gap:8px">
+
+      <span style="display:flex;align-items:center;gap:8px;flex:1;min-width:0">
+
+        <span class="meridian-caret" style="display:inline-block;font-size:10px;color:var(--muted);transition:transform 120ms ease;flex-shrink:0">▶</span>
+
+        <span style="font-weight:600;font-size:11px;color:var(--text)">Auto-checkpoint hooks</span>
+
+      </span>
+
+      <span style="font-size:10px;color:var(--muted);flex-shrink:0">Claude Code + Codex</span>
+
+    </summary>
+
+    <div style="padding:0 12px 12px">
+
+      <div style="font-size:10px;color:var(--muted);margin-bottom:10px">Install once, then SessionStart + Stop can auto-start and auto-checkpoint into Meridian for this project.</div>
+
+      <div style="display:grid;gap:10px;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));margin-bottom:10px">
+
+        <div>
+
+          <div style="font-size:10px;font-weight:600;color:var(--text);margin-bottom:4px">macOS / Linux / WSL</div>
+
+          <pre id="hooks-install-unix-${projectId}" style="background:var(--surface-1);border:1px solid var(--border);border-radius:4px;padding:10px;font-size:10px;font-family:var(--font-mono);color:var(--text);overflow-x:auto;margin:0 0 6px 0;white-space:pre-wrap;word-break:break-all"></pre>
+
+          <button class="secondary" id="hooks-copy-install-unix-${projectId}" style="font-size:10px;padding:4px 10px">Copy</button>
+
+        </div>
+
+        <div>
+
+          <div style="font-size:10px;font-weight:600;color:var(--text);margin-bottom:4px">Windows PowerShell</div>
+
+          <pre id="hooks-install-windows-${projectId}" style="background:var(--surface-1);border:1px solid var(--border);border-radius:4px;padding:10px;font-size:10px;font-family:var(--font-mono);color:var(--text);overflow-x:auto;margin:0 0 6px 0;white-space:pre-wrap;word-break:break-all"></pre>
+
+          <button class="secondary" id="hooks-copy-install-windows-${projectId}" style="font-size:10px;padding:4px 10px">Copy</button>
+
+        </div>
+
+      </div>
+
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:10px">
+
+        ${mcpData ? `<button id="hooks-gen-token-${projectId}" class="primary" style="font-size:10px;padding:4px 10px">Generate API key</button>` : ''}
+
+        <span id="hooks-token-status-${projectId}" style="font-size:10px;color:var(--muted)">${mcpData ? 'Generate an API key to replace the placeholder token in the hosted snippets below.' : 'Local mode - no Bearer token needed.'}</span>
+
+      </div>
+
+      ${mcpData ? `<div style="margin-bottom:10px;padding:8px 10px;border:1px solid var(--border);border-radius:4px;background:var(--surface-1)">
+
+        <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:6px">
+
+          <span style="font-size:10px;font-weight:600;color:var(--text)">Existing API keys</span>
+
+          <button id="hooks-refresh-tokens-${projectId}" class="secondary" style="font-size:10px;padding:3px 8px">Refresh</button>
+
+        </div>
+
+        <div id="hooks-token-list-${projectId}" style="display:grid;gap:6px"></div>
+
+      </div>` : ''}
+
+      <details style="margin-bottom:10px;border:1px solid var(--border);border-radius:4px;background:var(--surface-1)">
+
+        <summary style="cursor:pointer;padding:8px 10px;font-size:10px;font-weight:600;color:var(--text)">Windows manual config</summary>
+
+        <div style="padding:0 10px 10px">
+
+          <div style="font-size:10px;font-weight:600;color:var(--text);margin:8px 0 4px">Claude Code - <code>~/.claude/settings.json</code></div>
+
+          <pre id="hooks-win-claude-${projectId}" style="background:var(--surface-2);border:1px solid var(--border);border-radius:4px;padding:10px;font-size:10px;font-family:var(--font-mono);color:var(--text);overflow-x:auto;margin:0 0 6px 0;white-space:pre-wrap;word-break:break-all"></pre>
+
+          <button class="secondary" id="hooks-copy-win-claude-${projectId}" style="font-size:10px;padding:4px 10px;margin-bottom:10px">Copy</button>
+
+          <div style="font-size:10px;font-weight:600;color:var(--text);margin:0 0 4px">Codex - <code>~/.codex/config.toml</code></div>
+
+          <pre id="hooks-win-codex-${projectId}" style="background:var(--surface-2);border:1px solid var(--border);border-radius:4px;padding:10px;font-size:10px;font-family:var(--font-mono);color:var(--text);overflow-x:auto;margin:0 0 6px 0;white-space:pre-wrap;word-break:break-all"></pre>
+
+          <button class="secondary" id="hooks-copy-win-codex-${projectId}" style="font-size:10px;padding:4px 10px">Copy</button>
+
+        </div>
+
+      </details>
+
+      <details style="border:1px solid var(--border);border-radius:4px;background:var(--surface-1)">
+
+        <summary style="cursor:pointer;padding:8px 10px;font-size:10px;font-weight:600;color:var(--text)">macOS / Linux manual config</summary>
+
+        <div style="padding:0 10px 10px">
+
+          <div style="font-size:10px;font-weight:600;color:var(--text);margin:8px 0 4px">Claude Code - <code>~/.claude/settings.json</code></div>
+
+          <pre id="hooks-unix-claude-${projectId}" style="background:var(--surface-2);border:1px solid var(--border);border-radius:4px;padding:10px;font-size:10px;font-family:var(--font-mono);color:var(--text);overflow-x:auto;margin:0 0 6px 0;white-space:pre-wrap;word-break:break-all"></pre>
+
+          <button class="secondary" id="hooks-copy-unix-claude-${projectId}" style="font-size:10px;padding:4px 10px;margin-bottom:10px">Copy</button>
+
+          <div style="font-size:10px;font-weight:600;color:var(--text);margin:0 0 4px">Codex - <code>~/.codex/config.toml</code></div>
+
+          <pre id="hooks-unix-codex-${projectId}" style="background:var(--surface-2);border:1px solid var(--border);border-radius:4px;padding:10px;font-size:10px;font-family:var(--font-mono);color:var(--text);overflow-x:auto;margin:0 0 6px 0;white-space:pre-wrap;word-break:break-all"></pre>
+
+          <button class="secondary" id="hooks-copy-unix-codex-${projectId}" style="font-size:10px;padding:4px 10px">Copy</button>
+
+        </div>
+
+      </details>
+
+    </div>
+
+  </details>`;
+
+    html += `<div style="margin-bottom:14px;padding:10px 12px;border:1px solid var(--border);border-radius:6px;background:var(--surface-2)">
+
+      <div style="font-weight:600;font-size:11px;color:var(--text);margin-bottom:4px">Quick setup</div>
+
+      <div style="font-size:10px;color:var(--muted);margin-bottom:8px">Tell Meridian where your code lives and how to run tests.</div>
+
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px 12px;margin-bottom:8px">
+
+        <label style="font-size:10px;color:var(--muted)">repo_path<br><input id="exec-ez-repo_path-${projectId}" type="text" placeholder="Abs path to repo root" style="width:100%;background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:3px 6px;margin-top:2px" value="${escapeHtml(String(_ezCfg.repo_path || ''))}"></label>
+
+        <label style="font-size:10px;color:var(--muted)">test_cmd<br><input id="exec-ez-test_cmd-${projectId}" type="text" placeholder="pixi run test" style="width:100%;background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:3px 6px;margin-top:2px" value="${escapeHtml(String(_ezCfg.test_cmd || ''))}"></label>
+
+      </div>
+
+      <div style="display:flex;gap:8px;align-items:center">
+
+        <button id="exec-ez-save-${projectId}" class="primary" style="font-size:10px;padding:3px 10px">Save</button>
+
+        <span id="exec-ez-status-${projectId}" style="font-size:10px;color:var(--muted);min-height:14px"></span>
+
+      </div>
+
+    </div>`;
+
+    html += `<details id="adv-settings-${projectId}" ${_advOpen ? 'open' : ''} style="margin-bottom:14px;border:1px solid var(--border);border-radius:6px;background:var(--surface-2)">
+
+      <summary style="cursor:pointer;list-style:none;padding:10px 12px;display:flex;justify-content:space-between;align-items:center;gap:8px">
+
+        <span style="font-weight:600;font-size:11px;color:var(--muted)">Advanced settings</span>
+
+        <span class="meridian-caret" style="display:inline-block;font-size:10px;color:var(--muted);transition:transform 120ms ease;flex-shrink:0;${_advOpen ? 'transform:rotate(90deg)' : ''}">▶</span>
+
+      </summary>
+
+      <div style="padding:0 12px 12px">`;
+
+  }
+
+
+
   // "Connect claude.ai browser" card — always shown regardless of hosted/self-hosted
 
   const browserConnectorAccountNote = isHostedMode() ? `
@@ -8419,7 +8588,7 @@ async function loadSettingsTab(projectId) {
 
 
 
-  html += `<details class="meridian-disclosure" style="margin-bottom:16px;border:1px solid var(--border);border-radius:6px;background:var(--surface-2)">
+  if (!isHostedMode()) html += `<details class="meridian-disclosure" style="margin-bottom:16px;border:1px solid var(--border);border-radius:6px;background:var(--surface-2)">
 
     <summary style="cursor:pointer;list-style:none;padding:10px 12px;display:flex;justify-content:space-between;align-items:center;gap:8px">
 
@@ -8470,6 +8639,20 @@ async function loadSettingsTab(projectId) {
         <span id="hooks-token-status-${projectId}" style="font-size:10px;color:var(--muted)">${mcpData ? 'Generate an API key to replace the placeholder token in the hosted snippets below.' : 'Local mode - no Bearer token needed.'}</span>
 
       </div>
+
+      ${mcpData ? `<div style="margin-bottom:10px;padding:8px 10px;border:1px solid var(--border);border-radius:4px;background:var(--surface-1)">
+
+        <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:6px">
+
+          <span style="font-size:10px;font-weight:600;color:var(--text)">Existing API keys</span>
+
+          <button id="hooks-refresh-tokens-${projectId}" class="secondary" style="font-size:10px;padding:3px 8px">Refresh</button>
+
+        </div>
+
+        <div id="hooks-token-list-${projectId}" style="display:grid;gap:6px"></div>
+
+      </div>` : ''}
 
       <details style="margin-bottom:10px;border:1px solid var(--border);border-radius:4px;background:var(--surface-1)">
 
@@ -8861,7 +9044,9 @@ async function loadSettingsTab(projectId) {
 
     const httpText = `[mcp_servers.meridian]\ntype = "http"\nurl = "${mcpHttpUrl}"`;
 
-    const goalText = `/goal Complete pending sprint items in order. Done when all items\nmarked complete via complete_sprint_item(), pixi run test passes\n524+, generate_handoff() called. Stop after 40 turns or HITL.\n\nproject_id = "${displayPid}"`;
+    const _gCfg = (projectSettings && projectSettings.executor_config) || {};
+    const _gAutoText = `/goal Complete pending sprint items in order. Done when all items\nmarked complete via complete_sprint_item(), ${_gCfg.test_cmd || 'pixi run test'} passes${_gCfg.test_min != null ? '\n' + _gCfg.test_min + '+,' : ','} generate_handoff() called. Stop after 40 turns or HITL.\n\nproject_id = "${displayPid}"`;
+    const goalText = _gCfg.goal_template || _gAutoText;
 
     // Hosted .mcp.json for Claude Code
     const _mcpUrl = (state.serverConfig?.base_url || "https://usemeridian.us") + "/mcp";
@@ -8883,7 +9068,7 @@ async function loadSettingsTab(projectId) {
 
       ${isHostedMode() ? `<div style="margin-bottom:16px;padding:12px;background:var(--surface-1);border:1px solid var(--accent,#a8ff78)44;border-radius:6px">
         <div style="font-size:11px;font-weight:700;color:var(--text);margin-bottom:6px">Claude Code (Hosted)</div>
-        <div style="font-size:10px;color:var(--muted);margin-bottom:8px">Save as <code>.mcp.json</code> in your project root. Get your key from <a href="#" onclick="document.querySelector('[data-vtab=settings]')?.click();return false;" style="color:var(--accent,#a8ff78)">Settings → Browser connector → Generate API key</a>.</div>
+        <div style="font-size:10px;color:var(--muted);margin-bottom:8px">Save as <code>.mcp.json</code> in your project root. Get your key from the Auto-checkpoint hooks section above.</div>
         <pre id="hosted-mcp-json-${escapeHtml(projectId)}" style="background:var(--surface-0);border:1px solid var(--border);border-radius:4px;padding:10px;font-size:10px;font-family:var(--font-mono);color:var(--text);overflow-x:auto;margin:0 0 6px 0;white-space:pre-wrap;word-break:break-all"></pre>
         <button class="secondary" id="copy-hosted-mcp-json-${escapeHtml(projectId)}" style="font-size:10px;padding:4px 10px">Copy .mcp.json</button>
         ${mcpData && mcpData.github_repo ? `<button id="push-mcp-template-${escapeHtml(projectId)}" class="secondary" style="font-size:10px;padding:4px 10px;margin-left:4px" title="Push template.mcp.json to ${escapeHtml(mcpData.github_repo || '')}">Push to repo ↗</button>` : ""}
@@ -8905,9 +9090,19 @@ async function loadSettingsTab(projectId) {
 
       <div style="font-size:10px;font-weight:600;color:var(--text);margin-bottom:4px;margin-top:8px">/goal template</div>
 
-      <pre id="codex-goal-${escapeHtml(projectId)}" style="background:var(--surface-1);border:1px solid var(--border);border-radius:4px;padding:10px;font-size:10px;font-family:var(--font-mono);color:var(--text);overflow-x:auto;margin:0 0 6px 0;white-space:pre-wrap;word-break:break-all"></pre>
+      <textarea id="codex-goal-${escapeHtml(projectId)}" rows="6" style="width:100%;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;padding:10px;font-size:10px;font-family:var(--font-mono);color:var(--text);resize:vertical;margin:0 0 4px 0;white-space:pre;box-sizing:border-box"></textarea>
 
-      <button class="secondary" id="codex-copy-goal-${escapeHtml(projectId)}" style="font-size:10px;padding:4px 10px">Copy</button>
+      <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
+
+        <button class="secondary" id="codex-copy-goal-${escapeHtml(projectId)}" style="font-size:10px;padding:4px 10px">Copy</button>
+
+        <button class="primary" id="codex-save-goal-${escapeHtml(projectId)}" style="font-size:10px;padding:4px 10px">Save</button>
+
+        <button class="secondary" id="codex-regen-goal-${escapeHtml(projectId)}" style="font-size:10px;padding:4px 10px">Regenerate</button>
+
+        <span id="codex-goal-status-${escapeHtml(projectId)}" style="font-size:10px;color:var(--muted)"></span>
+
+      </div>
 
     </div>`;
 
@@ -8925,7 +9120,7 @@ async function loadSettingsTab(projectId) {
 
       if (httpEl) httpEl.textContent = httpText;
 
-      if (goalEl) goalEl.textContent = goalText;
+      if (goalEl) goalEl.value = goalText;
 
       function _codexCopySetup(btnId, text) {
 
@@ -8953,7 +9148,52 @@ async function loadSettingsTab(projectId) {
 
       _codexCopySetup(`codex-copy-http-${projectId}`, httpText);
 
-      _codexCopySetup(`codex-copy-goal-${projectId}`, goalText);
+      // Goal copy reads live textarea value
+      const copyGoalBtn = document.getElementById(`codex-copy-goal-${projectId}`);
+      if (copyGoalBtn && goalEl) {
+        copyGoalBtn.onclick = async () => {
+          try {
+            await navigator.clipboard.writeText(goalEl.value);
+            copyGoalBtn.textContent = 'Copied!';
+            setTimeout(() => { copyGoalBtn.textContent = 'Copy'; }, 1800);
+          } catch(e) { copyGoalBtn.textContent = 'Select and copy manually'; }
+        };
+      }
+
+      const saveGoalBtn = document.getElementById(`codex-save-goal-${projectId}`);
+      const goalStatusEl = document.getElementById(`codex-goal-status-${projectId}`);
+      if (saveGoalBtn && goalEl) {
+        saveGoalBtn.onclick = async () => {
+          saveGoalBtn.disabled = true;
+          try {
+            const curCfg = (projectSettings && projectSettings.executor_config) || {};
+            await saveProjectSettings(projectId, { executor_config: { ...curCfg, goal_template: goalEl.value } });
+            if (goalStatusEl) { goalStatusEl.textContent = 'Saved.'; setTimeout(() => { if (goalStatusEl) goalStatusEl.textContent = ''; }, 2000); }
+          } catch(e) {
+            if (goalStatusEl) goalStatusEl.textContent = `Failed: ${String(e)}`;
+          } finally {
+            saveGoalBtn.disabled = false;
+          }
+        };
+      }
+
+      const regenGoalBtn = document.getElementById(`codex-regen-goal-${projectId}`);
+      if (regenGoalBtn && goalEl) {
+        regenGoalBtn.onclick = async () => {
+          goalEl.value = _gAutoText;
+          regenGoalBtn.disabled = true;
+          try {
+            const curCfg = (projectSettings && projectSettings.executor_config) || {};
+            const { goal_template: _gt, ...restCfg } = curCfg;
+            await saveProjectSettings(projectId, { executor_config: restCfg });
+            if (goalStatusEl) { goalStatusEl.textContent = 'Regenerated.'; setTimeout(() => { if (goalStatusEl) goalStatusEl.textContent = ''; }, 2000); }
+          } catch(e) {
+            if (goalStatusEl) goalStatusEl.textContent = `Failed: ${String(e)}`;
+          } finally {
+            regenGoalBtn.disabled = false;
+          }
+        };
+      }
 
       const pushBtn = document.getElementById(`push-mcp-template-${projectId}`);
       if (pushBtn) {
@@ -10190,7 +10430,8 @@ async function loadSettingsTab(projectId) {
 
   }
 
-
+  // Close the Advanced collapsible opened for hosted users
+  if (isHostedMode()) html += '</div></details>';
 
   try {
     body.innerHTML = html;
@@ -10201,6 +10442,42 @@ async function loadSettingsTab(projectId) {
   }
 
   if (isDemoMode()) hideDemoAdminControls();
+
+  // Easy-setup mini executor save (hosted only)
+  setTimeout(() => {
+    const ezSaveBtn = document.getElementById(`exec-ez-save-${projectId}`);
+    const ezStatus = document.getElementById(`exec-ez-status-${projectId}`);
+    if (!ezSaveBtn) return;
+    ezSaveBtn.onclick = async () => {
+      ezSaveBtn.disabled = true;
+      const repoPath = (document.getElementById(`exec-ez-repo_path-${projectId}`)?.value || '').trim();
+      const testCmd = (document.getElementById(`exec-ez-test_cmd-${projectId}`)?.value || '').trim();
+      const curCfg = (projectSettings && projectSettings.executor_config) || {};
+      const cfg = { ...curCfg };
+      if (repoPath) cfg.repo_path = repoPath; else delete cfg.repo_path;
+      if (testCmd) cfg.test_cmd = testCmd; else delete cfg.test_cmd;
+      try {
+        await saveProjectSettings(projectId, { executor_config: cfg });
+        if (ezStatus) { ezStatus.textContent = 'Saved.'; setTimeout(() => { if (ezStatus) ezStatus.textContent = ''; }, 2000); }
+      } catch(e) {
+        if (ezStatus) ezStatus.textContent = `Save failed: ${String(e)}`;
+      } finally {
+        ezSaveBtn.disabled = false;
+      }
+    };
+  }, 0);
+
+  // Advanced settings toggle — persist open/closed state per project (hosted only)
+  setTimeout(() => {
+    const advDet = document.getElementById(`adv-settings-${projectId}`);
+    if (!advDet) return;
+    const advKey = `meridian.settings.adv.${projectId}`;
+    advDet.addEventListener('toggle', () => {
+      try { localStorage.setItem(advKey, advDet.open ? '1' : '0'); } catch(e) {}
+      const caret = advDet.querySelector(':scope > summary .meridian-caret');
+      if (caret) caret.style.transform = advDet.open ? 'rotate(90deg)' : '';
+    });
+  }, 0);
 
 
 
@@ -10328,6 +10605,92 @@ async function loadSettingsTab(projectId) {
 
     };
 
+    const tokenListEl = document.getElementById(`hooks-token-list-${projectId}`);
+
+    const renderHooksTokenList = (tokens) => {
+
+      if (!tokenListEl) return;
+
+      if (!Array.isArray(tokens) || !tokens.length) {
+
+        tokenListEl.innerHTML = `<div style="font-size:10px;color:var(--muted)">No API keys yet. Generate one above to prefill the hosted snippets.</div>`;
+
+        return;
+
+      }
+
+      tokenListEl.innerHTML = tokens.map((token) => `
+        <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;padding:6px 8px;border:1px solid var(--border);border-radius:4px;background:var(--surface-2)">
+          <div style="min-width:0;flex:1">
+            <div style="font-size:10px;color:var(--text);font-family:var(--font-mono);word-break:break-all">${escapeHtml(token.masked_token || 'sk_meridian_...')}</div>
+            <div style="font-size:9px;color:var(--muted);margin-top:2px">${escapeHtml(token.label || 'API key')} - ${escapeHtml(token.created_at || '')}</div>
+          </div>
+          <button class="secondary" data-token-id="${escapeHtml(token.id || '')}" style="font-size:10px;padding:3px 8px;color:var(--danger,#ef4444)">Revoke</button>
+        </div>
+      `).join('');
+
+      tokenListEl.querySelectorAll('[data-token-id]').forEach((btn) => {
+
+        btn.onclick = async () => {
+
+          const tokenId = btn.getAttribute('data-token-id');
+
+          if (!tokenId) return;
+
+          if (!confirm('Revoke this API key? Existing clients using it will stop working.')) return;
+
+          btn.disabled = true;
+
+          try {
+
+            await api(`/auth/tokens/${tokenId}`, { method: 'DELETE' });
+
+            const statusEl = document.getElementById(`hooks-token-status-${projectId}`);
+
+            if (statusEl) statusEl.textContent = 'API key revoked.';
+
+            await loadHooksTokens();
+
+          } catch (e) {
+
+            btn.disabled = false;
+
+            const statusEl = document.getElementById(`hooks-token-status-${projectId}`);
+
+            if (statusEl) statusEl.textContent = `error: ${escapeHtml(String(e))}`;
+
+          }
+
+        };
+
+      });
+
+    };
+
+    async function loadHooksTokens() {
+
+      if (!tokenListEl) return;
+
+      tokenListEl.innerHTML = `<div style="font-size:10px;color:var(--muted)">Loading API keys...</div>`;
+
+      try {
+
+        const tokens = await api('/auth/tokens');
+
+        renderHooksTokenList(tokens);
+
+      } catch (e) {
+
+        tokenListEl.innerHTML = `<div style="font-size:10px;color:var(--danger,#ef4444)">Could not load API keys.</div>`;
+
+        const statusEl = document.getElementById(`hooks-token-status-${projectId}`);
+
+        if (statusEl) statusEl.textContent = `error: ${escapeHtml(String(e))}`;
+
+      }
+
+    }
+
 
 
     const wireCopy = (buttonId, targetId) => {
@@ -10396,6 +10759,7 @@ async function loadSettingsTab(projectId) {
           currentToken = tok.token; // Share with browser connector section
 
           renderHooks();
+          await loadHooksTokens();
 
           // Also update hosted .mcp.json box if present
           const hostedMcpEl2 = document.getElementById(`hosted-mcp-json-${projectId}`);
@@ -10422,9 +10786,30 @@ async function loadSettingsTab(projectId) {
 
     }
 
+    const refreshBtn = document.getElementById(`hooks-refresh-tokens-${projectId}`);
 
+    if (refreshBtn) {
+
+      refreshBtn.onclick = async () => {
+
+        refreshBtn.disabled = true;
+
+        try {
+
+          await loadHooksTokens();
+
+        } finally {
+
+          refreshBtn.disabled = false;
+
+        }
+
+      };
+
+    }
 
     renderHooks();
+    if (tokenListEl) loadHooksTokens();
 
   }, 0);
 

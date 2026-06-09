@@ -5113,6 +5113,53 @@ async def _resolve_hook_db(request: Request) -> Any:
     return conn
 
 
+def _hook_script_path(filename: str) -> Path:
+    return Path(__file__).parent.parent / filename
+
+
+def _mask_api_token_hash(token_hash: str | None) -> str:
+    """Return a stable masked display string for a stored API token hash."""
+    value = (token_hash or "").strip()
+    if len(value) >= 10:
+        return f"sk_meridian_{value[:6]}...{value[-4:]}"
+    return "sk_meridian_..."
+
+
+async def _get_authenticated_tenant(request: Request) -> dict[str, Any]:
+    """Resolve the current hosted tenant from session cookie or bearer token."""
+    from .hosted import get_current_tenant, get_tenant_from_bearer
+
+    tenant = None
+    try:
+        tenant = await get_current_tenant(request)
+    except HTTPException:
+        pass
+    if tenant is None:
+        try:
+            tenant = await get_tenant_from_bearer(request)
+        except HTTPException:
+            pass
+    if tenant is None:
+        raise HTTPException(status_code=401, detail="authentication required")
+    return tenant
+
+
+@app.get("/hooks.ps1")
+async def get_hooks_ps1() -> PlainTextResponse:
+    script_path = _hook_script_path("hooks.ps1")
+    if not script_path.exists():
+        raise HTTPException(status_code=404, detail="hooks.ps1 not found")
+    return PlainTextResponse(script_path.read_text(encoding="utf-8"))
+
+
+@app.get("/hooks.sh")
+async def get_hooks_sh() -> PlainTextResponse:
+    script_path = _hook_script_path("hooks.sh")
+    if not script_path.exists():
+        raise HTTPException(status_code=404, detail="hooks.sh not found")
+    return PlainTextResponse(script_path.read_text(encoding="utf-8"))
+
+
 @app.post("/hooks/session-start")
 async def hooks_session_start(body: dict[str, Any], request: Request) -> dict[str, Any]:
     """Claude Code / Codex SessionStart hook.
@@ -5747,21 +5794,7 @@ async def create_api_token(request: Request) -> dict[str, Any]:
     Returns ``{"token": "sk_meridian_...", "id": "...", "label": "..."}``
     where ``token`` is shown exactly once and never stored in plain text.
     """
-    from .hosted import get_current_tenant, get_tenant_from_bearer
-
-    # Accept either session cookie or existing bearer token
-    tenant = None
-    try:
-        tenant = await get_current_tenant(request)
-    except HTTPException:
-        pass
-    if tenant is None:
-        try:
-            tenant = await get_tenant_from_bearer(request)
-        except HTTPException:
-            pass
-    if tenant is None:
-        raise HTTPException(status_code=401, detail="authentication required")
+    tenant = await _get_authenticated_tenant(request)
 
     body = {}
     try:
@@ -5779,18 +5812,38 @@ async def create_api_token(request: Request) -> dict[str, Any]:
     }
 
 
+@app.get("/auth/tokens")
+async def list_api_tokens(request: Request) -> list[dict[str, Any]]:
+    """List API bearer tokens for the authenticated tenant."""
+    tenant = await _get_authenticated_tenant(request)
+    db = request.app.state.db
+    tokens = await db_module.list_api_tokens(db, tenant["id"])
+    return [
+        {
+            "id": token["id"],
+            "label": token.get("label"),
+            "created_at": token.get("created_at"),
+            "masked_token": _mask_api_token_hash(token.get("token_hash")),
+        }
+        for token in tokens
+    ]
+
+
+@app.delete("/auth/tokens/{token_id}", status_code=204)
+async def delete_api_token(token_id: str, request: Request) -> Response:
+    """Revoke an API bearer token for the authenticated tenant."""
+    tenant = await _get_authenticated_tenant(request)
+    db = request.app.state.db
+    deleted = await db_module.delete_api_token(db, tenant["id"], token_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="token not found")
+    return Response(status_code=204)
+
+
 @app.get("/auth/me")
 async def get_me(request: Request) -> dict[str, Any]:
     """Return the authenticated tenant's profile (session cookie or bearer)."""
-    from .hosted import get_current_tenant, get_tenant_from_bearer
-
-    tenant = None
-    try:
-        tenant = await get_current_tenant(request)
-    except HTTPException:
-        pass
-    if tenant is None:
-        tenant = await get_tenant_from_bearer(request)
+    tenant = await _get_authenticated_tenant(request)
     safe = {k: v for k, v in tenant.items() if k not in ("neon_db_url", "github_pat")}
     safe["github_connected"] = bool(tenant.get("github_pat"))
     return safe

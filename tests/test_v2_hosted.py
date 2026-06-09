@@ -147,6 +147,51 @@ def test_bearer_auth_me_returns_401_without_token(client):
     assert r.status_code == 401
 
 
+def test_bearer_auth_tokens_list_and_revoke_with_valid_token(monkeypatch, tmp_path):
+    """GET/DELETE /auth/tokens lists masked keys and revokes only the target key."""
+    from meridian import db as db_module
+
+    async def _setup(db):
+        tenant = await db_module.upsert_tenant(db, "tokens-list@example.com")
+        raw_a, row_a = await db_module.create_api_token(db, tenant["id"], label="first")
+        raw_b, row_b = await db_module.create_api_token(db, tenant["id"], label="second")
+        return raw_a, raw_b, row_a, row_b
+
+    with _make_hosted_client(monkeypatch, tmp_path) as client:
+        _raw_a, raw_token, row_a, row_b = _run(_setup(client.app.state.db))
+
+        listed = client.get(
+            "/auth/tokens",
+            headers={"Authorization": f"Bearer {raw_token}"},
+        )
+        assert listed.status_code == 200
+        body = listed.json()
+        assert {item["id"] for item in body} == {row_a["id"], row_b["id"]}
+        assert {item["label"] for item in body} == {"first", "second"}
+        assert all(item["masked_token"].startswith("sk_meridian_") for item in body)
+        assert all("token_hash" not in item for item in body)
+
+        deleted = client.delete(
+            f"/auth/tokens/{row_a['id']}",
+            headers={"Authorization": f"Bearer {raw_token}"},
+        )
+        assert deleted.status_code == 204
+
+        listed_again = client.get(
+            "/auth/tokens",
+            headers={"Authorization": f"Bearer {raw_token}"},
+        )
+        assert listed_again.status_code == 200
+        remaining_ids = [item["id"] for item in listed_again.json()]
+        assert remaining_ids == [row_b["id"]]
+
+        missing = client.delete(
+            f"/auth/tokens/{row_a['id']}",
+            headers={"Authorization": f"Bearer {raw_token}"},
+        )
+        assert missing.status_code == 404
+
+
 # ---------------------------------------------------------------------------
 # Stripe webhook signature verification
 # ---------------------------------------------------------------------------

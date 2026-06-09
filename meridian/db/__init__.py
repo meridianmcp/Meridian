@@ -4783,6 +4783,34 @@ async def create_api_token(
     return raw, _row_to_dict(row)
 
 
+async def list_api_tokens(
+    db: aiosqlite.Connection,
+    tenant_id: str,
+) -> list[dict[str, Any]]:
+    """Return API token rows for a tenant, newest first."""
+    async with db.execute(
+        "SELECT id, label, token_hash, created_at FROM api_tokens "
+        "WHERE tenant_id = ? ORDER BY created_at DESC, id DESC",
+        (tenant_id,),
+    ) as cur:
+        rows = await cur.fetchall()
+    return [_row_to_dict(r) for r in rows if r is not None]
+
+
+async def delete_api_token(
+    db: aiosqlite.Connection,
+    tenant_id: str,
+    token_id: str,
+) -> bool:
+    """Delete one API token for a tenant. Returns True when a row was removed."""
+    cur = await db.execute(
+        "DELETE FROM api_tokens WHERE tenant_id = ? AND id = ?",
+        (tenant_id, token_id),
+    )
+    await db.commit()
+    return cur.rowcount > 0
+
+
 async def get_tenant_from_token_hash(
     db: aiosqlite.Connection,
     token_hash: str,
