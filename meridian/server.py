@@ -5322,6 +5322,13 @@ async def hooks_session_start(body: dict[str, Any], request: Request) -> dict[st
         for t in recent[:5]:
             lines.append(f"- [{t.get('status','?').upper()}] {str(t.get('description',''))[:120]}")
     lines.append(f"\nSESSION ID: {result.get('session_id', '')}")
+    if sprint_items:
+        top_item_id = sprint_items[0].get("id", "")
+        lines.append(
+            f"\nINSTRUCTION: Your first MCP call must be claim_sprint_item on the top "
+            f"pending sprint item before starting any work. "
+            f"Top item id: {top_item_id}"
+        )
     additional_context = "\n".join(lines)
     return {"hookSpecificOutput": {"additionalContext": additional_context}}
 
@@ -6551,6 +6558,11 @@ async def _dispatch_mcp_tool(
             db, args["project_id"],
             status=args.get("status"),
         )
+    if name == "claim_sprint_item":
+        item = await db_module.claim_sprint_item(db, args["project_id"], args["item_id"])
+        if item is None:
+            raise ValueError("sprint item not found")
+        return item
     if name == "complete_sprint_item":
         item = await db_module.complete_sprint_item(
             db, args["project_id"], args["item_id"],

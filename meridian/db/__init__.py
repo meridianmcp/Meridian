@@ -1589,7 +1589,13 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_project_icon(db)
     await _migrate_tenants_is_internal(db)
     await _migrate_workspace_members_rbac(db)
+    await _migrate_sprint_item_claimed_at(db)
     return db
+
+
+async def _migrate_sprint_item_claimed_at(db: aiosqlite.Connection) -> None:
+    """Add claimed_at to sprint_items for the claim_sprint_item MCP tool."""
+    await _migrate_add_column_if_missing(db, "sprint_items", "claimed_at", "TEXT")
 
 
 async def _migrate_workspace_members_rbac(db: aiosqlite.Connection) -> None:
@@ -3492,6 +3498,39 @@ async def start_sprint_item(
     return await _update_sprint_item_status(
         db, project_id, item_id, "in_progress"
     )
+
+
+async def claim_sprint_item(
+    db: aiosqlite.Connection,
+    project_id: str,
+    item_id: str,
+) -> dict[str, Any] | None:
+    """Claim a sprint item: set status='in_progress' and claimed_at=now().
+
+    Rejects (raises ValueError) if already in_progress, done, failed, or skipped.
+    Returns None if the item doesn't exist.
+    """
+    item = await get_sprint_item(db, item_id)
+    if item is None:
+        return None
+    if item.get("project_id") != project_id:
+        return None
+    blocked = {"in_progress", "done", "failed", "skipped"}
+    if (item.get("status") or "pending") in blocked:
+        raise ValueError(
+            f"cannot claim item with status '{item.get('status')}'"
+        )
+    cursor = await db.execute(
+        "UPDATE sprint_items SET status = 'in_progress', claimed_at = datetime('now') "
+        "WHERE id = ? AND project_id = ?",
+        (item_id, project_id),
+    )
+    await db.commit()
+    if cursor.rowcount == 0:
+        return None
+    updated = await get_sprint_item(db, item_id)
+    _publish_project_event(project_id, "sprint_item_updated", {"item_id": item_id, "status": "in_progress"})
+    return updated
 
 
 async def fail_sprint_item(

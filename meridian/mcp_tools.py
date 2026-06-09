@@ -38,6 +38,7 @@ _TOOL_EXAMPLES: dict[str, str] = {
     "add_sprint_item": 'add_sprint_item(project_id="abc-123", title="Add OAuth login", item_group="auth")',
     "get_sprint_items": 'get_sprint_items(project_id="abc-123")',
     "complete_sprint_item": 'complete_sprint_item(item_id="item-uuid")',
+    "claim_sprint_item": 'claim_sprint_item(project_id="abc-123", item_id="item-uuid")',
     "heartbeat": 'heartbeat(session_id="session-uuid")',
     "list_projects": 'list_projects()',
     "get_sessions": 'get_sessions(project_id="abc-123")',
@@ -524,6 +525,15 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "required": ["project_id", "file", "anchor", "content"]},
      "outputSchema": {"type": "object", "properties": {
          "id": {"type": "string"}, "status": {"type": "string"}}, "required": ["id"]}},
+    {"name": "claim_sprint_item",
+     "description": "Claim a pending sprint item: sets status to in_progress and records claimed_at. Read-only: false. Rejects if the item is already in_progress, done, failed, or skipped.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"},
+         "item_id": {"type": "string"}},
+         "required": ["project_id", "item_id"]},
+     "outputSchema": {"type": "object", "properties": {
+         "id": {"type": "string"}, "status": {"type": "string"},
+         "claimed_at": {"type": "string"}}}},
 ]
 
 _READ_ONLY_TOOLS = {
