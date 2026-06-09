@@ -8765,6 +8765,16 @@ async function loadSettingsTab(projectId) {
 
             renderConfig();
 
+            // Also refresh the hosted .mcp.json box with the real token
+            const pid = copyBtn?.id?.replace('mcp-copy-config-', '') || '';
+            const hostedEl = document.getElementById(`hosted-mcp-json-${pid}`);
+            if (hostedEl && currentToken) {
+              const refreshedJson = JSON.stringify({mcpServers:{meridian:{command:"npx",args:["-y","mcp-remote","https://usemeridian.us/mcp"],env:{BEARER_TOKEN:currentToken}}}},null,2);
+              hostedEl.textContent = refreshedJson;
+              const copyHostedBtn = document.getElementById(`copy-hosted-mcp-json-${pid}`);
+              if (copyHostedBtn) copyHostedBtn.onclick = async () => { try { await navigator.clipboard.writeText(refreshedJson); copyHostedBtn.textContent='Copied!'; setTimeout(()=>{copyHostedBtn.textContent='Copy .mcp.json';},1800); } catch(e){} };
+            }
+
             copyBtn.disabled = false;
 
             if (copyStatus) copyStatus.textContent = 'Real key generated — save it, it won\'t be shown again.';
@@ -8853,7 +8863,7 @@ async function loadSettingsTab(projectId) {
         meridian: {
           command: "npx",
           args: ["-y", "mcp-remote", state.serverConfig?.base_url || "https://usemeridian.us" + "/mcp"],
-          env: { BEARER_TOKEN: "sk_meridian_YOUR_KEY_HERE" }
+          env: { BEARER_TOKEN: currentToken || "sk_meridian_YOUR_KEY_HERE" }
         }
       }
     }, null, 2);
