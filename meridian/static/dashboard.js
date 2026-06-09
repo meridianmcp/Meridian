@@ -12849,15 +12849,15 @@ async function refreshGoal(projectId) {
 
     const allLines = mainText.split('\n');
 
-    const titleLine = allLines[0] || '';
-
+    // Only use goal-title as blue header if the first line looks like a version label
+    // (e.g. "v1.0.0", "v2.3 — auth sprint"). Otherwise everything goes in the textarea.
+    const _firstLine = allLines[0] || '';
+    const _isVersionLabel = /^v\d+\.\d+/.test(_firstLine.trim()) || _firstLine.trim().length === 0;
+    const titleLine = _isVersionLabel ? _firstLine : '';
     const titleEl = document.getElementById(`goal-title-${projectId}`);
-
     if (titleEl) titleEl.textContent = titleLine;
 
-
-
-    const body = allLines.slice(1).join('\n').replace(/^\n/, '');
+    const body = (_isVersionLabel ? allLines.slice(1) : allLines).join('\n').replace(/^\n/, '');
 
     // Find CURRENT FOCUS as the start of editable zone
 
@@ -13565,7 +13565,7 @@ async function loadPinnedDecisions(projectId) {
 
           <div style="display:flex;align-items:center;gap:8px;min-width:0;flex:1">
 
-            <span style="display:inline-block;background:${color}22;color:${color};font-size:9px;font-weight:700;letter-spacing:.5px;padding:2px 6px;border-radius:3px;flex-shrink:0">${escapeHtml(cat)}</span>
+            <span class="decision-cat-tag" data-id="${escapeHtml(d.id)}" data-cat="${escapeHtml(cat)}" title="Click to change category" style="display:inline-block;background:${color}22;color:${color};font-size:9px;font-weight:700;letter-spacing:.5px;padding:2px 6px;border-radius:3px;flex-shrink:0;cursor:pointer">${escapeHtml(cat)} ▾</span>
 
             <span class="decision-title-view" data-id="${escapeHtml(d.id)}" title="Click to edit title" style="color:var(--accent);font-weight:600;font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;cursor:pointer">${escapeHtml(d.title || '')}</span>
 
@@ -13647,6 +13647,36 @@ async function loadPinnedDecisions(projectId) {
 
       el.onclick = () => showEdit(el.dataset.id);
 
+    });
+
+    // Category tag — inline dropdown to change category
+    const _CATS = ['TECHNICAL','STRATEGIC','ARCHITECTURAL','PRODUCT','TACTICAL','BUSINESS','COMPETITIVE'];
+    host.querySelectorAll('.decision-cat-tag').forEach(tag => {
+      tag.onclick = (e) => {
+        e.stopPropagation();
+        const id = tag.dataset.id;
+        const cur = tag.dataset.cat;
+        // Remove any existing dropdown
+        document.querySelectorAll('.decision-cat-dropdown').forEach(d => d.remove());
+        const sel = document.createElement('select');
+        sel.className = 'decision-cat-dropdown';
+        sel.style.cssText = 'position:absolute;z-index:9999;background:#1a1a1a;color:#f0f0f0;font-size:10px;font-weight:700;border:1px solid var(--border);border-radius:4px;padding:3px 5px;cursor:pointer';
+        _CATS.forEach(c => { const o = document.createElement('option'); o.value=c; o.textContent=c; if(c===cur) o.selected=true; sel.appendChild(o); });
+        sel.style.left = tag.getBoundingClientRect().left + 'px';
+        sel.style.top = (tag.getBoundingClientRect().bottom + window.scrollY) + 'px';
+        document.body.appendChild(sel);
+        sel.focus();
+        sel.onblur = () => sel.remove();
+        sel.onchange = async () => {
+          const newCat = sel.value;
+          sel.remove();
+          try {
+            const pid = host.closest('[data-project-tab]')?.dataset.projectTab || host.dataset.projectId || '';
+            await api(`/projects/${pid}/decisions-pinned/${id}`, { method: 'PATCH', body: JSON.stringify({ category: newCat }) });
+            await loadPinnedDecisions(pid);
+          } catch(err) { toast('category update failed: ' + err.message, true); }
+        };
+      };
     });
 
     host.querySelectorAll('.decision-edit-cancel').forEach(btn => {
