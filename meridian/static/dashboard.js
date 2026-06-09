@@ -12895,6 +12895,10 @@ async function refreshGoal(projectId) {
 
     }
 
+    const shippedEl = document.getElementById(`goal-shipped-${projectId}`);
+
+    if (shippedEl && !shippedEl.textContent.trim()) shippedEl.style.display = 'none';
+
     autosizeGoalField(ta);
 
 
