@@ -80,11 +80,12 @@ def test_auth_github_repo_connect_redirects_to_repo_callback(tmp_path, monkeypat
             return hosted_module._make_session_cookie(session["id"])
 
         cookie = asyncio.run(_setup())
+        client.cookies.set(hosted_module._SESSION_COOKIE, cookie)
         r = client.get(
             "/auth/github/repo-connect?project_id=proj-123",
-            cookies={hosted_module._SESSION_COOKIE: cookie},
             follow_redirects=False,
         )
+        client.cookies.clear()
         assert r.status_code == 302
         location = r.headers["location"]
         assert "redirect_uri=" in location
