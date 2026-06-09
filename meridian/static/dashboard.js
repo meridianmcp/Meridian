@@ -2118,6 +2118,10 @@ async function _refreshOnFocus() {
 
       refreshProjectCountBadges(pid),
 
+      refreshHitl(pid),
+
+      loadSprintBoard(pid),
+
     ]);
 
   } catch(_) {}
