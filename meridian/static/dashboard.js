@@ -10191,7 +10191,13 @@ async function loadSettingsTab(projectId) {
 
 
 
-  body.innerHTML = html;
+  try {
+    body.innerHTML = html;
+  } catch (renderErr) {
+    console.error('Settings render failed:', renderErr);
+    body.innerHTML = `<div style="color:var(--error);font-size:11px">Failed to render settings: ${escapeHtml(String(renderErr))}</div>`;
+    return;
+  }
 
   if (isDemoMode()) hideDemoAdminControls();
 
