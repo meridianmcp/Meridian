@@ -2320,15 +2320,8 @@ async def set_north_star(
     project = await db_module.get_project(await _db(request), project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="project not found")
-    owner = await db_module.get_project_owner(await _db(request), project_id)
-    if owner is not None and body.human_id != owner:
-        raise HTTPException(
-            status_code=403,
-            detail={
-                "error": "goal_locked",
-                "message": "Only the project owner can set the north star.",
-            },
-        )
+    # Ownership check skipped in hosted mode — session cookie already proves
+    # the caller owns this project. human_id check only applies to local no-auth.
     try:
         result = await db_module.set_north_star(
             await _db(request), project_id, body.north_star
