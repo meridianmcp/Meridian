@@ -3944,28 +3944,56 @@ async def workspace_accept(request: Request, token: str = "") -> HTMLResponse:
     if not token:
         return HTMLResponse("<h2>Invalid invite link.</h2><p><a href='/auth/login'>Sign in</a></p>", status_code=400)
     import hashlib
+    from fastapi.responses import RedirectResponse as _Redir
+    from .hosted import get_current_tenant as _get_cur_tenant  # noqa: PLC0415
+    # Check auth BEFORE consuming the token so unauthenticated users can be
+    # sent to login and then bounced back here to complete the accept.
+    try:
+        await _get_cur_tenant(request)
+        authenticated = True
+    except Exception:
+        authenticated = False
+    if not authenticated:
+        # Preserve the token across the login flow via ?next=
+        return _Redir(f"/auth/login?next=/workspace/accept?token={token}", status_code=302)
     token_hash = hashlib.sha256(token.encode()).hexdigest()
     db = request.app.state.db
     invite = await db_module.get_workspace_invite_by_token_hash(db, token_hash)
     if not invite:
         return HTMLResponse(
-            "<h2>Invite not found or already used.</h2><p><a href='/auth/login'>Sign in to Meridian</a></p>",
+            "<h2>Invite not found or already used.</h2><p><a href='/dashboard'>Go to dashboard</a></p>",
             status_code=404,
         )
     await db_module.accept_workspace_invite(db, invite["id"])
-    # Ensure a tenant account exists for the invited email
     await db_module.upsert_tenant(db, email=invite["email"])
-    from fastapi.responses import RedirectResponse as _Redir
-    # Send authenticated users straight to the dashboard so the workspace
-    # switcher re-renders immediately with the new workspace. Unauthenticated
-    # users go to the login page first.
-    from .hosted import get_current_tenant as _get_cur_tenant  # noqa: PLC0415
+    return _Redir("/dashboard", status_code=302)
+
+
+@app.post("/workspace/connect-db", status_code=200)
+async def workspace_connect_db(request: Request) -> dict[str, Any]:
+    """Store a custom Postgres connection string as the user's project DB."""
+    if not _hosted_mode():
+        raise HTTPException(status_code=404)
+    from .hosted import get_current_tenant
+    from .pg_adapter import open_pg_connection
+    tenant = await get_current_tenant(request)
+    body = await request.json()
+    url: str = (body.get("url") or "").strip()
+    if not url or not url.startswith("postgresql"):
+        raise HTTPException(status_code=422, detail="Invalid connection string")
+    # Validate connectivity before storing
     try:
-        await _get_cur_tenant(request)
-        dest = "/dashboard"
-    except Exception:
-        dest = "/auth/login"
-    return _Redir(dest, status_code=302)
+        test_conn = await open_pg_connection(url)
+        await test_conn.close()
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=f"Could not connect: {exc}") from exc
+    encrypted = db_module.encrypt_field(url)
+    auth_db = request.app.state.db
+    await db_module.update_tenant(auth_db, tenant["id"], neon_db_url=encrypted)
+    # Evict cached connection so next request re-opens with the new URL
+    from . import _deps
+    _deps._tenant_db_cache.pop(tenant["id"], None)
+    return {"connected": True}
 
 
 @app.get("/workspace/members")
