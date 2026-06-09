@@ -6856,7 +6856,7 @@ async def submit_feedback(request: Request) -> dict[str, str]:
 
     body = await request.json()
     feedback_type = body.get("type", "general")
-    message = body.get("message", "")
+    message = (body.get("message") or "").strip()
     email = body.get("email", tenant.get("email"))
 
     if not message:

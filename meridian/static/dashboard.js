@@ -224,6 +224,78 @@ function ensureTourButton() {
   footer.appendChild(btn);
 }
 
+// Small, unobtrusive "Send feedback" affordance in the sidebar footer. Tagged
+// data-demo-hide so the demo's hideDemoAdminControls() sweep removes it (it
+// POSTs to a write endpoint). Opens a lightweight modal — bug/feature/other.
+function ensureFeedbackButton() {
+  // The /feedback endpoint is hosted-only (404 otherwise) — don't show a
+  // button that would fail on self-hosted instances.
+  if (!isHostedMode()) return;
+  const footer = document.querySelector('.sidebar-footer');
+  if (!footer || document.getElementById('feedback-launch-btn')) return;
+  const btn = document.createElement('button');
+  btn.id = 'feedback-launch-btn';
+  btn.type = 'button';
+  btn.setAttribute('data-demo-hide', '');
+  btn.textContent = '💬 Send feedback';
+  btn.title = 'Report a bug or request a feature';
+  btn.style = 'display:block;width:100%;margin-top:6px;padding:5px 10px;font-size:10px;color:var(--muted);font-family:var(--font-mono);text-align:center;background:transparent;border:1px solid var(--border);border-radius:5px;cursor:pointer';
+  btn.onmouseenter = () => { btn.style.borderColor = 'var(--accent)'; btn.style.color = 'var(--accent)'; };
+  btn.onmouseleave = () => { btn.style.borderColor = 'var(--border)'; btn.style.color = 'var(--muted)'; };
+  btn.onclick = () => { try { showFeedbackModal(); } catch (e) {} };
+  footer.appendChild(btn);
+}
+
+function showFeedbackModal() {
+  if (document.getElementById('feedback-modal')) return;
+  const overlay = document.createElement('div');
+  overlay.id = 'feedback-modal';
+  overlay.style.cssText = 'position:fixed;inset:0;z-index:10000;background:rgba(0,0,0,.55);display:flex;align-items:center;justify-content:center';
+  const box = document.createElement('div');
+  box.style.cssText = 'background:var(--surface-0);border:1px solid var(--border);border-radius:8px;padding:24px 28px;width:440px;max-width:94vw;display:flex;flex-direction:column;gap:12px';
+  box.innerHTML = `
+    <div style="font-weight:700;font-size:14px">Send feedback</div>
+    <label style="font-size:11px;color:var(--muted)">Type
+      <select id="feedback-type" style="display:block;width:100%;margin-top:4px;font-size:12px;font-family:var(--font-mono);background:var(--surface-1);color:var(--text);border:1px solid var(--border);border-radius:5px;padding:6px 8px">
+        <option value="bug">Bug</option>
+        <option value="feature">Feature request</option>
+        <option value="other">Other</option>
+      </select>
+    </label>
+    <label style="font-size:11px;color:var(--muted)">Message
+      <textarea id="feedback-message" rows="4" placeholder="What's on your mind?" style="display:block;width:100%;margin-top:4px;box-sizing:border-box;font-size:12px;font-family:inherit;background:var(--surface-1);color:var(--text);border:1px solid var(--border);border-radius:5px;padding:7px 10px;resize:vertical"></textarea>
+    </label>
+    <label style="font-size:11px;color:var(--muted)">Email (optional)
+      <input id="feedback-email" type="email" placeholder="you@example.com" style="display:block;width:100%;margin-top:4px;box-sizing:border-box;font-size:12px;font-family:var(--font-mono);background:var(--surface-1);color:var(--text);border:1px solid var(--border);border-radius:5px;padding:6px 10px">
+    </label>
+    <div id="feedback-status" style="font-size:11px;min-height:16px;color:var(--muted)"></div>
+    <div style="display:flex;gap:8px;justify-content:flex-end">
+      <button id="feedback-cancel" class="secondary" style="font-size:12px">Cancel</button>
+      <button id="feedback-send" style="font-size:12px">Send</button>
+    </div>`;
+  overlay.appendChild(box);
+  document.body.appendChild(overlay);
+  const statusEl = box.querySelector('#feedback-status');
+  box.querySelector('#feedback-cancel').onclick = () => overlay.remove();
+  overlay.onclick = e => { if (e.target === overlay) overlay.remove(); };
+  box.querySelector('#feedback-send').onclick = async () => {
+    const type = box.querySelector('#feedback-type').value;
+    const message = box.querySelector('#feedback-message').value.trim();
+    const email = box.querySelector('#feedback-email').value.trim();
+    if (!message) { statusEl.textContent = 'Enter a message.'; statusEl.style.color = 'var(--danger,#dc2626)'; return; }
+    statusEl.textContent = 'Sending…'; statusEl.style.color = 'var(--muted)';
+    try {
+      await api('/feedback', { method: 'POST', body: JSON.stringify({ type, message, email }) });
+      statusEl.textContent = 'Thanks! Feedback sent.'; statusEl.style.color = '#059669';
+      setTimeout(() => overlay.remove(), 900);
+    } catch (e) {
+      statusEl.textContent = e.message || 'Could not send — please try again.';
+      statusEl.style.color = 'var(--danger,#dc2626)';
+    }
+  };
+  box.querySelector('#feedback-message').focus();
+}
+
 function showLocalServerControls() {
   // Server-management buttons are display:none by default in the template so they
   // never flash on hosted/demo loads. Reveal them only once we've confirmed this
@@ -239,6 +311,7 @@ const STORAGE_KEY = (k) => (isDemoMode() ? 'meridian_demo_' : 'meridian_') + k.r
 const QUEUE_DONE_PAGE_SIZE = 10;
 const NORTH_STAR_MIN_HEIGHT_PX = 180;
 const DEFAULT_MAX_PINNED_DECISIONS = 20;
+const DEFAULT_CONTEXT_THRESHOLD = 40;
 const GITHUB_OCTICON_PATH = 'M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z';
 
 function getPanelState(projectId) {
@@ -4456,6 +4529,11 @@ async function loadSettingsTab(projectId) {
       <label style="font-size:10px;color:var(--muted)">deploy_cmd<br><input id="exec-deploy_cmd-${projectId}" type="text" placeholder="git push / fly deploy" style="width:100%;background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:3px 6px;margin-top:2px" value="${escapeHtml(String(execCfg.deploy_cmd || ''))}"></label>
       <label style="font-size:10px;color:var(--muted)">branch<br><input id="exec-branch-${projectId}" type="text" placeholder="dev" style="width:100%;background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:3px 6px;margin-top:2px" value="${escapeHtml(String(execCfg.branch || ''))}"></label>
     </div>
+    <label style="display:block;font-size:10px;color:var(--muted);margin-top:10px">
+      Checkpoint after <span id="exec-context_threshold-val-${projectId}" style="color:var(--text);font-family:var(--font-mono)">${escapeHtml(String(execCfg.context_threshold || DEFAULT_CONTEXT_THRESHOLD))}</span> turns
+      <input id="exec-context_threshold-${projectId}" type="range" min="10" max="100" step="5" value="${escapeHtml(String(execCfg.context_threshold || DEFAULT_CONTEXT_THRESHOLD))}" style="width:100%;max-width:320px;margin-top:4px;display:block">
+      <span style="font-size:9px;color:var(--muted)">When a session passes this many turns, <code>get_context_block</code> nudges it to checkpoint.</span>
+    </label>
     <div style="margin-top:8px;display:flex;gap:8px;align-items:center">
       <button id="exec-save-${projectId}" class="primary" style="font-size:10px;padding:3px 10px">Save</button>
       <span id="exec-status-${projectId}" style="font-size:10px;color:var(--muted);min-height:14px"></span>
@@ -4466,6 +4544,12 @@ async function loadSettingsTab(projectId) {
     const saveBtn = document.getElementById(`exec-save-${projectId}`);
     const statusEl = document.getElementById(`exec-status-${projectId}`);
     if (!saveBtn) return;
+    // Live-update the slider's value label as the user drags.
+    const ctxSlider = document.getElementById(`exec-context_threshold-${projectId}`);
+    const ctxVal = document.getElementById(`exec-context_threshold-val-${projectId}`);
+    if (ctxSlider && ctxVal) {
+      ctxSlider.addEventListener('input', () => { ctxVal.textContent = ctxSlider.value; });
+    }
     saveBtn.onclick = async () => {
       saveBtn.disabled = true;
       const fields = ['repo_path', 'env_file', 'test_cmd', 'deploy_cmd', 'branch'];
@@ -4477,6 +4561,8 @@ async function loadSettingsTab(projectId) {
       const minEl = document.getElementById(`exec-test_min-${projectId}`);
       const minVal = minEl ? parseInt(minEl.value || '', 10) : NaN;
       if (!isNaN(minVal) && minVal > 0) cfg.test_min = minVal;
+      const ctxRaw = ctxSlider ? parseInt(ctxSlider.value || '', 10) : NaN;
+      if (!isNaN(ctxRaw)) cfg.context_threshold = Math.min(100, Math.max(10, ctxRaw));
       try {
         await saveProjectSettings(projectId, { executor_config: cfg });
         if (statusEl) statusEl.textContent = 'Saved.';
@@ -7405,6 +7491,7 @@ async function restoreTabs() {
   if (isHostedMode()) hideHostedAdminControls();
   showLocalServerControls();
   ensureTourButton();
+  ensureFeedbackButton();
   // v0.6.6 — EZ first-run wizard: if no projects exist, show the overlay
   // Skip in demo mode — demo DB always has projects seeded.
   if (state.projects.length === 0 && !isDemoMode()) {

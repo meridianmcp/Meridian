@@ -596,3 +596,67 @@ def test_free_tier_second_project_returns_403(monkeypatch, tmp_path):
             assert "Free tier" in r2.json()["detail"]
         finally:
             _deps._tenant_db_cache.pop(tenant["id"], None)
+
+
+# ---------------------------------------------------------------------------
+# Feedback (sidebar "Send feedback" form)
+# ---------------------------------------------------------------------------
+
+def test_feedback_requires_auth(monkeypatch, tmp_path):
+    """POST /feedback without a session returns 401."""
+    client = _make_hosted_client(monkeypatch, tmp_path)
+    with client:
+        r = client.post("/feedback", json={"type": "bug", "message": "hi"})
+        assert r.status_code == 401, r.text
+
+
+def test_feedback_submit_persists_and_validates(monkeypatch, tmp_path):
+    """Authenticated POST /feedback stores a row; empty message is rejected."""
+    from meridian import db as db_module
+    from meridian import _deps
+    from meridian import hosted as hosted_module
+
+    client = _make_hosted_client(monkeypatch, tmp_path)
+    with client:
+        db = client.app.state.db
+
+        async def _setup():
+            tenant = await db_module.upsert_tenant(db, "fb@meridian-test.invalid")
+            session = await db_module.create_user_session(
+                db, tenant["id"], "2099-01-01T00:00:00+00:00"
+            )
+            return tenant, session
+
+        tenant, session = _run(_setup())
+        # Route the tenant's project DB to the in-memory auth DB (production seam).
+        _deps._tenant_db_cache[tenant["id"]] = db
+        try:
+            client.cookies.set(
+                hosted_module._SESSION_COOKIE,
+                hosted_module._make_session_cookie(session["id"]),
+            )
+
+            # Empty message → 400
+            r_bad = client.post("/feedback", json={"type": "bug", "message": "  "})
+            assert r_bad.status_code == 400, r_bad.text
+
+            # Valid submission → 201 with an id
+            r_ok = client.post(
+                "/feedback",
+                json={"type": "feature", "message": "Please add dark mode", "email": "fb@x.io"},
+            )
+            assert r_ok.status_code == 201, r_ok.text
+            # The returned id is the freshly-inserted feedback row's uuid.
+            assert r_ok.json().get("id")
+            assert r_ok.json()["id"] != "demo"
+        finally:
+            _deps._tenant_db_cache.pop(tenant["id"], None)
+
+
+def test_dashboard_js_has_feedback_button():
+    """dashboard.js wires the sidebar Send-feedback button + modal."""
+    import pathlib
+    js = pathlib.Path("meridian/static/dashboard.js").read_text(encoding="utf-8")
+    assert "ensureFeedbackButton" in js
+    assert "showFeedbackModal" in js
+    assert "/feedback" in js
