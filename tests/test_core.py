@@ -6425,6 +6425,29 @@ def test_hooks_session_start_missing_project_id(client):
     assert r.status_code == 400
 
 
+def test_hooks_installer_scripts_are_served(client):
+    """GET /hooks.ps1 and /hooks.sh should serve the repo installer scripts."""
+    ps1 = client.get("/hooks.ps1")
+    assert ps1.status_code == 200
+    assert "text/plain" in ps1.headers.get("content-type", "")
+    assert "hooks.ps1" in ps1.text
+
+    sh = client.get("/hooks.sh")
+    assert sh.status_code == 200
+    assert "text/plain" in sh.headers.get("content-type", "")
+    assert "hooks.sh" in sh.text
+
+
+def test_dashboard_js_has_hooks_token_management_ui(client):
+    """dashboard.js exposes the hooks token list/revoke UI and updated hosted copy."""
+    js = client.get("/static/dashboard.js").text
+    assert "Get your key from the Auto-checkpoint hooks section above." in js
+    assert "hooks-token-list-${projectId}" in js
+    assert "hooks-refresh-tokens-${projectId}" in js
+    assert "/auth/tokens/${tokenId}" in js
+    assert "Existing API keys" in js
+
+
 def test_pin_decision_custom_category_http(client):
     """Custom free-text category is accepted."""
     project = client.post("/projects", json={"name": "v29-custom-cat-http"}).json()

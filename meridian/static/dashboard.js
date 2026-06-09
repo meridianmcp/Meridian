@@ -8344,6 +8344,20 @@ async function loadSettingsTab(projectId) {
 
       </div>
 
+      ${mcpData ? `<div style="margin-bottom:10px;padding:8px 10px;border:1px solid var(--border);border-radius:4px;background:var(--surface-1)">
+
+        <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:6px">
+
+          <span style="font-size:10px;font-weight:600;color:var(--text)">Existing API keys</span>
+
+          <button id="hooks-refresh-tokens-${projectId}" class="secondary" style="font-size:10px;padding:3px 8px">Refresh</button>
+
+        </div>
+
+        <div id="hooks-token-list-${projectId}" style="display:grid;gap:6px"></div>
+
+      </div>` : ''}
+
       <details style="margin-bottom:10px;border:1px solid var(--border);border-radius:4px;background:var(--surface-1)">
 
         <summary style="cursor:pointer;padding:8px 10px;font-size:10px;font-weight:600;color:var(--text)">Windows manual config</summary>
@@ -8625,6 +8639,20 @@ async function loadSettingsTab(projectId) {
         <span id="hooks-token-status-${projectId}" style="font-size:10px;color:var(--muted)">${mcpData ? 'Generate an API key to replace the placeholder token in the hosted snippets below.' : 'Local mode - no Bearer token needed.'}</span>
 
       </div>
+
+      ${mcpData ? `<div style="margin-bottom:10px;padding:8px 10px;border:1px solid var(--border);border-radius:4px;background:var(--surface-1)">
+
+        <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:6px">
+
+          <span style="font-size:10px;font-weight:600;color:var(--text)">Existing API keys</span>
+
+          <button id="hooks-refresh-tokens-${projectId}" class="secondary" style="font-size:10px;padding:3px 8px">Refresh</button>
+
+        </div>
+
+        <div id="hooks-token-list-${projectId}" style="display:grid;gap:6px"></div>
+
+      </div>` : ''}
 
       <details style="margin-bottom:10px;border:1px solid var(--border);border-radius:4px;background:var(--surface-1)">
 
@@ -9039,7 +9067,7 @@ async function loadSettingsTab(projectId) {
 
       ${isHostedMode() ? `<div style="margin-bottom:16px;padding:12px;background:var(--surface-1);border:1px solid var(--accent,#a8ff78)44;border-radius:6px">
         <div style="font-size:11px;font-weight:700;color:var(--text);margin-bottom:6px">Claude Code (Hosted)</div>
-        <div style="font-size:10px;color:var(--muted);margin-bottom:8px">Save as <code>.mcp.json</code> in your project root. Get your key from <a href="#" onclick="document.querySelector('[data-vtab=settings]')?.click();return false;" style="color:var(--accent,#a8ff78)">Settings → Browser connector → Generate API key</a>.</div>
+        <div style="font-size:10px;color:var(--muted);margin-bottom:8px">Save as <code>.mcp.json</code> in your project root. Get your key from the Auto-checkpoint hooks section above.</div>
         <pre id="hosted-mcp-json-${escapeHtml(projectId)}" style="background:var(--surface-0);border:1px solid var(--border);border-radius:4px;padding:10px;font-size:10px;font-family:var(--font-mono);color:var(--text);overflow-x:auto;margin:0 0 6px 0;white-space:pre-wrap;word-break:break-all"></pre>
         <button class="secondary" id="copy-hosted-mcp-json-${escapeHtml(projectId)}" style="font-size:10px;padding:4px 10px">Copy .mcp.json</button>
         ${mcpData && mcpData.github_repo ? `<button id="push-mcp-template-${escapeHtml(projectId)}" class="secondary" style="font-size:10px;padding:4px 10px;margin-left:4px" title="Push template.mcp.json to ${escapeHtml(mcpData.github_repo || '')}">Push to repo ↗</button>` : ""}
@@ -10576,6 +10604,92 @@ async function loadSettingsTab(projectId) {
 
     };
 
+    const tokenListEl = document.getElementById(`hooks-token-list-${projectId}`);
+
+    const renderHooksTokenList = (tokens) => {
+
+      if (!tokenListEl) return;
+
+      if (!Array.isArray(tokens) || !tokens.length) {
+
+        tokenListEl.innerHTML = `<div style="font-size:10px;color:var(--muted)">No API keys yet. Generate one above to prefill the hosted snippets.</div>`;
+
+        return;
+
+      }
+
+      tokenListEl.innerHTML = tokens.map((token) => `
+        <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;padding:6px 8px;border:1px solid var(--border);border-radius:4px;background:var(--surface-2)">
+          <div style="min-width:0;flex:1">
+            <div style="font-size:10px;color:var(--text);font-family:var(--font-mono);word-break:break-all">${escapeHtml(token.masked_token || 'sk_meridian_...')}</div>
+            <div style="font-size:9px;color:var(--muted);margin-top:2px">${escapeHtml(token.label || 'API key')} - ${escapeHtml(token.created_at || '')}</div>
+          </div>
+          <button class="secondary" data-token-id="${escapeHtml(token.id || '')}" style="font-size:10px;padding:3px 8px;color:var(--danger,#ef4444)">Revoke</button>
+        </div>
+      `).join('');
+
+      tokenListEl.querySelectorAll('[data-token-id]').forEach((btn) => {
+
+        btn.onclick = async () => {
+
+          const tokenId = btn.getAttribute('data-token-id');
+
+          if (!tokenId) return;
+
+          if (!confirm('Revoke this API key? Existing clients using it will stop working.')) return;
+
+          btn.disabled = true;
+
+          try {
+
+            await api(`/auth/tokens/${tokenId}`, { method: 'DELETE' });
+
+            const statusEl = document.getElementById(`hooks-token-status-${projectId}`);
+
+            if (statusEl) statusEl.textContent = 'API key revoked.';
+
+            await loadHooksTokens();
+
+          } catch (e) {
+
+            btn.disabled = false;
+
+            const statusEl = document.getElementById(`hooks-token-status-${projectId}`);
+
+            if (statusEl) statusEl.textContent = `error: ${escapeHtml(String(e))}`;
+
+          }
+
+        };
+
+      });
+
+    };
+
+    async function loadHooksTokens() {
+
+      if (!tokenListEl) return;
+
+      tokenListEl.innerHTML = `<div style="font-size:10px;color:var(--muted)">Loading API keys...</div>`;
+
+      try {
+
+        const tokens = await api('/auth/tokens');
+
+        renderHooksTokenList(tokens);
+
+      } catch (e) {
+
+        tokenListEl.innerHTML = `<div style="font-size:10px;color:var(--danger,#ef4444)">Could not load API keys.</div>`;
+
+        const statusEl = document.getElementById(`hooks-token-status-${projectId}`);
+
+        if (statusEl) statusEl.textContent = `error: ${escapeHtml(String(e))}`;
+
+      }
+
+    }
+
 
 
     const wireCopy = (buttonId, targetId) => {
@@ -10644,6 +10758,7 @@ async function loadSettingsTab(projectId) {
           currentToken = tok.token; // Share with browser connector section
 
           renderHooks();
+          await loadHooksTokens();
 
           // Also update hosted .mcp.json box if present
           const hostedMcpEl2 = document.getElementById(`hosted-mcp-json-${projectId}`);
@@ -10670,9 +10785,30 @@ async function loadSettingsTab(projectId) {
 
     }
 
+    const refreshBtn = document.getElementById(`hooks-refresh-tokens-${projectId}`);
 
+    if (refreshBtn) {
+
+      refreshBtn.onclick = async () => {
+
+        refreshBtn.disabled = true;
+
+        try {
+
+          await loadHooksTokens();
+
+        } finally {
+
+          refreshBtn.disabled = false;
+
+        }
+
+      };
+
+    }
 
     renderHooks();
+    if (tokenListEl) loadHooksTokens();
 
   }, 0);
 
