@@ -6864,7 +6864,10 @@ async def submit_feedback(request: Request) -> dict[str, str]:
 
     # Feedback goes in the auth DB (not project DB) — tenants table is there
     auth_db = request.app.state.db
-    feedback_id = await db_module.add_feedback(auth_db, tenant["id"], feedback_type, message, email)
+    try:
+        feedback_id = await db_module.add_feedback(auth_db, tenant["id"], feedback_type, message, email)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Feedback save failed: {exc}") from exc
     return {"id": feedback_id}
 
 

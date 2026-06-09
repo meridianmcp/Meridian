@@ -1918,13 +1918,17 @@ async def delete_project(db: aiosqlite.Connection, project_id: str) -> None:
         raise ValueError(f"{count} task(s) in_progress — complete or cancel first")
 
     # Cascade delete child rows first, then the project itself.
+    # Order matters: hitl_requests FK -> sessions, so hitl first.
     for stmt, params in [
+        ("DELETE FROM hitl_requests WHERE project_id = ?", (project_id,)),
         ("DELETE FROM sprint_items WHERE project_id = ?", (project_id,)),
         ("DELETE FROM task_log WHERE project_id = ?", (project_id,)),
         ("DELETE FROM sessions WHERE project_id = ?", (project_id,)),
         ("DELETE FROM sessions_archived WHERE project_id = ?", (project_id,)),
         ("DELETE FROM goal_states WHERE project_id = ?", (project_id,)),
-        ("DELETE FROM projects WHERE id = ?", (project_id,)),  # projects uses 'id'
+        ("DELETE FROM decisions_pinned WHERE project_id = ?", (project_id,)),
+        ("DELETE FROM project_notes WHERE project_id = ?", (project_id,)),
+        ("DELETE FROM projects WHERE id = ?", (project_id,)),
     ]:
         try:
             await db.execute(stmt, params)
