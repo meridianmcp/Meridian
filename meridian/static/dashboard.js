@@ -8135,9 +8135,9 @@ async function loadSettingsTab(projectId) {
 
       hooks: {
 
-        SessionStart: [{ type: 'command', command: start }],
+        SessionStart: [{ matcher: "", hooks: [{ type: 'command', command: start }] }],
 
-        Stop: [{ type: 'command', command: stop }],
+        Stop: [{ matcher: "", hooks: [{ type: 'command', command: stop }] }],
 
       },
 
@@ -10356,8 +10356,16 @@ async function loadSettingsTab(projectId) {
           const tok = await api('/auth/tokens', { method: 'POST', body: JSON.stringify({ label: 'hooks-config' }) });
 
           hooksToken = tok.token;
+          currentToken = tok.token; // Share with browser connector section
 
           renderHooks();
+
+          // Also update hosted .mcp.json box if present
+          const hostedMcpEl2 = document.getElementById(`hosted-mcp-json-${projectId}`);
+          if (hostedMcpEl2) {
+            const j = JSON.stringify({mcpServers:{meridian:{command:"npx",args:["-y","mcp-remote","https://usemeridian.us/mcp"],env:{BEARER_TOKEN:tok.token}}}},null,2);
+            hostedMcpEl2.textContent = j;
+          }
 
         } catch (e) {
 
