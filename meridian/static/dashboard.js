@@ -4504,11 +4504,15 @@ function buildTabBody(project) {
 
         const match = Array.from(sel.options).find(o => o.value === val && o.value !== '__custom__');
 
-        if (match) { sel.value = val; inp.style.display = 'none'; }
+        if (match) { sel.value = val; inp.value = val; inp.style.display = 'none'; }
 
         else if (val) { sel.value = '__custom__'; inp.style.display = 'block'; inp.value = val; }
 
-        else { if (sel.options.length) sel.selectedIndex = 0; inp.style.display = 'none'; }
+        else {
+          if (sel.options.length) sel.selectedIndex = 0;
+          inp.value = sel.value && sel.value !== '__custom__' ? sel.value : '';
+          inp.style.display = 'none';
+        }
 
       };
 
@@ -14348,10 +14352,14 @@ async function saveNorthStar(projectId) {
 async function saveSprint(projectId) {
 
   const ta = document.getElementById(`goal-sprint-${projectId}`);
+  const sel = document.getElementById(`goal-sprint-select-${projectId}`);
 
   if (!ta) return;
 
-  const val = ta.value.trim();
+  const rawVal = (ta.style.display === 'none' && sel && sel.value && sel.value !== '__custom__')
+    ? sel.value
+    : ta.value;
+  const val = rawVal.trim();
 
   if (!val) return;
 
