@@ -2088,6 +2088,30 @@ function _armAccountSwitchWatch(loadedEmail) {
 
   });
 
+  // Poll for new projects every 8 seconds — catches projects created via planning
+
+  // chat even when the dashboard tab is always visible (split screen, 2nd monitor)
+
+  setInterval(async () => {
+
+    try {
+
+      const fresh = await api('/projects');
+
+      const currentIds = new Set((state.projects || []).map(p => p.id));
+
+      const newProjects = fresh.filter(p => !currentIds.has(p.id));
+
+      if (newProjects.length > 0) {
+
+        await loadProjects();
+
+      }
+
+    } catch(_) {}
+
+  }, 8000);
+
   setInterval(_checkAccountSwitch, 60000);
 
 }
