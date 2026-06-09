@@ -53,12 +53,16 @@ jobs:
           key: playwright-${{ runner.os }}-${{ hashFiles('pixi.lock') }}
           restore-keys: playwright-${{ runner.os }}-
       - name: Cache Playwright browsers
+        id: playwright-cache
         uses: actions/cache@v4
         with:
           path: ~/.cache/ms-playwright
           key: playwright-${{ runner.os }}-${{ hashFiles('pixi.lock') }}
           restore-keys: playwright-${{ runner.os }}-
       - run: pixi run python -m playwright install chromium --with-deps
+        if: steps.playwright-cache.outputs.cache-hit != 'true'
+      - run: pixi run python -m playwright install chromium
+        if: steps.playwright-cache.outputs.cache-hit == 'true'
       - run: pixi run python -m pytest --ignore=tests/test_demo_ux.py -x -q
 
   playwright-tests:
@@ -83,12 +87,16 @@ jobs:
           key: playwright-${{ runner.os }}-${{ hashFiles('pixi.lock') }}
           restore-keys: playwright-${{ runner.os }}-
       - name: Cache Playwright browsers
+        id: playwright-cache
         uses: actions/cache@v4
         with:
           path: ~/.cache/ms-playwright
           key: playwright-${{ runner.os }}-${{ hashFiles('pixi.lock') }}
           restore-keys: playwright-${{ runner.os }}-
       - run: pixi run python -m playwright install chromium --with-deps
+        if: steps.playwright-cache.outputs.cache-hit != 'true'
+      - run: pixi run python -m playwright install chromium
+        if: steps.playwright-cache.outputs.cache-hit == 'true'
       - run: pixi run python -m pytest tests/test_demo_ux.py -x -q
 
   # ─── 2. Preview deploy (dev branch only) ────────────────────────────────────

@@ -7380,7 +7380,11 @@ def test_delete_project_uses_modal_not_prompt(client):
     js = client.get("/static/dashboard.js").text
     assert "delete-project-modal" in js, "modal overlay id must be present"
     assert "del-proj-confirm" in js, "confirm button must be present"
-    assert "window.prompt(" not in js, "brittle window.prompt must be gone"
+    # _deleteProject must use modal, not window.prompt (other functions may still use prompt)
+    fn_start = js.find("async function _deleteProject(")
+    fn_end = js.find("\nasync function ", fn_start + 1)
+    fn_body = js[fn_start:fn_end]
+    assert "window.prompt(" not in fn_body, "_deleteProject must not use window.prompt"
 
 
 def test_admin_snapshot_file_db_has_data(tmp_path, monkeypatch):
