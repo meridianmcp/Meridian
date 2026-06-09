@@ -942,6 +942,22 @@ async def _body_size_guard_middleware(request: Request, call_next):
     return await call_next(request)
 
 
+# Content-Security-Policy for the MCP JSON-RPC surface. The /mcp endpoints
+# serve only JSON / SSE — never executable HTML — so a deny-all policy is both
+# correct and required for the OpenAI Apps SDK submission, which flags any MCP
+# route lacking a CSP header.
+_MCP_CSP = "default-src 'none'; frame-ancestors 'none'; base-uri 'none'"
+
+
+@app.middleware("http")
+async def _mcp_csp_middleware(request: Request, call_next):
+    """Stamp a strict Content-Security-Policy on all /mcp route responses."""
+    response = await call_next(request)
+    if request.url.path == "/mcp" or request.url.path.startswith("/mcp/"):
+        response.headers["Content-Security-Policy"] = _MCP_CSP
+    return response
+
+
 def _tenant_marker_from_request(request: Request) -> str | None:
     """Item 39 — lightweight tenant identifier for error context.
 

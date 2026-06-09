@@ -6975,6 +6975,23 @@ def test_mcp_sse_cors_headers_on_post(client):
     assert r.headers.get("access-control-allow-origin") == "*"
 
 
+def test_mcp_responses_carry_csp_header(client):
+    """All /mcp route responses carry a strict Content-Security-Policy header.
+
+    Required for the OpenAI Apps SDK submission, which flags MCP routes lacking
+    a CSP. The /mcp surface serves only JSON/SSE, so a deny-all policy is correct.
+    """
+    # POST /mcp/sse (JSON-RPC response)
+    r_sse = client.post("/mcp/sse", json={"jsonrpc": "2.0", "id": 1, "method": "ping", "params": {}})
+    csp = r_sse.headers.get("content-security-policy", "")
+    assert "default-src 'none'" in csp
+    assert "frame-ancestors 'none'" in csp
+
+    # POST /mcp with no auth (401 path still goes through the middleware)
+    r_mcp = client.post("/mcp", json={"jsonrpc": "2.0", "id": 1, "method": "ping", "params": {}})
+    assert "default-src 'none'" in r_mcp.headers.get("content-security-policy", "")
+
+
 def test_remote_mcp_401_includes_www_authenticate(client):
     """POST /mcp with no auth returns 401 with WWW-Authenticate: Bearer header.
 
