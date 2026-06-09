@@ -13675,11 +13675,18 @@ async function loadPinnedDecisions(projectId) {
         sel.className = 'decision-cat-dropdown';
         sel.style.cssText = 'position:absolute;z-index:9999;background:#1a1a1a;color:#f0f0f0;font-size:10px;font-weight:700;border:1px solid var(--border);border-radius:4px;padding:3px 5px;cursor:pointer';
         _CATS.forEach(c => { const o = document.createElement('option'); o.value=c; o.textContent=c; if(c===cur) o.selected=true; sel.appendChild(o); });
-        sel.style.left = tag.getBoundingClientRect().left + 'px';
-        sel.style.top = (tag.getBoundingClientRect().bottom + window.scrollY) + 'px';
+        const rect = tag.getBoundingClientRect();
+        sel.style.left = (rect.left + window.scrollX) + 'px';
+        sel.style.top = (rect.bottom + window.scrollY) + 'px';
+        sel.style.minWidth = Math.max(rect.width, 140) + 'px';
         document.body.appendChild(sel);
-        sel.focus();
-        sel.click();
+        sel.focus({ preventScroll: true });
+        if (typeof sel.showPicker === 'function') {
+          try { sel.showPicker(); }
+          catch (_) { sel.click(); }
+        } else {
+          sel.click();
+        }
         sel.onblur = () => sel.remove();
         sel.onchange = async () => {
           const newCat = sel.value;
