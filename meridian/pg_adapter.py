@@ -871,6 +871,7 @@ async def init_pg_db(url: str) -> PostgresConnection:
         await _migrate_pg_tenants_is_internal(conn)
         await _migrate_pg_workspace_members_rbac(conn)
     await _migrate_pg_sprint_items_claimed_at(conn)
+    await _migrate_pg_sprint_item_tree(conn)
     return conn
 
 
@@ -879,6 +880,16 @@ async def _migrate_pg_sprint_items_claimed_at(conn: PostgresConnection) -> None:
     await conn.executescript(
         "ALTER TABLE sprint_items ADD COLUMN IF NOT EXISTS claimed_at TEXT;"
         "ALTER TABLE sprint_items ADD COLUMN IF NOT EXISTS milestone_type TEXT NOT NULL DEFAULT 'task'"
+    )
+
+
+async def _migrate_pg_sprint_item_tree(conn: PostgresConnection) -> None:
+    """Add parent_id, split_from, merged_into, merged_from to sprint_items (Task 10)."""
+    await conn.executescript(
+        "ALTER TABLE sprint_items ADD COLUMN IF NOT EXISTS parent_id TEXT DEFAULT NULL;"
+        "ALTER TABLE sprint_items ADD COLUMN IF NOT EXISTS split_from TEXT DEFAULT NULL;"
+        "ALTER TABLE sprint_items ADD COLUMN IF NOT EXISTS merged_into TEXT DEFAULT NULL;"
+        "ALTER TABLE sprint_items ADD COLUMN IF NOT EXISTS merged_from TEXT DEFAULT NULL"
     )
 
 

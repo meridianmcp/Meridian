@@ -225,7 +225,11 @@ CREATE TABLE IF NOT EXISTS sprint_items (
     notes TEXT,
     feedback_thumb SMALLINT,
     feedback_note TEXT,
-    milestone_type TEXT NOT NULL DEFAULT 'task'
+    milestone_type TEXT NOT NULL DEFAULT 'task',
+    parent_id TEXT DEFAULT NULL REFERENCES sprint_items(id),
+    split_from TEXT DEFAULT NULL,
+    merged_into TEXT DEFAULT NULL,
+    merged_from TEXT DEFAULT NULL
 );
 
 -- v2.4 — decisions_pinned: editable constitution alongside the append-only
@@ -1591,7 +1595,16 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_tenants_is_internal(db)
     await _migrate_workspace_members_rbac(db)
     await _migrate_sprint_items_indeterminate(db)
+    await _migrate_sprint_item_tree(db)
     return db
+
+
+async def _migrate_sprint_item_tree(db: aiosqlite.Connection) -> None:
+    """Add parent_id, split_from, merged_into, merged_from to sprint_items."""
+    await _migrate_add_column_if_missing(db, "sprint_items", "parent_id", "TEXT DEFAULT NULL")
+    await _migrate_add_column_if_missing(db, "sprint_items", "split_from", "TEXT DEFAULT NULL")
+    await _migrate_add_column_if_missing(db, "sprint_items", "merged_into", "TEXT DEFAULT NULL")
+    await _migrate_add_column_if_missing(db, "sprint_items", "merged_from", "TEXT DEFAULT NULL")
 
 
 async def _migrate_sprint_items_indeterminate(db: aiosqlite.Connection) -> None:
