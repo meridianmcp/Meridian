@@ -4389,6 +4389,68 @@ async def repo_image_proxy(project_id: str, request: Request, path: str = ""):
     )
 
 
+
+
+@app.post("/projects/{project_id}/github/push-mcp-template", status_code=201)
+async def push_mcp_template(project_id: str, request: Request) -> dict[str, Any]:
+    """Push template.mcp.json to the connected GitHub repo.
+
+    Fails with 409 if the file already exists. The template contains a
+    placeholder Bearer token — users fill it in locally; .mcp.json should
+    be gitignored so the real token never gets committed.
+    """
+    if not _hosted_mode():
+        raise HTTPException(status_code=404)
+    tenant = await _get_tenant_from_request(request)
+    if tenant is None:
+        raise HTTPException(status_code=401, detail="not authenticated")
+
+    pat = tenant.get("github_pat")
+    repo = tenant.get("github_repo")
+    if not pat or not repo:
+        raise HTTPException(status_code=400, detail="No GitHub repo connected. Connect one in Settings first.")
+
+    token = db_module.decrypt_field(pat)
+    if not token:
+        raise HTTPException(status_code=400, detail="GitHub token could not be decrypted. Reconnect your repo.")
+
+    import httpx as _httpx
+    gh_headers = {"Authorization": f"token {token}", "Accept": "application/vnd.github+json"}
+
+    template_content = json.dumps({
+        "mcpServers": {
+            "meridian": {
+                "command": "npx",
+                "args": ["-y", "mcp-remote", "https://usemeridian.us/mcp"],
+                "env": {"BEARER_TOKEN": "sk_meridian_YOUR_KEY_HERE"}
+            }
+        }
+    }, indent=2)
+    template_b64 = base64.b64encode(template_content.encode()).decode()
+
+    async with _httpx.AsyncClient(timeout=10) as http:
+        # Check if file already exists
+        check = await http.get(
+            f"https://api.github.com/repos/{repo}/contents/template.mcp.json",
+            headers=gh_headers,
+        )
+        if check.status_code == 200:
+            raise HTTPException(status_code=409, detail="template.mcp.json already exists in the repo.")
+
+        # Create the file
+        r = await http.put(
+            f"https://api.github.com/repos/{repo}/contents/template.mcp.json",
+            headers=gh_headers,
+            json={
+                "message": "Add Meridian MCP config template",
+                "content": template_b64,
+            },
+        )
+        if r.status_code not in (201, 200):
+            raise HTTPException(status_code=r.status_code, detail=f"GitHub API error: {r.text[:200]}")
+
+    return {"pushed": True, "file": "template.mcp.json", "repo": repo}
+
 @app.delete("/projects/{project_id}/github/disconnect", status_code=200)
 async def github_disconnect(project_id: str, request: Request) -> dict[str, Any]:
     """Clear the tenant's stored GitHub credentials."""
