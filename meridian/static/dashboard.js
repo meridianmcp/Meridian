@@ -2092,7 +2092,10 @@ function _armAccountSwitchWatch(loadedEmail) {
 
   // Catches changes from planning-chat MCP calls even when dashboard is always visible.
 
-  setInterval(async () => { try { await loadProjects(); if (state.activeTab) await _refreshOnFocus(); } catch(_) {} }, 8000);
+  // Lightweight project-list poll — catches new projects from planning chat.
+  // Full data refresh (_refreshOnFocus) stays on tab-focus only to avoid hammering the server.
+  // TODO: replace with WS push event (server already has WS infrastructure).
+  setInterval(async () => { try { await loadProjects(); } catch(_) {} }, 10000);
 
   setInterval(_checkAccountSwitch, 60000);
 
