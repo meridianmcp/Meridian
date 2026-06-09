@@ -507,7 +507,7 @@ def test_remote_mcp_project_discovery_tools_return_sprint(client):
         "/mcp",
         json={
             "jsonrpc": "2.0", "id": 11, "method": "tools/call",
-            "params": {"name": "get_project_by_name", "arguments": {"name": "meridian"}},
+            "params": {"name": "get_project_by_name", "arguments": {"name": "meridian-build"}},
         },
         headers={"Authorization": f"Bearer {raw_token}"},
     )
