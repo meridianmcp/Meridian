@@ -226,11 +226,14 @@ These MCP servers pair with Meridian to give your AI agents codebase context and
     ```
 
 === "Browser clients"
-    Hosted Meridian works directly in Claude and ChatGPT without an extension.
+    Hosted Meridian works directly in Claude and ChatGPT (alpha) without an extension.
 
     1. Open Claude **Customize > Connectors** or ChatGPT **Settings > Apps**
     2. Add `https://usemeridian.us/mcp`
     3. Complete OAuth in the browser
+
+    **Claude** works natively with no configuration.
+    **ChatGPT (alpha)** — requires Developer Mode; some tools are filtered by ChatGPT's safety layer. Official catalog submission pending.
 
     For self-hosted localhost setups, use a local Claude SSE bridge or expose
     Meridian on a public HTTPS URL first.

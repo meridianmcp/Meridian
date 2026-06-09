@@ -53,6 +53,9 @@ some layouts), choose **Add custom connector**, then paste:
 
 ### ChatGPT
 
+!!! warning "Alpha: Developer Mode required"
+    ChatGPT support currently requires Developer Mode and some tools are blocked by ChatGPT's safety filter. Claude works with no extra steps. Official ChatGPT app catalog submission pending — this limitation goes away once approved.
+
 In ChatGPT, open **Settings > Apps**, choose **New App**, then add Meridian's
 public MCP endpoint:
 
