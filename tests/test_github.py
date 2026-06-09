@@ -304,7 +304,7 @@ def test_mcp_tools_list_includes_github_tools_when_connected(tmp_path, monkeypat
         assert r.status_code == 200
         tool_names_before = {tool["name"] for tool in r.json()["result"]["tools"]}
         assert "read_file" not in tool_names_before
-        assert "git_log" not in tool_names_before
+        assert "get_commits" not in tool_names_before
 
         client.post(
             f"/projects/{pid}/github/connect",
@@ -322,7 +322,7 @@ def test_mcp_tools_list_includes_github_tools_when_connected(tmp_path, monkeypat
         assert "read_file" in tool_names_after
         assert "list_files" in tool_names_after
         assert "search_code" in tool_names_after
-        assert "git_log" in tool_names_after
+        assert "get_commits" in tool_names_after
         assert "get_commit" in tool_names_after
 
 
@@ -347,4 +347,4 @@ def test_mcp_tools_list_no_github_tools_when_disconnected(tmp_path, monkeypatch)
         assert r.status_code == 200
         tool_names = {tool["name"] for tool in r.json()["result"]["tools"]}
         assert "read_file" not in tool_names
-        assert "git_log" not in tool_names
+        assert "get_commits" not in tool_names

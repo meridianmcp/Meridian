@@ -812,7 +812,7 @@ async def site_password_gate(request: Request, call_next):
     if not site_pw:
         return await call_next(request)
     path = request.url.path
-    if path in ("/health", "/mcp/health", "/__gate__", "/config", "/static", "/mcp/tools-doc", "/mcp/quickstart", "/mcp/sse") or path.startswith("/static/") or path == "/demo" or path.startswith("/demo/"):
+    if path in ("/health", "/mcp/health", "/__gate__", "/config", "/static", "/mcp/tools-doc", "/mcp/quickstart", "/mcp/sse", "/mcp", "/.well-known/oauth-authorization-server") or path.startswith("/static/") or path.startswith("/oauth/") or path == "/demo" or path.startswith("/demo/"):
         return await call_next(request)
     # Demo cookie bypasses site password gate — demo users don't go through __gate__
     if request.cookies.get(_DEMO_CONTEXT_COOKIE):
@@ -832,6 +832,10 @@ async def site_password_gate(request: Request, call_next):
 
             token_hash = hashlib.sha256(auth_header[7:].encode()).hexdigest()
             if await db_module.get_tenant_from_token_hash(auth_db, token_hash):
+                return await call_next(request)
+            # Also check OAuth tokens (ChatGPT and other OAuth clients use these)
+            oauth_hash = _oauth_token_hash(auth_header[len("Bearer "):].strip())
+            if _oa_tokens.get(oauth_hash) or await _get_oauth_token_from_db(auth_db, oauth_hash):
                 return await call_next(request)
     from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
     from fastapi.responses import HTMLResponse
@@ -936,6 +940,22 @@ async def _body_size_guard_middleware(request: Request, call_next):
                         },
                     )
     return await call_next(request)
+
+
+# Content-Security-Policy for the MCP JSON-RPC surface. The /mcp endpoints
+# serve only JSON / SSE — never executable HTML — so a deny-all policy is both
+# correct and required for the OpenAI Apps SDK submission, which flags any MCP
+# route lacking a CSP header.
+_MCP_CSP = "default-src 'none'; frame-ancestors 'none'; base-uri 'none'"
+
+
+@app.middleware("http")
+async def _mcp_csp_middleware(request: Request, call_next):
+    """Stamp a strict Content-Security-Policy on all /mcp route responses."""
+    response = await call_next(request)
+    if request.url.path == "/mcp" or request.url.path.startswith("/mcp/"):
+        response.headers["Content-Security-Policy"] = _MCP_CSP
+    return response
 
 
 def _tenant_marker_from_request(request: Request) -> str | None:
@@ -4577,8 +4597,10 @@ async def mcp_tools_doc() -> str:
         "Register a session and get the full project context (goal, sprint, recent tasks, decisions) in one call. "
         "**Use this instead of `register_session`.**")
     lines += _render_tool("get_session_brief",
-        "Compact session orientation (<500 tokens). Returns sprint focus, pending items, recent tasks, blocking "
-        "failures, and open HITL requests. Ideal for worker/automation sessions that don't need the full context.")
+        "Read-only: Call this FIRST for project summaries or to see what a session did — returns session, tasks, "
+        "decisions, and recent commits in one call. Compact session orientation (<500 tokens): sprint focus, "
+        "pending items, recent tasks, blocking failures, and open HITL requests. Ideal for worker/automation "
+        "sessions that don't need the full context.")
     lines += ["## Tasks\n"]
     lines += _render_tool("log_task",
         "Log what this session did, is doing, or failed at. Call frequently — this is the primary signal in the "
@@ -4598,7 +4620,7 @@ async def mcp_tools_doc() -> str:
     lines += _render_tool("release_file",
         "Release a file lock held by this session when you're done editing.")
     lines += _render_tool("idle_until_session_done",
-        "Wait on another session before touching a shared file. The tool polls every 30 seconds until the watched session is done.")
+        "Read-only: Wait on another session before touching a shared file. The tool polls every 30 seconds until the watched session is done.")
     lines += ["## Decisions\n"]
     lines += _render_tool("pin_decision",
         "Record an authoritative decision that supersedes earlier statements. Pinned decisions appear in every "
@@ -4613,20 +4635,20 @@ async def mcp_tools_doc() -> str:
         "Surface a question to the human queue. `urgency='blocking'` pauses the session until answered — poll "
         "`get_hitl_request` to resume. `normal`/`high` land in the dashboard without blocking.")
     lines += _render_tool("get_hitl_request",
-        "Poll a HITL request for the human's answer. Returns the row including `status` "
+        "Read-only: Poll a HITL request for the human's answer. Returns the row including `status` "
         "(`pending`/`answered`/`dismissed`) and `answer` text.")
     lines += ["## Handoff & context\n"]
     lines += _render_tool("generate_handoff",
-        "Generate a context handoff document. `mode='full'` writes the complete L0/L1/L2 handoff. `mode='delta'` "
+        "Read-only: Generate a context handoff document. `mode='full'` writes the complete L0/L1/L2 handoff. `mode='delta'` "
         "returns a compact session summary with completed items, pending items, and the next `/goal` string.")
     lines += _render_tool("get_context_block",
-        "Return a compact plain-text context block (north star, sprint, pending sprint items, recent tasks, recent "
+        "Read-only: Return a compact plain-text context block (north star, sprint, pending sprint items, recent tasks, recent "
         "decisions, active sessions). Use `mode='full'` to paste into a fresh Claude Code session; `mode='chat'` "
         "for a shorter paste into claude.ai.")
     lines += ["## Notes\n"]
     lines += _render_tool("add_note",
         "Add a per-project wiki note. Use for setup instructions, gotchas, environment details, how-tos.")
-    lines += _render_tool("get_notes", "List project notes (newest first). Filter by tag substring.")
+    lines += _render_tool("get_notes", "Read-only: List project notes (newest first). Filter by tag substring.")
     lines += _render_tool("delete_note")
     lines += ["## Projects\n"]
     lines += _render_tool("create_project")
@@ -5736,7 +5758,7 @@ def _jsonrpc_err(req_id: Any, code: int, message: str) -> dict[str, Any]:
 # GitHub MCP tools — injected per-tenant when github_pat is set
 # ---------------------------------------------------------------------------
 
-_GITHUB_TOOL_NAMES = frozenset({"read_file", "list_files", "search_code", "git_log", "get_commit"})
+_GITHUB_TOOL_NAMES = frozenset({"read_file", "list_files", "search_code", "get_commits", "get_commit"})
 
 
 def _github_tools_for_tenant(tenant: dict) -> list[dict[str, Any]]:
@@ -5778,7 +5800,7 @@ def _github_tools_for_tenant(tenant: dict) -> list[dict[str, Any]]:
             },
         },
         {
-            "name": "git_log",
+            "name": "get_commits",
             "description": "Return recent commits from the connected GitHub repository.",
             "inputSchema": {
                 "type": "object",
@@ -5858,7 +5880,7 @@ async def _dispatch_github_tool(name: str, args: dict[str, Any], tenant: dict) -
                 "items": [{"path": i["path"], "sha": i["sha"], "url": i.get("html_url", "")} for i in items[:20]],
             }
 
-        if name == "git_log":
+        if name == "get_commits":
             limit = min(int(args.get("limit") or 10), 50)
             r = await http.get(
                 f"https://api.github.com/repos/{repo}/commits",
@@ -6060,7 +6082,7 @@ async def _dispatch_mcp_tool(
             db, args["project_id"],
             include_superseded=bool(args.get("include_superseded", False)),
         )
-    if name == "delete_decision":
+    if name == "archive_decision":
         deleted = await db_module.delete_pinned_decision(db, args["decision_id"])
         if not deleted:
             raise ValueError("decision not found")
@@ -6328,7 +6350,7 @@ async def _dispatch_mcp_tool(
                 pref_key="sprint",
             )
         return item
-    if name == "get_run_transcript":
+    if name == "get_session_log":
         run = await db_module.get_executor_run_by_session(db, args.get("session_id", ""))
         if run is None:
             return {"error": "no run found for session"}
@@ -6900,10 +6922,25 @@ async def remote_mcp(request: Request) -> Any:
     if _bearer_hash:
         tenant = await db_module.get_tenant_from_token_hash(request.app.state.db, _bearer_hash)
     if tenant is None:
-        from .hosted import get_tenant_from_bearer
-
-        # Bearer auth required (hosted tenant path)
-        tenant = await get_tenant_from_bearer(request)  # raises 401 if invalid
+        import logging as _logging
+        _raw_auth = request.headers.get("authorization", "")
+        _logging.getLogger("meridian.mcp_auth").warning(
+            "[mcp_auth] unrecognised token raw=%r ua=%r",
+            (_raw_auth[:60] if _raw_auth else "(none)"),
+            request.headers.get("user-agent", "")[:60],
+        )
+        _base = str(request.base_url).rstrip("/")
+        return JSONResponse(
+            {"detail": "invalid API token"},
+            status_code=401,
+            headers={
+                "WWW-Authenticate": (
+                    f'Bearer realm="MCP",'
+                    f' error="invalid_token",'
+                    f' resource_metadata="{_base}/.well-known/oauth-authorization-server"'
+                ),
+            },
+        )
 
     try:
         body = await request.json()
@@ -8213,6 +8250,7 @@ def build_mcp_server():
                 )
             elif name in (
                 "pin_decision", "update_decision", "get_pinned_decisions",
+                "archive_decision",
                 "request_hitl", "get_hitl_request",
                 "list_hitl_requests", "answer_hitl", "dismiss_hitl",
                 "update_md_section",
@@ -8388,7 +8426,7 @@ def build_mcp_server():
                 result = await _dispatch_mcp_tool(
                     "get_session_brief", arguments, db, state["data_dir"]
                 )
-            elif name == "get_run_transcript":
+            elif name == "get_session_log":
                 session_id_arg = arguments.get("session_id", "")
                 run = await db_module.get_executor_run_by_session(db, session_id_arg)
                 if run is None:

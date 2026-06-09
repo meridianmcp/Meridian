@@ -284,18 +284,18 @@ def test_run_transcript_accumulates_via_log_task(client):
 
 
 # ---------------------------------------------------------------------------
-# MCP tool: get_run_transcript
+# MCP tool: get_session_log
 # ---------------------------------------------------------------------------
 
 
-def test_mcp_get_run_transcript(client):
+def test_mcp_get_session_log(client):
     pid, headers = _setup_authed_project(client, "runs-mcp-test")
     r2 = client.post(f"/projects/{pid}/start-session", json={"session_name": "sess"})
     sid = r2.json()["session_id"]
     _mcp_call(client, headers, "log_task", {
         "session_id": sid, "project_id": pid, "description": "MCP tool test task"
     })
-    resp = _mcp_call(client, headers, "get_run_transcript", {"session_id": sid})
+    resp = _mcp_call(client, headers, "get_session_log", {"session_id": sid})
     assert resp.status_code == 200
     result = json.loads(resp.json()["result"]["content"][0]["text"])
     assert result["session_id"] == sid
@@ -303,9 +303,9 @@ def test_mcp_get_run_transcript(client):
     assert result["task_count"] == 1
 
 
-def test_mcp_get_run_transcript_no_run(client):
+def test_mcp_get_session_log_no_run(client):
     _, headers = _setup_authed_project(client, "runs-mcp-norun-test")
-    resp = _mcp_call(client, headers, "get_run_transcript", {"session_id": "no-such-session"})
+    resp = _mcp_call(client, headers, "get_session_log", {"session_id": "no-such-session"})
     assert resp.status_code == 200
     result = json.loads(resp.json()["result"]["content"][0]["text"])
     assert "error" in result

@@ -77,6 +77,18 @@ public MCP endpoint:
     still say "connectors" or "custom connectors", but the Meridian MCP URL is
     still the same: `https://usemeridian.us/mcp`.
 
+#### ChatGPT Developer Mode
+
+If the standard **Settings > Apps** flow does not yet expose custom MCP servers
+for your account, enable Developer Mode and add Meridian by hand:
+
+1. **Settings → Connectors → Advanced → Developer Mode**
+2. Paste the server URL `https://usemeridian.us/mcp`
+3. Add a **Bearer token** from [usemeridian.us/settings](https://usemeridian.us/settings)
+
+Official catalog listing is pending OpenAI review — Developer Mode is the
+supported path until Meridian appears in the public App catalog.
+
 ### Claude Desktop
 
 Connect Meridian to Claude Desktop via MCP configuration:

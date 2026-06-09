@@ -6975,6 +6975,64 @@ def test_mcp_sse_cors_headers_on_post(client):
     assert r.headers.get("access-control-allow-origin") == "*"
 
 
+def test_mcp_responses_carry_csp_header(client):
+    """All /mcp route responses carry a strict Content-Security-Policy header.
+
+    Required for the OpenAI Apps SDK submission, which flags MCP routes lacking
+    a CSP. The /mcp surface serves only JSON/SSE, so a deny-all policy is correct.
+    """
+    # POST /mcp/sse (JSON-RPC response)
+    r_sse = client.post("/mcp/sse", json={"jsonrpc": "2.0", "id": 1, "method": "ping", "params": {}})
+    csp = r_sse.headers.get("content-security-policy", "")
+    assert "default-src 'none'" in csp
+    assert "frame-ancestors 'none'" in csp
+
+    # POST /mcp with no auth (401 path still goes through the middleware)
+    r_mcp = client.post("/mcp", json={"jsonrpc": "2.0", "id": 1, "method": "ping", "params": {}})
+    assert "default-src 'none'" in r_mcp.headers.get("content-security-policy", "")
+
+
+def test_remote_mcp_401_includes_www_authenticate(client):
+    """POST /mcp with no auth returns 401 with WWW-Authenticate: Bearer header.
+
+    ChatGPT and other OAuth clients use this header to discover the OAuth flow.
+    Without it they just show the 401 error to the user rather than starting OAuth.
+    """
+    r = client.post("/mcp", json={"jsonrpc": "2.0", "id": 1, "method": "ping", "params": {}})
+    assert r.status_code == 401
+    www_auth = r.headers.get("www-authenticate", "")
+    assert "Bearer" in www_auth
+    assert "realm" in www_auth
+
+
+def test_remote_mcp_401_invalid_bearer_includes_www_authenticate(client):
+    """POST /mcp with a garbage Bearer token still returns WWW-Authenticate header."""
+    r = client.post(
+        "/mcp",
+        json={"jsonrpc": "2.0", "id": 1, "method": "ping", "params": {}},
+        headers={"Authorization": "Bearer not-a-real-token-xyzzy"},
+    )
+    assert r.status_code == 401
+    www_auth = r.headers.get("www-authenticate", "")
+    assert "Bearer" in www_auth
+
+
+def test_login_page_preserves_next_param(client):
+    """GET /auth/login?next=/foo injects ?next= into all login button hrefs."""
+    r = client.get("/auth/login?next=/oauth/authorize%3Fclient_id%3Dabc")
+    assert r.status_code == 200
+    assert "/auth/google/login?next=" in r.text
+    assert "/auth/github/login?next=" in r.text
+
+
+def test_login_page_no_next_param(client):
+    """GET /auth/login without ?next= keeps bare login hrefs (no ?next= appended)."""
+    r = client.get("/auth/login")
+    assert r.status_code == 200
+    assert 'href="/auth/google/login"' in r.text
+    assert 'href="/auth/github/login"' in r.text
+
+
 # ---------------------------------------------------------------------------
 # Generalised notification system (sprint items 102853be, 2fae3acf, 36032131)
 # ---------------------------------------------------------------------------
