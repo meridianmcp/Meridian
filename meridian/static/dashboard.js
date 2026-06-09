@@ -149,11 +149,61 @@ async function ensureWorkspaceSwitcher() {
     sel.title = active ? (active.is_own ? 'My workspace' : `${active.owner_email} (${active.role})`) : '';
   };
 
+  // "Connect your DB" link below the switcher
+  const connectLink = document.createElement('a');
+  connectLink.id = 'connect-db-link';
+  connectLink.href = '#';
+  connectLink.textContent = '⊕ Connect your DB';
+  connectLink.style.cssText = 'display:block;margin-top:4px;font-size:9px;font-family:var(--font-mono);color:var(--muted);text-decoration:none;opacity:.7;letter-spacing:.03em';
+  connectLink.onmouseenter = () => { connectLink.style.opacity = '1'; connectLink.style.color = 'var(--accent)'; };
+  connectLink.onmouseleave = () => { connectLink.style.opacity = '.7'; connectLink.style.color = 'var(--muted)'; };
+  connectLink.onclick = e => { e.preventDefault(); showConnectDbModal(); };
+
   wrap.appendChild(label);
   wrap.appendChild(sel);
+  wrap.appendChild(connectLink);
   const existingLabel = footer.querySelector('.hosted-label');
   if (existingLabel) footer.insertBefore(wrap, existingLabel);
   else footer.prepend(wrap);
+}
+
+function showConnectDbModal() {
+  if (document.getElementById('connect-db-modal')) return;
+  const overlay = document.createElement('div');
+  overlay.id = 'connect-db-modal';
+  overlay.style.cssText = 'position:fixed;inset:0;z-index:10000;background:rgba(0,0,0,.55);display:flex;align-items:center;justify-content:center';
+  const box = document.createElement('div');
+  box.style.cssText = 'background:var(--surface-0);border:1px solid var(--border);border-radius:8px;padding:24px 28px;width:460px;max-width:94vw;display:flex;flex-direction:column;gap:12px';
+  box.innerHTML = `
+    <div style="font-weight:700;font-size:14px">Connect your Meridian DB</div>
+    <div style="font-size:12px;color:var(--muted)">Enter a PostgreSQL connection string to use your own Neon (or any Postgres) project as your workspace DB.</div>
+    <input id="connect-db-url" type="password" placeholder="postgresql://user:pass@host/db?sslmode=require"
+      style="font-family:var(--font-mono);font-size:11px;padding:7px 10px;border:1px solid var(--border);border-radius:5px;background:var(--surface-1);color:var(--text);width:100%;box-sizing:border-box">
+    <div id="connect-db-status" style="font-size:11px;min-height:16px;color:var(--muted)"></div>
+    <div style="display:flex;gap:8px;justify-content:flex-end">
+      <button id="connect-db-cancel" class="secondary" style="font-size:12px">Cancel</button>
+      <button id="connect-db-save" style="font-size:12px">Connect</button>
+    </div>`;
+  overlay.appendChild(box);
+  document.body.appendChild(overlay);
+  const urlInput = box.querySelector('#connect-db-url');
+  const statusEl = box.querySelector('#connect-db-status');
+  box.querySelector('#connect-db-cancel').onclick = () => overlay.remove();
+  overlay.onclick = e => { if (e.target === overlay) overlay.remove(); };
+  box.querySelector('#connect-db-save').onclick = async () => {
+    const url = urlInput.value.trim();
+    if (!url) { statusEl.textContent = 'Enter a connection string.'; statusEl.style.color = 'var(--danger,#dc2626)'; return; }
+    statusEl.textContent = 'Connecting…'; statusEl.style.color = 'var(--muted)';
+    try {
+      await api('/workspace/connect-db', { method: 'POST', body: JSON.stringify({ url }) });
+      statusEl.textContent = 'Connected! Reloading…'; statusEl.style.color = '#059669';
+      setTimeout(() => { overlay.remove(); loadProjects(); }, 800);
+    } catch (e) {
+      statusEl.textContent = e.message || 'Connection failed — check the URL and credentials.';
+      statusEl.style.color = 'var(--danger,#dc2626)';
+    }
+  };
+  urlInput.focus();
 }
 
 // A persistent "Take the tour" affordance in the sidebar footer so users —
@@ -409,6 +459,9 @@ function hideDemoAdminControls() {
     '#ws-settings-save',
     '#ws-dec-title', '#ws-dec-body', '#ws-dec-add',
     '#ws-note-title', '#ws-note-body', '#ws-note-add',
+    // Workspace DB connect UI — write action, hide in demo
+    '#connect-db-link',
+    '#connect-db-save',
   ];
   selectors.forEach(sel => {
     document.querySelectorAll(sel).forEach(el => { el.style.display = 'none'; });
@@ -833,7 +886,7 @@ function _renderPlanBadge(me) {
     }
   }
   // Persistent upgrade nudge for free-tier users (shown regardless of days left).
-  if (plan === 'free' && !me.expired && !isDemoMode() && !document.getElementById('upgrade-banner')) {
+  if (plan === 'free' && !noUpgrade && !me.expired && !isDemoMode() && !document.getElementById('upgrade-banner')) {
     const upgradeUrl = state.serverConfig?.stripe_payment_link || '/pricing';
     const b = document.createElement('div');
     b.id = 'upgrade-banner';
@@ -853,7 +906,7 @@ function _renderPlanBadge(me) {
     const label = _PLAN_LABELS[plan] || plan;
     const daysLeft = Math.max(0, days);
     b.style = `position:fixed;top:0;left:0;right:0;z-index:9997;background:linear-gradient(90deg,#059669,#059669);color:#fff;text-align:center;padding:5px 12px;font-size:12px;font-family:inherit;letter-spacing:0.02em`;
-    b.innerHTML = `${label}: <strong>${daysLeft} day${daysLeft !== 1 ? 's' : ''}</strong> remaining. <a href="/pricing" style="color:#fff;text-decoration:underline;font-weight:600">Upgrade now →</a>`;
+    b.innerHTML = `${label}: <strong>${daysLeft} day${daysLeft !== 1 ? 's' : ''}</strong> remaining. <a href="/pricing" style="color:#fff;text-decoration:underline;font-weight:600">4× faster with Standard →</a>`;
     document.body.prepend(b);
     document.body.style.paddingTop = ((parseInt(document.body.style.paddingTop || '0', 10)) + 28) + 'px';
   }
