@@ -123,15 +123,7 @@ Sign in at [usemeridian.us](https://usemeridian.us) → Settings → MCP client 
 
 Or manually:
 ```json
-{
-  "mcpServers": {
-    "meridian": {
-      "command": "npx",
-      "args": ["-y", "mcp-remote", "https://usemeridian.us/mcp"],
-      "env": {"BEARER_TOKEN": "sk_meridian_YOUR_KEY_HERE"}
-    }
-  }
-}
+{"mcpServers":{"meridian":{"type":"http","url":"https://usemeridian.us/mcp","headers":{"Authorization":"Bearer sk_meridian_YOUR_KEY_HERE"}}}}
 ```
 
 **Claude Desktop** users can install [meridian-hosted.dxt](https://github.com/meridianmcp/Meridian/releases/latest/download/meridian-hosted.dxt) directly (one-click, no config needed).
@@ -215,7 +207,7 @@ No more manual `start_session()` calls. No lost work when context fills.
 | **Extra storage** | $0.50 / GB-month | $0.50 / GB-month |
 | **Support** | Email | Priority |
 
-30-day free trial on Standard. Card required, no charge until day 31.
+30-day free trial · no card required
 
 ## License
 
@@ -227,4 +219,4 @@ For licensing questions: [hello@usemeridian.us](mailto:hello@usemeridian.us)
 
 ## Contributors
 
-[![Contributors](https://contrib.rocks/image?repo=meridianmcp/Meridian)](https://github.com/meridianmcp/Meridian/graphs/contributors)
+Built by [@ajc3xc](https://github.com/ajc3xc)
