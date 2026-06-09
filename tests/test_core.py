@@ -1904,17 +1904,17 @@ def test_http_set_north_star_owner_succeeds(client):
     assert body["north_star"] == "be the best"
 
 
-def test_http_set_north_star_non_owner_returns_403(client):
-    """POST /goal/north-star with wrong human_id returns 403."""
+def test_http_set_north_star_any_user_succeeds(client):
+    """POST /goal/north-star no longer requires ownership check — session auth proves it."""
     project = client.post(
         "/projects", json={"name": "alpha", "human_id": "adam"}
     ).json()
     client.post(f"/projects/{project['id']}/goal", json={"content": "go"})
     r = client.post(
         f"/projects/{project['id']}/goal/north-star",
-        json={"north_star": "steal the vision", "human_id": "eve"},
+        json={"north_star": "a clean minimal API", "human_id": "eve"},
     )
-    assert r.status_code == 403
+    assert r.status_code == 200
 
 
 def test_http_set_sprint_any_member(client):
@@ -7375,14 +7375,12 @@ def test_notify_test_endpoint_delivers_ntfy_message_via_postgres(tmp_path, monke
 # ---------------------------------------------------------------------------
 
 
-def test_delete_project_confirm_requires_typed_name(client):
-    """dashboard.js _deleteProject uses window.prompt requiring the project name."""
+def test_delete_project_uses_modal_not_prompt(client):
+    """dashboard.js _deleteProject uses a modal confirm, not window.prompt."""
     js = client.get("/static/dashboard.js").text
-    # Confirm dialog was replaced with a prompt that checks the typed name
-    assert "window.prompt(" in js, "_deleteProject must use window.prompt"
-    assert "typed.trim() !== t.project.name" in js, "typed name check missing"
-    # Old single-click confirm must be gone
-    assert 'window.confirm(\n    `Delete "' not in js, "single confirm() still present"
+    assert "delete-project-modal" in js, "modal overlay id must be present"
+    assert "del-proj-confirm" in js, "confirm button must be present"
+    assert "window.prompt(" not in js, "brittle window.prompt must be gone"
 
 
 def test_admin_snapshot_file_db_has_data(tmp_path, monkeypatch):
