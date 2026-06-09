@@ -1464,6 +1464,7 @@ async def me_endpoint(request: Request) -> dict[str, Any]:
         # G2.10 — internal marker, used by the dashboard to suppress
         # the upgrade banner and similar nag UI for staff accounts.
         "is_internal": bool(tenant.get("is_internal")),
+        "is_admin": tenant.get("email", "") in _admin_emails(),
     }
 
 

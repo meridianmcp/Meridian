@@ -2,7 +2,7 @@ const TABS_KEY = 'meridian.openTabs';
 
 const ACTIVE_PROJECT_KEY = 'meridian.activeProject';
 
-const _PLAN_LABELS = { solo: 'Standard', free: 'Free Trial', standard: 'Standard', pro: 'Pro', trial: 'Trial' };
+const _PLAN_LABELS = { solo: 'Standard', free: 'Free Trial', standard: 'Standard', pro: 'Pro', trial: 'Trial', admin: 'Admin' };
 
 const state = {
 
@@ -1858,7 +1858,7 @@ function _renderPlanBadge(me) {
 
   const planLabels = _PLAN_LABELS;
 
-  const plan = me.plan || 'free';
+  const plan = me.is_admin ? 'admin' : (me.plan || 'free');
 
   // Plan badge near version string
 
