@@ -44,7 +44,7 @@ start_session(project_id="abc-123", session_name="feature-x", human_id="alice", 
 
 
 ### `get_session_brief`
-Compact session orientation (<500 tokens). Returns sprint focus, pending items, recent tasks, blocking failures, and open HITL requests. Ideal for worker/automation sessions that don't need the full context.
+Read-only: Call this FIRST for project summaries or to see what a session did — returns session, tasks, decisions, and recent commits in one call. Compact session orientation (<500 tokens): sprint focus, pending items, recent tasks, blocking failures, and open HITL requests. Ideal for worker/automation sessions that don't need the full context.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -81,7 +81,7 @@ log_task(session_id="session-uuid", project_id="abc-123", description="Fixed aut
 
 
 ### `get_tasks`
-Get recent tasks across all sessions.
+Read-only: Get recent tasks across all sessions.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -97,7 +97,7 @@ get_tasks(project_id="abc-123")
 
 
 ### `search_tasks`
-Search tasks by keyword or natural-language query. Uses trigram similarity on Postgres, LIKE on SQLite. Returns top matches with similarity score.
+Read-only: Search tasks by keyword or natural-language query. Uses trigram similarity on Postgres, LIKE on SQLite. Returns top matches with similarity score.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -115,7 +115,7 @@ search_tasks(project_id="abc-123", query="rate limiting bug")
 ## Goal & sprint
 
 ### `get_goal`
-Read the current goal state.
+Read-only: Read the current goal state.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -201,7 +201,7 @@ release_file(session_id="session-uuid", file_path="meridian/server.py")
 
 
 ### `idle_until_session_done`
-Wait on another session before touching a shared file. The tool polls every 30 seconds until the watched session is done.
+Read-only: Wait on another session before touching a shared file. The tool polls every 30 seconds until the watched session is done.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -253,7 +253,7 @@ Patch a pinned decision. Pass `new_title` + `new_body` to atomically supersede (
 
 
 ### `get_pinned_decisions`
-List pinned decisions (active only by default, newest first).
+Read-only: List pinned decisions (active only by default, newest first).
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -290,7 +290,7 @@ request_hitl(project_id="abc-123", question="Should we add rate limiting here?",
 
 
 ### `get_hitl_request`
-Poll a HITL request for the human's answer. Returns the row including `status` (`pending`/`answered`/`dismissed`) and `answer` text.
+Read-only: Poll a HITL request for the human's answer. Returns the row including `status` (`pending`/`answered`/`dismissed`) and `answer` text.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -306,7 +306,7 @@ get_hitl_request(request_id="hitl-uuid")
 ## Handoff & context
 
 ### `generate_handoff`
-Generate a context handoff document. `mode='full'` writes the complete L0/L1/L2 handoff. `mode='delta'` returns a compact session summary with completed items, pending items, and the next `/goal` string.
+Read-only: Generate a context handoff document. `mode='full'` writes the complete L0/L1/L2 handoff. `mode='delta'` returns a compact session summary with completed items, pending items, and the next `/goal` string.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -323,7 +323,7 @@ generate_handoff(project_id="abc-123", mode="delta", session_id="session-uuid")
 
 
 ### `get_context_block`
-Return a compact plain-text context block (north star, sprint, pending sprint items, recent tasks, recent decisions, active sessions). Use `mode='full'` to paste into a fresh Claude Code session; `mode='chat'` for a shorter paste into claude.ai.
+Read-only: Return a compact plain-text context block (north star, sprint, pending sprint items, recent tasks, recent decisions, active sessions). Use `mode='full'` to paste into a fresh Claude Code session; `mode='chat'` for a shorter paste into claude.ai.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -359,7 +359,7 @@ add_note(project_id="abc-123", title="Deploy note", body="Reminder: update env v
 
 
 ### `get_notes`
-List project notes (newest first). Filter by tag substring.
+Read-only: List project notes (newest first). Filter by tag substring.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|

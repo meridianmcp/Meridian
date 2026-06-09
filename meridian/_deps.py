@@ -24,16 +24,27 @@ from fastapi.templating import Jinja2Templates
 
 def _read_version() -> str:
     v = os.environ.get("MERIDIAN_VERSION", "")
-    if v:
+    if v and v != "dev":
         return v
     try:
         import tomllib
         _root = Path(__file__).parent.parent
-        with open(_root / "pixi.toml", "rb") as _f:
-            data = tomllib.load(_f)
-            return data.get("workspace", {}).get("version", "") or data.get("version", "dev")
+        for _fname in ("pyproject.toml", "pixi.toml"):
+            try:
+                with open(_root / _fname, "rb") as _f:
+                    data = tomllib.load(_f)
+                    ver = (
+                        data.get("project", {}).get("version", "")
+                        or data.get("workspace", {}).get("version", "")
+                        or data.get("version", "")
+                    )
+                    if ver:
+                        return ver
+            except FileNotFoundError:
+                continue
     except Exception:
-        return "1.0.0-alpha"
+        pass
+    return "1.0.0-alpha"
 
 
 def _read_git_sha() -> str:
