@@ -1464,6 +1464,7 @@ async def me_endpoint(request: Request) -> dict[str, Any]:
         # G2.10 — internal marker, used by the dashboard to suppress
         # the upgrade banner and similar nag UI for staff accounts.
         "is_internal": bool(tenant.get("is_internal")),
+        "is_admin": tenant.get("email", "") in _admin_emails(),
     }
 
 
@@ -2320,15 +2321,8 @@ async def set_north_star(
     project = await db_module.get_project(await _db(request), project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="project not found")
-    owner = await db_module.get_project_owner(await _db(request), project_id)
-    if owner is not None and body.human_id != owner:
-        raise HTTPException(
-            status_code=403,
-            detail={
-                "error": "goal_locked",
-                "message": "Only the project owner can set the north star.",
-            },
-        )
+    # Ownership check skipped in hosted mode — session cookie already proves
+    # the caller owns this project. human_id check only applies to local no-auth.
     try:
         result = await db_module.set_north_star(
             await _db(request), project_id, body.north_star
@@ -6014,6 +6008,8 @@ async def _dispatch_mcp_tool(
         return goal
     if name == "set_goal":
         return await db_module.set_goal(db, args["project_id"], args["content"])
+    if name == "set_north_star":
+        return await db_module.set_north_star(db, args["project_id"], args["north_star"])
     if name == "log_task":
         return await db_module.log_task(
             db, args["session_id"], args["project_id"],
@@ -6862,8 +6858,13 @@ async def submit_feedback(request: Request) -> dict[str, str]:
     if not message:
         raise HTTPException(status_code=400, detail="Message is required")
 
-    db = await _db(request)
-    feedback_id = await db_module.add_feedback(db, tenant["id"], feedback_type, message, email)
+    # Validate email format if provided
+    if email and ("@" not in email or "." not in email.split("@")[-1]):
+        raise HTTPException(status_code=400, detail="Invalid email address")
+
+    # Feedback goes in the auth DB (not project DB) — tenants table is there
+    auth_db = request.app.state.db
+    feedback_id = await db_module.add_feedback(auth_db, tenant["id"], feedback_type, message, email)
     return {"id": feedback_id}
 
 

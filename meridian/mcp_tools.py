@@ -92,6 +92,13 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"}, "content": {"type": "string"}}, "required": ["project_id", "content"]},
      "outputSchema": {"type": "object", "properties": {"project_id": {"type": "string"}, "content": {"type": "string"}}}},
+    {"name": "set_north_star", "description": "Update only the north star — the long-lived product vision that rarely changes. Distinct from the version goal (set_goal). Any team member can call this.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"},
+         "north_star": {"type": "string"}},
+         "required": ["project_id", "north_star"]},
+     "outputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"}, "north_star": {"type": "string"}}}},
     {"name": "log_task", "description": "Log a task this session completed or is working on. Valid statuses: pending, in_progress, done, failed, backlog, future, backburner.",
      "inputSchema": {"type": "object", "properties": {
          "session_id": {"type": "string"}, "project_id": {"type": "string"},
