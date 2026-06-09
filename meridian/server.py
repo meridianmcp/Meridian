@@ -6014,6 +6014,8 @@ async def _dispatch_mcp_tool(
         return goal
     if name == "set_goal":
         return await db_module.set_goal(db, args["project_id"], args["content"])
+    if name == "set_north_star":
+        return await db_module.set_north_star(db, args["project_id"], args["north_star"])
     if name == "log_task":
         return await db_module.log_task(
             db, args["session_id"], args["project_id"],
