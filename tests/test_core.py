@@ -7536,3 +7536,25 @@ def test_sprint_tools_via_mcp_sse_tools_list(client):
     names = {t["name"] for t in r.json()["result"]["tools"]}
     missing = {"set_sprint", "add_sprint_item", "complete_sprint_item", "get_sprint_items"} - names
     assert not missing, f"Missing from tools/list: {missing}"
+
+
+def test_note_title_size_limit(client):
+    """POST /notes rejects title exceeding 500 chars with 400."""
+    project = client.post("/projects", json={"name": "size-test"}).json()
+    r = client.post(
+        f"/projects/{project['id']}/notes",
+        json={"title": "t" * 501, "body": "some body content"},
+    )
+    assert r.status_code == 400
+    assert "note title" in r.json().get("detail", "").lower()
+
+
+def test_sprint_item_title_size_limit(client):
+    """POST /sprint-items rejects title exceeding 500 chars with 400."""
+    project = client.post("/projects", json={"name": "size-test-sprint"}).json()
+    r = client.post(
+        f"/projects/{project['id']}/sprint-items",
+        json={"version": "v1.0", "title": "t" * 501},
+    )
+    assert r.status_code == 400
+    assert "sprint item title" in r.json().get("detail", "").lower()

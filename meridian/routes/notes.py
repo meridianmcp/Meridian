@@ -6,7 +6,7 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import Response
 
-from .._deps import _db
+from .._deps import _db, validate_input_size
 from .. import db as db_module
 
 router = APIRouter()
@@ -35,6 +35,8 @@ async def create_project_note_endpoint(
     text = (body.get("body") or "").strip()
     if not title or not text:
         raise HTTPException(status_code=400, detail="title and body required")
+    validate_input_size(title, "note title", 500)
+    validate_input_size(text, "note body", 10_000_000)
     # G4.15 — safety limit
     from .. import limits as _limits  # noqa: PLC0415
     existing = await db_module.get_project_notes(await _db(request), project_id)
@@ -49,6 +51,10 @@ async def update_project_note_endpoint(
     project_id: str, note_id: str, body: dict[str, Any], request: Request
 ) -> dict[str, Any]:
     """Patch title/body/tags."""
+    if body.get("title") is not None:
+        validate_input_size(body.get("title"), "note title", 500)
+    if body.get("body") is not None:
+        validate_input_size(body.get("body"), "note body", 10_000_000)
     result = await db_module.update_project_note(
         await _db(request), note_id,
         title=body.get("title"),

@@ -5,7 +5,7 @@ from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
 
-from .._deps import _db
+from .._deps import _db, validate_input_size
 from .. import db as db_module
 
 router = APIRouter()
@@ -37,6 +37,8 @@ async def create_pinned_decision_endpoint(
     category = body.get("category", "TECHNICAL")
     if not title or not text:
         raise HTTPException(status_code=400, detail="title and body required")
+    validate_input_size(title, "decision title", 500)
+    validate_input_size(text, "decision body", 100_000)
     # G4.15 — safety limit
     from .. import limits as _limits  # noqa: PLC0415
     existing = await db_module.get_pinned_decisions(await _db(request), project_id)
@@ -62,6 +64,14 @@ async def update_pinned_decision_endpoint(
     db = await _db(request)
     new_title = body.get("new_title")
     new_body = body.get("new_body")
+    if new_title is not None:
+        validate_input_size(new_title, "decision title", 500)
+    if new_body is not None:
+        validate_input_size(new_body, "decision body", 100_000)
+    if body.get("title") is not None:
+        validate_input_size(body.get("title"), "decision title", 500)
+    if body.get("body") is not None:
+        validate_input_size(body.get("body"), "decision body", 100_000)
     if new_title and new_body:
         try:
             return await db_module.supersede_pinned_decision(

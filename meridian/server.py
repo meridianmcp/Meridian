@@ -40,6 +40,7 @@ from ._deps import (
     _data_dir,
     _is_demo_request,
     _get_tenant_from_request,
+    validate_input_size,
 )
 
 
@@ -2323,6 +2324,12 @@ async def set_goal(
                 ),
             },
         )
+    _goal_str = body.content if isinstance(body.content, str) else json.dumps(body.content)
+    validate_input_size(_goal_str, "goal", 10_000)
+    if body.north_star is not None:
+        validate_input_size(body.north_star, "north_star", 10_000)
+    if body.sprint is not None:
+        validate_input_size(body.sprint, "version_goal", 10_000)
     result = await db_module.set_goal(
         await _db(request), project_id, body.content,
         north_star=body.north_star, sprint=body.sprint,
@@ -2344,6 +2351,7 @@ async def set_north_star(
     project = await db_module.get_project(await _db(request), project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="project not found")
+    validate_input_size(body.north_star, "north_star", 10_000)
     # Ownership check skipped in hosted mode — session cookie already proves
     # the caller owns this project. human_id check only applies to local no-auth.
     try:
@@ -2368,6 +2376,7 @@ async def set_sprint(
     project = await db_module.get_project(await _db(request), project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="project not found")
+    validate_input_size(body.sprint, "version_goal", 10_000)
     try:
         result = await db_module.set_sprint(
             await _db(request), project_id, body.sprint
@@ -5079,6 +5088,7 @@ async def start_session_endpoint(
     project = await db_module.get_project(await _db(request), project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="project not found")
+    validate_input_size(body.session_name, "session name", 200)
     return await _start_session_composite(
         await _db(request),
         project_id,

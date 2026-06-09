@@ -308,3 +308,16 @@ def _is_demo_request(request: Request) -> bool:
     env_demo = os.environ.get("MERIDIAN_DEMO", "").lower() in ("1", "true", "yes")
     cookie_demo = bool(request.cookies.get(_DEMO_CONTEXT_COOKIE))
     return env_demo or cookie_demo
+
+
+# ---------------------------------------------------------------------------
+# Input size validation
+# ---------------------------------------------------------------------------
+
+def validate_input_size(value: str | None, field_name: str, max_chars: int) -> None:
+    """Raise HTTPException(400) if value exceeds max_chars. Never truncates silently."""
+    if len(value or "") > max_chars:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{field_name} exceeds {max_chars} character limit",
+        )
