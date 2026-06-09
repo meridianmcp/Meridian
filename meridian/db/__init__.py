@@ -1740,14 +1740,15 @@ async def get_project_by_name(
     ) as cur:
         row = await cur.fetchone()
     if row is None:
+        # Case-insensitive EXACT match fallback (not substring — avoids false 409s)
         async with db.execute(
             "SELECT p.*, gs.goal_sprint AS sprint "
             "FROM projects p "
             "LEFT JOIN goal_states gs ON gs.project_id = p.id "
-            "WHERE LOWER(p.name) LIKE ? "
+            "WHERE LOWER(p.name) = ? "
             "ORDER BY p.created_at DESC, gs.version DESC "
             "LIMIT 1",
-            (f"%{name.lower()}%",),
+            (name.lower(),),
         ) as cur:
             row = await cur.fetchone()
     return _row_to_dict(row)
