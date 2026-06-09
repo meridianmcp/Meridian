@@ -8879,6 +8879,7 @@ async function loadSettingsTab(projectId) {
         <div style="font-size:10px;color:var(--muted);margin-bottom:8px">Save as <code>.mcp.json</code> in your project root. Get your key from <a href="/settings#api-tokens" style="color:var(--accent,#a8ff78)">Settings → API tokens</a>.</div>
         <pre id="hosted-mcp-json-${escapeHtml(projectId)}" style="background:var(--surface-0);border:1px solid var(--border);border-radius:4px;padding:10px;font-size:10px;font-family:var(--font-mono);color:var(--text);overflow-x:auto;margin:0 0 6px 0;white-space:pre-wrap;word-break:break-all"></pre>
         <button class="secondary" id="copy-hosted-mcp-json-${escapeHtml(projectId)}" style="font-size:10px;padding:4px 10px">Copy .mcp.json</button>
+        ${mcpData && mcpData.github_repo ? `<button id="push-mcp-template-${escapeHtml(projectId)}" class="secondary" style="font-size:10px;padding:4px 10px;margin-left:4px" title="Push template.mcp.json to ${escapeHtml(mcpData.github_repo || '')}">Push to repo ↗</button>` : ""}
       </div>` : ""}
 
       <div style="font-size:10px;color:var(--muted);margin-bottom:10px">Add to <code>~/.codex/config.toml</code> — or run <code>codex mcp add meridian ${escapeHtml(mcpHttpUrl)}</code></div>
@@ -8946,6 +8947,27 @@ async function loadSettingsTab(projectId) {
       _codexCopySetup(`codex-copy-http-${projectId}`, httpText);
 
       _codexCopySetup(`codex-copy-goal-${projectId}`, goalText);
+
+      const pushBtn = document.getElementById(`push-mcp-template-${projectId}`);
+      if (pushBtn) {
+        pushBtn.onclick = async () => {
+          pushBtn.disabled = true;
+          pushBtn.textContent = 'Pushing…';
+          try {
+            await api(`/projects/${projectId}/github/push-mcp-template`, { method: 'POST' });
+            pushBtn.textContent = '✓ Pushed!';
+            pushBtn.style.color = '#059669';
+          } catch(e) {
+            const msg = String(e);
+            if (msg.includes('409')) {
+              pushBtn.textContent = 'Already exists';
+            } else {
+              pushBtn.textContent = 'Failed: ' + msg.slice(0,40);
+            }
+            pushBtn.disabled = false;
+          }
+        };
+      }
 
       const hostedMcpEl = document.getElementById(`hosted-mcp-json-${projectId}`);
       if (hostedMcpEl) hostedMcpEl.textContent = hostedMcpJson;
