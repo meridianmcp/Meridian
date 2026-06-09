@@ -214,12 +214,13 @@ CREATE TABLE IF NOT EXISTS sprint_items (
     version TEXT NOT NULL,
     title TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'pending'
-        CHECK (status IN ('pending','todo','in_progress','done','failed','skipped','pushed')),
+        CHECK (status IN ('pending','todo','in_progress','done','failed','skipped','pushed','indeterminate')),
     item_group TEXT,
     pushed_to TEXT,
     human_id TEXT,
     added_at TEXT NOT NULL DEFAULT (datetime('now')),
     completed_at TEXT,
+    claimed_at TEXT,
     task_id TEXT,
     notes TEXT,
     feedback_thumb SMALLINT,
@@ -1589,13 +1590,67 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_project_icon(db)
     await _migrate_tenants_is_internal(db)
     await _migrate_workspace_members_rbac(db)
-    await _migrate_sprint_item_claimed_at(db)
+    await _migrate_sprint_items_indeterminate(db)
     return db
 
 
-async def _migrate_sprint_item_claimed_at(db: aiosqlite.Connection) -> None:
-    """Add claimed_at to sprint_items for the claim_sprint_item MCP tool."""
+async def _migrate_sprint_items_indeterminate(db: aiosqlite.Connection) -> None:
+    """Add 'indeterminate' status + claimed_at column to sprint_items.
+
+    Widens the CHECK constraint (requires table rebuild in SQLite) and adds
+    the claimed_at column. Idempotent: no-op when already migrated.
+    """
+    async with db.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='sprint_items'"
+    ) as cur:
+        row = await cur.fetchone()
+    if row is None:
+        return  # fresh DB — CREATE_TABLES already has the new schema
+    sql = (row["sql"] if isinstance(row, dict) else row[0]) or ""
+    # Already migrated when both new values are present in the schema.
+    if "'indeterminate'" in sql and "claimed_at" in sql:
+        return
+    # Ensure claimed_at exists before the rebuild references it.
     await _migrate_add_column_if_missing(db, "sprint_items", "claimed_at", "TEXT")
+    # Rebuild with the new CHECK constraint.
+    await db.executescript(
+        """
+        CREATE TABLE sprint_items_new (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL REFERENCES projects(id),
+            version TEXT NOT NULL,
+            title TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending'
+                CHECK (status IN
+                    ('pending','todo','in_progress','done','failed','skipped','pushed','indeterminate')),
+            item_group TEXT,
+            pushed_to TEXT,
+            human_id TEXT,
+            added_at TEXT NOT NULL DEFAULT (datetime('now')),
+            completed_at TEXT,
+            claimed_at TEXT,
+            task_id TEXT,
+            notes TEXT,
+            feedback_thumb SMALLINT,
+            feedback_note TEXT,
+            milestone_type TEXT NOT NULL DEFAULT 'task'
+        );
+        INSERT INTO sprint_items_new
+            SELECT id, project_id, version, title, status,
+                   item_group, pushed_to, human_id,
+                   added_at, completed_at, claimed_at,
+                   task_id, notes, feedback_thumb, feedback_note,
+                   COALESCE(milestone_type, 'task')
+            FROM sprint_items;
+        DROP TABLE sprint_items;
+        ALTER TABLE sprint_items_new RENAME TO sprint_items;
+        CREATE INDEX IF NOT EXISTS idx_sprint_items_project
+            ON sprint_items(project_id, status);
+        CREATE INDEX IF NOT EXISTS idx_sprint_items_version
+            ON sprint_items(project_id, version);
+        """
+    )
+    await db.commit()
 
 
 async def _migrate_workspace_members_rbac(db: aiosqlite.Connection) -> None:
@@ -3361,7 +3416,7 @@ async def expire_inactive_sessions(
 
 
 _VALID_SPRINT_STATUSES = {
-    "pending", "todo", "in_progress", "done", "failed", "skipped", "pushed"
+    "pending", "todo", "in_progress", "done", "failed", "skipped", "pushed", "indeterminate"
 }
 
 
@@ -3569,10 +3624,11 @@ async def patch_sprint_item(
     item_id: str,
     title: str | None = None,
     version: str | None = None,
+    status: str | None = None,
     feedback_thumb: int | None = None,
     feedback_note: str | None = None,
 ) -> dict[str, Any] | None:
-    """Update editable fields (title, version, feedback) of a sprint item."""
+    """Update editable fields (title, version, status, feedback) of a sprint item."""
     fields: list[str] = []
     values: list[Any] = []
     if title is not None:
@@ -3581,6 +3637,11 @@ async def patch_sprint_item(
     if version is not None:
         fields.append("version = ?")
         values.append(version)
+    if status is not None:
+        if status not in _VALID_SPRINT_STATUSES:
+            raise ValueError(f"invalid sprint-item status: {status!r}")
+        fields.append("status = ?")
+        values.append(status)
     if feedback_thumb is not None:
         fields.append("feedback_thumb = ?")
         values.append(int(feedback_thumb))

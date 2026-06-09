@@ -154,6 +154,9 @@ async def patch_sprint_item_endpoint(
     version = body.get("version")
     if version is not None:
         version = version.strip() or None
+    status = body.get("status")
+    if status is not None and status not in {"pending", "indeterminate"}:
+        raise HTTPException(status_code=422, detail="status patch only supports 'pending' or 'indeterminate'")
     feedback_thumb = body.get("feedback_thumb")
     if feedback_thumb is not None:
         try:
@@ -165,6 +168,7 @@ async def patch_sprint_item_endpoint(
     feedback_note = body.get("feedback_note")
     item = await db_module.patch_sprint_item(
         await _db(request), project_id, item_id, title=title, version=version,
+        status=status,
         feedback_thumb=feedback_thumb, feedback_note=feedback_note,
     )
     if item is None:

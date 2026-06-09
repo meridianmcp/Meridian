@@ -5082,7 +5082,7 @@ function renderSprintProgress(projectId, items) {
 
     pending: '○', todo: '○', in_progress: '◑',
 
-    done: '●', failed: '✕', skipped: '—', pushed: '→'
+    done: '●', failed: '✕', skipped: '—', pushed: '→', indeterminate: '⚠'
 
   }[s] || '?');
 
@@ -5098,7 +5098,9 @@ function renderSprintProgress(projectId, items) {
 
     skipped: 'var(--muted)',
 
-    pushed: 'var(--accent)'
+    pushed: 'var(--accent)',
+
+    indeterminate: '#fbbf24'
 
   }[s] || 'var(--muted)');
 
@@ -5186,6 +5188,54 @@ function renderSprintProgress(projectId, items) {
 
 
 
+  // Indeterminate items — amber "⚠ Needs attention" section above the queue.
+
+  const indeterminateItems = items.filter(it => it.status === 'indeterminate');
+
+  let html = '';
+
+  if (indeterminateItems.length > 0) {
+
+    html += `<div style="background:#422b00;border:1px solid #fbbf24;border-radius:6px;padding:8px 10px;margin-bottom:10px">
+
+      <div style="color:#fbbf24;font-weight:600;margin-bottom:6px;font-size:12px">⚠ Needs attention (${indeterminateItems.length})</div>`;
+
+    html += indeterminateItems.map(it => `
+
+      <div class="sprint-item-row" data-item="${escapeHtml(it.id)}" style="background:transparent;border-bottom:1px solid #5a3b00;padding:4px 0">
+
+        <span class="sprint-item-icon" style="color:#fbbf24">⚠</span>
+
+        <span class="sprint-item-title">${escapeHtml(it.title)}</span>
+
+        <span class="sprint-item-ver">${escapeHtml(it.version)}</span>
+
+        <span class="sprint-item-actions">
+
+          <button class="sprint-btn" title="Mark done"
+
+            onclick="sprintAction('${escapeHtml(projectId)}','${escapeHtml(it.id)}','complete')">✓ Done</button>
+
+          <button class="sprint-btn" title="Back to pending"
+
+            onclick="fetch('/projects/${escapeHtml(projectId)}/sprint-items/${escapeHtml(it.id)}',{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({status:'pending'})}).then(()=>renderSprintProgress(${JSON.stringify(projectId)},items.map(x=>x.id===it.id?{...x,status:'pending'}:x)))">↩ Pending</button>
+
+          <button class="sprint-btn sprint-btn-fail" title="Mark failed"
+
+            onclick="sprintAction('${escapeHtml(projectId)}','${escapeHtml(it.id)}','fail')">✕ Fail</button>
+
+          <button class="sprint-btn" title="Backburner (skip)" style="color:var(--muted)"
+
+            onclick="sprintAction('${escapeHtml(projectId)}','${escapeHtml(it.id)}','skip')">— Backburner</button>
+
+        </span>
+
+      </div>`).join('');
+
+    html += `</div>`;
+
+  }
+
   // Group by version (then item_group within version).
 
   const versionOrder = [...new Set(displayItems.map(it => it.version || ''))];
@@ -5201,10 +5251,6 @@ function renderSprintProgress(projectId, items) {
     groups.get(g).push(it);
 
   });
-
-
-
-  let html = '';
 
   for (const [groupName, groupItems] of groups) {
 

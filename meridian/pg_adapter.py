@@ -870,7 +870,16 @@ async def init_pg_db(url: str) -> PostgresConnection:
         await _migrate_pg_v25_notification_prefs(conn)
         await _migrate_pg_tenants_is_internal(conn)
         await _migrate_pg_workspace_members_rbac(conn)
+    await _migrate_pg_sprint_items_claimed_at(conn)
     return conn
+
+
+async def _migrate_pg_sprint_items_claimed_at(conn: PostgresConnection) -> None:
+    """Add claimed_at to sprint_items (Task 8/9) and milestone_type if missing."""
+    await conn.executescript(
+        "ALTER TABLE sprint_items ADD COLUMN IF NOT EXISTS claimed_at TEXT;"
+        "ALTER TABLE sprint_items ADD COLUMN IF NOT EXISTS milestone_type TEXT NOT NULL DEFAULT 'task'"
+    )
 
 
 async def _migrate_pg_workspace_members_rbac(conn: PostgresConnection) -> None:
