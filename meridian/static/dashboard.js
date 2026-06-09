@@ -8866,7 +8866,7 @@ async function loadSettingsTab(projectId) {
         meridian: {
           type: "http",
           url: _mcpUrl,
-          headers: { Authorization: `Bearer ${currentToken || "sk_meridian_YOUR_KEY_HERE"}` }
+          headers: { Authorization: "Bearer sk_meridian_YOUR_KEY_HERE" }
         }
       }
     }, null, 2);
