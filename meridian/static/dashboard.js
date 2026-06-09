@@ -4389,11 +4389,14 @@ function buildTabBody(project) {
 
 
 
-  document.getElementById(`save-goal-${project.id}`).onclick = () => saveGoal(project.id);
+  const saveGoalBtn = document.getElementById(`save-goal-${project.id}`);
+  if (saveGoalBtn) saveGoalBtn.onclick = () => saveGoal(project.id);
 
-  document.getElementById(`save-north-star-${project.id}`).onclick = () => saveNorthStar(project.id);
+  const saveNorthStarBtn = document.getElementById(`save-north-star-${project.id}`);
+  if (saveNorthStarBtn) saveNorthStarBtn.onclick = () => saveNorthStar(project.id);
 
-  document.getElementById(`save-sprint-${project.id}`).onclick = () => saveSprint(project.id);
+  const saveSprintBtn = document.getElementById(`save-sprint-${project.id}`);
+  if (saveSprintBtn) saveSprintBtn.onclick = () => saveSprint(project.id);
 
 
 
@@ -7942,6 +7945,8 @@ async function loadSettingsTab(projectId) {
 
   // Fetch both in parallel; mcp-config 404 = self-hosted (skip section).
 
+  try {
+
   const [notifResult, mcpResult, settingsResult, ntfyResult, ghResult] = await Promise.allSettled([
 
     api('/settings/notifications'),
@@ -10798,6 +10803,10 @@ async function loadSettingsTab(projectId) {
 
   }
 
+  } catch (e) {
+    body.innerHTML = `<div style="color:var(--error);font-size:11px">Failed to load settings: ${escapeHtml(String(e))}</div>`;
+  }
+
 }
 
 
@@ -12868,9 +12877,9 @@ async function refreshGoal(projectId) {
 
       if (shippedEl) {
 
-        shippedEl.style.display = 'block';
-
         shippedEl.textContent = body.slice(0, editStart).trimEnd();
+
+        shippedEl.style.display = shippedEl.textContent.trim() ? 'block' : 'none';
 
       }
 
@@ -13665,6 +13674,7 @@ async function loadPinnedDecisions(projectId) {
         sel.style.top = (tag.getBoundingClientRect().bottom + window.scrollY) + 'px';
         document.body.appendChild(sel);
         sel.focus();
+        sel.click();
         sel.onblur = () => sel.remove();
         sel.onchange = async () => {
           const newCat = sel.value;
