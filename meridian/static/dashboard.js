@@ -8591,8 +8591,6 @@ async function loadSettingsTab(projectId) {
 
       let activeClient = 'claude-desktop';
 
-      let currentToken = null;
-
       let currentPid = firstPid;
 
 
@@ -10254,6 +10252,8 @@ async function loadSettingsTab(projectId) {
   }
 
 
+  // Shared token variable for both setTimeout blocks (MCP config and hooks config)
+  let currentToken = null;
 
   setTimeout(() => {
 
