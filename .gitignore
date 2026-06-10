@@ -274,3 +274,6 @@ extensions/mcp-text-editor/.pixi/
 launch/
 
 .mcp.json
+
+# Codex session state files
+.codex-*-state.json
