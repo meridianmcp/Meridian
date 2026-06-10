@@ -794,7 +794,7 @@ async def auth_github_repo_connect(request: Request) -> RedirectResponse:
     return RedirectResponse(url, status_code=302)
 
 
-async def auth_github_repo_callback(request: Request) -> RedirectResponse:
+async def auth_github_repo_callback(request: Request, db: Any) -> RedirectResponse:
     """Handle GitHub repo-connect callback and store the tenant token."""
     from . import db as db_module
 
@@ -818,8 +818,9 @@ async def auth_github_repo_callback(request: Request) -> RedirectResponse:
 
     access_token = connection.get("access_token", "")
     repos = connection.get("repos") or []
-    selected_repo = (tenant.get("github_repo") or "").strip()
-    selected_branch = (tenant.get("github_branch") or "main").strip()
+    project = await db_module.get_project(db, project_id)
+    selected_repo = ((project or {}).get("github_repo") or "").strip()
+    selected_branch = ((project or {}).get("github_branch") or "main").strip()
     repo_lookup = {repo.get("full_name", ""): repo for repo in repos if repo.get("full_name")}
     if selected_repo and selected_repo in repo_lookup:
         selected_branch = (selected_branch or repo_lookup[selected_repo].get("default_branch") or "main").strip()
@@ -828,10 +829,15 @@ async def auth_github_repo_callback(request: Request) -> RedirectResponse:
         selected_repo = (first_repo.get("full_name") or "").strip()
         selected_branch = (first_repo.get("default_branch") or "main").strip()
 
+    # PAT stays on tenant (it's the auth credential, not project-specific)
     await db_module.update_tenant(
         request.app.state.db,
         tenant["id"],
         github_pat=db_module.encrypt_field(access_token),
+    )
+    # Repo + branch are per-project
+    await db_module.update_project_settings(
+        db, project_id,
         github_repo=selected_repo or None,
         github_branch=selected_branch or "main",
     )

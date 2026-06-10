@@ -115,7 +115,7 @@ if [[ $CLAUDE_CODE_DETECTED -eq 1 ]]; then
     SETTINGS="{}"
   fi
 
-  START_CMD="curl -s -X POST ${HEADERS} -d '{\"project_id\":\"${PROJECT_ID}\"}' ${MERIDIAN_URL}/hooks/session-start | jq -r '.hookSpecificOutput.additionalContext // empty'"
+  START_CMD="curl -s -X POST ${HEADERS} -d '{\"project_id\":\"${PROJECT_ID}\",\"cwd\":\"'\"\$PWD\"'\"}' ${MERIDIAN_URL}/hooks/session-start | jq -r '.hookSpecificOutput.additionalContext // empty'"
   STOP_CMD="curl -s -X POST ${HEADERS} -d '{\"project_id\":\"${PROJECT_ID}\"}' ${MERIDIAN_URL}/hooks/stop"
 
   # Use jq to merge hooks into settings without clobbering existing keys
@@ -134,7 +134,7 @@ if [[ $CODEX_DETECTED -eq 1 ]]; then
   echo "Codex detected - writing config to ${CODEX_CONFIG}"
   mkdir -p "$(dirname "$CODEX_CONFIG")"
 
-  START_CMD="curl -s -X POST ${HEADERS} -d '{\"project_id\":\"${PROJECT_ID}\"}' ${MERIDIAN_URL}/hooks/session-start | jq -r '.hookSpecificOutput.additionalContext // empty'"
+  START_CMD="curl -s -X POST ${HEADERS} -d '{\"project_id\":\"${PROJECT_ID}\",\"cwd\":\"'\"\$PWD\"'\"}' ${MERIDIAN_URL}/hooks/session-start | jq -r '.hookSpecificOutput.additionalContext // empty'"
   STOP_CMD="curl -s -X POST ${HEADERS} -d '{\"project_id\":\"${PROJECT_ID}\"}' ${MERIDIAN_URL}/hooks/stop"
   START_CMD_TOML="$(toml_quote "$START_CMD")"
   STOP_CMD_TOML="$(toml_quote "$STOP_CMD")"

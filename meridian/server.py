@@ -1375,7 +1375,8 @@ async def auth_github_repo_connect(request: Request):
 async def auth_github_repo_callback(request: Request):
     """Handle GitHub repo-connect callback and store repo access."""
     from .hosted import auth_github_repo_callback as _auth_github_repo_callback
-    return await _auth_github_repo_callback(request)
+    db = await _db(request)
+    return await _auth_github_repo_callback(request, db)
 
 
 @app.get("/auth/microsoft/login")
@@ -4407,15 +4408,16 @@ async def github_connect(project_id: str, request: Request) -> dict[str, Any]:
     except RuntimeError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
-    update_fields: dict[str, Any] = {
-        "github_repo": repo,
-        "github_branch": branch,
-    }
     if pat:
-        update_fields["github_pat"] = db_module.encrypt_field(pat)
-    await db_module.update_tenant(
-        request.app.state.db, tenant["id"],
-        **update_fields,
+        await db_module.update_tenant(
+            request.app.state.db, tenant["id"],
+            github_pat=db_module.encrypt_field(pat),
+        )
+    db = await _db(request)
+    await db_module.update_project_settings(
+        db, project_id,
+        github_repo=repo,
+        github_branch=branch,
     )
     return {
         "connected": True,
@@ -4429,18 +4431,20 @@ async def github_connect(project_id: str, request: Request) -> dict[str, Any]:
 
 @app.get("/projects/{project_id}/github/status")
 async def github_status(project_id: str, request: Request) -> dict[str, Any]:
-    """Return the tenant's current GitHub connection status."""
+    """Return the project's current GitHub connection status."""
     if not _hosted_mode():
         raise HTTPException(status_code=404)
     from .hosted import _github_user_snapshot as _github_snapshot
     tenant = await _get_tenant_from_request(request)
     if tenant is None:
         raise HTTPException(status_code=401, detail="not authenticated")
-    # Re-fetch from auth DB to get latest values
     fresh = await db_module.get_tenant_by_id(request.app.state.db, tenant["id"])
     if not fresh:
         raise HTTPException(status_code=404, detail="tenant not found")
     token = db_module.decrypt_field(fresh.get("github_pat"))
+    project = await db_module.get_project(await _db(request), project_id)
+    selected_repo = (project or {}).get("github_repo") or ""
+    selected_branch = (project or {}).get("github_branch") or "main"
     snapshot: dict[str, Any] | None = None
     if token:
         try:
@@ -4448,13 +4452,13 @@ async def github_status(project_id: str, request: Request) -> dict[str, Any]:
         except Exception:
             snapshot = None
     repos = (snapshot or {}).get("repos") or []
-    selected_repo = fresh.get("github_repo") or ""
     if selected_repo and repos and not any(r.get("full_name") == selected_repo for r in repos):
-        repos = [{"full_name": selected_repo, "name": selected_repo.split("/")[-1], "owner": selected_repo.split("/")[0] if "/" in selected_repo else "", "html_url": "", "default_branch": fresh.get("github_branch") or "main", "private": False, "updated_at": ""}] + repos
+        repos = [{"full_name": selected_repo, "name": selected_repo.split("/")[-1], "owner": selected_repo.split("/")[0] if "/" in selected_repo else "", "html_url": "", "default_branch": selected_branch, "private": False, "updated_at": ""}] + repos
     return {
-        "connected": bool(token),
+        "connected": bool(token and selected_repo),
+        "pat_linked": bool(token),
         "repo": selected_repo,
-        "branch": fresh.get("github_branch") or "main",
+        "branch": selected_branch,
         "github_user": (snapshot or {}).get("login", ""),
         "avatar_url": (snapshot or {}).get("avatar_url", ""),
         "repos": repos,
@@ -4482,9 +4486,10 @@ async def repo_image_proxy(project_id: str, request: Request, path: str = ""):
     if tenant is None:
         raise HTTPException(401, "not authenticated")
     fresh = await db_module.get_tenant_by_id(request.app.state.db, tenant["id"])
-    repo = (fresh or {}).get("github_repo") or ""
-    branch = (fresh or {}).get("github_branch") or "main"
     pat = db_module.decrypt_field((fresh or {}).get("github_pat")) if fresh else None
+    project = await db_module.get_project(await _db(request), project_id)
+    repo = (project or {}).get("github_repo") or ""
+    branch = (project or {}).get("github_branch") or "main"
     if not repo or not pat:
         raise HTTPException(404, "no repo connected")
     clean = path.strip().lstrip("/")
@@ -4530,8 +4535,10 @@ async def push_mcp_template(project_id: str, request: Request) -> dict[str, Any]
     if tenant is None:
         raise HTTPException(status_code=401, detail="not authenticated")
 
-    pat = tenant.get("github_pat")
-    repo = tenant.get("github_repo")
+    fresh = await db_module.get_tenant_by_id(request.app.state.db, tenant["id"])
+    project = await db_module.get_project(await _db(request), project_id)
+    pat = (fresh or {}).get("github_pat")
+    repo = (project or {}).get("github_repo")
     if not pat or not repo:
         raise HTTPException(status_code=400, detail="No GitHub repo connected. Connect one in Settings first.")
 
@@ -4580,15 +4587,15 @@ async def push_mcp_template(project_id: str, request: Request) -> dict[str, Any]
 
 @app.delete("/projects/{project_id}/github/disconnect", status_code=200)
 async def github_disconnect(project_id: str, request: Request) -> dict[str, Any]:
-    """Clear the tenant's stored GitHub credentials."""
+    """Clear the project's stored GitHub repo (keeps tenant PAT for other projects)."""
     if not _hosted_mode():
         raise HTTPException(status_code=404)
     tenant = await _get_tenant_from_request(request)
     if tenant is None:
         raise HTTPException(status_code=401, detail="not authenticated")
-    await db_module.update_tenant(
-        request.app.state.db, tenant["id"],
-        github_pat=None,
+    db = await _db(request)
+    await db_module.update_project_settings(
+        db, project_id,
         github_repo=None,
         github_branch=None,
     )
@@ -4656,8 +4663,9 @@ async def github_branches(project_id: str, request: Request) -> dict[str, Any]:
     if tenant is None:
         raise HTTPException(status_code=401, detail="not authenticated")
     fresh = await db_module.get_tenant_by_id(request.app.state.db, tenant["id"])
-    repo = (request.query_params.get("repo") or (fresh or {}).get("github_repo") or "").strip()
-    default_branch = (fresh or {}).get("github_branch") or "main"
+    project = await db_module.get_project(await _db(request), project_id)
+    repo = (request.query_params.get("repo") or (project or {}).get("github_repo") or "").strip()
+    default_branch = (project or {}).get("github_branch") or "main"
     token = db_module.decrypt_field((fresh or {}).get("github_pat")) if fresh else None
     branches: list[str] = []
     source = "fallback"
@@ -5303,6 +5311,7 @@ async def hooks_session_start(body: dict[str, Any], request: Request) -> dict[st
         from fastapi.responses import JSONResponse
         return JSONResponse(status_code=400, content={"error": "project_id required"})
     session_name = (body.get("session_name") or "hook-session").strip()
+    hook_cwd = (body.get("cwd") or "").strip()
     db = await _resolve_hook_db(request)
     project = await db_module.get_project(db, project_id)
     if project is None:
@@ -5327,6 +5336,20 @@ async def hooks_session_start(body: dict[str, Any], request: Request) -> dict[st
     sprint_items = await db_module.get_sprint_items(db, project_id, status="pending")
     recent = result.get("recent_tasks") or []
     lines = [f"PROJECT: {project['name']} ({project_id[:8]})"]
+    # cwd mismatch check: warn when executor_config.repo_path is set but doesn't match the hook's cwd
+    if hook_cwd:
+        try:
+            exec_cfg = (project.get("executor_config") or {})
+            if isinstance(exec_cfg, str):
+                import json as _json
+                exec_cfg = _json.loads(exec_cfg) or {}
+            repo_path = (exec_cfg.get("repo_path") or "").strip()
+            if repo_path:
+                norm = lambda p: p.replace("\\", "/").rstrip("/").lower()
+                if norm(hook_cwd) != norm(repo_path):
+                    lines.insert(0, f"⚠ WARNING: Hooks fired from {hook_cwd} but repo_path is {repo_path}. Wrong directory?")
+        except Exception:  # noqa: BLE001
+            pass
     if goal.get("north_star"):
         lines.append(f"NORTH STAR: {goal['north_star'][:300]}")
     if goal.get("sprint"):
@@ -6014,73 +6037,89 @@ def _github_tools_for_tenant(tenant: dict) -> list[dict[str, Any]]:
     """Return the 5 GitHub tool defs if the tenant has a GitHub PAT set."""
     if not db_module.decrypt_field(tenant.get("github_pat")):
         return []
+    _pid_prop = {"project_id": {"type": "string", "description": "Project ID whose GitHub repo to use."}}
     return [
         {
             "name": "read_file",
-            "description": "Read a file from the connected GitHub repository. Returns decoded UTF-8 content.",
+            "description": "Read a file from the project's connected GitHub repository. Returns decoded UTF-8 content.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
+                    "project_id": {"type": "string", "description": "Project ID whose GitHub repo to use."},
                     "path": {"type": "string", "description": "File path relative to repo root (e.g. src/main.py)"},
                     "ref": {"type": "string", "description": "Branch, tag, or commit SHA (default: configured branch)"},
                 },
-                "required": ["path"],
+                "required": ["project_id", "path"],
             },
         },
         {
             "name": "list_files",
-            "description": "List all files in the connected GitHub repository (recursive tree).",
+            "description": "List all files in the project's connected GitHub repository (recursive tree).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
+                    **_pid_prop,
                     "path": {"type": "string", "description": "Subdirectory to list (default: repo root)"},
                 },
+                "required": ["project_id"],
             },
         },
         {
             "name": "search_code",
-            "description": "Search code in the connected GitHub repository using GitHub code search.",
+            "description": "Search code in the project's connected GitHub repository using GitHub code search.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
+                    **_pid_prop,
                     "query": {"type": "string", "description": "Search query string (GitHub code search syntax)"},
                 },
-                "required": ["query"],
+                "required": ["project_id", "query"],
             },
         },
         {
             "name": "get_commits",
-            "description": "Return recent commits from the connected GitHub repository.",
+            "description": "Return recent commits from the project's connected GitHub repository.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
+                    **_pid_prop,
                     "limit": {"type": "integer", "description": "Number of commits to return (default: 10, max: 50)"},
                 },
+                "required": ["project_id"],
             },
         },
         {
             "name": "get_commit",
-            "description": "Return details for a specific commit from the connected GitHub repository.",
+            "description": "Return details for a specific commit from the project's connected GitHub repository.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
+                    **_pid_prop,
                     "sha": {"type": "string", "description": "Full or short commit SHA"},
                 },
-                "required": ["sha"],
+                "required": ["project_id", "sha"],
             },
         },
     ]
 
 
-async def _dispatch_github_tool(name: str, args: dict[str, Any], tenant: dict) -> Any:
-    """Dispatch a GitHub MCP tool call using the tenant's stored PAT."""
+async def _dispatch_github_tool(name: str, args: dict[str, Any], tenant: dict, db: Any) -> Any:
+    """Dispatch a GitHub MCP tool call using the tenant's PAT and per-project repo."""
     import httpx as _httpx
     import base64 as _b64
     pat = db_module.decrypt_field(tenant.get("github_pat"))
-    repo = tenant.get("github_repo") or ""
-    branch = tenant.get("github_branch") or "main"
-    if not pat or not repo:
-        return {"error": "GitHub not connected — use POST /projects/{id}/github/connect"}
+    if not pat:
+        return {"error": "GitHub not connected — connect via Settings > Connect Claude Code > GitHub"}
+    project_id = (args.get("project_id") or "").strip()
+    if not project_id:
+        return {"error": "project_id is required — pass the project whose GitHub repo you want to read"}
+    project = await db_module.get_project(db, project_id)
+    if project is None:
+        return {"error": f"project '{project_id}' not found"}
+    repo = (project.get("github_repo") or "").strip()
+    branch = (project.get("github_branch") or "main").strip()
+    if not repo:
+        return {"error": f"No GitHub repo connected for project {project_id} — use POST /projects/{project_id}/github/connect"}
     gh_headers = {"Authorization": f"token {pat}", "Accept": "application/vnd.github+json"}
     async with _httpx.AsyncClient(timeout=15.0) as http:
         if name == "read_file":
@@ -6206,7 +6245,7 @@ async def _handle_mcp_request(
             return _jsonrpc_err(req_id, -32603, f"tool '{name}' not allowed for read-only tokens")
         try:
             if name in _GITHUB_TOOL_NAMES and tenant:
-                result = await _dispatch_github_tool(name, args, tenant)
+                result = await _dispatch_github_tool(name, args, tenant, db)
             else:
                 result = await _dispatch_mcp_tool(name, args, db, data_dir, tenant=tenant)
             return _jsonrpc_ok(req_id, {"content": [{"type": "text", "text": json.dumps(result)}]})
@@ -6792,6 +6831,16 @@ async def _ensure_oauth_token_table(db: Any) -> None:
             created_at TEXT NOT NULL DEFAULT (datetime('now'))
         )"""
     )
+    await db.execute(
+        """CREATE TABLE IF NOT EXISTS oauth_codes (
+            code TEXT PRIMARY KEY,
+            tenant_id TEXT,
+            redirect_uri TEXT NOT NULL,
+            code_challenge TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )"""
+    )
     await db.commit()
 
 
@@ -6972,14 +7021,28 @@ async def _oauth_auth(request: Request):
             if _sess:
                 _tenant_id = _sess.get("tenant_id")
 
-    code = _sec.token_urlsafe(32)
+    code = _sec.token_hex(32)
+    _redirect_uri = p.get("redirect_uri", "")
+    _challenge = p.get("code_challenge") or ""
     _oa_codes[code] = {"client_id": p.get("client_id", ""),
-        "redirect_uri": p.get("redirect_uri", ""),
-        "challenge": p.get("code_challenge"),
+        "redirect_uri": _redirect_uri,
+        "challenge": _challenge,
         "tenant_id": _tenant_id,
         "exp": _tm.time() + 600}
+    try:
+        from datetime import datetime as _dt, timezone as _tz, timedelta as _td_cls
+        _expires = (_dt.now(tz=_tz.utc) + _td_cls(minutes=10)).strftime("%Y-%m-%d %H:%M:%S")
+        _adb = request.app.state.db
+        await _adb.execute(
+            "INSERT OR REPLACE INTO oauth_codes (code, tenant_id, redirect_uri, code_challenge, expires_at)"
+            " VALUES (?, ?, ?, ?, ?)",
+            (code, _tenant_id, _redirect_uri, _challenge, _expires),
+        )
+        await _adb.commit()
+    except Exception:
+        pass
     qs = _ue({"code": code, "state": p.get("state", "")})
-    return _RR(f"{p.get('redirect_uri', '')}?{qs}")
+    return _RR(f"{_redirect_uri}?{qs}")
 
 
 @app.post("/oauth/token")
@@ -6988,32 +7051,99 @@ async def _oauth_token(request: Request):
     d = dict(await request.json() if "json" in ct else await request.form())
     if d.get("grant_type") != "authorization_code":
         return JSONResponse({"error": "unsupported_grant_type"}, status_code=400)
+    # S256 is the only supported PKCE method
+    _method = d.get("code_challenge_method", "")
+    if _method and _method != "S256":
+        return JSONResponse({"error": "invalid_request", "error_description": "Only S256 code_challenge_method is supported"}, status_code=400)
     code = d.get("code", "")
-    if code not in _oa_codes:
+    auth_db = request.app.state.db
+    # Look up code from DB first (survives restarts), fall back to in-memory
+    cd: dict | None = None
+    try:
+        from datetime import datetime as _dt, timezone as _tz
+        async with auth_db.execute(
+            "SELECT tenant_id, redirect_uri, code_challenge, expires_at FROM oauth_codes WHERE code = ?",
+            (code,),
+        ) as _cur:
+            _row = await _cur.fetchone()
+        if _row:
+            _exp_str = _row["expires_at"] if hasattr(_row, "__getitem__") else _row[3]
+            _exp_dt = _dt.fromisoformat(str(_exp_str).replace("Z", "+00:00"))
+            if _exp_dt.tzinfo is None:
+                from datetime import timezone as _tz2
+                _exp_dt = _exp_dt.replace(tzinfo=_tz2.utc)
+            if _dt.now(tz=_tz.utc) > _exp_dt:
+                await auth_db.execute("DELETE FROM oauth_codes WHERE code = ?", (code,))
+                await auth_db.commit()
+                return JSONResponse({"error": "invalid_grant"}, status_code=400)
+            cd = {
+                "client_id": d.get("client_id", ""),
+                "redirect_uri": _row["redirect_uri"] if hasattr(_row, "__getitem__") else _row[1],
+                "challenge": _row["code_challenge"] if hasattr(_row, "__getitem__") else _row[2],
+                "tenant_id": _row["tenant_id"] if hasattr(_row, "__getitem__") else _row[0],
+            }
+            await auth_db.execute("DELETE FROM oauth_codes WHERE code = ?", (code,))
+            await auth_db.commit()
+    except Exception:
+        pass
+    if cd is None:
+        if code not in _oa_codes:
+            return JSONResponse({"error": "invalid_grant"}, status_code=400)
+        _mem = _oa_codes.pop(code)
+        if _tm.time() > _mem["exp"]:
+            return JSONResponse({"error": "invalid_grant"}, status_code=400)
+        cd = {
+            "client_id": _mem.get("client_id", ""),
+            "redirect_uri": _mem.get("redirect_uri", ""),
+            "challenge": _mem.get("challenge", ""),
+            "tenant_id": _mem.get("tenant_id"),
+        }
+    # redirect_uri must match what was stored
+    if cd["redirect_uri"] and d.get("redirect_uri") != cd["redirect_uri"]:
         return JSONResponse({"error": "invalid_grant"}, status_code=400)
-    cd = _oa_codes.pop(code)
-    if _tm.time() > cd["exp"]:
-        return JSONResponse({"error": "invalid_grant"}, status_code=400)
-    v = d.get("code_verifier")
-    if cd.get("challenge") and v:
+    # Validate code_verifier length
+    v = d.get("code_verifier", "")
+    if v and not (43 <= len(v) <= 128):
+        return JSONResponse({"error": "invalid_request", "error_description": "code_verifier must be 43-128 characters"}, status_code=400)
+    # Verify PKCE challenge when present
+    if cd["challenge"]:
+        if not v:
+            return JSONResponse({"error": "invalid_grant"}, status_code=400)
         ch = _b64.urlsafe_b64encode(_hs.sha256(v.encode()).digest()).decode().rstrip("=")
         if ch != cd["challenge"]:
             return JSONResponse({"error": "invalid_grant"}, status_code=400)
-    tok = _sec.token_urlsafe(32)
+    # Generate sk_meridian_ token
+    tok = f"sk_meridian_{_sec.token_urlsafe(32)}"
     tok_hash = _oauth_token_hash(tok)
+    tenant_id = cd.get("tenant_id")
     tok_data = {
         "client_id": cd["client_id"],
         "exp": int(_tm.time() + 86400 * 90),
-        "tenant_id": cd.get("tenant_id"),  # propagate for per-tenant DB routing
+        "tenant_id": tenant_id,
     }
     _oa_tokens[tok_hash] = tok_data
-    await _upsert_oauth_token(
-        request.app.state.db,
-        tok_hash,
-        tenant_id=tok_data.get("tenant_id"),
-        client_id=tok_data["client_id"],
-        exp=tok_data["exp"],
-    )
+    if tenant_id:
+        # Hosted mode: store in api_tokens so Bearer auth and _db() routing both work
+        import uuid as _uuid
+        _api_tid = str(_uuid.uuid4())
+        try:
+            await auth_db.execute(
+                "INSERT INTO api_tokens (id, tenant_id, token_hash, label, token_type)"
+                " VALUES (?, ?, ?, ?, ?)",
+                (_api_tid, tenant_id, tok_hash, "oauth", "readwrite"),
+            )
+            await auth_db.commit()
+        except Exception:
+            pass
+    else:
+        # Self-hosted / local: store in oauth_tokens as before
+        await _upsert_oauth_token(
+            auth_db,
+            tok_hash,
+            tenant_id=None,
+            client_id=tok_data["client_id"],
+            exp=tok_data["exp"],
+        )
     _save_oa_tokens(_oa_tokens)
     return JSONResponse({"access_token": tok, "token_type": "bearer", "expires_in": 86400 * 90})
 
