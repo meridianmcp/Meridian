@@ -5236,6 +5236,188 @@ function renderSprintProgress(projectId, items) {
 
   }
 
+  // Build parent → children map across all items (for progress counts + tree display).
+
+  const allChildrenOf = new Map();
+
+  items.forEach(it => {
+
+    if (it.parent_id) {
+
+      if (!allChildrenOf.has(it.parent_id)) allChildrenOf.set(it.parent_id, []);
+
+      allChildrenOf.get(it.parent_id).push(it);
+
+    }
+
+  });
+
+  // IDs of displayed items that have children (parents in displayItems).
+
+  const displayedParentIds = new Set(
+
+    displayItems.map(it => it.id).filter(id => allChildrenOf.has(id))
+
+  );
+
+  // Children of displayed parents, keyed by parent id (to render under parent, not standalone).
+
+  const displayChildrenOf = new Map();
+
+  displayItems.forEach(it => {
+
+    if (it.parent_id && displayedParentIds.has(it.parent_id)) {
+
+      if (!displayChildrenOf.has(it.parent_id)) displayChildrenOf.set(it.parent_id, []);
+
+      displayChildrenOf.get(it.parent_id).push(it);
+
+    }
+
+  });
+
+  const renderItem = (it, isChild) => {
+
+    const icon = statusIcon(it.status);
+
+    const color = statusColor(it.status);
+
+    const isActive = activeSet.has(it.status);
+
+    const meta = it.pushed_to
+
+      ? `<span class="sprint-item-meta">→ ${escapeHtml(it.pushed_to)}</span>`
+
+      : (it.notes ? `<span class="sprint-item-meta">${escapeHtml(it.notes.slice(0,60))}</span>` : '');
+
+    const editBtn = `<button class="sprint-btn" title="Edit title/version"
+
+             onclick="sprintItemEdit('${escapeHtml(projectId)}','${escapeHtml(it.id)}')">✏</button>`;
+
+    const thumbUp = it.feedback_thumb === 1 ? 'color:var(--accent-green)' : 'opacity:0.4';
+
+    const thumbDn = it.feedback_thumb === -1 ? 'color:var(--status-failed)' : 'opacity:0.4';
+
+    const feedbackHtml = it.status === 'done'
+
+      ? `<span class="sprint-item-feedback" style="display:inline-flex;align-items:center;gap:4px;font-size:11px;margin-left:4px">
+
+           <button title="Good" style="background:none;border:none;cursor:pointer;padding:0 2px;${thumbUp}"
+
+             onclick="sprintFeedback('${escapeHtml(projectId)}','${escapeHtml(it.id)}',1,${it.feedback_thumb == null ? 'null' : it.feedback_thumb},event)">👍</button>
+
+           <button title="Needs rework" style="background:none;border:none;cursor:pointer;padding:0 2px;${thumbDn}"
+
+             onclick="sprintFeedback('${escapeHtml(projectId)}','${escapeHtml(it.id)}',-1,${it.feedback_thumb == null ? 'null' : it.feedback_thumb},event)">👎</button>
+
+           ${it.feedback_note
+
+             ? `<span style="color:var(--muted);font-size:10px;max-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${escapeHtml(it.feedback_note)}">${escapeHtml(it.feedback_note)}</span>`
+
+             : `<input style="background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:9px;font-family:var(--font-mono);padding:1px 4px;width:80px" placeholder="note…"
+
+                   onblur="sprintFeedbackNote('${escapeHtml(projectId)}','${escapeHtml(it.id)}',this.value)"
+
+                   onkeydown="if(event.key==='Enter'){this.blur()}">`}
+
+         </span>`
+
+      : '';
+
+    const actions = isActive
+
+      ? `<span class="sprint-item-actions">
+
+           <button class="sprint-btn" title="Done"
+
+             onclick="sprintAction('${escapeHtml(projectId)}','${escapeHtml(it.id)}','complete')">✓</button>
+
+           <button class="sprint-btn" title="Skip"
+
+             onclick="sprintAction('${escapeHtml(projectId)}','${escapeHtml(it.id)}','skip')">—</button>
+
+           <button class="sprint-btn sprint-btn-fail" title="Fail"
+
+             onclick="sprintAction('${escapeHtml(projectId)}','${escapeHtml(it.id)}','fail')">✕</button>
+
+           <button class="sprint-btn sprint-btn-push" title="Push to next version"
+
+             onclick="sprintPushPrompt('${escapeHtml(projectId)}','${escapeHtml(it.id)}')">→</button>
+
+           ${editBtn}
+
+         </span>`
+
+      : `<span class="sprint-item-actions">${meta}${editBtn}${feedbackHtml}</span>`;
+
+    // Children progress badge for parent items.
+
+    const allKids = allChildrenOf.get(it.id) || [];
+
+    const kidDone = allKids.filter(c => c.status === 'done').length;
+
+    const childBadge = allKids.length > 0
+
+      ? `<span style="font-size:10px;color:var(--muted);margin-left:4px">[${kidDone}/${allKids.length}]</span>`
+
+      : '';
+
+    const indBadge = it.status === 'indeterminate'
+
+      ? `<span style="color:#fbbf24;margin-left:4px;font-size:11px">⚠</span>`
+
+      : '';
+
+    const indentStyle = isChild
+
+      ? 'margin-left:16px;border-left:2px solid var(--border);padding-left:8px;'
+
+      : '';
+
+    const rowHtml = `<div class="sprint-item-row" data-item="${escapeHtml(it.id)}"
+
+      data-title="${escapeHtml(it.title)}" data-version="${escapeHtml(it.version || '')}"
+
+      style="${indentStyle}">
+
+      <span class="sprint-item-icon" style="color:${color}">${icon}</span>
+
+      <span class="sprint-item-title">${escapeHtml(it.title)}${indBadge}${childBadge}</span>
+
+      <span class="sprint-item-ver">${escapeHtml(it.version || '')}</span>
+
+      ${actions}
+
+    </div>`;
+
+    // Subtasks collapsed by default; expand on click.
+
+    const dispKids = displayChildrenOf.get(it.id) || [];
+
+    const childrenBlock = dispKids.length > 0
+
+      ? `<details style="margin-left:16px;border-left:2px solid var(--border);margin-bottom:2px">
+
+           <summary style="cursor:pointer;padding:2px 6px;font-family:var(--font-mono);font-size:10px;color:var(--muted);list-style:none;display:flex;align-items:center;gap:4px;user-select:none">
+
+             <span>▸</span><span>${dispKids.length} subtask${dispKids.length !== 1 ? 's' : ''} · ${kidDone}/${allKids.length} done</span>
+
+           </summary>
+
+           <div style="padding:2px 0">
+
+             ${dispKids.map(c => renderItem(c, true)).join('')}
+
+           </div>
+
+         </details>`
+
+      : '';
+
+    return rowHtml + childrenBlock;
+
+  };
+
   // Group by version (then item_group within version).
 
   const versionOrder = [...new Set(displayItems.map(it => it.version || ''))];
@@ -5260,95 +5442,11 @@ function renderSprintProgress(projectId, items) {
 
     }
 
-    html += groupItems.map(it => {
+    // Render only top-level items; children of displayed parents are rendered under their parent.
 
-      const icon = statusIcon(it.status);
+    const topLevel = groupItems.filter(it => !it.parent_id || !displayedParentIds.has(it.parent_id));
 
-      const color = statusColor(it.status);
-
-      const isActive = activeSet.has(it.status);
-
-      const meta = it.pushed_to
-
-        ? `<span class="sprint-item-meta">→ ${escapeHtml(it.pushed_to)}</span>`
-
-        : (it.notes ? `<span class="sprint-item-meta">${escapeHtml(it.notes.slice(0,60))}</span>` : '');
-
-      const editBtn = `<button class="sprint-btn" title="Edit title/version"
-
-               onclick="sprintItemEdit('${escapeHtml(projectId)}','${escapeHtml(it.id)}')">✏</button>`;
-
-      const thumbUp = it.feedback_thumb === 1 ? 'color:var(--accent-green)' : 'opacity:0.4';
-
-      const thumbDn = it.feedback_thumb === -1 ? 'color:var(--status-failed)' : 'opacity:0.4';
-
-      const feedbackHtml = it.status === 'done'
-
-        ? `<span class="sprint-item-feedback" style="display:inline-flex;align-items:center;gap:4px;font-size:11px;margin-left:4px">
-
-             <button title="Good" style="background:none;border:none;cursor:pointer;padding:0 2px;${thumbUp}"
-
-               onclick="sprintFeedback('${escapeHtml(projectId)}','${escapeHtml(it.id)}',1,${it.feedback_thumb == null ? 'null' : it.feedback_thumb},event)">👍</button>
-
-             <button title="Needs rework" style="background:none;border:none;cursor:pointer;padding:0 2px;${thumbDn}"
-
-               onclick="sprintFeedback('${escapeHtml(projectId)}','${escapeHtml(it.id)}',-1,${it.feedback_thumb == null ? 'null' : it.feedback_thumb},event)">👎</button>
-
-             ${it.feedback_note
-
-               ? `<span style="color:var(--muted);font-size:10px;max-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${escapeHtml(it.feedback_note)}">${escapeHtml(it.feedback_note)}</span>`
-
-               : `<input style="background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:9px;font-family:var(--font-mono);padding:1px 4px;width:80px" placeholder="note…"
-
-                     onblur="sprintFeedbackNote('${escapeHtml(projectId)}','${escapeHtml(it.id)}',this.value)"
-
-                     onkeydown="if(event.key==='Enter'){this.blur()}">`}
-
-           </span>`
-
-        : '';
-
-      const actions = isActive
-
-        ? `<span class="sprint-item-actions">
-
-             <button class="sprint-btn" title="Done"
-
-               onclick="sprintAction('${escapeHtml(projectId)}','${escapeHtml(it.id)}','complete')">✓</button>
-
-             <button class="sprint-btn" title="Skip"
-
-               onclick="sprintAction('${escapeHtml(projectId)}','${escapeHtml(it.id)}','skip')">—</button>
-
-             <button class="sprint-btn sprint-btn-fail" title="Fail"
-
-               onclick="sprintAction('${escapeHtml(projectId)}','${escapeHtml(it.id)}','fail')">✕</button>
-
-             <button class="sprint-btn sprint-btn-push" title="Push to next version"
-
-               onclick="sprintPushPrompt('${escapeHtml(projectId)}','${escapeHtml(it.id)}')">→</button>
-
-             ${editBtn}
-
-           </span>`
-
-        : `<span class="sprint-item-actions">${meta}${editBtn}${feedbackHtml}</span>`;
-
-      return `<div class="sprint-item-row" data-item="${escapeHtml(it.id)}"
-
-        data-title="${escapeHtml(it.title)}" data-version="${escapeHtml(it.version)}">
-
-        <span class="sprint-item-icon" style="color:${color}">${icon}</span>
-
-        <span class="sprint-item-title">${escapeHtml(it.title)}</span>
-
-        <span class="sprint-item-ver">${escapeHtml(it.version)}</span>
-
-        ${actions}
-
-      </div>`;
-
-    }).join('');
+    html += topLevel.map(it => renderItem(it, false)).join('');
 
   }
 

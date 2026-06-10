@@ -7558,3 +7558,41 @@ def test_sprint_item_title_size_limit(client):
     )
     assert r.status_code == 400
     assert "sprint item title" in r.json().get("detail", "").lower()
+
+
+@pytest.mark.asyncio
+async def test_rollup_parent_all_done(db):
+    """Completing all children auto-completes the parent."""
+    p = await db_module.create_project(db, "rollup-all-done")
+    parent = await db_module.add_sprint_item(db, p["id"], "v1", "Parent")
+    child1 = await db_module.add_subtask(db, p["id"], parent["id"], "Child 1")
+    child2 = await db_module.add_subtask(db, p["id"], parent["id"], "Child 2")
+    await db_module.complete_sprint_item(db, p["id"], child1["id"])
+    await db_module.complete_sprint_item(db, p["id"], child2["id"])
+    updated_parent = await db_module.get_sprint_item(db, parent["id"])
+    assert updated_parent["status"] == "done"
+
+
+@pytest.mark.asyncio
+async def test_rollup_parent_failed_child_sets_indeterminate(db):
+    """A failed child with no remaining active siblings sets parent to indeterminate."""
+    p = await db_module.create_project(db, "rollup-fail")
+    parent = await db_module.add_sprint_item(db, p["id"], "v1", "Parent")
+    child1 = await db_module.add_subtask(db, p["id"], parent["id"], "Child 1")
+    child2 = await db_module.add_subtask(db, p["id"], parent["id"], "Child 2")
+    await db_module.complete_sprint_item(db, p["id"], child1["id"])
+    await db_module.fail_sprint_item(db, p["id"], child2["id"])
+    updated_parent = await db_module.get_sprint_item(db, parent["id"])
+    assert updated_parent["status"] == "indeterminate"
+
+
+@pytest.mark.asyncio
+async def test_rollup_parent_active_child_leaves_parent_unchanged(db):
+    """Completing one child while another is still pending leaves parent status unchanged."""
+    p = await db_module.create_project(db, "rollup-active")
+    parent = await db_module.add_sprint_item(db, p["id"], "v1", "Parent")
+    child1 = await db_module.add_subtask(db, p["id"], parent["id"], "Child 1")
+    await db_module.add_subtask(db, p["id"], parent["id"], "Child 2")
+    await db_module.complete_sprint_item(db, p["id"], child1["id"])
+    updated_parent = await db_module.get_sprint_item(db, parent["id"])
+    assert updated_parent["status"] == "pending"
