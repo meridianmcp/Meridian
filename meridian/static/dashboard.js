@@ -4207,7 +4207,7 @@ function buildTabBody(project) {
 
           <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
 
-            <button class="primary claude-section-btn" id="copy-handoff-${project.id}" title="MCP: generate_handoff() and copy the rendered markdown">Copy generate_handoff() output</button>
+            <button class="primary claude-section-btn" id="copy-handoff-${project.id}" title="Fetch generate_handoff() output and copy raw plain text">Copy handoff (plain text)</button>
 
             <button class="secondary claude-section-btn" id="regen-handoff-${project.id}" title="Regenerate the on-disk handoff markdown via generate_handoff()">Regenerate</button>
 
@@ -4215,7 +4215,21 @@ function buildTabBody(project) {
 
           </div>
 
-          <p class="claude-hint">Runs <code>generate_handoff()</code> and copies the rendered markdown for a fresh Claude Code chat.</p>
+          <div id="handoff-raw-${project.id}" style="display:none;margin-top:8px">
+
+            <textarea id="handoff-raw-text-${project.id}" readonly style="width:100%;height:220px;font-family:var(--font-mono);font-size:10px;background:#0d1117;color:#e6edf3;border:1px solid var(--border);padding:8px;border-radius:4px;resize:vertical;outline:none"></textarea>
+
+            <div style="display:flex;gap:6px;margin-top:4px;align-items:center">
+
+              <button class="secondary" id="handoff-copy-text-${project.id}" style="font-size:10px;padding:3px 10px">Copy text</button>
+
+              <button class="secondary" id="handoff-close-raw-${project.id}" style="font-size:10px;padding:3px 10px">Close</button>
+
+            </div>
+
+          </div>
+
+          <p class="claude-hint">Fetches raw plain-text handoff for a fresh Claude Code session. Select all or use Copy text.</p>
 
         </div>
 
@@ -6402,6 +6416,12 @@ function wireClaudeLaunchPanel(projectId) {
 
   if (copyHandoffBtn) copyHandoffBtn.onclick = async () => {
 
+    const orig = copyHandoffBtn.textContent;
+
+    copyHandoffBtn.disabled = true;
+
+    copyHandoffBtn.textContent = 'Loading…';
+
     try {
 
       const r = await fetch(`/projects/${projectId}/handoff`, { method: 'POST' });
@@ -6414,13 +6434,57 @@ function wireClaudeLaunchPanel(projectId) {
 
       if (text) {
 
-        showCopyPreview('generate_handoff() Output', text);
+        const rawContainer = document.getElementById(`handoff-raw-${projectId}`);
+
+        const rawTextEl = document.getElementById(`handoff-raw-text-${projectId}`);
+
+        if (rawContainer && rawTextEl) {
+
+          rawTextEl.value = text;
+
+          rawContainer.style.display = '';
+
+          rawTextEl.focus();
+
+          rawTextEl.select();
+
+        }
+
+        try { await navigator.clipboard.writeText(text); toast('handoff copied to clipboard'); }
+
+        catch(_) { toast('text shown below — select all and copy'); }
 
         stampHandoffTs(projectId, new Date());
 
       }
 
     } catch(e) { toast('handoff failed: ' + e.message, true); }
+
+    finally { copyHandoffBtn.disabled = false; copyHandoffBtn.textContent = orig; }
+
+  };
+
+  const handoffCopyTextBtn = document.getElementById(`handoff-copy-text-${projectId}`);
+
+  if (handoffCopyTextBtn) handoffCopyTextBtn.onclick = async () => {
+
+    const rawTextEl = document.getElementById(`handoff-raw-text-${projectId}`);
+
+    if (!rawTextEl) return;
+
+    try { await navigator.clipboard.writeText(rawTextEl.value); toast('copied'); }
+
+    catch(_) { rawTextEl.select(); document.execCommand('copy'); }
+
+  };
+
+  const handoffCloseBtn = document.getElementById(`handoff-close-raw-${projectId}`);
+
+  if (handoffCloseBtn) handoffCloseBtn.onclick = () => {
+
+    const rawContainer = document.getElementById(`handoff-raw-${projectId}`);
+
+    if (rawContainer) rawContainer.style.display = 'none';
 
   };
 
