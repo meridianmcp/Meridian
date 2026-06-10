@@ -7456,6 +7456,24 @@ def _mcp_rate_check(token_hash: str, limit: int) -> bool:
 
 @app.post("/mcp")
 async def remote_mcp(request: Request) -> Any:
+    try:
+        return await _remote_mcp_inner(request)
+    except Exception as _e:
+        import logging as _log
+        _req_id = getattr(request.state, "request_id", "unknown")
+        _log.getLogger("meridian.server").exception(
+            "unhandled exception in remote_mcp (request_id=%s)", _req_id, exc_info=_e
+        )
+        try:
+            _body = await request.body()
+            _req_id_from_body = __import__("json").loads(_body).get("id")
+        except Exception:
+            _req_id_from_body = None
+        from fastapi.responses import JSONResponse as _JR
+        return _JR({"jsonrpc": "2.0", "id": _req_id_from_body, "error": {"code": -32603, "message": "internal error — please retry"}})
+
+
+async def _remote_mcp_inner(request: Request) -> Any:
     """Remote MCP endpoint — JSON-RPC 2.0 over HTTP.
 
     Accepts OAuth bearer tokens and Meridian API keys over the same endpoint.
