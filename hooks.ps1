@@ -132,11 +132,12 @@ if ($ClaudeDetected) {
     if (-not $settings.PSObject.Properties["hooks"]) {
         $settings | Add-Member -NotePropertyName "hooks" -NotePropertyValue ([PSCustomObject]@{})
     }
+    # New format required by Claude Code v2.1.169+: matcher + hooks array wrapper
     $settings.hooks | Add-Member -NotePropertyName "SessionStart" -NotePropertyValue @(
-        [PSCustomObject]@{ type = "command"; command = $startCmd }
+        [PSCustomObject]@{ matcher = ""; hooks = @([PSCustomObject]@{ type = "command"; command = $startCmd }) }
     ) -Force
     $settings.hooks | Add-Member -NotePropertyName "Stop" -NotePropertyValue @(
-        [PSCustomObject]@{ type = "command"; command = $stopCmd }
+        [PSCustomObject]@{ matcher = ""; hooks = @([PSCustomObject]@{ type = "command"; command = $stopCmd }) }
     ) -Force
 
     $settings | ConvertTo-Json -Depth 10 | Set-Content $ClaudeSettingsPath -Encoding UTF8
