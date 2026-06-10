@@ -8484,6 +8484,8 @@ async function loadSettingsTab(projectId) {
 
         ${mcpData ? `<button id="hooks-gen-token-${projectId}" class="primary" style="font-size:10px;padding:4px 10px">Generate API key</button>` : ''}
 
+        ${mcpData ? `<button id="hooks-gen-readonly-token-${projectId}" class="secondary" style="font-size:10px;padding:4px 10px" title="Read-only tokens can only call get_* tools — safe for ChatGPT connectors">Generate read-only key</button>` : ''}
+
         <span id="hooks-token-status-${projectId}" style="font-size:10px;color:var(--muted)">${mcpData ? 'Generate an API key to replace the placeholder token in the hosted snippets below.' : 'Local mode - no Bearer token needed.'}</span>
 
       </div>
@@ -8779,6 +8781,8 @@ async function loadSettingsTab(projectId) {
       <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:10px">
 
         ${mcpData ? `<button id="hooks-gen-token-${projectId}" class="primary" style="font-size:10px;padding:4px 10px">Generate API key</button>` : ''}
+
+        ${mcpData ? `<button id="hooks-gen-readonly-token-${projectId}" class="secondary" style="font-size:10px;padding:4px 10px" title="Read-only tokens can only call get_* tools — safe for ChatGPT connectors">Generate read-only key</button>` : ''}
 
         <span id="hooks-token-status-${projectId}" style="font-size:10px;color:var(--muted)">${mcpData ? 'Generate an API key to replace the placeholder token in the hosted snippets below.' : 'Local mode - no Bearer token needed.'}</span>
 
@@ -10762,15 +10766,21 @@ async function loadSettingsTab(projectId) {
 
       }
 
-      tokenListEl.innerHTML = tokens.map((token) => `
-        <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;padding:6px 8px;border:1px solid var(--border);border-radius:4px;background:var(--surface-2)">
+      tokenListEl.innerHTML = tokens.map((token) => {
+
+        const isReadOnly = (token.token_type || 'readwrite') === 'readonly';
+
+        const typeBadge = `<span style="font-size:9px;padding:1px 5px;border-radius:3px;border:1px solid ${isReadOnly ? '#fbbf24' : 'var(--accent)'};color:${isReadOnly ? '#fbbf24' : 'var(--accent)'};margin-left:4px">${isReadOnly ? 'read-only' : 'read-write'}</span>`;
+
+        return `<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;padding:6px 8px;border:1px solid var(--border);border-radius:4px;background:var(--surface-2)">
           <div style="min-width:0;flex:1">
-            <div style="font-size:10px;color:var(--text);font-family:var(--font-mono);word-break:break-all">${escapeHtml(token.masked_token || 'sk_meridian_...')}</div>
+            <div style="font-size:10px;color:var(--text);font-family:var(--font-mono);word-break:break-all;display:flex;align-items:center;gap:4px">${escapeHtml(token.masked_token || 'sk_meridian_...')}${typeBadge}</div>
             <div style="font-size:9px;color:var(--muted);margin-top:2px">${escapeHtml(token.label || 'API key')} - ${escapeHtml(token.created_at || '')}</div>
           </div>
           <button class="secondary" data-token-id="${escapeHtml(token.id || '')}" style="font-size:10px;padding:3px 8px;color:var(--danger,#ef4444)">Revoke</button>
-        </div>
-      `).join('');
+        </div>`;
+
+      }).join('');
 
       tokenListEl.querySelectorAll('[data-token-id]').forEach((btn) => {
 
@@ -10922,6 +10932,44 @@ async function loadSettingsTab(projectId) {
           genBtn.disabled = false;
 
           genBtn.textContent = hooksToken ? 'Generate new key' : 'Generate API key';
+
+        }
+
+      };
+
+    }
+
+    const genReadonlyBtn = document.getElementById(`hooks-gen-readonly-token-${projectId}`);
+
+    if (genReadonlyBtn) {
+
+      genReadonlyBtn.onclick = async () => {
+
+        genReadonlyBtn.disabled = true;
+
+        genReadonlyBtn.textContent = 'Generating...';
+
+        try {
+
+          await api('/auth/tokens', { method: 'POST', body: JSON.stringify({ label: 'readonly', token_type: 'readonly' }) });
+
+          const statusEl = document.getElementById(`hooks-token-status-${projectId}`);
+
+          if (statusEl) statusEl.textContent = 'Read-only key generated — safe for ChatGPT connectors and CI read access.';
+
+          await loadHooksTokens();
+
+        } catch (e) {
+
+          const statusEl = document.getElementById(`hooks-token-status-${projectId}`);
+
+          if (statusEl) statusEl.textContent = `error: ${escapeHtml(String(e))}`;
+
+        } finally {
+
+          genReadonlyBtn.disabled = false;
+
+          genReadonlyBtn.textContent = 'Generate read-only key';
 
         }
 
