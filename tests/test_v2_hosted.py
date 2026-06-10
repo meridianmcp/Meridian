@@ -1,4 +1,4 @@
-"""v2.0 hosted-tier tests: tenant tables, token, webhook sig, landing, MCP auth, docker-compose."""
+﻿"""v2.0 hosted-tier tests: tenant tables, token, webhook sig, landing, MCP auth, docker-compose."""
 from __future__ import annotations
 
 import asyncio
@@ -415,7 +415,7 @@ def test_remote_mcp_initialize_with_valid_token(client):
         json={
             "jsonrpc": "2.0", "id": 1, "method": "initialize",
             "params": {
-                "protocolVersion": "2024-11-05",
+                "protocolVersion": "2025-03-26",
                 "capabilities": {},
                 "clientInfo": {},
             },
@@ -424,7 +424,7 @@ def test_remote_mcp_initialize_with_valid_token(client):
     )
     assert r.status_code == 200
     body = r.json()
-    assert body["result"]["protocolVersion"] == "2024-11-05"
+    assert body["result"]["protocolVersion"] == "2025-03-26"
 
 
 def test_remote_mcp_initialize_with_valid_oauth_token_from_db(client):
@@ -450,7 +450,7 @@ def test_remote_mcp_initialize_with_valid_oauth_token_from_db(client):
         json={
             "jsonrpc": "2.0", "id": 1, "method": "initialize",
             "params": {
-                "protocolVersion": "2024-11-05",
+                "protocolVersion": "2025-03-26",
                 "capabilities": {},
                 "clientInfo": {},
             },
@@ -459,7 +459,7 @@ def test_remote_mcp_initialize_with_valid_oauth_token_from_db(client):
     )
     assert r.status_code == 200
     body = r.json()
-    assert body["result"]["protocolVersion"] == "2024-11-05"
+    assert body["result"]["protocolVersion"] == "2025-03-26"
     assert token_hash in server_module._oa_tokens
 
 
@@ -730,7 +730,7 @@ def test_mcp_rate_limit_429_after_limit_exceeded(client, monkeypatch):
     monkeypatch.setattr(server_module, "_mcp_rate_check", _mock_check)
 
     payload = {"jsonrpc": "2.0", "id": 1, "method": "initialize",
-               "params": {"protocolVersion": "2024-11-05", "capabilities": {}, "clientInfo": {}}}
+               "params": {"protocolVersion": "2025-03-26", "capabilities": {}, "clientInfo": {}}}
     headers = {"Authorization": f"Bearer {raw_token}"}
 
     r1 = client.post("/mcp", json=payload, headers=headers)
