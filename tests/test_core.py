@@ -7024,7 +7024,7 @@ def test_mcp_sse_post_returns_jsonrpc(client):
     assert data.get("jsonrpc") == "2.0"
     assert data.get("id") == 1
     assert "result" in data
-    assert data["result"]["protocolVersion"] == "2024-11-05"
+    assert data["result"]["protocolVersion"] == "2025-03-26"
 
 
 def test_mcp_sse_post_tools_list(client):
