@@ -98,3 +98,52 @@ APP_URL=https://meridian.example.com
 !!! danger
     Never commit `.env` to git. Meridian's `.gitignore` already excludes `.env`
     and `secrets.env`.
+
+---
+
+## Context layers
+
+Meridian injects project context into every AI session through three distinct layers,
+each with different lifetime and scope.
+
+### STATIC — `CLAUDE.md` / `AGENTS.md`
+
+Repo conventions and project-level instructions committed to git. This is the
+document the AI reads at session start from the repository root. It never changes
+automatically between sessions — only a human (or `update_md_section`) edits it.
+
+**Use for:** architecture decisions, coding standards, file conventions, "never do X"
+rules. Anything that should be true for every session forever.
+
+### DYNAMIC — `additionalContext` from Session Start hook
+
+Live state injected at session start via `POST /hooks/session-start`. Meridian
+assembles this from `get_context_block` — includes the current goal, active sprint
+items (with their status), recent tasks, and pinned decisions.
+
+**Use for:** what's in-flight right now. Updates every session automatically. The AI
+sees the latest goal and sprint queue without any manual copy-paste.
+
+**Source:** `GET /projects/{id}/context-block` (called automatically by the hooks).
+
+### WORKSPACE — workspace notes and decisions
+
+Tenant-global context injected at the **top** of every project's context block.
+Created via `add_workspace_note` / `set_workspace_decision` and visible across all
+projects owned by your account.
+
+**Use for:** team-wide conventions, shared infrastructure notes, org-level decisions
+that apply to every project (e.g. "always use Neon for Postgres", "company style guide").
+
+```
+┌─────────────────────────────────────┐
+│  WORKSPACE (tenant-global)          │  ← shared across all projects
+│  workspace_notes + workspace_decisions
+├─────────────────────────────────────┤
+│  DYNAMIC (per-project, per-session) │  ← goal, sprint, tasks, decisions
+│  get_context_block output           │
+├─────────────────────────────────────┤
+│  STATIC (per-repo)                  │  ← CLAUDE.md / AGENTS.md
+│  committed to git                   │
+└─────────────────────────────────────┘
+```

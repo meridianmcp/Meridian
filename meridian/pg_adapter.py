@@ -872,6 +872,7 @@ async def init_pg_db(url: str) -> PostgresConnection:
         await _migrate_pg_workspace_members_rbac(conn)
     await _migrate_pg_sprint_items_claimed_at(conn)
     await _migrate_pg_sprint_item_tree(conn)
+    await _migrate_pg_api_token_type(conn)
     return conn
 
 
@@ -890,6 +891,13 @@ async def _migrate_pg_sprint_item_tree(conn: PostgresConnection) -> None:
         "ALTER TABLE sprint_items ADD COLUMN IF NOT EXISTS split_from TEXT DEFAULT NULL;"
         "ALTER TABLE sprint_items ADD COLUMN IF NOT EXISTS merged_into TEXT DEFAULT NULL;"
         "ALTER TABLE sprint_items ADD COLUMN IF NOT EXISTS merged_from TEXT DEFAULT NULL"
+    )
+
+
+async def _migrate_pg_api_token_type(conn: PostgresConnection) -> None:
+    """Add token_type to api_tokens for read-only token support (Task 3)."""
+    await conn.executescript(
+        "ALTER TABLE api_tokens ADD COLUMN IF NOT EXISTS token_type TEXT NOT NULL DEFAULT 'readwrite'"
     )
 
 

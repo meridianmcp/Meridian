@@ -3719,6 +3719,27 @@ function buildTabBody(project) {
 
               </div>
 
+              <div id="add-decision-form-${project.id}" style="display:none;margin-bottom:10px;padding:10px;background:var(--surface-1);border:1px solid var(--border);border-radius:6px">
+                <div style="display:grid;gap:6px">
+                  <input id="dec-form-title-${project.id}" type="text" placeholder="Title" style="background:var(--surface-2);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:11px;font-family:var(--font-mono);padding:4px 8px;width:100%;box-sizing:border-box">
+                  <textarea id="dec-form-body-${project.id}" rows="2" placeholder="Body" style="background:var(--surface-2);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:11px;font-family:var(--font-mono);padding:4px 8px;width:100%;box-sizing:border-box;resize:vertical"></textarea>
+                  <select id="dec-form-cat-${project.id}" style="background:var(--surface-2);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:11px;font-family:var(--font-mono);padding:4px 8px">
+                    <option value="TECHNICAL">TECHNICAL</option>
+                    <option value="ARCHITECTURAL">ARCHITECTURAL</option>
+                    <option value="PRODUCT">PRODUCT</option>
+                    <option value="TACTICAL">TACTICAL</option>
+                    <option value="STRATEGIC">STRATEGIC</option>
+                    <option value="COMPETITIVE">COMPETITIVE</option>
+                    <option value="BUSINESS">BUSINESS</option>
+                  </select>
+                  <div style="display:flex;gap:6px;align-items:center">
+                    <button id="dec-form-add-${project.id}" class="primary" style="font-size:10px;padding:3px 10px">Add</button>
+                    <button id="dec-form-cancel-${project.id}" class="secondary" style="font-size:10px;padding:3px 10px">Cancel</button>
+                    <span id="dec-form-status-${project.id}" style="font-size:10px;color:var(--muted)"></span>
+                  </div>
+                </div>
+              </div>
+
               <div style="color:var(--muted);font-size:10px;margin-bottom:8px">Editable current truth. Use <code>pin_decision</code> MCP tool or <code>update_decision</code> with new_title+new_body to supersede.</div>
 
               <div id="constitution-warning-${project.id}" style="margin-bottom:8px"></div>
@@ -3790,6 +3811,14 @@ function buildTabBody(project) {
       <div class="drawer-panel" id="drawer-devlog-${project.id}">
 
         <div class="drawer-header">DEV LOG · ${escapeHtml(project.name)}</div>
+
+        <div style="padding:8px 10px;border-bottom:1px solid var(--border);background:var(--surface-2)">
+          <textarea id="devlog-append-text-${project.id}" rows="2" placeholder="Add a note to DEVLOG.md…" style="width:100%;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;color:var(--text);font-size:11px;font-family:var(--font-mono);padding:5px 8px;resize:vertical;box-sizing:border-box;outline:none"></textarea>
+          <div style="display:flex;gap:6px;align-items:center;margin-top:4px">
+            <button id="devlog-append-btn-${project.id}" class="primary" style="font-size:10px;padding:3px 10px">Append</button>
+            <span id="devlog-append-status-${project.id}" style="font-size:10px;color:var(--muted)"></span>
+          </div>
+        </div>
 
         <div class="scroll-area"><div class="task-list" id="tasks-${project.id}"></div></div>
 
@@ -4207,7 +4236,7 @@ function buildTabBody(project) {
 
           <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
 
-            <button class="primary claude-section-btn" id="copy-handoff-${project.id}" title="MCP: generate_handoff() and copy the rendered markdown">Copy generate_handoff() output</button>
+            <button class="primary claude-section-btn" id="copy-handoff-${project.id}" title="Fetch generate_handoff() output and copy raw plain text">Copy handoff (plain text)</button>
 
             <button class="secondary claude-section-btn" id="regen-handoff-${project.id}" title="Regenerate the on-disk handoff markdown via generate_handoff()">Regenerate</button>
 
@@ -4215,7 +4244,21 @@ function buildTabBody(project) {
 
           </div>
 
-          <p class="claude-hint">Runs <code>generate_handoff()</code> and copies the rendered markdown for a fresh Claude Code chat.</p>
+          <div id="handoff-raw-${project.id}" style="display:none;margin-top:8px">
+
+            <textarea id="handoff-raw-text-${project.id}" readonly style="width:100%;height:220px;font-family:var(--font-mono);font-size:10px;background:#0d1117;color:#e6edf3;border:1px solid var(--border);padding:8px;border-radius:4px;resize:vertical;outline:none"></textarea>
+
+            <div style="display:flex;gap:6px;margin-top:4px;align-items:center">
+
+              <button class="secondary" id="handoff-copy-text-${project.id}" style="font-size:10px;padding:3px 10px">Copy text</button>
+
+              <button class="secondary" id="handoff-close-raw-${project.id}" style="font-size:10px;padding:3px 10px">Close</button>
+
+            </div>
+
+          </div>
+
+          <p class="claude-hint">Fetches raw plain-text handoff for a fresh Claude Code session. Select all or use Copy text.</p>
 
         </div>
 
@@ -4388,8 +4431,48 @@ function buildTabBody(project) {
   // v2.4 — wire the [+ Pin] and [Consolidate] buttons on the Decisions subtab.
 
   const addPinBtn = document.getElementById(`add-pinned-decision-${project.id}`);
+  const decForm = document.getElementById(`add-decision-form-${project.id}`);
+  const decFormTitle = document.getElementById(`dec-form-title-${project.id}`);
+  const decFormBody = document.getElementById(`dec-form-body-${project.id}`);
+  const decFormCat = document.getElementById(`dec-form-cat-${project.id}`);
+  const decFormAdd = document.getElementById(`dec-form-add-${project.id}`);
+  const decFormCancel = document.getElementById(`dec-form-cancel-${project.id}`);
+  const decFormStatus = document.getElementById(`dec-form-status-${project.id}`);
 
-  if (addPinBtn) addPinBtn.onclick = () => addPinnedDecision(project.id);
+  if (addPinBtn && decForm) {
+    addPinBtn.onclick = () => {
+      const visible = decForm.style.display !== 'none';
+      decForm.style.display = visible ? 'none' : 'block';
+      if (!visible && decFormTitle) decFormTitle.focus();
+    };
+  }
+  if (decFormCancel) decFormCancel.onclick = () => { decForm.style.display = 'none'; };
+  if (decFormAdd) {
+    const doAddDecision = async () => {
+      const title = (decFormTitle?.value || '').trim();
+      const body = (decFormBody?.value || '').trim();
+      const category = (decFormCat?.value || 'TECHNICAL');
+      if (!title || !body) { if (decFormStatus) decFormStatus.textContent = 'Title and body required.'; return; }
+      decFormAdd.disabled = true;
+      if (decFormStatus) decFormStatus.textContent = '';
+      try {
+        await api(`/projects/${project.id}/decisions-pinned`, { method: 'POST', body: JSON.stringify({ title, body, category }) });
+        if (decFormTitle) decFormTitle.value = '';
+        if (decFormBody) decFormBody.value = '';
+        decForm.style.display = 'none';
+        toast('decision pinned');
+        loadPinnedDecisions(project.id);
+      } catch(e) {
+        if (decFormStatus) decFormStatus.textContent = `Error: ${escapeHtml(String(e))}`;
+      } finally {
+        decFormAdd.disabled = false;
+      }
+    };
+    decFormAdd.onclick = doAddDecision;
+    [decFormTitle, decFormBody].forEach(el => {
+      if (el) el.addEventListener('keydown', (e) => { if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') doAddDecision(); });
+    });
+  }
 
   const consolidateBtn = document.getElementById(`consolidate-decisions-${project.id}`);
 
@@ -4454,7 +4537,19 @@ function buildTabBody(project) {
 
       const pctColor = doneCount === 0 ? 'var(--muted)' : doneCount === total ? 'var(--accent-green)' : '#fbbf24';
 
-      board.innerHTML = `<div style="font-size:10px;color:var(--muted);padding:3px 0;display:flex;align-items:center;gap:8px">
+      const pendingItems = scopeItems.filter(i => activeStatuses.has(i.status));
+      const statusColors = { pending: 'var(--muted)', todo: 'var(--muted)', in_progress: '#fbbf24' };
+      const itemsHtml = pendingItems.slice(0, 10).map(it => {
+        const color = statusColors[it.status] || 'var(--muted)';
+        const badge = it.status === 'in_progress' ? '⚡' : '·';
+        return `<div style="display:flex;align-items:center;gap:5px;padding:2px 0;border-top:1px solid var(--border)20">` +
+          `<span style="color:${color};font-size:9px;flex-shrink:0">${badge}</span>` +
+          `<span style="font-size:10px;color:var(--text);font-family:var(--font-mono);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${escapeHtml(it.title)}">${escapeHtml(it.title)}</span>` +
+          (it.version ? `<span style="font-size:9px;color:var(--muted);flex-shrink:0">${escapeHtml(it.version)}</span>` : '') +
+          `</div>`;
+      }).join('');
+
+      board.innerHTML = `<div style="font-size:10px;color:var(--muted);padding:3px 0;display:flex;align-items:center;gap:8px;margin-bottom:${pendingItems.length ? '4px' : '0'}">
 
         <span style="font-weight:600;color:var(--accent)">all active</span>
 
@@ -4464,7 +4559,7 @@ function buildTabBody(project) {
 
         <span style="opacity:0.5">· See LIVE tab for full board</span>
 
-      </div>`;
+      </div>${itemsHtml}`;
 
     } catch(e) {
 
@@ -4585,6 +4680,33 @@ function buildTabBody(project) {
   // + session summaries + task log. Manual is the only mode worth exposing.
 
 
+
+  // Dev log append button
+  {
+    const appendBtn = document.getElementById(`devlog-append-btn-${project.id}`);
+    const appendText = document.getElementById(`devlog-append-text-${project.id}`);
+    const appendStatus = document.getElementById(`devlog-append-status-${project.id}`);
+    if (appendBtn && appendText) {
+      appendBtn.onclick = async () => {
+        const text = appendText.value.trim();
+        if (!text) return;
+        appendBtn.disabled = true;
+        if (appendStatus) appendStatus.textContent = '';
+        try {
+          await api(`/projects/${project.id}/devlog`, { method: 'POST', body: JSON.stringify({ text }) });
+          appendText.value = '';
+          toast('Appended to DEVLOG.md');
+        } catch(e) {
+          if (appendStatus) appendStatus.textContent = `Error: ${escapeHtml(String(e))}`;
+        } finally {
+          appendBtn.disabled = false;
+        }
+      };
+      appendText.addEventListener('keydown', (e) => {
+        if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') appendBtn.click();
+      });
+    }
+  }
 
   // v1.5.x — Claude launch control panel (4 sections).
 
@@ -5324,6 +5446,8 @@ function renderSprintProgress(projectId, items) {
 
       : '';
 
+    const canEdit = it.status === 'pending' || it.status === 'todo';
+
     const actions = isActive
 
       ? `<span class="sprint-item-actions">
@@ -5344,11 +5468,11 @@ function renderSprintProgress(projectId, items) {
 
              onclick="sprintPushPrompt('${escapeHtml(projectId)}','${escapeHtml(it.id)}')">→</button>
 
-           ${editBtn}
+           ${canEdit ? editBtn : ''}
 
          </span>`
 
-      : `<span class="sprint-item-actions">${meta}${editBtn}${feedbackHtml}</span>`;
+      : `<span class="sprint-item-actions">${meta}${feedbackHtml}</span>`;
 
     // Children progress badge for parent items.
 
@@ -5508,15 +5632,17 @@ function renderSprintProgress(projectId, items) {
 
       <div style="padding:4px 10px 8px">
 
-        ${pushedItems.map(it => `<div style="display:flex;align-items:center;gap:6px;padding:3px 0;border-top:1px solid var(--border)">
+        ${pushedItems.map(it => `<div class="sprint-item-row" data-item="${escapeHtml(it.id)}" data-title="${escapeHtml(it.title)}" data-version="${escapeHtml(it.version || '')}" style="display:flex;align-items:center;gap:6px;padding:3px 0;border-top:1px solid var(--border)">
 
           <span style="color:var(--muted);font-size:10px;flex-shrink:0">→</span>
 
-          <span style="font-family:var(--font-mono);font-size:10px;color:var(--muted);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${escapeHtml(it.title)}">${escapeHtml(it.title)}</span>
+          <span class="sprint-item-title" style="font-family:var(--font-mono);font-size:10px;color:var(--muted);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${escapeHtml(it.title)}">${escapeHtml(it.title)}</span>
 
           ${it.pushed_to ? `<span style="font-size:9px;color:var(--accent);background:var(--accent)1a;border:1px solid var(--accent)33;border-radius:3px;padding:0 5px;flex-shrink:0;font-family:var(--font-mono)">${escapeHtml(it.pushed_to)}</span>` : ''}
 
-          ${it.version ? `<span style="font-size:9px;color:var(--muted);flex-shrink:0">${escapeHtml(it.version)}</span>` : ''}
+          <span class="sprint-item-ver" style="font-size:9px;color:var(--muted);flex-shrink:0">${escapeHtml(it.version || '')}</span>
+
+          <button class="sprint-btn" title="Edit title/version" onclick="sprintItemEdit('${escapeHtml(projectId)}','${escapeHtml(it.id)}')">✏</button>
 
         </div>`).join('')}
 
@@ -6402,6 +6528,12 @@ function wireClaudeLaunchPanel(projectId) {
 
   if (copyHandoffBtn) copyHandoffBtn.onclick = async () => {
 
+    const orig = copyHandoffBtn.textContent;
+
+    copyHandoffBtn.disabled = true;
+
+    copyHandoffBtn.textContent = 'Loading…';
+
     try {
 
       const r = await fetch(`/projects/${projectId}/handoff`, { method: 'POST' });
@@ -6414,13 +6546,57 @@ function wireClaudeLaunchPanel(projectId) {
 
       if (text) {
 
-        showCopyPreview('generate_handoff() Output', text);
+        const rawContainer = document.getElementById(`handoff-raw-${projectId}`);
+
+        const rawTextEl = document.getElementById(`handoff-raw-text-${projectId}`);
+
+        if (rawContainer && rawTextEl) {
+
+          rawTextEl.value = text;
+
+          rawContainer.style.display = '';
+
+          rawTextEl.focus();
+
+          rawTextEl.select();
+
+        }
+
+        try { await navigator.clipboard.writeText(text); toast('handoff copied to clipboard'); }
+
+        catch(_) { toast('text shown below — select all and copy'); }
 
         stampHandoffTs(projectId, new Date());
 
       }
 
     } catch(e) { toast('handoff failed: ' + e.message, true); }
+
+    finally { copyHandoffBtn.disabled = false; copyHandoffBtn.textContent = orig; }
+
+  };
+
+  const handoffCopyTextBtn = document.getElementById(`handoff-copy-text-${projectId}`);
+
+  if (handoffCopyTextBtn) handoffCopyTextBtn.onclick = async () => {
+
+    const rawTextEl = document.getElementById(`handoff-raw-text-${projectId}`);
+
+    if (!rawTextEl) return;
+
+    try { await navigator.clipboard.writeText(rawTextEl.value); toast('copied'); }
+
+    catch(_) { rawTextEl.select(); document.execCommand('copy'); }
+
+  };
+
+  const handoffCloseBtn = document.getElementById(`handoff-close-raw-${projectId}`);
+
+  if (handoffCloseBtn) handoffCloseBtn.onclick = () => {
+
+    const rawContainer = document.getElementById(`handoff-raw-${projectId}`);
+
+    if (rawContainer) rawContainer.style.display = 'none';
 
   };
 
@@ -8327,6 +8503,19 @@ async function loadSettingsTab(projectId) {
 
 
 
+  // Settings section accordion state — persisted per project
+  let _secState = { connect: true, executor: false, config: false, account: false };
+  try { Object.assign(_secState, JSON.parse(localStorage.getItem('meridian.settings.sections.' + projectId) || '{}')); } catch(e) {}
+  const _secHtml = function(k, title) {
+    const openAttr = _secState[k] ? 'open' : '';
+    const caretRot = _secState[k] ? 'transform:rotate(90deg)' : '';
+    return '<details id="settings-sec-' + k + '-' + projectId + '" ' + openAttr + ' style="margin-bottom:12px;border:1px solid var(--border);border-radius:6px">' +
+      '<summary style="cursor:pointer;list-style:none;padding:10px 12px;display:flex;align-items:center;gap:8px">' +
+      '<span class="meridian-caret" style="display:inline-block;font-size:10px;color:var(--muted);transition:transform 120ms ease;' + caretRot + '">▶</span>' +
+      '<span style="font-weight:600;font-size:11px;color:var(--text)">' + title + '</span>' +
+      '</summary><div style="padding:0 0 4px">';
+  };
+
   let html = '';
 
 
@@ -8484,6 +8673,8 @@ async function loadSettingsTab(projectId) {
 
         ${mcpData ? `<button id="hooks-gen-token-${projectId}" class="primary" style="font-size:10px;padding:4px 10px">Generate API key</button>` : ''}
 
+        ${mcpData ? `<button id="hooks-gen-readonly-token-${projectId}" class="secondary" style="font-size:10px;padding:4px 10px" title="Read-only tokens can only call get_* tools — safe for ChatGPT connectors">Generate read-only key</button>` : ''}
+
         <span id="hooks-token-status-${projectId}" style="font-size:10px;color:var(--muted)">${mcpData ? 'Generate an API key to replace the placeholder token in the hosted snippets below.' : 'Local mode - no Bearer token needed.'}</span>
 
       </div>
@@ -8591,6 +8782,7 @@ async function loadSettingsTab(projectId) {
 
 
   // "Connect claude.ai browser" card — always shown regardless of hosted/self-hosted
+  html += _secHtml('connect', 'Connect Claude Code');
 
   const browserConnectorAccountNote = isHostedMode() ? `
 
@@ -8779,6 +8971,8 @@ async function loadSettingsTab(projectId) {
       <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:10px">
 
         ${mcpData ? `<button id="hooks-gen-token-${projectId}" class="primary" style="font-size:10px;padding:4px 10px">Generate API key</button>` : ''}
+
+        ${mcpData ? `<button id="hooks-gen-readonly-token-${projectId}" class="secondary" style="font-size:10px;padding:4px 10px" title="Read-only tokens can only call get_* tools — safe for ChatGPT connectors">Generate read-only key</button>` : ''}
 
         <span id="hooks-token-status-${projectId}" style="font-size:10px;color:var(--muted)">${mcpData ? 'Generate an API key to replace the placeholder token in the hosted snippets below.' : 'Local mode - no Bearer token needed.'}</span>
 
@@ -9206,6 +9400,9 @@ async function loadSettingsTab(projectId) {
 
 
 
+    html += '</div></details>';  // close Connect Claude Code section
+    html += _secHtml('executor', 'Executor Setup');
+
     html += `<div style="margin-bottom:16px">
 
       <div style="color:var(--accent);font-size:10px;letter-spacing:.06em;text-transform:uppercase;margin-bottom:10px;padding-bottom:4px;border-bottom:1px solid var(--border)">Codex CLI setup</div>
@@ -9219,6 +9416,13 @@ async function loadSettingsTab(projectId) {
       </div>` : ""}
 
       <div style="font-size:10px;color:var(--muted);margin-bottom:10px">Add to <code>~/.codex/config.toml</code> — or run <code>codex mcp add meridian ${escapeHtml(mcpHttpUrl)}</code></div>
+
+      <div style="margin-bottom:12px">
+        <label style="font-size:10px;color:var(--muted)">Your Meridian path<br>
+          <input type="text" id="meridian-path-${escapeHtml(projectId)}" placeholder="/path/to/Meridian" value="${escapeHtml(rawTomlPath ? cwd : '')}" style="width:100%;max-width:400px;background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:3px 8px;margin-top:3px;box-sizing:border-box">
+        </label>
+        <div style="font-size:9px;color:var(--muted);margin-top:3px">Updates the STDIO cwd below in real time.</div>
+      </div>
 
       <div style="font-size:10px;font-weight:600;color:var(--text);margin-bottom:4px">Option A — STDIO (local, recommended)</div>
 
@@ -9364,11 +9568,25 @@ async function loadSettingsTab(projectId) {
       if (hostedMcpEl) hostedMcpEl.textContent = hostedMcpJson;
       _codexCopySetup(`copy-hosted-mcp-json-${projectId}`, hostedMcpJson);
 
+      // Path input — live-update STDIO cwd
+      const pathInput = document.getElementById(`meridian-path-${projectId}`);
+      if (pathInput) {
+        pathInput.addEventListener('input', function() {
+          const newCwd = pathInput.value.trim() || '/path/to/your/meridian';
+          const newStdio = '[mcp_servers.meridian]\ntype = "stdio"\ncommand = "pixi"\nargs = ["run", "python", "-m", "meridian", "--mcp"]\ncwd = "' + newCwd.replace(/"/g, '\\"') + '"';
+          if (stdioEl) stdioEl.textContent = newStdio;
+          _codexCopySetup(`codex-copy-stdio-${projectId}`, newStdio);
+        });
+      }
+
     }, 0);
 
   }
 
 
+
+  html += '</div></details>';  // close Executor Setup section
+  html += _secHtml('config', 'Project Config');
 
   html += `<div style="margin-bottom:16px">
 
@@ -9957,6 +10175,9 @@ async function loadSettingsTab(projectId) {
   }, 0);
 
 
+
+  html += '</div></details>';  // close Project Config section
+  html += _secHtml('account', 'Account');
 
   // Team members section (hosted mode only, uses mcpData as hosted-mode proxy)
 
@@ -10574,6 +10795,8 @@ async function loadSettingsTab(projectId) {
 
   }
 
+  html += '</div></details>';  // close Account section
+
   // Close the Advanced collapsible opened for hosted users
   if (isHostedMode()) html += '</div></details>';
 
@@ -10586,6 +10809,23 @@ async function loadSettingsTab(projectId) {
   }
 
   if (isDemoMode()) hideDemoAdminControls();
+
+  // Settings section accordion — persist open/closed state per project
+  setTimeout(() => {
+    ['connect', 'executor', 'config', 'account'].forEach(function(k) {
+      const det = document.getElementById('settings-sec-' + k + '-' + projectId);
+      if (!det) return;
+      det.addEventListener('toggle', function() {
+        try {
+          const ss = JSON.parse(localStorage.getItem('meridian.settings.sections.' + projectId) || '{}');
+          ss[k] = det.open;
+          localStorage.setItem('meridian.settings.sections.' + projectId, JSON.stringify(ss));
+        } catch(e) {}
+        const caret = det.querySelector(':scope > summary .meridian-caret');
+        if (caret) caret.style.transform = det.open ? 'rotate(90deg)' : '';
+      });
+    });
+  }, 0);
 
   // Easy-setup mini executor save (hosted only)
   setTimeout(() => {
@@ -10763,15 +11003,21 @@ async function loadSettingsTab(projectId) {
 
       }
 
-      tokenListEl.innerHTML = tokens.map((token) => `
-        <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;padding:6px 8px;border:1px solid var(--border);border-radius:4px;background:var(--surface-2)">
+      tokenListEl.innerHTML = tokens.map((token) => {
+
+        const isReadOnly = (token.token_type || 'readwrite') === 'readonly';
+
+        const typeBadge = `<span style="font-size:9px;padding:1px 5px;border-radius:3px;border:1px solid ${isReadOnly ? '#fbbf24' : 'var(--accent)'};color:${isReadOnly ? '#fbbf24' : 'var(--accent)'};margin-left:4px">${isReadOnly ? 'read-only' : 'read-write'}</span>`;
+
+        return `<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;padding:6px 8px;border:1px solid var(--border);border-radius:4px;background:var(--surface-2)">
           <div style="min-width:0;flex:1">
-            <div style="font-size:10px;color:var(--text);font-family:var(--font-mono);word-break:break-all">${escapeHtml(token.masked_token || 'sk_meridian_...')}</div>
+            <div style="font-size:10px;color:var(--text);font-family:var(--font-mono);word-break:break-all;display:flex;align-items:center;gap:4px">${escapeHtml(token.masked_token || 'sk_meridian_...')}${typeBadge}</div>
             <div style="font-size:9px;color:var(--muted);margin-top:2px">${escapeHtml(token.label || 'API key')} - ${escapeHtml(token.created_at || '')}</div>
           </div>
           <button class="secondary" data-token-id="${escapeHtml(token.id || '')}" style="font-size:10px;padding:3px 8px;color:var(--danger,#ef4444)">Revoke</button>
-        </div>
-      `).join('');
+        </div>`;
+
+      }).join('');
 
       tokenListEl.querySelectorAll('[data-token-id]').forEach((btn) => {
 
@@ -10923,6 +11169,44 @@ async function loadSettingsTab(projectId) {
           genBtn.disabled = false;
 
           genBtn.textContent = hooksToken ? 'Generate new key' : 'Generate API key';
+
+        }
+
+      };
+
+    }
+
+    const genReadonlyBtn = document.getElementById(`hooks-gen-readonly-token-${projectId}`);
+
+    if (genReadonlyBtn) {
+
+      genReadonlyBtn.onclick = async () => {
+
+        genReadonlyBtn.disabled = true;
+
+        genReadonlyBtn.textContent = 'Generating...';
+
+        try {
+
+          await api('/auth/tokens', { method: 'POST', body: JSON.stringify({ label: 'readonly', token_type: 'readonly' }) });
+
+          const statusEl = document.getElementById(`hooks-token-status-${projectId}`);
+
+          if (statusEl) statusEl.textContent = 'Read-only key generated — safe for ChatGPT connectors and CI read access.';
+
+          await loadHooksTokens();
+
+        } catch (e) {
+
+          const statusEl = document.getElementById(`hooks-token-status-${projectId}`);
+
+          if (statusEl) statusEl.textContent = `error: ${escapeHtml(String(e))}`;
+
+        } finally {
+
+          genReadonlyBtn.disabled = false;
+
+          genReadonlyBtn.textContent = 'Generate read-only key';
 
         }
 

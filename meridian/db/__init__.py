@@ -343,6 +343,7 @@ CREATE TABLE IF NOT EXISTS api_tokens (
     tenant_id TEXT NOT NULL REFERENCES tenants(id),
     token_hash TEXT NOT NULL UNIQUE,
     label TEXT,
+    token_type TEXT NOT NULL DEFAULT 'readwrite',
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -1596,6 +1597,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_workspace_members_rbac(db)
     await _migrate_sprint_items_indeterminate(db)
     await _migrate_sprint_item_tree(db)
+    await _migrate_api_token_type(db)
     return db
 
 
@@ -1605,6 +1607,13 @@ async def _migrate_sprint_item_tree(db: aiosqlite.Connection) -> None:
     await _migrate_add_column_if_missing(db, "sprint_items", "split_from", "TEXT DEFAULT NULL")
     await _migrate_add_column_if_missing(db, "sprint_items", "merged_into", "TEXT DEFAULT NULL")
     await _migrate_add_column_if_missing(db, "sprint_items", "merged_from", "TEXT DEFAULT NULL")
+
+
+async def _migrate_api_token_type(db: aiosqlite.Connection) -> None:
+    """Add token_type column to api_tokens for read-only token support."""
+    await _migrate_add_column_if_missing(
+        db, "api_tokens", "token_type", "TEXT NOT NULL DEFAULT 'readwrite'"
+    )
 
 
 async def _migrate_sprint_items_indeterminate(db: aiosqlite.Connection) -> None:
@@ -5034,20 +5043,24 @@ async def create_api_token(
     db: aiosqlite.Connection,
     tenant_id: str,
     label: str | None = None,
+    token_type: str = "readwrite",
 ) -> tuple[str, dict[str, Any]]:
     """Generate a bearer token for a tenant.
 
     Returns ``(raw_token, token_row_dict)``.  The raw token is shown once
     and never stored.  Only the SHA-256 hash is persisted.
+    ``token_type`` is 'readwrite' (default) or 'readonly'.
     """
+    if token_type not in ("readwrite", "readonly"):
+        token_type = "readwrite"
     import secrets
     import hashlib
     raw = f"sk_meridian_{secrets.token_urlsafe(32)}"
     token_hash = hashlib.sha256(raw.encode()).hexdigest()
     tid = _new_id()
     await db.execute(
-        "INSERT INTO api_tokens (id, tenant_id, token_hash, label) VALUES (?, ?, ?, ?)",
-        (tid, tenant_id, token_hash, label),
+        "INSERT INTO api_tokens (id, tenant_id, token_hash, label, token_type) VALUES (?, ?, ?, ?, ?)",
+        (tid, tenant_id, token_hash, label, token_type),
     )
     await db.commit()
     async with db.execute("SELECT * FROM api_tokens WHERE id = ?", (tid,)) as cur:
@@ -5061,7 +5074,7 @@ async def list_api_tokens(
 ) -> list[dict[str, Any]]:
     """Return API token rows for a tenant, newest first."""
     async with db.execute(
-        "SELECT id, label, token_hash, created_at FROM api_tokens "
+        "SELECT id, label, token_hash, token_type, created_at FROM api_tokens "
         "WHERE tenant_id = ? ORDER BY created_at DESC, id DESC",
         (tenant_id,),
     ) as cur:
@@ -5087,9 +5100,14 @@ async def get_tenant_from_token_hash(
     db: aiosqlite.Connection,
     token_hash: str,
 ) -> dict[str, Any] | None:
-    """Look up a tenant by a pre-hashed API token.  Returns tenant dict or None."""
+    """Look up a tenant by a pre-hashed API token.
+
+    Returns tenant dict with an extra ``_token_type`` field ('readwrite' or
+    'readonly') so callers can enforce read-only restrictions without a second
+    query.
+    """
     async with db.execute(
-        "SELECT t.* FROM tenants t "
+        "SELECT t.*, a.token_type AS _token_type FROM tenants t "
         "JOIN api_tokens a ON a.tenant_id = t.id "
         "WHERE a.token_hash = ?",
         (token_hash,),

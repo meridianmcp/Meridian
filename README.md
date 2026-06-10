@@ -40,6 +40,7 @@ other's task log, and resume from a compressed handoff when context fills up.
 - **Self-host** — free forever, any team size. Clone and run in 2 commands.
 - **Hosted** at [usemeridian.us](https://usemeridian.us) — 30 days free (no card), then $20/mo Standard.
 
+<!-- MERIDIAN:ANCHOR:START quickstart -->
 ## Quickstart — binary (no Python required)
 
 Download the single-file binary for your platform, double-click (or run from terminal), and the dashboard opens automatically.
@@ -73,6 +74,7 @@ pixi run start
 ```
 
 Dashboard opens at **http://localhost:7878**. Data persists in `./data/meridian.db`.
+<!-- MERIDIAN:ANCHOR:END quickstart -->
 
 ## Wire it into your AI client
 
@@ -132,6 +134,7 @@ Or manually:
 
 Get your API key at [usemeridian.us/settings](https://usemeridian.us/settings) after sign-in. Free tier: 30 days, no card, full features.
 
+<!-- MERIDIAN:ANCHOR:START features-list -->
 ## What you get
 
 - **Dashboard** at `http://localhost:7878` — sessions, tasks, sprint board,
@@ -143,6 +146,7 @@ Get your API key at [usemeridian.us/settings](https://usemeridian.us/settings) a
 - **Tiered handoffs** — L0/L1/L2 compression so a fresh session can resume in seconds.
 - **Webhook intake** — push events from LangGraph / Autogen / custom agents into the same dashboard.
 - **Works everywhere** — Claude Code, Claude Desktop, Cursor, Windsurf, LangGraph, custom.
+<!-- MERIDIAN:ANCHOR:END features-list -->
 
 ## How it works
 
@@ -194,6 +198,7 @@ project ID. Writes to `~/.claude/settings.json` (Claude Code) or
 
 No more manual `start_session()` calls. No lost work when context fills.
 
+<!-- MERIDIAN:ANCHOR:START pricing-table -->
 ## Hosted tier
 
 | | Standard | Pro |
@@ -208,6 +213,7 @@ No more manual `start_session()` calls. No lost work when context fills.
 | **Support** | Email | Priority |
 
 30-day free trial · no card required
+<!-- MERIDIAN:ANCHOR:END pricing-table -->
 
 ## License
 

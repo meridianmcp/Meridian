@@ -109,7 +109,7 @@ from .models import (
     TaskCreate,
     TaskUpdate,
 )
-from .mcp_tools import _MCP_TOOLS_LIST, _TOOL_EXAMPLES
+from .mcp_tools import _MCP_TOOLS_LIST, _TOOL_EXAMPLES, _READ_ONLY_TOOLS as _mcp_readonly_tools
 
 # Default on-disk location. Overridable via MERIDIAN_DB env var, which the
 # test suite uses to redirect to ``:memory:``.
@@ -3203,6 +3203,22 @@ async def put_project_file(
     return {"filename": filename, "size": len(body.content.encode("utf-8"))}
 
 
+@app.post("/projects/{project_id}/devlog")
+async def append_devlog_entry(
+    project_id: str, body: dict, request: Request
+) -> dict[str, object]:
+    """Append a user-written line to DEVLOG.md via the devlog anchor."""
+    project = await db_module.get_project(await _db(request), project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="project not found")
+    text = (body.get("text") or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="text is required")
+    line = f"- {_md_ts()} {text}"
+    await md_anchors_module.apply_append("DEVLOG.md", "devlog", line)
+    return {"ok": True}
+
+
 def _render_workspace_block(
     decisions: list[dict], notes: list[dict]
 ) -> str:
@@ -5919,12 +5935,16 @@ async def create_api_token(request: Request) -> dict[str, Any]:
     except Exception:
         pass
     label = (body.get("label") or "").strip() or None
+    token_type = body.get("token_type") or "readwrite"
+    if token_type not in ("readwrite", "readonly"):
+        token_type = "readwrite"
     db = request.app.state.db
-    raw_token, token_row = await db_module.create_api_token(db, tenant["id"], label)
+    raw_token, token_row = await db_module.create_api_token(db, tenant["id"], label, token_type=token_type)
     return {
         "token": raw_token,
         "id": token_row["id"],
         "label": token_row["label"],
+        "token_type": token_row.get("token_type", "readwrite"),
         "created_at": token_row["created_at"],
     }
 
@@ -5939,6 +5959,7 @@ async def list_api_tokens(request: Request) -> list[dict[str, Any]]:
         {
             "id": token["id"],
             "label": token.get("label"),
+            "token_type": token.get("token_type") or "readwrite",
             "created_at": token.get("created_at"),
             "masked_token": _mask_api_token_hash(token.get("token_hash")),
         }
@@ -6153,7 +6174,9 @@ async def _dispatch_github_tool(name: str, args: dict[str, Any], tenant: dict) -
 
 
 async def _handle_mcp_request(
-    body: dict[str, Any], db: Any, data_dir: str, tenant: dict[str, Any] | None = None
+    body: dict[str, Any], db: Any, data_dir: str,
+    tenant: dict[str, Any] | None = None,
+    token_type: str = "readwrite",
 ) -> dict[str, Any]:
     """Dispatch one JSON-RPC 2.0 MCP request and return the response dict."""
     req_id = body.get("id")
@@ -6179,6 +6202,8 @@ async def _handle_mcp_request(
     if method == "tools/call":
         name = params.get("name", "")
         args = params.get("arguments") or {}
+        if token_type == "readonly" and name not in _mcp_readonly_tools:
+            return _jsonrpc_err(req_id, -32603, f"tool '{name}' not allowed for read-only tokens")
         try:
             if name in _GITHUB_TOOL_NAMES and tenant:
                 result = await _dispatch_github_tool(name, args, tenant)
@@ -7222,6 +7247,9 @@ async def remote_mcp(request: Request) -> Any:
             },
         )
 
+    # Extract token_type for read-only enforcement ('readwrite' or 'readonly').
+    _token_type = (tenant.pop("_token_type", None) or "readwrite")
+
     # Per-token rate limiting: 60/min for free tier, 600/min for others.
     _plan = (tenant.get("plan") or "free").lower()
     _rate_limit = 60 if _plan == "free" else 600
@@ -7241,10 +7269,10 @@ async def remote_mcp(request: Request) -> Any:
     data_dir = _data_dir(request)
 
     if isinstance(body, list):
-        results = [await _handle_mcp_request(item, db, data_dir, tenant=tenant) for item in body]
+        results = [await _handle_mcp_request(item, db, data_dir, tenant=tenant, token_type=_token_type) for item in body]
         return JSONResponse(results)
 
-    result = await _handle_mcp_request(body, db, data_dir, tenant=tenant)
+    result = await _handle_mcp_request(body, db, data_dir, tenant=tenant, token_type=_token_type)
     return JSONResponse(result)
 
 
