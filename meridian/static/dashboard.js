@@ -8391,6 +8391,19 @@ async function loadSettingsTab(projectId) {
 
 
 
+  // Settings section accordion state — persisted per project
+  let _secState = { connect: true, executor: false, config: false, account: false };
+  try { Object.assign(_secState, JSON.parse(localStorage.getItem('meridian.settings.sections.' + projectId) || '{}')); } catch(e) {}
+  const _secHtml = function(k, title) {
+    const openAttr = _secState[k] ? 'open' : '';
+    const caretRot = _secState[k] ? 'transform:rotate(90deg)' : '';
+    return '<details id="settings-sec-' + k + '-' + projectId + '" ' + openAttr + ' style="margin-bottom:12px;border:1px solid var(--border);border-radius:6px">' +
+      '<summary style="cursor:pointer;list-style:none;padding:10px 12px;display:flex;align-items:center;gap:8px">' +
+      '<span class="meridian-caret" style="display:inline-block;font-size:10px;color:var(--muted);transition:transform 120ms ease;' + caretRot + '">▶</span>' +
+      '<span style="font-weight:600;font-size:11px;color:var(--text)">' + title + '</span>' +
+      '</summary><div style="padding:0 0 4px">';
+  };
+
   let html = '';
 
 
@@ -8657,6 +8670,7 @@ async function loadSettingsTab(projectId) {
 
 
   // "Connect claude.ai browser" card — always shown regardless of hosted/self-hosted
+  html += _secHtml('connect', 'Connect Claude Code');
 
   const browserConnectorAccountNote = isHostedMode() ? `
 
@@ -9273,6 +9287,9 @@ async function loadSettingsTab(projectId) {
 
 
 
+    html += '</div></details>';  // close Connect Claude Code section
+    html += _secHtml('executor', 'Executor Setup');
+
     html += `<div style="margin-bottom:16px">
 
       <div style="color:var(--accent);font-size:10px;letter-spacing:.06em;text-transform:uppercase;margin-bottom:10px;padding-bottom:4px;border-bottom:1px solid var(--border)">Codex CLI setup</div>
@@ -9286,6 +9303,13 @@ async function loadSettingsTab(projectId) {
       </div>` : ""}
 
       <div style="font-size:10px;color:var(--muted);margin-bottom:10px">Add to <code>~/.codex/config.toml</code> — or run <code>codex mcp add meridian ${escapeHtml(mcpHttpUrl)}</code></div>
+
+      <div style="margin-bottom:12px">
+        <label style="font-size:10px;color:var(--muted)">Your Meridian path<br>
+          <input type="text" id="meridian-path-${escapeHtml(projectId)}" placeholder="/path/to/Meridian" value="${escapeHtml(rawTomlPath ? cwd : '')}" style="width:100%;max-width:400px;background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:3px 8px;margin-top:3px;box-sizing:border-box">
+        </label>
+        <div style="font-size:9px;color:var(--muted);margin-top:3px">Updates the STDIO cwd below in real time.</div>
+      </div>
 
       <div style="font-size:10px;font-weight:600;color:var(--text);margin-bottom:4px">Option A — STDIO (local, recommended)</div>
 
@@ -9431,11 +9455,25 @@ async function loadSettingsTab(projectId) {
       if (hostedMcpEl) hostedMcpEl.textContent = hostedMcpJson;
       _codexCopySetup(`copy-hosted-mcp-json-${projectId}`, hostedMcpJson);
 
+      // Path input — live-update STDIO cwd
+      const pathInput = document.getElementById(`meridian-path-${projectId}`);
+      if (pathInput) {
+        pathInput.addEventListener('input', function() {
+          const newCwd = pathInput.value.trim() || '/path/to/your/meridian';
+          const newStdio = '[mcp_servers.meridian]\ntype = "stdio"\ncommand = "pixi"\nargs = ["run", "python", "-m", "meridian", "--mcp"]\ncwd = "' + newCwd.replace(/"/g, '\\"') + '"';
+          if (stdioEl) stdioEl.textContent = newStdio;
+          _codexCopySetup(`codex-copy-stdio-${projectId}`, newStdio);
+        });
+      }
+
     }, 0);
 
   }
 
 
+
+  html += '</div></details>';  // close Executor Setup section
+  html += _secHtml('config', 'Project Config');
 
   html += `<div style="margin-bottom:16px">
 
@@ -10024,6 +10062,9 @@ async function loadSettingsTab(projectId) {
   }, 0);
 
 
+
+  html += '</div></details>';  // close Project Config section
+  html += _secHtml('account', 'Account');
 
   // Team members section (hosted mode only, uses mcpData as hosted-mode proxy)
 
@@ -10641,6 +10682,8 @@ async function loadSettingsTab(projectId) {
 
   }
 
+  html += '</div></details>';  // close Account section
+
   // Close the Advanced collapsible opened for hosted users
   if (isHostedMode()) html += '</div></details>';
 
@@ -10653,6 +10696,23 @@ async function loadSettingsTab(projectId) {
   }
 
   if (isDemoMode()) hideDemoAdminControls();
+
+  // Settings section accordion — persist open/closed state per project
+  setTimeout(() => {
+    ['connect', 'executor', 'config', 'account'].forEach(function(k) {
+      const det = document.getElementById('settings-sec-' + k + '-' + projectId);
+      if (!det) return;
+      det.addEventListener('toggle', function() {
+        try {
+          const ss = JSON.parse(localStorage.getItem('meridian.settings.sections.' + projectId) || '{}');
+          ss[k] = det.open;
+          localStorage.setItem('meridian.settings.sections.' + projectId, JSON.stringify(ss));
+        } catch(e) {}
+        const caret = det.querySelector(':scope > summary .meridian-caret');
+        if (caret) caret.style.transform = det.open ? 'rotate(90deg)' : '';
+      });
+    });
+  }, 0);
 
   // Easy-setup mini executor save (hosted only)
   setTimeout(() => {
