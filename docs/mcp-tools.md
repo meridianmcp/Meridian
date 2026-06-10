@@ -115,7 +115,7 @@ search_tasks(project_id="abc-123", query="rate limiting bug")
 ## Goal & sprint
 
 ### `get_goal`
-Read-only: Read the current goal state.
+Read-only: Fine-grained — return just the goal fields (north_star, sprint, version_goal) in isolation. Use start_session or get_session_brief for full context including tasks and decisions. Use get_goal when you only need the raw goal fields.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
