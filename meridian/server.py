@@ -918,8 +918,20 @@ async def _request_id_middleware(request: Request, call_next):
     """Attach a uuid4 X-Request-ID to every response and request state."""
     req_id = str(_uuid.uuid4())
     request.state.request_id = req_id
+    # Peek at body for MCP initialize — must be done before call_next consumes it
+    _is_mcp_init = False
+    if request.url.path in ("/mcp", "/mcp/sse") and request.method == "POST":
+        try:
+            _raw = await request.body()
+            if b'"initialize"' in _raw:
+                _is_mcp_init = True
+        except Exception:
+            pass
     response = await call_next(request)
     response.headers["X-Request-ID"] = req_id
+    # MCP 2025-03-26: return Mcp-Session-Id on initialize so Claude Code can load tools
+    if _is_mcp_init:
+        response.headers["Mcp-Session-Id"] = req_id
     return response
 
 
