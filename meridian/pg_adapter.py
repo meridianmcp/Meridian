@@ -434,6 +434,8 @@ CREATE TABLE IF NOT EXISTS projects (
     rewind_token TEXT,
     hitl_auto_answer INTEGER NOT NULL DEFAULT 0,
     icon TEXT,
+    github_repo TEXT,
+    github_branch TEXT,
     created_at TEXT NOT NULL DEFAULT ({_TS})
 );
 
@@ -873,6 +875,7 @@ async def init_pg_db(url: str) -> PostgresConnection:
     await _migrate_pg_sprint_items_claimed_at(conn)
     await _migrate_pg_sprint_item_tree(conn)
     await _migrate_pg_api_token_type(conn)
+    await _migrate_pg_github_to_projects(conn)
     return conn
 
 
@@ -898,6 +901,14 @@ async def _migrate_pg_api_token_type(conn: PostgresConnection) -> None:
     """Add token_type to api_tokens for read-only token support (Task 3)."""
     await conn.executescript(
         "ALTER TABLE api_tokens ADD COLUMN IF NOT EXISTS token_type TEXT NOT NULL DEFAULT 'readwrite'"
+    )
+
+
+async def _migrate_pg_github_to_projects(conn: PostgresConnection) -> None:
+    """Move github_repo + github_branch from tenants to projects (Task 1)."""
+    await conn.executescript(
+        "ALTER TABLE projects ADD COLUMN IF NOT EXISTS github_repo TEXT;"
+        "ALTER TABLE projects ADD COLUMN IF NOT EXISTS github_branch TEXT"
     )
 
 

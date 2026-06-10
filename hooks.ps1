@@ -50,9 +50,8 @@ function New-SessionStartHookCommand {
         [string]$Token
     )
 
-    $bodyJson = '{"project_id":"' + $ProjectId + '"}'
     $headerClause = Get-HookHeaderClause -Token $Token
-    $scriptBody = "try { `$r = Invoke-WebRequest -Method POST -Uri '$BaseUrl/hooks/session-start'$headerClause -ContentType 'application/json' -Body '$bodyJson' -UseBasicParsing; `$r.Content } catch { '{}' }"
+    $scriptBody = "try { `$cwd = (Get-Location).Path.Replace('\', '/'); `$body = '{""project_id"":""$ProjectId"",""cwd"":""' + `$cwd + '""}'; `$r = Invoke-WebRequest -Method POST -Uri '$BaseUrl/hooks/session-start'$headerClause -ContentType 'application/json' -Body `$body -UseBasicParsing; `$r.Content } catch { '{}' }"
     return "powershell -NoProfile -NonInteractive -Command `"$scriptBody`""
 }
 
