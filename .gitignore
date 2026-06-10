@@ -1,5 +1,8 @@
 ﻿# Byte-compiled / optimized / DLL files
 __pycache__/
+
+# Per-repo Meridian config (written by hooks.ps1 / hooks.sh)
+.meridian/
 *.py[codz]
 *$py.class
 data/

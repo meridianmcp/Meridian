@@ -1,6 +1,5 @@
 Meridian Source License 1.0 (MSL-1.0)
-Based on the Business Source License 1.1 (BUSL-1.1) with Additional Use Grant
-and additional restrictions specific to Meridian.
+Functional Source License variant — based on FSL-1.1-MIT with additional terms.
 
 Copyright (c) 2026 Adam Camerer. All rights reserved.
 
@@ -8,22 +7,20 @@ Copyright (c) 2026 Adam Camerer. All rights reserved.
 PLAIN ENGLISH SUMMARY (not legally binding)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-  FREE:   Run Meridian locally on your own machine for any purpose —
-          personal, commercial, research, internal tooling. Any team
-          size. Connecting to a shared hosted database (Neon, Supabase,
-          etc.) is explicitly free. Self-hosting internally is free
-          provided you don't publish how-to guides or deployment tooling
-          for others to do the same.
+  FREE:   Run Meridian locally or self-host internally for any purpose —
+          personal, commercial, research, internal tooling. Any team size.
+          Connecting to a hosted database (Neon, Supabase, etc.) is free.
+          Writing internal deployment guides for your own organization is free.
 
-  PAID:   Hosting Meridian or a functionally equivalent product as a
-          service you offer to others. Building a competing coordination
-          platform. Publishing deployment tooling whose primary purpose
-          is enabling third parties to operate Meridian commercially.
+  PAID:   Hosting Meridian as a service for others. Building a competing
+          coordination platform for third parties. Publishing open-internet
+          guides or tooling whose primary purpose is enabling third parties
+          to commercially operate Meridian or a Competing Use product.
 
   NEVER:  The above during the Protection Period without a commercial
           license from us.
 
-  LATER:  After 6 years from first public release of each version, that
+  LATER:  After 5 years from first public release of each version, that
           version automatically becomes MIT — no strings attached.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -37,91 +34,93 @@ TERMS AND CONDITIONS
    "Software" means the Meridian source code, binaries, documentation,
    and all associated files distributed under this license.
 
-   "Protection Period" means six (6) years from the date each version
+   "Protection Period" means five (5) years from the date each version
    of the Software is first publicly distributed. Each version carries
    its own independent Protection Period from its own release date.
 
-   "Change Date" means the date six (6) years after the first public
+   "Change Date" means the date five (5) years after the first public
    distribution date of a given version of the Software.
 
    "Change License" means the MIT License
    (https://opensource.org/licenses/MIT).
 
+   "Competing Use" means making the Software or a functionally similar
+   product available to third parties as a hosted or managed service —
+   specifically, providing shared goal state, session coordination, task
+   queuing, or human-in-the-loop workflow functionality to users outside
+   your own organization. Internal use within your own organization,
+   regardless of organization size, is not Competing Use.
+
+   "Commercial Deployment Guide" means any publicly accessible
+   documentation, tutorial, blog post, video, Helm chart, Docker Compose
+   file, or similar material whose primary purpose is enabling third
+   parties to operate the Software commercially or as a multi-tenant
+   service. Internal deployment documentation for your own organization's
+   use, and general tutorials about using Meridian as a user, are
+   explicitly not Commercial Deployment Guides.
+
    "Local Use" means installation and operation of the Software on
-   machines owned or controlled by you, where each user operates their
-   own running instance. Remote access to a centrally hosted instance
-   does not qualify as Local Use.
+   machines owned or controlled by you or your organization, where
+   access is limited to members of your own organization.
 
-   "Hosted Database" means an external database service (such as
-   PostgreSQL on Neon, Railway, Supabase, or similar providers) used
-   as the data backend for locally-running instances. Connecting to a
-   Hosted Database does not by itself constitute hosting the Software.
+2. GRANT OF RIGHTS
 
-   "Production Use" means making the Software available as a service
-   to external third parties — i.e., offering Meridian or a Competing
-   Product as a hosted or managed service that others connect to.
-   Internal use of the Software within your own organization, including
-   use that generates revenue for your own business, is not Production
-   Use and is explicitly permitted under Section 2.
+   Subject to the terms and conditions of this License, and except for
+   Competing Use as defined above, the Licensor grants you a worldwide,
+   royalty-free, non-sublicensable, non-exclusive license to:
 
-   "Competing Product" means any software, service, or platform that:
-   a) provides shared goal state, task queue, and session coordination
-      functionality to multiple human users or AI agents, AND
-   b) is made available to third parties as a hosted or managed service.
+   a) Use, copy, modify, and distribute the Software for any purpose,
+      including commercial purposes within your own organization.
 
-   Mere similarity in features does not create a Competing Product.
-   The conjunction of (a) and (b) is required.
+   b) Self-host the Software internally for any team size, connecting
+      to external hosted databases as needed.
 
-   "Prohibited Publishing" means distributing materials — including but
-   not limited to Docker images, Helm charts, or hosted deployment
-   guides — whose primary purpose is enabling third parties to operate
-   the Software as a commercial or multi-tenant service. Writing blog
-   posts, documentation, tutorials, or internal deployment scripts
-   for personal or internal use does not constitute Prohibited Publishing.
+   c) Run the Software in CI/CD pipelines and automated workflows for
+      your own projects.
 
-2. ADDITIONAL USE GRANT (FREE USES)
+   d) Use the Software for academic, research, and educational purposes,
+      including publication of findings.
 
-   Notwithstanding the Production Use restriction in Section 3, the
-   following uses are explicitly permitted free of charge during the
-   Protection Period:
+   e) Write internal deployment documentation, scripts, and tooling for
+      your own organization's use.
 
-   a) Local Use for any purpose — personal, commercial, or internal —
-      regardless of team or organization size. There is no seat limit.
-
-   b) Connecting locally-running instances to a Hosted Database for
-      team coordination, regardless of team size.
-
-   c) Deploying the Software on infrastructure owned or controlled by
-      your organization for internal use only, provided no Prohibited
-      Publishing occurs.
-
-   d) Running the Software in local or self-owned CI/CD pipelines and
-      automated workflows for your own projects.
-
-   e) Using the Software for academic, research, and educational
-      purposes, including publication of research findings.
-
-   f) Distributing unmodified copies for evaluation or non-commercial
+   f) Distribute unmodified copies for evaluation or non-commercial
       purposes, provided this license is retained in full.
 
-3. PRODUCTION USE RESTRICTION
+3. RESTRICTIONS
 
-   During the Protection Period, Production Use of the Software is
-   not permitted without a separate written commercial license from
-   the Licensor, specifically including:
+   During the Protection Period, the following are not permitted without
+   a separate written commercial license from the Licensor:
 
-   a) Offering the Software or a Competing Product as a hosted or
-      managed service to third parties, whether for a fee or free.
+   a) Competing Use — making the Software or a functionally similar
+      product available to third parties as a hosted or managed service.
 
-   b) Prohibited Publishing as defined in Section 1.
+   b) Publishing Commercial Deployment Guides — openly distributing
+      guides, tooling, or materials whose primary purpose is enabling
+      third parties to commercially operate the Software.
 
-   c) Selling, sublicensing, or distributing the Software or derivatives
-      as part of any commercial product or service for third parties.
+   c) White-labeling — distributing the Software or derivatives with
+      Licensor attribution removed or obscured, for the purpose of
+      offering it as a competing product or service.
 
-   d) Removing, altering, or obscuring this license or any copyright
-      notices included with the Software.
+   d) AI Training Use — using the Software, its source code, or
+      documentation as training data for machine learning models
+      intended for commercial distribution or sale without prior
+      written permission from the Licensor.
 
-4. LICENSE CONVERSION (CHANGE LICENSE)
+   e) Sublicensing or reselling the Software or derivatives as a
+      standalone commercial product for third parties.
+
+4. PATENT GRANT
+
+   Subject to the terms of this License, the Licensor hereby grants
+   you a perpetual, worldwide, royalty-free, non-exclusive patent
+   license to make, use, sell, and distribute the Software, solely
+   to the extent necessary to exercise the rights granted in Section 2.
+   This patent grant does not extend to Competing Use or any use
+   restricted under Section 3.
+
+5. LICENSE CONVERSION
 
    On each version's Change Date, that version of the Software will
    automatically be made available under the Change License (MIT).
@@ -129,26 +128,23 @@ TERMS AND CONDITIONS
    Subsequent versions may carry their own Protection Period and
    Change Date under a new MSL notice.
 
-   The MIT License grants you perpetual, worldwide, royalty-free
-   permission to use, copy, modify, merge, publish, distribute,
-   sublicense, and/or sell copies of the Software without restriction,
-   subject only to the copyright notice and license text being retained.
-
-5. ATTRIBUTION
+6. ATTRIBUTION
 
    Any permitted use, modification, or redistribution must retain this
    license text, the copyright notice, and original attribution intact.
+   You may not remove, alter, or obscure any copyright or license
+   notices included with the Software.
 
-6. CONTRIBUTIONS
+7. CONTRIBUTIONS
 
    By submitting any contribution to this project, the contributor
-   grants the Licensor a perpetual, worldwide, royalty-free license
-   to use, modify, and distribute that contribution under any license
-   the Licensor sees fit, including future versions of this license or
-   commercial licenses. Contributors retain copyright in their own
-   contributions.
+   grants the Licensor a perpetual, worldwide, royalty-free, irrevocable
+   license to use, modify, reproduce, and distribute that contribution
+   under any license the Licensor sees fit, including future versions
+   of this license or commercial licenses. Contributors retain copyright
+   in their own contributions.
 
-7. DISCLAIMER OF WARRANTY
+8. DISCLAIMER OF WARRANTY
 
    THIS SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
    EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO WARRANTIES OF
@@ -158,14 +154,31 @@ TERMS AND CONDITIONS
    OTHERWISE, ARISING FROM, OUT OF, OR IN CONNECTION WITH THE SOFTWARE
    OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-8. COMMERCIAL LICENSING
+9. LIMITATION OF LIABILITY
 
-   For Production Use, hosting exemptions, OEM licensing, or any use
-   not covered by Section 2, contact: hello@usemeridian.us
+   IN NO EVENT SHALL THE LICENSOR BE LIABLE FOR ANY INDIRECT, INCIDENTAL,
+   SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING LOST PROFITS,
+   LOSS OF DATA, OR BUSINESS INTERRUPTION) HOWEVER CAUSED, EVEN IF
+   ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+10. GOVERNING LAW
+
+    This License shall be governed by and construed in accordance with
+    the laws of the State of Florida, United States, without regard to
+    its conflict of law provisions. Any disputes arising under this
+    License shall be subject to the exclusive jurisdiction of the state
+    and federal courts located in Florida.
+
+11. COMMERCIAL LICENSING
+
+    For Competing Use, hosting exemptions, OEM licensing, AI training
+    permissions, or any use not covered by Section 2, contact:
+    hello@usemeridian.us
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Meridian Source License 1.0 (MSL-1.0)
 Not an OSI-approved open source license.
-Based on the Business Source License 1.1 (BUSL-1.1).
-Protection Period: 6 years per version from first public distribution.
+Inspired by the Functional Source License (FSL-1.1-MIT).
+Protection Period: 5 years per version from first public distribution.
 Change License: MIT License.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

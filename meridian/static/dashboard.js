@@ -5358,6 +5358,40 @@ function renderSprintProgress(projectId, items) {
 
   }
 
+  // Human-assigned items — "Your tasks" section above the pending queue.
+
+  const humanItems = items.filter(it => it.milestone_type === 'human' && activeSet.has(it.status));
+
+  if (humanItems.length > 0) {
+
+    html += `<div style="background:rgba(59,130,246,0.08);border:1px solid rgba(59,130,246,0.35);border-radius:6px;padding:8px 10px;margin-bottom:10px">
+
+      <div style="color:var(--accent);font-weight:600;margin-bottom:6px;font-size:12px">👤 Your tasks (${humanItems.length})</div>`;
+
+    html += humanItems.map(it => `
+
+      <div class="sprint-item-row" data-item="${escapeHtml(it.id)}" style="background:transparent;border-bottom:1px solid rgba(59,130,246,0.2);padding:4px 0">
+
+        <span class="sprint-item-icon" style="color:var(--accent)">👤</span>
+
+        <span class="sprint-item-title">${escapeHtml(it.title)}</span>
+
+        <span class="sprint-item-ver">${escapeHtml(it.version)}</span>
+
+        <span class="sprint-item-actions">
+
+          <button class="sprint-btn" title="Mark done"
+
+            onclick="sprintAction('${escapeHtml(projectId)}','${escapeHtml(it.id)}','complete')">✓ Done</button>
+
+        </span>
+
+      </div>`).join('');
+
+    html += `</div>`;
+
+  }
+
   // Build parent → children map across all items (for progress counts + tree display).
 
   const allChildrenOf = new Map();

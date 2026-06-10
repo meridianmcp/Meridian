@@ -328,8 +328,8 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "depends_on": {"type": "string", "description": "Sprint item id that must complete first."},
          "failure_mode": {"type": "string", "enum": ["continue", "stop"],
                           "description": "'stop' blocks this item if the parent fails."},
-         "milestone_type": {"type": "string", "enum": ["task", "milestone"],
-                            "description": "'milestone' renders as a timeline marker."}},
+         "milestone_type": {"type": "string", "enum": ["task", "milestone", "human"],
+                            "description": "'milestone' renders as a timeline marker; 'human' marks a task for a human (hidden from executor sessions)."}},
          "required": ["project_id", "version", "title"]}},
     {"name": "complete_sprint_item", "description":
         "Mark a sprint item done. Pass task_id to link the task that shipped it.",

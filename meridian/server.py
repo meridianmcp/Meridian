@@ -5138,8 +5138,11 @@ async def _start_session_composite(
 
     # v1.1 — surface the active sprint checklist so cold sessions see
     # what's in flight before doing anything. "Active" = todo/pending/in_progress.
+    # Executor sessions (role="executor") exclude human-assigned tasks.
     active_statuses = ("todo", "pending", "in_progress")
-    all_sprint_items = await db_module.get_sprint_items(db, project_id)
+    all_sprint_items = await db_module.get_sprint_items(
+        db, project_id, include_human=(role != "executor")
+    )
     pending_items = [
         it for it in all_sprint_items if it.get("status") in active_statuses
     ]
@@ -6018,11 +6021,76 @@ async def delete_api_token(token_id: str, request: Request) -> Response:
 
 @app.get("/auth/me")
 async def get_me(request: Request) -> dict[str, Any]:
-    """Return the authenticated tenant's profile (session cookie or bearer)."""
+    """Return the authenticated tenant's profile (session cookie or bearer), including projects."""
     tenant = await _get_authenticated_tenant(request)
     safe = {k: v for k, v in tenant.items() if k not in ("neon_db_url", "github_pat")}
     safe["github_connected"] = bool(tenant.get("github_pat"))
+    try:
+        project_db = await _open_tenant_db_by_id(request, tenant["id"])
+        projects = await db_module.list_project_summaries(project_db)
+        safe["projects"] = [
+            {"id": p["id"], "name": p["name"]}
+            for p in (projects or [])
+        ]
+    except Exception:
+        safe["projects"] = []
     return safe
+
+
+@app.get("/auth/install", response_class=HTMLResponse)
+async def auth_install_page(request: Request) -> HTMLResponse:
+    """One-time install token page — requires browser session, returns a short-lived token."""
+    if not _hosted_mode():
+        raise HTTPException(status_code=404, detail="not available in self-hosted mode")
+    from datetime import datetime, timezone, timedelta
+    tenant = await _get_authenticated_tenant(request)
+    db = request.app.state.db
+    expires_at = (datetime.now(timezone.utc) + timedelta(minutes=10)).isoformat()
+    raw_token, _ = await db_module.create_api_token(
+        db, tenant["id"], label="install", expires_at=expires_at
+    )
+    email = tenant.get("email", "")
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Meridian — Install Token</title>
+  <style>
+    body{{font-family:system-ui,sans-serif;background:#0d0d0d;color:#e8e8e8;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}}
+    .card{{background:#1a1a1a;border:1px solid #2e2e2e;border-radius:12px;padding:32px;max-width:520px;width:100%}}
+    h2{{margin:0 0 8px;font-size:20px}}
+    p{{color:#888;margin:0 0 20px;font-size:14px}}
+    .token-box{{font-family:monospace;font-size:13px;background:#0d0d0d;border:1px solid #333;border-radius:6px;padding:14px;word-break:break-all;user-select:all;cursor:pointer;color:#7dd3fc;line-height:1.5}}
+    .copy-btn{{margin-top:12px;padding:8px 20px;border-radius:6px;border:none;background:#3b82f6;color:#fff;cursor:pointer;font-size:13px;width:100%}}
+    .copy-btn:active{{background:#2563eb}}
+    .note{{font-size:12px;color:#555;margin-top:16px;line-height:1.5}}
+    .email{{color:#888;font-size:12px;margin-bottom:20px}}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h2>Meridian Install Token</h2>
+    <div class="email">Signed in as {email}</div>
+    <p>Copy this token and paste it into the installer. It expires in 10 minutes and can only be used once.</p>
+    <div class="token-box" id="token" onclick="copyToken()">{raw_token}</div>
+    <button class="copy-btn" onclick="copyToken()">Copy token</button>
+    <div class="note">
+      This token grants one-time access to authenticate the installer.<br>
+      After authentication, you will receive a permanent API token stored locally.
+    </div>
+  </div>
+  <script>
+    function copyToken() {{
+      navigator.clipboard.writeText('{raw_token}').then(() => {{
+        const btn = document.querySelector('.copy-btn');
+        btn.textContent = '✓ Copied!';
+        setTimeout(() => btn.textContent = 'Copy token', 2000);
+      }});
+    }}
+  </script>
+</body>
+</html>"""
+    return HTMLResponse(content=html)
 
 
 # ---------------------------------------------------------------------------
@@ -6045,7 +6113,7 @@ def _jsonrpc_err(req_id: Any, code: int, message: str) -> dict[str, Any]:
 # GitHub MCP tools — injected per-tenant when github_pat is set
 # ---------------------------------------------------------------------------
 
-_GITHUB_TOOL_NAMES = frozenset({"read_file", "list_files", "search_code", "get_commits", "get_commit"})
+_GITHUB_TOOL_NAMES = frozenset({"read_file", "list_files", "search_code", "get_commits", "get_commit", "search_commits"})
 
 
 def _github_tools_for_tenant(tenant: dict) -> list[dict[str, Any]]:
@@ -6093,14 +6161,28 @@ def _github_tools_for_tenant(tenant: dict) -> list[dict[str, Any]]:
         },
         {
             "name": "get_commits",
-            "description": "Return recent commits from the project's connected GitHub repository.",
+            "description": "Return recent commits from the project's connected GitHub repository. Returns helpful error if no GitHub repo is connected.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     **_pid_prop,
-                    "limit": {"type": "integer", "description": "Number of commits to return (default: 10, max: 50)"},
+                    "limit": {"type": "integer", "description": "Number of commits to return (default: 50, max: 50)"},
+                    "since": {"type": "string", "description": "ISO 8601 date string to filter commits after this date (optional, e.g. '2024-01-01T00:00:00Z')"},
                 },
                 "required": ["project_id"],
+            },
+        },
+        {
+            "name": "search_commits",
+            "description": "Search recent commits by message substring. Fetches up to 100 recent commits and filters by case-insensitive match. Returns helpful error if no GitHub repo is connected.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    **_pid_prop,
+                    "query": {"type": "string", "description": "Case-insensitive substring to search in commit messages"},
+                    "limit": {"type": "integer", "description": "Max results to return (default: 20)"},
+                },
+                "required": ["project_id", "query"],
             },
         },
         {
@@ -6197,11 +6279,14 @@ async def _dispatch_github_tool(name: str, args: dict[str, Any], tenant: dict, d
             }
 
         if name == "get_commits":
-            limit = min(int(args.get("limit") or 10), 50)
+            limit = min(int(args.get("limit") or 50), 50)
+            params: dict[str, str] = {"per_page": str(limit)}
+            if args.get("since"):
+                params["since"] = args["since"]
             r = await http.get(
                 f"https://api.github.com/repos/{repo}/commits",
                 headers=gh_headers,
-                params={"per_page": str(limit)},
+                params=params,
             )
             r.raise_for_status()
             commits = r.json()
@@ -6216,6 +6301,28 @@ async def _dispatch_github_tool(name: str, args: dict[str, Any], tenant: dict, d
                     for c in commits
                 ]
             }
+
+        if name == "search_commits":
+            query = (args.get("query") or "").lower()
+            limit = min(int(args.get("limit") or 20), 100)
+            r = await http.get(
+                f"https://api.github.com/repos/{repo}/commits",
+                headers=gh_headers,
+                params={"per_page": "100"},
+            )
+            r.raise_for_status()
+            all_commits = r.json()
+            matched = [
+                {
+                    "sha": c["sha"][:12],
+                    "message": c["commit"]["message"].split("\n")[0],
+                    "author": c["commit"]["author"]["name"],
+                    "date": c["commit"]["author"]["date"],
+                }
+                for c in all_commits
+                if query in c["commit"]["message"].lower()
+            ][:limit]
+            return {"query": args.get("query"), "count": len(matched), "commits": matched}
 
         if name == "get_commit":
             sha = args.get("sha", "")
@@ -6648,9 +6755,15 @@ async def _dispatch_mcp_tool(
         await goal_md_module.sync_db_to_goal_md(db, args["project_id"])
         return result
     if name == "get_sprint_items":
+        include_human = args.get("human", True)
+        if isinstance(include_human, bool):
+            pass
+        else:
+            include_human = str(include_human).lower() not in ("false", "0", "no")
         return await db_module.get_sprint_items(
             db, args["project_id"],
             status=args.get("status"),
+            include_human=include_human,
         )
     if name == "claim_sprint_item":
         item = await db_module.claim_sprint_item(db, args["project_id"], args["item_id"])
@@ -8326,8 +8439,8 @@ def build_mcp_server():
                         },
                         "milestone_type": {
                             "type": "string",
-                            "enum": ["task", "milestone"],
-                            "description": "'milestone' renders as a timeline marker. Default: 'task'.",
+                            "enum": ["task", "milestone", "human"],
+                            "description": "'milestone' renders as a timeline marker; 'human' marks a task for a human (hidden from executor sessions). Default: 'task'.",
                         },
                     },
                     "required": ["project_id", "version", "title"],
@@ -8412,6 +8525,7 @@ def build_mcp_server():
                 description=(
                     "List sprint items for a project. Optional status filter "
                     "(todo|pending|in_progress|done|failed|skipped|pushed). "
+                    "Pass human=false to exclude human-assigned tasks (default: true). "
                     "Cold sessions read this to know what's still owed."
                 ),
                 inputSchema={
@@ -8424,6 +8538,10 @@ def build_mcp_server():
                                 "pending", "todo", "in_progress",
                                 "done", "failed", "skipped", "pushed",
                             ],
+                        },
+                        "human": {
+                            "type": "boolean",
+                            "description": "Include items with milestone_type='human'. Default: true. Pass false to hide human tasks (used by executor sessions).",
                         },
                     },
                     "required": ["project_id"],
