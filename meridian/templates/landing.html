@@ -601,38 +601,12 @@ irm https://usemeridian.us/hooks.ps1 | iex</pre>
 
 <section id="planning-chat">
   <h2>Use Meridian from claude.ai</h2>
-  <p class="section-lede">Get all 20+ Meridian tools directly in your claude.ai planning chat — no copy-pasting session output.</p>
+  <p class="section-lede">Get all 20+ Meridian tools directly in your claude.ai planning chat — no copy-pasting session output, no local install.</p>
   <div class="self-host" style="max-width:860px">
-    <p class="lede">Install the <a href="https://github.com/dnakov/claude-mcp" target="_blank">claude-mcp</a> browser extension (included as a submodule):</p>
-    <pre><span class="h"># Clone with submodules</span>
-<span class="c">$</span> git clone --recurse-submodules https://github.com/meridianmcp/Meridian
-
-<span class="h"># Chrome: Extensions → Developer mode → Load unpacked → extensions/claude-mcp</span>
-<span class="h"># Set URL to http://localhost:7878/mcp/sse in the extension popup</span>
-<span class="h"># All 20+ Meridian tools now available in claude.ai planning chat</span></pre>
+    <p class="lede">Works with Claude Code, Cursor, Windsurf, Claude Desktop, ChatGPT, and any MCP client. Self-host free forever or use the hosted tier.</p>
     <div class="self-host-row">
       <a href="/install-mcp" class="btn btn-primary">Step-by-step setup guide →</a>
-      <a href="https://github.com/dnakov/claude-mcp" class="btn btn-secondary" target="_blank">↗ dnakov/claude-mcp</a>
-      <a href="https://docs.usemeridian.us" class="btn btn-secondary">Docs</a>
-    </div>
-  </div>
-  <div class="self-host" style="max-width:860px;margin-top:2rem">
-    <p class="lede" style="margin-bottom:1rem">On the hosted tier, two client layers both connect to the same Meridian Cloud MCP Server:</p>
-    <div class="arch-diagram" style="flex-wrap:nowrap;overflow-x:auto">
-      <div class="arch-col">
-        <div class="arch-box arch-client" style="margin-bottom:6px">Chat<br><span>ChatGPT, Claude.ai</span></div>
-        <div style="font-size:11px;color:var(--muted);text-align:center;margin-bottom:6px">browser MCP</div>
-        <div class="arch-box arch-client">Executor<br><span>Claude Code, Codex, Cursor</span></div>
-        <div style="font-size:11px;color:var(--muted);text-align:center;margin-top:6px">HTTPS + Bearer token</div>
-      </div>
-      <div class="arch-arrows">→</div>
-      <div class="arch-col">
-        <div class="arch-box arch-server">Meridian Cloud<br><span>MCP Server</span></div>
-      </div>
-      <div class="arch-arrows">→</div>
-      <div class="arch-col">
-        <div class="arch-box arch-state">Neon Postgres<br><span>isolated per workspace</span></div>
-      </div>
+      <a href="https://docs.usemeridian.us" class="btn btn-secondary">Read the docs →</a>
     </div>
   </div>
 </section>
@@ -641,25 +615,6 @@ irm https://usemeridian.us/hooks.ps1 | iex</pre>
   <div class="self-host">
     <h2>Self-host in 30 seconds</h2>
     <p class="lede">Local SQLite by default. Connect your own Postgres for shared team state. Free forever for personal use.</p>
-    <div class="arch-diagram">
-      <div class="arch-col">
-        <div class="arch-box arch-client">Claude Code<br><span>any terminal</span></div>
-        <div class="arch-box arch-client">Cursor / Windsurf<br><span>IDE</span></div>
-        <div class="arch-box arch-client">Claude Desktop<br><span>desktop app</span></div>
-      </div>
-      <div class="arch-arrows">→</div>
-      <div class="arch-col">
-        <div class="arch-box arch-relay">MCP stdio<br><span>local</span></div>
-      </div>
-      <div class="arch-arrows">→</div>
-      <div class="arch-col">
-        <div class="arch-box arch-server">Meridian Server<br><span>:7878</span></div>
-      </div>
-      <div class="arch-arrows">→</div>
-      <div class="arch-col">
-        <div class="arch-box arch-state">SQLite meridian.db<br><span>or Postgres</span></div>
-      </div>
-    </div>
     <pre><span class="h"># macOS / Linux</span>
 <span class="c">$</span> curl -fsSL https://pixi.sh/install.sh | bash
 <span class="c">$</span> git clone https://github.com/meridianmcp/Meridian
@@ -715,17 +670,21 @@ irm https://usemeridian.us/hooks.ps1 | iex</pre>
       <div class="plan-price">$0<small> / mo</small></div>
       <div class="plan-trial"><span class="ok">available now</span> · no card required</div>
       <hr class="plan-divider">
-      <ul class="plan-features">
-        <li>Hosted dashboard at usemeridian.us</li>
-        <li>Remote MCP endpoint (HTTPS + Bearer)</li>
+      <div style="font-size:.75rem;font-weight:700;color:var(--muted);letter-spacing:.06em;text-transform:uppercase;font-family:var(--mono);margin-bottom:.5rem">Hosted free tier</div>
+      <ul class="plan-features" style="margin-bottom:1rem">
         <li>1 project · 1 concurrent session</li>
-        <li>Google + GitHub + email sign-in</li>
         <li>0.5 CU shared compute</li>
-        <li>10 CU-hours total included</li>
+        <li>10 CU-hours total · expires on inactivity</li>
         <li>HITL queue + pinned decisions</li>
-        <li>Self-hosting still stays free forever</li>
+        <li>Google + GitHub + email sign-in</li>
       </ul>
-      <div class="plan-note">Hosted free tier expires after inactivity. Self-hosted Meridian remains free forever.</div>
+      <div style="font-size:.75rem;font-weight:700;color:var(--muted);letter-spacing:.06em;text-transform:uppercase;font-family:var(--mono);margin-bottom:.5rem">Self-hosted</div>
+      <ul class="plan-features">
+        <li>Free forever · no seat limits</li>
+        <li>Full features · your own DB</li>
+        <li>Binary, pixi, or Docker</li>
+      </ul>
+      <div class="plan-note">Hosted free tier expires after inactivity. Self-hosted is free forever with no restrictions.</div>
       <a href="/auth/login" class="plan-cta secondary">Start free →</a>
     </div>
 
