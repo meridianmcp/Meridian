@@ -8669,7 +8669,7 @@ async function loadSettingsTab(projectId) {
 
       </div>
 
-      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:10px">
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:6px">
 
         ${mcpData ? `<button id="hooks-gen-token-${projectId}" class="primary" style="font-size:10px;padding:4px 10px">Generate API key</button>` : ''}
 
@@ -8677,6 +8677,15 @@ async function loadSettingsTab(projectId) {
 
         <span id="hooks-token-status-${projectId}" style="font-size:10px;color:var(--muted)">${mcpData ? 'Generate an API key to replace the placeholder token in the hosted snippets below.' : 'Local mode - no Bearer token needed.'}</span>
 
+      </div>
+
+      <div id="hooks-key-reveal-${projectId}" style="display:none;margin-bottom:8px;padding:8px 10px;border:1px solid var(--accent);border-radius:4px;background:var(--surface-1)">
+        <div style="font-size:10px;color:var(--accent);font-weight:600;margin-bottom:6px">Your new API key — save it now, it won't be shown again:</div>
+        <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
+          <input id="hooks-key-reveal-input-${projectId}" type="text" readonly style="flex:1;min-width:180px;background:var(--surface-2);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:4px 8px">
+          <button id="hooks-key-copy-btn-${projectId}" class="primary" style="font-size:10px;padding:4px 10px">Copy key</button>
+          <button id="hooks-key-dismiss-${projectId}" class="secondary" style="font-size:10px;padding:4px 8px" title="Dismiss">×</button>
+        </div>
       </div>
 
       ${mcpData ? `<div style="margin-bottom:10px;padding:8px 10px;border:1px solid var(--border);border-radius:4px;background:var(--surface-1)">
@@ -8765,21 +8774,21 @@ async function loadSettingsTab(projectId) {
 
     </div>`;
 
-    html += `<details id="adv-settings-${projectId}" ${_advOpen ? 'open' : ''} style="margin-bottom:14px;border:1px solid var(--border);border-radius:6px;background:var(--surface-2)">
-
-      <summary style="cursor:pointer;list-style:none;padding:10px 12px;display:flex;justify-content:space-between;align-items:center;gap:8px">
-
-        <span style="font-weight:600;font-size:11px;color:var(--muted)">Advanced settings</span>
-
-        <span class="meridian-caret" style="display:inline-block;font-size:10px;color:var(--muted);transition:transform 120ms ease;flex-shrink:0;${_advOpen ? 'transform:rotate(90deg)' : ''}">▶</span>
-
-      </summary>
-
-      <div style="padding:0 12px 12px">`;
-
   }
 
 
+
+  // ── PROJECT SETTINGS group ──────────────────────────────────────────────
+  {
+    let _psOpen = true;
+    try { _psOpen = localStorage.getItem('meridian.settings.ps.' + projectId) !== '0'; } catch(e) {}
+    const _psRot = _psOpen ? 'transform:rotate(90deg)' : '';
+    html += `<details id="settings-grp-ps-${projectId}" ${_psOpen ? 'open' : ''} style="margin-bottom:12px;border:2px solid var(--border);border-radius:8px">` +
+      `<summary style="cursor:pointer;list-style:none;padding:10px 14px;display:flex;align-items:center;gap:8px;background:var(--surface-2);border-radius:8px">` +
+      `<span class="meridian-caret" style="display:inline-block;font-size:10px;color:var(--muted);transition:transform 120ms ease;${_psRot}">▶</span>` +
+      `<span style="font-weight:700;font-size:11px;color:var(--text);letter-spacing:.04em">PROJECT SETTINGS</span>` +
+      `</summary><div style="padding:8px 8px 4px">`;
+  }
 
   // "Connect claude.ai browser" card — always shown regardless of hosted/self-hosted
   html += _secHtml('connect', 'Connect Claude Code');
@@ -8968,7 +8977,7 @@ async function loadSettingsTab(projectId) {
 
       </div>
 
-      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:10px">
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:6px">
 
         ${mcpData ? `<button id="hooks-gen-token-${projectId}" class="primary" style="font-size:10px;padding:4px 10px">Generate API key</button>` : ''}
 
@@ -8976,6 +8985,15 @@ async function loadSettingsTab(projectId) {
 
         <span id="hooks-token-status-${projectId}" style="font-size:10px;color:var(--muted)">${mcpData ? 'Generate an API key to replace the placeholder token in the hosted snippets below.' : 'Local mode - no Bearer token needed.'}</span>
 
+      </div>
+
+      <div id="hooks-key-reveal-${projectId}" style="display:none;margin-bottom:8px;padding:8px 10px;border:1px solid var(--accent);border-radius:4px;background:var(--surface-1)">
+        <div style="font-size:10px;color:var(--accent);font-weight:600;margin-bottom:6px">Your new API key — save it now, it won't be shown again:</div>
+        <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
+          <input id="hooks-key-reveal-input-${projectId}" type="text" readonly style="flex:1;min-width:180px;background:var(--surface-2);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:4px 8px">
+          <button id="hooks-key-copy-btn-${projectId}" class="primary" style="font-size:10px;padding:4px 10px">Copy key</button>
+          <button id="hooks-key-dismiss-${projectId}" class="secondary" style="font-size:10px;padding:4px 8px" title="Dismiss">×</button>
+        </div>
       </div>
 
       ${mcpData ? `<div style="margin-bottom:10px;padding:8px 10px;border:1px solid var(--border);border-radius:4px;background:var(--surface-1)">
@@ -9102,6 +9120,15 @@ async function loadSettingsTab(projectId) {
 
         <span id="mcp-copy-status-${projectId}" style="font-size:10px;color:var(--muted)"></span>
 
+      </div>
+
+      <div id="mcp-key-reveal-${projectId}" style="display:none;margin-top:8px;padding:8px 10px;border:1px solid var(--accent);border-radius:4px;background:var(--surface-1)">
+        <div style="font-size:10px;color:var(--accent);font-weight:600;margin-bottom:6px">Your new API key — save it now, it won't be shown again:</div>
+        <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
+          <input id="mcp-key-reveal-input-${projectId}" type="text" readonly style="flex:1;min-width:180px;background:var(--surface-2);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:4px 8px">
+          <button id="mcp-key-copy-btn-${projectId}" class="primary" style="font-size:10px;padding:4px 10px">Copy key</button>
+          <button id="mcp-key-dismiss-${projectId}" class="secondary" style="font-size:10px;padding:4px 8px" title="Dismiss">×</button>
+        </div>
       </div>
 
       <div id="mcp-file-note-${projectId}" style="font-size:10px;color:var(--muted);margin-top:6px"></div>
@@ -9304,7 +9331,24 @@ async function loadSettingsTab(projectId) {
 
             copyBtn.disabled = false;
 
-            if (copyStatus) copyStatus.textContent = 'Real key generated — save it, it won\'t be shown again.';
+            // Show raw key reveal zone
+            const mcpRevealEl = document.getElementById(`mcp-key-reveal-${projectId}`);
+            const mcpRevealInput = document.getElementById(`mcp-key-reveal-input-${projectId}`);
+            const mcpKeyCopyBtn = document.getElementById(`mcp-key-copy-btn-${projectId}`);
+            const mcpKeyDismiss = document.getElementById(`mcp-key-dismiss-${projectId}`);
+            if (mcpRevealEl && mcpRevealInput) {
+              mcpRevealInput.value = tok.token;
+              mcpRevealEl.style.display = '';
+              function _hideMcpReveal() {
+                mcpRevealEl.style.display = 'none';
+                if (copyStatus) copyStatus.textContent = 'Key saved: ' + tok.token.slice(0, 18) + '...' + tok.token.slice(-4);
+              }
+              if (mcpKeyCopyBtn) mcpKeyCopyBtn.onclick = async () => { try { await navigator.clipboard.writeText(tok.token); mcpKeyCopyBtn.textContent = 'Copied!'; setTimeout(() => { mcpKeyCopyBtn.textContent = 'Copy key'; }, 1800); } catch(e) {} };
+              if (mcpKeyDismiss) mcpKeyDismiss.onclick = _hideMcpReveal;
+              setTimeout(_hideMcpReveal, 30000);
+            } else if (copyStatus) {
+              copyStatus.textContent = 'Real key generated — save it, it won\'t be shown again.';
+            }
 
           } catch (e) {
 
@@ -9863,99 +9907,7 @@ async function loadSettingsTab(projectId) {
 
 
 
-  // Workspace section — tenant-global notes, decisions, defaults (v3.4).
-
-  // Applies across ALL projects; injected at the top of every context block.
-
-  html += `<div style="margin-bottom:16px" id="workspace-section-${projectId}">
-
-    <div style="color:var(--accent);font-size:10px;letter-spacing:.06em;text-transform:uppercase;margin-bottom:10px;padding-bottom:4px;border-bottom:1px solid var(--border)">Workspace</div>
-
-    <div style="font-size:10px;color:var(--muted);margin-bottom:10px">Applies across <strong>all projects</strong> in this workspace. Notes and decisions here are injected at the top of every project's context block.</div>
-
-
-
-    <div style="margin-bottom:12px">
-
-      <div style="font-size:10px;color:var(--text);margin-bottom:4px">Default settings</div>
-
-      <label style="display:flex;gap:8px;align-items:flex-start;font-size:11px;color:var(--text);cursor:pointer;margin-bottom:6px">
-
-        <input type="checkbox" id="ws-hitl-default" style="margin-top:2px">
-
-        <span>Auto-answer HITL by default<br>
-
-          <span style="font-size:9px;color:var(--muted)">Suggested default for new projects' HITL auto-answer toggle.</span>
-
-        </span>
-
-      </label>
-
-      <label style="font-size:10px;color:var(--muted);display:block">Default sprint name<br>
-
-        <input id="ws-sprint-default" type="text" placeholder="e.g. june-sprint" style="width:100%;max-width:240px;background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:3px 6px;margin-top:2px">
-
-      </label>
-
-      <label style="font-size:10px;color:var(--muted);display:block;margin-top:6px">Your display name<br>
-
-        <input id="ws-display-name" type="text" placeholder="e.g. Adam" style="width:100%;max-width:240px;background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:3px 6px;margin-top:2px">
-
-        <span style="display:block;font-size:9px;color:var(--muted);margin-top:2px">Used to attribute Claude/Codex hook sessions to you on the activity timeline when they don't set a name.</span>
-
-      </label>
-
-      <div style="margin-top:8px;display:flex;gap:8px;align-items:center">
-
-        <button id="ws-settings-save" class="primary" style="font-size:10px;padding:3px 10px">Save defaults</button>
-
-        <span id="ws-settings-status" style="font-size:10px;color:var(--muted);min-height:14px"></span>
-
-      </div>
-
-    </div>
-
-
-
-    <div style="margin-bottom:12px">
-
-      <div style="font-size:10px;color:var(--text);margin-bottom:4px">Workspace decisions</div>
-
-      <div id="ws-decisions-list" style="font-size:10px;font-family:var(--font-mono);margin-bottom:6px"><div style="color:var(--muted)">loading…</div></div>
-
-      <div style="display:flex;gap:6px;flex-wrap:wrap">
-
-        <input id="ws-dec-title" type="text" placeholder="Title" style="background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:4px 8px;flex:1;min-width:120px">
-
-        <input id="ws-dec-body" type="text" placeholder="Body" style="background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:4px 8px;flex:2;min-width:160px">
-
-        <button id="ws-dec-add" class="primary" style="font-size:10px;padding:4px 10px">Pin</button>
-
-      </div>
-
-    </div>
-
-
-
-    <div>
-
-      <div style="font-size:10px;color:var(--text);margin-bottom:4px">Workspace notes</div>
-
-      <div id="ws-notes-list" style="font-size:10px;font-family:var(--font-mono);margin-bottom:6px"><div style="color:var(--muted)">loading…</div></div>
-
-      <div style="display:flex;gap:6px;flex-wrap:wrap">
-
-        <input id="ws-note-title" type="text" placeholder="Title" style="background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:4px 8px;flex:1;min-width:120px">
-
-        <input id="ws-note-body" type="text" placeholder="Body" style="background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:4px 8px;flex:2;min-width:160px">
-
-        <button id="ws-note-add" class="primary" style="font-size:10px;padding:4px 10px">Add</button>
-
-      </div>
-
-    </div>
-
-  </div>`;
+  // Workspace section — moved to ACCOUNT & WORKSPACE group below.
 
 
 
@@ -10176,7 +10128,64 @@ async function loadSettingsTab(projectId) {
 
 
   html += '</div></details>';  // close Project Config section
+  html += '</div></details>';  // close PROJECT SETTINGS group
+
+  // ── ACCOUNT & WORKSPACE group ────────────────────────────────────────────
+  {
+    let _awOpen = false;
+    try { _awOpen = localStorage.getItem('meridian.settings.aw.' + projectId) === '1'; } catch(e) {}
+    const _awRot = _awOpen ? 'transform:rotate(90deg)' : '';
+    html += `<details id="settings-grp-aw-${projectId}" ${_awOpen ? 'open' : ''} style="margin-bottom:12px;border:2px solid var(--border);border-radius:8px">` +
+      `<summary style="cursor:pointer;list-style:none;padding:10px 14px;display:flex;align-items:center;gap:8px;background:var(--surface-2);border-radius:8px">` +
+      `<span class="meridian-caret" style="display:inline-block;font-size:10px;color:var(--muted);transition:transform 120ms ease;${_awRot}">▶</span>` +
+      `<span style="font-weight:700;font-size:11px;color:var(--text);letter-spacing:.04em">ACCOUNT &amp; WORKSPACE</span>` +
+      `</summary><div style="padding:8px 8px 4px">`;
+  }
+
   html += _secHtml('account', 'Account');
+
+  html += `<div style="margin-bottom:16px" id="workspace-section-${projectId}">
+    <div style="color:var(--accent);font-size:10px;letter-spacing:.06em;text-transform:uppercase;margin-bottom:10px;padding-bottom:4px;border-bottom:1px solid var(--border)">Workspace</div>
+    <div style="font-size:10px;color:var(--muted);margin-bottom:10px">Applies across <strong>all projects</strong> in this workspace. Notes and decisions here are injected at the top of every project's context block.</div>
+    <div style="margin-bottom:12px">
+      <div style="font-size:10px;color:var(--text);margin-bottom:4px">Default settings</div>
+      <label style="display:flex;gap:8px;align-items:flex-start;font-size:11px;color:var(--text);cursor:pointer;margin-bottom:6px">
+        <input type="checkbox" id="ws-hitl-default" style="margin-top:2px">
+        <span>Auto-answer HITL by default<br>
+          <span style="font-size:9px;color:var(--muted)">Suggested default for new projects' HITL auto-answer toggle.</span>
+        </span>
+      </label>
+      <label style="font-size:10px;color:var(--muted);display:block">Default sprint name<br>
+        <input id="ws-sprint-default" type="text" placeholder="e.g. june-sprint" style="width:100%;max-width:240px;background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:3px 6px;margin-top:2px">
+      </label>
+      <label style="font-size:10px;color:var(--muted);display:block;margin-top:6px">Your display name<br>
+        <input id="ws-display-name" type="text" placeholder="e.g. Adam" style="width:100%;max-width:240px;background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:3px 6px;margin-top:2px">
+        <span style="display:block;font-size:9px;color:var(--muted);margin-top:2px">Used to attribute Claude/Codex hook sessions to you on the activity timeline when they don't set a name.</span>
+      </label>
+      <div style="margin-top:8px;display:flex;gap:8px;align-items:center">
+        <button id="ws-settings-save" class="primary" style="font-size:10px;padding:3px 10px">Save defaults</button>
+        <span id="ws-settings-status" style="font-size:10px;color:var(--muted);min-height:14px"></span>
+      </div>
+    </div>
+    <div style="margin-bottom:12px">
+      <div style="font-size:10px;color:var(--text);margin-bottom:4px">Workspace decisions</div>
+      <div id="ws-decisions-list" style="font-size:10px;font-family:var(--font-mono);margin-bottom:6px"><div style="color:var(--muted)">loading…</div></div>
+      <div style="display:flex;gap:6px;flex-wrap:wrap">
+        <input id="ws-dec-title" type="text" placeholder="Title" style="background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:4px 8px;flex:1;min-width:120px">
+        <input id="ws-dec-body" type="text" placeholder="Body" style="background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:4px 8px;flex:2;min-width:160px">
+        <button id="ws-dec-add" class="primary" style="font-size:10px;padding:4px 10px">Pin</button>
+      </div>
+    </div>
+    <div>
+      <div style="font-size:10px;color:var(--text);margin-bottom:4px">Workspace notes</div>
+      <div id="ws-notes-list" style="font-size:10px;font-family:var(--font-mono);margin-bottom:6px"><div style="color:var(--muted)">loading…</div></div>
+      <div style="display:flex;gap:6px;flex-wrap:wrap">
+        <input id="ws-note-title" type="text" placeholder="Title" style="background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:4px 8px;flex:1;min-width:120px">
+        <input id="ws-note-body" type="text" placeholder="Body" style="background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:4px 8px;flex:2;min-width:160px">
+        <button id="ws-note-add" class="primary" style="font-size:10px;padding:4px 10px">Add</button>
+      </div>
+    </div>
+  </div>`;
 
   // Team members section (hosted mode only, uses mcpData as hosted-mode proxy)
 
@@ -10795,9 +10804,7 @@ async function loadSettingsTab(projectId) {
   }
 
   html += '</div></details>';  // close Account section
-
-  // Close the Advanced collapsible opened for hosted users
-  if (isHostedMode()) html += '</div></details>';
+  html += '</div></details>';  // close ACCOUNT & WORKSPACE group
 
   try {
     body.innerHTML = html;
@@ -10824,6 +10831,24 @@ async function loadSettingsTab(projectId) {
         if (caret) caret.style.transform = det.open ? 'rotate(90deg)' : '';
       });
     });
+
+    // Outer group toggles (PROJECT SETTINGS / ACCOUNT & WORKSPACE)
+    const psGrp = document.getElementById('settings-grp-ps-' + projectId);
+    if (psGrp) {
+      psGrp.addEventListener('toggle', function() {
+        try { localStorage.setItem('meridian.settings.ps.' + projectId, psGrp.open ? '1' : '0'); } catch(e) {}
+        const c = psGrp.querySelector(':scope > summary .meridian-caret');
+        if (c) c.style.transform = psGrp.open ? 'rotate(90deg)' : '';
+      });
+    }
+    const awGrp = document.getElementById('settings-grp-aw-' + projectId);
+    if (awGrp) {
+      awGrp.addEventListener('toggle', function() {
+        try { localStorage.setItem('meridian.settings.aw.' + projectId, awGrp.open ? '1' : '0'); } catch(e) {}
+        const c = awGrp.querySelector(':scope > summary .meridian-caret');
+        if (c) c.style.transform = awGrp.open ? 'rotate(90deg)' : '';
+      });
+    }
   }, 0);
 
   // Easy-setup mini executor save (hosted only)
@@ -10850,17 +10875,6 @@ async function loadSettingsTab(projectId) {
     };
   }, 0);
 
-  // Advanced settings toggle — persist open/closed state per project (hosted only)
-  setTimeout(() => {
-    const advDet = document.getElementById(`adv-settings-${projectId}`);
-    if (!advDet) return;
-    const advKey = `meridian.settings.adv.${projectId}`;
-    advDet.addEventListener('toggle', () => {
-      try { localStorage.setItem(advKey, advDet.open ? '1' : '0'); } catch(e) {}
-      const caret = advDet.querySelector(':scope > summary .meridian-caret');
-      if (caret) caret.style.transform = advDet.open ? 'rotate(90deg)' : '';
-    });
-  }, 0);
 
 
 
@@ -11130,6 +11144,29 @@ async function loadSettingsTab(projectId) {
 
 
 
+    function _showKeyReveal(rawToken, label) {
+      const revealEl = document.getElementById(`hooks-key-reveal-${projectId}`);
+      const revealInput = document.getElementById(`hooks-key-reveal-input-${projectId}`);
+      const revealCopyBtn = document.getElementById(`hooks-key-copy-btn-${projectId}`);
+      const revealDismiss = document.getElementById(`hooks-key-dismiss-${projectId}`);
+      if (!revealEl || !revealInput) return;
+      revealInput.value = rawToken;
+      revealEl.style.display = '';
+      function _hideReveal() {
+        revealEl.style.display = 'none';
+        const masked = rawToken.slice(0, 18) + '...' + rawToken.slice(-4);
+        const statusEl = document.getElementById(`hooks-token-status-${projectId}`);
+        if (statusEl) statusEl.textContent = `${label || 'Key'} saved: ${masked} — use "Generate new key" to rotate.`;
+      }
+      if (revealCopyBtn) {
+        revealCopyBtn.onclick = async () => {
+          try { await navigator.clipboard.writeText(rawToken); revealCopyBtn.textContent = 'Copied!'; setTimeout(() => { revealCopyBtn.textContent = 'Copy key'; }, 1800); } catch(e) {}
+        };
+      }
+      if (revealDismiss) revealDismiss.onclick = _hideReveal;
+      setTimeout(_hideReveal, 30000);
+    }
+
     const genBtn = document.getElementById(`hooks-gen-token-${projectId}`);
 
     if (genBtn) {
@@ -11156,6 +11193,8 @@ async function loadSettingsTab(projectId) {
             const j = JSON.stringify({mcpServers:{meridian:{command:"npx",args:["-y","mcp-remote","https://usemeridian.us/mcp"],env:{BEARER_TOKEN:tok.token}}}},null,2);
             hostedMcpEl2.textContent = j;
           }
+
+          _showKeyReveal(tok.token, 'API key');
 
         } catch (e) {
 
@@ -11187,11 +11226,9 @@ async function loadSettingsTab(projectId) {
 
         try {
 
-          await api('/auth/tokens', { method: 'POST', body: JSON.stringify({ label: 'readonly', token_type: 'readonly' }) });
+          const tok = await api('/auth/tokens', { method: 'POST', body: JSON.stringify({ label: 'readonly', token_type: 'readonly' }) });
 
-          const statusEl = document.getElementById(`hooks-token-status-${projectId}`);
-
-          if (statusEl) statusEl.textContent = 'Read-only key generated — safe for ChatGPT connectors and CI read access.';
+          _showKeyReveal(tok.token, 'Read-only key');
 
           await loadHooksTokens();
 
