@@ -1,4 +1,4 @@
-"""Hosted-tier auth: Google OAuth, bearer tokens, rate-limiting.
+﻿"""Hosted-tier auth: Google OAuth, bearer tokens, rate-limiting.
 
 Env vars consumed:
   GOOGLE_CLIENT_ID       — OAuth app client ID
@@ -713,7 +713,7 @@ async def auth_github_callback(request: Request) -> RedirectResponse:
     # Delegate to repo-connect handler if this is a repo OAuth flow
     state = request.query_params.get("state", "")
     if state.startswith("repo:"):
-        return await auth_github_repo_callback(request)
+        return await auth_github_repo_callback(request, request.app.state.db)
 
     from . import db as db_module
 
