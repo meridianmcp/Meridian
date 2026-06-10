@@ -6563,6 +6563,18 @@ async def _dispatch_mcp_tool(
         if item is None:
             raise ValueError("sprint item not found")
         return item
+    if name == "add_subtask":
+        return await db_module.add_subtask(
+            db, args["project_id"], args["parent_id"], args["title"]
+        )
+    if name == "split_sprint_item":
+        return await db_module.split_sprint_item(
+            db, args["project_id"], args["item_id"], args["titles"]
+        )
+    if name == "merge_sprint_items":
+        return await db_module.merge_sprint_items(
+            db, args["project_id"], args["item_ids"], args["new_title"]
+        )
     if name == "complete_sprint_item":
         item = await db_module.complete_sprint_item(
             db, args["project_id"], args["item_id"],

@@ -534,6 +534,38 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
      "outputSchema": {"type": "object", "properties": {
          "id": {"type": "string"}, "status": {"type": "string"},
          "claimed_at": {"type": "string"}}}},
+    {"name": "add_subtask",
+     "description": "Add a child sprint item under an existing parent item. Inherits the parent's version. Status starts as pending. Rejects if the parent is already done, failed, or skipped.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"},
+         "parent_id": {"type": "string", "description": "ID of the parent sprint item."},
+         "title": {"type": "string", "description": "Title of the new subtask."}},
+         "required": ["project_id", "parent_id", "title"]},
+     "outputSchema": {"type": "object", "properties": {
+         "id": {"type": "string"}, "parent_id": {"type": "string"},
+         "title": {"type": "string"}, "status": {"type": "string"}}}},
+    {"name": "split_sprint_item",
+     "description": "Split a sprint item into multiple smaller items. The original is closed (skipped) and N new items are created with split_from referencing the original. Returns list of new items.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"},
+         "item_id": {"type": "string", "description": "ID of the item to split."},
+         "titles": {"type": "array", "items": {"type": "string"},
+                    "description": "Titles for the new items (minimum 2)."}},
+         "required": ["project_id", "item_id", "titles"]},
+     "outputSchema": {"type": "array", "items": {"type": "object", "properties": {
+         "id": {"type": "string"}, "title": {"type": "string"},
+         "split_from": {"type": "string"}, "status": {"type": "string"}}}}},
+    {"name": "merge_sprint_items",
+     "description": "Merge multiple sprint items into one. Source items are closed (skipped, merged_into=survivor). Returns the new survivor item.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"},
+         "item_ids": {"type": "array", "items": {"type": "string"},
+                      "description": "IDs of items to merge (minimum 2)."},
+         "new_title": {"type": "string", "description": "Title for the merged survivor item."}},
+         "required": ["project_id", "item_ids", "new_title"]},
+     "outputSchema": {"type": "object", "properties": {
+         "id": {"type": "string"}, "title": {"type": "string"},
+         "merged_from": {"type": "string"}, "status": {"type": "string"}}}},
 ]
 
 _READ_ONLY_TOOLS = {
