@@ -6019,7 +6019,7 @@ async def get_me(request: Request) -> dict[str, Any]:
 # v2.0 — Remote MCP endpoint (HTTP JSON-RPC 2.0 transport)
 # ---------------------------------------------------------------------------
 
-_MCP_PROTOCOL_VERSION = "2024-11-05"
+_MCP_PROTOCOL_VERSION = "2025-03-26"
 _MCP_SERVER_INFO = {"name": "meridian", "version": _VERSION}
 
 
