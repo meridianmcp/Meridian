@@ -1,4 +1,4 @@
-"""Core tests for Meridian — db layer, HTTP endpoints, and handoff."""
+﻿"""Core tests for Meridian — db layer, HTTP endpoints, and handoff."""
 
 from __future__ import annotations
 
@@ -7013,7 +7013,7 @@ def test_mcp_sse_post_returns_jsonrpc(client):
         "id": 1,
         "method": "initialize",
         "params": {
-            "protocolVersion": "2024-11-05",
+            "protocolVersion": "2025-03-26",
             "clientInfo": {"name": "test", "version": "1.0"},
             "capabilities": {},
         },
