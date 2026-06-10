@@ -3203,6 +3203,22 @@ async def put_project_file(
     return {"filename": filename, "size": len(body.content.encode("utf-8"))}
 
 
+@app.post("/projects/{project_id}/devlog")
+async def append_devlog_entry(
+    project_id: str, body: dict, request: Request
+) -> dict[str, object]:
+    """Append a user-written line to DEVLOG.md via the devlog anchor."""
+    project = await db_module.get_project(await _db(request), project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="project not found")
+    text = (body.get("text") or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="text is required")
+    line = f"- {_md_ts()} {text}"
+    await md_anchors_module.apply_append("DEVLOG.md", "devlog", line)
+    return {"ok": True}
+
+
 def _render_workspace_block(
     decisions: list[dict], notes: list[dict]
 ) -> str:
