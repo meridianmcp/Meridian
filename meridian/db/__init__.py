@@ -24,6 +24,8 @@ import aiosqlite
 
 _log = logging.getLogger(__name__)
 
+_UNSET = object()  # sentinel for "not passed" in optional keyword args
+
 # ---------------------------------------------------------------------------
 # Transparent field encryption (Fernet, MERIDIAN_ENCRYPTION_KEY env var).
 # enc:<base64> prefix allows zero-downtime migration — plaintext values are
@@ -352,6 +354,15 @@ CREATE TABLE IF NOT EXISTS oauth_tokens (
     tenant_id TEXT REFERENCES tenants(id),
     client_id TEXT,
     exp BIGINT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS oauth_codes (
+    code TEXT PRIMARY KEY,
+    tenant_id TEXT,
+    redirect_uri TEXT NOT NULL,
+    code_challenge TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -1598,6 +1609,8 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_sprint_items_indeterminate(db)
     await _migrate_sprint_item_tree(db)
     await _migrate_api_token_type(db)
+    await _migrate_oauth_codes_table(db)
+    await _migrate_github_to_projects(db)
     return db
 
 
@@ -1614,6 +1627,63 @@ async def _migrate_api_token_type(db: aiosqlite.Connection) -> None:
     await _migrate_add_column_if_missing(
         db, "api_tokens", "token_type", "TEXT NOT NULL DEFAULT 'readwrite'"
     )
+
+
+async def _migrate_github_to_projects(db: aiosqlite.Connection) -> None:
+    """Move github_repo + github_branch from tenants to projects.
+
+    Adds the two columns to projects (idempotent). For SQLite installs where
+    tenants and projects share one DB, copies any non-NULL tenant values to
+    projects that were created by that tenant (matched via creator_human_id =
+    tenant email). Hosted Neon DBs have projects only (no tenants table), so
+    the copy step is skipped there — users re-connect their repo per project.
+    """
+    await _migrate_add_column_if_missing(db, "projects", "github_repo", "TEXT")
+    await _migrate_add_column_if_missing(db, "projects", "github_branch", "TEXT")
+    # Best-effort copy for SQLite installs (tenants table may not exist on Neon)
+    try:
+        async with db.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='tenants'"
+        ) as cur:
+            row = await cur.fetchone()
+        if row is not None:
+            await db.execute(
+                """UPDATE projects
+                   SET github_repo = (
+                         SELECT github_repo FROM tenants
+                         WHERE email = projects.creator_human_id
+                           AND github_repo IS NOT NULL
+                       ),
+                       github_branch = (
+                         SELECT github_branch FROM tenants
+                         WHERE email = projects.creator_human_id
+                           AND github_branch IS NOT NULL
+                       )
+                   WHERE github_repo IS NULL
+                     AND EXISTS (
+                           SELECT 1 FROM tenants
+                           WHERE email = projects.creator_human_id
+                             AND github_repo IS NOT NULL
+                         )"""
+            )
+            await db.commit()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+async def _migrate_oauth_codes_table(db: aiosqlite.Connection) -> None:
+    """vG9.40 — create oauth_codes table for PKCE authorization code persistence."""
+    await db.execute(
+        """CREATE TABLE IF NOT EXISTS oauth_codes (
+            code TEXT PRIMARY KEY,
+            tenant_id TEXT,
+            redirect_uri TEXT NOT NULL,
+            code_challenge TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )"""
+    )
+    await db.commit()
 
 
 async def _migrate_sprint_items_indeterminate(db: aiosqlite.Connection) -> None:
@@ -1905,6 +1975,8 @@ async def update_project_settings(
     max_pinned_decisions: int | None = None,
     executor_config: dict[str, Any] | None = None,
     hitl_auto_answer: bool | None = None,
+    github_repo: str | None = _UNSET,
+    github_branch: str | None = _UNSET,
 ) -> dict[str, Any] | None:
     """Persist project settings and return the updated values."""
     project = await get_project(db, project_id)
@@ -1921,6 +1993,12 @@ async def update_project_settings(
     if hitl_auto_answer is not None:
         updates.append("hitl_auto_answer = ?")
         params.append(1 if hitl_auto_answer else 0)
+    if github_repo is not _UNSET:
+        updates.append("github_repo = ?")
+        params.append(github_repo or None)
+    if github_branch is not _UNSET:
+        updates.append("github_branch = ?")
+        params.append(github_branch or None)
     if updates:
         params.append(project_id)
         await db.execute(
@@ -4979,7 +5057,7 @@ async def update_tenant(
         "compute_cu_hours_used", "storage_gb_used",
         "overage_reset_at", "compute_throttled_at",
         "trial_started_at", "inactivity_expires_at",
-        "github_pat", "github_repo", "github_branch",
+        "github_pat",
     }
     updates = {k: v for k, v in fields.items() if k in allowed}
     if not updates:

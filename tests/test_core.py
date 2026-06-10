@@ -6425,6 +6425,42 @@ def test_hooks_session_start_missing_project_id(client):
     assert r.status_code == 400
 
 
+def test_hooks_session_start_cwd_mismatch_warning(client):
+    """When cwd doesn't match executor_config.repo_path, a warning is prepended."""
+    project = client.post("/projects", json={"name": "cwd-mismatch-proj"}).json()
+    pid = project["id"]
+
+    # Set executor_config with a specific repo_path
+    r_patch = client.patch(
+        f"/projects/{pid}/settings",
+        json={"executor_config": {"repo_path": "/home/user/myproject"}},
+    )
+    assert r_patch.status_code == 200
+
+    # Fire hook from a different directory
+    r = client.post("/hooks/session-start", json={"project_id": pid, "cwd": "/tmp/other"})
+    assert r.status_code == 200
+    ctx = r.json()["hookSpecificOutput"]["additionalContext"]
+    assert "WARNING" in ctx
+    assert "/tmp/other" in ctx
+    assert "/home/user/myproject" in ctx
+
+
+def test_hooks_session_start_cwd_match_no_warning(client):
+    """When cwd matches executor_config.repo_path, no warning is added."""
+    project = client.post("/projects", json={"name": "cwd-match-proj"}).json()
+    pid = project["id"]
+    client.patch(
+        f"/projects/{pid}/settings",
+        json={"executor_config": {"repo_path": "/home/user/myproject"}},
+    )
+
+    r = client.post("/hooks/session-start", json={"project_id": pid, "cwd": "/home/user/myproject"})
+    assert r.status_code == 200
+    ctx = r.json()["hookSpecificOutput"]["additionalContext"]
+    assert "WARNING" not in ctx
+
+
 def test_hooks_installer_scripts_are_served(client):
     """GET /hooks.ps1 and /hooks.sh should serve the repo installer scripts."""
     ps1 = client.get("/hooks.ps1")
@@ -7596,3 +7632,207 @@ async def test_rollup_parent_active_child_leaves_parent_unchanged(db):
     await db_module.complete_sprint_item(db, p["id"], child1["id"])
     updated_parent = await db_module.get_sprint_item(db, parent["id"])
     assert updated_parent["status"] == "pending"
+
+
+# ---------------------------------------------------------------------------
+# PKCE OAuth 2.0 flow tests (sprint item 6473e7ef)
+# ---------------------------------------------------------------------------
+
+def _pkce_pair(length: int = 64):
+    """Return (code_verifier, code_challenge) for a PKCE S256 exchange."""
+    import base64
+    import hashlib
+    import secrets
+    verifier = secrets.token_urlsafe(length)[:length]
+    # Pad to minimum length if needed
+    if len(verifier) < 43:
+        verifier = verifier + "A" * (43 - len(verifier))
+    digest = hashlib.sha256(verifier.encode()).digest()
+    challenge = base64.urlsafe_b64encode(digest).decode().rstrip("=")
+    return verifier, challenge
+
+
+def test_pkce_oauth_full_flow(client):
+    """Full PKCE authorize→token exchange returns sk_meridian_ access token."""
+    import urllib.parse
+    verifier, challenge = _pkce_pair()
+    redirect_uri = "http://localhost:12345/callback"
+
+    r = client.get(
+        "/oauth/authorize",
+        params={
+            "response_type": "code",
+            "client_id": "meridian",
+            "redirect_uri": redirect_uri,
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+            "state": "test-state",
+        },
+        follow_redirects=False,
+    )
+    assert r.status_code in (302, 307), f"Expected redirect, got {r.status_code}"
+    location = r.headers["location"]
+    parsed = urllib.parse.urlparse(location)
+    params = dict(urllib.parse.parse_qsl(parsed.query))
+    assert "code" in params, f"No code in redirect: {location}"
+    assert params.get("state") == "test-state"
+    code = params["code"]
+
+    token_r = client.post(
+        "/oauth/token",
+        data={
+            "grant_type": "authorization_code",
+            "code": code,
+            "redirect_uri": redirect_uri,
+            "code_verifier": verifier,
+            "client_id": "meridian",
+        },
+    )
+    assert token_r.status_code == 200, token_r.text
+    body = token_r.json()
+    assert body["token_type"] == "bearer"
+    assert body["access_token"].startswith("sk_meridian_"), (
+        f"Expected sk_meridian_ prefix, got: {body['access_token'][:20]}"
+    )
+
+
+def test_pkce_challenge_mismatch_rejected(client):
+    """Token exchange with wrong code_verifier returns invalid_grant."""
+    import urllib.parse
+    _, challenge = _pkce_pair()
+    redirect_uri = "http://localhost:12345/callback"
+
+    r = client.get(
+        "/oauth/authorize",
+        params={
+            "response_type": "code",
+            "client_id": "meridian",
+            "redirect_uri": redirect_uri,
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+        },
+        follow_redirects=False,
+    )
+    code = dict(urllib.parse.parse_qsl(urllib.parse.urlparse(r.headers["location"]).query))["code"]
+
+    bad_verifier = "A" * 64  # wrong verifier, won't match the challenge
+    token_r = client.post(
+        "/oauth/token",
+        data={
+            "grant_type": "authorization_code",
+            "code": code,
+            "redirect_uri": redirect_uri,
+            "code_verifier": bad_verifier,
+            "client_id": "meridian",
+        },
+    )
+    assert token_r.status_code == 400
+    assert token_r.json()["error"] == "invalid_grant"
+
+
+def test_pkce_expired_code_rejected(client):
+    """Token exchange after code expiry returns invalid_grant."""
+    import urllib.parse
+    import time
+    import asyncio
+    verifier, challenge = _pkce_pair()
+    redirect_uri = "http://localhost:12345/callback"
+
+    r = client.get(
+        "/oauth/authorize",
+        params={
+            "response_type": "code",
+            "client_id": "meridian",
+            "redirect_uri": redirect_uri,
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+        },
+        follow_redirects=False,
+    )
+    code = dict(urllib.parse.parse_qsl(urllib.parse.urlparse(r.headers["location"]).query))["code"]
+
+    # Expire the in-memory code entry
+    from meridian import server as srv
+    if code in srv._oa_codes:
+        srv._oa_codes[code]["exp"] = time.time() - 1
+
+    # Also expire the DB entry by setting expires_at in the past
+    async def _expire_db():
+        db = client.app.state.db
+        await db.execute(
+            "UPDATE oauth_codes SET expires_at = '2000-01-01 00:00:00' WHERE code = ?",
+            (code,),
+        )
+        await db.commit()
+    loop = asyncio.new_event_loop()
+    try:
+        loop.run_until_complete(_expire_db())
+    finally:
+        loop.close()
+
+    token_r = client.post(
+        "/oauth/token",
+        data={
+            "grant_type": "authorization_code",
+            "code": code,
+            "redirect_uri": redirect_uri,
+            "code_verifier": verifier,
+            "client_id": "meridian",
+        },
+    )
+    assert token_r.status_code == 400
+    assert token_r.json()["error"] == "invalid_grant"
+
+
+def test_pkce_short_verifier_rejected(client):
+    """Token exchange with code_verifier shorter than 43 chars returns invalid_request."""
+    import urllib.parse
+    _, challenge = _pkce_pair()
+    redirect_uri = "http://localhost:12345/callback"
+
+    r = client.get(
+        "/oauth/authorize",
+        params={
+            "response_type": "code",
+            "client_id": "meridian",
+            "redirect_uri": redirect_uri,
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+        },
+        follow_redirects=False,
+    )
+    code = dict(urllib.parse.parse_qsl(urllib.parse.urlparse(r.headers["location"]).query))["code"]
+
+    token_r = client.post(
+        "/oauth/token",
+        data={
+            "grant_type": "authorization_code",
+            "code": code,
+            "redirect_uri": redirect_uri,
+            "code_verifier": "tooshort",
+            "client_id": "meridian",
+        },
+    )
+    assert token_r.status_code == 400
+    assert token_r.json()["error"] == "invalid_request"
+
+
+def test_pkce_plain_method_rejected(client):
+    """Token exchange with code_challenge_method=plain returns invalid_request."""
+    token_r = client.post(
+        "/oauth/token",
+        data={
+            "grant_type": "authorization_code",
+            "code": "somecode",
+            "code_challenge_method": "plain",
+            "client_id": "meridian",
+        },
+    )
+    assert token_r.status_code == 400
+    assert token_r.json()["error"] == "invalid_request"
+
+
+def test_oauth_codes_table_in_create_tables():
+    """CREATE_TABLES must define oauth_codes table for PKCE persistence."""
+    from meridian.db import CREATE_TABLES
+    assert "oauth_codes" in CREATE_TABLES, "CREATE_TABLES missing 'oauth_codes'"
