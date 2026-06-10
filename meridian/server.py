@@ -40,6 +40,7 @@ from ._deps import (
     _data_dir,
     _is_demo_request,
     _get_tenant_from_request,
+    validate_input_size,
 )
 
 
@@ -903,6 +904,83 @@ async def _limit_exceeded_handler(request: Request, exc: _limits_module.LimitExc
 
 
 # ---------------------------------------------------------------------------
+# X-Request-ID middleware + global exception handler
+# ---------------------------------------------------------------------------
+
+import uuid as _uuid
+import logging as _logging
+
+_req_id_logger = _logging.getLogger("meridian.server")
+
+
+@app.middleware("http")
+async def _request_id_middleware(request: Request, call_next):
+    """Attach a uuid4 X-Request-ID to every response and request state."""
+    req_id = str(_uuid.uuid4())
+    request.state.request_id = req_id
+    response = await call_next(request)
+    response.headers["X-Request-ID"] = req_id
+    return response
+
+
+@app.exception_handler(Exception)
+async def _global_exception_handler(request: Request, exc: Exception):
+    req_id = getattr(request.state, "request_id", "unknown")
+    _req_id_logger.exception(
+        "unhandled exception on %s %s (request_id=%s)",
+        request.method,
+        request.url.path,
+        req_id,
+        exc_info=exc,
+    )
+    return JSONResponse(
+        status_code=500,
+        content={"error": "internal server error", "request_id": req_id},
+    )
+
+
+# ---------------------------------------------------------------------------
+# Custom 404 / 500 error pages
+# ---------------------------------------------------------------------------
+
+_ERROR_PAGE_STYLE = (
+    "body{background:#0b0c0e;color:#fff;font-family:'IBM Plex Mono',ui-monospace,"
+    "'Cascadia Code','Fira Mono',monospace;min-height:100vh;display:flex;"
+    "align-items:center;justify-content:center;margin:0}"
+    ".card{text-align:center}"
+    "h1{font-size:3rem;margin:0 0 0.5rem}"
+    "p{color:#aaa;margin:0 0 1.5rem}"
+    "a{color:#6c8fff;text-decoration:none}"
+    "a:hover{text-decoration:underline}"
+)
+
+
+def _error_page(code: int, message: str) -> HTMLResponse:
+    html = (
+        "<!doctype html><html lang='en'><head>"
+        "<meta charset='utf-8'>"
+        f"<title>{code}</title>"
+        f"<style>{_ERROR_PAGE_STYLE}</style>"
+        "</head><body><div class='card'>"
+        f"<h1>{code}</h1>"
+        f"<p>{message}</p>"
+        "<a href='/'>&#8592; back to home</a>"
+        "</div></body></html>"
+    )
+    return HTMLResponse(content=html, status_code=code)
+
+
+@app.exception_handler(404)
+async def _404_handler(request: Request, exc: Exception) -> HTMLResponse:  # noqa: ARG001
+    return _error_page(404, "not found")
+
+
+@app.exception_handler(500)
+async def _500_handler(request: Request, exc: Exception) -> HTMLResponse:  # noqa: ARG001
+    return _error_page(500, "something went wrong")
+
+
+# ---------------------------------------------------------------------------
 # v2.0-fixes — Demo read-only middleware (MERIDIAN_DEMO=true)
 # ---------------------------------------------------------------------------
 
@@ -1121,6 +1199,29 @@ async def landing_page(request: Request) -> HTMLResponse:
     )
     resp.headers["Cache-Control"] = "no-cache, no-store"
     return resp
+
+
+@app.get("/robots.txt", response_class=PlainTextResponse)
+async def robots_txt() -> str:
+    return "User-agent: *\nAllow: /\nSitemap: https://usemeridian.us/sitemap.xml"
+
+
+@app.get("/sitemap.xml")
+async def sitemap_xml() -> Response:
+    today = "2026-06-09"
+    urls = ["/", "/demo", "/pricing", "/install-mcp"]
+    items = "\n".join(
+        f"  <url><loc>https://usemeridian.us{u}</loc>"
+        f"<lastmod>{today}</lastmod><changefreq>weekly</changefreq></url>"
+        for u in urls
+    )
+    xml = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n'
+        f"{items}\n"
+        "</urlset>"
+    )
+    return Response(content=xml, media_type="application/xml")
 
 
 @app.post("/demo-auth")
@@ -2300,6 +2401,12 @@ async def set_goal(
                 ),
             },
         )
+    _goal_str = body.content if isinstance(body.content, str) else json.dumps(body.content)
+    validate_input_size(_goal_str, "goal", 10_000)
+    if body.north_star is not None:
+        validate_input_size(body.north_star, "north_star", 10_000)
+    if body.sprint is not None:
+        validate_input_size(body.sprint, "version_goal", 10_000)
     result = await db_module.set_goal(
         await _db(request), project_id, body.content,
         north_star=body.north_star, sprint=body.sprint,
@@ -2321,6 +2428,7 @@ async def set_north_star(
     project = await db_module.get_project(await _db(request), project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="project not found")
+    validate_input_size(body.north_star, "north_star", 10_000)
     # Ownership check skipped in hosted mode — session cookie already proves
     # the caller owns this project. human_id check only applies to local no-auth.
     try:
@@ -2345,6 +2453,7 @@ async def set_sprint(
     project = await db_module.get_project(await _db(request), project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="project not found")
+    validate_input_size(body.sprint, "version_goal", 10_000)
     try:
         result = await db_module.set_sprint(
             await _db(request), project_id, body.sprint
@@ -5058,6 +5167,7 @@ async def start_session_endpoint(
     project = await db_module.get_project(await _db(request), project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="project not found")
+    validate_input_size(body.session_name, "session name", 200)
     return await _start_session_composite(
         await _db(request),
         project_id,
@@ -5214,6 +5324,13 @@ async def hooks_session_start(body: dict[str, Any], request: Request) -> dict[st
         for t in recent[:5]:
             lines.append(f"- [{t.get('status','?').upper()}] {str(t.get('description',''))[:120]}")
     lines.append(f"\nSESSION ID: {result.get('session_id', '')}")
+    if sprint_items:
+        top_item_id = sprint_items[0].get("id", "")
+        lines.append(
+            f"\nINSTRUCTION: Your first MCP call must be claim_sprint_item on the top "
+            f"pending sprint item before starting any work. "
+            f"Top item id: {top_item_id}"
+        )
     additional_context = "\n".join(lines)
     return {"hookSpecificOutput": {"additionalContext": additional_context}}
 
@@ -6443,6 +6560,23 @@ async def _dispatch_mcp_tool(
             db, args["project_id"],
             status=args.get("status"),
         )
+    if name == "claim_sprint_item":
+        item = await db_module.claim_sprint_item(db, args["project_id"], args["item_id"])
+        if item is None:
+            raise ValueError("sprint item not found")
+        return item
+    if name == "add_subtask":
+        return await db_module.add_subtask(
+            db, args["project_id"], args["parent_id"], args["title"]
+        )
+    if name == "split_sprint_item":
+        return await db_module.split_sprint_item(
+            db, args["project_id"], args["item_id"], args["titles"]
+        )
+    if name == "merge_sprint_items":
+        return await db_module.merge_sprint_items(
+            db, args["project_id"], args["item_ids"], args["new_title"]
+        )
     if name == "complete_sprint_item":
         item = await db_module.complete_sprint_item(
             db, args["project_id"], args["item_id"],
@@ -6988,12 +7122,37 @@ async def submit_feedback(request: Request) -> dict[str, str]:
     return {"id": feedback_id}
 
 
+# ---------------------------------------------------------------------------
+# Per-token rate limiting for /mcp POST
+# ---------------------------------------------------------------------------
+
+import time as _mcp_time
+
+# {token_hash: (count, window_start_epoch_seconds)}
+_mcp_rate_counters: dict[str, tuple[int, float]] = {}
+_MCP_RATE_WINDOW = 60  # seconds
+
+
+def _mcp_rate_check(token_hash: str, limit: int) -> bool:
+    """Return True (= rate limited) if the token has exceeded limit calls/min."""
+    now = _mcp_time.monotonic()
+    count, window_start = _mcp_rate_counters.get(token_hash, (0, now))
+    if now - window_start >= _MCP_RATE_WINDOW:
+        # New window
+        _mcp_rate_counters[token_hash] = (1, now)
+        return False
+    if count >= limit:
+        return True
+    _mcp_rate_counters[token_hash] = (count + 1, window_start)
+    return False
+
+
 @app.post("/mcp")
 async def remote_mcp(request: Request) -> Any:
     """Remote MCP endpoint — JSON-RPC 2.0 over HTTP.
 
     Accepts OAuth bearer tokens and Meridian API keys over the same endpoint.
-    Rate-limited to 100 requests/minute per IP.
+    Rate-limited: 600 req/min per authenticated token, 60 req/min for free tier.
     Accepts a single JSON-RPC 2.0 message or a batch (list).
     """
     from fastapi.responses import JSONResponse
@@ -7061,6 +7220,16 @@ async def remote_mcp(request: Request) -> Any:
                     f' resource_metadata="{_base}/.well-known/oauth-authorization-server"'
                 ),
             },
+        )
+
+    # Per-token rate limiting: 60/min for free tier, 600/min for others.
+    _plan = (tenant.get("plan") or "free").lower()
+    _rate_limit = 60 if _plan == "free" else 600
+    if _mcp_rate_check(_bearer_hash, _rate_limit):
+        return JSONResponse(
+            {"detail": f"rate limit exceeded ({_rate_limit} req/min)"},
+            status_code=429,
+            headers={"Retry-After": "60"},
         )
 
     try:

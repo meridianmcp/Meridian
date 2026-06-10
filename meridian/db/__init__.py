@@ -214,17 +214,22 @@ CREATE TABLE IF NOT EXISTS sprint_items (
     version TEXT NOT NULL,
     title TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'pending'
-        CHECK (status IN ('pending','todo','in_progress','done','failed','skipped','pushed')),
+        CHECK (status IN ('pending','todo','in_progress','done','failed','skipped','pushed','indeterminate')),
     item_group TEXT,
     pushed_to TEXT,
     human_id TEXT,
     added_at TEXT NOT NULL DEFAULT (datetime('now')),
     completed_at TEXT,
+    claimed_at TEXT,
     task_id TEXT,
     notes TEXT,
     feedback_thumb SMALLINT,
     feedback_note TEXT,
-    milestone_type TEXT NOT NULL DEFAULT 'task'
+    milestone_type TEXT NOT NULL DEFAULT 'task',
+    parent_id TEXT DEFAULT NULL REFERENCES sprint_items(id),
+    split_from TEXT DEFAULT NULL,
+    merged_into TEXT DEFAULT NULL,
+    merged_from TEXT DEFAULT NULL
 );
 
 -- v2.4 — decisions_pinned: editable constitution alongside the append-only
@@ -1589,7 +1594,76 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_project_icon(db)
     await _migrate_tenants_is_internal(db)
     await _migrate_workspace_members_rbac(db)
+    await _migrate_sprint_items_indeterminate(db)
+    await _migrate_sprint_item_tree(db)
     return db
+
+
+async def _migrate_sprint_item_tree(db: aiosqlite.Connection) -> None:
+    """Add parent_id, split_from, merged_into, merged_from to sprint_items."""
+    await _migrate_add_column_if_missing(db, "sprint_items", "parent_id", "TEXT DEFAULT NULL")
+    await _migrate_add_column_if_missing(db, "sprint_items", "split_from", "TEXT DEFAULT NULL")
+    await _migrate_add_column_if_missing(db, "sprint_items", "merged_into", "TEXT DEFAULT NULL")
+    await _migrate_add_column_if_missing(db, "sprint_items", "merged_from", "TEXT DEFAULT NULL")
+
+
+async def _migrate_sprint_items_indeterminate(db: aiosqlite.Connection) -> None:
+    """Add 'indeterminate' status + claimed_at column to sprint_items.
+
+    Widens the CHECK constraint (requires table rebuild in SQLite) and adds
+    the claimed_at column. Idempotent: no-op when already migrated.
+    """
+    async with db.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='sprint_items'"
+    ) as cur:
+        row = await cur.fetchone()
+    if row is None:
+        return  # fresh DB — CREATE_TABLES already has the new schema
+    sql = (row["sql"] if isinstance(row, dict) else row[0]) or ""
+    # Already migrated when both new values are present in the schema.
+    if "'indeterminate'" in sql and "claimed_at" in sql:
+        return
+    # Ensure claimed_at exists before the rebuild references it.
+    await _migrate_add_column_if_missing(db, "sprint_items", "claimed_at", "TEXT")
+    # Rebuild with the new CHECK constraint.
+    await db.executescript(
+        """
+        CREATE TABLE sprint_items_new (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL REFERENCES projects(id),
+            version TEXT NOT NULL,
+            title TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending'
+                CHECK (status IN
+                    ('pending','todo','in_progress','done','failed','skipped','pushed','indeterminate')),
+            item_group TEXT,
+            pushed_to TEXT,
+            human_id TEXT,
+            added_at TEXT NOT NULL DEFAULT (datetime('now')),
+            completed_at TEXT,
+            claimed_at TEXT,
+            task_id TEXT,
+            notes TEXT,
+            feedback_thumb SMALLINT,
+            feedback_note TEXT,
+            milestone_type TEXT NOT NULL DEFAULT 'task'
+        );
+        INSERT INTO sprint_items_new
+            SELECT id, project_id, version, title, status,
+                   item_group, pushed_to, human_id,
+                   added_at, completed_at, claimed_at,
+                   task_id, notes, feedback_thumb, feedback_note,
+                   COALESCE(milestone_type, 'task')
+            FROM sprint_items;
+        DROP TABLE sprint_items;
+        ALTER TABLE sprint_items_new RENAME TO sprint_items;
+        CREATE INDEX IF NOT EXISTS idx_sprint_items_project
+            ON sprint_items(project_id, status);
+        CREATE INDEX IF NOT EXISTS idx_sprint_items_version
+            ON sprint_items(project_id, version);
+        """
+    )
+    await db.commit()
 
 
 async def _migrate_workspace_members_rbac(db: aiosqlite.Connection) -> None:
@@ -3355,7 +3429,7 @@ async def expire_inactive_sessions(
 
 
 _VALID_SPRINT_STATUSES = {
-    "pending", "todo", "in_progress", "done", "failed", "skipped", "pushed"
+    "pending", "todo", "in_progress", "done", "failed", "skipped", "pushed", "indeterminate"
 }
 
 
@@ -3459,6 +3533,34 @@ async def _update_sprint_item_status(
     return result
 
 
+async def _maybe_rollup_parent(db: aiosqlite.Connection, project_id: str, item_id: str) -> None:
+    """After a child status change, roll up sibling statuses to parent if applicable."""
+    item = await get_sprint_item(db, item_id)
+    if item is None:
+        return
+    parent_id = item.get("parent_id")
+    if not parent_id:
+        return
+    async with db.execute(
+        "SELECT status FROM sprint_items WHERE parent_id = ? AND project_id = ?",
+        (parent_id, project_id),
+    ) as cur:
+        rows = await cur.fetchall()
+    statuses = [r[0] or "pending" for r in rows]
+    if not statuses:
+        return
+    _active = {"pending", "in_progress", "todo", "indeterminate"}
+    has_active = any(s in _active for s in statuses)
+    if has_active:
+        return
+    has_failed = any(s == "failed" for s in statuses)
+    all_terminal_ok = all(s in {"done", "skipped"} for s in statuses)
+    if all_terminal_ok:
+        await _update_sprint_item_status(db, project_id, parent_id, "done")
+    elif has_failed:
+        await _update_sprint_item_status(db, project_id, parent_id, "indeterminate")
+
+
 async def complete_sprint_item(
     db: aiosqlite.Connection,
     project_id: str,
@@ -3466,9 +3568,12 @@ async def complete_sprint_item(
     task_id: str | None = None,
 ) -> dict[str, Any] | None:
     """Mark a sprint item ``done`` and optionally link the task that shipped it."""
-    return await _update_sprint_item_status(
+    result = await _update_sprint_item_status(
         db, project_id, item_id, "done", task_id=task_id
     )
+    if result is not None:
+        await _maybe_rollup_parent(db, project_id, item_id)
+    return result
 
 
 async def skip_sprint_item(
@@ -3478,9 +3583,12 @@ async def skip_sprint_item(
     reason: str | None = None,
 ) -> dict[str, Any] | None:
     """Mark a sprint item ``skipped`` (intentionally not shipped)."""
-    return await _update_sprint_item_status(
+    result = await _update_sprint_item_status(
         db, project_id, item_id, "skipped", notes=reason
     )
+    if result is not None:
+        await _maybe_rollup_parent(db, project_id, item_id)
+    return result
 
 
 async def start_sprint_item(
@@ -3494,6 +3602,39 @@ async def start_sprint_item(
     )
 
 
+async def claim_sprint_item(
+    db: aiosqlite.Connection,
+    project_id: str,
+    item_id: str,
+) -> dict[str, Any] | None:
+    """Claim a sprint item: set status='in_progress' and claimed_at=now().
+
+    Rejects (raises ValueError) if already in_progress, done, failed, or skipped.
+    Returns None if the item doesn't exist.
+    """
+    item = await get_sprint_item(db, item_id)
+    if item is None:
+        return None
+    if item.get("project_id") != project_id:
+        return None
+    blocked = {"in_progress", "done", "failed", "skipped"}
+    if (item.get("status") or "pending") in blocked:
+        raise ValueError(
+            f"cannot claim item with status '{item.get('status')}'"
+        )
+    cursor = await db.execute(
+        "UPDATE sprint_items SET status = 'in_progress', claimed_at = datetime('now') "
+        "WHERE id = ? AND project_id = ?",
+        (item_id, project_id),
+    )
+    await db.commit()
+    if cursor.rowcount == 0:
+        return None
+    updated = await get_sprint_item(db, item_id)
+    _publish_project_event(project_id, "sprint_item_updated", {"item_id": item_id, "status": "in_progress"})
+    return updated
+
+
 async def fail_sprint_item(
     db: aiosqlite.Connection,
     project_id: str,
@@ -3501,9 +3642,12 @@ async def fail_sprint_item(
     reason: str | None = None,
 ) -> dict[str, Any] | None:
     """Mark a sprint item ``failed``. ``reason`` stored in ``notes``."""
-    return await _update_sprint_item_status(
+    result = await _update_sprint_item_status(
         db, project_id, item_id, "failed", notes=reason
     )
+    if result is not None:
+        await _maybe_rollup_parent(db, project_id, item_id)
+    return result
 
 
 async def push_sprint_item(
@@ -3530,10 +3674,11 @@ async def patch_sprint_item(
     item_id: str,
     title: str | None = None,
     version: str | None = None,
+    status: str | None = None,
     feedback_thumb: int | None = None,
     feedback_note: str | None = None,
 ) -> dict[str, Any] | None:
-    """Update editable fields (title, version, feedback) of a sprint item."""
+    """Update editable fields (title, version, status, feedback) of a sprint item."""
     fields: list[str] = []
     values: list[Any] = []
     if title is not None:
@@ -3542,6 +3687,11 @@ async def patch_sprint_item(
     if version is not None:
         fields.append("version = ?")
         values.append(version)
+    if status is not None:
+        if status not in _VALID_SPRINT_STATUSES:
+            raise ValueError(f"invalid sprint-item status: {status!r}")
+        fields.append("status = ?")
+        values.append(status)
     if feedback_thumb is not None:
         fields.append("feedback_thumb = ?")
         values.append(int(feedback_thumb))
@@ -3559,6 +3709,128 @@ async def patch_sprint_item(
     if cursor.rowcount == 0:
         return None
     return await get_sprint_item(db, item_id)
+
+
+async def add_subtask(
+    db: aiosqlite.Connection,
+    project_id: str,
+    parent_id: str,
+    title: str,
+) -> dict[str, Any]:
+    """Create a child sprint item under parent_id.
+
+    Inherits version from parent. Rejects if parent doesn't exist or is
+    done/failed/skipped.
+    """
+    parent = await get_sprint_item(db, parent_id)
+    if parent is None or parent.get("project_id") != project_id:
+        raise ValueError(f"parent sprint item not found: {parent_id}")
+    blocked = {"done", "failed", "skipped"}
+    if (parent.get("status") or "pending") in blocked:
+        raise ValueError(
+            f"cannot add subtask to parent with status '{parent.get('status')}'"
+        )
+    iid = _new_id()
+    await db.execute(
+        "INSERT INTO sprint_items "
+        "(id, project_id, version, title, parent_id, milestone_type) "
+        "VALUES (?, ?, ?, ?, ?, 'task')",
+        (iid, project_id, parent.get("version", ""), title, parent_id),
+    )
+    await db.commit()
+    item = await get_sprint_item(db, iid)
+    assert item is not None
+    return item
+
+
+async def split_sprint_item(
+    db: aiosqlite.Connection,
+    project_id: str,
+    item_id: str,
+    titles: list[str],
+) -> list[dict[str, Any]]:
+    """Split a sprint item into N new items at the same level.
+
+    Closes the original (status=skipped). New items inherit parent_id and
+    version from the original, with split_from=item_id.
+    """
+    original = await get_sprint_item(db, item_id)
+    if original is None or original.get("project_id") != project_id:
+        raise ValueError(f"sprint item not found: {item_id}")
+    allowed = {"pending", "in_progress"}
+    if (original.get("status") or "pending") not in allowed:
+        raise ValueError(
+            f"can only split pending or in_progress items, got '{original.get('status')}'"
+        )
+    if not titles:
+        raise ValueError("titles must not be empty")
+    # Close the original
+    await _update_sprint_item_status(db, project_id, item_id, "skipped")
+    # Create new items
+    new_items = []
+    for t in titles:
+        nid = _new_id()
+        await db.execute(
+            "INSERT INTO sprint_items "
+            "(id, project_id, version, title, parent_id, split_from, milestone_type) "
+            "VALUES (?, ?, ?, ?, ?, ?, 'task')",
+            (nid, project_id, original.get("version", ""), t,
+             original.get("parent_id"), item_id),
+        )
+        await db.commit()
+        new_item = await get_sprint_item(db, nid)
+        if new_item:
+            new_items.append(new_item)
+    return new_items
+
+
+async def merge_sprint_items(
+    db: aiosqlite.Connection,
+    project_id: str,
+    item_ids: list[str],
+    new_title: str,
+) -> dict[str, Any]:
+    """Merge N sprint items into one survivor.
+
+    Closes all sources (status=skipped, merged_into=survivor_id).
+    Creates survivor with merged_from=JSON(item_ids), version from first source.
+    All sources must be pending or in_progress.
+    """
+    if not item_ids:
+        raise ValueError("item_ids must not be empty")
+    sources = []
+    allowed = {"pending", "in_progress"}
+    for iid in item_ids:
+        item = await get_sprint_item(db, iid)
+        if item is None or item.get("project_id") != project_id:
+            raise ValueError(f"sprint item not found: {iid}")
+        if (item.get("status") or "pending") not in allowed:
+            raise ValueError(
+                f"cannot merge item '{iid}' with status '{item.get('status')}'"
+            )
+        sources.append(item)
+    # Create the survivor first
+    survivor_id = _new_id()
+    version = sources[0].get("version", "")
+    merged_from_json = json.dumps(item_ids)
+    await db.execute(
+        "INSERT INTO sprint_items "
+        "(id, project_id, version, title, merged_from, milestone_type) "
+        "VALUES (?, ?, ?, ?, ?, 'task')",
+        (survivor_id, project_id, version, new_title, merged_from_json),
+    )
+    # Close all sources
+    for iid in item_ids:
+        await db.execute(
+            "UPDATE sprint_items SET status = 'skipped', completed_at = datetime('now'), "
+            "merged_into = ? WHERE id = ? AND project_id = ?",
+            (survivor_id, iid, project_id),
+        )
+    await db.commit()
+    _publish_project_event(project_id, "sprint_item_updated", {"merged_into": survivor_id})
+    survivor = await get_sprint_item(db, survivor_id)
+    assert survivor is not None
+    return survivor
 
 
 async def get_sprint_items(

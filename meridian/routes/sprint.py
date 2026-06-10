@@ -5,7 +5,7 @@ from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
 
-from .._deps import _db, _get_tenant_from_request
+from .._deps import _db, _get_tenant_from_request, validate_input_size
 from .. import db as db_module
 
 router = APIRouter()
@@ -39,6 +39,7 @@ async def add_sprint_item_endpoint(
     title = (body.get("title") or "").strip()
     if not version or not title:
         raise HTTPException(status_code=422, detail="version and title are required")
+    validate_input_size(title, "sprint item title", 500)
     group = body.get("group") or body.get("item_group") or None
     human_id = body.get("human_id") or None
     depends_on = body.get("depends_on") or None
@@ -149,9 +150,13 @@ async def patch_sprint_item_endpoint(
         title = title.strip()
         if not title:
             raise HTTPException(status_code=422, detail="title cannot be empty")
+        validate_input_size(title, "sprint item title", 500)
     version = body.get("version")
     if version is not None:
         version = version.strip() or None
+    status = body.get("status")
+    if status is not None and status not in {"pending", "indeterminate"}:
+        raise HTTPException(status_code=422, detail="status patch only supports 'pending' or 'indeterminate'")
     feedback_thumb = body.get("feedback_thumb")
     if feedback_thumb is not None:
         try:
@@ -163,6 +168,7 @@ async def patch_sprint_item_endpoint(
     feedback_note = body.get("feedback_note")
     item = await db_module.patch_sprint_item(
         await _db(request), project_id, item_id, title=title, version=version,
+        status=status,
         feedback_thumb=feedback_thumb, feedback_note=feedback_note,
     )
     if item is None:

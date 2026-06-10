@@ -38,6 +38,7 @@ _TOOL_EXAMPLES: dict[str, str] = {
     "add_sprint_item": 'add_sprint_item(project_id="abc-123", title="Add OAuth login", item_group="auth")',
     "get_sprint_items": 'get_sprint_items(project_id="abc-123")',
     "complete_sprint_item": 'complete_sprint_item(item_id="item-uuid")',
+    "claim_sprint_item": 'claim_sprint_item(project_id="abc-123", item_id="item-uuid")',
     "heartbeat": 'heartbeat(session_id="session-uuid")',
     "list_projects": 'list_projects()',
     "get_sessions": 'get_sessions(project_id="abc-123")',
@@ -426,13 +427,13 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "id": {"type": "string"}, "status": {"type": "string"}}, "required": ["id"]}},
     {"name": "get_sprint_items", "description":
         "Read-only: List sprint items for a project. Optional status filter "
-        "(todo|pending|in_progress|done|failed|skipped|pushed). "
+        "(todo|pending|in_progress|done|failed|skipped|pushed|indeterminate). "
         "Cold sessions read this to know what's still owed.",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"},
          "status": {"type": "string",
                     "enum": ["pending", "todo", "in_progress", "done",
-                             "failed", "skipped", "pushed"],
+                             "failed", "skipped", "pushed", "indeterminate"],
                     "description": "Filter by status."}},
          "required": ["project_id"]},
      "outputSchema": {"type": "array", "items": {"type": "object", "properties": {
@@ -524,6 +525,47 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "required": ["project_id", "file", "anchor", "content"]},
      "outputSchema": {"type": "object", "properties": {
          "id": {"type": "string"}, "status": {"type": "string"}}, "required": ["id"]}},
+    {"name": "claim_sprint_item",
+     "description": "Claim a pending sprint item: sets status to in_progress and records claimed_at. Read-only: false. Rejects if the item is already in_progress, done, failed, or skipped.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"},
+         "item_id": {"type": "string"}},
+         "required": ["project_id", "item_id"]},
+     "outputSchema": {"type": "object", "properties": {
+         "id": {"type": "string"}, "status": {"type": "string"},
+         "claimed_at": {"type": "string"}}}},
+    {"name": "add_subtask",
+     "description": "Add a child sprint item under an existing parent item. Inherits the parent's version. Status starts as pending. Rejects if the parent is already done, failed, or skipped.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"},
+         "parent_id": {"type": "string", "description": "ID of the parent sprint item."},
+         "title": {"type": "string", "description": "Title of the new subtask."}},
+         "required": ["project_id", "parent_id", "title"]},
+     "outputSchema": {"type": "object", "properties": {
+         "id": {"type": "string"}, "parent_id": {"type": "string"},
+         "title": {"type": "string"}, "status": {"type": "string"}}}},
+    {"name": "split_sprint_item",
+     "description": "Split a sprint item into multiple smaller items. The original is closed (skipped) and N new items are created with split_from referencing the original. Returns list of new items.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"},
+         "item_id": {"type": "string", "description": "ID of the item to split."},
+         "titles": {"type": "array", "items": {"type": "string"},
+                    "description": "Titles for the new items (minimum 2)."}},
+         "required": ["project_id", "item_id", "titles"]},
+     "outputSchema": {"type": "array", "items": {"type": "object", "properties": {
+         "id": {"type": "string"}, "title": {"type": "string"},
+         "split_from": {"type": "string"}, "status": {"type": "string"}}}}},
+    {"name": "merge_sprint_items",
+     "description": "Merge multiple sprint items into one. Source items are closed (skipped, merged_into=survivor). Returns the new survivor item.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"},
+         "item_ids": {"type": "array", "items": {"type": "string"},
+                      "description": "IDs of items to merge (minimum 2)."},
+         "new_title": {"type": "string", "description": "Title for the merged survivor item."}},
+         "required": ["project_id", "item_ids", "new_title"]},
+     "outputSchema": {"type": "object", "properties": {
+         "id": {"type": "string"}, "title": {"type": "string"},
+         "merged_from": {"type": "string"}, "status": {"type": "string"}}}},
 ]
 
 _READ_ONLY_TOOLS = {

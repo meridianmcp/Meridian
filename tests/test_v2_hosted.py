@@ -705,3 +705,37 @@ def test_dashboard_js_has_feedback_button():
     assert "ensureFeedbackButton" in js
     assert "showFeedbackModal" in js
     assert "/feedback" in js
+
+
+def test_mcp_rate_limit_429_after_limit_exceeded(client, monkeypatch):
+    """POST /mcp returns 429 with Retry-After after exceeding per-token rate limit."""
+    from meridian import db as db_module
+    from meridian import server as server_module
+
+    async def _setup():
+        db = client.app.state.db
+        tenant = await db_module.upsert_tenant(db, "ratelimit@example.com")
+        raw, _ = await db_module.create_api_token(db, tenant["id"], label="rl-test")
+        return raw
+
+    raw_token = _run(_setup())
+
+    # Inject a mock _mcp_rate_check that rejects after the first call
+    call_count = [0]
+
+    def _mock_check(token_hash: str, limit: int) -> bool:
+        call_count[0] += 1
+        return call_count[0] > 1
+
+    monkeypatch.setattr(server_module, "_mcp_rate_check", _mock_check)
+
+    payload = {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+               "params": {"protocolVersion": "2024-11-05", "capabilities": {}, "clientInfo": {}}}
+    headers = {"Authorization": f"Bearer {raw_token}"}
+
+    r1 = client.post("/mcp", json=payload, headers=headers)
+    assert r1.status_code == 200
+
+    r2 = client.post("/mcp", json=payload, headers=headers)
+    assert r2.status_code == 429
+    assert r2.headers.get("Retry-After") == "60"
