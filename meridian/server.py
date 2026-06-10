@@ -6121,6 +6121,19 @@ def _github_tools_for_tenant(tenant: dict) -> list[dict[str, Any]]:
 
 
 async def _dispatch_github_tool(name: str, args: dict[str, Any], tenant: dict, db: Any) -> Any:
+    # Guard: check if project has a GitHub repo connected
+    project_id = args.get("project_id")
+    if project_id:
+        try:
+            proj = await db_module.get_project(db, project_id)
+            if proj and not proj.get("github_repo"):
+                return {
+                    "error": "no_github_repo",
+                    "message": f"No GitHub repo connected for project {project_id}. "
+                               f"Go to Settings → Connect GitHub repo to connect one.",
+                }
+        except Exception:
+            pass
     """Dispatch a GitHub MCP tool call using the tenant's PAT and per-project repo."""
     import httpx as _httpx
     import base64 as _b64

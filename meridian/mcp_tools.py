@@ -53,7 +53,7 @@ _TOOL_EXAMPLES: dict[str, str] = {
 _MCP_TOOLS_LIST: list[dict[str, Any]] = [
     {"name": "create_project", "description": "Create a new Meridian project.",
      "inputSchema": {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}},
-    {"name": "register_session", "description": "Register this Claude session. Call at session start.",
+    {"name": "register_session", "description": "Low-level: register this session without loading goal context. Use start_session instead for executor/human sessions — it registers AND returns goal + tasks in one call. Use register_session when you only need a session ID and will fetch context separately.",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"}, "session_name": {"type": "string"},
          "human_id": {"type": "string"},
@@ -74,7 +74,7 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
      "inputSchema": {"type": "object", "properties": {
          "name": {"type": "string"}},
          "required": ["name"]}},
-    {"name": "get_goal", "description": "Read-only: Read the current goal state.",
+    {"name": "get_goal", "description": "Read-only: Fine-grained — return just the goal fields (north_star, sprint, version_goal) in isolation. Use start_session or get_session_brief for full context including tasks and decisions. Use get_goal when you only need the raw goal fields.",
      "inputSchema": {"type": "object", "properties": {"project_id": {"type": "string"}}, "required": ["project_id"]}},
     {"name": "set_goal", "description": "Set or update the goal state.",
      "inputSchema": {"type": "object", "properties": {
