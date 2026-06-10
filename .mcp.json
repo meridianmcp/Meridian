@@ -1,9 +1,0 @@
-{
-  "mcpServers": {
-    "meridian": {
-      "command": "C:\\Users\\13144\\.pixi\\bin\\pixi.exe",
-      "args": ["run", "python", "-m", "meridian", "--mcp"],
-      "cwd": "C:\\Users\\13144\\Documents\\Meridian\\repository"
-    }
-  }
-}

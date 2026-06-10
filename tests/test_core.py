@@ -5703,6 +5703,18 @@ def test_oauth_metadata_includes_meridian_branding(client):
     assert body["logo_uri"] == "https://usemeridian.us/static/logo.svg"
 
 
+def test_oauth_protected_resource_metadata(client):
+    """GET /.well-known/oauth-protected-resource returns RFC 9728 metadata shape."""
+    r = client.get("/.well-known/oauth-protected-resource")
+    assert r.status_code == 200
+    body = r.json()
+    assert "/mcp" in body["resource"]
+    assert isinstance(body["authorization_servers"], list)
+    assert len(body["authorization_servers"]) > 0
+    assert body["scopes_supported"] == ["mcp"]
+    assert body["bearer_methods_supported"] == ["header"]
+
+
 def test_landing_page_cache_control(client):
     """/ returns Cache-Control: no-cache, no-store so Cloudflare doesn't serve stale HTML."""
     r = client.get("/")
@@ -7052,16 +7064,17 @@ def test_mcp_responses_carry_csp_header(client):
 
 
 def test_remote_mcp_401_includes_www_authenticate(client):
-    """POST /mcp with no auth returns 401 with WWW-Authenticate: Bearer header.
+    """POST /mcp with no auth returns 401 with WWW-Authenticate pointing to oauth-protected-resource.
 
-    ChatGPT and other OAuth clients use this header to discover the OAuth flow.
-    Without it they just show the 401 error to the user rather than starting OAuth.
+    RFC 9728: Claude Code reads resource_metadata, fetches protected-resource metadata,
+    finds the authorization server, and does the full PKCE flow in one shot.
     """
     r = client.post("/mcp", json={"jsonrpc": "2.0", "id": 1, "method": "ping", "params": {}})
     assert r.status_code == 401
     www_auth = r.headers.get("www-authenticate", "")
     assert "Bearer" in www_auth
     assert "realm" in www_auth
+    assert "oauth-protected-resource" in www_auth
 
 
 def test_remote_mcp_401_invalid_bearer_includes_www_authenticate(client):

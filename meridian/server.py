@@ -813,7 +813,7 @@ async def site_password_gate(request: Request, call_next):
     if not site_pw:
         return await call_next(request)
     path = request.url.path
-    if path in ("/health", "/mcp/health", "/__gate__", "/config", "/static", "/mcp/tools-doc", "/mcp/quickstart", "/mcp/sse", "/mcp", "/.well-known/oauth-authorization-server") or path.startswith("/static/") or path.startswith("/oauth/") or path == "/demo" or path.startswith("/demo/"):
+    if path in ("/health", "/mcp/health", "/__gate__", "/config", "/static", "/mcp/tools-doc", "/mcp/quickstart", "/mcp/sse", "/mcp", "/.well-known/oauth-authorization-server", "/.well-known/oauth-protected-resource") or path.startswith("/static/") or path.startswith("/oauth/") or path == "/demo" or path.startswith("/demo/"):
         return await call_next(request)
     # Demo cookie bypasses site password gate — demo users don't go through __gate__
     if request.cookies.get(_DEMO_CONTEXT_COOKIE):
@@ -6957,6 +6957,17 @@ async def _oauth_meta(request: Request):
         "token_endpoint_auth_methods_supported": ["client_secret_post", "none"]})
 
 
+@app.get("/.well-known/oauth-protected-resource")
+async def _oauth_protected_resource_meta(request: Request):
+    b = str(request.base_url).rstrip("/")
+    return JSONResponse({
+        "resource": f"{b}/mcp",
+        "authorization_servers": [b],
+        "scopes_supported": ["mcp"],
+        "bearer_methods_supported": ["header"],
+    })
+
+
 @app.post("/oauth/register")
 async def _oauth_reg(request: Request):
     d = await request.json()
@@ -7330,7 +7341,12 @@ async def remote_mcp(request: Request) -> Any:
     if _td is not None:
         if _tm.time() > _td.get("exp", 0):
             _oa_tokens.pop(_bearer_hash, None)
-            return JSONResponse({"error": "token_expired"}, status_code=401)
+            _base_r = str(request.base_url).rstrip("/")
+            return JSONResponse(
+                {"error": "token_expired"},
+                status_code=401,
+                headers={"WWW-Authenticate": f'Bearer resource_metadata="{_base_r}/.well-known/oauth-protected-resource"'},
+            )
         try:
             _body = await request.json()
         except Exception:
@@ -7372,7 +7388,7 @@ async def remote_mcp(request: Request) -> Any:
                 "WWW-Authenticate": (
                     f'Bearer realm="MCP",'
                     f' error="invalid_token",'
-                    f' resource_metadata="{_base}/.well-known/oauth-authorization-server"'
+                    f' resource_metadata="{_base}/.well-known/oauth-protected-resource"'
                 ),
             },
         )
