@@ -118,12 +118,12 @@ if [[ $CLAUDE_CODE_DETECTED -eq 1 ]]; then
   START_CMD="curl -s -X POST ${HEADERS} -d '{\"project_id\":\"${PROJECT_ID}\",\"cwd\":\"'\"\$PWD\"'\"}' ${MERIDIAN_URL}/hooks/session-start | jq -r '.hookSpecificOutput.additionalContext // empty'"
   STOP_CMD="curl -s -X POST ${HEADERS} -d '{\"project_id\":\"${PROJECT_ID}\"}' ${MERIDIAN_URL}/hooks/stop"
 
-  # Use jq to merge hooks into settings without clobbering existing keys
+  # New format required by Claude Code v2.1.169+: matcher + hooks array wrapper
   UPDATED=$(echo "$SETTINGS" | jq \
     --arg start "$START_CMD" \
     --arg stop "$STOP_CMD" \
-    '.hooks.SessionStart = [{"type": "command", "command": $start}] |
-     .hooks.Stop = [{"type": "command", "command": $stop}]')
+    '.hooks.SessionStart = [{"matcher": "", "hooks": [{"type": "command", "command": $start}]}] |
+     .hooks.Stop = [{"matcher": "", "hooks": [{"type": "command", "command": $stop}]}]')
 
   echo "$UPDATED" > "$SETTINGS_PATH"
   echo "  OK SessionStart + Stop hooks written to ${SETTINGS_PATH}"
