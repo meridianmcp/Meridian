@@ -1,8 +1,0 @@
-{
-  "mcpServers": {
-    "meridian": {
-      "type": "http",
-      "url": "https://usemeridian.us/mcp"
-    }
-  }
-}

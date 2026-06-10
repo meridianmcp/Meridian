@@ -269,3 +269,5 @@ extensions/mcp-text-editor/.pixi/
 /videos/
 
 launch/
+
+.mcp.json
