@@ -11151,7 +11151,7 @@ async function loadSettingsTab(projectId) {
       const revealDismiss = document.getElementById(`hooks-key-dismiss-${projectId}`);
       if (!revealEl || !revealInput) return;
       revealInput.value = rawToken;
-      revealEl.style.display = '';
+      revealEl.style.display = 'block';
       function _hideReveal() {
         revealEl.style.display = 'none';
         const masked = rawToken.slice(0, 18) + '...' + rawToken.slice(-4);

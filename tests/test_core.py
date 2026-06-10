@@ -7849,3 +7849,46 @@ def test_oauth_codes_table_in_create_tables():
     """CREATE_TABLES must define oauth_codes table for PKCE persistence."""
     from meridian.db import CREATE_TABLES
     assert "oauth_codes" in CREATE_TABLES, "CREATE_TABLES missing 'oauth_codes'"
+
+
+# ---------------------------------------------------------------------------
+# Bug fix: github_status returns graceful JSON on errors (not 500)
+# ---------------------------------------------------------------------------
+
+
+def test_github_status_returns_404_in_local_mode(client):
+    """github_status endpoint returns 404 in local (non-hosted) mode — not 500."""
+    p = client.post("/projects", json={"name": "gh-status-local"}).json()
+    r = client.get(f"/projects/{p['id']}/github/status")
+    assert r.status_code == 404
+
+
+def test_github_status_graceful_on_db_error(client, monkeypatch):
+    """github_status wraps DB/snapshot failures and returns connected=false (not 500).
+
+    Simulates a tenant lookup exception after auth passes to confirm the outer
+    try/except returns a safe JSON response instead of propagating as 500.
+    """
+    import meridian.db as _db_mod
+    from meridian import server as server_mod
+
+    p = client.post("/projects", json={"name": "gh-status-err"}).json()
+    project_id = p["id"]
+
+    monkeypatch.setenv("MERIDIAN_HOSTED", "true")
+
+    async def _mock_tenant(request):
+        return {"id": "tenant-test", "email": "test@test.com"}
+
+    async def _boom(*args, **kwargs):
+        raise RuntimeError("simulated DB failure")
+
+    monkeypatch.setattr(server_mod, "_get_tenant_from_request", _mock_tenant)
+    monkeypatch.setattr(_db_mod, "get_tenant_by_id", _boom)
+
+    r = client.get(f"/projects/{project_id}/github/status")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["connected"] is False
+    assert body["pat_linked"] is False
+    assert body["repos"] == []

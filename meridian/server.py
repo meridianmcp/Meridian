@@ -4438,32 +4438,37 @@ async def github_status(project_id: str, request: Request) -> dict[str, Any]:
     tenant = await _get_tenant_from_request(request)
     if tenant is None:
         raise HTTPException(status_code=401, detail="not authenticated")
-    fresh = await db_module.get_tenant_by_id(request.app.state.db, tenant["id"])
-    if not fresh:
-        raise HTTPException(status_code=404, detail="tenant not found")
-    token = db_module.decrypt_field(fresh.get("github_pat"))
-    project = await db_module.get_project(await _db(request), project_id)
-    selected_repo = (project or {}).get("github_repo") or ""
-    selected_branch = (project or {}).get("github_branch") or "main"
-    snapshot: dict[str, Any] | None = None
-    if token:
-        try:
-            snapshot = await _github_snapshot(token)
-        except Exception:
-            snapshot = None
-    repos = (snapshot or {}).get("repos") or []
-    if selected_repo and repos and not any(r.get("full_name") == selected_repo for r in repos):
-        repos = [{"full_name": selected_repo, "name": selected_repo.split("/")[-1], "owner": selected_repo.split("/")[0] if "/" in selected_repo else "", "html_url": "", "default_branch": selected_branch, "private": False, "updated_at": ""}] + repos
-    return {
-        "connected": bool(token and selected_repo),
-        "pat_linked": bool(token),
-        "repo": selected_repo,
-        "branch": selected_branch,
-        "github_user": (snapshot or {}).get("login", ""),
-        "avatar_url": (snapshot or {}).get("avatar_url", ""),
-        "repos": repos,
-        "last_verified": None,
-    }
+    try:
+        fresh = await db_module.get_tenant_by_id(request.app.state.db, tenant["id"])
+        if not fresh:
+            return {"connected": False, "pat_linked": False, "repo": "", "branch": "main",
+                    "github_user": "", "avatar_url": "", "repos": [], "last_verified": None}
+        token = db_module.decrypt_field(fresh.get("github_pat"))
+        project = await db_module.get_project(await _db(request), project_id)
+        selected_repo = (project or {}).get("github_repo") or ""
+        selected_branch = (project or {}).get("github_branch") or "main"
+        snapshot: dict[str, Any] | None = None
+        if token:
+            try:
+                snapshot = await _github_snapshot(token)
+            except Exception:
+                snapshot = None
+        repos = (snapshot or {}).get("repos") or []
+        if selected_repo and repos and not any(r.get("full_name") == selected_repo for r in repos):
+            repos = [{"full_name": selected_repo, "name": selected_repo.split("/")[-1], "owner": selected_repo.split("/")[0] if "/" in selected_repo else "", "html_url": "", "default_branch": selected_branch, "private": False, "updated_at": ""}] + repos
+        return {
+            "connected": bool(token and selected_repo),
+            "pat_linked": bool(token),
+            "repo": selected_repo,
+            "branch": selected_branch,
+            "github_user": (snapshot or {}).get("login", ""),
+            "avatar_url": (snapshot or {}).get("avatar_url", ""),
+            "repos": repos,
+            "last_verified": None,
+        }
+    except Exception:
+        return {"connected": False, "pat_linked": False, "repo": "", "branch": "main",
+                "github_user": "", "avatar_url": "", "repos": [], "last_verified": None}
 
 
 @app.get("/projects/{project_id}/repo-image")
