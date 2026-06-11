@@ -8784,36 +8784,6 @@ async function loadSettingsTab(projectId) {
 
   </details>`;
 
-    html += `<div style="margin-bottom:14px;padding:10px 12px;border:1px solid var(--border);border-radius:6px;background:var(--surface-2)">
-
-      <div style="font-weight:600;font-size:12px;color:var(--text);margin-bottom:4px">Known Locations</div>
-
-      <div style="font-size:10px;color:var(--muted);margin-bottom:8px">Hooks auto-register each machine + path on first session. Used to route sessions to the right project.</div>
-
-      <div id="exec-ez-paths-tbl-${projectId}" style="margin-bottom:8px;font-size:10px;font-family:var(--font-mono)">
-        ${(() => {
-          const paths = Array.isArray(_ezCfg.repo_paths) ? _ezCfg.repo_paths : [];
-          if (!paths.length) return '<div style="color:var(--muted);font-style:italic">No locations tracked yet -- run the installer to auto-populate.</div>';
-          return '<table style="width:100%;border-collapse:collapse">' +
-            paths.map((p, i) => `<tr>
-              <td style="padding:2px 6px 2px 0;color:var(--text)">${escapeHtml(p.hostname || '')}</td>
-              <td style="padding:2px 6px 2px 0;color:var(--muted)">${escapeHtml(p.cwd || '')}</td>
-              <td style="padding:2px 0;text-align:right"><button class="exec-ez-del-row" data-pid="${escapeHtml(projectId)}" data-idx="${i}" style="font-size:9px;padding:1px 6px;background:transparent;border:1px solid var(--border);border-radius:3px;color:var(--muted);cursor:pointer">Remove</button></td>
-            </tr>`).join('') + '</table>';
-        })()}
-      </div>
-
-      <div style="display:flex;gap:8px;align-items:center">
-
-        <button id="exec-ez-save-${projectId}" class="primary" style="font-size:10px;padding:3px 10px">Save</button>
-
-        <button id="exec-ez-clear-${projectId}" class="secondary" style="font-size:10px;padding:3px 10px">Clear all</button>
-
-        <span id="exec-ez-status-${projectId}" style="font-size:10px;color:var(--muted);min-height:14px"></span>
-
-      </div>
-
-    </div>`;
 
   }
 
@@ -8970,6 +8940,31 @@ async function loadSettingsTab(projectId) {
 
   </div>`;
 
+  }
+
+  // ── Known Locations card — always visible ────────────────────────────────────
+  {
+    const _klCfg = (projectSettings && projectSettings.executor_config) || {};
+    const _klPaths = Array.isArray(_klCfg.repo_paths) ? _klCfg.repo_paths : [];
+    html += `<div style="margin-bottom:12px;padding:12px 14px;border:1px solid var(--border);border-radius:8px;background:var(--surface)">
+      <div style="font-weight:600;font-size:13px;color:var(--text);margin-bottom:4px">Known Locations</div>
+      <div style="font-size:11px;color:var(--muted);margin-bottom:10px">Hooks auto-register each machine and directory on first session. Sessions route to this project when launched from a known location.</div>
+      <div id="exec-ez-paths-tbl-${projectId}" style="margin-bottom:8px;font-size:10px;font-family:var(--font-mono)">${
+        _klPaths.length
+          ? '<table style="width:100%;border-collapse:collapse">' +
+            _klPaths.map((p, i) => `<tr>
+              <td style="padding:2px 6px 2px 0;color:var(--text)">${escapeHtml(p.hostname || '')}</td>
+              <td style="padding:2px 6px 2px 0;color:var(--muted)">${escapeHtml(p.cwd || '')}</td>
+              <td style="padding:2px 0;text-align:right"><button class="exec-ez-del-row" data-pid="${escapeHtml(projectId)}" data-idx="${i}" style="font-size:9px;padding:1px 6px;background:transparent;border:1px solid var(--border);border-radius:3px;color:var(--muted);cursor:pointer">Remove</button></td>
+            </tr>`).join('') + '</table>'
+          : '<div style="color:var(--muted);font-style:italic;font-size:10px">No locations tracked yet — run the installer to auto-populate.</div>'
+      }</div>
+      <div style="display:flex;gap:8px;align-items:center">
+        <button id="exec-ez-save-${projectId}" class="primary" style="font-size:10px;padding:3px 10px">Save</button>
+        <button id="exec-ez-clear-${projectId}" class="secondary" style="font-size:10px;padding:3px 10px">Clear all</button>
+        <span id="exec-ez-status-${projectId}" style="font-size:10px;color:var(--muted);min-height:14px"></span>
+      </div>
+    </div>`;
   }
 
 
@@ -9449,13 +9444,15 @@ async function loadSettingsTab(projectId) {
 
     const mcpHttpUrl = `${serverUrl}/mcp`;
 
+    const isHosted = window.location.hostname === 'usemeridian.us';
+
     const rawTomlPath = state.serverConfig?.toml_path || '';
 
     const cwd = rawTomlPath
 
       ? rawTomlPath.replace(/[/\\]meridian\.toml$/i, '').replace(/\\/g, '/')
 
-      : '/path/to/your/meridian';
+      : (isHosted ? '' : '/path/to/your/meridian');
 
     const isDemo = !!state.serverConfig?.demo_mode;
 
@@ -9492,22 +9489,15 @@ async function loadSettingsTab(projectId) {
 
       <div style="color:var(--accent);font-size:10px;letter-spacing:.06em;text-transform:uppercase;margin-bottom:10px;padding-bottom:4px;border-bottom:1px solid var(--border)">Codex CLI setup</div>
 
-      ${isHostedMode() ? `<div style="margin-bottom:16px;padding:12px;background:var(--surface-1);border:1px solid var(--accent,#a8ff78)44;border-radius:6px">
-        <div style="font-size:11px;font-weight:700;color:var(--text);margin-bottom:6px">Claude Code (Hosted)</div>
-        <div style="font-size:10px;color:var(--muted);margin-bottom:8px">Save as <code>.mcp.json</code> in your project root. Get your key from the Auto-checkpoint hooks section above.</div>
-        <pre id="hosted-mcp-json-${escapeHtml(projectId)}" style="background:var(--surface-0);border:1px solid var(--border);border-radius:4px;padding:10px;font-size:10px;font-family:var(--font-mono);color:var(--text);overflow-x:auto;margin:0 0 6px 0;white-space:pre-wrap;word-break:break-all"></pre>
-        <button class="secondary" id="copy-hosted-mcp-json-${escapeHtml(projectId)}" style="font-size:10px;padding:4px 10px">Copy .mcp.json</button>
-        ${mcpData && mcpData.github_repo ? `<button id="push-mcp-template-${escapeHtml(projectId)}" class="secondary" style="font-size:10px;padding:4px 10px;margin-left:4px" title="Push template.mcp.json to ${escapeHtml(mcpData.github_repo || '')}">Push to repo ↗</button>` : ""}
-      </div>` : ""}
-
+      ${isHostedMode() ? '' : `
       <div style="font-size:10px;color:var(--muted);margin-bottom:10px">Add to <code>~/.codex/config.toml</code> — or run <code>codex mcp add meridian ${escapeHtml(mcpHttpUrl)}</code></div>
 
-      <div style="margin-bottom:12px">
+      ${!isHosted ? `<div style="margin-bottom:12px">
         <label style="font-size:10px;color:var(--muted)">Your Meridian path<br>
           <input type="text" id="meridian-path-${escapeHtml(projectId)}" placeholder="/path/to/Meridian" value="${escapeHtml(rawTomlPath ? cwd : '')}" style="width:100%;max-width:400px;background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:3px 8px;margin-top:3px;box-sizing:border-box">
         </label>
         <div style="font-size:9px;color:var(--muted);margin-top:3px">Updates the STDIO cwd below in real time.</div>
-      </div>
+      </div>` : ""}
 
       <div style="font-size:10px;font-weight:600;color:var(--text);margin-bottom:4px">Option A — STDIO (local, recommended)</div>
 
@@ -9520,6 +9510,7 @@ async function loadSettingsTab(projectId) {
       <pre id="codex-http-${escapeHtml(projectId)}" style="background:var(--surface-1);border:1px solid var(--border);border-radius:4px;padding:10px;font-size:10px;font-family:var(--font-mono);color:var(--text);overflow-x:auto;margin:0 0 6px 0;white-space:pre-wrap;word-break:break-all"></pre>
 
       <button class="secondary" id="codex-copy-http-${escapeHtml(projectId)}" style="font-size:10px;padding:4px 10px;margin-bottom:12px">Copy</button>
+      `}
 
       <div style="font-size:10px;font-weight:600;color:var(--text);margin-bottom:4px;margin-top:8px">/goal template</div>
 
@@ -9536,6 +9527,17 @@ async function loadSettingsTab(projectId) {
         <span id="codex-goal-status-${escapeHtml(projectId)}" style="font-size:10px;color:var(--muted)"></span>
 
       </div>
+
+      ${isHostedMode() ? `<div style="margin-top:12px;font-size:10px;color:var(--muted)">Need manual config? See <a href="https://docs.usemeridian.us/configuration" target="_blank" style="color:var(--accent);text-decoration:none">docs.usemeridian.us/configuration</a></div>
+
+      <details style="margin-top:8px;border:1px solid var(--border);border-radius:4px;overflow:hidden">
+        <summary style="cursor:pointer;list-style:none;padding:6px 10px;background:var(--surface-2);font-size:10px;color:var(--muted)">Advanced — HTTP config (Codex / custom)</summary>
+        <div style="padding:10px 12px">
+          <div style="font-size:10px;color:var(--muted);margin-bottom:8px">Add to <code>~/.codex/config.toml</code> — or run <code>codex mcp add meridian ${escapeHtml(mcpHttpUrl)}</code></div>
+          <pre id="codex-http-${escapeHtml(projectId)}" style="background:var(--surface-1);border:1px solid var(--border);border-radius:4px;padding:10px;font-size:10px;font-family:var(--font-mono);color:var(--text);overflow-x:auto;margin:0 0 6px 0;white-space:pre-wrap;word-break:break-all"></pre>
+          <button class="secondary" id="codex-copy-http-${escapeHtml(projectId)}" style="font-size:10px;padding:4px 10px">Copy</button>
+        </div>
+      </details>` : ''}
 
     </div>`;
 
@@ -11152,7 +11154,7 @@ async function loadSettingsTab(projectId) {
             <div style="font-size:10px;color:var(--text);font-family:var(--font-mono);word-break:break-all;display:flex;align-items:center;gap:4px">${escapeHtml(token.masked_token || 'sk_meridian_...')}${typeBadge}</div>
             <div style="font-size:9px;color:var(--muted);margin-top:2px">${escapeHtml(token.label || 'API key')} - ${escapeHtml(token.created_at || '')}</div>
           </div>
-          <button class="secondary" data-token-id="${escapeHtml(token.id || '')}" style="font-size:10px;padding:3px 8px;color:var(--danger,#ef4444)">Revoke</button>
+          <button class="secondary" data-token-id="${escapeHtml(token.id || '')}" data-token-label="${escapeHtml(token.label || '')}" style="font-size:10px;padding:3px 8px;color:var(--danger,#ef4444)">Revoke</button>
         </div>`;
 
       }).join('');
@@ -11165,7 +11167,12 @@ async function loadSettingsTab(projectId) {
 
           if (!tokenId) return;
 
-          if (!confirm('Revoke this API key? Existing clients using it will stop working.')) return;
+          const _revokeLabel = btn.getAttribute('data-token-label') || '';
+          const _isHooksKey = _revokeLabel === 'hooks-installer' || _revokeLabel === 'hooks-config';
+          const _revokeMsg = _isHooksKey
+            ? 'This key may be used in your Claude Code hooks. After revoking, re-run the installer to reconnect.\n\nRevoke anyway?'
+            : 'Revoke this API key? Existing clients using it will stop working.';
+          if (!confirm(_revokeMsg)) return;
 
           btn.disabled = true;
 
