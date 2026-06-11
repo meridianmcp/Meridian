@@ -79,7 +79,7 @@ Write-Host ""
 $DefaultUrl = "https://usemeridian.us"
 $MeridianUrl = Get-ArgValue -Arguments $CliArgs -Name "--url"
 if ($null -eq $MeridianUrl) {
-    $input = Read-Host "Meridian server URL [$DefaultUrl]"
+    $input = Read-Host "Meridian server URL (press Enter for $DefaultUrl)"
     if ([string]::IsNullOrWhiteSpace($input)) { $MeridianUrl = $DefaultUrl } else { $MeridianUrl = $input }
 }
 $MeridianUrl = $MeridianUrl.TrimEnd("/")
