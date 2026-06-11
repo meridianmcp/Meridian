@@ -11279,7 +11279,7 @@ async function loadSettingsTab(projectId) {
       revealEl.style.display = 'block';
       function _hideReveal() {
         revealEl.style.display = 'none';
-        const masked = rawToken.slice(0, 18) + '...' + rawToken.slice(-4);
+        const masked = 'sk_meridian_' + '•'.repeat(8) + rawToken.slice(-4);
         const statusEl = document.getElementById(`hooks-token-status-${projectId}`);
         if (statusEl) statusEl.textContent = `${label || 'Key'} saved: ${masked} — use "Generate new key" to rotate.`;
       }
