@@ -52,22 +52,21 @@ function Get-MeResponse {
 
 function Build-StartCmd {
     param([string]$Url, [string]$Token)
+    # Use curl (built-in Windows 10+, macOS, Linux) -- avoids WSL bash routing PowerShell hooks through bash
     if ([string]::IsNullOrEmpty($Token)) {
-        $inner = 'try { $cwd=(Get-Location).Path.Replace("\","/"); $h=$env:COMPUTERNAME; $body="{""cwd"":""$cwd"",""hostname"":""$h""}"; (Invoke-WebRequest -Method POST -Uri "' + $Url + '/hooks/session-start" -ContentType "application/json" -Body $body -UseBasicParsing).Content } catch { "{}" }'
+        return "curl -s -X POST $Url/hooks/session-start -H \"Content-Type: application/json\" -d \"{\\"cwd\\":\\"$(pwd)\\",\\"hostname\\":\\"$(hostname)\\"}\" || true"
     } else {
-        $inner = 'try { $cwd=(Get-Location).Path.Replace("\";"/"); $h=$env:COMPUTERNAME; $body="{""cwd"":""$cwd"",""hostname"":""$h""}"; $resp=Invoke-WebRequest -Method POST -Uri "' + $Url + '/hooks/session-start" -Headers @{ Authorization="Bearer ' + $Token + '" } -ContentType "application/json" -Body $body -UseBasicParsing -ErrorAction Stop; $resp.Content } catch { if ($_.Exception.Response -and $_.Exception.Response.StatusCode -eq 401) { Write-Host "[Meridian] API key revoked -- re-run: irm ' + $Url + '/hooks.ps1 | iex" -ForegroundColor Yellow }; "{}" }'
+        return "curl -s -X POST $Url/hooks/session-start -H \"Authorization: Bearer $Token\" -H \"Content-Type: application/json\" -d \"{\\"cwd\\":\\"$(pwd)\\",\\"hostname\\":\\"$(hostname)\\"}\" || true"
     }
-    return "powershell -NoProfile -NonInteractive -Command `"$inner`""
 }
 
 function Build-StopCmd {
     param([string]$Url, [string]$Token)
     if ([string]::IsNullOrEmpty($Token)) {
-        $inner = 'try { $h=$env:COMPUTERNAME; $body="{""hostname"":""$h""}"; Invoke-WebRequest -Method POST -Uri "' + $Url + '/hooks/stop" -ContentType "application/json" -Body $body -UseBasicParsing | Out-Null } catch { }'
+        return "curl -s -X POST $Url/hooks/stop -H \"Content-Type: application/json\" -d \"{\\"hostname\\":\\"$(hostname)\\"}\" || true"
     } else {
-        $inner = 'try { $h=$env:COMPUTERNAME; $body="{""hostname"":""$h""}"; Invoke-WebRequest -Method POST -Uri "' + $Url + '/hooks/stop" -Headers @{ Authorization="Bearer ' + $Token + '" } -ContentType "application/json" -Body $body -UseBasicParsing | Out-Null } catch { }'
+        return "curl -s -X POST $Url/hooks/stop -H \"Authorization: Bearer $Token\" -H \"Content-Type: application/json\" -d \"{\\"hostname\\":\\"$(hostname)\\"}\" || true"
     }
-    return "powershell -NoProfile -NonInteractive -Command `"$inner`""
 }
 
 Write-Host ""
