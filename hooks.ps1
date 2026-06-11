@@ -327,5 +327,8 @@ if ($testOk) {
 # ---- Done ------------------------------------------------------------------------
 Write-Host ""
 Write-Host "Done. Hooks installed for $MeridianUrl." -ForegroundColor Green
-Write-Host "Restart Claude Code to activate."
+Write-Host ""
+Write-Host "To start with hooks + remote control enabled:"
+Write-Host "  claude --rc --permission-mode bypassPermissions" -ForegroundColor Cyan
+Write-Host "('claude rc' server mode does NOT fire hooks)"
 Write-Host ""
