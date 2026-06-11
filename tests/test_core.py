@@ -6559,7 +6559,7 @@ def test_hooks_installer_scripts_are_served(client):
 def test_dashboard_js_has_hooks_token_management_ui(client):
     """dashboard.js exposes the hooks token list/revoke UI and executor setup."""
     js = client.get("/static/dashboard.js").text
-    assert "docs.usemeridian.us/configuration" in js
+    assert "Meridian Connect" in js
     assert "hooks-token-list-${projectId}" in js
     assert "hooks-refresh-tokens-${projectId}" in js
     assert "/auth/tokens/${tokenId}" in js
