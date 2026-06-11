@@ -9382,7 +9382,7 @@ async function loadSettingsTab(projectId) {
               mcpRevealEl.style.display = '';
               function _hideMcpReveal() {
                 mcpRevealEl.style.display = 'none';
-                if (copyStatus) copyStatus.textContent = 'Key saved: ' + tok.token.slice(0, 18) + '...' + tok.token.slice(-4);
+                if (copyStatus) copyStatus.textContent = 'Key saved: ' + ('sk_meridian_••••••••' + tok.token.slice(-4)) + tok.token.slice(-4);
               }
               if (mcpKeyCopyBtn) mcpKeyCopyBtn.onclick = async () => { try { await navigator.clipboard.writeText(tok.token); mcpKeyCopyBtn.textContent = 'Copied!'; setTimeout(() => { mcpKeyCopyBtn.textContent = 'Copy key'; }, 1800); } catch(e) {} };
               if (mcpKeyDismiss) mcpKeyDismiss.onclick = _hideMcpReveal;
