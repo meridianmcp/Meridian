@@ -5272,11 +5272,12 @@ def _hook_script_path(filename: str) -> Path:
 
 
 def _mask_api_token_hash(token_hash: str | None) -> str:
-    """Return a stable masked display string for a stored API token hash."""
+    """Return a stable masked display string for a stored API token hash.
+    Shows only last 4 chars of the hash as a stable identifier."""
     value = (token_hash or "").strip()
-    if len(value) >= 10:
-        return f"sk_meridian_{value[:6]}...{value[-4:]}"
-    return "sk_meridian_..."
+    if len(value) >= 4:
+        return f"sk_meridian_••••••••{value[-4:]}"
+    return "sk_meridian_••••••••..."
 
 
 async def _get_authenticated_tenant(request: Request) -> dict[str, Any]:
