@@ -875,6 +875,8 @@ async def init_pg_db(url: str) -> PostgresConnection:
     await _migrate_pg_sprint_items_claimed_at(conn)
     await _migrate_pg_sprint_item_tree(conn)
     await _migrate_pg_api_token_type(conn)
+    await _migrate_pg_api_token_expires_at(conn)
+    await _migrate_pg_oauth_codes(conn)
     await _migrate_pg_github_to_projects(conn)
     return conn
 
@@ -901,6 +903,27 @@ async def _migrate_pg_api_token_type(conn: PostgresConnection) -> None:
     """Add token_type to api_tokens for read-only token support (Task 3)."""
     await conn.executescript(
         "ALTER TABLE api_tokens ADD COLUMN IF NOT EXISTS token_type TEXT NOT NULL DEFAULT 'readwrite'"
+    )
+
+
+async def _migrate_pg_api_token_expires_at(conn: PostgresConnection) -> None:
+    """Add expires_at to api_tokens for short-lived install tokens."""
+    await conn.executescript(
+        "ALTER TABLE api_tokens ADD COLUMN IF NOT EXISTS expires_at TEXT"
+    )
+
+
+async def _migrate_pg_oauth_codes(conn: PostgresConnection) -> None:
+    """Add oauth_codes table for PKCE OAuth flow."""
+    await conn.executescript(
+        "CREATE TABLE IF NOT EXISTS oauth_codes ("
+        "    code TEXT PRIMARY KEY,"
+        "    tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,"
+        "    redirect_uri TEXT NOT NULL,"
+        "    code_challenge TEXT NOT NULL,"
+        "    expires_at TEXT NOT NULL,"
+        "    created_at TEXT NOT NULL DEFAULT (to_char(now() at time zone 'utc', 'YYYY-MM-DD HH24:MI:SS'))"
+        ")"
     )
 
 
