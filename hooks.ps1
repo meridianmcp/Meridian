@@ -1,12 +1,12 @@
-# hooks.ps1 - Meridian session lifecycle hooks installer (Windows / PowerShell)
+# hooks.ps1 - Meridian Connect (Windows / PowerShell)
 #
 # Usage:
 #   irm https://usemeridian.us/hooks.ps1 | iex
 #   .\hooks.ps1
-#   .\hooks.ps1 --url http://localhost:7878 --project-id your-project-id
+#   .\hooks.ps1 --url http://localhost:7878 --token sk_meridian_xxx
 #
-# Installs Claude Code, Codex, and Cursor integrations. Credentials are embedded
-# directly in hook commands  -- no per-repo config file required.
+# Installs Claude Code, Codex, and Cursor integrations.
+# One install per machine. Hooks are global - project_id comes from your goal.
 #
 # Requirements: PowerShell 5.1+
 
@@ -79,9 +79,9 @@ Write-Host ""
 $DefaultUrl = "https://usemeridian.us"
 $MeridianUrl = Get-ArgValue -Arguments $CliArgs -Name "--url"
 if ($null -eq $MeridianUrl) {
-    $MeridianUrl = Read-Host "Meridian server URL [$DefaultUrl]"
+    $input = Read-Host "Meridian server URL [$DefaultUrl]"
+    if ([string]::IsNullOrWhiteSpace($input)) { $MeridianUrl = $DefaultUrl } else { $MeridianUrl = $input }
 }
-if ([string]::IsNullOrWhiteSpace($MeridianUrl)) { $MeridianUrl = $DefaultUrl }
 $MeridianUrl = $MeridianUrl.TrimEnd("/")
 
 if (-not ($MeridianUrl -match "^https?://")) {
@@ -91,7 +91,7 @@ if (-not ($MeridianUrl -match "^https?://")) {
 
 Write-Host "Checking $MeridianUrl ..."
 if (-not (Test-UrlReachable -Url $MeridianUrl)) {
-    Write-Host "Error: Cannot reach $MeridianUrl/health  -- is the server running?" -ForegroundColor Red
+    Write-Host "Error: Cannot reach $MeridianUrl/health -- is the server running?" -ForegroundColor Red
     exit 1
 }
 Write-Host "  OK server is reachable" -ForegroundColor Green
@@ -102,7 +102,7 @@ $Token = Get-ArgValue -Arguments $CliArgs -Name "--token"
 
 if ($IsLocalhost) {
     Write-Host ""
-    Write-Host "Self-hosted / localhost detected  -- skipping auth."
+    Write-Host "Self-hosted / localhost detected -- skipping auth."
     if ($null -eq $Token) { $Token = "" }
 } else {
     if ($null -eq $Token) {
@@ -124,46 +124,77 @@ if ($IsLocalhost) {
     Write-Host "Validating token..."
     $me = Get-MeResponse -Url $MeridianUrl -Token $Token
     if ($null -eq $me) {
-        Write-Host "Error: Token validation failed  -- is the token correct?" -ForegroundColor Red
+        Write-Host "Error: Token validation failed -- is the token correct?" -ForegroundColor Red
         exit 1
     }
     Write-Host "  Authenticated as: $($me.email)" -ForegroundColor Green
 }
 
-# ---- Step 3: Generate permanent token --------------------------------------------
-# No project selection needed  -- hooks are global, project_id comes from the goal at session time.
+# No project selection -- hooks are global, project_id comes from the goal at session time.
+
+# ---- Step 3: Generate permanent token (only if install token, not already permanent) ---
 if (-not $IsLocalhost -and -not [string]::IsNullOrWhiteSpace($Token)) {
-    try {
-        $r = Invoke-WebRequest -Method POST -Uri "$MeridianUrl/auth/tokens" `
-            -Headers @{ Authorization = "Bearer $Token" } `
-            -ContentType "application/json" -Body '{"label":"hooks-installer"}' `
-            -UseBasicParsing -TimeoutSec 10 -ErrorAction SilentlyContinue
-        if ($r.StatusCode -eq 201) {
-            $td = $r.Content | ConvertFrom-Json
-            if ($td.token) {
-                $Token = $td.token
-                Write-Host "  Permanent token created." -ForegroundColor Green
+    if (-not $Token.StartsWith("sk_meridian_")) {
+        Write-Host "  Saving permanent API key..."
+        try {
+            $r = Invoke-WebRequest -Method POST -Uri "$MeridianUrl/auth/tokens" `
+                -Headers @{ Authorization = "Bearer $Token" } `
+                -ContentType "application/json" -Body '{"label":"hooks-installer"}' `
+                -UseBasicParsing -TimeoutSec 10 -ErrorAction SilentlyContinue
+            if ($r.StatusCode -eq 201) {
+                $td = $r.Content | ConvertFrom-Json
+                if ($td.token) {
+                    $Token = $td.token
+                    Write-Host "  Permanent API key saved." -ForegroundColor Green
+                }
             }
+        } catch {}
+    } else {
+        Write-Host "  Using existing API key." -ForegroundColor Green
+    }
+}
+
+# ---- Step 4: Build hook commands --------------------------------------------------
+$startCmd = Build-StartCmd -Url $MeridianUrl -Token $Token
+$stopCmd  = Build-StopCmd  -Url $MeridianUrl -Token $Token
+
+# ---- Step 5: Check for existing hooks --------------------------------------------
+$ClaudeSettingsPath = Join-Path $HOME ".claude\settings.json"
+$ClaudeDetected = (Get-Command claude -ErrorAction SilentlyContinue) -ne $null -or (Test-Path $ClaudeSettingsPath)
+$ExistingHooks = $false
+
+if ($ClaudeDetected -and (Test-Path $ClaudeSettingsPath)) {
+    try {
+        $existing = Get-Content $ClaudeSettingsPath -Raw | ConvertFrom-Json
+        if ($existing.hooks -and ($existing.hooks.SessionStart -or $existing.hooks.Stop)) {
+            $ExistingHooks = $true
         }
     } catch {}
 }
 
-# ---- Step 5: Build hook commands -------------------------------------------------
-$startCmd = Build-StartCmd -Url $MeridianUrl -Token $Token
-$stopCmd  = Build-StopCmd  -Url $MeridianUrl -Token $Token
+if ($ExistingHooks) {
+    Write-Host ""
+    Write-Host "Existing Meridian hooks detected in Claude Code." -ForegroundColor Yellow
+    $choice = Read-Host "  (U)pdate with new token / (S)kip / (O)verwrite all [U/s/o]"
+    if ($choice -match "^[Ss]") {
+        Write-Host "  Skipped -- existing hooks unchanged." -ForegroundColor Yellow
+        $ClaudeDetected = $false
+    } elseif ($choice -match "^[Oo]") {
+        Write-Host "  Overwriting..."
+    } else {
+        Write-Host "  Updating token in existing hooks..."
+    }
+}
 
 # ---- Step 6: Write hooks to ~/.claude/settings.json ------------------------------
-$ClaudeSettingsPath = Join-Path $HOME ".claude\settings.json"
-$ClaudeDetected = (Get-Command claude -ErrorAction SilentlyContinue) -ne $null -or (Test-Path $ClaudeSettingsPath)
-
 if ($ClaudeDetected) {
     Write-Host ""
-    Write-Host "Claude Code detected  -- writing hooks to $ClaudeSettingsPath"
+    Write-Host "Claude Code detected -- writing hooks to $ClaudeSettingsPath"
     $ClaudeDir = Split-Path $ClaudeSettingsPath
     if (-not (Test-Path $ClaudeDir)) { New-Item -ItemType Directory -Path $ClaudeDir | Out-Null }
 
     if (Test-Path $ClaudeSettingsPath) {
-        $settings = Get-Content $ClaudeSettingsPath -Raw | ConvertFrom-Json
+        try { $settings = Get-Content $ClaudeSettingsPath -Raw | ConvertFrom-Json } catch { $settings = [PSCustomObject]@{} }
     } else {
         $settings = [PSCustomObject]@{}
     }
@@ -180,11 +211,11 @@ if ($ClaudeDetected) {
     Write-Host "  OK SessionStart + Stop hooks written" -ForegroundColor Green
 }
 
-# ---- Step 7: Codex detection + config.toml ---------------------------------------
+# ---- Step 7: Codex ---------------------------------------------------------------
 $CodexDetected = (Get-Command codex -ErrorAction SilentlyContinue) -ne $null -or (Test-Path (Join-Path $HOME ".codex"))
 if ($CodexDetected) {
     Write-Host ""
-    Write-Host "Codex detected  -- writing MCP config to ~/.codex/config.toml"
+    Write-Host "Codex detected -- writing MCP config to ~/.codex/config.toml"
     $CodexDir = Join-Path $HOME ".codex"
     $CodexConfigPath = Join-Path $CodexDir "config.toml"
     if (-not (Test-Path $CodexDir)) { New-Item -ItemType Directory -Path $CodexDir | Out-Null }
@@ -205,7 +236,6 @@ stop = "$escapedStop"
 
     if (Test-Path $CodexConfigPath) {
         $existing = Get-Content $CodexConfigPath -Raw
-        # Strip old meridian + hooks blocks then append new ones
         $existing = $existing -replace '(?s)\[mcp_servers\.meridian\].*?(?=\n\[|\z)', ''
         $existing = $existing -replace '(?s)\[hooks\].*?(?=\n\[|\z)', ''
         $combined = $existing.TrimEnd() + $newBlock
@@ -216,11 +246,11 @@ stop = "$escapedStop"
     Write-Host "  OK MCP config written to $CodexConfigPath" -ForegroundColor Green
 }
 
-# ---- Step 8: Cursor detection + .cursor/mcp.json ---------------------------------
+# ---- Step 8: Cursor --------------------------------------------------------------
 $CursorDetected = (Get-Command cursor -ErrorAction SilentlyContinue) -ne $null -or (Test-Path (Join-Path $HOME ".cursor"))
 if ($CursorDetected) {
     Write-Host ""
-    Write-Host "Cursor detected  -- writing .cursor/mcp.json in current directory"
+    Write-Host "Cursor detected -- writing .cursor/mcp.json in current directory"
     $CursorDir = Join-Path (Get-Location).Path ".cursor"
     $CursorConfigPath = Join-Path $CursorDir "mcp.json"
     if (-not (Test-Path $CursorDir)) { New-Item -ItemType Directory -Path $CursorDir | Out-Null }
@@ -231,7 +261,7 @@ if ($CursorDetected) {
     }
     $cursorCfg | ConvertTo-Json -Depth 5 | Set-Content -Path $CursorConfigPath -Encoding UTF8
     Write-Host "  OK .cursor/mcp.json written" -ForegroundColor Green
-    Write-Host "  Note: Cursor MCP tools available. Automatic session tracking requires Claude Code or Codex." -ForegroundColor Yellow
+    Write-Host "  Note: Cursor MCP tools available. Auto session tracking requires Claude Code or Codex." -ForegroundColor Yellow
 }
 
 # ---- Step 9: Smoke test ----------------------------------------------------------
@@ -249,15 +279,13 @@ try {
     if ($r.StatusCode -eq 200) { $testOk = $true }
 } catch {}
 if ($testOk) {
-    Write-Host "  OK hook responded successfully" -ForegroundColor Green
+    Write-Host "  OK hook test passed" -ForegroundColor Green
 } else {
     Write-Host "  WARNING: hook test returned non-200 (hooks still installed)" -ForegroundColor Yellow
 }
 
 # ---- Done ------------------------------------------------------------------------
 Write-Host ""
-$displayName = if ($ProjectName) { "'$ProjectName'" } else { $ProjectId }
 Write-Host "Done. Hooks installed for $MeridianUrl." -ForegroundColor Green
 Write-Host "Restart Claude Code to activate."
 Write-Host ""
-
