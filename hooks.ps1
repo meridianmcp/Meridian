@@ -257,10 +257,10 @@ if ($ClaudeDetected) {
         $settings | Add-Member -NotePropertyName "hooks" -NotePropertyValue ([PSCustomObject]@{})
     }
     $settings.hooks | Add-Member -NotePropertyName "SessionStart" -NotePropertyValue @(
-        [PSCustomObject]@{ matcher = ""; hooks = @([PSCustomObject]@{ type = "command"; command = $startCmd }) }
+        [PSCustomObject]@{ matcher = ""; hooks = @([PSCustomObject]@{ type = "command"; command = $startCmd; shell = "powershell" }) }
     ) -Force
     $settings.hooks | Add-Member -NotePropertyName "Stop" -NotePropertyValue @(
-        [PSCustomObject]@{ matcher = ""; hooks = @([PSCustomObject]@{ type = "command"; command = $stopCmd }) }
+        [PSCustomObject]@{ matcher = ""; hooks = @([PSCustomObject]@{ type = "command"; command = $stopCmd; shell = "powershell" }) }
     ) -Force
     $settings | ConvertTo-Json -Depth 10 | Set-Content $ClaudeSettingsPath -Encoding UTF8
     Write-Host "  OK SessionStart + Stop hooks written" -ForegroundColor Green
