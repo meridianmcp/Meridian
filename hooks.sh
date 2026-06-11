@@ -6,14 +6,12 @@
 #   bash hooks.sh
 #   bash hooks.sh --url http://localhost:7878 --project-id your-project-id
 #
-# Writes .meridian/config to the current directory and installs GENERIC hooks
-# in ~/.claude/settings.json. Hooks read .meridian/config at fire time, so
-# they follow the project regardless of which repo directory you're in.
+# Installs Claude Code, Codex, and Cursor integrations. Credentials are embedded
+# directly in hook commands — no per-repo config file required.
 #
-# Requirements: curl, jq (for Claude Code JSON editing)
+# Requirements: curl, jq
 set -euo pipefail
 
-# ---- Defaults ----------------------------------------------------------------
 DEFAULT_URL="https://usemeridian.us"
 MERIDIAN_URL=""
 PROJECT_ID=""
@@ -99,12 +97,14 @@ fi
 # ---- Step 3: Project selection -----------------------------------------------
 PROJECT_NAME=""
 if [[ -z "$PROJECT_ID" ]]; then
-  PROJECTS="[]"
+  ME_DATA="{}"
   if [[ -n "$TOKEN" ]]; then
-    PROJECTS=$(curl -sf --max-time 10 \
-      -H "Authorization: Bearer $TOKEN" \
-      "$MERIDIAN_URL/auth/me" 2>/dev/null | jq -r '.projects // []' 2>/dev/null || echo "[]")
+    ME_DATA=$(curl -sf --max-time 10 -H "Authorization: Bearer $TOKEN" \
+      "$MERIDIAN_URL/auth/me" 2>/dev/null || echo "{}")
+  elif [[ $IS_LOCAL -eq 1 ]]; then
+    ME_DATA=$(curl -sf --max-time 10 "$MERIDIAN_URL/auth/me" 2>/dev/null || echo "{}")
   fi
+  PROJECTS=$(echo "$ME_DATA" | jq '.projects // []' 2>/dev/null || echo "[]")
   COUNT=$(echo "$PROJECTS" | jq 'length' 2>/dev/null || echo "0")
   if [[ "$COUNT" -gt 0 ]]; then
     echo ""
@@ -128,7 +128,7 @@ if [[ -z "$PROJECT_ID" ]]; then
   exit 1
 fi
 
-# ---- Step 4: Generate permanent token (if using short-lived install token) ---
+# ---- Step 4: Generate permanent token ----------------------------------------
 if [[ $IS_LOCAL -eq 0 ]] && [[ -n "$TOKEN" ]]; then
   PERM=$(curl -sf --max-time 10 -X POST \
     -H "Authorization: Bearer $TOKEN" \
@@ -142,54 +142,21 @@ if [[ $IS_LOCAL -eq 0 ]] && [[ -n "$TOKEN" ]]; then
   fi
 fi
 
-# ---- Step 5: Write .meridian/config ------------------------------------------
-CONFIG_DIR="$(pwd)/.meridian"
-CONFIG_FILE="$CONFIG_DIR/config"
-
-if [[ -f "$CONFIG_FILE" ]]; then
-  read -rp ".meridian/config already exists. Update? [y/N]: " OVERWRITE
-  if [[ ! "$OVERWRITE" =~ ^[Yy] ]]; then
-    echo "Skipping config write."
-  else
-    mkdir -p "$CONFIG_DIR"
-    cat > "$CONFIG_FILE" <<EOF
-url=$MERIDIAN_URL
-token=$TOKEN
-project_id=$PROJECT_ID
-EOF
-    echo "  Config written to $CONFIG_FILE"
-  fi
+# ---- Step 5: Build hook commands (cwd + hostname read at fire time) ----------
+if [[ -n "$TOKEN" ]]; then
+  START_CMD="curl -s -X POST -H 'Authorization: Bearer ${TOKEN}' -H 'Content-Type: application/json' -d \"{\\\"project_id\\\":\\\"${PROJECT_ID}\\\",\\\"cwd\\\":\\\"\$PWD\\\",\\\"hostname\\\":\\\"\$(hostname)\\\"}\" '${MERIDIAN_URL}/hooks/session-start' | jq -r '.hookSpecificOutput.additionalContext // empty' 2>/dev/null"
+  STOP_CMD="curl -s -X POST -H 'Authorization: Bearer ${TOKEN}' -H 'Content-Type: application/json' -d \"{\\\"project_id\\\":\\\"${PROJECT_ID}\\\",\\\"hostname\\\":\\\"\$(hostname)\\\"}\" '${MERIDIAN_URL}/hooks/stop' >/dev/null 2>&1"
 else
-  mkdir -p "$CONFIG_DIR"
-  cat > "$CONFIG_FILE" <<EOF
-url=$MERIDIAN_URL
-token=$TOKEN
-project_id=$PROJECT_ID
-EOF
-  echo "  Config written to $CONFIG_FILE"
+  START_CMD="curl -s -X POST -H 'Content-Type: application/json' -d \"{\\\"project_id\\\":\\\"${PROJECT_ID}\\\",\\\"cwd\\\":\\\"\$PWD\\\",\\\"hostname\\\":\\\"\$(hostname)\\\"}\" '${MERIDIAN_URL}/hooks/session-start' | jq -r '.hookSpecificOutput.additionalContext // empty' 2>/dev/null"
+  STOP_CMD="curl -s -X POST -H 'Content-Type: application/json' -d \"{\\\"project_id\\\":\\\"${PROJECT_ID}\\\",\\\"hostname\\\":\\\"\$(hostname)\\\"}\" '${MERIDIAN_URL}/hooks/stop' >/dev/null 2>&1"
 fi
 
-# ---- Add .meridian/ to .gitignore --------------------------------------------
-GITIGNORE="$(pwd)/.gitignore"
-if [[ -f "$GITIGNORE" ]]; then
-  if ! grep -qF ".meridian/" "$GITIGNORE"; then
-    printf '\n.meridian/\n' >> "$GITIGNORE"
-    echo "  Added .meridian/ to .gitignore"
-  fi
-else
-  echo ".meridian/" > "$GITIGNORE"
-  echo "  Created .gitignore with .meridian/"
-fi
-
-# ---- Step 6: Write generic hooks to ~/.claude/settings.json ------------------
+# ---- Step 6: Write hooks to ~/.claude/settings.json -------------------------
 SETTINGS_PATH="${HOME}/.claude/settings.json"
 CLAUDE_DETECTED=0
 if command -v claude &>/dev/null || [[ -f "$SETTINGS_PATH" ]]; then
   CLAUDE_DETECTED=1
 fi
-
-START_CMD='if [ -f "$(pwd)/.meridian/config" ]; then . "$(pwd)/.meridian/config"; curl -s -X POST -H "Authorization: Bearer $token" -H "Content-Type: application/json" -d "{\"project_id\":\"$project_id\",\"cwd\":\"$PWD\"}" "$url/hooks/session-start" | jq -r '"'"'.hookSpecificOutput.additionalContext // empty'"'"' 2>/dev/null; fi'
-STOP_CMD='if [ -f "$(pwd)/.meridian/config" ]; then . "$(pwd)/.meridian/config"; curl -s -X POST -H "Authorization: Bearer $token" -H "Content-Type: application/json" -d "{\"project_id\":\"$project_id\"}" "$url/hooks/stop" > /dev/null; fi'
 
 if [[ $CLAUDE_DETECTED -eq 1 ]]; then
   echo ""
@@ -211,14 +178,76 @@ if [[ $CLAUDE_DETECTED -eq 1 ]]; then
   echo "  OK SessionStart + Stop hooks written"
 fi
 
-# ---- Step 7: Smoke test ------------------------------------------------------
+# ---- Step 7: Codex detection + config.toml -----------------------------------
+CODEX_DETECTED=0
+if command -v codex &>/dev/null || [[ -d "${HOME}/.codex" ]]; then
+  CODEX_DETECTED=1
+fi
+
+if [[ $CODEX_DETECTED -eq 1 ]]; then
+  echo ""
+  echo "Codex detected — writing MCP config to ~/.codex/config.toml"
+  mkdir -p "${HOME}/.codex"
+  CODEX_CONFIG="${HOME}/.codex/config.toml"
+
+  AUTH_LINE=""
+  if [[ -n "$TOKEN" ]]; then
+    AUTH_LINE=$'\napi_key = "'"$TOKEN"'"'
+  fi
+
+  # jq -Rs encodes the command as a JSON string, then strip outer quotes
+  START_TOML=$(printf '%s' "$START_CMD" | jq -Rs '.[0:-1]')  # remove trailing newline via -s then strip
+  STOP_TOML=$(printf '%s' "$STOP_CMD"  | jq -Rs '.[0:-1]')
+
+  NEW_BLOCK="
+[mcp_servers.meridian]
+type = \"http\"
+url = \"${MERIDIAN_URL}/mcp\"${AUTH_LINE}
+
+[hooks]
+session_start = ${START_TOML}
+stop = ${STOP_TOML}"
+
+  if [[ -f "$CODEX_CONFIG" ]]; then
+    # Strip old meridian/hooks blocks and append new ones
+    perl -0777 -i -pe 's/\[mcp_servers\.meridian\].*?(?=\n\[|\z)//gs; s/\[hooks\].*?(?=\n\[|\z)//gs' "$CODEX_CONFIG" 2>/dev/null || true
+    printf '%s\n' "$NEW_BLOCK" >> "$CODEX_CONFIG"
+  else
+    printf '%s\n' "${NEW_BLOCK#$'\n'}" > "$CODEX_CONFIG"
+  fi
+  echo "  OK MCP config written to $CODEX_CONFIG"
+fi
+
+# ---- Step 8: Cursor detection + .cursor/mcp.json ----------------------------
+CURSOR_DETECTED=0
+if command -v cursor &>/dev/null || [[ -d "${HOME}/.cursor" ]]; then
+  CURSOR_DETECTED=1
+fi
+
+if [[ $CURSOR_DETECTED -eq 1 ]]; then
+  echo ""
+  echo "Cursor detected — writing .cursor/mcp.json in current directory"
+  mkdir -p ".cursor"
+  if [[ -n "$TOKEN" ]]; then
+    CURSOR_JSON=$(jq -n --arg url "${MERIDIAN_URL}/mcp" --arg tok "$TOKEN" \
+      '{"mcpServers":{"meridian":{"url":$url,"headers":{"Authorization":("Bearer "+$tok)}}}}')
+  else
+    CURSOR_JSON=$(jq -n --arg url "${MERIDIAN_URL}/mcp" \
+      '{"mcpServers":{"meridian":{"url":$url}}}')
+  fi
+  echo "$CURSOR_JSON" > ".cursor/mcp.json"
+  echo "  OK .cursor/mcp.json written"
+  echo "  Note: Cursor MCP tools available. Automatic session tracking requires Claude Code or Codex."
+fi
+
+# ---- Step 9: Smoke test -------------------------------------------------------
 echo ""
 echo "Testing hook..."
 TEST_ARGS=(-s -X POST -H "Content-Type: application/json")
 if [[ -n "$TOKEN" ]]; then
   TEST_ARGS+=(-H "Authorization: Bearer $TOKEN")
 fi
-TEST_BODY="{\"project_id\":\"$PROJECT_ID\",\"cwd\":\"$PWD\"}"
+TEST_BODY="{\"project_id\":\"$PROJECT_ID\",\"cwd\":\"$PWD\",\"hostname\":\"$(hostname)\"}"
 HTTP_STATUS=$(curl -o /dev/null -w "%{http_code}" --max-time 10 \
   "${TEST_ARGS[@]}" -d "$TEST_BODY" "$MERIDIAN_URL/hooks/session-start" 2>/dev/null || echo "0")
 if [[ "$HTTP_STATUS" == "200" ]]; then
@@ -234,5 +263,5 @@ if [[ -n "$PROJECT_NAME" ]]; then
 else
   echo "Done. Hooks installed for project $PROJECT_ID."
 fi
-echo "Start a new Claude Code session to activate."
+echo "Restart Claude Code to activate."
 echo ""

@@ -367,6 +367,15 @@ CREATE TABLE IF NOT EXISTS oauth_codes (
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+CREATE TABLE IF NOT EXISTS device_codes (
+    device_code TEXT PRIMARY KEY,
+    user_code TEXT NOT NULL UNIQUE,
+    tenant_id TEXT,
+    expires_at TEXT NOT NULL,
+    approved INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 -- v2.1 dark — multi-user roles, not exposed in UI or API at launch
 -- G5.19/G5.20 — role widened to include 'admin'; github_access caps
 -- repo-touching MCP tools per invitee. App layer (meridian.roles) is the
@@ -1612,6 +1621,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_api_token_type(db)
     await _migrate_api_tokens_expires_at(db)
     await _migrate_oauth_codes_table(db)
+    await _migrate_device_codes_table(db)
     await _migrate_github_to_projects(db)
     return db
 
@@ -1687,6 +1697,21 @@ async def _migrate_oauth_codes_table(db: aiosqlite.Connection) -> None:
             redirect_uri TEXT NOT NULL,
             code_challenge TEXT NOT NULL,
             expires_at TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )"""
+    )
+    await db.commit()
+
+
+async def _migrate_device_codes_table(db: aiosqlite.Connection) -> None:
+    """RFC 8628 device authorization flow — device_codes table."""
+    await db.execute(
+        """CREATE TABLE IF NOT EXISTS device_codes (
+            device_code TEXT PRIMARY KEY,
+            user_code TEXT NOT NULL UNIQUE,
+            tenant_id TEXT,
+            expires_at TEXT NOT NULL,
+            approved INTEGER NOT NULL DEFAULT 0,
             created_at TEXT NOT NULL DEFAULT (datetime('now'))
         )"""
     )
