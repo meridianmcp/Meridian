@@ -852,6 +852,11 @@ async def _migrate_ntfy_notifications(db: aiosqlite.Connection) -> None:
     await _migrate_add_column_if_missing(db, "projects", "ntfy_url", "TEXT")
 
 
+async def _migrate_notify_email(db: aiosqlite.Connection) -> None:
+    """v2.5.1 — projects.notify_email: separate email column for notifications."""
+    await _migrate_add_column_if_missing(db, "projects", "notify_email", "TEXT")
+
+
 async def _migrate_github_integration(db: aiosqlite.Connection) -> None:
     """v3.1 — per-tenant GitHub PAT and repo for the GitHub MCP tools.
 
@@ -1611,6 +1616,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_file_locks(db)
     await _migrate_milestone_type(db)
     await _migrate_ntfy_notifications(db)
+    await _migrate_notify_email(db)
     await _migrate_github_integration(db)
     await _migrate_workspace_layer(db)
     await _migrate_checkpoint_data(db)
@@ -2093,6 +2099,30 @@ async def set_project_ntfy_url(
     await db.execute(
         "UPDATE projects SET ntfy_url = ? WHERE id = ?",
         (ntfy_url or None, project_id),
+    )
+    await db.commit()
+
+
+async def get_project_notify_email(
+    db: aiosqlite.Connection, project_id: str
+) -> str | None:
+    """Return the notify_email for a project, or None if not set."""
+    async with db.execute(
+        "SELECT notify_email FROM projects WHERE id = ?", (project_id,)
+    ) as cur:
+        row = await cur.fetchone()
+    if row is None:
+        return None
+    return row["notify_email"] or None
+
+
+async def set_project_notify_email(
+    db: aiosqlite.Connection, project_id: str, notify_email: str | None
+) -> None:
+    """Save (or clear) the notify_email for a project."""
+    await db.execute(
+        "UPDATE projects SET notify_email = ? WHERE id = ?",
+        (notify_email or None, project_id),
     )
     await db.commit()
 

@@ -429,6 +429,7 @@ CREATE TABLE IF NOT EXISTS projects (
     goal_mode TEXT NOT NULL DEFAULT 'manual',
     decisions TEXT,
     ntfy_url TEXT,
+    notify_email TEXT,
     max_pinned_decisions INTEGER NOT NULL DEFAULT 20,
     executor_config TEXT,
     rewind_token TEXT,
@@ -854,6 +855,7 @@ async def init_pg_db(url: str) -> PostgresConnection:
     await _migrate_pg_goal_field_timestamps(conn)
     await _migrate_pg_v24_task_tree_and_framework(conn)
     await _migrate_pg_project_settings(conn)
+    await _migrate_pg_notify_email(conn)
     await _migrate_pg_file_locks(conn)
     await _migrate_pg_task_sprint_link(conn)
     await _migrate_pg_v26_client_type(conn)
@@ -1055,6 +1057,31 @@ async def set_project_ntfy_url(
     await db.commit()
 
 
+async def get_project_notify_email(
+    db: PostgresConnection, project_id: str
+) -> str | None:
+    """Return the notify_email for a Postgres-backed project, or None if unset."""
+    async with db.execute(
+        "SELECT notify_email FROM projects WHERE id = ?",
+        (project_id,),
+    ) as cur:
+        row = await cur.fetchone()
+    if row is None:
+        return None
+    return row["notify_email"] or None
+
+
+async def set_project_notify_email(
+    db: PostgresConnection, project_id: str, notify_email: str | None
+) -> None:
+    """Persist or clear the notify_email on a Postgres-backed project."""
+    await db.execute(
+        "UPDATE projects SET notify_email = ? WHERE id = ?",
+        (notify_email or None, project_id),
+    )
+    await db.commit()
+
+
 async def _migrate_pg_v09_notes_and_magic_links(conn: PostgresConnection) -> None:
     """v0.9 — project_notes + magic_link_tokens on existing Postgres DBs.
     CREATE_TABLES_PG covers fresh DBs; this is the upgrade path."""
@@ -1123,6 +1150,13 @@ async def _migrate_pg_project_settings(conn: PostgresConnection) -> None:
         "ALTER TABLE projects ADD COLUMN IF NOT EXISTS max_pinned_decisions INTEGER NOT NULL DEFAULT 20;"
         "ALTER TABLE projects ADD COLUMN IF NOT EXISTS executor_config TEXT;"
         "ALTER TABLE projects ADD COLUMN IF NOT EXISTS ntfy_url TEXT"
+    )
+
+
+async def _migrate_pg_notify_email(conn: PostgresConnection) -> None:
+    """v2.5.1 — add notify_email column to projects for separate email notifications."""
+    await conn.executescript(
+        "ALTER TABLE projects ADD COLUMN IF NOT EXISTS notify_email TEXT"
     )
 
 

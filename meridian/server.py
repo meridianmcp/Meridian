@@ -1790,63 +1790,115 @@ async def _ensure_unique_ntfy_topic(
     return candidate
 
 
+@app.get("/projects/{project_id}/ntfy")
+async def get_project_ntfy(
+    project_id: str, request: Request
+) -> dict[str, Any]:
+    """Return the current notification settings for this project."""
+    project = await db_module.get_project(await _db(request), project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="project not found")
+    db = await _db(request)
+    notify_url = await db_module.get_project_ntfy_url(db, project_id)
+    notify_email = await db_module.get_project_notify_email(db, project_id)
+    return {
+        "ntfy_url": notify_url or "",
+        "notify_url": notify_url or "",
+        "notify_email": notify_email or "",
+    }
+
+
 @app.patch("/projects/{project_id}/ntfy")
 async def set_project_ntfy(
     project_id: str, body: dict[str, Any], request: Request
 ) -> dict[str, Any]:
-    """Save (or clear) the notify URL for this project.
+    """Save (or clear) the notify URL and/or notify_email for this project.
 
-    Accepts ``notify_url`` (preferred) or ``ntfy_url`` (legacy) key.
+    Accepts ``notify_url`` (preferred) or ``ntfy_url`` (legacy) key for the
+    ntfy/webhook channel, and ``notify_email`` for the email channel.
     ntfy entries are canonicalized to the topic path segment only and
     suffixed with -2/-3/… if another project in this DB already uses
     the same topic. Emails and non-ntfy webhooks pass through verbatim.
 
-    After saving a non-empty value, fires a welcome notification so
+    After saving a non-empty notify_url, fires a welcome notification so
     ntfy.sh topics are created on first publish (avoids 404 on first
     real alert).
     """
     project = await db_module.get_project(await _db(request), project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="project not found")
-    # Accept both the new canonical key and the legacy key for backwards compat
-    raw_value = str(body.get("notify_url") or body.get("ntfy_url") or "").strip() or None
-    notify_url = _canonicalize_notify_target(raw_value)
     db = await _db(request)
-    if notify_url and "://" not in notify_url and "@" not in notify_url:
-        # bare topic → enforce per-DB uniqueness
-        notify_url = await _ensure_unique_ntfy_topic(db, project_id, notify_url)
-    await db_module.set_project_ntfy_url(db, project_id, notify_url)
-    if notify_url:
-        # Fire a welcome notification immediately so ntfy.sh creates the topic
-        # (topics are auto-created on first publish; GET before any publish = 404)
-        await _notify_project(
-            db, project_id,
-            "Notifications active",
-            "You will receive alerts here for HITL requests and sprint completions.",
-            event="setup",
-        )
-    return {"ntfy_url": notify_url or "", "notify_url": notify_url or ""}
+    # Handle ntfy_url / webhook channel
+    if "notify_url" in body or "ntfy_url" in body:
+        raw_value = str(body.get("notify_url") or body.get("ntfy_url") or "").strip() or None
+        notify_url = _canonicalize_notify_target(raw_value)
+        if notify_url and "://" not in notify_url and "@" not in notify_url:
+            # bare topic → enforce per-DB uniqueness
+            notify_url = await _ensure_unique_ntfy_topic(db, project_id, notify_url)
+        await db_module.set_project_ntfy_url(db, project_id, notify_url)
+        if notify_url:
+            # Fire a welcome notification immediately so ntfy.sh creates the topic
+            try:
+                ntfy_full = notify_url
+                if "://" not in ntfy_full and "@" not in ntfy_full:
+                    ntfy_full = f"https://ntfy.sh/{ntfy_full}"
+                await _dispatch_notification(
+                    ntfy_full,
+                    "Notifications active",
+                    "You will receive alerts here for HITL requests and sprint completions.",
+                    event="setup",
+                )
+            except Exception:  # noqa: BLE001
+                pass
+    else:
+        notify_url = await db_module.get_project_ntfy_url(db, project_id)
+    # Handle notify_email channel
+    if "notify_email" in body:
+        raw_email = str(body.get("notify_email") or "").strip() or None
+        await db_module.set_project_notify_email(db, project_id, raw_email)
+        notify_email = raw_email
+    else:
+        notify_email = await db_module.get_project_notify_email(db, project_id)
+    return {
+        "ntfy_url": notify_url or "",
+        "notify_url": notify_url or "",
+        "notify_email": notify_email or "",
+    }
 
 
 @app.post("/projects/{project_id}/notify/test")
 async def test_project_notification(
     project_id: str, request: Request
 ) -> dict[str, Any]:
-    """Send a test notification to verify the configured notify URL."""
+    """Send a test notification to verify the configured notify URL and/or email."""
     project = await db_module.get_project(await _db(request), project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="project not found")
     db = await _db(request)
     notify_url = await db_module.get_project_ntfy_url(db, project_id)
-    if not notify_url:
-        raise HTTPException(status_code=400, detail="No notify URL configured for this project")
-    await _dispatch_notification(
-        notify_url,
-        "Meridian test notification",
-        "Test from the Meridian dashboard. If you see this, notifications are working!",
-        event="test",
-    )
-    return {"ok": True, "notify_url": notify_url}
+    notify_email = await db_module.get_project_notify_email(db, project_id)
+    if not notify_url and not notify_email:
+        raise HTTPException(status_code=400, detail="No notify URL or email configured for this project")
+    sent_to = []
+    if notify_url:
+        ntfy_full = notify_url
+        if "://" not in ntfy_full and "@" not in ntfy_full:
+            ntfy_full = f"https://ntfy.sh/{ntfy_full}"
+        await _dispatch_notification(
+            ntfy_full,
+            "Meridian test notification",
+            "Test from the Meridian dashboard. If you see this, notifications are working!",
+            event="test",
+        )
+        sent_to.append(notify_url)
+    if notify_email:
+        await _send_email_notification(
+            notify_email,
+            "[Meridian] Test notification",
+            "Test from the Meridian dashboard. If you see this, email notifications are working!",
+        )
+        sent_to.append(notify_email)
+    return {"ok": True, "sent_to": sent_to}
 
 
 async def _send_email_notification(to_email: str, subject: str, body_text: str) -> None:
@@ -2006,19 +2058,30 @@ async def _dispatch_notification(
 async def _notify_project(
     db: Any, project_id: str, title: str, body_text: str, event: str = "notification"
 ) -> None:
-    """Best-effort notification for a project.  Silently ignores all errors."""
+    """Best-effort notification for a project.  Silently ignores all errors.
+
+    Fires to ntfy_url AND notify_email independently — both are tried even if
+    one fails.
+    """
+    # ntfy_url / webhook channel
     try:
         notify_url = await db_module.get_project_ntfy_url(db, project_id)
-        if not notify_url:
-            return
-        # G1.7 — stored ntfy values are topic-only; reconstruct the full URL
-        # at dispatch time. Anything else (email / non-ntfy webhook) is
-        # already in its dispatchable form.
-        if "://" not in notify_url and "@" not in notify_url:
-            notify_url = f"https://ntfy.sh/{notify_url}"
-        await _dispatch_notification(notify_url, title, body_text, event)
+        if notify_url:
+            # G1.7 — stored ntfy values are topic-only; reconstruct the full URL
+            # at dispatch time. Anything else (email / non-ntfy webhook) is
+            # already in its dispatchable form.
+            if "://" not in notify_url and "@" not in notify_url:
+                notify_url = f"https://ntfy.sh/{notify_url}"
+            await _dispatch_notification(notify_url, title, body_text, event)
     except Exception:  # noqa: BLE001
-        pass  # never let notifications crash the main flow
+        pass
+    # notify_email channel — fired independently so ntfy failure doesn't block email
+    try:
+        notify_email = await db_module.get_project_notify_email(db, project_id)
+        if notify_email:
+            await _send_email_notification(notify_email, f"[Meridian] {title}", body_text)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 async def _on_hitl_answered(

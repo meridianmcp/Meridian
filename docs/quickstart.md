@@ -258,6 +258,89 @@ get_tasks(project_id="...", limit=20)
 
 ---
 
+## Casual user path (no CLI required)
+
+Not running Claude Code? Meridian works entirely from the browser via the
+[Browser Connector](browser-connector.md).
+
+**1 — Connect on claude.ai**
+
+Open **Customize > Connectors** and add:
+- Hosted: `https://usemeridian.us/mcp`
+- Self-hosted: your public HTTPS URL (see [self-hosting](self-hosting.md))
+
+**2 — Start a session in chat**
+
+```
+start_session(project_id="<your-project-id>", session_name="planning-2026-06")
+get_context_block(project_id="<your-project-id>", mode="chat")
+```
+
+**3 — Work inline with MCP tools**
+
+Log decisions and notes as you chat:
+
+```
+pin_decision(project_id="...", title="Use psycopg3", body="asyncpg has DLL issues on Windows", category="TECHNICAL")
+log_task(session_id="...", project_id="...", description="Reviewed auth refactor plan")
+add_note(session_id="...", project_id="...", title="Design notes", body="...")
+```
+
+**4 — Save progress before ending**
+
+```
+checkpoint(session_id="...", project_id="...")
+```
+
+**5 — Hand off to the next session**
+
+```
+generate_handoff(project_id="...", mode="delta")
+```
+
+Paste the handoff at the start of the next chat. That's the full lightweight loop —
+no local server, no terminal, full session continuity.
+
+---
+
+## Lightweight workflow (hosted tier)
+
+Skip the install entirely. The hosted tier at [usemeridian.us](https://usemeridian.us) gives you a
+managed Meridian instance — sign in with Google or GitHub, paste the `.mcp.json` snippet from your
+welcome email, and you're coordinating in minutes.
+
+For browser-based clients (Claude.ai, ChatGPT), the [Browser Connector](browser-connector.md) needs
+no config files at all — just add your MCP URL in the client's connector settings.
+
+**Minimal session pattern — paste at the start of every chat:**
+
+```
+start_session(project_id="<your-id>", session_name="what-youre-doing")
+```
+
+**Log work as you complete it:**
+
+```
+log_task(session_id="...", project_id="...", description="Fixed auth redirect bug")
+```
+
+**Before context fills or before ending:**
+
+```
+checkpoint(session_id="...", project_id="...")
+```
+
+**Start the next session with full context:**
+
+```
+generate_handoff(project_id="...", mode="delta")
+```
+
+Paste the handoff block at the top of the next chat. That's the whole workflow — four tools, no
+local server, full session continuity.
+
+---
+
 ## Troubleshooting
 
 ### MCP tools not showing up in Claude Code

@@ -4340,6 +4340,8 @@ function buildTabBody(project) {
 
         p.activeVtab = vtab;
 
+        try { localStorage.setItem('meridian_last_tab_' + project.id, vtab); } catch(_) {}
+
         if (vtab === 'files') loadFilesTab(project.id);
 
         if (vtab === 'devlog') refreshTasks(project.id);
@@ -4389,6 +4391,15 @@ function buildTabBody(project) {
       };
 
     });
+
+    // Restore last active vtab from localStorage
+    try {
+      const saved = localStorage.getItem('meridian_last_tab_' + project.id);
+      if (saved) {
+        const savedBtn = vtabStrip.querySelector('.vtab-btn[data-vtab="' + saved + '"]');
+        if (savedBtn) savedBtn.click();
+      }
+    } catch(_) {}
 
   }
 
@@ -6844,33 +6855,192 @@ function renderTimeline(projectId, data) {
 
 
 
-  // [Heatmap] [Detail] sub-tabs. Heatmap (contribution calendar) is the
+  // [Heatmap] [Detail] sub-tabs + [By Sprint/Tasks/Sprints only] view switcher.
+  // View switcher is a dropdown added next to the sub-tabs.
 
-  // default primary view; Detail holds the per-session ECharts gantt.
+  const savedTlView = (() => { try { return localStorage.getItem('meridian_tl_view_' + projectId) || 'heatmap'; } catch(_) { return 'heatmap'; } })();
 
   wrap.innerHTML = `
 
-    <div class="tl-subtabs">
+    <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:4px">
 
-      <button class="tl-subtab active" data-sub="heatmap">Heatmap</button>
+      <div class="tl-subtabs" style="margin-bottom:0">
 
-      <button class="tl-subtab" data-sub="detail">Detail</button>
+        <button class="tl-subtab${savedTlView === 'heatmap' ? ' active' : ''}" data-sub="heatmap">Heatmap</button>
+
+        <button class="tl-subtab${savedTlView === 'detail' ? ' active' : ''}" data-sub="detail">Detail</button>
+
+      </div>
+
+      <select id="tl-view-select-${projectId}" style="padding:3px 6px;background:var(--surface-2);border:1px solid var(--border);color:var(--text);border-radius:4px;font-size:10px;font-family:var(--font-mono);cursor:pointer" title="Timeline grouping mode">
+
+        <option value="heatmap"${savedTlView === 'heatmap' ? ' selected' : ''}>By Heatmap</option>
+
+        <option value="detail"${savedTlView === 'detail' ? ' selected' : ''}>By Session</option>
+
+        <option value="tasks"${savedTlView === 'tasks' ? ' selected' : ''}>Tasks</option>
+
+        <option value="sprints"${savedTlView === 'sprints' ? ' selected' : ''}>Sprints only</option>
+
+        <option value="by-sprint"${savedTlView === 'by-sprint' ? ' selected' : ''}>By Sprint</option>
+
+      </select>
 
     </div>
 
-    <div class="tl-pane active" id="tl-pane-heatmap-${projectId}"></div>
+    <div class="tl-pane${savedTlView === 'heatmap' || savedTlView === 'detail' ? ' active' : ''}" id="tl-pane-heatmap-${projectId}"${savedTlView !== 'heatmap' ? ' style="display:none"' : ''}></div>
 
-    <div class="tl-pane" id="tl-pane-detail-${projectId}" style="display:none"></div>`;
+    <div class="tl-pane" id="tl-pane-detail-${projectId}" style="display:${savedTlView === 'detail' ? '' : 'none'}"></div>
+
+    <div id="tl-pane-tasks-${projectId}" style="display:${savedTlView === 'tasks' ? '' : 'none'}"></div>
+
+    <div id="tl-pane-sprints-${projectId}" style="display:${savedTlView === 'sprints' || savedTlView === 'by-sprint' ? '' : 'none'}"></div>`;
 
   const heatPane = document.getElementById(`tl-pane-heatmap-${projectId}`);
 
   const detailPane = document.getElementById(`tl-pane-detail-${projectId}`);
+
+  const tasksPane = document.getElementById(`tl-pane-tasks-${projectId}`);
+
+  const sprintsPane = document.getElementById(`tl-pane-sprints-${projectId}`);
+
+
+
+  const _renderTasksFlat = () => {
+
+    const { tasks = [] } = data || {};
+
+    if (!tasks.length) { tasksPane.innerHTML = `<div class="timeline-empty">no tasks logged yet</div>`; return; }
+
+    tasksPane.innerHTML = tasks.map(t => {
+
+      const ts = (t.created_at || '').slice(0, 16).replace('T', ' ');
+
+      const who = t.human_id || t.session_name || '';
+
+      const status = (t.status || '').toUpperCase();
+
+      return `<div style="padding:5px 8px;border-bottom:1px solid var(--border);display:flex;gap:8px;align-items:baseline">
+
+        <span style="font-size:9px;color:var(--muted);white-space:nowrap;min-width:100px">${escapeHtml(ts)}</span>
+
+        ${who ? `<span style="font-size:9px;color:var(--accent);white-space:nowrap">${escapeHtml(who)}</span>` : ''}
+
+        <span style="font-size:10px;color:var(--muted);white-space:nowrap">[${escapeHtml(status)}]</span>
+
+        <span style="font-size:11px;color:var(--text);word-break:break-word">${escapeHtml(t.description || '')}</span>
+
+      </div>`;
+
+    }).join('');
+
+  };
+
+
+
+  const _renderSprintsView = (groupBySprint) => {
+
+    api(`/projects/${projectId}/sprint-items?status=done`).then(items => {
+
+      const done = (items || []).filter(it => it.status === 'done').sort((a,b) =>
+
+        String(b.completed_at || b.added_at || '').localeCompare(String(a.completed_at || a.added_at || '')));
+
+      if (!done.length) { sprintsPane.innerHTML = `<div class="timeline-empty">no completed sprint items</div>`; return; }
+
+      if (groupBySprint) {
+
+        const groups = {};
+
+        done.forEach(it => {
+
+          const key = it.version || it.item_group || '(unversioned)';
+
+          (groups[key] = groups[key] || []).push(it);
+
+        });
+
+        sprintsPane.innerHTML = Object.entries(groups).map(([grp, items]) =>
+
+          `<div style="margin-bottom:12px">
+
+            <div style="font-size:10px;font-weight:700;color:var(--accent);text-transform:uppercase;letter-spacing:.04em;padding:4px 0;border-bottom:1px solid var(--border);margin-bottom:4px">${escapeHtml(grp)} (${items.length})</div>
+
+            ${items.map(it => `<div style="padding:3px 0;font-size:11px;color:var(--text);display:flex;gap:8px"><span style="font-size:9px;color:var(--muted);white-space:nowrap;min-width:70px">${escapeHtml((it.completed_at || it.added_at || '').slice(0,10))}</span><span>${escapeHtml(it.title || '')}</span></div>`).join('')}
+
+          </div>`
+
+        ).join('');
+
+      } else {
+
+        sprintsPane.innerHTML = done.map(it =>
+
+          `<div style="padding:4px 0;font-size:11px;color:var(--text);display:flex;gap:8px;border-bottom:1px solid var(--border)33">
+
+            <span style="font-size:9px;color:var(--muted);white-space:nowrap;min-width:70px">${escapeHtml((it.completed_at || it.added_at || '').slice(0,10))}</span>
+
+            ${it.version ? `<span style="font-size:9px;color:var(--accent)">${escapeHtml(it.version)}</span>` : ''}
+
+            <span>${escapeHtml(it.title || '')}</span>
+
+          </div>`
+
+        ).join('');
+
+      }
+
+    }).catch(e => { sprintsPane.innerHTML = `<div class="timeline-empty">failed: ${escapeHtml(e.message)}</div>`; });
+
+  };
 
 
 
   _renderTimelineHeatmap(projectId, data, heatPane);
 
   _renderTimelineGantt(projectId, data, detailPane);
+
+  if (savedTlView === 'tasks') _renderTasksFlat();
+
+  if (savedTlView === 'sprints') _renderSprintsView(false);
+
+  if (savedTlView === 'by-sprint') _renderSprintsView(true);
+
+
+
+  const viewSelect = document.getElementById(`tl-view-select-${projectId}`);
+
+  if (viewSelect) {
+
+    viewSelect.onchange = () => {
+
+      const view = viewSelect.value;
+
+      try { localStorage.setItem('meridian_tl_view_' + projectId, view); } catch(_) {}
+
+      wrap.querySelectorAll('.tl-subtab').forEach(b => b.classList.toggle('active', b.dataset.sub === view));
+
+      heatPane.style.display = view === 'heatmap' ? '' : 'none';
+
+      detailPane.style.display = view === 'detail' ? '' : 'none';
+
+      tasksPane.style.display = view === 'tasks' ? '' : 'none';
+
+      sprintsPane.style.display = (view === 'sprints' || view === 'by-sprint') ? '' : 'none';
+
+      if (view === 'heatmap' && p && p._heatchart) { try { p._heatchart.resize(); } catch(_) {} }
+
+      if (view === 'detail' && p && p._echart) { try { p._echart.resize(); } catch(_) {} }
+
+      if (view === 'tasks') _renderTasksFlat();
+
+      if (view === 'sprints') _renderSprintsView(false);
+
+      if (view === 'by-sprint') _renderSprintsView(true);
+
+    };
+
+  }
 
 
 
@@ -6880,11 +7050,19 @@ function renderTimeline(projectId, data) {
 
       const sub = btn.dataset.sub;
 
+      if (viewSelect) viewSelect.value = sub;
+
+      try { localStorage.setItem('meridian_tl_view_' + projectId, sub); } catch(_) {}
+
       wrap.querySelectorAll('.tl-subtab').forEach(b => b.classList.toggle('active', b === btn));
 
       heatPane.style.display = sub === 'heatmap' ? '' : 'none';
 
       detailPane.style.display = sub === 'detail' ? '' : 'none';
+
+      tasksPane.style.display = 'none';
+
+      sprintsPane.style.display = 'none';
 
       // ECharts can't measure a display:none container, so resize on reveal.
 
@@ -10801,6 +10979,8 @@ async function loadSettingsTab(projectId) {
 
   const savedNotifyUrl = ntfyData ? (ntfyData.notify_url || ntfyData.ntfy_url || '') : '';
 
+  const savedNotifyEmail = ntfyData ? (ntfyData.notify_email || '') : '';
+
   // pre-fill with OAuth email for hosted users if no URL is saved yet. ntfy
 
   // targets show topic-only (the https://ntfy.sh/ prefix is implied).
@@ -10863,11 +11043,26 @@ async function loadSettingsTab(projectId) {
 
     </div>
 
+    <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-top:6px">
+
+      <label style="font-size:10px;color:var(--muted);white-space:nowrap;min-width:100px">Notification email:</label>
+
+      <input type="email" id="notify-email-${projectId}"
+        value="${escapeHtml(savedNotifyEmail)}"
+        placeholder="you@example.com"
+        style="flex:1;min-width:180px;padding:5px 8px;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;color:var(--text);font-family:var(--font-mono);font-size:11px;outline:none">
+
+      <button class="secondary" id="notify-email-save-${projectId}" style="padding:4px 10px;font-size:10px">Save</button>
+
+      <span id="notify-email-status-${projectId}" style="font-size:10px;color:var(--muted);min-width:40px"></span>
+
+    </div>
+
     <div style="font-size:9px;color:var(--muted);margin-top:4px;line-height:1.6">
 
       <strong>ntfy</strong> — install the ntfy app (iOS / Android / desktop), pick any topic name, and type it here. The <code>https://ntfy.sh/</code> prefix is added for you.<br>
 
-      <strong>Email</strong> — enter your address to get alerts by email (hosted only).<br>
+      <strong>Email</strong> — enter your address in the field above to get alerts by email (hosted only; fires independently from ntfy).<br>
 
       <strong>Webhook</strong> — paste any <code>https://</code> URL (Slack, Discord, or your own) to receive a JSON POST.
 
@@ -11470,6 +11665,50 @@ async function loadSettingsTab(projectId) {
             ? `saved as ${shownVal}`
 
             : 'saved';
+
+          setTimeout(() => { statusEl.textContent = ''; }, 2400);
+
+        }
+
+      } catch (e) {
+
+        if (statusEl) statusEl.textContent = 'error';
+
+      }
+
+    };
+
+  }
+
+
+
+  // Wire notification email Save button
+
+  const notifyEmailSaveBtn = document.getElementById(`notify-email-save-${projectId}`);
+
+  if (notifyEmailSaveBtn) {
+
+    notifyEmailSaveBtn.onclick = async () => {
+
+      const inp = document.getElementById(`notify-email-${projectId}`);
+
+      const statusEl = document.getElementById(`notify-email-status-${projectId}`);
+
+      const raw = (inp ? inp.value : '').trim() || null;
+
+      try {
+
+        await api(`/projects/${projectId}/ntfy`, {
+
+          method: 'PATCH',
+
+          body: JSON.stringify({ notify_email: raw }),
+
+        });
+
+        if (statusEl) {
+
+          statusEl.textContent = 'saved';
 
           setTimeout(() => { statusEl.textContent = ''; }, 2400);
 
@@ -12699,7 +12938,9 @@ async function updateLiveFeed(projectId) {
 
         <span style="font-size:11px;font-weight:600;color:var(--text);font-family:var(--font-mono)">${escapeHtml(sess.name || 'unnamed session')}</span>
 
-        ${sess.human_id ? `<span style="font-size:10px;color:var(--muted)">${escapeHtml(sess.human_id)}</span>` : ''}
+        ${sess.human_id
+          ? `<span style="font-size:10px;color:var(--muted)">${escapeHtml(sess.human_id)}</span>`
+          : (sess.name ? `<span style="font-size:10px;color:var(--muted);font-style:italic">${escapeHtml(sess.name)}</span>` : '')}
 
         ${elapsedStr ? `<span style="font-size:10px;color:var(--muted);margin-left:auto">${elapsedStr}</span>` : ''}
 
@@ -13429,15 +13670,19 @@ function renderQueue(projectId, sprintItems = []) {
 
 
 
-  return [
+  const doneTitle = doneAll.length
+    ? `${doneAll.length} completed`
+    : 'Done';
 
-    section('⏸', 'Backburner', backburner, 'no backburner items', { key: 'backburner', collapsed: true }),
+  return [
 
     section('⏳', 'Pending', pending, 'no pending sprint items', { key: 'pending' }),
 
     section('🔄', 'In Progress', inProgress, 'nothing in progress', { key: 'in_progress' }),
 
-    section('✅', 'Done', done, 'no completed sprint items', { key: 'done', collapsed: true, footer: doneFooter }),
+    section('⏸', 'Backburner', backburner, 'no backburner items', { key: 'backburner', collapsed: true }),
+
+    section('✅', doneTitle, done, 'no completed sprint items', { key: 'done', collapsed: true, footer: doneFooter }),
 
     section('✕', 'Failed', failed, 'no failed sprint items', { key: 'failed', collapsed: true }),
 
@@ -14575,7 +14820,7 @@ async function _hitlDismiss(id) {
 
 
 
-async function loadPinnedDecisions(projectId) {
+async function loadPinnedDecisions(projectId, { showArchived = false } = {}) {
 
   /** v2.4 — fetch the active pinned decisions for this project and render
 
@@ -14593,7 +14838,13 @@ async function loadPinnedDecisions(projectId) {
 
     await loadProjectSettings(projectId);
 
-    const items = await api(`/projects/${projectId}/decisions-pinned`);
+    const url = showArchived
+      ? `/projects/${projectId}/decisions-pinned?include_superseded=true`
+      : `/projects/${projectId}/decisions-pinned`;
+    const allItems = await api(url);
+    const items = showArchived
+      ? (allItems || [])
+      : (allItems || []).filter(d => d.status !== 'superseded');
 
     getPanelState(projectId)._pinnedDecisions = items || [];
 
@@ -14635,7 +14886,7 @@ async function loadPinnedDecisions(projectId) {
 
             <button class="secondary" data-supersede="${escapeHtml(d.id)}" style="padding:1px 6px;font-size:9px">Supersede</button>
 
-            <button class="secondary" data-delete-decision="${escapeHtml(d.id)}" title="Delete this decision permanently (use Supersede to archive instead)" style="padding:1px 6px;font-size:12px;line-height:1;color:var(--muted)">&times;</button>
+            <button class="secondary" data-archive-decision="${escapeHtml(d.id)}" title="Archive this decision (soft-delete; visible via 'View archived')" style="padding:1px 6px;font-size:9px;color:var(--muted)">Archive</button>
 
           </div>
 
@@ -14667,7 +14918,7 @@ async function loadPinnedDecisions(projectId) {
 
       </div>`;
 
-    }).join('');
+    }).join('') + `<div id="decisions-view-archived-${escapeHtml(projectId)}" style="margin-top:8px;font-size:10px"></div>`;
 
 
 
@@ -14793,27 +15044,45 @@ async function loadPinnedDecisions(projectId) {
 
     });
 
-    host.querySelectorAll('[data-delete-decision]').forEach(btn => {
+    host.querySelectorAll('[data-archive-decision]').forEach(btn => {
 
       btn.onclick = async () => {
 
-        const id = btn.dataset.deleteDecision;
-
-        if (!confirm('Permanently delete this pinned decision? This cannot be undone.\n\n(To archive it while keeping the audit trail, use Supersede instead.)')) return;
+        const id = btn.dataset.archiveDecision;
 
         try {
 
-          await api(`/projects/${projectId}/decisions-pinned/${id}`, { method: 'DELETE' });
+          await api(`/projects/${projectId}/decisions-pinned/${id}`, {
+            method: 'PATCH',
+            body: JSON.stringify({ status: 'superseded' }),
+          });
 
-          toast('decision deleted');
+          toast('decision archived');
 
           loadPinnedDecisions(projectId);
 
-        } catch (e) { toast('delete failed: ' + e.message, true); }
+        } catch (e) { toast('archive failed: ' + e.message, true); }
 
       };
 
     });
+
+    // View archived toggle — wired into the placeholder div we added to host.innerHTML
+    const toggleEl = document.getElementById(`decisions-view-archived-${projectId}`);
+    if (toggleEl) {
+      if (showArchived) {
+        const archivedCount = (allItems || []).filter(d => d.status === 'superseded').length;
+        toggleEl.innerHTML = `<button class="secondary" style="padding:2px 8px;font-size:10px" onclick="loadPinnedDecisions('${escapeHtml(projectId)}', {showArchived:false})">← Hide archived</button> <span style="color:var(--muted)">${archivedCount} archived</span>`;
+      } else {
+        api(`/projects/${projectId}/decisions-pinned?include_superseded=true`).then(all => {
+          const n = (all || []).filter(d => d.status === 'superseded').length;
+          const el2 = document.getElementById(`decisions-view-archived-${projectId}`);
+          if (el2) el2.innerHTML = n > 0
+            ? `<button class="secondary" style="padding:2px 8px;font-size:10px" onclick="loadPinnedDecisions('${escapeHtml(projectId)}', {showArchived:true})">View archived (${n}) ▸</button>`
+            : '';
+        }).catch(() => {});
+      }
+    }
 
 
 
@@ -15493,7 +15762,9 @@ async function refreshSessions(projectId) {
 
       const humanSessions = groups[h];
 
-      const label = h === '\x00unknown' ? 'unknown' : h;
+      const label = h === '\x00unknown'
+        ? (humanSessions.length === 1 ? humanSessions[0].name : 'unknown')
+        : h;
 
       const topDot = _sessionPresenceDot(humanSessions[0]?.last_seen);
 
