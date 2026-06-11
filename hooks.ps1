@@ -105,36 +105,7 @@ if ($IsLocalhost) {
     Write-Host "Self-hosted / localhost detected -- skipping auth."
     if ($null -eq $Token) { $Token = "" }
 } else {
-    if ($null -eq $Token) {
-        Write-Host ""
-        Write-Host "Opening browser to authenticate..."
-        Start-Process "$MeridianUrl/auth/install"
-        Write-Host ""
-        $secToken = Read-Host "Paste the token shown in your browser" -AsSecureString
-        $Token = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto(
-            [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($secToken)
-        )
-    }
-    $Token = $Token.Trim()
-    if ([string]::IsNullOrWhiteSpace($Token)) {
-        Write-Host "Error: token is required for hosted Meridian." -ForegroundColor Red
-        exit 1
-    }
-    Write-Host ""
-    Write-Host "Validating token..."
-    $me = Get-MeResponse -Url $MeridianUrl -Token $Token
-    if ($null -eq $me) {
-        Write-Host "Error: Token validation failed -- is the token correct?" -ForegroundColor Red
-        exit 1
-    }
-    Write-Host "  Authenticated as: $($me.email)" -ForegroundColor Green
-}
-
-# No project selection -- hooks are global, project_id comes from the goal at session time.
-
-# ---- Step 3: Reuse existing token from hooks if valid, else generate permanent token ---
-if (-not $IsLocalhost -and -not [string]::IsNullOrWhiteSpace($Token)) {
-    # Try to reuse existing sk_meridian_ token from already-installed hooks
+    # Check for existing valid token in already-installed hooks first
     $existingToken = $null
     $settingsPath = Join-Path $HOME ".claude\settings.json"
     if (Test-Path $settingsPath) {
@@ -142,38 +113,62 @@ if (-not $IsLocalhost -and -not [string]::IsNullOrWhiteSpace($Token)) {
             $s = Get-Content $settingsPath -Raw | ConvertFrom-Json
             $cmd = $s.hooks.SessionStart[0].hooks[0].command
             if ($cmd -match 'Bearer (sk_meridian_[A-Za-z0-9_\-]+)') {
-                $existingToken = $Matches[1]
-            }
-        } catch {}
-    }
-
-    if (-not [string]::IsNullOrWhiteSpace($existingToken)) {
-        $check = Get-MeResponse -Url $MeridianUrl -Token $existingToken
-        if ($null -ne $check) {
-            $Token = $existingToken
-            Write-Host "  Reusing existing API key." -ForegroundColor Green
-        } else {
-            Write-Host "  Existing key expired -- generating new one..." -ForegroundColor Yellow
-            $existingToken = $null
-        }
-    }
-
-    if ([string]::IsNullOrWhiteSpace($existingToken) -and -not $Token.StartsWith("sk_meridian_")) {
-        try {
-            $r = Invoke-WebRequest -Method POST -Uri "$MeridianUrl/auth/tokens" `
-                -Headers @{ Authorization = "Bearer $Token" } `
-                -ContentType "application/json" -Body '{"label":"hooks-installer"}' `
-                -UseBasicParsing -TimeoutSec 10 -ErrorAction SilentlyContinue
-            if ($r.StatusCode -eq 201) {
-                $td = $r.Content | ConvertFrom-Json
-                if ($td.token) {
-                    $Token = $td.token
-                    Write-Host "  New permanent API key saved." -ForegroundColor Green
+                $candidate = $Matches[1]
+                $check = Get-MeResponse -Url $MeridianUrl -Token $candidate
+                if ($null -ne $check) {
+                    $existingToken = $candidate
+                    $Token = $candidate
+                    Write-Host "  Found existing API key -- authenticated as: $($check.email)" -ForegroundColor Green
                 }
             }
         } catch {}
     }
+
+    if ([string]::IsNullOrWhiteSpace($existingToken)) {
+        if ($null -eq $Token) {
+            Write-Host ""
+            Write-Host "Opening browser to authenticate..."
+            Start-Process "$MeridianUrl/auth/install"
+            Write-Host ""
+            $secToken = Read-Host "Paste the token shown in your browser" -AsSecureString
+            $Token = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto(
+                [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($secToken)
+            )
+        }
+        $Token = $Token.Trim()
+        if ([string]::IsNullOrWhiteSpace($Token)) {
+            Write-Host "Error: token is required for hosted Meridian." -ForegroundColor Red
+            exit 1
+        }
+        Write-Host ""
+        Write-Host "Validating token..."
+        $me = Get-MeResponse -Url $MeridianUrl -Token $Token
+        if ($null -eq $me) {
+            Write-Host "Error: Token validation failed -- is the token correct?" -ForegroundColor Red
+            exit 1
+        }
+        Write-Host "  Authenticated as: $($me.email)" -ForegroundColor Green
+
+        # Exchange install token for permanent sk_meridian_ key
+        if (-not $Token.StartsWith("sk_meridian_")) {
+            try {
+                $r = Invoke-WebRequest -Method POST -Uri "$MeridianUrl/auth/tokens" `
+                    -Headers @{ Authorization = "Bearer $Token" } `
+                    -ContentType "application/json" -Body '{"label":"hooks-installer"}' `
+                    -UseBasicParsing -TimeoutSec 10 -ErrorAction SilentlyContinue
+                if ($r.StatusCode -eq 201) {
+                    $td = $r.Content | ConvertFrom-Json
+                    if ($td.token) {
+                        $Token = $td.token
+                        Write-Host "  Permanent API key saved." -ForegroundColor Green
+                    }
+                }
+            } catch {}
+        }
+    }
 }
+
+# No project selection -- hooks are global, project_id comes from the goal at session time.
 
 # ---- Step 4: Build hook commands --------------------------------------------------
 $startCmd = Build-StartCmd -Url $MeridianUrl -Token $Token
