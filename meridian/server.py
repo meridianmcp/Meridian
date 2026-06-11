@@ -6153,17 +6153,23 @@ async def auth_install_page(request: Request) -> HTMLResponse:
 </head>
 <body>
   <div class="card">
-    <h2>Meridian Install Token</h2>
+    <h2>Meridian Connect</h2>
     <div class="email">Signed in as {email}</div>
     <p>Copy this token and paste it into the installer. It expires in 10 minutes and can only be used once.</p>
-    <div class="token-box" id="token" onclick="copyToken()">{raw_token}</div>
-    <button class="copy-btn" onclick="copyToken()">Copy token</button>
-    <div class="note">
-      This token grants one-time access to authenticate the installer.<br>
-      After authentication, you will receive a permanent API token stored locally.
+    <div style="position:relative;margin-bottom:12px">
+      <div class="token-box" id="token" style="filter:blur(6px);transition:filter 0.2s;word-break:break-all;user-select:all">{raw_token}</div>
+      <button onclick="toggleReveal()" id="revealBtn" style="position:absolute;top:50%;right:10px;transform:translateY(-50%);background:#222;border:1px solid #444;color:#aaa;border-radius:4px;padding:3px 10px;font-size:12px;cursor:pointer">Show</button>
     </div>
+    <button class="copy-btn" onclick="copyToken()">Copy token</button>
+    <div class="note">This token grants one-time installer access. Never share it — treat it like a password.</div>
   </div>
   <script>
+    var _revealed = false;
+    function toggleReveal() {{
+      _revealed = !_revealed;
+      document.getElementById('token').style.filter = _revealed ? 'none' : 'blur(6px)';
+      document.getElementById('revealBtn').textContent = _revealed ? 'Hide' : 'Show';
+    }}
     function copyToken() {{
       navigator.clipboard.writeText('{raw_token}').then(() => {{
         const btn = document.querySelector('.copy-btn');

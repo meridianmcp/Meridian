@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+﻿#!/usr/bin/env bash
 # hooks.sh - Meridian session lifecycle hooks installer
 #
 # Usage:
@@ -7,7 +7,7 @@
 #   bash hooks.sh --url http://localhost:7878 --project-id your-project-id
 #
 # Installs Claude Code, Codex, and Cursor integrations. Credentials are embedded
-# directly in hook commands — no per-repo config file required.
+# directly in hook commands â€” no per-repo config file required.
 #
 # Requirements: curl, jq
 set -euo pipefail
@@ -30,7 +30,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 echo ""
-echo "Meridian hook installer"
+echo "Meridian Connect"
 echo "-----------------------"
 echo ""
 
@@ -48,7 +48,7 @@ fi
 
 echo "Checking $MERIDIAN_URL ..."
 if ! curl -sf --max-time 5 "$MERIDIAN_URL/health" > /dev/null; then
-  echo "Error: Cannot reach $MERIDIAN_URL/health — is the server running?" >&2
+  echo "Error: Cannot reach $MERIDIAN_URL/health â€” is the server running?" >&2
   exit 1
 fi
 echo "  OK server is reachable"
@@ -61,7 +61,7 @@ fi
 
 if [[ $IS_LOCAL -eq 1 ]]; then
   echo ""
-  echo "Self-hosted / localhost detected — skipping auth."
+  echo "Self-hosted / localhost detected â€” skipping auth."
 else
   if [[ -z "$TOKEN" ]]; then
     echo ""
@@ -87,14 +87,14 @@ else
     -H "Authorization: Bearer $TOKEN" \
     "$MERIDIAN_URL/auth/me" 2>/dev/null || echo "null")
   if [[ "$ME" == "null" ]] || [[ -z "$ME" ]]; then
-    echo "Error: Token validation failed — is the token correct?" >&2
+    echo "Error: Token validation failed â€” is the token correct?" >&2
     exit 1
   fi
   EMAIL=$(echo "$ME" | jq -r '.email // empty' 2>/dev/null || echo "")
   echo "  Authenticated as: $EMAIL"
 fi
 
-# No project selection — hooks are global, project_id comes from the goal at session time.
+# No project selection â€” hooks are global, project_id comes from the goal at session time.
 
 # ---- Step 4: Generate permanent token ----------------------------------------
 if [[ $IS_LOCAL -eq 0 ]] && [[ -n "$TOKEN" ]]; then
@@ -128,7 +128,7 @@ fi
 
 if [[ $CLAUDE_DETECTED -eq 1 ]]; then
   echo ""
-  echo "Claude Code detected — writing hooks to $SETTINGS_PATH"
+  echo "Claude Code detected â€” writing hooks to $SETTINGS_PATH"
   mkdir -p "$(dirname "$SETTINGS_PATH")"
 
   EXISTING="{}"
@@ -154,7 +154,7 @@ fi
 
 if [[ $CODEX_DETECTED -eq 1 ]]; then
   echo ""
-  echo "Codex detected — writing MCP config to ~/.codex/config.toml"
+  echo "Codex detected â€” writing MCP config to ~/.codex/config.toml"
   mkdir -p "${HOME}/.codex"
   CODEX_CONFIG="${HOME}/.codex/config.toml"
 
@@ -194,7 +194,7 @@ fi
 
 if [[ $CURSOR_DETECTED -eq 1 ]]; then
   echo ""
-  echo "Cursor detected — writing .cursor/mcp.json in current directory"
+  echo "Cursor detected â€” writing .cursor/mcp.json in current directory"
   mkdir -p ".cursor"
   if [[ -n "$TOKEN" ]]; then
     CURSOR_JSON=$(jq -n --arg url "${MERIDIAN_URL}/mcp" --arg tok "$TOKEN" \
@@ -233,3 +233,4 @@ else
 fi
 echo "Restart Claude Code to activate."
 echo ""
+
