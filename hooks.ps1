@@ -132,10 +132,33 @@ if ($IsLocalhost) {
 
 # No project selection -- hooks are global, project_id comes from the goal at session time.
 
-# ---- Step 3: Generate permanent token (only if install token, not already permanent) ---
+# ---- Step 3: Reuse existing token from hooks if valid, else generate permanent token ---
 if (-not $IsLocalhost -and -not [string]::IsNullOrWhiteSpace($Token)) {
-    if (-not $Token.StartsWith("sk_meridian_")) {
-        Write-Host "  Saving permanent API key..."
+    # Try to reuse existing sk_meridian_ token from already-installed hooks
+    $existingToken = $null
+    $settingsPath = Join-Path $HOME ".claude\settings.json"
+    if (Test-Path $settingsPath) {
+        try {
+            $s = Get-Content $settingsPath -Raw | ConvertFrom-Json
+            $cmd = $s.hooks.SessionStart[0].hooks[0].command
+            if ($cmd -match 'Bearer (sk_meridian_[A-Za-z0-9_\-]+)') {
+                $existingToken = $Matches[1]
+            }
+        } catch {}
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($existingToken)) {
+        $check = Get-MeResponse -Url $MeridianUrl -Token $existingToken
+        if ($null -ne $check) {
+            $Token = $existingToken
+            Write-Host "  Reusing existing API key." -ForegroundColor Green
+        } else {
+            Write-Host "  Existing key expired -- generating new one..." -ForegroundColor Yellow
+            $existingToken = $null
+        }
+    }
+
+    if ([string]::IsNullOrWhiteSpace($existingToken) -and -not $Token.StartsWith("sk_meridian_")) {
         try {
             $r = Invoke-WebRequest -Method POST -Uri "$MeridianUrl/auth/tokens" `
                 -Headers @{ Authorization = "Bearer $Token" } `
@@ -145,12 +168,10 @@ if (-not $IsLocalhost -and -not [string]::IsNullOrWhiteSpace($Token)) {
                 $td = $r.Content | ConvertFrom-Json
                 if ($td.token) {
                     $Token = $td.token
-                    Write-Host "  Permanent API key saved." -ForegroundColor Green
+                    Write-Host "  New permanent API key saved." -ForegroundColor Green
                 }
             }
         } catch {}
-    } else {
-        Write-Host "  Using existing API key." -ForegroundColor Green
     }
 }
 
