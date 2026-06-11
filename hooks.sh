@@ -74,7 +74,7 @@ else
       echo "  Visit: $MERIDIAN_URL/auth/install"
     fi
     echo ""
-    read -rp "Paste the token shown in your browser: " TOKEN
+    read -rsp "Paste the token shown in your browser: " TOKEN; echo ""
   fi
   TOKEN="${TOKEN// /}"
   if [[ -z "$TOKEN" ]]; then
@@ -94,39 +94,7 @@ else
   echo "  Authenticated as: $EMAIL"
 fi
 
-# ---- Step 3: Project selection -----------------------------------------------
-PROJECT_NAME=""
-if [[ -z "$PROJECT_ID" ]]; then
-  ME_DATA="{}"
-  if [[ -n "$TOKEN" ]]; then
-    ME_DATA=$(curl -sf --max-time 10 -H "Authorization: Bearer $TOKEN" \
-      "$MERIDIAN_URL/auth/me" 2>/dev/null || echo "{}")
-  elif [[ $IS_LOCAL -eq 1 ]]; then
-    ME_DATA=$(curl -sf --max-time 10 "$MERIDIAN_URL/auth/me" 2>/dev/null || echo "{}")
-  fi
-  PROJECTS=$(echo "$ME_DATA" | jq '.projects // []' 2>/dev/null || echo "[]")
-  COUNT=$(echo "$PROJECTS" | jq 'length' 2>/dev/null || echo "0")
-  if [[ "$COUNT" -gt 0 ]]; then
-    echo ""
-    echo "Your projects:"
-    echo "$PROJECTS" | jq -r 'to_entries[] | "  [\(.key + 1)] \(.value.name)  (\(.value.id | .[0:8])...)"' 2>/dev/null
-    echo ""
-    read -rp "Select project number [1-$COUNT]: " CHOICE
-    if [[ "$CHOICE" -lt 1 ]] || [[ "$CHOICE" -gt "$COUNT" ]]; then
-      echo "Error: invalid selection." >&2
-      exit 1
-    fi
-    IDX=$((CHOICE - 1))
-    PROJECT_ID=$(echo "$PROJECTS" | jq -r ".[$IDX].id")
-    PROJECT_NAME=$(echo "$PROJECTS" | jq -r ".[$IDX].name")
-  else
-    read -rp "Project ID: " PROJECT_ID
-  fi
-fi
-if [[ -z "$PROJECT_ID" ]]; then
-  echo "Error: project_id is required." >&2
-  exit 1
-fi
+# No project selection — hooks are global, project_id comes from the goal at session time.
 
 # ---- Step 4: Generate permanent token ----------------------------------------
 if [[ $IS_LOCAL -eq 0 ]] && [[ -n "$TOKEN" ]]; then
@@ -144,11 +112,11 @@ fi
 
 # ---- Step 5: Build hook commands (cwd + hostname read at fire time) ----------
 if [[ -n "$TOKEN" ]]; then
-  START_CMD="curl -s -X POST -H 'Authorization: Bearer ${TOKEN}' -H 'Content-Type: application/json' -d \"{\\\"project_id\\\":\\\"${PROJECT_ID}\\\",\\\"cwd\\\":\\\"\$PWD\\\",\\\"hostname\\\":\\\"\$(hostname)\\\"}\" '${MERIDIAN_URL}/hooks/session-start' | jq -r '.hookSpecificOutput.additionalContext // empty' 2>/dev/null"
-  STOP_CMD="curl -s -X POST -H 'Authorization: Bearer ${TOKEN}' -H 'Content-Type: application/json' -d \"{\\\"project_id\\\":\\\"${PROJECT_ID}\\\",\\\"hostname\\\":\\\"\$(hostname)\\\"}\" '${MERIDIAN_URL}/hooks/stop' >/dev/null 2>&1"
+  START_CMD="curl -s -X POST -H 'Authorization: Bearer ${TOKEN}' -H 'Content-Type: application/json' -d \"{\\\"cwd\\\":\\\"\$PWD\\\",\\\"hostname\\\":\\\"\$(hostname)\\\"}\" '${MERIDIAN_URL}/hooks/session-start' | jq -r '.hookSpecificOutput.additionalContext // empty' 2>/dev/null"
+  STOP_CMD="curl -s -X POST -H 'Authorization: Bearer ${TOKEN}' -H 'Content-Type: application/json' -d \"{\\\"hostname\\\":\\\"\$(hostname)\\\"}\" '${MERIDIAN_URL}/hooks/stop' >/dev/null 2>&1"
 else
-  START_CMD="curl -s -X POST -H 'Content-Type: application/json' -d \"{\\\"project_id\\\":\\\"${PROJECT_ID}\\\",\\\"cwd\\\":\\\"\$PWD\\\",\\\"hostname\\\":\\\"\$(hostname)\\\"}\" '${MERIDIAN_URL}/hooks/session-start' | jq -r '.hookSpecificOutput.additionalContext // empty' 2>/dev/null"
-  STOP_CMD="curl -s -X POST -H 'Content-Type: application/json' -d \"{\\\"project_id\\\":\\\"${PROJECT_ID}\\\",\\\"hostname\\\":\\\"\$(hostname)\\\"}\" '${MERIDIAN_URL}/hooks/stop' >/dev/null 2>&1"
+  START_CMD="curl -s -X POST -H 'Content-Type: application/json' -d \"{\\\"cwd\\\":\\\"\$PWD\\\",\\\"hostname\\\":\\\"\$(hostname)\\\"}\" '${MERIDIAN_URL}/hooks/session-start' | jq -r '.hookSpecificOutput.additionalContext // empty' 2>/dev/null"
+  STOP_CMD="curl -s -X POST -H 'Content-Type: application/json' -d \"{\\\"hostname\\\":\\\"\$(hostname)\\\"}\" '${MERIDIAN_URL}/hooks/stop' >/dev/null 2>&1"
 fi
 
 # ---- Step 6: Write hooks to ~/.claude/settings.json -------------------------
@@ -247,7 +215,7 @@ TEST_ARGS=(-s -X POST -H "Content-Type: application/json")
 if [[ -n "$TOKEN" ]]; then
   TEST_ARGS+=(-H "Authorization: Bearer $TOKEN")
 fi
-TEST_BODY="{\"project_id\":\"$PROJECT_ID\",\"cwd\":\"$PWD\",\"hostname\":\"$(hostname)\"}"
+TEST_BODY="{\"cwd\":\"$PWD\",\"hostname\":\"$(hostname)\"}"
 HTTP_STATUS=$(curl -o /dev/null -w "%{http_code}" --max-time 10 \
   "${TEST_ARGS[@]}" -d "$TEST_BODY" "$MERIDIAN_URL/hooks/session-start" 2>/dev/null || echo "0")
 if [[ "$HTTP_STATUS" == "200" ]]; then
