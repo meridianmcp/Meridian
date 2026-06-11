@@ -3661,6 +3661,8 @@ async def _update_sprint_item_status(
         fields.append("completed_at = datetime('now')")
     else:
         fields.append("completed_at = NULL")
+    if status == "done":
+        fields.append("claimed_at = COALESCE(claimed_at, datetime('now'))")
     if task_id is not None:
         fields.append("task_id = ?")
         values.append(task_id)
@@ -4942,6 +4944,21 @@ async def get_project_stats(
         for d in all_days
     ]
 
+    async with db.execute(
+        "SELECT substr(completed_at, 1, 10) AS day, COUNT(*) AS cnt "
+        "FROM sprint_items "
+        "WHERE project_id = ? AND status = 'done' "
+        "AND completed_at IS NOT NULL AND completed_at >= ? "
+        "GROUP BY day ORDER BY day ASC",
+        (project_id, cutoff),
+    ) as cur:
+        sprint_day_rows = await cur.fetchall()
+    sprint_by_day = {r["day"]: r["cnt"] for r in sprint_day_rows}
+    sprint_items_per_day = [
+        {"day": d, "total": sprint_by_day.get(d, 0)}
+        for d in all_days
+    ]
+
     # Sprint completion % per version
     async with db.execute(
         "SELECT version, status, COUNT(*) AS cnt FROM sprint_items "
@@ -4972,6 +4989,7 @@ async def get_project_stats(
     return {
         "period_days": days,
         "tasks_per_day": tasks_per_day,
+        "sprint_items_per_day": sprint_items_per_day,
         "sprint_velocity": sprint_velocity,
     }
 
@@ -5986,8 +6004,10 @@ async def get_executor_runs(
 ) -> list[dict[str, Any]]:
     """List executor_runs for a project, newest first."""
     async with db.execute(
-        "SELECT * FROM executor_runs WHERE project_id = ? "
-        "ORDER BY started_at DESC LIMIT ?",
+        "SELECT er.*, s.name AS session_name FROM executor_runs er "
+        "LEFT JOIN sessions s ON s.id = er.session_id "
+        "WHERE er.project_id = ? "
+        "ORDER BY er.started_at DESC LIMIT ?",
         (project_id, limit),
     ) as cur:
         rows = await cur.fetchall()

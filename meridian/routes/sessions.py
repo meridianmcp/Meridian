@@ -74,6 +74,25 @@ async def close_session(session_id: str, request: Request) -> dict[str, str]:
     return {"status": "closed", "session_id": session_id}
 
 
+@router.patch("/sessions/{session_id}")
+async def patch_session(
+    session_id: str, body: dict[str, Any], request: Request
+) -> dict[str, str]:
+    """Update lightweight session state used by the dashboard."""
+    status = (body.get("status") or "").strip()
+    if status not in {"active", "idle", "closed"}:
+        raise HTTPException(status_code=422, detail="status must be active, idle, or closed")
+    db = await _db(request)
+    cursor = await db.execute(
+        "UPDATE sessions SET status = ? WHERE id = ?",
+        (status, session_id),
+    )
+    await db.commit()
+    if cursor.rowcount == 0:
+        raise HTTPException(status_code=404, detail="session not found")
+    return {"status": status, "session_id": session_id}
+
+
 @router.post("/sessions/{session_id}/heartbeat")
 async def heartbeat_session(
     session_id: str, request: Request

@@ -13,16 +13,32 @@ router = APIRouter()
 
 @router.get("/projects/{project_id}/sprint-items")
 async def list_sprint_items(
-    project_id: str, request: Request, status: str | None = None
-) -> list[dict[str, Any]]:
+    project_id: str,
+    request: Request,
+    status: str | None = None,
+    limit: int | None = None,
+    offset: int = 0,
+    with_counts: bool = False,
+) -> list[dict[str, Any]] | dict[str, Any]:
     """List sprint items, optionally filtered by status."""
     project = await db_module.get_project(await _db(request), project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="project not found")
     try:
-        return await db_module.get_sprint_items(
+        items = await db_module.get_sprint_items(
             await _db(request), project_id, status=status
         )
+        total_done_count = sum(1 for it in items if it.get("status") == "done")
+        if status is not None and with_counts:
+            all_items = await db_module.get_sprint_items(await _db(request), project_id)
+            total_done_count = sum(1 for it in all_items if it.get("status") == "done")
+        if limit is not None:
+            start = max(0, offset)
+            end = start + max(0, min(limit, 500))
+            items = items[start:end]
+        if with_counts:
+            return {"items": items, "total_done_count": total_done_count}
+        return items
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
 

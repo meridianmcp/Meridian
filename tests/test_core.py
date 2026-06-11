@@ -408,6 +408,22 @@ def test_close_session(client):
     assert sess["id"] not in {s["id"] for s in sessions}
 
 
+def test_patch_session_status_to_idle(client):
+    project = client.post("/projects", json={"name": "alpha"}).json()
+    sess = client.post(
+        "/sessions/register",
+        json={"project_id": project["id"], "name": "s1"},
+    ).json()
+
+    r = client.patch(f"/sessions/{sess['id']}", json={"status": "idle"})
+
+    assert r.status_code == 200
+    assert r.json()["status"] == "idle"
+    sessions = client.get(f"/projects/{project['id']}/sessions?active_only=false").json()
+    updated = next(s for s in sessions if s["id"] == sess["id"])
+    assert updated["status"] == "idle"
+
+
 # ---------------------------------------------------------------------------
 # Paid-tier: enqueue_claude_task
 # ---------------------------------------------------------------------------
@@ -2938,6 +2954,18 @@ async def test_complete_sprint_item_marks_done_and_links_task(db):
 
 
 @pytest.mark.asyncio
+async def test_complete_sprint_item_auto_claims_unclaimed_item(db):
+    p = await db_module.create_project(db, "alpha")
+    item = await db_module.add_sprint_item(db, p["id"], "v0.6.4", "save")
+
+    done = await db_module.complete_sprint_item(db, p["id"], item["id"])
+
+    assert done is not None
+    assert done["status"] == "done"
+    assert done["claimed_at"] is not None
+
+
+@pytest.mark.asyncio
 async def test_skip_sprint_item_stores_reason(db):
     p = await db_module.create_project(db, "alpha")
     item = await db_module.add_sprint_item(db, p["id"], "v0.6.4", "save")
@@ -3138,6 +3166,26 @@ def test_http_sprint_items_endpoints(client):
         json={"reason": "nope"},
     )
     assert r.status_code == 404
+
+
+def test_http_sprint_items_with_counts(client):
+    project = client.post("/projects", json={"name": "alpha"}).json()
+    done = client.post(
+        f"/projects/{project['id']}/sprint-items",
+        json={"version": "v1", "title": "done item"},
+    ).json()
+    client.post(
+        f"/projects/{project['id']}/sprint-items",
+        json={"version": "v1", "title": "pending item"},
+    )
+    client.post(f"/projects/{project['id']}/sprint-items/{done['id']}/complete")
+
+    r = client.get(f"/projects/{project['id']}/sprint-items?with_counts=true")
+
+    assert r.status_code == 200
+    body = r.json()
+    assert isinstance(body["items"], list)
+    assert body["total_done_count"] == 1
 
 
 # ---------------------------------------------------------------------------
@@ -4419,12 +4467,40 @@ def test_work_queue_vtab_in_dashboard(client):
     assert "Recent Sessions" in js, (
         "queue should keep a recent sessions section below the sprint board"
     )
-    assert "s.id !== panel.liveSessionId && s.status !== 'active'" in js, (
+    assert "s.id !== panel.liveSessionId && !isLiveSession(s)" in js, (
         "live session should stay out of the Recent Sessions list"
     )
     assert 'start_session(project_id="' in js, (
         "resume button should copy a start_session() snippet"
     )
+    assert "openTimelineForSession" in js and "View all ${sessionTasks.length} tasks" in js, (
+        "session rows should link to a filtered timeline"
+    )
+
+
+def test_dashboard_notifications_panel_uses_real_targets(client):
+    js = client.get("/static/dashboard.js").text
+    assert "ntfy-url-${projectId}" in js
+    assert "notify-email-${projectId}" in js
+    assert "ntfy_url:" in js
+    assert "notify_email:" in js
+    assert "Session stalled" not in js
+    assert "Storage at 80%" not in js
+    assert "Open in Claude / Codex" in js
+
+
+def test_dashboard_sprint_progress_has_no_thumb_buttons(client):
+    js = client.get("/static/dashboard.js").text
+    assert "sprint-item-feedback" not in js
+    assert "👍" not in js
+    assert "👎" not in js
+
+
+def test_dashboard_rewind_charts_label_sprint_items(client):
+    js = client.get("/static/dashboard.js").text
+    assert "Sprint items / day" in js
+    assert "Sprint items</span>" in js
+    assert "Tasks completed" not in js
 
 
 def test_project_sidebar_active_state_in_dashboard(client):
@@ -5270,7 +5346,7 @@ async def test_goal_history_keeps_real_content_changes(db):
 
 
 def test_stats_endpoint_returns_expected_shape(client):
-    """GET /projects/{id}/stats returns tasks_per_day and sprint_velocity."""
+    """GET /projects/{id}/stats returns task, sprint-item, and velocity series."""
     r = client.post("/projects", json={"name": "stats-test-proj"})
     assert r.status_code in (200, 201)
     pid = r.json()["id"]
@@ -5278,6 +5354,7 @@ def test_stats_endpoint_returns_expected_shape(client):
     assert r.status_code == 200
     data = r.json()
     assert "tasks_per_day" in data
+    assert "sprint_items_per_day" in data
     assert "sprint_velocity" in data
     assert "period_days" in data
     assert data["period_days"] == 30
@@ -5290,7 +5367,7 @@ def test_stats_endpoint_404_for_unknown_project(client):
 
 
 def test_stats_tasks_per_day_length_matches_period(client):
-    """tasks_per_day series has exactly period_days entries."""
+    """daily series have exactly period_days entries."""
     r = client.post("/projects", json={"name": "stats-days-proj"})
     pid = r.json()["id"]
     r = client.get(f"/projects/{pid}/stats?days=7")
@@ -5298,6 +5375,7 @@ def test_stats_tasks_per_day_length_matches_period(client):
     data = r.json()
     assert data["period_days"] == 7
     assert len(data["tasks_per_day"]) == 7
+    assert len(data["sprint_items_per_day"]) == 7
 
 
 # ---------------------------------------------------------------------------
@@ -6451,6 +6529,22 @@ def test_hooks_session_start_repo_paths_empty_auto_add(client):
     settings = client.get(f"/projects/{pid}/settings").json()
     rps = settings.get("executor_config", {}).get("repo_paths", [])
     assert any(p.get("cwd") == "/home/user/myproject" for p in rps)
+
+
+def test_hooks_session_start_repo_paths_normalizes_wsl_cwd(client):
+    project = client.post("/projects", json={"name": "rp-wsl-proj"}).json()
+    pid = project["id"]
+
+    r = client.post("/hooks/session-start", json={
+        "project_id": pid,
+        "cwd": "/mnt/c/Users/adam/project",
+        "hostname": "winbox",
+    })
+
+    assert r.status_code == 200
+    settings = client.get(f"/projects/{pid}/settings").json()
+    rps = settings.get("executor_config", {}).get("repo_paths", [])
+    assert any(p.get("cwd") == "C:/Users/adam/project" for p in rps)
 
 
 def test_hooks_session_start_repo_paths_exact_match_silent(client):
