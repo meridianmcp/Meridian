@@ -8654,7 +8654,6 @@ async function loadSettingsTab(projectId) {
 
   // Hosted easy-setup: hooks + mini executor shown by default; everything else in collapsible Advanced.
   if (isHostedMode()) {
-    const _ezCfg = (projectSettings && projectSettings.executor_config) || {};
     const _advKey = `meridian.settings.adv.${projectId}`;
     let _advOpen = false;
     try { _advOpen = localStorage.getItem(_advKey) === '1'; } catch(e) {}
