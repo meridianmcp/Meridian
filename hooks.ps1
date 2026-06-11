@@ -51,28 +51,28 @@ function Get-MeResponse {
 }
 
 function Build-StartCmd {
-    param([string]$Url, [string]$Token)
-    # Use curl (built-in Windows 10+, macOS, Linux) -- avoids WSL bash routing PowerShell hooks through bash
-    if ([string]::IsNullOrEmpty($Token)) {
-        return "curl -s -X POST $Url/hooks/session-start -H \"Content-Type: application/json\" -d \"{\\"cwd\\":\\"$(pwd)\\",\\"hostname\\":\\"$(hostname)\\"}\" || true"
-    } else {
-        return "curl -s -X POST $Url/hooks/session-start -H \"Authorization: Bearer $Token\" -H \"Content-Type: application/json\" -d \"{\\"cwd\\":\\"$(pwd)\\",\\"hostname\\":\\"$(hostname)\\"}\" || true"
-    }
+    param([string]$ScriptPath)
+    return "& `"`$ScriptPath`""
+}
+
+function Write-HookScripts {
+    param([string]$Url, [string]$Token, [string]$HooksDir)
+    $null = New-Item -ItemType Directory -Force $HooksDir
+    $startPath = Join-Path $HooksDir "meridian-start.ps1"
+    $stopPath = Join-Path $HooksDir "meridian-stop.ps1"
+    $authStart = if ([string]::IsNullOrEmpty($Token)) { "" } else { "    -Headers @{Authorization=`"Bearer $Token`"} ``" }
+    $authStop = $authStart
+    $startContent = "```$cwd = (Get-Location).Path -replace `"\\\\`", `"/`"`n```$h = ```$env:COMPUTERNAME`n```$b = `"{`"`"cwd`"`":`"`"`$cwd`"`",`"`"hostname`"`":`"`"`$h`"`"}`"`n$authStart`ntry { (Invoke-WebRequest -Method POST -Uri `"$Url/hooks/session-start`" -ContentType `"application/json`" -Body ```$b -UseBasicParsing).Content } catch { `"`"{}`"`" }"
+    $stopContent  = "```$h = ```$env:COMPUTERNAME`n```$b = `"{`"`"hostname`"`":`"`"`$h`"`"}`"`n$authStop`ntry { Invoke-WebRequest -Method POST -Uri `"$Url/hooks/stop`" -ContentType `"application/json`" -Body ```$b -UseBasicParsing | Out-Null } catch {}"
+    [System.IO.File]::WriteAllText($startPath, $startContent, (New-Object System.Text.UTF8Encoding $false))
+    [System.IO.File]::WriteAllText($stopPath, $stopContent, (New-Object System.Text.UTF8Encoding $false))
+    return @{ Start = $startPath; Stop = $stopPath }
 }
 
 function Build-StopCmd {
-    param([string]$Url, [string]$Token)
-    if ([string]::IsNullOrEmpty($Token)) {
-        return "curl -s -X POST $Url/hooks/stop -H \"Content-Type: application/json\" -d \"{\\"hostname\\":\\"$(hostname)\\"}\" || true"
-    } else {
-        return "curl -s -X POST $Url/hooks/stop -H \"Authorization: Bearer $Token\" -H \"Content-Type: application/json\" -d \"{\\"hostname\\":\\"$(hostname)\\"}\" || true"
-    }
+    param([string]$ScriptPath)
+    return "& `"`$ScriptPath`""
 }
-
-Write-Host ""
-Write-Host "Meridian Connect"
-Write-Host "-----------------------"
-Write-Host ""
 
 # ---- Step 1: URL ------------------------------------------------------------------
 $DefaultUrl = "https://usemeridian.us"
@@ -180,8 +180,10 @@ if ($IsLocalhost) {
 # No project selection -- hooks are global, project_id comes from the goal at session time.
 
 # ---- Step 4: Build hook commands --------------------------------------------------
-$startCmd = Build-StartCmd -Url $MeridianUrl -Token $Token
-$stopCmd  = Build-StopCmd  -Url $MeridianUrl -Token $Token
+$HooksDir = Join-Path $HOME ".claude\hooks"
+$scripts = Write-HookScripts -Url $MeridianUrl -Token $Token -HooksDir $HooksDir
+$startCmd = Build-StartCmd -ScriptPath $scripts.Start
+$stopCmd  = Build-StopCmd  -ScriptPath $scripts.Stop
 
 # ---- Step 5: Check for existing hooks --------------------------------------------
 $ClaudeSettingsPath = Join-Path $HOME ".claude\settings.json"
