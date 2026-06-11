@@ -6417,8 +6417,8 @@ def test_hooks_session_start_and_stop(client):
     r = client.post("/hooks/session-start", json={"project_id": project["id"]})
     assert r.status_code == 200
     body = r.json()
+    assert "hookEventName" in body
     assert "hookSpecificOutput" in body
-    assert "additionalContext" in body["hookSpecificOutput"]
     assert project["name"] in body["hookSpecificOutput"]["additionalContext"]
     # Stop hook — uses session_id from start result
     additional = body["hookSpecificOutput"]["additionalContext"]
