@@ -6,7 +6,7 @@
 #   .\hooks.ps1 --url http://localhost:7878 --project-id your-project-id
 #
 # Installs Claude Code, Codex, and Cursor integrations. Credentials are embedded
-# directly in hook commands â€” no per-repo config file required.
+# directly in hook commands  -- no per-repo config file required.
 #
 # Requirements: PowerShell 5.1+
 
@@ -91,7 +91,7 @@ if (-not ($MeridianUrl -match "^https?://")) {
 
 Write-Host "Checking $MeridianUrl ..."
 if (-not (Test-UrlReachable -Url $MeridianUrl)) {
-    Write-Host "Error: Cannot reach $MeridianUrl/health â€” is the server running?" -ForegroundColor Red
+    Write-Host "Error: Cannot reach $MeridianUrl/health  -- is the server running?" -ForegroundColor Red
     exit 1
 }
 Write-Host "  OK server is reachable" -ForegroundColor Green
@@ -102,7 +102,7 @@ $Token = Get-ArgValue -Arguments $CliArgs -Name "--token"
 
 if ($IsLocalhost) {
     Write-Host ""
-    Write-Host "Self-hosted / localhost detected â€” skipping auth."
+    Write-Host "Self-hosted / localhost detected  -- skipping auth."
     if ($null -eq $Token) { $Token = "" }
 } else {
     if ($null -eq $Token) {
@@ -124,14 +124,14 @@ if ($IsLocalhost) {
     Write-Host "Validating token..."
     $me = Get-MeResponse -Url $MeridianUrl -Token $Token
     if ($null -eq $me) {
-        Write-Host "Error: Token validation failed â€” is the token correct?" -ForegroundColor Red
+        Write-Host "Error: Token validation failed  -- is the token correct?" -ForegroundColor Red
         exit 1
     }
     Write-Host "  Authenticated as: $($me.email)" -ForegroundColor Green
 }
 
 # ---- Step 3: Generate permanent token --------------------------------------------
-# No project selection needed â€” hooks are global, project_id comes from the goal at session time.
+# No project selection needed  -- hooks are global, project_id comes from the goal at session time.
 if (-not $IsLocalhost -and -not [string]::IsNullOrWhiteSpace($Token)) {
     try {
         $r = Invoke-WebRequest -Method POST -Uri "$MeridianUrl/auth/tokens" `
@@ -158,7 +158,7 @@ $ClaudeDetected = (Get-Command claude -ErrorAction SilentlyContinue) -ne $null -
 
 if ($ClaudeDetected) {
     Write-Host ""
-    Write-Host "Claude Code detected â€” writing hooks to $ClaudeSettingsPath"
+    Write-Host "Claude Code detected  -- writing hooks to $ClaudeSettingsPath"
     $ClaudeDir = Split-Path $ClaudeSettingsPath
     if (-not (Test-Path $ClaudeDir)) { New-Item -ItemType Directory -Path $ClaudeDir | Out-Null }
 
@@ -184,7 +184,7 @@ if ($ClaudeDetected) {
 $CodexDetected = (Get-Command codex -ErrorAction SilentlyContinue) -ne $null -or (Test-Path (Join-Path $HOME ".codex"))
 if ($CodexDetected) {
     Write-Host ""
-    Write-Host "Codex detected â€” writing MCP config to ~/.codex/config.toml"
+    Write-Host "Codex detected  -- writing MCP config to ~/.codex/config.toml"
     $CodexDir = Join-Path $HOME ".codex"
     $CodexConfigPath = Join-Path $CodexDir "config.toml"
     if (-not (Test-Path $CodexDir)) { New-Item -ItemType Directory -Path $CodexDir | Out-Null }
@@ -220,7 +220,7 @@ stop = "$escapedStop"
 $CursorDetected = (Get-Command cursor -ErrorAction SilentlyContinue) -ne $null -or (Test-Path (Join-Path $HOME ".cursor"))
 if ($CursorDetected) {
     Write-Host ""
-    Write-Host "Cursor detected â€” writing .cursor/mcp.json in current directory"
+    Write-Host "Cursor detected  -- writing .cursor/mcp.json in current directory"
     $CursorDir = Join-Path (Get-Location).Path ".cursor"
     $CursorConfigPath = Join-Path $CursorDir "mcp.json"
     if (-not (Test-Path $CursorDir)) { New-Item -ItemType Directory -Path $CursorDir | Out-Null }
