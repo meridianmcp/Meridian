@@ -128,6 +128,7 @@ async def test_get_executor_runs_list(db):
     runs = await db_module.get_executor_runs(db, p["id"])
     assert len(runs) == 2
     assert all(r["project_id"] == p["id"] for r in runs)
+    assert {r["session_name"] for r in runs} == {"sess-1", "sess-2"}
 
 
 @pytest.mark.asyncio

@@ -5396,6 +5396,25 @@ async def hooks_session_start(body: dict[str, Any], request: Request) -> dict[st
     hook_hostname = (body.get("hostname") or "").strip()
     db = await _resolve_hook_db(request)
 
+    def _normalize_hook_cwd(path: str) -> str:
+        value = (path or "").strip().replace("\\", "/")
+        m = re.match(r"^/mnt/([a-zA-Z])(?:/(.*))?$", value)
+        if m:
+            drive = m.group(1).upper()
+            rest = (m.group(2) or "").strip("/")
+            value = f"{drive}:/{rest}" if rest else f"{drive}:/"
+        return value.rstrip("/")
+
+    normalized_hook_cwd = _normalize_hook_cwd(hook_cwd)
+    import logging as _hook_logging
+    _hook_logging.getLogger("meridian.hooks").info(
+        "hooks/session-start cwd raw=%r normalized=%r hostname=%r project_id=%r",
+        hook_cwd,
+        normalized_hook_cwd,
+        hook_hostname,
+        project_id,
+    )
+
     if not project_id:
         # No project_id in payload -- auto-route by cwd/hostname match
         projects = await db_module.list_projects(db)
@@ -5404,7 +5423,7 @@ async def hooks_session_start(body: dict[str, Any], request: Request) -> dict[st
             return JSONResponse(status_code=400, content={"error": "no projects found -- create a project first"})
         # Try to match by repo_paths cwd+hostname
         matched = None
-        norm_cwd = hook_cwd.replace("\\\\", "/").replace("\\", "/").lower().rstrip("/")
+        norm_cwd = normalized_hook_cwd.lower().rstrip("/")
         for p in projects:
             cfg = p.get("executor_config") or {}
             if isinstance(cfg, str):
@@ -5413,7 +5432,7 @@ async def hooks_session_start(body: dict[str, Any], request: Request) -> dict[st
                 except Exception: cfg = {}
             repo_paths = cfg.get("repo_paths") or []
             for rp in repo_paths:
-                rp_cwd = rp.get("cwd", "").replace("\\\\", "/").replace("\\", "/").lower().rstrip("/")
+                rp_cwd = _normalize_hook_cwd(rp.get("cwd", "")).lower().rstrip("/")
                 rp_host = rp.get("hostname", "").lower()
                 if rp_cwd == norm_cwd and (not rp_host or rp_host == hook_hostname.lower()):
                     matched = p
@@ -5434,14 +5453,14 @@ async def hooks_session_start(body: dict[str, Any], request: Request) -> dict[st
                             try: cfg2 = _json2.loads(cfg2)
                             except Exception: cfg2 = {}
                         rps = cfg2.get("repo_paths") or []
-                        norm2 = hook_cwd.replace("\\\\", "/").replace("\\", "/").lower().rstrip("/")
+                        norm2 = normalized_hook_cwd.lower().rstrip("/")
                         if not any(
-                            rp.get("cwd", "").replace("\\\\", "/").replace("\\", "/").lower().rstrip("/") == norm2
+                            _normalize_hook_cwd(rp.get("cwd", "")).lower().rstrip("/") == norm2
                             for rp in rps
                         ):
-                            rps.append({"hostname": hook_hostname, "cwd": hook_cwd})
+                            rps.append({"hostname": hook_hostname, "cwd": normalized_hook_cwd or hook_cwd})
                             cfg2["repo_paths"] = rps
-                            await db_module.set_executor_config(db, project_id, _json2.dumps(cfg2))
+                            await db_module.set_executor_config(db, project_id, cfg2)
                     except Exception:
                         pass
             else:
@@ -5466,11 +5485,11 @@ async def hooks_session_start(body: dict[str, Any], request: Request) -> dict[st
                         await db_module.request_hitl(
                             db,
                             project_id=projects[0]["id"],
-                            question=f"Which project is this session for? (cwd: {hook_cwd})",
+                            question=f"Which project is this session for? (cwd: {normalized_hook_cwd or hook_cwd})",
                             options=options,
                             urgency="normal",
                             kind="hook_project_select",
-                            payload={"cwd": hook_cwd, "hostname": hook_hostname, "projects": [{"id": p2["id"], "name": p2["name"]} for p2 in projects]},
+                            payload={"cwd": normalized_hook_cwd or hook_cwd, "raw_cwd": hook_cwd, "hostname": hook_hostname, "projects": [{"id": p2["id"], "name": p2["name"]} for p2 in projects]},
                         )
                     except Exception:
                         pass
@@ -5509,7 +5528,7 @@ async def hooks_session_start(body: dict[str, Any], request: Request) -> dict[st
             import json as _json
 
             def _norm_p(p: str) -> str:
-                return p.replace("\\", "/").rstrip("/").lower()
+                return _normalize_hook_cwd(p).lower()
 
             exec_cfg = (project.get("executor_config") or {})
             if isinstance(exec_cfg, str):
@@ -5526,7 +5545,7 @@ async def hooks_session_start(body: dict[str, Any], request: Request) -> dict[st
                 else:
                     repo_paths = []
 
-            norm_cwd = _norm_p(hook_cwd)
+            norm_cwd = _norm_p(normalized_hook_cwd or hook_cwd)
             norm_hn = hook_hostname.lower() if hook_hostname else ""
 
             exact_match = any(
@@ -5541,7 +5560,7 @@ async def hooks_session_start(body: dict[str, Any], request: Request) -> dict[st
 
             if not repo_paths:
                 # Case 1: empty → auto-add silently, proceed
-                exec_cfg["repo_paths"] = [{"hostname": hook_hostname or "unknown", "cwd": hook_cwd}]
+                exec_cfg["repo_paths"] = [{"hostname": hook_hostname or "unknown", "cwd": normalized_hook_cwd or hook_cwd}]
                 exec_cfg.pop("repo_path", None)
                 await db_module.set_executor_config(db, project_id, exec_cfg)
             elif exact_match:
@@ -5556,13 +5575,13 @@ async def hooks_session_start(body: dict[str, Any], request: Request) -> dict[st
                     removal_list = ", ".join(hn_paths)
                     opts = [
                         "Stop — cancel this session",
-                        f"Add this location — keep existing, add {hook_cwd}",
-                        f"I moved here — remove [{removal_list}], add {hook_cwd}",
+                        f"Add this location — keep existing, add {normalized_hook_cwd or hook_cwd}",
+                        f"I moved here — remove [{removal_list}], add {normalized_hook_cwd or hook_cwd}",
                         "Just this once — proceed without saving",
                     ]
                     hitl = await db_module.request_hitl(
                         db, project_id,
-                        question=f"⚠ Session started from {hook_cwd} on {hook_hostname} — not a known location for this project.",
+                        question=f"⚠ Session started from {normalized_hook_cwd or hook_cwd} on {hook_hostname} — not a known location for this project.",
                         context=f"Known paths for {hook_hostname}: {removal_list}",
                         urgency="blocking",
                         kind="hook_cwd_mismatch",
@@ -5581,13 +5600,13 @@ async def hooks_session_start(body: dict[str, Any], request: Request) -> dict[st
                 if not already_pending:
                     opts = [
                         "Stop — cancel this session",
-                        f"Add this machine and location — {hook_hostname}/{hook_cwd}",
+                        f"Add this machine and location — {hook_hostname}/{normalized_hook_cwd or hook_cwd}",
                         "Just this once — proceed without saving",
                     ]
                     hitl = await db_module.request_hitl(
                         db, project_id,
-                        question=f"⚠ New machine {hook_hostname!r} connecting to this project from {hook_cwd}.",
-                        context=f"cwd: {hook_cwd}",
+                        question=f"⚠ New machine {hook_hostname!r} connecting to this project from {normalized_hook_cwd or hook_cwd}.",
+                        context=f"cwd: {normalized_hook_cwd or hook_cwd}",
                         urgency="blocking",
                         kind="hook_cwd_mismatch",
                         payload=_json.dumps({"options": opts}),
