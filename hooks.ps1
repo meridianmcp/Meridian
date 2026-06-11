@@ -302,7 +302,7 @@ if ($CodexDetected) {
     $CodexConfigPath = Join-Path $CodexDir "config.toml"
     if (-not (Test-Path $CodexDir)) { New-Item -ItemType Directory -Path $CodexDir | Out-Null }
 
-    $authLine = if ([string]::IsNullOrEmpty($Token)) { "" } else { "`napi_key = `"$Token`"" }
+    $authLine = if ([string]::IsNullOrEmpty($Token)) { "" } else { "`n`n[mcp_servers.meridian.http_headers]`nAuthorization = `"Bearer $Token`"" }
     $escapedStart = $startCmd.Replace('\', '\\').Replace('"', '\"')
     $escapedStop  = $stopCmd.Replace('\', '\\').Replace('"', '\"')
     $newBlock = @"
