@@ -199,31 +199,47 @@ if ($ClaudeDetected -and (Test-Path $ClaudeSettingsPath)) {
 }
 
 if ($ExistingHooks) {
+if ($ExistingHooks) {
     Write-Host ""
-    Write-Host "Existing Meridian hooks detected in Claude Code." -ForegroundColor Yellow
-    $choice = Read-Host "  (S)kip -- already good / (U)pdate hooks format / (R)egenerate API key [S/u/r]"
-    if ($choice -match "^[Uu]") {
-        Write-Host "  Updating hooks with existing key..."
-    } elseif ($choice -match "^[Rr]") {
-        Write-Host "  Regenerating API key..."
-        # Force generate a new permanent token
-        try {
-            $r = Invoke-WebRequest -Method POST -Uri "$MeridianUrl/auth/tokens" `
-                -Headers @{ Authorization = "Bearer $Token" } `
-                -ContentType "application/json" -Body '{"label":"hooks-installer"}' `
-                -UseBasicParsing -TimeoutSec 10 -ErrorAction SilentlyContinue
-            if ($r.StatusCode -eq 201) {
-                $td = $r.Content | ConvertFrom-Json
-                if ($td.token) {
-                    $Token = $td.token
-                    Write-Host "  New API key generated." -ForegroundColor Green
-                }
-            }
-        } catch { Write-Host "  Warning: could not generate new key, using existing." -ForegroundColor Yellow }
+    Write-Host "Existing Meridian hooks detected." -ForegroundColor Yellow
+    if (-not [string]::IsNullOrWhiteSpace($existingToken)) {
+        Write-Host "  Token is valid -- hooks are working." -ForegroundColor Green
+        $choice = Read-Host "  (S)kip -- leave as-is / (U)pdate format / (R)egenerate key [S/u/r]"
+        if ($choice -match "^[Uu]") {
+            Write-Host "  Updating hooks..."
+        } elseif ($choice -match "^[Rr]") {
+            Write-Host "  Regenerating API key..."
+            try {
+                $r2 = Invoke-WebRequest -Method POST -Uri "$MeridianUrl/auth/tokens" `
+                    -Headers @{ Authorization = "Bearer $Token" } `
+                    -ContentType "application/json" -Body 
+'
+{"label":"hooks-installer"}
+'
+ `
+                    -UseBasicParsing -TimeoutSec 10 -ErrorAction SilentlyContinue
+                if ($r2.StatusCode -eq 201) { $td2 = $r2.Content | ConvertFrom-Json; if ($td2.token) { $Token = $td2.token; Write-Host "  New key generated." -ForegroundColor Green } }
+            } catch {}
+        } else {
+            Write-Host "  Skipped." -ForegroundColor Yellow
+            exit 0
+        }
     } else {
-        Write-Host "  Skipped -- existing hooks unchanged." -ForegroundColor Yellow
-        exit 0
+        Write-Host "  Token invalid or expired -- updating automatically..." -ForegroundColor Yellow
+        # No prompt needed -- just regenerate silently
+        try {
+            $r2 = Invoke-WebRequest -Method POST -Uri "$MeridianUrl/auth/tokens" `
+                -Headers @{ Authorization = "Bearer $Token" } `
+                -ContentType "application/json" -Body 
+'
+{"label":"hooks-installer"}
+'
+ `
+                -UseBasicParsing -TimeoutSec 10 -ErrorAction SilentlyContinue
+            if ($r2.StatusCode -eq 201) { $td2 = $r2.Content | ConvertFrom-Json; if ($td2.token) { $Token = $td2.token; Write-Host "  New key generated." -ForegroundColor Green } }
+        } catch {}
     }
+}
 }
 
 # ---- Step 6: Write hooks to ~/.claude/settings.json ------------------------------
