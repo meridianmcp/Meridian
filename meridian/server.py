@@ -5412,7 +5412,7 @@ async def hooks_session_start(body: dict[str, Any], request: Request) -> dict[st
                     except Exception:
                         pass
                 # Return empty context -- session runs without Meridian context until user answers
-                return {"hookSpecificOutput": {"additionalContext": ""}}
+                return {"hookEventName": "SessionStart", "hookSpecificOutput": {"additionalContext": ""}}
         else:
             project = matched
             project_id = project["id"]
@@ -5558,7 +5558,7 @@ async def hooks_session_start(body: dict[str, Any], request: Request) -> dict[st
             f"Top item id: {top_item_id}"
         )
     additional_context = "\n".join(lines)
-    return {"hookSpecificOutput": {"additionalContext": additional_context}}
+    return {"hookEventName": "SessionStart", "hookSpecificOutput": {"additionalContext": additional_context}}
 
 
 @app.post("/hooks/stop")
