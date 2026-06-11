@@ -36,19 +36,11 @@ function isDemoMode() {
 
 
 
-function isHostedMode() {
-
-  return !!window.MERIDIAN_HOSTED;
-
-}
+// moved to dashboard-demo.js
 
 
 
-function isHostedAdmin() {
-
-  return isHostedMode() && !!window.MERIDIAN_IS_ADMIN;
-
-}
+// moved to dashboard-demo.js
 
 
 
@@ -450,47 +442,7 @@ function ensureTourButton() {
 
 
 
-// Small, unobtrusive "Send feedback" affordance in the sidebar footer. Tagged
-
-// data-demo-hide so the demo's hideDemoAdminControls() sweep removes it (it
-
-// POSTs to a write endpoint). Opens a lightweight modal — bug/feature/other.
-
-function ensureFeedbackButton() {
-
-  // The /feedback endpoint is hosted-only (404 otherwise) — don't show a
-
-  // button that would fail on self-hosted instances.
-
-  if (!isHostedMode()) return;
-
-  const footer = document.querySelector('.sidebar-footer');
-
-  if (!footer || document.getElementById('feedback-launch-btn')) return;
-
-  const btn = document.createElement('button');
-
-  btn.id = 'feedback-launch-btn';
-
-  btn.type = 'button';
-
-  btn.setAttribute('data-demo-hide', '');
-
-  btn.textContent = '💬 Send feedback';
-
-  btn.title = 'Report a bug or request a feature';
-
-  btn.style = 'display:block;width:100%;margin-top:6px;padding:5px 10px;font-size:10px;color:var(--muted);font-family:var(--font-mono);text-align:center;background:transparent;border:1px solid var(--border);border-radius:5px;cursor:pointer';
-
-  btn.onmouseenter = () => { btn.style.borderColor = 'var(--accent)'; btn.style.color = 'var(--accent)'; };
-
-  btn.onmouseleave = () => { btn.style.borderColor = 'var(--border)'; btn.style.color = 'var(--muted)'; };
-
-  btn.onclick = () => { try { showFeedbackModal(); } catch (e) {} };
-
-  footer.appendChild(btn);
-
-}
+// moved to dashboard-demo.js
 
 
 
@@ -620,6 +572,7 @@ function showLocalServerControls() {
 const STORAGE_KEY = (k) => (isDemoMode() ? 'meridian_demo_' : 'meridian_') + k.replace(/^meridian[._]/, '');
 
 const QUEUE_DONE_PAGE_SIZE = 10;
+const SESSION_LIVE_WINDOW_MS = 10 * 60 * 1000;
 
 const NORTH_STAR_MIN_HEIGHT_PX = 180;
 
@@ -1007,147 +960,7 @@ async function saveProjectSettings(projectId, patch) {
 
 
 
-function hideDemoAdminControls() {
-
-  const selectors = [
-
-    '#restart-server-btn',
-
-    '#stop-server-btn',
-
-    '#banner-restart-btn',
-
-    '#git-check-btn',
-
-    '#update-banner',
-
-    '#delete-account-section',
-
-    '[data-demo-hide]',
-
-    // Settings: hide write controls entirely in demo
-
-    '[id^="ntfy-url-"]',
-
-    '[id^="ntfy-save-"]',
-
-    '[id^="ntfy-test-"]',
-
-    '[id^="ntfy-status-"]',
-
-    '[id^="mcp-gen-token-"]',
-
-    '[id^="invite-email-"]',
-
-    '[id^="invite-role-"]',
-
-    '[id^="invite-btn-"]',
-
-    '[id^="github-repo-"]',
-
-    '[id^="github-branch-"]',
-
-    '[id^="github-connect-btn-"]',
-
-    '[id^="github-save-btn-"]',
-
-    '[id^="github-disconnect-btn-"]',
-
-    '[id^="github-test-btn-"]',
-
-    // Files tab: hide Edit subtab, show Preview only
-
-    '[id^="file-mode-edit-"]',
-
-    // Workspace settings: hide write controls entirely in demo (v3.4)
-
-    '#ws-settings-save',
-
-    '#ws-dec-title', '#ws-dec-body', '#ws-dec-add',
-
-    '#ws-note-title', '#ws-note-body', '#ws-note-add',
-
-    // Workspace DB connect UI — write action, hide in demo
-
-    '#connect-db-link',
-
-    '#connect-db-save',
-
-    // Easy-setup + goal template write controls (settings tab)
-
-    '[id^="exec-ez-save-"]',
-
-    '[id^="codex-save-goal-"]',
-
-    '[id^="codex-regen-goal-"]',
-
-  ];
-
-  selectors.forEach(sel => {
-
-    document.querySelectorAll(sel).forEach(el => { el.style.display = 'none'; });
-
-  });
-
-
-
-  // Apply 'Sign in to use' tooltip + not-allowed cursor to write-action buttons
-
-  // so demo visitors know what to expect before clicking.
-
-  const writeBtnSelectors = [
-
-    'button[data-write]',
-
-    '.btn-write',
-
-    '#add-sprint-item-btn',
-
-    '[id^="save-goal-"]',
-
-    '[id^="save-sprint-"]',
-
-    '[id^="delete-project-"]',
-
-    '[id^="rename-project-"]',
-
-    '[id^="add-sprint-"]',
-
-    '[id^="mark-done-"]',
-
-    '[id^="claim-task-"]',
-
-    // HITL markdown section-update approval (writes + commits a doc) — demo-gated
-
-    '.hitl-approve-btn',
-
-    '.hitl-reject-btn',
-
-  ];
-
-  writeBtnSelectors.forEach(sel => {
-
-    document.querySelectorAll(sel).forEach(btn => {
-
-      if (btn.dataset.demoHintApplied) return;
-
-      btn.dataset.demoHintApplied = '1';
-
-      btn.title = 'Sign in to use';
-
-      btn.style.opacity = String(parseFloat(btn.style.opacity || '1') * 0.55);
-
-      btn.style.cursor = 'not-allowed';
-
-      const orig = btn.onclick;
-
-      btn.onclick = (e) => { e.preventDefault(); e.stopPropagation(); showDemoReadonlyToast(); };
-
-    });
-
-  });
-
-}
+// moved to dashboard-demo.js
 
 
 
@@ -2942,6 +2755,19 @@ function formatRelativeTime(ts) {
 
 }
 
+function sessionAgeMs(session) {
+  const raw = session && session.last_seen ? String(session.last_seen) : '';
+  if (!raw) return Number.POSITIVE_INFINITY;
+  const iso = raw.includes('T') ? raw : raw.replace(' ', 'T') + 'Z';
+  const parsed = new Date(iso).getTime();
+  return Number.isFinite(parsed) ? Date.now() - parsed : Number.POSITIVE_INFINITY;
+}
+
+function isLiveSession(session, ageMs) {
+  const age = ageMs == null ? sessionAgeMs(session) : ageMs;
+  return session && session.status === 'active' && age >= 0 && age <= SESSION_LIVE_WINDOW_MS;
+}
+
 
 
 function openTab(project) {
@@ -4174,7 +4000,7 @@ function buildTabBody(project) {
 
             <button class="primary claude-section-btn" id="copy-start-code-${project.id}" title="Copies start_session() command for Claude Code">Claude Code ⬡</button>
 
-            <button class="secondary claude-section-btn" id="copy-start-chat-${project.id}" title="Copies context for claude.ai planning chat">Planning Chat ✦</button>
+            <button class="secondary claude-section-btn" id="copy-start-chat-${project.id}" title="Copies context for Claude or Codex">Open in Claude / Codex</button>
 
             <button class="secondary claude-section-btn" id="btn-setup-hooks-${project.id}" title="Auto-wire SessionStart + Stop hooks for your AI tools" style="font-size:10px">⚡ Setup Hooks</button>
 
@@ -5461,35 +5287,7 @@ function renderSprintProgress(projectId, items) {
 
              onclick="sprintItemEdit('${escapeHtml(projectId)}','${escapeHtml(it.id)}')">✏</button>`;
 
-    const thumbUp = it.feedback_thumb === 1 ? 'color:var(--accent-green)' : 'opacity:0.4';
-
-    const thumbDn = it.feedback_thumb === -1 ? 'color:var(--status-failed)' : 'opacity:0.4';
-
-    const feedbackHtml = it.status === 'done'
-
-      ? `<span class="sprint-item-feedback" style="display:inline-flex;align-items:center;gap:4px;font-size:11px;margin-left:4px">
-
-           <button title="Good" style="background:none;border:none;cursor:pointer;padding:0 2px;${thumbUp}"
-
-             onclick="sprintFeedback('${escapeHtml(projectId)}','${escapeHtml(it.id)}',1,${it.feedback_thumb == null ? 'null' : it.feedback_thumb},event)">👍</button>
-
-           <button title="Needs rework" style="background:none;border:none;cursor:pointer;padding:0 2px;${thumbDn}"
-
-             onclick="sprintFeedback('${escapeHtml(projectId)}','${escapeHtml(it.id)}',-1,${it.feedback_thumb == null ? 'null' : it.feedback_thumb},event)">👎</button>
-
-           ${it.feedback_note
-
-             ? `<span style="color:var(--muted);font-size:10px;max-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${escapeHtml(it.feedback_note)}">${escapeHtml(it.feedback_note)}</span>`
-
-             : `<input style="background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:9px;font-family:var(--font-mono);padding:1px 4px;width:80px" placeholder="note…"
-
-                   onblur="sprintFeedbackNote('${escapeHtml(projectId)}','${escapeHtml(it.id)}',this.value)"
-
-                   onkeydown="if(event.key==='Enter'){this.blur()}">`}
-
-         </span>`
-
-      : '';
+    const feedbackHtml = '';
 
     const canEdit = it.status === 'pending' || it.status === 'todo';
 
@@ -5991,7 +5789,7 @@ function cacheMostRecentSession(projectId, sessions) {
 
   );
 
-  const top = sorted.find(s => s.status !== 'closed') || sorted[0];
+  const top = sorted.find(s => isLiveSession(s)) || sorted.find(s => s.status !== 'closed') || sorted[0];
 
   if (top) panel.liveLastSessionId = top.id;
 
@@ -6005,9 +5803,8 @@ function renderLiveSessions(projectId, sessions, tasks) {
 
   if (!root) return;
 
-  const now = Date.now();
-
   const claimMap = new Map();
+  const taskMap = new Map();
 
   tasks.forEach(t => {
 
@@ -6017,21 +5814,20 @@ function renderLiveSessions(projectId, sessions, tasks) {
 
     }
 
+    const sid = t.session_id || t.claimed_by;
+    if (sid) {
+      if (!taskMap.has(sid)) taskMap.set(sid, []);
+      taskMap.get(sid).push(t);
+    }
+
   });
+  taskMap.forEach(rows => rows.sort((a, b) => String(b.created_at || '').localeCompare(String(a.created_at || ''))));
 
   const rows = sessions
 
     .map(s => {
 
-      let ageMs = 0;
-
-      try {
-
-        const ts = s.last_seen ? s.last_seen.replace(' ', 'T') + 'Z' : '';
-
-        if (ts) ageMs = now - new Date(ts).getTime();
-
-      } catch(e) {}
+      const ageMs = sessionAgeMs(s);
 
       return { s, ageMs };
 
@@ -6053,7 +5849,9 @@ function renderLiveSessions(projectId, sessions, tasks) {
 
     const mins = ageMs / 60000;
 
-    const dot = mins < 5 ? '🟢' : mins < 30 ? '🟡' : '⚫';
+    const live = isLiveSession(s, ageMs);
+    const dot = live ? (mins < 5 ? '🟢' : '🟡') : '⚫';
+    const displayStatus = live ? 'live' : (s.status === 'closed' || s.status === 'archived' ? s.status : 'idle');
 
     const label = s.human_id ? `${s.human_id}/${s.name}` : s.name;
 
@@ -6063,6 +5861,13 @@ function renderLiveSessions(projectId, sessions, tasks) {
 
       ? `<div class="live-session-task">↳ ${escapeHtml((claimed.description || '').slice(0, 140))}</div>`
 
+      : '';
+    const sessionTasks = taskMap.get(s.id) || [];
+    const taskRows = sessionTasks.slice(0, 3).map(t =>
+      `<div class="live-session-task">↳ ${escapeHtml((t.description || '').slice(0, 140))}</div>`
+    ).join('') || claimedRow;
+    const taskLink = sessionTasks.length > 0
+      ? `<button class="link-button live-session-task-link" data-session-id="${escapeHtml(s.id)}" style="margin-left:18px;margin-top:3px;font-size:10px;color:var(--accent);background:none;border:none;padding:0;cursor:pointer">View all ${sessionTasks.length} tasks →</button>`
       : '';
 
     const summary = s.session_summary;
@@ -6093,7 +5898,11 @@ function renderLiveSessions(projectId, sessions, tasks) {
 
       : '';
 
-    return `<div class="live-session-row">
+    const endBtn = live
+      ? `<button class="secondary live-session-end" data-session-id="${escapeHtml(s.id)}" style="padding:1px 6px;font-size:9px;margin-left:6px" title="Mark this session idle">End session</button>`
+      : '';
+
+    return `<div class="live-session-row" data-session-status="${escapeHtml(displayStatus)}">
 
       <div class="live-session-head">
 
@@ -6101,16 +5910,50 @@ function renderLiveSessions(projectId, sessions, tasks) {
 
         <span class="live-session-name">${escapeHtml(label)}</span>${fwBadge}
 
+        <span class="live-session-status" style="font-size:9px;color:var(--muted);text-transform:uppercase">${escapeHtml(displayStatus)}</span>
+
         <span class="live-session-age">${escapeHtml(formatRelativeTime(s.last_seen))}</span>
+
+        ${endBtn}
 
       </div>
 
-      ${claimedRow}${summaryRow}
+      ${taskRows}${taskLink}${summaryRow}
 
     </div>`;
 
   }).join('');
 
+  root.querySelectorAll('.live-session-end').forEach(btn => {
+    btn.onclick = () => endLiveSession(projectId, btn.dataset.sessionId);
+  });
+  root.querySelectorAll('.live-session-task-link').forEach(btn => {
+    btn.onclick = () => openTimelineForSession(projectId, btn.dataset.sessionId);
+  });
+
+}
+
+async function endLiveSession(projectId, sessionId) {
+  if (!sessionId) return;
+  try {
+    await api(`/sessions/${sessionId}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ status: 'idle' }),
+    });
+    toast('Session marked idle');
+    await refreshLiveTab(projectId);
+  } catch(e) {
+    toast(`End session failed: ${e.message}`, true);
+  }
+}
+
+function openTimelineForSession(projectId, sessionId) {
+  const panel = getPanelState(projectId);
+  panel.timelineSessionFilter = sessionId || null;
+  try { localStorage.setItem('meridian_tl_view_' + projectId, 'tasks'); } catch(_) {}
+  const btn = document.querySelector(`#vtab-strip-${projectId} .vtab-btn[data-vtab="timeline"]`);
+  if (btn) btn.click();
+  else loadTimeline(projectId);
 }
 
 
@@ -6399,7 +6242,7 @@ function wireClaudeLaunchPanel(projectId) {
 
       const text = payload.content || '';
 
-      showCopyPreview('Planning Chat Handoff — paste into claude.ai', text);
+      showCopyPreview('Claude / Codex Handoff', text);
 
     } catch(e) { toast('handoff failed: ' + e.message, true); }
 
@@ -6823,7 +6666,12 @@ function renderTimeline(projectId, data) {
 
   if (!wrap) return;
 
-  const { tasks = [], goal_events = [] } = data || {};
+  const p = state.panels[projectId];
+  const sessionFilter = p && p.timelineSessionFilter;
+  const rawTasks = (data && data.tasks) || [];
+  const tasks = sessionFilter ? rawTasks.filter(t => t.session_id === sessionFilter) : rawTasks;
+  const goal_events = sessionFilter ? [] : ((data && data.goal_events) || []);
+  data = { ...(data || {}), tasks, goal_events };
 
 
 
@@ -6836,8 +6684,6 @@ function renderTimeline(projectId, data) {
   }
 
 
-
-  const p = state.panels[projectId];
 
   if (p && p._echart) { try { p._echart.dispose(); } catch (_) {} p._echart = null; }
 
@@ -6885,6 +6731,7 @@ function renderTimeline(projectId, data) {
         <option value="by-sprint"${savedTlView === 'by-sprint' ? ' selected' : ''}>By Sprint</option>
 
       </select>
+      ${sessionFilter ? `<span style="font-size:10px;color:var(--accent);border:1px solid var(--accent)55;border-radius:3px;padding:2px 6px">session ${escapeHtml(sessionFilter.slice(0, 8))}</span><button class="secondary" id="tl-clear-session-${projectId}" style="padding:2px 8px;font-size:10px">Clear</button>` : ''}
 
     </div>
 
@@ -7009,6 +6856,12 @@ function renderTimeline(projectId, data) {
 
 
   const viewSelect = document.getElementById(`tl-view-select-${projectId}`);
+  const clearSessionBtn = document.getElementById(`tl-clear-session-${projectId}`);
+
+  if (clearSessionBtn) clearSessionBtn.onclick = () => {
+    if (p) p.timelineSessionFilter = null;
+    loadTimeline(projectId);
+  };
 
   if (viewSelect) {
 
@@ -7078,53 +6931,11 @@ function renderTimeline(projectId, data) {
 
 
 
-function _heatmapPieces(maxScale) {
-
-  // Six-bucket green→red ramp scaled proportionally to maxScale so projects
-
-  // with very different activity levels stay legible.
-
-  const colors = ['#bbf7d0', '#4ade80', '#16a34a', '#ca8a04', '#ea580c', '#dc2626'];
-
-  const n = colors.length;
-
-  const pieces = [];
-
-  let lo = 1;
-
-  for (let i = 0; i < n; i++) {
-
-    if (i === n - 1) {
-
-      pieces.push({ min: lo, color: colors[i], label: `${lo}+` });
-
-      break;
-
-    }
-
-    const hi = Math.max(lo, Math.round((maxScale * (i + 1)) / n));
-
-    pieces.push({ min: lo, max: hi, color: colors[i], label: lo === hi ? `${lo}` : `${lo}–${hi}` });
-
-    lo = hi + 1;
-
-  }
-
-  return pieces;
-
-}
+// moved to dashboard-timeline.js
 
 
 
-function _heatmapMaxFor(projectId) {
-
-  const raw = parseInt(localStorage.getItem(`meridian_heatmap_max_${projectId}`), 10);
-
-  if (!Number.isFinite(raw)) return 25;
-
-  return Math.min(100, Math.max(10, raw));
-
-}
+// moved to dashboard-timeline.js
 
 
 
@@ -8475,11 +8286,7 @@ async function loadSettingsTab(projectId) {
 
   const PREFS = [
 
-    { key: 'hitl',    label: 'HITL — get emailed when a session needs your input' },
-
-    { key: 'stalled', label: 'Session stalled — no heartbeat for 2+ hours' },
-
-    { key: 'storage', label: 'Storage at 80% — before hitting your plan limit' },
+    { key: 'hitl',    label: 'HITL — get notified when a session needs your input' },
 
     { key: 'sprint',  label: 'Sprint done — all items completed' },
 
@@ -10981,11 +10788,9 @@ async function loadSettingsTab(projectId) {
 
   const savedNotifyEmail = ntfyData ? (ntfyData.notify_email || '') : '';
 
-  // pre-fill with OAuth email for hosted users if no URL is saved yet. ntfy
-
   // targets show topic-only (the https://ntfy.sh/ prefix is implied).
 
-  const defaultNotifyUrl = displayNotifyTarget(savedNotifyUrl) || (state.tenantEmail ? state.tenantEmail : '');
+  const defaultNotifyUrl = displayNotifyTarget(savedNotifyUrl);
 
   // ntfy security warning: shown once until user acknowledges via localStorage.
 
@@ -11003,7 +10808,7 @@ async function loadSettingsTab(projectId) {
 
     <div style="font-size:10px;color:var(--muted);margin-bottom:8px">
 
-      Paste an <a href="https://ntfy.sh" target="_blank" style="color:var(--accent)">ntfy.sh</a> topic URL, a Slack/Discord webhook URL, or your email address.
+      Save a push/webhook target and an email target independently.
 
       Alerts fire on HITL requests and sprint completions. No account needed for ntfy.
 
@@ -11025,11 +10830,13 @@ async function loadSettingsTab(projectId) {
 
     <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
 
+      <label style="font-size:10px;color:var(--muted);white-space:nowrap;min-width:100px">ntfy_url:</label>
+
       <input type="text" id="ntfy-url-${projectId}"
 
         value="${escapeHtml(defaultNotifyUrl)}"
 
-        placeholder="${escapeHtml(suggestNtfyTopic(projectId))}  ·  https://hooks.slack.com/…  ·  you@email.com"
+        placeholder="${escapeHtml(suggestNtfyTopic(projectId))}  ·  https://hooks.slack.com/…"
 
         ${ntfyInputDisabled}
 
@@ -11045,10 +10852,10 @@ async function loadSettingsTab(projectId) {
 
     <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-top:6px">
 
-      <label style="font-size:10px;color:var(--muted);white-space:nowrap;min-width:100px">Notification email:</label>
+      <label style="font-size:10px;color:var(--muted);white-space:nowrap;min-width:100px">notify_email:</label>
 
       <input type="email" id="notify-email-${projectId}"
-        value="${escapeHtml(savedNotifyEmail)}"
+        value="${escapeHtml(savedNotifyEmail || state.tenantEmail || '')}"
         placeholder="you@example.com"
         style="flex:1;min-width:180px;padding:5px 8px;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;color:var(--text);font-family:var(--font-mono);font-size:11px;outline:none">
 
@@ -11062,7 +10869,7 @@ async function loadSettingsTab(projectId) {
 
       <strong>ntfy</strong> — install the ntfy app (iOS / Android / desktop), pick any topic name, and type it here. The <code>https://ntfy.sh/</code> prefix is added for you.<br>
 
-      <strong>Email</strong> — enter your address in the field above to get alerts by email (hosted only; fires independently from ntfy).<br>
+      <strong>Email</strong> — save <code>notify_email</code> separately to get alerts by email (hosted only; fires independently from ntfy).<br>
 
       <strong>Webhook</strong> — paste any <code>https://</code> URL (Slack, Discord, or your own) to receive a JSON POST.
 
@@ -12986,7 +12793,7 @@ async function loadRecentSessions(projectId, sessions = null) {
 
     const recent = (allSessions || [])
 
-      .filter(s => s.id !== panel.liveSessionId && s.status !== 'active')
+      .filter(s => s.id !== panel.liveSessionId && !isLiveSession(s))
 
       .sort((a, b) => String(b.last_seen || b.created_at || '').localeCompare(String(a.last_seen || a.created_at || '')))
 
@@ -13016,7 +12823,7 @@ async function loadRecentSessions(projectId, sessions = null) {
 
         const safeCmd = escapeHtml(cmd);
 
-        return `<div style="border:1px solid var(--border);border-radius:3px;padding:5px 8px;margin-bottom:4px;background:var(--surface-1)">
+        return `<div class="recent-session-row" data-session-id="${escapeHtml(s.id)}" style="border:1px solid var(--border);border-radius:3px;padding:5px 8px;margin-bottom:4px;background:var(--surface-1);cursor:pointer">
 
           <div style="display:flex;justify-content:space-between;align-items:center;gap:6px">
 
@@ -13029,12 +12836,15 @@ async function loadRecentSessions(projectId, sessions = null) {
               <button class="secondary resume-session-btn" data-cmd="${safeCmd}"
 
                 style="padding:1px 6px;font-size:9px" title="Copy start_session() to clipboard">Resume</button>
+              <button class="secondary recent-session-timeline-btn" data-session-id="${escapeHtml(s.id)}"
+                style="padding:1px 6px;font-size:9px" title="Open filtered timeline">Timeline</button>
 
             </div>
 
           </div>
 
           ${summary ? `<div style="font-size:9px;color:var(--muted);margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="${escapeHtml(s.summary || s.last_summary || '')}">${summary}</div>` : ''}
+          <div class="recent-session-tasks" style="display:none;margin-top:6px;padding-top:5px;border-top:1px solid var(--border);font-size:10px;color:var(--muted)"></div>
 
         </div>`;
 
@@ -13042,7 +12852,8 @@ async function loadRecentSessions(projectId, sessions = null) {
 
     el.querySelectorAll('.resume-session-btn').forEach(btn => {
 
-      btn.onclick = () => {
+      btn.onclick = (event) => {
+        event.stopPropagation();
 
         const cmd = btn.dataset.cmd || '';
 
@@ -13050,6 +12861,36 @@ async function loadRecentSessions(projectId, sessions = null) {
 
       };
 
+    });
+    el.querySelectorAll('.recent-session-timeline-btn').forEach(btn => {
+      btn.onclick = (event) => {
+        event.stopPropagation();
+        openTimelineForSession(projectId, btn.dataset.sessionId);
+      };
+    });
+    el.querySelectorAll('.recent-session-row').forEach(row => {
+      row.onclick = async () => {
+        const target = row.querySelector('.recent-session-tasks');
+        const sid = row.dataset.sessionId;
+        if (!target || !sid) return;
+        if (target.style.display !== 'none') {
+          target.style.display = 'none';
+          return;
+        }
+        if (!target.dataset.loaded) {
+          target.textContent = 'loading...';
+          try {
+            const rows = await api(`/projects/${projectId}/sessions/${sid}/tasks/live?limit=20`);
+            target.innerHTML = rows && rows.length
+              ? rows.map(t => `<div style="padding:2px 0"><span style="color:var(--accent)">${escapeHtml((t.status || '').toUpperCase())}</span> ${escapeHtml((t.description || '').slice(0, 180))}</div>`).join('')
+              : '<div>(no task log for this session)</div>';
+            target.dataset.loaded = '1';
+          } catch(e) {
+            target.textContent = 'failed to load tasks';
+          }
+        }
+        target.style.display = 'block';
+      };
     });
 
     el.style.display = 'block';
@@ -13189,6 +13030,7 @@ async function loadRecentRuns(projectId) {
     body.innerHTML = runs.map(run => {
 
       const sid = (run.session_id || '').slice(0, 8);
+      const runLabel = run.session_name || sid;
 
       const ts = (run.started_at || '').slice(0, 16).replace('T', ' ');
 
@@ -13210,9 +13052,9 @@ async function loadRecentRuns(projectId) {
 
         <div style="display:flex;justify-content:space-between;align-items:center;gap:6px">
 
-          <span style="font-size:10px;color:var(--text);font-family:var(--font-mono)">${escapeHtml(sid)}${dots}</span>
+          <span style="font-size:10px;color:var(--text);font-family:var(--font-mono);min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${escapeHtml(run.session_id || '')}">${escapeHtml(runLabel)}${dots}</span>
 
-          <span style="font-size:9px;color:var(--muted)">${cnt} tasks · ${dur} · ${ts}</span>
+          <span style="font-size:9px;color:var(--muted)">${cnt} tasks · ${dur} · ${ts}${run.session_name && sid ? ` · ${escapeHtml(sid)}` : ''}</span>
 
           <span style="font-size:9px;color:${statusColor}">${run.status}</span>
 
@@ -13298,15 +13140,19 @@ async function loadQueue(projectId) {
 
       projectApi(projectId, `/projects/${projectId}/sessions?active_only=false`).catch(() => []),
 
-      projectApi(projectId, `/projects/${projectId}/sprint-items`),
+      projectApi(projectId, `/projects/${projectId}/sprint-items?with_counts=true`),
 
     ]);
 
-    const liveSession = (sessions || []).find(s => s.status === 'active');
+    const liveSession = (sessions || []).find(s => isLiveSession(s));
 
     panel.liveSessionId = liveSession ? liveSession.id : null;
 
-    panel.queueSprintItems = sprintItems || [];
+    const sprintPayload = sprintItems || [];
+    panel.queueSprintItems = Array.isArray(sprintPayload) ? sprintPayload : (sprintPayload.items || []);
+    panel.queueTotalDoneCount = Array.isArray(sprintPayload)
+      ? panel.queueSprintItems.filter(it => it.status === 'done').length
+      : (sprintPayload.total_done_count || 0);
 
 
 
@@ -13499,6 +13345,9 @@ function renderQueue(projectId, sprintItems = []) {
   });
 
   const doneLimit = panel.queueDoneLimit || QUEUE_DONE_PAGE_SIZE;
+  const totalDoneCount = panel.queueTotalDoneCount != null
+    ? panel.queueTotalDoneCount
+    : (sprintItems || []).filter(it => it.status === 'done').length;
 
   const items = (sprintItems || []).slice();
 
@@ -13630,7 +13479,7 @@ function renderQueue(projectId, sprintItems = []) {
 
       <div class="queue-section-header" role="button" tabindex="0" aria-expanded="${collapsed ? 'false' : 'true'}" data-section-key="${escapeHtml(key)}">
 
-        <span class="queue-section-header-label">${icon} ${title} <span class="queue-section-count">(${rows.length})</span></span>
+        <span class="queue-section-header-label">${icon} ${title} <span class="queue-section-count">(${opts.count != null ? opts.count : rows.length})</span></span>
 
         <span class="queue-section-chevron" aria-hidden="true">▶</span>
 
@@ -13670,8 +13519,8 @@ function renderQueue(projectId, sprintItems = []) {
 
 
 
-  const doneTitle = doneAll.length
-    ? `${doneAll.length} completed`
+  const doneTitle = totalDoneCount
+    ? `${totalDoneCount} completed`
     : 'Done';
 
   return [
@@ -13682,7 +13531,7 @@ function renderQueue(projectId, sprintItems = []) {
 
     section('⏸', 'Backburner', backburner, 'no backburner items', { key: 'backburner', collapsed: true }),
 
-    section('✅', doneTitle, done, 'no completed sprint items', { key: 'done', collapsed: true, footer: doneFooter }),
+    section('✅', doneTitle, done, 'no completed sprint items', { key: 'done', collapsed: true, footer: doneFooter, count: totalDoneCount }),
 
     section('✕', 'Failed', failed, 'no failed sprint items', { key: 'failed', collapsed: true }),
 
@@ -17186,7 +17035,7 @@ function renderRewindSubtabs(projectId, data, history, stats, activeTab) {
 
     { id: 'versions', label: '📦 Milestones' },
 
-    { id: 'sprint',   label: '⚡ Tasks' },
+    { id: 'sprint',   label: '⚡ Sprint items' },
 
     { id: 'goals',    label: '🎯 Goal' },
 
@@ -17238,11 +17087,11 @@ function renderRewindCharts(projectId, stats) {
 
   return `<div style="padding:8px 0">
 
-    <div style="color:var(--accent);font-weight:600;font-size:11px;margin-bottom:8px">📊 Tasks completed / day (last ${stats.period_days}d)</div>
+    <div style="color:var(--accent);font-weight:600;font-size:11px;margin-bottom:8px">📊 Sprint items / day (last ${stats.period_days}d)</div>
 
     <canvas id="chart-tasks-${escapeHtml(projectId)}" style="max-width:100%;max-height:160px"></canvas>
 
-    <div style="${legendStyle}"><span>${swatch('rgba(96,165,250,0.7)')}Tasks completed</span></div>
+    <div style="${legendStyle}"><span>${swatch('rgba(96,165,250,0.7)')}Sprint items</span></div>
 
     <div style="color:var(--accent);font-weight:600;font-size:11px;margin:18px 0 8px">⚡ Session task completion % by version</div>
 
@@ -17286,11 +17135,13 @@ function initRewindCharts(projectId, stats) {
 
   const tasksCanvas = document.getElementById(`chart-tasks-${projectId}`);
 
-  if (tasksCanvas && stats.tasks_per_day) {
+  const sprintItemsPerDay = stats.sprint_items_per_day || stats.tasks_per_day;
 
-    const labels = stats.tasks_per_day.map(d => d.day.slice(5));  // MM-DD
+  if (tasksCanvas && sprintItemsPerDay) {
 
-    const totals = stats.tasks_per_day.map(d => d.total);
+    const labels = sprintItemsPerDay.map(d => d.day.slice(5));  // MM-DD
+
+    const totals = sprintItemsPerDay.map(d => d.total);
 
     const chart = new Chart(tasksCanvas, {
 
@@ -17302,7 +17153,7 @@ function initRewindCharts(projectId, stats) {
 
         datasets: [{
 
-          label: 'tasks done',
+          label: 'sprint items',
 
           data: totals,
 
@@ -17598,11 +17449,9 @@ function renderRewindVersions(projectId, data) {
 
     `<div style="padding:2px 0"><span style="color:var(--accent-green)">${escapeHtml(s.version || '')}</span> — ${escapeHtml(s.title || '')} <span style="color:var(--muted);font-size:10px">${escapeHtml(s.completed_at || '')}</span></div>`);
 
-  const byStatus = data.tasks_by_status || {};
-
   const summary = `<section style="margin-top:14px;padding-top:10px;border-top:1px solid var(--border)">
 
-    <div style="color:var(--accent);font-weight:600">📊 ${byStatus.done || 0} tasks completed over ${data.period_days}d</div>
+    <div style="color:var(--accent);font-weight:600">📊 ${(data.sprint_items_completed || []).length} sprint items completed over ${data.period_days}d</div>
 
   </section>`;
 
