@@ -5327,17 +5327,42 @@ async def hooks_session_start(body: dict[str, Any], request: Request) -> dict[st
     unchanged when no Bearer token is supplied.
     """
     project_id = (body.get("project_id") or "").strip()
-    if not project_id:
-        from fastapi.responses import JSONResponse
-        return JSONResponse(status_code=400, content={"error": "project_id required"})
     session_name = (body.get("session_name") or "hook-session").strip()
     hook_cwd = (body.get("cwd") or "").strip()
     hook_hostname = (body.get("hostname") or "").strip()
     db = await _resolve_hook_db(request)
-    project = await db_module.get_project(db, project_id)
-    if project is None:
-        from fastapi.responses import JSONResponse
-        return JSONResponse(status_code=404, content={"error": "project not found"})
+
+    if not project_id:
+        # No project_id in payload -- auto-route by cwd/hostname match or use first project
+        projects = await db_module.list_projects(db)
+        if not projects:
+            from fastapi.responses import JSONResponse
+            return JSONResponse(status_code=400, content={"error": "no projects found -- create a project first"})
+        # Try to match by repo_paths cwd+hostname
+        matched = None
+        norm_cwd = hook_cwd.replace("\\\\", "/").replace("\\", "/").lower().rstrip("/")
+        for p in projects:
+            cfg = p.get("executor_config") or {}
+            if isinstance(cfg, str):
+                import json as _json
+                try: cfg = _json.loads(cfg)
+                except Exception: cfg = {}
+            repo_paths = cfg.get("repo_paths") or []
+            for rp in repo_paths:
+                rp_cwd = rp.get("cwd", "").replace("\\\\", "/").replace("\\", "/").lower().rstrip("/")
+                rp_host = rp.get("hostname", "").lower()
+                if rp_cwd == norm_cwd and (not rp_host or rp_host == hook_hostname.lower()):
+                    matched = p
+                    break
+            if matched:
+                break
+        project = matched or projects[0]
+        project_id = project["id"]
+    else:
+        project = await db_module.get_project(db, project_id)
+        if project is None:
+            from fastapi.responses import JSONResponse
+            return JSONResponse(status_code=404, content={"error": "project not found"})
     # v2.8 — Codex/Claude hook sessions rarely pass a human_id, so they land on
     # the timeline as "(unknown)". Fall back to the workspace display name the
     # user set in Settings so their automated sessions are attributed to them.
