@@ -10016,6 +10016,8 @@ async function loadSettingsTab(projectId) {
 
     const displayIn = document.getElementById('ws-display-name');
 
+    const nudgeIn = document.getElementById('ws-nudge-threshold');
+
     const saveBtn = document.getElementById('ws-settings-save');
 
     const saveStatus = document.getElementById('ws-settings-status');
@@ -10032,6 +10034,8 @@ async function loadSettingsTab(projectId) {
 
         if (displayIn) displayIn.value = s.display_name || '';
 
+        if (nudgeIn) nudgeIn.value = s.log_task_sprint_nudge_threshold != null ? s.log_task_sprint_nudge_threshold : 5;
+
       } catch (e) { /* defaults shown */ }
 
     })();
@@ -10041,6 +10045,8 @@ async function loadSettingsTab(projectId) {
       saveBtn.disabled = true;
 
       try {
+
+        const nudgeVal = nudgeIn ? parseInt(nudgeIn.value, 10) : 5;
 
         await api('/workspace/settings', {
 
@@ -10053,6 +10059,8 @@ async function loadSettingsTab(projectId) {
             sprint_name_default: (sprintIn && sprintIn.value.trim()) || '',
 
             display_name: (displayIn && displayIn.value.trim()) || '',
+
+            log_task_sprint_nudge_threshold: isNaN(nudgeVal) ? 5 : Math.max(0, nudgeVal),
 
           }),
 
@@ -10256,6 +10264,10 @@ async function loadSettingsTab(projectId) {
       <label style="font-size:10px;color:var(--muted);display:block;margin-top:6px">Your display name<br>
         <input id="ws-display-name" type="text" placeholder="e.g. Adam" style="width:100%;max-width:240px;background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:3px 6px;margin-top:2px">
         <span style="display:block;font-size:9px;color:var(--muted);margin-top:2px">Used to attribute Claude/Codex hook sessions to you on the activity timeline when they don't set a name.</span>
+      </label>
+      <label style="font-size:10px;color:var(--muted);display:block;margin-top:6px">log_task nudge threshold (0 = off)<br>
+        <input id="ws-nudge-threshold" type="number" min="0" max="100" placeholder="5" style="width:80px;background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:3px 6px;margin-top:2px">
+        <span style="display:block;font-size:9px;color:var(--muted);margin-top:2px">After this many inline log_task calls with no sprint items, show a nudge to file sprint items. Default: 5.</span>
       </label>
       <div style="margin-top:8px;display:flex;gap:8px;align-items:center">
         <button id="ws-settings-save" class="primary" style="font-size:10px;padding:3px 10px">Save defaults</button>
