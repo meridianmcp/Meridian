@@ -79,8 +79,18 @@ Write-Host ""
 $DefaultUrl = "https://usemeridian.us"
 $MeridianUrl = Get-ArgValue -Arguments $CliArgs -Name "--url"
 if ($null -eq $MeridianUrl) {
-    $input = Read-Host "Meridian server URL (press Enter for $DefaultUrl)"
-    if ([string]::IsNullOrWhiteSpace($input)) { $MeridianUrl = $DefaultUrl } else { $MeridianUrl = $input }
+    Write-Host "Where is Meridian running?"
+    Write-Host "  [1] usemeridian.us -- hosted (recommended)"
+    Write-Host "  [2] localhost:7878 -- self-hosted"
+    Write-Host "  [3] Other URL"
+    $choice = Read-Host "Choice [1]"
+    if ($choice -eq "2") {
+        $MeridianUrl = "http://localhost:7878"
+    } elseif ($choice -eq "3") {
+        $MeridianUrl = Read-Host "Enter URL (e.g. https://my-meridian.example.com)"
+    } else {
+        $MeridianUrl = $DefaultUrl
+    }
 }
 $MeridianUrl = $MeridianUrl.TrimEnd("/")
 
