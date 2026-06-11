@@ -6564,6 +6564,45 @@ async def _handle_mcp_request(
     return _jsonrpc_err(req_id, -32601, f"method not found: {method}")
 
 
+async def _maybe_add_log_task_nudge(db: Any, task: dict[str, Any]) -> dict[str, Any]:
+    """Append a soft nudge to log_task result when session logs many tasks with no sprint work."""
+    try:
+        settings = await db_module.get_workspace_settings(db)
+        threshold = settings.get("log_task_sprint_nudge_threshold", 5)
+        if not threshold:
+            return task
+        session_id = task.get("session_id")
+        project_id = task.get("project_id")
+        if not session_id or not project_id:
+            return task
+        async with db.execute(
+            "SELECT COUNT(*) AS cnt FROM task_log WHERE session_id = ? AND status != 'failed'",
+            (session_id,),
+        ) as cur:
+            row = await cur.fetchone()
+        task_count = int(row["cnt"]) if row else 0
+        if task_count < threshold:
+            return task
+        async with db.execute(
+            "SELECT COUNT(*) AS cnt FROM sprint_items WHERE project_id = ? "
+            "AND claimed_at >= (SELECT created_at FROM sessions WHERE id = ?)",
+            (project_id, session_id),
+        ) as cur:
+            row = await cur.fetchone()
+        sprint_count = int(row["cnt"]) if row else 0
+        if sprint_count > 0:
+            return task
+        task = dict(task)
+        task["nudge"] = (
+            f"You have logged {task_count} tasks inline with no sprint items. "
+            "If this is coordinated work, consider filing sprint items for better tracking. "
+            "Set log_task_sprint_nudge_threshold=0 in workspace settings to disable."
+        )
+    except Exception:  # noqa: BLE001
+        pass
+    return task
+
+
 async def _dispatch_mcp_tool(
     name: str,
     args: dict[str, Any],
@@ -6618,11 +6657,12 @@ async def _dispatch_mcp_tool(
     if name == "set_north_star":
         return await db_module.set_north_star(db, args["project_id"], args["north_star"])
     if name == "log_task":
-        return await db_module.log_task(
+        task = await db_module.log_task(
             db, args["session_id"], args["project_id"],
             args["description"], args.get("status", "done"),
             parent_task_id=args.get("parent_task_id"),
         )
+        return await _maybe_add_log_task_nudge(db, task)
     if name == "get_tasks":
         return await db_module.get_tasks(db, args["project_id"], args.get("limit", 20))
     if name == "search_tasks":
@@ -9258,6 +9298,7 @@ def build_mcp_server():
                     arguments.get("status", "done"),
                     parent_task_id=arguments.get("parent_task_id"),
                 )
+                result = await _maybe_add_log_task_nudge(db, result)
             elif name == "get_tasks":
                 result = await db_module.get_tasks(
                     db,

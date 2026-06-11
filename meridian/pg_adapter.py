@@ -607,6 +607,8 @@ CREATE TABLE IF NOT EXISTS workspace_settings (
     id TEXT PRIMARY KEY DEFAULT 'singleton',
     hitl_auto_answer_default INTEGER NOT NULL DEFAULT 0,
     sprint_name_default TEXT,
+    display_name TEXT,
+    log_task_sprint_nudge_threshold INTEGER NOT NULL DEFAULT 5,
     updated_at TEXT NOT NULL DEFAULT ({_TS})
 );
 """
@@ -862,6 +864,7 @@ async def init_pg_db(url: str) -> PostgresConnection:
     await _migrate_pg_v33_hitl_kind_payload(conn)
     await _migrate_pg_v34_hitl_auto_answer(conn)
     await _migrate_pg_v34_workspace_settings(conn)
+    await _migrate_pg_workspace_settings_columns(conn)
     await _migrate_pg_project_icon(conn)
     if is_main_db:
         await _migrate_pg_v10_tenant_columns(conn)
@@ -1232,6 +1235,15 @@ async def _migrate_pg_v34_workspace_settings(conn: PostgresConnection) -> None:
         "    sprint_name_default TEXT,"
         f"    updated_at TEXT NOT NULL DEFAULT ({_TS})"
         ")"
+    )
+
+
+async def _migrate_pg_workspace_settings_columns(conn: PostgresConnection) -> None:
+    """Add display_name and log_task_sprint_nudge_threshold to existing workspace_settings rows."""
+    await conn.executescript(
+        "ALTER TABLE workspace_settings ADD COLUMN IF NOT EXISTS display_name TEXT;"
+        "ALTER TABLE workspace_settings ADD COLUMN IF NOT EXISTS "
+        "log_task_sprint_nudge_threshold INTEGER NOT NULL DEFAULT 5"
     )
 
 

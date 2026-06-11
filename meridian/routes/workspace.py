@@ -100,9 +100,11 @@ async def update_workspace_settings_endpoint(
     body: dict[str, Any], request: Request
 ) -> dict[str, Any]:
     """Patch workspace-global defaults. Only the fields passed are changed."""
+    nudge_thresh = body.get("log_task_sprint_nudge_threshold")
     return await db_module.update_workspace_settings(
         await _db(request),
         hitl_auto_answer_default=body.get("hitl_auto_answer_default"),
         sprint_name_default=body.get("sprint_name_default"),
         display_name=body.get("display_name"),
+        log_task_sprint_nudge_threshold=int(nudge_thresh) if nudge_thresh is not None else None,
     )

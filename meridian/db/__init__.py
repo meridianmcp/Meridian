@@ -503,6 +503,7 @@ CREATE TABLE IF NOT EXISTS workspace_settings (
     hitl_auto_answer_default INTEGER NOT NULL DEFAULT 0,
     sprint_name_default TEXT,
     display_name TEXT,
+    log_task_sprint_nudge_threshold INTEGER NOT NULL DEFAULT 5,
     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE TABLE IF NOT EXISTS feedback (
@@ -813,6 +814,9 @@ async def _migrate_v34_workspace_settings(db: aiosqlite.Connection) -> None:
     # that don't pass an explicit human_id, so their activity is attributed to a
     # person on the timeline instead of "(unknown)".
     await _migrate_add_column_if_missing(db, "workspace_settings", "display_name", "TEXT")
+    await _migrate_add_column_if_missing(
+        db, "workspace_settings", "log_task_sprint_nudge_threshold", "INTEGER NOT NULL DEFAULT 5"
+    )
 
 
 async def _migrate_dunning_fields(db: aiosqlite.Connection) -> None:
@@ -6331,7 +6335,8 @@ async def get_workspace_settings(db: aiosqlite.Connection) -> dict[str, Any]:
     callers never have to None-check. One singleton row per workspace DB.
     """
     async with db.execute(
-        "SELECT hitl_auto_answer_default, sprint_name_default, display_name, updated_at "
+        "SELECT hitl_auto_answer_default, sprint_name_default, display_name, "
+        "log_task_sprint_nudge_threshold, updated_at "
         "FROM workspace_settings WHERE id = ?",
         (_WORKSPACE_SETTINGS_ID,),
     ) as cur:
@@ -6341,6 +6346,9 @@ async def get_workspace_settings(db: aiosqlite.Connection) -> dict[str, Any]:
         "hitl_auto_answer_default": bool(data.get("hitl_auto_answer_default")),
         "sprint_name_default": data.get("sprint_name_default"),
         "display_name": data.get("display_name"),
+        "log_task_sprint_nudge_threshold": int(data["log_task_sprint_nudge_threshold"])
+        if data.get("log_task_sprint_nudge_threshold") is not None
+        else 5,
         "updated_at": data.get("updated_at"),
     }
 
@@ -6351,6 +6359,7 @@ async def update_workspace_settings(
     hitl_auto_answer_default: bool | None = None,
     sprint_name_default: str | None = None,
     display_name: str | None = None,
+    log_task_sprint_nudge_threshold: int | None = None,
 ) -> dict[str, Any]:
     """Upsert the workspace settings singleton and return the new values.
 
@@ -6374,6 +6383,9 @@ async def update_workspace_settings(
     if display_name is not None:
         updates.append("display_name = ?")
         params.append(display_name.strip() or None)
+    if log_task_sprint_nudge_threshold is not None:
+        updates.append("log_task_sprint_nudge_threshold = ?")
+        params.append(max(0, int(log_task_sprint_nudge_threshold)))
     if updates:
         from datetime import datetime, timezone
         now_ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")

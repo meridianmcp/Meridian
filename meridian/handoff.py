@@ -378,6 +378,31 @@ async def _generate_handoff_l0(
     return str(out_path.resolve()), content
 
 
+def _build_readiness_block(
+    sprint: str | None,
+    pending_count: int,
+    decisions_count: int,
+) -> str:
+    """Build the =HANDOFF READINESS= header block prepended to every handoff."""
+    lines = ["=== HANDOFF READINESS ==="]
+    if sprint:
+        lines.append(f"✓ Sprint: {sprint}")
+    else:
+        lines.append("⚠ No sprint name set")
+    if pending_count == 0:
+        lines.append("⚠ No pending sprint items -- add tasks before handing off to an executor")
+    else:
+        n = pending_count
+        lines.append(f"✓ {n} pending sprint item{'s' if n != 1 else ''}")
+    if decisions_count == 0:
+        lines.append("⚠ No pinned decisions -- consider pinning key architectural choices")
+    else:
+        n = decisions_count
+        lines.append(f"✓ {n} pinned decision{'s' if n != 1 else ''}")
+    lines.append("=========================")
+    return "\n".join(lines)
+
+
 def _render_workspace_handoff_block(
     decisions: list[dict], notes: list[dict]
 ) -> str:
@@ -546,6 +571,13 @@ async def generate_handoff(
     )
     if ws_block:
         content = f"{ws_block}\n\n{content}"
+
+    readiness_block = _build_readiness_block(
+        sprint=goal.get("sprint"),
+        pending_count=len(pending_sprint_items),
+        decisions_count=len([d for d in pinned_decisions if d.get("status") == "active"]),
+    )
+    content = f"{readiness_block}\n\n{content}"
 
     out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
