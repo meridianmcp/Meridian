@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env bash
+#!/usr/bin/env bash
 # hooks.sh - Meridian session lifecycle hooks installer
 #
 # Usage:

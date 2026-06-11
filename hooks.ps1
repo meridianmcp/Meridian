@@ -1,4 +1,4 @@
-﻿# hooks.ps1 - Meridian session lifecycle hooks installer (Windows / PowerShell)
+# hooks.ps1 - Meridian session lifecycle hooks installer (Windows / PowerShell)
 #
 # Usage:
 #   irm https://usemeridian.us/hooks.ps1 | iex
