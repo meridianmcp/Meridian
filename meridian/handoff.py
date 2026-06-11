@@ -113,6 +113,52 @@ def _build_quick_start_goal(
     )
 
 
+def _extract_keywords(text: str) -> set[str]:
+    """Extract significant lowercase keywords from a title/description string."""
+    stop = {
+        "a", "an", "the", "and", "or", "in", "on", "at", "to", "for",
+        "of", "is", "it", "fix", "add", "update", "remove", "change",
+        "with", "from", "by", "via", "use", "set", "get", "put", "new",
+        "this", "that", "into", "as", "be", "has", "was", "not", "no",
+    }
+    words = re.findall(r"[a-z0-9_/-]{3,}", text.lower())
+    return {w for w in words if w not in stop}
+
+
+def _annotate_possibly_done(
+    pending_items: list[dict[str, Any]],
+    recent_tasks: list[dict[str, Any]],
+    recent_commits: list[str] | None = None,
+) -> list[dict[str, Any]]:
+    """Flag pending sprint items whose keywords match a recent task or commit.
+
+    Adds ``possibly_done=True`` and ``possibly_done_matches`` (list of
+    matching descriptions) to any item with ≥2 keyword matches in the last
+    20 tasks or last 10 commits.  Items are not modified otherwise.
+    """
+    # Build a corpus of recent activity texts
+    corpus: list[str] = [
+        str(t.get("description") or "") for t in (recent_tasks or [])[:20]
+    ]
+    if recent_commits:
+        corpus.extend(str(c) for c in recent_commits[:10])
+
+    for item in pending_items:
+        title = item.get("title") or ""
+        kws = _extract_keywords(title)
+        if len(kws) < 2:
+            continue
+        matches = []
+        for text in corpus:
+            text_kws = _extract_keywords(text)
+            if len(kws & text_kws) >= 2:
+                matches.append(text[:120])
+        if matches:
+            item["possibly_done"] = True
+            item["possibly_done_matches"] = matches[:3]
+    return pending_items
+
+
 def resolve_handoff_mode(
     requested_mode: str | None,
     session_id: str | None = None,
@@ -240,8 +286,11 @@ def _render_delta_handoff(
     lines += ["", "Pending:"]
     if pending_sprint_items:
         for item in pending_sprint_items:
+            suffix = ""
+            if item.get("possibly_done"):
+                suffix = " ⚠ possibly done — verify before executing"
             lines.append(
-                f"- {item['id']} [{item['status']}] {item['title']}"
+                f"- {item['id']} [{item['status']}] {item['title']}{suffix}"
             )
     else:
         lines.append("- none")
@@ -505,6 +554,8 @@ async def generate_handoff(
         if it.get("status") in ("todo", "pending")
     ]
     pending_sprint_items = _prepare_pending_sprint_items(pending_sprint_items)
+    # Flag items that may already be done based on recent task descriptions
+    pending_sprint_items = _annotate_possibly_done(pending_sprint_items, tasks)
     decisions_log = (project.get("decisions") or "").strip()
     now_utc = datetime.now(timezone.utc)
     generated_at = now_utc.isoformat(timespec="seconds")
