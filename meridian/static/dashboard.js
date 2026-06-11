@@ -8786,19 +8786,19 @@ async function loadSettingsTab(projectId) {
 
     html += `<div style="margin-bottom:14px;padding:10px 12px;border:1px solid var(--border);border-radius:6px;background:var(--surface-2)">
 
-      <div style="font-weight:600;font-size:11px;color:var(--text);margin-bottom:4px">Executor Setup</div>
+      <div style="font-weight:600;font-size:12px;color:var(--text);margin-bottom:4px">Known Locations</div>
 
-      <div style="font-size:10px;color:var(--muted);margin-bottom:8px">Repo locations auto-tracked by hooks. Each entry shows hostname + working directory.</div>
+      <div style="font-size:10px;color:var(--muted);margin-bottom:8px">Hooks auto-register each machine + path on first session. Used to route sessions to the right project.</div>
 
       <div id="exec-ez-paths-tbl-${projectId}" style="margin-bottom:8px;font-size:10px;font-family:var(--font-mono)">
         ${(() => {
           const paths = Array.isArray(_ezCfg.repo_paths) ? _ezCfg.repo_paths : [];
-          if (!paths.length) return '<div style="color:var(--muted);font-style:italic">No locations tracked yet — install hooks to auto-populate.</div>';
+          if (!paths.length) return '<div style="color:var(--muted);font-style:italic">No locations tracked yet -- run the installer to auto-populate.</div>';
           return '<table style="width:100%;border-collapse:collapse">' +
             paths.map((p, i) => `<tr>
               <td style="padding:2px 6px 2px 0;color:var(--text)">${escapeHtml(p.hostname || '')}</td>
               <td style="padding:2px 6px 2px 0;color:var(--muted)">${escapeHtml(p.cwd || '')}</td>
-              <td style="padding:2px 0;text-align:right"><button class="exec-ez-del-row" data-pid="${escapeHtml(projectId)}" data-idx="${i}" style="font-size:9px;padding:1px 6px;background:transparent;border:1px solid var(--border);border-radius:3px;color:var(--muted);cursor:pointer">✕</button></td>
+              <td style="padding:2px 0;text-align:right"><button class="exec-ez-del-row" data-pid="${escapeHtml(projectId)}" data-idx="${i}" style="font-size:9px;padding:1px 6px;background:transparent;border:1px solid var(--border);border-radius:3px;color:var(--muted);cursor:pointer">Remove</button></td>
             </tr>`).join('') + '</table>';
         })()}
       </div>
@@ -10961,7 +10961,7 @@ async function loadSettingsTab(projectId) {
         const tblEl = document.getElementById(`exec-ez-paths-tbl-${projectId}`);
         if (tblEl) {
           if (!_ezPaths.length) {
-            tblEl.innerHTML = '<div style="color:var(--muted);font-style:italic;font-size:10px">No locations tracked yet — install hooks to auto-populate.</div>';
+            tblEl.innerHTML = '<div style="color:var(--muted);font-style:italic;font-size:10px">No locations tracked yet -- run the installer to auto-populate.</div>';
           } else {
             tblEl.innerHTML = '<table style="width:100%;border-collapse:collapse">' +
               _ezPaths.map((p, i) => `<tr>
@@ -10980,7 +10980,7 @@ async function loadSettingsTab(projectId) {
       ezClearBtn.onclick = () => {
         _ezPaths = [];
         const tblEl = document.getElementById(`exec-ez-paths-tbl-${projectId}`);
-        if (tblEl) tblEl.innerHTML = '<div style="color:var(--muted);font-style:italic;font-size:10px">No locations tracked yet — install hooks to auto-populate.</div>';
+        if (tblEl) tblEl.innerHTML = '<div style="color:var(--muted);font-style:italic;font-size:10px">No locations tracked yet -- run the installer to auto-populate.</div>';
       };
     }
 
