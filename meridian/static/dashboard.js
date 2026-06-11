@@ -8702,7 +8702,9 @@ async function loadSettingsTab(projectId) {
 
       </div>
 
-      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:6px">
+      <div style="font-size:10px;color:var(--muted);margin-top:6px">Need manual config? See <a href="https://docs.usemeridian.us/configuration" target="_blank" style="color:var(--accent);text-decoration:none">docs.usemeridian.us/configuration</a></div>
+
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:6px;margin-top:10px">
 
         ${mcpData ? `<button id="hooks-gen-token-${projectId}" class="primary" style="font-size:10px;padding:4px 10px">Generate API key</button>` : ''}
 
@@ -9012,7 +9014,9 @@ async function loadSettingsTab(projectId) {
 
       </div>
 
-      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:6px">
+      <div style="font-size:10px;color:var(--muted);margin-top:6px">Need manual config? See <a href="https://docs.usemeridian.us/configuration" target="_blank" style="color:var(--accent);text-decoration:none">docs.usemeridian.us/configuration</a></div>
+
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:6px;margin-top:10px">
 
         ${mcpData ? `<button id="hooks-gen-token-${projectId}" class="primary" style="font-size:10px;padding:4px 10px">Generate API key</button>` : ''}
 
@@ -11166,9 +11170,9 @@ async function loadSettingsTab(projectId) {
           if (!tokenId) return;
 
           const _revokeLabel = btn.getAttribute('data-token-label') || '';
-          const _isHooksKey = _revokeLabel === 'hooks-installer' || _revokeLabel === 'hooks-config';
+          const _isHooksKey = _revokeLabel.includes('hooks') || _revokeLabel.includes('installer');
           const _revokeMsg = _isHooksKey
-            ? 'This key may be used in your Claude Code hooks. After revoking, re-run the installer to reconnect.\n\nRevoke anyway?'
+            ? 'This key may be used in your Claude Code hooks.\n\nAfter revoking, re-run: irm https://usemeridian.us/hooks.ps1 | iex\n\nRevoke anyway?'
             : 'Revoke this API key? Existing clients using it will stop working.';
           if (!confirm(_revokeMsg)) return;
 
