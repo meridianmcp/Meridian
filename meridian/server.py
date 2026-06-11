@@ -5331,7 +5331,7 @@ async def hooks_session_start(body: dict[str, Any], request: Request) -> dict[st
     db = await _resolve_hook_db(request)
 
     if not project_id:
-        # No project_id in payload -- auto-route by cwd/hostname match or use first project
+        # No project_id in payload -- auto-route by cwd/hostname match
         projects = await db_module.list_projects(db)
         if not projects:
             from fastapi.responses import JSONResponse
@@ -5354,8 +5354,65 @@ async def hooks_session_start(body: dict[str, Any], request: Request) -> dict[st
                     break
             if matched:
                 break
-        project = matched or projects[0]
-        project_id = project["id"]
+        if not matched:
+            # No cwd match -- if only 1 project use it, else fire HITL
+            if len(projects) == 1:
+                project = projects[0]
+                project_id = project["id"]
+                # Auto-add this cwd to the project's repo_paths
+                if hook_cwd and hook_hostname:
+                    try:
+                        import json as _json2
+                        cfg2 = project.get("executor_config") or {}
+                        if isinstance(cfg2, str):
+                            try: cfg2 = _json2.loads(cfg2)
+                            except Exception: cfg2 = {}
+                        rps = cfg2.get("repo_paths") or []
+                        norm2 = hook_cwd.replace("\\\\", "/").replace("\\", "/").lower().rstrip("/")
+                        if not any(
+                            rp.get("cwd", "").replace("\\\\", "/").replace("\\", "/").lower().rstrip("/") == norm2
+                            for rp in rps
+                        ):
+                            rps.append({"hostname": hook_hostname, "cwd": hook_cwd})
+                            cfg2["repo_paths"] = rps
+                            await db_module.set_executor_config(db, project_id, _json2.dumps(cfg2))
+                    except Exception:
+                        pass
+            else:
+                # Multiple projects -- fire HITL (deduped by kind+cwd) so user picks in dashboard/chat
+                # Check if HITL already pending for this cwd (dedup)
+                hitl_exists = False
+                for p2 in projects:
+                    try:
+                        cur = await db.execute(
+                            "SELECT id FROM hitl_requests WHERE project_id=? AND kind='hook_project_select' AND status='pending' LIMIT 1",
+                            (p2["id"],)
+                        )
+                        if await cur.fetchone():
+                            hitl_exists = True
+                            break
+                    except Exception:
+                        pass
+                if not hitl_exists:
+                    options = [p2["name"] for p2 in projects] + ["None -- skip Meridian for this session"]
+                    # File HITL on the first project (arbitrary anchor)
+                    try:
+                        await db_module.request_hitl(
+                            db,
+                            project_id=projects[0]["id"],
+                            question=f"Which project is this session for? (cwd: {hook_cwd})",
+                            options=options,
+                            urgency="normal",
+                            kind="hook_project_select",
+                            payload={"cwd": hook_cwd, "hostname": hook_hostname, "projects": [{"id": p2["id"], "name": p2["name"]} for p2 in projects]},
+                        )
+                    except Exception:
+                        pass
+                # Return empty context -- session runs without Meridian context until user answers
+                return {"hookSpecificOutput": {"additionalContext": ""}}
+        else:
+            project = matched
+            project_id = project["id"]
     else:
         project = await db_module.get_project(db, project_id)
         if project is None:
