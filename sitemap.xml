@@ -2,30 +2,50 @@
 <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
     <url>
          <loc>https://docs.usemeridian.us/</loc>
-         <lastmod>2026-05-23</lastmod>
+         <lastmod>2026-06-11</lastmod>
     </url>
     <url>
          <loc>https://docs.usemeridian.us/api-reference/</loc>
-         <lastmod>2026-05-23</lastmod>
+         <lastmod>2026-06-11</lastmod>
+    </url>
+    <url>
+         <loc>https://docs.usemeridian.us/browser-connector/</loc>
+         <lastmod>2026-06-11</lastmod>
     </url>
     <url>
          <loc>https://docs.usemeridian.us/configuration/</loc>
-         <lastmod>2026-05-23</lastmod>
+         <lastmod>2026-06-11</lastmod>
+    </url>
+    <url>
+         <loc>https://docs.usemeridian.us/faq/</loc>
+         <lastmod>2026-06-11</lastmod>
+    </url>
+    <url>
+         <loc>https://docs.usemeridian.us/github-integration/</loc>
+         <lastmod>2026-06-11</lastmod>
     </url>
     <url>
          <loc>https://docs.usemeridian.us/hosted/</loc>
-         <lastmod>2026-05-23</lastmod>
+         <lastmod>2026-06-11</lastmod>
     </url>
     <url>
          <loc>https://docs.usemeridian.us/mcp-tools/</loc>
-         <lastmod>2026-05-23</lastmod>
+         <lastmod>2026-06-11</lastmod>
     </url>
     <url>
          <loc>https://docs.usemeridian.us/quickstart/</loc>
-         <lastmod>2026-05-23</lastmod>
+         <lastmod>2026-06-11</lastmod>
+    </url>
+    <url>
+         <loc>https://docs.usemeridian.us/safety-limits/</loc>
+         <lastmod>2026-06-11</lastmod>
     </url>
     <url>
          <loc>https://docs.usemeridian.us/self-hosting/</loc>
-         <lastmod>2026-05-23</lastmod>
+         <lastmod>2026-06-11</lastmod>
+    </url>
+    <url>
+         <loc>https://docs.usemeridian.us/team-self-hosting/</loc>
+         <lastmod>2026-06-11</lastmod>
     </url>
 </urlset>
