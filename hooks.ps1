@@ -80,7 +80,7 @@ $DefaultUrl = "https://usemeridian.us"
 $MeridianUrl = Get-ArgValue -Arguments $CliArgs -Name "--url"
 if ($null -eq $MeridianUrl) {
     Write-Host "Where is Meridian running?"
-    Write-Host "  [1] usemeridian.us -- hosted (recommended)"
+    Write-Host "  [1] usemeridian.us -- hosted (recommended, press Enter)"
     Write-Host "  [2] localhost:7878 -- self-hosted"
     Write-Host "  [3] Other URL"
     $choice = Read-Host "Choice [1]"
