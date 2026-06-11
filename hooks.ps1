@@ -51,21 +51,21 @@ function Get-MeResponse {
 }
 
 function Build-StartCmd {
-    param([string]$Url, [string]$Token, [string]$ProjectId)
+    param([string]$Url, [string]$Token)
     if ([string]::IsNullOrEmpty($Token)) {
-        $inner = 'try { $cwd=(Get-Location).Path.Replace("\","/"); $h=$env:COMPUTERNAME; $body="{""project_id"":""' + $ProjectId + '"",""cwd"":""$cwd"",""hostname"":""$h""}"; (Invoke-WebRequest -Method POST -Uri "' + $Url + '/hooks/session-start" -ContentType "application/json" -Body $body -UseBasicParsing).Content } catch { "{}" }'
+        $inner = 'try { $cwd=(Get-Location).Path.Replace("\","/"); $h=$env:COMPUTERNAME; $body="{""cwd"":""$cwd"",""hostname"":""$h""}"; (Invoke-WebRequest -Method POST -Uri "' + $Url + '/hooks/session-start" -ContentType "application/json" -Body $body -UseBasicParsing).Content } catch { "{}" }'
     } else {
-        $inner = 'try { $cwd=(Get-Location).Path.Replace("\","/"); $h=$env:COMPUTERNAME; $body="{""project_id"":""' + $ProjectId + '"",""cwd"":""$cwd"",""hostname"":""$h""}"; (Invoke-WebRequest -Method POST -Uri "' + $Url + '/hooks/session-start" -Headers @{ Authorization="Bearer ' + $Token + '" } -ContentType "application/json" -Body $body -UseBasicParsing).Content } catch { "{}" }'
+        $inner = 'try { $cwd=(Get-Location).Path.Replace("\","/"); $h=$env:COMPUTERNAME; $body="{""cwd"":""$cwd"",""hostname"":""$h""}"; (Invoke-WebRequest -Method POST -Uri "' + $Url + '/hooks/session-start" -Headers @{ Authorization="Bearer ' + $Token + '" } -ContentType "application/json" -Body $body -UseBasicParsing).Content } catch { "{}" }'
     }
     return "powershell -NoProfile -NonInteractive -Command `"$inner`""
 }
 
 function Build-StopCmd {
-    param([string]$Url, [string]$Token, [string]$ProjectId)
+    param([string]$Url, [string]$Token)
     if ([string]::IsNullOrEmpty($Token)) {
-        $inner = 'try { $h=$env:COMPUTERNAME; $body="{""project_id"":""' + $ProjectId + '"",""hostname"":""$h""}"; Invoke-WebRequest -Method POST -Uri "' + $Url + '/hooks/stop" -ContentType "application/json" -Body $body -UseBasicParsing | Out-Null } catch { }'
+        $inner = 'try { $h=$env:COMPUTERNAME; $body="{""hostname"":""$h""}"; Invoke-WebRequest -Method POST -Uri "' + $Url + '/hooks/stop" -ContentType "application/json" -Body $body -UseBasicParsing | Out-Null } catch { }'
     } else {
-        $inner = 'try { $h=$env:COMPUTERNAME; $body="{""project_id"":""' + $ProjectId + '"",""hostname"":""$h""}"; Invoke-WebRequest -Method POST -Uri "' + $Url + '/hooks/stop" -Headers @{ Authorization="Bearer ' + $Token + '" } -ContentType "application/json" -Body $body -UseBasicParsing | Out-Null } catch { }'
+        $inner = 'try { $h=$env:COMPUTERNAME; $body="{""hostname"":""$h""}"; Invoke-WebRequest -Method POST -Uri "' + $Url + '/hooks/stop" -Headers @{ Authorization="Bearer ' + $Token + '" } -ContentType "application/json" -Body $body -UseBasicParsing | Out-Null } catch { }'
     }
     return "powershell -NoProfile -NonInteractive -Command `"$inner`""
 }
@@ -110,7 +110,10 @@ if ($IsLocalhost) {
         Write-Host "Opening browser to authenticate..."
         Start-Process "$MeridianUrl/auth/install"
         Write-Host ""
-        $Token = Read-Host "Paste the token shown in your browser"
+        $secToken = Read-Host "Paste the token shown in your browser" -AsSecureString
+        $Token = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto(
+            [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($secToken)
+        )
     }
     $Token = $Token.Trim()
     if ([string]::IsNullOrWhiteSpace($Token)) {
@@ -127,42 +130,8 @@ if ($IsLocalhost) {
     Write-Host "  Authenticated as: $($me.email)" -ForegroundColor Green
 }
 
-# ---- Step 3: Project selection ----------------------------------------------------
-$ProjectId = Get-ArgValue -Arguments $CliArgs -Name "--project-id"
-$ProjectName = ""
-
-if ($null -eq $ProjectId) {
-    $projects = @()
-    try {
-        $me2 = Get-MeResponse -Url $MeridianUrl -Token $Token
-        if ($me2 -and $me2.projects) { $projects = @($me2.projects) }
-    } catch {}
-    if ($projects.Count -gt 0) {
-        Write-Host ""
-        Write-Host "Your projects:"
-        for ($i = 0; $i -lt $projects.Count; $i++) {
-            $shortId = $projects[$i].id.Substring(0, [Math]::Min(8, $projects[$i].id.Length))
-            Write-Host "  [$($i + 1)] $($projects[$i].name)  ($shortId...)"
-        }
-        Write-Host ""
-        $choice = Read-Host "Select project number [1-$($projects.Count)]"
-        $idx = [int]$choice - 1
-        if ($idx -lt 0 -or $idx -ge $projects.Count) {
-            Write-Host "Error: invalid selection." -ForegroundColor Red
-            exit 1
-        }
-        $ProjectId = $projects[$idx].id
-        $ProjectName = $projects[$idx].name
-    } else {
-        $ProjectId = Read-Host "Project ID"
-    }
-}
-if ([string]::IsNullOrWhiteSpace($ProjectId)) {
-    Write-Host "Error: project_id is required." -ForegroundColor Red
-    exit 1
-}
-
-# ---- Step 4: Generate permanent token --------------------------------------------
+# ---- Step 3: Generate permanent token --------------------------------------------
+# No project selection needed — hooks are global, project_id comes from the goal at session time.
 if (-not $IsLocalhost -and -not [string]::IsNullOrWhiteSpace($Token)) {
     try {
         $r = Invoke-WebRequest -Method POST -Uri "$MeridianUrl/auth/tokens" `
@@ -180,8 +149,8 @@ if (-not $IsLocalhost -and -not [string]::IsNullOrWhiteSpace($Token)) {
 }
 
 # ---- Step 5: Build hook commands -------------------------------------------------
-$startCmd = Build-StartCmd -Url $MeridianUrl -Token $Token -ProjectId $ProjectId
-$stopCmd  = Build-StopCmd  -Url $MeridianUrl -Token $Token -ProjectId $ProjectId
+$startCmd = Build-StartCmd -Url $MeridianUrl -Token $Token
+$stopCmd  = Build-StopCmd  -Url $MeridianUrl -Token $Token
 
 # ---- Step 6: Write hooks to ~/.claude/settings.json ------------------------------
 $ClaudeSettingsPath = Join-Path $HOME ".claude\settings.json"
@@ -272,7 +241,7 @@ $testOk = $false
 try {
     $testCwd = (Get-Location).Path.Replace("\", "/")
     $testHostname = $env:COMPUTERNAME
-    $testBody = "{`"project_id`":`"$ProjectId`",`"cwd`":`"$testCwd`",`"hostname`":`"$testHostname`"}"
+    $testBody = "{`"cwd`":`"$testCwd`",`"hostname`":`"$testHostname`"}"
     $hdrs = @{ "Content-Type" = "application/json" }
     if (-not [string]::IsNullOrWhiteSpace($Token)) { $hdrs["Authorization"] = "Bearer $Token" }
     $r = Invoke-WebRequest -Method POST -Uri "$MeridianUrl/hooks/session-start" `
@@ -288,6 +257,6 @@ if ($testOk) {
 # ---- Done ------------------------------------------------------------------------
 Write-Host ""
 $displayName = if ($ProjectName) { "'$ProjectName'" } else { $ProjectId }
-Write-Host "Done. Hooks installed for project $displayName." -ForegroundColor Green
+Write-Host "Done. Hooks installed for $MeridianUrl." -ForegroundColor Green
 Write-Host "Restart Claude Code to activate."
 Write-Host ""
