@@ -78,7 +78,16 @@ function Write-HookScripts {
         $line2 = '$h=$env:COMPUTERNAME'
         $line3 = '$b=@{cwd=$cwd;hostname=$h}|ConvertTo-Json -Compress'
         $line4 = "try{(Invoke-WebRequest -Method POST -Uri `"$Url/hooks/session-start`"$hdr -ContentType `"application/json`" -Body `$b -UseBasicParsing).Content}catch{`"{}`"}"
-        [System.IO.File]::WriteAllText($sp, ($line1,$line2,$line3,$line4 -join [char]10), $enc)
+
+        $startLines = @($line1, $line2, $line3)
+        if ($Url -match "(localhost|127\.0\.0\.1)") {
+            $startLines += '$alive=$false'
+            $startLines += "try{`$alive=(Invoke-WebRequest -Uri `"$Url/health`" -UseBasicParsing -TimeoutSec 3 -ErrorAction Stop).StatusCode -eq 200}catch{}"
+            $startLines += 'if(-not $alive){$pixi=(Split-Path (Split-Path $PSScriptRoot -Parent) -Parent);if(Test-Path "$pixi\pixi.toml"){Start-Process pixi -ArgumentList "run","start" -WorkingDirectory $pixi -WindowStyle Hidden;Start-Sleep 3}}'
+        }
+        $startLines += $line4
+        [System.IO.File]::WriteAllText($sp, ($startLines -join [char]10), $enc)
+
         $line4s = "try{Invoke-WebRequest -Method POST -Uri `"$Url/hooks/stop`"$hdr -ContentType `"application/json`" -Body `$b -UseBasicParsing|Out-Null}catch{}"
         [System.IO.File]::WriteAllText($tp, ($line1,$line2,$line3,$line4s -join [char]10), $enc)
     }
