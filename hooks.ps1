@@ -58,15 +58,31 @@ function Build-StartCmd {
 function Write-HookScripts {
     param([string]$Url, [string]$Token, [string]$HooksDir)
     $null = New-Item -ItemType Directory -Force $HooksDir
-    $startPath = Join-Path $HooksDir "meridian-start.ps1"
-    $stopPath = Join-Path $HooksDir "meridian-stop.ps1"
-    $authStart = if ([string]::IsNullOrEmpty($Token)) { "" } else { "    -Headers @{Authorization=`"Bearer $Token`"} ``" }
-    $authStop = $authStart
-    $startContent = "```$cwd = (Get-Location).Path -replace `"\\\\`", `"/`"`n```$h = ```$env:COMPUTERNAME`n```$b = `"{`"`"cwd`"`":`"`"`$cwd`"`",`"`"hostname`"`":`"`"`$h`"`"}`"`n$authStart`ntry { (Invoke-WebRequest -Method POST -Uri `"$Url/hooks/session-start`" -ContentType `"application/json`" -Body ```$b -UseBasicParsing).Content } catch { `"`"{}`"`" }"
-    $stopContent  = "```$h = ```$env:COMPUTERNAME`n```$b = `"{`"`"hostname`"`":`"`"`$h`"`"}`"`n$authStop`ntry { Invoke-WebRequest -Method POST -Uri `"$Url/hooks/stop`" -ContentType `"application/json`" -Body ```$b -UseBasicParsing | Out-Null } catch {}"
-    [System.IO.File]::WriteAllText($startPath, $startContent, (New-Object System.Text.UTF8Encoding $false))
-    [System.IO.File]::WriteAllText($stopPath, $stopContent, (New-Object System.Text.UTF8Encoding $false))
-    return @{ Start = $startPath; Stop = $stopPath }
+    $sp = Join-Path $HooksDir "meridian-start.ps1"
+    $tp = Join-Path $HooksDir "meridian-stop.ps1"
+
+    # If scripts exist, update token in-place (regex replace)
+    foreach ($file in @($sp, $tp)) {
+        if (Test-Path $file) {
+            $c = [System.IO.File]::ReadAllText($file)
+            $c = $c -replace "sk_meridian_[A-Za-z0-9_\-]+", $Token
+            [System.IO.File]::WriteAllText($file, $c, (New-Object System.Text.UTF8Encoding $false))
+        }
+    }
+
+    # If scripts dont exist, create them via direct byte writing
+    if (-not (Test-Path $sp)) {
+        $enc = (New-Object System.Text.UTF8Encoding $false)
+        $hdr = if ([string]::IsNullOrEmpty($Token)) { "" } else { " -Headers @{Authorization=`"Bearer $Token`"}" }
+        $line1 = '$cwd=(Get-Location).Path -replace [char]92,[char]47'
+        $line2 = '$h=$env:COMPUTERNAME'
+        $line3 = '$b=@{cwd=$cwd;hostname=$h}|ConvertTo-Json -Compress'
+        $line4 = "try{(Invoke-WebRequest -Method POST -Uri `"$Url/hooks/session-start`"$hdr -ContentType `"application/json`" -Body `$b -UseBasicParsing).Content}catch{`"{}`"}"
+        [System.IO.File]::WriteAllText($sp, ($line1,$line2,$line3,$line4 -join [char]10), $enc)
+        $line4s = "try{Invoke-WebRequest -Method POST -Uri `"$Url/hooks/stop`"$hdr -ContentType `"application/json`" -Body `$b -UseBasicParsing|Out-Null}catch{}"
+        [System.IO.File]::WriteAllText($tp, ($line1,$line2,$line3,$line4s -join [char]10), $enc)
+    }
+    return @{ Start = $sp; Stop = $tp }
 }
 
 function Build-StopCmd {
