@@ -5358,6 +5358,40 @@ function renderSprintProgress(projectId, items) {
 
   }
 
+  // Human-assigned items — "Your tasks" section above the pending queue.
+
+  const humanItems = items.filter(it => it.milestone_type === 'human' && activeSet.has(it.status));
+
+  if (humanItems.length > 0) {
+
+    html += `<div style="background:rgba(59,130,246,0.08);border:1px solid rgba(59,130,246,0.35);border-radius:6px;padding:8px 10px;margin-bottom:10px">
+
+      <div style="color:var(--accent);font-weight:600;margin-bottom:6px;font-size:12px">👤 Your tasks (${humanItems.length})</div>`;
+
+    html += humanItems.map(it => `
+
+      <div class="sprint-item-row" data-item="${escapeHtml(it.id)}" style="background:transparent;border-bottom:1px solid rgba(59,130,246,0.2);padding:4px 0">
+
+        <span class="sprint-item-icon" style="color:var(--accent)">👤</span>
+
+        <span class="sprint-item-title">${escapeHtml(it.title)}</span>
+
+        <span class="sprint-item-ver">${escapeHtml(it.version)}</span>
+
+        <span class="sprint-item-actions">
+
+          <button class="sprint-btn" title="Mark done"
+
+            onclick="sprintAction('${escapeHtml(projectId)}','${escapeHtml(it.id)}','complete')">✓ Done</button>
+
+        </span>
+
+      </div>`).join('');
+
+    html += `</div>`;
+
+  }
+
   // Build parent → children map across all items (for progress counts + tree display).
 
   const allChildrenOf = new Map();
@@ -8752,21 +8786,28 @@ async function loadSettingsTab(projectId) {
 
     html += `<div style="margin-bottom:14px;padding:10px 12px;border:1px solid var(--border);border-radius:6px;background:var(--surface-2)">
 
-      <div style="font-weight:600;font-size:11px;color:var(--text);margin-bottom:4px">Quick setup</div>
+      <div style="font-weight:600;font-size:11px;color:var(--text);margin-bottom:4px">Executor Setup</div>
 
-      <div style="font-size:10px;color:var(--muted);margin-bottom:8px">Tell Meridian where your code lives and how to run tests.</div>
+      <div style="font-size:10px;color:var(--muted);margin-bottom:8px">Repo locations auto-tracked by hooks. Each entry shows hostname + working directory.</div>
 
-      <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px 12px;margin-bottom:8px">
-
-        <label style="font-size:10px;color:var(--muted)">repo_path<br><input id="exec-ez-repo_path-${projectId}" type="text" placeholder="Abs path to repo root" style="width:100%;background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:3px 6px;margin-top:2px" value="${escapeHtml(String(_ezCfg.repo_path || ''))}"></label>
-
-        <label style="font-size:10px;color:var(--muted)">test_cmd<br><input id="exec-ez-test_cmd-${projectId}" type="text" placeholder="pixi run test" style="width:100%;background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:3px 6px;margin-top:2px" value="${escapeHtml(String(_ezCfg.test_cmd || ''))}"></label>
-
+      <div id="exec-ez-paths-tbl-${projectId}" style="margin-bottom:8px;font-size:10px;font-family:var(--font-mono)">
+        ${(() => {
+          const paths = Array.isArray(_ezCfg.repo_paths) ? _ezCfg.repo_paths : [];
+          if (!paths.length) return '<div style="color:var(--muted);font-style:italic">No locations tracked yet — install hooks to auto-populate.</div>';
+          return '<table style="width:100%;border-collapse:collapse">' +
+            paths.map((p, i) => `<tr>
+              <td style="padding:2px 6px 2px 0;color:var(--text)">${escapeHtml(p.hostname || '')}</td>
+              <td style="padding:2px 6px 2px 0;color:var(--muted)">${escapeHtml(p.cwd || '')}</td>
+              <td style="padding:2px 0;text-align:right"><button class="exec-ez-del-row" data-pid="${escapeHtml(projectId)}" data-idx="${i}" style="font-size:9px;padding:1px 6px;background:transparent;border:1px solid var(--border);border-radius:3px;color:var(--muted);cursor:pointer">✕</button></td>
+            </tr>`).join('') + '</table>';
+        })()}
       </div>
 
       <div style="display:flex;gap:8px;align-items:center">
 
         <button id="exec-ez-save-${projectId}" class="primary" style="font-size:10px;padding:3px 10px">Save</button>
+
+        <button id="exec-ez-clear-${projectId}" class="secondary" style="font-size:10px;padding:3px 10px">Clear all</button>
 
         <span id="exec-ez-status-${projectId}" style="font-size:10px;color:var(--muted);min-height:14px"></span>
 
@@ -9800,9 +9841,28 @@ async function loadSettingsTab(projectId) {
 
     <div style="font-size:10px;color:var(--muted);margin-bottom:8px">Per-project defaults injected into executor sessions via <code>start_session(role="executor")</code>. Set once; all executors inherit automatically.</div>
 
-    <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px 12px">
+    <div style="margin-bottom:10px">
 
-      <label style="font-size:10px;color:var(--muted)">repo_path<br><input id="exec-repo_path-${projectId}" type="text" placeholder="Abs path to repo root" style="width:100%;background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:3px 6px;margin-top:2px" value="${escapeHtml(String(execCfg.repo_path || ''))}"></label>
+      <div style="font-size:10px;color:var(--muted);margin-bottom:4px">repo_paths<br><span style="font-size:9px;color:var(--muted)">Auto-tracked by hooks. Delete rows to remove locations.</span></div>
+
+      <div id="exec-repo-paths-tbl-${projectId}" style="font-size:10px;font-family:var(--font-mono);margin-bottom:6px">
+        ${(() => {
+          const rps = Array.isArray(execCfg.repo_paths) ? execCfg.repo_paths : [];
+          if (!rps.length) return '<div style="color:var(--muted);font-style:italic">No locations tracked yet.</div>';
+          return '<table style="width:100%;border-collapse:collapse">' +
+            rps.map((p, i) => `<tr>
+              <td style="padding:2px 6px 2px 0;color:var(--text)">${escapeHtml(p.hostname || '')}</td>
+              <td style="padding:2px 6px 2px 0;color:var(--muted)">${escapeHtml(p.cwd || '')}</td>
+              <td style="padding:2px 0;text-align:right"><button class="exec-del-rp-row" data-pid="${escapeHtml(projectId)}" data-idx="${i}" style="font-size:9px;padding:1px 6px;background:transparent;border:1px solid var(--border);border-radius:3px;color:var(--muted);cursor:pointer">✕</button></td>
+            </tr>`).join('') + '</table>';
+        })()}
+      </div>
+
+      <button id="exec-clear-paths-${projectId}" class="secondary" style="font-size:9px;padding:2px 8px">Clear all</button>
+
+    </div>
+
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px 12px">
 
       <label style="font-size:10px;color:var(--muted)">env_file<br><input id="exec-env_file-${projectId}" type="text" placeholder=".env file path" style="width:100%;background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:3px 6px;margin-top:2px" value="${escapeHtml(String(execCfg.env_file || ''))}"></label>
 
@@ -9858,13 +9918,42 @@ async function loadSettingsTab(projectId) {
 
     }
 
+    // Wire repo_paths delete/clear in Executor Config section
+    let _execRepoPaths = Array.isArray(execCfg.repo_paths) ? [...execCfg.repo_paths] : [];
+    const _rpTblEl = document.getElementById(`exec-repo-paths-tbl-${projectId}`);
+    const _rerenderRpTbl = () => {
+      if (!_rpTblEl) return;
+      if (!_execRepoPaths.length) {
+        _rpTblEl.innerHTML = '<div style="color:var(--muted);font-style:italic;font-size:10px">No locations tracked yet.</div>';
+      } else {
+        _rpTblEl.innerHTML = '<table style="width:100%;border-collapse:collapse">' +
+          _execRepoPaths.map((p, i) => `<tr>
+            <td style="padding:2px 6px 2px 0;color:var(--text);font-size:10px;font-family:var(--font-mono)">${escapeHtml(p.hostname||'')}</td>
+            <td style="padding:2px 6px 2px 0;color:var(--muted);font-size:10px;font-family:var(--font-mono)">${escapeHtml(p.cwd||'')}</td>
+            <td style="padding:2px 0;text-align:right"><button class="exec-del-rp-row" data-pid="${escapeHtml(projectId)}" data-idx="${i}" style="font-size:9px;padding:1px 6px;background:transparent;border:1px solid var(--border);border-radius:3px;color:var(--muted);cursor:pointer">✕</button></td>
+          </tr>`).join('') + '</table>';
+        _rpTblEl.querySelectorAll('.exec-del-rp-row').forEach(b => {
+          b.onclick = () => { _execRepoPaths.splice(parseInt(b.dataset.idx, 10), 1); _rerenderRpTbl(); };
+        });
+      }
+    };
+    if (_rpTblEl) {
+      _rpTblEl.querySelectorAll('.exec-del-rp-row').forEach(b => {
+        b.onclick = () => { _execRepoPaths.splice(parseInt(b.dataset.idx, 10), 1); _rerenderRpTbl(); };
+      });
+    }
+    const _clearRpBtn = document.getElementById(`exec-clear-paths-${projectId}`);
+    if (_clearRpBtn) { _clearRpBtn.onclick = () => { _execRepoPaths = []; _rerenderRpTbl(); }; }
+
     saveBtn.onclick = async () => {
 
       saveBtn.disabled = true;
 
-      const fields = ['repo_path', 'env_file', 'test_cmd', 'deploy_cmd', 'branch'];
+      const fields = ['env_file', 'test_cmd', 'deploy_cmd', 'branch'];
 
       const cfg = {};
+
+      cfg.repo_paths = _execRepoPaths;
 
       for (const f of fields) {
 
@@ -10852,19 +10941,54 @@ async function loadSettingsTab(projectId) {
     }
   }, 0);
 
-  // Easy-setup mini executor save (hosted only)
+  // Executor Setup mini section (repo_paths table)
   setTimeout(() => {
     const ezSaveBtn = document.getElementById(`exec-ez-save-${projectId}`);
+    const ezClearBtn = document.getElementById(`exec-ez-clear-${projectId}`);
     const ezStatus = document.getElementById(`exec-ez-status-${projectId}`);
     if (!ezSaveBtn) return;
+
+    // Collect current repo_paths from the table DOM (read from projectSettings, modified by delete/clear)
+    let _ezPaths = Array.isArray(
+      (projectSettings && projectSettings.executor_config && projectSettings.executor_config.repo_paths)
+    ) ? [...projectSettings.executor_config.repo_paths] : [];
+
+    // Wire delete-row buttons
+    document.querySelectorAll(`.exec-ez-del-row[data-pid="${projectId}"]`).forEach(btn => {
+      btn.onclick = () => {
+        const idx = parseInt(btn.dataset.idx, 10);
+        _ezPaths.splice(idx, 1);
+        const tblEl = document.getElementById(`exec-ez-paths-tbl-${projectId}`);
+        if (tblEl) {
+          if (!_ezPaths.length) {
+            tblEl.innerHTML = '<div style="color:var(--muted);font-style:italic;font-size:10px">No locations tracked yet — install hooks to auto-populate.</div>';
+          } else {
+            tblEl.innerHTML = '<table style="width:100%;border-collapse:collapse">' +
+              _ezPaths.map((p, i) => `<tr>
+                <td style="padding:2px 6px 2px 0;color:var(--text);font-size:10px;font-family:var(--font-mono)">${escapeHtml(p.hostname || '')}</td>
+                <td style="padding:2px 6px 2px 0;color:var(--muted);font-size:10px;font-family:var(--font-mono)">${escapeHtml(p.cwd || '')}</td>
+                <td style="padding:2px 0;text-align:right"><button class="exec-ez-del-row" data-pid="${escapeHtml(projectId)}" data-idx="${i}" style="font-size:9px;padding:1px 6px;background:transparent;border:1px solid var(--border);border-radius:3px;color:var(--muted);cursor:pointer">✕</button></td>
+              </tr>`).join('') + '</table>';
+            // Re-wire after re-render
+            document.querySelectorAll(`.exec-ez-del-row[data-pid="${projectId}"]`).forEach(b2 => { b2.onclick = btn.onclick; });
+          }
+        }
+      };
+    });
+
+    if (ezClearBtn) {
+      ezClearBtn.onclick = () => {
+        _ezPaths = [];
+        const tblEl = document.getElementById(`exec-ez-paths-tbl-${projectId}`);
+        if (tblEl) tblEl.innerHTML = '<div style="color:var(--muted);font-style:italic;font-size:10px">No locations tracked yet — install hooks to auto-populate.</div>';
+      };
+    }
+
     ezSaveBtn.onclick = async () => {
       ezSaveBtn.disabled = true;
-      const repoPath = (document.getElementById(`exec-ez-repo_path-${projectId}`)?.value || '').trim();
-      const testCmd = (document.getElementById(`exec-ez-test_cmd-${projectId}`)?.value || '').trim();
       const curCfg = (projectSettings && projectSettings.executor_config) || {};
-      const cfg = { ...curCfg };
-      if (repoPath) cfg.repo_path = repoPath; else delete cfg.repo_path;
-      if (testCmd) cfg.test_cmd = testCmd; else delete cfg.test_cmd;
+      const cfg = { ...curCfg, repo_paths: _ezPaths };
+      delete cfg.repo_path;
       try {
         await saveProjectSettings(projectId, { executor_config: cfg });
         if (ezStatus) { ezStatus.textContent = 'Saved.'; setTimeout(() => { if (ezStatus) ezStatus.textContent = ''; }, 2000); }
@@ -11996,6 +12120,24 @@ async function loadHitlTab(projectId) {
 
           </div>`;
 
+        } else if (st === 'pending' && r.kind === 'hook_cwd_mismatch') {
+
+          let optPl = null;
+          try { optPl = r.payload ? JSON.parse(r.payload) : null; } catch(e) { optPl = null; }
+          const opts = (optPl && Array.isArray(optPl.options)) ? optPl.options : [];
+          const optBtns = opts.map((o, i) =>
+            `<button class="secondary hitl-opt-btn" data-hitl-id="${escapeHtml(r.id)}" data-answer="${escapeHtml(o)}" style="padding:3px 10px;font-size:10px;text-align:left">${i+1}. ${escapeHtml(o)}</button>`
+          ).join('\n');
+          actionBtns = `
+
+          <div style="display:flex;flex-direction:column;gap:4px;margin-top:8px">
+
+            ${optBtns}
+
+            <button class="secondary hitl-dismiss-btn" data-hitl-id="${escapeHtml(r.id)}" style="padding:3px 10px;font-size:10px;margin-top:2px;align-self:flex-start">Dismiss</button>
+
+          </div>`;
+
         } else if (st === 'pending') {
 
           actionBtns = `
@@ -12061,6 +12203,28 @@ async function loadHitlTab(projectId) {
           const answer = (inp && inp.value || '').trim();
 
           if (!answer) { toast('answer required', true); return; }
+
+          try {
+
+            await api(`/hitl/${id}`, { method: 'PATCH', body: JSON.stringify({ action: 'answer', answer }) });
+
+            toast('answered ✓');
+
+            render();
+
+          } catch (e) { toast('failed: ' + e.message, true); }
+
+        };
+
+      });
+
+      body.querySelectorAll('.hitl-opt-btn').forEach(btn => {
+
+        btn.onclick = async () => {
+
+          const id = btn.dataset.hitlId;
+
+          const answer = btn.dataset.answer || '';
 
           try {
 

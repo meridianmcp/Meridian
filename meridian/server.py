@@ -5140,8 +5140,11 @@ async def _start_session_composite(
 
     # v1.1 — surface the active sprint checklist so cold sessions see
     # what's in flight before doing anything. "Active" = todo/pending/in_progress.
+    # Executor sessions (role="executor") exclude human-assigned tasks.
     active_statuses = ("todo", "pending", "in_progress")
-    all_sprint_items = await db_module.get_sprint_items(db, project_id)
+    all_sprint_items = await db_module.get_sprint_items(
+        db, project_id, include_human=(role != "executor")
+    )
     pending_items = [
         it for it in all_sprint_items if it.get("status") in active_statuses
     ]
@@ -5329,6 +5332,7 @@ async def hooks_session_start(body: dict[str, Any], request: Request) -> dict[st
         return JSONResponse(status_code=400, content={"error": "project_id required"})
     session_name = (body.get("session_name") or "hook-session").strip()
     hook_cwd = (body.get("cwd") or "").strip()
+    hook_hostname = (body.get("hostname") or "").strip()
     db = await _resolve_hook_db(request)
     project = await db_module.get_project(db, project_id)
     if project is None:
@@ -5353,18 +5357,101 @@ async def hooks_session_start(body: dict[str, Any], request: Request) -> dict[st
     sprint_items = await db_module.get_sprint_items(db, project_id, status="pending")
     recent = result.get("recent_tasks") or []
     lines = [f"PROJECT: {project['name']} ({project_id[:8]})"]
-    # cwd mismatch check: warn when executor_config.repo_path is set but doesn't match the hook's cwd
+    # repo_paths tracking: auto-add new locations, HITL on unknown hostname/path
     if hook_cwd:
         try:
+            import json as _json
+
+            def _norm_p(p: str) -> str:
+                return p.replace("\\", "/").rstrip("/").lower()
+
             exec_cfg = (project.get("executor_config") or {})
             if isinstance(exec_cfg, str):
-                import json as _json
                 exec_cfg = _json.loads(exec_cfg) or {}
-            repo_path = (exec_cfg.get("repo_path") or "").strip()
-            if repo_path:
-                norm = lambda p: p.replace("\\", "/").rstrip("/").lower()
-                if norm(hook_cwd) != norm(repo_path):
-                    lines.insert(0, f"⚠ WARNING: Hooks fired from {hook_cwd} but repo_path is {repo_path}. Wrong directory?")
+            # Migration: legacy repo_path (single string) → repo_paths array
+            repo_paths = exec_cfg.get("repo_paths")
+            if repo_paths is None:
+                old_rp = (exec_cfg.get("repo_path") or "").strip()
+                if old_rp:
+                    repo_paths = [{"hostname": "unknown", "cwd": old_rp}]
+                    exec_cfg["repo_paths"] = repo_paths
+                    exec_cfg.pop("repo_path", None)
+                    await db_module.set_executor_config(db, project_id, exec_cfg)
+                else:
+                    repo_paths = []
+
+            norm_cwd = _norm_p(hook_cwd)
+            norm_hn = hook_hostname.lower() if hook_hostname else ""
+
+            exact_match = any(
+                _norm_p(e.get("hostname", "")).lower() == norm_hn
+                and _norm_p(e.get("cwd", "")) == norm_cwd
+                for e in repo_paths
+            )
+            hostname_match = any(
+                _norm_p(e.get("hostname", "")).lower() == norm_hn
+                for e in repo_paths
+            ) if norm_hn else False
+
+            if not repo_paths:
+                # Case 1: empty → auto-add silently, proceed
+                exec_cfg["repo_paths"] = [{"hostname": hook_hostname or "unknown", "cwd": hook_cwd}]
+                exec_cfg.pop("repo_path", None)
+                await db_module.set_executor_config(db, project_id, exec_cfg)
+            elif exact_match:
+                # Case 2: exact match → proceed silently
+                pass
+            elif hostname_match:
+                # Case 3: hostname known, cwd differs → blocking HITL (deduped)
+                existing_hitl = await db_module.list_hitl_requests(db, project_id, status="pending", limit=50)
+                already_pending = any(r.get("kind") == "hook_cwd_mismatch" for r in existing_hitl)
+                if not already_pending:
+                    hn_paths = [e["cwd"] for e in repo_paths if _norm_p(e.get("hostname", "")).lower() == norm_hn]
+                    removal_list = ", ".join(hn_paths)
+                    opts = [
+                        "Stop — cancel this session",
+                        f"Add this location — keep existing, add {hook_cwd}",
+                        f"I moved here — remove [{removal_list}], add {hook_cwd}",
+                        "Just this once — proceed without saving",
+                    ]
+                    hitl = await db_module.request_hitl(
+                        db, project_id,
+                        question=f"⚠ Session started from {hook_cwd} on {hook_hostname} — not a known location for this project.",
+                        context=f"Known paths for {hook_hostname}: {removal_list}",
+                        urgency="blocking",
+                        kind="hook_cwd_mismatch",
+                        payload=_json.dumps({"options": opts}),
+                    )
+                    hid = (hitl or {}).get("id", "")
+                    lines.insert(0, (
+                        f"⚠ HITL filed (id: {hid}): unrecognised location for this project.\n"
+                        f"FIRST: call get_hitl_request(id='{hid}') and act on the answer before starting work.\n"
+                        f"Options: (1) Stop (2) Add this location (3) I moved here (4) Just this once"
+                    ))
+            else:
+                # Case 4: unknown hostname → blocking HITL (deduped)
+                existing_hitl = await db_module.list_hitl_requests(db, project_id, status="pending", limit=50)
+                already_pending = any(r.get("kind") == "hook_cwd_mismatch" for r in existing_hitl)
+                if not already_pending:
+                    opts = [
+                        "Stop — cancel this session",
+                        f"Add this machine and location — {hook_hostname}/{hook_cwd}",
+                        "Just this once — proceed without saving",
+                    ]
+                    hitl = await db_module.request_hitl(
+                        db, project_id,
+                        question=f"⚠ New machine {hook_hostname!r} connecting to this project from {hook_cwd}.",
+                        context=f"cwd: {hook_cwd}",
+                        urgency="blocking",
+                        kind="hook_cwd_mismatch",
+                        payload=_json.dumps({"options": opts}),
+                    )
+                    hid = (hitl or {}).get("id", "")
+                    lines.insert(0, (
+                        f"⚠ HITL filed (id: {hid}): unknown machine {hook_hostname!r}.\n"
+                        f"FIRST: call get_hitl_request(id='{hid}') and act on the answer before starting work.\n"
+                        f"Options: (1) Stop (2) Add this machine (3) Just this once"
+                    ))
         except Exception:  # noqa: BLE001
             pass
     if goal.get("north_star"):
@@ -6020,11 +6107,76 @@ async def delete_api_token(token_id: str, request: Request) -> Response:
 
 @app.get("/auth/me")
 async def get_me(request: Request) -> dict[str, Any]:
-    """Return the authenticated tenant's profile (session cookie or bearer)."""
+    """Return the authenticated tenant's profile (session cookie or bearer), including projects."""
     tenant = await _get_authenticated_tenant(request)
     safe = {k: v for k, v in tenant.items() if k not in ("neon_db_url", "github_pat")}
     safe["github_connected"] = bool(tenant.get("github_pat"))
+    try:
+        project_db = await _open_tenant_db_by_id(request, tenant["id"])
+        projects = await db_module.list_project_summaries(project_db)
+        safe["projects"] = [
+            {"id": p["id"], "name": p["name"]}
+            for p in (projects or [])
+        ]
+    except Exception:
+        safe["projects"] = []
     return safe
+
+
+@app.get("/auth/install", response_class=HTMLResponse)
+async def auth_install_page(request: Request) -> HTMLResponse:
+    """One-time install token page — requires browser session, returns a short-lived token."""
+    if not _hosted_mode():
+        raise HTTPException(status_code=404, detail="not available in self-hosted mode")
+    from datetime import datetime, timezone, timedelta
+    tenant = await _get_authenticated_tenant(request)
+    db = request.app.state.db
+    expires_at = (datetime.now(timezone.utc) + timedelta(minutes=10)).isoformat()
+    raw_token, _ = await db_module.create_api_token(
+        db, tenant["id"], label="install", expires_at=expires_at
+    )
+    email = tenant.get("email", "")
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Meridian — Install Token</title>
+  <style>
+    body{{font-family:system-ui,sans-serif;background:#0d0d0d;color:#e8e8e8;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}}
+    .card{{background:#1a1a1a;border:1px solid #2e2e2e;border-radius:12px;padding:32px;max-width:520px;width:100%}}
+    h2{{margin:0 0 8px;font-size:20px}}
+    p{{color:#888;margin:0 0 20px;font-size:14px}}
+    .token-box{{font-family:monospace;font-size:13px;background:#0d0d0d;border:1px solid #333;border-radius:6px;padding:14px;word-break:break-all;user-select:all;cursor:pointer;color:#7dd3fc;line-height:1.5}}
+    .copy-btn{{margin-top:12px;padding:8px 20px;border-radius:6px;border:none;background:#3b82f6;color:#fff;cursor:pointer;font-size:13px;width:100%}}
+    .copy-btn:active{{background:#2563eb}}
+    .note{{font-size:12px;color:#555;margin-top:16px;line-height:1.5}}
+    .email{{color:#888;font-size:12px;margin-bottom:20px}}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h2>Meridian Install Token</h2>
+    <div class="email">Signed in as {email}</div>
+    <p>Copy this token and paste it into the installer. It expires in 10 minutes and can only be used once.</p>
+    <div class="token-box" id="token" onclick="copyToken()">{raw_token}</div>
+    <button class="copy-btn" onclick="copyToken()">Copy token</button>
+    <div class="note">
+      This token grants one-time access to authenticate the installer.<br>
+      After authentication, you will receive a permanent API token stored locally.
+    </div>
+  </div>
+  <script>
+    function copyToken() {{
+      navigator.clipboard.writeText('{raw_token}').then(() => {{
+        const btn = document.querySelector('.copy-btn');
+        btn.textContent = '✓ Copied!';
+        setTimeout(() => btn.textContent = 'Copy token', 2000);
+      }});
+    }}
+  </script>
+</body>
+</html>"""
+    return HTMLResponse(content=html)
 
 
 # ---------------------------------------------------------------------------
@@ -6047,7 +6199,7 @@ def _jsonrpc_err(req_id: Any, code: int, message: str) -> dict[str, Any]:
 # GitHub MCP tools — injected per-tenant when github_pat is set
 # ---------------------------------------------------------------------------
 
-_GITHUB_TOOL_NAMES = frozenset({"read_file", "list_files", "search_code", "get_commits", "get_commit"})
+_GITHUB_TOOL_NAMES = frozenset({"read_file", "list_files", "search_code", "get_commits", "get_commit", "search_commits"})
 
 
 def _github_tools_for_tenant(tenant: dict) -> list[dict[str, Any]]:
@@ -6095,14 +6247,28 @@ def _github_tools_for_tenant(tenant: dict) -> list[dict[str, Any]]:
         },
         {
             "name": "get_commits",
-            "description": "Return recent commits from the project's connected GitHub repository.",
+            "description": "Return recent commits from the project's connected GitHub repository. Returns helpful error if no GitHub repo is connected.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     **_pid_prop,
-                    "limit": {"type": "integer", "description": "Number of commits to return (default: 10, max: 50)"},
+                    "limit": {"type": "integer", "description": "Number of commits to return (default: 50, max: 50)"},
+                    "since": {"type": "string", "description": "ISO 8601 date string to filter commits after this date (optional, e.g. '2024-01-01T00:00:00Z')"},
                 },
                 "required": ["project_id"],
+            },
+        },
+        {
+            "name": "search_commits",
+            "description": "Search recent commits by message substring. Fetches up to 100 recent commits and filters by case-insensitive match. Returns helpful error if no GitHub repo is connected.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    **_pid_prop,
+                    "query": {"type": "string", "description": "Case-insensitive substring to search in commit messages"},
+                    "limit": {"type": "integer", "description": "Max results to return (default: 20)"},
+                },
+                "required": ["project_id", "query"],
             },
         },
         {
@@ -6199,11 +6365,14 @@ async def _dispatch_github_tool(name: str, args: dict[str, Any], tenant: dict, d
             }
 
         if name == "get_commits":
-            limit = min(int(args.get("limit") or 10), 50)
+            limit = min(int(args.get("limit") or 50), 50)
+            params: dict[str, str] = {"per_page": str(limit)}
+            if args.get("since"):
+                params["since"] = args["since"]
             r = await http.get(
                 f"https://api.github.com/repos/{repo}/commits",
                 headers=gh_headers,
-                params={"per_page": str(limit)},
+                params=params,
             )
             r.raise_for_status()
             commits = r.json()
@@ -6218,6 +6387,28 @@ async def _dispatch_github_tool(name: str, args: dict[str, Any], tenant: dict, d
                     for c in commits
                 ]
             }
+
+        if name == "search_commits":
+            query = (args.get("query") or "").lower()
+            limit = min(int(args.get("limit") or 20), 100)
+            r = await http.get(
+                f"https://api.github.com/repos/{repo}/commits",
+                headers=gh_headers,
+                params={"per_page": "100"},
+            )
+            r.raise_for_status()
+            all_commits = r.json()
+            matched = [
+                {
+                    "sha": c["sha"][:12],
+                    "message": c["commit"]["message"].split("\n")[0],
+                    "author": c["commit"]["author"]["name"],
+                    "date": c["commit"]["author"]["date"],
+                }
+                for c in all_commits
+                if query in c["commit"]["message"].lower()
+            ][:limit]
+            return {"query": args.get("query"), "count": len(matched), "commits": matched}
 
         if name == "get_commit":
             sha = args.get("sha", "")
@@ -6650,9 +6841,15 @@ async def _dispatch_mcp_tool(
         await goal_md_module.sync_db_to_goal_md(db, args["project_id"])
         return result
     if name == "get_sprint_items":
+        include_human = args.get("human", True)
+        if isinstance(include_human, bool):
+            pass
+        else:
+            include_human = str(include_human).lower() not in ("false", "0", "no")
         return await db_module.get_sprint_items(
             db, args["project_id"],
             status=args.get("status"),
+            include_human=include_human,
         )
     if name == "claim_sprint_item":
         item = await db_module.claim_sprint_item(db, args["project_id"], args["item_id"])
@@ -6980,9 +7177,10 @@ async def _oauth_meta(request: Request):
         "authorization_endpoint": f"{b}/oauth/authorize",
         "token_endpoint": f"{b}/oauth/token",
         "registration_endpoint": f"{b}/oauth/register",
+        "device_authorization_endpoint": f"{b}/oauth/device",
         "scopes_supported": ["mcp"],
         "response_types_supported": ["code"],
-        "grant_types_supported": ["authorization_code"],
+        "grant_types_supported": ["authorization_code", "urn:ietf:params:oauth:grant-type:device_code"],
         "code_challenge_methods_supported": ["S256"],
         "token_endpoint_auth_methods_supported": ["client_secret_post", "none"]})
 
@@ -7020,6 +7218,198 @@ async def _oauth_reg(request: Request):
         "redirect_uris": redirect_uris,
         "grant_types": ["authorization_code"],
         "token_endpoint_auth_method": "client_secret_post"}, status_code=201)
+
+
+@app.post("/oauth/device")
+async def _oauth_device(request: Request):
+    """RFC 8628 device authorization endpoint.
+
+    Returns {device_code, user_code, verification_uri, verification_uri_complete,
+    expires_in, interval}. No auth required — the flow is initiated by the device.
+    """
+    import string as _str
+    auth_db = request.app.state.db
+    b = str(request.base_url).rstrip("/")
+    device_code = _sec.token_hex(32)
+    # User code: 4 uppercase letters + "-" + 4 uppercase letters
+    _chars = _str.ascii_uppercase
+    user_code = (
+        "".join(_sec.choice(_chars) for _ in range(4))
+        + "-"
+        + "".join(_sec.choice(_chars) for _ in range(4))
+    )
+    from datetime import datetime as _dt, timezone as _tz, timedelta as _td_cls
+    expires_at = (_dt.now(tz=_tz.utc) + _td_cls(seconds=300)).strftime("%Y-%m-%d %H:%M:%S")
+    await auth_db.execute(
+        "INSERT INTO device_codes (device_code, user_code, expires_at) VALUES (?, ?, ?)",
+        (device_code, user_code, expires_at),
+    )
+    await auth_db.commit()
+    return JSONResponse({
+        "device_code": device_code,
+        "user_code": user_code,
+        "verification_uri": f"{b}/activate",
+        "verification_uri_complete": f"{b}/activate?code={user_code}",
+        "expires_in": 300,
+        "interval": 5,
+    })
+
+
+@app.get("/activate", response_class=HTMLResponse)
+async def _activate_get(request: Request):
+    """Device activation page — shows approval UI for a pending device_code."""
+    if _hosted_mode():
+        try:
+            from .hosted import _SESSION_COOKIE, _read_session_cookie
+            cookie_val = request.cookies.get(_SESSION_COOKIE, "")
+            if not cookie_val:
+                raise ValueError("no session cookie")
+            sid = _read_session_cookie(cookie_val)
+            if not sid or not await db_module.get_user_session(request.app.state.db, sid):
+                raise ValueError("invalid session")
+        except Exception:
+            from urllib.parse import quote as _q
+            orig_qs = str(request.url.query)
+            next_path = f"/activate?{orig_qs}" if orig_qs else "/activate"
+            return _RR(f"/auth/login?next={_q(next_path)}")
+
+    code_param = (request.query_params.get("code") or "").strip().upper()
+    b = str(request.base_url).rstrip("/")
+    auth_db = request.app.state.db
+
+    row_data: dict | None = None
+    if code_param:
+        from datetime import datetime as _dt, timezone as _tz
+        async with auth_db.execute(
+            "SELECT device_code, user_code, expires_at, approved FROM device_codes WHERE user_code = ?",
+            (code_param,),
+        ) as _cur:
+            _row = await _cur.fetchone()
+        if _row:
+            _row_d = dict(zip(["device_code", "user_code", "expires_at", "approved"], _row)) if not hasattr(_row, "keys") else dict(_row)
+            _exp_str = _row_d.get("expires_at", "")
+            try:
+                _exp_dt = _dt.fromisoformat(str(_exp_str).replace("Z", "+00:00"))
+                if _exp_dt.tzinfo is None:
+                    _exp_dt = _exp_dt.replace(tzinfo=_tz.utc)
+                if _dt.now(tz=_tz.utc) <= _exp_dt and not _row_d.get("approved"):
+                    row_data = _row_d
+            except Exception:
+                pass
+
+    if code_param and row_data is None:
+        # Code not found / expired / already used
+        error_msg = "This code has expired or was already used. Start the device flow again."
+        return HTMLResponse(content=_activate_page(b, code_param, error=error_msg))
+
+    return HTMLResponse(content=_activate_page(b, code_param, row=row_data))
+
+
+def _activate_page(base_url: str, code: str, *, row: dict | None = None, error: str | None = None) -> str:
+    if error:
+        body_html = f'<div class="error">{error}</div>'
+    elif row:
+        uc = row.get("user_code", code)
+        body_html = f'''
+        <p class="sub">A device or application wants to connect to your Meridian account.</p>
+        <div class="code-box">{uc}</div>
+        <p class="sub" style="font-size:13px;margin-bottom:24px">Confirm this code matches what your device shows.</p>
+        <form method="POST" action="{base_url}/activate">
+          <input type="hidden" name="user_code" value="{uc}">
+          <div class="btn-row">
+            <button type="submit" name="action" value="approve" class="btn-approve">Approve</button>
+            <button type="submit" name="action" value="deny" class="btn-deny">Deny</button>
+          </div>
+        </form>'''
+    else:
+        body_html = '''
+        <p class="sub">Enter the code shown on your device.</p>
+        <form method="GET" action="/activate" style="margin-top:16px">
+          <input type="text" name="code" placeholder="XXXX-XXXX" autofocus
+            style="width:100%;max-width:220px;text-align:center;font-size:20px;font-family:var(--mono);
+                   background:#1a1a1a;border:1px solid #444;border-radius:6px;color:#e8e8e8;
+                   padding:10px 12px;letter-spacing:4px">
+          <button type="submit" style="display:block;margin:12px auto 0;padding:8px 24px;background:#3b82f6;
+            color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:14px">Continue</button>
+        </form>'''
+
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Meridian — Activate Device</title>
+  <style>
+    :root{{--mono:'IBM Plex Mono',monospace}}
+    body{{font-family:system-ui,sans-serif;background:#0d0d0d;color:#e8e8e8;
+          display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}}
+    .card{{background:#1a1a1a;border:1px solid #2e2e2e;border-radius:12px;
+           padding:32px 40px;max-width:460px;width:100%;text-align:center}}
+    h2{{margin:0 0 6px;font-size:20px;color:#fff}}
+    .sub{{color:#888;font-size:14px;margin:0 0 16px}}
+    .code-box{{font-family:var(--mono);font-size:28px;letter-spacing:8px;color:#7dd3fc;
+               background:#0d0d0d;border:1px solid #333;border-radius:8px;
+               padding:16px 24px;display:inline-block;margin-bottom:16px}}
+    .btn-row{{display:flex;gap:12px;justify-content:center;margin-top:8px}}
+    .btn-approve{{padding:10px 28px;background:#22c55e;color:#fff;border:none;
+                  border-radius:6px;font-size:15px;cursor:pointer;font-weight:600}}
+    .btn-approve:hover{{background:#16a34a}}
+    .btn-deny{{padding:10px 28px;background:#3a3a3a;color:#ccc;border:1px solid #555;
+               border-radius:6px;font-size:15px;cursor:pointer}}
+    .btn-deny:hover{{background:#555}}
+    .error{{color:#f87171;background:#2a1111;border:1px solid #7f1d1d;border-radius:6px;
+            padding:12px 16px;font-size:14px}}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h2>Meridian</h2>
+    {body_html}
+  </div>
+</body>
+</html>"""
+
+
+@app.post("/activate")
+async def _activate_post(request: Request):
+    """Handle device approval or denial."""
+    if _hosted_mode():
+        try:
+            from .hosted import _SESSION_COOKIE, _read_session_cookie, get_current_tenant
+            tenant = await get_current_tenant(request)
+            tenant_id = tenant["id"]
+        except Exception:
+            return _RR("/auth/login?next=/activate")
+    else:
+        tenant_id = None
+
+    form = dict(await request.form())
+    user_code = (form.get("user_code") or "").strip().upper()
+    action = (form.get("action") or "").strip()
+    auth_db = request.app.state.db
+
+    if not user_code:
+        return _RR("/activate", status_code=303)
+
+    async with auth_db.execute(
+        "SELECT device_code, user_code, expires_at, approved FROM device_codes WHERE user_code = ?",
+        (user_code,),
+    ) as _cur:
+        _row = await _cur.fetchone()
+
+    if _row is None:
+        return _RR("/activate", status_code=303)
+
+    if action == "approve":
+        await auth_db.execute(
+            "UPDATE device_codes SET tenant_id = ?, approved = 1 WHERE user_code = ?",
+            (tenant_id, user_code),
+        )
+        await auth_db.commit()
+    else:
+        await auth_db.execute("DELETE FROM device_codes WHERE user_code = ?", (user_code,))
+        await auth_db.commit()
+
+    return _RR("/dashboard", status_code=303)
 
 
 @app.get("/oauth/authorize")
@@ -7090,7 +7480,61 @@ async def _oauth_auth(request: Request):
 async def _oauth_token(request: Request):
     ct = request.headers.get("content-type", "")
     d = dict(await request.json() if "json" in ct else await request.form())
-    if d.get("grant_type") != "authorization_code":
+    grant_type = d.get("grant_type", "")
+
+    # ── RFC 8628 device_code grant ──────────────────────────────────────────
+    if grant_type == "urn:ietf:params:oauth:grant-type:device_code":
+        device_code = (d.get("device_code") or "").strip()
+        if not device_code:
+            return JSONResponse({"error": "invalid_request", "error_description": "device_code required"}, status_code=400)
+        auth_db = request.app.state.db
+        from datetime import datetime as _dt, timezone as _tz
+        async with auth_db.execute(
+            "SELECT device_code, user_code, tenant_id, expires_at, approved FROM device_codes WHERE device_code = ?",
+            (device_code,),
+        ) as _cur:
+            _row = await _cur.fetchone()
+        if _row is None:
+            return JSONResponse({"error": "expired_token", "error_description": "device code expired or not found"}, status_code=400)
+        _row_d = dict(zip(["device_code", "user_code", "tenant_id", "expires_at", "approved"], _row)) if not hasattr(_row, "keys") else dict(_row)
+        # Check expiry
+        try:
+            _exp_dt = _dt.fromisoformat(str(_row_d["expires_at"]).replace("Z", "+00:00"))
+            if _exp_dt.tzinfo is None:
+                _exp_dt = _exp_dt.replace(tzinfo=_tz.utc)
+            if _dt.now(tz=_tz.utc) > _exp_dt:
+                await auth_db.execute("DELETE FROM device_codes WHERE device_code = ?", (device_code,))
+                await auth_db.commit()
+                return JSONResponse({"error": "expired_token", "error_description": "device code expired"}, status_code=400)
+        except Exception:
+            return JSONResponse({"error": "expired_token"}, status_code=400)
+        if not _row_d.get("approved"):
+            return JSONResponse({"error": "authorization_pending"}, status_code=200)
+        # Approved — issue token
+        await auth_db.execute("DELETE FROM device_codes WHERE device_code = ?", (device_code,))
+        await auth_db.commit()
+        tok = f"sk_meridian_{_sec.token_urlsafe(32)}"
+        tok_hash = _oauth_token_hash(tok)
+        _oa_tenant_id = _row_d.get("tenant_id")
+        tok_data = {"client_id": d.get("client_id", "meridian"), "exp": int(_tm.time() + 86400 * 90), "tenant_id": _oa_tenant_id}
+        _oa_tokens[tok_hash] = tok_data
+        if _oa_tenant_id:
+            import uuid as _uuid
+            _api_tid = str(_uuid.uuid4())
+            try:
+                await auth_db.execute(
+                    "INSERT INTO api_tokens (id, tenant_id, token_hash, label, token_type) VALUES (?, ?, ?, ?, ?)",
+                    (_api_tid, _oa_tenant_id, tok_hash, "claude-code-oauth", "readwrite"),
+                )
+                await auth_db.commit()
+            except Exception:
+                pass
+        else:
+            await _upsert_oauth_token(auth_db, tok_hash, tenant_id=None, client_id=tok_data["client_id"], exp=tok_data["exp"])
+        _save_oa_tokens(_oa_tokens)
+        return JSONResponse({"access_token": tok, "token_type": "bearer", "expires_in": 86400 * 90})
+
+    if grant_type != "authorization_code":
         return JSONResponse({"error": "unsupported_grant_type"}, status_code=400)
     # S256 is the only supported PKCE method
     _method = d.get("code_challenge_method", "")
@@ -7345,6 +7789,24 @@ def _mcp_rate_check(token_hash: str, limit: int) -> bool:
 
 @app.post("/mcp")
 async def remote_mcp(request: Request) -> Any:
+    try:
+        return await _remote_mcp_inner(request)
+    except Exception as _e:
+        import logging as _log
+        _req_id = getattr(request.state, "request_id", "unknown")
+        _log.getLogger("meridian.server").exception(
+            "unhandled exception in remote_mcp (request_id=%s)", _req_id, exc_info=_e
+        )
+        try:
+            _body = await request.body()
+            _req_id_from_body = __import__("json").loads(_body).get("id")
+        except Exception:
+            _req_id_from_body = None
+        from fastapi.responses import JSONResponse as _JR
+        return _JR({"jsonrpc": "2.0", "id": _req_id_from_body, "error": {"code": -32603, "message": "internal error — please retry"}})
+
+
+async def _remote_mcp_inner(request: Request) -> Any:
     """Remote MCP endpoint — JSON-RPC 2.0 over HTTP.
 
     Accepts OAuth bearer tokens and Meridian API keys over the same endpoint.
@@ -7418,7 +7880,8 @@ async def remote_mcp(request: Request) -> Any:
                 "WWW-Authenticate": (
                     f'Bearer realm="MCP",'
                     f' error="invalid_token",'
-                    f' resource_metadata="{_base}/.well-known/oauth-protected-resource"'
+                    f' resource_metadata="{_base}/.well-known/oauth-protected-resource",'
+                    f' device_authorization_endpoint="{_base}/oauth/device"'
                 ),
             },
         )
@@ -8328,8 +8791,8 @@ def build_mcp_server():
                         },
                         "milestone_type": {
                             "type": "string",
-                            "enum": ["task", "milestone"],
-                            "description": "'milestone' renders as a timeline marker. Default: 'task'.",
+                            "enum": ["task", "milestone", "human"],
+                            "description": "'milestone' renders as a timeline marker; 'human' marks a task for a human (hidden from executor sessions). Default: 'task'.",
                         },
                     },
                     "required": ["project_id", "version", "title"],
@@ -8414,6 +8877,7 @@ def build_mcp_server():
                 description=(
                     "List sprint items for a project. Optional status filter "
                     "(todo|pending|in_progress|done|failed|skipped|pushed). "
+                    "Pass human=false to exclude human-assigned tasks (default: true). "
                     "Cold sessions read this to know what's still owed."
                 ),
                 inputSchema={
@@ -8426,6 +8890,10 @@ def build_mcp_server():
                                 "pending", "todo", "in_progress",
                                 "done", "failed", "skipped", "pushed",
                             ],
+                        },
+                        "human": {
+                            "type": "boolean",
+                            "description": "Include items with milestone_type='human'. Default: true. Pass false to hide human tasks (used by executor sessions).",
                         },
                     },
                     "required": ["project_id"],

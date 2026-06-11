@@ -128,7 +128,10 @@ class Project(BaseModel):
 class ExecutorConfig(BaseModel):
     """Per-project executor defaults injected into executor sessions."""
 
+    model_config = {"extra": "allow"}
+
     repo_path: str | None = None
+    repo_paths: list[dict] | None = None
     env_file: str | None = None
     test_cmd: str | None = None
     test_min: int | None = Field(default=None, ge=0)

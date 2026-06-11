@@ -466,10 +466,11 @@ async def generate_handoff(
     # v3.1 — workspace decisions + notes apply across all projects.
     workspace_decisions = await db_module.get_workspace_decisions(db)
     workspace_notes = await db_module.get_workspace_notes(db)
-    sprint_items_all = await db_module.get_sprint_items(db, project_id)
+    sprint_items_all = await db_module.get_sprint_items(db, project_id, include_human=False)
     # Separate genuinely pending from actively-claimed in_progress items so:
     # (1) quick_start_goal only names items that haven't been claimed yet, and
     # (2) the delta output surfaces "Currently running:" at the top.
+    # Human-typed items are excluded from executor goal context.
     in_progress_items = [
         it for it in sprint_items_all
         if it.get("status") == "in_progress"

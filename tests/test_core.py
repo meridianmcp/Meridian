@@ -6437,40 +6437,110 @@ def test_hooks_session_start_missing_project_id(client):
     assert r.status_code == 400
 
 
-def test_hooks_session_start_cwd_mismatch_warning(client):
-    """When cwd doesn't match executor_config.repo_path, a warning is prepended."""
-    project = client.post("/projects", json={"name": "cwd-mismatch-proj"}).json()
+def test_hooks_session_start_repo_paths_empty_auto_add(client):
+    """Case 1: repo_paths empty → auto-add silently, no HITL, returns 200."""
+    project = client.post("/projects", json={"name": "rp-empty-proj"}).json()
     pid = project["id"]
-
-    # Set executor_config with a specific repo_path
-    r_patch = client.patch(
-        f"/projects/{pid}/settings",
-        json={"executor_config": {"repo_path": "/home/user/myproject"}},
-    )
-    assert r_patch.status_code == 200
-
-    # Fire hook from a different directory
-    r = client.post("/hooks/session-start", json={"project_id": pid, "cwd": "/tmp/other"})
+    r = client.post("/hooks/session-start", json={
+        "project_id": pid, "cwd": "/home/user/myproject", "hostname": "mybox"
+    })
     assert r.status_code == 200
     ctx = r.json()["hookSpecificOutput"]["additionalContext"]
-    assert "WARNING" in ctx
-    assert "/tmp/other" in ctx
-    assert "/home/user/myproject" in ctx
+    assert "HITL" not in ctx
+    # Verify repo_path was stored
+    settings = client.get(f"/projects/{pid}/settings").json()
+    rps = settings.get("executor_config", {}).get("repo_paths", [])
+    assert any(p.get("cwd") == "/home/user/myproject" for p in rps)
 
 
-def test_hooks_session_start_cwd_match_no_warning(client):
-    """When cwd matches executor_config.repo_path, no warning is added."""
-    project = client.post("/projects", json={"name": "cwd-match-proj"}).json()
+def test_hooks_session_start_repo_paths_exact_match_silent(client):
+    """Case 2: exact hostname+cwd match → proceed silently, no HITL."""
+    project = client.post("/projects", json={"name": "rp-match-proj"}).json()
     pid = project["id"]
-    client.patch(
-        f"/projects/{pid}/settings",
-        json={"executor_config": {"repo_path": "/home/user/myproject"}},
-    )
-
-    r = client.post("/hooks/session-start", json={"project_id": pid, "cwd": "/home/user/myproject"})
+    client.patch(f"/projects/{pid}/settings", json={
+        "executor_config": {"repo_paths": [{"hostname": "mybox", "cwd": "/home/user/myproject"}]}
+    })
+    r = client.post("/hooks/session-start", json={
+        "project_id": pid, "cwd": "/home/user/myproject", "hostname": "mybox"
+    })
     assert r.status_code == 200
     ctx = r.json()["hookSpecificOutput"]["additionalContext"]
-    assert "WARNING" not in ctx
+    assert "HITL" not in ctx
+
+
+def test_hooks_session_start_repo_paths_hostname_cwd_mismatch_hitl(client):
+    """Case 3: hostname known, cwd different → HITL filed (blocking)."""
+    project = client.post("/projects", json={"name": "rp-mismatch-proj"}).json()
+    pid = project["id"]
+    client.patch(f"/projects/{pid}/settings", json={
+        "executor_config": {"repo_paths": [{"hostname": "mybox", "cwd": "/home/user/old-project"}]}
+    })
+    r = client.post("/hooks/session-start", json={
+        "project_id": pid, "cwd": "/home/user/new-project", "hostname": "mybox"
+    })
+    assert r.status_code == 200
+    ctx = r.json()["hookSpecificOutput"]["additionalContext"]
+    assert "HITL" in ctx
+    assert "get_hitl_request" in ctx
+    # Verify HITL was created
+    hitl_list = client.get(f"/projects/{pid}/hitl?status=pending").json()
+    assert any(h.get("kind") == "hook_cwd_mismatch" for h in hitl_list)
+
+
+def test_hooks_session_start_repo_paths_new_hostname_hitl(client):
+    """Case 4: no hostname match → HITL filed for unknown machine."""
+    project = client.post("/projects", json={"name": "rp-newhost-proj"}).json()
+    pid = project["id"]
+    client.patch(f"/projects/{pid}/settings", json={
+        "executor_config": {"repo_paths": [{"hostname": "otherbox", "cwd": "/home/user/myproject"}]}
+    })
+    r = client.post("/hooks/session-start", json={
+        "project_id": pid, "cwd": "/home/user/myproject", "hostname": "newbox"
+    })
+    assert r.status_code == 200
+    ctx = r.json()["hookSpecificOutput"]["additionalContext"]
+    assert "HITL" in ctx
+    hitl_list = client.get(f"/projects/{pid}/hitl?status=pending").json()
+    assert any(h.get("kind") == "hook_cwd_mismatch" for h in hitl_list)
+
+
+def test_hooks_session_start_repo_paths_hitl_dedup(client):
+    """HITL dedup: second hook call doesn't create another pending hook_cwd_mismatch."""
+    project = client.post("/projects", json={"name": "rp-dedup-proj"}).json()
+    pid = project["id"]
+    client.patch(f"/projects/{pid}/settings", json={
+        "executor_config": {"repo_paths": [{"hostname": "mybox", "cwd": "/home/user/old-project"}]}
+    })
+    # First call → creates HITL
+    client.post("/hooks/session-start", json={
+        "project_id": pid, "cwd": "/home/user/new-project", "hostname": "mybox"
+    })
+    # Second call → should NOT create another
+    client.post("/hooks/session-start", json={
+        "project_id": pid, "cwd": "/home/user/new-project", "hostname": "mybox"
+    })
+    hitl_list = client.get(f"/projects/{pid}/hitl?status=pending").json()
+    cwd_mismatch = [h for h in hitl_list if h.get("kind") == "hook_cwd_mismatch"]
+    assert len(cwd_mismatch) == 1
+
+
+def test_hooks_session_start_legacy_repo_path_migration(client):
+    """Legacy executor_config.repo_path is migrated to repo_paths array on first hook call."""
+    project = client.post("/projects", json={"name": "rp-legacy-proj"}).json()
+    pid = project["id"]
+    client.patch(f"/projects/{pid}/settings", json={
+        "executor_config": {"repo_path": "/home/user/myproject"}
+    })
+    # Call with matching path — should auto-migrate and proceed silently
+    r = client.post("/hooks/session-start", json={
+        "project_id": pid, "cwd": "/home/user/myproject", "hostname": "mybox"
+    })
+    assert r.status_code == 200
+    settings = client.get(f"/projects/{pid}/settings").json()
+    cfg = settings.get("executor_config", {})
+    # Legacy repo_path should be converted
+    assert "repo_paths" in cfg
+    assert not cfg.get("repo_path")  # migrated away from repo_path (key may be null)
 
 
 def test_hooks_installer_scripts_are_served(client):
@@ -7892,3 +7962,144 @@ def test_github_status_graceful_on_db_error(client, monkeypatch):
     assert body["connected"] is False
     assert body["pat_linked"] is False
     assert body["repos"] == []
+
+
+# ---------------------------------------------------------------------------
+# OAuth device flow (RFC 8628)
+# ---------------------------------------------------------------------------
+
+
+def test_oauth_device_returns_required_fields(client):
+    """POST /oauth/device returns all RFC 8628 required fields."""
+    r = client.post("/oauth/device")
+    assert r.status_code == 200
+    body = r.json()
+    assert "device_code" in body
+    assert "user_code" in body
+    assert "verification_uri" in body
+    assert "verification_uri_complete" in body
+    assert body["expires_in"] == 300
+    assert body["interval"] == 5
+    # user_code format: XXXX-XXXX
+    uc = body["user_code"]
+    assert len(uc) == 9 and uc[4] == "-"
+    assert uc[:4].isupper() and uc[5:].isupper()
+
+
+def test_oauth_device_dedup_codes(client):
+    """Two POST /oauth/device calls return different device_codes and user_codes."""
+    r1 = client.post("/oauth/device").json()
+    r2 = client.post("/oauth/device").json()
+    assert r1["device_code"] != r2["device_code"]
+    assert r1["user_code"] != r2["user_code"]
+
+
+def test_oauth_device_poll_pending(client):
+    """Polling /oauth/token before approval returns authorization_pending."""
+    dc = client.post("/oauth/device").json()["device_code"]
+    r = client.post("/oauth/token", json={
+        "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+        "device_code": dc,
+    })
+    assert r.status_code == 200
+    assert r.json()["error"] == "authorization_pending"
+
+
+def test_oauth_device_happy_path(client):
+    """Full device flow: issue → approve → poll → get token."""
+    resp = client.post("/oauth/device").json()
+    device_code = resp["device_code"]
+    user_code = resp["user_code"]
+
+    # Simulate user approval via POST /activate (no auth guard in local mode)
+    r = client.post("/activate", data={"user_code": user_code, "action": "approve"})
+    assert r.status_code in (200, 302, 303)
+
+    # Now poll for the token
+    r = client.post("/oauth/token", json={
+        "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+        "device_code": device_code,
+    })
+    assert r.status_code == 200
+    body = r.json()
+    assert "access_token" in body
+    assert body["access_token"].startswith("sk_meridian_")
+    assert body["token_type"] == "bearer"
+
+
+def test_oauth_device_expired_code(client):
+    """Polling with an unknown/expired device_code returns expired_token."""
+    r = client.post("/oauth/token", json={
+        "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+        "device_code": "nonexistent_device_code_xyz",
+    })
+    assert r.status_code == 400
+    assert r.json()["error"] == "expired_token"
+
+
+def test_oauth_device_deny_no_token(client):
+    """Deny action deletes the device code so subsequent poll returns expired_token."""
+    resp = client.post("/oauth/device").json()
+    device_code = resp["device_code"]
+    user_code = resp["user_code"]
+
+    # User denies
+    client.post("/activate", data={"user_code": user_code, "action": "deny"})
+
+    # Poll — code deleted on deny, so expired_token
+    r = client.post("/oauth/token", json={
+        "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+        "device_code": device_code,
+    })
+    assert r.status_code == 400
+    assert r.json()["error"] == "expired_token"
+
+
+def test_oauth_device_token_consumed_after_issue(client):
+    """After a token is issued, polling again returns expired_token (code deleted)."""
+    resp = client.post("/oauth/device").json()
+    device_code = resp["device_code"]
+    user_code = resp["user_code"]
+
+    client.post("/activate", data={"user_code": user_code, "action": "approve"})
+
+    # First poll: success
+    r1 = client.post("/oauth/token", json={
+        "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+        "device_code": device_code,
+    })
+    assert r1.status_code == 200
+    assert "access_token" in r1.json()
+
+    # Second poll: code is consumed, returns expired_token
+    r2 = client.post("/oauth/token", json={
+        "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+        "device_code": device_code,
+    })
+    assert r2.status_code == 400
+    assert r2.json()["error"] == "expired_token"
+
+
+def test_oauth_device_missing_device_code(client):
+    """POST /oauth/token with device grant but no device_code returns invalid_request."""
+    r = client.post("/oauth/token", json={
+        "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+    })
+    assert r.status_code == 400
+    assert r.json()["error"] == "invalid_request"
+
+
+def test_oauth_device_metadata_endpoint(client):
+    """/.well-known/oauth-authorization-server includes device_authorization_endpoint."""
+    r = client.get("/.well-known/oauth-authorization-server")
+    assert r.status_code == 200
+    body = r.json()
+    assert "device_authorization_endpoint" in body
+    assert body["device_authorization_endpoint"].endswith("/oauth/device")
+    assert "urn:ietf:params:oauth:grant-type:device_code" in body.get("grant_types_supported", [])
+
+
+def test_oauth_device_table_in_create_tables():
+    """CREATE_TABLES must define device_codes table for RFC 8628 persistence."""
+    from meridian.db import CREATE_TABLES
+    assert "device_codes" in CREATE_TABLES, "CREATE_TABLES missing 'device_codes'"

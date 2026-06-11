@@ -346,6 +346,7 @@ CREATE TABLE IF NOT EXISTS api_tokens (
     token_hash TEXT NOT NULL UNIQUE,
     label TEXT,
     token_type TEXT NOT NULL DEFAULT 'readwrite',
+    expires_at TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -363,6 +364,15 @@ CREATE TABLE IF NOT EXISTS oauth_codes (
     redirect_uri TEXT NOT NULL,
     code_challenge TEXT NOT NULL,
     expires_at TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS device_codes (
+    device_code TEXT PRIMARY KEY,
+    user_code TEXT NOT NULL UNIQUE,
+    tenant_id TEXT,
+    expires_at TEXT NOT NULL,
+    approved INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -1609,7 +1619,9 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_sprint_items_indeterminate(db)
     await _migrate_sprint_item_tree(db)
     await _migrate_api_token_type(db)
+    await _migrate_api_tokens_expires_at(db)
     await _migrate_oauth_codes_table(db)
+    await _migrate_device_codes_table(db)
     await _migrate_github_to_projects(db)
     return db
 
@@ -1627,6 +1639,11 @@ async def _migrate_api_token_type(db: aiosqlite.Connection) -> None:
     await _migrate_add_column_if_missing(
         db, "api_tokens", "token_type", "TEXT NOT NULL DEFAULT 'readwrite'"
     )
+
+
+async def _migrate_api_tokens_expires_at(db: aiosqlite.Connection) -> None:
+    """Add expires_at column to api_tokens for short-lived install tokens."""
+    await _migrate_add_column_if_missing(db, "api_tokens", "expires_at", "TEXT")
 
 
 async def _migrate_github_to_projects(db: aiosqlite.Connection) -> None:
@@ -1680,6 +1697,21 @@ async def _migrate_oauth_codes_table(db: aiosqlite.Connection) -> None:
             redirect_uri TEXT NOT NULL,
             code_challenge TEXT NOT NULL,
             expires_at TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )"""
+    )
+    await db.commit()
+
+
+async def _migrate_device_codes_table(db: aiosqlite.Connection) -> None:
+    """RFC 8628 device authorization flow — device_codes table."""
+    await db.execute(
+        """CREATE TABLE IF NOT EXISTS device_codes (
+            device_code TEXT PRIMARY KEY,
+            user_code TEXT NOT NULL UNIQUE,
+            tenant_id TEXT,
+            expires_at TEXT NOT NULL,
+            approved INTEGER NOT NULL DEFAULT 0,
             created_at TEXT NOT NULL DEFAULT (datetime('now'))
         )"""
     )
@@ -3545,8 +3577,8 @@ async def add_sprint_item(
     """
     if failure_mode not in (None, "continue", "stop"):
         raise ValueError("failure_mode must be 'continue' or 'stop'")
-    if milestone_type not in ("task", "milestone"):
-        raise ValueError("milestone_type must be 'task' or 'milestone'")
+    if milestone_type not in ("task", "milestone", "human"):
+        raise ValueError("milestone_type must be 'task', 'milestone', or 'human'")
     iid = _new_id()
     await db.execute(
         "INSERT INTO sprint_items "
@@ -3925,6 +3957,7 @@ async def get_sprint_items(
     project_id: str,
     status: str | None = None,
     show_blocked: bool = True,
+    include_human: bool = True,
 ) -> list[dict[str, Any]]:
     """List sprint items for a project, oldest first.
 
@@ -3934,24 +3967,27 @@ async def get_sprint_items(
     ``show_blocked=False`` hides items whose ``depends_on`` parent is not
     yet in a terminal state (done/skipped/failed/pushed), or whose parent
     has failed while the item has ``failure_mode='stop'``.
+
+    ``include_human=False`` excludes items with milestone_type='human'
+    (used for executor sessions that should not see human-assigned tasks).
     """
+    clauses = ["project_id = ?"]
+    params_list: list = [project_id]
     if status is not None:
         if status not in _VALID_SPRINT_STATUSES:
             raise ValueError(
                 f"invalid sprint-item status filter: {status!r}. "
                 f"Valid: {sorted(_VALID_SPRINT_STATUSES)}"
             )
-        query = (
-            "SELECT * FROM sprint_items WHERE project_id = ? "
-            "AND status = ? ORDER BY added_at ASC, rowid ASC"
-        )
-        params: tuple = (project_id, status)
-    else:
-        query = (
-            "SELECT * FROM sprint_items WHERE project_id = ? "
-            "ORDER BY added_at ASC, rowid ASC"
-        )
-        params = (project_id,)
+        clauses.append("status = ?")
+        params_list.append(status)
+    if not include_human:
+        clauses.append("(milestone_type IS NULL OR milestone_type != 'human')")
+    query = (
+        f"SELECT * FROM sprint_items WHERE {' AND '.join(clauses)} "
+        "ORDER BY added_at ASC, rowid ASC"
+    )
+    params: tuple = tuple(params_list)
     async with db.execute(query, params) as cur:
         rows = await cur.fetchall()
     items = [_row_to_dict(r) for r in rows]  # type: ignore[misc]
@@ -5122,12 +5158,14 @@ async def create_api_token(
     tenant_id: str,
     label: str | None = None,
     token_type: str = "readwrite",
+    expires_at: str | None = None,
 ) -> tuple[str, dict[str, Any]]:
     """Generate a bearer token for a tenant.
 
     Returns ``(raw_token, token_row_dict)``.  The raw token is shown once
     and never stored.  Only the SHA-256 hash is persisted.
     ``token_type`` is 'readwrite' (default) or 'readonly'.
+    ``expires_at`` is an ISO 8601 datetime string for short-lived tokens (e.g. install tokens).
     """
     if token_type not in ("readwrite", "readonly"):
         token_type = "readwrite"
@@ -5137,8 +5175,8 @@ async def create_api_token(
     token_hash = hashlib.sha256(raw.encode()).hexdigest()
     tid = _new_id()
     await db.execute(
-        "INSERT INTO api_tokens (id, tenant_id, token_hash, label, token_type) VALUES (?, ?, ?, ?, ?)",
-        (tid, tenant_id, token_hash, label, token_type),
+        "INSERT INTO api_tokens (id, tenant_id, token_hash, label, token_type, expires_at) VALUES (?, ?, ?, ?, ?, ?)",
+        (tid, tenant_id, token_hash, label, token_type, expires_at),
     )
     await db.commit()
     async with db.execute("SELECT * FROM api_tokens WHERE id = ?", (tid,)) as cur:
@@ -5182,16 +5220,33 @@ async def get_tenant_from_token_hash(
 
     Returns tenant dict with an extra ``_token_type`` field ('readwrite' or
     'readonly') so callers can enforce read-only restrictions without a second
-    query.
+    query. Returns None for expired tokens (and deletes them).
     """
+    from datetime import datetime, timezone
     async with db.execute(
-        "SELECT t.*, a.token_type AS _token_type FROM tenants t "
+        "SELECT t.*, a.token_type AS _token_type, a.id AS _token_id, a.expires_at AS _token_expires_at "
+        "FROM tenants t "
         "JOIN api_tokens a ON a.tenant_id = t.id "
         "WHERE a.token_hash = ?",
         (token_hash,),
     ) as cur:
         row = await cur.fetchone()
-    return _row_to_dict(row)
+    if row is None:
+        return None
+    d = _row_to_dict(row)
+    expires_at = d.pop("_token_expires_at", None)
+    token_id = d.pop("_token_id", None)
+    if expires_at:
+        try:
+            exp_dt = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+            if exp_dt < datetime.now(timezone.utc):
+                if token_id:
+                    await db.execute("DELETE FROM api_tokens WHERE id = ?", (token_id,))
+                    await db.commit()
+                return None
+        except Exception:
+            pass
+    return d
 
 
 async def count_tenants_by_plan(
