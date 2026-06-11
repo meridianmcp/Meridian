@@ -118,7 +118,7 @@ your project context on start and snapshots progress on end.
 
 ---
 <!-- MERIDIAN STATE — auto-generated, do not edit below -->
-## Current Sprint State  _(auto-updated 2026-06-10 20:13 UTC)_
+## Current Sprint State  _(auto-updated 2026-06-11 19:15 UTC)_
 
 **Key Files:**
 - `meridian/server.py` — FastAPI app + MCP handlers
