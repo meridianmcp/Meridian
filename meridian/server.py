@@ -879,10 +879,10 @@ try:
     _limiter = Limiter(key_func=get_remote_address)
     app.state.limiter = _limiter
     app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)  # type: ignore[arg-type]
-    _RATE_LIMIT = "60/minute"
+    _RATE_LIMIT = "100/minute"
 except ImportError:
     _limiter = None  # type: ignore[assignment]
-    _RATE_LIMIT = "60/minute"
+    _RATE_LIMIT = "100/minute"
 
 
 # G4.15 — Safety-limit exception → 429
@@ -8021,7 +8021,7 @@ async def _remote_mcp_inner(request: Request) -> Any:
 
     # Per-token rate limiting: 60/min for free tier, 600/min for others.
     _plan = (tenant.get("plan") or "free").lower()
-    _rate_limit = 60 if _plan == "free" else 600
+    _rate_limit = 100 if _plan == "free" else 1000
     if _mcp_rate_check(_bearer_hash, _rate_limit):
         return JSONResponse(
             {"detail": f"rate limit exceeded ({_rate_limit} req/min)"},
