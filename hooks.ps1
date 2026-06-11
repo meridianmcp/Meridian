@@ -191,14 +191,15 @@ if ($ClaudeDetected -and (Test-Path $ClaudeSettingsPath)) {
 if ($ExistingHooks) {
     Write-Host ""
     Write-Host "Existing Meridian hooks detected in Claude Code." -ForegroundColor Yellow
-    $choice = Read-Host "  (U)pdate with new token / (S)kip / (O)verwrite all [U/s/o]"
-    if ($choice -match "^[Ss]") {
-        Write-Host "  Skipped -- existing hooks unchanged." -ForegroundColor Yellow
-        $ClaudeDetected = $false
-    } elseif ($choice -match "^[Oo]") {
-        Write-Host "  Overwriting..."
+    $choice = Read-Host "  (S)kip -- already good / (U)pdate hooks format / (R)egenerate API key [S/u/r]"
+    if ($choice -match "^[Uu]") {
+        Write-Host "  Updating hooks with existing key..."
+    } elseif ($choice -match "^[Rr]") {
+        Write-Host "  Regenerating API key..."
+        $existingToken = $null
     } else {
-        Write-Host "  Updating token in existing hooks..."
+        Write-Host "  Skipped -- existing hooks unchanged." -ForegroundColor Yellow
+        exit 0
     }
 }
 
