@@ -119,6 +119,11 @@ else
   STOP_CMD="curl -s -X POST -H 'Content-Type: application/json' -d \"{\\\"hostname\\\":\\\"\$(hostname)\\\"}\" '${MERIDIAN_URL}/hooks/stop' >/dev/null 2>&1"
 fi
 
+# Auto-start: prepend health-check + pixi start for localhost installs
+if [[ $IS_LOCAL -eq 1 ]]; then
+  START_CMD="curl -sf --max-time 3 '${MERIDIAN_URL}/health' >/dev/null 2>&1 || { [ -f \"\$HOME/pixi.toml\" ] && (cd \"\$HOME\" && nohup pixi run start >/dev/null 2>&1 &) && sleep 3; }; ${START_CMD}"
+fi
+
 # ---- Step 6: Write hooks to ~/.claude/settings.json -------------------------
 SETTINGS_PATH="${HOME}/.claude/settings.json"
 CLAUDE_DETECTED=0
