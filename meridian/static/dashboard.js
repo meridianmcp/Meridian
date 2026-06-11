@@ -11062,7 +11062,7 @@ async function loadSettingsTab(projectId) {
 
 
   // Shared token variable for both setTimeout blocks (MCP config and hooks config)
-  let currentToken = null;
+  var currentToken = null;
 
   setTimeout(() => {
 
