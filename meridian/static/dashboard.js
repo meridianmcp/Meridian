@@ -1,4 +1,4 @@
-const TABS_KEY = 'meridian.openTabs';
+﻿const TABS_KEY = 'meridian.openTabs';
 
 const ACTIVE_PROJECT_KEY = 'meridian.activeProject';
 
@@ -8667,7 +8667,7 @@ async function loadSettingsTab(projectId) {
 
         <span class="meridian-caret" style="display:inline-block;font-size:10px;color:var(--muted);transition:transform 120ms ease;flex-shrink:0">▶</span>
 
-        <span style="font-weight:600;font-size:11px;color:var(--text)">Auto-checkpoint hooks</span>
+        <span style="font-weight:600;font-size:11px;color:var(--text)">Meridian Connect</span>
 
       </span>
 
@@ -8677,7 +8677,7 @@ async function loadSettingsTab(projectId) {
 
     <div style="padding:0 12px 12px">
 
-      <div style="font-size:10px;color:var(--muted);margin-bottom:10px">Install once, then SessionStart + Stop can auto-start and auto-checkpoint into Meridian for this project.</div>
+      <div style="font-size:10px;color:var(--muted);margin-bottom:10px">Install once per machine. Hooks auto-start sessions and sync context with Meridian.</div>
 
       <div style="display:grid;gap:10px;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));margin-bottom:10px">
 
@@ -8982,7 +8982,7 @@ async function loadSettingsTab(projectId) {
 
         <span class="meridian-caret" style="display:inline-block;font-size:10px;color:var(--muted);transition:transform 120ms ease;flex-shrink:0">▶</span>
 
-        <span style="font-weight:600;font-size:11px;color:var(--text)">Auto-checkpoint hooks</span>
+        <span style="font-weight:600;font-size:11px;color:var(--text)">Meridian Connect</span>
 
       </span>
 
@@ -8992,7 +8992,7 @@ async function loadSettingsTab(projectId) {
 
     <div style="padding:0 12px 12px">
 
-      <div style="font-size:10px;color:var(--muted);margin-bottom:10px">Install once, then SessionStart + Stop can auto-start and auto-checkpoint into Meridian for this project.</div>
+      <div style="font-size:10px;color:var(--muted);margin-bottom:10px">Install once per machine. Hooks auto-start sessions and sync context with Meridian.</div>
 
       <div style="display:grid;gap:10px;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));margin-bottom:10px">
 
@@ -11278,7 +11278,7 @@ async function loadSettingsTab(projectId) {
       revealEl.style.display = 'block';
       function _hideReveal() {
         revealEl.style.display = 'none';
-        const masked = 'sk_meridian_' + '•'.repeat(8) + rawToken.slice(-4);
+        const masked = 'sk_meridian_\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022' + rawToken.slice(-4);
         const statusEl = document.getElementById(`hooks-token-status-${projectId}`);
         if (statusEl) statusEl.textContent = `${label || 'Key'} saved: ${masked} — use "Generate new key" to rotate.`;
       }
