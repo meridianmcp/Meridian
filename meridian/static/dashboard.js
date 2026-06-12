@@ -6668,9 +6668,22 @@ async function loadSettingsTab(projectId) {
   {
     const _klCfg = (projectSettings && projectSettings.executor_config) || {};
     const _klPaths = Array.isArray(_klCfg.repo_paths) ? _klCfg.repo_paths : [];
+    const _klHosts = Array.isArray(_klCfg.hostnames) ? _klCfg.hostnames : [];
     html += `<div style="margin-bottom:12px;padding:12px 14px;border:1px solid var(--border);border-radius:8px;background:var(--surface)">
       <div style="font-weight:600;font-size:13px;color:var(--text);margin-bottom:4px">Known Locations</div>
-      <div style="font-size:11px;color:var(--muted);margin-bottom:10px">Hooks auto-register each machine and directory on first session. Sessions route to this project when launched from a known location.</div>
+      <div style="font-size:11px;color:var(--muted);margin-bottom:10px">First hook from a new machine auto-registers it here. All future sessions from that machine route to this project regardless of directory.</div>
+      <div style="font-size:10px;font-weight:600;color:var(--text);margin-bottom:4px">Registered Machines</div>
+      <div id="exec-ez-hosts-tbl-${projectId}" style="margin-bottom:8px;font-size:10px;font-family:var(--font-mono)">${
+        _klHosts.length
+          ? '<table style="width:100%;border-collapse:collapse">' +
+            _klHosts.map((h, i) => `<tr>
+              <td style="padding:2px 6px 2px 0;color:var(--text)">${escapeHtml(h.hostname || '')}</td>
+              <td style="padding:2px 6px 2px 0;color:var(--muted)"><label style="display:flex;align-items:center;gap:4px;cursor:pointer;font-size:9px"><input type="checkbox" class="exec-ez-host-autocwd" data-pid="${escapeHtml(projectId)}" data-idx="${i}" ${h.auto_add_cwds ? 'checked' : ''} style="cursor:pointer"> Auto-add new cwds</label></td>
+              <td style="padding:2px 0;text-align:right"><button class="exec-ez-del-host" data-pid="${escapeHtml(projectId)}" data-idx="${i}" style="font-size:9px;padding:1px 6px;background:transparent;border:1px solid var(--border);border-radius:3px;color:var(--muted);cursor:pointer">Remove</button></td>
+            </tr>`).join('') + '</table>'
+          : '<div style="color:var(--muted);font-style:italic;font-size:10px">No machines registered yet — first hook auto-registers.</div>'
+      }</div>
+      <div style="font-size:10px;font-weight:600;color:var(--text);margin-bottom:4px">Specific Paths (cwd overrides)</div>
       <div id="exec-ez-paths-tbl-${projectId}" style="margin-bottom:8px;font-size:10px;font-family:var(--font-mono)">${
         _klPaths.length
           ? '<table style="width:100%;border-collapse:collapse">' +
@@ -6679,7 +6692,7 @@ async function loadSettingsTab(projectId) {
               <td style="padding:2px 6px 2px 0;color:var(--muted)">${escapeHtml(p.cwd || '')}</td>
               <td style="padding:2px 0;text-align:right"><button class="exec-ez-del-row" data-pid="${escapeHtml(projectId)}" data-idx="${i}" style="font-size:9px;padding:1px 6px;background:transparent;border:1px solid var(--border);border-radius:3px;color:var(--muted);cursor:pointer">Remove</button></td>
             </tr>`).join('') + '</table>'
-          : '<div style="color:var(--muted);font-style:italic;font-size:10px">No locations tracked yet — run the installer to auto-populate.</div>'
+          : '<div style="color:var(--muted);font-style:italic;font-size:10px">No path overrides — machine-level routing handles most cases.</div>'
       }</div>
       <div style="display:flex;gap:8px;align-items:center">
         <button id="exec-ez-save-${projectId}" class="primary" style="font-size:10px;padding:3px 10px">Save</button>
@@ -7680,6 +7693,7 @@ async function loadSettingsTab(projectId) {
       const cfg = {};
 
       cfg.repo_paths = _execRepoPaths;
+      if (Array.isArray(execCfg.hostnames)) cfg.hostnames = execCfg.hostnames;
 
       for (const f of fields) {
 
@@ -8696,53 +8710,76 @@ async function loadSettingsTab(projectId) {
     }
   }, 0);
 
-  // Executor Setup mini section (repo_paths table)
+  // Known Locations card — hostnames + repo_paths
   setTimeout(() => {
     const ezSaveBtn = document.getElementById(`exec-ez-save-${projectId}`);
     const ezClearBtn = document.getElementById(`exec-ez-clear-${projectId}`);
     const ezStatus = document.getElementById(`exec-ez-status-${projectId}`);
     if (!ezSaveBtn) return;
 
-    // Collect current repo_paths from the table DOM (read from projectSettings, modified by delete/clear)
-    let _ezPaths = Array.isArray(
-      (projectSettings && projectSettings.executor_config && projectSettings.executor_config.repo_paths)
-    ) ? [...projectSettings.executor_config.repo_paths] : [];
+    const _execCfgBase = (projectSettings && projectSettings.executor_config) || {};
+    let _ezHosts = Array.isArray(_execCfgBase.hostnames) ? [..._execCfgBase.hostnames] : [];
+    let _ezPaths = Array.isArray(_execCfgBase.repo_paths) ? [..._execCfgBase.repo_paths] : [];
 
-    // Wire delete-row buttons
-    document.querySelectorAll(`.exec-ez-del-row[data-pid="${projectId}"]`).forEach(btn => {
-      btn.onclick = () => {
-        const idx = parseInt(btn.dataset.idx, 10);
-        _ezPaths.splice(idx, 1);
-        const tblEl = document.getElementById(`exec-ez-paths-tbl-${projectId}`);
-        if (tblEl) {
-          if (!_ezPaths.length) {
-            tblEl.innerHTML = '<div style="color:var(--muted);font-style:italic;font-size:10px">No locations tracked yet -- run the installer to auto-populate.</div>';
-          } else {
-            tblEl.innerHTML = '<table style="width:100%;border-collapse:collapse">' +
-              _ezPaths.map((p, i) => `<tr>
-                <td style="padding:2px 6px 2px 0;color:var(--text);font-size:10px;font-family:var(--font-mono)">${escapeHtml(p.hostname || '')}</td>
-                <td style="padding:2px 6px 2px 0;color:var(--muted);font-size:10px;font-family:var(--font-mono)">${escapeHtml(p.cwd || '')}</td>
-                <td style="padding:2px 0;text-align:right"><button class="exec-ez-del-row" data-pid="${escapeHtml(projectId)}" data-idx="${i}" style="font-size:9px;padding:1px 6px;background:transparent;border:1px solid var(--border);border-radius:3px;color:var(--muted);cursor:pointer">✕</button></td>
-              </tr>`).join('') + '</table>';
-            // Re-wire after re-render
-            document.querySelectorAll(`.exec-ez-del-row[data-pid="${projectId}"]`).forEach(b2 => { b2.onclick = btn.onclick; });
-          }
-        }
-      };
-    });
+    const _rerenderHostsTbl = () => {
+      const tbl = document.getElementById(`exec-ez-hosts-tbl-${projectId}`);
+      if (!tbl) return;
+      tbl.innerHTML = _ezHosts.length
+        ? '<table style="width:100%;border-collapse:collapse">' +
+          _ezHosts.map((h, i) => `<tr>
+            <td style="padding:2px 6px 2px 0;color:var(--text);font-size:10px;font-family:var(--font-mono)">${escapeHtml(h.hostname || '')}</td>
+            <td style="padding:2px 6px 2px 0;color:var(--muted)"><label style="display:flex;align-items:center;gap:4px;cursor:pointer;font-size:9px"><input type="checkbox" class="exec-ez-host-autocwd" data-pid="${escapeHtml(projectId)}" data-idx="${i}" ${h.auto_add_cwds ? 'checked' : ''} style="cursor:pointer"> Auto-add new cwds</label></td>
+            <td style="padding:2px 0;text-align:right"><button class="exec-ez-del-host" data-pid="${escapeHtml(projectId)}" data-idx="${i}" style="font-size:9px;padding:1px 6px;background:transparent;border:1px solid var(--border);border-radius:3px;color:var(--muted);cursor:pointer">✕</button></td>
+          </tr>`).join('') + '</table>'
+        : '<div style="color:var(--muted);font-style:italic;font-size:10px">No machines registered yet — first hook auto-registers.</div>';
+      _wireHostBtns();
+    };
+
+    const _wireHostBtns = () => {
+      document.querySelectorAll(`.exec-ez-del-host[data-pid="${projectId}"]`).forEach(btn => {
+        btn.onclick = () => { _ezHosts.splice(parseInt(btn.dataset.idx, 10), 1); _rerenderHostsTbl(); };
+      });
+      document.querySelectorAll(`.exec-ez-host-autocwd[data-pid="${projectId}"]`).forEach(cb => {
+        cb.onchange = () => {
+          const idx = parseInt(cb.dataset.idx, 10);
+          if (_ezHosts[idx]) _ezHosts[idx] = { ..._ezHosts[idx], auto_add_cwds: cb.checked };
+        };
+      });
+    };
+    _wireHostBtns();
+
+    const _rerenderPathsTbl = () => {
+      const tbl = document.getElementById(`exec-ez-paths-tbl-${projectId}`);
+      if (!tbl) return;
+      tbl.innerHTML = _ezPaths.length
+        ? '<table style="width:100%;border-collapse:collapse">' +
+          _ezPaths.map((p, i) => `<tr>
+            <td style="padding:2px 6px 2px 0;color:var(--text);font-size:10px;font-family:var(--font-mono)">${escapeHtml(p.hostname || '')}</td>
+            <td style="padding:2px 6px 2px 0;color:var(--muted);font-size:10px;font-family:var(--font-mono)">${escapeHtml(p.cwd || '')}</td>
+            <td style="padding:2px 0;text-align:right"><button class="exec-ez-del-row" data-pid="${escapeHtml(projectId)}" data-idx="${i}" style="font-size:9px;padding:1px 6px;background:transparent;border:1px solid var(--border);border-radius:3px;color:var(--muted);cursor:pointer">✕</button></td>
+          </tr>`).join('') + '</table>'
+        : '<div style="color:var(--muted);font-style:italic;font-size:10px">No path overrides — machine-level routing handles most cases.</div>';
+      _wirePathBtns();
+    };
+
+    const _wirePathBtns = () => {
+      document.querySelectorAll(`.exec-ez-del-row[data-pid="${projectId}"]`).forEach(btn => {
+        btn.onclick = () => { _ezPaths.splice(parseInt(btn.dataset.idx, 10), 1); _rerenderPathsTbl(); };
+      });
+    };
+    _wirePathBtns();
 
     if (ezClearBtn) {
       ezClearBtn.onclick = () => {
-        _ezPaths = [];
-        const tblEl = document.getElementById(`exec-ez-paths-tbl-${projectId}`);
-        if (tblEl) tblEl.innerHTML = '<div style="color:var(--muted);font-style:italic;font-size:10px">No locations tracked yet -- run the installer to auto-populate.</div>';
+        _ezHosts = []; _ezPaths = [];
+        _rerenderHostsTbl(); _rerenderPathsTbl();
       };
     }
 
     ezSaveBtn.onclick = async () => {
       ezSaveBtn.disabled = true;
       const curCfg = (projectSettings && projectSettings.executor_config) || {};
-      const cfg = { ...curCfg, repo_paths: _ezPaths };
+      const cfg = { ...curCfg, hostnames: _ezHosts, repo_paths: _ezPaths };
       delete cfg.repo_path;
       try {
         await saveProjectSettings(projectId, { executor_config: cfg });
