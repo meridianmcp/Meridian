@@ -31,7 +31,7 @@ control you want versus how much setup you are willing to do.
     **Linux**
 
     ```bash
-    curl -Lo meridian https://github.com/meridianmcp/Meridian/releases/latest/download/meridian-linux-x86_64
+    curl -Lo meridian https://github.com/meridianmcp/Meridian/releases/latest/download/meridian-linux
     chmod +x meridian
     ./meridian
     ```

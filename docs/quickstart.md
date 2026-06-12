@@ -33,11 +33,11 @@ Get Meridian running and connected to Claude Code in under 10 minutes.
 
     Download the latest binary from the [Releases page](https://github.com/meridianmcp/Meridian/releases/latest).
 
-    Look for `meridian-linux-amd64` under **Assets**.
+    Look for `meridian-linux` under **Assets**.
 
     ```bash
     # Download (replace X.Y.Z with the latest version)
-    curl -Lo meridian https://github.com/meridianmcp/Meridian/releases/latest/download/meridian-linux-amd64
+    curl -Lo meridian https://github.com/meridianmcp/Meridian/releases/latest/download/meridian-linux
     chmod +x meridian
     ./meridian
     # → Meridian running on http://127.0.0.1:7878
@@ -47,11 +47,11 @@ Get Meridian running and connected to Claude Code in under 10 minutes.
 
     Download the latest binary from the [Releases page](https://github.com/meridianmcp/Meridian/releases/latest).
 
-    Look for `meridian-macos-arm64` under **Assets**.
+    Look for `meridian-mac-arm64` under **Assets**.
 
     ```bash
     # Download (replace X.Y.Z with the latest version)
-    curl -Lo meridian https://github.com/meridianmcp/Meridian/releases/latest/download/meridian-macos-arm64
+    curl -Lo meridian https://github.com/meridianmcp/Meridian/releases/latest/download/meridian-mac-arm64
     chmod +x meridian
     # macOS may quarantine the binary — remove the quarantine flag:
     xattr -d com.apple.quarantine meridian 2>/dev/null || true

@@ -54,10 +54,10 @@ Paste this into your project's `.mcp.json` (or `~/.claude/mcp.json` for global):
 {
   "mcpServers": {
     "meridian": {
-      "command": "npx",
-      "args": ["-y", "mcp-remote", "https://usemeridian.us/mcp"],
-      "env": {
-        "BEARER_TOKEN": "sk_meridian_your_token_here"
+      "type": "http",
+      "url": "https://usemeridian.us/mcp",
+      "headers": {
+        "Authorization": "Bearer sk_meridian_your_token_here"
       }
     }
   }
@@ -66,7 +66,7 @@ Paste this into your project's `.mcp.json` (or `~/.claude/mcp.json` for global):
 
 !!! tip "No local install required"
     With the hosted tier, you don't need to clone the repo or install anything locally.
-    `npx mcp-remote` handles the connection transparently.
+    Claude Code's native HTTP transport connects directly — no proxy needed.
 
 ---
 
@@ -78,10 +78,10 @@ Add to `claude_desktop_config.json`:
 {
   "mcpServers": {
     "meridian": {
-      "command": "npx",
-      "args": ["-y", "mcp-remote", "https://usemeridian.us/mcp"],
-      "env": {
-        "BEARER_TOKEN": "sk_meridian_your_token_here"
+      "type": "http",
+      "url": "https://usemeridian.us/mcp",
+      "headers": {
+        "Authorization": "Bearer sk_meridian_your_token_here"
       }
     }
   }
@@ -101,10 +101,10 @@ Add to `.cursor/mcp.json`:
 {
   "mcpServers": {
     "meridian": {
-      "command": "npx",
-      "args": ["-y", "mcp-remote", "https://usemeridian.us/mcp"],
-      "env": {
-        "BEARER_TOKEN": "sk_meridian_your_token_here"
+      "type": "http",
+      "url": "https://usemeridian.us/mcp",
+      "headers": {
+        "Authorization": "Bearer sk_meridian_your_token_here"
       }
     }
   }
@@ -194,7 +194,7 @@ A: 100 requests per minute per bearer token. Sufficient for all normal usage pat
 A: Email hello@usemeridian.us — we'll regenerate it.
 
 **Q: Does the hosted tier work with Cursor / Windsurf?**
-A: Yes — any MCP-compatible client works with the remote `/mcp` endpoint via `mcp-remote`.
+A: Yes — any MCP-compatible client that supports HTTP transport works with the remote `/mcp` endpoint.
 
 **Q: Where is my data stored?**
 A: Each workspace gets an isolated Neon Postgres database in `aws-us-east-2` (US East). No data mixing between customers.
