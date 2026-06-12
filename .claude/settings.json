@@ -3,7 +3,7 @@
                        "meridian":  {
                                         "url":  "https://usemeridian.us/mcp",
                                         "headers":  {
-                                                        "Authorization":  "Bearer sk_meridian_B-WrKW2eVo4XnfeKQw2e2SflgE1gX2K2vtndNSVPuck"
+                                                        "Authorization":  "Bearer sk_meridian_NMICL8f-nT_zpvafKTYpYjTW9G0Ve9ardd02-Jl_Ams"
                                                     },
                                         "type":  "http"
                                     }
@@ -45,3 +45,4 @@
                                   ]
                     }
 }
+
