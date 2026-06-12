@@ -1,4 +1,4 @@
-﻿"""FastAPI HTTP server and MCP stdio server for Meridian.
+"""FastAPI HTTP server and MCP stdio server for Meridian.
 
 This module exposes two surfaces backed by the same async SQLite database:
 
@@ -5499,7 +5499,7 @@ async def hooks_session_start(body: dict[str, Any], request: Request) -> dict[st
                     except Exception:
                         pass
                 # Return empty context -- session runs without Meridian context until user answers
-                return {"hookEventName": "SessionStart", "hookSpecificOutput": {"additionalContext": ""}}
+                return {"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": ""}}
         else:
             project = matched
             project_id = project["id"]
@@ -5645,7 +5645,7 @@ async def hooks_session_start(body: dict[str, Any], request: Request) -> dict[st
             f"Top item id: {top_item_id}"
         )
     additional_context = "\n".join(lines)
-    return {"hookEventName": "SessionStart", "hookSpecificOutput": {"additionalContext": additional_context}}
+    return {"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": additional_context}}
 
 
 @app.post("/hooks/stop")
