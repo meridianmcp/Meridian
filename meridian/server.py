@@ -19,6 +19,7 @@ import math
 import os
 import re
 import signal
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -482,6 +483,71 @@ async def _seed_decisions_from_file(db, project_id: str) -> None:
     _log.getLogger(__name__).info("Seeded %d decisions from DECISIONS.md", seeded)
 
 
+# ---------------------------------------------------------------------------
+# Session keepalive — keep a busy session's ``last_seen`` fresh.
+#
+# ``last_seen`` only advances when a session makes an MCP tool call (the
+# implicit bump in :func:`build_mcp_server`). A session that goes heads-down on
+# non-MCP work — git, bash, file edits — makes no calls for minutes, so its
+# ``last_seen`` drifts past the 10-minute live window and a second session's
+# coordination check mistakes it for dead and starts on the same files.
+#
+# Fix: every tool call marks the session "connected"; a background loop then
+# refreshes last_seen for connected sessions every minute, for as long as they
+# stay within SESSION_KEEPALIVE_TTL_S of their last call. Sessions idle past
+# the TTL are forgotten so genuinely-dead ones still expire on schedule.
+# ---------------------------------------------------------------------------
+SESSION_KEEPALIVE_INTERVAL_S = int(os.environ.get("MERIDIAN_KEEPALIVE_INTERVAL_S", "60"))
+SESSION_KEEPALIVE_TTL_S = int(os.environ.get("MERIDIAN_KEEPALIVE_TTL_S", "600"))
+
+# session_id -> monotonic timestamp of the last activity that proved liveness.
+_CONNECTED_SESSIONS: dict[str, float] = {}
+
+
+def _mark_session_connected(session_id, now=None) -> None:
+    """Record that *session_id* just proved it's alive (any tool call) so the
+    keepalive loop holds its ``last_seen`` fresh through quiet, non-MCP work."""
+    if not session_id:
+        return
+    _CONNECTED_SESSIONS[session_id] = time.monotonic() if now is None else now
+
+
+async def _keepalive_connected_sessions(db, now=None, ttl_s=SESSION_KEEPALIVE_TTL_S):
+    """Refresh ``last_seen`` for every connected session still within *ttl_s*
+    of its last activity; forget the rest. Returns the ids refreshed.
+
+    Split out from the loop so a single tick can be driven from tests with an
+    explicit clock."""
+    if now is None:
+        now = time.monotonic()
+    fresh, stale = [], []
+    for sid, ts in list(_CONNECTED_SESSIONS.items()):
+        (fresh if now - ts <= ttl_s else stale).append(sid)
+    for sid in stale:
+        _CONNECTED_SESSIONS.pop(sid, None)
+    if fresh:
+        try:
+            await db_module.keepalive_sessions(db, fresh)
+        except Exception:  # noqa: BLE001 — a failed bump must not kill the loop
+            pass
+    return fresh
+
+
+async def _run_session_keepalive_loop(db) -> None:
+    """Periodically refresh connected sessions. Started by both the FastAPI
+    lifespan (hosted/HTTP clients) and the stdio entrypoint (local clients) so
+    a busy session never looks dead to a coordinating one regardless of how it
+    connected."""
+    while True:
+        try:
+            await asyncio.sleep(SESSION_KEEPALIVE_INTERVAL_S)
+            await _keepalive_connected_sessions(db)
+        except asyncio.CancelledError:
+            break
+        except Exception:  # noqa: BLE001 — never let the loop die
+            continue
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Open the SQLite connection on startup, close it on shutdown.
@@ -730,6 +796,9 @@ async def lifespan(app: FastAPI):
     version_task = asyncio.create_task(_version_check_loop())
     app.state.version_task = version_task
 
+    keepalive_task = asyncio.create_task(_run_session_keepalive_loop(db))
+    app.state.keepalive_task = keepalive_task
+
     try:
         yield
 
@@ -737,12 +806,17 @@ async def lifespan(app: FastAPI):
         summary_task.cancel()
         watch_task.cancel()
         version_task.cancel()
+        keepalive_task.cancel()
         try:
             await summary_task
         except (asyncio.CancelledError, Exception):  # noqa: BLE001
             pass
         try:
             await watch_task
+        except (asyncio.CancelledError, Exception):  # noqa: BLE001
+            pass
+        try:
+            await keepalive_task
         except (asyncio.CancelledError, Exception):  # noqa: BLE001
             pass
         await db.close()
@@ -5154,6 +5228,7 @@ async def _start_session_composite(
     session = await db_module.register_session(
         db, project_id, session_name, human_id=human_id, client_type=client_type
     )
+    _mark_session_connected(session["id"])
     try:
         await db_module.create_executor_run(db, session["id"], project_id)
     except Exception:
@@ -9690,16 +9765,31 @@ def build_mcp_server():
                 await db_module.update_session_seen(db, _session_id)
             except Exception:
                 pass
+        # Track liveness so the keepalive loop can hold last_seen fresh while
+        # this session is heads-down on non-MCP work (git/bash/file edits).
+        _mark_session_connected(_session_id)
 
         return [TextContent(type="text", text=json.dumps(result, default=str))]
 
     async def run_stdio() -> None:
         """Run the MCP server over stdio until the client disconnects."""
-        async with stdio_server() as (read_stream, write_stream):
-            await server.run(
-                read_stream,
-                write_stream,
-                server.create_initialization_options(),
-            )
+        # Keep this local session's last_seen fresh while it's busy on non-MCP
+        # work (git/bash/file ops) — otherwise a second local session sees it as
+        # dead inside the live window and starts on the same files.
+        keepalive_db = await _ensure_db()
+        keepalive = asyncio.create_task(_run_session_keepalive_loop(keepalive_db))
+        try:
+            async with stdio_server() as (read_stream, write_stream):
+                await server.run(
+                    read_stream,
+                    write_stream,
+                    server.create_initialization_options(),
+                )
+        finally:
+            keepalive.cancel()
+            try:
+                await keepalive
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
 
     return server, run_stdio

@@ -1693,6 +1693,27 @@ async def heartbeat_session(
     return cursor.rowcount > 0
 
 
+async def keepalive_sessions(
+    db: aiosqlite.Connection, session_ids: "list[str]"
+) -> int:
+    """Bump ``last_seen`` to now for each still-open session in *session_ids*.
+
+    Driven by the server's keepalive loop so a session busy on non-MCP work
+    (git/bash/file ops) — and therefore making no tool calls — doesn't drift
+    past the live window and get mistaken for dead by a coordinating session.
+    Closed/archived rows are skipped. Returns the number of rows refreshed."""
+    if not session_ids:
+        return 0
+    placeholders = ", ".join("?" for _ in session_ids)
+    cursor = await db.execute(
+        f"UPDATE sessions SET last_seen = datetime('now') "
+        f"WHERE id IN ({placeholders}) AND status NOT IN ('closed', 'archived')",
+        tuple(session_ids),
+    )
+    await db.commit()
+    return cursor.rowcount
+
+
 async def close_session(db: aiosqlite.Connection, session_id: str) -> None:
     """Mark a session as closed and finalize its executor_run."""
     await db.execute(
