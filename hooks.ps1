@@ -157,6 +157,24 @@ if ($IsLocalhost) {
             }
         } catch {}
     }
+    # Also check ps1 script directly (hooks use & "script.ps1" format not inline Bearer)
+    if ([string]::IsNullOrWhiteSpace($existingToken)) {
+        $psPath = Join-Path $HOME ".claude\hooks\meridian-start.ps1"
+        if (Test-Path $psPath) {
+            try {
+                $pscontent = Get-Content $psPath -Raw
+                if ($pscontent -match 'Bearer (sk_meridian_[A-Za-z0-9_\-]+)') {
+                    $candidate = $Matches[1]
+                    $check = Get-MeResponse -Url $MeridianUrl -Token $candidate
+                    if ($null -ne $check) {
+                        $existingToken = $candidate
+                        $Token = $candidate
+                        Write-Host "  Found existing API key in hooks script -- authenticated as: $($check.email)" -ForegroundColor Green
+                    }
+                }
+            } catch {}
+        }
+    }
 
     if ([string]::IsNullOrWhiteSpace($existingToken)) {
         if ($null -eq $Token) {
@@ -224,7 +242,6 @@ if ($ClaudeDetected -and (Test-Path $ClaudeSettingsPath)) {
     } catch {}
 }
 
-if ($ExistingHooks) {
 if ($ExistingHooks) {
     Write-Host ""
     Write-Host "Existing Meridian hooks detected." -ForegroundColor Yellow
