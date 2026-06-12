@@ -77,7 +77,22 @@ function Write-HookScripts {
         $line1 = '$cwd=(Get-Location).Path -replace [char]92,[char]47'
         $line2 = '$h=$env:COMPUTERNAME'
         $line3 = '$b=@{cwd=$cwd;hostname=$h}|ConvertTo-Json -Compress'
-        $line4 = "try{(Invoke-WebRequest -Method POST -Uri `"$Url/hooks/session-start`"$hdr -ContentType `"application/json`" -Body `$b -UseBasicParsing).Content}catch{`"{\"hookEventName\":\"SessionStart\",\"hookSpecificOutput\":{\"additionalContext\":\"\"}}`"}"
+        # try block: fire hook, output response content
+        $tryLine = "try{`$_r=(Invoke-WebRequest -Method POST -Uri `"$Url/hooks/session-start`"$hdr -ContentType `"application/json`" -Body `$b -UseBasicParsing);`$_r.Content}"
+        # catch block: self-heal on 401 via MERIDIAN_API_SECRET_KEY in .env, always return valid JSON
+        $catchLines = @(
+            "catch{`$_s=if(`$_.Exception.Response){[int]`$_.Exception.Response.StatusCode.value__}else{0}",
+            "if(`$_s -eq 401){try{`$_f=Join-Path (`$cwd -replace '/','\') '.env'",
+            "if(Test-Path `$_f){`$_c=[IO.File]::ReadAllText(`$_f)",
+            "if(`$_c -match 'MERIDIAN_API_SECRET_KEY=([^\r\n]+)'){`$_t=`$Matches[1].Trim()",
+            "if(`$_t){`$_r2=Invoke-WebRequest -Method POST -Uri `"$Url/hooks/session-start`" -Headers @{Authorization=`"Bearer `$_t`"} -ContentType `"application/json`" -Body `$b -UseBasicParsing",
+            "if(`$_r2.StatusCode -eq 200){`$_p=`$PSCommandPath",
+            "if(`$_p -and (Test-Path `$_p)){`$_sc=[IO.File]::ReadAllText(`$_p) -replace 'sk_meridian_[A-Za-z0-9_-]+',`$_t",
+            "[IO.File]::WriteAllText(`$_p,`$_sc,(New-Object System.Text.UTF8Encoding `$false))}",
+            "`$_r2.Content;return}}}}}catch{}}",
+            "'{`"hookSpecificOutput`":{`"hookEventName`":`"SessionStart`",`"additionalContext`":`"`"}}'",
+            "}"
+        )
 
         $startLines = @($line1, $line2, $line3)
         if ($Url -match "(localhost|127\.0\.0\.1)") {
@@ -85,7 +100,8 @@ function Write-HookScripts {
             $startLines += "try{`$alive=(Invoke-WebRequest -Uri `"$Url/health`" -UseBasicParsing -TimeoutSec 3 -ErrorAction Stop).StatusCode -eq 200}catch{}"
             $startLines += 'if(-not $alive){$pixi=(Split-Path (Split-Path $PSScriptRoot -Parent) -Parent);if(Test-Path "$pixi\pixi.toml"){Start-Process pixi -ArgumentList "run","start" -WorkingDirectory $pixi -WindowStyle Hidden;Start-Sleep 3}}'
         }
-        $startLines += $line4
+        $startLines += $tryLine
+        $startLines += $catchLines
         [System.IO.File]::WriteAllText($sp, ($startLines -join [char]10), $enc)
 
         $line4s = "try{Invoke-WebRequest -Method POST -Uri `"$Url/hooks/stop`"$hdr -ContentType `"application/json`" -Body `$b -UseBasicParsing|Out-Null}catch{}"

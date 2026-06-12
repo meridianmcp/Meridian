@@ -2095,7 +2095,33 @@ async def _on_hitl_answered(
     returned as ``apply_error`` so the answer itself still succeeds. Legacy
     ``'question'`` requests are a no-op.
     """
-    if (request_row or {}).get("kind") != "md_section_update":
+    kind = (request_row or {}).get("kind")
+
+    if kind == "hook_project_select" and approved:
+        # Store hostname → project mapping so future hooks auto-route
+        raw = request_row.get("payload")
+        try:
+            payload = json.loads(raw) if isinstance(raw, str) else (raw or {})
+        except (ValueError, TypeError):
+            payload = {}
+        hostname = (payload.get("hostname") or "").strip()
+        answer = (request_row.get("answer") or "")
+        projects_in_payload = payload.get("projects") or []
+        chosen = next((p for p in projects_in_payload if p.get("name") == answer), None)
+        if chosen and hostname:
+            try:
+                cfg = await db_module.get_executor_config(db, chosen["id"])
+                hostnames = cfg.get("hostnames") or []
+                norm_hn = hostname.lower()
+                if not any(h.get("hostname", "").lower() == norm_hn for h in hostnames):
+                    hostnames.append({"hostname": hostname, "auto_add_cwds": False})
+                    cfg["hostnames"] = hostnames
+                    await db_module.set_executor_config(db, chosen["id"], cfg)
+            except Exception:  # noqa: BLE001
+                pass
+        return {}
+
+    if kind != "md_section_update":
         return {}
     if not approved:
         return {"applied": False, "reason": "rejected"}
@@ -5426,9 +5452,11 @@ async def hooks_session_start(body: dict[str, Any], request: Request) -> dict[st
         if not projects:
             from fastapi.responses import JSONResponse
             return JSONResponse(status_code=400, content={"error": "no projects found -- create a project first"})
-        # Try to match by repo_paths cwd+hostname
+        # Routing — hostname-first: one machine = one project by default.
+        # Pass 1: exact cwd+hostname match in repo_paths
         matched = None
         norm_cwd = normalized_hook_cwd.lower().rstrip("/")
+        norm_hn_ar = hook_hostname.lower() if hook_hostname else ""
         for p in projects:
             cfg = p.get("executor_config") or {}
             if isinstance(cfg, str):
@@ -5439,33 +5467,42 @@ async def hooks_session_start(body: dict[str, Any], request: Request) -> dict[st
             for rp in repo_paths:
                 rp_cwd = _normalize_hook_cwd(rp.get("cwd", "")).lower().rstrip("/")
                 rp_host = rp.get("hostname", "").lower()
-                if rp_cwd == norm_cwd and (not rp_host or rp_host == hook_hostname.lower()):
+                if rp_cwd == norm_cwd and (not rp_host or rp_host == norm_hn_ar):
                     matched = p
                     break
             if matched:
                 break
+        # Pass 2: hostname registered in any project's hostnames list (hostname-only match)
+        if not matched and norm_hn_ar:
+            for p in projects:
+                cfg = p.get("executor_config") or {}
+                if isinstance(cfg, str):
+                    import json as _json_hn
+                    try: cfg = _json_hn.loads(cfg)
+                    except Exception: cfg = {}
+                if any(h.get("hostname", "").lower() == norm_hn_ar for h in (cfg.get("hostnames") or [])):
+                    matched = p
+                    break
         if not matched:
-            # No cwd match -- if only 1 project use it, else fire HITL
+            # No hostname/cwd match -- if only 1 project, register hostname; else fire HITL
             if len(projects) == 1:
                 project = projects[0]
                 project_id = project["id"]
-                # Auto-add this cwd to the project's repo_paths
-                if hook_cwd and hook_hostname:
+                # Auto-register hostname (not just cwd) so all future sessions from this machine route here
+                if hook_hostname:
                     try:
                         import json as _json2
                         cfg2 = project.get("executor_config") or {}
                         if isinstance(cfg2, str):
                             try: cfg2 = _json2.loads(cfg2)
                             except Exception: cfg2 = {}
-                        rps = cfg2.get("repo_paths") or []
-                        norm2 = normalized_hook_cwd.lower().rstrip("/")
-                        if not any(
-                            _normalize_hook_cwd(rp.get("cwd", "")).lower().rstrip("/") == norm2
-                            for rp in rps
-                        ):
-                            rps.append({"hostname": hook_hostname, "cwd": normalized_hook_cwd or hook_cwd})
-                            cfg2["repo_paths"] = rps
+                        hostnames2 = cfg2.get("hostnames") or []
+                        norm_hn2 = hook_hostname.lower()
+                        if not any(h.get("hostname", "").lower() == norm_hn2 for h in hostnames2):
+                            hostnames2.append({"hostname": hook_hostname, "auto_add_cwds": False})
+                            cfg2["hostnames"] = hostnames2
                             await db_module.set_executor_config(db, project_id, cfg2)
+                            project["executor_config"] = cfg2
                     except Exception:
                         pass
             else:
@@ -5484,17 +5521,16 @@ async def hooks_session_start(body: dict[str, Any], request: Request) -> dict[st
                     except Exception:
                         pass
                 if not hitl_exists:
-                    options = [p2["name"] for p2 in projects] + ["None -- skip Meridian for this session"]
                     # File HITL on the first project (arbitrary anchor)
                     try:
+                        import json as _json_hitl
                         await db_module.request_hitl(
                             db,
                             project_id=projects[0]["id"],
                             question=f"Which project is this session for? (cwd: {normalized_hook_cwd or hook_cwd})",
-                            options=options,
                             urgency="normal",
                             kind="hook_project_select",
-                            payload={"cwd": normalized_hook_cwd or hook_cwd, "raw_cwd": hook_cwd, "hostname": hook_hostname, "projects": [{"id": p2["id"], "name": p2["name"]} for p2 in projects]},
+                            payload=_json_hitl.dumps({"cwd": normalized_hook_cwd or hook_cwd, "raw_cwd": hook_cwd, "hostname": hook_hostname, "projects": [{"id": p2["id"], "name": p2["name"]} for p2 in projects]}),
                         )
                     except Exception:
                         pass
@@ -5563,7 +5599,23 @@ async def hooks_session_start(body: dict[str, Any], request: Request) -> dict[st
                 for e in repo_paths
             ) if norm_hn else False
 
-            if not repo_paths:
+            # Hostname registered at machine level (hostnames list) → route silently
+            hn_registered = any(
+                h.get("hostname", "").lower() == norm_hn
+                for h in (exec_cfg.get("hostnames") or [])
+            ) if norm_hn else False
+
+            if hn_registered:
+                # Hostname registered → proceed regardless of cwd
+                hn_entry = next(
+                    (h for h in (exec_cfg.get("hostnames") or []) if h.get("hostname", "").lower() == norm_hn),
+                    None,
+                )
+                if hn_entry and hn_entry.get("auto_add_cwds", False) and norm_cwd and not exact_match:
+                    repo_paths.append({"hostname": hook_hostname, "cwd": normalized_hook_cwd or hook_cwd})
+                    exec_cfg["repo_paths"] = repo_paths
+                    await db_module.set_executor_config(db, project_id, exec_cfg)
+            elif not repo_paths:
                 # Case 1: empty → auto-add silently, proceed
                 exec_cfg["repo_paths"] = [{"hostname": hook_hostname or "unknown", "cwd": normalized_hook_cwd or hook_cwd}]
                 exec_cfg.pop("repo_path", None)
@@ -5572,7 +5624,7 @@ async def hooks_session_start(body: dict[str, Any], request: Request) -> dict[st
                 # Case 2: exact match → proceed silently
                 pass
             elif hostname_match:
-                # Case 3: hostname known, cwd differs → blocking HITL (deduped)
+                # Case 3: hostname known in repo_paths, cwd differs → blocking HITL (deduped)
                 existing_hitl = await db_module.list_hitl_requests(db, project_id, status="pending", limit=50)
                 already_pending = any(r.get("kind") == "hook_cwd_mismatch" for r in existing_hitl)
                 if not already_pending:

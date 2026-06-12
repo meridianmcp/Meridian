@@ -6640,6 +6640,77 @@ def test_hooks_session_start_legacy_repo_path_migration(client):
     assert not cfg.get("repo_path")  # migrated away from repo_path (key may be null)
 
 
+def test_hooks_session_start_hostname_registered_bypasses_hitl(client):
+    """If hostname is in executor_config.hostnames, route silently even with unknown cwd."""
+    project = client.post("/projects", json={"name": "hn-route-proj"}).json()
+    pid = project["id"]
+    client.patch(f"/projects/{pid}/settings", json={
+        "executor_config": {
+            "hostnames": [{"hostname": "mybox", "auto_add_cwds": False}],
+            "repo_paths": [],
+        }
+    })
+    # Call without project_id — routing via hostname
+    r = client.post("/hooks/session-start", json={
+        "cwd": "/some/new/path", "hostname": "mybox"
+    })
+    assert r.status_code == 200
+    data = r.json()
+    # Response always has hookSpecificOutput with additionalContext
+    assert "hookSpecificOutput" in data
+    # No HITL should have been created
+    hitl_list = client.get(f"/projects/{pid}/hitl").json()
+    pending = [h for h in hitl_list if h.get("status") == "pending"]
+    assert pending == []
+
+
+def test_hooks_session_start_single_project_auto_registers_hostname(client):
+    """Single-project fallback auto-registers hostname in executor_config.hostnames."""
+    project = client.post("/projects", json={"name": "hn-autoreg-proj"}).json()
+    pid = project["id"]
+    # No executor_config set
+    r = client.post("/hooks/session-start", json={
+        "cwd": "/workspace/myrepo", "hostname": "devbox"
+    })
+    assert r.status_code == 200
+    settings = client.get(f"/projects/{pid}/settings").json()
+    cfg = settings.get("executor_config", {})
+    hostnames = cfg.get("hostnames", [])
+    assert any(h.get("hostname") == "devbox" for h in hostnames)
+
+
+def test_on_hitl_answered_hook_project_select_stores_hostname(client):
+    """Answering a hook_project_select HITL stores the hostname in the chosen project's executor_config.hostnames."""
+    p1 = client.post("/projects", json={"name": "hn-hitl-p1"}).json()
+    p2 = client.post("/projects", json={"name": "hn-hitl-p2"}).json()
+    pid1, pid2 = p1["id"], p2["id"]
+
+    # Trigger HITL by posting with unknown hostname (2 projects, no match)
+    r = client.post("/hooks/session-start", json={
+        "cwd": "/workspace/proj", "hostname": "unknownbox"
+    })
+    assert r.status_code == 200
+
+    # Find the pending hook_project_select HITL (filed on first project by server)
+    hitl_list = client.get(f"/projects/{pid1}/hitl").json() + client.get(f"/projects/{pid2}/hitl").json()
+    sel_hitl = [h for h in hitl_list if h.get("kind") == "hook_project_select" and h.get("status") == "pending"]
+    assert sel_hitl, "Expected a hook_project_select HITL to be created"
+    hitl_id = sel_hitl[0]["id"]
+
+    # Answer via PATCH /hitl/{id}: choose project p2 by name
+    resp = client.patch(f"/hitl/{hitl_id}", json={
+        "action": "answer",
+        "answer": p2["name"],
+    })
+    assert resp.status_code == 200
+
+    # hostname should now be in p2's executor_config.hostnames
+    settings = client.get(f"/projects/{pid2}/settings").json()
+    cfg = settings.get("executor_config", {})
+    hostnames = cfg.get("hostnames", [])
+    assert any(h.get("hostname") == "unknownbox" for h in hostnames)
+
+
 def test_hooks_installer_scripts_are_served(client):
     """GET /hooks.ps1 and /hooks.sh should serve the repo installer scripts."""
     ps1 = client.get("/hooks.ps1")
