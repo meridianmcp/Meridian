@@ -3571,7 +3571,7 @@ function buildTabBody(project) {
 
           </div>
 
-          <p class="claude-hint">Claude Code: pastes <code>start_session()</code> command. Planning chat: pastes handoff context. Hooks: opens setup instructions.</p>
+          <p class="claude-hint">Claude Code: pastes <code>start_session()</code> command. Open in Claude / Codex: pastes handoff context. Hooks: opens setup instructions.</p>
 
         </div>
 
