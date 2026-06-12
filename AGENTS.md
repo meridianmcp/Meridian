@@ -64,6 +64,62 @@ ALWAYS before ending:
 
 ---
 
+## Python scripting — use pixi run python, not PowerShell
+
+For any scripting, JSON parsing, or data processing, PREFER Python over PowerShell:
+
+```bash
+# PREFERRED
+pixi run python -c "import json; d=json.load(open('f.json')); print(d['key'])"
+pixi run python scripts/whatever.py
+
+# PowerShell only for: git, pixi tasks, file path ops
+git add ...; git commit -m "..."
+pixi run test-fast
+```
+
+**Why:** PowerShell string escaping is fragile — single/double quote nesting, here-strings, and `iex` encoding cause constant parse errors. Python is more predictable for any logic beyond simple file ops.
+
+**Python is NOT on PATH directly** — always use `pixi run python`, never `python` or `python3` bare.
+
+---
+
+## Environment — Windows PowerShell
+
+Shell is PowerShell on Windows. Never use bash, sh.
+- Command chaining: `;` not `&&`
+- Paths: `\` separator, or `-replace "\\","/"` for normalization
+- Tests: `pixi run test-fast` (parallel ~35s) or `pixi run test` (full with Playwright)
+- NEVER run hooks.ps1 or hooks.sh — invalidates Adam's active token
+
+---
+
+## Pre-start gate — wait for active sessions
+
+Before calling start_session, poll every 60 seconds:
+```powershell
+do {
+    $items = (Invoke-RestMethod "https://usemeridian.us/projects/PROJECT_ID/sprint-items?status=in_progress" -Headers @{Authorization="Bearer $token"})
+    $active = @($items | Where-Object { $_.status -eq "in_progress" })
+    if ($active.Count -gt 0) { Start-Sleep 60 }
+} while ($active.Count -gt 0)
+```
+
+---
+
+## Debugging — internal scratchpad
+
+For multi-turn debugging, maintain a state block updated every turn:
+```
+=== DEBUG STATE (turn N) ===
+Confirmed working: ...
+Current hypothesis: ...
+Tried and failed: ...
+Next: exactly one thing to try
+```
+
+---
+
 ## Parallel sessions — prevent file conflicts
 
 Running two Codex sessions on the same repo without isolation causes silent overwrites.
