@@ -1,3 +1,4 @@
+& {
 # hooks.ps1 - Meridian Connect (Windows / PowerShell)
 #
 # Usage:
@@ -510,3 +511,5 @@ Write-Host "To start with hooks + remote control enabled:"
 Write-Host "  claude --rc --permission-mode bypassPermissions" -ForegroundColor Cyan
 Write-Host "('claude rc' server mode does NOT fire hooks)"
 Write-Host ""
+
+}
