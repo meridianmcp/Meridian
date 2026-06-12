@@ -1,120 +1,114 @@
 & {
 # hooks.ps1 - Meridian Connect (Windows / PowerShell)
-#
-# Usage:
-#   irm https://usemeridian.us/hooks.ps1 | iex
-#   .\hooks.ps1
-#   .\hooks.ps1 --url http://localhost:7878 --token sk_meridian_xxx
-#
-# Installs Claude Code, Codex, and Cursor integrations.
-# One install per machine. Hooks are global - project_id comes from your goal.
-#
-# Requirements: PowerShell 5.1+
+# Run: irm https://usemeridian.us/hooks.ps1 | iex
 
-param(
-    [Parameter(ValueFromRemainingArguments = $true)]
-    [string[]]$CliArgs
-)
+param([string]$NonInteractive)
 
-$ErrorActionPreference = "Stop"
-
-function Get-ArgValue {
-    param([string[]]$Arguments, [string]$Name)
-    for ($i = 0; $i -lt $Arguments.Length; $i++) {
-        if ($Arguments[$i] -eq $Name) {
-            if ($i + 1 -ge $Arguments.Length) { Write-Error "Missing value for $Name"; exit 1 }
-            return $Arguments[$i + 1]
-        }
-    }
-    return $null
+function Get-Arg {
+    param([string]$Name, [string]$Default = '')
+    $i = $args.IndexOf("--$Name")
+    if ($i -ge 0 -and $i + 1 -lt $args.Count) { return $args[$i + 1] }
+    return $Default
 }
 
-function Test-UrlReachable {
+function Test-ServerHealth {
     param([string]$Url)
     try {
         $r = Invoke-WebRequest -Uri "$Url/health" -UseBasicParsing -TimeoutSec 5 -ErrorAction Stop
         return $r.StatusCode -eq 200
-    } catch {
-        return $false
-    }
+    } catch { return $false }
 }
 
 function Get-MeResponse {
     param([string]$Url, [string]$Token)
     try {
-        $headers = @{}
-        if (-not [string]::IsNullOrEmpty($Token)) { $headers["Authorization"] = "Bearer $Token" }
-        $r = Invoke-WebRequest -Uri "$Url/auth/me" -Headers $headers -UseBasicParsing -TimeoutSec 10 -ErrorAction Stop
-        return $r.Content | ConvertFrom-Json
-    } catch {
-        return $null
-    }
+        $r = Invoke-RestMethod -Uri "$Url/auth/me" -Headers @{ Authorization = "Bearer $Token" } -TimeoutSec 5 -ErrorAction Stop
+        return $r
+    } catch { return $null }
 }
 
-function Build-StartCmd {
-    param([string]$ScriptPath)
-    return "& `"`$ScriptPath`""
+# ---- Step 1: Determine Meridian URL ----------------------------------------------
+Write-Host ""
+Write-Host "Where is Meridian running?"
+Write-Host "  [1] usemeridian.us -- hosted (recommended, press Enter)"
+Write-Host "  [2] localhost:7878 -- self-hosted"
+Write-Host "  [3] Other URL"
+$urlChoice = Read-Host "Choice [1]"
+switch ($urlChoice) {
+    '2'   { $MeridianUrl = 'http://localhost:7878' }
+    '3'   { $MeridianUrl = (Read-Host 'Enter URL (no trailing slash)').TrimEnd('/') }
+    default { $MeridianUrl = 'https://usemeridian.us' }
 }
+$isLocal = $MeridianUrl -match 'localhost'
 
-function Write-HookScripts {
-    param([string]$Url, [string]$Token, [string]$HooksDir)
-    $null = New-Item -ItemType Directory -Force $HooksDir
-    $sp = Join-Path $HooksDir "meridian-start.ps1"
-    $tp = Join-Path $HooksDir "meridian-stop.ps1"
-    $enc = New-Object System.Text.UTF8Encoding $false
+Write-Host "Checking $MeridianUrl ..."
+if (-not (Test-ServerHealth -Url $MeridianUrl)) {
+    Write-Host "  Error: Cannot reach $MeridianUrl/health -- is the server running?" -ForegroundColor Red
+    return
+}
+Write-Host "  OK server is reachable" -ForegroundColor Green
 
-    # If scripts exist, update token in-place
-    if ($Token) {
-        foreach ($file in @($sp, $tp)) {
-            if (Test-Path $file) {
-                $c = [System.IO.File]::ReadAllText($file)
-                $c = $c -replace "sk_meridian_[A-Za-z0-9_\-]+", $Token
-                [System.IO.File]::WriteAllText($file, $c, $enc)
+# ---- Step 2: Authenticate --------------------------------------------------------
+$Token = ''
+$AuthUser = $null
+
+# Try to find existing token from ps1 script comment
+$HooksDir     = Join-Path $HOME '.claude\hooks'
+$startPsPath  = Join-Path $HooksDir 'meridian-start.ps1'
+if (Test-Path $startPsPath) {
+    try {
+        $pscontent = [System.IO.File]::ReadAllText($startPsPath)
+        if ($pscontent -match '(?:Bearer |MERIDIAN_TOKEN: )(sk_meridian_[A-Za-z0-9_\-]+)') {
+            $candidate = $Matches[1]
+            $check = Get-MeResponse -Url $MeridianUrl -Token $candidate
+            if ($null -ne $check) {
+                $Token = $candidate
+                $AuthUser = $check
+                Write-Host "  Found existing API key in hooks script -- authenticated as: $($check.email)" -ForegroundColor Green
             }
         }
-    }
-
-    if (-not (Test-Path $sp)) {
-        $isLocal = $Url -match "(localhost|127\.0\.0\.1)"
-        if ($isLocal) {
-            $startContent = @'
-# Meridian session-start hook (localhost)
-$fallback = [char]123+[char]34+"hookSpecificOutput"+[char]34+[char]58+[char]123+[char]34+"hookEventName"+[char]34+[char]58+[char]34+"SessionStart"+[char]34+[char]44+[char]34+"additionalContext"+[char]34+[char]58+[char]34+[char]34+[char]125+[char]125
-$cwd = (Get-Location).Path -replace "\\","/"
-$h = $env:COMPUTERNAME
-$b = '{"cwd":"' + $cwd + '","hostname":"' + $h + '"}'
-$alive = $false
-try { $alive = (Invoke-WebRequest -Uri "__URL__/health" -UseBasicParsing -TimeoutSec 3 -ErrorAction Stop).StatusCode -eq 200 } catch {}
-if (-not $alive) {
-    $pixi = Split-Path (Split-Path $PSScriptRoot -Parent) -Parent
-    if (Test-Path "$pixi\pixi.toml") { Start-Process pixi -ArgumentList "run","start" -WorkingDirectory $pixi -WindowStyle Hidden; Start-Sleep 3 }
+    } catch {}
 }
-$result = $null
-try {
-    $r = (Invoke-WebRequest -Method POST -Uri "__URL__/hooks/session-start" -ContentType 'application/json' -Body $b -UseBasicParsing -TimeoutSec 5).Content
-    if ($r -and $r.Contains("hookSpecificOutput")) { $result = $r }
-} catch {}
-if ($result) { $result } else { $fallback }
-'@
-            $stopContent = @'
-# Meridian session-stop hook (localhost)
-$cwd = (Get-Location).Path -replace "\\","/"
-$h = $env:COMPUTERNAME
-$b = '{"cwd":"' + $cwd + '","hostname":"' + $h + '"}'
-try { Invoke-WebRequest -Method POST -Uri "__URL__/hooks/stop" -ContentType 'application/json' -Body $b -UseBasicParsing | Out-Null } catch {}
-'@
-        } else {
-            $startContent = @'
+
+# Fall back to browser auth if no valid token found
+if ([string]::IsNullOrWhiteSpace($Token)) {
+    Write-Host "Opening browser to authenticate..."
+    $authUrl = "$MeridianUrl/auth/install-token"
+    try { Start-Process $authUrl } catch {}
+    $pastedToken = Read-Host "Paste the token shown in your browser"
+    $pastedToken = $pastedToken.Trim()
+    Write-Host "Validating token..."
+    $check = Get-MeResponse -Url $MeridianUrl -Token $pastedToken
+    if ($null -eq $check) {
+        Write-Host "  Error: token is invalid or expired. Re-run and try again." -ForegroundColor Red
+        return
+    }
+    $Token = $pastedToken
+    $AuthUser = $check
+    Write-Host "  Authenticated as: $($check.email)" -ForegroundColor Green
+}
+
+# ---- Step 3: Detect Claude Code / Codex ------------------------------------------
+$ClaudeSettingsPath = Join-Path $HOME '.claude\settings.json'
+$CodexDir           = Join-Path $HOME '.codex'
+$CodexConfigPath    = Join-Path $CodexDir 'config.toml'
+$ClaudeDetected     = Test-Path $ClaudeSettingsPath
+$CodexDetected      = Test-Path $CodexDir
+
+# ---- Step 4: Write hook scripts ---------------------------------------------------
+$null = New-Item -ItemType Directory -Force $HooksDir
+$enc  = New-Object System.Text.UTF8Encoding $false
+
+$startContent = @'
 # MERIDIAN_TOKEN: __TOKEN__
-# Meridian session-start hook -- self-healing token
-$fallback = [char]123+[char]34+"hookSpecificOutput"+[char]34+[char]58+[char]123+[char]34+"hookEventName"+[char]34+[char]58+[char]34+"SessionStart"+[char]34+[char]44+[char]34+"additionalContext"+[char]34+[char]58+[char]34+[char]34+[char]125+[char]125
+# Meridian session-start hook -- self-healing token with no-.env fallback
+$fallback = '{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":""}}'
 
 function Get-MeridianToken {
-    $self = $MyInvocation.ScriptName
-    if (-not $self) { $self = "$env:USERPROFILE\.claude\hooks\meridian-start.ps1" }
+    $self = "__HOOKDIR__\meridian-start.ps1"
     try {
         $c = [System.IO.File]::ReadAllText($self)
-        if ($c -match 'Authorization="Bearer (sk_meridian_[A-Za-z0-9_\-]+)"') { return $Matches[1] }
+        if ($c -match '(?:Bearer |MERIDIAN_TOKEN: )(sk_meridian_[A-Za-z0-9_\-]+)') { return $Matches[1] }
     } catch {}
     try {
         $cc = [System.IO.File]::ReadAllText("$env:USERPROFILE\.codex\config.toml")
@@ -124,27 +118,17 @@ function Get-MeridianToken {
 }
 
 function Refresh-Token {
-    $envPaths = @(
-        "$env:USERPROFILE\Documents\Meridian\repository\.env",
-        "$env:USERPROFILE\Meridian\.env"
-    )
+    $envPaths = @("C:\Users\13144\Documents\Meridian\repository\.env","$env:USERPROFILE\Documents\Meridian\repository\.env")
     foreach ($ep in $envPaths) {
         if (Test-Path $ep) {
             $line = Get-Content $ep | Where-Object { $_ -match "^MERIDIAN_API_SECRET_KEY=(.+)" }
             if ($line) {
                 $installKey = $line -replace "MERIDIAN_API_SECRET_KEY=",""
                 try {
-                    $r = Invoke-RestMethod -Uri "__URL__/auth/tokens" `
-                        -Method POST `
-                        -Headers @{Authorization="Bearer $installKey"; "Content-Type"="application/json"} `
-                        -Body '{"label":"hooks-installer"}' -TimeoutSec 5
+                    $r = Invoke-RestMethod -Uri "__URL__/auth/tokens" -Method POST -Headers @{Authorization="Bearer $installKey";"Content-Type"="application/json"} -Body '{"label":"hooks-installer"}' -TimeoutSec 5
                     if ($r.token) {
                         $oldTok = Get-MeridianToken
-                        foreach ($f in @(
-                            "$env:USERPROFILE\.claude\hooks\meridian-start.ps1",
-                            "$env:USERPROFILE\.claude\hooks\meridian-stop.ps1",
-                            "$env:USERPROFILE\.codex\config.toml"
-                        )) {
+                        foreach ($f in @("__HOOKDIR__\meridian-start.ps1","__HOOKDIR__\meridian-stop.ps1","$env:USERPROFILE\.codex\config.toml")) {
                             if (Test-Path $f) {
                                 $fc = [System.IO.File]::ReadAllText($f)
                                 if ($oldTok) { $fc = $fc -replace [regex]::Escape($oldTok), $r.token }
@@ -166,21 +150,17 @@ function Invoke-Hook($token) {
     $h = $env:COMPUTERNAME
     $b = '{"cwd":"' + $cwd + '","hostname":"' + $h + '"}'
     try {
-        $r = (Invoke-WebRequest -Method POST -Uri "__URL__/hooks/session-start" `
-            -Headers @{Authorization="Bearer __TOKEN__"} `
-            -ContentType 'application/json' -Body $b -UseBasicParsing -TimeoutSec 5).Content
+        $r = (Invoke-WebRequest -Method POST -Uri "__URL__/hooks/session-start" -Headers @{Authorization="Bearer $token"} -ContentType 'application/json' -Body $b -UseBasicParsing -TimeoutSec 5).Content
         if ($r -and $r.Contains("hookSpecificOutput")) { return $r }
     } catch {}
     return $null
 }
 
-# Main flow
 $tok = Get-MeridianToken
 $result = $null
 if ($tok) {
     try {
-        $null = Invoke-RestMethod -Uri "__URL__/auth/me" `
-            -Headers @{Authorization="Bearer $tok"} -TimeoutSec 3
+        $null = Invoke-RestMethod -Uri "__URL__/auth/me" -Headers @{Authorization="Bearer $tok"} -TimeoutSec 3
         $result = Invoke-Hook $tok
     } catch {
         $newTok = Refresh-Token
@@ -192,167 +172,29 @@ if ($tok) {
 }
 if ($result) { $result } else { $fallback }
 '@
-            $stopContent = @'
-# Meridian session-stop hook
-$cwd = (Get-Location).Path -replace "\\","/"
+
+$stopContent = @'
+# MERIDIAN_TOKEN: __TOKEN__
 $h = $env:COMPUTERNAME
-$b = '{"cwd":"' + $cwd + '","hostname":"' + $h + '"}'
-try {
-    Invoke-WebRequest -Method POST -Uri "__URL__/hooks/stop" -Headers @{Authorization="Bearer __TOKEN__"} -ContentType 'application/json' -Body $b -UseBasicParsing | Out-Null
-} catch {}
+$b = '{"hostname":"' + $h + '"}'
+try { Invoke-WebRequest -Method POST -Uri "__URL__/hooks/stop" -Headers @{Authorization="Bearer __TOKEN__"} -ContentType 'application/json' -Body $b -UseBasicParsing -TimeoutSec 5 | Out-Null } catch {}
 '@
-        }
-        $startContent = $startContent.Replace("__URL__", $Url)
-        $stopContent  = $stopContent.Replace("__URL__", $Url)
-        if ($Token) {
-            $startContent = $startContent.Replace("__TOKEN__", $Token)
-            $stopContent  = $stopContent.Replace("__TOKEN__", $Token)
-        }
-        [System.IO.File]::WriteAllText($sp, $startContent, $enc)
-        [System.IO.File]::WriteAllText($tp, $stopContent,  $enc)
-    }
-    return @{ Start = $sp; Stop = $tp }
-}
 
-function Build-StopCmd {
-    param([string]$ScriptPath)
-    return "& `"`$ScriptPath`""
-}
+$sp = Join-Path $HooksDir 'meridian-start.ps1'
+$tp = Join-Path $HooksDir 'meridian-stop.ps1'
 
-# ---- Step 1: URL ------------------------------------------------------------------
-$DefaultUrl = "https://usemeridian.us"
-$MeridianUrl = Get-ArgValue -Arguments $CliArgs -Name "--url"
-if ($null -eq $MeridianUrl) {
-    Write-Host "Where is Meridian running?"
-    Write-Host "  [1] usemeridian.us -- hosted (recommended, press Enter)"
-    Write-Host "  [2] localhost:7878 -- self-hosted"
-    Write-Host "  [3] Other URL"
-    $choice = Read-Host "Choice [1]"
-    if ($choice -eq "2") {
-        $MeridianUrl = "http://localhost:7878"
-    } elseif ($choice -eq "3") {
-        $MeridianUrl = Read-Host "Enter URL (e.g. https://my-meridian.example.com)"
-    } else {
-        $MeridianUrl = $DefaultUrl
-    }
-}
-$MeridianUrl = $MeridianUrl.TrimEnd("/")
+$startContent = $startContent.Replace('__URL__', $MeridianUrl).Replace('__TOKEN__', $Token).Replace('__HOOKDIR__', $HooksDir.Replace('\', '\\'))
+$stopContent  = $stopContent.Replace('__URL__', $MeridianUrl).Replace('__TOKEN__', $Token)
 
-if (-not ($MeridianUrl -match "^https?://")) {
-    Write-Host "Error: URL must start with https:// or http://" -ForegroundColor Red
-    exit 1
-}
+[System.IO.File]::WriteAllText($sp, $startContent, $enc)
+[System.IO.File]::WriteAllText($tp, $stopContent,  $enc)
 
-Write-Host "Checking $MeridianUrl ..."
-if (-not (Test-UrlReachable -Url $MeridianUrl)) {
-    Write-Host "Error: Cannot reach $MeridianUrl/health -- is the server running?" -ForegroundColor Red
-    exit 1
-}
-Write-Host "  OK server is reachable" -ForegroundColor Green
+$startCmd = "& `"$sp`""
+$stopCmd  = "& `"$tp`""
 
-# ---- Step 2: Auth -----------------------------------------------------------------
-$IsLocalhost = $MeridianUrl -match "^https?://(localhost|127\.0\.0\.1)(:\d+)?"
-$Token = Get-ArgValue -Arguments $CliArgs -Name "--token"
-
-if ($IsLocalhost) {
-    Write-Host ""
-    Write-Host "Self-hosted / localhost detected -- skipping auth."
-    if ($null -eq $Token) { $Token = "" }
-} else {
-    # Check for existing valid token in already-installed hooks first
-    $existingToken = $null
-    $settingsPath = Join-Path $HOME ".claude\settings.json"
-    if (Test-Path $settingsPath) {
-        try {
-            $s = Get-Content $settingsPath -Raw | ConvertFrom-Json
-            $cmd = $s.hooks.SessionStart[0].hooks[0].command
-            if ($cmd -match 'Bearer (sk_meridian_[A-Za-z0-9_\-]+)') {
-                $candidate = $Matches[1]
-                $check = Get-MeResponse -Url $MeridianUrl -Token $candidate
-                if ($null -ne $check) {
-                    $existingToken = $candidate
-                    $Token = $candidate
-                    Write-Host "  Found existing API key -- authenticated as: $($check.email)" -ForegroundColor Green
-                }
-            }
-        } catch {}
-    }
-    # Also check ps1 script directly (hooks use & "script.ps1" format not inline Bearer)
-    if ([string]::IsNullOrWhiteSpace($existingToken)) {
-        $psPath = Join-Path $HOME ".claude\hooks\meridian-start.ps1"
-        if (Test-Path $psPath) {
-            try {
-                $pscontent = Get-Content $psPath -Raw
-                if ($pscontent -match '(?:Bearer |MERIDIAN_TOKEN: )(sk_meridian_[A-Za-z0-9_\-]+)') {
-                    $candidate = $Matches[1]
-                    $check = Get-MeResponse -Url $MeridianUrl -Token $candidate
-                    if ($null -ne $check) {
-                        $existingToken = $candidate
-                        $Token = $candidate
-                        Write-Host "  Found existing API key in hooks script -- authenticated as: $($check.email)" -ForegroundColor Green
-                    }
-                }
-            } catch {}
-        }
-    }
-
-    if ([string]::IsNullOrWhiteSpace($existingToken)) {
-        if ($null -eq $Token) {
-            Write-Host ""
-            Write-Host "Opening browser to authenticate..."
-            Start-Process "$MeridianUrl/auth/install"
-            Write-Host ""
-            $secToken = Read-Host "Paste the token shown in your browser" -AsSecureString
-            $Token = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto(
-                [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($secToken)
-            )
-        }
-        $Token = $Token.Trim()
-        if ([string]::IsNullOrWhiteSpace($Token)) {
-            Write-Host "Error: token is required for hosted Meridian." -ForegroundColor Red
-            exit 1
-        }
-        Write-Host ""
-        Write-Host "Validating token..."
-        $me = Get-MeResponse -Url $MeridianUrl -Token $Token
-        if ($null -eq $me) {
-            Write-Host "Error: Token validation failed -- is the token correct?" -ForegroundColor Red
-            exit 1
-        }
-        Write-Host "  Authenticated as: $($me.email)" -ForegroundColor Green
-
-        # Exchange install token for permanent sk_meridian_ key
-        if (-not $Token.StartsWith("sk_meridian_")) {
-            try {
-                $r = Invoke-WebRequest -Method POST -Uri "$MeridianUrl/auth/tokens" `
-                    -Headers @{ Authorization = "Bearer $Token" } `
-                    -ContentType "application/json" -Body '{"label":"hooks-installer"}' `
-                    -UseBasicParsing -TimeoutSec 10 -ErrorAction SilentlyContinue
-                if ($r.StatusCode -eq 201) {
-                    $td = $r.Content | ConvertFrom-Json
-                    if ($td.token) {
-                        $Token = $td.token
-                        Write-Host "  Permanent API key saved." -ForegroundColor Green
-                    }
-                }
-            } catch {}
-        }
-    }
-}
-
-# No project selection -- hooks are global, project_id comes from the goal at session time.
-
-# ---- Step 4: Build hook commands --------------------------------------------------
-$HooksDir = Join-Path $HOME ".claude\hooks"
-$scripts = Write-HookScripts -Url $MeridianUrl -Token $Token -HooksDir $HooksDir
-$startCmd = Build-StartCmd -ScriptPath $scripts.Start
-$stopCmd  = Build-StopCmd  -ScriptPath $scripts.Stop
-
-# ---- Step 5: Check for existing hooks --------------------------------------------
-$ClaudeSettingsPath = Join-Path $HOME ".claude\settings.json"
-$ClaudeDetected = (Get-Command claude -ErrorAction SilentlyContinue) -ne $null -or (Test-Path $ClaudeSettingsPath)
+# ---- Step 5: Handle existing hooks -----------------------------------------------
 $ExistingHooks = $false
-
+$SkipInstall = $false
 if ($ClaudeDetected -and (Test-Path $ClaudeSettingsPath)) {
     try {
         $existing = Get-Content $ClaudeSettingsPath -Raw | ConvertFrom-Json
@@ -365,45 +207,57 @@ if ($ClaudeDetected -and (Test-Path $ClaudeSettingsPath)) {
 if ($ExistingHooks) {
     Write-Host ""
     Write-Host "Existing Meridian hooks detected." -ForegroundColor Yellow
-    if (-not [string]::IsNullOrWhiteSpace($existingToken)) {
+    $tokenValid = $null -ne (Get-MeResponse -Url $MeridianUrl -Token $Token)
+    if ($tokenValid) {
         Write-Host "  Token is valid -- hooks are working." -ForegroundColor Green
         $choice = Read-Host "  (S)kip -- leave as-is / (U)pdate format / (R)egenerate key [S/u/r]"
-        if ($choice -match "^[Uu]") {
+        if ($choice -match '^[Uu]') {
             Write-Host "  Updating hooks..."
-        } elseif ($choice -match "^[Rr]") {
+        } elseif ($choice -match '^[Rr]') {
             Write-Host "  Regenerating API key..."
             try {
-                $r2 = Invoke-WebRequest -Method POST -Uri "$MeridianUrl/auth/tokens" `
-                    -Headers @{ Authorization = "Bearer $Token" } `
-                -ContentType "application/json" -Body '{"label":"hooks-installer"}' `
-                -UseBasicParsing -TimeoutSec 10 -ErrorAction SilentlyContinue
-
-
-
-
-                if ($r2.StatusCode -eq 201) { $td2 = $r2.Content | ConvertFrom-Json; if ($td2.token) { $Token = $td2.token; Write-Host "  New key generated." -ForegroundColor Green; $scripts = Write-HookScripts -Url $MeridianUrl -Token $Token -HooksDir $HooksDir; $startCmd = Build-StartCmd -ScriptPath $scripts.Start; $stopCmd = Build-StopCmd -ScriptPath $scripts.Stop } }
+                $r2 = Invoke-WebRequest -Method POST -Uri "$MeridianUrl/auth/tokens" -Headers @{ Authorization = "Bearer $Token" } -ContentType "application/json" -Body '{"label":"hooks-installer"}' -UseBasicParsing -TimeoutSec 10 -ErrorAction SilentlyContinue
+                if ($r2.StatusCode -eq 201) {
+                    $td2 = $r2.Content | ConvertFrom-Json
+                    if ($td2.token) {
+                        $Token = $td2.token
+                        Write-Host "  New key generated." -ForegroundColor Green
+                        # Rewrite scripts with new token
+                        $startContent2 = $startContent -replace 'sk_meridian_[A-Za-z0-9_\-]+', $Token
+                        $stopContent2  = $stopContent  -replace 'sk_meridian_[A-Za-z0-9_\-]+', $Token
+                        [System.IO.File]::WriteAllText($sp, $startContent2, $enc)
+                        [System.IO.File]::WriteAllText($tp, $stopContent2,  $enc)
+                        $startCmd = "& `"$sp`""
+                        $stopCmd  = "& `"$tp`""
+                    }
+                }
             } catch {}
         } else {
             Write-Host "  Skipped -- hooks unchanged." -ForegroundColor Yellow
-            return
+            $SkipInstall = $true
         }
     } else {
         Write-Host "  Token invalid or expired -- updating automatically..." -ForegroundColor Yellow
-        # No prompt needed -- just regenerate silently
         try {
-            $r2 = Invoke-WebRequest -Method POST -Uri "$MeridianUrl/auth/tokens" `
-                -Headers @{ Authorization = "Bearer $Token" } `
-                -ContentType "application/json" -Body '{"label":"hooks-installer"}' `
-                -UseBasicParsing -TimeoutSec 10 -ErrorAction SilentlyContinue
-
-
-
-
-            if ($r2.StatusCode -eq 201) { $td2 = $r2.Content | ConvertFrom-Json; if ($td2.token) { $Token = $td2.token; Write-Host "  New key generated." -ForegroundColor Green ; $scripts = Write-HookScripts -Url $MeridianUrl -Token $Token -HooksDir $HooksDir; $startCmd = Build-StartCmd -ScriptPath $scripts.Start; $stopCmd = Build-StopCmd -ScriptPath $scripts.Stop } }
+            $r2 = Invoke-WebRequest -Method POST -Uri "$MeridianUrl/auth/tokens" -Headers @{ Authorization = "Bearer $Token" } -ContentType "application/json" -Body '{"label":"hooks-installer"}' -UseBasicParsing -TimeoutSec 10 -ErrorAction SilentlyContinue
+            if ($r2.StatusCode -eq 201) {
+                $td2 = $r2.Content | ConvertFrom-Json
+                if ($td2.token) {
+                    $Token = $td2.token
+                    Write-Host "  New key generated." -ForegroundColor Green
+                    $startContent2 = $startContent -replace 'sk_meridian_[A-Za-z0-9_\-]+', $Token
+                    $stopContent2  = $stopContent  -replace 'sk_meridian_[A-Za-z0-9_\-]+', $Token
+                    [System.IO.File]::WriteAllText($sp, $startContent2, $enc)
+                    [System.IO.File]::WriteAllText($tp, $stopContent2,  $enc)
+                    $startCmd = "& `"$sp`""
+                    $stopCmd  = "& `"$tp`""
+                }
+            }
         } catch {}
     }
 }
 
+if (-not $SkipInstall) {
 
 # ---- Step 6: Write hooks to ~/.claude/settings.json ------------------------------
 if ($ClaudeDetected) {
@@ -430,86 +284,49 @@ if ($ClaudeDetected) {
     Write-Host "  OK SessionStart + Stop hooks written" -ForegroundColor Green
 }
 
-# ---- Step 7: Codex ---------------------------------------------------------------
-$CodexDetected = (Get-Command codex -ErrorAction SilentlyContinue) -ne $null -or (Test-Path (Join-Path $HOME ".codex"))
+# ---- Step 7: Write Codex config --------------------------------------------------
 if ($CodexDetected) {
     Write-Host ""
     Write-Host "Codex detected -- writing MCP config to ~/.codex/config.toml"
-    $CodexDir = Join-Path $HOME ".codex"
-    $CodexConfigPath = Join-Path $CodexDir "config.toml"
-    if (-not (Test-Path $CodexDir)) { New-Item -ItemType Directory -Path $CodexDir | Out-Null }
+    $null = New-Item -ItemType Directory -Force $CodexDir
+    $meridianBlock = @"
 
-    $authLine = if ([string]::IsNullOrEmpty($Token)) { "" } else { "`n`n[mcp_servers.meridian.http_headers]`nAuthorization = `"Bearer $Token`"" }
-    $escapedStart = $startCmd.Replace('\', '\\').Replace('"', '\"')
-    $escapedStop  = $stopCmd.Replace('\', '\\').Replace('"', '\"')
-    $newBlock = @"
-
+# Meridian - added by hooks.ps1
 [mcp_servers.meridian]
 type = "http"
-url = "$MeridianUrl/mcp"$authLine
+url = "$MeridianUrl/mcp"
 
-[hooks]
-session_start = "$escapedStart"
-stop = "$escapedStop"
+[mcp_servers.meridian.http_headers]
+Authorization = "Bearer $Token"
 "@
-
     if (Test-Path $CodexConfigPath) {
         $existing = Get-Content $CodexConfigPath -Raw
-        $existing = $existing -replace '(?s)\[mcp_servers\.meridian\].*?(?=\n\[|\z)', ''
-        $existing = $existing -replace '(?s)\[hooks\].*?(?=\n\[|\z)', ''
-        $combined = $existing.TrimEnd() + $newBlock
+        # Remove old meridian block if present
+        $existing = $existing -replace '(?s)\n# Meridian - added by hooks\.ps1.*?(?=\n#|\n\[(?!mcp_servers\.meridian)|$)', ''
+        $existing = $existing -replace '(?s)\n\[mcp_servers\.meridian\].*?(?=\n\[(?!mcp_servers\.meridian)|$)', ''
+        $combined = $existing.TrimEnd() + $meridianBlock
     } else {
-        $combined = $newBlock.TrimStart()
+        $combined = $meridianBlock.TrimStart()
     }
     $combined | Set-Content -Path $CodexConfigPath -Encoding UTF8
     Write-Host "  OK MCP config written to $CodexConfigPath" -ForegroundColor Green
 }
 
-# ---- Step 8: Cursor --------------------------------------------------------------
-$CursorDetected = (Get-Command cursor -ErrorAction SilentlyContinue) -ne $null -or (Test-Path (Join-Path $HOME ".cursor"))
-if ($CursorDetected) {
-    Write-Host ""
-    Write-Host "Cursor detected -- writing .cursor/mcp.json in current directory"
-    $CursorDir = Join-Path (Get-Location).Path ".cursor"
-    $CursorConfigPath = Join-Path $CursorDir "mcp.json"
-    if (-not (Test-Path $CursorDir)) { New-Item -ItemType Directory -Path $CursorDir | Out-Null }
-    if ([string]::IsNullOrEmpty($Token)) {
-        $cursorCfg = @{ mcpServers = @{ meridian = @{ url = "$MeridianUrl/mcp" } } }
-    } else {
-        $cursorCfg = @{ mcpServers = @{ meridian = @{ url = "$MeridianUrl/mcp"; headers = @{ Authorization = "Bearer $Token" } } } }
-    }
-    $cursorCfg | ConvertTo-Json -Depth 5 | Set-Content -Path $CursorConfigPath -Encoding UTF8
-    Write-Host "  OK .cursor/mcp.json written" -ForegroundColor Green
-    Write-Host "  Note: Cursor MCP tools available. Auto session tracking requires Claude Code or Codex." -ForegroundColor Yellow
-}
-
-# ---- Step 9: Smoke test ----------------------------------------------------------
+# ---- Step 8: Test hook -----------------------------------------------------------
 Write-Host ""
 Write-Host "Testing hook..."
-$testOk = $false
-try {
-    $testCwd = (Get-Location).Path.Replace("\", "/")
-    $testHostname = $env:COMPUTERNAME
-    $testBody = "{`"cwd`":`"$testCwd`",`"hostname`":`"$testHostname`"}"
-    $hdrs = @{ "Content-Type" = "application/json" }
-    if (-not [string]::IsNullOrWhiteSpace($Token)) { $hdrs["Authorization"] = "Bearer $Token" }
-    $r = Invoke-WebRequest -Method POST -Uri "$MeridianUrl/hooks/session-start" `
-        -Headers $hdrs -Body $testBody -UseBasicParsing -TimeoutSec 10 -ErrorAction Stop
-    if ($r.StatusCode -eq 200) { $testOk = $true }
-} catch {}
-if ($testOk) {
+$testResult = powershell -NoProfile -NonInteractive -Command "& '$sp'"
+if ($testResult -and $testResult.Contains('hookSpecificOutput')) {
     Write-Host "  OK hook test passed" -ForegroundColor Green
 } else {
-    Write-Host "  WARNING: hook test returned non-200 (hooks still installed)" -ForegroundColor Yellow
+    Write-Host "  Warning: hook test returned unexpected output: $testResult" -ForegroundColor Yellow
 }
 
-# ---- Done ------------------------------------------------------------------------
 Write-Host ""
 Write-Host "Done. Hooks installed for $MeridianUrl." -ForegroundColor Green
-Write-Host ""
 Write-Host "To start with hooks + remote control enabled:"
-Write-Host "  claude --rc --permission-mode bypassPermissions" -ForegroundColor Cyan
+Write-Host "  claude --rc --permission-mode bypassPermissions"
 Write-Host "('claude rc' server mode does NOT fire hooks)"
-Write-Host ""
 
+} # end if (-not $SkipInstall)
 }
