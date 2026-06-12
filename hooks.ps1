@@ -78,7 +78,7 @@ function Write-HookScripts {
         if ($isLocal) {
             $startContent = @'
 # Meridian session-start hook (localhost)
-$fallback = '{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":""}}'
+$fallback = ($null | ForEach-Object { '{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":""}}' })
 $cwd = (Get-Location).Path -replace "\\","/"
 $h = $env:COMPUTERNAME
 $b = '{"cwd":"' + $cwd + '","hostname":"' + $h + '"}'
@@ -105,7 +105,7 @@ try { Invoke-WebRequest -Method POST -Uri "__URL__/hooks/stop" -ContentType 'app
         } else {
             $startContent = @'
 # Meridian session-start hook -- self-healing token
-$fallback = '{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":""}}'
+$fallback = ($null | ForEach-Object { '{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":""}}' })
 
 function Get-MeridianToken {
     $self = $MyInvocation.ScriptName
@@ -391,12 +391,12 @@ if ($ExistingHooks) {
         try {
             $r2 = Invoke-WebRequest -Method POST -Uri "$MeridianUrl/auth/tokens" `
                 -Headers @{ Authorization = "Bearer $Token" } `
-                -ContentType "application/json" -Body 
-'
-{"label":"hooks-installer"}
-'
- `
+                -ContentType "application/json" -Body '{"label":"hooks-installer"}' `
                 -UseBasicParsing -TimeoutSec 10 -ErrorAction SilentlyContinue
+
+
+
+
             if ($r2.StatusCode -eq 201) { $td2 = $r2.Content | ConvertFrom-Json; if ($td2.token) { $Token = $td2.token; Write-Host "  New key generated." -ForegroundColor Green } }
         } catch {}
     }
