@@ -77,7 +77,7 @@ function Write-HookScripts {
         $line1 = '$cwd=(Get-Location).Path -replace [char]92,[char]47'
         $line2 = '$h=$env:COMPUTERNAME'
         $line3 = '$b=@{cwd=$cwd;hostname=$h}|ConvertTo-Json -Compress'
-        $line4 = "try{(Invoke-WebRequest -Method POST -Uri `"$Url/hooks/session-start`"$hdr -ContentType `"application/json`" -Body `$b -UseBasicParsing).Content}catch{`"{}`"}"
+        $line4 = "try{(Invoke-WebRequest -Method POST -Uri `"$Url/hooks/session-start`"$hdr -ContentType `"application/json`" -Body `$b -UseBasicParsing).Content}catch{`"{\"hookEventName\":\"SessionStart\",\"hookSpecificOutput\":{\"additionalContext\":\"\"}}`"}"
 
         $startLines = @($line1, $line2, $line3)
         if ($Url -match "(localhost|127\.0\.0\.1)") {
