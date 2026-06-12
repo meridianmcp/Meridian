@@ -118,7 +118,7 @@ function Get-MeridianToken {
 }
 
 function Refresh-Token {
-    $envPaths = @("$env:USERPROFILE\Documents\Meridian\repository\.env")
+    $envPaths = @("C:\Users\13144\Documents\Meridian\repository\.env","$env:USERPROFILE\Documents\Meridian\repository\.env")
     foreach ($ep in $envPaths) {
         if (Test-Path $ep) {
             $line = Get-Content $ep | Where-Object { $_ -match "^MERIDIAN_API_SECRET_KEY=(.+)" }
@@ -222,10 +222,11 @@ if ($ExistingHooks) {
                     if ($td2.token) {
                         $Token = $td2.token
                         Write-Host "  New key generated." -ForegroundColor Green
-                        $startContent = $startContent -replace 'sk_meridian_[A-Za-z0-9_\-]+', $Token
-                        $stopContent  = $stopContent  -replace 'sk_meridian_[A-Za-z0-9_\-]+', $Token
-                        [System.IO.File]::WriteAllText($sp, $startContent, $enc)
-                        [System.IO.File]::WriteAllText($tp, $stopContent,  $enc)
+                        # Rewrite scripts with new token
+                        $startContent2 = $startContent -replace 'sk_meridian_[A-Za-z0-9_\-]+', $Token
+                        $stopContent2  = $stopContent  -replace 'sk_meridian_[A-Za-z0-9_\-]+', $Token
+                        [System.IO.File]::WriteAllText($sp, $startContent2, $enc)
+                        [System.IO.File]::WriteAllText($tp, $stopContent2,  $enc)
                         $startCmd = "& `"$sp`""
                         $stopCmd  = "& `"$tp`""
                     }
@@ -244,10 +245,10 @@ if ($ExistingHooks) {
                 if ($td2.token) {
                     $Token = $td2.token
                     Write-Host "  New key generated." -ForegroundColor Green
-                    $startContent = $startContent -replace 'sk_meridian_[A-Za-z0-9_\-]+', $Token
-                    $stopContent  = $stopContent  -replace 'sk_meridian_[A-Za-z0-9_\-]+', $Token
-                    [System.IO.File]::WriteAllText($sp, $startContent, $enc)
-                    [System.IO.File]::WriteAllText($tp, $stopContent,  $enc)
+                    $startContent2 = $startContent -replace 'sk_meridian_[A-Za-z0-9_\-]+', $Token
+                    $stopContent2  = $stopContent  -replace 'sk_meridian_[A-Za-z0-9_\-]+', $Token
+                    [System.IO.File]::WriteAllText($sp, $startContent2, $enc)
+                    [System.IO.File]::WriteAllText($tp, $stopContent2,  $enc)
                     $startCmd = "& `"$sp`""
                     $stopCmd  = "& `"$tp`""
                 }
@@ -264,6 +265,7 @@ if ($ClaudeDetected) {
     Write-Host "Claude Code detected -- writing hooks to $ClaudeSettingsPath"
     $ClaudeDir = Split-Path $ClaudeSettingsPath
     if (-not (Test-Path $ClaudeDir)) { New-Item -ItemType Directory -Path $ClaudeDir | Out-Null }
+
     if (Test-Path $ClaudeSettingsPath) {
         try { $settings = Get-Content $ClaudeSettingsPath -Raw | ConvertFrom-Json } catch { $settings = [PSCustomObject]@{} }
     } else {
@@ -299,6 +301,7 @@ Authorization = "Bearer $Token"
 "@
     if (Test-Path $CodexConfigPath) {
         $existing = Get-Content $CodexConfigPath -Raw
+        # Remove old meridian block if present
         $existing = $existing -replace '(?s)\n# Meridian - added by hooks\.ps1.*?(?=\n#|\n\[(?!mcp_servers\.meridian)|$)', ''
         $existing = $existing -replace '(?s)\n\[mcp_servers\.meridian\].*?(?=\n\[(?!mcp_servers\.meridian)|$)', ''
         $combined = $existing.TrimEnd() + $meridianBlock
