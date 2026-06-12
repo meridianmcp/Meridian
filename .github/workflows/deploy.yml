@@ -1,24 +1,20 @@
-﻿name: Deploy to Fly.io
+name: Deploy to Fly.io
 
-# Pipeline: dev push â†’ test â†’ preview â†’ smoke â†’ merge main â†’ prod (with rollback)
+# Pipeline: dev push → test → preview → smoke → merge main → prod (with rollback)
 # Production deploys ONLY happen when:
 #   (a) dev branch smoke tests pass and auto-merge fires, OR
 #   (b) a version tag is pushed, OR
 #   (c) manual workflow_dispatch
-# NEVER deploy prod directly from a dev push â€” always go through preview first.
+# NEVER deploy prod directly from a dev push — always go through preview first.
 
 on:
   push:
     branches: [dev, main]
     tags: ['v*.*.*']
   workflow_dispatch:
-    # G9.36 â€” Prod-freeze: dev pushes auto-deploy to PREVIEW only.
-    # Promotion to prod requires the operator to run this workflow
-    # manually with promote=yes (or use the Actions UI button).
-    # Same merge+dispatch path as before, just gated.
     inputs:
       promote:
-        description: 'Set to "yes" to merge dev â†’ main and roll prod. Anything else = no-op.'
+        description: 'Set to "yes" to merge dev → main and roll prod. Anything else = no-op.'
         required: false
         default: 'no'
         type: choice
@@ -30,7 +26,7 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
-  # â”€â”€â”€ 1. Tests â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  # ─── 1. Tests ──────────────────────────────────────────────────────────────
   test:
     runs-on: ubuntu-latest
     steps:
@@ -39,19 +35,7 @@ jobs:
         with:
           pixi-version: latest
           cache: true
-      - name: Cache Playwright browsers
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/ms-playwright
-          key: playwright-${{ runner.os }}-${{ hashFiles('pixi.lock') }}
-          restore-keys: playwright-${{ runner.os }}-
       - run: pixi install
-      - name: Cache Playwright browsers
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/ms-playwright
-          key: playwright-${{ runner.os }}-${{ hashFiles('pixi.lock') }}
-          restore-keys: playwright-${{ runner.os }}-
       - name: Cache Playwright browsers
         id: playwright-cache
         uses: actions/cache@v4
@@ -63,7 +47,7 @@ jobs:
         if: steps.playwright-cache.outputs.cache-hit != 'true'
       - run: pixi run python -m playwright install chromium
         if: steps.playwright-cache.outputs.cache-hit == 'true'
-      - run: pixi run python -m pytest --ignore=tests/test_demo_ux.py -x -q
+      - run: pixi run python -m pytest tests/test_core.py tests/test_new_v25.py tests/test_hosted.py tests/test_github.py tests/test_milestones.py tests/test_md_anchors.py tests/test_security.py tests/test_ui.py tests/test_executor_runs.py tests/test_error_alerting.py tests/test_v2_hosted.py -n auto -q --tb=short
 
   playwright-tests:
     runs-on: ubuntu-latest
@@ -74,18 +58,7 @@ jobs:
         with:
           pixi-version: latest
           cache: true
-      - name: Cache Playwright browsers
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/ms-playwright
-          key: playwright-${{ runner.os }}-${{ hashFiles('pixi.lock') }}
       - run: pixi install
-      - name: Cache Playwright browsers
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/ms-playwright
-          key: playwright-${{ runner.os }}-${{ hashFiles('pixi.lock') }}
-          restore-keys: playwright-${{ runner.os }}-
       - name: Cache Playwright browsers
         id: playwright-cache
         uses: actions/cache@v4
@@ -97,9 +70,9 @@ jobs:
         if: steps.playwright-cache.outputs.cache-hit != 'true'
       - run: pixi run python -m playwright install chromium
         if: steps.playwright-cache.outputs.cache-hit == 'true'
-      - run: pixi run python -m pytest tests/test_demo_ux.py -x -q
+      - run: pixi run python -m pytest tests/test_demo_ux.py -q --tb=short
 
-  # â”€â”€â”€ 2. Preview deploy (dev branch only) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  # ─── 2. Preview deploy (dev branch only) ──────────────────────────────────
   deploy-preview:
     needs: test
     if: github.ref == 'refs/heads/dev'
@@ -112,7 +85,7 @@ jobs:
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN_PREVIEW }}
 
-  # â”€â”€â”€ 3. Smoke tests against preview â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  # ─── 3. Smoke tests against preview ───────────────────────────────────────
   smoke-preview:
     needs: deploy-preview
     if: github.ref == 'refs/heads/dev'
@@ -150,11 +123,7 @@ jobs:
           echo "$RESP" | grep -q '"start_session"' || (echo "FAIL: MCP tools missing start_session" && exit 1)
           echo "MCP tools OK"
 
-  # â”€â”€â”€ 4. Merge dev â†’ main on operator-gated promotion (G9.36) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-  # Pre-launch the merge-to-main job auto-fired on any successful dev push,
-  # which auto-deployed prod. Now this only runs when an operator triggers
-  # the workflow with promote=yes (Actions UI â†’ "Run workflow" â†’ promote=yes,
-  # or `gh workflow run deploy.yml --ref dev -f promote=yes`).
+  # ─── 4. Merge dev → main on operator-gated promotion ──────────────────────
   merge-to-main:
     needs: smoke-preview
     if: >
@@ -170,27 +139,22 @@ jobs:
         with:
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
-      - name: Merge dev â†’ main
+      - name: Merge dev → main
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git fetch origin
           git checkout main
-          # Use regular merge (not ff-only) so CHANGELOG commits on main don't block.
-          git merge --no-ff --no-edit origin/dev -m "ci: merge dev â†’ main (auto)"
+          git merge --no-ff --no-edit origin/dev -m "ci: merge dev → main (auto)"
           git push origin main
 
       - name: Trigger production deploy
-        # GITHUB_TOKEN pushes don't re-trigger workflows â€” dispatch manually.
-        # This fires the deploy job in the same workflow file via workflow_dispatch.
         run: |
           gh workflow run deploy.yml --ref main
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-  # â”€â”€â”€ 5. Production deploy (main branch push or tag or manual) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-  # Triggered by the merge above (main push) or explicit workflow_dispatch / tag.
-  # Canary strategy: 1 machine takes traffic first â€” if unhealthy, Fly rolls back.
+  # ─── 5. Production deploy ─────────────────────────────────────────────────
   deploy:
     needs: test
     if: >
@@ -234,12 +198,12 @@ jobs:
       - name: Rollback on smoke failure
         if: steps.smoke.outcome == 'failure'
         run: |
-          echo "Smoke test failed â€” rolling back to previous image"
+          echo "Smoke test failed — rolling back to previous image"
           PREV="${{ steps.pre_deploy.outputs.image }}"
           if [ -n "$PREV" ]; then
             flyctl deploy --image "$PREV" --app meridian-hosted --strategy=immediate
           else
-            echo "No previous image recorded â€” manual rollback required"
+            echo "No previous image recorded — manual rollback required"
             exit 1
           fi
         env:
@@ -249,7 +213,7 @@ jobs:
         if: steps.smoke.outcome == 'failure'
         run: exit 1
 
-  # â”€â”€â”€ 6. CHANGELOG (after prod deploy on main) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  # ─── 6. CHANGELOG ─────────────────────────────────────────────────────────
   changelog:
     needs: deploy
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
@@ -276,6 +240,3 @@ jobs:
             git commit -m "chore: update CHANGELOG"
             git push origin HEAD:main
           fi
-
-
-
