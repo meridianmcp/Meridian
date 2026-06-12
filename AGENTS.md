@@ -108,6 +108,30 @@ project context on start and checkpoints on end.
 - Web docs: https://docs.usemeridian.us
 
 ---
+
+## PARALLEL SESSIONS
+
+Multiple AI sessions (Claude Code + Codex, or two concurrent Claude Code windows) can work on the same project simultaneously. Follow these rules to avoid conflicts:
+
+**Before editing any file:**
+1. Call `claim_file(file_path, session_id)` to register your intent.
+2. Check `start_session` response for `file_warnings` — if a file you need is already claimed by another active session, coordinate before editing.
+
+**High-contention files — always sequential, never parallel:**
+- `meridian/static/dashboard.js` — monolithic frontend, merge conflicts are painful
+- `meridian/server.py` — central FastAPI app, concurrent edits cause import errors
+- `meridian/db/__init__.py` — all DB logic, schema changes must be serialized
+
+**Rules:**
+- Never edit a file another active session has claimed (within the last 10 minutes).
+- `start_session` returns `file_warnings` when a conflict is detected — stop and coordinate.
+- Sprint items carry a `touches_files` field auto-populated from recent git history — check it before starting.
+- Cross-machine awareness works via the hosted DB — this covers Claude Code + Codex running simultaneously on separate machines.
+
+**Release locks when done:**
+Call `release_file(file_path, session_id)` after your changes are committed.
+
+---
 ## Meridian-managed notes
 
 <!-- Agent-proposed via update_md_section, human-approved via the dashboard HITL queue. -->

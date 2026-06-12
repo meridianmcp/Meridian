@@ -178,7 +178,7 @@ def test_dashboard_js_has_github_connect_card(js):
     assert "Connect GitHub repo" in js
 
 
-def test_signout_link_created_unconditionally_for_hosted_users(js):
+def test_signout_link_created_unconditionally_for_hosted_users(js, client):
     """Item 42 — Free-tier sign-out regression.
 
     The sign-out link in .sidebar-footer must be added by hideHostedAdminControls()
@@ -200,10 +200,11 @@ def test_signout_link_created_unconditionally_for_hosted_users(js):
         "hideHostedAdminControls() must call ensureSignOutLink() so the link "
         "appears for free-tier users without waiting on /me."
     )
-    # The link still gets enriched with the signed-in email when /me returns.
-    plan_badge_start = js.index("function _renderPlanBadge")
-    plan_badge_end = js.index("\nfunction ", plan_badge_start + 1)
-    plan_badge_body = js[plan_badge_start:plan_badge_end]
+    # _renderPlanBadge was extracted to dashboard-sprint.js — check it there.
+    js_sprint = client.get("/static/dashboard-sprint.js").text
+    plan_badge_start = js_sprint.index("function _renderPlanBadge")
+    plan_badge_end = js_sprint.index("\nfunction ", plan_badge_start + 1)
+    plan_badge_body = js_sprint[plan_badge_start:plan_badge_end]
     assert "ensureSignOutLink(me.email)" in plan_badge_body, (
         "_renderPlanBadge must still call ensureSignOutLink(me.email) to update "
         "the tooltip with the signed-in email when /me succeeds."

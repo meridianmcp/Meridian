@@ -663,9 +663,9 @@ async def test_count_decisions_returns_correct_count(db):
 
 
 def test_dashboard_js_has_sprint_group_header_class():
-    """dashboard.js renders sprint version group headers."""
+    """dashboard-sprint.js renders sprint version group headers."""
     import pathlib
-    js = pathlib.Path("meridian/static/dashboard.js").read_text(encoding="utf-8")
+    js = pathlib.Path("meridian/static/dashboard-sprint.js").read_text(encoding="utf-8")
     assert "sprint-group-header" in js
 
 

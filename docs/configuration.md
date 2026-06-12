@@ -147,3 +147,47 @@ that apply to every project (e.g. "always use Neon for Postgres", "company style
 │  committed to git                   │
 └─────────────────────────────────────┘
 ```
+
+---
+
+## Running parallel sessions safely
+
+Meridian supports multiple AI sessions working on the same project simultaneously — for example, Claude Code and Codex running on separate machines, or two Claude Code windows on different features.
+
+### File conflict prevention
+
+When you call `start_session`, Meridian checks the `file_locks` table for files claimed by other active sessions. If any overlap is found, the response includes a `file_warnings` array:
+
+```json
+{
+  "session_id": "...",
+  "file_warnings": [
+    "dashboard.js claimed by session pre-launch-final (last_seen 2026-06-11 22:45:00)"
+  ]
+}
+```
+
+**What to do:** Stop and coordinate with the other session before editing that file. Either wait for it to finish (and release the lock), or plan your changes so they don't conflict.
+
+### Claiming files with `claim_file`
+
+Before editing any file, call `claim_file(file_path, session_id)`. This registers a lock that:
+- Expires automatically after a configurable TTL (default: 4 hours)
+- Is visible to all concurrent sessions via `start_session`
+- Is released automatically when the session ends (via `checkpoint`)
+
+```
+claim_file(file_path="meridian/static/dashboard.js", session_id="<your-session-id>")
+```
+
+To release early (after you've committed), call `release_file(file_path, session_id)`.
+
+### Sprint item `touches_files`
+
+Each sprint item has a `touches_files` field — a JSON array of file paths the item is expected to modify. Meridian auto-populates this at `generate_handoff` time by running `git diff --name-only HEAD~3` and matching filenames against sprint item titles.
+
+This gives the next session a head-start on knowing which items conflict with which files, even before the files are actively claimed.
+
+### Cross-machine awareness
+
+The hosted tier stores file locks in Neon Postgres, so awareness is global — a lock claimed by a Claude Code session on your laptop is visible to a Codex session on a CI runner or another machine. Self-hosted installs achieve the same if all instances share one `MERIDIAN_DB_URL`.
