@@ -13,7 +13,7 @@ Operational reference. Source of truth: `meridian/limits.py` and
     spike without the cold-start latency tail.
 - **soft_limit (concurrent requests per machine) = 100**
 - **hard_limit = 200**
-  - The `_body_size_guard_middleware` + slowapi rate limiter (60/min/IP) cap
+  - The `_body_size_guard_middleware` + slowapi rate limiter (100/min/IP) cap
     most floods well before this. Hard limit is the safety net.
 - **autoscale: yes, max_machines_running = 4**
   - Two more machines on demand handles bursts; beyond four you're better
