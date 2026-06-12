@@ -5231,6 +5231,17 @@ async def _start_session_composite(
         db, project_id, session_name, human_id=human_id, client_type=client_type
     )
     _mark_session_connected(session["id"])
+    # G9.x - If start_session is called with an explicit project_id, any pending
+    # hook_project_select HITL for this project is redundant -- dismiss it silently.
+    # The executor already chose this project by calling start_session.
+    try:
+        await db.execute(
+            "UPDATE hitl_requests SET status='dismissed' WHERE project_id=? AND kind='hook_project_select' AND status='pending'",
+            (project_id,),
+        )
+        await db.commit()
+    except Exception:
+        pass
     try:
         await db_module.create_executor_run(db, session["id"], project_id)
     except Exception:
