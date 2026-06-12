@@ -10,7 +10,18 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
-  test:
+  test-core:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: prefix-dev/setup-pixi@v0.8.1
+        with:
+          pixi-version: latest
+          cache: false
+      - run: pixi install
+      - run: pixi run python -m pytest tests/test_core.py -v --tb=short
+
+  test-ux:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -28,4 +39,4 @@ jobs:
       - name: Install Playwright Chromium
         if: steps.playwright-cache.outputs.cache-hit != 'true'
         run: pixi run python -m playwright install chromium --with-deps
-      - run: pixi run test
+      - run: pixi run python -m pytest tests/test_demo_ux.py -v --tb=short
