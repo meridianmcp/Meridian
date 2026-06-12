@@ -111,6 +111,53 @@ async def test_register_and_close_session(db):
 
 
 @pytest.mark.asyncio
+async def test_keepalive_keeps_busy_session_alive_but_expires_dead_ones(db):
+    """Regression — a session busy with non-MCP work (git/bash/file ops) makes
+    no tool calls, so its last_seen goes stale and a coordinating session sees
+    it as dead inside the 10-min live window. The keepalive loop must refresh
+    still-connected sessions while still forgetting ones idle past the TTL."""
+    from datetime import datetime, timezone
+
+    server_module._CONNECTED_SESSIONS.clear()
+    p = await db_module.create_project(db, "alpha")
+    busy = await db_module.register_session(db, p["id"], "busy-sess")
+    dead = await db_module.register_session(db, p["id"], "dead-sess")
+
+    # Both last pinged Meridian 9 minutes ago — how a long git/test run looks.
+    for s in (busy, dead):
+        await db.execute(
+            "UPDATE sessions SET last_seen = datetime('now', '-9 minutes') WHERE id = ?",
+            (s["id"],),
+        )
+    await db.commit()
+
+    def _age(row) -> float:
+        ls = datetime.fromisoformat(row["last_seen"].replace(" ", "T")).replace(
+            tzinfo=timezone.utc
+        )
+        return (datetime.now(timezone.utc) - ls).total_seconds()
+
+    rows = {r["id"]: r for r in await db_module.get_sessions(db, p["id"], active_only=False)}
+    assert _age(rows[busy["id"]]) > 8 * 60  # the bug: a busy session looks dead
+
+    # busy made a tool call 30s ago (still connected); dead's client has been
+    # gone 20 min — past the 10-min TTL, so it should be forgotten, not revived.
+    now = 100_000.0
+    server_module._mark_session_connected(busy["id"], now=now - 30)
+    server_module._mark_session_connected(dead["id"], now=now - 20 * 60)
+
+    refreshed = await server_module._keepalive_connected_sessions(db, now=now)
+
+    assert busy["id"] in refreshed
+    assert dead["id"] not in refreshed
+    assert dead["id"] not in server_module._CONNECTED_SESSIONS  # pruned
+
+    rows = {r["id"]: r for r in await db_module.get_sessions(db, p["id"], active_only=False)}
+    assert _age(rows[busy["id"]]) < 60       # busy session is live again
+    assert _age(rows[dead["id"]]) > 8 * 60   # dead session left to expire
+
+
+@pytest.mark.asyncio
 async def test_log_task_and_get_tasks_newest_first(db):
     p = await db_module.create_project(db, "alpha")
     s = await db_module.register_session(db, p["id"], "sess-1")
