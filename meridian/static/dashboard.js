@@ -13797,6 +13797,11 @@ async function restoreTabs() {
 
   let saved = [];
 
+  // Read preferred before the loop -- openTab calls activateTab which would
+  // overwrite ACTIVE_PROJECT_KEY with each successive tab opened.
+  let preferred = null;
+  try { preferred = localStorage.getItem(STORAGE_KEY(ACTIVE_PROJECT_KEY)); } catch(e) {}
+
   try { saved = JSON.parse(localStorage.getItem(STORAGE_KEY(TABS_KEY)) || '[]'); } catch(e){}
 
   for (const id of saved) {
@@ -13807,19 +13812,17 @@ async function restoreTabs() {
 
   }
 
-  // If no tabs were restored, fall back to the persisted active project
-
-  // or — failing that — the first project in the list.
-
   if (state.tabs.length === 0 && state.projects.length > 0) {
 
-    let preferred = null;
-
-    try { preferred = localStorage.getItem(STORAGE_KEY(ACTIVE_PROJECT_KEY)); } catch(e) {}
-
+    // No tabs to restore -- open the preferred project or the first one.
     const fallback = state.projects.find(p => p.id === preferred) || state.projects[0];
 
     if (fallback) openTab(fallback);
+
+  } else if (preferred && state.tabs.find(t => t.id === preferred)) {
+
+    // Tabs were restored -- activate the one that was last active before reload.
+    activateTab(preferred);
 
   }
 
