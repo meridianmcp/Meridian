@@ -381,7 +381,7 @@ if ($ExistingHooks) {
 
 
 
-                if ($r2.StatusCode -eq 201) { $td2 = $r2.Content | ConvertFrom-Json; if ($td2.token) { $Token = $td2.token; Write-Host "  New key generated." -ForegroundColor Green } }
+                if ($r2.StatusCode -eq 201) { $td2 = $r2.Content | ConvertFrom-Json; if ($td2.token) { $Token = $td2.token; Write-Host "  New key generated." -ForegroundColor Green; $scripts = Write-HookScripts -Url $MeridianUrl -Token $Token -HooksDir $HooksDir; $startCmd = Build-StartCmd -ScriptPath $scripts.Start; $stopCmd = Build-StopCmd -ScriptPath $scripts.Stop } }
             } catch {}
         } else {
             Write-Host "  Skipped -- hooks unchanged." -ForegroundColor Yellow
@@ -399,7 +399,7 @@ if ($ExistingHooks) {
 
 
 
-            if ($r2.StatusCode -eq 201) { $td2 = $r2.Content | ConvertFrom-Json; if ($td2.token) { $Token = $td2.token; Write-Host "  New key generated." -ForegroundColor Green } }
+            if ($r2.StatusCode -eq 201) { $td2 = $r2.Content | ConvertFrom-Json; if ($td2.token) { $Token = $td2.token; Write-Host "  New key generated." -ForegroundColor Green ; $scripts = Write-HookScripts -Url $MeridianUrl -Token $Token -HooksDir $HooksDir; $startCmd = Build-StartCmd -ScriptPath $scripts.Start; $stopCmd = Build-StopCmd -ScriptPath $scripts.Stop } }
         } catch {}
     }
 }
