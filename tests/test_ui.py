@@ -325,6 +325,9 @@ def test_dashboard_claude_tab_has_session_controls(client):
     # Section 3 — handoff
     assert "copy-handoff-" in js, "copy handoff button missing"
     assert "regen-handoff-" in js, "regenerate handoff button missing"
+    assert "sequential-mode-" in js, "sequential mode toggle missing"
+    assert "touches-files-warning-" in js, "touches_files warning host missing"
+    assert "findTouchesFilesConflicts" in js, "handoff should check touches_files overlap"
     assert "Regenerated" in js, "regenerated confirmation message missing"
     assert "/handoff" in js, "handoff controls should call the generate_handoff endpoint"
     # Section 4 — open in Claude (narrow secondary)
@@ -339,6 +342,13 @@ def test_dashboard_claude_tab_has_session_controls(client):
     assert "/projects/${projectId}/settings" in js, (
         "dashboard should load persisted per-project settings"
     )
+
+
+def test_dashboard_settings_has_os_detection_banner(client):
+    js = client.get("/static/dashboard.js").text
+    assert "settings-os-detection-banner-" in js
+    assert "detectHookInstallOS" in js
+    assert "Detected OS:" in js
 
 
 def test_dashboard_open_in_claude_not_dominant(client):

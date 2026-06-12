@@ -11,6 +11,8 @@
 
 Every AI coding session starts completely fresh. Open Claude Code in two terminals and they have absolutely no idea what the other is doing. Hit the context limit mid-task and your entire working memory evaporates. Run parallel sessions and they step on each other — duplicate work, conflicting edits, no coordination.
 
+That third failure mode is file conflicts: parallel agents can edit the same high-contention files without knowing the other session already claimed the work.
+
 This isn't a Claude problem. It's a fundamental limitation of stateless sessions. And it gets worse with every wasted token.
 
 <img src="screenshots/01_dashboard.png" alt="Meridian landing page — the problem" style="max-width:100%;border-radius:8px;margin:12px 0">
@@ -23,6 +25,8 @@ Meridian is a local MCP server that gives all your Claude sessions a **shared pe
 
 Every session that connects to Meridian can:
 
+- **Claim files before editing** - parallel agents see active locks before they touch the same code
+
 - **Read the current goal** — what the project is trying to accomplish right now
 - **Log tasks** — what it's doing, what it finished, what failed
 - **See every other session's work** — no duplicate effort
@@ -31,6 +35,18 @@ Every session that connects to Meridian can:
 When the context window fills up, you can generate a handoff and start fresh. The new session will then read the file and pick up exactly where you left off -- no re-explaining required.
 
 <img src="screenshots/05b_charts_tab.png" alt="Meridian features" style="max-width:100%;border-radius:8px;margin:12px 0">
+
+## Running parallel agents safely
+
+Meridian lets multiple AI sessions work at once without pretending merge conflicts do not exist. Each executor can call `claim_file(session_id, path)` before editing shared files, and new sessions see `file_warnings` from active file claims when they start.
+
+For high-contention files, run sequentially instead of in parallel:
+
+- `meridian/static/dashboard.js`
+- `meridian/server.py`
+- `meridian/db/__init__.py`
+
+Sprint items can also carry a `touches_files` field so handoffs and dashboards can warn before an agent copies work that overlaps with an active session.
 
 ## Key Features
 

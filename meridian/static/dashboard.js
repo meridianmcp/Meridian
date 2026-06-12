@@ -3625,6 +3625,12 @@ function buildTabBody(project) {
 
           <div class="claude-section-label">Claude Code handoff (<code>generate_handoff</code>)</div>
 
+          <label style="display:flex;align-items:center;gap:6px;font-size:10px;color:var(--text);font-family:var(--font-mono);cursor:pointer">
+            <input type="checkbox" id="sequential-mode-${project.id}" style="cursor:pointer">
+            <span>Sequential mode</span>
+          </label>
+          <p class="claude-hint" id="touches-files-warning-${project.id}" style="display:none;color:#f59e0b">⚠ touches_files overlap detected in active sprint items. Coordinate or serialize before handing this off.</p>
+
           <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
 
             <button class="primary claude-section-btn" id="copy-handoff-${project.id}" title="Fetch generate_handoff() output and copy raw plain text">Copy handoff (plain text)</button>
@@ -5292,6 +5298,69 @@ function showCopyPreview(title, content) {
 function wireClaudeLaunchPanel(projectId) {
 
   const PROJECT_QUOTE = projectId.replace(/"/g, '\\"');
+  const sequentialKey = `meridian.sequentialMode.${projectId}`;
+
+  function normalizeTouchesFile(path) {
+    return String(path || '').trim().replace(/\\/g, '/').replace(/^\.\//, '');
+  }
+
+  function parseTouchesFiles(raw) {
+    if (!raw) return [];
+    if (Array.isArray(raw)) return raw.map(normalizeTouchesFile).filter(Boolean);
+    const text = String(raw).trim();
+    if (!text) return [];
+    try {
+      const parsed = JSON.parse(text);
+      if (Array.isArray(parsed)) return parsed.map(normalizeTouchesFile).filter(Boolean);
+      return [normalizeTouchesFile(parsed)].filter(Boolean);
+    } catch(e) {
+      return text.split(',').map(normalizeTouchesFile).filter(Boolean);
+    }
+  }
+
+  function findTouchesFilesConflicts(items) {
+    const active = (items || []).filter(it => ['pending', 'todo', 'in_progress'].includes(it.status || 'pending'));
+    const byFile = new Map();
+    active.forEach((item) => {
+      parseTouchesFiles(item.touches_files).forEach((file) => {
+        const key = file.toLowerCase();
+        const list = byFile.get(key) || [];
+        list.push({ file, item });
+        byFile.set(key, list);
+      });
+    });
+    return Array.from(byFile.values())
+      .filter(list => list.length > 1 && list.some(entry => entry.item.status === 'in_progress'))
+      .flat();
+  }
+
+  function applySequentialMode(text) {
+    const toggle = document.getElementById(`sequential-mode-${projectId}`);
+    if (!toggle || !toggle.checked || !text) return text;
+    return `${text}\n\nSEQUENTIAL MODE:\n- Work one sprint item at a time.\n- Call claim_file(session_id, path) before editing shared files.\n- Stop and coordinate if start_session returns file_warnings or claim_sprint_item returns CONFLICT.`;
+  }
+
+  async function warnBeforeHandoffCopy() {
+    try {
+      const items = await projectApi(projectId, `/projects/${projectId}/sprint-items`);
+      const conflicts = findTouchesFilesConflicts(items || []);
+      const warnEl = document.getElementById(`touches-files-warning-${projectId}`);
+      if (warnEl) warnEl.style.display = conflicts.length ? '' : 'none';
+      if (!conflicts.length) return true;
+      const files = Array.from(new Set(conflicts.map(c => c.file))).join(', ');
+      return confirm(`touches_files conflict warning:\n\n${files}\n\nContinue copying the handoff?`);
+    } catch(e) {
+      return true;
+    }
+  }
+
+  const sequentialToggle = document.getElementById(`sequential-mode-${projectId}`);
+  if (sequentialToggle) {
+    try { sequentialToggle.checked = localStorage.getItem(sequentialKey) === '1'; } catch(e) {}
+    sequentialToggle.onchange = () => {
+      try { localStorage.setItem(sequentialKey, sequentialToggle.checked ? '1' : '0'); } catch(e) {}
+    };
+  }
 
 
 
@@ -5320,6 +5389,7 @@ function wireClaudeLaunchPanel(projectId) {
     copyStartChatBtn.textContent = 'Loading…';
 
     try {
+      if (!(await warnBeforeHandoffCopy())) return;
 
       const r = await fetch(`/projects/${projectId}/handoff`, { method: 'POST' });
 
@@ -5327,7 +5397,7 @@ function wireClaudeLaunchPanel(projectId) {
 
       const payload = await r.json();
 
-      const text = payload.content || '';
+      const text = applySequentialMode(payload.content || '');
 
       showCopyPreview('Claude / Codex Handoff', text);
 
@@ -5510,6 +5580,7 @@ function wireClaudeLaunchPanel(projectId) {
     copyHandoffBtn.textContent = 'Loading…';
 
     try {
+      if (!(await warnBeforeHandoffCopy())) return;
 
       const r = await fetch(`/projects/${projectId}/handoff`, { method: 'POST' });
 
@@ -5517,7 +5588,7 @@ function wireClaudeLaunchPanel(projectId) {
 
       const payload = await r.json();
 
-      const text = payload.content || '';
+      const text = applySequentialMode(payload.content || '');
 
       if (text) {
 
@@ -6162,6 +6233,14 @@ async function loadSettingsTab(projectId) {
 
   const hooksBaseUrl = ((mcpData && mcpData.base_url) || window.location.origin || state.serverConfig?.server_url || 'http://localhost:7878').replace(/\/$/, '');
 
+  function detectHookInstallOS() {
+    const platform = String(navigator.userAgentData?.platform || navigator.platform || navigator.userAgent || '').toLowerCase();
+    if (platform.includes('win')) return { label: 'Windows', command: `irm ${hooksBaseUrl}/hooks.ps1 | iex` };
+    if (platform.includes('mac')) return { label: 'macOS', command: `curl -fsSL ${hooksBaseUrl}/hooks.sh | bash` };
+    if (platform.includes('linux') || platform.includes('x11')) return { label: 'Linux / WSL', command: `curl -fsSL ${hooksBaseUrl}/hooks.sh | bash` };
+    return { label: 'Unknown OS', command: `curl -fsSL ${hooksBaseUrl}/hooks.sh | bash` };
+  }
+
 
 
   function buildHookCurlHeaders(token) {
@@ -6272,6 +6351,13 @@ async function loadSettingsTab(projectId) {
   };
 
   let html = '';
+  const detectedHookOS = detectHookInstallOS();
+
+  html += `<div id="settings-os-detection-banner-${projectId}" style="margin-bottom:12px;padding:10px 12px;border:1px solid var(--accent);border-radius:6px;background:rgba(108,143,255,.08)">
+    <div style="font-size:10px;color:var(--accent);font-weight:700;letter-spacing:.04em;text-transform:uppercase;margin-bottom:4px">Detected OS: ${escapeHtml(detectedHookOS.label)}</div>
+    <div style="font-size:10px;color:var(--muted);line-height:1.5">Recommended setup command for this browser:</div>
+    <code style="display:block;margin-top:5px;padding:6px 8px;border:1px solid var(--border);border-radius:4px;background:var(--surface-1);color:var(--text);font-size:10px;white-space:pre-wrap;word-break:break-all">${escapeHtml(detectedHookOS.command)}</code>
+  </div>`;
 
 
 

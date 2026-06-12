@@ -61,6 +61,20 @@ ALWAYS before ending:
 
 ---
 
+## Parallel sessions
+
+Before editing shared files, call `claim_file(session_id, path)` and check the `file_warnings` returned by `start_session`. If another active session has claimed a file you need, serialize the work or ask the human before editing.
+
+High-contention files are always sequential:
+
+- `meridian/static/dashboard.js`
+- `meridian/server.py`
+- `meridian/db/__init__.py`
+
+Sprint items can carry `touches_files` so handoffs and dashboards can warn when planned work overlaps with a live session.
+
+---
+
 ## The 5 tools you use 90% of the time
 
 | Tool | When | Example |
@@ -119,7 +133,7 @@ your project context on start and snapshots progress on end.
 
 ---
 <!-- MERIDIAN STATE — auto-generated, do not edit below -->
-## Current Sprint State  _(auto-updated 2026-06-12 05:44 UTC)_
+## Current Sprint State  _(auto-updated 2026-06-12 19:40 UTC)_
 
 **Key Files:**
 - `meridian/server.py` — FastAPI app + MCP handlers

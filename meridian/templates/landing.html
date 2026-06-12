@@ -491,6 +491,15 @@
          alt="Meridian dashboard: two project tabs open, a pending HITL request in the queue, and active Claude sessions for two developers running in parallel"
          loading="lazy" decoding="async" width="1600" height="980">
   </figure>
+  <div class="features-grid" style="margin-top:1.2rem">
+    <div class="feature-item">
+      <div class="feature-icon">!</div>
+      <div>
+        <h4>Parallel safety built in</h4>
+        <p>File claims and sprint-item <code>touches_files</code> hints warn agents before they copy work that overlaps with an active session.</p>
+      </div>
+    </div>
+  </div>
 </section>
 
 <section>
@@ -500,7 +509,7 @@
     <div class="problem-card">
       <div class="problem-num">01 — ISOLATION</div>
       <h3>Sessions don't know about each other</h3>
-      <p>Every Claude tab boots blind. Run two in parallel and they duplicate work, contradict each other, and step on the same files.</p>
+      <p>Every Claude tab boots blind. Run two in parallel and they duplicate work or contradict each other because neither sees the other's plan.</p>
     </div>
     <div class="problem-card">
       <div class="problem-num">02 — AMNESIA</div>
@@ -509,8 +518,36 @@
     </div>
     <div class="problem-card">
       <div class="problem-num">03 — NO HANDOFFS</div>
-      <h3>Resume is a copy-paste mess</h3>
-      <p>Starting a fresh session means digging through git history, scrolling chat logs, and praying you remembered the latest decisions.</p>
+      <h3>Parallel agents step on shared files</h3>
+      <p>Two sessions editing the same dashboard, server, or database file can silently overwrite each other unless the work is claimed and serialized.</p>
+    </div>
+  </div>
+</section>
+
+<section>
+  <h2>Running parallel agents safely</h2>
+  <p class="section-lede">Meridian tracks active sessions, sprint-item file intent, and explicit file claims so parallel work stays coordinated.</p>
+  <div class="features-grid">
+    <div class="feature-item">
+      <div class="feature-icon">!</div>
+      <div>
+        <h4>File-claim warnings</h4>
+        <p>Executors call <code>claim_file</code> before editing. New sessions see warnings when a live session already owns the same file.</p>
+      </div>
+    </div>
+    <div class="feature-item">
+      <div class="feature-icon">-&gt;</div>
+      <div>
+        <h4>Sequential mode</h4>
+        <p>High-contention work such as <code>dashboard.js</code>, <code>server.py</code>, and <code>db/__init__.py</code> can be serialized instead of raced.</p>
+      </div>
+    </div>
+    <div class="feature-item">
+      <div class="feature-icon">[]</div>
+      <div>
+        <h4><code>touches_files</code> intent</h4>
+        <p>Sprint items can declare expected files so handoffs warn before another agent copies overlapping work.</p>
+      </div>
     </div>
   </div>
 </section>

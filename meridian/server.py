@@ -6836,6 +6836,80 @@ async def _maybe_add_log_task_nudge(db: Any, task: dict[str, Any]) -> dict[str, 
     return task
 
 
+def _parse_touches_files(raw: Any) -> list[str]:
+    """Decode a sprint item's touches_files field into normalized file paths."""
+    if raw is None:
+        return []
+    if isinstance(raw, list):
+        values = raw
+    else:
+        text = str(raw).strip()
+        if not text:
+            return []
+        try:
+            decoded = json.loads(text)
+            values = decoded if isinstance(decoded, list) else [decoded]
+        except Exception:  # noqa: BLE001
+            values = [part.strip() for part in text.split(",")]
+    paths: list[str] = []
+    for value in values:
+        path = str(value or "").strip().replace("\\", "/")
+        if path.startswith("./"):
+            path = path[2:]
+        if path:
+            paths.append(path)
+    return paths
+
+
+async def _sprint_item_file_claim_conflicts(
+    db: Any,
+    project_id: str,
+    item_id: str,
+    *,
+    exclude_session_id: str | None = None,
+) -> list[dict[str, Any]]:
+    """Return active file locks overlapping a sprint item's touches_files."""
+    item = await db_module.get_sprint_item(db, item_id)
+    if item is None or item.get("project_id") != project_id:
+        return []
+    touches = {path.lower() for path in _parse_touches_files(item.get("touches_files"))}
+    if not touches:
+        return []
+    await db_module.expire_file_locks(db)
+    params: list[Any] = [project_id]
+    exclude_clause = ""
+    if exclude_session_id:
+        exclude_clause = "AND fl.session_id != ? "
+        params.append(exclude_session_id)
+    async with db.execute(
+        "SELECT fl.file_path, fl.session_id, s.name AS session_name, s.last_seen "
+        "FROM file_locks fl "
+        "JOIN sessions s ON s.id = fl.session_id "
+        "WHERE s.project_id = ? "
+        f"{exclude_clause}"
+        "AND s.status IN ('active', 'live') "
+        "AND (s.last_seen IS NULL OR s.last_seen > datetime('now', '-10 minutes'))",
+        tuple(params),
+    ) as cur:
+        rows = await cur.fetchall()
+    conflicts: list[dict[str, Any]] = []
+    for row in rows:
+        r = dict(row)
+        path = str(r.get("file_path") or "").strip().replace("\\", "/")
+        if path.startswith("./"):
+            path = path[2:]
+        if path.lower() not in touches:
+            continue
+        conflicts.append({
+            "file_path": path,
+            "session_id": r.get("session_id"),
+            "session_name": r.get("session_name"),
+            "last_seen": r.get("last_seen"),
+            "sprint_item_id": item_id,
+        })
+    return conflicts
+
+
 async def _dispatch_mcp_tool(
     name: str,
     args: dict[str, Any],
@@ -7213,6 +7287,18 @@ async def _dispatch_mcp_tool(
             include_human=include_human,
         )
     if name == "claim_sprint_item":
+        conflicts = await _sprint_item_file_claim_conflicts(
+            db,
+            args["project_id"],
+            args["item_id"],
+            exclude_session_id=args.get("session_id"),
+        )
+        if conflicts:
+            return {
+                "error": "CONFLICT",
+                "message": "Cannot claim sprint item: active session has overlapping claimed files.",
+                "conflicts": conflicts,
+            }
         item = await db_module.claim_sprint_item(db, args["project_id"], args["item_id"])
         if item is None:
             raise ValueError("sprint item not found")

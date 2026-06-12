@@ -413,10 +413,11 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "urgency": {"type": "string", "enum": ["normal", "high", "blocking"]}},
          "required": ["project_id", "file", "anchor", "content"]}},
     {"name": "claim_sprint_item",
-     "description": "Claim a pending sprint item: sets status to in_progress and records claimed_at. Read-only: false. Rejects if the item is already in_progress, done, failed, or skipped.",
+     "description": "Claim a pending sprint item: sets status to in_progress and records claimed_at. Read-only: false. Rejects if the item is already in_progress, done, failed, skipped, or its touches_files overlap active file claims from another live session.",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"},
-         "item_id": {"type": "string"}},
+         "item_id": {"type": "string"},
+         "session_id": {"type": "string", "description": "Optional caller session id; its own file claims are ignored for conflict checks."}},
          "required": ["project_id", "item_id"]}},
     {"name": "add_subtask",
      "description": "Add a child sprint item under an existing parent item. Inherits the parent's version. Status starts as pending. Rejects if the parent is already done, failed, or skipped.",

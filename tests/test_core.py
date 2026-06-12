@@ -7861,6 +7861,34 @@ async def test_dispatch_mcp_tool_sprint_items_round_trip(db):
     assert done["status"] == "done"
 
 
+@pytest.mark.asyncio
+async def test_claim_sprint_item_rejects_active_file_lock_conflict(db):
+    """claim_sprint_item blocks touches_files overlap with another live session."""
+    import json
+    import meridian.server as srv
+
+    p = await db_module.create_project(db, "sprint-file-conflict-test")
+    item = await db_module.add_sprint_item(db, p["id"], "v1", "Edit dashboard")
+    await db.execute(
+        "UPDATE sprint_items SET touches_files = ? WHERE id = ?",
+        (json.dumps(["meridian/static/dashboard.js"]), item["id"]),
+    )
+    session = await db_module.register_session(db, p["id"], "dashboard-worker")
+    await db_module.claim_file(db, "meridian/static/dashboard.js", session["id"])
+
+    result = await srv._dispatch_mcp_tool(
+        "claim_sprint_item",
+        {"project_id": p["id"], "item_id": item["id"]},
+        db,
+        "/tmp",
+    )
+
+    assert result["error"] == "CONFLICT"
+    assert result["conflicts"][0]["file_path"] == "meridian/static/dashboard.js"
+    reread = await db_module.get_sprint_item(db, item["id"])
+    assert reread["status"] == "pending"
+
+
 def test_sprint_tools_via_mcp_sse_tools_list(client):
     """tools/list on /mcp/sse includes the 4 sprint tools."""
     r = client.post("/mcp/sse", json={
