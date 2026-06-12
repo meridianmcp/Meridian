@@ -1,4 +1,4 @@
-﻿"""Core tests for Meridian — db layer, HTTP endpoints, and handoff."""
+"""Core tests for Meridian — db layer, HTTP endpoints, and handoff."""
 
 from __future__ import annotations
 
@@ -6497,8 +6497,9 @@ def test_hooks_session_start_and_stop(client):
     r = client.post("/hooks/session-start", json={"project_id": project["id"]})
     assert r.status_code == 200
     body = r.json()
-    assert "hookEventName" in body
     assert "hookSpecificOutput" in body
+    assert "hookEventName" in body["hookSpecificOutput"]
+    assert body["hookSpecificOutput"]["hookEventName"] == "SessionStart"
     assert project["name"] in body["hookSpecificOutput"]["additionalContext"]
     # Stop hook — uses session_id from start result
     additional = body["hookSpecificOutput"]["additionalContext"]
