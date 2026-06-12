@@ -104,6 +104,7 @@ try { Invoke-WebRequest -Method POST -Uri "__URL__/hooks/stop" -ContentType 'app
 '@
         } else {
             $startContent = @'
+# MERIDIAN_TOKEN: __TOKEN__
 # Meridian session-start hook -- self-healing token
 $fallback = [char]123+[char]34+"hookSpecificOutput"+[char]34+[char]58+[char]123+[char]34+"hookEventName"+[char]34+[char]58+[char]34+"SessionStart"+[char]34+[char]44+[char]34+"additionalContext"+[char]34+[char]58+[char]34+[char]34+[char]125+[char]125
 
@@ -281,7 +282,7 @@ if ($IsLocalhost) {
         if (Test-Path $psPath) {
             try {
                 $pscontent = Get-Content $psPath -Raw
-                if ($pscontent -match 'Bearer (sk_meridian_[A-Za-z0-9_\-]+)') {
+                if ($pscontent -match '(?:Bearer |MERIDIAN_TOKEN: )(sk_meridian_[A-Za-z0-9_\-]+)') {
                     $candidate = $Matches[1]
                     $check = Get-MeResponse -Url $MeridianUrl -Token $candidate
                     if ($null -ne $check) {
