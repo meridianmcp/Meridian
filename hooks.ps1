@@ -242,6 +242,17 @@ if ($ClaudeDetected) {
 # ---- Step 7: Write Codex config --------------------------------------------------
 if ($CodexDetected) {
     Write-Host ""
+
+    # Write ~/.mcp.json with alwaysLoad so Meridian tools work in --rc mode
+    $mcpJsonPath = Join-Path $HOME ".mcp.json"
+    try {
+        if (Test-Path $mcpJsonPath) { $mcpObj = Get-Content $mcpJsonPath -Raw | ConvertFrom-Json } else { $mcpObj = [PSCustomObject]@{mcpServers=[PSCustomObject]@{}} }
+        if (-not $mcpObj.PSObject.Properties["mcpServers"]) { $mcpObj | Add-Member -NotePropertyName "mcpServers" -NotePropertyValue ([PSCustomObject]@{}) }
+        $mcpObj.mcpServers | Add-Member -NotePropertyName "meridian" -NotePropertyValue ([PSCustomObject]@{type="http";url="$MeridianUrl/mcp";alwaysLoad=$true}) -Force
+        $mcpObj | ConvertTo-Json -Depth 5 | Set-Content $mcpJsonPath -Encoding UTF8
+        Write-Host "  OK ~/.mcp.json written (alwaysLoad=true for --rc mode)" -ForegroundColor Green
+    } catch { Write-Host "  Warning: could not write ~/.mcp.json: $_" -ForegroundColor Yellow }
+
     Write-Host "Codex detected -- writing MCP config"
     $null = New-Item -ItemType Directory -Force $CodexDir
     $mb = "`n# Meridian - added by hooks.ps1`n[mcp_servers.meridian]`ntype = `"http`"`nurl = `"$MeridianUrl/mcp`"`n`n[mcp_servers.meridian.http_headers]`nAuthorization = `"Bearer $Token`""
