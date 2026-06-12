@@ -384,8 +384,8 @@ if ($ExistingHooks) {
                 if ($r2.StatusCode -eq 201) { $td2 = $r2.Content | ConvertFrom-Json; if ($td2.token) { $Token = $td2.token; Write-Host "  New key generated." -ForegroundColor Green } }
             } catch {}
         } else {
-            Write-Host "  Skipped." -ForegroundColor Yellow
-            exit 0
+            Write-Host "  Skipped -- hooks unchanged." -ForegroundColor Yellow
+            return
         }
     } else {
         Write-Host "  Token invalid or expired -- updating automatically..." -ForegroundColor Yellow
