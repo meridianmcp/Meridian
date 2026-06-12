@@ -5211,6 +5211,22 @@ async def delete_user_session(
     await db.commit()
 
 
+async def delete_api_tokens_by_label(
+    db: aiosqlite.Connection,
+    tenant_id: str,
+    label: str,
+) -> int:
+    """Delete all tokens with a given label for a tenant. Returns count deleted.
+    Used so label acts as a unique slot -- regenerating hooks-installer token
+    doesn't leave stale tokens that cause 401 loops."""
+    cur = await db.execute(
+        "DELETE FROM api_tokens WHERE tenant_id = ? AND label = ?",
+        (tenant_id, label),
+    )
+    await db.commit()
+    return cur.rowcount
+
+
 async def create_api_token(
     db: aiosqlite.Connection,
     tenant_id: str,

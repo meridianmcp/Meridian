@@ -6236,6 +6236,10 @@ async def create_api_token(request: Request) -> dict[str, Any]:
     if token_type not in ("readwrite", "readonly"):
         token_type = "readwrite"
     db = request.app.state.db
+    # If a label is provided, delete any existing token with the same label first
+    # so the label acts as a unique slot (prevents token accumulation + revocation loops)
+    if label:
+        await db_module.delete_api_tokens_by_label(db, tenant["id"], label)
     raw_token, token_row = await db_module.create_api_token(db, tenant["id"], label, token_type=token_type)
     return {
         "token": raw_token,
