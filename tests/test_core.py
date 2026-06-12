@@ -4440,14 +4440,16 @@ def test_timeline_tasks_newest_first(client):
 def test_work_queue_vtab_in_dashboard(client):
     """Dashboard JS restores the 4-group sprint queue with paged done items."""
     js = client.get("/static/dashboard.js").text
+    js_sprint = client.get("/static/dashboard-sprint.js").text
+    js_utils = client.get("/static/dashboard-utils.js").text
     assert 'data-vtab="queue"' in js, (
         "v1.4.0: queue vtab button missing from buildTabBody"
     )
     assert "loadQueue" in js, (
         "v1.4.0: loadQueue function missing from dashboard.js"
     )
-    assert "renderQueue" in js, (
-        "v1.4.0: renderQueue function missing from dashboard.js"
+    assert "renderQueue" in js_sprint, (
+        "v1.4.0: renderQueue function missing from dashboard-sprint.js"
     )
     assert "queue-body-" in js, (
         "v1.4.0: queue-body element id missing from dashboard.js"
@@ -4455,13 +4457,13 @@ def test_work_queue_vtab_in_dashboard(client):
     assert "/sprint-items" in js, (
         "queue should read sprint items so pending work reflects the sprint board"
     )
-    assert "QUEUE_DONE_PAGE_SIZE = 10" in js, (
+    assert "QUEUE_DONE_PAGE_SIZE = 10" in js_utils, (
         "done queue section should page sprint items 10 at a time"
     )
-    assert "Backburner" in js and "Pending" in js and "In Progress" in js and "Done" in js, (
+    assert "Backburner" in js_sprint and "Pending" in js_sprint and "In Progress" in js_sprint and "Done" in js_sprint, (
         "queue should render the restored 4-group sprint board"
     )
-    assert "queue-done-more-" in js, (
+    assert "queue-done-more-" in js_sprint, (
         "done sprint items should expose a load-more control"
     )
     assert "Recent Sessions" in js, (
@@ -5275,8 +5277,8 @@ def test_sessions_endpoint_returns_session_summary_field(client):
 
 
 def test_dashboard_js_handles_future_status_in_render_queue(client):
-    """dashboard.js renderQueue segments future tasks into a Future section."""
-    js = client.get("/static/dashboard.js").text
+    """dashboard-sprint.js renderQueue segments future tasks into a Future section."""
+    js = client.get("/static/dashboard-sprint.js").text
     assert "future" in js.lower(), "renderQueue must handle future status"
     assert "'future'" in js or '"future"' in js, "future filter must be present"
 

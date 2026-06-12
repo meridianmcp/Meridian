@@ -7,6 +7,20 @@ fill in your `project_id` to get Meridian session coordination automatically.
 
 ## Connect to Meridian
 
+Hosted tier (no install):
+```json
+{
+  "mcpServers": {
+    "meridian": {
+      "type": "http",
+      "url": "https://usemeridian.us/mcp",
+      "headers": { "Authorization": "Bearer sk_meridian_YOUR_TOKEN" }
+    }
+  }
+}
+```
+
+Self-hosted (from source):
 ```json
 {
   "mcpServers": {
@@ -14,19 +28,6 @@ fill in your `project_id` to get Meridian session coordination automatically.
       "command": "pixi",
       "args": ["run", "python", "-m", "meridian", "--mcp"],
       "cwd": "/path/to/Meridian"
-    }
-  }
-}
-```
-
-Or use the hosted tier (no install):
-```json
-{
-  "mcpServers": {
-    "meridian": {
-      "command": "npx",
-      "args": ["-y", "mcp-remote", "https://usemeridian.us/mcp"],
-      "env": { "BEARER_TOKEN": "sk_meridian_YOUR_TOKEN" }
     }
   }
 }
@@ -40,8 +41,7 @@ Or use the hosted tier (no install):
 PROJECT_ID=your-project-id-here
 ```
 
-Get your project ID from the Meridian dashboard at `http://localhost:7878` after
-running `create_project(name="your-project")`.
+Get your project ID from the Meridian dashboard after running `create_project(name="your-project")`.
 
 ---
 
@@ -73,9 +73,33 @@ ALWAYS before ending:
 
 ---
 
-## Auto-checkpoint with hooks
+## Parallel sessions — prevent file conflicts
 
-Wire Claude Code to checkpoint automatically on every session end:
+Running two Claude Code sessions on the same repo without isolation causes silent overwrites.
+
+**Option A — Claude Code native (recommended):**
+```bash
+claude --worktree
+```
+Each session gets its own branch + working directory. Conflicts surface as PR merges, not silent overwrites. Available in Claude Code v2.1.50+.
+
+**Option B — AGENTS.md isolation:**
+```yaml
+## executor
+description: Executes sprint items.
+tools: read, write, bash, edit
+isolation: worktree
+model: claude-sonnet-4-6
+```
+
+**Option C — Meridian file claims (cross-client, works with Codex too):**
+- Call `claim_file(session_id, path)` before editing any shared file.
+- Check `start_session` response for `file_warnings` — if another session has claimed a file you need, call `request_hitl` to ask the human to serialize the work.
+- High-contention files (always run sequentially): `dashboard.js`, `server.py`, `db/__init__.py`
+
+---
+
+## Auto-checkpoint with hooks
 
 ```bash
 # Mac/Linux
@@ -85,16 +109,13 @@ curl -fsSL https://usemeridian.us/hooks.sh | bash
 irm https://usemeridian.us/hooks.ps1 | iex
 ```
 
-Prompts for your Meridian URL and project ID, then writes `SessionStart` and `Stop`
-hooks to `~/.claude/settings.json`. From that point on, every session auto-injects
-your project context on start and snapshots progress on end.
+Writes `SessionStart` and `Stop` hooks to `~/.claude/settings.json`. Every session auto-injects project context on start and snapshots progress on end.
 
 ---
 
 ## Docs
 
-- Full MCP tool reference: `http://localhost:7878/mcp/tools-doc`
-- Quick reference: `http://localhost:7878/mcp/quickstart`
+- Full MCP tool reference: https://docs.usemeridian.us/mcp-tools/
 - Web docs: https://docs.usemeridian.us
 
 ---
@@ -103,11 +124,12 @@ your project context on start and snapshots progress on end.
 - **Secrets hygiene**: Never put credentials, connection strings, API keys, or secrets in chat or task descriptions. Mention env var names only.
 - **Before every push**: Run `pixi run test` locally first. CI is a safety net — not the first check. Never push broken code.
 - **End every session**: If tests pass, merge `dev → main` and push `main` to trigger deploy. Do not end the session with work stranded only on `dev`.
-- **Set sprint name**: Use `PATCH /projects/{id}/goal` with body `{"sprint": "name"}` directly (or the `set_sprint` MCP tool). Do NOT use `set_goal` for sprint-only updates.
-- **Handoff**: Use `get_context_block(project_id)` for the handoff context block. Do NOT read from `data/meridian-build_handoff.md` — that file is local-only and not reliable across sessions.
-- **Project discovery**: Use `list_projects()` when the project ID is unknown. Never call `create_project()` without explicit human instruction — use `list_projects()` to find existing projects first. Never create a project just to get a working ID.
-- **Staging pipeline**: `dev push → test → deploy preview → smoke test → merge main → prod`. Rollback fires automatically if prod /health returns non-200 after deploy.
-- **Demo write protection**: Adding a new write endpoint requires NO demo exception — the middleware in `server.py` handles it globally. When adding a new write UI element, add it to the `hideDemoAdminControls()` selector list in `dashboard.js`.
+- **Set sprint name**: Use the `set_sprint` MCP tool. Do NOT use `set_goal` for sprint-only updates.
+- **Handoff**: Use `get_context_block(project_id)` for the handoff context block.
+- **Project discovery**: Use `list_projects()` when the project ID is unknown. Never call `create_project()` without explicit human instruction.
+- **Staging pipeline**: `dev push → test → deploy preview → smoke test → merge main → prod`.
+- **Demo write protection**: When adding a new write UI element, add it to the `hideDemoAdminControls()` selector list in `dashboard.js`.
+- **Parallel sessions**: Claim files before editing with `claim_file()`. Never run two sessions touching the same file simultaneously. Check `start_session` file_warnings before proceeding.
 
 ---
 ## Meridian-managed notes
@@ -115,14 +137,3 @@ your project context on start and snapshots progress on end.
 <!-- Agent-proposed via update_md_section, human-approved via the dashboard HITL queue. -->
 <!-- MERIDIAN:ANCHOR:START:claude-body -->
 <!-- MERIDIAN:ANCHOR:END:claude-body -->
-
----
-<!-- MERIDIAN STATE — auto-generated, do not edit below -->
-## Current Sprint State  _(auto-updated 2026-06-11 19:15 UTC)_
-
-**Key Files:**
-- `meridian/server.py` — FastAPI app + MCP handlers
-- `meridian/db.py` — all DB functions (SQLite + Postgres)
-- `meridian/static/dashboard.js` — dashboard UI
-- `tests/test_core.py` — full test suite
-- `data/meridian-build_handoff.md` — session handoff

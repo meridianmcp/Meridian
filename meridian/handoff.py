@@ -159,6 +159,57 @@ def _annotate_possibly_done(
     return pending_items
 
 
+async def _annotate_touches_files(
+    db: aiosqlite.Connection,
+    project_id: str,
+    pending_items: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Auto-set touches_files on pending items whose title keywords match recently
+    changed files (git diff --name-only HEAD~3). Persists the match to the DB so
+    start_session file_warnings can reference it. Safe to skip on error."""
+    import subprocess  # noqa: PLC0415
+    try:
+        result = subprocess.run(
+            ["git", "diff", "--name-only", "HEAD~3"],
+            capture_output=True, text=True, timeout=5
+        )
+        changed_files = [f.strip() for f in result.stdout.splitlines() if f.strip()]
+    except Exception:  # noqa: BLE001
+        return pending_items
+    if not changed_files:
+        return pending_items
+
+    for item in pending_items:
+        if item.get("touches_files"):
+            continue
+        title_kws = _extract_keywords(item.get("title") or "")
+        if len(title_kws) < 2:
+            continue
+        matched = []
+        for fpath in changed_files:
+            # Match on filename stem and any path segment keyword
+            fname = os.path.basename(fpath)
+            fname_stem = os.path.splitext(fname)[0]
+            path_kws = _extract_keywords(fpath.replace("/", " ").replace(".", " "))
+            if fname_stem and fname_stem in title_kws:
+                matched.append(fpath)
+            elif len(title_kws & path_kws) >= 2:
+                matched.append(fpath)
+        if matched:
+            touches = json.dumps(matched[:10])
+            item["touches_files"] = touches
+            try:
+                async with db.execute(
+                    "UPDATE sprint_items SET touches_files = ? WHERE id = ? AND project_id = ?",
+                    (touches, item["id"], project_id),
+                ) as _:
+                    pass
+                await db.commit()
+            except Exception:  # noqa: BLE001
+                pass
+    return pending_items
+
+
 def resolve_handoff_mode(
     requested_mode: str | None,
     session_id: str | None = None,
@@ -556,6 +607,8 @@ async def generate_handoff(
     pending_sprint_items = _prepare_pending_sprint_items(pending_sprint_items)
     # Flag items that may already be done based on recent task descriptions
     pending_sprint_items = _annotate_possibly_done(pending_sprint_items, tasks)
+    # Auto-set touches_files from recent git history for items without it.
+    pending_sprint_items = await _annotate_touches_files(db, project_id, pending_sprint_items)
     decisions_log = (project.get("decisions") or "").strip()
     now_utc = datetime.now(timezone.utc)
     generated_at = now_utc.isoformat(timespec="seconds")

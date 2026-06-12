@@ -1633,6 +1633,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_oauth_codes_table(db)
     await _migrate_device_codes_table(db)
     await _migrate_github_to_projects(db)
+    await _migrate_touches_files(db)
     return db
 
 
@@ -1696,6 +1697,11 @@ async def _migrate_github_to_projects(db: aiosqlite.Connection) -> None:
             await db.commit()
     except Exception:  # noqa: BLE001
         pass
+
+
+async def _migrate_touches_files(db: aiosqlite.Connection) -> None:
+    """Add touches_files TEXT column to sprint_items for file conflict tracking."""
+    await _migrate_add_column_if_missing(db, "sprint_items", "touches_files", "TEXT")
 
 
 async def _migrate_oauth_codes_table(db: aiosqlite.Connection) -> None:
@@ -5561,6 +5567,48 @@ async def release_file_locks_for_session(
     )
     await db.commit()
     return cursor.rowcount
+
+
+async def get_file_conflict_warnings(
+    db: aiosqlite.Connection,
+    project_id: str,
+    exclude_session_id: str,
+) -> list[str]:
+    """Return warning strings for files claimed by other recently-active sessions.
+
+    Checks the file_locks table for locks held by sessions other than
+    ``exclude_session_id`` whose owning session is still live (status active/live
+    and last_seen within the last 10 minutes). Returns human-readable strings
+    like ``"dashboard.js claimed by session pre-launch-final (2h ago)"``.
+    """
+    warnings: list[str] = []
+    try:
+        async with db.execute(
+            "SELECT fl.file_path, s.name AS session_name, s.id AS session_id, s.last_seen "
+            "FROM file_locks fl "
+            "JOIN sessions s ON s.id = fl.session_id "
+            "WHERE fl.session_id != ? "
+            "AND s.project_id = ? "
+            "AND s.status IN ('active', 'live') "
+            "AND (s.last_seen IS NULL OR s.last_seen > datetime('now', '-10 minutes'))",
+            (exclude_session_id, project_id),
+        ) as cur:
+            rows = await cur.fetchall()
+        for row in rows:
+            r = _row_to_dict(row)
+            if not r:
+                continue
+            name = r.get("session_name") or (r.get("session_id") or "unknown")[:8]
+            last_seen = r.get("last_seen") or ""
+            if last_seen:
+                warnings.append(
+                    f"{r['file_path']} claimed by session {name} (last_seen {last_seen})"
+                )
+            else:
+                warnings.append(f"{r['file_path']} claimed by session {name}")
+    except Exception:  # noqa: BLE001
+        pass
+    return warnings
 
 
 # ---------------------------------------------------------------------------

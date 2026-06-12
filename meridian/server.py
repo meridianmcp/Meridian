@@ -5239,6 +5239,11 @@ async def _start_session_composite(
             executor_config = executor_config_for_output({})
             executor_context = build_executor_config_block({})
 
+    # File conflict warnings: flag any files claimed by other live sessions.
+    file_warnings = await db_module.get_file_conflict_warnings(
+        db, project_id, session["id"]
+    )
+
     payload: dict[str, Any] = {
         "session_id": session["id"],
         "goal": goal,
@@ -5254,6 +5259,8 @@ async def _start_session_composite(
         "meridian_instructions": meridian_instructions,  # v2.3
         "workspace_context": workspace_context,  # v3.4 — tenant-global block
     }
+    if file_warnings:
+        payload["file_warnings"] = file_warnings
     if executor_config is not None:
         payload["executor_config"] = executor_config
         payload["executor_context"] = executor_context

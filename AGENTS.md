@@ -1,21 +1,24 @@
 # AGENTS.md — Meridian User Template (Codex)
 
-This file is read by Codex at session start. Same content as CLAUDE.md — both
-agents use the same Meridian MCP tools.
+This file is read by Codex at session start. Same content as CLAUDE.md —
+both agents use the same Meridian MCP tools.
 
 ---
 
 ## Connect to Meridian
 
-Add to `~/.codex/config.toml`:
+Hosted tier (no install) — add to `~/.codex/config.toml`:
 
 ```toml
 [mcp_servers.meridian]
 type = "http"
-url = "http://localhost:7878/mcp"
+url = "https://usemeridian.us/mcp"
+
+[mcp_servers.meridian.http_headers]
+Authorization = "Bearer sk_meridian_YOUR_TOKEN"
 ```
 
-Or for STDIO (from source):
+Self-hosted (from source):
 ```toml
 [mcp_servers.meridian]
 type = "stdio"
@@ -61,6 +64,29 @@ ALWAYS before ending:
 
 ---
 
+## Parallel sessions — prevent file conflicts
+
+Running two Codex sessions on the same repo without isolation causes silent overwrites.
+
+**Option A — Meridian file claims (works across all clients):**
+- Call `claim_file(session_id, path)` before editing any shared file.
+- Check `start_session` response for `file_warnings` — if another session has claimed a file you need, stop and call `request_hitl` to ask the human to serialize the work.
+- High-contention files (always sequential): `dashboard.js`, `server.py`, `db/__init__.py`
+
+**Option B — AGENTS.md worktree isolation (Claude Code only):**
+```yaml
+## executor
+description: Executes sprint items.
+tools: read, write, bash, edit
+isolation: worktree
+model: claude-sonnet-4-6
+```
+
+**Option C — Codex sandboxed environments:**
+Codex runs tasks in parallel sandboxed environments by default when you use the web UI. For CLI, run each session in a separate directory/branch.
+
+---
+
 ## Auto-checkpoint with hooks
 
 ```bash
@@ -78,9 +104,32 @@ project context on start and checkpoints on end.
 
 ## Docs
 
-- Full MCP tool reference: `http://localhost:7878/mcp/tools-doc`
-- Quick reference: `http://localhost:7878/mcp/quickstart`
+- Full MCP tool reference: https://docs.usemeridian.us/mcp-tools/
 - Web docs: https://docs.usemeridian.us
+
+---
+
+## PARALLEL SESSIONS
+
+Multiple AI sessions (Claude Code + Codex, or two concurrent Claude Code windows) can work on the same project simultaneously. Follow these rules to avoid conflicts:
+
+**Before editing any file:**
+1. Call `claim_file(file_path, session_id)` to register your intent.
+2. Check `start_session` response for `file_warnings` — if a file you need is already claimed by another active session, coordinate before editing.
+
+**High-contention files — always sequential, never parallel:**
+- `meridian/static/dashboard.js` — monolithic frontend, merge conflicts are painful
+- `meridian/server.py` — central FastAPI app, concurrent edits cause import errors
+- `meridian/db/__init__.py` — all DB logic, schema changes must be serialized
+
+**Rules:**
+- Never edit a file another active session has claimed (within the last 10 minutes).
+- `start_session` returns `file_warnings` when a conflict is detected — stop and coordinate.
+- Sprint items carry a `touches_files` field auto-populated from recent git history — check it before starting.
+- Cross-machine awareness works via the hosted DB — this covers Claude Code + Codex running simultaneously on separate machines.
+
+**Release locks when done:**
+Call `release_file(file_path, session_id)` after your changes are committed.
 
 ---
 ## Meridian-managed notes
@@ -88,4 +137,3 @@ project context on start and checkpoints on end.
 <!-- Agent-proposed via update_md_section, human-approved via the dashboard HITL queue. -->
 <!-- MERIDIAN:ANCHOR:START:agents-body -->
 <!-- MERIDIAN:ANCHOR:END:agents-body -->
-
