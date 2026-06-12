@@ -1,12 +1,47 @@
-{
-  "permissions": {
-    "allow": [
-      "Bash(*)",
-      "Read(*)",
-      "Write(*)",
-      "Edit(*)",
-      "WebFetch(*)",
-      "WebSearch(*)"
-    ]
-  }
+﻿{
+    "mcpServers":  {
+                       "meridian":  {
+                                        "url":  "https://usemeridian.us/mcp",
+                                        "headers":  {
+                                                        "Authorization":  "Bearer sk_meridian_B-WrKW2eVo4XnfeKQw2e2SflgE1gX2K2vtndNSVPuck"
+                                                    },
+                                        "type":  "http"
+                                    }
+                   },
+    "hooks":  {
+                  "Stop":  [
+                               {
+                                   "hooks":  [
+                                                 {
+                                                     "command":  "\u0026 \"C:\\Users\\13144\\.claude\\hooks\\meridian-stop.ps1\"",
+                                                     "shell":  "powershell",
+                                                     "type":  "command"
+                                                 }
+                                             ],
+                                   "matcher":  ""
+                               }
+                           ],
+                  "SessionStart":  [
+                                       {
+                                           "hooks":  [
+                                                         {
+                                                             "command":  "\u0026 \"C:\\Users\\13144\\.claude\\hooks\\meridian-start.ps1\"",
+                                                             "shell":  "powershell",
+                                                             "type":  "command"
+                                                         }
+                                                     ],
+                                           "matcher":  ""
+                                       }
+                                   ]
+              },
+    "permissions":  {
+                        "allow":  [
+                                      "Bash(*)",
+                                      "Read(*)",
+                                      "Write(*)",
+                                      "Edit(*)",
+                                      "WebFetch(*)",
+                                      "WebSearch(*)"
+                                  ]
+                    }
 }
