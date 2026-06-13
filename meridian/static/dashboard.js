@@ -4,6 +4,7 @@ import "./dashboard-demo.js";
 import "./dashboard-timeline.js";
 import "./dashboard-mcp.js";
 import "./dashboard-sprint.js";
+import "./dashboard-settings.js";
 
 ﻿const TABS_KEY = 'meridian.openTabs';
 
@@ -6130,26 +6131,6 @@ function showFailoverBannerIfNeeded() {
     document.body.insertBefore(bar, document.body.firstChild);
   }).catch(() => {});
 }
-
-function suggestNtfyTopic(projectId) {
-
-  const proj = (state.projects || []).find(p => p.id === projectId);
-
-  const slug = (proj?.name || 'meridian')
-
-    .toLowerCase()
-
-    .replace(/[^a-z0-9]+/g, '-')
-
-    .replace(/^-+|-+$/g, '')
-
-    .slice(0, 24) || 'meridian';
-
-  return slug;
-
-}
-
-
 
 async function loadSettingsTab(projectId) {
 

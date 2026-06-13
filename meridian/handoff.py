@@ -725,7 +725,10 @@ async def generate_handoff(
 
     # 10e6b265 — session queue: append the queued next-session goal (if any) and
     # clear it so the handoff surfaces the next /goal inline, exactly once.
-    queued_goal = await db_module.pop_queued_session(db, project_id)
+    try:
+        queued_goal = await db_module.pop_queued_session(db, project_id)
+    except Exception:  # noqa: BLE001 — column may be absent on older DBs
+        queued_goal = None
     if queued_goal:
         content = (
             f"{content}\n\n=== QUEUED NEXT SESSION ===\n"
