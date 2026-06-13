@@ -1045,7 +1045,7 @@ async def _migrate_pg_tenants_is_internal(conn: PostgresConnection) -> None:
     # Backfill known internal emails.
     for email in sorted(db_module._internal_emails()):
         await conn.execute(
-            "UPDATE tenants SET is_internal = 1 WHERE LOWER(email) = $1",
+            "UPDATE tenants SET is_internal = 1 WHERE LOWER(email) = ?",
             (email,),
         )
 
@@ -1074,7 +1074,7 @@ async def _migrate_pg_admin_plan(conn: PostgresConnection) -> None:
     admin_emails = {e.strip().lower() for e in whitelist_raw.split(",") if e.strip()}
     for email in sorted(admin_emails):
         await conn.execute(
-            "UPDATE tenants SET plan = 'admin' WHERE LOWER(email) = $1 AND plan != 'admin'",
+            "UPDATE tenants SET plan = 'admin' WHERE LOWER(email) = ? AND plan != 'admin'",
             (email,),
         )
 
