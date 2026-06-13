@@ -5310,6 +5310,7 @@ def test_pg_migration_registry_matches_historical_order():
         "_migrate_pg_project_settings",
         "_migrate_pg_notify_email",
         "_migrate_pg_file_locks",
+        "_migrate_pg_active_worktrees",
         "_migrate_pg_task_sprint_link",
         "_migrate_pg_v26_client_type",
         "_migrate_pg_v27_pg_trgm",
@@ -5345,7 +5346,7 @@ def test_pg_migration_registry_matches_historical_order():
     ]
     # No duplicates across the three groups.
     allnames = core + hosted + late
-    assert len(allnames) == len(set(allnames)) == 36
+    assert len(allnames) == len(set(allnames)) == 37
 
 
 def test_cached_plan_error_is_retryable():
@@ -9579,6 +9580,22 @@ def test_worktrees_http_endpoints(client):
     # Delete again — 404
     r4 = client.delete(f"/projects/{pid}/worktrees/{wt['id']}")
     assert r4.status_code == 404
+
+
+def test_worktrees_endpoint_degrades_to_empty_on_db_error(client, monkeypatch):
+    """A missing/not-yet-migrated active_worktrees table must return [] (200),
+    not 500 the dashboard panel. Regression for the prod 'relation does not
+    exist' incident after the GET stub was removed."""
+    import meridian.server as srv
+    proj = client.post("/projects", json={"name": "wt-degrade"}).json()
+
+    async def boom(*_a, **_k):
+        raise RuntimeError("relation \"active_worktrees\" does not exist")
+
+    monkeypatch.setattr(srv.db_module, "list_active_worktrees", boom)
+    r = client.get(f"/projects/{proj['id']}/worktrees")
+    assert r.status_code == 200
+    assert r.json() == []
 
 
 # ---------------------------------------------------------------------------

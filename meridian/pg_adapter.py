@@ -591,6 +591,20 @@ CREATE TABLE IF NOT EXISTS file_locks (
 CREATE INDEX IF NOT EXISTS idx_file_locks_session ON file_locks(session_id);
 CREATE INDEX IF NOT EXISTS idx_file_locks_expires ON file_locks(expires_at);
 
+-- worktree isolation: live git worktrees registered per session.
+CREATE TABLE IF NOT EXISTS active_worktrees (
+    id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL REFERENCES sessions(id),
+    project_id TEXT NOT NULL REFERENCES projects(id),
+    item_id TEXT,
+    branch TEXT NOT NULL,
+    path TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT ({_TS}),
+    removed_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_active_worktrees_session ON active_worktrees(session_id);
+CREATE INDEX IF NOT EXISTS idx_active_worktrees_project ON active_worktrees(project_id, removed_at);
+
 -- v3.1 — workspace layer: tenant-global notes + decisions above projects.
 CREATE TABLE IF NOT EXISTS workspace_notes (
     id TEXT PRIMARY KEY,
@@ -1220,6 +1234,26 @@ async def _migrate_pg_file_locks(conn: PostgresConnection) -> None:
     )
 
 
+async def _migrate_pg_active_worktrees(conn: PostgresConnection) -> None:
+    """Create active_worktrees on existing Postgres DBs. It was missing from the
+    PG schema entirely (only in the SQLite path), so GET /worktrees 500'd on
+    hosted with 'relation active_worktrees does not exist'."""
+    await conn.executescript(
+        "CREATE TABLE IF NOT EXISTS active_worktrees ("
+        "    id TEXT PRIMARY KEY,"
+        "    session_id TEXT NOT NULL REFERENCES sessions(id),"
+        "    project_id TEXT NOT NULL REFERENCES projects(id),"
+        "    item_id TEXT,"
+        "    branch TEXT NOT NULL,"
+        "    path TEXT NOT NULL,"
+        f"    created_at TEXT NOT NULL DEFAULT ({_TS}),"
+        "    removed_at TEXT"
+        ");"
+        "CREATE INDEX IF NOT EXISTS idx_active_worktrees_session ON active_worktrees(session_id);"
+        "CREATE INDEX IF NOT EXISTS idx_active_worktrees_project ON active_worktrees(project_id, removed_at)"
+    )
+
+
 async def _migrate_pg_task_sprint_link(conn: PostgresConnection) -> None:
     """v2.6 â€” link task_log rows back to their sprint item when applicable."""
     await conn.executescript(
@@ -1489,6 +1523,7 @@ _PG_MIGRATIONS_CORE = (
     _migrate_pg_project_settings,
     _migrate_pg_notify_email,
     _migrate_pg_file_locks,
+    _migrate_pg_active_worktrees,
     _migrate_pg_task_sprint_link,
     _migrate_pg_v26_client_type,
     _migrate_pg_v27_pg_trgm,
