@@ -318,6 +318,9 @@ class PostgresConnection:
     # ---------------------------------------------------------------- Internals
 
     async def _do_execute(self, sql: str, params: tuple = ()) -> _PgCursor:
+        # aiosqlite callers pass None to mean "no params"; normalise here.
+        if params is None:
+            params = ()
         stripped = sql.strip()
         upper = stripped.upper()
 
