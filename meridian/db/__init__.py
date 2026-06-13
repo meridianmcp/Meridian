@@ -5333,6 +5333,40 @@ async def delete_workspace_note(
     return rc > 0
 
 
+async def move_workspace_note_to_project(
+    db: aiosqlite.Connection,
+    note_id: str,
+    project_id: str,
+    tenant_id: str | None = None,
+) -> dict[str, Any] | None:
+    """Convert a workspace note into a project note on ``project_id``.
+
+    Copies title/body/tags to a new project_notes row, then deletes the
+    workspace note. Returns the new project note, or None if the workspace
+    note was not found (or belongs to another tenant). Atomic: the delete
+    only runs after the project note is created.
+    """
+    scope, scope_params = _ws_tenant_clause(tenant_id)
+    sql = "SELECT * FROM workspace_notes WHERE id = ?" + (f" AND {scope}" if scope else "")
+    async with db.execute(sql, [note_id, *scope_params]) as cur:
+        row = await cur.fetchone()
+    note = _row_to_dict(row) if row is not None else None
+    if not note:
+        return None
+    # Guard against moving to a non-existent project.
+    if await get_project(db, project_id) is None:
+        return None
+    created = await add_project_note(
+        db,
+        project_id,
+        note.get("title") or "",
+        note.get("body") or "",
+        note.get("tags"),
+    )
+    await delete_workspace_note(db, note_id, tenant_id=tenant_id)
+    return created
+
+
 async def update_workspace_note(
     db: aiosqlite.Connection,
     note_id: str,

@@ -3930,6 +3930,32 @@ async def test_delete_workspace_note_respects_tenant(db):
 
 
 @pytest.mark.asyncio
+async def test_workspace_note_move_to_project(db):
+    """v1.1 — moving a workspace note creates a project note with the same
+    title/body/tags and removes the workspace note."""
+    p = await db_module.create_project(db, "move-target")
+    note = await db_module.add_workspace_note(
+        db, "Shared convention", "Use psycopg3 %s placeholders", "setup,db"
+    )
+    moved = await db_module.move_workspace_note_to_project(db, note["id"], p["id"])
+    assert moved is not None
+    assert moved["project_id"] == p["id"]
+    assert moved["title"] == "Shared convention"
+    assert moved["body"] == "Use psycopg3 %s placeholders"
+    assert moved["tags"] == "setup,db"
+    # Workspace note is gone; project note exists.
+    assert await db_module.get_workspace_notes(db) == []
+    proj_titles = {n["title"] for n in await db_module.get_project_notes(db, p["id"])}
+    assert "Shared convention" in proj_titles
+    # Unknown note id → None, nothing created.
+    assert await db_module.move_workspace_note_to_project(db, "no-such-id", p["id"]) is None
+    # Unknown project id → None, workspace note preserved.
+    note2 = await db_module.add_workspace_note(db, "keep me", "body")
+    assert await db_module.move_workspace_note_to_project(db, note2["id"], "no-such-project") is None
+    assert {n["title"] for n in await db_module.get_workspace_notes(db)} == {"keep me"}
+
+
+@pytest.mark.asyncio
 async def test_workspace_decisions_isolated_by_tenant(db):
     """A decision pinned by tenant A must not be visible to tenant B."""
     await db_module.pin_workspace_decision(db, "A-arch", "A body", tenant_id="tenant-a")

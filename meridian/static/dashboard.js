@@ -8103,6 +8103,7 @@ async function loadSettingsTab(projectId) {
 
               <span style="display:flex;gap:4px;flex-shrink:0">
                 <button class="secondary" data-nid-edit="${escapeHtml(n.id)}" data-ntitle="${escapeHtml(n.title || '')}" data-nbody="${escapeHtml(n.body || '')}" style="font-size:9px;padding:2px 6px" title="Edit">✎</button>
+                <button class="secondary" data-nid-move="${escapeHtml(n.id)}" style="font-size:9px;padding:2px 6px" title="Move to project">↗</button>
                 <button class="secondary" data-nid="${escapeHtml(n.id)}" style="font-size:9px;padding:2px 7px">×</button>
               </span>
 
@@ -8153,6 +8154,42 @@ async function loadSettingsTab(projectId) {
               try {
                 await api(`/workspace/notes/${nid}`, { method: 'PATCH', body: JSON.stringify({ title: newTitle, body: newBody }) });
                 renderWsNotes();
+              } catch (e) { alert('Error: ' + e); }
+            };
+
+          };
+
+        });
+
+        noteList.querySelectorAll('button[data-nid-move]').forEach(btn => {
+
+          btn.onclick = () => {
+
+            const nid = btn.dataset.nidMove;
+            const row = noteList.querySelector(`[data-note-row="${nid}"]`);
+            if (!row || row.querySelector('select[data-move-select]')) return;
+            const projects = state.projects || [];
+            if (!projects.length) { alert('No projects to move to.'); return; }
+            const picker = document.createElement('span');
+            picker.style.cssText = 'display:flex;gap:4px;align-items:center;flex-shrink:0';
+            picker.innerHTML = `
+              <select data-move-select style="font-size:9px;padding:2px 4px;background:var(--surface-2);border:1px solid var(--border);color:var(--text);border-radius:3px;max-width:120px">
+                ${projects.map(p => `<option value="${escapeHtml(p.id)}">${escapeHtml(p.name || p.id)}</option>`).join('')}
+              </select>
+              <button class="primary" data-move-go style="font-size:9px;padding:2px 8px">Move</button>
+              <button class="secondary" data-move-cancel style="font-size:9px;padding:2px 6px">×</button>`;
+            const actions = btn.parentElement;
+            actions.style.display = 'none';
+            row.appendChild(picker);
+            picker.querySelector('[data-move-cancel]').onclick = () => { picker.remove(); actions.style.display = ''; };
+            picker.querySelector('[data-move-go]').onclick = async () => {
+              const targetId = picker.querySelector('[data-move-select]').value;
+              if (!targetId) return;
+              try {
+                await api(`/workspace/notes/${nid}/move`, { method: 'POST', body: JSON.stringify({ project_id: targetId }) });
+                renderWsNotes();
+                // Refresh the target project's notes tab if it happens to be open.
+                try { if (typeof loadNotesTab === 'function') await loadNotesTab(targetId); } catch (_) { /* tab not open */ }
               } catch (e) { alert('Error: ' + e); }
             };
 

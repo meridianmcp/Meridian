@@ -60,6 +60,24 @@ async def delete_workspace_note_endpoint(
     return Response(status_code=204)
 
 
+@router.post("/workspace/notes/{note_id}/move", status_code=201)
+async def move_workspace_note_endpoint(
+    note_id: str, body: dict[str, Any], request: Request
+) -> dict[str, Any]:
+    """Move a workspace note to a project (converts it to a project note and
+    removes it from the workspace). Body: {project_id}. Returns the new note."""
+    project_id = (body.get("project_id") or "").strip()
+    if not project_id:
+        raise HTTPException(status_code=400, detail="project_id required")
+    moved = await db_module.move_workspace_note_to_project(
+        await _db(request), note_id, project_id,
+        tenant_id=await _tenant_id(request),
+    )
+    if moved is None:
+        raise HTTPException(status_code=404, detail="note or project not found")
+    return moved
+
+
 # --- Workspace decisions ---------------------------------------------------
 
 @router.get("/workspace/decisions")
