@@ -6024,6 +6024,29 @@ async def revoke_registered_machine(
     return Response(status_code=204)
 
 
+# ---------------------------------------------------------------------------
+# Session queue — queue the next /goal to run back-to-back (10e6b265)
+# ---------------------------------------------------------------------------
+
+
+@app.post("/projects/{project_id}/queue-session")
+async def queue_session(project_id: str, request: Request) -> dict[str, Any]:
+    """Queue the next /goal string; it's appended to the next handoff and then
+    cleared. Empty body clears the queue."""
+    db = await _db(request)
+    body = await request.json()
+    goal = (body.get("goal") or "").strip()
+    await db_module.set_queued_session(db, project_id, goal or None)
+    return {"queued": bool(goal), "goal": goal or None}
+
+
+@app.get("/projects/{project_id}/queued-session")
+async def get_queued_session_endpoint(project_id: str, request: Request) -> dict[str, Any]:
+    """Return the currently queued next-session goal, or null."""
+    db = await _db(request)
+    return {"goal": await db_module.get_queued_session(db, project_id)}
+
+
 async def _block_non_admin_connection_writes(request: Request) -> None:
     """G1.9 — connection profiles live in the hosted server's meridian.toml.
     Non-admin tenants must not be able to mutate them. Returns 403 cleanly

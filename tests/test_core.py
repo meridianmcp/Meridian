@@ -3935,6 +3935,52 @@ def test_hooks_session_start_unknown_hostname_returns_empty_not_401(client):
     assert r.json()["hookSpecificOutput"]["additionalContext"] == ""
 
 
+# ---------------------------------------------------------------------------
+# 10e6b265 — session queue
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_queued_session_set_get_pop(db):
+    p = await db_module.create_project(db, "queue-proj")
+    assert await db_module.get_queued_session(db, p["id"]) is None
+    await db_module.set_queued_session(db, p["id"], "/goal do the thing")
+    assert await db_module.get_queued_session(db, p["id"]) == "/goal do the thing"
+    # pop is read-once
+    assert await db_module.pop_queued_session(db, p["id"]) == "/goal do the thing"
+    assert await db_module.get_queued_session(db, p["id"]) is None
+    assert await db_module.pop_queued_session(db, p["id"]) is None
+
+
+@pytest.mark.asyncio
+async def test_generate_handoff_appends_and_clears_queue(db, tmp_path):
+    from meridian import handoff as handoff_module
+    p = await db_module.create_project(db, "queue-proj2")
+    await db_module.set_queued_session(db, p["id"], "/goal next sprint")
+    _, content = await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True
+    )
+    assert "=== QUEUED NEXT SESSION ===" in content
+    assert "/goal next sprint" in content
+    # Cleared after exactly one handoff.
+    assert await db_module.get_queued_session(db, p["id"]) is None
+    _, content2 = await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True
+    )
+    assert "=== QUEUED NEXT SESSION ===" not in content2
+
+
+def test_queue_session_http_roundtrip(client):
+    pid = client.post("/projects", json={"name": "qhttp"}).json()["id"]
+    assert client.get(f"/projects/{pid}/queued-session").json()["goal"] is None
+    r = client.post(f"/projects/{pid}/queue-session", json={"goal": "/goal X"})
+    assert r.status_code == 200 and r.json()["queued"] is True
+    assert client.get(f"/projects/{pid}/queued-session").json()["goal"] == "/goal X"
+    # Empty goal clears it.
+    client.post(f"/projects/{pid}/queue-session", json={"goal": ""})
+    assert client.get(f"/projects/{pid}/queued-session").json()["goal"] is None
+
+
 def test_build_goal_xml_omits_decisions_when_empty():
     """No <decisions> tag when there's nothing to show — worker
     sessions in v1.2.0 will pass decisions=None for the same reason."""

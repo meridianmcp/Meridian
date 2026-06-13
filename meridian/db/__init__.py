@@ -667,6 +667,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_active_worktrees(db)
     await _migrate_workspace_tenant_isolation(db)
     await _migrate_registered_hostnames(db)
+    await _migrate_queued_session(db)
     return db
 
 
@@ -5576,6 +5577,50 @@ async def revoke_registered_hostname(
         rc = cur.rowcount or 0
     await db.commit()
     return rc > 0
+
+
+# ---------------------------------------------------------------------------
+# 10e6b265 — session queue (projects.queued_session)
+# ---------------------------------------------------------------------------
+
+
+async def set_queued_session(
+    db: aiosqlite.Connection, project_id: str, goal: str | None
+) -> None:
+    """Queue the next /goal string to run after this session. Empty/None clears."""
+    await db.execute(
+        "UPDATE projects SET queued_session = ? WHERE id = ?",
+        ((goal or None), project_id),
+    )
+    await db.commit()
+
+
+async def get_queued_session(
+    db: aiosqlite.Connection, project_id: str
+) -> str | None:
+    """Return the queued next-session goal, or None when nothing is queued."""
+    async with db.execute(
+        "SELECT queued_session FROM projects WHERE id = ?", (project_id,)
+    ) as cur:
+        row = await cur.fetchone()
+    if row is None:
+        return None
+    val = row["queued_session"] if isinstance(row, dict) else row[0]
+    return val or None
+
+
+async def pop_queued_session(
+    db: aiosqlite.Connection, project_id: str
+) -> str | None:
+    """Return the queued goal and clear it (read-once) so a handoff surfaces it
+    exactly once."""
+    goal = await get_queued_session(db, project_id)
+    if goal:
+        await db.execute(
+            "UPDATE projects SET queued_session = NULL WHERE id = ?", (project_id,)
+        )
+        await db.commit()
+    return goal
 
 
 # ---------------------------------------------------------------------------
