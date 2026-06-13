@@ -3,7 +3,7 @@
 
 export function isDemoMode() {
 
-  return !!state.serverConfig?.demo_mode || window.location.pathname.startsWith('/demo');
+  return !!(window.state?.serverConfig?.demo_mode) || window.location.pathname.startsWith('/demo');
 
 }
 

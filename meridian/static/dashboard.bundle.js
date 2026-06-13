@@ -55,7 +55,7 @@
 
   // meridian/static/dashboard-demo.js
   function isDemoMode2() {
-    return !!state.serverConfig?.demo_mode || window.location.pathname.startsWith("/demo");
+    return !!window.state?.serverConfig?.demo_mode || window.location.pathname.startsWith("/demo");
   }
   function isHostedMode2() {
     return !!window.MERIDIAN_HOSTED;
@@ -328,7 +328,7 @@
   function renderTimeline2(projectId, data) {
     const wrap = document.getElementById(`timeline-wrap-${projectId}`);
     if (!wrap) return;
-    const p = state.panels[projectId];
+    const p = window.state?.panels[projectId];
     const sessionFilter = p && p.timelineSessionFilter;
     const rawTasks = data && data.tasks || [];
     const tasks = sessionFilter ? rawTasks.filter((t) => t.session_id === sessionFilter) : rawTasks;
@@ -847,7 +847,7 @@
       localStorage.setItem(`meridian_heatmap_max_${projectId}`, String(scaleMax));
       chart.setOption({ visualMap: { pieces: _heatmapPieces(scaleMax) } });
     });
-    const pnl = state.panels[projectId];
+    const pnl = window.state?.panels[projectId];
     if (pnl) pnl._heatchart = chart;
     applyFilters = () => {
       ({ calendars, series, titles, totalH } = computeView());
@@ -874,7 +874,7 @@
   }
   function _renderTimelineGantt(projectId, data, paneEl) {
     if (!paneEl) return;
-    const p = state.panels[projectId];
+    const p = window.state?.panels[projectId];
     const { tasks = [], goal_events = [] } = data || {};
     const parseTs = (ts) => {
       if (!ts) return null;
@@ -1147,7 +1147,7 @@
       const daysLeft = me.days_remaining != null ? me.days_remaining : 30;
       const elapsed = Math.max(0, 30 - daysLeft);
       const bannerBg = elapsed >= 28 ? "#dc2626" : elapsed >= 25 ? "#d97706" : "#ca8a04";
-      const upgradeUrl = state.serverConfig?.stripe_payment_link || "/pricing";
+      const upgradeUrl = window.state?.serverConfig?.stripe_payment_link || "/pricing";
       const daysStr = me.days_remaining != null ? `${me.days_remaining} day${me.days_remaining !== 1 ? "s" : ""}` : "limited time";
       const b = document.createElement("div");
       b.id = "trial-banner";
