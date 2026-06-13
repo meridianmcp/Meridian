@@ -142,6 +142,17 @@ model: claude-sonnet-4-6
 **Option C — Codex sandboxed environments:**
 Codex runs tasks in parallel sandboxed environments by default when you use the web UI. For CLI, run each session in a separate directory/branch.
 
+**Git hygiene for parallel executors (critical):**
+- Launch Claude Code with `--worktree {session_name}` so each session works in its own
+  `.claude/worktrees/{session_id}` checkout (git-ignored). Never run two executors against
+  one shared working tree.
+- NEVER `git add -A` / `git add .` / `git commit -a` — a repo-wide add sweeps up another
+  session's uncommitted work and commits it under your message (and can drop it on the next
+  cleanup commit). Stage only the specific files you changed, by path:
+  `git add path/to/file_a path/to/file_b`.
+- If you're in the main checkout (no worktree) alongside another live session, serialize:
+  commit only your files before continuing, and never `reset`/`checkout` files you didn't write.
+
 ---
 
 ## Auto-checkpoint with hooks
