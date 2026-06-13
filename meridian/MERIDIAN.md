@@ -19,6 +19,10 @@ for "what has been decided, claimed, and shipped."
   sessions are active. **`release_file(session_id, file_path)`** when done.
   Use **`idle_until_session_done(watching_session_id)`** to wait before taking
   over a file another session holds. Locks auto-expire after 2 hours.
+- **After completing each sprint item**, call `get_sprint_items(status='pending')`
+  to check for newly added items before moving to the next one. Sessions that only
+  check pending items once at start miss anything added while running — re-checking
+  at each item boundary picks up mid-run additions automatically.
 
 ## ON SESSION START
 

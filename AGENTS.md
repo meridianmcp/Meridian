@@ -46,6 +46,7 @@ ALWAYS during work:
 - Call `log_task(session_id, project_id, description)` after completing meaningful work.
 - Call `pin_decision(project_id, title, body, category)` for architectural choices.
 - Call `request_hitl(project_id, question)` when you need a human decision.
+- After completing each sprint item, call `get_sprint_items(status='pending')` to check for newly added items before moving to the next one. New items added mid-run get picked up at the next item boundary.
 
 ALWAYS before ending:
 - Call `checkpoint(session_id, project_id)` — snapshots progress, generates delta handoff.
