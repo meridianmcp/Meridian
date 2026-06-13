@@ -2878,6 +2878,12 @@ async def get_goal_history(
     return await db_module.get_goal_history(await _db(request), project_id)
 
 
+@app.get("/projects/{project_id}/worktrees")
+async def get_project_worktrees(project_id: str, request: Request) -> list:
+    """Return active worktrees for a project. Stub — returns empty list until worktree tracking is implemented."""
+    return []
+
+
 @app.get("/projects/{project_id}/stats")
 async def get_project_stats(
     project_id: str, request: Request, days: int = 30
@@ -8125,6 +8131,16 @@ async def _dispatch_mcp_tool(
             failure_mode=args.get("failure_mode"),
             milestone_type=args.get("milestone_type", "task"),
         )
+    if name == "update_sprint_item":
+        item = await db_module.patch_sprint_item(
+            db, args["project_id"], args["item_id"],
+            title=args.get("title"),
+            version=args.get("version"),
+            notes=args.get("notes"),
+            human_id=args.get("human_id"),
+            item_group=args.get("group"),
+        )
+        return item or {"error": "sprint item not found"}
     if name == "set_sprint":
         result = await db_module.set_sprint(db, args["project_id"], args["sprint"])
         await goal_md_module.sync_db_to_goal_md(db, args["project_id"])
@@ -10216,6 +10232,41 @@ def build_mcp_server():
                 },
             ),
             Tool(
+                name="update_sprint_item",
+                description=(
+                    "Edit fields on an existing sprint item: title, version, "
+                    "notes, human_id (assignee), or group. Only the fields you "
+                    "pass are changed; omitted fields are left untouched. Pass "
+                    "an empty string for human_id or group to clear it. Returns "
+                    "the updated item, or an error if the id is unknown."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "project_id": {"type": "string"},
+                        "item_id": {"type": "string"},
+                        "title": {"type": "string", "description": "New title."},
+                        "version": {
+                            "type": "string",
+                            "description": "Move the item to a different version/sprint bucket.",
+                        },
+                        "notes": {
+                            "type": "string",
+                            "description": "Free-form note/context shown on the item.",
+                        },
+                        "human_id": {
+                            "type": "string",
+                            "description": "Reassign to a person (assignee); empty string clears it.",
+                        },
+                        "group": {
+                            "type": "string",
+                            "description": "Objective name to group the item under (item_group); empty string clears it.",
+                        },
+                    },
+                    "required": ["project_id", "item_id"],
+                },
+            ),
+            Tool(
                 name="complete_sprint_item",
                 description=(
                     "Mark a sprint item done. Pass task_id to link the "
@@ -10742,6 +10793,18 @@ def build_mcp_server():
                     failure_mode=arguments.get("failure_mode"),
                     milestone_type=arguments.get("milestone_type", "task"),
                 )
+            elif name == "update_sprint_item":
+                item = await db_module.patch_sprint_item(
+                    db,
+                    arguments["project_id"],
+                    arguments["item_id"],
+                    title=arguments.get("title"),
+                    version=arguments.get("version"),
+                    notes=arguments.get("notes"),
+                    human_id=arguments.get("human_id"),
+                    item_group=arguments.get("group"),
+                )
+                result = item or {"error": "sprint item not found"}
             elif name == "complete_sprint_item":
                 item = await db_module.complete_sprint_item(
                     db,

@@ -203,10 +203,14 @@ async def patch_sprint_item_endpoint(
         except (ValueError, TypeError):
             raise HTTPException(status_code=422, detail="feedback_thumb must be -1 or 1")
     feedback_note = body.get("feedback_note")
+    notes = body.get("notes")
+    human_id = body.get("human_id")
+    item_group = body.get("group", body.get("item_group"))
     item = await db_module.patch_sprint_item(
         await _db(request), project_id, item_id, title=title, version=version,
         status=status,
         feedback_thumb=feedback_thumb, feedback_note=feedback_note,
+        notes=notes, human_id=human_id, item_group=item_group,
     )
     if item is None:
         raise HTTPException(status_code=404, detail="sprint item not found")

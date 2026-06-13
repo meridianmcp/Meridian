@@ -2658,8 +2658,16 @@ async def patch_sprint_item(
     status: str | None = None,
     feedback_thumb: int | None = None,
     feedback_note: str | None = None,
+    notes: str | None = None,
+    human_id: str | None = None,
+    item_group: str | None = None,
 ) -> dict[str, Any] | None:
-    """Update editable fields (title, version, status, feedback) of a sprint item."""
+    """Update editable fields of a sprint item.
+
+    Editable: title, version, status, feedback, notes, human_id (assignee),
+    item_group. Only fields passed as non-None are changed; omitted fields are
+    left untouched. To clear human_id or item_group, pass an empty string.
+    """
     fields: list[str] = []
     values: list[Any] = []
     if title is not None:
@@ -2679,6 +2687,15 @@ async def patch_sprint_item(
     if feedback_note is not None:
         fields.append("feedback_note = ?")
         values.append(feedback_note)
+    if notes is not None:
+        fields.append("notes = ?")
+        values.append(notes)
+    if human_id is not None:
+        fields.append("human_id = ?")
+        values.append(human_id or None)
+    if item_group is not None:
+        fields.append("item_group = ?")
+        values.append(item_group or None)
     if not fields:
         return await get_sprint_item(db, item_id)
     values.extend([item_id, project_id])

@@ -36,6 +36,7 @@ _TOOL_EXAMPLES: dict[str, str] = {
     "get_workspace_settings": 'get_workspace_settings()',
     "update_workspace_settings": 'update_workspace_settings(hitl_auto_answer_default=True, sprint_name_default="june-sprint")',
     "add_sprint_item": 'add_sprint_item(project_id="abc-123", title="Add OAuth login", item_group="auth")',
+    "update_sprint_item": 'update_sprint_item(project_id="abc-123", item_id="item-uuid", title="Add OAuth + SAML login", group="auth", human_id="alice")',
     "get_sprint_items": 'get_sprint_items(project_id="abc-123")',
     "complete_sprint_item": 'complete_sprint_item(item_id="item-uuid")',
     "claim_sprint_item": 'claim_sprint_item(project_id="abc-123", item_id="item-uuid")',
@@ -340,6 +341,20 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "milestone_type": {"type": "string", "enum": ["task", "milestone", "human"],
                             "description": "'milestone' renders as a timeline marker; 'human' marks a task for a human (hidden from executor sessions)."}},
          "required": ["project_id", "version", "title"]}},
+    {"name": "update_sprint_item", "description":
+        "Edit fields on an existing sprint item: title, version, notes, human_id (assignee), "
+        "or group. Only the fields you pass are changed; omitted fields are left untouched. "
+        "Pass an empty string for human_id or group to clear it. Returns the updated item, "
+        "or an error if the id is unknown.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"},
+         "item_id": {"type": "string"},
+         "title": {"type": "string", "description": "New title."},
+         "version": {"type": "string", "description": "Move the item to a different version/sprint bucket."},
+         "notes": {"type": "string", "description": "Free-form note/context shown on the item."},
+         "human_id": {"type": "string", "description": "Reassign to a person (assignee); empty string clears it."},
+         "group": {"type": "string", "description": "Objective name to group the item under (item_group); empty string clears it."}},
+         "required": ["project_id", "item_id"]}},
     {"name": "complete_sprint_item", "description":
         "Mark a sprint item done. Pass task_id to link the task that shipped it.",
      "inputSchema": {"type": "object", "properties": {
