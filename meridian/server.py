@@ -5652,6 +5652,28 @@ async def _get_authenticated_tenant(request: Request) -> dict[str, Any]:
     return tenant
 
 
+def _watcher_script_path(filename: str) -> Path:
+    return Path(__file__).parent.parent / "scripts" / filename
+
+
+@app.get("/install_watcher.ps1")
+async def get_install_watcher_ps1() -> PlainTextResponse:
+    """a7c43cc1 — serve the claude --rc FileSystemWatcher installer for Windows."""
+    script_path = _watcher_script_path("install_watcher.ps1")
+    if not script_path.exists():
+        raise HTTPException(status_code=404, detail="install_watcher.ps1 not found")
+    return PlainTextResponse(script_path.read_text(encoding="utf-8"))
+
+
+@app.get("/install_watcher.sh")
+async def get_install_watcher_sh() -> PlainTextResponse:
+    """a7c43cc1 — serve the claude --rc FSEvents/inotify installer for macOS/Linux."""
+    script_path = _watcher_script_path("install_watcher.sh")
+    if not script_path.exists():
+        raise HTTPException(status_code=404, detail="install_watcher.sh not found")
+    return PlainTextResponse(script_path.read_text(encoding="utf-8"))
+
+
 @app.get("/hooks.ps1")
 async def get_hooks_ps1() -> PlainTextResponse:
     script_path = _hook_script_path("hooks.ps1")
@@ -6447,6 +6469,26 @@ async def billing_portal_redirect(request: Request):
         return RedirectResponse("/pricing", status_code=302)
 
     return RedirectResponse(url, status_code=302)
+
+
+@app.post("/billing/portal")
+async def billing_portal_json(request: Request) -> dict[str, str]:
+    """Return Stripe billing portal URL as JSON for dashboard AJAX calls (e7d4400b)."""
+    from .hosted import create_stripe_billing_portal_session, get_current_tenant  # noqa: PLC0415
+
+    try:
+        tenant = await get_current_tenant(request)
+    except HTTPException:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    if not tenant.get("stripe_customer_id"):
+        raise HTTPException(status_code=404, detail="No billing account")
+    try:
+        url = await create_stripe_billing_portal_session(tenant)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    return {"url": url}
 
 
 @app.get("/checkout")
