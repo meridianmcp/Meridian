@@ -4014,6 +4014,41 @@ def test_status_sessions_and_hooks_shields(client):
         assert j["message"]
 
 
+# ---------------------------------------------------------------------------
+# STEP 5 — server-side sprint-item pagination
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_get_sprint_items_page_sql_pagination(db):
+    p = await db_module.create_project(db, "page-proj")
+    for i in range(7):
+        await db_module.add_sprint_item(db, p["id"], "v1", f"item-{i}")
+    items, total = await db_module.get_sprint_items_page(
+        db, p["id"], status="pending", limit=5, offset=0
+    )
+    assert total == 7 and len(items) == 5
+    items2, total2 = await db_module.get_sprint_items_page(
+        db, p["id"], status="pending", limit=5, offset=5
+    )
+    assert total2 == 7 and len(items2) == 2
+    # No overlap between pages.
+    assert {i["id"] for i in items}.isdisjoint({i["id"] for i in items2})
+
+
+def test_sprint_items_paginated_endpoint(client):
+    pid = client.post("/projects", json={"name": "pgproj"}).json()["id"]
+    for i in range(3):
+        client.post(f"/projects/{pid}/sprint-items", json={"title": f"t{i}", "version": "v1"})
+    j = client.get(f"/projects/{pid}/sprint-items?status=pending&page=1&limit=2").json()
+    assert j["total"] == 3 and j["page"] == 1 and j["pages"] == 2 and len(j["items"]) == 2
+    j2 = client.get(f"/projects/{pid}/sprint-items?status=pending&page=2&limit=2").json()
+    assert len(j2["items"]) == 1
+    # Without page= the legacy list shape is preserved.
+    legacy = client.get(f"/projects/{pid}/sprint-items?status=pending").json()
+    assert isinstance(legacy, list) and len(legacy) == 3
+
+
 def test_build_goal_xml_omits_decisions_when_empty():
     """No <decisions> tag when there's nothing to show — worker
     sessions in v1.2.0 will pass decisions=None for the same reason."""

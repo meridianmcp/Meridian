@@ -2797,6 +2797,47 @@ async def merge_sprint_items(
     return survivor
 
 
+async def get_sprint_items_page(
+    db: aiosqlite.Connection,
+    project_id: str,
+    status: str | None = None,
+    limit: int = 50,
+    offset: int = 0,
+) -> tuple[list[dict[str, Any]], int]:
+    """Return one SQL LIMIT/OFFSET page of sprint items plus the total count.
+
+    True server-side pagination for large completed lists (hundreds of rows) so
+    the dashboard's Completed tab doesn't fetch everything at once. Mirrors
+    get_sprint_items ordering. Does not do dependency (show_blocked) filtering —
+    it's for flat status-filtered lists like status='done'.
+    """
+    where = "project_id = ?"
+    params_list: list = [project_id]
+    if status is not None:
+        if status not in _VALID_SPRINT_STATUSES:
+            raise ValueError(
+                f"invalid sprint-item status filter: {status!r}. "
+                f"Valid: {sorted(_VALID_SPRINT_STATUSES)}"
+            )
+        where += " AND status = ?"
+        params_list.append(status)
+    async with db.execute(
+        f"SELECT COUNT(*) AS c FROM sprint_items WHERE {where}", tuple(params_list)
+    ) as cur:
+        crow = await cur.fetchone()
+    total = int(crow["c"] if isinstance(crow, dict) else crow[0]) if crow else 0
+    limit = max(1, min(int(limit), 500))
+    offset = max(0, int(offset))
+    async with db.execute(
+        f"SELECT * FROM sprint_items WHERE {where} "
+        "ORDER BY added_at ASC, rowid ASC LIMIT ? OFFSET ?",
+        (*params_list, limit, offset),
+    ) as cur:
+        rows = await cur.fetchall()
+    items = [_row_to_dict(r) for r in rows]  # type: ignore[misc]
+    return items, total
+
+
 async def get_sprint_items(
     db: aiosqlite.Connection,
     project_id: str,
