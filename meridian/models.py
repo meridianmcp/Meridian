@@ -317,3 +317,12 @@ class StartSessionRequest(BaseModel):
     )
 
 
+class WorktreeCreate(BaseModel):
+    """Body for POST /projects/{id}/worktrees."""
+
+    session_id: str = Field(..., description="Session that owns this worktree.")
+    branch: str = Field(..., min_length=1, description="Git branch name, e.g. worktree/abc12345.")
+    path: str = Field(..., min_length=1, description="Filesystem path of the worktree.")
+    item_id: str | None = Field(default=None, description="Sprint item this worktree was created for.")
+
+

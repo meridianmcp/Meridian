@@ -467,6 +467,21 @@ CREATE INDEX IF NOT EXISTS idx_file_locks_session
 CREATE INDEX IF NOT EXISTS idx_file_locks_expires
     ON file_locks(expires_at);
 
+CREATE TABLE IF NOT EXISTS active_worktrees (
+    id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL REFERENCES sessions(id),
+    project_id TEXT NOT NULL REFERENCES projects(id),
+    item_id TEXT,
+    branch TEXT NOT NULL,
+    path TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    removed_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_active_worktrees_session
+    ON active_worktrees(session_id);
+CREATE INDEX IF NOT EXISTS idx_active_worktrees_project
+    ON active_worktrees(project_id, removed_at);
+
 -- v3.1 — workspace layer: tenant-global notes + decisions that live above
 -- individual projects. Unlike project_notes / decisions_pinned (keyed by
 -- project_id), these belong to the workspace as a whole (one workspace per
@@ -649,6 +664,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_device_codes_table(db)
     await _migrate_github_to_projects(db)
     await _migrate_touches_files(db)
+    await _migrate_active_worktrees(db)
     return db
 
 
@@ -4409,6 +4425,65 @@ async def get_file_conflict_warnings(
     except Exception:  # noqa: BLE001
         pass
     return warnings
+
+
+# ---------------------------------------------------------------------------
+# Active worktrees — per-session git worktree tracking
+# ---------------------------------------------------------------------------
+
+
+async def register_worktree(
+    db: aiosqlite.Connection,
+    session_id: str,
+    project_id: str,
+    branch: str,
+    path: str,
+    item_id: str | None = None,
+) -> dict[str, Any]:
+    """Register a new active git worktree. Returns the inserted row."""
+    wid = _new_id()
+    await db.execute(
+        "INSERT INTO active_worktrees (id, session_id, project_id, item_id, branch, path) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (wid, session_id, project_id, item_id, branch, path),
+    )
+    await db.commit()
+    async with db.execute(
+        "SELECT * FROM active_worktrees WHERE id = ?", (wid,)
+    ) as cur:
+        row = await cur.fetchone()
+    return _row_to_dict(row)  # type: ignore[return-value]
+
+
+async def remove_worktree(
+    db: aiosqlite.Connection,
+    worktree_id: str,
+) -> bool:
+    """Mark a worktree as removed. Returns True when a row was updated."""
+    cursor = await db.execute(
+        "UPDATE active_worktrees SET removed_at = datetime('now') "
+        "WHERE id = ? AND removed_at IS NULL",
+        (worktree_id,),
+    )
+    await db.commit()
+    return (cursor.rowcount or 0) > 0
+
+
+async def list_active_worktrees(
+    db: aiosqlite.Connection,
+    project_id: str,
+) -> list[dict[str, Any]]:
+    """Return active (not removed) worktrees for a project, newest first."""
+    async with db.execute(
+        "SELECT aw.*, s.name AS session_name "
+        "FROM active_worktrees aw "
+        "LEFT JOIN sessions s ON s.id = aw.session_id "
+        "WHERE aw.project_id = ? AND aw.removed_at IS NULL "
+        "ORDER BY aw.created_at DESC",
+        (project_id,),
+    ) as cur:
+        rows = await cur.fetchall()
+    return [_row_to_dict(r) for r in rows if r is not None]  # type: ignore[misc]
 
 
 # ---------------------------------------------------------------------------
