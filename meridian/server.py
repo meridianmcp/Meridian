@@ -8472,14 +8472,6 @@ async def _oauth_auth(request: Request):
     except Exception:
         pass
     qs = _ue({"code": code, "state": p.get("state", "")})
-    # For localhost redirect URIs (remote Claude Code sessions), route through
-    # the hosted device-callback page so the browser can show the auth code
-    # rather than hitting a localhost URL that fails to load.
-    if _redirect_uri.startswith("http://localhost") and _hosted_mode():
-        from urllib.parse import quote as _qenc
-        _dc_qs = _ue({"code": code, "state": p.get("state", ""), "to": _redirect_uri})
-        _base = str(request.base_url).rstrip("/")
-        return _RR(f"{_base}/oauth/device-callback?{_dc_qs}")
     return _RR(f"{_redirect_uri}?{qs}")
 
 
