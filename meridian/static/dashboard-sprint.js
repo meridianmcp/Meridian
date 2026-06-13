@@ -3,11 +3,11 @@
 
 function _renderPlanBadge(me) {
 
-  const planColors = { free: '#6b7280', trial: '#059669', standard: '#2563eb', pro: '#7c3aed' };
+  const planColors = { free: '#3b82f6', trial: '#059669', standard: '#3b82f6', pro: '#7c3aed', admin: '#9ca3af' };
 
   const planLabels = _PLAN_LABELS;
 
-  const plan = me.is_admin ? 'admin' : (me.plan || 'free');
+  const plan = (me.is_internal || me.is_admin) ? 'admin' : (me.plan || 'free');
 
   // Plan badge near version string
 
@@ -19,11 +19,17 @@ function _renderPlanBadge(me) {
 
     badge.id = 'plan-badge';
 
+    const badgeColor = planColors[plan] || '#9ca3af';
+
+    const badgeLabel = plan === 'free' && me.days_remaining != null
+      ? `Free · ${me.days_remaining}d left`
+      : (planLabels[plan] || plan);
+
     badge.title = `${planLabels[plan] || plan} plan`;
 
-    badge.style = `margin-left:6px;padding:2px 7px;border-radius:10px;font-size:10px;font-weight:700;letter-spacing:0.04em;background:${planColors[plan] || '#6b7280'}22;color:${planColors[plan] || '#6b7280'};border:1px solid ${planColors[plan] || '#6b7280'}44;vertical-align:middle;text-transform:uppercase`;
+    badge.style = `margin-left:6px;padding:2px 7px;border-radius:10px;font-size:10px;font-weight:700;letter-spacing:0.04em;background:${badgeColor}22;color:${badgeColor};border:1px solid ${badgeColor}44;vertical-align:middle`;
 
-    badge.textContent = planLabels[plan] || plan;
+    badge.textContent = badgeLabel;
 
     verEl.parentNode.insertBefore(badge, verEl.nextSibling);
 
@@ -67,49 +73,30 @@ function _renderPlanBadge(me) {
 
   }
 
-  // Persistent upgrade nudge for free-tier users (shown regardless of days left).
+  // B — Single dismissable trial banner for free-tier users (893e2a1f)
+  // Color changes based on days elapsed in the 30-day trial.
 
-  if (plan === 'free' && !noUpgrade && !me.expired && !isDemoMode() && !document.getElementById('upgrade-banner')) {
+  if (plan === 'free' && !me.is_internal && !me.expired && !isDemoMode()
+      && !document.getElementById('trial-banner')
+      && !sessionStorage.getItem('trial-banner-dismissed')) {
+
+    const daysLeft = me.days_remaining != null ? me.days_remaining : 30;
+
+    const elapsed = Math.max(0, 30 - daysLeft);
+
+    const bannerBg = elapsed >= 28 ? '#dc2626' : elapsed >= 25 ? '#d97706' : '#ca8a04';
 
     const upgradeUrl = state.serverConfig?.stripe_payment_link || '/pricing';
 
-    const b = document.createElement('div');
-
-    b.id = 'upgrade-banner';
-
-    b.style = 'position:fixed;top:0;left:0;right:0;z-index:9996;background:#2563eb;color:#fff;text-align:center;padding:5px 12px;font-size:12px;font-family:inherit;letter-spacing:0.02em;display:flex;align-items:center;justify-content:center;gap:10px';
-
-    b.innerHTML = `<span>Upgrade to Standard — 4× faster, dedicated DB</span><a href="${escapeHtml(upgradeUrl)}" style="background:#fff;color:#2563eb;font-weight:700;text-decoration:none;padding:2px 10px;border-radius:4px;white-space:nowrap">$20/mo →</a><button onclick="sessionStorage.setItem('upgrade-banner-dismissed','1');this.closest('#upgrade-banner').remove();document.body.style.paddingTop=Math.max(0,parseInt(document.body.style.paddingTop||'0',10)-28)+'px'" style="background:none;border:none;color:rgba(255,255,255,0.7);font-size:16px;cursor:pointer;padding:0 0 0 6px;line-height:1" title="Dismiss">×</button>`;
-
-    if (!sessionStorage.getItem('upgrade-banner-dismissed')) {
-
-      document.body.prepend(b);
-
-      document.body.style.paddingTop = ((parseInt(document.body.style.paddingTop || '0', 10)) + 28) + 'px';
-
-    }
-
-  }
-
-  // Free trial days remaining banner for free-tier users
-
-  const days = me.days_remaining;
-
-  const isFreeOrTrial = (plan === 'free' || plan === 'trial');
-
-  if (isFreeOrTrial && days !== null && days !== undefined && days > 0 && !document.getElementById('trial-banner')) {
+    const daysStr = me.days_remaining != null ? `${me.days_remaining} day${me.days_remaining !== 1 ? 's' : ''}` : 'limited time';
 
     const b = document.createElement('div');
 
     b.id = 'trial-banner';
 
-    const label = _PLAN_LABELS[plan] || plan;
+    b.style = `position:fixed;top:0;left:0;right:0;z-index:9997;background:${bannerBg};color:#fff;text-align:center;padding:5px 12px;font-size:12px;font-family:inherit;letter-spacing:0.02em;display:flex;align-items:center;justify-content:center;gap:10px`;
 
-    const daysLeft = Math.max(0, days);
-
-    b.style = `position:fixed;top:0;left:0;right:0;z-index:9997;background:linear-gradient(90deg,#059669,#059669);color:#fff;text-align:center;padding:5px 12px;font-size:12px;font-family:inherit;letter-spacing:0.02em`;
-
-    b.innerHTML = `${label}: <strong>${daysLeft} day${daysLeft !== 1 ? 's' : ''}</strong> remaining. <a href="/pricing" style="color:#fff;text-decoration:underline;font-weight:600">4× faster with Standard →</a>`;
+    b.innerHTML = `<span>Free trial · <strong>${daysStr} remaining</strong></span><a href="${escapeHtml(upgradeUrl)}" style="color:#fff;text-decoration:underline;font-weight:600;white-space:nowrap">Upgrade to Standard →</a><button onclick="sessionStorage.setItem('trial-banner-dismissed','1');this.closest('#trial-banner').remove();document.body.style.paddingTop=Math.max(0,parseInt(document.body.style.paddingTop||'0',10)-28)+'px'" style="background:none;border:none;color:rgba(255,255,255,0.7);font-size:16px;cursor:pointer;padding:0 0 0 6px;line-height:1" title="Dismiss for this session">×</button>`;
 
     document.body.prepend(b);
 
@@ -117,29 +104,35 @@ function _renderPlanBadge(me) {
 
   }
 
-  // Expiry warning banner at ≤25 days remaining
+  // C — Update hosted-label to "Hosted (shared pool)" + upgrade link for free tier (0f9ce3fb)
 
-  const isExpiring = isFreeOrTrial && days !== null && days !== undefined && days <= 25;
+  if (isHostedMode() && !isHostedAdmin()) {
 
-  if (isExpiring && !document.getElementById('expiry-banner')) {
+    const hostedLabel = document.querySelector('.hosted-label');
 
-    const b = document.createElement('div');
+    if (hostedLabel && !hostedLabel.dataset.planUpdated) {
 
-    b.id = 'expiry-banner';
+      hostedLabel.dataset.planUpdated = '1';
 
-    const urgent = days <= 5;
+      hostedLabel.textContent = 'Hosted (shared pool)';
 
-    const label = _PLAN_LABELS[plan] || plan;
+      if (plan === 'free' && !me.is_internal && !document.getElementById('db-upgrade-link')) {
 
-    const upgradeMsg = plan === 'trial' ? 'Add a card to keep your data →' : 'Upgrade →';
+        const upgradeLink = document.createElement('a');
 
-    b.style = `position:fixed;top:0;left:0;right:0;z-index:9998;background:${urgent ? '#dc2626' : '#d97706'};color:#fff;text-align:center;padding:5px 12px;font-size:12px;font-family:inherit;letter-spacing:0.02em`;
+        upgradeLink.id = 'db-upgrade-link';
 
-    b.innerHTML = `${label} expires in <strong>${days} day${days !== 1 ? 's' : ''}</strong>. <a href="/pricing" style="color:#fff;text-decoration:underline">${upgradeMsg}</a>`;
+        upgradeLink.href = '/pricing';
 
-    document.body.prepend(b);
+        upgradeLink.textContent = 'Upgrade for dedicated DB →';
 
-    document.body.style.paddingTop = ((parseInt(document.body.style.paddingTop || '0', 10)) + 28) + 'px';
+        upgradeLink.style.cssText = 'display:block;margin-top:3px;font-size:9px;color:var(--accent);text-decoration:none;opacity:.85;font-family:var(--font-mono);letter-spacing:.02em';
+
+        hostedLabel.insertAdjacentElement('afterend', upgradeLink);
+
+      }
+
+    }
 
   }
 
