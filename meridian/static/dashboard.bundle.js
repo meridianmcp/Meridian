@@ -4,8 +4,8 @@
   var QUEUE_DONE_PAGE_SIZE2 = 10;
   var SESSION_LIVE_WINDOW_MS = 10 * 60 * 1e3;
   function getPanelState2(projectId) {
-    state.panels[projectId] = state.panels[projectId] || {};
-    return state.panels[projectId];
+    window.state.panels[projectId] = window.state.panels[projectId] || {};
+    return window.state.panels[projectId];
   }
   function toast2(msg, isError = false) {
     const el = document.getElementById("toast");
@@ -1614,7 +1614,7 @@
   // meridian/static/dashboard.js
   var TABS_KEY = "meridian.openTabs";
   var ACTIVE_PROJECT_KEY = "meridian.activeProject";
-  var state2 = {
+  var state = {
     projects: [],
     tabs: [],
     // [{id, project}]
@@ -1627,6 +1627,7 @@
     // workspace switcher — tenant_id of the currently active workspace (null = own)
     activeWorkspaceTenantId: null
   };
+  window.state = state;
   function hideHostedAdminControls() {
     const toHide = [
       "#restart-server-btn",
@@ -1720,15 +1721,15 @@
       const opt = document.createElement("option");
       opt.value = ws.tenant_id;
       opt.textContent = ws.is_own ? "My workspace" : ws.owner_email;
-      if (!state2.activeWorkspaceTenantId && ws.is_own) opt.selected = true;
-      if (state2.activeWorkspaceTenantId === ws.tenant_id) opt.selected = true;
+      if (!state.activeWorkspaceTenantId && ws.is_own) opt.selected = true;
+      if (state.activeWorkspaceTenantId === ws.tenant_id) opt.selected = true;
       sel.appendChild(opt);
     });
     sel.onchange = async () => {
       const chosen = sel.value;
       const own = workspaces.find((w) => w.is_own);
-      state2.activeWorkspaceTenantId = own && chosen === own.tenant_id ? null : chosen;
-      [...state2.tabs].forEach((t) => {
+      state.activeWorkspaceTenantId = own && chosen === own.tenant_id ? null : chosen;
+      [...state.tabs].forEach((t) => {
         try {
           closeTab(t.id);
         } catch (_) {
@@ -1975,7 +1976,7 @@
   }
   function syncSidebarActiveProject() {
     document.querySelectorAll(".project-item").forEach((item) => {
-      item.classList.toggle("active", item.dataset.projectId === state2.activeTab);
+      item.classList.toggle("active", item.dataset.projectId === state.activeTab);
     });
   }
   function autosizeGoalField(el, minPx = NORTH_STAR_MIN_HEIGHT_PX) {
@@ -2123,7 +2124,7 @@
     document.getElementById("demo-tour-highlight")?.remove();
   }
   function _tourActivateVtab(vtab, gtab) {
-    const pid = state2.activeTab;
+    const pid = state.activeTab;
     if (!pid || !vtab) return;
     const btn = document.querySelector(`#vtab-strip-${pid} .vtab-btn[data-vtab="${vtab}"]`);
     if (btn) btn.click();
@@ -2150,7 +2151,7 @@
     if (s.target) {
       targetEl = s.target();
     } else if (s.vtab) {
-      const pid = state2.activeTab;
+      const pid = state.activeTab;
       targetEl = pid ? document.querySelector(`#vtab-strip-${pid} .vtab-btn[data-vtab="${s.vtab}"]`) : null;
     }
     if (targetEl) {
@@ -2234,8 +2235,8 @@
   }
   async function api2(path, opts = {}) {
     const headers = { "Content-Type": "application/json" };
-    if (state2.activeWorkspaceTenantId) {
-      headers["X-Workspace-Tenant-Id"] = state2.activeWorkspaceTenantId;
+    if (state.activeWorkspaceTenantId) {
+      headers["X-Workspace-Tenant-Id"] = state.activeWorkspaceTenantId;
     }
     const r = await fetch(path, { headers, ...opts });
     if (!r.ok) {
@@ -2259,7 +2260,7 @@
       clearProjectLoadError(projectId, path);
       return data;
     } catch (e) {
-      if (e && e.status === 404 && /project not found/i.test(e.responseText || "") && !(state2.projects || []).some((p) => p.id === projectId) && !_staleProjectsHandled.has(projectId)) {
+      if (e && e.status === 404 && /project not found/i.test(e.responseText || "") && !(state.projects || []).some((p) => p.id === projectId) && !_staleProjectsHandled.has(projectId)) {
         _staleProjectsHandled.add(projectId);
         try {
           closeTab(projectId);
@@ -2278,7 +2279,7 @@
   async function loadServerConfig() {
     try {
       const cfg = await api2("/config");
-      state2.serverConfig = cfg || state2.serverConfig;
+      state.serverConfig = cfg || state.serverConfig;
       const verEl = document.getElementById("server-version");
       if (verEl && cfg?.version) verEl.textContent = `v${cfg.version}`;
       if (cfg?.demo_mode && !document.getElementById("demo-mode-banner")) {
@@ -2311,13 +2312,13 @@
     try {
       const me = await api2("/me");
       if (me && me.plan) {
-        state2.tenantPlan = me.plan;
-        state2.tenantEmail = me.email || "";
-        state2.tenantHasStripe = !!me.has_stripe_customer;
-        state2.tenantIsInternal = !!me.is_internal;
-        state2.tenantDaysRemaining = me.days_remaining;
-        state2.tenantExpired = !!me.expired;
-        state2.tenantExpiresAt = me.inactivity_expires_at || null;
+        state.tenantPlan = me.plan;
+        state.tenantEmail = me.email || "";
+        state.tenantHasStripe = !!me.has_stripe_customer;
+        state.tenantIsInternal = !!me.is_internal;
+        state.tenantDaysRemaining = me.days_remaining;
+        state.tenantExpired = !!me.expired;
+        state.tenantExpiresAt = me.inactivity_expires_at || null;
         _renderPlanBadge(me);
         updateGitHubConnectionIndicator(me);
         _armAccountSwitchWatch(me.email || "");
@@ -2327,9 +2328,9 @@
   }
   function _armAccountSwitchWatch(loadedEmail) {
     if (!isHostedMode()) return;
-    if (state2._acctWatchArmed) return;
-    state2._acctWatchArmed = true;
-    state2.loadedAccountEmail = loadedEmail || "";
+    if (state._acctWatchArmed) return;
+    state._acctWatchArmed = true;
+    state.loadedAccountEmail = loadedEmail || "";
     document.addEventListener("visibilitychange", () => {
       if (document.visibilityState === "visible") {
         _checkAccountSwitch();
@@ -2343,7 +2344,7 @@
       await loadProjects();
     } catch (_) {
     }
-    const pid = state2.activeTab;
+    const pid = state.activeTab;
     if (!pid) return;
     try {
       await Promise.allSettled([
@@ -2366,7 +2367,7 @@
       return;
     }
     const now = me && me.email || "";
-    const base = state2.loadedAccountEmail || "";
+    const base = state.loadedAccountEmail || "";
     if (now && base && now !== base) _showAccountSwitchBanner(now);
   }
   function _showAccountSwitchBanner(newEmail) {
@@ -2655,7 +2656,7 @@
   async function loadConfig() {
     try {
       const cfg = await api2("/config/api-key");
-      state2.apiKeyConfigured = !!cfg.configured;
+      state.apiKeyConfigured = !!cfg.configured;
       const hintEl = document.getElementById("mcp-hint");
       if (hintEl) hintEl.style.display = cfg.configured ? "none" : "block";
       const methodEl = document.getElementById("auth-method");
@@ -2674,18 +2675,18 @@
   async function loadProjects() {
     const list = document.getElementById("project-list");
     try {
-      state2.projects = await api2("/projects");
+      state.projects = await api2("/projects");
     } catch (e) {
-      state2.projects = [];
+      state.projects = [];
       if (list) {
         list.innerHTML = `<div class="empty" style="color:var(--status-failed);padding:6px 4px">projects failed: ${escapeHtml(e.message)}</div>`;
       }
       return;
     }
     list.innerHTML = "";
-    state2.projects.forEach((p) => {
+    state.projects.forEach((p) => {
       const div = document.createElement("div");
-      div.className = "project-item" + (state2.activeTab === p.id ? " active" : "");
+      div.className = "project-item" + (state.activeTab === p.id ? " active" : "");
       div.dataset.projectId = p.id;
       div.style.cssText = "display:flex;align-items:center;justify-content:space-between;gap:4px;";
       const nameSpan = document.createElement("span");
@@ -2699,10 +2700,10 @@
       menuBtn.onmouseleave = () => menuBtn.style.color = "var(--muted)";
       menuBtn.onclick = (e) => {
         e.stopPropagation();
-        let t = state2.tabs.find((tab) => tab.id === p.id);
+        let t = state.tabs.find((tab) => tab.id === p.id);
         if (!t) {
           openTab(p);
-          t = state2.tabs.find((tab) => tab.id === p.id);
+          t = state.tabs.find((tab) => tab.id === p.id);
         }
         if (t) _openTabMenu(t, menuBtn);
       };
@@ -2718,23 +2719,23 @@
       switcher.style.display = "none";
       const previous = switcher.value;
       switcher.innerHTML = "";
-      state2.projects.forEach((p) => {
+      state.projects.forEach((p) => {
         const opt = document.createElement("option");
         opt.value = p.id;
         opt.textContent = p.name;
         switcher.appendChild(opt);
       });
-      if (previous && state2.projects.some((p) => p.id === previous)) switcher.value = previous;
+      if (previous && state.projects.some((p) => p.id === previous)) switcher.value = previous;
     }
     syncSidebarActiveProject();
   }
   function openTab(project) {
-    const existing = state2.tabs.find((t) => t.id === project.id);
+    const existing = state.tabs.find((t) => t.id === project.id);
     if (existing) {
       activateTab(project.id);
       return;
     }
-    state2.tabs.push({ id: project.id, project });
+    state.tabs.push({ id: project.id, project });
     saveTabs();
     renderTabs();
     buildTabBody(project);
@@ -2742,21 +2743,21 @@
     setTimeout(() => refreshProjectCountBadges(project.id), 100);
   }
   function closeTab(id) {
-    state2.tabs = state2.tabs.filter((t) => t.id !== id);
-    const panel = state2.panels[id];
+    state.tabs = state.tabs.filter((t) => t.id !== id);
+    const panel = state.panels[id];
     if (panel) {
       try {
         panel.ws && panel.ws.close();
       } catch (e) {
       }
-      delete state2.panels[id];
+      delete state.panels[id];
     }
     document.getElementById(`tab-body-${id}`)?.remove();
     saveTabs();
     renderTabs();
-    if (state2.activeTab === id) {
-      const next = state2.tabs[state2.tabs.length - 1];
-      state2.activeTab = next ? next.id : null;
+    if (state.activeTab === id) {
+      const next = state.tabs[state.tabs.length - 1];
+      state.activeTab = next ? next.id : null;
       if (next) activateTab(next.id);
       else document.getElementById("tab-bodies").innerHTML = '<div class="empty">no project open \u2014 pick one on the left</div>';
     }
@@ -2764,7 +2765,7 @@
   }
   function saveTabs() {
     try {
-      localStorage.setItem(STORAGE_KEY(TABS_KEY), JSON.stringify(state2.tabs.map((t) => t.id)));
+      localStorage.setItem(STORAGE_KEY(TABS_KEY), JSON.stringify(state.tabs.map((t) => t.id)));
     } catch (e) {
     }
   }
@@ -2772,9 +2773,9 @@
   function renderTabs() {
     const bar = document.getElementById("tabs");
     bar.innerHTML = "";
-    const overflow = state2.tabs.length >= TAB_OVERFLOW_THRESHOLD;
-    const visible = overflow ? state2.tabs.slice(0, TAB_OVERFLOW_THRESHOLD - 1) : state2.tabs;
-    const hidden = overflow ? state2.tabs.slice(TAB_OVERFLOW_THRESHOLD - 1) : [];
+    const overflow = state.tabs.length >= TAB_OVERFLOW_THRESHOLD;
+    const visible = overflow ? state.tabs.slice(0, TAB_OVERFLOW_THRESHOLD - 1) : state.tabs;
+    const hidden = overflow ? state.tabs.slice(TAB_OVERFLOW_THRESHOLD - 1) : [];
     visible.forEach((t) => bar.appendChild(_makeTabEl(t)));
     if (overflow) {
       const more = document.createElement("div");
@@ -2818,7 +2819,7 @@
   }
   function _makeTabEl(t) {
     const div = document.createElement("div");
-    div.className = "tab" + (state2.activeTab === t.id ? " active" : "");
+    div.className = "tab" + (state.activeTab === t.id ? " active" : "");
     div.dataset.tabId = t.id;
     div.onclick = () => activateTab(t.id);
     if (t.project.icon) {
@@ -2906,7 +2907,7 @@ Current: ${current || "(none)"}`,
         body: JSON.stringify({ icon })
       });
       t.project = { ...t.project, icon: updated.icon || null };
-      const proj = state2.projects.find((p) => p.id === t.id);
+      const proj = state.projects.find((p) => p.id === t.id);
       if (proj) proj.icon = updated.icon || null;
       renderTabs();
       toast(icon ? `Icon set to ${icon}` : "Icon cleared");
@@ -2958,13 +2959,13 @@ Current: ${current || "(none)"}`,
         try {
           await api2(`/projects/${t.id}`, { method: "DELETE" });
           closeTab(t.id);
-          state2.projects = state2.projects.filter((p) => p.id !== t.id);
+          state.projects = state.projects.filter((p) => p.id !== t.id);
           await loadProjects();
           toast("Project deleted");
         } catch (e) {
           if (e.status === 404) {
             closeTab(t.id);
-            state2.projects = state2.projects.filter((p) => p.id !== t.id);
+            state.projects = state.projects.filter((p) => p.id !== t.id);
             await loadProjects();
             toast("Project removed");
           } else {
@@ -2976,7 +2977,7 @@ Current: ${current || "(none)"}`,
     });
   }
   function activateTab(id) {
-    state2.activeTab = id;
+    state.activeTab = id;
     renderTabs();
     syncSidebarActiveProject();
     document.querySelectorAll(".tab-body").forEach((el) => el.classList.remove("active"));
@@ -3866,7 +3867,7 @@ Current: ${current || "(none)"}`,
 
   `;
     root.appendChild(body);
-    state2.panels[project.id] = {
+    state.panels[project.id] = {
       ws: null,
       taskCache: [],
       goalRaw: null,
@@ -3880,7 +3881,7 @@ Current: ${current || "(none)"}`,
       vtabStrip.querySelectorAll(".vtab-btn").forEach((btn) => {
         btn.onclick = () => {
           const vtab = btn.dataset.vtab;
-          const p = state2.panels[project.id];
+          const p = state.panels[project.id];
           vtabStrip.querySelectorAll(".vtab-btn").forEach((b) => {
             b.classList.toggle("active", b.dataset.vtab === vtab);
           });
@@ -4090,7 +4091,7 @@ Current: ${current || "(none)"}`,
         const title = sprintAddInput.value.trim();
         if (!title) return;
         try {
-          await api2(`/projects/${project.id}/sprint-items`, { method: "POST", body: JSON.stringify({ title, version: state2.panels[project.id]?.sprint || "current" }) });
+          await api2(`/projects/${project.id}/sprint-items`, { method: "POST", body: JSON.stringify({ title, version: state.panels[project.id]?.sprint || "current" }) });
           sprintAddInput.value = "";
           loadSprintBoard2();
         } catch (e) {
@@ -4132,16 +4133,16 @@ Current: ${current || "(none)"}`,
     document.getElementById(`goal-north-star-${project.id}`).addEventListener("blur", () => saveNorthStar(project.id));
     document.getElementById(`goal-sprint-${project.id}`).addEventListener("blur", () => saveSprint(project.id));
     document.getElementById(`goal-${project.id}`).addEventListener("input", function() {
-      const p = state2.panels[project.id];
+      const p = state.panels[project.id];
       this.classList.toggle("dirty", this.value !== (p._lastSaved || ""));
     });
     document.getElementById(`goal-north-star-${project.id}`).addEventListener("input", function() {
-      const p = state2.panels[project.id];
+      const p = state.panels[project.id];
       this.classList.toggle("dirty", this.value !== (p._serverNorthStar || ""));
       autosizeGoalField(this);
     });
     document.getElementById(`goal-sprint-${project.id}`).addEventListener("input", function() {
-      const p = state2.panels[project.id];
+      const p = state.panels[project.id];
       this.classList.toggle("dirty", this.value !== (p._serverSprint || ""));
     });
     autosizeGoalField(document.getElementById(`goal-north-star-${project.id}`));
@@ -4168,7 +4169,7 @@ Current: ${current || "(none)"}`,
     const wait = Math.max(LIVE_THROTTLE_MS, LIVE_REFRESH_MS - sinceLastMs);
     s.timer = setTimeout(async () => {
       s.lastRefresh = Date.now();
-      const panel = state2.panels[projectId];
+      const panel = state.panels[projectId];
       if (panel && panel.activeVtab === "live") {
         await refreshLiveTab(projectId);
       }
@@ -4195,7 +4196,7 @@ Current: ${current || "(none)"}`,
     if (s.enabled) scheduleLiveRefresh(projectId);
   }
   async function loadLiveTab(projectId) {
-    const panel = state2.panels[projectId];
+    const panel = state.panels[projectId];
     if (!panel) return;
     panel.liveWired = panel.liveWired || false;
     if (!panel.liveWired) {
@@ -4496,7 +4497,7 @@ Current: ${current || "(none)"}`,
       version = val.slice(0, colonIdx).trim();
       title = val.slice(colonIdx + 1).trim();
     } else {
-      const panel = state2.panels[projectId];
+      const panel = state.panels[projectId];
       const sprint = panel && panel._serverSprint || "";
       const m = sprint.match(/v[\w.+-]+/i);
       version = m ? m[0] : "current";
@@ -4519,7 +4520,7 @@ Current: ${current || "(none)"}`,
     }
   }
   function cacheMostRecentSession(projectId, sessions) {
-    const panel = state2.panels[projectId];
+    const panel = state.panels[projectId];
     if (!panel) return;
     const sorted = sessions.slice().sort(
       (a, b) => (b.last_seen || "").localeCompare(a.last_seen || "")
@@ -4676,7 +4677,7 @@ Current: ${current || "(none)"}`,
     });
   }
   async function addLiveTask(projectId, description) {
-    const panel = state2.panels[projectId];
+    const panel = state.panels[projectId];
     const sessionId = panel && panel.liveLastSessionId;
     if (!sessionId) {
       try {
@@ -5086,7 +5087,7 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
     const wrap = document.getElementById(`timeline-wrap-${projectId}`);
     if (!wrap) return;
     const { tasks = [], goal_events = [] } = data || {};
-    const isAbs = !!(state2.panels[projectId] && state2.panels[projectId]._timelineAbsolute);
+    const isAbs = !!(state.panels[projectId] && state.panels[projectId]._timelineAbsolute);
     const fmtTs = (ts) => {
       if (!ts) return "";
       const iso = ts.includes("T") ? ts : ts.replace(" ", "T") + "Z";
@@ -5340,7 +5341,7 @@ stop = ${JSON.stringify(stop)}`;
         }).join("");
         return `<optgroup label="${escapeHtml(label)}">${options}</optgroup>`;
       }).join("");
-      const hooksBaseUrl = (mcpData && mcpData.base_url || window.location.origin || state2.serverConfig?.server_url || "http://localhost:7878").replace(/\/$/, "");
+      const hooksBaseUrl = (mcpData && mcpData.base_url || window.location.origin || state.serverConfig?.server_url || "http://localhost:7878").replace(/\/$/, "");
       let _secState = { connect: true, executor: false, config: false, account: false };
       try {
         Object.assign(_secState, JSON.parse(localStorage.getItem("meridian.settings.sections." + projectId) || "{}"));
@@ -5355,7 +5356,7 @@ stop = ${JSON.stringify(stop)}`;
       if (!isHostedMode()) {
         try {
           const _allProjSettings = await Promise.allSettled(
-            (state2.projects || []).map((p) => loadProjectSettings(p.id))
+            (state.projects || []).map((p) => loadProjectSettings(p.id))
           );
           for (const _ps of _allProjSettings) {
             if (_ps.status === "fulfilled") {
@@ -5375,32 +5376,32 @@ stop = ${JSON.stringify(stop)}`;
     <div style="font-size:10px;color:var(--muted);line-height:1.5">Recommended setup command for this browser:</div>
     <code style="display:block;margin-top:5px;padding:6px 8px;border:1px solid var(--border);border-radius:4px;background:var(--surface-1);color:var(--text);font-size:10px;white-space:pre-wrap;word-break:break-all">${escapeHtml(detectedHookOS.command)}</code>
   </div>`;
-      if (state2.tenantEmail) {
-        const plan = state2.tenantPlan || "free";
-        const hasStripe = !!state2.tenantHasStripe;
-        const noUpgrade = plan === "admin" || !!state2.tenantIsInternal;
+      if (state.tenantEmail) {
+        const plan = state.tenantPlan || "free";
+        const hasStripe = !!state.tenantHasStripe;
+        const noUpgrade = plan === "admin" || !!state.tenantIsInternal;
         let billingBtn = "";
         if (hasStripe) {
           billingBtn = `<button id="billing-portal-btn-${escapeHtml(projectId)}" class="primary" style="padding:4px 10px;font-size:10px;background:var(--accent);color:#001020;border-radius:4px;font-weight:600;cursor:pointer;border:none">Manage billing \u2192</button>`;
         } else if (!noUpgrade) {
-          const upgradeUrl = state2.serverConfig?.stripe_payment_link || "/pricing";
+          const upgradeUrl = state.serverConfig?.stripe_payment_link || "/pricing";
           billingBtn = `<a href="${escapeHtml(upgradeUrl)}" class="primary" style="padding:4px 10px;font-size:10px;text-decoration:none;background:var(--accent);color:#001020;border-radius:4px;font-weight:600">Upgrade to Standard \u2192</a>`;
         }
-        const days = state2.tenantDaysRemaining;
-        const expiresAt = state2.tenantExpiresAt;
-        const isTrialish = (plan === "free" || plan === "trial") && !state2.tenantIsInternal;
+        const days = state.tenantDaysRemaining;
+        const expiresAt = state.tenantExpiresAt;
+        const isTrialish = (plan === "free" || plan === "trial") && !state.tenantIsInternal;
         let expiryLine = "";
         let resubBtn = "";
-        if (isTrialish && (expiresAt || days != null || state2.tenantExpired)) {
+        if (isTrialish && (expiresAt || days != null || state.tenantExpired)) {
           const dateStr = expiresAt ? String(expiresAt).slice(0, 10) : "";
-          if (state2.tenantExpired) {
+          if (state.tenantExpired) {
             expiryLine = `<div style="color:#f87171">${_PLAN_LABELS[plan] || plan} expired${dateStr ? ` on ${escapeHtml(dateStr)}` : ""}.</div>`;
           } else {
             const dleft = days != null ? `${days} day${days === 1 ? "" : "s"} left` : "";
             expiryLine = `<div>${_PLAN_LABELS[plan] || plan} expires${dateStr ? ` on <span style="color:var(--text)">${escapeHtml(dateStr)}</span>` : ""}${dleft ? ` <span style="color:var(--muted)">(${dleft})</span>` : ""}.</div>`;
           }
-          const payLink = state2.serverConfig?.stripe_payment_link || "/pricing";
-          resubBtn = `<a href="${escapeHtml(payLink)}" class="primary" style="padding:4px 10px;font-size:10px;text-decoration:none;background:var(--accent);color:#001020;border-radius:4px;font-weight:600">${state2.tenantExpired ? "Resubscribe" : "Upgrade to Standard"}</a>`;
+          const payLink = state.serverConfig?.stripe_payment_link || "/pricing";
+          resubBtn = `<a href="${escapeHtml(payLink)}" class="primary" style="padding:4px 10px;font-size:10px;text-decoration:none;background:var(--accent);color:#001020;border-radius:4px;font-weight:600">${state.tenantExpired ? "Resubscribe" : "Upgrade to Standard"}</a>`;
         }
         html += `<div data-demo-hide style="margin-bottom:14px;padding:10px 12px;border:1px solid var(--border);border-radius:6px;background:var(--surface-2)">
 
@@ -5408,7 +5409,7 @@ stop = ${JSON.stringify(stop)}`;
 
       <div style="font-size:10px;color:var(--muted);line-height:1.7">
 
-        <div>Email: <span style="color:var(--text)">${escapeHtml(state2.tenantEmail)}</span></div>
+        <div>Email: <span style="color:var(--text)">${escapeHtml(state.tenantEmail)}</span></div>
 
         <div>Plan: <span style="color:var(--text)">${escapeHtml(_PLAN_LABELS[plan] || plan)}</span></div>
 
@@ -5946,7 +5947,7 @@ stop = ${JSON.stringify(stop)}`;
               configBlock.textContent = cfg;
               copyBtn.disabled = false;
               fileNote.textContent = `Save to: ${cli.file}`;
-            } else if (state2.serverConfig?.demo_mode) {
+            } else if (state.serverConfig?.demo_mode) {
               const demoKey = "sk_meridian_demo_" + "x".repeat(24);
               const demoCfg = JSON.stringify({
                 mcpServers: {
@@ -6073,12 +6074,12 @@ stop = ${JSON.stringify(stop)}`;
         }, 0);
       }
       {
-        const serverUrl = (state2.serverConfig?.server_url || "http://localhost:7878").replace(/\/$/, "");
+        const serverUrl = (state.serverConfig?.server_url || "http://localhost:7878").replace(/\/$/, "");
         const mcpHttpUrl = `${serverUrl}/mcp`;
         const isHosted = window.location.hostname === "usemeridian.us";
-        const rawTomlPath = state2.serverConfig?.toml_path || "";
+        const rawTomlPath = state.serverConfig?.toml_path || "";
         const cwd = rawTomlPath ? rawTomlPath.replace(/[/\\]meridian\.toml$/i, "").replace(/\\/g, "/") : isHosted ? "" : "/path/to/your/meridian";
-        const isDemo2 = !!state2.serverConfig?.demo_mode;
+        const isDemo2 = !!state.serverConfig?.demo_mode;
         const displayPid = isDemo2 ? "your-project-id" : projectId;
         const stdioText = `[mcp_servers.meridian]
 type = "stdio"
@@ -6094,7 +6095,7 @@ marked complete via complete_sprint_item(), ${_gCfg.test_cmd || "pixi run test"}
 
 project_id = "${displayPid}"`;
         const goalText = _gCfg.goal_template || _gAutoText;
-        const _mcpUrl = (state2.serverConfig?.base_url || "https://usemeridian.us") + "/mcp";
+        const _mcpUrl = (state.serverConfig?.base_url || "https://usemeridian.us") + "/mcp";
         const hostedMcpJson = JSON.stringify({
           mcpServers: {
             meridian: {
@@ -6926,7 +6927,7 @@ project_id = "${displayPid}"`;
           }
         }, 0);
       }
-      const isDemo = !!state2.serverConfig?.demo_mode;
+      const isDemo = !!state.serverConfig?.demo_mode;
       if (mcpData && !isDemo) {
         html += `<div style="margin-bottom:16px">
 
@@ -7175,7 +7176,7 @@ project_id = "${displayPid}"`;
       <label style="font-size:10px;color:var(--muted);white-space:nowrap;min-width:100px">notify_email:</label>
 
       <input type="email" id="notify-email-${projectId}"
-        value="${escapeHtml(savedNotifyEmail || state2.tenantEmail || "")}"
+        value="${escapeHtml(savedNotifyEmail || state.tenantEmail || "")}"
         placeholder="you@example.com"
         style="flex:1;min-width:180px;padding:5px 8px;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;color:var(--text);font-family:var(--font-mono);font-size:11px;outline:none">
 
@@ -8911,13 +8912,13 @@ project_id = "${displayPid}"`;
     const goalPath = `/projects/${projectId}/goal`;
     try {
       const goal = await projectApi(projectId, goalPath);
-      state2.panels[projectId].goalRaw = goal.content;
+      state.panels[projectId].goalRaw = goal.content;
       let text;
       if (typeof goal.content === "string") {
-        state2.panels[projectId].goalIsJson = false;
+        state.panels[projectId].goalIsJson = false;
         text = goal.content;
       } else {
-        state2.panels[projectId].goalIsJson = true;
+        state.panels[projectId].goalIsJson = true;
         text = JSON.stringify(goal.content, null, 2);
       }
       const AUTO_SPLIT = "--- AUTO BLOCKS BELOW ---";
@@ -8972,7 +8973,7 @@ project_id = "${displayPid}"`;
         spTA.value = goal.sprint || "";
         if (_sprintSelectSyncers[projectId]) _sprintSelectSyncers[projectId](goal.sprint || "");
       }
-      const p = state2.panels[projectId];
+      const p = state.panels[projectId];
       p._serverNorthStar = goal.north_star || "";
       p._serverSprint = goal.sprint || "";
       const nsLock = document.getElementById(`goal-ns-lock-${projectId}`);
@@ -9023,7 +9024,7 @@ project_id = "${displayPid}"`;
   function renderConstitutionWarning(projectId) {
     const host = document.getElementById(`constitution-warning-${projectId}`);
     if (!host) return;
-    const items = state2.panels[projectId]?._pinnedDecisions || [];
+    const items = state.panels[projectId]?._pinnedDecisions || [];
     const count = items.length;
     if (!count) {
       host.innerHTML = "";
@@ -9079,7 +9080,7 @@ project_id = "${displayPid}"`;
   };
   var _hitlPollTimer = null;
   function _hitlBadgeClick() {
-    const pid = state2.activeTab;
+    const pid = state.activeTab;
     if (pid) {
       const hitlBtn = document.querySelector(`#vtab-strip-${pid} [data-vtab="hitl"]`);
       if (hitlBtn) hitlBtn.click();
@@ -9481,7 +9482,7 @@ project_id = "${displayPid}"`;
       } catch (_) {
       }
     } catch (e) {
-      if (state2.panels[projectId]) state2.panels[projectId]._pinnedDecisions = [];
+      if (state.panels[projectId]) state.panels[projectId]._pinnedDecisions = [];
       renderConstitutionWarning(projectId);
       host.innerHTML = `<div style="color:var(--muted)">failed to load pinned decisions: ${escapeHtml(String(e))}</div>`;
     }
@@ -9713,9 +9714,9 @@ project_id = "${displayPid}"`;
     const shippedEl2 = document.getElementById(`goal-shipped-${projectId}`);
     const shippedText = shippedEl2 && shippedEl2.style.display !== "none" && shippedEl2.textContent ? "\n" + shippedEl2.textContent + "\n" : "";
     const raw = titleLine + shippedText + ta.value + autoBlocksText;
-    if (raw === state2.panels[projectId]._lastSaved) return;
+    if (raw === state.panels[projectId]._lastSaved) return;
     let content = raw;
-    if (state2.panels[projectId].goalIsJson) {
+    if (state.panels[projectId].goalIsJson) {
       try {
         content = JSON.parse(raw);
       } catch (e) {
@@ -9723,7 +9724,7 @@ project_id = "${displayPid}"`;
     }
     try {
       await api2(`/projects/${projectId}/goal`, { method: "POST", body: JSON.stringify({ content }) });
-      state2.panels[projectId]._lastSaved = raw;
+      state.panels[projectId]._lastSaved = raw;
       toast("version goal saved");
       refreshGoal(projectId);
     } catch (e) {
@@ -9735,7 +9736,7 @@ project_id = "${displayPid}"`;
     if (!ta) return;
     const val = ta.value.trim();
     if (!val) return;
-    const saved = state2.panels[projectId]?._serverNorthStar || "";
+    const saved = state.panels[projectId]?._serverNorthStar || "";
     if (saved && val !== saved && !confirm("North star is intended to be stable. Save changes?")) {
       ta.value = saved;
       autosizeGoalField(ta);
@@ -9833,8 +9834,8 @@ project_id = "${displayPid}"`;
     const tasksPath = `/projects/${projectId}/tasks?limit=100`;
     try {
       const tasks = await projectApi(projectId, tasksPath);
-      state2.panels[projectId].taskCache = tasks;
-      state2.panels[projectId].taskOffset = tasks.length;
+      state.panels[projectId].taskCache = tasks;
+      state.panels[projectId].taskOffset = tasks.length;
       renderTasks(projectId);
     } catch (e) {
       const root = document.getElementById(`tasks-${projectId}`);
@@ -9849,7 +9850,7 @@ project_id = "${displayPid}"`;
     }
   }
   function renderTasks(projectId) {
-    const tasks = state2.panels[projectId].taskCache || [];
+    const tasks = state.panels[projectId].taskCache || [];
     const root = document.getElementById(`tasks-${projectId}`);
     const hitlRoot = document.getElementById(`hitl-queue-${projectId}`);
     const banner = document.getElementById(`hitl-banner-${projectId}`);
@@ -9872,7 +9873,7 @@ project_id = "${displayPid}"`;
     }
   }
   async function _loadMoreTasks(projectId, btn) {
-    const p = state2.panels[projectId];
+    const p = state.panels[projectId];
     const offset = p.taskOffset || 0;
     btn.disabled = true;
     btn.textContent = "loading\u2026";
@@ -10029,7 +10030,7 @@ project_id = "${displayPid}"`;
     ws.onclose = () => {
       dot && dot.classList.remove("connected");
       setTimeout(() => {
-        if (state2.panels[projectId]) connectWs(projectId);
+        if (state.panels[projectId]) connectWs(projectId);
       }, 1500);
     };
     ws.onerror = () => {
@@ -10042,7 +10043,7 @@ project_id = "${displayPid}"`;
       } catch (e) {
       }
     };
-    state2.panels[projectId].ws = ws;
+    state.panels[projectId].ws = ws;
   }
   function handleWsEvent(projectId, event) {
     if (event.type === "update_available") {
@@ -10055,14 +10056,14 @@ project_id = "${displayPid}"`;
       return;
     }
     if (event.type === "project_renamed") {
-      const tab = state2.tabs.find((t) => t.id === event.project_id);
+      const tab = state.tabs.find((t) => t.id === event.project_id);
       if (tab) {
         tab.project = { ...tab.project, name: event.name };
         const hdr = document.querySelector(`#drawer-status-${event.project_id} .drawer-header span:first-child`);
         if (hdr) hdr.textContent = "STATUS \xB7 " + event.name;
         renderTabs();
       }
-      const proj = state2.projects.find((p) => p.id === event.project_id);
+      const proj = state.projects.find((p) => p.id === event.project_id);
       if (proj) {
         proj.name = event.name;
         loadProjects();
@@ -10070,7 +10071,7 @@ project_id = "${displayPid}"`;
       return;
     }
     if (event.type === "sprint_item_updated") {
-      const panel2 = state2.panels[projectId];
+      const panel2 = state.panels[projectId];
       if (panel2 && panel2.activeVtab === "queue") loadQueue(projectId);
       scheduleLiveRefresh(projectId);
       return;
@@ -10080,26 +10081,26 @@ project_id = "${displayPid}"`;
       return;
     }
     if (event.type === "session_started") {
-      const panel2 = state2.panels[projectId];
+      const panel2 = state.panels[projectId];
       if (panel2 && panel2.activeVtab === "queue") loadQueue(projectId);
       scheduleLiveRefresh(projectId);
       return;
     }
     if (event.type === "sprint_item_added") {
-      const panel2 = state2.panels[projectId];
+      const panel2 = state.panels[projectId];
       if (panel2 && panel2.activeVtab === "queue") loadQueue(projectId);
       scheduleLiveRefresh(projectId);
       refreshProjectCountBadges(projectId);
       return;
     }
     if (event.type === "note_added") {
-      const panel2 = state2.panels[projectId];
+      const panel2 = state.panels[projectId];
       if (panel2 && panel2.activeVtab === "notes") loadNotesTab(projectId);
       refreshProjectCountBadges(projectId);
       return;
     }
     if (event.type === "decision_pinned") {
-      if (state2.panels[projectId]) loadPinnedDecisions(projectId);
+      if (state.panels[projectId]) loadPinnedDecisions(projectId);
       refreshProjectCountBadges(projectId);
       return;
     }
@@ -10108,7 +10109,7 @@ project_id = "${displayPid}"`;
       refreshProjectCountBadges(projectId);
       return;
     }
-    const cache = state2.panels[projectId].taskCache;
+    const cache = state.panels[projectId].taskCache;
     if (event.type === "task_created") {
       cache.unshift(event.task);
     } else if (event.type === "task_updated") {
@@ -10118,7 +10119,7 @@ project_id = "${displayPid}"`;
     }
     renderTasks(projectId);
     refreshGoal(projectId);
-    const panel = state2.panels[projectId];
+    const panel = state.panels[projectId];
     if (panel && panel.activeVtab === "queue" && (event.type === "task_created" || event.type === "task_updated")) {
       updateLiveFeed(projectId);
     }
@@ -10150,7 +10151,7 @@ project_id = "${displayPid}"`;
       switcher.addEventListener("change", (ev) => {
         const id = ev.target.value;
         if (!id) return;
-        const p = state2.projects.find((x) => x.id === id);
+        const p = state.projects.find((x) => x.id === id);
         if (p) openTab(p);
       });
     }
@@ -10167,13 +10168,13 @@ project_id = "${displayPid}"`;
     } catch (e) {
     }
     for (const id of saved) {
-      const p = state2.projects.find((x) => x.id === id);
+      const p = state.projects.find((x) => x.id === id);
       if (p) openTab(p);
     }
-    if (state2.tabs.length === 0 && state2.projects.length > 0) {
-      const fallback = state2.projects.find((p) => p.id === preferred) || state2.projects[0];
+    if (state.tabs.length === 0 && state.projects.length > 0) {
+      const fallback = state.projects.find((p) => p.id === preferred) || state.projects[0];
       if (fallback) openTab(fallback);
-    } else if (preferred && state2.tabs.find((t) => t.id === preferred)) {
+    } else if (preferred && state.tabs.find((t) => t.id === preferred)) {
       activateTab(preferred);
     }
   }
@@ -10181,7 +10182,7 @@ project_id = "${displayPid}"`;
     await loadServerConfig();
     showFailoverBannerIfNeeded();
     if (typeof window._showConnSetupIfNeeded === "function") {
-      window._showConnSetupIfNeeded(state2.serverConfig);
+      window._showConnSetupIfNeeded(state.serverConfig);
     }
     await loadConfig();
     await loadProjects();
@@ -10190,7 +10191,7 @@ project_id = "${displayPid}"`;
     showLocalServerControls();
     ensureTourButton();
     ensureFeedbackButton();
-    if (state2.projects.length === 0 && !isDemoMode()) {
+    if (state.projects.length === 0 && !isDemoMode()) {
       document.getElementById("ez-wizard").style.display = "flex";
       return;
     }
@@ -10199,7 +10200,7 @@ project_id = "${displayPid}"`;
     const requestedProjectId = dashboardParams.get("project_id") || "";
     const requestedTab = dashboardParams.get("tab") || "";
     if (requestedProjectId) {
-      const requestedProject = state2.projects.find((p) => p.id === requestedProjectId);
+      const requestedProject = state.projects.find((p) => p.id === requestedProjectId);
       if (requestedProject) {
         openTab(requestedProject);
         if (requestedTab && requestedTab !== "status") {
@@ -10256,8 +10257,8 @@ project_id = "${displayPid}"`;
     const workspaceEntry = document.getElementById("workspace-entry");
     if (workspaceEntry) {
       workspaceEntry.onclick = () => {
-        const targetId = state2.activeTab || state2.projects[0]?.id;
-        const project = state2.projects.find((p) => p.id === targetId);
+        const targetId = state.activeTab || state.projects[0]?.id;
+        const project = state.projects.find((p) => p.id === targetId);
         if (!project) return;
         if (!document.getElementById(`tab-body-${targetId}`)) openTab(project);
         document.querySelector(`#vtab-strip-${targetId} [data-vtab="settings"]`)?.click();
@@ -10434,7 +10435,7 @@ project_id = "${displayPid}"`;
     };
   })();
   function initRewindTab(projectId) {
-    const p = state2.panels[projectId];
+    const p = state.panels[projectId];
     if (!p) return;
     if (p.rewindWired) {
       if (p.rewindDays) loadRewindTab(projectId, p.rewindDays);
@@ -10492,7 +10493,7 @@ project_id = "${displayPid}"`;
   async function loadRewindTab(projectId, days) {
     const wrap = document.getElementById(`rewind-wrap-${projectId}`);
     if (!wrap) return;
-    const p = state2.panels[projectId];
+    const p = state.panels[projectId];
     if (p) p.rewindDays = days;
     document.querySelectorAll(`.rewind-day-btn[data-pid="${projectId}"]`).forEach((b) => {
       b.classList.toggle("active", parseInt(b.dataset.days, 10) === days);
@@ -10564,7 +10565,7 @@ project_id = "${displayPid}"`;
   }
   function initRewindCharts(projectId, stats) {
     if (!stats || typeof Chart === "undefined") return;
-    const p = state2.panels[projectId];
+    const p = state.panels[projectId];
     if (p) {
       if (p._chartTasks) {
         p._chartTasks.destroy();
@@ -10826,7 +10827,7 @@ project_id = "${displayPid}"`;
     return goals + historyHtml;
   }
   async function copyRewindLink(projectId) {
-    const p = state2.panels[projectId];
+    const p = state.panels[projectId];
     const days = p && p.rewindDays || 7;
     try {
       const res = await api2(`/projects/${projectId}/rewind-token`, { method: "POST" });
@@ -10849,7 +10850,7 @@ project_id = "${displayPid}"`;
     }
   }
   try {
-    Object.assign(window, { hideHostedAdminControls, ensureSignOutLink: ensureSignOutLink2, ensureWorkspaceSwitcher: ensureWorkspaceSwitcher2, showConnectDbModal, showLocalServerControls, _summarizeApiErrorText, _projectLoadErrorInfo, wireProjectLoadRetry, renderProjectLoadError, recordProjectLoadError, clearProjectLoadError, renderProjectLoadAlert, retryProjectSurface, syncSidebarActiveProject, autosizeGoalField, githubIconSvg, getConstitutionLimit, loadProjectSettings, saveProjectSettings, _demoTourDone: _demoTourDone2, _demoTourSavedStep: _demoTourSavedStep2, _demoTourSaveStep, _demoTourMarkDone, _demoTourClose, _tourActivateVtab, startDemoTour: startDemoTour2, resumeDemoTour, api: api2, projectApi, loadServerConfig, _armAccountSwitchWatch, _refreshOnFocus, _checkAccountSwitch, _showAccountSwitchBanner, updateGitHubConnectionIndicator, _updateConnectionIndicator, checkGitStatus, _doRestart, loadConfig, loadProjects, openTab, closeTab, saveTabs, renderTabs, _makeTabEl, _openTabMenu, _setProjectIcon, _renameProject, _deleteProject, activateTab, buildTabBody, scheduleLiveRefresh, initLiveAutoRefresh, loadLiveTab, refreshLiveTab, wireSprintAddEnter: wireSprintAddEnter2, sprintAction, sprintPushPrompt, sprintFeedback, sprintFeedbackNote, sprintItemEdit, addSprintItemFromInput: addSprintItemFromInput2, cacheMostRecentSession, renderLiveSessions, endLiveSession, openTimelineForSession, renderLiveQueue, addLiveTask, cancelLiveTask, showCopyPreview, wireClaudeLaunchPanel, stampHandoffTs, populateSessionDropdown, loadTimeline: loadTimeline2, _renderTimelineLog: _renderTimelineLog2, loadDocsTab, normalizeNotifyTarget, displayNotifyTarget, osExecutorHintBanner, showFailoverBannerIfNeeded, suggestNtfyTopic, loadSettingsTab, loadNotesTab, loadHitlTab, loadTeamTab, updateLiveFeed, loadRecentSessions, loadMilestones, loadRecentRuns, loadQueue, renderSearchResults, wireQueueSectionToggles, _rewriteRepoImages, loadFilesTab, openFileEditor, saveFile, refreshTab, refreshGoal, parseDecisionsBlob, renderConstitutionWarning, _hitlBadgeClick, initHitlPanel, setVtabCountBadge, refreshProjectCountBadges, refreshHitl, _hitlAnswer, _hitlDismiss, loadPinnedDecisions, supersedePinnedDecision, addPinnedDecision, consolidateDecisions, renderDecisionsTable, wireGoalPreviewToggle, saveGoal, saveNorthStar, saveSprint, _sessionPresenceDot, refreshSessions, refreshTasks, renderTasks, _loadMoreTasks, renderTaskRow, deleteTaskRow, renderHitlRow, wireHitlRow, appendToGoal, hitlReply, hitlExecute, connectWs, handleWsEvent, restoreTabs, _deleteSprintItem, _sprintAction, completeSprintItem, failSprintItem, initRewindTab, toggleExpand, loadRewindTab, renderRewindSubtabs, renderRewindCharts, initRewindCharts, renderRewindSprint, _rewindSec, renderRewindActivity, renderRewindVersions, renderRewindGoals, copyRewindLink, state: state2 });
+    Object.assign(window, { hideHostedAdminControls, ensureSignOutLink: ensureSignOutLink2, ensureWorkspaceSwitcher: ensureWorkspaceSwitcher2, showConnectDbModal, showLocalServerControls, _summarizeApiErrorText, _projectLoadErrorInfo, wireProjectLoadRetry, renderProjectLoadError, recordProjectLoadError, clearProjectLoadError, renderProjectLoadAlert, retryProjectSurface, syncSidebarActiveProject, autosizeGoalField, githubIconSvg, getConstitutionLimit, loadProjectSettings, saveProjectSettings, _demoTourDone: _demoTourDone2, _demoTourSavedStep: _demoTourSavedStep2, _demoTourSaveStep, _demoTourMarkDone, _demoTourClose, _tourActivateVtab, startDemoTour: startDemoTour2, resumeDemoTour, api: api2, projectApi, loadServerConfig, _armAccountSwitchWatch, _refreshOnFocus, _checkAccountSwitch, _showAccountSwitchBanner, updateGitHubConnectionIndicator, _updateConnectionIndicator, checkGitStatus, _doRestart, loadConfig, loadProjects, openTab, closeTab, saveTabs, renderTabs, _makeTabEl, _openTabMenu, _setProjectIcon, _renameProject, _deleteProject, activateTab, buildTabBody, scheduleLiveRefresh, initLiveAutoRefresh, loadLiveTab, refreshLiveTab, wireSprintAddEnter: wireSprintAddEnter2, sprintAction, sprintPushPrompt, sprintFeedback, sprintFeedbackNote, sprintItemEdit, addSprintItemFromInput: addSprintItemFromInput2, cacheMostRecentSession, renderLiveSessions, endLiveSession, openTimelineForSession, renderLiveQueue, addLiveTask, cancelLiveTask, showCopyPreview, wireClaudeLaunchPanel, stampHandoffTs, populateSessionDropdown, loadTimeline: loadTimeline2, _renderTimelineLog: _renderTimelineLog2, loadDocsTab, normalizeNotifyTarget, displayNotifyTarget, osExecutorHintBanner, showFailoverBannerIfNeeded, suggestNtfyTopic, loadSettingsTab, loadNotesTab, loadHitlTab, loadTeamTab, updateLiveFeed, loadRecentSessions, loadMilestones, loadRecentRuns, loadQueue, renderSearchResults, wireQueueSectionToggles, _rewriteRepoImages, loadFilesTab, openFileEditor, saveFile, refreshTab, refreshGoal, parseDecisionsBlob, renderConstitutionWarning, _hitlBadgeClick, initHitlPanel, setVtabCountBadge, refreshProjectCountBadges, refreshHitl, _hitlAnswer, _hitlDismiss, loadPinnedDecisions, supersedePinnedDecision, addPinnedDecision, consolidateDecisions, renderDecisionsTable, wireGoalPreviewToggle, saveGoal, saveNorthStar, saveSprint, _sessionPresenceDot, refreshSessions, refreshTasks, renderTasks, _loadMoreTasks, renderTaskRow, deleteTaskRow, renderHitlRow, wireHitlRow, appendToGoal, hitlReply, hitlExecute, connectWs, handleWsEvent, restoreTabs, _deleteSprintItem, _sprintAction, completeSprintItem, failSprintItem, initRewindTab, toggleExpand, loadRewindTab, renderRewindSubtabs, renderRewindCharts, initRewindCharts, renderRewindSprint, _rewindSec, renderRewindActivity, renderRewindVersions, renderRewindGoals, copyRewindLink, state });
   } catch (e) {
   }
 })();

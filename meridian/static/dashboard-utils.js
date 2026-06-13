@@ -8,9 +8,9 @@ export const SESSION_LIVE_WINDOW_MS = 10 * 60 * 1000;
 
 export function getPanelState(projectId) {
 
-  state.panels[projectId] = state.panels[projectId] || {};
+  window.state.panels[projectId] = window.state.panels[projectId] || {};
 
-  return state.panels[projectId];
+  return window.state.panels[projectId];
 
 }
 

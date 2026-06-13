@@ -34,6 +34,9 @@ const state = {
 
 };
 
+// Expose state on window so esbuild IIFE modules can access it via window.state
+window.state = state;
+
 
 
 // function isDemoMode -- moved to dashboard-demo.js / dashboard-timeline.js
