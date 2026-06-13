@@ -1,0 +1,119 @@
+# CLAUDE.md — Meridian User Template
+
+This file is read by Claude Code at session start. Copy it to your project root as
+`CLAUDE.md` and fill in your `project_id` to get Meridian session coordination
+automatically. Replace every `YOUR_PROJECT_ID` placeholder below with your real
+project ID.
+
+---
+
+## Connect to Meridian
+
+```json
+{
+  "mcpServers": {
+    "meridian": {
+      "command": "pixi",
+      "args": ["run", "python", "-m", "meridian", "--mcp"],
+      "cwd": "/path/to/Meridian"
+    }
+  }
+}
+```
+
+Or use the hosted tier (no install):
+```json
+{
+  "mcpServers": {
+    "meridian": {
+      "command": "npx",
+      "args": ["-y", "mcp-remote", "https://usemeridian.us/mcp"],
+      "env": { "BEARER_TOKEN": "sk_meridian_YOUR_TOKEN" }
+    }
+  }
+}
+```
+
+---
+
+## Your project ID
+
+```
+PROJECT_ID=YOUR_PROJECT_ID
+```
+
+Get your project ID from the Meridian dashboard at `http://localhost:7878` after
+running `create_project(name="your-project")`.
+
+---
+
+## Session rules
+
+ALWAYS at session start:
+- Call `start_session(project_id="YOUR_PROJECT_ID", session_name="describe-what-youre-doing")`
+- This returns the goal, recent tasks, pending sprint items, and active sessions in one call.
+
+ALWAYS during work:
+- Call `log_task(session_id, project_id, description)` after completing meaningful work.
+- Call `pin_decision(project_id, title, body, category)` for any architectural choice.
+- Call `request_hitl(project_id, question)` when you need a human decision before continuing.
+
+ALWAYS before ending:
+- Call `checkpoint(session_id, project_id)` — snapshots progress, generates delta handoff, returns next `/goal` string.
+
+---
+
+## Parallel sessions
+
+Before editing shared files, call `claim_file(session_id, path)` and check the `file_warnings` returned by `start_session`. If another active session has claimed a file you need, serialize the work or ask the human before editing.
+
+List the high-contention files in your own project here — the ones where concurrent
+edits cause painful merge conflicts (for example a monolithic frontend bundle, your
+main server module, or your DB layer). Treat those as always-sequential.
+
+Sprint items can carry `touches_files` so handoffs and dashboards can warn when planned work overlaps with a live session.
+
+---
+
+## The 5 tools you use 90% of the time
+
+| Tool | When | Example |
+|------|------|---------|
+| `start_session` | First thing, every session | `start_session(project_id="YOUR_PROJECT_ID", session_name="auth-refactor")` |
+| `log_task` | After finishing anything meaningful | `log_task(session_id, project_id, "Fixed OAuth redirect bug")` |
+| `checkpoint` | Before context fills, before ending | `checkpoint(session_id, project_id)` |
+| `pin_decision` | Architectural choices | `pin_decision(project_id, "Use psycopg3", "asyncpg has DLL issues on Windows", "TECHNICAL")` |
+| `request_hitl` | Blocking questions for a human | `request_hitl(project_id, "Should we rate-limit per IP or per token?")` |
+
+---
+
+## Auto-checkpoint with hooks
+
+Wire Claude Code to checkpoint automatically on every session end:
+
+```bash
+# Mac/Linux
+curl -fsSL https://usemeridian.us/hooks.sh | bash
+
+# Windows
+irm https://usemeridian.us/hooks.ps1 | iex
+```
+
+Prompts for your Meridian URL and project ID, then writes `SessionStart` and `Stop`
+hooks to `~/.claude/settings.json`. From that point on, every session auto-injects
+your project context on start and snapshots progress on end.
+
+---
+
+## Docs
+
+- Full MCP tool reference: `http://localhost:7878/mcp/tools-doc`
+- Quick reference: `http://localhost:7878/mcp/quickstart`
+- Web docs: https://docs.usemeridian.us
+
+---
+## Meridian-managed notes
+
+<!-- Agent-proposed via update_md_section, human-approved via the dashboard HITL queue. -->
+<!-- MERIDIAN:ANCHOR:START:claude-body -->
+<!-- MERIDIAN:ANCHOR:END:claude-body -->
