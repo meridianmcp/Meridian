@@ -7372,6 +7372,29 @@ async function loadSettingsTab(projectId) {
 
 
 
+    // a7c43cc1 — claude --rc watcher installer collapsible
+    html += `<details style="margin-top:12px;border:1px solid var(--border);border-radius:6px;overflow:hidden">
+      <summary style="cursor:pointer;padding:8px 10px;font-size:10px;font-weight:600;color:var(--text);background:var(--surface-2);list-style:none;display:flex;align-items:center;gap:6px;user-select:none">
+        <span style="font-size:12px">⚡</span> Install rc watcher <span style="color:var(--muted);font-weight:400;margin-left:4px">(for <code>claude --rc</code> server mode)</span>
+      </summary>
+      <div style="padding:10px 12px;font-size:10px;color:var(--muted);line-height:1.8">
+        <p style="margin:0 0 8px">When Claude runs in <code>claude --rc</code> (headless server mode) the
+        standard SessionStart hooks do not fire. The rc watcher is a lightweight OS-native background service
+        (Windows Task Scheduler / macOS LaunchAgent / Linux systemd) that watches
+        <code>~/.claude/projects/</code> for new session files and fires the hook automatically.</p>
+        <div style="margin-bottom:6px;font-size:10px;color:var(--text);font-weight:600">Windows</div>
+        <div style="display:flex;gap:6px;align-items:center;margin-bottom:10px">
+          <code id="rc-watcher-win-cmd-${escapeHtml(projectId)}" style="flex:1;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;padding:4px 8px;font-size:10px;word-break:break-all">irm ${escapeHtml(hooksBaseUrl)}/install_watcher.ps1 | iex</code>
+          <button onclick="navigator.clipboard.writeText(document.getElementById('rc-watcher-win-cmd-${escapeHtml(projectId)}').textContent).then(()=>{this.textContent='Copied!';setTimeout(()=>this.textContent='Copy',1500)}).catch(()=>{})" style="padding:3px 8px;font-size:10px;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;cursor:pointer;white-space:nowrap;color:var(--text)">Copy</button>
+        </div>
+        <div style="margin-bottom:6px;font-size:10px;color:var(--text);font-weight:600">macOS / Linux</div>
+        <div style="display:flex;gap:6px;align-items:center">
+          <code id="rc-watcher-unix-cmd-${escapeHtml(projectId)}" style="flex:1;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;padding:4px 8px;font-size:10px;word-break:break-all">curl -fsSL ${escapeHtml(hooksBaseUrl)}/install_watcher.sh | bash</code>
+          <button onclick="navigator.clipboard.writeText(document.getElementById('rc-watcher-unix-cmd-${escapeHtml(projectId)}').textContent).then(()=>{this.textContent='Copied!';setTimeout(()=>this.textContent='Copy',1500)}).catch(()=>{})" style="padding:3px 8px;font-size:10px;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;cursor:pointer;white-space:nowrap;color:var(--text)">Copy</button>
+        </div>
+      </div>
+    </details>`;
+
     html += '</div></details>';  // close Connect Claude Code section
     html += _secHtml('executor', 'Executor Setup');
 

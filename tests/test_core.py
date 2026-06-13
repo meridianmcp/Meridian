@@ -6547,6 +6547,22 @@ def test_billing_portal_endpoint_registered():
     assert "/billing/portal" in routes
 
 
+def test_install_watcher_ps1_returns_script(client):
+    """a7c43cc1 — GET /install_watcher.ps1 serves the Windows watcher installer."""
+    r = client.get("/install_watcher.ps1")
+    assert r.status_code == 200
+    assert "FileSystemWatcher" in r.text or "Task" in r.text
+    assert r.headers["content-type"].startswith("text/plain")
+
+
+def test_install_watcher_sh_returns_script(client):
+    """a7c43cc1 — GET /install_watcher.sh serves the macOS/Linux watcher installer."""
+    r = client.get("/install_watcher.sh")
+    assert r.status_code == 200
+    assert "launchctl" in r.text or "systemctl" in r.text or "inotifywait" in r.text
+    assert r.headers["content-type"].startswith("text/plain")
+
+
 @pytest.mark.asyncio
 async def test_create_stripe_billing_portal_session_rejects_no_customer():
     """G2.11 — helper raises ValueError when stripe_customer_id is missing,
