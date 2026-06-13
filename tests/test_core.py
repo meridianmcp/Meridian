@@ -1233,7 +1233,7 @@ import importlib
 
 
 def test_list_project_files_returns_allow_list(client, monkeypatch, tmp_path):
-    """GET /projects/{id}/files returns the three editable filenames."""
+    """GET /projects/{id}/files returns only AGENTS.md and CLAUDE.md (e838425d)."""
     import meridian.server as srv_mod
     srv_mod = importlib.reload(srv_mod)
     monkeypatch.setattr(srv_mod, "_REPO_ROOT", tmp_path)
@@ -1243,8 +1243,11 @@ def test_list_project_files_returns_allow_list(client, monkeypatch, tmp_path):
     assert r.status_code == 200
     files = r.json()
     assert "AGENTS.md" in files
-    assert "ROADMAP.md" in files
-    assert "DEVLOG.md" in files
+    assert "CLAUDE.md" in files
+    assert "ROADMAP.md" not in files
+    assert "DEVLOG.md" not in files
+    assert "DECISIONS.md" not in files
+    assert "README.md" not in files
 
 
 def test_get_project_file_returns_empty_when_missing(client, monkeypatch, tmp_path):
@@ -1269,17 +1272,17 @@ def test_put_and_get_project_file_roundtrip(client, monkeypatch, tmp_path):
 
     project = client.post("/projects", json={"name": "alpha"}).json()
     r = client.put(
-        f"/projects/{project['id']}/files/DEVLOG.md",
-        json={"content": "# Dev Log\n\nEntry 1."},
+        f"/projects/{project['id']}/files/AGENTS.md",
+        json={"content": "# Agent Instructions\n\nEntry 1."},
     )
     assert r.status_code == 200
     body = r.json()
-    assert body["filename"] == "DEVLOG.md"
+    assert body["filename"] == "AGENTS.md"
     assert body["size"] > 0
 
-    r2 = client.get(f"/projects/{project['id']}/files/DEVLOG.md")
+    r2 = client.get(f"/projects/{project['id']}/files/AGENTS.md")
     assert r2.status_code == 200
-    assert r2.json()["content"] == "# Dev Log\n\nEntry 1."
+    assert r2.json()["content"] == "# Agent Instructions\n\nEntry 1."
 
 
 def test_get_project_file_403_for_disallowed_filename(client, monkeypatch, tmp_path):
@@ -1850,13 +1853,12 @@ def test_get_goal_ambient_tasks_carry_status_and_timestamp(client):
 
 
 def test_files_allow_list_includes_claude_md(client):
-    """v0.5.0 spec: CLAUDE.md joins the editable allow-list alongside
-    AGENTS.md / ROADMAP.md / DEVLOG.md."""
+    """e838425d: editable allow-list is AGENTS.md + CLAUDE.md only."""
     project = client.post("/projects", json={"name": "alpha"}).json()
     r = client.get(f"/projects/{project['id']}/files")
     assert r.status_code == 200
     files = r.json()
-    assert {"AGENTS.md", "ROADMAP.md", "DEVLOG.md", "CLAUDE.md"} <= set(files)
+    assert set(files) == {"AGENTS.md", "CLAUDE.md"}
 
 
 def test_files_get_for_claude_md_is_allowed(client, tmp_path, monkeypatch):
@@ -5459,7 +5461,8 @@ def test_context_endpoint_returns_expected_shape(client):
     assert isinstance(body["pending_tasks"], list)
     assert isinstance(body["recent_sessions"], list)
     assert isinstance(body["file_map"], list)
-    assert "DECISIONS.md" in body["file_map"]
+    assert "AGENTS.md" in body["file_map"]
+    assert "CLAUDE.md" in body["file_map"]
 
 
 def test_context_endpoint_404_for_unknown_project(client):

@@ -3185,7 +3185,7 @@ async def api_key_status() -> dict:
 # Repo root is the parent of this package directory (meridian/).
 _REPO_ROOT = Path(__file__).parent.parent
 # The dashboard only allows editing these specific files.
-_EDITABLE_FILES: list[str] = ["AGENTS.md", "ROADMAP.md", "DEVLOG.md", "CLAUDE.md", "README.md", "DECISIONS.md"]
+_EDITABLE_FILES: list[str] = ["AGENTS.md", "CLAUDE.md"]
 
 _DEMO_FILE_CONTENT: dict[str, dict[str, str]] = {
     "backend-api-v2": {
@@ -5910,7 +5910,7 @@ async def hooks_session_start(body: dict[str, Any], request: Request) -> dict[st
     goal = result.get("goal") or {}
     sprint_items = await db_module.get_sprint_items(db, project_id, status="pending")
     recent = result.get("recent_tasks") or []
-    lines = [f"PROJECT: {project['name']} ({project_id[:8]})"]
+    lines = [f"PROJECT: {project['name']} ({project_id})"]
     # repo_paths tracking: auto-add new locations, HITL on unknown hostname/path
     if hook_cwd:
         try:
@@ -6031,7 +6031,7 @@ async def hooks_session_start(body: dict[str, Any], request: Request) -> dict[st
     if sprint_items:
         lines.append(f"\nPENDING SPRINT ITEMS ({len(sprint_items)}):")
         for it in sprint_items[:8]:
-            lines.append(f"- {it.get('id', '')[:8]} {it.get('title', '')[:120]}")
+            lines.append(f"- {it.get('id', '')} {it.get('title', '')[:120]}")
     if recent:
         lines.append("\nRECENT TASKS:")
         for t in recent[:5]:
