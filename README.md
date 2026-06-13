@@ -32,8 +32,6 @@ from a compressed handoff in seconds. No copy-paste, no re-explaining from scrat
 
 ---
 
----
-
 ## What it is, in 30 seconds
 
 A local MCP server every AI session connects to. They share goal state, see each
@@ -120,7 +118,7 @@ git clone --recurse-submodules https://github.com/meridianmcp/Meridian
 2. Click **Load unpacked** and select `extensions/claude-mcp`
 3. Click the extension icon and set the URL to `http://localhost:7878/mcp`
 
-All 46 Meridian tools (`checkpoint`, `log_task`, `pin_decision`, etc.) are now available directly in claude.ai planning chat. No copy-pasting session output.
+All 51 Meridian tools (`checkpoint`, `log_task`, `pin_decision`, etc.) are now available directly in claude.ai planning chat. No copy-pasting session output.
 
 ### Hosted tier (no install)
 
