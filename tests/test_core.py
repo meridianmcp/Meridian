@@ -7348,6 +7348,37 @@ def test_hooks_session_start_plain_chat_no_auto_claim_instruction(client):
     assert "claim_sprint_item" in exe.json()["hookSpecificOutput"]["additionalContext"]
 
 
+def test_hooks_session_start_cwd_legacy_repo_path_beats_hostname_fallback(client):
+    """dab3ba0c: cwd-based routing takes priority over the hostname-only fallback.
+
+    A project whose legacy ``repo_path`` matches the session cwd must win over a
+    *different* project that merely has the hostname registered — otherwise a
+    machine registered to one project hijacks sessions that clearly belong to
+    another by their working directory.
+    """
+    # Project A: hostname registered, no cwd → would win the Pass-2 fallback.
+    a = client.post("/projects", json={"name": "route-by-hostname"}).json()
+    client.patch(
+        f"/projects/{a['id']}/settings",
+        json={"executor_config": {"hostnames": [{"hostname": "HOSTX"}]}},
+    )
+    # Project B: legacy single repo_path == cwd (not migrated to repo_paths).
+    b = client.post("/projects", json={"name": "route-by-cwd"}).json()
+    client.patch(
+        f"/projects/{b['id']}/settings",
+        json={"executor_config": {"repo_path": "C:/work/myrepo"}},
+    )
+
+    r = client.post(
+        "/hooks/session-start",
+        json={"cwd": "C:/work/myrepo", "hostname": "HOSTX"},
+    )
+    assert r.status_code == 200
+    ctx = r.json()["hookSpecificOutput"]["additionalContext"]
+    assert f"({b['id']})" in ctx, "cwd (legacy repo_path) match must win over hostname fallback"
+    assert f"({a['id']})" not in ctx, "hostname-only project must not hijack a cwd match"
+
+
 def test_hooks_session_start_missing_project_id(client):
     r = client.post("/hooks/session-start", json={})
     assert r.status_code == 400

@@ -5840,6 +5840,13 @@ async def hooks_session_start(body: dict[str, Any], request: Request) -> dict[st
                 if rp_cwd == norm_cwd and (not rp_host or rp_host == norm_hn_ar):
                     matched = p
                     break
+            # dab3ba0c — a project still on the legacy single repo_path (not yet
+            # migrated to repo_paths) must still win on a cwd match, so cwd-based
+            # routing takes priority over the hostname-only fallback below.
+            if not matched and norm_cwd:
+                legacy_rp = (cfg.get("repo_path") or "").strip()
+                if legacy_rp and _normalize_hook_cwd(legacy_rp).lower().rstrip("/") == norm_cwd:
+                    matched = p
             if matched:
                 break
         # Pass 2: hostname registered in any project's hostnames list (hostname-only match)
