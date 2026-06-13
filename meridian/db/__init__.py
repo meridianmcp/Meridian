@@ -2412,6 +2412,8 @@ async def add_sprint_item(
     await db.commit()
     item = await get_sprint_item(db, iid)
     assert item is not None
+    # ITEM 6 — live push so dashboards refresh the sprint board without polling.
+    _publish_project_event(project_id, "sprint_item_added", {"item_id": iid})
     return item
 
 
@@ -4443,6 +4445,8 @@ async def pin_decision(
         (did, project_id, title, body, category),
     )
     await db.commit()
+    # ITEM 6 — live push so the constitution view refreshes without polling.
+    _publish_project_event(project_id, "decision_pinned", {"decision_id": did})
     return (await get_pinned_decision(db, did)) or {"id": did}
 
 
@@ -4618,6 +4622,8 @@ async def request_hitl(
          kind, payload),
     )
     await db.commit()
+    # ITEM 6 — live push so the HITL queue refreshes without polling.
+    _publish_project_event(project_id, "hitl_filed", {"hitl_id": hid, "kind": kind})
     # v3.4 — per-project auto-answer. When the project trusts the agent, a
     # plain question is resolved immediately (first option / generic ack) so the
     # session never blocks. md_section_update diffs stay human-gated — auto
@@ -5030,6 +5036,8 @@ async def add_project_note(
         (nid, project_id, title, body, tags),
     )
     await db.commit()
+    # ITEM 6 — live push so the Notes tab refreshes without polling.
+    _publish_project_event(project_id, "note_added", {"note_id": nid})
     return (await get_project_note(db, nid)) or {"id": nid}
 
 

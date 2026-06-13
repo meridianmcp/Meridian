@@ -887,7 +887,7 @@ async def site_password_gate(request: Request, call_next):
     if not site_pw:
         return await call_next(request)
     path = request.url.path
-    if path in ("/health", "/mcp/health", "/__gate__", "/config", "/static", "/mcp/tools-doc", "/mcp/quickstart", "/mcp/sse", "/mcp", "/.well-known/oauth-authorization-server", "/.well-known/oauth-protected-resource") or path.startswith("/static/") or path.startswith("/oauth/") or path == "/demo" or path.startswith("/demo/"):
+    if path in ("/health", "/failover-status", "/mcp/health", "/__gate__", "/config", "/static", "/mcp/tools-doc", "/mcp/quickstart", "/mcp/sse", "/mcp", "/.well-known/oauth-authorization-server", "/.well-known/oauth-protected-resource") or path.startswith("/static/") or path.startswith("/oauth/") or path == "/demo" or path.startswith("/demo/"):
         return await call_next(request)
     # Demo cookie bypasses site password gate — demo users don't go through __gate__
     if request.cookies.get(_DEMO_CONTEXT_COOKIE):
@@ -1350,6 +1350,18 @@ async def demo_auth_post(request: Request):
 async def health() -> dict[str, str]:
     """Liveness probe."""
     return {"status": "ok", "service": "meridian"}
+
+
+@app.get("/failover-status")
+async def failover_status() -> dict[str, bool]:
+    """ITEM 7 — report whether this instance is serving in failover mode.
+
+    Driven by the ``MERIDIAN_IS_FAILOVER`` env var so the dashboard can show a
+    standby-region banner. Public + unauthenticated so the banner can render
+    before the user signs in.
+    """
+    flag = (os.environ.get("MERIDIAN_IS_FAILOVER") or "").strip().lower()
+    return {"is_failover": flag in ("1", "true", "yes", "on")}
 
 
 @app.get("/terms", response_class=HTMLResponse)
@@ -7287,6 +7299,22 @@ async def _dispatch_mcp_tool(
             include_human=include_human,
         )
     if name == "claim_sprint_item":
+        # ITEM 3 — protect installer scripts: refuse to claim a sprint item whose
+        # touches_files includes hooks.ps1 / hooks.sh unless force=true is passed.
+        _force = args.get("force") in (True, 1, "true", "1", "yes")
+        if not _force:
+            _pitem = await db_module.get_sprint_item(db, args["item_id"])
+            if _pitem is not None:
+                _touched = [p.lower() for p in _parse_touches_files(_pitem.get("touches_files"))]
+                _hits = sorted({fn for fn in ("hooks.ps1", "hooks.sh")
+                                if any(t == fn or t.endswith("/" + fn) for t in _touched)})
+                if _hits:
+                    return {
+                        "error": "PROTECTED",
+                        "message": ("Sprint item touches protected installer scripts "
+                                    f"({', '.join(_hits)}). Pass force=true to override."),
+                        "protected_files": _hits,
+                    }
         conflicts = await _sprint_item_file_claim_conflicts(
             db,
             args["project_id"],

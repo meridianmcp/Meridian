@@ -7889,6 +7889,108 @@ async def test_claim_sprint_item_rejects_active_file_lock_conflict(db):
     assert reread["status"] == "pending"
 
 
+@pytest.mark.asyncio
+async def test_add_project_note_publishes_to_subscribers(db):
+    """ITEM 6 — adding a project note pushes a note_added WS event."""
+    p = await db_module.create_project(db, "ws-note")
+    queue = db_module.subscribe_tasks(p["id"])
+    try:
+        note = await db_module.add_project_note(db, p["id"], "title", "body")
+        event = await asyncio.wait_for(queue.get(), timeout=1.0)
+        assert event["type"] == "note_added"
+        assert event["note_id"] == note["id"]
+    finally:
+        db_module.unsubscribe_tasks(p["id"], queue)
+
+
+@pytest.mark.asyncio
+async def test_add_sprint_item_publishes_to_subscribers(db):
+    """ITEM 6 — adding a sprint item pushes a sprint_item_added WS event."""
+    p = await db_module.create_project(db, "ws-sprint")
+    queue = db_module.subscribe_tasks(p["id"])
+    try:
+        item = await db_module.add_sprint_item(db, p["id"], "v1", "Ship it")
+        event = await asyncio.wait_for(queue.get(), timeout=1.0)
+        assert event["type"] == "sprint_item_added"
+        assert event["item_id"] == item["id"]
+    finally:
+        db_module.unsubscribe_tasks(p["id"], queue)
+
+
+@pytest.mark.asyncio
+async def test_pin_decision_publishes_to_subscribers(db):
+    """ITEM 6 — pinning a decision pushes a decision_pinned WS event."""
+    p = await db_module.create_project(db, "ws-decision")
+    queue = db_module.subscribe_tasks(p["id"])
+    try:
+        d = await db_module.pin_decision(
+            db, p["id"], "Use psycopg3", "asyncpg DLL issues on Windows", "TECHNICAL"
+        )
+        event = await asyncio.wait_for(queue.get(), timeout=1.0)
+        assert event["type"] == "decision_pinned"
+        assert event["decision_id"] == d["id"]
+    finally:
+        db_module.unsubscribe_tasks(p["id"], queue)
+
+
+@pytest.mark.asyncio
+async def test_request_hitl_publishes_to_subscribers(db):
+    """ITEM 6 — filing a HITL request pushes a hitl_filed WS event."""
+    p = await db_module.create_project(db, "ws-hitl")
+    queue = db_module.subscribe_tasks(p["id"])
+    try:
+        h = await db_module.request_hitl(db, p["id"], "Rate-limit per IP or token?")
+        event = await asyncio.wait_for(queue.get(), timeout=1.0)
+        assert event["type"] == "hitl_filed"
+        assert event["hitl_id"] == h["id"]
+    finally:
+        db_module.unsubscribe_tasks(p["id"], queue)
+
+
+@pytest.mark.asyncio
+async def test_claim_sprint_item_protects_hooks_scripts(db):
+    """ITEM 3 — claim_sprint_item refuses hooks.ps1/.sh items unless force=true."""
+    import json
+    import meridian.server as srv
+
+    p = await db_module.create_project(db, "hooks-protect")
+    item = await db_module.add_sprint_item(db, p["id"], "v1", "Rewrite installer")
+    await db.execute(
+        "UPDATE sprint_items SET touches_files = ? WHERE id = ?",
+        (json.dumps(["hooks.ps1"]), item["id"]),
+    )
+    await db.commit()
+
+    blocked = await srv._dispatch_mcp_tool(
+        "claim_sprint_item",
+        {"project_id": p["id"], "item_id": item["id"]},
+        db, "/tmp",
+    )
+    assert blocked["error"] == "PROTECTED"
+    assert "hooks.ps1" in blocked["protected_files"]
+    reread = await db_module.get_sprint_item(db, item["id"])
+    assert reread["status"] == "pending"
+
+    forced = await srv._dispatch_mcp_tool(
+        "claim_sprint_item",
+        {"project_id": p["id"], "item_id": item["id"], "force": True},
+        db, "/tmp",
+    )
+    assert forced.get("error") != "PROTECTED"
+
+
+def test_failover_status_endpoint(client, monkeypatch):
+    """ITEM 7 — /failover-status reflects the MERIDIAN_IS_FAILOVER env var."""
+    monkeypatch.delenv("MERIDIAN_IS_FAILOVER", raising=False)
+    r = client.get("/failover-status")
+    assert r.status_code == 200
+    assert r.json() == {"is_failover": False}
+
+    monkeypatch.setenv("MERIDIAN_IS_FAILOVER", "1")
+    r2 = client.get("/failover-status")
+    assert r2.json() == {"is_failover": True}
+
+
 def test_sprint_tools_via_mcp_sse_tools_list(client):
     """tools/list on /mcp/sse includes the 4 sprint tools."""
     r = client.post("/mcp/sse", json={

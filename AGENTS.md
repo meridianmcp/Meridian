@@ -121,6 +121,8 @@ Multiple AI sessions (Claude Code + Codex, or two concurrent Claude Code windows
 - `meridian/static/dashboard.js` — monolithic frontend, merge conflicts are painful
 - `meridian/server.py` — central FastAPI app, concurrent edits cause import errors
 - `meridian/db/__init__.py` — all DB logic, schema changes must be serialized
+- `hooks.ps1` — ⛔ NEVER edit or run. User-facing installer; running it rotates the API token and kills the human's active Claude Code session.
+- `hooks.sh` — ⛔ NEVER edit or run. Same token-rotation hazard as `hooks.ps1`.
 
 **Rules:**
 - Never edit a file another active session has claimed (within the last 10 minutes).

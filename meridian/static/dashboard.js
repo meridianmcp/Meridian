@@ -1520,10 +1520,9 @@ function _armAccountSwitchWatch(loadedEmail) {
 
   // Catches changes from planning-chat MCP calls even when dashboard is always visible.
 
-  // Lightweight project-list poll — catches new projects from planning chat.
-  // Full data refresh (_refreshOnFocus) stays on tab-focus only to avoid hammering the server.
-  // TODO: replace with WS push event (server already has WS infrastructure).
-  setInterval(async () => { try { await loadProjects(); } catch(_) {} }, 10000);
+  // ITEM 6 — 10s project-list poll removed. WS push events (note_added,
+  // decision_pinned, sprint_item_added, goal_updated, hitl_filed) now drive live
+  // section refreshes, and _refreshOnFocus catches new projects on tab focus.
 
   setInterval(_checkAccountSwitch, 60000);
 
@@ -6062,6 +6061,45 @@ function displayNotifyTarget(raw) {
 
 // Users who want stronger privacy can paste a longer, custom value.
 
+function osExecutorHintBanner(projectId) {
+  // ITEM 2 — Settings hooks banner: tell the user which shell/Python their
+  // executor will use, based on the browser's OS. Dismiss persists in localStorage.
+  try { if (localStorage.getItem('meridian.hooks.osbanner.dismissed') === '1') return ''; } catch (e) {}
+  const ua = String(navigator.userAgentData?.platform || navigator.platform || navigator.userAgent || '').toLowerCase();
+  const isWin = ua.includes('win');
+  const msg = isWin
+    ? 'Windows detected — executors use <strong>PowerShell</strong>; run Python with <code>pixi run python</code>.'
+    : 'Mac / Linux detected — executors use <strong>bash</strong>; run Python with <code>python3</code>.';
+  return `<div data-os-hint style="display:flex;align-items:flex-start;gap:8px;background:var(--surface-1);border:1px solid var(--border);border-left:3px solid var(--accent);border-radius:4px;padding:8px 10px;margin-bottom:10px;font-size:10px;color:var(--text);line-height:1.5">`
+    + `<span style="flex:1">${msg}</span>`
+    + `<button title="Dismiss" onclick="try{localStorage.setItem('meridian.hooks.osbanner.dismissed','1')}catch(e){}; var _b=this.closest('[data-os-hint]'); if(_b)_b.remove();" style="background:none;border:none;color:var(--muted);cursor:pointer;font-size:13px;line-height:1;padding:0 2px;flex-shrink:0">×</button>`
+    + `</div>`;
+}
+
+function showFailoverBannerIfNeeded() {
+  // ITEM 7 — failover banner: poll /failover-status once on load; if the server
+  // reports failover mode, show a dismissible yellow bar (sessionStorage dismiss).
+  try { if (sessionStorage.getItem('meridian.failover.dismissed') === '1') return; } catch (e) {}
+  fetch('/failover-status').then(r => r.ok ? r.json() : null).then(data => {
+    if (!data || !data.is_failover) return;
+    if (document.getElementById('failover-banner')) return;
+    const bar = document.createElement('div');
+    bar.id = 'failover-banner';
+    bar.style.cssText = 'position:sticky;top:0;z-index:9999;background:#fef3c7;color:#92400e;font-size:12px;font-weight:600;padding:8px 14px;display:flex;align-items:center;gap:10px;border-bottom:1px solid #f59e0b';
+    const label = document.createElement('span');
+    label.style.flex = '1';
+    label.textContent = '⚠ Meridian is running in failover mode — some data may be read-only or delayed.';
+    const btn = document.createElement('button');
+    btn.textContent = '×';
+    btn.title = 'Dismiss';
+    btn.style.cssText = 'background:none;border:none;color:#92400e;font-size:16px;font-weight:700;cursor:pointer;line-height:1;padding:0 4px';
+    btn.onclick = () => { try { sessionStorage.setItem('meridian.failover.dismissed', '1'); } catch (e) {} bar.remove(); };
+    bar.appendChild(label);
+    bar.appendChild(btn);
+    document.body.insertBefore(bar, document.body.firstChild);
+  }).catch(() => {});
+}
+
 function suggestNtfyTopic(projectId) {
 
   const proj = (state.projects || []).find(p => p.id === projectId);
@@ -6485,6 +6523,8 @@ async function loadSettingsTab(projectId) {
 
       <div style="font-size:10px;color:var(--muted);margin-bottom:10px">Install once per machine. Hooks auto-start sessions and sync context with Meridian.</div>
 
+      ${osExecutorHintBanner(projectId)}
+
       <div style="display:grid;gap:10px;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));margin-bottom:10px">
 
         <div>
@@ -6809,6 +6849,8 @@ async function loadSettingsTab(projectId) {
     <div style="padding:0 12px 12px">
 
       <div style="font-size:10px;color:var(--muted);margin-bottom:10px">Install once per machine. Hooks auto-start sessions and sync context with Meridian.</div>
+
+      ${osExecutorHintBanner(projectId)}
 
       <div style="display:grid;gap:10px;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));margin-bottom:10px">
 
@@ -12020,13 +12062,9 @@ function initHitlPanel() {
 
   refreshHitl();
 
-  if (_hitlPollTimer) clearInterval(_hitlPollTimer);
+  // ITEM 6 — 30s HITL poll removed: the hitl_filed WS push refreshes the queue live.
 
-  // 30s poll — cheap (single SELECT) and gives a "felt-instant" feel for
-
-  // a paused AI session looking for a human response.
-
-  _hitlPollTimer = setInterval(refreshHitl, 30_000);
+  if (_hitlPollTimer) { clearInterval(_hitlPollTimer); _hitlPollTimer = null; }
 
 }
 
@@ -13770,6 +13808,54 @@ function handleWsEvent(projectId, event) {
 
   }
 
+  // ITEM 6 — live mutation pushes (replace 10s/30s polling)
+
+  if (event.type === 'sprint_item_added') {
+
+    const panel = state.panels[projectId];
+
+    if (panel && panel.activeVtab === 'queue') loadQueue(projectId);
+
+    scheduleLiveRefresh(projectId);
+
+    refreshProjectCountBadges(projectId);
+
+    return;
+
+  }
+
+  if (event.type === 'note_added') {
+
+    const panel = state.panels[projectId];
+
+    if (panel && panel.activeVtab === 'notes') loadNotesTab(projectId);
+
+    refreshProjectCountBadges(projectId);
+
+    return;
+
+  }
+
+  if (event.type === 'decision_pinned') {
+
+    if (state.panels[projectId]) loadPinnedDecisions(projectId);
+
+    refreshProjectCountBadges(projectId);
+
+    return;
+
+  }
+
+  if (event.type === 'hitl_filed') {
+
+    refreshHitl();
+
+    refreshProjectCountBadges(projectId);
+
+    return;
+
+  }
+
 
 
   const cache = state.panels[projectId].taskCache;
@@ -13920,6 +14006,8 @@ async function restoreTabs() {
 (async function init() {
 
   await loadServerConfig();
+
+  showFailoverBannerIfNeeded();
 
   // v1.9.x — show connection setup modal if no meridian.toml exists
 
