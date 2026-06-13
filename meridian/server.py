@@ -3107,6 +3107,8 @@ async def dashboard_html(request: Request) -> Any:
             "is_admin": is_admin,
         },
     )
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
+    response.headers["Pragma"] = "no-cache"
     # Always clear the demo context cookie so /demo → /dashboard doesn't
     # leave the user stuck in read-only demo mode.
     response.delete_cookie(_DEMO_CONTEXT_COOKIE)
