@@ -7199,6 +7199,57 @@ async def _sprint_item_file_claim_conflicts(
     return conflicts
 
 
+async def _fetch_recent_commits(
+    project: dict[str, Any],
+    tenant: dict[str, Any] | None,
+) -> list[str]:
+    """Fetch last 20 commit messages for a project.
+
+    Tries GitHub API if tenant has github_pat and project has github_repo;
+    falls back to local ``git log --oneline -20``. Returns plain message strings.
+    Non-fatal — returns empty list on any failure.
+    """
+    import subprocess as _sp  # noqa: PLC0415
+    commits: list[str] = []
+    try:
+        if tenant:
+            pat = db_module.decrypt_field(tenant.get("github_pat"))
+            repo = (project.get("github_repo") or "").strip()
+            if pat and repo:
+                import httpx as _httpx  # noqa: PLC0415
+                gh_headers = {
+                    "Authorization": f"token {pat}",
+                    "Accept": "application/vnd.github+json",
+                }
+                async with _httpx.AsyncClient(timeout=8.0) as http:
+                    r = await http.get(
+                        f"https://api.github.com/repos/{repo}/commits",
+                        headers=gh_headers,
+                        params={"per_page": "20"},
+                    )
+                    if r.status_code == 200:
+                        for c in r.json():
+                            msg = c["commit"]["message"].split("\n")[0]
+                            commits.append(msg)
+                if commits:
+                    return commits
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        result = _sp.run(
+            ["git", "log", "--oneline", "-20"],
+            capture_output=True, text=True, timeout=5,
+        )
+        for line in result.stdout.splitlines():
+            line = line.strip()
+            if line and " " in line:
+                _, _, msg = line.partition(" ")
+                commits.append(msg)
+    except Exception:  # noqa: BLE001
+        pass
+    return commits
+
+
 async def _dispatch_mcp_tool(
     name: str,
     args: dict[str, Any],
@@ -7277,6 +7328,9 @@ async def _dispatch_mcp_tool(
             args.get("mode"),
             session_id,
         )
+        # Fetch recent commits for reconcile annotations (non-fatal)
+        _gh_project = await db_module.get_project(db, args["project_id"])
+        _gh_commits = await _fetch_recent_commits(_gh_project or {}, tenant)
         try:
             path, content = await asyncio.wait_for(
                 handoff_module_local.generate_handoff(
@@ -7285,6 +7339,7 @@ async def _dispatch_mcp_tool(
                     data_dir,
                     mode=mode,
                     session_id=session_id,
+                    commit_messages=_gh_commits or None,
                 ),
                 timeout=90.0,
             )
@@ -7335,16 +7390,42 @@ async def _dispatch_mcp_tool(
         await db_module.auto_capture_session(db, project_id, session_id)
         await _finalize_session_md(db, project_id, session_id)
         from . import handoff as handoff_module_local
+        # Fetch recent commits for reconcile annotations (non-fatal)
+        _ckpt_project = await db_module.get_project(db, project_id)
+        _commit_messages = await _fetch_recent_commits(_ckpt_project or {}, tenant)
         try:
             _, content = await asyncio.wait_for(
                 handoff_module_local.generate_handoff(
-                    db, project_id, data_dir, mode="delta", session_id=session_id
+                    db, project_id, data_dir, mode="delta", session_id=session_id,
+                    commit_messages=_commit_messages or None,
                 ),
                 timeout=30.0,
             )
         except asyncio.TimeoutError:
             content = "delta handoff timed out"
         pending_items = await db_module.get_sprint_items(db, project_id, status="pending")
+        # Log drift warnings for high-confidence reconcile matches (non-fatal)
+        if _commit_messages and pending_items:
+            try:
+                _commits_for_reconcile = []
+                for _line in _commit_messages:
+                    _sha = ""
+                    _msg = _line
+                    _commits_for_reconcile.append({"sha": _sha, "message": _msg})
+                _matches = handoff_module_local.reconcile_sprint_items(
+                    pending_items, _commits_for_reconcile
+                )
+                for _m in _matches:
+                    if _m.get("confidence") == "high":
+                        _first_sha = (_m["matching_commits"][0].get("sha") or "")[:8]
+                        await db_module.log_task(
+                            db, session_id, project_id,
+                            f"Sprint board drift detected: {_m['item_id'][:8]} "
+                            f"may already be done (matches commit {_first_sha})",
+                            status="pending",
+                        )
+            except Exception:  # noqa: BLE001
+                pass
         ids_str = ", ".join(it["id"][:8] for it in pending_items[:8])
         next_goal = (
             f'/goal Complete sprint items: {", ".join(it["id"] for it in pending_items[:8])}. '
