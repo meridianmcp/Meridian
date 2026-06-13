@@ -7780,6 +7780,18 @@ Current: ${current || "(none)"}`,
       const ageMs = sessionAgeMs(s);
       return { s, ageMs };
     }).filter(({ ageMs }) => ageMs > 0 && ageMs <= 24 * 3600 * 1e3).sort((a, b) => a.ageMs - b.ageMs);
+    const LIVE_PRESENCE_MS = 10 * 60 * 1e3;
+    const liveSection = root.closest(".live-section");
+    const sectionDivider = liveSection ? liveSection.nextElementSibling : null;
+    const anyLivePresence = rows.some(({ ageMs }) => ageMs <= LIVE_PRESENCE_MS);
+    if (!anyLivePresence) {
+      if (liveSection) liveSection.style.display = "none";
+      if (sectionDivider && sectionDivider.classList && sectionDivider.classList.contains("live-divider")) sectionDivider.style.display = "none";
+      root.innerHTML = "";
+      return;
+    }
+    if (liveSection) liveSection.style.display = "";
+    if (sectionDivider && sectionDivider.classList && sectionDivider.classList.contains("live-divider")) sectionDivider.style.display = "";
     if (!rows.length) {
       root.innerHTML = '<div class="live-empty">No active sessions.</div>';
       return;

@@ -6068,6 +6068,47 @@ async def test_list_hitl_requests_filter_by_status(db):
 
 
 @pytest.mark.asyncio
+async def test_dispatch_list_hitl_requests_project_id_optional(db):
+    """277567dc: omitting project_id lists pending HITLs across ALL projects.
+
+    Planning sessions calling list_hitl_requests scoped to their own project
+    missed HITLs filed under another project (e.g. hook_project_select anchored
+    to projects[0]) and got false 'no pending HITLs' confidence.
+    """
+    import meridian.server as srv
+    p1 = await db_module.create_project(db, "hitl-a")
+    p2 = await db_module.create_project(db, "hitl-b")
+    h1 = await db_module.request_hitl(db, p1["id"], "Question in A")
+    h2 = await db_module.request_hitl(db, p2["id"], "Question in B")
+
+    # No project_id → both projects' pending HITLs are visible.
+    all_pending = await srv._dispatch_mcp_tool("list_hitl_requests", {}, db, "/tmp")
+    ids = {r["id"] for r in all_pending}
+    assert {h1["id"], h2["id"]} <= ids
+
+    # Scoped to one project → only that project's HITLs.
+    scoped = await srv._dispatch_mcp_tool(
+        "list_hitl_requests", {"project_id": p1["id"]}, db, "/tmp"
+    )
+    sids = {r["id"] for r in scoped}
+    assert h1["id"] in sids and h2["id"] not in sids
+
+
+@pytest.mark.asyncio
+async def test_get_session_brief_surfaces_pending_hitl_questions(db):
+    """277567dc: session brief shows pending HITL question text, not just a count."""
+    import meridian.server as srv
+    p = await db_module.create_project(db, "brief-hitl")
+    await db_module.request_hitl(db, p["id"], "Should we rate-limit per IP?")
+    res = await srv._dispatch_mcp_tool(
+        "get_session_brief", {"project_id": p["id"]}, db, "/tmp"
+    )
+    text = res["text"]
+    assert "<hitl_pending" in text
+    assert "Should we rate-limit per IP?" in text
+
+
+@pytest.mark.asyncio
 async def test_get_hitl_request_returns_none_for_unknown(db):
     result = await db_module.get_hitl_request(db, "00000000-0000-0000-0000-000000000000")
     assert result is None
@@ -6398,7 +6439,7 @@ def test_landing_page_has_solution_dashboard_shot(client):
     """G6.27 — landing page shows the real dashboard screenshot, not a mockup."""
     r = client.get("/")
     assert r.status_code == 200
-    assert "/static/the-solution-dashboard-card.png" in r.text
+    assert "/static/dashboard-hero-screenshot.png" in r.text
     assert "solution-shot" in r.text
 
 
@@ -7291,7 +7332,11 @@ def test_hooks_session_start_injects_full_uuid_not_truncated(client):
         json={"version": "v1", "title": "do the thing"},
     ).json()
 
-    r = client.post("/hooks/session-start", json={"project_id": pid})
+    # Executor session (bypassPermissions) → INSTRUCTION/top-item line is emitted.
+    r = client.post(
+        "/hooks/session-start",
+        json={"project_id": pid, "permission_mode": "bypassPermissions"},
+    )
     assert r.status_code == 200
     ctx = r.json()["hookSpecificOutput"]["additionalContext"]
 
@@ -7311,6 +7356,68 @@ def test_hooks_session_start_injects_full_uuid_not_truncated(client):
     assert top_item_id, "Top item id line missing from hook context"
     assert top_item_id == item["id"], "top item id must be the full sprint-item id"
     assert len(top_item_id) == 36
+
+
+def test_hooks_session_start_plain_chat_no_auto_claim_instruction(client):
+    """b11fc37d: plain (non-executor) sessions get context but NO claim instruction.
+
+    The auto-claim nudge must only fire for executor sessions (bypassPermissions /
+    explicit executor flag), or casual chat sessions start grabbing sprint items.
+    """
+    project = client.post("/projects", json={"name": "plain-chat-proj"}).json()
+    pid = project["id"]
+    client.post(
+        f"/projects/{pid}/sprint-items",
+        json={"version": "v1", "title": "do the thing"},
+    )
+
+    # No permission_mode / executor flag → plain chat.
+    plain = client.post("/hooks/session-start", json={"project_id": pid})
+    assert plain.status_code == 200
+    plain_ctx = plain.json()["hookSpecificOutput"]["additionalContext"]
+    assert project["name"] in plain_ctx, "context should still be injected"
+    assert "PENDING SPRINT ITEMS" in plain_ctx, "pending items should still be shown"
+    assert "claim_sprint_item" not in plain_ctx, (
+        "plain chat must NOT be told to claim a sprint item"
+    )
+
+    # Executor flag → instruction present.
+    exe = client.post(
+        "/hooks/session-start",
+        json={"project_id": pid, "executor": True},
+    )
+    assert "claim_sprint_item" in exe.json()["hookSpecificOutput"]["additionalContext"]
+
+
+def test_hooks_session_start_cwd_legacy_repo_path_beats_hostname_fallback(client):
+    """dab3ba0c: cwd-based routing takes priority over the hostname-only fallback.
+
+    A project whose legacy ``repo_path`` matches the session cwd must win over a
+    *different* project that merely has the hostname registered — otherwise a
+    machine registered to one project hijacks sessions that clearly belong to
+    another by their working directory.
+    """
+    # Project A: hostname registered, no cwd → would win the Pass-2 fallback.
+    a = client.post("/projects", json={"name": "route-by-hostname"}).json()
+    client.patch(
+        f"/projects/{a['id']}/settings",
+        json={"executor_config": {"hostnames": [{"hostname": "HOSTX"}]}},
+    )
+    # Project B: legacy single repo_path == cwd (not migrated to repo_paths).
+    b = client.post("/projects", json={"name": "route-by-cwd"}).json()
+    client.patch(
+        f"/projects/{b['id']}/settings",
+        json={"executor_config": {"repo_path": "C:/work/myrepo"}},
+    )
+
+    r = client.post(
+        "/hooks/session-start",
+        json={"cwd": "C:/work/myrepo", "hostname": "HOSTX"},
+    )
+    assert r.status_code == 200
+    ctx = r.json()["hookSpecificOutput"]["additionalContext"]
+    assert f"({b['id']})" in ctx, "cwd (legacy repo_path) match must win over hostname fallback"
+    assert f"({a['id']})" not in ctx, "hostname-only project must not hijack a cwd match"
 
 
 def test_hooks_session_start_missing_project_id(client):

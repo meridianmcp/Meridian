@@ -2878,12 +2878,6 @@ async def get_goal_history(
     return await db_module.get_goal_history(await _db(request), project_id)
 
 
-@app.get("/projects/{project_id}/worktrees")
-async def get_project_worktrees(project_id: str, request: Request) -> list:
-    """Return active worktrees for a project. Stub — returns empty list until worktree tracking is implemented."""
-    return []
-
-
 @app.get("/projects/{project_id}/stats")
 async def get_project_stats(
     project_id: str, request: Request, days: int = 30
@@ -5745,6 +5739,22 @@ async def get_install_ps1() -> PlainTextResponse:
     return PlainTextResponse(script_path.read_text(encoding="utf-8"))
 
 
+def _hook_is_executor(body: dict[str, Any]) -> bool:
+    """True when a SessionStart hook payload denotes an executor session.
+
+    Executor sessions (Claude Code run with --dangerously-skip-permissions, or
+    an explicit executor flag) auto-claim sprint items. Plain conversational
+    sessions must not — they get context injected but no claim instruction.
+    Defaults to False so an unsignalled hook is treated as plain chat.
+    """
+    perm = str(body.get("permission_mode") or "").strip().lower()
+    if perm in ("bypasspermissions", "bypass", "dangerously-skip-permissions"):
+        return True
+    if str(body.get("session_role") or "").strip().lower() == "executor":
+        return True
+    return bool(body.get("executor")) or bool(body.get("dangerously_skip_permissions"))
+
+
 @app.post("/hooks/session-start")
 async def hooks_session_start(body: dict[str, Any], request: Request) -> dict[str, Any]:
     """Claude Code / Codex SessionStart hook.
@@ -5824,6 +5834,13 @@ async def hooks_session_start(body: dict[str, Any], request: Request) -> dict[st
                 if rp_cwd == norm_cwd and (not rp_host or rp_host == norm_hn_ar):
                     matched = p
                     break
+            # dab3ba0c — a project still on the legacy single repo_path (not yet
+            # migrated to repo_paths) must still win on a cwd match, so cwd-based
+            # routing takes priority over the hostname-only fallback below.
+            if not matched and norm_cwd:
+                legacy_rp = (cfg.get("repo_path") or "").strip()
+                if legacy_rp and _normalize_hook_cwd(legacy_rp).lower().rstrip("/") == norm_cwd:
+                    matched = p
             if matched:
                 break
         # Pass 2: hostname registered in any project's hostnames list (hostname-only match)
@@ -6043,7 +6060,12 @@ async def hooks_session_start(body: dict[str, Any], request: Request) -> dict[st
         for t in recent[:5]:
             lines.append(f"- [{t.get('status','?').upper()}] {str(t.get('description',''))[:120]}")
     lines.append(f"\nSESSION ID: {result.get('session_id', '')}")
-    if sprint_items:
+    # b11fc37d — only nudge auto-claim for *executor* sessions. Plain chat sessions
+    # get full context injected but must NOT be told to claim a sprint item, or
+    # casual conversational sessions start grabbing work. The local hook forwards
+    # Claude Code's permission_mode; bypassPermissions (i.e.
+    # --dangerously-skip-permissions) or an explicit executor flag means executor.
+    if sprint_items and _hook_is_executor(body):
         top_item_id = sprint_items[0].get("id", "")
         lines.append(
             f"\nINSTRUCTION: Your first MCP call must be claim_sprint_item on the top "
@@ -8054,8 +8076,10 @@ async def _dispatch_mcp_tool(
         status_filter = args.get("status", "pending")
         if status_filter == "all":
             status_filter = None
+        # project_id is optional — None lists across all projects (like the
+        # dashboard), so cross-project HITLs aren't missed (277567dc).
         return await db_module.list_hitl_requests(
-            db, args["project_id"],
+            db, args.get("project_id"),
             status=status_filter,
             limit=args.get("limit", 50),
         )
@@ -8317,7 +8341,20 @@ async def _dispatch_mcp_tool(
             f'  <item version="{it.get("version","")}">{(it.get("title") or "")[:80]}</item>'
             for it in sprint_items[:5]
         )
-        hitl_attr = f' count="{len(hitl_rows)}"' if hitl_rows else ""
+        # 277567dc — surface the actual pending HITL questions (not just a count)
+        # so a session sees what needs a human decision without a second call.
+        if hitl_rows:
+            hitl_xml = (
+                f'<hitl_pending count="{len(hitl_rows)}">\n'
+                + "\n".join(
+                    f'  <request id="{h.get("id","")}" urgency="{h.get("urgency","normal")}">'
+                    f'{(h.get("question") or "")[:140]}</request>'
+                    for h in hitl_rows[:5]
+                )
+                + "\n</hitl_pending>"
+            )
+        else:
+            hitl_xml = ""
         blocking_xml = f'<blocking>{(blocking[0].get("description") or "")[:100]}</blocking>' if blocking else ""
         # v2.6 — include session scratch-pad notes at top of brief
         notes_xml = ""
@@ -8338,7 +8375,7 @@ async def _dispatch_mcp_tool(
             f'<pending_items>\n{sprint_items_xml}\n</pending_items>\n'
             f'<last_tasks>\n{tasks_xml}\n</last_tasks>\n'
             f'{blocking_xml}\n'
-            f'{"<hitl_pending" + hitl_attr + "/>" if hitl_rows else ""}\n'
+            f'{hitl_xml}\n'
             f'</session_brief>'
         )
         return {"text": brief, "project_id": project_id, "role": role}

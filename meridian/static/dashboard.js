@@ -4981,6 +4981,22 @@ function renderLiveSessions(projectId, sessions, tasks, worktrees) {
 
     .sort((a, b) => a.ageMs - b.ageMs);
 
+  // dc234d4e — hide the Active sessions panel entirely when nothing is live in
+  // the last 10 min, instead of showing an empty "No active sessions" block
+  // (clutter on camera). It reappears on the next refresh once a session is live.
+  const LIVE_PRESENCE_MS = 10 * 60 * 1000;
+  const liveSection = root.closest('.live-section');
+  const sectionDivider = liveSection ? liveSection.nextElementSibling : null;
+  const anyLivePresence = rows.some(({ ageMs }) => ageMs <= LIVE_PRESENCE_MS);
+  if (!anyLivePresence) {
+    if (liveSection) liveSection.style.display = 'none';
+    if (sectionDivider && sectionDivider.classList && sectionDivider.classList.contains('live-divider')) sectionDivider.style.display = 'none';
+    root.innerHTML = '';
+    return;
+  }
+  if (liveSection) liveSection.style.display = '';
+  if (sectionDivider && sectionDivider.classList && sectionDivider.classList.contains('live-divider')) sectionDivider.style.display = '';
+
   if (!rows.length) {
 
     root.innerHTML = '<div class="live-empty">No active sessions.</div>';
