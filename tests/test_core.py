@@ -4592,7 +4592,7 @@ def test_dashboard_uses_static_assets(client):
     """Dashboard HTML references static files, not inline scripts."""
     r = client.get("/dashboard")
     assert r.status_code == 200
-    assert "/static/dashboard.js" in r.text
+    assert "/static/dashboard.bundle.js" in r.text
     assert "/static/dashboard.css" in r.text
 
 
@@ -5596,6 +5596,26 @@ def test_dashboard_js_renders_session_summary_in_live_tab(client):
     assert "active_only=false" in js, "LIVE tab must fetch with active_only=false"
 
 
+@pytest.mark.asyncio
+async def test_checkpoint_writes_session_summary(db, tmp_path):
+    """checkpoint() writes a non-empty session_summary to the sessions table."""
+    import meridian.server as srv
+    p = await db_module.create_project(db, "ckpt-summary-test")
+    s = await db_module.register_session(db, p["id"], "test-ckpt-session")
+    await db_module.log_task(db, s["id"], p["id"], "Fixed the bug", status="done")
+    result = await srv._dispatch_mcp_tool(
+        "checkpoint", {"session_id": s["id"], "project_id": p["id"]}, db, str(tmp_path)
+    )
+    assert isinstance(result, dict), "checkpoint should return a dict"
+    async with db.execute(
+        "SELECT session_summary FROM sessions WHERE id = ?", (s["id"],)
+    ) as cur:
+        row = await cur.fetchone()
+    assert row is not None
+    summary_val = row["session_summary"] if hasattr(row, "__getitem__") else row[0]
+    assert summary_val, "checkpoint() must write non-empty session_summary"
+
+
 # ---------------------------------------------------------------------------
 # Goal history filter — AUTO BLOCKS-only versions collapsed
 # ---------------------------------------------------------------------------
@@ -5918,6 +5938,151 @@ def test_dashboard_clears_demo_cookie(client):
     assert "max-age=0" in set_cookie.lower()
 
 
+def test_dashboard_js_filesystem_mcp_snippet_hidden_in_hosted_mode(client):
+    """dashboard.js filesystem MCP snippet is gated on !isHostedMode()."""
+    js = client.get("/static/dashboard.js").text
+    assert "server-filesystem" in js, "filesystem MCP snippet must be present in dashboard.js"
+    assert "isHostedMode" in js, "must be guarded by isHostedMode check"
+    assert "_allRepoPaths" in js, "must check repo_paths before showing snippet"
+
+
+def test_changelog_page_renders_devlog_sections(client):
+    """GET /changelog renders DEVLOG.md ## sections as individual entries."""
+    r = client.get("/changelog")
+    assert r.status_code == 200
+    assert "entry" in r.text.lower() or "entry-title" in r.text, "must render entries"
+    assert "entry-title" in r.text, "must have entry-title CSS class"
+
+
+def test_changelog_page_links_back_to_home(client):
+    """GET /changelog has a link back to the landing page."""
+    r = client.get("/changelog")
+    assert r.status_code == 200
+    assert 'href="/"' in r.text, "changelog must have a Back link to /"
+
+
+def test_landing_html_changelog_link_is_local(client):
+    """landing.html footer Changelog link must point to /changelog not GitHub."""
+    r = client.get("/")
+    assert r.status_code == 200
+    assert 'href="/changelog"' in r.text, "landing footer must link to /changelog"
+    assert "CHANGELOG.md" not in r.text or '/changelog"' in r.text, \
+        "landing footer should use local /changelog not GitHub CHANGELOG.md"
+
+
+def test_dashboard_html_has_changelog_sidebar_link(client):
+    """dashboard.html sidebar-footer must contain a changelog link."""
+    r = client.get("/dashboard")
+    assert r.status_code == 200
+    assert "/changelog" in r.text, "dashboard sidebar must link to /changelog"
+
+
+def test_changelog_route_is_public_no_auth(client):
+    """GET /changelog returns 200 without any auth cookie (public page)."""
+    r = client.get("/changelog", cookies={})
+    assert r.status_code == 200
+    assert "text/html" in r.headers["content-type"]
+
+
+def test_changelog_page_has_correct_title(client):
+    """GET /changelog has the right <title> element."""
+    r = client.get("/changelog")
+    assert r.status_code == 200
+    assert "Changelog" in r.text
+    assert "Meridian" in r.text
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_session_summary_contains_tasks_done(db, tmp_path):
+    """checkpoint() session_summary includes tasks-done count."""
+    import meridian.server as srv
+    p = await db_module.create_project(db, "ckpt-summary-tasks-test")
+    s = await db_module.register_session(db, p["id"], "session-with-tasks")
+    await db_module.log_task(db, s["id"], p["id"], "task one", status="done")
+    await db_module.log_task(db, s["id"], p["id"], "task two", status="done")
+    await srv._dispatch_mcp_tool(
+        "checkpoint", {"session_id": s["id"], "project_id": p["id"]}, db, str(tmp_path)
+    )
+    async with db.execute(
+        "SELECT session_summary FROM sessions WHERE id = ?", (s["id"],)
+    ) as cur:
+        row = await cur.fetchone()
+    val = row["session_summary"] if hasattr(row, "__getitem__") else row[0]
+    assert val and "Tasks done" in val, "session_summary must mention tasks done"
+
+
+def test_dashboard_js_recent_sessions_has_chevron(client):
+    """dashboard.js Recent Sessions rows have a chevron toggle element."""
+    js = client.get("/static/dashboard.js").text
+    assert "recent-session-chevron" in js, "recent-session-chevron class must be in JS"
+
+
+def test_dashboard_js_recent_sessions_shows_full_summary_on_expand(client):
+    """dashboard.js expand handler shows full-summary data attribute content."""
+    js = client.get("/static/dashboard.js").text
+    assert "fullSummary" in js or "full-summary" in js, \
+        "expand handler must use full session summary"
+    assert "full_summary" in js or "data-full-summary" in js or "fullSummary" in js, \
+        "full summary must be passed via data attribute"
+
+
+def test_dashboard_js_session_summary_handles_string_type(client):
+    """dashboard.js handles session_summary as string (checkpoint plain text format)."""
+    js = client.get("/static/dashboard.js").text
+    assert "typeof _rawSummary" in js or "typeof rawSummary" in js or \
+        "typeof _rawSummary === 'string'" in js, \
+        "dashboard.js must handle string session_summary from checkpoint"
+
+
+def test_filesystem_mcp_snippet_has_claude_mcp_add_command(client):
+    """dashboard.js filesystem snippet includes the claude mcp add command."""
+    js = client.get("/static/dashboard.js").text
+    assert "claude mcp add filesystem" in js, \
+        "filesystem snippet must include 'claude mcp add filesystem' command"
+
+
+def test_filesystem_mcp_snippet_has_copy_buttons(client):
+    """dashboard.js filesystem snippet has copy buttons."""
+    js = client.get("/static/dashboard.js").text
+    assert "server-filesystem" in js
+    assert "navigator.clipboard" in js, "filesystem snippet must have copy buttons using clipboard API"
+
+
+def test_filesystem_mcp_section_collapsible(client):
+    """dashboard.js filesystem MCP section uses a collapsible <details> element."""
+    js = client.get("/static/dashboard.js").text
+    assert "fs-mcp-section-" in js, "filesystem MCP section must have an id"
+    assert "<details>" in js or "details>" in js, \
+        "filesystem MCP section must use <details> for collapsible"
+
+
+def test_filesystem_mcp_snippet_wsl_note(client):
+    """dashboard.js filesystem snippet includes WSL/remote note."""
+    js = client.get("/static/dashboard.js").text
+    assert "WSL" in js, "filesystem snippet must mention WSL"
+    assert "cloudflared" in js, "filesystem snippet must mention cloudflared for remote"
+
+
+def test_sessions_api_accepts_string_session_summary(client):
+    """Sessions endpoint accepts string session_summary (not just dict)."""
+    project = client.post("/projects", json={"name": "str-summary-test"}).json()
+    sess = client.post(
+        "/sessions/register", json={"project_id": project["id"], "name": "test-sess"}
+    ).json()
+    r = client.get(f"/projects/{project['id']}/sessions?active_only=false")
+    assert r.status_code == 200
+    rows = r.json()
+    assert rows, "expected sessions in response"
+    assert "session_summary" in rows[0], "session_summary field must be in response"
+
+
+def test_changelog_page_has_back_nav(client):
+    """GET /changelog has proper navigation structure."""
+    r = client.get("/changelog")
+    assert r.status_code == 200
+    assert "Back" in r.text or "← Back" in r.text, "changelog must have a back navigation link"
+
+
 def test_terms_page_returns_200(client):
     """GET /terms returns 200 and contains ToS content."""
     r = client.get("/terms")
@@ -5934,6 +6099,14 @@ def test_privacy_page_returns_200(client):
     assert "text/html" in r.headers["content-type"]
     assert "Privacy Policy" in r.text
     assert "hello@usemeridian.us" in r.text
+
+
+def test_changelog_page_returns_200(client):
+    """GET /changelog returns 200 and renders DEVLOG.md sections as HTML."""
+    r = client.get("/changelog")
+    assert r.status_code == 200
+    assert "text/html" in r.headers["content-type"]
+    assert "Changelog" in r.text
 
 
 def test_demo_write_blocked_with_cookie(client):

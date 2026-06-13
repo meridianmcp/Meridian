@@ -277,3 +277,6 @@ launch/
 
 # Codex session state files
 .codex-*-state.json
+
+# Node / esbuild (ITEM 4)
+node_modules/

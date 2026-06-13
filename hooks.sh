@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Strip Windows CRLF if present
+sed -i 's/\r//' "$0" 2>/dev/null || true
 # hooks.sh - Meridian session lifecycle hooks installer
 #
 # Usage:
@@ -11,6 +13,17 @@
 #
 # Requirements: curl, jq
 set -euo pipefail
+
+if ! command -v jq &>/dev/null; then
+  echo "Error: jq is required but not found. Install it:"
+  echo "  macOS:         brew install jq"
+  echo "  Debian/Ubuntu: sudo apt install -y jq"
+  echo "  Fedora/RHEL:   sudo dnf install -y jq"
+  echo "  Arch:          sudo pacman -S jq"
+  echo "  Alpine:        apk add jq"
+  echo "  HPC/no sudo:   download from https://jqlang.github.io/jq/download/"
+  exit 1
+fi
 
 DEFAULT_URL="https://usemeridian.us"
 MERIDIAN_URL=""
@@ -36,9 +49,13 @@ echo ""
 
 # ---- Step 1: URL -------------------------------------------------------------
 if [[ -z "$MERIDIAN_URL" ]]; then
-  read -rp "Meridian server URL [$DEFAULT_URL]: " MERIDIAN_URL
+  if [ -t 0 ]; then
+    read -rp "Meridian server URL [$DEFAULT_URL]: " input_url
+    MERIDIAN_URL="${input_url:-$DEFAULT_URL}"
+  else
+    MERIDIAN_URL="$DEFAULT_URL"
+  fi
 fi
-MERIDIAN_URL="${MERIDIAN_URL:-$DEFAULT_URL}"
 MERIDIAN_URL="${MERIDIAN_URL%/}"
 
 if [[ ! "$MERIDIAN_URL" =~ ^https?:// ]]; then

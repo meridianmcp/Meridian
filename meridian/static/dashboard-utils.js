@@ -1,12 +1,12 @@
 // dashboard-utils.js — utility functions extracted from dashboard.js
 // Loaded first; all symbols are plain globals (no import/export).
 
-const _PLAN_LABELS = { solo: 'Standard', free: 'Free Trial', standard: 'Standard', pro: 'Pro', trial: 'Trial', admin: 'Admin' };
+export const _PLAN_LABELS = { solo: 'Standard', free: 'Free Trial', standard: 'Standard', pro: 'Pro', trial: 'Trial', admin: 'Admin' };
 
-const QUEUE_DONE_PAGE_SIZE = 10;
-const SESSION_LIVE_WINDOW_MS = 10 * 60 * 1000;
+export const QUEUE_DONE_PAGE_SIZE = 10;
+export const SESSION_LIVE_WINDOW_MS = 10 * 60 * 1000;
 
-function getPanelState(projectId) {
+export function getPanelState(projectId) {
 
   state.panels[projectId] = state.panels[projectId] || {};
 
@@ -14,7 +14,7 @@ function getPanelState(projectId) {
 
 }
 
-function toast(msg, isError=false) {
+export function toast(msg, isError=false) {
 
   const el = document.getElementById('toast');
 
@@ -30,13 +30,13 @@ function toast(msg, isError=false) {
 
 }
 
-function escapeHtml(s) {
+export function escapeHtml(s) {
 
   return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 
 }
 
-function formatRelativeTime(ts) {
+export function formatRelativeTime(ts) {
 
   if (!ts) return '';
 
@@ -62,7 +62,7 @@ function formatRelativeTime(ts) {
 
 }
 
-function sessionAgeMs(session) {
+export function sessionAgeMs(session) {
   const raw = session && session.last_seen ? String(session.last_seen) : '';
   if (!raw) return Number.POSITIVE_INFINITY;
   const iso = raw.includes('T') ? raw : raw.replace(' ', 'T') + 'Z';
@@ -70,14 +70,14 @@ function sessionAgeMs(session) {
   return Number.isFinite(parsed) ? Date.now() - parsed : Number.POSITIVE_INFINITY;
 }
 
-function isLiveSession(session, ageMs) {
+export function isLiveSession(session, ageMs) {
   const age = ageMs == null ? sessionAgeMs(session) : ageMs;
   return session && session.status === 'active' && age >= 0 && age <= SESSION_LIVE_WINDOW_MS;
 }
 
-const _HUMAN_COLORS = ['#6c8fff', '#a78bfa', '#22d3ee', '#4ade80', '#fbbf24', '#f87171', '#fb923c', '#e879f9'];
+export const _HUMAN_COLORS = ['#6c8fff', '#a78bfa', '#22d3ee', '#4ade80', '#fbbf24', '#f87171', '#fb923c', '#e879f9'];
 
-function _colorForHuman(humanId) {
+export function _colorForHuman(humanId) {
 
   /** Stable hash → palette index so each human keeps the same activity color. */
 
@@ -89,3 +89,8 @@ function _colorForHuman(humanId) {
 
 }
 
+
+
+// --- ITEM 4 esbuild: re-expose top-level symbols as globals so inline
+// handlers and cross-file references keep resolving after IIFE bundling.
+try { Object.assign(window, { getPanelState, toast, escapeHtml, formatRelativeTime, sessionAgeMs, isLiveSession, _colorForHuman, _PLAN_LABELS, QUEUE_DONE_PAGE_SIZE, SESSION_LIVE_WINDOW_MS, _HUMAN_COLORS }); } catch (e) {}

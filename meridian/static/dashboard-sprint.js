@@ -1,7 +1,7 @@
 // dashboard-sprint.js — sprint/queue renderers extracted from dashboard.js
 // Depends on: dashboard-utils.js (escapeHtml, getPanelState, formatRelativeTime, _PLAN_LABELS)
 
-function _renderPlanBadge(me) {
+export function _renderPlanBadge(me) {
 
   const planColors = { free: '#3b82f6', trial: '#059669', standard: '#3b82f6', pro: '#7c3aed', admin: '#9ca3af' };
 
@@ -188,7 +188,7 @@ function _renderPlanBadge(me) {
 
 }
 
-function renderSprintProgress(projectId, items) {
+export function renderSprintProgress(projectId, items) {
 
   /** Full grouped sprint board — replaces the old plain progress bar. */
 
@@ -668,7 +668,7 @@ function renderSprintProgress(projectId, items) {
 
 }
 
-function renderQueue(projectId, sprintItems = []) {
+export function renderQueue(projectId, sprintItems = []) {
 
   /** Render the 5-group sprint board for the Queue tab.
 
@@ -885,3 +885,8 @@ function renderQueue(projectId, sprintItems = []) {
 
 }
 
+
+
+// --- ITEM 4 esbuild: re-expose top-level symbols as globals so inline
+// handlers and cross-file references keep resolving after IIFE bundling.
+try { Object.assign(window, { _renderPlanBadge, renderSprintProgress, renderQueue }); } catch (e) {}

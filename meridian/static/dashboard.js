@@ -1,3 +1,10 @@
+// --- ITEM 4 esbuild: pull module scripts into the bundle graph ---
+import "./dashboard-utils.js";
+import "./dashboard-demo.js";
+import "./dashboard-timeline.js";
+import "./dashboard-mcp.js";
+import "./dashboard-sprint.js";
+
 ﻿const TABS_KEY = 'meridian.openTabs';
 
 const ACTIVE_PROJECT_KEY = 'meridian.activeProject';
@@ -5440,9 +5447,9 @@ function wireClaudeLaunchPanel(projectId) {
 
     const instructions = `Auto-setup Meridian hooks for your AI tools:\n\n` +
 
-      `macOS / Linux / WSL:\n  curl -fsSL ${baseUrl}/hooks.sh | bash\n\n` +
+      `macOS / Linux / WSL:\n  curl -fsSL ${baseUrl}/install.sh | sh\n\n` +
 
-      `Windows PowerShell:\n  irm ${baseUrl}/hooks.ps1 | iex\n\n` +
+      `Windows PowerShell:\n  irm ${baseUrl}/install.ps1 | iex\n\n` +
 
       `These scripts detect Claude Code and Codex, then wire SessionStart + Stop\n` +
 
@@ -6297,10 +6304,10 @@ async function loadSettingsTab(projectId) {
 
   function detectHookInstallOS() {
     const platform = String(navigator.userAgentData?.platform || navigator.platform || navigator.userAgent || '').toLowerCase();
-    if (platform.includes('win')) return { label: 'Windows', command: `irm ${hooksBaseUrl}/hooks.ps1 | iex` };
-    if (platform.includes('mac')) return { label: 'macOS', command: `curl -fsSL ${hooksBaseUrl}/hooks.sh | bash` };
-    if (platform.includes('linux') || platform.includes('x11')) return { label: 'Linux / WSL', command: `curl -fsSL ${hooksBaseUrl}/hooks.sh | bash` };
-    return { label: 'Unknown OS', command: `curl -fsSL ${hooksBaseUrl}/hooks.sh | bash` };
+    if (platform.includes('win')) return { label: 'Windows', command: `irm ${hooksBaseUrl}/install.ps1 | iex` };
+    if (platform.includes('mac')) return { label: 'macOS', command: `curl -fsSL ${hooksBaseUrl}/install.sh | sh` };
+    if (platform.includes('linux') || platform.includes('x11')) return { label: 'Linux / WSL', command: `curl -fsSL ${hooksBaseUrl}/install.sh | sh` };
+    return { label: 'Unknown OS', command: `curl -fsSL ${hooksBaseUrl}/install.sh | sh` };
   }
 
 
@@ -6411,6 +6418,25 @@ async function loadSettingsTab(projectId) {
       '<span style="font-weight:600;font-size:11px;color:var(--text)">' + title + '</span>' +
       '</summary><div style="padding:0 0 4px">';
   };
+
+  // Collect repo_paths across all projects for filesystem MCP snippet
+  const _allRepoPaths = [];
+  if (!isHostedMode()) {
+    try {
+      const _allProjSettings = await Promise.allSettled(
+        (state.projects || []).map(p => loadProjectSettings(p.id))
+      );
+      for (const _ps of _allProjSettings) {
+        if (_ps.status === 'fulfilled') {
+          const _rps = Array.isArray(_ps.value?.executor_config?.repo_paths)
+            ? _ps.value.executor_config.repo_paths : [];
+          for (const _rp of _rps) {
+            if (_rp && !_allRepoPaths.includes(_rp)) _allRepoPaths.push(_rp);
+          }
+        }
+      }
+    } catch (_) {}
+  }
 
   let html = '';
   const detectedHookOS = detectHookInstallOS();
@@ -8244,6 +8270,37 @@ async function loadSettingsTab(projectId) {
     </div>
   </div>`;
 
+  // Local file reading snippet — self-hosted only, only when repo_paths are set
+  if (!isHostedMode() && _allRepoPaths.length > 0) {
+    const _fsPaths = _allRepoPaths.map(p => JSON.stringify(p)).join(' ');
+    const _fsNpx = `npx -y @modelcontextprotocol/server-filesystem ${_allRepoPaths.map(p => JSON.stringify(p)).join(' ')}`;
+    const _fsClaude = `claude mcp add filesystem -- npx -y @modelcontextprotocol/server-filesystem ${_allRepoPaths.map(p => JSON.stringify(p)).join(' ')}`;
+    html += `<div style="margin-bottom:16px" id="fs-mcp-section-${projectId}">
+      <details>
+        <summary style="cursor:pointer;list-style:none;display:flex;align-items:center;gap:6px;padding-bottom:6px;border-bottom:1px solid var(--border);margin-bottom:8px">
+          <span style="color:var(--accent);font-size:10px;letter-spacing:.06em;text-transform:uppercase">Local file reading for planning chat</span>
+          <span style="font-size:9px;color:var(--muted);margin-left:auto">▼</span>
+        </summary>
+        <div style="font-size:10px;color:var(--muted);margin-bottom:8px">Add a filesystem MCP server so Claude can read your repo files during planning conversations.</div>
+        <div style="margin-bottom:8px">
+          <div style="font-size:9px;color:var(--muted);margin-bottom:3px">npx command:</div>
+          <div style="display:flex;gap:6px;align-items:flex-start">
+            <code id="fs-mcp-npx-${projectId}" style="flex:1;display:block;padding:6px 8px;border:1px solid var(--border);border-radius:3px;background:var(--surface-1);color:var(--text);font-size:9px;font-family:var(--font-mono);white-space:pre-wrap;word-break:break-all">${escapeHtml(_fsNpx)}</code>
+            <button class="secondary" style="font-size:9px;padding:3px 8px;flex-shrink:0" onclick="navigator.clipboard.writeText(${JSON.stringify(_fsNpx)}).then(()=>toast('Copied')).catch(()=>toast('Copy failed',true))">Copy</button>
+          </div>
+        </div>
+        <div style="margin-bottom:8px">
+          <div style="font-size:9px;color:var(--muted);margin-bottom:3px">claude mcp add (Claude Code):</div>
+          <div style="display:flex;gap:6px;align-items:flex-start">
+            <code style="flex:1;display:block;padding:6px 8px;border:1px solid var(--border);border-radius:3px;background:var(--surface-1);color:var(--text);font-size:9px;font-family:var(--font-mono);white-space:pre-wrap;word-break:break-all">${escapeHtml(_fsClaude)}</code>
+            <button class="secondary" style="font-size:9px;padding:3px 8px;flex-shrink:0" onclick="navigator.clipboard.writeText(${JSON.stringify(_fsClaude)}).then(()=>toast('Copied')).catch(()=>toast('Copy failed',true))">Copy</button>
+          </div>
+        </div>
+        <div style="font-size:9px;color:var(--muted);line-height:1.5">Requires Node.js. Add the generated URL as a second connector in claude.ai.<br>WSL users: localhost works directly. Remote/SSH: use <code style="font-size:8px">cloudflared tunnel --url http://localhost:PORT</code></div>
+      </details>
+    </div>`;
+  }
+
   // Team members section (hosted mode only) — always visible for all plan tiers (ecdae392)
 
   if (isHostedMode()) {
@@ -9116,9 +9173,9 @@ async function loadSettingsTab(projectId) {
 
       const activeToken = hooksToken || hostedPlaceholderToken;
 
-      const installUnix = `curl -fsSL ${hooksBaseUrl}/hooks.sh | bash`;
+      const installUnix = `curl -fsSL ${hooksBaseUrl}/install.sh | sh`;
 
-      const installWindows = `irm ${hooksBaseUrl}/hooks.ps1 | iex`;
+      const installWindows = `irm ${hooksBaseUrl}/install.ps1 | iex`;
 
       const snippets = {
 
@@ -9207,7 +9264,7 @@ async function loadSettingsTab(projectId) {
           const _revokeLabel = btn.getAttribute('data-token-label') || '';
           const _isHooksKey = _revokeLabel.includes('hooks') || _revokeLabel.includes('installer');
           const _revokeMsg = _isHooksKey
-            ? 'This key may be used in your Claude Code hooks.\n\nAfter revoking, re-run: irm https://usemeridian.us/hooks.ps1 | iex\n\nRevoke anyway?'
+            ? 'This key may be used in your Claude Code hooks.\n\nAfter revoking, re-run: irm https://usemeridian.us/install.ps1 | iex\n\nRevoke anyway?'
             : 'Revoke this API key? Existing clients using it will stop working.';
           if (!confirm(_revokeMsg)) return;
 
@@ -10857,7 +10914,12 @@ async function loadRecentSessions(projectId, sessions = null) {
 
         const status = s.status === 'idle' ? 'idle' : s.status === 'closed' ? 'done' : (s.status || 'session');
 
-        const summary = escapeHtml((s.session_summary || '').slice(0, 90));
+        const _rawSummary = s.session_summary;
+        const summaryText = typeof _rawSummary === 'string'
+          ? _rawSummary
+          : (_rawSummary && _rawSummary.summary ? _rawSummary.summary : '');
+        const summaryPreview = summaryText ? escapeHtml(summaryText.slice(0, 90)) : '';
+        const hasSummary = !!summaryText;
 
         const humanClause = s.human_id ? `, human_id="${String(s.human_id).replace(/"/g, '\\"')}"` : '';
 
@@ -10880,13 +10942,14 @@ async function loadRecentSessions(projectId, sessions = null) {
                 style="padding:1px 6px;font-size:9px" title="Copy start_session() to clipboard">Resume</button>
               <button class="secondary recent-session-timeline-btn" data-session-id="${escapeHtml(s.id)}"
                 style="padding:1px 6px;font-size:9px" title="Open filtered timeline">Timeline</button>
+              <span class="recent-session-chevron" style="font-size:9px;color:var(--muted);margin-left:2px">▼</span>
 
             </div>
 
           </div>
 
-          ${summary ? `<div style="font-size:9px;color:var(--muted);margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="${escapeHtml(s.summary || s.last_summary || '')}">${summary}</div>` : ''}
-          <div class="recent-session-tasks" style="display:none;margin-top:6px;padding-top:5px;border-top:1px solid var(--border);font-size:10px;color:var(--muted)"></div>
+          ${summaryPreview ? `<div style="font-size:9px;color:var(--muted);margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="${escapeHtml(summaryText)}">${summaryPreview}</div>` : ''}
+          <div class="recent-session-tasks" data-full-summary="${escapeHtml(summaryText)}" style="display:none;margin-top:6px;padding-top:5px;border-top:1px solid var(--border);font-size:10px;color:var(--muted)"></div>
 
         </div>`;
 
@@ -10911,27 +10974,36 @@ async function loadRecentSessions(projectId, sessions = null) {
       };
     });
     el.querySelectorAll('.recent-session-row').forEach(row => {
-      row.onclick = async () => {
+      row.onclick = async (evt) => {
+        if (evt.target.closest('.resume-session-btn, .recent-session-timeline-btn')) return;
         const target = row.querySelector('.recent-session-tasks');
+        const chevron = row.querySelector('.recent-session-chevron');
         const sid = row.dataset.sessionId;
         if (!target || !sid) return;
         if (target.style.display !== 'none') {
           target.style.display = 'none';
+          if (chevron) chevron.textContent = '▼';
           return;
         }
         if (!target.dataset.loaded) {
           target.textContent = 'loading...';
           try {
-            const rows = await api(`/projects/${projectId}/sessions/${sid}/tasks/live?limit=20`);
-            target.innerHTML = rows && rows.length
-              ? rows.map(t => `<div style="padding:2px 0"><span style="color:var(--accent)">${escapeHtml((t.status || '').toUpperCase())}</span> ${escapeHtml((t.description || '').slice(0, 180))}</div>`).join('')
+            const fullSummary = target.dataset.fullSummary || '';
+            const taskRows = await api(`/projects/${projectId}/sessions/${sid}/tasks/live?limit=20`);
+            const summaryHtml = fullSummary
+              ? `<div style="color:var(--text-dim);margin-bottom:5px;white-space:pre-wrap;word-break:break-word">${escapeHtml(fullSummary)}</div>`
+              : '';
+            const tasksHtml = taskRows && taskRows.length
+              ? taskRows.map(t => `<div style="padding:2px 0"><span style="color:var(--accent)">${escapeHtml((t.status || '').toUpperCase())}</span> ${escapeHtml((t.description || '').slice(0, 180))}</div>`).join('')
               : '<div>(no task log for this session)</div>';
+            target.innerHTML = summaryHtml + tasksHtml;
             target.dataset.loaded = '1';
           } catch(e) {
             target.textContent = 'failed to load tasks';
           }
         }
         target.style.display = 'block';
+        if (chevron) chevron.textContent = '▲';
       };
     });
 
@@ -15605,3 +15677,8 @@ async function copyRewindLink(projectId) {
 
 }
 
+
+
+// --- ITEM 4 esbuild: re-expose top-level symbols as globals so inline
+// handlers and cross-file references keep resolving after IIFE bundling.
+try { Object.assign(window, { hideHostedAdminControls, ensureSignOutLink, ensureWorkspaceSwitcher, showConnectDbModal, showLocalServerControls, _summarizeApiErrorText, _projectLoadErrorInfo, wireProjectLoadRetry, renderProjectLoadError, recordProjectLoadError, clearProjectLoadError, renderProjectLoadAlert, retryProjectSurface, syncSidebarActiveProject, autosizeGoalField, githubIconSvg, getConstitutionLimit, loadProjectSettings, saveProjectSettings, _demoTourDone, _demoTourSavedStep, _demoTourSaveStep, _demoTourMarkDone, _demoTourClose, _tourActivateVtab, startDemoTour, resumeDemoTour, api, projectApi, loadServerConfig, _armAccountSwitchWatch, _refreshOnFocus, _checkAccountSwitch, _showAccountSwitchBanner, updateGitHubConnectionIndicator, _updateConnectionIndicator, checkGitStatus, _doRestart, loadConfig, loadProjects, openTab, closeTab, saveTabs, renderTabs, _makeTabEl, _openTabMenu, _setProjectIcon, _renameProject, _deleteProject, activateTab, buildTabBody, scheduleLiveRefresh, initLiveAutoRefresh, loadLiveTab, refreshLiveTab, wireSprintAddEnter, sprintAction, sprintPushPrompt, sprintFeedback, sprintFeedbackNote, sprintItemEdit, addSprintItemFromInput, cacheMostRecentSession, renderLiveSessions, endLiveSession, openTimelineForSession, renderLiveQueue, addLiveTask, cancelLiveTask, showCopyPreview, wireClaudeLaunchPanel, stampHandoffTs, populateSessionDropdown, loadTimeline, _renderTimelineLog, loadDocsTab, normalizeNotifyTarget, displayNotifyTarget, osExecutorHintBanner, showFailoverBannerIfNeeded, suggestNtfyTopic, loadSettingsTab, loadNotesTab, loadHitlTab, loadTeamTab, updateLiveFeed, loadRecentSessions, loadMilestones, loadRecentRuns, loadQueue, renderSearchResults, wireQueueSectionToggles, _rewriteRepoImages, loadFilesTab, openFileEditor, saveFile, refreshTab, refreshGoal, parseDecisionsBlob, renderConstitutionWarning, _hitlBadgeClick, initHitlPanel, setVtabCountBadge, refreshProjectCountBadges, refreshHitl, _hitlAnswer, _hitlDismiss, loadPinnedDecisions, supersedePinnedDecision, addPinnedDecision, consolidateDecisions, renderDecisionsTable, wireGoalPreviewToggle, saveGoal, saveNorthStar, saveSprint, _sessionPresenceDot, refreshSessions, refreshTasks, renderTasks, _loadMoreTasks, renderTaskRow, deleteTaskRow, renderHitlRow, wireHitlRow, appendToGoal, hitlReply, hitlExecute, connectWs, handleWsEvent, restoreTabs, _deleteSprintItem, _sprintAction, completeSprintItem, failSprintItem, initRewindTab, toggleExpand, loadRewindTab, renderRewindSubtabs, renderRewindCharts, initRewindCharts, renderRewindSprint, _rewindSec, renderRewindActivity, renderRewindVersions, renderRewindGoals, copyRewindLink, state }); } catch (e) {}
