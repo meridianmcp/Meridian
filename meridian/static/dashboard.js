@@ -51,7 +51,7 @@ window.state = state;
 
 
 
-function hideHostedAdminControls() {
+async function hideHostedAdminControls() {
 
   // Hide ALL server-management controls — Restart/Stop kill the shared Fly machine
 
@@ -132,6 +132,26 @@ function hideHostedAdminControls() {
   // returns {} — the free-tier signout-missing bug fix.
 
   ensureSignOutLink();
+
+
+
+  // Plan badge + signed-in-as email — fetch /me and render badge here so it
+
+  // shows up even if loadServerConfig's /me call was swallowed by a catch.
+
+  try {
+
+    const me = await api('/me');
+
+    if (me && me.plan) {
+
+      _renderPlanBadge(me);
+
+      ensureSignOutLink(me.email);
+
+    }
+
+  } catch (e) { /* not hosted / not logged in */ }
 
 
 

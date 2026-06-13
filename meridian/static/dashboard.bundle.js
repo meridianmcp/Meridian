@@ -1639,7 +1639,7 @@
     activeWorkspaceTenantId: null
   };
   window.state = state;
-  function hideHostedAdminControls() {
+  async function hideHostedAdminControls() {
     const toHide = [
       "#restart-server-btn",
       "#stop-server-btn",
@@ -1671,6 +1671,14 @@
       footer.prepend(lbl);
     }
     ensureSignOutLink2();
+    try {
+      const me = await api2("/me");
+      if (me && me.plan) {
+        _renderPlanBadge(me);
+        ensureSignOutLink2(me.email);
+      }
+    } catch (e) {
+    }
     const advLink = document.getElementById("ez-advanced-link");
     if (advLink) advLink.textContent = "Close";
   }

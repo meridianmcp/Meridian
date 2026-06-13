@@ -350,7 +350,8 @@ async def test_get_available_pool_project(db):
 
 
 @pytest.mark.asyncio
-async def test_open_tenant_db_falls_back_to_auth_db_when_decrypt_fails(monkeypatch):
+async def test_open_tenant_db_admin_falls_back_to_auth_db_when_decrypt_fails(monkeypatch):
+    """Admin tenant with bad neon_db_url falls back to MERIDIAN_AUTH_DB."""
     from cryptography.fernet import InvalidToken
 
     import meridian._deps as deps_module
@@ -359,7 +360,7 @@ async def test_open_tenant_db_falls_back_to_auth_db_when_decrypt_fails(monkeypat
     deps_module._tenant_db_cache.clear()
 
     async def fake_get_tenant_by_id(_db, tenant_id):
-        return {"id": tenant_id, "neon_db_url": "enc:not-valid"}
+        return {"id": tenant_id, "plan": "admin", "neon_db_url": "enc:not-valid"}
 
     def fake_decrypt_field(_value):
         raise InvalidToken()
@@ -379,6 +380,34 @@ async def test_open_tenant_db_falls_back_to_auth_db_when_decrypt_fails(monkeypat
 
     conn = await deps_module._open_tenant_db_by_id(request, "tenant-1")
     assert conn == {"opened_url": "postgresql://fallback-db"}
+
+
+@pytest.mark.asyncio
+async def test_non_admin_tenant_with_null_db_gets_503(monkeypatch):
+    """Non-admin tenant with no neon_db_url must get 503, never the admin DB."""
+    from fastapi import HTTPException
+
+    import meridian._deps as deps_module
+
+    deps_module._tenant_db_cache.clear()
+
+    async def fake_get_tenant_by_id(_db, tenant_id):
+        return {"id": tenant_id, "plan": "free", "neon_db_url": None}
+
+    monkeypatch.setattr(db_module, "get_tenant_by_id", fake_get_tenant_by_id)
+    monkeypatch.setenv("MERIDIAN_AUTH_DB", "postgresql://admin-db-must-not-leak")
+
+    request = SimpleNamespace(
+        app=SimpleNamespace(state=SimpleNamespace(db="auth-db")),
+        state=SimpleNamespace(),
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await deps_module._open_tenant_db_by_id(request, "free-tenant-1")
+
+    assert exc_info.value.status_code == 503
+    # Confirm auth DB was NOT returned
+    assert deps_module._tenant_db_cache.get("free-tenant-1") is None
 
 
 def test_strip_unsupported_pg_query_params_preserves_sslmode():
