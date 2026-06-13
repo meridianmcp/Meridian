@@ -151,10 +151,13 @@ class ProjectSettings(BaseModel):
         description="Warn when the live constitution reaches this many items.",
     )
     executor_config: ExecutorConfig = Field(default_factory=ExecutorConfig)
-    hitl_auto_answer: bool = Field(
-        default=False,
-        description="When true, request_hitl auto-resolves immediately (first "
-        "option, answered_by='auto') instead of blocking the session.",
+    hitl_auto_answer: int = Field(
+        default=0,
+        ge=0,
+        le=2,
+        description="HITL auto-answer mode: 0=off, 1=safe (executor questions "
+        "only, no destructive keywords), 2=aggressive (everything except "
+        "correction + security-sensitive requests).",
     )
 
 
@@ -163,7 +166,7 @@ class ProjectSettingsPatch(BaseModel):
 
     max_pinned_decisions: int | None = Field(default=None, ge=1, le=200)
     executor_config: ExecutorConfig | None = None
-    hitl_auto_answer: bool | None = None
+    hitl_auto_answer: int | None = Field(default=None, ge=0, le=2)
 
 
 class GoalState(BaseModel):

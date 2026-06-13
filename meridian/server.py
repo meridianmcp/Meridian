@@ -2256,15 +2256,23 @@ async def _notify_project(
             if "://" not in notify_url and "@" not in notify_url:
                 notify_url = f"https://ntfy.sh/{notify_url}"
             await _dispatch_notification(notify_url, title, body_text, event)
-    except Exception:  # noqa: BLE001
-        pass
+    except Exception as exc:  # noqa: BLE001
+        # 11064ab0 — log instead of swallowing silently; silent failures are why
+        # there was "no evidence" a ntfy ping ever fired.
+        import logging as _l
+        _l.getLogger("meridian.notify").warning(
+            "ntfy notification failed for project %s (event=%s): %s", project_id, event, exc
+        )
     # notify_email channel — fired independently so ntfy failure doesn't block email
     try:
         notify_email = await db_module.get_project_notify_email(db, project_id)
         if notify_email:
             await _send_email_notification(notify_email, f"[Meridian] {title}", body_text)
-    except Exception:  # noqa: BLE001
-        pass
+    except Exception as exc:  # noqa: BLE001
+        import logging as _l
+        _l.getLogger("meridian.notify").warning(
+            "email notification failed for project %s (event=%s): %s", project_id, event, exc
+        )
 
 
 async def _on_hitl_answered(

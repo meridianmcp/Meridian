@@ -1554,25 +1554,31 @@ export async function loadSettingsTab(projectId) {
 
   // Human-in-the-loop section — per-project auto-answer toggle (v3.4)
 
-  const hitlAuto = !!(projectSettings && projectSettings.hitl_auto_answer);
+  // 035edf47 — 3-way auto-answer mode: 0=off, 1=safe, 2=aggressive.
+  const hitlMode = Math.max(0, Math.min(2, parseInt((projectSettings && projectSettings.hitl_auto_answer) || 0, 10) || 0));
+  const _hitlDesc = {
+    0: 'Off — every request waits for a human.',
+    1: 'Safe — auto-answers routine executor questions only; corrections, file-diff approvals, location mismatches, and anything destructive still wait for you.',
+    2: 'Aggressive — auto-answers everything except corrections and security-sensitive requests.',
+  };
 
   html += `<div style="margin-bottom:16px">
 
     <div style="color:var(--accent);font-size:10px;letter-spacing:.06em;text-transform:uppercase;margin-bottom:10px;padding-bottom:4px;border-bottom:1px solid var(--border)">Human-in-the-loop</div>
 
-    <label style="display:flex;gap:8px;align-items:flex-start;font-size:11px;color:var(--text);cursor:pointer">
+    <label style="display:block;font-size:11px;color:var(--text);margin-bottom:6px">Auto-answer HITL requests</label>
 
-      <input type="checkbox" id="hitl-auto-${projectId}" ${hitlAuto ? 'checked' : ''} style="margin-top:2px">
+    <select id="hitl-auto-${projectId}" style="width:100%;padding:6px 8px;font-size:11px;background:var(--surface-1);color:var(--text);border:1px solid var(--border);border-radius:5px;cursor:pointer">
 
-      <span>Auto-answer HITL requests<br>
+      <option value="0" ${hitlMode === 0 ? 'selected' : ''}>Off</option>
 
-        <span style="font-size:9px;color:var(--muted)">When on, Meridian picks the first option automatically — no interruption. Review auto-answered requests in the Queue tab.</span>
+      <option value="1" ${hitlMode === 1 ? 'selected' : ''}>Safe</option>
 
-      </span>
+      <option value="2" ${hitlMode === 2 ? 'selected' : ''}>Aggressive</option>
 
-    </label>
+    </select>
 
-    <div id="hitl-auto-status-${projectId}" style="font-size:10px;color:var(--muted);margin-top:4px;min-height:13px"></div>
+    <div id="hitl-auto-status-${projectId}" style="font-size:10px;color:var(--muted);margin-top:6px;min-height:13px">${_hitlDesc[hitlMode]}</div>
 
   </div>`;
 
@@ -1580,37 +1586,39 @@ export async function loadSettingsTab(projectId) {
 
   setTimeout(() => {
 
-    const cb = document.getElementById(`hitl-auto-${projectId}`);
+    const sel = document.getElementById(`hitl-auto-${projectId}`);
 
     const status = document.getElementById(`hitl-auto-status-${projectId}`);
 
-    if (!cb) return;
+    if (!sel) return;
 
-    cb.onchange = async () => {
+    sel.onchange = async () => {
 
-      cb.disabled = true;
+      const prev = sel.value;
+
+      sel.disabled = true;
 
       try {
 
-        const saved = await saveProjectSettings(projectId, { hitl_auto_answer: cb.checked });
+        const mode = Math.max(0, Math.min(2, parseInt(sel.value, 10) || 0));
 
-        cb.checked = !!saved.hitl_auto_answer;
+        const saved = await saveProjectSettings(projectId, { hitl_auto_answer: mode });
 
-        if (status) status.textContent = saved.hitl_auto_answer
+        const m = Math.max(0, Math.min(2, parseInt((saved && saved.hitl_auto_answer) || 0, 10) || 0));
 
-          ? 'Auto-answer ON — new requests resolve immediately.'
+        sel.value = String(m);
 
-          : 'Auto-answer OFF — requests wait for a human.';
+        if (status) status.textContent = _hitlDesc[m];
 
       } catch (e) {
 
-        cb.checked = !cb.checked;
+        sel.value = prev;
 
         if (status) status.textContent = `Save failed: ${String(e)}`;
 
       } finally {
 
-        cb.disabled = false;
+        sel.disabled = false;
 
       }
 

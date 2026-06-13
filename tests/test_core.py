@@ -5972,6 +5972,75 @@ async def test_hitl_correction_nonblocking(db):
     assert answered["status"] == "answered"
 
 
+def test_hitl_should_auto_answer_modes():
+    """035edf47 — 3-way auto-answer decision rules (off / safe / aggressive)."""
+    f = db_module._hitl_should_auto_answer
+    # Off — never.
+    assert f(0, "question", "Ship it?") is False
+    # Safe — only plain executor questions, no destructive keyword.
+    assert f(1, "question", "Ship it?") is True
+    assert f(1, "question", "Should we DELETE the prod table?") is False
+    assert f(1, "question", "Deploy to production?") is False
+    assert f(1, "question", "nuke the cache?") is False
+    assert f(1, "correction", "Proceed?") is False
+    assert f(1, "md_section_update", "approve diff?") is False
+    assert f(1, "hook_cwd_mismatch", "which project?") is False
+    # Aggressive — everything except correction + security.
+    assert f(2, "question", "Ship it?") is True
+    assert f(2, "md_section_update", "approve diff?") is True
+    assert f(2, "hook_cwd_mismatch", "which project?") is True
+    assert f(2, "correction", "use camelCase") is False
+    assert f(2, "question", "Should we rotate the API key?") is False
+
+
+@pytest.mark.asyncio
+async def test_request_hitl_aggressive_vs_safe_on_md_section(db):
+    """035edf47 — aggressive (2) auto-answers a md_section_update; safe (1) doesn't."""
+    pa = await db_module.create_project(db, "hitl-aggr")
+    await db_module.update_project_settings(db, pa["id"], hitl_auto_answer=2)
+    ha = await db_module.request_hitl(
+        db, pa["id"], "Approve the README change?", kind="md_section_update"
+    )
+    assert ha["status"] == "answered" and ha["answered_by"] == "auto"
+
+    ps = await db_module.create_project(db, "hitl-safe")
+    await db_module.update_project_settings(db, ps["id"], hitl_auto_answer=1)
+    hs = await db_module.request_hitl(
+        db, ps["id"], "Approve the README change?", kind="md_section_update"
+    )
+    assert hs["status"] == "pending"
+    # Settings round-trips the integer mode.
+    settings = await db_module.get_project_settings(db, pa["id"])
+    assert settings["hitl_auto_answer"] == 2
+
+
+@pytest.mark.asyncio
+async def test_notify_project_dispatches_ntfy_with_reconstructed_url(db, monkeypatch):
+    """11064ab0 — _notify_project turns a stored topic into a full ntfy.sh URL
+    and dispatches it. Regression guard for the notification path that had no
+    automated coverage (hence 'no evidence a ping ever fired')."""
+    import meridian.server as srv
+
+    async def fake_ntfy_url(_db, _pid):
+        return "my-topic"  # topic-only, as stored
+
+    async def fake_email(_db, _pid):
+        return None
+
+    sent = {}
+
+    async def fake_dispatch(url, title, body, event="notification"):
+        sent.update(url=url, title=title, event=event)
+
+    monkeypatch.setattr(db_module, "get_project_ntfy_url", fake_ntfy_url)
+    monkeypatch.setattr(db_module, "get_project_notify_email", fake_email)
+    monkeypatch.setattr(srv, "_dispatch_notification", fake_dispatch)
+
+    await srv._notify_project(db, "proj-id", "Action needed", "answer at dashboard", event="hitl")
+    assert sent["url"] == "https://ntfy.sh/my-topic"
+    assert sent["event"] == "hitl"
+
+
 @pytest.mark.asyncio
 async def test_request_hitl_manual_mode_unchanged(db):
     """v3.4 — default projects (auto-answer off) still create pending requests."""
@@ -6014,16 +6083,19 @@ async def test_request_hitl_md_section_update_not_auto_answered(db):
 
 @pytest.mark.asyncio
 async def test_project_settings_roundtrip_hitl_auto_answer(db):
-    """v3.4 — hitl_auto_answer persists through get/update_project_settings."""
+    """035edf47 — hitl_auto_answer (0=off/1=safe/2=aggressive) persists; clamps."""
     p = await db_module.create_project(db, "hitl-settings-proj")
     settings = await db_module.get_project_settings(db, p["id"])
-    assert settings["hitl_auto_answer"] is False
+    assert settings["hitl_auto_answer"] == 0
     updated = await db_module.update_project_settings(
-        db, p["id"], hitl_auto_answer=True
+        db, p["id"], hitl_auto_answer=2
     )
-    assert updated["hitl_auto_answer"] is True
+    assert updated["hitl_auto_answer"] == 2
     reread = await db_module.get_project_settings(db, p["id"])
-    assert reread["hitl_auto_answer"] is True
+    assert reread["hitl_auto_answer"] == 2
+    # Out-of-range values clamp into 0..2.
+    clamped = await db_module.update_project_settings(db, p["id"], hitl_auto_answer=9)
+    assert clamped["hitl_auto_answer"] == 2
 
 
 @pytest.mark.asyncio
