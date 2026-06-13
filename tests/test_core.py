@@ -5980,6 +5980,8 @@ def test_hitl_should_auto_answer_modes():
     # Safe — only plain executor questions, no destructive keyword.
     assert f(1, "question", "Ship it?") is True
     assert f(1, "question", "Should we DELETE the prod table?") is False
+    assert f(1, "question", "Deploy to production?") is False
+    assert f(1, "question", "nuke the cache?") is False
     assert f(1, "correction", "Proceed?") is False
     assert f(1, "md_section_update", "approve diff?") is False
     assert f(1, "hook_cwd_mismatch", "which project?") is False

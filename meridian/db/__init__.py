@@ -4810,8 +4810,9 @@ async def _project_hitl_auto_answer_mode(
 
 # 035edf47 — keyword guards for the 3-way HITL auto-answer modes.
 _HITL_DESTRUCTIVE_KEYWORDS = (
-    "delete", "drop ", "truncate", "destroy", "wipe", "purge", "remove",
-    "revoke", "rm -rf", "force push", "force-push", "overwrite", "reset --hard",
+    "delete", "drop ", "truncate", "destroy", "wipe", "purge", "nuke",
+    "production", "prod ", "remove", "revoke", "rm -rf", "force push",
+    "force-push", "overwrite", "reset --hard",
 )
 _HITL_SECURITY_KEYWORDS = (
     "security", "secret", "credential", "password", "api key", "apikey",
