@@ -666,6 +666,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_touches_files(db)
     await _migrate_active_worktrees(db)
     await _migrate_workspace_tenant_isolation(db)
+    await _migrate_registered_hostnames(db)
     return db
 
 
@@ -5470,6 +5471,111 @@ async def update_workspace_settings(
         )
     await db.commit()
     return await get_workspace_settings(db, tenant_id=tenant_id)
+
+
+# ---------------------------------------------------------------------------
+# registered_hostnames — token-based OAuth hooks (control-plane / auth DB)
+# ---------------------------------------------------------------------------
+
+
+async def register_hostname(
+    db: aiosqlite.Connection, tenant_id: str, hostname: str
+) -> str:
+    """Register (or rotate) a machine for token-based hooks and return its
+    registration_token. Re-registering the same (tenant, hostname) rotates the
+    token so a lost machine can be re-authorized from the dashboard."""
+    import secrets
+    token = secrets.token_hex(16)
+    async with db.execute(
+        "SELECT id FROM registered_hostnames WHERE tenant_id = ? AND hostname = ?",
+        (tenant_id, hostname),
+    ) as cur:
+        existing = await cur.fetchone()
+    if existing is not None:
+        await db.execute(
+            "UPDATE registered_hostnames "
+            "SET registration_token = ?, registered_at = datetime('now') "
+            "WHERE tenant_id = ? AND hostname = ?",
+            (token, tenant_id, hostname),
+        )
+    else:
+        await db.execute(
+            "INSERT INTO registered_hostnames "
+            "(id, tenant_id, hostname, registration_token) VALUES (?, ?, ?, ?)",
+            (_new_id(), tenant_id, hostname, token),
+        )
+    await db.commit()
+    return token
+
+
+async def resolve_hostname_registration(
+    db: aiosqlite.Connection, hostname: str, registration_token: str
+) -> str | None:
+    """Return the tenant_id for a hostname+token match (and bump last_seen), or
+    None when there is no match. Never raises — the hook path must fail open to
+    an empty context, not a 401."""
+    if not hostname or not registration_token:
+        return None
+    async with db.execute(
+        "SELECT tenant_id FROM registered_hostnames "
+        "WHERE hostname = ? AND registration_token = ?",
+        (hostname, registration_token),
+    ) as cur:
+        row = await cur.fetchone()
+    if row is None:
+        return None
+    tenant_id = row["tenant_id"] if isinstance(row, dict) else row[0]
+    await db.execute(
+        "UPDATE registered_hostnames SET last_seen = datetime('now') "
+        "WHERE hostname = ? AND registration_token = ?",
+        (hostname, registration_token),
+    )
+    await db.commit()
+    return tenant_id
+
+
+async def get_hostname_status(
+    db: aiosqlite.Connection, tenant_id: str, hostname: str
+) -> dict[str, Any]:
+    """Return {registered, token} for a tenant's hostname (token echoed so the
+    installer can finish writing the hook script after the browser connect)."""
+    async with db.execute(
+        "SELECT registration_token FROM registered_hostnames "
+        "WHERE tenant_id = ? AND hostname = ?",
+        (tenant_id, hostname),
+    ) as cur:
+        row = await cur.fetchone()
+    if row is None:
+        return {"registered": False, "token": None}
+    tok = row["registration_token"] if isinstance(row, dict) else row[0]
+    return {"registered": True, "token": tok}
+
+
+async def list_registered_hostnames(
+    db: aiosqlite.Connection, tenant_id: str
+) -> list[dict[str, Any]]:
+    """List a tenant's registered machines (token omitted) newest first."""
+    async with db.execute(
+        "SELECT id, hostname, registered_at, last_seen FROM registered_hostnames "
+        "WHERE tenant_id = ? ORDER BY registered_at DESC",
+        (tenant_id,),
+    ) as cur:
+        rows = await cur.fetchall()
+    return [_row_to_dict(r) for r in rows if r is not None]  # type: ignore[misc]
+
+
+async def revoke_registered_hostname(
+    db: aiosqlite.Connection, tenant_id: str, machine_id: str
+) -> bool:
+    """Delete one of the tenant's registrations by id. Returns True if removed.
+    Tenant-scoped so a tenant can never revoke another tenant's machine."""
+    async with db.execute(
+        "DELETE FROM registered_hostnames WHERE id = ? AND tenant_id = ?",
+        (machine_id, tenant_id),
+    ) as cur:
+        rc = cur.rowcount or 0
+    await db.commit()
+    return rc > 0
 
 
 # ---------------------------------------------------------------------------

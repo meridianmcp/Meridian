@@ -3883,6 +3883,58 @@ async def test_workspace_settings_single_row_fallback(db):
     assert s["sprint_name_default"] == "solo"
 
 
+# ---------------------------------------------------------------------------
+# 2da12762 — token-based OAuth hooks (registered_hostnames)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_register_hostname_returns_token_and_resolves(db):
+    token = await db_module.register_hostname(db, "tenant-a", "MACHINE-1")
+    assert token and len(token) >= 16
+    assert await db_module.resolve_hostname_registration(db, "MACHINE-1", token) == "tenant-a"
+    # Wrong token / unknown hostname do not resolve (fail closed at the db).
+    assert await db_module.resolve_hostname_registration(db, "MACHINE-1", "nope") is None
+    assert await db_module.resolve_hostname_registration(db, "OTHER", token) is None
+
+
+@pytest.mark.asyncio
+async def test_register_hostname_rotates_token(db):
+    t1 = await db_module.register_hostname(db, "tenant-a", "M1")
+    t2 = await db_module.register_hostname(db, "tenant-a", "M1")
+    assert t1 != t2
+    assert await db_module.resolve_hostname_registration(db, "M1", t1) is None
+    assert await db_module.resolve_hostname_registration(db, "M1", t2) == "tenant-a"
+
+
+@pytest.mark.asyncio
+async def test_hostname_status_list_and_revoke(db):
+    assert (await db_module.get_hostname_status(db, "tenant-a", "M1"))["registered"] is False
+    token = await db_module.register_hostname(db, "tenant-a", "M1")
+    assert await db_module.get_hostname_status(db, "tenant-a", "M1") == {
+        "registered": True, "token": token,
+    }
+    machines = await db_module.list_registered_hostnames(db, "tenant-a")
+    assert len(machines) == 1 and machines[0]["hostname"] == "M1"
+    assert "registration_token" not in machines[0]  # token never listed
+    # Revoke is tenant-scoped.
+    assert await db_module.revoke_registered_hostname(db, "tenant-b", machines[0]["id"]) is False
+    assert await db_module.revoke_registered_hostname(db, "tenant-a", machines[0]["id"]) is True
+    assert await db_module.list_registered_hostnames(db, "tenant-a") == []
+
+
+def test_hooks_session_start_unknown_hostname_returns_empty_not_401(client):
+    """An unknown hostname+token must fail open to an empty context so Claude
+    Code always starts cleanly — never 401."""
+    r = client.post("/hooks/session-start", json={
+        "hostname": "UNKNOWN-MACHINE",
+        "registration_token": "deadbeefdeadbeef",
+        "cwd": "/some/path",
+    })
+    assert r.status_code == 200
+    assert r.json()["hookSpecificOutput"]["additionalContext"] == ""
+
+
 def test_build_goal_xml_omits_decisions_when_empty():
     """No <decisions> tag when there's nothing to show — worker
     sessions in v1.2.0 will pass decisions=None for the same reason."""
