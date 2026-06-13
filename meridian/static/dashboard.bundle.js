@@ -6244,7 +6244,7 @@ Current: ${current || "(none)"}`,
 
       <button class="vtab-btn" data-vtab="goal" title="Goal State">\u{1F3AF}</button>
 
-      <button class="vtab-btn" data-vtab="files" title="Files">\u{1F4C1}</button>
+      ${window.MERIDIAN_HOSTED && !(project.github_repo || project.repo) ? "" : '<button class="vtab-btn" data-vtab="files" title="Files">\u{1F4C1}</button>'}
 
       <button class="vtab-btn" data-vtab="devlog" title="Dev Log">\u{1F4D3}</button>
 

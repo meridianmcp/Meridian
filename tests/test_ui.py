@@ -270,6 +270,17 @@ def test_dashboard_sidebar_has_no_translatex(client):
     )
 
 
+def test_files_vtab_gated_for_hosted_without_repo(client):
+    """1332fe4d — the Files vtab is hidden for hosted users with no GitHub repo
+    connected (an empty Files tab is dead weight on the hosted dashboard)."""
+    js = client.get("/static/dashboard.js").text
+    assert 'data-vtab="files"' in js, "Files vtab button missing from buildTabBody"
+    # Button must be wrapped in a hosted + github-repo guard.
+    assert "MERIDIAN_HOSTED && !(project.github_repo" in js, (
+        "Files vtab is not gated behind hosted + github_repo"
+    )
+
+
 def test_dashboard_live_tab_exists(client):
     """LIVE vtab (⚡) is registered and wired in dashboard.js (v1.6.x).
 

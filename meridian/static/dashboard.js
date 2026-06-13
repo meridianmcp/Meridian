@@ -2867,7 +2867,7 @@ function buildTabBody(project) {
 
       <button class="vtab-btn" data-vtab="goal" title="Goal State">🎯</button>
 
-      <button class="vtab-btn" data-vtab="files" title="Files">📁</button>
+      ${(window.MERIDIAN_HOSTED && !(project.github_repo || project.repo)) ? '' : '<button class="vtab-btn" data-vtab="files" title="Files">📁</button>'}
 
       <button class="vtab-btn" data-vtab="devlog" title="Dev Log">📓</button>
 
