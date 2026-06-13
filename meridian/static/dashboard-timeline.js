@@ -7,7 +7,7 @@ export function renderTimeline(projectId, data) {
 
   if (!wrap) return;
 
-  const p = state.panels[projectId];
+  const p = window.state?.panels[projectId];
   const sessionFilter = p && p.timelineSessionFilter;
   const rawTasks = (data && data.tasks) || [];
   const tasks = sessionFilter ? rawTasks.filter(t => t.session_id === sessionFilter) : rawTasks;
@@ -962,7 +962,7 @@ export function _renderTimelineHeatmap(projectId, data, paneEl) {
 
 
 
-  const pnl = state.panels[projectId];
+  const pnl = window.state?.panels[projectId];
 
   if (pnl) pnl._heatchart = chart;
 
@@ -1000,7 +1000,7 @@ export function _renderTimelineGantt(projectId, data, paneEl) {
 
   if (!paneEl) return;
 
-  const p = state.panels[projectId];
+  const p = window.state?.panels[projectId];
 
   const { tasks = [], goal_events = [] } = data || {};
 

@@ -86,7 +86,7 @@ export function _renderPlanBadge(me) {
 
     const bannerBg = elapsed >= 28 ? '#dc2626' : elapsed >= 25 ? '#d97706' : '#ca8a04';
 
-    const upgradeUrl = state.serverConfig?.stripe_payment_link || '/pricing';
+    const upgradeUrl = window.state?.serverConfig?.stripe_payment_link || '/pricing';
 
     const daysStr = me.days_remaining != null ? `${me.days_remaining} day${me.days_remaining !== 1 ? 's' : ''}` : 'limited time';
 

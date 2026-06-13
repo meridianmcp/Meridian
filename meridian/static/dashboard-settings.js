@@ -1,6 +1,6 @@
 function suggestNtfyTopic(projectId) {
 
-  const proj = (state.projects || []).find(p => p.id === projectId);
+  const proj = (window.state?.projects || []).find(p => p.id === projectId);
 
   const slug = (proj?.name || 'meridian')
 
