@@ -6449,6 +6449,26 @@ async def billing_portal_redirect(request: Request):
     return RedirectResponse(url, status_code=302)
 
 
+@app.post("/billing/portal")
+async def billing_portal_json(request: Request) -> dict[str, str]:
+    """Return Stripe billing portal URL as JSON for dashboard AJAX calls (e7d4400b)."""
+    from .hosted import create_stripe_billing_portal_session, get_current_tenant  # noqa: PLC0415
+
+    try:
+        tenant = await get_current_tenant(request)
+    except HTTPException:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    if not tenant.get("stripe_customer_id"):
+        raise HTTPException(status_code=404, detail="No billing account")
+    try:
+        url = await create_stripe_billing_portal_session(tenant)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    return {"url": url}
+
+
 @app.get("/checkout")
 async def checkout_redirect(request: Request, plan: str = "standard") -> RedirectResponse:
     """Create a Stripe Checkout Session and redirect to it.

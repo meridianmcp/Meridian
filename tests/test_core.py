@@ -6556,6 +6556,42 @@ async def test_create_stripe_billing_portal_session_rejects_no_customer():
         await create_stripe_billing_portal_session({"email": "free@example.com"})
 
 
+def test_billing_portal_post_returns_url_for_stripe_customer(client, monkeypatch):
+    """e7d4400b — POST /billing/portal returns JSON {url: ...} for a tenant
+    that has a stripe_customer_id so the dashboard can POST-then-redirect
+    instead of using a GET link."""
+    from meridian import hosted as _hosted
+    monkeypatch.setenv("MERIDIAN_HOSTED", "true")
+    fake_url = "https://billing.stripe.com/session/test_abc"
+
+    async def _fake_get_tenant(request):
+        return {"email": "user@example.com", "stripe_customer_id": "cus_test123"}
+
+    async def _fake_portal(tenant):
+        return fake_url
+
+    monkeypatch.setattr(_hosted, "get_current_tenant", _fake_get_tenant)
+    monkeypatch.setattr(_hosted, "create_stripe_billing_portal_session", _fake_portal)
+    r = client.post("/billing/portal")
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data.get("url") == fake_url
+
+
+def test_billing_portal_post_returns_404_without_stripe_customer(client, monkeypatch):
+    """e7d4400b — POST /billing/portal returns 404 when the tenant has no
+    stripe_customer_id (free tier / admin accounts)."""
+    from meridian import hosted as _hosted
+    monkeypatch.setenv("MERIDIAN_HOSTED", "true")
+
+    async def _fake_get_tenant(request):
+        return {"email": "admin@example.com"}  # no stripe_customer_id
+
+    monkeypatch.setattr(_hosted, "get_current_tenant", _fake_get_tenant)
+    r = client.post("/billing/portal")
+    assert r.status_code == 404
+
+
 def test_me_endpoint_exposes_has_stripe_customer(client, monkeypatch):
     """G2.11 — /me payload carries has_stripe_customer so the dashboard
     can flip the billing button between Manage and Upgrade without a

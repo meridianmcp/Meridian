@@ -6437,23 +6437,24 @@ async function loadSettingsTab(projectId) {
 
     const hasStripe = !!state.tenantHasStripe;
 
-    // Admin / internal plans have nothing to upgrade — only surface a billing
-
-    // button when there's a real Stripe customer to manage.
+    // Admin / internal accounts: no billing UI. Stripe customers: POST portal
+    // button (avoids GET redirect leak). Free tier: prominent upgrade link.
 
     const noUpgrade = plan === 'admin' || !!state.tenantIsInternal;
 
-    const showBilling = hasStripe || !noUpgrade;
+    let billingBtn = '';
 
-    const billingLabel = hasStripe ? 'Manage billing' : 'Upgrade';
+    if (hasStripe) {
 
-    const billingHref = hasStripe ? '/billing/portal' : '/pricing';
+      billingBtn = `<button id="billing-portal-btn-${escapeHtml(projectId)}" class="primary" style="padding:4px 10px;font-size:10px;background:var(--accent);color:#001020;border-radius:4px;font-weight:600;cursor:pointer;border:none">Manage billing →</button>`;
 
-    const billingBtn = showBilling
+    } else if (!noUpgrade) {
 
-      ? `<a href="${billingHref}" class="primary" style="padding:4px 10px;font-size:10px;text-decoration:none;background:var(--accent);color:#001020;border-radius:4px;font-weight:600">${escapeHtml(billingLabel)}</a>`
+      const upgradeUrl = state.serverConfig?.stripe_payment_link || '/pricing';
 
-      : '';
+      billingBtn = `<a href="${escapeHtml(upgradeUrl)}" class="primary" style="padding:4px 10px;font-size:10px;text-decoration:none;background:var(--accent);color:#001020;border-radius:4px;font-weight:600">Upgrade to Standard →</a>`;
+
+    }
 
     // Trial / free-tier expiry line + resubscribe affordance. Only relevant to
 
@@ -8220,9 +8221,9 @@ async function loadSettingsTab(projectId) {
     </div>
   </div>`;
 
-  // Team members section (hosted mode only, uses mcpData as hosted-mode proxy)
+  // Team members section (hosted mode only) — always visible for all plan tiers (ecdae392)
 
-  if (mcpData) {
+  if (isHostedMode()) {
 
     html += `<div style="margin-bottom:16px" id="members-section-${projectId}">
 
@@ -9037,6 +9038,38 @@ async function loadSettingsTab(projectId) {
         toast('Delete failed: ' + e.message, true);
 
         deleteBtn.disabled = false;
+
+      }
+
+    };
+
+  }
+
+  // e7d4400b — Billing portal: POST to avoid GET redirect leaking session cookie,
+  // redirect client-side once we have the URL.
+  const billingPortalBtn = document.getElementById(`billing-portal-btn-${projectId}`);
+
+  if (billingPortalBtn) {
+
+    billingPortalBtn.onclick = async () => {
+
+      billingPortalBtn.disabled = true;
+
+      billingPortalBtn.textContent = 'Loading…';
+
+      try {
+
+        const data = await api('/billing/portal', { method: 'POST' });
+
+        window.location.href = data.url;
+
+      } catch (e) {
+
+        toast('Could not open billing portal: ' + e.message, true);
+
+        billingPortalBtn.disabled = false;
+
+        billingPortalBtn.textContent = 'Manage billing →';
 
       }
 
