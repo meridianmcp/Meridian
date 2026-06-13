@@ -1627,6 +1627,68 @@ async def list_tools_endpoint() -> list[dict[str, Any]]:
     return _MCP_TOOLS_LIST
 
 
+# ---------------------------------------------------------------------------
+# v1.0.0-alpha — public status/shields endpoints (sprint item 29b33fdb)
+# ---------------------------------------------------------------------------
+# shields.io endpoint-badge JSON (https://shields.io/badges/endpoint-badge).
+# No auth, read-only, rate-limited to 1 req/5s per IP so the public badges
+# can't be used to hammer the DB. /status/hooks is intentionally omitted until
+# the registered_hostnames table (OAuth-hooks item) lands.
+_MCP_TOOL_COUNT = len(_MCP_TOOLS_LIST)
+
+
+def _status_rate_limit(func):
+    """Apply the 1-req/5s/IP shields rate limit when slowapi is available.
+
+    No-op passthrough when slowapi isn't installed (self-host minimal deploy),
+    so the endpoints still function — just without the per-IP cap.
+    """
+    if _limiter is None:
+        return func
+    return _limiter.limit("1/5 seconds")(func)
+
+
+@app.get("/status/server")
+@_status_rate_limit
+async def status_server(request: Request) -> dict[str, Any]:
+    """shields.io badge: server liveness."""
+    return {
+        "schemaVersion": 1,
+        "label": "meridian",
+        "message": "online",
+        "color": "brightgreen",
+    }
+
+
+@app.get("/status/tools")
+@_status_rate_limit
+async def status_tools(request: Request) -> dict[str, Any]:
+    """shields.io badge: MCP tool count (cached at startup)."""
+    return {
+        "schemaVersion": 1,
+        "label": "MCP tools",
+        "message": f"{_MCP_TOOL_COUNT} tools",
+        "color": "6c8fff",
+    }
+
+
+@app.get("/status/sessions")
+@_status_rate_limit
+async def status_sessions(request: Request) -> dict[str, Any]:
+    """shields.io badge: count of currently-live sessions."""
+    db = request.app.state.db
+    try:
+        n = await db_module.count_active_sessions(db)
+    except Exception:
+        n = 0
+    return {
+        "schemaVersion": 1,
+        "label": "active sessions",
+        "message": f"{n} live",
+        "color": "brightgreen" if n else "lightgrey",
+    }
+
+
 @app.get("/me")
 async def me_endpoint(request: Request) -> dict[str, Any]:
     """Return the current user's plan info. Returns {} for anonymous/self-hosted."""

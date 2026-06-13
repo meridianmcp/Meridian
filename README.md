@@ -16,6 +16,9 @@ Claude Code, Cursor, Cline, Claude Desktop, or any MCP client.
 [![Docs](https://img.shields.io/badge/docs-docs.usemeridian.us-6c8fff)](https://docs.usemeridian.us)
 [![Hosted](https://img.shields.io/badge/hosted-usemeridian.us-a78bfa)](https://usemeridian.us)
 [![Neon](https://img.shields.io/badge/db-neon%20postgres-00e599)](https://neon.tech)
+[![Server](https://img.shields.io/endpoint?url=https://usemeridian.us/status/server)](https://usemeridian.us)
+[![MCP Tools](https://img.shields.io/endpoint?url=https://usemeridian.us/status/tools)](https://docs.usemeridian.us/mcp-tools)
+[![Live Sessions](https://img.shields.io/endpoint?url=https://usemeridian.us/status/sessions)](https://usemeridian.us)
 
 ## Why Meridian
 
@@ -26,8 +29,6 @@ everything is lost. This is context debt — and it compounds.
 Meridian gives your sessions shared memory. They see the same task log, the same
 pinned decisions, the same goal state. When context fills up, a new session resumes
 from a compressed handoff in seconds. No copy-paste, no re-explaining from scratch.
-
----
 
 ---
 
@@ -117,7 +118,7 @@ git clone --recurse-submodules https://github.com/meridianmcp/Meridian
 2. Click **Load unpacked** and select `extensions/claude-mcp`
 3. Click the extension icon and set the URL to `http://localhost:7878/mcp`
 
-All 46 Meridian tools (`checkpoint`, `log_task`, `pin_decision`, etc.) are now available directly in claude.ai planning chat. No copy-pasting session output.
+All 51 Meridian tools (`checkpoint`, `log_task`, `pin_decision`, etc.) are now available directly in claude.ai planning chat. No copy-pasting session output.
 
 ### Hosted tier (no install)
 
