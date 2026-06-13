@@ -6013,6 +6013,33 @@ async def test_request_hitl_aggressive_vs_safe_on_md_section(db):
 
 
 @pytest.mark.asyncio
+async def test_notify_project_dispatches_ntfy_with_reconstructed_url(db, monkeypatch):
+    """11064ab0 — _notify_project turns a stored topic into a full ntfy.sh URL
+    and dispatches it. Regression guard for the notification path that had no
+    automated coverage (hence 'no evidence a ping ever fired')."""
+    import meridian.server as srv
+
+    async def fake_ntfy_url(_db, _pid):
+        return "my-topic"  # topic-only, as stored
+
+    async def fake_email(_db, _pid):
+        return None
+
+    sent = {}
+
+    async def fake_dispatch(url, title, body, event="notification"):
+        sent.update(url=url, title=title, event=event)
+
+    monkeypatch.setattr(db_module, "get_project_ntfy_url", fake_ntfy_url)
+    monkeypatch.setattr(db_module, "get_project_notify_email", fake_email)
+    monkeypatch.setattr(srv, "_dispatch_notification", fake_dispatch)
+
+    await srv._notify_project(db, "proj-id", "Action needed", "answer at dashboard", event="hitl")
+    assert sent["url"] == "https://ntfy.sh/my-topic"
+    assert sent["event"] == "hitl"
+
+
+@pytest.mark.asyncio
 async def test_request_hitl_manual_mode_unchanged(db):
     """v3.4 — default projects (auto-answer off) still create pending requests."""
     p = await db_module.create_project(db, "hitl-manual-proj")
