@@ -1677,6 +1677,21 @@ async def update_session_seen(
     await db.commit()
 
 
+async def count_active_sessions(db: aiosqlite.Connection) -> int:
+    """Count sessions currently live (status active or idle, not closed/expired).
+
+    Read-only; used by the public ``/status/sessions`` shields badge. Mirrors the
+    'live' definition used by the idle-expiry sweep (status IN active/idle).
+    """
+    async with db.execute(
+        "SELECT COUNT(*) AS n FROM sessions WHERE status IN ('active', 'idle')"
+    ) as cur:
+        row = await cur.fetchone()
+    if row is None:
+        return 0
+    return int(row["n"] if isinstance(row, dict) else row[0])
+
+
 async def heartbeat_session(
     db: aiosqlite.Connection, session_id: str
 ) -> bool:

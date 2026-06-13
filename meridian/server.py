@@ -1365,57 +1365,8 @@ async def failover_status() -> dict[str, bool]:
     return {"is_failover": flag in ("1", "true", "yes", "on")}
 
 
-# ---------------------------------------------------------------------------
-# Live status shields — shields.io endpoint-badge JSON, public + read-only
-# (29b33fdb)
-# ---------------------------------------------------------------------------
-
-
-def _shield(label: str, message: str, color: str = "brightgreen") -> dict[str, Any]:
-    """shields.io endpoint badge payload."""
-    return {"schemaVersion": 1, "label": label, "message": message, "color": color}
-
-
-@app.get("/status/server")
-async def status_server() -> dict[str, Any]:
-    """Liveness badge — always green when the app can answer."""
-    return _shield("meridian", "online", "brightgreen")
-
-
-@app.get("/status/tools")
-async def status_tools() -> dict[str, Any]:
-    """MCP tool-count badge (counted from the in-process tool list)."""
-    return _shield("MCP tools", f"{len(_MCP_TOOLS_LIST)} tools", "6c8fff")
-
-
-@app.get("/status/sessions")
-async def status_sessions(request: Request) -> dict[str, Any]:
-    """Active-session-count badge (best-effort; 0 on any error)."""
-    n = 0
-    try:
-        async with request.app.state.db.execute(
-            "SELECT COUNT(*) AS c FROM sessions WHERE status = 'active'"
-        ) as cur:
-            row = await cur.fetchone()
-        n = int(row["c"] if isinstance(row, dict) else row[0]) if row else 0
-    except Exception:  # noqa: BLE001
-        n = 0
-    return _shield("active sessions", f"{n} live", "brightgreen" if n else "lightgrey")
-
-
-@app.get("/status/hooks")
-async def status_hooks(request: Request) -> dict[str, Any]:
-    """Registered-machine-count badge (best-effort; 0 on any error)."""
-    n = 0
-    try:
-        async with request.app.state.db.execute(
-            "SELECT COUNT(DISTINCT hostname) AS c FROM registered_hostnames"
-        ) as cur:
-            row = await cur.fetchone()
-        n = int(row["c"] if isinstance(row, dict) else row[0]) if row else 0
-    except Exception:  # noqa: BLE001
-        n = 0
-    return _shield("hooks", f"{n} machines", "brightgreen" if n else "lightgrey")
+# Live status shields (/status/*) are defined further below — the canonical
+# rate-limited implementation lives next to the cached _MCP_TOOL_COUNT.
 
 
 @app.get("/terms", response_class=HTMLResponse)
@@ -1678,6 +1629,68 @@ async def server_config(request: Request) -> dict[str, Any]:
 async def list_tools_endpoint() -> list[dict[str, Any]]:
     """Return MCP tool definitions for the dashboard Docs vtab."""
     return _MCP_TOOLS_LIST
+
+
+# ---------------------------------------------------------------------------
+# v1.0.0-alpha — public status/shields endpoints (sprint item 29b33fdb)
+# ---------------------------------------------------------------------------
+# shields.io endpoint-badge JSON (https://shields.io/badges/endpoint-badge).
+# No auth, read-only, rate-limited to 1 req/5s per IP so the public badges
+# can't be used to hammer the DB. /status/hooks is intentionally omitted until
+# the registered_hostnames table (OAuth-hooks item) lands.
+_MCP_TOOL_COUNT = len(_MCP_TOOLS_LIST)
+
+
+def _status_rate_limit(func):
+    """Apply the 1-req/5s/IP shields rate limit when slowapi is available.
+
+    No-op passthrough when slowapi isn't installed (self-host minimal deploy),
+    so the endpoints still function — just without the per-IP cap.
+    """
+    if _limiter is None:
+        return func
+    return _limiter.limit("1/5 seconds")(func)
+
+
+@app.get("/status/server")
+@_status_rate_limit
+async def status_server(request: Request) -> dict[str, Any]:
+    """shields.io badge: server liveness."""
+    return {
+        "schemaVersion": 1,
+        "label": "meridian",
+        "message": "online",
+        "color": "brightgreen",
+    }
+
+
+@app.get("/status/tools")
+@_status_rate_limit
+async def status_tools(request: Request) -> dict[str, Any]:
+    """shields.io badge: MCP tool count (cached at startup)."""
+    return {
+        "schemaVersion": 1,
+        "label": "MCP tools",
+        "message": f"{_MCP_TOOL_COUNT} tools",
+        "color": "6c8fff",
+    }
+
+
+@app.get("/status/sessions")
+@_status_rate_limit
+async def status_sessions(request: Request) -> dict[str, Any]:
+    """shields.io badge: count of currently-live sessions."""
+    db = request.app.state.db
+    try:
+        n = await db_module.count_active_sessions(db)
+    except Exception:
+        n = 0
+    return {
+        "schemaVersion": 1,
+        "label": "active sessions",
+        "message": f"{n} live",
+        "color": "brightgreen" if n else "lightgrey",
+    }
 
 
 @app.get("/me")

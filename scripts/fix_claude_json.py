@@ -1,9 +1,5 @@
-"""Remove a stale duplicate `meridian` MCP server entry (the one carrying a
-hardcoded `Authorization` header) from the local `~/.claude.json`, leaving the
-global connector definition intact. One-off maintenance helper used when a
-rotated token left a dead Bearer entry behind. Operates only on the local
-machine's Claude Code config; contains no credentials itself.
-"""
+"""Remove stale meridian Bearer token from ~/.claude.json -- one-time fix 2026-06-13. Safe to delete after 2026-07-01."""
+
 r = open(r'C:\Users\13144\.claude.json', encoding='utf-8').read()
 
 # Find the meridian entry in global mcpServers that has Authorization

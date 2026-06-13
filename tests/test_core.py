@@ -316,6 +316,38 @@ def test_health(client):
     assert r.json()["status"] == "ok"
 
 
+def test_status_server_badge(client):
+    """shields.io endpoint badge: server liveness (sprint item 29b33fdb)."""
+    r = client.get("/status/server")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["schemaVersion"] == 1
+    assert body["label"] == "meridian"
+    assert body["message"] == "online"
+    assert body["color"] == "brightgreen"
+
+
+def test_status_tools_badge(client):
+    """shields.io endpoint badge: MCP tool count must be > 0."""
+    r = client.get("/status/tools")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["schemaVersion"] == 1
+    assert body["label"] == "MCP tools"
+    count = int(body["message"].split()[0])
+    assert count > 0
+
+
+def test_status_sessions_badge(client):
+    """shields.io endpoint badge: live session count."""
+    r = client.get("/status/sessions")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["schemaVersion"] == 1
+    assert body["label"] == "active sessions"
+    assert body["message"].endswith("live")
+
+
 def test_create_and_list_projects(client):
     r = client.post("/projects", json={"name": "alpha"})
     assert r.status_code == 201
@@ -3981,37 +4013,8 @@ def test_queue_session_http_roundtrip(client):
     assert client.get(f"/projects/{pid}/queued-session").json()["goal"] is None
 
 
-# ---------------------------------------------------------------------------
-# 29b33fdb — live status shields
-# ---------------------------------------------------------------------------
-
-
-def test_status_server_shield(client):
-    r = client.get("/status/server")
-    assert r.status_code == 200
-    j = r.json()
-    assert j["schemaVersion"] == 1
-    assert j["label"] == "meridian"
-    assert j["message"] == "online"
-    assert j["color"]
-
-
-def test_status_tools_shield_reports_positive_count(client):
-    r = client.get("/status/tools")
-    assert r.status_code == 200
-    j = r.json()
-    assert j["schemaVersion"] == 1
-    # "<n> tools" with n > 0
-    n = int(j["message"].split()[0])
-    assert n > 0
-
-
-def test_status_sessions_and_hooks_shields(client):
-    for path, label in (("/status/sessions", "active sessions"), ("/status/hooks", "hooks")):
-        j = client.get(path).json()
-        assert j["schemaVersion"] == 1
-        assert j["label"] == label
-        assert j["message"]
+# Live status shields (/status/*) are covered by test_status_*_badge above —
+# the canonical rate-limited endpoints came in on dev (45b4e35).
 
 
 # ---------------------------------------------------------------------------

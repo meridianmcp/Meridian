@@ -17,7 +17,7 @@ Claude Code, Cursor, Cline, Claude Desktop, or any MCP client.
 [![Hosted](https://img.shields.io/badge/hosted-usemeridian.us-a78bfa)](https://usemeridian.us)
 [![Neon](https://img.shields.io/badge/db-neon%20postgres-00e599)](https://neon.tech)
 [![Server](https://img.shields.io/endpoint?url=https://usemeridian.us/status/server)](https://usemeridian.us)
-[![MCP Tools](https://img.shields.io/endpoint?url=https://usemeridian.us/status/tools)](https://docs.usemeridian.us)
+[![MCP Tools](https://img.shields.io/endpoint?url=https://usemeridian.us/status/tools)](https://docs.usemeridian.us/mcp-tools)
 [![Live Sessions](https://img.shields.io/endpoint?url=https://usemeridian.us/status/sessions)](https://usemeridian.us)
 
 ## Why Meridian
@@ -31,8 +31,6 @@ pinned decisions, the same goal state. When context fills up, a new session resu
 from a compressed handoff in seconds. No copy-paste, no re-explaining from scratch.
 
 [![Meridian dashboard](docs/screenshots/01_dashboard.png)](https://usemeridian.us)
-
----
 
 ## What it is, in 30 seconds
 
