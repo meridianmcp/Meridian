@@ -16,6 +16,9 @@ Claude Code, Cursor, Cline, Claude Desktop, or any MCP client.
 [![Docs](https://img.shields.io/badge/docs-docs.usemeridian.us-6c8fff)](https://docs.usemeridian.us)
 [![Hosted](https://img.shields.io/badge/hosted-usemeridian.us-a78bfa)](https://usemeridian.us)
 [![Neon](https://img.shields.io/badge/db-neon%20postgres-00e599)](https://neon.tech)
+[![Server](https://img.shields.io/endpoint?url=https://usemeridian.us/status/server)](https://usemeridian.us)
+[![MCP Tools](https://img.shields.io/endpoint?url=https://usemeridian.us/status/tools)](https://docs.usemeridian.us/mcp-tools)
+[![Live Sessions](https://img.shields.io/endpoint?url=https://usemeridian.us/status/sessions)](https://usemeridian.us)
 
 ## Why Meridian
 
@@ -27,9 +30,7 @@ Meridian gives your sessions shared memory. They see the same task log, the same
 pinned decisions, the same goal state. When context fills up, a new session resumes
 from a compressed handoff in seconds. No copy-paste, no re-explaining from scratch.
 
----
-
----
+[![Meridian dashboard](docs/screenshots/01_dashboard.png)](https://usemeridian.us)
 
 ## What it is, in 30 seconds
 
@@ -41,20 +42,6 @@ other's task log, and resume from a compressed handoff when context fills up.
 - **Hosted** at [usemeridian.us](https://usemeridian.us) — 30 days free (no card), then $20/mo Standard.
 
 <!-- MERIDIAN:ANCHOR:START quickstart -->
-## Quickstart — binary (no Python required)
-
-Download the single-file binary for your platform, double-click (or run from terminal), and the dashboard opens automatically.
-
-> **Binary users skip `install.sh` entirely.** Just download, run, and wire hooks once with `hooks.sh` / `hooks.ps1`. No Python, no pixi, no git clone.
-
-| Platform | Download | Default port |
-|---|---|---|
-| Windows | [meridian.exe](https://github.com/meridianmcp/Meridian/releases/latest/download/meridian.exe) | 7700 |
-| macOS (Apple Silicon) | [meridian-mac-arm64](https://github.com/meridianmcp/Meridian/releases/latest/download/meridian-mac-arm64) | 7700 |
-| macOS (Intel) | [meridian-mac-x86](https://github.com/meridianmcp/Meridian/releases/latest/download/meridian-mac-x86) | 7700 |
-
-Data is stored in `~/.meridian/meridian.db`. Set `MERIDIAN_PORT` to change the port.
-
 ## Quickstart — from source
 
 **Linux / macOS:**
@@ -80,7 +67,22 @@ Dashboard opens at **http://localhost:7878**. Data persists in `./data/meridian.
 
 ### Claude Code
 
-Drop a `.mcp.json` at your project root:
+Drop a `.mcp.json` at your project root.
+
+**Hosted (no install)** — generate an API key at [usemeridian.us/settings](https://usemeridian.us/settings):
+```json
+{
+  "mcpServers": {
+    "meridian": {
+      "type": "http",
+      "url": "https://usemeridian.us/mcp",
+      "headers": { "Authorization": "Bearer sk_meridian_YOUR_KEY_HERE" }
+    }
+  }
+}
+```
+
+**Self-host (from source):**
 ```json
 {
   "mcpServers": {
@@ -117,7 +119,7 @@ git clone --recurse-submodules https://github.com/meridianmcp/Meridian
 2. Click **Load unpacked** and select `extensions/claude-mcp`
 3. Click the extension icon and set the URL to `http://localhost:7878/mcp`
 
-All 46 Meridian tools (`checkpoint`, `log_task`, `pin_decision`, etc.) are now available directly in claude.ai planning chat. No copy-pasting session output.
+All 51 Meridian tools (`checkpoint`, `log_task`, `pin_decision`, etc.) are now available directly in claude.ai planning chat. No copy-pasting session output.
 
 ### Hosted tier (no install)
 
@@ -127,8 +129,6 @@ Or manually:
 ```json
 {"mcpServers":{"meridian":{"type":"http","url":"https://usemeridian.us/mcp","headers":{"Authorization":"Bearer sk_meridian_YOUR_KEY_HERE"}}}}
 ```
-
-**Claude Desktop** users can install [meridian-hosted.dxt](https://github.com/meridianmcp/Meridian/releases/latest/download/meridian-hosted.dxt) directly (one-click, no config needed).
 
 **claude.ai (browser)** users: install the [dnakov/claude-mcp](https://github.com/dnakov/claude-mcp) Chrome extension, then visit [usemeridian.us/install-mcp](https://usemeridian.us/install-mcp) for a step-by-step setup guide with one-click copy buttons.
 
@@ -187,9 +187,10 @@ curl -fsSL https://usemeridian.us/hooks.sh | bash
 irm https://usemeridian.us/hooks.ps1 | iex
 ```
 
-Prompts for your Meridian server URL (default `http://localhost:7878`) and your
-project ID. Writes to `~/.claude/settings.json` (Claude Code) or
-`~/.codex/config.toml` (Codex). After setup, every session automatically:
+Prompts for your Meridian server URL (default `http://localhost:7878`), then opens
+your browser to connect this machine — no project ID or API token to paste. Writes
+to `~/.claude/settings.json` (Claude Code) or `~/.codex/config.toml` (Codex). After
+setup, every session automatically:
 
 1. **On start** — calls `POST /hooks/session-start` → injects goal, sprint items,
    recent tasks, and pinned decisions into the session context via `additionalContext`.

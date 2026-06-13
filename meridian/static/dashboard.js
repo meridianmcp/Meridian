@@ -3343,11 +3343,16 @@ function buildTabBody(project) {
 
           </span>
 
-          <button class="secondary" id="queue-refresh-${project.id}" style="padding:2px 8px;font-size:10px">refresh</button>
+          <span style="display:flex;gap:6px;align-items:center">
+            <button class="secondary" id="queue-reconcile-${project.id}" style="padding:2px 8px;font-size:10px" title="Check if any pending items may already be done based on recent commits">reconcile</button>
+            <button class="secondary" id="queue-refresh-${project.id}" style="padding:2px 8px;font-size:10px">refresh</button>
+          </span>
 
         </div>
 
         <div id="live-session-${project.id}" style="display:none;flex-shrink:0;border-bottom:1px solid var(--border);background:var(--surface-2);padding:8px 14px 10px"></div>
+
+        <div id="reconcile-results-${project.id}" style="display:none;flex-shrink:0;border-bottom:1px solid var(--border);background:var(--surface-2);padding:8px 14px 10px;font-family:var(--font-mono);font-size:11px"></div>
 
         <div style="padding:8px 14px 0;flex-shrink:0">
 
@@ -4512,7 +4517,7 @@ async function loadLiveTab(projectId) {
 
 async function refreshLiveTab(projectId) {
 
-  /** Fetch fresh sessions + tasks + sprint items and repaint all Live sections. */
+  /** Fetch fresh sessions + tasks + sprint items + worktrees and repaint all Live sections. */
 
   try {
 
@@ -4522,13 +4527,17 @@ async function refreshLiveTab(projectId) {
 
     const sprintItemsPath = `/projects/${projectId}/sprint-items`;
 
-    const [sessionsResult, tasksResult, sprintItemsResult] = await Promise.allSettled([
+    const worktreesPath = `/projects/${projectId}/worktrees`;
+
+    const [sessionsResult, tasksResult, sprintItemsResult, worktreesResult] = await Promise.allSettled([
 
       projectApi(projectId, sessionsPath),
 
       projectApi(projectId, tasksPath),
 
       projectApi(projectId, sprintItemsPath),
+
+      projectApi(projectId, worktreesPath),
 
     ]);
 
@@ -4556,7 +4565,9 @@ async function refreshLiveTab(projectId) {
 
     if (sessionsResult.status === 'fulfilled' && tasksResult.status === 'fulfilled') {
 
-      renderLiveSessions(projectId, sessionsResult.value || [], tasksResult.value || []);
+      const worktrees = worktreesResult.status === 'fulfilled' ? (worktreesResult.value || []) : [];
+
+      renderLiveSessions(projectId, sessionsResult.value || [], tasksResult.value || [], worktrees);
 
       cacheMostRecentSession(projectId, sessionsResult.value || []);
 
@@ -4896,11 +4907,18 @@ function cacheMostRecentSession(projectId, sessions) {
 
 
 
-function renderLiveSessions(projectId, sessions, tasks) {
+function renderLiveSessions(projectId, sessions, tasks, worktrees) {
 
   const root = document.getElementById(`live-sessions-${projectId}`);
 
   if (!root) return;
+
+  // Build a map of session_id → active worktree branches
+  const worktreeMap = new Map();
+  (worktrees || []).forEach(wt => {
+    if (!worktreeMap.has(wt.session_id)) worktreeMap.set(wt.session_id, []);
+    worktreeMap.get(wt.session_id).push(wt.branch);
+  });
 
   const claimMap = new Map();
   const taskMap = new Map();
@@ -4997,6 +5015,12 @@ function renderLiveSessions(projectId, sessions, tasks) {
 
       : '';
 
+    const sessionWorktrees = worktreeMap.get(s.id) || [];
+
+    const worktreeBadges = sessionWorktrees.map(branch =>
+      `<span class="worktree-badge" title="active worktree: ${escapeHtml(branch)}" style="display:inline-block;background:var(--surface-2);color:#a78bfa;font-size:9px;font-weight:600;padding:1px 5px;border-radius:3px;margin-left:4px">⎇ ${escapeHtml(branch.replace('worktree/', ''))}</span>`
+    ).join('');
+
     const endBtn = live
       ? `<button class="secondary live-session-end" data-session-id="${escapeHtml(s.id)}" style="padding:1px 6px;font-size:9px;margin-left:6px" title="Mark this session idle">End session</button>`
       : '';
@@ -5007,7 +5031,7 @@ function renderLiveSessions(projectId, sessions, tasks) {
 
         <span class="live-dot">${dot}</span>
 
-        <span class="live-session-name">${escapeHtml(label)}</span>${fwBadge}
+        <span class="live-session-name">${escapeHtml(label)}</span>${fwBadge}${worktreeBadges}
 
         <span class="live-session-status" style="font-size:9px;color:var(--muted);text-transform:uppercase">${escapeHtml(displayStatus)}</span>
 
@@ -6420,23 +6444,24 @@ async function loadSettingsTab(projectId) {
 
     const hasStripe = !!state.tenantHasStripe;
 
-    // Admin / internal plans have nothing to upgrade — only surface a billing
-
-    // button when there's a real Stripe customer to manage.
+    // Admin / internal accounts: no billing UI. Stripe customers: POST portal
+    // button (avoids GET redirect leak). Free tier: prominent upgrade link.
 
     const noUpgrade = plan === 'admin' || !!state.tenantIsInternal;
 
-    const showBilling = hasStripe || !noUpgrade;
+    let billingBtn = '';
 
-    const billingLabel = hasStripe ? 'Manage billing' : 'Upgrade';
+    if (hasStripe) {
 
-    const billingHref = hasStripe ? '/billing/portal' : '/pricing';
+      billingBtn = `<button id="billing-portal-btn-${escapeHtml(projectId)}" class="primary" style="padding:4px 10px;font-size:10px;background:var(--accent);color:#001020;border-radius:4px;font-weight:600;cursor:pointer;border:none">Manage billing →</button>`;
 
-    const billingBtn = showBilling
+    } else if (!noUpgrade) {
 
-      ? `<a href="${billingHref}" class="primary" style="padding:4px 10px;font-size:10px;text-decoration:none;background:var(--accent);color:#001020;border-radius:4px;font-weight:600">${escapeHtml(billingLabel)}</a>`
+      const upgradeUrl = state.serverConfig?.stripe_payment_link || '/pricing';
 
-      : '';
+      billingBtn = `<a href="${escapeHtml(upgradeUrl)}" class="primary" style="padding:4px 10px;font-size:10px;text-decoration:none;background:var(--accent);color:#001020;border-radius:4px;font-weight:600">Upgrade to Standard →</a>`;
+
+    }
 
     // Trial / free-tier expiry line + resubscribe affordance. Only relevant to
 
@@ -7354,6 +7379,29 @@ async function loadSettingsTab(projectId) {
 
 
 
+    // a7c43cc1 — claude --rc watcher installer collapsible
+    html += `<details style="margin-top:12px;border:1px solid var(--border);border-radius:6px;overflow:hidden">
+      <summary style="cursor:pointer;padding:8px 10px;font-size:10px;font-weight:600;color:var(--text);background:var(--surface-2);list-style:none;display:flex;align-items:center;gap:6px;user-select:none">
+        <span style="font-size:12px">⚡</span> Install rc watcher <span style="color:var(--muted);font-weight:400;margin-left:4px">(for <code>claude --rc</code> server mode)</span>
+      </summary>
+      <div style="padding:10px 12px;font-size:10px;color:var(--muted);line-height:1.8">
+        <p style="margin:0 0 8px">When Claude runs in <code>claude --rc</code> (headless server mode) the
+        standard SessionStart hooks do not fire. The rc watcher is a lightweight OS-native background service
+        (Windows Task Scheduler / macOS LaunchAgent / Linux systemd) that watches
+        <code>~/.claude/projects/</code> for new session files and fires the hook automatically.</p>
+        <div style="margin-bottom:6px;font-size:10px;color:var(--text);font-weight:600">Windows</div>
+        <div style="display:flex;gap:6px;align-items:center;margin-bottom:10px">
+          <code id="rc-watcher-win-cmd-${escapeHtml(projectId)}" style="flex:1;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;padding:4px 8px;font-size:10px;word-break:break-all">irm ${escapeHtml(hooksBaseUrl)}/install_watcher.ps1 | iex</code>
+          <button onclick="navigator.clipboard.writeText(document.getElementById('rc-watcher-win-cmd-${escapeHtml(projectId)}').textContent).then(()=>{this.textContent='Copied!';setTimeout(()=>this.textContent='Copy',1500)}).catch(()=>{})" style="padding:3px 8px;font-size:10px;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;cursor:pointer;white-space:nowrap;color:var(--text)">Copy</button>
+        </div>
+        <div style="margin-bottom:6px;font-size:10px;color:var(--text);font-weight:600">macOS / Linux</div>
+        <div style="display:flex;gap:6px;align-items:center">
+          <code id="rc-watcher-unix-cmd-${escapeHtml(projectId)}" style="flex:1;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;padding:4px 8px;font-size:10px;word-break:break-all">curl -fsSL ${escapeHtml(hooksBaseUrl)}/install_watcher.sh | bash</code>
+          <button onclick="navigator.clipboard.writeText(document.getElementById('rc-watcher-unix-cmd-${escapeHtml(projectId)}').textContent).then(()=>{this.textContent='Copied!';setTimeout(()=>this.textContent='Copy',1500)}).catch(()=>{})" style="padding:3px 8px;font-size:10px;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;cursor:pointer;white-space:nowrap;color:var(--text)">Copy</button>
+        </div>
+      </div>
+    </details>`;
+
     html += '</div></details>';  // close Connect Claude Code section
     html += _secHtml('executor', 'Executor Setup');
 
@@ -8040,11 +8088,14 @@ async function loadSettingsTab(projectId) {
 
         noteList.innerHTML = (items && items.length)
 
-          ? items.map(n => `<div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px;padding:4px 0;border-bottom:1px solid var(--border)">
+          ? items.map(n => `<div data-note-row="${escapeHtml(n.id)}" style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px;padding:4px 0;border-bottom:1px solid var(--border)">
 
-              <span>${escapeHtml(n.title || '')}: <span style="color:var(--muted)">${escapeHtml(n.body || '')}</span>${n.tags ? ` <span style="color:var(--accent);font-size:9px">${escapeHtml(n.tags)}</span>` : ''}</span>
+              <span data-note-view="${escapeHtml(n.id)}">${escapeHtml(n.title || '')}: <span style="color:var(--muted)">${escapeHtml(n.body || '')}</span>${n.tags ? ` <span style="color:var(--accent);font-size:9px">${escapeHtml(n.tags)}</span>` : ''}</span>
 
-              <button class="secondary" data-nid="${escapeHtml(n.id)}" style="font-size:9px;padding:2px 7px">×</button>
+              <span style="display:flex;gap:4px;flex-shrink:0">
+                <button class="secondary" data-nid-edit="${escapeHtml(n.id)}" data-ntitle="${escapeHtml(n.title || '')}" data-nbody="${escapeHtml(n.body || '')}" style="font-size:9px;padding:2px 6px" title="Edit">✎</button>
+                <button class="secondary" data-nid="${escapeHtml(n.id)}" style="font-size:9px;padding:2px 7px">×</button>
+              </span>
 
             </div>`).join('')
 
@@ -8059,6 +8110,42 @@ async function loadSettingsTab(projectId) {
             try { await api(`/workspace/notes/${btn.dataset.nid}`, { method: 'DELETE' }); renderWsNotes(); }
 
             catch (e) { alert('Error: ' + e); }
+
+          };
+
+        });
+
+        noteList.querySelectorAll('button[data-nid-edit]').forEach(btn => {
+
+          btn.onclick = () => {
+
+            const nid = btn.dataset.nidEdit;
+            const row = noteList.querySelector(`[data-note-row="${nid}"]`);
+            const view = noteList.querySelector(`[data-note-view="${nid}"]`);
+            if (!row || row.querySelector('textarea')) return;
+            const titleVal = btn.dataset.ntitle;
+            const bodyVal = btn.dataset.nbody;
+            view.style.display = 'none';
+            const edit = document.createElement('div');
+            edit.style.cssText = 'flex:1;display:flex;flex-direction:column;gap:4px';
+            edit.innerHTML = `
+              <input type="text" value="${escapeHtml(titleVal)}" style="font-size:10px;padding:2px 6px;background:var(--surface-2);border:1px solid var(--border);color:var(--text);border-radius:3px;width:100%">
+              <textarea rows="2" style="font-size:10px;padding:2px 6px;background:var(--surface-2);border:1px solid var(--border);color:var(--text);border-radius:3px;resize:vertical;width:100%">${escapeHtml(bodyVal)}</textarea>
+              <span style="display:flex;gap:4px">
+                <button class="primary" style="font-size:9px;padding:2px 8px">Save</button>
+                <button class="secondary" style="font-size:9px;padding:2px 8px">Cancel</button>
+              </span>`;
+            row.insertBefore(edit, row.querySelector('[data-note-view]').nextSibling);
+            edit.querySelector('button.secondary').onclick = () => { edit.remove(); view.style.display = ''; };
+            edit.querySelector('button.primary').onclick = async () => {
+              const newTitle = edit.querySelector('input').value.trim();
+              const newBody = edit.querySelector('textarea').value.trim();
+              if (!newTitle || !newBody) return;
+              try {
+                await api(`/workspace/notes/${nid}`, { method: 'PATCH', body: JSON.stringify({ title: newTitle, body: newBody }) });
+                renderWsNotes();
+              } catch (e) { alert('Error: ' + e); }
+            };
 
           };
 
@@ -8164,9 +8251,9 @@ async function loadSettingsTab(projectId) {
     </div>
   </div>`;
 
-  // Team members section (hosted mode only, uses mcpData as hosted-mode proxy)
+  // Team members section (hosted mode only) — always visible for all plan tiers (ecdae392)
 
-  if (mcpData) {
+  if (isHostedMode()) {
 
     html += `<div style="margin-bottom:16px" id="members-section-${projectId}">
 
@@ -8981,6 +9068,38 @@ async function loadSettingsTab(projectId) {
         toast('Delete failed: ' + e.message, true);
 
         deleteBtn.disabled = false;
+
+      }
+
+    };
+
+  }
+
+  // e7d4400b — Billing portal: POST to avoid GET redirect leaking session cookie,
+  // redirect client-side once we have the URL.
+  const billingPortalBtn = document.getElementById(`billing-portal-btn-${projectId}`);
+
+  if (billingPortalBtn) {
+
+    billingPortalBtn.onclick = async () => {
+
+      billingPortalBtn.disabled = true;
+
+      billingPortalBtn.textContent = 'Loading…';
+
+      try {
+
+        const data = await api('/billing/portal', { method: 'POST' });
+
+        window.location.href = data.url;
+
+      } catch (e) {
+
+        toast('Could not open billing portal: ' + e.message, true);
+
+        billingPortalBtn.disabled = false;
+
+        billingPortalBtn.textContent = 'Manage billing →';
 
       }
 
@@ -10624,6 +10743,23 @@ async function updateLiveFeed(projectId) {
 
     }).join('');
 
+    const extraCount = active.length - 1;
+
+    const extraRows = active.slice(1).map(s => {
+
+      const age = s.last_seen ? Math.round((Date.now() - new Date(s.last_seen + 'Z').getTime()) / 60000) : null;
+
+      const ageStr = age !== null ? (age < 2 ? 'just now' : `${age}m ago`) : '';
+
+      return `<div style="display:flex;align-items:center;gap:6px;padding:2px 0">
+        <span style="font-size:9px;color:var(--accent)">●</span>
+        <span style="font-size:10px;color:var(--text);font-family:var(--font-mono)">${escapeHtml(s.name || 'unnamed')}</span>
+        ${s.human_id ? `<span style="font-size:9px;color:var(--muted)">${escapeHtml(s.human_id)}</span>` : ''}
+        ${ageStr ? `<span style="font-size:9px;color:var(--muted);margin-left:auto">${ageStr}</span>` : ''}
+      </div>`;
+
+    }).join('');
+
     el.innerHTML = `
 
       <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
@@ -10636,15 +10772,41 @@ async function updateLiveFeed(projectId) {
           ? `<span style="font-size:10px;color:var(--muted)">${escapeHtml(sess.human_id)}</span>`
           : (sess.name ? `<span style="font-size:10px;color:var(--muted);font-style:italic">${escapeHtml(sess.name)}</span>` : '')}
 
+        ${extraCount > 0 ? `<button class="secondary" id="live-feed-extra-toggle-${projectId}" style="font-size:9px;padding:1px 6px;margin-left:4px">+${extraCount} more ▸</button>` : ''}
+
         ${elapsedStr ? `<span style="font-size:10px;color:var(--muted);margin-left:auto">${elapsedStr}</span>` : ''}
 
       </div>
+
+      ${extraCount > 0 ? `<div id="live-feed-extra-${projectId}" style="display:none;margin-bottom:6px;padding:4px 8px;background:var(--surface-2);border-radius:3px">${extraRows}</div>` : ''}
 
       <div style="font-family:var(--font-mono)">
 
         ${taskRows || '<div style="color:var(--muted);font-size:10px">no recent tasks</div>'}
 
       </div>`;
+
+    if (extraCount > 0) {
+
+      const toggleBtn = el.querySelector(`#live-feed-extra-toggle-${projectId}`);
+
+      const extraEl = el.querySelector(`#live-feed-extra-${projectId}`);
+
+      if (toggleBtn && extraEl) {
+
+        toggleBtn.onclick = () => {
+
+          const open = extraEl.style.display !== 'none';
+
+          extraEl.style.display = open ? 'none' : 'block';
+
+          toggleBtn.textContent = open ? `+${extraCount} more ▸` : `${extraCount} others ▾`;
+
+        };
+
+      }
+
+    }
 
     el.style.display = 'block';
 
@@ -10929,9 +11091,13 @@ async function loadRecentRuns(projectId) {
 
       const cnt = run.task_count || 0;
 
-      const statusColor = run.status === 'running' ? 'var(--accent)' : run.status === 'failed' ? 'var(--danger,#e05)' : 'var(--muted)';
+      // A run stuck in "running" whose session is no longer active should display as "done"
+      const displayRunStatus = (run.status === 'running' && run.session_status && run.session_status !== 'active')
+        ? 'done' : run.status;
 
-      const dots = run.status === 'running' ? ' ·' : '';
+      const statusColor = displayRunStatus === 'running' ? 'var(--accent)' : displayRunStatus === 'failed' ? 'var(--danger,#e05)' : 'var(--muted)';
+
+      const dots = displayRunStatus === 'running' ? ' ·' : '';
 
       return `<div class="run-row" data-run-id="${escapeHtml(run.id)}" data-project-id="${escapeHtml(projectId)}"
 
@@ -10943,7 +11109,7 @@ async function loadRecentRuns(projectId) {
 
           <span style="font-size:9px;color:var(--muted)">${cnt} tasks · ${dur} · ${ts}${run.session_name && sid ? ` · ${escapeHtml(sid)}` : ''}</span>
 
-          <span style="font-size:9px;color:${statusColor}">${run.status}</span>
+          <span style="font-size:9px;color:${statusColor}">${displayRunStatus}</span>
 
         </div>
 
@@ -11077,6 +11243,10 @@ async function loadQueue(projectId) {
 
     if (refreshBtn) refreshBtn.onclick = () => loadQueue(projectId);
 
+    const reconcileBtn = document.getElementById(`queue-reconcile-${projectId}`);
+
+    if (reconcileBtn) reconcileBtn.onclick = () => runReconcile(projectId);
+
     // Wire search input (debounced 300ms) — universal search across all tables
 
     const searchInput = document.getElementById(`task-search-${projectId}`);
@@ -11127,6 +11297,120 @@ async function loadQueue(projectId) {
 
 }
 
+
+
+async function runReconcile(projectId) {
+
+  /** Fetch reconcile results and show inline in the Queue tab header area. */
+
+  const container = document.getElementById(`reconcile-results-${projectId}`);
+
+  const btn = document.getElementById(`queue-reconcile-${projectId}`);
+
+  if (!container) return;
+
+  if (btn) { btn.disabled = true; btn.textContent = 'checking…'; }
+
+  container.style.display = 'block';
+
+  container.innerHTML = '<span style="color:var(--muted)">Checking commits against sprint board…</span>';
+
+  try {
+
+    const data = await projectApi(projectId, `/projects/${projectId}/reconcile`);
+
+    if (!data.matches || data.matches.length === 0) {
+
+      container.innerHTML = `<span style="color:var(--muted)">✓ No drift detected (checked ${data.commit_count || 0} commits against ${data.pending_count || 0} pending items)</span>
+        <button onclick="document.getElementById('reconcile-results-${projectId}').style.display='none'" style="margin-left:10px;background:none;border:none;color:var(--muted);cursor:pointer;font-size:10px">✕</button>`;
+
+    } else {
+
+      const n = data.matches.length;
+
+      let html = `<div style="margin-bottom:6px;color:var(--warning,#f59e0b);font-weight:600">${n} item${n !== 1 ? 's' : ''} may already be shipped — verify before executing</div>`;
+
+      data.matches.forEach(m => {
+
+        const confidence = m.confidence === 'high' ? '🔴 high' : '🟡 medium';
+
+        const commits = (m.matching_commits || []).slice(0, 2).map(c =>
+          `<span style="color:var(--muted)">${escapeHtml(c.sha)} — ${escapeHtml(c.message)}</span>`
+        ).join('<br>');
+
+        html += `<div style="border:1px solid var(--border);border-radius:4px;padding:6px 8px;margin-bottom:6px;background:var(--surface-3,var(--surface-2))">
+          <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px">
+            <div>
+              <span style="color:var(--text)">${escapeHtml(m.title.slice(0, 80))}${m.title.length > 80 ? '…' : ''}</span>
+              <span style="margin-left:6px;font-size:9px;opacity:0.7">${confidence}</span>
+              <div style="margin-top:3px;font-size:9px">${commits}</div>
+            </div>
+            <div style="display:flex;gap:4px;flex-shrink:0">
+              <button class="primary" style="padding:2px 7px;font-size:9px"
+                onclick="reconcileMarkDone('${projectId}','${m.item_id}',this)">Mark done</button>
+              <button class="secondary" style="padding:2px 7px;font-size:9px"
+                onclick="this.closest('div[style]').remove()">Keep</button>
+            </div>
+          </div>
+        </div>`;
+
+      });
+
+      html += `<button onclick="document.getElementById('reconcile-results-${projectId}').style.display='none'" style="background:none;border:none;color:var(--muted);cursor:pointer;font-size:10px;margin-top:2px">Dismiss</button>`;
+
+      container.innerHTML = html;
+
+    }
+
+  } catch (e) {
+
+    container.innerHTML = `<span style="color:var(--danger,#ef4444)">Reconcile failed: ${escapeHtml(e.message)}</span>
+      <button onclick="document.getElementById('reconcile-results-${projectId}').style.display='none'" style="margin-left:10px;background:none;border:none;color:var(--muted);cursor:pointer;font-size:10px">✕</button>`;
+
+  } finally {
+
+    if (btn) { btn.disabled = false; btn.textContent = 'reconcile'; }
+
+  }
+
+}
+
+
+async function reconcileMarkDone(projectId, itemId, btnEl) {
+
+  /** Mark a sprint item done from the reconcile panel. */
+
+  try {
+
+    btnEl.disabled = true;
+
+    btnEl.textContent = '…';
+
+    await projectApi(projectId, `/projects/${projectId}/sprint-items/${itemId}/complete`, { method: 'POST', body: JSON.stringify({}) });
+
+    const row = btnEl.closest('div[style]');
+
+    if (row) {
+
+      row.style.opacity = '0.4';
+
+      row.innerHTML = `<span style="color:var(--muted)">✓ marked done</span>`;
+
+    }
+
+    loadQueue(projectId);
+
+  } catch (e) {
+
+    btnEl.disabled = false;
+
+    btnEl.textContent = 'Mark done';
+
+    toast(`Failed: ${e.message}`, true);
+
+  }
+
+}
 
 
 function renderSearchResults(query, results) {

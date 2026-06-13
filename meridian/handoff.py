@@ -125,6 +125,45 @@ def _extract_keywords(text: str) -> set[str]:
     return {w for w in words if w not in stop}
 
 
+def reconcile_sprint_items(
+    pending_items: list[dict[str, Any]],
+    commits: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Cross-reference pending sprint items against commit messages.
+
+    Each commit should be a dict with 'sha' and 'message' keys.
+    confidence='high' if 3+ keywords overlap, 'medium' if 1-2 keywords overlap.
+    Returns only items that have at least one keyword match.
+    """
+    results = []
+    for item in pending_items:
+        title = item.get("title") or ""
+        kws = _extract_keywords(title)
+        if len(kws) < 2:
+            continue
+        matching_commits: list[dict[str, str]] = []
+        max_overlap = 0
+        for commit in commits:
+            msg = commit.get("message") or ""
+            msg_kws = _extract_keywords(msg)
+            overlap = len(kws & msg_kws)
+            if overlap >= 1:
+                matching_commits.append({
+                    "sha": (commit.get("sha") or "")[:12],
+                    "message": msg[:120],
+                })
+                max_overlap = max(max_overlap, overlap)
+        if matching_commits:
+            confidence = "high" if max_overlap >= 3 else "medium"
+            results.append({
+                "item_id": item["id"],
+                "title": title[:200],
+                "matching_commits": matching_commits[:5],
+                "confidence": confidence,
+            })
+    return results
+
+
 def _annotate_possibly_done(
     pending_items: list[dict[str, Any]],
     recent_tasks: list[dict[str, Any]],
@@ -537,6 +576,7 @@ async def generate_handoff(
     skip_ai_summary: bool = False,
     mode: str = "full",
     session_id: str | None = None,
+    commit_messages: list[str] | None = None,
 ) -> tuple[str, str]:
     """Fetch all state, render the L0/L1/L2 template, write the file, return both.
 
@@ -605,8 +645,8 @@ async def generate_handoff(
         if it.get("status") in ("todo", "pending")
     ]
     pending_sprint_items = _prepare_pending_sprint_items(pending_sprint_items)
-    # Flag items that may already be done based on recent task descriptions
-    pending_sprint_items = _annotate_possibly_done(pending_sprint_items, tasks)
+    # Flag items that may already be done based on recent task descriptions or commits
+    pending_sprint_items = _annotate_possibly_done(pending_sprint_items, tasks, commit_messages)
     # Auto-set touches_files from recent git history for items without it.
     pending_sprint_items = await _annotate_touches_files(db, project_id, pending_sprint_items)
     decisions_log = (project.get("decisions") or "").strip()
@@ -682,6 +722,15 @@ async def generate_handoff(
         decisions_count=len([d for d in pinned_decisions if d.get("status") == "active"]),
     )
     content = f"{readiness_block}\n\n{content}"
+
+    # 10e6b265 — session queue: append the queued next-session goal (if any) and
+    # clear it so the handoff surfaces the next /goal inline, exactly once.
+    queued_goal = await db_module.pop_queued_session(db, project_id)
+    if queued_goal:
+        content = (
+            f"{content}\n\n=== QUEUED NEXT SESSION ===\n"
+            f"{queued_goal}\n=== END QUEUE ==="
+        )
 
     out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)

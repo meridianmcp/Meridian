@@ -1,6 +1,8 @@
 """Sprint items routes — extracted from server.py."""
 from __future__ import annotations
 
+import subprocess
+from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
@@ -19,14 +21,33 @@ async def list_sprint_items(
     limit: int | None = None,
     offset: int = 0,
     with_counts: bool = False,
+    page: int | None = None,
 ) -> list[dict[str, Any]] | dict[str, Any]:
-    """List sprint items, optionally filtered by status."""
-    project = await db_module.get_project(await _db(request), project_id)
+    """List sprint items, optionally filtered by status.
+
+    Pass ``page`` (1-based) for true server-side pagination — returns
+    ``{items, total, page, pages}`` using SQL LIMIT/OFFSET so large completed
+    lists don't fetch every row. ``limit`` defaults to 50 in this mode. Without
+    ``page`` the legacy list/slice behaviour is unchanged.
+    """
+    db = await _db(request)
+    project = await db_module.get_project(db, project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="project not found")
+    if page is not None:
+        try:
+            per = max(1, min(limit or 50, 500))
+            page_n = max(1, page)
+            items, total = await db_module.get_sprint_items_page(
+                db, project_id, status=status, limit=per, offset=(page_n - 1) * per,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
+        pages = (total + per - 1) // per if per else 1
+        return {"items": items, "total": total, "page": page_n, "pages": pages}
     try:
         items = await db_module.get_sprint_items(
-            await _db(request), project_id, status=status
+            db, project_id, status=status
         )
         total_done_count = sum(1 for it in items if it.get("status") == "done")
         if status is not None and with_counts:
@@ -209,3 +230,78 @@ async def push_sprint_item_endpoint(
     if item is None:
         raise HTTPException(status_code=404, detail="sprint item not found")
     return item
+
+
+@router.get("/projects/{project_id}/reconcile")
+async def reconcile_sprint_items_endpoint(
+    project_id: str, request: Request
+) -> dict[str, Any]:
+    """Cross-reference pending sprint items against recent git commits.
+
+    Fetches commits from GitHub if the project has a repo+PAT connected,
+    otherwise falls back to local ``git log --oneline -20``.
+
+    Returns a list of pending items whose title keywords match recent commits,
+    with confidence='high' (3+ keyword overlap) or 'medium' (1-2 overlap).
+    """
+    db = await _db(request)
+    project = await db_module.get_project(db, project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="project not found")
+
+    commits: list[dict[str, str]] = []
+
+    # Try GitHub API first
+    try:
+        tenant = await _get_tenant_from_request(request)
+        if tenant:
+            pat = db_module.decrypt_field(tenant.get("github_pat"))
+            repo = (project.get("github_repo") or "").strip()
+            if pat and repo:
+                import httpx as _httpx  # noqa: PLC0415
+                gh_headers = {
+                    "Authorization": f"token {pat}",
+                    "Accept": "application/vnd.github+json",
+                }
+                async with _httpx.AsyncClient(timeout=10.0) as http:
+                    r = await http.get(
+                        f"https://api.github.com/repos/{repo}/commits",
+                        headers=gh_headers,
+                        params={"per_page": "20"},
+                    )
+                    if r.status_code == 200:
+                        for c in r.json():
+                            commits.append({
+                                "sha": c["sha"][:12],
+                                "message": c["commit"]["message"].split("\n")[0],
+                            })
+    except Exception:  # noqa: BLE001
+        pass
+
+    # Fall back to local git log if no commits yet
+    if not commits:
+        try:
+            result = subprocess.run(
+                ["git", "log", "--oneline", "-20"],
+                capture_output=True, text=True, timeout=5,
+            )
+            for line in result.stdout.splitlines():
+                line = line.strip()
+                if line and " " in line:
+                    sha, _, msg = line.partition(" ")
+                    commits.append({"sha": sha, "message": msg})
+        except Exception:  # noqa: BLE001
+            pass
+
+    pending = await db_module.get_sprint_items(db, project_id, status="pending")
+
+    from .. import handoff as handoff_module  # noqa: PLC0415
+    matches = handoff_module.reconcile_sprint_items(pending, commits)
+
+    return {
+        "reconciled_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "commit_count": len(commits),
+        "pending_count": len(pending),
+        "matched_count": len(matches),
+        "matches": matches,
+    }

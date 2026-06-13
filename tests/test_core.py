@@ -316,6 +316,38 @@ def test_health(client):
     assert r.json()["status"] == "ok"
 
 
+def test_status_server_badge(client):
+    """shields.io endpoint badge: server liveness (sprint item 29b33fdb)."""
+    r = client.get("/status/server")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["schemaVersion"] == 1
+    assert body["label"] == "meridian"
+    assert body["message"] == "online"
+    assert body["color"] == "brightgreen"
+
+
+def test_status_tools_badge(client):
+    """shields.io endpoint badge: MCP tool count must be > 0."""
+    r = client.get("/status/tools")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["schemaVersion"] == 1
+    assert body["label"] == "MCP tools"
+    count = int(body["message"].split()[0])
+    assert count > 0
+
+
+def test_status_sessions_badge(client):
+    """shields.io endpoint badge: live session count."""
+    r = client.get("/status/sessions")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["schemaVersion"] == 1
+    assert body["label"] == "active sessions"
+    assert body["message"].endswith("live")
+
+
 def test_create_and_list_projects(client):
     r = client.post("/projects", json={"name": "alpha"})
     assert r.status_code == 201
@@ -3812,6 +3844,214 @@ async def test_workspace_settings_db_defaults(db):
     assert settings["sprint_name_default"] is None
 
 
+# ---------------------------------------------------------------------------
+# 637dd900 — workspace layer tenant isolation
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_workspace_notes_isolated_by_tenant(db):
+    """A note created by tenant A must not be returned for tenant B."""
+    await db_module.add_workspace_note(db, "A-secret", "for A only", tenant_id="tenant-a")
+    await db_module.add_workspace_note(db, "B-secret", "for B only", tenant_id="tenant-b")
+
+    a_titles = {n["title"] for n in await db_module.get_workspace_notes(db, tenant_id="tenant-a")}
+    b_titles = {n["title"] for n in await db_module.get_workspace_notes(db, tenant_id="tenant-b")}
+    assert a_titles == {"A-secret"}
+    assert b_titles == {"B-secret"}
+
+
+@pytest.mark.asyncio
+async def test_workspace_note_legacy_null_visible_to_tenant(db):
+    """Pre-isolation rows (tenant_id IS NULL) stay visible to a tenant — they
+    only ever exist on that tenant's own dedicated DB."""
+    await db_module.add_workspace_note(db, "legacy", "old note")  # tenant_id NULL
+    titles = {n["title"] for n in await db_module.get_workspace_notes(db, tenant_id="tenant-a")}
+    assert "legacy" in titles
+
+
+@pytest.mark.asyncio
+async def test_delete_workspace_note_respects_tenant(db):
+    """Tenant B cannot delete tenant A's note."""
+    note = await db_module.add_workspace_note(db, "A-note", "body", tenant_id="tenant-a")
+    # Wrong tenant: no-op delete.
+    assert await db_module.delete_workspace_note(db, note["id"], tenant_id="tenant-b") is False
+    assert await db_module.get_workspace_notes(db, tenant_id="tenant-a")
+    # Right tenant: deletes.
+    assert await db_module.delete_workspace_note(db, note["id"], tenant_id="tenant-a") is True
+    assert await db_module.get_workspace_notes(db, tenant_id="tenant-a") == []
+
+
+@pytest.mark.asyncio
+async def test_workspace_decisions_isolated_by_tenant(db):
+    """A decision pinned by tenant A must not be visible to tenant B."""
+    await db_module.pin_workspace_decision(db, "A-arch", "A body", tenant_id="tenant-a")
+    await db_module.pin_workspace_decision(db, "B-arch", "B body", tenant_id="tenant-b")
+    a = {d["title"] for d in await db_module.get_workspace_decisions(db, tenant_id="tenant-a")}
+    assert a == {"A-arch"}
+
+
+@pytest.mark.asyncio
+async def test_workspace_settings_isolated_by_tenant(db):
+    """Settings written under tenant A are not seen by tenant B."""
+    await db_module.update_workspace_settings(
+        db, sprint_name_default="a-sprint", tenant_id="tenant-a"
+    )
+    a = await db_module.get_workspace_settings(db, tenant_id="tenant-a")
+    b = await db_module.get_workspace_settings(db, tenant_id="tenant-b")
+    assert a["sprint_name_default"] == "a-sprint"
+    assert b["sprint_name_default"] is None
+
+
+@pytest.mark.asyncio
+async def test_workspace_settings_single_row_fallback(db):
+    """A tenant-less read on a single-tenant DB falls back to the only row, so
+    internal callers (nudge, handoff) keep seeing the tenant's settings."""
+    await db_module.update_workspace_settings(
+        db, sprint_name_default="solo", tenant_id="tenant-a"
+    )
+    # No tenant_id passed (internal caller) — single-row fallback applies.
+    s = await db_module.get_workspace_settings(db)
+    assert s["sprint_name_default"] == "solo"
+
+
+# ---------------------------------------------------------------------------
+# 2da12762 — token-based OAuth hooks (registered_hostnames)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_register_hostname_returns_token_and_resolves(db):
+    token = await db_module.register_hostname(db, "tenant-a", "MACHINE-1")
+    assert token and len(token) >= 16
+    assert await db_module.resolve_hostname_registration(db, "MACHINE-1", token) == "tenant-a"
+    # Wrong token / unknown hostname do not resolve (fail closed at the db).
+    assert await db_module.resolve_hostname_registration(db, "MACHINE-1", "nope") is None
+    assert await db_module.resolve_hostname_registration(db, "OTHER", token) is None
+
+
+@pytest.mark.asyncio
+async def test_register_hostname_rotates_token(db):
+    t1 = await db_module.register_hostname(db, "tenant-a", "M1")
+    t2 = await db_module.register_hostname(db, "tenant-a", "M1")
+    assert t1 != t2
+    assert await db_module.resolve_hostname_registration(db, "M1", t1) is None
+    assert await db_module.resolve_hostname_registration(db, "M1", t2) == "tenant-a"
+
+
+@pytest.mark.asyncio
+async def test_hostname_status_list_and_revoke(db):
+    assert (await db_module.get_hostname_status(db, "tenant-a", "M1"))["registered"] is False
+    token = await db_module.register_hostname(db, "tenant-a", "M1")
+    assert await db_module.get_hostname_status(db, "tenant-a", "M1") == {
+        "registered": True, "token": token,
+    }
+    machines = await db_module.list_registered_hostnames(db, "tenant-a")
+    assert len(machines) == 1 and machines[0]["hostname"] == "M1"
+    assert "registration_token" not in machines[0]  # token never listed
+    # Revoke is tenant-scoped.
+    assert await db_module.revoke_registered_hostname(db, "tenant-b", machines[0]["id"]) is False
+    assert await db_module.revoke_registered_hostname(db, "tenant-a", machines[0]["id"]) is True
+    assert await db_module.list_registered_hostnames(db, "tenant-a") == []
+
+
+def test_hooks_session_start_unknown_hostname_returns_empty_not_401(client):
+    """An unknown hostname+token must fail open to an empty context so Claude
+    Code always starts cleanly — never 401."""
+    r = client.post("/hooks/session-start", json={
+        "hostname": "UNKNOWN-MACHINE",
+        "registration_token": "deadbeefdeadbeef",
+        "cwd": "/some/path",
+    })
+    assert r.status_code == 200
+    assert r.json()["hookSpecificOutput"]["additionalContext"] == ""
+
+
+# ---------------------------------------------------------------------------
+# 10e6b265 — session queue
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_queued_session_set_get_pop(db):
+    p = await db_module.create_project(db, "queue-proj")
+    assert await db_module.get_queued_session(db, p["id"]) is None
+    await db_module.set_queued_session(db, p["id"], "/goal do the thing")
+    assert await db_module.get_queued_session(db, p["id"]) == "/goal do the thing"
+    # pop is read-once
+    assert await db_module.pop_queued_session(db, p["id"]) == "/goal do the thing"
+    assert await db_module.get_queued_session(db, p["id"]) is None
+    assert await db_module.pop_queued_session(db, p["id"]) is None
+
+
+@pytest.mark.asyncio
+async def test_generate_handoff_appends_and_clears_queue(db, tmp_path):
+    from meridian import handoff as handoff_module
+    p = await db_module.create_project(db, "queue-proj2")
+    await db_module.set_queued_session(db, p["id"], "/goal next sprint")
+    _, content = await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True
+    )
+    assert "=== QUEUED NEXT SESSION ===" in content
+    assert "/goal next sprint" in content
+    # Cleared after exactly one handoff.
+    assert await db_module.get_queued_session(db, p["id"]) is None
+    _, content2 = await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True
+    )
+    assert "=== QUEUED NEXT SESSION ===" not in content2
+
+
+def test_queue_session_http_roundtrip(client):
+    pid = client.post("/projects", json={"name": "qhttp"}).json()["id"]
+    assert client.get(f"/projects/{pid}/queued-session").json()["goal"] is None
+    r = client.post(f"/projects/{pid}/queue-session", json={"goal": "/goal X"})
+    assert r.status_code == 200 and r.json()["queued"] is True
+    assert client.get(f"/projects/{pid}/queued-session").json()["goal"] == "/goal X"
+    # Empty goal clears it.
+    client.post(f"/projects/{pid}/queue-session", json={"goal": ""})
+    assert client.get(f"/projects/{pid}/queued-session").json()["goal"] is None
+
+
+# Live status shields (/status/*) are covered by test_status_*_badge above —
+# the canonical rate-limited endpoints came in on dev (45b4e35).
+
+
+# ---------------------------------------------------------------------------
+# STEP 5 — server-side sprint-item pagination
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_get_sprint_items_page_sql_pagination(db):
+    p = await db_module.create_project(db, "page-proj")
+    for i in range(7):
+        await db_module.add_sprint_item(db, p["id"], "v1", f"item-{i}")
+    items, total = await db_module.get_sprint_items_page(
+        db, p["id"], status="pending", limit=5, offset=0
+    )
+    assert total == 7 and len(items) == 5
+    items2, total2 = await db_module.get_sprint_items_page(
+        db, p["id"], status="pending", limit=5, offset=5
+    )
+    assert total2 == 7 and len(items2) == 2
+    # No overlap between pages.
+    assert {i["id"] for i in items}.isdisjoint({i["id"] for i in items2})
+
+
+def test_sprint_items_paginated_endpoint(client):
+    pid = client.post("/projects", json={"name": "pgproj"}).json()["id"]
+    for i in range(3):
+        client.post(f"/projects/{pid}/sprint-items", json={"title": f"t{i}", "version": "v1"})
+    j = client.get(f"/projects/{pid}/sprint-items?status=pending&page=1&limit=2").json()
+    assert j["total"] == 3 and j["page"] == 1 and j["pages"] == 2 and len(j["items"]) == 2
+    j2 = client.get(f"/projects/{pid}/sprint-items?status=pending&page=2&limit=2").json()
+    assert len(j2["items"]) == 1
+    # Without page= the legacy list shape is preserved.
+    legacy = client.get(f"/projects/{pid}/sprint-items?status=pending").json()
+    assert isinstance(legacy, list) and len(legacy) == 3
+
+
 def test_build_goal_xml_omits_decisions_when_empty():
     """No <decisions> tag when there's nothing to show — worker
     sessions in v1.2.0 will pass decisions=None for the same reason."""
@@ -6307,6 +6547,22 @@ def test_billing_portal_endpoint_registered():
     assert "/billing/portal" in routes
 
 
+def test_install_watcher_ps1_returns_script(client):
+    """a7c43cc1 — GET /install_watcher.ps1 serves the Windows watcher installer."""
+    r = client.get("/install_watcher.ps1")
+    assert r.status_code == 200
+    assert "FileSystemWatcher" in r.text or "Task" in r.text
+    assert r.headers["content-type"].startswith("text/plain")
+
+
+def test_install_watcher_sh_returns_script(client):
+    """a7c43cc1 — GET /install_watcher.sh serves the macOS/Linux watcher installer."""
+    r = client.get("/install_watcher.sh")
+    assert r.status_code == 200
+    assert "launchctl" in r.text or "systemctl" in r.text or "inotifywait" in r.text
+    assert r.headers["content-type"].startswith("text/plain")
+
+
 @pytest.mark.asyncio
 async def test_create_stripe_billing_portal_session_rejects_no_customer():
     """G2.11 — helper raises ValueError when stripe_customer_id is missing,
@@ -6314,6 +6570,42 @@ async def test_create_stripe_billing_portal_session_rejects_no_customer():
     from meridian.hosted import create_stripe_billing_portal_session
     with pytest.raises(ValueError):
         await create_stripe_billing_portal_session({"email": "free@example.com"})
+
+
+def test_billing_portal_post_returns_url_for_stripe_customer(client, monkeypatch):
+    """e7d4400b — POST /billing/portal returns JSON {url: ...} for a tenant
+    that has a stripe_customer_id so the dashboard can POST-then-redirect
+    instead of using a GET link."""
+    from meridian import hosted as _hosted
+    monkeypatch.setenv("MERIDIAN_HOSTED", "true")
+    fake_url = "https://billing.stripe.com/session/test_abc"
+
+    async def _fake_get_tenant(request):
+        return {"email": "user@example.com", "stripe_customer_id": "cus_test123"}
+
+    async def _fake_portal(tenant):
+        return fake_url
+
+    monkeypatch.setattr(_hosted, "get_current_tenant", _fake_get_tenant)
+    monkeypatch.setattr(_hosted, "create_stripe_billing_portal_session", _fake_portal)
+    r = client.post("/billing/portal")
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data.get("url") == fake_url
+
+
+def test_billing_portal_post_returns_404_without_stripe_customer(client, monkeypatch):
+    """e7d4400b — POST /billing/portal returns 404 when the tenant has no
+    stripe_customer_id (free tier / admin accounts)."""
+    from meridian import hosted as _hosted
+    monkeypatch.setenv("MERIDIAN_HOSTED", "true")
+
+    async def _fake_get_tenant(request):
+        return {"email": "admin@example.com"}  # no stripe_customer_id
+
+    monkeypatch.setattr(_hosted, "get_current_tenant", _fake_get_tenant)
+    r = client.post("/billing/portal")
+    assert r.status_code == 404
 
 
 def test_me_endpoint_exposes_has_stripe_customer(client, monkeypatch):
@@ -8448,3 +8740,277 @@ def test_oauth_device_table_in_create_tables():
     """CREATE_TABLES must define device_codes table for RFC 8628 persistence."""
     from meridian.db import CREATE_TABLES
     assert "device_codes" in CREATE_TABLES, "CREATE_TABLES missing 'device_codes'"
+
+
+# ---------------------------------------------------------------------------
+# Git worktree isolation (sprint item 24855305)
+# ---------------------------------------------------------------------------
+
+
+def test_active_worktrees_table_in_create_tables():
+    """CREATE_TABLES must define active_worktrees table."""
+    from meridian.db import CREATE_TABLES
+    assert "active_worktrees" in CREATE_TABLES, "CREATE_TABLES missing 'active_worktrees'"
+
+
+@pytest.mark.asyncio
+async def test_register_and_remove_worktree(db):
+    """register_worktree inserts a row; remove_worktree marks it removed."""
+    p = await db_module.create_project(db, "worktree-db-test")
+    session = await db_module.register_session(db, p["id"], "wt-session")
+
+    wt = await db_module.register_worktree(
+        db, session["id"], p["id"], "worktree/abc12345", "../repo-worktree-abc12345",
+        item_id="fake-item-id",
+    )
+    assert wt["branch"] == "worktree/abc12345"
+    assert wt["path"] == "../repo-worktree-abc12345"
+    assert wt["removed_at"] is None
+
+    active = await db_module.list_active_worktrees(db, p["id"])
+    assert len(active) == 1
+    assert active[0]["id"] == wt["id"]
+
+    removed = await db_module.remove_worktree(db, wt["id"])
+    assert removed is True
+
+    active_after = await db_module.list_active_worktrees(db, p["id"])
+    assert len(active_after) == 0
+
+
+@pytest.mark.asyncio
+async def test_claim_sprint_item_returns_worktree_fields_when_isolation_set(db):
+    """claim_sprint_item adds worktree_suggested fields when executor isolation=worktree."""
+    import json as _json
+    import meridian.server as srv
+
+    p = await db_module.create_project(db, "wt-isolation-test")
+    # Store executor_config with isolation=worktree and a repo_path
+    await db_module.set_executor_config(db, p["id"], {
+        "repo_path": "/home/user/myrepo",
+        "isolation": "worktree",
+    })
+    item = await db_module.add_sprint_item(db, p["id"], "v1", "Feature work")
+
+    result = await srv._dispatch_mcp_tool(
+        "claim_sprint_item",
+        {"project_id": p["id"], "item_id": item["id"]},
+        db, "/tmp",
+    )
+
+    assert result.get("error") is None
+    assert result["worktree_suggested"] is True
+    assert result["worktree_branch"].startswith("worktree/")
+    assert "myrepo" in result["worktree_path"]
+    assert "git worktree add" in result["worktree_setup_cmd"]
+    assert "git worktree remove" in result["worktree_cleanup_cmd"]
+    assert "git merge" in result["worktree_merge_cmd"]
+
+
+@pytest.mark.asyncio
+async def test_claim_sprint_item_worktree_isolation_bypasses_file_conflict(db):
+    """When isolation=worktree, claim succeeds even when touches_files overlap active locks."""
+    import json as _json
+    import meridian.server as srv
+
+    p = await db_module.create_project(db, "wt-bypass-conflict")
+    await db_module.set_executor_config(db, p["id"], {"isolation": "worktree"})
+    item = await db_module.add_sprint_item(db, p["id"], "v1", "Edit server")
+    await db.execute(
+        "UPDATE sprint_items SET touches_files = ? WHERE id = ?",
+        (_json.dumps(["meridian/server.py"]), item["id"]),
+    )
+    await db.commit()
+    other_session = await db_module.register_session(db, p["id"], "other-worker")
+    await db_module.claim_file(db, "meridian/server.py", other_session["id"])
+
+    result = await srv._dispatch_mcp_tool(
+        "claim_sprint_item",
+        {"project_id": p["id"], "item_id": item["id"]},
+        db, "/tmp",
+    )
+    # Should succeed (not CONFLICT) because isolation=worktree bypasses the check
+    assert result.get("error") != "CONFLICT"
+    assert result["worktree_suggested"] is True
+
+
+def test_worktrees_http_endpoints(client):
+    """GET/POST/DELETE /projects/{id}/worktrees round-trip."""
+    # Create project + session
+    proj = client.post("/projects", json={"name": "wt-http-test"}).json()
+    pid = proj["id"]
+    sess = client.post(f"/projects/{pid}/start-session", json={"session_name": "wt-test-sess"}).json()
+    sid = sess["session_id"]
+
+    # List — initially empty
+    r = client.get(f"/projects/{pid}/worktrees")
+    assert r.status_code == 200
+    assert r.json() == []
+
+    # Register a worktree
+    r2 = client.post(f"/projects/{pid}/worktrees", json={
+        "session_id": sid,
+        "branch": "worktree/abc12345",
+        "path": "../myrepo-worktree-abc12345",
+    })
+    assert r2.status_code == 201
+    wt = r2.json()
+    assert wt["branch"] == "worktree/abc12345"
+    assert wt["session_id"] == sid
+
+    # List — now has one
+    listed = client.get(f"/projects/{pid}/worktrees").json()
+    assert len(listed) == 1
+    assert listed[0]["id"] == wt["id"]
+
+    # Delete
+    r3 = client.delete(f"/projects/{pid}/worktrees/{wt['id']}")
+    assert r3.status_code == 204
+
+    # List — empty again
+    assert client.get(f"/projects/{pid}/worktrees").json() == []
+
+    # Delete again — 404
+    r4 = client.delete(f"/projects/{pid}/worktrees/{wt['id']}")
+    assert r4.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# Reconcile sprint items — unit + HTTP
+# ---------------------------------------------------------------------------
+
+
+def test_reconcile_sprint_items_high_confidence():
+    """3+ keyword overlap → confidence=high."""
+    items = [{"id": "item-1", "title": "implement oauth token refresh endpoint"}]
+    commits = [
+        {"sha": "abc123", "message": "feat: implement oauth token refresh for expired sessions"},
+    ]
+    results = handoff_module.reconcile_sprint_items(items, commits)
+    assert len(results) == 1
+    assert results[0]["item_id"] == "item-1"
+    assert results[0]["confidence"] == "high"
+    assert len(results[0]["matching_commits"]) == 1
+    assert results[0]["matching_commits"][0]["sha"] == "abc123"
+
+
+def test_reconcile_sprint_items_medium_confidence():
+    """1-2 keyword overlap → confidence=medium."""
+    items = [{"id": "item-2", "title": "reconcile sprint board drift detection"}]
+    commits = [
+        {"sha": "def456", "message": "fix: sprint board display"},
+    ]
+    results = handoff_module.reconcile_sprint_items(items, commits)
+    assert len(results) == 1
+    assert results[0]["confidence"] == "medium"
+
+
+def test_reconcile_sprint_items_no_match():
+    """Items with no keyword overlap are excluded."""
+    items = [{"id": "item-3", "title": "billing stripe webhook handler"}]
+    commits = [
+        {"sha": "xyz", "message": "chore: update readme typo"},
+    ]
+    results = handoff_module.reconcile_sprint_items(items, commits)
+    assert results == []
+
+
+def test_reconcile_sprint_items_short_title_skipped():
+    """Items with fewer than 2 keywords (after stop-word removal) are skipped."""
+    items = [{"id": "item-4", "title": "fix"}]  # all stop words
+    commits = [{"sha": "aaa", "message": "fix the broken thing"}]
+    results = handoff_module.reconcile_sprint_items(items, commits)
+    assert results == []
+
+
+def test_reconcile_sprint_items_multiple_commits():
+    """Multiple matching commits are all included (up to 5)."""
+    items = [{"id": "item-5", "title": "migrate database schema tables"}]
+    commits = [
+        {"sha": "s1", "message": "feat: migrate database tables"},
+        {"sha": "s2", "message": "chore: database schema migration cleanup"},
+        {"sha": "s3", "message": "totally unrelated commit"},
+    ]
+    results = handoff_module.reconcile_sprint_items(items, commits)
+    assert len(results) == 1
+    matching_shas = [c["sha"] for c in results[0]["matching_commits"]]
+    assert "s1" in matching_shas
+    assert "s2" in matching_shas
+    assert "s3" not in matching_shas
+
+
+def test_reconcile_endpoint_returns_structure(client):
+    """GET /projects/{id}/reconcile returns expected shape."""
+    project = client.post("/projects", json={"name": "recon-test"}).json()
+    pid = project["id"]
+
+    # No pending items → no matches
+    r = client.get(f"/projects/{pid}/reconcile")
+    assert r.status_code == 200
+    data = r.json()
+    assert "matches" in data
+    assert "commit_count" in data
+    assert "pending_count" in data
+    assert "matched_count" in data
+    assert data["matched_count"] == len(data["matches"])
+
+
+def test_reconcile_endpoint_matches_pending_items(client):
+    """Reconcile endpoint finds matching items against local git log."""
+    project = client.post("/projects", json={"name": "recon-match"}).json()
+    pid = project["id"]
+
+    # Add a sprint item whose keywords appear in recent git commits
+    client.post(
+        f"/projects/{pid}/sprint-items",
+        json={"version": "v1", "title": "implement session queue pagination feature"},
+    )
+
+    r = client.get(f"/projects/{pid}/reconcile")
+    assert r.status_code == 200
+    data = r.json()
+    assert data["pending_count"] >= 1
+    # commit_count may be 0 if no git repo available in test env — that's fine
+    assert isinstance(data["matches"], list)
+
+
+def test_reconcile_endpoint_404_for_unknown_project(client):
+    """Reconcile returns 404 for a non-existent project."""
+    r = client.get("/projects/does-not-exist/reconcile")
+    assert r.status_code == 404
+
+
+def test_generate_handoff_accepts_commit_messages(db, tmp_path):
+    """generate_handoff passes commit_messages to _annotate_possibly_done."""
+    import asyncio  # noqa: PLC0415
+    from meridian import handoff as hm  # noqa: PLC0415
+
+    async def run():
+        p = await db_module.create_project(db, "handoff-commits")
+        await db_module.add_sprint_item(
+            db, p["id"], "v1", "implement oauth token refresh endpoint"
+        )
+        commits = [
+            "feat: implement oauth token refresh for expired sessions",
+            "fix: unrelated change",
+        ]
+        _, content = await hm.generate_handoff(
+            db, p["id"], str(tmp_path),
+            skip_ai_summary=True,
+            commit_messages=commits,
+        )
+        return content
+
+    content = asyncio.get_event_loop().run_until_complete(run())
+    # The item should be flagged as possibly done
+    assert "possibly done" in content
+
+
+def test_dashboard_js_has_reconcile_button():
+    """dashboard.js contains the reconcile button and runReconcile function."""
+    js_path = Path(__file__).parent.parent / "meridian" / "static" / "dashboard.js"
+    src = js_path.read_text(encoding="utf-8")
+    assert "queue-reconcile-" in src
+    assert "runReconcile" in src
+    assert "reconcileMarkDone" in src
+    assert "reconcile-results-" in src

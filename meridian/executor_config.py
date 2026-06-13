@@ -14,6 +14,7 @@ EXECUTOR_CONFIG_KEYS = (
     "shell_type",
     "branch",
     "context_threshold",
+    "isolation",
 )
 
 EXECUTOR_CREDENTIALS_RULE = (

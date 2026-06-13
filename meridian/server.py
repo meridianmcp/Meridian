@@ -109,6 +109,7 @@ from .models import (
     Task,
     TaskCreate,
     TaskUpdate,
+    WorktreeCreate,
 )
 from .mcp_tools import _MCP_TOOLS_LIST, _TOOL_EXAMPLES, _READ_ONLY_TOOLS as _mcp_readonly_tools
 
@@ -887,7 +888,7 @@ async def site_password_gate(request: Request, call_next):
     if not site_pw:
         return await call_next(request)
     path = request.url.path
-    if path in ("/health", "/failover-status", "/mcp/health", "/__gate__", "/config", "/static", "/mcp/tools-doc", "/mcp/quickstart", "/mcp/sse", "/mcp", "/.well-known/oauth-authorization-server", "/.well-known/oauth-protected-resource") or path.startswith("/static/") or path.startswith("/oauth/") or path == "/demo" or path.startswith("/demo/"):
+    if path in ("/health", "/failover-status", "/mcp/health", "/__gate__", "/config", "/static", "/mcp/tools-doc", "/mcp/quickstart", "/mcp/sse", "/mcp", "/.well-known/oauth-authorization-server", "/.well-known/oauth-protected-resource", "/hooks/session-start", "/hooks/stop") or path.startswith("/static/") or path.startswith("/oauth/") or path.startswith("/status/") or path == "/demo" or path.startswith("/demo/"):
         return await call_next(request)
     # Demo cookie bypasses site password gate — demo users don't go through __gate__
     if request.cookies.get(_DEMO_CONTEXT_COOKIE):
@@ -1364,6 +1365,10 @@ async def failover_status() -> dict[str, bool]:
     return {"is_failover": flag in ("1", "true", "yes", "on")}
 
 
+# Live status shields (/status/*) are defined further below — the canonical
+# rate-limited implementation lives next to the cached _MCP_TOOL_COUNT.
+
+
 @app.get("/terms", response_class=HTMLResponse)
 async def terms_page(request: Request) -> HTMLResponse:
     """Static Terms of Service page."""
@@ -1624,6 +1629,68 @@ async def server_config(request: Request) -> dict[str, Any]:
 async def list_tools_endpoint() -> list[dict[str, Any]]:
     """Return MCP tool definitions for the dashboard Docs vtab."""
     return _MCP_TOOLS_LIST
+
+
+# ---------------------------------------------------------------------------
+# v1.0.0-alpha — public status/shields endpoints (sprint item 29b33fdb)
+# ---------------------------------------------------------------------------
+# shields.io endpoint-badge JSON (https://shields.io/badges/endpoint-badge).
+# No auth, read-only, rate-limited to 1 req/5s per IP so the public badges
+# can't be used to hammer the DB. /status/hooks is intentionally omitted until
+# the registered_hostnames table (OAuth-hooks item) lands.
+_MCP_TOOL_COUNT = len(_MCP_TOOLS_LIST)
+
+
+def _status_rate_limit(func):
+    """Apply the 1-req/5s/IP shields rate limit when slowapi is available.
+
+    No-op passthrough when slowapi isn't installed (self-host minimal deploy),
+    so the endpoints still function — just without the per-IP cap.
+    """
+    if _limiter is None:
+        return func
+    return _limiter.limit("1/5 seconds")(func)
+
+
+@app.get("/status/server")
+@_status_rate_limit
+async def status_server(request: Request) -> dict[str, Any]:
+    """shields.io badge: server liveness."""
+    return {
+        "schemaVersion": 1,
+        "label": "meridian",
+        "message": "online",
+        "color": "brightgreen",
+    }
+
+
+@app.get("/status/tools")
+@_status_rate_limit
+async def status_tools(request: Request) -> dict[str, Any]:
+    """shields.io badge: MCP tool count (cached at startup)."""
+    return {
+        "schemaVersion": 1,
+        "label": "MCP tools",
+        "message": f"{_MCP_TOOL_COUNT} tools",
+        "color": "6c8fff",
+    }
+
+
+@app.get("/status/sessions")
+@_status_rate_limit
+async def status_sessions(request: Request) -> dict[str, Any]:
+    """shields.io badge: count of currently-live sessions."""
+    db = request.app.state.db
+    try:
+        n = await db_module.count_active_sessions(db)
+    except Exception:
+        n = 0
+    return {
+        "schemaVersion": 1,
+        "label": "active sessions",
+        "message": f"{n} live",
+        "color": "brightgreen" if n else "lightgrey",
+    }
 
 
 @app.get("/me")
@@ -2830,6 +2897,43 @@ async def get_sessions(
 
 
 # /tasks POST + PATCH → meridian/routes/tasks.py
+
+
+@app.get("/projects/{project_id}/worktrees")
+async def list_worktrees(project_id: str, request: Request) -> list[dict[str, Any]]:
+    """List active git worktrees registered for a project."""
+    project = await db_module.get_project(await _db(request), project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="project not found")
+    return await db_module.list_active_worktrees(await _db(request), project_id)
+
+
+@app.post("/projects/{project_id}/worktrees", status_code=201)
+async def create_worktree(
+    project_id: str, request: Request, body: WorktreeCreate
+) -> dict[str, Any]:
+    """Register a git worktree for a session. Call after `git worktree add`."""
+    project = await db_module.get_project(await _db(request), project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="project not found")
+    return await db_module.register_worktree(
+        await _db(request),
+        body.session_id,
+        project_id,
+        body.branch,
+        body.path,
+        item_id=body.item_id,
+    )
+
+
+@app.delete("/projects/{project_id}/worktrees/{worktree_id}", status_code=204)
+async def delete_worktree(
+    project_id: str, worktree_id: str, request: Request
+) -> None:
+    """Mark a registered worktree as removed. Call after `git worktree remove`."""
+    removed = await db_module.remove_worktree(await _db(request), worktree_id)
+    if not removed:
+        raise HTTPException(status_code=404, detail="worktree not found or already removed")
 
 
 @app.get("/projects/{project_id}/export/pdf")
@@ -4406,6 +4510,61 @@ async def workspace_remove_member(request: Request, member_id: str) -> None:
     await db_module.delete_workspace_member(request.app.state.db, member_id, tenant["id"])
 
 
+@app.get("/workspace/notes")
+async def workspace_list_notes(request: Request, tag: str | None = None) -> list[dict[str, Any]]:
+    """List workspace-level notes, newest first."""
+    db = await _db(request)
+    _t = await _get_tenant_from_request(request)
+    return await db_module.get_workspace_notes(
+        db, tag=tag, tenant_id=_t["id"] if _t else None
+    )
+
+
+@app.post("/workspace/notes", status_code=201)
+async def workspace_add_note(request: Request) -> dict[str, Any]:
+    """Add a workspace-level note."""
+    db = await _db(request)
+    body = await request.json()
+    title = (body.get("title") or "").strip()
+    content = (body.get("body") or "").strip()
+    if not title or not content:
+        raise HTTPException(status_code=422, detail="title and body are required")
+    _t = await _get_tenant_from_request(request)
+    return await db_module.add_workspace_note(
+        db, title, content, body.get("tags"), tenant_id=_t["id"] if _t else None
+    )
+
+
+@app.patch("/workspace/notes/{note_id}")
+async def workspace_update_note(request: Request, note_id: str) -> dict[str, Any]:
+    """Patch title/body/tags on a workspace note."""
+    db = await _db(request)
+    body = await request.json()
+    _t = await _get_tenant_from_request(request)
+    result = await db_module.update_workspace_note(
+        db, note_id,
+        title=body.get("title"),
+        body=body.get("body"),
+        tags=body.get("tags"),
+        tenant_id=_t["id"] if _t else None,
+    )
+    if result is None:
+        raise HTTPException(status_code=404, detail="note not found")
+    return result
+
+
+@app.delete("/workspace/notes/{note_id}", status_code=204)
+async def workspace_delete_note(request: Request, note_id: str) -> None:
+    """Delete a workspace note."""
+    db = await _db(request)
+    _t = await _get_tenant_from_request(request)
+    deleted = await db_module.delete_workspace_note(
+        db, note_id, tenant_id=_t["id"] if _t else None
+    )
+    if not deleted:
+        raise HTTPException(status_code=404, detail="note not found")
+
+
 def _is_demo_request(request: Request) -> bool:
     """Return True when the request is in demo mode (env flag or cookie)."""
     env_demo = os.environ.get("MERIDIAN_DEMO", "").lower() in ("1", "true", "yes")
@@ -5493,6 +5652,28 @@ async def _get_authenticated_tenant(request: Request) -> dict[str, Any]:
     return tenant
 
 
+def _watcher_script_path(filename: str) -> Path:
+    return Path(__file__).parent.parent / "scripts" / filename
+
+
+@app.get("/install_watcher.ps1")
+async def get_install_watcher_ps1() -> PlainTextResponse:
+    """a7c43cc1 — serve the claude --rc FileSystemWatcher installer for Windows."""
+    script_path = _watcher_script_path("install_watcher.ps1")
+    if not script_path.exists():
+        raise HTTPException(status_code=404, detail="install_watcher.ps1 not found")
+    return PlainTextResponse(script_path.read_text(encoding="utf-8"))
+
+
+@app.get("/install_watcher.sh")
+async def get_install_watcher_sh() -> PlainTextResponse:
+    """a7c43cc1 — serve the claude --rc FSEvents/inotify installer for macOS/Linux."""
+    script_path = _watcher_script_path("install_watcher.sh")
+    if not script_path.exists():
+        raise HTTPException(status_code=404, detail="install_watcher.sh not found")
+    return PlainTextResponse(script_path.read_text(encoding="utf-8"))
+
+
 @app.get("/hooks.ps1")
 async def get_hooks_ps1() -> PlainTextResponse:
     script_path = _hook_script_path("hooks.ps1")
@@ -5525,7 +5706,25 @@ async def hooks_session_start(body: dict[str, Any], request: Request) -> dict[st
     session_name = (body.get("session_name") or "hook-session").strip()
     hook_cwd = (body.get("cwd") or "").strip()
     hook_hostname = (body.get("hostname") or "").strip()
-    db = await _resolve_hook_db(request)
+    registration_token = (body.get("registration_token") or "").strip()
+
+    # Token-based OAuth hooks: a hook script with no Bearer token but a
+    # hostname + registration_token authenticates against registered_hostnames
+    # in the control-plane DB. Unknown hostname/token MUST fail open to an empty
+    # context (Claude Code must always start cleanly) — never 401.
+    _has_bearer = request.headers.get("Authorization", "").startswith("Bearer ")
+    if not _has_bearer and registration_token:
+        _auth_db = request.app.state.db
+        _tid = await db_module.resolve_hostname_registration(
+            _auth_db, hook_hostname, registration_token
+        )
+        if not _tid:
+            return {"hookSpecificOutput": {
+                "hookEventName": "SessionStart", "additionalContext": ""}}
+        db = await _open_tenant_db_by_id(request, _tid)
+        request.state._db_conn = db
+    else:
+        db = await _resolve_hook_db(request)
 
     def _normalize_hook_cwd(path: str) -> str:
         value = (path or "").strip().replace("\\", "/")
@@ -5834,6 +6033,106 @@ async def hooks_stop(body: dict[str, Any], request: Request) -> dict[str, Any]:
     except Exception:  # noqa: BLE001
         pass
     return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
+# Token-based OAuth hooks — browser connect + machine registry (2da12762)
+# ---------------------------------------------------------------------------
+
+
+@app.get("/auth/hooks-connect")
+async def hooks_connect(request: Request, hostname: str = "") -> Any:
+    """Browser endpoint: register THIS machine to the logged-in tenant and show
+    the registration_token. Redirects to login when there is no session."""
+    from fastapi.responses import HTMLResponse, RedirectResponse
+    from urllib.parse import quote
+    hostname = (hostname or "").strip()
+    try:
+        tenant = await _get_authenticated_tenant(request)
+    except HTTPException:
+        nxt = quote(str(request.url), safe="")
+        return RedirectResponse(url=f"/auth/login?next={nxt}", status_code=303)
+    if not hostname:
+        raise HTTPException(status_code=400, detail="hostname required")
+    auth_db = request.app.state.db
+    token = await db_module.register_hostname(auth_db, tenant["id"], hostname)
+    safe_host = html_module.escape(hostname)
+    body = (
+        "<!doctype html><html><head><meta charset='utf-8'>"
+        "<title>Machine connected — Meridian</title>"
+        "<meta name='viewport' content='width=device-width, initial-scale=1'>"
+        "<style>body{font-family:system-ui,sans-serif;max-width:640px;margin:64px auto;"
+        "padding:0 20px;color:#1a1a2e}code{background:#f0f0f5;padding:2px 6px;border-radius:4px}"
+        ".tok{display:block;background:#0f1020;color:#7cf;padding:14px;border-radius:8px;"
+        "font-family:ui-monospace,monospace;word-break:break-all;margin:16px 0}"
+        ".ok{color:#1a9c4a;font-weight:600}</style></head><body>"
+        f"<h1>✅ <span class='ok'>{safe_host}</span> connected</h1>"
+        "<p>This machine is now registered for Meridian session hooks. The hook "
+        "script uses the registration token below — no API token needed.</p>"
+        f"<div class='tok'>{html_module.escape(token)}</div>"
+        "<p>You can close this tab. Manage or revoke machines anytime under "
+        "<strong>Settings → Known Machines</strong>.</p>"
+        "</body></html>"
+    )
+    return HTMLResponse(body)
+
+
+@app.get("/auth/hooks-status")
+async def hooks_status(request: Request, hostname: str = "") -> dict[str, Any]:
+    """Return {registered, token} for the logged-in tenant's hostname. The token
+    is echoed only to the authenticated owner so the installer can finish wiring
+    the hook script after the browser connect."""
+    tenant = await _get_authenticated_tenant(request)
+    auth_db = request.app.state.db
+    return await db_module.get_hostname_status(
+        auth_db, tenant["id"], (hostname or "").strip()
+    )
+
+
+@app.get("/projects/{project_id}/registered-machines")
+async def list_registered_machines(project_id: str, request: Request) -> list[dict[str, Any]]:
+    """List the tenant's registered hook machines (token omitted) for the
+    Settings → Known Machines panel. Registry is per-tenant; project_id only
+    scopes the dashboard route."""
+    tenant = await _get_authenticated_tenant(request)
+    auth_db = request.app.state.db
+    return await db_module.list_registered_hostnames(auth_db, tenant["id"])
+
+
+@app.delete("/projects/{project_id}/registered-machines/{machine_id}", status_code=204)
+async def revoke_registered_machine(
+    project_id: str, machine_id: str, request: Request
+) -> Response:
+    """Revoke one of the tenant's registered machines."""
+    tenant = await _get_authenticated_tenant(request)
+    auth_db = request.app.state.db
+    ok = await db_module.revoke_registered_hostname(auth_db, tenant["id"], machine_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="machine not found")
+    return Response(status_code=204)
+
+
+# ---------------------------------------------------------------------------
+# Session queue — queue the next /goal to run back-to-back (10e6b265)
+# ---------------------------------------------------------------------------
+
+
+@app.post("/projects/{project_id}/queue-session")
+async def queue_session(project_id: str, request: Request) -> dict[str, Any]:
+    """Queue the next /goal string; it's appended to the next handoff and then
+    cleared. Empty body clears the queue."""
+    db = await _db(request)
+    body = await request.json()
+    goal = (body.get("goal") or "").strip()
+    await db_module.set_queued_session(db, project_id, goal or None)
+    return {"queued": bool(goal), "goal": goal or None}
+
+
+@app.get("/projects/{project_id}/queued-session")
+async def get_queued_session_endpoint(project_id: str, request: Request) -> dict[str, Any]:
+    """Return the currently queued next-session goal, or null."""
+    db = await _db(request)
+    return {"goal": await db_module.get_queued_session(db, project_id)}
 
 
 async def _block_non_admin_connection_writes(request: Request) -> None:
@@ -6170,6 +6469,26 @@ async def billing_portal_redirect(request: Request):
         return RedirectResponse("/pricing", status_code=302)
 
     return RedirectResponse(url, status_code=302)
+
+
+@app.post("/billing/portal")
+async def billing_portal_json(request: Request) -> dict[str, str]:
+    """Return Stripe billing portal URL as JSON for dashboard AJAX calls (e7d4400b)."""
+    from .hosted import create_stripe_billing_portal_session, get_current_tenant  # noqa: PLC0415
+
+    try:
+        tenant = await get_current_tenant(request)
+    except HTTPException:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    if not tenant.get("stripe_customer_id"):
+        raise HTTPException(status_code=404, detail="No billing account")
+    try:
+        url = await create_stripe_billing_portal_session(tenant)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    return {"url": url}
 
 
 @app.get("/checkout")
@@ -6922,6 +7241,57 @@ async def _sprint_item_file_claim_conflicts(
     return conflicts
 
 
+async def _fetch_recent_commits(
+    project: dict[str, Any],
+    tenant: dict[str, Any] | None,
+) -> list[str]:
+    """Fetch last 20 commit messages for a project.
+
+    Tries GitHub API if tenant has github_pat and project has github_repo;
+    falls back to local ``git log --oneline -20``. Returns plain message strings.
+    Non-fatal — returns empty list on any failure.
+    """
+    import subprocess as _sp  # noqa: PLC0415
+    commits: list[str] = []
+    try:
+        if tenant:
+            pat = db_module.decrypt_field(tenant.get("github_pat"))
+            repo = (project.get("github_repo") or "").strip()
+            if pat and repo:
+                import httpx as _httpx  # noqa: PLC0415
+                gh_headers = {
+                    "Authorization": f"token {pat}",
+                    "Accept": "application/vnd.github+json",
+                }
+                async with _httpx.AsyncClient(timeout=8.0) as http:
+                    r = await http.get(
+                        f"https://api.github.com/repos/{repo}/commits",
+                        headers=gh_headers,
+                        params={"per_page": "20"},
+                    )
+                    if r.status_code == 200:
+                        for c in r.json():
+                            msg = c["commit"]["message"].split("\n")[0]
+                            commits.append(msg)
+                if commits:
+                    return commits
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        result = _sp.run(
+            ["git", "log", "--oneline", "-20"],
+            capture_output=True, text=True, timeout=5,
+        )
+        for line in result.stdout.splitlines():
+            line = line.strip()
+            if line and " " in line:
+                _, _, msg = line.partition(" ")
+                commits.append(msg)
+    except Exception:  # noqa: BLE001
+        pass
+    return commits
+
+
 async def _dispatch_mcp_tool(
     name: str,
     args: dict[str, Any],
@@ -6930,6 +7300,9 @@ async def _dispatch_mcp_tool(
     tenant: dict[str, Any] | None = None,
 ) -> Any:
     """Route a tools/call to the appropriate db_module function."""
+    # Tenant scope for the workspace layer (notes/decisions/settings). None for
+    # self-host / unauthenticated; the db functions then skip isolation.
+    _mcp_tenant_id = tenant.get("id") if tenant else None
     if name == "create_project":
         existing = await db_module.get_project_by_name(db, args["name"])
         if existing is not None:
@@ -6997,6 +7370,9 @@ async def _dispatch_mcp_tool(
             args.get("mode"),
             session_id,
         )
+        # Fetch recent commits for reconcile annotations (non-fatal)
+        _gh_project = await db_module.get_project(db, args["project_id"])
+        _gh_commits = await _fetch_recent_commits(_gh_project or {}, tenant)
         try:
             path, content = await asyncio.wait_for(
                 handoff_module_local.generate_handoff(
@@ -7005,6 +7381,7 @@ async def _dispatch_mcp_tool(
                     data_dir,
                     mode=mode,
                     session_id=session_id,
+                    commit_messages=_gh_commits or None,
                 ),
                 timeout=90.0,
             )
@@ -7055,16 +7432,42 @@ async def _dispatch_mcp_tool(
         await db_module.auto_capture_session(db, project_id, session_id)
         await _finalize_session_md(db, project_id, session_id)
         from . import handoff as handoff_module_local
+        # Fetch recent commits for reconcile annotations (non-fatal)
+        _ckpt_project = await db_module.get_project(db, project_id)
+        _commit_messages = await _fetch_recent_commits(_ckpt_project or {}, tenant)
         try:
             _, content = await asyncio.wait_for(
                 handoff_module_local.generate_handoff(
-                    db, project_id, data_dir, mode="delta", session_id=session_id
+                    db, project_id, data_dir, mode="delta", session_id=session_id,
+                    commit_messages=_commit_messages or None,
                 ),
                 timeout=30.0,
             )
         except asyncio.TimeoutError:
             content = "delta handoff timed out"
         pending_items = await db_module.get_sprint_items(db, project_id, status="pending")
+        # Log drift warnings for high-confidence reconcile matches (non-fatal)
+        if _commit_messages and pending_items:
+            try:
+                _commits_for_reconcile = []
+                for _line in _commit_messages:
+                    _sha = ""
+                    _msg = _line
+                    _commits_for_reconcile.append({"sha": _sha, "message": _msg})
+                _matches = handoff_module_local.reconcile_sprint_items(
+                    pending_items, _commits_for_reconcile
+                )
+                for _m in _matches:
+                    if _m.get("confidence") == "high":
+                        _first_sha = (_m["matching_commits"][0].get("sha") or "")[:8]
+                        await db_module.log_task(
+                            db, session_id, project_id,
+                            f"Sprint board drift detected: {_m['item_id'][:8]} "
+                            f"may already be done (matches commit {_first_sha})",
+                            status="pending",
+                        )
+            except Exception:  # noqa: BLE001
+                pass
         ids_str = ", ".join(it["id"][:8] for it in pending_items[:8])
         next_goal = (
             f'/goal Complete sprint items: {", ".join(it["id"] for it in pending_items[:8])}. '
@@ -7159,25 +7562,31 @@ async def _dispatch_mcp_tool(
     if name == "add_workspace_note":
         return await db_module.add_workspace_note(
             db, args["title"], args["body"], args.get("tags"),
+            tenant_id=_mcp_tenant_id,
         )
     if name == "get_workspace_notes":
-        return await db_module.get_workspace_notes(db, tag=args.get("tag"))
+        return await db_module.get_workspace_notes(
+            db, tag=args.get("tag"), tenant_id=_mcp_tenant_id,
+        )
     if name == "pin_workspace_decision":
         return await db_module.pin_workspace_decision(
             db, args["title"], args["body"],
             category=args.get("category", "TECHNICAL"),
+            tenant_id=_mcp_tenant_id,
         )
     if name == "get_workspace_decisions":
         return await db_module.get_workspace_decisions(
             db, include_superseded=args.get("include_superseded", False),
+            tenant_id=_mcp_tenant_id,
         )
     if name == "get_workspace_settings":
-        return await db_module.get_workspace_settings(db)
+        return await db_module.get_workspace_settings(db, tenant_id=_mcp_tenant_id)
     if name == "update_workspace_settings":
         return await db_module.update_workspace_settings(
             db,
             hitl_auto_answer_default=args.get("hitl_auto_answer_default"),
             sprint_name_default=args.get("sprint_name_default"),
+            tenant_id=_mcp_tenant_id,
         )
     if name == "get_context_block":
         # v2.3 — assemble the same shape as /projects/{id}/context-block but
@@ -7208,8 +7617,8 @@ async def _dispatch_mcp_tool(
         )
         # v3.1 — workspace decisions + notes apply across all projects; surface
         # them at the very top so a fresh session sees org-wide truth first.
-        ws_decisions = await db_module.get_workspace_decisions(db)
-        ws_notes = await db_module.get_workspace_notes(db)
+        ws_decisions = await db_module.get_workspace_decisions(db, tenant_id=_mcp_tenant_id)
+        ws_notes = await db_module.get_workspace_notes(db, tenant_id=_mcp_tenant_id)
         ws_block = _render_workspace_block(ws_decisions, ws_notes)
         if ws_block:
             text = f"{ws_block}\n\n{text}"
@@ -7315,21 +7724,65 @@ async def _dispatch_mcp_tool(
                                     f"({', '.join(_hits)}). Pass force=true to override."),
                         "protected_files": _hits,
                     }
-        conflicts = await _sprint_item_file_claim_conflicts(
-            db,
-            args["project_id"],
-            args["item_id"],
-            exclude_session_id=args.get("session_id"),
-        )
-        if conflicts:
-            return {
-                "error": "CONFLICT",
-                "message": "Cannot claim sprint item: active session has overlapping claimed files.",
-                "conflicts": conflicts,
-            }
+
+        # Check if worktree isolation is configured for this project.
+        # When isolation="worktree", bypass file-lock conflict check — the worktree
+        # solves the conflict by giving the session its own working copy.
+        _suggest_worktree = False
+        _exec_cfg: dict[str, Any] = {}
+        try:
+            _proj_settings = await db_module.get_project_settings(db, args["project_id"])
+            _raw_cfg = (_proj_settings or {}).get("executor_config") if _proj_settings else None
+            if _raw_cfg:
+                _exec_cfg = json.loads(_raw_cfg) if isinstance(_raw_cfg, str) else (_raw_cfg or {})
+        except Exception:  # noqa: BLE001
+            pass
+        _isolation = (_exec_cfg or {}).get("isolation", "")
+        if _isolation == "worktree":
+            _suggest_worktree = True
+        else:
+            conflicts = await _sprint_item_file_claim_conflicts(
+                db,
+                args["project_id"],
+                args["item_id"],
+                exclude_session_id=args.get("session_id"),
+            )
+            if conflicts:
+                return {
+                    "error": "CONFLICT",
+                    "message": "Cannot claim sprint item: active session has overlapping claimed files.",
+                    "conflicts": conflicts,
+                }
+
         item = await db_module.claim_sprint_item(db, args["project_id"], args["item_id"])
         if item is None:
             raise ValueError("sprint item not found")
+
+        if _suggest_worktree:
+            item_id_short = item["id"][:8]
+            repo_path = ""
+            _repo_paths = _exec_cfg.get("repo_paths")
+            if _repo_paths and isinstance(_repo_paths, list) and _repo_paths:
+                _first = _repo_paths[0]
+                repo_path = (_first.get("cwd") or "") if isinstance(_first, dict) else str(_first)
+            if not repo_path:
+                repo_path = _exec_cfg.get("repo_path") or ""
+            repo_name = os.path.basename(repo_path.rstrip("/\\")) if repo_path else "repo"
+            wt_branch = f"worktree/{item_id_short}"
+            wt_path = f"../{repo_name}-worktree-{item_id_short}"
+            item = dict(item)
+            item.update({
+                "worktree_suggested": True,
+                "worktree_branch": wt_branch,
+                "worktree_path": wt_path,
+                "worktree_setup_cmd": f"git worktree add {wt_path} -b {wt_branch}",
+                "worktree_cleanup_cmd": f"git worktree remove {wt_path} --force",
+                "worktree_merge_cmd": (
+                    f"git checkout dev && git merge {wt_branch} --no-edit "
+                    f"&& git branch -d {wt_branch}"
+                ),
+            })
+
         return item
     if name == "add_subtask":
         return await db_module.add_subtask(
