@@ -6412,6 +6412,25 @@ async function loadSettingsTab(projectId) {
       '</summary><div style="padding:0 0 4px">';
   };
 
+  // Collect repo_paths across all projects for filesystem MCP snippet
+  const _allRepoPaths = [];
+  if (!isHostedMode()) {
+    try {
+      const _allProjSettings = await Promise.allSettled(
+        (state.projects || []).map(p => loadProjectSettings(p.id))
+      );
+      for (const _ps of _allProjSettings) {
+        if (_ps.status === 'fulfilled') {
+          const _rps = Array.isArray(_ps.value?.executor_config?.repo_paths)
+            ? _ps.value.executor_config.repo_paths : [];
+          for (const _rp of _rps) {
+            if (_rp && !_allRepoPaths.includes(_rp)) _allRepoPaths.push(_rp);
+          }
+        }
+      }
+    } catch (_) {}
+  }
+
   let html = '';
   const detectedHookOS = detectHookInstallOS();
 
@@ -8243,6 +8262,37 @@ async function loadSettingsTab(projectId) {
       </div>
     </div>
   </div>`;
+
+  // Local file reading snippet — self-hosted only, only when repo_paths are set
+  if (!isHostedMode() && _allRepoPaths.length > 0) {
+    const _fsPaths = _allRepoPaths.map(p => JSON.stringify(p)).join(' ');
+    const _fsNpx = `npx -y @modelcontextprotocol/server-filesystem ${_allRepoPaths.map(p => JSON.stringify(p)).join(' ')}`;
+    const _fsClaude = `claude mcp add filesystem -- npx -y @modelcontextprotocol/server-filesystem ${_allRepoPaths.map(p => JSON.stringify(p)).join(' ')}`;
+    html += `<div style="margin-bottom:16px" id="fs-mcp-section-${projectId}">
+      <details>
+        <summary style="cursor:pointer;list-style:none;display:flex;align-items:center;gap:6px;padding-bottom:6px;border-bottom:1px solid var(--border);margin-bottom:8px">
+          <span style="color:var(--accent);font-size:10px;letter-spacing:.06em;text-transform:uppercase">Local file reading for planning chat</span>
+          <span style="font-size:9px;color:var(--muted);margin-left:auto">▼</span>
+        </summary>
+        <div style="font-size:10px;color:var(--muted);margin-bottom:8px">Add a filesystem MCP server so Claude can read your repo files during planning conversations.</div>
+        <div style="margin-bottom:8px">
+          <div style="font-size:9px;color:var(--muted);margin-bottom:3px">npx command:</div>
+          <div style="display:flex;gap:6px;align-items:flex-start">
+            <code id="fs-mcp-npx-${projectId}" style="flex:1;display:block;padding:6px 8px;border:1px solid var(--border);border-radius:3px;background:var(--surface-1);color:var(--text);font-size:9px;font-family:var(--font-mono);white-space:pre-wrap;word-break:break-all">${escapeHtml(_fsNpx)}</code>
+            <button class="secondary" style="font-size:9px;padding:3px 8px;flex-shrink:0" onclick="navigator.clipboard.writeText(${JSON.stringify(_fsNpx)}).then(()=>toast('Copied')).catch(()=>toast('Copy failed',true))">Copy</button>
+          </div>
+        </div>
+        <div style="margin-bottom:8px">
+          <div style="font-size:9px;color:var(--muted);margin-bottom:3px">claude mcp add (Claude Code):</div>
+          <div style="display:flex;gap:6px;align-items:flex-start">
+            <code style="flex:1;display:block;padding:6px 8px;border:1px solid var(--border);border-radius:3px;background:var(--surface-1);color:var(--text);font-size:9px;font-family:var(--font-mono);white-space:pre-wrap;word-break:break-all">${escapeHtml(_fsClaude)}</code>
+            <button class="secondary" style="font-size:9px;padding:3px 8px;flex-shrink:0" onclick="navigator.clipboard.writeText(${JSON.stringify(_fsClaude)}).then(()=>toast('Copied')).catch(()=>toast('Copy failed',true))">Copy</button>
+          </div>
+        </div>
+        <div style="font-size:9px;color:var(--muted);line-height:1.5">Requires Node.js. Add the generated URL as a second connector in claude.ai.<br>WSL users: localhost works directly. Remote/SSH: use <code style="font-size:8px">cloudflared tunnel --url http://localhost:PORT</code></div>
+      </details>
+    </div>`;
+  }
 
   // Team members section (hosted mode only) — always visible for all plan tiers (ecdae392)
 
@@ -10857,7 +10907,12 @@ async function loadRecentSessions(projectId, sessions = null) {
 
         const status = s.status === 'idle' ? 'idle' : s.status === 'closed' ? 'done' : (s.status || 'session');
 
-        const summary = escapeHtml((s.session_summary || '').slice(0, 90));
+        const _rawSummary = s.session_summary;
+        const summaryText = typeof _rawSummary === 'string'
+          ? _rawSummary
+          : (_rawSummary && _rawSummary.summary ? _rawSummary.summary : '');
+        const summaryPreview = summaryText ? escapeHtml(summaryText.slice(0, 90)) : '';
+        const hasSummary = !!summaryText;
 
         const humanClause = s.human_id ? `, human_id="${String(s.human_id).replace(/"/g, '\\"')}"` : '';
 
@@ -10880,13 +10935,14 @@ async function loadRecentSessions(projectId, sessions = null) {
                 style="padding:1px 6px;font-size:9px" title="Copy start_session() to clipboard">Resume</button>
               <button class="secondary recent-session-timeline-btn" data-session-id="${escapeHtml(s.id)}"
                 style="padding:1px 6px;font-size:9px" title="Open filtered timeline">Timeline</button>
+              <span class="recent-session-chevron" style="font-size:9px;color:var(--muted);margin-left:2px">▼</span>
 
             </div>
 
           </div>
 
-          ${summary ? `<div style="font-size:9px;color:var(--muted);margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="${escapeHtml(s.summary || s.last_summary || '')}">${summary}</div>` : ''}
-          <div class="recent-session-tasks" style="display:none;margin-top:6px;padding-top:5px;border-top:1px solid var(--border);font-size:10px;color:var(--muted)"></div>
+          ${summaryPreview ? `<div style="font-size:9px;color:var(--muted);margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="${escapeHtml(summaryText)}">${summaryPreview}</div>` : ''}
+          <div class="recent-session-tasks" data-full-summary="${escapeHtml(summaryText)}" style="display:none;margin-top:6px;padding-top:5px;border-top:1px solid var(--border);font-size:10px;color:var(--muted)"></div>
 
         </div>`;
 
@@ -10911,27 +10967,36 @@ async function loadRecentSessions(projectId, sessions = null) {
       };
     });
     el.querySelectorAll('.recent-session-row').forEach(row => {
-      row.onclick = async () => {
+      row.onclick = async (evt) => {
+        if (evt.target.closest('.resume-session-btn, .recent-session-timeline-btn')) return;
         const target = row.querySelector('.recent-session-tasks');
+        const chevron = row.querySelector('.recent-session-chevron');
         const sid = row.dataset.sessionId;
         if (!target || !sid) return;
         if (target.style.display !== 'none') {
           target.style.display = 'none';
+          if (chevron) chevron.textContent = '▼';
           return;
         }
         if (!target.dataset.loaded) {
           target.textContent = 'loading...';
           try {
-            const rows = await api(`/projects/${projectId}/sessions/${sid}/tasks/live?limit=20`);
-            target.innerHTML = rows && rows.length
-              ? rows.map(t => `<div style="padding:2px 0"><span style="color:var(--accent)">${escapeHtml((t.status || '').toUpperCase())}</span> ${escapeHtml((t.description || '').slice(0, 180))}</div>`).join('')
+            const fullSummary = target.dataset.fullSummary || '';
+            const taskRows = await api(`/projects/${projectId}/sessions/${sid}/tasks/live?limit=20`);
+            const summaryHtml = fullSummary
+              ? `<div style="color:var(--text-dim);margin-bottom:5px;white-space:pre-wrap;word-break:break-word">${escapeHtml(fullSummary)}</div>`
+              : '';
+            const tasksHtml = taskRows && taskRows.length
+              ? taskRows.map(t => `<div style="padding:2px 0"><span style="color:var(--accent)">${escapeHtml((t.status || '').toUpperCase())}</span> ${escapeHtml((t.description || '').slice(0, 180))}</div>`).join('')
               : '<div>(no task log for this session)</div>';
+            target.innerHTML = summaryHtml + tasksHtml;
             target.dataset.loaded = '1';
           } catch(e) {
             target.textContent = 'failed to load tasks';
           }
         }
         target.style.display = 'block';
+        if (chevron) chevron.textContent = '▲';
       };
     });
 

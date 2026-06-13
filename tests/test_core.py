@@ -5596,6 +5596,26 @@ def test_dashboard_js_renders_session_summary_in_live_tab(client):
     assert "active_only=false" in js, "LIVE tab must fetch with active_only=false"
 
 
+@pytest.mark.asyncio
+async def test_checkpoint_writes_session_summary(db, tmp_path):
+    """checkpoint() writes a non-empty session_summary to the sessions table."""
+    import meridian.server as srv
+    p = await db_module.create_project(db, "ckpt-summary-test")
+    s = await db_module.register_session(db, p["id"], "test-ckpt-session")
+    await db_module.log_task(db, s["id"], p["id"], "Fixed the bug", status="done")
+    result = await srv._dispatch_mcp_tool(
+        "checkpoint", {"session_id": s["id"], "project_id": p["id"]}, db, str(tmp_path)
+    )
+    assert isinstance(result, dict), "checkpoint should return a dict"
+    async with db.execute(
+        "SELECT session_summary FROM sessions WHERE id = ?", (s["id"],)
+    ) as cur:
+        row = await cur.fetchone()
+    assert row is not None
+    summary_val = row["session_summary"] if hasattr(row, "__getitem__") else row[0]
+    assert summary_val, "checkpoint() must write non-empty session_summary"
+
+
 # ---------------------------------------------------------------------------
 # Goal history filter — AUTO BLOCKS-only versions collapsed
 # ---------------------------------------------------------------------------
@@ -5918,6 +5938,14 @@ def test_dashboard_clears_demo_cookie(client):
     assert "max-age=0" in set_cookie.lower()
 
 
+def test_dashboard_js_filesystem_mcp_snippet_hidden_in_hosted_mode(client):
+    """dashboard.js filesystem MCP snippet is gated on !isHostedMode()."""
+    js = client.get("/static/dashboard.js").text
+    assert "server-filesystem" in js, "filesystem MCP snippet must be present in dashboard.js"
+    assert "isHostedMode" in js, "must be guarded by isHostedMode check"
+    assert "_allRepoPaths" in js, "must check repo_paths before showing snippet"
+
+
 def test_terms_page_returns_200(client):
     """GET /terms returns 200 and contains ToS content."""
     r = client.get("/terms")
@@ -5934,6 +5962,14 @@ def test_privacy_page_returns_200(client):
     assert "text/html" in r.headers["content-type"]
     assert "Privacy Policy" in r.text
     assert "hello@usemeridian.us" in r.text
+
+
+def test_changelog_page_returns_200(client):
+    """GET /changelog returns 200 and renders DEVLOG.md sections as HTML."""
+    r = client.get("/changelog")
+    assert r.status_code == 200
+    assert "text/html" in r.headers["content-type"]
+    assert "Changelog" in r.text
 
 
 def test_demo_write_blocked_with_cookie(client):

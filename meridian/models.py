@@ -221,7 +221,7 @@ class Session(BaseModel):
     status: Literal["active", "idle", "closed", "archived"]
     last_seen: str
     created_at: str
-    session_summary: dict | None = None
+    session_summary: Any = None
     agent_framework: str | None = None  # v2.4
     client_type: str | None = None  # v2.6
 

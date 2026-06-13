@@ -1381,6 +1381,26 @@ async def privacy_page(request: Request) -> HTMLResponse:
     return _templates.TemplateResponse(request, "privacy.html")
 
 
+@app.get("/changelog", response_class=HTMLResponse)
+async def changelog_page(request: Request) -> HTMLResponse:
+    """Public changelog rendered from DEVLOG.md — newest entries first."""
+    devlog_path = Path(__file__).parent.parent / "DEVLOG.md"
+    raw = devlog_path.read_text(encoding="utf-8") if devlog_path.exists() else ""
+    parts = re.split(r"\n(?=## )", raw)
+    entries = []
+    for part in parts:
+        if not part.startswith("## "):
+            continue
+        lines = part.split("\n", 1)
+        title = lines[0][3:].strip()
+        body = lines[1].strip() if len(lines) > 1 else ""
+        body = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", body)
+        body = re.sub(r"`([^`]+)`", r"<code>\1</code>", body)
+        entries.append({"title": title, "body": body})
+    entries.reverse()
+    return _templates.TemplateResponse(request, "changelog.html", {"entries": entries})
+
+
 @app.get("/pricing", response_class=HTMLResponse)
 async def pricing_page(request: Request) -> HTMLResponse:
     """Pricing page — Free / Solo / Team tiers with waitlist forms when hosted launch is pending."""
@@ -7508,6 +7528,41 @@ async def _dispatch_mcp_tool(
             )
         except Exception:
             pass  # non-fatal — checkpoint still returns normally
+        # Write plain-text session_summary for RECENT RUNS panel display
+        try:
+            _shipped_titles: list[str] = []
+            async with db.execute(
+                "SELECT si.title FROM sprint_items si "
+                "JOIN task_log tl ON tl.id = si.task_id "
+                "WHERE tl.session_id = ? AND si.status = 'done'",
+                (session_id,),
+            ) as _si_cur:
+                for _si_row in await _si_cur.fetchall():
+                    _t = _si_row["title"] if hasattr(_si_row, "__getitem__") else _si_row[0]
+                    if _t not in _shipped_titles:
+                        _shipped_titles.append(_t)
+            async with db.execute(
+                "SELECT DISTINCT si.title FROM sprint_items si "
+                "JOIN task_log tl ON tl.sprint_item_id = si.id "
+                "WHERE tl.session_id = ? AND tl.status = 'done' AND si.status = 'done'",
+                (session_id,),
+            ) as _si_cur2:
+                for _si_row2 in await _si_cur2.fetchall():
+                    _t2 = _si_row2["title"] if hasattr(_si_row2, "__getitem__") else _si_row2[0]
+                    if _t2 not in _shipped_titles:
+                        _shipped_titles.append(_t2)
+            _shipped_str = ", ".join(_shipped_titles) if _shipped_titles else "none"
+            _plain_summary = (
+                f"Shipped: {_shipped_str}. "
+                f"Tasks done: {_items_done}. "
+                f"Deploy: no."
+            )
+            await db.execute(
+                "UPDATE sessions SET session_summary = ? WHERE id = ?",
+                (_plain_summary, session_id),
+            )
+        except Exception:
+            pass  # non-fatal
         return {
             "summary": content,
             "pending_count": len(pending_items),
