@@ -5796,6 +5796,33 @@ async def test_request_hitl_auto_answer_resolves_immediately(db):
 
 
 @pytest.mark.asyncio
+async def test_hitl_correction_nonblocking(db):
+    """v1.1 — kind='correction' is never auto-answered (even when the project
+    has auto-answer on) and stays pending for the executor to pick up at the
+    next item boundary, fail-open. kind='question' is unaffected."""
+    p = await db_module.create_project(db, "hitl-correction-proj")
+    await db_module.update_project_settings(db, p["id"], hitl_auto_answer=True)
+    # A plain question on an auto-answer project resolves immediately.
+    q = await db_module.request_hitl(db, p["id"], "Proceed?")
+    assert q["status"] == "answered" and q["answered_by"] == "auto"
+    # A correction is NOT auto-answered — it lands pending, non-blocking.
+    c = await db_module.request_hitl(
+        db, p["id"], "Use camelCase for the new field", kind="correction"
+    )
+    assert c["kind"] == "correction"
+    assert c["status"] == "pending"
+    assert c.get("answered_by") in (None, "")
+    # Visible in the pending queue for the next item-boundary sweep.
+    pending = await db_module.list_hitl_requests(db, p["id"], status="pending")
+    assert any(r["id"] == c["id"] and r["kind"] == "correction" for r in pending)
+    # The executor acknowledges it and continues.
+    answered = await db_module.answer_hitl_request(
+        db, c["id"], "acknowledged", answered_by="executor"
+    )
+    assert answered["status"] == "answered"
+
+
+@pytest.mark.asyncio
 async def test_request_hitl_manual_mode_unchanged(db):
     """v3.4 — default projects (auto-answer off) still create pending requests."""
     p = await db_module.create_project(db, "hitl-manual-proj")

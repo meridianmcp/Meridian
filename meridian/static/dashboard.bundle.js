@@ -8065,6 +8065,8 @@ project_id = "${displayPid}"`;
 
               ${r.answered_by === "auto" ? `<span title="Auto-answered \u2014 no human reviewed this" style="font-size:9px;font-weight:600;background:var(--accent)22;color:var(--accent);padding:1px 6px;border-radius:3px">auto</span>` : ""}
 
+              ${r.kind === "correction" ? `<span title="Mid-run correction \u2014 non-blocking; the executor applies it at the next item boundary" style="font-size:9px;font-weight:600;background:#f59e0b22;color:#f59e0b;padding:1px 6px;border-radius:3px">\u270E correction</span>` : ""}
+
               <span style="font-size:9px;font-weight:600;background:${urgencyColor[urg] || "var(--accent)"}22;color:${urgencyColor[urg] || "var(--accent)"};padding:1px 6px;border-radius:3px">${escapeHtml(urg)}</span>
 
               <span style="font-size:9px;font-weight:600;background:${statusBadge[st] || "var(--muted)"}22;color:${statusBadge[st] || "var(--muted)"};padding:1px 6px;border-radius:3px">${escapeHtml(st)}</span>
@@ -9231,6 +9233,8 @@ project_id = "${displayPid}"`;
           <div style="display:flex;align-items:center;gap:6px;min-width:0;flex:1">
 
             <span style="background:${color}22;color:${color};font-size:9px;font-weight:700;letter-spacing:.5px;padding:2px 6px;border-radius:3px">${escapeHtml((r.urgency || "normal").toUpperCase())}</span>
+
+            ${r.kind === "correction" ? `<span title="Mid-run correction \u2014 non-blocking" style="background:#f59e0b22;color:#f59e0b;font-size:9px;font-weight:700;letter-spacing:.5px;padding:2px 6px;border-radius:3px">\u270E CORRECTION</span>` : ""}
 
             ${assigned}
 

@@ -27,6 +27,12 @@ for "what has been decided, claimed, and shipped."
   section. Autonomous executor sessions leave it gated behind a dashboard HITL.
   Human planning sessions (claude.ai) may pass **`force=true`** to skip the HITL and
   apply the change directly — only use `force` when a human is driving the session.
+- **Mid-run corrections**: after each `complete_sprint_item`, call
+  `list_hitl_requests(status='pending')` and handle any request with
+  `kind='correction'` before the next item: apply the correction, `log_task` it,
+  and `answer_hitl(request_id, "acknowledged")`. Corrections never block an
+  unattended run — fail open, log, and keep going. (Plain `kind='question'`
+  requests stay blocking/auto-answerable as before.)
 
 ## ON SESSION START
 

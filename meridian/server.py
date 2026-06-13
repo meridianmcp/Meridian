@@ -7920,12 +7920,16 @@ async def _dispatch_mcp_tool(
             "start_fresh": start_fresh,
         }
     if name == "request_hitl":
+        _hitl_kind = args.get("kind", "question")
+        if _hitl_kind not in ("question", "correction"):
+            _hitl_kind = "question"
         result = await db_module.request_hitl(
             db, args["project_id"], args["question"],
             session_id=args.get("session_id"),
             context=args.get("context"),
             urgency=args.get("urgency", "normal"),
             assigned_to=args.get("assigned_to"),
+            kind=_hitl_kind,
         )
         # v3.4 — auto-answered requests need no human; skip the notification.
         if result.get("answered_by") != "auto":
