@@ -5447,9 +5447,9 @@ function wireClaudeLaunchPanel(projectId) {
 
     const instructions = `Auto-setup Meridian hooks for your AI tools:\n\n` +
 
-      `macOS / Linux / WSL:\n  curl -fsSL ${baseUrl}/hooks.sh | bash\n\n` +
+      `macOS / Linux / WSL:\n  curl -fsSL ${baseUrl}/install.sh | sh\n\n` +
 
-      `Windows PowerShell:\n  irm ${baseUrl}/hooks.ps1 | iex\n\n` +
+      `Windows PowerShell:\n  irm ${baseUrl}/install.ps1 | iex\n\n` +
 
       `These scripts detect Claude Code and Codex, then wire SessionStart + Stop\n` +
 
@@ -6304,10 +6304,10 @@ async function loadSettingsTab(projectId) {
 
   function detectHookInstallOS() {
     const platform = String(navigator.userAgentData?.platform || navigator.platform || navigator.userAgent || '').toLowerCase();
-    if (platform.includes('win')) return { label: 'Windows', command: `irm ${hooksBaseUrl}/hooks.ps1 | iex` };
-    if (platform.includes('mac')) return { label: 'macOS', command: `curl -fsSL ${hooksBaseUrl}/hooks.sh | bash` };
-    if (platform.includes('linux') || platform.includes('x11')) return { label: 'Linux / WSL', command: `curl -fsSL ${hooksBaseUrl}/hooks.sh | bash` };
-    return { label: 'Unknown OS', command: `curl -fsSL ${hooksBaseUrl}/hooks.sh | bash` };
+    if (platform.includes('win')) return { label: 'Windows', command: `irm ${hooksBaseUrl}/install.ps1 | iex` };
+    if (platform.includes('mac')) return { label: 'macOS', command: `curl -fsSL ${hooksBaseUrl}/install.sh | sh` };
+    if (platform.includes('linux') || platform.includes('x11')) return { label: 'Linux / WSL', command: `curl -fsSL ${hooksBaseUrl}/install.sh | sh` };
+    return { label: 'Unknown OS', command: `curl -fsSL ${hooksBaseUrl}/install.sh | sh` };
   }
 
 
@@ -9173,9 +9173,9 @@ async function loadSettingsTab(projectId) {
 
       const activeToken = hooksToken || hostedPlaceholderToken;
 
-      const installUnix = `curl -fsSL ${hooksBaseUrl}/hooks.sh | bash`;
+      const installUnix = `curl -fsSL ${hooksBaseUrl}/install.sh | sh`;
 
-      const installWindows = `irm ${hooksBaseUrl}/hooks.ps1 | iex`;
+      const installWindows = `irm ${hooksBaseUrl}/install.ps1 | iex`;
 
       const snippets = {
 
@@ -9264,7 +9264,7 @@ async function loadSettingsTab(projectId) {
           const _revokeLabel = btn.getAttribute('data-token-label') || '';
           const _isHooksKey = _revokeLabel.includes('hooks') || _revokeLabel.includes('installer');
           const _revokeMsg = _isHooksKey
-            ? 'This key may be used in your Claude Code hooks.\n\nAfter revoking, re-run: irm https://usemeridian.us/hooks.ps1 | iex\n\nRevoke anyway?'
+            ? 'This key may be used in your Claude Code hooks.\n\nAfter revoking, re-run: irm https://usemeridian.us/install.ps1 | iex\n\nRevoke anyway?'
             : 'Revoke this API key? Existing clients using it will stop working.';
           if (!confirm(_revokeMsg)) return;
 

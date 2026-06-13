@@ -5710,6 +5710,22 @@ async def get_hooks_sh() -> PlainTextResponse:
     return PlainTextResponse(script_path.read_text(encoding="utf-8"))
 
 
+@app.get("/install.sh")
+async def get_install_sh() -> PlainTextResponse:
+    script_path = _hook_script_path("install.sh")
+    if not script_path.exists():
+        raise HTTPException(status_code=404, detail="install.sh not found")
+    return PlainTextResponse(script_path.read_text(encoding="utf-8"))
+
+
+@app.get("/install.ps1")
+async def get_install_ps1() -> PlainTextResponse:
+    script_path = _hook_script_path("install.ps1")
+    if not script_path.exists():
+        raise HTTPException(status_code=404, detail="install.ps1 not found")
+    return PlainTextResponse(script_path.read_text(encoding="utf-8"))
+
+
 @app.post("/hooks/session-start")
 async def hooks_session_start(body: dict[str, Any], request: Request) -> dict[str, Any]:
     """Claude Code / Codex SessionStart hook.
