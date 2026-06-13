@@ -2878,12 +2878,6 @@ async def get_goal_history(
     return await db_module.get_goal_history(await _db(request), project_id)
 
 
-@app.get("/projects/{project_id}/worktrees")
-async def get_project_worktrees(project_id: str, request: Request) -> list:
-    """Return active worktrees for a project. Stub — returns empty list until worktree tracking is implemented."""
-    return []
-
-
 @app.get("/projects/{project_id}/stats")
 async def get_project_stats(
     project_id: str, request: Request, days: int = 30
