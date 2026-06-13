@@ -70,6 +70,8 @@ High-contention files are always sequential:
 - `meridian/static/dashboard.js`
 - `meridian/server.py`
 - `meridian/db/__init__.py`
+- `hooks.ps1` — ⛔ NEVER edit or run. User-facing installer; running it rotates the API token and kills the human's active Claude Code session.
+- `hooks.sh` — ⛔ NEVER edit or run. Same token-rotation hazard as `hooks.ps1`.
 
 Sprint items can carry `touches_files` so handoffs and dashboards can warn when planned work overlaps with a live session.
 
@@ -133,7 +135,7 @@ your project context on start and snapshots progress on end.
 
 ---
 <!-- MERIDIAN STATE — auto-generated, do not edit below -->
-## Current Sprint State  _(auto-updated 2026-06-12 19:40 UTC)_
+## Current Sprint State  _(auto-updated 2026-06-13 00:11 UTC)_
 
 **Key Files:**
 - `meridian/server.py` — FastAPI app + MCP handlers
