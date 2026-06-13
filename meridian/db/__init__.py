@@ -794,7 +794,8 @@ async def get_project_settings(
         "project_id": data["id"],
         "max_pinned_decisions": int(data.get("max_pinned_decisions") or 20),
         "executor_config": executor_config,
-        "hitl_auto_answer": bool(data.get("hitl_auto_answer")),
+        # 035edf47 — 0=off, 1=safe, 2=aggressive (was a 0/1 bool).
+        "hitl_auto_answer": int(data.get("hitl_auto_answer") or 0),
     }
 
 
@@ -804,7 +805,7 @@ async def update_project_settings(
     *,
     max_pinned_decisions: int | None = None,
     executor_config: dict[str, Any] | None = None,
-    hitl_auto_answer: bool | None = None,
+    hitl_auto_answer: int | None = None,
     github_repo: str | None = _UNSET,
     github_branch: str | None = _UNSET,
 ) -> dict[str, Any] | None:
@@ -821,8 +822,9 @@ async def update_project_settings(
         updates.append("executor_config = ?")
         params.append(json.dumps(executor_config))
     if hitl_auto_answer is not None:
+        # 035edf47 — 0=off, 1=safe, 2=aggressive. Clamp to the valid range.
         updates.append("hitl_auto_answer = ?")
-        params.append(1 if hitl_auto_answer else 0)
+        params.append(max(0, min(2, int(hitl_auto_answer))))
     if github_repo is not _UNSET:
         updates.append("github_repo = ?")
         params.append(github_repo or None)
@@ -4777,12 +4779,11 @@ async def request_hitl(
     await db.commit()
     # ITEM 6 — live push so the HITL queue refreshes without polling.
     _publish_project_event(project_id, "hitl_filed", {"hitl_id": hid, "kind": kind})
-    # v3.4 — per-project auto-answer. When the project trusts the agent, a
-    # plain question is resolved immediately (first option / generic ack) so the
-    # session never blocks. md_section_update diffs stay human-gated — auto
-    # approving a file write would defeat the diff-approval safeguard. The row
-    # stays in the queue (status='answered', answered_by='auto') for audit.
-    if kind == "question" and await _project_hitl_auto_answer(db, project_id):
+    # 035edf47 — per-project auto-answer with a 3-way mode (off/safe/aggressive).
+    # The auto-answered row stays in the queue (status='answered',
+    # answered_by='auto') for audit. See _hitl_should_auto_answer for the rules.
+    _aa_mode = await _project_hitl_auto_answer_mode(db, project_id)
+    if _hitl_should_auto_answer(_aa_mode, kind, question):
         auto = _auto_hitl_answer(payload)
         answered = await answer_hitl_request(db, hid, auto, answered_by="auto")
         if answered is not None:
@@ -4790,18 +4791,52 @@ async def request_hitl(
     return (await get_hitl_request(db, hid)) or {"id": hid}
 
 
-async def _project_hitl_auto_answer(
+async def _project_hitl_auto_answer_mode(
     db: aiosqlite.Connection, project_id: str
-) -> bool:
-    """True when the project has the per-project HITL auto-answer toggle on."""
+) -> int:
+    """Per-project HITL auto-answer mode: 0=off, 1=safe, 2=aggressive."""
     async with db.execute(
         "SELECT hitl_auto_answer FROM projects WHERE id = ?", (project_id,)
     ) as cur:
         row = await cur.fetchone()
     if row is None:
-        return False
+        return 0
     data = _row_to_dict(row) or {}
-    return bool(data.get("hitl_auto_answer"))
+    try:
+        return max(0, min(2, int(data.get("hitl_auto_answer") or 0)))
+    except (TypeError, ValueError):
+        return 1 if data.get("hitl_auto_answer") else 0
+
+
+# 035edf47 — keyword guards for the 3-way HITL auto-answer modes.
+_HITL_DESTRUCTIVE_KEYWORDS = (
+    "delete", "drop ", "truncate", "destroy", "wipe", "purge", "remove",
+    "revoke", "rm -rf", "force push", "force-push", "overwrite", "reset --hard",
+)
+_HITL_SECURITY_KEYWORDS = (
+    "security", "secret", "credential", "password", "api key", "apikey",
+    "private key", "token", "encrypt", "permission", "vulnerab", "auth ",
+)
+
+
+def _hitl_should_auto_answer(mode: int, kind: str, question: str) -> bool:
+    """Decide whether a HITL of ``kind``/``question`` auto-answers under ``mode``.
+
+    0 (off): never. 1 (safe): only an executor ``question`` with no destructive
+    keyword — correction / md_section_update / hook_cwd_mismatch stay human-gated.
+    2 (aggressive): everything except ``correction`` and security-sensitive text.
+    """
+    if mode <= 0:
+        return False
+    q = (question or "").lower()
+    if mode == 1:  # safe
+        if (kind or "question") != "question":
+            return False
+        return not any(k in q for k in _HITL_DESTRUCTIVE_KEYWORDS)
+    # mode >= 2: aggressive
+    if (kind or "") == "correction":
+        return False
+    return not any(k in q for k in _HITL_SECURITY_KEYWORDS)
 
 
 def _auto_hitl_answer(payload: str | None) -> str:
