@@ -362,22 +362,36 @@ def test_hooks_invalid_bearer_returns_401_in_hosted_mode(monkeypatch, tmp_path):
         assert "invalid API token" in r.text
 
 
-def test_hooks_accept_valid_bearer_for_internal_tenant(monkeypatch, tmp_path):
-    """Valid Bearer auth should allow hosted hooks to resolve the tenant DB."""
+def test_hooks_accept_valid_bearer_for_admin_tenant(monkeypatch, tmp_path):
+    """Valid Bearer auth resolves the tenant DB through the REAL routing path.
+
+    Exercises the production ``_open_tenant_db_by_id`` resolver rather than
+    monkeypatching it away. An admin-plan tenant with no dedicated neon_db_url
+    legitimately falls back to the auth DB (see _deps.py), so the project we
+    create there is visible to the hook. A non-admin tenant on this same path
+    would 503 — that isolation guarantee is covered by
+    test_non_admin_tenant_with_null_db_gets_503 in test_hosted.py.
+    """
     from meridian import db as db_module
-    import meridian.server as server_module
+    import meridian._deps as deps_module
 
     async def _setup(db):
         tenant = await db_module.upsert_tenant(db, "hooks-hosted@example.com")
+        # admin plan → _open_tenant_db_by_id falls back to the auth DB when no
+        # dedicated neon_db_url is provisioned (the real resolver path).
+        await db_module.update_tenant(db, tenant["id"], plan="admin")
         raw_token, _ = await db_module.create_api_token(db, tenant["id"], label="hooks-test")
         project = await db_module.create_project(db, "hosted-hooks-valid")
         return raw_token, project
 
-    with _make_hosted_client(monkeypatch, tmp_path) as client:
-        async def _open_same_db(_request, _tenant_id):
-            return client.app.state.db
+    # With no MERIDIAN_AUTH_DB secret set, the admin-plan tenant resolves to the
+    # shared auth DB (the documented fallback) instead of dialing a Neon URL.
+    # Empty (not unset) so the server reload's load_dotenv doesn't repopulate it.
+    monkeypatch.setenv("MERIDIAN_AUTH_DB", "")
 
-        monkeypatch.setattr(server_module, "_open_tenant_db_by_id", _open_same_db)
+    with _make_hosted_client(monkeypatch, tmp_path) as client:
+        # Clear the module-level tenant DB cache so this test resolves fresh.
+        deps_module._tenant_db_cache.clear()
         raw_token, project = _run(_setup(client.app.state.db))
         start_resp = client.post(
             "/hooks/session-start",
@@ -463,9 +477,15 @@ def test_remote_mcp_initialize_with_valid_oauth_token_from_db(client):
     assert token_hash in server_module._oa_tokens
 
 
-def test_remote_mcp_tools_list_returns_8_tools(client):
-    """POST /mcp tools/list returns at least 8 tools."""
+def test_remote_mcp_tools_list_returns_full_tool_surface(client):
+    """POST /mcp tools/list returns the full base MCP tool surface.
+
+    A tenant with no GitHub connection gets exactly _MCP_TOOLS_LIST (no GitHub
+    tools appended), so the count is pinned to the source list rather than a
+    stale magic number — adding a tool keeps this assertion correct.
+    """
     from meridian import db as db_module
+    from meridian.mcp_tools import _MCP_TOOLS_LIST
 
     async def _setup():
         db = client.app.state.db
@@ -483,7 +503,8 @@ def test_remote_mcp_tools_list_returns_8_tools(client):
     assert r.status_code == 200
     tools = r.json()["result"]["tools"]
     names = {t["name"] for t in tools}
-    assert len(tools) >= 8
+    # No GitHub connected for this tenant → exactly the base tool list.
+    assert len(tools) == len(_MCP_TOOLS_LIST)
     for expected in ("create_project", "register_session", "log_task", "generate_handoff", "list_projects", "get_project_by_name"):
         assert expected in names
 

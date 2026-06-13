@@ -392,6 +392,34 @@ def test_magic_link_request_includes_dev_link_when_resend_absent(client):
     assert "dev_link" in body
 
 
+def test_auth_magic_is_rate_limited(client):
+    """POST /auth/magic is capped at 5/minute — the 6th call returns 429.
+
+    Guards the brute-force / email-bomb protection on the magic-link endpoint.
+    slowapi keys on the client address, so all TestClient calls share one bucket
+    and the limiter is fresh per `client` fixture (server module is reloaded).
+    """
+    statuses = [
+        client.post("/auth/magic", json={"email": f"rl{i}@example.com"}).status_code
+        for i in range(6)
+    ]
+    # First 5 within the 5/minute budget must not be rate-limited.
+    assert all(s != 429 for s in statuses[:5]), statuses
+    # The 6th exceeds the limit.
+    assert statuses[5] == 429, statuses
+
+
+def test_export_my_data_is_rate_limited(client):
+    """GET /export/my-data is capped at 3/minute — the 4th call returns 429.
+
+    The limiter runs before the handler, so the cap holds regardless of auth
+    state (unauthenticated calls 404 in self-host mode, but still count).
+    """
+    statuses = [client.get("/export/my-data").status_code for _ in range(4)]
+    assert all(s != 429 for s in statuses[:3]), statuses
+    assert statuses[3] == 429, statuses
+
+
 def test_magic_link_verify_rejects_bad_token(client):
     """GET /auth/magic/verify with unknown token returns 401."""
     r = client.get("/auth/magic/verify?token=badtoken123")
@@ -659,56 +687,16 @@ async def test_count_decisions_returns_correct_count(db):
 
 # ---------------------------------------------------------------------------
 # Dashboard.js static markers
+#
+# v1.1-tests: Removed 7 pure substring-presence grep tests here
+# (sprint-group-header / demo_mode / feedback_thumb / drawer-settings /
+# "Remove connection" / goal-history / activeVersions). They asserted a literal
+# string exists in the JS source — they break on a harmless rename and pass even
+# when the feature is broken, so they carry near-zero regression value. The
+# underlying behavior is covered server-side: demo mode by test_demo_ux.py,
+# feedback by the feedback endpoint tests, goal history by the /goal-history
+# route tests, and version grouping by the sprint-items endpoint tests.
 # ---------------------------------------------------------------------------
-
-
-def test_dashboard_js_has_sprint_group_header_class():
-    """dashboard-sprint.js renders sprint version group headers."""
-    import pathlib
-    js = pathlib.Path("meridian/static/dashboard-sprint.js").read_text(encoding="utf-8")
-    assert "sprint-group-header" in js
-
-
-def test_dashboard_js_has_demo_mode_check():
-    """dashboard.js handles demo_mode from config."""
-    import pathlib
-    js = pathlib.Path("meridian/static/dashboard.js").read_text(encoding="utf-8")
-    assert "demo_mode" in js
-
-
-def test_dashboard_js_has_feedback_thumb():
-    """dashboard.js renders feedback UI."""
-    import pathlib
-    js = pathlib.Path("meridian/static/dashboard.js").read_text(encoding="utf-8")
-    assert "feedback_thumb" in js
-
-
-def test_dashboard_js_has_settings_vtab():
-    """dashboard.js has a settings vtab for notification prefs."""
-    import pathlib
-    js = pathlib.Path("meridian/static/dashboard.js").read_text(encoding="utf-8")
-    assert "drawer-settings" in js
-
-
-def test_dashboard_js_has_connection_delete():
-    """dashboard.js allows deleting connection profiles."""
-    import pathlib
-    js = pathlib.Path("meridian/static/dashboard.js").read_text(encoding="utf-8")
-    assert "Remove connection" in js
-
-
-def test_dashboard_js_has_goal_history_fetch():
-    """dashboard.js fetches goal-history for swimlane markers."""
-    import pathlib
-    js = pathlib.Path("meridian/static/dashboard.js").read_text(encoding="utf-8")
-    assert "goal-history" in js
-
-
-def test_dashboard_js_sprint_board_shows_all_versions():
-    """dashboard.js sprint board groups by version not just current sprint."""
-    import pathlib
-    js = pathlib.Path("meridian/static/dashboard.js").read_text(encoding="utf-8")
-    assert "activeVersions" in js
 
 
 # ---------------------------------------------------------------------------

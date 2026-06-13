@@ -1312,6 +1312,36 @@ def test_put_project_file_403_for_disallowed_filename(client, monkeypatch, tmp_p
     assert r.status_code == 403
 
 
+@pytest.mark.parametrize("filename", ["ROADMAP.md", "DEVLOG.md", "DECISIONS.md", "README.md"])
+def test_server_own_docs_not_readable_or_writable(client, monkeypatch, tmp_path, filename):
+    """Hosted users must not read/write the server's own ROADMAP/DEVLOG/DECISIONS.
+
+    e838425d removed these from _EDITABLE_FILES so a tenant can never reach the
+    Meridian repo's own docs through the file editor API. Guard against anyone
+    re-adding them to the allow-list.
+    """
+    import meridian.server as srv_mod
+    srv_mod = importlib.reload(srv_mod)
+    monkeypatch.setattr(srv_mod, "_REPO_ROOT", tmp_path)
+    # Place a real file on disk so a 403 proves the allow-list blocks it,
+    # not merely that the file is missing.
+    (tmp_path / filename).write_text("# server doc — must stay private\n", encoding="utf-8")
+
+    project = client.post("/projects", json={"name": "alpha"}).json()
+    pid = project["id"]
+
+    r_get = client.get(f"/projects/{pid}/files/{filename}")
+    assert r_get.status_code == 403
+
+    r_put = client.put(
+        f"/projects/{pid}/files/{filename}",
+        json={"content": "overwritten by tenant"},
+    )
+    assert r_put.status_code == 403
+    # The on-disk file must be untouched by the rejected write.
+    assert (tmp_path / filename).read_text(encoding="utf-8") == "# server doc — must stay private\n"
+
+
 def test_file_endpoints_404_for_unknown_project(client, monkeypatch, tmp_path):
     """All file endpoints return 404 when the project does not exist."""
     import meridian.server as srv_mod
@@ -3929,6 +3959,32 @@ async def test_delete_workspace_note_respects_tenant(db):
     # Right tenant: deletes.
     assert await db_module.delete_workspace_note(db, note["id"], tenant_id="tenant-a") is True
     assert await db_module.get_workspace_notes(db, tenant_id="tenant-a") == []
+
+
+@pytest.mark.asyncio
+async def test_workspace_tenant_id_column_present_on_postgres(db_pg):
+    """Postgres: _migrate_pg_workspace_tenant_isolation adds tenant_id to the
+    workspace_* tables. Skipped unless TEST_DATABASE_URL is set.
+
+    SQLite coverage lives in test_workspace_notes_isolated_by_tenant /
+    test_workspace_decisions_isolated_by_tenant; this guards the equivalent
+    Postgres migration so isolation queries don't fail at runtime on prod.
+    """
+    for table in ("workspace_notes", "workspace_decisions", "workspace_settings"):
+        async with db_pg.execute(
+            "SELECT column_name FROM information_schema.columns WHERE table_name = ?",
+            (table,),
+        ) as cur:
+            rows = await cur.fetchall()
+        cols = {r["column_name"] for r in rows}
+        assert "tenant_id" in cols, f"{table} missing tenant_id column on Postgres"
+
+    # And the column actually scopes rows on the live Postgres backend.
+    await db_module.add_workspace_note(db_pg, "pg-A", "for A", tenant_id="tenant-a")
+    await db_module.add_workspace_note(db_pg, "pg-B", "for B", tenant_id="tenant-b")
+    a_titles = {n["title"] for n in await db_module.get_workspace_notes(db_pg, tenant_id="tenant-a")}
+    assert "pg-A" in a_titles
+    assert "pg-B" not in a_titles
 
 
 @pytest.mark.asyncio
@@ -7126,6 +7182,44 @@ def test_hooks_session_start_and_stop(client):
     r = client.post("/hooks/stop", json={"project_id": project["id"], "session_id": session_id})
     assert r.status_code == 200
     assert r.json()["ok"] is True
+
+
+def test_hooks_session_start_injects_full_uuid_not_truncated(client):
+    """SESSION ID + Top item id in the hook context must be full 36-char UUIDs.
+
+    Regression guard: a truncated session id breaks the agent's first
+    claim_sprint_item / log_task calls because the id no longer resolves.
+    """
+    import uuid as _uuid
+
+    project = client.post("/projects", json={"name": "uuid-hook-proj"}).json()
+    pid = project["id"]
+    # Seed a pending sprint item so the INSTRUCTION/top-item line is emitted too.
+    item = client.post(
+        f"/projects/{pid}/sprint-items",
+        json={"version": "v1", "title": "do the thing"},
+    ).json()
+
+    r = client.post("/hooks/session-start", json={"project_id": pid})
+    assert r.status_code == 200
+    ctx = r.json()["hookSpecificOutput"]["additionalContext"]
+
+    session_id = None
+    top_item_id = None
+    for line in ctx.splitlines():
+        if line.startswith("SESSION ID:"):
+            session_id = line.split(":", 1)[1].strip()
+        if "Top item id:" in line:
+            top_item_id = line.split("Top item id:", 1)[1].strip()
+
+    assert session_id, "SESSION ID line missing from hook context"
+    # Full canonical UUID: 36 chars, parseable, not truncated.
+    assert len(session_id) == 36, f"session id looks truncated: {session_id!r}"
+    assert str(_uuid.UUID(session_id)) == session_id
+
+    assert top_item_id, "Top item id line missing from hook context"
+    assert top_item_id == item["id"], "top item id must be the full sprint-item id"
+    assert len(top_item_id) == 36
 
 
 def test_hooks_session_start_missing_project_id(client):
