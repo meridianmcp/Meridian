@@ -6306,16 +6306,6 @@ async function loadSettingsTab(projectId) {
 
   const hooksBaseUrl = ((mcpData && mcpData.base_url) || window.location.origin || state.serverConfig?.server_url || 'http://localhost:7878').replace(/\/$/, '');
 
-  function detectHookInstallOS() {
-    const platform = String(navigator.userAgentData?.platform || navigator.platform || navigator.userAgent || '').toLowerCase();
-    if (platform.includes('win')) return { label: 'Windows', command: `irm ${hooksBaseUrl}/install.ps1 | iex` };
-    if (platform.includes('mac')) return { label: 'macOS', command: `curl -fsSL ${hooksBaseUrl}/install.sh | sh` };
-    if (platform.includes('linux') || platform.includes('x11')) return { label: 'Linux / WSL', command: `curl -fsSL ${hooksBaseUrl}/install.sh | sh` };
-    return { label: 'Unknown OS', command: `curl -fsSL ${hooksBaseUrl}/install.sh | sh` };
-  }
-
-
-
   function buildHookCurlHeaders(token) {
 
     const headers = [];

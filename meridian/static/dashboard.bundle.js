@@ -5271,13 +5271,7 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
       { key: "sprint", label: "Sprint done \u2014 all items completed" }
     ];
     try {
-      let detectHookInstallOS = function() {
-        const platform = String(navigator.userAgentData?.platform || navigator.platform || navigator.userAgent || "").toLowerCase();
-        if (platform.includes("win")) return { label: "Windows", command: `irm ${hooksBaseUrl}/install.ps1 | iex` };
-        if (platform.includes("mac")) return { label: "macOS", command: `curl -fsSL ${hooksBaseUrl}/install.sh | sh` };
-        if (platform.includes("linux") || platform.includes("x11")) return { label: "Linux / WSL", command: `curl -fsSL ${hooksBaseUrl}/install.sh | sh` };
-        return { label: "Unknown OS", command: `curl -fsSL ${hooksBaseUrl}/install.sh | sh` };
-      }, buildHookCurlHeaders = function(token) {
+      let buildHookCurlHeaders = function(token) {
         const headers = [];
         if (token) headers.push(`-H 'Authorization: Bearer ${token}'`);
         headers.push(`-H 'Content-Type: application/json'`);
@@ -5389,12 +5383,6 @@ stop = ${JSON.stringify(stop)}`;
         }
       }
       let html = "";
-      const detectedHookOS = detectHookInstallOS();
-      html += `<div id="settings-os-detection-banner-${projectId}" style="margin-bottom:12px;padding:10px 12px;border:1px solid var(--accent);border-radius:6px;background:rgba(108,143,255,.08)">
-    <div style="font-size:10px;color:var(--accent);font-weight:700;letter-spacing:.04em;text-transform:uppercase;margin-bottom:4px">Detected OS: ${escapeHtml(detectedHookOS.label)}</div>
-    <div style="font-size:10px;color:var(--muted);line-height:1.5">Recommended setup command for this browser:</div>
-    <code style="display:block;margin-top:5px;padding:6px 8px;border:1px solid var(--border);border-radius:4px;background:var(--surface-1);color:var(--text);font-size:10px;white-space:pre-wrap;word-break:break-all">${escapeHtml(detectedHookOS.command)}</code>
-  </div>`;
       if (state.tenantEmail) {
         const plan = state.tenantPlan || "free";
         const hasStripe = !!state.tenantHasStripe;
