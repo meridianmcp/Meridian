@@ -4931,7 +4931,7 @@ async def get_executor_runs(
 ) -> list[dict[str, Any]]:
     """List executor_runs for a project, newest first."""
     async with db.execute(
-        "SELECT er.*, s.name AS session_name FROM executor_runs er "
+        "SELECT er.*, s.name AS session_name, s.status AS session_status FROM executor_runs er "
         "LEFT JOIN sessions s ON s.id = er.session_id "
         "WHERE er.project_id = ? "
         "ORDER BY er.started_at DESC LIMIT ?",
@@ -5251,6 +5251,33 @@ async def delete_workspace_note(
         rc = cur.rowcount or 0
     await db.commit()
     return rc > 0
+
+
+async def update_workspace_note(
+    db: aiosqlite.Connection,
+    note_id: str,
+    title: str | None = None,
+    body: str | None = None,
+    tags: str | None = None,
+) -> dict[str, Any] | None:
+    """Patch title/body/tags on an existing workspace note."""
+    sets, params = [], []
+    if title is not None:
+        sets.append("title = ?"); params.append(title)
+    if body is not None:
+        sets.append("body = ?"); params.append(body)
+    if tags is not None:
+        sets.append("tags = ?"); params.append(tags)
+    if not sets:
+        async with db.execute("SELECT * FROM workspace_notes WHERE id = ?", (note_id,)) as cur:
+            row = await cur.fetchone()
+        return _row_to_dict(row)
+    params.append(note_id)
+    await db.execute(f"UPDATE workspace_notes SET {', '.join(sets)} WHERE id = ?", params)
+    await db.commit()
+    async with db.execute("SELECT * FROM workspace_notes WHERE id = ?", (note_id,)) as cur:
+        row = await cur.fetchone()
+    return _row_to_dict(row)
 
 
 async def pin_workspace_decision(
