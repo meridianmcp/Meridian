@@ -1046,20 +1046,21 @@ async def _migrate_pg_tenants_is_internal(conn: PostgresConnection) -> None:
     # Backfill known internal emails.
     for email in sorted(db_module._internal_emails()):
         await conn.execute(
-            "UPDATE tenants SET is_internal = 1 WHERE LOWER(email) = ?",
+            "UPDATE tenants SET is_internal = 1 WHERE LOWER(email) = $1",
             (email,),
         )
 
 
 async def _migrate_pg_workspace_tenant_isolation(conn: PostgresConnection) -> None:
     """Add tenant_id to workspace_notes/decisions/settings. Idempotent."""
-    await conn.executescript(
-        "ALTER TABLE workspace_notes ADD COLUMN IF NOT EXISTS tenant_id TEXT;"
-        "ALTER TABLE workspace_decisions ADD COLUMN IF NOT EXISTS tenant_id TEXT;"
-        "ALTER TABLE workspace_settings ADD COLUMN IF NOT EXISTS tenant_id TEXT;"
-        "CREATE INDEX IF NOT EXISTS idx_ws_notes_tenant ON workspace_notes(tenant_id);"
-        "CREATE INDEX IF NOT EXISTS idx_ws_decisions_tenant ON workspace_decisions(tenant_id)"
-    )
+    for sql in [
+        "ALTER TABLE workspace_notes ADD COLUMN IF NOT EXISTS tenant_id TEXT",
+        "ALTER TABLE workspace_decisions ADD COLUMN IF NOT EXISTS tenant_id TEXT",
+        "ALTER TABLE workspace_settings ADD COLUMN IF NOT EXISTS tenant_id TEXT",
+        "CREATE INDEX IF NOT EXISTS idx_ws_notes_tenant ON workspace_notes(tenant_id)",
+        "CREATE INDEX IF NOT EXISTS idx_ws_decisions_tenant ON workspace_decisions(tenant_id)",
+    ]:
+        await conn.execute(sql)
 
 
 async def _migrate_pg_admin_plan(conn: PostgresConnection) -> None:
@@ -1074,7 +1075,7 @@ async def _migrate_pg_admin_plan(conn: PostgresConnection) -> None:
     admin_emails = {e.strip().lower() for e in whitelist_raw.split(",") if e.strip()}
     for email in sorted(admin_emails):
         await conn.execute(
-            "UPDATE tenants SET plan = 'admin' WHERE LOWER(email) = ? AND plan != 'admin'",
+            "UPDATE tenants SET plan = 'admin' WHERE LOWER(email) = $1 AND plan != 'admin'",
             (email,),
         )
 
