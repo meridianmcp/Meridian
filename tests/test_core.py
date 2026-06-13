@@ -6068,6 +6068,47 @@ async def test_list_hitl_requests_filter_by_status(db):
 
 
 @pytest.mark.asyncio
+async def test_dispatch_list_hitl_requests_project_id_optional(db):
+    """277567dc: omitting project_id lists pending HITLs across ALL projects.
+
+    Planning sessions calling list_hitl_requests scoped to their own project
+    missed HITLs filed under another project (e.g. hook_project_select anchored
+    to projects[0]) and got false 'no pending HITLs' confidence.
+    """
+    import meridian.server as srv
+    p1 = await db_module.create_project(db, "hitl-a")
+    p2 = await db_module.create_project(db, "hitl-b")
+    h1 = await db_module.request_hitl(db, p1["id"], "Question in A")
+    h2 = await db_module.request_hitl(db, p2["id"], "Question in B")
+
+    # No project_id → both projects' pending HITLs are visible.
+    all_pending = await srv._dispatch_mcp_tool("list_hitl_requests", {}, db, "/tmp")
+    ids = {r["id"] for r in all_pending}
+    assert {h1["id"], h2["id"]} <= ids
+
+    # Scoped to one project → only that project's HITLs.
+    scoped = await srv._dispatch_mcp_tool(
+        "list_hitl_requests", {"project_id": p1["id"]}, db, "/tmp"
+    )
+    sids = {r["id"] for r in scoped}
+    assert h1["id"] in sids and h2["id"] not in sids
+
+
+@pytest.mark.asyncio
+async def test_get_session_brief_surfaces_pending_hitl_questions(db):
+    """277567dc: session brief shows pending HITL question text, not just a count."""
+    import meridian.server as srv
+    p = await db_module.create_project(db, "brief-hitl")
+    await db_module.request_hitl(db, p["id"], "Should we rate-limit per IP?")
+    res = await srv._dispatch_mcp_tool(
+        "get_session_brief", {"project_id": p["id"]}, db, "/tmp"
+    )
+    text = res["text"]
+    assert "<hitl_pending" in text
+    assert "Should we rate-limit per IP?" in text
+
+
+@pytest.mark.asyncio
 async def test_get_hitl_request_returns_none_for_unknown(db):
     result = await db_module.get_hitl_request(db, "00000000-0000-0000-0000-000000000000")
     assert result is None

@@ -8082,8 +8082,10 @@ async def _dispatch_mcp_tool(
         status_filter = args.get("status", "pending")
         if status_filter == "all":
             status_filter = None
+        # project_id is optional — None lists across all projects (like the
+        # dashboard), so cross-project HITLs aren't missed (277567dc).
         return await db_module.list_hitl_requests(
-            db, args["project_id"],
+            db, args.get("project_id"),
             status=status_filter,
             limit=args.get("limit", 50),
         )
@@ -8345,7 +8347,20 @@ async def _dispatch_mcp_tool(
             f'  <item version="{it.get("version","")}">{(it.get("title") or "")[:80]}</item>'
             for it in sprint_items[:5]
         )
-        hitl_attr = f' count="{len(hitl_rows)}"' if hitl_rows else ""
+        # 277567dc — surface the actual pending HITL questions (not just a count)
+        # so a session sees what needs a human decision without a second call.
+        if hitl_rows:
+            hitl_xml = (
+                f'<hitl_pending count="{len(hitl_rows)}">\n'
+                + "\n".join(
+                    f'  <request id="{h.get("id","")}" urgency="{h.get("urgency","normal")}">'
+                    f'{(h.get("question") or "")[:140]}</request>'
+                    for h in hitl_rows[:5]
+                )
+                + "\n</hitl_pending>"
+            )
+        else:
+            hitl_xml = ""
         blocking_xml = f'<blocking>{(blocking[0].get("description") or "")[:100]}</blocking>' if blocking else ""
         # v2.6 — include session scratch-pad notes at top of brief
         notes_xml = ""
@@ -8366,7 +8381,7 @@ async def _dispatch_mcp_tool(
             f'<pending_items>\n{sprint_items_xml}\n</pending_items>\n'
             f'<last_tasks>\n{tasks_xml}\n</last_tasks>\n'
             f'{blocking_xml}\n'
-            f'{"<hitl_pending" + hitl_attr + "/>" if hitl_rows else ""}\n'
+            f'{hitl_xml}\n'
             f'</session_brief>'
         )
         return {"text": brief, "project_id": project_id, "role": role}

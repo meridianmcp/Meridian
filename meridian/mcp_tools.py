@@ -271,15 +271,18 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
                   "description": "Controls verbosity. 'worker'=sprint+tasks only, 'planner'=full context."}},
          "required": ["project_id"]}},
     {"name": "list_hitl_requests", "description":
-        "Read-only: List HITL requests for a project without needing UUIDs. Returns pending queue "
-        "by default; pass status='all' to see answered/dismissed items too. "
-        "Essential for planning chat to see what needs a human decision.",
+        "Read-only: List HITL requests without needing UUIDs. OMIT project_id to list pending "
+        "HITLs across ALL your projects (matches the dashboard) — planning sessions should call it "
+        "this way so HITLs filed under another project aren't missed (a common cause of false "
+        "'no pending HITLs' confidence). Pass project_id to scope to one project. Returns the "
+        "pending queue by default; pass status='answered'/'dismissed'/'all' to widen.",
      "inputSchema": {"type": "object", "properties": {
-         "project_id": {"type": "string"},
+         "project_id": {"type": "string",
+                        "description": "Optional. Omit to list across all projects."},
          "status": {"type": "string",
                     "description": "Filter: 'pending' (default), 'answered', 'dismissed', or 'all'."},
          "limit": {"type": "integer", "description": "Max results, default 50."}},
-         "required": ["project_id"]}},
+         "required": []}},
     {"name": "answer_hitl", "description":
         "Answer a pending HITL request programmatically. Marks it answered so "
         "the waiting session can resume. Use list_hitl_requests to find request IDs.",
