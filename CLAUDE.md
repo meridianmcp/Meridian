@@ -145,6 +145,7 @@ your project context on start and snapshots progress on end.
 - **Staging pipeline**: `dev push → test → deploy preview → smoke test → merge main → prod`. Rollback fires automatically if prod /health returns non-200 after deploy.
 - **NEVER run hooks.ps1 or hooks.sh**: These are user-facing installers. Running them generates a new API token and invalidates the human's active Claude Code session. Never run `irm hooks.ps1 | iex` or `bash hooks.sh` during a sprint.
 - **Demo write protection**: Adding a new write endpoint requires NO demo exception — the middleware in `server.py` handles it globally. When adding a new write UI element, add it to the `hideDemoAdminControls()` selector list in `dashboard.js`.
+- **Set display name**: Settings → Account & Workspace → Workspace → "Your display name" → Adam
 
 ---
 ## Meridian-managed notes
@@ -155,7 +156,7 @@ your project context on start and snapshots progress on end.
 
 ---
 <!-- MERIDIAN STATE — auto-generated, do not edit below -->
-## Current Sprint State  _(auto-updated 2026-06-13 03:51 UTC)_
+## Current Sprint State  _(auto-updated 2026-06-13 06:35 UTC)_
 
 **Key Files:**
 - `meridian/server.py` — FastAPI app + MCP handlers

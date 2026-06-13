@@ -169,6 +169,29 @@ Expose Meridian on HTTPS (e.g., via Cloudflare Tunnel or ngrok) and use the remo
 
 ---
 
+## Local file reading in planning chat (optional)
+
+Expose your local files to planning chat via mcp-proxy + a free tunnel:
+
+**Windows:**
+```
+npx mcp-proxy --port 8808 --tunnel --shell -- cmd /c npx -y @modelcontextprotocol/server-filesystem "C:\path\to\repo"
+```
+
+**Mac/Linux:**
+```
+npx mcp-proxy --port 8808 --tunnel -- npx -y @modelcontextprotocol/server-filesystem /path/to/repo
+```
+
+Copy the tunnel URL printed (e.g. `https://xxxx.tunnel.gla.ma`) → add `/mcp` as a connector in claude.ai.
+
+Read-only. Requires Node.js. URL changes on restart.
+
+!!! note "Pro plan coming soon"
+    Pro plan includes a permanent tunnel URL that never changes — add once, works forever.
+
+---
+
 ## Troubleshooting
 
 **"No tools loaded" or the connector hangs**
