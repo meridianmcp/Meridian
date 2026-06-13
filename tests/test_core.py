@@ -7291,7 +7291,11 @@ def test_hooks_session_start_injects_full_uuid_not_truncated(client):
         json={"version": "v1", "title": "do the thing"},
     ).json()
 
-    r = client.post("/hooks/session-start", json={"project_id": pid})
+    # Executor session (bypassPermissions) → INSTRUCTION/top-item line is emitted.
+    r = client.post(
+        "/hooks/session-start",
+        json={"project_id": pid, "permission_mode": "bypassPermissions"},
+    )
     assert r.status_code == 200
     ctx = r.json()["hookSpecificOutput"]["additionalContext"]
 
@@ -7311,6 +7315,37 @@ def test_hooks_session_start_injects_full_uuid_not_truncated(client):
     assert top_item_id, "Top item id line missing from hook context"
     assert top_item_id == item["id"], "top item id must be the full sprint-item id"
     assert len(top_item_id) == 36
+
+
+def test_hooks_session_start_plain_chat_no_auto_claim_instruction(client):
+    """b11fc37d: plain (non-executor) sessions get context but NO claim instruction.
+
+    The auto-claim nudge must only fire for executor sessions (bypassPermissions /
+    explicit executor flag), or casual chat sessions start grabbing sprint items.
+    """
+    project = client.post("/projects", json={"name": "plain-chat-proj"}).json()
+    pid = project["id"]
+    client.post(
+        f"/projects/{pid}/sprint-items",
+        json={"version": "v1", "title": "do the thing"},
+    )
+
+    # No permission_mode / executor flag → plain chat.
+    plain = client.post("/hooks/session-start", json={"project_id": pid})
+    assert plain.status_code == 200
+    plain_ctx = plain.json()["hookSpecificOutput"]["additionalContext"]
+    assert project["name"] in plain_ctx, "context should still be injected"
+    assert "PENDING SPRINT ITEMS" in plain_ctx, "pending items should still be shown"
+    assert "claim_sprint_item" not in plain_ctx, (
+        "plain chat must NOT be told to claim a sprint item"
+    )
+
+    # Executor flag → instruction present.
+    exe = client.post(
+        "/hooks/session-start",
+        json={"project_id": pid, "executor": True},
+    )
+    assert "claim_sprint_item" in exe.json()["hookSpecificOutput"]["additionalContext"]
 
 
 def test_hooks_session_start_missing_project_id(client):

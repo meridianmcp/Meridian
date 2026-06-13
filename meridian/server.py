@@ -5745,6 +5745,22 @@ async def get_install_ps1() -> PlainTextResponse:
     return PlainTextResponse(script_path.read_text(encoding="utf-8"))
 
 
+def _hook_is_executor(body: dict[str, Any]) -> bool:
+    """True when a SessionStart hook payload denotes an executor session.
+
+    Executor sessions (Claude Code run with --dangerously-skip-permissions, or
+    an explicit executor flag) auto-claim sprint items. Plain conversational
+    sessions must not — they get context injected but no claim instruction.
+    Defaults to False so an unsignalled hook is treated as plain chat.
+    """
+    perm = str(body.get("permission_mode") or "").strip().lower()
+    if perm in ("bypasspermissions", "bypass", "dangerously-skip-permissions"):
+        return True
+    if str(body.get("session_role") or "").strip().lower() == "executor":
+        return True
+    return bool(body.get("executor")) or bool(body.get("dangerously_skip_permissions"))
+
+
 @app.post("/hooks/session-start")
 async def hooks_session_start(body: dict[str, Any], request: Request) -> dict[str, Any]:
     """Claude Code / Codex SessionStart hook.
@@ -6043,7 +6059,12 @@ async def hooks_session_start(body: dict[str, Any], request: Request) -> dict[st
         for t in recent[:5]:
             lines.append(f"- [{t.get('status','?').upper()}] {str(t.get('description',''))[:120]}")
     lines.append(f"\nSESSION ID: {result.get('session_id', '')}")
-    if sprint_items:
+    # b11fc37d — only nudge auto-claim for *executor* sessions. Plain chat sessions
+    # get full context injected but must NOT be told to claim a sprint item, or
+    # casual conversational sessions start grabbing work. The local hook forwards
+    # Claude Code's permission_mode; bypassPermissions (i.e.
+    # --dangerously-skip-permissions) or an explicit executor flag means executor.
+    if sprint_items and _hook_is_executor(body):
         top_item_id = sprint_items[0].get("id", "")
         lines.append(
             f"\nINSTRUCTION: Your first MCP call must be claim_sprint_item on the top "
