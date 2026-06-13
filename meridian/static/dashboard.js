@@ -8052,11 +8052,14 @@ async function loadSettingsTab(projectId) {
 
         noteList.innerHTML = (items && items.length)
 
-          ? items.map(n => `<div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px;padding:4px 0;border-bottom:1px solid var(--border)">
+          ? items.map(n => `<div data-note-row="${escapeHtml(n.id)}" style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px;padding:4px 0;border-bottom:1px solid var(--border)">
 
-              <span>${escapeHtml(n.title || '')}: <span style="color:var(--muted)">${escapeHtml(n.body || '')}</span>${n.tags ? ` <span style="color:var(--accent);font-size:9px">${escapeHtml(n.tags)}</span>` : ''}</span>
+              <span data-note-view="${escapeHtml(n.id)}">${escapeHtml(n.title || '')}: <span style="color:var(--muted)">${escapeHtml(n.body || '')}</span>${n.tags ? ` <span style="color:var(--accent);font-size:9px">${escapeHtml(n.tags)}</span>` : ''}</span>
 
-              <button class="secondary" data-nid="${escapeHtml(n.id)}" style="font-size:9px;padding:2px 7px">×</button>
+              <span style="display:flex;gap:4px;flex-shrink:0">
+                <button class="secondary" data-nid-edit="${escapeHtml(n.id)}" data-ntitle="${escapeHtml(n.title || '')}" data-nbody="${escapeHtml(n.body || '')}" style="font-size:9px;padding:2px 6px" title="Edit">✎</button>
+                <button class="secondary" data-nid="${escapeHtml(n.id)}" style="font-size:9px;padding:2px 7px">×</button>
+              </span>
 
             </div>`).join('')
 
@@ -8071,6 +8074,42 @@ async function loadSettingsTab(projectId) {
             try { await api(`/workspace/notes/${btn.dataset.nid}`, { method: 'DELETE' }); renderWsNotes(); }
 
             catch (e) { alert('Error: ' + e); }
+
+          };
+
+        });
+
+        noteList.querySelectorAll('button[data-nid-edit]').forEach(btn => {
+
+          btn.onclick = () => {
+
+            const nid = btn.dataset.nidEdit;
+            const row = noteList.querySelector(`[data-note-row="${nid}"]`);
+            const view = noteList.querySelector(`[data-note-view="${nid}"]`);
+            if (!row || row.querySelector('textarea')) return;
+            const titleVal = btn.dataset.ntitle;
+            const bodyVal = btn.dataset.nbody;
+            view.style.display = 'none';
+            const edit = document.createElement('div');
+            edit.style.cssText = 'flex:1;display:flex;flex-direction:column;gap:4px';
+            edit.innerHTML = `
+              <input type="text" value="${escapeHtml(titleVal)}" style="font-size:10px;padding:2px 6px;background:var(--surface-2);border:1px solid var(--border);color:var(--text);border-radius:3px;width:100%">
+              <textarea rows="2" style="font-size:10px;padding:2px 6px;background:var(--surface-2);border:1px solid var(--border);color:var(--text);border-radius:3px;resize:vertical;width:100%">${escapeHtml(bodyVal)}</textarea>
+              <span style="display:flex;gap:4px">
+                <button class="primary" style="font-size:9px;padding:2px 8px">Save</button>
+                <button class="secondary" style="font-size:9px;padding:2px 8px">Cancel</button>
+              </span>`;
+            row.insertBefore(edit, row.querySelector('[data-note-view]').nextSibling);
+            edit.querySelector('button.secondary').onclick = () => { edit.remove(); view.style.display = ''; };
+            edit.querySelector('button.primary').onclick = async () => {
+              const newTitle = edit.querySelector('input').value.trim();
+              const newBody = edit.querySelector('textarea').value.trim();
+              if (!newTitle || !newBody) return;
+              try {
+                await api(`/workspace/notes/${nid}`, { method: 'PATCH', body: JSON.stringify({ title: newTitle, body: newBody }) });
+                renderWsNotes();
+              } catch (e) { alert('Error: ' + e); }
+            };
 
           };
 
@@ -10636,6 +10675,23 @@ async function updateLiveFeed(projectId) {
 
     }).join('');
 
+    const extraCount = active.length - 1;
+
+    const extraRows = active.slice(1).map(s => {
+
+      const age = s.last_seen ? Math.round((Date.now() - new Date(s.last_seen + 'Z').getTime()) / 60000) : null;
+
+      const ageStr = age !== null ? (age < 2 ? 'just now' : `${age}m ago`) : '';
+
+      return `<div style="display:flex;align-items:center;gap:6px;padding:2px 0">
+        <span style="font-size:9px;color:var(--accent)">●</span>
+        <span style="font-size:10px;color:var(--text);font-family:var(--font-mono)">${escapeHtml(s.name || 'unnamed')}</span>
+        ${s.human_id ? `<span style="font-size:9px;color:var(--muted)">${escapeHtml(s.human_id)}</span>` : ''}
+        ${ageStr ? `<span style="font-size:9px;color:var(--muted);margin-left:auto">${ageStr}</span>` : ''}
+      </div>`;
+
+    }).join('');
+
     el.innerHTML = `
 
       <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
@@ -10648,15 +10704,41 @@ async function updateLiveFeed(projectId) {
           ? `<span style="font-size:10px;color:var(--muted)">${escapeHtml(sess.human_id)}</span>`
           : (sess.name ? `<span style="font-size:10px;color:var(--muted);font-style:italic">${escapeHtml(sess.name)}</span>` : '')}
 
+        ${extraCount > 0 ? `<button class="secondary" id="live-feed-extra-toggle-${projectId}" style="font-size:9px;padding:1px 6px;margin-left:4px">+${extraCount} more ▸</button>` : ''}
+
         ${elapsedStr ? `<span style="font-size:10px;color:var(--muted);margin-left:auto">${elapsedStr}</span>` : ''}
 
       </div>
+
+      ${extraCount > 0 ? `<div id="live-feed-extra-${projectId}" style="display:none;margin-bottom:6px;padding:4px 8px;background:var(--surface-2);border-radius:3px">${extraRows}</div>` : ''}
 
       <div style="font-family:var(--font-mono)">
 
         ${taskRows || '<div style="color:var(--muted);font-size:10px">no recent tasks</div>'}
 
       </div>`;
+
+    if (extraCount > 0) {
+
+      const toggleBtn = el.querySelector(`#live-feed-extra-toggle-${projectId}`);
+
+      const extraEl = el.querySelector(`#live-feed-extra-${projectId}`);
+
+      if (toggleBtn && extraEl) {
+
+        toggleBtn.onclick = () => {
+
+          const open = extraEl.style.display !== 'none';
+
+          extraEl.style.display = open ? 'none' : 'block';
+
+          toggleBtn.textContent = open ? `+${extraCount} more ▸` : `${extraCount} others ▾`;
+
+        };
+
+      }
+
+    }
 
     el.style.display = 'block';
 
@@ -10941,9 +11023,13 @@ async function loadRecentRuns(projectId) {
 
       const cnt = run.task_count || 0;
 
-      const statusColor = run.status === 'running' ? 'var(--accent)' : run.status === 'failed' ? 'var(--danger,#e05)' : 'var(--muted)';
+      // A run stuck in "running" whose session is no longer active should display as "done"
+      const displayRunStatus = (run.status === 'running' && run.session_status && run.session_status !== 'active')
+        ? 'done' : run.status;
 
-      const dots = run.status === 'running' ? ' ·' : '';
+      const statusColor = displayRunStatus === 'running' ? 'var(--accent)' : displayRunStatus === 'failed' ? 'var(--danger,#e05)' : 'var(--muted)';
+
+      const dots = displayRunStatus === 'running' ? ' ·' : '';
 
       return `<div class="run-row" data-run-id="${escapeHtml(run.id)}" data-project-id="${escapeHtml(projectId)}"
 
@@ -10955,7 +11041,7 @@ async function loadRecentRuns(projectId) {
 
           <span style="font-size:9px;color:var(--muted)">${cnt} tasks · ${dur} · ${ts}${run.session_name && sid ? ` · ${escapeHtml(sid)}` : ''}</span>
 
-          <span style="font-size:9px;color:${statusColor}">${run.status}</span>
+          <span style="font-size:9px;color:${statusColor}">${displayRunStatus}</span>
 
         </div>
 

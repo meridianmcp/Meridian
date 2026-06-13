@@ -131,6 +131,11 @@ your project context on start and snapshots progress on end.
 ---
 ## Executor rules (Meridian project only)
 
+- **Launching executor sessions with --rc**: Set `ENABLE_TOOL_SEARCH=false` before invoking `claude --rc` to ensure MCP tools load. Without it, deferred tools may not resolve in `--rc` mode.
+  ```powershell
+  $env:ENABLE_TOOL_SEARCH="false"
+  claude --rc --dangerously-skip-permissions
+  ```
 - **Secrets hygiene**: Never put credentials, connection strings, API keys, or secrets in chat or task descriptions. Mention env var names only.
 - **Before every push**: Run `pixi run test` locally first. CI is a safety net — not the first check. Never push broken code.
 - **End every session**: If tests pass, merge `dev → main` and push `main` to trigger deploy. Do not end the session with work stranded only on `dev`.
@@ -150,7 +155,7 @@ your project context on start and snapshots progress on end.
 
 ---
 <!-- MERIDIAN STATE — auto-generated, do not edit below -->
-## Current Sprint State  _(auto-updated 2026-06-13 00:41 UTC)_
+## Current Sprint State  _(auto-updated 2026-06-13 01:12 UTC)_
 
 **Key Files:**
 - `meridian/server.py` — FastAPI app + MCP handlers

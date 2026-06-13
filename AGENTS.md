@@ -109,6 +109,18 @@ project context on start and checkpoints on end.
 
 ---
 
+## Launching Claude Code executor sessions with --rc
+
+Set `ENABLE_TOOL_SEARCH=false` before invoking `claude --rc` to ensure MCP tools load.
+Without it, deferred tools may not resolve and MCP calls will fail silently.
+
+```powershell
+$env:ENABLE_TOOL_SEARCH="false"
+claude --rc --dangerously-skip-permissions
+```
+
+---
+
 ## PARALLEL SESSIONS
 
 Multiple AI sessions (Claude Code + Codex, or two concurrent Claude Code windows) can work on the same project simultaneously. Follow these rules to avoid conflicts:

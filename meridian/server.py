@@ -4444,6 +4444,50 @@ async def workspace_remove_member(request: Request, member_id: str) -> None:
     await db_module.delete_workspace_member(request.app.state.db, member_id, tenant["id"])
 
 
+@app.get("/workspace/notes")
+async def workspace_list_notes(request: Request, tag: str | None = None) -> list[dict[str, Any]]:
+    """List workspace-level notes, newest first."""
+    db = await _db(request)
+    return await db_module.get_workspace_notes(db, tag=tag)
+
+
+@app.post("/workspace/notes", status_code=201)
+async def workspace_add_note(request: Request) -> dict[str, Any]:
+    """Add a workspace-level note."""
+    db = await _db(request)
+    body = await request.json()
+    title = (body.get("title") or "").strip()
+    content = (body.get("body") or "").strip()
+    if not title or not content:
+        raise HTTPException(status_code=422, detail="title and body are required")
+    return await db_module.add_workspace_note(db, title, content, body.get("tags"))
+
+
+@app.patch("/workspace/notes/{note_id}")
+async def workspace_update_note(request: Request, note_id: str) -> dict[str, Any]:
+    """Patch title/body/tags on a workspace note."""
+    db = await _db(request)
+    body = await request.json()
+    result = await db_module.update_workspace_note(
+        db, note_id,
+        title=body.get("title"),
+        body=body.get("body"),
+        tags=body.get("tags"),
+    )
+    if result is None:
+        raise HTTPException(status_code=404, detail="note not found")
+    return result
+
+
+@app.delete("/workspace/notes/{note_id}", status_code=204)
+async def workspace_delete_note(request: Request, note_id: str) -> None:
+    """Delete a workspace note."""
+    db = await _db(request)
+    deleted = await db_module.delete_workspace_note(db, note_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="note not found")
+
+
 def _is_demo_request(request: Request) -> bool:
     """Return True when the request is in demo mode (env flag or cookie)."""
     env_demo = os.environ.get("MERIDIAN_DEMO", "").lower() in ("1", "true", "yes")
