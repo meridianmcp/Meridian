@@ -1,4 +1,4 @@
-function suggestNtfyTopic(projectId) {
+export function suggestNtfyTopic(projectId) {
 
   const proj = (window.state?.projects || []).find(p => p.id === projectId);
 
@@ -15,3 +15,5 @@ function suggestNtfyTopic(projectId) {
   return slug;
 
 }
+
+try { Object.assign(window, { suggestNtfyTopic }); } catch(e) {}

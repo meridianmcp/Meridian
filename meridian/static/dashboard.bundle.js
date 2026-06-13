@@ -1611,6 +1611,17 @@
   } catch (e) {
   }
 
+  // meridian/static/dashboard-settings.js
+  function suggestNtfyTopic2(projectId) {
+    const proj = (window.state?.projects || []).find((p) => p.id === projectId);
+    const slug = (proj?.name || "meridian").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 24) || "meridian";
+    return slug;
+  }
+  try {
+    Object.assign(window, { suggestNtfyTopic: suggestNtfyTopic2 });
+  } catch (e) {
+  }
+
   // meridian/static/dashboard.js
   var TABS_KEY = "meridian.openTabs";
   var ACTIVE_PROJECT_KEY = "meridian.activeProject";
