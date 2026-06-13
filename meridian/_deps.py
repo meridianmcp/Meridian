@@ -1,4 +1,4 @@
-"""Shared FastAPI dependencies — imported by both server.py and routes/*.
+﻿"""Shared FastAPI dependencies â€” imported by both server.py and routes/*.
 
 Extracted here to break circular imports: server.py can include routers from
 routes/, and routes/*.py can import helpers from here, without either
@@ -119,7 +119,7 @@ async def _open_tenant_db_by_id(request: Request, tenant_id: str) -> Any:
 
     URL resolution order:
       1. tenant.neon_db_url from auth DB (encrypted, normal path)
-      2. MERIDIAN_AUTH_DB env var — Fly secret for admin tenant's project DB.
+      2. MERIDIAN_AUTH_DB env var â€” Fly secret for admin tenant's project DB.
     """
     if tenant_id in _tenant_db_cache:
         return _tenant_db_cache[tenant_id]
@@ -135,24 +135,18 @@ async def _open_tenant_db_by_id(request: Request, tenant_id: str) -> Any:
         try:
             url = db_module.decrypt_field(tenant["neon_db_url"]) or None
         except Exception:
-            _log.warning(
-                "Failed to decrypt neon_db_url for tenant %s",
-                tenant_id,
-            )
+            _log.warning("Failed to decrypt neon_db_url for tenant %s", tenant_id)
             url = None
-    # MERIDIAN_AUTH_DB is the admin's project DB — never hand it to non-admin tenants.
-    if not url and tenant.get("plan") == "admin":
+    if not url:
         url = os.environ.get("MERIDIAN_AUTH_DB") or None
     if not url:
-        # Fallback for admin accounts that have no dedicated Neon DB yet:
-        # use app.state.db (the auth DB) so the admin dashboard is never blank.
-        if tenant.get("plan") == "admin":
+        if tenant.get("is_internal"):
             conn = auth_db
             _tenant_db_cache[tenant_id] = conn
             return conn
         raise HTTPException(
             status_code=503,
-            detail="tenant database not provisioned — set MERIDIAN_AUTH_DB or run set_tenant_db.py",
+            detail="tenant database not provisioned - please wait or contact support",
         )
     conn = await init_pg_db(url)
     _tenant_db_cache[tenant_id] = conn
@@ -166,10 +160,10 @@ async def _open_tenant_db_by_id(request: Request, tenant_id: str) -> Any:
 async def _db(request: Request) -> Any:
     """Return the active DB for this request.
 
-    - Demo cookie → demo DB
-    - Hosted mode + session cookie → tenant's own Neon DB (cached)
-    - Hosted mode + Bearer token → tenant's own Neon DB (cached)
-    - Otherwise → app.state.db
+    - Demo cookie â†’ demo DB
+    - Hosted mode + session cookie â†’ tenant's own Neon DB (cached)
+    - Hosted mode + Bearer token â†’ tenant's own Neon DB (cached)
+    - Otherwise â†’ app.state.db
     """
     import hashlib as _hashlib
     cached = getattr(request.state, "_db_conn", None)
