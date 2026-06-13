@@ -4505,7 +4505,7 @@ async function loadLiveTab(projectId) {
 
 async function refreshLiveTab(projectId) {
 
-  /** Fetch fresh sessions + tasks + sprint items and repaint all Live sections. */
+  /** Fetch fresh sessions + tasks + sprint items + worktrees and repaint all Live sections. */
 
   try {
 
@@ -4515,13 +4515,17 @@ async function refreshLiveTab(projectId) {
 
     const sprintItemsPath = `/projects/${projectId}/sprint-items`;
 
-    const [sessionsResult, tasksResult, sprintItemsResult] = await Promise.allSettled([
+    const worktreesPath = `/projects/${projectId}/worktrees`;
+
+    const [sessionsResult, tasksResult, sprintItemsResult, worktreesResult] = await Promise.allSettled([
 
       projectApi(projectId, sessionsPath),
 
       projectApi(projectId, tasksPath),
 
       projectApi(projectId, sprintItemsPath),
+
+      projectApi(projectId, worktreesPath),
 
     ]);
 
@@ -4549,7 +4553,9 @@ async function refreshLiveTab(projectId) {
 
     if (sessionsResult.status === 'fulfilled' && tasksResult.status === 'fulfilled') {
 
-      renderLiveSessions(projectId, sessionsResult.value || [], tasksResult.value || []);
+      const worktrees = worktreesResult.status === 'fulfilled' ? (worktreesResult.value || []) : [];
+
+      renderLiveSessions(projectId, sessionsResult.value || [], tasksResult.value || [], worktrees);
 
       cacheMostRecentSession(projectId, sessionsResult.value || []);
 
@@ -4889,11 +4895,18 @@ function cacheMostRecentSession(projectId, sessions) {
 
 
 
-function renderLiveSessions(projectId, sessions, tasks) {
+function renderLiveSessions(projectId, sessions, tasks, worktrees) {
 
   const root = document.getElementById(`live-sessions-${projectId}`);
 
   if (!root) return;
+
+  // Build a map of session_id → active worktree branches
+  const worktreeMap = new Map();
+  (worktrees || []).forEach(wt => {
+    if (!worktreeMap.has(wt.session_id)) worktreeMap.set(wt.session_id, []);
+    worktreeMap.get(wt.session_id).push(wt.branch);
+  });
 
   const claimMap = new Map();
   const taskMap = new Map();
@@ -4990,6 +5003,12 @@ function renderLiveSessions(projectId, sessions, tasks) {
 
       : '';
 
+    const sessionWorktrees = worktreeMap.get(s.id) || [];
+
+    const worktreeBadges = sessionWorktrees.map(branch =>
+      `<span class="worktree-badge" title="active worktree: ${escapeHtml(branch)}" style="display:inline-block;background:var(--surface-2);color:#a78bfa;font-size:9px;font-weight:600;padding:1px 5px;border-radius:3px;margin-left:4px">⎇ ${escapeHtml(branch.replace('worktree/', ''))}</span>`
+    ).join('');
+
     const endBtn = live
       ? `<button class="secondary live-session-end" data-session-id="${escapeHtml(s.id)}" style="padding:1px 6px;font-size:9px;margin-left:6px" title="Mark this session idle">End session</button>`
       : '';
@@ -5000,7 +5019,7 @@ function renderLiveSessions(projectId, sessions, tasks) {
 
         <span class="live-dot">${dot}</span>
 
-        <span class="live-session-name">${escapeHtml(label)}</span>${fwBadge}
+        <span class="live-session-name">${escapeHtml(label)}</span>${fwBadge}${worktreeBadges}
 
         <span class="live-session-status" style="font-size:9px;color:var(--muted);text-transform:uppercase">${escapeHtml(displayStatus)}</span>
 

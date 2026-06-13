@@ -109,6 +109,7 @@ from .models import (
     Task,
     TaskCreate,
     TaskUpdate,
+    WorktreeCreate,
 )
 from .mcp_tools import _MCP_TOOLS_LIST, _TOOL_EXAMPLES, _READ_ONLY_TOOLS as _mcp_readonly_tools
 
@@ -2830,6 +2831,43 @@ async def get_sessions(
 
 
 # /tasks POST + PATCH → meridian/routes/tasks.py
+
+
+@app.get("/projects/{project_id}/worktrees")
+async def list_worktrees(project_id: str, request: Request) -> list[dict[str, Any]]:
+    """List active git worktrees registered for a project."""
+    project = await db_module.get_project(await _db(request), project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="project not found")
+    return await db_module.list_active_worktrees(await _db(request), project_id)
+
+
+@app.post("/projects/{project_id}/worktrees", status_code=201)
+async def create_worktree(
+    project_id: str, request: Request, body: WorktreeCreate
+) -> dict[str, Any]:
+    """Register a git worktree for a session. Call after `git worktree add`."""
+    project = await db_module.get_project(await _db(request), project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="project not found")
+    return await db_module.register_worktree(
+        await _db(request),
+        body.session_id,
+        project_id,
+        body.branch,
+        body.path,
+        item_id=body.item_id,
+    )
+
+
+@app.delete("/projects/{project_id}/worktrees/{worktree_id}", status_code=204)
+async def delete_worktree(
+    project_id: str, worktree_id: str, request: Request
+) -> None:
+    """Mark a registered worktree as removed. Call after `git worktree remove`."""
+    removed = await db_module.remove_worktree(await _db(request), worktree_id)
+    if not removed:
+        raise HTTPException(status_code=404, detail="worktree not found or already removed")
 
 
 @app.get("/projects/{project_id}/export/pdf")
@@ -7315,21 +7353,65 @@ async def _dispatch_mcp_tool(
                                     f"({', '.join(_hits)}). Pass force=true to override."),
                         "protected_files": _hits,
                     }
-        conflicts = await _sprint_item_file_claim_conflicts(
-            db,
-            args["project_id"],
-            args["item_id"],
-            exclude_session_id=args.get("session_id"),
-        )
-        if conflicts:
-            return {
-                "error": "CONFLICT",
-                "message": "Cannot claim sprint item: active session has overlapping claimed files.",
-                "conflicts": conflicts,
-            }
+
+        # Check if worktree isolation is configured for this project.
+        # When isolation="worktree", bypass file-lock conflict check — the worktree
+        # solves the conflict by giving the session its own working copy.
+        _suggest_worktree = False
+        _exec_cfg: dict[str, Any] = {}
+        try:
+            _proj_settings = await db_module.get_project_settings(db, args["project_id"])
+            _raw_cfg = (_proj_settings or {}).get("executor_config") if _proj_settings else None
+            if _raw_cfg:
+                _exec_cfg = json.loads(_raw_cfg) if isinstance(_raw_cfg, str) else (_raw_cfg or {})
+        except Exception:  # noqa: BLE001
+            pass
+        _isolation = (_exec_cfg or {}).get("isolation", "")
+        if _isolation == "worktree":
+            _suggest_worktree = True
+        else:
+            conflicts = await _sprint_item_file_claim_conflicts(
+                db,
+                args["project_id"],
+                args["item_id"],
+                exclude_session_id=args.get("session_id"),
+            )
+            if conflicts:
+                return {
+                    "error": "CONFLICT",
+                    "message": "Cannot claim sprint item: active session has overlapping claimed files.",
+                    "conflicts": conflicts,
+                }
+
         item = await db_module.claim_sprint_item(db, args["project_id"], args["item_id"])
         if item is None:
             raise ValueError("sprint item not found")
+
+        if _suggest_worktree:
+            item_id_short = item["id"][:8]
+            repo_path = ""
+            _repo_paths = _exec_cfg.get("repo_paths")
+            if _repo_paths and isinstance(_repo_paths, list) and _repo_paths:
+                _first = _repo_paths[0]
+                repo_path = (_first.get("cwd") or "") if isinstance(_first, dict) else str(_first)
+            if not repo_path:
+                repo_path = _exec_cfg.get("repo_path") or ""
+            repo_name = os.path.basename(repo_path.rstrip("/\\")) if repo_path else "repo"
+            wt_branch = f"worktree/{item_id_short}"
+            wt_path = f"../{repo_name}-worktree-{item_id_short}"
+            item = dict(item)
+            item.update({
+                "worktree_suggested": True,
+                "worktree_branch": wt_branch,
+                "worktree_path": wt_path,
+                "worktree_setup_cmd": f"git worktree add {wt_path} -b {wt_branch}",
+                "worktree_cleanup_cmd": f"git worktree remove {wt_path} --force",
+                "worktree_merge_cmd": (
+                    f"git checkout dev && git merge {wt_branch} --no-edit "
+                    f"&& git branch -d {wt_branch}"
+                ),
+            })
+
         return item
     if name == "add_subtask":
         return await db_module.add_subtask(

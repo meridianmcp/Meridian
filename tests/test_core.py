@@ -8448,3 +8448,136 @@ def test_oauth_device_table_in_create_tables():
     """CREATE_TABLES must define device_codes table for RFC 8628 persistence."""
     from meridian.db import CREATE_TABLES
     assert "device_codes" in CREATE_TABLES, "CREATE_TABLES missing 'device_codes'"
+
+
+# ---------------------------------------------------------------------------
+# Git worktree isolation (sprint item 24855305)
+# ---------------------------------------------------------------------------
+
+
+def test_active_worktrees_table_in_create_tables():
+    """CREATE_TABLES must define active_worktrees table."""
+    from meridian.db import CREATE_TABLES
+    assert "active_worktrees" in CREATE_TABLES, "CREATE_TABLES missing 'active_worktrees'"
+
+
+@pytest.mark.asyncio
+async def test_register_and_remove_worktree(db):
+    """register_worktree inserts a row; remove_worktree marks it removed."""
+    p = await db_module.create_project(db, "worktree-db-test")
+    session = await db_module.register_session(db, p["id"], "wt-session")
+
+    wt = await db_module.register_worktree(
+        db, session["id"], p["id"], "worktree/abc12345", "../repo-worktree-abc12345",
+        item_id="fake-item-id",
+    )
+    assert wt["branch"] == "worktree/abc12345"
+    assert wt["path"] == "../repo-worktree-abc12345"
+    assert wt["removed_at"] is None
+
+    active = await db_module.list_active_worktrees(db, p["id"])
+    assert len(active) == 1
+    assert active[0]["id"] == wt["id"]
+
+    removed = await db_module.remove_worktree(db, wt["id"])
+    assert removed is True
+
+    active_after = await db_module.list_active_worktrees(db, p["id"])
+    assert len(active_after) == 0
+
+
+@pytest.mark.asyncio
+async def test_claim_sprint_item_returns_worktree_fields_when_isolation_set(db):
+    """claim_sprint_item adds worktree_suggested fields when executor isolation=worktree."""
+    import json as _json
+    import meridian.server as srv
+
+    p = await db_module.create_project(db, "wt-isolation-test")
+    # Store executor_config with isolation=worktree and a repo_path
+    await db_module.set_executor_config(db, p["id"], {
+        "repo_path": "/home/user/myrepo",
+        "isolation": "worktree",
+    })
+    item = await db_module.add_sprint_item(db, p["id"], "v1", "Feature work")
+
+    result = await srv._dispatch_mcp_tool(
+        "claim_sprint_item",
+        {"project_id": p["id"], "item_id": item["id"]},
+        db, "/tmp",
+    )
+
+    assert result.get("error") is None
+    assert result["worktree_suggested"] is True
+    assert result["worktree_branch"].startswith("worktree/")
+    assert "myrepo" in result["worktree_path"]
+    assert "git worktree add" in result["worktree_setup_cmd"]
+    assert "git worktree remove" in result["worktree_cleanup_cmd"]
+    assert "git merge" in result["worktree_merge_cmd"]
+
+
+@pytest.mark.asyncio
+async def test_claim_sprint_item_worktree_isolation_bypasses_file_conflict(db):
+    """When isolation=worktree, claim succeeds even when touches_files overlap active locks."""
+    import json as _json
+    import meridian.server as srv
+
+    p = await db_module.create_project(db, "wt-bypass-conflict")
+    await db_module.set_executor_config(db, p["id"], {"isolation": "worktree"})
+    item = await db_module.add_sprint_item(db, p["id"], "v1", "Edit server")
+    await db.execute(
+        "UPDATE sprint_items SET touches_files = ? WHERE id = ?",
+        (_json.dumps(["meridian/server.py"]), item["id"]),
+    )
+    await db.commit()
+    other_session = await db_module.register_session(db, p["id"], "other-worker")
+    await db_module.claim_file(db, "meridian/server.py", other_session["id"])
+
+    result = await srv._dispatch_mcp_tool(
+        "claim_sprint_item",
+        {"project_id": p["id"], "item_id": item["id"]},
+        db, "/tmp",
+    )
+    # Should succeed (not CONFLICT) because isolation=worktree bypasses the check
+    assert result.get("error") != "CONFLICT"
+    assert result["worktree_suggested"] is True
+
+
+def test_worktrees_http_endpoints(client):
+    """GET/POST/DELETE /projects/{id}/worktrees round-trip."""
+    # Create project + session
+    proj = client.post("/projects", json={"name": "wt-http-test"}).json()
+    pid = proj["id"]
+    sess = client.post(f"/projects/{pid}/start-session", json={"session_name": "wt-test-sess"}).json()
+    sid = sess["session_id"]
+
+    # List — initially empty
+    r = client.get(f"/projects/{pid}/worktrees")
+    assert r.status_code == 200
+    assert r.json() == []
+
+    # Register a worktree
+    r2 = client.post(f"/projects/{pid}/worktrees", json={
+        "session_id": sid,
+        "branch": "worktree/abc12345",
+        "path": "../myrepo-worktree-abc12345",
+    })
+    assert r2.status_code == 201
+    wt = r2.json()
+    assert wt["branch"] == "worktree/abc12345"
+    assert wt["session_id"] == sid
+
+    # List — now has one
+    listed = client.get(f"/projects/{pid}/worktrees").json()
+    assert len(listed) == 1
+    assert listed[0]["id"] == wt["id"]
+
+    # Delete
+    r3 = client.delete(f"/projects/{pid}/worktrees/{wt['id']}")
+    assert r3.status_code == 204
+
+    # List — empty again
+    assert client.get(f"/projects/{pid}/worktrees").json() == []
+
+    # Delete again — 404
+    r4 = client.delete(f"/projects/{pid}/worktrees/{wt['id']}")
+    assert r4.status_code == 404

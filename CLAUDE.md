@@ -75,6 +75,21 @@ High-contention files are always sequential:
 
 Sprint items can carry `touches_files` so handoffs and dashboards can warn when planned work overlaps with a live session.
 
+### Worktree isolation (parallel safe)
+
+When `claim_sprint_item()` returns `worktree_suggested: true`, use the provided commands to isolate your work:
+
+```
+1. git worktree add {worktree_path} -b {worktree_branch}    # from worktree_setup_cmd
+2. POST /projects/{id}/worktrees  {"session_id":..., "branch":..., "path":..., "item_id":...}
+3. cd {worktree_path} — do ALL work here (copy .env from parent dir)
+4. When done: git checkout dev && git merge {worktree_branch} --no-edit
+5. DELETE /projects/{id}/worktrees/{worktree_id}
+6. git worktree remove {worktree_path} --force && git branch -d {worktree_branch}
+```
+
+Enable worktree mode project-wide via `set_executor_config(isolation="worktree")`.
+
 ---
 
 ## The 5 tools you use 90% of the time
@@ -135,7 +150,7 @@ your project context on start and snapshots progress on end.
 
 ---
 <!-- MERIDIAN STATE — auto-generated, do not edit below -->
-## Current Sprint State  _(auto-updated 2026-06-13 00:11 UTC)_
+## Current Sprint State  _(auto-updated 2026-06-13 00:41 UTC)_
 
 **Key Files:**
 - `meridian/server.py` — FastAPI app + MCP handlers
