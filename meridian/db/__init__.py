@@ -665,6 +665,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_github_to_projects(db)
     await _migrate_touches_files(db)
     await _migrate_active_worktrees(db)
+    await _migrate_workspace_tenant_isolation(db)
     return db
 
 
@@ -5199,19 +5200,33 @@ async def delete_project_note(
 # ---------------------------------------------------------------------------
 
 
+def _ws_tenant_clause(tenant_id: str | None) -> tuple[str, list[Any]]:
+    """Return an ``AND (...)`` scope fragment + params for tenant isolation.
+
+    When ``tenant_id`` is None (self-host / internal callers) returns ('', [])
+    so behaviour is unchanged. When provided, rows owned by that tenant *or*
+    pre-isolation rows (``tenant_id IS NULL``, only ever present on a dedicated
+    per-tenant DB) match — see ``_migrate_workspace_tenant_isolation``.
+    """
+    if tenant_id is None:
+        return "", []
+    return "(tenant_id = ? OR tenant_id IS NULL)", [tenant_id]
+
+
 async def add_workspace_note(
     db: aiosqlite.Connection,
     title: str,
     body: str,
     tags: str | None = None,
+    tenant_id: str | None = None,
 ) -> dict[str, Any]:
     """Insert a workspace_notes row. tags is comma-separated free-form.
     Workspace notes belong to the whole workspace, not a single project."""
     nid = _new_id()
     await db.execute(
-        "INSERT INTO workspace_notes (id, title, body, tags) "
-        "VALUES (?, ?, ?, ?)",
-        (nid, title, body, tags),
+        "INSERT INTO workspace_notes (id, title, body, tags, tenant_id) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (nid, title, body, tags, tenant_id),
     )
     await db.commit()
     async with db.execute(
@@ -5224,30 +5239,36 @@ async def add_workspace_note(
 async def get_workspace_notes(
     db: aiosqlite.Connection,
     tag: str | None = None,
+    tenant_id: str | None = None,
 ) -> list[dict[str, Any]]:
-    """Return workspace notes, newest first. Optional tag substring filter."""
+    """Return workspace notes, newest first. Optional tag substring filter.
+    Scoped to ``tenant_id`` when provided (hosted)."""
+    clauses: list[str] = []
+    params: list[Any] = []
     if tag:
-        async with db.execute(
-            "SELECT * FROM workspace_notes WHERE tags LIKE ? "
-            "ORDER BY created_at DESC",
-            (f"%{tag}%",),
-        ) as cur:
-            rows = await cur.fetchall()
-    else:
-        async with db.execute(
-            "SELECT * FROM workspace_notes ORDER BY created_at DESC",
-        ) as cur:
-            rows = await cur.fetchall()
+        clauses.append("tags LIKE ?")
+        params.append(f"%{tag}%")
+    scope, scope_params = _ws_tenant_clause(tenant_id)
+    if scope:
+        clauses.append(scope)
+        params.extend(scope_params)
+    where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+    async with db.execute(
+        f"SELECT * FROM workspace_notes{where} ORDER BY created_at DESC",
+        params or None,
+    ) as cur:
+        rows = await cur.fetchall()
     return [_row_to_dict(r) for r in rows if r is not None]  # type: ignore[misc]
 
 
 async def delete_workspace_note(
-    db: aiosqlite.Connection, note_id: str
+    db: aiosqlite.Connection, note_id: str, tenant_id: str | None = None
 ) -> bool:
-    """Hard-delete a workspace note. Returns True if a row was removed."""
-    async with db.execute(
-        "DELETE FROM workspace_notes WHERE id = ?", (note_id,)
-    ) as cur:
+    """Hard-delete a workspace note. Returns True if a row was removed.
+    Cannot delete another tenant's note when ``tenant_id`` is set."""
+    scope, scope_params = _ws_tenant_clause(tenant_id)
+    sql = "DELETE FROM workspace_notes WHERE id = ?" + (f" AND {scope}" if scope else "")
+    async with db.execute(sql, [note_id, *scope_params]) as cur:
         rc = cur.rowcount or 0
     await db.commit()
     return rc > 0
@@ -5259,8 +5280,11 @@ async def update_workspace_note(
     title: str | None = None,
     body: str | None = None,
     tags: str | None = None,
+    tenant_id: str | None = None,
 ) -> dict[str, Any] | None:
-    """Patch title/body/tags on an existing workspace note."""
+    """Patch title/body/tags on an existing workspace note (tenant-scoped)."""
+    scope, scope_params = _ws_tenant_clause(tenant_id)
+    scope_sql = f" AND {scope}" if scope else ""
     sets, params = [], []
     if title is not None:
         sets.append("title = ?"); params.append(title)
@@ -5269,13 +5293,21 @@ async def update_workspace_note(
     if tags is not None:
         sets.append("tags = ?"); params.append(tags)
     if not sets:
-        async with db.execute("SELECT * FROM workspace_notes WHERE id = ?", (note_id,)) as cur:
+        async with db.execute(
+            f"SELECT * FROM workspace_notes WHERE id = ?{scope_sql}",
+            [note_id, *scope_params],
+        ) as cur:
             row = await cur.fetchone()
         return _row_to_dict(row)
-    params.append(note_id)
-    await db.execute(f"UPDATE workspace_notes SET {', '.join(sets)} WHERE id = ?", params)
+    await db.execute(
+        f"UPDATE workspace_notes SET {', '.join(sets)} WHERE id = ?{scope_sql}",
+        [*params, note_id, *scope_params],
+    )
     await db.commit()
-    async with db.execute("SELECT * FROM workspace_notes WHERE id = ?", (note_id,)) as cur:
+    async with db.execute(
+        f"SELECT * FROM workspace_notes WHERE id = ?{scope_sql}",
+        [note_id, *scope_params],
+    ) as cur:
         row = await cur.fetchone()
     return _row_to_dict(row)
 
@@ -5285,14 +5317,15 @@ async def pin_workspace_decision(
     title: str,
     body: str,
     category: str = "TECHNICAL",
+    tenant_id: str | None = None,
 ) -> dict[str, Any]:
     """Create a workspace-level pinned decision. category is free-text
     (STRATEGIC, TECHNICAL, PRODUCT, ...)."""
     did = _new_id()
     await db.execute(
-        "INSERT INTO workspace_decisions (id, title, body, category) "
-        "VALUES (?, ?, ?, ?)",
-        (did, title, body, category),
+        "INSERT INTO workspace_decisions (id, title, body, category, tenant_id) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (did, title, body, category, tenant_id),
     )
     await db.commit()
     async with db.execute(
@@ -5305,27 +5338,35 @@ async def pin_workspace_decision(
 async def get_workspace_decisions(
     db: aiosqlite.Connection,
     include_superseded: bool = False,
+    tenant_id: str | None = None,
 ) -> list[dict[str, Any]]:
-    """Return workspace decisions, newest first. Active only by default."""
-    if include_superseded:
-        sql = "SELECT * FROM workspace_decisions ORDER BY created_at DESC"
-    else:
-        sql = (
-            "SELECT * FROM workspace_decisions WHERE status = 'active' "
-            "ORDER BY created_at DESC"
-        )
-    async with db.execute(sql) as cur:
+    """Return workspace decisions, newest first. Active only by default.
+    Scoped to ``tenant_id`` when provided (hosted)."""
+    clauses: list[str] = []
+    params: list[Any] = []
+    if not include_superseded:
+        clauses.append("status = 'active'")
+    scope, scope_params = _ws_tenant_clause(tenant_id)
+    if scope:
+        clauses.append(scope)
+        params.extend(scope_params)
+    where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+    async with db.execute(
+        f"SELECT * FROM workspace_decisions{where} ORDER BY created_at DESC",
+        params or None,
+    ) as cur:
         rows = await cur.fetchall()
     return [_row_to_dict(r) for r in rows if r is not None]  # type: ignore[misc]
 
 
 async def delete_workspace_decision(
-    db: aiosqlite.Connection, decision_id: str
+    db: aiosqlite.Connection, decision_id: str, tenant_id: str | None = None
 ) -> bool:
-    """Hard-delete a workspace decision. Returns True if a row was removed."""
-    async with db.execute(
-        "DELETE FROM workspace_decisions WHERE id = ?", (decision_id,)
-    ) as cur:
+    """Hard-delete a workspace decision. Returns True if a row was removed.
+    Cannot delete another tenant's decision when ``tenant_id`` is set."""
+    scope, scope_params = _ws_tenant_clause(tenant_id)
+    sql = "DELETE FROM workspace_decisions WHERE id = ?" + (f" AND {scope}" if scope else "")
+    async with db.execute(sql, [decision_id, *scope_params]) as cur:
         rc = cur.rowcount or 0
     await db.commit()
     return rc > 0
@@ -5334,19 +5375,42 @@ async def delete_workspace_decision(
 _WORKSPACE_SETTINGS_ID = "singleton"
 
 
-async def get_workspace_settings(db: aiosqlite.Connection) -> dict[str, Any]:
+def _ws_settings_key(tenant_id: str | None) -> str:
+    """Row key for the workspace_settings singleton.
+
+    Hosted callers key by their tenant_id so internal accounts that share the
+    control-plane DB get isolated settings; self-host keeps the legacy
+    'singleton' row.
+    """
+    return tenant_id or _WORKSPACE_SETTINGS_ID
+
+
+async def get_workspace_settings(
+    db: aiosqlite.Connection, tenant_id: str | None = None
+) -> dict[str, Any]:
     """Return the workspace-level settings (tenant-global defaults).
 
     Always returns a dict — defaults when no row has been written yet — so
-    callers never have to None-check. One singleton row per workspace DB.
+    callers never have to None-check. One row per tenant (or the legacy
+    'singleton' row in self-host).
     """
-    async with db.execute(
+    _cols = (
         "SELECT hitl_auto_answer_default, sprint_name_default, display_name, "
-        "log_task_sprint_nudge_threshold, updated_at "
-        "FROM workspace_settings WHERE id = ?",
-        (_WORKSPACE_SETTINGS_ID,),
+        "log_task_sprint_nudge_threshold, updated_at FROM workspace_settings"
+    )
+    async with db.execute(
+        f"{_cols} WHERE id = ?", (_ws_settings_key(tenant_id),)
     ) as cur:
         row = await cur.fetchone()
+    if row is None and tenant_id is None:
+        # Internal/self-host caller with no tenant context. On a dedicated
+        # per-tenant DB the sole settings row is keyed by that tenant's id, so
+        # fall back to it when there is exactly one row. The shared control-plane
+        # DB has many rows, so this safely no-ops there (returns defaults).
+        async with db.execute(f"{_cols} LIMIT 2") as cur:
+            some = await cur.fetchall()
+        if len(some) == 1:
+            row = some[0]
     data = _row_to_dict(row) or {}
     return {
         "hitl_auto_answer_default": bool(data.get("hitl_auto_answer_default")),
@@ -5366,17 +5430,19 @@ async def update_workspace_settings(
     sprint_name_default: str | None = None,
     display_name: str | None = None,
     log_task_sprint_nudge_threshold: int | None = None,
+    tenant_id: str | None = None,
 ) -> dict[str, Any]:
-    """Upsert the workspace settings singleton and return the new values.
+    """Upsert the per-tenant workspace settings row and return the new values.
 
     Only the fields passed (non-None) are changed. ``sprint_name_default=""``
     or ``display_name=""`` explicitly clears that label.
     """
-    # Ensure the singleton row exists before updating individual fields.
+    settings_key = _ws_settings_key(tenant_id)
+    # Ensure the row exists before updating individual fields.
     await db.execute(
-        "INSERT INTO workspace_settings (id) VALUES (?) "
+        "INSERT INTO workspace_settings (id, tenant_id) VALUES (?, ?) "
         "ON CONFLICT(id) DO NOTHING",
-        (_WORKSPACE_SETTINGS_ID,),
+        (settings_key, tenant_id),
     )
     updates: list[str] = []
     params: list[Any] = []
@@ -5397,13 +5463,13 @@ async def update_workspace_settings(
         now_ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
         updates.append("updated_at = ?")
         params.append(now_ts)
-        params.append(_WORKSPACE_SETTINGS_ID)
+        params.append(settings_key)
         await db.execute(
             f"UPDATE workspace_settings SET {', '.join(updates)} WHERE id = ?",
             tuple(params),
         )
     await db.commit()
-    return await get_workspace_settings(db)
+    return await get_workspace_settings(db, tenant_id=tenant_id)
 
 
 # ---------------------------------------------------------------------------

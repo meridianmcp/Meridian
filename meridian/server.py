@@ -4448,7 +4448,10 @@ async def workspace_remove_member(request: Request, member_id: str) -> None:
 async def workspace_list_notes(request: Request, tag: str | None = None) -> list[dict[str, Any]]:
     """List workspace-level notes, newest first."""
     db = await _db(request)
-    return await db_module.get_workspace_notes(db, tag=tag)
+    _t = await _get_tenant_from_request(request)
+    return await db_module.get_workspace_notes(
+        db, tag=tag, tenant_id=_t["id"] if _t else None
+    )
 
 
 @app.post("/workspace/notes", status_code=201)
@@ -4460,7 +4463,10 @@ async def workspace_add_note(request: Request) -> dict[str, Any]:
     content = (body.get("body") or "").strip()
     if not title or not content:
         raise HTTPException(status_code=422, detail="title and body are required")
-    return await db_module.add_workspace_note(db, title, content, body.get("tags"))
+    _t = await _get_tenant_from_request(request)
+    return await db_module.add_workspace_note(
+        db, title, content, body.get("tags"), tenant_id=_t["id"] if _t else None
+    )
 
 
 @app.patch("/workspace/notes/{note_id}")
@@ -4468,11 +4474,13 @@ async def workspace_update_note(request: Request, note_id: str) -> dict[str, Any
     """Patch title/body/tags on a workspace note."""
     db = await _db(request)
     body = await request.json()
+    _t = await _get_tenant_from_request(request)
     result = await db_module.update_workspace_note(
         db, note_id,
         title=body.get("title"),
         body=body.get("body"),
         tags=body.get("tags"),
+        tenant_id=_t["id"] if _t else None,
     )
     if result is None:
         raise HTTPException(status_code=404, detail="note not found")
@@ -4483,7 +4491,10 @@ async def workspace_update_note(request: Request, note_id: str) -> dict[str, Any
 async def workspace_delete_note(request: Request, note_id: str) -> None:
     """Delete a workspace note."""
     db = await _db(request)
-    deleted = await db_module.delete_workspace_note(db, note_id)
+    _t = await _get_tenant_from_request(request)
+    deleted = await db_module.delete_workspace_note(
+        db, note_id, tenant_id=_t["id"] if _t else None
+    )
     if not deleted:
         raise HTTPException(status_code=404, detail="note not found")
 
@@ -7012,6 +7023,9 @@ async def _dispatch_mcp_tool(
     tenant: dict[str, Any] | None = None,
 ) -> Any:
     """Route a tools/call to the appropriate db_module function."""
+    # Tenant scope for the workspace layer (notes/decisions/settings). None for
+    # self-host / unauthenticated; the db functions then skip isolation.
+    _mcp_tenant_id = tenant.get("id") if tenant else None
     if name == "create_project":
         existing = await db_module.get_project_by_name(db, args["name"])
         if existing is not None:
@@ -7241,25 +7255,31 @@ async def _dispatch_mcp_tool(
     if name == "add_workspace_note":
         return await db_module.add_workspace_note(
             db, args["title"], args["body"], args.get("tags"),
+            tenant_id=_mcp_tenant_id,
         )
     if name == "get_workspace_notes":
-        return await db_module.get_workspace_notes(db, tag=args.get("tag"))
+        return await db_module.get_workspace_notes(
+            db, tag=args.get("tag"), tenant_id=_mcp_tenant_id,
+        )
     if name == "pin_workspace_decision":
         return await db_module.pin_workspace_decision(
             db, args["title"], args["body"],
             category=args.get("category", "TECHNICAL"),
+            tenant_id=_mcp_tenant_id,
         )
     if name == "get_workspace_decisions":
         return await db_module.get_workspace_decisions(
             db, include_superseded=args.get("include_superseded", False),
+            tenant_id=_mcp_tenant_id,
         )
     if name == "get_workspace_settings":
-        return await db_module.get_workspace_settings(db)
+        return await db_module.get_workspace_settings(db, tenant_id=_mcp_tenant_id)
     if name == "update_workspace_settings":
         return await db_module.update_workspace_settings(
             db,
             hitl_auto_answer_default=args.get("hitl_auto_answer_default"),
             sprint_name_default=args.get("sprint_name_default"),
+            tenant_id=_mcp_tenant_id,
         )
     if name == "get_context_block":
         # v2.3 — assemble the same shape as /projects/{id}/context-block but
@@ -7290,8 +7310,8 @@ async def _dispatch_mcp_tool(
         )
         # v3.1 — workspace decisions + notes apply across all projects; surface
         # them at the very top so a fresh session sees org-wide truth first.
-        ws_decisions = await db_module.get_workspace_decisions(db)
-        ws_notes = await db_module.get_workspace_notes(db)
+        ws_decisions = await db_module.get_workspace_decisions(db, tenant_id=_mcp_tenant_id)
+        ws_notes = await db_module.get_workspace_notes(db, tenant_id=_mcp_tenant_id)
         ws_block = _render_workspace_block(ws_decisions, ws_notes)
         if ws_block:
             text = f"{ws_block}\n\n{text}"

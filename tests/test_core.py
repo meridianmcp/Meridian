@@ -3812,6 +3812,77 @@ async def test_workspace_settings_db_defaults(db):
     assert settings["sprint_name_default"] is None
 
 
+# ---------------------------------------------------------------------------
+# 637dd900 — workspace layer tenant isolation
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_workspace_notes_isolated_by_tenant(db):
+    """A note created by tenant A must not be returned for tenant B."""
+    await db_module.add_workspace_note(db, "A-secret", "for A only", tenant_id="tenant-a")
+    await db_module.add_workspace_note(db, "B-secret", "for B only", tenant_id="tenant-b")
+
+    a_titles = {n["title"] for n in await db_module.get_workspace_notes(db, tenant_id="tenant-a")}
+    b_titles = {n["title"] for n in await db_module.get_workspace_notes(db, tenant_id="tenant-b")}
+    assert a_titles == {"A-secret"}
+    assert b_titles == {"B-secret"}
+
+
+@pytest.mark.asyncio
+async def test_workspace_note_legacy_null_visible_to_tenant(db):
+    """Pre-isolation rows (tenant_id IS NULL) stay visible to a tenant — they
+    only ever exist on that tenant's own dedicated DB."""
+    await db_module.add_workspace_note(db, "legacy", "old note")  # tenant_id NULL
+    titles = {n["title"] for n in await db_module.get_workspace_notes(db, tenant_id="tenant-a")}
+    assert "legacy" in titles
+
+
+@pytest.mark.asyncio
+async def test_delete_workspace_note_respects_tenant(db):
+    """Tenant B cannot delete tenant A's note."""
+    note = await db_module.add_workspace_note(db, "A-note", "body", tenant_id="tenant-a")
+    # Wrong tenant: no-op delete.
+    assert await db_module.delete_workspace_note(db, note["id"], tenant_id="tenant-b") is False
+    assert await db_module.get_workspace_notes(db, tenant_id="tenant-a")
+    # Right tenant: deletes.
+    assert await db_module.delete_workspace_note(db, note["id"], tenant_id="tenant-a") is True
+    assert await db_module.get_workspace_notes(db, tenant_id="tenant-a") == []
+
+
+@pytest.mark.asyncio
+async def test_workspace_decisions_isolated_by_tenant(db):
+    """A decision pinned by tenant A must not be visible to tenant B."""
+    await db_module.pin_workspace_decision(db, "A-arch", "A body", tenant_id="tenant-a")
+    await db_module.pin_workspace_decision(db, "B-arch", "B body", tenant_id="tenant-b")
+    a = {d["title"] for d in await db_module.get_workspace_decisions(db, tenant_id="tenant-a")}
+    assert a == {"A-arch"}
+
+
+@pytest.mark.asyncio
+async def test_workspace_settings_isolated_by_tenant(db):
+    """Settings written under tenant A are not seen by tenant B."""
+    await db_module.update_workspace_settings(
+        db, sprint_name_default="a-sprint", tenant_id="tenant-a"
+    )
+    a = await db_module.get_workspace_settings(db, tenant_id="tenant-a")
+    b = await db_module.get_workspace_settings(db, tenant_id="tenant-b")
+    assert a["sprint_name_default"] == "a-sprint"
+    assert b["sprint_name_default"] is None
+
+
+@pytest.mark.asyncio
+async def test_workspace_settings_single_row_fallback(db):
+    """A tenant-less read on a single-tenant DB falls back to the only row, so
+    internal callers (nudge, handoff) keep seeing the tenant's settings."""
+    await db_module.update_workspace_settings(
+        db, sprint_name_default="solo", tenant_id="tenant-a"
+    )
+    # No tenant_id passed (internal caller) — single-row fallback applies.
+    s = await db_module.get_workspace_settings(db)
+    assert s["sprint_name_default"] == "solo"
+
+
 def test_build_goal_xml_omits_decisions_when_empty():
     """No <decisions> tag when there's nothing to show — worker
     sessions in v1.2.0 will pass decisions=None for the same reason."""

@@ -7,10 +7,17 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import Response
 
-from .._deps import _db
+from .._deps import _db, _get_tenant_from_request
 from .. import db as db_module
 
 router = APIRouter()
+
+
+async def _tenant_id(request: Request) -> str | None:
+    """Resolve the current tenant id for workspace isolation, or None
+    (self-host / demo / unauthenticated)."""
+    tenant = await _get_tenant_from_request(request)
+    return tenant["id"] if tenant else None
 
 
 # --- Workspace notes -------------------------------------------------------
@@ -20,7 +27,9 @@ async def list_workspace_notes_endpoint(
     request: Request, tag: str | None = None
 ) -> list[dict[str, Any]]:
     """Workspace notes (newest first). ``?tag=X`` filters by substring match."""
-    return await db_module.get_workspace_notes(await _db(request), tag=tag)
+    return await db_module.get_workspace_notes(
+        await _db(request), tag=tag, tenant_id=await _tenant_id(request)
+    )
 
 
 @router.post("/workspace/notes", status_code=201)
@@ -34,6 +43,7 @@ async def create_workspace_note_endpoint(
         raise HTTPException(status_code=400, detail="title and body required")
     return await db_module.add_workspace_note(
         await _db(request), title, text, body.get("tags"),
+        tenant_id=await _tenant_id(request),
     )
 
 
@@ -42,7 +52,9 @@ async def delete_workspace_note_endpoint(
     note_id: str, request: Request
 ) -> Response:
     """Hard-delete a workspace note. Returns 204 or 404."""
-    ok = await db_module.delete_workspace_note(await _db(request), note_id)
+    ok = await db_module.delete_workspace_note(
+        await _db(request), note_id, tenant_id=await _tenant_id(request)
+    )
     if not ok:
         raise HTTPException(status_code=404, detail="note not found")
     return Response(status_code=204)
@@ -57,7 +69,8 @@ async def list_workspace_decisions_endpoint(
     """Active workspace decisions (newest first). ``?include_superseded=true``
     returns full history."""
     return await db_module.get_workspace_decisions(
-        await _db(request), include_superseded=include_superseded
+        await _db(request), include_superseded=include_superseded,
+        tenant_id=await _tenant_id(request),
     )
 
 
@@ -73,6 +86,7 @@ async def create_workspace_decision_endpoint(
         raise HTTPException(status_code=400, detail="title and body required")
     return await db_module.pin_workspace_decision(
         await _db(request), title, text, category,
+        tenant_id=await _tenant_id(request),
     )
 
 
@@ -81,7 +95,9 @@ async def delete_workspace_decision_endpoint(
     decision_id: str, request: Request
 ) -> Response:
     """Hard-delete a workspace decision. Returns 204 or 404."""
-    ok = await db_module.delete_workspace_decision(await _db(request), decision_id)
+    ok = await db_module.delete_workspace_decision(
+        await _db(request), decision_id, tenant_id=await _tenant_id(request)
+    )
     if not ok:
         raise HTTPException(status_code=404, detail="decision not found")
     return Response(status_code=204)
@@ -92,7 +108,9 @@ async def delete_workspace_decision_endpoint(
 @router.get("/workspace/settings")
 async def get_workspace_settings_endpoint(request: Request) -> dict[str, Any]:
     """Read the workspace-global default settings (singleton)."""
-    return await db_module.get_workspace_settings(await _db(request))
+    return await db_module.get_workspace_settings(
+        await _db(request), tenant_id=await _tenant_id(request)
+    )
 
 
 @router.patch("/workspace/settings")
@@ -107,4 +125,5 @@ async def update_workspace_settings_endpoint(
         sprint_name_default=body.get("sprint_name_default"),
         display_name=body.get("display_name"),
         log_task_sprint_nudge_threshold=int(nudge_thresh) if nudge_thresh is not None else None,
+        tenant_id=await _tenant_id(request),
     )
