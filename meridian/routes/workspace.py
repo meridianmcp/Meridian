@@ -125,5 +125,6 @@ async def update_workspace_settings_endpoint(
         sprint_name_default=body.get("sprint_name_default"),
         display_name=body.get("display_name"),
         log_task_sprint_nudge_threshold=int(nudge_thresh) if nudge_thresh is not None else None,
+        handoff_template=body.get("handoff_template"),
         tenant_id=await _tenant_id(request),
     )

@@ -7659,6 +7659,7 @@ async def _dispatch_mcp_tool(
             db,
             hitl_auto_answer_default=args.get("hitl_auto_answer_default"),
             sprint_name_default=args.get("sprint_name_default"),
+            handoff_template=args.get("handoff_template"),
             tenant_id=_mcp_tenant_id,
         )
     if name == "get_context_block":

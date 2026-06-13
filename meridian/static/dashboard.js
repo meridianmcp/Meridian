@@ -7939,6 +7939,8 @@ async function loadSettingsTab(projectId) {
 
     const nudgeIn = document.getElementById('ws-nudge-threshold');
 
+    const handoffTplIn = document.getElementById('ws-handoff-template');
+
     const saveBtn = document.getElementById('ws-settings-save');
 
     const saveStatus = document.getElementById('ws-settings-status');
@@ -7956,6 +7958,8 @@ async function loadSettingsTab(projectId) {
         if (displayIn) displayIn.value = s.display_name || '';
 
         if (nudgeIn) nudgeIn.value = s.log_task_sprint_nudge_threshold != null ? s.log_task_sprint_nudge_threshold : 5;
+
+        if (handoffTplIn) handoffTplIn.value = s.handoff_template || '';
 
       } catch (e) { /* defaults shown */ }
 
@@ -7982,6 +7986,8 @@ async function loadSettingsTab(projectId) {
             display_name: (displayIn && displayIn.value.trim()) || '',
 
             log_task_sprint_nudge_threshold: isNaN(nudgeVal) ? 5 : Math.max(0, nudgeVal),
+
+            handoff_template: (handoffTplIn && handoffTplIn.value.trim()) || '',
 
           }),
 
@@ -8228,6 +8234,11 @@ async function loadSettingsTab(projectId) {
       <label style="font-size:10px;color:var(--muted);display:block;margin-top:6px">log_task nudge threshold (0 = off)<br>
         <input id="ws-nudge-threshold" type="number" min="0" max="100" placeholder="5" style="width:80px;background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:3px 6px;margin-top:2px">
         <span style="display:block;font-size:9px;color:var(--muted);margin-top:2px">After this many inline log_task calls with no sprint items, show a nudge to file sprint items. Default: 5.</span>
+      </label>
+      <div style="font-size:10px;color:var(--text);margin:12px 0 4px">Handoff Format</div>
+      <label style="font-size:10px;color:var(--muted);display:block">Custom full-mode handoff template (leave blank for default)<br>
+        <textarea id="ws-handoff-template" rows="6" placeholder="# Handoff&#10;Sprint: {{sprint}}&#10;&#10;## Recent Tasks&#10;{{recent_tasks}}&#10;&#10;## Pending&#10;{{pending_items}}" style="width:100%;background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:6px 8px;margin-top:2px;resize:vertical"></textarea>
+        <span style="display:block;font-size:9px;color:var(--muted);margin-top:2px">Placeholders: {{sprint}}, {{recent_tasks}}, {{decisions}}, {{north_star}}, {{version_goal}}, {{pending_items}}, {{notes}}. Blank = default handoff.</span>
       </label>
       <div style="margin-top:8px;display:flex;gap:8px;align-items:center">
         <button id="ws-settings-save" class="primary" style="font-size:10px;padding:3px 10px">Save defaults</button>

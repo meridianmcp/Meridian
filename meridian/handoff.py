@@ -567,6 +567,80 @@ def _render_workspace_handoff_block(
     return "\n".join(lines).rstrip()
 
 
+def _render_custom_handoff(
+    template: str,
+    *,
+    sprint: str | None,
+    north_star: str | None,
+    version_goal: str | None,
+    recent_tasks: list[dict[str, Any]],
+    decisions: list[dict[str, Any]],
+    pending_items: list[dict[str, Any]],
+    notes: list[dict[str, Any]],
+) -> str:
+    """Render a user-supplied handoff template (workspace_settings.handoff_template).
+
+    Substitutes the documented ``{{placeholder}}`` tokens with plain-text
+    blocks. Uses literal string replacement (not Jinja2) so a malformed or
+    hostile template can never execute code or raise — unknown placeholders are
+    left untouched. Empty sources render as ``(none)``.
+    """
+    def _tasks_block() -> str:
+        if not recent_tasks:
+            return "(none)"
+        out = []
+        for t in recent_tasks[:10]:
+            status = (t.get("status") or "?").upper()
+            desc = (t.get("description") or "").strip().replace("\n", " ")
+            out.append(f"- [{status}] {desc[:160]}")
+        return "\n".join(out)
+
+    def _decisions_block() -> str:
+        active = [d for d in decisions if d.get("status", "active") == "active"]
+        if not active:
+            return "(none)"
+        out = []
+        for d in active[:10]:
+            cat = (d.get("category") or "").strip()
+            prefix = f"[{cat}] " if cat else ""
+            out.append(f"- {prefix}{d.get('title', '')} — {(d.get('body') or '')[:300]}")
+        return "\n".join(out)
+
+    def _pending_block() -> str:
+        if not pending_items:
+            return "(none)"
+        out = []
+        for it in pending_items[:30]:
+            out.append(f"- {it['id']} [{it.get('status', '?')}] {it.get('title', '')}")
+        return "\n".join(out)
+
+    def _notes_block() -> str:
+        if not notes:
+            return "(none)"
+        out = []
+        for n in notes[:10]:
+            tags = (n.get("tags") or "").strip()
+            suffix = f" ({tags})" if tags else ""
+            out.append(f"- {n.get('title', '')} — {(n.get('body') or '')[:300]}{suffix}")
+        return "\n".join(out)
+
+    replacements = {
+        "{{sprint}}": (sprint or "").strip() or "(none)",
+        "{{north_star}}": (north_star or "").strip() or "(none)",
+        "{{version_goal}}": (version_goal or "").strip() or "(none)",
+        "{{recent_tasks}}": _tasks_block(),
+        "{{decisions}}": _decisions_block(),
+        "{{pending_items}}": _pending_block(),
+        "{{notes}}": _notes_block(),
+    }
+    rendered = template
+    for token, value in replacements.items():
+        rendered = rendered.replace(token, value)
+    if not rendered.endswith("\n"):
+        rendered += "\n"
+    return rendered
+
+
 async def generate_handoff(
     db: aiosqlite.Connection,
     project_id: str,
@@ -690,25 +764,45 @@ async def generate_handoff(
             quick_start_goal=quick_start_goal,
         )
     else:
-        template = _env.get_template("handoff.md.j2")
-        content = template.render(
-            generated_at=generated_at,
-            project=project,
-            goal=goal,
-            sessions=sessions,
-            active_sessions=active_sessions,
-            archived_sessions=archived_sessions,
-            tasks=tasks,
-            l1_tasks=l1_tasks,
-            l2_tasks=l2_tasks,
-            session_names=session_names,
-            pinned_decisions=pinned_decisions,
-            strategic_notes=strategic_notes,
-            pending_sprint_items=pending_sprint_items,
-            decisions_log=decisions_log,
-            ai_summary=ai_summary,
-            quick_start_goal=quick_start_goal,
-        )
+        # v1.1 — per-user handoff template. When workspace_settings.handoff_template
+        # is set, render it instead of the default Jinja2 template. NULL/empty =
+        # default (no behavior change for existing users).
+        try:
+            ws_settings = await db_module.get_workspace_settings(db)
+        except Exception:  # noqa: BLE001 — column may be absent on older DBs
+            ws_settings = {}
+        custom_tpl = (ws_settings or {}).get("handoff_template")
+        if custom_tpl:
+            content = _render_custom_handoff(
+                custom_tpl,
+                sprint=goal.get("sprint"),
+                north_star=goal.get("north_star"),
+                version_goal=goal.get("content"),
+                recent_tasks=l1_tasks,
+                decisions=pinned_decisions,
+                pending_items=pending_sprint_items,
+                notes=strategic_notes,
+            )
+        else:
+            template = _env.get_template("handoff.md.j2")
+            content = template.render(
+                generated_at=generated_at,
+                project=project,
+                goal=goal,
+                sessions=sessions,
+                active_sessions=active_sessions,
+                archived_sessions=archived_sessions,
+                tasks=tasks,
+                l1_tasks=l1_tasks,
+                l2_tasks=l2_tasks,
+                session_names=session_names,
+                pinned_decisions=pinned_decisions,
+                strategic_notes=strategic_notes,
+                pending_sprint_items=pending_sprint_items,
+                decisions_log=decisions_log,
+                ai_summary=ai_summary,
+                quick_start_goal=quick_start_goal,
+            )
 
     ws_block = _render_workspace_handoff_block(
         workspace_decisions, workspace_notes

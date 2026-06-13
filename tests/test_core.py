@@ -208,6 +208,53 @@ async def test_handoff_generates_clean_markdown(db, tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_handoff_custom_template(db, tmp_path):
+    """v1.1 — workspace_settings.handoff_template overrides the default full-mode
+    template; NULL/empty reverts to the default (no behavior change)."""
+    p = await db_module.create_project(db, "alpha-custom-tpl")
+    await db_module.set_goal(db, p["id"], "ship v1.1 features")
+    s = await db_module.register_session(db, p["id"], "sess-tpl")
+    await db_module.log_task(db, s["id"], p["id"], "wired the template", "done")
+    item = await db_module.add_sprint_item(db, p["id"], "v1.1", "Custom handoff item")
+
+    # Default behavior first: no template set → standard L0/L1 handoff.
+    _, default_content = await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True
+    )
+    assert "MERIDIAN_CONTEXT" in default_content
+
+    # Set a custom template and confirm placeholders are substituted.
+    await db_module.update_workspace_settings(
+        db,
+        handoff_template=(
+            "# Custom Handoff\n"
+            "Goal: {{version_goal}}\n\n"
+            "## Tasks\n{{recent_tasks}}\n\n"
+            "## Pending\n{{pending_items}}\n"
+        ),
+    )
+    assert (await db_module.get_workspace_settings(db))["handoff_template"]
+    _, content = await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True
+    )
+    assert "# Custom Handoff" in content
+    assert "Goal: ship v1.1 features" in content
+    assert "wired the template" in content
+    assert item["id"] in content
+    # The default Jinja2 scaffolding must NOT appear when a custom template is used.
+    assert "MERIDIAN_CONTEXT" not in content
+    assert "## L0 — Core Context" not in content
+
+    # Empty string reverts to the server default.
+    await db_module.update_workspace_settings(db, handoff_template="")
+    assert (await db_module.get_workspace_settings(db))["handoff_template"] is None
+    _, reverted = await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True
+    )
+    assert "MERIDIAN_CONTEXT" in reverted
+
+
+@pytest.mark.asyncio
 async def test_handoff_lists_pending_sprint_items_in_dependency_order(db, tmp_path):
     p = await db_module.create_project(db, "alpha-queue")
     await db_module.set_goal(db, p["id"], "ship the queue")

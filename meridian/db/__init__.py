@@ -519,6 +519,7 @@ CREATE TABLE IF NOT EXISTS workspace_settings (
     sprint_name_default TEXT,
     display_name TEXT,
     log_task_sprint_nudge_threshold INTEGER NOT NULL DEFAULT 5,
+    handoff_template TEXT,
     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE TABLE IF NOT EXISTS feedback (
@@ -5454,7 +5455,8 @@ async def get_workspace_settings(
     """
     _cols = (
         "SELECT hitl_auto_answer_default, sprint_name_default, display_name, "
-        "log_task_sprint_nudge_threshold, updated_at FROM workspace_settings"
+        "log_task_sprint_nudge_threshold, handoff_template, updated_at "
+        "FROM workspace_settings"
     )
     async with db.execute(
         f"{_cols} WHERE id = ?", (_ws_settings_key(tenant_id),)
@@ -5477,6 +5479,7 @@ async def get_workspace_settings(
         "log_task_sprint_nudge_threshold": int(data["log_task_sprint_nudge_threshold"])
         if data.get("log_task_sprint_nudge_threshold") is not None
         else 5,
+        "handoff_template": data.get("handoff_template"),
         "updated_at": data.get("updated_at"),
     }
 
@@ -5488,6 +5491,7 @@ async def update_workspace_settings(
     sprint_name_default: str | None = None,
     display_name: str | None = None,
     log_task_sprint_nudge_threshold: int | None = None,
+    handoff_template: str | None = None,
     tenant_id: str | None = None,
 ) -> dict[str, Any]:
     """Upsert the per-tenant workspace settings row and return the new values.
@@ -5516,6 +5520,10 @@ async def update_workspace_settings(
     if log_task_sprint_nudge_threshold is not None:
         updates.append("log_task_sprint_nudge_threshold = ?")
         params.append(max(0, int(log_task_sprint_nudge_threshold)))
+    if handoff_template is not None:
+        updates.append("handoff_template = ?")
+        # Empty string clears the custom template (reverts to server default).
+        params.append(handoff_template.strip() or None)
     if updates:
         from datetime import datetime, timezone
         now_ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")

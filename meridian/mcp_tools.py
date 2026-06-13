@@ -243,10 +243,15 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
     {"name": "update_workspace_settings", "description":
         "Update workspace-global default settings. Pass only the fields you want to "
         "change. hitl_auto_answer_default (bool) seeds new projects' HITL auto-answer "
-        "behaviour; sprint_name_default (string) is the default sprint name.",
+        "behaviour; sprint_name_default (string) is the default sprint name; "
+        "handoff_template (string) overrides the default full-mode handoff with a "
+        "custom template — supports {{sprint}}, {{recent_tasks}}, {{decisions}}, "
+        "{{north_star}}, {{version_goal}}, {{pending_items}}, {{notes}} placeholders. "
+        "Pass an empty string to revert to the server default.",
      "inputSchema": {"type": "object", "properties": {
          "hitl_auto_answer_default": {"type": "boolean"},
-         "sprint_name_default": {"type": "string"}},
+         "sprint_name_default": {"type": "string"},
+         "handoff_template": {"type": "string"}},
          "required": []}},
     {"name": "get_session_brief", "description":
         "Read-only: Call this FIRST for project summaries or to see what a session did — "
