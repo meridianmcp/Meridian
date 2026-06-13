@@ -2866,9 +2866,15 @@ function buildTabBody(project) {
 
       <button class="vtab-btn" data-vtab="files" title="Files">📁</button>
 
+      <button class="vtab-btn" data-vtab="devlog" title="Dev Log">📓</button>
+
+      <button class="vtab-btn" data-vtab="timeline" title="Activity Timeline">📅</button>
+
       <button class="vtab-btn" data-vtab="rewind" title="Rewind — Last X days">↻</button>
 
       <button class="vtab-btn" data-vtab="queue" title="Work Queue">👷</button>
+
+      <button class="vtab-btn" data-vtab="team" title="Team — per-human activity">👥</button>
 
       <button class="vtab-btn" data-vtab="notes" title="Notes — per-project wiki" style="position:relative">📝<span class="notes-vtab-badge vtab-count-badge muted" data-pid="${project.id}" style="display:none;position:absolute;top:2px;right:2px;background:var(--surface-3,#2a2f3a);color:var(--muted);font-size:8px;font-weight:700;padding:0 3px;border-radius:6px;line-height:14px;pointer-events:none">0</span></button>
 
@@ -2877,16 +2883,6 @@ function buildTabBody(project) {
       <button class="vtab-btn" data-vtab="docs" title="MCP Tool Reference">📖</button>
 
       <button class="vtab-btn" data-vtab="settings" title="Notification Settings">⚙</button>
-
-      <!-- overflow: devlog, timeline, team hidden from strip; accessible via ⋯ -->
-
-      <button class="vtab-btn vtab-overflow-item" data-vtab="devlog" title="Dev Log" style="display:none">📓</button>
-
-      <button class="vtab-btn vtab-overflow-item" data-vtab="timeline" title="Activity Timeline" style="display:none">📅</button>
-
-      <button class="vtab-btn vtab-overflow-item" data-vtab="team" title="Team — per-human activity" style="display:none">👥</button>
-
-      <button class="vtab-btn vtab-more-btn" id="vtab-more-${project.id}" title="More tabs">⋯</button>
 
     </div>
 
@@ -3776,10 +3772,6 @@ function buildTabBody(project) {
 
         p.activeVtab = vtab;
 
-        // Mark ⋯ button active when an overflow vtab is selected
-        const moreBtnEl = vtabStrip.querySelector('.vtab-more-btn');
-        if (moreBtnEl) moreBtnEl.classList.toggle('active', ['devlog','timeline','team'].includes(vtab));
-
         try { localStorage.setItem('meridian_last_tab_' + project.id, vtab); } catch(_) {}
 
         if (vtab === 'files') loadFilesTab(project.id);
@@ -3831,39 +3823,6 @@ function buildTabBody(project) {
       };
 
     });
-
-    // ⋯ overflow button — floating dropdown for devlog, timeline, team
-    const moreBtn = document.getElementById(`vtab-more-${project.id}`);
-    if (moreBtn) {
-      moreBtn.onclick = (e) => {
-        e.stopPropagation();
-        const existingMenu = document.getElementById(`vtab-overflow-menu-${project.id}`);
-        if (existingMenu) { existingMenu.remove(); return; }
-        const menu = document.createElement('div');
-        menu.id = `vtab-overflow-menu-${project.id}`;
-        menu.style.cssText = 'position:absolute;bottom:0;left:44px;z-index:300;background:var(--surface-2);border:1px solid var(--border);border-radius:5px;padding:4px;display:flex;flex-direction:column;gap:2px;box-shadow:0 2px 10px rgba(0,0,0,0.35);min-width:130px';
-        [
-          { vtab: 'devlog',   icon: '📓', label: 'Dev Log' },
-          { vtab: 'timeline', icon: '📅', label: 'Timeline' },
-          { vtab: 'team',     icon: '👥', label: 'Team' },
-        ].forEach(({ vtab, icon, label }) => {
-          const opt = document.createElement('button');
-          opt.style.cssText = 'display:flex;align-items:center;gap:8px;padding:6px 10px;background:transparent;border:none;cursor:pointer;color:var(--text);font-size:12px;font-family:var(--font-mono);border-radius:4px;width:100%;text-align:left';
-          opt.innerHTML = `<span style="font-size:14px">${icon}</span>${label}`;
-          opt.onmouseenter = () => { opt.style.background = 'var(--surface-3,var(--surface-1))'; };
-          opt.onmouseleave = () => { opt.style.background = 'transparent'; };
-          opt.onclick = () => {
-            menu.remove();
-            const hiddenBtn = vtabStrip.querySelector(`.vtab-btn[data-vtab="${vtab}"]`);
-            if (hiddenBtn) hiddenBtn.click();
-          };
-          menu.appendChild(opt);
-        });
-        vtabStrip.appendChild(menu);
-        const closeMenu = (ev) => { if (!menu.contains(ev.target) && ev.target !== moreBtn) { menu.remove(); } document.removeEventListener('click', closeMenu); };
-        setTimeout(() => document.addEventListener('click', closeMenu), 0);
-      };
-    }
 
     // Restore last active vtab from localStorage
     try {
