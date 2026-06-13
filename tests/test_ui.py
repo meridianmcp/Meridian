@@ -16,6 +16,8 @@ from __future__ import annotations
 import pytest
 from bs4 import BeautifulSoup
 
+from dashboard_src import dashboard_source
+
 
 # ---------------------------------------------------------------------------
 # Shared fixtures
@@ -36,7 +38,10 @@ def soup(html):
 
 @pytest.fixture()
 def js(client):
-    return client.get("/static/dashboard.js").text
+    # dashboard.js was split into dashboard-*.js modules (v1.1 extraction).
+    # Use the raw concatenated source (not the esbuild bundle, which renames
+    # vars / escapes unicode) so string + structure assertions stay accurate.
+    return dashboard_source()
 
 
 @pytest.fixture()

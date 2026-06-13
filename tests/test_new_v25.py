@@ -1606,9 +1606,9 @@ async def test_delete_tenant_records_removes_rows():
 
 
 def test_dashboard_js_has_export_button():
-    """dashboard.js contains the export download link."""
-    from pathlib import Path
-    js = (Path(__file__).parent.parent / "meridian/static/dashboard.js").read_text(encoding="utf-8")
+    """dashboard frontend contains the export download link."""
+    from dashboard_src import dashboard_source
+    js = dashboard_source()
     assert "/export/my-data" in js
     assert "Delete my account" in js
 
@@ -1795,9 +1795,9 @@ def test_settings_usage_patch_404_self_hosted(client):
 
 
 def test_dashboard_js_has_usage_section():
-    """dashboard.js contains the usage progress bar section."""
-    from pathlib import Path
-    js = (Path(__file__).parent.parent / "meridian/static/dashboard.js").read_text(encoding="utf-8")
+    """dashboard frontend contains the usage progress bar section."""
+    from dashboard_src import dashboard_source
+    js = dashboard_source()
     assert "/settings/usage" in js
     assert "CU-hrs" in js
 
