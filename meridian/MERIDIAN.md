@@ -23,6 +23,10 @@ for "what has been decided, claimed, and shipped."
   to check for newly added items before moving to the next one. Sessions that only
   check pending items once at start miss anything added while running — re-checking
   at each item boundary picks up mid-run additions automatically.
+- **`update_md_section`** proposes a replacement for an anchored CLAUDE.md/AGENTS.md
+  section. Autonomous executor sessions leave it gated behind a dashboard HITL.
+  Human planning sessions (claude.ai) may pass **`force=true`** to skip the HITL and
+  apply the change directly — only use `force` when a human is driving the session.
 
 ## ON SESSION START
 

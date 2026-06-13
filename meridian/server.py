@@ -7728,6 +7728,19 @@ async def _dispatch_mcp_tool(
         content = args["content"]
         # Raises ValueError for non-replace anchors / unknown files / README.
         md_anchors_module.assert_replace_target(md_file, anchor)
+        # v1.1 — force=true: human planning sessions (claude.ai) skip the HITL
+        # round-trip and apply the section replacement directly. Executor sessions
+        # omit force (default False) so the diff stays human-gated as before.
+        if args.get("force") in (True, 1, "true", "1", "yes"):
+            try:
+                path = await md_anchors_module.apply_replace(md_file, anchor, content)
+            except md_anchors_module.AnchorError as exc:
+                return {"applied": False, "apply_error": str(exc)}
+            except Exception as exc:  # noqa: BLE001 — never crash the tool call
+                return {"applied": False, "apply_error": f"write failed: {exc}"}
+            if path is None:
+                return {"applied": False, "reason": "no-op-or-hosted"}
+            return {"applied": True, "forced": True, "file": md_file, "anchor": anchor}
         diff = md_anchors_module.build_diff(md_file, anchor, content)
         payload = json.dumps({
             "file": md_file,

@@ -408,13 +408,16 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "the dashboard, then Meridian replaces that section and stages the file "
         "for the next checkpoint commit. 'anchor' is the section name between the "
         "MERIDIAN:ANCHOR:START/END comments. (ROADMAP/DECISIONS/DEVLOG are "
-        "append-only and not replaceable.)",
+        "append-only and not replaceable.) Pass force=true from a human planning "
+        "session (claude.ai) to skip the HITL and apply the replacement directly; "
+        "autonomous executor sessions should omit force so the diff stays gated.",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"},
          "file": {"type": "string", "description": "CLAUDE.md | AGENTS.md"},
          "anchor": {"type": "string"},
          "content": {"type": "string", "description": "Full proposed body for the section."},
          "session_id": {"type": "string"},
+         "force": {"type": "boolean", "description": "Human planning sessions pass true to apply directly without HITL. Default false."},
          "urgency": {"type": "string", "enum": ["normal", "high", "blocking"]}},
          "required": ["project_id", "file", "anchor", "content"]}},
     {"name": "claim_sprint_item",
