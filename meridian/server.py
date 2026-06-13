@@ -7417,7 +7417,7 @@ async def _dispatch_mcp_tool(
                     data_dir,
                     mode=mode,
                     session_id=session_id,
-                    commit_messages=_gh_commits or None,
+                    commit_messages=_gh_commits or [],
                 ),
                 timeout=90.0,
             )
@@ -7475,7 +7475,7 @@ async def _dispatch_mcp_tool(
             _, content = await asyncio.wait_for(
                 handoff_module_local.generate_handoff(
                     db, project_id, data_dir, mode="delta", session_id=session_id,
-                    commit_messages=_commit_messages or None,
+                    commit_messages=_commit_messages or [],
                 ),
                 timeout=30.0,
             )
@@ -8472,7 +8472,71 @@ async def _oauth_auth(request: Request):
     except Exception:
         pass
     qs = _ue({"code": code, "state": p.get("state", "")})
+    # For localhost redirect URIs (remote Claude Code sessions), route through
+    # the hosted device-callback page so the browser can show the auth code
+    # rather than hitting a localhost URL that fails to load.
+    if _redirect_uri.startswith("http://localhost") and _hosted_mode():
+        from urllib.parse import quote as _qenc
+        _dc_qs = _ue({"code": code, "state": p.get("state", ""), "to": _redirect_uri})
+        _base = str(request.base_url).rstrip("/")
+        return _RR(f"{_base}/oauth/device-callback?{_dc_qs}")
     return _RR(f"{_redirect_uri}?{qs}")
+
+
+@app.get("/oauth/device-callback")
+async def _oauth_device_callback(request: Request):
+    """Show auth code on a success page; JS auto-redirects to the original
+    localhost callback so the MCP SDK completes the flow without user action
+    in local sessions. Remote sessions see the URL to paste."""
+    p = dict(request.query_params)
+    code = p.get("code", "")
+    state = p.get("state", "")
+    to = p.get("to", "")  # original localhost redirect_uri
+    callback_url = f"{to}?code={code}&state={state}" if to else ""
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Meridian — Authorized</title>
+<style>
+body{{font-family:system-ui,sans-serif;background:#0f0f0f;color:#e5e5e5;
+  display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}}
+.card{{background:#1a1a1a;border:1px solid #333;border-radius:12px;padding:2rem 2.5rem;
+  max-width:520px;width:90%;text-align:center}}
+h1{{color:#4ade80;margin:0 0 .5rem}}
+p{{color:#999;margin:.5rem 0}}
+.url{{background:#111;border:1px solid #444;border-radius:6px;padding:.75rem 1rem;
+  font-family:monospace;font-size:.8rem;word-break:break-all;text-align:left;
+  color:#e5e5e5;margin:1rem 0;cursor:pointer;user-select:all}}
+.copy-btn{{background:#4ade80;color:#000;border:none;border-radius:6px;
+  padding:.5rem 1.25rem;font-weight:600;cursor:pointer;font-size:.9rem}}
+.copy-btn:hover{{background:#22c55e}}
+.note{{font-size:.8rem;color:#666;margin-top:.75rem}}
+</style></head>
+<body><div class="card">
+<h1>&#10003; Authorized</h1>
+<p>Paste this URL into your terminal when prompted:</p>
+<div class="url" id="cburl" onclick="copyUrl()">{callback_url}</div>
+<button class="copy-btn" onclick="copyUrl()">Copy URL</button>
+<p class="note" id="note">In a local session this page will auto-close.</p>
+</div>
+<script>
+function copyUrl(){{
+  var u = document.getElementById('cburl').textContent;
+  navigator.clipboard && navigator.clipboard.writeText(u).then(function(){{
+    document.querySelector('.copy-btn').textContent = 'Copied!';
+  }});
+}}
+// Auto-redirect for local sessions — localhost server may be listening.
+var to = {_json.dumps(callback_url)};
+if (to) {{
+  fetch(to, {{mode:'no-cors'}}).then(function(){{
+    document.getElementById('note').textContent = 'Local session detected — you can close this tab.';
+  }}).catch(function(){{}});
+  // Hard redirect after short delay so the MCP SDK receives the code.
+  setTimeout(function(){{ window.location.href = to; }}, 800);
+}}
+</script></body></html>"""
+    from fastapi.responses import HTMLResponse as _HR
+    return _HR(html)
 
 
 @app.post("/oauth/token")

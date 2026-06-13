@@ -437,6 +437,7 @@ CREATE TABLE IF NOT EXISTS projects (
     icon TEXT,
     github_repo TEXT,
     github_branch TEXT,
+    queued_session TEXT,
     created_at TEXT NOT NULL DEFAULT ({_TS})
 );
 
@@ -883,6 +884,7 @@ async def init_pg_db(url: str) -> PostgresConnection:
     await _migrate_pg_api_token_expires_at(conn)
     await _migrate_pg_oauth_codes(conn)
     await _migrate_pg_github_to_projects(conn)
+    await _migrate_pg_queued_session(conn)
     return conn
 
 
@@ -937,6 +939,13 @@ async def _migrate_pg_github_to_projects(conn: PostgresConnection) -> None:
     await conn.executescript(
         "ALTER TABLE projects ADD COLUMN IF NOT EXISTS github_repo TEXT;"
         "ALTER TABLE projects ADD COLUMN IF NOT EXISTS github_branch TEXT"
+    )
+
+
+async def _migrate_pg_queued_session(conn: PostgresConnection) -> None:
+    """10e6b265 — projects.queued_session for back-to-back /goal runs."""
+    await conn.executescript(
+        "ALTER TABLE projects ADD COLUMN IF NOT EXISTS queued_session TEXT"
     )
 
 

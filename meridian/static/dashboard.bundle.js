@@ -1115,16 +1115,18 @@
 
   // meridian/static/dashboard-sprint.js
   function _renderPlanBadge2(me) {
-    const planColors = { free: "#6b7280", trial: "#059669", standard: "#2563eb", pro: "#7c3aed" };
+    const planColors = { free: "#3b82f6", trial: "#059669", standard: "#3b82f6", pro: "#7c3aed", admin: "#9ca3af" };
     const planLabels = _PLAN_LABELS;
-    const plan = me.is_admin ? "admin" : me.plan || "free";
+    const plan = me.is_internal || me.is_admin ? "admin" : me.plan || "free";
     const verEl = document.getElementById("server-version");
     if (verEl && !document.getElementById("plan-badge")) {
       const badge = document.createElement("span");
       badge.id = "plan-badge";
+      const badgeColor = planColors[plan] || "#9ca3af";
+      const badgeLabel = plan === "free" && me.days_remaining != null ? `Free \xB7 ${me.days_remaining}d left` : planLabels[plan] || plan;
       badge.title = `${planLabels[plan] || plan} plan`;
-      badge.style = `margin-left:6px;padding:2px 7px;border-radius:10px;font-size:10px;font-weight:700;letter-spacing:0.04em;background:${planColors[plan] || "#6b7280"}22;color:${planColors[plan] || "#6b7280"};border:1px solid ${planColors[plan] || "#6b7280"}44;vertical-align:middle;text-transform:uppercase`;
-      badge.textContent = planLabels[plan] || plan;
+      badge.style = `margin-left:6px;padding:2px 7px;border-radius:10px;font-size:10px;font-weight:700;letter-spacing:0.04em;background:${badgeColor}22;color:${badgeColor};border:1px solid ${badgeColor}44;vertical-align:middle`;
+      badge.textContent = badgeLabel;
       verEl.parentNode.insertBefore(badge, verEl.nextSibling);
     }
     const noUpgrade = plan === "admin" || !!me.is_internal;
@@ -1141,40 +1143,33 @@
         planBadge.parentNode.insertBefore(link, planBadge.nextSibling);
       }
     }
-    if (plan === "free" && !noUpgrade && !me.expired && !isDemoMode() && !document.getElementById("upgrade-banner")) {
+    if (plan === "free" && !me.is_internal && !me.expired && !isDemoMode() && !document.getElementById("trial-banner") && !sessionStorage.getItem("trial-banner-dismissed")) {
+      const daysLeft = me.days_remaining != null ? me.days_remaining : 30;
+      const elapsed = Math.max(0, 30 - daysLeft);
+      const bannerBg = elapsed >= 28 ? "#dc2626" : elapsed >= 25 ? "#d97706" : "#ca8a04";
       const upgradeUrl = state.serverConfig?.stripe_payment_link || "/pricing";
-      const b = document.createElement("div");
-      b.id = "upgrade-banner";
-      b.style = "position:fixed;top:0;left:0;right:0;z-index:9996;background:#2563eb;color:#fff;text-align:center;padding:5px 12px;font-size:12px;font-family:inherit;letter-spacing:0.02em;display:flex;align-items:center;justify-content:center;gap:10px";
-      b.innerHTML = `<span>Upgrade to Standard \u2014 4\xD7 faster, dedicated DB</span><a href="${escapeHtml(upgradeUrl)}" style="background:#fff;color:#2563eb;font-weight:700;text-decoration:none;padding:2px 10px;border-radius:4px;white-space:nowrap">$20/mo \u2192</a><button onclick="sessionStorage.setItem('upgrade-banner-dismissed','1');this.closest('#upgrade-banner').remove();document.body.style.paddingTop=Math.max(0,parseInt(document.body.style.paddingTop||'0',10)-28)+'px'" style="background:none;border:none;color:rgba(255,255,255,0.7);font-size:16px;cursor:pointer;padding:0 0 0 6px;line-height:1" title="Dismiss">\xD7</button>`;
-      if (!sessionStorage.getItem("upgrade-banner-dismissed")) {
-        document.body.prepend(b);
-        document.body.style.paddingTop = parseInt(document.body.style.paddingTop || "0", 10) + 28 + "px";
-      }
-    }
-    const days = me.days_remaining;
-    const isFreeOrTrial = plan === "free" || plan === "trial";
-    if (isFreeOrTrial && days !== null && days !== void 0 && days > 0 && !document.getElementById("trial-banner")) {
+      const daysStr = me.days_remaining != null ? `${me.days_remaining} day${me.days_remaining !== 1 ? "s" : ""}` : "limited time";
       const b = document.createElement("div");
       b.id = "trial-banner";
-      const label = _PLAN_LABELS[plan] || plan;
-      const daysLeft = Math.max(0, days);
-      b.style = `position:fixed;top:0;left:0;right:0;z-index:9997;background:linear-gradient(90deg,#059669,#059669);color:#fff;text-align:center;padding:5px 12px;font-size:12px;font-family:inherit;letter-spacing:0.02em`;
-      b.innerHTML = `${label}: <strong>${daysLeft} day${daysLeft !== 1 ? "s" : ""}</strong> remaining. <a href="/pricing" style="color:#fff;text-decoration:underline;font-weight:600">4\xD7 faster with Standard \u2192</a>`;
+      b.style = `position:fixed;top:0;left:0;right:0;z-index:9997;background:${bannerBg};color:#fff;text-align:center;padding:5px 12px;font-size:12px;font-family:inherit;letter-spacing:0.02em;display:flex;align-items:center;justify-content:center;gap:10px`;
+      b.innerHTML = `<span>Free trial \xB7 <strong>${daysStr} remaining</strong></span><a href="${escapeHtml(upgradeUrl)}" style="color:#fff;text-decoration:underline;font-weight:600;white-space:nowrap">Upgrade to Standard \u2192</a><button onclick="sessionStorage.setItem('trial-banner-dismissed','1');this.closest('#trial-banner').remove();document.body.style.paddingTop=Math.max(0,parseInt(document.body.style.paddingTop||'0',10)-28)+'px'" style="background:none;border:none;color:rgba(255,255,255,0.7);font-size:16px;cursor:pointer;padding:0 0 0 6px;line-height:1" title="Dismiss for this session">\xD7</button>`;
       document.body.prepend(b);
       document.body.style.paddingTop = parseInt(document.body.style.paddingTop || "0", 10) + 28 + "px";
     }
-    const isExpiring = isFreeOrTrial && days !== null && days !== void 0 && days <= 25;
-    if (isExpiring && !document.getElementById("expiry-banner")) {
-      const b = document.createElement("div");
-      b.id = "expiry-banner";
-      const urgent = days <= 5;
-      const label = _PLAN_LABELS[plan] || plan;
-      const upgradeMsg = plan === "trial" ? "Add a card to keep your data \u2192" : "Upgrade \u2192";
-      b.style = `position:fixed;top:0;left:0;right:0;z-index:9998;background:${urgent ? "#dc2626" : "#d97706"};color:#fff;text-align:center;padding:5px 12px;font-size:12px;font-family:inherit;letter-spacing:0.02em`;
-      b.innerHTML = `${label} expires in <strong>${days} day${days !== 1 ? "s" : ""}</strong>. <a href="/pricing" style="color:#fff;text-decoration:underline">${upgradeMsg}</a>`;
-      document.body.prepend(b);
-      document.body.style.paddingTop = parseInt(document.body.style.paddingTop || "0", 10) + 28 + "px";
+    if (isHostedMode() && !isHostedAdmin()) {
+      const hostedLabel = document.querySelector(".hosted-label");
+      if (hostedLabel && !hostedLabel.dataset.planUpdated) {
+        hostedLabel.dataset.planUpdated = "1";
+        hostedLabel.textContent = "Hosted (shared pool)";
+        if (plan === "free" && !me.is_internal && !document.getElementById("db-upgrade-link")) {
+          const upgradeLink = document.createElement("a");
+          upgradeLink.id = "db-upgrade-link";
+          upgradeLink.href = "/pricing";
+          upgradeLink.textContent = "Upgrade for dedicated DB \u2192";
+          upgradeLink.style.cssText = "display:block;margin-top:3px;font-size:9px;color:var(--accent);text-decoration:none;opacity:.85;font-family:var(--font-mono);letter-spacing:.02em";
+          hostedLabel.insertAdjacentElement("afterend", upgradeLink);
+        }
+      }
     }
     if (me.expired && !document.getElementById("expired-banner")) {
       const b = document.createElement("div");
@@ -3516,11 +3511,16 @@ Current: ${current || "(none)"}`,
 
           </span>
 
-          <button class="secondary" id="queue-refresh-${project.id}" style="padding:2px 8px;font-size:10px">refresh</button>
+          <span style="display:flex;gap:6px;align-items:center">
+            <button class="secondary" id="queue-reconcile-${project.id}" style="padding:2px 8px;font-size:10px" title="Check if any pending items may already be done based on recent commits">reconcile</button>
+            <button class="secondary" id="queue-refresh-${project.id}" style="padding:2px 8px;font-size:10px">refresh</button>
+          </span>
 
         </div>
 
         <div id="live-session-${project.id}" style="display:none;flex-shrink:0;border-bottom:1px solid var(--border);background:var(--surface-2);padding:8px 14px 10px"></div>
+
+        <div id="reconcile-results-${project.id}" style="display:none;flex-shrink:0;border-bottom:1px solid var(--border);background:var(--surface-2);padding:8px 14px 10px;font-family:var(--font-mono);font-size:11px"></div>
 
         <div style="padding:8px 14px 0;flex-shrink:0">
 
@@ -4331,10 +4331,12 @@ Current: ${current || "(none)"}`,
       const sessionsPath = `/projects/${projectId}/sessions?active_only=false`;
       const tasksPath = `/projects/${projectId}/tasks?limit=200`;
       const sprintItemsPath = `/projects/${projectId}/sprint-items`;
-      const [sessionsResult, tasksResult, sprintItemsResult] = await Promise.allSettled([
+      const worktreesPath = `/projects/${projectId}/worktrees`;
+      const [sessionsResult, tasksResult, sprintItemsResult, worktreesResult] = await Promise.allSettled([
         projectApi(projectId, sessionsPath),
         projectApi(projectId, tasksPath),
-        projectApi(projectId, sprintItemsPath)
+        projectApi(projectId, sprintItemsPath),
+        projectApi(projectId, worktreesPath)
       ]);
       if (sprintItemsResult.status === "fulfilled") {
         renderSprintProgress(projectId, sprintItemsResult.value || []);
@@ -4346,7 +4348,8 @@ Current: ${current || "(none)"}`,
         }
       }
       if (sessionsResult.status === "fulfilled" && tasksResult.status === "fulfilled") {
-        renderLiveSessions(projectId, sessionsResult.value || [], tasksResult.value || []);
+        const worktrees = worktreesResult.status === "fulfilled" ? worktreesResult.value || [] : [];
+        renderLiveSessions(projectId, sessionsResult.value || [], tasksResult.value || [], worktrees);
         cacheMostRecentSession(projectId, sessionsResult.value || []);
       } else {
         const sessionsRoot = document.getElementById(`live-sessions-${projectId}`);
@@ -4524,9 +4527,14 @@ Current: ${current || "(none)"}`,
     const top = sorted.find((s) => isLiveSession(s)) || sorted.find((s) => s.status !== "closed") || sorted[0];
     if (top) panel.liveLastSessionId = top.id;
   }
-  function renderLiveSessions(projectId, sessions, tasks) {
+  function renderLiveSessions(projectId, sessions, tasks, worktrees) {
     const root = document.getElementById(`live-sessions-${projectId}`);
     if (!root) return;
+    const worktreeMap = /* @__PURE__ */ new Map();
+    (worktrees || []).forEach((wt) => {
+      if (!worktreeMap.has(wt.session_id)) worktreeMap.set(wt.session_id, []);
+      worktreeMap.get(wt.session_id).push(wt.branch);
+    });
     const claimMap = /* @__PURE__ */ new Map();
     const taskMap = /* @__PURE__ */ new Map();
     tasks.forEach((t) => {
@@ -4565,6 +4573,10 @@ Current: ${current || "(none)"}`,
       const summaryRow = summary && summary.summary && (s.status === "closed" || s.status === "archived") ? `<div class="live-session-outcome" style="font-size:10px;color:var(--muted);margin-top:3px;padding-left:18px">\u2713 ${escapeHtml((summary.summary || "").slice(0, 160))}` + (summary.tasks_completed != null ? ` \xB7 ${summary.tasks_completed} tasks` : "") + `</div>` : "";
       const fw = s.agent_framework || "claude_code";
       const fwBadge = fw && fw !== "claude_code" ? `<span class="framework-badge" title="framework: ${escapeHtml(fw)}" style="display:inline-block;background:var(--surface-2);color:var(--accent);font-size:9px;font-weight:600;padding:1px 5px;border-radius:3px;margin-left:4px">${escapeHtml(fw)}</span>` : "";
+      const sessionWorktrees = worktreeMap.get(s.id) || [];
+      const worktreeBadges = sessionWorktrees.map(
+        (branch) => `<span class="worktree-badge" title="active worktree: ${escapeHtml(branch)}" style="display:inline-block;background:var(--surface-2);color:#a78bfa;font-size:9px;font-weight:600;padding:1px 5px;border-radius:3px;margin-left:4px">\u2387 ${escapeHtml(branch.replace("worktree/", ""))}</span>`
+      ).join("");
       const endBtn = live ? `<button class="secondary live-session-end" data-session-id="${escapeHtml(s.id)}" style="padding:1px 6px;font-size:9px;margin-left:6px" title="Mark this session idle">End session</button>` : "";
       return `<div class="live-session-row" data-session-status="${escapeHtml(displayStatus)}">
 
@@ -4572,7 +4584,7 @@ Current: ${current || "(none)"}`,
 
         <span class="live-dot">${dot}</span>
 
-        <span class="live-session-name">${escapeHtml(label)}</span>${fwBadge}
+        <span class="live-session-name">${escapeHtml(label)}</span>${fwBadge}${worktreeBadges}
 
         <span class="live-session-status" style="font-size:9px;color:var(--muted);text-transform:uppercase">${escapeHtml(displayStatus)}</span>
 
@@ -4847,10 +4859,10 @@ Continue copying the handoff?`);
       const instructions = `Auto-setup Meridian hooks for your AI tools:
 
 macOS / Linux / WSL:
-  curl -fsSL ${baseUrl}/hooks.sh | bash
+  curl -fsSL ${baseUrl}/install.sh | sh
 
 Windows PowerShell:
-  irm ${baseUrl}/hooks.ps1 | iex
+  irm ${baseUrl}/install.ps1 | iex
 
 These scripts detect Claude Code and Codex, then wire SessionStart + Stop
 hooks pointing to ${baseUrl}/hooks/ with your project_id.
@@ -5230,11 +5242,6 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
     }).catch(() => {
     });
   }
-  function suggestNtfyTopic(projectId) {
-    const proj = (state2.projects || []).find((p) => p.id === projectId);
-    const slug = (proj?.name || "meridian").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 24) || "meridian";
-    return slug;
-  }
   async function loadSettingsTab(projectId) {
     const body = document.getElementById(`settings-body-${projectId}`);
     if (!body) return;
@@ -5246,10 +5253,10 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
     try {
       let detectHookInstallOS = function() {
         const platform = String(navigator.userAgentData?.platform || navigator.platform || navigator.userAgent || "").toLowerCase();
-        if (platform.includes("win")) return { label: "Windows", command: `irm ${hooksBaseUrl}/hooks.ps1 | iex` };
-        if (platform.includes("mac")) return { label: "macOS", command: `curl -fsSL ${hooksBaseUrl}/hooks.sh | bash` };
-        if (platform.includes("linux") || platform.includes("x11")) return { label: "Linux / WSL", command: `curl -fsSL ${hooksBaseUrl}/hooks.sh | bash` };
-        return { label: "Unknown OS", command: `curl -fsSL ${hooksBaseUrl}/hooks.sh | bash` };
+        if (platform.includes("win")) return { label: "Windows", command: `irm ${hooksBaseUrl}/install.ps1 | iex` };
+        if (platform.includes("mac")) return { label: "macOS", command: `curl -fsSL ${hooksBaseUrl}/install.sh | sh` };
+        if (platform.includes("linux") || platform.includes("x11")) return { label: "Linux / WSL", command: `curl -fsSL ${hooksBaseUrl}/install.sh | sh` };
+        return { label: "Unknown OS", command: `curl -fsSL ${hooksBaseUrl}/install.sh | sh` };
       }, buildHookCurlHeaders = function(token) {
         const headers = [];
         if (token) headers.push(`-H 'Authorization: Bearer ${token}'`);
@@ -5344,6 +5351,23 @@ stop = ${JSON.stringify(stop)}`;
         const caretRot = _secState[k] ? "transform:rotate(90deg)" : "";
         return '<details id="settings-sec-' + k + "-" + projectId + '" ' + openAttr + ' style="margin-bottom:12px;border:1px solid var(--border);border-radius:6px"><summary style="cursor:pointer;list-style:none;padding:10px 12px;display:flex;align-items:center;gap:8px"><span class="meridian-caret" style="display:inline-block;font-size:10px;color:var(--muted);transition:transform 120ms ease;' + caretRot + '">\u25B6</span><span style="font-weight:600;font-size:11px;color:var(--text)">' + title + '</span></summary><div style="padding:0 0 4px">';
       };
+      const _allRepoPaths = [];
+      if (!isHostedMode()) {
+        try {
+          const _allProjSettings = await Promise.allSettled(
+            (state2.projects || []).map((p) => loadProjectSettings(p.id))
+          );
+          for (const _ps of _allProjSettings) {
+            if (_ps.status === "fulfilled") {
+              const _rps = Array.isArray(_ps.value?.executor_config?.repo_paths) ? _ps.value.executor_config.repo_paths : [];
+              for (const _rp of _rps) {
+                if (_rp && !_allRepoPaths.includes(_rp)) _allRepoPaths.push(_rp);
+              }
+            }
+          }
+        } catch (_) {
+        }
+      }
       let html = "";
       const detectedHookOS = detectHookInstallOS();
       html += `<div id="settings-os-detection-banner-${projectId}" style="margin-bottom:12px;padding:10px 12px;border:1px solid var(--accent);border-radius:6px;background:rgba(108,143,255,.08)">
@@ -5355,10 +5379,13 @@ stop = ${JSON.stringify(stop)}`;
         const plan = state2.tenantPlan || "free";
         const hasStripe = !!state2.tenantHasStripe;
         const noUpgrade = plan === "admin" || !!state2.tenantIsInternal;
-        const showBilling = hasStripe || !noUpgrade;
-        const billingLabel = hasStripe ? "Manage billing" : "Upgrade";
-        const billingHref = hasStripe ? "/billing/portal" : "/pricing";
-        const billingBtn = showBilling ? `<a href="${billingHref}" class="primary" style="padding:4px 10px;font-size:10px;text-decoration:none;background:var(--accent);color:#001020;border-radius:4px;font-weight:600">${escapeHtml(billingLabel)}</a>` : "";
+        let billingBtn = "";
+        if (hasStripe) {
+          billingBtn = `<button id="billing-portal-btn-${escapeHtml(projectId)}" class="primary" style="padding:4px 10px;font-size:10px;background:var(--accent);color:#001020;border-radius:4px;font-weight:600;cursor:pointer;border:none">Manage billing \u2192</button>`;
+        } else if (!noUpgrade) {
+          const upgradeUrl = state2.serverConfig?.stripe_payment_link || "/pricing";
+          billingBtn = `<a href="${escapeHtml(upgradeUrl)}" class="primary" style="padding:4px 10px;font-size:10px;text-decoration:none;background:var(--accent);color:#001020;border-radius:4px;font-weight:600">Upgrade to Standard \u2192</a>`;
+        }
         const days = state2.tenantDaysRemaining;
         const expiresAt = state2.tenantExpiresAt;
         const isTrialish = (plan === "free" || plan === "trial") && !state2.tenantIsInternal;
@@ -6077,6 +6104,27 @@ project_id = "${displayPid}"`;
             }
           }
         }, null, 2);
+        html += `<details style="margin-top:12px;border:1px solid var(--border);border-radius:6px;overflow:hidden">
+      <summary style="cursor:pointer;padding:8px 10px;font-size:10px;font-weight:600;color:var(--text);background:var(--surface-2);list-style:none;display:flex;align-items:center;gap:6px;user-select:none">
+        <span style="font-size:12px">\u26A1</span> Install rc watcher <span style="color:var(--muted);font-weight:400;margin-left:4px">(for <code>claude --rc</code> server mode)</span>
+      </summary>
+      <div style="padding:10px 12px;font-size:10px;color:var(--muted);line-height:1.8">
+        <p style="margin:0 0 8px">When Claude runs in <code>claude --rc</code> (headless server mode) the
+        standard SessionStart hooks do not fire. The rc watcher is a lightweight OS-native background service
+        (Windows Task Scheduler / macOS LaunchAgent / Linux systemd) that watches
+        <code>~/.claude/projects/</code> for new session files and fires the hook automatically.</p>
+        <div style="margin-bottom:6px;font-size:10px;color:var(--text);font-weight:600">Windows</div>
+        <div style="display:flex;gap:6px;align-items:center;margin-bottom:10px">
+          <code id="rc-watcher-win-cmd-${escapeHtml(projectId)}" style="flex:1;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;padding:4px 8px;font-size:10px;word-break:break-all">irm ${escapeHtml(hooksBaseUrl)}/install_watcher.ps1 | iex</code>
+          <button onclick="navigator.clipboard.writeText(document.getElementById('rc-watcher-win-cmd-${escapeHtml(projectId)}').textContent).then(()=>{this.textContent='Copied!';setTimeout(()=>this.textContent='Copy',1500)}).catch(()=>{})" style="padding:3px 8px;font-size:10px;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;cursor:pointer;white-space:nowrap;color:var(--text)">Copy</button>
+        </div>
+        <div style="margin-bottom:6px;font-size:10px;color:var(--text);font-weight:600">macOS / Linux</div>
+        <div style="display:flex;gap:6px;align-items:center">
+          <code id="rc-watcher-unix-cmd-${escapeHtml(projectId)}" style="flex:1;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;padding:4px 8px;font-size:10px;word-break:break-all">curl -fsSL ${escapeHtml(hooksBaseUrl)}/install_watcher.sh | bash</code>
+          <button onclick="navigator.clipboard.writeText(document.getElementById('rc-watcher-unix-cmd-${escapeHtml(projectId)}').textContent).then(()=>{this.textContent='Copied!';setTimeout(()=>this.textContent='Copy',1500)}).catch(()=>{})" style="padding:3px 8px;font-size:10px;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;cursor:pointer;white-space:nowrap;color:var(--text)">Copy</button>
+        </div>
+      </div>
+    </details>`;
         html += "</div></details>";
         html += _secHtml("executor", "Executor Setup");
         html += `<div style="margin-bottom:16px">
@@ -6562,11 +6610,14 @@ project_id = "${displayPid}"`;
           if (!noteList) return;
           try {
             const items = await api2("/workspace/notes");
-            noteList.innerHTML = items && items.length ? items.map((n) => `<div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px;padding:4px 0;border-bottom:1px solid var(--border)">
+            noteList.innerHTML = items && items.length ? items.map((n) => `<div data-note-row="${escapeHtml(n.id)}" style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px;padding:4px 0;border-bottom:1px solid var(--border)">
 
-              <span>${escapeHtml(n.title || "")}: <span style="color:var(--muted)">${escapeHtml(n.body || "")}</span>${n.tags ? ` <span style="color:var(--accent);font-size:9px">${escapeHtml(n.tags)}</span>` : ""}</span>
+              <span data-note-view="${escapeHtml(n.id)}">${escapeHtml(n.title || "")}: <span style="color:var(--muted)">${escapeHtml(n.body || "")}</span>${n.tags ? ` <span style="color:var(--accent);font-size:9px">${escapeHtml(n.tags)}</span>` : ""}</span>
 
-              <button class="secondary" data-nid="${escapeHtml(n.id)}" style="font-size:9px;padding:2px 7px">\xD7</button>
+              <span style="display:flex;gap:4px;flex-shrink:0">
+                <button class="secondary" data-nid-edit="${escapeHtml(n.id)}" data-ntitle="${escapeHtml(n.title || "")}" data-nbody="${escapeHtml(n.body || "")}" style="font-size:9px;padding:2px 6px" title="Edit">\u270E</button>
+                <button class="secondary" data-nid="${escapeHtml(n.id)}" style="font-size:9px;padding:2px 7px">\xD7</button>
+              </span>
 
             </div>`).join("") : '<div style="color:var(--muted)">No workspace notes yet.</div>';
             noteList.querySelectorAll("button[data-nid]").forEach((btn) => {
@@ -6578,6 +6629,42 @@ project_id = "${displayPid}"`;
                 } catch (e) {
                   alert("Error: " + e);
                 }
+              };
+            });
+            noteList.querySelectorAll("button[data-nid-edit]").forEach((btn) => {
+              btn.onclick = () => {
+                const nid = btn.dataset.nidEdit;
+                const row = noteList.querySelector(`[data-note-row="${nid}"]`);
+                const view = noteList.querySelector(`[data-note-view="${nid}"]`);
+                if (!row || row.querySelector("textarea")) return;
+                const titleVal = btn.dataset.ntitle;
+                const bodyVal = btn.dataset.nbody;
+                view.style.display = "none";
+                const edit = document.createElement("div");
+                edit.style.cssText = "flex:1;display:flex;flex-direction:column;gap:4px";
+                edit.innerHTML = `
+              <input type="text" value="${escapeHtml(titleVal)}" style="font-size:10px;padding:2px 6px;background:var(--surface-2);border:1px solid var(--border);color:var(--text);border-radius:3px;width:100%">
+              <textarea rows="2" style="font-size:10px;padding:2px 6px;background:var(--surface-2);border:1px solid var(--border);color:var(--text);border-radius:3px;resize:vertical;width:100%">${escapeHtml(bodyVal)}</textarea>
+              <span style="display:flex;gap:4px">
+                <button class="primary" style="font-size:9px;padding:2px 8px">Save</button>
+                <button class="secondary" style="font-size:9px;padding:2px 8px">Cancel</button>
+              </span>`;
+                row.insertBefore(edit, row.querySelector("[data-note-view]").nextSibling);
+                edit.querySelector("button.secondary").onclick = () => {
+                  edit.remove();
+                  view.style.display = "";
+                };
+                edit.querySelector("button.primary").onclick = async () => {
+                  const newTitle = edit.querySelector("input").value.trim();
+                  const newBody = edit.querySelector("textarea").value.trim();
+                  if (!newTitle || !newBody) return;
+                  try {
+                    await api2(`/workspace/notes/${nid}`, { method: "PATCH", body: JSON.stringify({ title: newTitle, body: newBody }) });
+                    renderWsNotes();
+                  } catch (e) {
+                    alert("Error: " + e);
+                  }
+                };
               };
             });
           } catch (e) {
@@ -6661,7 +6748,36 @@ project_id = "${displayPid}"`;
       </div>
     </div>
   </div>`;
-      if (mcpData) {
+      if (!isHostedMode() && _allRepoPaths.length > 0) {
+        const _fsPaths = _allRepoPaths.map((p) => JSON.stringify(p)).join(" ");
+        const _fsNpx = `npx -y @modelcontextprotocol/server-filesystem ${_allRepoPaths.map((p) => JSON.stringify(p)).join(" ")}`;
+        const _fsClaude = `claude mcp add filesystem -- npx -y @modelcontextprotocol/server-filesystem ${_allRepoPaths.map((p) => JSON.stringify(p)).join(" ")}`;
+        html += `<div style="margin-bottom:16px" id="fs-mcp-section-${projectId}">
+      <details>
+        <summary style="cursor:pointer;list-style:none;display:flex;align-items:center;gap:6px;padding-bottom:6px;border-bottom:1px solid var(--border);margin-bottom:8px">
+          <span style="color:var(--accent);font-size:10px;letter-spacing:.06em;text-transform:uppercase">Local file reading for planning chat</span>
+          <span style="font-size:9px;color:var(--muted);margin-left:auto">\u25BC</span>
+        </summary>
+        <div style="font-size:10px;color:var(--muted);margin-bottom:8px">Add a filesystem MCP server so Claude can read your repo files during planning conversations.</div>
+        <div style="margin-bottom:8px">
+          <div style="font-size:9px;color:var(--muted);margin-bottom:3px">npx command:</div>
+          <div style="display:flex;gap:6px;align-items:flex-start">
+            <code id="fs-mcp-npx-${projectId}" style="flex:1;display:block;padding:6px 8px;border:1px solid var(--border);border-radius:3px;background:var(--surface-1);color:var(--text);font-size:9px;font-family:var(--font-mono);white-space:pre-wrap;word-break:break-all">${escapeHtml(_fsNpx)}</code>
+            <button class="secondary" style="font-size:9px;padding:3px 8px;flex-shrink:0" onclick="navigator.clipboard.writeText(${JSON.stringify(_fsNpx)}).then(()=>toast('Copied')).catch(()=>toast('Copy failed',true))">Copy</button>
+          </div>
+        </div>
+        <div style="margin-bottom:8px">
+          <div style="font-size:9px;color:var(--muted);margin-bottom:3px">claude mcp add (Claude Code):</div>
+          <div style="display:flex;gap:6px;align-items:flex-start">
+            <code style="flex:1;display:block;padding:6px 8px;border:1px solid var(--border);border-radius:3px;background:var(--surface-1);color:var(--text);font-size:9px;font-family:var(--font-mono);white-space:pre-wrap;word-break:break-all">${escapeHtml(_fsClaude)}</code>
+            <button class="secondary" style="font-size:9px;padding:3px 8px;flex-shrink:0" onclick="navigator.clipboard.writeText(${JSON.stringify(_fsClaude)}).then(()=>toast('Copied')).catch(()=>toast('Copy failed',true))">Copy</button>
+          </div>
+        </div>
+        <div style="font-size:9px;color:var(--muted);line-height:1.5">Requires Node.js. Add the generated URL as a second connector in claude.ai.<br>WSL users: localhost works directly. Remote/SSH: use <code style="font-size:8px">cloudflared tunnel --url http://localhost:PORT</code></div>
+      </details>
+    </div>`;
+      }
+      if (isHostedMode()) {
         html += `<div style="margin-bottom:16px" id="members-section-${projectId}">
 
       <div style="color:var(--accent);font-size:10px;letter-spacing:.06em;text-transform:uppercase;margin-bottom:10px;padding-bottom:4px;border-bottom:1px solid var(--border)">Team members</div>
@@ -7253,14 +7369,29 @@ project_id = "${displayPid}"`;
           }
         };
       }
+      const billingPortalBtn = document.getElementById(`billing-portal-btn-${projectId}`);
+      if (billingPortalBtn) {
+        billingPortalBtn.onclick = async () => {
+          billingPortalBtn.disabled = true;
+          billingPortalBtn.textContent = "Loading\u2026";
+          try {
+            const data = await api2("/billing/portal", { method: "POST" });
+            window.location.href = data.url;
+          } catch (e) {
+            toast("Could not open billing portal: " + e.message, true);
+            billingPortalBtn.disabled = false;
+            billingPortalBtn.textContent = "Manage billing \u2192";
+          }
+        };
+      }
       var currentToken = null;
       setTimeout(() => {
         const hostedPlaceholderToken = mcpData ? "sk_meridian_" + "x".repeat(32) : "";
         let hooksToken = null;
         const renderHooks = () => {
           const activeToken = hooksToken || hostedPlaceholderToken;
-          const installUnix = `curl -fsSL ${hooksBaseUrl}/hooks.sh | bash`;
-          const installWindows = `irm ${hooksBaseUrl}/hooks.ps1 | iex`;
+          const installUnix = `curl -fsSL ${hooksBaseUrl}/install.sh | sh`;
+          const installWindows = `irm ${hooksBaseUrl}/install.ps1 | iex`;
           const snippets = {
             [`hooks-install-unix-${projectId}`]: installUnix,
             [`hooks-install-windows-${projectId}`]: installWindows,
@@ -7308,7 +7439,7 @@ project_id = "${displayPid}"`;
               if (!tokenId) return;
               const _revokeLabel = btn.getAttribute("data-token-label") || "";
               const _isHooksKey = _revokeLabel.includes("hooks") || _revokeLabel.includes("installer");
-              const _revokeMsg = _isHooksKey ? "This key may be used in your Claude Code hooks.\n\nAfter revoking, re-run: irm https://usemeridian.us/hooks.ps1 | iex\n\nRevoke anyway?" : "Revoke this API key? Existing clients using it will stop working.";
+              const _revokeMsg = _isHooksKey ? "This key may be used in your Claude Code hooks.\n\nAfter revoking, re-run: irm https://usemeridian.us/install.ps1 | iex\n\nRevoke anyway?" : "Revoke this API key? Existing clients using it will stop working.";
               if (!confirm(_revokeMsg)) return;
               btn.disabled = true;
               try {
@@ -8145,6 +8276,17 @@ project_id = "${displayPid}"`;
 
       </div>`;
       }).join("");
+      const extraCount = active.length - 1;
+      const extraRows = active.slice(1).map((s) => {
+        const age = s.last_seen ? Math.round((Date.now() - (/* @__PURE__ */ new Date(s.last_seen + "Z")).getTime()) / 6e4) : null;
+        const ageStr = age !== null ? age < 2 ? "just now" : `${age}m ago` : "";
+        return `<div style="display:flex;align-items:center;gap:6px;padding:2px 0">
+        <span style="font-size:9px;color:var(--accent)">\u25CF</span>
+        <span style="font-size:10px;color:var(--text);font-family:var(--font-mono)">${escapeHtml(s.name || "unnamed")}</span>
+        ${s.human_id ? `<span style="font-size:9px;color:var(--muted)">${escapeHtml(s.human_id)}</span>` : ""}
+        ${ageStr ? `<span style="font-size:9px;color:var(--muted);margin-left:auto">${ageStr}</span>` : ""}
+      </div>`;
+      }).join("");
       el.innerHTML = `
 
       <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
@@ -8155,15 +8297,30 @@ project_id = "${displayPid}"`;
 
         ${sess.human_id ? `<span style="font-size:10px;color:var(--muted)">${escapeHtml(sess.human_id)}</span>` : sess.name ? `<span style="font-size:10px;color:var(--muted);font-style:italic">${escapeHtml(sess.name)}</span>` : ""}
 
+        ${extraCount > 0 ? `<button class="secondary" id="live-feed-extra-toggle-${projectId}" style="font-size:9px;padding:1px 6px;margin-left:4px">+${extraCount} more \u25B8</button>` : ""}
+
         ${elapsedStr ? `<span style="font-size:10px;color:var(--muted);margin-left:auto">${elapsedStr}</span>` : ""}
 
       </div>
+
+      ${extraCount > 0 ? `<div id="live-feed-extra-${projectId}" style="display:none;margin-bottom:6px;padding:4px 8px;background:var(--surface-2);border-radius:3px">${extraRows}</div>` : ""}
 
       <div style="font-family:var(--font-mono)">
 
         ${taskRows || '<div style="color:var(--muted);font-size:10px">no recent tasks</div>'}
 
       </div>`;
+      if (extraCount > 0) {
+        const toggleBtn = el.querySelector(`#live-feed-extra-toggle-${projectId}`);
+        const extraEl = el.querySelector(`#live-feed-extra-${projectId}`);
+        if (toggleBtn && extraEl) {
+          toggleBtn.onclick = () => {
+            const open = extraEl.style.display !== "none";
+            extraEl.style.display = open ? "none" : "block";
+            toggleBtn.textContent = open ? `+${extraCount} more \u25B8` : `${extraCount} others \u25BE`;
+          };
+        }
+      }
       el.style.display = "block";
     } catch (e) {
       panel.liveSessionId = null;
@@ -8190,7 +8347,10 @@ project_id = "${displayPid}"`;
         const dt = seenAt ? formatRelativeTime(seenAt) : "";
         const name = escapeHtml(s.name || s.id || "session");
         const status = s.status === "idle" ? "idle" : s.status === "closed" ? "done" : s.status || "session";
-        const summary = escapeHtml((s.session_summary || "").slice(0, 90));
+        const _rawSummary = s.session_summary;
+        const summaryText = typeof _rawSummary === "string" ? _rawSummary : _rawSummary && _rawSummary.summary ? _rawSummary.summary : "";
+        const summaryPreview = summaryText ? escapeHtml(summaryText.slice(0, 90)) : "";
+        const hasSummary = !!summaryText;
         const humanClause = s.human_id ? `, human_id="${String(s.human_id).replace(/"/g, '\\"')}"` : "";
         const cmd = `start_session(project_id="${projectId}", session_name="${String(s.name || "resume-session").replace(/"/g, '\\"')}"${humanClause})`;
         const safeCmd = escapeHtml(cmd);
@@ -8209,13 +8369,14 @@ project_id = "${displayPid}"`;
                 style="padding:1px 6px;font-size:9px" title="Copy start_session() to clipboard">Resume</button>
               <button class="secondary recent-session-timeline-btn" data-session-id="${escapeHtml(s.id)}"
                 style="padding:1px 6px;font-size:9px" title="Open filtered timeline">Timeline</button>
+              <span class="recent-session-chevron" style="font-size:9px;color:var(--muted);margin-left:2px">\u25BC</span>
 
             </div>
 
           </div>
 
-          ${summary ? `<div style="font-size:9px;color:var(--muted);margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="${escapeHtml(s.summary || s.last_summary || "")}">${summary}</div>` : ""}
-          <div class="recent-session-tasks" style="display:none;margin-top:6px;padding-top:5px;border-top:1px solid var(--border);font-size:10px;color:var(--muted)"></div>
+          ${summaryPreview ? `<div style="font-size:9px;color:var(--muted);margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="${escapeHtml(summaryText)}">${summaryPreview}</div>` : ""}
+          <div class="recent-session-tasks" data-full-summary="${escapeHtml(summaryText)}" style="display:none;margin-top:6px;padding-top:5px;border-top:1px solid var(--border);font-size:10px;color:var(--muted)"></div>
 
         </div>`;
       }).join("")}`;
@@ -8233,25 +8394,32 @@ project_id = "${displayPid}"`;
         };
       });
       el.querySelectorAll(".recent-session-row").forEach((row) => {
-        row.onclick = async () => {
+        row.onclick = async (evt) => {
+          if (evt.target.closest(".resume-session-btn, .recent-session-timeline-btn")) return;
           const target = row.querySelector(".recent-session-tasks");
+          const chevron = row.querySelector(".recent-session-chevron");
           const sid = row.dataset.sessionId;
           if (!target || !sid) return;
           if (target.style.display !== "none") {
             target.style.display = "none";
+            if (chevron) chevron.textContent = "\u25BC";
             return;
           }
           if (!target.dataset.loaded) {
             target.textContent = "loading...";
             try {
-              const rows = await api2(`/projects/${projectId}/sessions/${sid}/tasks/live?limit=20`);
-              target.innerHTML = rows && rows.length ? rows.map((t) => `<div style="padding:2px 0"><span style="color:var(--accent)">${escapeHtml((t.status || "").toUpperCase())}</span> ${escapeHtml((t.description || "").slice(0, 180))}</div>`).join("") : "<div>(no task log for this session)</div>";
+              const fullSummary = target.dataset.fullSummary || "";
+              const taskRows = await api2(`/projects/${projectId}/sessions/${sid}/tasks/live?limit=20`);
+              const summaryHtml = fullSummary ? `<div style="color:var(--text-dim);margin-bottom:5px;white-space:pre-wrap;word-break:break-word">${escapeHtml(fullSummary)}</div>` : "";
+              const tasksHtml = taskRows && taskRows.length ? taskRows.map((t) => `<div style="padding:2px 0"><span style="color:var(--accent)">${escapeHtml((t.status || "").toUpperCase())}</span> ${escapeHtml((t.description || "").slice(0, 180))}</div>`).join("") : "<div>(no task log for this session)</div>";
+              target.innerHTML = summaryHtml + tasksHtml;
               target.dataset.loaded = "1";
             } catch (e) {
               target.textContent = "failed to load tasks";
             }
           }
           target.style.display = "block";
+          if (chevron) chevron.textContent = "\u25B2";
         };
       });
       el.style.display = "block";
@@ -8332,8 +8500,9 @@ project_id = "${displayPid}"`;
         const ts = (run.started_at || "").slice(0, 16).replace("T", " ");
         const dur = run.duration_s != null ? run.duration_s < 60 ? `${run.duration_s}s` : `${Math.round(run.duration_s / 60)}m` : run.status === "running" ? "live" : "\u2014";
         const cnt = run.task_count || 0;
-        const statusColor = run.status === "running" ? "var(--accent)" : run.status === "failed" ? "var(--danger,#e05)" : "var(--muted)";
-        const dots = run.status === "running" ? " \xB7" : "";
+        const displayRunStatus = run.status === "running" && run.session_status && run.session_status !== "active" ? "done" : run.status;
+        const statusColor = displayRunStatus === "running" ? "var(--accent)" : displayRunStatus === "failed" ? "var(--danger,#e05)" : "var(--muted)";
+        const dots = displayRunStatus === "running" ? " \xB7" : "";
         return `<div class="run-row" data-run-id="${escapeHtml(run.id)}" data-project-id="${escapeHtml(projectId)}"
 
           style="border:1px solid var(--border);border-radius:3px;padding:5px 8px;margin-bottom:4px;background:var(--surface-1);cursor:pointer">
@@ -8344,7 +8513,7 @@ project_id = "${displayPid}"`;
 
           <span style="font-size:9px;color:var(--muted)">${cnt} tasks \xB7 ${dur} \xB7 ${ts}${run.session_name && sid ? ` \xB7 ${escapeHtml(sid)}` : ""}</span>
 
-          <span style="font-size:9px;color:${statusColor}">${run.status}</span>
+          <span style="font-size:9px;color:${statusColor}">${displayRunStatus}</span>
 
         </div>
 
@@ -8408,6 +8577,8 @@ project_id = "${displayPid}"`;
       loadRecentSessions(projectId, sessions || []);
       const refreshBtn = document.getElementById(`queue-refresh-${projectId}`);
       if (refreshBtn) refreshBtn.onclick = () => loadQueue(projectId);
+      const reconcileBtn = document.getElementById(`queue-reconcile-${projectId}`);
+      if (reconcileBtn) reconcileBtn.onclick = () => runReconcile(projectId);
       const searchInput = document.getElementById(`task-search-${projectId}`);
       if (searchInput) {
         searchInput.placeholder = "Search sprint items, notes, decisions\u2026";
@@ -8435,6 +8606,58 @@ project_id = "${displayPid}"`;
     } catch (e) {
       body.innerHTML = renderProjectLoadError(projectId, "Queue unavailable", `/projects/${projectId}/sprint-items`, e);
       wireProjectLoadRetry(body, projectId);
+    }
+  }
+  async function runReconcile(projectId) {
+    const container = document.getElementById(`reconcile-results-${projectId}`);
+    const btn = document.getElementById(`queue-reconcile-${projectId}`);
+    if (!container) return;
+    if (btn) {
+      btn.disabled = true;
+      btn.textContent = "checking\u2026";
+    }
+    container.style.display = "block";
+    container.innerHTML = '<span style="color:var(--muted)">Checking commits against sprint board\u2026</span>';
+    try {
+      const data = await projectApi(projectId, `/projects/${projectId}/reconcile`);
+      if (!data.matches || data.matches.length === 0) {
+        container.innerHTML = `<span style="color:var(--muted)">\u2713 No drift detected (checked ${data.commit_count || 0} commits against ${data.pending_count || 0} pending items)</span>
+        <button onclick="document.getElementById('reconcile-results-${projectId}').style.display='none'" style="margin-left:10px;background:none;border:none;color:var(--muted);cursor:pointer;font-size:10px">\u2715</button>`;
+      } else {
+        const n = data.matches.length;
+        let html = `<div style="margin-bottom:6px;color:var(--warning,#f59e0b);font-weight:600">${n} item${n !== 1 ? "s" : ""} may already be shipped \u2014 verify before executing</div>`;
+        data.matches.forEach((m) => {
+          const confidence = m.confidence === "high" ? "\u{1F534} high" : "\u{1F7E1} medium";
+          const commits = (m.matching_commits || []).slice(0, 2).map(
+            (c) => `<span style="color:var(--muted)">${escapeHtml(c.sha)} \u2014 ${escapeHtml(c.message)}</span>`
+          ).join("<br>");
+          html += `<div style="border:1px solid var(--border);border-radius:4px;padding:6px 8px;margin-bottom:6px;background:var(--surface-3,var(--surface-2))">
+          <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px">
+            <div>
+              <span style="color:var(--text)">${escapeHtml(m.title.slice(0, 80))}${m.title.length > 80 ? "\u2026" : ""}</span>
+              <span style="margin-left:6px;font-size:9px;opacity:0.7">${confidence}</span>
+              <div style="margin-top:3px;font-size:9px">${commits}</div>
+            </div>
+            <div style="display:flex;gap:4px;flex-shrink:0">
+              <button class="primary" style="padding:2px 7px;font-size:9px"
+                onclick="reconcileMarkDone('${projectId}','${m.item_id}',this)">Mark done</button>
+              <button class="secondary" style="padding:2px 7px;font-size:9px"
+                onclick="this.closest('div[style]').remove()">Keep</button>
+            </div>
+          </div>
+        </div>`;
+        });
+        html += `<button onclick="document.getElementById('reconcile-results-${projectId}').style.display='none'" style="background:none;border:none;color:var(--muted);cursor:pointer;font-size:10px;margin-top:2px">Dismiss</button>`;
+        container.innerHTML = html;
+      }
+    } catch (e) {
+      container.innerHTML = `<span style="color:var(--danger,#ef4444)">Reconcile failed: ${escapeHtml(e.message)}</span>
+      <button onclick="document.getElementById('reconcile-results-${projectId}').style.display='none'" style="margin-left:10px;background:none;border:none;color:var(--muted);cursor:pointer;font-size:10px">\u2715</button>`;
+    } finally {
+      if (btn) {
+        btn.disabled = false;
+        btn.textContent = "reconcile";
+      }
     }
   }
   function renderSearchResults(query, results) {
