@@ -888,7 +888,7 @@ async def site_password_gate(request: Request, call_next):
     if not site_pw:
         return await call_next(request)
     path = request.url.path
-    if path in ("/health", "/failover-status", "/mcp/health", "/__gate__", "/config", "/static", "/mcp/tools-doc", "/mcp/quickstart", "/mcp/sse", "/mcp", "/.well-known/oauth-authorization-server", "/.well-known/oauth-protected-resource", "/hooks/session-start", "/hooks/stop") or path.startswith("/static/") or path.startswith("/oauth/") or path == "/demo" or path.startswith("/demo/"):
+    if path in ("/health", "/failover-status", "/mcp/health", "/__gate__", "/config", "/static", "/mcp/tools-doc", "/mcp/quickstart", "/mcp/sse", "/mcp", "/.well-known/oauth-authorization-server", "/.well-known/oauth-protected-resource", "/hooks/session-start", "/hooks/stop") or path.startswith("/static/") or path.startswith("/oauth/") or path.startswith("/status/") or path == "/demo" or path.startswith("/demo/"):
         return await call_next(request)
     # Demo cookie bypasses site password gate — demo users don't go through __gate__
     if request.cookies.get(_DEMO_CONTEXT_COOKIE):
@@ -1363,6 +1363,59 @@ async def failover_status() -> dict[str, bool]:
     """
     flag = (os.environ.get("MERIDIAN_IS_FAILOVER") or "").strip().lower()
     return {"is_failover": flag in ("1", "true", "yes", "on")}
+
+
+# ---------------------------------------------------------------------------
+# Live status shields — shields.io endpoint-badge JSON, public + read-only
+# (29b33fdb)
+# ---------------------------------------------------------------------------
+
+
+def _shield(label: str, message: str, color: str = "brightgreen") -> dict[str, Any]:
+    """shields.io endpoint badge payload."""
+    return {"schemaVersion": 1, "label": label, "message": message, "color": color}
+
+
+@app.get("/status/server")
+async def status_server() -> dict[str, Any]:
+    """Liveness badge — always green when the app can answer."""
+    return _shield("meridian", "online", "brightgreen")
+
+
+@app.get("/status/tools")
+async def status_tools() -> dict[str, Any]:
+    """MCP tool-count badge (counted from the in-process tool list)."""
+    return _shield("MCP tools", f"{len(_MCP_TOOLS_LIST)} tools", "6c8fff")
+
+
+@app.get("/status/sessions")
+async def status_sessions(request: Request) -> dict[str, Any]:
+    """Active-session-count badge (best-effort; 0 on any error)."""
+    n = 0
+    try:
+        async with request.app.state.db.execute(
+            "SELECT COUNT(*) AS c FROM sessions WHERE status = 'active'"
+        ) as cur:
+            row = await cur.fetchone()
+        n = int(row["c"] if isinstance(row, dict) else row[0]) if row else 0
+    except Exception:  # noqa: BLE001
+        n = 0
+    return _shield("active sessions", f"{n} live", "brightgreen" if n else "lightgrey")
+
+
+@app.get("/status/hooks")
+async def status_hooks(request: Request) -> dict[str, Any]:
+    """Registered-machine-count badge (best-effort; 0 on any error)."""
+    n = 0
+    try:
+        async with request.app.state.db.execute(
+            "SELECT COUNT(DISTINCT hostname) AS c FROM registered_hostnames"
+        ) as cur:
+            row = await cur.fetchone()
+        n = int(row["c"] if isinstance(row, dict) else row[0]) if row else 0
+    except Exception:  # noqa: BLE001
+        n = 0
+    return _shield("hooks", f"{n} machines", "brightgreen" if n else "lightgrey")
 
 
 @app.get("/terms", response_class=HTMLResponse)

@@ -3981,6 +3981,39 @@ def test_queue_session_http_roundtrip(client):
     assert client.get(f"/projects/{pid}/queued-session").json()["goal"] is None
 
 
+# ---------------------------------------------------------------------------
+# 29b33fdb — live status shields
+# ---------------------------------------------------------------------------
+
+
+def test_status_server_shield(client):
+    r = client.get("/status/server")
+    assert r.status_code == 200
+    j = r.json()
+    assert j["schemaVersion"] == 1
+    assert j["label"] == "meridian"
+    assert j["message"] == "online"
+    assert j["color"]
+
+
+def test_status_tools_shield_reports_positive_count(client):
+    r = client.get("/status/tools")
+    assert r.status_code == 200
+    j = r.json()
+    assert j["schemaVersion"] == 1
+    # "<n> tools" with n > 0
+    n = int(j["message"].split()[0])
+    assert n > 0
+
+
+def test_status_sessions_and_hooks_shields(client):
+    for path, label in (("/status/sessions", "active sessions"), ("/status/hooks", "hooks")):
+        j = client.get(path).json()
+        assert j["schemaVersion"] == 1
+        assert j["label"] == label
+        assert j["message"]
+
+
 def test_build_goal_xml_omits_decisions_when_empty():
     """No <decisions> tag when there's nothing to show — worker
     sessions in v1.2.0 will pass decisions=None for the same reason."""
