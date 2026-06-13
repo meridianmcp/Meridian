@@ -8821,3 +8821,144 @@ def test_worktrees_http_endpoints(client):
     # Delete again — 404
     r4 = client.delete(f"/projects/{pid}/worktrees/{wt['id']}")
     assert r4.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# Reconcile sprint items — unit + HTTP
+# ---------------------------------------------------------------------------
+
+
+def test_reconcile_sprint_items_high_confidence():
+    """3+ keyword overlap → confidence=high."""
+    items = [{"id": "item-1", "title": "implement oauth token refresh endpoint"}]
+    commits = [
+        {"sha": "abc123", "message": "feat: implement oauth token refresh for expired sessions"},
+    ]
+    results = handoff_module.reconcile_sprint_items(items, commits)
+    assert len(results) == 1
+    assert results[0]["item_id"] == "item-1"
+    assert results[0]["confidence"] == "high"
+    assert len(results[0]["matching_commits"]) == 1
+    assert results[0]["matching_commits"][0]["sha"] == "abc123"
+
+
+def test_reconcile_sprint_items_medium_confidence():
+    """1-2 keyword overlap → confidence=medium."""
+    items = [{"id": "item-2", "title": "reconcile sprint board drift detection"}]
+    commits = [
+        {"sha": "def456", "message": "fix: sprint board display"},
+    ]
+    results = handoff_module.reconcile_sprint_items(items, commits)
+    assert len(results) == 1
+    assert results[0]["confidence"] == "medium"
+
+
+def test_reconcile_sprint_items_no_match():
+    """Items with no keyword overlap are excluded."""
+    items = [{"id": "item-3", "title": "billing stripe webhook handler"}]
+    commits = [
+        {"sha": "xyz", "message": "chore: update readme typo"},
+    ]
+    results = handoff_module.reconcile_sprint_items(items, commits)
+    assert results == []
+
+
+def test_reconcile_sprint_items_short_title_skipped():
+    """Items with fewer than 2 keywords (after stop-word removal) are skipped."""
+    items = [{"id": "item-4", "title": "fix"}]  # all stop words
+    commits = [{"sha": "aaa", "message": "fix the broken thing"}]
+    results = handoff_module.reconcile_sprint_items(items, commits)
+    assert results == []
+
+
+def test_reconcile_sprint_items_multiple_commits():
+    """Multiple matching commits are all included (up to 5)."""
+    items = [{"id": "item-5", "title": "migrate database schema tables"}]
+    commits = [
+        {"sha": "s1", "message": "feat: migrate database tables"},
+        {"sha": "s2", "message": "chore: database schema migration cleanup"},
+        {"sha": "s3", "message": "totally unrelated commit"},
+    ]
+    results = handoff_module.reconcile_sprint_items(items, commits)
+    assert len(results) == 1
+    matching_shas = [c["sha"] for c in results[0]["matching_commits"]]
+    assert "s1" in matching_shas
+    assert "s2" in matching_shas
+    assert "s3" not in matching_shas
+
+
+def test_reconcile_endpoint_returns_structure(client):
+    """GET /projects/{id}/reconcile returns expected shape."""
+    project = client.post("/projects", json={"name": "recon-test"}).json()
+    pid = project["id"]
+
+    # No pending items → no matches
+    r = client.get(f"/projects/{pid}/reconcile")
+    assert r.status_code == 200
+    data = r.json()
+    assert "matches" in data
+    assert "commit_count" in data
+    assert "pending_count" in data
+    assert "matched_count" in data
+    assert data["matched_count"] == len(data["matches"])
+
+
+def test_reconcile_endpoint_matches_pending_items(client):
+    """Reconcile endpoint finds matching items against local git log."""
+    project = client.post("/projects", json={"name": "recon-match"}).json()
+    pid = project["id"]
+
+    # Add a sprint item whose keywords appear in recent git commits
+    client.post(
+        f"/projects/{pid}/sprint-items",
+        json={"version": "v1", "title": "implement session queue pagination feature"},
+    )
+
+    r = client.get(f"/projects/{pid}/reconcile")
+    assert r.status_code == 200
+    data = r.json()
+    assert data["pending_count"] >= 1
+    # commit_count may be 0 if no git repo available in test env — that's fine
+    assert isinstance(data["matches"], list)
+
+
+def test_reconcile_endpoint_404_for_unknown_project(client):
+    """Reconcile returns 404 for a non-existent project."""
+    r = client.get("/projects/does-not-exist/reconcile")
+    assert r.status_code == 404
+
+
+def test_generate_handoff_accepts_commit_messages(db, tmp_path):
+    """generate_handoff passes commit_messages to _annotate_possibly_done."""
+    import asyncio  # noqa: PLC0415
+    from meridian import handoff as hm  # noqa: PLC0415
+
+    async def run():
+        p = await db_module.create_project(db, "handoff-commits")
+        await db_module.add_sprint_item(
+            db, p["id"], "v1", "implement oauth token refresh endpoint"
+        )
+        commits = [
+            "feat: implement oauth token refresh for expired sessions",
+            "fix: unrelated change",
+        ]
+        _, content = await hm.generate_handoff(
+            db, p["id"], str(tmp_path),
+            skip_ai_summary=True,
+            commit_messages=commits,
+        )
+        return content
+
+    content = asyncio.get_event_loop().run_until_complete(run())
+    # The item should be flagged as possibly done
+    assert "possibly done" in content
+
+
+def test_dashboard_js_has_reconcile_button():
+    """dashboard.js contains the reconcile button and runReconcile function."""
+    js_path = Path(__file__).parent.parent / "meridian" / "static" / "dashboard.js"
+    src = js_path.read_text(encoding="utf-8")
+    assert "queue-reconcile-" in src
+    assert "runReconcile" in src
+    assert "reconcileMarkDone" in src
+    assert "reconcile-results-" in src

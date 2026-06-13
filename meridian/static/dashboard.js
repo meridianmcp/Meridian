@@ -3336,11 +3336,16 @@ function buildTabBody(project) {
 
           </span>
 
-          <button class="secondary" id="queue-refresh-${project.id}" style="padding:2px 8px;font-size:10px">refresh</button>
+          <span style="display:flex;gap:6px;align-items:center">
+            <button class="secondary" id="queue-reconcile-${project.id}" style="padding:2px 8px;font-size:10px" title="Check if any pending items may already be done based on recent commits">reconcile</button>
+            <button class="secondary" id="queue-refresh-${project.id}" style="padding:2px 8px;font-size:10px">refresh</button>
+          </span>
 
         </div>
 
         <div id="live-session-${project.id}" style="display:none;flex-shrink:0;border-bottom:1px solid var(--border);background:var(--surface-2);padding:8px 14px 10px"></div>
+
+        <div id="reconcile-results-${project.id}" style="display:none;flex-shrink:0;border-bottom:1px solid var(--border);background:var(--surface-2);padding:8px 14px 10px;font-family:var(--font-mono);font-size:11px"></div>
 
         <div style="padding:8px 14px 0;flex-shrink:0">
 
@@ -11175,6 +11180,10 @@ async function loadQueue(projectId) {
 
     if (refreshBtn) refreshBtn.onclick = () => loadQueue(projectId);
 
+    const reconcileBtn = document.getElementById(`queue-reconcile-${projectId}`);
+
+    if (reconcileBtn) reconcileBtn.onclick = () => runReconcile(projectId);
+
     // Wire search input (debounced 300ms) — universal search across all tables
 
     const searchInput = document.getElementById(`task-search-${projectId}`);
@@ -11225,6 +11234,120 @@ async function loadQueue(projectId) {
 
 }
 
+
+
+async function runReconcile(projectId) {
+
+  /** Fetch reconcile results and show inline in the Queue tab header area. */
+
+  const container = document.getElementById(`reconcile-results-${projectId}`);
+
+  const btn = document.getElementById(`queue-reconcile-${projectId}`);
+
+  if (!container) return;
+
+  if (btn) { btn.disabled = true; btn.textContent = 'checking…'; }
+
+  container.style.display = 'block';
+
+  container.innerHTML = '<span style="color:var(--muted)">Checking commits against sprint board…</span>';
+
+  try {
+
+    const data = await projectApi(projectId, `/projects/${projectId}/reconcile`);
+
+    if (!data.matches || data.matches.length === 0) {
+
+      container.innerHTML = `<span style="color:var(--muted)">✓ No drift detected (checked ${data.commit_count || 0} commits against ${data.pending_count || 0} pending items)</span>
+        <button onclick="document.getElementById('reconcile-results-${projectId}').style.display='none'" style="margin-left:10px;background:none;border:none;color:var(--muted);cursor:pointer;font-size:10px">✕</button>`;
+
+    } else {
+
+      const n = data.matches.length;
+
+      let html = `<div style="margin-bottom:6px;color:var(--warning,#f59e0b);font-weight:600">${n} item${n !== 1 ? 's' : ''} may already be shipped — verify before executing</div>`;
+
+      data.matches.forEach(m => {
+
+        const confidence = m.confidence === 'high' ? '🔴 high' : '🟡 medium';
+
+        const commits = (m.matching_commits || []).slice(0, 2).map(c =>
+          `<span style="color:var(--muted)">${escapeHtml(c.sha)} — ${escapeHtml(c.message)}</span>`
+        ).join('<br>');
+
+        html += `<div style="border:1px solid var(--border);border-radius:4px;padding:6px 8px;margin-bottom:6px;background:var(--surface-3,var(--surface-2))">
+          <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px">
+            <div>
+              <span style="color:var(--text)">${escapeHtml(m.title.slice(0, 80))}${m.title.length > 80 ? '…' : ''}</span>
+              <span style="margin-left:6px;font-size:9px;opacity:0.7">${confidence}</span>
+              <div style="margin-top:3px;font-size:9px">${commits}</div>
+            </div>
+            <div style="display:flex;gap:4px;flex-shrink:0">
+              <button class="primary" style="padding:2px 7px;font-size:9px"
+                onclick="reconcileMarkDone('${projectId}','${m.item_id}',this)">Mark done</button>
+              <button class="secondary" style="padding:2px 7px;font-size:9px"
+                onclick="this.closest('div[style]').remove()">Keep</button>
+            </div>
+          </div>
+        </div>`;
+
+      });
+
+      html += `<button onclick="document.getElementById('reconcile-results-${projectId}').style.display='none'" style="background:none;border:none;color:var(--muted);cursor:pointer;font-size:10px;margin-top:2px">Dismiss</button>`;
+
+      container.innerHTML = html;
+
+    }
+
+  } catch (e) {
+
+    container.innerHTML = `<span style="color:var(--danger,#ef4444)">Reconcile failed: ${escapeHtml(e.message)}</span>
+      <button onclick="document.getElementById('reconcile-results-${projectId}').style.display='none'" style="margin-left:10px;background:none;border:none;color:var(--muted);cursor:pointer;font-size:10px">✕</button>`;
+
+  } finally {
+
+    if (btn) { btn.disabled = false; btn.textContent = 'reconcile'; }
+
+  }
+
+}
+
+
+async function reconcileMarkDone(projectId, itemId, btnEl) {
+
+  /** Mark a sprint item done from the reconcile panel. */
+
+  try {
+
+    btnEl.disabled = true;
+
+    btnEl.textContent = '…';
+
+    await projectApi(projectId, `/projects/${projectId}/sprint-items/${itemId}/complete`, { method: 'POST', body: JSON.stringify({}) });
+
+    const row = btnEl.closest('div[style]');
+
+    if (row) {
+
+      row.style.opacity = '0.4';
+
+      row.innerHTML = `<span style="color:var(--muted)">✓ marked done</span>`;
+
+    }
+
+    loadQueue(projectId);
+
+  } catch (e) {
+
+    btnEl.disabled = false;
+
+    btnEl.textContent = 'Mark done';
+
+    toast(`Failed: ${e.message}`, true);
+
+  }
+
+}
 
 
 function renderSearchResults(query, results) {
