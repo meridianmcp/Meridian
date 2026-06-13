@@ -607,9 +607,8 @@ CREATE TABLE IF NOT EXISTS workspace_decisions (
     created_at TEXT NOT NULL DEFAULT ({_TS})
 );
 CREATE INDEX IF NOT EXISTS idx_workspace_notes_created ON workspace_notes(created_at DESC);
-CREATE INDEX IF NOT EXISTS idx_workspace_notes_tenant ON workspace_notes(tenant_id);
 CREATE INDEX IF NOT EXISTS idx_workspace_decisions_status ON workspace_decisions(status, created_at DESC);
-CREATE INDEX IF NOT EXISTS idx_workspace_decisions_tenant ON workspace_decisions(tenant_id);
+-- tenant_id indexes added by _migrate_pg_workspace_tenant_isolation (migration handles existing DBs)
 
 -- v3.4 — workspace-level settings singleton (tenant-global defaults).
 CREATE TABLE IF NOT EXISTS workspace_settings (
