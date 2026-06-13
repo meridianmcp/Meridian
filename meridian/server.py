@@ -2943,7 +2943,16 @@ async def list_worktrees(project_id: str, request: Request) -> list[dict[str, An
     project = await db_module.get_project(await _db(request), project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="project not found")
-    return await db_module.list_active_worktrees(await _db(request), project_id)
+    # Degrade gracefully: a missing/not-yet-migrated active_worktrees table must
+    # not 500 the dashboard panel — return [] and log instead.
+    try:
+        return await db_module.list_active_worktrees(await _db(request), project_id)
+    except Exception as exc:  # noqa: BLE001
+        import logging as _l
+        _l.getLogger("meridian.server").warning(
+            "list_worktrees failed for project %s: %s", project_id, exc
+        )
+        return []
 
 
 @app.post("/projects/{project_id}/worktrees", status_code=201)
