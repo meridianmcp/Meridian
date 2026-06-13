@@ -7,6 +7,7 @@ from typing import Any
 EXECUTOR_CONFIG_KEYS = (
     "repo_path",
     "repo_paths",
+    "hostnames",
     "env_file",
     "test_cmd",
     "test_min",
