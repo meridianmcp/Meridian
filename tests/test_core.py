@@ -4352,7 +4352,7 @@ def test_dashboard_uses_static_assets(client):
     """Dashboard HTML references static files, not inline scripts."""
     r = client.get("/dashboard")
     assert r.status_code == 200
-    assert "/static/dashboard.js" in r.text
+    assert "/static/dashboard.bundle.js" in r.text
     assert "/static/dashboard.css" in r.text
 
 

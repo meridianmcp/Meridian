@@ -1,7 +1,7 @@
 // Extracted from dashboard.js -- timeline/heatmap/gantt functions
 // DO NOT DELETE -- loaded via script tag in dashboard.html
 
-function renderTimeline(projectId, data) {
+export function renderTimeline(projectId, data) {
 
   const wrap = document.getElementById(`timeline-wrap-${projectId}`);
 
@@ -270,7 +270,7 @@ function renderTimeline(projectId, data) {
 
 }
 
-function _heatmapPieces(maxScale) {
+export function _heatmapPieces(maxScale) {
 
   // Six-bucket green→red ramp scaled proportionally to maxScale so projects
 
@@ -306,7 +306,7 @@ function _heatmapPieces(maxScale) {
 
 }
 
-function _heatmapMaxFor(projectId) {
+export function _heatmapMaxFor(projectId) {
 
   const raw = parseInt(localStorage.getItem(`meridian_heatmap_max_${projectId}`), 10);
 
@@ -316,7 +316,7 @@ function _heatmapMaxFor(projectId) {
 
 }
 
-function _renderTimelineHeatmap(projectId, data, paneEl) {
+export function _renderTimelineHeatmap(projectId, data, paneEl) {
 
   /** Contribution calendar — one colored square per day, intensity by task
 
@@ -994,7 +994,7 @@ function _renderTimelineHeatmap(projectId, data, paneEl) {
 
 }
 
-function _renderTimelineGantt(projectId, data, paneEl) {
+export function _renderTimelineGantt(projectId, data, paneEl) {
 
   /** Per-session ECharts gantt — the secondary "Detail" timeline view. */
 
@@ -1391,3 +1391,7 @@ function _renderTimelineGantt(projectId, data, paneEl) {
   try { new ResizeObserver(() => { try { chart.resize(); } catch (_) {} }).observe(container); } catch (_) {}
 
 }
+
+// --- ITEM 4 esbuild: re-expose top-level symbols as globals so inline
+// handlers and cross-file references keep resolving after IIFE bundling.
+try { Object.assign(window, { renderTimeline, _heatmapPieces, _heatmapMaxFor, _renderTimelineHeatmap, _renderTimelineGantt }); } catch (e) {}

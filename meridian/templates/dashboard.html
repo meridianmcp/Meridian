@@ -131,12 +131,8 @@
   </div>
 </div>
 
-<script src="/static/dashboard-utils.js?v={{ asset_version or version }}"></script>
-<script src="/static/dashboard-demo.js?v={{ asset_version or version }}"></script>
-<script src="/static/dashboard-timeline.js?v={{ asset_version or version }}"></script>
-<script src="/static/dashboard-mcp.js?v={{ asset_version or version }}"></script>
-<script src="/static/dashboard-sprint.js?v={{ asset_version or version }}"></script>
-<script src="/static/dashboard.js?v={{ asset_version or version }}"></script>
+<!-- ITEM 4 esbuild: single bundled IIFE (build with `node build.mjs`) -->
+<script src="/static/dashboard.bundle.js?v={{ asset_version or version }}"></script>
 
 </body>
 </html>

@@ -1,7 +1,7 @@
 // dashboard-mcp.js — MCP tool renderer extracted from dashboard.js
 // Depends on: dashboard-utils.js (escapeHtml)
 
-function _renderToolEntry(tool) {
+export function _renderToolEntry(tool) {
 
   const props = (tool.inputSchema && tool.inputSchema.properties) ? tool.inputSchema.properties : {};
 
@@ -25,3 +25,8 @@ function _renderToolEntry(tool) {
 
 }
 
+
+
+// --- ITEM 4 esbuild: re-expose top-level symbols as globals so inline
+// handlers and cross-file references keep resolving after IIFE bundling.
+try { Object.assign(window, { _renderToolEntry }); } catch (e) {}
