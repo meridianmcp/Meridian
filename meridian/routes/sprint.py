@@ -19,14 +19,33 @@ async def list_sprint_items(
     limit: int | None = None,
     offset: int = 0,
     with_counts: bool = False,
+    page: int | None = None,
 ) -> list[dict[str, Any]] | dict[str, Any]:
-    """List sprint items, optionally filtered by status."""
-    project = await db_module.get_project(await _db(request), project_id)
+    """List sprint items, optionally filtered by status.
+
+    Pass ``page`` (1-based) for true server-side pagination — returns
+    ``{items, total, page, pages}`` using SQL LIMIT/OFFSET so large completed
+    lists don't fetch every row. ``limit`` defaults to 50 in this mode. Without
+    ``page`` the legacy list/slice behaviour is unchanged.
+    """
+    db = await _db(request)
+    project = await db_module.get_project(db, project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="project not found")
+    if page is not None:
+        try:
+            per = max(1, min(limit or 50, 500))
+            page_n = max(1, page)
+            items, total = await db_module.get_sprint_items_page(
+                db, project_id, status=status, limit=per, offset=(page_n - 1) * per,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
+        pages = (total + per - 1) // per if per else 1
+        return {"items": items, "total": total, "page": page_n, "pages": pages}
     try:
         items = await db_module.get_sprint_items(
-            await _db(request), project_id, status=status
+            db, project_id, status=status
         )
         total_done_count = sum(1 for it in items if it.get("status") == "done")
         if status is not None and with_counts:

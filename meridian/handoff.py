@@ -683,6 +683,15 @@ async def generate_handoff(
     )
     content = f"{readiness_block}\n\n{content}"
 
+    # 10e6b265 — session queue: append the queued next-session goal (if any) and
+    # clear it so the handoff surfaces the next /goal inline, exactly once.
+    queued_goal = await db_module.pop_queued_session(db, project_id)
+    if queued_goal:
+        content = (
+            f"{content}\n\n=== QUEUED NEXT SESSION ===\n"
+            f"{queued_goal}\n=== END QUEUE ==="
+        )
+
     out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / f"{_slugify(project['name'])}_handoff.md"

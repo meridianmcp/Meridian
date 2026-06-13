@@ -888,7 +888,7 @@ async def site_password_gate(request: Request, call_next):
     if not site_pw:
         return await call_next(request)
     path = request.url.path
-    if path in ("/health", "/failover-status", "/mcp/health", "/__gate__", "/config", "/static", "/mcp/tools-doc", "/mcp/quickstart", "/mcp/sse", "/mcp", "/.well-known/oauth-authorization-server", "/.well-known/oauth-protected-resource") or path.startswith("/static/") or path.startswith("/oauth/") or path == "/demo" or path.startswith("/demo/"):
+    if path in ("/health", "/failover-status", "/mcp/health", "/__gate__", "/config", "/static", "/mcp/tools-doc", "/mcp/quickstart", "/mcp/sse", "/mcp", "/.well-known/oauth-authorization-server", "/.well-known/oauth-protected-resource", "/hooks/session-start", "/hooks/stop") or path.startswith("/static/") or path.startswith("/oauth/") or path.startswith("/status/") or path == "/demo" or path.startswith("/demo/"):
         return await call_next(request)
     # Demo cookie bypasses site password gate — demo users don't go through __gate__
     if request.cookies.get(_DEMO_CONTEXT_COOKIE):
@@ -1363,6 +1363,10 @@ async def failover_status() -> dict[str, bool]:
     """
     flag = (os.environ.get("MERIDIAN_IS_FAILOVER") or "").strip().lower()
     return {"is_failover": flag in ("1", "true", "yes", "on")}
+
+
+# Live status shields (/status/*) are defined further below — the canonical
+# rate-limited implementation lives next to the cached _MCP_TOOL_COUNT.
 
 
 @app.get("/terms", response_class=HTMLResponse)
@@ -4510,7 +4514,10 @@ async def workspace_remove_member(request: Request, member_id: str) -> None:
 async def workspace_list_notes(request: Request, tag: str | None = None) -> list[dict[str, Any]]:
     """List workspace-level notes, newest first."""
     db = await _db(request)
-    return await db_module.get_workspace_notes(db, tag=tag)
+    _t = await _get_tenant_from_request(request)
+    return await db_module.get_workspace_notes(
+        db, tag=tag, tenant_id=_t["id"] if _t else None
+    )
 
 
 @app.post("/workspace/notes", status_code=201)
@@ -4522,7 +4529,10 @@ async def workspace_add_note(request: Request) -> dict[str, Any]:
     content = (body.get("body") or "").strip()
     if not title or not content:
         raise HTTPException(status_code=422, detail="title and body are required")
-    return await db_module.add_workspace_note(db, title, content, body.get("tags"))
+    _t = await _get_tenant_from_request(request)
+    return await db_module.add_workspace_note(
+        db, title, content, body.get("tags"), tenant_id=_t["id"] if _t else None
+    )
 
 
 @app.patch("/workspace/notes/{note_id}")
@@ -4530,11 +4540,13 @@ async def workspace_update_note(request: Request, note_id: str) -> dict[str, Any
     """Patch title/body/tags on a workspace note."""
     db = await _db(request)
     body = await request.json()
+    _t = await _get_tenant_from_request(request)
     result = await db_module.update_workspace_note(
         db, note_id,
         title=body.get("title"),
         body=body.get("body"),
         tags=body.get("tags"),
+        tenant_id=_t["id"] if _t else None,
     )
     if result is None:
         raise HTTPException(status_code=404, detail="note not found")
@@ -4545,7 +4557,10 @@ async def workspace_update_note(request: Request, note_id: str) -> dict[str, Any
 async def workspace_delete_note(request: Request, note_id: str) -> None:
     """Delete a workspace note."""
     db = await _db(request)
-    deleted = await db_module.delete_workspace_note(db, note_id)
+    _t = await _get_tenant_from_request(request)
+    deleted = await db_module.delete_workspace_note(
+        db, note_id, tenant_id=_t["id"] if _t else None
+    )
     if not deleted:
         raise HTTPException(status_code=404, detail="note not found")
 
@@ -5669,7 +5684,25 @@ async def hooks_session_start(body: dict[str, Any], request: Request) -> dict[st
     session_name = (body.get("session_name") or "hook-session").strip()
     hook_cwd = (body.get("cwd") or "").strip()
     hook_hostname = (body.get("hostname") or "").strip()
-    db = await _resolve_hook_db(request)
+    registration_token = (body.get("registration_token") or "").strip()
+
+    # Token-based OAuth hooks: a hook script with no Bearer token but a
+    # hostname + registration_token authenticates against registered_hostnames
+    # in the control-plane DB. Unknown hostname/token MUST fail open to an empty
+    # context (Claude Code must always start cleanly) — never 401.
+    _has_bearer = request.headers.get("Authorization", "").startswith("Bearer ")
+    if not _has_bearer and registration_token:
+        _auth_db = request.app.state.db
+        _tid = await db_module.resolve_hostname_registration(
+            _auth_db, hook_hostname, registration_token
+        )
+        if not _tid:
+            return {"hookSpecificOutput": {
+                "hookEventName": "SessionStart", "additionalContext": ""}}
+        db = await _open_tenant_db_by_id(request, _tid)
+        request.state._db_conn = db
+    else:
+        db = await _resolve_hook_db(request)
 
     def _normalize_hook_cwd(path: str) -> str:
         value = (path or "").strip().replace("\\", "/")
@@ -5978,6 +6011,106 @@ async def hooks_stop(body: dict[str, Any], request: Request) -> dict[str, Any]:
     except Exception:  # noqa: BLE001
         pass
     return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
+# Token-based OAuth hooks — browser connect + machine registry (2da12762)
+# ---------------------------------------------------------------------------
+
+
+@app.get("/auth/hooks-connect")
+async def hooks_connect(request: Request, hostname: str = "") -> Any:
+    """Browser endpoint: register THIS machine to the logged-in tenant and show
+    the registration_token. Redirects to login when there is no session."""
+    from fastapi.responses import HTMLResponse, RedirectResponse
+    from urllib.parse import quote
+    hostname = (hostname or "").strip()
+    try:
+        tenant = await _get_authenticated_tenant(request)
+    except HTTPException:
+        nxt = quote(str(request.url), safe="")
+        return RedirectResponse(url=f"/auth/login?next={nxt}", status_code=303)
+    if not hostname:
+        raise HTTPException(status_code=400, detail="hostname required")
+    auth_db = request.app.state.db
+    token = await db_module.register_hostname(auth_db, tenant["id"], hostname)
+    safe_host = html_module.escape(hostname)
+    body = (
+        "<!doctype html><html><head><meta charset='utf-8'>"
+        "<title>Machine connected — Meridian</title>"
+        "<meta name='viewport' content='width=device-width, initial-scale=1'>"
+        "<style>body{font-family:system-ui,sans-serif;max-width:640px;margin:64px auto;"
+        "padding:0 20px;color:#1a1a2e}code{background:#f0f0f5;padding:2px 6px;border-radius:4px}"
+        ".tok{display:block;background:#0f1020;color:#7cf;padding:14px;border-radius:8px;"
+        "font-family:ui-monospace,monospace;word-break:break-all;margin:16px 0}"
+        ".ok{color:#1a9c4a;font-weight:600}</style></head><body>"
+        f"<h1>✅ <span class='ok'>{safe_host}</span> connected</h1>"
+        "<p>This machine is now registered for Meridian session hooks. The hook "
+        "script uses the registration token below — no API token needed.</p>"
+        f"<div class='tok'>{html_module.escape(token)}</div>"
+        "<p>You can close this tab. Manage or revoke machines anytime under "
+        "<strong>Settings → Known Machines</strong>.</p>"
+        "</body></html>"
+    )
+    return HTMLResponse(body)
+
+
+@app.get("/auth/hooks-status")
+async def hooks_status(request: Request, hostname: str = "") -> dict[str, Any]:
+    """Return {registered, token} for the logged-in tenant's hostname. The token
+    is echoed only to the authenticated owner so the installer can finish wiring
+    the hook script after the browser connect."""
+    tenant = await _get_authenticated_tenant(request)
+    auth_db = request.app.state.db
+    return await db_module.get_hostname_status(
+        auth_db, tenant["id"], (hostname or "").strip()
+    )
+
+
+@app.get("/projects/{project_id}/registered-machines")
+async def list_registered_machines(project_id: str, request: Request) -> list[dict[str, Any]]:
+    """List the tenant's registered hook machines (token omitted) for the
+    Settings → Known Machines panel. Registry is per-tenant; project_id only
+    scopes the dashboard route."""
+    tenant = await _get_authenticated_tenant(request)
+    auth_db = request.app.state.db
+    return await db_module.list_registered_hostnames(auth_db, tenant["id"])
+
+
+@app.delete("/projects/{project_id}/registered-machines/{machine_id}", status_code=204)
+async def revoke_registered_machine(
+    project_id: str, machine_id: str, request: Request
+) -> Response:
+    """Revoke one of the tenant's registered machines."""
+    tenant = await _get_authenticated_tenant(request)
+    auth_db = request.app.state.db
+    ok = await db_module.revoke_registered_hostname(auth_db, tenant["id"], machine_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="machine not found")
+    return Response(status_code=204)
+
+
+# ---------------------------------------------------------------------------
+# Session queue — queue the next /goal to run back-to-back (10e6b265)
+# ---------------------------------------------------------------------------
+
+
+@app.post("/projects/{project_id}/queue-session")
+async def queue_session(project_id: str, request: Request) -> dict[str, Any]:
+    """Queue the next /goal string; it's appended to the next handoff and then
+    cleared. Empty body clears the queue."""
+    db = await _db(request)
+    body = await request.json()
+    goal = (body.get("goal") or "").strip()
+    await db_module.set_queued_session(db, project_id, goal or None)
+    return {"queued": bool(goal), "goal": goal or None}
+
+
+@app.get("/projects/{project_id}/queued-session")
+async def get_queued_session_endpoint(project_id: str, request: Request) -> dict[str, Any]:
+    """Return the currently queued next-session goal, or null."""
+    db = await _db(request)
+    return {"goal": await db_module.get_queued_session(db, project_id)}
 
 
 async def _block_non_admin_connection_writes(request: Request) -> None:
@@ -7074,6 +7207,9 @@ async def _dispatch_mcp_tool(
     tenant: dict[str, Any] | None = None,
 ) -> Any:
     """Route a tools/call to the appropriate db_module function."""
+    # Tenant scope for the workspace layer (notes/decisions/settings). None for
+    # self-host / unauthenticated; the db functions then skip isolation.
+    _mcp_tenant_id = tenant.get("id") if tenant else None
     if name == "create_project":
         existing = await db_module.get_project_by_name(db, args["name"])
         if existing is not None:
@@ -7303,25 +7439,31 @@ async def _dispatch_mcp_tool(
     if name == "add_workspace_note":
         return await db_module.add_workspace_note(
             db, args["title"], args["body"], args.get("tags"),
+            tenant_id=_mcp_tenant_id,
         )
     if name == "get_workspace_notes":
-        return await db_module.get_workspace_notes(db, tag=args.get("tag"))
+        return await db_module.get_workspace_notes(
+            db, tag=args.get("tag"), tenant_id=_mcp_tenant_id,
+        )
     if name == "pin_workspace_decision":
         return await db_module.pin_workspace_decision(
             db, args["title"], args["body"],
             category=args.get("category", "TECHNICAL"),
+            tenant_id=_mcp_tenant_id,
         )
     if name == "get_workspace_decisions":
         return await db_module.get_workspace_decisions(
             db, include_superseded=args.get("include_superseded", False),
+            tenant_id=_mcp_tenant_id,
         )
     if name == "get_workspace_settings":
-        return await db_module.get_workspace_settings(db)
+        return await db_module.get_workspace_settings(db, tenant_id=_mcp_tenant_id)
     if name == "update_workspace_settings":
         return await db_module.update_workspace_settings(
             db,
             hitl_auto_answer_default=args.get("hitl_auto_answer_default"),
             sprint_name_default=args.get("sprint_name_default"),
+            tenant_id=_mcp_tenant_id,
         )
     if name == "get_context_block":
         # v2.3 — assemble the same shape as /projects/{id}/context-block but
@@ -7352,8 +7494,8 @@ async def _dispatch_mcp_tool(
         )
         # v3.1 — workspace decisions + notes apply across all projects; surface
         # them at the very top so a fresh session sees org-wide truth first.
-        ws_decisions = await db_module.get_workspace_decisions(db)
-        ws_notes = await db_module.get_workspace_notes(db)
+        ws_decisions = await db_module.get_workspace_decisions(db, tenant_id=_mcp_tenant_id)
+        ws_notes = await db_module.get_workspace_notes(db, tenant_id=_mcp_tenant_id)
         ws_block = _render_workspace_block(ws_decisions, ws_notes)
         if ws_block:
             text = f"{ws_block}\n\n{text}"

@@ -3844,6 +3844,214 @@ async def test_workspace_settings_db_defaults(db):
     assert settings["sprint_name_default"] is None
 
 
+# ---------------------------------------------------------------------------
+# 637dd900 — workspace layer tenant isolation
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_workspace_notes_isolated_by_tenant(db):
+    """A note created by tenant A must not be returned for tenant B."""
+    await db_module.add_workspace_note(db, "A-secret", "for A only", tenant_id="tenant-a")
+    await db_module.add_workspace_note(db, "B-secret", "for B only", tenant_id="tenant-b")
+
+    a_titles = {n["title"] for n in await db_module.get_workspace_notes(db, tenant_id="tenant-a")}
+    b_titles = {n["title"] for n in await db_module.get_workspace_notes(db, tenant_id="tenant-b")}
+    assert a_titles == {"A-secret"}
+    assert b_titles == {"B-secret"}
+
+
+@pytest.mark.asyncio
+async def test_workspace_note_legacy_null_visible_to_tenant(db):
+    """Pre-isolation rows (tenant_id IS NULL) stay visible to a tenant — they
+    only ever exist on that tenant's own dedicated DB."""
+    await db_module.add_workspace_note(db, "legacy", "old note")  # tenant_id NULL
+    titles = {n["title"] for n in await db_module.get_workspace_notes(db, tenant_id="tenant-a")}
+    assert "legacy" in titles
+
+
+@pytest.mark.asyncio
+async def test_delete_workspace_note_respects_tenant(db):
+    """Tenant B cannot delete tenant A's note."""
+    note = await db_module.add_workspace_note(db, "A-note", "body", tenant_id="tenant-a")
+    # Wrong tenant: no-op delete.
+    assert await db_module.delete_workspace_note(db, note["id"], tenant_id="tenant-b") is False
+    assert await db_module.get_workspace_notes(db, tenant_id="tenant-a")
+    # Right tenant: deletes.
+    assert await db_module.delete_workspace_note(db, note["id"], tenant_id="tenant-a") is True
+    assert await db_module.get_workspace_notes(db, tenant_id="tenant-a") == []
+
+
+@pytest.mark.asyncio
+async def test_workspace_decisions_isolated_by_tenant(db):
+    """A decision pinned by tenant A must not be visible to tenant B."""
+    await db_module.pin_workspace_decision(db, "A-arch", "A body", tenant_id="tenant-a")
+    await db_module.pin_workspace_decision(db, "B-arch", "B body", tenant_id="tenant-b")
+    a = {d["title"] for d in await db_module.get_workspace_decisions(db, tenant_id="tenant-a")}
+    assert a == {"A-arch"}
+
+
+@pytest.mark.asyncio
+async def test_workspace_settings_isolated_by_tenant(db):
+    """Settings written under tenant A are not seen by tenant B."""
+    await db_module.update_workspace_settings(
+        db, sprint_name_default="a-sprint", tenant_id="tenant-a"
+    )
+    a = await db_module.get_workspace_settings(db, tenant_id="tenant-a")
+    b = await db_module.get_workspace_settings(db, tenant_id="tenant-b")
+    assert a["sprint_name_default"] == "a-sprint"
+    assert b["sprint_name_default"] is None
+
+
+@pytest.mark.asyncio
+async def test_workspace_settings_single_row_fallback(db):
+    """A tenant-less read on a single-tenant DB falls back to the only row, so
+    internal callers (nudge, handoff) keep seeing the tenant's settings."""
+    await db_module.update_workspace_settings(
+        db, sprint_name_default="solo", tenant_id="tenant-a"
+    )
+    # No tenant_id passed (internal caller) — single-row fallback applies.
+    s = await db_module.get_workspace_settings(db)
+    assert s["sprint_name_default"] == "solo"
+
+
+# ---------------------------------------------------------------------------
+# 2da12762 — token-based OAuth hooks (registered_hostnames)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_register_hostname_returns_token_and_resolves(db):
+    token = await db_module.register_hostname(db, "tenant-a", "MACHINE-1")
+    assert token and len(token) >= 16
+    assert await db_module.resolve_hostname_registration(db, "MACHINE-1", token) == "tenant-a"
+    # Wrong token / unknown hostname do not resolve (fail closed at the db).
+    assert await db_module.resolve_hostname_registration(db, "MACHINE-1", "nope") is None
+    assert await db_module.resolve_hostname_registration(db, "OTHER", token) is None
+
+
+@pytest.mark.asyncio
+async def test_register_hostname_rotates_token(db):
+    t1 = await db_module.register_hostname(db, "tenant-a", "M1")
+    t2 = await db_module.register_hostname(db, "tenant-a", "M1")
+    assert t1 != t2
+    assert await db_module.resolve_hostname_registration(db, "M1", t1) is None
+    assert await db_module.resolve_hostname_registration(db, "M1", t2) == "tenant-a"
+
+
+@pytest.mark.asyncio
+async def test_hostname_status_list_and_revoke(db):
+    assert (await db_module.get_hostname_status(db, "tenant-a", "M1"))["registered"] is False
+    token = await db_module.register_hostname(db, "tenant-a", "M1")
+    assert await db_module.get_hostname_status(db, "tenant-a", "M1") == {
+        "registered": True, "token": token,
+    }
+    machines = await db_module.list_registered_hostnames(db, "tenant-a")
+    assert len(machines) == 1 and machines[0]["hostname"] == "M1"
+    assert "registration_token" not in machines[0]  # token never listed
+    # Revoke is tenant-scoped.
+    assert await db_module.revoke_registered_hostname(db, "tenant-b", machines[0]["id"]) is False
+    assert await db_module.revoke_registered_hostname(db, "tenant-a", machines[0]["id"]) is True
+    assert await db_module.list_registered_hostnames(db, "tenant-a") == []
+
+
+def test_hooks_session_start_unknown_hostname_returns_empty_not_401(client):
+    """An unknown hostname+token must fail open to an empty context so Claude
+    Code always starts cleanly — never 401."""
+    r = client.post("/hooks/session-start", json={
+        "hostname": "UNKNOWN-MACHINE",
+        "registration_token": "deadbeefdeadbeef",
+        "cwd": "/some/path",
+    })
+    assert r.status_code == 200
+    assert r.json()["hookSpecificOutput"]["additionalContext"] == ""
+
+
+# ---------------------------------------------------------------------------
+# 10e6b265 — session queue
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_queued_session_set_get_pop(db):
+    p = await db_module.create_project(db, "queue-proj")
+    assert await db_module.get_queued_session(db, p["id"]) is None
+    await db_module.set_queued_session(db, p["id"], "/goal do the thing")
+    assert await db_module.get_queued_session(db, p["id"]) == "/goal do the thing"
+    # pop is read-once
+    assert await db_module.pop_queued_session(db, p["id"]) == "/goal do the thing"
+    assert await db_module.get_queued_session(db, p["id"]) is None
+    assert await db_module.pop_queued_session(db, p["id"]) is None
+
+
+@pytest.mark.asyncio
+async def test_generate_handoff_appends_and_clears_queue(db, tmp_path):
+    from meridian import handoff as handoff_module
+    p = await db_module.create_project(db, "queue-proj2")
+    await db_module.set_queued_session(db, p["id"], "/goal next sprint")
+    _, content = await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True
+    )
+    assert "=== QUEUED NEXT SESSION ===" in content
+    assert "/goal next sprint" in content
+    # Cleared after exactly one handoff.
+    assert await db_module.get_queued_session(db, p["id"]) is None
+    _, content2 = await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True
+    )
+    assert "=== QUEUED NEXT SESSION ===" not in content2
+
+
+def test_queue_session_http_roundtrip(client):
+    pid = client.post("/projects", json={"name": "qhttp"}).json()["id"]
+    assert client.get(f"/projects/{pid}/queued-session").json()["goal"] is None
+    r = client.post(f"/projects/{pid}/queue-session", json={"goal": "/goal X"})
+    assert r.status_code == 200 and r.json()["queued"] is True
+    assert client.get(f"/projects/{pid}/queued-session").json()["goal"] == "/goal X"
+    # Empty goal clears it.
+    client.post(f"/projects/{pid}/queue-session", json={"goal": ""})
+    assert client.get(f"/projects/{pid}/queued-session").json()["goal"] is None
+
+
+# Live status shields (/status/*) are covered by test_status_*_badge above —
+# the canonical rate-limited endpoints came in on dev (45b4e35).
+
+
+# ---------------------------------------------------------------------------
+# STEP 5 — server-side sprint-item pagination
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_get_sprint_items_page_sql_pagination(db):
+    p = await db_module.create_project(db, "page-proj")
+    for i in range(7):
+        await db_module.add_sprint_item(db, p["id"], "v1", f"item-{i}")
+    items, total = await db_module.get_sprint_items_page(
+        db, p["id"], status="pending", limit=5, offset=0
+    )
+    assert total == 7 and len(items) == 5
+    items2, total2 = await db_module.get_sprint_items_page(
+        db, p["id"], status="pending", limit=5, offset=5
+    )
+    assert total2 == 7 and len(items2) == 2
+    # No overlap between pages.
+    assert {i["id"] for i in items}.isdisjoint({i["id"] for i in items2})
+
+
+def test_sprint_items_paginated_endpoint(client):
+    pid = client.post("/projects", json={"name": "pgproj"}).json()["id"]
+    for i in range(3):
+        client.post(f"/projects/{pid}/sprint-items", json={"title": f"t{i}", "version": "v1"})
+    j = client.get(f"/projects/{pid}/sprint-items?status=pending&page=1&limit=2").json()
+    assert j["total"] == 3 and j["page"] == 1 and j["pages"] == 2 and len(j["items"]) == 2
+    j2 = client.get(f"/projects/{pid}/sprint-items?status=pending&page=2&limit=2").json()
+    assert len(j2["items"]) == 1
+    # Without page= the legacy list shape is preserved.
+    legacy = client.get(f"/projects/{pid}/sprint-items?status=pending").json()
+    assert isinstance(legacy, list) and len(legacy) == 3
+
+
 def test_build_goal_xml_omits_decisions_when_empty():
     """No <decisions> tag when there's nothing to show — worker
     sessions in v1.2.0 will pass decisions=None for the same reason."""
