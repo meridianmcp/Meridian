@@ -213,6 +213,40 @@ jobs:
         if: steps.smoke.outcome == 'failure'
         run: exit 1
 
+  # ─── 5a. Ensure prod runs in both regions (HA) ────────────────────────────
+  # Spread prod machines across iad (primary) + ord (Chicago) so a single
+  # region outage can't take prod down. Idempotent — `scale count` just sets
+  # desired state. Non-fatal: a scaling hiccup must not fail the deploy, and
+  # idle machines auto-stop so the second region adds little steady-state cost.
+  ensure-regions:
+    needs: deploy
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: superfly/flyctl-actions/setup-flyctl@master
+      - name: Spread machines across iad,ord
+        run: flyctl scale count 2 --region iad,ord --app meridian-hosted --yes
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+
+  # ─── 5b. Refresh preview to latest main ───────────────────────────────────
+  # After a successful prod deploy, redeploy meridian-preview from the same
+  # commit so preview never drifts behind main. Non-fatal: a preview hiccup
+  # must not fail the prod pipeline.
+  refresh-preview:
+    needs: deploy
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: superfly/flyctl-actions/setup-flyctl@master
+      - name: Redeploy meridian-preview from main
+        run: flyctl deploy --remote-only --config fly-preview.toml --build-arg MERIDIAN_GIT_SHA=$(git rev-parse --short=12 HEAD)
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN_PREVIEW }}
+
   # ─── 6. CHANGELOG ─────────────────────────────────────────────────────────
   changelog:
     needs: deploy

@@ -17,10 +17,13 @@ SQL translation rules:
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import re
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+
+logger = logging.getLogger(__name__)
 
 
 def _is_transient_pg_error(exc: Exception) -> bool:
@@ -857,44 +860,39 @@ async def init_pg_db(url: str) -> PostgresConnection:
     is_main_db = not main_db_url or _same_pg_host(url, main_db_url)
     if is_main_db:
         await conn.executescript(CREATE_TABLES_HOSTED)
-    await _migrate_pg_sprint_items_v2(conn)
-    await _migrate_pg_v25_sprint_feedback(conn)
-    await _migrate_pg_drop_chat_tables(conn)
-    await _migrate_pg_goal_field_timestamps(conn)
-    await _migrate_pg_v24_task_tree_and_framework(conn)
-    await _migrate_pg_project_settings(conn)
-    await _migrate_pg_notify_email(conn)
-    await _migrate_pg_file_locks(conn)
-    await _migrate_pg_task_sprint_link(conn)
-    await _migrate_pg_v26_client_type(conn)
-    await _migrate_pg_v27_pg_trgm(conn)
-    await _migrate_pg_v24_pinned_decisions_and_hitl(conn)
-    await _migrate_pg_v09_notes_and_magic_links(conn)
-    await _migrate_pg_v32_workspace_and_checkpoint(conn)
-    await _migrate_pg_v33_hitl_kind_payload(conn)
-    await _migrate_pg_v34_hitl_auto_answer(conn)
-    await _migrate_pg_v34_workspace_settings(conn)
-    await _migrate_pg_workspace_settings_columns(conn)
-    await _migrate_pg_project_icon(conn)
+    # Migrations are run through _run_pg_migrations so that a single failing
+    # migration logs a WARNING but never crashes uvicorn startup. A bad
+    # migration (a stray index on a not-yet-created column) once killed all
+    # four prod machines for an hour on 2026-06-13 — startup must survive any
+    # individual migration error. Every _migrate_pg_* is idempotent
+    # (ADD COLUMN IF NOT EXISTS, CREATE TABLE IF NOT EXISTS, etc.), so skipping
+    # one this boot and retrying it next boot is safe.
+    #
+    # Ordering matters and is preserved: core migrations first, then the
+    # main-auth-DB-only set, then the late migrations that run on every DB.
+    await _run_pg_migrations(conn, _PG_MIGRATIONS_CORE)
     if is_main_db:
-        await _migrate_pg_v10_tenant_columns(conn)
-        await _migrate_pg_v25_admins_table(conn)
-        await _migrate_pg_v28_dunning_and_github_sub(conn)
-        await _migrate_pg_v29_free_tier_columns(conn)
-        await _migrate_pg_v31_github_integration(conn)
-        await _migrate_pg_v25_notification_prefs(conn)
-        await _migrate_pg_tenants_is_internal(conn)
-        await _migrate_pg_workspace_members_rbac(conn)
-        await _migrate_pg_admin_plan(conn)
-    await _migrate_pg_workspace_tenant_isolation(conn)
-    await _migrate_pg_sprint_items_claimed_at(conn)
-    await _migrate_pg_sprint_item_tree(conn)
-    await _migrate_pg_api_token_type(conn)
-    await _migrate_pg_api_token_expires_at(conn)
-    await _migrate_pg_oauth_codes(conn)
-    await _migrate_pg_github_to_projects(conn)
-    await _migrate_pg_queued_session(conn)
+        await _run_pg_migrations(conn, _PG_MIGRATIONS_HOSTED)
+    await _run_pg_migrations(conn, _PG_MIGRATIONS_LATE)
     return conn
+
+
+async def _run_pg_migrations(conn: PostgresConnection, migrations: tuple) -> None:
+    """Run each migration in isolation; log and continue on failure.
+
+    A migration error must never abort startup — see init_pg_db for the
+    outage that motivated this. Each migration is idempotent, so a failure
+    here is retried on the next boot.
+    """
+    for migration in migrations:
+        try:
+            await migration(conn)
+        except Exception as exc:  # noqa: BLE001 — startup must survive any migration error
+            logger.warning(
+                "pg migration %s failed (continuing startup): %s",
+                getattr(migration, "__name__", repr(migration)),
+                exc,
+            )
 
 
 async def _migrate_pg_sprint_items_claimed_at(conn: PostgresConnection) -> None:
@@ -1474,3 +1472,57 @@ async def _migrate_pg_v25_admins_table(conn: PostgresConnection) -> None:
             " ON CONFLICT (email) DO NOTHING",
             (str(_uuid.uuid4()), email, "system", notes),
         )
+
+
+# ── Migration registry ──────────────────────────────────────────────────────
+# Ordered tuples consumed by _run_pg_migrations (see init_pg_db). Order is
+# load-bearing and matches the historical call sequence exactly. Defined at
+# module level — after every _migrate_pg_* function exists — so the references
+# resolve at import time. Each migration is idempotent and runs through a
+# per-migration try/except so one failure can't crash uvicorn startup.
+_PG_MIGRATIONS_CORE = (
+    _migrate_pg_sprint_items_v2,
+    _migrate_pg_v25_sprint_feedback,
+    _migrate_pg_drop_chat_tables,
+    _migrate_pg_goal_field_timestamps,
+    _migrate_pg_v24_task_tree_and_framework,
+    _migrate_pg_project_settings,
+    _migrate_pg_notify_email,
+    _migrate_pg_file_locks,
+    _migrate_pg_task_sprint_link,
+    _migrate_pg_v26_client_type,
+    _migrate_pg_v27_pg_trgm,
+    _migrate_pg_v24_pinned_decisions_and_hitl,
+    _migrate_pg_v09_notes_and_magic_links,
+    _migrate_pg_v32_workspace_and_checkpoint,
+    _migrate_pg_v33_hitl_kind_payload,
+    _migrate_pg_v34_hitl_auto_answer,
+    _migrate_pg_v34_workspace_settings,
+    _migrate_pg_workspace_settings_columns,
+    _migrate_pg_project_icon,
+)
+
+# Main auth DB only — tenants, billing, admins, RBAC. Skipped on per-customer DBs.
+_PG_MIGRATIONS_HOSTED = (
+    _migrate_pg_v10_tenant_columns,
+    _migrate_pg_v25_admins_table,
+    _migrate_pg_v28_dunning_and_github_sub,
+    _migrate_pg_v29_free_tier_columns,
+    _migrate_pg_v31_github_integration,
+    _migrate_pg_v25_notification_prefs,
+    _migrate_pg_tenants_is_internal,
+    _migrate_pg_workspace_members_rbac,
+    _migrate_pg_admin_plan,
+)
+
+# Late migrations — run on every DB after the hosted-only set.
+_PG_MIGRATIONS_LATE = (
+    _migrate_pg_workspace_tenant_isolation,
+    _migrate_pg_sprint_items_claimed_at,
+    _migrate_pg_sprint_item_tree,
+    _migrate_pg_api_token_type,
+    _migrate_pg_api_token_expires_at,
+    _migrate_pg_oauth_codes,
+    _migrate_pg_github_to_projects,
+    _migrate_pg_queued_session,
+)

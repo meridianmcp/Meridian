@@ -1,4 +1,10 @@
 app = "meridian-hosted"
+# Multi-region HA: iad (Ashburn) is primary, ord (Chicago) is the secondary so a
+# single-region outage can't take prod down. Machines-platform apps don't declare
+# regions in fly.toml — placement is set by `fly scale count` (see the
+# ensure-regions job in .github/workflows/deploy.yml, which spreads machines
+# across iad,ord after every prod deploy). Idle machines auto-stop, so the
+# secondary region adds HA at near-zero steady-state cost.
 primary_region = "iad"
 
 [build]

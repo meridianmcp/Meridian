@@ -5257,6 +5257,96 @@ def test_pg_adapter_translates_datetime_interval_units():
     assert params == ["2", "lock-123"]
 
 
+@pytest.mark.asyncio
+async def test_run_pg_migrations_survives_a_failing_migration(caplog):
+    """A single failing migration must NOT crash startup — it logs a WARNING
+    and the remaining migrations still run.
+
+    Regression guard for the 2026-06-13 outage: a bad startup migration raised
+    and killed all four prod machines. init_pg_db now runs every migration
+    through _run_pg_migrations, which isolates failures per-migration.
+    """
+    from meridian import pg_adapter as pg_module
+
+    ran = []
+
+    async def ok_one(conn):
+        ran.append("ok_one")
+
+    async def boom(conn):
+        ran.append("boom")
+        raise RuntimeError("simulated bad migration")
+
+    async def ok_two(conn):
+        ran.append("ok_two")
+
+    with caplog.at_level("WARNING", logger="meridian.pg_adapter"):
+        # Must not raise even though the middle migration blows up.
+        await pg_module._run_pg_migrations(object(), (ok_one, boom, ok_two))
+
+    assert ran == ["ok_one", "boom", "ok_two"]  # all attempted, in order
+    assert any("boom" in r.message and "simulated bad migration" in r.message
+               for r in caplog.records), "failing migration should log a WARNING"
+
+
+def test_pg_migration_registry_matches_historical_order():
+    """The migration registry tuples must concatenate to the exact historical
+    call order (core → hosted → late) so refactoring the runner can't silently
+    drop or reorder a migration.
+    """
+    from meridian import pg_adapter as pg_module
+
+    core = [f.__name__ for f in pg_module._PG_MIGRATIONS_CORE]
+    hosted = [f.__name__ for f in pg_module._PG_MIGRATIONS_HOSTED]
+    late = [f.__name__ for f in pg_module._PG_MIGRATIONS_LATE]
+
+    assert core == [
+        "_migrate_pg_sprint_items_v2",
+        "_migrate_pg_v25_sprint_feedback",
+        "_migrate_pg_drop_chat_tables",
+        "_migrate_pg_goal_field_timestamps",
+        "_migrate_pg_v24_task_tree_and_framework",
+        "_migrate_pg_project_settings",
+        "_migrate_pg_notify_email",
+        "_migrate_pg_file_locks",
+        "_migrate_pg_task_sprint_link",
+        "_migrate_pg_v26_client_type",
+        "_migrate_pg_v27_pg_trgm",
+        "_migrate_pg_v24_pinned_decisions_and_hitl",
+        "_migrate_pg_v09_notes_and_magic_links",
+        "_migrate_pg_v32_workspace_and_checkpoint",
+        "_migrate_pg_v33_hitl_kind_payload",
+        "_migrate_pg_v34_hitl_auto_answer",
+        "_migrate_pg_v34_workspace_settings",
+        "_migrate_pg_workspace_settings_columns",
+        "_migrate_pg_project_icon",
+    ]
+    assert hosted == [
+        "_migrate_pg_v10_tenant_columns",
+        "_migrate_pg_v25_admins_table",
+        "_migrate_pg_v28_dunning_and_github_sub",
+        "_migrate_pg_v29_free_tier_columns",
+        "_migrate_pg_v31_github_integration",
+        "_migrate_pg_v25_notification_prefs",
+        "_migrate_pg_tenants_is_internal",
+        "_migrate_pg_workspace_members_rbac",
+        "_migrate_pg_admin_plan",
+    ]
+    assert late == [
+        "_migrate_pg_workspace_tenant_isolation",
+        "_migrate_pg_sprint_items_claimed_at",
+        "_migrate_pg_sprint_item_tree",
+        "_migrate_pg_api_token_type",
+        "_migrate_pg_api_token_expires_at",
+        "_migrate_pg_oauth_codes",
+        "_migrate_pg_github_to_projects",
+        "_migrate_pg_queued_session",
+    ]
+    # No duplicates across the three groups.
+    allnames = core + hosted + late
+    assert len(allnames) == len(set(allnames)) == 36
+
+
 def test_cached_plan_error_is_retryable():
     """A stale prepared-plan error must be classified transient so the pool
     retries with a fresh connection.
