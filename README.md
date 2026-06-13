@@ -16,6 +16,9 @@ Claude Code, Cursor, Cline, Claude Desktop, or any MCP client.
 [![Docs](https://img.shields.io/badge/docs-docs.usemeridian.us-6c8fff)](https://docs.usemeridian.us)
 [![Hosted](https://img.shields.io/badge/hosted-usemeridian.us-a78bfa)](https://usemeridian.us)
 [![Neon](https://img.shields.io/badge/db-neon%20postgres-00e599)](https://neon.tech)
+[![Server](https://img.shields.io/endpoint?url=https://usemeridian.us/status/server)](https://usemeridian.us)
+[![MCP Tools](https://img.shields.io/endpoint?url=https://usemeridian.us/status/tools)](https://docs.usemeridian.us/mcp-tools)
+[![Live Sessions](https://img.shields.io/endpoint?url=https://usemeridian.us/status/sessions)](https://usemeridian.us)
 
 ## Why Meridian
 
