@@ -6089,6 +6089,14 @@ async def hooks_session_start(body: dict[str, Any], request: Request) -> dict[st
             f"pending sprint item before starting any work. "
             f"Top item id: {top_item_id}"
         )
+    # fffdcc95 — yellow warning when an executor runs in the main checkout instead of an
+    # isolated .claude/worktrees/ tree; parallel sessions there can clobber each other.
+    if _hook_is_executor(body) and "/.claude/worktrees/" not in (normalized_hook_cwd or "").lower():
+        lines.insert(0, (
+            "⚠️ Parallel safety degraded: this executor is running in the main checkout, "
+            "not a .claude/worktrees/ isolate. Stage ONLY your own files by path "
+            "(never git add -A) so you don't sweep up another session's work."
+        ))
     additional_context = "\n".join(lines)
     return {"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": additional_context}}
 

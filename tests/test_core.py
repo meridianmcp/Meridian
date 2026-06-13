@@ -7493,6 +7493,28 @@ def test_hooks_session_start_cwd_legacy_repo_path_beats_hostname_fallback(client
     assert f"({a['id']})" not in ctx, "hostname-only project must not hijack a cwd match"
 
 
+def test_hooks_session_start_warns_executor_in_main_checkout(client):
+    """fffdcc95 — an executor not in a .claude/worktrees/ isolate gets a parallel
+    -safety warning; one inside a worktree (or a plain chat) does not."""
+    pid = client.post("/projects", json={"name": "wt-warn-proj"}).json()["id"]
+    # Executor in the main checkout → warned.
+    main_ctx = client.post("/hooks/session-start", json={
+        "project_id": pid, "permission_mode": "bypassPermissions",
+        "cwd": "C:/Users/me/repo", "hostname": "HOSTW",
+    }).json()["hookSpecificOutput"]["additionalContext"]
+    assert "Parallel safety degraded" in main_ctx
+    # Executor inside a worktree → no warning.
+    wt_ctx = client.post("/hooks/session-start", json={
+        "project_id": pid, "permission_mode": "bypassPermissions",
+        "cwd": "C:/Users/me/repo/.claude/worktrees/sess123", "hostname": "HOSTW",
+    }).json()["hookSpecificOutput"]["additionalContext"]
+    assert "Parallel safety degraded" not in wt_ctx
+    # Plain chat (non-executor) → no warning.
+    chat_ctx = client.post("/hooks/session-start", json={"project_id": pid}).json()[
+        "hookSpecificOutput"]["additionalContext"]
+    assert "Parallel safety degraded" not in chat_ctx
+
+
 def test_hooks_session_start_missing_project_id(client):
     r = client.post("/hooks/session-start", json={})
     assert r.status_code == 400
