@@ -59,8 +59,8 @@ def test_dashboard_loads_200(client):
     assert soup.find("body") is not None, "HTML body element missing"
     # Static JS and CSS must be referenced
     scripts = [s.get("src", "") for s in soup.find_all("script")]
-    assert any("dashboard.js" in s for s in scripts), (
-        "dashboard.html must load /static/dashboard.js"
+    assert any("dashboard.bundle.js" in s for s in scripts), (
+        "dashboard.html must load /static/dashboard.bundle.js"
     )
     links = [l.get("href", "") for l in soup.find_all("link")]
     assert any("dashboard.css" in l for l in links), (
@@ -167,8 +167,8 @@ def test_dashboard_has_timeline_tab(soup, js):
     )
     # The HTML template must load the JS bundle
     scripts = [s.get("src", "") for s in soup.find_all("script")]
-    assert any("dashboard.js" in s for s in scripts), (
-        "dashboard.html must reference /static/dashboard.js"
+    assert any("dashboard.bundle.js" in s for s in scripts), (
+        "dashboard.html must reference /static/dashboard.bundle.js"
     )
 
 
@@ -203,7 +203,9 @@ def test_signout_link_created_unconditionally_for_hosted_users(js, client):
     # _renderPlanBadge was extracted to dashboard-sprint.js — check it there.
     js_sprint = client.get("/static/dashboard-sprint.js").text
     plan_badge_start = js_sprint.index("function _renderPlanBadge")
-    plan_badge_end = js_sprint.index("\nfunction ", plan_badge_start + 1)
+    import re as _re
+    _next = _re.search(r"\n(?:export )?function ", js_sprint[plan_badge_start + 1:])
+    plan_badge_end = (plan_badge_start + 1 + _next.start()) if _next else len(js_sprint)
     plan_badge_body = js_sprint[plan_badge_start:plan_badge_end]
     assert "ensureSignOutLink(me.email)" in plan_badge_body, (
         "_renderPlanBadge must still call ensureSignOutLink(me.email) to update "

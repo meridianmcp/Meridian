@@ -1,25 +1,25 @@
 // Extracted from dashboard.js -- demo/tour/utility functions
 // DO NOT DELETE -- loaded via script tag in dashboard.html
 
-function isDemoMode() {
+export function isDemoMode() {
 
   return !!state.serverConfig?.demo_mode || window.location.pathname.startsWith('/demo');
 
 }
 
-function isHostedMode() {
+export function isHostedMode() {
 
   return !!window.MERIDIAN_HOSTED;
 
 }
 
-function isHostedAdmin() {
+export function isHostedAdmin() {
 
   return isHostedMode() && !!window.MERIDIAN_IS_ADMIN;
 
 }
 
-function ensureTourButton() {
+export function ensureTourButton() {
 
   const footer = document.querySelector('.sidebar-footer');
 
@@ -47,7 +47,7 @@ function ensureTourButton() {
 
 }
 
-function ensureFeedbackButton() {
+export function ensureFeedbackButton() {
 
   // The /feedback endpoint is hosted-only (404 otherwise) — don't show a
 
@@ -83,7 +83,7 @@ function ensureFeedbackButton() {
 
 }
 
-function showFeedbackModal() {
+export function showFeedbackModal() {
 
   if (document.getElementById('feedback-modal')) return;
 
@@ -182,7 +182,7 @@ function showFeedbackModal() {
 
 }
 
-function hideDemoAdminControls() {
+export function hideDemoAdminControls() {
 
   const selectors = [
 
@@ -324,7 +324,7 @@ function hideDemoAdminControls() {
 
 }
 
-function showDemoReadonlyToast() {
+export function showDemoReadonlyToast() {
 
   const el = document.getElementById('toast');
 
@@ -338,7 +338,7 @@ function showDemoReadonlyToast() {
 
 }
 
-function showDemoOnboardingOverlay() {
+export function showDemoOnboardingOverlay() {
 
   if (document.getElementById('demo-onboarding-overlay')) return;
 
@@ -387,3 +387,7 @@ function showDemoOnboardingOverlay() {
   document.body.appendChild(overlay);
 
 }
+
+// --- ITEM 4 esbuild: re-expose top-level symbols as globals so inline
+// handlers and cross-file references keep resolving after IIFE bundling.
+try { Object.assign(window, { isDemoMode, isHostedMode, isHostedAdmin, ensureTourButton, ensureFeedbackButton, showFeedbackModal, hideDemoAdminControls, showDemoReadonlyToast, showDemoOnboardingOverlay }); } catch (e) {}
