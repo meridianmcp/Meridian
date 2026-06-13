@@ -960,6 +960,15 @@ except ImportError:
     _RATE_LIMIT = "100/minute"
 
 
+def _rate_limit(rate: str):
+    """Return a decorator that applies *rate* via slowapi, or a no-op when slowapi is absent."""
+    def decorator(func):
+        if _limiter is None:
+            return func
+        return _limiter.limit(rate)(func)
+    return decorator
+
+
 # G4.15 — Safety-limit exception → 429
 from . import limits as _limits_module  # noqa: E402, PLC0415
 
@@ -1547,6 +1556,7 @@ async def auth_logout(request: Request):
 
 
 @app.post("/auth/magic")
+@_rate_limit("5/minute")
 async def auth_magic_request(request: Request):
     """v0.9 — request a magic-link email. Rate-limited.
 
@@ -4595,6 +4605,7 @@ def _is_demo_request(request: Request) -> bool:
 
 
 @app.get("/export/my-data")
+@_rate_limit("3/minute")
 async def export_my_data(request: Request) -> Response:
     """GDPR data portability — returns a JSON file of all account data."""
     if not _hosted_mode():

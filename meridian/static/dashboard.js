@@ -6443,13 +6443,6 @@ async function loadSettingsTab(projectId) {
   }
 
   let html = '';
-  const detectedHookOS = detectHookInstallOS();
-
-  html += `<div id="settings-os-detection-banner-${projectId}" style="margin-bottom:12px;padding:10px 12px;border:1px solid var(--accent);border-radius:6px;background:rgba(108,143,255,.08)">
-    <div style="font-size:10px;color:var(--accent);font-weight:700;letter-spacing:.04em;text-transform:uppercase;margin-bottom:4px">Detected OS: ${escapeHtml(detectedHookOS.label)}</div>
-    <div style="font-size:10px;color:var(--muted);line-height:1.5">Recommended setup command for this browser:</div>
-    <code style="display:block;margin-top:5px;padding:6px 8px;border:1px solid var(--border);border-radius:4px;background:var(--surface-1);color:var(--text);font-size:10px;white-space:pre-wrap;word-break:break-all">${escapeHtml(detectedHookOS.command)}</code>
-  </div>`;
 
 
 

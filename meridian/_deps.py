@@ -137,10 +137,12 @@ async def _open_tenant_db_by_id(request: Request, tenant_id: str) -> Any:
         except Exception:
             _log.warning("Failed to decrypt neon_db_url for tenant %s", tenant_id)
             url = None
-    if not url:
+    # MERIDIAN_AUTH_DB is the admin's project DB — only admin-plan tenants may use it.
+    if not url and tenant.get("plan") == "admin":
         url = os.environ.get("MERIDIAN_AUTH_DB") or None
     if not url:
-        if tenant.get("is_internal"):
+        # Fallback: admin accounts without a dedicated Neon DB use the auth DB directly.
+        if tenant.get("plan") == "admin":
             conn = auth_db
             _tenant_db_cache[tenant_id] = conn
             return conn

@@ -656,6 +656,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_v34_workspace_settings(db)
     await _migrate_project_icon(db)
     await _migrate_tenants_is_internal(db)
+    await _migrate_admin_plan(db)
     await _migrate_workspace_members_rbac(db)
     await _migrate_sprint_items_indeterminate(db)
     await _migrate_sprint_item_tree(db)

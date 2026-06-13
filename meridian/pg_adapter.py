@@ -594,6 +594,7 @@ CREATE TABLE IF NOT EXISTS workspace_notes (
     title TEXT NOT NULL,
     body TEXT NOT NULL,
     tags TEXT,
+    tenant_id TEXT,
     created_at TEXT NOT NULL DEFAULT ({_TS})
 );
 CREATE TABLE IF NOT EXISTS workspace_decisions (
@@ -602,10 +603,13 @@ CREATE TABLE IF NOT EXISTS workspace_decisions (
     body TEXT NOT NULL,
     category TEXT NOT NULL DEFAULT 'TECHNICAL',
     status TEXT NOT NULL DEFAULT 'active',
+    tenant_id TEXT,
     created_at TEXT NOT NULL DEFAULT ({_TS})
 );
 CREATE INDEX IF NOT EXISTS idx_workspace_notes_created ON workspace_notes(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_workspace_notes_tenant ON workspace_notes(tenant_id);
 CREATE INDEX IF NOT EXISTS idx_workspace_decisions_status ON workspace_decisions(status, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_workspace_decisions_tenant ON workspace_decisions(tenant_id);
 
 -- v3.4 — workspace-level settings singleton (tenant-global defaults).
 CREATE TABLE IF NOT EXISTS workspace_settings (
@@ -882,6 +886,8 @@ async def init_pg_db(url: str) -> PostgresConnection:
         await _migrate_pg_v25_notification_prefs(conn)
         await _migrate_pg_tenants_is_internal(conn)
         await _migrate_pg_workspace_members_rbac(conn)
+        await _migrate_pg_admin_plan(conn)
+    await _migrate_pg_workspace_tenant_isolation(conn)
     await _migrate_pg_sprint_items_claimed_at(conn)
     await _migrate_pg_sprint_item_tree(conn)
     await _migrate_pg_api_token_type(conn)
@@ -1041,6 +1047,34 @@ async def _migrate_pg_tenants_is_internal(conn: PostgresConnection) -> None:
     for email in sorted(db_module._internal_emails()):
         await conn.execute(
             "UPDATE tenants SET is_internal = 1 WHERE LOWER(email) = ?",
+            (email,),
+        )
+
+
+async def _migrate_pg_workspace_tenant_isolation(conn: PostgresConnection) -> None:
+    """Add tenant_id to workspace_notes/decisions/settings. Idempotent."""
+    await conn.executescript(
+        "ALTER TABLE workspace_notes ADD COLUMN IF NOT EXISTS tenant_id TEXT;"
+        "ALTER TABLE workspace_decisions ADD COLUMN IF NOT EXISTS tenant_id TEXT;"
+        "ALTER TABLE workspace_settings ADD COLUMN IF NOT EXISTS tenant_id TEXT;"
+        "CREATE INDEX IF NOT EXISTS idx_ws_notes_tenant ON workspace_notes(tenant_id);"
+        "CREATE INDEX IF NOT EXISTS idx_ws_decisions_tenant ON workspace_decisions(tenant_id)"
+    )
+
+
+async def _migrate_pg_admin_plan(conn: PostgresConnection) -> None:
+    """Set plan='admin' for tenants whose email is in MERIDIAN_ADMIN_EMAILS / ADMIN_EMAIL.
+
+    Makes the plan column authoritative for admin-DB routing in _deps.py.
+    Idempotent — safe to run on every startup.
+    """
+    whitelist_raw = os.environ.get("MERIDIAN_ADMIN_EMAILS", os.environ.get("ADMIN_EMAIL", ""))
+    if not whitelist_raw:
+        return
+    admin_emails = {e.strip().lower() for e in whitelist_raw.split(",") if e.strip()}
+    for email in sorted(admin_emails):
+        await conn.execute(
+            "UPDATE tenants SET plan = 'admin' WHERE LOWER(email) = ? AND plan != 'admin'",
             (email,),
         )
 

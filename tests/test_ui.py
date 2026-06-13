@@ -348,9 +348,10 @@ def test_dashboard_claude_tab_has_session_controls(client):
 
 def test_dashboard_settings_has_os_detection_banner(client):
     js = client.get("/static/dashboard.js").text
-    assert "settings-os-detection-banner-" in js
+    # OS hint lives inside the Meridian Connect tab only (not duplicated at top of settings)
     assert "detectHookInstallOS" in js
-    assert "Detected OS:" in js
+    assert "osExecutorHintBanner" in js
+    assert "settings-os-detection-banner-" not in js
 
 
 def test_dashboard_open_in_claude_not_dominant(client):
