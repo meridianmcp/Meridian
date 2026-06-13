@@ -614,6 +614,7 @@ CREATE TABLE IF NOT EXISTS workspace_settings (
     sprint_name_default TEXT,
     display_name TEXT,
     log_task_sprint_nudge_threshold INTEGER NOT NULL DEFAULT 5,
+    handoff_template TEXT,
     updated_at TEXT NOT NULL DEFAULT ({_TS})
 );
 """
@@ -1289,7 +1290,8 @@ async def _migrate_pg_workspace_settings_columns(conn: PostgresConnection) -> No
     await conn.executescript(
         "ALTER TABLE workspace_settings ADD COLUMN IF NOT EXISTS display_name TEXT;"
         "ALTER TABLE workspace_settings ADD COLUMN IF NOT EXISTS "
-        "log_task_sprint_nudge_threshold INTEGER NOT NULL DEFAULT 5"
+        "log_task_sprint_nudge_threshold INTEGER NOT NULL DEFAULT 5;"
+        "ALTER TABLE workspace_settings ADD COLUMN IF NOT EXISTS handoff_template TEXT"
     )
 
 

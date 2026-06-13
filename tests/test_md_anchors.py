@@ -316,6 +316,30 @@ async def test_update_md_section_creates_hitl_then_applies(db, tmp_path, monkeyp
 
 
 @pytest.mark.asyncio
+async def test_update_md_section_force_skips_hitl(db, tmp_path, monkeypatch):
+    """v1.1 — force=true applies the section replacement directly (no HITL),
+    while the default path still files a HITL request."""
+    monkeypatch.setenv("MERIDIAN_MD_ROOT", str(tmp_path))
+    monkeypatch.delenv("MERIDIAN_HOSTED", raising=False)
+    _write_anchor_file(tmp_path / "AGENTS.md", "agents-body", "before\n")
+    p = await db_module.create_project(db, "force-tool")
+    result = await server_module._dispatch_mcp_tool(
+        "update_md_section",
+        {"project_id": p["id"], "file": "AGENTS.md", "anchor": "agents-body",
+         "content": "FORCED CONTENT", "force": True},
+        db, str(tmp_path),
+    )
+    # Applied directly — no HITL kind/status in the response.
+    assert result["applied"] is True
+    assert result["forced"] is True
+    assert "kind" not in result
+    # File written immediately, without an approval step.
+    assert "FORCED CONTENT" in (tmp_path / "AGENTS.md").read_text(encoding="utf-8")
+    # No HITL request was created.
+    assert await db_module.list_hitl_requests(db, p["id"], status="pending") == []
+
+
+@pytest.mark.asyncio
 async def test_update_md_section_rejects_append_anchor(db, tmp_path, monkeypatch):
     monkeypatch.setenv("MERIDIAN_MD_ROOT", str(tmp_path))
     p = await db_module.create_project(db, "tool2")

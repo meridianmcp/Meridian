@@ -4,9 +4,176 @@ from __future__ import annotations
 
 import asyncio
 
+import pytest
+
 from meridian import db as db_module
 from meridian import hosted as hosted_module
 from meridian import server as server_module
+
+
+# ---------------------------------------------------------------------------
+# v1.1 — CI/CD, search/diff, and Issues GitHub MCP tools
+# ---------------------------------------------------------------------------
+
+class _GHResp:
+    def __init__(self, status=200, payload=None, text=""):
+        self.status_code = status
+        self._payload = payload if payload is not None else {}
+        self.text = text
+
+    def json(self):
+        return self._payload
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise RuntimeError(f"HTTP {self.status_code}")
+
+
+class _MockGHClient:
+    """Routes GitHub API calls to canned responses by URL substring."""
+
+    def __init__(self, routes):
+        self.routes = routes
+        self.calls = []
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        pass
+
+    def _match(self, url):
+        for frag, resp in self.routes:
+            if frag in url:
+                return resp
+        return _GHResp(404, {})
+
+    async def get(self, url, **kwargs):
+        self.calls.append(("GET", url, kwargs))
+        return self._match(url)
+
+    async def post(self, url, **kwargs):
+        self.calls.append(("POST", url, kwargs))
+        return self._match(url)
+
+
+async def _gh_project(db):
+    """Create a project with a connected GitHub repo + a tenant dict with a PAT."""
+    proj = await db_module.create_project(db, "gh-tools")
+    await db.execute(
+        "UPDATE projects SET github_repo = ?, github_branch = ? WHERE id = ?",
+        ("octo/repo", "main", proj["id"]),
+    )
+    await db.commit()
+    tenant = {"github_pat": db_module.encrypt_field("ghp_secret")}
+    return proj, tenant
+
+
+def test_new_github_tools_registered():
+    """The CI/CD, diff, and Issues tools are advertised when a PAT is set."""
+    tenant = {"github_pat": db_module.encrypt_field("ghp_x")}
+    names = {t["name"] for t in server_module._github_tools_for_tenant(tenant)}
+    for expected in (
+        "get_workflow_runs", "get_workflow_run_logs", "trigger_workflow",
+        "git_diff", "list_branches", "list_issues", "create_issue", "get_issue",
+    ):
+        assert expected in names
+        assert expected in server_module._GITHUB_TOOL_NAMES
+    # No PAT → no tools.
+    assert server_module._github_tools_for_tenant({"github_pat": None}) == []
+
+
+@pytest.mark.asyncio
+async def test_github_get_workflow_runs(db, monkeypatch):
+    proj, tenant = await _gh_project(db)
+    mock = _MockGHClient([
+        ("/actions/workflows/deploy.yml/runs", _GHResp(200, {"workflow_runs": [
+            {"id": 42, "name": "Deploy", "status": "completed", "conclusion": "success",
+             "created_at": "2026-06-13T00:00:00Z", "html_url": "https://gh/runs/42"},
+        ]})),
+    ])
+    monkeypatch.setattr("httpx.AsyncClient", lambda **kw: mock)
+    res = await server_module._dispatch_github_tool(
+        "get_workflow_runs",
+        {"project_id": proj["id"], "workflow_name": "deploy.yml"}, tenant, db,
+    )
+    assert res["count"] == 1
+    assert res["runs"][0]["id"] == 42
+    assert res["runs"][0]["conclusion"] == "success"
+
+
+@pytest.mark.asyncio
+async def test_github_git_diff(db, monkeypatch):
+    proj, tenant = await _gh_project(db)
+    mock = _MockGHClient([
+        ("/compare/main...feature", _GHResp(200, {
+            "total_commits": 3,
+            "files": [{"filename": "a.py", "status": "modified", "additions": 5,
+                       "deletions": 2, "patch": "@@ -1 +1 @@"}],
+        })),
+    ])
+    monkeypatch.setattr("httpx.AsyncClient", lambda **kw: mock)
+    res = await server_module._dispatch_github_tool(
+        "git_diff", {"project_id": proj["id"], "base": "main", "head": "feature"}, tenant, db,
+    )
+    assert res["total_commits"] == 3
+    assert res["files"][0]["filename"] == "a.py"
+
+
+@pytest.mark.asyncio
+async def test_github_list_issues_excludes_prs(db, monkeypatch):
+    proj, tenant = await _gh_project(db)
+    mock = _MockGHClient([
+        ("/issues", _GHResp(200, [
+            {"number": 1, "title": "Bug", "state": "open", "labels": [{"name": "bug"}],
+             "created_at": "2026-06-13T00:00:00Z", "html_url": "u", "body": "broken"},
+            {"number": 2, "title": "A PR", "state": "open", "labels": [],
+             "created_at": "x", "html_url": "u2", "body": "", "pull_request": {"url": "p"}},
+        ])),
+    ])
+    monkeypatch.setattr("httpx.AsyncClient", lambda **kw: mock)
+    res = await server_module._dispatch_github_tool(
+        "list_issues", {"project_id": proj["id"]}, tenant, db,
+    )
+    nums = [i["number"] for i in res["issues"]]
+    assert nums == [1]  # PR #2 excluded
+    assert res["issues"][0]["labels"] == ["bug"]
+
+
+@pytest.mark.asyncio
+async def test_github_create_issue(db, monkeypatch):
+    proj, tenant = await _gh_project(db)
+    mock = _MockGHClient([
+        ("/issues", _GHResp(201, {"number": 7, "title": "New", "state": "open",
+                                   "html_url": "https://gh/issues/7"})),
+    ])
+    monkeypatch.setattr("httpx.AsyncClient", lambda **kw: mock)
+    res = await server_module._dispatch_github_tool(
+        "create_issue",
+        {"project_id": proj["id"], "title": "New", "body": "b", "labels": ["bug"]},
+        tenant, db,
+    )
+    assert res["number"] == 7
+    # POST body carried title/body/labels.
+    post_call = next(c for c in mock.calls if c[0] == "POST")
+    assert post_call[2]["json"]["title"] == "New"
+    assert post_call[2]["json"]["labels"] == ["bug"]
+
+
+@pytest.mark.asyncio
+async def test_github_trigger_workflow_defaults_ref(db, monkeypatch):
+    proj, tenant = await _gh_project(db)
+    mock = _MockGHClient([("/dispatches", _GHResp(204))])
+    monkeypatch.setattr("httpx.AsyncClient", lambda **kw: mock)
+    res = await server_module._dispatch_github_tool(
+        "trigger_workflow",
+        {"project_id": proj["id"], "workflow_name": "deploy.yml", "inputs": {"promote": "yes"}},
+        tenant, db,
+    )
+    assert res["dispatched"] is True
+    assert res["ref"] == "main"  # defaulted to configured branch
+    post_call = next(c for c in mock.calls if c[0] == "POST")
+    assert post_call[2]["json"]["inputs"] == {"promote": "yes"}
 
 
 def _github_client(tmp_path, monkeypatch):

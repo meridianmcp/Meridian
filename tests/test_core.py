@@ -208,6 +208,53 @@ async def test_handoff_generates_clean_markdown(db, tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_handoff_custom_template(db, tmp_path):
+    """v1.1 — workspace_settings.handoff_template overrides the default full-mode
+    template; NULL/empty reverts to the default (no behavior change)."""
+    p = await db_module.create_project(db, "alpha-custom-tpl")
+    await db_module.set_goal(db, p["id"], "ship v1.1 features")
+    s = await db_module.register_session(db, p["id"], "sess-tpl")
+    await db_module.log_task(db, s["id"], p["id"], "wired the template", "done")
+    item = await db_module.add_sprint_item(db, p["id"], "v1.1", "Custom handoff item")
+
+    # Default behavior first: no template set → standard L0/L1 handoff.
+    _, default_content = await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True
+    )
+    assert "MERIDIAN_CONTEXT" in default_content
+
+    # Set a custom template and confirm placeholders are substituted.
+    await db_module.update_workspace_settings(
+        db,
+        handoff_template=(
+            "# Custom Handoff\n"
+            "Goal: {{version_goal}}\n\n"
+            "## Tasks\n{{recent_tasks}}\n\n"
+            "## Pending\n{{pending_items}}\n"
+        ),
+    )
+    assert (await db_module.get_workspace_settings(db))["handoff_template"]
+    _, content = await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True
+    )
+    assert "# Custom Handoff" in content
+    assert "Goal: ship v1.1 features" in content
+    assert "wired the template" in content
+    assert item["id"] in content
+    # The default Jinja2 scaffolding must NOT appear when a custom template is used.
+    assert "MERIDIAN_CONTEXT" not in content
+    assert "## L0 — Core Context" not in content
+
+    # Empty string reverts to the server default.
+    await db_module.update_workspace_settings(db, handoff_template="")
+    assert (await db_module.get_workspace_settings(db))["handoff_template"] is None
+    _, reverted = await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True
+    )
+    assert "MERIDIAN_CONTEXT" in reverted
+
+
+@pytest.mark.asyncio
 async def test_handoff_lists_pending_sprint_items_in_dependency_order(db, tmp_path):
     p = await db_module.create_project(db, "alpha-queue")
     await db_module.set_goal(db, p["id"], "ship the queue")
@@ -3883,6 +3930,32 @@ async def test_delete_workspace_note_respects_tenant(db):
 
 
 @pytest.mark.asyncio
+async def test_workspace_note_move_to_project(db):
+    """v1.1 — moving a workspace note creates a project note with the same
+    title/body/tags and removes the workspace note."""
+    p = await db_module.create_project(db, "move-target")
+    note = await db_module.add_workspace_note(
+        db, "Shared convention", "Use psycopg3 %s placeholders", "setup,db"
+    )
+    moved = await db_module.move_workspace_note_to_project(db, note["id"], p["id"])
+    assert moved is not None
+    assert moved["project_id"] == p["id"]
+    assert moved["title"] == "Shared convention"
+    assert moved["body"] == "Use psycopg3 %s placeholders"
+    assert moved["tags"] == "setup,db"
+    # Workspace note is gone; project note exists.
+    assert await db_module.get_workspace_notes(db) == []
+    proj_titles = {n["title"] for n in await db_module.get_project_notes(db, p["id"])}
+    assert "Shared convention" in proj_titles
+    # Unknown note id → None, nothing created.
+    assert await db_module.move_workspace_note_to_project(db, "no-such-id", p["id"]) is None
+    # Unknown project id → None, workspace note preserved.
+    note2 = await db_module.add_workspace_note(db, "keep me", "body")
+    assert await db_module.move_workspace_note_to_project(db, note2["id"], "no-such-project") is None
+    assert {n["title"] for n in await db_module.get_workspace_notes(db)} == {"keep me"}
+
+
+@pytest.mark.asyncio
 async def test_workspace_decisions_isolated_by_tenant(db):
     """A decision pinned by tenant A must not be visible to tenant B."""
     await db_module.pin_workspace_decision(db, "A-arch", "A body", tenant_id="tenant-a")
@@ -5720,6 +5793,33 @@ async def test_request_hitl_auto_answer_resolves_immediately(db):
     # Still in the queue for audit — a session polling sees it resolved.
     fetched = await db_module.get_hitl_request(db, h["id"])
     assert fetched["status"] == "answered"
+
+
+@pytest.mark.asyncio
+async def test_hitl_correction_nonblocking(db):
+    """v1.1 — kind='correction' is never auto-answered (even when the project
+    has auto-answer on) and stays pending for the executor to pick up at the
+    next item boundary, fail-open. kind='question' is unaffected."""
+    p = await db_module.create_project(db, "hitl-correction-proj")
+    await db_module.update_project_settings(db, p["id"], hitl_auto_answer=True)
+    # A plain question on an auto-answer project resolves immediately.
+    q = await db_module.request_hitl(db, p["id"], "Proceed?")
+    assert q["status"] == "answered" and q["answered_by"] == "auto"
+    # A correction is NOT auto-answered — it lands pending, non-blocking.
+    c = await db_module.request_hitl(
+        db, p["id"], "Use camelCase for the new field", kind="correction"
+    )
+    assert c["kind"] == "correction"
+    assert c["status"] == "pending"
+    assert c.get("answered_by") in (None, "")
+    # Visible in the pending queue for the next item-boundary sweep.
+    pending = await db_module.list_hitl_requests(db, p["id"], status="pending")
+    assert any(r["id"] == c["id"] and r["kind"] == "correction" for r in pending)
+    # The executor acknowledges it and continues.
+    answered = await db_module.answer_hitl_request(
+        db, c["id"], "acknowledged", answered_by="executor"
+    )
+    assert answered["status"] == "answered"
 
 
 @pytest.mark.asyncio

@@ -6537,6 +6537,7 @@ project_id = "${displayPid}"`;
         const sprintIn = document.getElementById("ws-sprint-default");
         const displayIn = document.getElementById("ws-display-name");
         const nudgeIn = document.getElementById("ws-nudge-threshold");
+        const handoffTplIn = document.getElementById("ws-handoff-template");
         const saveBtn = document.getElementById("ws-settings-save");
         const saveStatus = document.getElementById("ws-settings-status");
         (async () => {
@@ -6546,6 +6547,7 @@ project_id = "${displayPid}"`;
             if (sprintIn) sprintIn.value = s.sprint_name_default || "";
             if (displayIn) displayIn.value = s.display_name || "";
             if (nudgeIn) nudgeIn.value = s.log_task_sprint_nudge_threshold != null ? s.log_task_sprint_nudge_threshold : 5;
+            if (handoffTplIn) handoffTplIn.value = s.handoff_template || "";
           } catch (e) {
           }
         })();
@@ -6559,7 +6561,8 @@ project_id = "${displayPid}"`;
                 hitl_auto_answer_default: !!(hitlCb && hitlCb.checked),
                 sprint_name_default: sprintIn && sprintIn.value.trim() || "",
                 display_name: displayIn && displayIn.value.trim() || "",
-                log_task_sprint_nudge_threshold: isNaN(nudgeVal) ? 5 : Math.max(0, nudgeVal)
+                log_task_sprint_nudge_threshold: isNaN(nudgeVal) ? 5 : Math.max(0, nudgeVal),
+                handoff_template: handoffTplIn && handoffTplIn.value.trim() || ""
               })
             });
             if (saveStatus) saveStatus.textContent = "Saved.";
@@ -6628,6 +6631,7 @@ project_id = "${displayPid}"`;
 
               <span style="display:flex;gap:4px;flex-shrink:0">
                 <button class="secondary" data-nid-edit="${escapeHtml(n.id)}" data-ntitle="${escapeHtml(n.title || "")}" data-nbody="${escapeHtml(n.body || "")}" style="font-size:9px;padding:2px 6px" title="Edit">\u270E</button>
+                <button class="secondary" data-nid-move="${escapeHtml(n.id)}" style="font-size:9px;padding:2px 6px" title="Move to project">\u2197</button>
                 <button class="secondary" data-nid="${escapeHtml(n.id)}" style="font-size:9px;padding:2px 7px">\xD7</button>
               </span>
 
@@ -6673,6 +6677,47 @@ project_id = "${displayPid}"`;
                   try {
                     await api2(`/workspace/notes/${nid}`, { method: "PATCH", body: JSON.stringify({ title: newTitle, body: newBody }) });
                     renderWsNotes();
+                  } catch (e) {
+                    alert("Error: " + e);
+                  }
+                };
+              };
+            });
+            noteList.querySelectorAll("button[data-nid-move]").forEach((btn) => {
+              btn.onclick = () => {
+                const nid = btn.dataset.nidMove;
+                const row = noteList.querySelector(`[data-note-row="${nid}"]`);
+                if (!row || row.querySelector("select[data-move-select]")) return;
+                const projects = state.projects || [];
+                if (!projects.length) {
+                  alert("No projects to move to.");
+                  return;
+                }
+                const picker = document.createElement("span");
+                picker.style.cssText = "display:flex;gap:4px;align-items:center;flex-shrink:0";
+                picker.innerHTML = `
+              <select data-move-select style="font-size:9px;padding:2px 4px;background:var(--surface-2);border:1px solid var(--border);color:var(--text);border-radius:3px;max-width:120px">
+                ${projects.map((p) => `<option value="${escapeHtml(p.id)}">${escapeHtml(p.name || p.id)}</option>`).join("")}
+              </select>
+              <button class="primary" data-move-go style="font-size:9px;padding:2px 8px">Move</button>
+              <button class="secondary" data-move-cancel style="font-size:9px;padding:2px 6px">\xD7</button>`;
+                const actions = btn.parentElement;
+                actions.style.display = "none";
+                row.appendChild(picker);
+                picker.querySelector("[data-move-cancel]").onclick = () => {
+                  picker.remove();
+                  actions.style.display = "";
+                };
+                picker.querySelector("[data-move-go]").onclick = async () => {
+                  const targetId = picker.querySelector("[data-move-select]").value;
+                  if (!targetId) return;
+                  try {
+                    await api2(`/workspace/notes/${nid}/move`, { method: "POST", body: JSON.stringify({ project_id: targetId }) });
+                    renderWsNotes();
+                    try {
+                      if (typeof loadNotesTab === "function") await loadNotesTab(targetId);
+                    } catch (_) {
+                    }
                   } catch (e) {
                     alert("Error: " + e);
                   }
@@ -6735,6 +6780,11 @@ project_id = "${displayPid}"`;
       <label style="font-size:10px;color:var(--muted);display:block;margin-top:6px">log_task nudge threshold (0 = off)<br>
         <input id="ws-nudge-threshold" type="number" min="0" max="100" placeholder="5" style="width:80px;background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:3px 6px;margin-top:2px">
         <span style="display:block;font-size:9px;color:var(--muted);margin-top:2px">After this many inline log_task calls with no sprint items, show a nudge to file sprint items. Default: 5.</span>
+      </label>
+      <div style="font-size:10px;color:var(--text);margin:12px 0 4px">Handoff Format</div>
+      <label style="font-size:10px;color:var(--muted);display:block">Custom full-mode handoff template (leave blank for default)<br>
+        <textarea id="ws-handoff-template" rows="6" placeholder="# Handoff&#10;Sprint: {{sprint}}&#10;&#10;## Recent Tasks&#10;{{recent_tasks}}&#10;&#10;## Pending&#10;{{pending_items}}" style="width:100%;background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:6px 8px;margin-top:2px;resize:vertical"></textarea>
+        <span style="display:block;font-size:9px;color:var(--muted);margin-top:2px">Placeholders: {{sprint}}, {{recent_tasks}}, {{decisions}}, {{north_star}}, {{version_goal}}, {{pending_items}}, {{notes}}. Blank = default handoff.</span>
       </label>
       <div style="margin-top:8px;display:flex;gap:8px;align-items:center">
         <button id="ws-settings-save" class="primary" style="font-size:10px;padding:3px 10px">Save defaults</button>
@@ -8015,6 +8065,8 @@ project_id = "${displayPid}"`;
 
               ${r.answered_by === "auto" ? `<span title="Auto-answered \u2014 no human reviewed this" style="font-size:9px;font-weight:600;background:var(--accent)22;color:var(--accent);padding:1px 6px;border-radius:3px">auto</span>` : ""}
 
+              ${r.kind === "correction" ? `<span title="Mid-run correction \u2014 non-blocking; the executor applies it at the next item boundary" style="font-size:9px;font-weight:600;background:#f59e0b22;color:#f59e0b;padding:1px 6px;border-radius:3px">\u270E correction</span>` : ""}
+
               <span style="font-size:9px;font-weight:600;background:${urgencyColor[urg] || "var(--accent)"}22;color:${urgencyColor[urg] || "var(--accent)"};padding:1px 6px;border-radius:3px">${escapeHtml(urg)}</span>
 
               <span style="font-size:9px;font-weight:600;background:${statusBadge[st] || "var(--muted)"}22;color:${statusBadge[st] || "var(--muted)"};padding:1px 6px;border-radius:3px">${escapeHtml(st)}</span>
@@ -9181,6 +9233,8 @@ project_id = "${displayPid}"`;
           <div style="display:flex;align-items:center;gap:6px;min-width:0;flex:1">
 
             <span style="background:${color}22;color:${color};font-size:9px;font-weight:700;letter-spacing:.5px;padding:2px 6px;border-radius:3px">${escapeHtml((r.urgency || "normal").toUpperCase())}</span>
+
+            ${r.kind === "correction" ? `<span title="Mid-run correction \u2014 non-blocking" style="background:#f59e0b22;color:#f59e0b;font-size:9px;font-weight:700;letter-spacing:.5px;padding:2px 6px;border-radius:3px">\u270E CORRECTION</span>` : ""}
 
             ${assigned}
 

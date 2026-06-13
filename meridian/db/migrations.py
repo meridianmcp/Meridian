@@ -265,6 +265,8 @@ async def _migrate_v34_workspace_settings(db: aiosqlite.Connection) -> None:
     await _migrate_add_column_if_missing(
         db, "workspace_settings", "log_task_sprint_nudge_threshold", "INTEGER NOT NULL DEFAULT 5"
     )
+    # v1.1 — per-user handoff template (NULL = server default Jinja2 template)
+    await _migrate_add_column_if_missing(db, "workspace_settings", "handoff_template", "TEXT")
 
 
 async def _migrate_dunning_fields(db: aiosqlite.Connection) -> None:

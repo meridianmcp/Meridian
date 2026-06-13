@@ -519,6 +519,7 @@ CREATE TABLE IF NOT EXISTS workspace_settings (
     sprint_name_default TEXT,
     display_name TEXT,
     log_task_sprint_nudge_threshold INTEGER NOT NULL DEFAULT 5,
+    handoff_template TEXT,
     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE TABLE IF NOT EXISTS feedback (
@@ -5332,6 +5333,40 @@ async def delete_workspace_note(
     return rc > 0
 
 
+async def move_workspace_note_to_project(
+    db: aiosqlite.Connection,
+    note_id: str,
+    project_id: str,
+    tenant_id: str | None = None,
+) -> dict[str, Any] | None:
+    """Convert a workspace note into a project note on ``project_id``.
+
+    Copies title/body/tags to a new project_notes row, then deletes the
+    workspace note. Returns the new project note, or None if the workspace
+    note was not found (or belongs to another tenant). Atomic: the delete
+    only runs after the project note is created.
+    """
+    scope, scope_params = _ws_tenant_clause(tenant_id)
+    sql = "SELECT * FROM workspace_notes WHERE id = ?" + (f" AND {scope}" if scope else "")
+    async with db.execute(sql, [note_id, *scope_params]) as cur:
+        row = await cur.fetchone()
+    note = _row_to_dict(row) if row is not None else None
+    if not note:
+        return None
+    # Guard against moving to a non-existent project.
+    if await get_project(db, project_id) is None:
+        return None
+    created = await add_project_note(
+        db,
+        project_id,
+        note.get("title") or "",
+        note.get("body") or "",
+        note.get("tags"),
+    )
+    await delete_workspace_note(db, note_id, tenant_id=tenant_id)
+    return created
+
+
 async def update_workspace_note(
     db: aiosqlite.Connection,
     note_id: str,
@@ -5454,7 +5489,8 @@ async def get_workspace_settings(
     """
     _cols = (
         "SELECT hitl_auto_answer_default, sprint_name_default, display_name, "
-        "log_task_sprint_nudge_threshold, updated_at FROM workspace_settings"
+        "log_task_sprint_nudge_threshold, handoff_template, updated_at "
+        "FROM workspace_settings"
     )
     async with db.execute(
         f"{_cols} WHERE id = ?", (_ws_settings_key(tenant_id),)
@@ -5477,6 +5513,7 @@ async def get_workspace_settings(
         "log_task_sprint_nudge_threshold": int(data["log_task_sprint_nudge_threshold"])
         if data.get("log_task_sprint_nudge_threshold") is not None
         else 5,
+        "handoff_template": data.get("handoff_template"),
         "updated_at": data.get("updated_at"),
     }
 
@@ -5488,6 +5525,7 @@ async def update_workspace_settings(
     sprint_name_default: str | None = None,
     display_name: str | None = None,
     log_task_sprint_nudge_threshold: int | None = None,
+    handoff_template: str | None = None,
     tenant_id: str | None = None,
 ) -> dict[str, Any]:
     """Upsert the per-tenant workspace settings row and return the new values.
@@ -5516,6 +5554,10 @@ async def update_workspace_settings(
     if log_task_sprint_nudge_threshold is not None:
         updates.append("log_task_sprint_nudge_threshold = ?")
         params.append(max(0, int(log_task_sprint_nudge_threshold)))
+    if handoff_template is not None:
+        updates.append("handoff_template = ?")
+        # Empty string clears the custom template (reverts to server default).
+        params.append(handoff_template.strip() or None)
     if updates:
         from datetime import datetime, timezone
         now_ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")

@@ -6889,7 +6889,11 @@ def _jsonrpc_err(req_id: Any, code: int, message: str) -> dict[str, Any]:
 # GitHub MCP tools — injected per-tenant when github_pat is set
 # ---------------------------------------------------------------------------
 
-_GITHUB_TOOL_NAMES = frozenset({"read_file", "list_files", "search_code", "get_commits", "get_commit", "search_commits"})
+_GITHUB_TOOL_NAMES = frozenset({
+    "read_file", "list_files", "search_code", "get_commits", "get_commit", "search_commits",
+    "get_workflow_runs", "get_workflow_run_logs", "trigger_workflow", "git_diff",
+    "list_branches", "list_issues", "create_issue", "get_issue",
+})
 
 
 def _github_tools_for_tenant(tenant: dict) -> list[dict[str, Any]]:
@@ -6971,6 +6975,107 @@ def _github_tools_for_tenant(tenant: dict) -> list[dict[str, Any]]:
                     "sha": {"type": "string", "description": "Full or short commit SHA"},
                 },
                 "required": ["project_id", "sha"],
+            },
+        },
+        {
+            "name": "get_workflow_runs",
+            "description": "List recent GitHub Actions workflow runs with status/conclusion/url. Optionally filter by workflow file name (e.g. deploy.yml).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    **_pid_prop,
+                    "workflow_name": {"type": "string", "description": "Workflow file name (e.g. deploy.yml) to filter by. Omit for all runs."},
+                    "limit": {"type": "integer", "description": "Max runs to return (default: 10, max: 50)"},
+                },
+                "required": ["project_id"],
+            },
+        },
+        {
+            "name": "get_workflow_run_logs",
+            "description": "Return the failed job steps for a GitHub Actions run, with the last 50 log lines per failed job. Use to see why CI is red.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    **_pid_prop,
+                    "run_id": {"type": "string", "description": "Workflow run id (from get_workflow_runs)"},
+                },
+                "required": ["project_id", "run_id"],
+            },
+        },
+        {
+            "name": "trigger_workflow",
+            "description": "Fire a GitHub Actions workflow_dispatch event. ref defaults to the project's configured branch (or main). inputs is an optional object of workflow inputs.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    **_pid_prop,
+                    "workflow_name": {"type": "string", "description": "Workflow file name (e.g. deploy.yml)"},
+                    "inputs": {"type": "object", "description": "Optional workflow_dispatch inputs."},
+                    "ref": {"type": "string", "description": "Git ref to run on (default: configured branch or main)."},
+                },
+                "required": ["project_id", "workflow_name"],
+            },
+        },
+        {
+            "name": "git_diff",
+            "description": "Compare two refs (base...head) in the connected repo. Returns changed files with additions/deletions/patch and the total commit count.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    **_pid_prop,
+                    "base": {"type": "string", "description": "Base ref (branch, tag, or SHA)"},
+                    "head": {"type": "string", "description": "Head ref (branch, tag, or SHA)"},
+                },
+                "required": ["project_id", "base", "head"],
+            },
+        },
+        {
+            "name": "list_branches",
+            "description": "List branches in the project's connected GitHub repository. Returns name, head sha, and protected flag.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {**_pid_prop},
+                "required": ["project_id"],
+            },
+        },
+        {
+            "name": "list_issues",
+            "description": "List issues in the connected repo. Returns number, title, state, labels, created_at, url, and a body preview. Pull requests are excluded.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    **_pid_prop,
+                    "state": {"type": "string", "enum": ["open", "closed", "all"], "description": "Issue state filter (default: open)"},
+                    "labels": {"type": "string", "description": "Comma-separated label names to filter by."},
+                    "limit": {"type": "integer", "description": "Max issues to return (default: 20, max: 50)"},
+                },
+                "required": ["project_id"],
+            },
+        },
+        {
+            "name": "create_issue",
+            "description": "Open a new issue in the connected repo. Returns the created issue number and url.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    **_pid_prop,
+                    "title": {"type": "string"},
+                    "body": {"type": "string"},
+                    "labels": {"type": "array", "items": {"type": "string"}, "description": "Optional label names."},
+                },
+                "required": ["project_id", "title"],
+            },
+        },
+        {
+            "name": "get_issue",
+            "description": "Read a single issue plus its comments from the connected repo.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    **_pid_prop,
+                    "number": {"type": "integer", "description": "Issue number"},
+                },
+                "required": ["project_id", "number"],
             },
         },
     ]
@@ -7118,6 +7223,232 @@ async def _dispatch_github_tool(name: str, args: dict[str, Any], tenant: dict, d
                 "date": c["commit"]["author"]["date"],
                 "files_changed": len(c.get("files", [])),
                 "files": files,
+            }
+
+        if name == "get_workflow_runs":
+            limit = min(int(args.get("limit") or 10), 50)
+            wf = (args.get("workflow_name") or "").strip()
+            url = (
+                f"https://api.github.com/repos/{repo}/actions/workflows/{wf}/runs"
+                if wf else
+                f"https://api.github.com/repos/{repo}/actions/runs"
+            )
+            r = await http.get(url, headers=gh_headers, params={"per_page": str(limit)})
+            if r.status_code == 404:
+                return {"error": f"Workflow not found: {wf}" if wf else "No Actions runs found"}
+            r.raise_for_status()
+            runs = r.json().get("workflow_runs", [])
+            return {
+                "repo": repo,
+                "count": len(runs),
+                "runs": [
+                    {
+                        "id": run["id"],
+                        "name": run.get("name"),
+                        "status": run.get("status"),
+                        "conclusion": run.get("conclusion"),
+                        "created_at": run.get("created_at"),
+                        "html_url": run.get("html_url"),
+                    }
+                    for run in runs
+                ],
+            }
+
+        if name == "get_workflow_run_logs":
+            run_id = str(args.get("run_id") or "").strip()
+            r = await http.get(
+                f"https://api.github.com/repos/{repo}/actions/runs/{run_id}/jobs",
+                headers=gh_headers,
+            )
+            if r.status_code == 404:
+                return {"error": f"Run not found: {run_id}"}
+            r.raise_for_status()
+            jobs = r.json().get("jobs", [])
+            failed = [j for j in jobs if j.get("conclusion") == "failure"]
+            out = []
+            for j in failed:
+                failed_steps = [
+                    {"name": s.get("name"), "number": s.get("number")}
+                    for s in j.get("steps", [])
+                    if s.get("conclusion") == "failure"
+                ]
+                log_excerpt = ""
+                try:
+                    lr = await http.get(
+                        f"https://api.github.com/repos/{repo}/actions/jobs/{j['id']}/logs",
+                        headers=gh_headers,
+                        follow_redirects=True,
+                    )
+                    if lr.status_code == 200:
+                        lines = lr.text.splitlines()
+                        log_excerpt = "\n".join(lines[-50:])
+                except Exception:  # noqa: BLE001 — logs are best-effort
+                    log_excerpt = ""
+                out.append({
+                    "job": j.get("name"),
+                    "job_id": j.get("id"),
+                    "html_url": j.get("html_url"),
+                    "failed_steps": failed_steps,
+                    "log_tail": log_excerpt,
+                })
+            return {"run_id": run_id, "failed_job_count": len(failed), "failed_jobs": out}
+
+        if name == "trigger_workflow":
+            wf = (args.get("workflow_name") or "").strip()
+            ref = (args.get("ref") or branch).strip()
+            inputs = args.get("inputs") or {}
+            body: dict[str, Any] = {"ref": ref}
+            if inputs:
+                body["inputs"] = inputs
+            r = await http.post(
+                f"https://api.github.com/repos/{repo}/actions/workflows/{wf}/dispatches",
+                headers=gh_headers,
+                json=body,
+            )
+            if r.status_code == 404:
+                return {"error": f"Workflow not found: {wf}"}
+            if r.status_code not in (201, 204):
+                return {"error": f"Dispatch failed ({r.status_code}): {r.text[:200]}"}
+            return {"dispatched": True, "workflow": wf, "ref": ref, "inputs": inputs}
+
+        if name == "git_diff":
+            base = (args.get("base") or "").strip()
+            head = (args.get("head") or "").strip()
+            r = await http.get(
+                f"https://api.github.com/repos/{repo}/compare/{base}...{head}",
+                headers=gh_headers,
+            )
+            if r.status_code == 404:
+                return {"error": f"Refs not found: {base}...{head}"}
+            r.raise_for_status()
+            data = r.json()
+            files = [
+                {
+                    "filename": f["filename"],
+                    "status": f.get("status"),
+                    "additions": f.get("additions", 0),
+                    "deletions": f.get("deletions", 0),
+                    "patch": f.get("patch", ""),
+                }
+                for f in data.get("files", [])[:50]
+            ]
+            return {
+                "base": base,
+                "head": head,
+                "total_commits": data.get("total_commits", 0),
+                "files": files,
+            }
+
+        if name == "list_branches":
+            r = await http.get(
+                f"https://api.github.com/repos/{repo}/branches",
+                headers=gh_headers,
+                params={"per_page": "100"},
+            )
+            r.raise_for_status()
+            branches = r.json()
+            return {
+                "repo": repo,
+                "count": len(branches),
+                "branches": [
+                    {
+                        "name": b["name"],
+                        "sha": b.get("commit", {}).get("sha", "")[:12],
+                        "protected": b.get("protected", False),
+                    }
+                    for b in branches
+                ],
+            }
+
+        if name == "list_issues":
+            state = (args.get("state") or "open").strip()
+            limit = min(int(args.get("limit") or 20), 50)
+            params = {"state": state, "per_page": str(limit)}
+            if args.get("labels"):
+                params["labels"] = args["labels"]
+            r = await http.get(
+                f"https://api.github.com/repos/{repo}/issues",
+                headers=gh_headers,
+                params=params,
+            )
+            r.raise_for_status()
+            issues = r.json()
+            return {
+                "repo": repo,
+                "state": state,
+                "issues": [
+                    {
+                        "number": i["number"],
+                        "title": i.get("title"),
+                        "state": i.get("state"),
+                        "labels": [lbl["name"] for lbl in i.get("labels", [])],
+                        "created_at": i.get("created_at"),
+                        "html_url": i.get("html_url"),
+                        "body_preview": (i.get("body") or "")[:200],
+                    }
+                    for i in issues
+                    if "pull_request" not in i  # exclude PRs
+                ],
+            }
+
+        if name == "create_issue":
+            title = (args.get("title") or "").strip()
+            if not title:
+                return {"error": "title is required"}
+            body_payload: dict[str, Any] = {"title": title, "body": args.get("body") or ""}
+            if args.get("labels"):
+                body_payload["labels"] = args["labels"]
+            r = await http.post(
+                f"https://api.github.com/repos/{repo}/issues",
+                headers=gh_headers,
+                json=body_payload,
+            )
+            if r.status_code not in (200, 201):
+                return {"error": f"Create issue failed ({r.status_code}): {r.text[:200]}"}
+            i = r.json()
+            return {
+                "number": i["number"],
+                "title": i.get("title"),
+                "state": i.get("state"),
+                "html_url": i.get("html_url"),
+            }
+
+        if name == "get_issue":
+            number = str(args.get("number") or "").strip()
+            r = await http.get(
+                f"https://api.github.com/repos/{repo}/issues/{number}",
+                headers=gh_headers,
+            )
+            if r.status_code == 404:
+                return {"error": f"Issue not found: {number}"}
+            r.raise_for_status()
+            i = r.json()
+            comments = []
+            try:
+                cr = await http.get(
+                    f"https://api.github.com/repos/{repo}/issues/{number}/comments",
+                    headers=gh_headers,
+                    params={"per_page": "30"},
+                )
+                if cr.status_code == 200:
+                    comments = [
+                        {
+                            "author": c.get("user", {}).get("login"),
+                            "created_at": c.get("created_at"),
+                            "body": (c.get("body") or "")[:500],
+                        }
+                        for c in cr.json()
+                    ]
+            except Exception:  # noqa: BLE001 — comments are best-effort
+                comments = []
+            return {
+                "number": i["number"],
+                "title": i.get("title"),
+                "state": i.get("state"),
+                "labels": [lbl["name"] for lbl in i.get("labels", [])],
+                "body": i.get("body") or "",
+                "html_url": i.get("html_url"),
+                "comments": comments,
             }
 
     return {"error": f"Unknown GitHub tool: {name}"}
@@ -7589,12 +7920,16 @@ async def _dispatch_mcp_tool(
             "start_fresh": start_fresh,
         }
     if name == "request_hitl":
+        _hitl_kind = args.get("kind", "question")
+        if _hitl_kind not in ("question", "correction"):
+            _hitl_kind = "question"
         result = await db_module.request_hitl(
             db, args["project_id"], args["question"],
             session_id=args.get("session_id"),
             context=args.get("context"),
             urgency=args.get("urgency", "normal"),
             assigned_to=args.get("assigned_to"),
+            kind=_hitl_kind,
         )
         # v3.4 — auto-answered requests need no human; skip the notification.
         if result.get("answered_by") != "auto":
@@ -7659,6 +7994,7 @@ async def _dispatch_mcp_tool(
             db,
             hitl_auto_answer_default=args.get("hitl_auto_answer_default"),
             sprint_name_default=args.get("sprint_name_default"),
+            handoff_template=args.get("handoff_template"),
             tenant_id=_mcp_tenant_id,
         )
     if name == "get_context_block":
@@ -7727,6 +8063,19 @@ async def _dispatch_mcp_tool(
         content = args["content"]
         # Raises ValueError for non-replace anchors / unknown files / README.
         md_anchors_module.assert_replace_target(md_file, anchor)
+        # v1.1 — force=true: human planning sessions (claude.ai) skip the HITL
+        # round-trip and apply the section replacement directly. Executor sessions
+        # omit force (default False) so the diff stays human-gated as before.
+        if args.get("force") in (True, 1, "true", "1", "yes"):
+            try:
+                path = await md_anchors_module.apply_replace(md_file, anchor, content)
+            except md_anchors_module.AnchorError as exc:
+                return {"applied": False, "apply_error": str(exc)}
+            except Exception as exc:  # noqa: BLE001 — never crash the tool call
+                return {"applied": False, "apply_error": f"write failed: {exc}"}
+            if path is None:
+                return {"applied": False, "reason": "no-op-or-hosted"}
+            return {"applied": True, "forced": True, "file": md_file, "anchor": anchor}
         diff = md_anchors_module.build_diff(md_file, anchor, content)
         payload = json.dumps({
             "file": md_file,

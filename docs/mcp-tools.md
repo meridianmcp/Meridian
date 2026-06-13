@@ -279,6 +279,7 @@ Surface a question to the human queue. `urgency='blocking'` pauses the session u
 | `session_id` | string | optional |  |
 | `context` | string | optional |  |
 | `urgency` | string | optional |  |
+| `kind` | string | optional | question (default, auto-answerable) or correction (non-blocking mid-run human correction). |
 | `assigned_to` | string | optional |  |
 
 **Example:**

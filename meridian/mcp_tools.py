@@ -166,13 +166,17 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "Surface a question to the human-in-the-loop queue. urgency='blocking' "
         "means this session pauses until answered (poll get_hitl_request). "
         "urgency='normal'/'high' lands in the dashboard but doesn't block. "
-        "assigned_to routes to a specific human_id (null = broadcast).",
+        "assigned_to routes to a specific human_id (null = broadcast). "
+        "kind='correction' files a non-blocking mid-run correction: never "
+        "auto-answered, never blocks — an unattended executor picks it up at the "
+        "next sprint-item boundary, applies it, and continues.",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"},
          "question": {"type": "string"},
          "session_id": {"type": "string"},
          "context": {"type": "string"},
          "urgency": {"type": "string", "enum": ["normal", "high", "blocking"]},
+         "kind": {"type": "string", "enum": ["question", "correction"], "description": "question (default, auto-answerable) or correction (non-blocking mid-run human correction)."},
          "assigned_to": {"type": "string"}},
          "required": ["project_id", "question"]}},
     {"name": "get_hitl_request", "description":
@@ -243,10 +247,15 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
     {"name": "update_workspace_settings", "description":
         "Update workspace-global default settings. Pass only the fields you want to "
         "change. hitl_auto_answer_default (bool) seeds new projects' HITL auto-answer "
-        "behaviour; sprint_name_default (string) is the default sprint name.",
+        "behaviour; sprint_name_default (string) is the default sprint name; "
+        "handoff_template (string) overrides the default full-mode handoff with a "
+        "custom template — supports {{sprint}}, {{recent_tasks}}, {{decisions}}, "
+        "{{north_star}}, {{version_goal}}, {{pending_items}}, {{notes}} placeholders. "
+        "Pass an empty string to revert to the server default.",
      "inputSchema": {"type": "object", "properties": {
          "hitl_auto_answer_default": {"type": "boolean"},
-         "sprint_name_default": {"type": "string"}},
+         "sprint_name_default": {"type": "string"},
+         "handoff_template": {"type": "string"}},
          "required": []}},
     {"name": "get_session_brief", "description":
         "Read-only: Call this FIRST for project summaries or to see what a session did — "
@@ -403,13 +412,16 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "the dashboard, then Meridian replaces that section and stages the file "
         "for the next checkpoint commit. 'anchor' is the section name between the "
         "MERIDIAN:ANCHOR:START/END comments. (ROADMAP/DECISIONS/DEVLOG are "
-        "append-only and not replaceable.)",
+        "append-only and not replaceable.) Pass force=true from a human planning "
+        "session (claude.ai) to skip the HITL and apply the replacement directly; "
+        "autonomous executor sessions should omit force so the diff stays gated.",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"},
          "file": {"type": "string", "description": "CLAUDE.md | AGENTS.md"},
          "anchor": {"type": "string"},
          "content": {"type": "string", "description": "Full proposed body for the section."},
          "session_id": {"type": "string"},
+         "force": {"type": "boolean", "description": "Human planning sessions pass true to apply directly without HITL. Default false."},
          "urgency": {"type": "string", "enum": ["normal", "high", "blocking"]}},
          "required": ["project_id", "file", "anchor", "content"]}},
     {"name": "claim_sprint_item",

@@ -19,6 +19,20 @@ for "what has been decided, claimed, and shipped."
   sessions are active. **`release_file(session_id, file_path)`** when done.
   Use **`idle_until_session_done(watching_session_id)`** to wait before taking
   over a file another session holds. Locks auto-expire after 2 hours.
+- **After completing each sprint item**, call `get_sprint_items(status='pending')`
+  to check for newly added items before moving to the next one. Sessions that only
+  check pending items once at start miss anything added while running — re-checking
+  at each item boundary picks up mid-run additions automatically.
+- **`update_md_section`** proposes a replacement for an anchored CLAUDE.md/AGENTS.md
+  section. Autonomous executor sessions leave it gated behind a dashboard HITL.
+  Human planning sessions (claude.ai) may pass **`force=true`** to skip the HITL and
+  apply the change directly — only use `force` when a human is driving the session.
+- **Mid-run corrections**: after each `complete_sprint_item`, call
+  `list_hitl_requests(status='pending')` and handle any request with
+  `kind='correction'` before the next item: apply the correction, `log_task` it,
+  and `answer_hitl(request_id, "acknowledged")`. Corrections never block an
+  unattended run — fail open, log, and keep going. (Plain `kind='question'`
+  requests stay blocking/auto-answerable as before.)
 
 ## ON SESSION START
 
