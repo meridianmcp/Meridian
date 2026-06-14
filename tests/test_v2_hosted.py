@@ -340,6 +340,44 @@ def test_stripe_webhook_stale_timestamp_rejected(client):
         os.environ.pop("STRIPE_WEBHOOK_SECRET", None)
 
 
+def _make_github_sig(payload: bytes, secret: str) -> str:
+    return "sha256=" + hmac.new(secret.encode(), payload, hashlib.sha256).hexdigest()
+
+
+def test_github_marketplace_webhook_signature(client):
+    """POST /webhooks/github-marketplace: 200 on valid X-Hub-Signature-256, 401 on bad."""
+    secret = "gh_mp_secret"
+    os.environ["GITHUB_MARKETPLACE_WEBHOOK_SECRET"] = secret
+    try:
+        payload = json.dumps({
+            "action": "purchased",
+            "marketplace_purchase": {"account": {"login": "octocat"}},
+        }).encode()
+        good = client.post(
+            "/webhooks/github-marketplace",
+            content=payload,
+            headers={
+                "Content-Type": "application/json",
+                "X-Hub-Signature-256": _make_github_sig(payload, secret),
+                "X-GitHub-Delivery": "delivery-1",
+            },
+        )
+        assert good.status_code == 200
+        assert good.json()["action"] == "purchased"
+
+        bad = client.post(
+            "/webhooks/github-marketplace",
+            content=payload,
+            headers={
+                "Content-Type": "application/json",
+                "X-Hub-Signature-256": "sha256=" + "0" * 64,
+            },
+        )
+        assert bad.status_code == 401
+    finally:
+        os.environ.pop("GITHUB_MARKETPLACE_WEBHOOK_SECRET", None)
+
+
 # ---------------------------------------------------------------------------
 # Landing page
 # ---------------------------------------------------------------------------
