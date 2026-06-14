@@ -454,7 +454,8 @@ def test_remote_mcp_initialize_with_valid_oauth_token_from_db(client):
             (token_hash, None, "claude-ai", int(time.time()) + 3600),
         )
         await db.commit()
-        server_module._oa_tokens.clear()
+        from meridian.mcp import http_handler as _mcp_http
+        _mcp_http._oa_tokens.clear()
         return raw_token, token_hash
 
     raw_token, token_hash = _run(_setup())
@@ -474,7 +475,8 @@ def test_remote_mcp_initialize_with_valid_oauth_token_from_db(client):
     assert r.status_code == 200
     body = r.json()
     assert body["result"]["protocolVersion"] == "2025-03-26"
-    assert token_hash in server_module._oa_tokens
+    from meridian.mcp import http_handler as _mcp_http
+    assert token_hash in _mcp_http._oa_tokens
 
 
 def test_remote_mcp_tools_list_returns_full_tool_surface(client):
@@ -748,7 +750,8 @@ def test_mcp_rate_limit_429_after_limit_exceeded(client, monkeypatch):
         call_count[0] += 1
         return call_count[0] > 1
 
-    monkeypatch.setattr(server_module, "_mcp_rate_check", _mock_check)
+    from meridian.mcp import http_handler as _mcp_http
+    monkeypatch.setattr(_mcp_http, "_mcp_rate_check", _mock_check)
 
     payload = {"jsonrpc": "2.0", "id": 1, "method": "initialize",
                "params": {"protocolVersion": "2025-03-26", "capabilities": {}, "clientInfo": {}}}

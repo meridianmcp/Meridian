@@ -767,7 +767,8 @@ def test_handoff_endpoint_auto_switches_repeat_session_to_delta(client):
 
 @pytest.mark.asyncio
 async def test_docs_mcp_tools_matches_live_tool_doc():
-    expected = await server_module.mcp_tools_doc()
+    from meridian.mcp.http_handler import mcp_tools_doc
+    expected = await mcp_tools_doc()
     actual = (
         Path(__file__).resolve().parents[1] / "docs" / "mcp-tools.md"
     ).read_text(encoding="utf-8")
@@ -1236,8 +1237,10 @@ import importlib
 def test_list_project_files_returns_allow_list(client, monkeypatch, tmp_path):
     """GET /projects/{id}/files returns only AGENTS.md and CLAUDE.md (e838425d)."""
     import meridian.server as srv_mod
+    import meridian.routes.files as files_mod
     srv_mod = importlib.reload(srv_mod)
     monkeypatch.setattr(srv_mod, "_REPO_ROOT", tmp_path)
+    monkeypatch.setattr(files_mod, "_REPO_ROOT", tmp_path)
 
     project = client.post("/projects", json={"name": "alpha"}).json()
     r = client.get(f"/projects/{project['id']}/files")
@@ -1254,8 +1257,10 @@ def test_list_project_files_returns_allow_list(client, monkeypatch, tmp_path):
 def test_get_project_file_returns_empty_when_missing(client, monkeypatch, tmp_path):
     """Reading a file that does not exist returns content='' not a 404."""
     import meridian.server as srv_mod
+    import meridian.routes.files as files_mod
     srv_mod = importlib.reload(srv_mod)
     monkeypatch.setattr(srv_mod, "_REPO_ROOT", tmp_path)
+    monkeypatch.setattr(files_mod, "_REPO_ROOT", tmp_path)
 
     project = client.post("/projects", json={"name": "alpha"}).json()
     r = client.get(f"/projects/{project['id']}/files/AGENTS.md")
@@ -1268,8 +1273,10 @@ def test_get_project_file_returns_empty_when_missing(client, monkeypatch, tmp_pa
 def test_put_and_get_project_file_roundtrip(client, monkeypatch, tmp_path):
     """Writing then reading a file returns the written content."""
     import meridian.server as srv_mod
+    import meridian.routes.files as files_mod
     srv_mod = importlib.reload(srv_mod)
     monkeypatch.setattr(srv_mod, "_REPO_ROOT", tmp_path)
+    monkeypatch.setattr(files_mod, "_REPO_ROOT", tmp_path)
 
     project = client.post("/projects", json={"name": "alpha"}).json()
     r = client.put(
@@ -1289,8 +1296,10 @@ def test_put_and_get_project_file_roundtrip(client, monkeypatch, tmp_path):
 def test_get_project_file_403_for_disallowed_filename(client, monkeypatch, tmp_path):
     """Accessing a filename outside the allow-list returns 403."""
     import meridian.server as srv_mod
+    import meridian.routes.files as files_mod
     srv_mod = importlib.reload(srv_mod)
     monkeypatch.setattr(srv_mod, "_REPO_ROOT", tmp_path)
+    monkeypatch.setattr(files_mod, "_REPO_ROOT", tmp_path)
 
     project = client.post("/projects", json={"name": "alpha"}).json()
     # Path traversal: FastAPI normalises the URL so it may 404 before reaching
@@ -1302,8 +1311,10 @@ def test_get_project_file_403_for_disallowed_filename(client, monkeypatch, tmp_p
 def test_put_project_file_403_for_disallowed_filename(client, monkeypatch, tmp_path):
     """Writing outside the allow-list returns 403."""
     import meridian.server as srv_mod
+    import meridian.routes.files as files_mod
     srv_mod = importlib.reload(srv_mod)
     monkeypatch.setattr(srv_mod, "_REPO_ROOT", tmp_path)
+    monkeypatch.setattr(files_mod, "_REPO_ROOT", tmp_path)
 
     project = client.post("/projects", json={"name": "alpha"}).json()
     r = client.put(
@@ -1322,8 +1333,10 @@ def test_server_own_docs_not_readable_or_writable(client, monkeypatch, tmp_path,
     re-adding them to the allow-list.
     """
     import meridian.server as srv_mod
+    import meridian.routes.files as files_mod
     srv_mod = importlib.reload(srv_mod)
     monkeypatch.setattr(srv_mod, "_REPO_ROOT", tmp_path)
+    monkeypatch.setattr(files_mod, "_REPO_ROOT", tmp_path)
     # Place a real file on disk so a 403 proves the allow-list blocks it,
     # not merely that the file is missing.
     (tmp_path / filename).write_text("# server doc — must stay private\n", encoding="utf-8")
@@ -1346,8 +1359,10 @@ def test_server_own_docs_not_readable_or_writable(client, monkeypatch, tmp_path,
 def test_file_endpoints_404_for_unknown_project(client, monkeypatch, tmp_path):
     """All file endpoints return 404 when the project does not exist."""
     import meridian.server as srv_mod
+    import meridian.routes.files as files_mod
     srv_mod = importlib.reload(srv_mod)
     monkeypatch.setattr(srv_mod, "_REPO_ROOT", tmp_path)
+    monkeypatch.setattr(files_mod, "_REPO_ROOT", tmp_path)
 
     assert client.get("/projects/no-such/files").status_code == 404
     assert client.get("/projects/no-such/files/AGENTS.md").status_code == 404
@@ -1897,7 +1912,9 @@ def test_files_get_for_claude_md_is_allowed(client, tmp_path, monkeypatch):
     # Point the file root at a temp dir so we don't depend on the repo
     # actually containing CLAUDE.md on disk during the test run.
     from meridian import server as srv
+    import meridian.routes.files as files_mod
     monkeypatch.setattr(srv, "_REPO_ROOT", tmp_path)
+    monkeypatch.setattr(files_mod, "_REPO_ROOT", tmp_path)
     (tmp_path / "CLAUDE.md").write_text("# claude\n", encoding="utf-8")
     project = client.post("/projects", json={"name": "alpha"}).json()
     r = client.get(f"/projects/{project['id']}/files/CLAUDE.md")
@@ -7387,7 +7404,7 @@ def test_local_mode_connections_endpoint_unchanged(client, monkeypatch):
 
 def test_canonicalize_notify_target_strips_ntfy_prefix():
     """G1.7 — ntfy URLs collapse to topic-only; emails/webhooks pass through."""
-    from meridian.server import _canonicalize_notify_target
+    from meridian.routes.projects import _canonicalize_notify_target
 
     assert _canonicalize_notify_target("https://ntfy.sh/foo") == "foo"
     assert _canonicalize_notify_target("https://ntfy.sh/foo/") == "foo"
@@ -9481,9 +9498,9 @@ def test_pkce_expired_code_rejected(client):
     code = dict(urllib.parse.parse_qsl(urllib.parse.urlparse(r.headers["location"]).query))["code"]
 
     # Expire the in-memory code entry
-    from meridian import server as srv
-    if code in srv._oa_codes:
-        srv._oa_codes[code]["exp"] = time.time() - 1
+    from meridian.mcp import http_handler as _mcp_http
+    if code in _mcp_http._oa_codes:
+        _mcp_http._oa_codes[code]["exp"] = time.time() - 1
 
     # Also expire the DB entry by setting expires_at in the past
     async def _expire_db():
@@ -9600,6 +9617,8 @@ def test_github_status_graceful_on_db_error(client, monkeypatch):
         raise RuntimeError("simulated DB failure")
 
     monkeypatch.setattr(server_mod, "_get_tenant_from_request", _mock_tenant)
+    import meridian.routes.github as _github_mod
+    monkeypatch.setattr(_github_mod, "_get_tenant_from_request", _mock_tenant)
     monkeypatch.setattr(_db_mod, "get_tenant_by_id", _boom)
 
     r = client.get(f"/projects/{project_id}/github/status")

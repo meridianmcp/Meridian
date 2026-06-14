@@ -316,3 +316,221 @@ def validate_input_size(value: str | None, field_name: str, max_chars: int) -> N
             status_code=400,
             detail=f"{field_name} exceeds {max_chars} character limit",
         )
+
+
+# ---------------------------------------------------------------------------
+# Rate limiter (optional slowapi) — moved here so routes/ can import it
+# ---------------------------------------------------------------------------
+try:
+    from slowapi import Limiter
+    from slowapi.util import get_remote_address as _get_remote_address
+    _limiter = Limiter(key_func=_get_remote_address)
+except ImportError:
+    _limiter = None  # type: ignore[assignment]
+
+
+def _rate_limit(rate: str):
+    """Return a no-op or slowapi limiter decorator."""
+    def decorator(func):
+        if _limiter is None:
+            return func
+        return _limiter.limit(rate)(func)
+    return decorator
+
+
+def _reset_limiter_storage() -> None:
+    """Clear all in-memory rate-limit counters and route registrations.
+
+    Used by tests: since _limiter is a module-level singleton (not re-created
+    on importlib.reload(server)), we must flush the storage counters AND the
+    route-limit registrations that accumulate across server reloads.
+    """
+    if _limiter is None:
+        return
+    try:
+        if hasattr(_limiter, "_storage"):
+            _limiter._storage.reset()
+    except Exception:
+        pass
+    try:
+        if hasattr(_limiter, "_route_limits"):
+            _limiter._route_limits.clear()
+        if hasattr(_limiter, "_dynamic_route_limits"):
+            _limiter._dynamic_route_limits.clear()
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Authenticated tenant helper (session cookie or Bearer token)
+# ---------------------------------------------------------------------------
+
+async def _get_authenticated_tenant(request: Request) -> "dict[str, Any]":
+    """Resolve the current hosted tenant from session cookie or bearer token."""
+    from .hosted import get_current_tenant, get_tenant_from_bearer
+
+    tenant = None
+    try:
+        tenant = await get_current_tenant(request)
+    except HTTPException:
+        pass
+    if tenant is None:
+        try:
+            tenant = await get_tenant_from_bearer(request)
+        except HTTPException:
+            pass
+    if tenant is None:
+        raise HTTPException(status_code=401, detail="authentication required")
+    return tenant
+
+
+def _mask_api_token_hash(token_hash: str | None) -> str:
+    """Return a stable masked display string for a stored API token hash."""
+    value = (token_hash or "").strip()
+    if len(value) >= 4:
+        return f"sk_meridian_••••••••{value[-4:]}"
+    return "sk_meridian_••••••••..."
+
+
+# ---------------------------------------------------------------------------
+# Markdown timestamp helpers
+# ---------------------------------------------------------------------------
+
+def _md_ts() -> str:
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
+def _md_one_line(text: str, limit: int = 200) -> str:
+    """Collapse a multi-line text body to a single trimmed line."""
+    flat = " ".join((text or "").split())
+    return flat if len(flat) <= limit else flat[:limit].rstrip() + "…"
+
+
+# ---------------------------------------------------------------------------
+# Context-block renderers (shared by routes/files.py and server.py MCP handler)
+# ---------------------------------------------------------------------------
+
+def _render_workspace_block(
+    decisions: list[dict], notes: list[dict]
+) -> str:
+    """v3.1 — render workspace-level decisions + notes as a compact text block.
+
+    Workspace decisions/notes are tenant-global (above any single project), so
+    they are prepended to every project's context block + handoff. Returns an
+    empty string when there is nothing to show, so callers can skip the join.
+    """
+    if not decisions and not notes:
+        return ""
+    lines = ["WORKSPACE (applies to all projects):"]
+    for d in decisions[:10]:
+        cat = (d.get("category") or "").strip()
+        prefix = f"[{cat}] " if cat else ""
+        lines.append(f"  • DECISION {prefix}{d.get('title', '')}: {d.get('body', '')}")
+    for n in notes[:10]:
+        tags = (n.get("tags") or "").strip()
+        suffix = f" ({tags})" if tags else ""
+        lines.append(f"  • NOTE {n.get('title', '')}: {n.get('body', '')}{suffix}")
+    return "\n".join(lines)
+
+
+def _render_context_block(
+    project: dict,
+    goal: "dict | None",
+    sprint_items: list[dict],
+    pending_tasks: list[dict],
+    sessions: list[dict],
+    recent_decisions: list[str],
+    *,
+    mode: str = "full",
+    repo_root: "str | None" = None,
+) -> str:
+    """v2.3 — render the project context as a single text block.
+
+    ``mode='full'`` produces the Code Handoff variant — everything a fresh
+    Claude Code session needs to continue work without re-deriving state.
+    ``mode='chat'`` produces the shorter "new claude.ai conversation"
+    variant — drops sessions and trims long fields so a paste into a new
+    chat doesn't overflow the first message.
+
+    Returns a plain-text block (no JSON, no markdown fences) suitable for
+    direct clipboard copy + paste.
+    """
+    short_id = project["id"].split("-")[0]
+    lines = [f"PROJECT: {project['name']} ({short_id})"]
+    if goal:
+        if goal.get("north_star"):
+            ns = goal["north_star"]
+            if mode == "chat" and len(ns) > 400:
+                ns = ns[:400].rstrip() + "…"
+            lines.append(f"NORTH STAR: {ns}")
+        if goal.get("sprint"):
+            lines.append(f"SPRINT: {goal['sprint']}")
+        if mode == "full" and goal.get("content"):
+            vg = goal["content"]
+            if isinstance(vg, dict):
+                vg = vg.get("content") or str(vg)
+            if len(vg) > 2000:
+                vg = vg[:2000].rstrip() + "…"
+            lines += ["", "VERSION GOAL:", vg]
+    if sprint_items:
+        lines += ["", "PENDING SPRINT ITEMS:"]
+        for it in sprint_items[:10]:
+            lines.append(f"- [{it.get('status', '?')}] {it.get('title', '')}")
+    if pending_tasks:
+        cap = 10 if mode == "full" else 5
+        lines += ["", f"RECENT TASKS (last {min(len(pending_tasks), cap)}):"]
+        for t in pending_tasks[:cap]:
+            stat = (t.get("status") or "?").upper()
+            desc = t.get("description") or ""
+            if len(desc) > 200:
+                desc = desc[:200].rstrip() + "…"
+            lines.append(f"- [{stat}] {desc}")
+    if mode == "full" and sessions:
+        lines += ["", "ACTIVE SESSIONS:"]
+        for s in sessions[:5]:
+            lines.append(f"- {s.get('name', '?')} ({s.get('status', '?')})")
+    if recent_decisions:
+        lines += ["", "RECENT DECISIONS:"]
+        for d in recent_decisions[-5:]:
+            text = d
+            if len(text) > 240:
+                text = text[:240].rstrip() + "…"
+            lines.append(f"- {text}")
+    if mode == "full":
+        if repo_root:
+            lines += ["", f"REPO: {repo_root}"]
+        lines += ["TEST: pixi run test"]
+    lines += [
+        "",
+        f"To continue: connect to Meridian and call start_session(project_id=\"{project['id']}\", session_name=\"<name>\").",
+    ]
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Workspace permission check
+# ---------------------------------------------------------------------------
+
+async def _require_workspace_perm(
+    request: Request, tenant: "dict[str, Any]", perm: str,
+) -> str:
+    """Resolve the calling user's role in the tenant's workspace and 403 if they lack perm."""
+    from . import db as _db_module
+    from .hosted import get_current_tenant as _get_ct
+    from .roles import has_perm
+    try:
+        caller = await _get_ct(request)
+    except HTTPException:
+        raise HTTPException(403, "Sign in required")
+    caller_email = caller.get("email", "")
+    resolved = await _db_module.resolve_member_role(
+        request.app.state.db, tenant["id"], caller_email,
+    )
+    role = resolved[0] if resolved else None
+    if not has_perm(role, perm):
+        raise HTTPException(
+            403,
+            f"Workspace role '{role or 'none'}' lacks permission '{perm}'",
+        )
+    return role  # type: ignore[return-value]
