@@ -502,10 +502,51 @@ _READ_ONLY_TOOLS = {
 }
 _DESTRUCTIVE_TOOLS = {"delete_note", "archive_decision", "dismiss_hitl"}
 
+_TITLE_OVERRIDES: dict[str, str] = {
+    "request_hitl": "Request HITL",
+    "get_hitl_request": "Get HITL Request",
+    "list_hitl_requests": "List HITL Requests",
+    "answer_hitl": "Answer HITL",
+    "dismiss_hitl": "Dismiss HITL",
+    "update_md_section": "Update Markdown Section",
+    "add_sprint_note": "Add Sprint Note",
+    "get_sprint_notes": "Get Sprint Notes",
+    "get_sprint_items": "Get Sprint Items",
+    "add_sprint_item": "Add Sprint Item",
+    "update_sprint_item": "Update Sprint Item",
+    "complete_sprint_item": "Complete Sprint Item",
+    "claim_sprint_item": "Claim Sprint Item",
+    "merge_sprint_items": "Merge Sprint Items",
+    "split_sprint_item": "Split Sprint Item",
+    "add_subtask": "Add Subtask",
+    "get_context_block": "Get Context Block",
+    "get_session_brief": "Get Session Brief",
+    "get_session_log": "Get Session Log",
+    "get_pinned_decisions": "Get Pinned Decisions",
+    "pin_decision": "Pin Decision",
+    "update_decision": "Update Decision",
+    "archive_decision": "Archive Decision",
+    "get_workspace_decisions": "Get Workspace Decisions",
+    "pin_workspace_decision": "Pin Workspace Decision",
+    "get_workspace_notes": "Get Workspace Notes",
+    "add_workspace_note": "Add Workspace Note",
+    "get_workspace_settings": "Get Workspace Settings",
+    "update_workspace_settings": "Update Workspace Settings",
+    "set_executor_config": "Set Executor Config",
+    "set_north_star": "Set North Star",
+    "idle_until_session_done": "Wait for Session to Close",
+    "generate_handoff": "Generate Handoff",
+    "get_agent_instructions": "Get Agent Instructions",
+    "set_agent_instructions": "Set Agent Instructions",
+}
+
 for _tool in _MCP_TOOLS_LIST:
     _is_read_only = _tool["name"] in _READ_ONLY_TOOLS
     _is_destructive = _tool["name"] in _DESTRUCTIVE_TOOLS
+    _title = _TITLE_OVERRIDES.get(_tool["name"]) or _tool["name"].replace("_", " ").title()
+    _tool["title"] = _title
     _tool["annotations"] = {
+        "title": _title,
         "readOnlyHint": _is_read_only,
         "destructiveHint": _is_destructive,
         "openWorldHint": False,

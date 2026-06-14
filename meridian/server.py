@@ -6767,12 +6767,35 @@ _GITHUB_TOOL_NAMES = frozenset({
 })
 
 
+_GITHUB_READ_ONLY = frozenset({
+    "read_file", "list_files", "search_code", "get_commits", "search_commits",
+    "get_commit", "get_workflow_runs", "get_workflow_run_logs",
+    "git_diff", "list_branches", "list_issues", "get_issue",
+})
+_GITHUB_TITLE_OVERRIDES: dict[str, str] = {
+    "read_file": "Read File",
+    "list_files": "List Files",
+    "search_code": "Search Code",
+    "get_commits": "Get Commits",
+    "search_commits": "Search Commits",
+    "get_commit": "Get Commit",
+    "get_workflow_runs": "Get Workflow Runs",
+    "get_workflow_run_logs": "Get Workflow Run Logs",
+    "trigger_workflow": "Trigger Workflow",
+    "git_diff": "Git Diff",
+    "list_branches": "List Branches",
+    "list_issues": "List Issues",
+    "create_issue": "Create Issue",
+    "get_issue": "Get Issue",
+}
+
+
 def _github_tools_for_tenant(tenant: dict) -> list[dict[str, Any]]:
     """Return the 5 GitHub tool defs if the tenant has a GitHub PAT set."""
     if not db_module.decrypt_field(tenant.get("github_pat")):
         return []
     _pid_prop = {"project_id": {"type": "string", "description": "Project ID whose GitHub repo to use."}}
-    return [
+    _tools = [
         {
             "name": "read_file",
             "description": "Read a file from the project's connected GitHub repository. Returns decoded UTF-8 content.",
@@ -6950,6 +6973,18 @@ def _github_tools_for_tenant(tenant: dict) -> list[dict[str, Any]]:
             },
         },
     ]
+    for _t in _tools:
+        _ro = _t["name"] in _GITHUB_READ_ONLY
+        _gh_title = _GITHUB_TITLE_OVERRIDES.get(_t["name"], _t["name"].replace("_", " ").title())
+        _t["title"] = _gh_title
+        _t["annotations"] = {
+            "title": _gh_title,
+            "readOnlyHint": _ro,
+            "destructiveHint": False,
+            "openWorldHint": False,
+            "idempotentHint": _ro,
+        }
+    return _tools
 
 
 async def _dispatch_github_tool(name: str, args: dict[str, Any], tenant: dict, db: Any) -> Any:

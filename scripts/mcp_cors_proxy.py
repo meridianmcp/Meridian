@@ -41,7 +41,7 @@ _CORS = {
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Headers": "Content-Type, Authorization, Mcp-Session-Id, Mcp-Protocol-Version",
     "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-    "Access-Control-Expose-Headers": "Mcp-Session-Id",
+    "Access-Control-Expose-Headers": "Mcp-Session-Id, Mcp-Protocol-Version",
 }
 
 _BACKEND = "http://127.0.0.1:8808"
@@ -106,7 +106,12 @@ class _Handler(BaseHTTPRequestHandler):
             with urllib.request.urlopen(fwd, timeout=30) as resp:
                 body = resp.read()
                 ctype = resp.headers.get("Content-Type", "application/json")
-                self._send(resp.status, body, ctype)
+                extra = {
+                    hdr: resp.headers.get(hdr)
+                    for hdr in ("Mcp-Session-Id", "Mcp-Protocol-Version")
+                    if resp.headers.get(hdr)
+                }
+                self._send(resp.status, body, ctype, extra or None)
         except urllib.error.HTTPError as exc:  # backend returned a real status
             body = exc.read() or b"{}"
             self._send(exc.code, body, exc.headers.get("Content-Type", "application/json"))
