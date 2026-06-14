@@ -61,12 +61,13 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "human_id": {"type": "string"},
          "client": {"type": "string", "enum": ["claude-code", "claude-desktop", "cursor", "other"]}},
          "required": ["project_id", "session_name"]}},
-    {"name": "start_session", "description": "Register session and return goal + recent tasks in one call.",
+    {"name": "start_session", "description": "Register a session and return orientation. Compact by default (session_id, sprint focus + status counts, 3 recent tasks, board_change count) to keep an executor's context small. Pass compact=false for the full block (goal XML, decisions, MERIDIAN.md instructions, workspace context, sprint items) — or fetch it later with get_session_brief.",
      "inputSchema": {"type": "object", "properties": {
           "project_id": {"type": "string"}, "session_name": {"type": "string"},
           "human_id": {"type": "string"},
           "client": {"type": "string", "enum": ["claude-code", "claude-desktop", "cursor", "other"]},
-          "role": {"type": "string", "enum": ["executor"], "description": "Pass 'executor' to inject executor_config and credentials guidance."}},
+          "role": {"type": "string", "enum": ["executor"], "description": "Pass 'executor' to inject executor_config and credentials guidance."},
+          "compact": {"type": "boolean", "description": "Default true — slim orientation. Set false for the full goal/instructions payload."}},
           "required": ["project_id", "session_name"]}},
     {"name": "list_projects", "description":
         "Read-only: Call first when project_id is unknown. Returns [{id, name, sprint, created_at}] newest first.",

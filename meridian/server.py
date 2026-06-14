@@ -3234,12 +3234,19 @@ async def _start_session_composite(
     client_type: str | None = None,
     role: str | None = None,
     source: str | None = None,
+    compact: bool = False,
 ) -> dict[str, Any]:
     """Register + goal + tasks + sessions + handoff-check in one shot.
 
     Replaces the four-call cold-start sequence (register_session, get_goal,
     get_tasks, check handoff file) with a single call that returns everything
     a new session needs before touching anything.
+
+    ``compact=True`` (3689f680) returns a slim orientation block — session_id,
+    sprint focus + status counts, the 3 most recent tasks, and a board_change
+    count — and skips the heavy goal_xml / cache_blocks / meridian_instructions
+    / workspace payload that overflows an executor's context. Full context is
+    available via ``compact=False`` or ``get_session_brief``.
 
     G8.34 — If a session with the same ``session_name`` is still active and
     pinged a heartbeat within the last 5 minutes, return a compact
@@ -3341,6 +3348,46 @@ async def _start_session_composite(
         ]
 
     recent_tasks = await db_module.get_tasks(db, project_id, limit=10)
+
+    # 3689f680 — compact orientation: skip the heavy goal_xml / cache_blocks /
+    # instructions / workspace payload (the part that overflows an executor's
+    # context) and return just enough to start working.
+    if compact:
+        _c_items = await db_module.get_sprint_items(
+            db, project_id, include_human=(role != "executor")
+        )
+        _c_counts: dict[str, int] = {}
+        for _it in _c_items:
+            _st = _it.get("status") or "pending"
+            _c_counts[_st] = _c_counts.get(_st, 0) + 1
+        _c_started = str(session.get("created_at") or "")
+        _c_board_change = sum(
+            1 for _it in _c_items if (_it.get("added_at") or "") > _c_started
+        )
+        _c_sprint = (goal or {}).get("sprint") if goal else None
+        _c_payload = {
+            "session_id": session["id"],
+            "compact": True,
+            "sprint": (str(_c_sprint)[:300] if _c_sprint else None),
+            "sprint_summary": {
+                "total": len(_c_items),
+                "done": _c_counts.get("done", 0),
+                "in_progress": _c_counts.get("in_progress", 0),
+                "pending": _c_counts.get("pending", 0) + _c_counts.get("todo", 0),
+            },
+            "recent_tasks": recent_tasks[:3],
+            "board_change": _c_board_change,
+            "note": (
+                "Compact orientation. For full goal/decisions/instructions call "
+                "start_session(compact=False) or get_session_brief(project_id)."
+            ),
+        }
+        # Per-project agent instructions are small but behaviorally critical
+        # (custom rules the session must follow), so keep them even in compact.
+        _c_agent = await db_module.get_agent_instructions(db, project_id)
+        if _c_agent:
+            _c_payload["agent_instructions"] = _c_agent
+        return _c_payload
 
     await _expire_and_generate_handoffs(db, data_dir)
     active_sessions = await db_module.get_sessions(db, project_id, active_only=True)

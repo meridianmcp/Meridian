@@ -1409,6 +1409,7 @@ def build_mcp_server():
                 )
                 result = {"session_id": arguments["session_id"], "ok": ok}
             elif name == "start_session":
+                # 3689f680 — compact by default (full block via compact=False).
                 result = await _start_session_composite(
                     db,
                     arguments["project_id"],
@@ -1417,6 +1418,7 @@ def build_mcp_server():
                     human_id=arguments.get("human_id"),
                     client_type=arguments.get("client"),
                     role=arguments.get("role"),
+                    compact=arguments.get("compact", True),
                 )
             elif name == "list_projects":
                 result = await db_module.list_project_summaries(db)

@@ -682,6 +682,9 @@ async def _dispatch_mcp_tool(
             client_type=args.get("client"),
         )
     if name == "start_session":
+        # 3689f680 — MCP start_session defaults to a compact response so an
+        # executor's context isn't blown by the full goal/instructions payload.
+        # Pass compact=False explicitly for the full block.
         return await _server._start_session_composite(
             db,
             args["project_id"],
@@ -690,6 +693,7 @@ async def _dispatch_mcp_tool(
             human_id=args.get("human_id"),
             client_type=args.get("client"),
             role=args.get("role"),
+            compact=args.get("compact", True),
         )
     if name == "list_projects":
         return await db_module.list_project_summaries(db)

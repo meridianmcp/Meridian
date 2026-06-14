@@ -3401,6 +3401,45 @@ def test_start_session_endpoint_includes_sprint_items(client):
     assert "Dashboard save" in body["sprint_items_xml"]
 
 
+@pytest.mark.asyncio
+async def test_start_session_mcp_compact_default(db, tmp_path):
+    """3689f680 — MCP start_session defaults to a compact response."""
+    import meridian.server as srv
+
+    p = await db_module.create_project(db, "compact-default")
+    seed = await db_module.register_session(db, p["id"], "seed")
+    await db_module.log_task(db, seed["id"], p["id"], "did a thing", "done")
+    await db_module.add_sprint_item(db, p["id"], "v1", "an item")
+
+    res = await srv._dispatch_mcp_tool(
+        "start_session", {"project_id": p["id"], "session_name": "exec-1"}, db, str(tmp_path)
+    )
+    assert res["compact"] is True
+    assert "session_id" in res
+    assert res["sprint_summary"]["total"] >= 1
+    assert len(res["recent_tasks"]) <= 3
+    assert "board_change" in res
+    # The heavy payload that overflows context is omitted.
+    assert "goal_xml" not in res
+    assert "meridian_instructions" not in res
+
+
+@pytest.mark.asyncio
+async def test_start_session_mcp_compact_false_full(db, tmp_path):
+    """compact=False still returns the full orientation block."""
+    import meridian.server as srv
+
+    p = await db_module.create_project(db, "compact-false")
+    res = await srv._dispatch_mcp_tool(
+        "start_session",
+        {"project_id": p["id"], "session_name": "exec-2", "compact": False},
+        db, str(tmp_path),
+    )
+    assert "goal_xml" in res
+    assert "meridian_instructions" in res
+    assert res.get("compact") is not True
+
+
 def test_http_sprint_items_endpoints(client):
     project = client.post("/projects", json={"name": "alpha"}).json()
     # 422 when version/title missing.
