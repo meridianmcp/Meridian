@@ -1,0 +1,20 @@
+[run]
+source = meridian
+omit =
+    # Postgres adapter — only exercised with real Postgres, tests use SQLite
+    meridian/pg_adapter.py
+    # Client SDK — separate package, not a server concern
+    meridian/sdk.py
+    # Cloud-hosted auth/Stripe — requires real OAuth + Stripe in integration
+    meridian/hosted.py
+    # Goal sync — skipped on win32 in tests
+    meridian/goal_md.py
+    # stdio MCP transport — only exercised via piped stdin/stdout, not HTTP
+    meridian/mcp/stdio_handler.py
+
+[report]
+exclude_lines =
+    pragma: no cover
+    def __repr__
+    if TYPE_CHECKING:
+    raise NotImplementedError

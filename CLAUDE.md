@@ -138,6 +138,7 @@ your project context on start and snapshots progress on end.
   ```
 - **Secrets hygiene**: Never put credentials, connection strings, API keys, or secrets in chat or task descriptions. Mention env var names only.
 - **Before every push**: Run `pixi run test` locally first. CI is a safety net — not the first check. Never push broken code.
+- **Tests required**: Every sprint item that adds a feature or fixes a bug must include at least one test. No merging to main without tests for the changed code. CI enforces 70% overall coverage (pg_adapter, sdk, hosted, goal_md excluded) — do not reduce it.
 - **End every session**: If tests pass, merge `dev → main` and push `main` to trigger deploy. Do not end the session with work stranded only on `dev`.
 - **Set sprint name**: Use `PATCH /projects/{id}/goal` with body `{"sprint": "name"}` directly (or the `set_sprint` MCP tool). Do NOT use `set_goal` for sprint-only updates.
 - **Handoff**: Use `get_context_block(project_id)` for the handoff context block. Do NOT read from `data/meridian-build_handoff.md` — that file is local-only and not reliable across sessions.
@@ -157,7 +158,7 @@ your project context on start and snapshots progress on end.
 
 ---
 <!-- MERIDIAN STATE — auto-generated, do not edit below -->
-## Current Sprint State  _(auto-updated 2026-06-13 08:51 UTC)_
+## Current Sprint State  _(auto-updated 2026-06-14 07:31 UTC)_
 
 **Key Files:**
 - `meridian/server.py` — FastAPI app + MCP handlers
