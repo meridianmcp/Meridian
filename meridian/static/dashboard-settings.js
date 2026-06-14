@@ -1887,7 +1887,11 @@ export async function loadSettingsTab(projectId) {
 
         if (handoffTplIn) handoffTplIn.value = s.handoff_template || '';
 
-      } catch (e) { /* defaults shown */ }
+      } catch (e) {
+        // A failed load must not masquerade as "saved defaults" — surface it so
+        // the toggle state shown is never silently stale.
+        if (saveStatus) saveStatus.textContent = 'Could not load workspace defaults.';
+      }
 
     })();
 
@@ -1923,9 +1927,15 @@ export async function loadSettingsTab(projectId) {
 
         setTimeout(() => { if (saveStatus) saveStatus.textContent = ''; }, 2000);
 
+        toast('Workspace defaults saved');
+
       } catch (e) {
 
-        if (saveStatus) saveStatus.textContent = `Save failed: ${String(e)}`;
+        const msg = (e && e.message) ? e.message : String(e);
+
+        if (saveStatus) saveStatus.textContent = `Save failed: ${msg}`;
+
+        toast(`Save failed: ${msg}`, true);
 
       } finally {
 

@@ -3024,6 +3024,7 @@ project_id = "${displayPid}"`;
             if (nudgeIn) nudgeIn.value = s.log_task_sprint_nudge_threshold != null ? s.log_task_sprint_nudge_threshold : 5;
             if (handoffTplIn) handoffTplIn.value = s.handoff_template || "";
           } catch (e) {
+            if (saveStatus) saveStatus.textContent = "Could not load workspace defaults.";
           }
         })();
         if (saveBtn) saveBtn.onclick = async () => {
@@ -3044,8 +3045,11 @@ project_id = "${displayPid}"`;
             setTimeout(() => {
               if (saveStatus) saveStatus.textContent = "";
             }, 2e3);
+            toast("Workspace defaults saved");
           } catch (e) {
-            if (saveStatus) saveStatus.textContent = `Save failed: ${String(e)}`;
+            const msg = e && e.message ? e.message : String(e);
+            if (saveStatus) saveStatus.textContent = `Save failed: ${msg}`;
+            toast(`Save failed: ${msg}`, true);
           } finally {
             saveBtn.disabled = false;
           }
