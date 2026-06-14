@@ -161,6 +161,10 @@ export async function loadNotesTab(projectId) {
 
     if (!title || !text) { toast('title and body required', true); return; }
 
+    if (title.length > 500) { toast('Title too long (500 char limit)', true); if (addTitle) addTitle.style.borderColor = 'var(--red, #f87171)'; return; }
+
+    if (addTitle) addTitle.style.borderColor = '';
+
     try {
 
       await api(`/projects/${projectId}/notes`, {

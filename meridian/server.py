@@ -2592,6 +2592,7 @@ async def post_decision_endpoint(
     text = (body.get("text") or "").strip()
     if not text:
         raise HTTPException(status_code=422, detail="text is required")
+    validate_input_size(text, "decision text", 100_000)
     updated = await db_module.set_decision(await _db(request), project_id, text)
     return {"project_id": project_id, "decisions": updated}
 
@@ -4377,6 +4378,8 @@ async def workspace_add_note(request: Request) -> dict[str, Any]:
     content = (body.get("body") or "").strip()
     if not title or not content:
         raise HTTPException(status_code=422, detail="title and body are required")
+    validate_input_size(title, "note title", 500)
+    validate_input_size(content, "note body", 10_000_000)
     _t = await _get_tenant_from_request(request)
     return await db_module.add_workspace_note(
         db, title, content, body.get("tags"), tenant_id=_t["id"] if _t else None
@@ -7581,6 +7584,7 @@ async def _dispatch_mcp_tool(
     if name == "set_north_star":
         return await db_module.set_north_star(db, args["project_id"], args["north_star"])
     if name == "log_task":
+        validate_input_size(args.get("description"), "description", 50_000)
         task = await db_module.log_task(
             db, args["session_id"], args["project_id"],
             args["description"], args.get("status", "done"),
@@ -7624,6 +7628,8 @@ async def _dispatch_mcp_tool(
             mode = "full"
         return {"file_path": path, "content": content, "mode": mode}
     if name == "pin_decision":
+        validate_input_size(args.get("title"), "decision title", 500)
+        validate_input_size(args.get("body"), "decision body", 100_000)
         category = args.get("category", "TECHNICAL")
         result = await db_module.pin_decision(
             db, args["project_id"], args["title"], args["body"], category,
@@ -7783,6 +7789,8 @@ async def _dispatch_mcp_tool(
             "start_fresh": start_fresh,
         }
     if name == "request_hitl":
+        validate_input_size(args.get("question"), "question", 10_000)
+        validate_input_size(args.get("context"), "context", 50_000)
         _hitl_kind = args.get("kind", "question")
         if _hitl_kind not in ("question", "correction"):
             _hitl_kind = "question"
@@ -7815,6 +7823,8 @@ async def _dispatch_mcp_tool(
             raise ValueError("hitl request not found")
         return result
     if name == "add_note":
+        validate_input_size(args.get("title"), "note title", 500)
+        validate_input_size(args.get("body"), "note body", 10_000_000)
         result = await db_module.add_project_note(
             db, args["project_id"], args["title"], args["body"],
             args.get("tags"),
@@ -7831,6 +7841,8 @@ async def _dispatch_mcp_tool(
         ok = await db_module.delete_project_note(db, args["note_id"])
         return {"deleted": ok}
     if name == "add_workspace_note":
+        validate_input_size(args.get("title"), "note title", 500)
+        validate_input_size(args.get("body"), "note body", 10_000_000)
         return await db_module.add_workspace_note(
             db, args["title"], args["body"], args.get("tags"),
             tenant_id=_mcp_tenant_id,
@@ -7840,6 +7852,8 @@ async def _dispatch_mcp_tool(
             db, tag=args.get("tag"), tenant_id=_mcp_tenant_id,
         )
     if name == "pin_workspace_decision":
+        validate_input_size(args.get("title"), "decision title", 500)
+        validate_input_size(args.get("body"), "decision body", 100_000)
         return await db_module.pin_workspace_decision(
             db, args["title"], args["body"],
             category=args.get("category", "TECHNICAL"),
@@ -7965,12 +7979,15 @@ async def _dispatch_mcp_tool(
         active_only = args.get("status", "active") != "all"
         return await db_module.get_sessions(db, args["project_id"], active_only=active_only)
     if name == "add_sprint_note":
+        validate_input_size(args.get("title"), "note title", 500)
+        validate_input_size(args.get("body"), "note body", 10_000_000)
         return await db_module.add_session_note(
             db, args["session_id"], args["title"], args["body"]
         )
     if name == "get_sprint_notes":
         return await db_module.get_session_notes(db, args["session_id"])
     if name == "add_sprint_item":
+        validate_input_size(args.get("title"), "sprint item title", 500)
         return await db_module.add_sprint_item(
             db, args["project_id"], args["version"], args["title"],
             group=args.get("group"),
@@ -7980,6 +7997,8 @@ async def _dispatch_mcp_tool(
             milestone_type=args.get("milestone_type", "task"),
         )
     if name == "update_sprint_item":
+        validate_input_size(args.get("title"), "sprint item title", 500)
+        validate_input_size(args.get("notes"), "sprint item notes", 50_000)
         item = await db_module.patch_sprint_item(
             db, args["project_id"], args["item_id"],
             title=args.get("title"),

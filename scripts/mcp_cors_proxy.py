@@ -82,8 +82,10 @@ class _Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:  # noqa: N802 — forward the real MCP traffic
         length = int(self.headers.get("Content-Length", 0) or 0)
         payload = self.rfile.read(length) if length else b""
+        # Always target /mcp on the backend — mcp-proxy only listens there;
+        # claude.ai sends POST / which would 404 if we forwarded self.path.
         fwd = urllib.request.Request(
-            self.backend.rstrip("/") + self.path,
+            self.backend.rstrip("/") + "/mcp",
             data=payload,
             method="POST",
             headers={
@@ -94,6 +96,12 @@ class _Handler(BaseHTTPRequestHandler):
         auth = self.headers.get("Authorization")
         if auth:
             fwd.add_header("Authorization", auth)
+        session_id = self.headers.get("Mcp-Session-Id")
+        if session_id:
+            fwd.add_header("Mcp-Session-Id", session_id)
+        proto_ver = self.headers.get("Mcp-Protocol-Version")
+        if proto_ver:
+            fwd.add_header("Mcp-Protocol-Version", proto_ver)
         try:
             with urllib.request.urlopen(fwd, timeout=30) as resp:
                 body = resp.read()
@@ -118,9 +126,9 @@ def main() -> None:
     _Handler.backend = args.backend
     srv = ThreadingHTTPServer(("0.0.0.0", args.listen), _Handler)
     sys.stderr.write(
-        f"[mcp-cors-proxy] listening on 0.0.0.0:{args.listen} -> {args.backend}\n"
+        f"[mcp-cors-proxy] listening on 0.0.0.0:{args.listen} -> {args.backend}/mcp\n"
         f"[mcp-cors-proxy] point your tunnel at port {args.listen}; "
-        f"add https://<tunnel>/mcp to claude.ai\n"
+        f"add https://<tunnel>/mcp as a connector in claude.ai\n"
     )
     try:
         srv.serve_forever()

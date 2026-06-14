@@ -4353,6 +4353,12 @@ project_id = "${displayPid}"`;
         toast("title and body required", true);
         return;
       }
+      if (title.length > 500) {
+        toast("Title too long (500 char limit)", true);
+        if (addTitle) addTitle.style.borderColor = "var(--red, #f87171)";
+        return;
+      }
+      if (addTitle) addTitle.style.borderColor = "";
       try {
         await api(`/projects/${projectId}/notes`, {
           method: "POST",
@@ -7245,6 +7251,16 @@ Current: ${current || "(none)"}`,
           if (decFormStatus) decFormStatus.textContent = "Title and body required.";
           return;
         }
+        if (title.length > 500) {
+          if (decFormStatus) decFormStatus.textContent = "Title too long (500 char limit).";
+          if (decFormTitle) decFormTitle.style.borderColor = "var(--red, #f87171)";
+          return;
+        }
+        if (body2.length > 1e5) {
+          if (decFormStatus) decFormStatus.textContent = "Body too long (100,000 char limit).";
+          if (decFormBody) decFormBody.style.borderColor = "var(--red, #f87171)";
+          return;
+        }
         decFormAdd.disabled = true;
         if (decFormStatus) decFormStatus.textContent = "";
         try {
@@ -7261,6 +7277,17 @@ Current: ${current || "(none)"}`,
         }
       };
       decFormAdd.onclick = doAddDecision;
+      if (decFormTitle) decFormTitle.oninput = () => {
+        const over = decFormTitle.value.length > 500;
+        decFormTitle.style.borderColor = over ? "var(--red, #f87171)" : "";
+        if (decFormStatus) decFormStatus.textContent = over ? `Title: ${decFormTitle.value.length}/500` : "";
+      };
+      if (decFormBody) decFormBody.oninput = () => {
+        const len = decFormBody.value.length, limit = 1e5;
+        const over = len > limit, near = len > limit * 0.9;
+        decFormBody.style.borderColor = over ? "var(--red, #f87171)" : near ? "var(--warning, #fb923c)" : "";
+        if (decFormStatus) decFormStatus.textContent = over || near ? `Body: ${len.toLocaleString()}/${limit.toLocaleString()}` : "";
+      };
       [decFormTitle, decFormBody].forEach((el) => {
         if (el) el.addEventListener("keydown", (e) => {
           if ((e.ctrlKey || e.metaKey) && e.key === "Enter") doAddDecision();
@@ -7786,12 +7813,18 @@ Current: ${current || "(none)"}`,
       toast("Title required", true);
       return;
     }
+    if (title.length > 500) {
+      toast("Title too long (500 char limit)", true);
+      inp.style.borderColor = "var(--red, #f87171)";
+      return;
+    }
     try {
       await api2(`/projects/${projectId}/sprint-items`, {
         method: "POST",
         body: JSON.stringify({ version, title })
       });
       inp.value = "";
+      inp.style.borderColor = "";
       toast("Sprint item added");
       await refreshLiveTab(projectId);
     } catch (e) {

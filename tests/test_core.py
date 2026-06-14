@@ -9124,6 +9124,60 @@ def test_sprint_item_title_size_limit(client):
     assert "sprint item title" in r.json().get("detail", "").lower()
 
 
+def _mcp_call(client, name, arguments):
+    """Helper: invoke a Meridian MCP tool via /mcp/sse and return the parsed response."""
+    r = client.post("/mcp/sse", json={
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": {"name": name, "arguments": arguments},
+    })
+    assert r.status_code == 200
+    return r.json()
+
+
+def test_mcp_pin_decision_title_size_limit(client):
+    """MCP pin_decision rejects decision title > 500 chars."""
+    project = client.post("/projects", json={"name": "mcp-size-dec"}).json()
+    resp = _mcp_call(client, "pin_decision", {
+        "project_id": project["id"],
+        "title": "t" * 501,
+        "body": "some body",
+    })
+    err_msg = resp.get("error", {}).get("message", "")
+    assert "decision title" in err_msg.lower(), f"Expected 'decision title' in error, got: {resp}"
+
+
+def test_mcp_pin_decision_body_size_limit(client):
+    """MCP pin_decision rejects decision body > 100k chars.
+
+    Patches limits.BODY_BYTES to bypass the middleware body-size guard so the
+    field-level validate_input_size check can fire instead.
+    """
+    import unittest.mock
+    from meridian import limits as _limits_mod
+    project = client.post("/projects", json={"name": "mcp-size-dec-body"}).json()
+    with unittest.mock.patch.object(_limits_mod, "BODY_BYTES", 10_000_000):
+        resp = _mcp_call(client, "pin_decision", {
+            "project_id": project["id"],
+            "title": "valid title",
+            "body": "b" * 100_001,
+        })
+    err_msg = resp.get("error", {}).get("message", "")
+    assert "decision body" in err_msg.lower(), f"Expected 'decision body' in error, got: {resp}"
+
+
+def test_mcp_log_task_description_size_limit(client):
+    """MCP log_task rejects description > 50k chars."""
+    project = client.post("/projects", json={"name": "mcp-size-task"}).json()
+    sess = client.post("/sessions/register", json={"project_id": project["id"], "name": "s"}).json()
+    resp = _mcp_call(client, "log_task", {
+        "session_id": sess["id"],
+        "project_id": project["id"],
+        "description": "d" * 50_001,
+    })
+    err_msg = resp.get("error", {}).get("message", "")
+    assert "description" in err_msg.lower(), f"Expected 'description' in error, got: {resp}"
+
+
 @pytest.mark.asyncio
 async def test_rollup_parent_all_done(db):
     """Completing all children auto-completes the parent."""

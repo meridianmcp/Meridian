@@ -48,3 +48,43 @@ def test_cors_shim_get_probe_returns_200_info_with_cors():
             assert "name" in body and "transport" in body
     finally:
         srv.shutdown()
+
+
+def test_cors_shim_post_always_targets_mcp_backend_path():
+    """POST / (as claude.ai sends) must be forwarded to /mcp on the backend, not /."""
+    import http.server
+
+    received_paths: list[str] = []
+
+    class _FakeBackend(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):  # noqa: N802
+            received_paths.append(self.path)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b"{}")
+
+        def log_message(self, *_):
+            pass
+
+    fake = ThreadingHTTPServer(("127.0.0.1", 0), _FakeBackend)
+    threading.Thread(target=fake.serve_forever, daemon=True).start()
+    fake_port = fake.server_address[1]
+
+    mod = _load_shim()
+    mod._Handler.backend = f"http://127.0.0.1:{fake_port}"
+    srv, shim_port = _serve(mod)
+    try:
+        # Simulate claude.ai sending POST / (root path)
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{shim_port}/",
+            data=b'{"jsonrpc":"2.0"}',
+            method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=5) as r:
+            assert r.status == 200
+        assert received_paths == ["/mcp"], f"expected ['/mcp'], got {received_paths}"
+    finally:
+        srv.shutdown()
+        fake.shutdown()
