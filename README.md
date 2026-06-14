@@ -11,6 +11,7 @@ Open-source MCP server for persistent AI session memory — shared task log,
 pinned decisions, human-in-the-loop queue, and tiered handoffs. Works with
 Claude Code, Cursor, Cline, Claude Desktop, or any MCP client.
 
+[![GitHub Stars](https://img.shields.io/github/stars/meridianmcp/Meridian?style=social)](https://github.com/meridianmcp/Meridian)
 [![License: MSL-1.0](https://img.shields.io/badge/license-MSL--1.0-blue)](LICENSE)
 [![Tests](https://github.com/meridianmcp/Meridian/actions/workflows/test.yml/badge.svg)](https://github.com/meridianmcp/Meridian/actions/workflows/test.yml)
 [![Docs](https://img.shields.io/badge/docs-docs.usemeridian.us-6c8fff)](https://docs.usemeridian.us)
@@ -119,7 +120,7 @@ git clone --recurse-submodules https://github.com/meridianmcp/Meridian
 2. Click **Load unpacked** and select `extensions/claude-mcp`
 3. Click the extension icon and set the URL to `http://localhost:7878/mcp`
 
-All 51 Meridian tools (`checkpoint`, `log_task`, `pin_decision`, etc.) are now available directly in claude.ai planning chat. No copy-pasting session output.
+All 54+ Meridian tools (`checkpoint`, `log_task`, `pin_decision`, etc.) are now available directly in claude.ai planning chat. No copy-pasting session output.
 
 ### Hosted tier (no install)
 

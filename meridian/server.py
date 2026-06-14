@@ -5248,6 +5248,28 @@ async def _start_session_composite(
     except Exception:
         pass
 
+    # 5b13b7b6 — session name uniqueness: reject if an active session with this
+    # name was seen within the last 60 seconds (genuine concurrent duplicate start).
+    # Sessions older than 60 s are handled by the continuation window or by the
+    # stale-replacement flow above — don't block those.
+    from datetime import datetime, timedelta, timezone as _tz
+    _uniq_cutoff = (
+        datetime.now(_tz.utc) - timedelta(seconds=60)
+    ).strftime("%Y-%m-%d %H:%M:%S")
+    _active_sessions = await db_module.get_sessions(db, project_id, active_only=True)
+    for _as in _active_sessions:
+        if (_as.get("name") or "").lower() != session_name.lower():
+            continue
+        if _as.get("status") != "active":
+            continue
+        _ls = _as.get("last_seen") or ""
+        if _ls > _uniq_cutoff:
+            raise ValueError(
+                f"session '{session_name}' already exists and is active "
+                f"(id: {_as['id'][:8]}...) — use a different name or close "
+                "the existing session first."
+            )
+
     if not human_id and not _hosted_mode():
         human_id = db_module.get_default_human_id()
     session = await db_module.register_session(
@@ -5422,16 +5444,19 @@ async def start_session_endpoint(
     if project is None:
         raise HTTPException(status_code=404, detail="project not found")
     validate_input_size(body.session_name, "session name", 200)
-    return await _start_session_composite(
-        await _db(request),
-        project_id,
-        body.session_name,
-        _data_dir(request),
-        human_id=body.human_id,
-        client_type=body.client,
-        role=body.role,
-        source=body.source,
-    )
+    try:
+        return await _start_session_composite(
+            await _db(request),
+            project_id,
+            body.session_name,
+            _data_dir(request),
+            human_id=body.human_id,
+            client_type=body.client,
+            role=body.role,
+            source=body.source,
+        )
+    except ValueError as _ve:
+        raise HTTPException(status_code=400, detail=str(_ve)) from _ve
 
 
 # ---------------------------------------------------------------------------
@@ -7578,6 +7603,21 @@ async def _dispatch_mcp_tool(
     # Tenant scope for the workspace layer (notes/decisions/settings). None for
     # self-host / unauthenticated; the db functions then skip isolation.
     _mcp_tenant_id = tenant.get("id") if tenant else None
+    # b6ab6e83 — project_name resolver: accept project_name as alternative to
+    # project_id, and resolve non-UUID project_id values as human-readable names.
+    _pid_raw = args.get("project_id", "")
+    _pname_raw = args.get("project_name", "")
+    _is_uuid = bool(re.match(
+        r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+        _pid_raw, re.I,
+    ))
+    if _pname_raw or (_pid_raw and not _is_uuid):
+        _lookup = _pname_raw or _pid_raw
+        _resolved_proj = await db_module.get_project_by_name(db, _lookup)
+        if _resolved_proj:
+            args = {**args, "project_id": _resolved_proj["id"]}
+        elif _pname_raw and not _pid_raw:
+            raise ValueError(f"no project found matching name '{_lookup}'")
     if name == "create_project":
         existing = await db_module.get_project_by_name(db, args["name"])
         if existing is not None:
@@ -8028,7 +8068,22 @@ async def _dispatch_mcp_tool(
         return await db_module.get_session_notes(db, args["session_id"])
     if name == "add_sprint_item":
         validate_input_size(args.get("title"), "sprint item title", 500)
-        return await db_module.add_sprint_item(
+        # 10c0f6a0 — fuzzy duplicate guard: warn if title closely matches existing item
+        _new_words = set(args["title"].lower().split())
+        _dup_warnings: list[dict[str, Any]] = []
+        if len(_new_words) >= 3:
+            _all_items = await db_module.get_sprint_items(db, args["project_id"])
+            for _ex in _all_items:
+                if _ex.get("status") in {"pending", "todo", "in_progress", "done"}:
+                    _ex_words = set(_ex["title"].lower().split())
+                    if _ex_words:
+                        _overlap = len(_new_words & _ex_words) / len(_new_words)
+                        if _overlap >= 0.6:
+                            _dup_warnings.append({
+                                "item_id": _ex["id"], "title": _ex["title"][:120],
+                                "status": _ex["status"], "match_pct": round(_overlap * 100),
+                            })
+        _new_item = await db_module.add_sprint_item(
             db, args["project_id"], args["version"], args["title"],
             group=args.get("group"),
             human_id=args.get("human_id"),
@@ -8036,6 +8091,9 @@ async def _dispatch_mcp_tool(
             failure_mode=args.get("failure_mode"),
             milestone_type=args.get("milestone_type", "task"),
         )
+        if _dup_warnings:
+            _new_item = {**_new_item, "duplicate_warnings": _dup_warnings}
+        return _new_item
     if name == "update_sprint_item":
         validate_input_size(args.get("title"), "sprint item title", 500)
         validate_input_size(args.get("notes"), "sprint item notes", 50_000)
@@ -8058,11 +8116,24 @@ async def _dispatch_mcp_tool(
             pass
         else:
             include_human = str(include_human).lower() not in ("false", "0", "no")
-        return await db_module.get_sprint_items(
+        _items = await db_module.get_sprint_items(
             db, args["project_id"],
             status=args.get("status"),
             include_human=include_human,
         )
+        # 10c0f6a0 — stale-session warning: in_progress items claimed >2h ago
+        from datetime import datetime as _dt_cls
+        _now_utc = _dt_cls.utcnow()
+        for _i, _it in enumerate(_items):
+            if _it.get("status") == "in_progress" and _it.get("claimed_at"):
+                try:
+                    _ca = _dt_cls.fromisoformat(_it["claimed_at"].split(".")[0].replace("Z", ""))
+                    _age_h = (_now_utc - _ca).total_seconds() / 3600
+                    if _age_h > 2:
+                        _items[_i] = {**_it, "stale_warning": True, "stale_age_hours": round(_age_h, 1)}
+                except Exception:  # noqa: BLE001
+                    pass
+        return _items
     if name == "claim_sprint_item":
         # ITEM 3 — protect installer scripts: refuse to claim a sprint item whose
         # touches_files includes hooks.ps1 / hooks.sh unless force=true is passed.
@@ -8113,7 +8184,31 @@ async def _dispatch_mcp_tool(
                     "conflicts": conflicts,
                 }
 
-        item = await db_module.claim_sprint_item(db, args["project_id"], args["item_id"])
+        try:
+            item = await db_module.claim_sprint_item(db, args["project_id"], args["item_id"])
+        except ValueError:
+            # 10c0f6a0 — if already in_progress, check for stale claim and surface info
+            _stale_item = await db_module.get_sprint_item(db, args["item_id"])
+            if _stale_item and _stale_item.get("status") == "in_progress" and _stale_item.get("claimed_at"):
+                from datetime import datetime as _dt_cls
+                try:
+                    _ca = _dt_cls.fromisoformat(_stale_item["claimed_at"].split(".")[0].replace("Z", ""))
+                    _age_h = (_dt_cls.utcnow() - _ca).total_seconds() / 3600
+                    if _age_h > 2:
+                        return {
+                            "error": "STALE_CLAIM",
+                            "message": (
+                                f"Item is in_progress but claimed {round(_age_h, 1)}h ago with no recent "
+                                "activity — the claiming session may have ended. Safe to force-reclaim "
+                                "by updating status to 'pending' first via update_sprint_item."
+                            ),
+                            "stale_age_hours": round(_age_h, 1),
+                            "claimed_at": _stale_item["claimed_at"],
+                            "item": _stale_item,
+                        }
+                except Exception:  # noqa: BLE001
+                    pass
+            raise
         if item is None:
             raise ValueError("sprint item not found")
 

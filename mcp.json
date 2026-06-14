@@ -1,0 +1,27 @@
+{
+  "$schema": "https://registry.modelcontextprotocol.io/schema/v1/server.json",
+  "name": "io.github.meridianmcp/meridian",
+  "displayName": "Meridian",
+  "description": "Shared memory for AI coding sessions — persistent task log, pinned decisions, HITL queue, sprint board, and tiered handoffs. Coordinate parallel Claude Code sessions without losing context.",
+  "repository": "https://github.com/meridianmcp/Meridian",
+  "homepage": "https://usemeridian.us",
+  "license": "MSL-1.0",
+  "author": {
+    "name": "Adam Camerer",
+    "email": "hello@usemeridian.us",
+    "url": "https://usemeridian.us"
+  },
+  "categories": ["development-tools"],
+  "tags": ["memory", "session", "coordination", "sprint", "decisions", "hitl"],
+  "transports": [
+    {
+      "type": "streamable-http",
+      "url": "https://usemeridian.us/mcp",
+      "security": {
+        "type": "oauth2"
+      }
+    }
+  ],
+  "documentation": "https://docs.usemeridian.us",
+  "support": "hello@usemeridian.us"
+}
