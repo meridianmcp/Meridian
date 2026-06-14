@@ -349,6 +349,7 @@ Add a per-project wiki note. Use for setup instructions, gotchas, environment de
 | `title` | string | required |  |
 | `body` | string | required |  |
 | `tags` | string | optional |  |
+| `kind` | string | optional |  |
 | `category` | string | optional |  |
 
 **Example:**
