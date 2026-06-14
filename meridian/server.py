@@ -3987,6 +3987,155 @@ async def get_queued_session_endpoint(project_id: str, request: Request) -> dict
     return {"goal": await db_module.get_queued_session(db, project_id)}
 
 
+# ---------------------------------------------------------------------------
+# v2.0 — Bearer token management
+# ---------------------------------------------------------------------------
+
+
+@app.post("/auth/tokens", status_code=201)
+async def create_api_token(request: Request) -> dict[str, Any]:
+    """Generate a new API bearer token for the authenticated tenant.
+
+    Requires a valid session cookie (browser flow) or existing bearer token.
+    Returns ``{"token": "sk_meridian_...", "id": "...", "label": "..."}``
+    where ``token`` is shown exactly once and never stored in plain text.
+    """
+    tenant = await _get_authenticated_tenant(request)
+
+    body = {}
+    try:
+        body = await request.json()
+    except Exception:
+        pass
+    label = (body.get("label") or "").strip() or None
+    token_type = body.get("token_type") or "readwrite"
+    if token_type not in ("readwrite", "readonly"):
+        token_type = "readwrite"
+    db = request.app.state.db
+    # If a label is provided, delete any existing token with the same label first
+    # so the label acts as a unique slot (prevents token accumulation + revocation loops)
+    if label:
+        await db_module.delete_api_tokens_by_label(db, tenant["id"], label)
+    raw_token, token_row = await db_module.create_api_token(db, tenant["id"], label, token_type=token_type)
+    return {
+        "token": raw_token,
+        "id": token_row["id"],
+        "label": token_row["label"],
+        "token_type": token_row.get("token_type", "readwrite"),
+        "created_at": token_row["created_at"],
+    }
+
+
+@app.get("/auth/tokens")
+async def list_api_tokens(request: Request) -> list[dict[str, Any]]:
+    """List API bearer tokens for the authenticated tenant."""
+    tenant = await _get_authenticated_tenant(request)
+    db = request.app.state.db
+    tokens = await db_module.list_api_tokens(db, tenant["id"])
+    return [
+        {
+            "id": token["id"],
+            "label": token.get("label"),
+            "token_type": token.get("token_type") or "readwrite",
+            "created_at": token.get("created_at"),
+            "masked_token": _mask_api_token_hash(token.get("token_hash")),
+        }
+        for token in tokens
+    ]
+
+
+@app.delete("/auth/tokens/{token_id}", status_code=204)
+async def delete_api_token(token_id: str, request: Request) -> Response:
+    """Revoke an API bearer token for the authenticated tenant."""
+    tenant = await _get_authenticated_tenant(request)
+    db = request.app.state.db
+    deleted = await db_module.delete_api_token(db, tenant["id"], token_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="token not found")
+    return Response(status_code=204)
+
+
+@app.get("/auth/me")
+async def get_me(request: Request) -> dict[str, Any]:
+    """Return the authenticated tenant's profile (session cookie or bearer), including projects."""
+    tenant = await _get_authenticated_tenant(request)
+    safe = {k: v for k, v in tenant.items() if k not in ("neon_db_url", "github_pat")}
+    safe["github_connected"] = bool(tenant.get("github_pat"))
+    try:
+        project_db = await _open_tenant_db_by_id(request, tenant["id"])
+        projects = await db_module.list_project_summaries(project_db)
+        safe["projects"] = [
+            {"id": p["id"], "name": p["name"]}
+            for p in (projects or [])
+        ]
+    except Exception:
+        safe["projects"] = []
+    return safe
+
+
+@app.get("/auth/install", response_class=HTMLResponse)
+async def auth_install_page(request: Request) -> HTMLResponse:
+    """One-time install token page — requires browser session, returns a short-lived token."""
+    if not _hosted_mode():
+        raise HTTPException(status_code=404, detail="not available in self-hosted mode")
+    from datetime import datetime, timezone, timedelta
+    tenant = await _get_authenticated_tenant(request)
+    db = request.app.state.db
+    expires_at = (datetime.now(timezone.utc) + timedelta(minutes=10)).isoformat()
+    raw_token, _ = await db_module.create_api_token(
+        db, tenant["id"], label="install", expires_at=expires_at
+    )
+    email = tenant.get("email", "")
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Meridian Connect</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>&#x1F9ED;</text></svg>">
+  <style>
+    body{{font-family:system-ui,sans-serif;background:#0d0d0d;color:#e8e8e8;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}}
+    .card{{background:#1a1a1a;border:1px solid #2e2e2e;border-radius:12px;padding:32px;max-width:520px;width:100%}}
+    h2{{margin:0 0 8px;font-size:20px}}
+    p{{color:#888;margin:0 0 20px;font-size:14px}}
+    .token-box{{font-family:monospace;font-size:13px;background:#0d0d0d;border:1px solid #333;border-radius:6px;padding:14px;word-break:break-all;user-select:all;cursor:pointer;color:#7dd3fc;line-height:1.5}}
+    .copy-btn{{margin-top:12px;padding:8px 20px;border-radius:6px;border:none;background:#3b82f6;color:#fff;cursor:pointer;font-size:13px;width:100%}}
+    .copy-btn:active{{background:#2563eb}}
+    .note{{font-size:12px;color:#555;margin-top:16px;line-height:1.5}}
+    .email{{color:#888;font-size:12px;margin-bottom:20px}}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h2>Meridian Connect</h2>
+    <div class="email">Signed in as {email}</div>
+    <p>Copy this token and paste it into the installer. It expires in 10 minutes and can only be used once.</p>
+    <div style="position:relative;margin-bottom:12px">
+      <div class="token-box" id="token" style="filter:blur(6px);transition:filter 0.2s;word-break:break-all;user-select:all">{raw_token}</div>
+      <button onclick="toggleReveal()" id="revealBtn" style="position:absolute;top:50%;right:10px;transform:translateY(-50%);background:#222;border:1px solid #444;color:#aaa;border-radius:4px;padding:3px 10px;font-size:12px;cursor:pointer">Show</button>
+    </div>
+    <button class="copy-btn" onclick="copyToken()">Copy token</button>
+    <div class="note">This token grants one-time installer access. Never share it — treat it like a password.</div>
+  </div>
+  <script>
+    var _revealed = false;
+    function toggleReveal() {{
+      _revealed = !_revealed;
+      document.getElementById('token').style.filter = _revealed ? 'none' : 'blur(6px)';
+      document.getElementById('revealBtn').textContent = _revealed ? 'Hide' : 'Show';
+    }}
+    function copyToken() {{
+      navigator.clipboard.writeText('{raw_token}').then(() => {{
+        const btn = document.querySelector('.copy-btn');
+        btn.textContent = '✓ Copied!';
+        setTimeout(() => btn.textContent = 'Copy token', 2000);
+      }});
+    }}
+  </script>
+</body>
+</html>"""
+    return HTMLResponse(content=html)
+
+
 # v2.0 — Remote MCP endpoint (HTTP JSON-RPC 2.0 transport)
 # ---------------------------------------------------------------------------
 

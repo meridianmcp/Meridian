@@ -115,13 +115,6 @@ def client(tmp_path, monkeypatch):
     # Import after env vars are set so the module sees them.
     from fastapi.testclient import TestClient
 
-    # Reset the rate-limiter BEFORE reloading server.py. The _limiter singleton
-    # lives in _deps.py and is not recreated on importlib.reload(server). We
-    # clear storage counters and route-limit registrations first so they are
-    # re-registered cleanly during the reload (decorators run at module load).
-    from meridian._deps import _reset_limiter_storage
-    _reset_limiter_storage()
-
     # Force a fresh import so lifespan picks up the env vars cleanly.
     import importlib
     import meridian.server as server_module
