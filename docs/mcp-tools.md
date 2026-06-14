@@ -1,6 +1,6 @@
 # MCP Tool Reference
 
-Meridian exposes **55 tools** over MCP.
+Meridian exposes **57 tools** over MCP.
 
 They fall into two usage patterns:
 
@@ -175,6 +175,8 @@ Claim exclusive edit rights on a file path for this session. Locks auto-expire a
 |-----------|------|----------|-------------|
 | `session_id` | string | required |  |
 | `file_path` | string | required |  |
+| `symbol` | string | optional | Optional symbol to claim (class/function/method name, e.g. 'AuthRouter' or 'AuthRouter.login'). Requires `content`. |
+| `content` | string | optional | Full source of the file, required when `symbol` is given so the server can resolve the symbol's line range. |
 
 **Example:**
 ```

@@ -10306,3 +10306,157 @@ async def test_get_session_brief_shows_new_items_count(db):
     text = res["text"]
     assert "<board_change>" in text
     assert "added since this session started" in text
+
+
+# ---------------------------------------------------------------------------
+# Symbol-level parallel protection (4bac57ff)
+# ---------------------------------------------------------------------------
+
+_SYM_SRC = (
+    "class AuthRouter:\n"
+    "    def login(self):\n"
+    "        return 1\n"
+    "\n"
+    "class MCPHandler:\n"
+    "    def handle(self):\n"
+    "        return 2\n"
+    "\n"
+    "def helper():\n"
+    "    return 3\n"
+)
+
+
+def test_extract_symbols_python_and_js():
+    from meridian.symbols import extract_symbols
+
+    py = extract_symbols("a.py", _SYM_SRC)
+    by_name = {s["name"]: s for s in py}
+    assert by_name["AuthRouter"]["type"] == "class"
+    assert by_name["AuthRouter.login"]["type"] == "method"
+    assert by_name["helper"]["type"] == "function"
+    # Class range covers its method.
+    assert by_name["AuthRouter"]["line_start"] <= by_name["AuthRouter.login"]["line_start"]
+    assert by_name["AuthRouter"]["line_end"] >= by_name["AuthRouter.login"]["line_end"]
+
+    js = extract_symbols("a.js", "function bar(){return 1}\nclass W { render(){} }\n")
+    js_names = {s["name"] for s in js}
+    assert "bar" in js_names and "W" in js_names
+
+    # Unsupported extension / broken source degrade to [] (whole-file fallback).
+    assert extract_symbols("a.txt", "hi") == []
+    assert extract_symbols("a.py", "def (") == []
+
+
+@pytest.mark.asyncio
+async def test_claim_symbol_allows_different_symbols_same_file(db):
+    """Two sessions can own different classes in the same file — the core win."""
+    p = await db_module.create_project(db, "sym-different")
+    s1 = await db_module.register_session(db, p["id"], "sess-a")
+    s2 = await db_module.register_session(db, p["id"], "sess-b")
+
+    r1 = await db_module.claim_symbol(db, s1["id"], "meridian/server.py", "AuthRouter", _SYM_SRC)
+    assert r1["claimed"] is True
+    assert r1["symbol_type"] == "class"
+
+    r2 = await db_module.claim_symbol(db, s2["id"], "meridian/server.py", "MCPHandler", _SYM_SRC)
+    assert r2["claimed"] is True
+
+
+@pytest.mark.asyncio
+async def test_claim_symbol_blocks_overlap_with_safe_suggestion(db):
+    """Overlapping claim is hard-blocked and lists symbols still safe to claim."""
+    p = await db_module.create_project(db, "sym-overlap")
+    s1 = await db_module.register_session(db, p["id"], "big-boi")
+    s2 = await db_module.register_session(db, p["id"], "sess-b")
+
+    await db_module.claim_symbol(db, s1["id"], "meridian/server.py", "AuthRouter", _SYM_SRC)
+
+    # Same symbol — blocked.
+    blocked = await db_module.claim_symbol(db, s2["id"], "meridian/server.py", "AuthRouter", _SYM_SRC)
+    assert blocked["claimed"] is False
+    assert blocked["reason"] == "symbol_conflict"
+    assert "AuthRouter" in blocked["message"]
+    assert "big-boi" in blocked["message"]
+    assert "MCPHandler" in blocked["safe_to_claim"]
+    assert "AuthRouter" not in blocked["safe_to_claim"]
+
+    # A method that overlaps the claimed class range is also blocked.
+    method_blocked = await db_module.claim_symbol(
+        db, s2["id"], "meridian/server.py", "AuthRouter.login", _SYM_SRC
+    )
+    assert method_blocked["claimed"] is False
+    assert method_blocked["reason"] == "symbol_conflict"
+
+
+@pytest.mark.asyncio
+async def test_claim_symbol_unparseable_and_missing(db):
+    p = await db_module.create_project(db, "sym-edge")
+    s1 = await db_module.register_session(db, p["id"], "sess-a")
+
+    unparseable = await db_module.claim_symbol(db, s1["id"], "notes.txt", "AuthRouter", "plain text")
+    assert unparseable["claimed"] is False
+    assert unparseable["reason"] == "unparseable"
+
+    missing = await db_module.claim_symbol(db, s1["id"], "a.py", "DoesNotExist", _SYM_SRC)
+    assert missing["claimed"] is False
+    assert missing["reason"] == "symbol_not_found"
+    assert "AuthRouter" in missing["available_symbols"]
+
+
+@pytest.mark.asyncio
+async def test_claim_file_mcp_symbol_path_and_fallback(db):
+    """claim_file MCP tool routes to symbol claim, and falls back when unparseable."""
+    import meridian.server as srv
+
+    p = await db_module.create_project(db, "sym-mcp")
+    s1 = await db_module.register_session(db, p["id"], "sess-a")
+
+    res = await srv._dispatch_mcp_tool(
+        "claim_file",
+        {"session_id": s1["id"], "file_path": "meridian/server.py",
+         "symbol": "AuthRouter", "content": _SYM_SRC},
+        db, "/tmp",
+    )
+    assert res["claimed"] is True
+    assert res["symbol"] == "AuthRouter"
+
+    # Unparseable content with a symbol falls back to a whole-file lock.
+    res2 = await srv._dispatch_mcp_tool(
+        "claim_file",
+        {"session_id": s1["id"], "file_path": "README.txt",
+         "symbol": "Foo", "content": "not code"},
+        db, "/tmp",
+    )
+    assert res2["claimed"] is True
+    assert "symbol" not in res2  # whole-file lock shape, not a symbol claim
+
+
+@pytest.mark.asyncio
+async def test_symbol_claims_released_on_close_session(db):
+    p = await db_module.create_project(db, "sym-release")
+    s1 = await db_module.register_session(db, p["id"], "sess-a")
+    await db_module.claim_symbol(db, s1["id"], "meridian/server.py", "AuthRouter", _SYM_SRC)
+    assert len(await db_module.get_symbol_claims(db, "meridian/server.py")) == 1
+
+    await db_module.close_session(db, s1["id"])
+    assert await db_module.get_symbol_claims(db, "meridian/server.py") == []
+
+
+@pytest.mark.asyncio
+async def test_symbol_hotspots(db):
+    """A symbol claimed by 3+ distinct sessions is a hotspot."""
+    p = await db_module.create_project(db, "sym-hotspot")
+    sessions = [await db_module.register_session(db, p["id"], f"s{i}") for i in range(3)]
+    # Three sessions claim the same symbol in sequence (each releases so the next
+    # can claim) — soft-release retains the history that makes it a hotspot.
+    for sess in sessions:
+        r = await db_module.claim_symbol(db, sess["id"], "meridian/server.py", "AuthRouter", _SYM_SRC)
+        assert r["claimed"] is True
+        await db_module.release_symbol_claims_for_session(db, sess["id"])
+
+    # No active claims remain, but the history shows 3 distinct sessions.
+    assert await db_module.get_symbol_claims(db, "meridian/server.py") == []
+    hotspots = await db_module.get_symbol_hotspots(db, min_sessions=3)
+    assert any(h["symbol_name"] == "AuthRouter" and h["session_count"] >= 3 for h in hotspots)
+    # Raising the threshold above the observed count yields nothing.
+    assert await db_module.get_symbol_hotspots(db, min_sessions=99) == []

@@ -444,17 +444,39 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "branch": {"type": "string"}},
          "required": ["project_id"]}},
     {"name": "claim_file", "description":
-        "Claim exclusive edit rights on a file path for this session. Locks auto-expire after 2 hours.",
+        "Claim edit rights on a file for this session. Whole-file by default "
+        "(auto-expires after 2 hours). For symbol-level claims — so two sessions "
+        "can edit the same file if they own different classes/functions — also "
+        "pass `symbol` (e.g. 'AuthRouter' or 'AuthRouter.login') AND `content` "
+        "(the file's full source). Meridian parses the source (stdlib ast for "
+        "Python, tree-sitter for JS/TS/C/C++/Go/Rust/Java/C#), and hard-blocks if "
+        "another live session already owns an overlapping line range — the block "
+        "lists which symbols are still safe to claim. Unparseable content falls "
+        "back to a whole-file lock.",
      "inputSchema": {"type": "object", "properties": {
          "session_id": {"type": "string"},
-         "file_path": {"type": "string"}},
+         "file_path": {"type": "string"},
+         "symbol": {"type": "string", "description": "Optional symbol to claim (class/function/method name, e.g. 'AuthRouter' or 'AuthRouter.login'). Requires `content`."},
+         "content": {"type": "string", "description": "Full source of the file, required when `symbol` is given so the server can resolve the symbol's line range."}},
          "required": ["session_id", "file_path"]}},
     {"name": "release_file", "description":
-        "Release a file lock held by this session.",
+        "Release a file lock (and any symbol claims this session holds on it).",
      "inputSchema": {"type": "object", "properties": {
          "session_id": {"type": "string"},
          "file_path": {"type": "string"}},
          "required": ["session_id", "file_path"]}},
+    {"name": "get_symbol_claims", "description":
+        "Read-only: list symbol-level claims on a file (who owns which class/function/method line ranges).",
+     "inputSchema": {"type": "object", "properties": {
+         "file_path": {"type": "string"}},
+         "required": ["file_path"]}},
+    {"name": "get_symbol_hotspots", "description":
+        "Read-only: symbols claimed by 3+ distinct sessions within 14 days — a refactor/ownership smell. Optionally scope to one file.",
+     "inputSchema": {"type": "object", "properties": {
+         "file_path": {"type": "string"},
+         "min_sessions": {"type": "integer"},
+         "days": {"type": "integer"}},
+         "required": []}},
     {"name": "idle_until_session_done", "description":
         "Read-only: Poll every 30 seconds until another session is closed or archived. Use this when you need to wait before editing a locked file.",
      "inputSchema": {"type": "object", "properties": {

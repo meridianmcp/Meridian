@@ -1433,7 +1433,27 @@ async def _dispatch_mcp_tool(
         }
         return await db_module.set_executor_config(db, args["project_id"], cfg_fields)
     if name == "claim_file":
+        # 4bac57ff — symbol-level claim when both `symbol` and `content` are
+        # supplied; otherwise the coarse whole-file lock. Falls back to a
+        # whole-file lock when the content can't be parsed into symbols.
+        _symbol = args.get("symbol")
+        _content = args.get("content")
+        if _symbol and _content is not None:
+            result = await db_module.claim_symbol(
+                db, args["session_id"], args["file_path"], _symbol, _content
+            )
+            if result.get("reason") == "unparseable":
+                return await db_module.claim_file(db, args["file_path"], args["session_id"])
+            return result
         return await db_module.claim_file(db, args["file_path"], args["session_id"])
+    if name == "get_symbol_claims":
+        return {"claims": await db_module.get_symbol_claims(db, args["file_path"])}
+    if name == "get_symbol_hotspots":
+        return {"hotspots": await db_module.get_symbol_hotspots(
+            db, args.get("file_path"),
+            min_sessions=args.get("min_sessions", 3),
+            days=args.get("days", 14),
+        )}
     if name == "release_file":
         released = await db_module.release_file(db, args["file_path"], args["session_id"])
         return {"released": released, "file_path": args["file_path"]}

@@ -469,6 +469,26 @@ CREATE INDEX IF NOT EXISTS idx_file_locks_session
 CREATE INDEX IF NOT EXISTS idx_file_locks_expires
     ON file_locks(expires_at);
 
+-- Symbol-level parallel protection (4bac57ff): claim individual class/function
+-- /method line ranges so two sessions can edit the same file without colliding.
+CREATE TABLE IF NOT EXISTS file_symbol_claims (
+    id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    file_path TEXT NOT NULL,
+    symbol_name TEXT NOT NULL,
+    symbol_type TEXT NOT NULL,
+    line_start INTEGER NOT NULL,
+    line_end INTEGER NOT NULL,
+    claimed_at TEXT NOT NULL DEFAULT (datetime('now')),
+    -- Soft-release: an active claim has released_at IS NULL; released rows are
+    -- retained so hotspot scoring can count distinct sessions over time.
+    released_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_file_symbol_claims_file
+    ON file_symbol_claims(file_path);
+CREATE INDEX IF NOT EXISTS idx_file_symbol_claims_session
+    ON file_symbol_claims(session_id);
+
 CREATE TABLE IF NOT EXISTS active_worktrees (
     id TEXT PRIMARY KEY,
     session_id TEXT NOT NULL REFERENCES sessions(id),
@@ -647,6 +667,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_session_notes(db)
     await _migrate_executor_runs(db)
     await _migrate_file_locks(db)
+    await _migrate_file_symbol_claims(db)
     await _migrate_milestone_type(db)
     await _migrate_ntfy_notifications(db)
     await _migrate_notify_email(db)
@@ -1803,6 +1824,7 @@ async def close_session(db: aiosqlite.Connection, session_id: str) -> None:
         (session_id,),
     )
     await release_file_locks_for_session(db, session_id)
+    await release_symbol_claims_for_session(db, session_id)
     await db.commit()
     try:
         await finalize_executor_run(db, session_id, status="done")
@@ -4530,8 +4552,15 @@ async def release_file(
         "DELETE FROM file_locks WHERE file_path = ? AND session_id = ?",
         (normalized, session_id),
     )
+    # Also soft-release any symbol-level claims this session holds on the file
+    # (4bac57ff) — keeps hotspot history while freeing the symbols.
+    sym_cursor = await db.execute(
+        "UPDATE file_symbol_claims SET released_at = datetime('now') "
+        "WHERE file_path = ? AND session_id = ? AND released_at IS NULL",
+        (normalized, session_id),
+    )
     await db.commit()
-    return cursor.rowcount > 0
+    return cursor.rowcount > 0 or sym_cursor.rowcount > 0
 
 
 async def release_file_locks_for_session(
@@ -4587,6 +4616,231 @@ async def get_file_conflict_warnings(
     except Exception:  # noqa: BLE001
         pass
     return warnings
+
+
+# ---------------------------------------------------------------------------
+# Symbol-level parallel protection (4bac57ff)
+# ---------------------------------------------------------------------------
+
+
+def _ranges_overlap(a_start: int, a_end: int, b_start: int, b_end: int) -> bool:
+    """Inclusive line-range overlap test."""
+    return a_start <= b_end and b_start <= a_end
+
+
+async def _live_symbol_claims_for_file(
+    db: aiosqlite.Connection,
+    file_path: str,
+    exclude_session_id: str,
+) -> list[dict[str, Any]]:
+    """Symbol claims on ``file_path`` held by *other* still-live sessions.
+
+    A session is live when status is active/live and last_seen is within the
+    last 10 minutes — mirrors get_file_conflict_warnings so a crashed session's
+    stale claims never block forever.
+    """
+    async with db.execute(
+        "SELECT fsc.symbol_name, fsc.symbol_type, fsc.line_start, fsc.line_end, "
+        "       fsc.session_id, s.name AS session_name "
+        "FROM file_symbol_claims fsc "
+        "JOIN sessions s ON s.id = fsc.session_id "
+        "WHERE fsc.file_path = ? AND fsc.session_id != ? "
+        "AND fsc.released_at IS NULL "
+        "AND s.status IN ('active', 'live') "
+        "AND (s.last_seen IS NULL OR s.last_seen > datetime('now', '-10 minutes'))",
+        (file_path, exclude_session_id),
+    ) as cur:
+        rows = await cur.fetchall()
+    return [r for r in (_row_to_dict(row) for row in rows) if r]
+
+
+async def claim_symbol(
+    db: aiosqlite.Connection,
+    session_id: str,
+    file_path: str,
+    symbol: str,
+    content: str,
+) -> dict[str, Any]:
+    """Claim a single class/function/method by line range within a file.
+
+    Parses ``content`` to locate ``symbol``'s line span, then hard-blocks if any
+    *other* live session already claims an overlapping span. On a block it
+    returns the conflicting claims plus ``safe_to_claim`` — symbols in the file
+    whose ranges are free — so the caller can immediately pick a non-colliding
+    symbol. Returns ``reason='unparseable'`` (unsupported/syntax-error/missing
+    grammar) so callers can fall back to whole-file ``claim_file``.
+    """
+    from ..symbols import extract_symbols
+
+    normalized = (file_path or "").strip()
+    symbol = (symbol or "").strip()
+    if not normalized:
+        raise ValueError("file_path is required")
+    if not symbol:
+        raise ValueError("symbol is required")
+
+    symbols = extract_symbols(normalized, content or "")
+    if not symbols:
+        return {
+            "claimed": False,
+            "reason": "unparseable",
+            "file_path": normalized,
+            "message": (
+                f"Could not extract symbols from {normalized} "
+                "(unsupported language, syntax error, or missing grammar). "
+                "Use whole-file claim_file instead."
+            ),
+        }
+
+    target = next((s for s in symbols if s["name"] == symbol), None)
+    if target is None:
+        return {
+            "claimed": False,
+            "reason": "symbol_not_found",
+            "file_path": normalized,
+            "available_symbols": [s["name"] for s in symbols],
+            "message": (
+                f"Symbol '{symbol}' not found in {normalized}. "
+                f"Available: {', '.join(s['name'] for s in symbols) or '(none)'}"
+            ),
+        }
+
+    others = await _live_symbol_claims_for_file(db, normalized, session_id)
+    conflicts = [
+        c for c in others
+        if _ranges_overlap(target["line_start"], target["line_end"], c["line_start"], c["line_end"])
+    ]
+    if conflicts:
+        claimed_ranges = [(c["line_start"], c["line_end"]) for c in others]
+        safe = [
+            s["name"] for s in symbols
+            if s["name"] != symbol
+            and not any(_ranges_overlap(s["line_start"], s["line_end"], cs, ce) for cs, ce in claimed_ranges)
+        ]
+        holder = conflicts[0]
+        holder_name = holder.get("session_name") or (holder.get("session_id") or "unknown")[:8]
+        safe_hint = f" — you can safely claim {', '.join(safe)}" if safe else " — no other symbols are free"
+        return {
+            "claimed": False,
+            "reason": "symbol_conflict",
+            "file_path": normalized,
+            "symbol": symbol,
+            "conflicts": [
+                {
+                    "symbol_name": c["symbol_name"],
+                    "line_start": c["line_start"],
+                    "line_end": c["line_end"],
+                    "holder_session_id": c["session_id"],
+                    "holder_session_name": c.get("session_name"),
+                }
+                for c in conflicts
+            ],
+            "safe_to_claim": safe,
+            "message": (
+                f"⚠️ {conflicts[0]['symbol_name']} "
+                f"(lines {conflicts[0]['line_start']}-{conflicts[0]['line_end']}) "
+                f"claimed by session {holder_name}{safe_hint}"
+            ),
+        }
+
+    # No conflict — (re)claim this symbol for the session (idempotent per symbol).
+    # Drop any prior row for this exact (session, file, symbol), active or
+    # released, so a re-claim is a single fresh active row.
+    await db.execute(
+        "DELETE FROM file_symbol_claims WHERE session_id = ? AND file_path = ? AND symbol_name = ?",
+        (session_id, normalized, symbol),
+    )
+    await db.execute(
+        "INSERT INTO file_symbol_claims "
+        "(id, session_id, file_path, symbol_name, symbol_type, line_start, line_end) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (_new_id(), session_id, normalized, symbol, target["type"],
+         target["line_start"], target["line_end"]),
+    )
+    await db.commit()
+    return {
+        "claimed": True,
+        "file_path": normalized,
+        "session_id": session_id,
+        "symbol": symbol,
+        "symbol_type": target["type"],
+        "line_start": target["line_start"],
+        "line_end": target["line_end"],
+    }
+
+
+async def get_symbol_claims(
+    db: aiosqlite.Connection,
+    file_path: str,
+) -> list[dict[str, Any]]:
+    """Return active symbol claims on a file (released_at IS NULL), newest first."""
+    async with db.execute(
+        "SELECT fsc.*, s.name AS session_name FROM file_symbol_claims fsc "
+        "LEFT JOIN sessions s ON s.id = fsc.session_id "
+        "WHERE fsc.file_path = ? AND fsc.released_at IS NULL "
+        "ORDER BY fsc.claimed_at DESC",
+        ((file_path or "").strip(),),
+    ) as cur:
+        rows = await cur.fetchall()
+    return [r for r in (_row_to_dict(row) for row in rows) if r]
+
+
+async def release_symbol_claims_for_session(
+    db: aiosqlite.Connection,
+    session_id: str,
+    file_path: str | None = None,
+) -> int:
+    """Soft-release a session's active symbol claims (all, or just one file).
+
+    Sets released_at instead of deleting so hotspot scoring retains the history.
+    Returns the number of claims released.
+    """
+    if file_path:
+        cur = await db.execute(
+            "UPDATE file_symbol_claims SET released_at = datetime('now') "
+            "WHERE session_id = ? AND file_path = ? AND released_at IS NULL",
+            (session_id, (file_path or "").strip()),
+        )
+    else:
+        cur = await db.execute(
+            "UPDATE file_symbol_claims SET released_at = datetime('now') "
+            "WHERE session_id = ? AND released_at IS NULL",
+            (session_id,),
+        )
+    await db.commit()
+    return cur.rowcount
+
+
+async def get_symbol_hotspots(
+    db: aiosqlite.Connection,
+    file_path: str | None = None,
+    *,
+    min_sessions: int = 3,
+    days: int = 14,
+) -> list[dict[str, Any]]:
+    """Symbols claimed by ``min_sessions``+ distinct sessions within ``days``.
+
+    A hotspot is a symbol many sessions keep touching — a refactor/ownership
+    smell. Computed over recent rows in file_symbol_claims (active + not-yet-
+    released claims within the window).
+    """
+    params: list[Any] = [f"-{max(0, int(days))} days"]
+    where = "WHERE claimed_at > datetime('now', ?)"
+    if file_path:
+        where += " AND file_path = ?"
+        params.append((file_path or "").strip())
+    sql = (
+        "SELECT file_path, symbol_name, symbol_type, "
+        "COUNT(DISTINCT session_id) AS session_count "
+        f"FROM file_symbol_claims {where} "
+        "GROUP BY file_path, symbol_name, symbol_type "
+        "HAVING COUNT(DISTINCT session_id) >= ? "
+        "ORDER BY session_count DESC, file_path"
+    )
+    params.append(int(min_sessions))
+    async with db.execute(sql, tuple(params)) as cur:
+        rows = await cur.fetchall()
+    return [r for r in (_row_to_dict(row) for row in rows) if r]
 
 
 # ---------------------------------------------------------------------------
