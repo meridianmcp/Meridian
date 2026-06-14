@@ -43,6 +43,7 @@ async def create_project_note_endpoint(
     _limits.check_notes_per_project(len(existing))
     note = await db_module.add_project_note(
         await _db(request), project_id, title, text, body.get("tags"),
+        kind=body.get("kind"),
     )
     # e5592013 — non-blocking lint: "MANUAL" notes are usually human tasks.
     if isinstance(note, dict) and "MANUAL" in title:

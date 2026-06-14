@@ -918,7 +918,7 @@ async def _dispatch_mcp_tool(
         validate_input_size(args.get("body"), "note body", 10_000_000)
         result = await db_module.add_project_note(
             db, args["project_id"], args["title"], args["body"],
-            args.get("tags"),
+            args.get("tags"), kind=args.get("kind"),
         )
         await _server._append_note_to_roadmap(
             args["title"], args["body"], args.get("tags"), args.get("category"),

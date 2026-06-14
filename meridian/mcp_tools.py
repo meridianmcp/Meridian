@@ -189,14 +189,17 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "required": ["request_id"]}},
     {"name": "add_note", "description":
         "Add a per-project wiki note (setup, gotcha, howto, env, ...). "
-        "Free-form title/body; comma-separated tags optional. Tag a note "
-        "'roadmap' AND pass a committable category (TECHNICAL/ARCHITECTURAL/"
-        "PRODUCT) to also append it to ROADMAP.md's roadmap-notes anchor.",
+        "Free-form title/body; comma-separated tags optional. Optional kind "
+        "(wiki=gotcha/rule/howto, insight=strategic/product analysis, "
+        "reference=external/one-off docs) controls how the dashboard renders it. "
+        "Tag a note 'roadmap' AND pass a committable category (TECHNICAL/"
+        "ARCHITECTURAL/PRODUCT) to also append it to ROADMAP.md's roadmap-notes anchor.",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"},
          "title": {"type": "string"},
          "body": {"type": "string"},
          "tags": {"type": "string"},
+         "kind": {"type": "string", "enum": ["wiki", "insight", "reference"]},
          "category": {"type": "string"}},
          "required": ["project_id", "title", "body"]}},
     {"name": "get_notes", "description":

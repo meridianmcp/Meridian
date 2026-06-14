@@ -4282,10 +4282,21 @@ project_id = "${displayPid}"`;
     const body = document.getElementById(`notes-body-${projectId}`);
     const searchInput = document.getElementById(`notes-search-${projectId}`);
     const tagSelect = document.getElementById(`notes-tagsel-${projectId}`);
+    const kindSelect = document.getElementById(`notes-kindsel-${projectId}`);
     const showAuto = document.getElementById(`notes-show-auto-${projectId}`);
+    const KIND_STYLE = {
+      wiki: { label: "wiki", color: "var(--muted)", border: "var(--border)" },
+      insight: { label: "insight", color: "var(--accent)", border: "var(--accent)" },
+      reference: { label: "reference", color: "#c9a227", border: "#c9a227" }
+    };
+    const noteKind = (n) => {
+      const k = String(n.note_kind || "").toLowerCase();
+      return KIND_STYLE[k] ? k : "wiki";
+    };
     const addTitle = document.getElementById(`notes-add-title-${projectId}`);
     const addBody = document.getElementById(`notes-add-body-${projectId}`);
     const addTags = document.getElementById(`notes-add-tags-${projectId}`);
+    const addKind = document.getElementById(`notes-add-kind-${projectId}`);
     const addBtn = document.getElementById(`notes-add-btn-${projectId}`);
     if (!body) return;
     const isAutoCapture = (n) => {
@@ -4310,9 +4321,11 @@ project_id = "${displayPid}"`;
     const applyFilters = () => {
       const q = (searchInput?.value || "").trim().toLowerCase();
       const selectedTag = (tagSelect?.value || "").trim().toLowerCase();
+      const selectedKind = (kindSelect?.value || "").trim().toLowerCase();
       const includeAuto = !!showAuto?.checked;
       const visible = allNotes.filter((n) => {
         if (!includeAuto && isAutoCapture(n)) return false;
+        if (selectedKind && noteKind(n) !== selectedKind) return false;
         if (selectedTag && !noteTags(n).map((t) => t.toLowerCase()).includes(selectedTag)) return false;
         if (q) {
           const hay = `${n.title || ""}
@@ -4336,16 +4349,20 @@ ${n.tags || ""}`.toLowerCase();
           (t) => `<span style="display:inline-block;background:var(--accent)22;color:var(--accent);font-size:9px;font-weight:600;padding:1px 6px;border-radius:3px;margin-right:4px">${escapeHtml(t)}</span>`
         ).join("");
         const dt = (n.created_at || "").slice(0, 10);
+        const kind = noteKind(n);
+        const ks = KIND_STYLE[kind];
+        const isInsight = kind === "insight";
+        const kindPill = `<span title="note kind: ${ks.label}" style="display:inline-block;background:${ks.color}22;color:${ks.color};font-size:9px;font-weight:700;padding:1px 6px;border-radius:3px;margin-right:4px;text-transform:uppercase;letter-spacing:0.4px">${ks.label}</span>`;
         const autoPill = isAutoCapture(n) ? `<span title="Auto-captured session summary" style="display:inline-block;background:var(--surface-3,#2a2f3a);color:var(--muted);font-size:9px;font-weight:600;padding:1px 6px;border-radius:3px;margin-right:4px">session</span>` : "";
-        return `<div style="background:var(--surface-2);border:1px solid var(--border);border-left:3px solid var(--accent);border-radius:0 4px 4px 0;padding:10px 12px;margin-bottom:8px">
+        return `<div style="background:var(--surface-2);border:1px solid var(--border);border-left:${isInsight ? "4px" : "3px"} solid ${ks.border};border-radius:0 4px 4px 0;padding:${isInsight ? "12px 14px" : "10px 12px"};margin-bottom:8px">
           <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:6px">
             <div style="display:flex;align-items:center;gap:8px;min-width:0;flex:1">
-              <span style="color:var(--accent);font-weight:600;font-size:12px">${escapeHtml(n.title || "")}</span>
+              <span style="color:var(--accent);font-weight:600;font-size:${isInsight ? "13px" : "12px"}">${escapeHtml(n.title || "")}</span>
               <span style="color:var(--muted);font-size:10px">${escapeHtml(dt)}</span>
             </div>
             <button class="secondary notes-del-btn" data-note-id="${escapeHtml(n.id)}" style="padding:1px 8px;font-size:10px">Delete</button>
           </div>
-          <div style="margin-bottom:6px">${autoPill}${pills}</div>
+          <div style="margin-bottom:6px">${kindPill}${autoPill}${pills}</div>
           <div class="note-body-md" style="color:var(--text);line-height:1.5;font-size:12px">${typeof marked !== "undefined" ? marked.parse(n.body || "") : escapeHtml(n.body || "")}</div>
         </div>`;
       }).join("");
@@ -4382,6 +4399,7 @@ ${n.tags || ""}`.toLowerCase();
       };
     }
     if (tagSelect) tagSelect.onchange = applyFilters;
+    if (kindSelect) kindSelect.onchange = applyFilters;
     if (showAuto) showAuto.onchange = () => {
       refreshTagOptions();
       applyFilters();
@@ -4403,7 +4421,7 @@ ${n.tags || ""}`.toLowerCase();
       try {
         const res = await api(`/projects/${projectId}/notes`, {
           method: "POST",
-          body: JSON.stringify({ title, body: text, tags: tags || void 0 })
+          body: JSON.stringify({ title, body: text, tags: tags || void 0, kind: addKind && addKind.value || void 0 })
         });
         if (addTitle) addTitle.value = "";
         if (addBody) addBody.value = "";
@@ -6920,6 +6938,8 @@ Current: ${current || "(none)"}`,
 
             <input type="text" id="notes-search-${project.id}" placeholder="search notes\u2026" style="background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:2px 6px;width:120px">
 
+            <select id="notes-kindsel-${project.id}" title="Filter by kind" style="background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:2px 6px"><option value="">all kinds</option><option value="wiki">wiki</option><option value="insight">insight</option><option value="reference">reference</option></select>
+
             <select id="notes-tagsel-${project.id}" title="Filter by tag" style="background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:2px 6px;max-width:130px"><option value="">all tags</option></select>
 
             <label title="Show auto-captured session summaries (checkpoint notes)" style="display:flex;align-items:center;gap:3px;font-size:9px;color:var(--muted);cursor:pointer;user-select:none"><input type="checkbox" id="notes-show-auto-${project.id}" style="margin:0;cursor:pointer">summaries</label>
@@ -6941,6 +6961,8 @@ Current: ${current || "(none)"}`,
             <input type="text" id="notes-add-title-${project.id}" placeholder="Title" style="flex:1;background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:11px;font-family:var(--font-mono);padding:5px 8px;outline:none">
 
             <input type="text" id="notes-add-tags-${project.id}" placeholder="tags (comma-sep)" style="width:140px;background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:11px;font-family:var(--font-mono);padding:5px 8px;outline:none">
+
+            <select id="notes-add-kind-${project.id}" title="Note kind" style="width:100px;background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:11px;font-family:var(--font-mono);padding:5px 8px;outline:none"><option value="wiki">wiki</option><option value="insight">insight</option><option value="reference">reference</option></select>
 
           </div>
 

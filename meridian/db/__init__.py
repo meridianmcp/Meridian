@@ -263,6 +263,7 @@ CREATE TABLE IF NOT EXISTS project_notes (
     title TEXT NOT NULL,
     body TEXT NOT NULL,
     tags TEXT,
+    note_kind TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
@@ -674,6 +675,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_parallel_safety(db)
     await _migrate_changelog_entries(db)
     await _migrate_agent_instructions(db)
+    await _migrate_note_kind(db)
     return db
 
 
@@ -3507,9 +3509,15 @@ async def summarize_session(
 async def auto_capture_session(
     db: aiosqlite.Connection, project_id: str, session_id: str
 ) -> None:
-    """Rule-based session end capture: bucket done tasks into Fixed/Added/Changed
-    and save as a project note tagged 'auto-capture'. No-op for sessions with
-    fewer than 2 done tasks so trivial sessions don't generate noise."""
+    """Rule-based session capture: bucket done tasks into Fixed/Added/Changed
+    and save as an ephemeral *session* note (scratch pad). No-op for sessions
+    with fewer than 2 done tasks so trivial sessions don't generate noise.
+
+    9d44998b — this writes to session_notes, NOT project_notes. The permanent
+    artifact of a session is its task_log entries; the bucketed summary is a
+    transient convenience that expires with the session rather than polluting
+    the project wiki with "Session summary (date)" notes.
+    """
     from datetime import datetime, timezone
 
     async with db.execute(
@@ -3546,8 +3554,8 @@ async def auto_capture_session(
                 lines.append(f"  - {desc[:100]}")
     if len(lines) <= 1:
         return
-    await add_project_note(
-        db, project_id, f"Session summary ({date_str})", "\n".join(lines), tags="auto-capture"
+    await add_session_note(
+        db, session_id, f"Session summary ({date_str})", "\n".join(lines)
     )
 
 
@@ -5295,13 +5303,21 @@ async def add_project_note(
     title: str,
     body: str,
     tags: str | None = None,
+    kind: str | None = None,
 ) -> dict[str, Any]:
-    """Insert a project_notes row. tags is comma-separated free-form."""
+    """Insert a project_notes row. tags is comma-separated free-form.
+
+    ``kind`` is the 9d44998b taxonomy (wiki | insight | reference); NULL is
+    treated as 'wiki' by readers. Unknown values are coerced to NULL so the
+    column stays a closed vocabulary.
+    """
+    if kind not in ("wiki", "insight", "reference"):
+        kind = None
     nid = _new_id()
     await db.execute(
-        "INSERT INTO project_notes (id, project_id, title, body, tags) "
-        "VALUES (?, ?, ?, ?, ?)",
-        (nid, project_id, title, body, tags),
+        "INSERT INTO project_notes (id, project_id, title, body, tags, note_kind) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (nid, project_id, title, body, tags, kind),
     )
     await db.commit()
     # ITEM 6 — live push so the Notes tab refreshes without polling.
