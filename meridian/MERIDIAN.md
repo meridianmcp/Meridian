@@ -50,6 +50,15 @@ If a handoff exists, read it before doing anything else.
 Before you stop, call `generate_handoff` so the next session can resume cleanly.
 Ensure any tasks you logged as `pending` are either completed or released.
 
+## DOCS FILES
+
+- **Never hand-write `docs/mcp-tools.md`** — it is auto-generated. Regenerate it
+  with `pixi run python -c "import asyncio; from meridian import server as srv; doc = asyncio.run(srv.mcp_tools_doc()); open('docs/mcp-tools.md','w').write(doc)"` whenever MCP tool definitions change.
+- **Never auto-write other `docs/*.md` files** unless the sprint item explicitly
+  says to update them. Executor sessions writing docs speculatively cause the docs
+  to go backwards (replacing current content with stale or hallucinated content).
+  If a docs update is needed, file it as a separate sprint item for human review.
+
 ## DESIGN PRINCIPLES
 
 - The version goal is **stable** — only humans (or you when explicitly directed)

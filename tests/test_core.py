@@ -10039,3 +10039,202 @@ def test_dashboard_js_has_reconcile_button():
     assert "runReconcile" in src
     assert "reconcileMarkDone" in src
     assert "reconcile-results-" in src
+
+
+# ---------------------------------------------------------------------------
+# dcf1e428 — list_hitl_requests 'recent' pseudo-status
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_list_hitl_requests_recent_includes_answered(db):
+    """status='recent' returns pending + answered in last 24h; not old answered."""
+    p = await db_module.create_project(db, "hitl-recent")
+    pid = p["id"]
+    s = await db_module.register_session(db, pid, "s1")
+    sid = s["id"]
+
+    r_pending = await db_module.request_hitl(db, pid, "still pending", session_id=sid)
+    r_answered = await db_module.request_hitl(db, pid, "just answered", session_id=sid)
+    await db_module.answer_hitl_request(db, r_answered["id"], "yes", answered_by="adam")
+
+    rows = await db_module.list_hitl_requests(db, pid, status="recent")
+    ids = {r["id"] for r in rows}
+    assert r_pending["id"] in ids
+    assert r_answered["id"] in ids
+
+    # Checking pending-only still works.
+    pending_only = await db_module.list_hitl_requests(db, pid, status="pending")
+    assert r_pending["id"] in {r["id"] for r in pending_only}
+    assert r_answered["id"] not in {r["id"] for r in pending_only}
+
+
+@pytest.mark.asyncio
+async def test_get_session_brief_shows_answered_hitl(db):
+    """dcf1e428: session brief shows recently answered HITLs in hitl_recent block."""
+    import meridian.server as srv
+    p = await db_module.create_project(db, "brief-answered-hitl")
+    pid = p["id"]
+    s = await db_module.register_session(db, pid, "s1")
+    r = await db_module.request_hitl(db, pid, "Rate per IP?", session_id=s["id"])
+    await db_module.answer_hitl_request(db, r["id"], "yes per IP", answered_by="adam")
+
+    res = await srv._dispatch_mcp_tool("get_session_brief", {"project_id": pid}, db, "/tmp")
+    text = res["text"]
+    assert "<hitl_recent" in text
+    assert "Rate per IP?" in text
+
+
+# ---------------------------------------------------------------------------
+# 62d321dd — sprint change guard
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_set_sprint_guard_warns_when_unstarted_items(db):
+    """set_sprint returns WARNING when pending unclaimed items exist."""
+    import meridian.server as srv
+    p = await db_module.create_project(db, "sprint-guard")
+    pid = p["id"]
+    await db_module.set_goal(db, pid, "initial goal")
+    await db_module.add_sprint_item(db, pid, "v1", "never started item")
+
+    res = await srv._dispatch_mcp_tool(
+        "set_sprint", {"project_id": pid, "sprint": "new sprint"}, db, "/tmp"
+    )
+    assert res.get("sprint_not_updated") is True
+    assert "WARNING" in res.get("warning", "")
+    assert res["unstarted_count"] >= 1
+
+
+@pytest.mark.asyncio
+async def test_set_sprint_guard_force_bypasses(db):
+    """set_sprint with force=True proceeds even with unstarted items."""
+    import meridian.server as srv
+    p = await db_module.create_project(db, "sprint-guard-force")
+    pid = p["id"]
+    await db_module.set_goal(db, pid, "initial goal")
+    await db_module.add_sprint_item(db, pid, "v1", "not started")
+
+    res = await srv._dispatch_mcp_tool(
+        "set_sprint", {"project_id": pid, "sprint": "new sprint", "force": True}, db, "/tmp"
+    )
+    assert "sprint_not_updated" not in res
+    goal = await db_module.get_goal(db, pid)
+    assert goal["sprint"] == "new sprint"
+
+
+@pytest.mark.asyncio
+async def test_set_sprint_no_guard_when_all_started(db):
+    """set_sprint proceeds without warning when all pending items are claimed."""
+    import meridian.server as srv
+    p = await db_module.create_project(db, "sprint-guard-claimed")
+    pid = p["id"]
+    await db_module.set_goal(db, pid, "initial goal")
+    item = await db_module.add_sprint_item(db, pid, "v1", "in progress")
+    await db_module.claim_sprint_item(db, pid, item["id"])
+
+    res = await srv._dispatch_mcp_tool(
+        "set_sprint", {"project_id": pid, "sprint": "next sprint"}, db, "/tmp"
+    )
+    assert "sprint_not_updated" not in res
+    assert "WARNING" not in res.get("warning", "")
+
+
+# ---------------------------------------------------------------------------
+# fd86aacc — add_sprint_item active session warning
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_add_sprint_item_warns_when_session_active(db):
+    """add_sprint_item returns active_session_warning when a session is live."""
+    import meridian.server as srv
+    p = await db_module.create_project(db, "sprint-item-active-warn")
+    pid = p["id"]
+    await db_module.register_session(db, pid, "active-executor")
+
+    res = await srv._dispatch_mcp_tool(
+        "add_sprint_item", {"project_id": pid, "version": "v1", "title": "new task"}, db, "/tmp"
+    )
+    assert "active_session_warning" in res
+    assert "WARNING" in res["active_session_warning"]
+    assert "active-executor" in res["active_session_warning"]
+
+
+@pytest.mark.asyncio
+async def test_add_sprint_item_no_warning_when_no_sessions(db):
+    """add_sprint_item has no active_session_warning when no sessions exist."""
+    import meridian.server as srv
+    p = await db_module.create_project(db, "sprint-item-no-warn")
+
+    res = await srv._dispatch_mcp_tool(
+        "add_sprint_item", {"project_id": p["id"], "version": "v1", "title": "new task"}, db, "/tmp"
+    )
+    assert "active_session_warning" not in res
+
+
+# ---------------------------------------------------------------------------
+# fd86aacc — get_session_brief board change counter
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# 0507f4a1 — get_sprint_progress MCP tool
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_get_sprint_progress_basic(db):
+    """get_sprint_progress returns totals, done count, and percent_complete."""
+    import meridian.server as srv
+    p = await db_module.create_project(db, "sprint-progress")
+    pid = p["id"]
+    item1 = await db_module.add_sprint_item(db, pid, "v1", "pending task")
+    item2 = await db_module.add_sprint_item(db, pid, "v1", "done task")
+    await db_module.claim_sprint_item(db, pid, item2["id"])
+    await db_module.complete_sprint_item(db, pid, item2["id"])
+
+    res = await srv._dispatch_mcp_tool(
+        "get_sprint_progress", {"project_id": pid}, db, "/tmp"
+    )
+    assert res["total"] == 2
+    assert res["done"] == 1
+    assert res["pending"] == 1
+    assert res["percent_complete"] == 50
+    assert len(res["items"]) == 2
+
+
+@pytest.mark.asyncio
+async def test_get_sprint_progress_version_filter(db):
+    """get_sprint_progress version filter scopes results correctly."""
+    import meridian.server as srv
+    p = await db_module.create_project(db, "sprint-progress-version")
+    pid = p["id"]
+    await db_module.add_sprint_item(db, pid, "v1", "v1 task")
+    await db_module.add_sprint_item(db, pid, "v2", "v2 task")
+
+    res = await srv._dispatch_mcp_tool(
+        "get_sprint_progress", {"project_id": pid, "version": "v1"}, db, "/tmp"
+    )
+    assert res["total"] == 1
+    assert res["items"][0]["title"].startswith("v1 task")
+
+
+@pytest.mark.asyncio
+async def test_get_session_brief_shows_new_items_count(db):
+    """fd86aacc: session brief shows N items added since session started."""
+    import meridian.server as srv
+    p = await db_module.create_project(db, "brief-board-change")
+    pid = p["id"]
+    s = await db_module.register_session(db, pid, "my-session")
+    sid = s["id"]
+
+    await db_module.add_sprint_item(db, pid, "v1", "item added after session start")
+
+    res = await srv._dispatch_mcp_tool(
+        "get_session_brief", {"project_id": pid, "session_id": sid}, db, "/tmp"
+    )
+    text = res["text"]
+    assert "<board_change>" in text
+    assert "added since this session started" in text

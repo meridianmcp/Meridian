@@ -18,6 +18,7 @@ _TOOL_EXAMPLES: dict[str, str] = {
     "get_goal": 'get_goal(project_id="abc-123")',
     "set_goal": 'set_goal(project_id="abc-123", content="Build a great product")',
     "set_sprint": 'set_sprint(project_id="abc-123", sprint="v2.0 - auth + dashboard")',
+    "get_sprint_progress": 'get_sprint_progress(project_id="abc-123")',
     "set_north_star": 'set_north_star(project_id="abc-123", north_star="Ship by Q3")',
     "pin_decision": 'pin_decision(project_id="abc-123", title="Use psycopg3", body="asyncpg has DLL issues on Windows", category="TECHNICAL")',
     "get_pinned_decisions": 'get_pinned_decisions(project_id="abc-123")',
@@ -274,13 +275,15 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "Read-only: List HITL requests without needing UUIDs. OMIT project_id to list pending "
         "HITLs across ALL your projects (matches the dashboard) — planning sessions should call it "
         "this way so HITLs filed under another project aren't missed (a common cause of false "
-        "'no pending HITLs' confidence). Pass project_id to scope to one project. Returns the "
-        "pending queue by default; pass status='answered'/'dismissed'/'all' to widen.",
+        "'no pending HITLs' confidence). Pass project_id to scope to one project. Returns pending "
+        "queue plus answered/dismissed from the last 24 h by default so planning sessions can see "
+        "what was recently decided without a separate call. Pass status='pending' for only the "
+        "active queue, or status='answered'/'dismissed'/'all' for specific history.",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string",
                         "description": "Optional. Omit to list across all projects."},
          "status": {"type": "string",
-                    "description": "Filter: 'pending' (default), 'answered', 'dismissed', or 'all'."},
+                    "description": "Filter: omit for pending+recent-answered (default), 'pending', 'answered', 'dismissed', or 'all'."},
          "limit": {"type": "integer", "description": "Max results, default 50."}},
          "required": []}},
     {"name": "answer_hitl", "description":
@@ -322,11 +325,25 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "required": ["session_id"]}},
     {"name": "set_sprint", "description":
         "Update only the sprint — the short-term focus that changes each session or week. "
-        "Any team member can call this; no ownership check.",
+        "Any team member can call this; no ownership check. If pending items from the current "
+        "sprint were never started, returns a WARNING block listing them. Pass force=true to "
+        "override and overwrite anyway.",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"},
-         "sprint": {"type": "string"}},
+         "sprint": {"type": "string"},
+         "force": {"type": "boolean",
+                   "description": "Skip the unstarted-items guard and overwrite the sprint anyway."}},
          "required": ["project_id", "sprint"]}},
+    {"name": "get_sprint_progress", "description":
+        "Read-only: Return summary of sprint items by status (pending/in_progress/done/failed) "
+        "optionally filtered by version or item_group. Returns total, done, in_progress, pending, "
+        "failed, percent_complete, and item list. Useful for planning sessions to see how far "
+        "through the sprint we are without listing all items.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"},
+         "version": {"type": "string", "description": "Filter to a specific sprint version bucket."},
+         "item_group": {"type": "string", "description": "Filter to a specific item group."}},
+         "required": ["project_id"]}},
     {"name": "add_sprint_item", "description":
         "Append a todo item to the project's sprint checklist. Use when starting work on a "
         "new version so the next session sees what's in flight. Optional: group items under "
@@ -498,7 +515,7 @@ _READ_ONLY_TOOLS = {
     "list_hitl_requests", "list_sessions", "get_sprint_notes",
     "get_session_log", "idle_until_session_done", "generate_handoff",
     "get_workspace_notes", "get_workspace_decisions", "get_workspace_settings",
-    "get_sprint_items", "get_agent_instructions",
+    "get_sprint_items", "get_sprint_progress", "get_agent_instructions",
 }
 _DESTRUCTIVE_TOOLS = {"delete_note", "archive_decision", "dismiss_hitl"}
 
@@ -512,6 +529,7 @@ _TITLE_OVERRIDES: dict[str, str] = {
     "add_sprint_note": "Add Sprint Note",
     "get_sprint_notes": "Get Sprint Notes",
     "get_sprint_items": "Get Sprint Items",
+    "get_sprint_progress": "Get Sprint Progress",
     "add_sprint_item": "Add Sprint Item",
     "update_sprint_item": "Update Sprint Item",
     "complete_sprint_item": "Complete Sprint Item",

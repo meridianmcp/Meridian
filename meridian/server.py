@@ -7991,7 +7991,9 @@ async def _dispatch_mcp_tool(
         xml_text = f'<meridian_context project_id="{project_id}" mode="{mode}">\n{text}\n</meridian_context>'
         return {"mode": mode, "text": xml_text, "project_id": project_id}
     if name == "list_hitl_requests":
-        status_filter = args.get("status", "pending")
+        # dcf1e428 — default 'recent' (pending + answered last 24h) so dismissed HITLs
+        # don't give false "no pending HITLs" confidence to planning sessions.
+        status_filter = args.get("status", "recent")
         if status_filter == "all":
             status_filter = None
         # project_id is optional — None lists across all projects (like the
@@ -8083,6 +8085,27 @@ async def _dispatch_mcp_tool(
                                 "item_id": _ex["id"], "title": _ex["title"][:120],
                                 "status": _ex["status"], "match_pct": round(_overlap * 100),
                             })
+        # fd86aacc — warn if active executor sessions exist when adding a new item
+        _active_session_warnings: list[str] = []
+        try:
+            from datetime import datetime, timezone as _tz
+            _active_sessions = await db_module.get_sessions(db, args["project_id"])
+            _now_ts = datetime.now(_tz.utc)
+            for _sess in _active_sessions:
+                _ls = _sess.get("last_seen")
+                if _ls:
+                    try:
+                        _ls_dt = datetime.fromisoformat(str(_ls).replace("Z", "+00:00"))
+                        if _ls_dt.tzinfo is None:
+                            _ls_dt = _ls_dt.replace(tzinfo=_tz.utc)
+                        if (_now_ts - _ls_dt).total_seconds() < 600:
+                            _active_session_warnings.append(
+                                f"session '{_sess.get('name', _sess.get('id','?'))}' is active"
+                            )
+                    except Exception:
+                        pass
+        except Exception:
+            pass
         _new_item = await db_module.add_sprint_item(
             db, args["project_id"], args["version"], args["title"],
             group=args.get("group"),
@@ -8091,8 +8114,16 @@ async def _dispatch_mcp_tool(
             failure_mode=args.get("failure_mode"),
             milestone_type=args.get("milestone_type", "task"),
         )
+        _extra: dict[str, Any] = {}
         if _dup_warnings:
-            _new_item = {**_new_item, "duplicate_warnings": _dup_warnings}
+            _extra["duplicate_warnings"] = _dup_warnings
+        if _active_session_warnings:
+            _extra["active_session_warning"] = (
+                "WARNING: " + "; ".join(_active_session_warnings)
+                + " — new item added but may not be picked up until next session start."
+            )
+        if _extra:
+            _new_item = {**_new_item, **_extra}
         return _new_item
     if name == "update_sprint_item":
         validate_input_size(args.get("title"), "sprint item title", 500)
@@ -8107,9 +8138,61 @@ async def _dispatch_mcp_tool(
         )
         return item or {"error": "sprint item not found"}
     if name == "set_sprint":
+        # 62d321dd — guard: warn if pending items were never started before rolling sprint
+        if not args.get("force"):
+            _unstarted = [
+                it for it in await db_module.get_sprint_items(db, args["project_id"], status="pending")
+                if it.get("claimed_at") is None
+            ]
+            if _unstarted:
+                _list = "\n".join(
+                    f'  [{it["id"][:8]}] {it.get("title","")[:100]}'
+                    for it in _unstarted[:10]
+                )
+                return {
+                    "warning": (
+                        f"WARNING: {len(_unstarted)} item(s) from the current sprint were never "
+                        f"started:\n{_list}\n"
+                        "Proceeding will leave these orphaned. Move them to the new sprint version "
+                        "or push to backlog first. Call set_sprint again with force=true to override."
+                    ),
+                    "unstarted_count": len(_unstarted),
+                    "unstarted_ids": [it["id"] for it in _unstarted],
+                    "sprint_not_updated": True,
+                }
         result = await db_module.set_sprint(db, args["project_id"], args["sprint"])
         await goal_md_module.sync_db_to_goal_md(db, args["project_id"])
         return result
+    if name == "get_sprint_progress":
+        # 0507f4a1 — sprint progress summary
+        _version_filter = args.get("version")
+        _group_filter = args.get("item_group")
+        _all = await db_module.get_sprint_items(db, args["project_id"])
+        if _version_filter:
+            _all = [it for it in _all if it.get("version") == _version_filter]
+        if _group_filter:
+            _all = [it for it in _all if it.get("item_group") == _group_filter]
+        _counts: dict[str, int] = {}
+        for _it in _all:
+            _st = _it.get("status") or "pending"
+            _counts[_st] = _counts.get(_st, 0) + 1
+        _done_n = _counts.get("done", 0)
+        _total = len(_all)
+        _pct = round(100 * _done_n / _total) if _total else 0
+        return {
+            "total": _total,
+            "done": _done_n,
+            "in_progress": _counts.get("in_progress", 0),
+            "pending": _counts.get("pending", 0),
+            "failed": _counts.get("failed", 0),
+            "skipped": _counts.get("skipped", 0),
+            "percent_complete": _pct,
+            "by_status": _counts,
+            "items": [
+                {"id": it["id"], "title": (it.get("title") or "")[:80], "status": it.get("status")}
+                for it in _all
+            ],
+        }
     if name == "get_sprint_items":
         include_human = args.get("human", True)
         if isinstance(include_human, bool):
@@ -8354,8 +8437,14 @@ async def _dispatch_mcp_tool(
         session_id_for_notes = args.get("session_id")
         goal = await db_module.get_goal(db, project_id)
         tasks = await db_module.get_tasks(db, project_id, limit=5)
-        hitl_rows = await db_module.list_hitl_requests(db, project_id, status="pending")
+        # dcf1e428 — use 'recent' to surface pending + answered last 24h for planning sessions
+        hitl_rows = await db_module.list_hitl_requests(db, project_id, status="recent")
         sprint_items = await db_module.get_sprint_items(db, project_id, status="pending")
+        # 0507f4a1 — sprint progress summary for session brief
+        _all_items_for_progress = await db_module.get_sprint_items(db, project_id)
+        _done_count = sum(1 for it in _all_items_for_progress if it.get("status") == "done")
+        _total_count = len(_all_items_for_progress)
+        _pct = round(100 * _done_count / _total_count) if _total_count else 0
         blocking = [t for t in tasks if t.get("status") == "failed"]
         sprint_str = (goal.get("sprint") or "") if goal else ""
         tasks_xml = "\n".join(
@@ -8366,23 +8455,37 @@ async def _dispatch_mcp_tool(
             f'  <item version="{it.get("version","")}">{(it.get("title") or "")[:80]}</item>'
             for it in sprint_items[:5]
         )
-        # 277567dc — surface the actual pending HITL questions (not just a count)
-        # so a session sees what needs a human decision without a second call.
-        if hitl_rows:
+        # 277567dc — surface pending HITLs so session sees what needs a human decision.
+        # dcf1e428 — also surface recently answered HITLs so planning sessions can see what was decided.
+        _pending_hitls = [h for h in hitl_rows if h.get("status") == "pending"]
+        _answered_hitls = [h for h in hitl_rows if h.get("status") != "pending"]
+        if _pending_hitls:
             hitl_xml = (
-                f'<hitl_pending count="{len(hitl_rows)}">\n'
+                f'<hitl_pending count="{len(_pending_hitls)}">\n'
                 + "\n".join(
                     f'  <request id="{h.get("id","")}" urgency="{h.get("urgency","normal")}">'
                     f'{(h.get("question") or "")[:140]}</request>'
-                    for h in hitl_rows[:5]
+                    for h in _pending_hitls[:5]
                 )
                 + "\n</hitl_pending>"
             )
         else:
             hitl_xml = ""
+        if _answered_hitls:
+            hitl_xml += (
+                f'\n<hitl_recent count="{len(_answered_hitls)}">\n'
+                + "\n".join(
+                    f'  <request status="{h.get("status","?")}">'
+                    f'Q: {(h.get("question") or "")[:80]} '
+                    f'A: {(h.get("answer") or "")[:80]}</request>'
+                    for h in _answered_hitls[:3]
+                )
+                + "\n</hitl_recent>"
+            )
         blocking_xml = f'<blocking>{(blocking[0].get("description") or "")[:100]}</blocking>' if blocking else ""
         # v2.6 — include session scratch-pad notes at top of brief
         notes_xml = ""
+        new_items_xml = ""
         if session_id_for_notes:
             try:
                 session_notes = await db_module.get_session_notes(db, session_id_for_notes)
@@ -8393,9 +8496,35 @@ async def _dispatch_mcp_tool(
                     ) + "\n</session_notes>\n"
             except Exception:
                 pass
+            # fd86aacc — show items added to the board since this session started
+            try:
+                _all_sess = await db_module.get_sessions(db, project_id, active_only=False)
+                _curr_sess = next(
+                    (s for s in _all_sess if s.get("id") == session_id_for_notes), None
+                )
+                if _curr_sess and _curr_sess.get("created_at"):
+                    _sess_started = str(_curr_sess["created_at"])
+                    _all_items = await db_module.get_sprint_items(db, project_id)
+                    _new_count = sum(
+                        1 for it in _all_items
+                        if (it.get("added_at") or "") >= _sess_started
+                    )
+                    if _new_count > 0:
+                        new_items_xml = (
+                            f'<board_change>{_new_count} item{"s" if _new_count != 1 else ""}'
+                            f' added since this session started</board_change>\n'
+                        )
+            except Exception:
+                pass
+        _progress_xml = (
+            f'<progress done="{_done_count}" total="{_total_count}" pct="{_pct}%"/>\n'
+            if _total_count else ""
+        )
         brief = (
             f'<session_brief project_id="{project_id}" role="{role}">\n'
             f'{notes_xml}'
+            f'{new_items_xml}'
+            f'{_progress_xml}'
             f'<sprint>{sprint_str[:200]}</sprint>\n'
             f'<pending_items>\n{sprint_items_xml}\n</pending_items>\n'
             f'<last_tasks>\n{tasks_xml}\n</last_tasks>\n'

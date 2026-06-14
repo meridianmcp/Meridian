@@ -6,12 +6,18 @@
     "url": "https://github.com/meridianmcp/Meridian",
     "source": "github"
   },
-  "version": "1.0.2",
+  "version": "0.1.0",
   "packages": [
     {
       "registryType": "npm",
       "identifier": "@meridianmcp/mcp",
-      "version": "1.0.2",
+      "version": "0.1.0",
+      "transport": { "type": "stdio" }
+    },
+    {
+      "registryType": "pypi",
+      "identifier": "meridian-server",
+      "version": "0.1.0",
       "transport": { "type": "stdio" }
     }
   ],

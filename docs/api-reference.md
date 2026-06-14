@@ -18,7 +18,7 @@ Check server health.
 ```json
 {
   "status": "ok",
-  "version": "1.9.0",
+  "version": "0.1.0",
   "db": "postgres"
 }
 ```

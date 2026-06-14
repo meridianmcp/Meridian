@@ -4934,28 +4934,50 @@ async def list_hitl_requests(
     ``project_id=None`` returns across all projects — used by the
     dashboard's top-level HITL panel. ``status=None`` returns every
     status; default ``'pending'`` shows only the active queue.
+    ``status='recent'`` returns pending + answered/dismissed in the last 24h.
     """
+    # dcf1e428 — 'recent' pseudo-status: pending OR resolved in last 24h
+    if status == "recent":
+        where = []
+        args: list[Any] = []
+        if project_id is not None:
+            where.append("project_id = ?")
+            args.append(project_id)
+        proj_clause = (" AND ".join(where) + " AND ") if where else ""
+        args.append(limit)
+        sql = (
+            f"SELECT * FROM hitl_requests WHERE {proj_clause}"
+            "(status = 'pending' OR "
+            " (status IN ('answered', 'dismissed') AND "
+            "  COALESCE(answered_at, created_at) >= datetime('now', '-1 day'))) "
+            "ORDER BY "
+            "  CASE urgency WHEN 'blocking' THEN 0 WHEN 'high' THEN 1 ELSE 2 END, "
+            "  created_at DESC LIMIT ?"
+        )
+        async with db.execute(sql, args) as cur:
+            rows = await cur.fetchall()
+        return [_row_to_dict(r) for r in rows if r is not None]  # type: ignore[misc]
     if status is not None and status not in _VALID_HITL_STATUS:
         raise ValueError(
             f"status must be one of {sorted(_VALID_HITL_STATUS)} or None"
         )
-    where = []
-    args: list[Any] = []
+    where2 = []
+    args2: list[Any] = []
     if project_id is not None:
-        where.append("project_id = ?")
-        args.append(project_id)
+        where2.append("project_id = ?")
+        args2.append(project_id)
     if status is not None:
-        where.append("status = ?")
-        args.append(status)
-    where_clause = (" WHERE " + " AND ".join(where)) if where else ""
-    args.append(limit)
+        where2.append("status = ?")
+        args2.append(status)
+    where_clause = (" WHERE " + " AND ".join(where2)) if where2 else ""
+    args2.append(limit)
     sql = (
         f"SELECT * FROM hitl_requests{where_clause} "
         "ORDER BY "
         "  CASE urgency WHEN 'blocking' THEN 0 WHEN 'high' THEN 1 ELSE 2 END, "
         "  created_at DESC LIMIT ?"
     )
-    async with db.execute(sql, args) as cur:
+    async with db.execute(sql, args2) as cur:
         rows = await cur.fetchall()
     return [_row_to_dict(r) for r in rows if r is not None]  # type: ignore[misc]
 

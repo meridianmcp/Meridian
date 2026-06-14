@@ -5,6 +5,7 @@ on:
   push:
     tags:
       - 'v[0-9]+.[0-9]+.[0-9]+'
+      - 'v[0-9]+.[0-9]+.[0-9]+-*'
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -191,7 +192,14 @@ jobs:
         with:
           node-version: '20'
           registry-url: 'https://registry.npmjs.org'
-      - run: cd npm && npm version ${{ github.ref_name }} --no-git-tag-version && npm publish
+      - run: |
+          TAG="${{ github.ref_name }}"
+          cd npm && npm version "$TAG" --no-git-tag-version
+          if [[ "$TAG" == *"-"* ]]; then
+            npm publish --tag pre-alpha
+          else
+            npm publish
+          fi
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
@@ -210,4 +218,17 @@ jobs:
         run: npx -y mcp-publisher publish
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  pypi-publish:
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          version: latest
+      - name: Build and publish to PyPI
+        run: uv build && uv publish
+        env:
+          UV_PUBLISH_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
 
