@@ -192,6 +192,67 @@ def test_bearer_auth_tokens_list_and_revoke_with_valid_token(monkeypatch, tmp_pa
         assert missing.status_code == 404
 
 
+def test_delete_orphaned_oauth_keys_endpoint(monkeypatch, tmp_path):
+    """DELETE /api/keys/orphaned purges only 'oauth' tokens older than 24h."""
+    from meridian import db as db_module
+
+    from datetime import datetime, timezone, timedelta
+
+    async def _setup(db):
+        tenant = await db_module.upsert_tenant(db, "orphan@example.com")
+        tid = tenant["id"]
+        # Auth token for the request (recent, label 'session' — must survive).
+        raw_session, _ = await db_module.create_api_token(db, tid, label="session")
+        old_ts = (
+            datetime.now(timezone.utc) - timedelta(hours=48)
+        ).strftime("%Y-%m-%d %H:%M:%S")
+        # Stale orphaned oauth token (48h old) — must be purged.
+        await db.execute(
+            "INSERT INTO api_tokens (id, tenant_id, token_hash, label, token_type, created_at)"
+            " VALUES (?, ?, ?, ?, ?, ?)",
+            ("orph-old", tid, "h-old", "oauth", "readwrite", old_ts),
+        )
+        # Fresh oauth token (just minted) — must survive (may be in use).
+        await db.execute(
+            "INSERT INTO api_tokens (id, tenant_id, token_hash, label, token_type)"
+            " VALUES (?, ?, ?, ?, ?)",
+            ("orph-new", tid, "h-new", "oauth", "readwrite"),
+        )
+        # Old token with a different label — must survive (not an oauth orphan).
+        await db.execute(
+            "INSERT INTO api_tokens (id, tenant_id, token_hash, label, token_type, created_at)"
+            " VALUES (?, ?, ?, ?, ?, ?)",
+            ("keep-old", tid, "h-keep", "install", "readwrite", old_ts),
+        )
+        await db.commit()
+        return raw_session
+
+    with _make_hosted_client(monkeypatch, tmp_path) as client:
+        raw_session = _run(_setup(client.app.state.db))
+
+        r = client.delete(
+            "/api/keys/orphaned",
+            headers={"Authorization": f"Bearer {raw_session}"},
+        )
+        assert r.status_code == 200
+        assert r.json()["deleted"] == 1
+
+        async def _remaining(db):
+            async with db.execute("SELECT id FROM api_tokens ORDER BY id") as cur:
+                return [row[0] for row in await cur.fetchall()]
+
+        ids = _run(_remaining(client.app.state.db))
+        assert "orph-old" not in ids
+        assert "orph-new" in ids   # fresh oauth token kept
+        assert "keep-old" in ids   # non-oauth label kept
+
+
+def test_delete_orphaned_oauth_keys_requires_auth(client):
+    """DELETE /api/keys/orphaned without a token returns 401."""
+    r = client.delete("/api/keys/orphaned")
+    assert r.status_code == 401
+
+
 # ---------------------------------------------------------------------------
 # Stripe webhook signature verification
 # ---------------------------------------------------------------------------

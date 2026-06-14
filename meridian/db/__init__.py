@@ -4157,6 +4157,38 @@ async def delete_api_tokens_by_label(
     return cur.rowcount
 
 
+async def delete_orphaned_oauth_tokens(
+    db: aiosqlite.Connection,
+    tenant_id: str,
+    *,
+    label: str = "oauth",
+    older_than_hours: int = 24,
+) -> int:
+    """Purge a tenant's stale OAuth-minted API tokens. Returns count deleted.
+
+    The Claude Code MCP ``authorization_code`` flow mints an ``oauth``-labelled
+    ``api_tokens`` row at ``/oauth/token`` even when the redirect back to the
+    local callback fails; the user then retries, orphaning the previous token.
+    Left alone these accumulate as dead key-list entries. This deletes rows
+    matching ``label`` whose ``created_at`` is older than ``older_than_hours``,
+    leaving recent (possibly in-use) tokens untouched.
+
+    ``created_at`` is the canonical ``YYYY-MM-DD HH:MM:SS`` UTC form, so a
+    lexicographic comparison against the Python-computed cutoff is correct on
+    both SQLite and Postgres.
+    """
+    from datetime import datetime, timezone, timedelta
+    cutoff = (
+        datetime.now(timezone.utc) - timedelta(hours=max(0, older_than_hours))
+    ).strftime("%Y-%m-%d %H:%M:%S")
+    cur = await db.execute(
+        "DELETE FROM api_tokens WHERE tenant_id = ? AND label = ? AND created_at < ?",
+        (tenant_id, label, cutoff),
+    )
+    await db.commit()
+    return cur.rowcount
+
+
 async def create_api_token(
     db: aiosqlite.Connection,
     tenant_id: str,

@@ -4067,6 +4067,23 @@ async def delete_api_token(token_id: str, request: Request) -> Response:
     return Response(status_code=204)
 
 
+@app.delete("/api/keys/orphaned")
+async def delete_orphaned_oauth_keys(request: Request) -> dict[str, Any]:
+    """Purge this tenant's orphaned OAuth API keys (``label='oauth'``, >24h old).
+
+    Claude Code's MCP ``authorization_code`` flow mints an ``oauth``-labelled
+    bearer token at ``/oauth/token`` even when the redirect back to the local
+    callback fails; the user retries, orphaning the previous token. This sweeps
+    those stale rows so the tenant's key list doesn't accumulate dead entries.
+    Recent tokens (<24h) are left untouched in case one is still in use.
+    Returns ``{"deleted": <count>}``.
+    """
+    tenant = await _get_authenticated_tenant(request)
+    db = request.app.state.db
+    deleted = await db_module.delete_orphaned_oauth_tokens(db, tenant["id"])
+    return {"deleted": deleted}
+
+
 @app.get("/auth/me")
 async def get_me(request: Request) -> dict[str, Any]:
     """Return the authenticated tenant's profile (session cookie or bearer), including projects."""
@@ -5107,6 +5124,9 @@ async def _oauth_token(request: Request):
                 (_api_tid, tenant_id, tok_hash, "oauth", "readwrite"),
             )
             await auth_db.commit()
+            # Self-heal: sweep this tenant's prior 'oauth' tokens orphaned by
+            # failed-redirect retries (>24h old) so they don't accumulate.
+            await db_module.delete_orphaned_oauth_tokens(auth_db, tenant_id)
         except Exception:
             pass
     else:
