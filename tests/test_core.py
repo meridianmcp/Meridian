@@ -9196,6 +9196,32 @@ def test_mcp_log_task_description_size_limit(client):
     assert "description" in err_msg.lower(), f"Expected 'description' in error, got: {resp}"
 
 
+def test_mcp_agent_instructions_round_trip(client):
+    """get/set_agent_instructions MCP tools round-trip correctly."""
+    project = client.post("/projects", json={"name": "ai-instr-test"}).json()
+    pid = project["id"]
+    # Initially empty
+    r1 = _mcp_call(client, "get_agent_instructions", {"project_id": pid})
+    assert r1.get("result", {}).get("content", [{}])[0].get("text", "null") in (
+        "null", '{"project_id": "' + pid + '", "agent_instructions": null}',
+        '{"project_id": "' + pid + '", "agent_instructions": null}'
+    ) or '"agent_instructions": null' in r1.get("result", {}).get("content", [{}])[0].get("text", "")
+    # Set instructions
+    r2 = _mcp_call(client, "set_agent_instructions", {
+        "project_id": pid,
+        "instructions": "Always run tests before committing.",
+    })
+    assert r2.get("result") is not None, f"set failed: {r2}"
+    # Read back
+    r3 = _mcp_call(client, "get_agent_instructions", {"project_id": pid})
+    text3 = r3.get("result", {}).get("content", [{}])[0].get("text", "")
+    assert "Always run tests before committing" in text3, f"instructions not returned: {text3}"
+    # start_session injects agent_instructions in payload
+    sess_resp = _mcp_call(client, "start_session", {"project_id": pid, "session_name": "ai-test"})
+    sess_text = sess_resp.get("result", {}).get("content", [{}])[0].get("text", "")
+    assert "Always run tests before committing" in sess_text, f"instructions not in start_session: {sess_text}"
+
+
 @pytest.mark.asyncio
 async def test_rollup_parent_all_done(db):
     """Completing all children auto-completes the parent."""

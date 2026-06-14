@@ -153,6 +153,7 @@ CREATE TABLE IF NOT EXISTS projects (
     executor_config TEXT,
     hitl_auto_answer INTEGER NOT NULL DEFAULT 0,
     icon TEXT,
+    agent_instructions TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -672,6 +673,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_queued_session(db)
     await _migrate_parallel_safety(db)
     await _migrate_changelog_entries(db)
+    await _migrate_agent_instructions(db)
     return db
 
 
@@ -708,6 +710,32 @@ async def get_project(
     ) as cur:
         row = await cur.fetchone()
     return _row_to_dict(row)
+
+
+async def get_agent_instructions(
+    db: aiosqlite.Connection, project_id: str
+) -> str | None:
+    """Return the agent_instructions field for a project, or None if not set."""
+    async with db.execute(
+        "SELECT agent_instructions FROM projects WHERE id = ?", (project_id,)
+    ) as cur:
+        row = await cur.fetchone()
+    if row is None:
+        return None
+    val = row["agent_instructions"] if isinstance(row, dict) else row[0]
+    return val or None
+
+
+async def set_agent_instructions(
+    db: aiosqlite.Connection, project_id: str, instructions: str | None
+) -> dict[str, Any]:
+    """Set agent_instructions for a project. Pass None to clear."""
+    await db.execute(
+        "UPDATE projects SET agent_instructions = ? WHERE id = ?",
+        (instructions or None, project_id),
+    )
+    await db.commit()
+    return {"project_id": project_id, "agent_instructions": instructions or None}
 
 
 async def get_project_by_name(

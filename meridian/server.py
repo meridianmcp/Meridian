@@ -5379,6 +5379,9 @@ async def _start_session_composite(
         db, project_id, session["id"]
     )
 
+    # 8a0c5a78 — inject per-project agent instructions so every session sees them.
+    agent_instructions = await db_module.get_agent_instructions(db, project_id)
+
     payload: dict[str, Any] = {
         "session_id": session["id"],
         "goal": goal,
@@ -5394,6 +5397,8 @@ async def _start_session_composite(
         "meridian_instructions": meridian_instructions,  # v2.3
         "workspace_context": workspace_context,  # v3.4 — tenant-global block
     }
+    if agent_instructions:
+        payload["agent_instructions"] = agent_instructions
     if file_warnings:
         payload["file_warnings"] = file_warnings
     if executor_config is not None:
@@ -8185,6 +8190,13 @@ async def _dispatch_mcp_tool(
             "task_count": run["task_count"],
             "transcript": run["transcript"],
         }
+    if name == "get_agent_instructions":
+        instructions = await db_module.get_agent_instructions(db, args["project_id"])
+        return {"project_id": args["project_id"], "agent_instructions": instructions}
+    if name == "set_agent_instructions":
+        validate_input_size(args.get("instructions"), "agent_instructions", 100_000)
+        instructions = (args.get("instructions") or "").strip() or None
+        return await db_module.set_agent_instructions(db, args["project_id"], instructions)
     if name == "set_executor_config":
         cfg_fields = {
             k: args[k]

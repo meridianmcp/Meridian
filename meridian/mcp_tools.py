@@ -392,6 +392,23 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "query": {"type": "string"},
          "limit": {"type": "integer", "description": "Max results per type (default 10)."}},
          "required": ["project_id", "query"]}},
+    {"name": "get_agent_instructions", "description":
+        "Read-only: Return the custom agent_instructions for a project. "
+        "These are injected automatically by start_session so every session picks them up. "
+        "Use this when you need to read or display the current instructions.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"}},
+         "required": ["project_id"]}},
+    {"name": "set_agent_instructions", "description":
+        "Set or update the custom agent_instructions for a project. "
+        "Instructions are injected into every start_session response so AI sessions see them "
+        "automatically — no need to repeat in every session. "
+        "Pass null or empty string to clear. "
+        "Use for persistent rules like coding conventions, deploy steps, or codebase notes.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"},
+         "instructions": {"type": "string", "description": "Markdown text injected at session start. Pass null to clear."}},
+         "required": ["project_id", "instructions"]}},
     {"name": "set_executor_config", "description":
         "Store per-project executor defaults (repo_path, env_file, test_cmd, test_min, deploy_cmd, shell_type, branch). "
         "Executor sessions auto-load these when start_session(role='executor') is used. "
@@ -481,7 +498,7 @@ _READ_ONLY_TOOLS = {
     "list_hitl_requests", "list_sessions", "get_sprint_notes",
     "get_session_log", "idle_until_session_done", "generate_handoff",
     "get_workspace_notes", "get_workspace_decisions", "get_workspace_settings",
-    "get_sprint_items",
+    "get_sprint_items", "get_agent_instructions",
 }
 _DESTRUCTIVE_TOOLS = {"delete_note", "archive_decision", "dismiss_hitl"}
 
