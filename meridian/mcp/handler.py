@@ -969,6 +969,25 @@ async def _dispatch_mcp_tool(
         if isinstance(result, dict) and "MANUAL" in (args.get("title") or ""):
             result = {**result, "lint": _MANUAL_NOTE_LINT}
         return result
+    if name == "capture_insight":
+        # db9edba3 — one-call insight capture for planning (claude.ai) sessions:
+        # persists a kind='insight' note (prominent in the dashboard + surfaced in
+        # the planner handoff) WITHOUT the auto-capture "Session summary" noise.
+        validate_input_size(args.get("title"), "insight title", 500)
+        _ins_body = args.get("body")
+        _bullets = args.get("bullet_points")
+        if (not _ins_body) and isinstance(_bullets, list) and _bullets:
+            _ins_body = "\n".join(f"- {str(b).strip()}" for b in _bullets if str(b).strip())
+        _ins_body = _ins_body or ""
+        validate_input_size(_ins_body, "insight body", 10_000_000)
+        if not _ins_body:
+            return {"error": "capture_insight requires body or non-empty bullet_points"}
+        _ins_tags = args.get("tags")
+        _ins_tags = f"{_ins_tags},insight" if _ins_tags else "insight"
+        return await db_module.add_project_note(
+            db, args["project_id"], args["title"], _ins_body,
+            _ins_tags, kind="insight",
+        )
     if name == "get_notes":
         return await db_module.get_project_notes(
             db, args["project_id"], tag=args.get("tag"),

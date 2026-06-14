@@ -1,6 +1,6 @@
 # MCP Tool Reference
 
-Meridian exposes **57 tools** over MCP.
+Meridian exposes **58 tools** over MCP.
 
 They fall into two usage patterns:
 

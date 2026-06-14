@@ -207,6 +207,20 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "kind": {"type": "string", "enum": ["wiki", "insight", "reference"]},
          "category": {"type": "string"}},
          "required": ["project_id", "title", "body"]}},
+    {"name": "capture_insight", "description":
+        "Save a key takeaway from a planning (claude.ai) conversation in one call — "
+        "persists a prominent kind='insight' note that's searchable, filterable, and "
+        "surfaced in generate_handoff(mode='planner'), WITHOUT the auto-capture "
+        "'Session summary' noise checkpoint() makes. Pass body (markdown) OR "
+        "bullet_points (a list, joined into a bullet list). Use mid-conversation "
+        "whenever you're afraid of losing context.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"},
+         "title": {"type": "string"},
+         "body": {"type": "string", "description": "Markdown body. Omit if using bullet_points."},
+         "bullet_points": {"type": "array", "items": {"type": "string"}, "description": "Key takeaways, joined into a markdown bullet list."},
+         "tags": {"type": "string", "description": "Optional comma-separated tags (an 'insight' tag is always added)."}},
+         "required": ["project_id", "title"]}},
     {"name": "get_notes", "description":
         "Read-only: List project notes (newest first). Optional ?tag substring filter.",
      "inputSchema": {"type": "object", "properties": {

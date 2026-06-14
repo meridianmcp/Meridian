@@ -311,10 +311,16 @@ def _note_tags(note: dict[str, Any]) -> set[str]:
 def _select_strategic_notes(
     notes: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    """Keep only notes that help a restarted planning chat."""
+    """Keep only notes that help a restarted planning chat.
+
+    Includes notes carrying a strategic tag and every kind='insight' note
+    (db9edba3 — insights captured via capture_insight are planner-facing by
+    definition, so they surface here regardless of tags).
+    """
     selected = []
     for note in notes:
-        if _note_tags(note) & _STRATEGIC_NOTE_TAGS:
+        kind = (note.get("note_kind") or note.get("kind") or "").lower()
+        if kind == "insight" or (_note_tags(note) & _STRATEGIC_NOTE_TAGS):
             selected.append(note)
     return selected
 

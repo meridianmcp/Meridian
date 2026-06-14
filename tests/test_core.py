@@ -10595,3 +10595,64 @@ async def test_claim_sprint_item_soft_file_overlap_warning(db):
     assert res.get("status") == "in_progress"
     assert res.get("worktree_suggested") is True
     assert "meridian/server.py" in res["file_overlap_warning"]["message"]
+
+
+# ---------------------------------------------------------------------------
+# Planning chat save mechanism (db9edba3)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_capture_insight_body(db):
+    import meridian.server as srv
+
+    p = await db_module.create_project(db, "ins-body")
+    res = await srv._dispatch_mcp_tool(
+        "capture_insight",
+        {"project_id": p["id"], "title": "Pricing", "body": "Workspace tiers, not per-seat."},
+        db, "/tmp",
+    )
+    assert res["note_kind"] == "insight"
+    assert "Workspace tiers" in res["body"]
+    assert "insight" in (res.get("tags") or "")
+
+
+@pytest.mark.asyncio
+async def test_capture_insight_bullet_points(db):
+    import meridian.server as srv
+
+    p = await db_module.create_project(db, "ins-bullets")
+    res = await srv._dispatch_mcp_tool(
+        "capture_insight",
+        {"project_id": p["id"], "title": "Takeaways",
+         "bullet_points": ["Ship device flow", "Defer WS tunnel"]},
+        db, "/tmp",
+    )
+    assert res["note_kind"] == "insight"
+    assert "- Ship device flow" in res["body"]
+    assert "- Defer WS tunnel" in res["body"]
+
+
+@pytest.mark.asyncio
+async def test_capture_insight_requires_content(db):
+    import meridian.server as srv
+
+    p = await db_module.create_project(db, "ins-empty")
+    res = await srv._dispatch_mcp_tool(
+        "capture_insight", {"project_id": p["id"], "title": "Empty"}, db, "/tmp",
+    )
+    assert "error" in res
+
+
+def test_select_strategic_notes_includes_insights():
+    """Insights surface in the planner handoff even without a strategic tag."""
+    from meridian.handoff import _select_strategic_notes
+
+    notes = [
+        {"title": "wiki note", "tags": "ops", "note_kind": "wiki"},
+        {"title": "an insight", "tags": "", "note_kind": "insight"},
+    ]
+    selected = _select_strategic_notes(notes)
+    titles = {n["title"] for n in selected}
+    assert "an insight" in titles
+    assert "wiki note" not in titles
