@@ -5,6 +5,8 @@ export const _PLAN_LABELS = { solo: 'Standard', free: 'Free Trial', standard: 'S
 
 export const QUEUE_DONE_PAGE_SIZE = 10;
 export const SESSION_LIVE_WINDOW_MS = 10 * 60 * 1000;
+export const DEFAULT_MAX_PINNED_DECISIONS = 20;
+export const DEFAULT_CONTEXT_THRESHOLD = 40;
 
 export function getPanelState(projectId) {
 
@@ -93,4 +95,4 @@ export function _colorForHuman(humanId) {
 
 // --- ITEM 4 esbuild: re-expose top-level symbols as globals so inline
 // handlers and cross-file references keep resolving after IIFE bundling.
-try { Object.assign(window, { getPanelState, toast, escapeHtml, formatRelativeTime, sessionAgeMs, isLiveSession, _colorForHuman, _PLAN_LABELS, QUEUE_DONE_PAGE_SIZE, SESSION_LIVE_WINDOW_MS, _HUMAN_COLORS }); } catch (e) {}
+try { Object.assign(window, { getPanelState, toast, escapeHtml, formatRelativeTime, sessionAgeMs, isLiveSession, _colorForHuman, _PLAN_LABELS, QUEUE_DONE_PAGE_SIZE, SESSION_LIVE_WINDOW_MS, _HUMAN_COLORS, DEFAULT_MAX_PINNED_DECISIONS, DEFAULT_CONTEXT_THRESHOLD }); } catch (e) {}

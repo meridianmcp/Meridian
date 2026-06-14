@@ -421,3 +421,32 @@ def test_dashboard_live_tab_has_progress_bar(client, js):
     assert "live-sprint-bar" in css, (
         ".live-sprint-bar CSS class missing"
     )
+
+
+def test_dashboard_constants_in_utils(client):
+    """DEFAULT_CONTEXT_THRESHOLD and DEFAULT_MAX_PINNED_DECISIONS must be
+    defined in dashboard-utils.js so the settings tab can access them as
+    globals before dashboard.js finishes initialising (16389f76).
+    """
+    from pathlib import Path
+    utils_src = (
+        Path(__file__).parent.parent / "meridian" / "static" / "dashboard-utils.js"
+    ).read_text(encoding="utf-8")
+    dashboard_src = (
+        Path(__file__).parent.parent / "meridian" / "static" / "dashboard.js"
+    ).read_text(encoding="utf-8")
+
+    assert "DEFAULT_CONTEXT_THRESHOLD" in utils_src, (
+        "DEFAULT_CONTEXT_THRESHOLD must be defined in dashboard-utils.js"
+    )
+    assert "DEFAULT_MAX_PINNED_DECISIONS" in utils_src, (
+        "DEFAULT_MAX_PINNED_DECISIONS must be defined in dashboard-utils.js"
+    )
+    # Neither constant should be defined (as a const) in dashboard.js anymore
+    import re
+    assert not re.search(r"^const DEFAULT_CONTEXT_THRESHOLD\s*=", dashboard_src, re.MULTILINE), (
+        "DEFAULT_CONTEXT_THRESHOLD must not be re-defined in dashboard.js"
+    )
+    assert not re.search(r"^const DEFAULT_MAX_PINNED_DECISIONS\s*=", dashboard_src, re.MULTILINE), (
+        "DEFAULT_MAX_PINNED_DECISIONS must not be re-defined in dashboard.js"
+    )

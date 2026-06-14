@@ -3,6 +3,8 @@
   var _PLAN_LABELS2 = { solo: "Standard", free: "Free Trial", standard: "Standard", pro: "Pro", trial: "Trial", admin: "Admin" };
   var QUEUE_DONE_PAGE_SIZE2 = 10;
   var SESSION_LIVE_WINDOW_MS = 10 * 60 * 1e3;
+  var DEFAULT_MAX_PINNED_DECISIONS2 = 20;
+  var DEFAULT_CONTEXT_THRESHOLD2 = 40;
   function getPanelState2(projectId) {
     window.state.panels[projectId] = window.state.panels[projectId] || {};
     return window.state.panels[projectId];
@@ -49,7 +51,7 @@
     return _HUMAN_COLORS[Math.abs(h) % _HUMAN_COLORS.length];
   }
   try {
-    Object.assign(window, { getPanelState: getPanelState2, toast: toast2, escapeHtml: escapeHtml2, formatRelativeTime: formatRelativeTime2, sessionAgeMs: sessionAgeMs2, isLiveSession: isLiveSession2, _colorForHuman: _colorForHuman2, _PLAN_LABELS: _PLAN_LABELS2, QUEUE_DONE_PAGE_SIZE: QUEUE_DONE_PAGE_SIZE2, SESSION_LIVE_WINDOW_MS, _HUMAN_COLORS });
+    Object.assign(window, { getPanelState: getPanelState2, toast: toast2, escapeHtml: escapeHtml2, formatRelativeTime: formatRelativeTime2, sessionAgeMs: sessionAgeMs2, isLiveSession: isLiveSession2, _colorForHuman: _colorForHuman2, _PLAN_LABELS: _PLAN_LABELS2, QUEUE_DONE_PAGE_SIZE: QUEUE_DONE_PAGE_SIZE2, SESSION_LIVE_WINDOW_MS, _HUMAN_COLORS, DEFAULT_MAX_PINNED_DECISIONS: DEFAULT_MAX_PINNED_DECISIONS2, DEFAULT_CONTEXT_THRESHOLD: DEFAULT_CONTEXT_THRESHOLD2 });
   } catch (e) {
   }
 
@@ -5109,8 +5111,6 @@ project_id = "${displayPid}"`;
   }
   var STORAGE_KEY2 = (k) => (isDemoMode() ? "meridian_demo_" : "meridian_") + k.replace(/^meridian[._]/, "");
   var NORTH_STAR_MIN_HEIGHT_PX = 180;
-  var DEFAULT_MAX_PINNED_DECISIONS2 = 20;
-  var DEFAULT_CONTEXT_THRESHOLD2 = 40;
   var GITHUB_OCTICON_PATH = "M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z";
   function _summarizeApiErrorText(raw) {
     if (raw === void 0 || raw === null) return "Request failed before data could load.";
@@ -5269,14 +5269,14 @@ project_id = "${displayPid}"`;
   function getConstitutionLimit(projectId) {
     const panel = getPanelState(projectId);
     const parsed = parseInt(String(panel._projectSettings?.max_pinned_decisions || ""), 10);
-    return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_MAX_PINNED_DECISIONS2;
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_MAX_PINNED_DECISIONS;
   }
   async function loadProjectSettings2(projectId, opts = {}) {
     const panel = getPanelState(projectId);
     if (!opts.force && panel._projectSettings) return panel._projectSettings;
     if (!opts.force && panel._projectSettingsPromise) return panel._projectSettingsPromise;
     panel._projectSettingsPromise = projectApi2(projectId, `/projects/${projectId}/settings`).then((settings) => {
-      panel._projectSettings = settings || { project_id: projectId, max_pinned_decisions: DEFAULT_MAX_PINNED_DECISIONS2 };
+      panel._projectSettings = settings || { project_id: projectId, max_pinned_decisions: DEFAULT_MAX_PINNED_DECISIONS };
       return panel._projectSettings;
     }).finally(() => {
       panel._projectSettingsPromise = null;
@@ -5289,7 +5289,7 @@ project_id = "${displayPid}"`;
       method: "PATCH",
       body: JSON.stringify(patch || {})
     });
-    panel._projectSettings = settings || { project_id: projectId, max_pinned_decisions: DEFAULT_MAX_PINNED_DECISIONS2 };
+    panel._projectSettings = settings || { project_id: projectId, max_pinned_decisions: DEFAULT_MAX_PINNED_DECISIONS };
     return panel._projectSettings;
   }
   var _DEMO_TOUR_STEPS = [
@@ -10992,7 +10992,7 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
     }
   }
   try {
-    Object.assign(window, { hideHostedAdminControls, ensureSignOutLink: ensureSignOutLink2, ensureWorkspaceSwitcher: ensureWorkspaceSwitcher2, showConnectDbModal, showLocalServerControls, _summarizeApiErrorText, _projectLoadErrorInfo, wireProjectLoadRetry: wireProjectLoadRetry2, renderProjectLoadError: renderProjectLoadError2, recordProjectLoadError, clearProjectLoadError, renderProjectLoadAlert, retryProjectSurface, syncSidebarActiveProject, autosizeGoalField, githubIconSvg: githubIconSvg2, getConstitutionLimit, loadProjectSettings: loadProjectSettings2, saveProjectSettings: saveProjectSettings2, _demoTourDone: _demoTourDone2, _demoTourSavedStep: _demoTourSavedStep2, _demoTourSaveStep, _demoTourMarkDone, _demoTourClose, _tourActivateVtab, startDemoTour: startDemoTour2, resumeDemoTour, api: api2, projectApi: projectApi2, loadServerConfig, _armAccountSwitchWatch, _refreshOnFocus, _checkAccountSwitch, _showAccountSwitchBanner, updateGitHubConnectionIndicator, _updateConnectionIndicator, checkGitStatus, _doRestart, loadConfig, loadProjects, openTab, closeTab, saveTabs, renderTabs, _makeTabEl, _openTabMenu, _setProjectIcon, _renameProject, _deleteProject, activateTab, buildTabBody, scheduleLiveRefresh, initLiveAutoRefresh, loadLiveTab, refreshLiveTab, wireSprintAddEnter: wireSprintAddEnter2, sprintAction, sprintPushPrompt, sprintFeedback, sprintFeedbackNote, sprintItemEdit, addSprintItemFromInput: addSprintItemFromInput2, cacheMostRecentSession, renderLiveSessions, endLiveSession, openTimelineForSession, renderLiveQueue, addLiveTask, cancelLiveTask, showCopyPreview, wireClaudeLaunchPanel, stampHandoffTs, populateSessionDropdown, loadTimeline: loadTimeline2, _renderTimelineLog: _renderTimelineLog2, loadDocsTab, normalizeNotifyTarget, displayNotifyTarget: displayNotifyTarget2, osExecutorHintBanner: osExecutorHintBanner2, showFailoverBannerIfNeeded, suggestNtfyTopic, loadHitlTab, loadTeamTab, updateLiveFeed, loadRecentSessions, loadMilestones, loadRecentRuns, loadQueue, renderSearchResults: renderSearchResults2, wireQueueSectionToggles, refreshTab, refreshGoal, parseDecisionsBlob, renderConstitutionWarning: renderConstitutionWarning2, _hitlBadgeClick, initHitlPanel, setVtabCountBadge: setVtabCountBadge2, refreshProjectCountBadges, refreshHitl, _hitlAnswer, _hitlDismiss, loadPinnedDecisions, supersedePinnedDecision, addPinnedDecision, consolidateDecisions, renderDecisionsTable, wireGoalPreviewToggle, saveGoal, saveNorthStar, saveSprint, _sessionPresenceDot, refreshSessions, refreshTasks, renderTasks, _loadMoreTasks, renderTaskRow, deleteTaskRow, renderHitlRow, wireHitlRow, appendToGoal, hitlReply, hitlExecute, connectWs, handleWsEvent, restoreTabs, _deleteSprintItem, _sprintAction, completeSprintItem, failSprintItem, toggleExpand, state, DEFAULT_CONTEXT_THRESHOLD: DEFAULT_CONTEXT_THRESHOLD2, DEFAULT_MAX_PINNED_DECISIONS: DEFAULT_MAX_PINNED_DECISIONS2 });
+    Object.assign(window, { hideHostedAdminControls, ensureSignOutLink: ensureSignOutLink2, ensureWorkspaceSwitcher: ensureWorkspaceSwitcher2, showConnectDbModal, showLocalServerControls, _summarizeApiErrorText, _projectLoadErrorInfo, wireProjectLoadRetry: wireProjectLoadRetry2, renderProjectLoadError: renderProjectLoadError2, recordProjectLoadError, clearProjectLoadError, renderProjectLoadAlert, retryProjectSurface, syncSidebarActiveProject, autosizeGoalField, githubIconSvg: githubIconSvg2, getConstitutionLimit, loadProjectSettings: loadProjectSettings2, saveProjectSettings: saveProjectSettings2, _demoTourDone: _demoTourDone2, _demoTourSavedStep: _demoTourSavedStep2, _demoTourSaveStep, _demoTourMarkDone, _demoTourClose, _tourActivateVtab, startDemoTour: startDemoTour2, resumeDemoTour, api: api2, projectApi: projectApi2, loadServerConfig, _armAccountSwitchWatch, _refreshOnFocus, _checkAccountSwitch, _showAccountSwitchBanner, updateGitHubConnectionIndicator, _updateConnectionIndicator, checkGitStatus, _doRestart, loadConfig, loadProjects, openTab, closeTab, saveTabs, renderTabs, _makeTabEl, _openTabMenu, _setProjectIcon, _renameProject, _deleteProject, activateTab, buildTabBody, scheduleLiveRefresh, initLiveAutoRefresh, loadLiveTab, refreshLiveTab, wireSprintAddEnter: wireSprintAddEnter2, sprintAction, sprintPushPrompt, sprintFeedback, sprintFeedbackNote, sprintItemEdit, addSprintItemFromInput: addSprintItemFromInput2, cacheMostRecentSession, renderLiveSessions, endLiveSession, openTimelineForSession, renderLiveQueue, addLiveTask, cancelLiveTask, showCopyPreview, wireClaudeLaunchPanel, stampHandoffTs, populateSessionDropdown, loadTimeline: loadTimeline2, _renderTimelineLog: _renderTimelineLog2, loadDocsTab, normalizeNotifyTarget, displayNotifyTarget: displayNotifyTarget2, osExecutorHintBanner: osExecutorHintBanner2, showFailoverBannerIfNeeded, suggestNtfyTopic, loadHitlTab, loadTeamTab, updateLiveFeed, loadRecentSessions, loadMilestones, loadRecentRuns, loadQueue, renderSearchResults: renderSearchResults2, wireQueueSectionToggles, refreshTab, refreshGoal, parseDecisionsBlob, renderConstitutionWarning: renderConstitutionWarning2, _hitlBadgeClick, initHitlPanel, setVtabCountBadge: setVtabCountBadge2, refreshProjectCountBadges, refreshHitl, _hitlAnswer, _hitlDismiss, loadPinnedDecisions, supersedePinnedDecision, addPinnedDecision, consolidateDecisions, renderDecisionsTable, wireGoalPreviewToggle, saveGoal, saveNorthStar, saveSprint, _sessionPresenceDot, refreshSessions, refreshTasks, renderTasks, _loadMoreTasks, renderTaskRow, deleteTaskRow, renderHitlRow, wireHitlRow, appendToGoal, hitlReply, hitlExecute, connectWs, handleWsEvent, restoreTabs, _deleteSprintItem, _sprintAction, completeSprintItem, failSprintItem, toggleExpand, state });
   } catch (e) {
   }
 })();
