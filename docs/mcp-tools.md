@@ -34,6 +34,7 @@ Register a session and get the full project context (goal, sprint, recent tasks,
 | `human_id` | string | optional |  |
 | `client` | string | optional |  |
 | `role` | string | optional | Pass 'executor' to inject executor_config and credentials guidance. |
+| `compact` | boolean | optional | Default true — slim orientation. Set false for the full goal/instructions payload. |
 
 **Example:**
 ```

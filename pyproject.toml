@@ -1,5 +1,5 @@
 [project]
-name = "meridian-server"
+name = "meridian-coordinator"
 version = "0.1.0.dev1"
 description = "Multi-session Claude coordinator MCP server"
 requires-python = ">=3.11,<3.13"
