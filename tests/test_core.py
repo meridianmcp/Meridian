@@ -8221,6 +8221,14 @@ async def test_auto_capture_writes_session_note_not_project_note():
     assert any("Session summary" in t for t in session_titles), session_titles
 
 
+def test_favicon_ico_redirects_to_logo(client):
+    """ac21d522 — bare /favicon.ico redirects to the compass logo, so crawlers
+    (and Google's favicon service) never fall back to a generic icon."""
+    r = client.get("/favicon.ico", follow_redirects=False)
+    assert r.status_code in (301, 307, 308)
+    assert r.headers["location"] == "/static/logo.svg"
+
+
 # ---------------------------------------------------------------------------
 # v0.9 — Magic link tokens
 # ---------------------------------------------------------------------------

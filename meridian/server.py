@@ -1031,6 +1031,18 @@ async def robots_txt() -> str:
     return "User-agent: *\nAllow: /\nSitemap: https://usemeridian.us/sitemap.xml"
 
 
+@app.get("/favicon.ico")
+async def favicon() -> Response:
+    """ac21d522 — serve the compass logo for bare /favicon.ico requests.
+
+    Browsers and crawlers (incl. Google's favicon service) hit /favicon.ico
+    directly when no recognised icon link is found. Redirect to the SVG so the
+    site never shows a generic placeholder icon. (The HTML <link rel="icon">
+    tags already point modern browsers at /static/logo.svg.)
+    """
+    return RedirectResponse(url="/static/logo.svg", status_code=301)
+
+
 @app.get("/sitemap.xml")
 async def sitemap_xml() -> Response:
     today = "2026-06-09"
