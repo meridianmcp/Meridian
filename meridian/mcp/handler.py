@@ -552,6 +552,43 @@ async def _sprint_item_file_claim_conflicts(
     return conflicts
 
 
+async def _board_change_for_session(
+    db: Any,
+    project_id: str,
+    session_id: str | None,
+) -> dict[str, Any] | None:
+    """Count sprint items added since a session started (live-queue signal).
+
+    Returns ``{"new_items_since_session_start": N, "message": "..."}`` when N>0,
+    else None. Attached to between-task MCP responses (complete_sprint_item,
+    claim_sprint_item, get_sprint_progress) so a single-terminal executor sees
+    items a planner injected mid-run and picks them up at the next item
+    boundary — without interrupting the current task. (d01a74bf)
+    """
+    if not session_id:
+        return None
+    try:
+        _all_sess = await db_module.get_sessions(db, project_id, active_only=False)
+        _curr = next((s for s in _all_sess if s.get("id") == session_id), None)
+        if not _curr or not _curr.get("created_at"):
+            return None
+        started = str(_curr["created_at"])
+        items = await db_module.get_sprint_items(db, project_id)
+        new_count = sum(1 for it in items if (it.get("added_at") or "") > started)
+        if new_count <= 0:
+            return None
+        return {
+            "new_items_since_session_start": new_count,
+            "message": (
+                f"{new_count} new sprint item{'s' if new_count != 1 else ''} "
+                "added since this session started — call get_sprint_progress() "
+                "to review and pick them up after the current item."
+            ),
+        }
+    except Exception:  # noqa: BLE001
+        return None
+
+
 async def _fetch_recent_commits(
     project: dict[str, Any],
     tenant: dict[str, Any] | None,
@@ -1193,7 +1230,7 @@ async def _dispatch_mcp_tool(
         _done_n = _counts.get("done", 0)
         _total = len(_all)
         _pct = round(100 * _done_n / _total) if _total else 0
-        return {
+        _resp_progress = {
             "total": _total,
             "done": _done_n,
             "in_progress": _counts.get("in_progress", 0),
@@ -1207,6 +1244,10 @@ async def _dispatch_mcp_tool(
                 for it in _all
             ],
         }
+        _bc = await _board_change_for_session(db, args["project_id"], args.get("session_id"))
+        if _bc:
+            _resp_progress["board_change"] = _bc
+        return _resp_progress
     if name == "get_sprint_items":
         include_human = args.get("human", True)
         if isinstance(include_human, bool):
@@ -1265,20 +1306,23 @@ async def _dispatch_mcp_tool(
         _isolation = (_exec_cfg or {}).get("isolation", "")
         _aw_raw = _proj_settings_claim.get("auto_worktrees")
         _auto_worktrees = bool(int(_aw_raw) if _aw_raw is not None else 1)
+        # Compute file-claim overlaps once. In worktree mode they're a soft
+        # informational warning (worktrees isolate the edit); otherwise a hard
+        # block. (d01a74bf part 2)
+        _file_conflicts = await _sprint_item_file_claim_conflicts(
+            db,
+            args["project_id"],
+            args["item_id"],
+            exclude_session_id=args.get("session_id"),
+        )
         if _isolation == "worktree" or _auto_worktrees:
             _suggest_worktree = True
         else:
-            conflicts = await _sprint_item_file_claim_conflicts(
-                db,
-                args["project_id"],
-                args["item_id"],
-                exclude_session_id=args.get("session_id"),
-            )
-            if conflicts:
+            if _file_conflicts:
                 return {
                     "error": "CONFLICT",
                     "message": "Cannot claim sprint item: active session has overlapping claimed files.",
-                    "conflicts": conflicts,
+                    "conflicts": _file_conflicts,
                 }
 
         try:
@@ -1341,6 +1385,26 @@ async def _dispatch_mcp_tool(
                 ),
             })
 
+        # Soft, non-blocking overlap warning (e.g. in worktree mode where the
+        # hard CONFLICT check is intentionally skipped). (d01a74bf part 2)
+        if _file_conflicts:
+            item = dict(item)
+            _paths = ", ".join(sorted({c["file_path"] for c in _file_conflicts}))
+            item["file_overlap_warning"] = {
+                "message": (
+                    f"Heads up: {_paths} also claimed by another live session. "
+                    "Your worktree isolates the edit, but coordinate before merging."
+                ),
+                "conflicts": _file_conflicts,
+            }
+
+        _bc_claim = await _board_change_for_session(
+            db, args["project_id"], args.get("session_id")
+        )
+        if _bc_claim:
+            item = dict(item)
+            item["board_change"] = _bc_claim
+
         return item
     if name == "add_subtask":
         return await db_module.add_subtask(
@@ -1391,6 +1455,14 @@ async def _dispatch_mcp_tool(
         if _merge_warning:
             item = dict(item)
             item["merge_warning"] = _merge_warning
+        # d01a74bf — surface board additions at the item boundary so a planner's
+        # mid-run injections get picked up before the next claim.
+        _bc_complete = await _board_change_for_session(
+            db, args["project_id"], args.get("session_id")
+        )
+        if _bc_complete:
+            item = dict(item)
+            item["board_change"] = _bc_complete
         # Notify only when the sprint is fully complete.
         active_statuses = {"pending", "todo", "in_progress"}
         remaining_items = await db_module.get_sprint_items(db, args["project_id"])

@@ -18,11 +18,16 @@ for "what has been decided, claimed, and shipped."
 - **`claim_file(session_id, file_path)`** before editing shared files when parallel
   sessions are active. **`release_file(session_id, file_path)`** when done.
   Use **`idle_until_session_done(watching_session_id)`** to wait before taking
-  over a file another session holds. Locks auto-expire after 2 hours.
-- **After completing each sprint item**, call `get_sprint_items(status='pending')`
-  to check for newly added items before moving to the next one. Sessions that only
-  check pending items once at start miss anything added while running — re-checking
-  at each item boundary picks up mid-run additions automatically.
+  over a file another session holds. Locks auto-expire after 2 hours. For a big
+  shared file, claim a single symbol instead so another session can edit a
+  different one: pass **`symbol`** (e.g. `"AuthRouter"` or `"AuthRouter.login"`)
+  **and `content`** (the file's full source) — Meridian parses it and blocks only
+  on an overlapping line range, telling you which symbols are still safe.
+- **After completing each sprint item**, call `get_sprint_progress(project_id,
+  session_id)` before claiming the next one. Its `board_change` field reports any
+  items a planner injected since this session started (also echoed on
+  `complete_sprint_item`/`claim_sprint_item`), so single-terminal runs pick up
+  mid-run additions at the item boundary without interrupting the current task.
 - **`update_md_section`** proposes a replacement for an anchored CLAUDE.md/AGENTS.md
   section. Autonomous executor sessions leave it gated behind a dashboard HITL.
   Human planning sessions (claude.ai) may pass **`force=true`** to skip the HITL and

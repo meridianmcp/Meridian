@@ -10460,3 +10460,85 @@ async def test_symbol_hotspots(db):
     assert any(h["symbol_name"] == "AuthRouter" and h["session_count"] >= 3 for h in hotspots)
     # Raising the threshold above the observed count yields nothing.
     assert await db_module.get_symbol_hotspots(db, min_sessions=99) == []
+
+
+# ---------------------------------------------------------------------------
+# Live queue orchestration (d01a74bf)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_get_sprint_progress_board_change(db):
+    """get_sprint_progress with session_id reports items added after start."""
+    import meridian.server as srv
+
+    p = await db_module.create_project(db, "lq-progress")
+    s = await db_module.register_session(db, p["id"], "exec")
+    # Back-date the session so a freshly-added item is unambiguously newer.
+    await db.execute(
+        "UPDATE sessions SET created_at = '2020-01-01 00:00:00' WHERE id = ?", (s["id"],)
+    )
+    await db.commit()
+    await db_module.add_sprint_item(db, p["id"], "v1", "injected mid-run")
+
+    res = await srv._dispatch_mcp_tool(
+        "get_sprint_progress", {"project_id": p["id"], "session_id": s["id"]}, db, "/tmp"
+    )
+    assert res["board_change"]["new_items_since_session_start"] >= 1
+
+    # Without session_id there's no board_change field.
+    res2 = await srv._dispatch_mcp_tool(
+        "get_sprint_progress", {"project_id": p["id"]}, db, "/tmp"
+    )
+    assert "board_change" not in res2
+
+
+@pytest.mark.asyncio
+async def test_complete_sprint_item_reports_board_change(db):
+    """complete_sprint_item surfaces items injected since the session started."""
+    import meridian.server as srv
+
+    p = await db_module.create_project(db, "lq-complete")
+    s = await db_module.register_session(db, p["id"], "exec")
+    await db.execute(
+        "UPDATE sessions SET created_at = '2020-01-01 00:00:00' WHERE id = ?", (s["id"],)
+    )
+    await db.commit()
+    item = await db_module.add_sprint_item(db, p["id"], "v1", "the item")
+    await db_module.add_sprint_item(db, p["id"], "v1", "injected later")
+
+    res = await srv._dispatch_mcp_tool(
+        "complete_sprint_item",
+        {"project_id": p["id"], "item_id": item["id"], "session_id": s["id"]},
+        db, "/tmp",
+    )
+    assert res["status"] == "done"
+    assert res["board_change"]["new_items_since_session_start"] >= 1
+
+
+@pytest.mark.asyncio
+async def test_claim_sprint_item_soft_file_overlap_warning(db):
+    """In worktree mode, claim returns a non-blocking file_overlap_warning."""
+    import json
+    import meridian.server as srv
+
+    p = await db_module.create_project(db, "lq-overlap")
+    # auto_worktrees is on by default → hard CONFLICT is skipped, soft warning kept.
+    item = await db_module.add_sprint_item(db, p["id"], "v1", "edit server")
+    await db.execute(
+        "UPDATE sprint_items SET touches_files = ? WHERE id = ?",
+        (json.dumps(["meridian/server.py"]), item["id"]),
+    )
+    await db.commit()
+    other = await db_module.register_session(db, p["id"], "other-live")
+    await db_module.claim_file(db, "meridian/server.py", other["id"])
+
+    res = await srv._dispatch_mcp_tool(
+        "claim_sprint_item",
+        {"project_id": p["id"], "item_id": item["id"], "session_id": "claimer"},
+        db, "/tmp",
+    )
+    # Claim still succeeds (worktree isolates) but warns about the overlap.
+    assert res.get("status") == "in_progress"
+    assert res.get("worktree_suggested") is True
+    assert "meridian/server.py" in res["file_overlap_warning"]["message"]

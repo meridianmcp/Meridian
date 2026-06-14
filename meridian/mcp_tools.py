@@ -341,9 +341,12 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "Read-only: Return summary of sprint items by status (pending/in_progress/done/failed) "
         "optionally filtered by version or item_group. Returns total, done, in_progress, pending, "
         "failed, percent_complete, and item list. Useful for planning sessions to see how far "
-        "through the sprint we are without listing all items.",
+        "through the sprint we are without listing all items. Pass session_id to also get a "
+        "board_change field reporting items added since that session started (live-queue signal "
+        "— call this between sprint items to pick up mid-run injections).",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"},
+         "session_id": {"type": "string", "description": "Optional: include board_change (items added since this session started)."},
          "version": {"type": "string", "description": "Filter to a specific sprint version bucket."},
          "item_group": {"type": "string", "description": "Filter to a specific item group."}},
          "required": ["project_id"]}},
@@ -379,11 +382,14 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "group": {"type": "string", "description": "Objective name to group the item under (item_group); empty string clears it."}},
          "required": ["project_id", "item_id"]}},
     {"name": "complete_sprint_item", "description":
-        "Mark a sprint item done. Pass task_id to link the task that shipped it.",
+        "Mark a sprint item done. Pass task_id to link the task that shipped it. "
+        "Pass session_id to get a board_change field (items injected mid-run) and an "
+        "active-worktree merge reminder in the response.",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"},
          "item_id": {"type": "string"},
-         "task_id": {"type": "string"}},
+         "task_id": {"type": "string"},
+         "session_id": {"type": "string", "description": "Optional: include board_change + worktree merge reminder."}},
          "required": ["project_id", "item_id"]}},
     {"name": "get_sprint_items", "description":
         "Read-only: List sprint items for a project. Optional status filter "
