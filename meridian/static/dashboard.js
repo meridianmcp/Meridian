@@ -6523,6 +6523,12 @@ async function loadHitlTab(projectId) {
 
         const ctxHtml = r.context ? `<div style="margin-top:6px;color:var(--muted);font-size:11px;font-style:italic">${escapeHtml(r.context.slice(0, 200))}</div>` : '';
 
+        // cd134cf1 — selectable answer options + a highlighted recommended default.
+        let optPayload = null;
+        try { optPayload = r.payload ? JSON.parse(r.payload) : null; } catch (e) { optPayload = null; }
+        const hitlOpts = (optPayload && Array.isArray(optPayload.options)) ? optPayload.options : [];
+        const hitlRec = (optPayload && typeof optPayload.recommended === 'string') ? optPayload.recommended : null;
+
         let actionBtns = '';
 
         if (st === 'pending' && isMd) {
@@ -6537,19 +6543,28 @@ async function loadHitlTab(projectId) {
 
           </div>`;
 
-        } else if (st === 'pending' && r.kind === 'hook_cwd_mismatch') {
+        } else if (st === 'pending' && hitlOpts.length) {
 
-          let optPl = null;
-          try { optPl = r.payload ? JSON.parse(r.payload) : null; } catch(e) { optPl = null; }
-          const opts = (optPl && Array.isArray(optPl.options)) ? optPl.options : [];
-          const optBtns = opts.map((o, i) =>
-            `<button class="secondary hitl-opt-btn" data-hitl-id="${escapeHtml(r.id)}" data-answer="${escapeHtml(o)}" style="padding:3px 10px;font-size:10px;text-align:left">${i+1}. ${escapeHtml(o)}</button>`
-          ).join('\n');
+          const optBtns = hitlOpts.map((o, i) => {
+            const isRec = hitlRec !== null && String(o) === hitlRec;
+            const recStyle = isRec
+              ? 'border:1px solid var(--accent);background:var(--accent)1a;font-weight:600'
+              : '';
+            const recBadge = isRec
+              ? ' <span style="font-size:8px;color:var(--accent);font-weight:700;text-transform:uppercase;letter-spacing:.04em">(recommended)</span>'
+              : '';
+            return `<button class="secondary hitl-opt-btn" data-hitl-id="${escapeHtml(r.id)}" data-answer="${escapeHtml(o)}"${isRec ? ' data-recommended="1" autofocus' : ''} style="padding:3px 10px;font-size:10px;text-align:left;${recStyle}">${i+1}. ${escapeHtml(o)}${recBadge}</button>`;
+          }).join('\n');
+          const kbHint = hitlOpts.length
+            ? `<div style="font-size:9px;color:var(--muted);margin-top:2px">Press <b>1–${Math.min(9, hitlOpts.length)}</b> to choose${hitlRec !== null ? ', <b>Enter</b> for the recommended option' : ''}.</div>`
+            : '';
           actionBtns = `
 
-          <div style="display:flex;flex-direction:column;gap:4px;margin-top:8px">
+          <div class="hitl-opts" data-hitl-id="${escapeHtml(r.id)}" tabindex="0" style="display:flex;flex-direction:column;gap:4px;margin-top:8px;outline:none">
 
             ${optBtns}
+
+            ${kbHint}
 
             <button class="secondary hitl-dismiss-btn" data-hitl-id="${escapeHtml(r.id)}" style="padding:3px 10px;font-size:10px;margin-top:2px;align-self:flex-start">Dismiss</button>
 
@@ -6656,6 +6671,35 @@ async function loadHitlTab(projectId) {
           } catch (e) { toast('failed: ' + e.message, true); }
 
         };
+
+      });
+
+      // cd134cf1 — keyboard: digits 1-9 pick an option, Enter picks recommended.
+      body.querySelectorAll('.hitl-opts').forEach(box => {
+
+        box.addEventListener('keydown', (e) => {
+
+          const btns = Array.from(box.querySelectorAll('.hitl-opt-btn'));
+
+          if (!btns.length) return;
+
+          if (e.key === 'Enter') {
+
+            const rec = box.querySelector('.hitl-opt-btn[data-recommended="1"]');
+
+            const target = rec || (document.activeElement && document.activeElement.classList.contains('hitl-opt-btn') ? document.activeElement : null);
+
+            if (target) { e.preventDefault(); target.click(); }
+
+          } else if (/^[1-9]$/.test(e.key)) {
+
+            const idx = parseInt(e.key, 10) - 1;
+
+            if (idx < btns.length) { e.preventDefault(); btns[idx].click(); }
+
+          }
+
+        });
 
       });
 

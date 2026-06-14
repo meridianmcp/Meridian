@@ -171,7 +171,10 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "assigned_to routes to a specific human_id (null = broadcast). "
         "kind='correction' files a non-blocking mid-run correction: never "
         "auto-answered, never blocks — an unattended executor picks it up at the "
-        "next sprint-item boundary, applies it, and continues.",
+        "next sprint-item boundary, applies it, and continues. Pass `options` "
+        "(answer choices, rendered as buttons) and `recommended` (an option "
+        "string or 0-based index) to flag the safe default — the dashboard "
+        "highlights it and Enter submits it, and an auto-answer picks it.",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"},
          "question": {"type": "string"},
@@ -179,7 +182,9 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "context": {"type": "string"},
          "urgency": {"type": "string", "enum": ["normal", "high", "blocking"]},
          "kind": {"type": "string", "enum": ["question", "correction"], "description": "question (default, auto-answerable) or correction (non-blocking mid-run human correction)."},
-         "assigned_to": {"type": "string"}},
+         "assigned_to": {"type": "string"},
+         "options": {"type": "array", "items": {"type": "string"}, "description": "Answer choices rendered as selectable buttons in the dashboard."},
+         "recommended": {"description": "The safe-default option — an option string or a 0-based index into options. Highlighted in the dashboard; Enter submits it; auto-answer prefers it."}},
          "required": ["project_id", "question"]}},
     {"name": "get_hitl_request", "description":
         "Read-only: Poll a HITL request for the human's answer. Returns the row including "

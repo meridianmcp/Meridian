@@ -922,6 +922,9 @@ async def _dispatch_mcp_tool(
         _hitl_kind = args.get("kind", "question")
         if _hitl_kind not in ("question", "correction"):
             _hitl_kind = "question"
+        _hitl_options = args.get("options")
+        if _hitl_options is not None and not isinstance(_hitl_options, list):
+            _hitl_options = None
         result = await db_module.request_hitl(
             db, args["project_id"], args["question"],
             session_id=args.get("session_id"),
@@ -929,6 +932,8 @@ async def _dispatch_mcp_tool(
             urgency=args.get("urgency", "normal"),
             assigned_to=args.get("assigned_to"),
             kind=_hitl_kind,
+            options=_hitl_options,
+            recommended=args.get("recommended"),
         )
         # v3.4 — auto-answered requests need no human; skip the notification.
         if result.get("answered_by") != "auto":

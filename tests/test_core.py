@@ -6192,6 +6192,59 @@ async def test_request_hitl_auto_answer_picks_first_option(db):
 
 
 @pytest.mark.asyncio
+async def test_request_hitl_recommended_option_string(db):
+    """cd134cf1 — recommended option is stored in payload and preferred by auto-answer."""
+    import json as _json
+    p = await db_module.create_project(db, "hitl-rec-str")
+    await db_module.update_project_settings(db, p["id"], hitl_auto_answer=True)
+    h = await db_module.request_hitl(
+        db, p["id"], "Rate-limit strategy?",
+        options=["per-IP", "per-token"], recommended="per-token",
+    )
+    pl = _json.loads(h["payload"])
+    assert pl["options"] == ["per-IP", "per-token"]
+    assert pl["recommended"] == "per-token"
+    # Auto-answer prefers the recommended option, not options[0].
+    assert h["status"] == "answered"
+    assert h["answer"] == "per-token"
+
+
+@pytest.mark.asyncio
+async def test_request_hitl_recommended_option_by_index(db):
+    """cd134cf1 — recommended may be a 0-based index into options."""
+    import json as _json
+    p = await db_module.create_project(db, "hitl-rec-idx")
+    h = await db_module.request_hitl(
+        db, p["id"], "Pick one", options=["a", "b", "c"], recommended=2,
+    )
+    pl = _json.loads(h["payload"])
+    assert pl["recommended"] == "c"
+
+
+@pytest.mark.asyncio
+async def test_request_hitl_recommended_invalid_index_ignored(db):
+    """An out-of-range index produces no recommended key (not a crash)."""
+    import json as _json
+    p = await db_module.create_project(db, "hitl-rec-bad")
+    h = await db_module.request_hitl(
+        db, p["id"], "Pick one", options=["a", "b"], recommended=9,
+    )
+    pl = _json.loads(h["payload"])
+    assert pl["options"] == ["a", "b"]
+    assert "recommended" not in pl
+
+
+def test_resolve_recommended_option_unit():
+    from meridian.db import _resolve_recommended_option as rr
+    assert rr(["a", "b"], "b") == "b"
+    assert rr(["a", "b"], 0) == "a"
+    assert rr(["a", "b"], 5) is None
+    assert rr(["a", "b"], "z") is None      # not in options
+    assert rr(None, "free text") == "free text"  # free-text recommendation, no options
+    assert rr(["a"], True) is None          # bool rejected
+
+
+@pytest.mark.asyncio
 async def test_request_hitl_md_section_update_not_auto_answered(db):
     """v3.4 — md_section_update diff approvals stay human-gated even when
     auto-answer is on; auto-approving a file write would defeat the safeguard."""

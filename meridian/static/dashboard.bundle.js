@@ -8828,6 +8828,14 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
           const answerHtml = r.answer ? `<div style="margin-top:8px;padding:6px 8px;background:var(--surface-1);border-radius:3px;border-left:3px solid #22c55e;color:var(--text);font-size:11px"><b>Answer:</b> ${escapeHtml(r.answer)}</div>` : "";
           const applyErr = r.apply_error ? `<div style="margin-top:6px;color:#e05252;font-size:10px"><b>Not applied:</b> ${escapeHtml(r.apply_error)}</div>` : "";
           const ctxHtml = r.context ? `<div style="margin-top:6px;color:var(--muted);font-size:11px;font-style:italic">${escapeHtml(r.context.slice(0, 200))}</div>` : "";
+          let optPayload = null;
+          try {
+            optPayload = r.payload ? JSON.parse(r.payload) : null;
+          } catch (e) {
+            optPayload = null;
+          }
+          const hitlOpts = optPayload && Array.isArray(optPayload.options) ? optPayload.options : [];
+          const hitlRec = optPayload && typeof optPayload.recommended === "string" ? optPayload.recommended : null;
           let actionBtns = "";
           if (st === "pending" && isMd) {
             actionBtns = `
@@ -8839,22 +8847,21 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
             <button class="secondary hitl-reject-btn" data-hitl-id="${escapeHtml(r.id)}" style="padding:3px 10px;font-size:10px">Reject</button>
 
           </div>`;
-          } else if (st === "pending" && r.kind === "hook_cwd_mismatch") {
-            let optPl = null;
-            try {
-              optPl = r.payload ? JSON.parse(r.payload) : null;
-            } catch (e) {
-              optPl = null;
-            }
-            const opts = optPl && Array.isArray(optPl.options) ? optPl.options : [];
-            const optBtns = opts.map(
-              (o, i) => `<button class="secondary hitl-opt-btn" data-hitl-id="${escapeHtml(r.id)}" data-answer="${escapeHtml(o)}" style="padding:3px 10px;font-size:10px;text-align:left">${i + 1}. ${escapeHtml(o)}</button>`
-            ).join("\n");
+          } else if (st === "pending" && hitlOpts.length) {
+            const optBtns = hitlOpts.map((o, i) => {
+              const isRec = hitlRec !== null && String(o) === hitlRec;
+              const recStyle = isRec ? "border:1px solid var(--accent);background:var(--accent)1a;font-weight:600" : "";
+              const recBadge = isRec ? ' <span style="font-size:8px;color:var(--accent);font-weight:700;text-transform:uppercase;letter-spacing:.04em">(recommended)</span>' : "";
+              return `<button class="secondary hitl-opt-btn" data-hitl-id="${escapeHtml(r.id)}" data-answer="${escapeHtml(o)}"${isRec ? ' data-recommended="1" autofocus' : ""} style="padding:3px 10px;font-size:10px;text-align:left;${recStyle}">${i + 1}. ${escapeHtml(o)}${recBadge}</button>`;
+            }).join("\n");
+            const kbHint = hitlOpts.length ? `<div style="font-size:9px;color:var(--muted);margin-top:2px">Press <b>1\u2013${Math.min(9, hitlOpts.length)}</b> to choose${hitlRec !== null ? ", <b>Enter</b> for the recommended option" : ""}.</div>` : "";
             actionBtns = `
 
-          <div style="display:flex;flex-direction:column;gap:4px;margin-top:8px">
+          <div class="hitl-opts" data-hitl-id="${escapeHtml(r.id)}" tabindex="0" style="display:flex;flex-direction:column;gap:4px;margin-top:8px;outline:none">
 
             ${optBtns}
+
+            ${kbHint}
 
             <button class="secondary hitl-dismiss-btn" data-hitl-id="${escapeHtml(r.id)}" style="padding:3px 10px;font-size:10px;margin-top:2px;align-self:flex-start">Dismiss</button>
 
@@ -8934,6 +8941,26 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
               toast("failed: " + e.message, true);
             }
           };
+        });
+        body.querySelectorAll(".hitl-opts").forEach((box) => {
+          box.addEventListener("keydown", (e) => {
+            const btns = Array.from(box.querySelectorAll(".hitl-opt-btn"));
+            if (!btns.length) return;
+            if (e.key === "Enter") {
+              const rec = box.querySelector('.hitl-opt-btn[data-recommended="1"]');
+              const target = rec || (document.activeElement && document.activeElement.classList.contains("hitl-opt-btn") ? document.activeElement : null);
+              if (target) {
+                e.preventDefault();
+                target.click();
+              }
+            } else if (/^[1-9]$/.test(e.key)) {
+              const idx = parseInt(e.key, 10) - 1;
+              if (idx < btns.length) {
+                e.preventDefault();
+                btns[idx].click();
+              }
+            }
+          });
         });
         body.querySelectorAll(".hitl-dismiss-btn").forEach((btn) => {
           btn.onclick = async () => {

@@ -5106,6 +5106,8 @@ async def request_hitl(
     assigned_to: str | None = None,
     kind: str = "question",
     payload: str | None = None,
+    options: list[str] | None = None,
+    recommended: str | int | None = None,
 ) -> dict[str, Any]:
     """Create a HITL request. Returns the inserted row.
 
@@ -5113,11 +5115,32 @@ async def request_hitl(
     :func:`get_hitl_request` until ``status='answered'`` to receive
     the human's reply. Non-blocking requests still show up in the
     dashboard queue — callers can keep working and check later.
+
+    ``options`` renders selectable answer buttons in the dashboard. ``recommended``
+    (an option string, or a 0-based index into ``options``) flags the safe default:
+    the dashboard highlights it with a "(recommended)" badge + border and Enter
+    submits it, and an auto-answer picks it instead of the first option. Explicit
+    ``payload`` JSON, when given, is merged with the options/recommended fields.
     """
     if urgency not in _VALID_HITL_URGENCY:
         raise ValueError(
             f"urgency must be one of {sorted(_VALID_HITL_URGENCY)}; got {urgency!r}"
         )
+    # cd134cf1 — fold options + recommended into the payload JSON.
+    if options is not None or recommended is not None:
+        try:
+            _pl = json.loads(payload) if payload else {}
+            if not isinstance(_pl, dict):
+                _pl = {}
+        except (TypeError, ValueError):
+            _pl = {}
+        _opts = [str(o) for o in options] if options is not None else _pl.get("options")
+        if _opts is not None:
+            _pl["options"] = _opts
+        _rec = _resolve_recommended_option(_opts, recommended)
+        if _rec is not None:
+            _pl["recommended"] = _rec
+        payload = json.dumps(_pl)
     hid = _new_id()
     await db.execute(
         "INSERT INTO hitl_requests "
@@ -5191,15 +5214,39 @@ def _hitl_should_auto_answer(mode: int, kind: str, question: str) -> bool:
     return not any(k in q for k in _HITL_SECURITY_KEYWORDS)
 
 
+def _resolve_recommended_option(
+    options: list[str] | None, recommended: str | int | None
+) -> str | None:
+    """Resolve ``recommended`` (option string or 0-based index) to an option string.
+
+    Returns None when there's nothing valid to recommend. A bool is rejected
+    (``True``/``False`` are ints in Python but never a meaningful option index).
+    """
+    if recommended is None or isinstance(recommended, bool):
+        return None
+    if isinstance(recommended, int):
+        if options and 0 <= recommended < len(options):
+            return str(options[recommended])
+        return None
+    rec = str(recommended)
+    if options and rec in {str(o) for o in options}:
+        return rec
+    # A free-text recommendation with no options list is still meaningful.
+    return rec if not options else None
+
+
 def _auto_hitl_answer(payload: str | None) -> str:
-    """Derive the auto-answer string. v1 heuristic: if the payload carries a
-    non-empty ``options`` list, pick the first option; otherwise a generic ack."""
+    """Derive the auto-answer string. Prefer an explicit ``recommended`` option;
+    else the first of a non-empty ``options`` list; else a generic ack."""
     if payload:
         try:
             parsed = json.loads(payload)
         except (TypeError, ValueError):
             parsed = None
         if isinstance(parsed, dict):
+            rec = parsed.get("recommended")
+            if isinstance(rec, str) and rec:
+                return rec
             options = parsed.get("options")
             if isinstance(options, list) and options:
                 return str(options[0])

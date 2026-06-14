@@ -283,6 +283,8 @@ Surface a question to the human queue. `urgency='blocking'` pauses the session u
 | `urgency` | string | optional |  |
 | `kind` | string | optional | question (default, auto-answerable) or correction (non-blocking mid-run human correction). |
 | `assigned_to` | string | optional |  |
+| `options` | array | optional | Answer choices rendered as selectable buttons in the dashboard. |
+| `recommended` | string | optional | The safe-default option — an option string or a 0-based index into options. Highlighted in the dashboard; Enter submits it; auto-answer prefers it. |
 
 **Example:**
 ```
