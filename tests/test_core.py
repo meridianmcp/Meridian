@@ -8180,6 +8180,64 @@ def test_project_notes_http_crud(client):
     assert r.status_code == 404
 
 
+def test_project_note_manual_title_returns_lint_hint(client):
+    """e5592013 — POST /notes with 'MANUAL' in the title returns a non-blocking
+    `lint` hint suggesting add_sprint_item; ordinary notes do not."""
+    project = client.post("/projects", json={"name": "e5592013-manual-lint"}).json()
+    # "MANUAL" in title → lint hint present, note still created (201).
+    r = client.post(
+        f"/projects/{project['id']}/notes",
+        json={"title": "MANUAL: rotate prod token", "body": "Adam to do this"},
+    )
+    assert r.status_code == 201
+    payload = r.json()
+    assert "lint" in payload
+    assert "add_sprint_item" in payload["lint"]
+    # Ordinary note → no lint field.
+    r2 = client.post(
+        f"/projects/{project['id']}/notes",
+        json={"title": "Gotcha: psycopg3", "body": "use %%"},
+    )
+    assert r2.status_code == 201
+    assert "lint" not in r2.json()
+
+
+def test_project_note_kind_persists_and_coerces(client):
+    """9d44998b — note_kind (wiki|insight|reference) round-trips; unknown→null."""
+    project = client.post("/projects", json={"name": "9d44998b-kind"}).json()
+    pid = project["id"]
+    r = client.post(f"/projects/{pid}/notes",
+                    json={"title": "Strategy", "body": "big brain", "kind": "insight"})
+    assert r.status_code == 201
+    assert r.json().get("note_kind") == "insight"
+    # Unknown kind is coerced to NULL so the column stays a closed vocabulary.
+    r = client.post(f"/projects/{pid}/notes",
+                    json={"title": "Gotcha", "body": "use %%", "kind": "bogus"})
+    assert r.status_code == 201
+    assert r.json().get("note_kind") is None
+    notes = {n["title"]: n.get("note_kind") for n in client.get(f"/projects/{pid}/notes").json()}
+    assert notes["Strategy"] == "insight"
+    assert notes["Gotcha"] is None
+
+
+async def test_auto_capture_writes_session_note_not_project_note():
+    """9d44998b — auto_capture_session writes the bucketed summary to the
+    ephemeral session scratch-pad, NOT a permanent project note."""
+    import meridian.db as dbm
+    conn = await dbm.init_db(":memory:")
+    project = await dbm.create_project(conn, "auto-cap")
+    pid = project["id"]
+    sess = await dbm.register_session(conn, pid, "s1")
+    sid = sess["id"]
+    await dbm.log_task(conn, sid, pid, "fix the broken thing", status="done")
+    await dbm.log_task(conn, sid, pid, "add a new feature", status="done")
+    await dbm.auto_capture_session(conn, pid, sid)
+    project_titles = [n["title"] for n in await dbm.get_project_notes(conn, pid)]
+    session_titles = [n["title"] for n in await dbm.get_session_notes(conn, sid)]
+    assert not any("Session summary" in t for t in project_titles), project_titles
+    assert any("Session summary" in t for t in session_titles), session_titles
+
+
 # ---------------------------------------------------------------------------
 # v0.9 — Magic link tokens
 # ---------------------------------------------------------------------------
@@ -9603,7 +9661,7 @@ def test_github_status_graceful_on_db_error(client, monkeypatch):
     try/except returns a safe JSON response instead of propagating as 500.
     """
     import meridian.db as _db_mod
-    from meridian import server as server_mod
+    from meridian.routes import github as github_mod
 
     p = client.post("/projects", json={"name": "gh-status-err"}).json()
     project_id = p["id"]
@@ -9616,9 +9674,9 @@ def test_github_status_graceful_on_db_error(client, monkeypatch):
     async def _boom(*args, **kwargs):
         raise RuntimeError("simulated DB failure")
 
-    monkeypatch.setattr(server_mod, "_get_tenant_from_request", _mock_tenant)
-    import meridian.routes.github as _github_mod
-    monkeypatch.setattr(_github_mod, "_get_tenant_from_request", _mock_tenant)
+    # github_status lives in routes/github.py and binds _get_tenant_from_request
+    # from ._deps at import — patch it where the route looks it up.
+    monkeypatch.setattr(github_mod, "_get_tenant_from_request", _mock_tenant)
     monkeypatch.setattr(_db_mod, "get_tenant_by_id", _boom)
 
     r = client.get(f"/projects/{project_id}/github/status")

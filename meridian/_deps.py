@@ -1,4 +1,4 @@
-﻿"""Shared FastAPI dependencies â€” imported by both server.py and routes/*.
+"""Shared FastAPI dependencies â€” imported by both server.py and routes/*.
 
 Extracted here to break circular imports: server.py can include routers from
 routes/, and routes/*.py can import helpers from here, without either
@@ -309,6 +309,15 @@ def _is_demo_request(request: Request) -> bool:
 # Input size validation
 # ---------------------------------------------------------------------------
 
+# e5592013 — non-blocking lint hint surfaced when a note titled "MANUAL …" is
+# created: those are almost always human tasks that belong on the sprint board.
+_MANUAL_NOTE_LINT = (
+    "Heads-up: notes with 'MANUAL' in the title are usually human tasks — "
+    "consider add_sprint_item(human_id='adam', milestone_type='human') so it "
+    "lands on the sprint board instead of the notes wiki."
+)
+
+
 def validate_input_size(value: str | None, field_name: str, max_chars: int) -> None:
     """Raise HTTPException(400) if value exceeds max_chars. Never truncates silently."""
     if len(value or "") > max_chars:
@@ -319,18 +328,25 @@ def validate_input_size(value: str | None, field_name: str, max_chars: int) -> N
 
 
 # ---------------------------------------------------------------------------
-# Rate limiter (optional slowapi) — moved here so routes/ can import it
+# Rate limiter (slowapi, in-memory, no Redis required)
+#
+# The Limiter instance lives here so extracted routers can apply ``_rate_limit``
+# at import time without importing from server.py (circular). server.py owns the
+# one-time registration: ``app.state.limiter`` + the RateLimitExceeded handler.
 # ---------------------------------------------------------------------------
 try:
     from slowapi import Limiter
-    from slowapi.util import get_remote_address as _get_remote_address
-    _limiter = Limiter(key_func=_get_remote_address)
-except ImportError:
+    from slowapi.util import get_remote_address
+
+    _limiter = Limiter(key_func=get_remote_address)
+except ImportError:  # pragma: no cover - slowapi always installed in prod
     _limiter = None  # type: ignore[assignment]
+
+_RATE_LIMIT = "100/minute"
 
 
 def _rate_limit(rate: str):
-    """Return a no-op or slowapi limiter decorator."""
+    """Return a decorator that applies *rate* via slowapi, or a no-op when slowapi is absent."""
     def decorator(func):
         if _limiter is None:
             return func

@@ -1,4 +1,4 @@
-﻿"""FastAPI HTTP server and MCP stdio server for Meridian.
+"""FastAPI HTTP server and MCP stdio server for Meridian.
 
 This module exposes two surfaces backed by the same async SQLite database:
 
@@ -44,6 +44,7 @@ from ._deps import (
     validate_input_size,
     _limiter,
     _rate_limit,
+    _RATE_LIMIT,
     _get_authenticated_tenant,
     _mask_api_token_hash,
     _md_ts,
@@ -52,6 +53,30 @@ from ._deps import (
     _render_workspace_block,
     _render_context_block,
 )
+
+# The slowapi Limiter is a process-singleton in ._deps so extracted routers can
+# apply _rate_limit at import time. The test suite reloads THIS module to get a
+# "fresh" limiter; since ._deps (and the route modules) are NOT reloaded, a naive
+# reload would re-run server.py's own @_rate_limit decorators and double-register
+# their limits (slowapi .extend()s per key) → double counting. So drop only the
+# registrations owned by THIS module before its decorators re-run, and reset the
+# shared counters. Router-owned registrations (meridian.routes.*) are added once
+# and must survive — clearing them would silently disable their rate limits,
+# because route modules don't re-decorate on a server.py reload.
+if _limiter is not None:
+    _own = f"{__name__}."  # "meridian.server."
+    for _store in (
+        _limiter._route_limits,
+        _limiter._dynamic_route_limits,
+        _limiter._Limiter__marked_for_limiting,  # type: ignore[attr-defined]
+    ):
+        for _key in [k for k in _store if k.startswith(_own)]:
+            del _store[_key]
+    _limiter._application_limits.clear()
+    try:
+        _limiter.reset()
+    except Exception:  # pragma: no cover - storage may not support reset
+        pass
 
 
 def _load_meridian_md() -> str:
@@ -567,13 +592,6 @@ from .routes.github import router as _github_router          # noqa: E402
 from .routes.billing import router as _billing_router        # noqa: E402
 from .routes.hooks import router as _hooks_router            # noqa: E402
 from .routes.projects import router as _projects_router      # noqa: E402
-from .mcp.http_handler import router as _mcp_http_router     # noqa: E402
-from .mcp.http_handler import (                              # noqa: E402
-    _hydrate_oauth_cache,
-    _oauth_token_hash,
-    _get_oauth_token_from_db,
-)
-from .mcp import http_handler as _mcp_http_handler           # noqa: E402
 
 app.include_router(_notes_router)
 app.include_router(_hitl_router)
@@ -591,7 +609,6 @@ app.include_router(_github_router)
 app.include_router(_billing_router)
 app.include_router(_hooks_router)
 app.include_router(_projects_router)
-app.include_router(_mcp_http_router)
 
 # ---------------------------------------------------------------------------
 # Password gate middleware
@@ -650,7 +667,7 @@ async def site_password_gate(request: Request, call_next):
                 return await call_next(request)
             # Also check OAuth tokens (ChatGPT and other OAuth clients use these)
             oauth_hash = _oauth_token_hash(auth_header[len("Bearer "):].strip())
-            if _mcp_http_handler._oa_tokens.get(oauth_hash) or await _get_oauth_token_from_db(auth_db, oauth_hash):
+            if _oa_tokens.get(oauth_hash) or await _get_oauth_token_from_db(auth_db, oauth_hash):
                 return await call_next(request)
     from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
     from fastapi.responses import HTMLResponse
@@ -692,7 +709,6 @@ try:
         app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)  # type: ignore[arg-type]
 except ImportError:
     pass
-_RATE_LIMIT = "100/minute"
 
 
 # G4.15 — Safety-limit exception → 429
@@ -1272,21 +1288,11 @@ async def install_mcp_page(request: Request) -> HTMLResponse:
     return resp
 
 
-# v0.9 — Magic-link request (rate-limited — must stay in server.py; slowapi
-# does not wire @_rate_limit correctly for routes included via APIRouter)
-@app.post("/auth/magic")
-@_rate_limit("5/minute")
-async def auth_magic_request(request: Request):
-    """v0.9 — request a magic-link email. Rate-limited.
+# ---------------------------------------------------------------------------
+# v2.0 — Google OAuth routes
+# ---------------------------------------------------------------------------
 
-    Body: ``{"email": "user@example.com"}``. Sends a single-use signed
-    link via Resend. Idempotent within the 24-hour token window — if a
-    valid unused token exists for this email, returns success without
-    sending a duplicate email.
-    """
-    from .hosted import auth_magic_request as _impl
-    return await _impl(request)
-
+# /auth/* OAuth + magic-link routes moved to meridian/routes/auth.py
 
 @app.get("/config")
 async def server_config(request: Request) -> dict[str, Any]:
@@ -1504,7 +1510,6 @@ async def me_workspaces(request: Request) -> list[dict[str, Any]]:
 
 
 # Project CRUD + project-level routes → meridian/routes/projects.py
-
 
 async def _send_email_notification(to_email: str, subject: str, body_text: str) -> None:
     """Send a notification email via Resend.
@@ -2045,6 +2050,21 @@ _EDITABLE_FILES: list[str] = ["AGENTS.md", "CLAUDE.md"]
 
 # File-editing and context-block routes → meridian/routes/files.py
 
+
+async def append_devlog_entry(
+    project_id: str, body: dict, request: Request
+) -> dict[str, object]:
+    """Append a user-written line to DEVLOG.md via the devlog anchor."""
+    project = await db_module.get_project(await _db(request), project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="project not found")
+    text = (body.get("text") or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="text is required")
+    line = f"- {_md_ts()} {text}"
+    await md_anchors_module.apply_append("DEVLOG.md", "devlog", line)
+    return {"ok": True}
+
 # Decisions routes → meridian/routes/decisions.py
 # ---------------------------------------------------------------------------
 # v2.4 — HITL (human-in-the-loop) queue
@@ -2056,7 +2076,6 @@ _EDITABLE_FILES: list[str] = ["AGENTS.md", "CLAUDE.md"]
 
 
 # team/summary, events, webhook-token, search, runs → meridian/routes/projects.py
-
 
 # ---------------------------------------------------------------------------
 # CLAUDE.md auto-update helper
@@ -2685,7 +2704,6 @@ async def workspace_remove_member(request: Request, member_id: str) -> None:
 
 
 # workspace/notes + workspace/decisions + workspace/settings → meridian/routes/workspace.py
-
 def _is_demo_request(request: Request) -> bool:
     """Return True when the request is in demo mode (env flag or cookie)."""
     env_demo = os.environ.get("MERIDIAN_DEMO", "").lower() in ("1", "true", "yes")
@@ -2693,7 +2711,6 @@ def _is_demo_request(request: Request) -> bool:
     return env_demo or cookie_demo
 
 
-# Export, account management, settings, and GitHub integration routes extracted
 # to routes/export.py and routes/github.py respectively.
 # NOTE: export_my_data stays in server.py because slowapi @_rate_limit does not
 # wire correctly for routes included via APIRouter (same constraint as magic-link).
@@ -2726,8 +2743,248 @@ async def export_my_data(request: Request) -> Response:
     )
 
 
-# /mcp/quickstart and /mcp/tools-doc → meridian/mcp/http_handler.py
 
+@app.get("/settings/mcp-config")
+async def get_mcp_config(request: Request) -> dict[str, Any]:
+    """Return project list + base URL for building the MCP client config snippet."""
+    if not _hosted_mode():
+        raise HTTPException(status_code=404)
+    from .hosted import get_current_tenant
+    tenant = await get_current_tenant(request)
+    projects = await db_module.list_projects(await _db(request))
+    return {
+        "projects": [{"id": p["id"], "name": p["name"]} for p in projects],
+        "base_url": os.environ.get("MERIDIAN_SERVER_URL", "https://usemeridian.us"),
+        "tenant_id": tenant["id"],
+    }
+
+
+@app.get("/settings/usage")
+async def get_usage_settings(request: Request) -> dict[str, Any]:
+    """Return current compute + storage usage and overage caps for the tenant."""
+    if not _hosted_mode():
+        raise HTTPException(status_code=404)
+    from .hosted import get_current_tenant, PLAN_LIMITS, COMPUTE_OVERAGE_RATE, STORAGE_OVERAGE_RATE
+    tenant = await get_current_tenant(request)
+    plan = tenant.get("plan") or "standard"
+    limits = PLAN_LIMITS.get(plan, PLAN_LIMITS["free"])
+    unlimited = math.isinf(limits["cu_hours"])
+    # float('inf') is not valid JSON for the browser's JSON.parse — emit null + a flag.
+    cu_limit = None if math.isinf(limits["cu_hours"]) else limits["cu_hours"]
+    cu_grace = None if unlimited else limits["cu_hours"] + limits["grace_cu_hours"]
+    gb_limit = None if math.isinf(limits["storage_gb"]) else limits["storage_gb"]
+    return {
+        "plan": plan,
+        "unlimited": unlimited,
+        "compute": {
+            "used": float(tenant.get("compute_cu_hours_used") or 0),
+            "limit": cu_limit,
+            "grace": cu_grace,
+            "cap_usd": float(tenant.get("compute_overage_cap_usd") or 0),
+            "throttled": bool(tenant.get("compute_throttled_at")),
+            "rate": COMPUTE_OVERAGE_RATE,
+            "unlimited": unlimited,
+        },
+        "storage": {
+            "used_gb": float(tenant.get("storage_gb_used") or 0),
+            "limit_gb": gb_limit,
+            "cap_usd": float(tenant.get("storage_overage_cap_usd") or 0),
+            "rate": STORAGE_OVERAGE_RATE,
+            "unlimited": unlimited,
+        },
+    }
+
+
+@app.patch("/settings/usage")
+async def update_usage_caps(request: Request) -> dict[str, Any]:
+    """Update compute and storage overage spending caps for the tenant."""
+    if not _hosted_mode():
+        raise HTTPException(status_code=404)
+    from .hosted import get_current_tenant
+    tenant = await get_current_tenant(request)
+    body = await request.json()
+    compute_cap = float(body.get("compute_cap") or 0)
+    storage_cap = float(body.get("storage_cap") or 0)
+    await db_module.update_tenant(
+        request.app.state.db, tenant["id"],
+        compute_overage_cap_usd=compute_cap,
+        storage_overage_cap_usd=storage_cap,
+    )
+    return {"status": "ok", "compute_cap": compute_cap, "storage_cap": storage_cap}
+
+
+# ---------------------------------------------------------------------------
+# GitHub integration endpoints (hosted-tier only)
+# ---------------------------------------------------------------------------
+
+# GitHub integration routes moved to meridian/routes/github.py
+
+@app.get("/mcp/quickstart", response_class=PlainTextResponse)
+async def mcp_quickstart() -> str:
+    """One-page MCP quick reference — the 5 tools you use 90% of the time.
+
+    Returns plain text cheat sheet, suitable for pasting into a new chat session
+    or displaying in the dashboard Settings tab.
+    """
+    tool_count = len(_MCP_TOOLS_LIST)
+    return f"""\
+# Meridian MCP — Quick Reference
+
+The 5 tools you use 90% of the time:
+
+| Tool | One-liner | Example |
+|------|-----------|---------|
+| start_session | Register session, get full project context | start_session(project_id="abc-123", session_name="feature-x") |
+| log_task | Record completed work | log_task(session_id="sid", project_id="abc-123", description="Fixed OAuth redirect") |
+| checkpoint | Snapshot: auto-capture + delta handoff + next /goal | checkpoint(session_id="sid", project_id="abc-123") |
+| pin_decision | Add to live constitution | pin_decision(project_id="abc-123", title="Use psycopg3", body="asyncpg has DLL issues on Windows", category="TECHNICAL") |
+| request_hitl | Surface blocking question to human | request_hitl(project_id="abc-123", question="Rate-limit per IP or per token?", urgency="blocking") |
+
+## Session lifecycle
+
+  list_projects()        ← first, if you don't know the project_id
+  start_session()       ← always first
+  log_task()            ← after any meaningful work
+  pin_decision()        ← for architectural choices
+  request_hitl()        ← when you need a human call
+  checkpoint()          ← before ending / before context fills
+
+## Auto-hooks (recommended)
+
+Wire Claude Code / Codex to call these automatically:
+
+  Mac/Linux:  curl -fsSL https://usemeridian.us/hooks.sh | bash
+  Windows:    irm https://usemeridian.us/hooks.ps1 | iex
+
+## Full tool reference
+
+  GET /mcp/tools-doc     — complete markdown reference ({tool_count} tools)
+  https://docs.usemeridian.us
+"""
+
+
+@app.get("/mcp/tools-doc", response_class=PlainTextResponse)
+async def mcp_tools_doc() -> str:
+    """Generate organized markdown MCP tool reference."""
+    tool_map = {t["name"]: t for t in _MCP_TOOLS_LIST}
+
+    def _render_tool(name: str, override_desc: str | None = None) -> list[str]:
+        tool = tool_map.get(name)
+        if not tool:
+            return []
+        out = [f"\n### `{name}`\n"]
+        desc = override_desc or tool.get("description", "")
+        out.append(f"{desc}\n")
+        props = (tool.get("inputSchema") or {}).get("properties") or {}
+        required = set((tool.get("inputSchema") or {}).get("required") or [])
+        if props:
+            out.append("\n| Parameter | Type | Required | Description |")
+            out.append("|-----------|------|----------|-------------|")
+            for k, v in props.items():
+                req = "required" if k in required else "optional"
+                desc_col = (v.get("description") or "").replace("|", "\\|")
+                out.append(f"| `{k}` | {v.get('type', 'string')} | {req} | {desc_col} |")
+        example = _TOOL_EXAMPLES.get(name)
+        if example:
+            out.append(f"\n**Example:**\n```\n{example}\n```")
+        out.append("")
+        out.append("---")
+        out.append("")
+        return out
+
+    n = len(_MCP_TOOLS_LIST)
+    lines: list[str] = [
+        "# MCP Tool Reference\n",
+        "\n",
+        f"Meridian exposes **{n} tools** over MCP.\n",
+        "\n",
+        "They fall into two usage patterns:\n",
+        "\n",
+        "- **Planner sessions** (claude.ai, planning work) - `start_session` · `pin_decision` · `update_decision` · `add_note` · `get_context_block` · `generate_handoff`\n",
+        "- **Executor sessions** (Claude Code, Cursor, automated workers) - `start_session` · `log_task` · `request_hitl` · `get_session_brief` · `generate_handoff`\n",
+        "\n",
+        "---\n",
+        "\n",
+        "## Quick Reference - 5 tools you use 90% of the time\n",
+        "\n",
+        "| Tool | One-liner | Example call |\n",
+        "|------|-----------|-------------|\n",
+        "| `start_session` | Register session, get full project context | `start_session(project_id=\"abc-123\", session_name=\"feature-x\", human_id=\"alice\")` |\n",
+        "| `log_task` | Record completed work to the shared task log | `log_task(session_id=\"sid\", project_id=\"abc-123\", description=\"Wired OAuth redirect\")` |\n",
+        "| `checkpoint` | Snapshot progress: auto-capture + delta handoff + next /goal | `checkpoint(session_id=\"sid\", project_id=\"abc-123\")` |\n",
+        "| `pin_decision` | Add an architectural decision to the live constitution | `pin_decision(project_id=\"abc-123\", title=\"Use psycopg3\", body=\"asyncpg has DLL issues on Windows\", category=\"TECHNICAL\")` |\n",
+        "| `request_hitl` | Surface a blocking question to the human queue | `request_hitl(project_id=\"abc-123\", question=\"Should we rate-limit per IP or per token?\", urgency=\"blocking\")` |\n",
+        "\n> **Tip:** Use `checkpoint()` instead of `generate_handoff()` when ending a session — it also runs `auto_capture` and returns the next `/goal` string.\n",
+        "\n---\n",
+        "## Starting a session\n",
+    ]
+    lines += _render_tool("start_session",
+        "Register a session and get the full project context (goal, sprint, recent tasks, decisions) in one call. "
+        "**Use this instead of `register_session`.**")
+    lines += _render_tool("get_session_brief",
+        "Read-only: Call this FIRST for project summaries or to see what a session did — returns session, tasks, "
+        "decisions, and recent commits in one call. Compact session orientation (<500 tokens): sprint focus, "
+        "pending items, recent tasks, blocking failures, and open HITL requests. Ideal for worker/automation "
+        "sessions that don't need the full context.")
+    lines += ["## Tasks\n"]
+    lines += _render_tool("log_task",
+        "Log what this session did, is doing, or failed at. Call frequently — this is the primary signal in the "
+        "timeline and handoffs.\n\n"
+        "Valid statuses: `pending` · `in_progress` · `done` · `failed` · `backlog` · `future` · `backburner`")
+    lines += _render_tool("get_tasks")
+    lines += _render_tool("search_tasks")
+    lines += ["## Goal & sprint\n"]
+    lines += _render_tool("get_goal")
+    lines += _render_tool("set_goal")
+    lines += ["## Executor config & file coordination\n"]
+    lines += _render_tool("set_executor_config",
+        "Store project-level executor defaults so worker sessions start with repo path, env file, test command, "
+        "deploy command, shell, branch, and the injected credentials rule.")
+    lines += _render_tool("claim_file",
+        "Claim exclusive edit rights on a file path for this session. Locks auto-expire after 2 hours.")
+    lines += _render_tool("release_file",
+        "Release a file lock held by this session when you're done editing.")
+    lines += _render_tool("idle_until_session_done",
+        "Read-only: Wait on another session before touching a shared file. The tool polls every 30 seconds until the watched session is done.")
+    lines += ["## Decisions\n"]
+    lines += _render_tool("pin_decision",
+        "Record an authoritative decision that supersedes earlier statements. Pinned decisions appear in every "
+        "session's context block.\n\n"
+        "Categories: `STRATEGIC` · `COMPETITIVE` · `TECHNICAL` · `TACTICAL` · `BUSINESS` · `PRODUCT` · `ARCHITECTURAL`")
+    lines += _render_tool("update_decision",
+        "Patch a pinned decision. Pass `new_title` + `new_body` to atomically supersede (creates a new row, marks "
+        "old as superseded). Otherwise patches in place.")
+    lines += _render_tool("get_pinned_decisions")
+    lines += ["## Human-in-the-loop (HITL)\n"]
+    lines += _render_tool("request_hitl",
+        "Surface a question to the human queue. `urgency='blocking'` pauses the session until answered — poll "
+        "`get_hitl_request` to resume. `normal`/`high` land in the dashboard without blocking.")
+    lines += _render_tool("get_hitl_request",
+        "Read-only: Poll a HITL request for the human's answer. Returns the row including `status` "
+        "(`pending`/`answered`/`dismissed`) and `answer` text.")
+    lines += ["## Handoff & context\n"]
+    lines += _render_tool("generate_handoff",
+        "Read-only: Generate a context handoff document. `mode='full'` writes the complete L0/L1/L2 handoff. `mode='delta'` "
+        "returns a compact session summary with completed items, pending items, and the next `/goal` string.")
+    lines += _render_tool("get_context_block",
+        "Read-only: Return a compact plain-text context block (north star, sprint, pending sprint items, recent tasks, recent "
+        "decisions, active sessions). Use `mode='full'` to paste into a fresh Claude Code session; `mode='chat'` "
+        "for a shorter paste into claude.ai.")
+    lines += ["## Notes\n"]
+    lines += _render_tool("add_note",
+        "Add a per-project wiki note. Use for setup instructions, gotchas, environment details, how-tos.")
+    lines += _render_tool("get_notes", "Read-only: List project notes (newest first). Filter by tag substring.")
+    lines += _render_tool("delete_note")
+    lines += ["## Projects\n"]
+    lines += _render_tool("create_project")
+    lines += ["## Legacy\n"]
+    lines += _render_tool("register_session",
+        "!!! note \"Deprecated\"\n    Use `start_session` instead — it registers the session **and** returns "
+        "goal + context in one call.")
+    # strip trailing ---
+    while lines and lines[-1].strip() in ("---", ""):
+        lines.pop()
+    return "\n".join(part.rstrip("\n") for part in lines).rstrip() + "\n"
 # /admin/health, /admin/git-status → meridian/routes/admin.py
 
 
@@ -3175,7 +3432,6 @@ async def _resolve_hook_db(request: Request) -> Any:
     return conn
 
 
-def _hook_is_executor(body: dict[str, Any]) -> bool:
     """True when a SessionStart hook payload denotes an executor session.
 
     Executor sessions (Claude Code run with --dangerously-skip-permissions, or
@@ -3557,7 +3813,83 @@ async def hooks_stop(body: dict[str, Any], request: Request) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# Session queue — queue the next /goal to run back-to-back (10e6b265)
+# Token-based OAuth hooks — browser connect + machine registry (2da12762)
+# ---------------------------------------------------------------------------
+
+
+@app.get("/auth/hooks-connect")
+async def hooks_connect(request: Request, hostname: str = "") -> Any:
+    """Browser endpoint: register THIS machine to the logged-in tenant and show
+    the registration_token. Redirects to login when there is no session."""
+    from fastapi.responses import HTMLResponse, RedirectResponse
+    from urllib.parse import quote
+    hostname = (hostname or "").strip()
+    try:
+        tenant = await _get_authenticated_tenant(request)
+    except HTTPException:
+        nxt = quote(str(request.url), safe="")
+        return RedirectResponse(url=f"/auth/login?next={nxt}", status_code=303)
+    if not hostname:
+        raise HTTPException(status_code=400, detail="hostname required")
+    auth_db = request.app.state.db
+    token = await db_module.register_hostname(auth_db, tenant["id"], hostname)
+    safe_host = html_module.escape(hostname)
+    body = (
+        "<!doctype html><html><head><meta charset='utf-8'>"
+        "<title>Machine connected — Meridian</title>"
+        "<meta name='viewport' content='width=device-width, initial-scale=1'>"
+        "<style>body{font-family:system-ui,sans-serif;max-width:640px;margin:64px auto;"
+        "padding:0 20px;color:#1a1a2e}code{background:#f0f0f5;padding:2px 6px;border-radius:4px}"
+        ".tok{display:block;background:#0f1020;color:#7cf;padding:14px;border-radius:8px;"
+        "font-family:ui-monospace,monospace;word-break:break-all;margin:16px 0}"
+        ".ok{color:#1a9c4a;font-weight:600}</style></head><body>"
+        f"<h1>✅ <span class='ok'>{safe_host}</span> connected</h1>"
+        "<p>This machine is now registered for Meridian session hooks. The hook "
+        "script uses the registration token below — no API token needed.</p>"
+        f"<div class='tok'>{html_module.escape(token)}</div>"
+        "<p>You can close this tab. Manage or revoke machines anytime under "
+        "<strong>Settings → Known Machines</strong>.</p>"
+        "</body></html>"
+    )
+    return HTMLResponse(body)
+
+
+@app.get("/auth/hooks-status")
+async def hooks_status(request: Request, hostname: str = "") -> dict[str, Any]:
+    """Return {registered, token} for the logged-in tenant's hostname. The token
+    is echoed only to the authenticated owner so the installer can finish wiring
+    the hook script after the browser connect."""
+    tenant = await _get_authenticated_tenant(request)
+    auth_db = request.app.state.db
+    return await db_module.get_hostname_status(
+        auth_db, tenant["id"], (hostname or "").strip()
+    )
+
+
+@app.get("/projects/{project_id}/registered-machines")
+async def list_registered_machines(project_id: str, request: Request) -> list[dict[str, Any]]:
+    """List the tenant's registered hook machines (token omitted) for the
+    Settings → Known Machines panel. Registry is per-tenant; project_id only
+    scopes the dashboard route."""
+    tenant = await _get_authenticated_tenant(request)
+    auth_db = request.app.state.db
+    return await db_module.list_registered_hostnames(auth_db, tenant["id"])
+
+
+@app.delete("/projects/{project_id}/registered-machines/{machine_id}", status_code=204)
+async def revoke_registered_machine(
+    project_id: str, machine_id: str, request: Request
+) -> Response:
+    """Revoke one of the tenant's registered machines."""
+    tenant = await _get_authenticated_tenant(request)
+    auth_db = request.app.state.db
+    ok = await db_module.revoke_registered_hostname(auth_db, tenant["id"], machine_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="machine not found")
+    return Response(status_code=204)
+
+
+# ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
 
 
@@ -3579,7 +3911,6 @@ async def get_queued_session_endpoint(project_id: str, request: Request) -> dict
     return {"goal": await db_module.get_queued_session(db, project_id)}
 
 
-# ---------------------------------------------------------------------------
 # v2.0 — Remote MCP endpoint (HTTP JSON-RPC 2.0 transport)
 # ---------------------------------------------------------------------------
 
@@ -3826,1528 +4157,1014 @@ def _github_tools_for_tenant(tenant: dict) -> list[dict[str, Any]]:
     return _tools
 
 
-async def _dispatch_github_tool(name: str, args: dict[str, Any], tenant: dict, db: Any) -> Any:
-    # Guard: check if project has a GitHub repo connected
-    project_id = args.get("project_id")
-    if project_id:
+# MCP tool dispatcher moved to meridian/mcp/handler.py. Re-exported here so
+# server.py's HTTP routes and mcp.stdio_handler keep importing from .server.
+from .mcp.handler import (  # noqa: E402
+    _dispatch_github_tool,
+    _handle_mcp_request,
+    _dispatch_mcp_tool,
+    _maybe_add_log_task_nudge,
+)
+
+# ---------------------------------------------------------------------------
+# 9768d806 — MCP SSE transport (for dnakov/claude-mcp Chrome extension)
+# ---------------------------------------------------------------------------
+# Protocol: GET /mcp/sse opens an SSE stream, receives "endpoint" event with
+# the POST URL. Client POSTs JSON-RPC to POST /mcp/sse?session_id=<uuid> and
+# reads the JSON response directly from the HTTP response body.
+
+_SSE_SESSIONS: dict[str, dict[str, Any]] = {}  # session_id → {db, queue}
+
+# ── OAuth 2.0 for claude.ai custom connector ──────────────────────────────
+import secrets as _sec, hashlib as _hs, base64 as _b64, time as _tm, json as _json
+from urllib.parse import urlencode as _ue
+from fastapi.responses import RedirectResponse as _RR
+
+_oa_clients: dict = {}
+_oa_codes: dict = {}
+
+# Tokens persisted to disk in local mode for backwards compatibility.
+_OA_TOKEN_FILE = DEFAULT_DATA_DIR / "oauth_tokens.json"
+
+def _oauth_token_hash(token: str) -> str:
+    return _hs.sha256(token.encode()).hexdigest()
+
+
+def _normalize_oa_tokens(tokens: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    now = int(_tm.time())
+    normalized: dict[str, dict[str, Any]] = {}
+    for raw_key, raw_value in (tokens or {}).items():
+        if not isinstance(raw_value, dict):
+            continue
         try:
-            proj = await db_module.get_project(db, project_id)
-            if proj and not proj.get("github_repo"):
-                return {
-                    "error": "no_github_repo",
-                    "message": f"No GitHub repo connected for project {project_id}. "
-                               f"Go to Settings → Connect GitHub repo to connect one.",
-                }
-        except Exception:
-            pass
-    """Dispatch a GitHub MCP tool call using the tenant's PAT and per-project repo."""
-    import httpx as _httpx
-    import base64 as _b64
-    pat = db_module.decrypt_field(tenant.get("github_pat"))
-    if not pat:
-        return {"error": "GitHub not connected — connect via Settings > Connect Claude Code > GitHub"}
-    project_id = (args.get("project_id") or "").strip()
-    if not project_id:
-        return {"error": "project_id is required — pass the project whose GitHub repo you want to read"}
-    project = await db_module.get_project(db, project_id)
-    if project is None:
-        return {"error": f"project '{project_id}' not found"}
-    repo = (project.get("github_repo") or "").strip()
-    branch = (project.get("github_branch") or "main").strip()
-    if not repo:
-        return {"error": f"No GitHub repo connected for project {project_id} — use POST /projects/{project_id}/github/connect"}
-    gh_headers = {"Authorization": f"token {pat}", "Accept": "application/vnd.github+json"}
-    async with _httpx.AsyncClient(timeout=15.0) as http:
-        if name == "read_file":
-            path = args.get("path", "")
-            ref = args.get("ref") or branch
-            r = await http.get(
-                f"https://api.github.com/repos/{repo}/contents/{path}",
-                headers=gh_headers,
-                params={"ref": ref},
-            )
-            if r.status_code == 404:
-                return {"error": f"File not found: {path}"}
-            r.raise_for_status()
-            data = r.json()
-            if isinstance(data, list):
-                return {"entries": [{"name": e["name"], "type": e["type"], "path": e["path"]} for e in data]}
-            content_b64 = data.get("content", "")
-            content = _b64.b64decode(content_b64).decode("utf-8", errors="replace")
-            return {"path": data["path"], "sha": data["sha"], "size": data["size"], "content": content}
-
-        if name == "list_files":
-            path = args.get("path") or ""
-            r = await http.get(
-                f"https://api.github.com/repos/{repo}/git/trees/HEAD",
-                headers=gh_headers,
-                params={"recursive": "1"},
-            )
-            r.raise_for_status()
-            tree = r.json().get("tree", [])
-            files = [e["path"] for e in tree if e.get("type") == "blob"]
-            if path:
-                files = [f for f in files if f.startswith(path)]
-            return {"repo": repo, "count": len(files), "files": files}
-
-        if name == "search_code":
-            query = args.get("query", "")
-            r = await http.get(
-                "https://api.github.com/search/code",
-                headers=gh_headers,
-                params={"q": f"{query} repo:{repo}"},
-            )
-            r.raise_for_status()
-            items = r.json().get("items", [])
-            return {
-                "total_count": r.json().get("total_count", 0),
-                "items": [{"path": i["path"], "sha": i["sha"], "url": i.get("html_url", "")} for i in items[:20]],
-            }
-
-        if name == "get_commits":
-            limit = min(int(args.get("limit") or 50), 50)
-            params: dict[str, str] = {"per_page": str(limit)}
-            if args.get("since"):
-                params["since"] = args["since"]
-            r = await http.get(
-                f"https://api.github.com/repos/{repo}/commits",
-                headers=gh_headers,
-                params=params,
-            )
-            r.raise_for_status()
-            commits = r.json()
-            return {
-                "commits": [
-                    {
-                        "sha": c["sha"][:12],
-                        "message": c["commit"]["message"].split("\n")[0],
-                        "author": c["commit"]["author"]["name"],
-                        "date": c["commit"]["author"]["date"],
-                    }
-                    for c in commits
-                ]
-            }
-
-        if name == "search_commits":
-            query = (args.get("query") or "").lower()
-            limit = min(int(args.get("limit") or 20), 100)
-            r = await http.get(
-                f"https://api.github.com/repos/{repo}/commits",
-                headers=gh_headers,
-                params={"per_page": "100"},
-            )
-            r.raise_for_status()
-            all_commits = r.json()
-            matched = [
-                {
-                    "sha": c["sha"][:12],
-                    "message": c["commit"]["message"].split("\n")[0],
-                    "author": c["commit"]["author"]["name"],
-                    "date": c["commit"]["author"]["date"],
-                }
-                for c in all_commits
-                if query in c["commit"]["message"].lower()
-            ][:limit]
-            return {"query": args.get("query"), "count": len(matched), "commits": matched}
-
-        if name == "get_commit":
-            sha = args.get("sha", "")
-            r = await http.get(
-                f"https://api.github.com/repos/{repo}/commits/{sha}",
-                headers=gh_headers,
-            )
-            if r.status_code == 404:
-                return {"error": f"Commit not found: {sha}"}
-            r.raise_for_status()
-            c = r.json()
-            files = [{"filename": f["filename"], "status": f["status"], "additions": f.get("additions", 0), "deletions": f.get("deletions", 0)} for f in c.get("files", [])[:50]]
-            return {
-                "sha": c["sha"],
-                "message": c["commit"]["message"],
-                "author": c["commit"]["author"]["name"],
-                "date": c["commit"]["author"]["date"],
-                "files_changed": len(c.get("files", [])),
-                "files": files,
-            }
-
-        if name == "get_workflow_runs":
-            limit = min(int(args.get("limit") or 10), 50)
-            wf = (args.get("workflow_name") or "").strip()
-            url = (
-                f"https://api.github.com/repos/{repo}/actions/workflows/{wf}/runs"
-                if wf else
-                f"https://api.github.com/repos/{repo}/actions/runs"
-            )
-            r = await http.get(url, headers=gh_headers, params={"per_page": str(limit)})
-            if r.status_code == 404:
-                return {"error": f"Workflow not found: {wf}" if wf else "No Actions runs found"}
-            r.raise_for_status()
-            runs = r.json().get("workflow_runs", [])
-            return {
-                "repo": repo,
-                "count": len(runs),
-                "runs": [
-                    {
-                        "id": run["id"],
-                        "name": run.get("name"),
-                        "status": run.get("status"),
-                        "conclusion": run.get("conclusion"),
-                        "created_at": run.get("created_at"),
-                        "html_url": run.get("html_url"),
-                    }
-                    for run in runs
-                ],
-            }
-
-        if name == "get_workflow_run_logs":
-            run_id = str(args.get("run_id") or "").strip()
-            r = await http.get(
-                f"https://api.github.com/repos/{repo}/actions/runs/{run_id}/jobs",
-                headers=gh_headers,
-            )
-            if r.status_code == 404:
-                return {"error": f"Run not found: {run_id}"}
-            r.raise_for_status()
-            jobs = r.json().get("jobs", [])
-            failed = [j for j in jobs if j.get("conclusion") == "failure"]
-            out = []
-            for j in failed:
-                failed_steps = [
-                    {"name": s.get("name"), "number": s.get("number")}
-                    for s in j.get("steps", [])
-                    if s.get("conclusion") == "failure"
-                ]
-                log_excerpt = ""
-                try:
-                    lr = await http.get(
-                        f"https://api.github.com/repos/{repo}/actions/jobs/{j['id']}/logs",
-                        headers=gh_headers,
-                        follow_redirects=True,
-                    )
-                    if lr.status_code == 200:
-                        lines = lr.text.splitlines()
-                        log_excerpt = "\n".join(lines[-50:])
-                except Exception:  # noqa: BLE001 — logs are best-effort
-                    log_excerpt = ""
-                out.append({
-                    "job": j.get("name"),
-                    "job_id": j.get("id"),
-                    "html_url": j.get("html_url"),
-                    "failed_steps": failed_steps,
-                    "log_tail": log_excerpt,
-                })
-            return {"run_id": run_id, "failed_job_count": len(failed), "failed_jobs": out}
-
-        if name == "trigger_workflow":
-            wf = (args.get("workflow_name") or "").strip()
-            ref = (args.get("ref") or branch).strip()
-            inputs = args.get("inputs") or {}
-            body: dict[str, Any] = {"ref": ref}
-            if inputs:
-                body["inputs"] = inputs
-            r = await http.post(
-                f"https://api.github.com/repos/{repo}/actions/workflows/{wf}/dispatches",
-                headers=gh_headers,
-                json=body,
-            )
-            if r.status_code == 404:
-                return {"error": f"Workflow not found: {wf}"}
-            if r.status_code not in (201, 204):
-                return {"error": f"Dispatch failed ({r.status_code}): {r.text[:200]}"}
-            return {"dispatched": True, "workflow": wf, "ref": ref, "inputs": inputs}
-
-        if name == "git_diff":
-            base = (args.get("base") or "").strip()
-            head = (args.get("head") or "").strip()
-            r = await http.get(
-                f"https://api.github.com/repos/{repo}/compare/{base}...{head}",
-                headers=gh_headers,
-            )
-            if r.status_code == 404:
-                return {"error": f"Refs not found: {base}...{head}"}
-            r.raise_for_status()
-            data = r.json()
-            files = [
-                {
-                    "filename": f["filename"],
-                    "status": f.get("status"),
-                    "additions": f.get("additions", 0),
-                    "deletions": f.get("deletions", 0),
-                    "patch": f.get("patch", ""),
-                }
-                for f in data.get("files", [])[:50]
-            ]
-            return {
-                "base": base,
-                "head": head,
-                "total_commits": data.get("total_commits", 0),
-                "files": files,
-            }
-
-        if name == "list_branches":
-            r = await http.get(
-                f"https://api.github.com/repos/{repo}/branches",
-                headers=gh_headers,
-                params={"per_page": "100"},
-            )
-            r.raise_for_status()
-            branches = r.json()
-            return {
-                "repo": repo,
-                "count": len(branches),
-                "branches": [
-                    {
-                        "name": b["name"],
-                        "sha": b.get("commit", {}).get("sha", "")[:12],
-                        "protected": b.get("protected", False),
-                    }
-                    for b in branches
-                ],
-            }
-
-        if name == "list_issues":
-            state = (args.get("state") or "open").strip()
-            limit = min(int(args.get("limit") or 20), 50)
-            params = {"state": state, "per_page": str(limit)}
-            if args.get("labels"):
-                params["labels"] = args["labels"]
-            r = await http.get(
-                f"https://api.github.com/repos/{repo}/issues",
-                headers=gh_headers,
-                params=params,
-            )
-            r.raise_for_status()
-            issues = r.json()
-            return {
-                "repo": repo,
-                "state": state,
-                "issues": [
-                    {
-                        "number": i["number"],
-                        "title": i.get("title"),
-                        "state": i.get("state"),
-                        "labels": [lbl["name"] for lbl in i.get("labels", [])],
-                        "created_at": i.get("created_at"),
-                        "html_url": i.get("html_url"),
-                        "body_preview": (i.get("body") or "")[:200],
-                    }
-                    for i in issues
-                    if "pull_request" not in i  # exclude PRs
-                ],
-            }
-
-        if name == "create_issue":
-            title = (args.get("title") or "").strip()
-            if not title:
-                return {"error": "title is required"}
-            body_payload: dict[str, Any] = {"title": title, "body": args.get("body") or ""}
-            if args.get("labels"):
-                body_payload["labels"] = args["labels"]
-            r = await http.post(
-                f"https://api.github.com/repos/{repo}/issues",
-                headers=gh_headers,
-                json=body_payload,
-            )
-            if r.status_code not in (200, 201):
-                return {"error": f"Create issue failed ({r.status_code}): {r.text[:200]}"}
-            i = r.json()
-            return {
-                "number": i["number"],
-                "title": i.get("title"),
-                "state": i.get("state"),
-                "html_url": i.get("html_url"),
-            }
-
-        if name == "get_issue":
-            number = str(args.get("number") or "").strip()
-            r = await http.get(
-                f"https://api.github.com/repos/{repo}/issues/{number}",
-                headers=gh_headers,
-            )
-            if r.status_code == 404:
-                return {"error": f"Issue not found: {number}"}
-            r.raise_for_status()
-            i = r.json()
-            comments = []
-            try:
-                cr = await http.get(
-                    f"https://api.github.com/repos/{repo}/issues/{number}/comments",
-                    headers=gh_headers,
-                    params={"per_page": "30"},
-                )
-                if cr.status_code == 200:
-                    comments = [
-                        {
-                            "author": c.get("user", {}).get("login"),
-                            "created_at": c.get("created_at"),
-                            "body": (c.get("body") or "")[:500],
-                        }
-                        for c in cr.json()
-                    ]
-            except Exception:  # noqa: BLE001 — comments are best-effort
-                comments = []
-            return {
-                "number": i["number"],
-                "title": i.get("title"),
-                "state": i.get("state"),
-                "labels": [lbl["name"] for lbl in i.get("labels", [])],
-                "body": i.get("body") or "",
-                "html_url": i.get("html_url"),
-                "comments": comments,
-            }
-
-    return {"error": f"Unknown GitHub tool: {name}"}
-
-
-async def _handle_mcp_request(
-    body: dict[str, Any], db: Any, data_dir: str,
-    tenant: dict[str, Any] | None = None,
-    token_type: str = "readwrite",
-) -> dict[str, Any]:
-    """Dispatch one JSON-RPC 2.0 MCP request and return the response dict."""
-    req_id = body.get("id")
-    method = body.get("method", "")
-    params = body.get("params") or {}
-
-    if method == "initialize":
-        return _jsonrpc_ok(req_id, {
-            "protocolVersion": _MCP_PROTOCOL_VERSION,
-            "serverInfo": _MCP_SERVER_INFO,
-            "capabilities": {"tools": {}},
-        })
-
-    if method in ("notifications/initialized", "ping"):
-        return _jsonrpc_ok(req_id, {})
-
-    if method == "tools/list":
-        tools = list(_MCP_TOOLS_LIST)
-        if tenant:
-            tools = tools + _github_tools_for_tenant(tenant)
-        return _jsonrpc_ok(req_id, {"tools": tools})
-
-    if method == "tools/call":
-        name = params.get("name", "")
-        args = params.get("arguments") or {}
-        if token_type == "readonly" and name not in _mcp_readonly_tools:
-            return _jsonrpc_err(req_id, -32603, f"tool '{name}' not allowed for read-only tokens")
-        try:
-            if name in _GITHUB_TOOL_NAMES and tenant:
-                result = await _dispatch_github_tool(name, args, tenant, db)
-            else:
-                result = await _dispatch_mcp_tool(name, args, db, data_dir, tenant=tenant)
-            return _jsonrpc_ok(req_id, {"content": [{"type": "text", "text": json.dumps(result)}]})
-        except Exception as exc:
-            return _jsonrpc_err(req_id, -32603, str(exc))
-
-    return _jsonrpc_err(req_id, -32601, f"method not found: {method}")
-
-
-async def _maybe_add_log_task_nudge(db: Any, task: dict[str, Any]) -> dict[str, Any]:
-    """Append a soft nudge to log_task result when session logs many tasks with no sprint work."""
-    try:
-        settings = await db_module.get_workspace_settings(db)
-        threshold = settings.get("log_task_sprint_nudge_threshold", 5)
-        if not threshold:
-            return task
-        session_id = task.get("session_id")
-        project_id = task.get("project_id")
-        if not session_id or not project_id:
-            return task
-        async with db.execute(
-            "SELECT COUNT(*) AS cnt FROM task_log WHERE session_id = ? AND status != 'failed'",
-            (session_id,),
-        ) as cur:
-            row = await cur.fetchone()
-        task_count = int(row["cnt"]) if row else 0
-        if task_count < threshold:
-            return task
-        async with db.execute(
-            "SELECT COUNT(*) AS cnt FROM sprint_items WHERE project_id = ? "
-            "AND claimed_at >= (SELECT created_at FROM sessions WHERE id = ?)",
-            (project_id, session_id),
-        ) as cur:
-            row = await cur.fetchone()
-        sprint_count = int(row["cnt"]) if row else 0
-        if sprint_count > 0:
-            return task
-        task = dict(task)
-        task["nudge"] = (
-            f"You have logged {task_count} tasks inline with no sprint items. "
-            "If this is coordinated work, consider filing sprint items for better tracking. "
-            "Set log_task_sprint_nudge_threshold=0 in workspace settings to disable."
+            exp = int(raw_value.get("exp", 0))
+        except (TypeError, ValueError):
+            continue
+        if exp <= now:
+            continue
+        token_hash = (
+            raw_key
+            if isinstance(raw_key, str)
+            and len(raw_key) == 64
+            and all(c in "0123456789abcdef" for c in raw_key.lower())
+            else _oauth_token_hash(str(raw_key))
         )
-    except Exception:  # noqa: BLE001
+        normalized[token_hash] = {
+            "tenant_id": raw_value.get("tenant_id"),
+            "client_id": raw_value.get("client_id"),
+            "exp": exp,
+        }
+    return normalized
+
+
+def _load_oa_tokens_file() -> dict[str, dict[str, Any]]:
+    try:
+        if _OA_TOKEN_FILE.exists():
+            data = _json.loads(_OA_TOKEN_FILE.read_text())
+            return _normalize_oa_tokens(data)
+    except Exception:
         pass
-    return task
+    return {}
+
+def _save_oa_tokens(tokens: dict) -> None:
+    if _hosted_mode():
+        return
+    try:
+        _OA_TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
+        _OA_TOKEN_FILE.write_text(_json.dumps(tokens))
+    except Exception:
+        pass
+
+async def _ensure_oauth_token_table(db: Any) -> None:
+    await db.execute(
+        """CREATE TABLE IF NOT EXISTS oauth_tokens (
+            token_hash TEXT PRIMARY KEY,
+            tenant_id TEXT,
+            client_id TEXT,
+            exp BIGINT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )"""
+    )
+    await db.execute(
+        """CREATE TABLE IF NOT EXISTS oauth_clients (
+            client_id TEXT PRIMARY KEY,
+            client_secret TEXT NOT NULL,
+            redirect_uris TEXT NOT NULL DEFAULT '[]',
+            client_name TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )"""
+    )
+    await db.execute(
+        """CREATE TABLE IF NOT EXISTS oauth_codes (
+            code TEXT PRIMARY KEY,
+            tenant_id TEXT,
+            redirect_uri TEXT NOT NULL,
+            code_challenge TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )"""
+    )
+    await db.commit()
 
 
-def _parse_touches_files(raw: Any) -> list[str]:
-    """Decode a sprint item's touches_files field into normalized file paths."""
-    if raw is None:
-        return []
-    if isinstance(raw, list):
-        values = raw
-    else:
-        text = str(raw).strip()
-        if not text:
-            return []
-        try:
-            decoded = json.loads(text)
-            values = decoded if isinstance(decoded, list) else [decoded]
-        except Exception:  # noqa: BLE001
-            values = [part.strip() for part in text.split(",")]
-    paths: list[str] = []
-    for value in values:
-        path = str(value or "").strip().replace("\\", "/")
-        if path.startswith("./"):
-            path = path[2:]
-        if path:
-            paths.append(path)
-    return paths
-
-
-async def _sprint_item_file_claim_conflicts(
+async def _upsert_oauth_token(
     db: Any,
-    project_id: str,
-    item_id: str,
+    token_hash: str,
     *,
-    exclude_session_id: str | None = None,
-) -> list[dict[str, Any]]:
-    """Return active file locks overlapping a sprint item's touches_files."""
-    item = await db_module.get_sprint_item(db, item_id)
-    if item is None or item.get("project_id") != project_id:
-        return []
-    touches = {path.lower() for path in _parse_touches_files(item.get("touches_files"))}
-    if not touches:
-        return []
-    await db_module.expire_file_locks(db)
-    params: list[Any] = [project_id]
-    exclude_clause = ""
-    if exclude_session_id:
-        exclude_clause = "AND fl.session_id != ? "
-        params.append(exclude_session_id)
+    tenant_id: str | None,
+    client_id: str,
+    exp: int,
+) -> None:
+    await db.execute(
+        "INSERT INTO oauth_tokens (token_hash, tenant_id, client_id, exp) "
+        "VALUES (?, ?, ?, ?) "
+        "ON CONFLICT(token_hash) DO UPDATE SET "
+        "tenant_id = excluded.tenant_id, "
+        "client_id = excluded.client_id, "
+        "exp = excluded.exp",
+        (token_hash, tenant_id, client_id, exp),
+    )
+    await db.commit()
+
+
+async def _get_oauth_token_from_db(
+    db: Any,
+    token_hash: str,
+) -> dict[str, Any] | None:
     async with db.execute(
-        "SELECT fl.file_path, fl.session_id, s.name AS session_name, s.last_seen "
-        "FROM file_locks fl "
-        "JOIN sessions s ON s.id = fl.session_id "
-        "WHERE s.project_id = ? "
-        f"{exclude_clause}"
-        "AND s.status IN ('active', 'live') "
-        "AND (s.last_seen IS NULL OR s.last_seen > datetime('now', '-10 minutes'))",
-        tuple(params),
+        "SELECT token_hash, tenant_id, client_id, exp "
+        "FROM oauth_tokens WHERE token_hash = ? AND exp > ?",
+        (token_hash, int(_tm.time())),
+    ) as cur:
+        row = await cur.fetchone()
+    if row is None:
+        return None
+    return {
+        "tenant_id": row["tenant_id"],
+        "client_id": row["client_id"],
+        "exp": int(row["exp"]),
+    }
+
+
+async def _load_oauth_tokens_from_db(db: Any) -> dict[str, dict[str, Any]]:
+    async with db.execute(
+        "SELECT token_hash, tenant_id, client_id, exp "
+        "FROM oauth_tokens WHERE exp > ?",
+        (int(_tm.time()),),
     ) as cur:
         rows = await cur.fetchall()
-    conflicts: list[dict[str, Any]] = []
-    for row in rows:
-        r = dict(row)
-        path = str(r.get("file_path") or "").strip().replace("\\", "/")
-        if path.startswith("./"):
-            path = path[2:]
-        if path.lower() not in touches:
-            continue
-        conflicts.append({
-            "file_path": path,
-            "session_id": r.get("session_id"),
-            "session_name": r.get("session_name"),
-            "last_seen": r.get("last_seen"),
-            "sprint_item_id": item_id,
-        })
-    return conflicts
+    return {
+        row["token_hash"]: {
+            "tenant_id": row["tenant_id"],
+            "client_id": row["client_id"],
+            "exp": int(row["exp"]),
+        }
+        for row in rows
+    }
 
 
-async def _fetch_recent_commits(
-    project: dict[str, Any],
-    tenant: dict[str, Any] | None,
-) -> list[str]:
-    """Fetch last 20 commit messages for a project.
+async def _hydrate_oauth_cache(auth_db: Any) -> None:
+    global _oa_tokens, _oa_clients
 
-    Tries GitHub API if tenant has github_pat and project has github_repo;
-    falls back to local ``git log --oneline -20``. Returns plain message strings.
-    Non-fatal — returns empty list on any failure.
+    await _ensure_oauth_token_table(auth_db)
+    _oa_tokens = await _load_oauth_tokens_from_db(auth_db)
+    # Load persisted OAuth client registrations (DCR)
+    try:
+        import json as _json
+        async with auth_db.execute("SELECT client_id, client_secret, redirect_uris FROM oauth_clients") as cur:
+            rows = await cur.fetchall()
+        for row in rows:
+            _oa_clients[row["client_id"]] = {
+                "secret": row["client_secret"],
+                "redirect_uris": _json.loads(row["redirect_uris"] or "[]")
+            }
+        if rows:
+            print(f"[oauth] loaded {len(rows)} persisted client registrations")
+    except Exception:
+        pass
+
+    if _hosted_mode():
+        return
+
+    legacy_tokens = _load_oa_tokens_file()
+    if not legacy_tokens:
+        return
+
+    _oa_tokens.update(legacy_tokens)
+    for token_hash, token_data in legacy_tokens.items():
+        await _upsert_oauth_token(
+            auth_db,
+            token_hash,
+            tenant_id=token_data.get("tenant_id"),
+            client_id=str(token_data.get("client_id") or ""),
+            exp=int(token_data.get("exp", 0)),
+        )
+    _save_oa_tokens(_oa_tokens)
+
+
+_oa_tokens: dict[str, dict[str, Any]] = {}
+
+
+@app.get("/.well-known/oauth-authorization-server")
+async def _oauth_meta(request: Request):
+    b = str(request.base_url).rstrip("/")
+    return JSONResponse({"issuer": b,
+        "client_name": "Meridian", "logo_uri": "https://usemeridian.us/static/logo.svg",
+        "authorization_endpoint": f"{b}/oauth/authorize",
+        "token_endpoint": f"{b}/oauth/token",
+        "registration_endpoint": f"{b}/oauth/register",
+        "device_authorization_endpoint": f"{b}/oauth/device",
+        "scopes_supported": ["mcp"],
+        "response_types_supported": ["code"],
+        "grant_types_supported": ["authorization_code", "urn:ietf:params:oauth:grant-type:device_code"],
+        "code_challenge_methods_supported": ["S256"],
+        "token_endpoint_auth_methods_supported": ["client_secret_post", "none"]})
+
+
+@app.get("/.well-known/oauth-protected-resource")
+async def _oauth_protected_resource_meta(request: Request):
+    b = str(request.base_url).rstrip("/")
+    return JSONResponse({
+        "resource": f"{b}/mcp",
+        "authorization_servers": [b],
+        "scopes_supported": ["mcp"],
+        "bearer_methods_supported": ["header"],
+    })
+
+
+@app.post("/oauth/register")
+async def _oauth_reg(request: Request):
+    d = await request.json()
+    cid, cs = _sec.token_urlsafe(16), _sec.token_urlsafe(32)
+    redirect_uris = d.get("redirect_uris", [])
+    client_name = d.get("client_name", "")
+    _oa_clients[cid] = {"secret": cs, "redirect_uris": redirect_uris}
+    # Persist to DB so registrations survive restarts
+    try:
+        import json as _json
+        auth_db = request.app.state.db
+        await auth_db.execute(
+            "INSERT OR REPLACE INTO oauth_clients (client_id, client_secret, redirect_uris, client_name) VALUES (?, ?, ?, ?)",
+            (cid, cs, _json.dumps(redirect_uris), client_name)
+        )
+        await auth_db.commit()
+    except Exception:
+        pass  # in-memory fallback still works
+    return JSONResponse({"client_id": cid, "client_secret": cs,
+        "redirect_uris": redirect_uris,
+        "grant_types": ["authorization_code"],
+        "token_endpoint_auth_method": "client_secret_post"}, status_code=201)
+
+
+@app.post("/oauth/device")
+async def _oauth_device(request: Request):
+    """RFC 8628 device authorization endpoint.
+
+    Returns {device_code, user_code, verification_uri, verification_uri_complete,
+    expires_in, interval}. No auth required — the flow is initiated by the device.
     """
-    import subprocess as _sp  # noqa: PLC0415
-    commits: list[str] = []
-    try:
-        if tenant:
-            pat = db_module.decrypt_field(tenant.get("github_pat"))
-            repo = (project.get("github_repo") or "").strip()
-            if pat and repo:
-                import httpx as _httpx  # noqa: PLC0415
-                gh_headers = {
-                    "Authorization": f"token {pat}",
-                    "Accept": "application/vnd.github+json",
-                }
-                async with _httpx.AsyncClient(timeout=8.0) as http:
-                    r = await http.get(
-                        f"https://api.github.com/repos/{repo}/commits",
-                        headers=gh_headers,
-                        params={"per_page": "20"},
-                    )
-                    if r.status_code == 200:
-                        for c in r.json():
-                            msg = c["commit"]["message"].split("\n")[0]
-                            commits.append(msg)
-                if commits:
-                    return commits
-    except Exception:  # noqa: BLE001
-        pass
-    try:
-        result = _sp.run(
-            ["git", "log", "--oneline", "-20"],
-            capture_output=True, text=True, timeout=5,
-        )
-        for line in result.stdout.splitlines():
-            line = line.strip()
-            if line and " " in line:
-                _, _, msg = line.partition(" ")
-                commits.append(msg)
-    except Exception:  # noqa: BLE001
-        pass
-    return commits
+    import string as _str
+    auth_db = request.app.state.db
+    b = str(request.base_url).rstrip("/")
+    device_code = _sec.token_hex(32)
+    # User code: 4 uppercase letters + "-" + 4 uppercase letters
+    _chars = _str.ascii_uppercase
+    user_code = (
+        "".join(_sec.choice(_chars) for _ in range(4))
+        + "-"
+        + "".join(_sec.choice(_chars) for _ in range(4))
+    )
+    from datetime import datetime as _dt, timezone as _tz, timedelta as _td_cls
+    expires_at = (_dt.now(tz=_tz.utc) + _td_cls(seconds=300)).strftime("%Y-%m-%d %H:%M:%S")
+    await auth_db.execute(
+        "INSERT INTO device_codes (device_code, user_code, expires_at) VALUES (?, ?, ?)",
+        (device_code, user_code, expires_at),
+    )
+    await auth_db.commit()
+    return JSONResponse({
+        "device_code": device_code,
+        "user_code": user_code,
+        "verification_uri": f"{b}/activate",
+        "verification_uri_complete": f"{b}/activate?code={user_code}",
+        "expires_in": 300,
+        "interval": 5,
+    })
 
 
-async def _dispatch_mcp_tool(
-    name: str,
-    args: dict[str, Any],
-    db: Any,
-    data_dir: str,
-    tenant: dict[str, Any] | None = None,
-) -> Any:
-    """Route a tools/call to the appropriate db_module function."""
-    # Tenant scope for the workspace layer (notes/decisions/settings). None for
-    # self-host / unauthenticated; the db functions then skip isolation.
-    _mcp_tenant_id = tenant.get("id") if tenant else None
-    # b6ab6e83 — project_name resolver: accept project_name as alternative to
-    # project_id, and resolve non-UUID project_id values as human-readable names.
-    _pid_raw = args.get("project_id", "")
-    _pname_raw = args.get("project_name", "")
-    _is_uuid = bool(re.match(
-        r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
-        _pid_raw, re.I,
-    ))
-    if _pname_raw or (_pid_raw and not _is_uuid):
-        _lookup = _pname_raw or _pid_raw
-        _resolved_proj = await db_module.get_project_by_name(db, _lookup)
-        if _resolved_proj:
-            args = {**args, "project_id": _resolved_proj["id"]}
-        elif _pname_raw and not _pid_raw:
-            raise ValueError(f"no project found matching name '{_lookup}'")
-    if name == "create_project":
-        existing = await db_module.get_project_by_name(db, args["name"])
-        if existing is not None:
-            return {"error": f"project '{args['name']}' already exists", "project": existing}
-        return await db_module.create_project(db, args["name"])
-    if name == "register_session":
-        hid = args.get("human_id")
-        if not hid and not _hosted_mode():
-            hid = db_module.get_default_human_id()
-        return await db_module.register_session(
-            db, args["project_id"], args["session_name"],
-            hid,
-            agent_framework=args.get("agent_framework", "claude_code"),
-            client_type=args.get("client"),
-        )
-    if name == "start_session":
-        return await _start_session_composite(
-            db,
-            args["project_id"],
-            args["session_name"],
-            data_dir,
-            human_id=args.get("human_id"),
-            client_type=args.get("client"),
-            role=args.get("role"),
-        )
-    if name == "list_projects":
-        return await db_module.list_project_summaries(db)
-    if name == "get_project_by_name":
-        project = await db_module.get_project_by_name(db, args["name"])
-        if project is None:
-            raise ValueError(f"no project found matching '{args['name']}'")
-        return {
-            "id": project["id"],
-            "name": project["name"],
-            "sprint": project.get("sprint"),
-        }
-    if name == "get_goal":
-        goal = await db_module.get_goal(db, args["project_id"])
-        if goal and goal.get("decisions") and len(goal["decisions"]) > 3000:
-            goal["decisions"] = goal["decisions"][-3000:]
-        return goal
-    if name == "set_goal":
-        return await db_module.set_goal(db, args["project_id"], args["content"])
-    if name == "set_north_star":
-        return await db_module.set_north_star(db, args["project_id"], args["north_star"])
-    if name == "log_task":
-        validate_input_size(args.get("description"), "description", 50_000)
-        task = await db_module.log_task(
-            db, args["session_id"], args["project_id"],
-            args["description"], args.get("status", "done"),
-            parent_task_id=args.get("parent_task_id"),
-        )
-        return await _maybe_add_log_task_nudge(db, task)
-    if name == "get_tasks":
-        return await db_module.get_tasks(db, args["project_id"], args.get("limit", 20))
-    if name == "search_tasks":
-        return await db_module.search_tasks(
-            db, args["project_id"], args["query"], args.get("limit", 5)
-        )
-    if name == "generate_handoff":
-        from . import handoff as handoff_module_local
-        session_id = args.get("session_id")
-        if not isinstance(session_id, str):
-            session_id = None
-        mode = handoff_module_local.resolve_handoff_mode(
-            args.get("mode"),
-            session_id,
-        )
-        # Fetch recent commits for reconcile annotations (non-fatal)
-        _gh_project = await db_module.get_project(db, args["project_id"])
-        _gh_commits = await _fetch_recent_commits(_gh_project or {}, tenant)
+@app.get("/activate", response_class=HTMLResponse)
+async def _activate_get(request: Request):
+    """Device activation page — shows approval UI for a pending device_code."""
+    if _hosted_mode():
         try:
-            path, content = await asyncio.wait_for(
-                handoff_module_local.generate_handoff(
-                    db,
-                    args["project_id"],
-                    data_dir,
-                    mode=mode,
-                    session_id=session_id,
-                    commit_messages=_gh_commits or [],
-                ),
-                timeout=90.0,
-            )
-        except asyncio.TimeoutError:
-            path, content = await handoff_module_local._generate_handoff_l0(
-                db, args["project_id"], data_dir
-            )
-            mode = "full"
-        return {"file_path": path, "content": content, "mode": mode}
-    if name == "pin_decision":
-        validate_input_size(args.get("title"), "decision title", 500)
-        validate_input_size(args.get("body"), "decision body", 100_000)
-        category = args.get("category", "TECHNICAL")
-        result = await db_module.pin_decision(
-            db, args["project_id"], args["title"], args["body"], category,
-        )
-        await _append_decision_to_md(args["title"], args["body"], category)
-        return result
-    if name == "update_decision":
-        new_title = args.get("new_title")
-        new_body = args.get("new_body")
-        if new_title and new_body:
-            return await db_module.supersede_pinned_decision(
-                db, args["decision_id"], new_title, new_body, args.get("category"),
-            )
-        result = await db_module.update_pinned_decision(
-            db, args["decision_id"],
-            body=args.get("body"),
-            title=args.get("title"),
-            category=args.get("category"),
-            status=args.get("status"),
-            superseded_by=args.get("superseded_by"),
-        )
-        if result is None:
-            raise ValueError("decision not found")
-        return result
-    if name == "get_pinned_decisions":
-        return await db_module.get_pinned_decisions(
-            db, args["project_id"],
-            include_superseded=bool(args.get("include_superseded", False)),
-        )
-    if name == "archive_decision":
-        deleted = await db_module.delete_pinned_decision(db, args["decision_id"])
-        if not deleted:
-            raise ValueError("decision not found")
-        return {"deleted": True, "decision_id": args["decision_id"]}
-    if name == "checkpoint":
-        session_id = args["session_id"]
-        project_id = args["project_id"]
-        await db_module.auto_capture_session(db, project_id, session_id)
-        await _finalize_session_md(db, project_id, session_id)
-        from . import handoff as handoff_module_local
-        # Fetch recent commits for reconcile annotations (non-fatal)
-        _ckpt_project = await db_module.get_project(db, project_id)
-        _commit_messages = await _fetch_recent_commits(_ckpt_project or {}, tenant)
-        try:
-            _, content = await asyncio.wait_for(
-                handoff_module_local.generate_handoff(
-                    db, project_id, data_dir, mode="delta", session_id=session_id,
-                    commit_messages=_commit_messages or [],
-                ),
-                timeout=30.0,
-            )
-        except asyncio.TimeoutError:
-            content = "delta handoff timed out"
-        pending_items = await db_module.get_sprint_items(db, project_id, status="pending")
-        # Log drift warnings for high-confidence reconcile matches (non-fatal)
-        if _commit_messages and pending_items:
-            try:
-                _commits_for_reconcile = []
-                for _line in _commit_messages:
-                    _sha = ""
-                    _msg = _line
-                    _commits_for_reconcile.append({"sha": _sha, "message": _msg})
-                _matches = handoff_module_local.reconcile_sprint_items(
-                    pending_items, _commits_for_reconcile
-                )
-                for _m in _matches:
-                    if _m.get("confidence") == "high":
-                        _first_sha = (_m["matching_commits"][0].get("sha") or "")[:8]
-                        await db_module.log_task(
-                            db, session_id, project_id,
-                            f"Sprint board drift detected: {_m['item_id'][:8]} "
-                            f"may already be done (matches commit {_first_sha})",
-                            status="pending",
-                        )
-            except Exception:  # noqa: BLE001
-                pass
-        ids_str = ", ".join(it["id"][:8] for it in pending_items[:8])
-        next_goal = (
-            f'/goal Complete sprint items: {", ".join(it["id"] for it in pending_items[:8])}. '
-            f"Done when complete_sprint_item()\'d, tests pass, generate_handoff called."
-        ) if pending_items else "/goal Continue work — all sprint items done."
-        # 04f03ee4 — include start_session one-liner so next session can resume immediately
-        start_fresh = f'start_session(project_id="{project_id}", session_name="describe-what-youre-doing")'
-        # fa595ad8 — store snapshot for Recent Sessions dashboard panel (non-fatal)
-        # v3.1 — snapshot now lives on sessions.checkpoint_data, not a checkpoint:* note.
-        try:
-            from datetime import datetime as _ckpt_dt, timezone as _ckpt_tz
-            async with db.execute(
-                "SELECT name FROM sessions WHERE id = ?", (session_id,)
-            ) as _sc:
-                _sr = await _sc.fetchone()
-            _session_name = (_sr["name"] if _sr else None) or session_id[:8]
-            async with db.execute(
-                "SELECT COUNT(*) AS n FROM task_log "
-                "WHERE session_id = ? AND status = 'done'",
-                (session_id,),
-            ) as _tc:
-                _tr = await _tc.fetchone()
-            _items_done = int(_tr["n"]) if _tr else 0
-            _summary_line = (content or "").split("\n")[0][:140]
-            await db_module.set_session_checkpoint(
-                db, session_id,
-                {
-                    "session_id": session_id,
-                    "session_name": _session_name,
-                    "items_done": _items_done,
-                    "summary_line": _summary_line,
-                    "next_goal": next_goal,
-                    "start_fresh": start_fresh,
-                    "checkpointed_at": _ckpt_dt.now(_ckpt_tz.utc).strftime(
-                        "%Y-%m-%d %H:%M:%S"
-                    ),
-                },
-            )
+            from .hosted import _SESSION_COOKIE, _read_session_cookie
+            cookie_val = request.cookies.get(_SESSION_COOKIE, "")
+            if not cookie_val:
+                raise ValueError("no session cookie")
+            sid = _read_session_cookie(cookie_val)
+            if not sid or not await db_module.get_user_session(request.app.state.db, sid):
+                raise ValueError("invalid session")
         except Exception:
-            pass  # non-fatal — checkpoint still returns normally
-        # Write plain-text session_summary for RECENT RUNS panel display
-        try:
-            _shipped_titles: list[str] = []
-            async with db.execute(
-                "SELECT si.title FROM sprint_items si "
-                "JOIN task_log tl ON tl.id = si.task_id "
-                "WHERE tl.session_id = ? AND si.status = 'done'",
-                (session_id,),
-            ) as _si_cur:
-                for _si_row in await _si_cur.fetchall():
-                    _t = _si_row["title"] if hasattr(_si_row, "__getitem__") else _si_row[0]
-                    if _t not in _shipped_titles:
-                        _shipped_titles.append(_t)
-            async with db.execute(
-                "SELECT DISTINCT si.title FROM sprint_items si "
-                "JOIN task_log tl ON tl.sprint_item_id = si.id "
-                "WHERE tl.session_id = ? AND tl.status = 'done' AND si.status = 'done'",
-                (session_id,),
-            ) as _si_cur2:
-                for _si_row2 in await _si_cur2.fetchall():
-                    _t2 = _si_row2["title"] if hasattr(_si_row2, "__getitem__") else _si_row2[0]
-                    if _t2 not in _shipped_titles:
-                        _shipped_titles.append(_t2)
-            _shipped_str = ", ".join(_shipped_titles) if _shipped_titles else "none"
-            _plain_summary = (
-                f"Shipped: {_shipped_str}. "
-                f"Tasks done: {_items_done}. "
-                f"Deploy: no."
-            )
-            await db.execute(
-                "UPDATE sessions SET session_summary = ? WHERE id = ?",
-                (_plain_summary, session_id),
-            )
-        except Exception:
-            pass  # non-fatal
-        return {
-            "summary": content,
-            "pending_count": len(pending_items),
-            "pending_ids": ids_str,
-            "next_goal": next_goal,
-            "start_fresh": start_fresh,
-        }
-    if name == "request_hitl":
-        validate_input_size(args.get("question"), "question", 10_000)
-        validate_input_size(args.get("context"), "context", 50_000)
-        _hitl_kind = args.get("kind", "question")
-        if _hitl_kind not in ("question", "correction"):
-            _hitl_kind = "question"
-        result = await db_module.request_hitl(
-            db, args["project_id"], args["question"],
-            session_id=args.get("session_id"),
-            context=args.get("context"),
-            urgency=args.get("urgency", "normal"),
-            assigned_to=args.get("assigned_to"),
-            kind=_hitl_kind,
-        )
-        # v3.4 — auto-answered requests need no human; skip the notification.
-        if result.get("answered_by") != "auto":
-            # Notify via configured notify_url — best-effort, non-blocking
-            _hitl_urgency = args.get("urgency", "normal").upper()
-            _hitl_q = args["question"][:200]
-            _hitl_base = os.environ.get("MERIDIAN_BASE_URL", "https://usemeridian.us").rstrip("/")
-            await _maybe_notify(
-                db, args["project_id"],
-                f"Action needed ({_hitl_urgency})",
-                f"{_hitl_q}\n\nAnswer at: {_hitl_base}/dashboard",
-                event="hitl",
-                tenant=tenant,
-                pref_key="hitl",
-            )
-        return result
-    if name == "get_hitl_request":
-        result = await db_module.get_hitl_request(db, args["request_id"])
-        if result is None:
-            raise ValueError("hitl request not found")
-        return result
-    if name == "add_note":
-        validate_input_size(args.get("title"), "note title", 500)
-        validate_input_size(args.get("body"), "note body", 10_000_000)
-        result = await db_module.add_project_note(
-            db, args["project_id"], args["title"], args["body"],
-            args.get("tags"),
-        )
-        await _append_note_to_roadmap(
-            args["title"], args["body"], args.get("tags"), args.get("category"),
-        )
-        return result
-    if name == "get_notes":
-        return await db_module.get_project_notes(
-            db, args["project_id"], tag=args.get("tag"),
-        )
-    if name == "delete_note":
-        ok = await db_module.delete_project_note(db, args["note_id"])
-        return {"deleted": ok}
-    if name == "add_workspace_note":
-        validate_input_size(args.get("title"), "note title", 500)
-        validate_input_size(args.get("body"), "note body", 10_000_000)
-        return await db_module.add_workspace_note(
-            db, args["title"], args["body"], args.get("tags"),
-            tenant_id=_mcp_tenant_id,
-        )
-    if name == "get_workspace_notes":
-        return await db_module.get_workspace_notes(
-            db, tag=args.get("tag"), tenant_id=_mcp_tenant_id,
-        )
-    if name == "pin_workspace_decision":
-        validate_input_size(args.get("title"), "decision title", 500)
-        validate_input_size(args.get("body"), "decision body", 100_000)
-        return await db_module.pin_workspace_decision(
-            db, args["title"], args["body"],
-            category=args.get("category", "TECHNICAL"),
-            tenant_id=_mcp_tenant_id,
-        )
-    if name == "get_workspace_decisions":
-        return await db_module.get_workspace_decisions(
-            db, include_superseded=args.get("include_superseded", False),
-            tenant_id=_mcp_tenant_id,
-        )
-    if name == "get_workspace_settings":
-        return await db_module.get_workspace_settings(db, tenant_id=_mcp_tenant_id)
-    if name == "update_workspace_settings":
-        return await db_module.update_workspace_settings(
-            db,
-            hitl_auto_answer_default=args.get("hitl_auto_answer_default"),
-            sprint_name_default=args.get("sprint_name_default"),
-            handoff_template=args.get("handoff_template"),
-            tenant_id=_mcp_tenant_id,
-        )
-    if name == "get_context_block":
-        # v2.3 — assemble the same shape as /projects/{id}/context-block but
-        # return both the rendered text AND the source dict so MCP clients
-        # can choose to render their own variant.
-        # v2.5 — wrap in semantic XML for better Claude Code parsing.
-        project_id = args["project_id"]
-        mode = args.get("mode", "full")
-        project = await db_module.get_project(db, project_id)
-        if project is None:
-            raise ValueError("project not found")
-        goal = await db_module.get_goal(db, project_id)
-        sprint_items = await db_module.get_sprint_items(
-            db, project_id, status="pending"
-        )
-        all_tasks = await db_module.get_tasks(db, project_id, limit=20)
-        pending_tasks = [
-            t for t in all_tasks if t.get("status") in ("pending", "in_progress", "done")
-        ][:10]
-        sessions = await db_module.get_sessions(db, project_id, active_only=True)
-        decisions_raw = (project.get("decisions") or "").strip()
-        recent_decisions = [
-            l.strip() for l in decisions_raw.splitlines() if l.strip()
-        ][-5:]
-        text = _render_context_block(
-            project, goal, sprint_items, pending_tasks, sessions, recent_decisions,
-            mode=mode,
-        )
-        # v3.1 — workspace decisions + notes apply across all projects; surface
-        # them at the very top so a fresh session sees org-wide truth first.
-        ws_decisions = await db_module.get_workspace_decisions(db, tenant_id=_mcp_tenant_id)
-        ws_notes = await db_module.get_workspace_notes(db, tenant_id=_mcp_tenant_id)
-        ws_block = _render_workspace_block(ws_decisions, ws_notes)
-        if ws_block:
-            text = f"{ws_block}\n\n{text}"
-        xml_text = f'<meridian_context project_id="{project_id}" mode="{mode}">\n{text}\n</meridian_context>'
-        return {"mode": mode, "text": xml_text, "project_id": project_id}
-    if name == "list_hitl_requests":
-        # dcf1e428 — default 'recent' (pending + answered last 24h) so dismissed HITLs
-        # don't give false "no pending HITLs" confidence to planning sessions.
-        status_filter = args.get("status", "recent")
-        if status_filter == "all":
-            status_filter = None
-        # project_id is optional — None lists across all projects (like the
-        # dashboard), so cross-project HITLs aren't missed (277567dc).
-        return await db_module.list_hitl_requests(
-            db, args.get("project_id"),
-            status=status_filter,
-            limit=args.get("limit", 50),
-        )
-    if name == "answer_hitl":
-        result = await _answer_hitl_and_apply(
-            db, args["request_id"], args["answer"],
-            answered_by=args.get("answered_by"), approved=True,
-        )
-        if result is None:
-            raise ValueError("hitl request not found")
-        return result
-    if name == "dismiss_hitl":
-        result = await db_module.dismiss_hitl_request(db, args["request_id"])
-        if result is not None:
-            await _on_hitl_answered(db, result, approved=False)
-        if result is None:
-            raise ValueError("hitl request not found")
-        return result
-    if name == "update_md_section":
-        md_file = args["file"]
-        anchor = args["anchor"]
-        content = args["content"]
-        # Raises ValueError for non-replace anchors / unknown files / README.
-        md_anchors_module.assert_replace_target(md_file, anchor)
-        # v1.1 — force=true: human planning sessions (claude.ai) skip the HITL
-        # round-trip and apply the section replacement directly. Executor sessions
-        # omit force (default False) so the diff stays human-gated as before.
-        if args.get("force") in (True, 1, "true", "1", "yes"):
+            from urllib.parse import quote as _q
+            orig_qs = str(request.url.query)
+            next_path = f"/activate?{orig_qs}" if orig_qs else "/activate"
+            return _RR(f"/auth/login?next={_q(next_path)}")
+
+    code_param = (request.query_params.get("code") or "").strip().upper()
+    b = str(request.base_url).rstrip("/")
+    auth_db = request.app.state.db
+
+    row_data: dict | None = None
+    if code_param:
+        from datetime import datetime as _dt, timezone as _tz
+        async with auth_db.execute(
+            "SELECT device_code, user_code, expires_at, approved FROM device_codes WHERE user_code = ?",
+            (code_param,),
+        ) as _cur:
+            _row = await _cur.fetchone()
+        if _row:
+            _row_d = dict(zip(["device_code", "user_code", "expires_at", "approved"], _row)) if not hasattr(_row, "keys") else dict(_row)
+            _exp_str = _row_d.get("expires_at", "")
             try:
-                path = await md_anchors_module.apply_replace(md_file, anchor, content)
-            except md_anchors_module.AnchorError as exc:
-                return {"applied": False, "apply_error": str(exc)}
-            except Exception as exc:  # noqa: BLE001 — never crash the tool call
-                return {"applied": False, "apply_error": f"write failed: {exc}"}
-            if path is None:
-                return {"applied": False, "reason": "no-op-or-hosted"}
-            return {"applied": True, "forced": True, "file": md_file, "anchor": anchor}
-        diff = md_anchors_module.build_diff(md_file, anchor, content)
-        payload = json.dumps({
-            "file": md_file,
-            "anchor": anchor,
-            "content": content,
-            "base_hash": md_anchors_module.anchor_content_hash(md_file, anchor),
-            "diff": diff,
-        })
-        return await db_module.request_hitl(
-            db, args["project_id"],
-            question=f"Approve update to {md_file} § {anchor}?",
-            session_id=args.get("session_id"),
-            context=(
-                f"Proposed section replacement for {md_file} (anchor: {anchor}). "
-                "Review the diff in the dashboard, then Approve or Reject."
-            ),
-            urgency=args.get("urgency", "normal"),
-            kind="md_section_update",
-            payload=payload,
-        )
-    if name == "list_sessions":
-        active_only = args.get("status", "active") != "all"
-        return await db_module.get_sessions(db, args["project_id"], active_only=active_only)
-    if name == "add_sprint_note":
-        validate_input_size(args.get("title"), "note title", 500)
-        validate_input_size(args.get("body"), "note body", 10_000_000)
-        return await db_module.add_session_note(
-            db, args["session_id"], args["title"], args["body"]
-        )
-    if name == "get_sprint_notes":
-        return await db_module.get_session_notes(db, args["session_id"])
-    if name == "add_sprint_item":
-        validate_input_size(args.get("title"), "sprint item title", 500)
-        # 10c0f6a0 — fuzzy duplicate guard: warn if title closely matches existing item
-        _new_words = set(args["title"].lower().split())
-        _dup_warnings: list[dict[str, Any]] = []
-        if len(_new_words) >= 3:
-            _all_items = await db_module.get_sprint_items(db, args["project_id"])
-            for _ex in _all_items:
-                if _ex.get("status") in {"pending", "todo", "in_progress", "done"}:
-                    _ex_words = set(_ex["title"].lower().split())
-                    if _ex_words:
-                        _overlap = len(_new_words & _ex_words) / len(_new_words)
-                        if _overlap >= 0.6:
-                            _dup_warnings.append({
-                                "item_id": _ex["id"], "title": _ex["title"][:120],
-                                "status": _ex["status"], "match_pct": round(_overlap * 100),
-                            })
-        # fd86aacc — warn if active executor sessions exist when adding a new item
-        _active_session_warnings: list[str] = []
-        try:
-            from datetime import datetime, timezone as _tz
-            _active_sessions = await db_module.get_sessions(db, args["project_id"])
-            _now_ts = datetime.now(_tz.utc)
-            for _sess in _active_sessions:
-                _ls = _sess.get("last_seen")
-                if _ls:
-                    try:
-                        _ls_dt = datetime.fromisoformat(str(_ls).replace("Z", "+00:00"))
-                        if _ls_dt.tzinfo is None:
-                            _ls_dt = _ls_dt.replace(tzinfo=_tz.utc)
-                        if (_now_ts - _ls_dt).total_seconds() < 600:
-                            _active_session_warnings.append(
-                                f"session '{_sess.get('name', _sess.get('id','?'))}' is active"
-                            )
-                    except Exception:
-                        pass
-        except Exception:
-            pass
-        _new_item = await db_module.add_sprint_item(
-            db, args["project_id"], args["version"], args["title"],
-            group=args.get("group"),
-            human_id=args.get("human_id"),
-            depends_on=args.get("depends_on"),
-            failure_mode=args.get("failure_mode"),
-            milestone_type=args.get("milestone_type", "task"),
-        )
-        _extra: dict[str, Any] = {}
-        if _dup_warnings:
-            _extra["duplicate_warnings"] = _dup_warnings
-        if _active_session_warnings:
-            _extra["active_session_warning"] = (
-                "WARNING: " + "; ".join(_active_session_warnings)
-                + " — new item added but may not be picked up until next session start."
-            )
-        if _extra:
-            _new_item = {**_new_item, **_extra}
-        return _new_item
-    if name == "update_sprint_item":
-        validate_input_size(args.get("title"), "sprint item title", 500)
-        validate_input_size(args.get("notes"), "sprint item notes", 50_000)
-        item = await db_module.patch_sprint_item(
-            db, args["project_id"], args["item_id"],
-            title=args.get("title"),
-            version=args.get("version"),
-            notes=args.get("notes"),
-            human_id=args.get("human_id"),
-            item_group=args.get("group"),
-        )
-        return item or {"error": "sprint item not found"}
-    if name == "set_sprint":
-        # 62d321dd — guard: warn if pending items were never started before rolling sprint
-        if not args.get("force"):
-            _unstarted = [
-                it for it in await db_module.get_sprint_items(db, args["project_id"], status="pending")
-                if it.get("claimed_at") is None
-            ]
-            if _unstarted:
-                _list = "\n".join(
-                    f'  [{it["id"][:8]}] {it.get("title","")[:100]}'
-                    for it in _unstarted[:10]
-                )
-                return {
-                    "warning": (
-                        f"WARNING: {len(_unstarted)} item(s) from the current sprint were never "
-                        f"started:\n{_list}\n"
-                        "Proceeding will leave these orphaned. Move them to the new sprint version "
-                        "or push to backlog first. Call set_sprint again with force=true to override."
-                    ),
-                    "unstarted_count": len(_unstarted),
-                    "unstarted_ids": [it["id"] for it in _unstarted],
-                    "sprint_not_updated": True,
-                }
-        result = await db_module.set_sprint(db, args["project_id"], args["sprint"])
-        await goal_md_module.sync_db_to_goal_md(db, args["project_id"])
-        return result
-    if name == "get_sprint_progress":
-        # 0507f4a1 — sprint progress summary
-        _version_filter = args.get("version")
-        _group_filter = args.get("item_group")
-        _all = await db_module.get_sprint_items(db, args["project_id"])
-        if _version_filter:
-            _all = [it for it in _all if it.get("version") == _version_filter]
-        if _group_filter:
-            _all = [it for it in _all if it.get("item_group") == _group_filter]
-        _counts: dict[str, int] = {}
-        for _it in _all:
-            _st = _it.get("status") or "pending"
-            _counts[_st] = _counts.get(_st, 0) + 1
-        _done_n = _counts.get("done", 0)
-        _total = len(_all)
-        _pct = round(100 * _done_n / _total) if _total else 0
-        return {
-            "total": _total,
-            "done": _done_n,
-            "in_progress": _counts.get("in_progress", 0),
-            "pending": _counts.get("pending", 0),
-            "failed": _counts.get("failed", 0),
-            "skipped": _counts.get("skipped", 0),
-            "percent_complete": _pct,
-            "by_status": _counts,
-            "items": [
-                {"id": it["id"], "title": (it.get("title") or "")[:80], "status": it.get("status")}
-                for it in _all
-            ],
-        }
-    if name == "get_sprint_items":
-        include_human = args.get("human", True)
-        if isinstance(include_human, bool):
-            pass
-        else:
-            include_human = str(include_human).lower() not in ("false", "0", "no")
-        _items = await db_module.get_sprint_items(
-            db, args["project_id"],
-            status=args.get("status"),
-            include_human=include_human,
-        )
-        # 10c0f6a0 — stale-session warning: in_progress items claimed >2h ago
-        from datetime import datetime as _dt_cls
-        _now_utc = _dt_cls.utcnow()
-        for _i, _it in enumerate(_items):
-            if _it.get("status") == "in_progress" and _it.get("claimed_at"):
-                try:
-                    _ca = _dt_cls.fromisoformat(_it["claimed_at"].split(".")[0].replace("Z", ""))
-                    _age_h = (_now_utc - _ca).total_seconds() / 3600
-                    if _age_h > 2:
-                        _items[_i] = {**_it, "stale_warning": True, "stale_age_hours": round(_age_h, 1)}
-                except Exception:  # noqa: BLE001
-                    pass
-        return _items
-    if name == "claim_sprint_item":
-        # ITEM 3 — protect installer scripts: refuse to claim a sprint item whose
-        # touches_files includes hooks.ps1 / hooks.sh unless force=true is passed.
-        _force = args.get("force") in (True, 1, "true", "1", "yes")
-        if not _force:
-            _pitem = await db_module.get_sprint_item(db, args["item_id"])
-            if _pitem is not None:
-                _touched = [p.lower() for p in _parse_touches_files(_pitem.get("touches_files"))]
-                _hits = sorted({fn for fn in ("hooks.ps1", "hooks.sh")
-                                if any(t == fn or t.endswith("/" + fn) for t in _touched)})
-                if _hits:
-                    return {
-                        "error": "PROTECTED",
-                        "message": ("Sprint item touches protected installer scripts "
-                                    f"({', '.join(_hits)}). Pass force=true to override."),
-                        "protected_files": _hits,
-                    }
-
-        # 0716c9e0 — parallel safety: load project settings once for both
-        # auto_worktrees (suggest worktree by default) and isolation=worktree.
-        _suggest_worktree = False
-        _exec_cfg: dict[str, Any] = {}
-        _proj_settings_claim: dict[str, Any] = {}
-        try:
-            _ps = await db_module.get_project_settings(db, args["project_id"])
-            _proj_settings_claim = _ps or {}
-            _raw_cfg = _proj_settings_claim.get("executor_config")
-            if _raw_cfg:
-                _exec_cfg = json.loads(_raw_cfg) if isinstance(_raw_cfg, str) else (_raw_cfg or {})
-        except Exception:  # noqa: BLE001
-            pass
-        _isolation = (_exec_cfg or {}).get("isolation", "")
-        _aw_raw = _proj_settings_claim.get("auto_worktrees")
-        _auto_worktrees = bool(int(_aw_raw) if _aw_raw is not None else 1)
-        if _isolation == "worktree" or _auto_worktrees:
-            _suggest_worktree = True
-        else:
-            conflicts = await _sprint_item_file_claim_conflicts(
-                db,
-                args["project_id"],
-                args["item_id"],
-                exclude_session_id=args.get("session_id"),
-            )
-            if conflicts:
-                return {
-                    "error": "CONFLICT",
-                    "message": "Cannot claim sprint item: active session has overlapping claimed files.",
-                    "conflicts": conflicts,
-                }
-
-        try:
-            item = await db_module.claim_sprint_item(db, args["project_id"], args["item_id"])
-        except ValueError:
-            # 10c0f6a0 — if already in_progress, check for stale claim and surface info
-            _stale_item = await db_module.get_sprint_item(db, args["item_id"])
-            if _stale_item and _stale_item.get("status") == "in_progress" and _stale_item.get("claimed_at"):
-                from datetime import datetime as _dt_cls
-                try:
-                    _ca = _dt_cls.fromisoformat(_stale_item["claimed_at"].split(".")[0].replace("Z", ""))
-                    _age_h = (_dt_cls.utcnow() - _ca).total_seconds() / 3600
-                    if _age_h > 2:
-                        return {
-                            "error": "STALE_CLAIM",
-                            "message": (
-                                f"Item is in_progress but claimed {round(_age_h, 1)}h ago with no recent "
-                                "activity — the claiming session may have ended. Safe to force-reclaim "
-                                "by updating status to 'pending' first via update_sprint_item."
-                            ),
-                            "stale_age_hours": round(_age_h, 1),
-                            "claimed_at": _stale_item["claimed_at"],
-                            "item": _stale_item,
-                        }
-                except Exception:  # noqa: BLE001
-                    pass
-            raise
-        if item is None:
-            raise ValueError("sprint item not found")
-
-        if _suggest_worktree:
-            item_id_short = item["id"][:8]
-            _session_id_claim = args.get("session_id") or ""
-            if _auto_worktrees and _isolation != "worktree" and _session_id_claim:
-                # Default path: .claude/worktrees/{session_id_short} (gitignored)
-                wt_branch = f"worktree/{item_id_short}"
-                wt_path = f".claude/worktrees/{_session_id_claim[:8]}"
-            else:
-                # Legacy isolation=worktree path: repo-relative sibling dir
-                repo_path = ""
-                _repo_paths = _exec_cfg.get("repo_paths")
-                if _repo_paths and isinstance(_repo_paths, list) and _repo_paths:
-                    _first = _repo_paths[0]
-                    repo_path = (_first.get("cwd") or "") if isinstance(_first, dict) else str(_first)
-                if not repo_path:
-                    repo_path = _exec_cfg.get("repo_path") or ""
-                repo_name = os.path.basename(repo_path.rstrip("/\\")) if repo_path else "repo"
-                wt_branch = f"worktree/{item_id_short}"
-                wt_path = f"../{repo_name}-worktree-{item_id_short}"
-            item = dict(item)
-            item.update({
-                "worktree_suggested": True,
-                "worktree_branch": wt_branch,
-                "worktree_path": wt_path,
-                "worktree_setup_cmd": f"git worktree add {wt_path} -b {wt_branch}",
-                "worktree_cleanup_cmd": f"git worktree remove {wt_path} --force",
-                "worktree_merge_cmd": (
-                    f"git checkout dev && git merge {wt_branch} --no-edit "
-                    f"&& git branch -d {wt_branch}"
-                ),
-            })
-
-        return item
-    if name == "add_subtask":
-        return await db_module.add_subtask(
-            db, args["project_id"], args["parent_id"], args["title"]
-        )
-    if name == "split_sprint_item":
-        return await db_module.split_sprint_item(
-            db, args["project_id"], args["item_id"], args["titles"]
-        )
-    if name == "merge_sprint_items":
-        return await db_module.merge_sprint_items(
-            db, args["project_id"], args["item_ids"], args["new_title"]
-        )
-    if name == "complete_sprint_item":
-        # 0716c9e0 — check active worktree before marking done.
-        _complete_session_id = args.get("session_id") or ""
-        _merge_warning: dict[str, Any] | None = None
-        if _complete_session_id:
-            try:
-                _ps_complete = await db_module.get_project_settings(db, args["project_id"])
-                _req_merge = bool(int((_ps_complete or {}).get("require_merge_approval") or 1))
-                if _req_merge:
-                    _wt = await db_module.get_active_worktree_for_session(db, _complete_session_id)
-                    if _wt:
-                        _hitl = await db_module.request_hitl(
-                            db, args["project_id"],
-                            f"Session has active worktree on branch '{_wt['branch']}' "
-                            f"at '{_wt['path']}'. Merge to main before closing. "
-                            f"Run: git checkout dev && git merge {_wt['branch']} --no-edit",
-                            session_id=_complete_session_id,
-                            urgency="normal", kind="correction",
-                        )
-                        _merge_warning = {
-                            "worktree_branch": _wt["branch"],
-                            "worktree_path": _wt["path"],
-                            "hitl_id": (_hitl or {}).get("id"),
-                            "message": "Merge reminder filed — see HITL queue.",
-                        }
-            except Exception:  # noqa: BLE001
-                pass
-
-        item = await db_module.complete_sprint_item(
-            db, args["project_id"], args["item_id"],
-            task_id=args.get("task_id"),
-        )
-        if item is None:
-            raise ValueError("sprint item not found")
-        if _merge_warning:
-            item = dict(item)
-            item["merge_warning"] = _merge_warning
-        # Notify only when the sprint is fully complete.
-        active_statuses = {"pending", "todo", "in_progress"}
-        remaining_items = await db_module.get_sprint_items(db, args["project_id"])
-        if not any((it.get("status") or "") in active_statuses for it in remaining_items):
-            await _maybe_notify(
-                db, args["project_id"],
-                "Sprint done ✓",
-                "All sprint items are complete.",
-                event="sprint_done",
-                tenant=tenant,
-                pref_key="sprint",
-            )
-        return item
-    if name == "get_session_log":
-        run = await db_module.get_executor_run_by_session(db, args.get("session_id", ""))
-        if run is None:
-            return {"error": "no run found for session"}
-        return {
-            "run_id": run["id"],
-            "session_id": run["session_id"],
-            "started_at": run["started_at"],
-            "ended_at": run.get("ended_at"),
-            "status": run["status"],
-            "task_count": run["task_count"],
-            "transcript": run["transcript"],
-        }
-    if name == "get_agent_instructions":
-        instructions = await db_module.get_agent_instructions(db, args["project_id"])
-        return {"project_id": args["project_id"], "agent_instructions": instructions}
-    if name == "set_agent_instructions":
-        validate_input_size(args.get("instructions"), "agent_instructions", 100_000)
-        instructions = (args.get("instructions") or "").strip() or None
-        return await db_module.set_agent_instructions(db, args["project_id"], instructions)
-    if name == "set_executor_config":
-        cfg_fields = {
-            k: args[k]
-            for k in ("repo_path", "env_file", "test_cmd", "test_min",
-                      "deploy_cmd", "shell_type", "branch")
-            if k in args
-        }
-        return await db_module.set_executor_config(db, args["project_id"], cfg_fields)
-    if name == "claim_file":
-        return await db_module.claim_file(db, args["file_path"], args["session_id"])
-    if name == "release_file":
-        released = await db_module.release_file(db, args["file_path"], args["session_id"])
-        return {"released": released, "file_path": args["file_path"]}
-    if name == "idle_until_session_done":
-        return await _idle_until_session_done(db, args["watching_session_id"])
-    if name == "search_all":
-        return await db_module.search_all(
-            db, args["project_id"], args["query"],
-            limit=args.get("limit", 10),
-        )
-    if name == "get_session_brief":
-        # v2.5 — single-call orientation, <500 tokens, XML output.
-        project_id = args["project_id"]
-        role = args.get("role", "worker")
-        session_id_for_notes = args.get("session_id")
-        goal = await db_module.get_goal(db, project_id)
-        tasks = await db_module.get_tasks(db, project_id, limit=5)
-        # dcf1e428 — use 'recent' to surface pending + answered last 24h for planning sessions
-        hitl_rows = await db_module.list_hitl_requests(db, project_id, status="recent")
-        sprint_items = await db_module.get_sprint_items(db, project_id, status="pending")
-        # 0507f4a1 — sprint progress summary for session brief
-        _all_items_for_progress = await db_module.get_sprint_items(db, project_id)
-        _done_count = sum(1 for it in _all_items_for_progress if it.get("status") == "done")
-        _total_count = len(_all_items_for_progress)
-        _pct = round(100 * _done_count / _total_count) if _total_count else 0
-        blocking = [t for t in tasks if t.get("status") == "failed"]
-        sprint_str = (goal.get("sprint") or "") if goal else ""
-        tasks_xml = "\n".join(
-            f'  <task status="{t.get("status","?")}">{(t.get("description") or "")[:80]}</task>'
-            for t in tasks
-        )
-        sprint_items_xml = "\n".join(
-            f'  <item version="{it.get("version","")}">{(it.get("title") or "")[:80]}</item>'
-            for it in sprint_items[:5]
-        )
-        # 277567dc — surface pending HITLs so session sees what needs a human decision.
-        # dcf1e428 — also surface recently answered HITLs so planning sessions can see what was decided.
-        _pending_hitls = [h for h in hitl_rows if h.get("status") == "pending"]
-        _answered_hitls = [h for h in hitl_rows if h.get("status") != "pending"]
-        if _pending_hitls:
-            hitl_xml = (
-                f'<hitl_pending count="{len(_pending_hitls)}">\n'
-                + "\n".join(
-                    f'  <request id="{h.get("id","")}" urgency="{h.get("urgency","normal")}">'
-                    f'{(h.get("question") or "")[:140]}</request>'
-                    for h in _pending_hitls[:5]
-                )
-                + "\n</hitl_pending>"
-            )
-        else:
-            hitl_xml = ""
-        if _answered_hitls:
-            hitl_xml += (
-                f'\n<hitl_recent count="{len(_answered_hitls)}">\n'
-                + "\n".join(
-                    f'  <request status="{h.get("status","?")}">'
-                    f'Q: {(h.get("question") or "")[:80]} '
-                    f'A: {(h.get("answer") or "")[:80]}</request>'
-                    for h in _answered_hitls[:3]
-                )
-                + "\n</hitl_recent>"
-            )
-        blocking_xml = f'<blocking>{(blocking[0].get("description") or "")[:100]}</blocking>' if blocking else ""
-        # v2.6 — include session scratch-pad notes at top of brief
-        notes_xml = ""
-        new_items_xml = ""
-        if session_id_for_notes:
-            try:
-                session_notes = await db_module.get_session_notes(db, session_id_for_notes)
-                if session_notes:
-                    notes_xml = "<session_notes>\n" + "\n".join(
-                        f'  <note title="{n.get("title","")}">{(n.get("body") or "")[:120]}</note>'
-                        for n in session_notes
-                    ) + "\n</session_notes>\n"
+                _exp_dt = _dt.fromisoformat(str(_exp_str).replace("Z", "+00:00"))
+                if _exp_dt.tzinfo is None:
+                    _exp_dt = _exp_dt.replace(tzinfo=_tz.utc)
+                if _dt.now(tz=_tz.utc) <= _exp_dt and not _row_d.get("approved"):
+                    row_data = _row_d
             except Exception:
                 pass
-            # fd86aacc — show items added to the board since this session started
+
+    if code_param and row_data is None:
+        # Code not found / expired / already used
+        error_msg = "This code has expired or was already used. Start the device flow again."
+        return HTMLResponse(content=_activate_page(b, code_param, error=error_msg))
+
+    return HTMLResponse(content=_activate_page(b, code_param, row=row_data))
+
+
+def _activate_page(base_url: str, code: str, *, row: dict | None = None, error: str | None = None) -> str:
+    if error:
+        body_html = f'<div class="error">{error}</div>'
+    elif row:
+        uc = row.get("user_code", code)
+        body_html = f'''
+        <p class="sub">A device or application wants to connect to your Meridian account.</p>
+        <div class="code-box">{uc}</div>
+        <p class="sub" style="font-size:13px;margin-bottom:24px">Confirm this code matches what your device shows.</p>
+        <form method="POST" action="{base_url}/activate">
+          <input type="hidden" name="user_code" value="{uc}">
+          <div class="btn-row">
+            <button type="submit" name="action" value="approve" class="btn-approve">Approve</button>
+            <button type="submit" name="action" value="deny" class="btn-deny">Deny</button>
+          </div>
+        </form>'''
+    else:
+        body_html = '''
+        <p class="sub">Enter the code shown on your device.</p>
+        <form method="GET" action="/activate" style="margin-top:16px">
+          <input type="text" name="code" placeholder="XXXX-XXXX" autofocus
+            style="width:100%;max-width:220px;text-align:center;font-size:20px;font-family:var(--mono);
+                   background:#1a1a1a;border:1px solid #444;border-radius:6px;color:#e8e8e8;
+                   padding:10px 12px;letter-spacing:4px">
+          <button type="submit" style="display:block;margin:12px auto 0;padding:8px 24px;background:#3b82f6;
+            color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:14px">Continue</button>
+        </form>'''
+
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Meridian — Activate Device</title>
+  <style>
+    :root{{--mono:'IBM Plex Mono',monospace}}
+    body{{font-family:system-ui,sans-serif;background:#0d0d0d;color:#e8e8e8;
+          display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}}
+    .card{{background:#1a1a1a;border:1px solid #2e2e2e;border-radius:12px;
+           padding:32px 40px;max-width:460px;width:100%;text-align:center}}
+    h2{{margin:0 0 6px;font-size:20px;color:#fff}}
+    .sub{{color:#888;font-size:14px;margin:0 0 16px}}
+    .code-box{{font-family:var(--mono);font-size:28px;letter-spacing:8px;color:#7dd3fc;
+               background:#0d0d0d;border:1px solid #333;border-radius:8px;
+               padding:16px 24px;display:inline-block;margin-bottom:16px}}
+    .btn-row{{display:flex;gap:12px;justify-content:center;margin-top:8px}}
+    .btn-approve{{padding:10px 28px;background:#22c55e;color:#fff;border:none;
+                  border-radius:6px;font-size:15px;cursor:pointer;font-weight:600}}
+    .btn-approve:hover{{background:#16a34a}}
+    .btn-deny{{padding:10px 28px;background:#3a3a3a;color:#ccc;border:1px solid #555;
+               border-radius:6px;font-size:15px;cursor:pointer}}
+    .btn-deny:hover{{background:#555}}
+    .error{{color:#f87171;background:#2a1111;border:1px solid #7f1d1d;border-radius:6px;
+            padding:12px 16px;font-size:14px}}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h2>Meridian</h2>
+    {body_html}
+  </div>
+</body>
+</html>"""
+
+
+@app.post("/activate")
+async def _activate_post(request: Request):
+    """Handle device approval or denial."""
+    if _hosted_mode():
+        try:
+            from .hosted import _SESSION_COOKIE, _read_session_cookie, get_current_tenant
+            tenant = await get_current_tenant(request)
+            tenant_id = tenant["id"]
+        except Exception:
+            return _RR("/auth/login?next=/activate")
+    else:
+        tenant_id = None
+
+    form = dict(await request.form())
+    user_code = (form.get("user_code") or "").strip().upper()
+    action = (form.get("action") or "").strip()
+    auth_db = request.app.state.db
+
+    if not user_code:
+        return _RR("/activate", status_code=303)
+
+    async with auth_db.execute(
+        "SELECT device_code, user_code, expires_at, approved FROM device_codes WHERE user_code = ?",
+        (user_code,),
+    ) as _cur:
+        _row = await _cur.fetchone()
+
+    if _row is None:
+        return _RR("/activate", status_code=303)
+
+    if action == "approve":
+        await auth_db.execute(
+            "UPDATE device_codes SET tenant_id = ?, approved = 1 WHERE user_code = ?",
+            (tenant_id, user_code),
+        )
+        await auth_db.commit()
+    else:
+        await auth_db.execute("DELETE FROM device_codes WHERE user_code = ?", (user_code,))
+        await auth_db.commit()
+
+    return _RR("/dashboard", status_code=303)
+
+
+@app.get("/oauth/authorize")
+async def _oauth_auth(request: Request):
+    p = dict(request.query_params)
+    # ── Session cookie guard (hosted mode only) ─────────────────────────────
+    # Prevents unauthenticated callers from obtaining MCP access tokens.
+    # Local / self-hosted installs skip this guard (_hosted_mode() is False).
+    if _hosted_mode():
+        authed = False
+        from .hosted import _SESSION_COOKIE, _read_session_cookie
+        auth_db = request.app.state.db
+        cookie_val = request.cookies.get(_SESSION_COOKIE, "")
+        if cookie_val:
+            sid = _read_session_cookie(cookie_val)
+            if sid and await db_module.get_user_session(auth_db, sid):
+                authed = True
+        if not authed:
+            # Also accept a bearer token (API-key flow)
+            auth_header = request.headers.get("authorization", "")
+            if auth_header.startswith("Bearer "):
+                tok_hash = hashlib.sha256(auth_header[7:].encode()).hexdigest()
+                if await db_module.get_tenant_from_token_hash(auth_db, tok_hash):
+                    authed = True
+        if not authed:
+            from urllib.parse import quote as _q
+            orig_qs = str(request.url.query)
+            next_path = f"/oauth/authorize?{orig_qs}" if orig_qs else "/oauth/authorize"
+            return _RR(f"/auth/login?next={_q(next_path)}")
+    # ── Auto-approve ────────────────────────────────────────────────────────
+    # In hosted mode, capture the tenant_id from the session so MCP requests
+    # can be routed to the correct per-tenant project DB.
+    _tenant_id: str | None = None
+    if _hosted_mode():
+        from .hosted import _SESSION_COOKIE, _read_session_cookie
+        _cookie = request.cookies.get(_SESSION_COOKIE, "")
+        _sid = _read_session_cookie(_cookie) if _cookie else None
+        if _sid:
+            _sess = await db_module.get_user_session(request.app.state.db, _sid)
+            if _sess:
+                _tenant_id = _sess.get("tenant_id")
+
+    code = _sec.token_hex(32)
+    _redirect_uri = p.get("redirect_uri", "")
+    _challenge = p.get("code_challenge") or ""
+    _oa_codes[code] = {"client_id": p.get("client_id", ""),
+        "redirect_uri": _redirect_uri,
+        "challenge": _challenge,
+        "tenant_id": _tenant_id,
+        "exp": _tm.time() + 600}
+    try:
+        from datetime import datetime as _dt, timezone as _tz, timedelta as _td_cls
+        _expires = (_dt.now(tz=_tz.utc) + _td_cls(minutes=10)).strftime("%Y-%m-%d %H:%M:%S")
+        _adb = request.app.state.db
+        await _adb.execute(
+            "INSERT OR REPLACE INTO oauth_codes (code, tenant_id, redirect_uri, code_challenge, expires_at)"
+            " VALUES (?, ?, ?, ?, ?)",
+            (code, _tenant_id, _redirect_uri, _challenge, _expires),
+        )
+        await _adb.commit()
+    except Exception:
+        pass
+    qs = _ue({"code": code, "state": p.get("state", "")})
+    return _RR(f"{_redirect_uri}?{qs}")
+
+
+@app.get("/oauth/device-callback")
+async def _oauth_device_callback(request: Request):
+    """Show auth code on a success page; JS auto-redirects to the original
+    localhost callback so the MCP SDK completes the flow without user action
+    in local sessions. Remote sessions see the URL to paste."""
+    p = dict(request.query_params)
+    code = p.get("code", "")
+    state = p.get("state", "")
+    to = p.get("to", "")  # original localhost redirect_uri
+    callback_url = f"{to}?code={code}&state={state}" if to else ""
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Meridian — Authorized</title>
+<style>
+body{{font-family:system-ui,sans-serif;background:#0f0f0f;color:#e5e5e5;
+  display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}}
+.card{{background:#1a1a1a;border:1px solid #333;border-radius:12px;padding:2rem 2.5rem;
+  max-width:520px;width:90%;text-align:center}}
+h1{{color:#4ade80;margin:0 0 .5rem}}
+p{{color:#999;margin:.5rem 0}}
+.url{{background:#111;border:1px solid #444;border-radius:6px;padding:.75rem 1rem;
+  font-family:monospace;font-size:.8rem;word-break:break-all;text-align:left;
+  color:#e5e5e5;margin:1rem 0;cursor:pointer;user-select:all}}
+.copy-btn{{background:#4ade80;color:#000;border:none;border-radius:6px;
+  padding:.5rem 1.25rem;font-weight:600;cursor:pointer;font-size:.9rem}}
+.copy-btn:hover{{background:#22c55e}}
+.note{{font-size:.8rem;color:#666;margin-top:.75rem}}
+</style></head>
+<body><div class="card">
+<h1>&#10003; Authorized</h1>
+<p>Paste this URL into your terminal when prompted:</p>
+<div class="url" id="cburl" onclick="copyUrl()">{callback_url}</div>
+<button class="copy-btn" onclick="copyUrl()">Copy URL</button>
+<p class="note" id="note">In a local session this page will auto-close.</p>
+</div>
+<script>
+function copyUrl(){{
+  var u = document.getElementById('cburl').textContent;
+  navigator.clipboard && navigator.clipboard.writeText(u).then(function(){{
+    document.querySelector('.copy-btn').textContent = 'Copied!';
+  }});
+}}
+// Auto-redirect for local sessions — localhost server may be listening.
+var to = {_json.dumps(callback_url)};
+if (to) {{
+  fetch(to, {{mode:'no-cors'}}).then(function(){{
+    document.getElementById('note').textContent = 'Local session detected — you can close this tab.';
+  }}).catch(function(){{}});
+  // Hard redirect after short delay so the MCP SDK receives the code.
+  setTimeout(function(){{ window.location.href = to; }}, 800);
+}}
+</script></body></html>"""
+    from fastapi.responses import HTMLResponse as _HR
+    return _HR(html)
+
+
+@app.post("/oauth/token")
+async def _oauth_token(request: Request):
+    ct = request.headers.get("content-type", "")
+    d = dict(await request.json() if "json" in ct else await request.form())
+    grant_type = d.get("grant_type", "")
+
+    # ── RFC 8628 device_code grant ──────────────────────────────────────────
+    if grant_type == "urn:ietf:params:oauth:grant-type:device_code":
+        device_code = (d.get("device_code") or "").strip()
+        if not device_code:
+            return JSONResponse({"error": "invalid_request", "error_description": "device_code required"}, status_code=400)
+        auth_db = request.app.state.db
+        from datetime import datetime as _dt, timezone as _tz
+        async with auth_db.execute(
+            "SELECT device_code, user_code, tenant_id, expires_at, approved FROM device_codes WHERE device_code = ?",
+            (device_code,),
+        ) as _cur:
+            _row = await _cur.fetchone()
+        if _row is None:
+            return JSONResponse({"error": "expired_token", "error_description": "device code expired or not found"}, status_code=400)
+        _row_d = dict(zip(["device_code", "user_code", "tenant_id", "expires_at", "approved"], _row)) if not hasattr(_row, "keys") else dict(_row)
+        # Check expiry
+        try:
+            _exp_dt = _dt.fromisoformat(str(_row_d["expires_at"]).replace("Z", "+00:00"))
+            if _exp_dt.tzinfo is None:
+                _exp_dt = _exp_dt.replace(tzinfo=_tz.utc)
+            if _dt.now(tz=_tz.utc) > _exp_dt:
+                await auth_db.execute("DELETE FROM device_codes WHERE device_code = ?", (device_code,))
+                await auth_db.commit()
+                return JSONResponse({"error": "expired_token", "error_description": "device code expired"}, status_code=400)
+        except Exception:
+            return JSONResponse({"error": "expired_token"}, status_code=400)
+        if not _row_d.get("approved"):
+            return JSONResponse({"error": "authorization_pending"}, status_code=200)
+        # Approved — issue token
+        await auth_db.execute("DELETE FROM device_codes WHERE device_code = ?", (device_code,))
+        await auth_db.commit()
+        tok = f"sk_meridian_{_sec.token_urlsafe(32)}"
+        tok_hash = _oauth_token_hash(tok)
+        _oa_tenant_id = _row_d.get("tenant_id")
+        tok_data = {"client_id": d.get("client_id", "meridian"), "exp": int(_tm.time() + 86400 * 90), "tenant_id": _oa_tenant_id}
+        _oa_tokens[tok_hash] = tok_data
+        if _oa_tenant_id:
+            import uuid as _uuid
+            _api_tid = str(_uuid.uuid4())
             try:
-                _all_sess = await db_module.get_sessions(db, project_id, active_only=False)
-                _curr_sess = next(
-                    (s for s in _all_sess if s.get("id") == session_id_for_notes), None
+                await auth_db.execute(
+                    "INSERT INTO api_tokens (id, tenant_id, token_hash, label, token_type) VALUES (?, ?, ?, ?, ?)",
+                    (_api_tid, _oa_tenant_id, tok_hash, "claude-code-oauth", "readwrite"),
                 )
-                if _curr_sess and _curr_sess.get("created_at"):
-                    _sess_started = str(_curr_sess["created_at"])
-                    _all_items = await db_module.get_sprint_items(db, project_id)
-                    _new_count = sum(
-                        1 for it in _all_items
-                        if (it.get("added_at") or "") >= _sess_started
-                    )
-                    if _new_count > 0:
-                        new_items_xml = (
-                            f'<board_change>{_new_count} item{"s" if _new_count != 1 else ""}'
-                            f' added since this session started</board_change>\n'
-                        )
+                await auth_db.commit()
             except Exception:
                 pass
-        _progress_xml = (
-            f'<progress done="{_done_count}" total="{_total_count}" pct="{_pct}%"/>\n'
-            if _total_count else ""
+        else:
+            await _upsert_oauth_token(auth_db, tok_hash, tenant_id=None, client_id=tok_data["client_id"], exp=tok_data["exp"])
+        _save_oa_tokens(_oa_tokens)
+        return JSONResponse({"access_token": tok, "token_type": "bearer", "expires_in": 86400 * 90})
+
+    if grant_type != "authorization_code":
+        return JSONResponse({"error": "unsupported_grant_type"}, status_code=400)
+    # S256 is the only supported PKCE method
+    _method = d.get("code_challenge_method", "")
+    if _method and _method != "S256":
+        return JSONResponse({"error": "invalid_request", "error_description": "Only S256 code_challenge_method is supported"}, status_code=400)
+    code = d.get("code", "")
+    auth_db = request.app.state.db
+    # Look up code from DB first (survives restarts), fall back to in-memory
+    cd: dict | None = None
+    try:
+        from datetime import datetime as _dt, timezone as _tz
+        async with auth_db.execute(
+            "SELECT tenant_id, redirect_uri, code_challenge, expires_at FROM oauth_codes WHERE code = ?",
+            (code,),
+        ) as _cur:
+            _row = await _cur.fetchone()
+        if _row:
+            _exp_str = _row["expires_at"] if hasattr(_row, "__getitem__") else _row[3]
+            _exp_dt = _dt.fromisoformat(str(_exp_str).replace("Z", "+00:00"))
+            if _exp_dt.tzinfo is None:
+                from datetime import timezone as _tz2
+                _exp_dt = _exp_dt.replace(tzinfo=_tz2.utc)
+            if _dt.now(tz=_tz.utc) > _exp_dt:
+                await auth_db.execute("DELETE FROM oauth_codes WHERE code = ?", (code,))
+                await auth_db.commit()
+                return JSONResponse({"error": "invalid_grant"}, status_code=400)
+            cd = {
+                "client_id": d.get("client_id", ""),
+                "redirect_uri": _row["redirect_uri"] if hasattr(_row, "__getitem__") else _row[1],
+                "challenge": _row["code_challenge"] if hasattr(_row, "__getitem__") else _row[2],
+                "tenant_id": _row["tenant_id"] if hasattr(_row, "__getitem__") else _row[0],
+            }
+            await auth_db.execute("DELETE FROM oauth_codes WHERE code = ?", (code,))
+            await auth_db.commit()
+    except Exception:
+        pass
+    if cd is None:
+        if code not in _oa_codes:
+            return JSONResponse({"error": "invalid_grant"}, status_code=400)
+        _mem = _oa_codes.pop(code)
+        if _tm.time() > _mem["exp"]:
+            return JSONResponse({"error": "invalid_grant"}, status_code=400)
+        cd = {
+            "client_id": _mem.get("client_id", ""),
+            "redirect_uri": _mem.get("redirect_uri", ""),
+            "challenge": _mem.get("challenge", ""),
+            "tenant_id": _mem.get("tenant_id"),
+        }
+    # redirect_uri must match what was stored
+    if cd["redirect_uri"] and d.get("redirect_uri") != cd["redirect_uri"]:
+        return JSONResponse({"error": "invalid_grant"}, status_code=400)
+    # Validate code_verifier length
+    v = d.get("code_verifier", "")
+    if v and not (43 <= len(v) <= 128):
+        return JSONResponse({"error": "invalid_request", "error_description": "code_verifier must be 43-128 characters"}, status_code=400)
+    # Verify PKCE challenge when present
+    if cd["challenge"]:
+        if not v:
+            return JSONResponse({"error": "invalid_grant"}, status_code=400)
+        ch = _b64.urlsafe_b64encode(_hs.sha256(v.encode()).digest()).decode().rstrip("=")
+        if ch != cd["challenge"]:
+            return JSONResponse({"error": "invalid_grant"}, status_code=400)
+    # Generate sk_meridian_ token
+    tok = f"sk_meridian_{_sec.token_urlsafe(32)}"
+    tok_hash = _oauth_token_hash(tok)
+    tenant_id = cd.get("tenant_id")
+    tok_data = {
+        "client_id": cd["client_id"],
+        "exp": int(_tm.time() + 86400 * 90),
+        "tenant_id": tenant_id,
+    }
+    _oa_tokens[tok_hash] = tok_data
+    if tenant_id:
+        # Hosted mode: store in api_tokens so Bearer auth and _db() routing both work
+        import uuid as _uuid
+        _api_tid = str(_uuid.uuid4())
+        try:
+            await auth_db.execute(
+                "INSERT INTO api_tokens (id, tenant_id, token_hash, label, token_type)"
+                " VALUES (?, ?, ?, ?, ?)",
+                (_api_tid, tenant_id, tok_hash, "oauth", "readwrite"),
+            )
+            await auth_db.commit()
+        except Exception:
+            pass
+    else:
+        # Self-hosted / local: store in oauth_tokens as before
+        await _upsert_oauth_token(
+            auth_db,
+            tok_hash,
+            tenant_id=None,
+            client_id=tok_data["client_id"],
+            exp=tok_data["exp"],
         )
-        brief = (
-            f'<session_brief project_id="{project_id}" role="{role}">\n'
-            f'{notes_xml}'
-            f'{new_items_xml}'
-            f'{_progress_xml}'
-            f'<sprint>{sprint_str[:200]}</sprint>\n'
-            f'<pending_items>\n{sprint_items_xml}\n</pending_items>\n'
-            f'<last_tasks>\n{tasks_xml}\n</last_tasks>\n'
-            f'{blocking_xml}\n'
-            f'{hitl_xml}\n'
-            f'</session_brief>'
+    _save_oa_tokens(_oa_tokens)
+    return JSONResponse({"access_token": tok, "token_type": "bearer", "expires_in": 86400 * 90})
+
+
+@app.get("/mcp")
+async def _mcp_get(request: Request):
+    accept = request.headers.get("accept", "")
+    if "text/event-stream" in accept:
+        return _RR("/mcp/sse")
+    return JSONResponse({"name": "meridian", "version": "1.0", "transport": "http+sse"})
+
+# ── End OAuth ──────────────────────────────────────────────────────────────
+
+
+_SSE_CORS_HEADERS = {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Headers": "Content-Type, Authorization",
+    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+    "Cache-Control": "no-cache, no-store",
+    "X-Accel-Buffering": "no",
+}
+
+
+@app.options("/mcp/sse")
+async def mcp_sse_options(request: Request) -> Response:
+    """CORS preflight for chrome-extension:// origin."""
+    return Response(status_code=204, headers=_SSE_CORS_HEADERS)
+
+
+@app.get("/mcp/sse")
+async def mcp_sse_get(request: Request) -> StreamingResponse:
+    """MCP SSE transport GET — opens event stream for dnakov/claude-mcp.
+
+    Sends ``event: endpoint`` with POST URL, then heartbeats every 15 s.
+    No strict auth required: uses the same _db() resolver (Bearer / cookie /
+    local fallback) so both local and hosted-tier clients work.
+    """
+    import uuid as _uuid
+    import anyio as _anyio
+
+    db = await _db(request)
+    data_dir = _data_dir(request)
+
+    # Reuse session_id on reconnect if client sends one and it's valid
+    requested_sid = request.query_params.get("session_id")
+    if requested_sid and requested_sid in _SSE_SESSIONS:
+        session_id = requested_sid
+        _SSE_SESSIONS[session_id]["db"] = db
+    else:
+        session_id = str(_uuid.uuid4())
+        _SSE_SESSIONS[session_id] = {"db": db, "data_dir": data_dir}
+
+    endpoint_path = f"/mcp/sse?session_id={session_id}"
+
+    async def _stream():
+        try:
+            yield f"event: endpoint\ndata: {endpoint_path}\n\n"
+            # Heartbeat loop — exit when client disconnects
+            while True:
+                if await request.is_disconnected():
+                    break
+                yield ": heartbeat\n\n"
+                await _anyio.sleep(15)
+        finally:
+            _SSE_SESSIONS.pop(session_id, None)
+
+    return StreamingResponse(
+        _stream(),
+        media_type="text/event-stream",
+        headers=_SSE_CORS_HEADERS,
+    )
+
+
+@app.post("/mcp/sse")
+async def mcp_sse_post(request: Request) -> Any:
+    """MCP SSE transport POST — JSON-RPC handler for dnakov/claude-mcp.
+
+    Client POSTs a JSON-RPC 2.0 message; response is returned as JSON in the
+    HTTP response body (extension reads it directly, not via the SSE stream).
+    """
+    from fastapi.responses import JSONResponse as _JSONResp
+
+    session_id = request.query_params.get("session_id", "")
+    sess = _SSE_SESSIONS.get(session_id)
+    db = sess["db"] if sess else await _db(request)
+    data_dir = sess["data_dir"] if sess else _data_dir(request)
+
+    try:
+        body = await request.json()
+    except Exception:
+        return _JSONResp(_jsonrpc_err(None, -32700, "parse error"), status_code=400, headers=_SSE_CORS_HEADERS)
+
+    if isinstance(body, list):
+        results = [await _handle_mcp_request(item, db, data_dir) for item in body]
+        return _JSONResp(results, headers=_SSE_CORS_HEADERS)
+
+    result = await _handle_mcp_request(body, db, data_dir)
+    return _JSONResp(result, headers=_SSE_CORS_HEADERS)
+
+
+@app.post("/feedback", status_code=201)
+async def submit_feedback(request: Request) -> dict[str, str]:
+    """Submit user feedback. Requires JSON body: {\"type\": \"...\", \"message\": \"...\", \"email\": \"...\"}."""
+    if not _hosted_mode():
+        raise HTTPException(status_code=404)
+    if _is_demo_request(request):
+        return {"id": "demo"}
+    from .hosted import get_current_tenant
+    tenant = await get_current_tenant(request)
+    if not tenant:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    body = await request.json()
+    feedback_type = body.get("type", "general")
+    message = (body.get("message") or "").strip()
+    email = body.get("email", tenant.get("email"))
+
+    if not message:
+        raise HTTPException(status_code=400, detail="Message is required")
+
+    # Validate email format if provided
+    if email and ("@" not in email or "." not in email.split("@")[-1]):
+        raise HTTPException(status_code=400, detail="Invalid email address")
+
+    # Feedback goes in the auth DB (not project DB) — tenants table is there
+    auth_db = request.app.state.db
+    try:
+        feedback_id = await db_module.add_feedback(auth_db, tenant["id"], feedback_type, message, email)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Feedback save failed: {exc}") from exc
+    return {"id": feedback_id}
+
+
+# ---------------------------------------------------------------------------
+# Per-token rate limiting for /mcp POST
+# ---------------------------------------------------------------------------
+
+import time as _mcp_time
+
+# {token_hash: (count, window_start_epoch_seconds)}
+_mcp_rate_counters: dict[str, tuple[int, float]] = {}
+_MCP_RATE_WINDOW = 60  # seconds
+
+
+def _mcp_rate_check(token_hash: str, limit: int) -> bool:
+    """Return True (= rate limited) if the token has exceeded limit calls/min."""
+    now = _mcp_time.monotonic()
+    count, window_start = _mcp_rate_counters.get(token_hash, (0, now))
+    if now - window_start >= _MCP_RATE_WINDOW:
+        # New window
+        _mcp_rate_counters[token_hash] = (1, now)
+        return False
+    if count >= limit:
+        return True
+    _mcp_rate_counters[token_hash] = (count + 1, window_start)
+    return False
+
+
+@app.post("/mcp")
+async def remote_mcp(request: Request) -> Any:
+    try:
+        return await _remote_mcp_inner(request)
+    except Exception as _e:
+        import logging as _log
+        _req_id = getattr(request.state, "request_id", "unknown")
+        _log.getLogger("meridian.server").exception(
+            "unhandled exception in remote_mcp (request_id=%s)", _req_id, exc_info=_e
         )
-        return {"text": brief, "project_id": project_id, "role": role}
-    raise ValueError(f"unknown tool: {name}")
+        try:
+            _body = await request.body()
+            _req_id_from_body = __import__("json").loads(_body).get("id")
+        except Exception:
+            _req_id_from_body = None
+        from fastapi.responses import JSONResponse as _JR
+        return _JR({"jsonrpc": "2.0", "id": _req_id_from_body, "error": {"code": -32603, "message": "internal error — please retry"}})
+
+
+async def _remote_mcp_inner(request: Request) -> Any:
+    """Remote MCP endpoint — JSON-RPC 2.0 over HTTP.
+
+    Accepts OAuth bearer tokens and Meridian API keys over the same endpoint.
+    Rate-limited: 600 req/min per authenticated token, 60 req/min for free tier.
+    Accepts a single JSON-RPC 2.0 message or a batch (list).
+    """
+    from fastapi.responses import JSONResponse
+
+    if _limiter is not None:
+        try:
+            await _limiter._check_request_limit(request, None, False)
+        except Exception:
+            pass  # rate limiting is best-effort; don't block on errors
+
+    # Check local OAuth tokens first (claude.ai connector via tunnel or hosted OAuth)
+    _auth = request.headers.get("authorization", "")
+    _bearer = _auth.removeprefix("Bearer ").strip()
+    _bearer_hash = _oauth_token_hash(_bearer) if _bearer else ""
+    _td = _oa_tokens.get(_bearer_hash) if _bearer_hash else None
+    if _td is None and _bearer_hash:
+        _td = await _get_oauth_token_from_db(request.app.state.db, _bearer_hash)
+        if _td is not None:
+            _oa_tokens[_bearer_hash] = _td
+    if _td is not None:
+        if _tm.time() > _td.get("exp", 0):
+            _oa_tokens.pop(_bearer_hash, None)
+            _base_r = str(request.base_url).rstrip("/")
+            return JSONResponse(
+                {"error": "token_expired"},
+                status_code=401,
+                headers={"WWW-Authenticate": f'Bearer resource_metadata="{_base_r}/.well-known/oauth-protected-resource"'},
+            )
+        try:
+            _body = await request.json()
+        except Exception:
+            return JSONResponse(_jsonrpc_err(None, -32700, "parse error"), status_code=400)
+        # In hosted mode, route to the tenant's project DB (not the shared auth DB).
+        # tenant_id is stored in _oa_tokens when the OAuth flow ran in hosted mode.
+        _mdb = request.app.state.db
+        _oa_tenant_id = _td.get("tenant_id")
+        if _oa_tenant_id and _hosted_mode():
+            try:
+                from ._deps import _open_tenant_db_by_id
+                _mdb = await _open_tenant_db_by_id(request, _oa_tenant_id)
+            except Exception:
+                pass  # fall back to auth DB — better than 500
+        _mdd = request.app.state.data_dir
+        _oa_tenant = None
+        if _oa_tenant_id and _hosted_mode():
+            _oa_tenant = await db_module.get_tenant_by_id(request.app.state.db, _oa_tenant_id)
+        if isinstance(_body, list):
+            return JSONResponse([await _handle_mcp_request(i, _mdb, _mdd, tenant=_oa_tenant) for i in _body])
+        return JSONResponse(await _handle_mcp_request(_body, _mdb, _mdd, tenant=_oa_tenant))
+
+    tenant = None
+    if _bearer_hash:
+        tenant = await db_module.get_tenant_from_token_hash(request.app.state.db, _bearer_hash)
+    if tenant is None:
+        import logging as _logging
+        _raw_auth = request.headers.get("authorization", "")
+        _logging.getLogger("meridian.mcp_auth").warning(
+            "[mcp_auth] unrecognised token raw=%r ua=%r",
+            (_raw_auth[:60] if _raw_auth else "(none)"),
+            request.headers.get("user-agent", "")[:60],
+        )
+        _base = str(request.base_url).rstrip("/")
+        return JSONResponse(
+            {"detail": "invalid API token"},
+            status_code=401,
+            headers={
+                "WWW-Authenticate": (
+                    f'Bearer realm="MCP",'
+                    f' error="invalid_token",'
+                    f' resource_metadata="{_base}/.well-known/oauth-protected-resource",'
+                    f' device_authorization_endpoint="{_base}/oauth/device"'
+                ),
+            },
+        )
+
+    # Extract token_type for read-only enforcement ('readwrite' or 'readonly').
+    _token_type = (tenant.pop("_token_type", None) or "readwrite")
+
+    # Per-token rate limiting: 60/min for free tier, 600/min for others.
+    _plan = (tenant.get("plan") or "free").lower()
+    _rate_limit = 100 if _plan == "free" else 1000
+    if _mcp_rate_check(_bearer_hash, _rate_limit):
+        return JSONResponse(
+            {"detail": f"rate limit exceeded ({_rate_limit} req/min)"},
+            status_code=429,
+            headers={"Retry-After": "60"},
+        )
+
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(_jsonrpc_err(None, -32700, "parse error"), status_code=400)
+
+    db = await _db(request)
+    data_dir = _data_dir(request)
+
+    if isinstance(body, list):
+        results = [await _handle_mcp_request(item, db, data_dir, tenant=tenant, token_type=_token_type) for item in body]
+        return JSONResponse(results)
+
+    result = await _handle_mcp_request(body, db, data_dir, tenant=tenant, token_type=_token_type)
+    return JSONResponse(result)
 
 # ---------------------------------------------------------------------------
 # MCP server — implementation lives in meridian/mcp/stdio_handler.py

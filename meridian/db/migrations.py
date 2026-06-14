@@ -12,7 +12,7 @@ from typing import Any
 
 import aiosqlite
 
-__all__ = ['_migrate_task_log_backlog_future', '_migrate_task_log_backburner', '_migrate_task_log_hitl', '_column_exists', '_migrate_add_column_if_missing', '_migrate_human_identity', '_migrate_v24_task_tree_and_framework', '_migrate_v25_feedback_and_notifications', '_migrate_v33_hitl_kind_payload', '_migrate_v34_hitl_auto_answer', '_migrate_v34_workspace_settings', '_migrate_dunning_fields', '_migrate_overage_fields', '_migrate_v26_client_type', '_migrate_ntfy_notifications', '_migrate_notify_email', '_migrate_github_integration', '_migrate_sprint_item_dependencies', '_migrate_v09_notes_and_magic_links', '_migrate_v24_pinned_decisions_and_hitl', '_migrate_goal_field_timestamps', '_migrate_task_claims', '_migrate_task_sprint_link', '_migrate_session_type', '_migrate_session_summary', '_migrate_parent_session_id', '_migrate_decisions', '_migrate_goal_mode', '_migrate_worker_pid', '_migrate_rewind_token', '_migrate_project_settings', '_migrate_neon_pool_projects_free_tier', '_migrate_tenants_free_plan', '_migrate_decisions_free_category', '_migrate_sessions_archived', '_migrate_goal_hierarchy', '_migrate_sprint_items_v2', '_migrate_drop_chat_tables', '_migrate_hosted_tables', '_migrate_session_notes', '_migrate_milestone_type', '_migrate_executor_runs', '_migrate_file_locks', '_migrate_workspace_layer', '_migrate_checkpoint_data', 'init_hosted_tables', '_migrate_sprint_item_tree', '_migrate_api_token_type', '_migrate_api_tokens_expires_at', '_migrate_github_to_projects', '_migrate_touches_files', '_migrate_oauth_codes_table', '_migrate_device_codes_table', '_migrate_sprint_items_indeterminate', '_migrate_workspace_members_rbac', '_migrate_project_icon', '_internal_emails', '_migrate_tenants_is_internal', '_migrate_admin_plan', '_migrate_active_worktrees', '_migrate_workspace_tenant_isolation', '_migrate_registered_hostnames', '_migrate_queued_session', '_migrate_parallel_safety', '_migrate_changelog_entries', '_migrate_agent_instructions']
+__all__ = ['_migrate_task_log_backlog_future', '_migrate_task_log_backburner', '_migrate_task_log_hitl', '_column_exists', '_migrate_add_column_if_missing', '_migrate_human_identity', '_migrate_v24_task_tree_and_framework', '_migrate_v25_feedback_and_notifications', '_migrate_v33_hitl_kind_payload', '_migrate_v34_hitl_auto_answer', '_migrate_v34_workspace_settings', '_migrate_dunning_fields', '_migrate_overage_fields', '_migrate_v26_client_type', '_migrate_ntfy_notifications', '_migrate_notify_email', '_migrate_github_integration', '_migrate_sprint_item_dependencies', '_migrate_v09_notes_and_magic_links', '_migrate_v24_pinned_decisions_and_hitl', '_migrate_goal_field_timestamps', '_migrate_task_claims', '_migrate_task_sprint_link', '_migrate_session_type', '_migrate_session_summary', '_migrate_parent_session_id', '_migrate_decisions', '_migrate_goal_mode', '_migrate_worker_pid', '_migrate_rewind_token', '_migrate_project_settings', '_migrate_neon_pool_projects_free_tier', '_migrate_tenants_free_plan', '_migrate_decisions_free_category', '_migrate_sessions_archived', '_migrate_goal_hierarchy', '_migrate_sprint_items_v2', '_migrate_drop_chat_tables', '_migrate_hosted_tables', '_migrate_session_notes', '_migrate_milestone_type', '_migrate_executor_runs', '_migrate_file_locks', '_migrate_workspace_layer', '_migrate_checkpoint_data', 'init_hosted_tables', '_migrate_sprint_item_tree', '_migrate_api_token_type', '_migrate_api_tokens_expires_at', '_migrate_github_to_projects', '_migrate_touches_files', '_migrate_oauth_codes_table', '_migrate_device_codes_table', '_migrate_sprint_items_indeterminate', '_migrate_workspace_members_rbac', '_migrate_project_icon', '_internal_emails', '_migrate_tenants_is_internal', '_migrate_admin_plan', '_migrate_active_worktrees', '_migrate_workspace_tenant_isolation', '_migrate_registered_hostnames', '_migrate_queued_session', '_migrate_parallel_safety', '_migrate_changelog_entries', '_migrate_agent_instructions', '_migrate_note_kind']
 
 async def _migrate_task_log_backlog_future(db: aiosqlite.Connection) -> None:
     """Rebuild ``task_log`` to add 'backlog' and 'future' statuses (v1.9.x).
@@ -1068,6 +1068,15 @@ async def _migrate_github_to_projects(db: aiosqlite.Connection) -> None:
 async def _migrate_touches_files(db: aiosqlite.Connection) -> None:
     """Add touches_files TEXT column to sprint_items for file conflict tracking."""
     await _migrate_add_column_if_missing(db, "sprint_items", "touches_files", "TEXT")
+
+
+async def _migrate_note_kind(db: aiosqlite.Connection) -> None:
+    """9d44998b — add note_kind to project_notes (wiki | insight | reference).
+
+    Nullable; the app treats NULL as 'wiki'. Existing rows are left untouched so
+    the dashboard renders them as compact wiki notes by default.
+    """
+    await _migrate_add_column_if_missing(db, "project_notes", "note_kind", "TEXT")
 
 
 async def _migrate_oauth_codes_table(db: aiosqlite.Connection) -> None:
