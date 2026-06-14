@@ -171,21 +171,37 @@ Expose Meridian on HTTPS (e.g., via Cloudflare Tunnel or ngrok) and use the remo
 
 ## Local file reading in planning chat (optional)
 
-Expose your local files to planning chat via mcp-proxy + a free tunnel:
+Expose your local files to planning chat. A bare `mcp-proxy` tunnel **does not work**
+with claude.ai: its connector validation probes the endpoint with `GET /mcp` and a CORS
+`OPTIONS` preflight *before* the MCP handshake, and mcp-proxy answers those non-POST
+requests with `400` — which claude.ai reads as "couldn't connect," even though `POST`
+works fine. Front mcp-proxy with the bundled CORS shim
+(`scripts/mcp_cors_proxy.py`) so those probes get the `200`/`204` + `Access-Control-*`
+headers claude.ai expects (the same ones Meridian's own `/mcp` returns).
 
-**Windows:**
+**1. Run mcp-proxy locally — note: NO `--tunnel` (the shim is the public face):**
+
+Windows:
 ```
-npx mcp-proxy --port 8808 --tunnel --shell -- cmd /c npx -y @modelcontextprotocol/server-filesystem "C:\path\to\repo"
+npx mcp-proxy --port 8808 --shell -- cmd /c npx -y @modelcontextprotocol/server-filesystem "C:\path\to\repo"
+```
+Mac/Linux:
+```
+npx mcp-proxy --port 8808 -- npx -y @modelcontextprotocol/server-filesystem /path/to/repo
 ```
 
-**Mac/Linux:**
+**2. Run the CORS shim in front of it:**
 ```
-npx mcp-proxy --port 8808 --tunnel -- npx -y @modelcontextprotocol/server-filesystem /path/to/repo
+python scripts/mcp_cors_proxy.py --listen 8809 --backend http://127.0.0.1:8808
 ```
 
-Copy the tunnel URL printed (e.g. `https://xxxx.tunnel.gla.ma`) → add `/mcp` as a connector in claude.ai.
+**3. Tunnel the shim's port (8809) and add it to claude.ai:**
+```
+cloudflared tunnel --url http://localhost:8809
+```
+Copy the printed `https://…` URL → add `<url>/mcp` as a connector in claude.ai.
 
-Read-only. Requires Node.js. URL changes on restart.
+Read-only. Requires Node.js + Python 3. URL changes on restart.
 
 !!! note "Pro plan coming soon"
     Pro plan includes a permanent tunnel URL that never changes — add once, works forever.
