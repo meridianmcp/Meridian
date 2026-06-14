@@ -42,6 +42,18 @@ imageio = { version = ">=2.37.3, <3", extras = ["ffmpeg"] }
 google-api-python-client = ">=2.197.0, <3"
 google-auth-oauthlib = ">=1.4.0, <2"
 soundfile = ">=0.13.1, <0.14"
+# Tree-sitter core + grammars — foundation for symbol-level parallel protection
+# (sprint 4bac57ff). Python uses stdlib `ast`; these cover the other languages.
+tree-sitter = ">=0.21"
+tree-sitter-python = ">=0.21"
+tree-sitter-javascript = ">=0.21"
+tree-sitter-typescript = ">=0.21"
+tree-sitter-c = ">=0.21"
+tree-sitter-cpp = ">=0.21"
+tree-sitter-go = ">=0.21"
+tree-sitter-rust = ">=0.21"
+tree-sitter-java = ">=0.21"
+tree-sitter-c-sharp = ">=0.21"
 
 [tasks]
 start = { cmd = "python -m meridian", env = { MERIDIAN_CLAUDE_CLI = "cmd /c C:/Users/13144/AppData/Roaming/npm/claude.cmd -p" } }
