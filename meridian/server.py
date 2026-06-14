@@ -45,6 +45,13 @@ from ._deps import (
     _limiter,
     _rate_limit,
     _RATE_LIMIT,
+    _get_authenticated_tenant,
+    _mask_api_token_hash,
+    _md_ts,
+    _md_one_line,
+    _require_workspace_perm,
+    _render_workspace_block,
+    _render_context_block,
 )
 
 # The slowapi Limiter is a process-singleton in ._deps so extracted routers can
@@ -578,10 +585,13 @@ from .routes.decisions import router as _decisions_router    # noqa: E402
 from .routes.handoff import router as _handoff_router        # noqa: E402
 from .routes.admin import router as _admin_router            # noqa: E402
 from .routes.workspace import router as _workspace_router    # noqa: E402
+from .routes.auth import router as _auth_router              # noqa: E402
 from .routes.files import router as _files_router            # noqa: E402
 from .routes.export import router as _export_router          # noqa: E402
-from .routes.auth import router as _auth_router              # noqa: E402
 from .routes.github import router as _github_router          # noqa: E402
+from .routes.billing import router as _billing_router        # noqa: E402
+from .routes.hooks import router as _hooks_router            # noqa: E402
+from .routes.projects import router as _projects_router      # noqa: E402
 
 app.include_router(_notes_router)
 app.include_router(_hitl_router)
@@ -592,10 +602,13 @@ app.include_router(_decisions_router)
 app.include_router(_handoff_router)
 app.include_router(_admin_router)
 app.include_router(_workspace_router)
+app.include_router(_auth_router)
 app.include_router(_files_router)
 app.include_router(_export_router)
-app.include_router(_auth_router)
 app.include_router(_github_router)
+app.include_router(_billing_router)
+app.include_router(_hooks_router)
+app.include_router(_projects_router)
 
 # ---------------------------------------------------------------------------
 # Password gate middleware
@@ -686,16 +699,16 @@ async def gate_submit(request: Request):
     response.set_cookie(_GATE_COOKIE, token, max_age=_GATE_MAX_AGE, httponly=True, samesite="lax")
     return response
 
+# v2.0 — Rate limiter (slowapi) — limiter singleton lives in _deps.py
 # ---------------------------------------------------------------------------
-# v2.0 — Rate limiter registration (the Limiter + _rate_limit live in _deps so
-# extracted routers can apply it; server.py owns the app-level registration).
-# ---------------------------------------------------------------------------
-if _limiter is not None:
+try:
     from slowapi import _rate_limit_exceeded_handler
     from slowapi.errors import RateLimitExceeded
-
-    app.state.limiter = _limiter
-    app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)  # type: ignore[arg-type]
+    if _limiter is not None:
+        app.state.limiter = _limiter
+        app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)  # type: ignore[arg-type]
+except ImportError:
+    pass
 
 
 # G4.15 — Safety-limit exception → 429
@@ -1293,7 +1306,6 @@ async def install_mcp_page(request: Request) -> HTMLResponse:
 
 # /auth/* OAuth + magic-link routes moved to meridian/routes/auth.py
 
-
 @app.get("/config")
 async def server_config(request: Request) -> dict[str, Any]:
     """v0.6.5 — expose runtime configuration to the dashboard.
@@ -1509,294 +1521,7 @@ async def me_workspaces(request: Request) -> list[dict[str, Any]]:
     return result
 
 
-@app.get("/projects", response_model=list[Project])
-async def list_projects(request: Request) -> list[dict[str, Any]]:
-    """List every project."""
-    return await db_module.list_projects(await _db(request))
-
-
-@app.post("/projects", response_model=Project, status_code=201)
-async def create_project(
-    body: ProjectCreate, request: Request
-) -> dict[str, Any]:
-    """Create a new project. 409 if the name is already in use."""
-    existing = await db_module.get_project_by_name(await _db(request), body.name)
-    if existing is not None:
-        raise HTTPException(
-            status_code=409, detail=f"project '{body.name}' already exists"
-        )
-    tenant = await _get_tenant_from_request(request)
-    if tenant and tenant.get("plan") == "free":
-        existing_projects = await db_module.list_projects(await _db(request))
-        if len(existing_projects) >= 1:
-            raise HTTPException(
-                status_code=403,
-                detail="Free tier is limited to 1 project. Upgrade to Solo ($20/mo) for unlimited projects.",
-            )
-    # G4.15 — safety limit: projects per tenant
-    from . import limits as _limits  # noqa: PLC0415
-    all_projects = await db_module.list_projects(await _db(request))
-    _limits.check_projects_per_tenant(len(all_projects))
-    return await db_module.create_project(
-        await _db(request), body.name, human_id=body.human_id
-    )
-
-
-@app.get("/setup/needed")
-async def setup_needed(request: Request) -> dict[str, Any]:
-    """Returns {needed: true} if no projects exist yet (first-run wizard trigger)."""
-    projects = await db_module.list_projects(await _db(request))
-    return {"needed": len(projects) == 0}
-
-
-@app.get("/projects/by-name/{name}")
-async def get_project_by_name(name: str, request: Request) -> dict[str, Any]:
-    """Look up a project by name (case-insensitive substring match).
-
-    Returns the project row plus a brief goal summary so a cold session
-    can confirm it found the right project without a second round-trip.
-    """
-    db = await _db(request)
-    # Exact match first (most common case).
-    project = await db_module.get_project_by_name(db, name)
-    if project is None:
-        # Case-insensitive substring fallback.
-        all_projects = await db_module.list_projects(db)
-        lower = name.lower()
-        matches = [p for p in all_projects if lower in p["name"].lower()]
-        if matches:
-            project = matches[0]
-    if project is None:
-        raise HTTPException(
-            status_code=404, detail=f"no project found matching '{name}'"
-        )
-    goal = await db_module.get_goal(db, project["id"])
-    return {
-        "project": project,
-        "goal_version": goal["version"] if goal else None,
-        "goal_summary": (str(goal["content"])[:200] if goal else None),
-    }
-
-
-@app.get("/projects/{project_id}", response_model=Project)
-async def get_project(project_id: str, request: Request) -> dict[str, Any]:
-    """Look up a project by id."""
-    project = await db_module.get_project(await _db(request), project_id)
-    if project is None:
-        raise HTTPException(status_code=404, detail="project not found")
-    return project
-
-
-@app.get("/projects/{project_id}/settings", response_model=ProjectSettings)
-async def get_project_settings(project_id: str, request: Request) -> dict[str, Any]:
-    """Return persisted per-project dashboard settings."""
-    settings = await db_module.get_project_settings(await _db(request), project_id)
-    if settings is None:
-        raise HTTPException(status_code=404, detail="project not found")
-    return settings
-
-
-@app.patch("/projects/{project_id}/settings", response_model=ProjectSettings)
-async def patch_project_settings(
-    project_id: str, body: ProjectSettingsPatch, request: Request
-) -> dict[str, Any]:
-    """Update persisted per-project dashboard settings."""
-    executor_config_dict = (
-        normalize_executor_config(body.executor_config.model_dump(exclude_none=True))
-        if body.executor_config is not None
-        else None
-    )
-    settings = await db_module.update_project_settings(
-        await _db(request),
-        project_id,
-        max_pinned_decisions=body.max_pinned_decisions,
-        executor_config=executor_config_dict,
-        hitl_auto_answer=body.hitl_auto_answer,
-        auto_worktrees=body.auto_worktrees,
-        require_merge_approval=body.require_merge_approval,
-    )
-    if settings is None:
-        raise HTTPException(status_code=404, detail="project not found")
-    return settings
-
-
-@app.get("/projects/{project_id}/ntfy")
-async def get_project_ntfy(project_id: str, request: Request) -> dict[str, Any]:
-    """Return the ntfy push URL configured for this project."""
-    project = await db_module.get_project(await _db(request), project_id)
-    if project is None:
-        raise HTTPException(status_code=404, detail="project not found")
-    url = await db_module.get_project_ntfy_url(await _db(request), project_id)
-    return {"ntfy_url": url or ""}
-
-
-def _canonicalize_notify_target(raw: str | None) -> str | None:
-    """G1.7 — normalize the notify target so ntfy entries are stored as the
-    topic path segment only, while emails and webhooks pass through.
-
-    Examples:
-      "https://ntfy.sh/foo"   -> "foo"
-      "https://ntfy.sh/foo/"  -> "foo"
-      "ntfy.sh/foo"           -> "foo"
-      "foo"                   -> "foo"
-      "you@example.com"       -> "you@example.com"
-      "https://hooks.slack.com/services/abc" -> "https://hooks.slack.com/services/abc"
-      ""                      -> None
-    """
-    if not raw:
-        return None
-    val = str(raw).strip()
-    if not val:
-        return None
-    # Email → pass through.
-    if "@" in val and "://" not in val:
-        return val
-    lower = val.lower()
-    for prefix in ("https://ntfy.sh/", "http://ntfy.sh/", "ntfy.sh/"):
-        if lower.startswith(prefix):
-            topic = val[len(prefix):].strip().strip("/")
-            return topic or None
-    # Any other URL with a scheme → webhook, pass through.
-    if "://" in val:
-        return val
-    # Bare token, no slashes → treat as ntfy topic.
-    return val.strip("/") or None
-
-
-async def _ensure_unique_ntfy_topic(
-    db: Any, project_id: str, topic: str
-) -> str:
-    """G1.7 — make sure ``topic`` is not already in use by another project in
-    this DB. Suffix with -2, -3, … until free. Returns the topic actually
-    used. Pure topic strings only; webhooks/emails skip this check upstream.
-    """
-    projects = await db_module.list_projects(db)
-    in_use = {
-        str(p.get("ntfy_url") or "").strip().lower()
-        for p in projects
-        if p.get("id") != project_id and p.get("ntfy_url")
-    }
-    base = topic
-    candidate = base
-    n = 2
-    while candidate.lower() in in_use:
-        candidate = f"{base}-{n}"
-        n += 1
-        if n > 999:
-            break
-    return candidate
-
-
-@app.get("/projects/{project_id}/ntfy")
-async def get_project_ntfy(
-    project_id: str, request: Request
-) -> dict[str, Any]:
-    """Return the current notification settings for this project."""
-    project = await db_module.get_project(await _db(request), project_id)
-    if project is None:
-        raise HTTPException(status_code=404, detail="project not found")
-    db = await _db(request)
-    notify_url = await db_module.get_project_ntfy_url(db, project_id)
-    notify_email = await db_module.get_project_notify_email(db, project_id)
-    return {
-        "ntfy_url": notify_url or "",
-        "notify_url": notify_url or "",
-        "notify_email": notify_email or "",
-    }
-
-
-@app.patch("/projects/{project_id}/ntfy")
-async def set_project_ntfy(
-    project_id: str, body: dict[str, Any], request: Request
-) -> dict[str, Any]:
-    """Save (or clear) the notify URL and/or notify_email for this project.
-
-    Accepts ``notify_url`` (preferred) or ``ntfy_url`` (legacy) key for the
-    ntfy/webhook channel, and ``notify_email`` for the email channel.
-    ntfy entries are canonicalized to the topic path segment only and
-    suffixed with -2/-3/… if another project in this DB already uses
-    the same topic. Emails and non-ntfy webhooks pass through verbatim.
-
-    After saving a non-empty notify_url, fires a welcome notification so
-    ntfy.sh topics are created on first publish (avoids 404 on first
-    real alert).
-    """
-    project = await db_module.get_project(await _db(request), project_id)
-    if project is None:
-        raise HTTPException(status_code=404, detail="project not found")
-    db = await _db(request)
-    # Handle ntfy_url / webhook channel
-    if "notify_url" in body or "ntfy_url" in body:
-        raw_value = str(body.get("notify_url") or body.get("ntfy_url") or "").strip() or None
-        notify_url = _canonicalize_notify_target(raw_value)
-        if notify_url and "://" not in notify_url and "@" not in notify_url:
-            # bare topic → enforce per-DB uniqueness
-            notify_url = await _ensure_unique_ntfy_topic(db, project_id, notify_url)
-        await db_module.set_project_ntfy_url(db, project_id, notify_url)
-        if notify_url:
-            # Fire a welcome notification immediately so ntfy.sh creates the topic
-            try:
-                ntfy_full = notify_url
-                if "://" not in ntfy_full and "@" not in ntfy_full:
-                    ntfy_full = f"https://ntfy.sh/{ntfy_full}"
-                await _dispatch_notification(
-                    ntfy_full,
-                    "Notifications active",
-                    "You will receive alerts here for HITL requests and sprint completions.",
-                    event="setup",
-                )
-            except Exception:  # noqa: BLE001
-                pass
-    else:
-        notify_url = await db_module.get_project_ntfy_url(db, project_id)
-    # Handle notify_email channel
-    if "notify_email" in body:
-        raw_email = str(body.get("notify_email") or "").strip() or None
-        await db_module.set_project_notify_email(db, project_id, raw_email)
-        notify_email = raw_email
-    else:
-        notify_email = await db_module.get_project_notify_email(db, project_id)
-    return {
-        "ntfy_url": notify_url or "",
-        "notify_url": notify_url or "",
-        "notify_email": notify_email or "",
-    }
-
-
-@app.post("/projects/{project_id}/notify/test")
-async def test_project_notification(
-    project_id: str, request: Request
-) -> dict[str, Any]:
-    """Send a test notification to verify the configured notify URL and/or email."""
-    project = await db_module.get_project(await _db(request), project_id)
-    if project is None:
-        raise HTTPException(status_code=404, detail="project not found")
-    db = await _db(request)
-    notify_url = await db_module.get_project_ntfy_url(db, project_id)
-    notify_email = await db_module.get_project_notify_email(db, project_id)
-    if not notify_url and not notify_email:
-        raise HTTPException(status_code=400, detail="No notify URL or email configured for this project")
-    sent_to = []
-    if notify_url:
-        ntfy_full = notify_url
-        if "://" not in ntfy_full and "@" not in ntfy_full:
-            ntfy_full = f"https://ntfy.sh/{ntfy_full}"
-        await _dispatch_notification(
-            ntfy_full,
-            "Meridian test notification",
-            "Test from the Meridian dashboard. If you see this, notifications are working!",
-            event="test",
-        )
-        sent_to.append(notify_url)
-    if notify_email:
-        await _send_email_notification(
-            notify_email,
-            "[Meridian] Test notification",
-            "Test from the Meridian dashboard. If you see this, email notifications are working!",
-        )
-        sent_to.append(notify_email)
-    return {"ok": True, "sent_to": sent_to}
-
+# Project CRUD + project-level routes → meridian/routes/projects.py
 
 async def _send_email_notification(to_email: str, subject: str, body_text: str) -> None:
     """Send a notification email via Resend.
@@ -2079,18 +1804,6 @@ async def _answer_hitl_and_apply(
     return {**row, **extra}
 
 
-def _md_ts() -> str:
-    from datetime import datetime, timezone  # noqa: PLC0415
-
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
-
-
-def _md_one_line(text: str, limit: int = 200) -> str:
-    """Collapse a multi-line decision/note body to a single trimmed line."""
-    flat = " ".join((text or "").split())
-    return flat if len(flat) <= limit else flat[:limit].rstrip() + "…"
-
-
 def _md_normalize_tags(tags: Any) -> list[str]:
     if not tags:
         return []
@@ -2209,587 +1922,15 @@ async def _maybe_notify(
         pass
 
 
-@app.patch("/projects/{project_id}/icon")
-async def set_project_icon(
-    project_id: str, body: dict[str, Any], request: Request
-) -> dict[str, Any]:
-    """G4.17 — set or clear the single-emoji icon for a project.
-
-    Body: ``{"icon": "🎯"}`` or ``{"icon": null}``. Stored as the user-provided
-    string capped to a short length (typical emoji is 1-4 codepoints); the
-    frontend never expects more than ~8 chars. Wider validation lives in
-    the UI picker.
-    """
-    project = await db_module.get_project(await _db(request), project_id)
-    if project is None:
-        raise HTTPException(404, "project not found")
-    raw = body.get("icon")
-    icon: str | None
-    if raw is None:
-        icon = None
-    else:
-        icon = str(raw).strip()[:8] or None
-    db = await _db(request)
-    await db.execute(
-        "UPDATE projects SET icon = ? WHERE id = ?",
-        (icon, project_id),
-    )
-    await db.commit()
-    db_module.publish_global(
-        {"type": "project_icon_changed", "project_id": project_id, "icon": icon}
-    )
-    return await db_module.get_project(db, project_id)
+# set_project_icon, rename_project, delete_project → meridian/routes/projects.py
 
 
-@app.post("/projects/{project_id}/rename")
-async def rename_project(
-    project_id: str, body: dict[str, Any], request: Request
-) -> dict[str, Any]:
-    """v1.9.x — rename a project.  Broadcasts project_renamed WS event."""
-    new_name = str(body.get("name") or "").strip()
-    if not new_name:
-        raise HTTPException(400, "name is required")
-    project = await db_module.get_project(await _db(request), project_id)
-    if project is None:
-        raise HTTPException(404, "project not found")
-    existing = await db_module.get_project_by_name(await _db(request), new_name)
-    if existing and existing["id"] != project_id:
-        raise HTTPException(409, f"project '{new_name}' already exists")
-    updated = await db_module.rename_project(await _db(request), project_id, new_name)
-    db_module.publish_global(
-        {"type": "project_renamed", "project_id": project_id, "name": new_name}
-    )
-    return updated
-
-
-@app.delete("/projects/{project_id}", status_code=204)
-async def delete_project(project_id: str, request: Request) -> None:
-    """v1.9.x — delete a project and all data.
-
-    Returns 409 if any tasks are in_progress, 404 if the project is unknown.
-    """
-    project = await db_module.get_project(await _db(request), project_id)
-    if project is None:
-        raise HTTPException(404, "project not found")
-    try:
-        await db_module.delete_project(await _db(request), project_id)
-    except ValueError as exc:
-        raise HTTPException(409, str(exc)) from exc
-
-
-@app.get("/projects/{project_id}/goal", response_model=GoalState)
-async def get_goal(project_id: str, request: Request) -> dict[str, Any]:
-    """Read the latest goal state plus ambient task context.
-
-    The response payload (v0.4.2+) includes ``ambient_tasks`` — the
-    five most recent task rows, newest first, as ``{status, description,
-    created_at}`` dicts. Cold sessions can render the directive *and*
-    last activity from a single MCP call.
-
-    G8.34/G9 — Returns 200 with an empty stub when the project exists
-    but no goal has been set yet (previously 404). The 404-as-empty
-    semantics produced a console error on the dashboard's initial
-    render for every fresh project, which made the panel-render
-    Playwright test flake by environment. Browsers can't tell the
-    difference between "field is empty" and "fetch threw 4xx", so
-    the only honest answer is 200 with empty fields. Returns 404 still
-    when the project itself does not exist.
-    """
-    project = await db_module.get_project(await _db(request), project_id)
-    if project is None:
-        raise HTTPException(status_code=404, detail="project not found")
-    goal = await db_module.get_goal(await _db(request), project_id)
-    if goal is None:
-        recent = await db_module.get_tasks(await _db(request), project_id, limit=5)
-        return {
-            "id": "",
-            "project_id": project_id,
-            "content": "",
-            "version": 0,
-            "created_at": "",
-            "updated_at": "",
-            "ambient_tasks": [
-                {
-                    "status": t["status"],
-                    "description": t["description"],
-                    "created_at": t["created_at"],
-                }
-                for t in recent
-            ],
-            "north_star": None,
-            "sprint": None,
-        }
-    recent = await db_module.get_tasks(await _db(request), project_id, limit=5)
-    goal["ambient_tasks"] = [
-        {
-            "status": t["status"],
-            "description": t["description"],
-            "created_at": t["created_at"],
-        }
-        for t in recent
-    ]
-    # v1.1.3 — per-field ages + coherence warning so the dashboard
-    # can paint green / amber / red dots and so cold sessions see
-    # which fields have gone stale before doing anything.
-    field_ages = await db_module.get_goal_field_ages(
-        await _db(request), project_id
-    )
-    coherence = db_module.compute_coherence_warning(field_ages)
-    goal["field_ages"] = field_ages
-    goal["coherence_warning"] = coherence
-    # v1.1.4 — append-only decisions log.
-    decisions = await db_module.get_decisions(await _db(request), project_id)
-    goal["decisions"] = decisions
-    # v0.6.1 — also serve the XML envelope so MCP / cache-aware consumers
-    # don't have to re-stitch fields locally. The JSON keys stay for the
-    # dashboard and the test suite.
-    goal["xml"] = db_module.build_goal_xml(
-        goal, project["name"], goal["ambient_tasks"], coherence,
-        decisions=decisions,
-    )
-    # v0.6.2 — pre-built Anthropic content blocks with cache_control
-    # markers on the static fields. Callers can pass these straight
-    # into messages.create() to get prompt caching for free.
-    goal["cache_blocks"] = db_module.build_goal_cache_blocks(
-        goal, project["name"], goal["ambient_tasks"]
-    )
-    return goal
-
-
-@app.patch("/projects/{project_id}/goal-mode")
-async def patch_goal_mode(
-    project_id: str, body: GoalModeSet, request: Request
-) -> dict[str, str]:
-    """Switch a project between 'manual' and 'auto' goal modes."""
-    project = await db_module.get_project(await _db(request), project_id)
-    if project is None:
-        raise HTTPException(status_code=404, detail="project not found")
-    try:
-        await db_module.set_goal_mode(await _db(request), project_id, body.mode)
-    except ValueError as exc:
-        raise HTTPException(status_code=422, detail=str(exc))
-    return {"project_id": project_id, "goal_mode": body.mode}
-
-
-@app.get("/projects/{project_id}/goal-mode")
-async def get_goal_mode(project_id: str, request: Request) -> dict[str, str]:
-    """Return the current goal mode for a project."""
-    project = await db_module.get_project(await _db(request), project_id)
-    if project is None:
-        raise HTTPException(status_code=404, detail="project not found")
-    mode = await db_module.get_goal_mode(await _db(request), project_id)
-    return {"project_id": project_id, "goal_mode": mode}
-
-
-@app.post("/projects/{project_id}/goal", response_model=GoalState)
-async def set_goal(
-    project_id: str, body: GoalSet, request: Request
-) -> dict[str, Any]:
-    """Upsert the goal state, incrementing version.
-
-    Goal-ownership rule (v0.3.2): if the project has a recorded
-    ``creator_human_id`` *and* the request body supplies a ``human_id``
-    that doesn't match, refuse with 403. Sessions without a human_id
-    (legacy callers, MCP workers that don't claim an identity) keep
-    their old write privilege.
-    """
-    project = await db_module.get_project(await _db(request), project_id)
-    if project is None:
-        raise HTTPException(status_code=404, detail="project not found")
-    owner = await db_module.get_project_owner(await _db(request), project_id)
-    if owner is not None and body.human_id is not None and body.human_id != owner:
-        raise HTTPException(
-            status_code=403,
-            detail={
-                "error": "goal_locked",
-                "message": (
-                    "Only the project owner can set the goal. "
-                    "Use the HITL queue to propose changes."
-                ),
-            },
-        )
-    _goal_str = body.content if isinstance(body.content, str) else json.dumps(body.content)
-    validate_input_size(_goal_str, "goal", 10_000)
-    if body.north_star is not None:
-        validate_input_size(body.north_star, "north_star", 10_000)
-    if body.sprint is not None:
-        validate_input_size(body.sprint, "version_goal", 10_000)
-    result = await db_module.set_goal(
-        await _db(request), project_id, body.content,
-        north_star=body.north_star, sprint=body.sprint,
-        minor=body.minor,
-    )
-    await goal_md_module.sync_db_to_goal_md(await _db(request), project_id)
-    return result
-
-
-@app.post("/projects/{project_id}/goal/north-star", response_model=GoalState)
-async def set_north_star(
-    project_id: str, body: SetNorthStarRequest, request: Request
-) -> dict[str, Any]:
-    """v0.5.2 — update only the north star field.
-
-    Owner-only: requires ``human_id`` matching the project creator.
-    Returns the new goal version.
-    """
-    project = await db_module.get_project(await _db(request), project_id)
-    if project is None:
-        raise HTTPException(status_code=404, detail="project not found")
-    validate_input_size(body.north_star, "north_star", 10_000)
-    # Ownership check skipped in hosted mode — session cookie already proves
-    # the caller owns this project. human_id check only applies to local no-auth.
-    try:
-        result = await db_module.set_north_star(
-            await _db(request), project_id, body.north_star
-        )
-        await goal_md_module.sync_db_to_goal_md(await _db(request), project_id)
-        return result
-    except ValueError as exc:
-        raise HTTPException(status_code=422, detail=str(exc))
-
-
-@app.post("/projects/{project_id}/goal/sprint", response_model=GoalState)
-async def set_sprint(
-    project_id: str, body: SetSprintRequest, request: Request
-) -> dict[str, Any]:
-    """v0.5.2 — update only the sprint field.
-
-    Any team member can update the sprint — no ownership check.
-    Returns the new goal version.
-    """
-    project = await db_module.get_project(await _db(request), project_id)
-    if project is None:
-        raise HTTPException(status_code=404, detail="project not found")
-    validate_input_size(body.sprint, "version_goal", 10_000)
-    try:
-        result = await db_module.set_sprint(
-            await _db(request), project_id, body.sprint
-        )
-        await goal_md_module.sync_db_to_goal_md(await _db(request), project_id)
-        return result
-    except ValueError as exc:
-        raise HTTPException(status_code=422, detail=str(exc))
-
-
-@app.post("/projects/{project_id}/start-worker-session")
-async def start_worker_session_endpoint(
-    project_id: str, request: Request,
-    body: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    """v1.2.0 — REST mirror of the MCP ``start_worker_session`` tool.
-
-    Optional body: ``{task_id}``. Returns
-    ``{session_id, task, worker_context}`` or 404 when there's no
-    claimable task / the named task doesn't belong to this project.
-    """
-    project = await db_module.get_project(await _db(request), project_id)
-    if project is None:
-        raise HTTPException(status_code=404, detail="project not found")
-    try:
-        return await db_module.start_worker_session(
-            await _db(request),
-            project_id,
-            task_id=(body or {}).get("task_id"),
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=404, detail=str(exc))
-
-
-@app.post("/projects/{project_id}/decisions")
-async def post_decision_endpoint(
-    project_id: str, body: dict[str, Any], request: Request
-) -> dict[str, Any]:
-    """v1.1.4 — append a decision entry to the project's append-only
-    decisions log. Body: ``{text}``."""
-    project = await db_module.get_project(await _db(request), project_id)
-    if project is None:
-        raise HTTPException(status_code=404, detail="project not found")
-    text = (body.get("text") or "").strip()
-    if not text:
-        raise HTTPException(status_code=422, detail="text is required")
-    validate_input_size(text, "decision text", 100_000)
-    updated = await db_module.set_decision(await _db(request), project_id, text)
-    return {"project_id": project_id, "decisions": updated}
-
-
-@app.get("/projects/{project_id}/timeline")
-async def get_timeline_endpoint(
-    project_id: str, request: Request
-) -> dict[str, Any]:
-    """v1.1.1 — return the data needed to render the Activity Timeline.
-
-    v1.6.x — filtered to only meaningful history: completed/failed tasks
-    plus goal-change events. Session idle/active events were noise and
-    have been dropped (the LIVE vtab covers active sessions instead).
-    Pending/in_progress tasks belong on the LIVE tab, not in history.
-    """
-    project = await db_module.get_project(await _db(request), project_id)
-    if project is None:
-        raise HTTPException(status_code=404, detail="project not found")
-    timeline = await db_module.get_timeline(await _db(request), project_id)
-    return {
-        "tasks": [
-            t for t in timeline.get("tasks", [])
-            if t.get("status") in ("done", "failed")
-        ],
-        "sessions": [],
-        "goal_events": timeline.get("goal_events", []),
-        "daily_counts": timeline.get("daily_counts", []),
-        "people": timeline.get("people", []),
-        "clients": timeline.get("clients", []),
-    }
-
-
-@app.get("/projects/{project_id}/rewind")
-async def get_rewind(
-    project_id: str,
-    request: Request,
-    days: int = 7,
-    token: str | None = None,
-) -> dict[str, Any]:
-    """v1.3.0 — "Last X days" project rewind summary.
-
-    Returns versions shipped, goal changes, decisions logged, session
-    summaries, sprint items completed, and task counts for the period.
-    When a ``token`` query param is supplied, it must match the project's
-    stored ``rewind_token`` — letting an external link validate ownership
-    without any other auth (Meridian is local-first; no token = no auth
-    required, same as every other endpoint).
-    """
-    project = await db_module.get_project(await _db(request), project_id)
-    if project is None:
-        raise HTTPException(status_code=404, detail="project not found")
-    if token is not None:
-        stored = await db_module.get_rewind_token(await _db(request), project_id)
-        if not stored or token != stored:
-            raise HTTPException(status_code=403, detail="invalid rewind token")
-    if days <= 0:
-        raise HTTPException(status_code=422, detail="days must be positive")
-    return await db_module.get_rewind_data(await _db(request), project_id, days)
-
-
-@app.post("/projects/{project_id}/rewind-token")
-async def post_rewind_token(
-    project_id: str, request: Request
-) -> dict[str, str]:
-    """v1.3.0 — mint (or return) the project's shareable rewind token.
-
-    The token is stored on the projects row so subsequent calls return
-    the same value; teams can publish a link once without it rotating.
-    Response: ``{"token": "<uuid4>", "expires": "never"}``.
-    """
-    project = await db_module.get_project(await _db(request), project_id)
-    if project is None:
-        raise HTTPException(status_code=404, detail="project not found")
-    token = await db_module.get_or_create_rewind_token(await _db(request), project_id)
-    return {"token": token, "expires": "never"}
-
-
-@app.get("/projects/{project_id}/goal-history")
-async def get_goal_history(
-    project_id: str, request: Request
-) -> list[dict[str, Any]]:
-    """Return meaningful goal versions for a project, newest first.
-
-    AUTO BLOCKS-only versions are collapsed out so the history shows
-    only real content changes. Each entry: version, north_star,
-    version_goal, sprint, created_at. Used by the Rewind goal subtab.
-    """
-    project = await db_module.get_project(await _db(request), project_id)
-    if project is None:
-        raise HTTPException(status_code=404, detail="project not found")
-    return await db_module.get_goal_history(await _db(request), project_id)
-
-
-@app.get("/projects/{project_id}/stats")
-async def get_project_stats(
-    project_id: str, request: Request, days: int = 30
-) -> dict[str, Any]:
-    """Return activity stats for the Charts subtab.
-
-    Returns tasks/day series and sprint completion % per version.
-    ``days`` defaults to 30, max 365.
-    """
-    project = await db_module.get_project(await _db(request), project_id)
-    if project is None:
-        raise HTTPException(status_code=404, detail="project not found")
-    days = max(1, min(days, 365))
-    return await db_module.get_project_stats(await _db(request), project_id, days)
-
+# Goal routes, sessions, worktrees, PDF export → meridian/routes/projects.py
 
 # Sprint item routes → meridian/routes/sprint.py
-
-
-@app.get("/projects/{project_id}/sessions", response_model=list[Session])
-async def get_sessions(
-    project_id: str, request: Request, active_only: bool = True
-) -> list[dict[str, Any]]:
-    """List sessions attached to the project.
-
-    Pass ``?active_only=false`` to include closed and archived sessions
-    (useful for the LIVE tab showing recent session outcomes).
-    Expires stale sessions (last_seen > 30 min ago) before returning so
-    the dashboard doesn't accumulate ghost entries indefinitely.
-    """
-    project = await db_module.get_project(await _db(request), project_id)
-    if project is None:
-        raise HTTPException(status_code=404, detail="project not found")
-    await _expire_and_generate_handoffs(await _db(request), _data_dir(request))
-    return await db_module.get_sessions(
-        await _db(request), project_id, active_only=active_only
-    )
-
-
 # Tasks + claim/release routes → meridian/routes/tasks.py
-
-
 # Handoff route → meridian/routes/handoff.py
-
-
 # Session lifecycle routes → meridian/routes/sessions.py
-
-
-# /tasks POST + PATCH → meridian/routes/tasks.py
-
-
-@app.get("/projects/{project_id}/worktrees")
-async def list_worktrees(project_id: str, request: Request) -> list[dict[str, Any]]:
-    """List active git worktrees registered for a project."""
-    project = await db_module.get_project(await _db(request), project_id)
-    if project is None:
-        raise HTTPException(status_code=404, detail="project not found")
-    # Degrade gracefully: a missing/not-yet-migrated active_worktrees table must
-    # not 500 the dashboard panel — return [] and log instead.
-    try:
-        return await db_module.list_active_worktrees(await _db(request), project_id)
-    except Exception as exc:  # noqa: BLE001
-        import logging as _l
-        _l.getLogger("meridian.server").warning(
-            "list_worktrees failed for project %s: %s", project_id, exc
-        )
-        return []
-
-
-@app.post("/projects/{project_id}/worktrees", status_code=201)
-async def create_worktree(
-    project_id: str, request: Request, body: WorktreeCreate
-) -> dict[str, Any]:
-    """Register a git worktree for a session. Call after `git worktree add`."""
-    project = await db_module.get_project(await _db(request), project_id)
-    if project is None:
-        raise HTTPException(status_code=404, detail="project not found")
-    return await db_module.register_worktree(
-        await _db(request),
-        body.session_id,
-        project_id,
-        body.branch,
-        body.path,
-        item_id=body.item_id,
-    )
-
-
-@app.delete("/projects/{project_id}/worktrees/{worktree_id}", status_code=204)
-async def delete_worktree(
-    project_id: str, worktree_id: str, request: Request
-) -> None:
-    """Mark a registered worktree as removed. Call after `git worktree remove`."""
-    removed = await db_module.remove_worktree(await _db(request), worktree_id)
-    if not removed:
-        raise HTTPException(status_code=404, detail="worktree not found or already removed")
-
-
-@app.get("/projects/{project_id}/export/pdf")
-async def export_project_pdf(project_id: str, request: Request):
-    """Generate a tamper-evident IP attribution PDF for the project.
-
-    Contains north star, version goal, sprint, full task log with
-    timestamps and session names, and a SHA-256 hash of the content
-    embedded in the footer.
-    """
-    import hashlib
-    from fpdf import FPDF
-    import io
-
-    db = await _db(request)
-    project = await db_module.get_project(db, project_id)
-    if project is None:
-        raise HTTPException(status_code=404, detail="project not found")
-    goal = await db_module.get_goal(db, project_id)
-    tasks = await db_module.get_tasks(db, project_id, limit=200)
-    sessions = await db_module.get_sessions(db, project_id, active_only=False)
-    session_names = {s["id"]: s["name"] for s in sessions}
-
-    # Build text content for hashing
-    lines = [
-        f"MERIDIAN IP ATTRIBUTION RECORD",
-        f"Project: {project['name']} ({project['id']})",
-        f"Generated: {__import__('datetime').datetime.now(__import__('datetime').timezone.utc).isoformat()}",
-        "",
-    ]
-    if goal:
-        lines += [
-            f"Goal Version: {goal['version']}",
-            f"North Star: {goal.get('north_star') or '(not set)'}",
-            f"Version Goal: {goal['content']}",
-            f"Sprint: {goal.get('sprint') or '(not set)'}",
-            "",
-        ]
-    lines.append("TASK LOG:")
-    for t in tasks:
-        sname = session_names.get(t["session_id"], t["session_id"][:8])
-        lines.append(f"[{t['created_at']}] [{t['status'].upper()}] {sname}: {t['description']}")
-
-    full_text = "\n".join(lines)
-    sha256 = hashlib.sha256(full_text.encode()).hexdigest()
-
-    # Build PDF
-    pdf = FPDF()
-    pdf.add_page()
-    pdf.set_font("Helvetica", "B", 16)
-    pdf.cell(0, 10, "Meridian IP Attribution Record", new_x="LMARGIN", new_y="NEXT")
-    pdf.set_font("Helvetica", "", 10)
-    pdf.cell(0, 7, f"Project: {project['name']}", new_x="LMARGIN", new_y="NEXT")
-    pdf.ln(4)
-
-    if goal:
-        pdf.set_font("Helvetica", "B", 12)
-        pdf.cell(0, 8, "Goal Hierarchy", new_x="LMARGIN", new_y="NEXT")
-        pdf.set_font("Helvetica", "", 9)
-        for label, val in [
-            ("North Star", goal.get("north_star") or "(not set)"),
-            ("Version Goal", str(goal["content"])),
-            ("Sprint", goal.get("sprint") or "(not set)"),
-        ]:
-            pdf.set_font("Helvetica", "B", 9)
-            pdf.cell(30, 6, f"{label}:", new_x="RIGHT", new_y="LAST")
-            pdf.set_font("Helvetica", "", 9)
-            # Multi-line safe: use multi_cell for value
-            x, y = pdf.get_x(), pdf.get_y()
-            pdf.multi_cell(0, 6, val[:300])
-        pdf.ln(4)
-
-    pdf.set_font("Helvetica", "B", 12)
-    pdf.cell(0, 8, f"Task Log ({len(tasks)} entries)", new_x="LMARGIN", new_y="NEXT")
-    pdf.set_font("Courier", "", 7)
-    for t in tasks:
-        sname = session_names.get(t["session_id"], t["session_id"][:8])
-        row = f"[{t['created_at']}] [{t['status'].upper()}] {sname}: {t['description']}"
-        pdf.multi_cell(0, 5, row[:200])
-
-    # Footer with SHA256
-    pdf.ln(6)
-    pdf.set_font("Helvetica", "I", 7)
-    pdf.set_text_color(120, 120, 120)
-    pdf.multi_cell(0, 5, f"SHA-256: {sha256}")
-
-    pdf_bytes = pdf.output()
-    return Response(
-        content=bytes(pdf_bytes),
-        media_type="application/pdf",
-        headers={
-            "Content-Disposition": f'attachment; filename="{project["name"]}_ip_record.pdf"'
-        },
-    )
 
 
 @app.get("/onboarding", response_class=HTMLResponse)
@@ -2919,7 +2060,7 @@ _REPO_ROOT = Path(__file__).parent.parent
 # The dashboard only allows editing these specific files.
 _EDITABLE_FILES: list[str] = ["AGENTS.md", "CLAUDE.md"]
 
-# _DEMO_FILE_CONTENT + file-editing routes moved to meridian/routes/files.py
+# File-editing and context-block routes → meridian/routes/files.py
 
 
 @app.post("/projects/{project_id}/devlog")
@@ -2936,103 +2077,6 @@ async def append_devlog_entry(
     line = f"- {_md_ts()} {text}"
     await md_anchors_module.apply_append("DEVLOG.md", "devlog", line)
     return {"ok": True}
-
-
-def _render_workspace_block(
-    decisions: list[dict], notes: list[dict]
-) -> str:
-    """v3.1 — render workspace-level decisions + notes as a compact text block.
-
-    Workspace decisions/notes are tenant-global (above any single project), so
-    they are prepended to every project's context block + handoff. Returns an
-    empty string when there is nothing to show, so callers can skip the join.
-    """
-    if not decisions and not notes:
-        return ""
-    lines = ["WORKSPACE (applies to all projects):"]
-    for d in decisions[:10]:
-        cat = (d.get("category") or "").strip()
-        prefix = f"[{cat}] " if cat else ""
-        lines.append(f"  • DECISION {prefix}{d.get('title', '')}: {d.get('body', '')}")
-    for n in notes[:10]:
-        tags = (n.get("tags") or "").strip()
-        suffix = f" ({tags})" if tags else ""
-        lines.append(f"  • NOTE {n.get('title', '')}: {n.get('body', '')}{suffix}")
-    return "\n".join(lines)
-
-
-def _render_context_block(
-    project: dict,
-    goal: dict | None,
-    sprint_items: list[dict],
-    pending_tasks: list[dict],
-    sessions: list[dict],
-    recent_decisions: list[str],
-    *,
-    mode: str = "full",
-    repo_root: str | None = None,
-) -> str:
-    """v2.3 — render the project context as a single text block.
-
-    ``mode='full'`` produces the Code Handoff variant — everything a fresh
-    Claude Code session needs to continue work without re-deriving state.
-    ``mode='chat'`` produces the shorter "new claude.ai conversation"
-    variant — drops sessions and trims long fields so a paste into a new
-    chat doesn't overflow the first message.
-
-    Returns a plain-text block (no JSON, no markdown fences) suitable for
-    direct clipboard copy + paste.
-    """
-    short_id = project["id"].split("-")[0]
-    lines = [f"PROJECT: {project['name']} ({short_id})"]
-    if goal:
-        if goal.get("north_star"):
-            ns = goal["north_star"]
-            if mode == "chat" and len(ns) > 400:
-                ns = ns[:400].rstrip() + "…"
-            lines.append(f"NORTH STAR: {ns}")
-        if goal.get("sprint"):
-            lines.append(f"SPRINT: {goal['sprint']}")
-        if mode == "full" and goal.get("content"):
-            vg = goal["content"]
-            if isinstance(vg, dict):
-                vg = vg.get("content") or str(vg)
-            if len(vg) > 2000:
-                vg = vg[:2000].rstrip() + "…"
-            lines += ["", "VERSION GOAL:", vg]
-    if sprint_items:
-        lines += ["", "PENDING SPRINT ITEMS:"]
-        for it in sprint_items[:10]:
-            lines.append(f"- [{it.get('status', '?')}] {it.get('title', '')}")
-    if pending_tasks:
-        cap = 10 if mode == "full" else 5
-        lines += ["", f"RECENT TASKS (last {min(len(pending_tasks), cap)}):"]
-        for t in pending_tasks[:cap]:
-            stat = (t.get("status") or "?").upper()
-            desc = t.get("description") or ""
-            if len(desc) > 200:
-                desc = desc[:200].rstrip() + "…"
-            lines.append(f"- [{stat}] {desc}")
-    if mode == "full" and sessions:
-        lines += ["", "ACTIVE SESSIONS:"]
-        for s in sessions[:5]:
-            lines.append(f"- {s.get('name', '?')} ({s.get('status', '?')})")
-    if recent_decisions:
-        lines += ["", "RECENT DECISIONS:"]
-        for d in recent_decisions[-5:]:
-            text = d
-            if len(text) > 240:
-                text = text[:240].rstrip() + "…"
-            lines.append(f"- {text}")
-    if mode == "full":
-        if repo_root:
-            lines += ["", f"REPO: {repo_root}"]
-        lines += ["TEST: pixi run test"]
-    lines += [
-        "",
-        f"To continue: connect to Meridian and call start_session(project_id=\"{project['id']}\", session_name=\"<name>\").",
-    ]
-    return "\n".join(lines)
 
 
 @app.get("/projects/{project_id}/context-block")
@@ -3118,170 +2162,7 @@ async def get_project_context(
 # Notes routes → meridian/routes/notes.py
 
 
-# ---------------------------------------------------------------------------
-# v2.4 — Team visibility (per-human swimlane + standup digest data)
-# ---------------------------------------------------------------------------
-
-
-@app.get("/team/summary")
-async def get_team_summary_endpoint(
-    request: Request, project_id: str | None = None, days: int = 1
-) -> dict[str, Any]:
-    """Aggregate task_log + sessions by human_id over the last N days.
-
-    ``project_id`` optional — omit to roll up across all projects.
-    Returns ``{period_days, humans:[...], active_count}``. Used by the
-    Team tab cards, swimlane timeline, and standup digest.
-    """
-    return await db_module.get_team_summary(await _db(request), project_id, days)
-
-
-# ---------------------------------------------------------------------------
-# v2.4 — Webhook intake for framework integrations
-# ---------------------------------------------------------------------------
-
-
-@app.post("/projects/{project_id}/events", status_code=201)
-async def post_project_event(
-    project_id: str, body: dict[str, Any], request: Request
-) -> dict[str, Any]:
-    """Normalize a framework event into Meridian's task_log.
-
-    Auth: ``X-Meridian-Token: <project_token>`` header.  The token grants
-    write-access to a single project's task_log only — call
-    ``ensure_project_token`` to mint one (returned by the dashboard's
-    Project settings panel, by GET /projects/{id}/webhook-token).
-
-    Body schema (all optional except description+session_name):
-    ```
-    {
-      "type": "task_completed" | "checkpoint" | "hitl_request" | "session_start",
-      "session_name": "langgraph-researcher",
-      "human_id": "langgraph",
-      "agent_framework": "langgraph",
-      "description": "researcher agent fetched 3 sources",
-      "status": "done",
-      "parent_task_id": null,
-      "metadata": {}
-    }
-    ```
-    """
-    db = await _db(request)
-    auth_token = request.headers.get("X-Meridian-Token", "")
-    project_by_token = await db_module.get_project_by_token(db, auth_token) if auth_token else None
-    if project_by_token is None or project_by_token["id"] != project_id:
-        raise HTTPException(status_code=401, detail="invalid or missing X-Meridian-Token")
-
-    event_type = body.get("type") or "task_completed"
-    description = (body.get("description") or "").strip()
-    if not description:
-        raise HTTPException(status_code=400, detail="description required")
-    session_name = body.get("session_name") or f"webhook/{body.get('agent_framework', 'custom')}"
-    human_id = body.get("human_id")
-    framework = body.get("agent_framework") or "custom"
-    status = body.get("status") or "done"
-
-    # Find-or-create a session for this framework/human/name combo so
-    # bursty webhook traffic doesn't create one session per event.
-    sessions = await db_module.get_sessions(db, project_id, active_only=False)
-    target = next(
-        (s for s in sessions if s.get("name") == session_name and s.get("agent_framework") == framework),
-        None,
-    )
-    if target is None:
-        target = await db_module.register_session(
-            db, project_id, session_name,
-            human_id=human_id, agent_framework=framework,
-        )
-
-    if event_type == "hitl_request":
-        return await db_module.request_hitl(
-            db, project_id, description,
-            session_id=target["id"], context=body.get("context"),
-            urgency=body.get("urgency", "normal"),
-            assigned_to=body.get("assigned_to"),
-        )
-
-    task = await db_module.log_task(
-        db, target["id"], project_id, description,
-        status=status, parent_task_id=body.get("parent_task_id"),
-    )
-    return {"task": task, "session_id": target["id"], "event_type": event_type}
-
-
-@app.get("/projects/{project_id}/webhook-token")
-async def get_project_webhook_token(
-    project_id: str, request: Request
-) -> dict[str, Any]:
-    """Mint-and-return the project webhook token. Shown ONCE in the UI."""
-    token = await db_module.ensure_project_token(await _db(request), project_id)
-    if token is None:
-        raise HTTPException(status_code=404, detail="project not found")
-    return {"project_id": project_id, "token": token}
-
-
-# ---------------------------------------------------------------------------
-# v3.0 — Executor runs
-# ---------------------------------------------------------------------------
-
-
-@app.get("/projects/{project_id}/search")
-async def search_project_all(
-    project_id: str,
-    request: Request,
-    q: str = "",
-    limit: int = 10,
-) -> dict[str, Any]:
-    """Universal search across tasks, notes, decisions, and sprint items."""
-    db = await _db(request)
-    project = await db_module.get_project(db, project_id)
-    if project is None:
-        raise HTTPException(status_code=404, detail="project not found")
-    if not q.strip():
-        return {"query": q, "tasks": [], "notes": [], "decisions": [], "sprint_items": [], "total": 0}
-    return await db_module.search_all(db, project_id, q.strip(), limit=limit)
-
-
-@app.get("/projects/{project_id}/runs")
-async def get_project_runs(
-    project_id: str,
-    request: Request,
-    limit: int = 20,
-) -> list[dict[str, Any]]:
-    """List executor_runs for a project, newest first."""
-    db = await _db(request)
-    project = await db_module.get_project(db, project_id)
-    if project is None:
-        raise HTTPException(status_code=404, detail="project not found")
-    runs = await db_module.get_executor_runs(db, project_id, limit=limit)
-    for run in runs:
-        if run.get("started_at") and run.get("ended_at"):
-            from datetime import datetime
-            try:
-                fmt = "%Y-%m-%d %H:%M:%S"
-                start = datetime.strptime(run["started_at"], fmt)
-                end = datetime.strptime(run["ended_at"], fmt)
-                run["duration_s"] = int((end - start).total_seconds())
-            except Exception:
-                run["duration_s"] = None
-        else:
-            run["duration_s"] = None
-    return runs
-
-
-@app.get("/projects/{project_id}/runs/{run_id}")
-async def get_project_run(
-    project_id: str,
-    run_id: str,
-    request: Request,
-) -> dict[str, Any]:
-    """Return a single executor_run with full transcript."""
-    db = await _db(request)
-    run = await db_module.get_executor_run(db, run_id)
-    if run is None or run.get("project_id") != project_id:
-        raise HTTPException(status_code=404, detail="run not found")
-    return run
-
+# team/summary, events, webhook-token, search, runs → meridian/routes/projects.py
 
 # ---------------------------------------------------------------------------
 # CLAUDE.md auto-update helper
@@ -3686,34 +2567,6 @@ async def get_notification_prefs(request: Request) -> dict[str, Any]:
 _WORKSPACE_MEMBER_LIMITS: dict[str, int] = {"standard": 25, "pro": 50}
 
 
-async def _require_workspace_perm(
-    request: Request, tenant: dict[str, Any], perm: str,
-) -> str:
-    """G5.19 — Resolve the calling user's role in the tenant's workspace
-    and 403 if they lack ``perm``. Returns the resolved role on success.
-
-    The tenant owner (email matches tenant.email) implicitly has every
-    permission. For invitees, ROLE_PERMS gates the action.
-    """
-    from .hosted import get_current_tenant as _get_ct  # noqa: PLC0415
-    from .roles import has_perm  # noqa: PLC0415
-    try:
-        caller = await _get_ct(request)
-    except HTTPException:
-        raise HTTPException(403, "Sign in required")
-    caller_email = caller.get("email", "")
-    resolved = await db_module.resolve_member_role(
-        request.app.state.db, tenant["id"], caller_email,
-    )
-    role = resolved[0] if resolved else None
-    if not has_perm(role, perm):
-        raise HTTPException(
-            403,
-            f"Workspace role '{role or 'none'}' lacks permission '{perm}'",
-        )
-    return role  # type: ignore[return-value]
-
-
 @app.post("/workspace/invite", status_code=201)
 async def workspace_invite(request: Request) -> dict[str, Any]:
     """Invite a new workspace member. Sends invite email via Resend."""
@@ -3937,63 +2790,7 @@ async def workspace_remove_member(request: Request, member_id: str) -> None:
     await db_module.delete_workspace_member(request.app.state.db, member_id, tenant["id"])
 
 
-@app.get("/workspace/notes")
-async def workspace_list_notes(request: Request, tag: str | None = None) -> list[dict[str, Any]]:
-    """List workspace-level notes, newest first."""
-    db = await _db(request)
-    _t = await _get_tenant_from_request(request)
-    return await db_module.get_workspace_notes(
-        db, tag=tag, tenant_id=_t["id"] if _t else None
-    )
-
-
-@app.post("/workspace/notes", status_code=201)
-async def workspace_add_note(request: Request) -> dict[str, Any]:
-    """Add a workspace-level note."""
-    db = await _db(request)
-    body = await request.json()
-    title = (body.get("title") or "").strip()
-    content = (body.get("body") or "").strip()
-    if not title or not content:
-        raise HTTPException(status_code=422, detail="title and body are required")
-    validate_input_size(title, "note title", 500)
-    validate_input_size(content, "note body", 10_000_000)
-    _t = await _get_tenant_from_request(request)
-    return await db_module.add_workspace_note(
-        db, title, content, body.get("tags"), tenant_id=_t["id"] if _t else None
-    )
-
-
-@app.patch("/workspace/notes/{note_id}")
-async def workspace_update_note(request: Request, note_id: str) -> dict[str, Any]:
-    """Patch title/body/tags on a workspace note."""
-    db = await _db(request)
-    body = await request.json()
-    _t = await _get_tenant_from_request(request)
-    result = await db_module.update_workspace_note(
-        db, note_id,
-        title=body.get("title"),
-        body=body.get("body"),
-        tags=body.get("tags"),
-        tenant_id=_t["id"] if _t else None,
-    )
-    if result is None:
-        raise HTTPException(status_code=404, detail="note not found")
-    return result
-
-
-@app.delete("/workspace/notes/{note_id}", status_code=204)
-async def workspace_delete_note(request: Request, note_id: str) -> None:
-    """Delete a workspace note."""
-    db = await _db(request)
-    _t = await _get_tenant_from_request(request)
-    deleted = await db_module.delete_workspace_note(
-        db, note_id, tenant_id=_t["id"] if _t else None
-    )
-    if not deleted:
-        raise HTTPException(status_code=404, detail="note not found")
-
-
+# workspace/notes + workspace/decisions + workspace/settings → meridian/routes/workspace.py
 def _is_demo_request(request: Request) -> bool:
     """Return True when the request is in demo mode (env flag or cookie)."""
     env_demo = os.environ.get("MERIDIAN_DEMO", "").lower() in ("1", "true", "yes")
@@ -4001,7 +2798,37 @@ def _is_demo_request(request: Request) -> bool:
     return env_demo or cookie_demo
 
 
-# /export/my-data + /account/delete moved to meridian/routes/export.py
+# to routes/export.py and routes/github.py respectively.
+# NOTE: export_my_data stays in server.py because slowapi @_rate_limit does not
+# wire correctly for routes included via APIRouter (same constraint as magic-link).
+@app.get("/export/my-data")
+@_rate_limit("3/minute")
+async def export_my_data(request: Request) -> Response:
+    """GDPR data portability — returns a JSON file of all account data."""
+    if not _hosted_mode():
+        raise HTTPException(status_code=404)
+    if _is_demo_request(request):
+        return JSONResponse(
+            {"detail": "Not available in demo mode. Sign up at usemeridian.us"},
+            status_code=403,
+        )
+    from .hosted import get_current_tenant
+    tenant = await get_current_tenant(request)
+    # Account rows (tenant/tokens/members) live in the auth DB; the tenant's
+    # project data lives in its own per-tenant DB. Pass both so the export
+    # actually contains projects (hosted mode previously exported empty arrays).
+    data = await db_module.export_tenant_data(
+        request.app.state.db, tenant["id"], project_db=await _db(request),
+    )
+    payload = json.dumps(data, indent=2, default=str).encode()
+    email_slug = (tenant.get("email") or "user").split("@")[0][:20]
+    filename = f"meridian-export-{email_slug}.json"
+    return Response(
+        content=payload,
+        media_type="application/json",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
 
 
 @app.get("/settings/mcp-config")
@@ -4245,7 +3072,6 @@ async def mcp_tools_doc() -> str:
     while lines and lines[-1].strip() in ("---", ""):
         lines.pop()
     return "\n".join(part.rstrip("\n") for part in lines).rstrip() + "\n"
-
 # /admin/health, /admin/git-status → meridian/routes/admin.py
 
 
@@ -4691,92 +3517,6 @@ async def _resolve_hook_db(request: Request) -> Any:
     conn = await _open_tenant_db_by_id(request, tenant["id"])
     request.state._db_conn = conn
     return conn
-
-
-def _hook_script_path(filename: str) -> Path:
-    return Path(__file__).parent.parent / filename
-
-
-def _mask_api_token_hash(token_hash: str | None) -> str:
-    """Return a stable masked display string for a stored API token hash.
-    Shows only last 4 chars of the hash as a stable identifier."""
-    value = (token_hash or "").strip()
-    if len(value) >= 4:
-        return f"sk_meridian_••••••••{value[-4:]}"
-    return "sk_meridian_••••••••..."
-
-
-async def _get_authenticated_tenant(request: Request) -> dict[str, Any]:
-    """Resolve the current hosted tenant from session cookie or bearer token."""
-    from .hosted import get_current_tenant, get_tenant_from_bearer
-
-    tenant = None
-    try:
-        tenant = await get_current_tenant(request)
-    except HTTPException:
-        pass
-    if tenant is None:
-        try:
-            tenant = await get_tenant_from_bearer(request)
-        except HTTPException:
-            pass
-    if tenant is None:
-        raise HTTPException(status_code=401, detail="authentication required")
-    return tenant
-
-
-def _watcher_script_path(filename: str) -> Path:
-    return Path(__file__).parent.parent / "scripts" / filename
-
-
-@app.get("/install_watcher.ps1")
-async def get_install_watcher_ps1() -> PlainTextResponse:
-    """a7c43cc1 — serve the claude --rc FileSystemWatcher installer for Windows."""
-    script_path = _watcher_script_path("install_watcher.ps1")
-    if not script_path.exists():
-        raise HTTPException(status_code=404, detail="install_watcher.ps1 not found")
-    return PlainTextResponse(script_path.read_text(encoding="utf-8"))
-
-
-@app.get("/install_watcher.sh")
-async def get_install_watcher_sh() -> PlainTextResponse:
-    """a7c43cc1 — serve the claude --rc FSEvents/inotify installer for macOS/Linux."""
-    script_path = _watcher_script_path("install_watcher.sh")
-    if not script_path.exists():
-        raise HTTPException(status_code=404, detail="install_watcher.sh not found")
-    return PlainTextResponse(script_path.read_text(encoding="utf-8"))
-
-
-@app.get("/hooks.ps1")
-async def get_hooks_ps1() -> PlainTextResponse:
-    script_path = _hook_script_path("hooks.ps1")
-    if not script_path.exists():
-        raise HTTPException(status_code=404, detail="hooks.ps1 not found")
-    return PlainTextResponse(script_path.read_text(encoding="utf-8"))
-
-
-@app.get("/hooks.sh")
-async def get_hooks_sh() -> PlainTextResponse:
-    script_path = _hook_script_path("hooks.sh")
-    if not script_path.exists():
-        raise HTTPException(status_code=404, detail="hooks.sh not found")
-    return PlainTextResponse(script_path.read_text(encoding="utf-8"))
-
-
-@app.get("/install.sh")
-async def get_install_sh() -> PlainTextResponse:
-    script_path = _hook_script_path("install.sh")
-    if not script_path.exists():
-        raise HTTPException(status_code=404, detail="install.sh not found")
-    return PlainTextResponse(script_path.read_text(encoding="utf-8"))
-
-
-@app.get("/install.ps1")
-async def get_install_ps1() -> PlainTextResponse:
-    script_path = _hook_script_path("install.ps1")
-    if not script_path.exists():
-        raise HTTPException(status_code=404, detail="install.ps1 not found")
-    return PlainTextResponse(script_path.read_text(encoding="utf-8"))
 
 
 def _hook_is_executor(body: dict[str, Any]) -> bool:
@@ -5238,7 +3978,6 @@ async def revoke_registered_machine(
 
 
 # ---------------------------------------------------------------------------
-# Session queue — queue the next /goal to run back-to-back (10e6b265)
 # ---------------------------------------------------------------------------
 
 
@@ -5258,553 +3997,6 @@ async def get_queued_session_endpoint(project_id: str, request: Request) -> dict
     """Return the currently queued next-session goal, or null."""
     db = await _db(request)
     return {"goal": await db_module.get_queued_session(db, project_id)}
-
-
-async def _block_non_admin_connection_writes(request: Request) -> None:
-    """G1.9 — connection profiles live in the hosted server's meridian.toml.
-    Non-admin tenants must not be able to mutate them. Returns 403 cleanly
-    instead of the surprising 404 when, e.g., the dashboard tried to
-    activate a connection name that doesn't exist in the toml at all.
-    """
-    if not _hosted_mode():
-        return
-    from .hosted import get_current_tenant, is_admin_db  # noqa: PLC0415
-    try:
-        tenant = await get_current_tenant(request)
-    except HTTPException:
-        raise HTTPException(403, "Sign in to manage connections")
-    if not await is_admin_db(tenant.get("email", ""), request.app.state.db):
-        raise HTTPException(
-            403, "Connection profiles are admin-only on the hosted service"
-        )
-
-
-@app.post("/config/connections")
-async def save_connection(body: dict[str, Any], request: Request) -> dict[str, Any]:
-    """v1.9.x — save a new connection profile to meridian.toml.
-
-    Body fields:
-      * ``name``      — profile name (e.g. "local", "neon")
-      * ``type``      — "sqlite" or "postgres"
-      * ``url``       — Postgres URL (required when type == "postgres")
-      * ``activate``  — if true, set as the active connection (default true)
-
-    Hosted non-admin tenants get 403; the dashboard hides the picker for
-    them too, but this is the canonical defense.
-    """
-    await _block_non_admin_connection_writes(request)
-    name = str(body.get("name", "local")).strip()
-    conn_type = body.get("type")  # optional — if omitted, reuse existing
-    url = str(body.get("url", "")).strip()
-    activate = bool(body.get("activate", True))
-
-    if not name:
-        raise HTTPException(400, "name is required")
-
-    # Load existing toml or start fresh.
-    data = toml_config_module.load_toml() or {}
-    connections: dict[str, dict[str, str]] = {}
-    for cname, ccfg in data.get("connections", {}).items():
-        connections[cname] = dict(ccfg)
-
-    if conn_type is not None:
-        # Creating or updating a connection profile
-        if conn_type not in ("sqlite", "postgres"):
-            raise HTTPException(400, "type must be 'sqlite' or 'postgres'")
-        if conn_type == "postgres" and not url:
-            raise HTTPException(400, "url is required for postgres connections")
-        new_cfg: dict[str, str] = {"type": conn_type}
-        if conn_type == "postgres":
-            new_cfg["url"] = url
-        connections[name] = new_cfg
-    elif name == "env":
-        # "env" is the synthetic connection backed by MERIDIAN_DB_URL (hosted).
-        # It is never written to meridian.toml and is already the active DB, so
-        # re-selecting it (clicking the active connection in the picker) is a
-        # no-op rather than a 404.
-        return {"ok": True, "connection_name": "env", "restart_required": False}
-    elif name not in connections and name != "local":
-        raise HTTPException(404, f"connection '{name}' not found in meridian.toml")
-
-    current_default = data.get("default", {}).get("connection", "local")
-    toml_config_module.save_toml(
-        default_connection=name if activate else current_default,
-        connections=connections,
-    )
-    return {
-        "ok": True,
-        "connection_name": name,
-        "restart_required": activate and conn_type == "postgres",
-    }
-
-
-
-@app.delete("/config/connections/{name}")
-async def delete_connection(name: str, request: Request) -> dict[str, Any]:
-    """v1.9.x — remove a named connection profile from meridian.toml.
-
-    Hosted non-admin tenants get 403 (see _block_non_admin_connection_writes).
-    """
-    await _block_non_admin_connection_writes(request)
-    data = toml_config_module.load_toml() or {}
-    connections: dict[str, dict[str, str]] = {
-        cname: dict(ccfg)
-        for cname, ccfg in data.get("connections", {}).items()
-    }
-    if name not in connections:
-        raise HTTPException(404, f"connection '{name}' not found")
-    del connections[name]
-    current_default = data.get("default", {}).get("connection", "local")
-    # If we deleted the active connection, fall back to local
-    if current_default == name:
-        current_default = "local"
-    toml_config_module.save_toml(
-        default_connection=current_default,
-        connections=connections,
-    )
-    return {"ok": True, "deleted": name}
-
-# ---------------------------------------------------------------------------
-# Waitlist
-# ---------------------------------------------------------------------------
-
-
-@app.post("/waitlist", status_code=201)
-async def join_waitlist(request: Request) -> dict[str, Any]:
-    """POST {"email": "...", "note": "..."} — add to hosted-tier waitlist.
-
-    Returns the created entry. 409 on duplicate email.
-    """
-    body = await request.json()
-    email = (body.get("email") or "").strip()
-    if not email or "@" not in email:
-        raise HTTPException(status_code=422, detail="valid email required")
-    plan = (body.get("plan") or "standard").strip()
-    source = (body.get("source") or "landing").strip()
-    note_parts = []
-    if body.get("note"):
-        note_parts.append(body["note"].strip())
-    note_parts.append(f"plan:{plan} source:{source}")
-    note = " ".join(note_parts) if note_parts else None
-    db = await _db(request)
-    try:
-        entry = await db_module.add_waitlist_entry(db, email, note)
-    except Exception as exc:
-        if "UNIQUE" in str(exc) or "unique" in str(exc):
-            raise HTTPException(status_code=409, detail="email already on waitlist")
-        raise
-    # Fire-and-forget confirmation email — never block the response
-    if _hosted_mode():
-        try:
-            from .hosted import send_waitlist_confirmation_email  # noqa: PLC0415
-            asyncio.create_task(send_waitlist_confirmation_email(email))
-        except Exception:
-            pass
-    return entry
-
-
-@app.get("/waitlist")
-async def list_waitlist(request: Request) -> list[dict[str, Any]]:
-    """GET all waitlist entries, newest first. Admin use only."""
-    db = request.app.state.db
-    return await db_module.get_waitlist(db)
-
-
-@app.get("/admin/waitlist", response_class=HTMLResponse)
-async def admin_waitlist_page(request: Request) -> HTMLResponse:
-    """Admin waitlist management page — shows signups, tenant stats, approve/delete buttons."""
-    from .hosted import get_current_tenant, is_admin_db  # noqa: PLC0415
-
-    try:
-        tenant = await get_current_tenant(request)
-    except HTTPException:
-        return HTMLResponse("<h1>403</h1><p>Not authenticated.</p>", status_code=403)
-    if not await is_admin_db(tenant.get("email", ""), request.app.state.db):
-        return HTMLResponse("<h1>403</h1><p>Admin only.</p>", status_code=403)
-
-    db = request.app.state.db
-    entries = await db_module.get_waitlist(db)
-
-    async def _count(sql: str) -> int:
-        async with db.execute(sql) as cur:
-            row = await cur.fetchone()
-        return (row[0] if row else 0) or 0
-
-    total_tenants = await _count("SELECT COUNT(*) FROM tenants")
-    free_tenants = await _count("SELECT COUNT(*) FROM tenants WHERE plan='free'")
-    paid_tenants = await _count("SELECT COUNT(*) FROM tenants WHERE plan NOT IN ('free','') AND plan IS NOT NULL")
-
-    rows_html = "".join(
-        f"""<tr>
-          <td style="padding:6px 10px;border-bottom:1px solid #2a2d35">{html_module.escape(e.get("email",""))}</td>
-          <td style="padding:6px 10px;border-bottom:1px solid #2a2d35;color:#8b8fa8;font-size:11px">{html_module.escape((e.get("created_at") or "")[:16])}</td>
-          <td style="padding:6px 10px;border-bottom:1px solid #2a2d35;color:#8b8fa8;font-size:11px">{html_module.escape(e.get("note") or "")}</td>
-          <td style="padding:6px 10px;border-bottom:1px solid #2a2d35">
-            <button onclick="delWL('{html_module.escape(e.get('id',''))}',this)" style="background:#2a0f0f;border:1px solid #5a1a1a;color:#e05252;border-radius:3px;padding:2px 8px;font-size:10px;cursor:pointer">Delete</button>
-          </td>
-        </tr>"""
-        for e in entries
-    ) or "<tr><td colspan='4' style='padding:16px;text-align:center;color:#8b8fa8'>No waitlist entries.</td></tr>"
-
-    html = f"""<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<title>Admin — Waitlist — Meridian</title>
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<style>
-*{{box-sizing:border-box;margin:0;padding:0}}
-body{{background:#0d0d0f;color:#e8eaf0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;padding:32px 24px}}
-h1{{font-size:1.4rem;margin-bottom:8px}}nav a{{color:#6c8fff;text-decoration:none;font-size:13px;margin-right:16px}}
-.stats{{display:flex;gap:16px;margin:20px 0}}
-.stat{{background:#16181c;border:1px solid #2a2d35;border-radius:8px;padding:12px 18px;min-width:120px}}
-.stat .n{{font-size:1.6rem;font-weight:700;color:#6c8fff}}.stat .l{{font-size:11px;color:#8b8fa8;margin-top:2px}}
-table{{width:100%;border-collapse:collapse;background:#16181c;border:1px solid #2a2d35;border-radius:8px;overflow:hidden;margin-top:16px}}
-th{{padding:8px 10px;text-align:left;background:#1e2029;font-size:11px;color:#8b8fa8;border-bottom:1px solid #2a2d35}}
-tr:hover td{{background:#1a1c23}}
-</style>
-</head>
-<body>
-<nav><a href="/dashboard">← Dashboard</a> <a href="/admin/health">Health</a></nav>
-<h1 style="margin-top:16px">Waitlist Management</h1>
-<p style="color:#8b8fa8;font-size:13px;margin-top:4px">{len(entries)} total signup{"s" if len(entries)!=1 else ""}</p>
-<div class="stats">
-  <div class="stat"><div class="n">{len(entries)}</div><div class="l">Waitlist</div></div>
-  <div class="stat"><div class="n">{total_tenants}</div><div class="l">Total Tenants</div></div>
-  <div class="stat"><div class="n">{free_tenants}</div><div class="l">Free Plan</div></div>
-  <div class="stat"><div class="n">{paid_tenants}</div><div class="l">Paid Plan</div></div>
-</div>
-<table>
-<thead><tr><th>Email</th><th>Signed Up</th><th>Note</th><th>Action</th></tr></thead>
-<tbody id="wl-body">{rows_html}</tbody>
-</table>
-<script>
-async function delWL(id, btn) {{
-  if (!confirm('Delete this waitlist entry?')) return;
-  const r = await fetch('/admin/waitlist/' + id, {{method:'DELETE'}});
-  if (r.ok) {{ btn.closest('tr').remove(); }} else {{ alert('Failed: ' + r.status); }}
-}}
-</script>
-</body></html>"""
-    return HTMLResponse(html)
-
-
-@app.delete("/admin/waitlist/{entry_id}")
-async def admin_delete_waitlist_entry(entry_id: str, request: Request) -> dict[str, Any]:
-    """Delete a waitlist entry by id. Admin only."""
-    from .hosted import get_current_tenant, is_admin_db  # noqa: PLC0415
-
-    try:
-        tenant = await get_current_tenant(request)
-    except HTTPException:
-        raise HTTPException(status_code=403, detail="not authenticated")
-    if not await is_admin_db(tenant.get("email", ""), request.app.state.db):
-        raise HTTPException(status_code=403, detail="admin only")
-    db = request.app.state.db
-    await db.execute("DELETE FROM waitlist WHERE id = ?", (entry_id,))
-    await db.commit()
-    return {"deleted": True, "id": entry_id}
-
-
-@app.get("/waitlist-pending")
-async def waitlist_pending(request: Request) -> HTMLResponse:
-    """Landing page for non-admin users who sign in during pre-launch."""
-    message = (request.query_params.get("message") or "").strip()
-    badge = "Early access is full" if message else "✓ You're on the list"
-    heading = "You're on the waitlist" if message else "Thanks for signing up!"
-    body = (
-        message
-        if message
-        else "Meridian is in early access. We'll email you when your account is ready."
-    )
-    html = """<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<title>You're on the waitlist — Meridian</title>
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<style>
-*{box-sizing:border-box;margin:0;padding:0}
-body{background:#0d0d0f;color:#e8eaf0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
-  min-height:100vh;display:flex;align-items:center;justify-content:center}
-.card{background:#16181c;border:1px solid #2a2d35;border-radius:12px;padding:44px 40px;
-  max-width:480px;width:100%;margin:20px;text-align:center}
-.logo{font-size:1.3rem;font-weight:700;color:#e8eaf0;margin-bottom:24px}
-.logo span{color:#6c8fff}
-h1{font-size:1.5rem;font-weight:700;margin-bottom:12px}
-p{color:#8b8fa8;font-size:.9rem;line-height:1.6;margin-bottom:16px}
-.badge{display:inline-block;background:#1e2029;border:1px solid #2a2d35;border-radius:20px;
-  padding:6px 16px;font-size:.8rem;color:#6c8fff;margin-bottom:24px}
-a{color:#6c8fff;text-decoration:none}
-a:hover{text-decoration:underline}
-</style>
-</head>
-<body>
-<div class="card">
-  <div class="logo">⬡ <span>Meridian</span></div>
-  <div class="badge">__BADGE__</div>
-  <h1>__HEADING__</h1>
-  <p>__BODY__</p>
-  <p>In the meantime, explore the live demo or read the docs.</p>
-  <div style="display:flex;gap:10px;justify-content:center;margin-top:20px;flex-wrap:wrap">
-    <a href="/" style="display:inline-block;background:#1a1c23;border:1px solid #2a2d35;border-radius:8px;padding:9px 18px;color:#e8eaf0;font-size:.85rem;text-decoration:none">← Back to home</a>
-    <a href="/demo" style="display:inline-block;background:#7c3aed;border:none;border-radius:8px;padding:9px 18px;color:#fff;font-size:.85rem;text-decoration:none">→ Try the live demo</a>
-    <a href="https://docs.usemeridian.us" target="_blank" style="display:inline-block;background:#1a1c23;border:1px solid #2a2d35;border-radius:8px;padding:9px 18px;color:#e8eaf0;font-size:.85rem;text-decoration:none">Read the docs</a>
-  </div>
-  <p style="margin-top:24px;font-size:.78rem"><a href="/auth/logout">sign out</a></p>
-</div>
-</body>
-</html>"""
-    html = (
-        html.replace("__BADGE__", badge)
-        .replace("__HEADING__", heading)
-        .replace("__BODY__", body)
-    )
-    return HTMLResponse(html)
-
-
-# ---------------------------------------------------------------------------
-# v1.0 — Stripe Checkout (API-based, plan-aware)
-# ---------------------------------------------------------------------------
-
-
-@app.get("/billing/portal")
-async def billing_portal_redirect(request: Request):
-    """G2.11 — open a Stripe Customer Portal session for the signed-in tenant.
-
-    Routes to /pricing when the tenant has no stripe_customer_id (free tier
-    or trial), to /auth/login when not signed in, and to the Stripe-hosted
-    portal otherwise.
-    """
-    from fastapi.responses import RedirectResponse  # noqa: PLC0415
-    from .hosted import create_stripe_billing_portal_session, get_current_tenant  # noqa: PLC0415
-
-    try:
-        tenant = await get_current_tenant(request)
-    except HTTPException:
-        return RedirectResponse("/auth/login?next=/billing/portal", status_code=302)
-
-    try:
-        url = await create_stripe_billing_portal_session(tenant)
-    except ValueError:
-        # No stripe_customer_id yet — direct the user to subscribe instead.
-        return RedirectResponse("/pricing", status_code=302)
-    except RuntimeError:
-        # Stripe not configured (local dev) — fall through to pricing.
-        return RedirectResponse("/pricing", status_code=302)
-
-    return RedirectResponse(url, status_code=302)
-
-
-@app.post("/billing/portal")
-async def billing_portal_json(request: Request) -> dict[str, str]:
-    """Return Stripe billing portal URL as JSON for dashboard AJAX calls (e7d4400b)."""
-    from .hosted import create_stripe_billing_portal_session, get_current_tenant  # noqa: PLC0415
-
-    try:
-        tenant = await get_current_tenant(request)
-    except HTTPException:
-        raise HTTPException(status_code=401, detail="Not authenticated")
-    if not tenant.get("stripe_customer_id"):
-        raise HTTPException(status_code=404, detail="No billing account")
-    try:
-        url = await create_stripe_billing_portal_session(tenant)
-    except ValueError as exc:
-        raise HTTPException(status_code=404, detail=str(exc))
-    except RuntimeError as exc:
-        raise HTTPException(status_code=503, detail=str(exc))
-    return {"url": url}
-
-
-@app.get("/checkout")
-async def checkout_redirect(request: Request, plan: str = "standard") -> RedirectResponse:
-    """Create a Stripe Checkout Session and redirect to it.
-
-    Requires an active session cookie. ``plan`` must be ``standard`` or ``pro``.
-    Falls back to the payment link if Stripe API is not configured.
-    """
-    from .hosted import create_stripe_checkout_session, get_current_tenant
-
-    if plan not in ("standard", "pro"):
-        raise HTTPException(status_code=400, detail="plan must be standard or pro")
-
-    try:
-        tenant = await get_current_tenant(request)
-    except HTTPException:
-        return RedirectResponse(f"/auth/login?next=/checkout%3Fplan%3D{plan}", status_code=302)
-
-    try:
-        url = await create_stripe_checkout_session(tenant, plan)
-    except RuntimeError:
-        # Stripe not configured — fall back to payment link
-        fallback = os.environ.get("STRIPE_PAYMENT_LINK", "/auth/login")
-        return RedirectResponse(fallback, status_code=302)
-
-    return RedirectResponse(url, status_code=302)
-
-
-# ---------------------------------------------------------------------------
-# v2.0 — Stripe webhook
-# ---------------------------------------------------------------------------
-
-
-@app.post("/webhooks/stripe", status_code=200)
-async def stripe_webhook(request: Request) -> dict[str, str]:
-    """Handle Stripe webhook events.
-
-    Verifies the ``Stripe-Signature`` header against ``STRIPE_WEBHOOK_SECRET``.
-    On ``checkout.session.completed`` or ``invoice.paid``:
-      1. Upserts the tenant by email.
-      2. Provisions a Neon DB if not already done.
-      3. Creates an API bearer token and sends a welcome email.
-
-    Returns ``{"status": "ok"}`` on success or if the event type is ignored.
-    Returns 400 on signature verification failure.
-    """
-    import hmac as _hmac
-    import hashlib as _hashlib
-    import time as _time
-
-    webhook_secret = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
-    raw_body = await request.body()
-    sig_header = request.headers.get("Stripe-Signature", "")
-
-    # Verify signature if secret is configured
-    if webhook_secret:
-        try:
-            _verify_stripe_signature(raw_body, sig_header, webhook_secret)
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-    try:
-        event = json.loads(raw_body)
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail="invalid JSON") from exc
-
-    event_type = event.get("type", "")
-    _HANDLED = {
-        "checkout.session.completed",
-        "invoice.paid",
-        "customer.subscription.created",
-        "invoice.payment_failed",
-        "customer.subscription.past_due",
-    }
-    if event_type not in _HANDLED:
-        return {"status": "ignored"}
-
-    event_obj = event.get("data", {}).get("object", {})
-    email = (
-        event_obj.get("customer_email")
-        or event_obj.get("customer_details", {}).get("email")
-        or ""
-    )
-    stripe_customer_id = event_obj.get("customer", "")
-
-    db = request.app.state.db
-
-    # Dunning: payment failed → stamp payment_failed_at and return early.
-    if event_type in ("invoice.payment_failed", "customer.subscription.past_due"):
-        if stripe_customer_id:
-            tenant = await db_module.get_tenant_by_stripe_customer(db, stripe_customer_id)
-            if tenant and not tenant.get("payment_failed_at"):
-                from datetime import datetime, timezone as _tz
-                ts = datetime.now(_tz.utc).isoformat()
-                await db_module.update_tenant(db, tenant["id"], payment_failed_at=ts, dunning_email_sent=0)
-        return {"status": "dunning_started"}
-
-    if not email:
-        return {"status": "no_email"}
-
-    # Resolve plan from checkout metadata (standard or pro); default to standard
-    plan = event_obj.get("metadata", {}).get("plan", "standard")
-    if plan not in ("standard", "pro"):
-        plan = "standard"
-
-    tenant = await db_module.upsert_tenant(db, email=email)
-    if stripe_customer_id:
-        tenant = await db_module.update_tenant(
-            db, tenant["id"], stripe_customer_id=stripe_customer_id, plan=plan
-        )
-        # Payment recovered — clear any dunning state
-        if tenant and tenant.get("payment_failed_at"):
-            tenant = await db_module.update_tenant(
-                db, tenant["id"], payment_failed_at=None, dunning_email_sent=0
-            )
-
-    # Extract metered subscription item ID when overage price is configured.
-    # Best-effort — never block provisioning if this fails.
-    from .hosted import STRIPE_OVERAGE_PRICE_ID as _OVERAGE_PRICE_ID
-    subscription_id = event_obj.get("subscription")
-    if subscription_id and _OVERAGE_PRICE_ID and stripe_customer_id:
-        try:
-            import stripe as _stripe
-            _stripe.api_key = os.environ.get("STRIPE_API_KEY", "")
-            sub = _stripe.Subscription.retrieve(subscription_id)
-            metered_item_id = next(
-                (i.id for i in sub.items.data if i.price.id == _OVERAGE_PRICE_ID),
-                None,
-            )
-            if metered_item_id:
-                await db_module.update_tenant(
-                    db, tenant["id"], stripe_metered_item_id=metered_item_id
-                )
-        except Exception:  # noqa: BLE001
-            pass
-
-    # Capacity check before provisioning
-    from .hosted import check_capacity, provision_neon_db, send_welcome_email
-    try:
-        await check_capacity(db)
-    except RuntimeError as cap_exc:
-        import logging
-        logging.getLogger(__name__).error("Capacity exceeded: %s", cap_exc)
-        return {"status": "capacity_exceeded"}
-
-    # Provision Neon DB
-    try:
-        tenant = await provision_neon_db(tenant["id"], db)
-    except Exception as exc:
-        # Log but don't fail the webhook — Stripe will retry
-        import logging
-        logging.getLogger(__name__).error("Neon provisioning failed for %s: %s", email, exc)
-        return {"status": "provisioning_queued"}
-
-    # Create API token + send welcome email
-    raw_token, _token_row = await db_module.create_api_token(db, tenant["id"], label="welcome")
-    try:
-        await send_welcome_email(email, raw_token, tenant)
-    except Exception as exc:
-        import logging
-        logging.getLogger(__name__).warning("Welcome email failed for %s: %s", email, exc)
-
-    return {"status": "ok"}
-
-
-def _verify_stripe_signature(raw_body: bytes, sig_header: str, secret: str) -> None:
-    """Verify a Stripe webhook signature. Raises ValueError on failure."""
-    import hmac
-    import hashlib
-    import time
-
-    parts = {k: v for part in sig_header.split(",") for k, v in [part.split("=", 1)] if "=" in part}
-    timestamp = parts.get("t", "")
-    sig = parts.get("v1", "")
-    if not timestamp or not sig:
-        raise ValueError("missing signature components")
-
-    try:
-        ts = int(timestamp)
-    except ValueError:
-        raise ValueError("invalid timestamp")
-
-    tolerance = 300  # 5 minutes
-    if abs(time.time() - ts) > tolerance:
-        raise ValueError("webhook timestamp too old")
-
-    payload = f"{timestamp}.{raw_body.decode()}"
-    expected = hmac.new(secret.encode(), payload.encode(), hashlib.sha256).hexdigest()
-    if not hmac.compare_digest(expected, sig):
-        raise ValueError("signature mismatch")
 
 
 # ---------------------------------------------------------------------------
@@ -5956,7 +4148,6 @@ async def auth_install_page(request: Request) -> HTMLResponse:
     return HTMLResponse(content=html)
 
 
-# ---------------------------------------------------------------------------
 # v2.0 — Remote MCP endpoint (HTTP JSON-RPC 2.0 transport)
 # ---------------------------------------------------------------------------
 
@@ -7211,7 +5402,6 @@ async def _remote_mcp_inner(request: Request) -> Any:
 
     result = await _handle_mcp_request(body, db, data_dir, tenant=tenant, token_type=_token_type)
     return JSONResponse(result)
-
 
 # ---------------------------------------------------------------------------
 # MCP server — implementation lives in meridian/mcp/stdio_handler.py

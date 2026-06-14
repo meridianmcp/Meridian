@@ -1,4 +1,4 @@
-"""Core tests for Meridian — db layer, HTTP endpoints, and handoff."""
+﻿"""Core tests for Meridian — db layer, HTTP endpoints, and handoff."""
 
 from __future__ import annotations
 
@@ -7387,7 +7387,7 @@ def test_local_mode_connections_endpoint_unchanged(client, monkeypatch):
 
 def test_canonicalize_notify_target_strips_ntfy_prefix():
     """G1.7 — ntfy URLs collapse to topic-only; emails/webhooks pass through."""
-    from meridian.server import _canonicalize_notify_target
+    from meridian.routes.projects import _canonicalize_notify_target
 
     assert _canonicalize_notify_target("https://ntfy.sh/foo") == "foo"
     assert _canonicalize_notify_target("https://ntfy.sh/foo/") == "foo"

@@ -47,6 +47,23 @@ async def create_workspace_note_endpoint(
     )
 
 
+@router.patch("/workspace/notes/{note_id}")
+async def update_workspace_note_endpoint(
+    note_id: str, body: dict[str, Any], request: Request
+) -> dict[str, Any]:
+    """Patch title/body/tags on a workspace note."""
+    result = await db_module.update_workspace_note(
+        await _db(request), note_id,
+        title=body.get("title"),
+        body=body.get("body"),
+        tags=body.get("tags"),
+        tenant_id=await _tenant_id(request),
+    )
+    if result is None:
+        raise HTTPException(status_code=404, detail="note not found")
+    return result
+
+
 @router.delete("/workspace/notes/{note_id}", status_code=204)
 async def delete_workspace_note_endpoint(
     note_id: str, request: Request
