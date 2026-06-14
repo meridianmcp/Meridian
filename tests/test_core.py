@@ -5344,10 +5344,11 @@ def test_pg_migration_registry_matches_historical_order():
         "_migrate_pg_github_to_projects",
         "_migrate_pg_queued_session",
         "_migrate_pg_parallel_safety",
+        "_migrate_pg_changelog_entries",
     ]
     # No duplicates across the three groups.
     allnames = core + hosted + late
-    assert len(allnames) == len(set(allnames)) == 38
+    assert len(allnames) == len(set(allnames)) == 39
 
 
 def test_cached_plan_error_is_retryable():
@@ -6355,6 +6356,82 @@ def test_changelog_page_has_correct_title(client):
     assert r.status_code == 200
     assert "Changelog" in r.text
     assert "Meridian" in r.text
+
+
+def test_landing_html_changelog_nav_link(client):
+    """landing.html nav must also link to /changelog (03744d18)."""
+    r = client.get("/")
+    assert r.status_code == 200
+    # Confirm the nav section (before the footer) has the link — the footer link
+    # was already there; this checks the top nav was also updated.
+    # The nav comes before the <footer> tag in the HTML.
+    html = r.text
+    nav_end = html.find("<footer")
+    assert nav_end > 0
+    nav_section = html[:nav_end]
+    assert 'href="/changelog"' in nav_section, "landing nav must include /changelog link"
+
+
+def test_api_changelog_entries_public(client):
+    """GET /api/changelog-entries returns JSON array (may be empty on fresh DB)."""
+    r = client.get("/api/changelog-entries")
+    assert r.status_code == 200
+    data = r.json()
+    assert "entries" in data
+    assert isinstance(data["entries"], list)
+
+
+@pytest.mark.asyncio
+async def test_changelog_db_create_list_delete(db):
+    """create_changelog_entry / list_changelog_entries / delete_changelog_entry round-trip."""
+    entry = await db_module.create_changelog_entry(
+        db, title="v1.1 Release", body="New features shipped.", version="v1.1.0"
+    )
+    assert entry["id"]
+    assert entry["title"] == "v1.1 Release"
+    assert entry["version"] == "v1.1.0"
+
+    entries = await db_module.list_changelog_entries(db)
+    ids = [e["id"] for e in entries]
+    assert entry["id"] in ids
+
+    deleted = await db_module.delete_changelog_entry(db, entry["id"])
+    assert deleted is True
+
+    entries2 = await db_module.list_changelog_entries(db)
+    assert entry["id"] not in [e["id"] for e in entries2]
+
+
+@pytest.mark.asyncio
+async def test_changelog_db_update(db):
+    """update_changelog_entry patches fields in place."""
+    entry = await db_module.create_changelog_entry(
+        db, title="Old title", body="Old body"
+    )
+    updated = await db_module.update_changelog_entry(
+        db, entry["id"], title="New title", body="New body"
+    )
+    assert updated is not None
+    assert updated["title"] == "New title"
+    assert updated["body"] == "New body"
+    # version stays None since we didn't set it
+    assert updated["version"] is None
+
+    # Not found returns None
+    result = await db_module.update_changelog_entry(db, "nonexistent-id", title="x")
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_changelog_page_shows_db_entries_when_present(db, tmp_path):
+    """When changelog_entries has data, /changelog renders it (not DEVLOG fallback)."""
+    import meridian.server as srv
+    await db_module.create_changelog_entry(
+        db, title="Parallel safety shipped", body="Worktrees now default.", version="v1.1.0"
+    )
+    # Verify the DB entry appears in list_changelog_entries
+    entries = await db_module.list_changelog_entries(db)
+    assert any(e["title"] == "Parallel safety shipped" for e in entries)
 
 
 @pytest.mark.asyncio

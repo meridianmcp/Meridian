@@ -1100,22 +1100,111 @@ async def privacy_page(request: Request) -> HTMLResponse:
 
 @app.get("/changelog", response_class=HTMLResponse)
 async def changelog_page(request: Request) -> HTMLResponse:
-    """Public changelog rendered from DEVLOG.md — newest entries first."""
-    devlog_path = Path(__file__).parent.parent / "DEVLOG.md"
-    raw = devlog_path.read_text(encoding="utf-8") if devlog_path.exists() else ""
-    parts = re.split(r"\n(?=## )", raw)
-    entries = []
-    for part in parts:
-        if not part.startswith("## "):
-            continue
-        lines = part.split("\n", 1)
-        title = lines[0][3:].strip()
-        body = lines[1].strip() if len(lines) > 1 else ""
-        body = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", body)
-        body = re.sub(r"`([^`]+)`", r"<code>\1</code>", body)
-        entries.append({"title": title, "body": body})
-    entries.reverse()
-    return _templates.TemplateResponse(request, "changelog.html", {"entries": entries})
+    """Public changelog rendered from DB — newest entries first.
+
+    Falls back to DEVLOG.md when no DB entries exist (bootstrap / self-hosted).
+    Admin users see inline controls to add/edit/delete entries.
+    """
+    db = await _db(request)
+    entries = await db_module.list_changelog_entries(db)
+    is_admin = False
+    if _hosted_mode():
+        try:
+            from .hosted import get_current_tenant, is_admin_db
+            tenant = await get_current_tenant(request)
+            is_admin = await is_admin_db(tenant.get("email", ""), db)
+        except Exception:  # noqa: BLE001
+            pass
+
+    if not entries:
+        # Bootstrap: render DEVLOG.md when the DB table is empty
+        devlog_path = Path(__file__).parent.parent / "DEVLOG.md"
+        raw = devlog_path.read_text(encoding="utf-8") if devlog_path.exists() else ""
+        parts = re.split(r"\n(?=## )", raw)
+        for part in parts:
+            if not part.startswith("## "):
+                continue
+            lines = part.split("\n", 1)
+            title = lines[0][3:].strip()
+            body = lines[1].strip() if len(lines) > 1 else ""
+            body = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", body)
+            body = re.sub(r"`([^`]+)`", r"<code>\1</code>", body)
+            entries.append({"id": None, "version": None, "title": title,
+                            "body": body, "published_at": None})
+        entries.reverse()
+
+    return _templates.TemplateResponse(
+        request, "changelog.html",
+        {"entries": entries, "is_admin": is_admin},
+    )
+
+
+@app.get("/api/changelog-entries")
+async def api_changelog_entries(request: Request) -> dict:
+    """Return changelog entries as JSON."""
+    db = await _db(request)
+    entries = await db_module.list_changelog_entries(db)
+    return {"entries": entries}
+
+
+@app.post("/api/admin/changelog-entries")
+async def api_create_changelog_entry(request: Request) -> dict:
+    """Admin-only: create a new changelog entry."""
+    if not _hosted_mode():
+        raise HTTPException(status_code=403, detail="admin API only available in hosted mode")
+    from .hosted import get_current_tenant, is_admin_db
+    tenant = await get_current_tenant(request)
+    db = await _db(request)
+    if not await is_admin_db(tenant.get("email", ""), db):
+        raise HTTPException(status_code=403, detail="admin only")
+    body_data = await request.json()
+    title = (body_data.get("title") or "").strip()
+    body = (body_data.get("body") or "").strip()
+    version = (body_data.get("version") or "").strip() or None
+    published_at = (body_data.get("published_at") or "").strip() or None
+    if not title:
+        raise HTTPException(status_code=422, detail="title is required")
+    entry = await db_module.create_changelog_entry(db, title, body, version, published_at)
+    return entry
+
+
+@app.patch("/api/admin/changelog-entries/{entry_id}")
+async def api_update_changelog_entry(request: Request, entry_id: str) -> dict:
+    """Admin-only: update a changelog entry."""
+    if not _hosted_mode():
+        raise HTTPException(status_code=403, detail="admin API only available in hosted mode")
+    from .hosted import get_current_tenant, is_admin_db
+    tenant = await get_current_tenant(request)
+    db = await _db(request)
+    if not await is_admin_db(tenant.get("email", ""), db):
+        raise HTTPException(status_code=403, detail="admin only")
+    body_data = await request.json()
+    entry = await db_module.update_changelog_entry(
+        db, entry_id,
+        title=body_data.get("title"),
+        body=body_data.get("body"),
+        version=body_data.get("version"),
+        published_at=body_data.get("published_at"),
+    )
+    if entry is None:
+        raise HTTPException(status_code=404, detail="entry not found")
+    return entry
+
+
+@app.delete("/api/admin/changelog-entries/{entry_id}")
+async def api_delete_changelog_entry(request: Request, entry_id: str) -> dict:
+    """Admin-only: delete a changelog entry."""
+    if not _hosted_mode():
+        raise HTTPException(status_code=403, detail="admin API only available in hosted mode")
+    from .hosted import get_current_tenant, is_admin_db
+    tenant = await get_current_tenant(request)
+    db = await _db(request)
+    if not await is_admin_db(tenant.get("email", ""), db):
+        raise HTTPException(status_code=403, detail="admin only")
+    deleted = await db_module.delete_changelog_entry(db, entry_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="entry not found")
+    return {"deleted": True}
 
 
 @app.get("/pricing", response_class=HTMLResponse)

@@ -671,6 +671,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_registered_hostnames(db)
     await _migrate_queued_session(db)
     await _migrate_parallel_safety(db)
+    await _migrate_changelog_entries(db)
     return db
 
 
@@ -6411,3 +6412,84 @@ async def add_feedback(
     )
     await db.commit()
     return feedback_id
+
+
+async def list_changelog_entries(db: aiosqlite.Connection) -> list[dict[str, Any]]:
+    """Return all changelog entries ordered newest first."""
+    async with db.execute(
+        "SELECT id, version, title, body, published_at, created_at "
+        "FROM changelog_entries ORDER BY published_at DESC"
+    ) as cur:
+        rows = await cur.fetchall()
+    return [dict(r) if isinstance(r, dict) else {
+        "id": r[0], "version": r[1], "title": r[2], "body": r[3],
+        "published_at": r[4], "created_at": r[5],
+    } for r in rows]
+
+
+async def create_changelog_entry(
+    db: aiosqlite.Connection,
+    title: str,
+    body: str,
+    version: str | None = None,
+    published_at: str | None = None,
+) -> dict[str, Any]:
+    """Create a new changelog entry. Returns the created row."""
+    import datetime
+    entry_id = str(uuid.uuid4())
+    ts = published_at or datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    await db.execute(
+        "INSERT INTO changelog_entries (id, version, title, body, published_at) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (entry_id, version, title, body, ts),
+    )
+    await db.commit()
+    return {"id": entry_id, "version": version, "title": title, "body": body,
+            "published_at": ts, "created_at": ts}
+
+
+async def update_changelog_entry(
+    db: aiosqlite.Connection,
+    entry_id: str,
+    title: str | None = None,
+    body: str | None = None,
+    version: str | None = None,
+    published_at: str | None = None,
+) -> dict[str, Any] | None:
+    """Patch a changelog entry. Returns the updated row or None if not found."""
+    async with db.execute(
+        "SELECT id, version, title, body, published_at, created_at "
+        "FROM changelog_entries WHERE id = ?",
+        (entry_id,),
+    ) as cur:
+        row = await cur.fetchone()
+    if row is None:
+        return None
+    r = dict(row) if isinstance(row, dict) else {
+        "id": row[0], "version": row[1], "title": row[2], "body": row[3],
+        "published_at": row[4], "created_at": row[5],
+    }
+    new_title = title if title is not None else r["title"]
+    new_body = body if body is not None else r["body"]
+    new_version = version if version is not None else r["version"]
+    new_published_at = published_at if published_at is not None else r["published_at"]
+    await db.execute(
+        "UPDATE changelog_entries SET title=?, body=?, version=?, published_at=? WHERE id=?",
+        (new_title, new_body, new_version, new_published_at, entry_id),
+    )
+    await db.commit()
+    return {**r, "title": new_title, "body": new_body, "version": new_version,
+            "published_at": new_published_at}
+
+
+async def delete_changelog_entry(db: aiosqlite.Connection, entry_id: str) -> bool:
+    """Delete a changelog entry. Returns True if it existed."""
+    async with db.execute(
+        "SELECT 1 FROM changelog_entries WHERE id = ?", (entry_id,)
+    ) as cur:
+        row = await cur.fetchone()
+    if row is None:
+        return False
+    await db.execute("DELETE FROM changelog_entries WHERE id = ?", (entry_id,))
+    await db.commit()
+    return True

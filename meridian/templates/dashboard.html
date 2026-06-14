@@ -60,7 +60,10 @@
         <button class="sidebar-stop-btn" id="restart-server-btn" title="Restart the Meridian server" style="flex:1;display:none" onclick="if(confirm('Restart the Meridian server?')) _doRestart()">&#x27F3; Restart</button>
         <button class="sidebar-stop-btn" id="stop-server-btn" title="Stop the Meridian server" style="flex:1;display:none">&#x23F9; Stop</button>
       </div>
-      <div style="margin-top:8px;text-align:center"><a href="/changelog" target="_blank" style="font-size:10px;color:var(--muted);font-family:'IBM Plex Mono',monospace;text-decoration:none;opacity:0.6" onmouseover="this.style.opacity='1'" onmouseout="this.style.opacity='0.6'">changelog</a></div>
+      <div style="margin-top:8px;text-align:center;display:flex;align-items:center;justify-content:center;gap:10px">
+        <a href="/changelog" target="_blank" style="font-size:10px;color:var(--muted);font-family:'IBM Plex Mono',monospace;text-decoration:none;opacity:0.6" onmouseover="this.style.opacity='1'" onmouseout="this.style.opacity='0.6'">changelog</a>
+        {% if is_admin %}<a href="/changelog#admin-bar" target="_blank" style="font-size:10px;color:var(--accent-green,#00d4aa);font-family:'IBM Plex Mono',monospace;text-decoration:none;opacity:0.7;border:1px solid var(--accent-green,#00d4aa);border-radius:3px;padding:1px 6px" onmouseover="this.style.opacity='1'" onmouseout="this.style.opacity='0.7'" title="Publish a new release note">+ note</a>{% endif %}
+      </div>
     </div>
   </aside>
   <main class="main">

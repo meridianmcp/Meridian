@@ -14,13 +14,30 @@
   a{color:var(--accent);text-decoration:none} a:hover{text-decoration:underline}
   h1{font-size:1.8rem;font-weight:800;margin-bottom:.4rem}
   .meta{color:var(--muted);font-size:.85rem;margin-bottom:2rem}
-  .entry{border-bottom:1px solid var(--border);padding:1.5rem 0}
+  .entry{border-bottom:1px solid var(--border);padding:1.5rem 0;position:relative}
   .entry:last-child{border-bottom:none}
-  .entry-title{font-size:1.05rem;font-weight:700;color:var(--text);margin-bottom:.6rem}
+  .entry-header{display:flex;align-items:baseline;gap:.8rem;margin-bottom:.6rem;flex-wrap:wrap}
+  .entry-title{font-size:1.05rem;font-weight:700;color:var(--text)}
+  .entry-version{font-size:.78rem;font-family:var(--mono);color:var(--accent);background:rgba(108,143,255,.1);border:1px solid rgba(108,143,255,.2);border-radius:10px;padding:1px 8px}
+  .entry-date{font-size:.78rem;color:var(--muted);font-family:var(--mono)}
   .entry-body{color:var(--muted);font-size:.92rem;white-space:pre-wrap;word-break:break-word;font-family:var(--mono)}
   .entry-body strong{color:var(--text);font-weight:600}
   .entry-body code{background:var(--surface);border:1px solid var(--border);border-radius:3px;padding:1px 5px;font-size:.88em}
   footer{margin-top:3rem;padding-top:1.5rem;border-top:1px solid var(--border);color:var(--muted);font-size:.82rem;text-align:center}
+
+  /* Admin controls */
+  .admin-bar{background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:14px 16px;margin-bottom:2rem}
+  .admin-bar h3{font-size:.85rem;font-family:var(--mono);color:var(--muted);margin-bottom:10px;text-transform:uppercase;letter-spacing:.5px}
+  .admin-form{display:flex;flex-direction:column;gap:8px}
+  .admin-form input,.admin-form textarea{background:var(--bg);border:1px solid var(--border);border-radius:4px;color:var(--text);font-family:var(--mono);font-size:.85rem;padding:6px 10px;outline:none;width:100%}
+  .admin-form textarea{resize:vertical;min-height:80px}
+  .admin-form input:focus,.admin-form textarea:focus{border-color:var(--accent)}
+  .admin-form .row{display:flex;gap:8px}
+  .admin-form .row input{flex:1}
+  .btn-sm{background:var(--accent);color:#fff;border:none;border-radius:4px;padding:5px 14px;font-family:var(--mono);font-size:.82rem;cursor:pointer;font-weight:600}
+  .btn-sm:hover{background:#5577ee}
+  .btn-del{background:none;border:1px solid var(--border);border-radius:3px;color:var(--muted);font-family:var(--mono);font-size:.75rem;padding:2px 8px;cursor:pointer;margin-left:8px}
+  .btn-del:hover{color:#f87171;border-color:#f87171}
 </style>
 </head>
 <body>
@@ -28,16 +45,65 @@
 <nav><a class="logo" href="/">⬡ Meridian</a><a href="/">← Back</a></nav>
 
 <h1>Changelog</h1>
-<div class="meta">Developer log — incidents, decisions, and shipped features</div>
+<div class="meta">Release notes — what's new in each version</div>
 
+{% if is_admin %}
+<div class="admin-bar" id="admin-bar">
+  <h3>Admin — New Release Note</h3>
+  <div class="admin-form" id="new-entry-form">
+    <input id="new-title" type="text" placeholder="Title (e.g. Parallel session safety)" />
+    <div class="row">
+      <input id="new-version" type="text" placeholder="Version (e.g. v1.1.0, optional)" style="flex:1" />
+      <input id="new-date" type="text" placeholder="Date (YYYY-MM-DD, optional)" style="flex:1" />
+    </div>
+    <textarea id="new-body" placeholder="Body — markdown-style. Use **bold** and \`code\`."></textarea>
+    <div><button class="btn-sm" onclick="createEntry()">Publish</button></div>
+  </div>
+</div>
+{% endif %}
+
+<div id="entries-list">
 {% for entry in entries %}
-<div class="entry">
-  <div class="entry-title">{{ entry.title }}</div>
+<div class="entry" id="entry-{{ entry.id or loop.index }}">
+  <div class="entry-header">
+    <span class="entry-title">{{ entry.title }}</span>
+    {% if entry.version %}<span class="entry-version">{{ entry.version }}</span>{% endif %}
+    {% if entry.published_at %}<span class="entry-date">{{ entry.published_at[:10] }}</span>{% endif %}
+    {% if is_admin and entry.id %}<button class="btn-del" onclick="deleteEntry('{{ entry.id }}')">delete</button>{% endif %}
+  </div>
   <div class="entry-body">{{ entry.body | safe }}</div>
 </div>
 {% endfor %}
+</div>
 
 <footer><a href="/">Meridian</a> &nbsp;·&nbsp; <a href="/terms">Terms</a> &nbsp;·&nbsp; <a href="/privacy">Privacy</a></footer>
 </div>
+
+{% if is_admin %}
+<script>
+async function createEntry() {
+  const title = document.getElementById('new-title').value.trim();
+  const version = document.getElementById('new-version').value.trim() || null;
+  const date = document.getElementById('new-date').value.trim() || null;
+  const body = document.getElementById('new-body').value.trim();
+  if (!title) { alert('Title is required'); return; }
+  const resp = await fetch('/api/admin/changelog-entries', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({title, version, body, published_at: date}),
+  });
+  if (!resp.ok) { alert('Error: ' + (await resp.text())); return; }
+  location.reload();
+}
+
+async function deleteEntry(id) {
+  if (!confirm('Delete this entry?')) return;
+  const resp = await fetch('/api/admin/changelog-entries/' + id, {method: 'DELETE'});
+  if (!resp.ok) { alert('Error: ' + (await resp.text())); return; }
+  const el = document.getElementById('entry-' + id);
+  if (el) el.remove();
+}
+</script>
+{% endif %}
 </body>
 </html>

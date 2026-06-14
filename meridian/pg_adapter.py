@@ -1347,6 +1347,22 @@ async def _migrate_pg_parallel_safety(conn: PostgresConnection) -> None:
     )
 
 
+async def _migrate_pg_changelog_entries(conn: PostgresConnection) -> None:
+    """03744d18 — changelog_entries table for user-facing release notes."""
+    await conn.executescript(
+        "CREATE TABLE IF NOT EXISTS changelog_entries ("
+        f"    id TEXT PRIMARY KEY,"
+        f"    version TEXT,"
+        f"    title TEXT NOT NULL,"
+        f"    body TEXT NOT NULL,"
+        f"    published_at TEXT NOT NULL DEFAULT ({_TS}),"
+        f"    created_at TEXT NOT NULL DEFAULT ({_TS})"
+        ");"
+        "CREATE INDEX IF NOT EXISTS idx_changelog_published "
+        "ON changelog_entries(published_at DESC)"
+    )
+
+
 async def _migrate_pg_v34_workspace_settings(conn: PostgresConnection) -> None:
     """v3.4 — workspace_settings singleton table on existing Postgres DBs.
     Runs on ALL DBs (lives on every workspace DB). Mirrors
@@ -1571,4 +1587,5 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_github_to_projects,
     _migrate_pg_queued_session,
     _migrate_pg_parallel_safety,
+    _migrate_pg_changelog_entries,
 )
