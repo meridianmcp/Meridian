@@ -2051,6 +2051,7 @@ _EDITABLE_FILES: list[str] = ["AGENTS.md", "CLAUDE.md"]
 # File-editing and context-block routes → meridian/routes/files.py
 
 
+@app.post("/projects/{project_id}/devlog")
 async def append_devlog_entry(
     project_id: str, body: dict, request: Request
 ) -> dict[str, object]:
@@ -2064,6 +2065,80 @@ async def append_devlog_entry(
     line = f"- {_md_ts()} {text}"
     await md_anchors_module.apply_append("DEVLOG.md", "devlog", line)
     return {"ok": True}
+
+
+@app.get("/projects/{project_id}/context-block")
+async def get_project_context_block(
+    project_id: str, request: Request, mode: str = "full"
+) -> Response:
+    """v2.3 — plain-text context block suitable for direct clipboard paste.
+
+    Query: ``?mode=full`` (default) or ``?mode=chat`` (shorter).
+    Returns ``text/plain`` — the dashboard "Code Handoff" / "Copy chat
+    context" buttons stream this straight into ``navigator.clipboard``.
+    """
+    if mode not in ("full", "chat"):
+        raise HTTPException(status_code=400, detail="mode must be 'full' or 'chat'")
+    project = await db_module.get_project(await _db(request), project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="project not found")
+    goal = await db_module.get_goal(await _db(request), project_id)
+    sprint_items = await db_module.get_sprint_items(
+        await _db(request), project_id, status="pending"
+    )
+    all_tasks = await db_module.get_tasks(await _db(request), project_id, limit=20)
+    pending_tasks = [
+        t for t in all_tasks if t.get("status") in ("pending", "in_progress", "done")
+    ][:10]
+    sessions = await db_module.get_sessions(
+        await _db(request), project_id, active_only=True
+    )
+    decisions_raw = (project.get("decisions") or "").strip()
+    recent_decisions = [
+        l.strip() for l in decisions_raw.splitlines() if l.strip()
+    ][-5:]
+    text = _render_context_block(
+        project, goal, sprint_items, pending_tasks, sessions, recent_decisions,
+        mode=mode,
+        repo_root=str(Path.cwd()) if mode == "full" else None,
+    )
+    return Response(content=text, media_type="text/plain; charset=utf-8")
+
+
+@app.get("/projects/{project_id}/context")
+async def get_project_context(
+    project_id: str, request: Request
+) -> dict[str, Any]:
+    """Return a onboarding context payload for new chat sessions (v1.9.x).
+
+    A new claude.ai chat can paste this JSON to get up to speed instantly.
+    Returns: north_star, current_sprint, sprint_items (pending), recent_decisions
+    (last 5), pending_tasks (last 10), recent_sessions (last 5), file_map.
+    """
+    project = await db_module.get_project(await _db(request), project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="project not found")
+    goal = await db_module.get_goal(await _db(request), project_id)
+    sprint_items = await db_module.get_sprint_items(
+        await _db(request), project_id, status="pending", show_blocked=False
+    )
+    all_tasks = await db_module.get_tasks(await _db(request), project_id, limit=20)
+    pending_tasks = [t for t in all_tasks if t["status"] in ("pending", "in_progress")][:10]
+    sessions = await db_module.get_sessions(await _db(request), project_id, active_only=True)
+    decisions_raw = (project.get("decisions") or "").strip()
+    recent_decisions = [l.strip() for l in decisions_raw.splitlines() if l.strip()][-5:]
+    return {
+        "project": {"id": project["id"], "name": project["name"]},
+        "north_star": goal.get("north_star") if goal else None,
+        "current_sprint": goal.get("sprint") if goal else None,
+        "version_goal": goal.get("content") if goal else None,
+        "sprint_items": sprint_items,
+        "recent_decisions": recent_decisions,
+        "pending_tasks": pending_tasks,
+        "recent_sessions": sessions[:5],
+        "file_map": list(_EDITABLE_FILES),
+    }
+
 
 # Decisions routes → meridian/routes/decisions.py
 # ---------------------------------------------------------------------------
@@ -3432,6 +3507,7 @@ async def _resolve_hook_db(request: Request) -> Any:
     return conn
 
 
+def _hook_is_executor(body: dict[str, Any]) -> bool:
     """True when a SessionStart hook payload denotes an executor session.
 
     Executor sessions (Claude Code run with --dangerously-skip-permissions, or
