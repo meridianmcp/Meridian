@@ -3438,6 +3438,17 @@ async def _start_session_composite(
     }
     if agent_instructions:
         payload["agent_instructions"] = agent_instructions
+    # 1c4fdd6c — sprint-drift guard: if items are already in_progress, remind the
+    # session to mark each done with complete_sprint_item (the top drift cause).
+    _inprog = [it for it in all_sprint_items if it.get("status") == "in_progress"]
+    if _inprog:
+        _n_ip = len(_inprog)
+        payload["in_progress_reminder"] = (
+            f"{_n_ip} sprint item{'s are' if _n_ip != 1 else ' is'} already "
+            "in_progress on this board. As you finish each, call "
+            "complete_sprint_item(item_id) — items are never auto-reconciled from "
+            "git, so forgetting this is what drifts the board."
+        )
     if file_warnings:
         payload["file_warnings"] = file_warnings
     if executor_config is not None:

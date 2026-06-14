@@ -10656,3 +10656,46 @@ def test_select_strategic_notes_includes_insights():
     titles = {n["title"] for n in selected}
     assert "an insight" in titles
     assert "wiki note" not in titles
+
+
+# ---------------------------------------------------------------------------
+# Sprint drift guard (1c4fdd6c)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_sweeps_in_progress_items(db, tmp_path):
+    import meridian.server as srv
+
+    p = await db_module.create_project(db, "drift-ckpt")
+    s = await db_module.register_session(db, p["id"], "exec")
+    item = await db_module.add_sprint_item(db, p["id"], "v1", "half-done item")
+    await db_module.claim_sprint_item(db, p["id"], item["id"])  # -> in_progress
+
+    res = await srv._dispatch_mcp_tool(
+        "checkpoint", {"project_id": p["id"], "session_id": s["id"]}, db, str(tmp_path)
+    )
+    assert any(i["id"] == item["id"] for i in res["in_progress_items"])
+    assert "complete_sprint_item" in res["action_required"]
+
+
+@pytest.mark.asyncio
+async def test_start_session_in_progress_reminder(db, tmp_path):
+    import meridian.server as srv
+
+    p = await db_module.create_project(db, "drift-start")
+    item = await db_module.add_sprint_item(db, p["id"], "v1", "left in progress")
+    await db_module.claim_sprint_item(db, p["id"], item["id"])  # -> in_progress
+
+    payload = await srv._start_session_composite(
+        db, p["id"], "fresh-cold-session", str(tmp_path)
+    )
+    assert "in_progress_reminder" in payload
+    assert "complete_sprint_item" in payload["in_progress_reminder"]
+
+    # No in_progress items → no reminder.
+    p2 = await db_module.create_project(db, "drift-clean")
+    payload2 = await srv._start_session_composite(
+        db, p2["id"], "clean-session", str(tmp_path)
+    )
+    assert "in_progress_reminder" not in payload2

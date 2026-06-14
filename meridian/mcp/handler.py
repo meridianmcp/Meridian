@@ -909,13 +909,33 @@ async def _dispatch_mcp_tool(
             )
         except Exception:
             pass  # non-fatal
-        return {
+        # 1c4fdd6c — sprint-drift guard: sweep in_progress items and surface them
+        # so the executor confirms done/not-done before the handoff is final
+        # (the #1 cause of board drift is forgetting complete_sprint_item).
+        _in_progress = await db_module.get_sprint_items(
+            db, project_id, status="in_progress"
+        )
+        _ckpt_resp = {
             "summary": content,
             "pending_count": len(pending_items),
             "pending_ids": ids_str,
             "next_goal": next_goal,
             "start_fresh": start_fresh,
         }
+        if _in_progress:
+            _ckpt_resp["in_progress_items"] = [
+                {"id": it["id"], "title": (it.get("title") or "")[:80]}
+                for it in _in_progress
+            ]
+            _n = len(_in_progress)
+            _ckpt_resp["action_required"] = (
+                f"You have {_n} in_progress sprint item{'s' if _n != 1 else ''}. "
+                "Before this handoff is final, confirm each: call "
+                "complete_sprint_item(item_id) for any that shipped, or leave it "
+                "in_progress / fail_sprint_item(item_id, reason) if not done. "
+                "These are NOT auto-reconciled from git — you must mark them."
+            )
+        return _ckpt_resp
     if name == "request_hitl":
         validate_input_size(args.get("question"), "question", 10_000)
         validate_input_size(args.get("context"), "context", 50_000)
