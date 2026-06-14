@@ -15,13 +15,11 @@ That third failure mode is file conflicts: parallel agents can edit the same hig
 
 This isn't a Claude problem. It's a fundamental limitation of stateless sessions. And it gets worse with every wasted token.
 
-<img src="screenshots/01_dashboard.png" alt="Meridian landing page — the problem" style="max-width:100%;border-radius:8px;margin:12px 0">
-
 ## The Solution
 
 Meridian is a local MCP server that gives all your Claude sessions a **shared persistent brain**.
 
-<img src="screenshots/dashboard.png" alt="Meridian dashboard — hero" style="max-width:100%;border-radius:8px;margin:12px 0">
+<img src="screenshots/dashboard-hero-screenshot.png" alt="Meridian dashboard" style="max-width:100%;border-radius:8px;margin:12px 0">
 
 Every session that connects to Meridian can:
 
@@ -38,28 +36,36 @@ When the context window fills up, you can generate a handoff and start fresh. Th
 
 ## Running parallel agents safely
 
-Meridian lets multiple AI sessions work at once without pretending merge conflicts do not exist. Each executor can call `claim_file(session_id, path)` before editing shared files, and new sessions see `file_warnings` from active file claims when they start.
+Meridian has two layers of parallel safety:
 
-For high-contention files, run sequentially instead of in parallel:
+**Git worktrees (recommended)** — `claim_sprint_item` returns worktree setup commands by default. Each executor works in an isolated branch under `.claude/worktrees/{session}`, so parallel sessions never touch the same working tree. When the item is done, Meridian reminds the executor to merge before closing the worktree.
 
-- `meridian/static/dashboard.js`
-- `meridian/server.py`
-- `meridian/db/__init__.py`
+```bash
+# Meridian returns this automatically when you claim a sprint item:
+git worktree add .claude/worktrees/abc12345 -b worktree/item123
+# ... do all work here ...
+git checkout dev && git merge worktree/item123 --no-edit
+git worktree remove .claude/worktrees/abc12345 --force
+```
 
-Sprint items can also carry a `touches_files` field so handoffs and dashboards can warn before an agent copies work that overlaps with an active session.
+**File claims (lightweight alternative)** — for quick edits without a full worktree, call `claim_file(session_id, path)` before editing shared files. New sessions see `file_warnings` from active claims when they call `start_session`. Sprint items carry a `touches_files` field so the dashboard warns when planned work overlaps with a live session.
+
+Both modes are configurable per-project in **Settings → Parallel Safety**.
 
 ## Key Features
 
-| Feature | What it does |
-|---------|-------------|
-| `start_session` | Register this session, load full context in one call |
-| `get_goal` | Read the shared north star, sprint, and version goal |
+| Tool | What it does |
+|------|-------------|
+| `start_session` | Register this session, load full context (goal, sprint, tasks, decisions) in one call |
 | `log_task` | Log progress — all sessions see it instantly |
-| `claim_task` | Lock a task so two sessions can't double-work it |
-| `generate_handoff` | Compress full context into a resumable file |
-| `get_sprint_items` | See the sprint board — what's todo, in progress, done |
-| `set_goal` | Update the shared goal — all sessions align instantly |
-| `get_sessions` | See all active sessions and their last activity |
+| `checkpoint` | Snapshot progress + generate delta handoff + return next `/goal` string |
+| `pin_decision` | Add an architectural decision to the live shared constitution |
+| `request_hitl` | Surface a blocking question to the human queue — with auto-answer modes |
+| `claim_sprint_item` | Claim a sprint item; returns git worktree setup commands by default |
+| `get_sprint_items` | See the sprint board — pending, in-progress, done |
+| `pin_workspace_decision` | Cross-project decisions injected into every session's context |
+| `get_commits` / `list_branches` | GitHub hub: read commits, branches, PRs, issues from connected repo |
+| `generate_handoff` | Compress full context into a resumable file (also returned by `checkpoint`) |
 
 ## Architecture
 
@@ -108,20 +114,25 @@ Zero local install — sign in at [usemeridian.us](https://usemeridian.us), copy
 
 ## Dashboard
 
-### Video walkthrough
+The Meridian dashboard runs at `localhost:7878` (self-hosted) or `usemeridian.us/dashboard` (hosted). All project data, session activity, and configuration lives here.
 
-<video controls preload="metadata" width="100%" style="max-width:900px;border-radius:8px;margin:8px 0">
-  <source src="/videos/meridian-using-demo.mp4" type="video/mp4">
-  Your browser does not support embedded video. <a href="/videos/meridian-using-demo.mp4">Download the walkthrough</a>.
-</video>
+<img src="screenshots/dashboard-hero-screenshot.png" alt="Meridian dashboard" style="max-width:100%;border-radius:8px;margin:8px 0">
 
-<img src="screenshots/01_dashboard.png" alt="Meridian dashboard overview" style="max-width:100%;border-radius:8px;margin:8px 0">
-<img src="screenshots/02_live_tab.png" alt="Meridian dashboard live tab" style="max-width:100%;border-radius:8px;margin:8px 0">
-<img src="screenshots/04_queue_tab.png" alt="Meridian dashboard queue tab" style="max-width:100%;border-radius:8px;margin:8px 0">
-<img src="screenshots/06_files_tab.png" alt="Meridian dashboard files tab" style="max-width:100%;border-radius:8px;margin:8px 0">
+Key tabs:
+
+- **Live** — active sessions, real-time task feed, HITL queue
+- **Goal** — north star, sprint focus, version goal with per-field freshness indicators
+- **Sprint** — sprint board (kanban-style), add/claim/complete items from the UI
+- **Decisions** — live constitution: pinned architectural decisions shared across all sessions
+- **Queue** — full task log across all sessions with search
+- **Team** — session presence, human activity heatmap
+- **HITL** — human-in-the-loop queue: answer or dismiss blocking questions from AI sessions
+- **Rewind** — timeline of every goal change, task, and session event; charts tab with velocity data
+- **Files** — edit AGENTS.md, ROADMAP.md, DEVLOG.md in-browser; GitHub hub (commits, branches, issues) for connected repos
+- **Settings** — executor config, HITL auto-answer mode, parallel safety toggles, max decisions limit
 
 !!! info "HITL, in plain English"
-    HITL means "human in the loop." When an AI session hits a risky choice or needs approval, it can pause and put a question in Meridian's queue so a person can answer it before work continues.
+    HITL means "human in the loop." When an AI session hits a risky choice or needs approval, it can pause and put a question in Meridian's queue so a person can answer it before work continues. HITL supports auto-answer modes (Off / Safe / Aggressive) so routine executor questions don't block unattended runs.
 
 ## Quick Install
 
@@ -265,28 +276,11 @@ These MCP servers pair with Meridian to give your AI agents codebase context and
 | [Desktop Commander](https://github.com/wonderwhy-er/DesktopCommanderMCP) | Terminal, process management, file system | Already in submodule |
 
 
-## Screenshots
+## Screenshot
 
 The Meridian dashboard runs in your browser at `localhost:7878`. All data stays on your machine (or your dedicated Neon DB on the hosted tier).
 
-<div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin:16px 0">
-  <div>
-    <p><strong>Dashboard — project overview</strong></p>
-    <img src="screenshots/01_dashboard.png" alt="Meridian dashboard" style="border-radius:6px;border:1px solid #2a2d35;width:100%">
-  </div>
-  <div>
-    <p><strong>Live sessions tab</strong></p>
-    <img src="screenshots/02_live_tab.png" alt="Live sessions" style="border-radius:6px;border:1px solid #2a2d35;width:100%">
-  </div>
-  <div>
-    <p><strong>Goal + sprint board</strong></p>
-    <img src="screenshots/03_goal_tab.png" alt="Goal tab" style="border-radius:6px;border:1px solid #2a2d35;width:100%">
-  </div>
-  <div>
-    <p><strong>Queue — task log</strong></p>
-    <img src="screenshots/04_queue_tab.png" alt="Queue tab" style="border-radius:6px;border:1px solid #2a2d35;width:100%">
-  </div>
-</div>
+<img src="screenshots/dashboard-hero-screenshot.png" alt="Meridian dashboard" style="max-width:100%;border-radius:8px;border:1px solid #2a2d35;margin:12px 0">
 
 Try the live demo at [usemeridian.us/demo](https://usemeridian.us/demo) — no sign-in needed.
 

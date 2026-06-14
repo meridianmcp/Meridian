@@ -245,16 +245,37 @@ log_task(session_id="...", project_id="...",
   status="done")
 ```
 
-**When context is filling up:**
+**When context is filling up — or before ending:**
 ```
-generate_handoff(project_id="...")
+checkpoint(session_id="...", project_id="...")
 ```
-Then start a new Claude Code session and paste the handoff file.
+Returns a compact delta handoff and the next `/goal` string. Start a new session and paste it to resume instantly.
 
 **See what other sessions are doing:**
 ```
 get_tasks(project_id="...", limit=20)
 ```
+
+---
+
+## Optional: Auto-checkpoint with hooks
+
+Wire Claude Code to call `start_session` on every start and `checkpoint` on every stop automatically, with no extra prompting:
+
+=== "macOS / Linux"
+    ```bash
+    curl -fsSL https://usemeridian.us/hooks.sh | bash
+    ```
+
+=== "Windows (PowerShell)"
+    ```powershell
+    irm https://usemeridian.us/hooks.ps1 | iex
+    ```
+
+Both installers prompt for your Meridian URL and project ID, then write `SessionStart` and `Stop` hooks to `~/.claude/settings.json`. From that point on, every Claude Code session auto-injects context on start and snapshots progress on end.
+
+!!! tip
+    After installing hooks, you no longer need to manually call `start_session` at the top of each prompt.
 
 ---
 

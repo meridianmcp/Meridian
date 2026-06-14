@@ -117,22 +117,53 @@ Add to `.cursor/mcp.json`:
 
 After signing in at `https://usemeridian.us/auth/login`:
 
-### Projects tab
-- **Create projects** — one per codebase or initiative
-- **Sprint board** — see all sprint items, mark done/fail/push
-- **Goal editor** — edit the shared goal your sessions align to
-
 ### Live tab
-- **Active sessions** — all connected Claude sessions with last-seen timestamp
-- **Task queue** — real-time feed of what every session is doing
+- **Active sessions** — all connected Claude sessions with last-seen timestamp and framework badge
+- **Task feed** — real-time stream of what every session is doing
+- **HITL panel** — answer or dismiss pending human-in-the-loop requests inline
+
+### Goal tab
+- **North star** — long-lived product vision (rarely changes)
+- **Sprint** — current short-term focus
+- **Version goal** — what this version ships; per-field freshness indicators show when each was last updated
+
+### Sprint tab
+- **Sprint board** — kanban view of all sprint items (pending → in-progress → done)
+- **Add / claim / complete** items from the UI
+- **Per-item notes** — add inline context and annotations to sprint items
+
+### Decisions tab
+- **Live constitution** — all pinned architectural decisions, newest first
+- **Workspace decisions** — cross-project decisions injected into every session's context
+- **Add / supersede** decisions; AI sessions call `pin_decision` directly
+
+### Queue tab
+- **Full task log** — searchable history of every task logged across all sessions
+- **Status filter** — filter by pending, in-progress, done, failed, backlog
+
+### Team tab
+- **Session presence** — who's active, last-seen, client type
+- **Activity heatmap** — tasks per human per day
+- **Session timeline** — per-session task history
+
+### HITL tab
+- **Queue** — all HITL requests with status (pending / answered / dismissed)
+- **Auto-answer settings** — configure Off / Safe / Aggressive mode per project
 
 ### Rewind tab
 - **Goal history** — every version of the goal, newest first
-- **Activity timeline** — every task, session event, and goal change
+- **Activity timeline** — every task, session event, and goal change, with timestamps
 - **Charts** — tasks/day per team member, sprint velocity
 
 ### Files tab
-- **AGENTS.md / ROADMAP.md / DEVLOG.md** — project markdown files, editable in browser
+- **Markdown editor** — edit AGENTS.md, ROADMAP.md, DEVLOG.md in-browser
+- **GitHub hub** — view commits, branches, open issues, and workflow runs for connected repos (requires GitHub integration in Settings)
+
+### Settings tab
+- **Executor config** — repo path, test command, deploy command, branch — injected into `start_session(role='executor')`
+- **HITL auto-answer** — Off / Safe / Aggressive mode
+- **Parallel safety** — auto-worktrees on claim, require merge approval on complete
+- **Max pinned decisions** — warn when the live constitution reaches this count
 
 ---
 
