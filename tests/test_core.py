@@ -10699,3 +10699,84 @@ async def test_start_session_in_progress_reminder(db, tmp_path):
         db, p2["id"], "clean-session", str(tmp_path)
     )
     assert "in_progress_reminder" not in payload2
+
+
+# ---------------------------------------------------------------------------
+# Blog CMS (6234f9b8)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_blog_post_db_lifecycle(db):
+    p1 = await db_module.upsert_blog_post(db, title="Hello World", body_md="# Hi")
+    assert p1["status"] == "draft"
+    assert p1["slug"] == "hello-world"
+    # Update keeps the id, refreshes body.
+    p1b = await db_module.upsert_blog_post(db, post_id=p1["id"], title="Hello World", body_md="# Hi 2")
+    assert p1b["id"] == p1["id"]
+    assert "Hi 2" in p1b["body_md"]
+    # Slug collision gets a suffix.
+    p2 = await db_module.upsert_blog_post(db, title="Hello World", body_md="x")
+    assert p2["slug"] == "hello-world-2"
+    # Publish / unpublish.
+    pub = await db_module.publish_blog_post(db, p1["id"])
+    assert pub["status"] == "published" and pub["published_at"]
+    assert [x["id"] for x in await db_module.list_blog_posts(db, status="published")] == [p1["id"]]
+    unp = await db_module.unpublish_blog_post(db, p1["id"])
+    assert unp["status"] == "draft" and unp["published_at"] is None
+    # Delete.
+    assert await db_module.delete_blog_post(db, p1["id"]) is True
+    assert await db_module.get_blog_post(db, p1["id"]) is None
+
+
+def test_blog_admin_and_public_http(client):
+    # Create a draft.
+    r = client.post("/admin/blog/posts", json={"title": "Launch Day", "body_md": "# Launch\n\nWe **shipped**."})
+    assert r.status_code == 200
+    post = r.json()
+    assert post["status"] == "draft"
+    slug = post["slug"]
+
+    # Draft is not publicly visible yet.
+    assert client.get(f"/blog/{slug}").status_code == 404
+
+    # Publish, then it renders publicly with converted markdown.
+    pub = client.post(f"/admin/blog/posts/{post['id']}/publish")
+    assert pub.status_code == 200 and pub.json()["status"] == "published"
+    page = client.get(f"/blog/{slug}")
+    assert page.status_code == 200
+    assert "<h1>Launch</h1>" in page.text
+    assert "<strong>shipped</strong>" in page.text
+    # Index lists it.
+    assert "Launch Day" in client.get("/blog").text
+
+    # Unpublish hides it again.
+    client.post(f"/admin/blog/posts/{post['id']}/unpublish")
+    assert client.get(f"/blog/{slug}").status_code == 404
+
+    # generate-draft returns editor content without persisting.
+    gd = client.post("/admin/blog/generate-draft")
+    assert gd.status_code == 200
+    assert "title" in gd.json() and "body_md" in gd.json()
+
+    # Delete.
+    assert client.delete(f"/admin/blog/posts/{post['id']}").status_code == 200
+    assert client.get(f"/admin/blog/posts/{post['id']}").status_code == 404
+
+
+def test_blog_admin_requires_admin_when_hosted(monkeypatch, tmp_path):
+    """In hosted mode the blog admin endpoints reject non-admin callers."""
+    import importlib
+    from fastapi.testclient import TestClient
+    monkeypatch.setenv("MERIDIAN_HOSTED", "true")
+    monkeypatch.setenv("MERIDIAN_DB", ":memory:")
+    monkeypatch.setenv("MERIDIAN_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("MERIDIAN_DB_URL", "")
+    monkeypatch.setenv("MERIDIAN_DEMO_DB_URL", "")
+    monkeypatch.setenv("MERIDIAN_SKIP_DEMO", "1")
+    monkeypatch.setenv("MERIDIAN_GOAL_MD", str(tmp_path / "GOAL.md"))
+    import meridian.server as server_module
+    server_module = importlib.reload(server_module)
+    with TestClient(server_module.app) as c:
+        # No auth → 403 (not authenticated / admin only).
+        assert c.get("/admin/blog/posts").status_code == 403

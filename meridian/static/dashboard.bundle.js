@@ -3758,6 +3758,10 @@ project_id = "${displayPid}"`;
       }
       html += "</div></details>";
       html += "</div></details>";
+      if ((window.state.tenantPlan || "") === "admin" || !isHostedMode()) {
+        const _inp = "width:100%;background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:11px;font-family:var(--font-mono);padding:5px 8px;outline:none";
+        html += `<details id="settings-grp-blog-${projectId}" style="margin-bottom:12px;border:2px solid var(--border);border-radius:8px"><summary style="cursor:pointer;list-style:none;padding:10px 14px;display:flex;align-items:center;gap:8px;background:var(--surface-2);border-radius:8px"><span style="font-weight:700;font-size:11px;color:var(--text);letter-spacing:.04em">BLOG <span style="color:var(--muted)">(admin)</span></span></summary><div style="padding:10px"><div style="font-size:10px;color:var(--muted);margin-bottom:8px">Authoring is admin-only. Publish makes a post live at <code>/blog/&lt;slug&gt;</code> immediately.</div><input id="blog-edit-id" type="hidden"><input id="blog-title" type="text" placeholder="Post title" style="${_inp};margin-bottom:6px"><textarea id="blog-body" rows="8" placeholder="# Heading&#10;&#10;Markdown body. **bold**, \`code\`, fenced blocks." style="${_inp};resize:vertical"></textarea><div style="display:flex;gap:6px;margin-top:6px;align-items:center;flex-wrap:wrap"><button id="blog-save" class="primary" style="font-size:10px;padding:3px 10px">Save draft</button><button id="blog-gen" class="secondary" style="font-size:10px;padding:3px 10px">Generate from activity</button><button id="blog-new" class="secondary" style="font-size:10px;padding:3px 10px">New</button><span id="blog-status" style="font-size:10px;color:var(--muted)"></span></div><div id="blog-list" style="margin-top:12px;font-size:11px"><div style="color:var(--muted)">loading\u2026</div></div></div></details>`;
+      }
       try {
         body.innerHTML = html;
       } catch (renderErr) {
@@ -3766,6 +3770,120 @@ project_id = "${displayPid}"`;
         return;
       }
       if (isDemoMode()) hideDemoAdminControls();
+      setTimeout(() => {
+        const titleIn = document.getElementById("blog-title");
+        const bodyIn = document.getElementById("blog-body");
+        const idIn = document.getElementById("blog-edit-id");
+        const listEl = document.getElementById("blog-list");
+        const statusEl = document.getElementById("blog-status");
+        const saveBtn = document.getElementById("blog-save");
+        const genBtn = document.getElementById("blog-gen");
+        const newBtn = document.getElementById("blog-new");
+        if (!listEl || !saveBtn) return;
+        const setStatus = (m) => {
+          if (statusEl) {
+            statusEl.textContent = m;
+            if (m) setTimeout(() => {
+              if (statusEl.textContent === m) statusEl.textContent = "";
+            }, 2500);
+          }
+        };
+        const clearEditor = () => {
+          if (idIn) idIn.value = "";
+          if (titleIn) titleIn.value = "";
+          if (bodyIn) bodyIn.value = "";
+        };
+        async function loadList() {
+          try {
+            const posts = await api("/admin/blog/posts");
+            if (!posts.length) {
+              listEl.innerHTML = '<div style="color:var(--muted)">No posts yet.</div>';
+              return;
+            }
+            listEl.innerHTML = posts.map((p) => {
+              const pub = p.status === "published";
+              return `<div style="display:flex;align-items:center;gap:6px;padding:5px 0;border-bottom:1px solid var(--border)">
+            <span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escapeHtml(p.title)}</span>
+            <span style="font-size:9px;font-weight:600;padding:1px 6px;border-radius:3px;background:${pub ? "#22c55e22;color:#22c55e" : "var(--muted)22;color:var(--muted)"}">${pub ? "published" : "draft"}</span>
+            <button class="secondary blog-edit" data-id="${escapeHtml(p.id)}" style="font-size:9px;padding:2px 7px">Edit</button>
+            <button class="secondary blog-toggle" data-id="${escapeHtml(p.id)}" data-pub="${pub ? "1" : "0"}" style="font-size:9px;padding:2px 7px">${pub ? "Unpublish" : "Publish"}</button>
+            <button class="secondary blog-del" data-id="${escapeHtml(p.id)}" style="font-size:9px;padding:2px 7px">\u{1F5D1}</button>
+          </div>`;
+            }).join("");
+            listEl.querySelectorAll(".blog-edit").forEach((b) => b.onclick = async () => {
+              try {
+                const p = await api(`/admin/blog/posts/${b.dataset.id}`);
+                if (idIn) idIn.value = p.id;
+                if (titleIn) titleIn.value = p.title;
+                if (bodyIn) bodyIn.value = p.body_md || "";
+                setStatus("Loaded for editing.");
+              } catch (e) {
+                toast("load failed: " + e.message, true);
+              }
+            });
+            listEl.querySelectorAll(".blog-toggle").forEach((b) => b.onclick = async () => {
+              const action = b.dataset.pub === "1" ? "unpublish" : "publish";
+              try {
+                await api(`/admin/blog/posts/${b.dataset.id}/${action}`, { method: "POST" });
+                toast(action + "ed \u2713");
+                loadList();
+              } catch (e) {
+                toast("failed: " + e.message, true);
+              }
+            });
+            listEl.querySelectorAll(".blog-del").forEach((b) => b.onclick = async () => {
+              if (!confirm("Delete this post?")) return;
+              try {
+                await api(`/admin/blog/posts/${b.dataset.id}`, { method: "DELETE" });
+                toast("deleted");
+                if (idIn && idIn.value === b.dataset.id) clearEditor();
+                loadList();
+              } catch (e) {
+                toast("failed: " + e.message, true);
+              }
+            });
+          } catch (e) {
+            listEl.innerHTML = `<div style="color:var(--muted)">Could not load posts: ${escapeHtml(e.message)}</div>`;
+          }
+        }
+        saveBtn.onclick = async () => {
+          const title = (titleIn && titleIn.value || "").trim();
+          if (!title) {
+            setStatus("Title required.");
+            return;
+          }
+          saveBtn.disabled = true;
+          try {
+            const payload = { title, body_md: bodyIn && bodyIn.value || "" };
+            if (idIn && idIn.value) payload.id = idIn.value;
+            const saved = await api("/admin/blog/posts", { method: "POST", body: JSON.stringify(payload) });
+            if (idIn) idIn.value = saved.id;
+            setStatus("Saved draft.");
+            toast("saved \u2713");
+            loadList();
+          } catch (e) {
+            toast("save failed: " + e.message, true);
+          } finally {
+            saveBtn.disabled = false;
+          }
+        };
+        if (genBtn) genBtn.onclick = async () => {
+          try {
+            const d = await api("/admin/blog/generate-draft", { method: "POST" });
+            if (idIn) idIn.value = "";
+            if (titleIn) titleIn.value = d.title || "";
+            if (bodyIn) bodyIn.value = d.body_md || "";
+            setStatus("Draft generated \u2014 review and save.");
+          } catch (e) {
+            toast("failed: " + e.message, true);
+          }
+        };
+        if (newBtn) newBtn.onclick = () => {
+          clearEditor();
+          setStatus("New post.");
+        };
+        loadList();
+      }, 0);
       setTimeout(() => {
         ["connect", "executor", "config", "account"].forEach(function(k) {
           const det = document.getElementById("settings-sec-" + k + "-" + projectId);

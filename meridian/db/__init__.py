@@ -489,6 +489,20 @@ CREATE INDEX IF NOT EXISTS idx_file_symbol_claims_file
 CREATE INDEX IF NOT EXISTS idx_file_symbol_claims_session
     ON file_symbol_claims(session_id);
 
+-- Blog CMS (6234f9b8): admin-authored posts; draft until published.
+CREATE TABLE IF NOT EXISTS blog_posts (
+    id TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    slug TEXT NOT NULL UNIQUE,
+    body_md TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'draft'
+        CHECK (status IN ('draft','published')),
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    published_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_blog_posts_status ON blog_posts(status);
+
 CREATE TABLE IF NOT EXISTS active_worktrees (
     id TEXT PRIMARY KEY,
     session_id TEXT NOT NULL REFERENCES sessions(id),
@@ -668,6 +682,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_executor_runs(db)
     await _migrate_file_locks(db)
     await _migrate_file_symbol_claims(db)
+    await _migrate_blog_posts(db)
     await _migrate_milestone_type(db)
     await _migrate_ntfy_notifications(db)
     await _migrate_notify_email(db)
@@ -4841,6 +4856,135 @@ async def get_symbol_hotspots(
     async with db.execute(sql, tuple(params)) as cur:
         rows = await cur.fetchall()
     return [r for r in (_row_to_dict(row) for row in rows) if r]
+
+
+# ---------------------------------------------------------------------------
+# Blog CMS (6234f9b8) — admin-authored posts
+# ---------------------------------------------------------------------------
+
+
+def _slugify_title(title: str) -> str:
+    """Lowercase, hyphenated, alphanumeric slug from a title."""
+    import re as _re
+    slug = _re.sub(r"[^a-z0-9]+", "-", (title or "").lower()).strip("-")
+    return slug or "post"
+
+
+async def _unique_blog_slug(db: aiosqlite.Connection, base: str, exclude_id: str | None = None) -> str:
+    """Return ``base``, or base-2/base-3/... if the slug is already taken."""
+    slug = base
+    n = 1
+    while True:
+        async with db.execute(
+            "SELECT id FROM blog_posts WHERE slug = ?", (slug,)
+        ) as cur:
+            row = await cur.fetchone()
+        existing = _row_to_dict(row)
+        if existing is None or existing.get("id") == exclude_id:
+            return slug
+        n += 1
+        slug = f"{base}-{n}"
+
+
+async def upsert_blog_post(
+    db: aiosqlite.Connection,
+    *,
+    post_id: str | None = None,
+    title: str,
+    body_md: str = "",
+    slug: str | None = None,
+) -> dict[str, Any]:
+    """Create a draft, or update an existing post's title/body/slug. Status is
+    not changed here — use publish_blog_post / unpublish_blog_post for that."""
+    title = (title or "").strip() or "Untitled"
+    if post_id:
+        existing = await get_blog_post(db, post_id)
+        if existing is None:
+            raise ValueError("blog post not found")
+        new_slug = await _unique_blog_slug(
+            db, _slugify_title(slug or existing.get("slug") or title), exclude_id=post_id
+        )
+        await db.execute(
+            "UPDATE blog_posts SET title = ?, body_md = ?, slug = ?, "
+            "updated_at = datetime('now') WHERE id = ?",
+            (title, body_md or "", new_slug, post_id),
+        )
+        await db.commit()
+        return await get_blog_post(db, post_id)
+    bid = _new_id()
+    new_slug = await _unique_blog_slug(db, _slugify_title(slug or title))
+    await db.execute(
+        "INSERT INTO blog_posts (id, title, slug, body_md, status) "
+        "VALUES (?, ?, ?, ?, 'draft')",
+        (bid, title, new_slug, body_md or ""),
+    )
+    await db.commit()
+    return await get_blog_post(db, bid)
+
+
+async def get_blog_post(db: aiosqlite.Connection, post_id: str) -> dict[str, Any] | None:
+    async with db.execute("SELECT * FROM blog_posts WHERE id = ?", (post_id,)) as cur:
+        row = await cur.fetchone()
+    return _row_to_dict(row)
+
+
+async def get_blog_post_by_slug(
+    db: aiosqlite.Connection, slug: str, *, published_only: bool = True
+) -> dict[str, Any] | None:
+    sql = "SELECT * FROM blog_posts WHERE slug = ?"
+    params: list[Any] = [(slug or "").strip()]
+    if published_only:
+        sql += " AND status = 'published'"
+    async with db.execute(sql, tuple(params)) as cur:
+        row = await cur.fetchone()
+    return _row_to_dict(row)
+
+
+async def list_blog_posts(
+    db: aiosqlite.Connection, status: str | None = None
+) -> list[dict[str, Any]]:
+    """List posts newest-first. ``status`` filters to draft/published."""
+    if status in ("draft", "published"):
+        sql = ("SELECT * FROM blog_posts WHERE status = ? "
+               "ORDER BY COALESCE(published_at, updated_at) DESC")
+        params: tuple[Any, ...] = (status,)
+    else:
+        sql = "SELECT * FROM blog_posts ORDER BY updated_at DESC"
+        params = ()
+    async with db.execute(sql, params) as cur:
+        rows = await cur.fetchall()
+    return [r for r in (_row_to_dict(row) for row in rows) if r]
+
+
+async def publish_blog_post(db: aiosqlite.Connection, post_id: str) -> dict[str, Any] | None:
+    cur = await db.execute(
+        "UPDATE blog_posts SET status = 'published', "
+        "published_at = COALESCE(published_at, datetime('now')), "
+        "updated_at = datetime('now') WHERE id = ?",
+        (post_id,),
+    )
+    await db.commit()
+    if cur.rowcount == 0:
+        return None
+    return await get_blog_post(db, post_id)
+
+
+async def unpublish_blog_post(db: aiosqlite.Connection, post_id: str) -> dict[str, Any] | None:
+    cur = await db.execute(
+        "UPDATE blog_posts SET status = 'draft', published_at = NULL, "
+        "updated_at = datetime('now') WHERE id = ?",
+        (post_id,),
+    )
+    await db.commit()
+    if cur.rowcount == 0:
+        return None
+    return await get_blog_post(db, post_id)
+
+
+async def delete_blog_post(db: aiosqlite.Connection, post_id: str) -> bool:
+    cur = await db.execute("DELETE FROM blog_posts WHERE id = ?", (post_id,))
+    await db.commit()
+    return cur.rowcount > 0
 
 
 # ---------------------------------------------------------------------------
