@@ -21,7 +21,7 @@ import meridian.server as _server
 from .. import db as db_module
 from .. import goal_md as goal_md_module
 from .. import md_anchors as md_anchors_module
-from .._deps import _hosted_mode, validate_input_size
+from .._deps import _hosted_mode, validate_input_size, _MANUAL_NOTE_LINT
 
 async def _dispatch_github_tool(name: str, args: dict[str, Any], tenant: dict, db: Any) -> Any:
     # Guard: check if project has a GitHub repo connected
@@ -923,6 +923,9 @@ async def _dispatch_mcp_tool(
         await _server._append_note_to_roadmap(
             args["title"], args["body"], args.get("tags"), args.get("category"),
         )
+        # e5592013 — lint: "MANUAL" notes are usually human tasks, not wiki.
+        if isinstance(result, dict) and "MANUAL" in (args.get("title") or ""):
+            result = {**result, "lint": _MANUAL_NOTE_LINT}
         return result
     if name == "get_notes":
         return await db_module.get_project_notes(

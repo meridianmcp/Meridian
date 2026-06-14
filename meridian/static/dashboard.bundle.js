@@ -4280,85 +4280,112 @@ project_id = "${displayPid}"`;
   // meridian/static/dashboard-notes.js
   async function loadNotesTab2(projectId) {
     const body = document.getElementById(`notes-body-${projectId}`);
-    const tagFilter = document.getElementById(`notes-tag-${projectId}`);
+    const searchInput = document.getElementById(`notes-search-${projectId}`);
+    const tagSelect = document.getElementById(`notes-tagsel-${projectId}`);
+    const showAuto = document.getElementById(`notes-show-auto-${projectId}`);
     const addTitle = document.getElementById(`notes-add-title-${projectId}`);
     const addBody = document.getElementById(`notes-add-body-${projectId}`);
     const addTags = document.getElementById(`notes-add-tags-${projectId}`);
     const addBtn = document.getElementById(`notes-add-btn-${projectId}`);
     if (!body) return;
-    const render = async () => {
-      body.innerHTML = `<div class="empty" style="color:var(--muted)">loading notes\u2026</div>`;
-      const tag = (tagFilter && tagFilter.value || "").trim();
-      const qs = tag ? `?tag=${encodeURIComponent(tag)}` : "";
-      try {
-        const notes = await projectApi(projectId, `/projects/${projectId}/notes${qs}`);
-        const visibleNotes = (notes || []).filter((n) => {
-          const title = String(n.title || "").trim().toLowerCase();
-          const tags = String(n.tags || "").split(",").map((t) => t.trim().toLowerCase()).filter(Boolean);
-          return !title.startsWith("checkpoint:") && !tags.includes("checkpoint");
-        });
-        setVtabCountBadge(`.notes-vtab-badge[data-pid="${projectId}"]`, visibleNotes.length);
-        if (!visibleNotes.length) {
-          body.innerHTML = `<div style="color:var(--muted);padding:10px;text-align:center;border:1px dashed var(--border);border-radius:4px">
-
-          (no notes yet \u2014 use the form below or <code>add_note</code> MCP tool)
-
-        </div>`;
-          return;
+    const isAutoCapture = (n) => {
+      const title = String(n.title || "").trim().toLowerCase();
+      const tags = String(n.tags || "").split(",").map((t) => t.trim().toLowerCase());
+      return title.startsWith("checkpoint:") || title.startsWith("session summary") || tags.includes("checkpoint") || tags.includes("auto-capture");
+    };
+    const noteTags = (n) => String(n.tags || "").split(",").map((t) => t.trim()).filter(Boolean);
+    let allNotes = [];
+    const refreshTagOptions = () => {
+      if (!tagSelect) return;
+      const prev = tagSelect.value;
+      const seen = /* @__PURE__ */ new Set();
+      for (const n of allNotes) {
+        if (!showAuto?.checked && isAutoCapture(n)) continue;
+        for (const t of noteTags(n)) seen.add(t);
+      }
+      const tags = [...seen].sort((a, b) => a.localeCompare(b));
+      tagSelect.innerHTML = `<option value="">all tags</option>` + tags.map((t) => `<option value="${escapeHtml(t)}">${escapeHtml(t)}</option>`).join("");
+      if (tags.includes(prev)) tagSelect.value = prev;
+    };
+    const applyFilters = () => {
+      const q = (searchInput?.value || "").trim().toLowerCase();
+      const selectedTag = (tagSelect?.value || "").trim().toLowerCase();
+      const includeAuto = !!showAuto?.checked;
+      const visible = allNotes.filter((n) => {
+        if (!includeAuto && isAutoCapture(n)) return false;
+        if (selectedTag && !noteTags(n).map((t) => t.toLowerCase()).includes(selectedTag)) return false;
+        if (q) {
+          const hay = `${n.title || ""}
+${n.body || ""}
+${n.tags || ""}`.toLowerCase();
+          if (!hay.includes(q)) return false;
         }
-        body.innerHTML = visibleNotes.map((n) => {
-          const tags = (n.tags || "").split(",").map((t) => t.trim()).filter(Boolean);
-          const pills = tags.map(
-            (t) => `<span style="display:inline-block;background:var(--accent)22;color:var(--accent);font-size:9px;font-weight:600;padding:1px 6px;border-radius:3px;margin-right:4px">${escapeHtml(t)}</span>`
-          ).join("");
-          const dt = (n.created_at || "").slice(0, 10);
-          return `<div style="background:var(--surface-2);border:1px solid var(--border);border-left:3px solid var(--accent);border-radius:0 4px 4px 0;padding:10px 12px;margin-bottom:8px">
-
+        return true;
+      });
+      setVtabCountBadge(
+        `.notes-vtab-badge[data-pid="${projectId}"]`,
+        allNotes.filter((n) => !isAutoCapture(n)).length
+      );
+      if (!visible.length) {
+        const reason = allNotes.length ? `(no notes match \u2014 clear the search/tag filter${!includeAuto ? " or tick \u201Csummaries\u201D" : ""})` : `(no notes yet \u2014 use the form below or <code>add_note</code> MCP tool)`;
+        body.innerHTML = `<div style="color:var(--muted);padding:10px;text-align:center;border:1px dashed var(--border);border-radius:4px">${reason}</div>`;
+        return;
+      }
+      body.innerHTML = visible.map((n) => {
+        const pills = noteTags(n).map(
+          (t) => `<span style="display:inline-block;background:var(--accent)22;color:var(--accent);font-size:9px;font-weight:600;padding:1px 6px;border-radius:3px;margin-right:4px">${escapeHtml(t)}</span>`
+        ).join("");
+        const dt = (n.created_at || "").slice(0, 10);
+        const autoPill = isAutoCapture(n) ? `<span title="Auto-captured session summary" style="display:inline-block;background:var(--surface-3,#2a2f3a);color:var(--muted);font-size:9px;font-weight:600;padding:1px 6px;border-radius:3px;margin-right:4px">session</span>` : "";
+        return `<div style="background:var(--surface-2);border:1px solid var(--border);border-left:3px solid var(--accent);border-radius:0 4px 4px 0;padding:10px 12px;margin-bottom:8px">
           <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:6px">
-
             <div style="display:flex;align-items:center;gap:8px;min-width:0;flex:1">
-
               <span style="color:var(--accent);font-weight:600;font-size:12px">${escapeHtml(n.title || "")}</span>
-
               <span style="color:var(--muted);font-size:10px">${escapeHtml(dt)}</span>
-
             </div>
-
             <button class="secondary notes-del-btn" data-note-id="${escapeHtml(n.id)}" style="padding:1px 8px;font-size:10px">Delete</button>
-
           </div>
-
-          <div style="margin-bottom:6px">${pills}</div>
-
+          <div style="margin-bottom:6px">${autoPill}${pills}</div>
           <div class="note-body-md" style="color:var(--text);line-height:1.5;font-size:12px">${typeof marked !== "undefined" ? marked.parse(n.body || "") : escapeHtml(n.body || "")}</div>
-
         </div>`;
-        }).join("");
-        body.querySelectorAll(".notes-del-btn").forEach((btn) => {
-          btn.onclick = async () => {
-            if (!confirm("Delete this note?")) return;
-            try {
-              const r = await fetch(`/projects/${projectId}/notes/${btn.dataset.noteId}`, { method: "DELETE" });
-              if (!r.ok) throw new Error(`${r.status}`);
-              toast("note deleted");
-              render();
-            } catch (e) {
-              toast("delete failed: " + e.message, true);
-            }
-          };
-        });
+      }).join("");
+      body.querySelectorAll(".notes-del-btn").forEach((btn) => {
+        btn.onclick = async () => {
+          if (!confirm("Delete this note?")) return;
+          try {
+            const r = await fetch(`/projects/${projectId}/notes/${btn.dataset.noteId}`, { method: "DELETE" });
+            if (!r.ok) throw new Error(`${r.status}`);
+            toast("note deleted");
+            await load();
+          } catch (e) {
+            toast("delete failed: " + e.message, true);
+          }
+        };
+      });
+    };
+    const load = async () => {
+      body.innerHTML = `<div class="empty" style="color:var(--muted)">loading notes\u2026</div>`;
+      try {
+        allNotes = await projectApi(projectId, `/projects/${projectId}/notes`) || [];
+        refreshTagOptions();
+        applyFilters();
       } catch (e) {
-        body.innerHTML = renderProjectLoadError(projectId, "Notes unavailable", `/projects/${projectId}/notes${qs}`, e);
+        body.innerHTML = renderProjectLoadError(projectId, "Notes unavailable", `/projects/${projectId}/notes`, e);
         wireProjectLoadRetry(body, projectId);
       }
     };
-    if (tagFilter) {
+    if (searchInput) {
       let t = null;
-      tagFilter.oninput = () => {
+      searchInput.oninput = () => {
         clearTimeout(t);
-        t = setTimeout(render, 250);
+        t = setTimeout(applyFilters, 150);
       };
     }
+    if (tagSelect) tagSelect.onchange = applyFilters;
+    if (showAuto) showAuto.onchange = () => {
+      refreshTagOptions();
+      applyFilters();
+    };
     if (addBtn) addBtn.onclick = async () => {
       const title = (addTitle && addTitle.value || "").trim();
       const text = (addBody && addBody.value || "").trim();
@@ -4374,20 +4401,21 @@ project_id = "${displayPid}"`;
       }
       if (addTitle) addTitle.style.borderColor = "";
       try {
-        await api(`/projects/${projectId}/notes`, {
+        const res = await api(`/projects/${projectId}/notes`, {
           method: "POST",
           body: JSON.stringify({ title, body: text, tags: tags || void 0 })
         });
         if (addTitle) addTitle.value = "";
         if (addBody) addBody.value = "";
         if (addTags) addTags.value = "";
-        toast("note added");
-        render();
+        if (res && res.lint) toast(res.lint, false);
+        else toast("note added");
+        await load();
       } catch (e) {
         toast("add failed: " + e.message, true);
       }
     };
-    render();
+    await load();
   }
   try {
     Object.assign(window, { loadNotesTab: loadNotesTab2 });
@@ -6888,7 +6916,15 @@ Current: ${current || "(none)"}`,
 
           </span>
 
-          <input type="text" id="notes-tag-${project.id}" placeholder="filter by tag\u2026" style="background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:2px 6px;width:120px">
+          <span style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;justify-content:flex-end">
+
+            <input type="text" id="notes-search-${project.id}" placeholder="search notes\u2026" style="background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:2px 6px;width:120px">
+
+            <select id="notes-tagsel-${project.id}" title="Filter by tag" style="background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:2px 6px;max-width:130px"><option value="">all tags</option></select>
+
+            <label title="Show auto-captured session summaries (checkpoint notes)" style="display:flex;align-items:center;gap:3px;font-size:9px;color:var(--muted);cursor:pointer;user-select:none"><input type="checkbox" id="notes-show-auto-${project.id}" style="margin:0;cursor:pointer">summaries</label>
+
+          </span>
 
         </div>
 

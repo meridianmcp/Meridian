@@ -3443,7 +3443,15 @@ function buildTabBody(project) {
 
           </span>
 
-          <input type="text" id="notes-tag-${project.id}" placeholder="filter by tag…" style="background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:2px 6px;width:120px">
+          <span style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;justify-content:flex-end">
+
+            <input type="text" id="notes-search-${project.id}" placeholder="search notes…" style="background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:2px 6px;width:120px">
+
+            <select id="notes-tagsel-${project.id}" title="Filter by tag" style="background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:2px 6px;max-width:130px"><option value="">all tags</option></select>
+
+            <label title="Show auto-captured session summaries (checkpoint notes)" style="display:flex;align-items:center;gap:3px;font-size:9px;color:var(--muted);cursor:pointer;user-select:none"><input type="checkbox" id="notes-show-auto-${project.id}" style="margin:0;cursor:pointer">summaries</label>
+
+          </span>
 
         </div>
 

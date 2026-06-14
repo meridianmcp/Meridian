@@ -6,7 +6,7 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import Response
 
-from .._deps import _db, validate_input_size
+from .._deps import _db, validate_input_size, _MANUAL_NOTE_LINT
 from .. import db as db_module
 
 router = APIRouter()
@@ -41,9 +41,13 @@ async def create_project_note_endpoint(
     from .. import limits as _limits  # noqa: PLC0415
     existing = await db_module.get_project_notes(await _db(request), project_id)
     _limits.check_notes_per_project(len(existing))
-    return await db_module.add_project_note(
+    note = await db_module.add_project_note(
         await _db(request), project_id, title, text, body.get("tags"),
     )
+    # e5592013 — non-blocking lint: "MANUAL" notes are usually human tasks.
+    if isinstance(note, dict) and "MANUAL" in title:
+        note = {**note, "lint": _MANUAL_NOTE_LINT}
+    return note
 
 
 @router.patch("/projects/{project_id}/notes/{note_id}")

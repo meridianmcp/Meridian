@@ -8163,6 +8163,28 @@ def test_project_notes_http_crud(client):
     assert r.status_code == 404
 
 
+def test_project_note_manual_title_returns_lint_hint(client):
+    """e5592013 — POST /notes with 'MANUAL' in the title returns a non-blocking
+    `lint` hint suggesting add_sprint_item; ordinary notes do not."""
+    project = client.post("/projects", json={"name": "e5592013-manual-lint"}).json()
+    # "MANUAL" in title → lint hint present, note still created (201).
+    r = client.post(
+        f"/projects/{project['id']}/notes",
+        json={"title": "MANUAL: rotate prod token", "body": "Adam to do this"},
+    )
+    assert r.status_code == 201
+    payload = r.json()
+    assert "lint" in payload
+    assert "add_sprint_item" in payload["lint"]
+    # Ordinary note → no lint field.
+    r2 = client.post(
+        f"/projects/{project['id']}/notes",
+        json={"title": "Gotcha: psycopg3", "body": "use %%"},
+    )
+    assert r2.status_code == 201
+    assert "lint" not in r2.json()
+
+
 # ---------------------------------------------------------------------------
 # v0.9 — Magic link tokens
 # ---------------------------------------------------------------------------

@@ -309,6 +309,15 @@ def _is_demo_request(request: Request) -> bool:
 # Input size validation
 # ---------------------------------------------------------------------------
 
+# e5592013 — non-blocking lint hint surfaced when a note titled "MANUAL …" is
+# created: those are almost always human tasks that belong on the sprint board.
+_MANUAL_NOTE_LINT = (
+    "Heads-up: notes with 'MANUAL' in the title are usually human tasks — "
+    "consider add_sprint_item(human_id='adam', milestone_type='human') so it "
+    "lands on the sprint board instead of the notes wiki."
+)
+
+
 def validate_input_size(value: str | None, field_name: str, max_chars: int) -> None:
     """Raise HTTPException(400) if value exceeds max_chars. Never truncates silently."""
     if len(value or "") > max_chars:
