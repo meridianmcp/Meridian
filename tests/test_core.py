@@ -5784,6 +5784,24 @@ def test_sessions_endpoint_returns_session_summary_field(client):
     assert "session_summary" in rows[0]
 
 
+def test_session_notes_rest_endpoint(client):
+    """GET /sessions/{id}/notes returns sprint scratch-pad notes for a session."""
+    project = client.post("/projects", json={"name": "sn-test"}).json()
+    sess = client.post("/sessions/register", json={"project_id": project["id"], "name": "s"}).json()
+    sid = sess["id"]
+    # No notes yet → empty list
+    r = client.get(f"/sessions/{sid}/notes")
+    assert r.status_code == 200
+    assert r.json() == []
+    # Add a note via MCP and check it appears
+    _mcp_call(client, "add_sprint_note", {"session_id": sid, "title": "test note", "body": "hello"})
+    r2 = client.get(f"/sessions/{sid}/notes")
+    assert r2.status_code == 200
+    notes = r2.json()
+    assert len(notes) == 1
+    assert notes[0]["title"] == "test note"
+
+
 # ---------------------------------------------------------------------------
 # v1.9.x — backlog/future statuses in queue UI
 # ---------------------------------------------------------------------------

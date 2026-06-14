@@ -2961,6 +2961,16 @@ function buildTabBody(project) {
 
           <hr class="live-divider">
 
+          <div class="live-section" id="sprint-notes-section-${project.id}" style="display:none">
+
+            <div class="live-section-label">Sprint notes (session scratch pad)</div>
+
+            <div id="sprint-notes-${project.id}" style="font-size:11px"></div>
+
+          </div>
+
+          <hr class="live-divider" id="sprint-notes-divider-${project.id}" style="display:none">
+
           <div class="live-section">
 
             <div class="live-section-label" style="display:flex;justify-content:space-between;align-items:center">
@@ -4603,9 +4613,21 @@ async function refreshLiveTab(projectId) {
 
       const worktrees = worktreesResult.status === 'fulfilled' ? (worktreesResult.value || []) : [];
 
-      renderLiveSessions(projectId, sessionsResult.value || [], tasksResult.value || [], worktrees);
+      const sessions = sessionsResult.value || [];
 
-      cacheMostRecentSession(projectId, sessionsResult.value || []);
+      renderLiveSessions(projectId, sessions, tasksResult.value || [], worktrees);
+
+      cacheMostRecentSession(projectId, sessions);
+
+      // Sprint notes: load for the most recently active session.
+
+      const activeSession = sessions.find(s => s.status === 'active') || sessions[0];
+
+      if (activeSession && activeSession.id) {
+
+        loadSprintNotesPanel(projectId, activeSession.id).catch(() => {});
+
+      }
 
     } else {
 
@@ -4854,6 +4876,156 @@ async function sprintItemEdit(projectId, itemId) {
     }, 150);
 
   };
+
+}
+
+
+
+async function sprintItemNotesEdit(projectId, itemId) {
+
+  /** Inline-edit the notes field of a sprint item. */
+
+  const row = document.querySelector(`.sprint-item-row[data-item="${CSS.escape(itemId)}"]`);
+
+  if (!row) return;
+
+  const curNotes = row.dataset.notes || '';
+
+  // Already editing?
+
+  if (row.querySelector('.sprint-notes-textarea')) return;
+
+  const existingNotesEl = row.querySelector('.sprint-item-notes');
+
+  const textarea = document.createElement('textarea');
+
+  textarea.className = 'sprint-notes-textarea';
+
+  textarea.value = curNotes;
+
+  textarea.placeholder = 'Add context, links, or notes…';
+
+  textarea.style.cssText = 'width:100%;min-height:56px;background:var(--surface-1);border:1px solid var(--accent);border-radius:3px;padding:3px 5px;color:var(--text);font-size:10px;font-family:var(--font-mono);line-height:1.4;resize:vertical;box-sizing:border-box;margin-top:3px';
+
+  if (existingNotesEl) {
+
+    existingNotesEl.replaceWith(textarea);
+
+  } else {
+
+    const titleSpan = row.querySelector('.sprint-item-title');
+
+    if (titleSpan) titleSpan.parentNode.insertBefore(textarea, titleSpan.nextSibling);
+
+    else row.appendChild(textarea);
+
+  }
+
+  textarea.focus();
+
+  const save = async () => {
+
+    const newNotes = textarea.value.trim() || null;
+
+    try {
+
+      await api(`/projects/${projectId}/sprint-items/${itemId}`, {
+
+        method: 'PATCH',
+
+        body: JSON.stringify({ notes: newNotes }),
+
+      });
+
+      row.dataset.notes = newNotes || '';
+
+      await refreshLiveTab(projectId);
+
+    } catch(e) { toast(`Save failed: ${e.message}`, true); cancel(); }
+
+  };
+
+  const cancel = () => {
+
+    if (existingNotesEl) textarea.replaceWith(existingNotesEl);
+
+    else textarea.remove();
+
+  };
+
+  textarea.onkeydown = e => {
+
+    if (e.key === 'Escape') { e.preventDefault(); cancel(); }
+
+    if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); save(); }
+
+  };
+
+  textarea.onblur = () => setTimeout(() => {
+
+    if (!row.contains(document.activeElement)) save();
+
+  }, 150);
+
+}
+
+
+
+async function loadSprintNotesPanel(projectId, sessionId) {
+
+  /** Load and render ephemeral session scratch-pad notes in the sprint panel. */
+
+  const section = document.getElementById(`sprint-notes-section-${projectId}`);
+
+  const divider = document.getElementById(`sprint-notes-divider-${projectId}`);
+
+  const container = document.getElementById(`sprint-notes-${projectId}`);
+
+  if (!section || !container) return;
+
+  try {
+
+    const notes = await projectApi(projectId, `/sessions/${sessionId}/notes`);
+
+    if (!notes || !notes.length) {
+
+      section.style.display = 'none';
+
+      if (divider) divider.style.display = 'none';
+
+      return;
+
+    }
+
+    section.style.display = '';
+
+    if (divider) divider.style.display = '';
+
+    container.innerHTML = notes.map(n => `
+
+      <div style="background:var(--surface-2);border:1px solid var(--border);border-left:3px solid var(--accent-green,#22c55e);border-radius:0 4px 4px 0;padding:6px 8px;margin-bottom:6px">
+
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:3px">
+
+          <span style="color:var(--accent-green,#22c55e);font-weight:600;font-size:11px">${escapeHtml(n.title || '')}</span>
+
+          <span style="color:var(--muted);font-size:9px">${escapeHtml((n.created_at || '').slice(0, 16).replace('T', ' '))}</span>
+
+        </div>
+
+        <div style="color:var(--text);font-size:10px;line-height:1.5;white-space:pre-wrap;word-break:break-word">${typeof marked !== 'undefined' ? marked.parse(n.body || '') : escapeHtml(n.body || '')}</div>
+
+      </div>
+
+    `).join('');
+
+  } catch (_) {
+
+    section.style.display = 'none';
+
+    if (divider) divider.style.display = 'none';
+
+  }
 
 }
 

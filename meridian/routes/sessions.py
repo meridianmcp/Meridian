@@ -105,3 +105,11 @@ async def heartbeat_session(
     if not ok:
         raise HTTPException(status_code=404, detail="session not found")
     return {"status": "ok", "session_id": session_id}
+
+
+@router.get("/sessions/{session_id}/notes")
+async def get_session_notes(
+    session_id: str, request: Request
+) -> list[dict[str, Any]]:
+    """Return sprint scratch-pad notes for a session (newest first)."""
+    return await db_module.get_session_notes(await _db(request), session_id)

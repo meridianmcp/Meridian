@@ -442,11 +442,19 @@ export function renderSprintProgress(projectId, items) {
 
       ? `<span class="sprint-item-meta">→ ${escapeHtml(it.pushed_to)}</span>`
 
-      : (it.notes ? `<span class="sprint-item-meta">${escapeHtml(it.notes.slice(0,60))}</span>` : '');
+      : '';
+
+    const notesHtml = it.notes && !it.pushed_to
+      ? `<div class="sprint-item-notes" style="font-size:10px;color:var(--muted);margin-top:2px;line-height:1.4;white-space:pre-wrap;word-break:break-word">${escapeHtml(it.notes.length > 180 ? it.notes.slice(0, 180) + '…' : it.notes)}</div>`
+      : '';
 
     const editBtn = `<button class="sprint-btn" title="Edit title/version"
 
              onclick="sprintItemEdit('${escapeHtml(projectId)}','${escapeHtml(it.id)}')">✏</button>`;
+
+    const notesBtn = `<button class="sprint-btn" title="Add/edit notes"
+
+             onclick="sprintItemNotesEdit('${escapeHtml(projectId)}','${escapeHtml(it.id)}')">📝</button>`;
 
     const feedbackHtml = '';
 
@@ -473,6 +481,8 @@ export function renderSprintProgress(projectId, items) {
              onclick="sprintPushPrompt('${escapeHtml(projectId)}','${escapeHtml(it.id)}')">→</button>
 
            ${canEdit ? editBtn : ''}
+
+           ${notesBtn}
 
          </span>`
 
@@ -506,11 +516,19 @@ export function renderSprintProgress(projectId, items) {
 
       data-title="${escapeHtml(it.title)}" data-version="${escapeHtml(it.version || '')}"
 
+      data-notes="${escapeHtml(it.notes || '')}"
+
       style="${indentStyle}">
 
       <span class="sprint-item-icon" style="color:${color}">${icon}</span>
 
-      <span class="sprint-item-title">${escapeHtml(it.title)}${indBadge}${childBadge}</span>
+      <div style="flex:1;min-width:0">
+
+        <span class="sprint-item-title">${escapeHtml(it.title)}${indBadge}${childBadge}</span>
+
+        ${notesHtml}
+
+      </div>
 
       <span class="sprint-item-ver">${escapeHtml(it.version || '')}</span>
 
