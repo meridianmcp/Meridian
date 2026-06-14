@@ -5343,10 +5343,11 @@ def test_pg_migration_registry_matches_historical_order():
         "_migrate_pg_oauth_codes",
         "_migrate_pg_github_to_projects",
         "_migrate_pg_queued_session",
+        "_migrate_pg_parallel_safety",
     ]
     # No duplicates across the three groups.
     allnames = core + hosted + late
-    assert len(allnames) == len(set(allnames)) == 37
+    assert len(allnames) == len(set(allnames)) == 38
 
 
 def test_cached_plan_error_is_retryable():
@@ -8889,6 +8890,7 @@ async def test_claim_sprint_item_rejects_active_file_lock_conflict(db):
     import meridian.server as srv
 
     p = await db_module.create_project(db, "sprint-file-conflict-test")
+    await db_module.update_project_settings(db, p["id"], auto_worktrees=0)
     item = await db_module.add_sprint_item(db, p["id"], "v1", "Edit dashboard")
     await db.execute(
         "UPDATE sprint_items SET touches_files = ? WHERE id = ?",

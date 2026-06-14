@@ -1608,6 +1608,8 @@ async def patch_project_settings(
         max_pinned_decisions=body.max_pinned_decisions,
         executor_config=executor_config_dict,
         hitl_auto_answer=body.hitl_auto_answer,
+        auto_worktrees=body.auto_worktrees,
+        require_merge_approval=body.require_merge_approval,
     )
     if settings is None:
         raise HTTPException(status_code=404, detail="project not found")
@@ -7931,20 +7933,23 @@ async def _dispatch_mcp_tool(
                         "protected_files": _hits,
                     }
 
-        # Check if worktree isolation is configured for this project.
-        # When isolation="worktree", bypass file-lock conflict check — the worktree
-        # solves the conflict by giving the session its own working copy.
+        # 0716c9e0 — parallel safety: load project settings once for both
+        # auto_worktrees (suggest worktree by default) and isolation=worktree.
         _suggest_worktree = False
         _exec_cfg: dict[str, Any] = {}
+        _proj_settings_claim: dict[str, Any] = {}
         try:
-            _proj_settings = await db_module.get_project_settings(db, args["project_id"])
-            _raw_cfg = (_proj_settings or {}).get("executor_config") if _proj_settings else None
+            _ps = await db_module.get_project_settings(db, args["project_id"])
+            _proj_settings_claim = _ps or {}
+            _raw_cfg = _proj_settings_claim.get("executor_config")
             if _raw_cfg:
                 _exec_cfg = json.loads(_raw_cfg) if isinstance(_raw_cfg, str) else (_raw_cfg or {})
         except Exception:  # noqa: BLE001
             pass
         _isolation = (_exec_cfg or {}).get("isolation", "")
-        if _isolation == "worktree":
+        _aw_raw = _proj_settings_claim.get("auto_worktrees")
+        _auto_worktrees = bool(int(_aw_raw) if _aw_raw is not None else 1)
+        if _isolation == "worktree" or _auto_worktrees:
             _suggest_worktree = True
         else:
             conflicts = await _sprint_item_file_claim_conflicts(
@@ -7966,16 +7971,23 @@ async def _dispatch_mcp_tool(
 
         if _suggest_worktree:
             item_id_short = item["id"][:8]
-            repo_path = ""
-            _repo_paths = _exec_cfg.get("repo_paths")
-            if _repo_paths and isinstance(_repo_paths, list) and _repo_paths:
-                _first = _repo_paths[0]
-                repo_path = (_first.get("cwd") or "") if isinstance(_first, dict) else str(_first)
-            if not repo_path:
-                repo_path = _exec_cfg.get("repo_path") or ""
-            repo_name = os.path.basename(repo_path.rstrip("/\\")) if repo_path else "repo"
-            wt_branch = f"worktree/{item_id_short}"
-            wt_path = f"../{repo_name}-worktree-{item_id_short}"
+            _session_id_claim = args.get("session_id") or ""
+            if _auto_worktrees and _isolation != "worktree" and _session_id_claim:
+                # Default path: .claude/worktrees/{session_id_short} (gitignored)
+                wt_branch = f"worktree/{item_id_short}"
+                wt_path = f".claude/worktrees/{_session_id_claim[:8]}"
+            else:
+                # Legacy isolation=worktree path: repo-relative sibling dir
+                repo_path = ""
+                _repo_paths = _exec_cfg.get("repo_paths")
+                if _repo_paths and isinstance(_repo_paths, list) and _repo_paths:
+                    _first = _repo_paths[0]
+                    repo_path = (_first.get("cwd") or "") if isinstance(_first, dict) else str(_first)
+                if not repo_path:
+                    repo_path = _exec_cfg.get("repo_path") or ""
+                repo_name = os.path.basename(repo_path.rstrip("/\\")) if repo_path else "repo"
+                wt_branch = f"worktree/{item_id_short}"
+                wt_path = f"../{repo_name}-worktree-{item_id_short}"
             item = dict(item)
             item.update({
                 "worktree_suggested": True,
@@ -8003,12 +8015,42 @@ async def _dispatch_mcp_tool(
             db, args["project_id"], args["item_ids"], args["new_title"]
         )
     if name == "complete_sprint_item":
+        # 0716c9e0 — check active worktree before marking done.
+        _complete_session_id = args.get("session_id") or ""
+        _merge_warning: dict[str, Any] | None = None
+        if _complete_session_id:
+            try:
+                _ps_complete = await db_module.get_project_settings(db, args["project_id"])
+                _req_merge = bool(int((_ps_complete or {}).get("require_merge_approval") or 1))
+                if _req_merge:
+                    _wt = await db_module.get_active_worktree_for_session(db, _complete_session_id)
+                    if _wt:
+                        _hitl = await db_module.request_hitl(
+                            db, args["project_id"],
+                            f"Session has active worktree on branch '{_wt['branch']}' "
+                            f"at '{_wt['path']}'. Merge to main before closing. "
+                            f"Run: git checkout dev && git merge {_wt['branch']} --no-edit",
+                            session_id=_complete_session_id,
+                            urgency="normal", kind="correction",
+                        )
+                        _merge_warning = {
+                            "worktree_branch": _wt["branch"],
+                            "worktree_path": _wt["path"],
+                            "hitl_id": (_hitl or {}).get("id"),
+                            "message": "Merge reminder filed — see HITL queue.",
+                        }
+            except Exception:  # noqa: BLE001
+                pass
+
         item = await db_module.complete_sprint_item(
             db, args["project_id"], args["item_id"],
             task_id=args.get("task_id"),
         )
         if item is None:
             raise ValueError("sprint item not found")
+        if _merge_warning:
+            item = dict(item)
+            item["merge_warning"] = _merge_warning
         # Notify only when the sprint is fully complete.
         active_statuses = {"pending", "todo", "in_progress"}
         remaining_items = await db_module.get_sprint_items(db, args["project_id"])

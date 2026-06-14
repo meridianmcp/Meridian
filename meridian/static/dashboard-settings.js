@@ -1628,6 +1628,60 @@ export async function loadSettingsTab(projectId) {
 
 
 
+  // 0716c9e0 — Parallel Safety section
+
+  const autoWorktrees = parseInt((projectSettings && projectSettings.auto_worktrees) != null ? projectSettings.auto_worktrees : 1, 10);
+  const requireMergeApproval = parseInt((projectSettings && projectSettings.require_merge_approval) != null ? projectSettings.require_merge_approval : 1, 10);
+
+  html += `<div style="margin-bottom:16px">
+
+    <div style="color:var(--accent);font-size:10px;letter-spacing:.06em;text-transform:uppercase;margin-bottom:10px;padding-bottom:4px;border-bottom:1px solid var(--border)">Parallel Safety</div>
+
+    <div style="font-size:10px;color:var(--muted);margin-bottom:10px">Controls how executors coordinate when multiple sessions work in parallel.</div>
+
+    <label style="display:block;font-size:11px;color:var(--text);margin-bottom:4px">Suggest git worktree on claim</label>
+    <div style="font-size:10px;color:var(--muted);margin-bottom:6px">When ON, <code>claim_sprint_item</code> returns worktree setup commands so each session works in isolation.</div>
+    <select id="auto-worktrees-${projectId}" style="width:100%;padding:6px 8px;font-size:11px;background:var(--surface-1);color:var(--text);border:1px solid var(--border);border-radius:5px;cursor:pointer;margin-bottom:12px">
+      <option value="1" ${autoWorktrees === 1 ? 'selected' : ''}>On (recommended)</option>
+      <option value="0" ${autoWorktrees === 0 ? 'selected' : ''}>Off</option>
+    </select>
+
+    <label style="display:block;font-size:11px;color:var(--text);margin-bottom:4px">Require merge approval</label>
+    <div style="font-size:10px;color:var(--muted);margin-bottom:6px">When ON, completing a sprint item with an active worktree files a HITL correction reminding the executor to merge before removing the worktree.</div>
+    <select id="require-merge-${projectId}" style="width:100%;padding:6px 8px;font-size:11px;background:var(--surface-1);color:var(--text);border:1px solid var(--border);border-radius:5px;cursor:pointer">
+      <option value="1" ${requireMergeApproval === 1 ? 'selected' : ''}>On (recommended)</option>
+      <option value="0" ${requireMergeApproval === 0 ? 'selected' : ''}>Off</option>
+    </select>
+    <div id="parallel-safety-status-${projectId}" style="font-size:10px;color:var(--muted);margin-top:6px;min-height:13px"></div>
+
+  </div>`;
+
+
+
+  setTimeout(() => {
+
+    const awSel = document.getElementById(`auto-worktrees-${projectId}`);
+    const rmSel = document.getElementById(`require-merge-${projectId}`);
+    const psStatus = document.getElementById(`parallel-safety-status-${projectId}`);
+
+    const saveSetting = async (patch) => {
+      if (psStatus) psStatus.textContent = 'Saving…';
+      try {
+        await saveProjectSettings(projectId, patch);
+        if (psStatus) psStatus.textContent = 'Saved.';
+        setTimeout(() => { if (psStatus) psStatus.textContent = ''; }, 1500);
+      } catch (e) {
+        if (psStatus) psStatus.textContent = `Save failed: ${String(e)}`;
+      }
+    };
+
+    if (awSel) awSel.onchange = () => saveSetting({ auto_worktrees: parseInt(awSel.value, 10) });
+    if (rmSel) rmSel.onchange = () => saveSetting({ require_merge_approval: parseInt(rmSel.value, 10) });
+
+  }, 0);
+
+
+
   // Executor Config section
 
   const execCfg = (projectSettings && projectSettings.executor_config) || {};

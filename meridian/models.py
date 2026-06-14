@@ -159,6 +159,18 @@ class ProjectSettings(BaseModel):
         "only, no destructive keywords), 2=aggressive (everything except "
         "correction + security-sensitive requests).",
     )
+    auto_worktrees: int = Field(
+        default=1,
+        ge=0,
+        le=1,
+        description="0716c9e0: suggest git worktree on claim_sprint_item (default ON).",
+    )
+    require_merge_approval: int = Field(
+        default=1,
+        ge=0,
+        le=1,
+        description="0716c9e0: warn via HITL when completing an item with an active worktree (default ON).",
+    )
 
 
 class ProjectSettingsPatch(BaseModel):
@@ -167,6 +179,8 @@ class ProjectSettingsPatch(BaseModel):
     max_pinned_decisions: int | None = Field(default=None, ge=1, le=200)
     executor_config: ExecutorConfig | None = None
     hitl_auto_answer: int | None = Field(default=None, ge=0, le=2)
+    auto_worktrees: int | None = Field(default=None, ge=0, le=1)
+    require_merge_approval: int | None = Field(default=None, ge=0, le=1)
 
 
 class GoalState(BaseModel):

@@ -440,6 +440,8 @@ CREATE TABLE IF NOT EXISTS projects (
     executor_config TEXT,
     rewind_token TEXT,
     hitl_auto_answer INTEGER NOT NULL DEFAULT 0,
+    auto_worktrees INTEGER NOT NULL DEFAULT 1,
+    require_merge_approval INTEGER NOT NULL DEFAULT 1,
     icon TEXT,
     github_repo TEXT,
     github_branch TEXT,
@@ -1337,6 +1339,14 @@ async def _migrate_pg_v34_hitl_auto_answer(conn: PostgresConnection) -> None:
     )
 
 
+async def _migrate_pg_parallel_safety(conn: PostgresConnection) -> None:
+    """0716c9e0 — per-project parallel safety toggles. Mirrors db._migrate_parallel_safety."""
+    await conn.executescript(
+        "ALTER TABLE projects ADD COLUMN IF NOT EXISTS auto_worktrees INTEGER NOT NULL DEFAULT 1;"
+        "ALTER TABLE projects ADD COLUMN IF NOT EXISTS require_merge_approval INTEGER NOT NULL DEFAULT 1"
+    )
+
+
 async def _migrate_pg_v34_workspace_settings(conn: PostgresConnection) -> None:
     """v3.4 — workspace_settings singleton table on existing Postgres DBs.
     Runs on ALL DBs (lives on every workspace DB). Mirrors
@@ -1560,4 +1570,5 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_oauth_codes,
     _migrate_pg_github_to_projects,
     _migrate_pg_queued_session,
+    _migrate_pg_parallel_safety,
 )

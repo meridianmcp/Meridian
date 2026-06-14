@@ -670,6 +670,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_workspace_tenant_isolation(db)
     await _migrate_registered_hostnames(db)
     await _migrate_queued_session(db)
+    await _migrate_parallel_safety(db)
     return db
 
 
@@ -777,7 +778,8 @@ async def get_project_settings(
 ) -> dict[str, Any] | None:
     """Return the persisted settings for a project."""
     async with db.execute(
-        "SELECT id, max_pinned_decisions, executor_config, hitl_auto_answer "
+        "SELECT id, max_pinned_decisions, executor_config, hitl_auto_answer, "
+        "auto_worktrees, require_merge_approval "
         "FROM projects WHERE id = ?",
         (project_id,),
     ) as cur:
@@ -796,6 +798,9 @@ async def get_project_settings(
         "executor_config": executor_config,
         # 035edf47 — 0=off, 1=safe, 2=aggressive (was a 0/1 bool).
         "hitl_auto_answer": int(data.get("hitl_auto_answer") or 0),
+        # 0716c9e0 — parallel safety toggles; default ON (1).
+        "auto_worktrees": int(data.get("auto_worktrees") if data.get("auto_worktrees") is not None else 1),
+        "require_merge_approval": int(data.get("require_merge_approval") if data.get("require_merge_approval") is not None else 1),
     }
 
 
@@ -806,6 +811,8 @@ async def update_project_settings(
     max_pinned_decisions: int | None = None,
     executor_config: dict[str, Any] | None = None,
     hitl_auto_answer: int | None = None,
+    auto_worktrees: int | None = None,
+    require_merge_approval: int | None = None,
     github_repo: str | None = _UNSET,
     github_branch: str | None = _UNSET,
 ) -> dict[str, Any] | None:
@@ -825,6 +832,12 @@ async def update_project_settings(
         # 035edf47 — 0=off, 1=safe, 2=aggressive. Clamp to the valid range.
         updates.append("hitl_auto_answer = ?")
         params.append(max(0, min(2, int(hitl_auto_answer))))
+    if auto_worktrees is not None:
+        updates.append("auto_worktrees = ?")
+        params.append(1 if auto_worktrees else 0)
+    if require_merge_approval is not None:
+        updates.append("require_merge_approval = ?")
+        params.append(1 if require_merge_approval else 0)
     if github_repo is not _UNSET:
         updates.append("github_repo = ?")
         params.append(github_repo or None)
@@ -4564,6 +4577,21 @@ async def list_active_worktrees(
     ) as cur:
         rows = await cur.fetchall()
     return [_row_to_dict(r) for r in rows if r is not None]  # type: ignore[misc]
+
+
+async def get_active_worktree_for_session(
+    db: aiosqlite.Connection,
+    session_id: str,
+) -> dict[str, Any] | None:
+    """Return the most recent active worktree for a session, or None."""
+    async with db.execute(
+        "SELECT * FROM active_worktrees "
+        "WHERE session_id = ? AND removed_at IS NULL "
+        "ORDER BY created_at DESC LIMIT 1",
+        (session_id,),
+    ) as cur:
+        row = await cur.fetchone()
+    return _row_to_dict(row) if row is not None else None
 
 
 # ---------------------------------------------------------------------------
