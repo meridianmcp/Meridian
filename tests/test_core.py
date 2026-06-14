@@ -9586,7 +9586,7 @@ def test_github_status_graceful_on_db_error(client, monkeypatch):
     try/except returns a safe JSON response instead of propagating as 500.
     """
     import meridian.db as _db_mod
-    from meridian import server as server_mod
+    from meridian.routes import github as github_mod
 
     p = client.post("/projects", json={"name": "gh-status-err"}).json()
     project_id = p["id"]
@@ -9599,7 +9599,9 @@ def test_github_status_graceful_on_db_error(client, monkeypatch):
     async def _boom(*args, **kwargs):
         raise RuntimeError("simulated DB failure")
 
-    monkeypatch.setattr(server_mod, "_get_tenant_from_request", _mock_tenant)
+    # github_status lives in routes/github.py and binds _get_tenant_from_request
+    # from ._deps at import — patch it where the route looks it up.
+    monkeypatch.setattr(github_mod, "_get_tenant_from_request", _mock_tenant)
     monkeypatch.setattr(_db_mod, "get_tenant_by_id", _boom)
 
     r = client.get(f"/projects/{project_id}/github/status")

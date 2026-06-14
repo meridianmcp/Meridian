@@ -42,7 +42,34 @@ from ._deps import (
     _is_demo_request,
     _get_tenant_from_request,
     validate_input_size,
+    _limiter,
+    _rate_limit,
+    _RATE_LIMIT,
 )
+
+# The slowapi Limiter is a process-singleton in ._deps so extracted routers can
+# apply _rate_limit at import time. The test suite reloads THIS module to get a
+# "fresh" limiter; since ._deps (and the route modules) are NOT reloaded, a naive
+# reload would re-run server.py's own @_rate_limit decorators and double-register
+# their limits (slowapi .extend()s per key) → double counting. So drop only the
+# registrations owned by THIS module before its decorators re-run, and reset the
+# shared counters. Router-owned registrations (meridian.routes.*) are added once
+# and must survive — clearing them would silently disable their rate limits,
+# because route modules don't re-decorate on a server.py reload.
+if _limiter is not None:
+    _own = f"{__name__}."  # "meridian.server."
+    for _store in (
+        _limiter._route_limits,
+        _limiter._dynamic_route_limits,
+        _limiter._Limiter__marked_for_limiting,  # type: ignore[attr-defined]
+    ):
+        for _key in [k for k in _store if k.startswith(_own)]:
+            del _store[_key]
+    _limiter._application_limits.clear()
+    try:
+        _limiter.reset()
+    except Exception:  # pragma: no cover - storage may not support reset
+        pass
 
 
 def _load_meridian_md() -> str:
@@ -551,6 +578,10 @@ from .routes.decisions import router as _decisions_router    # noqa: E402
 from .routes.handoff import router as _handoff_router        # noqa: E402
 from .routes.admin import router as _admin_router            # noqa: E402
 from .routes.workspace import router as _workspace_router    # noqa: E402
+from .routes.files import router as _files_router            # noqa: E402
+from .routes.export import router as _export_router          # noqa: E402
+from .routes.auth import router as _auth_router              # noqa: E402
+from .routes.github import router as _github_router          # noqa: E402
 
 app.include_router(_notes_router)
 app.include_router(_hitl_router)
@@ -561,6 +592,10 @@ app.include_router(_decisions_router)
 app.include_router(_handoff_router)
 app.include_router(_admin_router)
 app.include_router(_workspace_router)
+app.include_router(_files_router)
+app.include_router(_export_router)
+app.include_router(_auth_router)
+app.include_router(_github_router)
 
 # ---------------------------------------------------------------------------
 # Password gate middleware
@@ -652,29 +687,15 @@ async def gate_submit(request: Request):
     return response
 
 # ---------------------------------------------------------------------------
-# v2.0 — Rate limiter (slowapi, in-memory, no Redis required)
+# v2.0 — Rate limiter registration (the Limiter + _rate_limit live in _deps so
+# extracted routers can apply it; server.py owns the app-level registration).
 # ---------------------------------------------------------------------------
-try:
-    from slowapi import Limiter, _rate_limit_exceeded_handler
+if _limiter is not None:
+    from slowapi import _rate_limit_exceeded_handler
     from slowapi.errors import RateLimitExceeded
-    from slowapi.util import get_remote_address
 
-    _limiter = Limiter(key_func=get_remote_address)
     app.state.limiter = _limiter
     app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)  # type: ignore[arg-type]
-    _RATE_LIMIT = "100/minute"
-except ImportError:
-    _limiter = None  # type: ignore[assignment]
-    _RATE_LIMIT = "100/minute"
-
-
-def _rate_limit(rate: str):
-    """Return a decorator that applies *rate* via slowapi, or a no-op when slowapi is absent."""
-    def decorator(func):
-        if _limiter is None:
-            return func
-        return _limiter.limit(rate)(func)
-    return decorator
 
 
 # G4.15 — Safety-limit exception → 429
@@ -1258,125 +1279,7 @@ async def install_mcp_page(request: Request) -> HTMLResponse:
 # v2.0 — Google OAuth routes
 # ---------------------------------------------------------------------------
 
-@app.get("/auth/login")
-async def auth_login(request: Request):
-    """Serve sign-in page with Google and GitHub OAuth buttons."""
-    from .hosted import auth_login as _auth_login
-    return await _auth_login(request)
-
-
-@app.get("/auth/google/login")
-async def auth_google_login(request: Request):
-    """Redirect browser directly to Google OAuth consent page."""
-    from .hosted import auth_google_login as _auth_google_login
-    return await _auth_google_login(request)
-
-
-@app.get("/auth/callback")
-async def auth_callback(request: Request):
-    """Handle Google OAuth callback — create/update tenant, set session cookie."""
-    from .hosted import auth_callback as _auth_callback
-    return await _auth_callback(request)
-
-
-@app.get("/auth/github/login")
-async def auth_github_login(request: Request):
-    """Redirect browser to GitHub OAuth consent page."""
-    from .hosted import auth_github_login as _auth_github_login
-    return await _auth_github_login(request)
-
-
-@app.get("/auth/github/callback")
-async def auth_github_callback(request: Request):
-    """Handle GitHub OAuth callback — create/update tenant, set session cookie."""
-    from .hosted import auth_github_callback as _auth_github_callback
-    return await _auth_github_callback(request)
-
-
-@app.get("/auth/github/repo-connect")
-async def auth_github_repo_connect(request: Request):
-    """Redirect browser to GitHub OAuth for repo connection."""
-    from .hosted import auth_github_repo_connect as _auth_github_repo_connect
-    return await _auth_github_repo_connect(request)
-
-
-@app.get("/auth/github/repo-callback")
-async def auth_github_repo_callback(request: Request):
-    """Handle GitHub repo-connect callback and store repo access."""
-    from .hosted import auth_github_repo_callback as _auth_github_repo_callback
-    db = await _db(request)
-    return await _auth_github_repo_callback(request, db)
-
-
-@app.get("/auth/microsoft/login")
-async def auth_microsoft_login(request: Request):
-    """Redirect browser to Microsoft OAuth consent page."""
-    from .hosted import auth_microsoft_login as _auth_microsoft_login
-    return await _auth_microsoft_login(request)
-
-
-@app.get("/auth/microsoft/callback")
-async def auth_microsoft_callback(request: Request):
-    """Handle Microsoft OAuth callback — create/update tenant, set session cookie."""
-    from .hosted import auth_microsoft_callback as _auth_microsoft_callback
-    return await _auth_microsoft_callback(request)
-
-
-@app.get("/auth/email-required")
-async def auth_email_required(request: Request) -> HTMLResponse:
-    """Shown when OAuth provider returned no usable email (e.g. GitHub with private email)."""
-    provider = request.query_params.get("provider", "your provider")
-    html = f"""<!DOCTYPE html><html><head><meta charset=utf-8>
-<title>Email required — Meridian</title>
-<style>body{{font-family:system-ui,sans-serif;max-width:480px;margin:80px auto;padding:0 20px;color:#e8eaed;background:#0d1117}}
-h2{{color:#58a6ff}}p{{color:#8b949e;line-height:1.6}}a{{color:#58a6ff}}
-.card{{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:24px;margin-top:24px}}
-</style></head><body>
-<div class="card">
-<h2>Email address required</h2>
-<p>We couldn't get a verified email from {provider}. Meridian needs your email to create your account.</p>
-<p>To fix this:<br>
-&nbsp;&nbsp;1. Go to <a href="https://github.com/settings/emails" target="_blank" rel="noopener">github.com/settings/emails</a><br>
-&nbsp;&nbsp;2. Add and verify a primary email address<br>
-&nbsp;&nbsp;3. <a href="/auth/github/login">Try signing in again</a></p>
-<p>Or <a href="/auth/login">use a magic link</a> to sign in with your email directly.</p>
-</div>
-</body></html>"""
-    return HTMLResponse(html)
-
-
-@app.get("/auth/logout")
-async def auth_logout(request: Request):
-    """Clear session cookie and delete DB session."""
-    from .hosted import auth_logout as _auth_logout
-    return await _auth_logout(request)
-
-
-@app.post("/auth/magic")
-@_rate_limit("5/minute")
-async def auth_magic_request(request: Request):
-    """v0.9 — request a magic-link email. Rate-limited.
-
-    Body: ``{"email": "user@example.com"}``. Sends a single-use signed
-    link via Resend. Idempotent within the 24-hour token window — if a
-    valid unused token exists for this email, returns success without
-    sending a duplicate email.
-    """
-    from .hosted import auth_magic_request as _impl
-    return await _impl(request)
-
-
-@app.get("/auth/magic/verify")
-async def auth_magic_verify(request: Request, token: str = ""):
-    """v0.9 — consume a magic-link token, create a session, redirect.
-
-    Single-use: marks ``used_at`` on success so re-clicking the same
-    link doesn't re-authenticate. New tenants flow through the OAuth
-    paywall check — redirected to /pricing?signup=1 if no Stripe
-    subscription yet.
-    """
-    from .hosted import auth_magic_verify as _impl
-    return await _impl(request, token)
+# /auth/* OAuth + magic-link routes moved to meridian/routes/auth.py
 
 
 @app.get("/config")
@@ -3004,344 +2907,7 @@ _REPO_ROOT = Path(__file__).parent.parent
 # The dashboard only allows editing these specific files.
 _EDITABLE_FILES: list[str] = ["AGENTS.md", "CLAUDE.md"]
 
-_DEMO_FILE_CONTENT: dict[str, dict[str, str]] = {
-    "backend-api-v2": {
-        "AGENTS.md": """\
-# backend-api-v2 — Agent Session Instructions
-
-## Start a session
-
-Run `start_session(project_id="...", session_name="describe-what-youre-doing")` at session start.
-This returns your sprint items, active sessions, and goal in one call.
-
-## Project context
-
-REST API in Python (FastAPI) + Postgres. Rate limiting via Redis token bucket.
-API key auth: `mk_live_` / `mk_test_` prefixed keys, only the hash stored.
-
-## Session rules
-
-- `log_task(session_id, project_id, desc)` after each meaningful task
-- `pin_decision(...)` for architectural choices
-- `request_hitl(...)` when blocked on a human decision
-- `checkpoint(...)` before ending
-
-## Common gotchas
-
-- Use `%s` placeholders in psycopg3 queries, never `?`
-- Rate limiter tests: fakeredis for unit tests, real Redis for nightly suite
-- API keys: always hash before storage, never log raw key value
-- Migrations in `alembic/` — never edit schema directly in prod
-""",
-        "ROADMAP.md": """\
-# backend-api-v2 Roadmap
-
-## v1.2 (current sprint)
-- [x] Redis token bucket rate limiting
-- [x] POST /v1/api-keys — issue API keys
-- [x] DELETE /v1/api-keys/{id} — revoke keys
-- [x] OpenAPI spec generation + Redoc UI at /docs
-- [x] Integration test suite (47 tests)
-- [ ] TypeScript client SDK from OpenAPI spec
-- [ ] Python client SDK from OpenAPI spec
-- [ ] Load test rate limiter at 10k req/min
-
-## v1.3
-- [ ] Outbound webhooks — POST on entity change
-- [ ] Event streaming via SSE for live updates
-
-## v1.4
-- [ ] Multi-tenant isolation (schema-per-tenant)
-""",
-        "DEVLOG.md": """\
-# backend-api-v2 Dev Log
-
-## 2026-06-04
-**Bob** — Finished POST /v1/api-keys and DELETE revoke endpoint. All tests passing.
-Worker 2 started TypeScript SDK generation from OpenAPI spec.
-
-## 2026-06-03
-**Alice** — Unblocked Bob's API keys PR — resolved merge conflict with worker 1's OpenAPI changes.
-**Worker 1** — Merged api_keys endpoints into spec. 47 integration tests all green.
-
-## 2026-05-28
-**Bob** — Rate limiter shipped to staging. 1000 req/min load test holding steady.
-Found off-by-one in window reset logic — fixed + test added.
-
-## 2026-05-22
-**Alice** — Architecture review: cursor pagination wins over offset.
-URL versioning (/v1/) confirmed. Reviewed Bob's rate limiter PR.
-Redis connection pool leak on exception path — fixed.
-""",
-        "CLAUDE.md": """\
-# backend-api-v2 — Session Instructions
-
-## Project ID
-`PROJECT_ID=<project-id>`
-
-## Stack
-Python 3.12, FastAPI, psycopg3 (asyncpg removed), Redis, Alembic migrations.
-CI: GitHub Actions — tests + lint on PR, Docker build on merge.
-
-## Key rules
-- `%s` placeholders only in SQL — never `?`
-- API key generation: 32-byte base64url, prefix `mk_live_`/`mk_test_`, store hash only
-- Rate limiter: Redis EVAL scripts for atomic token bucket operations
-- All endpoints under `/v1/` prefix
-
-## Before pushing
-Run `pytest -x` — all 47 integration tests must pass.
-""",
-        "README.md": """\
-# backend-api-v2
-
-Fast, observable REST API — rate limiting, API key auth, full OpenAPI spec.
-
-## Quick start
-
-```bash
-docker compose up        # Postgres + Redis
-uvicorn main:app --reload
-```
-
-Docs: http://localhost:8000/docs
-
-## Auth
-
-Issue an API key: `POST /v1/api-keys`
-Authenticate: `Authorization: Bearer mk_live_...`
-
-## Rate limits
-
-100 req/min per API key.
-Response headers: `X-RateLimit-Limit`, `X-RateLimit-Remaining`, `X-RateLimit-Reset`.
-""",
-        "DECISIONS.md": """\
-# backend-api-v2 — Architectural Decisions
-
-## Postgres over MySQL [2026-05-05]
-Better JSON operators, pgvector for future embedding search, existing team familiarity.
-
-## API versioning via URL prefix, not Accept header [2026-05-07]
-/v1/ is visible in logs, easy to route in nginx, simpler for SDK consumers.
-
-## Redis token bucket for rate limiting [2026-05-28]
-Survives deploys, consistent across instances. In-memory rejected — state lost on restart.
-
-## API keys prefixed mk_live_ / mk_test_ [2026-05-30]
-Stripe-style prefixes identifiable in logs and support tickets.
-Raw key shown once on creation, only hash stored. 32-byte base64url = 256 bits entropy.
-
-## Cursor-based pagination over offset [2026-05-22]
-Offset pagination breaks when rows are inserted during traversal.
-Cursor (created_at + id) is stable under concurrent writes. Default 20, max 100.
-""",
-    },
-    "data-pipeline": {
-        "AGENTS.md": """\
-# data-pipeline — Agent Session Instructions
-
-## Start a session
-
-Run `start_session(project_id="...", session_name="describe-what-youre-doing")` at session start.
-
-## Project context
-
-Kafka + Flink + Iceberg ETL pipeline ingesting 50M events/day from 8 sources.
-Avro schemas with Confluent Schema Registry. Dead Letter Queue per source.
-
-## Session rules
-
-- `log_task(session_id, project_id, desc)` after each meaningful task
-- `pin_decision(...)` for schema or architecture choices
-- `request_hitl(...)` for any schema evolution change touching production consumers
-- `checkpoint(...)` before ending
-
-## Critical: schema changes
-
-Any change to a registered Avro schema must go through HITL in Meridian before applying.
-Incompatible changes break consumers — caught at Schema Registry only if FORWARD_TRANSITIVE is enforced.
-""",
-        "ROADMAP.md": """\
-# data-pipeline Roadmap
-
-## v0.3 (current sprint)
-- [x] Dead Letter Queue per source topic
-- [x] DLQ replay tooling (scripts/dlq_replay.py)
-- [x] Consumer auto-scaling (HPA at 50k lag)
-- [x] PagerDuty alerts: DLQ spike, consumer lag, disk
-- [x] Iceberg table compaction nightly job
-- [x] E2E test suite (34 tests)
-- [x] On-call runbook — all alert types documented
-- [ ] Load test: 50M events/day sustained simulation
-
-## v0.4
-- [ ] Schema evolution: backward compatibility CI gate
-- [ ] Data lineage tracking (OpenLineage)
-- [ ] Cost dashboard: Kafka + compute + storage by source
-- [ ] DLQ self-service replay UI
-
-## v0.5
-- [ ] Debezium CDC for Postgres change data capture
-""",
-        "DEVLOG.md": """\
-# data-pipeline Dev Log
-
-## 2026-06-04
-**Jordan** — Updated on-call runbooks for DLQ, Kafka broker failure, schema registry outage.
-**Worker 1** — E2E test suite: 34 tests, all 8 sources covered. Load test running now (48M/day, investigating).
-**Worker 2** — Snapshot expiry policy live: 30 snapshots retained, storage costs projected -60%.
-
-## 2026-06-03
-**Jordan** — PagerDuty alerts wired: DLQ spike, consumer lag >100k, broker disk >80%.
-Silence rules: IoT sensor source excluded during 02:00-04:00 maintenance window.
-**Worker 2** — Iceberg compaction live. Query latency -40% on 30-day lookbacks.
-
-## 2026-05-30
-**Maya** — Fixed consumer offset commit race on rebalance. Was causing duplicate processing at partition handoff.
-Consumer auto-scaling live: HPA triggers above 50k lag, tested under 3x load.
-
-## 2026-05-28
-**Jordan** — DLQ consumer: logs error, emits metric, archives to S3 Parquet. Replay tooling complete.
-Stress test: 10k bad events injected, all landed in DLQ, zero main pipeline impact.
-
-## 2026-05-28
-**Maya** — Schema Registry deployed. All 8 sources registered with Avro schemas. FORWARD_TRANSITIVE policy set.
-""",
-        "CLAUDE.md": """\
-# data-pipeline — Session Instructions
-
-## Project ID
-`PROJECT_ID=<project-id>`
-
-## Stack
-Apache Kafka (3-broker, k8s), Confluent Schema Registry (Avro),
-Apache Flink (streaming, 5-min tumbling windows), Apache Iceberg + S3,
-Python consumers (Faust), PagerDuty, Grafana.
-
-## Key rules
-- Schema changes: ALWAYS request_hitl before modifying a registered schema
-- DLQ topics: `{source}-dlq` — never publish to main topic from replay without HITL
-- Flink: periodic 1-second watermarks, 2-minute out-of-orderness bound
-- Consumer offsets: commit after successful processing only — never auto-commit
-
-## Testing
-`pytest tests/` for unit tests.
-E2E tests in `tests/e2e/` require full Kafka + Flink + Iceberg stack running.
-""",
-        "README.md": """\
-# data-pipeline
-
-ETL pipeline ingesting 50M events/day from 8 sources. Kafka → Flink → Iceberg.
-
-## Architecture
-
-```
-8 sources → Kafka topics → Avro validation → Flink windowing → Iceberg tables
-                                ↓
-                         Dead Letter Queue → S3 Parquet archive
-```
-
-## Local dev
-
-```bash
-docker compose up  # Kafka, Schema Registry, Flink, MinIO (S3-compatible)
-python -m consumers.clickstream
-```
-
-## Key metrics
-
-- 50M events/day throughput target
-- p99 end-to-end latency: 4m12s (target: <5 min)
-- On-call burden target: <2 pages/week
-""",
-        "DECISIONS.md": """\
-# data-pipeline — Architectural Decisions
-
-## Avro over Protobuf for schema serialization [2026-05-14]
-Avro integrates natively with Confluent Schema Registry. Protobuf requires cross-team code generation.
-
-## Flink over Spark Streaming for windowing [2026-05-22]
-Flink true streaming (not micro-batch). Lower latency, better watermark handling.
-Spark Streaming prototyped: 3x higher p99 latency, rejected.
-
-## Iceberg over Delta Lake and Hudi for table format [2026-05-22]
-Best Flink native connector. Partition evolution without rewrite. PyIceberg for Python consumers.
-
-## Dead Letter Queue per source, not per error type [2026-05-30]
-Per-source DLQs easier to operate — on-call knows which team owns each queue.
-
-## FORWARD_TRANSITIVE schema compatibility policy [2026-05-28]
-Writers must be backward compatible; readers handle forward compatible changes.
-Breaks caught at Schema Registry registration time.
-
-## PagerDuty over OpsGenie for alerting [2026-06-02]
-Company standard, existing on-call rotation, Grafana integration already set up.
-""",
-    },
-}
-
-
-@app.get("/projects/{project_id}/files")
-async def list_project_files(
-    project_id: str, request: Request
-) -> list[str]:
-    """Return the list of editable markdown files for a project.
-
-    Files that do not yet exist on disk are still listed so the user can
-    create them from the dashboard. 403 is raised if the project is unknown.
-    """
-    project = await db_module.get_project(await _db(request), project_id)
-    if project is None:
-        raise HTTPException(status_code=404, detail="project not found")
-    return _EDITABLE_FILES
-
-
-@app.get("/projects/{project_id}/files/{filename}")
-async def get_project_file(
-    project_id: str, filename: str, request: Request
-) -> dict[str, str]:
-    """Read one editable markdown file and return its content.
-
-    Returns ``{"filename": ..., "content": ...}`` with an empty string when
-    the file does not yet exist. 403 if the filename is not in the allow-list.
-    In demo mode, returns realistic fake content keyed by project name.
-    """
-    project = await db_module.get_project(await _db(request), project_id)
-    if project is None:
-        raise HTTPException(status_code=404, detail="project not found")
-    if filename not in _EDITABLE_FILES:
-        raise HTTPException(status_code=403, detail="file not in allow-list")
-    from fastapi.responses import JSONResponse
-    env_demo = os.environ.get("MERIDIAN_DEMO", "").lower() in ("1", "true", "yes")
-    cookie_demo = bool(request.cookies.get(_DEMO_CONTEXT_COOKIE))
-    if env_demo or cookie_demo:
-        proj_name = project.get("name", "")
-        demo_files = _DEMO_FILE_CONTENT.get(proj_name, {})
-        content = demo_files.get(filename, "")
-        return JSONResponse(content={"filename": filename, "content": content}, headers={"Content-Type": "application/json; charset=utf-8"})
-    path = _REPO_ROOT / filename
-    content = path.read_text(encoding="utf-8") if path.exists() else ""
-    return JSONResponse(content={"filename": filename, "content": content}, headers={"Content-Type": "application/json; charset=utf-8"})
-
-
-@app.put("/projects/{project_id}/files/{filename}")
-async def put_project_file(
-    project_id: str, filename: str, body: FileContent, request: Request
-) -> dict[str, object]:
-    """Write content to one editable markdown file.
-
-    Creates the file if it does not exist. 403 if the filename is not in the
-    allow-list. Returns ``{"filename": ..., "size": <bytes>}``.
-    """
-    project = await db_module.get_project(await _db(request), project_id)
-    if project is None:
-        raise HTTPException(status_code=404, detail="project not found")
-    if filename not in _EDITABLE_FILES:
-        raise HTTPException(status_code=403, detail="file not in allow-list")
-    path = _REPO_ROOT / filename
-    path.write_text(body.content, encoding="utf-8")
-    return {"filename": filename, "size": len(body.content.encode("utf-8"))}
+# _DEMO_FILE_CONTENT + file-editing routes moved to meridian/routes/files.py
 
 
 @app.post("/projects/{project_id}/devlog")
@@ -4423,72 +3989,7 @@ def _is_demo_request(request: Request) -> bool:
     return env_demo or cookie_demo
 
 
-@app.get("/export/my-data")
-@_rate_limit("3/minute")
-async def export_my_data(request: Request) -> Response:
-    """GDPR data portability — returns a JSON file of all account data."""
-    if not _hosted_mode():
-        raise HTTPException(status_code=404)
-    if _is_demo_request(request):
-        return JSONResponse(
-            {"detail": "Not available in demo mode. Sign up at usemeridian.us"},
-            status_code=403,
-        )
-    from .hosted import get_current_tenant
-    tenant = await get_current_tenant(request)
-    # Account rows (tenant/tokens/members) live in the auth DB; the tenant's
-    # project data lives in its own per-tenant DB. Pass both so the export
-    # actually contains projects (hosted mode previously exported empty arrays).
-    data = await db_module.export_tenant_data(
-        request.app.state.db, tenant["id"], project_db=await _db(request),
-    )
-    payload = json.dumps(data, indent=2, default=str).encode()
-    email_slug = (tenant.get("email") or "user").split("@")[0][:20]
-    filename = f"meridian-export-{email_slug}.json"
-    return Response(
-        content=payload,
-        media_type="application/json",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
-    )
-
-
-@app.post("/account/delete")
-async def delete_account(request: Request) -> Response:
-    """Self-service account deletion. Requires JSON body: {\"confirmation\": \"DELETE\"}."""
-    if not _hosted_mode():
-        raise HTTPException(status_code=404)
-    if _is_demo_request(request):
-        return JSONResponse(
-            {"detail": "Not available in demo mode. Sign up at usemeridian.us"},
-            status_code=403,
-        )
-    from .hosted import get_current_tenant, cancel_stripe_subscription, _drop_tenant_neon_database, send_account_deleted_email
-    from .roles import PERM_DELETE_TENANT  # noqa: PLC0415
-    from fastapi.responses import JSONResponse
-    tenant = await get_current_tenant(request)
-    # G5.19 — only the tenant owner can delete the account. Admin
-    # invitees are explicitly excluded by ROLE_PERMS.
-    await _require_workspace_perm(request, tenant, PERM_DELETE_TENANT)
-    body = await request.json()
-    if body.get("confirmation") != "DELETE":
-        raise HTTPException(status_code=400, detail="Type DELETE to confirm account deletion.")
-
-    stripe_id = tenant.get("stripe_customer_id")
-    if stripe_id:
-        await cancel_stripe_subscription(stripe_id)
-
-    if tenant.get("neon_project_id"):
-        asyncio.create_task(_drop_tenant_neon_database(tenant))
-
-    email = tenant.get("email", "")
-    await db_module.delete_tenant_records(request.app.state.db, tenant["id"])
-
-    if email:
-        asyncio.create_task(send_account_deleted_email(email))
-
-    resp = JSONResponse({"deleted": True})
-    resp.delete_cookie("meridian_session")
-    return resp
+# /export/my-data + /account/delete moved to meridian/routes/export.py
 
 
 @app.get("/settings/mcp-config")
@@ -4564,329 +4065,7 @@ async def update_usage_caps(request: Request) -> dict[str, Any]:
 # GitHub integration endpoints (hosted-tier only)
 # ---------------------------------------------------------------------------
 
-@app.post("/projects/{project_id}/github/connect")
-async def github_connect(project_id: str, request: Request) -> dict[str, Any]:
-    """Connect or update the tenant's GitHub repo settings."""
-    if not _hosted_mode():
-        raise HTTPException(status_code=404)
-    import httpx as _httpx
-    from .hosted import _github_user_snapshot as _github_snapshot
-    tenant = await _get_tenant_from_request(request)
-    if tenant is None:
-        raise HTTPException(status_code=401, detail="not authenticated")
-    body = await request.json()
-    pat = (body.get("pat") or body.get("token") or body.get("access_token") or "").strip()
-    repo = (body.get("repo") or "").strip()
-    branch = (body.get("branch") or "main").strip()
-    if not repo or "/" not in repo:
-        raise HTTPException(status_code=422, detail="repo must be owner/repo format")
-    fresh = await db_module.get_tenant_by_id(request.app.state.db, tenant["id"])
-    stored_pat = db_module.decrypt_field((fresh or {}).get("github_pat"))
-    validate_pat = pat or stored_pat or ""
-    github_user = ""
-    avatar_url = ""
-    repos: list[dict[str, Any]] = []
-    try:
-        if validate_pat:
-            snapshot = await _github_snapshot(validate_pat)
-            github_user = snapshot.get("login", "")
-            avatar_url = snapshot.get("avatar_url", "")
-            repos = snapshot.get("repos") or []
-            if repo and repos:
-                repo_lookup = {r.get("full_name", ""): r for r in repos if r.get("full_name")}
-                if repo not in repo_lookup:
-                    repo = repos[0].get("full_name", repo)
-                    branch = repos[0].get("default_branch") or branch
-                elif branch == "main" and repo_lookup[repo].get("default_branch"):
-                    branch = repo_lookup[repo].get("default_branch") or branch
-        elif not stored_pat:
-            raise HTTPException(status_code=422, detail="GitHub is not connected")
-    except _httpx.RequestError as exc:
-        raise HTTPException(status_code=502, detail=f"Could not reach GitHub: {exc}") from exc
-    except RuntimeError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
-
-    if pat:
-        await db_module.update_tenant(
-            request.app.state.db, tenant["id"],
-            github_pat=db_module.encrypt_field(pat),
-        )
-    db = await _db(request)
-    await db_module.update_project_settings(
-        db, project_id,
-        github_repo=repo,
-        github_branch=branch,
-    )
-    return {
-        "connected": True,
-        "repo": repo,
-        "branch": branch,
-        "github_user": github_user,
-        "avatar_url": avatar_url,
-        "repos": repos,
-    }
-
-
-@app.get("/projects/{project_id}/github/status")
-async def github_status(project_id: str, request: Request) -> dict[str, Any]:
-    """Return the project's current GitHub connection status."""
-    if not _hosted_mode():
-        raise HTTPException(status_code=404)
-    from .hosted import _github_user_snapshot as _github_snapshot
-    tenant = await _get_tenant_from_request(request)
-    if tenant is None:
-        raise HTTPException(status_code=401, detail="not authenticated")
-    try:
-        fresh = await db_module.get_tenant_by_id(request.app.state.db, tenant["id"])
-        if not fresh:
-            return {"connected": False, "pat_linked": False, "repo": "", "branch": "main",
-                    "github_user": "", "avatar_url": "", "repos": [], "last_verified": None}
-        token = db_module.decrypt_field(fresh.get("github_pat"))
-        project = await db_module.get_project(await _db(request), project_id)
-        selected_repo = (project or {}).get("github_repo") or ""
-        selected_branch = (project or {}).get("github_branch") or "main"
-        snapshot: dict[str, Any] | None = None
-        if token:
-            try:
-                snapshot = await _github_snapshot(token)
-            except Exception:
-                snapshot = None
-        repos = (snapshot or {}).get("repos") or []
-        if selected_repo and repos and not any(r.get("full_name") == selected_repo for r in repos):
-            repos = [{"full_name": selected_repo, "name": selected_repo.split("/")[-1], "owner": selected_repo.split("/")[0] if "/" in selected_repo else "", "html_url": "", "default_branch": selected_branch, "private": False, "updated_at": ""}] + repos
-        return {
-            "connected": bool(token and selected_repo),
-            "pat_linked": bool(token),
-            "repo": selected_repo,
-            "branch": selected_branch,
-            "github_user": (snapshot or {}).get("login", ""),
-            "avatar_url": (snapshot or {}).get("avatar_url", ""),
-            "repos": repos,
-            "last_verified": None,
-        }
-    except Exception:
-        return {"connected": False, "pat_linked": False, "repo": "", "branch": "main",
-                "github_user": "", "avatar_url": "", "repos": [], "last_verified": None}
-
-
-@app.get("/projects/{project_id}/repo-image")
-async def repo_image_proxy(project_id: str, request: Request, path: str = ""):
-    """G7.32 — proxy a repo-relative image through the project's GitHub PAT.
-
-    Used by markdown preview to render images that live in the connected
-    repo (e.g. ``![](docs/screenshots/foo.png)``) without exposing the PAT
-    to the browser. Returns the raw bytes with the upstream Content-Type.
-
-    Limits:
-     - Hosted-only (PAT lives on the tenant).
-     - Path is normalized to disallow ``..``; absolute URLs are rejected.
-     - Falls back to 404 when the project isn't connected to a repo.
-     - 1 MB response cap (oversized images are 413).
-    """
-    if not _hosted_mode():
-        raise HTTPException(404)
-    tenant = await _get_tenant_from_request(request)
-    if tenant is None:
-        raise HTTPException(401, "not authenticated")
-    fresh = await db_module.get_tenant_by_id(request.app.state.db, tenant["id"])
-    pat = db_module.decrypt_field((fresh or {}).get("github_pat")) if fresh else None
-    project = await db_module.get_project(await _db(request), project_id)
-    repo = (project or {}).get("github_repo") or ""
-    branch = (project or {}).get("github_branch") or "main"
-    if not repo or not pat:
-        raise HTTPException(404, "no repo connected")
-    clean = path.strip().lstrip("/")
-    if not clean or ".." in clean.split("/") or "://" in clean:
-        raise HTTPException(400, "invalid path")
-    if "/" not in repo:
-        raise HTTPException(400, "repo not owner/name")
-    owner, repo_name = repo.split("/", 1)
-    raw_url = f"https://raw.githubusercontent.com/{owner}/{repo_name}/{branch}/{clean}"
-    import httpx  # noqa: PLC0415
-    try:
-        async with httpx.AsyncClient(timeout=10) as http:
-            r = await http.get(raw_url, headers={"Authorization": f"Bearer {pat}"})
-    except Exception as exc:  # noqa: BLE001
-        raise HTTPException(502, f"upstream fetch failed: {exc}") from exc
-    if r.status_code == 404:
-        raise HTTPException(404, "file not found in repo")
-    if r.status_code >= 400:
-        raise HTTPException(r.status_code, "upstream error")
-    body = r.content
-    if len(body) > 1_000_000:
-        raise HTTPException(413, "image too large")
-    return Response(
-        content=body,
-        media_type=r.headers.get("content-type", "application/octet-stream"),
-        headers={"Cache-Control": "private, max-age=60"},
-    )
-
-
-
-
-@app.post("/projects/{project_id}/github/push-mcp-template", status_code=201)
-async def push_mcp_template(project_id: str, request: Request) -> dict[str, Any]:
-    """Push template.mcp.json to the connected GitHub repo.
-
-    Fails with 409 if the file already exists. The template contains a
-    placeholder Bearer token — users fill it in locally; .mcp.json should
-    be gitignored so the real token never gets committed.
-    """
-    if not _hosted_mode():
-        raise HTTPException(status_code=404)
-    tenant = await _get_tenant_from_request(request)
-    if tenant is None:
-        raise HTTPException(status_code=401, detail="not authenticated")
-
-    fresh = await db_module.get_tenant_by_id(request.app.state.db, tenant["id"])
-    project = await db_module.get_project(await _db(request), project_id)
-    pat = (fresh or {}).get("github_pat")
-    repo = (project or {}).get("github_repo")
-    if not pat or not repo:
-        raise HTTPException(status_code=400, detail="No GitHub repo connected. Connect one in Settings first.")
-
-    token = db_module.decrypt_field(pat)
-    if not token:
-        raise HTTPException(status_code=400, detail="GitHub token could not be decrypted. Reconnect your repo.")
-
-    import httpx as _httpx
-    gh_headers = {"Authorization": f"token {token}", "Accept": "application/vnd.github+json"}
-
-    template_content = json.dumps({
-        "mcpServers": {
-            "meridian": {
-                "type": "http",
-                "url": "https://usemeridian.us/mcp",
-                "headers": {
-                    "Authorization": "Bearer sk_meridian_YOUR_KEY_HERE"
-                }
-            }
-        }
-    }, indent=2)
-    template_b64 = base64.b64encode(template_content.encode()).decode()
-
-    async with _httpx.AsyncClient(timeout=10) as http:
-        # Check if file already exists
-        check = await http.get(
-            f"https://api.github.com/repos/{repo}/contents/template.mcp.json",
-            headers=gh_headers,
-        )
-        if check.status_code == 200:
-            raise HTTPException(status_code=409, detail="template.mcp.json already exists in the repo.")
-
-        # Create the file
-        r = await http.put(
-            f"https://api.github.com/repos/{repo}/contents/template.mcp.json",
-            headers=gh_headers,
-            json={
-                "message": "Add Meridian MCP config template",
-                "content": template_b64,
-            },
-        )
-        if r.status_code not in (201, 200):
-            raise HTTPException(status_code=r.status_code, detail=f"GitHub API error: {r.text[:200]}")
-
-    return {"pushed": True, "file": "template.mcp.json", "repo": repo}
-
-@app.delete("/projects/{project_id}/github/disconnect", status_code=200)
-async def github_disconnect(project_id: str, request: Request) -> dict[str, Any]:
-    """Clear the project's stored GitHub repo (keeps tenant PAT for other projects)."""
-    if not _hosted_mode():
-        raise HTTPException(status_code=404)
-    tenant = await _get_tenant_from_request(request)
-    if tenant is None:
-        raise HTTPException(status_code=401, detail="not authenticated")
-    db = await _db(request)
-    await db_module.update_project_settings(
-        db, project_id,
-        github_repo=None,
-        github_branch=None,
-    )
-    _GITHUB_REPOS_CACHE.pop(tenant["id"], None)
-    return {"disconnected": True}
-
-
-# Per-tenant in-memory cache of the accessible GitHub repo list. Avoids hitting
-# the GitHub API on every dropdown render; refreshed lazily after 24h or on demand.
-_GITHUB_REPOS_CACHE: dict[str, dict[str, Any]] = {}
-_GITHUB_REPOS_TTL_SECONDS = 24 * 3600
-
-
-@app.get("/projects/{project_id}/github/repos")
-async def github_repos(project_id: str, request: Request) -> dict[str, Any]:
-    """Return the tenant's accessible GitHub repos for the connect dropdown.
-
-    Cached in-memory for 24h per tenant; pass ?refresh=1 to force a re-fetch.
-    """
-    if not _hosted_mode():
-        raise HTTPException(status_code=404)
-    import time as _time
-    from .hosted import _github_user_snapshot as _github_snapshot
-    tenant = await _get_tenant_from_request(request)
-    if tenant is None:
-        raise HTTPException(status_code=401, detail="not authenticated")
-    fresh = await db_module.get_tenant_by_id(request.app.state.db, tenant["id"])
-    token = db_module.decrypt_field((fresh or {}).get("github_pat"))
-    if not token:
-        return {"connected": False, "repos": [], "synced_at": None}
-    force = request.query_params.get("refresh") in ("1", "true", "yes")
-    now = _time.time()
-    cached = _GITHUB_REPOS_CACHE.get(tenant["id"])
-    if cached and not force and (now - cached["fetched_at"]) < _GITHUB_REPOS_TTL_SECONDS:
-        return {"connected": True, "repos": cached["repos"], "synced_at": cached["fetched_at"], "cached": True}
-    try:
-        snapshot = await _github_snapshot(token)
-    except Exception as exc:
-        if cached:
-            return {"connected": True, "repos": cached["repos"], "synced_at": cached["fetched_at"], "cached": True, "stale": True}
-        raise HTTPException(status_code=502, detail=f"GitHub repo fetch failed: {exc}") from exc
-    repos = snapshot.get("repos") or []
-    _GITHUB_REPOS_CACHE[tenant["id"]] = {"repos": repos, "fetched_at": now}
-    return {"connected": True, "repos": repos, "synced_at": now, "cached": False}
-
-
-# Common branch names we offer as a fallback when the live GitHub list is
-# unavailable (e.g. the API is unreachable). The repo's current/default branch
-# is always merged in by the caller so the saved value never disappears.
-_FALLBACK_BRANCHES = ("main", "master", "dev", "develop", "gh-pages")
-
-
-@app.get("/projects/{project_id}/github/branches")
-async def github_branches(project_id: str, request: Request) -> dict[str, Any]:
-    """v2.8 — list the branches of a repo so the Branch field can be a dropdown.
-
-    Query: ``?repo=owner/name`` (defaults to the tenant's connected repo).
-    Falls back to a static list of common branches if GitHub can't be reached,
-    so the dropdown always has sensible options.
-    """
-    if not _hosted_mode():
-        raise HTTPException(status_code=404)
-    from .hosted import _github_repo_branches
-    tenant = await _get_tenant_from_request(request)
-    if tenant is None:
-        raise HTTPException(status_code=401, detail="not authenticated")
-    fresh = await db_module.get_tenant_by_id(request.app.state.db, tenant["id"])
-    project = await db_module.get_project(await _db(request), project_id)
-    repo = (request.query_params.get("repo") or (project or {}).get("github_repo") or "").strip()
-    default_branch = (project or {}).get("github_branch") or "main"
-    token = db_module.decrypt_field((fresh or {}).get("github_pat")) if fresh else None
-    branches: list[str] = []
-    source = "fallback"
-    if token and repo and "/" in repo:
-        try:
-            branches = await _github_repo_branches(token, repo)
-            source = "github"
-        except Exception:  # noqa: BLE001
-            branches = []
-    if not branches:
-        # Merge the saved branch + common defaults, preserving order, no dupes.
-        seen: set[str] = set()
-        for b in (default_branch, *_FALLBACK_BRANCHES):
-            if b and b not in seen:
-                seen.add(b)
-                branches.append(b)
-    return {"repo": repo, "branches": branches, "default_branch": default_branch, "source": source}
-
+# GitHub integration routes moved to meridian/routes/github.py
 
 @app.get("/mcp/quickstart", response_class=PlainTextResponse)
 async def mcp_quickstart() -> str:

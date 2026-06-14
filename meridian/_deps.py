@@ -316,3 +316,30 @@ def validate_input_size(value: str | None, field_name: str, max_chars: int) -> N
             status_code=400,
             detail=f"{field_name} exceeds {max_chars} character limit",
         )
+
+
+# ---------------------------------------------------------------------------
+# Rate limiter (slowapi, in-memory, no Redis required)
+#
+# The Limiter instance lives here so extracted routers can apply ``_rate_limit``
+# at import time without importing from server.py (circular). server.py owns the
+# one-time registration: ``app.state.limiter`` + the RateLimitExceeded handler.
+# ---------------------------------------------------------------------------
+try:
+    from slowapi import Limiter
+    from slowapi.util import get_remote_address
+
+    _limiter = Limiter(key_func=get_remote_address)
+except ImportError:  # pragma: no cover - slowapi always installed in prod
+    _limiter = None  # type: ignore[assignment]
+
+_RATE_LIMIT = "100/minute"
+
+
+def _rate_limit(rate: str):
+    """Return a decorator that applies *rate* via slowapi, or a no-op when slowapi is absent."""
+    def decorator(func):
+        if _limiter is None:
+            return func
+        return _limiter.limit(rate)(func)
+    return decorator
