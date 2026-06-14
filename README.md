@@ -141,7 +141,14 @@ Get your API key at [usemeridian.us/settings](https://usemeridian.us/settings) a
 - **Dashboard** at `http://localhost:7878` — sessions, tasks, sprint board,
   swimlane timeline, HITL queue, pinned decisions.
 - **MCP tools** — `start_session`, `log_task`, `claim_task`, `set_decision`,
-  `pin_decision`, `request_hitl`, `generate_handoff`, plus 10 more.
+  `pin_decision`, `request_hitl`, `generate_handoff`, and ~50 more.
+- **Symbol-level parallel safety** — `claim_file` can claim a single class or
+  function (parsed with `ast` / tree-sitter) so two sessions edit the same file
+  safely; an overlapping claim is blocked with the free symbols listed.
+- **Live work queue** — planners inject sprint items mid-run; executors pick them
+  up at the next item boundary via a `board_change` signal, no interruption.
+- **HITL recommended option** — `request_hitl` can flag a safe-default option the
+  dashboard highlights; Enter submits it, number keys pick others.
 - **GitHub hub** (hosted) — connect your repo once in Settings; sessions get `read_file`,
   `list_files`, `search_code`, `git_log`, `get_commit` injected automatically. No extra install.
 - **Tiered handoffs** — L0/L1/L2 compression so a fresh session can resume in seconds.

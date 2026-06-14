@@ -203,8 +203,11 @@ Copy the printed `https://…` URL → add `<url>/mcp` as a connector in claude.
 
 Read-only. Requires Node.js + Python 3. URL changes on restart.
 
-!!! note "Pro plan coming soon"
-    Pro plan includes a permanent tunnel URL that never changes — add once, works forever.
+!!! note "Permanent tunnel — Standard tier"
+    The Standard tier includes a permanent tunnel URL that never changes — add it
+    to claude.ai once and it works forever. Filesystem access via the tunnel is the
+    core planning workflow (it lets the planner see gitignored strategy files), so
+    it ships in Standard rather than being gated behind a higher tier.
 
 ---
 

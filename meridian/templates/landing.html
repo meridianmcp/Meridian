@@ -551,6 +551,20 @@
         <p>Sprint items can declare expected files so handoffs warn before another agent copies overlapping work.</p>
       </div>
     </div>
+    <div class="feature-item">
+      <div class="feature-icon">{}</div>
+      <div>
+        <h4>Symbol-level claims</h4>
+        <p>Claim a single class or function instead of a whole file — Meridian parses it (ast / tree-sitter) and only blocks on overlapping line ranges, so two sessions can edit the same file safely.</p>
+      </div>
+    </div>
+    <div class="feature-item">
+      <div class="feature-icon">~</div>
+      <div>
+        <h4>Live work queue</h4>
+        <p>A planner can inject sprint items mid-run; executors pick them up at the next item boundary via a <code>board_change</code> signal — no interruption.</p>
+      </div>
+    </div>
   </div>
 </section>
 
