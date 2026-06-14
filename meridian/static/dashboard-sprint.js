@@ -799,7 +799,20 @@ export function renderQueue(projectId, sprintItems = []) {
 
       </div>` : '';
 
-    return `<div class="queue-item">
+    // e62ce019 — backburner (pushed/skipped) items get a permanent-delete button.
+    const isBackburner = ['pushed', 'skipped'].includes(it.status);
+
+    const archiveBtn = isBackburner ? `
+
+      <div style="flex-shrink:0">
+
+        <button class="secondary" data-demo-hide style="padding:1px 6px;font-size:9px" title="Delete permanently"
+
+          onclick="sprintArchive('${escapeHtml(projectId)}','${escapeHtml(it.id)}')">🗑</button>
+
+      </div>` : '';
+
+    return `<div class="queue-item" data-bb-title="${escapeHtml((it.title || '').toLowerCase())}" data-bb-group="${escapeHtml((it.item_group || '').toLowerCase())}">
 
       <div style="display:flex;justify-content:space-between;gap:8px;align-items:flex-start">
 
@@ -821,7 +834,7 @@ export function renderQueue(projectId, sprintItems = []) {
 
         </div>
 
-        ${actions}
+        ${actions}${archiveBtn}
 
       </div>
 
@@ -867,6 +880,70 @@ export function renderQueue(projectId, sprintItems = []) {
 
 
 
+  // e62ce019 — backburner section: search box + grouping by item_group +
+  // per-item permanent delete. Falls back to the plain section when empty.
+  const backburnerSection = () => {
+
+    if (!backburner.length) {
+
+      return section('⏸', 'Backburner', backburner, 'no backburner items', { key: 'backburner', collapsed: true });
+
+    }
+
+    const collapsed = sectionState.backburner ?? true;
+
+    const groups = {};
+
+    for (const it of backburner) {
+
+      const g = it.item_group || '(ungrouped)';
+
+      (groups[g] = groups[g] || []).push(it);
+
+    }
+
+    const groupNames = Object.keys(groups).sort((a, b) => a.localeCompare(b));
+
+    const search = `<input type="text" id="backburner-search-${escapeHtml(projectId)}" placeholder="filter backburner…"
+
+      oninput="filterBackburner('${escapeHtml(projectId)}', this.value)"
+
+      style="width:100%;box-sizing:border-box;background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:3px 8px;margin-bottom:8px;outline:none">`;
+
+    const groupHtml = groupNames.map(g => `
+
+      <div class="bb-group">
+
+        <div style="font-size:9px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:0.4px;margin:8px 0 4px">${escapeHtml(g)} <span style="opacity:0.6">(${groups[g].length})</span></div>
+
+        ${groups[g].map(renderItem).join('')}
+
+      </div>`).join('');
+
+    return `<div class="queue-section" data-section="backburner" data-collapsed="${collapsed ? 'true' : 'false'}">
+
+      <div class="queue-section-header" role="button" tabindex="0" aria-expanded="${collapsed ? 'false' : 'true'}" data-section-key="backburner">
+
+        <span class="queue-section-header-label">⏸ Backburner <span class="queue-section-count">(${backburner.length})</span></span>
+
+        <span class="queue-section-chevron" aria-hidden="true">▶</span>
+
+      </div>
+
+      <div class="queue-section-body">
+
+        <div class="queue-section-body-inner">
+
+          ${search}${groupHtml}
+
+        </div>
+
+      </div>
+
+    </div>`;
+
+  };
+
   const doneFooter = doneAll.length > done.length
 
     ? `<div style="padding-top:6px">
@@ -893,7 +970,7 @@ export function renderQueue(projectId, sprintItems = []) {
 
     section('🔄', 'In Progress', inProgress, 'nothing in progress', { key: 'in_progress' }),
 
-    section('⏸', 'Backburner', backburner, 'no backburner items', { key: 'backburner', collapsed: true }),
+    backburnerSection(),
 
     section('✅', doneTitle, done, 'no completed sprint items', { key: 'done', collapsed: true, footer: doneFooter, count: totalDoneCount }),
 

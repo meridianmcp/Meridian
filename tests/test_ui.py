@@ -73,6 +73,19 @@ def test_dashboard_loads_200(client):
     )
 
 
+def test_backburner_section_has_grouping_search_and_archive(js):
+    """e62ce019 — the backburner section groups by item_group, has a filter box,
+    and a per-item permanent-delete (archive) button wired to the DELETE path."""
+    # Search box wired to the client-side filter.
+    assert "backburner-search-" in js, "backburner search input missing"
+    assert "filterBackburner(" in js, "backburner filter wiring missing"
+    # Grouping by item_group.
+    assert "bb-group" in js, "backburner item_group grouping missing"
+    # Per-item archive/delete button (write control → must be demo-hidden).
+    assert "sprintArchive(" in js, "backburner archive button missing"
+    assert "async function sprintArchive" in js, "sprintArchive impl missing"
+
+
 def test_dashboard_north_star_not_same_as_version_goal(js):
     """Goal tab shows three separate subtabs — not stacked textareas sharing content.
 

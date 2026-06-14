@@ -1548,7 +1548,17 @@
           onclick="sprintPushPrompt('${escapeHtml(projectId)}','${escapeHtml(it.id)}')">\u2192</button>
 
       </div>` : "";
-      return `<div class="queue-item">
+      const isBackburner = ["pushed", "skipped"].includes(it.status);
+      const archiveBtn = isBackburner ? `
+
+      <div style="flex-shrink:0">
+
+        <button class="secondary" data-demo-hide style="padding:1px 6px;font-size:9px" title="Delete permanently"
+
+          onclick="sprintArchive('${escapeHtml(projectId)}','${escapeHtml(it.id)}')">\u{1F5D1}</button>
+
+      </div>` : "";
+      return `<div class="queue-item" data-bb-title="${escapeHtml((it.title || "").toLowerCase())}" data-bb-group="${escapeHtml((it.item_group || "").toLowerCase())}">
 
       <div style="display:flex;justify-content:space-between;gap:8px;align-items:flex-start">
 
@@ -1570,7 +1580,7 @@
 
         </div>
 
-        ${actions}
+        ${actions}${archiveBtn}
 
       </div>
 
@@ -1604,6 +1614,53 @@
 
     </div>`;
     };
+    const backburnerSection = () => {
+      if (!backburner.length) {
+        return section("\u23F8", "Backburner", backburner, "no backburner items", { key: "backburner", collapsed: true });
+      }
+      const collapsed = sectionState.backburner ?? true;
+      const groups = {};
+      for (const it of backburner) {
+        const g = it.item_group || "(ungrouped)";
+        (groups[g] = groups[g] || []).push(it);
+      }
+      const groupNames = Object.keys(groups).sort((a, b) => a.localeCompare(b));
+      const search = `<input type="text" id="backburner-search-${escapeHtml(projectId)}" placeholder="filter backburner\u2026"
+
+      oninput="filterBackburner('${escapeHtml(projectId)}', this.value)"
+
+      style="width:100%;box-sizing:border-box;background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:3px 8px;margin-bottom:8px;outline:none">`;
+      const groupHtml = groupNames.map((g) => `
+
+      <div class="bb-group">
+
+        <div style="font-size:9px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:0.4px;margin:8px 0 4px">${escapeHtml(g)} <span style="opacity:0.6">(${groups[g].length})</span></div>
+
+        ${groups[g].map(renderItem).join("")}
+
+      </div>`).join("");
+      return `<div class="queue-section" data-section="backburner" data-collapsed="${collapsed ? "true" : "false"}">
+
+      <div class="queue-section-header" role="button" tabindex="0" aria-expanded="${collapsed ? "false" : "true"}" data-section-key="backburner">
+
+        <span class="queue-section-header-label">\u23F8 Backburner <span class="queue-section-count">(${backburner.length})</span></span>
+
+        <span class="queue-section-chevron" aria-hidden="true">\u25B6</span>
+
+      </div>
+
+      <div class="queue-section-body">
+
+        <div class="queue-section-body-inner">
+
+          ${search}${groupHtml}
+
+        </div>
+
+      </div>
+
+    </div>`;
+    };
     const doneFooter = doneAll.length > done.length ? `<div style="padding-top:6px">
 
         <button class="secondary" id="queue-done-more-${projectId}" style="padding:3px 10px;font-size:10px">
@@ -1617,7 +1674,7 @@
     return [
       section("\u23F3", "Pending", pending, "no pending sprint items", { key: "pending" }),
       section("\u{1F504}", "In Progress", inProgress, "nothing in progress", { key: "in_progress" }),
-      section("\u23F8", "Backburner", backburner, "no backburner items", { key: "backburner", collapsed: true }),
+      backburnerSection(),
       section("\u2705", doneTitle, done, "no completed sprint items", { key: "done", collapsed: true, footer: doneFooter, count: totalDoneCount }),
       section("\u2715", "Failed", failed, "no failed sprint items", { key: "failed", collapsed: true })
     ].join("");
@@ -7785,6 +7842,30 @@ Current: ${current || "(none)"}`,
       toast(`Failed: ${e.message}`, true);
     }
   }
+  async function sprintArchive(projectId, itemId) {
+    if (!confirm("Permanently delete this backburner item? This cannot be undone.")) return;
+    try {
+      const r = await fetch(`/projects/${projectId}/sprint-items/${itemId}`, { method: "DELETE" });
+      if (!r.ok && r.status !== 204) throw new Error(`${r.status}`);
+      toast("Backburner item deleted");
+      await refreshLiveTab(projectId);
+    } catch (e) {
+      toast(`Delete failed: ${e.message}`, true);
+    }
+  }
+  function filterBackburner(projectId, value) {
+    const q = (value || "").trim().toLowerCase();
+    const sec = document.querySelector('.queue-section[data-section="backburner"]');
+    if (!sec) return;
+    sec.querySelectorAll(".queue-item").forEach((el) => {
+      const hit = !q || (el.dataset.bbTitle || "").includes(q) || (el.dataset.bbGroup || "").includes(q);
+      el.style.display = hit ? "" : "none";
+    });
+    sec.querySelectorAll(".bb-group").forEach((g) => {
+      const anyVisible = Array.from(g.querySelectorAll(".queue-item")).some((el) => el.style.display !== "none");
+      g.style.display = anyVisible ? "" : "none";
+    });
+  }
   async function sprintPushPrompt(projectId, itemId) {
     const toVersion = window.prompt("Push to version (e.g. v2.0):");
     if (!toVersion) return;
@@ -11149,7 +11230,7 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
     }
   }
   try {
-    Object.assign(window, { hideHostedAdminControls, ensureSignOutLink: ensureSignOutLink2, ensureWorkspaceSwitcher: ensureWorkspaceSwitcher2, showConnectDbModal, showLocalServerControls, _summarizeApiErrorText, _projectLoadErrorInfo, wireProjectLoadRetry: wireProjectLoadRetry2, renderProjectLoadError: renderProjectLoadError2, recordProjectLoadError, clearProjectLoadError, renderProjectLoadAlert, retryProjectSurface, syncSidebarActiveProject, autosizeGoalField, githubIconSvg: githubIconSvg2, getConstitutionLimit, loadProjectSettings: loadProjectSettings2, saveProjectSettings: saveProjectSettings2, _demoTourDone: _demoTourDone2, _demoTourSavedStep: _demoTourSavedStep2, _demoTourSaveStep, _demoTourMarkDone, _demoTourClose, _tourActivateVtab, startDemoTour: startDemoTour2, resumeDemoTour, api: api2, projectApi: projectApi2, loadServerConfig, _armAccountSwitchWatch, _refreshOnFocus, _checkAccountSwitch, _showAccountSwitchBanner, updateGitHubConnectionIndicator, _updateConnectionIndicator, checkGitStatus, _doRestart, loadConfig, loadProjects, openTab, closeTab, saveTabs, renderTabs, _makeTabEl, _openTabMenu, _setProjectIcon, _renameProject, _deleteProject, activateTab, buildTabBody, scheduleLiveRefresh, initLiveAutoRefresh, loadLiveTab, refreshLiveTab, wireSprintAddEnter: wireSprintAddEnter2, sprintAction, sprintPushPrompt, sprintFeedback, sprintFeedbackNote, sprintItemEdit, addSprintItemFromInput: addSprintItemFromInput2, cacheMostRecentSession, renderLiveSessions, endLiveSession, openTimelineForSession, renderLiveQueue, addLiveTask, cancelLiveTask, showCopyPreview, wireClaudeLaunchPanel, stampHandoffTs, populateSessionDropdown, loadTimeline: loadTimeline2, _renderTimelineLog: _renderTimelineLog2, loadDocsTab, normalizeNotifyTarget, displayNotifyTarget: displayNotifyTarget2, osExecutorHintBanner: osExecutorHintBanner2, showFailoverBannerIfNeeded, suggestNtfyTopic, loadHitlTab, loadTeamTab, updateLiveFeed, loadRecentSessions, loadMilestones, loadRecentRuns, loadQueue, renderSearchResults: renderSearchResults2, wireQueueSectionToggles, refreshTab, refreshGoal, parseDecisionsBlob, renderConstitutionWarning: renderConstitutionWarning2, _hitlBadgeClick, initHitlPanel, setVtabCountBadge: setVtabCountBadge2, refreshProjectCountBadges, refreshHitl, _hitlAnswer, _hitlDismiss, loadPinnedDecisions, supersedePinnedDecision, addPinnedDecision, consolidateDecisions, renderDecisionsTable, wireGoalPreviewToggle, saveGoal, saveNorthStar, saveSprint, _sessionPresenceDot, refreshSessions, refreshTasks, renderTasks, _loadMoreTasks, renderTaskRow, deleteTaskRow, renderHitlRow, wireHitlRow, appendToGoal, hitlReply, hitlExecute, connectWs, handleWsEvent, restoreTabs, _deleteSprintItem, _sprintAction, completeSprintItem, failSprintItem, toggleExpand, state });
+    Object.assign(window, { hideHostedAdminControls, ensureSignOutLink: ensureSignOutLink2, ensureWorkspaceSwitcher: ensureWorkspaceSwitcher2, showConnectDbModal, showLocalServerControls, _summarizeApiErrorText, _projectLoadErrorInfo, wireProjectLoadRetry: wireProjectLoadRetry2, renderProjectLoadError: renderProjectLoadError2, recordProjectLoadError, clearProjectLoadError, renderProjectLoadAlert, retryProjectSurface, syncSidebarActiveProject, autosizeGoalField, githubIconSvg: githubIconSvg2, getConstitutionLimit, loadProjectSettings: loadProjectSettings2, saveProjectSettings: saveProjectSettings2, _demoTourDone: _demoTourDone2, _demoTourSavedStep: _demoTourSavedStep2, _demoTourSaveStep, _demoTourMarkDone, _demoTourClose, _tourActivateVtab, startDemoTour: startDemoTour2, resumeDemoTour, api: api2, projectApi: projectApi2, loadServerConfig, _armAccountSwitchWatch, _refreshOnFocus, _checkAccountSwitch, _showAccountSwitchBanner, updateGitHubConnectionIndicator, _updateConnectionIndicator, checkGitStatus, _doRestart, loadConfig, loadProjects, openTab, closeTab, saveTabs, renderTabs, _makeTabEl, _openTabMenu, _setProjectIcon, _renameProject, _deleteProject, activateTab, buildTabBody, scheduleLiveRefresh, initLiveAutoRefresh, loadLiveTab, refreshLiveTab, wireSprintAddEnter: wireSprintAddEnter2, sprintAction, sprintArchive, filterBackburner, sprintPushPrompt, sprintFeedback, sprintFeedbackNote, sprintItemEdit, addSprintItemFromInput: addSprintItemFromInput2, cacheMostRecentSession, renderLiveSessions, endLiveSession, openTimelineForSession, renderLiveQueue, addLiveTask, cancelLiveTask, showCopyPreview, wireClaudeLaunchPanel, stampHandoffTs, populateSessionDropdown, loadTimeline: loadTimeline2, _renderTimelineLog: _renderTimelineLog2, loadDocsTab, normalizeNotifyTarget, displayNotifyTarget: displayNotifyTarget2, osExecutorHintBanner: osExecutorHintBanner2, showFailoverBannerIfNeeded, suggestNtfyTopic, loadHitlTab, loadTeamTab, updateLiveFeed, loadRecentSessions, loadMilestones, loadRecentRuns, loadQueue, renderSearchResults: renderSearchResults2, wireQueueSectionToggles, refreshTab, refreshGoal, parseDecisionsBlob, renderConstitutionWarning: renderConstitutionWarning2, _hitlBadgeClick, initHitlPanel, setVtabCountBadge: setVtabCountBadge2, refreshProjectCountBadges, refreshHitl, _hitlAnswer, _hitlDismiss, loadPinnedDecisions, supersedePinnedDecision, addPinnedDecision, consolidateDecisions, renderDecisionsTable, wireGoalPreviewToggle, saveGoal, saveNorthStar, saveSprint, _sessionPresenceDot, refreshSessions, refreshTasks, renderTasks, _loadMoreTasks, renderTaskRow, deleteTaskRow, renderHitlRow, wireHitlRow, appendToGoal, hitlReply, hitlExecute, connectWs, handleWsEvent, restoreTabs, _deleteSprintItem, _sprintAction, completeSprintItem, failSprintItem, toggleExpand, state });
   } catch (e) {
   }
 })();
