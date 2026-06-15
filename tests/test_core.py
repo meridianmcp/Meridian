@@ -8576,6 +8576,58 @@ async def test_answer_hitl_and_dismiss_hitl(db):
 
 
 @pytest.mark.asyncio
+async def test_request_hitl_mcp_dual_channel_fields(db):
+    """501cc9e8 — request_hitl MCP dispatch returns chat_prompt and poll_instruction
+    for blocking urgency so Claude Code can surface the question inline."""
+    import meridian.server as srv
+
+    project = await db_module.create_project(db, "hitl-dual-ch")
+    pid = project["id"]
+
+    # Blocking HITL with options → both fields present
+    result = await srv._dispatch_mcp_tool(
+        "request_hitl",
+        {
+            "project_id": pid,
+            "question": "Deploy to prod?",
+            "urgency": "blocking",
+            "options": ["Yes, deploy", "No, hold"],
+            "recommended": "No, hold",
+        },
+        db, "/tmp",
+    )
+    assert result["status"] == "pending"
+    assert "chat_prompt" in result
+    assert "Deploy to prod?" in result["chat_prompt"]
+    assert "BLOCKING" in result["chat_prompt"]
+    assert "No, hold (recommended)" in result["chat_prompt"]
+    assert result["id"] in result["chat_prompt"]
+    assert "poll_instruction" in result
+    assert result["id"] in result["poll_instruction"]
+    assert "answer_hitl" in result["poll_instruction"]
+
+    # Normal urgency → chat_prompt present, but no poll_instruction
+    result2 = await srv._dispatch_mcp_tool(
+        "request_hitl",
+        {"project_id": pid, "question": "FYI: build started", "urgency": "normal"},
+        db, "/tmp",
+    )
+    assert "chat_prompt" in result2
+    assert "poll_instruction" not in result2
+
+    # Auto-answered → no chat_prompt added (status != 'pending')
+    await db_module.update_project_settings(db, pid, hitl_auto_answer=1)
+    result3 = await srv._dispatch_mcp_tool(
+        "request_hitl",
+        {"project_id": pid, "question": "Should we proceed?", "urgency": "normal"},
+        db, "/tmp",
+    )
+    assert result3.get("answered_by") == "auto"
+    assert result3.get("status") == "answered"
+    assert "chat_prompt" not in result3
+
+
+@pytest.mark.asyncio
 async def test_add_and_get_sprint_notes(db):
     """add_session_note / get_session_notes round-trip correctly."""
     project = await db_module.create_project(db, "sprint-notes-test")

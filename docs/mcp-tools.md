@@ -273,7 +273,7 @@ get_pinned_decisions(project_id="abc-123")
 ## Human-in-the-loop (HITL)
 
 ### `request_hitl`
-Surface a question to the human queue. `urgency='blocking'` pauses the session until answered — poll `get_hitl_request` to resume. `normal`/`high` land in the dashboard without blocking.
+Surface a question to the human queue. Response includes `chat_prompt` (question + options formatted for inline display) and, when `urgency='blocking'`, a `poll_instruction`. Dual-channel: filed in the dashboard AND shown in Claude Code chat — first answer wins. For blocking: display `chat_prompt` to the user, then poll `get_hitl_request(request_id)` every 30 s. If the user answers in chat, call `answer_hitl(request_id, answer)`. `normal`/`high` land in the dashboard without blocking the session.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -306,6 +306,28 @@ Read-only: Poll a HITL request for the human's answer. Returns the row including
 ```
 get_hitl_request(request_id="hitl-uuid")
 ```
+
+---
+
+
+### `answer_hitl`
+Answer a pending HITL request programmatically. Marks it answered so the waiting session can resume. Use when the human answers in Claude Code chat rather than the dashboard.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `request_id` | string | required |  |
+| `answer` | string | required |  |
+| `answered_by` | string | optional | Optional human_id of the answerer. |
+
+---
+
+
+### `dismiss_hitl`
+Dismiss a HITL request (won't-answer / no longer relevant).
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `request_id` | string | required |  |
 
 ---
 

@@ -3001,6 +3001,10 @@ The 5 tools you use 90% of the time:
   log_task()            ← after any meaningful work
   pin_decision()        ← for architectural choices
   request_hitl()        ← when you need a human call
+                           If urgency='blocking': display the returned `chat_prompt`
+                           to the user, then poll get_hitl_request(request_id) every
+                           30 s. If the user answers in chat, call answer_hitl(). First
+                           answer (dashboard or chat) unblocks you.
   checkpoint()          ← before ending / before context fills
 
 ## Auto-hooks (recommended)
@@ -3111,11 +3115,20 @@ async def mcp_tools_doc() -> str:
     lines += _render_tool("get_pinned_decisions")
     lines += ["## Human-in-the-loop (HITL)\n"]
     lines += _render_tool("request_hitl",
-        "Surface a question to the human queue. `urgency='blocking'` pauses the session until answered — poll "
-        "`get_hitl_request` to resume. `normal`/`high` land in the dashboard without blocking.")
+        "Surface a question to the human queue. Response includes `chat_prompt` (question + options "
+        "formatted for inline display) and, when `urgency='blocking'`, a `poll_instruction`. "
+        "Dual-channel: filed in the dashboard AND shown in Claude Code chat — first answer wins. "
+        "For blocking: display `chat_prompt` to the user, then poll `get_hitl_request(request_id)` "
+        "every 30 s. If the user answers in chat, call `answer_hitl(request_id, answer)`. "
+        "`normal`/`high` land in the dashboard without blocking the session.")
     lines += _render_tool("get_hitl_request",
         "Read-only: Poll a HITL request for the human's answer. Returns the row including `status` "
         "(`pending`/`answered`/`dismissed`) and `answer` text.")
+    lines += _render_tool("answer_hitl",
+        "Answer a pending HITL request programmatically. Marks it answered so the waiting session "
+        "can resume. Use when the human answers in Claude Code chat rather than the dashboard.")
+    lines += _render_tool("dismiss_hitl",
+        "Dismiss a HITL request (won't-answer / no longer relevant).")
     lines += ["## Handoff & context\n"]
     lines += _render_tool("generate_handoff",
         "Read-only: Generate a context handoff document. `mode='full'` writes the complete L0/L1/L2 handoff. `mode='delta'` "

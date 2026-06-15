@@ -989,7 +989,41 @@ async def _dispatch_mcp_tool(
                 tenant=tenant,
                 pref_key="hitl",
             )
-        return result
+        # Dual-channel: enrich response so Claude Code displays the question inline.
+        # The auto-answer short-circuit above already returned if answered_by='auto'.
+        _dc_result = dict(result)
+        if _dc_result.get("status") == "pending":
+            _dc_q = _dc_result.get("question", "")
+            _dc_urg = _dc_result.get("urgency", "normal")
+            _dc_rid = _dc_result.get("id", "")
+            _dc_opts: list[str] = []
+            _dc_rec: str | None = None
+            try:
+                _dc_pl = json.loads(_dc_result.get("payload") or "{}")
+                _dc_opts = _dc_pl.get("options") or []
+                _dc_rec = _dc_pl.get("recommended")
+            except (TypeError, ValueError):
+                pass
+            _opts_text = ""
+            if _dc_opts:
+                _opts_text = "\n\nOptions:\n" + "\n".join(
+                    f"  {i + 1}. {o}" + (" (recommended)" if o == _dc_rec else "")
+                    for i, o in enumerate(_dc_opts)
+                )
+            _dc_result["chat_prompt"] = (
+                f"[HITL {_dc_urg.upper()}] {_dc_q}{_opts_text}\n\n"
+                f"Filed in Meridian dashboard AND shown here — first answer wins.\n"
+                f"HITL ID: {_dc_rid}"
+            )
+            if _dc_urg == "blocking":
+                _dc_result["poll_instruction"] = (
+                    f"Show the question above to the user now. Then poll "
+                    f"get_hitl_request(request_id='{_dc_rid}') every 30 s. "
+                    f"If the user answers here in chat, call "
+                    f"answer_hitl(request_id='{_dc_rid}', answer='<their reply>'). "
+                    f"Whichever arrives first (dashboard or chat) unblocks you."
+                )
+        return _dc_result
     if name == "get_hitl_request":
         result = await db_module.get_hitl_request(db, args["request_id"])
         if result is None:
