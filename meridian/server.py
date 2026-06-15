@@ -3607,6 +3607,13 @@ async def _start_session_composite(
         _c_agent = await db_module.get_agent_instructions(db, project_id)
         if _c_agent:
             _c_payload["agent_instructions"] = _c_agent
+        # File conflict warnings must surface in compact mode — an executor that
+        # misses them will silently overwrite another session's uncommitted work.
+        _c_file_warnings = await db_module.get_file_conflict_warnings(
+            db, project_id, session["id"]
+        )
+        if _c_file_warnings:
+            _c_payload["file_warnings"] = _c_file_warnings
         return _c_payload
 
     await _expire_and_generate_handoffs(db, data_dir)
