@@ -41,12 +41,13 @@ PROJECT_ID=your-project-id-here
 
 ALWAYS at session start:
 - Call `start_session(project_id="PROJECT_ID", session_name="describe-what-youre-doing")`
+- If the response contains pending sprint items, immediately call `claim_sprint_item` on the first unclaimed one and start working. Do NOT ask "what would you like to work on?" when there are pending items.
 
 ALWAYS during work:
 - Call `log_task(session_id, project_id, description)` after completing meaningful work.
 - Call `pin_decision(project_id, title, body, category)` for architectural choices.
 - Call `request_hitl(project_id, question)` when you need a human decision.
-- After completing each sprint item, call `get_sprint_items(status='pending')` to check for newly added items before moving to the next one. New items added mid-run get picked up at the next item boundary.
+- After completing each sprint item, call `get_sprint_progress(project_id=..., session_id=...)` (pass session_id) before claiming the next one. The `board_change` field reports items injected mid-run — pick them up at the item boundary. Never use `get_sprint_items` for this; it returns a huge payload with no board_change.
 
 ALWAYS before ending:
 - Call `checkpoint(session_id, project_id)` — snapshots progress, generates delta handoff.
@@ -65,23 +66,21 @@ ALWAYS before ending:
 
 ---
 
-## Python scripting — use pixi run python, not PowerShell
+## Python scripting
 
-For any scripting, JSON parsing, or data processing, PREFER Python over PowerShell:
+For **stdlib-only** one-liners (secrets, JSON, base64, file ops — no Meridian deps):
+- **Windows:** `py -c "import secrets; print(secrets.token_hex(32))"`
+- **Linux/Mac:** `python3 -c "import secrets; print(secrets.token_hex(32))"`
 
+`py` is the native Windows Python launcher — always on PATH, starts instantly, no virtualenv overhead.
+
+For scripts that need **Meridian deps** (psycopg3, cryptography, etc), use `pixi run python`:
 ```bash
-# PREFERRED
 pixi run python -c "import json; d=json.load(open('f.json')); print(d['key'])"
 pixi run python scripts/whatever.py
-
-# PowerShell only for: git, pixi tasks, file path ops
-git add ...; git commit -m "..."
-pixi run test-fast
 ```
 
 **Why:** PowerShell string escaping is fragile — single/double quote nesting, here-strings, and `iex` encoding cause constant parse errors. Python is more predictable for any logic beyond simple file ops.
-
-**Python is NOT on PATH directly** — always use `pixi run python`, never `python` or `python3` bare.
 
 ---
 

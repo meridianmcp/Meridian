@@ -3451,8 +3451,20 @@ async def _start_session_composite(
             _st = _it.get("status") or "pending"
             _c_counts[_st] = _c_counts.get(_st, 0) + 1
         _c_started = str(session.get("created_at") or "")
-        _c_board_change = sum(
+        _c_board_change_n = sum(
             1 for _it in _c_items if (_it.get("added_at") or "") > _c_started
+        )
+        _c_board_change: int | dict[str, Any] = (
+            {
+                "new_items_since_session_start": _c_board_change_n,
+                "message": (
+                    f"{_c_board_change_n} new sprint item"
+                    f"{'s' if _c_board_change_n != 1 else ''} already in queue — "
+                    "call get_sprint_progress(project_id, session_id) now to see them."
+                ),
+            }
+            if _c_board_change_n > 0
+            else 0
         )
         _c_sprint = (goal or {}).get("sprint") if goal else None
         _c_payload = {

@@ -50,6 +50,7 @@ running `create_project(name="your-project")`.
 ALWAYS at session start:
 - Call `start_session(project_id="PROJECT_ID", session_name="describe-what-youre-doing")`
 - This returns the goal, recent tasks, pending sprint items, and active sessions in one call.
+- If the response contains pending sprint items, immediately call `claim_sprint_item` on the first unclaimed one and start working. Do NOT ask "what would you like to work on?" when there are pending items.
 
 ALWAYS during work:
 - Call `log_task(session_id, project_id, description)` after completing meaningful work.
@@ -89,6 +90,17 @@ When `claim_sprint_item()` returns `worktree_suggested: true`, use the provided 
 ```
 
 Enable worktree mode project-wide via `set_executor_config(isolation="worktree")`.
+
+---
+
+## Python one-liners
+
+For stdlib-only scripts (secret generation, JSON parsing, base64, file ops):
+- **Windows:** `py -c "import secrets; print(secrets.token_hex(32))"`
+- **Linux/Mac:** `python3 -c "import secrets; print(secrets.token_hex(32))"`
+
+Use `pixi run python` only when Meridian deps are needed (psycopg3, cryptography, etc).
+Never use PowerShell for logic that Python handles cleanly.
 
 ---
 
@@ -147,7 +159,7 @@ your project context on start and snapshots progress on end.
 - **NEVER run hooks.ps1 or hooks.sh**: These are user-facing installers. Running them generates a new API token and invalidates the human's active Claude Code session. Never run `irm hooks.ps1 | iex` or `bash hooks.sh` during a sprint.
 - **Demo write protection**: Adding a new write endpoint requires NO demo exception — the middleware in `server.py` handles it globally. When adding a new write UI element, add it to the `hideDemoAdminControls()` selector list in `dashboard.js`.
 - **Set display name**: Settings → Account & Workspace → Workspace → "Your display name" → Adam
-- **Mid-run sprint item pickup**: After completing each sprint item, call `get_sprint_items(status='pending')` to check for newly added items before moving to the next one. New items added to the board mid-run get picked up automatically at the next item boundary.
+- **Mid-run sprint item pickup**: After completing each sprint item, call `get_sprint_progress(project_id=..., session_id=...)` (pass session_id) before claiming the next one. The `board_change` field reports items a planner injected since this session started — pick them up at the item boundary. Never call `get_sprint_items` for this; it returns a huge payload with no board_change.
 
 ---
 ## Meridian-managed notes
@@ -158,7 +170,7 @@ your project context on start and snapshots progress on end.
 
 ---
 <!-- MERIDIAN STATE — auto-generated, do not edit below -->
-## Current Sprint State  _(auto-updated 2026-06-15 01:37 UTC)_
+## Current Sprint State  _(auto-updated 2026-06-15 19:09 UTC)_
 
 **Key Files:**
 - `meridian/server.py` — FastAPI app + MCP handlers
