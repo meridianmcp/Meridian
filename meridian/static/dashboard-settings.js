@@ -37,6 +37,47 @@ function _applySettingsRoleVisibility(projectId, guest) {
   });
 }
 
+// e21fc91a — collapse the Meridian Connect install options to the visitor's OS,
+// with a "show other platforms" toggle. Runs post-render over the hooks-install-*
+// blocks so it covers every Connect section without touching the templates.
+function _detectClientOS() {
+  const ua = (navigator.userAgent || navigator.platform || '').toLowerCase();
+  return ua.includes('win') ? 'windows' : 'unix';
+}
+
+function _collapseConnectPlatforms(projectId) {
+  const body = document.getElementById(`settings-body-${projectId}`);
+  if (!body) return;
+  const os = _detectClientOS();
+  const grids = new Set();
+  body.querySelectorAll('pre[id^="hooks-install-"]').forEach(pre => {
+    const platform = pre.id.includes('-windows-') ? 'windows' : 'unix';
+    const wrap = pre.parentElement;
+    if (!wrap) return;
+    wrap.dataset.connectPlatform = platform;
+    wrap.style.display = (platform === os) ? '' : 'none';
+    if (wrap.parentElement) grids.add(wrap.parentElement);
+  });
+  grids.forEach(grid => {
+    if (grid.parentElement && grid.parentElement.querySelector('.connect-os-toggle')) return;
+    const link = document.createElement('a');
+    link.href = '#';
+    link.className = 'connect-os-toggle';
+    link.textContent = 'Show other platforms';
+    link.style.cssText = 'display:inline-block;margin:2px 0 6px;font-size:10px;color:var(--accent);text-decoration:none;cursor:pointer';
+    link.onclick = (e) => {
+      e.preventDefault();
+      const expanded = link.dataset.expanded === '1';
+      grid.querySelectorAll('[data-connect-platform]').forEach(el => {
+        el.style.display = expanded ? (el.dataset.connectPlatform === os ? '' : 'none') : '';
+      });
+      link.dataset.expanded = expanded ? '' : '1';
+      link.textContent = expanded ? 'Show other platforms' : 'Show detected platform only';
+    };
+    grid.insertAdjacentElement('afterend', link);
+  });
+}
+
 export async function loadSettingsTab(projectId) {
 
   const body = document.getElementById(`settings-body-${projectId}`);
@@ -2976,6 +3017,8 @@ export async function loadSettingsTab(projectId) {
   }
 
   _applySettingsRoleVisibility(projectId, _guest);
+
+  _collapseConnectPlatforms(projectId);
 
   if (isDemoMode()) hideDemoAdminControls();
 

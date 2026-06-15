@@ -6412,7 +6412,11 @@ async function loadDocsTab(projectId) {
 
     }
 
-    body.innerHTML = html;
+    const _toolSearch = `<div style="position:sticky;top:0;background:var(--surface-1,#10131a);padding:0 0 8px;margin-bottom:6px;z-index:2"><input type="text" id="docs-search-${projectId}" placeholder="Search tools by name or description…" style="width:100%;box-sizing:border-box;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;color:var(--text);font-size:12px;font-family:var(--font-mono);padding:5px 9px;outline:none"></div>`;
+
+    body.innerHTML = _toolSearch + html;
+
+    _wireTabSearch(`docs-search-${projectId}`, `docs-body-${projectId}`, '.tool-entry');
 
   } catch (e) {
 

@@ -1108,7 +1108,7 @@
       return `<tr><td style="color:var(--text);padding:2px 10px 2px 0">${escapeHtml(name)}</td><td style="color:var(--muted);padding:2px 10px 2px 0">${type}</td><td style="color:var(--muted);padding:2px 10px 2px 0;font-style:italic">${req}</td><td style="color:var(--muted);padding:2px 0">${desc}</td></tr>`;
     }).join("");
     const signature = Object.keys(props).map((n) => required.has(n) ? n : `${n}?`).join(", ");
-    return `<div style="margin-bottom:12px"><div style="color:var(--text);font-weight:600">${escapeHtml(tool.name)}(<span style="color:var(--muted)">${escapeHtml(signature)}</span>)</div><div style="color:var(--muted);margin:3px 0 4px 0;font-size:10.5px">${escapeHtml(tool.description || "")}</div>${params ? `<table style="font-size:10px;border-collapse:collapse;width:100%">${params}</table>` : ""}</div>`;
+    return `<div class="tool-entry" data-search="${escapeHtml((tool.name || "") + " " + (tool.description || ""))}" style="margin-bottom:14px"><div style="color:var(--text);font-weight:600;font-size:13px">${escapeHtml(tool.name)}(<span style="color:var(--muted);font-weight:400">${escapeHtml(signature)}</span>)</div><div style="color:var(--muted);margin:3px 0 5px 0;font-size:12px;line-height:1.45">${escapeHtml(tool.description || "")}</div>${params ? `<table style="font-size:11px;border-collapse:collapse;width:100%">${params}</table>` : ""}</div>`;
   }
   try {
     Object.assign(window, { _renderToolEntry: _renderToolEntry2 });
@@ -1711,6 +1711,42 @@
     if (inviteForm) inviteForm.style.display = "none";
     body.querySelectorAll("button").forEach((b) => {
       if (/^save\b/i.test((b.textContent || "").trim())) b.style.display = "none";
+    });
+  }
+  function _detectClientOS() {
+    const ua = (navigator.userAgent || navigator.platform || "").toLowerCase();
+    return ua.includes("win") ? "windows" : "unix";
+  }
+  function _collapseConnectPlatforms(projectId) {
+    const body = document.getElementById(`settings-body-${projectId}`);
+    if (!body) return;
+    const os = _detectClientOS();
+    const grids = /* @__PURE__ */ new Set();
+    body.querySelectorAll('pre[id^="hooks-install-"]').forEach((pre) => {
+      const platform = pre.id.includes("-windows-") ? "windows" : "unix";
+      const wrap = pre.parentElement;
+      if (!wrap) return;
+      wrap.dataset.connectPlatform = platform;
+      wrap.style.display = platform === os ? "" : "none";
+      if (wrap.parentElement) grids.add(wrap.parentElement);
+    });
+    grids.forEach((grid) => {
+      if (grid.parentElement && grid.parentElement.querySelector(".connect-os-toggle")) return;
+      const link = document.createElement("a");
+      link.href = "#";
+      link.className = "connect-os-toggle";
+      link.textContent = "Show other platforms";
+      link.style.cssText = "display:inline-block;margin:2px 0 6px;font-size:10px;color:var(--accent);text-decoration:none;cursor:pointer";
+      link.onclick = (e) => {
+        e.preventDefault();
+        const expanded = link.dataset.expanded === "1";
+        grid.querySelectorAll("[data-connect-platform]").forEach((el) => {
+          el.style.display = expanded ? el.dataset.connectPlatform === os ? "" : "none" : "";
+        });
+        link.dataset.expanded = expanded ? "" : "1";
+        link.textContent = expanded ? "Show other platforms" : "Show detected platform only";
+      };
+      grid.insertAdjacentElement("afterend", link);
     });
   }
   async function loadSettingsTab2(projectId) {
@@ -3800,6 +3836,7 @@ project_id = "${displayPid}"`;
         return;
       }
       _applySettingsRoleVisibility(projectId, _guest);
+      _collapseConnectPlatforms(projectId);
       if (isDemoMode()) hideDemoAdminControls();
       setTimeout(() => {
         const titleIn = document.getElementById("blog-title");
@@ -8937,7 +8974,9 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
         });
         html += "</div>";
       }
-      body.innerHTML = html;
+      const _toolSearch = `<div style="position:sticky;top:0;background:var(--surface-1,#10131a);padding:0 0 8px;margin-bottom:6px;z-index:2"><input type="text" id="docs-search-${projectId}" placeholder="Search tools by name or description\u2026" style="width:100%;box-sizing:border-box;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;color:var(--text);font-size:12px;font-family:var(--font-mono);padding:5px 9px;outline:none"></div>`;
+      body.innerHTML = _toolSearch + html;
+      _wireTabSearch(`docs-search-${projectId}`, `docs-body-${projectId}`, ".tool-entry");
     } catch (e) {
       body.innerHTML = `<div style="color:var(--error)">Failed to load tools: ${escapeHtml(String(e))}</div>`;
     }
