@@ -6527,6 +6527,23 @@ async def accept_workspace_invite(
     return _row_to_dict(row)
 
 
+async def get_pending_invites_for_email(
+    db: aiosqlite.Connection,
+    email: str,
+) -> list[dict[str, Any]]:
+    """Return all pending workspace_members rows for email (joined_at IS NULL).
+
+    Used at OAuth login to auto-accept invites sent before the user had an
+    account (fbbe99af fallback).
+    """
+    async with db.execute(
+        "SELECT * FROM workspace_members WHERE LOWER(email) = LOWER(?) AND joined_at IS NULL",
+        (email,),
+    ) as cur:
+        rows = await cur.fetchall()
+    return [r for r in (_row_to_dict(row) for row in rows) if r]
+
+
 async def resolve_member_role(
     db: aiosqlite.Connection,
     tenant_id: str,
