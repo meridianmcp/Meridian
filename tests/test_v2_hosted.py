@@ -543,7 +543,7 @@ def test_remote_mcp_initialize_with_valid_token(client):
 
 def test_remote_mcp_initialize_with_valid_oauth_token_from_db(client):
     """POST /mcp accepts OAuth bearer tokens reloaded from the auth DB."""
-    from meridian import server as server_module
+    from meridian.routes import oauth as oauth_module
 
     async def _setup():
         db = client.app.state.db
@@ -554,7 +554,7 @@ def test_remote_mcp_initialize_with_valid_oauth_token_from_db(client):
             (token_hash, None, "claude-ai", int(time.time()) + 3600),
         )
         await db.commit()
-        server_module._oa_tokens.clear()
+        oauth_module._oa_tokens.clear()
         return raw_token, token_hash
 
     raw_token, token_hash = _run(_setup())
@@ -574,7 +574,7 @@ def test_remote_mcp_initialize_with_valid_oauth_token_from_db(client):
     assert r.status_code == 200
     body = r.json()
     assert body["result"]["protocolVersion"] == "2025-03-26"
-    assert token_hash in server_module._oa_tokens
+    assert token_hash in oauth_module._oa_tokens
 
 
 def test_remote_mcp_tools_list_returns_full_tool_surface(client):

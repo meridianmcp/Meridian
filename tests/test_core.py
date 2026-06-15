@@ -9805,9 +9805,9 @@ def test_pkce_expired_code_rejected(client):
     code = dict(urllib.parse.parse_qsl(urllib.parse.urlparse(r.headers["location"]).query))["code"]
 
     # Expire the in-memory code entry
-    from meridian import server as srv
-    if code in srv._oa_codes:
-        srv._oa_codes[code]["exp"] = time.time() - 1
+    from meridian.routes import oauth as oa_mod
+    if code in oa_mod._oa_codes:
+        oa_mod._oa_codes[code]["exp"] = time.time() - 1
 
     # Also expire the DB entry by setting expires_at in the past
     async def _expire_db():
