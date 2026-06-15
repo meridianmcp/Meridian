@@ -10548,6 +10548,13 @@ async function restoreTabs() {
 
   if (isHostedMode()) hideHostedAdminControls();
 
+  // abd58a10 — render the workspace switcher independently of _renderPlanBadge.
+  // It used to be reached only at the tail of _renderPlanBadge(me), so any /me
+  // hiccup (slow, empty, missing plan) silently dropped the switcher for invited
+  // members. Calling it directly here guarantees it appears whenever the user
+  // belongs to ≥2 workspaces. ensureWorkspaceSwitcher() is idempotent.
+  if (isHostedMode() && !isDemoMode()) ensureWorkspaceSwitcher();
+
   showLocalServerControls();
 
   ensureTourButton();

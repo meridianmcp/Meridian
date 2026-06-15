@@ -11141,6 +11141,7 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
     }
     if (isDemoMode()) hideDemoAdminControls();
     if (isHostedMode()) hideHostedAdminControls();
+    if (isHostedMode() && !isDemoMode()) ensureWorkspaceSwitcher2();
     showLocalServerControls();
     ensureTourButton();
     ensureFeedbackButton();
