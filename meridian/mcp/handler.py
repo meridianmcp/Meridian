@@ -686,6 +686,30 @@ async def _board_change_for_session(
         return None
 
 
+_HOTSPOT_RULES: tuple[tuple[frozenset[str], str], ...] = (
+    (frozenset({"server", "route", "api", "endpoint", "fastapi", "lifespan", "oauth"}), "meridian/server.py"),
+    (frozenset({"dashboard", "ui", "frontend", "javascript", "css", "button", "tab", "panel"}), "meridian/static/dashboard.js"),
+    (frozenset({"db", "database", "schema", "migration", "query", "sql", "table", "column"}), "meridian/db/__init__.py"),
+    (frozenset({"mcp", "tool", "handler", "dispatch", "stdio"}), "meridian/mcp/handler.py"),
+    (frozenset({"pg", "postgres", "postgresql", "neon", "adapter"}), "meridian/pg_adapter.py"),
+    (frozenset({"claude.md", "agents.md", "meridian.md", "docs", "instructions", "rules"}), "CLAUDE.md"),
+)
+
+
+def _suggest_files_for_title(title: str) -> list[str]:
+    """Return hotspot files likely touched by a sprint item based on its title keywords.
+
+    Each hotspot fires when at least one keyword matches a word in the title.
+    (f5726fd0)
+    """
+    words = frozenset(title.lower().split())
+    suggested: list[str] = []
+    for keywords, path in _HOTSPOT_RULES:
+        if words & keywords:
+            suggested.append(path)
+    return suggested
+
+
 async def _unclaimed_file_warnings(
     db: Any,
     session_id: str,
@@ -1629,6 +1653,12 @@ async def _dispatch_mcp_tool(
         if _bc_claim:
             item = dict(item)
             item["board_change"] = _bc_claim
+
+        # f5726fd0 — suggest files to claim based on item title keywords.
+        _sug = _suggest_files_for_title(item.get("title") or "")
+        if _sug:
+            item = dict(item)
+            item["suggested_files"] = _sug
 
         return item
     if name == "add_subtask":
