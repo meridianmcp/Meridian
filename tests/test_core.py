@@ -6941,6 +6941,33 @@ def test_oauth_dcr_includes_client_secret_expires_at(client):
     assert isinstance(body["client_secret_expires_at"], int)
 
 
+def test_workspace_accept_sets_pending_invite_cookie(client, monkeypatch):
+    """fbbe99af — /workspace/accept unauthenticated must set pending_invite_token cookie.
+
+    The ?next= URL alone drops the token when it contains a nested ?token= param.
+    The cookie survives the full OAuth provider redirect chain.
+    """
+    from meridian import hosted as hosted_module
+
+    monkeypatch.setenv("MERIDIAN_HOSTED", "true")
+
+    async def mock_no_auth(request):
+        from fastapi import HTTPException
+        raise HTTPException(status_code=401)
+
+    monkeypatch.setattr(hosted_module, "get_current_tenant", mock_no_auth)
+
+    r = client.get("/workspace/accept?token=test-invite-token-xyz", follow_redirects=False)
+    assert r.status_code == 302, f"Expected 302, got {r.status_code}"
+    loc = r.headers.get("location", "")
+    assert "/auth/login" in loc, f"Expected redirect to /auth/login, got {loc}"
+    # Token must be URL-encoded in the next param (not a raw ?token= that breaks parsing)
+    assert "pending_invite_token" not in loc, "Token must NOT be exposed in the URL"
+    # Cookie must be set
+    assert "pending_invite_token" in r.cookies, "pending_invite_token cookie must be set"
+    assert r.cookies["pending_invite_token"] == "test-invite-token-xyz"
+
+
 def test_landing_page_cache_control(client):
     """/ returns Cache-Control: no-cache, no-store so Cloudflare doesn't serve stale HTML."""
     r = client.get("/")

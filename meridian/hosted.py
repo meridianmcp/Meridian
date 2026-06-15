@@ -636,6 +636,30 @@ async def _auto_accept_pending_invites(db: Any, email: str) -> None:
         pass  # never block login on invite-accept failure
 
 
+async def _consume_pending_invite_cookie(request: Any, db: Any) -> str | None:
+    """fbbe99af — accept invite token stored in the pending_invite_token cookie.
+
+    /workspace/accept stores the token here before redirecting to OAuth so it
+    survives the provider redirect chain (the ?next= URL alone drops the token).
+    Returns "/dashboard" if an invite was found and accepted, None otherwise.
+    Caller must call response.delete_cookie("pending_invite_token") to clear it.
+    """
+    import hashlib
+    from . import db as db_module
+    token = request.cookies.get("pending_invite_token", "")
+    if not token:
+        return None
+    try:
+        token_hash = hashlib.sha256(token.encode()).hexdigest()
+        invite = await db_module.get_workspace_invite_by_token_hash(db, token_hash)
+        if invite:
+            await db_module.accept_workspace_invite(db, invite["id"])
+            return "/dashboard"
+    except Exception:
+        pass
+    return None
+
+
 async def auth_callback(request: Request) -> RedirectResponse:
     """Handle Google OAuth callback — upsert tenant, set session cookie."""
     from . import db as db_module
@@ -686,6 +710,11 @@ async def auth_callback(request: Request) -> RedirectResponse:
     # Safety: only allow local paths
     if not (_next_url.startswith("/") and not _next_url.startswith("//")):
         _next_url = ""
+    # fbbe99af — consume pending invite cookie (takes priority; clears token so
+    # the /workspace/accept redirect doesn't 404 on the already-accepted token)
+    _invite_url = await _consume_pending_invite_cookie(request, db)
+    if _invite_url:
+        _next_url = _invite_url
     redirect_to = await _post_login_redirect(tenant, db, next_url=_next_url)
     response = RedirectResponse(redirect_to, status_code=302)
     response.set_cookie(
@@ -697,6 +726,7 @@ async def auth_callback(request: Request) -> RedirectResponse:
         max_age=_SESSION_MAX_AGE_HOURS * 3600,
     )
     response.delete_cookie("meridian_demo")
+    response.delete_cookie("pending_invite_token")
     return response
 
 
@@ -778,6 +808,9 @@ async def auth_github_callback(request: Request) -> RedirectResponse:
     session = await db_module.create_user_session(db, tenant["id"], expires_at)
     cookie_value = _make_session_cookie(session["id"])
 
+    _invite_url = await _consume_pending_invite_cookie(request, db)
+    if _invite_url:
+        _next_url = _invite_url
     redirect_to = await _post_login_redirect(tenant, db, next_url=_next_url)
     response = RedirectResponse(redirect_to, status_code=302)
     response.set_cookie(
@@ -789,6 +822,7 @@ async def auth_github_callback(request: Request) -> RedirectResponse:
         max_age=_SESSION_MAX_AGE_HOURS * 3600,
     )
     response.delete_cookie("meridian_demo")
+    response.delete_cookie("pending_invite_token")
     return response
 
 
@@ -918,6 +952,9 @@ async def auth_microsoft_callback(request: Request) -> RedirectResponse:
     session = await db_module.create_user_session(db, tenant["id"], expires_at)
     cookie_value = _make_session_cookie(session["id"])
 
+    _invite_url = await _consume_pending_invite_cookie(request, db)
+    if _invite_url:
+        _next_url = _invite_url
     redirect_to = await _post_login_redirect(tenant, db, next_url=_next_url)
     response = RedirectResponse(redirect_to, status_code=302)
     response.set_cookie(
@@ -929,6 +966,7 @@ async def auth_microsoft_callback(request: Request) -> RedirectResponse:
         max_age=_SESSION_MAX_AGE_HOURS * 3600,
     )
     response.delete_cookie("meridian_demo")
+    response.delete_cookie("pending_invite_token")
     return response
 
 

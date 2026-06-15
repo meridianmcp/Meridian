@@ -2669,8 +2669,24 @@ async def workspace_accept(request: Request, token: str = "") -> HTMLResponse:
     except Exception:
         authenticated = False
     if not authenticated:
-        # Preserve the token across the login flow via ?next=
-        return _Redir(f"/auth/login?next=/workspace/accept?token={token}", status_code=302)
+        # fbbe99af — store token in a session cookie so it survives the OAuth
+        # redirect chain (the ?next= URL param alone drops the token because
+        # the ?token= is parsed as a top-level query param at intermediate hops).
+        from urllib.parse import quote as _q
+        _secure = os.environ.get("MERIDIAN_BASE_URL", "").startswith("https://")
+        _redir = _Redir(
+            f"/auth/login?next={_q(f'/workspace/accept?token={token}')}",
+            status_code=302,
+        )
+        _redir.set_cookie(
+            "pending_invite_token",
+            token,
+            httponly=True,
+            secure=_secure,
+            samesite="lax",
+            max_age=3600,
+        )
+        return _redir
     token_hash = hashlib.sha256(token.encode()).hexdigest()
     db = request.app.state.db
     invite = await db_module.get_workspace_invite_by_token_hash(db, token_hash)
