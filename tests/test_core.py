@@ -5400,6 +5400,20 @@ def test_pg_adapter_translates_datetime_interval_units():
     assert params == ["2", "lock-123"]
 
 
+def test_pg_adapter_translates_datetime_literal_interval():
+    """Rule 3b: datetime('now', 'literal') → PG interval expression (c02e89c4 fix)."""
+    from meridian.pg_adapter import _pg_adapt_sql
+
+    for literal in ("-1 day", "-10 minutes", "-24 hours"):
+        sql, params = _pg_adapt_sql(
+            f"SELECT * FROM t WHERE ts >= datetime('now', '{literal}')",
+            (),
+        )
+        assert "datetime('now'" not in sql, f"raw sqlite form left in SQL for '{literal}'"
+        assert "::interval" in sql
+        assert literal in sql
+
+
 @pytest.mark.asyncio
 async def test_run_pg_migrations_survives_a_failing_migration(caplog):
     """A single failing migration must NOT crash startup — it logs a WARNING
@@ -10836,3 +10850,16 @@ def test_blog_admin_requires_admin_when_hosted(monkeypatch, tmp_path):
     with TestClient(server_module.app) as c:
         # No auth → 403 (not authenticated / admin only).
         assert c.get("/admin/blog/posts").status_code == 403
+
+
+def test_pre_commit_hook_exists_and_has_patterns():
+    """hooks/pre-commit.sh must exist and contain the key credential patterns (d7913547)."""
+    from pathlib import Path
+    hook = Path(__file__).parent.parent / "hooks" / "pre-commit.sh"
+    assert hook.exists(), "hooks/pre-commit.sh missing"
+    content = hook.read_text(encoding="utf-8")
+    assert "postgresql://" in content
+    assert "npg_" in content
+    assert "sk_meridian_" in content
+    assert "git show" in content
+    assert "exit 1" in content
