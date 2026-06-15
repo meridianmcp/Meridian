@@ -620,6 +620,22 @@ async def _post_login_redirect(tenant: dict, db=None, next_url: str = "") -> str
     return "/waitlist-pending"
 
 
+async def _auto_accept_pending_invites(db: Any, email: str) -> None:
+    """fbbe99af fallback — auto-accept any pending workspace invites for email at login.
+
+    Invited users who sign in via OAuth before clicking the invite link land
+    here without an accepted membership row, locking them out of the workspace.
+    This accepts all pending rows so they get access immediately on login.
+    """
+    from . import db as db_module
+    try:
+        pending = await db_module.get_pending_invites_for_email(db, email)
+        for invite in pending:
+            await db_module.accept_workspace_invite(db, invite["id"])
+    except Exception:
+        pass  # never block login on invite-accept failure
+
+
 async def auth_callback(request: Request) -> RedirectResponse:
     """Handle Google OAuth callback — upsert tenant, set session cookie."""
     from . import db as db_module
@@ -640,6 +656,7 @@ async def auth_callback(request: Request) -> RedirectResponse:
 
     db = request.app.state.db
     tenant = await db_module.upsert_tenant(db, email=email, google_sub=sub)
+    await _auto_accept_pending_invites(db, email)
 
     # G5.22 — Skip auto-provisioning a Neon DB when the user has already
     # accepted an invite to someone else's workspace. Provisioning then
@@ -745,6 +762,7 @@ async def auth_github_callback(request: Request) -> RedirectResponse:
 
     db = request.app.state.db
     tenant = await db_module.upsert_tenant(db, email=email, github_sub=sub)
+    await _auto_accept_pending_invites(db, email)
 
     # G5.22 — same invite-aware skip as the Google callback. See the comment
     # in auth_callback for details.
@@ -892,6 +910,7 @@ async def auth_microsoft_callback(request: Request) -> RedirectResponse:
 
     db = request.app.state.db
     tenant = await db_module.upsert_tenant(db, email=email, microsoft_sub=sub)
+    await _auto_accept_pending_invites(db, email)
 
     expires_at = (
         datetime.now(timezone.utc) + timedelta(hours=_SESSION_MAX_AGE_HOURS)
