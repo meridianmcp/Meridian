@@ -4727,6 +4727,7 @@ async def _oauth_reg(request: Request):
     except Exception:
         pass  # in-memory fallback still works
     return JSONResponse({"client_id": cid, "client_secret": cs,
+        "client_secret_expires_at": 0,
         "redirect_uris": redirect_uris,
         "grant_types": ["authorization_code"],
         "token_endpoint_auth_method": "client_secret_post"}, status_code=201)

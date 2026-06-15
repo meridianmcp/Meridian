@@ -1506,6 +1506,25 @@ async def _migrate_pg_v25_notification_prefs(conn: PostgresConnection) -> None:
     )
 
 
+async def _migrate_pg_agent_instructions(conn: PostgresConnection) -> None:
+    """8a0c5a78 — projects.agent_instructions: per-project custom instructions
+    injected into start_session so every AI session picks them up automatically.
+    """
+    await conn.executescript(
+        "ALTER TABLE projects ADD COLUMN IF NOT EXISTS agent_instructions TEXT"
+    )
+
+
+async def _migrate_pg_note_kind(conn: PostgresConnection) -> None:
+    """9d44998b — project_notes.note_kind (wiki | insight | reference).
+
+    Nullable; the app treats NULL as 'wiki'. Existing rows are left untouched.
+    """
+    await conn.executescript(
+        "ALTER TABLE project_notes ADD COLUMN IF NOT EXISTS note_kind TEXT"
+    )
+
+
 async def _migrate_pg_v25_admins_table(conn: PostgresConnection) -> None:
     """v2.5 — create admins table and seed known admin emails.
 
@@ -1588,4 +1607,6 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_queued_session,
     _migrate_pg_parallel_safety,
     _migrate_pg_changelog_entries,
+    _migrate_pg_agent_instructions,
+    _migrate_pg_note_kind,
 )

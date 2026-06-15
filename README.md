@@ -235,3 +235,5 @@ For licensing questions: [hello@usemeridian.us](mailto:hello@usemeridian.us)
 ## Contributors
 
 Built by [@ajc3xc](https://github.com/ajc3xc)
+
+[![Add to Cursor](https://cursor.com/deeplink/mcp-install-badge.svg)](https://cursor.com/install-mcp?name=meridian&config=eyJ0eXBlIjoiaHR0cCIsInVybCI6Imh0dHBzOi8vdXNlbWVyaWRpYW4udXMvbWNwIiwiaGVhZGVycyI6eyJBdXRob3JpemF0aW9uIjoiQmVhcmVyIHNrX21lcmlkaWFuX1lPVVJfS0VZX0hFUkUifX0=)
