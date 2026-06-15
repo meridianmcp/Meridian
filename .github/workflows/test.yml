@@ -40,3 +40,12 @@ jobs:
         if: steps.playwright-cache.outputs.cache-hit != 'true'
         run: pixi run python -m playwright install chromium --with-deps
       - run: pixi run python -m pytest tests/test_demo_ux.py -q --tb=short
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install ruff
+        run: pip install ruff
+      - name: Lint (warn only — violations do not fail CI yet)
+        run: ruff check . || true
