@@ -586,7 +586,16 @@ async def _post_login_redirect(tenant: dict, db=None, next_url: str = "") -> str
                 if existing_membership is not None:
                     if next_url and next_url.startswith("/") and not next_url.startswith("//"):
                         return next_url
-                    return _cfg("MERIDIAN_AFTER_LOGIN_URL", "/dashboard")
+                    # 90de5ac9 — invited user with no own projects: send them
+                    # directly into the inviter's workspace by encoding the
+                    # owner's tenant_id in the redirect URL.  The dashboard JS
+                    # reads ?ws= on init and sets activeWorkspaceTenantId so
+                    # /projects returns the owner's project list immediately.
+                    owner_tid = existing_membership.get("tenant_id", "")
+                    base = _cfg("MERIDIAN_AFTER_LOGIN_URL", "/dashboard")
+                    if owner_tid:
+                        return f"{base}?ws={owner_tid}"
+                    return base
                 free_count = await db_module.count_tenants_by_plan(
                     db, "free", provisioned_only=True
                 )

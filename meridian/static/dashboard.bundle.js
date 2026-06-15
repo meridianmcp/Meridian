@@ -4776,13 +4776,13 @@ ${n.tags || ""}`.toLowerCase();
     });
     wrap.innerHTML = '<div style="color:var(--muted)">loading rewind\u2026</div>';
     try {
-      const [data, history, stats] = await Promise.all([
+      const [data, history2, stats] = await Promise.all([
         api(`/projects/${projectId}/rewind?days=${days}`),
         api(`/projects/${projectId}/goal-history`).catch(() => []),
         api(`/projects/${projectId}/stats?days=30`).catch(() => null)
       ]);
       const activeTab = p && p.rewindSubtab || "versions";
-      wrap.innerHTML = renderRewindSubtabs(projectId, data, history, stats, activeTab);
+      wrap.innerHTML = renderRewindSubtabs(projectId, data, history2, stats, activeTab);
       wrap.querySelectorAll(".rewind-subtab-btn").forEach((btn) => {
         btn.onclick = () => {
           const tab = btn.dataset.tab;
@@ -4799,7 +4799,7 @@ ${n.tags || ""}`.toLowerCase();
       wrap.innerHTML = `<div style="color:var(--status-failed)">rewind failed: ${escapeHtml(e.message)}</div>`;
     }
   }
-  function renderRewindSubtabs(projectId, data, history, stats, activeTab) {
+  function renderRewindSubtabs(projectId, data, history2, stats, activeTab) {
     const tabs = [
       { id: "versions", label: "\u{1F4E6} Milestones" },
       { id: "sprint", label: "\u26A1 Sprint items" },
@@ -4809,7 +4809,7 @@ ${n.tags || ""}`.toLowerCase();
     ];
     const tabBar = `<div class="rewind-subtab-bar">${tabs.map((t) => `<button class="rewind-subtab-btn${activeTab === t.id ? " active" : ""}" data-tab="${t.id}">${t.label}</button>`).join("")}</div>`;
     const make = (id, html) => `<div class="rewind-subtab-pane" data-tab="${id}" style="${activeTab === id ? "" : "display:none"}">${html}</div>`;
-    return tabBar + make("activity", renderRewindActivity(projectId, data)) + make("versions", renderRewindVersions(projectId, data)) + make("sprint", renderRewindSprint(projectId, data)) + make("goals", renderRewindGoals(projectId, data, history)) + make("charts", renderRewindCharts(projectId, stats));
+    return tabBar + make("activity", renderRewindActivity(projectId, data)) + make("versions", renderRewindVersions(projectId, data)) + make("sprint", renderRewindSprint(projectId, data)) + make("goals", renderRewindGoals(projectId, data, history2)) + make("charts", renderRewindCharts(projectId, stats));
   }
   function renderRewindCharts(projectId, stats) {
     if (!stats) {
@@ -5026,7 +5026,7 @@ ${n.tags || ""}`.toLowerCase();
   </section>`;
     return versions + sprints + summary;
   }
-  function renderRewindGoals(projectId, data, history) {
+  function renderRewindGoals(projectId, data, history2) {
     const preStyle = "margin:0;white-space:pre-wrap;word-break:break-word;background:var(--bg-card);padding:6px;border-radius:3px;font-size:10px;font-family:inherit";
     const goals = _rewindSec("\u{1F3AF}", "Goal changes", (data.goal_changes || []).slice().reverse(), (g, idx) => {
       const id = `gc-expand-${projectId}-${idx}`;
@@ -5055,8 +5055,8 @@ ${n.tags || ""}`.toLowerCase();
     </div>`;
     });
     let historyHtml = "";
-    if (history && history.length) {
-      const rows = [...history].reverse().map((v, idx) => {
+    if (history2 && history2.length) {
+      const rows = [...history2].reverse().map((v, idx) => {
         const id = `gv-expand-${projectId}-${idx}`;
         const raw = (v.version_goal || v.north_star || "").replace(/\s+/g, " ").trim();
         const snippet = raw.length > 80 ? raw.slice(0, 79) + "\u2026" : raw;
@@ -5094,7 +5094,7 @@ ${n.tags || ""}`.toLowerCase();
       });
       historyHtml = `<section style="margin-top:14px;padding-top:10px;border-top:1px solid var(--border)">
 
-      <div style="color:var(--accent);font-weight:600;margin-bottom:6px">\u{1F4DC} Goal version history (${history.length} versions, newest first)</div>
+      <div style="color:var(--accent);font-weight:600;margin-bottom:6px">\u{1F4DC} Goal version history (${history2.length} versions, newest first)</div>
 
       ${rows.join("")}
 
@@ -9180,8 +9180,8 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
         let goalMarkers = [];
         try {
           const windowStart = Date.now() - days * 86400 * 1e3;
-          const history = await api2(`/projects/${projectId}/goal-history`);
-          const sorted = [...history || []].sort(
+          const history2 = await api2(`/projects/${projectId}/goal-history`);
+          const sorted = [...history2 || []].sort(
             (a, b) => Date.parse((a.created_at || "").replace(" ", "T") + "Z") - Date.parse((b.created_at || "").replace(" ", "T") + "Z")
           );
           sorted.forEach((entry, i) => {
@@ -11113,6 +11113,14 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
     }
   }
   (async function init() {
+    const _wsParam = new URLSearchParams(window.location.search).get("ws");
+    if (_wsParam && !state.activeWorkspaceTenantId) {
+      state.activeWorkspaceTenantId = _wsParam;
+      try {
+        history.replaceState(null, "", window.location.pathname);
+      } catch (_) {
+      }
+    }
     await loadServerConfig();
     showFailoverBannerIfNeeded();
     if (typeof window._showConnSetupIfNeeded === "function") {

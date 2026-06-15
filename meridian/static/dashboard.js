@@ -10505,6 +10505,15 @@ async function restoreTabs() {
 
 (async function init() {
 
+  // 90de5ac9 — invited users land with ?ws=<owner_tenant_id> after OAuth login.
+  // Set activeWorkspaceTenantId before any API calls so loadProjects() sends
+  // X-Workspace-Tenant-Id and the owner's project list loads directly.
+  const _wsParam = new URLSearchParams(window.location.search).get('ws');
+  if (_wsParam && !state.activeWorkspaceTenantId) {
+    state.activeWorkspaceTenantId = _wsParam;
+    try { history.replaceState(null, '', window.location.pathname); } catch (_) {}
+  }
+
   await loadServerConfig();
 
   showFailoverBannerIfNeeded();

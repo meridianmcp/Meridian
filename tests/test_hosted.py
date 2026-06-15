@@ -221,6 +221,41 @@ async def test_post_login_redirect_launch_open_waitlists_when_capacity_full(
 
 
 @pytest.mark.asyncio
+async def test_post_login_redirect_invited_user_gets_workspace_redirect(
+    db, monkeypatch
+):
+    """90de5ac9 — invited user with no own DB is redirected to
+    /dashboard?ws=<owner_tenant_id> so the dashboard pre-selects the inviter's
+    workspace and skips the 'create first project' wizard."""
+    from datetime import datetime, timezone
+    import hashlib
+    from meridian import hosted as hosted_module
+
+    owner = await db_module.upsert_tenant(db, "owner-ws@example.com")
+    invitee = await db_module.upsert_tenant(db, "invitee-ws@example.com")
+    # invitee has no Neon DB (no_slot)
+    assert not invitee.get("neon_project_id") and not invitee.get("neon_db_url")
+
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    await db.execute(
+        "INSERT INTO workspace_members (id, tenant_id, email, role, joined_at) "
+        "VALUES (?, ?, ?, ?, ?)",
+        ("wm-test-1", owner["id"], "invitee-ws@example.com", "member", now),
+    )
+    await db.commit()
+
+    monkeypatch.setenv("MERIDIAN_LAUNCH_OPEN", "true")
+
+    async def fail_if_called(*_args, **_kwargs):
+        raise AssertionError("provision_neon_db must not run for invitees")
+
+    monkeypatch.setattr(hosted_module, "provision_neon_db", fail_if_called)
+
+    dest = await hosted_module._post_login_redirect(invitee, db)
+    assert dest == f"/dashboard?ws={owner['id']}"
+
+
+@pytest.mark.asyncio
 async def test_neon_pool_projects_table_exists(db):
     """neon_pool_projects table must exist after init_db."""
     async with db.execute(
