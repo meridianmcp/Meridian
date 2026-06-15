@@ -1864,3 +1864,84 @@ def test_search_tasks_http_empty_query(client):
     r = client.get(f"/projects/{pid}/tasks/search")
     assert r.status_code == 200
     assert r.json() == []
+
+
+# ---------------------------------------------------------------------------
+# 6e25b507 — search_all + get_notes body/notes column search
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_search_all_searches_sprint_item_notes(db):
+    """search_all matches sprint items by notes field, not just title."""
+    p = await db_module.create_project(db, "sa-sprint-notes")
+    item = await db_module.add_sprint_item(db, p["id"], "v1", "Fix login page")
+    await db_module.patch_sprint_item(db, p["id"], item["id"], notes="involves psycopg3 connection pool refactor")
+    result = await db_module.search_all(db, p["id"], "psycopg3")
+    titles_in_sprint = [i["title"] for i in result["sprint_items"]]
+    assert "Fix login page" in titles_in_sprint
+
+
+@pytest.mark.asyncio
+async def test_search_all_sprint_title_still_matches(db):
+    """search_all still matches sprint items by title after notes column added."""
+    p = await db_module.create_project(db, "sa-sprint-title")
+    await db_module.add_sprint_item(db, p["id"], "v1", "Implement rate limiting")
+    result = await db_module.search_all(db, p["id"], "rate limiting")
+    assert any(i["title"] == "Implement rate limiting" for i in result["sprint_items"])
+
+
+@pytest.mark.asyncio
+async def test_get_project_notes_query_searches_body(db):
+    """get_project_notes query= searches body text, not just tags."""
+    p = await db_module.create_project(db, "gnotes-body-search")
+    await db_module.add_project_note(
+        db, p["id"], "Deploy checklist", "Remember to set DATABASE_URL in production", tags="ops"
+    )
+    await db_module.add_project_note(
+        db, p["id"], "Dev setup", "Run pixi install then pixi run test", tags="setup"
+    )
+    matches = await db_module.get_project_notes(db, p["id"], query="DATABASE_URL")
+    assert len(matches) == 1
+    assert matches[0]["title"] == "Deploy checklist"
+
+
+@pytest.mark.asyncio
+async def test_get_project_notes_query_searches_title(db):
+    """get_project_notes query= also matches on title."""
+    p = await db_module.create_project(db, "gnotes-title-search")
+    await db_module.add_project_note(db, p["id"], "Auth migration guide", "Step by step")
+    await db_module.add_project_note(db, p["id"], "Unrelated note", "Nothing here")
+    matches = await db_module.get_project_notes(db, p["id"], query="migration")
+    assert len(matches) == 1
+    assert "migration" in matches[0]["title"].lower()
+
+
+@pytest.mark.asyncio
+async def test_get_project_notes_query_and_tag_combined(db):
+    """get_project_notes filters by both tag and query when both are provided."""
+    p = await db_module.create_project(db, "gnotes-combo")
+    await db_module.add_project_note(
+        db, p["id"], "Prod secret rotation", "Rotate the API key now", tags="ops,security"
+    )
+    await db_module.add_project_note(
+        db, p["id"], "Dev secret", "Local dev API key", tags="dev"
+    )
+    await db_module.add_project_note(
+        db, p["id"], "Ops checklist", "Deploy and verify health endpoint", tags="ops"
+    )
+    matches = await db_module.get_project_notes(db, p["id"], tag="ops", query="secret")
+    assert len(matches) == 1
+    assert matches[0]["title"] == "Prod secret rotation"
+
+
+def test_get_notes_http_query_param(client):
+    """GET /projects/{id}/notes?query=X searches title and body."""
+    pid = client.post("/projects", json={"name": "http-notes-query"}).json()["id"]
+    client.post(f"/projects/{pid}/notes", json={"title": "Env setup", "body": "Set REDIS_URL in .env file"})
+    client.post(f"/projects/{pid}/notes", json={"title": "Deployment", "body": "Push to main to deploy"})
+    r = client.get(f"/projects/{pid}/notes?query=REDIS_URL")
+    assert r.status_code == 200
+    hits = r.json()
+    assert len(hits) == 1
+    assert hits[0]["title"] == "Env setup"

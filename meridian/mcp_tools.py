@@ -226,7 +226,8 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "Read-only: List project notes (newest first). Optional ?tag substring filter.",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"},
-         "tag": {"type": "string"}},
+         "tag": {"type": "string"},
+         "query": {"type": "string", "description": "Text search across note title and body (case-insensitive)."}},
          "required": ["project_id"]}},
     {"name": "delete_note", "description":
         "Hard-delete a project note by id.",

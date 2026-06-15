@@ -372,6 +372,7 @@ Read-only: List project notes (newest first). Filter by tag substring.
 |-----------|------|----------|-------------|
 | `project_id` | string | required |  |
 | `tag` | string | optional |  |
+| `query` | string | optional | Text search across note title and body (case-insensitive). |
 
 **Example:**
 ```
