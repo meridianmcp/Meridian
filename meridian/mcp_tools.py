@@ -38,6 +38,8 @@ _TOOL_EXAMPLES: dict[str, str] = {
     "update_workspace_settings": 'update_workspace_settings(hitl_auto_answer_default=True, sprint_name_default="june-sprint")',
     "add_sprint_item": 'add_sprint_item(project_id="abc-123", title="Add OAuth login", item_group="auth")',
     "update_sprint_item": 'update_sprint_item(project_id="abc-123", item_id="item-uuid", title="Add OAuth + SAML login", group="auth", human_id="alice")',
+    "reconcile_sprint_drift": 'reconcile_sprint_drift(project_id="abc-123")',
+    "get_planning_brief": 'get_planning_brief(project_id="abc-123")',
     "get_sprint_items": 'get_sprint_items(project_id="abc-123")',
     "complete_sprint_item": 'complete_sprint_item(item_id="item-uuid")',
     "claim_sprint_item": 'claim_sprint_item(project_id="abc-123", item_id="item-uuid")',
@@ -412,6 +414,22 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "task_id": {"type": "string"},
          "session_id": {"type": "string", "description": "Optional: include board_change + worktree merge reminder."}},
          "required": ["project_id", "item_id"]}},
+    {"name": "reconcile_sprint_drift", "description":
+        "Read-only: Cross-reference pending sprint items against recent git commits and "
+        "return items that may already be done. Uses keyword matching — confidence 'high' "
+        "means 3+ keywords overlap (safe to mark done), 'medium' means 1-2 (verify first). "
+        "Call during planning sessions to identify board drift before filing new items.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"}},
+         "required": ["project_id"]}},
+    {"name": "get_planning_brief", "description":
+        "Read-only: Return a compact planning context — sprint, north star, pending items, "
+        "in-progress items, recent tasks, active sessions, recent decisions, and pending HITLs. "
+        "No session registration needed. Designed for planning chat sessions that need to see "
+        "project state without side effects.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"}},
+         "required": ["project_id"]}},
     {"name": "get_sprint_items", "description":
         "Read-only: List sprint items for a project. Optional status filter "
         "(todo|pending|in_progress|done|failed|skipped|pushed|indeterminate). "
@@ -568,6 +586,7 @@ _READ_ONLY_TOOLS = {
     "get_session_log", "idle_until_session_done", "generate_handoff",
     "get_workspace_notes", "get_workspace_decisions", "get_workspace_settings",
     "get_sprint_items", "get_sprint_progress", "get_agent_instructions",
+    "reconcile_sprint_drift", "get_planning_brief",
 }
 _DESTRUCTIVE_TOOLS = {"delete_note", "archive_decision", "dismiss_hitl"}
 
@@ -608,6 +627,8 @@ _TITLE_OVERRIDES: dict[str, str] = {
     "generate_handoff": "Generate Handoff",
     "get_agent_instructions": "Get Agent Instructions",
     "set_agent_instructions": "Set Agent Instructions",
+    "reconcile_sprint_drift": "Reconcile Sprint Drift",
+    "get_planning_brief": "Get Planning Brief",
 }
 
 for _tool in _MCP_TOOLS_LIST:

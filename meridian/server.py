@@ -596,6 +596,7 @@ from .routes.hooks import router as _hooks_router            # noqa: E402
 from .routes.projects import router as _projects_router      # noqa: E402
 from .routes.blog import router as _blog_router              # noqa: E402
 from .routes.marketplace import router as _marketplace_router  # noqa: E402
+from .routes.tunnel import router as _tunnel_router          # noqa: E402
 
 app.include_router(_notes_router)
 app.include_router(_hitl_router)
@@ -615,6 +616,7 @@ app.include_router(_hooks_router)
 app.include_router(_projects_router)
 app.include_router(_blog_router)
 app.include_router(_marketplace_router)
+app.include_router(_tunnel_router)
 
 # ---------------------------------------------------------------------------
 # Password gate middleware
@@ -1537,6 +1539,7 @@ async def me_endpoint(request: Request) -> dict[str, Any]:
         # the upgrade banner and similar nag UI for staff accounts.
         "is_internal": bool(tenant.get("is_internal")),
         "is_admin": tenant.get("email", "") in _admin_emails(),
+        "tunnel_active": bool(tenant.get("tunnel_active")),
     }
 
 
@@ -3137,6 +3140,17 @@ async def mcp_tools_doc() -> str:
         "Read-only: Return a compact plain-text context block (north star, sprint, pending sprint items, recent tasks, recent "
         "decisions, active sessions). Use `mode='full'` to paste into a fresh Claude Code session; `mode='chat'` "
         "for a shorter paste into claude.ai.")
+    lines += ["## Planning tools\n"]
+    lines += _render_tool("get_planning_brief",
+        "Read-only: Return a compact planning context (sprint, north star, pending items, "
+        "in-progress items, recent tasks, active sessions, recent decisions, pending HITLs). "
+        "No session registration needed — designed for planning chat sessions that need to see "
+        "project state without side effects.")
+    lines += _render_tool("reconcile_sprint_drift",
+        "Read-only: Cross-reference pending sprint items against recent git commits and return "
+        "items that may already be done. confidence='high' means 3+ keywords overlap (safe to "
+        "mark done via `complete_sprint_item`); confidence='medium' means 1–2 (verify first). "
+        "Call during planning sessions to identify board drift.")
     lines += ["## Notes\n"]
     lines += _render_tool("add_note",
         "Add a per-project wiki note. Use for setup instructions, gotchas, environment details, how-tos.")

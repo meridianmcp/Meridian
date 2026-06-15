@@ -23,6 +23,73 @@ from .. import goal_md as goal_md_module
 from .. import md_anchors as md_anchors_module
 from .._deps import _hosted_mode, validate_input_size, _MANUAL_NOTE_LINT
 
+_MCP_PROMPTS: list[dict[str, Any]] = [
+    {
+        "name": "start-executor",
+        "description": "Paste-ready instructions for starting an executor session on a project.",
+        "arguments": [
+            {"name": "project_id", "description": "Meridian project ID", "required": True},
+        ],
+    },
+    {
+        "name": "daily-standup",
+        "description": "Standup summary prompt — shows shipped, in-progress, blocked, and next items.",
+        "arguments": [
+            {"name": "project_id", "description": "Meridian project ID", "required": True},
+        ],
+    },
+]
+
+
+def _build_prompt_messages(name: str, args: dict[str, Any]) -> list[dict[str, Any]]:
+    pid = args.get("project_id", "<project_id>")
+    if name == "start-executor":
+        return [
+            {
+                "role": "user",
+                "content": {
+                    "type": "text",
+                    "text": (
+                        f"Start an executor session for Meridian project `{pid}`.\n\n"
+                        f"1. Call `start_session(project_id=\"{pid}\", session_name=\"<brief task>\")`"
+                        " — returns sprint focus, pending items, and recent tasks.\n"
+                        "2. If there are pending sprint items, immediately call "
+                        f"`claim_sprint_item(project_id=\"{pid}\", item_id=\"<first pending item id>\")`"
+                        " and start working. Do NOT ask what to work on.\n"
+                        "3. After each meaningful action call "
+                        f"`log_task(session_id=..., project_id=\"{pid}\", description=...)`.\n"
+                        "4. When an item is done: run tests, call `complete_sprint_item`, then call "
+                        f"`get_sprint_progress(project_id=\"{pid}\", session_id=...)` to pick up any new items.\n"
+                        "5. Before ending: call "
+                        f"`checkpoint(session_id=..., project_id=\"{pid}\")` — snapshots progress "
+                        "and returns the next `/goal` string.\n\n"
+                        "Push to dev branch when tests pass. Never push broken code."
+                    ),
+                },
+            }
+        ]
+    if name == "daily-standup":
+        return [
+            {
+                "role": "user",
+                "content": {
+                    "type": "text",
+                    "text": (
+                        f"Provide a standup summary for Meridian project `{pid}`.\n\n"
+                        f"Call `get_planning_brief(project_id=\"{pid}\")` to get current state, "
+                        "then format as:\n\n"
+                        "**Shipped** (done since yesterday)\n"
+                        "**In Progress** (currently in_progress)\n"
+                        "**Blocked** (failed items, pending HITLs)\n"
+                        "**Next** (top 3 pending items)\n\n"
+                        "Keep it concise — one line per item."
+                    ),
+                },
+            }
+        ]
+    raise ValueError(f"unknown prompt: {name}")
+
+
 async def _dispatch_github_tool(name: str, args: dict[str, Any], tenant: dict, db: Any) -> Any:
     # Guard: check if project has a GitHub repo connected
     project_id = args.get("project_id")
@@ -417,7 +484,7 @@ async def _handle_mcp_request(
         return _server._jsonrpc_ok(req_id, {
             "protocolVersion": _server._MCP_PROTOCOL_VERSION,
             "serverInfo": _server._MCP_SERVER_INFO,
-            "capabilities": {"tools": {}},
+            "capabilities": {"tools": {}, "prompts": {}},
         })
 
     if method in ("notifications/initialized", "ping"):
@@ -428,6 +495,20 @@ async def _handle_mcp_request(
         if tenant:
             tools = tools + _server._github_tools_for_tenant(tenant)
         return _server._jsonrpc_ok(req_id, {"tools": tools})
+
+    if method == "prompts/list":
+        return _server._jsonrpc_ok(req_id, {"prompts": _MCP_PROMPTS})
+
+    if method == "prompts/get":
+        prompt_name = params.get("name", "")
+        prompt_args = params.get("arguments") or {}
+        try:
+            messages = _build_prompt_messages(prompt_name, prompt_args)
+        except ValueError as exc:
+            return _server._jsonrpc_err(req_id, -32602, str(exc))
+        return _server._jsonrpc_ok(req_id, {"description": next(
+            (p["description"] for p in _MCP_PROMPTS if p["name"] == prompt_name), ""
+        ), "messages": messages})
 
     if method == "tools/call":
         name = params.get("name", "")
@@ -1737,6 +1818,82 @@ async def _dispatch_mcp_tool(
             f'</session_brief>'
         )
         return {"text": brief, "project_id": project_id, "role": role}
+    if name == "reconcile_sprint_drift":
+        from .. import handoff as handoff_module_local
+        project = await db_module.get_project(db, args["project_id"])
+        if project is None:
+            raise ValueError("project not found")
+        pending_items = await db_module.get_sprint_items(db, args["project_id"], status="pending")
+        commit_msgs = await _fetch_recent_commits(project, tenant)
+        commits = [{"sha": "", "message": m} for m in commit_msgs]
+        matches = handoff_module_local.reconcile_sprint_items(pending_items, commits)
+        action_items = [
+            {
+                "item_id": m["item_id"],
+                "title": m["title"],
+                "confidence": m["confidence"],
+                "matching_commits": m["matching_commits"],
+                "suggested_action": (
+                    f"complete_sprint_item(project_id='{args['project_id']}', item_id='{m['item_id']}')"
+                    if m["confidence"] == "high"
+                    else "verify manually before marking done"
+                ),
+            }
+            for m in matches
+        ]
+        return {
+            "pending_item_count": len(pending_items),
+            "commit_count": len(commit_msgs),
+            "drift_count": len(matches),
+            "high_confidence": sum(1 for m in matches if m["confidence"] == "high"),
+            "medium_confidence": sum(1 for m in matches if m["confidence"] == "medium"),
+            "matches": action_items,
+        }
+    if name == "get_planning_brief":
+        project_id = args["project_id"]
+        project = await db_module.get_project(db, project_id)
+        if project is None:
+            raise ValueError("project not found")
+        goal = await db_module.get_goal(db, project_id)
+        pending_items = await db_module.get_sprint_items(db, project_id, status="pending")
+        in_progress = await db_module.get_sprint_items(db, project_id, status="in_progress")
+        recent_tasks = await db_module.get_tasks(db, project_id, limit=5)
+        sessions = await db_module.get_sessions(db, project_id, active_only=True)
+        hitls = await db_module.list_hitl_requests(db, project_id, status="pending")
+        decisions_raw = (project.get("decisions") or "").strip()
+        recent_decisions = [ln.strip() for ln in decisions_raw.splitlines() if ln.strip()][-3:]
+        return {
+            "project_id": project_id,
+            "project_name": project.get("name"),
+            "sprint": (goal.get("sprint") or "") if goal else "",
+            "north_star": (goal.get("north_star") or "") if goal else "",
+            "pending_count": len(pending_items),
+            "pending_items": [
+                {"id": it["id"], "title": (it.get("title") or "")[:120], "version": it.get("version")}
+                for it in pending_items[:10]
+            ],
+            "in_progress": [
+                {"id": it["id"], "title": (it.get("title") or "")[:80]}
+                for it in in_progress
+            ],
+            "recent_tasks": [
+                {"description": (t.get("description") or "")[:80], "status": t.get("status")}
+                for t in recent_tasks
+            ],
+            "active_sessions": [
+                {"name": s.get("name"), "human_id": s.get("human_id")}
+                for s in sessions
+            ],
+            "recent_decisions": recent_decisions,
+            "pending_hitls": [
+                {
+                    "id": h.get("id"),
+                    "question": (h.get("question") or "")[:120],
+                    "urgency": h.get("urgency"),
+                }
+                for h in (hitls if isinstance(hitls, list) else [])[:5]
+            ],
+        }
     raise ValueError(f"unknown tool: {name}")
 
 

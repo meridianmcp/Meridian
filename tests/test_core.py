@@ -922,6 +922,36 @@ def test_websocket_receives_task_event(client):
     assert event["task"]["description"] == "[ASK]: pick one"
 
 
+# ---------------------------------------------------------------------------
+# b43b0c6a — Pro tunnel endpoints
+# ---------------------------------------------------------------------------
+
+
+def test_tunnel_status_returns_inactive_for_unknown_tenant(client):
+    r = client.get("/tunnel/status/no-such-tenant")
+    assert r.status_code == 200
+    assert r.json() == {"tenant_id": "no-such-tenant", "active": False}
+
+
+def test_fs_mcp_proxy_returns_503_when_not_hosted(client):
+    # Self-hosted mode: /fs/mcp/* returns 503 (tunnel requires hosted mode)
+    r = client.get("/fs/mcp/some-tenant-id")
+    assert r.status_code == 503
+
+
+def test_fs_mcp_proxy_subpath_returns_503_when_not_hosted(client):
+    r = client.post("/fs/mcp/some-tenant-id/message")
+    assert r.status_code == 503
+
+
+def test_tunnel_ws_closes_without_hosted_mode(client):
+    with client.websocket_connect("/tunnel/fake-tenant-id") as ws:
+        try:
+            ws.receive_text()
+        except Exception:
+            pass  # closed with code 4403 — expected in self-hosted mode
+
+
 def test_get_auth_token_uses_oauth_first(monkeypatch):
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test-env")
     monkeypatch.setattr(
@@ -5489,6 +5519,7 @@ def test_pg_migration_registry_matches_historical_order():
         "_migrate_pg_tenants_is_internal",
         "_migrate_pg_workspace_members_rbac",
         "_migrate_pg_admin_plan",
+        "_migrate_pg_tunnel_active",
     ]
     assert late == [
         "_migrate_pg_workspace_tenant_isolation",
@@ -5506,7 +5537,7 @@ def test_pg_migration_registry_matches_historical_order():
     ]
     # No duplicates across the three groups.
     allnames = core + hosted + late
-    assert len(allnames) == len(set(allnames)) == 41
+    assert len(allnames) == len(set(allnames)) == 42
 
 
 def test_cached_plan_error_is_retryable():
@@ -10942,3 +10973,187 @@ def test_pre_commit_hook_exists_and_has_patterns():
     assert "sk_meridian_" in content
     assert "git show" in content
     assert "exit 1" in content
+
+
+# 8b7ac6f2 — reconcile_sprint_drift + get_planning_brief + MCP prompts
+
+@pytest.mark.asyncio
+async def test_reconcile_sprint_drift_returns_structure(db):
+    """reconcile_sprint_drift returns the expected shape with no commits."""
+    import meridian.server as srv
+
+    p = await db_module.create_project(db, "drift-test")
+    await db_module.add_sprint_item(db, p["id"], "v1", "Add OAuth login feature")
+
+    res = await srv._dispatch_mcp_tool(
+        "reconcile_sprint_drift", {"project_id": p["id"]}, db, "/tmp"
+    )
+    assert "pending_item_count" in res
+    assert "commit_count" in res
+    assert "drift_count" in res
+    assert "high_confidence" in res
+    assert "medium_confidence" in res
+    assert isinstance(res["matches"], list)
+    assert res["pending_item_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_reconcile_sprint_drift_detects_high_confidence(db):
+    """reconcile_sprint_drift flags items when commits match 3+ keywords."""
+    import meridian.server as srv
+    from unittest.mock import patch
+
+    p = await db_module.create_project(db, "drift-high")
+    await db_module.add_sprint_item(db, p["id"], "v1", "Fix OAuth redirect callback bug")
+
+    fake_commits = ["Fix OAuth redirect callback handling in auth middleware"]
+    with patch("meridian.mcp.handler._fetch_recent_commits", return_value=fake_commits):
+        res = await srv._dispatch_mcp_tool(
+            "reconcile_sprint_drift", {"project_id": p["id"]}, db, "/tmp"
+        )
+
+    assert res["drift_count"] >= 1
+    match = res["matches"][0]
+    assert match["confidence"] in ("high", "medium")
+    assert "suggested_action" in match
+    assert match["item_id"]
+
+
+@pytest.mark.asyncio
+async def test_reconcile_sprint_drift_unknown_project(db):
+    """reconcile_sprint_drift raises ValueError for unknown project."""
+    import meridian.server as srv
+
+    with pytest.raises(ValueError, match="project not found"):
+        await srv._dispatch_mcp_tool(
+            "reconcile_sprint_drift", {"project_id": "does-not-exist"}, db, "/tmp"
+        )
+
+
+@pytest.mark.asyncio
+async def test_get_planning_brief_returns_structure(db):
+    """get_planning_brief returns all expected keys."""
+    import meridian.server as srv
+
+    p = await db_module.create_project(db, "brief-test")
+    await db_module.set_goal(db, p["id"], "build a product")
+    await db_module.set_sprint(db, p["id"], "v1-sprint")
+    await db_module.add_sprint_item(db, p["id"], "v1", "Build something cool")
+
+    res = await srv._dispatch_mcp_tool(
+        "get_planning_brief", {"project_id": p["id"]}, db, "/tmp"
+    )
+    assert res["project_id"] == p["id"]
+    assert res["project_name"] == "brief-test"
+    assert res["sprint"] == "v1-sprint"
+    assert isinstance(res["pending_items"], list)
+    assert res["pending_count"] == 1
+    assert res["pending_items"][0]["title"].startswith("Build something cool")
+    assert isinstance(res["in_progress"], list)
+    assert isinstance(res["recent_tasks"], list)
+    assert isinstance(res["active_sessions"], list)
+    assert isinstance(res["pending_hitls"], list)
+
+
+@pytest.mark.asyncio
+async def test_get_planning_brief_unknown_project(db):
+    """get_planning_brief raises ValueError for unknown project."""
+    import meridian.server as srv
+
+    with pytest.raises(ValueError, match="project not found"):
+        await srv._dispatch_mcp_tool(
+            "get_planning_brief", {"project_id": "no-such-project"}, db, "/tmp"
+        )
+
+
+def test_mcp_prompts_list():
+    """prompts/list returns both registered prompts."""
+    from meridian.mcp.handler import _MCP_PROMPTS
+
+    names = {p["name"] for p in _MCP_PROMPTS}
+    assert "start-executor" in names
+    assert "daily-standup" in names
+    for prompt in _MCP_PROMPTS:
+        assert "description" in prompt
+        assert "arguments" in prompt
+
+
+def test_mcp_prompts_get_start_executor():
+    """prompts/get for start-executor returns a user message with project_id substituted."""
+    from meridian.mcp.handler import _build_prompt_messages
+
+    msgs = _build_prompt_messages("start-executor", {"project_id": "test-pid"})
+    assert len(msgs) == 1
+    assert msgs[0]["role"] == "user"
+    text = msgs[0]["content"]["text"]
+    assert "test-pid" in text
+    assert "start_session" in text
+    assert "claim_sprint_item" in text
+    assert "checkpoint" in text
+
+
+def test_mcp_prompts_get_daily_standup():
+    """prompts/get for daily-standup returns a user message with project_id substituted."""
+    from meridian.mcp.handler import _build_prompt_messages
+
+    msgs = _build_prompt_messages("daily-standup", {"project_id": "test-pid"})
+    assert len(msgs) == 1
+    text = msgs[0]["content"]["text"]
+    assert "test-pid" in text
+    assert "get_planning_brief" in text
+
+
+def test_mcp_prompts_get_unknown_raises():
+    """_build_prompt_messages raises ValueError for unknown prompt name."""
+    from meridian.mcp.handler import _build_prompt_messages
+
+    with pytest.raises(ValueError, match="unknown prompt"):
+        _build_prompt_messages("no-such-prompt", {})
+
+
+@pytest.mark.asyncio
+async def test_mcp_handle_prompts_list(db):
+    """_handle_mcp_request handles prompts/list and returns registered prompts."""
+    from meridian.mcp.handler import _handle_mcp_request
+
+    req = {"jsonrpc": "2.0", "id": 1, "method": "prompts/list", "params": {}}
+    res = await _handle_mcp_request(req, db, "/tmp")
+    assert res["result"]["prompts"]
+    names = {p["name"] for p in res["result"]["prompts"]}
+    assert "start-executor" in names
+    assert "daily-standup" in names
+
+
+@pytest.mark.asyncio
+async def test_mcp_handle_prompts_get(db):
+    """_handle_mcp_request handles prompts/get and returns messages."""
+    from meridian.mcp.handler import _handle_mcp_request
+
+    req = {
+        "jsonrpc": "2.0", "id": 2, "method": "prompts/get",
+        "params": {"name": "start-executor", "arguments": {"project_id": "abc"}},
+    }
+    res = await _handle_mcp_request(req, db, "/tmp")
+    assert "messages" in res["result"]
+    assert res["result"]["messages"][0]["role"] == "user"
+
+
+@pytest.mark.asyncio
+async def test_mcp_initialize_advertises_prompts(db):
+    """MCP initialize response includes prompts capability."""
+    from meridian.mcp.handler import _handle_mcp_request
+
+    req = {"jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {}}
+    res = await _handle_mcp_request(req, db, "/tmp")
+    assert "prompts" in res["result"]["capabilities"]
+
+
+def test_new_planning_tools_in_tool_list():
+    """reconcile_sprint_drift and get_planning_brief appear in _MCP_TOOLS_LIST."""
+    from meridian.mcp_tools import _MCP_TOOLS_LIST, _READ_ONLY_TOOLS
+
+    names = {t["name"] for t in _MCP_TOOLS_LIST}
+    assert "reconcile_sprint_drift" in names
+    assert "get_planning_brief" in names
+    assert "reconcile_sprint_drift" in _READ_ONLY_TOOLS
+    assert "get_planning_brief" in _READ_ONLY_TOOLS

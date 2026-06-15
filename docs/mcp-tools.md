@@ -1,6 +1,6 @@
 # MCP Tool Reference
 
-Meridian exposes **58 tools** over MCP.
+Meridian exposes **60 tools** over MCP.
 
 They fall into two usage patterns:
 
@@ -361,6 +361,37 @@ Read-only: Return a compact plain-text context block (north star, sprint, pendin
 **Example:**
 ```
 get_context_block(project_id="abc-123", mode="chat")
+```
+
+---
+
+## Planning tools
+
+### `get_planning_brief`
+Read-only: Return a compact planning context (sprint, north star, pending items, in-progress items, recent tasks, active sessions, recent decisions, pending HITLs). No session registration needed — designed for planning chat sessions that need to see project state without side effects.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `project_id` | string | required |  |
+
+**Example:**
+```
+get_planning_brief(project_id="abc-123")
+```
+
+---
+
+
+### `reconcile_sprint_drift`
+Read-only: Cross-reference pending sprint items against recent git commits and return items that may already be done. confidence='high' means 3+ keywords overlap (safe to mark done via `complete_sprint_item`); confidence='medium' means 1–2 (verify first). Call during planning sessions to identify board drift.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `project_id` | string | required |  |
+
+**Example:**
+```
+reconcile_sprint_drift(project_id="abc-123")
 ```
 
 ---
