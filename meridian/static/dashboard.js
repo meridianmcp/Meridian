@@ -318,6 +318,8 @@ async function ensureWorkspaceSwitcher() {
 
     sel.title = active ? (active.is_own ? 'My workspace' : `${active.owner_email} (${active.role})`) : '';
 
+    _renderWorkspaceContextBadge(wrap, workspaces);
+
   };
 
 
@@ -346,6 +348,8 @@ async function ensureWorkspaceSwitcher() {
 
   wrap.appendChild(sel);
 
+  _renderWorkspaceContextBadge(wrap, workspaces);
+
   wrap.appendChild(connectLink);
 
   const existingLabel = footer.querySelector('.hosted-label');
@@ -368,6 +372,37 @@ async function getActiveWorkspaceRole() {
     const ws = (wss || []).find(w => w.tenant_id === state.activeWorkspaceTenantId);
     return (ws && ws.role) || 'owner';
   } catch (_) { return 'owner'; }
+}
+
+
+// fcb02a6d — plan/role badge in the sidebar. On your own workspace it shows your
+// plan (Free/Trial/Standard/Pro); on a workspace you were invited to it shows an
+// "invite · {role}" badge. Re-rendered on every workspace switch.
+function _renderWorkspaceContextBadge(wrap, workspaces) {
+  if (!wrap) return;
+  let badge = wrap.querySelector('.ws-context-badge');
+  if (!badge) {
+    badge = document.createElement('div');
+    badge.className = 'ws-context-badge';
+    badge.style.cssText = 'display:inline-block;margin-top:6px;padding:2px 8px;border-radius:10px;font-size:9px;font-weight:700;letter-spacing:.05em;font-family:var(--font-mono);text-transform:uppercase';
+    wrap.appendChild(badge);
+  }
+  const active = (workspaces || []).find(w =>
+    state.activeWorkspaceTenantId ? w.tenant_id === state.activeWorkspaceTenantId : w.is_own);
+  const colors = { free: '#3b82f6', trial: '#059669', standard: '#3b82f6', pro: '#7c3aed', admin: '#9ca3af', invite: '#f59e0b' };
+  let label, color;
+  if (active && !active.is_own) {
+    label = `invite · ${active.role || 'member'}`;
+    color = colors.invite;
+  } else {
+    const plan = window.state.tenantPlan || 'free';
+    label = (window._PLAN_LABELS && window._PLAN_LABELS[plan]) || plan;
+    color = colors[plan] || '#9ca3af';
+  }
+  badge.textContent = label;
+  badge.style.background = color + '22';
+  badge.style.color = color;
+  badge.style.border = '1px solid ' + color + '44';
 }
 
 

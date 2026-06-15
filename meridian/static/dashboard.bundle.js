@@ -5295,6 +5295,7 @@ ${n.tags || ""}`.toLowerCase();
       await loadProjects();
       const active = workspaces.find((w) => w.tenant_id === chosen);
       sel.title = active ? active.is_own ? "My workspace" : `${active.owner_email} (${active.role})` : "";
+      _renderWorkspaceContextBadge(wrap, workspaces);
     };
     const connectLink = document.createElement("a");
     connectLink.id = "connect-db-link";
@@ -5315,6 +5316,7 @@ ${n.tags || ""}`.toLowerCase();
     };
     wrap.appendChild(label);
     wrap.appendChild(sel);
+    _renderWorkspaceContextBadge(wrap, workspaces);
     wrap.appendChild(connectLink);
     const existingLabel = footer.querySelector(".hosted-label");
     if (existingLabel) footer.insertBefore(wrap, existingLabel);
@@ -5329,6 +5331,31 @@ ${n.tags || ""}`.toLowerCase();
     } catch (_) {
       return "owner";
     }
+  }
+  function _renderWorkspaceContextBadge(wrap, workspaces) {
+    if (!wrap) return;
+    let badge = wrap.querySelector(".ws-context-badge");
+    if (!badge) {
+      badge = document.createElement("div");
+      badge.className = "ws-context-badge";
+      badge.style.cssText = "display:inline-block;margin-top:6px;padding:2px 8px;border-radius:10px;font-size:9px;font-weight:700;letter-spacing:.05em;font-family:var(--font-mono);text-transform:uppercase";
+      wrap.appendChild(badge);
+    }
+    const active = (workspaces || []).find((w) => state.activeWorkspaceTenantId ? w.tenant_id === state.activeWorkspaceTenantId : w.is_own);
+    const colors = { free: "#3b82f6", trial: "#059669", standard: "#3b82f6", pro: "#7c3aed", admin: "#9ca3af", invite: "#f59e0b" };
+    let label, color;
+    if (active && !active.is_own) {
+      label = `invite \xB7 ${active.role || "member"}`;
+      color = colors.invite;
+    } else {
+      const plan = window.state.tenantPlan || "free";
+      label = window._PLAN_LABELS && window._PLAN_LABELS[plan] || plan;
+      color = colors[plan] || "#9ca3af";
+    }
+    badge.textContent = label;
+    badge.style.background = color + "22";
+    badge.style.color = color;
+    badge.style.border = "1px solid " + color + "44";
   }
   function showConnectDbModal() {
     if (document.getElementById("connect-db-modal")) return;
