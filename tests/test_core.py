@@ -5487,10 +5487,12 @@ def test_pg_migration_registry_matches_historical_order():
         "_migrate_pg_queued_session",
         "_migrate_pg_parallel_safety",
         "_migrate_pg_changelog_entries",
+        "_migrate_pg_agent_instructions",
+        "_migrate_pg_note_kind",
     ]
     # No duplicates across the three groups.
     allnames = core + hosted + late
-    assert len(allnames) == len(set(allnames)) == 39
+    assert len(allnames) == len(set(allnames)) == 41
 
 
 def test_cached_plan_error_is_retryable():
@@ -6908,6 +6910,21 @@ def test_oauth_protected_resource_metadata(client):
     assert len(body["authorization_servers"]) > 0
     assert body["scopes_supported"] == ["mcp"]
     assert body["bearer_methods_supported"] == ["header"]
+
+
+def test_oauth_dcr_includes_client_secret_expires_at(client):
+    """POST /oauth/register response must include client_secret_expires_at as an integer (RFC 7591).
+
+    Smithery and other OAuth clients reject DCR responses that omit or mis-type
+    this field with "client_secret_expires_at property must be a number".
+    0 means the secret never expires.
+    """
+    r = client.post("/oauth/register", json={"redirect_uris": ["https://example.com/cb"]})
+    assert r.status_code == 201
+    body = r.json()
+    assert "client_secret_expires_at" in body, "client_secret_expires_at missing from DCR response"
+    assert body["client_secret_expires_at"] == 0
+    assert isinstance(body["client_secret_expires_at"], int)
 
 
 def test_landing_page_cache_control(client):
