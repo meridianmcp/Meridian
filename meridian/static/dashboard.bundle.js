@@ -10215,10 +10215,8 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
       };
     }
     refreshHitl();
-    if (_hitlPollTimer) {
-      clearInterval(_hitlPollTimer);
-      _hitlPollTimer = null;
-    }
+    if (_hitlPollTimer) clearInterval(_hitlPollTimer);
+    _hitlPollTimer = setInterval(refreshHitl, 6e4);
   }
   function setVtabCountBadge2(selector, count) {
     document.querySelectorAll(selector).forEach((badge) => {
@@ -11221,6 +11219,8 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
     if (event.type === "hitl_filed") {
       refreshHitl();
       refreshProjectCountBadges(projectId);
+      const _hitlPanel = state.panels[projectId];
+      if (_hitlPanel && _hitlPanel.activeVtab === "hitl") loadHitlTab(projectId);
       return;
     }
     const cache = state.panels[projectId].taskCache;

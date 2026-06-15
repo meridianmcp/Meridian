@@ -8726,9 +8726,11 @@ function initHitlPanel() {
 
   refreshHitl();
 
-  // ITEM 6 — 30s HITL poll removed: the hitl_filed WS push refreshes the queue live.
-
-  if (_hitlPollTimer) { clearInterval(_hitlPollTimer); _hitlPollTimer = null; }
+  // 20591f72 — restore 60s fallback poll: WS push is the fast path but if the
+  // project panel isn't open yet (no WS listener) the event is dropped silently.
+  // 60s keeps the bar fresh without noticeable lag for the human.
+  if (_hitlPollTimer) clearInterval(_hitlPollTimer);
+  _hitlPollTimer = setInterval(refreshHitl, 60000);
 
 }
 
@@ -10519,6 +10521,10 @@ function handleWsEvent(projectId, event) {
     refreshHitl();
 
     refreshProjectCountBadges(projectId);
+
+    // 20591f72 — also reload the drawer panel if the user is on the HITL vtab.
+    const _hitlPanel = state.panels[projectId];
+    if (_hitlPanel && _hitlPanel.activeVtab === 'hitl') loadHitlTab(projectId);
 
     return;
 
