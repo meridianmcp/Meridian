@@ -17,6 +17,8 @@ from typing import Any
 from fastapi import HTTPException, Request
 from fastapi.templating import Jinja2Templates
 
+from .roles import has_perm, PERM_WRITE, PERM_INVITE, PERM_SETTINGS
+
 
 # ---------------------------------------------------------------------------
 # Version constants
@@ -538,6 +540,11 @@ async def _require_workspace_perm(
     try:
         caller = await _get_ct(request)
     except HTTPException:
+        caller = None
+    if caller is None:
+        # Bearer/API-token callers (MCP, scripts) aren't cookie-authenticated.
+        caller = await _get_tenant_from_request(request)
+    if caller is None:
         raise HTTPException(403, "Sign in required")
     caller_email = caller.get("email", "")
     resolved = await _db_module.resolve_member_role(
@@ -550,3 +557,86 @@ async def _require_workspace_perm(
             f"Workspace role '{role or 'none'}' lacks permission '{perm}'",
         )
     return role  # type: ignore[return-value]
+
+
+# ---------------------------------------------------------------------------
+# 393eed0a — server-side workspace-role enforcement on cross-workspace writes
+# ---------------------------------------------------------------------------
+
+# Mutating paths that act on the CALLER'S OWN account (never the active
+# workspace) — billing, account, auth/token management — plus pre-auth/public
+# endpoints and the per-tool-gated /mcp endpoint. These are exempt from
+# workspace-role enforcement even when an X-Workspace-Tenant-Id header rides
+# along (e.g. a member viewing an invited workspace clicks "manage billing",
+# which still targets THEIR OWN Stripe customer).
+_ROLE_ENFORCE_SKIP_PREFIXES: tuple[str, ...] = (
+    "/auth/", "/oauth/", "/billing", "/account", "/demo", "/waitlist",
+    "/health", "/webhooks/", "/mcp", "/__gate__",
+)
+
+
+def _required_perm_for_request(method: str, path: str) -> "str | None":
+    """Map a mutating request to the workspace permission it requires, or None
+    to skip role enforcement for this path.
+
+    Only POST/PUT/PATCH/DELETE are gated. Self-scoped and public paths return
+    None. Everything else returns the least privilege a member-tier role would
+    need: team management → INVITE, workspace/project config → SETTINGS, whole-
+    project deletion → SETTINGS, and ordinary project-data writes → WRITE.
+    """
+    if method not in ("POST", "PUT", "PATCH", "DELETE"):
+        return None
+    if any(path.startswith(p) for p in _ROLE_ENFORCE_SKIP_PREFIXES):
+        return None
+    # Team management — add / remove / modify workspace members.
+    if path.startswith("/workspace/invite") or path.startswith("/workspace/members"):
+        return PERM_INVITE
+    # Workspace / project configuration — a member must not reconfigure an
+    # owner's workspace, project settings, notify targets, or GitHub link.
+    if path == "/workspace/settings":
+        return PERM_SETTINGS
+    if path.endswith("/settings") or path.endswith("/ntfy") or "/github/" in path:
+        return PERM_SETTINGS
+    # Deleting an entire project (DELETE /projects/{id}, not a sub-resource).
+    if method == "DELETE" and path.startswith("/projects/") and path.count("/") == 2:
+        return PERM_SETTINGS
+    # Default: ordinary project-data write (tasks, sessions, sprint, notes,
+    # decisions, goal, handoff, …) — members allowed, viewers blocked.
+    return PERM_WRITE
+
+
+async def _enforcement_context(
+    request: Request,
+) -> "tuple[str, str, str] | None":
+    """Return ``(caller_email, active_workspace_tenant_id, role)`` when this
+    request operates on a workspace the caller was INVITED to, else ``None``.
+
+    Role enforcement only matters cross-workspace: every tenant is implicitly
+    owner of their own workspace. We fast-path with NO database hit when there
+    is no ``X-Workspace-Tenant-Id`` header — the overwhelmingly common solo-owner
+    case the dashboard never sends a header for. ``None`` is returned for
+    self-hosted, demo, unauthenticated, own-workspace, and not-a-member requests
+    (none of which need a role gate at this layer).
+    """
+    if not _hosted_mode():
+        return None
+    if request.cookies.get(_DEMO_CONTEXT_COOKIE):
+        return None
+    ws_header = request.headers.get("x-workspace-tenant-id", "").strip()
+    if not ws_header:
+        return None  # operating on own workspace → owner → no gate, no DB hit
+    caller = await _get_tenant_from_request(request)
+    if caller is None:
+        return None  # unauthenticated → the route's own auth returns 401
+    if ws_header == caller.get("id"):
+        return None  # header explicitly names the caller's own workspace
+    from . import db as _db_module
+    resolved = await _db_module.resolve_member_role(
+        request.app.state.db, ws_header, caller.get("email", ""),
+    )
+    if resolved is None:
+        # Not an accepted member of ws_header → _db() will NOT switch the active
+        # DB to it, so the write lands on the caller's own DB where they are
+        # owner. Nothing to gate here.
+        return None
+    return (caller.get("email", ""), ws_header, resolved[0])
