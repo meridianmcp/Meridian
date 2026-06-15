@@ -11128,6 +11128,17 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
     }
     await loadConfig();
     await loadProjects();
+    if (state.projects.length === 0 && !state.activeWorkspaceTenantId && isHostedMode() && !isDemoMode()) {
+      try {
+        const wss = await fetch("/me/workspaces").then((r) => r.ok ? r.json() : null);
+        const first = wss && wss.find((w) => !w.is_own);
+        if (first) {
+          state.activeWorkspaceTenantId = first.tenant_id;
+          await loadProjects();
+        }
+      } catch (_) {
+      }
+    }
     if (isDemoMode()) hideDemoAdminControls();
     if (isHostedMode()) hideHostedAdminControls();
     showLocalServerControls();

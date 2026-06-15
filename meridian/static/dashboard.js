@@ -10530,6 +10530,20 @@ async function restoreTabs() {
 
   await loadProjects();
 
+  // 90de5ac9 (follow-up) — existing invited members who have no own projects:
+  // silently switch to their first accepted workspace membership so they land
+  // in the right context without being shown the 'create first project' wizard.
+  if (state.projects.length === 0 && !state.activeWorkspaceTenantId && isHostedMode() && !isDemoMode()) {
+    try {
+      const wss = await fetch('/me/workspaces').then(r => r.ok ? r.json() : null);
+      const first = wss && wss.find(w => !w.is_own);
+      if (first) {
+        state.activeWorkspaceTenantId = first.tenant_id;
+        await loadProjects();
+      }
+    } catch (_) {}
+  }
+
   if (isDemoMode()) hideDemoAdminControls();
 
   if (isHostedMode()) hideHostedAdminControls();
