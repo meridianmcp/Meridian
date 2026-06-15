@@ -1014,7 +1014,7 @@ async def _dispatch_mcp_tool(
         )
     if name == "get_notes":
         return await db_module.get_project_notes(
-            db, args["project_id"], tag=args.get("tag"),
+            db, args["project_id"], tag=args.get("tag"), query=args.get("query"),
         )
     if name == "delete_note":
         ok = await db_module.delete_project_note(db, args["note_id"])

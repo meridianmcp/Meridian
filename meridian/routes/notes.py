@@ -14,13 +14,13 @@ router = APIRouter()
 
 @router.get("/projects/{project_id}/notes")
 async def list_project_notes_endpoint(
-    project_id: str, request: Request, tag: str | None = None
+    project_id: str, request: Request, tag: str | None = None, query: str | None = None
 ) -> list[dict[str, Any]]:
-    """Project notes (newest first). ``?tag=X`` filters by substring match."""
+    """Project notes (newest first). ``?tag=X`` filters by tag; ``?query=X`` searches title+body."""
     project = await db_module.get_project(await _db(request), project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="project not found")
-    return await db_module.get_project_notes(await _db(request), project_id, tag=tag)
+    return await db_module.get_project_notes(await _db(request), project_id, tag=tag, query=query)
 
 
 @router.post("/projects/{project_id}/notes", status_code=201)
