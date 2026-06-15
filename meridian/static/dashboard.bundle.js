@@ -1108,7 +1108,7 @@
       return `<tr><td style="color:var(--text);padding:2px 10px 2px 0">${escapeHtml(name)}</td><td style="color:var(--muted);padding:2px 10px 2px 0">${type}</td><td style="color:var(--muted);padding:2px 10px 2px 0;font-style:italic">${req}</td><td style="color:var(--muted);padding:2px 0">${desc}</td></tr>`;
     }).join("");
     const signature = Object.keys(props).map((n) => required.has(n) ? n : `${n}?`).join(", ");
-    return `<div style="margin-bottom:12px"><div style="color:var(--text);font-weight:600">${escapeHtml(tool.name)}(<span style="color:var(--muted)">${escapeHtml(signature)}</span>)</div><div style="color:var(--muted);margin:3px 0 4px 0;font-size:10.5px">${escapeHtml(tool.description || "")}</div>${params ? `<table style="font-size:10px;border-collapse:collapse;width:100%">${params}</table>` : ""}</div>`;
+    return `<div class="tool-entry" data-search="${escapeHtml((tool.name || "") + " " + (tool.description || ""))}" style="margin-bottom:14px"><div style="color:var(--text);font-weight:600;font-size:13px">${escapeHtml(tool.name)}(<span style="color:var(--muted);font-weight:400">${escapeHtml(signature)}</span>)</div><div style="color:var(--muted);margin:3px 0 5px 0;font-size:12px;line-height:1.45">${escapeHtml(tool.description || "")}</div>${params ? `<table style="font-size:11px;border-collapse:collapse;width:100%">${params}</table>` : ""}</div>`;
   }
   try {
     Object.assign(window, { _renderToolEntry: _renderToolEntry2 });
@@ -1690,10 +1690,72 @@
     const slug = (proj?.name || "meridian").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 24) || "meridian";
     return slug;
   }
+  function _applySettingsRoleVisibility(projectId, guest) {
+    if (!guest) return;
+    const body = document.getElementById(`settings-body-${projectId}`);
+    if (!body) return;
+    [
+      `settings-account-card-${projectId}`,
+      // account + plan + billing + delete
+      `settings-account-danger-${projectId}`,
+      // export my data + danger zone
+      `settings-notifications-card-${projectId}`,
+      // ntfy / webhook / email
+      `workspace-section-${projectId}`
+      // workspace defaults + decisions/notes
+    ].forEach((id) => {
+      const el = document.getElementById(id);
+      if (el) el.style.display = "none";
+    });
+    const inviteForm = document.getElementById(`settings-invite-form-${projectId}`);
+    if (inviteForm) inviteForm.style.display = "none";
+    body.querySelectorAll("button").forEach((b) => {
+      if (/^save\b/i.test((b.textContent || "").trim())) b.style.display = "none";
+    });
+  }
+  function _detectClientOS() {
+    const ua = (navigator.userAgent || navigator.platform || "").toLowerCase();
+    return ua.includes("win") ? "windows" : "unix";
+  }
+  function _collapseConnectPlatforms(projectId) {
+    const body = document.getElementById(`settings-body-${projectId}`);
+    if (!body) return;
+    const os = _detectClientOS();
+    const grids = /* @__PURE__ */ new Set();
+    body.querySelectorAll('pre[id^="hooks-install-"]').forEach((pre) => {
+      const platform = pre.id.includes("-windows-") ? "windows" : "unix";
+      const wrap = pre.parentElement;
+      if (!wrap) return;
+      wrap.dataset.connectPlatform = platform;
+      wrap.style.display = platform === os ? "" : "none";
+      if (wrap.parentElement) grids.add(wrap.parentElement);
+    });
+    grids.forEach((grid) => {
+      if (grid.parentElement && grid.parentElement.querySelector(".connect-os-toggle")) return;
+      const link = document.createElement("a");
+      link.href = "#";
+      link.className = "connect-os-toggle";
+      link.textContent = "Show other platforms";
+      link.style.cssText = "display:inline-block;margin:2px 0 6px;font-size:10px;color:var(--accent);text-decoration:none;cursor:pointer";
+      link.onclick = (e) => {
+        e.preventDefault();
+        const expanded = link.dataset.expanded === "1";
+        grid.querySelectorAll("[data-connect-platform]").forEach((el) => {
+          el.style.display = expanded ? el.dataset.connectPlatform === os ? "" : "none" : "";
+        });
+        link.dataset.expanded = expanded ? "" : "1";
+        link.textContent = expanded ? "Show other platforms" : "Show detected platform only";
+      };
+      grid.insertAdjacentElement("afterend", link);
+    });
+  }
   async function loadSettingsTab2(projectId) {
     const body = document.getElementById(`settings-body-${projectId}`);
     if (!body) return;
     body.innerHTML = '<div style="color:var(--muted);font-size:11px">loading\u2026</div>';
+    const _activeRole = await getActiveWorkspaceRole();
+    const _guest = _activeRole === "viewer" || _activeRole === "member";
+    const _canInvite = _activeRole === "owner" || _activeRole === "admin";
     const PREFS = [
       { key: "hitl", label: "HITL \u2014 get notified when a session needs your input" },
       { key: "sprint", label: "Sprint done \u2014 all items completed" }
@@ -1838,7 +1900,7 @@ stop = ${JSON.stringify(stop)}`;
           const payLink = window.state.serverConfig?.stripe_payment_link || "/pricing";
           resubBtn = `<a href="${escapeHtml(payLink)}" class="primary" style="padding:4px 10px;font-size:10px;text-decoration:none;background:var(--accent);color:#001020;border-radius:4px;font-weight:600">${window.state.tenantExpired ? "Resubscribe" : "Upgrade to Standard"}</a>`;
         }
-        html += `<div data-demo-hide style="margin-bottom:14px;padding:10px 12px;border:1px solid var(--border);border-radius:6px;background:var(--surface-2)">
+        html += `<div data-demo-hide id="settings-account-card-${projectId}" style="margin-bottom:14px;padding:10px 12px;border:1px solid var(--border);border-radius:6px;background:var(--surface-2)">
 
       <div style="font-weight:600;font-size:11px;color:var(--text);margin-bottom:6px">Account</div>
 
@@ -3325,7 +3387,7 @@ project_id = "${displayPid}"`;
 
       <div id="members-list-${projectId}" style="margin-bottom:10px;font-size:11px;font-family:var(--font-mono)"><div style="color:var(--muted)">loading\u2026</div></div>
 
-      <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
+      <div id="settings-invite-form-${projectId}" style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
 
         <input id="invite-email-${projectId}" type="email" placeholder="teammate@example.com" style="background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:4px 8px;flex:1;min-width:160px">
 
@@ -3375,6 +3437,9 @@ project_id = "${displayPid}"`;
 
             </div>`;
               }).join("");
+              if (_guest) {
+                listEl.querySelectorAll('.member-role-select, .resend-invite-btn, button[title="Remove member"]').forEach((el) => el.remove());
+              }
               listEl.querySelectorAll("select.member-role-select").forEach((sel) => {
                 sel.dataset.prev = sel.value;
                 sel.onchange = async () => {
@@ -3469,7 +3534,7 @@ project_id = "${displayPid}"`;
       }
       const isDemo = !!window.state.serverConfig?.demo_mode;
       if (mcpData && !isDemo) {
-        html += `<div style="margin-bottom:16px">
+        html += `<div style="margin-bottom:16px" id="settings-account-danger-${projectId}">
 
       <div style="color:var(--accent);font-size:10px;letter-spacing:.06em;text-transform:uppercase;margin-bottom:10px;padding-bottom:4px;border-bottom:1px solid var(--border)">Account</div>
 
@@ -3663,7 +3728,7 @@ project_id = "${displayPid}"`;
       }
       const ntfyInputDisabled = ntfyWarnAcknowledged ? "" : "disabled";
       const ntfyWarnDisplay = ntfyWarnAcknowledged ? "display:none" : "";
-      html += `<div data-demo-hide style="margin-bottom:14px;padding:10px 12px;border:1px solid var(--border);border-radius:6px;background:var(--surface-2)">
+      html += `<div data-demo-hide id="settings-notifications-card-${projectId}" style="margin-bottom:14px;padding:10px 12px;border:1px solid var(--border);border-radius:6px;background:var(--surface-2)">
 
     <div style="font-weight:600;font-size:11px;color:var(--text);margin-bottom:4px">Notifications</div>
 
@@ -3770,6 +3835,8 @@ project_id = "${displayPid}"`;
         body.innerHTML = `<div style="color:var(--error);font-size:11px">Failed to render settings: ${escapeHtml(String(renderErr))}</div>`;
         return;
       }
+      _applySettingsRoleVisibility(projectId, _guest);
+      _collapseConnectPlatforms(projectId);
       if (isDemoMode()) hideDemoAdminControls();
       setTimeout(() => {
         const titleIn = document.getElementById("blog-title");
@@ -4540,7 +4607,7 @@ ${n.tags || ""}`.toLowerCase();
               <span style="color:var(--accent);font-weight:600;font-size:${isInsight ? "13px" : "12px"}">${escapeHtml(n.title || "")}</span>
               <span style="color:var(--muted);font-size:10px">${escapeHtml(dt)}</span>
             </div>
-            <button class="secondary notes-del-btn" data-note-id="${escapeHtml(n.id)}" style="padding:1px 8px;font-size:10px">Delete</button>
+            <button class="secondary notes-del-btn guest-hidden" data-note-id="${escapeHtml(n.id)}" style="padding:1px 8px;font-size:10px">Delete</button>
           </div>
           <div style="margin-bottom:6px">${kindPill}${autoPill}${pills}</div>
           <div class="note-body-md" style="color:var(--text);line-height:1.5;font-size:12px">${typeof marked !== "undefined" ? marked.parse(n.body || "") : escapeHtml(n.body || "")}</div>
@@ -4776,13 +4843,13 @@ ${n.tags || ""}`.toLowerCase();
     });
     wrap.innerHTML = '<div style="color:var(--muted)">loading rewind\u2026</div>';
     try {
-      const [data, history, stats] = await Promise.all([
+      const [data, history2, stats] = await Promise.all([
         api(`/projects/${projectId}/rewind?days=${days}`),
         api(`/projects/${projectId}/goal-history`).catch(() => []),
         api(`/projects/${projectId}/stats?days=30`).catch(() => null)
       ]);
       const activeTab = p && p.rewindSubtab || "versions";
-      wrap.innerHTML = renderRewindSubtabs(projectId, data, history, stats, activeTab);
+      wrap.innerHTML = renderRewindSubtabs(projectId, data, history2, stats, activeTab);
       wrap.querySelectorAll(".rewind-subtab-btn").forEach((btn) => {
         btn.onclick = () => {
           const tab = btn.dataset.tab;
@@ -4799,7 +4866,7 @@ ${n.tags || ""}`.toLowerCase();
       wrap.innerHTML = `<div style="color:var(--status-failed)">rewind failed: ${escapeHtml(e.message)}</div>`;
     }
   }
-  function renderRewindSubtabs(projectId, data, history, stats, activeTab) {
+  function renderRewindSubtabs(projectId, data, history2, stats, activeTab) {
     const tabs = [
       { id: "versions", label: "\u{1F4E6} Milestones" },
       { id: "sprint", label: "\u26A1 Sprint items" },
@@ -4809,7 +4876,7 @@ ${n.tags || ""}`.toLowerCase();
     ];
     const tabBar = `<div class="rewind-subtab-bar">${tabs.map((t) => `<button class="rewind-subtab-btn${activeTab === t.id ? " active" : ""}" data-tab="${t.id}">${t.label}</button>`).join("")}</div>`;
     const make = (id, html) => `<div class="rewind-subtab-pane" data-tab="${id}" style="${activeTab === id ? "" : "display:none"}">${html}</div>`;
-    return tabBar + make("activity", renderRewindActivity(projectId, data)) + make("versions", renderRewindVersions(projectId, data)) + make("sprint", renderRewindSprint(projectId, data)) + make("goals", renderRewindGoals(projectId, data, history)) + make("charts", renderRewindCharts(projectId, stats));
+    return tabBar + make("activity", renderRewindActivity(projectId, data)) + make("versions", renderRewindVersions(projectId, data)) + make("sprint", renderRewindSprint(projectId, data)) + make("goals", renderRewindGoals(projectId, data, history2)) + make("charts", renderRewindCharts(projectId, stats));
   }
   function renderRewindCharts(projectId, stats) {
     if (!stats) {
@@ -5026,7 +5093,7 @@ ${n.tags || ""}`.toLowerCase();
   </section>`;
     return versions + sprints + summary;
   }
-  function renderRewindGoals(projectId, data, history) {
+  function renderRewindGoals(projectId, data, history2) {
     const preStyle = "margin:0;white-space:pre-wrap;word-break:break-word;background:var(--bg-card);padding:6px;border-radius:3px;font-size:10px;font-family:inherit";
     const goals = _rewindSec("\u{1F3AF}", "Goal changes", (data.goal_changes || []).slice().reverse(), (g, idx) => {
       const id = `gc-expand-${projectId}-${idx}`;
@@ -5055,8 +5122,8 @@ ${n.tags || ""}`.toLowerCase();
     </div>`;
     });
     let historyHtml = "";
-    if (history && history.length) {
-      const rows = [...history].reverse().map((v, idx) => {
+    if (history2 && history2.length) {
+      const rows = [...history2].reverse().map((v, idx) => {
         const id = `gv-expand-${projectId}-${idx}`;
         const raw = (v.version_goal || v.north_star || "").replace(/\s+/g, " ").trim();
         const snippet = raw.length > 80 ? raw.slice(0, 79) + "\u2026" : raw;
@@ -5094,7 +5161,7 @@ ${n.tags || ""}`.toLowerCase();
       });
       historyHtml = `<section style="margin-top:14px;padding-top:10px;border-top:1px solid var(--border)">
 
-      <div style="color:var(--accent);font-weight:600;margin-bottom:6px">\u{1F4DC} Goal version history (${history.length} versions, newest first)</div>
+      <div style="color:var(--accent);font-weight:600;margin-bottom:6px">\u{1F4DC} Goal version history (${history2.length} versions, newest first)</div>
 
       ${rows.join("")}
 
@@ -5265,6 +5332,8 @@ ${n.tags || ""}`.toLowerCase();
       await loadProjects();
       const active = workspaces.find((w) => w.tenant_id === chosen);
       sel.title = active ? active.is_own ? "My workspace" : `${active.owner_email} (${active.role})` : "";
+      _renderWorkspaceContextBadge(wrap, workspaces);
+      _refreshGuestMode();
     };
     const connectLink = document.createElement("a");
     connectLink.id = "connect-db-link";
@@ -5285,10 +5354,73 @@ ${n.tags || ""}`.toLowerCase();
     };
     wrap.appendChild(label);
     wrap.appendChild(sel);
+    _renderWorkspaceContextBadge(wrap, workspaces);
     wrap.appendChild(connectLink);
     const existingLabel = footer.querySelector(".hosted-label");
     if (existingLabel) footer.insertBefore(wrap, existingLabel);
     else footer.prepend(wrap);
+  }
+  async function getActiveWorkspaceRole2() {
+    if (!isHostedMode() || !state.activeWorkspaceTenantId) return "owner";
+    try {
+      const wss = await fetch("/me/workspaces").then((r) => r.ok ? r.json() : null);
+      const ws = (wss || []).find((w) => w.tenant_id === state.activeWorkspaceTenantId);
+      return ws && ws.role || "owner";
+    } catch (_) {
+      return "owner";
+    }
+  }
+  function _renderWorkspaceContextBadge(wrap, workspaces) {
+    if (!wrap) return;
+    let badge = wrap.querySelector(".ws-context-badge");
+    if (!badge) {
+      badge = document.createElement("div");
+      badge.className = "ws-context-badge";
+      badge.style.cssText = "display:inline-block;margin-top:6px;padding:2px 8px;border-radius:10px;font-size:9px;font-weight:700;letter-spacing:.05em;font-family:var(--font-mono);text-transform:uppercase";
+      wrap.appendChild(badge);
+    }
+    const active = (workspaces || []).find((w) => state.activeWorkspaceTenantId ? w.tenant_id === state.activeWorkspaceTenantId : w.is_own);
+    const colors = { free: "#3b82f6", trial: "#059669", standard: "#3b82f6", pro: "#7c3aed", admin: "#9ca3af", invite: "#f59e0b" };
+    let label, color;
+    if (active && !active.is_own) {
+      label = `invite \xB7 ${active.role || "member"}`;
+      color = colors.invite;
+    } else {
+      const plan = window.state.tenantPlan || "free";
+      label = window._PLAN_LABELS && window._PLAN_LABELS[plan] || plan;
+      color = colors[plan] || "#9ca3af";
+    }
+    badge.textContent = label;
+    badge.style.background = color + "22";
+    badge.style.color = color;
+    badge.style.border = "1px solid " + color + "44";
+  }
+  function _filterTabRows(query, container, rowSelector) {
+    if (!container) return;
+    const q = (query || "").trim().toLowerCase();
+    container.querySelectorAll(rowSelector).forEach((row) => {
+      const hay = (row.dataset.search || row.textContent || "").toLowerCase();
+      row.style.display = !q || hay.includes(q) ? "" : "none";
+    });
+  }
+  function _wireTabSearch(inputId, containerId, rowSelector) {
+    const input = document.getElementById(inputId);
+    const container = document.getElementById(containerId);
+    if (!input || !container) return;
+    if (!input.dataset.searchWired) {
+      input.dataset.searchWired = "1";
+      input.addEventListener("input", () => _filterTabRows(input.value, container, rowSelector));
+    }
+    _filterTabRows(input.value, container, rowSelector);
+  }
+  async function _refreshGuestMode() {
+    let guest = false;
+    try {
+      const r = await getActiveWorkspaceRole2();
+      guest = r === "viewer" || r === "member";
+    } catch (_) {
+    }
+    document.body.classList.toggle("meridian-guest", guest);
   }
   function showConnectDbModal() {
     if (document.getElementById("connect-db-modal")) return;
@@ -6921,6 +7053,10 @@ Current: ${current || "(none)"}`,
           </div>
         </div>
 
+        <div style="padding:6px 10px;border-bottom:1px solid var(--border)">
+          <input type="text" id="devlog-search-${project.id}" placeholder="Search dev log (description, session)\u2026" style="width:100%;box-sizing:border-box;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;color:var(--text);font-size:11px;font-family:var(--font-mono);padding:4px 8px;outline:none">
+        </div>
+
         <div class="scroll-area"><div class="task-list" id="tasks-${project.id}"></div></div>
 
       </div>
@@ -7172,6 +7308,8 @@ Current: ${current || "(none)"}`,
 
           <div style="display:flex;gap:6px;align-items:center">
 
+            <input type="text" id="hitl-search-${project.id}" placeholder="search\u2026" style="background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:2px 6px;outline:none;width:110px">
+
             <select id="hitl-status-filter-${project.id}" style="background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:2px 6px">
 
               <option value="pending">pending</option>
@@ -7243,6 +7381,8 @@ Current: ${current || "(none)"}`,
           </span>
 
           <span style="display:flex;gap:6px;align-items:center">
+
+            <input type="text" id="team-search-${project.id}" placeholder="search\u2026" style="background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:2px 6px;outline:none;width:100px">
 
             <select id="team-days-${project.id}" style="background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:2px 4px">
 
@@ -8834,7 +8974,9 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
         });
         html += "</div>";
       }
-      body.innerHTML = html;
+      const _toolSearch = `<div style="position:sticky;top:0;background:var(--surface-1,#10131a);padding:0 0 8px;margin-bottom:6px;z-index:2"><input type="text" id="docs-search-${projectId}" placeholder="Search tools by name or description\u2026" style="width:100%;box-sizing:border-box;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;color:var(--text);font-size:12px;font-family:var(--font-mono);padding:5px 9px;outline:none"></div>`;
+      body.innerHTML = _toolSearch + html;
+      _wireTabSearch(`docs-search-${projectId}`, `docs-body-${projectId}`, ".tool-entry");
     } catch (e) {
       body.innerHTML = `<div style="color:var(--error)">Failed to load tools: ${escapeHtml(String(e))}</div>`;
     }
@@ -8955,6 +9097,10 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
           }
           const hitlOpts = optPayload && Array.isArray(optPayload.options) ? optPayload.options : [];
           const hitlRec = optPayload && typeof optPayload.recommended === "string" ? optPayload.recommended : null;
+          const dualChannelHint = st === "pending" && !isMd && (urg === "blocking" || urg === "high") ? `<div style="margin-top:6px;display:flex;align-items:center;gap:6px;font-size:10px;color:var(--accent)">
+               <span title="Also displayed inline in Claude Code \u2014 first answer (dashboard or chat) wins">\u{1F4DF} Dual-channel \u2014 also shown in Claude Code chat</span>
+               <button class="secondary hitl-copy-id-btn" data-hitl-id="${escapeHtml(r.id)}" title="Copy HITL ID to clipboard" style="padding:1px 7px;font-size:9px">Copy ID</button>
+             </div>` : "";
           let actionBtns = "";
           if (st === "pending" && isMd) {
             actionBtns = `
@@ -8998,7 +9144,7 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
 
           </div>`;
           }
-          return `<div style="background:var(--surface-2);border:1px solid var(--border);border-left:3px solid ${urgencyColor[urg] || "var(--accent)"};border-radius:0 4px 4px 0;padding:10px 12px;margin-bottom:8px">
+          return `<div class="hitl-row" data-search="${escapeHtml((r.question || "") + " " + (r.status || "") + " " + (r.context || ""))}" style="background:var(--surface-2);border:1px solid var(--border);border-left:3px solid ${urgencyColor[urg] || "var(--accent)"};border-radius:0 4px 4px 0;padding:10px 12px;margin-bottom:8px">
 
           <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px;margin-bottom:4px">
 
@@ -9020,7 +9166,7 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
 
           <div style="color:var(--muted);font-size:10px">${escapeHtml(dt)}${r.assigned_to ? " \xB7 @" + escapeHtml(r.assigned_to) : ""}</div>
 
-          ${mdMeta}${ctxHtml}${diffHtml}${answerHtml}${applyErr}${actionBtns}
+          ${mdMeta}${ctxHtml}${dualChannelHint}${diffHtml}${answerHtml}${applyErr}${actionBtns}
 
         </div>`;
         };
@@ -9030,6 +9176,7 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
           html += resolved.map(renderCard).join("");
         }
         body.innerHTML = html;
+        _wireTabSearch(`hitl-search-${projectId}`, `hitl-body-${projectId}`, ".hitl-row");
         body.querySelectorAll(".hitl-answer-btn").forEach((btn) => {
           btn.onclick = async () => {
             const id = btn.dataset.hitlId;
@@ -9118,6 +9265,20 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
             }
           };
         });
+        body.querySelectorAll(".hitl-copy-id-btn").forEach((btn) => {
+          btn.onclick = () => {
+            const id = btn.dataset.hitlId;
+            navigator.clipboard.writeText(id).then(() => toast("HITL ID copied \u2713")).catch(() => {
+              const tmp = document.createElement("textarea");
+              tmp.value = id;
+              document.body.appendChild(tmp);
+              tmp.select();
+              document.execCommand("copy");
+              document.body.removeChild(tmp);
+              toast("HITL ID copied \u2713");
+            });
+          };
+        });
       } catch (e) {
         body.innerHTML = `<div style="color:var(--muted)">failed to load HITL queue: ${escapeHtml(String(e))}</div>`;
       }
@@ -9157,7 +9318,7 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
             const desc = (t.description || "").slice(0, 90);
             return `<div style="color:var(--muted);font-size:10px;padding:1px 0">[${escapeHtml(s)}] ${escapeHtml(desc)}</div>`;
           }).join("");
-          return `<div style="background:var(--surface-2);border:1px solid var(--border);border-left:3px solid ${c};border-radius:4px;padding:10px 12px;margin-bottom:8px">
+          return `<div class="team-card" data-search="${escapeHtml((h.human_id || "") + " " + (h.active_session || "") + " " + (h.agent_framework || ""))}" style="background:var(--surface-2);border:1px solid var(--border);border-left:3px solid ${c};border-radius:4px;padding:10px 12px;margin-bottom:8px">
 
           <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px">
 
@@ -9180,8 +9341,8 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
         let goalMarkers = [];
         try {
           const windowStart = Date.now() - days * 86400 * 1e3;
-          const history = await api2(`/projects/${projectId}/goal-history`);
-          const sorted = [...history || []].sort(
+          const history2 = await api2(`/projects/${projectId}/goal-history`);
+          const sorted = [...history2 || []].sort(
             (a, b) => Date.parse((a.created_at || "").replace(" ", "T") + "Z") - Date.parse((b.created_at || "").replace(" ", "T") + "Z")
           );
           sorted.forEach((entry, i) => {
@@ -9265,6 +9426,7 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
         </section>
 
         ${decisionsHtml}`;
+        _wireTabSearch(`team-search-${projectId}`, `team-body-${projectId}`, ".team-card");
       } catch (e) {
         body.innerHTML = renderProjectLoadError2(projectId, "Team summary unavailable", `/team/summary?project_id=${encodeURIComponent(projectId)}&days=${days}`, e);
         wireProjectLoadRetry2(body, projectId);
@@ -10214,7 +10376,7 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
 
             <button class="secondary" data-supersede="${escapeHtml(d.id)}" style="padding:1px 6px;font-size:9px">Supersede</button>
 
-            <button class="secondary" data-archive-decision="${escapeHtml(d.id)}" title="Archive this decision (soft-delete; visible via 'View archived')" style="padding:1px 6px;font-size:9px;color:var(--muted)">Archive</button>
+            <button class="secondary guest-hidden" data-archive-decision="${escapeHtml(d.id)}" title="Archive this decision (soft-delete; visible via 'View archived')" style="padding:1px 6px;font-size:9px;color:var(--muted)">Archive</button>
 
           </div>
 
@@ -10794,6 +10956,7 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
     hitlRoot.innerHTML = hitl.map((t) => renderHitlRow(projectId, t)).join("");
     hitl.forEach((t) => wireHitlRow(projectId, t));
     root.innerHTML = tasks.map((t) => renderTaskRow(t)).join("");
+    _wireTabSearch(`devlog-search-${projectId}`, `tasks-${projectId}`, ".task");
     const existingBtn = document.getElementById(`devlog-load-more-${projectId}`);
     if (existingBtn) existingBtn.remove();
     if (tasks.length === 100) {
@@ -10830,10 +10993,10 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
   }
   function renderTaskRow(t) {
     const claimBadge = t.claimed_by ? `<span class="claim-badge" title="claimed at ${escapeHtml(t.claimed_at || "")}">U0001f512 ${escapeHtml((t.claimed_by_human_id || t.claimed_by_session_name || t.claimed_by || "").slice(0, 16))}</span>` : "";
-    const deleteBtn = `<button title="Delete from task log (permanent)" onclick="deleteTaskRow(event,'${t.id}','${t.status}')" style="background:none;border:none;color:var(--muted);cursor:pointer;font-size:13px;padding:0 4px;flex-shrink:0;line-height:1" onmouseenter="this.style.color='var(--status-failed)'" onmouseleave="this.style.color='var(--muted)'">\xD7</button>`;
+    const deleteBtn = `<button class="guest-hidden" title="Delete from task log (permanent)" onclick="deleteTaskRow(event,'${t.id}','${t.status}')" style="background:none;border:none;color:var(--muted);cursor:pointer;font-size:13px;padding:0 4px;flex-shrink:0;line-height:1" onmouseenter="this.style.color='var(--status-failed)'" onmouseleave="this.style.color='var(--muted)'">\xD7</button>`;
     return `
 
-    <div class="task ${t.status}" id="task-row-${t.id}" style="display:flex;align-items:flex-start;gap:4px">
+    <div class="task ${t.status}" id="task-row-${t.id}" data-search="${escapeHtml((t.description || "") + " " + (t.session_name || "") + " " + (t.claimed_by_session_name || "") + " " + (t.status || ""))}" style="display:flex;align-items:flex-start;gap:4px">
 
       <span class="status-badge">${t.status}</span>
 
@@ -11113,6 +11276,14 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
     }
   }
   (async function init() {
+    const _wsParam = new URLSearchParams(window.location.search).get("ws");
+    if (_wsParam && !state.activeWorkspaceTenantId) {
+      state.activeWorkspaceTenantId = _wsParam;
+      try {
+        history.replaceState(null, "", window.location.pathname);
+      } catch (_) {
+      }
+    }
     await loadServerConfig();
     showFailoverBannerIfNeeded();
     if (typeof window._showConnSetupIfNeeded === "function") {
@@ -11120,8 +11291,21 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
     }
     await loadConfig();
     await loadProjects();
+    if (state.projects.length === 0 && !state.activeWorkspaceTenantId && isHostedMode() && !isDemoMode()) {
+      try {
+        const wss = await fetch("/me/workspaces").then((r) => r.ok ? r.json() : null);
+        const first = wss && wss.find((w) => !w.is_own);
+        if (first) {
+          state.activeWorkspaceTenantId = first.tenant_id;
+          await loadProjects();
+        }
+      } catch (_) {
+      }
+    }
     if (isDemoMode()) hideDemoAdminControls();
     if (isHostedMode()) hideHostedAdminControls();
+    if (isHostedMode() && !isDemoMode()) ensureWorkspaceSwitcher2();
+    _refreshGuestMode();
     showLocalServerControls();
     ensureTourButton();
     ensureFeedbackButton();
@@ -11380,7 +11564,7 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
     }
   }
   try {
-    Object.assign(window, { hideHostedAdminControls, ensureSignOutLink: ensureSignOutLink2, ensureWorkspaceSwitcher: ensureWorkspaceSwitcher2, showConnectDbModal, showLocalServerControls, _summarizeApiErrorText, _projectLoadErrorInfo, wireProjectLoadRetry: wireProjectLoadRetry2, renderProjectLoadError: renderProjectLoadError2, recordProjectLoadError, clearProjectLoadError, renderProjectLoadAlert, retryProjectSurface, syncSidebarActiveProject, autosizeGoalField, githubIconSvg: githubIconSvg2, getConstitutionLimit, loadProjectSettings: loadProjectSettings2, saveProjectSettings: saveProjectSettings2, _demoTourDone: _demoTourDone2, _demoTourSavedStep: _demoTourSavedStep2, _demoTourSaveStep, _demoTourMarkDone, _demoTourClose, _tourActivateVtab, startDemoTour: startDemoTour2, resumeDemoTour, api: api2, projectApi: projectApi2, loadServerConfig, _armAccountSwitchWatch, _refreshOnFocus, _checkAccountSwitch, _showAccountSwitchBanner, updateGitHubConnectionIndicator, _updateConnectionIndicator, checkGitStatus, _doRestart, loadConfig, loadProjects, openTab, closeTab, saveTabs, renderTabs, _makeTabEl, _openTabMenu, _setProjectIcon, _renameProject, _deleteProject, activateTab, buildTabBody, scheduleLiveRefresh, initLiveAutoRefresh, loadLiveTab, refreshLiveTab, wireSprintAddEnter: wireSprintAddEnter2, sprintAction, sprintArchive, filterBackburner, sprintPushPrompt, sprintFeedback, sprintFeedbackNote, sprintItemEdit, addSprintItemFromInput: addSprintItemFromInput2, cacheMostRecentSession, renderLiveSessions, endLiveSession, openTimelineForSession, renderLiveQueue, addLiveTask, cancelLiveTask, showCopyPreview, wireClaudeLaunchPanel, stampHandoffTs, populateSessionDropdown, loadTimeline: loadTimeline2, _renderTimelineLog: _renderTimelineLog2, loadDocsTab, normalizeNotifyTarget, displayNotifyTarget: displayNotifyTarget2, osExecutorHintBanner: osExecutorHintBanner2, showFailoverBannerIfNeeded, suggestNtfyTopic, loadHitlTab, loadTeamTab, updateLiveFeed, loadRecentSessions, loadMilestones, loadRecentRuns, loadQueue, renderSearchResults: renderSearchResults2, wireQueueSectionToggles, refreshTab, refreshGoal, parseDecisionsBlob, renderConstitutionWarning: renderConstitutionWarning2, _hitlBadgeClick, initHitlPanel, setVtabCountBadge: setVtabCountBadge2, refreshProjectCountBadges, refreshHitl, _hitlAnswer, _hitlDismiss, loadPinnedDecisions, supersedePinnedDecision, addPinnedDecision, consolidateDecisions, renderDecisionsTable, wireGoalPreviewToggle, saveGoal, saveNorthStar, saveSprint, _sessionPresenceDot, refreshSessions, refreshTasks, renderTasks, _loadMoreTasks, renderTaskRow, deleteTaskRow, renderHitlRow, wireHitlRow, appendToGoal, hitlReply, hitlExecute, connectWs, handleWsEvent, restoreTabs, _deleteSprintItem, _sprintAction, completeSprintItem, failSprintItem, toggleExpand, state });
+    Object.assign(window, { hideHostedAdminControls, ensureSignOutLink: ensureSignOutLink2, ensureWorkspaceSwitcher: ensureWorkspaceSwitcher2, getActiveWorkspaceRole: getActiveWorkspaceRole2, showConnectDbModal, showLocalServerControls, _summarizeApiErrorText, _projectLoadErrorInfo, wireProjectLoadRetry: wireProjectLoadRetry2, renderProjectLoadError: renderProjectLoadError2, recordProjectLoadError, clearProjectLoadError, renderProjectLoadAlert, retryProjectSurface, syncSidebarActiveProject, autosizeGoalField, githubIconSvg: githubIconSvg2, getConstitutionLimit, loadProjectSettings: loadProjectSettings2, saveProjectSettings: saveProjectSettings2, _demoTourDone: _demoTourDone2, _demoTourSavedStep: _demoTourSavedStep2, _demoTourSaveStep, _demoTourMarkDone, _demoTourClose, _tourActivateVtab, startDemoTour: startDemoTour2, resumeDemoTour, api: api2, projectApi: projectApi2, loadServerConfig, _armAccountSwitchWatch, _refreshOnFocus, _checkAccountSwitch, _showAccountSwitchBanner, updateGitHubConnectionIndicator, _updateConnectionIndicator, checkGitStatus, _doRestart, loadConfig, loadProjects, openTab, closeTab, saveTabs, renderTabs, _makeTabEl, _openTabMenu, _setProjectIcon, _renameProject, _deleteProject, activateTab, buildTabBody, scheduleLiveRefresh, initLiveAutoRefresh, loadLiveTab, refreshLiveTab, wireSprintAddEnter: wireSprintAddEnter2, sprintAction, sprintArchive, filterBackburner, sprintPushPrompt, sprintFeedback, sprintFeedbackNote, sprintItemEdit, addSprintItemFromInput: addSprintItemFromInput2, cacheMostRecentSession, renderLiveSessions, endLiveSession, openTimelineForSession, renderLiveQueue, addLiveTask, cancelLiveTask, showCopyPreview, wireClaudeLaunchPanel, stampHandoffTs, populateSessionDropdown, loadTimeline: loadTimeline2, _renderTimelineLog: _renderTimelineLog2, loadDocsTab, normalizeNotifyTarget, displayNotifyTarget: displayNotifyTarget2, osExecutorHintBanner: osExecutorHintBanner2, showFailoverBannerIfNeeded, suggestNtfyTopic, loadHitlTab, loadTeamTab, updateLiveFeed, loadRecentSessions, loadMilestones, loadRecentRuns, loadQueue, renderSearchResults: renderSearchResults2, wireQueueSectionToggles, refreshTab, refreshGoal, parseDecisionsBlob, renderConstitutionWarning: renderConstitutionWarning2, _hitlBadgeClick, initHitlPanel, setVtabCountBadge: setVtabCountBadge2, refreshProjectCountBadges, refreshHitl, _hitlAnswer, _hitlDismiss, loadPinnedDecisions, supersedePinnedDecision, addPinnedDecision, consolidateDecisions, renderDecisionsTable, wireGoalPreviewToggle, saveGoal, saveNorthStar, saveSprint, _sessionPresenceDot, refreshSessions, refreshTasks, renderTasks, _loadMoreTasks, renderTaskRow, deleteTaskRow, renderHitlRow, wireHitlRow, appendToGoal, hitlReply, hitlExecute, connectWs, handleWsEvent, restoreTabs, _deleteSprintItem, _sprintAction, completeSprintItem, failSprintItem, toggleExpand, state });
   } catch (e) {
   }
 })();

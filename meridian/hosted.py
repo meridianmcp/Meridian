@@ -586,7 +586,16 @@ async def _post_login_redirect(tenant: dict, db=None, next_url: str = "") -> str
                 if existing_membership is not None:
                     if next_url and next_url.startswith("/") and not next_url.startswith("//"):
                         return next_url
-                    return _cfg("MERIDIAN_AFTER_LOGIN_URL", "/dashboard")
+                    # 90de5ac9 — invited user with no own projects: send them
+                    # directly into the inviter's workspace by encoding the
+                    # owner's tenant_id in the redirect URL.  The dashboard JS
+                    # reads ?ws= on init and sets activeWorkspaceTenantId so
+                    # /projects returns the owner's project list immediately.
+                    owner_tid = existing_membership.get("tenant_id", "")
+                    base = _cfg("MERIDIAN_AFTER_LOGIN_URL", "/dashboard")
+                    if owner_tid:
+                        return f"{base}?ws={owner_tid}"
+                    return base
                 free_count = await db_module.count_tenants_by_plan(
                     db, "free", provisioned_only=True
                 )
@@ -634,6 +643,30 @@ async def _auto_accept_pending_invites(db: Any, email: str) -> None:
             await db_module.accept_workspace_invite(db, invite["id"])
     except Exception:
         pass  # never block login on invite-accept failure
+
+
+async def _consume_pending_invite_cookie(request: Any, db: Any) -> str | None:
+    """fbbe99af — accept invite token stored in the pending_invite_token cookie.
+
+    /workspace/accept stores the token here before redirecting to OAuth so it
+    survives the provider redirect chain (the ?next= URL alone drops the token).
+    Returns "/dashboard" if an invite was found and accepted, None otherwise.
+    Caller must call response.delete_cookie("pending_invite_token") to clear it.
+    """
+    import hashlib
+    from . import db as db_module
+    token = request.cookies.get("pending_invite_token", "")
+    if not token:
+        return None
+    try:
+        token_hash = hashlib.sha256(token.encode()).hexdigest()
+        invite = await db_module.get_workspace_invite_by_token_hash(db, token_hash)
+        if invite:
+            await db_module.accept_workspace_invite(db, invite["id"])
+            return "/dashboard"
+    except Exception:
+        pass
+    return None
 
 
 async def auth_callback(request: Request) -> RedirectResponse:
@@ -686,6 +719,11 @@ async def auth_callback(request: Request) -> RedirectResponse:
     # Safety: only allow local paths
     if not (_next_url.startswith("/") and not _next_url.startswith("//")):
         _next_url = ""
+    # fbbe99af — consume pending invite cookie (takes priority; clears token so
+    # the /workspace/accept redirect doesn't 404 on the already-accepted token)
+    _invite_url = await _consume_pending_invite_cookie(request, db)
+    if _invite_url:
+        _next_url = _invite_url
     redirect_to = await _post_login_redirect(tenant, db, next_url=_next_url)
     response = RedirectResponse(redirect_to, status_code=302)
     response.set_cookie(
@@ -697,6 +735,7 @@ async def auth_callback(request: Request) -> RedirectResponse:
         max_age=_SESSION_MAX_AGE_HOURS * 3600,
     )
     response.delete_cookie("meridian_demo")
+    response.delete_cookie("pending_invite_token")
     return response
 
 
@@ -778,6 +817,9 @@ async def auth_github_callback(request: Request) -> RedirectResponse:
     session = await db_module.create_user_session(db, tenant["id"], expires_at)
     cookie_value = _make_session_cookie(session["id"])
 
+    _invite_url = await _consume_pending_invite_cookie(request, db)
+    if _invite_url:
+        _next_url = _invite_url
     redirect_to = await _post_login_redirect(tenant, db, next_url=_next_url)
     response = RedirectResponse(redirect_to, status_code=302)
     response.set_cookie(
@@ -789,6 +831,7 @@ async def auth_github_callback(request: Request) -> RedirectResponse:
         max_age=_SESSION_MAX_AGE_HOURS * 3600,
     )
     response.delete_cookie("meridian_demo")
+    response.delete_cookie("pending_invite_token")
     return response
 
 
@@ -918,6 +961,9 @@ async def auth_microsoft_callback(request: Request) -> RedirectResponse:
     session = await db_module.create_user_session(db, tenant["id"], expires_at)
     cookie_value = _make_session_cookie(session["id"])
 
+    _invite_url = await _consume_pending_invite_cookie(request, db)
+    if _invite_url:
+        _next_url = _invite_url
     redirect_to = await _post_login_redirect(tenant, db, next_url=_next_url)
     response = RedirectResponse(redirect_to, status_code=302)
     response.set_cookie(
@@ -929,6 +975,7 @@ async def auth_microsoft_callback(request: Request) -> RedirectResponse:
         max_age=_SESSION_MAX_AGE_HOURS * 3600,
     )
     response.delete_cookie("meridian_demo")
+    response.delete_cookie("pending_invite_token")
     return response
 
 
@@ -2431,6 +2478,33 @@ async def auth_magic_request(request: Request):
     return JSONResponse(payload)
 
 
+def _magic_error_page(message: str, *, status_code: int, title: str = "Sign-in link problem"):
+    """fdf1120f — render a friendly HTML page for magic-link failures.
+
+    The verify endpoint is opened directly in a browser (often a mobile mail
+    app), so a raw JSON HTTPException renders as a blank/confusing page. Return
+    real HTML with a clear path back to request a fresh link.
+    """
+    from fastapi.responses import HTMLResponse
+    html = (
+        '<!doctype html><html lang="en"><head><meta charset="utf-8">'
+        '<meta name="viewport" content="width=device-width, initial-scale=1">'
+        f'<title>Meridian — {title}</title></head>'
+        '<body style="margin:0;background:#0a0e14;color:#e6edf3;font-family:-apple-system,'
+        "BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;display:flex;min-height:100vh;"
+        'align-items:center;justify-content:center">'
+        '<div style="max-width:380px;padding:32px 28px;text-align:center">'
+        '<div style="font-size:30px;margin-bottom:10px">🧭</div>'
+        f'<h1 style="font-size:18px;margin:0 0 10px;font-weight:600">{title}</h1>'
+        f'<p style="font-size:14px;color:#9ca3af;line-height:1.6;margin:0 0 22px">{message}</p>'
+        '<a href="/auth/login" style="display:inline-block;padding:10px 22px;background:#3b82f6;'
+        'color:#fff;text-decoration:none;border-radius:6px;font-size:14px;font-weight:600">'
+        'Request a new link →</a>'
+        '</div></body></html>'
+    )
+    return HTMLResponse(html, status_code=status_code)
+
+
 async def auth_magic_verify(request: Request, token: str = ""):
     """v0.9 — GET /auth/magic/verify?token=xxx.
 
@@ -2438,30 +2512,55 @@ async def auth_magic_verify(request: Request, token: str = ""):
     that email, creates a session, sets the cookie, and redirects via
     the shared _post_login_redirect — paywall gate applies symmetrically
     to magic-link sign-ups.
+
+    fdf1120f — this endpoint is opened directly in a browser, so failures
+    return a real HTML page (not a blank JSON error) and the sign-in work is
+    guarded so a transient error never renders a blank 500.
     """
+    import logging as _logging
     from . import db as db_module
 
     raw = (token or "").strip()
     if not raw:
-        raise HTTPException(status_code=400, detail="missing token")
+        return _magic_error_page(
+            "This sign-in link is missing its token. Please request a new one.",
+            status_code=400,
+        )
     token_hash = hashlib.sha256(raw.encode()).hexdigest()
 
     db = request.app.state.db
-    row = await db_module.consume_magic_token(db, token_hash)
+    try:
+        row = await db_module.consume_magic_token(db, token_hash)
+    except Exception:
+        _logging.getLogger("meridian.auth").exception("magic verify: token consume failed")
+        return _magic_error_page(
+            "Something went wrong verifying your link. Please request a new one.",
+            status_code=500, title="Sign-in problem",
+        )
     if row is None:
         # Don't reveal whether expired vs used vs nonexistent.
-        raise HTTPException(status_code=401, detail="link expired or already used")
+        return _magic_error_page(
+            "This sign-in link has expired or was already used. Magic links work "
+            "once and expire after a short time.",
+            status_code=401, title="Link expired",
+        )
 
-    email = row["email"]
-    tenant = await db_module.upsert_tenant(db, email=email)
+    try:
+        email = row["email"]
+        tenant = await db_module.upsert_tenant(db, email=email)
+        expires_at = (
+            datetime.now(timezone.utc) + timedelta(hours=_SESSION_MAX_AGE_HOURS)
+        ).isoformat()
+        session = await db_module.create_user_session(db, tenant["id"], expires_at)
+        cookie_value = _make_session_cookie(session["id"])
+        redirect_to = await _post_login_redirect(tenant, db)
+    except Exception:
+        _logging.getLogger("meridian.auth").exception("magic verify: sign-in failed")
+        return _magic_error_page(
+            "Something went wrong signing you in. Please request a new link.",
+            status_code=500, title="Sign-in problem",
+        )
 
-    expires_at = (
-        datetime.now(timezone.utc) + timedelta(hours=_SESSION_MAX_AGE_HOURS)
-    ).isoformat()
-    session = await db_module.create_user_session(db, tenant["id"], expires_at)
-    cookie_value = _make_session_cookie(session["id"])
-
-    redirect_to = await _post_login_redirect(tenant, db)
     response = RedirectResponse(redirect_to, status_code=302)
     response.set_cookie(
         _SESSION_COOKIE,

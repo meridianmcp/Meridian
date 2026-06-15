@@ -76,8 +76,9 @@ def test_upsert_tenant_creates_row():
     assert t["email"] == "alice@example.com"
     assert t["id"] is not None
     assert t["plan"] == "free"
-    assert t["trial_started_at"] is not None
-    assert t["inactivity_expires_at"] is not None
+    # c3e91df4 — trial clock starts at first project creation, not signup
+    assert t["trial_started_at"] is None
+    assert t["inactivity_expires_at"] is None
 
 
 def test_upsert_tenant_idempotent():
@@ -759,6 +760,48 @@ def test_free_tier_second_project_returns_403(monkeypatch, tmp_path):
             r2 = client.post("/projects", json={"name": "second-project"})
             assert r2.status_code == 403, r2.text
             assert "Free tier" in r2.json()["detail"]
+        finally:
+            _deps._tenant_db_cache.pop(tenant["id"], None)
+
+
+def test_trial_starts_on_first_project_not_at_signup(monkeypatch, tmp_path):
+    """c3e91df4 — trial_started_at must be NULL after signup and set only when
+    the tenant creates their first own project. Invited members who never create
+    a project must never consume a trial slot."""
+    from meridian import db as db_module
+    from meridian import _deps
+    from meridian import hosted as hosted_module
+
+    client = _make_hosted_client(monkeypatch, tmp_path)
+
+    with client:
+        db = client.app.state.db
+
+        async def _setup():
+            return await db_module.upsert_tenant(db, "trial-test@meridian-test.invalid")
+
+        tenant = _run(_setup())
+        # c3e91df4: trial clock must NOT start at signup
+        assert tenant["trial_started_at"] is None
+        assert tenant["inactivity_expires_at"] is None
+
+        _deps._tenant_db_cache[tenant["id"]] = db
+        try:
+            session = _run(
+                db_module.create_user_session(db, tenant["id"], "2099-01-01T00:00:00+00:00")
+            )
+            client.cookies.set(
+                hosted_module._SESSION_COOKIE,
+                hosted_module._make_session_cookie(session["id"]),
+            )
+
+            r = client.post("/projects", json={"name": "first-project"})
+            assert r.status_code == 201, r.text
+
+            # Trial must now be started on the tenant row
+            refreshed = _run(db_module.get_tenant_by_id(db, tenant["id"]))
+            assert refreshed["trial_started_at"] is not None
+            assert refreshed["inactivity_expires_at"] is not None
         finally:
             _deps._tenant_db_cache.pop(tenant["id"], None)
 

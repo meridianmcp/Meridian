@@ -16,6 +16,68 @@ export function suggestNtfyTopic(projectId) {
 
 }
 
+// 9b8261e4 — hide owner-only settings cards from invited viewers/members. The
+// real gate is server-side (393eed0a); this keeps the guest UI honest and clean.
+function _applySettingsRoleVisibility(projectId, guest) {
+  if (!guest) return;
+  const body = document.getElementById(`settings-body-${projectId}`);
+  if (!body) return;
+  [
+    `settings-account-card-${projectId}`,       // account + plan + billing + delete
+    `settings-account-danger-${projectId}`,     // export my data + danger zone
+    `settings-notifications-card-${projectId}`, // ntfy / webhook / email
+    `workspace-section-${projectId}`,           // workspace defaults + decisions/notes
+  ].forEach(id => { const el = document.getElementById(id); if (el) el.style.display = 'none'; });
+  // Keep the team-members list visible (read-only), but drop the invite form.
+  const inviteForm = document.getElementById(`settings-invite-form-${projectId}`);
+  if (inviteForm) inviteForm.style.display = 'none';
+  // Hide every Save button so nothing in the tab is editable.
+  body.querySelectorAll('button').forEach(b => {
+    if (/^save\b/i.test((b.textContent || '').trim())) b.style.display = 'none';
+  });
+}
+
+// e21fc91a — collapse the Meridian Connect install options to the visitor's OS,
+// with a "show other platforms" toggle. Runs post-render over the hooks-install-*
+// blocks so it covers every Connect section without touching the templates.
+function _detectClientOS() {
+  const ua = (navigator.userAgent || navigator.platform || '').toLowerCase();
+  return ua.includes('win') ? 'windows' : 'unix';
+}
+
+function _collapseConnectPlatforms(projectId) {
+  const body = document.getElementById(`settings-body-${projectId}`);
+  if (!body) return;
+  const os = _detectClientOS();
+  const grids = new Set();
+  body.querySelectorAll('pre[id^="hooks-install-"]').forEach(pre => {
+    const platform = pre.id.includes('-windows-') ? 'windows' : 'unix';
+    const wrap = pre.parentElement;
+    if (!wrap) return;
+    wrap.dataset.connectPlatform = platform;
+    wrap.style.display = (platform === os) ? '' : 'none';
+    if (wrap.parentElement) grids.add(wrap.parentElement);
+  });
+  grids.forEach(grid => {
+    if (grid.parentElement && grid.parentElement.querySelector('.connect-os-toggle')) return;
+    const link = document.createElement('a');
+    link.href = '#';
+    link.className = 'connect-os-toggle';
+    link.textContent = 'Show other platforms';
+    link.style.cssText = 'display:inline-block;margin:2px 0 6px;font-size:10px;color:var(--accent);text-decoration:none;cursor:pointer';
+    link.onclick = (e) => {
+      e.preventDefault();
+      const expanded = link.dataset.expanded === '1';
+      grid.querySelectorAll('[data-connect-platform]').forEach(el => {
+        el.style.display = expanded ? (el.dataset.connectPlatform === os ? '' : 'none') : '';
+      });
+      link.dataset.expanded = expanded ? '' : '1';
+      link.textContent = expanded ? 'Show other platforms' : 'Show detected platform only';
+    };
+    grid.insertAdjacentElement('afterend', link);
+  });
+}
+
 export async function loadSettingsTab(projectId) {
 
   const body = document.getElementById(`settings-body-${projectId}`);
@@ -23,6 +85,12 @@ export async function loadSettingsTab(projectId) {
   if (!body) return;
 
   body.innerHTML = '<div style="color:var(--muted);font-size:11px">loading…</div>';
+
+  // 9b8261e4 — when viewing a workspace you were invited to as a viewer/member,
+  // hide owner-only sections (server enforcement lives in 393eed0a).
+  const _activeRole = await getActiveWorkspaceRole();
+  const _guest = _activeRole === 'viewer' || _activeRole === 'member';
+  const _canInvite = _activeRole === 'owner' || _activeRole === 'admin';
 
 
   const PREFS = [
@@ -366,7 +434,7 @@ export async function loadSettingsTab(projectId) {
 
     }
 
-    html += `<div data-demo-hide style="margin-bottom:14px;padding:10px 12px;border:1px solid var(--border);border-radius:6px;background:var(--surface-2)">
+    html += `<div data-demo-hide id="settings-account-card-${projectId}" style="margin-bottom:14px;padding:10px 12px;border:1px solid var(--border);border-radius:6px;background:var(--surface-2)">
 
       <div style="font-weight:600;font-size:11px;color:var(--text);margin-bottom:6px">Account</div>
 
@@ -2279,7 +2347,7 @@ export async function loadSettingsTab(projectId) {
 
       <div id="members-list-${projectId}" style="margin-bottom:10px;font-size:11px;font-family:var(--font-mono)"><div style="color:var(--muted)">loading…</div></div>
 
-      <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
+      <div id="settings-invite-form-${projectId}" style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
 
         <input id="invite-email-${projectId}" type="email" placeholder="teammate@example.com" style="background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:4px 8px;flex:1;min-width:160px">
 
@@ -2352,6 +2420,14 @@ export async function loadSettingsTab(projectId) {
             </div>`;
 
           }).join('');
+
+          // 9b8261e4 — guests (viewer/member) see the member list read-only:
+          // drop role-change selects, resend, and remove controls.
+          if (_guest) {
+
+            listEl.querySelectorAll('.member-role-select, .resend-invite-btn, button[title="Remove member"]').forEach(el => el.remove());
+
+          }
 
           listEl.querySelectorAll('select.member-role-select').forEach(sel => {
 
@@ -2505,7 +2581,7 @@ export async function loadSettingsTab(projectId) {
 
   if (mcpData && !isDemo) {
 
-    html += `<div style="margin-bottom:16px">
+    html += `<div style="margin-bottom:16px" id="settings-account-danger-${projectId}">
 
       <div style="color:var(--accent);font-size:10px;letter-spacing:.06em;text-transform:uppercase;margin-bottom:10px;padding-bottom:4px;border-bottom:1px solid var(--border)">Account</div>
 
@@ -2793,7 +2869,7 @@ export async function loadSettingsTab(projectId) {
 
   const ntfyWarnDisplay = ntfyWarnAcknowledged ? 'display:none' : '';
 
-  html += `<div data-demo-hide style="margin-bottom:14px;padding:10px 12px;border:1px solid var(--border);border-radius:6px;background:var(--surface-2)">
+  html += `<div data-demo-hide id="settings-notifications-card-${projectId}" style="margin-bottom:14px;padding:10px 12px;border:1px solid var(--border);border-radius:6px;background:var(--surface-2)">
 
     <div style="font-weight:600;font-size:11px;color:var(--text);margin-bottom:4px">Notifications</div>
 
@@ -2939,6 +3015,10 @@ export async function loadSettingsTab(projectId) {
     body.innerHTML = `<div style="color:var(--error);font-size:11px">Failed to render settings: ${escapeHtml(String(renderErr))}</div>`;
     return;
   }
+
+  _applySettingsRoleVisibility(projectId, _guest);
+
+  _collapseConnectPlatforms(projectId);
 
   if (isDemoMode()) hideDemoAdminControls();
 

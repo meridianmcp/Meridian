@@ -6941,6 +6941,33 @@ def test_oauth_dcr_includes_client_secret_expires_at(client):
     assert isinstance(body["client_secret_expires_at"], int)
 
 
+def test_workspace_accept_sets_pending_invite_cookie(client, monkeypatch):
+    """fbbe99af — /workspace/accept unauthenticated must set pending_invite_token cookie.
+
+    The ?next= URL alone drops the token when it contains a nested ?token= param.
+    The cookie survives the full OAuth provider redirect chain.
+    """
+    from meridian import hosted as hosted_module
+
+    monkeypatch.setenv("MERIDIAN_HOSTED", "true")
+
+    async def mock_no_auth(request):
+        from fastapi import HTTPException
+        raise HTTPException(status_code=401)
+
+    monkeypatch.setattr(hosted_module, "get_current_tenant", mock_no_auth)
+
+    r = client.get("/workspace/accept?token=test-invite-token-xyz", follow_redirects=False)
+    assert r.status_code == 302, f"Expected 302, got {r.status_code}"
+    loc = r.headers.get("location", "")
+    assert "/auth/login" in loc, f"Expected redirect to /auth/login, got {loc}"
+    # Token must be URL-encoded in the next param (not a raw ?token= that breaks parsing)
+    assert "pending_invite_token" not in loc, "Token must NOT be exposed in the URL"
+    # Cookie must be set
+    assert "pending_invite_token" in r.cookies, "pending_invite_token cookie must be set"
+    assert r.cookies["pending_invite_token"] == "test-invite-token-xyz"
+
+
 def test_landing_page_cache_control(client):
     """/ returns Cache-Control: no-cache, no-store so Cloudflare doesn't serve stale HTML."""
     r = client.get("/")
@@ -8546,6 +8573,58 @@ async def test_answer_hitl_and_dismiss_hitl(db):
 
     pending = await db_module.list_hitl_requests(db, pid, status="pending")
     assert len(pending) == 0
+
+
+@pytest.mark.asyncio
+async def test_request_hitl_mcp_dual_channel_fields(db):
+    """501cc9e8 — request_hitl MCP dispatch returns chat_prompt and poll_instruction
+    for blocking urgency so Claude Code can surface the question inline."""
+    import meridian.server as srv
+
+    project = await db_module.create_project(db, "hitl-dual-ch")
+    pid = project["id"]
+
+    # Blocking HITL with options → both fields present
+    result = await srv._dispatch_mcp_tool(
+        "request_hitl",
+        {
+            "project_id": pid,
+            "question": "Deploy to prod?",
+            "urgency": "blocking",
+            "options": ["Yes, deploy", "No, hold"],
+            "recommended": "No, hold",
+        },
+        db, "/tmp",
+    )
+    assert result["status"] == "pending"
+    assert "chat_prompt" in result
+    assert "Deploy to prod?" in result["chat_prompt"]
+    assert "BLOCKING" in result["chat_prompt"]
+    assert "No, hold (recommended)" in result["chat_prompt"]
+    assert result["id"] in result["chat_prompt"]
+    assert "poll_instruction" in result
+    assert result["id"] in result["poll_instruction"]
+    assert "answer_hitl" in result["poll_instruction"]
+
+    # Normal urgency → chat_prompt present, but no poll_instruction
+    result2 = await srv._dispatch_mcp_tool(
+        "request_hitl",
+        {"project_id": pid, "question": "FYI: build started", "urgency": "normal"},
+        db, "/tmp",
+    )
+    assert "chat_prompt" in result2
+    assert "poll_instruction" not in result2
+
+    # Auto-answered → no chat_prompt added (status != 'pending')
+    await db_module.update_project_settings(db, pid, hitl_auto_answer=1)
+    result3 = await srv._dispatch_mcp_tool(
+        "request_hitl",
+        {"project_id": pid, "question": "Should we proceed?", "urgency": "normal"},
+        db, "/tmp",
+    )
+    assert result3.get("answered_by") == "auto"
+    assert result3.get("status") == "answered"
+    assert "chat_prompt" not in result3
 
 
 @pytest.mark.asyncio

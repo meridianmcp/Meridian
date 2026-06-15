@@ -400,8 +400,15 @@ async def _handle_mcp_request(
     body: dict[str, Any], db: Any, data_dir: str,
     tenant: dict[str, Any] | None = None,
     token_type: str = "readwrite",
+    enforce_role: str | None = None,
 ) -> dict[str, Any]:
-    """Dispatch one JSON-RPC 2.0 MCP request and return the response dict."""
+    """Dispatch one JSON-RPC 2.0 MCP request and return the response dict.
+
+    ``enforce_role`` (393eed0a) — when set, the caller is acting in a workspace
+    they were INVITED to under that role; write tools are denied unless the role
+    carries PERM_WRITE. Defaults to None (owner / self-host) → no gate, so the
+    live claude.ai connector path is unaffected.
+    """
     req_id = body.get("id")
     method = body.get("method", "")
     params = body.get("params") or {}
@@ -427,6 +434,15 @@ async def _handle_mcp_request(
         args = params.get("arguments") or {}
         if token_type == "readonly" and name not in _server._mcp_readonly_tools:
             return _server._jsonrpc_err(req_id, -32603, f"tool '{name}' not allowed for read-only tokens")
+        # 393eed0a — workspace-role gate (defense in depth for cross-workspace MCP).
+        if enforce_role is not None and name not in _server._mcp_readonly_tools \
+                and name not in _server._GITHUB_TOOL_NAMES:
+            from ..roles import has_perm, PERM_WRITE  # noqa: PLC0415
+            if not has_perm(enforce_role, PERM_WRITE):
+                return _server._jsonrpc_err(
+                    req_id, -32603,
+                    f"workspace role '{enforce_role}' is read-only; tool '{name}' denied",
+                )
         try:
             if name in _server._GITHUB_TOOL_NAMES and tenant:
                 result = await _dispatch_github_tool(name, args, tenant, db)
@@ -973,7 +989,41 @@ async def _dispatch_mcp_tool(
                 tenant=tenant,
                 pref_key="hitl",
             )
-        return result
+        # Dual-channel: enrich response so Claude Code displays the question inline.
+        # The auto-answer short-circuit above already returned if answered_by='auto'.
+        _dc_result = dict(result)
+        if _dc_result.get("status") == "pending":
+            _dc_q = _dc_result.get("question", "")
+            _dc_urg = _dc_result.get("urgency", "normal")
+            _dc_rid = _dc_result.get("id", "")
+            _dc_opts: list[str] = []
+            _dc_rec: str | None = None
+            try:
+                _dc_pl = json.loads(_dc_result.get("payload") or "{}")
+                _dc_opts = _dc_pl.get("options") or []
+                _dc_rec = _dc_pl.get("recommended")
+            except (TypeError, ValueError):
+                pass
+            _opts_text = ""
+            if _dc_opts:
+                _opts_text = "\n\nOptions:\n" + "\n".join(
+                    f"  {i + 1}. {o}" + (" (recommended)" if o == _dc_rec else "")
+                    for i, o in enumerate(_dc_opts)
+                )
+            _dc_result["chat_prompt"] = (
+                f"[HITL {_dc_urg.upper()}] {_dc_q}{_opts_text}\n\n"
+                f"Filed in Meridian dashboard AND shown here — first answer wins.\n"
+                f"HITL ID: {_dc_rid}"
+            )
+            if _dc_urg == "blocking":
+                _dc_result["poll_instruction"] = (
+                    f"Show the question above to the user now. Then poll "
+                    f"get_hitl_request(request_id='{_dc_rid}') every 30 s. "
+                    f"If the user answers here in chat, call "
+                    f"answer_hitl(request_id='{_dc_rid}', answer='<their reply>'). "
+                    f"Whichever arrives first (dashboard or chat) unblocks you."
+                )
+        return _dc_result
     if name == "get_hitl_request":
         result = await db_module.get_hitl_request(db, args["request_id"])
         if result is None:
@@ -1014,7 +1064,7 @@ async def _dispatch_mcp_tool(
         )
     if name == "get_notes":
         return await db_module.get_project_notes(
-            db, args["project_id"], tag=args.get("tag"),
+            db, args["project_id"], tag=args.get("tag"), query=args.get("query"),
         )
     if name == "delete_note":
         ok = await db_module.delete_project_note(db, args["note_id"])

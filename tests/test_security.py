@@ -148,3 +148,147 @@ def test_mcp_rejects_no_bearer(client):
         json={"jsonrpc": "2.0", "method": "tools/list", "id": 1},
     )
     assert resp.status_code == 401
+
+
+# ---------------------------------------------------------------------------
+# 393eed0a — server-side workspace-role enforcement
+# ---------------------------------------------------------------------------
+
+def test_required_perm_for_request_mapping():
+    """The (method, path) → permission map gates the right things and skips
+    reads, self-scoped writes, and public endpoints."""
+    from meridian._deps import _required_perm_for_request
+    from meridian.roles import PERM_WRITE, PERM_INVITE, PERM_SETTINGS
+
+    # Reads are never gated.
+    assert _required_perm_for_request("GET", "/projects/p1/tasks") is None
+    # Self-scoped / pre-auth / per-tool-gated paths are skipped.
+    for path in ("/billing/portal", "/account/delete", "/auth/tokens",
+                 "/oauth/token", "/mcp", "/webhooks/stripe", "/__gate__"):
+        assert _required_perm_for_request("POST", path) is None, path
+    # Team management.
+    assert _required_perm_for_request("POST", "/workspace/invite") == PERM_INVITE
+    assert _required_perm_for_request("DELETE", "/workspace/members/m1") == PERM_INVITE
+    # Workspace / project configuration.
+    assert _required_perm_for_request("PATCH", "/workspace/settings") == PERM_SETTINGS
+    assert _required_perm_for_request("PATCH", "/projects/p1/settings") == PERM_SETTINGS
+    assert _required_perm_for_request("PATCH", "/projects/p1/ntfy") == PERM_SETTINGS
+    assert _required_perm_for_request("POST", "/projects/p1/github/connect") == PERM_SETTINGS
+    # Whole-project deletion is elevated; a sub-resource delete is a normal write.
+    assert _required_perm_for_request("DELETE", "/projects/p1") == PERM_SETTINGS
+    assert _required_perm_for_request("DELETE", "/projects/p1/sprint/s1") == PERM_WRITE
+    # Ordinary project-data writes.
+    assert _required_perm_for_request("POST", "/tasks") == PERM_WRITE
+    assert _required_perm_for_request("POST", "/projects/p1/decisions") == PERM_WRITE
+
+
+def _boot_hosted_role_client(monkeypatch, tmp_path):
+    """Boot a hosted TestClient (fresh server import) for role-enforcement tests."""
+    import importlib
+    monkeypatch.setenv("MERIDIAN_HOSTED", "true")
+    monkeypatch.setenv("MERIDIAN_DB", ":memory:")
+    monkeypatch.setenv("MERIDIAN_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("MERIDIAN_DB_URL", "")
+    monkeypatch.setenv("MERIDIAN_DEMO_DB_URL", "")
+    # Blank any real Neon admin URL from the dev env so the admin-plan owner's
+    # workspace resolves to the in-memory auth DB instead of dialing Neon.
+    monkeypatch.setenv("MERIDIAN_AUTH_DB", "")
+    monkeypatch.setenv("MERIDIAN_SKIP_DEMO", "1")
+    monkeypatch.setenv("MERIDIAN_GOAL_MD", str(tmp_path / "GOAL.md"))
+    monkeypatch.setenv("MERIDIAN_MD_ROOT", str(tmp_path))
+    import meridian.server as server_module
+    server_module = importlib.reload(server_module)
+    from fastapi.testclient import TestClient
+    return TestClient(server_module.app)
+
+
+def test_role_enforcement_cross_workspace_http_and_mcp(monkeypatch, tmp_path):
+    """A viewer invited to another workspace is read-only there; a member can
+    write project data. Enforced on both the HTTP and MCP write paths, and only
+    when the request targets the invited workspace (X-Workspace-Tenant-Id)."""
+    import asyncio
+    from datetime import datetime, timezone
+    from meridian import db as db_module
+
+    with _boot_hosted_role_client(monkeypatch, tmp_path) as c:
+        db = c.app.state.db
+
+        async def _setup():
+            owner = await db_module.upsert_tenant(db, "rl-owner@example.com")
+            # admin plan → the cross-workspace switch resolves to the auth DB in
+            # tests (no per-tenant Neon DB is provisioned).
+            await db.execute("UPDATE tenants SET plan='admin' WHERE id=?", (owner["id"],))
+            invitee = await db_module.upsert_tenant(db, "rl-invitee@example.com")
+            raw, _ = await db_module.create_api_token(db, invitee["id"])
+            proj = await db_module.create_project(db, "rl-owner-proj")
+            sess = await db_module.register_session(db, proj["id"], "rl-sess")
+            now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+            await db.execute(
+                "INSERT INTO workspace_members "
+                "(id, tenant_id, email, role, github_access, joined_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                ("rl-wm", owner["id"], "rl-invitee@example.com", "viewer", "none", now),
+            )
+            await db.commit()
+            return owner["id"], raw, proj["id"], sess["id"]
+
+        owner_id, token, pid, sid = asyncio.run(_setup())
+        hdr = {"Authorization": f"Bearer {token}", "X-Workspace-Tenant-Id": owner_id}
+
+        # viewer: reads are allowed in the invited workspace.
+        r = c.get(f"/projects/{pid}/tasks", headers=hdr)
+        assert r.status_code == 200, r.text
+
+        # viewer: HTTP write is blocked by the role middleware (before the route).
+        r = c.post("/tasks", headers=hdr,
+                   json={"session_id": sid, "project_id": pid, "description": "nope"})
+        assert r.status_code == 403, r.text
+        assert "cannot perform" in r.text
+
+        # viewer: MCP write tool is denied by the per-tool gate; a read tool is not.
+        def _mcp(name, args):
+            return c.post("/mcp", headers=hdr, json={
+                "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": {"name": name, "arguments": args}})
+        mr = _mcp("pin_decision", {"project_id": pid, "title": "t", "body": "b", "category": "X"})
+        assert "denied" in mr.text and "read-only" in mr.text, mr.text
+        mr = _mcp("get_tasks", {"project_id": pid})
+        assert "denied" not in mr.text, mr.text
+
+        # Promote viewer → member: the same HTTP write now passes and succeeds.
+        async def _promote():
+            await db.execute("UPDATE workspace_members SET role='member' WHERE id='rl-wm'")
+            await db.commit()
+        asyncio.run(_promote())
+
+        r = c.post("/tasks", headers=hdr,
+                   json={"session_id": sid, "project_id": pid, "description": "ok"})
+        assert r.status_code == 201, r.text
+
+        # Member still cannot change workspace settings (PERM_SETTINGS).
+        r = c.patch("/projects/%s/settings" % pid, headers=hdr,
+                    json={"require_merge_approval": True})
+        assert r.status_code == 403, r.text
+        assert "cannot perform" in r.text
+
+
+# ---------------------------------------------------------------------------
+# fdf1120f — magic-link verify renders HTML on failure, never a blank JSON page
+# ---------------------------------------------------------------------------
+
+def test_magic_verify_invalid_token_returns_html(client):
+    """An expired/invalid magic link (opened in a browser) must render a real
+    HTML page with a way back — not a blank JSON 401."""
+    r = client.get("/auth/magic/verify?token=bogus-nonexistent", follow_redirects=False)
+    assert r.status_code == 401
+    assert "text/html" in r.headers.get("content-type", "")
+    assert "Request a new link" in r.text
+    assert "expired" in r.text.lower()
+
+
+def test_magic_verify_missing_token_returns_html(client):
+    """No token → HTML 400, not a blank JSON error."""
+    r = client.get("/auth/magic/verify", follow_redirects=False)
+    assert r.status_code == 400
+    assert "text/html" in r.headers.get("content-type", "")
+    assert "Request a new link" in r.text

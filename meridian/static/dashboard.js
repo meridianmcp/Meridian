@@ -318,6 +318,10 @@ async function ensureWorkspaceSwitcher() {
 
     sel.title = active ? (active.is_own ? 'My workspace' : `${active.owner_email} (${active.role})`) : '';
 
+    _renderWorkspaceContextBadge(wrap, workspaces);
+
+    _refreshGuestMode();
+
   };
 
 
@@ -346,6 +350,8 @@ async function ensureWorkspaceSwitcher() {
 
   wrap.appendChild(sel);
 
+  _renderWorkspaceContextBadge(wrap, workspaces);
+
   wrap.appendChild(connectLink);
 
   const existingLabel = footer.querySelector('.hosted-label');
@@ -354,6 +360,88 @@ async function ensureWorkspaceSwitcher() {
 
   else footer.prepend(wrap);
 
+}
+
+
+// 9b8261e4 — the caller's role in the currently ACTIVE workspace. The own
+// workspace (or self-hosted) is always 'owner'; an invited workspace returns
+// the membership role (admin|member|viewer). Used to hide owner-only settings
+// UI for guests. Fails open to 'owner' (server-side enforcement is the gate).
+async function getActiveWorkspaceRole() {
+  if (!isHostedMode() || !state.activeWorkspaceTenantId) return 'owner';
+  try {
+    const wss = await fetch('/me/workspaces').then(r => r.ok ? r.json() : null);
+    const ws = (wss || []).find(w => w.tenant_id === state.activeWorkspaceTenantId);
+    return (ws && ws.role) || 'owner';
+  } catch (_) { return 'owner'; }
+}
+
+
+// fcb02a6d — plan/role badge in the sidebar. On your own workspace it shows your
+// plan (Free/Trial/Standard/Pro); on a workspace you were invited to it shows an
+// "invite · {role}" badge. Re-rendered on every workspace switch.
+function _renderWorkspaceContextBadge(wrap, workspaces) {
+  if (!wrap) return;
+  let badge = wrap.querySelector('.ws-context-badge');
+  if (!badge) {
+    badge = document.createElement('div');
+    badge.className = 'ws-context-badge';
+    badge.style.cssText = 'display:inline-block;margin-top:6px;padding:2px 8px;border-radius:10px;font-size:9px;font-weight:700;letter-spacing:.05em;font-family:var(--font-mono);text-transform:uppercase';
+    wrap.appendChild(badge);
+  }
+  const active = (workspaces || []).find(w =>
+    state.activeWorkspaceTenantId ? w.tenant_id === state.activeWorkspaceTenantId : w.is_own);
+  const colors = { free: '#3b82f6', trial: '#059669', standard: '#3b82f6', pro: '#7c3aed', admin: '#9ca3af', invite: '#f59e0b' };
+  let label, color;
+  if (active && !active.is_own) {
+    label = `invite · ${active.role || 'member'}`;
+    color = colors.invite;
+  } else {
+    const plan = window.state.tenantPlan || 'free';
+    label = (window._PLAN_LABELS && window._PLAN_LABELS[plan]) || plan;
+    color = colors[plan] || '#9ca3af';
+  }
+  badge.textContent = label;
+  badge.style.background = color + '22';
+  badge.style.color = color;
+  badge.style.border = '1px solid ' + color + '44';
+}
+
+
+// 2271635e — client-side search/filter for tab lists. Matches a row's
+// data-search attribute (preferred) or its textContent; hides non-matches.
+function _filterTabRows(query, container, rowSelector) {
+  if (!container) return;
+  const q = (query || '').trim().toLowerCase();
+  container.querySelectorAll(rowSelector).forEach(row => {
+    const hay = (row.dataset.search || row.textContent || '').toLowerCase();
+    row.style.display = (!q || hay.includes(q)) ? '' : 'none';
+  });
+}
+
+function _wireTabSearch(inputId, containerId, rowSelector) {
+  const input = document.getElementById(inputId);
+  const container = document.getElementById(containerId);
+  if (!input || !container) return;
+  if (!input.dataset.searchWired) {
+    input.dataset.searchWired = '1';
+    input.addEventListener('input', () => _filterTabRows(input.value, container, rowSelector));
+  }
+  _filterTabRows(input.value, container, rowSelector);  // re-apply after a re-render
+}
+
+
+// c545f727 — toggle a body class so destructive controls marked .guest-hidden
+// are hidden for invited viewers/members in the active workspace. Owner/admin
+// keep them. Server-side enforcement (393eed0a) is the real gate; this just
+// declutters the UI so guests don't click buttons that 403.
+async function _refreshGuestMode() {
+  let guest = false;
+  try {
+    const r = await getActiveWorkspaceRole();
+    guest = (r === 'viewer' || r === 'member');
+  } catch (_) {}
+  document.body.classList.toggle('meridian-guest', guest);
 }
 
 
@@ -3250,6 +3338,10 @@ function buildTabBody(project) {
           </div>
         </div>
 
+        <div style="padding:6px 10px;border-bottom:1px solid var(--border)">
+          <input type="text" id="devlog-search-${project.id}" placeholder="Search dev log (description, session)…" style="width:100%;box-sizing:border-box;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;color:var(--text);font-size:11px;font-family:var(--font-mono);padding:4px 8px;outline:none">
+        </div>
+
         <div class="scroll-area"><div class="task-list" id="tasks-${project.id}"></div></div>
 
       </div>
@@ -3501,6 +3593,8 @@ function buildTabBody(project) {
 
           <div style="display:flex;gap:6px;align-items:center">
 
+            <input type="text" id="hitl-search-${project.id}" placeholder="search…" style="background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:2px 6px;outline:none;width:110px">
+
             <select id="hitl-status-filter-${project.id}" style="background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:2px 6px">
 
               <option value="pending">pending</option>
@@ -3572,6 +3666,8 @@ function buildTabBody(project) {
           </span>
 
           <span style="display:flex;gap:6px;align-items:center">
+
+            <input type="text" id="team-search-${project.id}" placeholder="search…" style="background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:2px 6px;outline:none;width:100px">
 
             <select id="team-days-${project.id}" style="background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:2px 4px">
 
@@ -6316,7 +6412,11 @@ async function loadDocsTab(projectId) {
 
     }
 
-    body.innerHTML = html;
+    const _toolSearch = `<div style="position:sticky;top:0;background:var(--surface-1,#10131a);padding:0 0 8px;margin-bottom:6px;z-index:2"><input type="text" id="docs-search-${projectId}" placeholder="Search tools by name or description…" style="width:100%;box-sizing:border-box;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;color:var(--text);font-size:12px;font-family:var(--font-mono);padding:5px 9px;outline:none"></div>`;
+
+    body.innerHTML = _toolSearch + html;
+
+    _wireTabSearch(`docs-search-${projectId}`, `docs-body-${projectId}`, '.tool-entry');
 
   } catch (e) {
 
@@ -6529,6 +6629,14 @@ async function loadHitlTab(projectId) {
         const hitlOpts = (optPayload && Array.isArray(optPayload.options)) ? optPayload.options : [];
         const hitlRec = (optPayload && typeof optPayload.recommended === 'string') ? optPayload.recommended : null;
 
+        // Dual-channel indicator for pending blocking/high questions
+        const dualChannelHint = (st === 'pending' && !isMd && (urg === 'blocking' || urg === 'high'))
+          ? `<div style="margin-top:6px;display:flex;align-items:center;gap:6px;font-size:10px;color:var(--accent)">
+               <span title="Also displayed inline in Claude Code — first answer (dashboard or chat) wins">📟 Dual-channel — also shown in Claude Code chat</span>
+               <button class="secondary hitl-copy-id-btn" data-hitl-id="${escapeHtml(r.id)}" title="Copy HITL ID to clipboard" style="padding:1px 7px;font-size:9px">Copy ID</button>
+             </div>`
+          : '';
+
         let actionBtns = '';
 
         if (st === 'pending' && isMd) {
@@ -6586,7 +6694,7 @@ async function loadHitlTab(projectId) {
 
         }
 
-        return `<div style="background:var(--surface-2);border:1px solid var(--border);border-left:3px solid ${urgencyColor[urg] || 'var(--accent)'};border-radius:0 4px 4px 0;padding:10px 12px;margin-bottom:8px">
+        return `<div class="hitl-row" data-search="${escapeHtml((r.question || '') + ' ' + (r.status || '') + ' ' + (r.context || ''))}" style="background:var(--surface-2);border:1px solid var(--border);border-left:3px solid ${urgencyColor[urg] || 'var(--accent)'};border-radius:0 4px 4px 0;padding:10px 12px;margin-bottom:8px">
 
           <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px;margin-bottom:4px">
 
@@ -6608,7 +6716,7 @@ async function loadHitlTab(projectId) {
 
           <div style="color:var(--muted);font-size:10px">${escapeHtml(dt)}${r.assigned_to ? ' · @' + escapeHtml(r.assigned_to) : ''}</div>
 
-          ${mdMeta}${ctxHtml}${diffHtml}${answerHtml}${applyErr}${actionBtns}
+          ${mdMeta}${ctxHtml}${dualChannelHint}${diffHtml}${answerHtml}${applyErr}${actionBtns}
 
         </div>`;
 
@@ -6625,6 +6733,8 @@ async function loadHitlTab(projectId) {
       }
 
       body.innerHTML = html;
+
+      _wireTabSearch(`hitl-search-${projectId}`, `hitl-body-${projectId}`, '.hitl-row');
 
       body.querySelectorAll('.hitl-answer-btn').forEach(btn => {
 
@@ -6765,6 +6875,29 @@ async function loadHitlTab(projectId) {
 
       });
 
+      body.querySelectorAll('.hitl-copy-id-btn').forEach(btn => {
+
+        btn.onclick = () => {
+
+          const id = btn.dataset.hitlId;
+
+          navigator.clipboard.writeText(id).then(() => toast('HITL ID copied ✓')).catch(() => {
+
+            // fallback for browsers without clipboard API
+            const tmp = document.createElement('textarea');
+            tmp.value = id;
+            document.body.appendChild(tmp);
+            tmp.select();
+            document.execCommand('copy');
+            document.body.removeChild(tmp);
+            toast('HITL ID copied ✓');
+
+          });
+
+        };
+
+      });
+
     } catch (e) {
 
       body.innerHTML = `<div style="color:var(--muted)">failed to load HITL queue: ${escapeHtml(String(e))}</div>`;
@@ -6857,7 +6990,7 @@ async function loadTeamTab(projectId) {
 
         }).join('');
 
-        return `<div style="background:var(--surface-2);border:1px solid var(--border);border-left:3px solid ${c};border-radius:4px;padding:10px 12px;margin-bottom:8px">
+        return `<div class="team-card" data-search="${escapeHtml((h.human_id || '') + ' ' + (h.active_session || '') + ' ' + (h.agent_framework || ''))}" style="background:var(--surface-2);border:1px solid var(--border);border-left:3px solid ${c};border-radius:4px;padding:10px 12px;margin-bottom:8px">
 
           <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px">
 
@@ -7048,6 +7181,8 @@ async function loadTeamTab(projectId) {
         </section>
 
         ${decisionsHtml}`;
+
+      _wireTabSearch(`team-search-${projectId}`, `team-body-${projectId}`, '.team-card');
 
     } catch (e) {
 
@@ -8896,7 +9031,7 @@ async function loadPinnedDecisions(projectId, { showArchived = false } = {}) {
 
             <button class="secondary" data-supersede="${escapeHtml(d.id)}" style="padding:1px 6px;font-size:9px">Supersede</button>
 
-            <button class="secondary" data-archive-decision="${escapeHtml(d.id)}" title="Archive this decision (soft-delete; visible via 'View archived')" style="padding:1px 6px;font-size:9px;color:var(--muted)">Archive</button>
+            <button class="secondary guest-hidden" data-archive-decision="${escapeHtml(d.id)}" title="Archive this decision (soft-delete; visible via 'View archived')" style="padding:1px 6px;font-size:9px;color:var(--muted)">Archive</button>
 
           </div>
 
@@ -9898,6 +10033,8 @@ function renderTasks(projectId) {
 
   root.innerHTML = tasks.map(t => renderTaskRow(t)).join('');
 
+  _wireTabSearch(`devlog-search-${projectId}`, `tasks-${projectId}`, '.task');
+
   // Pagination: show "Load more" button if we got a full page
 
   const existingBtn = document.getElementById(`devlog-load-more-${projectId}`);
@@ -9980,11 +10117,11 @@ function renderTaskRow(t) {
 
     : '';
 
-  const deleteBtn = `<button title="Delete from task log (permanent)" onclick="deleteTaskRow(event,'${t.id}','${t.status}')" style="background:none;border:none;color:var(--muted);cursor:pointer;font-size:13px;padding:0 4px;flex-shrink:0;line-height:1" onmouseenter="this.style.color='var(--status-failed)'" onmouseleave="this.style.color='var(--muted)'">\u00d7</button>`;
+  const deleteBtn = `<button class="guest-hidden" title="Delete from task log (permanent)" onclick="deleteTaskRow(event,'${t.id}','${t.status}')" style="background:none;border:none;color:var(--muted);cursor:pointer;font-size:13px;padding:0 4px;flex-shrink:0;line-height:1" onmouseenter="this.style.color='var(--status-failed)'" onmouseleave="this.style.color='var(--muted)'">\u00d7</button>`;
 
   return `
 
-    <div class="task ${t.status}" id="task-row-${t.id}" style="display:flex;align-items:flex-start;gap:4px">
+    <div class="task ${t.status}" id="task-row-${t.id}" data-search="${escapeHtml((t.description || '') + ' ' + (t.session_name || '') + ' ' + (t.claimed_by_session_name || '') + ' ' + (t.status || ''))}" style="display:flex;align-items:flex-start;gap:4px">
 
       <span class="status-badge">${t.status}</span>
 
@@ -10505,6 +10642,15 @@ async function restoreTabs() {
 
 (async function init() {
 
+  // 90de5ac9 — invited users land with ?ws=<owner_tenant_id> after OAuth login.
+  // Set activeWorkspaceTenantId before any API calls so loadProjects() sends
+  // X-Workspace-Tenant-Id and the owner's project list loads directly.
+  const _wsParam = new URLSearchParams(window.location.search).get('ws');
+  if (_wsParam && !state.activeWorkspaceTenantId) {
+    state.activeWorkspaceTenantId = _wsParam;
+    try { history.replaceState(null, '', window.location.pathname); } catch (_) {}
+  }
+
   await loadServerConfig();
 
   showFailoverBannerIfNeeded();
@@ -10521,9 +10667,32 @@ async function restoreTabs() {
 
   await loadProjects();
 
+  // 90de5ac9 (follow-up) — existing invited members who have no own projects:
+  // silently switch to their first accepted workspace membership so they land
+  // in the right context without being shown the 'create first project' wizard.
+  if (state.projects.length === 0 && !state.activeWorkspaceTenantId && isHostedMode() && !isDemoMode()) {
+    try {
+      const wss = await fetch('/me/workspaces').then(r => r.ok ? r.json() : null);
+      const first = wss && wss.find(w => !w.is_own);
+      if (first) {
+        state.activeWorkspaceTenantId = first.tenant_id;
+        await loadProjects();
+      }
+    } catch (_) {}
+  }
+
   if (isDemoMode()) hideDemoAdminControls();
 
   if (isHostedMode()) hideHostedAdminControls();
+
+  // abd58a10 — render the workspace switcher independently of _renderPlanBadge.
+  // It used to be reached only at the tail of _renderPlanBadge(me), so any /me
+  // hiccup (slow, empty, missing plan) silently dropped the switcher for invited
+  // members. Calling it directly here guarantees it appears whenever the user
+  // belongs to ≥2 workspaces. ensureWorkspaceSwitcher() is idempotent.
+  if (isHostedMode() && !isDemoMode()) ensureWorkspaceSwitcher();
+
+  _refreshGuestMode();
 
   showLocalServerControls();
 
@@ -11116,4 +11285,4 @@ function toggleExpand(id) {
 
 // --- ITEM 4 esbuild: re-expose top-level symbols as globals so inline
 // handlers and cross-file references keep resolving after IIFE bundling.
-try { Object.assign(window, { hideHostedAdminControls, ensureSignOutLink, ensureWorkspaceSwitcher, showConnectDbModal, showLocalServerControls, _summarizeApiErrorText, _projectLoadErrorInfo, wireProjectLoadRetry, renderProjectLoadError, recordProjectLoadError, clearProjectLoadError, renderProjectLoadAlert, retryProjectSurface, syncSidebarActiveProject, autosizeGoalField, githubIconSvg, getConstitutionLimit, loadProjectSettings, saveProjectSettings, _demoTourDone, _demoTourSavedStep, _demoTourSaveStep, _demoTourMarkDone, _demoTourClose, _tourActivateVtab, startDemoTour, resumeDemoTour, api, projectApi, loadServerConfig, _armAccountSwitchWatch, _refreshOnFocus, _checkAccountSwitch, _showAccountSwitchBanner, updateGitHubConnectionIndicator, _updateConnectionIndicator, checkGitStatus, _doRestart, loadConfig, loadProjects, openTab, closeTab, saveTabs, renderTabs, _makeTabEl, _openTabMenu, _setProjectIcon, _renameProject, _deleteProject, activateTab, buildTabBody, scheduleLiveRefresh, initLiveAutoRefresh, loadLiveTab, refreshLiveTab, wireSprintAddEnter, sprintAction, sprintArchive, filterBackburner, sprintPushPrompt, sprintFeedback, sprintFeedbackNote, sprintItemEdit, addSprintItemFromInput, cacheMostRecentSession, renderLiveSessions, endLiveSession, openTimelineForSession, renderLiveQueue, addLiveTask, cancelLiveTask, showCopyPreview, wireClaudeLaunchPanel, stampHandoffTs, populateSessionDropdown, loadTimeline, _renderTimelineLog, loadDocsTab, normalizeNotifyTarget, displayNotifyTarget, osExecutorHintBanner, showFailoverBannerIfNeeded, suggestNtfyTopic, loadHitlTab, loadTeamTab, updateLiveFeed, loadRecentSessions, loadMilestones, loadRecentRuns, loadQueue, renderSearchResults, wireQueueSectionToggles, refreshTab, refreshGoal, parseDecisionsBlob, renderConstitutionWarning, _hitlBadgeClick, initHitlPanel, setVtabCountBadge, refreshProjectCountBadges, refreshHitl, _hitlAnswer, _hitlDismiss, loadPinnedDecisions, supersedePinnedDecision, addPinnedDecision, consolidateDecisions, renderDecisionsTable, wireGoalPreviewToggle, saveGoal, saveNorthStar, saveSprint, _sessionPresenceDot, refreshSessions, refreshTasks, renderTasks, _loadMoreTasks, renderTaskRow, deleteTaskRow, renderHitlRow, wireHitlRow, appendToGoal, hitlReply, hitlExecute, connectWs, handleWsEvent, restoreTabs, _deleteSprintItem, _sprintAction, completeSprintItem, failSprintItem, toggleExpand, state }); } catch (e) {}
+try { Object.assign(window, { hideHostedAdminControls, ensureSignOutLink, ensureWorkspaceSwitcher, getActiveWorkspaceRole, showConnectDbModal, showLocalServerControls, _summarizeApiErrorText, _projectLoadErrorInfo, wireProjectLoadRetry, renderProjectLoadError, recordProjectLoadError, clearProjectLoadError, renderProjectLoadAlert, retryProjectSurface, syncSidebarActiveProject, autosizeGoalField, githubIconSvg, getConstitutionLimit, loadProjectSettings, saveProjectSettings, _demoTourDone, _demoTourSavedStep, _demoTourSaveStep, _demoTourMarkDone, _demoTourClose, _tourActivateVtab, startDemoTour, resumeDemoTour, api, projectApi, loadServerConfig, _armAccountSwitchWatch, _refreshOnFocus, _checkAccountSwitch, _showAccountSwitchBanner, updateGitHubConnectionIndicator, _updateConnectionIndicator, checkGitStatus, _doRestart, loadConfig, loadProjects, openTab, closeTab, saveTabs, renderTabs, _makeTabEl, _openTabMenu, _setProjectIcon, _renameProject, _deleteProject, activateTab, buildTabBody, scheduleLiveRefresh, initLiveAutoRefresh, loadLiveTab, refreshLiveTab, wireSprintAddEnter, sprintAction, sprintArchive, filterBackburner, sprintPushPrompt, sprintFeedback, sprintFeedbackNote, sprintItemEdit, addSprintItemFromInput, cacheMostRecentSession, renderLiveSessions, endLiveSession, openTimelineForSession, renderLiveQueue, addLiveTask, cancelLiveTask, showCopyPreview, wireClaudeLaunchPanel, stampHandoffTs, populateSessionDropdown, loadTimeline, _renderTimelineLog, loadDocsTab, normalizeNotifyTarget, displayNotifyTarget, osExecutorHintBanner, showFailoverBannerIfNeeded, suggestNtfyTopic, loadHitlTab, loadTeamTab, updateLiveFeed, loadRecentSessions, loadMilestones, loadRecentRuns, loadQueue, renderSearchResults, wireQueueSectionToggles, refreshTab, refreshGoal, parseDecisionsBlob, renderConstitutionWarning, _hitlBadgeClick, initHitlPanel, setVtabCountBadge, refreshProjectCountBadges, refreshHitl, _hitlAnswer, _hitlDismiss, loadPinnedDecisions, supersedePinnedDecision, addPinnedDecision, consolidateDecisions, renderDecisionsTable, wireGoalPreviewToggle, saveGoal, saveNorthStar, saveSprint, _sessionPresenceDot, refreshSessions, refreshTasks, renderTasks, _loadMoreTasks, renderTaskRow, deleteTaskRow, renderHitlRow, wireHitlRow, appendToGoal, hitlReply, hitlExecute, connectWs, handleWsEvent, restoreTabs, _deleteSprintItem, _sprintAction, completeSprintItem, failSprintItem, toggleExpand, state }); } catch (e) {}

@@ -50,6 +50,8 @@ from ._deps import (
     _md_ts,
     _md_one_line,
     _require_workspace_perm,
+    _enforcement_context,
+    _required_perm_for_request,
     _render_workspace_block,
     _render_context_block,
 )
@@ -954,6 +956,51 @@ async def _demo_read_only_middleware(request: Request, call_next):
     ):
         return Response(
             content=json.dumps({"error": "demo_readonly", "message": "Read-only demo — sign in for full access"}),
+            status_code=403,
+            media_type="application/json",
+        )
+    return await call_next(request)
+
+
+# ---------------------------------------------------------------------------
+# 393eed0a — workspace-role enforcement (viewer read-only / member-limited)
+# ---------------------------------------------------------------------------
+@app.middleware("http")
+async def _role_enforcement_middleware(request: Request, call_next):
+    """Enforce workspace roles on cross-workspace writes.
+
+    viewer = read-only; member = project-data writes; admin = + settings/invites;
+    owner = everything. Acts ONLY when the request targets a workspace the caller
+    was invited to (i.e. carries X-Workspace-Tenant-Id) — solo owners are never
+    gated and pay no extra DB cost. Self-scoped writes (billing/account/auth) and
+    the per-tool-gated /mcp endpoint are skipped by _required_perm_for_request.
+    """
+    from .roles import has_perm  # noqa: PLC0415
+    required = _required_perm_for_request(request.method, request.url.path)
+    if required is None:
+        return await call_next(request)
+    try:
+        ctx = await _enforcement_context(request)
+    except Exception:
+        import logging as _l  # noqa: PLC0415
+        _l.getLogger("meridian.roles").exception("role enforcement check failed")
+        # The no-header fast path returns None WITHOUT querying, so reaching here
+        # means a workspace header was present → a cross-workspace write we could
+        # not verify → fail closed.
+        return Response(
+            content=json.dumps({
+                "error": "forbidden",
+                "message": "Could not verify workspace permissions.",
+            }),
+            status_code=403,
+            media_type="application/json",
+        )
+    if ctx is not None and not has_perm(ctx[2], required):
+        return Response(
+            content=json.dumps({
+                "error": "forbidden",
+                "message": f"Your workspace role ('{ctx[2]}') cannot perform this action.",
+            }),
             status_code=403,
             media_type="application/json",
         )
@@ -2669,8 +2716,24 @@ async def workspace_accept(request: Request, token: str = "") -> HTMLResponse:
     except Exception:
         authenticated = False
     if not authenticated:
-        # Preserve the token across the login flow via ?next=
-        return _Redir(f"/auth/login?next=/workspace/accept?token={token}", status_code=302)
+        # fbbe99af — store token in a session cookie so it survives the OAuth
+        # redirect chain (the ?next= URL param alone drops the token because
+        # the ?token= is parsed as a top-level query param at intermediate hops).
+        from urllib.parse import quote as _q
+        _secure = os.environ.get("MERIDIAN_BASE_URL", "").startswith("https://")
+        _redir = _Redir(
+            f"/auth/login?next={_q(f'/workspace/accept?token={token}')}",
+            status_code=302,
+        )
+        _redir.set_cookie(
+            "pending_invite_token",
+            token,
+            httponly=True,
+            secure=_secure,
+            samesite="lax",
+            max_age=3600,
+        )
+        return _redir
     token_hash = hashlib.sha256(token.encode()).hexdigest()
     db = request.app.state.db
     invite = await db_module.get_workspace_invite_by_token_hash(db, token_hash)
@@ -2938,6 +3001,10 @@ The 5 tools you use 90% of the time:
   log_task()            ← after any meaningful work
   pin_decision()        ← for architectural choices
   request_hitl()        ← when you need a human call
+                           If urgency='blocking': display the returned `chat_prompt`
+                           to the user, then poll get_hitl_request(request_id) every
+                           30 s. If the user answers in chat, call answer_hitl(). First
+                           answer (dashboard or chat) unblocks you.
   checkpoint()          ← before ending / before context fills
 
 ## Auto-hooks (recommended)
@@ -3048,11 +3115,20 @@ async def mcp_tools_doc() -> str:
     lines += _render_tool("get_pinned_decisions")
     lines += ["## Human-in-the-loop (HITL)\n"]
     lines += _render_tool("request_hitl",
-        "Surface a question to the human queue. `urgency='blocking'` pauses the session until answered — poll "
-        "`get_hitl_request` to resume. `normal`/`high` land in the dashboard without blocking.")
+        "Surface a question to the human queue. Response includes `chat_prompt` (question + options "
+        "formatted for inline display) and, when `urgency='blocking'`, a `poll_instruction`. "
+        "Dual-channel: filed in the dashboard AND shown in Claude Code chat — first answer wins. "
+        "For blocking: display `chat_prompt` to the user, then poll `get_hitl_request(request_id)` "
+        "every 30 s. If the user answers in chat, call `answer_hitl(request_id, answer)`. "
+        "`normal`/`high` land in the dashboard without blocking the session.")
     lines += _render_tool("get_hitl_request",
         "Read-only: Poll a HITL request for the human's answer. Returns the row including `status` "
         "(`pending`/`answered`/`dismissed`) and `answer` text.")
+    lines += _render_tool("answer_hitl",
+        "Answer a pending HITL request programmatically. Marks it answered so the waiting session "
+        "can resume. Use when the human answers in Claude Code chat rather than the dashboard.")
+    lines += _render_tool("dismiss_hitl",
+        "Dismiss a HITL request (won't-answer / no longer relevant).")
     lines += ["## Handoff & context\n"]
     lines += _render_tool("generate_handoff",
         "Read-only: Generate a context handoff document. `mode='full'` writes the complete L0/L1/L2 handoff. `mode='delta'` "
@@ -5479,11 +5555,24 @@ async def _remote_mcp_inner(request: Request) -> Any:
     db = await _db(request)
     data_dir = _data_dir(request)
 
+    # 393eed0a — compute a workspace-role gate only when an X-Workspace-Tenant-Id
+    # header rides along (an API-token client targeting an invited workspace). The
+    # claude.ai connector never sends it, so this is a no-op (no DB hit) on the
+    # hot path.
+    _enf_role = None
+    if request.headers.get("x-workspace-tenant-id", "").strip():
+        try:
+            _ctx = await _enforcement_context(request)
+            if _ctx is not None:
+                _enf_role = _ctx[2]
+        except Exception:
+            _enf_role = None
+
     if isinstance(body, list):
-        results = [await _handle_mcp_request(item, db, data_dir, tenant=tenant, token_type=_token_type) for item in body]
+        results = [await _handle_mcp_request(item, db, data_dir, tenant=tenant, token_type=_token_type, enforce_role=_enf_role) for item in body]
         return JSONResponse(results)
 
-    result = await _handle_mcp_request(body, db, data_dir, tenant=tenant, token_type=_token_type)
+    result = await _handle_mcp_request(body, db, data_dir, tenant=tenant, token_type=_token_type, enforce_role=_enf_role)
     return JSONResponse(result)
 
 # ---------------------------------------------------------------------------

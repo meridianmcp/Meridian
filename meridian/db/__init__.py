@@ -2190,9 +2190,9 @@ async def search_all(
             "ORDER BY created_at DESC LIMIT ?"
         )
         sprint_sql = (
-            "SELECT id, title, version, status, added_at AS created_at, 'sprint_item' AS match_type "
+            "SELECT id, title, notes, version, status, added_at AS created_at, 'sprint_item' AS match_type "
             "FROM sprint_items "
-            "WHERE project_id = ? AND title ILIKE ? "
+            "WHERE project_id = ? AND (title ILIKE ? OR notes ILIKE ?) "
             "ORDER BY added_at DESC LIMIT ?"
         )
     else:
@@ -2215,16 +2215,16 @@ async def search_all(
             "ORDER BY created_at DESC LIMIT ?"
         )
         sprint_sql = (
-            "SELECT id, title, version, status, added_at AS created_at, 'sprint_item' AS match_type "
+            "SELECT id, title, notes, version, status, added_at AS created_at, 'sprint_item' AS match_type "
             "FROM sprint_items "
-            "WHERE project_id = ? AND title LIKE ? "
+            "WHERE project_id = ? AND (title LIKE ? OR notes LIKE ?) "
             "ORDER BY added_at DESC LIMIT ?"
         )
 
     tasks = await _search(tasks_sql, (project_id, like_pat, limit))
     notes = await _search(notes_sql, (project_id, like_pat, like_pat, limit))
     decisions = await _search(decisions_sql, (project_id, like_pat, like_pat, limit))
-    sprint_items = await _search(sprint_sql, (project_id, like_pat, limit))
+    sprint_items = await _search(sprint_sql, (project_id, like_pat, like_pat, limit))
 
     return {
         "query": query,
@@ -4078,14 +4078,11 @@ async def upsert_tenant(
         if updates:
             await db.commit()
         return tenant
-    from datetime import datetime, timezone, timedelta
     tid = _new_id()
-    now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-    expires_str = (datetime.now(timezone.utc) + timedelta(days=30)).strftime("%Y-%m-%d %H:%M:%S")
     await db.execute(
         "INSERT INTO tenants (id, email, google_sub, github_sub, microsoft_sub, "
-        "plan, trial_started_at, inactivity_expires_at, notification_prefs) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (tid, email, google_sub, github_sub, microsoft_sub, "free", now_str, expires_str,
+        "plan, notification_prefs) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (tid, email, google_sub, github_sub, microsoft_sub, "free",
          '{"storage":true,"sprint":true}'),
     )
     await db.commit()
@@ -5822,23 +5819,29 @@ async def get_project_notes(
     db: aiosqlite.Connection,
     project_id: str,
     tag: str | None = None,
+    query: str | None = None,
 ) -> list[dict[str, Any]]:
-    """Return notes for a project, newest first. Optional tag filter
-    matches any comma-separated tag (substring match)."""
+    """Return notes for a project, newest first. Optional tag filter (substring
+    match on tags) and/or text query (searches title + body)."""
+    is_pg = hasattr(db, "_pool")
+    clauses: list[str] = ["project_id = ?"]
+    params: list[Any] = [project_id]
     if tag:
-        async with db.execute(
-            "SELECT * FROM project_notes WHERE project_id = ? "
-            "AND tags LIKE ? ORDER BY created_at DESC",
-            (project_id, f"%{tag}%"),
-        ) as cur:
-            rows = await cur.fetchall()
-    else:
-        async with db.execute(
-            "SELECT * FROM project_notes WHERE project_id = ? "
-            "ORDER BY created_at DESC",
-            (project_id,),
-        ) as cur:
-            rows = await cur.fetchall()
+        clauses.append("tags LIKE ?")
+        params.append(f"%{tag}%")
+    if query:
+        like_pat = f"%{query}%"
+        if is_pg:
+            clauses.append("(title ILIKE ? OR body ILIKE ?)")
+        else:
+            clauses.append("(title LIKE ? OR body LIKE ?)")
+        params.extend([like_pat, like_pat])
+    where = " AND ".join(clauses)
+    async with db.execute(
+        f"SELECT * FROM project_notes WHERE {where} ORDER BY created_at DESC",
+        params or None,
+    ) as cur:
+        rows = await cur.fetchall()
     return [_row_to_dict(r) for r in rows if r is not None]  # type: ignore[misc]
 
 

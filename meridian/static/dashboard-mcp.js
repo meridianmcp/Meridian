@@ -21,7 +21,7 @@ export function _renderToolEntry(tool) {
 
   const signature = Object.keys(props).map(n => required.has(n) ? n : `${n}?`).join(', ');
 
-  return `<div style="margin-bottom:12px"><div style="color:var(--text);font-weight:600">${escapeHtml(tool.name)}(<span style="color:var(--muted)">${escapeHtml(signature)}</span>)</div><div style="color:var(--muted);margin:3px 0 4px 0;font-size:10.5px">${escapeHtml(tool.description || '')}</div>${params ? `<table style="font-size:10px;border-collapse:collapse;width:100%">${params}</table>` : ''}</div>`;
+  return `<div class="tool-entry" data-search="${escapeHtml((tool.name || '') + ' ' + (tool.description || ''))}" style="margin-bottom:14px"><div style="color:var(--text);font-weight:600;font-size:13px">${escapeHtml(tool.name)}(<span style="color:var(--muted);font-weight:400">${escapeHtml(signature)}</span>)</div><div style="color:var(--muted);margin:3px 0 5px 0;font-size:12px;line-height:1.45">${escapeHtml(tool.description || '')}</div>${params ? `<table style="font-size:11px;border-collapse:collapse;width:100%">${params}</table>` : ''}</div>`;
 
 }
 
