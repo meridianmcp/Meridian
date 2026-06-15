@@ -684,6 +684,7 @@ CREATE TABLE IF NOT EXISTS tenants (
     github_branch TEXT,
     notification_prefs TEXT NOT NULL DEFAULT '{{}}',
     is_internal INTEGER NOT NULL DEFAULT 0,
+    tunnel_active INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL DEFAULT ({_TS})
 );
 
@@ -1101,6 +1102,13 @@ async def _migrate_pg_admin_plan(conn: PostgresConnection) -> None:
             "UPDATE tenants SET plan = 'admin' WHERE LOWER(email) = ? AND plan != 'admin'",
             (email,),
         )
+
+
+async def _migrate_pg_tunnel_active(conn: PostgresConnection) -> None:
+    """b43b0c6a — tenants.tunnel_active: live binary-connection flag. Idempotent."""
+    await conn.executescript(
+        "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS tunnel_active INTEGER NOT NULL DEFAULT 0"
+    )
 
 
 async def get_project_ntfy_url(
@@ -1603,6 +1611,7 @@ _PG_MIGRATIONS_HOSTED = (
     _migrate_pg_tenants_is_internal,
     _migrate_pg_workspace_members_rbac,
     _migrate_pg_admin_plan,
+    _migrate_pg_tunnel_active,
 )
 
 # Late migrations — run on every DB after the hosted-only set.

@@ -332,6 +332,7 @@ CREATE TABLE IF NOT EXISTS tenants (
     trial_started_at TEXT,
     inactivity_expires_at TEXT,
     is_internal INTEGER NOT NULL DEFAULT 0,
+    tunnel_active INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -712,6 +713,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_changelog_entries(db)
     await _migrate_agent_instructions(db)
     await _migrate_note_kind(db)
+    await _migrate_tunnel_active(db)
     return db
 
 
@@ -4115,7 +4117,7 @@ async def update_tenant(
         "compute_cu_hours_used", "storage_gb_used",
         "overage_reset_at", "compute_throttled_at",
         "trial_started_at", "inactivity_expires_at",
-        "github_pat",
+        "github_pat", "tunnel_active",
     }
     updates = {k: v for k, v in fields.items() if k in allowed}
     if not updates:

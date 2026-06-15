@@ -1580,6 +1580,8 @@ async function loadServerConfig() {
 
       updateGitHubConnectionIndicator(me);
 
+      updateTunnelConnectionIndicator(me);
+
       _armAccountSwitchWatch(me.email || '');
 
     }
@@ -1759,6 +1761,35 @@ function updateGitHubConnectionIndicator(source) {
     ? (repo ? `GitHub repo connected: ${repo} (${branch})` : 'GitHub repo connected')
 
     : 'GitHub repo not connected';
+
+}
+
+
+
+// b43b0c6a — Pro tunnel status dot in sidebar footer
+function updateTunnelConnectionIndicator(me) {
+
+  const wrap = document.getElementById('connection-tunnel');
+
+  if (!wrap || !me) return;
+
+  const isPro = me.plan === 'pro' || me.plan === 'admin' || me.is_internal;
+
+  if (!isPro) { wrap.style.display = 'none'; return; }
+
+  const active = !!me.tunnel_active;
+
+  const dot = document.getElementById('connection-tunnel-dot');
+
+  wrap.style.display = 'inline-flex';
+
+  wrap.title = active ? 'Pro tunnel connected' : 'Pro tunnel disconnected — run `meridian --tunnel`';
+
+  if (dot) dot.style.background = active ? '#22c55e' : '#ef4444';
+
+  wrap.style.borderColor = active ? '#22c55e55' : 'var(--border)';
+
+  wrap.style.color = active ? '#22c55e' : 'var(--muted)';
 
 }
 

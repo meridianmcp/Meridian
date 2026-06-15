@@ -945,11 +945,11 @@ def test_fs_mcp_proxy_subpath_returns_503_when_not_hosted(client):
 
 
 def test_tunnel_ws_closes_without_hosted_mode(client):
-    with client.websocket_connect("/tunnel/fake-tenant-id") as ws:
-        try:
+    try:
+        with client.websocket_connect("/tunnel/fake-tenant-id") as ws:
             ws.receive_text()
-        except Exception:
-            pass  # closed with code 4403 — expected in self-hosted mode
+    except Exception:
+        pass  # server closes immediately in self-hosted mode (code 4403) — expected
 
 
 def test_get_auth_token_uses_oauth_first(monkeypatch):
