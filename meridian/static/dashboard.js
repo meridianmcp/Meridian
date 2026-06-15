@@ -320,6 +320,8 @@ async function ensureWorkspaceSwitcher() {
 
     _renderWorkspaceContextBadge(wrap, workspaces);
 
+    _refreshGuestMode();
+
   };
 
 
@@ -426,6 +428,20 @@ function _wireTabSearch(inputId, containerId, rowSelector) {
     input.addEventListener('input', () => _filterTabRows(input.value, container, rowSelector));
   }
   _filterTabRows(input.value, container, rowSelector);  // re-apply after a re-render
+}
+
+
+// c545f727 — toggle a body class so destructive controls marked .guest-hidden
+// are hidden for invited viewers/members in the active workspace. Owner/admin
+// keep them. Server-side enforcement (393eed0a) is the real gate; this just
+// declutters the UI so guests don't click buttons that 403.
+async function _refreshGuestMode() {
+  let guest = false;
+  try {
+    const r = await getActiveWorkspaceRole();
+    guest = (r === 'viewer' || r === 'member');
+  } catch (_) {}
+  document.body.classList.toggle('meridian-guest', guest);
 }
 
 
@@ -6609,6 +6625,14 @@ async function loadHitlTab(projectId) {
         const hitlOpts = (optPayload && Array.isArray(optPayload.options)) ? optPayload.options : [];
         const hitlRec = (optPayload && typeof optPayload.recommended === 'string') ? optPayload.recommended : null;
 
+        // Dual-channel indicator for pending blocking/high questions
+        const dualChannelHint = (st === 'pending' && !isMd && (urg === 'blocking' || urg === 'high'))
+          ? `<div style="margin-top:6px;display:flex;align-items:center;gap:6px;font-size:10px;color:var(--accent)">
+               <span title="Also displayed inline in Claude Code — first answer (dashboard or chat) wins">📟 Dual-channel — also shown in Claude Code chat</span>
+               <button class="secondary hitl-copy-id-btn" data-hitl-id="${escapeHtml(r.id)}" title="Copy HITL ID to clipboard" style="padding:1px 7px;font-size:9px">Copy ID</button>
+             </div>`
+          : '';
+
         let actionBtns = '';
 
         if (st === 'pending' && isMd) {
@@ -6688,7 +6712,7 @@ async function loadHitlTab(projectId) {
 
           <div style="color:var(--muted);font-size:10px">${escapeHtml(dt)}${r.assigned_to ? ' · @' + escapeHtml(r.assigned_to) : ''}</div>
 
-          ${mdMeta}${ctxHtml}${diffHtml}${answerHtml}${applyErr}${actionBtns}
+          ${mdMeta}${ctxHtml}${dualChannelHint}${diffHtml}${answerHtml}${applyErr}${actionBtns}
 
         </div>`;
 
@@ -6842,6 +6866,29 @@ async function loadHitlTab(projectId) {
             render();
 
           } catch (e) { toast('failed: ' + e.message, true); }
+
+        };
+
+      });
+
+      body.querySelectorAll('.hitl-copy-id-btn').forEach(btn => {
+
+        btn.onclick = () => {
+
+          const id = btn.dataset.hitlId;
+
+          navigator.clipboard.writeText(id).then(() => toast('HITL ID copied ✓')).catch(() => {
+
+            // fallback for browsers without clipboard API
+            const tmp = document.createElement('textarea');
+            tmp.value = id;
+            document.body.appendChild(tmp);
+            tmp.select();
+            document.execCommand('copy');
+            document.body.removeChild(tmp);
+            toast('HITL ID copied ✓');
+
+          });
 
         };
 
@@ -8980,7 +9027,7 @@ async function loadPinnedDecisions(projectId, { showArchived = false } = {}) {
 
             <button class="secondary" data-supersede="${escapeHtml(d.id)}" style="padding:1px 6px;font-size:9px">Supersede</button>
 
-            <button class="secondary" data-archive-decision="${escapeHtml(d.id)}" title="Archive this decision (soft-delete; visible via 'View archived')" style="padding:1px 6px;font-size:9px;color:var(--muted)">Archive</button>
+            <button class="secondary guest-hidden" data-archive-decision="${escapeHtml(d.id)}" title="Archive this decision (soft-delete; visible via 'View archived')" style="padding:1px 6px;font-size:9px;color:var(--muted)">Archive</button>
 
           </div>
 
@@ -10066,7 +10113,7 @@ function renderTaskRow(t) {
 
     : '';
 
-  const deleteBtn = `<button title="Delete from task log (permanent)" onclick="deleteTaskRow(event,'${t.id}','${t.status}')" style="background:none;border:none;color:var(--muted);cursor:pointer;font-size:13px;padding:0 4px;flex-shrink:0;line-height:1" onmouseenter="this.style.color='var(--status-failed)'" onmouseleave="this.style.color='var(--muted)'">\u00d7</button>`;
+  const deleteBtn = `<button class="guest-hidden" title="Delete from task log (permanent)" onclick="deleteTaskRow(event,'${t.id}','${t.status}')" style="background:none;border:none;color:var(--muted);cursor:pointer;font-size:13px;padding:0 4px;flex-shrink:0;line-height:1" onmouseenter="this.style.color='var(--status-failed)'" onmouseleave="this.style.color='var(--muted)'">\u00d7</button>`;
 
   return `
 
@@ -10640,6 +10687,8 @@ async function restoreTabs() {
   // members. Calling it directly here guarantees it appears whenever the user
   // belongs to ≥2 workspaces. ensureWorkspaceSwitcher() is idempotent.
   if (isHostedMode() && !isDemoMode()) ensureWorkspaceSwitcher();
+
+  _refreshGuestMode();
 
   showLocalServerControls();
 

@@ -4570,7 +4570,7 @@ ${n.tags || ""}`.toLowerCase();
               <span style="color:var(--accent);font-weight:600;font-size:${isInsight ? "13px" : "12px"}">${escapeHtml(n.title || "")}</span>
               <span style="color:var(--muted);font-size:10px">${escapeHtml(dt)}</span>
             </div>
-            <button class="secondary notes-del-btn" data-note-id="${escapeHtml(n.id)}" style="padding:1px 8px;font-size:10px">Delete</button>
+            <button class="secondary notes-del-btn guest-hidden" data-note-id="${escapeHtml(n.id)}" style="padding:1px 8px;font-size:10px">Delete</button>
           </div>
           <div style="margin-bottom:6px">${kindPill}${autoPill}${pills}</div>
           <div class="note-body-md" style="color:var(--text);line-height:1.5;font-size:12px">${typeof marked !== "undefined" ? marked.parse(n.body || "") : escapeHtml(n.body || "")}</div>
@@ -5296,6 +5296,7 @@ ${n.tags || ""}`.toLowerCase();
       const active = workspaces.find((w) => w.tenant_id === chosen);
       sel.title = active ? active.is_own ? "My workspace" : `${active.owner_email} (${active.role})` : "";
       _renderWorkspaceContextBadge(wrap, workspaces);
+      _refreshGuestMode();
     };
     const connectLink = document.createElement("a");
     connectLink.id = "connect-db-link";
@@ -5374,6 +5375,15 @@ ${n.tags || ""}`.toLowerCase();
       input.addEventListener("input", () => _filterTabRows(input.value, container, rowSelector));
     }
     _filterTabRows(input.value, container, rowSelector);
+  }
+  async function _refreshGuestMode() {
+    let guest = false;
+    try {
+      const r = await getActiveWorkspaceRole2();
+      guest = r === "viewer" || r === "member";
+    } catch (_) {
+    }
+    document.body.classList.toggle("meridian-guest", guest);
   }
   function showConnectDbModal() {
     if (document.getElementById("connect-db-modal")) return;
@@ -9048,6 +9058,10 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
           }
           const hitlOpts = optPayload && Array.isArray(optPayload.options) ? optPayload.options : [];
           const hitlRec = optPayload && typeof optPayload.recommended === "string" ? optPayload.recommended : null;
+          const dualChannelHint = st === "pending" && !isMd && (urg === "blocking" || urg === "high") ? `<div style="margin-top:6px;display:flex;align-items:center;gap:6px;font-size:10px;color:var(--accent)">
+               <span title="Also displayed inline in Claude Code \u2014 first answer (dashboard or chat) wins">\u{1F4DF} Dual-channel \u2014 also shown in Claude Code chat</span>
+               <button class="secondary hitl-copy-id-btn" data-hitl-id="${escapeHtml(r.id)}" title="Copy HITL ID to clipboard" style="padding:1px 7px;font-size:9px">Copy ID</button>
+             </div>` : "";
           let actionBtns = "";
           if (st === "pending" && isMd) {
             actionBtns = `
@@ -9113,7 +9127,7 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
 
           <div style="color:var(--muted);font-size:10px">${escapeHtml(dt)}${r.assigned_to ? " \xB7 @" + escapeHtml(r.assigned_to) : ""}</div>
 
-          ${mdMeta}${ctxHtml}${diffHtml}${answerHtml}${applyErr}${actionBtns}
+          ${mdMeta}${ctxHtml}${dualChannelHint}${diffHtml}${answerHtml}${applyErr}${actionBtns}
 
         </div>`;
         };
@@ -9210,6 +9224,20 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
             } catch (e) {
               toast("failed: " + e.message, true);
             }
+          };
+        });
+        body.querySelectorAll(".hitl-copy-id-btn").forEach((btn) => {
+          btn.onclick = () => {
+            const id = btn.dataset.hitlId;
+            navigator.clipboard.writeText(id).then(() => toast("HITL ID copied \u2713")).catch(() => {
+              const tmp = document.createElement("textarea");
+              tmp.value = id;
+              document.body.appendChild(tmp);
+              tmp.select();
+              document.execCommand("copy");
+              document.body.removeChild(tmp);
+              toast("HITL ID copied \u2713");
+            });
           };
         });
       } catch (e) {
@@ -10309,7 +10337,7 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
 
             <button class="secondary" data-supersede="${escapeHtml(d.id)}" style="padding:1px 6px;font-size:9px">Supersede</button>
 
-            <button class="secondary" data-archive-decision="${escapeHtml(d.id)}" title="Archive this decision (soft-delete; visible via 'View archived')" style="padding:1px 6px;font-size:9px;color:var(--muted)">Archive</button>
+            <button class="secondary guest-hidden" data-archive-decision="${escapeHtml(d.id)}" title="Archive this decision (soft-delete; visible via 'View archived')" style="padding:1px 6px;font-size:9px;color:var(--muted)">Archive</button>
 
           </div>
 
@@ -10926,7 +10954,7 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
   }
   function renderTaskRow(t) {
     const claimBadge = t.claimed_by ? `<span class="claim-badge" title="claimed at ${escapeHtml(t.claimed_at || "")}">U0001f512 ${escapeHtml((t.claimed_by_human_id || t.claimed_by_session_name || t.claimed_by || "").slice(0, 16))}</span>` : "";
-    const deleteBtn = `<button title="Delete from task log (permanent)" onclick="deleteTaskRow(event,'${t.id}','${t.status}')" style="background:none;border:none;color:var(--muted);cursor:pointer;font-size:13px;padding:0 4px;flex-shrink:0;line-height:1" onmouseenter="this.style.color='var(--status-failed)'" onmouseleave="this.style.color='var(--muted)'">\xD7</button>`;
+    const deleteBtn = `<button class="guest-hidden" title="Delete from task log (permanent)" onclick="deleteTaskRow(event,'${t.id}','${t.status}')" style="background:none;border:none;color:var(--muted);cursor:pointer;font-size:13px;padding:0 4px;flex-shrink:0;line-height:1" onmouseenter="this.style.color='var(--status-failed)'" onmouseleave="this.style.color='var(--muted)'">\xD7</button>`;
     return `
 
     <div class="task ${t.status}" id="task-row-${t.id}" data-search="${escapeHtml((t.description || "") + " " + (t.session_name || "") + " " + (t.claimed_by_session_name || "") + " " + (t.status || ""))}" style="display:flex;align-items:flex-start;gap:4px">
@@ -11238,6 +11266,7 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
     if (isDemoMode()) hideDemoAdminControls();
     if (isHostedMode()) hideHostedAdminControls();
     if (isHostedMode() && !isDemoMode()) ensureWorkspaceSwitcher2();
+    _refreshGuestMode();
     showLocalServerControls();
     ensureTourButton();
     ensureFeedbackButton();

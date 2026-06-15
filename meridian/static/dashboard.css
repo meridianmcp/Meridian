@@ -203,6 +203,10 @@ html, body {
   list-style: none;
 }
 .meridian-disclosure > summary::-webkit-details-marker { display: none; }
+
+/* c545f727 — hide destructive controls from invited viewers/members. The
+   meridian-guest body class is toggled from getActiveWorkspaceRole(). */
+body.meridian-guest .guest-hidden { display: none !important; }
 .meridian-disclosure[open] > summary .meridian-caret {
   transform: rotate(90deg);
 }

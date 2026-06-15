@@ -115,7 +115,7 @@ export async function loadNotesTab(projectId) {
               <span style="color:var(--accent);font-weight:600;font-size:${isInsight ? '13px' : '12px'}">${escapeHtml(n.title || '')}</span>
               <span style="color:var(--muted);font-size:10px">${escapeHtml(dt)}</span>
             </div>
-            <button class="secondary notes-del-btn" data-note-id="${escapeHtml(n.id)}" style="padding:1px 8px;font-size:10px">Delete</button>
+            <button class="secondary notes-del-btn guest-hidden" data-note-id="${escapeHtml(n.id)}" style="padding:1px 8px;font-size:10px">Delete</button>
           </div>
           <div style="margin-bottom:6px">${kindPill}${autoPill}${pills}</div>
           <div class="note-body-md" style="color:var(--text);line-height:1.5;font-size:12px">${typeof marked !== 'undefined' ? marked.parse(n.body || '') : escapeHtml(n.body || '')}</div>
