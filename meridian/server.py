@@ -50,6 +50,8 @@ from ._deps import (
     _md_ts,
     _md_one_line,
     _require_workspace_perm,
+    _enforcement_context,
+    _required_perm_for_request,
     _render_workspace_block,
     _render_context_block,
 )
@@ -954,6 +956,51 @@ async def _demo_read_only_middleware(request: Request, call_next):
     ):
         return Response(
             content=json.dumps({"error": "demo_readonly", "message": "Read-only demo — sign in for full access"}),
+            status_code=403,
+            media_type="application/json",
+        )
+    return await call_next(request)
+
+
+# ---------------------------------------------------------------------------
+# 393eed0a — workspace-role enforcement (viewer read-only / member-limited)
+# ---------------------------------------------------------------------------
+@app.middleware("http")
+async def _role_enforcement_middleware(request: Request, call_next):
+    """Enforce workspace roles on cross-workspace writes.
+
+    viewer = read-only; member = project-data writes; admin = + settings/invites;
+    owner = everything. Acts ONLY when the request targets a workspace the caller
+    was invited to (i.e. carries X-Workspace-Tenant-Id) — solo owners are never
+    gated and pay no extra DB cost. Self-scoped writes (billing/account/auth) and
+    the per-tool-gated /mcp endpoint are skipped by _required_perm_for_request.
+    """
+    from .roles import has_perm  # noqa: PLC0415
+    required = _required_perm_for_request(request.method, request.url.path)
+    if required is None:
+        return await call_next(request)
+    try:
+        ctx = await _enforcement_context(request)
+    except Exception:
+        import logging as _l  # noqa: PLC0415
+        _l.getLogger("meridian.roles").exception("role enforcement check failed")
+        # The no-header fast path returns None WITHOUT querying, so reaching here
+        # means a workspace header was present → a cross-workspace write we could
+        # not verify → fail closed.
+        return Response(
+            content=json.dumps({
+                "error": "forbidden",
+                "message": "Could not verify workspace permissions.",
+            }),
+            status_code=403,
+            media_type="application/json",
+        )
+    if ctx is not None and not has_perm(ctx[2], required):
+        return Response(
+            content=json.dumps({
+                "error": "forbidden",
+                "message": f"Your workspace role ('{ctx[2]}') cannot perform this action.",
+            }),
             status_code=403,
             media_type="application/json",
         )
@@ -5495,11 +5542,24 @@ async def _remote_mcp_inner(request: Request) -> Any:
     db = await _db(request)
     data_dir = _data_dir(request)
 
+    # 393eed0a — compute a workspace-role gate only when an X-Workspace-Tenant-Id
+    # header rides along (an API-token client targeting an invited workspace). The
+    # claude.ai connector never sends it, so this is a no-op (no DB hit) on the
+    # hot path.
+    _enf_role = None
+    if request.headers.get("x-workspace-tenant-id", "").strip():
+        try:
+            _ctx = await _enforcement_context(request)
+            if _ctx is not None:
+                _enf_role = _ctx[2]
+        except Exception:
+            _enf_role = None
+
     if isinstance(body, list):
-        results = [await _handle_mcp_request(item, db, data_dir, tenant=tenant, token_type=_token_type) for item in body]
+        results = [await _handle_mcp_request(item, db, data_dir, tenant=tenant, token_type=_token_type, enforce_role=_enf_role) for item in body]
         return JSONResponse(results)
 
-    result = await _handle_mcp_request(body, db, data_dir, tenant=tenant, token_type=_token_type)
+    result = await _handle_mcp_request(body, db, data_dir, tenant=tenant, token_type=_token_type, enforce_role=_enf_role)
     return JSONResponse(result)
 
 # ---------------------------------------------------------------------------

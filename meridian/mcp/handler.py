@@ -400,8 +400,15 @@ async def _handle_mcp_request(
     body: dict[str, Any], db: Any, data_dir: str,
     tenant: dict[str, Any] | None = None,
     token_type: str = "readwrite",
+    enforce_role: str | None = None,
 ) -> dict[str, Any]:
-    """Dispatch one JSON-RPC 2.0 MCP request and return the response dict."""
+    """Dispatch one JSON-RPC 2.0 MCP request and return the response dict.
+
+    ``enforce_role`` (393eed0a) — when set, the caller is acting in a workspace
+    they were INVITED to under that role; write tools are denied unless the role
+    carries PERM_WRITE. Defaults to None (owner / self-host) → no gate, so the
+    live claude.ai connector path is unaffected.
+    """
     req_id = body.get("id")
     method = body.get("method", "")
     params = body.get("params") or {}
@@ -427,6 +434,15 @@ async def _handle_mcp_request(
         args = params.get("arguments") or {}
         if token_type == "readonly" and name not in _server._mcp_readonly_tools:
             return _server._jsonrpc_err(req_id, -32603, f"tool '{name}' not allowed for read-only tokens")
+        # 393eed0a — workspace-role gate (defense in depth for cross-workspace MCP).
+        if enforce_role is not None and name not in _server._mcp_readonly_tools \
+                and name not in _server._GITHUB_TOOL_NAMES:
+            from ..roles import has_perm, PERM_WRITE  # noqa: PLC0415
+            if not has_perm(enforce_role, PERM_WRITE):
+                return _server._jsonrpc_err(
+                    req_id, -32603,
+                    f"workspace role '{enforce_role}' is read-only; tool '{name}' denied",
+                )
         try:
             if name in _server._GITHUB_TOOL_NAMES and tenant:
                 result = await _dispatch_github_tool(name, args, tenant, db)
