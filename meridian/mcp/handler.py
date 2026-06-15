@@ -686,6 +686,50 @@ async def _board_change_for_session(
         return None
 
 
+async def _unclaimed_file_warnings(
+    db: Any,
+    session_id: str,
+) -> list[str]:
+    """Return warnings for files modified without a lock claim.
+
+    Runs ``git diff --name-only HEAD`` + ``git diff --name-only --cached``
+    to find modified files, then compares against this session's file_locks.
+    Non-fatal on any git or DB error — returns []. (02cd3992)
+    """
+    try:
+        # Get files claimed by this session.
+        cur = await db.execute(
+            "SELECT file_path FROM file_locks WHERE session_id = ?",
+            (session_id,),
+        )
+        rows = await cur.fetchall()
+        claimed = {(r["file_path"] if isinstance(r, dict) else r[0]) for r in rows}
+
+        # Get modified files via git (uncommitted + staged).
+        proc = await asyncio.create_subprocess_exec(
+            "git", "diff", "--name-only", "HEAD",
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5.0)
+        unstaged = set(stdout.decode().splitlines()) if stdout else set()
+
+        proc2 = await asyncio.create_subprocess_exec(
+            "git", "diff", "--name-only", "--cached",
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+        )
+        stdout2, _ = await asyncio.wait_for(proc2.communicate(), timeout=5.0)
+        staged = set(stdout2.decode().splitlines()) if stdout2 else set()
+
+        modified = {p for p in (unstaged | staged) if p}
+        unclaimed = modified - claimed
+        return [
+            f"⚠️ You modified {p} without claiming it — another session may have conflicted."
+            for p in sorted(unclaimed)
+        ]
+    except Exception:  # noqa: BLE001
+        return []
+
+
 async def _fetch_recent_commits(
     project: dict[str, Any],
     tenant: dict[str, Any] | None,
@@ -1636,6 +1680,18 @@ async def _dispatch_mcp_tool(
         if _merge_warning:
             item = dict(item)
             item["merge_warning"] = _merge_warning
+        # 02cd3992 — unclaimed-file warning: flag files modified without a lock.
+        # Non-blocking; surfaces the open-door problem so the executor can act.
+        if _complete_session_id:
+            try:
+                _unclaimed_warnings = await _unclaimed_file_warnings(
+                    db, _complete_session_id
+                )
+                if _unclaimed_warnings:
+                    item = dict(item)
+                    item["unclaimed_file_warnings"] = _unclaimed_warnings
+            except Exception:  # noqa: BLE001
+                pass
         # d01a74bf — surface board additions at the item boundary so a planner's
         # mid-run injections get picked up before the next claim.
         _bc_complete = await _board_change_for_session(
