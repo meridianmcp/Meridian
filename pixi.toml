@@ -19,7 +19,6 @@ pytest-xdist = ">=3.5"
 pytest-cov = ">=4.0"
 beautifulsoup4 = ">=4.12"
 git-cliff = ">=2.13.1,<3"
-ffmpeg = ">=8.1.1,<9"
 
 [pypi-dependencies]
 mcp = ">=1.0"
@@ -29,19 +28,12 @@ psycopg = {version = ">=3.1", extras = ["binary"]}
 psycopg-pool = ">=3.2"
 websockets = ">=12.0"
 watchfiles = ">=0.21"
-fpdf2 = ">=2.7"
-pyinstaller = ">=6.0"
 authlib = ">=1.3"
 itsdangerous = ">=2.1"
 resend = ">=0.7"
 bcrypt = ">=4.0"
 slowapi = ">=0.1"
-mkdocs-material = ">=9.5"
 playwright = ">=1.40"
-imageio = { version = ">=2.37.3, <3", extras = ["ffmpeg"] }
-google-api-python-client = ">=2.197.0, <3"
-google-auth-oauthlib = ">=1.4.0, <2"
-soundfile = ">=0.13.1, <0.14"
 # Tree-sitter core + grammars — foundation for symbol-level parallel protection
 # (sprint 4bac57ff). Python uses stdlib `ast`; these cover the other languages.
 tree-sitter = ">=0.21"
@@ -54,6 +46,23 @@ tree-sitter-go = ">=0.21"
 tree-sitter-rust = ">=0.21"
 tree-sitter-java = ">=0.21"
 tree-sitter-c-sharp = ">=0.21"
+
+# Dev/build-only deps — not installed on Fly (Dockerfile uses pyproject.toml via uv).
+# Use `pixi run -e dev <task>` for docs, exe builds, and media scripts.
+[feature.dev.dependencies]
+ffmpeg = ">=8.1.1,<9"
+
+[feature.dev.pypi-dependencies]
+pyinstaller = ">=6.0"
+mkdocs-material = ">=9.5"
+imageio = { version = ">=2.37.3, <3", extras = ["ffmpeg"] }
+soundfile = ">=0.13.1, <0.14"
+google-api-python-client = ">=2.197.0, <3"
+google-auth-oauthlib = ">=1.4.0, <2"
+fpdf2 = ">=2.7"
+
+[environments]
+dev = { features = ["dev"], solve-group = "default" }
 
 [tasks]
 start = { cmd = "python -m meridian", env = { MERIDIAN_CLAUDE_CLI = "cmd /c C:/Users/13144/AppData/Roaming/npm/claude.cmd -p" } }

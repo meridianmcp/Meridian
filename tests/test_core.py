@@ -3143,7 +3143,13 @@ def test_dashboard_html_has_project_switcher(client):
 # v0.6.7 — IP attribution PDF export
 # ---------------------------------------------------------------------------
 
+_fpdf_available = pytest.mark.skipif(
+    __import__("importlib").util.find_spec("fpdf") is None,
+    reason="fpdf2 not installed (dev-only dep)",
+)
 
+
+@_fpdf_available
 def test_export_pdf_returns_pdf(client):
     """GET /projects/{id}/export/pdf returns a PDF."""
     proj = client.post("/projects", json={"name": "iptest"}).json()
@@ -3155,6 +3161,7 @@ def test_export_pdf_returns_pdf(client):
     assert len(r.content) > 100
 
 
+@_fpdf_available
 def test_export_pdf_contains_sha256(client):
     """PDF export works for a project with tasks and returns valid PDF bytes."""
     proj = client.post("/projects", json={"name": "iptest2"}).json()
@@ -3168,6 +3175,7 @@ def test_export_pdf_contains_sha256(client):
     assert len(r.content) > 500
 
 
+@_fpdf_available
 def test_export_pdf_404_unknown_project(client):
     """GET /projects/bad-id/export/pdf returns 404."""
     r = client.get("/projects/doesnotexist/export/pdf")
