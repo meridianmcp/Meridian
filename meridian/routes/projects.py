@@ -129,9 +129,23 @@ async def create_project(
     from .. import limits as _limits  # noqa: PLC0415
     all_projects = await db_module.list_projects(await _db(request))
     _limits.check_projects_per_tenant(len(all_projects))
-    return await db_module.create_project(
+    project = await db_module.create_project(
         await _db(request), body.name, human_id=body.human_id
     )
+    # c3e91df4 — start the free-tier trial clock on first own project creation,
+    # not at signup. Invited members who never create their own project stay
+    # at trial_started_at=NULL and never consume a trial slot.
+    if tenant and tenant.get("plan") == "free" and not tenant.get("trial_started_at"):
+        if len(all_projects) == 0:
+            from datetime import datetime, timezone, timedelta  # noqa: PLC0415
+            now = datetime.now(timezone.utc)
+            await db_module.update_tenant(
+                request.app.state.db,
+                tenant["id"],
+                trial_started_at=now.strftime("%Y-%m-%d %H:%M:%S"),
+                inactivity_expires_at=(now + timedelta(days=30)).strftime("%Y-%m-%d %H:%M:%S"),
+            )
+    return project
 
 
 @router.get("/setup/needed")
