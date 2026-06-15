@@ -1690,10 +1690,36 @@
     const slug = (proj?.name || "meridian").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 24) || "meridian";
     return slug;
   }
+  function _applySettingsRoleVisibility(projectId, guest) {
+    if (!guest) return;
+    const body = document.getElementById(`settings-body-${projectId}`);
+    if (!body) return;
+    [
+      `settings-account-card-${projectId}`,
+      // account + plan + billing + delete
+      `settings-account-danger-${projectId}`,
+      // export my data + danger zone
+      `settings-notifications-card-${projectId}`,
+      // ntfy / webhook / email
+      `workspace-section-${projectId}`
+      // workspace defaults + decisions/notes
+    ].forEach((id) => {
+      const el = document.getElementById(id);
+      if (el) el.style.display = "none";
+    });
+    const inviteForm = document.getElementById(`settings-invite-form-${projectId}`);
+    if (inviteForm) inviteForm.style.display = "none";
+    body.querySelectorAll("button").forEach((b) => {
+      if (/^save\b/i.test((b.textContent || "").trim())) b.style.display = "none";
+    });
+  }
   async function loadSettingsTab2(projectId) {
     const body = document.getElementById(`settings-body-${projectId}`);
     if (!body) return;
     body.innerHTML = '<div style="color:var(--muted);font-size:11px">loading\u2026</div>';
+    const _activeRole = await getActiveWorkspaceRole();
+    const _guest = _activeRole === "viewer" || _activeRole === "member";
+    const _canInvite = _activeRole === "owner" || _activeRole === "admin";
     const PREFS = [
       { key: "hitl", label: "HITL \u2014 get notified when a session needs your input" },
       { key: "sprint", label: "Sprint done \u2014 all items completed" }
@@ -1838,7 +1864,7 @@ stop = ${JSON.stringify(stop)}`;
           const payLink = window.state.serverConfig?.stripe_payment_link || "/pricing";
           resubBtn = `<a href="${escapeHtml(payLink)}" class="primary" style="padding:4px 10px;font-size:10px;text-decoration:none;background:var(--accent);color:#001020;border-radius:4px;font-weight:600">${window.state.tenantExpired ? "Resubscribe" : "Upgrade to Standard"}</a>`;
         }
-        html += `<div data-demo-hide style="margin-bottom:14px;padding:10px 12px;border:1px solid var(--border);border-radius:6px;background:var(--surface-2)">
+        html += `<div data-demo-hide id="settings-account-card-${projectId}" style="margin-bottom:14px;padding:10px 12px;border:1px solid var(--border);border-radius:6px;background:var(--surface-2)">
 
       <div style="font-weight:600;font-size:11px;color:var(--text);margin-bottom:6px">Account</div>
 
@@ -3325,7 +3351,7 @@ project_id = "${displayPid}"`;
 
       <div id="members-list-${projectId}" style="margin-bottom:10px;font-size:11px;font-family:var(--font-mono)"><div style="color:var(--muted)">loading\u2026</div></div>
 
-      <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
+      <div id="settings-invite-form-${projectId}" style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
 
         <input id="invite-email-${projectId}" type="email" placeholder="teammate@example.com" style="background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:4px 8px;flex:1;min-width:160px">
 
@@ -3375,6 +3401,9 @@ project_id = "${displayPid}"`;
 
             </div>`;
               }).join("");
+              if (_guest) {
+                listEl.querySelectorAll('.member-role-select, .resend-invite-btn, button[title="Remove member"]').forEach((el) => el.remove());
+              }
               listEl.querySelectorAll("select.member-role-select").forEach((sel) => {
                 sel.dataset.prev = sel.value;
                 sel.onchange = async () => {
@@ -3469,7 +3498,7 @@ project_id = "${displayPid}"`;
       }
       const isDemo = !!window.state.serverConfig?.demo_mode;
       if (mcpData && !isDemo) {
-        html += `<div style="margin-bottom:16px">
+        html += `<div style="margin-bottom:16px" id="settings-account-danger-${projectId}">
 
       <div style="color:var(--accent);font-size:10px;letter-spacing:.06em;text-transform:uppercase;margin-bottom:10px;padding-bottom:4px;border-bottom:1px solid var(--border)">Account</div>
 
@@ -3663,7 +3692,7 @@ project_id = "${displayPid}"`;
       }
       const ntfyInputDisabled = ntfyWarnAcknowledged ? "" : "disabled";
       const ntfyWarnDisplay = ntfyWarnAcknowledged ? "display:none" : "";
-      html += `<div data-demo-hide style="margin-bottom:14px;padding:10px 12px;border:1px solid var(--border);border-radius:6px;background:var(--surface-2)">
+      html += `<div data-demo-hide id="settings-notifications-card-${projectId}" style="margin-bottom:14px;padding:10px 12px;border:1px solid var(--border);border-radius:6px;background:var(--surface-2)">
 
     <div style="font-weight:600;font-size:11px;color:var(--text);margin-bottom:4px">Notifications</div>
 
@@ -3770,6 +3799,7 @@ project_id = "${displayPid}"`;
         body.innerHTML = `<div style="color:var(--error);font-size:11px">Failed to render settings: ${escapeHtml(String(renderErr))}</div>`;
         return;
       }
+      _applySettingsRoleVisibility(projectId, _guest);
       if (isDemoMode()) hideDemoAdminControls();
       setTimeout(() => {
         const titleIn = document.getElementById("blog-title");
@@ -5265,6 +5295,7 @@ ${n.tags || ""}`.toLowerCase();
       await loadProjects();
       const active = workspaces.find((w) => w.tenant_id === chosen);
       sel.title = active ? active.is_own ? "My workspace" : `${active.owner_email} (${active.role})` : "";
+      _renderWorkspaceContextBadge(wrap, workspaces);
     };
     const connectLink = document.createElement("a");
     connectLink.id = "connect-db-link";
@@ -5285,10 +5316,46 @@ ${n.tags || ""}`.toLowerCase();
     };
     wrap.appendChild(label);
     wrap.appendChild(sel);
+    _renderWorkspaceContextBadge(wrap, workspaces);
     wrap.appendChild(connectLink);
     const existingLabel = footer.querySelector(".hosted-label");
     if (existingLabel) footer.insertBefore(wrap, existingLabel);
     else footer.prepend(wrap);
+  }
+  async function getActiveWorkspaceRole2() {
+    if (!isHostedMode() || !state.activeWorkspaceTenantId) return "owner";
+    try {
+      const wss = await fetch("/me/workspaces").then((r) => r.ok ? r.json() : null);
+      const ws = (wss || []).find((w) => w.tenant_id === state.activeWorkspaceTenantId);
+      return ws && ws.role || "owner";
+    } catch (_) {
+      return "owner";
+    }
+  }
+  function _renderWorkspaceContextBadge(wrap, workspaces) {
+    if (!wrap) return;
+    let badge = wrap.querySelector(".ws-context-badge");
+    if (!badge) {
+      badge = document.createElement("div");
+      badge.className = "ws-context-badge";
+      badge.style.cssText = "display:inline-block;margin-top:6px;padding:2px 8px;border-radius:10px;font-size:9px;font-weight:700;letter-spacing:.05em;font-family:var(--font-mono);text-transform:uppercase";
+      wrap.appendChild(badge);
+    }
+    const active = (workspaces || []).find((w) => state.activeWorkspaceTenantId ? w.tenant_id === state.activeWorkspaceTenantId : w.is_own);
+    const colors = { free: "#3b82f6", trial: "#059669", standard: "#3b82f6", pro: "#7c3aed", admin: "#9ca3af", invite: "#f59e0b" };
+    let label, color;
+    if (active && !active.is_own) {
+      label = `invite \xB7 ${active.role || "member"}`;
+      color = colors.invite;
+    } else {
+      const plan = window.state.tenantPlan || "free";
+      label = window._PLAN_LABELS && window._PLAN_LABELS[plan] || plan;
+      color = colors[plan] || "#9ca3af";
+    }
+    badge.textContent = label;
+    badge.style.background = color + "22";
+    badge.style.color = color;
+    badge.style.border = "1px solid " + color + "44";
   }
   function showConnectDbModal() {
     if (document.getElementById("connect-db-modal")) return;
@@ -11400,7 +11467,7 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
     }
   }
   try {
-    Object.assign(window, { hideHostedAdminControls, ensureSignOutLink: ensureSignOutLink2, ensureWorkspaceSwitcher: ensureWorkspaceSwitcher2, showConnectDbModal, showLocalServerControls, _summarizeApiErrorText, _projectLoadErrorInfo, wireProjectLoadRetry: wireProjectLoadRetry2, renderProjectLoadError: renderProjectLoadError2, recordProjectLoadError, clearProjectLoadError, renderProjectLoadAlert, retryProjectSurface, syncSidebarActiveProject, autosizeGoalField, githubIconSvg: githubIconSvg2, getConstitutionLimit, loadProjectSettings: loadProjectSettings2, saveProjectSettings: saveProjectSettings2, _demoTourDone: _demoTourDone2, _demoTourSavedStep: _demoTourSavedStep2, _demoTourSaveStep, _demoTourMarkDone, _demoTourClose, _tourActivateVtab, startDemoTour: startDemoTour2, resumeDemoTour, api: api2, projectApi: projectApi2, loadServerConfig, _armAccountSwitchWatch, _refreshOnFocus, _checkAccountSwitch, _showAccountSwitchBanner, updateGitHubConnectionIndicator, _updateConnectionIndicator, checkGitStatus, _doRestart, loadConfig, loadProjects, openTab, closeTab, saveTabs, renderTabs, _makeTabEl, _openTabMenu, _setProjectIcon, _renameProject, _deleteProject, activateTab, buildTabBody, scheduleLiveRefresh, initLiveAutoRefresh, loadLiveTab, refreshLiveTab, wireSprintAddEnter: wireSprintAddEnter2, sprintAction, sprintArchive, filterBackburner, sprintPushPrompt, sprintFeedback, sprintFeedbackNote, sprintItemEdit, addSprintItemFromInput: addSprintItemFromInput2, cacheMostRecentSession, renderLiveSessions, endLiveSession, openTimelineForSession, renderLiveQueue, addLiveTask, cancelLiveTask, showCopyPreview, wireClaudeLaunchPanel, stampHandoffTs, populateSessionDropdown, loadTimeline: loadTimeline2, _renderTimelineLog: _renderTimelineLog2, loadDocsTab, normalizeNotifyTarget, displayNotifyTarget: displayNotifyTarget2, osExecutorHintBanner: osExecutorHintBanner2, showFailoverBannerIfNeeded, suggestNtfyTopic, loadHitlTab, loadTeamTab, updateLiveFeed, loadRecentSessions, loadMilestones, loadRecentRuns, loadQueue, renderSearchResults: renderSearchResults2, wireQueueSectionToggles, refreshTab, refreshGoal, parseDecisionsBlob, renderConstitutionWarning: renderConstitutionWarning2, _hitlBadgeClick, initHitlPanel, setVtabCountBadge: setVtabCountBadge2, refreshProjectCountBadges, refreshHitl, _hitlAnswer, _hitlDismiss, loadPinnedDecisions, supersedePinnedDecision, addPinnedDecision, consolidateDecisions, renderDecisionsTable, wireGoalPreviewToggle, saveGoal, saveNorthStar, saveSprint, _sessionPresenceDot, refreshSessions, refreshTasks, renderTasks, _loadMoreTasks, renderTaskRow, deleteTaskRow, renderHitlRow, wireHitlRow, appendToGoal, hitlReply, hitlExecute, connectWs, handleWsEvent, restoreTabs, _deleteSprintItem, _sprintAction, completeSprintItem, failSprintItem, toggleExpand, state });
+    Object.assign(window, { hideHostedAdminControls, ensureSignOutLink: ensureSignOutLink2, ensureWorkspaceSwitcher: ensureWorkspaceSwitcher2, getActiveWorkspaceRole: getActiveWorkspaceRole2, showConnectDbModal, showLocalServerControls, _summarizeApiErrorText, _projectLoadErrorInfo, wireProjectLoadRetry: wireProjectLoadRetry2, renderProjectLoadError: renderProjectLoadError2, recordProjectLoadError, clearProjectLoadError, renderProjectLoadAlert, retryProjectSurface, syncSidebarActiveProject, autosizeGoalField, githubIconSvg: githubIconSvg2, getConstitutionLimit, loadProjectSettings: loadProjectSettings2, saveProjectSettings: saveProjectSettings2, _demoTourDone: _demoTourDone2, _demoTourSavedStep: _demoTourSavedStep2, _demoTourSaveStep, _demoTourMarkDone, _demoTourClose, _tourActivateVtab, startDemoTour: startDemoTour2, resumeDemoTour, api: api2, projectApi: projectApi2, loadServerConfig, _armAccountSwitchWatch, _refreshOnFocus, _checkAccountSwitch, _showAccountSwitchBanner, updateGitHubConnectionIndicator, _updateConnectionIndicator, checkGitStatus, _doRestart, loadConfig, loadProjects, openTab, closeTab, saveTabs, renderTabs, _makeTabEl, _openTabMenu, _setProjectIcon, _renameProject, _deleteProject, activateTab, buildTabBody, scheduleLiveRefresh, initLiveAutoRefresh, loadLiveTab, refreshLiveTab, wireSprintAddEnter: wireSprintAddEnter2, sprintAction, sprintArchive, filterBackburner, sprintPushPrompt, sprintFeedback, sprintFeedbackNote, sprintItemEdit, addSprintItemFromInput: addSprintItemFromInput2, cacheMostRecentSession, renderLiveSessions, endLiveSession, openTimelineForSession, renderLiveQueue, addLiveTask, cancelLiveTask, showCopyPreview, wireClaudeLaunchPanel, stampHandoffTs, populateSessionDropdown, loadTimeline: loadTimeline2, _renderTimelineLog: _renderTimelineLog2, loadDocsTab, normalizeNotifyTarget, displayNotifyTarget: displayNotifyTarget2, osExecutorHintBanner: osExecutorHintBanner2, showFailoverBannerIfNeeded, suggestNtfyTopic, loadHitlTab, loadTeamTab, updateLiveFeed, loadRecentSessions, loadMilestones, loadRecentRuns, loadQueue, renderSearchResults: renderSearchResults2, wireQueueSectionToggles, refreshTab, refreshGoal, parseDecisionsBlob, renderConstitutionWarning: renderConstitutionWarning2, _hitlBadgeClick, initHitlPanel, setVtabCountBadge: setVtabCountBadge2, refreshProjectCountBadges, refreshHitl, _hitlAnswer, _hitlDismiss, loadPinnedDecisions, supersedePinnedDecision, addPinnedDecision, consolidateDecisions, renderDecisionsTable, wireGoalPreviewToggle, saveGoal, saveNorthStar, saveSprint, _sessionPresenceDot, refreshSessions, refreshTasks, renderTasks, _loadMoreTasks, renderTaskRow, deleteTaskRow, renderHitlRow, wireHitlRow, appendToGoal, hitlReply, hitlExecute, connectWs, handleWsEvent, restoreTabs, _deleteSprintItem, _sprintAction, completeSprintItem, failSprintItem, toggleExpand, state });
   } catch (e) {
   }
 })();
