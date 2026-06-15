@@ -270,3 +270,25 @@ def test_role_enforcement_cross_workspace_http_and_mcp(monkeypatch, tmp_path):
                     json={"require_merge_approval": True})
         assert r.status_code == 403, r.text
         assert "cannot perform" in r.text
+
+
+# ---------------------------------------------------------------------------
+# fdf1120f — magic-link verify renders HTML on failure, never a blank JSON page
+# ---------------------------------------------------------------------------
+
+def test_magic_verify_invalid_token_returns_html(client):
+    """An expired/invalid magic link (opened in a browser) must render a real
+    HTML page with a way back — not a blank JSON 401."""
+    r = client.get("/auth/magic/verify?token=bogus-nonexistent", follow_redirects=False)
+    assert r.status_code == 401
+    assert "text/html" in r.headers.get("content-type", "")
+    assert "Request a new link" in r.text
+    assert "expired" in r.text.lower()
+
+
+def test_magic_verify_missing_token_returns_html(client):
+    """No token → HTML 400, not a blank JSON error."""
+    r = client.get("/auth/magic/verify", follow_redirects=False)
+    assert r.status_code == 400
+    assert "text/html" in r.headers.get("content-type", "")
+    assert "Request a new link" in r.text

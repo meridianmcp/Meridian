@@ -2478,6 +2478,33 @@ async def auth_magic_request(request: Request):
     return JSONResponse(payload)
 
 
+def _magic_error_page(message: str, *, status_code: int, title: str = "Sign-in link problem"):
+    """fdf1120f — render a friendly HTML page for magic-link failures.
+
+    The verify endpoint is opened directly in a browser (often a mobile mail
+    app), so a raw JSON HTTPException renders as a blank/confusing page. Return
+    real HTML with a clear path back to request a fresh link.
+    """
+    from fastapi.responses import HTMLResponse
+    html = (
+        '<!doctype html><html lang="en"><head><meta charset="utf-8">'
+        '<meta name="viewport" content="width=device-width, initial-scale=1">'
+        f'<title>Meridian — {title}</title></head>'
+        '<body style="margin:0;background:#0a0e14;color:#e6edf3;font-family:-apple-system,'
+        "BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;display:flex;min-height:100vh;"
+        'align-items:center;justify-content:center">'
+        '<div style="max-width:380px;padding:32px 28px;text-align:center">'
+        '<div style="font-size:30px;margin-bottom:10px">🧭</div>'
+        f'<h1 style="font-size:18px;margin:0 0 10px;font-weight:600">{title}</h1>'
+        f'<p style="font-size:14px;color:#9ca3af;line-height:1.6;margin:0 0 22px">{message}</p>'
+        '<a href="/auth/login" style="display:inline-block;padding:10px 22px;background:#3b82f6;'
+        'color:#fff;text-decoration:none;border-radius:6px;font-size:14px;font-weight:600">'
+        'Request a new link →</a>'
+        '</div></body></html>'
+    )
+    return HTMLResponse(html, status_code=status_code)
+
+
 async def auth_magic_verify(request: Request, token: str = ""):
     """v0.9 — GET /auth/magic/verify?token=xxx.
 
@@ -2485,30 +2512,55 @@ async def auth_magic_verify(request: Request, token: str = ""):
     that email, creates a session, sets the cookie, and redirects via
     the shared _post_login_redirect — paywall gate applies symmetrically
     to magic-link sign-ups.
+
+    fdf1120f — this endpoint is opened directly in a browser, so failures
+    return a real HTML page (not a blank JSON error) and the sign-in work is
+    guarded so a transient error never renders a blank 500.
     """
+    import logging as _logging
     from . import db as db_module
 
     raw = (token or "").strip()
     if not raw:
-        raise HTTPException(status_code=400, detail="missing token")
+        return _magic_error_page(
+            "This sign-in link is missing its token. Please request a new one.",
+            status_code=400,
+        )
     token_hash = hashlib.sha256(raw.encode()).hexdigest()
 
     db = request.app.state.db
-    row = await db_module.consume_magic_token(db, token_hash)
+    try:
+        row = await db_module.consume_magic_token(db, token_hash)
+    except Exception:
+        _logging.getLogger("meridian.auth").exception("magic verify: token consume failed")
+        return _magic_error_page(
+            "Something went wrong verifying your link. Please request a new one.",
+            status_code=500, title="Sign-in problem",
+        )
     if row is None:
         # Don't reveal whether expired vs used vs nonexistent.
-        raise HTTPException(status_code=401, detail="link expired or already used")
+        return _magic_error_page(
+            "This sign-in link has expired or was already used. Magic links work "
+            "once and expire after a short time.",
+            status_code=401, title="Link expired",
+        )
 
-    email = row["email"]
-    tenant = await db_module.upsert_tenant(db, email=email)
+    try:
+        email = row["email"]
+        tenant = await db_module.upsert_tenant(db, email=email)
+        expires_at = (
+            datetime.now(timezone.utc) + timedelta(hours=_SESSION_MAX_AGE_HOURS)
+        ).isoformat()
+        session = await db_module.create_user_session(db, tenant["id"], expires_at)
+        cookie_value = _make_session_cookie(session["id"])
+        redirect_to = await _post_login_redirect(tenant, db)
+    except Exception:
+        _logging.getLogger("meridian.auth").exception("magic verify: sign-in failed")
+        return _magic_error_page(
+            "Something went wrong signing you in. Please request a new link.",
+            status_code=500, title="Sign-in problem",
+        )
 
-    expires_at = (
-        datetime.now(timezone.utc) + timedelta(hours=_SESSION_MAX_AGE_HOURS)
-    ).isoformat()
-    session = await db_module.create_user_session(db, tenant["id"], expires_at)
-    cookie_value = _make_session_cookie(session["id"])
-
-    redirect_to = await _post_login_redirect(tenant, db)
     response = RedirectResponse(redirect_to, status_code=302)
     response.set_cookie(
         _SESSION_COOKIE,
