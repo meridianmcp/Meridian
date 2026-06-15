@@ -5534,10 +5534,11 @@ def test_pg_migration_registry_matches_historical_order():
         "_migrate_pg_changelog_entries",
         "_migrate_pg_agent_instructions",
         "_migrate_pg_note_kind",
+        "_migrate_pg_file_symbol_claims",
     ]
     # No duplicates across the three groups.
     allnames = core + hosted + late
-    assert len(allnames) == len(set(allnames)) == 42
+    assert len(allnames) == len(set(allnames)) == 43
 
 
 def test_cached_plan_error_is_retryable():
