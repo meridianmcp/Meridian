@@ -45,6 +45,11 @@ from ._deps import (
     _limiter,
     _rate_limit,
     _RATE_LIMIT,
+    _TENANT_RL_WINDOW_SECONDS,
+    _TENANT_RL_PLAN_TTL_SECONDS,
+    _TENANT_RL_PER_MINUTE,
+    _tenant_rl_hits,
+    _tenant_rl_plan_cache,
     _get_authenticated_tenant,
     _mask_api_token_hash,
     _md_ts,
@@ -863,6 +868,87 @@ async def _body_size_guard_middleware(request: Request, call_next):
                             "current": exc.current,
                         },
                     )
+    return await call_next(request)
+
+
+# ---------------------------------------------------------------------------
+# Tier-based per-tenant rate limiting (live-queue hardening, 2b93cb59)
+#
+# Executors poll get_sprint_progress between tasks; this meters the programmatic
+# (Bearer-token) surface per tenant per minute by plan — free=500, standard=2000,
+# pro/admin=unlimited. Dashboard/cookie, demo, unauthenticated, /health and
+# /static traffic is never metered. FAIL-OPEN: any error resolving the tenant or
+# counting hits lets the request through, so a limiter bug can never take down
+# live traffic. In-memory sliding window (process-local, no Redis), matching the
+# slowapi limiter's storage model.
+# ---------------------------------------------------------------------------
+async def _tenant_rate_limit_decision(request: Request):
+    """Return a 429 JSONResponse when the bearer tenant is over its per-minute
+    plan budget, else None. Hosted-mode + Bearer-token requests only."""
+    import hashlib
+    import time as _time
+
+    if not _hosted_mode():
+        return None
+    auth = request.headers.get("authorization", "")
+    if not auth.startswith("Bearer "):
+        return None  # cookie/dashboard, demo, and unauth traffic is never metered
+    path = request.url.path
+    if path.startswith("/health") or path.startswith("/static"):
+        return None
+
+    token_hash = hashlib.sha256(auth[7:].encode()).hexdigest()
+    now = _time.monotonic()
+    cached = _tenant_rl_plan_cache.get(token_hash)
+    if cached is not None and (now - cached[0]) < _TENANT_RL_PLAN_TTL_SECONDS:
+        tenant_id, plan = cached[1]
+    else:
+        from . import db as _db_mod  # noqa: PLC0415
+        tenant = await _db_mod.get_tenant_from_token_hash(request.app.state.db, token_hash)
+        if not tenant:
+            return None  # unknown token — let the route's own auth reject it
+        tenant_id = tenant.get("id") or token_hash
+        plan = (tenant.get("plan") or "free").lower()
+        _tenant_rl_plan_cache[token_hash] = (now, (tenant_id, plan))
+
+    limit = _TENANT_RL_PER_MINUTE.get(plan, _TENANT_RL_PER_MINUTE["free"])
+    if limit is None:
+        return None  # pro / admin — unlimited
+
+    hits = _tenant_rl_hits.setdefault(tenant_id, [])
+    cutoff = now - _TENANT_RL_WINDOW_SECONDS
+    if hits and hits[0] < cutoff:
+        keep = len(hits)
+        for keep in range(len(hits)):
+            if hits[keep] >= cutoff:
+                break
+        del hits[:keep]
+    if len(hits) >= limit:
+        from fastapi.responses import JSONResponse  # noqa: PLC0415
+        retry = max(1, int(_TENANT_RL_WINDOW_SECONDS - (now - hits[0]))) if hits else 1
+        return JSONResponse(
+            status_code=429,
+            content={
+                "detail": f"Rate limit exceeded: plan '{plan}' allows {limit} requests/min.",
+                "plan": plan,
+                "limit_per_minute": limit,
+                "retry_after_seconds": retry,
+            },
+            headers={"Retry-After": str(retry)},
+        )
+    hits.append(now)
+    return None
+
+
+@app.middleware("http")
+async def _tenant_rate_limit_middleware(request: Request, call_next):
+    blocked = None
+    try:
+        blocked = await _tenant_rate_limit_decision(request)
+    except Exception:  # FAIL OPEN — a limiter bug must never break live traffic
+        blocked = None
+    if blocked is not None:
+        return blocked
     return await call_next(request)
 
 
@@ -3097,6 +3183,19 @@ async def mcp_tools_doc() -> str:
     lines += ["## Goal & sprint\n"]
     lines += _render_tool("get_goal")
     lines += _render_tool("set_goal")
+    lines += _render_tool(
+        "get_sprint_progress",
+        "Read-only: Sprint progress summary — counts by status, `percent_complete`, and the item "
+        "list.\n\n"
+        "**Poll this between tasks.** After each `complete_sprint_item`, call "
+        "`get_sprint_progress(project_id, session_id)` (pass `session_id`) before claiming the "
+        "next item. The `board_change` field reports items a planner injected since this session "
+        "started, so an executor picks them up at the item boundary without restarting — never "
+        "idle-poll, only poll at task boundaries. The result is cached server-side for **10 "
+        "seconds**, so parallel sessions polling together share a single DB query.\n\n"
+        "Statuses include `provisional_complete` — work finished but not yet verified/deployed, a "
+        "non-terminal state between `in_progress` and `done` that does not count toward "
+        "`percent_complete`.")
     lines += ["## Executor config & file coordination\n"]
     lines += _render_tool("set_executor_config",
         "Store project-level executor defaults so worker sessions start with repo path, env file, test command, "
@@ -3151,6 +3250,25 @@ async def mcp_tools_doc() -> str:
         "items that may already be done. confidence='high' means 3+ keywords overlap (safe to "
         "mark done via `complete_sprint_item`); confidence='medium' means 1–2 (verify first). "
         "Call during planning sessions to identify board drift.")
+    lines += ["## Rate limits\n"]
+    lines += [
+        "\n",
+        "The hosted MCP surface (Bearer-token requests) is metered per tenant per minute by plan:\n",
+        "\n",
+        "| Plan | Requests / minute |\n",
+        "|------|-------------------|\n",
+        "| `free` | 500 |\n",
+        "| `standard` | 2000 |\n",
+        "| `pro` | unlimited |\n",
+        "\n",
+        "Over-limit requests receive `429 Too Many Requests` with a `Retry-After` header. "
+        "Dashboard (cookie) traffic, `/health`, and `/static` are never metered, and self-hosted "
+        "instances are unmetered. Polling `get_sprint_progress` between tasks stays well within "
+        "these limits — the 10 s server-side cache keeps parallel polling cheap.\n",
+        "\n",
+        "---\n",
+        "\n",
+    ]
     lines += ["## Notes\n"]
     lines += _render_tool("add_note",
         "Add a per-project wiki note. Use for setup instructions, gotchas, environment details, how-tos.")

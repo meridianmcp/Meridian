@@ -16,6 +16,7 @@ import asyncio
 import json
 import logging
 import os
+import time
 import uuid
 from pathlib import Path
 from typing import Any
@@ -217,7 +218,7 @@ CREATE TABLE IF NOT EXISTS sprint_items (
     version TEXT NOT NULL,
     title TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'pending'
-        CHECK (status IN ('pending','todo','in_progress','done','failed','skipped','pushed','indeterminate')),
+        CHECK (status IN ('pending','todo','in_progress','provisional_complete','done','failed','skipped','pushed','indeterminate')),
     item_group TEXT,
     pushed_to TEXT,
     human_id TEXT,
@@ -699,6 +700,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_workspace_members_rbac(db)
     await _migrate_sprint_items_indeterminate(db)
     await _migrate_sprint_item_tree(db)
+    await _migrate_sprint_items_provisional_complete(db)
     await _migrate_api_token_type(db)
     await _migrate_api_tokens_expires_at(db)
     await _migrate_oauth_codes_table(db)
@@ -2491,8 +2493,48 @@ async def expire_inactive_sessions(
 
 
 _VALID_SPRINT_STATUSES = {
-    "pending", "todo", "in_progress", "done", "failed", "skipped", "pushed", "indeterminate"
+    "pending", "todo", "in_progress", "provisional_complete",
+    "done", "failed", "skipped", "pushed", "indeterminate",
 }
+
+# Non-terminal statuses that keep a parent item "active" and never stamp
+# completed_at. provisional_complete sits between in_progress and done:
+# the executor has finished the work but it is not yet verified/deployed, so
+# it must NOT roll a parent up to done or count toward percent_complete.
+_ACTIVE_SPRINT_STATUSES = {
+    "pending", "in_progress", "todo", "indeterminate", "provisional_complete",
+}
+
+# ---------------------------------------------------------------------------
+# get_sprint_progress 10s cache — one get_sprint_items DB query serves all
+# parallel sessions polling between tasks. Keyed by project_id; busted on any
+# sprint-item mutation so progress counts never read stale after a write.
+# ---------------------------------------------------------------------------
+_SPRINT_ITEMS_CACHE: dict[str, tuple[float, list[dict[str, Any]]]] = {}
+_SPRINT_ITEMS_CACHE_TTL = 10.0  # seconds
+
+
+def _invalidate_sprint_items_cache(project_id: str) -> None:
+    """Drop the cached sprint-item list for a project after a mutation."""
+    _SPRINT_ITEMS_CACHE.pop(project_id, None)
+
+
+async def get_sprint_items_cached(
+    db: aiosqlite.Connection, project_id: str
+) -> list[dict[str, Any]]:
+    """Return get_sprint_items(project_id), cached for _SPRINT_ITEMS_CACHE_TTL.
+
+    Parallel executors polling get_sprint_progress between tasks share one DB
+    query within the TTL window. Any add/update mutation calls
+    _invalidate_sprint_items_cache so counts are never stale after a write.
+    """
+    now = time.monotonic()
+    hit = _SPRINT_ITEMS_CACHE.get(project_id)
+    if hit is not None and (now - hit[0]) < _SPRINT_ITEMS_CACHE_TTL:
+        return hit[1]
+    items = await get_sprint_items(db, project_id)
+    _SPRINT_ITEMS_CACHE[project_id] = (now, items)
+    return items
 
 
 async def add_sprint_item(
@@ -2533,6 +2575,7 @@ async def add_sprint_item(
     await db.commit()
     item = await get_sprint_item(db, iid)
     assert item is not None
+    _invalidate_sprint_items_cache(project_id)
     # ITEM 6 — live push so dashboards refresh the sprint board without polling.
     _publish_project_event(project_id, "sprint_item_added", {"item_id": iid})
     return item
@@ -2593,6 +2636,7 @@ async def _update_sprint_item_status(
     await db.commit()
     if cursor.rowcount == 0:
         return None
+    _invalidate_sprint_items_cache(project_id)
     result = await get_sprint_item(db, item_id)
     # Broadcast to dashboard WebSocket subscribers so the sprint board refreshes live.
     _publish_project_event(project_id, "sprint_item_updated", {"item_id": item_id, "status": status})
@@ -2615,8 +2659,7 @@ async def _maybe_rollup_parent(db: aiosqlite.Connection, project_id: str, item_i
     statuses = [r[0] or "pending" for r in rows]
     if not statuses:
         return
-    _active = {"pending", "in_progress", "todo", "indeterminate"}
-    has_active = any(s in _active for s in statuses)
+    has_active = any(s in _ACTIVE_SPRINT_STATUSES for s in statuses)
     if has_active:
         return
     has_failed = any(s == "failed" for s in statuses)
@@ -2640,6 +2683,25 @@ async def complete_sprint_item(
     if result is not None:
         await _maybe_rollup_parent(db, project_id, item_id)
     return result
+
+
+async def provisional_complete_sprint_item(
+    db: aiosqlite.Connection,
+    project_id: str,
+    item_id: str,
+    task_id: str | None = None,
+) -> dict[str, Any] | None:
+    """Mark a sprint item ``provisional_complete`` — work finished but not yet
+    verified/deployed.
+
+    A non-terminal state between in_progress and done: it does not stamp
+    ``completed_at``, does not count toward percent_complete, and keeps any
+    parent item active (no roll-up). The executor flips it to ``done`` via
+    complete_sprint_item once the change is verified/shipped.
+    """
+    return await _update_sprint_item_status(
+        db, project_id, item_id, "provisional_complete", task_id=task_id
+    )
 
 
 async def skip_sprint_item(
