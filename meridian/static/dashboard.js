@@ -406,6 +406,29 @@ function _renderWorkspaceContextBadge(wrap, workspaces) {
 }
 
 
+// 2271635e — client-side search/filter for tab lists. Matches a row's
+// data-search attribute (preferred) or its textContent; hides non-matches.
+function _filterTabRows(query, container, rowSelector) {
+  if (!container) return;
+  const q = (query || '').trim().toLowerCase();
+  container.querySelectorAll(rowSelector).forEach(row => {
+    const hay = (row.dataset.search || row.textContent || '').toLowerCase();
+    row.style.display = (!q || hay.includes(q)) ? '' : 'none';
+  });
+}
+
+function _wireTabSearch(inputId, containerId, rowSelector) {
+  const input = document.getElementById(inputId);
+  const container = document.getElementById(containerId);
+  if (!input || !container) return;
+  if (!input.dataset.searchWired) {
+    input.dataset.searchWired = '1';
+    input.addEventListener('input', () => _filterTabRows(input.value, container, rowSelector));
+  }
+  _filterTabRows(input.value, container, rowSelector);  // re-apply after a re-render
+}
+
+
 
 function showConnectDbModal() {
 
@@ -3299,6 +3322,10 @@ function buildTabBody(project) {
           </div>
         </div>
 
+        <div style="padding:6px 10px;border-bottom:1px solid var(--border)">
+          <input type="text" id="devlog-search-${project.id}" placeholder="Search dev log (description, session)…" style="width:100%;box-sizing:border-box;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;color:var(--text);font-size:11px;font-family:var(--font-mono);padding:4px 8px;outline:none">
+        </div>
+
         <div class="scroll-area"><div class="task-list" id="tasks-${project.id}"></div></div>
 
       </div>
@@ -3550,6 +3577,8 @@ function buildTabBody(project) {
 
           <div style="display:flex;gap:6px;align-items:center">
 
+            <input type="text" id="hitl-search-${project.id}" placeholder="search…" style="background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:2px 6px;outline:none;width:110px">
+
             <select id="hitl-status-filter-${project.id}" style="background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:2px 6px">
 
               <option value="pending">pending</option>
@@ -3621,6 +3650,8 @@ function buildTabBody(project) {
           </span>
 
           <span style="display:flex;gap:6px;align-items:center">
+
+            <input type="text" id="team-search-${project.id}" placeholder="search…" style="background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:2px 6px;outline:none;width:100px">
 
             <select id="team-days-${project.id}" style="background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:2px 4px">
 
@@ -6635,7 +6666,7 @@ async function loadHitlTab(projectId) {
 
         }
 
-        return `<div style="background:var(--surface-2);border:1px solid var(--border);border-left:3px solid ${urgencyColor[urg] || 'var(--accent)'};border-radius:0 4px 4px 0;padding:10px 12px;margin-bottom:8px">
+        return `<div class="hitl-row" data-search="${escapeHtml((r.question || '') + ' ' + (r.status || '') + ' ' + (r.context || ''))}" style="background:var(--surface-2);border:1px solid var(--border);border-left:3px solid ${urgencyColor[urg] || 'var(--accent)'};border-radius:0 4px 4px 0;padding:10px 12px;margin-bottom:8px">
 
           <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px;margin-bottom:4px">
 
@@ -6674,6 +6705,8 @@ async function loadHitlTab(projectId) {
       }
 
       body.innerHTML = html;
+
+      _wireTabSearch(`hitl-search-${projectId}`, `hitl-body-${projectId}`, '.hitl-row');
 
       body.querySelectorAll('.hitl-answer-btn').forEach(btn => {
 
@@ -6906,7 +6939,7 @@ async function loadTeamTab(projectId) {
 
         }).join('');
 
-        return `<div style="background:var(--surface-2);border:1px solid var(--border);border-left:3px solid ${c};border-radius:4px;padding:10px 12px;margin-bottom:8px">
+        return `<div class="team-card" data-search="${escapeHtml((h.human_id || '') + ' ' + (h.active_session || '') + ' ' + (h.agent_framework || ''))}" style="background:var(--surface-2);border:1px solid var(--border);border-left:3px solid ${c};border-radius:4px;padding:10px 12px;margin-bottom:8px">
 
           <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px">
 
@@ -7097,6 +7130,8 @@ async function loadTeamTab(projectId) {
         </section>
 
         ${decisionsHtml}`;
+
+      _wireTabSearch(`team-search-${projectId}`, `team-body-${projectId}`, '.team-card');
 
     } catch (e) {
 
@@ -9947,6 +9982,8 @@ function renderTasks(projectId) {
 
   root.innerHTML = tasks.map(t => renderTaskRow(t)).join('');
 
+  _wireTabSearch(`devlog-search-${projectId}`, `tasks-${projectId}`, '.task');
+
   // Pagination: show "Load more" button if we got a full page
 
   const existingBtn = document.getElementById(`devlog-load-more-${projectId}`);
@@ -10033,7 +10070,7 @@ function renderTaskRow(t) {
 
   return `
 
-    <div class="task ${t.status}" id="task-row-${t.id}" style="display:flex;align-items:flex-start;gap:4px">
+    <div class="task ${t.status}" id="task-row-${t.id}" data-search="${escapeHtml((t.description || '') + ' ' + (t.session_name || '') + ' ' + (t.claimed_by_session_name || '') + ' ' + (t.status || ''))}" style="display:flex;align-items:flex-start;gap:4px">
 
       <span class="status-badge">${t.status}</span>
 

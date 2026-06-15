@@ -5357,6 +5357,24 @@ ${n.tags || ""}`.toLowerCase();
     badge.style.color = color;
     badge.style.border = "1px solid " + color + "44";
   }
+  function _filterTabRows(query, container, rowSelector) {
+    if (!container) return;
+    const q = (query || "").trim().toLowerCase();
+    container.querySelectorAll(rowSelector).forEach((row) => {
+      const hay = (row.dataset.search || row.textContent || "").toLowerCase();
+      row.style.display = !q || hay.includes(q) ? "" : "none";
+    });
+  }
+  function _wireTabSearch(inputId, containerId, rowSelector) {
+    const input = document.getElementById(inputId);
+    const container = document.getElementById(containerId);
+    if (!input || !container) return;
+    if (!input.dataset.searchWired) {
+      input.dataset.searchWired = "1";
+      input.addEventListener("input", () => _filterTabRows(input.value, container, rowSelector));
+    }
+    _filterTabRows(input.value, container, rowSelector);
+  }
   function showConnectDbModal() {
     if (document.getElementById("connect-db-modal")) return;
     const overlay = document.createElement("div");
@@ -6988,6 +7006,10 @@ Current: ${current || "(none)"}`,
           </div>
         </div>
 
+        <div style="padding:6px 10px;border-bottom:1px solid var(--border)">
+          <input type="text" id="devlog-search-${project.id}" placeholder="Search dev log (description, session)\u2026" style="width:100%;box-sizing:border-box;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;color:var(--text);font-size:11px;font-family:var(--font-mono);padding:4px 8px;outline:none">
+        </div>
+
         <div class="scroll-area"><div class="task-list" id="tasks-${project.id}"></div></div>
 
       </div>
@@ -7239,6 +7261,8 @@ Current: ${current || "(none)"}`,
 
           <div style="display:flex;gap:6px;align-items:center">
 
+            <input type="text" id="hitl-search-${project.id}" placeholder="search\u2026" style="background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:2px 6px;outline:none;width:110px">
+
             <select id="hitl-status-filter-${project.id}" style="background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:2px 6px">
 
               <option value="pending">pending</option>
@@ -7310,6 +7334,8 @@ Current: ${current || "(none)"}`,
           </span>
 
           <span style="display:flex;gap:6px;align-items:center">
+
+            <input type="text" id="team-search-${project.id}" placeholder="search\u2026" style="background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:2px 6px;outline:none;width:100px">
 
             <select id="team-days-${project.id}" style="background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:2px 4px">
 
@@ -9065,7 +9091,7 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
 
           </div>`;
           }
-          return `<div style="background:var(--surface-2);border:1px solid var(--border);border-left:3px solid ${urgencyColor[urg] || "var(--accent)"};border-radius:0 4px 4px 0;padding:10px 12px;margin-bottom:8px">
+          return `<div class="hitl-row" data-search="${escapeHtml((r.question || "") + " " + (r.status || "") + " " + (r.context || ""))}" style="background:var(--surface-2);border:1px solid var(--border);border-left:3px solid ${urgencyColor[urg] || "var(--accent)"};border-radius:0 4px 4px 0;padding:10px 12px;margin-bottom:8px">
 
           <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px;margin-bottom:4px">
 
@@ -9097,6 +9123,7 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
           html += resolved.map(renderCard).join("");
         }
         body.innerHTML = html;
+        _wireTabSearch(`hitl-search-${projectId}`, `hitl-body-${projectId}`, ".hitl-row");
         body.querySelectorAll(".hitl-answer-btn").forEach((btn) => {
           btn.onclick = async () => {
             const id = btn.dataset.hitlId;
@@ -9224,7 +9251,7 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
             const desc = (t.description || "").slice(0, 90);
             return `<div style="color:var(--muted);font-size:10px;padding:1px 0">[${escapeHtml(s)}] ${escapeHtml(desc)}</div>`;
           }).join("");
-          return `<div style="background:var(--surface-2);border:1px solid var(--border);border-left:3px solid ${c};border-radius:4px;padding:10px 12px;margin-bottom:8px">
+          return `<div class="team-card" data-search="${escapeHtml((h.human_id || "") + " " + (h.active_session || "") + " " + (h.agent_framework || ""))}" style="background:var(--surface-2);border:1px solid var(--border);border-left:3px solid ${c};border-radius:4px;padding:10px 12px;margin-bottom:8px">
 
           <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px">
 
@@ -9332,6 +9359,7 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
         </section>
 
         ${decisionsHtml}`;
+        _wireTabSearch(`team-search-${projectId}`, `team-body-${projectId}`, ".team-card");
       } catch (e) {
         body.innerHTML = renderProjectLoadError2(projectId, "Team summary unavailable", `/team/summary?project_id=${encodeURIComponent(projectId)}&days=${days}`, e);
         wireProjectLoadRetry2(body, projectId);
@@ -10861,6 +10889,7 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
     hitlRoot.innerHTML = hitl.map((t) => renderHitlRow(projectId, t)).join("");
     hitl.forEach((t) => wireHitlRow(projectId, t));
     root.innerHTML = tasks.map((t) => renderTaskRow(t)).join("");
+    _wireTabSearch(`devlog-search-${projectId}`, `tasks-${projectId}`, ".task");
     const existingBtn = document.getElementById(`devlog-load-more-${projectId}`);
     if (existingBtn) existingBtn.remove();
     if (tasks.length === 100) {
@@ -10900,7 +10929,7 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
     const deleteBtn = `<button title="Delete from task log (permanent)" onclick="deleteTaskRow(event,'${t.id}','${t.status}')" style="background:none;border:none;color:var(--muted);cursor:pointer;font-size:13px;padding:0 4px;flex-shrink:0;line-height:1" onmouseenter="this.style.color='var(--status-failed)'" onmouseleave="this.style.color='var(--muted)'">\xD7</button>`;
     return `
 
-    <div class="task ${t.status}" id="task-row-${t.id}" style="display:flex;align-items:flex-start;gap:4px">
+    <div class="task ${t.status}" id="task-row-${t.id}" data-search="${escapeHtml((t.description || "") + " " + (t.session_name || "") + " " + (t.claimed_by_session_name || "") + " " + (t.status || ""))}" style="display:flex;align-items:flex-start;gap:4px">
 
       <span class="status-badge">${t.status}</span>
 
