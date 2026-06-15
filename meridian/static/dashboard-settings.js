@@ -2926,6 +2926,12 @@ export async function loadSettingsTab(projectId) {
       `</div></details>`;
   }
 
+  html += `<div style="margin-top:20px;padding-top:12px;border-top:1px solid var(--border);display:flex;gap:12px;font-size:9px;color:var(--muted)">` +
+    `<a href="/terms" target="_blank" rel="noopener" style="color:var(--muted);text-decoration:none" onmouseover="this.style.color='var(--text)'" onmouseout="this.style.color='var(--muted)'">Terms of Service</a>` +
+    `<a href="/privacy" target="_blank" rel="noopener" style="color:var(--muted);text-decoration:none" onmouseover="this.style.color='var(--text)'" onmouseout="this.style.color='var(--muted)'">Privacy Policy</a>` +
+    `<span style="margin-left:auto">© 2026 Meridian</span>` +
+    `</div>`;
+
   try {
     body.innerHTML = html;
   } catch (renderErr) {

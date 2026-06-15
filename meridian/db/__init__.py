@@ -4603,6 +4603,8 @@ async def get_file_conflict_warnings(
     and last_seen within the last 10 minutes). Returns human-readable strings
     like ``"dashboard.js claimed by session pre-launch-final (2h ago)"``.
     """
+    from datetime import datetime, timezone, timedelta
+    cutoff_10m = (datetime.now(timezone.utc) - timedelta(minutes=10)).strftime("%Y-%m-%d %H:%M:%S")
     warnings: list[str] = []
     try:
         async with db.execute(
@@ -4612,8 +4614,8 @@ async def get_file_conflict_warnings(
             "WHERE fl.session_id != ? "
             "AND s.project_id = ? "
             "AND s.status IN ('active', 'live') "
-            "AND (s.last_seen IS NULL OR s.last_seen > datetime('now', '-10 minutes'))",
-            (exclude_session_id, project_id),
+            "AND (s.last_seen IS NULL OR s.last_seen > ?)",
+            (exclude_session_id, project_id, cutoff_10m),
         ) as cur:
             rows = await cur.fetchall()
         for row in rows:
@@ -4654,6 +4656,8 @@ async def _live_symbol_claims_for_file(
     last 10 minutes — mirrors get_file_conflict_warnings so a crashed session's
     stale claims never block forever.
     """
+    from datetime import datetime, timezone, timedelta
+    cutoff_10m = (datetime.now(timezone.utc) - timedelta(minutes=10)).strftime("%Y-%m-%d %H:%M:%S")
     async with db.execute(
         "SELECT fsc.symbol_name, fsc.symbol_type, fsc.line_start, fsc.line_end, "
         "       fsc.session_id, s.name AS session_name "
@@ -4662,8 +4666,8 @@ async def _live_symbol_claims_for_file(
         "WHERE fsc.file_path = ? AND fsc.session_id != ? "
         "AND fsc.released_at IS NULL "
         "AND s.status IN ('active', 'live') "
-        "AND (s.last_seen IS NULL OR s.last_seen > datetime('now', '-10 minutes'))",
-        (file_path, exclude_session_id),
+        "AND (s.last_seen IS NULL OR s.last_seen > ?)",
+        (file_path, exclude_session_id, cutoff_10m),
     ) as cur:
         rows = await cur.fetchall()
     return [r for r in (_row_to_dict(row) for row in rows) if r]
@@ -5423,18 +5427,20 @@ async def list_hitl_requests(
     """
     # dcf1e428 — 'recent' pseudo-status: pending OR resolved in last 24h
     if status == "recent":
+        from datetime import datetime, timezone, timedelta
+        cutoff_24h = (datetime.now(timezone.utc) - timedelta(hours=24)).strftime("%Y-%m-%d %H:%M:%S")
         where = []
         args: list[Any] = []
         if project_id is not None:
             where.append("project_id = ?")
             args.append(project_id)
         proj_clause = (" AND ".join(where) + " AND ") if where else ""
-        args.append(limit)
+        args.extend([cutoff_24h, limit])
         sql = (
             f"SELECT * FROM hitl_requests WHERE {proj_clause}"
             "(status = 'pending' OR "
             " (status IN ('answered', 'dismissed') AND "
-            "  COALESCE(answered_at, created_at) >= datetime('now', '-1 day'))) "
+            "  COALESCE(answered_at, created_at) >= ?)) "
             "ORDER BY "
             "  CASE urgency WHEN 'blocking' THEN 0 WHEN 'high' THEN 1 ELSE 2 END, "
             "  created_at DESC LIMIT ?"

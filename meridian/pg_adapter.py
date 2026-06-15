@@ -134,6 +134,16 @@ def _pg_adapt_sql(sql: str, params: tuple) -> tuple[str, list]:
         sql,
     )
 
+    # 3b. datetime('now', 'literal interval') — e.g. '-10 minutes', '-1 day'
+    sql = re.sub(
+        r"datetime\('now',\s*'([^']+)'\)",
+        lambda m: (
+            f"to_char(now() at time zone 'utc' + '{m.group(1)}'::interval,"
+            f" 'YYYY-MM-DD HH24:MI:SS')"
+        ),
+        sql,
+    )
+
     # 4. datetime('now') bare
     sql = re.sub(r"datetime\('now'\)", _DATETIME_NOW_EXPR, sql)
 
