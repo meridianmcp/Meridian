@@ -767,7 +767,23 @@ def test_handoff_endpoint_auto_switches_repeat_session_to_delta(client):
 
 @pytest.mark.asyncio
 async def test_docs_mcp_tools_matches_live_tool_doc():
-    expected = await server_module.mcp_tools_doc()
+    # Generate the expected doc from a PRISTINE, source-fresh copy of the tool
+    # definitions rather than the process-global ``_MCP_TOOLS_LIST``. Under
+    # ``pytest -n auto`` this test shares a worker process with siblings that
+    # reload ``meridian.server`` (and could otherwise mutate the cached tool
+    # list), which made this assertion flake intermittently. Re-execing
+    # ``meridian.mcp_tools`` into a throwaway module gives us the canonical tool
+    # metadata straight from source, immune to any in-process contamination.
+    import importlib.util
+    from unittest import mock
+
+    spec = importlib.util.find_spec("meridian.mcp_tools")
+    fresh = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(fresh)
+    with mock.patch.object(server_module, "_MCP_TOOLS_LIST", fresh._MCP_TOOLS_LIST), \
+         mock.patch.object(server_module, "_TOOL_EXAMPLES", fresh._TOOL_EXAMPLES):
+        expected = await server_module.mcp_tools_doc()
+
     actual = (
         Path(__file__).resolve().parents[1] / "docs" / "mcp-tools.md"
     ).read_text(encoding="utf-8")
