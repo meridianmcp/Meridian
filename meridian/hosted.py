@@ -1480,7 +1480,7 @@ async def send_invite_email(
 
     from_addr = _cfg("MERIDIAN_FROM_EMAIL", "Meridian <noreply@usemeridian.us>")
     html_body = f"""<h2>You've been invited to Meridian</h2>
-<p><strong>{inviter_email}</strong> invited you to collaborate on Meridian — shared memory for AI coding sessions.</p>
+<p><strong>{inviter_email.split('@')[0]}</strong> invited you to collaborate on Meridian — shared memory for AI coding sessions.</p>
 <p style="margin:24px 0">
   <a href="{invite_url}" style="background:#6c8fff;color:#fff;padding:12px 24px;text-decoration:none;border-radius:6px;font-weight:700;display:inline-block">Accept invitation →</a>
 </p>
