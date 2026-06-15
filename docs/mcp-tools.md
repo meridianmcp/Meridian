@@ -145,6 +145,28 @@ set_goal(project_id="abc-123", content="Build a great product")
 
 ---
 
+
+### `get_sprint_progress`
+Read-only: Sprint progress summary — counts by status, `percent_complete`, and the item list.
+
+**Poll this between tasks.** After each `complete_sprint_item`, call `get_sprint_progress(project_id, session_id)` (pass `session_id`) before claiming the next item. The `board_change` field reports items a planner injected since this session started, so an executor picks them up at the item boundary without restarting — never idle-poll, only poll at task boundaries. The result is cached server-side for **10 seconds**, so parallel sessions polling together share a single DB query.
+
+Statuses include `provisional_complete` — work finished but not yet verified/deployed, a non-terminal state between `in_progress` and `done` that does not count toward `percent_complete`.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `project_id` | string | required |  |
+| `session_id` | string | optional | Optional: include board_change (items added since this session started). |
+| `version` | string | optional | Filter to a specific sprint version bucket. |
+| `item_group` | string | optional | Filter to a specific item group. |
+
+**Example:**
+```
+get_sprint_progress(project_id="abc-123")
+```
+
+---
+
 ## Executor config & file coordination
 
 ### `set_executor_config`
@@ -393,6 +415,20 @@ Read-only: Cross-reference pending sprint items against recent git commits and r
 ```
 reconcile_sprint_drift(project_id="abc-123")
 ```
+
+---
+
+## Rate limits
+
+The hosted MCP surface (Bearer-token requests) is metered per tenant per minute by plan:
+
+| Plan | Requests / minute |
+|------|-------------------|
+| `free` | 500 |
+| `standard` | 2000 |
+| `pro` | unlimited |
+
+Over-limit requests receive `429 Too Many Requests` with a `Retry-After` header. Dashboard (cookie) traffic, `/health`, and `/static` are never metered, and self-hosted instances are unmetered. Polling `get_sprint_progress` between tasks stays well within these limits — the 10 s server-side cache keeps parallel polling cheap.
 
 ---
 

@@ -12,7 +12,7 @@ from typing import Any
 
 import aiosqlite
 
-__all__ = ['_migrate_task_log_backlog_future', '_migrate_task_log_backburner', '_migrate_task_log_hitl', '_column_exists', '_migrate_add_column_if_missing', '_migrate_human_identity', '_migrate_v24_task_tree_and_framework', '_migrate_v25_feedback_and_notifications', '_migrate_v33_hitl_kind_payload', '_migrate_v34_hitl_auto_answer', '_migrate_v34_workspace_settings', '_migrate_dunning_fields', '_migrate_overage_fields', '_migrate_v26_client_type', '_migrate_ntfy_notifications', '_migrate_notify_email', '_migrate_github_integration', '_migrate_sprint_item_dependencies', '_migrate_v09_notes_and_magic_links', '_migrate_v24_pinned_decisions_and_hitl', '_migrate_goal_field_timestamps', '_migrate_task_claims', '_migrate_task_sprint_link', '_migrate_session_type', '_migrate_session_summary', '_migrate_parent_session_id', '_migrate_decisions', '_migrate_goal_mode', '_migrate_worker_pid', '_migrate_rewind_token', '_migrate_project_settings', '_migrate_neon_pool_projects_free_tier', '_migrate_tenants_free_plan', '_migrate_decisions_free_category', '_migrate_sessions_archived', '_migrate_goal_hierarchy', '_migrate_sprint_items_v2', '_migrate_drop_chat_tables', '_migrate_hosted_tables', '_migrate_session_notes', '_migrate_milestone_type', '_migrate_executor_runs', '_migrate_file_locks', '_migrate_file_symbol_claims', '_migrate_blog_posts', '_migrate_workspace_layer', '_migrate_checkpoint_data', 'init_hosted_tables', '_migrate_sprint_item_tree', '_migrate_api_token_type', '_migrate_api_tokens_expires_at', '_migrate_github_to_projects', '_migrate_touches_files', '_migrate_oauth_codes_table', '_migrate_device_codes_table', '_migrate_sprint_items_indeterminate', '_migrate_workspace_members_rbac', '_migrate_project_icon', '_internal_emails', '_migrate_tenants_is_internal', '_migrate_admin_plan', '_migrate_active_worktrees', '_migrate_workspace_tenant_isolation', '_migrate_registered_hostnames', '_migrate_queued_session', '_migrate_parallel_safety', '_migrate_changelog_entries', '_migrate_agent_instructions', '_migrate_note_kind', '_migrate_tunnel_active']
+__all__ = ['_migrate_task_log_backlog_future', '_migrate_task_log_backburner', '_migrate_task_log_hitl', '_column_exists', '_migrate_add_column_if_missing', '_migrate_human_identity', '_migrate_v24_task_tree_and_framework', '_migrate_v25_feedback_and_notifications', '_migrate_v33_hitl_kind_payload', '_migrate_v34_hitl_auto_answer', '_migrate_v34_workspace_settings', '_migrate_dunning_fields', '_migrate_overage_fields', '_migrate_v26_client_type', '_migrate_ntfy_notifications', '_migrate_notify_email', '_migrate_github_integration', '_migrate_sprint_item_dependencies', '_migrate_v09_notes_and_magic_links', '_migrate_v24_pinned_decisions_and_hitl', '_migrate_goal_field_timestamps', '_migrate_task_claims', '_migrate_task_sprint_link', '_migrate_session_type', '_migrate_session_summary', '_migrate_parent_session_id', '_migrate_decisions', '_migrate_goal_mode', '_migrate_worker_pid', '_migrate_rewind_token', '_migrate_project_settings', '_migrate_neon_pool_projects_free_tier', '_migrate_tenants_free_plan', '_migrate_decisions_free_category', '_migrate_sessions_archived', '_migrate_goal_hierarchy', '_migrate_sprint_items_v2', '_migrate_drop_chat_tables', '_migrate_hosted_tables', '_migrate_session_notes', '_migrate_milestone_type', '_migrate_executor_runs', '_migrate_file_locks', '_migrate_file_symbol_claims', '_migrate_blog_posts', '_migrate_workspace_layer', '_migrate_checkpoint_data', 'init_hosted_tables', '_migrate_sprint_item_tree', '_migrate_api_token_type', '_migrate_api_tokens_expires_at', '_migrate_github_to_projects', '_migrate_touches_files', '_migrate_oauth_codes_table', '_migrate_device_codes_table', '_migrate_sprint_items_indeterminate', '_migrate_sprint_items_provisional_complete', '_migrate_workspace_members_rbac', '_migrate_project_icon', '_internal_emails', '_migrate_tenants_is_internal', '_migrate_admin_plan', '_migrate_active_worktrees', '_migrate_workspace_tenant_isolation', '_migrate_registered_hostnames', '_migrate_queued_session', '_migrate_parallel_safety', '_migrate_changelog_entries', '_migrate_agent_instructions', '_migrate_note_kind', '_migrate_tunnel_active']
 
 async def _migrate_task_log_backlog_future(db: aiosqlite.Connection) -> None:
     """Rebuild ``task_log`` to add 'backlog' and 'future' statuses (v1.9.x).
@@ -1210,6 +1210,56 @@ async def _migrate_sprint_items_indeterminate(db: aiosqlite.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_sprint_items_version
             ON sprint_items(project_id, version);
         """
+    )
+    await db.commit()
+
+
+async def _migrate_sprint_items_provisional_complete(db: aiosqlite.Connection) -> None:
+    """Widen the sprint_items status CHECK to include 'provisional_complete'.
+
+    SQLite-only: Postgres stores status as free TEXT (no CHECK), so the hosted
+    tier needs no migration. Idempotent. Preserves ALL existing columns by
+    rebuilding from the live CREATE statement with only the status CHECK tuple
+    widened — robust against columns added by later migrations.
+    """
+    import re
+
+    async with db.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='sprint_items'"
+    ) as cur:
+        row = await cur.fetchone()
+    if row is None:
+        return  # fresh DB — CREATE_TABLES already lists provisional_complete
+    sql = (row["sql"] if isinstance(row, dict) else row[0]) or ""
+    if "'provisional_complete'" in sql:
+        return  # already migrated
+    if "status IN" not in sql:
+        return  # no status CHECK to widen (unexpected for SQLite)
+
+    new_sql = sql.replace(
+        "'in_progress','done'", "'in_progress','provisional_complete','done'"
+    )
+    if new_sql == sql:  # spacing differed — fall back to inserting before 'done'
+        new_sql = sql.replace("'done'", "'provisional_complete','done'", 1)
+    if new_sql == sql:
+        return  # could not locate the tuple — leave the schema untouched
+
+    tmp_sql = re.sub(
+        r'(CREATE TABLE\s+(?:IF NOT EXISTS\s+)?)["\']?sprint_items["\']?',
+        r"\1sprint_items_pc_new",
+        new_sql,
+        count=1,
+    )
+    async with db.execute("SELECT * FROM sprint_items LIMIT 0") as cur:
+        cols = [d[0] for d in cur.description]
+    collist = ", ".join(cols)
+    await db.executescript(
+        tmp_sql + ";\n"
+        f"INSERT INTO sprint_items_pc_new ({collist}) SELECT {collist} FROM sprint_items;\n"
+        "DROP TABLE sprint_items;\n"
+        "ALTER TABLE sprint_items_pc_new RENAME TO sprint_items;\n"
+        "CREATE INDEX IF NOT EXISTS idx_sprint_items_project ON sprint_items(project_id, status);\n"
+        "CREATE INDEX IF NOT EXISTS idx_sprint_items_version ON sprint_items(project_id, version);\n"
     )
     await db.commit()
 

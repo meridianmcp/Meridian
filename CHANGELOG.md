@@ -4,6 +4,10 @@ All notable changes to Meridian. Generated from git history via `git-cliff`.
 
 ## [unreleased]
 
+### Features
+
+- Live queue — executors poll get_sprint_progress() between tasks automatically, new items picked up mid-session without restart. Adds the `provisional_complete` status (work finished, not yet verified/deployed) and a 10s server-side cache so parallel sessions share one query. Rate limits: free 500/min, standard 2000/min, pro unlimited.
+
 ### Bug Fixes
 
 - Fix: isolate demo dashboard state ([b8a0dbc](https://github.com/meridianmcp/Meridian/commit/b8a0dbcefea08b8d155cc6f790f09c41ebcfd33f))

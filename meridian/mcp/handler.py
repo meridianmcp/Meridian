@@ -1397,7 +1397,8 @@ async def _dispatch_mcp_tool(
         # 0507f4a1 — sprint progress summary
         _version_filter = args.get("version")
         _group_filter = args.get("item_group")
-        _all = await db_module.get_sprint_items(db, args["project_id"])
+        # 10s cache: parallel executors polling between tasks share one DB query.
+        _all = await db_module.get_sprint_items_cached(db, args["project_id"])
         if _version_filter:
             _all = [it for it in _all if it.get("version") == _version_filter]
         if _group_filter:
@@ -1413,6 +1414,7 @@ async def _dispatch_mcp_tool(
             "total": _total,
             "done": _done_n,
             "in_progress": _counts.get("in_progress", 0),
+            "provisional_complete": _counts.get("provisional_complete", 0),
             "pending": _counts.get("pending", 0),
             "failed": _counts.get("failed", 0),
             "skipped": _counts.get("skipped", 0),

@@ -432,13 +432,13 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "required": ["project_id"]}},
     {"name": "get_sprint_items", "description":
         "Read-only: List sprint items for a project. Optional status filter "
-        "(todo|pending|in_progress|done|failed|skipped|pushed|indeterminate). "
+        "(todo|pending|in_progress|provisional_complete|done|failed|skipped|pushed|indeterminate). "
         "Cold sessions read this to know what's still owed.",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"},
          "status": {"type": "string",
-                    "enum": ["pending", "todo", "in_progress", "done",
-                             "failed", "skipped", "pushed", "indeterminate"],
+                    "enum": ["pending", "todo", "in_progress", "provisional_complete",
+                             "done", "failed", "skipped", "pushed", "indeterminate"],
                     "description": "Filter by status."}},
          "required": ["project_id"]}},
     {"name": "get_session_log", "description":

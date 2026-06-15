@@ -10522,6 +10522,120 @@ async def test_get_sprint_progress_version_filter(db):
     assert res["items"][0]["title"].startswith("v1 task")
 
 
+# ---------------------------------------------------------------------------
+# 2b93cb59 — live-queue hardening: provisional_complete, 10s cache, tier limits
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_provisional_complete_is_non_terminal(db):
+    """provisional_complete sits between in_progress and done: no completed_at,
+    not counted as done, and convertible to done afterward."""
+    import meridian.server as srv
+    p = await db_module.create_project(db, "prov")
+    pid = p["id"]
+    a = await db_module.add_sprint_item(db, pid, "v1", "needs verify")
+    await db_module.add_sprint_item(db, pid, "v1", "still pending")
+
+    prov = await db_module.provisional_complete_sprint_item(db, pid, a["id"])
+    assert prov is not None
+    assert prov["status"] == "provisional_complete"
+    assert prov["completed_at"] is None  # non-terminal
+
+    res = await srv._dispatch_mcp_tool("get_sprint_progress", {"project_id": pid}, db, "/tmp")
+    assert res["done"] == 0
+    assert res["provisional_complete"] == 1
+    assert res["percent_complete"] == 0  # provisional does not count as done
+
+    done = await db_module.complete_sprint_item(db, pid, a["id"])
+    assert done["status"] == "done"
+    assert done["completed_at"] is not None
+
+
+@pytest.mark.asyncio
+async def test_provisional_complete_keeps_parent_active(db):
+    """A child in provisional_complete must NOT roll its parent up to done."""
+    parent_id_holder = await db_module.create_project(db, "prov-parent")
+    pid = parent_id_holder["id"]
+    parent = await db_module.add_sprint_item(db, pid, "v1", "parent")
+    c1 = await db_module.add_subtask(db, pid, parent["id"], "child done")
+    c2 = await db_module.add_subtask(db, pid, parent["id"], "child provisional")
+    await db_module.complete_sprint_item(db, pid, c1["id"])
+    await db_module.provisional_complete_sprint_item(db, pid, c2["id"])
+
+    refreshed = await db_module.get_sprint_item(db, parent["id"])
+    assert refreshed["status"] not in ("done", "indeterminate")
+
+
+@pytest.mark.asyncio
+async def test_get_sprint_items_cached_hits_and_invalidates(db):
+    """Cached fetch serves the same list within the TTL, and a mutation busts it."""
+    p = await db_module.create_project(db, "cache")
+    pid = p["id"]
+    await db_module.add_sprint_item(db, pid, "v1", "one")
+
+    first = await db_module.get_sprint_items_cached(db, pid)
+    second = await db_module.get_sprint_items_cached(db, pid)
+    assert second is first  # cache hit — same object, no second DB query
+    assert len(first) == 1
+
+    await db_module.add_sprint_item(db, pid, "v1", "two")  # mutation invalidates
+    third = await db_module.get_sprint_items_cached(db, pid)
+    assert third is not first
+    assert len(third) == 2
+
+
+@pytest.mark.asyncio
+async def test_tenant_rate_limit_tiers(db, monkeypatch):
+    """Free plan blocks past its per-minute budget; pro is unlimited; non-hosted
+    and non-bearer traffic is never metered. FAIL-OPEN by construction."""
+    import types
+    import meridian.server as srv
+    from meridian._deps import _reset_tenant_rate_limit
+
+    def _fake_req(token, path="/mcp"):
+        return types.SimpleNamespace(
+            headers={"authorization": f"Bearer {token}"},
+            url=types.SimpleNamespace(path=path),
+            app=types.SimpleNamespace(state=types.SimpleNamespace(db=db)),
+        )
+
+    async def _fake_tenant(_auth_db, _token_hash):
+        return _fake_tenant.plan and {"id": _fake_tenant.tid, "plan": _fake_tenant.plan}
+    _fake_tenant.plan = "free"
+    _fake_tenant.tid = "tenant-free"
+
+    monkeypatch.setattr(srv, "_hosted_mode", lambda: True)
+    monkeypatch.setattr(db_module, "get_tenant_from_token_hash", _fake_tenant)
+    monkeypatch.setitem(srv._TENANT_RL_PER_MINUTE, "free", 3)
+    _reset_tenant_rate_limit()
+
+    # free: first 3 allowed, 4th blocked with 429
+    for _ in range(3):
+        assert await srv._tenant_rate_limit_decision(_fake_req("tok-free")) is None
+    blocked = await srv._tenant_rate_limit_decision(_fake_req("tok-free"))
+    assert getattr(blocked, "status_code", None) == 429
+
+    # pro: unlimited — never blocked even past the (patched) free budget
+    _fake_tenant.plan = "pro"
+    _fake_tenant.tid = "tenant-pro"
+    _reset_tenant_rate_limit()
+    for _ in range(10):
+        assert await srv._tenant_rate_limit_decision(_fake_req("tok-pro")) is None
+
+    # non-hosted: never metered
+    monkeypatch.setattr(srv, "_hosted_mode", lambda: False)
+    assert await srv._tenant_rate_limit_decision(_fake_req("tok-free")) is None
+
+    # no bearer token: never metered
+    monkeypatch.setattr(srv, "_hosted_mode", lambda: True)
+    no_auth = types.SimpleNamespace(
+        headers={}, url=types.SimpleNamespace(path="/mcp"),
+        app=types.SimpleNamespace(state=types.SimpleNamespace(db=db)),
+    )
+    assert await srv._tenant_rate_limit_decision(no_auth) is None
+
+
 @pytest.mark.asyncio
 async def test_get_session_brief_shows_new_items_count(db):
     """fd86aacc: session brief shows N items added since session started."""

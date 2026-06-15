@@ -347,6 +347,36 @@ except ImportError:  # pragma: no cover - slowapi always installed in prod
 _RATE_LIMIT = "100/minute"
 
 
+# ---------------------------------------------------------------------------
+# Tier-based per-tenant rate limiting (live-queue hardening, 2b93cb59)
+#
+# Bearer-token (programmatic / MCP) traffic is metered per tenant per minute by
+# plan. Cookie/dashboard, demo, unauthenticated, /health and /static traffic is
+# never metered. The state lives here (next to the slowapi limiter) so the
+# canonical test reset below clears it too — no cross-test bleed.
+# ``None`` means unlimited (pro/admin). The limiter is FAIL-OPEN at the call
+# site: any error resolving the tenant or counting hits lets the request pass.
+# ---------------------------------------------------------------------------
+_TENANT_RL_WINDOW_SECONDS = 60.0
+_TENANT_RL_PLAN_TTL_SECONDS = 60.0
+_TENANT_RL_PER_MINUTE: dict[str, "int | None"] = {
+    "free": 500,
+    "standard": 2000,
+    "pro": None,
+    "admin": None,
+}
+# tenant_id -> monotonic timestamps of requests within the current window
+_tenant_rl_hits: dict[str, list[float]] = {}
+# token_hash -> (cached_at_monotonic, (tenant_id, plan))
+_tenant_rl_plan_cache: dict[str, "tuple[float, tuple[str, str]]"] = {}
+
+
+def _reset_tenant_rate_limit() -> None:
+    """Clear per-tenant rate-limit counters and the token→plan cache."""
+    _tenant_rl_hits.clear()
+    _tenant_rl_plan_cache.clear()
+
+
 def _rate_limit(rate: str):
     """Return a decorator that applies *rate* via slowapi, or a no-op when slowapi is absent."""
     def decorator(func):
@@ -363,6 +393,7 @@ def _reset_limiter_storage() -> None:
     on importlib.reload(server)), we must flush the storage counters AND the
     route-limit registrations that accumulate across server reloads.
     """
+    _reset_tenant_rate_limit()
     if _limiter is None:
         return
     try:
