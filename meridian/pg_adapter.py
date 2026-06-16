@@ -1543,6 +1543,31 @@ async def _migrate_pg_note_kind(conn: PostgresConnection) -> None:
     )
 
 
+async def _migrate_pg_file_symbol_claims(conn: PostgresConnection) -> None:
+    """345599ec — symbol-level parallel protection: per-symbol line-range claims.
+
+    Table only existed in SQLite; hosted tier had no relation, breaking all
+    symbol-level locking. CREATE TABLE IF NOT EXISTS is idempotent.
+    """
+    await conn.executescript(
+        "CREATE TABLE IF NOT EXISTS file_symbol_claims ("
+        "    id TEXT PRIMARY KEY,"
+        "    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,"
+        "    file_path TEXT NOT NULL,"
+        "    symbol_name TEXT NOT NULL,"
+        "    symbol_type TEXT NOT NULL,"
+        "    line_start INTEGER NOT NULL,"
+        "    line_end INTEGER NOT NULL,"
+        f"   claimed_at TEXT NOT NULL DEFAULT ({_TS}),"
+        "    released_at TEXT"
+        ");"
+        "CREATE INDEX IF NOT EXISTS idx_file_symbol_claims_file "
+        "ON file_symbol_claims(file_path);"
+        "CREATE INDEX IF NOT EXISTS idx_file_symbol_claims_session "
+        "ON file_symbol_claims(session_id)"
+    )
+
+
 async def _migrate_pg_v25_admins_table(conn: PostgresConnection) -> None:
     """v2.5 — create admins table and seed known admin emails.
 
@@ -1628,4 +1653,5 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_changelog_entries,
     _migrate_pg_agent_instructions,
     _migrate_pg_note_kind,
+    _migrate_pg_file_symbol_claims,
 )

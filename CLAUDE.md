@@ -74,8 +74,6 @@ High-contention files are always sequential:
 - `hooks.ps1` — ⛔ NEVER edit or run. User-facing installer; running it rotates the API token and kills the human's active Claude Code session.
 - `hooks.sh` — ⛔ NEVER edit or run. Same token-rotation hazard as `hooks.ps1`.
 
-Sprint items can carry `touches_files` so handoffs and dashboards can warn when planned work overlaps with a live session.
-
 ### Worktree isolation (parallel safe)
 
 When `claim_sprint_item()` returns `worktree_suggested: true`, use the provided commands to isolate your work:
@@ -151,6 +149,9 @@ your project context on start and snapshots progress on end.
 - **Secrets hygiene**: Never put credentials, connection strings, API keys, or secrets in chat or task descriptions. Mention env var names only.
 - **Before every push**: Run `pixi run test` locally first. CI is a safety net — not the first check. Never push broken code.
 - **Tests required**: Every sprint item that adds a feature or fixes a bug must include at least one test. No merging to main without tests for the changed code. CI enforces 70% overall coverage (pg_adapter, sdk, hosted, goal_md excluded) — do not reduce it.
+- **Never commit directly to main**: All work goes to `dev`. Merge `dev → main` only to trigger a deploy.
+- **Never fire `promote=yes` without HITL from adam**: Always call `request_hitl` and wait for adam's approval before triggering a prod deploy via `trigger_workflow(deploy.yml, promote=yes)`.
+- **`complete_sprint_item` is mandatory**: Call it for every sprint item you finish. The board never auto-reconciles from git — skipping this drifts the sprint board and breaks handoffs.
 - **End every session**: If tests pass, merge `dev → main` and push `main` to trigger deploy. Do not end the session with work stranded only on `dev`.
 - **Set sprint name**: Use `PATCH /projects/{id}/goal` with body `{"sprint": "name"}` directly (or the `set_sprint` MCP tool). Do NOT use `set_goal` for sprint-only updates.
 - **Handoff**: Use `get_context_block(project_id)` for the handoff context block. Do NOT read from `data/meridian-build_handoff.md` — that file is local-only and not reliable across sessions.
@@ -170,7 +171,7 @@ your project context on start and snapshots progress on end.
 
 ---
 <!-- MERIDIAN STATE — auto-generated, do not edit below -->
-## Current Sprint State  _(auto-updated 2026-06-15 19:09 UTC)_
+## Current Sprint State  _(auto-updated 2026-06-15 20:23 UTC)_
 
 **Key Files:**
 - `meridian/server.py` — FastAPI app + MCP handlers

@@ -82,6 +82,36 @@ def main(argv: list[str] | None = None) -> int:
         help="Run the MCP server over stdio (for Claude Desktop / Code).",
     )
     parser.add_argument(
+        "--tunnel",
+        action="store_true",
+        help="Run the Pro filesystem tunnel client (gives claude.ai a "
+        "permanent URL to your repo). Requires a Pro plan + Node.js/npx.",
+    )
+    parser.add_argument(
+        "--token",
+        default=None,
+        help="API token for --tunnel (defaults to MERIDIAN_API_KEY / "
+        "BEARER_TOKEN).",
+    )
+    parser.add_argument(
+        "--server",
+        default=None,
+        help="Meridian server base URL for --tunnel (defaults to MERIDIAN_URL "
+        "or https://usemeridian.us).",
+    )
+    parser.add_argument(
+        "--repo",
+        default=None,
+        help="Repo path to expose over --tunnel (defaults to the current "
+        "working directory).",
+    )
+    parser.add_argument(
+        "--tunnel-port",
+        type=int,
+        default=8808,
+        help="Local port for the tunnel's mcp-proxy (default 8808).",
+    )
+    parser.add_argument(
         "--host",
         default=os.environ.get("MERIDIAN_HOST", "127.0.0.1"),
         help="HTTP bind host (default 127.0.0.1, override with MERIDIAN_HOST).",
@@ -93,6 +123,22 @@ def main(argv: list[str] | None = None) -> int:
         help="HTTP port (default 7878, override with MERIDIAN_PORT).",
     )
     args = parser.parse_args(argv)
+
+    if args.tunnel:
+        from .tunnel_client import run_tunnel
+
+        loop = asyncio.get_event_loop()
+        try:
+            return loop.run_until_complete(
+                run_tunnel(
+                    token=args.token,
+                    base_url=args.server,
+                    repo_path=args.repo,
+                    port=args.tunnel_port,
+                )
+            )
+        except KeyboardInterrupt:
+            return 0
 
     if args.mcp:
         from .server import build_mcp_server

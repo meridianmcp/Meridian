@@ -767,7 +767,23 @@ def test_handoff_endpoint_auto_switches_repeat_session_to_delta(client):
 
 @pytest.mark.asyncio
 async def test_docs_mcp_tools_matches_live_tool_doc():
-    expected = await server_module.mcp_tools_doc()
+    # Generate the expected doc from a PRISTINE, source-fresh copy of the tool
+    # definitions rather than the process-global ``_MCP_TOOLS_LIST``. Under
+    # ``pytest -n auto`` this test shares a worker process with siblings that
+    # reload ``meridian.server`` (and could otherwise mutate the cached tool
+    # list), which made this assertion flake intermittently. Re-execing
+    # ``meridian.mcp_tools`` into a throwaway module gives us the canonical tool
+    # metadata straight from source, immune to any in-process contamination.
+    import importlib.util
+    from unittest import mock
+
+    spec = importlib.util.find_spec("meridian.mcp_tools")
+    fresh = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(fresh)
+    with mock.patch.object(server_module, "_MCP_TOOLS_LIST", fresh._MCP_TOOLS_LIST), \
+         mock.patch.object(server_module, "_TOOL_EXAMPLES", fresh._TOOL_EXAMPLES):
+        expected = await server_module.mcp_tools_doc()
+
     actual = (
         Path(__file__).resolve().parents[1] / "docs" / "mcp-tools.md"
     ).read_text(encoding="utf-8")
@@ -3143,7 +3159,13 @@ def test_dashboard_html_has_project_switcher(client):
 # v0.6.7 — IP attribution PDF export
 # ---------------------------------------------------------------------------
 
+_fpdf_available = pytest.mark.skipif(
+    __import__("importlib").util.find_spec("fpdf") is None,
+    reason="fpdf2 not installed (dev-only dep)",
+)
 
+
+@_fpdf_available
 def test_export_pdf_returns_pdf(client):
     """GET /projects/{id}/export/pdf returns a PDF."""
     proj = client.post("/projects", json={"name": "iptest"}).json()
@@ -3155,6 +3177,7 @@ def test_export_pdf_returns_pdf(client):
     assert len(r.content) > 100
 
 
+@_fpdf_available
 def test_export_pdf_contains_sha256(client):
     """PDF export works for a project with tasks and returns valid PDF bytes."""
     proj = client.post("/projects", json={"name": "iptest2"}).json()
@@ -3168,6 +3191,7 @@ def test_export_pdf_contains_sha256(client):
     assert len(r.content) > 500
 
 
+@_fpdf_available
 def test_export_pdf_404_unknown_project(client):
     """GET /projects/bad-id/export/pdf returns 404."""
     r = client.get("/projects/doesnotexist/export/pdf")
@@ -5534,10 +5558,11 @@ def test_pg_migration_registry_matches_historical_order():
         "_migrate_pg_changelog_entries",
         "_migrate_pg_agent_instructions",
         "_migrate_pg_note_kind",
+        "_migrate_pg_file_symbol_claims",
     ]
     # No duplicates across the three groups.
     allnames = core + hosted + late
-    assert len(allnames) == len(set(allnames)) == 42
+    assert len(allnames) == len(set(allnames)) == 43
 
 
 def test_cached_plan_error_is_retryable():
@@ -9780,9 +9805,9 @@ def test_pkce_expired_code_rejected(client):
     code = dict(urllib.parse.parse_qsl(urllib.parse.urlparse(r.headers["location"]).query))["code"]
 
     # Expire the in-memory code entry
-    from meridian import server as srv
-    if code in srv._oa_codes:
-        srv._oa_codes[code]["exp"] = time.time() - 1
+    from meridian.routes import oauth as oa_mod
+    if code in oa_mod._oa_codes:
+        oa_mod._oa_codes[code]["exp"] = time.time() - 1
 
     # Also expire the DB entry by setting expires_at in the past
     async def _expire_db():

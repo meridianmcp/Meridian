@@ -686,6 +686,74 @@ async def _board_change_for_session(
         return None
 
 
+_HOTSPOT_RULES: tuple[tuple[frozenset[str], str], ...] = (
+    (frozenset({"server", "route", "api", "endpoint", "fastapi", "lifespan", "oauth"}), "meridian/server.py"),
+    (frozenset({"dashboard", "ui", "frontend", "javascript", "css", "button", "tab", "panel"}), "meridian/static/dashboard.js"),
+    (frozenset({"db", "database", "schema", "migration", "query", "sql", "table", "column"}), "meridian/db/__init__.py"),
+    (frozenset({"mcp", "tool", "handler", "dispatch", "stdio"}), "meridian/mcp/handler.py"),
+    (frozenset({"pg", "postgres", "postgresql", "neon", "adapter"}), "meridian/pg_adapter.py"),
+    (frozenset({"claude.md", "agents.md", "meridian.md", "docs", "instructions", "rules"}), "CLAUDE.md"),
+)
+
+
+def _suggest_files_for_title(title: str) -> list[str]:
+    """Return hotspot files likely touched by a sprint item based on its title keywords.
+
+    Each hotspot fires when at least one keyword matches a word in the title.
+    (f5726fd0)
+    """
+    words = frozenset(title.lower().split())
+    suggested: list[str] = []
+    for keywords, path in _HOTSPOT_RULES:
+        if words & keywords:
+            suggested.append(path)
+    return suggested
+
+
+async def _unclaimed_file_warnings(
+    db: Any,
+    session_id: str,
+) -> list[str]:
+    """Return warnings for files modified without a lock claim.
+
+    Runs ``git diff --name-only HEAD`` + ``git diff --name-only --cached``
+    to find modified files, then compares against this session's file_locks.
+    Non-fatal on any git or DB error — returns []. (02cd3992)
+    """
+    try:
+        # Get files claimed by this session.
+        cur = await db.execute(
+            "SELECT file_path FROM file_locks WHERE session_id = ?",
+            (session_id,),
+        )
+        rows = await cur.fetchall()
+        claimed = {(r["file_path"] if isinstance(r, dict) else r[0]) for r in rows}
+
+        # Get modified files via git (uncommitted + staged).
+        proc = await asyncio.create_subprocess_exec(
+            "git", "diff", "--name-only", "HEAD",
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5.0)
+        unstaged = set(stdout.decode().splitlines()) if stdout else set()
+
+        proc2 = await asyncio.create_subprocess_exec(
+            "git", "diff", "--name-only", "--cached",
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+        )
+        stdout2, _ = await asyncio.wait_for(proc2.communicate(), timeout=5.0)
+        staged = set(stdout2.decode().splitlines()) if stdout2 else set()
+
+        modified = {p for p in (unstaged | staged) if p}
+        unclaimed = modified - claimed
+        return [
+            f"⚠️ You modified {p} without claiming it — another session may have conflicted."
+            for p in sorted(unclaimed)
+        ]
+    except Exception:  # noqa: BLE001
+        return []
+
+
 async def _fetch_recent_commits(
     project: dict[str, Any],
     tenant: dict[str, Any] | None,
@@ -1586,6 +1654,12 @@ async def _dispatch_mcp_tool(
             item = dict(item)
             item["board_change"] = _bc_claim
 
+        # f5726fd0 — suggest files to claim based on item title keywords.
+        _sug = _suggest_files_for_title(item.get("title") or "")
+        if _sug:
+            item = dict(item)
+            item["suggested_files"] = _sug
+
         return item
     if name == "add_subtask":
         return await db_module.add_subtask(
@@ -1636,6 +1710,18 @@ async def _dispatch_mcp_tool(
         if _merge_warning:
             item = dict(item)
             item["merge_warning"] = _merge_warning
+        # 02cd3992 — unclaimed-file warning: flag files modified without a lock.
+        # Non-blocking; surfaces the open-door problem so the executor can act.
+        if _complete_session_id:
+            try:
+                _unclaimed_warnings = await _unclaimed_file_warnings(
+                    db, _complete_session_id
+                )
+                if _unclaimed_warnings:
+                    item = dict(item)
+                    item["unclaimed_file_warnings"] = _unclaimed_warnings
+            except Exception:  # noqa: BLE001
+                pass
         # d01a74bf — surface board additions at the item boundary so a planner's
         # mid-run injections get picked up before the next claim.
         _bc_complete = await _board_change_for_session(

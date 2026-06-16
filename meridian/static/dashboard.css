@@ -134,7 +134,15 @@ html, body {
   transition: background 0.15s, color 0.15s;
 }
 .vtab-btn:hover { background: var(--surface-2); color: var(--text); }
-.vtab-btn.active { background: var(--surface-2); color: var(--accent); }
+/* Active tab: emoji glyphs ignore `color`, so the accent text color alone is
+   invisible on the emoji buttons. Add an inset left accent bar + brighter
+   background so the selected tab is unmistakable regardless of glyph. */
+.vtab-btn.active {
+  background: var(--surface-2); /* fallback for browsers without color-mix */
+  background: color-mix(in srgb, var(--accent) 16%, var(--surface-2));
+  color: var(--accent);
+  box-shadow: inset 3px 0 0 var(--accent);
+}
 
 .vtab-drawer {
   flex: 1; min-width: 0;

@@ -2976,7 +2976,7 @@ function buildTabBody(project) {
 
     <div class="vtab-strip" id="vtab-strip-${project.id}">
 
-      <button class="vtab-btn active" data-vtab="status" title="Status &amp; Sessions">≡</button>
+      <button class="vtab-btn active" data-vtab="status" title="Status &amp; Sessions" aria-label="Status and sessions">📊</button>
 
       <button class="vtab-btn" data-vtab="live" title="Live — right-now view">⚡</button>
 
@@ -3234,7 +3234,7 @@ function buildTabBody(project) {
 
             <div style="color:var(--muted);font-size:10px;margin-bottom:4px">What this session is doing right now. Updated frequently — not a multi-week scrum sprint.</div>
 
-            <div style="display:flex;gap:6px;margin-bottom:10px;align-items:center">
+            <div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:10px;align-items:center">
 
               <select id="goal-sprint-select-${project.id}" style="flex:1;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;padding:6px 8px;color:var(--muted);font-family:var(--font-mono);font-size:11px;outline:none"><option value="" disabled selected>loading sessions…</option></select>
 
@@ -3580,7 +3580,7 @@ function buildTabBody(project) {
 
         </div>
 
-        <div style="flex:1;overflow-y:auto;padding:14px;font-family:'IBM Plex Mono',monospace;font-size:12px" id="notes-body-${project.id}">
+        <div style="flex:1;overflow-y:auto;overflow-x:hidden;word-break:break-word;padding:14px;font-family:'IBM Plex Mono',monospace;font-size:12px" id="notes-body-${project.id}">
 
           <div class="empty" style="color:var(--muted)">loading notes…</div>
 
@@ -8332,7 +8332,17 @@ async function refreshGoal(projectId) {
     const _isVersionLabel = /^v\d+\.\d+/.test(_firstLine.trim()) || _firstLine.trim().length === 0;
     const titleLine = _isVersionLabel ? _firstLine : '';
     const titleEl = document.getElementById(`goal-title-${projectId}`);
-    if (titleEl) titleEl.textContent = titleLine;
+    if (titleEl) {
+      titleEl.textContent = titleLine;
+      // 06d57fef — when there's no version label, hide the title bar entirely.
+      // Otherwise the empty div renders as a stray gray bar above the textarea
+      // (its background/border/padding show even with no text). Round the
+      // textarea's top corners when the bar is gone so it doesn't look clipped.
+      const hasTitle = !!titleLine.trim();
+      titleEl.style.display = hasTitle ? 'block' : 'none';
+      const taEl = document.getElementById(`goal-${projectId}`);
+      if (taEl) taEl.style.borderRadius = hasTitle ? '0 0 4px 4px' : '4px';
+    }
 
     const body = (_isVersionLabel ? allLines.slice(1) : allLines).join('\n').replace(/^\n/, '');
 
@@ -8726,9 +8736,11 @@ function initHitlPanel() {
 
   refreshHitl();
 
-  // ITEM 6 — 30s HITL poll removed: the hitl_filed WS push refreshes the queue live.
-
-  if (_hitlPollTimer) { clearInterval(_hitlPollTimer); _hitlPollTimer = null; }
+  // 20591f72 — restore 60s fallback poll: WS push is the fast path but if the
+  // project panel isn't open yet (no WS listener) the event is dropped silently.
+  // 60s keeps the bar fresh without noticeable lag for the human.
+  if (_hitlPollTimer) clearInterval(_hitlPollTimer);
+  _hitlPollTimer = setInterval(refreshHitl, 60000);
 
 }
 
@@ -10519,6 +10531,10 @@ function handleWsEvent(projectId, event) {
     refreshHitl();
 
     refreshProjectCountBadges(projectId);
+
+    // 20591f72 — also reload the drawer panel if the user is on the HITL vtab.
+    const _hitlPanel = state.panels[projectId];
+    if (_hitlPanel && _hitlPanel.activeVtab === 'hitl') loadHitlTab(projectId);
 
     return;
 

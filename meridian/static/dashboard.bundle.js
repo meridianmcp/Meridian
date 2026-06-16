@@ -6677,7 +6677,7 @@ Current: ${current || "(none)"}`,
 
     <div class="vtab-strip" id="vtab-strip-${project.id}">
 
-      <button class="vtab-btn active" data-vtab="status" title="Status &amp; Sessions">\u2261</button>
+      <button class="vtab-btn active" data-vtab="status" title="Status &amp; Sessions" aria-label="Status and sessions">\u{1F4CA}</button>
 
       <button class="vtab-btn" data-vtab="live" title="Live \u2014 right-now view">\u26A1</button>
 
@@ -6935,7 +6935,7 @@ Current: ${current || "(none)"}`,
 
             <div style="color:var(--muted);font-size:10px;margin-bottom:4px">What this session is doing right now. Updated frequently \u2014 not a multi-week scrum sprint.</div>
 
-            <div style="display:flex;gap:6px;margin-bottom:10px;align-items:center">
+            <div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:10px;align-items:center">
 
               <select id="goal-sprint-select-${project.id}" style="flex:1;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;padding:6px 8px;color:var(--muted);font-family:var(--font-mono);font-size:11px;outline:none"><option value="" disabled selected>loading sessions\u2026</option></select>
 
@@ -7281,7 +7281,7 @@ Current: ${current || "(none)"}`,
 
         </div>
 
-        <div style="flex:1;overflow-y:auto;padding:14px;font-family:'IBM Plex Mono',monospace;font-size:12px" id="notes-body-${project.id}">
+        <div style="flex:1;overflow-y:auto;overflow-x:hidden;word-break:break-word;padding:14px;font-family:'IBM Plex Mono',monospace;font-size:12px" id="notes-body-${project.id}">
 
           <div class="empty" style="color:var(--muted)">loading notes\u2026</div>
 
@@ -10040,7 +10040,13 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
       const _isVersionLabel = /^v\d+\.\d+/.test(_firstLine.trim()) || _firstLine.trim().length === 0;
       const titleLine = _isVersionLabel ? _firstLine : "";
       const titleEl = document.getElementById(`goal-title-${projectId}`);
-      if (titleEl) titleEl.textContent = titleLine;
+      if (titleEl) {
+        titleEl.textContent = titleLine;
+        const hasTitle = !!titleLine.trim();
+        titleEl.style.display = hasTitle ? "block" : "none";
+        const taEl = document.getElementById(`goal-${projectId}`);
+        if (taEl) taEl.style.borderRadius = hasTitle ? "0 0 4px 4px" : "4px";
+      }
       const body = (_isVersionLabel ? allLines.slice(1) : allLines).join("\n").replace(/^\n/, "");
       const editStart = body.search(/^(CURRENT FOCUS|KEY FILES)/m);
       if (editStart > 0) {
@@ -10215,10 +10221,8 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
       };
     }
     refreshHitl();
-    if (_hitlPollTimer) {
-      clearInterval(_hitlPollTimer);
-      _hitlPollTimer = null;
-    }
+    if (_hitlPollTimer) clearInterval(_hitlPollTimer);
+    _hitlPollTimer = setInterval(refreshHitl, 6e4);
   }
   function setVtabCountBadge2(selector, count) {
     document.querySelectorAll(selector).forEach((badge) => {
@@ -11221,6 +11225,8 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
     if (event.type === "hitl_filed") {
       refreshHitl();
       refreshProjectCountBadges(projectId);
+      const _hitlPanel = state.panels[projectId];
+      if (_hitlPanel && _hitlPanel.activeVtab === "hitl") loadHitlTab(projectId);
       return;
     }
     const cache = state.panels[projectId].taskCache;
