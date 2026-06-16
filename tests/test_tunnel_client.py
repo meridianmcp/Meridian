@@ -116,6 +116,10 @@ def test_build_proxy_command_structure():
     assert "mcp-proxy" in cmd
     assert "--port" in cmd
     assert "9000" in cmd
+    # Streamable HTTP + stateless mode required for the tunnel relay.
+    assert "--server" in cmd
+    assert "stream" in cmd
+    assert "--stateless" in cmd
     # The separator + the wrapped filesystem server must be present.
     assert "--" in cmd
     assert "@modelcontextprotocol/server-filesystem" in cmd
