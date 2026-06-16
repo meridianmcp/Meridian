@@ -82,8 +82,19 @@ def _ws_url(base_url: str, tenant_id: str, token: str) -> str:
 
 
 def _permanent_url(base_url: str, tenant_id: str) -> str:
-    """The URL the user adds to claude.ai once (matches the server route)."""
-    return f"{base_url.rstrip('/')}/fs/mcp/{tenant_id}"
+    """The URL the user adds to claude.ai once.
+
+    Points at the mcp-proxy **Streamable HTTP** transport (`/mcp`), NOT the
+    proxy root: mcp-proxy serves transports at `/mcp` (streamable) and `/sse`
+    (SSE) and returns 404 for `/`. The server route `/fs/mcp/{tenant_id}/{rest}`
+    relays the `/mcp` suffix straight to the local proxy.
+    """
+    return f"{base_url.rstrip('/')}/fs/mcp/{tenant_id}/mcp"
+
+
+def _sse_url(base_url: str, tenant_id: str) -> str:
+    """SSE-transport variant of the permanent URL, for older MCP clients."""
+    return f"{base_url.rstrip('/')}/fs/mcp/{tenant_id}/sse"
 
 
 def _find_npx() -> str:
@@ -111,15 +122,28 @@ def _build_proxy_command(
 ) -> list[str]:
     """Build the ``mcp-proxy`` command that wraps the filesystem MCP server.
 
-    Equivalent to::
+    Roughly::
 
-        npx -y mcp-proxy --port <port> -- \
-            <npx> -y @modelcontextprotocol/server-filesystem <repo_path>
+        npx -y mcp-proxy [--shell] --port <port> -- \
+            npx -y @modelcontextprotocol/server-filesystem <repo_path>
+
+    The OUTER ``npx`` is the resolved launcher (full ``npx.cmd`` path on Windows,
+    so Python's ``subprocess`` can start it). The INNER command is bare ``npx``,
+    resolved by mcp-proxy.
+
+    On Windows we pass ``--shell`` so mcp-proxy spawns the inner ``npx`` through
+    cmd.exe. Without it, mcp-proxy's direct spawn fails two ways on modern Node:
+    bare ``npx`` → ENOENT, and a full ``npx.cmd`` path → EINVAL (Node 24's
+    CVE-2024-27980 mitigation refuses to spawn ``.cmd``/``.bat`` without a shell).
+
+    Note: with ``--shell`` mcp-proxy concatenates args unescaped, so a
+    ``repo_path`` containing spaces is not yet supported on Windows.
     """
-    return [
-        npx, "-y", "mcp-proxy", "--port", str(port), "--",
-        npx, "-y", "@modelcontextprotocol/server-filesystem", repo_path,
-    ]
+    cmd = [npx, "-y", "mcp-proxy", "--port", str(port)]
+    if sys.platform == "win32":
+        cmd.append("--shell")
+    cmd += ["--", "npx", "-y", "@modelcontextprotocol/server-filesystem", repo_path]
+    return cmd
 
 
 # ---------------------------------------------------------------------------
@@ -282,6 +306,7 @@ async def run_tunnel(
     print("", flush=True)
     print("  Permanent MCP URL — add this to claude.ai once:", flush=True)
     print(f"    {permanent}", flush=True)
+    print(f"  (SSE-transport clients: {_sse_url(base_url, tenant_id)})", flush=True)
     print("", flush=True)
 
     # 3. Reconnect loop with exponential backoff.

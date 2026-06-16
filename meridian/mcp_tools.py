@@ -510,6 +510,13 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "session_id": {"type": "string"},
          "file_path": {"type": "string"}},
          "required": ["session_id", "file_path"]}},
+    {"name": "get_file_claims", "description":
+        "Read-only: show active claims on a file — the whole-file lock (with the "
+        "holder's session name, if any) plus any symbol-level claims. Use to check "
+        "who owns a file before editing it.",
+     "inputSchema": {"type": "object", "properties": {
+         "file_path": {"type": "string"}},
+         "required": ["file_path"]}},
     {"name": "get_symbol_claims", "description":
         "Read-only: list symbol-level claims on a file (who owns which class/function/method line ranges).",
      "inputSchema": {"type": "object", "properties": {
@@ -586,7 +593,7 @@ _READ_ONLY_TOOLS = {
     "get_session_log", "idle_until_session_done", "generate_handoff",
     "get_workspace_notes", "get_workspace_decisions", "get_workspace_settings",
     "get_sprint_items", "get_sprint_progress", "get_agent_instructions",
-    "reconcile_sprint_drift", "get_planning_brief",
+    "reconcile_sprint_drift", "get_planning_brief", "get_file_claims",
 }
 _DESTRUCTIVE_TOOLS = {"delete_note", "archive_decision", "dismiss_hitl"}
 
@@ -629,6 +636,7 @@ _TITLE_OVERRIDES: dict[str, str] = {
     "set_agent_instructions": "Set Agent Instructions",
     "reconcile_sprint_drift": "Reconcile Sprint Drift",
     "get_planning_brief": "Get Planning Brief",
+    "get_file_claims": "Get File Claims",
 }
 
 for _tool in _MCP_TOOLS_LIST:

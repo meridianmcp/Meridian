@@ -757,15 +757,17 @@ async def _unclaimed_file_warnings(
 async def _fetch_recent_commits(
     project: dict[str, Any],
     tenant: dict[str, Any] | None,
-) -> list[str]:
-    """Fetch last 20 commit messages for a project.
+) -> list[dict[str, str]]:
+    """Fetch last 20 commits for a project as ``{"sha", "message"}`` dicts.
 
     Tries GitHub API if tenant has github_pat and project has github_repo;
-    falls back to local ``git log --oneline -20``. Returns plain message strings.
+    falls back to local ``git log --oneline -20``. The SHA is preserved so
+    reconcile-drift output can cite the matching commit (callers that only
+    need messages can map ``c["message"]``).
     Non-fatal — returns empty list on any failure.
     """
     import subprocess as _sp  # noqa: PLC0415
-    commits: list[str] = []
+    commits: list[dict[str, str]] = []
     try:
         if tenant:
             pat = db_module.decrypt_field(tenant.get("github_pat"))
@@ -785,7 +787,7 @@ async def _fetch_recent_commits(
                     if r.status_code == 200:
                         for c in r.json():
                             msg = c["commit"]["message"].split("\n")[0]
-                            commits.append(msg)
+                            commits.append({"sha": (c.get("sha") or "")[:12], "message": msg})
                 if commits:
                     return commits
     except Exception:  # noqa: BLE001
@@ -798,8 +800,8 @@ async def _fetch_recent_commits(
         for line in result.stdout.splitlines():
             line = line.strip()
             if line and " " in line:
-                _, _, msg = line.partition(" ")
-                commits.append(msg)
+                sha, _, msg = line.partition(" ")
+                commits.append({"sha": sha, "message": msg})
     except Exception:  # noqa: BLE001
         pass
     return commits
@@ -914,7 +916,7 @@ async def _dispatch_mcp_tool(
                     data_dir,
                     mode=mode,
                     session_id=session_id,
-                    commit_messages=_gh_commits or [],
+                    commit_messages=[c["message"] for c in _gh_commits],
                 ),
                 timeout=90.0,
             )
@@ -969,12 +971,12 @@ async def _dispatch_mcp_tool(
         from .. import handoff as handoff_module_local
         # Fetch recent commits for reconcile annotations (non-fatal)
         _ckpt_project = await db_module.get_project(db, project_id)
-        _commit_messages = await _fetch_recent_commits(_ckpt_project or {}, tenant)
+        _commits = await _fetch_recent_commits(_ckpt_project or {}, tenant)
         try:
             _, content = await asyncio.wait_for(
                 handoff_module_local.generate_handoff(
                     db, project_id, data_dir, mode="delta", session_id=session_id,
-                    commit_messages=_commit_messages or [],
+                    commit_messages=[c["message"] for c in _commits],
                 ),
                 timeout=30.0,
             )
@@ -982,15 +984,10 @@ async def _dispatch_mcp_tool(
             content = "delta handoff timed out"
         pending_items = await db_module.get_sprint_items(db, project_id, status="pending")
         # Log drift warnings for high-confidence reconcile matches (non-fatal)
-        if _commit_messages and pending_items:
+        if _commits and pending_items:
             try:
-                _commits_for_reconcile = []
-                for _line in _commit_messages:
-                    _sha = ""
-                    _msg = _line
-                    _commits_for_reconcile.append({"sha": _sha, "message": _msg})
                 _matches = handoff_module_local.reconcile_sprint_items(
-                    pending_items, _commits_for_reconcile
+                    pending_items, _commits
                 )
                 for _m in _matches:
                     if _m.get("confidence") == "high":
@@ -1785,6 +1782,8 @@ async def _dispatch_mcp_tool(
                 return await db_module.claim_file(db, args["file_path"], args["session_id"])
             return result
         return await db_module.claim_file(db, args["file_path"], args["session_id"])
+    if name == "get_file_claims":
+        return await db_module.get_file_claims(db, args["file_path"])
     if name == "get_symbol_claims":
         return {"claims": await db_module.get_symbol_claims(db, args["file_path"])}
     if name == "get_symbol_hotspots":
@@ -1912,8 +1911,7 @@ async def _dispatch_mcp_tool(
         if project is None:
             raise ValueError("project not found")
         pending_items = await db_module.get_sprint_items(db, args["project_id"], status="pending")
-        commit_msgs = await _fetch_recent_commits(project, tenant)
-        commits = [{"sha": "", "message": m} for m in commit_msgs]
+        commits = await _fetch_recent_commits(project, tenant)
         matches = handoff_module_local.reconcile_sprint_items(pending_items, commits)
         action_items = [
             {
@@ -1931,7 +1929,7 @@ async def _dispatch_mcp_tool(
         ]
         return {
             "pending_item_count": len(pending_items),
-            "commit_count": len(commit_msgs),
+            "commit_count": len(commits),
             "drift_count": len(matches),
             "high_confidence": sum(1 for m in matches if m["confidence"] == "high"),
             "medium_confidence": sum(1 for m in matches if m["confidence"] == "medium"),

@@ -86,10 +86,18 @@ def test_ws_url_quotes_token():
     assert "a%2Fb%2Bc%20d" in url
 
 
-def test_permanent_url_matches_server_route():
+def test_permanent_url_targets_mcp_transport_endpoint():
+    # Must point at the /mcp transport, NOT the proxy root (which 404s).
     assert (
         tc._permanent_url("https://usemeridian.us/", "abc")
-        == "https://usemeridian.us/fs/mcp/abc"
+        == "https://usemeridian.us/fs/mcp/abc/mcp"
+    )
+
+
+def test_sse_url_targets_sse_endpoint():
+    assert (
+        tc._sse_url("https://usemeridian.us", "abc")
+        == "https://usemeridian.us/fs/mcp/abc/sse"
     )
 
 
@@ -116,6 +124,17 @@ def test_build_proxy_command_structure():
     sep = cmd.index("--")
     assert "mcp-proxy" in cmd[:sep]
     assert "@modelcontextprotocol/server-filesystem" in cmd[sep:]
+    # Inner command is bare npx (resolved by mcp-proxy / the shell), not a path.
+    assert cmd[sep + 1] == "npx"
+
+
+def test_build_proxy_command_uses_shell_on_windows(monkeypatch):
+    # --shell is required on Windows (Node refuses to spawn .cmd without it);
+    # omitted elsewhere to avoid unescaped shell arg concatenation.
+    monkeypatch.setattr(tc.sys, "platform", "win32")
+    assert "--shell" in tc._build_proxy_command("npx.cmd", "C:/repo")
+    monkeypatch.setattr(tc.sys, "platform", "linux")
+    assert "--shell" not in tc._build_proxy_command("npx", "/repo")
 
 
 # ---------------------------------------------------------------------------
