@@ -4696,6 +4696,33 @@ async def get_file_conflict_warnings(
     return warnings
 
 
+async def get_file_claims(
+    db: aiosqlite.Connection,
+    file_path: str,
+) -> dict[str, Any]:
+    """Return active claims on a file: the whole-file lock plus symbol claims.
+
+    Read-only. Expires stale whole-file locks first so callers never see a
+    lock past its TTL. ``file_lock`` is the active ``file_locks`` row (with the
+    holder's ``session_name``) or ``None``; ``symbol_claims`` is the list from
+    :func:`get_symbol_claims`.
+    """
+    normalized = (file_path or "").strip()
+    await expire_file_locks(db)
+    async with db.execute(
+        "SELECT fl.*, s.name AS session_name FROM file_locks fl "
+        "LEFT JOIN sessions s ON s.id = fl.session_id "
+        "WHERE fl.file_path = ?",
+        (normalized,),
+    ) as cur:
+        row = await cur.fetchone()
+    return {
+        "file_path": normalized,
+        "file_lock": _row_to_dict(row),
+        "symbol_claims": await get_symbol_claims(db, normalized),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Symbol-level parallel protection (4bac57ff)
 # ---------------------------------------------------------------------------

@@ -11145,7 +11145,9 @@ async def test_reconcile_sprint_drift_detects_high_confidence(db):
     p = await db_module.create_project(db, "drift-high")
     await db_module.add_sprint_item(db, p["id"], "v1", "Fix OAuth redirect callback bug")
 
-    fake_commits = ["Fix OAuth redirect callback handling in auth middleware"]
+    fake_commits = [
+        {"sha": "abc1234def5", "message": "Fix OAuth redirect callback handling in auth middleware"},
+    ]
     with patch("meridian.mcp.handler._fetch_recent_commits", return_value=fake_commits):
         res = await srv._dispatch_mcp_tool(
             "reconcile_sprint_drift", {"project_id": p["id"]}, db, "/tmp"
@@ -11156,6 +11158,8 @@ async def test_reconcile_sprint_drift_detects_high_confidence(db):
     assert match["confidence"] in ("high", "medium")
     assert "suggested_action" in match
     assert match["item_id"]
+    # Regression: the matching commit's SHA must be reported, not empty.
+    assert match["matching_commits"][0]["sha"] == "abc1234def5"
 
 
 @pytest.mark.asyncio
