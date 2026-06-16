@@ -445,6 +445,7 @@ body{background:#0d0d0f;color:#e8eaf0;font-family:-apple-system,BlinkMacSystemFo
 .email-form{display:flex;flex-direction:column;gap:8px}
 .email-input{width:100%;padding:12px 14px;background:#0d0d0f;border:1px solid #2a2d35;border-radius:8px;color:#e8eaf0;font-size:.95rem;outline:none;font-family:inherit}
 .email-input:focus{border-color:#6c8fff}
+.email-hint{font-size:.78rem;color:#8b8fa8;line-height:1.4;margin:-2px 2px 2px}
 .btn-email{background:#6c8fff;color:#fff;margin-bottom:0}
 .btn-email:disabled{opacity:.6;cursor:wait}
 .email-status{font-size:.82rem;color:#8b8fa8;margin-top:6px;min-height:1em;text-align:center}
@@ -470,6 +471,7 @@ body{background:#0d0d0f;color:#e8eaf0;font-family:-apple-system,BlinkMacSystemFo
   <div class="divider">or</div>
   <form class="email-form" id="magic-form" onsubmit="event.preventDefault();sendMagic();">
     <input type="email" class="email-input" id="magic-email" placeholder="you@example.com" autocomplete="email" required>
+    <div class="email-hint">We'll send a magic link to this address — click it to sign in. No password needed.</div>
     <button type="submit" class="btn btn-email" id="magic-btn">Send magic link →</button>
     <div class="email-status" id="magic-status"></div>
   </form>
@@ -507,7 +509,7 @@ async function sendMagic() {
     status.textContent = 'Something went wrong. Try again in a moment.';
   } finally {
     btn.disabled = false;
-    btn.textContent = 'Send sign-in link →';
+    btn.textContent = 'Send magic link →';
   }
 }
 </script>
