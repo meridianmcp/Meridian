@@ -139,7 +139,11 @@ def _build_proxy_command(
     Note: with ``--shell`` mcp-proxy concatenates args unescaped, so a
     ``repo_path`` containing spaces is not yet supported on Windows.
     """
-    cmd = [npx, "-y", "mcp-proxy", "--port", str(port)]
+    # --server stream: serve only Streamable HTTP (/mcp), no SSE.
+    # --stateless: each POST is handled independently — required for the
+    #   tunnel relay's one-shot request/response model (no persistent SSE pipe).
+    cmd = [npx, "-y", "mcp-proxy", "--port", str(port),
+           "--server", "stream", "--stateless"]
     if sys.platform == "win32":
         cmd.append("--shell")
     cmd += ["--", "npx", "-y", "@modelcontextprotocol/server-filesystem", repo_path]
