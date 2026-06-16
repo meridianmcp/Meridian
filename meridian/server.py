@@ -1597,6 +1597,7 @@ async def me_endpoint(request: Request) -> dict[str, Any]:
     tenant = await _get_tenant_from_request(request)
     if tenant is None:
         return {}
+    from .hosted import _admin_emails
     from datetime import datetime, timezone
     plan = tenant.get("plan") or "standard"
     expires_raw = tenant.get("inactivity_expires_at")
@@ -1631,6 +1632,9 @@ async def me_endpoint(request: Request) -> dict[str, Any]:
         "is_internal": bool(tenant.get("is_internal")),
         "is_admin": tenant.get("email", "") in _admin_emails(),
         "tunnel_active": bool(tenant.get("tunnel_active")),
+        # Tunnel client (`meridian --tunnel`) reads this to build its
+        # wss://.../tunnel/{tenant_id} and permanent /fs/mcp/{tenant_id} URLs.
+        "tenant_id": tenant.get("id"),
     }
 
 

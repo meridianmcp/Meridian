@@ -193,6 +193,22 @@ def test_bearer_auth_tokens_list_and_revoke_with_valid_token(monkeypatch, tmp_pa
         assert missing.status_code == 404
 
 
+def test_me_returns_tenant_id_for_authenticated_user(monkeypatch, tmp_path):
+    """GET /me exposes tenant_id so `meridian --tunnel` can build its URLs."""
+    from meridian import db as db_module
+
+    async def _setup(db):
+        tenant = await db_module.upsert_tenant(db, "tunnel-me@example.com")
+        raw, _row = await db_module.create_api_token(db, tenant["id"], label="t")
+        return tenant["id"], raw
+
+    with _make_hosted_client(monkeypatch, tmp_path) as client:
+        tenant_id, raw_token = _run(_setup(client.app.state.db))
+        r = client.get("/me", headers={"Authorization": f"Bearer {raw_token}"})
+        assert r.status_code == 200
+        assert r.json()["tenant_id"] == tenant_id
+
+
 def test_delete_orphaned_oauth_keys_endpoint(monkeypatch, tmp_path):
     """DELETE /api/keys/orphaned purges only 'oauth' tokens older than 24h."""
     from meridian import db as db_module
