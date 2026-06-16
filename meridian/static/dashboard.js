@@ -950,6 +950,124 @@ async function saveProjectSettings(projectId, patch) {
 
 
 
+async function loadSettingsTab(projectId) {
+
+  const host = document.getElementById(`settings-body-${projectId}`);
+
+  if (!host) return;
+
+  host.innerHTML = `<div class="empty" style="color:var(--muted)">loading…</div>`;
+
+  try {
+
+    const [data, defaultData] = await Promise.all([
+
+      projectApi(projectId, `/projects/${projectId}/agent-instructions`),
+
+      projectApi(projectId, `/projects/${projectId}/agent-instructions/default`),
+
+    ]);
+
+    const current = data.agent_instructions || '';
+
+    const defaultText = defaultData.default_agent_instructions || '';
+
+    host.innerHTML = `
+
+      <div style="margin-bottom:12px">
+
+        <div style="font-size:11px;font-weight:700;letter-spacing:.5px;color:var(--accent);text-transform:uppercase;margin-bottom:4px">Executor Rules</div>
+
+        <div style="font-size:10px;color:var(--muted);margin-bottom:8px;line-height:1.5">
+          These rules are injected into every <code>start_session</code> response so AI coding
+          sessions pick them up automatically — no per-repo file required.
+        </div>
+
+        <textarea id="agent-instructions-${projectId}"
+          rows="24"
+          style="width:100%;box-sizing:border-box;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:8px;resize:vertical;outline:none;line-height:1.5"
+          placeholder="Enter executor rules…"
+        >${escapeHtml(current)}</textarea>
+
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-top:6px">
+
+          <span id="agent-instructions-chars-${projectId}" style="font-size:10px;color:var(--muted)">${current.length} chars</span>
+
+          <span style="display:flex;gap:6px">
+
+            <button class="secondary admin-only" id="agent-instructions-reset-${projectId}"
+              style="padding:2px 10px;font-size:10px"
+              title="Restore Meridian default rules">Reset to defaults</button>
+
+            <button class="primary admin-only" id="agent-instructions-save-${projectId}"
+              style="padding:2px 10px;font-size:10px">Save</button>
+
+          </span>
+
+        </div>
+
+      </div>
+
+    `;
+
+    const ta = document.getElementById(`agent-instructions-${projectId}`);
+
+    const charEl = document.getElementById(`agent-instructions-chars-${projectId}`);
+
+    ta.addEventListener('input', () => {
+
+      charEl.textContent = `${ta.value.length} chars`;
+
+    });
+
+    document.getElementById(`agent-instructions-save-${projectId}`).onclick = async () => {
+
+      try {
+
+        await api(`/projects/${projectId}/agent-instructions`, {
+
+          method: 'PATCH',
+
+          body: JSON.stringify({ agent_instructions: ta.value }),
+
+        });
+
+        toast('Executor rules saved');
+
+      } catch (e) { toast('Save failed: ' + e.message, true); }
+
+    };
+
+    document.getElementById(`agent-instructions-reset-${projectId}`).onclick = async () => {
+
+      if (!confirm('Reset to Meridian default executor rules? Your custom rules will be replaced.')) return;
+
+      try {
+
+        const r = await api(`/projects/${projectId}/agent-instructions`, {
+
+          method: 'PATCH',
+
+          body: JSON.stringify({ agent_instructions: null }),
+
+        });
+
+        ta.value = r.agent_instructions || defaultText;
+
+        charEl.textContent = `${ta.value.length} chars`;
+
+        toast('Reset to defaults');
+
+      } catch (e) { toast('Reset failed: ' + e.message, true); }
+
+    };
+
+  } catch (e) { host.innerHTML = `<div class="empty" style="color:var(--error)">Failed to load: ${escapeHtml(e.message)}</div>`; }
+
+}
+
+
+
 // function hideDemoAdminControls -- moved to dashboard-demo.js / dashboard-timeline.js
 
 
@@ -11332,4 +11450,4 @@ function toggleExpand(id) {
 
 // --- ITEM 4 esbuild: re-expose top-level symbols as globals so inline
 // handlers and cross-file references keep resolving after IIFE bundling.
-try { Object.assign(window, { hideHostedAdminControls, ensureSignOutLink, ensureWorkspaceSwitcher, getActiveWorkspaceRole, showConnectDbModal, showLocalServerControls, _summarizeApiErrorText, _projectLoadErrorInfo, wireProjectLoadRetry, renderProjectLoadError, recordProjectLoadError, clearProjectLoadError, renderProjectLoadAlert, retryProjectSurface, syncSidebarActiveProject, autosizeGoalField, githubIconSvg, getConstitutionLimit, loadProjectSettings, saveProjectSettings, _demoTourDone, _demoTourSavedStep, _demoTourSaveStep, _demoTourMarkDone, _demoTourClose, _tourActivateVtab, startDemoTour, resumeDemoTour, api, projectApi, loadServerConfig, _armAccountSwitchWatch, _refreshOnFocus, _checkAccountSwitch, _showAccountSwitchBanner, updateGitHubConnectionIndicator, _updateConnectionIndicator, checkGitStatus, _doRestart, loadConfig, loadProjects, openTab, closeTab, saveTabs, renderTabs, _makeTabEl, _openTabMenu, _setProjectIcon, _renameProject, _deleteProject, activateTab, buildTabBody, scheduleLiveRefresh, initLiveAutoRefresh, loadLiveTab, refreshLiveTab, wireSprintAddEnter, sprintAction, sprintArchive, filterBackburner, sprintPushPrompt, sprintFeedback, sprintFeedbackNote, sprintItemEdit, addSprintItemFromInput, cacheMostRecentSession, renderLiveSessions, endLiveSession, openTimelineForSession, renderLiveQueue, addLiveTask, cancelLiveTask, showCopyPreview, wireClaudeLaunchPanel, stampHandoffTs, populateSessionDropdown, loadTimeline, _renderTimelineLog, loadDocsTab, normalizeNotifyTarget, displayNotifyTarget, osExecutorHintBanner, showFailoverBannerIfNeeded, suggestNtfyTopic, loadHitlTab, loadTeamTab, updateLiveFeed, loadRecentSessions, loadMilestones, loadRecentRuns, loadQueue, renderSearchResults, wireQueueSectionToggles, refreshTab, refreshGoal, parseDecisionsBlob, renderConstitutionWarning, _hitlBadgeClick, initHitlPanel, setVtabCountBadge, refreshProjectCountBadges, refreshHitl, _hitlAnswer, _hitlDismiss, loadPinnedDecisions, supersedePinnedDecision, addPinnedDecision, consolidateDecisions, renderDecisionsTable, wireGoalPreviewToggle, saveGoal, saveNorthStar, saveSprint, _sessionPresenceDot, refreshSessions, refreshTasks, renderTasks, _loadMoreTasks, renderTaskRow, deleteTaskRow, renderHitlRow, wireHitlRow, appendToGoal, hitlReply, hitlExecute, connectWs, handleWsEvent, restoreTabs, _deleteSprintItem, _sprintAction, completeSprintItem, failSprintItem, toggleExpand, state }); } catch (e) {}
+try { Object.assign(window, { hideHostedAdminControls, ensureSignOutLink, ensureWorkspaceSwitcher, getActiveWorkspaceRole, showConnectDbModal, showLocalServerControls, _summarizeApiErrorText, _projectLoadErrorInfo, wireProjectLoadRetry, renderProjectLoadError, recordProjectLoadError, clearProjectLoadError, renderProjectLoadAlert, retryProjectSurface, syncSidebarActiveProject, autosizeGoalField, githubIconSvg, getConstitutionLimit, loadProjectSettings, saveProjectSettings, loadSettingsTab, _demoTourDone, _demoTourSavedStep, _demoTourSaveStep, _demoTourMarkDone, _demoTourClose, _tourActivateVtab, startDemoTour, resumeDemoTour, api, projectApi, loadServerConfig, _armAccountSwitchWatch, _refreshOnFocus, _checkAccountSwitch, _showAccountSwitchBanner, updateGitHubConnectionIndicator, _updateConnectionIndicator, checkGitStatus, _doRestart, loadConfig, loadProjects, openTab, closeTab, saveTabs, renderTabs, _makeTabEl, _openTabMenu, _setProjectIcon, _renameProject, _deleteProject, activateTab, buildTabBody, scheduleLiveRefresh, initLiveAutoRefresh, loadLiveTab, refreshLiveTab, wireSprintAddEnter, sprintAction, sprintArchive, filterBackburner, sprintPushPrompt, sprintFeedback, sprintFeedbackNote, sprintItemEdit, addSprintItemFromInput, cacheMostRecentSession, renderLiveSessions, endLiveSession, openTimelineForSession, renderLiveQueue, addLiveTask, cancelLiveTask, showCopyPreview, wireClaudeLaunchPanel, stampHandoffTs, populateSessionDropdown, loadTimeline, _renderTimelineLog, loadDocsTab, normalizeNotifyTarget, displayNotifyTarget, osExecutorHintBanner, showFailoverBannerIfNeeded, suggestNtfyTopic, loadHitlTab, loadTeamTab, updateLiveFeed, loadRecentSessions, loadMilestones, loadRecentRuns, loadQueue, renderSearchResults, wireQueueSectionToggles, refreshTab, refreshGoal, parseDecisionsBlob, renderConstitutionWarning, _hitlBadgeClick, initHitlPanel, setVtabCountBadge, refreshProjectCountBadges, refreshHitl, _hitlAnswer, _hitlDismiss, loadPinnedDecisions, supersedePinnedDecision, addPinnedDecision, consolidateDecisions, renderDecisionsTable, wireGoalPreviewToggle, saveGoal, saveNorthStar, saveSprint, _sessionPresenceDot, refreshSessions, refreshTasks, renderTasks, _loadMoreTasks, renderTaskRow, deleteTaskRow, renderHitlRow, wireHitlRow, appendToGoal, hitlReply, hitlExecute, connectWs, handleWsEvent, restoreTabs, _deleteSprintItem, _sprintAction, completeSprintItem, failSprintItem, toggleExpand, state }); } catch (e) {}

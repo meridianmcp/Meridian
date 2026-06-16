@@ -139,28 +139,14 @@ your project context on start and snapshots progress on end.
 - Web docs: https://docs.usemeridian.us
 
 ---
-## Executor rules (Meridian project only)
 
-- **Launching executor sessions with --rc**: Set `ENABLE_TOOL_SEARCH=false` before invoking `claude --rc` to ensure MCP tools load. Without it, deferred tools may not resolve in `--rc` mode.
-  ```powershell
-  $env:ENABLE_TOOL_SEARCH="false"
-  claude --rc --dangerously-skip-permissions
-  ```
-- **Secrets hygiene**: Never put credentials, connection strings, API keys, or secrets in chat or task descriptions. Mention env var names only.
-- **Before every push**: Run `pixi run test` locally first. CI is a safety net — not the first check. Never push broken code.
-- **Tests required**: Every sprint item that adds a feature or fixes a bug must include at least one test. No merging to main without tests for the changed code. CI enforces 70% overall coverage (pg_adapter, sdk, hosted, goal_md excluded) — do not reduce it.
-- **Never commit directly to main**: All work goes to `dev`. Merge `dev → main` only to trigger a deploy.
-- **Never fire `promote=yes` without HITL from adam**: Always call `request_hitl` and wait for adam's approval before triggering a prod deploy via `trigger_workflow(deploy.yml, promote=yes)`.
-- **`complete_sprint_item` is mandatory**: Call it for every sprint item you finish. The board never auto-reconciles from git — skipping this drifts the sprint board and breaks handoffs.
-- **End every session**: If tests pass, merge `dev → main` and push `main` to trigger deploy. Do not end the session with work stranded only on `dev`.
-- **Set sprint name**: Use `PATCH /projects/{id}/goal` with body `{"sprint": "name"}` directly (or the `set_sprint` MCP tool). Do NOT use `set_goal` for sprint-only updates.
-- **Handoff**: Use `get_context_block(project_id)` for the handoff context block. Do NOT read from `data/meridian-build_handoff.md` — that file is local-only and not reliable across sessions.
-- **Project discovery**: Use `list_projects()` when the project ID is unknown. Never call `create_project()` without explicit human instruction — use `list_projects()` to find existing projects first. Never create a project just to get a working ID.
-- **Staging pipeline**: `dev push → test → deploy preview → smoke test → merge main → prod`. Rollback fires automatically if prod /health returns non-200 after deploy.
-- **NEVER run hooks.ps1 or hooks.sh**: These are user-facing installers. Running them generates a new API token and invalidates the human's active Claude Code session. Never run `irm hooks.ps1 | iex` or `bash hooks.sh` during a sprint.
-- **Demo write protection**: Adding a new write endpoint requires NO demo exception — the middleware in `server.py` handles it globally. When adding a new write UI element, add it to the `hideDemoAdminControls()` selector list in `dashboard.js`.
-- **Set display name**: Settings → Account & Workspace → Workspace → "Your display name" → Adam
-- **Mid-run sprint item pickup**: After completing each sprint item, call `get_sprint_progress(project_id=..., session_id=...)` (pass session_id) before claiming the next one. The `board_change` field reports items a planner injected since this session started — pick them up at the item boundary. Never call `get_sprint_items` for this; it returns a huge payload with no board_change.
+## Executor rules
+
+Executor rules (the behavioral guidelines injected into every `start_session` response)
+are managed in the **Meridian dashboard → Settings → Executor Rules**.
+
+You can view, edit, or reset them to the Meridian defaults there.
+New projects get the Meridian defaults automatically — no file configuration required.
 
 ---
 ## Meridian-managed notes
@@ -171,7 +157,7 @@ your project context on start and snapshots progress on end.
 
 ---
 <!-- MERIDIAN STATE — auto-generated, do not edit below -->
-## Current Sprint State  _(auto-updated 2026-06-16 16:01 UTC)_
+## Current Sprint State  _(auto-updated 2026-06-16 16:23 UTC)_
 
 **Key Files:**
 - `meridian/server.py` — FastAPI app + MCP handlers
