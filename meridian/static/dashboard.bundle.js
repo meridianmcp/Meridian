@@ -1749,7 +1749,7 @@
       grid.insertAdjacentElement("afterend", link);
     });
   }
-  async function loadSettingsTab2(projectId) {
+  async function loadSettingsTab(projectId) {
     const body = document.getElementById(`settings-body-${projectId}`);
     if (!body) return;
     body.innerHTML = '<div style="color:var(--muted);font-size:11px">loading\u2026</div>';
@@ -4446,7 +4446,7 @@ project_id = "${displayPid}"`;
               method: "POST",
               body: JSON.stringify({ repo, branch })
             });
-            loadSettingsTab2(projectId);
+            loadSettingsTab(projectId);
           } catch (e) {
             if (statusEl) statusEl.textContent = e.message || "Save failed";
           } finally {
@@ -4462,7 +4462,7 @@ project_id = "${displayPid}"`;
           ghDisconnectBtn.disabled = true;
           try {
             await api(`/projects/${projectId}/github/disconnect`, { method: "DELETE" });
-            loadSettingsTab2(projectId);
+            loadSettingsTab(projectId);
           } catch (e) {
             if (statusEl) statusEl.textContent = "error disconnecting";
             ghDisconnectBtn.disabled = false;
@@ -4520,7 +4520,7 @@ project_id = "${displayPid}"`;
     }
   }
   try {
-    Object.assign(window, { suggestNtfyTopic: suggestNtfyTopic2, loadSettingsTab: loadSettingsTab2 });
+    Object.assign(window, { suggestNtfyTopic: suggestNtfyTopic2, loadSettingsTab });
   } catch (e) {
   }
 
@@ -5629,7 +5629,7 @@ ${n.tags || ""}`.toLowerCase();
     if (activeVtab === "notes") await loadNotesTab(projectId);
     if (activeVtab === "hitl") await loadHitlTab(projectId);
     if (activeVtab === "docs") await loadDocsTab(projectId);
-    if (activeVtab === "settings") await loadSettingsTab(projectId);
+    if (activeVtab === "settings") await loadSettingsTab2(projectId);
   }
   function syncSidebarActiveProject() {
     document.querySelectorAll(".project-item").forEach((item) => {
@@ -5669,6 +5669,88 @@ ${n.tags || ""}`.toLowerCase();
     });
     panel._projectSettings = settings || { project_id: projectId, max_pinned_decisions: DEFAULT_MAX_PINNED_DECISIONS };
     return panel._projectSettings;
+  }
+  async function loadSettingsTab2(projectId) {
+    const host = document.getElementById(`settings-body-${projectId}`);
+    if (!host) return;
+    host.innerHTML = `<div class="empty" style="color:var(--muted)">loading\u2026</div>`;
+    try {
+      const [data, defaultData] = await Promise.all([
+        projectApi2(projectId, `/projects/${projectId}/agent-instructions`),
+        projectApi2(projectId, `/projects/${projectId}/agent-instructions/default`)
+      ]);
+      const current = data.agent_instructions || "";
+      const defaultText = defaultData.default_agent_instructions || "";
+      host.innerHTML = `
+
+      <div style="margin-bottom:12px">
+
+        <div style="font-size:11px;font-weight:700;letter-spacing:.5px;color:var(--accent);text-transform:uppercase;margin-bottom:4px">Executor Rules</div>
+
+        <div style="font-size:10px;color:var(--muted);margin-bottom:8px;line-height:1.5">
+          These rules are injected into every <code>start_session</code> response so AI coding
+          sessions pick them up automatically \u2014 no per-repo file required.
+        </div>
+
+        <textarea id="agent-instructions-${projectId}"
+          rows="24"
+          style="width:100%;box-sizing:border-box;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:8px;resize:vertical;outline:none;line-height:1.5"
+          placeholder="Enter executor rules\u2026"
+        >${escapeHtml(current)}</textarea>
+
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-top:6px">
+
+          <span id="agent-instructions-chars-${projectId}" style="font-size:10px;color:var(--muted)">${current.length} chars</span>
+
+          <span style="display:flex;gap:6px">
+
+            <button class="secondary admin-only" id="agent-instructions-reset-${projectId}"
+              style="padding:2px 10px;font-size:10px"
+              title="Restore Meridian default rules">Reset to defaults</button>
+
+            <button class="primary admin-only" id="agent-instructions-save-${projectId}"
+              style="padding:2px 10px;font-size:10px">Save</button>
+
+          </span>
+
+        </div>
+
+      </div>
+
+    `;
+      const ta = document.getElementById(`agent-instructions-${projectId}`);
+      const charEl = document.getElementById(`agent-instructions-chars-${projectId}`);
+      ta.addEventListener("input", () => {
+        charEl.textContent = `${ta.value.length} chars`;
+      });
+      document.getElementById(`agent-instructions-save-${projectId}`).onclick = async () => {
+        try {
+          await api2(`/projects/${projectId}/agent-instructions`, {
+            method: "PATCH",
+            body: JSON.stringify({ agent_instructions: ta.value })
+          });
+          toast("Executor rules saved");
+        } catch (e) {
+          toast("Save failed: " + e.message, true);
+        }
+      };
+      document.getElementById(`agent-instructions-reset-${projectId}`).onclick = async () => {
+        if (!confirm("Reset to Meridian default executor rules? Your custom rules will be replaced.")) return;
+        try {
+          const r = await api2(`/projects/${projectId}/agent-instructions`, {
+            method: "PATCH",
+            body: JSON.stringify({ agent_instructions: null })
+          });
+          ta.value = r.agent_instructions || defaultText;
+          charEl.textContent = `${ta.value.length} chars`;
+          toast("Reset to defaults");
+        } catch (e) {
+          toast("Reset failed: " + e.message, true);
+        }
+      };
+    } catch (e) {
+      host.innerHTML = `<div class="empty" style="color:var(--error)">Failed to load: ${escapeHtml(e.message)}</div>`;
+    }
   }
   var _DEMO_TOUR_STEPS = [
     {
@@ -7618,7 +7700,7 @@ Current: ${current || "(none)"}`,
           if (vtab === "notes") loadNotesTab(project.id);
           if (vtab === "hitl") loadHitlTab(project.id);
           if (vtab === "docs") loadDocsTab(project.id);
-          if (vtab === "settings") loadSettingsTab(project.id);
+          if (vtab === "settings") loadSettingsTab2(project.id);
         };
       });
       try {
@@ -11587,7 +11669,7 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
     }
   }
   try {
-    Object.assign(window, { hideHostedAdminControls, ensureSignOutLink: ensureSignOutLink2, ensureWorkspaceSwitcher: ensureWorkspaceSwitcher2, getActiveWorkspaceRole: getActiveWorkspaceRole2, showConnectDbModal, showLocalServerControls, _summarizeApiErrorText, _projectLoadErrorInfo, wireProjectLoadRetry: wireProjectLoadRetry2, renderProjectLoadError: renderProjectLoadError2, recordProjectLoadError, clearProjectLoadError, renderProjectLoadAlert, retryProjectSurface, syncSidebarActiveProject, autosizeGoalField, githubIconSvg: githubIconSvg2, getConstitutionLimit, loadProjectSettings: loadProjectSettings2, saveProjectSettings: saveProjectSettings2, _demoTourDone: _demoTourDone2, _demoTourSavedStep: _demoTourSavedStep2, _demoTourSaveStep, _demoTourMarkDone, _demoTourClose, _tourActivateVtab, startDemoTour: startDemoTour2, resumeDemoTour, api: api2, projectApi: projectApi2, loadServerConfig, _armAccountSwitchWatch, _refreshOnFocus, _checkAccountSwitch, _showAccountSwitchBanner, updateGitHubConnectionIndicator, _updateConnectionIndicator, checkGitStatus, _doRestart, loadConfig, loadProjects, openTab, closeTab, saveTabs, renderTabs, _makeTabEl, _openTabMenu, _setProjectIcon, _renameProject, _deleteProject, activateTab, buildTabBody, scheduleLiveRefresh, initLiveAutoRefresh, loadLiveTab, refreshLiveTab, wireSprintAddEnter: wireSprintAddEnter2, sprintAction, sprintArchive, filterBackburner, sprintPushPrompt, sprintFeedback, sprintFeedbackNote, sprintItemEdit, addSprintItemFromInput: addSprintItemFromInput2, cacheMostRecentSession, renderLiveSessions, endLiveSession, openTimelineForSession, renderLiveQueue, addLiveTask, cancelLiveTask, showCopyPreview, wireClaudeLaunchPanel, stampHandoffTs, populateSessionDropdown, loadTimeline: loadTimeline2, _renderTimelineLog: _renderTimelineLog2, loadDocsTab, normalizeNotifyTarget, displayNotifyTarget: displayNotifyTarget2, osExecutorHintBanner: osExecutorHintBanner2, showFailoverBannerIfNeeded, suggestNtfyTopic, loadHitlTab, loadTeamTab, updateLiveFeed, loadRecentSessions, loadMilestones, loadRecentRuns, loadQueue, renderSearchResults: renderSearchResults2, wireQueueSectionToggles, refreshTab, refreshGoal, parseDecisionsBlob, renderConstitutionWarning: renderConstitutionWarning2, _hitlBadgeClick, initHitlPanel, setVtabCountBadge: setVtabCountBadge2, refreshProjectCountBadges, refreshHitl, _hitlAnswer, _hitlDismiss, loadPinnedDecisions, supersedePinnedDecision, addPinnedDecision, consolidateDecisions, renderDecisionsTable, wireGoalPreviewToggle, saveGoal, saveNorthStar, saveSprint, _sessionPresenceDot, refreshSessions, refreshTasks, renderTasks, _loadMoreTasks, renderTaskRow, deleteTaskRow, renderHitlRow, wireHitlRow, appendToGoal, hitlReply, hitlExecute, connectWs, handleWsEvent, restoreTabs, _deleteSprintItem, _sprintAction, completeSprintItem, failSprintItem, toggleExpand, state });
+    Object.assign(window, { hideHostedAdminControls, ensureSignOutLink: ensureSignOutLink2, ensureWorkspaceSwitcher: ensureWorkspaceSwitcher2, getActiveWorkspaceRole: getActiveWorkspaceRole2, showConnectDbModal, showLocalServerControls, _summarizeApiErrorText, _projectLoadErrorInfo, wireProjectLoadRetry: wireProjectLoadRetry2, renderProjectLoadError: renderProjectLoadError2, recordProjectLoadError, clearProjectLoadError, renderProjectLoadAlert, retryProjectSurface, syncSidebarActiveProject, autosizeGoalField, githubIconSvg: githubIconSvg2, getConstitutionLimit, loadProjectSettings: loadProjectSettings2, saveProjectSettings: saveProjectSettings2, loadSettingsTab: loadSettingsTab2, _demoTourDone: _demoTourDone2, _demoTourSavedStep: _demoTourSavedStep2, _demoTourSaveStep, _demoTourMarkDone, _demoTourClose, _tourActivateVtab, startDemoTour: startDemoTour2, resumeDemoTour, api: api2, projectApi: projectApi2, loadServerConfig, _armAccountSwitchWatch, _refreshOnFocus, _checkAccountSwitch, _showAccountSwitchBanner, updateGitHubConnectionIndicator, _updateConnectionIndicator, checkGitStatus, _doRestart, loadConfig, loadProjects, openTab, closeTab, saveTabs, renderTabs, _makeTabEl, _openTabMenu, _setProjectIcon, _renameProject, _deleteProject, activateTab, buildTabBody, scheduleLiveRefresh, initLiveAutoRefresh, loadLiveTab, refreshLiveTab, wireSprintAddEnter: wireSprintAddEnter2, sprintAction, sprintArchive, filterBackburner, sprintPushPrompt, sprintFeedback, sprintFeedbackNote, sprintItemEdit, addSprintItemFromInput: addSprintItemFromInput2, cacheMostRecentSession, renderLiveSessions, endLiveSession, openTimelineForSession, renderLiveQueue, addLiveTask, cancelLiveTask, showCopyPreview, wireClaudeLaunchPanel, stampHandoffTs, populateSessionDropdown, loadTimeline: loadTimeline2, _renderTimelineLog: _renderTimelineLog2, loadDocsTab, normalizeNotifyTarget, displayNotifyTarget: displayNotifyTarget2, osExecutorHintBanner: osExecutorHintBanner2, showFailoverBannerIfNeeded, suggestNtfyTopic, loadHitlTab, loadTeamTab, updateLiveFeed, loadRecentSessions, loadMilestones, loadRecentRuns, loadQueue, renderSearchResults: renderSearchResults2, wireQueueSectionToggles, refreshTab, refreshGoal, parseDecisionsBlob, renderConstitutionWarning: renderConstitutionWarning2, _hitlBadgeClick, initHitlPanel, setVtabCountBadge: setVtabCountBadge2, refreshProjectCountBadges, refreshHitl, _hitlAnswer, _hitlDismiss, loadPinnedDecisions, supersedePinnedDecision, addPinnedDecision, consolidateDecisions, renderDecisionsTable, wireGoalPreviewToggle, saveGoal, saveNorthStar, saveSprint, _sessionPresenceDot, refreshSessions, refreshTasks, renderTasks, _loadMoreTasks, renderTaskRow, deleteTaskRow, renderHitlRow, wireHitlRow, appendToGoal, hitlReply, hitlExecute, connectWs, handleWsEvent, restoreTabs, _deleteSprintItem, _sprintAction, completeSprintItem, failSprintItem, toggleExpand, state });
   } catch (e) {
   }
 })();

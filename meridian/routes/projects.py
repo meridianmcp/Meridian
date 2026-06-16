@@ -129,9 +129,10 @@ async def create_project(
     from .. import limits as _limits  # noqa: PLC0415
     all_projects = await db_module.list_projects(await _db(request))
     _limits.check_projects_per_tenant(len(all_projects))
-    project = await db_module.create_project(
-        await _db(request), body.name, human_id=body.human_id
-    )
+    db = await _db(request)
+    project = await db_module.create_project(db, body.name, human_id=body.human_id)
+    from ..agent_defaults import DEFAULT_AGENT_INSTRUCTIONS  # noqa: PLC0415
+    await db_module.set_agent_instructions(db, project["id"], DEFAULT_AGENT_INSTRUCTIONS)
     # c3e91df4 — start the free-tier trial clock on first own project creation,
     # not at signup. Invited members who never create their own project stay
     # at trial_started_at=NULL and never consume a trial slot.
@@ -383,6 +384,37 @@ async def set_project_icon(
         {"type": "project_icon_changed", "project_id": project_id, "icon": icon}
     )
     return await db_module.get_project(db, project_id)
+
+
+@router.get("/projects/{project_id}/agent-instructions")
+async def get_agent_instructions(project_id: str, request: Request) -> dict[str, Any]:
+    """Return the current agent_instructions for a project."""
+    instructions = await db_module.get_agent_instructions(await _db(request), project_id)
+    return {"project_id": project_id, "agent_instructions": instructions}
+
+
+@router.patch("/projects/{project_id}/agent-instructions")
+async def patch_agent_instructions(
+    project_id: str, body: dict[str, Any], request: Request
+) -> dict[str, Any]:
+    """Set or clear agent_instructions. Pass null to reset to server defaults."""
+    from ..agent_defaults import DEFAULT_AGENT_INSTRUCTIONS  # noqa: PLC0415
+    instructions = body.get("agent_instructions")
+    if instructions is None:
+        instructions = DEFAULT_AGENT_INSTRUCTIONS
+    elif instructions == "":
+        instructions = None
+    result = await db_module.set_agent_instructions(
+        await _db(request), project_id, instructions
+    )
+    return result
+
+
+@router.get("/projects/{project_id}/agent-instructions/default")
+async def get_default_agent_instructions(project_id: str, request: Request) -> dict[str, Any]:
+    """Return the server DEFAULT_AGENT_INSTRUCTIONS (for the Reset button)."""
+    from ..agent_defaults import DEFAULT_AGENT_INSTRUCTIONS  # noqa: PLC0415
+    return {"default_agent_instructions": DEFAULT_AGENT_INSTRUCTIONS}
 
 
 @router.post("/projects/{project_id}/rename")

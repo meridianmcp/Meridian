@@ -714,6 +714,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_parallel_safety(db)
     await _migrate_changelog_entries(db)
     await _migrate_agent_instructions(db)
+    await _backfill_agent_instructions(db)
     await _migrate_note_kind(db)
     await _migrate_tunnel_active(db)
     return db

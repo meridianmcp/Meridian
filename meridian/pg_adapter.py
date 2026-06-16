@@ -1533,6 +1533,15 @@ async def _migrate_pg_agent_instructions(conn: PostgresConnection) -> None:
     )
 
 
+async def _migrate_pg_backfill_agent_instructions(conn: PostgresConnection) -> None:
+    """Set DEFAULT_AGENT_INSTRUCTIONS on projects with no custom rules (idempotent)."""
+    from .agent_defaults import DEFAULT_AGENT_INSTRUCTIONS  # avoid circular import
+    await conn.execute(
+        "UPDATE projects SET agent_instructions = %s WHERE agent_instructions IS NULL",
+        (DEFAULT_AGENT_INSTRUCTIONS,),
+    )
+
+
 async def _migrate_pg_note_kind(conn: PostgresConnection) -> None:
     """9d44998b — project_notes.note_kind (wiki | insight | reference).
 
@@ -1652,6 +1661,7 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_parallel_safety,
     _migrate_pg_changelog_entries,
     _migrate_pg_agent_instructions,
+    _migrate_pg_backfill_agent_instructions,
     _migrate_pg_note_kind,
     _migrate_pg_file_symbol_claims,
 )
