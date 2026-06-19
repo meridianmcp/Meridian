@@ -102,8 +102,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--repo",
         default=None,
-        help="Repo path to expose over --tunnel (defaults to the current "
-        "working directory).",
+        help="Repo path to expose over --tunnel (defaults to your home directory (~)).",
     )
     parser.add_argument(
         "--tunnel-port",
