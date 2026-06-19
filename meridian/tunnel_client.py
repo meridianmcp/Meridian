@@ -264,7 +264,7 @@ async def run_tunnel(
         return 2
 
     base_url = _resolve_base_url(base_url)
-    repo_path = str(Path(repo_path or os.getcwd()).resolve())
+    repo_path = str(Path(repo_path or Path.home()).resolve())
 
     # 1. Resolve tenant_id + plan from /me.
     try:
