@@ -606,6 +606,43 @@ _TUNNEL_LABELS = ("fs", "code", "extract")
 # Per-process routing cache: tenant_id → {tool_name: tunnel_label}
 _tunnel_tool_routes: dict[str, dict[str, str]] = {}
 
+# Phase 3 — server-side tool-description rewriting. When the bridge aggregates a
+# tenant's tunneled tools, the raw filesystem read tools (read_file /
+# read_multiple_files) get a code-intel-first directive prepended to their
+# description so every client is steered toward graph queries for source code
+# without any per-project agent_instructions change. Self-describing and
+# conditional ("if those tools are available"), so it is safe to apply always.
+_CODE_INTEL_FIRST_GUIDANCE = (
+    "IMPORTANT: For source code files (.py .js .ts .go .rs .java .cpp .c .rb etc), "
+    "you MUST call search_graph or get_function_tool FIRST if those tools are "
+    "available. Use read_file only for non-code files (documents, spreadsheets, "
+    "config files, data) or as a last resort when code intel tools are absent."
+)
+
+# Tools whose descriptions get the code-intel-first prefix at the bridge.
+_READ_TOOLS_TO_REWRITE = frozenset({"read_file", "read_multiple_files"})
+
+
+def _rewrite_tool_description(tool: dict) -> dict:
+    """Prepend the code-intel-first directive to raw file-read tool descriptions.
+
+    Returns a shallow copy with the rewritten ``description`` for the targeted
+    tools; all other tools are returned unchanged. Idempotent — the guidance is
+    not added twice if it is already present.
+    """
+    name = tool.get("name")
+    if name not in _READ_TOOLS_TO_REWRITE:
+        return tool
+    desc = tool.get("description") or ""
+    if _CODE_INTEL_FIRST_GUIDANCE in desc:
+        return tool
+    rewritten = dict(tool)
+    rewritten["description"] = (
+        f"{_CODE_INTEL_FIRST_GUIDANCE}\n\n{desc}".rstrip()
+        if desc else _CODE_INTEL_FIRST_GUIDANCE
+    )
+    return rewritten
+
 
 def _label_maps(label: str) -> "tuple[dict[str, WebSocket], dict[str, asyncio.Future[dict]]]":
     """Return the (sockets, pending) registries for a tunnel label."""
@@ -714,7 +751,7 @@ async def list_tunnel_tools(
             if not name or name in reserved_names or name in routes:
                 continue
             routes[name] = label
-            aggregated.append(tool)
+            aggregated.append(_rewrite_tool_description(tool))
     if routes:
         _tunnel_tool_routes[tenant_id] = routes
     elif not has_active_tunnel(tenant_id):

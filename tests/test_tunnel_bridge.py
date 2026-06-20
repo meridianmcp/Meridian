@@ -431,6 +431,50 @@ def test_fs_mcp_proxy_subpath_builds_local_path(monkeypatch):
     assert captured["path"] == "/sse"
 
 
+# ---------------------------------------------------------------------------
+# Phase 3 — code-intel-first description rewriting at the bridge
+# ---------------------------------------------------------------------------
+
+def test_rewrite_tool_description_prepends_for_read_file():
+    out = tn._rewrite_tool_description({"name": "read_file", "description": "Read a file."})
+    assert out["description"].startswith("IMPORTANT:")
+    assert "Read a file." in out["description"]
+
+
+def test_rewrite_tool_description_handles_read_multiple_and_empty_desc():
+    out = tn._rewrite_tool_description({"name": "read_multiple_files"})
+    assert out["description"] == tn._CODE_INTEL_FIRST_GUIDANCE
+
+
+def test_rewrite_tool_description_leaves_other_tools_untouched():
+    tool = {"name": "search_graph", "description": "Query the graph."}
+    assert tn._rewrite_tool_description(tool) is tool
+
+
+def test_rewrite_tool_description_is_idempotent():
+    once = tn._rewrite_tool_description({"name": "read_file", "description": "x"})
+    twice = tn._rewrite_tool_description(once)
+    assert once["description"] == twice["description"]
+    assert twice["description"].count("IMPORTANT:") == 1
+
+
+def test_list_tunnel_tools_rewrites_read_file_description(monkeypatch):
+    tn._tunnel_sockets["t1"] = object()
+
+    def responder(label, method, params):
+        return {"result": {"tools": [
+            {"name": "read_file", "description": "Read a file."},
+            {"name": "list_directory", "description": "List a dir."},
+        ]}}
+
+    _stub_proxy(monkeypatch, responder)
+    tools = asyncio.run(tn.list_tunnel_tools("t1"))
+    by_name = {t["name"]: t for t in tools}
+    assert by_name["read_file"]["description"].startswith("IMPORTANT:")
+    # Non-read tools are untouched.
+    assert by_name["list_directory"]["description"] == "List a dir."
+
+
 def test_code_mcp_proxy_routes_to_code_socket(monkeypatch):
     monkeypatch.setattr(tn, "_hosted_mode", lambda: True)
     resp = asyncio.run(tn.code_mcp_proxy("t1", _FakeReq("/code/mcp/t1")))
