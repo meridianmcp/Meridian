@@ -790,3 +790,62 @@ def test_force_utf8_io_tolerates_streams_without_reconfigure(monkeypatch):
     monkeypatch.setattr(tc.sys, "stderr", object())
     tc._force_utf8_io()  # should not raise
     assert tc.os.environ["PYTHONIOENCODING"] == "utf-8"
+
+
+# ---------------------------------------------------------------------------
+# Token cache — _config_path / _read_cached_token / _write_cached_token
+# ---------------------------------------------------------------------------
+
+def test_config_path_under_home(monkeypatch, tmp_path):
+    monkeypatch.setattr(tc.Path, "home", staticmethod(lambda: tmp_path))
+    assert tc._config_path() == tmp_path / ".meridian" / "config.json"
+
+
+def test_read_cached_token_missing_file_returns_none(monkeypatch, tmp_path):
+    monkeypatch.setattr(tc, "_config_path", lambda: tmp_path / "config.json")
+    assert tc._read_cached_token("https://usemeridian.us") is None
+
+
+def test_write_then_read_cached_token_roundtrips(monkeypatch, tmp_path):
+    cfg = tmp_path / ".meridian" / "config.json"
+    monkeypatch.setattr(tc, "_config_path", lambda: cfg)
+    tc._write_cached_token("https://usemeridian.us", "sk_meridian_abc")
+    # File written under a freshly-created parent dir.
+    assert cfg.exists()
+    assert tc._read_cached_token("https://usemeridian.us") == "sk_meridian_abc"
+
+
+def test_read_cached_token_rejects_other_base_url(monkeypatch, tmp_path):
+    cfg = tmp_path / "config.json"
+    monkeypatch.setattr(tc, "_config_path", lambda: cfg)
+    tc._write_cached_token("https://usemeridian.us", "sk_meridian_abc")
+    # A token cached for one base_url must never be served for another.
+    assert tc._read_cached_token("https://other.example") is None
+
+
+def test_read_cached_token_rejects_expired(monkeypatch, tmp_path):
+    cfg = tmp_path / "config.json"
+    monkeypatch.setattr(tc, "_config_path", lambda: cfg)
+    tc._write_cached_token("https://usemeridian.us", "sk_meridian_abc")
+    # Rewind the cached expiry into the past.
+    data = json.loads(cfg.read_text(encoding="utf-8"))
+    data["tunnel_token"]["expires_at"] = 0
+    cfg.write_text(json.dumps(data), encoding="utf-8")
+    assert tc._read_cached_token("https://usemeridian.us") is None
+
+
+def test_read_cached_token_tolerates_malformed_json(monkeypatch, tmp_path):
+    cfg = tmp_path / "config.json"
+    monkeypatch.setattr(tc, "_config_path", lambda: cfg)
+    cfg.write_text("{not valid json", encoding="utf-8")
+    assert tc._read_cached_token("https://usemeridian.us") is None
+
+
+def test_write_cached_token_preserves_other_keys(monkeypatch, tmp_path):
+    cfg = tmp_path / "config.json"
+    monkeypatch.setattr(tc, "_config_path", lambda: cfg)
+    cfg.write_text(json.dumps({"unrelated": "keep-me"}), encoding="utf-8")
+    tc._write_cached_token("https://usemeridian.us", "sk_meridian_xyz")
+    data = json.loads(cfg.read_text(encoding="utf-8"))
+    assert data["unrelated"] == "keep-me"
+    assert data["tunnel_token"]["token"] == "sk_meridian_xyz"

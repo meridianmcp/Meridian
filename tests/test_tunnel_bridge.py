@@ -9,7 +9,9 @@ bridge helpers directly (with `_do_proxy` stubbed) and the handler integration
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
+import types
 
 import pytest
 from fastapi.responses import Response
@@ -240,3 +242,205 @@ def test_handler_tools_call_native_tool_not_routed_to_tunnel(monkeypatch):
     }
     asyncio.run(mh._handle_mcp_request(body, db=None, data_dir="/tmp", tenant=tenant))
     assert routed["hit"] is False
+
+
+# ---------------------------------------------------------------------------
+# _do_proxy — HTTP relay over the tunnel socket
+# ---------------------------------------------------------------------------
+
+class _FakeWS:
+    """Resolves the pending future inline when the server sends a request."""
+
+    def __init__(self, pending, response):
+        self._pending = pending
+        self._response = response
+
+    async def send_json(self, payload):
+        fut = self._pending.get(payload["id"])
+        if fut is not None and not fut.done():
+            fut.set_result({**self._response, "id": payload["id"]})
+
+
+def test_do_proxy_503_when_socket_not_connected():
+    resp = asyncio.run(tn._do_proxy(
+        "t1", "POST", "/mcp", "", {}, b"x",
+        tn._tunnel_sockets, tn._pending_reqs, "fs",
+    ))
+    assert resp.status_code == 503
+    assert b"fs tunnel not connected" in resp.body
+
+
+def test_do_proxy_success_roundtrip_strips_hop_headers():
+    body = base64.b64encode(b'{"ok":true}').decode()
+    response = {
+        "status": 200,
+        # transfer-encoding/content-length are hop-by-hop and must be dropped.
+        "headers": {"content-type": "application/json",
+                    "transfer-encoding": "chunked", "content-length": "11"},
+        "body": body,
+    }
+    tn._tunnel_sockets["t1"] = _FakeWS(tn._pending_reqs, response)
+    resp = asyncio.run(tn._do_proxy(
+        "t1", "POST", "/mcp", "", {}, b'{"q":1}',
+        tn._tunnel_sockets, tn._pending_reqs, "fs",
+    ))
+    assert resp.status_code == 200
+    assert resp.body == b'{"ok":true}'
+    hdr_keys = {k.lower() for k in resp.headers.keys()}
+    assert "transfer-encoding" not in hdr_keys
+    assert "content-type" in hdr_keys
+    # Pending map is cleaned up after the request resolves.
+    assert tn._pending_reqs == {}
+
+
+# ---------------------------------------------------------------------------
+# Proxy route guards — hosted mode + status endpoint + header forwarding
+# ---------------------------------------------------------------------------
+
+def test_code_proxy_503_when_not_hosted(monkeypatch):
+    monkeypatch.setattr(tn, "_hosted_mode", lambda: False)
+    resp = asyncio.run(tn._code_proxy("t1", "/mcp", None))
+    assert resp.status_code == 503
+    assert b"hosted mode" in resp.body
+
+
+def test_extract_proxy_503_when_not_hosted(monkeypatch):
+    monkeypatch.setattr(tn, "_hosted_mode", lambda: False)
+    resp = asyncio.run(tn._extract_proxy("t1", "/mcp", None))
+    assert resp.status_code == 503
+    assert b"hosted mode" in resp.body
+
+
+def test_tunnel_status_reports_active_sockets():
+    tn._tunnel_sockets["t1"] = object()
+    tn._tunnel_code_sockets["t1"] = object()
+    status = asyncio.run(tn.tunnel_status("t1"))
+    assert status == {
+        "tenant_id": "t1",
+        "active": True,
+        "code_active": True,
+        "extract_active": False,
+    }
+
+
+def test_fwd_headers_strips_sensitive_and_host():
+    req = types.SimpleNamespace(headers={
+        "host": "usemeridian.us",
+        "authorization": "Bearer x",
+        "cookie": "s=1",
+        "x-forwarded-for": "1.2.3.4",
+        "accept": "application/json",
+    })
+    assert tn._fwd_headers(req) == {"accept": "application/json"}
+
+
+# ---------------------------------------------------------------------------
+# _do_proxy — timeout (504) and send-failure (502) paths
+# ---------------------------------------------------------------------------
+
+class _SilentWS:
+    """Accepts the request but never resolves the future (forces a timeout)."""
+
+    async def send_json(self, payload):
+        return None
+
+
+class _BrokenWS:
+    """Raises on send, exercising the 502 transport-error path."""
+
+    async def send_json(self, payload):
+        raise RuntimeError("socket gone")
+
+
+def test_do_proxy_504_on_timeout(monkeypatch):
+    monkeypatch.setattr(tn, "_PROXY_TIMEOUT", 0.05)
+    tn._tunnel_sockets["t1"] = _SilentWS()
+    resp = asyncio.run(tn._do_proxy(
+        "t1", "POST", "/mcp", "", {}, b"x",
+        tn._tunnel_sockets, tn._pending_reqs, "fs",
+    ))
+    assert resp.status_code == 504
+    assert b"timeout" in resp.body
+    assert tn._pending_reqs == {}  # cleaned up after timeout
+
+
+def test_do_proxy_502_on_send_failure():
+    tn._tunnel_sockets["t1"] = _BrokenWS()
+    resp = asyncio.run(tn._do_proxy(
+        "t1", "POST", "/mcp", "", {}, b"x",
+        tn._tunnel_sockets, tn._pending_reqs, "fs",
+    ))
+    assert resp.status_code == 502
+    assert tn._pending_reqs == {}
+
+
+# ---------------------------------------------------------------------------
+# HTTP proxy route wrappers — /fs/mcp /code/mcp /extract/mcp
+# ---------------------------------------------------------------------------
+
+class _FakeReq:
+    """Minimal stand-in for a Starlette Request for the proxy route wrappers."""
+
+    def __init__(self, path, query="", method="POST", headers=None, body=b""):
+        self.method = method
+        self.headers = headers or {}
+        self.url = types.SimpleNamespace(path=path, query=query)
+        self._body = body
+
+    async def body(self):
+        return self._body
+
+
+def test_fs_mcp_proxy_503_when_not_hosted(monkeypatch):
+    monkeypatch.setattr(tn, "_hosted_mode", lambda: False)
+    resp = asyncio.run(tn.fs_mcp_proxy("t1", _FakeReq("/fs/mcp/t1")))
+    assert resp.status_code == 503
+    assert b"hosted mode" in resp.body
+
+
+def test_fs_mcp_proxy_strips_prefix_and_503_without_tunnel(monkeypatch):
+    monkeypatch.setattr(tn, "_hosted_mode", lambda: True)
+    captured = {}
+
+    async def fake_proxy(tenant_id, method, path, query, headers, body_bytes):
+        captured["path"] = path
+        captured["query"] = query
+        return Response(content=b'{"error":"fs tunnel not connected"}',
+                        status_code=503, media_type="application/json")
+
+    monkeypatch.setattr(tn, "_proxy_request", fake_proxy)
+    req = _FakeReq("/fs/mcp/t1/mcp", query="x=1", headers={"host": "h", "accept": "j"})
+    resp = asyncio.run(tn.fs_mcp_proxy("t1", req))
+    assert resp.status_code == 503
+    # The /fs/mcp/{tenant_id} prefix is stripped so the local proxy sees /mcp.
+    assert captured["path"] == "/mcp"
+    assert captured["query"] == "x=1"
+
+
+def test_fs_mcp_proxy_subpath_builds_local_path(monkeypatch):
+    monkeypatch.setattr(tn, "_hosted_mode", lambda: True)
+    captured = {}
+
+    async def fake_proxy(tenant_id, method, path, query, headers, body_bytes):
+        captured["path"] = path
+        return Response(content=b"{}", status_code=200, media_type="application/json")
+
+    monkeypatch.setattr(tn, "_proxy_request", fake_proxy)
+    resp = asyncio.run(tn.fs_mcp_proxy_subpath("t1", "sse", _FakeReq("/fs/mcp/t1/sse")))
+    assert resp.status_code == 200
+    assert captured["path"] == "/sse"
+
+
+def test_code_mcp_proxy_routes_to_code_socket(monkeypatch):
+    monkeypatch.setattr(tn, "_hosted_mode", lambda: True)
+    resp = asyncio.run(tn.code_mcp_proxy("t1", _FakeReq("/code/mcp/t1")))
+    # No code socket connected → 503 from _do_proxy.
+    assert resp.status_code == 503
+    assert b"code tunnel not connected" in resp.body
+
+
+def test_extract_mcp_proxy_routes_to_extract_socket(monkeypatch):
+    monkeypatch.setattr(tn, "_hosted_mode", lambda: True)
+    resp = asyncio.run(tn.extract_mcp_proxy("t1", _FakeReq("/extract/mcp/t1")))
+    assert resp.status_code == 503
+    assert b"extract tunnel not connected" in resp.body

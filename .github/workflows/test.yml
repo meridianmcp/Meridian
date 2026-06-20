@@ -19,7 +19,7 @@ jobs:
           pixi-version: latest
           cache: false
       - run: pixi install
-      - run: pixi run python -m pytest tests/test_core.py tests/test_new_v25.py tests/test_hosted.py tests/test_github.py tests/test_milestones.py tests/test_md_anchors.py tests/test_security.py tests/test_ui.py tests/test_executor_runs.py tests/test_error_alerting.py tests/test_v2_hosted.py -n auto -q --tb=short --cov=meridian --cov-config=.coveragerc --cov-report=term-missing --cov-fail-under=70
+      - run: pixi run python -m pytest tests/test_core.py tests/test_new_v25.py tests/test_hosted.py tests/test_github.py tests/test_milestones.py tests/test_md_anchors.py tests/test_security.py tests/test_ui.py tests/test_executor_runs.py tests/test_error_alerting.py tests/test_v2_hosted.py tests/test_tunnel_client.py tests/test_tunnel_bridge.py tests/test_mcp_cors_proxy.py -n auto -q --tb=short --cov=meridian --cov-config=.coveragerc --cov-report=term-missing --cov-fail-under=70
 
   test-ux:
     runs-on: ubuntu-latest
