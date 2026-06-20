@@ -5675,12 +5675,14 @@ ${n.tags || ""}`.toLowerCase();
     if (!host) return;
     host.innerHTML = `<div class="empty" style="color:var(--muted)">loading\u2026</div>`;
     try {
-      const [data, defaultData] = await Promise.all([
+      const [data, defaultData, settingsData] = await Promise.all([
         projectApi2(projectId, `/projects/${projectId}/agent-instructions`),
-        projectApi2(projectId, `/projects/${projectId}/agent-instructions/default`)
+        projectApi2(projectId, `/projects/${projectId}/agent-instructions/default`),
+        projectApi2(projectId, `/projects/${projectId}/settings`)
       ]);
       const current = data.agent_instructions || "";
       const defaultText = defaultData.default_agent_instructions || "";
+      const codeIntelEnabled = settingsData ? !!settingsData.code_intel_enabled : false;
       host.innerHTML = `
 
       <div style="margin-bottom:12px">
@@ -5746,6 +5748,56 @@ ${n.tags || ""}`.toLowerCase();
           toast("Reset to defaults");
         } catch (e) {
           toast("Reset failed: " + e.message, true);
+        }
+      };
+      const ciBlock = document.createElement("div");
+      ciBlock.style.cssText = "margin-top:18px;padding-top:14px;border-top:1px solid var(--border)";
+      ciBlock.innerHTML = `
+
+      <div style="font-size:11px;font-weight:700;letter-spacing:.5px;color:var(--accent);text-transform:uppercase;margin-bottom:4px">Code Intelligence</div>
+
+      <div style="font-size:10px;color:var(--muted);margin-bottom:8px;line-height:1.5">
+
+        Enable to connect <strong>codebase-memory-mcp</strong> \u2014 structural graph queries instead of raw file reads.
+        120\xD7 fewer tokens, sub-ms lookups. <a href="https://github.com/DeusData/codebase-memory-mcp" target="_blank" style="color:var(--accent)">GitHub \u2197</a>
+      </div>
+
+      <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:11px;color:var(--text)">
+
+        <input type="checkbox" id="code-intel-toggle-${projectId}" ${codeIntelEnabled ? "checked" : ""}
+          style="width:14px;height:14px;accent-color:var(--accent);cursor:pointer">
+
+        Enable Code Intelligence for this project
+
+      </label>
+
+      <div id="code-intel-info-${projectId}" style="margin-top:10px;display:${codeIntelEnabled ? "block" : "none"}">
+
+        <div style="font-size:10px;color:var(--muted);margin-bottom:4px">Install (once, on the machine running the tunnel):</div>
+
+        <code style="display:block;font-size:10px;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;padding:6px 8px;color:var(--text);word-break:break-all">curl -fsSL https://raw.githubusercontent.com/DeusData/codebase-memory-mcp/main/install.sh | bash</code>
+
+        <div style="font-size:10px;color:var(--muted);margin-top:8px;margin-bottom:4px">Add to claude.ai after starting <code>meridian --tunnel</code>:</div>
+
+        <code id="code-intel-url-${projectId}" style="display:block;font-size:10px;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;padding:6px 8px;color:var(--text);word-break:break-all">https://usemeridian.us/code/mcp/{your-tenant-id}/mcp</code>
+
+      </div>
+
+    `;
+      host.appendChild(ciBlock);
+      const ciToggle = document.getElementById(`code-intel-toggle-${projectId}`);
+      const ciInfo = document.getElementById(`code-intel-info-${projectId}`);
+      ciToggle.onchange = async () => {
+        const enabled = ciToggle.checked ? 1 : 0;
+        ciInfo.style.display = enabled ? "block" : "none";
+        try {
+          await api2(`/projects/${projectId}/settings`, {
+            method: "PATCH",
+            body: JSON.stringify({ code_intel_enabled: enabled })
+          });
+          toast(enabled ? "Code Intelligence enabled" : "Code Intelligence disabled");
+        } catch (e) {
+          toast("Save failed: " + e.message, true);
         }
       };
     } catch (e) {

@@ -717,6 +717,10 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _backfill_agent_instructions(db)
     await _migrate_note_kind(db)
     await _migrate_tunnel_active(db)
+    await _migrate_code_intel(db)
+    await _migrate_notes_priority(db)
+    await _migrate_task_log_kind(db)
+    await _migrate_oauth_refresh_tokens(db)
     return db
 
 
@@ -851,7 +855,7 @@ async def get_project_settings(
     """Return the persisted settings for a project."""
     async with db.execute(
         "SELECT id, max_pinned_decisions, executor_config, hitl_auto_answer, "
-        "auto_worktrees, require_merge_approval "
+        "auto_worktrees, require_merge_approval, code_intel_enabled "
         "FROM projects WHERE id = ?",
         (project_id,),
     ) as cur:
@@ -873,6 +877,8 @@ async def get_project_settings(
         # 0716c9e0 — parallel safety toggles; default ON (1).
         "auto_worktrees": int(data.get("auto_worktrees") if data.get("auto_worktrees") is not None else 1),
         "require_merge_approval": int(data.get("require_merge_approval") if data.get("require_merge_approval") is not None else 1),
+        # Sprint-2/3 — codebase-memory-mcp toggle.
+        "code_intel_enabled": int(data.get("code_intel_enabled") or 0),
     }
 
 
@@ -885,6 +891,7 @@ async def update_project_settings(
     hitl_auto_answer: int | None = None,
     auto_worktrees: int | None = None,
     require_merge_approval: int | None = None,
+    code_intel_enabled: int | None = None,
     github_repo: str | None = _UNSET,
     github_branch: str | None = _UNSET,
 ) -> dict[str, Any] | None:
@@ -910,6 +917,9 @@ async def update_project_settings(
     if require_merge_approval is not None:
         updates.append("require_merge_approval = ?")
         params.append(1 if require_merge_approval else 0)
+    if code_intel_enabled is not None:
+        updates.append("code_intel_enabled = ?")
+        params.append(1 if code_intel_enabled else 0)
     if github_repo is not _UNSET:
         updates.append("github_repo = ?")
         params.append(github_repo or None)
@@ -1953,6 +1963,7 @@ async def log_task(
     parent_session_id: str | None = None,
     parent_task_id: str | None = None,
     sprint_item_id: str | None = None,
+    kind: str | None = None,
 ) -> dict[str, Any]:
     """Append a task-log entry and broadcast to live subscribers.
 
@@ -1964,14 +1975,19 @@ async def log_task(
     ``parent_task_id`` (v2.4) records that this task is a sub-step of
     another task. Lets the dashboard render multi-agent work as a tree
     (researcher → fetched 3 sources, writer → drafted reply, etc.).
+
+    ``kind`` (Sprint-4) is the entry taxonomy: shipped/found/decided/blocked.
+    Defaults to 'shipped'. Unknown values are coerced to NULL.
     """
     if status not in {"pending", "in_progress", "done", "failed", "pending-hitl", "backlog", "future", "backburner"}:
         raise ValueError(f"invalid task status: {status}")
+    if kind not in ("shipped", "found", "decided", "blocked"):
+        kind = None
     tid = _new_id()
     await db.execute(
         "INSERT INTO task_log "
-        "(id, session_id, project_id, description, status, parent_session_id, parent_task_id, sprint_item_id) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        "(id, session_id, project_id, description, status, parent_session_id, parent_task_id, sprint_item_id, kind) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             tid,
             session_id,
@@ -1981,6 +1997,7 @@ async def log_task(
             parent_session_id,
             parent_task_id,
             sprint_item_id,
+            kind,
         ),
     )
     await update_session_seen(db, session_id)
@@ -5876,20 +5893,26 @@ async def add_project_note(
     body: str,
     tags: str | None = None,
     kind: str | None = None,
+    priority: str = "normal",
 ) -> dict[str, Any]:
     """Insert a project_notes row. tags is comma-separated free-form.
 
     ``kind`` is the 9d44998b taxonomy (wiki | insight | reference); NULL is
     treated as 'wiki' by readers. Unknown values are coerced to NULL so the
     column stays a closed vocabulary.
+
+    ``priority`` is high/normal/low; defaults to 'normal'. High-priority notes
+    are surfaced first in generate_handoff and get_session_brief (planner role).
     """
     if kind not in ("wiki", "insight", "reference"):
         kind = None
+    if priority not in ("high", "normal", "low"):
+        priority = "normal"
     nid = _new_id()
     await db.execute(
-        "INSERT INTO project_notes (id, project_id, title, body, tags, note_kind) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
-        (nid, project_id, title, body, tags, kind),
+        "INSERT INTO project_notes (id, project_id, title, body, tags, note_kind, priority) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (nid, project_id, title, body, tags, kind, priority),
     )
     await db.commit()
     # ITEM 6 — live push so the Notes tab refreshes without polling.
@@ -5944,8 +5967,9 @@ async def update_project_note(
     title: str | None = None,
     body: str | None = None,
     tags: str | None = None,
+    priority: str | None = None,
 ) -> dict[str, Any] | None:
-    """Patch any combination of title/body/tags. Returns updated row."""
+    """Patch any combination of title/body/tags/priority. Returns updated row."""
     existing = await get_project_note(db, note_id)
     if existing is None:
         return None
@@ -5956,6 +5980,8 @@ async def update_project_note(
         fields["body"] = body
     if tags is not None:
         fields["tags"] = tags
+    if priority is not None and priority in ("high", "normal", "low"):
+        fields["priority"] = priority
     if not fields:
         return existing
     from datetime import datetime, timezone

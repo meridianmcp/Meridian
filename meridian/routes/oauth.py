@@ -181,6 +181,75 @@ async def _load_oauth_tokens_from_db(db: Any) -> dict[str, dict[str, Any]]:
     }
 
 
+_RT_LIFETIME_SECS = 86400 * 90  # 90 days
+
+
+async def _issue_refresh_token(
+    db: Any,
+    *,
+    tenant_id: str | None,
+    client_id: str,
+) -> str:
+    """Generate, store, and return a new opaque refresh token."""
+    rt = f"rt_meridian_{_sec.token_urlsafe(32)}"
+    rt_hash = _oauth_token_hash(rt)
+    from datetime import datetime, timedelta, timezone  # noqa: PLC0415
+    expires = (datetime.now(timezone.utc) + timedelta(seconds=_RT_LIFETIME_SECS)).isoformat()
+    try:
+        await db.execute(
+            "INSERT INTO oauth_refresh_tokens (token_hash, tenant_id, client_id, expires_at)"
+            " VALUES (?, ?, ?, ?)",
+            (rt_hash, tenant_id, client_id, expires),
+        )
+        await db.commit()
+    except Exception:
+        pass
+    return rt
+
+
+async def _consume_refresh_token(
+    db: Any,
+    rt_hash: str,
+) -> dict[str, Any] | None:
+    """Look up a refresh token, mark it used, and return its data.
+
+    Returns None if the token doesn't exist, has expired, or was already used
+    (replay protection for token rotation).
+    """
+    from datetime import datetime, timezone  # noqa: PLC0415
+    async with db.execute(
+        "SELECT token_hash, tenant_id, client_id, expires_at, used_at"
+        " FROM oauth_refresh_tokens WHERE token_hash = ?",
+        (rt_hash,),
+    ) as cur:
+        row = await cur.fetchone()
+    if row is None:
+        return None
+    row_d = dict(row) if hasattr(row, "keys") else dict(zip(
+        ["token_hash", "tenant_id", "client_id", "expires_at", "used_at"], row
+    ))
+    if row_d.get("used_at"):
+        return None
+    try:
+        exp_dt = datetime.fromisoformat(str(row_d["expires_at"]).replace("Z", "+00:00"))
+        if exp_dt.tzinfo is None:
+            exp_dt = exp_dt.replace(tzinfo=timezone.utc)
+        if datetime.now(tz=timezone.utc) > exp_dt:
+            return None
+    except Exception:
+        return None
+    now_str = datetime.now(timezone.utc).isoformat()
+    try:
+        await db.execute(
+            "UPDATE oauth_refresh_tokens SET used_at = ? WHERE token_hash = ?",
+            (now_str, rt_hash),
+        )
+        await db.commit()
+    except Exception:
+        pass
+    return {"tenant_id": row_d.get("tenant_id"), "client_id": row_d.get("client_id") or ""}
+
+
 async def _hydrate_oauth_cache(auth_db: Any) -> None:
     global _oa_tokens, _oa_clients
 
@@ -235,7 +304,7 @@ async def _oauth_meta(request: Request):
         "device_authorization_endpoint": f"{b}/oauth/device",
         "scopes_supported": ["mcp"],
         "response_types_supported": ["code"],
-        "grant_types_supported": ["authorization_code", "urn:ietf:params:oauth:grant-type:device_code"],
+        "grant_types_supported": ["authorization_code", "refresh_token", "urn:ietf:params:oauth:grant-type:device_code"],
         "code_challenge_methods_supported": ["S256"],
         "token_endpoint_auth_methods_supported": ["client_secret_post", "none"]})
 
@@ -648,6 +717,47 @@ async def _oauth_token(request: Request):
         _save_oa_tokens(_oa_tokens)
         return JSONResponse({"access_token": tok, "token_type": "bearer", "expires_in": 86400 * 90})
 
+    # ── RFC 6749 refresh_token grant ────────────────────────────────────────
+    if grant_type == "refresh_token":
+        rt_val = (d.get("refresh_token") or "").strip()
+        if not rt_val:
+            return JSONResponse({"error": "invalid_request", "error_description": "refresh_token required"}, status_code=400)
+        auth_db = request.app.state.db
+        rt_hash = _oauth_token_hash(rt_val)
+        rt_data = await _consume_refresh_token(auth_db, rt_hash)
+        if rt_data is None:
+            return JSONResponse({"error": "invalid_grant", "error_description": "refresh token expired, not found, or already used"}, status_code=400)
+        rt_tenant_id = rt_data.get("tenant_id")
+        rt_client_id = rt_data.get("client_id") or d.get("client_id", "meridian")
+        # Issue new access token
+        new_tok = f"sk_meridian_{_sec.token_urlsafe(32)}"
+        new_tok_hash = _oauth_token_hash(new_tok)
+        new_tok_data = {"client_id": rt_client_id, "exp": int(_tm.time() + 86400 * 90), "tenant_id": rt_tenant_id}
+        _oa_tokens[new_tok_hash] = new_tok_data
+        if rt_tenant_id:
+            import uuid as _uuid  # noqa: PLC0415
+            _api_tid = str(_uuid.uuid4())
+            try:
+                await auth_db.execute(
+                    "INSERT INTO api_tokens (id, tenant_id, token_hash, label, token_type)"
+                    " VALUES (?, ?, ?, ?, ?)",
+                    (_api_tid, rt_tenant_id, new_tok_hash, "oauth", "readwrite"),
+                )
+                await auth_db.commit()
+            except Exception:
+                pass
+        else:
+            await _upsert_oauth_token(auth_db, new_tok_hash, tenant_id=None, client_id=rt_client_id, exp=new_tok_data["exp"])
+        _save_oa_tokens(_oa_tokens)
+        # Issue new refresh token (rotation)
+        new_rt = await _issue_refresh_token(auth_db, tenant_id=rt_tenant_id, client_id=rt_client_id)
+        return JSONResponse({
+            "access_token": new_tok,
+            "token_type": "bearer",
+            "expires_in": 86400 * 90,
+            "refresh_token": new_rt,
+        })
+
     if grant_type != "authorization_code":
         return JSONResponse({"error": "unsupported_grant_type"}, status_code=400)
     _method = d.get("code_challenge_method", "")
@@ -737,4 +847,10 @@ async def _oauth_token(request: Request):
             exp=tok_data["exp"],
         )
     _save_oa_tokens(_oa_tokens)
-    return JSONResponse({"access_token": tok, "token_type": "bearer", "expires_in": 86400 * 90})
+    refresh_tok = await _issue_refresh_token(auth_db, tenant_id=tenant_id, client_id=tok_data["client_id"])
+    return JSONResponse({
+        "access_token": tok,
+        "token_type": "bearer",
+        "expires_in": 86400 * 90,
+        "refresh_token": refresh_tok,
+    })

@@ -31,6 +31,7 @@ from pathlib import Path
 
 DEFAULT_BASE_URL = "https://usemeridian.us"
 DEFAULT_PROXY_PORT = 8808
+DEFAULT_CODE_PROXY_PORT = 8809
 # Server's proxy timeout is 30s (_PROXY_TIMEOUT); stay just under it so a slow
 # local response surfaces as our error rather than the server's tunnel timeout.
 _LOCAL_REQUEST_TIMEOUT = 28.0
@@ -95,6 +96,45 @@ def _permanent_url(base_url: str, tenant_id: str) -> str:
 def _sse_url(base_url: str, tenant_id: str) -> str:
     """SSE-transport variant of the permanent URL, for older MCP clients."""
     return f"{base_url.rstrip('/')}/fs/mcp/{tenant_id}/sse"
+
+
+def _ws_code_url(base_url: str, tenant_id: str, token: str) -> str:
+    """Build the codebase-memory-mcp tunnel WebSocket URL."""
+    base = base_url.rstrip("/")
+    if base.startswith("https://"):
+        ws_base = "wss://" + base[len("https://"):]
+    elif base.startswith("http://"):
+        ws_base = "ws://" + base[len("http://"):]
+    else:
+        ws_base = base
+    from urllib.parse import quote
+    return f"{ws_base}/tunnel-code/{tenant_id}?token={quote(token, safe='')}"
+
+
+def _permanent_code_url(base_url: str, tenant_id: str) -> str:
+    """The URL for codebase-memory-mcp — add to claude.ai once."""
+    return f"{base_url.rstrip('/')}/code/mcp/{tenant_id}/mcp"
+
+
+def _find_codebase_memory_mcp() -> str | None:
+    """Return the path to the codebase-memory-mcp binary, or None if not installed."""
+    return shutil.which("codebase-memory-mcp")
+
+
+def _build_code_proxy_command(
+    npx: str, port: int = DEFAULT_CODE_PROXY_PORT
+) -> list[str] | None:
+    """Build the mcp-proxy command wrapping codebase-memory-mcp on the given port.
+
+    Returns None when codebase-memory-mcp is not installed — caller skips the
+    code tunnel gracefully.
+    """
+    binary = _find_codebase_memory_mcp()
+    if binary is None:
+        return None
+    # codebase-memory-mcp is a native binary, not an npm package — no --shell needed.
+    return [npx, "-y", "mcp-proxy", "--port", str(port),
+            "--server", "stream", "--stateless", "--", binary]
 
 
 def _find_npx() -> str:
@@ -216,14 +256,14 @@ async def _fetch_me(base_url: str, token: str) -> dict:
         return r.json()
 
 
-async def _run_connection(ws_url: str, port: int) -> None:
+async def _run_connection(ws_url: str, port: int, label: str = "fs") -> None:
     """Hold one WebSocket session open, relaying requests until it drops."""
     import httpx
     import websockets
 
     local_base = f"http://127.0.0.1:{port}"
     async with websockets.connect(ws_url, max_size=None, ping_interval=20) as ws:
-        print("tunnel: connected — relaying filesystem requests", flush=True)
+        print(f"tunnel:{label}: connected", flush=True)
         async with httpx.AsyncClient() as http_client:
             async for raw in ws:
                 try:
@@ -243,16 +283,38 @@ async def _run_connection(ws_url: str, port: int) -> None:
 # Orchestration
 # ---------------------------------------------------------------------------
 
+async def _reconnect_loop(ws_url: str, port: int, label: str) -> None:
+    """Keep one tunnel alive, reconnecting with exponential backoff."""
+    backoff = 1.0
+    while True:
+        try:
+            await _run_connection(ws_url, port, label)
+            backoff = 1.0
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            print(
+                f"tunnel:{label}: disconnected ({exc}); reconnecting in {backoff:.0f}s",
+                file=sys.stderr,
+                flush=True,
+            )
+        await asyncio.sleep(backoff)
+        backoff = min(backoff * 2, _MAX_BACKOFF)
+
+
 async def run_tunnel(
     *,
     token: str | None = None,
     base_url: str | None = None,
     repo_path: str | None = None,
     port: int = DEFAULT_PROXY_PORT,
+    code_port: int = DEFAULT_CODE_PROXY_PORT,
 ) -> int:
-    """Resolve config, start the local proxy, and keep the tunnel up.
+    """Resolve config, start local proxies, and keep both tunnels up.
 
-    Returns a process exit code. Blocks until interrupted (Ctrl-C).
+    Starts a filesystem tunnel on *port* (always) and a codebase-memory-mcp
+    tunnel on *code_port* (only if the binary is installed). Blocks until
+    interrupted (Ctrl-C). Returns a process exit code.
     """
     token = _resolve_token(token)
     if not token:
@@ -291,13 +353,13 @@ async def run_tunnel(
         )
         return 1
 
-    # 2. Spawn the local mcp-proxy + filesystem server.
+    # 2. Spawn filesystem proxy.
     npx = _find_npx()
-    cmd = _build_proxy_command(npx, repo_path, port)
+    cmd_fs = _build_proxy_command(npx, repo_path, port)
     print(f"meridian tunnel: serving {repo_path}", flush=True)
-    print(f"  local proxy: http://127.0.0.1:{port}", flush=True)
+    print(f"  filesystem proxy: http://127.0.0.1:{port}", flush=True)
     try:
-        proc = subprocess.Popen(cmd)
+        proc_fs = subprocess.Popen(cmd_fs)
     except FileNotFoundError:
         print(
             f"error: could not launch npx ({npx!r}). Is Node.js installed and "
@@ -306,38 +368,55 @@ async def run_tunnel(
         )
         return 1
 
-    permanent = _permanent_url(base_url, tenant_id)
+    # 3. Optionally spawn codebase-memory-mcp proxy.
+    proc_code: subprocess.Popen | None = None
+    cmd_code = _build_code_proxy_command(npx, code_port)
+    if cmd_code is not None:
+        print(f"  code-intel proxy:  http://127.0.0.1:{code_port}", flush=True)
+        try:
+            proc_code = subprocess.Popen(cmd_code)
+        except Exception as exc:
+            print(f"  warning: could not start code-intel proxy: {exc}", file=sys.stderr)
+            proc_code = None
+    else:
+        print(
+            "  code-intel:        not available (install codebase-memory-mcp to enable)",
+            flush=True,
+        )
+
+    # 4. Print permanent URLs.
     print("", flush=True)
-    print("  Permanent MCP URL — add this to claude.ai once:", flush=True)
-    print(f"    {permanent}", flush=True)
-    print(f"  (SSE-transport clients: {_sse_url(base_url, tenant_id)})", flush=True)
+    print("  Permanent MCP URLs — add these to claude.ai once:", flush=True)
+    print(f"    Filesystem:  {_permanent_url(base_url, tenant_id)}", flush=True)
+    if proc_code is not None:
+        print(f"    Code intel:  {_permanent_code_url(base_url, tenant_id)}", flush=True)
+    print(f"  (SSE clients: {_sse_url(base_url, tenant_id)})", flush=True)
     print("", flush=True)
 
-    # 3. Reconnect loop with exponential backoff.
-    ws_url = _ws_url(base_url, tenant_id, token)
-    backoff = 1.0
+    # 5. Run reconnect loops — filesystem always, code only when proxy started.
+    ws_fs = _ws_url(base_url, tenant_id, token)
+    ws_code = _ws_code_url(base_url, tenant_id, token)
+    tasks = [asyncio.ensure_future(_reconnect_loop(ws_fs, port, "fs"))]
+    if proc_code is not None:
+        tasks.append(asyncio.ensure_future(_reconnect_loop(ws_code, code_port, "code")))
+
     try:
-        while True:
-            try:
-                await _run_connection(ws_url, port)
-                backoff = 1.0  # clean exit — reset backoff
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                print(
-                    f"tunnel: disconnected ({exc}); reconnecting in "
-                    f"{backoff:.0f}s",
-                    file=sys.stderr,
-                    flush=True,
-                )
-            await asyncio.sleep(backoff)
-            backoff = min(backoff * 2, _MAX_BACKOFF)
+        await asyncio.gather(*tasks)
     except (KeyboardInterrupt, asyncio.CancelledError):
         print("\ntunnel: shutting down", flush=True)
         return 0
     finally:
-        proc.terminate()
+        for t in tasks:
+            t.cancel()
+        proc_fs.terminate()
         try:
-            proc.wait(timeout=5)
+            proc_fs.wait(timeout=5)
         except Exception:
-            proc.kill()
+            proc_fs.kill()
+        if proc_code is not None:
+            proc_code.terminate()
+            try:
+                proc_code.wait(timeout=5)
+            except Exception:
+                proc_code.kill()
+    return 0

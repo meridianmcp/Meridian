@@ -1111,6 +1111,41 @@ async def _migrate_pg_tunnel_active(conn: PostgresConnection) -> None:
     )
 
 
+async def _migrate_pg_code_intel(conn: PostgresConnection) -> None:
+    """Sprint-2/3 — projects.code_intel_enabled: per-project Code Intelligence toggle."""
+    await conn.executescript(
+        "ALTER TABLE projects ADD COLUMN IF NOT EXISTS code_intel_enabled INTEGER NOT NULL DEFAULT 0"
+    )
+
+
+async def _migrate_pg_notes_priority(conn: PostgresConnection) -> None:
+    """Sprint-4 — project_notes.priority: high/normal/low ranking for generate_handoff."""
+    await conn.executescript(
+        "ALTER TABLE project_notes ADD COLUMN IF NOT EXISTS priority TEXT NOT NULL DEFAULT 'normal'"
+    )
+
+
+async def _migrate_pg_task_log_kind(conn: PostgresConnection) -> None:
+    """Sprint-4 — task_log.kind: shipped/found/decided/blocked taxonomy."""
+    await conn.executescript(
+        "ALTER TABLE task_log ADD COLUMN IF NOT EXISTS kind TEXT DEFAULT 'shipped'"
+    )
+
+
+async def _migrate_pg_oauth_refresh_tokens(conn: PostgresConnection) -> None:
+    """Sprint-5 — oauth_refresh_tokens: RFC 6749 refresh_token with rotation."""
+    await conn.executescript(
+        """CREATE TABLE IF NOT EXISTS oauth_refresh_tokens (
+            token_hash TEXT PRIMARY KEY,
+            tenant_id TEXT,
+            client_id TEXT,
+            expires_at TIMESTAMPTZ NOT NULL,
+            used_at TIMESTAMPTZ,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )"""
+    )
+
+
 async def get_project_ntfy_url(
     db: PostgresConnection, project_id: str
 ) -> str | None:
@@ -1664,4 +1699,8 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_backfill_agent_instructions,
     _migrate_pg_note_kind,
     _migrate_pg_file_symbol_claims,
+    _migrate_pg_code_intel,
+    _migrate_pg_notes_priority,
+    _migrate_pg_task_log_kind,
+    _migrate_pg_oauth_refresh_tokens,
 )

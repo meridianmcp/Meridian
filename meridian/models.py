@@ -171,6 +171,12 @@ class ProjectSettings(BaseModel):
         le=1,
         description="0716c9e0: warn via HITL when completing an item with an active worktree (default ON).",
     )
+    code_intel_enabled: int = Field(
+        default=0,
+        ge=0,
+        le=1,
+        description="Sprint-2/3: show codebase-memory-mcp install URL in dashboard and agent guidance.",
+    )
 
 
 class ProjectSettingsPatch(BaseModel):
@@ -181,6 +187,7 @@ class ProjectSettingsPatch(BaseModel):
     hitl_auto_answer: int | None = Field(default=None, ge=0, le=2)
     auto_worktrees: int | None = Field(default=None, ge=0, le=1)
     require_merge_approval: int | None = Field(default=None, ge=0, le=1)
+    code_intel_enabled: int | None = Field(default=None, ge=0, le=1)
 
 
 class GoalState(BaseModel):

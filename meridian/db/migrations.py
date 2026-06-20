@@ -12,7 +12,7 @@ from typing import Any
 
 import aiosqlite
 
-__all__ = ['_migrate_task_log_backlog_future', '_migrate_task_log_backburner', '_migrate_task_log_hitl', '_column_exists', '_migrate_add_column_if_missing', '_migrate_human_identity', '_migrate_v24_task_tree_and_framework', '_migrate_v25_feedback_and_notifications', '_migrate_v33_hitl_kind_payload', '_migrate_v34_hitl_auto_answer', '_migrate_v34_workspace_settings', '_migrate_dunning_fields', '_migrate_overage_fields', '_migrate_v26_client_type', '_migrate_ntfy_notifications', '_migrate_notify_email', '_migrate_github_integration', '_migrate_sprint_item_dependencies', '_migrate_v09_notes_and_magic_links', '_migrate_v24_pinned_decisions_and_hitl', '_migrate_goal_field_timestamps', '_migrate_task_claims', '_migrate_task_sprint_link', '_migrate_session_type', '_migrate_session_summary', '_migrate_parent_session_id', '_migrate_decisions', '_migrate_goal_mode', '_migrate_worker_pid', '_migrate_rewind_token', '_migrate_project_settings', '_migrate_neon_pool_projects_free_tier', '_migrate_tenants_free_plan', '_migrate_decisions_free_category', '_migrate_sessions_archived', '_migrate_goal_hierarchy', '_migrate_sprint_items_v2', '_migrate_drop_chat_tables', '_migrate_hosted_tables', '_migrate_session_notes', '_migrate_milestone_type', '_migrate_executor_runs', '_migrate_file_locks', '_migrate_file_symbol_claims', '_migrate_blog_posts', '_migrate_workspace_layer', '_migrate_checkpoint_data', 'init_hosted_tables', '_migrate_sprint_item_tree', '_migrate_api_token_type', '_migrate_api_tokens_expires_at', '_migrate_github_to_projects', '_migrate_touches_files', '_migrate_oauth_codes_table', '_migrate_device_codes_table', '_migrate_sprint_items_indeterminate', '_migrate_sprint_items_provisional_complete', '_migrate_workspace_members_rbac', '_migrate_project_icon', '_internal_emails', '_migrate_tenants_is_internal', '_migrate_admin_plan', '_migrate_active_worktrees', '_migrate_workspace_tenant_isolation', '_migrate_registered_hostnames', '_migrate_queued_session', '_migrate_parallel_safety', '_migrate_changelog_entries', '_migrate_agent_instructions', '_migrate_note_kind', '_migrate_tunnel_active', '_backfill_agent_instructions']
+__all__ = ['_migrate_task_log_backlog_future', '_migrate_task_log_backburner', '_migrate_task_log_hitl', '_column_exists', '_migrate_add_column_if_missing', '_migrate_human_identity', '_migrate_v24_task_tree_and_framework', '_migrate_v25_feedback_and_notifications', '_migrate_v33_hitl_kind_payload', '_migrate_v34_hitl_auto_answer', '_migrate_v34_workspace_settings', '_migrate_dunning_fields', '_migrate_overage_fields', '_migrate_v26_client_type', '_migrate_ntfy_notifications', '_migrate_notify_email', '_migrate_github_integration', '_migrate_sprint_item_dependencies', '_migrate_v09_notes_and_magic_links', '_migrate_v24_pinned_decisions_and_hitl', '_migrate_goal_field_timestamps', '_migrate_task_claims', '_migrate_task_sprint_link', '_migrate_session_type', '_migrate_session_summary', '_migrate_parent_session_id', '_migrate_decisions', '_migrate_goal_mode', '_migrate_worker_pid', '_migrate_rewind_token', '_migrate_project_settings', '_migrate_neon_pool_projects_free_tier', '_migrate_tenants_free_plan', '_migrate_decisions_free_category', '_migrate_sessions_archived', '_migrate_goal_hierarchy', '_migrate_sprint_items_v2', '_migrate_drop_chat_tables', '_migrate_hosted_tables', '_migrate_session_notes', '_migrate_milestone_type', '_migrate_executor_runs', '_migrate_file_locks', '_migrate_file_symbol_claims', '_migrate_blog_posts', '_migrate_workspace_layer', '_migrate_checkpoint_data', 'init_hosted_tables', '_migrate_sprint_item_tree', '_migrate_api_token_type', '_migrate_api_tokens_expires_at', '_migrate_github_to_projects', '_migrate_touches_files', '_migrate_oauth_codes_table', '_migrate_device_codes_table', '_migrate_sprint_items_indeterminate', '_migrate_sprint_items_provisional_complete', '_migrate_workspace_members_rbac', '_migrate_project_icon', '_internal_emails', '_migrate_tenants_is_internal', '_migrate_admin_plan', '_migrate_active_worktrees', '_migrate_workspace_tenant_isolation', '_migrate_registered_hostnames', '_migrate_queued_session', '_migrate_parallel_safety', '_migrate_changelog_entries', '_migrate_agent_instructions', '_migrate_note_kind', '_migrate_tunnel_active', '_backfill_agent_instructions', '_migrate_code_intel', '_migrate_notes_priority', '_migrate_task_log_kind', '_migrate_oauth_refresh_tokens']
 
 async def _migrate_task_log_backlog_future(db: aiosqlite.Connection) -> None:
     """Rebuild ``task_log`` to add 'backlog' and 'future' statuses (v1.9.x).
@@ -1540,6 +1540,56 @@ async def _backfill_agent_instructions(db: aiosqlite.Connection) -> None:
     await db.execute(
         "UPDATE projects SET agent_instructions = ? WHERE agent_instructions IS NULL",
         (DEFAULT_AGENT_INSTRUCTIONS,),
+    )
+    await db.commit()
+
+
+async def _migrate_code_intel(db: aiosqlite.Connection) -> None:
+    """Sprint-2/3 — projects.code_intel_enabled: per-project Code Intelligence toggle.
+    When 1, the dashboard shows the codebase-memory-mcp install command and
+    permanent URL. The agent_instructions already include conditional guidance.
+    """
+    await _migrate_add_column_if_missing(
+        db, "projects", "code_intel_enabled", "INTEGER NOT NULL DEFAULT 0"
+    )
+
+
+async def _migrate_notes_priority(db: aiosqlite.Connection) -> None:
+    """Sprint-4 — project_notes.priority: high/normal/low ranking for generate_handoff
+    and get_session_brief planner role. High-priority notes are surfaced first.
+    """
+    await _migrate_add_column_if_missing(
+        db, "project_notes", "priority", "TEXT NOT NULL DEFAULT 'normal'"
+    )
+
+
+async def _migrate_task_log_kind(db: aiosqlite.Connection) -> None:
+    """Sprint-4 — task_log.kind: shipped/found/decided/blocked taxonomy so log
+    entries are differentiated beyond status. Defaults to 'shipped'.
+    """
+    await _migrate_add_column_if_missing(
+        db, "task_log", "kind", "TEXT DEFAULT 'shipped'"
+    )
+
+
+async def _migrate_oauth_refresh_tokens(db: aiosqlite.Connection) -> None:
+    """Sprint-5 — oauth_refresh_tokens: RFC 6749 refresh_token support with rotation.
+
+    token_hash: sha256 of the opaque refresh token, PRIMARY KEY.
+    tenant_id:  owning tenant (nullable for anonymous/open sessions).
+    client_id:  OAuth client that issued the token.
+    expires_at: ISO-8601 UTC; tokens expire after 90 days by default.
+    used_at:    set on rotation so replayed old tokens are rejected.
+    """
+    await db.execute(
+        """CREATE TABLE IF NOT EXISTS oauth_refresh_tokens (
+            token_hash TEXT PRIMARY KEY,
+            tenant_id TEXT,
+            client_id TEXT,
+            expires_at TEXT NOT NULL,
+            used_at TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )"""
     )
     await db.commit()
 

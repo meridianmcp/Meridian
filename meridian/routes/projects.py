@@ -221,6 +221,7 @@ async def patch_project_settings(
         hitl_auto_answer=body.hitl_auto_answer,
         auto_worktrees=body.auto_worktrees,
         require_merge_approval=body.require_merge_approval,
+        code_intel_enabled=body.code_intel_enabled,
     )
     if settings is None:
         raise HTTPException(status_code=404, detail="project not found")

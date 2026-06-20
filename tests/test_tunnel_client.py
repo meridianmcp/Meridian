@@ -101,6 +101,24 @@ def test_sse_url_targets_sse_endpoint():
     )
 
 
+def test_ws_code_url_https_to_wss():
+    url = tc._ws_code_url("https://usemeridian.us", "tenant-123", "sk_tok")
+    assert url.startswith("wss://usemeridian.us/tunnel-code/tenant-123?token=")
+    assert "token=sk_tok" in url
+
+
+def test_ws_code_url_http_to_ws():
+    url = tc._ws_code_url("http://localhost:7878", "t1", "tok")
+    assert url.startswith("ws://localhost:7878/tunnel-code/t1?token=")
+
+
+def test_permanent_code_url():
+    assert (
+        tc._permanent_code_url("https://usemeridian.us/", "abc")
+        == "https://usemeridian.us/code/mcp/abc/mcp"
+    )
+
+
 # ---------------------------------------------------------------------------
 # npx + proxy command
 # ---------------------------------------------------------------------------
@@ -139,6 +157,29 @@ def test_build_proxy_command_uses_shell_on_windows(monkeypatch):
     assert "--shell" in tc._build_proxy_command("npx.cmd", "C:/repo")
     monkeypatch.setattr(tc.sys, "platform", "linux")
     assert "--shell" not in tc._build_proxy_command("npx", "/repo")
+
+
+def test_build_code_proxy_command_returns_none_when_missing(monkeypatch):
+    monkeypatch.setattr(tc.shutil, "which", lambda name: None)
+    assert tc._build_code_proxy_command("npx") is None
+
+
+def test_build_code_proxy_command_structure(monkeypatch):
+    monkeypatch.setattr(tc.shutil, "which", lambda name: "/usr/local/bin/codebase-memory-mcp")
+    cmd = tc._build_code_proxy_command("npx", port=9009)
+    assert cmd is not None
+    assert cmd[0] == "npx"
+    assert "mcp-proxy" in cmd
+    assert "--port" in cmd
+    assert "9009" in cmd
+    assert "--server" in cmd
+    assert "stream" in cmd
+    assert "--stateless" in cmd
+    assert "--" in cmd
+    sep = cmd.index("--")
+    assert cmd[sep + 1] == "/usr/local/bin/codebase-memory-mcp"
+    # codebase-memory-mcp is a native binary — no --shell needed
+    assert "--shell" not in cmd
 
 
 # ---------------------------------------------------------------------------

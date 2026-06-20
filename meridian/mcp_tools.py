@@ -92,7 +92,8 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
     {"name": "log_task", "description": "Log a task this session completed or is working on. Valid statuses: pending, in_progress, done, failed, backlog, future, backburner.",
      "inputSchema": {"type": "object", "properties": {
          "session_id": {"type": "string"}, "project_id": {"type": "string"},
-         "description": {"type": "string"}, "status": {"type": "string"}},
+         "description": {"type": "string"}, "status": {"type": "string"},
+         "kind": {"type": "string", "enum": ["shipped", "found", "decided", "blocked"], "description": "Entry taxonomy. shipped=work done, found=discovery, decided=arch choice, blocked=blocker."}},
          "required": ["session_id", "project_id", "description"]}},
     {"name": "get_tasks", "description": "Read-only: Get recent tasks across all sessions.",
      "inputSchema": {"type": "object", "properties": {
@@ -208,6 +209,7 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "body": {"type": "string"},
          "tags": {"type": "string"},
          "kind": {"type": "string", "enum": ["wiki", "insight", "reference"]},
+         "priority": {"type": "string", "enum": ["high", "normal", "low"], "description": "high-priority notes surface first in generate_handoff and planner context."},
          "category": {"type": "string"}},
          "required": ["project_id", "title", "body"]}},
     {"name": "capture_insight", "description":
@@ -222,7 +224,8 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "title": {"type": "string"},
          "body": {"type": "string", "description": "Markdown body. Omit if using bullet_points."},
          "bullet_points": {"type": "array", "items": {"type": "string"}, "description": "Key takeaways, joined into a markdown bullet list."},
-         "tags": {"type": "string", "description": "Optional comma-separated tags (an 'insight' tag is always added)."}},
+         "tags": {"type": "string", "description": "Optional comma-separated tags (an 'insight' tag is always added)."},
+         "priority": {"type": "string", "enum": ["high", "normal", "low"], "description": "high-priority notes appear first in planner context and generate_handoff."}},
          "required": ["project_id", "title"]}},
     {"name": "get_notes", "description":
         "Read-only: List project notes (newest first). Optional ?tag substring filter.",

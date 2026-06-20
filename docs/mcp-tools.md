@@ -72,6 +72,7 @@ Valid statuses: `pending` · `in_progress` · `done` · `failed` · `backlog` ·
 | `project_id` | string | required |  |
 | `description` | string | required |  |
 | `status` | string | optional |  |
+| `kind` | string | optional | Entry taxonomy. shipped=work done, found=discovery, decided=arch choice, blocked=blocker. |
 
 **Example:**
 ```
@@ -444,6 +445,7 @@ Add a per-project wiki note. Use for setup instructions, gotchas, environment de
 | `body` | string | required |  |
 | `tags` | string | optional |  |
 | `kind` | string | optional |  |
+| `priority` | string | optional | high-priority notes surface first in generate_handoff and planner context. |
 | `category` | string | optional |  |
 
 **Example:**

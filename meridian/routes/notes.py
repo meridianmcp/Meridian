@@ -65,6 +65,7 @@ async def update_project_note_endpoint(
         title=body.get("title"),
         body=body.get("body"),
         tags=body.get("tags"),
+        priority=body.get("priority"),
     )
     if result is None:
         raise HTTPException(status_code=404, detail="note not found")
