@@ -10,11 +10,9 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
-from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock
 
 import httpx
-import pytest
 
 from meridian import tunnel_client as tc
 
@@ -196,7 +194,8 @@ def test_build_code_proxy_command_structure():
     assert "--shell" not in cmd
 
 
-def test_build_extractor_proxy_command_structure():
+def test_build_extractor_proxy_command_structure(monkeypatch):
+    monkeypatch.setattr(tc.sys, "platform", "linux")
     cmd = tc._build_extractor_proxy_command("npx", port=9010)
     assert cmd[0] == "npx"
     assert "mcp-proxy" in cmd
@@ -209,7 +208,40 @@ def test_build_extractor_proxy_command_structure():
     # Inner command must be: npx -y mcp-server-code-extractor
     assert cmd[sep + 1] == "npx"
     assert "mcp-server-code-extractor" in cmd[sep:]
+    # No --shell on non-Windows (direct spawn of npx works).
     assert "--shell" not in cmd
+
+
+def test_build_extractor_proxy_command_uses_shell_and_full_npx_on_windows(monkeypatch):
+    # On Windows the inner npx must be spawned through a shell (bare npx → ENOENT,
+    # npx.cmd → EINVAL under Node 24), and the full npx path is passed explicitly
+    # so the proxy child doesn't depend on inheriting PATH.
+    monkeypatch.setattr(tc.sys, "platform", "win32")
+    npx_path = r"C:\Users\13144\AppData\Roaming\npm\npx.cmd"
+    cmd = tc._build_extractor_proxy_command(npx_path, port=9010)
+    assert "--shell" in cmd
+    sep = cmd.index("--")
+    assert cmd[sep + 1] == npx_path  # inner uses the full npx path, not bare "npx"
+    assert "mcp-server-code-extractor" in cmd[sep:]
+
+
+def test_build_code_proxy_command_uses_shell_for_cmd_shim_on_windows(monkeypatch):
+    monkeypatch.setattr(tc.sys, "platform", "win32")
+    shim = r"C:\Users\13144\AppData\Roaming\npm\codebase-memory-mcp.cmd"
+    cmd = tc._build_code_proxy_command("npx.cmd", shim, port=9009)
+    assert "--shell" in cmd  # .cmd shim must go through a shell
+    sep = cmd.index("--")
+    assert cmd[sep + 1] == shim
+
+
+def test_build_code_proxy_command_no_shell_for_native_exe_on_windows(monkeypatch):
+    monkeypatch.setattr(tc.sys, "platform", "win32")
+    exe = r"C:\Users\13144\.meridian\bin\codebase-memory-mcp.exe"
+    cmd = tc._build_code_proxy_command("npx.cmd", exe, port=9009)
+    # A real .exe spawns directly — no --shell (preserves space-in-path support).
+    assert "--shell" not in cmd
+    sep = cmd.index("--")
+    assert cmd[sep + 1] == exe
 
 
 # ---------------------------------------------------------------------------
@@ -280,6 +312,8 @@ def test_find_codebase_memory_mcp_checks_path(monkeypatch):
 def test_find_codebase_memory_mcp_checks_managed_dir(monkeypatch, tmp_path):
     monkeypatch.setattr(tc.shutil, "which", lambda name: None)
     monkeypatch.setattr(tc, "_managed_bin_dir", lambda: tmp_path)
+    # Point APPDATA at an empty dir so the Windows npm-global probe finds nothing.
+    monkeypatch.setenv("APPDATA", str(tmp_path / "empty-appdata"))
     # Create the binary in the managed dir.
     bin_name = "codebase-memory-mcp.exe" if tc.sys.platform == "win32" else "codebase-memory-mcp"
     (tmp_path / bin_name).touch()
@@ -290,7 +324,23 @@ def test_find_codebase_memory_mcp_checks_managed_dir(monkeypatch, tmp_path):
 def test_find_codebase_memory_mcp_returns_none_when_absent(monkeypatch, tmp_path):
     monkeypatch.setattr(tc.shutil, "which", lambda name: None)
     monkeypatch.setattr(tc, "_managed_bin_dir", lambda: tmp_path)
+    monkeypatch.setenv("APPDATA", str(tmp_path / "empty-appdata"))
     assert tc._find_codebase_memory_mcp() is None
+
+
+def test_find_codebase_memory_mcp_npm_global_cmd_on_windows(monkeypatch, tmp_path):
+    # shutil.which misses (npm dir not on PATH) but the .cmd shim exists in the
+    # npm global location → fallback must resolve it. Force win32 so the probe runs.
+    monkeypatch.setattr(tc.sys, "platform", "win32")
+    monkeypatch.setattr(tc.shutil, "which", lambda name: None)
+    monkeypatch.setattr(tc, "_managed_bin_dir", lambda: tmp_path / "managed")
+    appdata = tmp_path / "AppData" / "Roaming"
+    npm_dir = appdata / "npm"
+    npm_dir.mkdir(parents=True)
+    shim = npm_dir / "codebase-memory-mcp.cmd"
+    shim.touch()
+    monkeypatch.setenv("APPDATA", str(appdata))
+    assert tc._find_codebase_memory_mcp() == str(shim)
 
 
 # ---------------------------------------------------------------------------
@@ -620,3 +670,32 @@ def test_install_mcp_json_updates_existing_cursor_config(tmp_path):
     assert cursor in paths
     data = json.loads(cursor.read_text(encoding="utf-8"))
     assert "meridian-fs" in data["mcpServers"]
+
+
+# ---------------------------------------------------------------------------
+# _force_utf8_io — Windows cp1252 crash guard
+# ---------------------------------------------------------------------------
+
+def test_force_utf8_io_sets_env_and_reconfigures(monkeypatch):
+    monkeypatch.delenv("PYTHONIOENCODING", raising=False)
+    calls = []
+
+    class FakeStream:
+        def reconfigure(self, **kw):
+            calls.append(kw)
+
+    monkeypatch.setattr(tc.sys, "stdout", FakeStream())
+    monkeypatch.setattr(tc.sys, "stderr", FakeStream())
+    tc._force_utf8_io()
+    assert tc.os.environ["PYTHONIOENCODING"] == "utf-8"
+    # Both streams reconfigured to utf-8 with replacement (never raises).
+    assert calls == [{"encoding": "utf-8", "errors": "replace"}] * 2
+
+
+def test_force_utf8_io_tolerates_streams_without_reconfigure(monkeypatch):
+    monkeypatch.delenv("PYTHONIOENCODING", raising=False)
+    # A stream lacking .reconfigure (e.g. pytest capture) must not raise.
+    monkeypatch.setattr(tc.sys, "stdout", object())
+    monkeypatch.setattr(tc.sys, "stderr", object())
+    tc._force_utf8_io()  # should not raise
+    assert tc.os.environ["PYTHONIOENCODING"] == "utf-8"

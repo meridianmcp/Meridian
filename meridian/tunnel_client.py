@@ -39,6 +39,23 @@ _LOCAL_REQUEST_TIMEOUT = 28.0
 _MAX_BACKOFF = 30.0
 
 
+def _force_utf8_io() -> None:
+    """Make stdio UTF-8 so the tunnel's Unicode status output can't crash.
+
+    Windows consoles default to cp1252; printing the URLs, ✓ marks, and box
+    characters in the startup banner would raise ``UnicodeEncodeError`` and kill
+    the tunnel. Setting ``PYTHONIOENCODING`` propagates UTF-8 to the spawned
+    proxy children, and reconfiguring the live streams fixes the already-started
+    parent process (the env var alone is read only at interpreter startup).
+    """
+    os.environ["PYTHONIOENCODING"] = "utf-8"
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:  # noqa: BLE001 — non-TextIOWrapper streams (e.g. captured in tests)
+            pass
+
+
 # ---------------------------------------------------------------------------
 # Config resolution (pure — unit tested)
 # ---------------------------------------------------------------------------
@@ -141,10 +158,20 @@ def _build_extractor_proxy_command(
     """Build the mcp-proxy command wrapping mcp-server-code-extractor on the given port.
 
     mcp-server-code-extractor is a pure npx package — stateless, no binary to manage.
+
+    The OUTER and INNER commands both use the resolved ``npx`` launcher (a full
+    ``npx.cmd`` path on Windows). On Windows we also pass ``--shell`` so mcp-proxy
+    spawns the inner ``npx.cmd`` through cmd.exe — a bare/direct spawn fails with
+    ENOENT (bare ``npx``) or EINVAL (``.cmd`` under Node 24's CVE-2024-27980
+    mitigation). Passing the full npx path (rather than relying on the child
+    inheriting PATH) also avoids ENOENT when the proxy child has a stripped PATH.
     """
-    return [npx, "-y", "mcp-proxy", "--port", str(port),
-            "--server", "stream", "--stateless", "--",
-            "npx", "-y", "mcp-server-code-extractor"]
+    cmd = [npx, "-y", "mcp-proxy", "--port", str(port),
+           "--server", "stream", "--stateless"]
+    if sys.platform == "win32":
+        cmd.append("--shell")
+    cmd += ["--", npx, "-y", "mcp-server-code-extractor"]
+    return cmd
 
 
 def _managed_bin_dir() -> "Path":
@@ -153,10 +180,22 @@ def _managed_bin_dir() -> "Path":
 
 
 def _find_codebase_memory_mcp() -> str | None:
-    """Return path to codebase-memory-mcp, checking PATH then the managed dir."""
+    """Return path to codebase-memory-mcp, checking PATH, npm global, then managed dir.
+
+    ``shutil.which`` honours PATHEXT, so on Windows it already resolves the npm
+    shim ``codebase-memory-mcp.cmd`` when ``%APPDATA%\\npm`` is on PATH. The
+    explicit npm-global probe is a fallback for when it is not.
+    """
     found = shutil.which("codebase-memory-mcp")
     if found:
         return found
+    # Windows npm global install: %APPDATA%\npm\codebase-memory-mcp.cmd
+    if sys.platform == "win32":
+        appdata = os.environ.get("APPDATA", "")
+        if appdata:
+            shim = Path(appdata) / "npm" / "codebase-memory-mcp.cmd"
+            if shim.exists():
+                return str(shim)
     name = "codebase-memory-mcp.exe" if sys.platform == "win32" else "codebase-memory-mcp"
     managed = _managed_bin_dir() / name
     if managed.exists():
@@ -284,10 +323,21 @@ async def _ensure_codebase_memory_mcp() -> "str | None":
 def _build_code_proxy_command(
     npx: str, binary: str, port: int = DEFAULT_CODE_PROXY_PORT
 ) -> list[str]:
-    """Build the mcp-proxy command wrapping codebase-memory-mcp on the given port."""
-    # codebase-memory-mcp is a native binary — no --shell flag needed.
-    return [npx, "-y", "mcp-proxy", "--port", str(port),
-            "--server", "stream", "--stateless", "--", binary]
+    """Build the mcp-proxy command wrapping codebase-memory-mcp on the given port.
+
+    ``binary`` may be a native executable (the auto-downloaded ``.exe`` in
+    ``~/.meridian/bin``) or an npm shim (``codebase-memory-mcp.cmd`` from a global
+    npm install). On Windows a ``.cmd``/``.bat`` shim must be spawned through a
+    shell (``--shell``) — mcp-proxy's direct spawn hits EINVAL under Node 24's
+    CVE-2024-27980 mitigation. A real ``.exe`` spawns directly (and preserves
+    support for paths with spaces), so ``--shell`` is added only for shims.
+    """
+    cmd = [npx, "-y", "mcp-proxy", "--port", str(port),
+           "--server", "stream", "--stateless"]
+    if sys.platform == "win32" and binary.lower().endswith((".cmd", ".bat")):
+        cmd.append("--shell")
+    cmd += ["--", binary]
+    return cmd
 
 
 def _find_npx() -> str:
@@ -621,6 +671,7 @@ async def run_tunnel(
     code-intel proxy after it starts — so the first session has a fully indexed
     codebase without any manual tool call.
     """
+    _force_utf8_io()
     token = _resolve_token(token)
     if not token:
         print(
