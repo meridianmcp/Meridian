@@ -548,14 +548,20 @@ def _find_npx() -> str:
 
 
 def _build_proxy_command(
-    npx: str, repo_path: str, port: int = DEFAULT_PROXY_PORT
+    npx: str, repo_path: str, port: int = DEFAULT_PROXY_PORT,
+    roots: "list[str] | None" = None,
 ) -> list[str]:
     """Build the ``mcp-proxy`` command that wraps the filesystem MCP server.
 
     Roughly::
 
         npx -y mcp-proxy [--shell] --port <port> -- \
-            npx -y @modelcontextprotocol/server-filesystem <repo_path>
+            npx -y @modelcontextprotocol/server-filesystem <dir1> [<dir2> ...]
+
+    The directories served are *roots* when provided (the tenant's configured
+    ``executor_config.filesystem_roots`` — supports multi-root setups like
+    ``C:\\Users\\me\\Documents`` AND ``D:\\Projects``), otherwise the single
+    *repo_path* (the home-directory default — unchanged behaviour).
 
     The OUTER ``npx`` is the resolved launcher (full ``npx.cmd`` path on Windows,
     so Python's ``subprocess`` can start it). The INNER command is bare ``npx``,
@@ -567,8 +573,9 @@ def _build_proxy_command(
     CVE-2024-27980 mitigation refuses to spawn ``.cmd``/``.bat`` without a shell).
 
     Note: with ``--shell`` mcp-proxy concatenates args unescaped, so a
-    ``repo_path`` containing spaces is not yet supported on Windows.
+    directory containing spaces is not yet supported on Windows.
     """
+    dirs = [r for r in (roots or []) if r and r.strip()] or [repo_path]
     # --server stream: serve only Streamable HTTP (/mcp), no SSE.
     # --stateless: each POST is handled independently — required for the
     #   tunnel relay's one-shot request/response model (no persistent SSE pipe).
@@ -576,8 +583,30 @@ def _build_proxy_command(
            "--server", "stream", "--stateless"]
     if sys.platform == "win32":
         cmd.append("--shell")
-    cmd += ["--", "npx", "-y", "@modelcontextprotocol/server-filesystem", repo_path]
+    cmd += ["--", "npx", "-y", "@modelcontextprotocol/server-filesystem", *dirs]
     return cmd
+
+
+async def _fetch_filesystem_roots(base_url: str, token: str) -> "list[str]":
+    """GET /tunnel/filesystem-roots — the dirs the fs connector may serve.
+
+    Returns the tenant's configured roots (unioned across projects), or an empty
+    list on any error so the caller falls back to the home-directory default.
+    """
+    import httpx
+
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            r = await client.get(
+                f"{base_url}/tunnel/filesystem-roots",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            if r.status_code == 200:
+                roots = (r.json() or {}).get("filesystem_roots") or []
+                return [str(x).strip() for x in roots if isinstance(x, str) and x.strip()]
+    except Exception:  # noqa: BLE001 — network/parse error → defaults
+        pass
+    return []
 
 
 # ---------------------------------------------------------------------------
@@ -945,6 +974,10 @@ async def run_tunnel(
     ppt_port = int(ppt_plugin.get("port") or 8811)
     word_port = int(word_plugin.get("port") or 8812)
 
+    # Filesystem connector roots (executor_config.filesystem_roots, unioned across
+    # the tenant's projects). Empty → fall back to the home dir (repo_path).
+    fs_roots = await _fetch_filesystem_roots(base_url, token)
+
     # 2. Spawn filesystem proxy (slot "fs"). Honour an enable toggle + command
     #    override; the default (no override) keeps the exact filesystem builder.
     npx = _find_npx()
@@ -953,9 +986,10 @@ async def run_tunnel(
         fs_override = fs_plugin.get("command")
         cmd_fs = (
             _build_proxy_for_inner(npx, list(fs_override), fs_port)
-            if fs_override else _build_proxy_command(npx, repo_path, fs_port)
+            if fs_override else _build_proxy_command(npx, repo_path, fs_port, roots=fs_roots)
         )
-        print(f"meridian tunnel: serving {repo_path}", flush=True)
+        _served = ", ".join(fs_roots) if fs_roots else repo_path
+        print(f"meridian tunnel: serving {_served}", flush=True)
         print(f"  filesystem proxy: http://127.0.0.1:{fs_port}", flush=True)
         try:
             proc_fs = subprocess.Popen(cmd_fs)

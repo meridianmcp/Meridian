@@ -32,7 +32,7 @@ from fastapi import APIRouter, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import Response
 
 from .. import db as db_module
-from .._deps import _hosted_mode, _get_tenant_from_request
+from .._deps import _hosted_mode, _get_tenant_from_request, _db
 from ..tunnel_plugins import normalize_plugins_config, resolve_plugins
 
 router = APIRouter()
@@ -838,6 +838,48 @@ def _json_response(payload: dict, status_code: int = 200) -> Response:
         status_code=status_code,
         media_type="application/json",
     )
+
+
+def _union_filesystem_roots(projects: list[dict]) -> list[str]:
+    """Collect a deduped, order-preserved list of executor_config.filesystem_roots
+    across the given project rows. executor_config may be a JSON string or dict."""
+    roots: list[str] = []
+    seen: set[str] = set()
+    for p in projects:
+        raw = p.get("executor_config")
+        if isinstance(raw, str) and raw.strip():
+            try:
+                raw = json.loads(raw)
+            except Exception:  # noqa: BLE001
+                continue
+        if not isinstance(raw, dict):
+            continue
+        for r in (raw.get("filesystem_roots") or []):
+            if isinstance(r, str) and r.strip() and r.strip() not in seen:
+                seen.add(r.strip())
+                roots.append(r.strip())
+    return roots
+
+
+@router.get("/tunnel/filesystem-roots")
+async def get_tunnel_filesystem_roots(request: Request) -> Response:
+    """Return the directories the tunnel's filesystem connector may read.
+
+    The dashboard stores these per-project under ``executor_config.filesystem_roots``
+    (Settings → Executor Config). The tunnel is tenant-scoped, so this unions the
+    roots across all of the tenant's projects. An empty list means the client
+    falls back to the user's home directory (current default behaviour). Best-effort:
+    any DB error yields an empty list rather than failing the tunnel.
+    """
+    tenant = await _get_tenant_from_request(request)
+    if tenant is None:
+        return _json_response({"filesystem_roots": []})
+    try:
+        db = await _db(request)
+        projects = await db_module.list_projects(db)
+    except Exception:  # noqa: BLE001 — unprovisioned/unreachable DB → defaults
+        projects = []
+    return _json_response({"filesystem_roots": _union_filesystem_roots(projects)})
 
 
 # ---------------------------------------------------------------------------

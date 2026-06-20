@@ -1781,6 +1781,22 @@ export async function loadSettingsTab(projectId) {
 
     </div>
 
+    <div style="margin-bottom:10px">
+
+      <div style="font-size:10px;color:var(--muted);margin-bottom:4px">Filesystem Roots<br><span style="font-size:9px;color:var(--muted)">Directories the tunnel filesystem connector can read. Default: your home directory.</span></div>
+
+      <div id="exec-fs-roots-tbl-${projectId}" style="font-size:10px;font-family:var(--font-mono);margin-bottom:6px"></div>
+
+      <div style="display:flex;gap:6px">
+
+        <input id="exec-fs-roots-input-${projectId}" type="text" placeholder="e.g. C:\\Users\\you\\Documents" style="flex:1;background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:3px 6px">
+
+        <button id="exec-fs-roots-add-${projectId}" class="secondary" style="font-size:9px;padding:2px 10px">Add</button>
+
+      </div>
+
+    </div>
+
     <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px 12px">
 
       <label style="font-size:10px;color:var(--muted)">env_file<br><input id="exec-env_file-${projectId}" type="text" placeholder=".env file path" style="width:100%;background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:3px 6px;margin-top:2px" value="${escapeHtml(String(execCfg.env_file || ''))}"></label>
@@ -1864,6 +1880,39 @@ export async function loadSettingsTab(projectId) {
     const _clearRpBtn = document.getElementById(`exec-clear-paths-${projectId}`);
     if (_clearRpBtn) { _clearRpBtn.onclick = () => { _execRepoPaths = []; _rerenderRpTbl(); }; }
 
+    // Wire filesystem_roots add/remove list (plain directory strings)
+    let _execFsRoots = Array.isArray(execCfg.filesystem_roots)
+      ? execCfg.filesystem_roots.filter(r => typeof r === 'string' && r.trim()).map(r => r.trim())
+      : [];
+    const _fsTblEl = document.getElementById(`exec-fs-roots-tbl-${projectId}`);
+    const _rerenderFsTbl = () => {
+      if (!_fsTblEl) return;
+      if (!_execFsRoots.length) {
+        _fsTblEl.innerHTML = '<div style="color:var(--muted);font-style:italic;font-size:10px">None — defaults to your home directory.</div>';
+        return;
+      }
+      _fsTblEl.innerHTML = '<table style="width:100%;border-collapse:collapse">' +
+        _execFsRoots.map((p, i) => `<tr>
+          <td style="padding:2px 6px 2px 0;color:var(--text);font-size:10px;font-family:var(--font-mono)">${escapeHtml(p)}</td>
+          <td style="padding:2px 0;text-align:right"><button class="exec-del-fs-row" data-idx="${i}" style="font-size:9px;padding:1px 6px;background:transparent;border:1px solid var(--border);border-radius:3px;color:var(--muted);cursor:pointer">✕</button></td>
+        </tr>`).join('') + '</table>';
+      _fsTblEl.querySelectorAll('.exec-del-fs-row').forEach(b => {
+        b.onclick = () => { _execFsRoots.splice(parseInt(b.dataset.idx, 10), 1); _rerenderFsTbl(); };
+      });
+    };
+    _rerenderFsTbl();
+    const _fsInput = document.getElementById(`exec-fs-roots-input-${projectId}`);
+    const _fsAddBtn = document.getElementById(`exec-fs-roots-add-${projectId}`);
+    const _addFsRoot = () => {
+      const v = (_fsInput?.value || '').trim();
+      if (!v) return;
+      if (!_execFsRoots.includes(v)) _execFsRoots.push(v);
+      if (_fsInput) _fsInput.value = '';
+      _rerenderFsTbl();
+    };
+    if (_fsAddBtn) _fsAddBtn.onclick = _addFsRoot;
+    if (_fsInput) _fsInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); _addFsRoot(); } });
+
     saveBtn.onclick = async () => {
 
       saveBtn.disabled = true;
@@ -1873,6 +1922,7 @@ export async function loadSettingsTab(projectId) {
       const cfg = {};
 
       cfg.repo_paths = _execRepoPaths;
+      cfg.filesystem_roots = _execFsRoots;
       if (Array.isArray(execCfg.hostnames)) cfg.hostnames = execCfg.hostnames;
 
       for (const f of fields) {
