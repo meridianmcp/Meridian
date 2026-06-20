@@ -1,14 +1,17 @@
 """Tests for the `meridian --tunnel` client (meridian/tunnel_client.py).
 
 Covers config resolution, URL building, the npx/proxy command construction,
-and the request-relay framing (via an httpx MockTransport). Network and
-subprocess orchestration in run_tunnel() is not exercised here.
+asset selection, auto-download logic, and the request-relay framing (via an
+httpx MockTransport). Network and subprocess orchestration in run_tunnel() is
+not exercised here.
 """
 from __future__ import annotations
 
 import asyncio
 import base64
 import json
+from pathlib import Path
+from unittest.mock import AsyncMock, patch
 
 import httpx
 import pytest
@@ -159,15 +162,8 @@ def test_build_proxy_command_uses_shell_on_windows(monkeypatch):
     assert "--shell" not in tc._build_proxy_command("npx", "/repo")
 
 
-def test_build_code_proxy_command_returns_none_when_missing(monkeypatch):
-    monkeypatch.setattr(tc.shutil, "which", lambda name: None)
-    assert tc._build_code_proxy_command("npx") is None
-
-
-def test_build_code_proxy_command_structure(monkeypatch):
-    monkeypatch.setattr(tc.shutil, "which", lambda name: "/usr/local/bin/codebase-memory-mcp")
-    cmd = tc._build_code_proxy_command("npx", port=9009)
-    assert cmd is not None
+def test_build_code_proxy_command_structure():
+    cmd = tc._build_code_proxy_command("npx", "/usr/local/bin/codebase-memory-mcp", port=9009)
     assert cmd[0] == "npx"
     assert "mcp-proxy" in cmd
     assert "--port" in cmd
@@ -180,6 +176,158 @@ def test_build_code_proxy_command_structure(monkeypatch):
     assert cmd[sep + 1] == "/usr/local/bin/codebase-memory-mcp"
     # codebase-memory-mcp is a native binary — no --shell needed
     assert "--shell" not in cmd
+
+
+# ---------------------------------------------------------------------------
+# _find_codebase_memory_mcp — PATH + managed dir
+# ---------------------------------------------------------------------------
+
+def test_find_codebase_memory_mcp_checks_path(monkeypatch):
+    monkeypatch.setattr(tc.shutil, "which", lambda name: "/usr/bin/codebase-memory-mcp")
+    assert tc._find_codebase_memory_mcp() == "/usr/bin/codebase-memory-mcp"
+
+
+def test_find_codebase_memory_mcp_checks_managed_dir(monkeypatch, tmp_path):
+    monkeypatch.setattr(tc.shutil, "which", lambda name: None)
+    monkeypatch.setattr(tc, "_managed_bin_dir", lambda: tmp_path)
+    # Create the binary in the managed dir.
+    bin_name = "codebase-memory-mcp.exe" if tc.sys.platform == "win32" else "codebase-memory-mcp"
+    (tmp_path / bin_name).touch()
+    result = tc._find_codebase_memory_mcp()
+    assert result == str(tmp_path / bin_name)
+
+
+def test_find_codebase_memory_mcp_returns_none_when_absent(monkeypatch, tmp_path):
+    monkeypatch.setattr(tc.shutil, "which", lambda name: None)
+    monkeypatch.setattr(tc, "_managed_bin_dir", lambda: tmp_path)
+    assert tc._find_codebase_memory_mcp() is None
+
+
+# ---------------------------------------------------------------------------
+# _pick_release_asset
+# ---------------------------------------------------------------------------
+
+_FAKE_ASSETS = [
+    {"name": "codebase-memory-mcp-x86_64-pc-windows-msvc.exe", "browser_download_url": "https://gh/win.exe"},
+    {"name": "codebase-memory-mcp-x86_64-unknown-linux-musl",  "browser_download_url": "https://gh/linux"},
+    {"name": "codebase-memory-mcp-aarch64-apple-darwin",        "browser_download_url": "https://gh/mac-arm"},
+    {"name": "codebase-memory-mcp-x86_64-apple-darwin",         "browser_download_url": "https://gh/mac-x64"},
+    {"name": "codebase-memory-mcp-source.tar.gz",               "browser_download_url": "https://gh/src.tar.gz"},
+]
+
+
+def test_pick_release_asset_windows(monkeypatch):
+    monkeypatch.setattr(tc.sys, "platform", "win32")
+    import platform as _p
+    monkeypatch.setattr(_p, "machine", lambda: "AMD64")
+    asset = tc._pick_release_asset(_FAKE_ASSETS)
+    assert asset is not None
+    assert asset["name"].endswith(".exe")
+
+
+def test_pick_release_asset_linux(monkeypatch):
+    monkeypatch.setattr(tc.sys, "platform", "linux")
+    import platform as _p
+    monkeypatch.setattr(_p, "machine", lambda: "x86_64")
+    asset = tc._pick_release_asset(_FAKE_ASSETS)
+    assert asset is not None
+    assert "linux" in asset["name"]
+    assert not asset["name"].endswith(".tar.gz")
+
+
+def test_pick_release_asset_macos_arm(monkeypatch):
+    monkeypatch.setattr(tc.sys, "platform", "darwin")
+    import platform as _p
+    monkeypatch.setattr(_p, "machine", lambda: "arm64")
+    asset = tc._pick_release_asset(_FAKE_ASSETS)
+    assert asset is not None
+    assert "aarch64" in asset["name"] or "arm64" in asset["name"]
+
+
+def test_pick_release_asset_returns_none_for_empty():
+    assert tc._pick_release_asset([]) is None
+
+
+# ---------------------------------------------------------------------------
+# _ensure_codebase_memory_mcp — find-or-download
+# ---------------------------------------------------------------------------
+
+def test_ensure_returns_existing_binary(monkeypatch):
+    monkeypatch.setattr(tc, "_find_codebase_memory_mcp", lambda: "/usr/bin/codebase-memory-mcp")
+    result = asyncio.run(tc._ensure_codebase_memory_mcp())
+    assert result == "/usr/bin/codebase-memory-mcp"
+
+
+def test_ensure_downloads_when_missing(monkeypatch):
+    monkeypatch.setattr(tc, "_find_codebase_memory_mcp", lambda: None)
+    monkeypatch.setattr(tc, "_download_codebase_memory_mcp", AsyncMock(return_value="/tmp/codebase-memory-mcp"))
+    result = asyncio.run(tc._ensure_codebase_memory_mcp())
+    assert result == "/tmp/codebase-memory-mcp"
+
+
+def test_ensure_returns_none_on_download_failure(monkeypatch):
+    monkeypatch.setattr(tc, "_find_codebase_memory_mcp", lambda: None)
+    monkeypatch.setattr(tc, "_download_codebase_memory_mcp", AsyncMock(return_value=None))
+    result = asyncio.run(tc._ensure_codebase_memory_mcp())
+    assert result is None
+
+
+def test_download_codebase_memory_mcp_installs_binary(monkeypatch, tmp_path):
+    """_download_codebase_memory_mcp writes binary and returns its path."""
+    monkeypatch.setattr(tc, "_managed_bin_dir", lambda: tmp_path)
+
+    fake_release = {
+        "tag_name": "v1.2.3",
+        "assets": [
+            {"name": "codebase-memory-mcp-x86_64-unknown-linux-musl",
+             "browser_download_url": "https://gh/linux"},
+        ],
+    }
+    fake_content = b"\x7fELF fake binary"
+
+    def make_mock_client(*args, **kwargs):
+        class FakeResp:
+            def raise_for_status(self): pass
+            def json(self): return fake_release
+            content = fake_content
+
+        class FakeClient:
+            async def __aenter__(self): return self
+            async def __aexit__(self, *a): pass
+            async def get(self, url, **kw): return FakeResp()
+
+        return FakeClient()
+
+    monkeypatch.setattr(tc.sys, "platform", "linux")
+    monkeypatch.setattr(tc, "_pick_release_asset", lambda assets: assets[0])
+
+    import httpx as _httpx
+    monkeypatch.setattr(_httpx, "AsyncClient", make_mock_client)
+
+    result = asyncio.run(tc._download_codebase_memory_mcp())
+    assert result is not None
+    dest = tmp_path / "codebase-memory-mcp"
+    assert dest.exists()
+    assert dest.read_bytes() == fake_content
+
+
+def test_download_codebase_memory_mcp_returns_none_on_http_error(monkeypatch, tmp_path):
+    monkeypatch.setattr(tc, "_managed_bin_dir", lambda: tmp_path)
+
+    def make_error_client(*args, **kwargs):
+        class FakeClient:
+            async def __aenter__(self): return self
+            async def __aexit__(self, *a): pass
+            async def get(self, url, **kw):
+                raise Exception("network error")
+
+        return FakeClient()
+
+    import httpx as _httpx
+    monkeypatch.setattr(_httpx, "AsyncClient", make_error_client)
+
+    result = asyncio.run(tc._download_codebase_memory_mcp())
+    assert result is None
 
 
 # ---------------------------------------------------------------------------

@@ -116,23 +116,131 @@ def _permanent_code_url(base_url: str, tenant_id: str) -> str:
     return f"{base_url.rstrip('/')}/code/mcp/{tenant_id}/mcp"
 
 
+def _managed_bin_dir() -> "Path":
+    """~/.meridian/bin — where auto-downloaded binaries are installed."""
+    return Path.home() / ".meridian" / "bin"
+
+
 def _find_codebase_memory_mcp() -> str | None:
-    """Return the path to the codebase-memory-mcp binary, or None if not installed."""
-    return shutil.which("codebase-memory-mcp")
+    """Return path to codebase-memory-mcp, checking PATH then the managed dir."""
+    found = shutil.which("codebase-memory-mcp")
+    if found:
+        return found
+    name = "codebase-memory-mcp.exe" if sys.platform == "win32" else "codebase-memory-mcp"
+    managed = _managed_bin_dir() / name
+    if managed.exists():
+        return str(managed)
+    return None
+
+
+def _pick_release_asset(assets: list[dict]) -> "dict | None":
+    """Pick the best GitHub release asset for the current platform and arch."""
+    import platform as _platform
+
+    machine = _platform.machine().lower()
+    is_arm = machine in ("arm64", "aarch64")
+
+    if sys.platform == "win32":
+        os_kws = ["win", "windows"]
+    elif sys.platform == "darwin":
+        os_kws = ["darwin", "macos", "mac", "apple"]
+    else:
+        os_kws = ["linux"]
+    arch_kws = ["aarch64", "arm64"] if is_arm else ["x86_64", "amd64", "x64"]
+
+    def _score(name: str) -> int:
+        n = name.lower()
+        s = 0
+        for kw in os_kws:
+            if kw in n:
+                s += 10
+                break
+        for kw in arch_kws:
+            if kw in n:
+                s += 5
+                break
+        if sys.platform == "win32" and n.endswith(".exe"):
+            s += 3
+        elif sys.platform != "win32" and not any(n.endswith(e) for e in (".exe", ".zip", ".tar.gz", ".tgz")):
+            s += 1
+        if any(n.endswith(e) for e in (".tar.gz", ".tgz", ".zip")):
+            s -= 5
+        return s
+
+    candidates = [
+        (a, _score(a["name"]))
+        for a in assets
+        if a.get("name") and a.get("browser_download_url")
+    ]
+    candidates.sort(key=lambda x: x[1], reverse=True)
+    if not candidates or candidates[0][1] <= 0:
+        return None
+    return candidates[0][0]
+
+
+async def _download_codebase_memory_mcp() -> "str | None":
+    """Download the latest codebase-memory-mcp release for this platform.
+
+    Saves to ~/.meridian/bin/ and makes the file executable. Returns the path
+    on success, None on failure (error printed to stderr).
+    """
+    import httpx
+
+    bin_dir = _managed_bin_dir()
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    bin_name = "codebase-memory-mcp.exe" if sys.platform == "win32" else "codebase-memory-mcp"
+    dest = bin_dir / bin_name
+
+    print("  code-intel: codebase-memory-mcp not found — downloading from GitHub...", flush=True)
+
+    api_url = "https://api.github.com/repos/DeusData/codebase-memory-mcp/releases/latest"
+    try:
+        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+            r = await client.get(api_url, headers={"Accept": "application/vnd.github+json"})
+            r.raise_for_status()
+            release = r.json()
+
+        assets = release.get("assets", [])
+        asset = _pick_release_asset(assets)
+        if asset is None:
+            print(
+                "  code-intel: no suitable binary found in the GitHub release — "
+                "install codebase-memory-mcp manually and re-run `meridian --tunnel`.",
+                file=sys.stderr, flush=True,
+            )
+            return None
+
+        version = release.get("tag_name", "unknown")
+        print(f"  code-intel: downloading {asset['name']} ({version})...", flush=True)
+
+        async with httpx.AsyncClient(timeout=120.0, follow_redirects=True) as client:
+            r = await client.get(asset["browser_download_url"])
+            r.raise_for_status()
+            dest.write_bytes(r.content)
+
+        if sys.platform != "win32":
+            dest.chmod(dest.stat().st_mode | 0o111)  # make executable
+
+        print(f"  code-intel: installed to {dest}", flush=True)
+        return str(dest)
+    except Exception as exc:
+        print(f"  code-intel: download failed ({exc})", file=sys.stderr, flush=True)
+        return None
+
+
+async def _ensure_codebase_memory_mcp() -> "str | None":
+    """Return path to codebase-memory-mcp, auto-downloading if not already installed."""
+    found = _find_codebase_memory_mcp()
+    if found:
+        return found
+    return await _download_codebase_memory_mcp()
 
 
 def _build_code_proxy_command(
-    npx: str, port: int = DEFAULT_CODE_PROXY_PORT
-) -> list[str] | None:
-    """Build the mcp-proxy command wrapping codebase-memory-mcp on the given port.
-
-    Returns None when codebase-memory-mcp is not installed — caller skips the
-    code tunnel gracefully.
-    """
-    binary = _find_codebase_memory_mcp()
-    if binary is None:
-        return None
-    # codebase-memory-mcp is a native binary, not an npm package — no --shell needed.
+    npx: str, binary: str, port: int = DEFAULT_CODE_PROXY_PORT
+) -> list[str]:
+    """Build the mcp-proxy command wrapping codebase-memory-mcp on the given port."""
+    # codebase-memory-mcp is a native binary — no --shell flag needed.
     return [npx, "-y", "mcp-proxy", "--port", str(port),
             "--server", "stream", "--stateless", "--", binary]
 
@@ -368,10 +476,15 @@ async def run_tunnel(
         )
         return 1
 
-    # 3. Optionally spawn codebase-memory-mcp proxy.
+    # 3. Optionally spawn codebase-memory-mcp proxy (auto-install if not found).
     proc_code: subprocess.Popen | None = None
-    cmd_code = _build_code_proxy_command(npx, code_port)
-    if cmd_code is not None:
+    code_binary = await _ensure_codebase_memory_mcp()
+    if code_binary is not None:
+        # Ensure managed bin dir is on PATH so child processes can find the binary too.
+        managed_bin = str(_managed_bin_dir())
+        if managed_bin not in os.environ.get("PATH", ""):
+            os.environ["PATH"] = managed_bin + os.pathsep + os.environ.get("PATH", "")
+        cmd_code = _build_code_proxy_command(npx, code_binary, code_port)
         print(f"  code-intel proxy:  http://127.0.0.1:{code_port}", flush=True)
         try:
             proc_code = subprocess.Popen(cmd_code)
@@ -380,7 +493,7 @@ async def run_tunnel(
             proc_code = None
     else:
         print(
-            "  code-intel:        not available (install codebase-memory-mcp to enable)",
+            "  code-intel:        not available (codebase-memory-mcp could not be installed)",
             flush=True,
         )
 
