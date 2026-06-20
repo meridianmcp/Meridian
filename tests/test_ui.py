@@ -499,3 +499,21 @@ def test_settings_tab_renderer_is_not_duplicated():
         "dashboard-settings.js must append the Executor Rules section via "
         "window.loadExecutorRulesSection so the full settings tab includes it"
     )
+
+
+def test_known_locations_has_manual_path_entry(js):
+    """Item a89bb60d — Known Locations card has a manual path-entry form (cwd +
+    hostname inputs + Add button) that merges into executor_config.repo_paths and
+    persists via GET-merge-PATCH."""
+    # Inputs + Add button present in the rendered card.
+    assert "exec-ez-add-cwd-" in js, "manual cwd input missing"
+    assert "exec-ez-add-host-" in js, "manual hostname input missing"
+    assert "exec-ez-add-btn-" in js, "Add button missing"
+    # Hostname input pre-fills from registered machines (datalist of known hosts).
+    assert "exec-ez-host-options-" in js, "hostname datalist (registered machines) missing"
+    # Add handler GETs settings, merges into repo_paths, and PATCHes back.
+    assert "_doAddPath" in js, "Add handler missing"
+    assert "cfg.repo_paths = paths" in js, "Add handler must merge into repo_paths"
+    assert "saveProjectSettings(projectId, { executor_config: cfg })" in js, (
+        "Add handler must persist via saveProjectSettings (PATCH settings)"
+    )

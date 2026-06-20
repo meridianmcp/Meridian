@@ -787,6 +787,12 @@ export async function loadSettingsTab(projectId) {
             </tr>`).join('') + '</table>'
           : '<div style="color:var(--muted);font-style:italic;font-size:10px">No path overrides — machine-level routing handles most cases.</div>'
       }</div>
+      <div style="display:flex;gap:6px;margin-bottom:8px">
+        <input id="exec-ez-add-cwd-${projectId}" type="text" placeholder="cwd e.g. C:\\Users\\you\\project" style="flex:2;box-sizing:border-box;background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:3px 6px">
+        <input id="exec-ez-add-host-${projectId}" type="text" placeholder="hostname" list="exec-ez-host-options-${projectId}" value="${escapeHtml(String((_klHosts[0] && _klHosts[0].hostname) || ''))}" style="flex:1;box-sizing:border-box;background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:3px 6px">
+        <button id="exec-ez-add-btn-${projectId}" class="secondary" style="font-size:10px;padding:3px 10px">Add</button>
+      </div>
+      <datalist id="exec-ez-host-options-${projectId}">${_klHosts.map(h => `<option value="${escapeHtml(String(h.hostname || ''))}"></option>`).join('')}</datalist>
       <div style="display:flex;gap:8px;align-items:center">
         <button id="exec-ez-save-${projectId}" class="primary" style="font-size:10px;padding:3px 10px">Save</button>
         <button id="exec-ez-clear-${projectId}" class="secondary" style="font-size:10px;padding:3px 10px">Clear all</button>
@@ -3237,6 +3243,39 @@ export async function loadSettingsTab(projectId) {
       });
     };
     _wirePathBtns();
+
+    // Manual path entry: GET current settings, merge {cwd, hostname} into
+    // executor_config.repo_paths (deduped), PATCH back — so a hand-added path
+    // persists immediately and coexists with hook-registered entries.
+    const _ezAddBtn = document.getElementById(`exec-ez-add-btn-${projectId}`);
+    const _ezAddCwd = document.getElementById(`exec-ez-add-cwd-${projectId}`);
+    const _ezAddHost = document.getElementById(`exec-ez-add-host-${projectId}`);
+    const _doAddPath = async () => {
+      const cwd = (_ezAddCwd?.value || '').trim();
+      const hostname = (_ezAddHost?.value || '').trim();
+      if (!cwd) { if (ezStatus) ezStatus.textContent = 'Enter a cwd path.'; return; }
+      if (_ezAddBtn) _ezAddBtn.disabled = true;
+      try {
+        const settings = await api(`/projects/${projectId}/settings`);
+        const cfg = (settings && settings.executor_config) || {};
+        const paths = Array.isArray(cfg.repo_paths) ? cfg.repo_paths.slice() : [];
+        const dup = paths.some(p => (p.cwd || '').trim() === cwd && (p.hostname || '').trim() === hostname);
+        if (!dup) paths.push({ cwd, hostname });
+        cfg.repo_paths = paths;
+        delete cfg.repo_path;
+        await saveProjectSettings(projectId, { executor_config: cfg });
+        _ezPaths = paths;            // keep in-memory state in sync with persisted
+        _rerenderPathsTbl();
+        if (_ezAddCwd) _ezAddCwd.value = '';
+        if (ezStatus) { ezStatus.textContent = dup ? 'Already present.' : 'Added.'; setTimeout(() => { if (ezStatus) ezStatus.textContent = ''; }, 2000); }
+      } catch (e) {
+        if (ezStatus) ezStatus.textContent = `Add failed: ${String(e)}`;
+      } finally {
+        if (_ezAddBtn) _ezAddBtn.disabled = false;
+      }
+    };
+    if (_ezAddBtn) _ezAddBtn.onclick = _doAddPath;
+    if (_ezAddCwd) _ezAddCwd.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); _doAddPath(); } });
 
     if (ezClearBtn) {
       ezClearBtn.onclick = () => {
