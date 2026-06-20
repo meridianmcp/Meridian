@@ -195,8 +195,10 @@ def test_build_code_proxy_command_structure():
 
 
 def test_build_extractor_proxy_command_structure(monkeypatch):
+    # mcp-proxy (outer) is npm; the inner launcher is the PyPI extractor (uvx here).
     monkeypatch.setattr(tc.sys, "platform", "linux")
-    cmd = tc._build_extractor_proxy_command("npx", port=9010)
+    inner = ["uvx", "mcp-server-code-extractor"]
+    cmd = tc._build_extractor_proxy_command("npx", inner, port=9010)
     assert cmd[0] == "npx"
     assert "mcp-proxy" in cmd
     assert "--port" in cmd
@@ -205,24 +207,113 @@ def test_build_extractor_proxy_command_structure(monkeypatch):
     assert "stream" in cmd
     assert "--stateless" in cmd
     sep = cmd.index("--")
-    # Inner command must be: npx -y mcp-server-code-extractor
-    assert cmd[sep + 1] == "npx"
-    assert "mcp-server-code-extractor" in cmd[sep:]
-    # No --shell on non-Windows (direct spawn of npx works).
+    # Inner command is the resolved extractor launcher, NOT npx.
+    assert cmd[sep + 1:] == inner
+    # No --shell on non-Windows.
     assert "--shell" not in cmd
 
 
-def test_build_extractor_proxy_command_uses_shell_and_full_npx_on_windows(monkeypatch):
-    # On Windows the inner npx must be spawned through a shell (bare npx → ENOENT,
-    # npx.cmd → EINVAL under Node 24), and the full npx path is passed explicitly
-    # so the proxy child doesn't depend on inheriting PATH.
+def test_build_extractor_proxy_command_no_shell_for_uvx_exe_on_windows(monkeypatch):
+    # uvx.exe is a real executable → spawns directly, no --shell needed.
     monkeypatch.setattr(tc.sys, "platform", "win32")
-    npx_path = r"C:\Users\13144\AppData\Roaming\npm\npx.cmd"
-    cmd = tc._build_extractor_proxy_command(npx_path, port=9010)
+    inner = [r"C:\Users\13144\.local\bin\uvx.exe", "mcp-server-code-extractor"]
+    cmd = tc._build_extractor_proxy_command(r"C:\npm\npx.cmd", inner, port=9010)
+    assert "--shell" not in cmd
+    sep = cmd.index("--")
+    assert cmd[sep + 1:] == inner
+
+
+def test_build_extractor_proxy_command_shell_for_cmd_inner_on_windows(monkeypatch):
+    # A .cmd/.bat inner launcher must go through a shell on Windows.
+    monkeypatch.setattr(tc.sys, "platform", "win32")
+    inner = [r"C:\some\tool.cmd", "mcp-server-code-extractor"]
+    cmd = tc._build_extractor_proxy_command(r"C:\npm\npx.cmd", inner, port=9010)
     assert "--shell" in cmd
     sep = cmd.index("--")
-    assert cmd[sep + 1] == npx_path  # inner uses the full npx path, not bare "npx"
-    assert "mcp-server-code-extractor" in cmd[sep:]
+    assert cmd[sep + 1:] == inner
+
+
+def test_build_extractor_proxy_command_python_module_inner(monkeypatch):
+    # pip fallback: inner is `python -m code_extractor`.
+    monkeypatch.setattr(tc.sys, "platform", "linux")
+    inner = ["/env/bin/python", "-m", "code_extractor"]
+    cmd = tc._build_extractor_proxy_command("npx", inner, port=9010)
+    sep = cmd.index("--")
+    assert cmd[sep + 1:] == ["/env/bin/python", "-m", "code_extractor"]
+
+
+# ---------------------------------------------------------------------------
+# _find_uvx / _resolve_extractor_inner_cmd
+# ---------------------------------------------------------------------------
+
+def test_find_uvx_from_path(monkeypatch):
+    monkeypatch.setattr(tc.shutil, "which", lambda name: "/usr/local/bin/uvx" if name == "uvx" else None)
+    assert tc._find_uvx() == "/usr/local/bin/uvx"
+
+
+def test_find_uvx_local_bin_fallback(monkeypatch, tmp_path):
+    monkeypatch.setattr(tc.shutil, "which", lambda name: None)
+    monkeypatch.setattr(tc.sys, "platform", "linux")
+    monkeypatch.setattr(tc.Path, "home", staticmethod(lambda: tmp_path))
+    uvx = tmp_path / ".local" / "bin" / "uvx"
+    uvx.parent.mkdir(parents=True)
+    uvx.touch()
+    assert tc._find_uvx() == str(uvx)
+
+
+def test_find_uvx_returns_none_when_absent(monkeypatch, tmp_path):
+    monkeypatch.setattr(tc.shutil, "which", lambda name: None)
+    monkeypatch.setattr(tc.Path, "home", staticmethod(lambda: tmp_path))
+    assert tc._find_uvx() is None
+
+
+def test_resolve_extractor_inner_prefers_uvx(monkeypatch):
+    monkeypatch.setattr(tc, "_find_uvx", lambda: "/usr/local/bin/uvx")
+    assert tc._resolve_extractor_inner_cmd() == ["/usr/local/bin/uvx", "mcp-server-code-extractor"]
+
+
+def test_resolve_extractor_inner_pip_fallback_when_no_uvx(monkeypatch):
+    monkeypatch.setattr(tc, "_find_uvx", lambda: None)
+    import importlib.util as _ilu
+    # Package not yet importable → triggers pip install.
+    monkeypatch.setattr(_ilu, "find_spec", lambda name: None)
+    installed = {}
+
+    def fake_run(cmd, **kw):
+        installed["cmd"] = cmd
+        return None  # subprocess.run(..., check=True) return value is unused
+
+    monkeypatch.setattr(tc.subprocess, "run", fake_run)
+    monkeypatch.setattr(tc.sys, "executable", "/env/bin/python")
+    result = tc._resolve_extractor_inner_cmd()
+    assert result == ["/env/bin/python", "-m", "code_extractor"]
+    # pip install was attempted for the PyPI package.
+    assert installed["cmd"][:4] == ["/env/bin/python", "-m", "pip", "install"]
+    assert "mcp-server-code-extractor" in installed["cmd"]
+
+
+def test_resolve_extractor_inner_skips_install_when_already_present(monkeypatch):
+    monkeypatch.setattr(tc, "_find_uvx", lambda: None)
+    import importlib.util as _ilu
+    monkeypatch.setattr(_ilu, "find_spec", lambda name: object())  # already importable
+    called = {"run": False}
+    monkeypatch.setattr(tc.subprocess, "run", lambda *a, **k: called.__setitem__("run", True))
+    monkeypatch.setattr(tc.sys, "executable", "/env/bin/python")
+    result = tc._resolve_extractor_inner_cmd()
+    assert result == ["/env/bin/python", "-m", "code_extractor"]
+    assert called["run"] is False  # no pip install when already present
+
+
+def test_resolve_extractor_inner_returns_none_on_install_failure(monkeypatch):
+    monkeypatch.setattr(tc, "_find_uvx", lambda: None)
+    import importlib.util as _ilu
+    monkeypatch.setattr(_ilu, "find_spec", lambda name: None)
+
+    def boom(*a, **k):
+        raise RuntimeError("pip exploded")
+
+    monkeypatch.setattr(tc.subprocess, "run", boom)
+    assert tc._resolve_extractor_inner_cmd() is None
 
 
 def test_build_code_proxy_command_uses_shell_for_cmd_shim_on_windows(monkeypatch):

@@ -152,25 +152,72 @@ def _permanent_extract_url(base_url: str, tenant_id: str) -> str:
     return f"{base_url.rstrip('/')}/extract/mcp/{tenant_id}/mcp"
 
 
+def _find_uvx() -> "str | None":
+    """Locate the ``uvx`` launcher (uv's ephemeral-tool runner)."""
+    found = shutil.which("uvx")
+    if found:
+        return found
+    # uv's standalone installer drops uvx in ~/.local/bin on every platform.
+    name = "uvx.exe" if sys.platform == "win32" else "uvx"
+    candidate = Path.home() / ".local" / "bin" / name
+    if candidate.exists():
+        return str(candidate)
+    return None
+
+
+def _resolve_extractor_inner_cmd() -> "list[str] | None":
+    """Resolve the launcher for mcp-server-code-extractor (a **PyPI** package).
+
+    It is published on PyPI, not npm. Preferred: ``uvx mcp-server-code-extractor``
+    (zero install, ephemeral). Fallback: pip-install the package into the current
+    interpreter's environment and run it as ``python -m code_extractor`` (the
+    module is ``code_extractor``). Returns the inner-command token list, or None
+    if neither path is available.
+    """
+    uvx = _find_uvx()
+    if uvx:
+        return [uvx, "mcp-server-code-extractor"]
+    # Fallback: ensure the package is importable in this env, then run as a module.
+    import importlib.util
+    if importlib.util.find_spec("code_extractor") is None:
+        print(
+            "  code-extractor: uvx not found — pip installing mcp-server-code-extractor...",
+            flush=True,
+        )
+        try:
+            subprocess.run(
+                [sys.executable, "-m", "pip", "install", "mcp-server-code-extractor"],
+                check=True,
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(
+                f"  warning: could not pip install mcp-server-code-extractor: {exc}",
+                file=sys.stderr, flush=True,
+            )
+            return None
+    return [sys.executable, "-m", "code_extractor"]
+
+
 def _build_extractor_proxy_command(
-    npx: str, port: int = DEFAULT_EXTRACT_PROXY_PORT
+    npx: str, inner_cmd: list[str], port: int = DEFAULT_EXTRACT_PROXY_PORT
 ) -> list[str]:
-    """Build the mcp-proxy command wrapping mcp-server-code-extractor on the given port.
+    """Wrap *inner_cmd* (the code-extractor launcher) in mcp-proxy on *port*.
 
-    mcp-server-code-extractor is a pure npx package — stateless, no binary to manage.
+    mcp-server-code-extractor is a PyPI package, so *inner_cmd* is the resolved
+    Python launcher — e.g. ``[uvx, "mcp-server-code-extractor"]`` or
+    ``[python, "-m", "code_extractor"]`` (see :func:`_resolve_extractor_inner_cmd`).
+    The OUTER launcher is still ``npx`` because mcp-proxy itself is an npm tool.
 
-    The OUTER and INNER commands both use the resolved ``npx`` launcher (a full
-    ``npx.cmd`` path on Windows). On Windows we also pass ``--shell`` so mcp-proxy
-    spawns the inner ``npx.cmd`` through cmd.exe — a bare/direct spawn fails with
-    ENOENT (bare ``npx``) or EINVAL (``.cmd`` under Node 24's CVE-2024-27980
-    mitigation). Passing the full npx path (rather than relying on the child
-    inheriting PATH) also avoids ENOENT when the proxy child has a stripped PATH.
+    On Windows, ``--shell`` is added only when the inner launcher is a ``.cmd``/
+    ``.bat`` shim (Node 24's CVE-2024-27980 mitigation blocks direct ``.cmd``
+    spawns). ``uvx.exe`` / ``python.exe`` are real executables that spawn directly
+    and preserve support for paths with spaces, so no shell is needed for them.
     """
     cmd = [npx, "-y", "mcp-proxy", "--port", str(port),
            "--server", "stream", "--stateless"]
-    if sys.platform == "win32":
+    if sys.platform == "win32" and inner_cmd and inner_cmd[0].lower().endswith((".cmd", ".bat")):
         cmd.append("--shell")
-    cmd += ["--", npx, "-y", "mcp-server-code-extractor"]
+    cmd += ["--", *inner_cmd]
     return cmd
 
 
@@ -745,14 +792,24 @@ async def run_tunnel(
             flush=True,
         )
 
-    # 4. Spawn mcp-server-code-extractor proxy (stateless npx — always available).
-    cmd_extract = _build_extractor_proxy_command(npx, extract_port)
-    print(f"  code-extractor:    http://127.0.0.1:{extract_port}", flush=True)
-    try:
-        proc_extract = subprocess.Popen(cmd_extract)
-    except Exception as exc:
-        print(f"  warning: could not start code-extractor proxy: {exc}", file=sys.stderr)
-        proc_extract = None
+    # 4. Spawn mcp-server-code-extractor proxy. It's a PyPI package (run via uvx,
+    #    or pip-installed and run as `python -m code_extractor`), wrapped in
+    #    mcp-proxy. None if the launcher can't be resolved.
+    proc_extract = None
+    extractor_inner = _resolve_extractor_inner_cmd()
+    if extractor_inner is not None:
+        cmd_extract = _build_extractor_proxy_command(npx, extractor_inner, extract_port)
+        print(f"  code-extractor:    http://127.0.0.1:{extract_port}", flush=True)
+        try:
+            proc_extract = subprocess.Popen(cmd_extract)
+        except Exception as exc:
+            print(f"  warning: could not start code-extractor proxy: {exc}", file=sys.stderr)
+            proc_extract = None
+    else:
+        print(
+            "  code-extractor:    not available (uvx missing and pip install failed)",
+            flush=True,
+        )
 
     # 5. Print permanent URLs.
     print("", flush=True)
