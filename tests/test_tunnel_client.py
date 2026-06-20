@@ -529,3 +529,94 @@ def test_relay_request_drops_host_header():
     # httpx sets Host to the real target, never the forwarded stale value.
     assert seen_headers.get("host") == "127.0.0.1:8808"
     assert seen_headers.get("x-keep") == "yes"
+
+
+# ---------------------------------------------------------------------------
+# .mcp.json auto-update (STEP 2)
+# ---------------------------------------------------------------------------
+
+def test_tunnel_mcp_entries_urls():
+    entries = tc._tunnel_mcp_entries("https://usemeridian.us", "tid-123")
+    assert set(entries) == {"meridian-fs", "meridian-code", "meridian-extractor"}
+    assert entries["meridian-fs"]["type"] == "http"
+    assert entries["meridian-fs"]["url"] == "https://usemeridian.us/fs/mcp/tid-123/mcp"
+    assert entries["meridian-code"]["url"] == "https://usemeridian.us/code/mcp/tid-123/mcp"
+    assert entries["meridian-extractor"]["url"] == "https://usemeridian.us/extract/mcp/tid-123/mcp"
+
+
+def test_inject_mcp_entries_into_empty():
+    out = tc._inject_mcp_entries(None, {"meridian-fs": {"type": "http", "url": "u"}})
+    data = json.loads(out)
+    assert data["mcpServers"]["meridian-fs"]["url"] == "u"
+
+
+def test_inject_mcp_entries_preserves_existing_servers_and_keys():
+    existing = json.dumps({
+        "mcpServers": {"meridian": {"command": "pixi", "args": ["run"]}},
+        "otherTopLevel": 7,
+    })
+    entries = tc._tunnel_mcp_entries("https://usemeridian.us", "t1")
+    out = tc._inject_mcp_entries(existing, entries)
+    data = json.loads(out)
+    # Existing connector and unrelated keys survive; ours are merged in.
+    assert data["mcpServers"]["meridian"]["command"] == "pixi"
+    assert data["otherTopLevel"] == 7
+    assert data["mcpServers"]["meridian-fs"]["url"].endswith("/fs/mcp/t1/mcp")
+    assert "meridian-code" in data["mcpServers"]
+
+
+def test_inject_mcp_entries_recovers_from_malformed_json():
+    out = tc._inject_mcp_entries("{not json", {"meridian-fs": {"type": "http", "url": "u"}})
+    data = json.loads(out)
+    assert data["mcpServers"]["meridian-fs"]["url"] == "u"
+
+
+def test_mcp_json_paths_includes_cursor_only_when_present(tmp_path):
+    # No .cursor/mcp.json → only .mcp.json is targeted.
+    paths = tc._mcp_json_paths(tmp_path)
+    assert paths == [tmp_path / ".mcp.json"]
+
+    cursor = tmp_path / ".cursor" / "mcp.json"
+    cursor.parent.mkdir(parents=True)
+    cursor.write_text("{}", encoding="utf-8")
+    paths = tc._mcp_json_paths(tmp_path)
+    assert cursor in paths
+
+
+def test_install_mcp_json_creates_then_restore_deletes(tmp_path):
+    snaps = tc._install_mcp_json(tmp_path, "https://usemeridian.us", "tid")
+    mcp = tmp_path / ".mcp.json"
+    assert mcp.exists()
+    data = json.loads(mcp.read_text(encoding="utf-8"))
+    assert "meridian-extractor" in data["mcpServers"]
+    # original was None (we created it) → restore deletes the file
+    tc._restore_mcp_json(snaps)
+    assert not mcp.exists()
+
+
+def test_install_mcp_json_restore_returns_exact_original(tmp_path):
+    mcp = tmp_path / ".mcp.json"
+    original = '{\n  "mcpServers": {\n    "meridian": {"command": "pixi"}\n  }\n}\n'
+    mcp.write_text(original, encoding="utf-8")
+
+    snaps = tc._install_mcp_json(tmp_path, "https://usemeridian.us", "tid")
+    # During the session our entries are present alongside the user's.
+    live = json.loads(mcp.read_text(encoding="utf-8"))
+    assert "meridian-fs" in live["mcpServers"]
+    assert live["mcpServers"]["meridian"]["command"] == "pixi"
+
+    tc._restore_mcp_json(snaps)
+    # Restored byte-for-byte to what the user had.
+    assert mcp.read_text(encoding="utf-8") == original
+
+
+def test_install_mcp_json_updates_existing_cursor_config(tmp_path):
+    cursor = tmp_path / ".cursor" / "mcp.json"
+    cursor.parent.mkdir(parents=True)
+    cursor.write_text("{}", encoding="utf-8")
+
+    snaps = tc._install_mcp_json(tmp_path, "https://usemeridian.us", "tid")
+    paths = {p for p, _ in snaps}
+    assert cursor in paths
+    data = json.loads(cursor.read_text(encoding="utf-8"))
+    assert "meridian-fs" in data["mcpServers"]

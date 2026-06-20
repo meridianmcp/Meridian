@@ -23,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import json
 import logging
 import uuid
 from typing import Any
@@ -584,3 +585,170 @@ async def tunnel_status(tenant_id: str) -> dict:
         "code_active": tenant_id in _tunnel_code_sockets,
         "extract_active": tenant_id in _tunnel_extract_sockets,
     }
+
+
+# ---------------------------------------------------------------------------
+# Single-connector bridge — surface fs/code/extractor tools through /mcp
+# ---------------------------------------------------------------------------
+#
+# When a tenant has a live tunnel, the Meridian remote-MCP endpoint aggregates
+# the tunneled servers' tools into its own ``tools/list`` and routes matching
+# ``tools/call`` requests back over the tunnel. The user's existing single
+# Meridian connector therefore gains filesystem / code-intel / extractor tools
+# automatically — no extra connectors to add.
+#
+# Routing is keyed by tool name. The cache below maps tenant_id → {tool: label}
+# so a stateless ``tools/call`` can find the owning tunnel without re-listing.
+# Cold/missing entries trigger a one-shot re-discovery via ``list_tunnel_tools``.
+
+_TUNNEL_LABELS = ("fs", "code", "extract")
+
+# Per-process routing cache: tenant_id → {tool_name: tunnel_label}
+_tunnel_tool_routes: dict[str, dict[str, str]] = {}
+
+
+def _label_maps(label: str) -> "tuple[dict[str, WebSocket], dict[str, asyncio.Future[dict]]]":
+    """Return the (sockets, pending) registries for a tunnel label."""
+    if label == "fs":
+        return _tunnel_sockets, _pending_reqs
+    if label == "code":
+        return _tunnel_code_sockets, _pending_code_reqs
+    return _tunnel_extract_sockets, _pending_extract_reqs
+
+
+def has_active_tunnel(tenant_id: str) -> bool:
+    """True if the tenant has at least one live tunnel socket (any kind)."""
+    return (
+        tenant_id in _tunnel_sockets
+        or tenant_id in _tunnel_code_sockets
+        or tenant_id in _tunnel_extract_sockets
+    )
+
+
+def _parse_mcp_payload(raw: bytes | None) -> dict | None:
+    """Parse an MCP JSON-RPC response body that may be plain JSON or SSE-framed.
+
+    mcp-proxy's Streamable HTTP transport returns either ``application/json``
+    or an SSE stream (``data: {...}`` lines). Return the last JSON-RPC object
+    that parses, or None.
+    """
+    if not raw:
+        return None
+    text = raw.decode("utf-8", "replace").strip()
+    if not text:
+        return None
+    if not text.startswith("{") and "data:" in text:
+        result: dict | None = None
+        for line in text.splitlines():
+            line = line.strip()
+            if line.startswith("data:"):
+                payload = line[5:].strip()
+                if not payload:
+                    continue
+                try:
+                    parsed = json.loads(payload)
+                except Exception:  # noqa: BLE001
+                    continue
+                if isinstance(parsed, dict):
+                    result = parsed
+        return result
+    try:
+        parsed = json.loads(text)
+    except Exception:  # noqa: BLE001
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+async def _tunnel_jsonrpc(
+    tenant_id: str, label: str, method: str, params: dict | None,
+) -> dict | None:
+    """Send one JSON-RPC request to a tunneled MCP server and parse the reply."""
+    sockets, pending = _label_maps(label)
+    if tenant_id not in sockets:
+        return None
+    body = json.dumps({
+        "jsonrpc": "2.0",
+        "id": "meridian-bridge",
+        "method": method,
+        "params": params or {},
+    }).encode()
+    headers = {
+        "content-type": "application/json",
+        "accept": "application/json, text/event-stream",
+    }
+    resp = await _do_proxy(
+        tenant_id, "POST", "/mcp", "", headers, body, sockets, pending, label,
+    )
+    if resp.status_code >= 400:
+        return None
+    return _parse_mcp_payload(resp.body)
+
+
+async def list_tunnel_tools(
+    tenant_id: str, reserved_names: "frozenset[str] | set[str]" = frozenset(),
+) -> list[dict]:
+    """Aggregate tools from every active tunnel and refresh the routing cache.
+
+    Tools whose name is already taken by a native or GitHub tool (``reserved_names``)
+    are skipped so the merged ``tools/list`` has no duplicates and native tools
+    always win at call time.
+    """
+    aggregated: list[dict] = []
+    routes: dict[str, str] = {}
+    for label in _TUNNEL_LABELS:
+        sockets, _ = _label_maps(label)
+        if tenant_id not in sockets:
+            continue
+        try:
+            resp = await _tunnel_jsonrpc(tenant_id, label, "tools/list", {})
+        except Exception as exc:  # noqa: BLE001
+            _log.debug("tunnel %s tools/list failed for %s: %s", label, tenant_id[:8], exc)
+            resp = None
+        if not resp:
+            continue
+        tools = ((resp.get("result") or {}).get("tools")) or []
+        for tool in tools:
+            if not isinstance(tool, dict):
+                continue
+            name = tool.get("name")
+            if not name or name in reserved_names or name in routes:
+                continue
+            routes[name] = label
+            aggregated.append(tool)
+    if routes:
+        _tunnel_tool_routes[tenant_id] = routes
+    elif not has_active_tunnel(tenant_id):
+        _tunnel_tool_routes.pop(tenant_id, None)
+    return aggregated
+
+
+async def call_tunnel_tool(
+    tenant_id: str, name: str, arguments: dict | None,
+) -> dict | None:
+    """Route a ``tools/call`` to the tunnel that owns ``name``.
+
+    Returns the MCP ``result`` object (with ``content``) on success, or None if
+    no active tunnel exposes a tool by that name. Raises on a tunnel-reported
+    JSON-RPC error so the caller can surface it as a normal MCP error.
+    """
+    label = (_tunnel_tool_routes.get(tenant_id) or {}).get(name)
+    if label is None:
+        # Cold cache (e.g. client skipped tools/list, or a different worker) —
+        # discover once, then retry the lookup.
+        await list_tunnel_tools(tenant_id)
+        label = (_tunnel_tool_routes.get(tenant_id) or {}).get(name)
+    if label is None:
+        return None
+    sockets, _ = _label_maps(label)
+    if tenant_id not in sockets:
+        return None
+    resp = await _tunnel_jsonrpc(
+        tenant_id, label, "tools/call",
+        {"name": name, "arguments": arguments or {}},
+    )
+    if not resp:
+        return None
+    err = resp.get("error")
+    if err:
+        raise RuntimeError(str(err.get("message") if isinstance(err, dict) else err))
+    return resp.get("result")

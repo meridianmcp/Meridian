@@ -463,6 +463,24 @@ async def _dispatch_github_tool(name: str, args: dict[str, Any], tenant: dict, d
     return {"error": f"Unknown GitHub tool: {name}"}
 
 
+_MERIDIAN_TOOL_NAMES_CACHE: "frozenset[str] | None" = None
+
+
+def _meridian_tool_names() -> "frozenset[str]":
+    """Set of native Meridian MCP tool names (cached after first build).
+
+    Used by the tunnel bridge to tell native tools apart from tunneled ones so
+    native tools always take precedence and only genuinely-new tunnel tools are
+    routed over the WebSocket relay.
+    """
+    global _MERIDIAN_TOOL_NAMES_CACHE
+    if _MERIDIAN_TOOL_NAMES_CACHE is None:
+        _MERIDIAN_TOOL_NAMES_CACHE = frozenset(
+            t["name"] for t in _server._MCP_TOOLS_LIST if t.get("name")
+        )
+    return _MERIDIAN_TOOL_NAMES_CACHE
+
+
 async def _handle_mcp_request(
     body: dict[str, Any], db: Any, data_dir: str,
     tenant: dict[str, Any] | None = None,
@@ -494,6 +512,24 @@ async def _handle_mcp_request(
         tools = list(_server._MCP_TOOLS_LIST)
         if tenant:
             tools = tools + _server._github_tools_for_tenant(tenant)
+        # Single-connector bridge: when this tenant has a live `meridian --tunnel`,
+        # surface its filesystem / code-intel / extractor tools here so the user's
+        # existing Meridian connector gains them with zero extra config. Reserve
+        # native + GitHub names so the merged list has no duplicates.
+        if tenant and tenant.get("id"):
+            from ..routes import tunnel as _tunnel_mod  # noqa: PLC0415
+            if _tunnel_mod.has_active_tunnel(tenant["id"]):
+                try:
+                    # Reserve native names AND the full GitHub name set: tools/call
+                    # always routes GitHub names (e.g. read_file) to the GitHub
+                    # dispatch when a tenant is set, so the tunnel must not advertise
+                    # them here or list/call would disagree.
+                    reserved = {t.get("name") for t in tools} | set(_server._GITHUB_TOOL_NAMES)
+                    tools = tools + await _tunnel_mod.list_tunnel_tools(
+                        tenant["id"], reserved,
+                    )
+                except Exception:  # noqa: BLE001
+                    pass  # tunnel hiccup must never break native tools/list
         return _server._jsonrpc_ok(req_id, {"tools": tools})
 
     if method == "prompts/list":
@@ -525,7 +561,21 @@ async def _handle_mcp_request(
                     f"workspace role '{enforce_role}' is read-only; tool '{name}' denied",
                 )
         try:
-            if name in _server._GITHUB_TOOL_NAMES and tenant:
+            _is_github = bool(name in _server._GITHUB_TOOL_NAMES and tenant)
+            # Single-connector bridge: a tool that is neither a native Meridian tool
+            # nor a GitHub tool may belong to an active tunnel (fs/code/extractor).
+            # Native + GitHub tools keep precedence so existing behaviour is unchanged.
+            if not _is_github and name not in _meridian_tool_names() and tenant and tenant.get("id"):
+                from ..routes import tunnel as _tunnel_mod  # noqa: PLC0415
+                if _tunnel_mod.has_active_tunnel(tenant["id"]):
+                    tunnel_result = await _tunnel_mod.call_tunnel_tool(
+                        tenant["id"], name, args,
+                    )
+                    if tunnel_result is not None:
+                        # Pass the tunneled server's result through verbatim — it
+                        # already carries the MCP `content` envelope.
+                        return _server._jsonrpc_ok(req_id, tunnel_result)
+            if _is_github:
                 result = await _dispatch_github_tool(name, args, tenant, db)
             else:
                 result = await _dispatch_mcp_tool(name, args, db, data_dir, tenant=tenant)

@@ -511,6 +511,95 @@ async def _reconnect_loop(ws_url: str, port: int, label: str) -> None:
         backoff = min(backoff * 2, _MAX_BACKOFF)
 
 
+# ---------------------------------------------------------------------------
+# Local MCP config auto-update (.mcp.json / .cursor/mcp.json) — pure, unit tested
+# ---------------------------------------------------------------------------
+
+# Connector keys we inject; used for restore so we only touch our own entries.
+TUNNEL_MCP_KEYS = ("meridian-fs", "meridian-code", "meridian-extractor")
+
+
+def _tunnel_mcp_entries(base_url: str, tenant_id: str) -> dict[str, dict]:
+    """The three HTTP MCP connector entries pointing at this tenant's tunnel."""
+    return {
+        "meridian-fs": {"type": "http", "url": _permanent_url(base_url, tenant_id)},
+        "meridian-code": {"type": "http", "url": _permanent_code_url(base_url, tenant_id)},
+        "meridian-extractor": {"type": "http", "url": _permanent_extract_url(base_url, tenant_id)},
+    }
+
+
+def _mcp_json_paths(cwd: "str | Path") -> list["Path"]:
+    """MCP config files to update: `.mcp.json` always, `.cursor/mcp.json` if present.
+
+    `.mcp.json` (Claude Code) is created if absent — that is the whole point of
+    auto-update. `.cursor/mcp.json` is only touched when it already exists so we
+    never create Cursor config for non-Cursor users.
+    """
+    cwd = Path(cwd)
+    paths = [cwd / ".mcp.json"]
+    cursor = cwd / ".cursor" / "mcp.json"
+    if cursor.exists():
+        paths.append(cursor)
+    return paths
+
+
+def _inject_mcp_entries(text: "str | None", entries: dict[str, dict]) -> str:
+    """Merge *entries* under ``mcpServers`` in an existing `.mcp.json` body.
+
+    *text* is the current file content (``None``/empty for a new file). Existing
+    servers and other top-level keys are preserved. Returns the new file text.
+    """
+    data = {}
+    if text:
+        try:
+            data = json.loads(text)
+        except Exception:  # noqa: BLE001 — malformed config: start clean rather than crash
+            data = {}
+    if not isinstance(data, dict):
+        data = {}
+    servers = data.get("mcpServers")
+    if not isinstance(servers, dict):
+        servers = {}
+    servers.update(entries)
+    data["mcpServers"] = servers
+    return json.dumps(data, indent=2) + "\n"
+
+
+def _install_mcp_json(
+    cwd: "str | Path", base_url: str, tenant_id: str,
+) -> list[tuple["Path", "str | None"]]:
+    """Inject tunnel connector entries into local MCP config files.
+
+    Returns a list of ``(path, original_text_or_None)`` snapshots for restore.
+    ``original_text_or_None`` is ``None`` when we created the file. Failures on
+    any single file are reported and skipped — never fatal to the tunnel.
+    """
+    entries = _tunnel_mcp_entries(base_url, tenant_id)
+    snapshots: list[tuple[Path, str | None]] = []
+    for path in _mcp_json_paths(cwd):
+        existed = path.exists()
+        original = path.read_text(encoding="utf-8") if existed else None
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(_inject_mcp_entries(original, entries), encoding="utf-8")
+            snapshots.append((path, original))
+        except Exception as exc:  # noqa: BLE001
+            print(f"  warning: could not update {path}: {exc}", file=sys.stderr, flush=True)
+    return snapshots
+
+
+def _restore_mcp_json(snapshots: list[tuple["Path", "str | None"]]) -> None:
+    """Undo :func:`_install_mcp_json`: restore originals, delete files we created."""
+    for path, original in snapshots:
+        try:
+            if original is None:
+                path.unlink(missing_ok=True)
+            else:
+                path.write_text(original, encoding="utf-8")
+        except Exception:  # noqa: BLE001 — best-effort cleanup
+            pass
+
+
 async def run_tunnel(
     *,
     token: str | None = None,
@@ -625,6 +714,28 @@ async def run_tunnel(
     print(f"  (SSE clients: {_sse_url(base_url, tenant_id)})", flush=True)
     print("", flush=True)
 
+    # 5b. Auto-update local MCP client config so a co-located Claude Code / Cursor
+    #     session picks up the fs/code/extractor connectors with zero manual edits.
+    #     Restored to its original state on shutdown (step 8 finally block).
+    mcp_snapshots: list[tuple[Path, str | None]] = []
+    try:
+        mcp_snapshots = _install_mcp_json(Path.cwd(), base_url, tenant_id)
+    except Exception as exc:  # noqa: BLE001
+        print(f"  warning: could not update local MCP config: {exc}", file=sys.stderr, flush=True)
+    if mcp_snapshots:
+        for path, _orig in mcp_snapshots:
+            print(f"  Updated MCP config: {path}", flush=True)
+        print(
+            "    added connectors: meridian-fs, meridian-code, meridian-extractor "
+            "(removed on Ctrl+C)",
+            flush=True,
+        )
+        print(
+            "    Other clients (e.g. Cursor → .cursor/mcp.json): add the three URLs above manually.",
+            flush=True,
+        )
+        print("", flush=True)
+
     # 6. Auto-index code dirs via code-intel proxy (fire-and-forget background tasks).
     index_tasks: list[asyncio.Task] = []
     if proc_code is not None and code_dirs:
@@ -649,6 +760,10 @@ async def run_tunnel(
         print("\ntunnel: shutting down", flush=True)
         return 0
     finally:
+        # Restore local MCP config first so a Ctrl+C never leaves stale tunnel URLs.
+        if mcp_snapshots:
+            _restore_mcp_json(mcp_snapshots)
+            print("  Restored local MCP config (removed tunnel connectors).", flush=True)
         for t in tasks + index_tasks:
             t.cancel()
         proc_fs.terminate()
