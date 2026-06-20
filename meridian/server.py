@@ -1641,7 +1641,24 @@ async def me_endpoint(request: Request) -> dict[str, Any]:
         # Tunnel client (`meridian --tunnel`) reads this to build its
         # wss://.../tunnel/{tenant_id} and permanent /fs/mcp/{tenant_id} URLs.
         "tenant_id": tenant.get("id"),
+        # Resolved tunnel plugin registry (3-slot model) — the client spawns
+        # whatever is enabled here, applying any per-tenant command/port
+        # overrides over the built-in defaults. NULL config → built-in defaults.
+        "tunnel_plugins": _resolved_tunnel_plugins(tenant.get("tunnel_plugins")),
     }
+
+
+def _resolved_tunnel_plugins(raw: Any) -> list[dict[str, Any]]:
+    """Parse the stored tunnel_plugins JSON and resolve it over the defaults."""
+    from .tunnel_plugins import resolve_plugins
+    parsed: Any = raw
+    if isinstance(raw, str) and raw.strip():
+        import json as _json
+        try:
+            parsed = _json.loads(raw)
+        except Exception:  # noqa: BLE001 — malformed config → fall back to defaults
+            parsed = None
+    return resolve_plugins(parsed)
 
 
 @app.get("/me/workspaces")

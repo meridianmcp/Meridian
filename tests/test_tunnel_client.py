@@ -849,3 +849,28 @@ def test_write_cached_token_preserves_other_keys(monkeypatch, tmp_path):
     data = json.loads(cfg.read_text(encoding="utf-8"))
     assert data["unrelated"] == "keep-me"
     assert data["tunnel_token"]["token"] == "sk_meridian_xyz"
+
+
+# ---------------------------------------------------------------------------
+# _build_proxy_for_inner — generic mcp-proxy wrapper for command overrides
+# ---------------------------------------------------------------------------
+
+def test_build_proxy_for_inner_structure():
+    cmd = tc._build_proxy_for_inner("npx", ["codegraph", "--stdio"], 8809)
+    assert cmd[:7] == ["npx", "-y", "mcp-proxy", "--port", "8809",
+                       "--server", "stream"]
+    assert "--stateless" in cmd
+    # Inner command appears after the -- separator.
+    assert cmd[cmd.index("--") + 1:] == ["codegraph", "--stdio"]
+
+
+def test_build_proxy_for_inner_no_shell_for_exe_on_windows(monkeypatch):
+    monkeypatch.setattr(tc.sys, "platform", "win32")
+    cmd = tc._build_proxy_for_inner("npx.cmd", ["codegraph.exe"], 8809)
+    assert "--shell" not in cmd
+
+
+def test_build_proxy_for_inner_shell_for_cmd_shim_on_windows(monkeypatch):
+    monkeypatch.setattr(tc.sys, "platform", "win32")
+    cmd = tc._build_proxy_for_inner("npx.cmd", ["codegraph.cmd"], 8809)
+    assert "--shell" in cmd

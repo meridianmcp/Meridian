@@ -718,6 +718,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_note_kind(db)
     await _migrate_tunnel_active(db)
     await _migrate_code_intel(db)
+    await _migrate_tunnel_plugins(db)
     await _migrate_notes_priority(db)
     await _migrate_task_log_kind(db)
     await _migrate_oauth_refresh_tokens(db)
@@ -4197,7 +4198,7 @@ async def update_tenant(
         "compute_cu_hours_used", "storage_gb_used",
         "overage_reset_at", "compute_throttled_at",
         "trial_started_at", "inactivity_expires_at",
-        "github_pat", "tunnel_active",
+        "github_pat", "tunnel_active", "tunnel_plugins",
     }
     updates = {k: v for k, v in fields.items() if k in allowed}
     if not updates:

@@ -486,6 +486,29 @@ def _build_code_proxy_command(
     return cmd
 
 
+def _build_proxy_for_inner(
+    npx: str, inner_cmd: list[str], port: int
+) -> list[str]:
+    """Wrap an arbitrary *inner_cmd* in mcp-proxy on *port*.
+
+    Used for tenant plugin **command overrides** (e.g. swapping code-intel from
+    codebase-memory-mcp to ``codegraph``). The default built-in slots keep their
+    dedicated builders (:func:`_build_proxy_command`, :func:`_build_code_proxy_command`,
+    :func:`_build_extractor_proxy_command`) so their exact, well-tested behaviour
+    is preserved; this generic wrapper only applies when a slot's command is
+    overridden via the plugin registry.
+
+    On Windows ``--shell`` is added only when the inner launcher is a ``.cmd``/
+    ``.bat`` shim (Node 24 CVE-2024-27980 mitigation), matching the other builders.
+    """
+    cmd = [npx, "-y", "mcp-proxy", "--port", str(port),
+           "--server", "stream", "--stateless"]
+    if sys.platform == "win32" and inner_cmd and inner_cmd[0].lower().endswith((".cmd", ".bat")):
+        cmd.append("--shell")
+    cmd += ["--", *inner_cmd]
+    return cmd
+
+
 def _find_npx() -> str:
     """Locate the npx launcher.
 
@@ -808,10 +831,13 @@ async def run_tunnel(
 ) -> int:
     """Resolve config, start local proxies, and keep all tunnels up.
 
-    Always starts a filesystem tunnel on *port*. Starts a codebase-memory-mcp
-    tunnel on *code_port* (auto-installing if needed) and a code-extractor
-    tunnel on *extract_port*. Blocks until interrupted (Ctrl-C). Returns a
-    process exit code.
+    The tenant's tunnel plugin registry (from ``/me``, 3-slot model) decides what
+    runs behind each of the three transport slots — filesystem (*port*),
+    code-intel (*code_port*, auto-installing codebase-memory-mcp when its command
+    is not overridden), and code-extractor (*extract_port*). Each slot can be
+    disabled, given a command override, or assigned a different port via the
+    per-tenant config; an empty config reproduces the built-in defaults exactly.
+    Blocks until interrupted (Ctrl-C). Returns a process exit code.
 
     If *code_dirs* is provided, calls ``index_repository`` on each path via the
     code-intel proxy after it starts — so the first session has a fully indexed
@@ -882,70 +908,122 @@ async def run_tunnel(
         )
         return 1
 
-    # 2. Spawn filesystem proxy.
-    npx = _find_npx()
-    cmd_fs = _build_proxy_command(npx, repo_path, port)
-    print(f"meridian tunnel: serving {repo_path}", flush=True)
-    print(f"  filesystem proxy: http://127.0.0.1:{port}", flush=True)
-    try:
-        proc_fs = subprocess.Popen(cmd_fs)
-    except FileNotFoundError:
-        print(
-            f"error: could not launch npx ({npx!r}). Is Node.js installed and "
-            "on PATH?",
-            file=sys.stderr,
-        )
-        return 1
+    # Resolve the tenant's tunnel plugin registry (3-slot model). The server's
+    # /me response returns the already-resolved list (defaults + per-tenant
+    # overrides); fall back to built-in defaults for older servers. Each slot
+    # may be disabled, given a command override, or assigned a different port.
+    from .tunnel_plugins import resolve_plugins
+    plugins = me.get("tunnel_plugins") or resolve_plugins(None)
+    by_slot = {p.get("slot"): p for p in plugins if isinstance(p, dict)}
+    fs_plugin = by_slot.get("fs") or {}
+    code_plugin = by_slot.get("code") or {}
+    extract_plugin = by_slot.get("extract") or {}
+    # Per-slot effective ports (override > the run_tunnel arg default).
+    fs_port = int(fs_plugin.get("port") or port)
+    code_port = int(code_plugin.get("port") or code_port)
+    extract_port = int(extract_plugin.get("port") or extract_port)
 
-    # 3. Optionally spawn codebase-memory-mcp proxy (auto-install if not found).
+    # 2. Spawn filesystem proxy (slot "fs"). Honour an enable toggle + command
+    #    override; the default (no override) keeps the exact filesystem builder.
+    npx = _find_npx()
+    proc_fs: subprocess.Popen | None = None
+    if fs_plugin.get("enabled", True):
+        fs_override = fs_plugin.get("command")
+        cmd_fs = (
+            _build_proxy_for_inner(npx, list(fs_override), fs_port)
+            if fs_override else _build_proxy_command(npx, repo_path, fs_port)
+        )
+        print(f"meridian tunnel: serving {repo_path}", flush=True)
+        print(f"  filesystem proxy: http://127.0.0.1:{fs_port}", flush=True)
+        try:
+            proc_fs = subprocess.Popen(cmd_fs)
+        except FileNotFoundError:
+            print(
+                f"error: could not launch npx ({npx!r}). Is Node.js installed and "
+                "on PATH?",
+                file=sys.stderr,
+            )
+            return 1
+    else:
+        print("  filesystem:        disabled (tunnel_plugins config)", flush=True)
+
+    # 3. Spawn the code-intel proxy (slot "code"). A command override (e.g.
+    #    codegraph) replaces codebase-memory-mcp and skips the auto-install; the
+    #    default path auto-installs codebase-memory-mcp if it is not found.
     proc_code: subprocess.Popen | None = None
-    code_binary = await _ensure_codebase_memory_mcp()
-    if code_binary is not None:
-        # Ensure managed bin dir is on PATH so child processes can find the binary too.
-        managed_bin = str(_managed_bin_dir())
-        if managed_bin not in os.environ.get("PATH", ""):
-            os.environ["PATH"] = managed_bin + os.pathsep + os.environ.get("PATH", "")
-        cmd_code = _build_code_proxy_command(npx, code_binary, code_port)
-        print(f"  code-intel proxy:  http://127.0.0.1:{code_port}", flush=True)
+    if not code_plugin.get("enabled", True):
+        print("  code-intel:        disabled (tunnel_plugins config)", flush=True)
+    elif code_plugin.get("command"):
+        cmd_code = _build_proxy_for_inner(npx, list(code_plugin["command"]), code_port)
+        print(f"  code-intel proxy:  http://127.0.0.1:{code_port} (custom command)", flush=True)
         try:
             proc_code = subprocess.Popen(cmd_code)
         except Exception as exc:
             print(f"  warning: could not start code-intel proxy: {exc}", file=sys.stderr)
             proc_code = None
     else:
-        print(
-            "  code-intel:        not available (codebase-memory-mcp could not be installed)",
-            flush=True,
-        )
+        code_binary = await _ensure_codebase_memory_mcp()
+        if code_binary is not None:
+            # Ensure managed bin dir is on PATH so child processes can find the binary too.
+            managed_bin = str(_managed_bin_dir())
+            if managed_bin not in os.environ.get("PATH", ""):
+                os.environ["PATH"] = managed_bin + os.pathsep + os.environ.get("PATH", "")
+            cmd_code = _build_code_proxy_command(npx, code_binary, code_port)
+            print(f"  code-intel proxy:  http://127.0.0.1:{code_port}", flush=True)
+            try:
+                proc_code = subprocess.Popen(cmd_code)
+            except Exception as exc:
+                print(f"  warning: could not start code-intel proxy: {exc}", file=sys.stderr)
+                proc_code = None
+        else:
+            print(
+                "  code-intel:        not available (codebase-memory-mcp could not be installed)",
+                flush=True,
+            )
 
     # 4. Spawn mcp-server-code-extractor proxy. It's a PyPI package (run via uvx,
     #    or pip-installed and run as `python -m code_extractor`), wrapped in
     #    mcp-proxy. None if the launcher can't be resolved.
     proc_extract = None
-    extractor_inner = _resolve_extractor_inner_cmd()
-    if extractor_inner is not None:
-        cmd_extract = _build_extractor_proxy_command(npx, extractor_inner, extract_port)
-        print(f"  code-extractor:    http://127.0.0.1:{extract_port}", flush=True)
-        try:
-            proc_extract = subprocess.Popen(cmd_extract)
-        except Exception as exc:
-            print(f"  warning: could not start code-extractor proxy: {exc}", file=sys.stderr)
-            proc_extract = None
+    if not extract_plugin.get("enabled", True):
+        print("  code-extractor:    disabled (tunnel_plugins config)", flush=True)
     else:
-        print(
-            "  code-extractor:    not available (uvx missing and pip install failed)",
-            flush=True,
-        )
+        ext_override = extract_plugin.get("command")
+        if ext_override:
+            cmd_extract = _build_proxy_for_inner(npx, list(ext_override), extract_port)
+            print(f"  code-extractor:    http://127.0.0.1:{extract_port} (custom command)", flush=True)
+            try:
+                proc_extract = subprocess.Popen(cmd_extract)
+            except Exception as exc:
+                print(f"  warning: could not start code-extractor proxy: {exc}", file=sys.stderr)
+                proc_extract = None
+        else:
+            extractor_inner = _resolve_extractor_inner_cmd()
+            if extractor_inner is not None:
+                cmd_extract = _build_extractor_proxy_command(npx, extractor_inner, extract_port)
+                print(f"  code-extractor:    http://127.0.0.1:{extract_port}", flush=True)
+                try:
+                    proc_extract = subprocess.Popen(cmd_extract)
+                except Exception as exc:
+                    print(f"  warning: could not start code-extractor proxy: {exc}", file=sys.stderr)
+                    proc_extract = None
+            else:
+                print(
+                    "  code-extractor:    not available (uvx missing and pip install failed)",
+                    flush=True,
+                )
 
     # 5. Print permanent URLs.
     print("", flush=True)
     print("  Permanent MCP URLs — add these to claude.ai once:", flush=True)
-    print(f"    Filesystem:      {_permanent_url(base_url, tenant_id)}", flush=True)
+    if proc_fs is not None:
+        print(f"    Filesystem:      {_permanent_url(base_url, tenant_id)}", flush=True)
     if proc_code is not None:
         print(f"    Code Intel:      {_permanent_code_url(base_url, tenant_id)}", flush=True)
     if proc_extract is not None:
         print(f"    Code Extractor:  {_permanent_extract_url(base_url, tenant_id)}", flush=True)
-    print(f"  (SSE clients: {_sse_url(base_url, tenant_id)})", flush=True)
+    if proc_fs is not None:
+        print(f"  (SSE clients: {_sse_url(base_url, tenant_id)})", flush=True)
     print("", flush=True)
 
     # 5b. Auto-update local MCP client config so a co-located Claude Code / Cursor
@@ -978,15 +1056,20 @@ async def run_tunnel(
                 asyncio.ensure_future(_index_code_dir(code_port, str(Path(d).resolve())))
             )
 
-    # 7. Run reconnect loops — filesystem always, code + extract when proxies started.
+    # 7. Run reconnect loops — one per enabled slot whose proxy started.
     ws_fs = _ws_url(base_url, tenant_id, token)
     ws_code = _ws_code_url(base_url, tenant_id, token)
     ws_extract = _ws_extract_url(base_url, tenant_id, token)
-    tasks = [asyncio.ensure_future(_reconnect_loop(ws_fs, port, "fs"))]
+    tasks: list[asyncio.Task] = []
+    if proc_fs is not None:
+        tasks.append(asyncio.ensure_future(_reconnect_loop(ws_fs, fs_port, "fs")))
     if proc_code is not None:
         tasks.append(asyncio.ensure_future(_reconnect_loop(ws_code, code_port, "code")))
     if proc_extract is not None:
         tasks.append(asyncio.ensure_future(_reconnect_loop(ws_extract, extract_port, "extract")))
+    if not tasks:
+        print("error: no tunnel plugins enabled — nothing to serve.", file=sys.stderr)
+        return 1
 
     try:
         await asyncio.gather(*tasks)
@@ -1000,11 +1083,12 @@ async def run_tunnel(
             print("  Restored local MCP config (removed tunnel connectors).", flush=True)
         for t in tasks + index_tasks:
             t.cancel()
-        proc_fs.terminate()
-        try:
-            proc_fs.wait(timeout=5)
-        except Exception:
-            proc_fs.kill()
+        if proc_fs is not None:
+            proc_fs.terminate()
+            try:
+                proc_fs.wait(timeout=5)
+            except Exception:
+                proc_fs.kill()
         if proc_code is not None:
             proc_code.terminate()
             try:
