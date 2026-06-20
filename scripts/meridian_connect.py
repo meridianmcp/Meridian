@@ -57,6 +57,15 @@ def main() -> int:
     parser.add_argument("--url", default="", help=f"Meridian server URL (default: {DEFAULT_URL})")
     parser.add_argument("--token", default="", help="Bearer token (skips browser auth)")
     parser.add_argument("--project-id", default="", help="Project ID (optional)")
+    parser.add_argument(
+        "--tunnel",
+        action="store_true",
+        help=(
+            "After hooks are installed, start the filesystem tunnel (Pro). "
+            "Prints your permanent MCP URL and keeps running — add it to "
+            "claude.ai once and never touch it again."
+        ),
+    )
     args = parser.parse_args()
 
     print()
@@ -237,8 +246,34 @@ def main() -> int:
     else:
         print("  WARNING: hook test failed (hooks still installed)")
 
-    # ---- Done ----------------------------------------------------------------
+    # ---- Done / Tunnel -------------------------------------------------------
     print()
+    if args.tunnel and not is_local:
+        print("Hooks installed. Starting filesystem tunnel...")
+        print()
+        import asyncio
+        import selectors
+        from meridian.tunnel_client import run_tunnel
+
+        if platform.system() == "Windows":
+            asyncio.set_event_loop_policy(asyncio.DefaultEventLoopPolicy())
+            _loop = asyncio.SelectorEventLoop(selectors.SelectSelector())
+            asyncio.set_event_loop(_loop)
+        else:
+            _loop = asyncio.get_event_loop()
+
+        try:
+            return _loop.run_until_complete(
+                run_tunnel(token=token, base_url=meridian_url)
+            )
+        except KeyboardInterrupt:
+            print("\ntunnel: stopped", flush=True)
+            return 0
+
+    if args.tunnel and is_local:
+        print("Note: --tunnel is for hosted Meridian (Pro). Skipping for local server.")
+        print()
+
     print("Done. Hooks installed. Restart Claude Code to activate.")
     print()
     return 0
