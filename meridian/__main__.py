@@ -111,6 +111,14 @@ def main(argv: list[str] | None = None) -> int:
         help="Local port for the tunnel's mcp-proxy (default 8808).",
     )
     parser.add_argument(
+        "--code-dir",
+        action="append",
+        metavar="PATH",
+        dest="code_dirs",
+        help="Directory to auto-index with codebase-memory-mcp on tunnel start "
+        "(repeatable: --code-dir /repo1 --code-dir /repo2).",
+    )
+    parser.add_argument(
         "--host",
         default=os.environ.get("MERIDIAN_HOST", "127.0.0.1"),
         help="HTTP bind host (default 127.0.0.1, override with MERIDIAN_HOST).",
@@ -134,6 +142,7 @@ def main(argv: list[str] | None = None) -> int:
                     base_url=args.server,
                     repo_path=args.repo,
                     port=args.tunnel_port,
+                    code_dirs=args.code_dirs,
                 )
             )
         except KeyboardInterrupt:

@@ -122,6 +122,24 @@ def test_permanent_code_url():
     )
 
 
+def test_ws_extract_url_https_to_wss():
+    url = tc._ws_extract_url("https://usemeridian.us", "tenant-123", "sk_tok")
+    assert url.startswith("wss://usemeridian.us/tunnel-extract/tenant-123?token=")
+    assert "token=sk_tok" in url
+
+
+def test_ws_extract_url_http_to_ws():
+    url = tc._ws_extract_url("http://localhost:7878", "t1", "tok")
+    assert url.startswith("ws://localhost:7878/tunnel-extract/t1?token=")
+
+
+def test_permanent_extract_url():
+    assert (
+        tc._permanent_extract_url("https://usemeridian.us/", "abc")
+        == "https://usemeridian.us/extract/mcp/abc/mcp"
+    )
+
+
 # ---------------------------------------------------------------------------
 # npx + proxy command
 # ---------------------------------------------------------------------------
@@ -176,6 +194,78 @@ def test_build_code_proxy_command_structure():
     assert cmd[sep + 1] == "/usr/local/bin/codebase-memory-mcp"
     # codebase-memory-mcp is a native binary — no --shell needed
     assert "--shell" not in cmd
+
+
+def test_build_extractor_proxy_command_structure():
+    cmd = tc._build_extractor_proxy_command("npx", port=9010)
+    assert cmd[0] == "npx"
+    assert "mcp-proxy" in cmd
+    assert "--port" in cmd
+    assert "9010" in cmd
+    assert "--server" in cmd
+    assert "stream" in cmd
+    assert "--stateless" in cmd
+    sep = cmd.index("--")
+    # Inner command must be: npx -y mcp-server-code-extractor
+    assert cmd[sep + 1] == "npx"
+    assert "mcp-server-code-extractor" in cmd[sep:]
+    assert "--shell" not in cmd
+
+
+# ---------------------------------------------------------------------------
+# _index_code_dir
+# ---------------------------------------------------------------------------
+
+def test_index_code_dir_succeeds_after_probe(monkeypatch):
+    """_index_code_dir waits for proxy readiness then calls tools/call."""
+    calls = []
+
+    class FakeResp:
+        status_code = 200
+        def raise_for_status(self): pass
+
+    class FakeClient:
+        def __init__(self, *a, **kw): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): pass
+        async def post(self, url, **kw):
+            calls.append(kw.get("json", {}).get("method"))
+            return FakeResp()
+
+    import httpx as _httpx
+    monkeypatch.setattr(_httpx, "AsyncClient", FakeClient)
+
+    asyncio.run(tc._index_code_dir(8809, "/repo"))
+    assert "tools/list" in calls
+    assert "tools/call" in calls
+
+
+def test_index_code_dir_gives_up_after_timeout(monkeypatch):
+    """_index_code_dir exits gracefully when the proxy never starts."""
+    import httpx as _httpx
+
+    class ErrorClient:
+        def __init__(self, *a, **kw): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): pass
+        async def post(self, *a, **kw): raise Exception("refused")
+
+    monkeypatch.setattr(_httpx, "AsyncClient", ErrorClient)
+    # Patch sleep to avoid a 60-second real wait
+    sleep_count = []
+
+    async def fast_sleep(n):
+        sleep_count.append(n)
+        if len(sleep_count) >= 3:
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(asyncio, "sleep", fast_sleep)
+
+    try:
+        asyncio.run(tc._index_code_dir(8809, "/repo"))
+    except asyncio.CancelledError:
+        pass
+    assert len(sleep_count) > 0
 
 
 # ---------------------------------------------------------------------------

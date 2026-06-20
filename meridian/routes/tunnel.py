@@ -41,10 +41,12 @@ _PROXY_TIMEOUT = 30.0
 # Per-process in-memory registry: tenant_id → active WebSocket
 _tunnel_sockets: dict[str, WebSocket] = {}
 _tunnel_code_sockets: dict[str, WebSocket] = {}
+_tunnel_extract_sockets: dict[str, WebSocket] = {}
 
 # Correlation maps: request_id → Future that resolves when client responds
 _pending_reqs: dict[str, asyncio.Future[dict]] = {}
 _pending_code_reqs: dict[str, asyncio.Future[dict]] = {}
+_pending_extract_reqs: dict[str, asyncio.Future[dict]] = {}
 
 
 def _is_tunnel_allowed(tenant: dict) -> bool:
@@ -229,6 +231,80 @@ async def tunnel_code_ws(ws: WebSocket, tenant_id: str) -> None:
             if not fut.done():
                 fut.cancel()
         _log.info("tunnel-code: tenant %s disconnected", tenant_id[:8])
+
+
+# ---------------------------------------------------------------------------
+# /tunnel-extract/{tenant_id}  — WebSocket: mcp-server-code-extractor tunnel
+# ---------------------------------------------------------------------------
+
+@router.websocket("/tunnel-extract/{tenant_id}")
+async def tunnel_extract_ws(ws: WebSocket, tenant_id: str) -> None:
+    """Hold open a WebSocket for one tenant's mcp-server-code-extractor proxy.
+
+    Mirrors /tunnel-code/{tenant_id}. Auth rules are identical.
+    """
+    if not _hosted_mode():
+        await ws.close(code=4403, reason="tunnel requires hosted mode")
+        return
+
+    auth_db = ws.app.state.db
+    await ws.accept()
+
+    auth_header = ws.headers.get("authorization", "")
+    token_param = ws.query_params.get("token", "")
+    raw_token = auth_header or token_param
+
+    tenant = await _resolve_tenant_from_token(auth_db, raw_token)
+    if tenant is None or tenant.get("id") != tenant_id:
+        await ws.close(code=4401, reason="invalid or mismatched token")
+        return
+
+    if not _is_tunnel_allowed(tenant):
+        await ws.close(code=4403, reason="tunnel requires Pro plan")
+        return
+
+    old_ws = _tunnel_extract_sockets.pop(tenant_id, None)
+    if old_ws is not None:
+        try:
+            await old_ws.close(code=4000, reason="replaced by new connection")
+        except Exception:
+            pass
+
+    _tunnel_extract_sockets[tenant_id] = ws
+    _log.info("tunnel-extract: tenant %s connected", tenant_id[:8])
+
+    try:
+        while True:
+            try:
+                msg = await asyncio.wait_for(ws.receive_json(), timeout=120.0)
+            except asyncio.TimeoutError:
+                try:
+                    await ws.send_json({"type": "ping"})
+                except Exception:
+                    break
+                continue
+
+            if not isinstance(msg, dict):
+                continue
+            msg_type = msg.get("type")
+            if msg_type == "ping":
+                continue
+            if msg_type == "response":
+                req_id = msg.get("id")
+                fut = _pending_extract_reqs.get(req_id)
+                if fut is not None and not fut.done():
+                    fut.set_result(msg)
+
+    except WebSocketDisconnect:
+        pass
+    except Exception as exc:
+        _log.debug("tunnel-extract: tenant %s disconnected: %s", tenant_id[:8], exc)
+    finally:
+        _tunnel_extract_sockets.pop(tenant_id, None)
+        for fut in list(_pending_extract_reqs.values()):
+            if not fut.done():
+                fut.cancel()
+        _log.info("tunnel-extract: tenant %s disconnected", tenant_id[:8])
 
 
 # ---------------------------------------------------------------------------
@@ -452,6 +528,50 @@ async def code_mcp_proxy_subpath(tenant_id: str, rest: str, request: Request) ->
 
 
 # ---------------------------------------------------------------------------
+# /extract/mcp/{tenant_id}  — HTTP: proxies through the code-extractor tunnel
+# ---------------------------------------------------------------------------
+
+async def _extract_proxy(tenant_id: str, local_path: str, request: Request) -> Response:
+    if not _hosted_mode():
+        return Response(
+            content='{"error":"tunnel requires hosted mode"}',
+            status_code=503,
+            media_type="application/json",
+        )
+    body_bytes = await request.body()
+    return await _do_proxy(
+        tenant_id=tenant_id,
+        method=request.method,
+        path=local_path,
+        query=str(request.url.query),
+        headers=_fwd_headers(request),
+        body_bytes=body_bytes or None,
+        sockets=_tunnel_extract_sockets,
+        pending=_pending_extract_reqs,
+        label="extract",
+    )
+
+
+@router.get("/extract/mcp/{tenant_id}")
+@router.post("/extract/mcp/{tenant_id}")
+@router.options("/extract/mcp/{tenant_id}")
+async def extract_mcp_proxy(tenant_id: str, request: Request) -> Response:
+    """Proxy requests to the tenant's mcp-server-code-extractor over the extract tunnel."""
+    prefix = f"/extract/mcp/{tenant_id}"
+    local_path = request.url.path[len(prefix):] or "/"
+    return await _extract_proxy(tenant_id, local_path, request)
+
+
+@router.get("/extract/mcp/{tenant_id}/{rest:path}")
+@router.post("/extract/mcp/{tenant_id}/{rest:path}")
+@router.options("/extract/mcp/{tenant_id}/{rest:path}")
+async def extract_mcp_proxy_subpath(tenant_id: str, rest: str, request: Request) -> Response:
+    """Same as extract_mcp_proxy but for sub-paths."""
+    local_path = f"/{rest}" if rest else "/"
+    return await _extract_proxy(tenant_id, local_path, request)
+
+
+# ---------------------------------------------------------------------------
 # GET /tunnel/status/{tenant_id}  — lightweight status check (no auth required)
 # ---------------------------------------------------------------------------
 
@@ -462,4 +582,5 @@ async def tunnel_status(tenant_id: str) -> dict:
         "tenant_id": tenant_id,
         "active": tenant_id in _tunnel_sockets,
         "code_active": tenant_id in _tunnel_code_sockets,
+        "extract_active": tenant_id in _tunnel_extract_sockets,
     }

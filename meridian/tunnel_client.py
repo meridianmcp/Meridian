@@ -32,6 +32,7 @@ from pathlib import Path
 DEFAULT_BASE_URL = "https://usemeridian.us"
 DEFAULT_PROXY_PORT = 8808
 DEFAULT_CODE_PROXY_PORT = 8809
+DEFAULT_EXTRACT_PROXY_PORT = 8810
 # Server's proxy timeout is 30s (_PROXY_TIMEOUT); stay just under it so a slow
 # local response surfaces as our error rather than the server's tunnel timeout.
 _LOCAL_REQUEST_TIMEOUT = 28.0
@@ -114,6 +115,36 @@ def _ws_code_url(base_url: str, tenant_id: str, token: str) -> str:
 def _permanent_code_url(base_url: str, tenant_id: str) -> str:
     """The URL for codebase-memory-mcp — add to claude.ai once."""
     return f"{base_url.rstrip('/')}/code/mcp/{tenant_id}/mcp"
+
+
+def _ws_extract_url(base_url: str, tenant_id: str, token: str) -> str:
+    """Build the mcp-server-code-extractor tunnel WebSocket URL."""
+    base = base_url.rstrip("/")
+    if base.startswith("https://"):
+        ws_base = "wss://" + base[len("https://"):]
+    elif base.startswith("http://"):
+        ws_base = "ws://" + base[len("http://"):]
+    else:
+        ws_base = base
+    from urllib.parse import quote
+    return f"{ws_base}/tunnel-extract/{tenant_id}?token={quote(token, safe='')}"
+
+
+def _permanent_extract_url(base_url: str, tenant_id: str) -> str:
+    """The URL for mcp-server-code-extractor — add to claude.ai once."""
+    return f"{base_url.rstrip('/')}/extract/mcp/{tenant_id}/mcp"
+
+
+def _build_extractor_proxy_command(
+    npx: str, port: int = DEFAULT_EXTRACT_PROXY_PORT
+) -> list[str]:
+    """Build the mcp-proxy command wrapping mcp-server-code-extractor on the given port.
+
+    mcp-server-code-extractor is a pure npx package — stateless, no binary to manage.
+    """
+    return [npx, "-y", "mcp-proxy", "--port", str(port),
+            "--server", "stream", "--stateless", "--",
+            "npx", "-y", "mcp-server-code-extractor"]
 
 
 def _managed_bin_dir() -> "Path":
@@ -299,6 +330,62 @@ def _build_proxy_command(
 
 
 # ---------------------------------------------------------------------------
+# Auto-index helper (calls index_repository on codebase-memory-mcp proxy)
+# ---------------------------------------------------------------------------
+
+async def _index_code_dir(port: int, code_dir: str) -> None:
+    """Wait for the code-intel proxy to start, then call index_repository on code_dir.
+
+    Uses Streamable HTTP (MCP 2025-03-26): mcp-proxy handles the stdio lifecycle
+    per POST, so a direct tools/call is sufficient — no client-side initialize needed.
+    Failures are non-fatal (logged to stderr, tunnel continues).
+    """
+    import httpx
+
+    local = f"http://127.0.0.1:{port}/mcp"
+    probe = {"jsonrpc": "2.0", "id": "probe", "method": "tools/list", "params": {}}
+
+    # Poll until the proxy is accepting connections (up to 60s).
+    for _ in range(60):
+        try:
+            async with httpx.AsyncClient(timeout=2.0) as c:
+                r = await c.post(local, json=probe,
+                                 headers={"Content-Type": "application/json"})
+                if r.status_code < 500:
+                    break
+        except Exception:
+            pass
+        await asyncio.sleep(1.0)
+    else:
+        print(
+            f"  code-intel: proxy not ready after 60s — skipping auto-index of {code_dir}",
+            file=sys.stderr, flush=True,
+        )
+        return
+
+    payload = {
+        "jsonrpc": "2.0",
+        "id": "idx",
+        "method": "tools/call",
+        "params": {"name": "index_repository", "arguments": {"path": code_dir}},
+    }
+    try:
+        async with httpx.AsyncClient(timeout=300.0) as c:
+            r = await c.post(local, json=payload,
+                             headers={"Content-Type": "application/json"})
+        if r.status_code < 400:
+            print(f"  code-intel: indexed {code_dir}", flush=True)
+        else:
+            print(
+                f"  code-intel: index returned HTTP {r.status_code} for {code_dir}",
+                file=sys.stderr, flush=True,
+            )
+    except Exception as exc:
+        print(f"  code-intel: index failed for {code_dir}: {exc}",
+              file=sys.stderr, flush=True)
+
+
+# ---------------------------------------------------------------------------
 # Request relay (mostly pure — unit tested with httpx MockTransport)
 # ---------------------------------------------------------------------------
 
@@ -417,12 +504,19 @@ async def run_tunnel(
     repo_path: str | None = None,
     port: int = DEFAULT_PROXY_PORT,
     code_port: int = DEFAULT_CODE_PROXY_PORT,
+    extract_port: int = DEFAULT_EXTRACT_PROXY_PORT,
+    code_dirs: list[str] | None = None,
 ) -> int:
-    """Resolve config, start local proxies, and keep both tunnels up.
+    """Resolve config, start local proxies, and keep all tunnels up.
 
-    Starts a filesystem tunnel on *port* (always) and a codebase-memory-mcp
-    tunnel on *code_port* (only if the binary is installed). Blocks until
-    interrupted (Ctrl-C). Returns a process exit code.
+    Always starts a filesystem tunnel on *port*. Starts a codebase-memory-mcp
+    tunnel on *code_port* (auto-installing if needed) and a code-extractor
+    tunnel on *extract_port*. Blocks until interrupted (Ctrl-C). Returns a
+    process exit code.
+
+    If *code_dirs* is provided, calls ``index_repository`` on each path via the
+    code-intel proxy after it starts — so the first session has a fully indexed
+    codebase without any manual tool call.
     """
     token = _resolve_token(token)
     if not token:
@@ -497,21 +591,43 @@ async def run_tunnel(
             flush=True,
         )
 
-    # 4. Print permanent URLs.
+    # 4. Spawn mcp-server-code-extractor proxy (stateless npx — always available).
+    cmd_extract = _build_extractor_proxy_command(npx, extract_port)
+    print(f"  code-extractor:    http://127.0.0.1:{extract_port}", flush=True)
+    try:
+        proc_extract = subprocess.Popen(cmd_extract)
+    except Exception as exc:
+        print(f"  warning: could not start code-extractor proxy: {exc}", file=sys.stderr)
+        proc_extract = None
+
+    # 5. Print permanent URLs.
     print("", flush=True)
     print("  Permanent MCP URLs — add these to claude.ai once:", flush=True)
-    print(f"    Filesystem:  {_permanent_url(base_url, tenant_id)}", flush=True)
+    print(f"    Filesystem:      {_permanent_url(base_url, tenant_id)}", flush=True)
     if proc_code is not None:
-        print(f"    Code intel:  {_permanent_code_url(base_url, tenant_id)}", flush=True)
+        print(f"    Code Intel:      {_permanent_code_url(base_url, tenant_id)}", flush=True)
+    if proc_extract is not None:
+        print(f"    Code Extractor:  {_permanent_extract_url(base_url, tenant_id)}", flush=True)
     print(f"  (SSE clients: {_sse_url(base_url, tenant_id)})", flush=True)
     print("", flush=True)
 
-    # 5. Run reconnect loops — filesystem always, code only when proxy started.
+    # 6. Auto-index code dirs via code-intel proxy (fire-and-forget background tasks).
+    index_tasks: list[asyncio.Task] = []
+    if proc_code is not None and code_dirs:
+        for d in code_dirs:
+            index_tasks.append(
+                asyncio.ensure_future(_index_code_dir(code_port, str(Path(d).resolve())))
+            )
+
+    # 7. Run reconnect loops — filesystem always, code + extract when proxies started.
     ws_fs = _ws_url(base_url, tenant_id, token)
     ws_code = _ws_code_url(base_url, tenant_id, token)
+    ws_extract = _ws_extract_url(base_url, tenant_id, token)
     tasks = [asyncio.ensure_future(_reconnect_loop(ws_fs, port, "fs"))]
     if proc_code is not None:
         tasks.append(asyncio.ensure_future(_reconnect_loop(ws_code, code_port, "code")))
+    if proc_extract is not None:
+        tasks.append(asyncio.ensure_future(_reconnect_loop(ws_extract, extract_port, "extract")))
 
     try:
         await asyncio.gather(*tasks)
@@ -519,7 +635,7 @@ async def run_tunnel(
         print("\ntunnel: shutting down", flush=True)
         return 0
     finally:
-        for t in tasks:
+        for t in tasks + index_tasks:
             t.cancel()
         proc_fs.terminate()
         try:
@@ -532,4 +648,10 @@ async def run_tunnel(
                 proc_code.wait(timeout=5)
             except Exception:
                 proc_code.kill()
+        if proc_extract is not None:
+            proc_extract.terminate()
+            try:
+                proc_extract.wait(timeout=5)
+            except Exception:
+                proc_extract.kill()
     return 0
