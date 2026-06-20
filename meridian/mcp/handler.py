@@ -1814,13 +1814,19 @@ async def _dispatch_mcp_tool(
         instructions = (args.get("instructions") or "").strip() or None
         return await db_module.set_agent_instructions(db, args["project_id"], instructions)
     if name == "set_executor_config":
-        cfg_fields = {
-            k: args[k]
-            for k in ("repo_path", "env_file", "test_cmd", "test_min",
-                      "deploy_cmd", "shell_type", "branch")
-            if k in args
-        }
-        return await db_module.set_executor_config(db, args["project_id"], cfg_fields)
+        from ..executor_config import merge_repo_paths  # local — avoid import cycle
+        # Merge onto the existing config so we never wipe other keys (repo_paths,
+        # hostnames, filesystem_roots, …). repo_paths is merged entry-by-entry so
+        # a manual {cwd, hostname} coexists with hook-registered ones.
+        existing = await db_module.get_executor_config(db, args["project_id"])
+        cfg = dict(existing) if isinstance(existing, dict) else {}
+        for k in ("repo_path", "env_file", "test_cmd", "test_min",
+                  "deploy_cmd", "shell_type", "branch"):
+            if k in args:
+                cfg[k] = args[k]
+        if "repo_paths" in args:
+            cfg["repo_paths"] = merge_repo_paths(cfg.get("repo_paths"), args["repo_paths"])
+        return await db_module.set_executor_config(db, args["project_id"], cfg)
     if name == "claim_file":
         # 4bac57ff — symbol-level claim when both `symbol` and `content` are
         # supplied; otherwise the coarse whole-file lock. Falls back to a

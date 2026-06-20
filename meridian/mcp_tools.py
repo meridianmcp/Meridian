@@ -483,11 +483,17 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "required": ["project_id", "instructions"]}},
     {"name": "set_executor_config", "description":
         "Store per-project executor defaults (repo_path, env_file, test_cmd, test_min, deploy_cmd, shell_type, branch). "
+        "Merges onto the existing config — other keys (hostnames, filesystem_roots, …) are preserved. "
+        "Pass repo_paths as an array of {cwd, hostname} known locations; they are merged into the existing "
+        "repo_paths (deduped) rather than overwriting, so manual + hook-registered entries coexist. "
         "Executor sessions auto-load these when start_session(role='executor') is used. "
         "Credentials rule is always injected separately: read secrets from env_file only, never remote shell.",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"},
          "repo_path": {"type": "string"},
+         "repo_paths": {"type": "array", "items": {"type": "object", "properties": {
+             "cwd": {"type": "string"}, "hostname": {"type": "string"}}},
+             "description": "Known locations [{cwd, hostname}] — merged into existing repo_paths, not overwritten."},
          "env_file": {"type": "string"},
          "test_cmd": {"type": "string"},
          "test_min": {"type": "integer"},

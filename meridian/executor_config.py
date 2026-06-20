@@ -24,6 +24,41 @@ EXECUTOR_CREDENTIALS_RULE = (
 )
 
 
+def merge_repo_paths(
+    existing: Any, new: Any
+) -> list[dict[str, str]]:
+    """Merge two ``repo_paths`` lists of ``{cwd, hostname}`` entries.
+
+    Dedupes by ``(cwd, hostname)`` and preserves order (existing entries first,
+    then new ones). Entries are normalized to ``{"cwd", "hostname"}`` with
+    stripped strings; anything without a ``cwd`` is dropped. Used so a manual
+    path entry (dashboard / set_executor_config) coexists with hook-registered
+    entries instead of overwriting them.
+    """
+    out: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+
+    def _add(entries: Any) -> None:
+        if not isinstance(entries, (list, tuple)):
+            return
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            cwd = str(entry.get("cwd") or "").strip()
+            if not cwd:
+                continue
+            hostname = str(entry.get("hostname") or "").strip()
+            key = (cwd, hostname)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append({"cwd": cwd, "hostname": hostname})
+
+    _add(existing)
+    _add(new)
+    return out
+
+
 def normalize_executor_config(raw: dict[str, Any] | None) -> dict[str, Any]:
     """Keep only the supported executor_config keys."""
     if not isinstance(raw, dict):

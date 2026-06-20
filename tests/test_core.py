@@ -10016,6 +10016,61 @@ def test_mcp_agent_instructions_round_trip(client):
     assert "Always run tests before committing" in sess_text, f"instructions not in start_session: {sess_text}"
 
 
+def test_merge_repo_paths_helper():
+    """merge_repo_paths dedupes by (cwd, hostname), preserves order, drops junk."""
+    from meridian.executor_config import merge_repo_paths
+    existing = [{"cwd": "C:/a", "hostname": "h1"}]
+    new = [
+        {"cwd": "C:/a", "hostname": "h1"},          # dup → skipped
+        {"cwd": "D:/b", "hostname": "h2"},          # new
+        {"cwd": "  ", "hostname": "h3"},            # blank cwd → dropped
+        {"hostname": "h4"},                          # no cwd → dropped
+        "not-a-dict",                                # junk → dropped
+        {"cwd": " E:/c ", "hostname": " h5 "},       # trimmed
+    ]
+    assert merge_repo_paths(existing, new) == [
+        {"cwd": "C:/a", "hostname": "h1"},
+        {"cwd": "D:/b", "hostname": "h2"},
+        {"cwd": "E:/c", "hostname": "h5"},
+    ]
+    # hostname optional; None/garbage inputs yield [].
+    assert merge_repo_paths(None, [{"cwd": "C:/x"}]) == [{"cwd": "C:/x", "hostname": ""}]
+    assert merge_repo_paths("junk", None) == []
+
+
+def test_mcp_set_executor_config_merges_repo_paths(client):
+    """set_executor_config merges repo_paths [{cwd,hostname}] across calls instead
+    of overwriting, and preserves other executor_config keys."""
+    import json as _json
+    pid = client.post("/projects", json={"name": "repo-paths-merge-test"}).json()["id"]
+
+    def _cfg(resp):
+        assert resp.get("result") is not None, resp
+        return _json.loads(resp["result"]["content"][0]["text"])
+
+    # First call: a scalar + one known location.
+    cfg1 = _cfg(_mcp_call(client, "set_executor_config", {
+        "project_id": pid, "branch": "dev",
+        "repo_paths": [{"cwd": "C:/a", "hostname": "host1"}],
+    }))
+    assert cfg1["branch"] == "dev"
+    assert cfg1["repo_paths"] == [{"cwd": "C:/a", "hostname": "host1"}]
+
+    # Second call: a dup + a new entry + a different scalar. The first entry must
+    # survive (merge, not overwrite); branch preserved; dup not duplicated.
+    cfg2 = _cfg(_mcp_call(client, "set_executor_config", {
+        "project_id": pid, "test_cmd": "pixi run test",
+        "repo_paths": [{"cwd": "C:/a", "hostname": "host1"},
+                       {"cwd": "D:/b", "hostname": "host2"}],
+    }))
+    assert cfg2["repo_paths"] == [
+        {"cwd": "C:/a", "hostname": "host1"},
+        {"cwd": "D:/b", "hostname": "host2"},
+    ]
+    assert cfg2["branch"] == "dev"            # preserved across the merge
+    assert cfg2["test_cmd"] == "pixi run test"
+
+
 @pytest.mark.asyncio
 async def test_rollup_parent_all_done(db):
     """Completing all children auto-completes the parent."""
