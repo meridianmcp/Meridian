@@ -45,52 +45,6 @@ running `create_project(name="your-project")`.
 
 ---
 
-## Session rules
-
-ALWAYS at session start:
-- Call `start_session(project_id="PROJECT_ID", session_name="describe-what-youre-doing")`
-- This returns the goal, recent tasks, pending sprint items, and active sessions in one call.
-- If the response contains pending sprint items, immediately call `claim_sprint_item` on the first unclaimed one and start working. Do NOT ask "what would you like to work on?" when there are pending items.
-
-ALWAYS during work:
-- Call `log_task(session_id, project_id, description)` after completing meaningful work.
-- Call `pin_decision(project_id, title, body, category)` for any architectural choice.
-- Call `request_hitl(project_id, question)` when you need a human decision before continuing.
-
-ALWAYS before ending:
-- Call `checkpoint(session_id, project_id)` — snapshots progress, generates delta handoff, returns next `/goal` string.
-
----
-
-## Parallel sessions
-
-Before editing shared files, call `claim_file(session_id, path)` and check the `file_warnings` returned by `start_session`. If another active session has claimed a file you need, serialize the work or ask the human before editing.
-
-High-contention files are always sequential:
-
-- `meridian/static/dashboard.js`
-- `meridian/server.py`
-- `meridian/db/__init__.py`
-- `hooks.ps1` — ⛔ NEVER edit or run. User-facing installer; running it rotates the API token and kills the human's active Claude Code session.
-- `hooks.sh` — ⛔ NEVER edit or run. Same token-rotation hazard as `hooks.ps1`.
-
-### Worktree isolation (parallel safe)
-
-When `claim_sprint_item()` returns `worktree_suggested: true`, use the provided commands to isolate your work:
-
-```
-1. git worktree add {worktree_path} -b {worktree_branch}    # from worktree_setup_cmd
-2. POST /projects/{id}/worktrees  {"session_id":..., "branch":..., "path":..., "item_id":...}
-3. cd {worktree_path} — do ALL work here (copy .env from parent dir)
-4. When done: git checkout dev && git merge {worktree_branch} --no-edit
-5. DELETE /projects/{id}/worktrees/{worktree_id}
-6. git worktree remove {worktree_path} --force && git branch -d {worktree_branch}
-```
-
-Enable worktree mode project-wide via `set_executor_config(isolation="worktree")`.
-
----
-
 ## Python one-liners
 
 For stdlib-only scripts (secret generation, JSON parsing, base64, file ops):
@@ -157,7 +111,7 @@ New projects get the Meridian defaults automatically — no file configuration r
 
 ---
 <!-- MERIDIAN STATE — auto-generated, do not edit below -->
-## Current Sprint State  _(auto-updated 2026-06-16 16:23 UTC)_
+## Current Sprint State  _(auto-updated 2026-06-20 06:25 UTC)_
 
 **Key Files:**
 - `meridian/server.py` — FastAPI app + MCP handlers

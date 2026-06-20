@@ -47,31 +47,13 @@ running `create_project(name="your-project")`.
 
 ---
 
-## Session rules
+## Executor rules
 
-ALWAYS at session start:
-- Call `start_session(project_id="YOUR_PROJECT_ID", session_name="describe-what-youre-doing")`
-- This returns the goal, recent tasks, pending sprint items, and active sessions in one call.
-
-ALWAYS during work:
-- Call `log_task(session_id, project_id, description)` after completing meaningful work.
-- Call `pin_decision(project_id, title, body, category)` for any architectural choice.
-- Call `request_hitl(project_id, question)` when you need a human decision before continuing.
-
-ALWAYS before ending:
-- Call `checkpoint(session_id, project_id)` — snapshots progress, generates delta handoff, returns next `/goal` string.
-
----
-
-## Parallel sessions
-
-Before editing shared files, call `claim_file(session_id, path)` and check the `file_warnings` returned by `start_session`. If another active session has claimed a file you need, serialize the work or ask the human before editing.
-
-List the high-contention files in your own project here — the ones where concurrent
-edits cause painful merge conflicts (for example a monolithic frontend bundle, your
-main server module, or your DB layer). Treat those as always-sequential.
-
-Sprint items can carry `touches_files` so handoffs and dashboards can warn when planned work overlaps with a live session.
+The behavioral rules for your sessions (session-start discipline, file/symbol
+claiming, sprint-board hygiene, deploy gates) are injected automatically into every
+`start_session` response. View, edit, or reset them in the Meridian dashboard →
+**Settings → Executor Rules**. New projects get the Meridian defaults automatically —
+no file configuration required.
 
 ---
 
