@@ -313,15 +313,18 @@ def _select_strategic_notes(
 ) -> list[dict[str, Any]]:
     """Keep only notes that help a restarted planning chat.
 
-    Includes notes carrying a strategic tag and every kind='insight' note
-    (db9edba3 — insights captured via capture_insight are planner-facing by
-    definition, so they surface here regardless of tags).
+    Includes: kind='insight' notes, notes with strategic tags, and any note
+    flagged priority='high' (Sprint-4 — explicit human signal that the note
+    belongs in every generate_handoff and planner brief).
     """
     selected = []
     for note in notes:
         kind = (note.get("note_kind") or note.get("kind") or "").lower()
-        if kind == "insight" or (_note_tags(note) & _STRATEGIC_NOTE_TAGS):
+        priority = (note.get("priority") or "normal").lower()
+        if kind == "insight" or priority == "high" or (_note_tags(note) & _STRATEGIC_NOTE_TAGS):
             selected.append(note)
+    # High-priority notes sort to the top.
+    selected.sort(key=lambda n: {"high": 0, "normal": 1, "low": 2}.get((n.get("priority") or "normal").lower(), 1))
     return selected
 
 

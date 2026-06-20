@@ -946,7 +946,7 @@ def test_websocket_receives_task_event(client):
 def test_tunnel_status_returns_inactive_for_unknown_tenant(client):
     r = client.get("/tunnel/status/no-such-tenant")
     assert r.status_code == 200
-    assert r.json() == {"tenant_id": "no-such-tenant", "active": False}
+    assert r.json() == {"tenant_id": "no-such-tenant", "active": False, "code_active": False}
 
 
 def test_fs_mcp_proxy_returns_503_when_not_hosted(client):
@@ -5560,10 +5560,14 @@ def test_pg_migration_registry_matches_historical_order():
         "_migrate_pg_backfill_agent_instructions",
         "_migrate_pg_note_kind",
         "_migrate_pg_file_symbol_claims",
+        "_migrate_pg_code_intel",
+        "_migrate_pg_notes_priority",
+        "_migrate_pg_task_log_kind",
+        "_migrate_pg_oauth_refresh_tokens",
     ]
     # No duplicates across the three groups.
     allnames = core + hosted + late
-    assert len(allnames) == len(set(allnames)) == 44
+    assert len(allnames) == len(set(allnames)) == 48
 
 
 def test_cached_plan_error_is_retryable():
@@ -5659,6 +5663,129 @@ def test_pg_pool_disables_prepared_statements():
 
     src = inspect.getsource(pg_module)
     assert src.count('"prepare_threshold": None') >= 2
+
+
+# ---------------------------------------------------------------------------
+# Sprint-4: notes priority + task log kind
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_add_note_with_high_priority(db):
+    p = await db_module.create_project(db, "prio-test")
+    note = await db_module.add_project_note(
+        db, p["id"], "Critical deployment note", "Read before shipping", priority="high"
+    )
+    assert note["priority"] == "high"
+
+
+@pytest.mark.asyncio
+async def test_add_note_invalid_priority_defaults_to_normal(db):
+    p = await db_module.create_project(db, "prio-default")
+    note = await db_module.add_project_note(
+        db, p["id"], "A note", "Body", priority="invalid-value"
+    )
+    assert note["priority"] == "normal"
+
+
+@pytest.mark.asyncio
+async def test_update_note_priority(db):
+    p = await db_module.create_project(db, "prio-update")
+    note = await db_module.add_project_note(db, p["id"], "T", "B")
+    assert note.get("priority") == "normal"
+    updated = await db_module.update_project_note(db, note["id"], priority="high")
+    assert updated["priority"] == "high"
+
+
+@pytest.mark.asyncio
+async def test_log_task_with_kind(db):
+    p = await db_module.create_project(db, "kind-test")
+    s = await db_module.register_session(db, p["id"], "sess")
+    task = await db_module.log_task(db, s["id"], p["id"], "Shipped auth fix", kind="shipped")
+    assert task["kind"] == "shipped"
+
+
+@pytest.mark.asyncio
+async def test_log_task_invalid_kind_stored_as_null(db):
+    p = await db_module.create_project(db, "kind-null")
+    s = await db_module.register_session(db, p["id"], "sess")
+    task = await db_module.log_task(db, s["id"], p["id"], "Something", kind="bogus")
+    assert task.get("kind") is None
+
+
+def test_high_priority_note_in_strategic_selection():
+    from meridian.handoff import _select_strategic_notes
+    notes = [
+        {"note_kind": "wiki", "priority": "high", "tags": "", "title": "High prio", "body": ""},
+        {"note_kind": "wiki", "priority": "normal", "tags": "", "title": "Normal", "body": ""},
+        {"note_kind": "insight", "priority": "normal", "tags": "", "title": "Insight", "body": ""},
+    ]
+    selected = _select_strategic_notes(notes)
+    titles = [n["title"] for n in selected]
+    assert "High prio" in titles
+    assert "Insight" in titles
+    assert "Normal" not in titles
+    # High priority note sorts before insight
+    assert selected[0]["title"] == "High prio"
+
+
+# ---------------------------------------------------------------------------
+# Sprint-5: OAuth refresh tokens
+# ---------------------------------------------------------------------------
+
+def test_oauth_token_endpoint_returns_refresh_token(client):
+    """authorization_code grant must now return refresh_token in the response."""
+    from meridian.routes import oauth as oauth_module
+    import secrets, time
+
+    code = f"code-{secrets.token_hex(8)}"
+    oauth_module._oa_codes[code] = {
+        "client_id": "test-client",
+        "redirect_uri": "",
+        "challenge": "",
+        "tenant_id": None,
+        "exp": time.time() + 300,
+    }
+    r = client.post("/oauth/token", json={
+        "grant_type": "authorization_code",
+        "code": code,
+        "redirect_uri": "",
+    })
+    assert r.status_code == 200
+    body = r.json()
+    assert "access_token" in body
+    assert "refresh_token" in body
+    assert body["refresh_token"].startswith("rt_meridian_")
+
+
+def test_oauth_discovery_advertises_refresh_token(client):
+    r = client.get("/.well-known/oauth-authorization-server")
+    assert r.status_code == 200
+    assert "refresh_token" in r.json().get("grant_types_supported", [])
+
+
+@pytest.mark.asyncio
+async def test_oauth_refresh_token_grant_issues_new_tokens(db):
+    """Exercising _issue_refresh_token + _consume_refresh_token helpers directly."""
+    from meridian.routes import oauth as oauth_module
+
+    rt = await oauth_module._issue_refresh_token(db, tenant_id=None, client_id="test")
+    assert rt.startswith("rt_meridian_")
+
+    rt_hash = oauth_module._oauth_token_hash(rt)
+    rt_data = await oauth_module._consume_refresh_token(db, rt_hash)
+    assert rt_data is not None
+    assert rt_data["client_id"] == "test"
+
+    # Replay: already used — must be rejected
+    rt_data2 = await oauth_module._consume_refresh_token(db, rt_hash)
+    assert rt_data2 is None
+
+
+@pytest.mark.asyncio
+async def test_oauth_refresh_token_unknown_rejected(db):
+    from meridian.routes import oauth as oauth_module
+    result = await oauth_module._consume_refresh_token(db, "nonexistent-hash")
+    assert result is None
 
 
 def test_rewind_milestones_tab_label(client):

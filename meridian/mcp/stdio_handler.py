@@ -277,7 +277,8 @@ def build_mcp_server():
                     "Log what this session just did, is doing, or failed "
                     "at. Call frequently to keep all sessions informed of "
                     "progress. Status is one of 'pending', 'done', "
-                    "'failed' (default 'done')."
+                    "'failed' (default 'done'). Optional kind classifies the "
+                    "entry: shipped (default), found, decided, blocked."
                 ),
                 inputSchema={
                     "type": "object",
@@ -289,6 +290,11 @@ def build_mcp_server():
                             "type": "string",
                             "enum": ["pending", "done", "failed"],
                             "default": "done",
+                        },
+                        "kind": {
+                            "type": "string",
+                            "enum": ["shipped", "found", "decided", "blocked"],
+                            "description": "Entry taxonomy. shipped=work done, found=discovery, decided=arch choice, blocked=blocker.",
                         },
                     },
                     "required": [
@@ -608,9 +614,12 @@ def build_mcp_server():
             Tool(
                 name="add_note",
                 description=(
-                    "v0.9 — add a per-project wiki note. Use for setup steps, "
-                    "gotchas, env var reference, how-tos — anything a future "
-                    "session would want to grep. Tags are comma-separated."
+                    "Add a per-project wiki note (setup, gotcha, howto, env, ...). "
+                    "Free-form title/body; comma-separated tags optional. Optional kind "
+                    "(wiki=gotcha/rule/howto, insight=strategic/product analysis, "
+                    "reference=external/one-off docs) controls how the dashboard renders it. "
+                    "Tag a note 'roadmap' AND pass a committable category (TECHNICAL/ARCHITECTURAL/PRODUCT) "
+                    "to also append it to ROADMAP.md's roadmap-notes anchor."
                 ),
                 inputSchema={
                     "type": "object",
@@ -619,6 +628,20 @@ def build_mcp_server():
                         "title": {"type": "string"},
                         "body": {"type": "string"},
                         "tags": {"type": "string"},
+                        "kind": {
+                            "type": "string",
+                            "enum": ["wiki", "insight", "reference"],
+                            "description": "Note taxonomy for dashboard rendering.",
+                        },
+                        "priority": {
+                            "type": "string",
+                            "enum": ["high", "normal", "low"],
+                            "description": "high-priority notes surface first in generate_handoff and planner context.",
+                        },
+                        "category": {
+                            "type": "string",
+                            "description": "Required when tags includes 'roadmap'. E.g. TECHNICAL, ARCHITECTURAL, PRODUCT.",
+                        },
                     },
                     "required": ["project_id", "title", "body"],
                 },

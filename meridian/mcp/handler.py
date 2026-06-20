@@ -888,6 +888,7 @@ async def _dispatch_mcp_tool(
             db, args["session_id"], args["project_id"],
             args["description"], args.get("status", "done"),
             parent_task_id=args.get("parent_task_id"),
+            kind=args.get("kind"),
         )
         return await _maybe_add_log_task_nudge(db, task)
     if name == "get_tasks":
@@ -1181,6 +1182,7 @@ async def _dispatch_mcp_tool(
         result = await db_module.add_project_note(
             db, args["project_id"], args["title"], args["body"],
             args.get("tags"), kind=args.get("kind"),
+            priority=args.get("priority", "normal"),
         )
         await _server._append_note_to_roadmap(
             args["title"], args["body"], args.get("tags"), args.get("category"),
@@ -1207,6 +1209,7 @@ async def _dispatch_mcp_tool(
         return await db_module.add_project_note(
             db, args["project_id"], args["title"], _ins_body,
             _ins_tags, kind="insight",
+            priority=args.get("priority", "normal"),
         )
     if name == "get_notes":
         return await db_module.get_project_notes(
@@ -1892,6 +1895,39 @@ async def _dispatch_mcp_tool(
             f'<progress done="{_done_count}" total="{_total_count}" pct="{_pct}%"/>\n'
             if _total_count else ""
         )
+        # Sprint-4: planner role gets richer context — all decisions + all notes + active sessions.
+        planner_extra_xml = ""
+        if role == "planner":
+            try:
+                _decisions = await db_module.get_pinned_decisions(db, project_id, include_superseded=False)
+                if _decisions:
+                    planner_extra_xml += "<decisions>\n" + "\n".join(
+                        f'  <decision category="{d.get("category","")}">{(d.get("title") or "")}: {(d.get("body") or "")[:120]}</decision>'
+                        for d in _decisions[:20]
+                    ) + "\n</decisions>\n"
+            except Exception:
+                pass
+            try:
+                _wiki_notes = await db_module.get_project_notes(db, project_id)
+                # High-priority notes first
+                _wiki_notes = sorted(_wiki_notes, key=lambda n: {"high": 0, "normal": 1, "low": 2}.get(n.get("priority", "normal"), 1))
+                if _wiki_notes:
+                    planner_extra_xml += "<project_notes>\n" + "\n".join(
+                        f'  <note priority="{n.get("priority","normal")}" kind="{n.get("note_kind","wiki")}" tags="{n.get("tags","")}">'
+                        f'{(n.get("title") or "")}: {(n.get("body") or "")[:120]}</note>'
+                        for n in _wiki_notes[:30]
+                    ) + "\n</project_notes>\n"
+            except Exception:
+                pass
+            try:
+                _active_sessions = await db_module.get_sessions(db, project_id, active_only=True)
+                if _active_sessions:
+                    planner_extra_xml += "<active_sessions>\n" + "\n".join(
+                        f'  <session id="{s.get("id","")}" name="{s.get("name","")}" human="{s.get("human_id","")}" last_seen="{s.get("last_seen","")[:19]}"/>'
+                        for s in _active_sessions[:10]
+                    ) + "\n</active_sessions>\n"
+            except Exception:
+                pass
         brief = (
             f'<session_brief project_id="{project_id}" role="{role}">\n'
             f'{notes_xml}'
@@ -1902,6 +1938,7 @@ async def _dispatch_mcp_tool(
             f'<last_tasks>\n{tasks_xml}\n</last_tasks>\n'
             f'{blocking_xml}\n'
             f'{hitl_xml}\n'
+            f'{planner_extra_xml}'
             f'</session_brief>'
         )
         return {"text": brief, "project_id": project_id, "role": role}

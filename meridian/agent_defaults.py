@@ -58,4 +58,11 @@ in the Meridian dashboard → Settings → Executor Rules.
 ## Deploy gate
 - Never fire production deployments without first calling `request_hitl` and
   receiving explicit human approval.
+
+## Code intelligence (if available)
+- If `trace_path` appears in your MCP tool list, use it before opening any file.
+- Prefer structural graph queries (`trace_path`, `search_graph`, `get_architecture`,
+  `detect_changes`) over raw file reads — they are faster and use far fewer tokens.
+- Fall back to reading files only when a graph query is insufficient.
+- If `trace_path` is not in your tool list, ignore this section.
 """
