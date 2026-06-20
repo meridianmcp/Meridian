@@ -209,6 +209,80 @@ def test_me_returns_tenant_id_for_authenticated_user(monkeypatch, tmp_path):
         assert r.json()["tenant_id"] == tenant_id
 
 
+def test_tunnel_plugins_get_returns_resolved_defaults(monkeypatch, tmp_path):
+    """GET /tunnel/plugins returns the three resolved slots for a fresh tenant."""
+    from meridian import db as db_module
+
+    async def _setup(db):
+        tenant = await db_module.upsert_tenant(db, "tp-get@example.com")
+        raw, _row = await db_module.create_api_token(db, tenant["id"], label="t")
+        return raw
+
+    with _make_hosted_client(monkeypatch, tmp_path) as client:
+        raw_token = _run(_setup(client.app.state.db))
+        r = client.get("/tunnel/plugins", headers={"Authorization": f"Bearer {raw_token}"})
+        assert r.status_code == 200
+        body = r.json()
+        assert [p["name"] for p in body["plugins"]] == [
+            "filesystem", "code-intel", "code-extractor"
+        ]
+        assert body["config"] == {}
+        assert body["active"] == {"fs": False, "code": False, "extract": False}
+
+
+def test_tunnel_plugins_put_persists_command_override(monkeypatch, tmp_path):
+    """PUT /tunnel/plugins stores a code-intel command override; GET reflects it."""
+    from meridian import db as db_module
+
+    async def _setup(db):
+        tenant = await db_module.upsert_tenant(db, "tp-put@example.com")
+        raw, _row = await db_module.create_api_token(db, tenant["id"], label="t")
+        return raw
+
+    with _make_hosted_client(monkeypatch, tmp_path) as client:
+        raw_token = _run(_setup(client.app.state.db))
+        hdr = {"Authorization": f"Bearer {raw_token}"}
+        put = client.put(
+            "/tunnel/plugins",
+            headers=hdr,
+            json={"config": [{"name": "code-intel", "command": "codegraph --stdio"}]},
+        )
+        assert put.status_code == 200
+        code = next(p for p in put.json()["plugins"] if p["name"] == "code-intel")
+        assert code["command"] == ["codegraph", "--stdio"]
+        # Persisted — a fresh GET still shows the override.
+        got = client.get("/tunnel/plugins", headers=hdr).json()
+        code2 = next(p for p in got["plugins"] if p["name"] == "code-intel")
+        assert code2["command"] == ["codegraph", "--stdio"]
+
+
+def test_tunnel_plugins_put_empty_clears_overrides(monkeypatch, tmp_path):
+    """PUT with an empty config clears overrides back to built-in defaults."""
+    from meridian import db as db_module
+
+    async def _setup(db):
+        tenant = await db_module.upsert_tenant(db, "tp-clear@example.com")
+        raw, _row = await db_module.create_api_token(db, tenant["id"], label="t")
+        return raw
+
+    with _make_hosted_client(monkeypatch, tmp_path) as client:
+        raw_token = _run(_setup(client.app.state.db))
+        hdr = {"Authorization": f"Bearer {raw_token}"}
+        client.put("/tunnel/plugins", headers=hdr,
+                   json={"config": [{"name": "code-intel", "enabled": False}]})
+        client.put("/tunnel/plugins", headers=hdr, json={"config": []})
+        got = client.get("/tunnel/plugins", headers=hdr).json()
+        assert got["config"] == {}
+        assert all(p["enabled"] for p in got["plugins"])
+
+
+def test_tunnel_plugins_requires_auth(monkeypatch, tmp_path):
+    """PUT /tunnel/plugins without a valid tenant returns 401."""
+    with _make_hosted_client(monkeypatch, tmp_path) as client:
+        r = client.put("/tunnel/plugins", json={"config": []})
+        assert r.status_code == 401
+
+
 def test_delete_orphaned_oauth_keys_endpoint(monkeypatch, tmp_path):
     """DELETE /api/keys/orphaned purges only 'oauth' tokens older than 24h."""
     from meridian import db as db_module

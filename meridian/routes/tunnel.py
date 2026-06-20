@@ -32,7 +32,8 @@ from fastapi import APIRouter, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import Response
 
 from .. import db as db_module
-from .._deps import _hosted_mode
+from .._deps import _hosted_mode, _get_tenant_from_request
+from ..tunnel_plugins import normalize_plugins_config, resolve_plugins
 
 router = APIRouter()
 _log = logging.getLogger(__name__)
@@ -585,6 +586,84 @@ async def tunnel_status(tenant_id: str) -> dict:
         "code_active": tenant_id in _tunnel_code_sockets,
         "extract_active": tenant_id in _tunnel_extract_sockets,
     }
+
+
+# ---------------------------------------------------------------------------
+# Tunnel plugin registry — per-tenant config (dashboard Settings → Tunnel Plugins)
+# ---------------------------------------------------------------------------
+
+def _parse_plugins_json(raw: Any) -> Any:
+    """Parse a stored tunnel_plugins JSON string into Python, tolerating junk."""
+    if isinstance(raw, str) and raw.strip():
+        try:
+            return json.loads(raw)
+        except Exception:  # noqa: BLE001 — malformed config → treat as defaults
+            return None
+    return raw
+
+
+@router.get("/tunnel/plugins")
+async def get_tunnel_plugins(request: Request) -> Response:
+    """Return the current tenant's resolved tunnel plugins + raw override config.
+
+    The dashboard's Settings → Tunnel Plugins section renders ``plugins`` (the
+    three slots with overrides applied) and round-trips ``config`` (the raw
+    per-tenant overrides). Live tunnel sockets feed the per-slot status dots.
+    """
+    tenant = await _get_tenant_from_request(request)
+    if tenant is None:
+        return _json_response({
+            "plugins": resolve_plugins(None), "config": {},
+            "active": {"fs": False, "code": False, "extract": False},
+        })
+    parsed = _parse_plugins_json(tenant.get("tunnel_plugins"))
+    tid = tenant.get("id")
+    return _json_response({
+        "plugins": resolve_plugins(parsed),
+        "config": parsed if isinstance(parsed, (dict, list)) else {},
+        "active": {
+            "fs": tid in _tunnel_sockets,
+            "code": tid in _tunnel_code_sockets,
+            "extract": tid in _tunnel_extract_sockets,
+        },
+    })
+
+
+@router.put("/tunnel/plugins")
+async def put_tunnel_plugins(request: Request) -> Response:
+    """Persist the tenant's tunnel plugin overrides (Settings → Tunnel Plugins).
+
+    Accepts ``{"config": <overrides>}`` or a bare overrides dict/list. The config
+    is normalized before storage; an empty result clears overrides (NULL → the
+    built-in defaults). Takes effect the next time `meridian --tunnel` (re)starts.
+    """
+    tenant = await _get_tenant_from_request(request)
+    if tenant is None:
+        return _json_response({"error": "authentication required"}, status_code=401)
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        return _json_response({"error": "invalid JSON body"}, status_code=400)
+    raw = body.get("config") if isinstance(body, dict) and "config" in body else body
+    normalized = normalize_plugins_config(raw)
+    stored = json.dumps(normalized) if normalized else None
+    # tenants lives in the control-plane DB (app.state.db), not the tenant's
+    # data-plane DB — mirror the WS handler's update_tenant(tunnel_active=...).
+    await db_module.update_tenant(request.app.state.db, tenant["id"], tunnel_plugins=stored)
+    return _json_response({
+        "ok": True,
+        "plugins": resolve_plugins(normalized),
+        "config": normalized,
+    })
+
+
+def _json_response(payload: dict, status_code: int = 200) -> Response:
+    """Small JSON Response helper (keeps these handlers free of FastAPI magic)."""
+    return Response(
+        content=json.dumps(payload),
+        status_code=status_code,
+        media_type="application/json",
+    )
 
 
 # ---------------------------------------------------------------------------

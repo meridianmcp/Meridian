@@ -3025,6 +3025,10 @@ export async function loadSettingsTab(projectId) {
   // delay the rest of the settings wiring below. (fix-settings-tab)
   try { window.loadExecutorRulesSection?.(projectId); } catch (e) {}
 
+  // Tunnel Plugins section (per-account tunnel config) — also defined in
+  // dashboard.js, appended below Executor Rules.
+  try { window.loadTunnelPluginsSection?.(projectId); } catch (e) {}
+
   if (isDemoMode()) hideDemoAdminControls();
 
   // ── Blog CMS wiring (admin only, 6234f9b8) ──────────────────────────────

@@ -1153,6 +1153,113 @@ async function loadExecutorRulesSection(projectId) {
 }
 
 
+// Tunnel Plugins — per-account (tenant) config for what `meridian --tunnel`
+// spawns behind each of the three transport slots (filesystem / code-intel /
+// code-extractor). Swapping a slot's command (e.g. code-intel → codegraph) or
+// disabling a slot is a pure config change here — no redeploy. Rendered under
+// Settings, below Executor Rules. The config is account-scoped, so projectId is
+// only used to locate the settings DOM host.
+const _TUNNEL_DEFAULT_PORTS = { fs: 8808, code: 8809, extract: 8810 };
+
+async function loadTunnelPluginsSection(projectId) {
+  const host = document.getElementById(`settings-body-${projectId}`);
+  if (!host) return;
+  const existing = document.getElementById(`tunnel-plugins-section-${projectId}`);
+  if (existing) existing.remove();
+  const section = document.createElement('div');
+  section.id = `tunnel-plugins-section-${projectId}`;
+  section.style.cssText = 'margin-top:18px;padding-top:14px;border-top:1px solid var(--border)';
+  host.appendChild(section);
+
+  try {
+    const data = await api('/tunnel/plugins');
+    const plugins = (data && data.plugins) || [];
+    const active = (data && data.active) || {};
+
+    const rows = plugins.map((p) => {
+      const cmd = Array.isArray(p.command) ? p.command.join(' ') : '';
+      const dot = active[p.slot] ? 'var(--success, #3fb950)' : 'var(--muted)';
+      const dotTitle = active[p.slot] ? 'connected' : 'not connected';
+      return `
+        <div style="border:1px solid var(--border);border-radius:4px;padding:8px;margin-bottom:8px">
+          <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px">
+            <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:11px;color:var(--text);font-weight:600">
+              <input type="checkbox" class="tp-enabled" data-name="${escapeHtml(p.name)}" ${p.enabled ? 'checked' : ''}
+                style="width:14px;height:14px;accent-color:var(--accent);cursor:pointer">
+              ${escapeHtml(p.name)}
+              <span style="font-size:9px;color:var(--muted);font-weight:400">/${escapeHtml(p.slot)}</span>
+            </label>
+            <span title="${dotTitle}" style="display:inline-flex;align-items:center;gap:4px;font-size:9px;color:var(--muted)">
+              <span style="width:8px;height:8px;border-radius:50%;background:${dot}"></span>${dotTitle}
+            </span>
+          </div>
+          <div style="display:flex;gap:8px;align-items:center">
+            <input type="text" class="tp-command" data-name="${escapeHtml(p.name)}" value="${escapeHtml(cmd)}"
+              placeholder="default (${escapeHtml(p.description || 'built-in command')})"
+              style="flex:1;box-sizing:border-box;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:5px 7px;outline:none">
+            <input type="number" class="tp-port" data-name="${escapeHtml(p.name)}" data-slot="${escapeHtml(p.slot)}" value="${p.port}"
+              title="local proxy port"
+              style="width:74px;box-sizing:border-box;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:5px 7px;outline:none">
+          </div>
+        </div>`;
+    }).join('');
+
+    section.innerHTML = `
+      <div style="font-size:11px;font-weight:700;letter-spacing:.5px;color:var(--accent);text-transform:uppercase;margin-bottom:4px">Tunnel Plugins</div>
+      <div style="font-size:10px;color:var(--muted);margin-bottom:8px;line-height:1.5">
+        What <code>meridian --tunnel</code> spawns behind each transport slot. Leave a command
+        blank for the built-in default, or set one to swap it (e.g. <code>code-intel</code> →
+        <code>codegraph</code>). Changes apply the next time the tunnel restarts.
+      </div>
+      ${rows || '<div style="color:var(--muted);font-size:10px">No plugins.</div>'}
+      <div style="display:flex;justify-content:flex-end;gap:6px;margin-top:6px">
+        <button class="secondary admin-only" id="tp-reset-${projectId}" style="padding:2px 10px;font-size:10px" title="Clear all overrides (back to built-in defaults)">Reset to defaults</button>
+        <button class="primary admin-only" id="tp-save-${projectId}" style="padding:2px 10px;font-size:10px">Save</button>
+      </div>
+      <div id="tp-status-${projectId}" style="font-size:10px;color:var(--muted);margin-top:4px;text-align:right"></div>`;
+
+    const statusEl = document.getElementById(`tp-status-${projectId}`);
+    const setStatus = (m) => { if (statusEl) { statusEl.textContent = m; if (m) setTimeout(() => { if (statusEl.textContent === m) statusEl.textContent = ''; }, 2500); } };
+
+    const collectConfig = () => {
+      const cfg = [];
+      section.querySelectorAll('.tp-enabled').forEach((en) => {
+        const name = en.dataset.name;
+        const cmdEl = section.querySelector(`.tp-command[data-name="${CSS.escape(name)}"]`);
+        const portEl = section.querySelector(`.tp-port[data-name="${CSS.escape(name)}"]`);
+        const entry = { name, enabled: en.checked };
+        const cmdVal = (cmdEl && cmdEl.value || '').trim();
+        if (cmdVal) entry.command = cmdVal;
+        const portVal = parseInt(portEl && portEl.value, 10);
+        const slot = portEl && portEl.dataset.slot;
+        if (Number.isInteger(portVal) && portVal !== _TUNNEL_DEFAULT_PORTS[slot]) entry.port = portVal;
+        cfg.push(entry);
+      });
+      return cfg;
+    };
+
+    document.getElementById(`tp-save-${projectId}`).onclick = async () => {
+      try {
+        await api('/tunnel/plugins', { method: 'PUT', body: JSON.stringify({ config: collectConfig() }) });
+        toast('Tunnel plugins saved');
+        setStatus('Saved — restart the tunnel to apply.');
+      } catch (e) { toast('Save failed: ' + e.message, true); }
+    };
+
+    document.getElementById(`tp-reset-${projectId}`).onclick = async () => {
+      if (!confirm('Clear all tunnel plugin overrides and return to built-in defaults?')) return;
+      try {
+        await api('/tunnel/plugins', { method: 'PUT', body: JSON.stringify({ config: [] }) });
+        toast('Reset to defaults');
+        loadTunnelPluginsSection(projectId);
+      } catch (e) { toast('Reset failed: ' + e.message, true); }
+    };
+  } catch (e) {
+    section.innerHTML = `<div class="empty" style="color:var(--error)">Failed to load tunnel plugins: ${escapeHtml(e.message)}</div>`;
+  }
+}
+
+
 
 // function hideDemoAdminControls -- moved to dashboard-demo.js / dashboard-timeline.js
 

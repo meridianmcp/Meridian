@@ -3841,6 +3841,10 @@ project_id = "${displayPid}"`;
         window.loadExecutorRulesSection?.(projectId);
       } catch (e) {
       }
+      try {
+        window.loadTunnelPluginsSection?.(projectId);
+      } catch (e) {
+      }
       if (isDemoMode()) hideDemoAdminControls();
       setTimeout(() => {
         const titleIn = document.getElementById("blog-title");
