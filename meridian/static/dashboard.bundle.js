@@ -1749,7 +1749,7 @@
       grid.insertAdjacentElement("afterend", link);
     });
   }
-  async function loadSettingsTab(projectId) {
+  async function loadSettingsTab2(projectId) {
     const body = document.getElementById(`settings-body-${projectId}`);
     if (!body) return;
     body.innerHTML = '<div style="color:var(--muted);font-size:11px">loading\u2026</div>';
@@ -3837,6 +3837,10 @@ project_id = "${displayPid}"`;
       }
       _applySettingsRoleVisibility(projectId, _guest);
       _collapseConnectPlatforms(projectId);
+      try {
+        window.loadExecutorRulesSection?.(projectId);
+      } catch (e) {
+      }
       if (isDemoMode()) hideDemoAdminControls();
       setTimeout(() => {
         const titleIn = document.getElementById("blog-title");
@@ -4446,7 +4450,7 @@ project_id = "${displayPid}"`;
               method: "POST",
               body: JSON.stringify({ repo, branch })
             });
-            loadSettingsTab(projectId);
+            loadSettingsTab2(projectId);
           } catch (e) {
             if (statusEl) statusEl.textContent = e.message || "Save failed";
           } finally {
@@ -4462,7 +4466,7 @@ project_id = "${displayPid}"`;
           ghDisconnectBtn.disabled = true;
           try {
             await api(`/projects/${projectId}/github/disconnect`, { method: "DELETE" });
-            loadSettingsTab(projectId);
+            loadSettingsTab2(projectId);
           } catch (e) {
             if (statusEl) statusEl.textContent = "error disconnecting";
             ghDisconnectBtn.disabled = false;
@@ -4520,7 +4524,7 @@ project_id = "${displayPid}"`;
     }
   }
   try {
-    Object.assign(window, { suggestNtfyTopic: suggestNtfyTopic2, loadSettingsTab });
+    Object.assign(window, { suggestNtfyTopic: suggestNtfyTopic2, loadSettingsTab: loadSettingsTab2 });
   } catch (e) {
   }
 
@@ -5629,7 +5633,7 @@ ${n.tags || ""}`.toLowerCase();
     if (activeVtab === "notes") await loadNotesTab(projectId);
     if (activeVtab === "hitl") await loadHitlTab(projectId);
     if (activeVtab === "docs") await loadDocsTab(projectId);
-    if (activeVtab === "settings") await loadSettingsTab2(projectId);
+    if (activeVtab === "settings") await loadSettingsTab(projectId);
   }
   function syncSidebarActiveProject() {
     document.querySelectorAll(".project-item").forEach((item) => {
@@ -5670,10 +5674,14 @@ ${n.tags || ""}`.toLowerCase();
     panel._projectSettings = settings || { project_id: projectId, max_pinned_decisions: DEFAULT_MAX_PINNED_DECISIONS };
     return panel._projectSettings;
   }
-  async function loadSettingsTab2(projectId) {
+  async function loadExecutorRulesSection(projectId) {
     const host = document.getElementById(`settings-body-${projectId}`);
     if (!host) return;
-    host.innerHTML = `<div class="empty" style="color:var(--muted)">loading\u2026</div>`;
+    const _existing = document.getElementById(`executor-rules-section-${projectId}`);
+    if (_existing) _existing.remove();
+    const section = document.createElement("div");
+    section.id = `executor-rules-section-${projectId}`;
+    host.appendChild(section);
     try {
       const [data, defaultData, settingsData] = await Promise.all([
         projectApi2(projectId, `/projects/${projectId}/agent-instructions`),
@@ -5683,7 +5691,7 @@ ${n.tags || ""}`.toLowerCase();
       const current = data.agent_instructions || "";
       const defaultText = defaultData.default_agent_instructions || "";
       const codeIntelEnabled = settingsData ? !!settingsData.code_intel_enabled : false;
-      host.innerHTML = `
+      section.innerHTML = `
 
       <div style="margin-bottom:12px">
 
@@ -5784,7 +5792,7 @@ ${n.tags || ""}`.toLowerCase();
       </div>
 
     `;
-      host.appendChild(ciBlock);
+      section.appendChild(ciBlock);
       const ciToggle = document.getElementById(`code-intel-toggle-${projectId}`);
       const ciInfo = document.getElementById(`code-intel-info-${projectId}`);
       ciToggle.onchange = async () => {
@@ -5801,7 +5809,7 @@ ${n.tags || ""}`.toLowerCase();
         }
       };
     } catch (e) {
-      host.innerHTML = `<div class="empty" style="color:var(--error)">Failed to load: ${escapeHtml(e.message)}</div>`;
+      section.innerHTML = `<div class="empty" style="color:var(--error)">Failed to load executor rules: ${escapeHtml(e.message)}</div>`;
     }
   }
   var _DEMO_TOUR_STEPS = [
@@ -7752,7 +7760,7 @@ Current: ${current || "(none)"}`,
           if (vtab === "notes") loadNotesTab(project.id);
           if (vtab === "hitl") loadHitlTab(project.id);
           if (vtab === "docs") loadDocsTab(project.id);
-          if (vtab === "settings") loadSettingsTab2(project.id);
+          if (vtab === "settings") loadSettingsTab(project.id);
         };
       });
       try {
@@ -11721,7 +11729,7 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
     }
   }
   try {
-    Object.assign(window, { hideHostedAdminControls, ensureSignOutLink: ensureSignOutLink2, ensureWorkspaceSwitcher: ensureWorkspaceSwitcher2, getActiveWorkspaceRole: getActiveWorkspaceRole2, showConnectDbModal, showLocalServerControls, _summarizeApiErrorText, _projectLoadErrorInfo, wireProjectLoadRetry: wireProjectLoadRetry2, renderProjectLoadError: renderProjectLoadError2, recordProjectLoadError, clearProjectLoadError, renderProjectLoadAlert, retryProjectSurface, syncSidebarActiveProject, autosizeGoalField, githubIconSvg: githubIconSvg2, getConstitutionLimit, loadProjectSettings: loadProjectSettings2, saveProjectSettings: saveProjectSettings2, loadSettingsTab: loadSettingsTab2, _demoTourDone: _demoTourDone2, _demoTourSavedStep: _demoTourSavedStep2, _demoTourSaveStep, _demoTourMarkDone, _demoTourClose, _tourActivateVtab, startDemoTour: startDemoTour2, resumeDemoTour, api: api2, projectApi: projectApi2, loadServerConfig, _armAccountSwitchWatch, _refreshOnFocus, _checkAccountSwitch, _showAccountSwitchBanner, updateGitHubConnectionIndicator, _updateConnectionIndicator, checkGitStatus, _doRestart, loadConfig, loadProjects, openTab, closeTab, saveTabs, renderTabs, _makeTabEl, _openTabMenu, _setProjectIcon, _renameProject, _deleteProject, activateTab, buildTabBody, scheduleLiveRefresh, initLiveAutoRefresh, loadLiveTab, refreshLiveTab, wireSprintAddEnter: wireSprintAddEnter2, sprintAction, sprintArchive, filterBackburner, sprintPushPrompt, sprintFeedback, sprintFeedbackNote, sprintItemEdit, addSprintItemFromInput: addSprintItemFromInput2, cacheMostRecentSession, renderLiveSessions, endLiveSession, openTimelineForSession, renderLiveQueue, addLiveTask, cancelLiveTask, showCopyPreview, wireClaudeLaunchPanel, stampHandoffTs, populateSessionDropdown, loadTimeline: loadTimeline2, _renderTimelineLog: _renderTimelineLog2, loadDocsTab, normalizeNotifyTarget, displayNotifyTarget: displayNotifyTarget2, osExecutorHintBanner: osExecutorHintBanner2, showFailoverBannerIfNeeded, suggestNtfyTopic, loadHitlTab, loadTeamTab, updateLiveFeed, loadRecentSessions, loadMilestones, loadRecentRuns, loadQueue, renderSearchResults: renderSearchResults2, wireQueueSectionToggles, refreshTab, refreshGoal, parseDecisionsBlob, renderConstitutionWarning: renderConstitutionWarning2, _hitlBadgeClick, initHitlPanel, setVtabCountBadge: setVtabCountBadge2, refreshProjectCountBadges, refreshHitl, _hitlAnswer, _hitlDismiss, loadPinnedDecisions, supersedePinnedDecision, addPinnedDecision, consolidateDecisions, renderDecisionsTable, wireGoalPreviewToggle, saveGoal, saveNorthStar, saveSprint, _sessionPresenceDot, refreshSessions, refreshTasks, renderTasks, _loadMoreTasks, renderTaskRow, deleteTaskRow, renderHitlRow, wireHitlRow, appendToGoal, hitlReply, hitlExecute, connectWs, handleWsEvent, restoreTabs, _deleteSprintItem, _sprintAction, completeSprintItem, failSprintItem, toggleExpand, state });
+    Object.assign(window, { hideHostedAdminControls, ensureSignOutLink: ensureSignOutLink2, ensureWorkspaceSwitcher: ensureWorkspaceSwitcher2, getActiveWorkspaceRole: getActiveWorkspaceRole2, showConnectDbModal, showLocalServerControls, _summarizeApiErrorText, _projectLoadErrorInfo, wireProjectLoadRetry: wireProjectLoadRetry2, renderProjectLoadError: renderProjectLoadError2, recordProjectLoadError, clearProjectLoadError, renderProjectLoadAlert, retryProjectSurface, syncSidebarActiveProject, autosizeGoalField, githubIconSvg: githubIconSvg2, getConstitutionLimit, loadProjectSettings: loadProjectSettings2, saveProjectSettings: saveProjectSettings2, loadExecutorRulesSection, _demoTourDone: _demoTourDone2, _demoTourSavedStep: _demoTourSavedStep2, _demoTourSaveStep, _demoTourMarkDone, _demoTourClose, _tourActivateVtab, startDemoTour: startDemoTour2, resumeDemoTour, api: api2, projectApi: projectApi2, loadServerConfig, _armAccountSwitchWatch, _refreshOnFocus, _checkAccountSwitch, _showAccountSwitchBanner, updateGitHubConnectionIndicator, _updateConnectionIndicator, checkGitStatus, _doRestart, loadConfig, loadProjects, openTab, closeTab, saveTabs, renderTabs, _makeTabEl, _openTabMenu, _setProjectIcon, _renameProject, _deleteProject, activateTab, buildTabBody, scheduleLiveRefresh, initLiveAutoRefresh, loadLiveTab, refreshLiveTab, wireSprintAddEnter: wireSprintAddEnter2, sprintAction, sprintArchive, filterBackburner, sprintPushPrompt, sprintFeedback, sprintFeedbackNote, sprintItemEdit, addSprintItemFromInput: addSprintItemFromInput2, cacheMostRecentSession, renderLiveSessions, endLiveSession, openTimelineForSession, renderLiveQueue, addLiveTask, cancelLiveTask, showCopyPreview, wireClaudeLaunchPanel, stampHandoffTs, populateSessionDropdown, loadTimeline: loadTimeline2, _renderTimelineLog: _renderTimelineLog2, loadDocsTab, normalizeNotifyTarget, displayNotifyTarget: displayNotifyTarget2, osExecutorHintBanner: osExecutorHintBanner2, showFailoverBannerIfNeeded, suggestNtfyTopic, loadHitlTab, loadTeamTab, updateLiveFeed, loadRecentSessions, loadMilestones, loadRecentRuns, loadQueue, renderSearchResults: renderSearchResults2, wireQueueSectionToggles, refreshTab, refreshGoal, parseDecisionsBlob, renderConstitutionWarning: renderConstitutionWarning2, _hitlBadgeClick, initHitlPanel, setVtabCountBadge: setVtabCountBadge2, refreshProjectCountBadges, refreshHitl, _hitlAnswer, _hitlDismiss, loadPinnedDecisions, supersedePinnedDecision, addPinnedDecision, consolidateDecisions, renderDecisionsTable, wireGoalPreviewToggle, saveGoal, saveNorthStar, saveSprint, _sessionPresenceDot, refreshSessions, refreshTasks, renderTasks, _loadMoreTasks, renderTaskRow, deleteTaskRow, renderHitlRow, wireHitlRow, appendToGoal, hitlReply, hitlExecute, connectWs, handleWsEvent, restoreTabs, _deleteSprintItem, _sprintAction, completeSprintItem, failSprintItem, toggleExpand, state });
   } catch (e) {
   }
 })();

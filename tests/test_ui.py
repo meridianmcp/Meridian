@@ -463,3 +463,39 @@ def test_dashboard_constants_in_utils(client):
     assert not re.search(r"^const DEFAULT_MAX_PINNED_DECISIONS\s*=", dashboard_src, re.MULTILINE), (
         "DEFAULT_MAX_PINNED_DECISIONS must not be re-defined in dashboard.js"
     )
+
+
+def test_settings_tab_renderer_is_not_duplicated():
+    """Only the settings module may define loadSettingsTab.
+
+    Regression for fix-settings-tab: dashboard.js once defined its own
+    loadSettingsTab (Executor Rules only). In the esbuild IIFE bundle it shadowed
+    the full-settings module's loadSettingsTab, so opening Settings rendered ONLY
+    Executor Rules — every other section vanished. The Executor Rules render now
+    lives under the distinct name loadExecutorRulesSection, which the settings
+    module appends. Guard against the duplicate name coming back.
+    """
+    import re
+    from pathlib import Path
+
+    static = Path(__file__).parent.parent / "meridian" / "static"
+    dashboard_src = (static / "dashboard.js").read_text(encoding="utf-8")
+    settings_src = (static / "dashboard-settings.js").read_text(encoding="utf-8")
+
+    # The full settings renderer is defined once, in the module.
+    assert re.search(r"function loadSettingsTab\s*\(", settings_src), (
+        "dashboard-settings.js must define loadSettingsTab (the full settings renderer)"
+    )
+    # dashboard.js must NOT define loadSettingsTab (that collision is the bug).
+    assert not re.search(r"function loadSettingsTab\s*\(", dashboard_src), (
+        "dashboard.js must not define loadSettingsTab — it collides with the "
+        "settings module in the bundle and shadows the full settings render"
+    )
+    # The Executor Rules section lives under its own name and is appended by the module.
+    assert re.search(r"function loadExecutorRulesSection\s*\(", dashboard_src), (
+        "dashboard.js must define loadExecutorRulesSection (the Executor Rules section)"
+    )
+    assert "loadExecutorRulesSection" in settings_src, (
+        "dashboard-settings.js must append the Executor Rules section via "
+        "window.loadExecutorRulesSection so the full settings tab includes it"
+    )

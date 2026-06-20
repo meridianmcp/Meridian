@@ -3020,6 +3020,11 @@ export async function loadSettingsTab(projectId) {
 
   _collapseConnectPlatforms(projectId);
 
+  // Append the Executor Rules + Code Intelligence section (defined in dashboard.js)
+  // so the full settings tab includes it. Fire-and-forget so its fetch doesn't
+  // delay the rest of the settings wiring below. (fix-settings-tab)
+  try { window.loadExecutorRulesSection?.(projectId); } catch (e) {}
+
   if (isDemoMode()) hideDemoAdminControls();
 
   // ── Blog CMS wiring (admin only, 6234f9b8) ──────────────────────────────
