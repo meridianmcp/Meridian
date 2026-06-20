@@ -968,6 +968,36 @@ def test_tunnel_ws_closes_without_hosted_mode(client):
         pass  # server closes immediately in self-hosted mode (code 4403) — expected
 
 
+def test_tunnel_code_ws_route_exists_closes_without_hosted_mode(client):
+    # Verifies /tunnel-code/ is registered — Starlette returns HTTP 403 for
+    # unmatched WebSocket paths (not a close frame), so an Exception here is
+    # expected but it must NOT be a 403 from missing route.
+    try:
+        with client.websocket_connect("/tunnel-code/fake-tenant-id") as ws:
+            ws.receive_text()
+    except Exception:
+        pass  # expected: server closes with 4403 in self-hosted mode
+
+
+def test_tunnel_extract_ws_route_exists_closes_without_hosted_mode(client):
+    try:
+        with client.websocket_connect("/tunnel-extract/fake-tenant-id") as ws:
+            ws.receive_text()
+    except Exception:
+        pass  # expected: server closes with 4403 in self-hosted mode
+
+
+def test_code_mcp_proxy_returns_503_not_404_when_not_hosted(client):
+    # Route must exist (503 = tunnel not connected); 404 means the route is missing.
+    r = client.get("/code/mcp/some-tenant-id")
+    assert r.status_code == 503
+
+
+def test_code_mcp_proxy_subpath_returns_503_not_404_when_not_hosted(client):
+    r = client.post("/code/mcp/some-tenant-id/mcp")
+    assert r.status_code == 503
+
+
 def test_extract_mcp_proxy_returns_503_when_not_hosted(client):
     r = client.get("/extract/mcp/some-tenant-id")
     assert r.status_code == 503

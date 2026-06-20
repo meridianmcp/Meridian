@@ -675,12 +675,18 @@ async def site_password_gate(request: Request, call_next):
             if session_id and await db_module.get_user_session(auth_db, session_id):
                 return await call_next(request)
         auth_header = request.headers.get("authorization", "")
-        if auth_header.startswith("Bearer "):
-            import hashlib
-
-            token_hash = hashlib.sha256(auth_header[7:].encode()).hexdigest()
+        # WebSocket tunnel connections pass the token via ?token= query param
+        # (not an Authorization header) so we must check both.
+        token_qp = request.query_params.get("token", "")
+        for raw_tok in filter(None, [
+            auth_header[7:].strip() if auth_header.startswith("Bearer ") else "",
+            token_qp,
+        ]):
+            import hashlib  # noqa: PLC0415
+            token_hash = hashlib.sha256(raw_tok.encode()).hexdigest()
             if await db_module.get_tenant_from_token_hash(auth_db, token_hash):
                 return await call_next(request)
+        if auth_header.startswith("Bearer "):
             # Also check OAuth tokens (ChatGPT and other OAuth clients use these)
             # c5f8ac43 — delegate to routes.oauth module where the in-process cache lives.
             from .routes import oauth as _om  # noqa: PLC0415

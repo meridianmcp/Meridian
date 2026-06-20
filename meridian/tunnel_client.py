@@ -165,7 +165,12 @@ def _find_codebase_memory_mcp() -> str | None:
 
 
 def _pick_release_asset(assets: list[dict]) -> "dict | None":
-    """Pick the best GitHub release asset for the current platform and arch."""
+    """Pick the best GitHub release asset for the current platform and arch.
+
+    Hard-excludes assets for other platforms before scoring so an arch-only
+    match can never cause a cross-platform download (e.g. darwin-amd64 on
+    Windows when no windows asset is present).
+    """
     import platform as _platform
 
     machine = _platform.machine().lower()
@@ -173,14 +178,23 @@ def _pick_release_asset(assets: list[dict]) -> "dict | None":
 
     if sys.platform == "win32":
         os_kws = ["win", "windows"]
+        os_exclude = ["linux", "darwin", "macos", "mac", "apple"]
     elif sys.platform == "darwin":
         os_kws = ["darwin", "macos", "mac", "apple"]
+        # "win" is a substring of "darwin" — never use it as an exclusion keyword here
+        os_exclude = ["linux", "windows", "msvc"]
     else:
         os_kws = ["linux"]
+        os_exclude = ["darwin", "macos", "mac", "apple", "windows", "win"]
+
     arch_kws = ["aarch64", "arm64"] if is_arm else ["x86_64", "amd64", "x64"]
 
     def _score(name: str) -> int:
         n = name.lower()
+        # Hard-exclude wrong-platform assets — never download a binary that
+        # won't run on this OS, even if the arch matches.
+        if any(kw in n for kw in os_exclude):
+            return -100
         s = 0
         for kw in os_kws:
             if kw in n:

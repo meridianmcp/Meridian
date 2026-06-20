@@ -315,6 +315,32 @@ def test_pick_release_asset_windows(monkeypatch):
     assert asset["name"].endswith(".exe")
 
 
+def test_pick_release_asset_windows_never_picks_darwin(monkeypatch):
+    """Core regression: darwin-amd64 must NOT be selected on Windows even if
+    no Windows asset exists — arch match alone must not beat hard OS exclusion."""
+    monkeypatch.setattr(tc.sys, "platform", "win32")
+    import platform as _p
+    monkeypatch.setattr(_p, "machine", lambda: "AMD64")
+    darwin_only = [
+        {"name": "codebase-memory-mcp-x86_64-apple-darwin",
+         "browser_download_url": "https://gh/mac-x64"},
+        {"name": "codebase-memory-mcp-aarch64-apple-darwin",
+         "browser_download_url": "https://gh/mac-arm"},
+    ]
+    assert tc._pick_release_asset(darwin_only) is None
+
+
+def test_pick_release_asset_linux_never_picks_windows(monkeypatch):
+    monkeypatch.setattr(tc.sys, "platform", "linux")
+    import platform as _p
+    monkeypatch.setattr(_p, "machine", lambda: "x86_64")
+    win_only = [
+        {"name": "codebase-memory-mcp-x86_64-pc-windows-msvc.exe",
+         "browser_download_url": "https://gh/win.exe"},
+    ]
+    assert tc._pick_release_asset(win_only) is None
+
+
 def test_pick_release_asset_linux(monkeypatch):
     monkeypatch.setattr(tc.sys, "platform", "linux")
     import platform as _p

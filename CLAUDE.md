@@ -111,7 +111,7 @@ New projects get the Meridian defaults automatically — no file configuration r
 
 ---
 <!-- MERIDIAN STATE — auto-generated, do not edit below -->
-## Current Sprint State  _(auto-updated 2026-06-20 07:44 UTC)_
+## Current Sprint State  _(auto-updated 2026-06-20 16:38 UTC)_
 
 **Key Files:**
 - `meridian/server.py` — FastAPI app + MCP handlers
