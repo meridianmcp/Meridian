@@ -1159,7 +1159,7 @@ async function loadExecutorRulesSection(projectId) {
 // disabling a slot is a pure config change here — no redeploy. Rendered under
 // Settings, below Executor Rules. The config is account-scoped, so projectId is
 // only used to locate the settings DOM host.
-const _TUNNEL_DEFAULT_PORTS = { fs: 8808, code: 8809, extract: 8810 };
+const _TUNNEL_DEFAULT_PORTS = { fs: 8808, code: 8809, extract: 8810, ppt: 8811, word: 8812 };
 
 async function loadTunnelPluginsSection(projectId) {
   const host = document.getElementById(`settings-body-${projectId}`);

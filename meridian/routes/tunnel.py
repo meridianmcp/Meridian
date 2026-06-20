@@ -44,11 +44,15 @@ _PROXY_TIMEOUT = 30.0
 _tunnel_sockets: dict[str, WebSocket] = {}
 _tunnel_code_sockets: dict[str, WebSocket] = {}
 _tunnel_extract_sockets: dict[str, WebSocket] = {}
+_tunnel_ppt_sockets: dict[str, WebSocket] = {}
+_tunnel_word_sockets: dict[str, WebSocket] = {}
 
 # Correlation maps: request_id → Future that resolves when client responds
 _pending_reqs: dict[str, asyncio.Future[dict]] = {}
 _pending_code_reqs: dict[str, asyncio.Future[dict]] = {}
 _pending_extract_reqs: dict[str, asyncio.Future[dict]] = {}
+_pending_ppt_reqs: dict[str, asyncio.Future[dict]] = {}
+_pending_word_reqs: dict[str, asyncio.Future[dict]] = {}
 
 
 def _is_tunnel_allowed(tenant: dict) -> bool:
@@ -307,6 +311,101 @@ async def tunnel_extract_ws(ws: WebSocket, tenant_id: str) -> None:
             if not fut.done():
                 fut.cancel()
         _log.info("tunnel-extract: tenant %s disconnected", tenant_id[:8])
+
+
+# ---------------------------------------------------------------------------
+# /tunnel-ppt/{tenant_id} and /tunnel-word/{tenant_id}  — Office MCP tunnels
+# ---------------------------------------------------------------------------
+#
+# These mirror /tunnel-extract exactly. They share one helper to avoid
+# duplicating the auth + receive-loop body a fourth and fifth time.
+
+async def _serve_tunnel_ws(
+    ws: WebSocket,
+    tenant_id: str,
+    sockets: dict[str, WebSocket],
+    pending: dict[str, "asyncio.Future[dict]"],
+    label: str,
+) -> None:
+    """Auth a tunnel WebSocket, register it, and relay client responses.
+
+    Identical protocol to tunnel_extract_ws — the per-slot socket and pending
+    registries are passed in so one body serves any Office/code slot.
+    """
+    if not _hosted_mode():
+        await ws.close(code=4403, reason="tunnel requires hosted mode")
+        return
+
+    auth_db = ws.app.state.db
+    await ws.accept()
+
+    auth_header = ws.headers.get("authorization", "")
+    token_param = ws.query_params.get("token", "")
+    raw_token = auth_header or token_param
+
+    tenant = await _resolve_tenant_from_token(auth_db, raw_token)
+    if tenant is None or tenant.get("id") != tenant_id:
+        await ws.close(code=4401, reason="invalid or mismatched token")
+        return
+
+    if not _is_tunnel_allowed(tenant):
+        await ws.close(code=4403, reason="tunnel requires Pro plan")
+        return
+
+    old_ws = sockets.pop(tenant_id, None)
+    if old_ws is not None:
+        try:
+            await old_ws.close(code=4000, reason="replaced by new connection")
+        except Exception:
+            pass
+
+    sockets[tenant_id] = ws
+    _log.info("tunnel-%s: tenant %s connected", label, tenant_id[:8])
+
+    try:
+        while True:
+            try:
+                msg = await asyncio.wait_for(ws.receive_json(), timeout=120.0)
+            except asyncio.TimeoutError:
+                try:
+                    await ws.send_json({"type": "ping"})
+                except Exception:
+                    break
+                continue
+
+            if not isinstance(msg, dict):
+                continue
+            msg_type = msg.get("type")
+            if msg_type == "ping":
+                continue
+            if msg_type == "response":
+                req_id = msg.get("id")
+                fut = pending.get(req_id)
+                if fut is not None and not fut.done():
+                    fut.set_result(msg)
+
+    except WebSocketDisconnect:
+        pass
+    except Exception as exc:
+        _log.debug("tunnel-%s: tenant %s disconnected: %s", label, tenant_id[:8], exc)
+    finally:
+        sockets.pop(tenant_id, None)
+        for fut in list(pending.values()):
+            if not fut.done():
+                fut.cancel()
+        _log.info("tunnel-%s: tenant %s disconnected", label, tenant_id[:8])
+
+
+@router.websocket("/tunnel-ppt/{tenant_id}")
+async def tunnel_ppt_ws(ws: WebSocket, tenant_id: str) -> None:
+    """Hold open a WebSocket for one tenant's powerpoint-mcp proxy."""
+    await _serve_tunnel_ws(ws, tenant_id, _tunnel_ppt_sockets, _pending_ppt_reqs, "ppt")
+
+
+@router.websocket("/tunnel-word/{tenant_id}")
+async def tunnel_word_ws(ws: WebSocket, tenant_id: str) -> None:
+    """Hold open a WebSocket for one tenant's word-mcp-live proxy."""
+    await _serve_tunnel_ws(ws, tenant_id, _tunnel_word_sockets, _pending_word_reqs, "word")
 
 
 # ---------------------------------------------------------------------------
@@ -574,6 +673,77 @@ async def extract_mcp_proxy_subpath(tenant_id: str, rest: str, request: Request)
 
 
 # ---------------------------------------------------------------------------
+# /ppt/mcp/{tenant_id} and /word/mcp/{tenant_id}  — Office MCP HTTP proxies
+# ---------------------------------------------------------------------------
+
+async def _office_proxy(
+    tenant_id: str, local_path: str, request: Request,
+    sockets: dict[str, WebSocket], pending: dict, label: str,
+) -> Response:
+    """Forward an HTTP request through an Office (ppt/word) tunnel socket."""
+    if not _hosted_mode():
+        return Response(
+            content='{"error":"tunnel requires hosted mode"}',
+            status_code=503,
+            media_type="application/json",
+        )
+    body_bytes = await request.body()
+    return await _do_proxy(
+        tenant_id=tenant_id,
+        method=request.method,
+        path=local_path,
+        query=str(request.url.query),
+        headers=_fwd_headers(request),
+        body_bytes=body_bytes or None,
+        sockets=sockets,
+        pending=pending,
+        label=label,
+    )
+
+
+@router.get("/ppt/mcp/{tenant_id}")
+@router.post("/ppt/mcp/{tenant_id}")
+@router.options("/ppt/mcp/{tenant_id}")
+async def ppt_mcp_proxy(tenant_id: str, request: Request) -> Response:
+    """Proxy requests to the tenant's powerpoint-mcp over the ppt tunnel."""
+    prefix = f"/ppt/mcp/{tenant_id}"
+    local_path = request.url.path[len(prefix):] or "/"
+    return await _office_proxy(tenant_id, local_path, request,
+                               _tunnel_ppt_sockets, _pending_ppt_reqs, "ppt")
+
+
+@router.get("/ppt/mcp/{tenant_id}/{rest:path}")
+@router.post("/ppt/mcp/{tenant_id}/{rest:path}")
+@router.options("/ppt/mcp/{tenant_id}/{rest:path}")
+async def ppt_mcp_proxy_subpath(tenant_id: str, rest: str, request: Request) -> Response:
+    """Same as ppt_mcp_proxy but for sub-paths."""
+    local_path = f"/{rest}" if rest else "/"
+    return await _office_proxy(tenant_id, local_path, request,
+                               _tunnel_ppt_sockets, _pending_ppt_reqs, "ppt")
+
+
+@router.get("/word/mcp/{tenant_id}")
+@router.post("/word/mcp/{tenant_id}")
+@router.options("/word/mcp/{tenant_id}")
+async def word_mcp_proxy(tenant_id: str, request: Request) -> Response:
+    """Proxy requests to the tenant's word-mcp-live over the word tunnel."""
+    prefix = f"/word/mcp/{tenant_id}"
+    local_path = request.url.path[len(prefix):] or "/"
+    return await _office_proxy(tenant_id, local_path, request,
+                               _tunnel_word_sockets, _pending_word_reqs, "word")
+
+
+@router.get("/word/mcp/{tenant_id}/{rest:path}")
+@router.post("/word/mcp/{tenant_id}/{rest:path}")
+@router.options("/word/mcp/{tenant_id}/{rest:path}")
+async def word_mcp_proxy_subpath(tenant_id: str, rest: str, request: Request) -> Response:
+    """Same as word_mcp_proxy but for sub-paths."""
+    local_path = f"/{rest}" if rest else "/"
+    return await _office_proxy(tenant_id, local_path, request,
+                               _tunnel_word_sockets, _pending_word_reqs, "word")
+
+
+# ---------------------------------------------------------------------------
 # GET /tunnel/status/{tenant_id}  — lightweight status check (no auth required)
 # ---------------------------------------------------------------------------
 
@@ -585,6 +755,8 @@ async def tunnel_status(tenant_id: str) -> dict:
         "active": tenant_id in _tunnel_sockets,
         "code_active": tenant_id in _tunnel_code_sockets,
         "extract_active": tenant_id in _tunnel_extract_sockets,
+        "ppt_active": tenant_id in _tunnel_ppt_sockets,
+        "word_active": tenant_id in _tunnel_word_sockets,
     }
 
 
@@ -625,6 +797,8 @@ async def get_tunnel_plugins(request: Request) -> Response:
             "fs": tid in _tunnel_sockets,
             "code": tid in _tunnel_code_sockets,
             "extract": tid in _tunnel_extract_sockets,
+            "ppt": tid in _tunnel_ppt_sockets,
+            "word": tid in _tunnel_word_sockets,
         },
     })
 
@@ -680,7 +854,7 @@ def _json_response(payload: dict, status_code: int = 200) -> Response:
 # so a stateless ``tools/call`` can find the owning tunnel without re-listing.
 # Cold/missing entries trigger a one-shot re-discovery via ``list_tunnel_tools``.
 
-_TUNNEL_LABELS = ("fs", "code", "extract")
+_TUNNEL_LABELS = ("fs", "code", "extract", "ppt", "word")
 
 # Per-process routing cache: tenant_id → {tool_name: tunnel_label}
 _tunnel_tool_routes: dict[str, dict[str, str]] = {}
@@ -729,6 +903,10 @@ def _label_maps(label: str) -> "tuple[dict[str, WebSocket], dict[str, asyncio.Fu
         return _tunnel_sockets, _pending_reqs
     if label == "code":
         return _tunnel_code_sockets, _pending_code_reqs
+    if label == "ppt":
+        return _tunnel_ppt_sockets, _pending_ppt_reqs
+    if label == "word":
+        return _tunnel_word_sockets, _pending_word_reqs
     return _tunnel_extract_sockets, _pending_extract_reqs
 
 
@@ -738,6 +916,8 @@ def has_active_tunnel(tenant_id: str) -> bool:
         tenant_id in _tunnel_sockets
         or tenant_id in _tunnel_code_sockets
         or tenant_id in _tunnel_extract_sockets
+        or tenant_id in _tunnel_ppt_sockets
+        or tenant_id in _tunnel_word_sockets
     )
 
 

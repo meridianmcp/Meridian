@@ -946,7 +946,7 @@ def test_websocket_receives_task_event(client):
 def test_tunnel_status_returns_inactive_for_unknown_tenant(client):
     r = client.get("/tunnel/status/no-such-tenant")
     assert r.status_code == 200
-    assert r.json() == {"tenant_id": "no-such-tenant", "active": False, "code_active": False, "extract_active": False}
+    assert r.json() == {"tenant_id": "no-such-tenant", "active": False, "code_active": False, "extract_active": False, "ppt_active": False, "word_active": False}
 
 
 def test_fs_mcp_proxy_returns_503_when_not_hosted(client):

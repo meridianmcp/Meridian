@@ -21,14 +21,16 @@ from __future__ import annotations
 
 from typing import Any
 
-# slot = the fixed server transport a plugin rides on. The three built-ins each
-# own one slot; that mapping is immutable (a config override can't move a
-# built-in to another slot, which would collide with the server routes).
-SLOTS = ("fs", "code", "extract")
+# slot = the fixed server transport a plugin rides on. Each built-in owns one
+# slot; that mapping is immutable (a config override can't move a built-in to
+# another slot, which would collide with the server routes).
+SLOTS = ("fs", "code", "extract", "ppt", "word")
 
 DEFAULT_FS_PORT = 8808
 DEFAULT_CODE_PORT = 8809
 DEFAULT_EXTRACT_PORT = 8810
+DEFAULT_PPT_PORT = 8811
+DEFAULT_WORD_PORT = 8812
 
 # Ordered: filesystem first (the always-on base), then the two code plugins.
 BUILTIN_PLUGINS: list[dict[str, Any]] = [
@@ -66,10 +68,35 @@ BUILTIN_PLUGINS: list[dict[str, Any]] = [
         "description": "Symbol extractor (mcp-server-code-extractor)",
         "description_overrides": {},
     },
+    {
+        "name": "powerpoint",
+        "slot": "ppt",
+        "port": DEFAULT_PPT_PORT,
+        "url_prefix": "/ppt",
+        # Office plugins are opt-in: off by default, enabled from the dashboard.
+        "enabled": False,
+        "builtin": True,
+        "command": ["uvx", "powerpoint-mcp"],
+        "env": {},
+        "description": "PowerPoint authoring (powerpoint-mcp)",
+        "description_overrides": {},
+    },
+    {
+        "name": "word",
+        "slot": "word",
+        "port": DEFAULT_WORD_PORT,
+        "url_prefix": "/word",
+        "enabled": False,
+        "builtin": True,
+        "command": ["uvx", "word-mcp-live"],
+        "env": {"MCP_AUTHOR": "Adam", "MCP_AUTHOR_INITIALS": "AC"},
+        "description": "Word authoring (word-mcp-live)",
+        "description_overrides": {},
+    },
 ]
 
 # Editable per-slot fields that a tenant override may set.
-_OVERRIDABLE = ("enabled", "command", "port", "description", "description_overrides")
+_OVERRIDABLE = ("enabled", "command", "port", "description", "description_overrides", "env")
 
 
 def builtin_names() -> tuple[str, ...]:
@@ -137,6 +164,9 @@ def normalize_plugins_config(raw: Any) -> dict[str, dict]:
             ov["description_overrides"] = {
                 str(k): str(v) for k, v in dov.items() if str(k)
             }
+        env = it.get("env")
+        if isinstance(env, dict):
+            ov["env"] = {str(k): str(v) for k, v in env.items() if str(k)}
         out[name] = ov
     return out
 

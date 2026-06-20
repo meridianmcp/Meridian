@@ -68,7 +68,7 @@ dev = { features = ["dev"], solve-group = "default" }
 [tasks]
 start = { cmd = "python -m meridian", env = { MERIDIAN_CLAUDE_CLI = "cmd /c C:/Users/13144/AppData/Roaming/npm/claude.cmd -p" } }
 dev = "uvicorn meridian.server:app --reload --port 7878"
-test = "pytest tests/ -v -n auto --ignore=tests/test_demo_ux.py"
+test = "pytest tests/ -n auto --ignore=tests/test_demo_ux.py --cov=meridian --cov-config=.coveragerc --cov-report=term-missing --cov-fail-under=80"
 test-fast = "pytest tests/test_core.py tests/test_new_v25.py tests/test_hosted.py tests/test_github.py tests/test_milestones.py tests/test_md_anchors.py tests/test_security.py tests/test_ui.py tests/test_executor_runs.py tests/test_error_alerting.py tests/test_v2_hosted.py -n auto --ignore=tests/test_demo_ux.py -v"
 build-exe = "pyinstaller meridian.spec --clean"
 build-connect = "pyinstaller meridian-connect.spec --clean"

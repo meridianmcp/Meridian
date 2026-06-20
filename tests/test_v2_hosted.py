@@ -224,10 +224,12 @@ def test_tunnel_plugins_get_returns_resolved_defaults(monkeypatch, tmp_path):
         assert r.status_code == 200
         body = r.json()
         assert [p["name"] for p in body["plugins"]] == [
-            "filesystem", "code-intel", "code-extractor"
+            "filesystem", "code-intel", "code-extractor", "powerpoint", "word"
         ]
         assert body["config"] == {}
-        assert body["active"] == {"fs": False, "code": False, "extract": False}
+        assert body["active"] == {
+            "fs": False, "code": False, "extract": False, "ppt": False, "word": False
+        }
 
 
 def test_tunnel_plugins_put_persists_command_override(monkeypatch, tmp_path):
@@ -273,7 +275,9 @@ def test_tunnel_plugins_put_empty_clears_overrides(monkeypatch, tmp_path):
         client.put("/tunnel/plugins", headers=hdr, json={"config": []})
         got = client.get("/tunnel/plugins", headers=hdr).json()
         assert got["config"] == {}
-        assert all(p["enabled"] for p in got["plugins"])
+        # Defaults restored: code/fs slots on, Office slots off.
+        enabled = {p["name"] for p in got["plugins"] if p["enabled"]}
+        assert enabled == {"filesystem", "code-intel", "code-extractor"}
 
 
 def test_tunnel_plugins_requires_auth(monkeypatch, tmp_path):

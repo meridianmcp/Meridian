@@ -47,7 +47,7 @@ jobs:
         if: steps.playwright-cache.outputs.cache-hit != 'true'
       - run: pixi run python -m playwright install chromium
         if: steps.playwright-cache.outputs.cache-hit == 'true'
-      - run: pixi run python -m pytest tests/test_core.py tests/test_new_v25.py tests/test_hosted.py tests/test_github.py tests/test_milestones.py tests/test_md_anchors.py tests/test_security.py tests/test_ui.py tests/test_executor_runs.py tests/test_error_alerting.py tests/test_v2_hosted.py -n auto -q --tb=short
+      - run: pixi run python -m pytest tests/ -n auto -q --tb=short --ignore=tests/test_demo_ux.py --cov=meridian --cov-config=.coveragerc --cov-report=term-missing --cov-fail-under=80
 
   playwright-tests:
     runs-on: ubuntu-latest

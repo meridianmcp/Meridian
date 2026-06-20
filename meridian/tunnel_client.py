@@ -251,6 +251,24 @@ def _permanent_extract_url(base_url: str, tenant_id: str) -> str:
     return f"{base_url.rstrip('/')}/extract/mcp/{tenant_id}/mcp"
 
 
+def _ws_office_url(base_url: str, tenant_id: str, token: str, slot: str) -> str:
+    """Build the WebSocket URL for an Office tunnel slot (ppt/word)."""
+    base = base_url.rstrip("/")
+    if base.startswith("https://"):
+        ws_base = "wss://" + base[len("https://"):]
+    elif base.startswith("http://"):
+        ws_base = "ws://" + base[len("http://"):]
+    else:
+        ws_base = base
+    from urllib.parse import quote
+    return f"{ws_base}/tunnel-{slot}/{tenant_id}?token={quote(token, safe='')}"
+
+
+def _permanent_office_url(base_url: str, tenant_id: str, slot: str) -> str:
+    """The permanent URL for an Office tunnel slot (ppt/word) — add to claude.ai once."""
+    return f"{base_url.rstrip('/')}/{slot}/mcp/{tenant_id}/mcp"
+
+
 def _find_uvx() -> "str | None":
     """Locate the ``uvx`` launcher (uv's ephemeral-tool runner)."""
     found = shutil.which("uvx")
@@ -918,10 +936,14 @@ async def run_tunnel(
     fs_plugin = by_slot.get("fs") or {}
     code_plugin = by_slot.get("code") or {}
     extract_plugin = by_slot.get("extract") or {}
+    ppt_plugin = by_slot.get("ppt") or {}
+    word_plugin = by_slot.get("word") or {}
     # Per-slot effective ports (override > the run_tunnel arg default).
     fs_port = int(fs_plugin.get("port") or port)
     code_port = int(code_plugin.get("port") or code_port)
     extract_port = int(extract_plugin.get("port") or extract_port)
+    ppt_port = int(ppt_plugin.get("port") or 8811)
+    word_port = int(word_plugin.get("port") or 8812)
 
     # 2. Spawn filesystem proxy (slot "fs"). Honour an enable toggle + command
     #    override; the default (no override) keeps the exact filesystem builder.
@@ -1013,6 +1035,30 @@ async def run_tunnel(
                     flush=True,
                 )
 
+    # 4b. Spawn Office MCP proxies (ppt/word). Off by default — enabled via the
+    #     dashboard's Tunnel Plugins section. Each carries its own command and
+    #     optional env (e.g. word-mcp-live's MCP_AUTHOR) in the plugin registry.
+    office_procs: dict[str, subprocess.Popen] = {}
+    office_ports = {"ppt": ppt_port, "word": word_port}
+    for slot, plugin, human in (("ppt", ppt_plugin, "PowerPoint"),
+                                ("word", word_plugin, "Word")):
+        if not plugin.get("enabled", False):
+            continue
+        cmd = plugin.get("command")
+        if not cmd:
+            continue
+        oport = office_ports[slot]
+        plugin_env = plugin.get("env") or {}
+        spawn_env = None
+        if plugin_env:
+            spawn_env = {**os.environ, **{str(k): str(v) for k, v in plugin_env.items()}}
+        cmd_office = _build_proxy_for_inner(npx, list(cmd), oport)
+        print(f"  {human.lower()}:{' ' * (15 - len(human))}http://127.0.0.1:{oport}", flush=True)
+        try:
+            office_procs[slot] = subprocess.Popen(cmd_office, env=spawn_env)
+        except Exception as exc:
+            print(f"  warning: could not start {slot} proxy: {exc}", file=sys.stderr)
+
     # 5. Print permanent URLs.
     print("", flush=True)
     print("  Permanent MCP URLs — add these to claude.ai once:", flush=True)
@@ -1022,6 +1068,10 @@ async def run_tunnel(
         print(f"    Code Intel:      {_permanent_code_url(base_url, tenant_id)}", flush=True)
     if proc_extract is not None:
         print(f"    Code Extractor:  {_permanent_extract_url(base_url, tenant_id)}", flush=True)
+    if "ppt" in office_procs:
+        print(f"    PowerPoint:      {_permanent_office_url(base_url, tenant_id, 'ppt')}", flush=True)
+    if "word" in office_procs:
+        print(f"    Word:            {_permanent_office_url(base_url, tenant_id, 'word')}", flush=True)
     if proc_fs is not None:
         print(f"  (SSE clients: {_sse_url(base_url, tenant_id)})", flush=True)
     print("", flush=True)
@@ -1067,6 +1117,11 @@ async def run_tunnel(
         tasks.append(asyncio.ensure_future(_reconnect_loop(ws_code, code_port, "code")))
     if proc_extract is not None:
         tasks.append(asyncio.ensure_future(_reconnect_loop(ws_extract, extract_port, "extract")))
+    for slot, oproc in office_procs.items():
+        ws_office = _ws_office_url(base_url, tenant_id, token, slot)
+        tasks.append(asyncio.ensure_future(
+            _reconnect_loop(ws_office, office_ports[slot], slot)
+        ))
     if not tasks:
         print("error: no tunnel plugins enabled — nothing to serve.", file=sys.stderr)
         return 1
@@ -1101,4 +1156,10 @@ async def run_tunnel(
                 proc_extract.wait(timeout=5)
             except Exception:
                 proc_extract.kill()
+        for oproc in office_procs.values():
+            oproc.terminate()
+            try:
+                oproc.wait(timeout=5)
+            except Exception:
+                oproc.kill()
     return 0

@@ -24,15 +24,16 @@ from meridian.mcp import handler as mh
 @pytest.fixture(autouse=True)
 def _clean_bridge_state():
     """Reset per-process tunnel registries between tests."""
-    tn._tunnel_sockets.clear()
-    tn._tunnel_code_sockets.clear()
-    tn._tunnel_extract_sockets.clear()
-    tn._tunnel_tool_routes.clear()
+    def _reset():
+        tn._tunnel_sockets.clear()
+        tn._tunnel_code_sockets.clear()
+        tn._tunnel_extract_sockets.clear()
+        tn._tunnel_ppt_sockets.clear()
+        tn._tunnel_word_sockets.clear()
+        tn._tunnel_tool_routes.clear()
+    _reset()
     yield
-    tn._tunnel_sockets.clear()
-    tn._tunnel_code_sockets.clear()
-    tn._tunnel_extract_sockets.clear()
-    tn._tunnel_tool_routes.clear()
+    _reset()
 
 
 # ---------------------------------------------------------------------------
@@ -320,6 +321,8 @@ def test_tunnel_status_reports_active_sockets():
         "active": True,
         "code_active": True,
         "extract_active": False,
+        "ppt_active": False,
+        "word_active": False,
     }
 
 
@@ -488,3 +491,47 @@ def test_extract_mcp_proxy_routes_to_extract_socket(monkeypatch):
     resp = asyncio.run(tn.extract_mcp_proxy("t1", _FakeReq("/extract/mcp/t1")))
     assert resp.status_code == 503
     assert b"extract tunnel not connected" in resp.body
+
+
+# ---------------------------------------------------------------------------
+# Office tunnels (ppt / word) — route guards + roundtrip
+# ---------------------------------------------------------------------------
+
+def test_ppt_proxy_503_when_not_hosted(monkeypatch):
+    monkeypatch.setattr(tn, "_hosted_mode", lambda: False)
+    resp = asyncio.run(tn.ppt_mcp_proxy("t1", _FakeReq("/ppt/mcp/t1")))
+    assert resp.status_code == 503
+    assert b"hosted mode" in resp.body
+
+
+def test_word_proxy_503_when_not_hosted(monkeypatch):
+    monkeypatch.setattr(tn, "_hosted_mode", lambda: False)
+    resp = asyncio.run(tn.word_mcp_proxy("t1", _FakeReq("/word/mcp/t1")))
+    assert resp.status_code == 503
+    assert b"hosted mode" in resp.body
+
+
+def test_ppt_proxy_503_when_no_socket(monkeypatch):
+    monkeypatch.setattr(tn, "_hosted_mode", lambda: True)
+    resp = asyncio.run(tn.ppt_mcp_proxy("t1", _FakeReq("/ppt/mcp/t1")))
+    assert resp.status_code == 503
+    assert b"ppt tunnel not connected" in resp.body
+
+
+def test_word_proxy_subpath_200_roundtrip(monkeypatch):
+    monkeypatch.setattr(tn, "_hosted_mode", lambda: True)
+    response = {"status": 200, "headers": {"content-type": "application/json"},
+                "body": base64.b64encode(b'{"ok":1}').decode()}
+    tn._tunnel_word_sockets["t1"] = _FakeWS(tn._pending_word_reqs, response)
+    resp = asyncio.run(tn.word_mcp_proxy_subpath("t1", "mcp", _FakeReq("/word/mcp/t1/mcp")))
+    assert resp.status_code == 200
+    assert resp.body == b'{"ok":1}'
+
+
+def test_office_slots_in_label_maps_and_bridge():
+    # _label_maps resolves the new slots to their own registries.
+    assert tn._label_maps("ppt")[0] is tn._tunnel_ppt_sockets
+    assert tn._label_maps("word")[0] is tn._tunnel_word_sockets
+    assert "ppt" in tn._TUNNEL_LABELS and "word" in tn._TUNNEL_LABELS
+    tn._tunnel_word_sockets["t1"] = object()
+    assert tn.has_active_tunnel("t1") is True

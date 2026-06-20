@@ -13,13 +13,21 @@ from meridian import tunnel_plugins as tp
 # Defaults
 # ---------------------------------------------------------------------------
 
-def test_resolve_defaults_returns_three_builtins_in_order():
+def test_resolve_defaults_returns_builtins_in_order():
     plugins = tp.resolve_plugins(None)
-    assert [p["name"] for p in plugins] == ["filesystem", "code-intel", "code-extractor"]
-    assert [p["slot"] for p in plugins] == ["fs", "code", "extract"]
-    # Defaults: all enabled, no command override.
-    assert all(p["enabled"] for p in plugins)
-    assert all(p["command"] is None for p in plugins)
+    assert [p["name"] for p in plugins] == [
+        "filesystem", "code-intel", "code-extractor", "powerpoint", "word"
+    ]
+    assert [p["slot"] for p in plugins] == ["fs", "code", "extract", "ppt", "word"]
+    # The three code/fs slots default ON with no command override; the two Office
+    # slots default OFF with a built-in uvx command.
+    by_name = {p["name"]: p for p in plugins}
+    assert all(by_name[n]["enabled"] for n in ("filesystem", "code-intel", "code-extractor"))
+    assert all(by_name[n]["command"] is None for n in ("filesystem", "code-intel", "code-extractor"))
+    assert by_name["powerpoint"]["enabled"] is False
+    assert by_name["word"]["enabled"] is False
+    assert by_name["powerpoint"]["command"] == ["uvx", "powerpoint-mcp"]
+    assert by_name["word"]["env"] == {"MCP_AUTHOR": "Adam", "MCP_AUTHOR_INITIALS": "AC"}
 
 
 def test_resolve_empty_config_matches_defaults():
@@ -28,9 +36,15 @@ def test_resolve_empty_config_matches_defaults():
 
 
 def test_active_plugins_filters_disabled():
-    cfg = {"code-extractor": {"enabled": False}}
-    active = tp.active_plugins(cfg)
-    assert [p["name"] for p in active] == ["filesystem", "code-intel"]
+    # Office slots are off by default, so only the three code/fs slots are active.
+    assert [p["name"] for p in tp.active_plugins(None)] == [
+        "filesystem", "code-intel", "code-extractor"
+    ]
+    # Disabling another slot drops it; enabling word adds it.
+    cfg = {"code-extractor": {"enabled": False}, "word": {"enabled": True}}
+    assert [p["name"] for p in tp.active_plugins(cfg)] == [
+        "filesystem", "code-intel", "word"
+    ]
 
 
 def test_plugin_by_slot():
@@ -112,4 +126,17 @@ def test_description_overrides_normalized_to_strings():
 
 
 def test_builtin_names_helper():
-    assert tp.builtin_names() == ("filesystem", "code-intel", "code-extractor")
+    assert tp.builtin_names() == (
+        "filesystem", "code-intel", "code-extractor", "powerpoint", "word"
+    )
+
+
+def test_office_plugins_enableable_and_overridable():
+    cfg = {"powerpoint": {"enabled": True, "port": 9000},
+           "word": {"enabled": True, "command": "uvx word-mcp-live --debug"}}
+    ppt = tp.plugin_by_slot(cfg, "ppt")
+    word = tp.plugin_by_slot(cfg, "word")
+    assert ppt["enabled"] is True and ppt["port"] == 9000
+    assert word["enabled"] is True and word["command"] == ["uvx", "word-mcp-live", "--debug"]
+    # word keeps its default env unless overridden.
+    assert word["env"] == {"MCP_AUTHOR": "Adam", "MCP_AUTHOR_INITIALS": "AC"}
