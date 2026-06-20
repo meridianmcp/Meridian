@@ -177,6 +177,7 @@ Store project-level executor defaults so worker sessions start with repo path, e
 |-----------|------|----------|-------------|
 | `project_id` | string | required |  |
 | `repo_path` | string | optional |  |
+| `repo_paths` | array | optional | Known locations [{cwd, hostname}] — merged into existing repo_paths, not overwritten. |
 | `env_file` | string | optional |  |
 | `test_cmd` | string | optional |  |
 | `test_min` | integer | optional |  |
