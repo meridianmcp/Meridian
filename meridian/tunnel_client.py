@@ -27,6 +27,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 DEFAULT_BASE_URL = "https://usemeridian.us"
@@ -80,6 +81,104 @@ def _resolve_base_url(arg_url: str | None = None) -> str:
     """Resolve the server base URL: CLI arg > MERIDIAN_URL > default."""
     url = (arg_url or os.environ.get("MERIDIAN_URL") or DEFAULT_BASE_URL).strip()
     return url.rstrip("/")
+
+
+# ---------------------------------------------------------------------------
+# Token cache — ~/.meridian/config.json (30-day expiry, per base_url)
+# ---------------------------------------------------------------------------
+
+def _config_path() -> Path:
+    return Path.home() / ".meridian" / "config.json"
+
+
+def _read_cached_token(base_url: str) -> str | None:
+    """Return a cached tunnel token for *base_url* if present and unexpired."""
+    path = _config_path()
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        entry = data.get("tunnel_token", {})
+        if entry.get("base_url") != base_url:
+            return None
+        if time.time() > entry.get("expires_at", 0):
+            return None
+        return entry.get("token") or None
+    except Exception:
+        return None
+
+
+def _write_cached_token(base_url: str, token: str) -> None:
+    """Persist *token* to ``~/.meridian/config.json`` with a 30-day expiry."""
+    path = _config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    data: dict = {}
+    if path.exists():
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    data["tunnel_token"] = {
+        "token": token,
+        "base_url": base_url,
+        "expires_at": int(time.time()) + 30 * 24 * 3600,
+    }
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    tmp.replace(path)
+    try:
+        path.chmod(0o600)
+    except Exception:
+        pass
+
+
+async def _browser_auth_flow(base_url: str) -> str:
+    """Open a browser to authorize tunnel access; poll until approved or timeout.
+
+    Returns the raw API token on success, or an empty string on failure/cancel.
+    The token is never written to shell history or passed via the process list —
+    it lives only in memory until the caller caches it to disk.
+    """
+    import uuid as _uuid
+    import webbrowser
+
+    device_code = str(_uuid.uuid4())
+    connect_url = f"{base_url}/auth/tunnel-connect?device_code={device_code}"
+    poll_url = f"{base_url}/auth/tunnel-poll"
+
+    print("", flush=True)
+    print("No API token found. Opening browser to authorize tunnel access.", flush=True)
+    print(f"  {connect_url}", flush=True)
+    print("Waiting for authorization — press Ctrl-C to cancel (10 min timeout).", flush=True)
+    print("", flush=True)
+
+    try:
+        webbrowser.open(connect_url)
+    except Exception:
+        pass  # headless servers — user can open the URL manually
+
+    import httpx
+    deadline = time.monotonic() + 600
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        while time.monotonic() < deadline:
+            try:
+                r = await client.get(poll_url, params={"device_code": device_code})
+                if r.status_code == 200:
+                    data = r.json()
+                    if data.get("status") == "complete":
+                        token = data.get("token", "")
+                        if token:
+                            print("  authorized.", flush=True)
+                            return token
+                elif r.status_code == 404:
+                    print("error: device code expired — please try again.", file=sys.stderr)
+                    return ""
+            except Exception:
+                pass
+            await asyncio.sleep(3)
+
+    print("error: tunnel auth timed out (10 min). Run again to retry.", file=sys.stderr)
+    return ""
 
 
 def _ws_url(base_url: str, tenant_id: str, token: str) -> str:
@@ -719,24 +818,51 @@ async def run_tunnel(
     codebase without any manual tool call.
     """
     _force_utf8_io()
-    token = _resolve_token(token)
-    if not token:
-        print(
-            "error: no API token. Pass --token or set MERIDIAN_API_KEY "
-            "(or BEARER_TOKEN).",
-            file=sys.stderr,
-        )
-        return 2
-
+    # Resolve base_url first — it's the cache key for the stored token.
     base_url = _resolve_base_url(base_url)
     repo_path = str(Path(repo_path or Path.home()).resolve())
+
+    # Token priority: --token / env vars > cached token > browser auth flow.
+    # The --token flag is kept for CI/scripted use so the raw value is never in
+    # shell history; the env-var path likewise keeps it out of `ps` output.
+    resolved_token = _resolve_token(token)
+    _from_cache = False
+    _browser_authed = False
+    if not resolved_token:
+        resolved_token = _read_cached_token(base_url) or ""
+        _from_cache = bool(resolved_token)
+    if not resolved_token:
+        resolved_token = await _browser_auth_flow(base_url)
+        _browser_authed = bool(resolved_token)
+    if not resolved_token:
+        print("error: tunnel auth cancelled or timed out.", file=sys.stderr)
+        return 2
+    token = resolved_token
 
     # 1. Resolve tenant_id + plan from /me.
     try:
         me = await _fetch_me(base_url, token)
     except Exception as exc:
-        print(f"error: could not reach {base_url}/me: {exc}", file=sys.stderr)
-        return 1
+        # Cached token may be revoked — retry via browser flow once, then give up.
+        if _from_cache and not _browser_authed:
+            print("cached token rejected — re-authenticating...", file=sys.stderr, flush=True)
+            token = await _browser_auth_flow(base_url)
+            _browser_authed = bool(token)
+            if not token:
+                print("error: tunnel auth cancelled.", file=sys.stderr)
+                return 2
+            try:
+                me = await _fetch_me(base_url, token)
+            except Exception as exc2:
+                print(f"error: could not reach {base_url}/me: {exc2}", file=sys.stderr)
+                return 1
+        else:
+            print(f"error: could not reach {base_url}/me: {exc}", file=sys.stderr)
+            return 1
+
+    # Cache the token only after /me confirms it works.
+    if _browser_authed:
+        _write_cached_token(base_url, token)
 
     tenant_id = me.get("tenant_id")
     if not tenant_id:

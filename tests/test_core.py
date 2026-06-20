@@ -1016,6 +1016,187 @@ def test_tunnel_extract_ws_closes_without_hosted_mode(client):
         pass  # server closes immediately in self-hosted mode (code 4403) — expected
 
 
+# ---------------------------------------------------------------------------
+# Tunnel device-code auth (browser login flow)
+# ---------------------------------------------------------------------------
+
+
+def test_tunnel_connect_returns_404_in_self_hosted_mode(client):
+    r = client.get("/auth/tunnel-connect?device_code=abc123")
+    assert r.status_code == 404
+
+
+def test_tunnel_poll_returns_404_in_self_hosted_mode(client):
+    r = client.get("/auth/tunnel-poll?device_code=abc123")
+    assert r.status_code == 404
+
+
+def test_tunnel_connect_post_returns_404_in_self_hosted_mode(client):
+    r = client.post("/auth/tunnel-connect", json={"device_code": "abc123"})
+    assert r.status_code == 404
+
+
+def _make_tunnel_hosted_client(monkeypatch, tmp_path):
+    """Reload server in hosted mode; return (TestClient, reloaded_server_module)."""
+    import importlib
+    from fastapi.testclient import TestClient
+    import meridian.server as srv
+    monkeypatch.setenv("MERIDIAN_HOSTED", "true")
+    monkeypatch.setenv("MERIDIAN_DB", ":memory:")
+    monkeypatch.setenv("MERIDIAN_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("MERIDIAN_DB_URL", "")
+    monkeypatch.setenv("MERIDIAN_DEMO_DB_URL", "")
+    monkeypatch.setenv("MERIDIAN_SKIP_DEMO", "1")
+    monkeypatch.setenv("MERIDIAN_GOAL_MD", str(tmp_path / "GOAL.md"))
+    srv = importlib.reload(srv)
+    return TestClient(srv.app), srv
+
+
+def test_tunnel_poll_pending_without_authorization(monkeypatch, tmp_path):
+    """Poll returns pending when no authorization has occurred for the device code."""
+    hclient, _ = _make_tunnel_hosted_client(monkeypatch, tmp_path)
+    r = hclient.get("/auth/tunnel-poll?device_code=nonexistent-code-xyz")
+    assert r.status_code == 200
+    assert r.json()["status"] == "pending"
+
+
+def test_tunnel_poll_requires_device_code(monkeypatch, tmp_path):
+    hclient, _ = _make_tunnel_hosted_client(monkeypatch, tmp_path)
+    r = hclient.get("/auth/tunnel-poll")
+    assert r.status_code == 400
+
+
+def test_tunnel_connect_post_requires_session(monkeypatch, tmp_path):
+    """POST /auth/tunnel-connect returns 401 without a session cookie."""
+    hclient, _ = _make_tunnel_hosted_client(monkeypatch, tmp_path)
+    r = hclient.post("/auth/tunnel-connect", json={"device_code": "abc"})
+    assert r.status_code == 401
+
+
+def test_tunnel_device_flow_complete(monkeypatch, tmp_path):
+    """Device code injected directly into the dict is returned by poll (single-use)."""
+    hclient, srv = _make_tunnel_hosted_client(monkeypatch, tmp_path)
+    device_code = str(uuid.uuid4())
+    raw_token = "sk_meridian_test_device_flow_abc123"
+    srv._tunnel_device_codes[device_code] = (raw_token, time.time() + 600)
+
+    r = hclient.get(f"/auth/tunnel-poll?device_code={device_code}")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["status"] == "complete"
+    assert body["token"] == raw_token
+
+    # Second poll: consumed — returns pending.
+    r2 = hclient.get(f"/auth/tunnel-poll?device_code={device_code}")
+    assert r2.json()["status"] == "pending"
+
+
+def test_tunnel_device_code_expires(monkeypatch, tmp_path):
+    """An expired device code is cleaned up and poll returns pending."""
+    hclient, srv = _make_tunnel_hosted_client(monkeypatch, tmp_path)
+    device_code = str(uuid.uuid4())
+    srv._tunnel_device_codes[device_code] = ("sk_meridian_expired", time.time() - 1)
+
+    r = hclient.get(f"/auth/tunnel-poll?device_code={device_code}")
+    assert r.json()["status"] == "pending"
+    assert device_code not in srv._tunnel_device_codes
+
+
+def test_tunnel_connect_page_redirects_unauthenticated(monkeypatch, tmp_path):
+    """GET /auth/tunnel-connect without session redirects to login."""
+    hclient, _ = _make_tunnel_hosted_client(monkeypatch, tmp_path)
+    r = hclient.get("/auth/tunnel-connect?device_code=abc", follow_redirects=False)
+    assert r.status_code == 302
+    assert "/auth/login" in r.headers["location"]
+    assert "device_code" in r.headers["location"]
+
+
+# ---------------------------------------------------------------------------
+# tunnel_client.py — config cache unit tests
+# ---------------------------------------------------------------------------
+
+
+def test_config_path_returns_expected_location():
+    from meridian.tunnel_client import _config_path
+    p = _config_path()
+    assert p.name == "config.json"
+    assert p.parent.name == ".meridian"
+
+
+def test_read_cached_token_returns_none_when_missing(tmp_path, monkeypatch):
+    from meridian import tunnel_client as tc
+    monkeypatch.setattr(tc, "_config_path", lambda: tmp_path / "config.json")
+    assert tc._read_cached_token("https://usemeridian.us") is None
+
+
+def test_read_cached_token_returns_none_when_expired(tmp_path, monkeypatch):
+    from meridian import tunnel_client as tc
+    cfg = tmp_path / "config.json"
+    cfg.write_text(json.dumps({
+        "tunnel_token": {
+            "token": "sk_meridian_old",
+            "base_url": "https://usemeridian.us",
+            "expires_at": time.time() - 1,
+        }
+    }), encoding="utf-8")
+    monkeypatch.setattr(tc, "_config_path", lambda: cfg)
+    assert tc._read_cached_token("https://usemeridian.us") is None
+
+
+def test_read_cached_token_returns_none_for_wrong_base_url(tmp_path, monkeypatch):
+    from meridian import tunnel_client as tc
+    cfg = tmp_path / "config.json"
+    cfg.write_text(json.dumps({
+        "tunnel_token": {
+            "token": "sk_meridian_abc",
+            "base_url": "https://other.example.com",
+            "expires_at": time.time() + 3600,
+        }
+    }), encoding="utf-8")
+    monkeypatch.setattr(tc, "_config_path", lambda: cfg)
+    assert tc._read_cached_token("https://usemeridian.us") is None
+
+
+def test_write_and_read_cached_token_roundtrip(tmp_path, monkeypatch):
+    from meridian import tunnel_client as tc
+    cfg = tmp_path / "config.json"
+    monkeypatch.setattr(tc, "_config_path", lambda: cfg)
+    tc._write_cached_token("https://usemeridian.us", "sk_meridian_fresh")
+    result = tc._read_cached_token("https://usemeridian.us")
+    assert result == "sk_meridian_fresh"
+
+
+def test_write_cached_token_preserves_existing_keys(tmp_path, monkeypatch):
+    from meridian import tunnel_client as tc
+    cfg = tmp_path / "config.json"
+    cfg.write_text(json.dumps({"other_key": "keep_me"}), encoding="utf-8")
+    monkeypatch.setattr(tc, "_config_path", lambda: cfg)
+    tc._write_cached_token("https://usemeridian.us", "sk_meridian_new")
+    data = json.loads(cfg.read_text(encoding="utf-8"))
+    assert data["other_key"] == "keep_me"
+    assert data["tunnel_token"]["token"] == "sk_meridian_new"
+
+
+def test_resolve_token_returns_empty_when_no_env(monkeypatch):
+    from meridian.tunnel_client import _resolve_token
+    monkeypatch.delenv("MERIDIAN_API_KEY", raising=False)
+    monkeypatch.delenv("BEARER_TOKEN", raising=False)
+    assert _resolve_token(None) == ""
+
+
+def test_resolve_token_cli_arg_takes_priority(monkeypatch):
+    from meridian.tunnel_client import _resolve_token
+    monkeypatch.setenv("MERIDIAN_API_KEY", "sk_env")
+    assert _resolve_token("sk_cli") == "sk_cli"
+
+
+def test_resolve_token_strips_bearer_prefix(monkeypatch):
+    from meridian.tunnel_client import _resolve_token
+    monkeypatch.delenv("MERIDIAN_API_KEY", raising=False)
+    monkeypatch.delenv("BEARER_TOKEN", raising=False)
+    assert _resolve_token("Bearer sk_meridian_abc") == "sk_meridian_abc"
+
+
 def test_get_auth_token_uses_oauth_first(monkeypatch):
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test-env")
     monkeypatch.setattr(

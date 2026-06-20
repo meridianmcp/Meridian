@@ -4469,6 +4469,168 @@ async def auth_install_page(request: Request) -> HTMLResponse:
     return HTMLResponse(content=html)
 
 
+# ---------------------------------------------------------------------------
+# Tunnel device-code auth  (`meridian --tunnel` browser login flow)
+# ---------------------------------------------------------------------------
+
+import time as _tc_time
+
+# {device_code: (raw_token, expires_epoch)}
+_tunnel_device_codes: dict[str, tuple[str, float]] = {}
+_TUNNEL_DEVICE_CODE_TTL = 600  # 10 minutes
+
+
+def _cleanup_tunnel_device_codes() -> None:
+    now = _tc_time.time()
+    expired = [k for k, (_, exp) in list(_tunnel_device_codes.items()) if now > exp]
+    for k in expired:
+        _tunnel_device_codes.pop(k, None)
+
+
+@app.get("/auth/tunnel-connect", response_class=HTMLResponse)
+async def tunnel_connect_page(request: Request) -> Any:
+    """Device-code page for `meridian --tunnel` browser auth.
+
+    If the user has a session cookie, renders an Authorize button.
+    If not authenticated, redirects to /auth/login with a next= return URL.
+    """
+    if not _hosted_mode():
+        raise HTTPException(status_code=404, detail="not available in self-hosted mode")
+
+    device_code = request.query_params.get("device_code", "").strip()
+    if not device_code:
+        raise HTTPException(status_code=400, detail="device_code required")
+
+    tenant = None
+    try:
+        tenant = await _get_authenticated_tenant(request)
+    except HTTPException:
+        pass
+
+    if tenant is None:
+        from urllib.parse import quote as _q
+        next_path = f"/auth/tunnel-connect?device_code={_q(device_code, safe='')}"
+        return RedirectResponse(url=f"/auth/login?next={_q(next_path, safe='/')}", status_code=302)
+
+    email = tenant.get("email", "")
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Authorize Tunnel — Meridian</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>&#x1F9ED;</text></svg>">
+  <style>
+    body{{font-family:system-ui,sans-serif;background:#0d0d0d;color:#e8e8e8;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}}
+    .card{{background:#1a1a1a;border:1px solid #2e2e2e;border-radius:12px;padding:32px;max-width:480px;width:100%;text-align:center}}
+    h2{{margin:0 0 8px;font-size:20px}}
+    .sub{{color:#888;margin:0 0 16px;font-size:14px;line-height:1.5}}
+    .email{{color:#60a5fa;font-size:13px;margin-bottom:24px}}
+    .btn{{padding:12px 32px;border-radius:8px;border:none;background:#3b82f6;color:#fff;cursor:pointer;font-size:15px;font-weight:600;width:100%;transition:background 0.15s}}
+    .btn:hover{{background:#2563eb}}
+    .btn:disabled{{background:#374151;cursor:default;color:#6b7280}}
+    .note{{font-size:12px;color:#555;margin-top:16px;line-height:1.5}}
+    .success{{display:none;color:#4ade80;font-size:15px;margin-top:16px;font-weight:500}}
+    .err{{display:none;color:#f87171;font-size:13px;margin-top:12px}}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h2>Authorize Meridian Tunnel</h2>
+    <p class="sub"><code>meridian --tunnel</code> is requesting access to relay requests through your account.</p>
+    <p class="email">Signed in as {email}</p>
+    <button class="btn" id="authBtn" onclick="authorize()">Authorize tunnel access</button>
+    <div class="err" id="err"></div>
+    <div class="success" id="ok">&#x2713; Authorized! You can close this tab.</div>
+    <p class="note">This grants your local tunnel client access. You can revoke it any time from the dashboard under API tokens.</p>
+  </div>
+  <script>
+    async function authorize() {{
+      const btn = document.getElementById('authBtn');
+      btn.disabled = true;
+      btn.textContent = 'Authorizing…';
+      try {{
+        const r = await fetch('/auth/tunnel-connect', {{
+          method: 'POST',
+          headers: {{'Content-Type': 'application/json'}},
+          body: JSON.stringify({{device_code: '{device_code}'}})
+        }});
+        if (r.ok) {{
+          btn.style.display = 'none';
+          document.getElementById('ok').style.display = 'block';
+        }} else {{
+          const j = await r.json().catch(() => ({{}}));
+          document.getElementById('err').textContent = j.detail || 'Authorization failed.';
+          document.getElementById('err').style.display = 'block';
+          btn.disabled = false;
+          btn.textContent = 'Authorize tunnel access';
+        }}
+      }} catch (e) {{
+        document.getElementById('err').textContent = 'Network error. Please try again.';
+        document.getElementById('err').style.display = 'block';
+        btn.disabled = false;
+        btn.textContent = 'Authorize tunnel access';
+      }}
+    }}
+  </script>
+</body>
+</html>"""
+    return HTMLResponse(content=html)
+
+
+@app.post("/auth/tunnel-connect")
+async def tunnel_connect_authorize(request: Request) -> dict[str, Any]:
+    """Complete the device-code flow — create a tunnel token and register it for polling."""
+    if not _hosted_mode():
+        raise HTTPException(status_code=404, detail="not available in self-hosted mode")
+
+    tenant = await _get_authenticated_tenant(request)
+
+    body: dict = {}
+    try:
+        body = await request.json()
+    except Exception:
+        pass
+    device_code = (body.get("device_code") or "").strip()
+    if not device_code:
+        raise HTTPException(status_code=400, detail="device_code required")
+
+    _cleanup_tunnel_device_codes()
+    if device_code in _tunnel_device_codes:
+        return {"status": "ok"}  # idempotent
+
+    # One active tunnel-cli token per tenant (overwrites any previous one).
+    db = request.app.state.db
+    await db_module.delete_api_tokens_by_label(db, tenant["id"], "tunnel-cli")
+    raw_token, _ = await db_module.create_api_token(db, tenant["id"], label="tunnel-cli")
+
+    _tunnel_device_codes[device_code] = (raw_token, _tc_time.time() + _TUNNEL_DEVICE_CODE_TTL)
+    return {"status": "ok"}
+
+
+@app.get("/auth/tunnel-poll")
+async def tunnel_connect_poll(request: Request) -> dict[str, Any]:
+    """Poll endpoint for the tunnel device-code flow.
+
+    Returns ``{"status": "pending"}`` until the user clicks Authorize, then
+    ``{"status": "complete", "token": "sk_meridian_..."}`` exactly once
+    (the device code is consumed on first successful read).
+    """
+    if not _hosted_mode():
+        raise HTTPException(status_code=404, detail="not available in self-hosted mode")
+
+    device_code = request.query_params.get("device_code", "").strip()
+    if not device_code:
+        raise HTTPException(status_code=400, detail="device_code required")
+
+    _cleanup_tunnel_device_codes()
+
+    if device_code not in _tunnel_device_codes:
+        return {"status": "pending"}
+
+    raw_token, _ = _tunnel_device_codes.pop(device_code)
+    return {"status": "complete", "token": raw_token}
+
+
 # v2.0 — Remote MCP endpoint (HTTP JSON-RPC 2.0 transport)
 # ---------------------------------------------------------------------------
 
