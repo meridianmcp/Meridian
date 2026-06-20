@@ -72,10 +72,14 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
           "compact": {"type": "boolean", "description": "Default true — slim orientation. Set false for the full goal/instructions payload."}},
           "required": ["project_id", "session_name"]}},
     {"name": "list_projects", "description":
-        "Read-only: Call first when project_id is unknown. Returns [{id, name, sprint, created_at}] newest first.",
+        "Read-only: List all projects — find, browse, or look up your projects and their IDs. "
+        "Call this first when you have a project name but need its project_id, or to discover "
+        "which projects exist. Returns [{id, name, sprint, created_at}] newest first.",
      "inputSchema": {"type": "object", "properties": {}}},
     {"name": "get_project_by_name", "description":
-        "Read-only: Look up a project by name (case-insensitive substring match). Returns the first hit with id, name, and sprint.",
+        "Read-only: Find a project by name — look up, search, or resolve a project's project_id "
+        "from its name (case-insensitive substring match). Use when the user names a project but "
+        "you need its id. Returns the first hit with id, name, and sprint.",
      "inputSchema": {"type": "object", "properties": {
          "name": {"type": "string"}},
          "required": ["name"]}},
