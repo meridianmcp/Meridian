@@ -65,4 +65,13 @@ in the Meridian dashboard → Settings → Executor Rules.
   `detect_changes`) over raw file reads — they are faster and use far fewer tokens.
 - Fall back to reading files only when a graph query is insufficient.
 - If `trace_path` is not in your tool list, ignore this section.
+
+## MANDATORY CODE INTEL PROTOCOL
+When `search_graph`, `get_function_tool`, or `get_code_snippet` are in your tool
+list AND the task involves source code files, use them BEFORE any `read_file` or
+`read_multiple_files` call. Call `search_graph` to locate symbols. Call
+`get_function_tool` to extract specific functions. Reading whole source code
+files when code intel tools are present is a protocol violation. For non-code
+files (documents, presentations, spreadsheets, config, data), use filesystem
+tools directly.
 """

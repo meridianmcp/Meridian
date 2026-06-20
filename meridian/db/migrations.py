@@ -1533,12 +1533,15 @@ async def _migrate_tunnel_active(db: aiosqlite.Connection) -> None:
 async def _backfill_agent_instructions(db: aiosqlite.Connection) -> None:
     """Set DEFAULT_AGENT_INSTRUCTIONS on every project that has no custom rules.
 
-    Idempotent: only touches rows where agent_instructions IS NULL.
-    Called after _migrate_agent_instructions ensures the column exists.
+    Idempotent: only touches rows where agent_instructions is empty (NULL or the
+    empty string). Projects that already carry custom rules are never touched, so
+    user edits are preserved. Called after _migrate_agent_instructions ensures
+    the column exists.
     """
     from ..agent_defaults import DEFAULT_AGENT_INSTRUCTIONS  # avoid circular import
     await db.execute(
-        "UPDATE projects SET agent_instructions = ? WHERE agent_instructions IS NULL",
+        "UPDATE projects SET agent_instructions = ? "
+        "WHERE agent_instructions IS NULL OR agent_instructions = ''",
         (DEFAULT_AGENT_INSTRUCTIONS,),
     )
     await db.commit()

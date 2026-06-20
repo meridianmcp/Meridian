@@ -5773,6 +5773,7 @@ def test_pg_migration_registry_matches_historical_order():
         "_migrate_pg_workspace_members_rbac",
         "_migrate_pg_admin_plan",
         "_migrate_pg_tunnel_active",
+        "_migrate_pg_tunnel_plugins",
     ]
     assert late == [
         "_migrate_pg_workspace_tenant_isolation",
@@ -5796,7 +5797,15 @@ def test_pg_migration_registry_matches_historical_order():
     ]
     # No duplicates across the three groups.
     allnames = core + hosted + late
-    assert len(allnames) == len(set(allnames)) == 48
+    assert len(allnames) == len(set(allnames)) == 49
+
+
+def test_default_agent_instructions_has_code_intel_protocol():
+    """Phase 4 — the mandatory code-intel protocol ships in the default rules."""
+    from meridian.agent_defaults import DEFAULT_AGENT_INSTRUCTIONS
+    assert "MANDATORY CODE INTEL PROTOCOL" in DEFAULT_AGENT_INSTRUCTIONS
+    assert "get_function_tool" in DEFAULT_AGENT_INSTRUCTIONS
+    assert "search_graph" in DEFAULT_AGENT_INSTRUCTIONS
 
 
 def test_cached_plan_error_is_retryable():

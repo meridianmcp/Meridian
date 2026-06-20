@@ -1111,6 +1111,15 @@ async def _migrate_pg_tunnel_active(conn: PostgresConnection) -> None:
     )
 
 
+async def _migrate_pg_tunnel_plugins(conn: PostgresConnection) -> None:
+    """Tunnel plugin registry — tenants.tunnel_plugins: per-tenant JSON config for
+    what `meridian --tunnel` spawns behind each transport slot. NULL → built-in
+    defaults. Mirrors the SQLite _migrate_tunnel_plugins. Idempotent."""
+    await conn.executescript(
+        "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS tunnel_plugins TEXT"
+    )
+
+
 async def _migrate_pg_code_intel(conn: PostgresConnection) -> None:
     """Sprint-2/3 — projects.code_intel_enabled: per-project Code Intelligence toggle."""
     await conn.executescript(
@@ -1569,10 +1578,14 @@ async def _migrate_pg_agent_instructions(conn: PostgresConnection) -> None:
 
 
 async def _migrate_pg_backfill_agent_instructions(conn: PostgresConnection) -> None:
-    """Set DEFAULT_AGENT_INSTRUCTIONS on projects with no custom rules (idempotent)."""
+    """Set DEFAULT_AGENT_INSTRUCTIONS on projects with no custom rules (idempotent).
+
+    Empty = NULL or empty string; projects with custom rules are never touched.
+    """
     from .agent_defaults import DEFAULT_AGENT_INSTRUCTIONS  # avoid circular import
     await conn.execute(
-        "UPDATE projects SET agent_instructions = %s WHERE agent_instructions IS NULL",
+        "UPDATE projects SET agent_instructions = %s "
+        "WHERE agent_instructions IS NULL OR agent_instructions = ''",
         (DEFAULT_AGENT_INSTRUCTIONS,),
     )
 
@@ -1681,6 +1694,7 @@ _PG_MIGRATIONS_HOSTED = (
     _migrate_pg_workspace_members_rbac,
     _migrate_pg_admin_plan,
     _migrate_pg_tunnel_active,
+    _migrate_pg_tunnel_plugins,
 )
 
 # Late migrations — run on every DB after the hosted-only set.
