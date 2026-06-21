@@ -1133,7 +1133,7 @@ async def run_tunnel(
     for slot, plugin, human in (("ppt", ppt_plugin, "PowerPoint"),
                                 ("word", word_plugin, "Word"),
                                 ("dc", dc_plugin, "Desktop Commander")):
-        if not plugin.get("enabled", False if slot != "dc" else True):
+        if not plugin.get("enabled", False):
             continue
         cmd = plugin.get("command")
         # Desktop Commander: default command uses bare "npx" (not the full resolved

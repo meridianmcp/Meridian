@@ -816,7 +816,7 @@ async def get_tunnel_plugins(request: Request) -> Response:
     if tenant is None:
         return _json_response({
             "plugins": resolve_plugins(None), "config": {},
-            "active": {"fs": False, "code": False, "extract": False},
+            "active": {"fs": False, "code": False, "extract": False, "ppt": False, "word": False, "dc": False},
             "plan": "free",
         })
     parsed = _parse_plugins_json(tenant.get("tunnel_plugins"))
@@ -830,6 +830,7 @@ async def get_tunnel_plugins(request: Request) -> Response:
             "extract": tid in _tunnel_extract_sockets,
             "ppt": tid in _tunnel_ppt_sockets,
             "word": tid in _tunnel_word_sockets,
+            "dc": tid in _tunnel_dc_sockets,
         },
         # The tunnel (and thus this section) is Pro/admin-only; the dashboard
         # uses this to gate the Tunnel Plugins card.
