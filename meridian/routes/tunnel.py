@@ -933,10 +933,10 @@ _CODE_INTEL_FIRST_GUIDANCE = (
 
 # Tools whose descriptions get the code-intel-first prefix at the bridge.
 # Names are connector-namespaced by list_tunnel_tools using SLOT_DISPLAY_NAMES,
-# so these are the filesystem connector's read tools — "filesystem:read_file" /
-# "filesystem:read_multiple_files". (codebase:read_file etc. would be a different
+# so these are the filesystem connector's read tools — "filesystem__read_file" /
+# "filesystem__read_multiple_files". (codebase__read_file etc. would be a different
 # server and is intentionally not matched.)
-_READ_TOOLS_TO_REWRITE = frozenset({"filesystem:read_file", "filesystem:read_multiple_files"})
+_READ_TOOLS_TO_REWRITE = frozenset({"filesystem__read_file", "filesystem__read_multiple_files"})
 
 
 def _rewrite_tool_description(tool: dict) -> dict:
@@ -1048,8 +1048,8 @@ async def list_tunnel_tools(
 ) -> list[dict]:
     """Aggregate tools from every active tunnel and refresh the routing cache.
 
-    Each tool name is namespaced by its connector slot — ``code:trace_path``,
-    ``extract:get_symbols_tool``, ``fs:read_file`` — so Claude can tell the
+    Each tool name is namespaced by its connector slot — ``codebase__trace_path``,
+    ``extractor__get_symbols_tool``, ``filesystem__read_file`` — so Claude can tell the
     connectors apart and tool search surfaces them by connector. The prefixed
     name is what's advertised and what the routing cache is keyed by;
     ``call_tunnel_tool`` strips the prefix before forwarding to the tunnel.
@@ -1078,7 +1078,7 @@ async def list_tunnel_tools(
             if not name:
                 continue
             display = SLOT_DISPLAY_NAMES.get(label, label)
-            prefixed = f"{display}:{name}"
+            prefixed = f"{display}__{name}"
             if prefixed in reserved_names or prefixed in routes:
                 continue
             tool_copy = dict(tool)
@@ -1113,7 +1113,7 @@ async def call_tunnel_tool(
     if tenant_id not in sockets:
         return None
     # The tunneled server only knows the bare tool name; strip the connector prefix.
-    bare_name = name.split(":", 1)[1] if ":" in name else name
+    bare_name = name.split("__", 1)[1] if "__" in name else name
     resp = await _tunnel_jsonrpc(
         tenant_id, label, "tools/call",
         {"name": bare_name, "arguments": arguments or {}},

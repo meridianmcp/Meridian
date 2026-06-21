@@ -104,17 +104,17 @@ def test_list_tunnel_tools_aggregates_and_reserves(monkeypatch):
     # three survive — namespaced by their connector slot.
     tools = asyncio.run(tn.list_tunnel_tools("t1", reserved_names={"read_file"}))
     names = {t["name"] for t in tools}
-    assert names == {"filesystem:read_file", "filesystem:list_directory", "codebase:trace_path"}
+    assert names == {"filesystem__read_file", "filesystem__list_directory", "codebase__trace_path"}
     assert tn._tunnel_tool_routes["t1"] == {
-        "filesystem:read_file": "fs", "filesystem:list_directory": "fs",
-        "codebase:trace_path": "code",
+        "filesystem__read_file": "fs", "filesystem__list_directory": "fs",
+        "codebase__trace_path": "code",
     }
 
 
 def test_call_tunnel_tool_routes_to_owner(monkeypatch):
     tn._tunnel_code_sockets["t1"] = object()
     # Routing cache is keyed by the connector-prefixed name.
-    tn._tunnel_tool_routes["t1"] = {"codebase:trace_path": "code"}
+    tn._tunnel_tool_routes["t1"] = {"codebase__trace_path": "code"}
 
     seen = {}
 
@@ -125,7 +125,7 @@ def test_call_tunnel_tool_routes_to_owner(monkeypatch):
         return {"result": {"content": [{"type": "text", "text": "traced"}]}}
 
     _stub_proxy(monkeypatch, responder)
-    result = asyncio.run(tn.call_tunnel_tool("t1", "codebase:trace_path", {"symbol": "foo"}))
+    result = asyncio.run(tn.call_tunnel_tool("t1", "codebase__trace_path", {"symbol": "foo"}))
     assert result["content"][0]["text"] == "traced"
     assert seen["label"] == "code"
     assert seen["method"] == "tools/call"
@@ -134,9 +134,9 @@ def test_call_tunnel_tool_routes_to_owner(monkeypatch):
 
 
 def test_call_tunnel_tool_strips_prefix_before_forward(monkeypatch):
-    """call_tunnel_tool('codebase:get_symbols_tool') forwards bare 'get_symbols_tool'."""
+    """call_tunnel_tool('codebase__get_symbols_tool') forwards bare 'get_symbols_tool'."""
     tn._tunnel_code_sockets["t1"] = object()
-    tn._tunnel_tool_routes["t1"] = {"codebase:get_symbols_tool": "code"}
+    tn._tunnel_tool_routes["t1"] = {"codebase__get_symbols_tool": "code"}
     seen = {}
 
     def responder(label, method, params):
@@ -144,7 +144,7 @@ def test_call_tunnel_tool_strips_prefix_before_forward(monkeypatch):
         return {"result": {"content": []}}
 
     _stub_proxy(monkeypatch, responder)
-    asyncio.run(tn.call_tunnel_tool("t1", "codebase:get_symbols_tool", {}))
+    asyncio.run(tn.call_tunnel_tool("t1", "codebase__get_symbols_tool", {}))
     assert seen["params"]["name"] == "get_symbols_tool"
 
 
@@ -162,7 +162,7 @@ def test_call_tunnel_tool_cold_cache_discovers(monkeypatch):
 
     _stub_proxy(monkeypatch, responder)
     # Caller uses the advertised (prefixed) name; cold cache rediscovers it.
-    result = asyncio.run(tn.call_tunnel_tool("t1", "extractor:get_symbols", {}))
+    result = asyncio.run(tn.call_tunnel_tool("t1", "extractor__get_symbols", {}))
     assert result["content"][0]["text"] == "ok"
     assert seen["params"]["name"] == "get_symbols"  # bare name forwarded
 
@@ -464,13 +464,13 @@ def test_fs_mcp_proxy_subpath_builds_local_path(monkeypatch):
 # ---------------------------------------------------------------------------
 
 def test_rewrite_tool_description_prepends_for_prefixed_read_file():
-    out = tn._rewrite_tool_description({"name": "filesystem:read_file", "description": "Read a file."})
+    out = tn._rewrite_tool_description({"name": "filesystem__read_file", "description": "Read a file."})
     assert out["description"].startswith("IMPORTANT:")
     assert "Read a file." in out["description"]
 
 
 def test_rewrite_tool_description_handles_read_multiple_and_empty_desc():
-    out = tn._rewrite_tool_description({"name": "filesystem:read_multiple_files"})
+    out = tn._rewrite_tool_description({"name": "filesystem__read_multiple_files"})
     assert out["description"] == tn._CODE_INTEL_FIRST_GUIDANCE
 
 
@@ -489,7 +489,7 @@ def test_rewrite_tool_description_leaves_other_tools_untouched():
 
 
 def test_rewrite_tool_description_is_idempotent():
-    once = tn._rewrite_tool_description({"name": "filesystem:read_file", "description": "x"})
+    once = tn._rewrite_tool_description({"name": "filesystem__read_file", "description": "x"})
     twice = tn._rewrite_tool_description(once)
     assert once["description"] == twice["description"]
     assert twice["description"].count("IMPORTANT:") == 1
@@ -497,7 +497,7 @@ def test_rewrite_tool_description_is_idempotent():
 
 def test_list_tunnel_tools_prefixes_and_rewrites(monkeypatch):
     """Aggregated tools are connector-prefixed (display names); only
-    filesystem:read_file gets the rewrite."""
+    filesystem__read_file gets the rewrite."""
     tn._tunnel_sockets["t1"] = object()
     tn._tunnel_code_sockets["t1"] = object()
 
@@ -515,17 +515,17 @@ def test_list_tunnel_tools_prefixes_and_rewrites(monkeypatch):
     tools = asyncio.run(tn.list_tunnel_tools("t1"))
     by_name = {t["name"]: t for t in tools}
     # Names are connector-namespaced with full display names.
-    assert "codebase:get_symbols_tool" in by_name
-    assert "filesystem:read_file" in by_name and "filesystem:list_directory" in by_name
+    assert "codebase__get_symbols_tool" in by_name
+    assert "filesystem__read_file" in by_name and "filesystem__list_directory" in by_name
     assert "get_symbols_tool" not in by_name  # bare name not advertised
-    # Only filesystem:read_file gets the code-intel-first directive.
-    assert by_name["filesystem:read_file"]["description"].startswith("IMPORTANT:")
-    assert by_name["filesystem:list_directory"]["description"] == "List a dir."
-    assert by_name["codebase:get_symbols_tool"]["description"] == "syms"
+    # Only filesystem__read_file gets the code-intel-first directive.
+    assert by_name["filesystem__read_file"]["description"].startswith("IMPORTANT:")
+    assert by_name["filesystem__list_directory"]["description"] == "List a dir."
+    assert by_name["codebase__get_symbols_tool"]["description"] == "syms"
 
 
 def test_fs_and_code_read_file_coexist(monkeypatch):
-    """filesystem:read_file and codebase:read_file are distinct, non-colliding."""
+    """filesystem__read_file and codebase__read_file are distinct, non-colliding."""
     tn._tunnel_sockets["t1"] = object()
     tn._tunnel_code_sockets["t1"] = object()
 
@@ -535,10 +535,10 @@ def test_fs_and_code_read_file_coexist(monkeypatch):
     _stub_proxy(monkeypatch, responder)
     tools = asyncio.run(tn.list_tunnel_tools("t1"))
     names = {t["name"] for t in tools}
-    assert {"filesystem:read_file", "codebase:read_file"} <= names
+    assert {"filesystem__read_file", "codebase__read_file"} <= names
     routes = tn._tunnel_tool_routes["t1"]
-    assert routes["filesystem:read_file"] == "fs"   # routed back via internal label
-    assert routes["codebase:read_file"] == "code"
+    assert routes["filesystem__read_file"] == "fs"   # routed back via internal label
+    assert routes["codebase__read_file"] == "code"
 
 
 def test_slot_display_names_cover_all_labels():
