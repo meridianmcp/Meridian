@@ -60,7 +60,7 @@ jobs:
           if [ "${{ inputs.hotfix }}" = "yes" ]; then
             pixi run python -m pytest tests/test_core.py tests/test_new_v25.py tests/test_hosted.py tests/test_security.py -n auto -q --tb=short
           else
-            pixi run python -m pytest tests/ -n auto -q --tb=short --ignore=tests/test_demo_ux.py --cov=meridian --cov-config=.coveragerc --cov-report=term-missing --cov-fail-under=80
+            pixi run test-cov
           fi
 
   playwright-tests:
