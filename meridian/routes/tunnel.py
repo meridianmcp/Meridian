@@ -1063,25 +1063,20 @@ async def list_tunnel_tools(
         sockets, _ = _label_maps(label)
         if tenant_id not in sockets:
             continue
-        try:
-            resp = await _tunnel_jsonrpc(tenant_id, label, "tools/list", {})
-        except Exception as exc:  # noqa: BLE001
-            _log.debug("tunnel %s tools/list failed for %s: %s", label, tenant_id[:8], exc)
-            resp = None
-        if not resp:
-            continue
-        tools = ((resp.get("result") or {}).get("tools")) or []
-        # Retry up to 3x with 2s backoff if proxy returns empty — local
-        # proxy may still be starting when the WebSocket first connects.
-        for _attempt in range(3):
+        tools: list[dict] = []
+        for _attempt in range(4):  # initial try + up to 3 retries
+            try:
+                resp = await _tunnel_jsonrpc(tenant_id, label, "tools/list", {})
+                tools = ((resp.get("result") or {}).get("tools")) or [] if resp else []
+            except Exception as exc:  # noqa: BLE001
+                _log.debug("tunnel %s tools/list failed for %s: %s", label, tenant_id[:8], exc)
+                tools = []
             if tools:
                 break
-            await asyncio.sleep(2)
-            try:
-                resp2 = await _tunnel_jsonrpc(tenant_id, label, "tools/list", {})
-                tools = ((resp2.get("result") or {}).get("tools")) or [] if resp2 else []
-            except Exception:  # noqa: BLE001
-                break
+            if _attempt < 3:
+                await asyncio.sleep(2)
+        if not tools:
+            continue
         for tool in tools:
             if not isinstance(tool, dict):
                 continue
