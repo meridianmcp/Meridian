@@ -466,6 +466,18 @@ async def _download_codebase_memory_mcp() -> "str | None":
             r.raise_for_status()
             dest.write_bytes(r.content)
 
+        # Sanity-check: a real binary should be well over 1 MB. A redirect page
+        # or partial download will be tiny — reject it so we don't silently cache
+        # a broken file that produces "path not found" on every tunnel start.
+        if dest.stat().st_size < 1_000_000:
+            dest.unlink(missing_ok=True)
+            print(
+                f"  code-intel: downloaded file is too small ({dest.stat().st_size if dest.exists() else 0} bytes) "
+                "— likely a corrupt download. Try: npm install -g codebase-memory-mcp",
+                file=sys.stderr, flush=True,
+            )
+            return None
+
         if sys.platform != "win32":
             dest.chmod(dest.stat().st_mode | 0o111)  # make executable
 
@@ -1001,12 +1013,14 @@ async def run_tunnel(
     extract_plugin = by_slot.get("extract") or {}
     ppt_plugin = by_slot.get("ppt") or {}
     word_plugin = by_slot.get("word") or {}
+    dc_plugin = by_slot.get("dc") or {}
     # Per-slot effective ports (override > the run_tunnel arg default).
     fs_port = int(fs_plugin.get("port") or port)
     code_port = int(code_plugin.get("port") or code_port)
     extract_port = int(extract_plugin.get("port") or extract_port)
     ppt_port = int(ppt_plugin.get("port") or 8811)
     word_port = int(word_plugin.get("port") or 8812)
+    dc_port = int(dc_plugin.get("port") or 8813)
 
     # Filesystem connector roots (executor_config.filesystem_roots, unioned across
     # the tenant's projects). Empty → fall back to the home dir (repo_path).
@@ -1115,12 +1129,16 @@ async def run_tunnel(
     #     dashboard's Tunnel Plugins section. Each carries its own command and
     #     optional env (e.g. word-mcp-live's MCP_AUTHOR) in the plugin registry.
     office_procs: dict[str, subprocess.Popen] = {}
-    office_ports = {"ppt": ppt_port, "word": word_port}
+    office_ports = {"ppt": ppt_port, "word": word_port, "dc": dc_port}
     for slot, plugin, human in (("ppt", ppt_plugin, "PowerPoint"),
-                                ("word", word_plugin, "Word")):
-        if not plugin.get("enabled", False):
+                                ("word", word_plugin, "Word"),
+                                ("dc", dc_plugin, "Desktop Commander")):
+        if not plugin.get("enabled", False if slot != "dc" else True):
             continue
         cmd = plugin.get("command")
+        # Desktop Commander: default command (no override) uses npx directly.
+        if cmd is None and slot == "dc":
+            cmd = [npx, "-y", "@wonderwhy-er/desktop-commander@latest"]
         if not cmd:
             continue
         oport = office_ports[slot]
@@ -1129,7 +1147,7 @@ async def run_tunnel(
         if plugin_env:
             spawn_env = {**os.environ, **{str(k): str(v) for k, v in plugin_env.items()}}
         cmd_office = _build_proxy_for_inner(npx, list(cmd), oport)
-        print(f"  {human.lower()}:{' ' * (15 - len(human))}http://127.0.0.1:{oport}", flush=True)
+        print(f"  {human.lower():{15}}http://127.0.0.1:{oport}", flush=True)
         try:
             office_procs[slot] = subprocess.Popen(cmd_office, env=spawn_env)
             proc_holders.append({"proc": office_procs[slot], "cmd": cmd_office, "env": spawn_env, "label": slot})

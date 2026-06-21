@@ -24,13 +24,14 @@ from typing import Any
 # slot = the fixed server transport a plugin rides on. Each built-in owns one
 # slot; that mapping is immutable (a config override can't move a built-in to
 # another slot, which would collide with the server routes).
-SLOTS = ("fs", "code", "extract", "ppt", "word")
+SLOTS = ("fs", "code", "extract", "ppt", "word", "dc")
 
 DEFAULT_FS_PORT = 8808
 DEFAULT_CODE_PORT = 8809
 DEFAULT_EXTRACT_PORT = 8810
 DEFAULT_PPT_PORT = 8811
 DEFAULT_WORD_PORT = 8812
+DEFAULT_DC_PORT = 8813
 
 # Ordered: filesystem first (the always-on base), then the two code plugins.
 BUILTIN_PLUGINS: list[dict[str, Any]] = [
@@ -91,6 +92,17 @@ BUILTIN_PLUGINS: list[dict[str, Any]] = [
         "command": ["uvx", "word-mcp-live"],
         "env": {"MCP_AUTHOR": "Adam", "MCP_AUTHOR_INITIALS": "AC"},
         "description": "Word authoring (word-mcp-live)",
+        "description_overrides": {},
+    },
+    {
+        "name": "desktop-commander",
+        "slot": "dc",
+        "port": DEFAULT_DC_PORT,
+        "url_prefix": "/dc",
+        "enabled": True,
+        "builtin": True,
+        "command": None,  # spawned via npx @wonderwhy-er/desktop-commander@latest
+        "description": "Desktop Commander — system tools, file access, terminal (local only)",
         "description_overrides": {},
     },
 ]

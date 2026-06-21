@@ -46,6 +46,7 @@ _tunnel_code_sockets: dict[str, WebSocket] = {}
 _tunnel_extract_sockets: dict[str, WebSocket] = {}
 _tunnel_ppt_sockets: dict[str, WebSocket] = {}
 _tunnel_word_sockets: dict[str, WebSocket] = {}
+_tunnel_dc_sockets: dict[str, WebSocket] = {}
 
 # Correlation maps: request_id → Future that resolves when client responds
 _pending_reqs: dict[str, asyncio.Future[dict]] = {}
@@ -53,6 +54,7 @@ _pending_code_reqs: dict[str, asyncio.Future[dict]] = {}
 _pending_extract_reqs: dict[str, asyncio.Future[dict]] = {}
 _pending_ppt_reqs: dict[str, asyncio.Future[dict]] = {}
 _pending_word_reqs: dict[str, asyncio.Future[dict]] = {}
+_pending_dc_reqs: dict[str, asyncio.Future[dict]] = {}
 
 
 def _is_tunnel_allowed(tenant: dict) -> bool:
@@ -408,6 +410,12 @@ async def tunnel_word_ws(ws: WebSocket, tenant_id: str) -> None:
     await _serve_tunnel_ws(ws, tenant_id, _tunnel_word_sockets, _pending_word_reqs, "word")
 
 
+@router.websocket("/tunnel-dc/{tenant_id}")
+async def tunnel_dc_ws(ws: WebSocket, tenant_id: str) -> None:
+    """Hold open a WebSocket for one tenant's desktop-commander proxy."""
+    await _serve_tunnel_ws(ws, tenant_id, _tunnel_dc_sockets, _pending_dc_reqs, "dc")
+
+
 # ---------------------------------------------------------------------------
 # Shared proxy helper
 # ---------------------------------------------------------------------------
@@ -743,6 +751,27 @@ async def word_mcp_proxy_subpath(tenant_id: str, rest: str, request: Request) ->
                                _tunnel_word_sockets, _pending_word_reqs, "word")
 
 
+@router.get("/dc/mcp/{tenant_id}")
+@router.post("/dc/mcp/{tenant_id}")
+@router.options("/dc/mcp/{tenant_id}")
+async def dc_mcp_proxy(tenant_id: str, request: Request) -> Response:
+    """Proxy requests to the tenant's desktop-commander over the dc tunnel."""
+    prefix = f"/dc/mcp/{tenant_id}"
+    local_path = request.url.path[len(prefix):] or "/"
+    return await _office_proxy(tenant_id, local_path, request,
+                               _tunnel_dc_sockets, _pending_dc_reqs, "dc")
+
+
+@router.get("/dc/mcp/{tenant_id}/{rest:path}")
+@router.post("/dc/mcp/{tenant_id}/{rest:path}")
+@router.options("/dc/mcp/{tenant_id}/{rest:path}")
+async def dc_mcp_proxy_subpath(tenant_id: str, rest: str, request: Request) -> Response:
+    """Same as dc_mcp_proxy but for sub-paths."""
+    local_path = f"/{rest}" if rest else "/"
+    return await _office_proxy(tenant_id, local_path, request,
+                               _tunnel_dc_sockets, _pending_dc_reqs, "dc")
+
+
 # ---------------------------------------------------------------------------
 # GET /tunnel/status/{tenant_id}  — lightweight status check (no auth required)
 # ---------------------------------------------------------------------------
@@ -757,6 +786,7 @@ async def tunnel_status(tenant_id: str) -> dict:
         "extract_active": tenant_id in _tunnel_extract_sockets,
         "ppt_active": tenant_id in _tunnel_ppt_sockets,
         "word_active": tenant_id in _tunnel_word_sockets,
+        "dc_active": tenant_id in _tunnel_dc_sockets,
     }
 
 
@@ -901,7 +931,7 @@ async def get_tunnel_filesystem_roots(request: Request) -> Response:
 # so a stateless ``tools/call`` can find the owning tunnel without re-listing.
 # Cold/missing entries trigger a one-shot re-discovery via ``list_tunnel_tools``.
 
-_TUNNEL_LABELS = ("fs", "code", "extract", "ppt", "word")
+_TUNNEL_LABELS = ("fs", "code", "extract", "ppt", "word", "dc")
 
 # Human-readable connector prefix shown to Claude in tool names (e.g.
 # "filesystem:read_file" instead of "fs:read_file"). The routing cache still
@@ -913,6 +943,7 @@ SLOT_DISPLAY_NAMES = {
     "extract": "extractor",
     "ppt": "powerpoint",
     "word": "word",
+    "dc": "desktop-commander",
 }
 
 # Per-process routing cache: tenant_id → {tool_name: tunnel_label}
@@ -970,6 +1001,8 @@ def _label_maps(label: str) -> "tuple[dict[str, WebSocket], dict[str, asyncio.Fu
         return _tunnel_ppt_sockets, _pending_ppt_reqs
     if label == "word":
         return _tunnel_word_sockets, _pending_word_reqs
+    if label == "dc":
+        return _tunnel_dc_sockets, _pending_dc_reqs
     return _tunnel_extract_sockets, _pending_extract_reqs
 
 
@@ -981,6 +1014,7 @@ def has_active_tunnel(tenant_id: str) -> bool:
         or tenant_id in _tunnel_extract_sockets
         or tenant_id in _tunnel_ppt_sockets
         or tenant_id in _tunnel_word_sockets
+        or tenant_id in _tunnel_dc_sockets
     )
 
 
