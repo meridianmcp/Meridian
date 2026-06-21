@@ -140,3 +140,36 @@ def test_office_plugins_enableable_and_overridable():
     assert word["enabled"] is True and word["command"] == ["uvx", "word-mcp-live", "--debug"]
     # word keeps its default env unless overridden.
     assert word["env"] == {"MCP_AUTHOR": "Adam", "MCP_AUTHOR_INITIALS": "AC"}
+
+
+# ---------------------------------------------------------------------------
+# Office auto-enable via binary detection (6c2b3562)
+# ---------------------------------------------------------------------------
+
+def test_detect_office_binaries_uses_which():
+    found = tp.detect_office_binaries(
+        which=lambda b: "/usr/bin/" + b if b == "powerpoint-mcp" else None
+    )
+    assert found == {"ppt"}
+
+
+def test_detect_office_binaries_none_found():
+    assert tp.detect_office_binaries(which=lambda b: None) == set()
+
+
+def test_resolve_auto_enables_detected_office_slots():
+    by_slot = {p["slot"]: p for p in tp.resolve_plugins(None, detected_slots={"ppt"})}
+    assert by_slot["ppt"]["enabled"] is True       # detected → on
+    assert by_slot["word"]["enabled"] is False      # not detected → stays off
+
+
+def test_resolve_detection_respects_explicit_disable():
+    cfg = {"powerpoint": {"enabled": False}}
+    by_slot = {p["slot"]: p for p in tp.resolve_plugins(cfg, detected_slots={"ppt"})}
+    assert by_slot["ppt"]["enabled"] is False       # explicit user choice wins
+
+
+def test_resolve_detection_keeps_explicit_enable_without_binary():
+    cfg = {"word": {"enabled": True}}
+    by_slot = {p["slot"]: p for p in tp.resolve_plugins(cfg, detected_slots=set())}
+    assert by_slot["word"]["enabled"] is True

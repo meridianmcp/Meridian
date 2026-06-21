@@ -985,8 +985,16 @@ async def run_tunnel(
     # /me response returns the already-resolved list (defaults + per-tenant
     # overrides); fall back to built-in defaults for older servers. Each slot
     # may be disabled, given a command override, or assigned a different port.
-    from .tunnel_plugins import resolve_plugins
-    plugins = me.get("tunnel_plugins") or resolve_plugins(None)
+    from .tunnel_plugins import resolve_plugins, detect_office_binaries
+    # Auto-enable Office slots whose launcher is installed on this machine, unless
+    # the user explicitly configured them. Resolve locally from the raw config
+    # (tunnel_plugins_config) so binary-detection applies; fall back to the
+    # server-resolved list for older servers that don't send the raw config.
+    detected = detect_office_binaries()
+    if "tunnel_plugins_config" in me:
+        plugins = resolve_plugins(me.get("tunnel_plugins_config"), detected_slots=detected)
+    else:
+        plugins = me.get("tunnel_plugins") or resolve_plugins(None, detected_slots=detected)
     by_slot = {p.get("slot"): p for p in plugins if isinstance(p, dict)}
     fs_plugin = by_slot.get("fs") or {}
     code_plugin = by_slot.get("code") or {}

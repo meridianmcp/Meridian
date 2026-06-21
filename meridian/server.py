@@ -1645,20 +1645,28 @@ async def me_endpoint(request: Request) -> dict[str, Any]:
         # whatever is enabled here, applying any per-tenant command/port
         # overrides over the built-in defaults. NULL config → built-in defaults.
         "tunnel_plugins": _resolved_tunnel_plugins(tenant.get("tunnel_plugins")),
+        # Raw per-tenant overrides so the client can re-resolve locally with
+        # binary-detection (auto-enabling Office slots) while still honouring any
+        # explicit enabled setting the user saved.
+        "tunnel_plugins_config": _parsed_tunnel_plugins(tenant.get("tunnel_plugins")),
     }
+
+
+def _parsed_tunnel_plugins(raw: Any) -> Any:
+    """Parse the stored tunnel_plugins JSON into Python (None on junk/empty)."""
+    if isinstance(raw, str) and raw.strip():
+        import json as _json
+        try:
+            return _json.loads(raw)
+        except Exception:  # noqa: BLE001
+            return None
+    return raw if isinstance(raw, (dict, list)) else None
 
 
 def _resolved_tunnel_plugins(raw: Any) -> list[dict[str, Any]]:
     """Parse the stored tunnel_plugins JSON and resolve it over the defaults."""
     from .tunnel_plugins import resolve_plugins
-    parsed: Any = raw
-    if isinstance(raw, str) and raw.strip():
-        import json as _json
-        try:
-            parsed = _json.loads(raw)
-        except Exception:  # noqa: BLE001 — malformed config → fall back to defaults
-            parsed = None
-    return resolve_plugins(parsed)
+    return resolve_plugins(_parsed_tunnel_plugins(raw))
 
 
 @app.get("/me/workspaces")

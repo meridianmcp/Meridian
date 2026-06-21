@@ -171,14 +171,19 @@ def normalize_plugins_config(raw: Any) -> dict[str, dict]:
     return out
 
 
-def resolve_plugins(raw_config: Any) -> list[dict]:
+def resolve_plugins(raw_config: Any, detected_slots: Any = frozenset()) -> list[dict]:
     """Merge per-tenant overrides over the built-in defaults.
 
-    Returns the three built-in plugin descriptors in order, each with overrides
-    applied (``enabled``, ``command``, ``port``, ``description``,
-    ``description_overrides``). The ``slot``/``url_prefix`` of a built-in are
-    fixed and never moved by config. An empty/absent config returns the
-    defaults verbatim — so existing tunnels behave identically.
+    Returns the built-in plugin descriptors in order, each with overrides applied
+    (``enabled``, ``command``, ``port``, ``description``, ``description_overrides``,
+    ``env``). The ``slot``/``url_prefix`` of a built-in are fixed and never moved
+    by config. An empty/absent config returns the defaults verbatim — so existing
+    tunnels behave identically.
+
+    ``detected_slots`` are slots whose backing binary was found on the local
+    machine (see :func:`detect_office_binaries`). A detected slot is auto-enabled
+    **only when the user did not explicitly set ``enabled``** for it, so an
+    explicit ``enabled: false`` in the config always wins.
     """
     overrides = normalize_plugins_config(raw_config)
     resolved: list[dict] = []
@@ -188,6 +193,9 @@ def resolve_plugins(raw_config: Any) -> list[dict]:
         for key in _OVERRIDABLE:
             if key in ov:
                 merged[key] = ov[key]
+        # Auto-enable a detected slot unless the user explicitly chose enabled.
+        if base["slot"] in detected_slots and "enabled" not in ov:
+            merged["enabled"] = True
         # slot / url_prefix are immutable for built-ins.
         merged["slot"] = base["slot"]
         merged["url_prefix"] = base["url_prefix"]
@@ -195,9 +203,24 @@ def resolve_plugins(raw_config: Any) -> list[dict]:
     return resolved
 
 
-def active_plugins(raw_config: Any) -> list[dict]:
+# Office slots auto-enable when their MCP launcher is on PATH (sprint 6c2b3562).
+OFFICE_BINARIES = {"ppt": "powerpoint-mcp", "word": "word-mcp-live"}
+
+
+def detect_office_binaries(which: Any = None) -> set[str]:
+    """Return the Office slots (``ppt``/``word``) whose binary is on PATH.
+
+    ``which`` defaults to :func:`shutil.which`; injectable for tests.
+    """
+    if which is None:
+        import shutil
+        which = shutil.which
+    return {slot for slot, binary in OFFICE_BINARIES.items() if which(binary)}
+
+
+def active_plugins(raw_config: Any, detected_slots: Any = frozenset()) -> list[dict]:
     """:func:`resolve_plugins` filtered to the enabled entries."""
-    return [p for p in resolve_plugins(raw_config) if p.get("enabled")]
+    return [p for p in resolve_plugins(raw_config, detected_slots) if p.get("enabled")]
 
 
 def plugin_by_slot(raw_config: Any, slot: str) -> dict | None:
