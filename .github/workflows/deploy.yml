@@ -109,12 +109,12 @@ jobs:
         run: |
           BASE="https://meridian-preview.fly.dev"
           echo "Waiting for /health..."
-          for i in $(seq 1 18); do
+          for i in $(seq 1 9); do
             STATUS=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" "$BASE/health" || echo "000")
             echo "Attempt $i: $STATUS"
             [ "$STATUS" = "200" ] && break
-            [ "$i" = "18" ] && (echo "FAIL: /health never returned 200" && exit 1)
-            sleep 5
+            [ "$i" = "9" ] && (echo "FAIL: /health never returned 200" && exit 1)
+            sleep 10
           done
 
       - name: Landing page loads
@@ -204,7 +204,7 @@ jobs:
       - name: Post-deploy smoke test
         id: smoke
         run: |
-          sleep 20
+          if [ "${{ inputs.hotfix }}" = "yes" ]; then sleep 5; else sleep 10; fi
           STATUS=$(curl -s -o /dev/null -w "%{http_code}" https://usemeridian.us/health)
           echo "Health: $STATUS"
           [ "$STATUS" = "200" ] || (echo "FAIL: prod /health returned $STATUS" && exit 1)
