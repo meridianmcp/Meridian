@@ -1074,7 +1074,7 @@ async def list_tunnel_tools(
             if tools:
                 break
             if _attempt < 3:
-                await asyncio.sleep(2)
+                await asyncio.sleep(0.5)
         if not tools:
             continue
         for tool in tools:
