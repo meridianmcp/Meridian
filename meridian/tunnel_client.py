@@ -777,6 +777,32 @@ async def _reconnect_loop(ws_url: str, port: int, label: str) -> None:
         backoff = min(backoff * 2, _MAX_BACKOFF)
 
 
+async def _proc_watchdog(holder: dict, poll_interval: float = 3.0) -> None:
+    """Relaunch a slot's local subprocess if it dies.
+
+    ``holder`` is a mutable dict ``{"proc", "cmd", "env", "label"}``. Each tick
+    polls ``holder["proc"].poll()``; if the process has exited (returncode is not
+    None) it is re-spawned from ``holder["cmd"]`` (with ``holder["env"]``) and
+    stored back into the holder. Without this, a crashed local proxy leaves
+    127.0.0.1:880x dead — the WebSocket reconnects to the server but the tools
+    silently vanish. Runs until cancelled.
+    """
+    label = holder.get("label", "?")
+    while True:
+        await asyncio.sleep(poll_interval)
+        proc = holder.get("proc")
+        if proc is None or proc.poll() is None:
+            continue  # not started, or still running
+        print(
+            f"tunnel:{label}: local proxy exited (code {proc.returncode}); relaunching",
+            file=sys.stderr, flush=True,
+        )
+        try:
+            holder["proc"] = subprocess.Popen(holder["cmd"], env=holder.get("env"))
+        except Exception as exc:  # noqa: BLE001 — keep watching; try again next tick
+            print(f"tunnel:{label}: relaunch failed: {exc}", file=sys.stderr, flush=True)
+
+
 # ---------------------------------------------------------------------------
 # Local MCP config auto-update (.mcp.json / .cursor/mcp.json) — pure, unit tested
 # ---------------------------------------------------------------------------
@@ -981,6 +1007,9 @@ async def run_tunnel(
     # 2. Spawn filesystem proxy (slot "fs"). Honour an enable toggle + command
     #    override; the default (no override) keeps the exact filesystem builder.
     npx = _find_npx()
+    # Each spawned slot records a {proc, cmd, env, label} holder so a watchdog
+    # can relaunch it if the local proxy dies (see _proc_watchdog).
+    proc_holders: list[dict] = []
     proc_fs: subprocess.Popen | None = None
     if fs_plugin.get("enabled", True):
         fs_override = fs_plugin.get("command")
@@ -993,6 +1022,7 @@ async def run_tunnel(
         print(f"  filesystem proxy: http://127.0.0.1:{fs_port}", flush=True)
         try:
             proc_fs = subprocess.Popen(cmd_fs)
+            proc_holders.append({"proc": proc_fs, "cmd": cmd_fs, "env": None, "label": "fs"})
         except FileNotFoundError:
             print(
                 f"error: could not launch npx ({npx!r}). Is Node.js installed and "
@@ -1014,6 +1044,7 @@ async def run_tunnel(
         print(f"  code-intel proxy:  http://127.0.0.1:{code_port} (custom command)", flush=True)
         try:
             proc_code = subprocess.Popen(cmd_code)
+            proc_holders.append({"proc": proc_code, "cmd": cmd_code, "env": None, "label": "code"})
         except Exception as exc:
             print(f"  warning: could not start code-intel proxy: {exc}", file=sys.stderr)
             proc_code = None
@@ -1028,6 +1059,7 @@ async def run_tunnel(
             print(f"  code-intel proxy:  http://127.0.0.1:{code_port}", flush=True)
             try:
                 proc_code = subprocess.Popen(cmd_code)
+                proc_holders.append({"proc": proc_code, "cmd": cmd_code, "env": None, "label": "code"})
             except Exception as exc:
                 print(f"  warning: could not start code-intel proxy: {exc}", file=sys.stderr)
                 proc_code = None
@@ -1050,6 +1082,7 @@ async def run_tunnel(
             print(f"  code-extractor:    http://127.0.0.1:{extract_port} (custom command)", flush=True)
             try:
                 proc_extract = subprocess.Popen(cmd_extract)
+                proc_holders.append({"proc": proc_extract, "cmd": cmd_extract, "env": None, "label": "extract"})
             except Exception as exc:
                 print(f"  warning: could not start code-extractor proxy: {exc}", file=sys.stderr)
                 proc_extract = None
@@ -1060,6 +1093,7 @@ async def run_tunnel(
                 print(f"  code-extractor:    http://127.0.0.1:{extract_port}", flush=True)
                 try:
                     proc_extract = subprocess.Popen(cmd_extract)
+                    proc_holders.append({"proc": proc_extract, "cmd": cmd_extract, "env": None, "label": "extract"})
                 except Exception as exc:
                     print(f"  warning: could not start code-extractor proxy: {exc}", file=sys.stderr)
                     proc_extract = None
@@ -1090,6 +1124,7 @@ async def run_tunnel(
         print(f"  {human.lower()}:{' ' * (15 - len(human))}http://127.0.0.1:{oport}", flush=True)
         try:
             office_procs[slot] = subprocess.Popen(cmd_office, env=spawn_env)
+            proc_holders.append({"proc": office_procs[slot], "cmd": cmd_office, "env": spawn_env, "label": slot})
         except Exception as exc:
             print(f"  warning: could not start {slot} proxy: {exc}", file=sys.stderr)
 
@@ -1159,6 +1194,10 @@ async def run_tunnel(
     if not tasks:
         print("error: no tunnel plugins enabled — nothing to serve.", file=sys.stderr)
         return 1
+    # Watchdog per spawned slot — relaunch the local proxy if it crashes so the
+    # tools don't silently vanish while the WebSocket stays connected.
+    for holder in proc_holders:
+        tasks.append(asyncio.ensure_future(_proc_watchdog(holder)))
 
     try:
         await asyncio.gather(*tasks)
@@ -1172,28 +1211,15 @@ async def run_tunnel(
             print("  Restored local MCP config (removed tunnel connectors).", flush=True)
         for t in tasks + index_tasks:
             t.cancel()
-        if proc_fs is not None:
-            proc_fs.terminate()
+        # Terminate the current proc for each slot (holder["proc"] may have been
+        # replaced by the watchdog after a relaunch).
+        for holder in proc_holders:
+            proc = holder.get("proc")
+            if proc is None:
+                continue
+            proc.terminate()
             try:
-                proc_fs.wait(timeout=5)
+                proc.wait(timeout=5)
             except Exception:
-                proc_fs.kill()
-        if proc_code is not None:
-            proc_code.terminate()
-            try:
-                proc_code.wait(timeout=5)
-            except Exception:
-                proc_code.kill()
-        if proc_extract is not None:
-            proc_extract.terminate()
-            try:
-                proc_extract.wait(timeout=5)
-            except Exception:
-                proc_extract.kill()
-        for oproc in office_procs.values():
-            oproc.terminate()
-            try:
-                oproc.wait(timeout=5)
-            except Exception:
-                oproc.kill()
+                proc.kill()
     return 0

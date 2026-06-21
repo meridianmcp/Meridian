@@ -874,3 +874,72 @@ def test_build_proxy_for_inner_shell_for_cmd_shim_on_windows(monkeypatch):
     monkeypatch.setattr(tc.sys, "platform", "win32")
     cmd = tc._build_proxy_for_inner("npx.cmd", ["codegraph.cmd"], 8809)
     assert "--shell" in cmd
+
+
+# ---------------------------------------------------------------------------
+# _proc_watchdog — relaunch a local proxy subprocess when it dies (aff0b1d1)
+# ---------------------------------------------------------------------------
+
+class _StopLoop(Exception):
+    """Sentinel raised from a patched asyncio.sleep to end the watchdog loop."""
+
+
+class _DeadProc:
+    returncode = 1
+
+    def poll(self):
+        return 1  # exited
+
+
+class _LiveProc:
+    returncode = None
+
+    def poll(self):
+        return None  # still running
+
+
+def test_proc_watchdog_relaunches_on_exit(monkeypatch):
+    holder = {"proc": _DeadProc(), "cmd": ["mcp-proxy", "--port", "8808"],
+              "env": {"X": "1"}, "label": "fs"}
+    spawned = []
+
+    def fake_popen(cmd, env=None):
+        spawned.append((cmd, env))
+        return _LiveProc()
+
+    monkeypatch.setattr(tc.subprocess, "Popen", fake_popen)
+
+    calls = {"n": 0}
+
+    async def fake_sleep(_d):
+        calls["n"] += 1
+        if calls["n"] >= 2:   # let the first iteration run, then break
+            raise _StopLoop()
+
+    monkeypatch.setattr(tc.asyncio, "sleep", fake_sleep)
+
+    try:
+        asyncio.run(tc._proc_watchdog(holder, poll_interval=0))
+    except _StopLoop:
+        pass
+
+    # The dead proc was relaunched from holder['cmd'] with holder['env'].
+    assert spawned == [(["mcp-proxy", "--port", "8808"], {"X": "1"})]
+    assert isinstance(holder["proc"], _LiveProc)
+
+
+def test_proc_watchdog_leaves_running_proc(monkeypatch):
+    holder = {"proc": _LiveProc(), "cmd": ["x"], "env": None, "label": "code"}
+    spawned = []
+    monkeypatch.setattr(tc.subprocess, "Popen",
+                        lambda *a, **k: spawned.append(1) or _LiveProc())
+
+    async def fake_sleep(_d):
+        raise _StopLoop()
+
+    monkeypatch.setattr(tc.asyncio, "sleep", fake_sleep)
+    try:
+        asyncio.run(tc._proc_watchdog(holder))
+    except _StopLoop:
+        pass
+    assert spawned == []  # a running proc is never relaunched
