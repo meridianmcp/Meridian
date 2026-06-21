@@ -1162,6 +1162,26 @@ async def call_tunnel_tool(
     sockets, _ = _label_maps(label)
     if tenant_id not in sockets:
         return None
+    # Filesystem tools require absolute paths. Relative paths resolve against
+    # the mcp-proxy CWD (usually the home dir) — not the intended repo root —
+    # causing confusing "file not found" errors. Catch them early and return a
+    # clear message so the caller knows what to fix.
+    if label == "fs" and arguments:
+        _PATH_KEYS = ("path", "paths", "source", "destination")
+        for _key in _PATH_KEYS:
+            _val = arguments.get(_key)
+            if _val is None:
+                continue
+            _candidates = [_val] if isinstance(_val, str) else (_val if isinstance(_val, list) else [])
+            for _p in _candidates:
+                if not isinstance(_p, str) or not _p:
+                    continue
+                import os.path as _osp
+                if not _osp.isabs(_p) and not (len(_p) >= 2 and _p[1] == ":"):
+                    raise RuntimeError(
+                        f"filesystem tools require absolute paths — got relative path {_p!r}. "
+                        f"Use a full path, e.g. C:\\\\Users\\\\13144\\\\Documents\\\\...\\\\{_p}"
+                    )
     # The tunneled server only knows the bare tool name; strip the connector prefix.
     bare_name = name.split("__", 1)[1] if "__" in name else name
     resp = await _tunnel_jsonrpc(
