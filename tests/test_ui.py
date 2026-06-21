@@ -517,3 +517,24 @@ def test_known_locations_has_manual_path_entry(js):
     assert "saveProjectSettings(projectId, { executor_config: cfg })" in js, (
         "Add handler must persist via saveProjectSettings (PATCH settings)"
     )
+
+
+def test_tunnel_plugins_section_exposed_on_window(js):
+    """Regression (9d03d7cc): loadTunnelPluginsSection must be on window so the
+    settings module's window.loadTunnelPluginsSection?.() call actually renders it."""
+    import re
+    # It's invoked via window.* from the settings module …
+    assert "window.loadTunnelPluginsSection" in js
+    # … so it MUST be in the Object.assign(window, {...}) export, else the call no-ops.
+    assert re.search(r"Object\.assign\(window,\s*\{[^}]*\bloadTunnelPluginsSection\b", js), (
+        "loadTunnelPluginsSection missing from the window export — settings call would no-op"
+    )
+
+
+def test_tunnel_plugins_section_plan_gated_and_collapsible(js):
+    """9f40cb60 enhance: the card is Pro/admin-gated and rendered as a collapsible."""
+    # Plan gate: bail out for non-pro/admin.
+    assert "plan === 'pro' || plan === 'admin'" in js
+    # Collapsible <details> card.
+    assert "<details class=\"meridian-disclosure\" open" in js or \
+           "<details class='meridian-disclosure' open" in js

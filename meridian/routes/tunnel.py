@@ -787,6 +787,7 @@ async def get_tunnel_plugins(request: Request) -> Response:
         return _json_response({
             "plugins": resolve_plugins(None), "config": {},
             "active": {"fs": False, "code": False, "extract": False},
+            "plan": "free",
         })
     parsed = _parse_plugins_json(tenant.get("tunnel_plugins"))
     tid = tenant.get("id")
@@ -800,6 +801,10 @@ async def get_tunnel_plugins(request: Request) -> Response:
             "ppt": tid in _tunnel_ppt_sockets,
             "word": tid in _tunnel_word_sockets,
         },
+        # The tunnel (and thus this section) is Pro/admin-only; the dashboard
+        # uses this to gate the Tunnel Plugins card.
+        "plan": tenant.get("plan") or "free",
+        "is_admin": bool(tenant.get("is_internal")),
     })
 
 

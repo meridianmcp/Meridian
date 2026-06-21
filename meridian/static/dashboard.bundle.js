@@ -5917,6 +5917,117 @@ ${n.tags || ""}`.toLowerCase();
       section.innerHTML = `<div class="empty" style="color:var(--error)">Failed to load executor rules: ${escapeHtml(e.message)}</div>`;
     }
   }
+  var _TUNNEL_DEFAULT_PORTS = { fs: 8808, code: 8809, extract: 8810, ppt: 8811, word: 8812 };
+  async function loadTunnelPluginsSection(projectId) {
+    const host = document.getElementById(`settings-body-${projectId}`);
+    if (!host) return;
+    const existing = document.getElementById(`tunnel-plugins-section-${projectId}`);
+    if (existing) existing.remove();
+    const section = document.createElement("div");
+    section.id = `tunnel-plugins-section-${projectId}`;
+    section.style.cssText = "margin-top:18px;padding-top:14px;border-top:1px solid var(--border)";
+    host.appendChild(section);
+    try {
+      const data = await api2("/tunnel/plugins");
+      const plan = data && data.plan || "free";
+      if (!(plan === "pro" || plan === "admin" || data && data.is_admin)) {
+        section.remove();
+        return;
+      }
+      const plugins = data && data.plugins || [];
+      const active = data && data.active || {};
+      const rows = plugins.map((p) => {
+        const cmd = Array.isArray(p.command) ? p.command.join(" ") : "";
+        const dot = active[p.slot] ? "var(--success, #3fb950)" : "var(--muted)";
+        const dotTitle = active[p.slot] ? "connected" : "not connected";
+        return `
+        <div style="border:1px solid var(--border);border-radius:4px;padding:8px;margin-bottom:8px">
+          <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px">
+            <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:11px;color:var(--text);font-weight:600">
+              <input type="checkbox" class="tp-enabled" data-name="${escapeHtml(p.name)}" ${p.enabled ? "checked" : ""}
+                style="width:14px;height:14px;accent-color:var(--accent);cursor:pointer">
+              ${escapeHtml(p.name)}
+              <span style="font-size:9px;color:var(--muted);font-weight:400">/${escapeHtml(p.slot)}</span>
+            </label>
+            <span title="${dotTitle}" style="display:inline-flex;align-items:center;gap:4px;font-size:9px;color:var(--muted)">
+              <span style="width:8px;height:8px;border-radius:50%;background:${dot}"></span>${dotTitle}
+            </span>
+          </div>
+          <div style="display:flex;gap:8px;align-items:center">
+            <input type="text" class="tp-command" data-name="${escapeHtml(p.name)}" value="${escapeHtml(cmd)}"
+              placeholder="default (${escapeHtml(p.description || "built-in command")})"
+              style="flex:1;box-sizing:border-box;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:5px 7px;outline:none">
+            <input type="number" class="tp-port" data-name="${escapeHtml(p.name)}" data-slot="${escapeHtml(p.slot)}" value="${p.port}"
+              title="local proxy port"
+              style="width:74px;box-sizing:border-box;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:5px 7px;outline:none">
+          </div>
+        </div>`;
+      }).join("");
+      section.innerHTML = `
+      <details class="meridian-disclosure" open style="border:1px solid var(--border);border-radius:6px;background:var(--surface-2);padding:0">
+      <summary style="cursor:pointer;list-style:none;padding:8px 10px;font-size:11px;font-weight:700;letter-spacing:.5px;color:var(--accent);text-transform:uppercase">Tunnel Plugins</summary>
+      <div style="padding:0 10px 10px">
+      <div style="font-size:10px;color:var(--muted);margin-bottom:8px;line-height:1.5">
+        What <code>meridian --tunnel</code> spawns behind each transport slot. Leave a command
+        blank for the built-in default, or set one to swap it (e.g. <code>code-intel</code> \u2192
+        <code>codegraph</code>). Changes apply the next time the tunnel restarts.
+      </div>
+      ${rows || '<div style="color:var(--muted);font-size:10px">No plugins.</div>'}
+      <div style="display:flex;justify-content:flex-end;gap:6px;margin-top:6px">
+        <button class="secondary admin-only" id="tp-reset-${projectId}" style="padding:2px 10px;font-size:10px" title="Clear all overrides (back to built-in defaults)">Reset to defaults</button>
+        <button class="primary admin-only" id="tp-save-${projectId}" style="padding:2px 10px;font-size:10px">Save</button>
+      </div>
+      <div id="tp-status-${projectId}" style="font-size:10px;color:var(--muted);margin-top:4px;text-align:right"></div>
+      </div>
+      </details>`;
+      const statusEl = document.getElementById(`tp-status-${projectId}`);
+      const setStatus = (m) => {
+        if (statusEl) {
+          statusEl.textContent = m;
+          if (m) setTimeout(() => {
+            if (statusEl.textContent === m) statusEl.textContent = "";
+          }, 2500);
+        }
+      };
+      const collectConfig = () => {
+        const cfg = [];
+        section.querySelectorAll(".tp-enabled").forEach((en) => {
+          const name = en.dataset.name;
+          const cmdEl = section.querySelector(`.tp-command[data-name="${CSS.escape(name)}"]`);
+          const portEl = section.querySelector(`.tp-port[data-name="${CSS.escape(name)}"]`);
+          const entry = { name, enabled: en.checked };
+          const cmdVal = (cmdEl && cmdEl.value || "").trim();
+          if (cmdVal) entry.command = cmdVal;
+          const portVal = parseInt(portEl && portEl.value, 10);
+          const slot = portEl && portEl.dataset.slot;
+          if (Number.isInteger(portVal) && portVal !== _TUNNEL_DEFAULT_PORTS[slot]) entry.port = portVal;
+          cfg.push(entry);
+        });
+        return cfg;
+      };
+      document.getElementById(`tp-save-${projectId}`).onclick = async () => {
+        try {
+          await api2("/tunnel/plugins", { method: "PUT", body: JSON.stringify({ config: collectConfig() }) });
+          toast("Tunnel plugins saved");
+          setStatus("Saved \u2014 restart the tunnel to apply.");
+        } catch (e) {
+          toast("Save failed: " + e.message, true);
+        }
+      };
+      document.getElementById(`tp-reset-${projectId}`).onclick = async () => {
+        if (!confirm("Clear all tunnel plugin overrides and return to built-in defaults?")) return;
+        try {
+          await api2("/tunnel/plugins", { method: "PUT", body: JSON.stringify({ config: [] }) });
+          toast("Reset to defaults");
+          loadTunnelPluginsSection(projectId);
+        } catch (e) {
+          toast("Reset failed: " + e.message, true);
+        }
+      };
+    } catch (e) {
+      section.innerHTML = `<div class="empty" style="color:var(--error)">Failed to load tunnel plugins: ${escapeHtml(e.message)}</div>`;
+    }
+  }
   var _DEMO_TOUR_STEPS = [
     {
       vtab: null,
@@ -11834,7 +11945,7 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
     }
   }
   try {
-    Object.assign(window, { hideHostedAdminControls, ensureSignOutLink: ensureSignOutLink2, ensureWorkspaceSwitcher: ensureWorkspaceSwitcher2, getActiveWorkspaceRole: getActiveWorkspaceRole2, showConnectDbModal, showLocalServerControls, _summarizeApiErrorText, _projectLoadErrorInfo, wireProjectLoadRetry: wireProjectLoadRetry2, renderProjectLoadError: renderProjectLoadError2, recordProjectLoadError, clearProjectLoadError, renderProjectLoadAlert, retryProjectSurface, syncSidebarActiveProject, autosizeGoalField, githubIconSvg: githubIconSvg2, getConstitutionLimit, loadProjectSettings: loadProjectSettings2, saveProjectSettings: saveProjectSettings2, loadExecutorRulesSection, _demoTourDone: _demoTourDone2, _demoTourSavedStep: _demoTourSavedStep2, _demoTourSaveStep, _demoTourMarkDone, _demoTourClose, _tourActivateVtab, startDemoTour: startDemoTour2, resumeDemoTour, api: api2, projectApi: projectApi2, loadServerConfig, _armAccountSwitchWatch, _refreshOnFocus, _checkAccountSwitch, _showAccountSwitchBanner, updateGitHubConnectionIndicator, _updateConnectionIndicator, checkGitStatus, _doRestart, loadConfig, loadProjects, openTab, closeTab, saveTabs, renderTabs, _makeTabEl, _openTabMenu, _setProjectIcon, _renameProject, _deleteProject, activateTab, buildTabBody, scheduleLiveRefresh, initLiveAutoRefresh, loadLiveTab, refreshLiveTab, wireSprintAddEnter: wireSprintAddEnter2, sprintAction, sprintArchive, filterBackburner, sprintPushPrompt, sprintFeedback, sprintFeedbackNote, sprintItemEdit, addSprintItemFromInput: addSprintItemFromInput2, cacheMostRecentSession, renderLiveSessions, endLiveSession, openTimelineForSession, renderLiveQueue, addLiveTask, cancelLiveTask, showCopyPreview, wireClaudeLaunchPanel, stampHandoffTs, populateSessionDropdown, loadTimeline: loadTimeline2, _renderTimelineLog: _renderTimelineLog2, loadDocsTab, normalizeNotifyTarget, displayNotifyTarget: displayNotifyTarget2, osExecutorHintBanner: osExecutorHintBanner2, showFailoverBannerIfNeeded, suggestNtfyTopic, loadHitlTab, loadTeamTab, updateLiveFeed, loadRecentSessions, loadMilestones, loadRecentRuns, loadQueue, renderSearchResults: renderSearchResults2, wireQueueSectionToggles, refreshTab, refreshGoal, parseDecisionsBlob, renderConstitutionWarning: renderConstitutionWarning2, _hitlBadgeClick, initHitlPanel, setVtabCountBadge: setVtabCountBadge2, refreshProjectCountBadges, refreshHitl, _hitlAnswer, _hitlDismiss, loadPinnedDecisions, supersedePinnedDecision, addPinnedDecision, consolidateDecisions, renderDecisionsTable, wireGoalPreviewToggle, saveGoal, saveNorthStar, saveSprint, _sessionPresenceDot, refreshSessions, refreshTasks, renderTasks, _loadMoreTasks, renderTaskRow, deleteTaskRow, renderHitlRow, wireHitlRow, appendToGoal, hitlReply, hitlExecute, connectWs, handleWsEvent, restoreTabs, _deleteSprintItem, _sprintAction, completeSprintItem, failSprintItem, toggleExpand, state });
+    Object.assign(window, { hideHostedAdminControls, ensureSignOutLink: ensureSignOutLink2, ensureWorkspaceSwitcher: ensureWorkspaceSwitcher2, getActiveWorkspaceRole: getActiveWorkspaceRole2, showConnectDbModal, showLocalServerControls, _summarizeApiErrorText, _projectLoadErrorInfo, wireProjectLoadRetry: wireProjectLoadRetry2, renderProjectLoadError: renderProjectLoadError2, recordProjectLoadError, clearProjectLoadError, renderProjectLoadAlert, retryProjectSurface, syncSidebarActiveProject, autosizeGoalField, githubIconSvg: githubIconSvg2, getConstitutionLimit, loadProjectSettings: loadProjectSettings2, saveProjectSettings: saveProjectSettings2, loadExecutorRulesSection, loadTunnelPluginsSection, _demoTourDone: _demoTourDone2, _demoTourSavedStep: _demoTourSavedStep2, _demoTourSaveStep, _demoTourMarkDone, _demoTourClose, _tourActivateVtab, startDemoTour: startDemoTour2, resumeDemoTour, api: api2, projectApi: projectApi2, loadServerConfig, _armAccountSwitchWatch, _refreshOnFocus, _checkAccountSwitch, _showAccountSwitchBanner, updateGitHubConnectionIndicator, _updateConnectionIndicator, checkGitStatus, _doRestart, loadConfig, loadProjects, openTab, closeTab, saveTabs, renderTabs, _makeTabEl, _openTabMenu, _setProjectIcon, _renameProject, _deleteProject, activateTab, buildTabBody, scheduleLiveRefresh, initLiveAutoRefresh, loadLiveTab, refreshLiveTab, wireSprintAddEnter: wireSprintAddEnter2, sprintAction, sprintArchive, filterBackburner, sprintPushPrompt, sprintFeedback, sprintFeedbackNote, sprintItemEdit, addSprintItemFromInput: addSprintItemFromInput2, cacheMostRecentSession, renderLiveSessions, endLiveSession, openTimelineForSession, renderLiveQueue, addLiveTask, cancelLiveTask, showCopyPreview, wireClaudeLaunchPanel, stampHandoffTs, populateSessionDropdown, loadTimeline: loadTimeline2, _renderTimelineLog: _renderTimelineLog2, loadDocsTab, normalizeNotifyTarget, displayNotifyTarget: displayNotifyTarget2, osExecutorHintBanner: osExecutorHintBanner2, showFailoverBannerIfNeeded, suggestNtfyTopic, loadHitlTab, loadTeamTab, updateLiveFeed, loadRecentSessions, loadMilestones, loadRecentRuns, loadQueue, renderSearchResults: renderSearchResults2, wireQueueSectionToggles, refreshTab, refreshGoal, parseDecisionsBlob, renderConstitutionWarning: renderConstitutionWarning2, _hitlBadgeClick, initHitlPanel, setVtabCountBadge: setVtabCountBadge2, refreshProjectCountBadges, refreshHitl, _hitlAnswer, _hitlDismiss, loadPinnedDecisions, supersedePinnedDecision, addPinnedDecision, consolidateDecisions, renderDecisionsTable, wireGoalPreviewToggle, saveGoal, saveNorthStar, saveSprint, _sessionPresenceDot, refreshSessions, refreshTasks, renderTasks, _loadMoreTasks, renderTaskRow, deleteTaskRow, renderHitlRow, wireHitlRow, appendToGoal, hitlReply, hitlExecute, connectWs, handleWsEvent, restoreTabs, _deleteSprintItem, _sprintAction, completeSprintItem, failSprintItem, toggleExpand, state });
   } catch (e) {
   }
 })();
