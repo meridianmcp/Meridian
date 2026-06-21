@@ -1136,9 +1136,11 @@ async def run_tunnel(
         if not plugin.get("enabled", False if slot != "dc" else True):
             continue
         cmd = plugin.get("command")
-        # Desktop Commander: default command (no override) uses npx directly.
+        # Desktop Commander: default command uses bare "npx" (not the full resolved
+        # path) so mcp-proxy's --shell mode can invoke it via PATH without hitting
+        # the 'C:\Program Files\...' space-in-path quoting bug.
         if cmd is None and slot == "dc":
-            cmd = [npx, "-y", "@wonderwhy-er/desktop-commander@latest"]
+            cmd = ["npx", "-y", "@wonderwhy-er/desktop-commander@latest"]
         if not cmd:
             continue
         oport = office_ports[slot]
@@ -1147,7 +1149,7 @@ async def run_tunnel(
         if plugin_env:
             spawn_env = {**os.environ, **{str(k): str(v) for k, v in plugin_env.items()}}
         cmd_office = _build_proxy_for_inner(npx, list(cmd), oport)
-        print(f"  {human.lower():{15}}http://127.0.0.1:{oport}", flush=True)
+        print(f"  {human.lower():<16}http://127.0.0.1:{oport}", flush=True)
         try:
             office_procs[slot] = subprocess.Popen(cmd_office, env=spawn_env)
             proc_holders.append({"proc": office_procs[slot], "cmd": cmd_office, "env": spawn_env, "label": slot})
