@@ -534,11 +534,15 @@ def _stub_run_tunnel_spawn(monkeypatch, *, code_binary="/bin/codebase-memory-mcp
 
     monkeypatch.setattr(tc.subprocess, "Popen", lambda cmd, *a, **k: FakeProc(cmd))
 
-    # Reconnect loops should return immediately (no real WS).
+    # Reconnect loops + watchdogs should return immediately (no real WS / polling).
     async def fake_reconnect(ws_url, port, label):
         return None
 
+    async def fake_watchdog(holder, poll_interval=3.0):
+        return None
+
     monkeypatch.setattr(tc, "_reconnect_loop", fake_reconnect)
+    monkeypatch.setattr(tc, "_proc_watchdog", fake_watchdog)
     return procs
 
 
@@ -711,7 +715,11 @@ def test_run_tunnel_code_and_extract_popen_raise_are_warned(monkeypatch, tmp_pat
     async def fake_reconnect(ws_url, port, label):
         return None
 
+    async def fake_watchdog(holder, poll_interval=3.0):
+        return None
+
     monkeypatch.setattr(tc, "_reconnect_loop", fake_reconnect)
+    monkeypatch.setattr(tc, "_proc_watchdog", fake_watchdog)
 
     class FakeProc:
         def terminate(self): pass
