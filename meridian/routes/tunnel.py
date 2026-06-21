@@ -898,6 +898,18 @@ async def get_tunnel_filesystem_roots(request: Request) -> Response:
 
 _TUNNEL_LABELS = ("fs", "code", "extract", "ppt", "word")
 
+# Human-readable connector prefix shown to Claude in tool names (e.g.
+# "filesystem:read_file" instead of "fs:read_file"). The routing cache still
+# maps the prefixed name back to the internal slot label, and call_tunnel_tool
+# strips the prefix before forwarding, so the display name is cosmetic.
+SLOT_DISPLAY_NAMES = {
+    "fs": "filesystem",
+    "code": "codebase",
+    "extract": "extractor",
+    "ppt": "powerpoint",
+    "word": "word",
+}
+
 # Per-process routing cache: tenant_id → {tool_name: tunnel_label}
 _tunnel_tool_routes: dict[str, dict[str, str]] = {}
 
@@ -915,10 +927,11 @@ _CODE_INTEL_FIRST_GUIDANCE = (
 )
 
 # Tools whose descriptions get the code-intel-first prefix at the bridge.
-# Names are connector-namespaced by list_tunnel_tools (see below), so these are
-# the filesystem connector's read tools — "fs:read_file" / "fs:read_multiple_files".
-# (code:read_file etc. would be a different server and is intentionally not matched.)
-_READ_TOOLS_TO_REWRITE = frozenset({"fs:read_file", "fs:read_multiple_files"})
+# Names are connector-namespaced by list_tunnel_tools using SLOT_DISPLAY_NAMES,
+# so these are the filesystem connector's read tools — "filesystem:read_file" /
+# "filesystem:read_multiple_files". (codebase:read_file etc. would be a different
+# server and is intentionally not matched.)
+_READ_TOOLS_TO_REWRITE = frozenset({"filesystem:read_file", "filesystem:read_multiple_files"})
 
 
 def _rewrite_tool_description(tool: dict) -> dict:
@@ -1059,12 +1072,13 @@ async def list_tunnel_tools(
             name = tool.get("name")
             if not name:
                 continue
-            prefixed = f"{label}:{name}"
+            display = SLOT_DISPLAY_NAMES.get(label, label)
+            prefixed = f"{display}:{name}"
             if prefixed in reserved_names or prefixed in routes:
                 continue
             tool_copy = dict(tool)
             tool_copy["name"] = prefixed
-            routes[prefixed] = label
+            routes[prefixed] = label  # route back via the internal slot label
             aggregated.append(_rewrite_tool_description(tool_copy))
     if routes:
         _tunnel_tool_routes[tenant_id] = routes
