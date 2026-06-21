@@ -850,6 +850,8 @@ async function retryProjectSurface(projectId) {
 
   if (activeVtab === 'settings') await loadSettingsTab(projectId);
 
+  if (activeVtab === 'codeintel') await loadCodeIntelTab(projectId);
+
 }
 
 
@@ -3323,6 +3325,8 @@ function buildTabBody(project) {
 
       <button class="vtab-btn" data-vtab="settings" title="Notification Settings">⚙</button>
 
+      <button class="vtab-btn" data-vtab="codeintel" title="Code Intel — codebase index &amp; architecture" id="vtab-codeintel-${project.id}" style="display:none">🔍</button>
+
     </div>
 
     <div class="vtab-drawer open" id="drawer-${project.id}">
@@ -4047,6 +4051,22 @@ function buildTabBody(project) {
 
       </div>
 
+      <div class="drawer-panel" id="drawer-codeintel-${project.id}">
+
+        <div class="drawer-header">
+
+          <span>CODE INTEL · ${escapeHtml(project.name)}</span>
+
+        </div>
+
+        <div style="flex:1;overflow-y:auto;padding:14px" id="codeintel-body-${project.id}">
+
+          <div class="empty" style="color:var(--muted)">loading…</div>
+
+        </div>
+
+      </div>
+
     </div>
 
     <section class="claude-handoff-panel">
@@ -4289,6 +4309,8 @@ function buildTabBody(project) {
 
         if (vtab === 'settings') loadSettingsTab(project.id);
 
+        if (vtab === 'codeintel') loadCodeIntelTab(project.id);
+
       };
 
     });
@@ -4301,6 +4323,9 @@ function buildTabBody(project) {
         if (savedBtn) savedBtn.click();
       }
     } catch(_) {}
+
+    // Show Code Intel tab only when tunnel:code is active
+    _initCodeIntelTabVisibility(project.id);
 
   }
 
@@ -6776,6 +6801,136 @@ async function loadDocsTab(projectId) {
 
   }
 
+}
+
+
+
+// Code Intel tab — show only when tunnel:code socket is live.
+// Called once per project panel after vtab strip is wired.
+async function _initCodeIntelTabVisibility(projectId) {
+  if (!window.MERIDIAN_HOSTED) return;
+  try {
+    const data = await api('/tunnel/plugins');
+    const btn = document.getElementById(`vtab-codeintel-${projectId}`);
+    if (!btn) return;
+    const isActive = !!(data && data.active && data.active.code);
+    btn.style.display = isActive ? '' : 'none';
+  } catch (_) {}
+}
+
+async function loadCodeIntelTab(projectId) {
+  const body = document.getElementById(`codeintel-body-${projectId}`);
+  if (!body) return;
+
+  body.innerHTML = '<div class="empty" style="color:var(--muted)">loading…</div>';
+
+  try {
+    const [pluginsData, meData, settingsData] = await Promise.all([
+      api('/tunnel/plugins'),
+      api('/me'),
+      loadProjectSettings(projectId),
+    ]);
+
+    if (!pluginsData?.active?.code) {
+      body.innerHTML = '<div class="empty" style="color:var(--muted)">Code intel tunnel is not active. Run <code>meridian --tunnel</code> to connect it.</div>';
+      return;
+    }
+
+    const tenantId = meData?.tenant_id;
+    if (!tenantId) {
+      body.innerHTML = '<div class="empty" style="color:var(--error)">Could not resolve tenant ID from /me.</div>';
+      return;
+    }
+
+    const codeBase = `/code/mcp/${tenantId}/mcp`;
+
+    async function _codeMcpCall(method, params) {
+      const r = await fetch(codeBase, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json', 'Accept': 'application/json, text/event-stream'},
+        body: JSON.stringify({jsonrpc: '2.0', id: 1, method, params: params || {}}),
+      });
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const text = await r.text();
+      let parsed = null;
+      if (text.trim().startsWith('{')) {
+        parsed = JSON.parse(text);
+      } else {
+        for (const line of text.split('\n')) {
+          if (line.startsWith('data:')) {
+            try { parsed = JSON.parse(line.slice(5).trim()); } catch (_) {}
+          }
+        }
+      }
+      if (!parsed) throw new Error('empty response from code MCP');
+      if (parsed.error) throw new Error(parsed.error.message || String(parsed.error));
+      return parsed.result;
+    }
+
+    // Verify live + count available tools
+    let toolCount = 0;
+    try {
+      const tlResult = await _codeMcpCall('tools/list', {});
+      toolCount = (tlResult?.tools || []).length;
+    } catch (_) {}
+
+    const execCfg = settingsData?.executor_config || {};
+    const repoPaths = Array.isArray(execCfg.repo_paths) ? execCfg.repo_paths : [];
+
+    let html = '';
+
+    // Live indicator
+    html += `<div style="display:flex;align-items:center;gap:8px;margin-bottom:14px">
+      <span style="width:8px;height:8px;border-radius:50%;background:#22c55e;display:inline-block;flex-shrink:0"></span>
+      <span style="font-size:11px;color:var(--text);font-weight:600">Code Intel Live</span>
+      ${toolCount ? `<span style="font-size:10px;color:var(--muted)">${toolCount} tool${toolCount !== 1 ? 's' : ''}</span>` : ''}
+    </div>`;
+
+    // Index status per repo path
+    html += `<div style="margin-bottom:16px"><div style="font-size:10px;color:var(--accent);text-transform:uppercase;letter-spacing:.06em;margin-bottom:8px;padding-bottom:4px;border-bottom:1px solid var(--border)">Index Status</div>`;
+    if (repoPaths.length) {
+      for (const rp of repoPaths) {
+        const cwd = typeof rp === 'string' ? rp : (rp.cwd || '');
+        const hostname = typeof rp === 'object' ? (rp.hostname || '') : '';
+        if (!cwd) continue;
+        try {
+          const result = await _codeMcpCall('tools/call', {name: 'index_status', arguments: {repo_path: cwd}});
+          const text = (result?.content || []).map(c => c.text || '').join('').trim();
+          html += `<div style="margin-bottom:10px">
+            <div style="font-size:10px;color:var(--text);font-weight:600;margin-bottom:4px">${escapeHtml(cwd)}${hostname ? `<span style="color:var(--muted);font-weight:400"> · ${escapeHtml(hostname)}</span>` : ''}</div>
+            <pre style="font-size:10px;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;padding:8px;white-space:pre-wrap;word-break:break-all;color:var(--text);margin:0;line-height:1.5">${escapeHtml(text || '(no status returned)')}</pre>
+          </div>`;
+        } catch (e) {
+          html += `<div style="margin-bottom:10px">
+            <div style="font-size:10px;color:var(--text);font-weight:600;margin-bottom:4px">${escapeHtml(cwd)}</div>
+            <div style="font-size:10px;color:var(--error)">index_status failed: ${escapeHtml(String(e))}</div>
+          </div>`;
+        }
+      }
+    } else {
+      html += `<div style="font-size:10px;color:var(--muted)">No repo paths configured. Add them in Settings → Executor Config to see index status.</div>`;
+    }
+    html += '</div>';
+
+    // Architecture summary
+    html += `<div><div style="font-size:10px;color:var(--accent);text-transform:uppercase;letter-spacing:.06em;margin-bottom:8px;padding-bottom:4px;border-bottom:1px solid var(--border)">Architecture Summary</div>`;
+    try {
+      const archArgs = repoPaths.length ? {repo_path: typeof repoPaths[0] === 'string' ? repoPaths[0] : (repoPaths[0].cwd || '')} : {};
+      const archResult = await _codeMcpCall('tools/call', {name: 'get_architecture', arguments: archArgs});
+      const archText = (archResult?.content || []).map(c => c.text || '').join('').trim();
+      html += `<pre style="font-size:10px;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;padding:10px;white-space:pre-wrap;word-break:break-all;color:var(--text);margin:0;line-height:1.5">${escapeHtml(archText || '(no architecture returned)')}</pre>`;
+    } catch (e) {
+      html += `<div style="font-size:10px;color:var(--error)">get_architecture failed: ${escapeHtml(String(e))}</div>`;
+    }
+    html += `<div style="margin-top:8px;display:flex;gap:6px">
+      <button class="secondary" style="font-size:10px;padding:3px 10px" onclick="loadCodeIntelTab(${JSON.stringify(projectId)})">↺ Refresh</button>
+    </div></div>`;
+
+    body.innerHTML = html;
+
+  } catch (e) {
+    body.innerHTML = `<div style="color:var(--error)">Failed to load code intel: ${escapeHtml(String(e))}</div>`;
+  }
 }
 
 
@@ -11653,4 +11808,4 @@ function toggleExpand(id) {
 
 // --- ITEM 4 esbuild: re-expose top-level symbols as globals so inline
 // handlers and cross-file references keep resolving after IIFE bundling.
-try { Object.assign(window, { hideHostedAdminControls, ensureSignOutLink, ensureWorkspaceSwitcher, getActiveWorkspaceRole, showConnectDbModal, showLocalServerControls, _summarizeApiErrorText, _projectLoadErrorInfo, wireProjectLoadRetry, renderProjectLoadError, recordProjectLoadError, clearProjectLoadError, renderProjectLoadAlert, retryProjectSurface, syncSidebarActiveProject, autosizeGoalField, githubIconSvg, getConstitutionLimit, loadProjectSettings, saveProjectSettings, loadExecutorRulesSection, loadTunnelPluginsSection, _demoTourDone, _demoTourSavedStep, _demoTourSaveStep, _demoTourMarkDone, _demoTourClose, _tourActivateVtab, startDemoTour, resumeDemoTour, api, projectApi, loadServerConfig, _armAccountSwitchWatch, _refreshOnFocus, _checkAccountSwitch, _showAccountSwitchBanner, updateGitHubConnectionIndicator, _updateConnectionIndicator, checkGitStatus, _doRestart, loadConfig, loadProjects, openTab, closeTab, saveTabs, renderTabs, _makeTabEl, _openTabMenu, _setProjectIcon, _renameProject, _deleteProject, activateTab, buildTabBody, scheduleLiveRefresh, initLiveAutoRefresh, loadLiveTab, refreshLiveTab, wireSprintAddEnter, sprintAction, sprintArchive, filterBackburner, sprintPushPrompt, sprintFeedback, sprintFeedbackNote, sprintItemEdit, addSprintItemFromInput, cacheMostRecentSession, renderLiveSessions, endLiveSession, openTimelineForSession, renderLiveQueue, addLiveTask, cancelLiveTask, showCopyPreview, wireClaudeLaunchPanel, stampHandoffTs, populateSessionDropdown, loadTimeline, _renderTimelineLog, loadDocsTab, normalizeNotifyTarget, displayNotifyTarget, osExecutorHintBanner, showFailoverBannerIfNeeded, suggestNtfyTopic, loadHitlTab, loadTeamTab, updateLiveFeed, loadRecentSessions, loadMilestones, loadRecentRuns, loadQueue, renderSearchResults, wireQueueSectionToggles, refreshTab, refreshGoal, parseDecisionsBlob, renderConstitutionWarning, _hitlBadgeClick, initHitlPanel, setVtabCountBadge, refreshProjectCountBadges, refreshHitl, _hitlAnswer, _hitlDismiss, loadPinnedDecisions, supersedePinnedDecision, addPinnedDecision, consolidateDecisions, renderDecisionsTable, wireGoalPreviewToggle, saveGoal, saveNorthStar, saveSprint, _sessionPresenceDot, refreshSessions, refreshTasks, renderTasks, _loadMoreTasks, renderTaskRow, deleteTaskRow, renderHitlRow, wireHitlRow, appendToGoal, hitlReply, hitlExecute, connectWs, handleWsEvent, restoreTabs, _deleteSprintItem, _sprintAction, completeSprintItem, failSprintItem, toggleExpand, state }); } catch (e) {}
+try { Object.assign(window, { loadCodeIntelTab, _initCodeIntelTabVisibility, hideHostedAdminControls, ensureSignOutLink, ensureWorkspaceSwitcher, getActiveWorkspaceRole, showConnectDbModal, showLocalServerControls, _summarizeApiErrorText, _projectLoadErrorInfo, wireProjectLoadRetry, renderProjectLoadError, recordProjectLoadError, clearProjectLoadError, renderProjectLoadAlert, retryProjectSurface, syncSidebarActiveProject, autosizeGoalField, githubIconSvg, getConstitutionLimit, loadProjectSettings, saveProjectSettings, loadExecutorRulesSection, loadTunnelPluginsSection, _demoTourDone, _demoTourSavedStep, _demoTourSaveStep, _demoTourMarkDone, _demoTourClose, _tourActivateVtab, startDemoTour, resumeDemoTour, api, projectApi, loadServerConfig, _armAccountSwitchWatch, _refreshOnFocus, _checkAccountSwitch, _showAccountSwitchBanner, updateGitHubConnectionIndicator, _updateConnectionIndicator, checkGitStatus, _doRestart, loadConfig, loadProjects, openTab, closeTab, saveTabs, renderTabs, _makeTabEl, _openTabMenu, _setProjectIcon, _renameProject, _deleteProject, activateTab, buildTabBody, scheduleLiveRefresh, initLiveAutoRefresh, loadLiveTab, refreshLiveTab, wireSprintAddEnter, sprintAction, sprintArchive, filterBackburner, sprintPushPrompt, sprintFeedback, sprintFeedbackNote, sprintItemEdit, addSprintItemFromInput, cacheMostRecentSession, renderLiveSessions, endLiveSession, openTimelineForSession, renderLiveQueue, addLiveTask, cancelLiveTask, showCopyPreview, wireClaudeLaunchPanel, stampHandoffTs, populateSessionDropdown, loadTimeline, _renderTimelineLog, loadDocsTab, normalizeNotifyTarget, displayNotifyTarget, osExecutorHintBanner, showFailoverBannerIfNeeded, suggestNtfyTopic, loadHitlTab, loadTeamTab, updateLiveFeed, loadRecentSessions, loadMilestones, loadRecentRuns, loadQueue, renderSearchResults, wireQueueSectionToggles, refreshTab, refreshGoal, parseDecisionsBlob, renderConstitutionWarning, _hitlBadgeClick, initHitlPanel, setVtabCountBadge, refreshProjectCountBadges, refreshHitl, _hitlAnswer, _hitlDismiss, loadPinnedDecisions, supersedePinnedDecision, addPinnedDecision, consolidateDecisions, renderDecisionsTable, wireGoalPreviewToggle, saveGoal, saveNorthStar, saveSprint, _sessionPresenceDot, refreshSessions, refreshTasks, renderTasks, _loadMoreTasks, renderTaskRow, deleteTaskRow, renderHitlRow, wireHitlRow, appendToGoal, hitlReply, hitlExecute, connectWs, handleWsEvent, restoreTabs, _deleteSprintItem, _sprintAction, completeSprintItem, failSprintItem, toggleExpand, state }); } catch (e) {}
