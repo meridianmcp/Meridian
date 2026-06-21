@@ -16,16 +16,17 @@ from meridian import tunnel_plugins as tp
 def test_resolve_defaults_returns_builtins_in_order():
     plugins = tp.resolve_plugins(None)
     assert [p["name"] for p in plugins] == [
-        "filesystem", "code-intel", "code-extractor", "powerpoint", "word"
+        "filesystem", "code-intel", "code-extractor", "powerpoint", "word", "desktop-commander"
     ]
-    assert [p["slot"] for p in plugins] == ["fs", "code", "extract", "ppt", "word"]
-    # The three code/fs slots default ON with no command override; the two Office
-    # slots default OFF with a built-in uvx command.
+    assert [p["slot"] for p in plugins] == ["fs", "code", "extract", "ppt", "word", "dc"]
+    # The three code/fs slots default ON with no command override; Office slots
+    # and desktop-commander default OFF.
     by_name = {p["name"]: p for p in plugins}
     assert all(by_name[n]["enabled"] for n in ("filesystem", "code-intel", "code-extractor"))
     assert all(by_name[n]["command"] is None for n in ("filesystem", "code-intel", "code-extractor"))
     assert by_name["powerpoint"]["enabled"] is False
     assert by_name["word"]["enabled"] is False
+    assert by_name["desktop-commander"]["enabled"] is False
     assert by_name["powerpoint"]["command"] == ["uvx", "powerpoint-mcp"]
     assert by_name["word"]["env"] == {"MCP_AUTHOR": "Adam", "MCP_AUTHOR_INITIALS": "AC"}
 
@@ -127,7 +128,7 @@ def test_description_overrides_normalized_to_strings():
 
 def test_builtin_names_helper():
     assert tp.builtin_names() == (
-        "filesystem", "code-intel", "code-extractor", "powerpoint", "word"
+        "filesystem", "code-intel", "code-extractor", "powerpoint", "word", "desktop-commander"
     )
 
 

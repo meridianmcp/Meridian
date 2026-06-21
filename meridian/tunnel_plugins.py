@@ -99,7 +99,7 @@ BUILTIN_PLUGINS: list[dict[str, Any]] = [
         "slot": "dc",
         "port": DEFAULT_DC_PORT,
         "url_prefix": "/dc",
-        "enabled": True,
+        "enabled": False,
         "builtin": True,
         "command": None,  # spawned via npx @wonderwhy-er/desktop-commander@latest
         "description": "Desktop Commander — system tools, file access, terminal (local only)",

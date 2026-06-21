@@ -540,7 +540,7 @@ def test_download_codebase_memory_mcp_installs_binary(monkeypatch, tmp_path):
              "browser_download_url": "https://gh/linux"},
         ],
     }
-    fake_content = b"\x7fELF fake binary"
+    fake_content = b"\x7fELF fake binary" + b"\x00" * (1024 * 1024)  # >1MB to pass size check
 
     def make_mock_client(*args, **kwargs):
         class FakeResp:

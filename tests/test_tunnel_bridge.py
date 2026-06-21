@@ -348,6 +348,7 @@ def test_tunnel_status_reports_active_sockets():
         "extract_active": False,
         "ppt_active": False,
         "word_active": False,
+        "dc_active": False,
     }
 
 
