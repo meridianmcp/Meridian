@@ -1043,6 +1043,29 @@ async def _tunnel_jsonrpc(
     return _parse_mcp_payload(resp.body)
 
 
+async def _fetch_slot_tools(tenant_id: str, label: str) -> "tuple[str, list[dict]]":
+    """Fetch tools/list for one tunnel slot with retries. Returns (label, tools)."""
+    sockets, _ = _label_maps(label)
+    if tenant_id not in sockets:
+        return label, []
+    tools: list[dict] = []
+    for _attempt in range(4):  # initial try + up to 3 retries
+        try:
+            resp = await asyncio.wait_for(
+                _tunnel_jsonrpc(tenant_id, label, "tools/list", {}),
+                timeout=3.0,
+            )
+            tools = ((resp.get("result") or {}).get("tools")) or [] if resp else []
+        except Exception as exc:  # noqa: BLE001
+            _log.debug("tunnel %s tools/list failed for %s: %s", label, tenant_id[:8], exc)
+            tools = []
+        if tools:
+            break
+        if _attempt < 3:
+            await asyncio.sleep(0.5)
+    return label, tools
+
+
 async def list_tunnel_tools(
     tenant_id: str, reserved_names: "frozenset[str] | set[str]" = frozenset(),
 ) -> list[dict]:
@@ -1056,30 +1079,14 @@ async def list_tunnel_tools(
     Because prefixed names can't collide with native/GitHub (bare) tool names,
     ``reserved_names`` no longer needs to drop them — it's kept for forward
     compatibility but matched against the prefixed name (a no-op in practice).
+    Slots are fetched in parallel so one slow/dead slot can't block the others.
     """
     aggregated: list[dict] = []
     routes: dict[str, str] = {}
-    for label in _TUNNEL_LABELS:
-        sockets, _ = _label_maps(label)
-        if tenant_id not in sockets:
-            continue
-        tools: list[dict] = []
-        for _attempt in range(4):  # initial try + up to 3 retries
-            try:
-                resp = await asyncio.wait_for(
-                    _tunnel_jsonrpc(tenant_id, label, "tools/list", {}),
-                    timeout=3.0,
-                )
-                tools = ((resp.get("result") or {}).get("tools")) or [] if resp else []
-            except Exception as exc:  # noqa: BLE001
-                _log.debug("tunnel %s tools/list failed for %s: %s", label, tenant_id[:8], exc)
-                tools = []
-            if tools:
-                break
-            if _attempt < 3:
-                await asyncio.sleep(0.5)
-        if not tools:
-            continue
+    slot_results = await asyncio.gather(
+        *[_fetch_slot_tools(tenant_id, label) for label in _TUNNEL_LABELS]
+    )
+    for label, tools in slot_results:
         for tool in tools:
             if not isinstance(tool, dict):
                 continue
