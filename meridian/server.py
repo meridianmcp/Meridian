@@ -5139,8 +5139,12 @@ async def _remote_mcp_inner(request: Request) -> Any:
             try:
                 from ._deps import _open_tenant_db_by_id
                 _mdb = await _open_tenant_db_by_id(request, _oa_tenant_id)
-            except Exception:
-                pass  # fall back to auth DB — better than 500
+            except Exception as _db_err:
+                import logging as _mcp_log
+                _mcp_log.getLogger("meridian.mcp").error(
+                    "[mcp] DB routing failed for tenant %s: %s — request will use auth DB (HITL bug source)",
+                    _oa_tenant_id, _db_err,
+                )
         _mdd = request.app.state.data_dir
         _oa_tenant = None
         if _oa_tenant_id and _hosted_mode():

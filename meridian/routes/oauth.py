@@ -149,19 +149,39 @@ async def _get_oauth_token_from_db(
     db: Any,
     token_hash: str,
 ) -> dict[str, Any] | None:
+    # Check oauth_tokens first (self-hosted / anonymous flows)
     async with db.execute(
         "SELECT token_hash, tenant_id, client_id, exp "
         "FROM oauth_tokens WHERE token_hash = ? AND exp > ?",
         (token_hash, int(_tm.time())),
     ) as cur:
         row = await cur.fetchone()
-    if row is None:
-        return None
-    return {
-        "tenant_id": row["tenant_id"],
-        "client_id": row["client_id"],
-        "exp": int(row["exp"]),
-    }
+    if row is not None:
+        return {
+            "tenant_id": row["tenant_id"],
+            "client_id": row["client_id"],
+            "exp": int(row["exp"]),
+        }
+    # Also check api_tokens — hosted-mode OAuth tokens (authorization_code +
+    # device_code flows with a tenant_id) are stored there, not in oauth_tokens.
+    # Without this fallback, _oa_tokens cache misses after a server restart
+    # fail to repopulate tenant_id, breaking the project-DB routing path.
+    try:
+        async with db.execute(
+            "SELECT tenant_id FROM api_tokens WHERE token_hash = ?",
+            (token_hash,),
+        ) as cur2:
+            row2 = await cur2.fetchone()
+        if row2 is not None:
+            tid = row2["tenant_id"] if hasattr(row2, "__getitem__") else row2[0]
+            return {
+                "tenant_id": tid,
+                "client_id": "claude-ai",
+                "exp": int(_tm.time()) + 86400 * 90,
+            }
+    except Exception:
+        pass
+    return None
 
 
 async def _load_oauth_tokens_from_db(db: Any) -> dict[str, dict[str, Any]]:
