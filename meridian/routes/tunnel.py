@@ -1066,7 +1066,10 @@ async def list_tunnel_tools(
         tools: list[dict] = []
         for _attempt in range(4):  # initial try + up to 3 retries
             try:
-                resp = await _tunnel_jsonrpc(tenant_id, label, "tools/list", {})
+                resp = await asyncio.wait_for(
+                    _tunnel_jsonrpc(tenant_id, label, "tools/list", {}),
+                    timeout=3.0,
+                )
                 tools = ((resp.get("result") or {}).get("tools")) or [] if resp else []
             except Exception as exc:  # noqa: BLE001
                 _log.debug("tunnel %s tools/list failed for %s: %s", label, tenant_id[:8], exc)
