@@ -915,7 +915,10 @@ _CODE_INTEL_FIRST_GUIDANCE = (
 )
 
 # Tools whose descriptions get the code-intel-first prefix at the bridge.
-_READ_TOOLS_TO_REWRITE = frozenset({"read_file", "read_multiple_files"})
+# Names are connector-namespaced by list_tunnel_tools (see below), so these are
+# the filesystem connector's read tools — "fs:read_file" / "fs:read_multiple_files".
+# (code:read_file etc. would be a different server and is intentionally not matched.)
+_READ_TOOLS_TO_REWRITE = frozenset({"fs:read_file", "fs:read_multiple_files"})
 
 
 def _rewrite_tool_description(tool: dict) -> dict:
@@ -1027,9 +1030,14 @@ async def list_tunnel_tools(
 ) -> list[dict]:
     """Aggregate tools from every active tunnel and refresh the routing cache.
 
-    Tools whose name is already taken by a native or GitHub tool (``reserved_names``)
-    are skipped so the merged ``tools/list`` has no duplicates and native tools
-    always win at call time.
+    Each tool name is namespaced by its connector slot — ``code:trace_path``,
+    ``extract:get_symbols_tool``, ``fs:read_file`` — so Claude can tell the
+    connectors apart and tool search surfaces them by connector. The prefixed
+    name is what's advertised and what the routing cache is keyed by;
+    ``call_tunnel_tool`` strips the prefix before forwarding to the tunnel.
+    Because prefixed names can't collide with native/GitHub (bare) tool names,
+    ``reserved_names`` no longer needs to drop them — it's kept for forward
+    compatibility but matched against the prefixed name (a no-op in practice).
     """
     aggregated: list[dict] = []
     routes: dict[str, str] = {}
@@ -1049,10 +1057,15 @@ async def list_tunnel_tools(
             if not isinstance(tool, dict):
                 continue
             name = tool.get("name")
-            if not name or name in reserved_names or name in routes:
+            if not name:
                 continue
-            routes[name] = label
-            aggregated.append(_rewrite_tool_description(tool))
+            prefixed = f"{label}:{name}"
+            if prefixed in reserved_names or prefixed in routes:
+                continue
+            tool_copy = dict(tool)
+            tool_copy["name"] = prefixed
+            routes[prefixed] = label
+            aggregated.append(_rewrite_tool_description(tool_copy))
     if routes:
         _tunnel_tool_routes[tenant_id] = routes
     elif not has_active_tunnel(tenant_id):
@@ -1080,9 +1093,11 @@ async def call_tunnel_tool(
     sockets, _ = _label_maps(label)
     if tenant_id not in sockets:
         return None
+    # The tunneled server only knows the bare tool name; strip the connector prefix.
+    bare_name = name.split(":", 1)[1] if ":" in name else name
     resp = await _tunnel_jsonrpc(
         tenant_id, label, "tools/call",
-        {"name": name, "arguments": arguments or {}},
+        {"name": bare_name, "arguments": arguments or {}},
     )
     if not resp:
         return None

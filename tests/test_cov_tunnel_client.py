@@ -243,7 +243,7 @@ def test_run_connection_relays_request_and_skips_noise(monkeypatch):
         async def __aenter__(self): return self
         async def __aexit__(self, *a): pass
 
-    async def fake_relay(client, base, msg):
+    async def fake_relay(client, base, msg, label=""):
         relayed.append(msg)
         return {"type": "response", "id": msg["id"], "status": 200}
 

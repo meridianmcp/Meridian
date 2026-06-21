@@ -100,17 +100,20 @@ def test_list_tunnel_tools_aggregates_and_reserves(monkeypatch):
         return {"result": {"tools": []}}
 
     _stub_proxy(monkeypatch, responder)
-    # Reserve read_file (collides with GitHub) — it must be dropped.
+    # Connector-prefixed names can't collide with the bare reserved name, so all
+    # three survive — namespaced by their connector slot.
     tools = asyncio.run(tn.list_tunnel_tools("t1", reserved_names={"read_file"}))
     names = {t["name"] for t in tools}
-    assert names == {"list_directory", "trace_path"}
-    # Routing cache populated for the survivors only.
-    assert tn._tunnel_tool_routes["t1"] == {"list_directory": "fs", "trace_path": "code"}
+    assert names == {"fs:read_file", "fs:list_directory", "code:trace_path"}
+    assert tn._tunnel_tool_routes["t1"] == {
+        "fs:read_file": "fs", "fs:list_directory": "fs", "code:trace_path": "code",
+    }
 
 
 def test_call_tunnel_tool_routes_to_owner(monkeypatch):
     tn._tunnel_code_sockets["t1"] = object()
-    tn._tunnel_tool_routes["t1"] = {"trace_path": "code"}
+    # Routing cache is keyed by the connector-prefixed name.
+    tn._tunnel_tool_routes["t1"] = {"code:trace_path": "code"}
 
     seen = {}
 
@@ -121,25 +124,46 @@ def test_call_tunnel_tool_routes_to_owner(monkeypatch):
         return {"result": {"content": [{"type": "text", "text": "traced"}]}}
 
     _stub_proxy(monkeypatch, responder)
-    result = asyncio.run(tn.call_tunnel_tool("t1", "trace_path", {"symbol": "foo"}))
+    result = asyncio.run(tn.call_tunnel_tool("t1", "code:trace_path", {"symbol": "foo"}))
     assert result["content"][0]["text"] == "traced"
     assert seen["label"] == "code"
     assert seen["method"] == "tools/call"
+    # The prefix is stripped before forwarding to the tunnel's local proxy.
     assert seen["params"] == {"name": "trace_path", "arguments": {"symbol": "foo"}}
 
 
+def test_call_tunnel_tool_strips_prefix_before_forward(monkeypatch):
+    """call_tunnel_tool('code:get_symbols_tool') forwards bare 'get_symbols_tool'."""
+    tn._tunnel_code_sockets["t1"] = object()
+    tn._tunnel_tool_routes["t1"] = {"code:get_symbols_tool": "code"}
+    seen = {}
+
+    def responder(label, method, params):
+        seen["params"] = params
+        return {"result": {"content": []}}
+
+    _stub_proxy(monkeypatch, responder)
+    asyncio.run(tn.call_tunnel_tool("t1", "code:get_symbols_tool", {}))
+    assert seen["params"]["name"] == "get_symbols_tool"
+
+
 def test_call_tunnel_tool_cold_cache_discovers(monkeypatch):
-    """No cached route → bridge re-lists tools, then routes the call."""
+    """No cached route → bridge re-lists tools (which prefixes), then routes the
+    call by the prefixed name and forwards the bare name."""
     tn._tunnel_extract_sockets["t1"] = object()
+    seen = {}
 
     def responder(label, method, params):
         if method == "tools/list":
             return {"result": {"tools": [{"name": "get_symbols"}]}}
+        seen["params"] = params
         return {"result": {"content": [{"type": "text", "text": "ok"}]}}
 
     _stub_proxy(monkeypatch, responder)
-    result = asyncio.run(tn.call_tunnel_tool("t1", "get_symbols", {}))
+    # Caller uses the advertised (prefixed) name; cold cache rediscovers it.
+    result = asyncio.run(tn.call_tunnel_tool("t1", "extract:get_symbols", {}))
     assert result["content"][0]["text"] == "ok"
+    assert seen["params"]["name"] == "get_symbols"  # bare name forwarded
 
 
 def test_call_tunnel_tool_unknown_returns_none(monkeypatch):
@@ -438,44 +462,81 @@ def test_fs_mcp_proxy_subpath_builds_local_path(monkeypatch):
 # Phase 3 — code-intel-first description rewriting at the bridge
 # ---------------------------------------------------------------------------
 
-def test_rewrite_tool_description_prepends_for_read_file():
-    out = tn._rewrite_tool_description({"name": "read_file", "description": "Read a file."})
+def test_rewrite_tool_description_prepends_for_prefixed_read_file():
+    out = tn._rewrite_tool_description({"name": "fs:read_file", "description": "Read a file."})
     assert out["description"].startswith("IMPORTANT:")
     assert "Read a file." in out["description"]
 
 
 def test_rewrite_tool_description_handles_read_multiple_and_empty_desc():
-    out = tn._rewrite_tool_description({"name": "read_multiple_files"})
+    out = tn._rewrite_tool_description({"name": "fs:read_multiple_files"})
     assert out["description"] == tn._CODE_INTEL_FIRST_GUIDANCE
 
 
+def test_rewrite_tool_description_skips_bare_and_non_fs_read_file():
+    # Bare (un-prefixed) read_file is NOT rewritten — only the fs connector's is.
+    bare = {"name": "read_file", "description": "Read a file."}
+    assert tn._rewrite_tool_description(bare) is bare
+    # A code-connector read_file is a different server — also left alone.
+    code = {"name": "code:read_file", "description": "graph read"}
+    assert tn._rewrite_tool_description(code) is code
+
+
 def test_rewrite_tool_description_leaves_other_tools_untouched():
-    tool = {"name": "search_graph", "description": "Query the graph."}
+    tool = {"name": "code:search_graph", "description": "Query the graph."}
     assert tn._rewrite_tool_description(tool) is tool
 
 
 def test_rewrite_tool_description_is_idempotent():
-    once = tn._rewrite_tool_description({"name": "read_file", "description": "x"})
+    once = tn._rewrite_tool_description({"name": "fs:read_file", "description": "x"})
     twice = tn._rewrite_tool_description(once)
     assert once["description"] == twice["description"]
     assert twice["description"].count("IMPORTANT:") == 1
 
 
-def test_list_tunnel_tools_rewrites_read_file_description(monkeypatch):
+def test_list_tunnel_tools_prefixes_and_rewrites(monkeypatch):
+    """Aggregated tools are connector-prefixed; only fs:read_file gets the rewrite."""
     tn._tunnel_sockets["t1"] = object()
+    tn._tunnel_code_sockets["t1"] = object()
 
     def responder(label, method, params):
-        return {"result": {"tools": [
-            {"name": "read_file", "description": "Read a file."},
-            {"name": "list_directory", "description": "List a dir."},
-        ]}}
+        if label == "fs":
+            return {"result": {"tools": [
+                {"name": "read_file", "description": "Read a file."},
+                {"name": "list_directory", "description": "List a dir."},
+            ]}}
+        if label == "code":
+            return {"result": {"tools": [{"name": "get_symbols_tool", "description": "syms"}]}}
+        return {"result": {"tools": []}}
 
     _stub_proxy(monkeypatch, responder)
     tools = asyncio.run(tn.list_tunnel_tools("t1"))
     by_name = {t["name"]: t for t in tools}
-    assert by_name["read_file"]["description"].startswith("IMPORTANT:")
-    # Non-read tools are untouched.
-    assert by_name["list_directory"]["description"] == "List a dir."
+    # Names are connector-namespaced.
+    assert "code:get_symbols_tool" in by_name
+    assert "fs:read_file" in by_name and "fs:list_directory" in by_name
+    assert "get_symbols_tool" not in by_name  # bare name not advertised
+    # Only fs:read_file gets the code-intel-first directive.
+    assert by_name["fs:read_file"]["description"].startswith("IMPORTANT:")
+    assert by_name["fs:list_directory"]["description"] == "List a dir."
+    assert by_name["code:get_symbols_tool"]["description"] == "syms"
+
+
+def test_fs_and_code_read_file_coexist(monkeypatch):
+    """fs:read_file and code:read_file are distinct, non-colliding entries."""
+    tn._tunnel_sockets["t1"] = object()
+    tn._tunnel_code_sockets["t1"] = object()
+
+    def responder(label, method, params):
+        return {"result": {"tools": [{"name": "read_file", "description": f"{label} read"}]}}
+
+    _stub_proxy(monkeypatch, responder)
+    tools = asyncio.run(tn.list_tunnel_tools("t1"))
+    names = {t["name"] for t in tools}
+    assert {"fs:read_file", "code:read_file"} <= names
+    routes = tn._tunnel_tool_routes["t1"]
+    assert routes["fs:read_file"] == "fs"
+    assert routes["code:read_file"] == "code"
 
 
 def test_code_mcp_proxy_routes_to_code_socket(monkeypatch):
