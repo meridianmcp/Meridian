@@ -178,6 +178,7 @@ async def _get_oauth_token_from_db(
                 "tenant_id": tid,
                 "client_id": "claude-ai",
                 "exp": int(_tm.time()) + 86400 * 90,
+                "_is_api_token": True,  # Regular API token — falls through to bearer path in remote_mcp
             }
     except Exception:
         pass

@@ -5116,9 +5116,9 @@ async def _remote_mcp_inner(request: Request) -> Any:
     _td = _oa_mod._oa_tokens.get(_bearer_hash) if _bearer_hash else None  # noqa: SLF001
     if _td is None and _bearer_hash:
         _td = await _oa_mod._get_oauth_token_from_db(request.app.state.db, _bearer_hash)  # noqa: SLF001
-        if _td is not None:
+        if _td is not None and not _td.get("_is_api_token"):
             _oa_mod._oa_tokens[_bearer_hash] = _td  # noqa: SLF001
-    if _td is not None:
+    if _td is not None and not _td.get("_is_api_token"):
         if _tm_local.time() > _td.get("exp", 0):
             _oa_mod._oa_tokens.pop(_bearer_hash, None)  # noqa: SLF001
             _base_r = str(request.base_url).rstrip("/")
