@@ -21,6 +21,14 @@ on:
         options:
           - 'no'
           - 'yes'
+      hotfix:
+        description: 'Set to "yes" to skip coverage + preview and deploy straight to prod (emergency only).'
+        required: false
+        default: 'no'
+        type: choice
+        options:
+          - 'no'
+          - 'yes'
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -47,7 +55,13 @@ jobs:
         if: steps.playwright-cache.outputs.cache-hit != 'true'
       - run: pixi run python -m playwright install chromium
         if: steps.playwright-cache.outputs.cache-hit == 'true'
-      - run: pixi run python -m pytest tests/ -n auto -q --tb=short --ignore=tests/test_demo_ux.py --cov=meridian --cov-config=.coveragerc --cov-report=term-missing --cov-fail-under=80
+      - name: Run tests (fast for hotfix, full with coverage otherwise)
+        run: |
+          if [ "${{ inputs.hotfix }}" = "yes" ]; then
+            pixi run python -m pytest tests/test_core.py tests/test_new_v25.py tests/test_hosted.py tests/test_security.py -n auto -q --tb=short
+          else
+            pixi run python -m pytest tests/ -n auto -q --tb=short --ignore=tests/test_demo_ux.py --cov=meridian --cov-config=.coveragerc --cov-report=term-missing --cov-fail-under=80
+          fi
 
   playwright-tests:
     runs-on: ubuntu-latest
@@ -72,10 +86,10 @@ jobs:
         if: steps.playwright-cache.outputs.cache-hit == 'true'
       - run: pixi run python -m pytest tests/test_demo_ux.py -q --tb=short
 
-  # ─── 2. Preview deploy (dev branch only) ──────────────────────────────────
+  # ─── 2. Preview deploy (dev branch only, skip for hotfix) ────────────────
   deploy-preview:
     needs: test
-    if: github.ref == 'refs/heads/dev'
+    if: github.ref == 'refs/heads/dev' && inputs.hotfix != 'yes'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -85,10 +99,10 @@ jobs:
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN_PREVIEW }}
 
-  # ─── 3. Smoke tests against preview ───────────────────────────────────────
+  # ─── 3. Smoke tests against preview (skip for hotfix) ────────────────────
   smoke-preview:
     needs: deploy-preview
-    if: github.ref == 'refs/heads/dev'
+    if: github.ref == 'refs/heads/dev' && inputs.hotfix != 'yes'
     runs-on: ubuntu-latest
     steps:
       - name: Wait for preview to boot (retry /health up to 90s)
@@ -125,11 +139,12 @@ jobs:
 
   # ─── 4. Merge dev → main on operator-gated promotion ──────────────────────
   merge-to-main:
-    needs: smoke-preview
+    needs: [smoke-preview, test]
     if: >
       github.event_name == 'workflow_dispatch' &&
       inputs.promote == 'yes' &&
-      github.ref == 'refs/heads/dev'
+      github.ref == 'refs/heads/dev' &&
+      (inputs.hotfix == 'yes' || needs.smoke-preview.result == 'success')
     runs-on: ubuntu-latest
     permissions:
       contents: write
