@@ -1138,7 +1138,7 @@ async def run_tunnel(
 
     # 5. Print permanent URLs.
     print("", flush=True)
-    print("  Permanent MCP URLs — add these to claude.ai once:", flush=True)
+    print("  Tunnel URLs (for Cursor / non-claude.ai clients only):", flush=True)
     if proc_fs is not None:
         print(f"    Filesystem:      {_permanent_url(base_url, tenant_id)}", flush=True)
     if proc_code is not None:
@@ -1149,6 +1149,7 @@ async def run_tunnel(
         print(f"    PowerPoint:      {_permanent_office_url(base_url, tenant_id, 'ppt')}", flush=True)
     if "word" in office_procs:
         print(f"    Word:            {_permanent_office_url(base_url, tenant_id, 'word')}", flush=True)
+    print(f"  claude.ai: all tools appear under your Meridian connector automatically.", flush=True)
     if proc_fs is not None:
         print(f"  (SSE clients: {_sse_url(base_url, tenant_id)})", flush=True)
     print("", flush=True)

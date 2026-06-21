@@ -1071,6 +1071,17 @@ async def list_tunnel_tools(
         if not resp:
             continue
         tools = ((resp.get("result") or {}).get("tools")) or []
+        # Retry up to 3x with 2s backoff if proxy returns empty — local
+        # proxy may still be starting when the WebSocket first connects.
+        for _attempt in range(3):
+            if tools:
+                break
+            await asyncio.sleep(2)
+            try:
+                resp2 = await _tunnel_jsonrpc(tenant_id, label, "tools/list", {})
+                tools = ((resp2.get("result") or {}).get("tools")) or [] if resp2 else []
+            except Exception:  # noqa: BLE001
+                break
         for tool in tools:
             if not isinstance(tool, dict):
                 continue
