@@ -605,6 +605,16 @@ async def _oauth_auth(request: Request):
 
     code = _sec.token_hex(32)
     _redirect_uri = p.get("redirect_uri", "")
+    if not _redirect_uri:
+        _cid = p.get("client_id", "")
+        _registered = _oa_clients.get(_cid, {}).get("redirect_uris", [])
+        if _registered:
+            _redirect_uri = _registered[0]
+        else:
+            return JSONResponse(
+                {"error": "invalid_request", "error_description": "redirect_uri required"},
+                status_code=400,
+            )
     _challenge = p.get("code_challenge") or ""
     _oa_codes[code] = {"client_id": p.get("client_id", ""),
         "redirect_uri": _redirect_uri,
