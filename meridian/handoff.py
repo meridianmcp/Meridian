@@ -856,12 +856,29 @@ async def _generate_planner_handoff(
     project_id: str,
     output_dir: str,
 ) -> tuple[str, str]:
-    """Planner-optimised handoff — strategic context for a claude.ai planning chat.
+    """Planner-optimised handoff — a *directive planning-session prompt*.
 
-    Includes: north star, pinned decisions, strategic notes, open HITL queue,
-    pending sprint items, recent tasks. Excludes mechanical executor details
-    (file paths, test commands, repo path) — those are for Claude Code, not the
-    planning chat.
+    Unlike the executor handoffs, this is not a state dump for resuming work.
+    It is an instruction set for a fresh claude.ai planning chat: it tells the
+    next planning session which tools to call and in what order, surfaces the
+    real items and decisions that need attention, and hands over a structured
+    thinking scaffold to fill in. Mechanical executor details (file paths, test
+    commands, repo path) are deliberately omitted — those belong to Claude Code.
+
+    Sections, in order:
+    * a header framing the chat as a planning session,
+    * the **call-these-tools-in-this-order** protocol (real MCP tool names),
+    * north star + current sprint focus (the frame to plan against),
+    * pinned decisions (the constitution to plan within),
+    * strategic notes (carried context),
+    * sprint items to review (real pending / in_progress items),
+    * open decisions (real pending HITL requests, or "none"),
+    * recent activity (last few tasks for momentum),
+    * a thinking scaffold with empty labelled sections to fill.
+
+    Every data fetch is guarded so a brand-new project with no goal, items,
+    decisions, or HITLs still produces a clean, crash-free prompt with "none"
+    placeholders.
 
     Returns ``(path, content)`` like the full handoff.
     """
@@ -869,21 +886,61 @@ async def _generate_planner_handoff(
 
     project = await db_module.get_project(db, project_id)
     goal = await db_module.get_goal(db, project_id)
-    pinned = await db_module.get_pinned_decisions(db, project_id)
+
+    # Guard every fetch — a fresh project may have none of these, and the
+    # planner prompt must still render rather than crash mid-handoff.
+    async def _safe(coro, default):
+        try:
+            return await coro
+        except Exception:  # noqa: BLE001 — never break the planner prompt on a fetch
+            return default
+
+    pinned = await _safe(db_module.get_pinned_decisions(db, project_id), [])
     # 5a5bba43 — planner brief renders note bodies, so request the full rows.
-    notes = await db_module.get_project_notes(db, project_id, bodies=True)
+    notes = await _safe(db_module.get_project_notes(db, project_id, bodies=True), [])
     strategic = _select_strategic_notes(notes)
-    pending_items = await db_module.get_sprint_items(db, project_id, status="pending")
-    tasks = await db_module.get_tasks(db, project_id, limit=10)
-    hitl = await db_module.list_hitl_requests(db, project_id, status="pending")
+    pending_items = await _safe(
+        db_module.get_sprint_items(db, project_id, status="pending"), []
+    )
+    in_progress_items = await _safe(
+        db_module.get_sprint_items(db, project_id, status="in_progress"), []
+    )
+    tasks = await _safe(db_module.get_tasks(db, project_id, limit=10), [])
+    hitl = await _safe(
+        db_module.list_hitl_requests(db, project_id, status="pending"), []
+    )
 
     north_star = (goal or {}).get("north_star") or (goal or {}).get("goal_north_star") or ""
     sprint = (goal or {}).get("sprint") or (goal or {}).get("goal_sprint") or ""
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
     lines = [
-        f"# Meridian Planner Handoff — {project['name']}",
+        f"# Meridian Planning Session — {project['name']}",
         f"_Generated {now}_",
+        "",
+        "You are the **planner** for this project. Your job is not to write code "
+        "— it is to decide *what* should be built next and in what order, then "
+        "record those decisions in Meridian so the executor sessions can pick "
+        "them up. Work through the protocol below, fill in the thinking "
+        "scaffold, and turn your conclusions into sprint items and decisions.",
+        "",
+        "## Planning protocol — call these tools in this order",
+        "",
+        f'1. `get_planning_brief(project_id="{project_id}")` — load the compact '
+        "current state (sprint, north star, pending + in-progress items, recent "
+        "tasks, active sessions, pending HITLs).",
+        f'2. `get_sprint_progress(project_id="{project_id}")` — see how much of '
+        "the current sprint is done vs. outstanding.",
+        f'3. `list_hitl_requests(project_id="{project_id}")` — review the open '
+        "human decisions blocking progress; answer or supersede them.",
+        f'4. `get_pinned_decisions(project_id="{project_id}")` — re-read the '
+        "constitution so new items don't contradict prior choices.",
+        "5. Think through the scaffold below (current state → gaps → priorities "
+        "→ proposed items → risks).",
+        f'6. `add_sprint_item(project_id="{project_id}", title="...", '
+        'item_group="...")` — record each proposed next item.',
+        f'7. `pin_decision(project_id="{project_id}", title="...", body="...", '
+        'category="...")` — record any architectural / scope decisions you made.',
         "",
         "## North Star",
         north_star or "(not set)",
@@ -894,7 +951,7 @@ async def _generate_planner_handoff(
     ]
 
     if pinned:
-        lines += ["## Pinned Decisions (Constitution)", ""]
+        lines += ["## Pinned Decisions (plan within these)", ""]
         for d in pinned:
             cat = d.get("category", "")
             # 366317e9 — pinned is ordered urgent → normal → low; tag urgent ones.
@@ -908,34 +965,66 @@ async def _generate_planner_handoff(
             lines.append(f"- **{n.get('title', '')}** — {(n.get('body') or '')[:150]}")
         lines.append("")
 
-    if hitl:
-        lines += [f"## Open HITL Requests ({len(hitl)} pending)", ""]
-        for h in hitl:
-            urg = h.get("urgency", "normal")
-            lines.append(f"- [{urg.upper()}] `{h['id'][:8]}` — {h.get('question', '')}")
-        lines.append("")
+    # Sprint items to review — in-progress first (what's live), then pending.
+    # Capped so a large backlog doesn't bury the prompt.
+    lines += ["## Sprint items to review", ""]
+    if in_progress_items or pending_items:
+        if in_progress_items:
+            lines.append("_In progress:_")
+            for it in in_progress_items[:10]:
+                lines.append(f"- `{it['id'][:8]}` [in_progress] {(it.get('title') or '')[:100]}")
+        if pending_items:
+            alpha = [i for i in pending_items if i.get("version") != "post-launch"]
+            shown = alpha or pending_items
+            lines.append("_Pending:_")
+            for it in shown[:20]:
+                lines.append(f"- `{it['id'][:8]}` [pending] {(it.get('title') or '')[:100]}")
+            remaining = len(shown) - 20
+            if remaining > 0:
+                lines.append(f"- … (+{remaining} more pending)")
+    else:
+        lines.append("- none — the backlog is empty; propose the first items below.")
+    lines.append("")
 
-    if pending_items:
-        alpha = [i for i in pending_items if i.get("version") != "post-launch"]
-        lines += [f"## Pending Sprint Items ({len(alpha)} alpha-launch)", ""]
-        for it in alpha[:20]:
-            lines.append(f"- `{it['id'][:8]}` {it.get('title', '')[:100]}")
-        lines.append("")
+    # Open decisions (HITL) — the human questions blocking progress.
+    lines += ["## Open decisions (HITL)", ""]
+    if hitl:
+        for h in hitl:
+            urg = (h.get("urgency") or "normal").upper()
+            lines.append(f"- [{urg}] `{(h.get('id') or '')[:8]}` — {(h.get('question') or '')[:200]}")
+    else:
+        lines.append("- none — no human decisions are currently pending.")
+    lines.append("")
 
     if tasks:
-        lines += ["## Recent Tasks (last 10)", ""]
+        lines += ["## Recent activity (last 10 tasks)", ""]
         for t in tasks[:10]:
             ts = (t.get("created_at") or "")[:10]
             status = t.get("status", "?")
             lines.append(f"- [{status.upper()}] {ts} — {(t.get('description') or '')[:100]}")
         lines.append("")
 
+    # Thinking scaffold — empty labelled sections for the planner to fill in.
     lines += [
-        "## Start a Planning Session",
+        "## Thinking scaffold",
         "",
-        f'```',
-        f'start_session(project_id="{project_id}", session_name="planning-session")',
-        f'```',
+        "_Fill in each section below before recording new sprint items / "
+        "decisions._",
+        "",
+        "### Current state",
+        "_Where the project stands right now — what's shipped, what's in flight._",
+        "",
+        "### Gaps & risks",
+        "_What's missing, fragile, or blocking; what could go wrong if ignored._",
+        "",
+        "### Priorities",
+        "_The 1-3 things that matter most for the next sprint, ranked._",
+        "",
+        "### Proposed next sprint items",
+        "_Concrete items to create via add_sprint_item — title + group each._",
+        "",
+        "### Open questions",
+        "_Anything needing a human decision — raise via request_hitl if blocking._",
         "",
     ]
 

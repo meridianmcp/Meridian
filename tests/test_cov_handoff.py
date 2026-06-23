@@ -293,7 +293,9 @@ async def test_generate_handoff_delta_empty(db, tmp_path):
 
 @pytest.mark.asyncio
 async def test_generate_handoff_planner_mode_full_content(db, tmp_path):
-    """Planner mode emits strategic blocks: north star, decisions, notes, HITL."""
+    """Planner mode emits a directive planning prompt: tool-order protocol,
+    sprint-items-to-review (real pending item), open-HITL section (real HITL),
+    strategic context, and the thinking scaffold."""
     p = await db_module.create_project(db, "alpha-planner")
     await db_module.set_goal(
         db, p["id"], "vision", north_star="Be the best", sprint="plan-sprint"
@@ -311,29 +313,53 @@ async def test_generate_handoff_planner_mode_full_content(db, tmp_path):
     path, content = await handoff_module.generate_handoff(
         db, p["id"], str(tmp_path), mode="planner"
     )
-    assert "Meridian Planner Handoff — alpha-planner" in content
+    # Framed as a planning session, not a data dump.
+    assert "Meridian Planning Session — alpha-planner" in content
+    # The call-these-tools-in-this-order protocol, using the real tool names.
+    assert "Planning protocol — call these tools in this order" in content
+    assert "get_planning_brief(" in content
+    assert "get_sprint_progress(" in content
+    assert "list_hitl_requests(" in content
+    assert "get_pinned_decisions(" in content
+    # Strategic frame carried over.
     assert "Be the best" in content
     assert "plan-sprint" in content
     assert "Planner decision" in content
     assert "Strat note" in content
-    assert "Open HITL Requests" in content
-    assert "Rate limit per IP or token?" in content
+    # Sprint items to review — the real pending item shows up.
+    assert "## Sprint items to review" in content
     assert "Planner pending item" in content
+    # Open decisions (HITL) — the real open HITL question shows up.
+    assert "## Open decisions (HITL)" in content
+    assert "Rate limit per IP or token?" in content
+    # Recent activity + thinking scaffold sections.
     assert "planner task" in content
-    assert "Start a Planning Session" in content
+    assert "## Thinking scaffold" in content
+    assert "### Current state" in content
+    assert "### Gaps & risks" in content
+    assert "### Priorities" in content
+    assert "### Proposed next sprint items" in content
+    assert "### Open questions" in content
     assert path.endswith("alpha-planner_planner_handoff.md")
 
 
 @pytest.mark.asyncio
 async def test_generate_handoff_planner_mode_minimal(db, tmp_path):
-    """Planner mode with no goal/decisions/notes still renders the skeleton."""
+    """Planner mode with no goal/items/HITLs still renders a clean prompt with
+    'none' placeholders rather than crashing."""
     p = await db_module.create_project(db, "alpha-planner-min")
     _, content = await handoff_module.generate_handoff(
         db, p["id"], str(tmp_path), mode="planner"
     )
     assert "## North Star" in content
     assert "(not set)" in content
-    assert "Start a Planning Session" in content
+    # Protocol + scaffold are always present.
+    assert "Planning protocol — call these tools in this order" in content
+    assert "## Thinking scaffold" in content
+    # Empty backlog + empty HITL queue render the "none" placeholders.
+    assert "## Sprint items to review" in content
+    assert "## Open decisions (HITL)" in content
+    assert content.count("- none") >= 2
 
 
 @pytest.mark.asyncio
@@ -499,7 +525,7 @@ def test_planner_handoff_endpoint(client):
     assert r.status_code == 200
     body = r.json()
     assert body["mode"] == "planner"
-    assert "Meridian Planner Handoff" in body["content"]
+    assert "Meridian Planning Session" in body["content"]
     assert "be great" in body["content"]
 
 
