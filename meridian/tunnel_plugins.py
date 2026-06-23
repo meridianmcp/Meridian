@@ -163,16 +163,15 @@ def expand_command(value: Any, *, repo_path: str | None = None) -> list[str] | N
     return [tok.replace("{repo_path}", rp) for tok in cmd]
 
 
-def normalize_plugins_config(raw: Any) -> dict[str, dict]:
-    """Validate stored config into ``{plugin_name: override_dict}``.
+def _iter_plugin_items(raw: Any) -> list[dict]:
+    """Normalize a stored config into an ordered list of ``{"name", ...}`` dicts.
 
-    Accepts either a dict keyed by plugin name (``{"code-intel": {...}}``) or a
-    list of ``{"name": ..., ...}`` dicts (the dashboard form's shape). Unknown
-    plugin names are kept (so the config round-trips) but only built-in names
-    take effect in :func:`resolve_plugins`. Malformed input yields ``{}``.
+    Accepts the dict-keyed form (``{"code-intel": {...}}``) or the list form (the
+    dashboard's shape). Order is preserved so first-occurrence dedup is possible
+    (see :func:`resolve_custom_plugins`). Non-dict / garbage input yields ``[]``.
     """
     if not raw:
-        return {}
+        return []
     items: list[dict] = []
     if isinstance(raw, dict):
         for name, ov in raw.items():
@@ -182,11 +181,19 @@ def normalize_plugins_config(raw: Any) -> dict[str, dict]:
                 items.append({"name": name})
     elif isinstance(raw, list):
         items = [x for x in raw if isinstance(x, dict) and x.get("name")]
-    else:
-        return {}
+    return items
 
+
+def normalize_plugins_config(raw: Any) -> dict[str, dict]:
+    """Validate stored config into ``{plugin_name: override_dict}``.
+
+    Accepts either a dict keyed by plugin name (``{"code-intel": {...}}``) or a
+    list of ``{"name": ..., ...}`` dicts (the dashboard form's shape). Unknown
+    plugin names are kept (so the config round-trips) but only built-in names
+    take effect in :func:`resolve_plugins`. Malformed input yields ``{}``.
+    """
     out: dict[str, dict] = {}
-    for it in items:
+    for it in _iter_plugin_items(raw):
         name = str(it.get("name") or "").strip()
         if not name:
             continue
@@ -209,6 +216,69 @@ def normalize_plugins_config(raw: Any) -> dict[str, dict]:
         if isinstance(env, dict):
             ov["env"] = {str(k): str(v) for k, v in env.items() if str(k)}
         out[name] = ov
+    return out
+
+
+# Built-in default ports — a custom plugin may not reuse one, or its local proxy
+# would collide with the built-in slot riding that port (see resolve_custom_plugins).
+_BUILTIN_DEFAULT_PORTS = frozenset({
+    DEFAULT_FS_PORT, DEFAULT_CODE_PORT, DEFAULT_EXTRACT_PORT,
+    DEFAULT_PPT_PORT, DEFAULT_WORD_PORT, DEFAULT_DC_PORT,
+})
+
+
+def resolve_custom_plugins(raw_config: Any) -> list[dict]:
+    """Resolve user-defined (non-built-in) plugins from the stored config.
+
+    A custom plugin is a config entry whose ``name`` is **not** a built-in name
+    (see :func:`builtin_names`), carrying its own ``command`` and a local
+    ``port``. Unlike the built-ins these are **LOCAL-ONLY** (pinned architectural
+    decision): they ride a local mcp-proxy port + the local ``.mcp.json`` and
+    have no server route — they never appear in the claude.ai connector. The
+    tunnel client spawns each enabled one behind ``_build_proxy_for_inner`` and
+    points the local MCP config at its ``http://127.0.0.1:<port>`` proxy.
+
+    Returns validated descriptors
+    ``{"name", "command" (list[str]), "port" (int), "enabled" (bool),
+    "builtin": False, "custom": True}``. Invalid entries are dropped silently
+    (they simply don't run); validation rules:
+
+    - ``name``: non-empty (stripped), not a built-in name, unique (first wins).
+    - ``command``: coerced via :func:`_coerce_command`; must be non-empty. The
+      ``{repo_path}`` template is left intact here — expansion happens in the
+      client at spawn time via :func:`expand_command`.
+    - ``port``: a real ``int`` (``bool`` rejected), in 1024–65535, and not one of
+      the built-in default ports (8808–8813) so a custom proxy can't collide
+      with a built-in slot.
+
+    Pure: no I/O, no subprocess. An empty/absent/garbage config yields ``[]``.
+    """
+    builtins = set(builtin_names())
+    out: list[dict] = []
+    seen: set[str] = set()
+    # Walk the raw items in their original order (not via normalize_plugins_config,
+    # whose dict collapse would make the *last* duplicate win) so dedup is first-wins.
+    for it in _iter_plugin_items(raw_config):
+        name = str(it.get("name") or "").strip()
+        if not name or name in builtins or name in seen:
+            continue
+        cmd = _coerce_command(it.get("command"))
+        if not cmd:
+            continue
+        port = it.get("port")
+        if not isinstance(port, int) or isinstance(port, bool):
+            continue
+        if not (1024 <= port <= 65535) or port in _BUILTIN_DEFAULT_PORTS:
+            continue
+        seen.add(name)
+        out.append({
+            "name": name,
+            "command": cmd,
+            "port": port,
+            "enabled": bool(it.get("enabled", True)),
+            "builtin": False,
+            "custom": True,
+        })
     return out
 
 

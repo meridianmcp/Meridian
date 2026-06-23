@@ -33,7 +33,7 @@ from fastapi.responses import Response
 
 from .. import db as db_module
 from .._deps import _hosted_mode, _get_tenant_from_request, _db
-from ..tunnel_plugins import normalize_plugins_config, resolve_plugins
+from ..tunnel_plugins import normalize_plugins_config, resolve_plugins, resolve_custom_plugins
 
 router = APIRouter()
 _log = logging.getLogger(__name__)
@@ -815,7 +815,7 @@ async def get_tunnel_plugins(request: Request) -> Response:
     tenant = await _get_tenant_from_request(request)
     if tenant is None:
         return _json_response({
-            "plugins": resolve_plugins(None), "config": {},
+            "plugins": resolve_plugins(None), "custom": [], "config": {},
             "active": {"fs": False, "code": False, "extract": False, "ppt": False, "word": False, "dc": False},
             "plan": "free",
         })
@@ -823,6 +823,9 @@ async def get_tunnel_plugins(request: Request) -> Response:
     tid = tenant.get("id")
     return _json_response({
         "plugins": resolve_plugins(parsed),
+        # User-defined (non-built-in) plugins, so the dashboard can render and
+        # edit existing custom entries. LOCAL-ONLY — no server route involved.
+        "custom": resolve_custom_plugins(parsed),
         "config": parsed if isinstance(parsed, (dict, list)) else {},
         "active": {
             "fs": tid in _tunnel_sockets,

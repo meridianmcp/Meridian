@@ -607,3 +607,34 @@ def test_tunnel_plugins_section_has_ux_enhancements(js):
 
     # (1) Reset still guards with a confirm() dialog (not regressed).
     assert "confirm(" in js, "reset confirmation dialog regressed"
+
+
+def test_tunnel_plugins_custom_subsection_present(js):
+    """Sprint ce84619d — the Tunnel Plugins card gains a Custom plugins subsection:
+    a list of existing custom plugins (each with Remove), an add form (name /
+    command / port + Add), and the custom entries are merged into collectConfig."""
+    # The custom list is seeded from data.custom and kept in a mutable array.
+    assert "data.custom" in js or "data && data.custom" in js, (
+        "custom plugins must be read from the GET /tunnel/plugins `custom` key"
+    )
+    assert "const customPlugins" in js, "customPlugins array missing"
+    assert "renderCustomList" in js, "custom list renderer missing"
+
+    # Add form: name / command / port inputs + an Add button (id-scoped per project).
+    assert "tp-custom-name-${projectId}" in js, "custom name input missing"
+    assert "tp-custom-command-${projectId}" in js, "custom command input missing"
+    assert "tp-custom-port-${projectId}" in js, "custom port input missing"
+    assert "tp-custom-add-${projectId}" in js, "custom Add button missing"
+
+    # Per-row Remove button, wired via addEventListener (no inline onclick to globals).
+    assert "tp-custom-remove" in js, "custom Remove button missing"
+    assert "customPlugins.splice" in js, "Remove must drop the entry from customPlugins"
+
+    # collectConfig merges the custom entries (name + command + port + enabled).
+    assert "customPlugins.forEach" in js, "collectConfig must merge custom plugins"
+
+    # LOCAL-ONLY framing surfaced to the user (no claude.ai connector).
+    assert "127.0.0.1" in js, "custom plugins local-proxy framing missing"
+
+    # Add-form validation rejects the built-in default ports (8808–8813).
+    assert "8808" in js and "8813" in js, "custom port guard against built-in ports missing"

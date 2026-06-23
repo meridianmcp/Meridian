@@ -760,6 +760,113 @@ def test_run_tunnel_code_and_extract_popen_raise_are_warned(monkeypatch, tmp_pat
     assert rc == 0  # fs alone keeps the tunnel up
 
 
+def test_tunnel_mcp_entries_includes_custom_local_proxies():
+    """Custom plugins get a LOCAL http://127.0.0.1:<port>/mcp connector entry,
+    alongside the three built-in relay entries (which keep the hosted URL)."""
+    entries = tc._tunnel_mcp_entries(
+        "https://usemeridian.us", "tid-x",
+        custom=[{"name": "fetch", "port": 8901}, {"name": "git", "port": 8902}],
+    )
+    # Built-ins still point at the hosted relay.
+    assert entries["meridian-fs"]["url"].startswith("https://usemeridian.us/fs/mcp/")
+    # Custom ones point at the local proxy, NOT the hosted server.
+    assert entries["meridian-custom-fetch"] == {"type": "http", "url": "http://127.0.0.1:8901/mcp"}
+    assert entries["meridian-custom-git"] == {"type": "http", "url": "http://127.0.0.1:8902/mcp"}
+
+
+def test_run_tunnel_spawns_custom_plugin_locally_and_writes_mcp_json(monkeypatch, tmp_path):
+    """A custom plugin in the config spawns an extra local proxy (proc_holders
+    gains a custom:<name> entry) and is written into the local .mcp.json pointing
+    at its 127.0.0.1 proxy — never a hosted server route (LOCAL-ONLY)."""
+    procs = _stub_run_tunnel_spawn(monkeypatch)
+    # Capture every watchdog holder so we can assert the custom slot is covered.
+    seen_labels = []
+
+    async def fake_watchdog(holder, poll_interval=3.0):
+        seen_labels.append(holder.get("label"))
+        return None
+
+    monkeypatch.setattr(tc, "_proc_watchdog", fake_watchdog)
+    # Don't restore (delete) the .mcp.json on shutdown so we can inspect it.
+    monkeypatch.setattr(tc, "_restore_mcp_json", lambda snaps: None)
+
+    monkeypatch.setattr(
+        tc, "_fetch_me",
+        AsyncMock(return_value={
+            "tenant_id": "tid-cust", "plan": "pro",
+            "tunnel_plugins_config": [
+                {"name": "fetch", "command": "uvx mcp-server-fetch", "port": 8901},
+            ],
+        }),
+    )
+    monkeypatch.setattr(tc.Path, "cwd", staticmethod(lambda: tmp_path))
+
+    rc = _run_tunnel(token="sk_tok", base_url="https://x", repo_path=str(tmp_path))
+    assert rc == 0
+    # fs + code + extract built-ins + the one custom proxy = 4 spawns.
+    assert len(procs) == 4
+    # The custom inner command was wrapped + spawned (mcp-proxy on its port).
+    assert any("mcp-server-fetch" in p.cmd for p in procs)
+    assert any("8901" in p.cmd for p in procs)
+    # proc_holders gained a custom:<name> entry (so the watchdog covers it).
+    assert "custom:fetch" in seen_labels
+    # .mcp.json got the local connector entry pointing at the 127.0.0.1 proxy.
+    data = json.loads((tmp_path / ".mcp.json").read_text(encoding="utf-8"))
+    assert data["mcpServers"]["meridian-custom-fetch"]["url"] == "http://127.0.0.1:8901/mcp"
+
+
+def test_run_tunnel_custom_plugin_repo_path_expanded_at_spawn(monkeypatch, tmp_path):
+    """{repo_path} in a custom plugin command is expanded to the served repo at
+    spawn time (resolve_custom_plugins leaves it intact; the client expands it)."""
+    procs = _stub_run_tunnel_spawn(monkeypatch)
+    monkeypatch.setattr(tc, "_restore_mcp_json", lambda snaps: None)
+    monkeypatch.setattr(
+        tc, "_fetch_me",
+        AsyncMock(return_value={
+            "tenant_id": "tid-rp", "plan": "pro",
+            "tunnel_plugins_config": [
+                {"name": "myserena", "command": "tool --project {repo_path}", "port": 8902},
+            ],
+        }),
+    )
+    monkeypatch.setattr(tc.Path, "cwd", staticmethod(lambda: tmp_path))
+
+    rc = _run_tunnel(token="sk_tok", base_url="https://x", repo_path=str(tmp_path))
+    assert rc == 0
+    # The literal {repo_path} placeholder must not survive into the spawned command.
+    custom_cmds = [p.cmd for p in procs if any("8902" in str(t) for t in p.cmd)]
+    assert custom_cmds, "custom proxy was not spawned"
+    flat = " ".join(custom_cmds[0])
+    assert "{repo_path}" not in flat
+    assert str(tmp_path) in flat
+
+
+def test_run_tunnel_custom_only_keeps_tunnel_alive(monkeypatch, tmp_path):
+    """With every built-in slot disabled but one custom plugin enabled, the tunnel
+    still serves (the local proxy + mcp.json) — exit 0, not 'nothing to serve'."""
+    procs = _stub_run_tunnel_spawn(monkeypatch)
+    monkeypatch.setattr(tc, "_restore_mcp_json", lambda snaps: None)
+    monkeypatch.setattr(
+        tc, "_fetch_me",
+        AsyncMock(return_value={
+            "tenant_id": "tid-co", "plan": "pro",
+            "tunnel_plugins_config": [
+                {"name": "filesystem", "enabled": False},
+                {"name": "code-intel", "enabled": False},
+                {"name": "code-extractor", "enabled": False},
+                {"name": "fetch", "command": "uvx mcp-server-fetch", "port": 8901},
+            ],
+        }),
+    )
+    monkeypatch.setattr(tc.Path, "cwd", staticmethod(lambda: tmp_path))
+
+    rc = _run_tunnel(token="sk_tok", base_url="https://x", repo_path=str(tmp_path))
+    assert rc == 0
+    # Only the custom proxy spawned (all built-ins disabled).
+    assert len(procs) == 1
+    assert any("mcp-server-fetch" in p.cmd for p in procs)
+
+
 def test_run_tunnel_finally_kills_proc_on_wait_timeout(monkeypatch, tmp_path):
     """On shutdown, a proc whose .wait() times out is force-killed (finally block)."""
     _stub_run_tunnel_spawn(monkeypatch)

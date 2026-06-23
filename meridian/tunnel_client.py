@@ -851,13 +851,31 @@ async def _proc_watchdog(
 TUNNEL_MCP_KEYS = ("meridian-fs", "meridian-code", "meridian-extractor")
 
 
-def _tunnel_mcp_entries(base_url: str, tenant_id: str) -> dict[str, dict]:
-    """The three HTTP MCP connector entries pointing at this tenant's tunnel."""
-    return {
+def _tunnel_mcp_entries(
+    base_url: str, tenant_id: str, custom: "list[dict] | None" = None,
+) -> dict[str, dict]:
+    """The HTTP MCP connector entries pointing at this tenant's tunnel.
+
+    The three built-in slots point at the hosted relay URLs (claude.ai-reachable).
+    *custom* is the list of running user-defined plugins (``{"name", "port"}``);
+    each gets an entry keyed ``meridian-custom-<name>`` pointing at its LOCAL
+    mcp-proxy (``http://127.0.0.1:<port>/mcp``) — they are LOCAL-ONLY and have no
+    server route, so a co-located client reaches them directly, not via the relay.
+    """
+    entries = {
         "meridian-fs": {"type": "http", "url": _permanent_url(base_url, tenant_id)},
         "meridian-code": {"type": "http", "url": _permanent_code_url(base_url, tenant_id)},
         "meridian-extractor": {"type": "http", "url": _permanent_extract_url(base_url, tenant_id)},
     }
+    for cp in custom or []:
+        name = cp.get("name")
+        port = cp.get("port")
+        if not name or not isinstance(port, int):
+            continue
+        entries[f"meridian-custom-{name}"] = {
+            "type": "http", "url": f"http://127.0.0.1:{port}/mcp",
+        }
+    return entries
 
 
 def _mcp_json_paths(cwd: "str | Path") -> list["Path"]:
@@ -899,14 +917,19 @@ def _inject_mcp_entries(text: "str | None", entries: dict[str, dict]) -> str:
 
 def _install_mcp_json(
     cwd: "str | Path", base_url: str, tenant_id: str,
+    custom: "list[dict] | None" = None,
 ) -> list[tuple["Path", "str | None"]]:
     """Inject tunnel connector entries into local MCP config files.
+
+    *custom* is the list of running user-defined plugins (``{"name", "port"}``);
+    each gets a LOCAL ``http://127.0.0.1:<port>/mcp`` connector entry alongside the
+    built-in relay entries (see :func:`_tunnel_mcp_entries`).
 
     Returns a list of ``(path, original_text_or_None)`` snapshots for restore.
     ``original_text_or_None`` is ``None`` when we created the file. Failures on
     any single file are reported and skipped — never fatal to the tunnel.
     """
-    entries = _tunnel_mcp_entries(base_url, tenant_id)
+    entries = _tunnel_mcp_entries(base_url, tenant_id, custom)
     snapshots: list[tuple[Path, str | None]] = []
     for path in _mcp_json_paths(cwd):
         existed = path.exists()
@@ -1026,7 +1049,8 @@ async def run_tunnel(
     # overrides); fall back to built-in defaults for older servers. Each slot
     # may be disabled, given a command override, or assigned a different port.
     from .tunnel_plugins import (
-        resolve_plugins, detect_office_binaries, expand_command, SERENA_EXTRACT_COMMAND,
+        resolve_plugins, resolve_custom_plugins, detect_office_binaries,
+        expand_command, SERENA_EXTRACT_COMMAND,
     )
     # Auto-enable Office slots whose launcher is installed on this machine, unless
     # the user explicitly configured them. Resolve locally from the raw config
@@ -1190,6 +1214,30 @@ async def run_tunnel(
         except Exception as exc:
             print(f"  warning: could not start {slot} proxy: {exc}", file=sys.stderr)
 
+    # 4c. Spawn user-defined custom plugins (LOCAL-ONLY). These have no server
+    #     route — they ride a local mcp-proxy port + the local .mcp.json only, so
+    #     a co-located Cursor/Claude Code session connects to them at
+    #     http://127.0.0.1:<port>. {repo_path} in the command is expanded to the
+    #     served repo at spawn time, exactly like the built-in extractor slot.
+    custom_plugins = resolve_custom_plugins(me.get("tunnel_plugins_config"))
+    running_custom: list[dict] = []
+    for cp in custom_plugins:
+        if not cp.get("enabled", True):
+            continue
+        cname = cp["name"]
+        cport = cp["port"]
+        cmd_inner = expand_command(cp["command"], repo_path=repo_path)
+        if not cmd_inner:
+            continue
+        cmd_custom = _build_proxy_for_inner(npx, list(cmd_inner), cport)
+        print(f"  custom:{cname:<9}http://127.0.0.1:{cport}", flush=True)
+        try:
+            proc_custom = subprocess.Popen(cmd_custom)
+            proc_holders.append({"proc": proc_custom, "cmd": cmd_custom, "env": None, "label": f"custom:{cname}"})
+            running_custom.append({"name": cname, "port": cport})
+        except Exception as exc:
+            print(f"  warning: could not start custom plugin {cname!r}: {exc}", file=sys.stderr)
+
     # 5. Print permanent URLs.
     print("", flush=True)
     print("  Tunnel URLs (for Cursor / non-claude.ai clients only):", flush=True)
@@ -1213,15 +1261,18 @@ async def run_tunnel(
     #     Restored to its original state on shutdown (step 8 finally block).
     mcp_snapshots: list[tuple[Path, str | None]] = []
     try:
-        mcp_snapshots = _install_mcp_json(Path.cwd(), base_url, tenant_id)
+        mcp_snapshots = _install_mcp_json(Path.cwd(), base_url, tenant_id, running_custom)
     except Exception as exc:  # noqa: BLE001
         print(f"  warning: could not update local MCP config: {exc}", file=sys.stderr, flush=True)
     if mcp_snapshots:
         for path, _orig in mcp_snapshots:
             print(f"  Updated MCP config: {path}", flush=True)
+        _custom_conns = "".join(
+            f", meridian-custom-{cp['name']}" for cp in running_custom
+        )
         print(
-            "    added connectors: meridian-fs, meridian-code, meridian-extractor "
-            "(removed on Ctrl+C)",
+            "    added connectors: meridian-fs, meridian-code, meridian-extractor"
+            f"{_custom_conns} (removed on Ctrl+C)",
             flush=True,
         )
         print(
@@ -1254,7 +1305,10 @@ async def run_tunnel(
         tasks.append(asyncio.ensure_future(
             _reconnect_loop(ws_office, office_ports[slot], slot)
         ))
-    if not tasks:
+    # Custom plugins are LOCAL-ONLY (no hosted relay, so no reconnect loop) but a
+    # running one still serves its local proxy + mcp.json connector — so it counts
+    # as "something to serve" even when every built-in slot is disabled.
+    if not tasks and not running_custom:
         print("error: no tunnel plugins enabled — nothing to serve.", file=sys.stderr)
         return 1
     # Watchdog per spawned slot — relaunch the local proxy if it crashes so the

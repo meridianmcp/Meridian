@@ -5989,6 +5989,12 @@ ${n.tags || ""}`.toLowerCase();
       }
       const plugins = data && data.plugins || [];
       const active = data && data.active || {};
+      const customPlugins = (data && data.custom || []).map((c) => ({
+        name: String(c.name || ""),
+        command: Array.isArray(c.command) ? c.command.join(" ") : String(c.command || ""),
+        port: c.port,
+        enabled: c.enabled !== false
+      }));
       const rows = plugins.map((p) => {
         const cmd = Array.isArray(p.command) ? p.command.join(" ") : "";
         const dot = active[p.slot] ? "var(--success, #3fb950)" : "var(--muted)";
@@ -6070,6 +6076,53 @@ ${n.tags || ""}`.toLowerCase();
           ${curatedRows}
         </div>
       </details>`;
+      const renderCustomList = () => {
+        const listEl = document.getElementById(`tp-custom-list-${projectId}`);
+        if (!listEl) return;
+        if (!customPlugins.length) {
+          listEl.innerHTML = '<div style="color:var(--muted);font-size:10px">No custom plugins yet.</div>';
+          return;
+        }
+        listEl.innerHTML = customPlugins.map((c, i) => `
+        <div style="border:1px solid var(--border);border-radius:4px;padding:8px;margin-bottom:6px;display:flex;gap:8px;align-items:center">
+          <div style="flex:1;min-width:0">
+            <div style="font-size:11px;color:var(--text);font-weight:600">${escapeHtml(c.name)}
+              <span style="font-size:9px;color:var(--muted);font-weight:400">:${escapeHtml(String(c.port))}</span></div>
+            <div style="font-size:10px;color:var(--muted);font-family:var(--font-mono);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escapeHtml(c.command)}</div>
+          </div>
+          <button class="secondary tp-custom-remove" data-idx="${i}" style="padding:2px 8px;font-size:10px;flex-shrink:0">Remove</button>
+        </div>`).join("");
+        listEl.querySelectorAll(".tp-custom-remove").forEach((btn) => {
+          btn.addEventListener("click", () => {
+            const idx = parseInt(btn.dataset.idx, 10);
+            if (Number.isInteger(idx)) {
+              customPlugins.splice(idx, 1);
+              renderCustomList();
+            }
+          });
+        });
+      };
+      const customSection = `
+      <details style="margin-top:8px;border:1px solid var(--border);border-radius:4px;background:var(--surface-2);padding:0">
+        <summary style="cursor:pointer;list-style:none;padding:6px 8px;font-size:10px;font-weight:600;color:var(--accent)">&#9656; Custom plugins</summary>
+        <div style="padding:0 8px 8px">
+          <div style="font-size:10px;color:var(--muted);margin-bottom:8px;line-height:1.5">
+            Add your own MCP server. Runs locally as <code>http://127.0.0.1:&lt;port&gt;</code> and is written
+            into this machine's <code>.mcp.json</code> for a co-located Cursor / Claude Code session.
+            Local-only \u2014 it does not appear in the claude.ai connector. Use a port outside 8808\u20138813.
+          </div>
+          <div id="tp-custom-list-${projectId}" style="margin-bottom:8px"></div>
+          <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
+            <input type="text" id="tp-custom-name-${projectId}" placeholder="name (e.g. fetch)"
+              style="width:120px;box-sizing:border-box;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:5px 7px;outline:none">
+            <input type="text" id="tp-custom-command-${projectId}" placeholder="command (e.g. uvx mcp-server-fetch)"
+              style="flex:1;min-width:160px;box-sizing:border-box;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:5px 7px;outline:none">
+            <input type="number" id="tp-custom-port-${projectId}" placeholder="port"
+              style="width:74px;box-sizing:border-box;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:5px 7px;outline:none">
+            <button class="secondary admin-only" id="tp-custom-add-${projectId}" style="padding:2px 10px;font-size:10px;flex-shrink:0">Add</button>
+          </div>
+        </div>
+      </details>`;
       section.innerHTML = `
       <details class="meridian-disclosure" open style="border:1px solid var(--border);border-radius:6px;background:var(--surface-2);padding:0">
       <summary style="cursor:pointer;list-style:none;padding:8px 10px;font-size:11px;font-weight:700;letter-spacing:.5px;color:var(--accent);text-transform:uppercase">Tunnel Plugins</summary>
@@ -6085,6 +6138,7 @@ ${n.tags || ""}`.toLowerCase();
         <button class="primary admin-only" id="tp-save-${projectId}" style="padding:2px 10px;font-size:10px">Save</button>
       </div>
       <div id="tp-status-${projectId}" style="font-size:10px;color:var(--muted);margin-top:4px;text-align:right"></div>
+      ${customSection}
       ${installSection}
       ${browseSection}
       </div>
@@ -6112,6 +6166,13 @@ ${n.tags || ""}`.toLowerCase();
           if (Number.isInteger(portVal) && portVal !== _TUNNEL_DEFAULT_PORTS[slot]) entry.port = portVal;
           cfg.push(entry);
         });
+        customPlugins.forEach((c) => {
+          const name = (c.name || "").trim();
+          const command = (c.command || "").trim();
+          const port = parseInt(c.port, 10);
+          if (!name || !command || !Number.isInteger(port)) return;
+          cfg.push({ name, command, port, enabled: c.enabled !== false });
+        });
         return cfg;
       };
       document.getElementById(`tp-save-${projectId}`).onclick = async () => {
@@ -6133,6 +6194,34 @@ ${n.tags || ""}`.toLowerCase();
           toast("Reset failed: " + e.message, true);
         }
       };
+      renderCustomList();
+      const _addCustom = () => {
+        const nameEl = document.getElementById(`tp-custom-name-${projectId}`);
+        const cmdEl = document.getElementById(`tp-custom-command-${projectId}`);
+        const portEl = document.getElementById(`tp-custom-port-${projectId}`);
+        const name = (nameEl && nameEl.value || "").trim();
+        const command = (cmdEl && cmdEl.value || "").trim();
+        const port = parseInt(portEl && portEl.value, 10);
+        if (!name || !command || !Number.isInteger(port)) {
+          toast("Custom plugin needs a name, command, and port", true);
+          return;
+        }
+        if (port < 1024 || port > 65535 || [8808, 8809, 8810, 8811, 8812, 8813].includes(port)) {
+          toast("Pick a port in 1024\u201365535 and outside 8808\u20138813", true);
+          return;
+        }
+        if (customPlugins.some((c) => c.name === name)) {
+          toast(`A custom plugin named "${name}" already exists`, true);
+          return;
+        }
+        customPlugins.push({ name, command, port, enabled: true });
+        if (nameEl) nameEl.value = "";
+        if (cmdEl) cmdEl.value = "";
+        if (portEl) portEl.value = "";
+        renderCustomList();
+      };
+      const _addBtn = document.getElementById(`tp-custom-add-${projectId}`);
+      if (_addBtn) _addBtn.addEventListener("click", _addCustom);
       section.querySelectorAll(".tp-copy").forEach((btn) => {
         btn.addEventListener("click", async () => {
           const ok = await _tunnelCopyToClipboard(btn.dataset.copy || "");
