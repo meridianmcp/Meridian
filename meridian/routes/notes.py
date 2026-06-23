@@ -14,19 +14,36 @@ router = APIRouter()
 
 @router.get("/projects/{project_id}/notes")
 async def list_project_notes_endpoint(
-    project_id: str, request: Request, tag: str | None = None, query: str | None = None
-) -> list[dict[str, Any]]:
+    project_id: str,
+    request: Request,
+    tag: str | None = None,
+    query: str | None = None,
+    paginate: bool = False,
+    limit: int = 100,
+    cursor: int = 0,
+) -> list[dict[str, Any]] | dict[str, Any]:
     """Project notes (newest first). ``?tag=X`` filters by tag; ``?query=X`` searches title+body.
 
     5a5bba43 — the dashboard Notes tab renders full note bodies, so this HTTP
     endpoint returns the complete rows (``bodies=True``) for backward compat.
     The MCP ``get_notes`` tool defaults to the lightweight (no-body) list.
+
+    9fa119dd — pass ``?paginate=true`` for the cursor "Load More" envelope
+    ``{notes, has_more, next_cursor}`` (default ``limit=100``, ``cursor`` is the
+    next offset), mirroring the sprint-items ``?page=`` envelope. Without
+    ``paginate`` the legacy bare-list shape is unchanged.
     """
-    project = await db_module.get_project(await _db(request), project_id)
+    db = await _db(request)
+    project = await db_module.get_project(db, project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="project not found")
+    if paginate:
+        return await db_module.get_project_notes_page(
+            db, project_id, tag=tag, query=query, bodies=True,
+            limit=limit, cursor=cursor,
+        )
     return await db_module.get_project_notes(
-        await _db(request), project_id, tag=tag, query=query, bodies=True
+        db, project_id, tag=tag, query=query, bodies=True
     )
 
 

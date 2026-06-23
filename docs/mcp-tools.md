@@ -458,7 +458,7 @@ add_note(project_id="abc-123", title="Deploy note", body="Reminder: update env v
 
 
 ### `get_notes`
-Read-only: List project notes (newest first), LIGHTWEIGHT by default — id/slug/title/tags/kind/priority/timestamps with NO body, so the list can't overflow context. Pull model: scan the list, then `read_note(project_id, slug)` for one note's full body. Filter by tag substring or `query` full-text search. Pass `bodies=true` only when you truly need every body inline.
+Read-only: List project notes (newest first), LIGHTWEIGHT by default — id/slug/title/tags/kind/priority/timestamps with NO body, so the list can't overflow context. Pull model: scan the list, then `read_note(project_id, slug)` for one note's full body. Filter by tag substring or `query` full-text search. Pass `bodies=true` only when you truly need every body inline. Pass `limit` (default 100, max 500) and/or `cursor` for a `{notes, has_more, next_cursor}` page, then re-call with `cursor=next_cursor`.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -466,6 +466,8 @@ Read-only: List project notes (newest first), LIGHTWEIGHT by default — id/slug
 | `tag` | string | optional |  |
 | `query` | string | optional | Text search across note title and body (case-insensitive). |
 | `bodies` | boolean | optional | Default false. true returns full note bodies inline (legacy behavior) — usually unnecessary; prefer read_note(slug). |
+| `limit` | integer | optional | Page size (default 100, clamped 1..500). Passing limit or cursor switches the result to the {notes, has_more, next_cursor} pagination envelope. |
+| `cursor` | integer | optional | Offset cursor from a prior page's next_cursor. Passing it switches the result to the {notes, has_more, next_cursor} envelope. |
 
 **Example:**
 ```

@@ -86,6 +86,23 @@ def test_backburner_section_has_grouping_search_and_archive(js):
     assert "async function sprintArchive" in js, "sprintArchive impl missing"
 
 
+def test_notes_tab_has_cursor_load_more(js):
+    """9fa119dd — the notes tab paginates: the initial load hits the paginated
+    notes endpoint, and a "Load More" button fetches the next cursor + appends,
+    mirroring the devlog/tasks Load-More wiring."""
+    # Initial + subsequent fetches use the cursor-pagination endpoint.
+    assert "/notes?paginate=true&limit=" in js, (
+        "notes tab must fetch the paginated ?paginate=true endpoint"
+    )
+    # A Load More control wired to the cursor exists in the notes tab.
+    assert "notes-load-more-" in js, "notes Load More button id missing"
+    assert "const loadMore" in js, "notes loadMore() handler missing"
+    # The handler consumes the {notes, has_more, next_cursor} envelope.
+    assert "next_cursor" in js and "has_more" in js, (
+        "notes loadMore must read the has_more / next_cursor envelope"
+    )
+
+
 def test_dashboard_north_star_not_same_as_version_goal(js):
     """Goal tab shows three separate subtabs — not stacked textareas sharing content.
 

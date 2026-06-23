@@ -655,7 +655,10 @@ def build_mcp_server():
                     "context. Pull model: scan the list, then read_note("
                     "project_id, slug) for one note's full body. Optional "
                     "``tag`` filter matches any comma-separated tag. Pass "
-                    "bodies=true only when you truly need every body inline."
+                    "bodies=true only when you truly need every body inline. "
+                    "Pagination: pass limit (default 100, max 500) and/or "
+                    "cursor for a {notes, has_more, next_cursor} envelope, then "
+                    "re-call with cursor=next_cursor; omit both for the full list."
                 ),
                 inputSchema={
                     "type": "object",
@@ -665,6 +668,14 @@ def build_mcp_server():
                         "bodies": {
                             "type": "boolean",
                             "description": "Default false. true returns full bodies inline (legacy); prefer read_note(slug).",
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "description": "Page size (default 100, clamped 1..500). Passing limit or cursor returns the {notes, has_more, next_cursor} envelope.",
+                        },
+                        "cursor": {
+                            "type": "integer",
+                            "description": "Offset cursor from a prior page's next_cursor. Passing it returns the {notes, has_more, next_cursor} envelope.",
                         },
                     },
                     "required": ["project_id"],

@@ -1265,6 +1265,18 @@ async def _dispatch_mcp_tool(
         # 5a5bba43 — pull model: default to the lightweight list (no bodies) so
         # bulk note injection can't overflow context. Agents fetch one body via
         # read_note(slug). Pass bodies=true to opt back into full rows.
+        # 9fa119dd — cursor pagination, opt-in (mirrors get_sprint_items, whose
+        # MCP tool stays a bare list while the HTTP route paginates): pass
+        # ``cursor`` and/or ``limit`` to get the {notes, has_more, next_cursor}
+        # envelope, then re-call with cursor=next_cursor for the next page.
+        # Without either arg the legacy bare list is returned for back-compat.
+        if "cursor" in args or "limit" in args:
+            return await db_module.get_project_notes_page(
+                db, args["project_id"], tag=args.get("tag"), query=args.get("query"),
+                bodies=bool(args.get("bodies", False)),
+                limit=int(args.get("limit", 100)),
+                cursor=int(args.get("cursor", 0)),
+            )
         return await db_module.get_project_notes(
             db, args["project_id"], tag=args.get("tag"), query=args.get("query"),
             bodies=bool(args.get("bodies", False)),

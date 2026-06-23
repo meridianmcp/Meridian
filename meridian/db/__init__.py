@@ -5965,25 +5965,16 @@ async def get_project_note(
     return _row_to_dict(row)
 
 
-async def get_project_notes(
+def _project_notes_where(
     db: aiosqlite.Connection,
     project_id: str,
-    tag: str | None = None,
-    query: str | None = None,
-    bodies: bool = False,
-) -> list[dict[str, Any]]:
-    """Return notes for a project, newest first. Optional tag filter (substring
-    match on tags) and/or text query (searches title + body).
+    tag: str | None,
+    query: str | None,
+) -> tuple[str, list[Any]]:
+    """Build the shared WHERE clause + params for the project_notes filters.
 
-    5a5bba43 — pull model: by default (``bodies=False``) the returned rows OMIT
-    the ``body`` field — a lightweight id/slug/title/kind/priority/timestamps
-    list — so bulk note injection can't overflow an agent's context. Callers
-    that actually render note bodies (dashboard notes view, handoff, planner
-    context) pass ``bodies=True``; agents fetch a single body on demand via
-    ``read_note(slug)`` → ``get_project_note_by_slug``.
-
-    The ``query`` filter always searches the body even when bodies are omitted
-    from the result — the search happens in SQL, the body just isn't returned.
+    Factored out so get_project_notes and get_project_notes_page apply the
+    exact same tag / full-text filtering before list vs. paginated fetch.
     """
     is_pg = hasattr(db, "_pool")
     clauses: list[str] = ["project_id = ?"]
@@ -5998,21 +5989,103 @@ async def get_project_notes(
         else:
             clauses.append("(title LIKE ? OR body LIKE ?)")
         params.extend([like_pat, like_pat])
-    where = " AND ".join(clauses)
-    # Lightweight projection (no body) by default for context economy. Explicit
-    # column list — keep in sync with the project_notes schema.
-    cols = (
+    return " AND ".join(clauses), params
+
+
+def _project_notes_cols(bodies: bool) -> str:
+    """Column list for a notes fetch — full row when ``bodies`` else the
+    lightweight id/slug/title/kind/priority/timestamps projection."""
+    return (
         "*"
         if bodies
         else "id, project_id, title, tags, note_kind, priority, slug, "
         "created_at, updated_at"
     )
-    async with db.execute(
-        f"SELECT {cols} FROM project_notes WHERE {where} ORDER BY created_at DESC",
-        params or None,
-    ) as cur:
+
+
+async def get_project_notes(
+    db: aiosqlite.Connection,
+    project_id: str,
+    tag: str | None = None,
+    query: str | None = None,
+    bodies: bool = False,
+    limit: int | None = None,
+    offset: int = 0,
+) -> list[dict[str, Any]]:
+    """Return notes for a project, newest first. Optional tag filter (substring
+    match on tags) and/or text query (searches title + body).
+
+    5a5bba43 — pull model: by default (``bodies=False``) the returned rows OMIT
+    the ``body`` field — a lightweight id/slug/title/kind/priority/timestamps
+    list — so bulk note injection can't overflow an agent's context. Callers
+    that actually render note bodies (dashboard notes view, handoff, planner
+    context) pass ``bodies=True``; agents fetch a single body on demand via
+    ``read_note(slug)`` → ``get_project_note_by_slug``.
+
+    The ``query`` filter always searches the body even when bodies are omitted
+    from the result — the search happens in SQL, the body just isn't returned.
+
+    9fa119dd — ``limit``/``offset`` add SQL LIMIT/OFFSET paging (clamped to
+    1..500) mirroring get_sprint_items_page. ``limit=None`` (the default) keeps
+    the legacy "return every matching row" behaviour for existing callers.
+    """
+    where, params = _project_notes_where(db, project_id, tag, query)
+    cols = _project_notes_cols(bodies)
+    sql = f"SELECT {cols} FROM project_notes WHERE {where} ORDER BY created_at DESC"
+    if limit is not None:
+        limit = max(1, min(int(limit), 500))
+        offset = max(0, int(offset))
+        sql += " LIMIT ? OFFSET ?"
+        params = [*params, limit, offset]
+    async with db.execute(sql, params or None) as cur:
         rows = await cur.fetchall()
     return [_row_to_dict(r) for r in rows if r is not None]  # type: ignore[misc]
+
+
+async def get_project_notes_page(
+    db: aiosqlite.Connection,
+    project_id: str,
+    tag: str | None = None,
+    query: str | None = None,
+    bodies: bool = False,
+    limit: int = 100,
+    cursor: int = 0,
+) -> dict[str, Any]:
+    """9fa119dd — one cursor page of project notes (newest first) for the
+    dashboard's "Load More" notes list.
+
+    Mirrors get_sprint_items_page's offset paging, but returns the
+    cursor envelope the dashboard / get_notes tool consume::
+
+        {"notes": [...], "has_more": bool, "next_cursor": int | None}
+
+    The cursor is the next offset (notes are ordered ``created_at DESC`` with no
+    stable secondary key, so an offset cursor is the consistent mechanism — same
+    as sprint items / tasks). One extra row is fetched internally to compute
+    ``has_more`` without a second COUNT query; ``next_cursor`` is the offset to
+    pass back for the following page, or ``None`` when the list is exhausted.
+
+    ``tag``, ``query`` and ``bodies`` behave exactly as in get_project_notes.
+    ``limit`` is clamped to 1..500.
+    """
+    limit = max(1, min(int(limit), 500))
+    cursor = max(0, int(cursor))
+    # Fetch limit+1: the extra row tells us another page exists without COUNT.
+    # Build the query directly (not via get_project_notes) so the +1 probe row
+    # isn't lost to that function's own 500-row clamp at the limit==500 boundary.
+    where, params = _project_notes_where(db, project_id, tag, query)
+    cols = _project_notes_cols(bodies)
+    async with db.execute(
+        f"SELECT {cols} FROM project_notes WHERE {where} "
+        "ORDER BY created_at DESC LIMIT ? OFFSET ?",
+        [*params, limit + 1, cursor],
+    ) as cur:
+        raw = await cur.fetchall()
+    rows = [_row_to_dict(r) for r in raw if r is not None]  # type: ignore[misc]
+    has_more = len(rows) > limit
+    notes = rows[:limit]
+    next_cursor = cursor + len(notes) if has_more else None
+    return {"notes": notes, "has_more": has_more, "next_cursor": next_cursor}
 
 
 async def get_project_note_by_slug(

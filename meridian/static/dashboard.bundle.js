@@ -4662,6 +4662,21 @@ project_id = "${displayPid}"`;
     };
     const noteTags = (n) => String(n.tags || "").split(",").map((t) => t.trim()).filter(Boolean);
     let allNotes = [];
+    const NOTES_PAGE = 100;
+    let nextCursor = 0;
+    let hasMore = false;
+    const renderLoadMore = () => {
+      const existing = document.getElementById(`notes-load-more-${projectId}`);
+      if (existing) existing.remove();
+      if (!hasMore) return;
+      const btn = document.createElement("button");
+      btn.id = `notes-load-more-${projectId}`;
+      btn.className = "secondary";
+      btn.style = "width:100%;margin-top:8px;padding:5px;font-size:11px;font-family:var(--font-mono)";
+      btn.textContent = `Load ${NOTES_PAGE} more \u2193`;
+      btn.onclick = () => loadMore(btn);
+      body.appendChild(btn);
+    };
     const refreshTagOptions = () => {
       if (!tagSelect) return;
       const prev = tagSelect.value;
@@ -4698,6 +4713,7 @@ ${n.tags || ""}`.toLowerCase();
       if (!visible.length) {
         const reason = allNotes.length ? `(no notes match \u2014 clear the search/tag filter${!includeAuto ? " or tick \u201Csummaries\u201D" : ""})` : `(no notes yet \u2014 use the form below or <code>add_note</code> MCP tool)`;
         body.innerHTML = `<div style="color:var(--muted);padding:10px;text-align:center;border:1px dashed var(--border);border-radius:4px">${reason}</div>`;
+        renderLoadMore();
         return;
       }
       body.innerHTML = visible.map((n) => {
@@ -4735,11 +4751,41 @@ ${n.tags || ""}`.toLowerCase();
           }
         };
       });
+      renderLoadMore();
+    };
+    const loadMore = async (btn) => {
+      if (btn) {
+        btn.disabled = true;
+        btn.textContent = "loading\u2026";
+      }
+      try {
+        const page = await projectApi(
+          projectId,
+          `/projects/${projectId}/notes?paginate=true&limit=${NOTES_PAGE}&cursor=${nextCursor}`
+        ) || {};
+        allNotes = [...allNotes, ...page.notes || []];
+        hasMore = !!page.has_more;
+        nextCursor = page.next_cursor != null ? page.next_cursor : nextCursor;
+        refreshTagOptions();
+        applyFilters();
+      } catch (e) {
+        if (btn) {
+          btn.disabled = false;
+          btn.textContent = `Load ${NOTES_PAGE} more \u2193 (retry)`;
+        }
+        toast("load more failed: " + e.message, true);
+      }
     };
     const load = async () => {
       body.innerHTML = `<div class="empty" style="color:var(--muted)">loading notes\u2026</div>`;
       try {
-        allNotes = await projectApi(projectId, `/projects/${projectId}/notes`) || [];
+        const page = await projectApi(
+          projectId,
+          `/projects/${projectId}/notes?paginate=true&limit=${NOTES_PAGE}&cursor=0`
+        ) || {};
+        allNotes = page.notes || [];
+        hasMore = !!page.has_more;
+        nextCursor = page.next_cursor != null ? page.next_cursor : 0;
         refreshTagOptions();
         applyFilters();
       } catch (e) {

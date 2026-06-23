@@ -239,12 +239,17 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "list, then call read_note(project_id, slug) to fetch one note's full "
         "body on demand. Optional ?tag substring filter and ?query full-text "
         "search (matches title+body even though bodies aren't returned). Pass "
-        "bodies=true only when you truly need every body inline.",
+        "bodies=true only when you truly need every body inline. Pagination: "
+        "pass limit (default 100, max 500) and/or cursor to get a "
+        "{notes, has_more, next_cursor} envelope, then re-call with "
+        "cursor=next_cursor for the next page; omit both for the full list.",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"},
          "tag": {"type": "string"},
          "query": {"type": "string", "description": "Text search across note title and body (case-insensitive)."},
-         "bodies": {"type": "boolean", "description": "Default false. true returns full note bodies inline (legacy behavior) — usually unnecessary; prefer read_note(slug)."}},
+         "bodies": {"type": "boolean", "description": "Default false. true returns full note bodies inline (legacy behavior) — usually unnecessary; prefer read_note(slug)."},
+         "limit": {"type": "integer", "description": "Page size (default 100, clamped 1..500). Passing limit or cursor switches the result to the {notes, has_more, next_cursor} pagination envelope."},
+         "cursor": {"type": "integer", "description": "Offset cursor from a prior page's next_cursor. Passing it switches the result to the {notes, has_more, next_cursor} envelope."}},
          "required": ["project_id"]}},
     {"name": "read_note", "description":
         "Read-only: Fetch one project note's full body by its per-project slug "

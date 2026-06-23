@@ -8861,6 +8861,162 @@ async def test_get_project_notes_query_still_searches_body_when_omitted(db):
     assert "body" not in hits[0]
 
 
+# ---------------------------------------------------------------------------
+# 9fa119dd — notes pagination (cursor "Load More", mirrors sprint-items paging)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_get_project_notes_limit_and_offset(db):
+    """9fa119dd — get_project_notes respects limit/offset (SQL LIMIT/OFFSET) and
+    pages newest-first with no overlap, mirroring get_sprint_items_page."""
+    p = await db_module.create_project(db, "9fa119dd-limit")
+    for i in range(7):
+        await db_module.add_project_note(db, p["id"], f"note-{i}", f"body-{i}")
+    page1 = await db_module.get_project_notes(db, p["id"], limit=5, offset=0)
+    page2 = await db_module.get_project_notes(db, p["id"], limit=5, offset=5)
+    assert len(page1) == 5 and len(page2) == 2
+    # No overlap, no gap: the two pages together cover all 7 distinct notes.
+    ids1 = {n["id"] for n in page1}
+    ids2 = {n["id"] for n in page2}
+    assert ids1.isdisjoint(ids2)
+    assert len(ids1 | ids2) == 7
+    # limit=None keeps the legacy "every row" behaviour for existing callers.
+    everything = await db_module.get_project_notes(db, p["id"])
+    assert len(everything) == 7
+
+
+@pytest.mark.asyncio
+async def test_get_project_notes_limit_clamped(db):
+    """9fa119dd — limit is clamped to 1..500 (matches get_sprint_items_page)."""
+    p = await db_module.create_project(db, "9fa119dd-clamp")
+    for i in range(3):
+        await db_module.add_project_note(db, p["id"], f"n{i}", "b")
+    # limit below 1 clamps up to 1.
+    assert len(await db_module.get_project_notes(db, p["id"], limit=0)) == 1
+    assert len(await db_module.get_project_notes(db, p["id"], limit=-9)) == 1
+    # Absurdly large limit clamps to 500 but still returns all rows present.
+    assert len(await db_module.get_project_notes(db, p["id"], limit=99999)) == 3
+
+
+@pytest.mark.asyncio
+async def test_get_project_notes_page_cursor_walk(db):
+    """9fa119dd — get_project_notes_page returns the {notes, has_more,
+    next_cursor} envelope; the cursor walks the whole list with no overlap/gap
+    and terminates (has_more False, next_cursor None) on the last page."""
+    p = await db_module.create_project(db, "9fa119dd-cursor")
+    for i in range(5):
+        await db_module.add_project_note(db, p["id"], f"item-{i}", f"b-{i}")
+    first = await db_module.get_project_notes_page(db, p["id"], limit=2, cursor=0)
+    assert len(first["notes"]) == 2
+    assert first["has_more"] is True
+    assert first["next_cursor"] == 2
+    second = await db_module.get_project_notes_page(
+        db, p["id"], limit=2, cursor=first["next_cursor"]
+    )
+    assert len(second["notes"]) == 2 and second["has_more"] is True
+    assert second["next_cursor"] == 4
+    third = await db_module.get_project_notes_page(
+        db, p["id"], limit=2, cursor=second["next_cursor"]
+    )
+    assert len(third["notes"]) == 1
+    assert third["has_more"] is False
+    assert third["next_cursor"] is None
+    # Walking the cursor visited every note exactly once (no overlap/gap).
+    seen = [n["id"] for pg in (first, second, third) for n in pg["notes"]]
+    assert len(seen) == 5 and len(set(seen)) == 5
+
+
+@pytest.mark.asyncio
+async def test_get_project_notes_page_default_limit_is_100(db):
+    """9fa119dd — the page default caps at 100 with has_more when more exist."""
+    p = await db_module.create_project(db, "9fa119dd-default")
+    for i in range(101):
+        await db_module.add_project_note(db, p["id"], f"n{i:03d}", "b")
+    page = await db_module.get_project_notes_page(db, p["id"])
+    assert len(page["notes"]) == 100
+    assert page["has_more"] is True
+    assert page["next_cursor"] == 100
+    rest = await db_module.get_project_notes_page(db, p["id"], cursor=100)
+    assert len(rest["notes"]) == 1 and rest["has_more"] is False
+
+
+@pytest.mark.asyncio
+async def test_get_project_notes_page_respects_filters(db):
+    """9fa119dd — tag/query filters apply before paging; bodies flag honoured."""
+    p = await db_module.create_project(db, "9fa119dd-filter")
+    await db_module.add_project_note(db, p["id"], "Keep A", "needle one", tags="keep")
+    await db_module.add_project_note(db, p["id"], "Drop B", "unrelated", tags="drop")
+    await db_module.add_project_note(db, p["id"], "Keep C", "needle two", tags="keep")
+    tagged = await db_module.get_project_notes_page(db, p["id"], tag="keep", limit=10)
+    assert {n["title"] for n in tagged["notes"]} == {"Keep A", "Keep C"}
+    assert tagged["has_more"] is False
+    # query filter + bodies projection round-trip through the page envelope.
+    queried = await db_module.get_project_notes_page(
+        db, p["id"], query="needle two", limit=10, bodies=True
+    )
+    assert len(queried["notes"]) == 1
+    assert queried["notes"][0]["body"] == "needle two"
+
+
+def test_project_notes_paginated_endpoint(client):
+    """9fa119dd — GET /projects/{id}/notes?paginate=true returns the cursor
+    envelope; the cursor fetches the next page; the bare list is unchanged."""
+    pid = client.post("/projects", json={"name": "9fa119dd-route"}).json()["id"]
+    for i in range(3):
+        client.post(f"/projects/{pid}/notes", json={"title": f"t{i}", "body": "b"})
+    j = client.get(f"/projects/{pid}/notes?paginate=true&limit=2&cursor=0").json()
+    assert j["has_more"] is True and j["next_cursor"] == 2 and len(j["notes"]) == 2
+    # Notes carry bodies on the HTTP route (dashboard renders them).
+    assert "body" in j["notes"][0]
+    j2 = client.get(f"/projects/{pid}/notes?paginate=true&limit=2&cursor=2").json()
+    assert len(j2["notes"]) == 1 and j2["has_more"] is False and j2["next_cursor"] is None
+    # No overlap between the two cursor pages.
+    assert {n["id"] for n in j["notes"]}.isdisjoint({n["id"] for n in j2["notes"]})
+    # Without paginate= the legacy bare-list shape is preserved.
+    legacy = client.get(f"/projects/{pid}/notes").json()
+    assert isinstance(legacy, list) and len(legacy) == 3
+
+
+@pytest.mark.asyncio
+async def test_get_notes_mcp_tool_pagination_envelope(db):
+    """9fa119dd — the get_notes MCP tool returns the {notes, has_more,
+    next_cursor} envelope when limit/cursor is passed, and the lightweight bare
+    list (no body) when neither is — mirroring get_sprint_items' MCP behaviour."""
+    import meridian.server as srv
+
+    p = await db_module.create_project(db, "9fa119dd-mcp")
+    pid = p["id"]
+    for i in range(3):
+        await db_module.add_project_note(db, pid, f"note-{i}", f"body-{i}")
+    # Pagination requested → envelope, capped at limit.
+    page = await srv._dispatch_mcp_tool(
+        "get_notes", {"project_id": pid, "limit": 2, "cursor": 0}, db, "/tmp"
+    )
+    assert isinstance(page, dict)
+    assert set(page) >= {"notes", "has_more", "next_cursor"}
+    assert len(page["notes"]) == 2 and page["has_more"] is True and page["next_cursor"] == 2
+    rest = await srv._dispatch_mcp_tool(
+        "get_notes", {"project_id": pid, "limit": 2, "cursor": 2}, db, "/tmp"
+    )
+    assert len(rest["notes"]) == 1 and rest["has_more"] is False
+    # No args → unchanged lightweight bare list (back-compat, no body).
+    listed = await srv._dispatch_mcp_tool("get_notes", {"project_id": pid}, db, "/tmp")
+    assert isinstance(listed, list) and len(listed) == 3
+    assert "body" not in listed[0]
+
+
+def test_get_notes_tool_schema_documents_pagination():
+    """9fa119dd — the canonical get_notes schema exposes limit + cursor and the
+    description mentions the cursor/limit pagination."""
+    from meridian.mcp_tools import _MCP_TOOLS_LIST
+
+    tool = {t["name"]: t for t in _MCP_TOOLS_LIST}["get_notes"]
+    props = tool["inputSchema"]["properties"]
+    assert "limit" in props and "cursor" in props
+    assert "cursor" in tool["description"] and "next_cursor" in tool["description"]
+
+
 @pytest.mark.asyncio
 async def test_get_project_note_by_slug_returns_full_body(db):
     """5a5bba43 — get_project_note_by_slug returns the one full note; wrong slug

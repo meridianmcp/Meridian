@@ -50,6 +50,28 @@ export async function loadNotesTab(projectId) {
     String(n.tags || '').split(',').map(t => t.trim()).filter(Boolean);
 
   let allNotes = [];
+  // 9fa119dd — cursor pagination: the notes list caps at NOTES_PAGE per fetch
+  // and a "Load More" button pulls the next cursor and appends, mirroring the
+  // devlog/tasks Load-More wiring. allNotes accumulates every loaded page so the
+  // client-side search / tag / kind filters keep working over what's loaded.
+  const NOTES_PAGE = 100;
+  let nextCursor = 0;
+  let hasMore = false;
+
+  // Render (or remove) the "Load More" button below the notes list based on the
+  // current hasMore flag — appended after the filtered list each render.
+  const renderLoadMore = () => {
+    const existing = document.getElementById(`notes-load-more-${projectId}`);
+    if (existing) existing.remove();
+    if (!hasMore) return;
+    const btn = document.createElement('button');
+    btn.id = `notes-load-more-${projectId}`;
+    btn.className = 'secondary';
+    btn.style = 'width:100%;margin-top:8px;padding:5px;font-size:11px;font-family:var(--font-mono)';
+    btn.textContent = `Load ${NOTES_PAGE} more ↓`;
+    btn.onclick = () => loadMore(btn);
+    body.appendChild(btn);
+  };
 
   // Rebuild the tag dropdown from whatever tags are present, preserving the
   // current selection if it still exists.
@@ -93,6 +115,7 @@ export async function loadNotesTab(projectId) {
         ? `(no notes match — clear the search/tag filter${!includeAuto ? ' or tick “summaries”' : ''})`
         : `(no notes yet — use the form below or <code>add_note</code> MCP tool)`;
       body.innerHTML = `<div style="color:var(--muted);padding:10px;text-align:center;border:1px dashed var(--border);border-radius:4px">${reason}</div>`;
+      renderLoadMore();
       return;
     }
 
@@ -133,12 +156,42 @@ export async function loadNotesTab(projectId) {
         } catch (e) { toast('delete failed: ' + e.message, true); }
       };
     });
+
+    renderLoadMore();
+  };
+
+  // Fetch the next cursor page and append it to allNotes, then re-render. The
+  // server returns {notes, has_more, next_cursor}; cursor is the next offset.
+  const loadMore = async (btn) => {
+    if (btn) { btn.disabled = true; btn.textContent = 'loading…'; }
+    try {
+      const page = await projectApi(
+        projectId,
+        `/projects/${projectId}/notes?paginate=true&limit=${NOTES_PAGE}&cursor=${nextCursor}`,
+      ) || {};
+      allNotes = [...allNotes, ...(page.notes || [])];
+      hasMore = !!page.has_more;
+      nextCursor = page.next_cursor != null ? page.next_cursor : nextCursor;
+      refreshTagOptions();
+      applyFilters();
+    } catch (e) {
+      if (btn) { btn.disabled = false; btn.textContent = `Load ${NOTES_PAGE} more ↓ (retry)`; }
+      toast('load more failed: ' + e.message, true);
+    }
   };
 
   const load = async () => {
     body.innerHTML = `<div class="empty" style="color:var(--muted)">loading notes…</div>`;
     try {
-      allNotes = await projectApi(projectId, `/projects/${projectId}/notes`) || [];
+      // 9fa119dd — first cursor page. ?paginate=true returns the
+      // {notes, has_more, next_cursor} envelope (vs. the legacy bare list).
+      const page = await projectApi(
+        projectId,
+        `/projects/${projectId}/notes?paginate=true&limit=${NOTES_PAGE}&cursor=0`,
+      ) || {};
+      allNotes = page.notes || [];
+      hasMore = !!page.has_more;
+      nextCursor = page.next_cursor != null ? page.next_cursor : 0;
       refreshTagOptions();
       applyFilters();
     } catch (e) {
