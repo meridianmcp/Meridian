@@ -562,3 +562,48 @@ def test_tunnel_plugins_section_plan_gated_and_collapsible(js):
     # Collapsible <details> card.
     assert "<details class=\"meridian-disclosure\" open" in js or \
            "<details class='meridian-disclosure' open" in js
+
+
+def test_tunnel_plugins_section_has_ux_enhancements(js):
+    """Sprint bca73c3f — the Tunnel Plugins card gains four UX sub-features:
+    (1) explicit reset-confirm dialog, (2) per-plugin live tools dropdown,
+    (3) OS-detected dependency-install cards, (4) a curated installable list."""
+    import re
+
+    # (4) Curated installable plugin list — a module-level constant with real,
+    # well-known MCP servers (name + command + description + docs).
+    assert "_CURATED_TUNNEL_PLUGINS" in js, "curated plugin constant missing"
+    assert "uvx mcp-server-fetch" in js, "curated 'Fetch' command missing"
+    assert "@modelcontextprotocol/server-sequential-thinking" in js, (
+        "curated 'Sequential Thinking' command missing"
+    )
+    # Rendered with a copy-to-clipboard action.
+    assert "navigator.clipboard" in js, "clipboard copy not wired"
+
+    # (2) Per-plugin live tools dropdown — JSON-RPC tools/list against the slot's
+    # MCP proxy at /<slot>/mcp/<tenantId>/mcp, parsed JSON-or-SSE like the code tab.
+    assert "method: 'tools/list'" in js, "tools/list JSON-RPC call missing"
+    assert re.search(r"`/\$\{slot\}/mcp/\$\{tenantId\}/mcp`", js), (
+        "per-slot MCP proxy URL (/<slot>/mcp/<tenantId>/mcp) not constructed"
+    )
+    # Tenant id sourced from /me (reused across slots), and the live tool names
+    # rendered from result.tools.
+    assert "api('/me')" in js, "tenant id must come from /me"
+    assert "result.tools" in js or "result && parsed.result.tools" in js or \
+           "parsed.result && parsed.result.tools" in js, "tool list not read from result.tools"
+    # Graceful 'not connected' state when the slot isn't live.
+    assert "not connected — start the tunnel" in js, "missing inactive-slot message"
+
+    # (3) OS-detected install command cards — navigator-based detection + the
+    # winget / brew install one-liners for uv and Node.js.
+    assert "_detectTunnelOs" in js, "OS detection helper missing"
+    assert "navigator.userAgent" in js and "navigator.platform" in js, (
+        "OS detection must read navigator.userAgent / navigator.platform"
+    )
+    assert "winget install --id=astral-sh.uv -e" in js, "Windows uv install cmd missing"
+    assert "winget install OpenJS.NodeJS -e" in js, "Windows Node install cmd missing"
+    assert "brew install uv" in js and "brew install node" in js, "macOS install cmds missing"
+    assert "https://astral.sh/uv/install.sh" in js, "Linux uv install cmd missing"
+
+    # (1) Reset still guards with a confirm() dialog (not regressed).
+    assert "confirm(" in js, "reset confirmation dialog regressed"

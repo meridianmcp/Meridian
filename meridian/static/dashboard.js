@@ -1163,6 +1163,71 @@ async function loadExecutorRulesSection(projectId) {
 // only used to locate the settings DOM host.
 const _TUNNEL_DEFAULT_PORTS = { fs: 8808, code: 8809, extract: 8810, ppt: 8811, word: 8812 };
 
+// Curated, well-known MCP servers a user can drop into a tunnel slot's command.
+// Copy-to-clipboard for now (one-click custom-slot install lands in a later
+// sprint). Commands use the canonical `uvx` / `npx -y` launchers the tunnel
+// already knows how to spawn.
+const _CURATED_TUNNEL_PLUGINS = [
+  { name: 'Sequential Thinking', command: 'npx -y @modelcontextprotocol/server-sequential-thinking', description: 'Structured step-by-step reasoning', docs: 'https://github.com/modelcontextprotocol/servers' },
+  { name: 'Fetch', command: 'uvx mcp-server-fetch', description: 'Fetch & convert web pages to markdown', docs: 'https://github.com/modelcontextprotocol/servers' },
+  { name: 'Git', command: 'uvx mcp-server-git', description: 'Read/search/manipulate Git repos', docs: 'https://github.com/modelcontextprotocol/servers' },
+  { name: 'Time', command: 'uvx mcp-server-time', description: 'Time & timezone conversion', docs: 'https://github.com/modelcontextprotocol/servers' },
+  { name: 'Memory', command: 'npx -y @modelcontextprotocol/server-memory', description: 'Knowledge-graph persistent memory', docs: 'https://github.com/modelcontextprotocol/servers' },
+];
+
+// Detect the viewer's OS so we can surface the right dependency-install commands
+// for the two launchers tunnel plugins use (uv → uvx, Node → npx). Returns one
+// of 'windows' | 'macos' | 'linux' (best-effort; defaults to 'linux').
+function _detectTunnelOs() {
+  const ua = (navigator.userAgent || '') + ' ' + (navigator.platform || '');
+  if (/win/i.test(ua)) return 'windows';
+  if (/mac|darwin|iphone|ipad/i.test(ua)) return 'macos';
+  return 'linux';
+}
+
+// uv (powers `uvx`) + Node.js (powers `npx`) install one-liners per OS.
+const _TUNNEL_INSTALL_CMDS = {
+  windows: {
+    label: 'Windows',
+    uv: 'winget install --id=astral-sh.uv -e',
+    node: 'winget install OpenJS.NodeJS -e',
+  },
+  macos: {
+    label: 'macOS',
+    uv: 'brew install uv',
+    node: 'brew install node',
+  },
+  linux: {
+    label: 'Linux',
+    uv: 'curl -LsSf https://astral.sh/uv/install.sh | sh',
+    node: 'sudo apt-get install -y nodejs npm',
+  },
+};
+
+// Copy text to the clipboard with a graceful fallback for non-secure contexts
+// or browsers without the async Clipboard API.
+async function _tunnelCopyToClipboard(text) {
+  try {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      await navigator.clipboard.writeText(text);
+      return true;
+    }
+  } catch (_) { /* fall through to legacy path */ }
+  try {
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.style.position = 'fixed';
+    ta.style.opacity = '0';
+    document.body.appendChild(ta);
+    ta.select();
+    const ok = document.execCommand('copy');
+    document.body.removeChild(ta);
+    return ok;
+  } catch (_) {
+    return false;
+  }
+}
+
 async function loadTunnelPluginsSection(projectId) {
   const host = document.getElementById(`settings-body-${projectId}`);
   if (!host) return;
@@ -1209,8 +1274,70 @@ async function loadTunnelPluginsSection(projectId) {
               title="local proxy port"
               style="width:74px;box-sizing:border-box;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:5px 7px;outline:none">
           </div>
+          <details class="tp-tools" data-slot="${escapeHtml(p.slot)}" data-loaded="0" style="margin-top:6px">
+            <summary style="cursor:pointer;list-style:none;font-size:10px;color:var(--accent);user-select:none">&#9656; tools</summary>
+            <div class="tp-tools-body" style="margin-top:5px;font-size:10px;color:var(--muted);font-family:var(--font-mono)">&hellip;</div>
+          </details>
         </div>`;
     }).join('');
+
+    const detectedOs = _detectTunnelOs();
+    const installCard = (label, cmds, prominent) => `
+      <div style="border:1px solid var(--border);border-radius:4px;padding:8px;margin-bottom:6px;background:var(--surface-1)${prominent ? '' : ';opacity:.85'}">
+        <div style="font-size:10px;color:var(--text);font-weight:600;margin-bottom:6px">${escapeHtml(label)}${prominent ? ' <span style="color:var(--muted);font-weight:400">(detected)</span>' : ''}</div>
+        ${[['uv', 'powers uvx plugins', cmds.uv], ['Node.js', 'powers npx plugins', cmds.node]].map(([dep, note, command]) => `
+          <div style="margin-bottom:6px">
+            <div style="font-size:9px;color:var(--muted);margin-bottom:3px">${escapeHtml(dep)} <span style="opacity:.8">— ${escapeHtml(note)}</span></div>
+            <div style="display:flex;gap:6px;align-items:center">
+              <code style="flex:1;box-sizing:border-box;background:var(--surface-2);border:1px solid var(--border);border-radius:4px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:4px 7px;overflow-x:auto;white-space:nowrap">${escapeHtml(command)}</code>
+              <button class="secondary tp-copy" data-copy="${escapeHtml(command)}" style="padding:2px 8px;font-size:10px;flex-shrink:0">Copy</button>
+            </div>
+          </div>`).join('')}
+      </div>`;
+
+    const otherOsCards = Object.keys(_TUNNEL_INSTALL_CMDS)
+      .filter((k) => k !== detectedOs)
+      .map((k) => installCard(_TUNNEL_INSTALL_CMDS[k].label, _TUNNEL_INSTALL_CMDS[k], false))
+      .join('');
+
+    const installSection = `
+      <details style="margin-top:8px;border:1px solid var(--border);border-radius:4px;background:var(--surface-2);padding:0">
+        <summary style="cursor:pointer;list-style:none;padding:6px 8px;font-size:10px;font-weight:600;color:var(--accent)">&#9656; Install dependencies</summary>
+        <div style="padding:0 8px 8px">
+          <div style="font-size:10px;color:var(--muted);margin-bottom:8px;line-height:1.5">
+            Tunnel plugins launch via <code>uvx</code> (uv) and <code>npx</code> (Node.js). Install whichever a plugin's command needs.
+          </div>
+          ${installCard(_TUNNEL_INSTALL_CMDS[detectedOs].label, _TUNNEL_INSTALL_CMDS[detectedOs], true)}
+          <details style="margin-top:2px">
+            <summary style="cursor:pointer;list-style:none;font-size:10px;color:var(--muted)">&#9656; other platforms</summary>
+            <div style="margin-top:6px">${otherOsCards}</div>
+          </details>
+        </div>
+      </details>`;
+
+    const curatedRows = _CURATED_TUNNEL_PLUGINS.map((c) => `
+      <div style="border:1px solid var(--border);border-radius:4px;padding:8px;margin-bottom:6px;background:var(--surface-1)">
+        <div style="display:flex;align-items:baseline;gap:6px;flex-wrap:wrap;margin-bottom:4px">
+          <span style="font-size:11px;color:var(--text);font-weight:600">${escapeHtml(c.name)}</span>
+          <a href="${escapeHtml(c.docs)}" target="_blank" rel="noopener" style="font-size:9px;color:var(--accent);text-decoration:none">docs &#8599;</a>
+        </div>
+        <div style="font-size:10px;color:var(--muted);margin-bottom:5px">${escapeHtml(c.description)}</div>
+        <div style="display:flex;gap:6px;align-items:center">
+          <code style="flex:1;box-sizing:border-box;background:var(--surface-2);border:1px solid var(--border);border-radius:4px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:4px 7px;overflow-x:auto;white-space:nowrap">${escapeHtml(c.command)}</code>
+          <button class="secondary tp-copy" data-copy="${escapeHtml(c.command)}" style="padding:2px 8px;font-size:10px;flex-shrink:0">Copy command</button>
+        </div>
+      </div>`).join('');
+
+    const browseSection = `
+      <details style="margin-top:8px;border:1px solid var(--border);border-radius:4px;background:var(--surface-2);padding:0">
+        <summary style="cursor:pointer;list-style:none;padding:6px 8px;font-size:10px;font-weight:600;color:var(--accent)">&#9656; Browse plugins</summary>
+        <div style="padding:0 8px 8px">
+          <div style="font-size:10px;color:var(--muted);margin-bottom:8px;line-height:1.5">
+            Well-known MCP servers. Copy a command and paste it into a slot above to swap that slot's launcher.
+          </div>
+          ${curatedRows}
+        </div>
+      </details>`;
 
     section.innerHTML = `
       <details class="meridian-disclosure" open style="border:1px solid var(--border);border-radius:6px;background:var(--surface-2);padding:0">
@@ -1227,6 +1354,8 @@ async function loadTunnelPluginsSection(projectId) {
         <button class="primary admin-only" id="tp-save-${projectId}" style="padding:2px 10px;font-size:10px">Save</button>
       </div>
       <div id="tp-status-${projectId}" style="font-size:10px;color:var(--muted);margin-top:4px;text-align:right"></div>
+      ${installSection}
+      ${browseSection}
       </div>
       </details>`;
 
@@ -1259,13 +1388,87 @@ async function loadTunnelPluginsSection(projectId) {
     };
 
     document.getElementById(`tp-reset-${projectId}`).onclick = async () => {
-      if (!confirm('Clear all tunnel plugin overrides and return to built-in defaults?')) return;
+      if (!confirm('Reset tunnel plugins?\n\nThis clears ALL command and port overrides for every slot and returns them to Meridian\'s built-in defaults. This cannot be undone.')) return;
       try {
         await api('/tunnel/plugins', { method: 'PUT', body: JSON.stringify({ config: [] }) });
         toast('Reset to defaults');
         loadTunnelPluginsSection(projectId);
       } catch (e) { toast('Reset failed: ' + e.message, true); }
     };
+
+    // Copy buttons (install commands + curated plugin commands).
+    section.querySelectorAll('.tp-copy').forEach((btn) => {
+      btn.addEventListener('click', async () => {
+        const ok = await _tunnelCopyToClipboard(btn.dataset.copy || '');
+        if (ok) {
+          const prev = btn.textContent;
+          btn.textContent = 'Copied';
+          setTimeout(() => { btn.textContent = prev; }, 1200);
+        } else {
+          toast('Copy failed — select and copy manually', true);
+        }
+      });
+    });
+
+    // Per-plugin live tools dropdown. Lazy-load the slot's tool manifest the
+    // first time its <details> is expanded; reuse one /me lookup across slots.
+    let _tenantIdPromise = null;
+    const _getTenantId = () => {
+      if (!_tenantIdPromise) {
+        _tenantIdPromise = api('/me').then((m) => (m && m.tenant_id) || null).catch(() => null);
+      }
+      return _tenantIdPromise;
+    };
+
+    section.querySelectorAll('.tp-tools').forEach((det) => {
+      det.addEventListener('toggle', async () => {
+        if (!det.open || det.dataset.loaded === '1') return;
+        det.dataset.loaded = '1';
+        const slot = det.dataset.slot;
+        const bodyEl = det.querySelector('.tp-tools-body');
+        if (!bodyEl) return;
+        // Not active? Don't even bother hitting the proxy.
+        if (!active[slot]) {
+          bodyEl.innerHTML = '<span style="color:var(--muted)">not connected — start the tunnel</span>';
+          det.dataset.loaded = '0';
+          return;
+        }
+        bodyEl.textContent = 'loading…';
+        try {
+          const tenantId = await _getTenantId();
+          if (!tenantId) throw new Error('no tenant');
+          const r = await fetch(`/${slot}/mcp/${tenantId}/mcp`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'Accept': 'application/json, text/event-stream' },
+            body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} }),
+          });
+          if (!r.ok) throw new Error(`HTTP ${r.status}`);
+          const text = await r.text();
+          let parsed = null;
+          if (text.trim().startsWith('{')) {
+            parsed = JSON.parse(text);
+          } else {
+            for (const line of text.split('\n')) {
+              if (line.startsWith('data:')) {
+                try { parsed = JSON.parse(line.slice(5).trim()); } catch (_) {}
+              }
+            }
+          }
+          if (!parsed) throw new Error('empty response');
+          if (parsed.error) throw new Error(parsed.error.message || String(parsed.error));
+          const tools = (parsed.result && parsed.result.tools) || [];
+          if (!tools.length) {
+            bodyEl.innerHTML = '<span style="color:var(--muted)">no tools reported</span>';
+            return;
+          }
+          bodyEl.innerHTML = `<div style="color:var(--muted);margin-bottom:3px">${tools.length} tool${tools.length !== 1 ? 's' : ''}</div>` +
+            tools.map((t) => `<div style="color:var(--text)">${escapeHtml(t && t.name || String(t))}</div>`).join('');
+        } catch (e) {
+          bodyEl.innerHTML = `<span style="color:var(--muted)">not connected — start the tunnel</span>`;
+          det.dataset.loaded = '0';
+        }
+      });
+    });
   } catch (e) {
     section.innerHTML = `<div class="empty" style="color:var(--error)">Failed to load tunnel plugins: ${escapeHtml(e.message)}</div>`;
   }
