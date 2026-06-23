@@ -4202,13 +4202,99 @@ async def hooks_session_start(body: dict[str, Any], request: Request) -> dict[st
     return {"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": additional_context}}
 
 
+def _normalize_hook_cwd_path(path: str) -> str:
+    """Normalize a hook cwd to the canonical form used in repo_paths matching.
+
+    Mirrors the nested ``_normalize_hook_cwd`` in ``hooks_session_start`` so the
+    stop hook resolves a project from a cwd the exact same way session-start
+    does (WSL /mnt/c/... → C:/..., backslashes → forward slashes, no trailing /).
+    """
+    value = (path or "").strip().replace("\\", "/")
+    m = re.match(r"^/mnt/([a-zA-Z])(?:/(.*))?$", value)
+    if m:
+        drive = m.group(1).upper()
+        rest = (m.group(2) or "").strip("/")
+        value = f"{drive}:/{rest}" if rest else f"{drive}:/"
+    return value.rstrip("/")
+
+
+async def _resolve_hook_project_id(
+    db: Any, cwd: str, hostname: str
+) -> str | None:
+    """Resolve a project id from a hook's cwd/hostname (best-effort, never raises).
+
+    Mirrors the cwd/hostname routing the SessionStart hook uses so the Stop
+    hook can target the same project when no explicit ``project_id`` is given:
+
+    * Pass 1 — exact cwd+hostname match in a project's ``repo_paths`` (and the
+      legacy single ``repo_path``), so cwd routing wins.
+    * Pass 2 — hostname registered in any project's machine ``hostnames`` list.
+    * Fallback — if exactly one project exists, route to it.
+
+    Returns the project id, or ``None`` when nothing matches.
+    """
+    norm_cwd = _normalize_hook_cwd_path(cwd).lower()
+    norm_hn = (hostname or "").strip().lower()
+    if not norm_cwd and not norm_hn:
+        return None
+    try:
+        projects = await db_module.list_projects(db)
+    except Exception:  # noqa: BLE001
+        return None
+    if not projects:
+        return None
+
+    def _cfg(p: dict[str, Any]) -> dict[str, Any]:
+        cfg = p.get("executor_config") or {}
+        if isinstance(cfg, str):
+            try:
+                cfg = json.loads(cfg)
+            except Exception:  # noqa: BLE001
+                cfg = {}
+        return cfg if isinstance(cfg, dict) else {}
+
+    # Pass 1: exact cwd (+ optional hostname) match in repo_paths / legacy repo_path.
+    if norm_cwd:
+        for p in projects:
+            cfg = _cfg(p)
+            for rp in (cfg.get("repo_paths") or []):
+                rp_cwd = _normalize_hook_cwd_path(rp.get("cwd", "")).lower()
+                rp_host = (rp.get("hostname") or "").lower()
+                if rp_cwd == norm_cwd and (not rp_host or rp_host == norm_hn):
+                    return p["id"]
+            legacy_rp = (cfg.get("repo_path") or "").strip()
+            if legacy_rp and _normalize_hook_cwd_path(legacy_rp).lower() == norm_cwd:
+                return p["id"]
+    # Pass 2: hostname registered at machine level (hostnames list).
+    if norm_hn:
+        for p in projects:
+            cfg = _cfg(p)
+            if any((h.get("hostname") or "").lower() == norm_hn for h in (cfg.get("hostnames") or [])):
+                return p["id"]
+    # Fallback: a single-project workspace is unambiguous.
+    if len(projects) == 1:
+        return projects[0]["id"]
+    return None
+
+
 @app.post("/hooks/stop")
 async def hooks_stop(body: dict[str, Any], request: Request) -> dict[str, Any]:
     """Claude Code / Codex Stop hook.
 
-    Accepts {project_id, session_id?}. Fires auto_capture + delta handoff
-    and returns immediately. Fire-and-forget — the agent does not wait for
-    this to complete before exiting.
+    Accepts {project_id?, session_id?, cwd?, hostname?}. Fires auto_capture +
+    a delta handoff so a delta is produced even when the executor disconnects
+    without calling generate_handoff itself.
+
+    Best-effort / non-blocking: this never raises out and never returns 4xx/5xx
+    for a missing session — a missing/unresolvable session yields
+    ``{"ok": true, "handoff": null, "reason": "no session"}`` and any
+    generate_handoff failure yields ``{"ok": true, "handoff": null, "error": ...}``
+    (both 200). The agent does not wait for this before exiting.
+
+    Resolution: an explicit ``session_id`` is preferred; otherwise the
+    most-recent active session for the project (resolved from ``project_id`` or,
+    failing that, the ``cwd``/``hostname`` the same way the SessionStart hook
+    routes) is handed off.
 
     Hosted callers can authenticate with Authorization: Bearer sk_meridian_...
     to route directly to their tenant DB. Local/browser-session behavior is
@@ -4216,26 +4302,55 @@ async def hooks_stop(body: dict[str, Any], request: Request) -> dict[str, Any]:
     """
     project_id = (body.get("project_id") or "").strip()
     session_id = (body.get("session_id") or "").strip() or None
-    if not project_id:
-        return {"ok": False, "error": "project_id required"}
+    hook_cwd = (body.get("cwd") or "").strip()
+    hook_hostname = (body.get("hostname") or "").strip()
+    # Resolve the tenant DB first so a bad Bearer token still 401s (hosted mode);
+    # everything after this point is best-effort and only ever returns 200.
     db = await _resolve_hook_db(request)
-    if session_id:
+    # No explicit project — try to route by cwd/hostname like session-start does.
+    if not project_id:
+        project_id = await _resolve_hook_project_id(db, hook_cwd, hook_hostname) or ""
+    if not project_id:
+        # Nothing identifies a project (no id, no cwd/hostname match) — can't act.
+        return {"ok": False, "error": "project_id required"}
+    # Resolve the session to hand off: explicit id wins, else most-recent active.
+    if not session_id:
         try:
-            await db_module.auto_capture_session(db, project_id, session_id)
+            active = await db_module.get_sessions(db, project_id, active_only=True)
+            if active:
+                session_id = active[0].get("id") or None
         except Exception:  # noqa: BLE001
-            pass
+            session_id = None
+    if not session_id:
+        # Best-effort: no session to summarise — never an error.
+        return {"ok": True, "handoff": None, "reason": "no session"}
+    # Bucket done tasks + finalize any session markdown (both guarded).
+    try:
+        await db_module.auto_capture_session(db, project_id, session_id)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
         await _finalize_session_md(db, project_id, session_id)
+    except Exception:  # noqa: BLE001
+        pass
+    # Produce the delta handoff inline but fully guarded — any failure (and the
+    # timeout) returns cleanly with handoff null so the hook never blocks/errors.
     try:
         from . import handoff as handoff_module_local
-        await asyncio.wait_for(
+        path, _content = await asyncio.wait_for(
             handoff_module_local.generate_handoff(
                 db, project_id, _data_dir(request), mode="delta", session_id=session_id
             ),
             timeout=20.0,
         )
-    except Exception:  # noqa: BLE001
-        pass
-    return {"ok": True}
+        return {"ok": True, "handoff": {"mode": "delta", "path": path}}
+    except Exception as exc:  # noqa: BLE001
+        import logging as _hook_logging
+        _hook_logging.getLogger("meridian.hooks").info(
+            "hooks/stop delta handoff failed for project=%s session=%s: %r",
+            project_id, session_id, exc,
+        )
+        return {"ok": True, "handoff": None, "error": str(exc)}
 
 
 # ---------------------------------------------------------------------------

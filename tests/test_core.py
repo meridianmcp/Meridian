@@ -8364,6 +8364,123 @@ def test_hooks_session_start_and_stop(client):
     assert r.json()["ok"] is True
 
 
+def _session_id_from_start(start_json: dict) -> str | None:
+    """Pull the full SESSION ID out of a /hooks/session-start response."""
+    ctx = start_json["hookSpecificOutput"]["additionalContext"]
+    for line in ctx.splitlines():
+        if line.startswith("SESSION ID:"):
+            return line.split(":", 1)[1].strip()
+    return None
+
+
+def test_hooks_stop_explicit_session_generates_delta_handoff(client, monkeypatch):
+    """07d62922: POST /hooks/stop with a session_id calls generate_handoff(mode='delta').
+
+    We monkeypatch generate_handoff to capture the mode it's invoked with and
+    confirm the server-side delta is produced even though the executor never
+    called generate_handoff itself.
+    """
+    captured: dict[str, object] = {}
+
+    async def _fake_handoff(db, project_id, output_dir, *, mode="full", session_id=None, **kw):
+        captured["mode"] = mode
+        captured["project_id"] = project_id
+        captured["session_id"] = session_id
+        return ("/tmp/handoff-delta.md", "# delta handoff\n")
+
+    monkeypatch.setattr("meridian.handoff.generate_handoff", _fake_handoff)
+
+    project = client.post("/projects", json={"name": "stop-delta-proj"}).json()
+    start = client.post("/hooks/session-start", json={"project_id": project["id"]}).json()
+    session_id = _session_id_from_start(start)
+    assert session_id
+
+    r = client.post(
+        "/hooks/stop",
+        json={"project_id": project["id"], "session_id": session_id},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ok"] is True
+    assert body["handoff"]["mode"] == "delta"
+    # generate_handoff was actually invoked, with mode='delta' and our session.
+    assert captured["mode"] == "delta"
+    assert captured["project_id"] == project["id"]
+    assert captured["session_id"] == session_id
+
+
+def test_hooks_stop_resolves_most_recent_active_session_without_session_id(client, monkeypatch):
+    """07d62922: with no session_id, /hooks/stop hands off the most-recent active session."""
+    captured: dict[str, object] = {}
+
+    async def _fake_handoff(db, project_id, output_dir, *, mode="full", session_id=None, **kw):
+        captured["mode"] = mode
+        captured["session_id"] = session_id
+        return ("/tmp/handoff-delta.md", "# delta handoff\n")
+
+    monkeypatch.setattr("meridian.handoff.generate_handoff", _fake_handoff)
+
+    project = client.post("/projects", json={"name": "stop-resolve-proj"}).json()
+    start = client.post("/hooks/session-start", json={"project_id": project["id"]}).json()
+    expected_session = _session_id_from_start(start)
+    assert expected_session
+
+    # No session_id supplied — server resolves the active session by project.
+    r = client.post("/hooks/stop", json={"project_id": project["id"]})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ok"] is True
+    assert body["handoff"]["mode"] == "delta"
+    assert captured["mode"] == "delta"
+    assert captured["session_id"] == expected_session
+
+
+def test_hooks_stop_no_resolvable_session_returns_ok_null_handoff(client, monkeypatch):
+    """07d62922: a project with no active session yields ok=true, handoff=null (best-effort)."""
+    called = {"n": 0}
+
+    async def _fake_handoff(*a, **kw):
+        called["n"] += 1
+        return ("/tmp/x.md", "x")
+
+    monkeypatch.setattr("meridian.handoff.generate_handoff", _fake_handoff)
+
+    # Project exists but no session-start ran, so there is no active session.
+    project = client.post("/projects", json={"name": "stop-nosession-proj"}).json()
+    r = client.post("/hooks/stop", json={"project_id": project["id"]})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ok"] is True
+    assert body["handoff"] is None
+    assert body.get("reason") == "no session"
+    # No session → generate_handoff must not be called at all.
+    assert called["n"] == 0
+
+
+def test_hooks_stop_handoff_exception_is_swallowed(client, monkeypatch):
+    """07d62922: generate_handoff raising still yields 200, ok=true, handoff=null."""
+
+    async def _boom(*a, **kw):
+        raise RuntimeError("handoff blew up")
+
+    monkeypatch.setattr("meridian.handoff.generate_handoff", _boom)
+
+    project = client.post("/projects", json={"name": "stop-boom-proj"}).json()
+    start = client.post("/hooks/session-start", json={"project_id": project["id"]}).json()
+    session_id = _session_id_from_start(start)
+    assert session_id
+
+    r = client.post(
+        "/hooks/stop",
+        json={"project_id": project["id"], "session_id": session_id},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ok"] is True
+    assert body["handoff"] is None
+    assert "handoff blew up" in body.get("error", "")
+
+
 def test_hooks_session_start_injects_full_uuid_not_truncated(client):
     """SESSION ID + Top item id in the hook context must be full 36-char UUIDs.
 
