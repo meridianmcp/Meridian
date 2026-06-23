@@ -5795,10 +5795,11 @@ def test_pg_migration_registry_matches_historical_order():
         "_migrate_pg_task_log_kind",
         "_migrate_pg_oauth_refresh_tokens",
         "_migrate_pg_note_slug",
+        "_migrate_pg_decision_priority_edit_log",
     ]
     # No duplicates across the three groups.
     allnames = core + hosted + late
-    assert len(allnames) == len(set(allnames)) == 50
+    assert len(allnames) == len(set(allnames)) == 51
 
 
 def test_default_agent_instructions_has_code_intel_protocol():
@@ -8070,6 +8071,186 @@ async def test_get_pinned_decisions_filters_superseded(db):
     old = next(d for d in all_ if d["title"] == "first truth")
     assert old["status"] == "superseded"
     assert old["superseded_by"] == new["id"]
+
+
+# ---------------------------------------------------------------------------
+# 366317e9 — decision priority field + append-only edit history
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_decision_priority_migration_adds_columns_idempotently(db):
+    """The migration adds priority + edit_log; existing rows default to
+    priority='normal' / edit_log NULL, and re-running is a no-op."""
+    from meridian.db import migrations as _mig
+
+    # Columns are present after init.
+    assert await _mig._column_exists(db, "decisions_pinned", "priority")
+    assert await _mig._column_exists(db, "decisions_pinned", "edit_log")
+
+    p = await db_module.create_project(db, "pri-migrate")
+    d = await db_module.pin_decision(db, p["id"], "t", "b", "TECHNICAL")
+    # Raw row defaults.
+    async with db.execute(
+        "SELECT priority, edit_log FROM decisions_pinned WHERE id = ?", (d["id"],)
+    ) as cur:
+        row = await cur.fetchone()
+    assert (row["priority"] if isinstance(row, dict) else row[0]) == "normal"
+    assert (row["edit_log"] if isinstance(row, dict) else row[1]) is None
+
+    # Idempotent: second run does not raise and columns survive.
+    await _mig._migrate_decision_priority_edit_log(db)
+    assert await _mig._column_exists(db, "decisions_pinned", "priority")
+    assert await _mig._column_exists(db, "decisions_pinned", "edit_log")
+
+
+@pytest.mark.asyncio
+async def test_pin_decision_stores_priority(db):
+    p = await db_module.create_project(db, "pri-store")
+    d = await db_module.pin_decision(
+        db, p["id"], "urgent thing", "do it", "TECHNICAL", priority="urgent"
+    )
+    assert d["priority"] == "urgent"
+    assert d["edit_log"] == []
+
+
+@pytest.mark.asyncio
+async def test_pin_decision_defaults_priority_normal(db):
+    p = await db_module.create_project(db, "pri-default")
+    d = await db_module.pin_decision(db, p["id"], "t", "b", "TECHNICAL")
+    assert d["priority"] == "normal"
+
+
+@pytest.mark.asyncio
+async def test_pin_decision_invalid_priority_normalized(db):
+    """An invalid priority is coerced to 'normal' rather than rejected."""
+    p = await db_module.create_project(db, "pri-invalid")
+    d = await db_module.pin_decision(
+        db, p["id"], "t", "b", "TECHNICAL", priority="EXTREME"
+    )
+    assert d["priority"] == "normal"
+
+
+@pytest.mark.asyncio
+async def test_update_decision_priority(db):
+    p = await db_module.create_project(db, "pri-update")
+    d = await db_module.pin_decision(db, p["id"], "t", "b", "TECHNICAL")
+    assert d["priority"] == "normal"
+    updated = await db_module.update_pinned_decision(db, d["id"], priority="low")
+    assert updated["priority"] == "low"
+    # Invalid normalizes to normal.
+    updated = await db_module.update_pinned_decision(db, d["id"], priority="bogus")
+    assert updated["priority"] == "normal"
+
+
+@pytest.mark.asyncio
+async def test_edit_body_appends_previous_to_edit_log(db):
+    """Editing a body snapshots the previous body + ts into edit_log."""
+    p = await db_module.create_project(db, "edit-log")
+    d = await db_module.pin_decision(db, p["id"], "t", "body v1", "TECHNICAL")
+    assert d["edit_log"] == []
+
+    after1 = await db_module.update_pinned_decision(db, d["id"], body="body v2")
+    assert after1["body"] == "body v2"
+    assert len(after1["edit_log"]) == 1
+    assert after1["edit_log"][0]["body"] == "body v1"
+    assert after1["edit_log"][0]["ts"]  # non-empty iso timestamp
+
+
+@pytest.mark.asyncio
+async def test_edit_log_accumulates_append_only(db):
+    """Multiple body edits accumulate; earlier history is never dropped."""
+    p = await db_module.create_project(db, "edit-log-multi")
+    d = await db_module.pin_decision(db, p["id"], "t", "v1", "TECHNICAL")
+    await db_module.update_pinned_decision(db, d["id"], body="v2")
+    await db_module.update_pinned_decision(db, d["id"], body="v3")
+    final = await db_module.update_pinned_decision(db, d["id"], body="v4")
+    bodies = [e["body"] for e in final["edit_log"]]
+    assert bodies == ["v1", "v2", "v3"]
+    assert final["body"] == "v4"
+
+
+@pytest.mark.asyncio
+async def test_edit_log_unchanged_body_not_recorded(db):
+    """Re-saving the same body (or editing only title/priority) does not push
+    a spurious edit_log entry."""
+    p = await db_module.create_project(db, "edit-log-noop")
+    d = await db_module.pin_decision(db, p["id"], "t", "same", "TECHNICAL")
+    after = await db_module.update_pinned_decision(db, d["id"], body="same")
+    assert after["edit_log"] == []
+    after = await db_module.update_pinned_decision(
+        db, d["id"], title="new title", priority="urgent"
+    )
+    assert after["edit_log"] == []
+
+
+@pytest.mark.asyncio
+async def test_get_pinned_decisions_orders_by_priority(db):
+    """get_pinned_decisions returns urgent → normal → low, with parsed edit_log."""
+    p = await db_module.create_project(db, "pri-order")
+    await db_module.pin_decision(db, p["id"], "low one", "b", "TECHNICAL", priority="low")
+    await db_module.pin_decision(db, p["id"], "normal one", "b", "TECHNICAL")
+    await db_module.pin_decision(db, p["id"], "urgent one", "b", "TECHNICAL", priority="urgent")
+    decisions = await db_module.get_pinned_decisions(db, p["id"])
+    assert [d["title"] for d in decisions] == ["urgent one", "normal one", "low one"]
+    # edit_log is always a parsed list.
+    assert all(isinstance(d["edit_log"], list) for d in decisions)
+
+
+@pytest.mark.asyncio
+async def test_supersede_inherits_priority(db):
+    """A superseding decision inherits the old row's priority by default."""
+    p = await db_module.create_project(db, "pri-supersede")
+    d = await db_module.pin_decision(db, p["id"], "old", "b", "TECHNICAL", priority="urgent")
+    new = await db_module.supersede_pinned_decision(db, d["id"], "new", "b2", "TECHNICAL")
+    assert new["priority"] == "urgent"
+
+
+def test_decision_priority_http_round_trip(client):
+    """HTTP create with priority, PATCH to change it, and edit_log via PATCH body."""
+    project = client.post("/projects", json={"name": "pri-http"}).json()
+    r = client.post(
+        f"/projects/{project['id']}/decisions-pinned",
+        json={"title": "p1", "body": "v1", "category": "TECHNICAL", "priority": "urgent"},
+    )
+    assert r.status_code == 201
+    d = r.json()
+    assert d["priority"] == "urgent"
+    assert d["edit_log"] == []
+    # Change priority in place.
+    r = client.patch(
+        f"/projects/{project['id']}/decisions-pinned/{d['id']}",
+        json={"priority": "low"},
+    )
+    assert r.status_code == 200
+    assert r.json()["priority"] == "low"
+    # Edit body → edit_log records the prior body.
+    r = client.patch(
+        f"/projects/{project['id']}/decisions-pinned/{d['id']}",
+        json={"body": "v2"},
+    )
+    assert r.status_code == 200
+    body_json = r.json()
+    assert body_json["body"] == "v2"
+    assert [e["body"] for e in body_json["edit_log"]] == ["v1"]
+
+
+def test_mcp_pin_decision_with_priority(client):
+    """MCP pin_decision accepts priority and get_pinned_decisions returns it ordered."""
+    import json as _json
+    project = client.post("/projects", json={"name": "pri-mcp"}).json()
+    pid = project["id"]
+    _mcp_call(client, "pin_decision", {
+        "project_id": pid, "title": "low", "body": "b", "priority": "low",
+    })
+    _mcp_call(client, "pin_decision", {
+        "project_id": pid, "title": "urgent", "body": "b", "priority": "urgent",
+    })
+    resp = _mcp_call(client, "get_pinned_decisions", {"project_id": pid})
+    assert resp.get("result") is not None, resp
+    payload = _json.loads(resp["result"]["content"][0]["text"])
+    assert [d["title"] for d in payload] == ["urgent", "low"]
+    assert all("edit_log" in d and isinstance(d["edit_log"], list) for d in payload)
 
 
 def test_decisions_pinned_http_round_trip(client):

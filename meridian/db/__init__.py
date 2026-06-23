@@ -248,6 +248,8 @@ CREATE TABLE IF NOT EXISTS decisions_pinned (
     title TEXT NOT NULL,
     body TEXT NOT NULL,
     category TEXT NOT NULL DEFAULT 'TECHNICAL',
+    priority TEXT NOT NULL DEFAULT 'normal',
+    edit_log TEXT,
     status TEXT NOT NULL DEFAULT 'active'
         CHECK (status IN ('active','superseded')),
     superseded_by TEXT REFERENCES decisions_pinned(id),
@@ -724,6 +726,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_task_log_kind(db)
     await _migrate_note_slug(db)
     await _migrate_oauth_refresh_tokens(db)
+    await _migrate_decision_priority_edit_log(db)
     return db
 
 
@@ -5183,6 +5186,45 @@ _SUGGESTED_DECISION_CATEGORIES = {
     "BUSINESS", "PRODUCT", "ARCHITECTURAL",
 }
 
+# 366317e9 — decision priority drives dashboard ordering + context-injection
+# weight. urgent surfaces first, then normal, then low. Rank map is reused by
+# get_pinned_decisions and the handoff/context-block sort keys.
+_DECISION_PRIORITIES = ("urgent", "normal", "low")
+_DECISION_PRIORITY_RANK = {"urgent": 0, "normal": 1, "low": 2}
+
+
+def _normalize_decision_priority(priority: str | None) -> str:
+    """Coerce an arbitrary priority into the {urgent, normal, low} set.
+
+    Unknown/empty values normalize to 'normal' so a bad input never rejects a
+    pin; the dashboard and context injection only understand the three levels.
+    """
+    p = (priority or "").strip().lower()
+    return p if p in _DECISION_PRIORITY_RANK else "normal"
+
+
+def _parse_decision_edit_log(raw: Any) -> list[dict[str, Any]]:
+    """Parse the ``edit_log`` JSON blob into a list. NULL/empty/garbage → []."""
+    if not raw:
+        return []
+    if isinstance(raw, list):
+        return raw
+    try:
+        parsed = json.loads(raw)
+    except (ValueError, TypeError):
+        return []
+    return parsed if isinstance(parsed, list) else []
+
+
+def _hydrate_decision_row(row: Any) -> dict[str, Any] | None:
+    """Row → dict with ``priority`` defaulted and ``edit_log`` parsed to a list."""
+    d = _row_to_dict(row)
+    if d is None:
+        return None
+    d["priority"] = _normalize_decision_priority(d.get("priority"))
+    d["edit_log"] = _parse_decision_edit_log(d.get("edit_log"))
+    return d
+
 
 async def pin_decision(
     db: aiosqlite.Connection,
@@ -5190,6 +5232,7 @@ async def pin_decision(
     title: str,
     body: str,
     category: str = "TECHNICAL",
+    priority: str = "normal",
 ) -> dict[str, Any]:
     """Create a new pinned decision row. Returns the inserted row.
 
@@ -5200,12 +5243,17 @@ async def pin_decision(
 
     category is free-text; suggested values: STRATEGIC, COMPETITIVE, TECHNICAL,
     TACTICAL, BUSINESS, PRODUCT, ARCHITECTURAL.
+
+    priority (366317e9) is one of urgent | normal | low (default normal);
+    invalid values normalize to 'normal'. It weights dashboard ordering and the
+    decisions injected into start_session / generate_handoff context.
     """
     did = _new_id()
+    priority = _normalize_decision_priority(priority)
     await db.execute(
-        "INSERT INTO decisions_pinned (id, project_id, title, body, category) "
-        "VALUES (?, ?, ?, ?, ?)",
-        (did, project_id, title, body, category),
+        "INSERT INTO decisions_pinned (id, project_id, title, body, category, priority) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (did, project_id, title, body, category, priority),
     )
     await db.commit()
     # ITEM 6 — live push so the constitution view refreshes without polling.
@@ -5220,7 +5268,7 @@ async def get_pinned_decision(
         "SELECT * FROM decisions_pinned WHERE id = ?", (decision_id,)
     ) as cur:
         row = await cur.fetchone()
-    return _row_to_dict(row)
+    return _hydrate_decision_row(row)
 
 
 async def get_pinned_decisions(
@@ -5228,7 +5276,12 @@ async def get_pinned_decisions(
     project_id: str,
     include_superseded: bool = False,
 ) -> list[dict[str, Any]]:
-    """Return all pinned decisions for a project, newest first.
+    """Return all pinned decisions for a project, highest priority first.
+
+    Rows are ordered urgent → normal → low, then newest-first within a
+    priority band, so the dashboard and context injection both surface the
+    most important decisions at the top. Each row carries a normalized
+    ``priority`` and a parsed ``edit_log`` list (366317e9).
 
     Defaults to active only — superseded entries stay in history but
     are filtered out of the live constitution view.
@@ -5247,7 +5300,11 @@ async def get_pinned_decisions(
         args = (project_id,)
     async with db.execute(sql, args) as cur:
         rows = await cur.fetchall()
-    return [_row_to_dict(r) for r in rows if r is not None]  # type: ignore[misc]
+    decisions = [_hydrate_decision_row(r) for r in rows if r is not None]
+    # Stable sort by priority rank keeps the SQL newest-first order within each
+    # band. urgent (0) < normal (1) < low (2).
+    decisions.sort(key=lambda d: _DECISION_PRIORITY_RANK.get(d["priority"], 1))  # type: ignore[index,union-attr]
+    return decisions  # type: ignore[return-value]
 
 
 async def update_pinned_decision(
@@ -5259,23 +5316,41 @@ async def update_pinned_decision(
     title: str | None = None,
     status: str | None = None,
     superseded_by: str | None = None,
+    priority: str | None = None,
 ) -> dict[str, Any] | None:
-    """Patch any combination of body / category / title / status / superseded_by.
+    """Patch any combination of body / category / title / status / superseded_by /
+    priority.
 
     Use ``status='superseded'`` + ``superseded_by=<new_id>`` to retire a
     decision while preserving the audit trail. Pass only the fields you
     intend to change; others stay untouched.
+
+    366317e9 — when ``body`` is patched to a *different* value, the previous
+    body is appended to the append-only ``edit_log`` JSON array as
+    ``{"body": <previous body>, "ts": <iso timestamp>}`` BEFORE the row is
+    overwritten. History is never dropped; multiple edits accumulate.
+    ``priority`` is normalized to {urgent, normal, low} (invalid → 'normal').
     """
+    from datetime import datetime, timezone
     existing = await get_pinned_decision(db, decision_id)
     if existing is None:
         return None
+    now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     fields: dict[str, Any] = {}
     if body is not None:
         fields["body"] = body
+        # Append-only edit history: snapshot the prior body before overwriting,
+        # but only when the body actually changed (no-op edits don't pollute it).
+        if body != existing.get("body"):
+            history = _parse_decision_edit_log(existing.get("edit_log"))
+            history.append({"body": existing.get("body"), "ts": now_iso})
+            fields["edit_log"] = json.dumps(history)
     if title is not None:
         fields["title"] = title
     if category is not None:
         fields["category"] = category
+    if priority is not None:
+        fields["priority"] = _normalize_decision_priority(priority)
     if status is not None:
         if status not in ("active", "superseded"):
             raise ValueError("status must be 'active' or 'superseded'")
@@ -5284,8 +5359,7 @@ async def update_pinned_decision(
         fields["superseded_by"] = superseded_by
     if not fields:
         return existing
-    from datetime import datetime, timezone
-    fields["updated_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    fields["updated_at"] = now_iso
     set_clause = ", ".join(f"{k} = ?" for k in fields)
     args = list(fields.values()) + [decision_id]
     await db.execute(
@@ -5301,11 +5375,13 @@ async def supersede_pinned_decision(
     new_title: str,
     new_body: str,
     category: str | None = None,
+    priority: str | None = None,
 ) -> dict[str, Any]:
     """Atomic supersede: create a new active decision and mark the old as superseded.
 
     Returns the new decision row. The old row keeps the back-link via
-    ``superseded_by`` so the dashboard can render the chain.
+    ``superseded_by`` so the dashboard can render the chain. The new row inherits
+    the old decision's priority unless ``priority`` overrides it (366317e9).
     """
     old = await get_pinned_decision(db, old_decision_id)
     if old is None:
@@ -5316,6 +5392,7 @@ async def supersede_pinned_decision(
         new_title,
         new_body,
         category or old.get("category", "TECHNICAL"),
+        priority or old.get("priority", "normal"),
     )
     await update_pinned_decision(
         db, old_decision_id, status="superseded", superseded_by=new["id"]

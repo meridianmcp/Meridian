@@ -10946,6 +10946,12 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
     PRODUCT: "#22d3ee",
     ARCHITECTURAL: "#fb923c"
   };
+  var _DECISION_PRIORITY_COLORS = {
+    urgent: "#f87171",
+    normal: "#94a3b8",
+    low: "#64748b"
+  };
+  var _DECISION_PRIORITY_ORDER = ["urgent", "normal", "low"];
   function renderConstitutionWarning2(projectId) {
     const host = document.getElementById(`constitution-warning-${projectId}`);
     if (!host) return;
@@ -11186,6 +11192,9 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
       host.innerHTML = items.map((d) => {
         const cat = d.category || "TECHNICAL";
         const color = _DECISION_CATEGORY_COLORS[cat] || _DECISION_CATEGORY_COLORS.TECHNICAL;
+        const prio = _DECISION_PRIORITY_ORDER.includes(d.priority) ? d.priority : "normal";
+        const prioColor = _DECISION_PRIORITY_COLORS[prio] || _DECISION_PRIORITY_COLORS.normal;
+        const editCount = Array.isArray(d.edit_log) ? d.edit_log.length : 0;
         const dateStr = (d.created_at || "").slice(0, 10);
         return `<div data-decision-card="${escapeHtml(d.id)}" style="background:var(--surface-2);border:1px solid var(--border);border-left:4px solid ${color};border-radius:4px;padding:10px 12px;margin-bottom:8px">
 
@@ -11195,11 +11204,15 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
 
             <span class="decision-cat-tag" data-id="${escapeHtml(d.id)}" data-cat="${escapeHtml(cat)}" title="Click to change category" style="display:inline-block;background:${color}22;color:${color};font-size:9px;font-weight:700;letter-spacing:.5px;padding:2px 6px;border-radius:3px;flex-shrink:0;cursor:pointer">${escapeHtml(cat)} \u25BE</span>
 
+            <span class="decision-prio-tag" data-id="${escapeHtml(d.id)}" data-prio="${escapeHtml(prio)}" data-project="${escapeHtml(projectId)}" title="Click to change priority (urgent \u2192 normal \u2192 low)" style="display:inline-block;background:${prioColor}22;color:${prioColor};font-size:9px;font-weight:700;letter-spacing:.5px;padding:2px 6px;border-radius:3px;flex-shrink:0;cursor:pointer">${prio === "urgent" ? "\u26A1 " : ""}${escapeHtml(prio.toUpperCase())} \u25BE</span>
+
             <span class="decision-title-view" data-id="${escapeHtml(d.id)}" title="Click to edit title" style="color:var(--accent);font-weight:600;font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;cursor:pointer">${escapeHtml(d.title || "")}</span>
 
           </div>
 
           <div style="display:flex;gap:6px;flex-shrink:0;align-items:center">
+
+            ${editCount ? `<span class="decision-edit-count" data-id="${escapeHtml(d.id)}" title="${editCount} previous ${editCount === 1 ? "revision" : "revisions"} \u2014 body has been edited" style="color:var(--muted);font-size:9px;border:1px solid var(--border);border-radius:3px;padding:1px 5px;cursor:default">\u270E ${editCount}</span>` : ""}
 
             <span style="color:var(--muted);font-size:10px">${escapeHtml(dateStr)}</span>
 
@@ -11325,6 +11338,24 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
       });
       host.querySelectorAll("[data-supersede]").forEach((btn) => {
         btn.onclick = () => supersedePinnedDecision(projectId, btn.dataset.supersede);
+      });
+      host.querySelectorAll(".decision-prio-tag").forEach((tag) => {
+        tag.onclick = async () => {
+          const id = tag.dataset.id;
+          const pid = tag.dataset.project;
+          const cur = _DECISION_PRIORITY_ORDER.includes(tag.dataset.prio) ? tag.dataset.prio : "normal";
+          const next = _DECISION_PRIORITY_ORDER[(_DECISION_PRIORITY_ORDER.indexOf(cur) + 1) % _DECISION_PRIORITY_ORDER.length];
+          try {
+            await api2(`/projects/${pid}/decisions-pinned/${id}`, {
+              method: "PATCH",
+              body: JSON.stringify({ priority: next })
+            });
+            toast(`priority \u2192 ${next}`);
+            loadPinnedDecisions(pid);
+          } catch (e) {
+            toast("priority change failed: " + e.message, true);
+          }
+        };
       });
       host.querySelectorAll("[data-archive-decision]").forEach((btn) => {
         btn.onclick = async () => {

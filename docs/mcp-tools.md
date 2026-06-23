@@ -254,6 +254,7 @@ Categories: `STRATEGIC` · `COMPETITIVE` · `TECHNICAL` · `TACTICAL` · `BUSINE
 | `title` | string | required |  |
 | `body` | string | required |  |
 | `category` | string | optional |  |
+| `priority` | string | optional | urgent decisions sort first and are weighted higher in start_session / generate_handoff context. Default normal. |
 
 **Example:**
 ```
@@ -274,13 +275,14 @@ Patch a pinned decision. Pass `new_title` + `new_body` to atomically supersede (
 | `title` | string | optional |  |
 | `body` | string | optional |  |
 | `category` | string | optional |  |
+| `priority` | string | optional | Change ordering/weight (urgent \| normal \| low). |
 | `status` | string | optional |  |
 
 ---
 
 
 ### `get_pinned_decisions`
-Read-only: List pinned decisions (active only by default, newest first).
+Read-only: List pinned decisions, highest priority first (urgent → normal → low, then newest-first). Active only by default. Each row includes its priority and a parsed edit_log array of prior bodies ({body, ts}) recorded on every in-place body edit.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|

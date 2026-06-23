@@ -411,7 +411,9 @@ def build_mcp_server():
                     "earlier statements. The append-only set_decision log "
                     "captures every micro-decision; pin_decision holds the "
                     "live constitution. category: STRATEGIC, COMPETITIVE, "
-                    "TECHNICAL, TACTICAL, BUSINESS, PRODUCT, ARCHITECTURAL."
+                    "TECHNICAL, TACTICAL, BUSINESS, PRODUCT, ARCHITECTURAL. "
+                    "priority (urgent|normal|low, default normal) weights "
+                    "dashboard ordering + injected context."
                 ),
                 inputSchema={
                     "type": "object",
@@ -420,6 +422,10 @@ def build_mcp_server():
                         "title": {"type": "string"},
                         "body": {"type": "string"},
                         "category": {"type": "string"},
+                        "priority": {
+                            "type": "string",
+                            "enum": ["urgent", "normal", "low"],
+                        },
                     },
                     "required": ["project_id", "title", "body"],
                 },
@@ -430,7 +436,8 @@ def build_mcp_server():
                     "v2.4 — patch a pinned decision. Pass new_title + new_body "
                     "to atomically supersede (new active row created, old "
                     "marked superseded with back-link). Otherwise patches "
-                    "body/title/category/status in place."
+                    "body/title/category/status/priority in place. Editing the "
+                    "body appends the prior body to the append-only edit_log."
                 ),
                 inputSchema={
                     "type": "object",
@@ -441,6 +448,10 @@ def build_mcp_server():
                         "title": {"type": "string"},
                         "body": {"type": "string"},
                         "category": {"type": "string"},
+                        "priority": {
+                            "type": "string",
+                            "enum": ["urgent", "normal", "low"],
+                        },
                         "status": {"type": "string"},
                     },
                     "required": ["decision_id"],
@@ -449,9 +460,11 @@ def build_mcp_server():
             Tool(
                 name="get_pinned_decisions",
                 description=(
-                    "v2.4 — list pinned decisions for a project (active only "
-                    "by default, newest first). Pass include_superseded=true "
-                    "for the full history."
+                    "v2.4 — list pinned decisions for a project, highest "
+                    "priority first (urgent → normal → low, then newest). "
+                    "Active only by default; pass include_superseded=true for "
+                    "the full history. Each row includes its priority and a "
+                    "parsed edit_log array of prior bodies ({body, ts})."
                 ),
                 inputSchema={
                     "type": "object",

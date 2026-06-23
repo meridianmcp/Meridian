@@ -523,6 +523,8 @@ CREATE TABLE IF NOT EXISTS decisions_pinned (
     title TEXT NOT NULL,
     body TEXT NOT NULL,
     category TEXT NOT NULL DEFAULT 'TECHNICAL',
+    priority TEXT NOT NULL DEFAULT 'normal',
+    edit_log TEXT,
     status TEXT NOT NULL DEFAULT 'active',
     superseded_by TEXT REFERENCES decisions_pinned(id),
     created_at TEXT NOT NULL DEFAULT ({_TS}),
@@ -1197,6 +1199,24 @@ async def _migrate_pg_note_slug(conn: PostgresConnection) -> None:
         )
 
 
+async def _migrate_pg_decision_priority_edit_log(conn: PostgresConnection) -> None:
+    """366317e9 — decisions_pinned.priority + decisions_pinned.edit_log.
+
+    priority (urgent | normal | low, default 'normal') drives dashboard ordering
+    and context-injection weight. edit_log is an append-only JSON array of
+    ``{"body": <previous body>, "ts": <iso timestamp>}`` entries pushed on every
+    in-place body edit. Both ADD COLUMN IF NOT EXISTS so re-running is a no-op;
+    existing rows default priority to 'normal' and leave edit_log NULL.
+    """
+    await conn.executescript(
+        "ALTER TABLE decisions_pinned "
+        "ADD COLUMN IF NOT EXISTS priority TEXT NOT NULL DEFAULT 'normal'"
+    )
+    await conn.executescript(
+        "ALTER TABLE decisions_pinned ADD COLUMN IF NOT EXISTS edit_log TEXT"
+    )
+
+
 def _slugify_note_pg(title: str) -> str:
     """Kebab-case a note title (lowercase, alnum+dashes, collapse, trim).
 
@@ -1769,4 +1789,5 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_task_log_kind,
     _migrate_pg_oauth_refresh_tokens,
     _migrate_pg_note_slug,
+    _migrate_pg_decision_priority_edit_log,
 )

@@ -9347,6 +9347,20 @@ const _DECISION_CATEGORY_COLORS = {
 
 };
 
+// 366317e9 — decision priority badge colors + cycle order. Clicking the badge
+// cycles urgent → normal → low → urgent. urgent decisions sort to the top.
+const _DECISION_PRIORITY_COLORS = {
+
+  urgent: '#f87171',
+
+  normal: '#94a3b8',
+
+  low:    '#64748b',
+
+};
+
+const _DECISION_PRIORITY_ORDER = ['urgent', 'normal', 'low'];
+
 
 
 function renderConstitutionWarning(projectId) {
@@ -9843,6 +9857,12 @@ async function loadPinnedDecisions(projectId, { showArchived = false } = {}) {
 
       const color = _DECISION_CATEGORY_COLORS[cat] || _DECISION_CATEGORY_COLORS.TECHNICAL;
 
+      const prio = _DECISION_PRIORITY_ORDER.includes(d.priority) ? d.priority : 'normal';
+
+      const prioColor = _DECISION_PRIORITY_COLORS[prio] || _DECISION_PRIORITY_COLORS.normal;
+
+      const editCount = Array.isArray(d.edit_log) ? d.edit_log.length : 0;
+
       const dateStr = (d.created_at || '').slice(0, 10);
 
       return `<div data-decision-card="${escapeHtml(d.id)}" style="background:var(--surface-2);border:1px solid var(--border);border-left:4px solid ${color};border-radius:4px;padding:10px 12px;margin-bottom:8px">
@@ -9853,11 +9873,15 @@ async function loadPinnedDecisions(projectId, { showArchived = false } = {}) {
 
             <span class="decision-cat-tag" data-id="${escapeHtml(d.id)}" data-cat="${escapeHtml(cat)}" title="Click to change category" style="display:inline-block;background:${color}22;color:${color};font-size:9px;font-weight:700;letter-spacing:.5px;padding:2px 6px;border-radius:3px;flex-shrink:0;cursor:pointer">${escapeHtml(cat)} ▾</span>
 
+            <span class="decision-prio-tag" data-id="${escapeHtml(d.id)}" data-prio="${escapeHtml(prio)}" data-project="${escapeHtml(projectId)}" title="Click to change priority (urgent → normal → low)" style="display:inline-block;background:${prioColor}22;color:${prioColor};font-size:9px;font-weight:700;letter-spacing:.5px;padding:2px 6px;border-radius:3px;flex-shrink:0;cursor:pointer">${prio === 'urgent' ? '⚡ ' : ''}${escapeHtml(prio.toUpperCase())} ▾</span>
+
             <span class="decision-title-view" data-id="${escapeHtml(d.id)}" title="Click to edit title" style="color:var(--accent);font-weight:600;font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;cursor:pointer">${escapeHtml(d.title || '')}</span>
 
           </div>
 
           <div style="display:flex;gap:6px;flex-shrink:0;align-items:center">
+
+            ${editCount ? `<span class="decision-edit-count" data-id="${escapeHtml(d.id)}" title="${editCount} previous ${editCount === 1 ? 'revision' : 'revisions'} — body has been edited" style="color:var(--muted);font-size:9px;border:1px solid var(--border);border-radius:3px;padding:1px 5px;cursor:default">✎ ${editCount}</span>` : ''}
 
             <span style="color:var(--muted);font-size:10px">${escapeHtml(dateStr)}</span>
 
@@ -10018,6 +10042,39 @@ async function loadPinnedDecisions(projectId, { showArchived = false } = {}) {
     host.querySelectorAll('[data-supersede]').forEach(btn => {
 
       btn.onclick = () => supersedePinnedDecision(projectId, btn.dataset.supersede);
+
+    });
+
+    // 366317e9 — click the priority badge to cycle urgent → normal → low.
+    host.querySelectorAll('.decision-prio-tag').forEach(tag => {
+
+      tag.onclick = async () => {
+
+        const id = tag.dataset.id;
+
+        const pid = tag.dataset.project;
+
+        const cur = _DECISION_PRIORITY_ORDER.includes(tag.dataset.prio) ? tag.dataset.prio : 'normal';
+
+        const next = _DECISION_PRIORITY_ORDER[(_DECISION_PRIORITY_ORDER.indexOf(cur) + 1) % _DECISION_PRIORITY_ORDER.length];
+
+        try {
+
+          await api(`/projects/${pid}/decisions-pinned/${id}`, {
+
+            method: 'PATCH',
+
+            body: JSON.stringify({ priority: next }),
+
+          });
+
+          toast(`priority → ${next}`);
+
+          loadPinnedDecisions(pid);
+
+        } catch (e) { toast('priority change failed: ' + e.message, true); }
+
+      };
 
     });
 

@@ -136,12 +136,15 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "project_id": {"type": "string"},
          "title": {"type": "string"},
          "body": {"type": "string"},
-         "category": {"type": "string"}},
+         "category": {"type": "string"},
+         "priority": {"type": "string", "enum": ["urgent", "normal", "low"], "description": "urgent decisions sort first and are weighted higher in start_session / generate_handoff context. Default normal."}},
          "required": ["project_id", "title", "body"]}},
     {"name": "update_decision", "description":
         "Patch a pinned decision. Pass new_title + new_body to atomically "
         "supersede (creates a new active row, marks old as superseded with "
-        "back-link). Otherwise patches body/title/category/status in place.",
+        "back-link). Otherwise patches body/title/category/status/priority in "
+        "place. Editing the body appends the previous body to the append-only "
+        "edit_log (read it back via get_pinned_decisions).",
      "inputSchema": {"type": "object", "properties": {
          "decision_id": {"type": "string"},
          "new_title": {"type": "string"},
@@ -149,10 +152,14 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "title": {"type": "string"},
          "body": {"type": "string"},
          "category": {"type": "string"},
+         "priority": {"type": "string", "enum": ["urgent", "normal", "low"], "description": "Change ordering/weight (urgent | normal | low)."},
          "status": {"type": "string"}},
          "required": ["decision_id"]}},
     {"name": "get_pinned_decisions", "description":
-        "Read-only: List pinned decisions (active only by default, newest first).",
+        "Read-only: List pinned decisions, highest priority first (urgent → "
+        "normal → low, then newest-first). Active only by default. Each row "
+        "includes its priority and a parsed edit_log array of prior bodies "
+        "({body, ts}) recorded on every in-place body edit.",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"},
          "include_superseded": {"type": "boolean"}},

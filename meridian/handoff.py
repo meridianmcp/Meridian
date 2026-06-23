@@ -510,7 +510,10 @@ async def _generate_handoff_l0(
     if pinned:
         lines += ["### Pinned Decisions"]
         for d in pinned:
-            lines.append(f"- **{d.get('title', '?')}**: {d.get('body', '')}")
+            # 366317e9 — urgent decisions are flagged so they stand out in the
+            # priority-ordered list.
+            mark = " ⚡" if d.get("priority") == "urgent" else ""
+            lines.append(f"- **{d.get('title', '?')}**{mark}: {d.get('body', '')}")
         lines.append("")
     lines += [
         "---",
@@ -894,7 +897,9 @@ async def _generate_planner_handoff(
         lines += ["## Pinned Decisions (Constitution)", ""]
         for d in pinned:
             cat = d.get("category", "")
-            lines.append(f"- **[{cat}]** {d.get('title', '')} — {(d.get('body') or '')[:200]}")
+            # 366317e9 — pinned is ordered urgent → normal → low; tag urgent ones.
+            prio = " ⚡urgent" if d.get("priority") == "urgent" else ""
+            lines.append(f"- **[{cat}]**{prio} {d.get('title', '')} — {(d.get('body') or '')[:200]}")
         lines.append("")
 
     if strategic:

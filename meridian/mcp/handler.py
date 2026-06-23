@@ -983,6 +983,7 @@ async def _dispatch_mcp_tool(
         category = args.get("category", "TECHNICAL")
         result = await db_module.pin_decision(
             db, args["project_id"], args["title"], args["body"], category,
+            priority=args.get("priority", "normal"),
         )
         await _server._append_decision_to_md(args["title"], args["body"], category)
         return result
@@ -992,6 +993,7 @@ async def _dispatch_mcp_tool(
         if new_title and new_body:
             return await db_module.supersede_pinned_decision(
                 db, args["decision_id"], new_title, new_body, args.get("category"),
+                priority=args.get("priority"),
             )
         result = await db_module.update_pinned_decision(
             db, args["decision_id"],
@@ -1000,6 +1002,7 @@ async def _dispatch_mcp_tool(
             category=args.get("category"),
             status=args.get("status"),
             superseded_by=args.get("superseded_by"),
+            priority=args.get("priority"),
         )
         if result is None:
             raise ValueError("decision not found")
@@ -1982,8 +1985,10 @@ async def _dispatch_mcp_tool(
             try:
                 _decisions = await db_module.get_pinned_decisions(db, project_id, include_superseded=False)
                 if _decisions:
+                    # 366317e9 — already ordered urgent → normal → low by the DB
+                    # layer; surface the priority so the planner weights them.
                     planner_extra_xml += "<decisions>\n" + "\n".join(
-                        f'  <decision category="{d.get("category","")}">{(d.get("title") or "")}: {(d.get("body") or "")[:120]}</decision>'
+                        f'  <decision priority="{d.get("priority","normal")}" category="{d.get("category","")}">{(d.get("title") or "")}: {(d.get("body") or "")[:120]}</decision>'
                         for d in _decisions[:20]
                     ) + "\n</decisions>\n"
             except Exception:
