@@ -7871,6 +7871,26 @@ def test_install_watcher_sh_returns_script(client):
     assert r.headers["content-type"].startswith("text/plain")
 
 
+def test_install_tunnel_ps1_returns_script(client):
+    """e05d0e02 — GET /install_tunnel.ps1 serves the Windows tunnel auto-start
+    installer (Task Scheduler job that keeps `meridian --tunnel` alive)."""
+    r = client.get("/install_tunnel.ps1")
+    assert r.status_code == 200
+    assert "MeridianTunnel" in r.text and "ScheduledTask" in r.text
+    assert "--tunnel" in r.text
+    assert r.headers["content-type"].startswith("text/plain")
+
+
+def test_install_tunnel_sh_returns_script(client):
+    """e05d0e02 — GET /install_tunnel.sh serves the macOS LaunchAgent / Linux
+    systemd installer that keeps `meridian --tunnel` alive across reboots."""
+    r = client.get("/install_tunnel.sh")
+    assert r.status_code == 200
+    assert "launchctl" in r.text or "systemctl" in r.text
+    assert "--tunnel" in r.text
+    assert r.headers["content-type"].startswith("text/plain")
+
+
 @pytest.mark.asyncio
 async def test_create_stripe_billing_portal_session_rejects_no_customer():
     """G2.11 — helper raises ValueError when stripe_customer_id is missing,

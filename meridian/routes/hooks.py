@@ -46,6 +46,26 @@ async def get_install_watcher_sh() -> PlainTextResponse:
     return PlainTextResponse(script_path.read_text(encoding="utf-8"))
 
 
+@router.get("/install_tunnel.ps1")
+async def get_install_tunnel_ps1() -> PlainTextResponse:
+    """e05d0e02 — serve the Windows Task Scheduler installer that keeps
+    `meridian --tunnel` alive across logins/reboots."""
+    script_path = _watcher_script_path("install_tunnel.ps1")
+    if not script_path.exists():
+        raise HTTPException(status_code=404, detail="install_tunnel.ps1 not found")
+    return PlainTextResponse(script_path.read_text(encoding="utf-8"))
+
+
+@router.get("/install_tunnel.sh")
+async def get_install_tunnel_sh() -> PlainTextResponse:
+    """e05d0e02 — serve the macOS LaunchAgent / Linux systemd installer that
+    keeps `meridian --tunnel` alive across logins/reboots."""
+    script_path = _watcher_script_path("install_tunnel.sh")
+    if not script_path.exists():
+        raise HTTPException(status_code=404, detail="install_tunnel.sh not found")
+    return PlainTextResponse(script_path.read_text(encoding="utf-8"))
+
+
 @router.get("/hooks.ps1")
 async def get_hooks_ps1() -> PlainTextResponse:
     script_path = _hook_script_path("hooks.ps1")
