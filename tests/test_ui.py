@@ -519,6 +519,30 @@ def test_known_locations_has_manual_path_entry(js):
     )
 
 
+def test_codeintel_tab_sends_project_slug_not_repo_path(js):
+    """HOTFIX 9d11c952 — the Code Intel tab must call index_status / get_architecture
+    with the `project` slug the code-intel graph keys on (root_path with :/\\ collapsed
+    to dashes, e.g. C-Users-13144-Documents-Meridian-repository), NOT a raw `repo_path`.
+    The backend tools require `project`; sending `repo_path` made the lookup a no-op."""
+    import re
+    # The slug helper exists and collapses drive-colon + path separators to dashes.
+    assert "_repoPathToProject" in js, "repo-path -> project slug helper missing"
+    assert re.search(r"_repoPathToProject\s*\([^)]*\)\s*\{[^}]*\[\\\\/:\]", js), (
+        "_repoPathToProject must collapse [\\\\/:] runs to dashes"
+    )
+    # Both tool calls send the derived `project`, and neither still sends `repo_path`.
+    assert "name: 'index_status', arguments: {project: _repoPathToProject(" in js, (
+        "index_status must be called with project slug, not repo_path"
+    )
+    assert "name: 'get_architecture', arguments: archArgs" in js
+    assert "{project: _repoPathToProject(archPath)}" in js, (
+        "get_architecture must be called with project slug, not repo_path"
+    )
+    assert "index_status', arguments: {repo_path:" not in js, (
+        "stale repo_path arg still sent to index_status"
+    )
+
+
 def test_tunnel_plugins_section_exposed_on_window(js):
     """Regression (9d03d7cc): loadTunnelPluginsSection must be on window so the
     settings module's window.loadTunnelPluginsSection?.() call actually renders it."""

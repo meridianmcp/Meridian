@@ -9388,6 +9388,9 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
     } catch (_) {
     }
   }
+  function _repoPathToProject(repoPath) {
+    return String(repoPath || "").replace(/[\\/:]+/g, "-").replace(/^-+|-+$/g, "");
+  }
   async function loadCodeIntelTab(projectId) {
     const body = document.getElementById(`codeintel-body-${projectId}`);
     if (!body) return;
@@ -9454,7 +9457,7 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
           const hostname = typeof rp === "object" ? rp.hostname || "" : "";
           if (!cwd) continue;
           try {
-            const result = await _codeMcpCall("tools/call", { name: "index_status", arguments: { repo_path: cwd } });
+            const result = await _codeMcpCall("tools/call", { name: "index_status", arguments: { project: _repoPathToProject(cwd) } });
             const text = (result?.content || []).map((c) => c.text || "").join("").trim();
             html += `<div style="margin-bottom:10px">
             <div style="font-size:10px;color:var(--text);font-weight:600;margin-bottom:4px">${escapeHtml(cwd)}${hostname ? `<span style="color:var(--muted);font-weight:400"> \xB7 ${escapeHtml(hostname)}</span>` : ""}</div>
@@ -9473,7 +9476,8 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
       html += "</div>";
       html += `<div><div style="font-size:10px;color:var(--accent);text-transform:uppercase;letter-spacing:.06em;margin-bottom:8px;padding-bottom:4px;border-bottom:1px solid var(--border)">Architecture Summary</div>`;
       try {
-        const archArgs = repoPaths.length ? { repo_path: typeof repoPaths[0] === "string" ? repoPaths[0] : repoPaths[0].cwd || "" } : {};
+        const archPath = repoPaths.length ? typeof repoPaths[0] === "string" ? repoPaths[0] : repoPaths[0].cwd || "" : "";
+        const archArgs = archPath ? { project: _repoPathToProject(archPath) } : {};
         const archResult = await _codeMcpCall("tools/call", { name: "get_architecture", arguments: archArgs });
         const archText = (archResult?.content || []).map((c) => c.text || "").join("").trim();
         html += `<pre style="font-size:10px;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;padding:10px;white-space:pre-wrap;word-break:break-all;color:var(--text);margin:0;line-height:1.5">${escapeHtml(archText || "(no architecture returned)")}</pre>`;
