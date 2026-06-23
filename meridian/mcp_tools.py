@@ -446,7 +446,9 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "Append a todo item to the project's sprint checklist. Use when starting work on a "
         "new version so the next session sees what's in flight. Optional: group items under "
         "a named objective with 'group'; attribute to a person with 'human_id'. "
-        "Use 'depends_on' to block until another item finishes.",
+        "Use 'depends_on' to block until another item finishes. Blocks near-duplicate titles "
+        "(>=60% word overlap with an open pending/in_progress item) and returns the conflict; "
+        "pass force=true to add anyway.",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"},
          "version": {"type": "string"},
@@ -457,7 +459,9 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "failure_mode": {"type": "string", "enum": ["continue", "stop"],
                           "description": "'stop' blocks this item if the parent fails."},
          "milestone_type": {"type": "string", "enum": ["task", "milestone", "human"],
-                            "description": "'milestone' renders as a timeline marker; 'human' marks a task for a human (hidden from executor sessions)."}},
+                            "description": "'milestone' renders as a timeline marker; 'human' marks a task for a human (hidden from executor sessions)."},
+         "force": {"type": "boolean",
+                   "description": "Override the duplicate guard and add the item even if its title closely matches an existing open item. Default false."}},
          "required": ["project_id", "version", "title"]}},
     {"name": "update_sprint_item", "description":
         "Edit fields on an existing sprint item: title, version, notes, human_id (assignee), "

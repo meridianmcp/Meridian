@@ -1705,21 +1705,6 @@ async def _handle_sprint_tools(
         return await db_module.get_session_notes(db, args["session_id"])
     if name == "add_sprint_item":
         validate_input_size(args.get("title"), "sprint item title", 500)
-        # 10c0f6a0 — fuzzy duplicate guard: warn if title closely matches existing item
-        _new_words = set(args["title"].lower().split())
-        _dup_warnings: list[dict[str, Any]] = []
-        if len(_new_words) >= 3:
-            _all_items = await db_module.get_sprint_items(db, args["project_id"])
-            for _ex in _all_items:
-                if _ex.get("status") in {"pending", "todo", "in_progress", "done"}:
-                    _ex_words = set(_ex["title"].lower().split())
-                    if _ex_words:
-                        _overlap = len(_new_words & _ex_words) / len(_new_words)
-                        if _overlap >= 0.6:
-                            _dup_warnings.append({
-                                "item_id": _ex["id"], "title": _ex["title"][:120],
-                                "status": _ex["status"], "match_pct": round(_overlap * 100),
-                            })
         # fd86aacc — warn if active executor sessions exist when adding a new item
         _active_session_warnings: list[str] = []
         try:
@@ -1748,10 +1733,13 @@ async def _handle_sprint_tools(
             depends_on=args.get("depends_on"),
             failure_mode=args.get("failure_mode"),
             milestone_type=args.get("milestone_type", "task"),
+            force=bool(args.get("force", False)),
         )
+        # b0d42ef6 — duplicate guard blocked the insert: surface the error as-is
+        # (no item was created, so the warnings below don't apply).
+        if isinstance(_new_item, dict) and _new_item.get("error") == "duplicate":
+            return _new_item
         _extra: dict[str, Any] = {}
-        if _dup_warnings:
-            _extra["duplicate_warnings"] = _dup_warnings
         if _active_session_warnings:
             _extra["active_session_warning"] = (
                 "WARNING: " + "; ".join(_active_session_warnings)

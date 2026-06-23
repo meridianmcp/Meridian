@@ -1010,7 +1010,10 @@ def build_mcp_server():
                     "'group'; attribute the item to a person with 'human_id'. "
                     "Use 'depends_on' to block this item until another item "
                     "finishes; 'failure_mode=stop' stops the chain if the "
-                    "parent fails. Returns the new item."
+                    "parent fails. Blocks near-duplicate titles (>=60% word "
+                    "overlap with an open pending/in_progress item) and returns "
+                    "the conflict instead of creating a duplicate; pass "
+                    "force=true to add anyway. Returns the new item."
                 ),
                 inputSchema={
                     "type": "object",
@@ -1042,6 +1045,10 @@ def build_mcp_server():
                             "type": "string",
                             "enum": ["task", "milestone", "human"],
                             "description": "'milestone' renders as a timeline marker; 'human' marks a task for a human (hidden from executor sessions). Default: 'task'.",
+                        },
+                        "force": {
+                            "type": "boolean",
+                            "description": "Override the duplicate guard and add the item even if its title closely matches an existing open item. Default: false.",
                         },
                     },
                     "required": ["project_id", "version", "title"],
@@ -1607,6 +1614,7 @@ def build_mcp_server():
                     depends_on=arguments.get("depends_on"),
                     failure_mode=arguments.get("failure_mode"),
                     milestone_type=arguments.get("milestone_type", "task"),
+                    force=bool(arguments.get("force", False)),
                 )
             elif name == "update_sprint_item":
                 item = await db_module.patch_sprint_item(

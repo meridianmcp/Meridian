@@ -16,6 +16,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import time
 import uuid
 from pathlib import Path
@@ -2534,6 +2535,42 @@ _ACTIVE_SPRINT_STATUSES = {
     "pending", "in_progress", "todo", "indeterminate", "provisional_complete",
 }
 
+# Statuses that make an existing item a *blocking* duplicate when a new item
+# with a near-identical title is added. Only open/active work counts: a title
+# that overlaps a finished item (done / skipped / failed / pushed) is allowed
+# through, since re-doing finished work is legitimate. ``todo`` is the DB
+# default for freshly-added items and is pending-equivalent here.
+_DUP_BLOCKING_SPRINT_STATUSES = {"pending", "todo", "in_progress"}
+
+# b0d42ef6 — fuzzy-duplicate threshold for add_sprint_item. Two titles are
+# treated as duplicates when their word-set overlap is >= 60%.
+_SPRINT_DUP_OVERLAP_THRESHOLD = 0.60
+
+
+def _title_word_set(title: str) -> set[str]:
+    """Tokenise a sprint-item title into a lowercased word set.
+
+    Splits on any run of non-alphanumeric characters and lowercases, so
+    "Add OAuth login!" and "add  oauth   LOGIN" both yield {add, oauth, login}.
+    Punctuation and surrounding whitespace are discarded.
+    """
+    return {w for w in re.split(r"[^0-9a-z]+", title.lower()) if w}
+
+
+def _title_word_overlap(a: set[str], b: set[str]) -> float:
+    """Word-set overlap of two pre-tokenised titles, in ``[0.0, 1.0]``.
+
+    Defined as ``|a ∩ b| / |smaller set|`` (the overlap coefficient). Dividing
+    by the smaller of the two word sets makes the metric symmetric and means a
+    short title that is fully contained in a longer one scores 1.0 — so
+    "Add OAuth" vs "Add OAuth login and refresh-token rotation" is flagged as a
+    duplicate even though the longer title has many extra words. Returns 0.0 if
+    either set is empty.
+    """
+    if not a or not b:
+        return 0.0
+    return len(a & b) / min(len(a), len(b))
+
 # ---------------------------------------------------------------------------
 # get_sprint_progress 10s cache — one get_sprint_items DB query serves all
 # parallel sessions polling between tasks. Keyed by project_id; busted on any
@@ -2576,6 +2613,7 @@ async def add_sprint_item(
     depends_on: str | None = None,
     failure_mode: str | None = None,
     milestone_type: str = "task",
+    force: bool = False,
 ) -> dict[str, Any]:
     """Append a new ``todo`` sprint item to a project's checklist.
 
@@ -2588,11 +2626,49 @@ async def add_sprint_item(
     this item to proceed; 'stop' blocks it.
     ``milestone_type`` is 'task' (default) or 'milestone' — milestones
     render as vertical timeline markers in the sprint swimlane.
+
+    Duplicate guard (b0d42ef6): unless ``force`` is True, the new ``title``
+    is compared (word-set overlap, see ``_title_word_overlap``) against every
+    open item in the project (status pending / todo / in_progress). If any
+    existing item meets the >= 60% overlap threshold the item is **not**
+    inserted and a structured error dict is returned instead::
+
+        {"error": "duplicate", "message": ..., "existing": {id, title,
+         status, overlap_pct}}
+
+    The caller can pass ``force=True`` to override the guard and insert
+    anyway. Finished items (done / skipped / failed / pushed) never block,
+    so legitimately re-doing past work is unaffected.
     """
     if failure_mode not in (None, "continue", "stop"):
         raise ValueError("failure_mode must be 'continue' or 'stop'")
     if milestone_type not in ("task", "milestone", "human"):
         raise ValueError("milestone_type must be 'task', 'milestone', or 'human'")
+    # b0d42ef6 — block near-duplicate titles against open items unless forced.
+    if not force:
+        _new_words = _title_word_set(title)
+        if _new_words:
+            for _ex in await get_sprint_items(db, project_id):
+                if _ex.get("status") not in _DUP_BLOCKING_SPRINT_STATUSES:
+                    continue
+                _overlap = _title_word_overlap(_new_words, _title_word_set(_ex.get("title", "")))
+                if _overlap >= _SPRINT_DUP_OVERLAP_THRESHOLD:
+                    _pct = round(_overlap * 100)
+                    return {
+                        "error": "duplicate",
+                        "message": (
+                            f"Sprint item not created: title is {_pct}% a word-match "
+                            f"for existing {_ex['status']} item '{_ex.get('title', '')[:120]}' "
+                            f"({_ex['id'][:8]}). Pass force=true to add it anyway, or update "
+                            f"the existing item instead."
+                        ),
+                        "existing": {
+                            "id": _ex["id"],
+                            "title": _ex.get("title", ""),
+                            "status": _ex["status"],
+                            "overlap_pct": _pct,
+                        },
+                    }
     iid = _new_id()
     await db.execute(
         "INSERT INTO sprint_items "

@@ -11829,6 +11829,125 @@ async def test_add_sprint_item_no_warning_when_no_sessions(db):
 
 
 # ---------------------------------------------------------------------------
+# b0d42ef6 — add_sprint_item duplicate guard (BLOCKING with force override)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_add_sprint_item_blocks_duplicate_of_pending(db):
+    """A >=60% word-overlap title for a PENDING item is blocked (no row created)."""
+    p = await db_module.create_project(db, "dup-pending")
+    pid = p["id"]
+    existing = await db_module.add_sprint_item(db, pid, "v1", "Add OAuth login flow")
+
+    res = await db_module.add_sprint_item(db, pid, "v1", "add oauth login flow")
+    assert res.get("error") == "duplicate"
+    assert res["existing"]["id"] == existing["id"]
+    assert res["existing"]["status"] == "pending"
+    assert res["existing"]["title"] == "Add OAuth login flow"
+    assert res["existing"]["overlap_pct"] == 100
+    assert existing["id"][:8] in res["message"]
+    # No second row was created — only the original pending item exists.
+    items = await db_module.get_sprint_items(db, pid)
+    assert len(items) == 1
+    assert items[0]["id"] == existing["id"]
+
+
+@pytest.mark.asyncio
+async def test_add_sprint_item_blocks_duplicate_of_in_progress(db):
+    """A near-duplicate of an IN_PROGRESS item is blocked too."""
+    p = await db_module.create_project(db, "dup-in-progress")
+    pid = p["id"]
+    existing = await db_module.add_sprint_item(db, pid, "v1", "Rewrite the installer script")
+    await db_module.claim_sprint_item(db, pid, existing["id"])  # -> in_progress
+    claimed = await db_module.get_sprint_item(db, existing["id"])
+    assert claimed["status"] == "in_progress"
+
+    res = await db_module.add_sprint_item(db, pid, "v1", "rewrite installer script")
+    assert res.get("error") == "duplicate"
+    assert res["existing"]["id"] == existing["id"]
+    assert res["existing"]["status"] == "in_progress"
+    items = await db_module.get_sprint_items(db, pid)
+    assert len(items) == 1
+
+
+@pytest.mark.asyncio
+async def test_add_sprint_item_allows_duplicate_of_done(db):
+    """A duplicate of a DONE item is allowed — finished work never blocks."""
+    p = await db_module.create_project(db, "dup-done")
+    pid = p["id"]
+    done = await db_module.add_sprint_item(db, pid, "v1", "Add OAuth login flow")
+    await db_module.complete_sprint_item(db, pid, done["id"])
+
+    res = await db_module.add_sprint_item(db, pid, "v1", "Add OAuth login flow")
+    assert "error" not in res
+    assert res["id"] != done["id"]
+    items = await db_module.get_sprint_items(db, pid)
+    assert len(items) == 2
+
+
+@pytest.mark.asyncio
+async def test_add_sprint_item_allows_below_threshold(db):
+    """Below-threshold (<60%) similarity is allowed through."""
+    p = await db_module.create_project(db, "dup-below")
+    pid = p["id"]
+    await db_module.add_sprint_item(db, pid, "v1", "First fix")  # {first, fix}
+
+    # {second, fix}: overlap = 1/2 = 50% < 60% -> allowed.
+    res = await db_module.add_sprint_item(db, pid, "v1", "Second fix")
+    assert "error" not in res
+    items = await db_module.get_sprint_items(db, pid)
+    assert len(items) == 2
+
+
+@pytest.mark.asyncio
+async def test_add_sprint_item_force_overrides_duplicate(db):
+    """force=True bypasses the guard and creates the item despite overlap."""
+    p = await db_module.create_project(db, "dup-force")
+    pid = p["id"]
+    existing = await db_module.add_sprint_item(db, pid, "v1", "Add OAuth login flow")
+
+    # Sanity: it WOULD be blocked without force.
+    blocked = await db_module.add_sprint_item(db, pid, "v1", "Add OAuth login flow")
+    assert blocked.get("error") == "duplicate"
+
+    forced = await db_module.add_sprint_item(
+        db, pid, "v1", "Add OAuth login flow", force=True
+    )
+    assert "error" not in forced
+    assert forced["id"] != existing["id"]
+    items = await db_module.get_sprint_items(db, pid)
+    assert len(items) == 2
+
+
+@pytest.mark.asyncio
+async def test_add_sprint_item_dispatch_returns_duplicate_error(db):
+    """The MCP add_sprint_item tool surfaces the duplicate error; force=true overrides."""
+    import meridian.server as srv
+    p = await db_module.create_project(db, "dup-dispatch")
+    pid = p["id"]
+    existing = await db_module.add_sprint_item(db, pid, "v1", "Refactor the auth middleware")
+
+    res = await srv._dispatch_mcp_tool(
+        "add_sprint_item",
+        {"project_id": pid, "version": "v1", "title": "refactor auth middleware"},
+        db, "/tmp",
+    )
+    assert res.get("error") == "duplicate"
+    assert res["existing"]["id"] == existing["id"]
+    assert len(await db_module.get_sprint_items(db, pid)) == 1
+
+    forced = await srv._dispatch_mcp_tool(
+        "add_sprint_item",
+        {"project_id": pid, "version": "v1", "title": "refactor auth middleware", "force": True},
+        db, "/tmp",
+    )
+    assert forced.get("error") != "duplicate"
+    assert "id" in forced
+    assert len(await db_module.get_sprint_items(db, pid)) == 2
+
+
+# ---------------------------------------------------------------------------
 # fd86aacc — get_session_brief board change counter
 # ---------------------------------------------------------------------------
 
