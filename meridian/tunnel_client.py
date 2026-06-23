@@ -997,7 +997,9 @@ async def run_tunnel(
     # /me response returns the already-resolved list (defaults + per-tenant
     # overrides); fall back to built-in defaults for older servers. Each slot
     # may be disabled, given a command override, or assigned a different port.
-    from .tunnel_plugins import resolve_plugins, detect_office_binaries
+    from .tunnel_plugins import (
+        resolve_plugins, detect_office_binaries, expand_command, SERENA_EXTRACT_COMMAND,
+    )
     # Auto-enable Office slots whose launcher is installed on this machine, unless
     # the user explicitly configured them. Resolve locally from the raw config
     # (tunnel_plugins_config) so binary-detection applies; fall back to the
@@ -1091,17 +1093,21 @@ async def run_tunnel(
                 flush=True,
             )
 
-    # 4. Spawn mcp-server-code-extractor proxy. It's a PyPI package (run via uvx,
-    #    or pip-installed and run as `python -m code_extractor`), wrapped in
-    #    mcp-proxy. None if the launcher can't be resolved.
+    # 4. Spawn the code-extractor proxy (slot "extract"). Default: Serena
+    #    (uvx serena ...), with {repo_path} expanded to the served repo so it
+    #    loads the right project. A tenant command override replaces it; an older
+    #    server that still resolves this slot to command=None falls back to
+    #    mcp-server-code-extractor via _resolve_extractor_inner_cmd().
     proc_extract = None
     if not extract_plugin.get("enabled", True):
         print("  code-extractor:    disabled (tunnel_plugins config)", flush=True)
     else:
-        ext_override = extract_plugin.get("command")
+        ext_raw = extract_plugin.get("command")
+        ext_override = expand_command(ext_raw, repo_path=repo_path)
         if ext_override:
             cmd_extract = _build_proxy_for_inner(npx, list(ext_override), extract_port)
-            print(f"  code-extractor:    http://127.0.0.1:{extract_port} (custom command)", flush=True)
+            _ext_label = "" if ext_raw == SERENA_EXTRACT_COMMAND else " (custom command)"
+            print(f"  code-extractor:    http://127.0.0.1:{extract_port}{_ext_label}", flush=True)
             try:
                 proc_extract = subprocess.Popen(cmd_extract)
                 proc_holders.append({"proc": proc_extract, "cmd": cmd_extract, "env": None, "label": "extract"})

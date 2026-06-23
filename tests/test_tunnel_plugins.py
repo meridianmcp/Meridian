@@ -23,7 +23,11 @@ def test_resolve_defaults_returns_builtins_in_order():
     # and desktop-commander default OFF.
     by_name = {p["name"]: p for p in plugins}
     assert all(by_name[n]["enabled"] for n in ("filesystem", "code-intel", "code-extractor"))
-    assert all(by_name[n]["command"] is None for n in ("filesystem", "code-intel", "code-extractor"))
+    # filesystem + code-intel use the client's platform default (command None);
+    # code-extractor defaults to Serena (LSP symbol tools), {repo_path} expanded
+    # to the served repo at spawn time.
+    assert all(by_name[n]["command"] is None for n in ("filesystem", "code-intel"))
+    assert by_name["code-extractor"]["command"] == tp.SERENA_EXTRACT_COMMAND
     assert by_name["powerpoint"]["enabled"] is False
     assert by_name["word"]["enabled"] is False
     assert by_name["desktop-commander"]["enabled"] is False
@@ -51,6 +55,33 @@ def test_active_plugins_filters_disabled():
 def test_plugin_by_slot():
     assert tp.plugin_by_slot(None, "code")["name"] == "code-intel"
     assert tp.plugin_by_slot(None, "nope") is None
+
+
+# ---------------------------------------------------------------------------
+# expand_command — {repo_path} template substitution (Serena extract default)
+# ---------------------------------------------------------------------------
+
+def test_expand_command_substitutes_repo_path_in_serena_default():
+    out = tp.expand_command(tp.SERENA_EXTRACT_COMMAND, repo_path="/home/me/proj")
+    assert out == ["uvx", "serena", "start-mcp-server",
+                   "--context", "ide-assistant", "--project", "/home/me/proj"]
+    # The module-level constant must not be mutated by expansion.
+    assert tp.SERENA_EXTRACT_COMMAND[-1] == "{repo_path}"
+
+
+def test_expand_command_accepts_string_and_leaves_unknown_placeholders():
+    out = tp.expand_command("tool --project {repo_path} --flag {other}", repo_path="/r")
+    assert out == ["tool", "--project", "/r", "--flag", "{other}"]
+
+
+def test_expand_command_none_and_empty_yield_none():
+    assert tp.expand_command(None, repo_path="/r") is None
+    assert tp.expand_command("   ", repo_path="/r") is None
+    assert tp.expand_command([], repo_path="/r") is None
+
+
+def test_expand_command_missing_repo_path_blanks_placeholder():
+    assert tp.expand_command(["x", "{repo_path}"]) == ["x", ""]
 
 
 # ---------------------------------------------------------------------------

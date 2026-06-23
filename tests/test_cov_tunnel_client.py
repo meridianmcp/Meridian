@@ -654,22 +654,44 @@ def test_run_tunnel_fs_npx_not_found_returns_1(monkeypatch, tmp_path):
     assert rc == 1
 
 
-def test_run_tunnel_code_unavailable_extractor_unavailable(monkeypatch, tmp_path):
-    """code-intel binary unavailable + extractor inner None → those slots skip."""
-    procs = _stub_run_tunnel_spawn(
-        monkeypatch, code_binary=None, extractor_inner=None,
-    )
-    # Override extractor resolver to actually return None (the helper above
-    # substitutes a default for None, so set it explicitly here).
-    monkeypatch.setattr(tc, "_resolve_extractor_inner_cmd", lambda: None)
+def test_run_tunnel_code_unavailable_and_extract_disabled(monkeypatch, tmp_path):
+    """code-intel binary unavailable + extract slot disabled via config → both
+    skip; fs alone keeps the tunnel alive (exit 0). (The extract slot now defaults
+    to Serena, so 'unavailable' is expressed by disabling it, not a None resolver.)"""
+    procs = _stub_run_tunnel_spawn(monkeypatch, code_binary=None)
     monkeypatch.setattr(
         tc, "_fetch_me",
-        AsyncMock(return_value={"tenant_id": "t", "plan": "pro"}),
+        AsyncMock(return_value={
+            "tenant_id": "t", "plan": "pro",
+            "tunnel_plugins_config": {"code-extractor": {"enabled": False}},
+        }),
     )
     monkeypatch.setattr(tc.Path, "cwd", staticmethod(lambda: tmp_path))
 
     rc = _run_tunnel(token="sk_tok", base_url="https://x", repo_path=str(tmp_path))
-    # Only fs spawns; code + extract unavailable but fs keeps tunnel alive → 0.
+    # Only fs spawns; code unavailable + extract disabled but fs keeps tunnel → 0.
+    assert rc == 0
+    assert len(procs) == 1
+
+
+def test_run_tunnel_legacy_resolved_list_extract_none_skips(monkeypatch, tmp_path):
+    """Backward-compat: an older server sends an already-resolved plugin list with
+    code-extractor command=None. With the resolver returning None the extract slot
+    falls through and skips cleanly (fs alone → exit 0)."""
+    procs = _stub_run_tunnel_spawn(monkeypatch, code_binary=None)
+    monkeypatch.setattr(tc, "_resolve_extractor_inner_cmd", lambda: None)
+    legacy_plugins = [
+        {"name": "filesystem", "slot": "fs", "enabled": True, "command": None, "port": 8808},
+        {"name": "code-extractor", "slot": "extract", "enabled": True, "command": None, "port": 8810},
+    ]
+    monkeypatch.setattr(
+        tc, "_fetch_me",
+        AsyncMock(return_value={"tenant_id": "t", "plan": "pro", "tunnel_plugins": legacy_plugins}),
+    )
+    monkeypatch.setattr(tc.Path, "cwd", staticmethod(lambda: tmp_path))
+
+    rc = _run_tunnel(token="sk_tok", base_url="https://x", repo_path=str(tmp_path))
+    # fs spawns; extract command=None + resolver None → skip.
     assert rc == 0
     assert len(procs) == 1
 

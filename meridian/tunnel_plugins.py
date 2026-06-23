@@ -33,6 +33,17 @@ DEFAULT_PPT_PORT = 8811
 DEFAULT_WORD_PORT = 8812
 DEFAULT_DC_PORT = 8813
 
+# The code-extractor slot's default launcher: Serena (LSP-based symbol tools —
+# find_symbol / replace_symbol_body, etc.), run ephemerally via uvx. The
+# ``{repo_path}`` placeholder is expanded to the tunnel's working directory at
+# spawn time (see :func:`expand_command`) — Serena needs ``--project`` to load
+# the right repo. Swapping this default is a pure-data change here, no redeploy.
+SERENA_EXTRACT_COMMAND: list[str] = [
+    "uvx", "serena", "start-mcp-server",
+    "--context", "ide-assistant",
+    "--project", "{repo_path}",
+]
+
 # Ordered: filesystem first (the always-on base), then the two code plugins.
 BUILTIN_PLUGINS: list[dict[str, Any]] = [
     {
@@ -65,8 +76,9 @@ BUILTIN_PLUGINS: list[dict[str, Any]] = [
         "url_prefix": "/extract",
         "enabled": True,
         "builtin": True,
-        "command": None,  # default: uvx mcp-server-code-extractor
-        "description": "Symbol extractor (mcp-server-code-extractor)",
+        # default: Serena (LSP symbol tools); {repo_path} expanded at spawn time.
+        "command": list(SERENA_EXTRACT_COMMAND),
+        "description": "Symbol-level code intelligence (Serena LSP)",
         "description_overrides": {},
     },
     {
@@ -132,6 +144,23 @@ def _coerce_command(value: Any) -> list[str] | None:
         parts = [str(x).strip() for x in value if str(x).strip()]
         return parts or None
     return None
+
+
+def expand_command(value: Any, *, repo_path: str | None = None) -> list[str] | None:
+    """Coerce *value* to a command token list and expand template variables.
+
+    Supports ``{repo_path}`` → *repo_path* (the tunnel's working directory) so a
+    plugin command can target the active repo — e.g. Serena's
+    ``--project {repo_path}`` (see :data:`SERENA_EXTRACT_COMMAND`). Unknown
+    ``{...}`` placeholders are left untouched. Accepts the same shapes as
+    :func:`_coerce_command`; ``None``/empty in yields ``None``. Returns a fresh
+    list, so module-level command constants are never mutated.
+    """
+    cmd = _coerce_command(value)
+    if cmd is None:
+        return None
+    rp = repo_path or ""
+    return [tok.replace("{repo_path}", rp) for tok in cmd]
 
 
 def normalize_plugins_config(raw: Any) -> dict[str, dict]:
