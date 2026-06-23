@@ -109,6 +109,8 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "project_id": {"type": "string"}, "query": {"type": "string"}, "limit": {"type": "integer"}},
          "required": ["project_id", "query"]}},
     {"name": "generate_handoff", "description":
+        "EXECUTOR SESSIONS: MANDATORY - call at end of every session before disconnect. "
+        "Never write markdown manually. "
         "Read-only: Generate a context handoff. mode='full' writes the complete L0/L1/L2 handoff; "
         "mode='delta' returns a compact session update (completed + pending + /goal); "
         "mode='starter' returns a <=20-line block for paste-after-/compact or cold start - "
@@ -443,6 +445,7 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "item_group": {"type": "string", "description": "Filter to a specific item group."}},
          "required": ["project_id"]}},
     {"name": "add_sprint_item", "description":
+        "ALWAYS call get_sprint_items first to check for existing pending items before adding. "
         "Append a todo item to the project's sprint checklist. Use when starting work on a "
         "new version so the next session sees what's in flight. Optional: group items under "
         "a named objective with 'group'; attribute to a person with 'human_id'. "
@@ -496,6 +499,7 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "project_id": {"type": "string"}},
          "required": ["project_id"]}},
     {"name": "get_planning_brief", "description":
+        "PLANNING SESSIONS: CALL THIS FIRST before anything else. "
         "Read-only: Return a compact planning context — sprint, north star, pending items, "
         "in-progress items, recent tasks, active sessions, recent decisions, and pending HITLs. "
         "No session registration needed. Designed for planning chat sessions that need to see "

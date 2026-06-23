@@ -417,6 +417,8 @@ def build_mcp_server():
             Tool(
                 name="generate_handoff",
                 description=(
+                    "EXECUTOR SESSIONS: MANDATORY - call at end of every session "
+                    "before disconnect. Never write markdown manually. "
                     "Generate a context handoff file. Call when context is "
                     "filling up or before ending a session. mode='full' "
                     "writes the complete L0/L1/L2 handoff. mode='delta' "
@@ -1066,6 +1068,8 @@ def build_mcp_server():
             Tool(
                 name="add_sprint_item",
                 description=(
+                    "ALWAYS call get_sprint_items first to check for existing "
+                    "pending items before adding. "
                     "Append a todo item to the project's machine-trackable "
                     "sprint checklist (v1.1). Use this when you start work on "
                     "a new version so the next session sees what's in flight. "

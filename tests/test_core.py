@@ -9527,6 +9527,18 @@ async def test_add_note_mcp_tool_accepts_code_anchor(db):
     assert "file_path" in props and "symbol" in props
 
 
+def test_tool_descriptions_enforce_session_protocol():
+    """8a04b6b3 — the three behaviour-critical tools lead their descriptions with
+    an enforcement directive so the model can't miss the protocol."""
+    from meridian.mcp_tools import _MCP_TOOLS_LIST
+
+    by_name = {t["name"]: t for t in _MCP_TOOLS_LIST}
+    assert "PLANNING SESSIONS: CALL THIS FIRST" in by_name["get_planning_brief"]["description"]
+    gh = by_name["generate_handoff"]["description"]
+    assert "EXECUTOR SESSIONS: MANDATORY" in gh and "Never write markdown manually" in gh
+    assert "ALWAYS call get_sprint_items first" in by_name["add_sprint_item"]["description"]
+
+
 @pytest.mark.asyncio
 async def test_read_note_mcp_tool_pull_model(db):
     """5a5bba43 — get_notes MCP dispatch returns a no-body list by default;
