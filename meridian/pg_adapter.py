@@ -557,6 +557,8 @@ CREATE TABLE IF NOT EXISTS project_notes (
     body TEXT NOT NULL,
     tags TEXT,
     slug TEXT,
+    file_path TEXT,
+    symbol TEXT,
     created_at TEXT NOT NULL DEFAULT ({_TS}),
     updated_at TEXT NOT NULL DEFAULT ({_TS})
 );
@@ -1217,6 +1219,22 @@ async def _migrate_pg_decision_priority_edit_log(conn: PostgresConnection) -> No
     )
 
 
+async def _migrate_pg_code_anchored_notes(conn: PostgresConnection) -> None:
+    """771c00d7 — project_notes.file_path + project_notes.symbol: code-anchored notes.
+
+    A note with note_kind='code' plus a ``file_path`` (and optional ``symbol``)
+    anchors a warning/context to a file/symbol, surfaced automatically at
+    ``claim_file``/``get_file_claims``. Both nullable so normal notes are
+    unaffected. ADD COLUMN IF NOT EXISTS so re-running is a no-op.
+    """
+    await conn.executescript(
+        "ALTER TABLE project_notes ADD COLUMN IF NOT EXISTS file_path TEXT"
+    )
+    await conn.executescript(
+        "ALTER TABLE project_notes ADD COLUMN IF NOT EXISTS symbol TEXT"
+    )
+
+
 def _slugify_note_pg(title: str) -> str:
     """Kebab-case a note title (lowercase, alnum+dashes, collapse, trim).
 
@@ -1790,4 +1808,5 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_oauth_refresh_tokens,
     _migrate_pg_note_slug,
     _migrate_pg_decision_priority_edit_log,
+    _migrate_pg_code_anchored_notes,
 )

@@ -212,7 +212,11 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "Add a per-project wiki note (setup, gotcha, howto, env, ...). "
         "Free-form title/body; comma-separated tags optional. Optional kind "
         "(wiki=gotcha/rule/howto, insight=strategic/product analysis, "
-        "reference=external/one-off docs) controls how the dashboard renders it. "
+        "reference=external/one-off docs, code=warning/context anchored to a "
+        "file) controls how the dashboard renders it. For a code anchor pass "
+        "kind='code' plus file_path (and optional symbol): the note is then "
+        "surfaced automatically when a session calls claim_file/get_file_claims "
+        "for that path, so the executor sees the warning before editing. "
         "Tag a note 'roadmap' AND pass a committable category (TECHNICAL/"
         "ARCHITECTURAL/PRODUCT) to also append it to ROADMAP.md's roadmap-notes anchor.",
      "inputSchema": {"type": "object", "properties": {
@@ -220,8 +224,10 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "title": {"type": "string"},
          "body": {"type": "string"},
          "tags": {"type": "string"},
-         "kind": {"type": "string", "enum": ["wiki", "insight", "reference"]},
+         "kind": {"type": "string", "enum": ["wiki", "insight", "reference", "code"]},
          "priority": {"type": "string", "enum": ["high", "normal", "low"], "description": "high-priority notes surface first in generate_handoff and planner context."},
+         "file_path": {"type": "string", "description": "Code anchor (kind='code'): repo-relative or absolute path this note warns about. Surfaced at claim_file/get_file_claims for the same path."},
+         "symbol": {"type": "string", "description": "Optional symbol (class/function/method) to scope the code anchor to. File-level anchors (no symbol) surface for any symbol in the file."},
          "category": {"type": "string"}},
          "required": ["project_id", "title", "body"]}},
     {"name": "capture_insight", "description":
@@ -539,7 +545,9 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "Python, tree-sitter for JS/TS/C/C++/Go/Rust/Java/C#), and hard-blocks if "
         "another live session already owns an overlapping line range — the block "
         "lists which symbols are still safe to claim. Unparseable content falls "
-        "back to a whole-file lock.",
+        "back to a whole-file lock. The response includes a `code_notes` list of "
+        "code-anchored project notes (kind='code') for this file/symbol — read "
+        "them before editing.",
      "inputSchema": {"type": "object", "properties": {
          "session_id": {"type": "string"},
          "file_path": {"type": "string"},
@@ -555,9 +563,13 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
     {"name": "get_file_claims", "description":
         "Read-only: show active claims on a file — the whole-file lock (with the "
         "holder's session name, if any) plus any symbol-level claims. Use to check "
-        "who owns a file before editing it.",
+        "who owns a file before editing it. Pass project_id (and optional symbol) "
+        "to also get a `code_notes` list of code-anchored notes (kind='code') for "
+        "that path.",
      "inputSchema": {"type": "object", "properties": {
-         "file_path": {"type": "string"}},
+         "file_path": {"type": "string"},
+         "project_id": {"type": "string", "description": "Include code-anchored notes (kind='code') for this project/path in the response."},
+         "symbol": {"type": "string", "description": "Optional symbol to scope code-anchored notes to (requires project_id)."}},
          "required": ["file_path"]}},
     {"name": "get_symbol_claims", "description":
         "Read-only: list symbol-level claims on a file (who owns which class/function/method line ranges).",

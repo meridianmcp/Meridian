@@ -449,6 +449,8 @@ Add a per-project wiki note. Use for setup instructions, gotchas, environment de
 | `tags` | string | optional |  |
 | `kind` | string | optional |  |
 | `priority` | string | optional | high-priority notes surface first in generate_handoff and planner context. |
+| `file_path` | string | optional | Code anchor (kind='code'): repo-relative or absolute path this note warns about. Surfaced at claim_file/get_file_claims for the same path. |
+| `symbol` | string | optional | Optional symbol (class/function/method) to scope the code anchor to. File-level anchors (no symbol) surface for any symbol in the file. |
 | `category` | string | optional |  |
 
 **Example:**

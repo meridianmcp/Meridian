@@ -268,6 +268,8 @@ CREATE TABLE IF NOT EXISTS project_notes (
     tags TEXT,
     note_kind TEXT,
     slug TEXT,
+    file_path TEXT,
+    symbol TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
@@ -727,6 +729,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_note_slug(db)
     await _migrate_oauth_refresh_tokens(db)
     await _migrate_decision_priority_edit_log(db)
+    await _migrate_code_anchored_notes(db)
     return db
 
 
@@ -4573,6 +4576,83 @@ async def get_pool_project_counts(
 _FILE_LOCK_TTL_HOURS = 2
 
 
+def _normalize_file_path(file_path: str | None) -> str:
+    """Normalize a file path the same way ``claim_file`` stores it.
+
+    claim_file stores ``(file_path or "").strip()`` verbatim — no separator
+    rewriting — so code-anchored notes (771c00d7) must apply the *identical*
+    rule for their ``file_path`` anchor to match a claim. Centralized here so
+    the anchor and the lock can never drift apart.
+    """
+    return (file_path or "").strip()
+
+
+async def get_code_notes_for_file(
+    db: aiosqlite.Connection,
+    project_id: str,
+    file_path: str,
+    symbol: str | None = None,
+) -> list[dict[str, Any]]:
+    """771c00d7 — code-anchored notes for a file (newest first).
+
+    Returns full project_notes rows where ``note_kind='code'`` and ``file_path``
+    matches (after the same normalization ``claim_file`` applies) for the given
+    project. Symbol scoping:
+
+    * file-level anchors (note ``symbol`` is NULL/empty) always surface — they
+      apply to any symbol in the file;
+    * symbol anchors surface only when ``symbol`` is given and matches the
+      note's ``symbol``.
+
+    So ``symbol=None`` returns file-level anchors only; passing a ``symbol``
+    additionally returns anchors pinned to that symbol. Returns ``[]`` for a
+    blank path so callers can pass an un-anchored claim through unchanged.
+    """
+    normalized = _normalize_file_path(file_path)
+    if not normalized or not project_id:
+        return []
+    sym = (symbol or "").strip()
+    if sym:
+        clause = "AND (symbol IS NULL OR symbol = '' OR symbol = ?)"
+        params: list[Any] = [project_id, normalized, sym]
+    else:
+        clause = "AND (symbol IS NULL OR symbol = '')"
+        params = [project_id, normalized]
+    async with db.execute(
+        "SELECT * FROM project_notes "
+        "WHERE project_id = ? AND note_kind = 'code' AND file_path = ? "
+        f"{clause} ORDER BY created_at DESC",
+        params,
+    ) as cur:
+        rows = await cur.fetchall()
+    return [_row_to_dict(r) for r in rows if r is not None]  # type: ignore[misc]
+
+
+async def _code_notes_for_session_file(
+    db: aiosqlite.Connection,
+    session_id: str,
+    file_path: str,
+    symbol: str | None = None,
+) -> list[dict[str, Any]]:
+    """Resolve a session's project, then return its code-anchored notes for a file.
+
+    ``claim_file`` is keyed by session_id (not project_id), so we look up the
+    owning project here before delegating to :func:`get_code_notes_for_file`.
+    Best-effort: an unknown session id yields ``[]`` rather than raising, so the
+    file-lock path is never broken by the additive code-notes surface.
+    """
+    async with db.execute(
+        "SELECT project_id FROM sessions WHERE id = ?", (session_id,)
+    ) as cur:
+        row = await cur.fetchone()
+    sess = _row_to_dict(row)
+    if not sess or not sess.get("project_id"):
+        return []
+    return await get_code_notes_for_file(
+        db, sess["project_id"], file_path, symbol
+    )
+
+
 async def expire_file_locks(db: aiosqlite.Connection) -> int:
     """Delete expired file locks and return how many rows were cleared."""
     cursor = await db.execute(
@@ -4587,10 +4667,19 @@ async def claim_file(
     file_path: str,
     session_id: str,
     *,
+    symbol: str | None = None,
     ttl_hours: int = _FILE_LOCK_TTL_HOURS,
 ) -> dict[str, Any]:
-    """Claim a file path for a session, auto-releasing expired locks first."""
-    normalized = (file_path or "").strip()
+    """Claim a file path for a session, auto-releasing expired locks first.
+
+    771c00d7 — the returned dict carries a ``code_notes`` list: project notes
+    anchored to this file path (note_kind='code'), so the executor sees relevant
+    warnings/context before editing. When ``symbol`` is given, symbol-scoped
+    anchors for that symbol are preferred but file-level anchors (no symbol)
+    are always included. Empty when none. Additive — existing callers are
+    unaffected.
+    """
+    normalized = _normalize_file_path(file_path)
     if not normalized:
         raise ValueError("file_path is required")
     await expire_file_locks(db)
@@ -4608,6 +4697,9 @@ async def claim_file(
             "holder_session_id": existing.get("session_id"),
             "claimed_at": existing.get("claimed_at"),
             "expires_at": existing.get("expires_at"),
+            "code_notes": await _code_notes_for_session_file(
+                db, session_id, normalized, symbol
+            ),
         }
 
     if existing and existing.get("session_id") == session_id:
@@ -4636,6 +4728,9 @@ async def claim_file(
         "session_id": lock.get("session_id"),
         "claimed_at": lock.get("claimed_at"),
         "expires_at": lock.get("expires_at"),
+        "code_notes": await _code_notes_for_session_file(
+            db, session_id, normalized, symbol
+        ),
     }
 
 
@@ -4723,6 +4818,8 @@ async def get_file_conflict_warnings(
 async def get_file_claims(
     db: aiosqlite.Connection,
     file_path: str,
+    project_id: str | None = None,
+    symbol: str | None = None,
 ) -> dict[str, Any]:
     """Return active claims on a file: the whole-file lock plus symbol claims.
 
@@ -4730,8 +4827,13 @@ async def get_file_claims(
     lock past its TTL. ``file_lock`` is the active ``file_locks`` row (with the
     holder's ``session_name``) or ``None``; ``symbol_claims`` is the list from
     :func:`get_symbol_claims`.
+
+    771c00d7 — when ``project_id`` is supplied, the result also carries a
+    ``code_notes`` list of that project's code-anchored notes for this path
+    (symbol-scoped when ``symbol`` is given). ``project_id=None`` keeps the
+    legacy two-key result for callers that don't track a project.
     """
-    normalized = (file_path or "").strip()
+    normalized = _normalize_file_path(file_path)
     await expire_file_locks(db)
     async with db.execute(
         "SELECT fl.*, s.name AS session_name FROM file_locks fl "
@@ -4740,11 +4842,16 @@ async def get_file_claims(
         (normalized,),
     ) as cur:
         row = await cur.fetchone()
-    return {
+    result: dict[str, Any] = {
         "file_path": normalized,
         "file_lock": _row_to_dict(row),
         "symbol_claims": await get_symbol_claims(db, normalized),
     }
+    if project_id:
+        result["code_notes"] = await get_code_notes_for_file(
+            db, project_id, normalized, symbol
+        )
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -6001,30 +6108,51 @@ async def add_project_note(
     tags: str | None = None,
     kind: str | None = None,
     priority: str = "normal",
+    file_path: str | None = None,
+    symbol: str | None = None,
 ) -> dict[str, Any]:
     """Insert a project_notes row. tags is comma-separated free-form.
 
-    ``kind`` is the 9d44998b taxonomy (wiki | insight | reference); NULL is
+    ``kind`` is the note taxonomy (wiki | insight | reference | code); NULL is
     treated as 'wiki' by readers. Unknown values are coerced to NULL so the
     column stays a closed vocabulary.
 
     ``priority`` is high/normal/low; defaults to 'normal'. High-priority notes
     are surfaced first in generate_handoff and get_session_brief (planner role).
 
+    771c00d7 — a code-anchored note pins a warning/context to a file: pass
+    ``kind='code'`` plus a non-empty ``file_path`` (and optional ``symbol``).
+    The path is normalized the same way ``claim_file`` stores it so the anchor
+    matches a claim, and the note surfaces automatically at claim_file /
+    get_file_claims. ``file_path``/``symbol`` are NULL for normal notes.
+
     5a5bba43 — a kebab-cased ``slug`` is generated from the title and stored,
     unique per project (collisions get a ``-2``/``-3``/… suffix). The slug is the
     handle ``read_note(slug)`` and the dashboard's ``mem:name`` links resolve.
     """
-    if kind not in ("wiki", "insight", "reference"):
+    if kind not in ("wiki", "insight", "reference", "code"):
         kind = None
     if priority not in ("high", "normal", "low"):
         priority = "normal"
+    # 771c00d7 — code anchor: require a real path, normalize it to match claims,
+    # and keep ``symbol`` only alongside a path. Anchors are independent of kind
+    # so an explicitly anchored note still resolves even if kind was coerced.
+    anchor_path = _normalize_file_path(file_path)
+    if file_path is not None and not anchor_path:
+        raise ValueError("file_path must be a non-empty string when provided")
+    sym = (symbol or "").strip()
+    stored_path = anchor_path or None
+    stored_symbol = sym or None
+    if stored_path is None:
+        stored_symbol = None  # a symbol is meaningless without a file anchor
     nid = _new_id()
     slug = await _unique_note_slug(db, project_id, _slugify_note(title))
     await db.execute(
-        "INSERT INTO project_notes (id, project_id, title, body, tags, note_kind, priority, slug) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        (nid, project_id, title, body, tags, kind, priority, slug),
+        "INSERT INTO project_notes "
+        "(id, project_id, title, body, tags, note_kind, priority, slug, file_path, symbol) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (nid, project_id, title, body, tags, kind, priority, slug,
+         stored_path, stored_symbol),
     )
     await db.commit()
     # ITEM 6 — live push so the Notes tab refreshes without polling.

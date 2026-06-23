@@ -65,10 +65,19 @@ async def create_project_note_endpoint(
     from .. import limits as _limits  # noqa: PLC0415
     existing = await db_module.get_project_notes(await _db(request), project_id)
     _limits.check_notes_per_project(len(existing))
-    note = await db_module.add_project_note(
-        await _db(request), project_id, title, text, body.get("tags"),
-        kind=body.get("kind"),
-    )
+    # 771c00d7 — optional code anchor (kind='code' + file_path[, symbol]).
+    if body.get("file_path") is not None:
+        validate_input_size(body.get("file_path"), "note file_path", 2_000)
+    if body.get("symbol") is not None:
+        validate_input_size(body.get("symbol"), "note symbol", 500)
+    try:
+        note = await db_module.add_project_note(
+            await _db(request), project_id, title, text, body.get("tags"),
+            kind=body.get("kind"),
+            file_path=body.get("file_path"), symbol=body.get("symbol"),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
     # e5592013 — non-blocking lint: "MANUAL" notes are usually human tasks.
     if isinstance(note, dict) and "MANUAL" in title:
         note = {**note, "lint": _MANUAL_NOTE_LINT}

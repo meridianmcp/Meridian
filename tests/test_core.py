@@ -5796,10 +5796,11 @@ def test_pg_migration_registry_matches_historical_order():
         "_migrate_pg_oauth_refresh_tokens",
         "_migrate_pg_note_slug",
         "_migrate_pg_decision_priority_edit_log",
+        "_migrate_pg_code_anchored_notes",
     ]
     # No duplicates across the three groups.
     allnames = core + hosted + late
-    assert len(allnames) == len(set(allnames)) == 51
+    assert len(allnames) == len(set(allnames)) == 52
 
 
 def test_default_agent_instructions_has_code_intel_protocol():
@@ -9239,6 +9240,173 @@ async def test_note_slug_backfill_populates_preexisting_rows(db):
     await _mig._migrate_note_slug(db)
     rows2 = await db_module.get_project_notes(db, pid)
     assert sorted(r["slug"] for r in rows2) == slugs
+
+
+@pytest.mark.asyncio
+async def test_migrate_code_anchored_notes_adds_columns_idempotently(db):
+    """771c00d7 — _migrate_code_anchored_notes adds file_path + symbol to
+    project_notes, and is a no-op on re-run (and when columns already exist)."""
+    from meridian.db import migrations as _mig
+
+    # Columns exist after init_db. Drop the table's awareness by checking
+    # introspection, then prove the migration is safely idempotent.
+    assert await _mig._column_exists(db, "project_notes", "file_path")
+    assert await _mig._column_exists(db, "project_notes", "symbol")
+    # Re-running must not raise (ADD COLUMN is guarded) and columns persist.
+    await _mig._migrate_code_anchored_notes(db)
+    await _mig._migrate_code_anchored_notes(db)
+    assert await _mig._column_exists(db, "project_notes", "file_path")
+    assert await _mig._column_exists(db, "project_notes", "symbol")
+
+
+@pytest.mark.asyncio
+async def test_add_code_anchored_note_round_trip(db):
+    """771c00d7 — a kind='code' note stores file_path + symbol; normal notes
+    leave both NULL and are unaffected."""
+    p = await db_module.create_project(db, "771c00d7-roundtrip")
+    pid = p["id"]
+    coded = await db_module.add_project_note(
+        db, pid, "Careful: psycopg3 %% rule", "Use %% not % in LIKE patterns",
+        kind="code", file_path="meridian/db/__init__.py", symbol="add_project_note",
+    )
+    assert coded["note_kind"] == "code"
+    assert coded["file_path"] == "meridian/db/__init__.py"
+    assert coded["symbol"] == "add_project_note"
+
+    plain = await db_module.add_project_note(db, pid, "Setup", "rm -rf data/")
+    assert plain.get("file_path") is None
+    assert plain.get("symbol") is None
+    assert plain.get("note_kind") is None
+
+    # A blank file_path is rejected; a symbol without a path is dropped.
+    with pytest.raises(ValueError):
+        await db_module.add_project_note(
+            db, pid, "Bad", "no path", kind="code", file_path="   "
+        )
+    no_path = await db_module.add_project_note(
+        db, pid, "Sym only", "b", kind="code", symbol="Foo.bar"
+    )
+    assert no_path.get("file_path") is None
+    assert no_path.get("symbol") is None
+
+
+@pytest.mark.asyncio
+async def test_get_code_notes_for_file_matching_and_symbol_scope(db):
+    """771c00d7 — get_code_notes_for_file matches by path; file-level anchors
+    surface for any symbol, symbol anchors only for that symbol."""
+    p = await db_module.create_project(db, "771c00d7-match")
+    pid = p["id"]
+    fpath = "meridian/server.py"
+    # File-level anchor (no symbol) + two symbol-scoped anchors.
+    await db_module.add_project_note(
+        db, pid, "File warning", "whole-file gotcha", kind="code", file_path=fpath
+    )
+    await db_module.add_project_note(
+        db, pid, "login warning", "auth edge case",
+        kind="code", file_path=fpath, symbol="AuthRouter.login",
+    )
+    await db_module.add_project_note(
+        db, pid, "logout warning", "session cleanup",
+        kind="code", file_path=fpath, symbol="AuthRouter.logout",
+    )
+    # A code note on a *different* file must never leak in.
+    await db_module.add_project_note(
+        db, pid, "other file", "x", kind="code", file_path="meridian/db/__init__.py"
+    )
+    # A normal note that happens to mention nothing — must be excluded.
+    await db_module.add_project_note(db, pid, "plain", "body")
+
+    # No symbol → only the file-level anchor.
+    file_only = await db_module.get_code_notes_for_file(db, pid, fpath)
+    assert {n["title"] for n in file_only} == {"File warning"}
+
+    # symbol='AuthRouter.login' → file-level + that symbol, not the other symbol.
+    scoped = await db_module.get_code_notes_for_file(
+        db, pid, fpath, symbol="AuthRouter.login"
+    )
+    assert {n["title"] for n in scoped} == {"File warning", "login warning"}
+
+    # A path with no anchors → empty. Blank path / project → empty.
+    assert await db_module.get_code_notes_for_file(db, pid, "nope.py") == []
+    assert await db_module.get_code_notes_for_file(db, pid, "  ") == []
+    assert await db_module.get_code_notes_for_file(db, "", fpath) == []
+    # Path normalization mirrors claim_file (.strip()) so surrounding ws matches.
+    assert len(await db_module.get_code_notes_for_file(db, pid, f"  {fpath}  ")) == 1
+
+
+@pytest.mark.asyncio
+async def test_claim_file_surfaces_code_notes(db):
+    """771c00d7 — claim_file's response carries code_notes for an anchored file,
+    and an empty list when the file has none."""
+    p = await db_module.create_project(db, "771c00d7-claim")
+    pid = p["id"]
+    fpath = "meridian/pg_adapter.py"
+    await db_module.add_project_note(
+        db, pid, "PG anchor", "psycopg3 uses %s", kind="code", file_path=fpath
+    )
+    sess = await db_module.register_session(db, pid, "worker")
+    sid = sess["id"]
+
+    claimed = await db_module.claim_file(db, fpath, sid)
+    assert claimed["claimed"] is True
+    assert [n["title"] for n in claimed["code_notes"]] == ["PG anchor"]
+
+    # A file with no anchors → empty code_notes (still present, additive).
+    other = await db_module.claim_file(db, "meridian/static/dashboard.css", sid)
+    assert other["code_notes"] == []
+
+    # get_file_claims with project_id → code_notes; without → legacy shape.
+    claims = await db_module.get_file_claims(db, fpath, pid)
+    assert [n["title"] for n in claims["code_notes"]] == ["PG anchor"]
+    legacy = await db_module.get_file_claims(db, fpath)
+    assert "code_notes" not in legacy
+
+
+@pytest.mark.asyncio
+async def test_claim_file_mcp_dispatch_includes_code_notes(db):
+    """771c00d7 — the claim_file MCP dispatch surfaces code_notes end-to-end."""
+    import meridian.server as srv
+
+    p = await db_module.create_project(db, "771c00d7-mcp")
+    pid = p["id"]
+    fpath = "meridian/mcp/handler.py"
+    await db_module.add_project_note(
+        db, pid, "Dispatch note", "watch the order", kind="code", file_path=fpath
+    )
+    sess = await db_module.register_session(db, pid, "mcp-worker")
+    out = await srv._dispatch_mcp_tool(
+        "claim_file", {"session_id": sess["id"], "file_path": fpath}, db, "/tmp"
+    )
+    assert out["claimed"] is True
+    assert [n["title"] for n in out["code_notes"]] == ["Dispatch note"]
+
+
+@pytest.mark.asyncio
+async def test_add_note_mcp_tool_accepts_code_anchor(db):
+    """771c00d7 — the add_note MCP tool stores a code anchor; schema advertises
+    file_path/symbol and the 'code' kind."""
+    import meridian.server as srv
+    from meridian.mcp_tools import _MCP_TOOLS_LIST
+
+    p = await db_module.create_project(db, "771c00d7-addnote")
+    pid = p["id"]
+    note = await srv._dispatch_mcp_tool(
+        "add_note",
+        {
+            "project_id": pid, "title": "anchor", "body": "b",
+            "kind": "code", "file_path": "meridian/db/__init__.py",
+            "symbol": "claim_file",
+        },
+        db, "/tmp",
+    )
+    assert note["note_kind"] == "code"
+    assert note["file_path"] == "meridian/db/__init__.py"
+    assert note["symbol"] == "claim_file"
+
+    by_name = {t["name"]: t for t in _MCP_TOOLS_LIST}
+    props = by_name["add_note"]["inputSchema"]["properties"]
+    assert "code" in props["kind"]["enum"]
+    assert "file_path" in props and "symbol" in props
 
 
 @pytest.mark.asyncio

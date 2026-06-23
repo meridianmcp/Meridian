@@ -228,7 +228,9 @@ def build_mcp_server():
                 description=(
                     "Claim exclusive edit rights on a file path for this session. "
                     "Returns {claimed: true} on success or {claimed: false, holder_session_id} "
-                    "when another session holds the lock. Locks auto-expire after 2 hours. "
+                    "when another session holds the lock. The response also carries a "
+                    "`code_notes` list of code-anchored project notes (kind='code') for this "
+                    "path — read them before editing. Locks auto-expire after 2 hours. "
                     "Always release_file() when done editing."
                 ),
                 inputSchema={
@@ -236,6 +238,7 @@ def build_mcp_server():
                     "properties": {
                         "session_id": {"type": "string"},
                         "file_path": {"type": "string", "description": "Repo-relative or absolute file path."},
+                        "symbol": {"type": "string", "description": "Optional symbol to scope surfaced code-anchored notes to."},
                     },
                     "required": ["session_id", "file_path"],
                 },
@@ -630,7 +633,10 @@ def build_mcp_server():
                     "Add a per-project wiki note (setup, gotcha, howto, env, ...). "
                     "Free-form title/body; comma-separated tags optional. Optional kind "
                     "(wiki=gotcha/rule/howto, insight=strategic/product analysis, "
-                    "reference=external/one-off docs) controls how the dashboard renders it. "
+                    "reference=external/one-off docs, code=warning/context anchored to a file) "
+                    "controls how the dashboard renders it. For a code anchor pass kind='code' "
+                    "plus file_path (and optional symbol): the note is surfaced automatically "
+                    "when a session calls claim_file/get_file_claims for that path. "
                     "Tag a note 'roadmap' AND pass a committable category (TECHNICAL/ARCHITECTURAL/PRODUCT) "
                     "to also append it to ROADMAP.md's roadmap-notes anchor."
                 ),
@@ -643,13 +649,21 @@ def build_mcp_server():
                         "tags": {"type": "string"},
                         "kind": {
                             "type": "string",
-                            "enum": ["wiki", "insight", "reference"],
+                            "enum": ["wiki", "insight", "reference", "code"],
                             "description": "Note taxonomy for dashboard rendering.",
                         },
                         "priority": {
                             "type": "string",
                             "enum": ["high", "normal", "low"],
                             "description": "high-priority notes surface first in generate_handoff and planner context.",
+                        },
+                        "file_path": {
+                            "type": "string",
+                            "description": "Code anchor (kind='code'): path this note warns about; surfaced at claim_file/get_file_claims for the same path.",
+                        },
+                        "symbol": {
+                            "type": "string",
+                            "description": "Optional symbol (class/function/method) to scope the code anchor to. File-level anchors surface for any symbol.",
                         },
                         "category": {
                             "type": "string",
@@ -1364,6 +1378,7 @@ def build_mcp_server():
                         db,
                         arguments["file_path"],
                         arguments["session_id"],
+                        symbol=arguments.get("symbol"),
                     )
                 except ValueError as exc:
                     result = {"error": str(exc)}

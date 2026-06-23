@@ -1232,11 +1232,17 @@ async def _dispatch_mcp_tool(
     if name == "add_note":
         validate_input_size(args.get("title"), "note title", 500)
         validate_input_size(args.get("body"), "note body", 10_000_000)
-        result = await db_module.add_project_note(
-            db, args["project_id"], args["title"], args["body"],
-            args.get("tags"), kind=args.get("kind"),
-            priority=args.get("priority", "normal"),
-        )
+        validate_input_size(args.get("file_path"), "note file_path", 2_000)
+        validate_input_size(args.get("symbol"), "note symbol", 500)
+        try:
+            result = await db_module.add_project_note(
+                db, args["project_id"], args["title"], args["body"],
+                args.get("tags"), kind=args.get("kind"),
+                priority=args.get("priority", "normal"),
+                file_path=args.get("file_path"), symbol=args.get("symbol"),
+            )
+        except ValueError as exc:
+            return {"error": str(exc)}
         await _server._append_note_to_roadmap(
             args["title"], args["body"], args.get("tags"), args.get("category"),
         )
@@ -1866,11 +1872,24 @@ async def _dispatch_mcp_tool(
                 db, args["session_id"], args["file_path"], _symbol, _content
             )
             if result.get("reason") == "unparseable":
-                return await db_module.claim_file(db, args["file_path"], args["session_id"])
+                # 771c00d7 — still surface code-anchored notes (symbol-scoped) on
+                # the whole-file fallback so the executor never misses a warning.
+                return await db_module.claim_file(
+                    db, args["file_path"], args["session_id"], symbol=_symbol
+                )
+            # 771c00d7 — attach symbol-scoped code notes to the symbol claim too,
+            # resolving the project from the session (same as claim_file does).
+            result["code_notes"] = await db_module._code_notes_for_session_file(
+                db, args["session_id"], args["file_path"], _symbol,
+            )
             return result
-        return await db_module.claim_file(db, args["file_path"], args["session_id"])
+        return await db_module.claim_file(
+            db, args["file_path"], args["session_id"], symbol=_symbol
+        )
     if name == "get_file_claims":
-        return await db_module.get_file_claims(db, args["file_path"])
+        return await db_module.get_file_claims(
+            db, args["file_path"], args.get("project_id"), args.get("symbol")
+        )
     if name == "get_symbol_claims":
         return {"claims": await db_module.get_symbol_claims(db, args["file_path"])}
     if name == "get_symbol_hotspots":
