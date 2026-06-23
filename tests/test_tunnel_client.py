@@ -943,3 +943,73 @@ def test_proc_watchdog_leaves_running_proc(monkeypatch):
     except _StopLoop:
         pass
     assert spawned == []  # a running proc is never relaunched
+
+
+def test_proc_watchdog_gives_up_after_max_retries(monkeypatch):
+    """Crash isolation (edff64a6): a proxy that keeps exiting (e.g. ENOENT) is
+    relaunched at most ``max_retries`` times, then the watchdog gives up and
+    returns instead of spin-looping forever. No _StopLoop needed — if the loop
+    were still unbounded this test would hang."""
+    holder = {"proc": _DeadProc(), "cmd": ["broken-cmd"], "env": None, "label": "extract"}
+    spawned = []
+
+    # Every relaunch yields another already-dead proc → the slot never recovers.
+    def fake_popen(cmd, env=None):
+        spawned.append(cmd)
+        return _DeadProc()
+
+    monkeypatch.setattr(tc.subprocess, "Popen", fake_popen)
+
+    async def fake_sleep(_d):  # no real waiting; backoff values don't matter here
+        return None
+
+    monkeypatch.setattr(tc.asyncio, "sleep", fake_sleep)
+
+    # Terminates on its own via the give-up return (no exception).
+    asyncio.run(tc._proc_watchdog(holder, poll_interval=0, max_retries=3))
+
+    # Relaunched exactly max_retries times, then stopped.
+    assert len(spawned) == 3
+
+
+def test_proc_watchdog_healthy_tick_resets_failure_streak(monkeypatch):
+    """A proxy that recovers (a healthy tick) clears the crash streak: each
+    relaunch lives one tick then exits, so the watchdog keeps recovering it well
+    past max_retries instead of giving up — only *consecutive* failures count."""
+
+    class _FlakyProc:
+        """poll() reports running for `alive` ticks, then exits with code 1."""
+        def __init__(self, alive):
+            self._alive = alive
+            self.returncode = None
+
+        def poll(self):
+            if self._alive > 0:
+                self._alive -= 1
+                return None
+            self.returncode = 1
+            return 1
+
+    holder = {"proc": _FlakyProc(alive=0), "cmd": ["c"], "env": None, "label": "fs"}
+    spawned = []
+    calls = {"n": 0}
+
+    def fake_popen(cmd, env=None):
+        spawned.append(cmd)
+        return _FlakyProc(alive=1)  # each relaunch runs one healthy tick, then dies
+
+    monkeypatch.setattr(tc.subprocess, "Popen", fake_popen)
+
+    async def fake_sleep(_d):
+        calls["n"] += 1
+        if calls["n"] >= 10:  # plenty of ticks to exceed the cap via resets
+            raise _StopLoop()
+
+    monkeypatch.setattr(tc.asyncio, "sleep", fake_sleep)
+    try:
+        asyncio.run(tc._proc_watchdog(holder, poll_interval=0, max_retries=3))
+    except _StopLoop:
+        pass
+
+    # Recovered repeatedly — relaunch count exceeds max_retries, so it never gave up.
+    assert len(spawned) > 3

@@ -38,6 +38,9 @@ DEFAULT_EXTRACT_PROXY_PORT = 8810
 # local response surfaces as our error rather than the server's tunnel timeout.
 _LOCAL_REQUEST_TIMEOUT = 28.0
 _MAX_BACKOFF = 30.0
+# Crash isolation: how many times the watchdog relaunches a slot's proxy that
+# keeps exiting (e.g. ENOENT on a missing binary) before giving up on that slot.
+_WATCHDOG_MAX_RETRIES = 5
 
 
 def _force_utf8_io() -> None:
@@ -789,30 +792,55 @@ async def _reconnect_loop(ws_url: str, port: int, label: str) -> None:
         backoff = min(backoff * 2, _MAX_BACKOFF)
 
 
-async def _proc_watchdog(holder: dict, poll_interval: float = 3.0) -> None:
-    """Relaunch a slot's local subprocess if it dies.
+async def _proc_watchdog(
+    holder: dict, poll_interval: float = 3.0, max_retries: int = _WATCHDOG_MAX_RETRIES
+) -> None:
+    """Relaunch a slot's local subprocess if it dies — with bounded retries.
 
     ``holder`` is a mutable dict ``{"proc", "cmd", "env", "label"}``. Each tick
-    polls ``holder["proc"].poll()``; if the process has exited (returncode is not
-    None) it is re-spawned from ``holder["cmd"]`` (with ``holder["env"]``) and
-    stored back into the holder. Without this, a crashed local proxy leaves
-    127.0.0.1:880x dead — the WebSocket reconnects to the server but the tools
-    silently vanish. Runs until cancelled.
+    polls ``holder["proc"].poll()``; if the process has exited it is re-spawned
+    from ``holder["cmd"]`` (with ``holder["env"]``) and stored back into the
+    holder. Without this, a crashed local proxy leaves 127.0.0.1:880x dead — the
+    WebSocket reconnects to the server but the tools silently vanish.
+
+    Crash isolation: a proxy whose command is broken (e.g. ENOENT on a missing
+    binary) used to be relaunched every tick forever, spamming the terminal. Now
+    consecutive failures back off exponentially (capped at ``_MAX_BACKOFF``) and
+    the watchdog gives up after ``max_retries`` straight failures, leaving that
+    one slot down without taking the tunnel — or the terminal — down with it. A
+    proxy that comes back healthy resets the counter, so an occasional crash
+    still recovers. Runs until cancelled or it gives up on the slot.
     """
     label = holder.get("label", "?")
+    failures = 0
+    backoff = poll_interval
     while True:
-        await asyncio.sleep(poll_interval)
+        await asyncio.sleep(backoff)
         proc = holder.get("proc")
         if proc is None or proc.poll() is None:
-            continue  # not started, or still running
+            if proc is not None:  # a healthy tick clears the crash streak
+                failures = 0
+                backoff = poll_interval
+            continue
+        failures += 1
+        if failures > max_retries:
+            print(
+                f"tunnel:{label}: local proxy keeps exiting (code {proc.returncode}); "
+                f"giving up after {max_retries} retries — fix the command and restart "
+                f"the tunnel.",
+                file=sys.stderr, flush=True,
+            )
+            return
         print(
-            f"tunnel:{label}: local proxy exited (code {proc.returncode}); relaunching",
+            f"tunnel:{label}: local proxy exited (code {proc.returncode}); relaunching "
+            f"(attempt {failures}/{max_retries})",
             file=sys.stderr, flush=True,
         )
         try:
             holder["proc"] = subprocess.Popen(holder["cmd"], env=holder.get("env"))
-        except Exception as exc:  # noqa: BLE001 — keep watching; try again next tick
+        except Exception as exc:  # noqa: BLE001 — count it, back off, may still recover
             print(f"tunnel:{label}: relaunch failed: {exc}", file=sys.stderr, flush=True)
+        backoff = min(max(backoff, poll_interval) * 2, _MAX_BACKOFF)
 
 
 # ---------------------------------------------------------------------------
