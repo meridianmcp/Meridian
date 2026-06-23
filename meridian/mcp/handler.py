@@ -1262,9 +1262,22 @@ async def _dispatch_mcp_tool(
             priority=args.get("priority", "normal"),
         )
     if name == "get_notes":
+        # 5a5bba43 — pull model: default to the lightweight list (no bodies) so
+        # bulk note injection can't overflow context. Agents fetch one body via
+        # read_note(slug). Pass bodies=true to opt back into full rows.
         return await db_module.get_project_notes(
             db, args["project_id"], tag=args.get("tag"), query=args.get("query"),
+            bodies=bool(args.get("bodies", False)),
         )
+    if name == "read_note":
+        # 5a5bba43 — the pull half of the list→read model: fetch one note's full
+        # body by its per-project slug (returned in the get_notes list).
+        note = await db_module.get_project_note_by_slug(
+            db, args["project_id"], args["slug"],
+        )
+        if note is None:
+            return {"error": f"note '{args['slug']}' not found in project {args['project_id']}"}
+        return note
     if name == "delete_note":
         ok = await db_module.delete_project_note(db, args["note_id"])
         return {"deleted": ok}
@@ -1964,7 +1977,8 @@ async def _dispatch_mcp_tool(
             except Exception:
                 pass
             try:
-                _wiki_notes = await db_module.get_project_notes(db, project_id)
+                # 5a5bba43 — planner context renders note bodies, so ask for them.
+                _wiki_notes = await db_module.get_project_notes(db, project_id, bodies=True)
                 # High-priority notes first
                 _wiki_notes = sorted(_wiki_notes, key=lambda n: {"high": 0, "normal": 1, "low": 2}.get(n.get("priority", "normal"), 1))
                 if _wiki_notes:

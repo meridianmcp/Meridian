@@ -1,6 +1,6 @@
 # MCP Tool Reference
 
-Meridian exposes **61 tools** over MCP.
+Meridian exposes **62 tools** over MCP.
 
 They fall into two usage patterns:
 
@@ -458,17 +458,34 @@ add_note(project_id="abc-123", title="Deploy note", body="Reminder: update env v
 
 
 ### `get_notes`
-Read-only: List project notes (newest first). Filter by tag substring.
+Read-only: List project notes (newest first), LIGHTWEIGHT by default — id/slug/title/tags/kind/priority/timestamps with NO body, so the list can't overflow context. Pull model: scan the list, then `read_note(project_id, slug)` for one note's full body. Filter by tag substring or `query` full-text search. Pass `bodies=true` only when you truly need every body inline.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `project_id` | string | required |  |
 | `tag` | string | optional |  |
 | `query` | string | optional | Text search across note title and body (case-insensitive). |
+| `bodies` | boolean | optional | Default false. true returns full note bodies inline (legacy behavior) — usually unnecessary; prefer read_note(slug). |
 
 **Example:**
 ```
 get_notes(project_id="abc-123")
+```
+
+---
+
+
+### `read_note`
+Read-only: Fetch one project note's full body by its per-project `slug` (the `slug` field from `get_notes`). The pull half of the list→read model.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `project_id` | string | required |  |
+| `slug` | string | required | The note's slug (kebab-cased, unique per project) as returned by get_notes. |
+
+**Example:**
+```
+read_note(project_id="abc-123", slug="deploy-note")
 ```
 
 ---

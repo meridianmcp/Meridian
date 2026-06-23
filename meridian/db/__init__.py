@@ -265,6 +265,7 @@ CREATE TABLE IF NOT EXISTS project_notes (
     body TEXT NOT NULL,
     tags TEXT,
     note_kind TEXT,
+    slug TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
@@ -721,6 +722,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_tunnel_plugins(db)
     await _migrate_notes_priority(db)
     await _migrate_task_log_kind(db)
+    await _migrate_note_slug(db)
     await _migrate_oauth_refresh_tokens(db)
     return db
 
@@ -5887,6 +5889,33 @@ async def get_team_summary(
 # ---------------------------------------------------------------------------
 
 
+async def _unique_note_slug(
+    db: aiosqlite.Connection,
+    project_id: str,
+    base: str,
+    exclude_id: str | None = None,
+) -> str:
+    """Return ``base``, or base-2/base-3/… if the slug is taken in this project.
+
+    Slugs are unique *per project* (Obsidian ``mem:name`` style), so the same
+    slug may exist under different projects. ``exclude_id`` lets a row keep its
+    own slug on update without colliding with itself.
+    """
+    slug = base
+    n = 1
+    while True:
+        async with db.execute(
+            "SELECT id FROM project_notes WHERE project_id = ? AND slug = ?",
+            (project_id, slug),
+        ) as cur:
+            row = await cur.fetchone()
+        existing = _row_to_dict(row)
+        if existing is None or existing.get("id") == exclude_id:
+            return slug
+        n += 1
+        slug = f"{base}-{n}"
+
+
 async def add_project_note(
     db: aiosqlite.Connection,
     project_id: str,
@@ -5904,16 +5933,21 @@ async def add_project_note(
 
     ``priority`` is high/normal/low; defaults to 'normal'. High-priority notes
     are surfaced first in generate_handoff and get_session_brief (planner role).
+
+    5a5bba43 — a kebab-cased ``slug`` is generated from the title and stored,
+    unique per project (collisions get a ``-2``/``-3``/… suffix). The slug is the
+    handle ``read_note(slug)`` and the dashboard's ``mem:name`` links resolve.
     """
     if kind not in ("wiki", "insight", "reference"):
         kind = None
     if priority not in ("high", "normal", "low"):
         priority = "normal"
     nid = _new_id()
+    slug = await _unique_note_slug(db, project_id, _slugify_note(title))
     await db.execute(
-        "INSERT INTO project_notes (id, project_id, title, body, tags, note_kind, priority) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (nid, project_id, title, body, tags, kind, priority),
+        "INSERT INTO project_notes (id, project_id, title, body, tags, note_kind, priority, slug) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (nid, project_id, title, body, tags, kind, priority, slug),
     )
     await db.commit()
     # ITEM 6 — live push so the Notes tab refreshes without polling.
@@ -5936,9 +5970,21 @@ async def get_project_notes(
     project_id: str,
     tag: str | None = None,
     query: str | None = None,
+    bodies: bool = False,
 ) -> list[dict[str, Any]]:
     """Return notes for a project, newest first. Optional tag filter (substring
-    match on tags) and/or text query (searches title + body)."""
+    match on tags) and/or text query (searches title + body).
+
+    5a5bba43 — pull model: by default (``bodies=False``) the returned rows OMIT
+    the ``body`` field — a lightweight id/slug/title/kind/priority/timestamps
+    list — so bulk note injection can't overflow an agent's context. Callers
+    that actually render note bodies (dashboard notes view, handoff, planner
+    context) pass ``bodies=True``; agents fetch a single body on demand via
+    ``read_note(slug)`` → ``get_project_note_by_slug``.
+
+    The ``query`` filter always searches the body even when bodies are omitted
+    from the result — the search happens in SQL, the body just isn't returned.
+    """
     is_pg = hasattr(db, "_pool")
     clauses: list[str] = ["project_id = ?"]
     params: list[Any] = [project_id]
@@ -5953,12 +5999,36 @@ async def get_project_notes(
             clauses.append("(title LIKE ? OR body LIKE ?)")
         params.extend([like_pat, like_pat])
     where = " AND ".join(clauses)
+    # Lightweight projection (no body) by default for context economy. Explicit
+    # column list — keep in sync with the project_notes schema.
+    cols = (
+        "*"
+        if bodies
+        else "id, project_id, title, tags, note_kind, priority, slug, "
+        "created_at, updated_at"
+    )
     async with db.execute(
-        f"SELECT * FROM project_notes WHERE {where} ORDER BY created_at DESC",
+        f"SELECT {cols} FROM project_notes WHERE {where} ORDER BY created_at DESC",
         params or None,
     ) as cur:
         rows = await cur.fetchall()
     return [_row_to_dict(r) for r in rows if r is not None]  # type: ignore[misc]
+
+
+async def get_project_note_by_slug(
+    db: aiosqlite.Connection, project_id: str, slug: str
+) -> dict[str, Any] | None:
+    """5a5bba43 — fetch a single full note (incl. body) by its per-project slug.
+
+    Backs the ``read_note(slug)`` MCP tool — the pull half of the list→read
+    model. Returns None when no note with that slug exists in the project.
+    """
+    async with db.execute(
+        "SELECT * FROM project_notes WHERE project_id = ? AND slug = ?",
+        (project_id, slug),
+    ) as cur:
+        row = await cur.fetchone()
+    return _row_to_dict(row)
 
 
 async def update_project_note(

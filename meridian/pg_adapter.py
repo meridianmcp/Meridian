@@ -554,6 +554,7 @@ CREATE TABLE IF NOT EXISTS project_notes (
     title TEXT NOT NULL,
     body TEXT NOT NULL,
     tags TEXT,
+    slug TEXT,
     created_at TEXT NOT NULL DEFAULT ({_TS}),
     updated_at TEXT NOT NULL DEFAULT ({_TS})
 );
@@ -1155,6 +1156,56 @@ async def _migrate_pg_oauth_refresh_tokens(conn: PostgresConnection) -> None:
     )
 
 
+async def _migrate_pg_note_slug(conn: PostgresConnection) -> None:
+    """5a5bba43 — project_notes.slug: Obsidian ``mem:name`` style handle.
+
+    Adds a nullable ``slug`` column and backfills pre-existing rows with a
+    kebab-cased, per-project-unique slug derived from the title. Idempotent:
+    ADD COLUMN IF NOT EXISTS plus a backfill that only fills NULL/empty slugs,
+    so re-running on an already-migrated DB is a no-op. The uniqueness loop runs
+    in Python (mirrors the SQLite path) to stay in sync with add_project_note's
+    collision suffixing.
+    """
+    await conn.executescript(
+        "ALTER TABLE project_notes ADD COLUMN IF NOT EXISTS slug TEXT"
+    )
+    async with conn.execute(
+        "SELECT id, project_id, title FROM project_notes "
+        "WHERE slug IS NULL OR slug = '' ORDER BY created_at ASC, id ASC"
+    ) as cur:
+        rows = list(await cur.fetchall())
+    if not rows:
+        return
+    used: dict[str, set[str]] = {}
+    async with conn.execute(
+        "SELECT project_id, slug FROM project_notes "
+        "WHERE slug IS NOT NULL AND slug != ''"
+    ) as cur:
+        for r in await cur.fetchall():
+            used.setdefault(r["project_id"], set()).add(r["slug"])
+    for r in rows:
+        seen = used.setdefault(r["project_id"], set())
+        base = _slugify_note_pg(r["title"])
+        slug = base
+        n = 1
+        while slug in seen:
+            n += 1
+            slug = f"{base}-{n}"
+        seen.add(slug)
+        await conn.execute(
+            "UPDATE project_notes SET slug = ? WHERE id = ?", (slug, r["id"])
+        )
+
+
+def _slugify_note_pg(title: str) -> str:
+    """Kebab-case a note title (lowercase, alnum+dashes, collapse, trim).
+
+    Mirrors db.migrations._slugify_note / db._slugify_note so SQLite and
+    Postgres produce identical slugs."""
+    slug = re.sub(r"[^a-z0-9]+", "-", (title or "").lower()).strip("-")
+    return slug or "note"
+
+
 async def get_project_ntfy_url(
     db: PostgresConnection, project_id: str
 ) -> str | None:
@@ -1717,4 +1768,5 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_notes_priority,
     _migrate_pg_task_log_kind,
     _migrate_pg_oauth_refresh_tokens,
+    _migrate_pg_note_slug,
 )

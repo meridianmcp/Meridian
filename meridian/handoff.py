@@ -709,7 +709,8 @@ async def generate_handoff(
 
     # v2.4 — L0/L1/L2 data sources
     pinned_decisions = await db_module.get_pinned_decisions(db, project_id)
-    project_notes = await db_module.get_project_notes(db, project_id)
+    # 5a5bba43 — handoff renders note bodies, so request the full rows.
+    project_notes = await db_module.get_project_notes(db, project_id, bodies=True)
     strategic_notes = _select_strategic_notes(project_notes)
     # v3.1 — workspace decisions + notes apply across all projects.
     workspace_decisions = await db_module.get_workspace_decisions(db)
@@ -866,7 +867,8 @@ async def _generate_planner_handoff(
     project = await db_module.get_project(db, project_id)
     goal = await db_module.get_goal(db, project_id)
     pinned = await db_module.get_pinned_decisions(db, project_id)
-    notes = await db_module.get_project_notes(db, project_id)
+    # 5a5bba43 — planner brief renders note bodies, so request the full rows.
+    notes = await db_module.get_project_notes(db, project_id, bodies=True)
     strategic = _select_strategic_notes(notes)
     pending_items = await db_module.get_sprint_items(db, project_id, status="pending")
     tasks = await db_module.get_tasks(db, project_id, limit=10)

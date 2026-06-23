@@ -3312,7 +3312,15 @@ async def mcp_tools_doc() -> str:
     lines += ["## Notes\n"]
     lines += _render_tool("add_note",
         "Add a per-project wiki note. Use for setup instructions, gotchas, environment details, how-tos.")
-    lines += _render_tool("get_notes", "Read-only: List project notes (newest first). Filter by tag substring.")
+    lines += _render_tool("get_notes",
+        "Read-only: List project notes (newest first), LIGHTWEIGHT by default — id/slug/title/"
+        "tags/kind/priority/timestamps with NO body, so the list can't overflow context. Pull "
+        "model: scan the list, then `read_note(project_id, slug)` for one note's full body. Filter "
+        "by tag substring or `query` full-text search. Pass `bodies=true` only when you truly need "
+        "every body inline.")
+    lines += _render_tool("read_note",
+        "Read-only: Fetch one project note's full body by its per-project `slug` (the `slug` field "
+        "from `get_notes`). The pull half of the list→read model.")
     lines += _render_tool("delete_note")
     lines += ["## Projects\n"]
     lines += _render_tool("create_project")

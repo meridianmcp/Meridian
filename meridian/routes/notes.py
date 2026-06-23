@@ -16,11 +16,18 @@ router = APIRouter()
 async def list_project_notes_endpoint(
     project_id: str, request: Request, tag: str | None = None, query: str | None = None
 ) -> list[dict[str, Any]]:
-    """Project notes (newest first). ``?tag=X`` filters by tag; ``?query=X`` searches title+body."""
+    """Project notes (newest first). ``?tag=X`` filters by tag; ``?query=X`` searches title+body.
+
+    5a5bba43 — the dashboard Notes tab renders full note bodies, so this HTTP
+    endpoint returns the complete rows (``bodies=True``) for backward compat.
+    The MCP ``get_notes`` tool defaults to the lightweight (no-body) list.
+    """
     project = await db_module.get_project(await _db(request), project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="project not found")
-    return await db_module.get_project_notes(await _db(request), project_id, tag=tag, query=query)
+    return await db_module.get_project_notes(
+        await _db(request), project_id, tag=tag, query=query, bodies=True
+    )
 
 
 @router.post("/projects/{project_id}/notes", status_code=201)

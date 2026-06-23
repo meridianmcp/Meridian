@@ -12,7 +12,7 @@ from typing import Any
 
 import aiosqlite
 
-__all__ = ['_migrate_task_log_backlog_future', '_migrate_task_log_backburner', '_migrate_task_log_hitl', '_column_exists', '_migrate_add_column_if_missing', '_migrate_human_identity', '_migrate_v24_task_tree_and_framework', '_migrate_v25_feedback_and_notifications', '_migrate_v33_hitl_kind_payload', '_migrate_v34_hitl_auto_answer', '_migrate_v34_workspace_settings', '_migrate_dunning_fields', '_migrate_overage_fields', '_migrate_v26_client_type', '_migrate_ntfy_notifications', '_migrate_notify_email', '_migrate_github_integration', '_migrate_sprint_item_dependencies', '_migrate_v09_notes_and_magic_links', '_migrate_v24_pinned_decisions_and_hitl', '_migrate_goal_field_timestamps', '_migrate_task_claims', '_migrate_task_sprint_link', '_migrate_session_type', '_migrate_session_summary', '_migrate_parent_session_id', '_migrate_decisions', '_migrate_goal_mode', '_migrate_worker_pid', '_migrate_rewind_token', '_migrate_project_settings', '_migrate_neon_pool_projects_free_tier', '_migrate_tenants_free_plan', '_migrate_decisions_free_category', '_migrate_sessions_archived', '_migrate_goal_hierarchy', '_migrate_sprint_items_v2', '_migrate_drop_chat_tables', '_migrate_hosted_tables', '_migrate_session_notes', '_migrate_milestone_type', '_migrate_executor_runs', '_migrate_file_locks', '_migrate_file_symbol_claims', '_migrate_blog_posts', '_migrate_workspace_layer', '_migrate_checkpoint_data', 'init_hosted_tables', '_migrate_sprint_item_tree', '_migrate_api_token_type', '_migrate_api_tokens_expires_at', '_migrate_github_to_projects', '_migrate_touches_files', '_migrate_oauth_codes_table', '_migrate_device_codes_table', '_migrate_sprint_items_indeterminate', '_migrate_sprint_items_provisional_complete', '_migrate_workspace_members_rbac', '_migrate_project_icon', '_internal_emails', '_migrate_tenants_is_internal', '_migrate_admin_plan', '_migrate_active_worktrees', '_migrate_workspace_tenant_isolation', '_migrate_registered_hostnames', '_migrate_queued_session', '_migrate_parallel_safety', '_migrate_changelog_entries', '_migrate_agent_instructions', '_migrate_note_kind', '_migrate_tunnel_active', '_backfill_agent_instructions', '_migrate_code_intel', '_migrate_tunnel_plugins', '_migrate_notes_priority', '_migrate_task_log_kind', '_migrate_oauth_refresh_tokens']
+__all__ = ['_migrate_task_log_backlog_future', '_migrate_task_log_backburner', '_migrate_task_log_hitl', '_column_exists', '_migrate_add_column_if_missing', '_migrate_human_identity', '_migrate_v24_task_tree_and_framework', '_migrate_v25_feedback_and_notifications', '_migrate_v33_hitl_kind_payload', '_migrate_v34_hitl_auto_answer', '_migrate_v34_workspace_settings', '_migrate_dunning_fields', '_migrate_overage_fields', '_migrate_v26_client_type', '_migrate_ntfy_notifications', '_migrate_notify_email', '_migrate_github_integration', '_migrate_sprint_item_dependencies', '_migrate_v09_notes_and_magic_links', '_migrate_v24_pinned_decisions_and_hitl', '_migrate_goal_field_timestamps', '_migrate_task_claims', '_migrate_task_sprint_link', '_migrate_session_type', '_migrate_session_summary', '_migrate_parent_session_id', '_migrate_decisions', '_migrate_goal_mode', '_migrate_worker_pid', '_migrate_rewind_token', '_migrate_project_settings', '_migrate_neon_pool_projects_free_tier', '_migrate_tenants_free_plan', '_migrate_decisions_free_category', '_migrate_sessions_archived', '_migrate_goal_hierarchy', '_migrate_sprint_items_v2', '_migrate_drop_chat_tables', '_migrate_hosted_tables', '_migrate_session_notes', '_migrate_milestone_type', '_migrate_executor_runs', '_migrate_file_locks', '_migrate_file_symbol_claims', '_migrate_blog_posts', '_migrate_workspace_layer', '_migrate_checkpoint_data', 'init_hosted_tables', '_migrate_sprint_item_tree', '_migrate_api_token_type', '_migrate_api_tokens_expires_at', '_migrate_github_to_projects', '_migrate_touches_files', '_migrate_oauth_codes_table', '_migrate_device_codes_table', '_migrate_sprint_items_indeterminate', '_migrate_sprint_items_provisional_complete', '_migrate_workspace_members_rbac', '_migrate_project_icon', '_internal_emails', '_migrate_tenants_is_internal', '_migrate_admin_plan', '_migrate_active_worktrees', '_migrate_workspace_tenant_isolation', '_migrate_registered_hostnames', '_migrate_queued_session', '_migrate_parallel_safety', '_migrate_changelog_entries', '_migrate_agent_instructions', '_migrate_note_kind', '_migrate_tunnel_active', '_backfill_agent_instructions', '_migrate_code_intel', '_migrate_tunnel_plugins', '_migrate_notes_priority', '_migrate_task_log_kind', '_migrate_note_slug', '_slugify_note', '_migrate_oauth_refresh_tokens']
 
 async def _migrate_task_log_backlog_future(db: aiosqlite.Connection) -> None:
     """Rebuild ``task_log`` to add 'backlog' and 'future' statuses (v1.9.x).
@@ -193,6 +193,17 @@ async def _migrate_add_column_if_missing(
     if not await _column_exists(db, table, column):
         await db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
         await db.commit()
+
+
+def _slugify_note(title: str) -> str:
+    """Kebab-case a note title into a URL/handle-safe slug.
+
+    Lowercase, collapse any run of non-alphanumerics into a single dash, trim
+    leading/trailing dashes. Empty titles fall back to ``note`` so the column is
+    never blank. Mirrors db._slugify_note (kept here to avoid an import cycle —
+    migrations is imported *by* db/__init__)."""
+    slug = re.sub(r"[^a-z0-9]+", "-", (title or "").lower()).strip("-")
+    return slug or "note"
 
 
 async def _migrate_human_identity(db: aiosqlite.Connection) -> None:
@@ -1584,6 +1595,54 @@ async def _migrate_task_log_kind(db: aiosqlite.Connection) -> None:
     await _migrate_add_column_if_missing(
         db, "task_log", "kind", "TEXT DEFAULT 'shipped'"
     )
+
+
+async def _migrate_note_slug(db: aiosqlite.Connection) -> None:
+    """5a5bba43 — project_notes.slug: Obsidian ``mem:name`` style stable handle.
+
+    Adds a nullable ``slug`` column and backfills every existing row with a
+    kebab-cased slug derived from its title, unique per project (collisions get
+    a ``-2``/``-3``/… suffix). Idempotent: the column add is guarded, and the
+    backfill only touches rows whose slug is still NULL/empty, so re-running on
+    an already-migrated DB is a no-op.
+    """
+    await _migrate_add_column_if_missing(db, "project_notes", "slug", "TEXT")
+    # Backfill: assign slugs to any pre-existing rows that lack one. Oldest
+    # first so the unsuffixed slug goes to the earliest note on a title clash.
+    async with db.execute(
+        "SELECT id, project_id, title FROM project_notes "
+        "WHERE slug IS NULL OR slug = '' ORDER BY created_at ASC, id ASC"
+    ) as cur:
+        rows = list(await cur.fetchall())
+    if not rows:
+        return
+    # Seed used-slug sets per project from rows that already have one so the
+    # backfill never collides with an existing slug.
+    used: dict[str, set[str]] = {}
+    async with db.execute(
+        "SELECT project_id, slug FROM project_notes "
+        "WHERE slug IS NOT NULL AND slug != ''"
+    ) as cur:
+        for r in await cur.fetchall():
+            pid = r["project_id"] if isinstance(r, dict) else r[0]
+            existing_slug = r["slug"] if isinstance(r, dict) else r[1]
+            used.setdefault(pid, set()).add(existing_slug)
+    for r in rows:
+        nid = r["id"] if isinstance(r, dict) else r[0]
+        pid = r["project_id"] if isinstance(r, dict) else r[1]
+        title = r["title"] if isinstance(r, dict) else r[2]
+        seen = used.setdefault(pid, set())
+        base = _slugify_note(title)
+        slug = base
+        n = 1
+        while slug in seen:
+            n += 1
+            slug = f"{base}-{n}"
+        seen.add(slug)
+        await db.execute(
+            "UPDATE project_notes SET slug = ? WHERE id = ?", (slug, nid)
+        )
+    await db.commit()
 
 
 async def _migrate_oauth_refresh_tokens(db: aiosqlite.Connection) -> None:

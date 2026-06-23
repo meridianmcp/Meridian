@@ -649,16 +649,41 @@ def build_mcp_server():
             Tool(
                 name="get_notes",
                 description=(
-                    "v0.9 — list project notes (newest first). Optional "
-                    "``tag`` filter matches any comma-separated tag."
+                    "v0.9 — list project notes (newest first), LIGHTWEIGHT by "
+                    "default: each item is id/slug/title/tags/kind/priority/"
+                    "timestamps with NO body, so the list never overflows "
+                    "context. Pull model: scan the list, then read_note("
+                    "project_id, slug) for one note's full body. Optional "
+                    "``tag`` filter matches any comma-separated tag. Pass "
+                    "bodies=true only when you truly need every body inline."
                 ),
                 inputSchema={
                     "type": "object",
                     "properties": {
                         "project_id": {"type": "string"},
                         "tag": {"type": "string"},
+                        "bodies": {
+                            "type": "boolean",
+                            "description": "Default false. true returns full bodies inline (legacy); prefer read_note(slug).",
+                        },
                     },
                     "required": ["project_id"],
+                },
+            ),
+            Tool(
+                name="read_note",
+                description=(
+                    "5a5bba43 — fetch one project note's full body by its "
+                    "per-project slug (the ``slug`` field from get_notes). The "
+                    "pull half of the list→read model."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "project_id": {"type": "string"},
+                        "slug": {"type": "string"},
+                    },
+                    "required": ["project_id", "slug"],
                 },
             ),
             Tool(
@@ -1387,7 +1412,7 @@ def build_mcp_server():
                 "list_hitl_requests", "answer_hitl", "dismiss_hitl",
                 "update_md_section",
                 "list_sessions",
-                "add_note", "get_notes", "delete_note",
+                "add_note", "get_notes", "read_note", "delete_note",
                 "add_workspace_note", "get_workspace_notes",
                 "pin_workspace_decision", "get_workspace_decisions",
             ):

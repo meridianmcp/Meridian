@@ -30,6 +30,7 @@ _TOOL_EXAMPLES: dict[str, str] = {
     "get_hitl_request": 'get_hitl_request(request_id="hitl-uuid")',
     "add_note": 'add_note(project_id="abc-123", title="Deploy note", body="Reminder: update env vars before deploy", tags="ops,deploy")',
     "get_notes": 'get_notes(project_id="abc-123")',
+    "read_note": 'read_note(project_id="abc-123", slug="deploy-note")',
     "add_workspace_note": 'add_workspace_note(title="Onboarding", body="All repos use pixi", tags="setup")',
     "get_workspace_notes": 'get_workspace_notes(tag="setup")',
     "pin_workspace_decision": 'pin_workspace_decision(title="Monorepo", body="One repo for all services", category="ARCHITECTURAL")',
@@ -232,12 +233,28 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "priority": {"type": "string", "enum": ["high", "normal", "low"], "description": "high-priority notes appear first in planner context and generate_handoff."}},
          "required": ["project_id", "title"]}},
     {"name": "get_notes", "description":
-        "Read-only: List project notes (newest first). Optional ?tag substring filter.",
+        "Read-only: List project notes (newest first), LIGHTWEIGHT by default — "
+        "each item is id/slug/title/tags/kind/priority/timestamps with NO body, "
+        "so the list never overflows context. This is the pull model: scan the "
+        "list, then call read_note(project_id, slug) to fetch one note's full "
+        "body on demand. Optional ?tag substring filter and ?query full-text "
+        "search (matches title+body even though bodies aren't returned). Pass "
+        "bodies=true only when you truly need every body inline.",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"},
          "tag": {"type": "string"},
-         "query": {"type": "string", "description": "Text search across note title and body (case-insensitive)."}},
+         "query": {"type": "string", "description": "Text search across note title and body (case-insensitive)."},
+         "bodies": {"type": "boolean", "description": "Default false. true returns full note bodies inline (legacy behavior) — usually unnecessary; prefer read_note(slug)."}},
          "required": ["project_id"]}},
+    {"name": "read_note", "description":
+        "Read-only: Fetch one project note's full body by its per-project slug "
+        "(the ``slug`` field from get_notes). The pull half of the list→read "
+        "model — get_notes returns slugs without bodies, read_note pulls a "
+        "single body when you need it.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"},
+         "slug": {"type": "string", "description": "The note's slug (kebab-cased, unique per project) as returned by get_notes."}},
+         "required": ["project_id", "slug"]}},
     {"name": "delete_note", "description":
         "Hard-delete a project note by id.",
      "inputSchema": {"type": "object", "properties": {
@@ -599,7 +616,7 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
 ]
 
 _READ_ONLY_TOOLS = {
-    "list_projects", "get_project_by_name", "get_goal", "get_notes",
+    "list_projects", "get_project_by_name", "get_goal", "get_notes", "read_note",
     "get_pinned_decisions", "get_tasks", "search_tasks", "search_all",
     "get_session_brief", "get_context_block", "get_hitl_request",
     "list_hitl_requests", "list_sessions", "get_sprint_notes",

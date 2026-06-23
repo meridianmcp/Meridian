@@ -5794,10 +5794,11 @@ def test_pg_migration_registry_matches_historical_order():
         "_migrate_pg_notes_priority",
         "_migrate_pg_task_log_kind",
         "_migrate_pg_oauth_refresh_tokens",
+        "_migrate_pg_note_slug",
     ]
     # No duplicates across the three groups.
     allnames = core + hosted + late
-    assert len(allnames) == len(set(allnames)) == 49
+    assert len(allnames) == len(set(allnames)) == 50
 
 
 def test_default_agent_instructions_has_code_intel_protocol():
@@ -8793,6 +8794,160 @@ def test_project_note_kind_persists_and_coerces(client):
     notes = {n["title"]: n.get("note_kind") for n in client.get(f"/projects/{pid}/notes").json()}
     assert notes["Strategy"] == "insight"
     assert notes["Gotcha"] is None
+
+
+# ---------------------------------------------------------------------------
+# 5a5bba43 — note slugs + pull model (get_notes lightweight / read_note)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_add_project_note_generates_slug(db):
+    """5a5bba43 — add_project_note kebab-cases the title into a stored slug."""
+    p = await db_module.create_project(db, "5a5bba43-slug")
+    note = await db_module.add_project_note(
+        db, p["id"], "Reset the Local DB!", "rm -rf data/"
+    )
+    assert note["slug"] == "reset-the-local-db"
+
+
+@pytest.mark.asyncio
+async def test_note_slug_unique_per_project_on_collision(db):
+    """5a5bba43 — same title in one project gets -2/-3 suffixes; a different
+    project reuses the bare slug (uniqueness is per-project)."""
+    p1 = await db_module.create_project(db, "5a5bba43-coll-1")
+    p2 = await db_module.create_project(db, "5a5bba43-coll-2")
+    a = await db_module.add_project_note(db, p1["id"], "Deploy Steps", "a")
+    b = await db_module.add_project_note(db, p1["id"], "Deploy Steps", "b")
+    c = await db_module.add_project_note(db, p1["id"], "Deploy Steps", "c")
+    assert a["slug"] == "deploy-steps"
+    assert b["slug"] == "deploy-steps-2"
+    assert c["slug"] == "deploy-steps-3"
+    # Different project → bare slug is free again.
+    d = await db_module.add_project_note(db, p2["id"], "Deploy Steps", "d")
+    assert d["slug"] == "deploy-steps"
+
+
+@pytest.mark.asyncio
+async def test_get_project_notes_omits_bodies_by_default(db):
+    """5a5bba43 — pull model: default list has no body; bodies=True includes it."""
+    p = await db_module.create_project(db, "5a5bba43-bodies")
+    await db_module.add_project_note(
+        db, p["id"], "Gotcha", "secret heavy body text", tags="ops"
+    )
+    light = await db_module.get_project_notes(db, p["id"])
+    assert len(light) == 1
+    row = light[0]
+    assert "body" not in row
+    # Lightweight rows still carry the handle fields needed to drive read_note.
+    assert row["title"] == "Gotcha"
+    assert row["slug"] == "gotcha"
+    assert "id" in row and "tags" in row and "created_at" in row
+    # bodies=True restores the legacy full-row shape.
+    full = await db_module.get_project_notes(db, p["id"], bodies=True)
+    assert full[0]["body"] == "secret heavy body text"
+
+
+@pytest.mark.asyncio
+async def test_get_project_notes_query_still_searches_body_when_omitted(db):
+    """5a5bba43 — ?query searches the body in SQL even though the body field is
+    not returned in the lightweight (default) projection."""
+    p = await db_module.create_project(db, "5a5bba43-query")
+    await db_module.add_project_note(db, p["id"], "Title A", "needle in body")
+    await db_module.add_project_note(db, p["id"], "Title B", "unrelated text")
+    hits = await db_module.get_project_notes(db, p["id"], query="needle")
+    assert len(hits) == 1
+    assert hits[0]["title"] == "Title A"
+    assert "body" not in hits[0]
+
+
+@pytest.mark.asyncio
+async def test_get_project_note_by_slug_returns_full_body(db):
+    """5a5bba43 — get_project_note_by_slug returns the one full note; wrong slug
+    or wrong project returns None (slugs are per-project)."""
+    p1 = await db_module.create_project(db, "5a5bba43-by-slug-1")
+    p2 = await db_module.create_project(db, "5a5bba43-by-slug-2")
+    await db_module.add_project_note(db, p1["id"], "Env Vars", "set FOO=bar")
+    got = await db_module.get_project_note_by_slug(db, p1["id"], "env-vars")
+    assert got is not None
+    assert got["body"] == "set FOO=bar"
+    assert got["slug"] == "env-vars"
+    # Unknown slug → None.
+    assert await db_module.get_project_note_by_slug(db, p1["id"], "nope") is None
+    # Right slug, wrong project → None (per-project scoping).
+    assert await db_module.get_project_note_by_slug(db, p2["id"], "env-vars") is None
+
+
+@pytest.mark.asyncio
+async def test_note_slug_backfill_populates_preexisting_rows(db):
+    """5a5bba43 — _migrate_note_slug backfills slugs for rows inserted before the
+    column existed, unique per project, and is idempotent on re-run."""
+    from meridian.db import migrations as _mig
+
+    p = await db_module.create_project(db, "5a5bba43-backfill")
+    pid = p["id"]
+    # Simulate legacy rows by clearing the slugs the inserts generated.
+    await db_module.add_project_note(db, pid, "Same Title", "one")
+    await db_module.add_project_note(db, pid, "Same Title", "two")
+    await db_module.add_project_note(db, pid, "Other", "three")
+    await db.execute("UPDATE project_notes SET slug = NULL WHERE project_id = ?", (pid,))
+    await db.commit()
+    # Re-run the migration → every row gets a unique, kebab-cased slug.
+    await _mig._migrate_note_slug(db)
+    rows = await db_module.get_project_notes(db, pid)
+    slugs = sorted(r["slug"] for r in rows)
+    assert slugs == ["other", "same-title", "same-title-2"]
+    assert all(r["slug"] for r in rows)
+    # Idempotent: a second run leaves the now-populated slugs untouched.
+    await _mig._migrate_note_slug(db)
+    rows2 = await db_module.get_project_notes(db, pid)
+    assert sorted(r["slug"] for r in rows2) == slugs
+
+
+@pytest.mark.asyncio
+async def test_read_note_mcp_tool_pull_model(db):
+    """5a5bba43 — get_notes MCP dispatch returns a no-body list by default;
+    read_note pulls one full body by slug; unknown slug returns an error."""
+    import meridian.server as srv
+
+    p = await db_module.create_project(db, "5a5bba43-mcp-pull")
+    pid = p["id"]
+    await db_module.add_project_note(db, pid, "Deploy Note", "update env vars first")
+    # get_notes → lightweight (no body).
+    listed = await srv._dispatch_mcp_tool("get_notes", {"project_id": pid}, db, "/tmp")
+    assert len(listed) == 1
+    assert "body" not in listed[0]
+    slug = listed[0]["slug"]
+    assert slug == "deploy-note"
+    # read_note(slug) → full body.
+    one = await srv._dispatch_mcp_tool(
+        "read_note", {"project_id": pid, "slug": slug}, db, "/tmp"
+    )
+    assert one["body"] == "update env vars first"
+    # Unknown slug → error payload, not a crash.
+    miss = await srv._dispatch_mcp_tool(
+        "read_note", {"project_id": pid, "slug": "ghost"}, db, "/tmp"
+    )
+    assert "error" in miss
+    # get_notes(bodies=true) opts back into the legacy full-row shape.
+    full = await srv._dispatch_mcp_tool(
+        "get_notes", {"project_id": pid, "bodies": True}, db, "/tmp"
+    )
+    assert full[0]["body"] == "update env vars first"
+
+
+@pytest.mark.asyncio
+async def test_read_note_registered_in_tool_list():
+    """5a5bba43 — read_note is declared in the canonical MCP tool list and marked
+    read-only so the dashboard/clients surface it correctly."""
+    from meridian.mcp_tools import _MCP_TOOLS_LIST, _READ_ONLY_TOOLS
+
+    by_name = {t["name"]: t for t in _MCP_TOOLS_LIST}
+    assert "read_note" in by_name
+    schema = by_name["read_note"]["inputSchema"]
+    assert schema["required"] == ["project_id", "slug"]
+    assert "read_note" in _READ_ONLY_TOOLS
+    assert by_name["read_note"]["annotations"]["readOnlyHint"] is True
 
 
 async def test_auto_capture_writes_session_note_not_project_note():
