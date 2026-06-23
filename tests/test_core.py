@@ -12774,12 +12774,17 @@ async def test_get_planning_brief_unknown_project(db):
 
 
 def test_mcp_prompts_list():
-    """prompts/list returns both registered prompts."""
+    """prompts/list returns every registered slash-command prompt."""
     from meridian.mcp.handler import _MCP_PROMPTS
 
     names = {p["name"] for p in _MCP_PROMPTS}
-    assert "start-executor" in names
-    assert "daily-standup" in names
+    assert {
+        "start-executor",
+        "daily-standup",
+        "planning-session-start",
+        "executor-goal",
+        "hotfix-loop",
+    } <= names
     for prompt in _MCP_PROMPTS:
         assert "description" in prompt
         assert "arguments" in prompt
@@ -12853,6 +12858,77 @@ async def test_mcp_initialize_advertises_prompts(db):
     req = {"jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {}}
     res = await _handle_mcp_request(req, db, "/tmp")
     assert "prompts" in res["result"]["capabilities"]
+
+
+# a7a67388 — planning-session-start / executor-goal / hotfix-loop prompts
+
+def test_mcp_prompts_get_planning_session_start():
+    """planning-session-start returns the planner protocol scaffold."""
+    from meridian.mcp.handler import _build_prompt_messages
+
+    msgs = _build_prompt_messages("planning-session-start", {"project_id": "plan-pid"})
+    assert len(msgs) == 1 and msgs[0]["role"] == "user"
+    text = msgs[0]["content"]["text"]
+    assert "plan-pid" in text
+    assert "get_planning_brief" in text
+    assert "add_sprint_item" in text
+
+
+def test_mcp_prompts_get_hotfix_loop():
+    """hotfix-loop returns the read -> edit -> push protocol."""
+    from meridian.mcp.handler import _build_prompt_messages
+
+    msgs = _build_prompt_messages("hotfix-loop", {"project_id": "fix-pid"})
+    assert len(msgs) == 1
+    text = msgs[0]["content"]["text"]
+    assert "fix-pid" in text
+    assert "claim_file" in text
+    assert "dev" in text  # push to dev only
+
+
+@pytest.mark.asyncio
+async def test_mcp_prompts_executor_goal_template_no_project(db):
+    """executor-goal with no project resolves to a template, not an error."""
+    from meridian.mcp.handler import _build_prompt_messages_async
+
+    msgs = await _build_prompt_messages_async("executor-goal", {}, db)
+    text = msgs[0]["content"]["text"]
+    assert "/goal" in text
+    assert "start_session" in text
+
+
+@pytest.mark.asyncio
+async def test_mcp_prompts_executor_goal_live_items(db):
+    """executor-goal with a real project_id renders its live pending items."""
+    from meridian.mcp.handler import _handle_mcp_request
+
+    proj = await db_module.create_project(db, "exec-goal-core")
+    pid = proj["id"]
+    item = await db_module.add_sprint_item(db, pid, "v1", "Render live goal items")
+
+    req = {
+        "jsonrpc": "2.0", "id": 7, "method": "prompts/get",
+        "params": {"name": "executor-goal", "arguments": {"project_id": pid}},
+    }
+    res = await _handle_mcp_request(req, db, "/tmp")
+    text = res["result"]["messages"][0]["content"]["text"]
+    assert item["id"] in text
+    assert "Render live goal items" in text
+    assert res["result"]["description"]
+
+
+@pytest.mark.asyncio
+async def test_mcp_prompts_get_unknown_returns_error(db):
+    """prompts/get for an unknown name returns a -32602 JSON-RPC error."""
+    from meridian.mcp.handler import _handle_mcp_request
+
+    req = {
+        "jsonrpc": "2.0", "id": 8, "method": "prompts/get",
+        "params": {"name": "does-not-exist"},
+    }
+    res = await _handle_mcp_request(req, db, "/tmp")
+    assert res["error"]["code"] == -32602
+    assert "unknown prompt" in res["error"]["message"]
 
 
 def test_new_planning_tools_in_tool_list():

@@ -122,7 +122,94 @@ def test_tools_list_tunnel_exception_is_swallowed(monkeypatch):
 def test_prompts_list():
     resp = _run(mh._handle_mcp_request(_req("prompts/list"), db=None, data_dir="/tmp"))
     names = {p["name"] for p in resp["result"]["prompts"]}
-    assert names == {"start-executor", "daily-standup"}
+    assert names == {
+        "start-executor",
+        "daily-standup",
+        "planning-session-start",
+        "executor-goal",
+        "hotfix-loop",
+    }
+    # Every descriptor matches the MCP prompts/list shape.
+    for p in resp["result"]["prompts"]:
+        assert p["name"] and "description" in p
+        assert isinstance(p["arguments"], list)
+        for a in p["arguments"]:
+            assert {"name", "description", "required"} <= set(a)
+
+
+def test_prompts_get_planning_session_start():
+    resp = _run(mh._handle_mcp_request(
+        _req("prompts/get", {"name": "planning-session-start", "arguments": {"project_id": "pidplan"}}),
+        db=None, data_dir="/tmp",
+    ))
+    assert resp["result"]["description"]
+    text = resp["result"]["messages"][0]["content"]["text"]
+    assert text  # non-empty
+    assert "pidplan" in text
+    assert "get_planning_brief" in text
+
+
+def test_prompts_get_hotfix_loop():
+    resp = _run(mh._handle_mcp_request(
+        _req("prompts/get", {"name": "hotfix-loop", "arguments": {"project_id": "pidfix"}}),
+        db=None, data_dir="/tmp",
+    ))
+    text = resp["result"]["messages"][0]["content"]["text"]
+    assert text
+    assert "pidfix" in text
+    # read -> edit -> push protocol keywords present.
+    assert "claim_file" in text and "dev" in text
+
+
+def test_prompts_get_executor_goal_no_project_returns_template():
+    # No project_id / project_name → friendly template, not an error or crash.
+    resp = _run(mh._handle_mcp_request(
+        _req("prompts/get", {"name": "executor-goal"}),
+        db=_make_db(), data_dir="/tmp",
+    ))
+    assert "error" not in resp
+    text = resp["result"]["messages"][0]["content"]["text"]
+    assert text
+    assert "/goal" in text and "start_session" in text
+
+
+def test_prompts_get_executor_goal_live_items():
+    db = _make_db()
+    import meridian.db as db_module
+
+    async def _seed():
+        proj = await db_module.create_project(db, "exec-goal-proj")
+        pid = proj["id"]
+        item = await db_module.add_sprint_item(db, pid, "v1", "Wire the prompts endpoint")
+        return pid, item["id"]
+
+    pid, item_id = _run(_seed())
+    resp = _run(mh._handle_mcp_request(
+        _req("prompts/get", {"name": "executor-goal", "arguments": {"project_id": pid}}),
+        db=db, data_dir="/tmp",
+    ))
+    text = resp["result"]["messages"][0]["content"]["text"]
+    assert item_id in text  # the live pending item id is rendered
+    assert "Wire the prompts endpoint" in text
+    assert "complete_sprint_item" in text
+
+
+def test_prompts_get_executor_goal_by_project_name():
+    db = _make_db()
+    import meridian.db as db_module
+
+    async def _seed():
+        proj = await db_module.create_project(db, "named-exec-proj")
+        await db_module.add_sprint_item(db, proj["id"], "v1", "Item via name lookup")
+        return proj["id"]
+
+    pid = _run(_seed())
+    resp = _run(mh._handle_mcp_request(
+        _req("prompts/get", {"name": "executor-goal", "arguments": {"project_name": "named-exec-proj"}}),
+        db=db, data_dir="/tmp",
+    ))
+    text = resp["result"]["messages"][0]["content"]["text"]
+    assert "Item via name lookup" in text
 
 
 def test_prompts_get_start_executor():
@@ -160,6 +247,96 @@ def test_prompts_get_unknown_returns_invalid_params():
 def test_build_prompt_messages_unknown_raises():
     with pytest.raises(ValueError, match="unknown prompt"):
         mh._build_prompt_messages("ghost", {})
+
+
+# ---------------------------------------------------------------------------
+# stdio transport — prompts/list + prompts/get parity with the HTTP surface
+# ---------------------------------------------------------------------------
+
+def _stdio_server(monkeypatch, db):
+    """Build the stdio MCP server with its lazy DB pinned to an in-memory db.
+
+    The registered prompt handlers call the server's internal ``_ensure_db``,
+    which calls ``db_module.init_db``. Monkeypatching ``init_db`` to return our
+    pre-seeded in-memory connection lets the handlers run without opening a real
+    on-disk SQLite file.
+    """
+    import meridian.server as srv
+    import meridian.db as db_module
+
+    async def _return_db(*_a, **_k):
+        return db
+
+    monkeypatch.setattr(db_module, "init_db", _return_db)
+    monkeypatch.setenv("MERIDIAN_DB", ":memory:")
+    monkeypatch.delenv("MERIDIAN_DB_URL", raising=False)
+    server, _run_stdio = srv.build_mcp_server()
+    return server
+
+
+def test_stdio_prompts_list_matches_registry(monkeypatch):
+    import mcp.types as t
+
+    db = _make_db()
+    server = _stdio_server(monkeypatch, db)
+    handler = server.request_handlers[t.ListPromptsRequest]
+    res = _run(handler(t.ListPromptsRequest(method="prompts/list")))
+    names = {p.name for p in res.root.prompts}
+    assert names == {p["name"] for p in mh._MCP_PROMPTS}
+
+
+def test_stdio_get_prompt_hotfix_loop(monkeypatch):
+    import mcp.types as t
+
+    db = _make_db()
+    server = _stdio_server(monkeypatch, db)
+    handler = server.request_handlers[t.GetPromptRequest]
+    req = t.GetPromptRequest(
+        method="prompts/get",
+        params=t.GetPromptRequestParams(name="hotfix-loop", arguments={"project_id": "abc"}),
+    )
+    res = _run(handler(req))
+    msgs = res.root.messages
+    assert msgs and msgs[0].role == "user"
+    assert "abc" in msgs[0].content.text
+
+
+def test_stdio_get_prompt_executor_goal_live(monkeypatch):
+    import mcp.types as t
+    import meridian.db as db_module
+
+    db = _make_db()
+
+    async def _seed():
+        proj = await db_module.create_project(db, "stdio-exec-proj")
+        item = await db_module.add_sprint_item(db, proj["id"], "v1", "stdio live item")
+        return proj["id"], item["id"]
+
+    pid, item_id = _run(_seed())
+    server = _stdio_server(monkeypatch, db)
+    handler = server.request_handlers[t.GetPromptRequest]
+    req = t.GetPromptRequest(
+        method="prompts/get",
+        params=t.GetPromptRequestParams(name="executor-goal", arguments={"project_id": pid}),
+    )
+    res = _run(handler(req))
+    text = res.root.messages[0].content.text
+    assert item_id in text
+    assert "stdio live item" in text
+
+
+def test_stdio_get_prompt_unknown_raises(monkeypatch):
+    import mcp.types as t
+
+    db = _make_db()
+    server = _stdio_server(monkeypatch, db)
+    handler = server.request_handlers[t.GetPromptRequest]
+    req = t.GetPromptRequest(
+        method="prompts/get",
+        params=t.GetPromptRequestParams(name="ghost", arguments={}),
+    )
+    with pytest.raises(ValueError, match="unknown prompt"):
+        _run(handler(req))
 
 
 # ---------------------------------------------------------------------------

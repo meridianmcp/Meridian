@@ -41,8 +41,20 @@ def build_mcp_server():
 
     from mcp.server import Server
     from mcp.server.stdio import stdio_server
-    from mcp.types import TextContent, Tool
+    from mcp.types import (
+        GetPromptResult,
+        Prompt,
+        PromptArgument,
+        PromptMessage,
+        TextContent,
+        Tool,
+    )
     import json
+
+    # Slash-command prompt templates — share the exact same registry + builders
+    # as the HTTP /mcp surface (meridian/mcp/handler.py) so both transports
+    # advertise identical prompts and bodies.
+    from . import handler as _handler
 
     server: Server = Server("meridian")
 
@@ -82,6 +94,57 @@ def build_mcp_server():
                 state["db"] = await db_module.init_db(db_path)
             state["data_dir"] = str(data_dir)
         return state["db"]
+
+    @server.list_prompts()
+    async def list_prompts() -> list[Prompt]:
+        """Advertise the slash-command prompt templates (shared with HTTP /mcp)."""
+        return [
+            Prompt(
+                name=p["name"],
+                description=p.get("description", ""),
+                arguments=[
+                    PromptArgument(
+                        name=a["name"],
+                        description=a.get("description", ""),
+                        required=bool(a.get("required", False)),
+                    )
+                    for a in p.get("arguments", [])
+                ],
+            )
+            for p in _handler._MCP_PROMPTS
+        ]
+
+    @server.get_prompt()
+    async def get_prompt(
+        name: str, arguments: dict[str, str] | None
+    ) -> GetPromptResult:
+        """Render one prompt. ``executor-goal`` pulls live pending sprint items.
+
+        Delegates to the same async builder the HTTP surface uses so the two
+        transports never drift. An unknown name raises ValueError, which the MCP
+        SDK surfaces to the client as an error (mirrors the -32602 JSON-RPC error
+        on the HTTP path).
+        """
+        db = await _ensure_db()
+        messages = await _handler._build_prompt_messages_async(
+            name, arguments or {}, db
+        )
+        description = next(
+            (p["description"] for p in _handler._MCP_PROMPTS if p["name"] == name),
+            "",
+        )
+        return GetPromptResult(
+            description=description,
+            messages=[
+                PromptMessage(
+                    role=m["role"],
+                    content=TextContent(
+                        type="text", text=m["content"]["text"]
+                    ),
+                )
+                for m in messages
+            ],
+        )
 
     @server.list_tools()
     async def list_tools() -> list[Tool]:

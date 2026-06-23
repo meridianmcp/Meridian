@@ -38,11 +38,215 @@ _MCP_PROMPTS: list[dict[str, Any]] = [
             {"name": "project_id", "description": "Meridian project ID", "required": True},
         ],
     },
+    {
+        "name": "planning-session-start",
+        "description": (
+            "Planning-session scaffold — the get_planning_brief protocol and "
+            "tool-call order for a claude.ai planning chat."
+        ),
+        "arguments": [
+            {"name": "project_id", "description": "Meridian project ID", "required": False},
+            {"name": "project_name", "description": "Project name (used in the header when no id is given)", "required": False},
+        ],
+    },
+    {
+        "name": "executor-goal",
+        "description": (
+            "A /goal-style executor prompt built from the project's live pending "
+            "sprint items. Pass project_id (or project_name) for the real items; "
+            "omit both for a fill-in template."
+        ),
+        "arguments": [
+            {"name": "project_id", "description": "Meridian project ID — renders the live pending sprint items", "required": False},
+            {"name": "project_name", "description": "Project name — resolved to an id when project_id is omitted", "required": False},
+        ],
+    },
+    {
+        "name": "hotfix-loop",
+        "description": (
+            "The read → edit → push hotfix protocol for a fast, test-gated fix on "
+            "an existing Meridian project."
+        ),
+        "arguments": [
+            {"name": "project_id", "description": "Meridian project ID", "required": False},
+        ],
+    },
 ]
+
+
+def _one_user_message(text: str) -> list[dict[str, Any]]:
+    """Wrap a single prompt body in the MCP user-message envelope."""
+    return [{"role": "user", "content": {"type": "text", "text": text}}]
+
+
+async def _build_prompt_messages_async(
+    name: str, args: dict[str, Any], db: Any,
+) -> list[dict[str, Any]]:
+    """Async prompt builder — resolves dynamic prompts against the DB.
+
+    ``executor-goal`` pulls the project's live pending sprint items (reusing the
+    same goal builder generate_handoff uses) so the slash-command template
+    materialises a ready-to-run /goal string. Every other prompt is static and
+    falls through to the synchronous :func:`_build_prompt_messages`. All DB work
+    is guarded — a missing/unknown project degrades to the instructional
+    template instead of raising.
+    """
+    if name == "executor-goal":
+        return await _build_executor_goal_messages(args, db)
+    return _build_prompt_messages(name, args)
+
+
+async def _build_executor_goal_messages(
+    args: dict[str, Any], db: Any,
+) -> list[dict[str, Any]]:
+    """Build the executor-goal prompt from live pending sprint items.
+
+    Resolves the project from ``project_id`` (preferred) or ``project_name``.
+    When neither resolves to a project — or the project has no pending items —
+    returns a clear fill-in template rather than an error, so the slash command
+    is always useful even on a cold/empty project.
+    """
+    from ..handoff import _build_quick_start_goal, _prepare_pending_sprint_items
+
+    project: dict[str, Any] | None = None
+    project_id = (args.get("project_id") or "").strip()
+    project_name = (args.get("project_name") or "").strip()
+    if db is not None:
+        try:
+            if project_id:
+                project = await db_module.get_project(db, project_id)
+            elif project_name:
+                project = await db_module.get_project_by_name(db, project_name)
+        except Exception:  # noqa: BLE001 — degrade to template, never crash the prompt
+            project = None
+
+    if project is None:
+        # No project resolved → instructional template, not an error.
+        label = project_id or project_name or "<project_id>"
+        return _one_user_message(
+            f"Run an executor session for Meridian project `{label}`.\n\n"
+            "This is the template form — pass a real project_id (or project_name) "
+            "to materialise the live pending sprint items here.\n\n"
+            f"1. `start_session(project_id=\"{label}\", session_name=\"<brief task>\")` "
+            "— returns sprint focus, pending items, and recent tasks.\n"
+            "2. For each pending item: "
+            f"`claim_sprint_item(project_id=\"{label}\", item_id=\"<id>\")`, do the work, "
+            "run the test suite, then `complete_sprint_item(...)`. Do NOT ask what to work on.\n"
+            "3. `log_task(session_id=..., project_id=..., description=...)` after each meaningful step.\n"
+            "4. Between items call "
+            f"`get_sprint_progress(project_id=\"{label}\", session_id=...)` to pick up new items.\n"
+            "5. Before ending: `checkpoint(session_id=..., project_id=...)`.\n\n"
+            "/goal Complete the pending sprint items. Done when every claimed item is "
+            "marked complete via complete_sprint_item(), the test suite passes, and "
+            "generate_handoff() is called at the end. Stop after 40 turns or if HITL triggered.\n\n"
+            "Push to dev when tests pass. Never push broken code."
+        )
+
+    pid = project["id"]
+    pname = project.get("name") or pid
+    pending: list[dict[str, Any]] = []
+    try:
+        # Treat 'todo' + 'pending' as the pending bucket, exactly like
+        # generate_handoff, so freshly added items (status 'pending') and any
+        # 'todo' items both surface. Human-typed items are excluded.
+        all_items = await db_module.get_sprint_items(
+            db, pid, include_human=False,
+        )
+        pending = [
+            it for it in all_items
+            if it.get("status") in ("todo", "pending")
+        ]
+        pending = _prepare_pending_sprint_items(pending)
+    except Exception:  # noqa: BLE001 — empty list still renders a valid goal
+        pending = []
+
+    quick_start_goal = _build_quick_start_goal(pending)
+    if pending:
+        item_lines = "\n".join(
+            f"  {i}. [{it['id']}] {(it.get('title') or '').strip()}"
+            for i, it in enumerate(pending, 1)
+        )
+        items_block = f"Pending sprint items ({len(pending)}):\n{item_lines}\n\n"
+    else:
+        items_block = (
+            "No pending sprint items right now — verify the sprint is complete "
+            "or ask the planner for the next batch.\n\n"
+        )
+
+    return _one_user_message(
+        f"Run an executor session for Meridian project `{pname}` (`{pid}`).\n\n"
+        f"1. `start_session(project_id=\"{pid}\", session_name=\"<brief task>\")`.\n"
+        "2. Work the pending items below in order — "
+        f"`claim_sprint_item(project_id=\"{pid}\", item_id=...)`, do the work, run the "
+        "test suite, then `complete_sprint_item(...)`. Do NOT ask what to work on.\n"
+        "3. `log_task(session_id=..., project_id=..., description=...)` after each meaningful step.\n"
+        "4. Between items call "
+        f"`get_sprint_progress(project_id=\"{pid}\", session_id=...)` to pick up new items.\n"
+        "5. Before ending: `checkpoint(session_id=..., project_id=...)`.\n\n"
+        f"{items_block}"
+        f"{quick_start_goal}\n\n"
+        "Push to dev when tests pass. Never push broken code."
+    )
 
 
 def _build_prompt_messages(name: str, args: dict[str, Any]) -> list[dict[str, Any]]:
     pid = args.get("project_id", "<project_id>")
+    if name == "planning-session-start":
+        pid_arg = (args.get("project_id") or "").strip()
+        pname = (args.get("project_name") or "").strip()
+        header = pname or pid_arg or "this project"
+        pid_for_calls = pid_arg or "<project_id>"
+        return _one_user_message(
+            f"You are the **planner** for Meridian project {header}. Your job is "
+            "not to write code — it is to decide *what* should be built next and "
+            "in what order, then record those decisions in Meridian so executor "
+            "sessions can pick them up.\n\n"
+            "Planning protocol — call these tools in this order:\n"
+            f"1. `get_planning_brief(project_id=\"{pid_for_calls}\")` — load the compact "
+            "current state (sprint, north star, pending + in-progress items, recent "
+            "tasks, active sessions, pending HITLs).\n"
+            f"2. `get_sprint_progress(project_id=\"{pid_for_calls}\")` — see how much of the "
+            "current sprint is done vs. outstanding.\n"
+            f"3. `list_hitl_requests(project_id=\"{pid_for_calls}\")` — review open human "
+            "decisions blocking progress; answer or supersede them.\n"
+            f"4. `get_pinned_decisions(project_id=\"{pid_for_calls}\")` — re-read the "
+            "constitution so new items don't contradict prior choices.\n"
+            "5. Think through the scaffold below (current state → gaps & risks → "
+            "priorities → proposed items → open questions).\n"
+            f"6. `add_sprint_item(project_id=\"{pid_for_calls}\", title=\"...\", group=\"...\")` "
+            "— record each proposed next item.\n"
+            f"7. `pin_decision(project_id=\"{pid_for_calls}\", title=\"...\", body=\"...\", "
+            "category=\"...\")` — record any architectural / scope decisions you made.\n\n"
+            "Thinking scaffold — fill in before recording items/decisions:\n"
+            "- **Current state** — what's shipped, what's in flight.\n"
+            "- **Gaps & risks** — what's missing, fragile, or blocking.\n"
+            "- **Priorities** — the 1-3 things that matter most next, ranked.\n"
+            "- **Proposed next sprint items** — concrete items (title + group each).\n"
+            "- **Open questions** — anything needing a human decision (request_hitl if blocking)."
+        )
+    if name == "hotfix-loop":
+        pid_arg = (args.get("project_id") or "").strip() or "<project_id>"
+        return _one_user_message(
+            f"Run a hotfix loop on Meridian project `{pid_arg}` — a fast, "
+            "test-gated read → edit → push cycle for a single focused fix.\n\n"
+            f"1. `start_session(project_id=\"{pid_arg}\", session_name=\"hotfix: <what>\")` "
+            "to register and load current context.\n"
+            "2. **Read** — locate the bug. Read the failing file(s) and any test that "
+            "covers the area BEFORE editing; reproduce the failure first so you know "
+            "the fix worked.\n"
+            "3. `claim_file(session_id=..., file_path=...)` for each file you'll touch so "
+            "a parallel session doesn't collide.\n"
+            "4. **Edit** — make the minimal change that fixes the issue. No scope creep; "
+            "a hotfix touches as little as possible.\n"
+            "5. Run the full test suite and confirm it is green (do not reduce coverage). "
+            "Add or update a regression test for the bug.\n"
+            "6. `log_task(session_id=..., project_id=..., description=\"hotfix: ...\")` and "
+            "`release_file(...)` the files you claimed.\n"
+            "7. **Push** — commit and push to the dev branch only. Never push broken code, "
+            "and never push straight to main.\n"
+            "8. If anything is ambiguous or risky, "
+            f"`request_hitl(project_id=\"{pid_arg}\", question=...)` before pushing."
+        )
     if name == "start-executor":
         return [
             {
@@ -539,7 +743,7 @@ async def _handle_mcp_request(
         prompt_name = params.get("name", "")
         prompt_args = params.get("arguments") or {}
         try:
-            messages = _build_prompt_messages(prompt_name, prompt_args)
+            messages = await _build_prompt_messages_async(prompt_name, prompt_args, db)
         except ValueError as exc:
             return _server._jsonrpc_err(req_id, -32602, str(exc))
         return _server._jsonrpc_ok(req_id, {"description": next(
