@@ -1234,12 +1234,14 @@ async def _dispatch_mcp_tool(
         validate_input_size(args.get("body"), "note body", 10_000_000)
         validate_input_size(args.get("file_path"), "note file_path", 2_000)
         validate_input_size(args.get("symbol"), "note symbol", 500)
+        validate_input_size(args.get("source"), "note source", 2_000)
         try:
             result = await db_module.add_project_note(
                 db, args["project_id"], args["title"], args["body"],
                 args.get("tags"), kind=args.get("kind"),
                 priority=args.get("priority", "normal"),
                 file_path=args.get("file_path"), symbol=args.get("symbol"),
+                source=args.get("source"),
             )
         except ValueError as exc:
             return {"error": str(exc)}
@@ -1250,6 +1252,27 @@ async def _dispatch_mcp_tool(
         if isinstance(result, dict) and "MANUAL" in (args.get("title") or ""):
             result = {**result, "lint": _MANUAL_NOTE_LINT}
         return result
+    if name == "ingest_document":
+        # e3f150d0 — extract a Word/PDF/text document into a kind='document'
+        # note. Extraction (.txt/.md/.docx) is stdlib-only and server-side;
+        # PDFs/unsupported types must be pre-extracted by the caller and passed
+        # as `content`. The body cap is applied inside db.ingest_document.
+        validate_input_size(args.get("title"), "document title", 500)
+        validate_input_size(args.get("file_path"), "document file_path", 2_000)
+        validate_input_size(args.get("source"), "document source", 2_000)
+        validate_input_size(args.get("content"), "document content", 50_000_000)
+        from ..doc_ingest import DocExtractionError  # local import: optional dep-free
+        try:
+            return await db_module.ingest_document(
+                db, args["project_id"],
+                file_path=args.get("file_path"),
+                content=args.get("content"),
+                title=args.get("title"),
+                source=args.get("source"),
+                tags=args.get("tags"),
+            )
+        except (ValueError, DocExtractionError, FileNotFoundError) as exc:
+            return {"error": str(exc)}
     if name == "capture_insight":
         # db9edba3 — one-call insight capture for planning (claude.ai) sessions:
         # persists a kind='insight' note (prominent in the dashboard + surfaced in

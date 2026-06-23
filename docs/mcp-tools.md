@@ -1,6 +1,6 @@
 # MCP Tool Reference
 
-Meridian exposes **62 tools** over MCP.
+Meridian exposes **63 tools** over MCP.
 
 They fall into two usage patterns:
 
@@ -451,6 +451,7 @@ Add a per-project wiki note. Use for setup instructions, gotchas, environment de
 | `priority` | string | optional | high-priority notes surface first in generate_handoff and planner context. |
 | `file_path` | string | optional | Code anchor (kind='code'): repo-relative or absolute path this note warns about. Surfaced at claim_file/get_file_claims for the same path. |
 | `symbol` | string | optional | Optional symbol (class/function/method) to scope the code anchor to. File-level anchors (no symbol) surface for any symbol in the file. |
+| `source` | string | optional | Provenance: a URL or file path this note was ingested from. Stored on the note (used by kind='document'). |
 | `category` | string | optional |  |
 
 **Example:**

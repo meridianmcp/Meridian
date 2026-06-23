@@ -649,7 +649,7 @@ def build_mcp_server():
                         "tags": {"type": "string"},
                         "kind": {
                             "type": "string",
-                            "enum": ["wiki", "insight", "reference", "code"],
+                            "enum": ["wiki", "insight", "reference", "code", "document"],
                             "description": "Note taxonomy for dashboard rendering.",
                         },
                         "priority": {
@@ -665,12 +665,64 @@ def build_mcp_server():
                             "type": "string",
                             "description": "Optional symbol (class/function/method) to scope the code anchor to. File-level anchors surface for any symbol.",
                         },
+                        "source": {
+                            "type": "string",
+                            "description": "Provenance: a URL or file path this note was ingested from (used by kind='document').",
+                        },
                         "category": {
                             "type": "string",
                             "description": "Required when tags includes 'roadmap'. E.g. TECHNICAL, ARCHITECTURAL, PRODUCT.",
                         },
                     },
                     "required": ["project_id", "title", "body"],
+                },
+            ),
+            Tool(
+                name="ingest_document",
+                description=(
+                    "e3f150d0 — turn a Word/PDF/text document into a queryable "
+                    "kind='document' note with a source link (a report, thesis "
+                    "chapter, or spec doc becomes searchable project memory). "
+                    "Pass file_path OR content (one required): file_path is "
+                    "extracted SERVER-SIDE, STDLIB ONLY (.txt/.md/.markdown and "
+                    "source files read directly; .docx unzipped + paragraphs "
+                    "extracted, no python-docx, no new deps). For .pdf or any "
+                    "type Meridian can't parse server-side, extract the text with "
+                    "your OWN tools and pass it as content (passing a .pdf "
+                    "file_path returns an error telling you to do this). title "
+                    "defaults to the file's basename; source defaults to "
+                    "file_path. The stored body is capped (truncated with a "
+                    "'…[truncated]' marker if very long; the kept prefix stays "
+                    "searchable). Meridian never summarizes — pass a summary as "
+                    "content if you want one stored. Returns the created note "
+                    "(id, slug, title, source)."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "project_id": {"type": "string"},
+                        "file_path": {
+                            "type": "string",
+                            "description": "Path to a .txt/.md/.docx file to extract server-side (stdlib only). For .pdf or other types, pass pre-extracted text as 'content' instead.",
+                        },
+                        "content": {
+                            "type": "string",
+                            "description": "Pre-extracted document text. Use for PDFs and any type Meridian can't parse server-side. Takes precedence over file_path.",
+                        },
+                        "title": {
+                            "type": "string",
+                            "description": "Note title. Defaults to the file's basename.",
+                        },
+                        "source": {
+                            "type": "string",
+                            "description": "Provenance URL/path stored on the note. Defaults to file_path.",
+                        },
+                        "tags": {
+                            "type": "string",
+                            "description": "Comma-separated tags.",
+                        },
+                    },
+                    "required": ["project_id"],
                 },
             ),
             Tool(
@@ -1451,7 +1503,7 @@ def build_mcp_server():
                 "list_hitl_requests", "answer_hitl", "dismiss_hitl",
                 "update_md_section",
                 "list_sessions",
-                "add_note", "get_notes", "read_note", "delete_note",
+                "add_note", "ingest_document", "get_notes", "read_note", "delete_note",
                 "add_workspace_note", "get_workspace_notes",
                 "pin_workspace_decision", "get_workspace_decisions",
             ):

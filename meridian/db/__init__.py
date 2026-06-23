@@ -270,6 +270,7 @@ CREATE TABLE IF NOT EXISTS project_notes (
     slug TEXT,
     file_path TEXT,
     symbol TEXT,
+    source TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
@@ -730,6 +731,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_oauth_refresh_tokens(db)
     await _migrate_decision_priority_edit_log(db)
     await _migrate_code_anchored_notes(db)
+    await _migrate_note_source(db)
     return db
 
 
@@ -6110,12 +6112,17 @@ async def add_project_note(
     priority: str = "normal",
     file_path: str | None = None,
     symbol: str | None = None,
+    source: str | None = None,
 ) -> dict[str, Any]:
     """Insert a project_notes row. tags is comma-separated free-form.
 
-    ``kind`` is the note taxonomy (wiki | insight | reference | code); NULL is
-    treated as 'wiki' by readers. Unknown values are coerced to NULL so the
-    column stays a closed vocabulary.
+    ``kind`` is the note taxonomy (wiki | insight | reference | code |
+    document); NULL is treated as 'wiki' by readers. Unknown values are coerced
+    to NULL so the column stays a closed vocabulary.
+
+    e3f150d0 — ``source`` records where a note was ingested from (a URL or file
+    path), set by ``ingest_document`` for ``kind='document'`` notes. Nullable;
+    NULL for normal notes.
 
     ``priority`` is high/normal/low; defaults to 'normal'. High-priority notes
     are surfaced first in generate_handoff and get_session_brief (planner role).
@@ -6130,10 +6137,11 @@ async def add_project_note(
     unique per project (collisions get a ``-2``/``-3``/… suffix). The slug is the
     handle ``read_note(slug)`` and the dashboard's ``mem:name`` links resolve.
     """
-    if kind not in ("wiki", "insight", "reference", "code"):
+    if kind not in ("wiki", "insight", "reference", "code", "document"):
         kind = None
     if priority not in ("high", "normal", "low"):
         priority = "normal"
+    stored_source = (source or "").strip() or None
     # 771c00d7 — code anchor: require a real path, normalize it to match claims,
     # and keep ``symbol`` only alongside a path. Anchors are independent of kind
     # so an explicitly anchored note still resolves even if kind was coerced.
@@ -6149,10 +6157,11 @@ async def add_project_note(
     slug = await _unique_note_slug(db, project_id, _slugify_note(title))
     await db.execute(
         "INSERT INTO project_notes "
-        "(id, project_id, title, body, tags, note_kind, priority, slug, file_path, symbol) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "(id, project_id, title, body, tags, note_kind, priority, slug, "
+        "file_path, symbol, source) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (nid, project_id, title, body, tags, kind, priority, slug,
-         stored_path, stored_symbol),
+         stored_path, stored_symbol, stored_source),
     )
     await db.commit()
     # ITEM 6 — live push so the Notes tab refreshes without polling.
@@ -6168,6 +6177,70 @@ async def get_project_note(
     ) as cur:
         row = await cur.fetchone()
     return _row_to_dict(row)
+
+
+async def ingest_document(
+    db: aiosqlite.Connection,
+    project_id: str,
+    file_path: str | None = None,
+    content: str | None = None,
+    title: str | None = None,
+    source: str | None = None,
+    tags: str | None = None,
+) -> dict[str, Any]:
+    """e3f150d0 — turn a document into a queryable ``kind='document'`` note.
+
+    Body selection:
+      * ``content`` given  → use it verbatim (the caller extracted the text, e.g.
+        from a PDF with its own tooling — Meridian never parses PDFs server-side).
+      * else ``file_path`` → extract the text server-side with the stdlib-only
+        ``doc_ingest.extract_text`` (.txt/.md/.docx). Unsupported types (.pdf, …)
+        raise, telling the caller to pass ``content`` instead.
+      * neither             → ``ValueError``.
+
+    Defaults: ``title`` falls back to the file's basename (or "Untitled
+    document"); ``source`` falls back to ``file_path``. The body is capped at
+    ``doc_ingest.DOC_BODY_MAX_CHARS`` (truncated with a clear "…[truncated]"
+    marker if longer; the kept prefix stays full-text searchable). The note is
+    stored via :func:`add_project_note` with ``kind='document'`` and ``source``.
+
+    Meridian is a coordination store, not an LLM: this never summarizes. Pass a
+    summary as ``content`` if you want one stored instead of the raw text.
+    """
+    from ..doc_ingest import extract_text, cap_body  # local import: avoid cycle
+
+    if content is not None and str(content).strip() != "":
+        body = content
+        ingest_source = source if (source and source.strip()) else (file_path or None)
+    elif file_path and str(file_path).strip():
+        # Server-side, stdlib-only extraction. extract_text raises a clear
+        # UnsupportedDocumentError for .pdf and other unparseable types.
+        body = extract_text(file_path)
+        ingest_source = source if (source and source.strip()) else file_path
+    else:
+        raise ValueError(
+            "ingest_document requires either 'content' (pre-extracted text) or "
+            "'file_path' (a .txt/.md/.docx file to extract server-side)"
+        )
+
+    # Title defaults to the file's basename, else a generic placeholder.
+    doc_title = (title or "").strip()
+    if not doc_title:
+        if file_path and str(file_path).strip():
+            doc_title = os.path.basename(file_path.strip()) or "Untitled document"
+        else:
+            doc_title = "Untitled document"
+
+    capped = cap_body(body or "")
+    return await add_project_note(
+        db,
+        project_id,
+        doc_title,
+        capped,
+        tags,
+        kind="document",
+        source=(ingest_source or None),
+    )
 
 
 def _project_notes_where(

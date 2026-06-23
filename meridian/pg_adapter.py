@@ -559,6 +559,7 @@ CREATE TABLE IF NOT EXISTS project_notes (
     slug TEXT,
     file_path TEXT,
     symbol TEXT,
+    source TEXT,
     created_at TEXT NOT NULL DEFAULT ({_TS}),
     updated_at TEXT NOT NULL DEFAULT ({_TS})
 );
@@ -1235,6 +1236,19 @@ async def _migrate_pg_code_anchored_notes(conn: PostgresConnection) -> None:
     )
 
 
+async def _migrate_pg_note_source(conn: PostgresConnection) -> None:
+    """e3f150d0 — project_notes.source: provenance for an ingested note.
+
+    A document-ingested note (``note_kind='document'``) records the URL or file
+    path it was extracted from in ``source``. Nullable so normal notes are
+    unaffected. ADD COLUMN IF NOT EXISTS so re-running is a no-op. Mirrors
+    db._migrate_note_source.
+    """
+    await conn.executescript(
+        "ALTER TABLE project_notes ADD COLUMN IF NOT EXISTS source TEXT"
+    )
+
+
 def _slugify_note_pg(title: str) -> str:
     """Kebab-case a note title (lowercase, alnum+dashes, collapse, trim).
 
@@ -1809,4 +1823,5 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_note_slug,
     _migrate_pg_decision_priority_edit_log,
     _migrate_pg_code_anchored_notes,
+    _migrate_pg_note_source,
 )

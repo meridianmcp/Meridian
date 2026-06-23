@@ -29,6 +29,7 @@ _TOOL_EXAMPLES: dict[str, str] = {
     "request_hitl": 'request_hitl(project_id="abc-123", question="Should we add rate limiting here?", urgency="normal")',
     "get_hitl_request": 'get_hitl_request(request_id="hitl-uuid")',
     "add_note": 'add_note(project_id="abc-123", title="Deploy note", body="Reminder: update env vars before deploy", tags="ops,deploy")',
+    "ingest_document": 'ingest_document(project_id="abc-123", file_path="docs/spec.docx", tags="spec")  # or, for a PDF: ingest_document(project_id="abc-123", content="<text you extracted>", title="Q3 report", source="https://example.com/q3.pdf")',
     "get_notes": 'get_notes(project_id="abc-123")',
     "read_note": 'read_note(project_id="abc-123", slug="deploy-note")',
     "add_workspace_note": 'add_workspace_note(title="Onboarding", body="All repos use pixi", tags="setup")',
@@ -213,10 +214,12 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "Free-form title/body; comma-separated tags optional. Optional kind "
         "(wiki=gotcha/rule/howto, insight=strategic/product analysis, "
         "reference=external/one-off docs, code=warning/context anchored to a "
-        "file) controls how the dashboard renders it. For a code anchor pass "
-        "kind='code' plus file_path (and optional symbol): the note is then "
-        "surfaced automatically when a session calls claim_file/get_file_claims "
-        "for that path, so the executor sees the warning before editing. "
+        "file, document=ingested report/spec/thesis) controls how the dashboard "
+        "renders it. For a code anchor pass kind='code' plus file_path (and "
+        "optional symbol): the note is then surfaced automatically when a session "
+        "calls claim_file/get_file_claims for that path, so the executor sees the "
+        "warning before editing. Pass source (a URL or file path) to record where "
+        "the note came from — set automatically by ingest_document. "
         "Tag a note 'roadmap' AND pass a committable category (TECHNICAL/"
         "ARCHITECTURAL/PRODUCT) to also append it to ROADMAP.md's roadmap-notes anchor.",
      "inputSchema": {"type": "object", "properties": {
@@ -224,12 +227,36 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "title": {"type": "string"},
          "body": {"type": "string"},
          "tags": {"type": "string"},
-         "kind": {"type": "string", "enum": ["wiki", "insight", "reference", "code"]},
+         "kind": {"type": "string", "enum": ["wiki", "insight", "reference", "code", "document"]},
          "priority": {"type": "string", "enum": ["high", "normal", "low"], "description": "high-priority notes surface first in generate_handoff and planner context."},
          "file_path": {"type": "string", "description": "Code anchor (kind='code'): repo-relative or absolute path this note warns about. Surfaced at claim_file/get_file_claims for the same path."},
          "symbol": {"type": "string", "description": "Optional symbol (class/function/method) to scope the code anchor to. File-level anchors (no symbol) surface for any symbol in the file."},
+         "source": {"type": "string", "description": "Provenance: a URL or file path this note was ingested from. Stored on the note (used by kind='document')."},
          "category": {"type": "string"}},
          "required": ["project_id", "title", "body"]}},
+    {"name": "ingest_document", "description":
+        "Turn a Word/PDF/text document into a queryable kind='document' note with "
+        "a source link — a report, thesis chapter, or spec doc becomes searchable "
+        "project memory. Pass file_path OR content (one is required):\n"
+        "• file_path → Meridian extracts the text SERVER-SIDE, STDLIB ONLY: .txt/"
+        ".md/.markdown and source files are read directly; .docx is unzipped and "
+        "its paragraphs extracted (no python-docx). No new dependencies.\n"
+        "• content → use this for .pdf and anything Meridian can't parse server-"
+        "side: extract the text with YOUR OWN tools first, then pass it here. "
+        "(Passing file_path for a .pdf returns an error telling you to do this.)\n"
+        "title defaults to the file's basename; source defaults to file_path. The "
+        "stored body is capped (truncated with a '…[truncated]' marker if very "
+        "long; the kept prefix stays searchable). Meridian never summarizes — pass "
+        "a summary as content if you want one stored instead of the raw text. "
+        "Returns the created note (id, slug, title, source).",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"},
+         "file_path": {"type": "string", "description": "Path to a .txt/.md/.docx file to extract server-side (stdlib only). For .pdf or other types, pass pre-extracted text as 'content' instead."},
+         "content": {"type": "string", "description": "Pre-extracted document text. Use for PDFs and any type Meridian can't parse server-side. Takes precedence over file_path when both are given."},
+         "title": {"type": "string", "description": "Note title. Defaults to the file's basename."},
+         "source": {"type": "string", "description": "Provenance URL/path stored on the note. Defaults to file_path."},
+         "tags": {"type": "string", "description": "Comma-separated tags."}},
+         "required": ["project_id"]}},
     {"name": "capture_insight", "description":
         "Save a key takeaway from a planning (claude.ai) conversation in one call — "
         "persists a prominent kind='insight' note that's searchable, filterable, and "

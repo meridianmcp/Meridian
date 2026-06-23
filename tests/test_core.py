@@ -5797,10 +5797,11 @@ def test_pg_migration_registry_matches_historical_order():
         "_migrate_pg_note_slug",
         "_migrate_pg_decision_priority_edit_log",
         "_migrate_pg_code_anchored_notes",
+        "_migrate_pg_note_source",
     ]
     # No duplicates across the three groups.
     allnames = core + hosted + late
-    assert len(allnames) == len(set(allnames)) == 52
+    assert len(allnames) == len(set(allnames)) == 53
 
 
 def test_default_agent_instructions_has_code_intel_protocol():
@@ -9453,6 +9454,231 @@ async def test_read_note_registered_in_tool_list():
     assert schema["required"] == ["project_id", "slug"]
     assert "read_note" in _READ_ONLY_TOOLS
     assert by_name["read_note"]["annotations"]["readOnlyHint"] is True
+
+
+# ---------------------------------------------------------------------------
+# e3f150d0 — document ingestion: project_notes.source + extract_text +
+# ingest_document
+# ---------------------------------------------------------------------------
+
+
+def _build_docx(paragraphs: list[str]) -> bytes:
+    """Build a minimal valid .docx (zip with word/document.xml) in memory.
+
+    Mirrors just enough of the OOXML container for extract_docx_text to parse:
+    one <w:p> per paragraph, each wrapping a <w:t> run. Stdlib only — the test
+    never depends on python-docx (which is not installed)."""
+    import io
+    import zipfile as _zip
+
+    W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    body = "".join(
+        f'<w:p><w:r><w:t xml:space="preserve">{p}</w:t></w:r></w:p>' for p in paragraphs
+    )
+    document_xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        f'<w:document xmlns:w="{W}"><w:body>{body}</w:body></w:document>'
+    )
+    content_types = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+        '<Default Extension="xml" ContentType="application/xml"/>'
+        '<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>'
+        '</Types>'
+    )
+    buf = io.BytesIO()
+    with _zip.ZipFile(buf, "w", _zip.ZIP_DEFLATED) as zf:
+        zf.writestr("[Content_Types].xml", content_types)
+        zf.writestr("word/document.xml", document_xml)
+    return buf.getvalue()
+
+
+@pytest.mark.asyncio
+async def test_migrate_note_source_adds_column_idempotently(db):
+    """e3f150d0 — _migrate_note_source adds project_notes.source and is a no-op
+    on re-run (and when the column already exists after init_db)."""
+    from meridian.db import migrations as _mig
+
+    assert await _mig._column_exists(db, "project_notes", "source")
+    # Re-running must not raise (ADD COLUMN is guarded) and the column persists.
+    await _mig._migrate_note_source(db)
+    await _mig._migrate_note_source(db)
+    assert await _mig._column_exists(db, "project_notes", "source")
+
+
+def test_extract_text_reads_txt_and_md(tmp_path):
+    """e3f150d0 — extract_text reads plain-text/markdown files verbatim."""
+    from meridian.doc_ingest import extract_text
+
+    # Write bytes so the on-disk newlines are deterministic across OSes (text
+    # mode rewrites \n -> \r\n on Windows). extract_text reads bytes verbatim.
+    txt = tmp_path / "spec.txt"
+    txt.write_bytes(b"line one\nline two\n")
+    assert extract_text(str(txt)) == "line one\nline two\n"
+
+    md = tmp_path / "notes.md"
+    md.write_bytes("# Heading\n\nbody text".encode("utf-8"))
+    assert extract_text(str(md)) == "# Heading\n\nbody text"
+
+
+def test_extract_text_docx_paragraph_breaks(tmp_path):
+    """e3f150d0 — extract_text unzips a .docx and joins <w:t> runs with newlines
+    on <w:p> paragraph boundaries (stdlib only, no python-docx)."""
+    from meridian.doc_ingest import extract_text, extract_docx_text
+
+    data = _build_docx(["First paragraph.", "Second paragraph.", "Third."])
+    # Direct bytes API.
+    assert extract_docx_text(data) == "First paragraph.\nSecond paragraph.\nThird."
+    # Via a real .docx file on disk.
+    docx = tmp_path / "thesis.docx"
+    docx.write_bytes(data)
+    assert extract_text(str(docx)) == "First paragraph.\nSecond paragraph.\nThird."
+
+
+def test_extract_text_pdf_and_unsupported_raise_clear_error(tmp_path):
+    """e3f150d0 — .pdf (and any other unsupported type) raises a clear error
+    telling the caller to pass pre-extracted text as content."""
+    from meridian.doc_ingest import extract_text, UnsupportedDocumentError
+
+    pdf = tmp_path / "paper.pdf"
+    pdf.write_bytes(b"%PDF-1.4 fake")
+    with pytest.raises(UnsupportedDocumentError) as exc_pdf:
+        extract_text(str(pdf))
+    assert "content" in str(exc_pdf.value).lower()
+
+    weird = tmp_path / "archive.zip"
+    weird.write_bytes(b"PK\x03\x04")
+    with pytest.raises(UnsupportedDocumentError) as exc_zip:
+        extract_text(str(weird))
+    assert "content" in str(exc_zip.value).lower()
+
+    # Missing file → FileNotFoundError.
+    with pytest.raises(FileNotFoundError):
+        extract_text(str(tmp_path / "nope.txt"))
+
+
+@pytest.mark.asyncio
+async def test_ingest_document_from_content_stores_document_note(db):
+    """e3f150d0 — ingest_document with content stores a kind='document' note
+    carrying the source; title/source provided are used verbatim."""
+    p = await db_module.create_project(db, "e3f150d0-content")
+    pid = p["id"]
+    note = await db_module.ingest_document(
+        db, pid,
+        content="Q3 revenue grew 12% QoQ.",
+        title="Q3 Report",
+        source="https://example.com/q3.pdf",
+        tags="finance,report",
+    )
+    assert note["note_kind"] == "document"
+    assert note["body"] == "Q3 revenue grew 12% QoQ."
+    assert note["source"] == "https://example.com/q3.pdf"
+    assert note["title"] == "Q3 Report"
+    # Searchable like any note (body full-text query).
+    hits = await db_module.get_project_notes(db, pid, query="revenue")
+    assert any(n["id"] == note["id"] for n in hits)
+
+
+@pytest.mark.asyncio
+async def test_ingest_document_from_file_extracts_and_defaults(db, tmp_path):
+    """e3f150d0 — ingest_document with file_path extracts server-side; title
+    defaults to the basename and source defaults to file_path."""
+    p = await db_module.create_project(db, "e3f150d0-file")
+    pid = p["id"]
+    doc = tmp_path / "design-spec.txt"
+    doc.write_text("The widget must debounce input by 300ms.", encoding="utf-8")
+    note = await db_module.ingest_document(db, pid, file_path=str(doc))
+    assert note["note_kind"] == "document"
+    assert note["body"] == "The widget must debounce input by 300ms."
+    assert note["title"] == "design-spec.txt"  # basename default
+    assert note["source"] == str(doc)           # source defaults to file_path
+
+
+@pytest.mark.asyncio
+async def test_ingest_document_caps_oversized_body(db):
+    """e3f150d0 — an oversized body is truncated with the '…[truncated]' marker
+    while staying a kind='document' note."""
+    from meridian.doc_ingest import DOC_BODY_MAX_CHARS, TRUNCATION_MARKER
+
+    p = await db_module.create_project(db, "e3f150d0-cap")
+    pid = p["id"]
+    big = "x" * (DOC_BODY_MAX_CHARS + 5000)
+    note = await db_module.ingest_document(db, pid, content=big, title="huge")
+    assert note["body"].endswith(TRUNCATION_MARKER)
+    assert len(note["body"]) == DOC_BODY_MAX_CHARS + len(TRUNCATION_MARKER)
+
+
+@pytest.mark.asyncio
+async def test_ingest_document_requires_content_or_file_path(db):
+    """e3f150d0 — calling with neither content nor file_path raises ValueError."""
+    p = await db_module.create_project(db, "e3f150d0-missing")
+    pid = p["id"]
+    with pytest.raises(ValueError):
+        await db_module.ingest_document(db, pid)
+
+
+@pytest.mark.asyncio
+async def test_ingest_document_mcp_tool_round_trip(db, tmp_path):
+    """e3f150d0 — the ingest_document MCP tool extracts a .docx server-side and
+    stores a kind='document' note; the PDF path returns a clear error payload.
+    Also asserts the tool is declared in the canonical tool list."""
+    import meridian.server as srv
+    from meridian.mcp_tools import _MCP_TOOLS_LIST
+
+    p = await db_module.create_project(db, "e3f150d0-mcp")
+    pid = p["id"]
+
+    docx = tmp_path / "chapter.docx"
+    docx.write_bytes(_build_docx(["Intro.", "Method."]))
+    note = await srv._dispatch_mcp_tool(
+        "ingest_document",
+        {"project_id": pid, "file_path": str(docx), "tags": "thesis"},
+        db, "/tmp",
+    )
+    assert note["note_kind"] == "document"
+    assert note["body"] == "Intro.\nMethod."
+    assert note["title"] == "chapter.docx"
+    assert note["source"] == str(docx)
+
+    # A .pdf file_path is rejected server-side with guidance to pass content.
+    pdf = tmp_path / "scan.pdf"
+    pdf.write_bytes(b"%PDF-1.7 ...")
+    err = await srv._dispatch_mcp_tool(
+        "ingest_document", {"project_id": pid, "file_path": str(pdf)}, db, "/tmp"
+    )
+    assert "error" in err and "content" in err["error"].lower()
+
+    by_name = {t["name"]: t for t in _MCP_TOOLS_LIST}
+    assert "ingest_document" in by_name
+    assert by_name["ingest_document"]["inputSchema"]["required"] == ["project_id"]
+    # It writes, so it must not be flagged read-only.
+    assert by_name["ingest_document"]["annotations"]["readOnlyHint"] is False
+
+
+@pytest.mark.asyncio
+async def test_add_note_mcp_tool_stores_source_and_document_kind(db):
+    """e3f150d0 — the add_note MCP tool accepts source + kind='document' and the
+    schema advertises both."""
+    import meridian.server as srv
+    from meridian.mcp_tools import _MCP_TOOLS_LIST
+
+    p = await db_module.create_project(db, "e3f150d0-addnote")
+    pid = p["id"]
+    note = await srv._dispatch_mcp_tool(
+        "add_note",
+        {
+            "project_id": pid, "title": "Spec", "body": "ingested text",
+            "kind": "document", "source": "https://example.com/spec",
+        },
+        db, "/tmp",
+    )
+    assert note["note_kind"] == "document"
+    assert note["source"] == "https://example.com/spec"
+
+    by_name = {t["name"]: t for t in _MCP_TOOLS_LIST}
+    props = by_name["add_note"]["inputSchema"]["properties"]
+    assert "document" in props["kind"]["enum"]
+    assert "source" in props
 
 
 async def test_auto_capture_writes_session_note_not_project_note():
