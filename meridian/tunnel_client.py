@@ -25,6 +25,7 @@ import base64
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -41,6 +42,77 @@ _MAX_BACKOFF = 30.0
 # Crash isolation: how many times the watchdog relaunches a slot's proxy that
 # keeps exiting (e.g. ENOENT on a missing binary) before giving up on that slot.
 _WATCHDOG_MAX_RETRIES = 5
+
+
+def _spawn_kwargs() -> dict:
+    """Extra ``subprocess.Popen`` kwargs for spawning a proxy child.
+
+    On Windows, ``CREATE_NEW_PROCESS_GROUP`` puts each proxy in its own group so a
+    console Ctrl+C (``CTRL_C_EVENT``, broadcast to the whole foreground group) is
+    NOT delivered to the children. That broadcast is what makes the cmd.exe shims
+    behind ``npx``/``mcp-proxy`` pop "Terminate batch job (Y/N)?" and hang the
+    terminal on shutdown. We tear the children down explicitly instead (see
+    :func:`_terminate_proc_tree`). No-op on POSIX.
+    """
+    if sys.platform == "win32":
+        return {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+    return {}
+
+
+def _terminate_proc_tree(proc: "subprocess.Popen | None") -> None:
+    """Stop a spawned proxy *and its whole child tree*. Best-effort; never raises.
+
+    On Windows ``proc.terminate()`` only kills the direct child (the mcp-proxy
+    launcher), orphaning the node/cmd grandchildren — and, combined with a console
+    Ctrl+C, leaving the "Terminate batch job (Y/N)?" prompt. ``taskkill /F /T``
+    kills the entire tree by PID. On POSIX a terminate→wait→kill escalation is
+    enough.
+    """
+    if proc is None:
+        return
+    if sys.platform == "win32":
+        try:
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                capture_output=True, check=False,
+            )
+        except Exception:  # noqa: BLE001 — fall back to terminate below
+            try:
+                proc.terminate()
+            except Exception:  # noqa: BLE001
+                pass
+        try:
+            proc.wait(timeout=5)
+        except Exception:  # noqa: BLE001
+            try:
+                proc.kill()
+            except Exception:  # noqa: BLE001
+                pass
+        return
+    try:
+        proc.terminate()
+        proc.wait(timeout=5)
+    except Exception:  # noqa: BLE001
+        try:
+            proc.kill()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _dc_default_command() -> list[str]:
+    """Default Desktop Commander launcher, shell-wrapped per OS.
+
+    DC ships only as an npm package, so the launcher is
+    ``npx -y @wonderwhy-er/desktop-commander@latest``. On Windows ``npx`` is the
+    extension-less shim: spawned directly by mcp-proxy (no ``--shell``, since the
+    first token isn't a ``.cmd``/``.bat`` path) it raises ``ENOENT`` and the
+    watchdog spin-loops. Wrapping in ``cmd /c`` makes mcp-proxy spawn the real
+    ``cmd.exe``, which resolves ``npx`` via ``PATHEXT``. POSIX needs no wrapper.
+    """
+    base = ["npx", "-y", "@wonderwhy-er/desktop-commander@latest"]
+    if sys.platform == "win32":
+        return ["cmd", "/c", *base]
+    return base
 
 
 def _force_utf8_io() -> None:
@@ -837,7 +909,9 @@ async def _proc_watchdog(
             file=sys.stderr, flush=True,
         )
         try:
-            holder["proc"] = subprocess.Popen(holder["cmd"], env=holder.get("env"))
+            holder["proc"] = subprocess.Popen(
+                holder["cmd"], env=holder.get("env"), **_spawn_kwargs()
+            )
         except Exception as exc:  # noqa: BLE001 — count it, back off, may still recover
             print(f"tunnel:{label}: relaunch failed: {exc}", file=sys.stderr, flush=True)
         backoff = min(max(backoff, poll_interval) * 2, _MAX_BACKOFF)
@@ -1097,7 +1171,7 @@ async def run_tunnel(
         print(f"meridian tunnel: serving {_served}", flush=True)
         print(f"  filesystem proxy: http://127.0.0.1:{fs_port}", flush=True)
         try:
-            proc_fs = subprocess.Popen(cmd_fs)
+            proc_fs = subprocess.Popen(cmd_fs, **_spawn_kwargs())
             proc_holders.append({"proc": proc_fs, "cmd": cmd_fs, "env": None, "label": "fs"})
         except FileNotFoundError:
             print(
@@ -1119,7 +1193,7 @@ async def run_tunnel(
         cmd_code = _build_proxy_for_inner(npx, list(code_plugin["command"]), code_port)
         print(f"  code-intel proxy:  http://127.0.0.1:{code_port} (custom command)", flush=True)
         try:
-            proc_code = subprocess.Popen(cmd_code)
+            proc_code = subprocess.Popen(cmd_code, **_spawn_kwargs())
             proc_holders.append({"proc": proc_code, "cmd": cmd_code, "env": None, "label": "code"})
         except Exception as exc:
             print(f"  warning: could not start code-intel proxy: {exc}", file=sys.stderr)
@@ -1134,7 +1208,7 @@ async def run_tunnel(
             cmd_code = _build_code_proxy_command(npx, code_binary, code_port)
             print(f"  code-intel proxy:  http://127.0.0.1:{code_port}", flush=True)
             try:
-                proc_code = subprocess.Popen(cmd_code)
+                proc_code = subprocess.Popen(cmd_code, **_spawn_kwargs())
                 proc_holders.append({"proc": proc_code, "cmd": cmd_code, "env": None, "label": "code"})
             except Exception as exc:
                 print(f"  warning: could not start code-intel proxy: {exc}", file=sys.stderr)
@@ -1161,7 +1235,7 @@ async def run_tunnel(
             _ext_label = "" if ext_raw == SERENA_EXTRACT_COMMAND else " (custom command)"
             print(f"  code-extractor:    http://127.0.0.1:{extract_port}{_ext_label}", flush=True)
             try:
-                proc_extract = subprocess.Popen(cmd_extract)
+                proc_extract = subprocess.Popen(cmd_extract, **_spawn_kwargs())
                 proc_holders.append({"proc": proc_extract, "cmd": cmd_extract, "env": None, "label": "extract"})
             except Exception as exc:
                 print(f"  warning: could not start code-extractor proxy: {exc}", file=sys.stderr)
@@ -1172,7 +1246,7 @@ async def run_tunnel(
                 cmd_extract = _build_extractor_proxy_command(npx, extractor_inner, extract_port)
                 print(f"  code-extractor:    http://127.0.0.1:{extract_port}", flush=True)
                 try:
-                    proc_extract = subprocess.Popen(cmd_extract)
+                    proc_extract = subprocess.Popen(cmd_extract, **_spawn_kwargs())
                     proc_holders.append({"proc": proc_extract, "cmd": cmd_extract, "env": None, "label": "extract"})
                 except Exception as exc:
                     print(f"  warning: could not start code-extractor proxy: {exc}", file=sys.stderr)
@@ -1194,11 +1268,12 @@ async def run_tunnel(
         if not plugin.get("enabled", False):
             continue
         cmd = plugin.get("command")
-        # Desktop Commander: default command uses bare "npx" (not the full resolved
-        # path) so mcp-proxy's --shell mode can invoke it via PATH without hitting
-        # the 'C:\Program Files\...' space-in-path quoting bug.
+        # Desktop Commander: no command override → use the per-OS default launcher.
+        # On Windows that wraps npx in `cmd /c` so mcp-proxy spawns the real
+        # cmd.exe and resolves npx via PATHEXT (a bare "npx" inner command would
+        # ENOENT and the watchdog would spin-loop). See _dc_default_command.
         if cmd is None and slot == "dc":
-            cmd = ["npx", "-y", "@wonderwhy-er/desktop-commander@latest"]
+            cmd = _dc_default_command()
         if not cmd:
             continue
         oport = office_ports[slot]
@@ -1209,7 +1284,7 @@ async def run_tunnel(
         cmd_office = _build_proxy_for_inner(npx, list(cmd), oport)
         print(f"  {human.lower():<16}http://127.0.0.1:{oport}", flush=True)
         try:
-            office_procs[slot] = subprocess.Popen(cmd_office, env=spawn_env)
+            office_procs[slot] = subprocess.Popen(cmd_office, env=spawn_env, **_spawn_kwargs())
             proc_holders.append({"proc": office_procs[slot], "cmd": cmd_office, "env": spawn_env, "label": slot})
         except Exception as exc:
             print(f"  warning: could not start {slot} proxy: {exc}", file=sys.stderr)
@@ -1232,7 +1307,7 @@ async def run_tunnel(
         cmd_custom = _build_proxy_for_inner(npx, list(cmd_inner), cport)
         print(f"  custom:{cname:<9}http://127.0.0.1:{cport}", flush=True)
         try:
-            proc_custom = subprocess.Popen(cmd_custom)
+            proc_custom = subprocess.Popen(cmd_custom, **_spawn_kwargs())
             proc_holders.append({"proc": proc_custom, "cmd": cmd_custom, "env": None, "label": f"custom:{cname}"})
             running_custom.append({"name": cname, "port": cport})
         except Exception as exc:
@@ -1316,27 +1391,50 @@ async def run_tunnel(
     for holder in proc_holders:
         tasks.append(asyncio.ensure_future(_proc_watchdog(holder)))
 
+    # Install signal handlers so Ctrl+C (and Ctrl+Break on Windows) cancels the
+    # slot loops and runs the cleanup below. On Windows the SelectorEventLoop has
+    # no add_signal_handler, and a bare KeyboardInterrupt out of run_until_complete
+    # would leave this coroutine suspended — skipping the proxy teardown and
+    # leaking node processes. Cancelling the tasks from the handler unwinds us
+    # through the finally cleanly instead.
+    loop = asyncio.get_event_loop()
+
+    def _request_stop(_signum=None, _frame=None):
+        for t in tasks:
+            loop.call_soon_threadsafe(t.cancel)
+
+    installed_signals: list[tuple] = []
+    _sigs = [signal.SIGINT]
+    if sys.platform == "win32" and hasattr(signal, "SIGBREAK"):
+        _sigs.append(signal.SIGBREAK)
+    for _sig in _sigs:
+        try:
+            installed_signals.append((_sig, signal.getsignal(_sig)))
+            signal.signal(_sig, _request_stop)
+        except (ValueError, OSError):  # not the main thread / unsupported signal
+            pass
+
     try:
         await asyncio.gather(*tasks)
     except (KeyboardInterrupt, asyncio.CancelledError):
         print("\ntunnel: shutting down", flush=True)
         return 0
     finally:
+        # Restore the original signal handlers.
+        for _sig, _prev in installed_signals:
+            try:
+                signal.signal(_sig, _prev)
+            except (ValueError, OSError):  # noqa: PERF203
+                pass
         # Restore local MCP config first so a Ctrl+C never leaves stale tunnel URLs.
         if mcp_snapshots:
             _restore_mcp_json(mcp_snapshots)
             print("  Restored local MCP config (removed tunnel connectors).", flush=True)
         for t in tasks + index_tasks:
             t.cancel()
-        # Terminate the current proc for each slot (holder["proc"] may have been
-        # replaced by the watchdog after a relaunch).
+        # Terminate the current proc + its child tree for each slot (holder["proc"]
+        # may have been replaced by the watchdog after a relaunch). taskkill /T on
+        # Windows so the node/cmd grandchildren die too — not just the launcher.
         for holder in proc_holders:
-            proc = holder.get("proc")
-            if proc is None:
-                continue
-            proc.terminate()
-            try:
-                proc.wait(timeout=5)
-            except Exception:
-                proc.kill()
+            _terminate_proc_tree(holder.get("proc"))
     return 0

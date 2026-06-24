@@ -877,6 +877,78 @@ def test_build_proxy_for_inner_shell_for_cmd_shim_on_windows(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Windows shutdown hardening — process group + tree teardown (ff0809e1)
+# ---------------------------------------------------------------------------
+
+def test_spawn_kwargs_new_process_group_on_windows(monkeypatch):
+    monkeypatch.setattr(tc.sys, "platform", "win32")
+    kw = tc._spawn_kwargs()
+    # Children get their own group so a console Ctrl+C never reaches them (which
+    # is what triggers the "Terminate batch job (Y/N)?" hang).
+    assert kw == {"creationflags": tc.subprocess.CREATE_NEW_PROCESS_GROUP}
+
+
+def test_spawn_kwargs_empty_on_posix(monkeypatch):
+    monkeypatch.setattr(tc.sys, "platform", "linux")
+    assert tc._spawn_kwargs() == {}
+
+
+def test_terminate_proc_tree_uses_taskkill_on_windows(monkeypatch):
+    monkeypatch.setattr(tc.sys, "platform", "win32")
+    calls = {}
+
+    def fake_run(argv, **kwargs):
+        calls["argv"] = argv
+
+    class _Proc:
+        pid = 4321
+        def wait(self, timeout=None):
+            return 0
+
+    monkeypatch.setattr(tc.subprocess, "run", fake_run)
+    tc._terminate_proc_tree(_Proc())
+    # /T kills the whole tree (node + cmd grandchildren), /F forces it.
+    assert calls["argv"] == ["taskkill", "/F", "/T", "/PID", "4321"]
+
+
+def test_terminate_proc_tree_terminates_on_posix(monkeypatch):
+    monkeypatch.setattr(tc.sys, "platform", "linux")
+    events = []
+
+    class _Proc:
+        pid = 10
+        def terminate(self):
+            events.append("terminate")
+        def wait(self, timeout=None):
+            events.append("wait")
+            return 0
+        def kill(self):
+            events.append("kill")
+
+    tc._terminate_proc_tree(_Proc())
+    assert events == ["terminate", "wait"]  # clean exit, no kill escalation
+
+
+def test_terminate_proc_tree_none_is_noop():
+    # No proc for a slot that never spawned — must not raise.
+    tc._terminate_proc_tree(None)
+
+
+def test_dc_default_command_wraps_cmd_on_windows(monkeypatch):
+    monkeypatch.setattr(tc.sys, "platform", "win32")
+    assert tc._dc_default_command() == [
+        "cmd", "/c", "npx", "-y", "@wonderwhy-er/desktop-commander@latest",
+    ]
+
+
+def test_dc_default_command_bare_npx_on_posix(monkeypatch):
+    monkeypatch.setattr(tc.sys, "platform", "linux")
+    assert tc._dc_default_command() == [
+        "npx", "-y", "@wonderwhy-er/desktop-commander@latest",
+    ]
+
+
+# ---------------------------------------------------------------------------
 # _proc_watchdog — relaunch a local proxy subprocess when it dies (aff0b1d1)
 # ---------------------------------------------------------------------------
 
@@ -903,7 +975,7 @@ def test_proc_watchdog_relaunches_on_exit(monkeypatch):
               "env": {"X": "1"}, "label": "fs"}
     spawned = []
 
-    def fake_popen(cmd, env=None):
+    def fake_popen(cmd, env=None, **kwargs):
         spawned.append((cmd, env))
         return _LiveProc()
 
@@ -954,7 +1026,7 @@ def test_proc_watchdog_gives_up_after_max_retries(monkeypatch):
     spawned = []
 
     # Every relaunch yields another already-dead proc → the slot never recovers.
-    def fake_popen(cmd, env=None):
+    def fake_popen(cmd, env=None, **kwargs):
         spawned.append(cmd)
         return _DeadProc()
 
@@ -994,7 +1066,7 @@ def test_proc_watchdog_healthy_tick_resets_failure_streak(monkeypatch):
     spawned = []
     calls = {"n": 0}
 
-    def fake_popen(cmd, env=None):
+    def fake_popen(cmd, env=None, **kwargs):
         spawned.append(cmd)
         return _FlakyProc(alive=1)  # each relaunch runs one healthy tick, then dies
 
