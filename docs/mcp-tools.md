@@ -1,6 +1,6 @@
 # MCP Tool Reference
 
-Meridian exposes **61 tools** over MCP.
+Meridian exposes **67 tools** over MCP.
 
 They fall into two usage patterns:
 
@@ -29,12 +29,14 @@ Register a session and get the full project context (goal, sprint, recent tasks,
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `project_id` | string | required |  |
+| `project_id` | string | optional |  |
+| `project_name` | string | optional | Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given. |
 | `session_name` | string | required |  |
 | `human_id` | string | optional |  |
 | `client` | string | optional |  |
 | `role` | string | optional | Pass 'executor' to inject executor_config and credentials guidance. |
 | `compact` | boolean | optional | Default true — slim orientation. Set false for the full goal/instructions payload. |
+| `version` | string | optional | Optional sprint-version bucket (e.g. 'v0.1.x') to scope this session to. Sprint progress/items in the orientation and /goal filter to it. Omit to auto-infer the bucket with the most pending items. |
 
 **Example:**
 ```
@@ -49,7 +51,8 @@ Read-only: Call this FIRST for project summaries or to see what a session did �
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `project_id` | string | required |  |
+| `project_id` | string | optional |  |
+| `project_name` | string | optional | Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given. |
 | `role` | string | optional | Controls verbosity. 'worker'=sprint+tasks only, 'planner'=full context. |
 
 **Example:**
@@ -69,7 +72,8 @@ Valid statuses: `pending` · `in_progress` · `done` · `failed` · `backlog` ·
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `session_id` | string | required |  |
-| `project_id` | string | required |  |
+| `project_id` | string | optional |  |
+| `project_name` | string | optional | Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given. |
 | `description` | string | required |  |
 | `status` | string | optional |  |
 | `kind` | string | optional | Entry taxonomy. shipped=work done, found=discovery, decided=arch choice, blocked=blocker. |
@@ -87,7 +91,8 @@ Read-only: Get recent tasks across all sessions.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `project_id` | string | required |  |
+| `project_id` | string | optional |  |
+| `project_name` | string | optional | Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given. |
 | `limit` | integer | optional |  |
 
 **Example:**
@@ -103,7 +108,8 @@ Read-only: Search tasks by keyword or natural-language query. Uses trigram simil
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `project_id` | string | required |  |
+| `project_id` | string | optional |  |
+| `project_name` | string | optional | Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given. |
 | `query` | string | required |  |
 | `limit` | integer | optional |  |
 
@@ -121,7 +127,8 @@ Read-only: Fine-grained — return just the goal fields (north_star, sprint, ver
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `project_id` | string | required |  |
+| `project_id` | string | optional |  |
+| `project_name` | string | optional | Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given. |
 
 **Example:**
 ```
@@ -136,7 +143,8 @@ Set or update the goal state.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `project_id` | string | required |  |
+| `project_id` | string | optional |  |
+| `project_name` | string | optional | Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given. |
 | `content` | string | required |  |
 
 **Example:**
@@ -156,7 +164,8 @@ Statuses include `provisional_complete` — work finished but not yet verified/d
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `project_id` | string | required |  |
+| `project_id` | string | optional |  |
+| `project_name` | string | optional | Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given. |
 | `session_id` | string | optional | Optional: include board_change (items added since this session started). |
 | `version` | string | optional | Filter to a specific sprint version bucket. |
 | `item_group` | string | optional | Filter to a specific item group. |
@@ -175,7 +184,8 @@ Store project-level executor defaults so worker sessions start with repo path, e
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `project_id` | string | required |  |
+| `project_id` | string | optional |  |
+| `project_name` | string | optional | Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given. |
 | `repo_path` | string | optional |  |
 | `repo_paths` | array | optional | Known locations [{cwd, hostname}] — merged into existing repo_paths, not overwritten. |
 | `env_file` | string | optional |  |
@@ -250,10 +260,12 @@ Categories: `STRATEGIC` · `COMPETITIVE` · `TECHNICAL` · `TACTICAL` · `BUSINE
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `project_id` | string | required |  |
+| `project_id` | string | optional |  |
+| `project_name` | string | optional | Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given. |
 | `title` | string | required |  |
 | `body` | string | required |  |
 | `category` | string | optional |  |
+| `priority` | string | optional | urgent decisions sort first and are weighted higher in start_session / generate_handoff context. Default normal. |
 
 **Example:**
 ```
@@ -274,17 +286,19 @@ Patch a pinned decision. Pass `new_title` + `new_body` to atomically supersede (
 | `title` | string | optional |  |
 | `body` | string | optional |  |
 | `category` | string | optional |  |
+| `priority` | string | optional | Change ordering/weight (urgent \| normal \| low). |
 | `status` | string | optional |  |
 
 ---
 
 
 ### `get_pinned_decisions`
-Read-only: List pinned decisions (active only by default, newest first).
+Read-only: List pinned decisions, highest priority first (urgent → normal → low, then newest-first). Active only by default. Each row includes its priority and a parsed edit_log array of prior bodies ({body, ts}) recorded on every in-place body edit.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `project_id` | string | required |  |
+| `project_id` | string | optional |  |
+| `project_name` | string | optional | Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given. |
 | `include_superseded` | boolean | optional |  |
 
 **Example:**
@@ -301,7 +315,8 @@ Surface a question to the human queue. Response includes `chat_prompt` (question
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `project_id` | string | required |  |
+| `project_id` | string | optional |  |
+| `project_name` | string | optional | Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given. |
 | `question` | string | required |  |
 | `session_id` | string | optional |  |
 | `context` | string | optional |  |
@@ -362,7 +377,8 @@ Read-only: Generate a context handoff document. `mode='full'` writes the complet
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `project_id` | string | required |  |
+| `project_id` | string | optional |  |
+| `project_name` | string | optional | Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given. |
 | `mode` | string | optional |  |
 | `session_id` | string | optional | Optional session id for auto-delta on repeated calls in the same session. |
 
@@ -379,7 +395,8 @@ Read-only: Return a compact plain-text context block (north star, sprint, pendin
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `project_id` | string | required |  |
+| `project_id` | string | optional |  |
+| `project_name` | string | optional | Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given. |
 | `mode` | string | optional |  |
 
 **Example:**
@@ -396,7 +413,8 @@ Read-only: Return a compact planning context (sprint, north star, pending items,
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `project_id` | string | required |  |
+| `project_id` | string | optional |  |
+| `project_name` | string | optional | Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given. |
 
 **Example:**
 ```
@@ -411,7 +429,8 @@ Read-only: Cross-reference pending sprint items against recent git commits and r
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `project_id` | string | required |  |
+| `project_id` | string | optional |  |
+| `project_name` | string | optional | Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given. |
 
 **Example:**
 ```
@@ -441,12 +460,16 @@ Add a per-project wiki note. Use for setup instructions, gotchas, environment de
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `project_id` | string | required |  |
+| `project_id` | string | optional |  |
+| `project_name` | string | optional | Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given. |
 | `title` | string | required |  |
 | `body` | string | required |  |
 | `tags` | string | optional |  |
 | `kind` | string | optional |  |
 | `priority` | string | optional | high-priority notes surface first in generate_handoff and planner context. |
+| `file_path` | string | optional | Code anchor (kind='code'): repo-relative or absolute path this note warns about. Surfaced at claim_file/get_file_claims for the same path. |
+| `symbol` | string | optional | Optional symbol (class/function/method) to scope the code anchor to. File-level anchors (no symbol) surface for any symbol in the file. |
+| `source` | string | optional | Provenance: a URL or file path this note was ingested from. Stored on the note (used by kind='document'). |
 | `category` | string | optional |  |
 
 **Example:**
@@ -458,17 +481,38 @@ add_note(project_id="abc-123", title="Deploy note", body="Reminder: update env v
 
 
 ### `get_notes`
-Read-only: List project notes (newest first). Filter by tag substring.
+Read-only: List project notes (newest first), LIGHTWEIGHT by default — id/slug/title/tags/kind/priority/timestamps with NO body, so the list can't overflow context. Pull model: scan the list, then `read_note(project_id, slug)` for one note's full body. Filter by tag substring or `query` full-text search. Pass `bodies=true` only when you truly need every body inline. Pass `limit` (default 100, max 500) and/or `cursor` for a `{notes, has_more, next_cursor}` page, then re-call with `cursor=next_cursor`.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `project_id` | string | required |  |
+| `project_id` | string | optional |  |
+| `project_name` | string | optional | Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given. |
 | `tag` | string | optional |  |
 | `query` | string | optional | Text search across note title and body (case-insensitive). |
+| `bodies` | boolean | optional | Default false. true returns full note bodies inline (legacy behavior) — usually unnecessary; prefer read_note(slug). |
+| `limit` | integer | optional | Page size (default 100, clamped 1..500). Passing limit or cursor switches the result to the {notes, has_more, next_cursor} pagination envelope. |
+| `cursor` | integer | optional | Offset cursor from a prior page's next_cursor. Passing it switches the result to the {notes, has_more, next_cursor} envelope. |
 
 **Example:**
 ```
 get_notes(project_id="abc-123")
+```
+
+---
+
+
+### `read_note`
+Read-only: Fetch one project note's full body by its per-project `slug` (the `slug` field from `get_notes`). The pull half of the list→read model.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `project_id` | string | optional |  |
+| `project_name` | string | optional | Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given. |
+| `slug` | string | required | The note's slug (kebab-cased, unique per project) as returned by get_notes. |
+
+**Example:**
+```
+read_note(project_id="abc-123", slug="deploy-note")
 ```
 
 ---
@@ -491,6 +535,7 @@ Create a new Meridian project.
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `name` | string | required |  |
+| `execution_mode` | string | optional | Executor posture for sessions on this project. 'autonomous' (default) claims and runs sprint items immediately without asking; 'interactive' asks for direction first. Editable later in dashboard Settings. |
 
 **Example:**
 ```
@@ -507,7 +552,8 @@ create_project(name="my-app")
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `project_id` | string | required |  |
+| `project_id` | string | optional |  |
+| `project_name` | string | optional | Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given. |
 | `session_name` | string | required |  |
 | `human_id` | string | optional |  |
 | `client` | string | optional |  |

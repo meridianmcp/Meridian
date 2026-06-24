@@ -14,13 +14,37 @@ router = APIRouter()
 
 @router.get("/projects/{project_id}/notes")
 async def list_project_notes_endpoint(
-    project_id: str, request: Request, tag: str | None = None, query: str | None = None
-) -> list[dict[str, Any]]:
-    """Project notes (newest first). ``?tag=X`` filters by tag; ``?query=X`` searches title+body."""
-    project = await db_module.get_project(await _db(request), project_id)
+    project_id: str,
+    request: Request,
+    tag: str | None = None,
+    query: str | None = None,
+    paginate: bool = False,
+    limit: int = 100,
+    cursor: int = 0,
+) -> list[dict[str, Any]] | dict[str, Any]:
+    """Project notes (newest first). ``?tag=X`` filters by tag; ``?query=X`` searches title+body.
+
+    5a5bba43 — the dashboard Notes tab renders full note bodies, so this HTTP
+    endpoint returns the complete rows (``bodies=True``) for backward compat.
+    The MCP ``get_notes`` tool defaults to the lightweight (no-body) list.
+
+    9fa119dd — pass ``?paginate=true`` for the cursor "Load More" envelope
+    ``{notes, has_more, next_cursor}`` (default ``limit=100``, ``cursor`` is the
+    next offset), mirroring the sprint-items ``?page=`` envelope. Without
+    ``paginate`` the legacy bare-list shape is unchanged.
+    """
+    db = await _db(request)
+    project = await db_module.get_project(db, project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="project not found")
-    return await db_module.get_project_notes(await _db(request), project_id, tag=tag, query=query)
+    if paginate:
+        return await db_module.get_project_notes_page(
+            db, project_id, tag=tag, query=query, bodies=True,
+            limit=limit, cursor=cursor,
+        )
+    return await db_module.get_project_notes(
+        db, project_id, tag=tag, query=query, bodies=True
+    )
 
 
 @router.post("/projects/{project_id}/notes", status_code=201)
@@ -41,10 +65,19 @@ async def create_project_note_endpoint(
     from .. import limits as _limits  # noqa: PLC0415
     existing = await db_module.get_project_notes(await _db(request), project_id)
     _limits.check_notes_per_project(len(existing))
-    note = await db_module.add_project_note(
-        await _db(request), project_id, title, text, body.get("tags"),
-        kind=body.get("kind"),
-    )
+    # 771c00d7 — optional code anchor (kind='code' + file_path[, symbol]).
+    if body.get("file_path") is not None:
+        validate_input_size(body.get("file_path"), "note file_path", 2_000)
+    if body.get("symbol") is not None:
+        validate_input_size(body.get("symbol"), "note symbol", 500)
+    try:
+        note = await db_module.add_project_note(
+            await _db(request), project_id, title, text, body.get("tags"),
+            kind=body.get("kind"),
+            file_path=body.get("file_path"), symbol=body.get("symbol"),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
     # e5592013 — non-blocking lint: "MANUAL" notes are usually human tasks.
     if isinstance(note, dict) and "MANUAL" in title:
         note = {**note, "lint": _MANUAL_NOTE_LINT}

@@ -271,9 +271,11 @@ async def test_handoff_lists_pending_sprint_items_in_dependency_order(db, tmp_pa
     assert f"Depends on item 1 (`{first['id']}`): First fix" in content
     assert f'start_session(project_id="{p["id"]}", session_name="<your-name>")' in content
     assert (
-        f"/goal Complete sprint items: {first['id']}, {second['id']}."
+        f"Complete sprint items: {first['id']}, {second['id']}."
         in content
     )
+    # f628b880 — the /goal leads with the non-deferential executor directive.
+    assert "/goal You are an executor. Claim and execute" in content
     assert "complete_sprint_item()" in content
 
 
@@ -332,7 +334,7 @@ async def test_handoff_delta_mode_reports_recent_changes(db, tmp_path):
     assert "# Session Update — alpha-delta" in content
     assert f"- {first['id']} — First fix" in content
     assert f"- {second['id']} [pending] Second fix" in content
-    assert f"/goal Complete sprint items: {second['id']}." in content
+    assert f"Complete sprint items: {second['id']}." in content
 
 
 async def test_handoff_starter_mode(db, tmp_path):
@@ -946,7 +948,7 @@ def test_websocket_receives_task_event(client):
 def test_tunnel_status_returns_inactive_for_unknown_tenant(client):
     r = client.get("/tunnel/status/no-such-tenant")
     assert r.status_code == 200
-    assert r.json() == {"tenant_id": "no-such-tenant", "active": False, "code_active": False, "extract_active": False, "ppt_active": False, "word_active": False}
+    assert r.json() == {"tenant_id": "no-such-tenant", "active": False, "code_active": False, "extract_active": False, "ppt_active": False, "word_active": False, "dc_active": False}
 
 
 def test_fs_mcp_proxy_returns_503_when_not_hosted(client):
@@ -2865,6 +2867,171 @@ async def test_dispatch_unknown_project_name_raises(db):
 
 
 # ---------------------------------------------------------------------------
+# 8a449ec0 — project_name advertised in every project-scoped tool schema
+# ---------------------------------------------------------------------------
+
+def test_every_project_id_tool_schema_advertises_project_name():
+    """Generic contract: every _MCP_TOOLS_LIST tool whose inputSchema declares
+    project_id ALSO declares a sibling project_name property, and does NOT list
+    project_id in its required array (project_name is an accepted alternative;
+    the resolver + handlers enforce a real project at runtime). All OTHER
+    required fields are preserved."""
+    from meridian.mcp_tools import _MCP_TOOLS_LIST
+
+    checked = 0
+    for tool in _MCP_TOOLS_LIST:
+        schema = tool.get("inputSchema") or {}
+        props = schema.get("properties") or {}
+        if "project_id" not in props:
+            continue
+        checked += 1
+        name = tool["name"]
+        # 1. project_name sibling exists and is a string property.
+        assert "project_name" in props, f"{name} missing project_name property"
+        assert props["project_name"].get("type") == "string", name
+        assert "alternative to project_id" in (
+            props["project_name"].get("description") or ""
+        ), name
+        # 2. project_id is no longer strictly required.
+        required = schema.get("required") or []
+        assert "project_id" not in required, (
+            f"{name} still lists project_id as required"
+        )
+        # 3. project_name is an alternative, never itself required.
+        assert "project_name" not in required, name
+
+    # Sanity: the loop actually inspected the full project-scoped surface.
+    assert checked >= 38, f"expected >=38 project-scoped tools, saw {checked}"
+
+
+def test_project_name_change_preserves_other_required_fields():
+    """Removing project_id from required must not drop other required fields."""
+    from meridian.mcp_tools import _MCP_TOOLS_LIST
+
+    by_name = {t["name"]: t for t in _MCP_TOOLS_LIST}
+    expected = {
+        "log_task": {"session_id", "description"},
+        "set_goal": {"content"},
+        "set_north_star": {"north_star"},
+        "add_sprint_item": {"version", "title"},
+        "update_sprint_item": {"item_id"},
+        "update_md_section": {"file", "anchor", "content"},
+        "split_sprint_item": {"item_id", "titles"},
+        "merge_sprint_items": {"item_ids", "new_title"},
+        "register_session": {"session_name"},
+    }
+    for name, want in expected.items():
+        got = set(by_name[name]["inputSchema"].get("required") or [])
+        assert got == want, f"{name}: required={got}, expected {want}"
+
+
+def test_stdio_tool_schemas_advertise_project_name():
+    """stdio parity: every stdio Tool(...) decl that mirrors an _MCP_TOOLS_LIST
+    tool and declares project_id also advertises project_name and drops
+    project_id from required. Parsed straight from source via ast so the test
+    sees exactly what the stdio client is told."""
+    import ast
+
+    from meridian.mcp_tools import _MCP_TOOLS_LIST
+
+    allowed = {t["name"] for t in _MCP_TOOLS_LIST}
+    src = (
+        Path(__file__).resolve().parents[1]
+        / "meridian" / "mcp" / "stdio_handler.py"
+    ).read_text(encoding="utf-8")
+    tree = ast.parse(src)
+
+    seen = 0
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Call) and getattr(node.func, "id", None) == "Tool"):
+            continue
+        kw = {k.arg: k.value for k in node.keywords}
+        name_node = kw.get("name")
+        if not isinstance(name_node, ast.Constant) or "inputSchema" not in kw:
+            continue
+        name = name_node.value
+        if name not in allowed:
+            continue
+        schema = ast.literal_eval(kw["inputSchema"])
+        props = schema.get("properties") or {}
+        if "project_id" not in props:
+            continue
+        seen += 1
+        assert "project_name" in props, f"stdio {name} missing project_name"
+        assert "project_id" not in (schema.get("required") or []), (
+            f"stdio {name} still requires project_id"
+        )
+    assert seen >= 27, f"expected >=27 stdio project-scoped decls, saw {seen}"
+
+
+@pytest.mark.asyncio
+async def test_dispatch_project_scoped_tool_with_only_project_name(db):
+    """A project-scoped write tool invoked through _dispatch_mcp_tool with ONLY
+    project_name (no project_id) resolves the name and operates on the project."""
+    from meridian import server as srv
+
+    p = await db_module.create_project(db, "only-by-name-proj")
+    # add_sprint_item: required = {version, title}; project supplied by name.
+    added = await srv._dispatch_mcp_tool(
+        "add_sprint_item",
+        {"project_name": "only-by-name-proj", "version": "v1", "title": "By name"},
+        db, "/tmp",
+    )
+    assert added["title"] == "By name"
+    assert added["project_id"] == p["id"]
+
+    # get_sprint_items by name returns the same item.
+    items = await srv._dispatch_mcp_tool(
+        "get_sprint_items", {"project_name": "only-by-name-proj"}, db, "/tmp"
+    )
+    assert any(it["id"] == added["id"] for it in items)
+
+
+@pytest.mark.asyncio
+async def test_dispatch_project_id_wins_over_project_name(db):
+    """When both are given, project_id takes precedence (the resolver only
+    overrides when project_name is set OR project_id is a non-UUID name)."""
+    from meridian import server as srv
+
+    real = await db_module.create_project(db, "wins-real")
+    await db_module.create_project(db, "wins-decoy")
+    items = await srv._dispatch_mcp_tool(
+        "get_sprint_items",
+        {"project_id": real["id"], "project_name": "wins-decoy"},
+        db, "/tmp",
+    )
+    # Resolves against the UUID project_id, not the decoy name → no crash, list.
+    assert isinstance(items, list)
+
+
+@pytest.mark.asyncio
+async def test_dispatch_unresolvable_project_name_on_write_tool_raises(db):
+    """project_name that matches nothing on a write tool → clean ValueError."""
+    from meridian import server as srv
+
+    with pytest.raises(ValueError, match="no project found matching name"):
+        await srv._dispatch_mcp_tool(
+            "add_sprint_item",
+            {"project_name": "ghost-project", "version": "v1", "title": "x"},
+            db, "/tmp",
+        )
+
+
+@pytest.mark.asyncio
+async def test_dispatch_project_scoped_tool_with_neither_fails_cleanly(db):
+    """Neither project_id nor project_name → deterministic error, never a hang
+    or silent success. The resolver's args.get(...,"") defaults keep it from
+    KeyError-ing; the handler then surfaces a clean exception the transport
+    layers turn into an {"error": ...} payload."""
+    from meridian import server as srv
+
+    with pytest.raises((KeyError, ValueError)):
+        await srv._dispatch_mcp_tool(
+            "add_sprint_item", {"version": "v1", "title": "orphan"}, db, "/tmp"
+        )
+
+
+# ---------------------------------------------------------------------------
 # 5b13b7b6 — session name uniqueness
 # ---------------------------------------------------------------------------
 
@@ -4473,6 +4640,196 @@ async def test_workspace_settings_single_row_fallback(db):
 
 
 # ---------------------------------------------------------------------------
+# b2115251 — workspace-level sprint board (cross-project personal backlog)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_migrate_workspace_sprint_board_idempotent(db):
+    """The migration creates workspace_sprint_items and re-running is a no-op."""
+    from meridian.db.migrations import _migrate_workspace_sprint_board
+
+    # init_db already ran it; a second run must not raise.
+    await _migrate_workspace_sprint_board(db)
+    async with db.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' "
+        "AND name='workspace_sprint_items'"
+    ) as cur:
+        assert await cur.fetchone() is not None
+    # Table is usable after the redundant migration.
+    item = await db_module.add_workspace_sprint_item(db, "still works")
+    assert item["status"] == "todo"
+
+
+@pytest.mark.asyncio
+async def test_add_workspace_sprint_item_defaults(db):
+    """A new workspace sprint item starts as todo with its bucket + position."""
+    item = await db_module.add_workspace_sprint_item(
+        db, "finish thesis ch3", item_group="thesis", human_id="adam"
+    )
+    assert item["status"] == "todo"
+    assert item["title"] == "finish thesis ch3"
+    assert item["item_group"] == "thesis"
+    assert item["human_id"] == "adam"
+    assert item["completed_at"] is None
+    # Second item in the same workspace gets the next position.
+    second = await db_module.add_workspace_sprint_item(db, "second")
+    assert second["position"] == item["position"] + 1
+
+
+@pytest.mark.asyncio
+async def test_workspace_sprint_items_isolated_by_tenant(db):
+    """Items created by tenant A must not be returned for tenant B."""
+    await db_module.add_workspace_sprint_item(
+        db, "A-task", item_group="thesis", tenant_id="tenant-a"
+    )
+    await db_module.add_workspace_sprint_item(
+        db, "B-task", item_group="thesis", tenant_id="tenant-b"
+    )
+    a = {i["title"] for i in await db_module.get_workspace_sprint_items(db, tenant_id="tenant-a")}
+    b = {i["title"] for i in await db_module.get_workspace_sprint_items(db, tenant_id="tenant-b")}
+    assert a == {"A-task"}
+    assert b == {"B-task"}
+
+
+@pytest.mark.asyncio
+async def test_workspace_sprint_item_legacy_null_visible_to_tenant(db):
+    """Pre-isolation rows (tenant_id IS NULL) stay visible to a tenant — they
+    only ever exist on that tenant's own dedicated DB. Mirrors workspace notes."""
+    await db_module.add_workspace_sprint_item(db, "legacy")  # tenant_id NULL
+    titles = {i["title"] for i in await db_module.get_workspace_sprint_items(db, tenant_id="tenant-a")}
+    assert "legacy" in titles
+
+
+@pytest.mark.asyncio
+async def test_workspace_sprint_items_group_filter(db):
+    """item_group is the cross-project bucket; the filter narrows to one bucket."""
+    await db_module.add_workspace_sprint_item(db, "thesis task", item_group="thesis", tenant_id="t")
+    await db_module.add_workspace_sprint_item(db, "meridian task", item_group="meridian", tenant_id="t")
+    thesis = await db_module.get_workspace_sprint_items(db, item_group="thesis", tenant_id="t")
+    assert [i["title"] for i in thesis] == ["thesis task"]
+
+
+@pytest.mark.asyncio
+async def test_workspace_sprint_items_status_filter(db):
+    """The status filter narrows the board; an invalid status filter raises."""
+    a = await db_module.add_workspace_sprint_item(db, "open one", tenant_id="t")
+    await db_module.add_workspace_sprint_item(db, "open two", tenant_id="t")
+    await db_module.complete_workspace_sprint_item(db, a["id"], tenant_id="t")
+    done = await db_module.get_workspace_sprint_items(db, status="done", tenant_id="t")
+    assert [i["title"] for i in done] == ["open one"]
+    with pytest.raises(ValueError):
+        await db_module.get_workspace_sprint_items(db, status="bogus", tenant_id="t")
+
+
+@pytest.mark.asyncio
+async def test_update_workspace_sprint_item_fields_and_completed_at(db):
+    """Patch title/status/group; terminal status stamps completed_at, then clears."""
+    item = await db_module.add_workspace_sprint_item(db, "old", tenant_id="t")
+    updated = await db_module.update_workspace_sprint_item(
+        db, item["id"], title="new", status="in_progress",
+        item_group="personal", tenant_id="t",
+    )
+    assert updated["title"] == "new"
+    assert updated["status"] == "in_progress"
+    assert updated["item_group"] == "personal"
+    assert updated["completed_at"] is None  # non-terminal clears it
+    # Terminal status stamps completed_at.
+    finished = await db_module.update_workspace_sprint_item(
+        db, item["id"], status="failed", tenant_id="t"
+    )
+    assert finished["completed_at"] is not None
+    # Re-opening clears it again.
+    reopened = await db_module.update_workspace_sprint_item(
+        db, item["id"], status="todo", tenant_id="t"
+    )
+    assert reopened["completed_at"] is None
+
+
+@pytest.mark.asyncio
+async def test_complete_workspace_sprint_item_respects_tenant(db):
+    """Tenant B cannot complete or update tenant A's item."""
+    item = await db_module.add_workspace_sprint_item(db, "A-only", tenant_id="tenant-a")
+    # Wrong tenant: no row matched.
+    assert await db_module.complete_workspace_sprint_item(db, item["id"], tenant_id="tenant-b") is None
+    assert await db_module.update_workspace_sprint_item(db, item["id"], title="x", tenant_id="tenant-b") is None
+    # Right tenant: completes and stamps done.
+    done = await db_module.complete_workspace_sprint_item(db, item["id"], tenant_id="tenant-a")
+    assert done["status"] == "done"
+    assert done["completed_at"] is not None
+
+
+@pytest.mark.asyncio
+async def test_workspace_sprint_item_none_tenant_self_host(db):
+    """Self-host (tenant_id=None) sees every item, like workspace notes."""
+    await db_module.add_workspace_sprint_item(db, "one", tenant_id="tenant-a")
+    await db_module.add_workspace_sprint_item(db, "two", tenant_id="tenant-b")
+    titles = {i["title"] for i in await db_module.get_workspace_sprint_items(db)}
+    assert titles == {"one", "two"}
+
+
+def test_workspace_sprint_items_crud_http(client):
+    """Workspace sprint items round-trip through the HTTP routes the dashboard uses."""
+    created = client.post(
+        "/workspace/sprint-items",
+        json={"title": "ship workspace board", "group": "meridian"},
+    )
+    assert created.status_code == 201
+    item_id = created.json()["id"]
+    assert created.json()["status"] == "todo"
+    # Listed and grouped.
+    listed = client.get("/workspace/sprint-items").json()
+    assert any(i["id"] == item_id for i in listed)
+    # Group filter.
+    grouped = client.get("/workspace/sprint-items?group=meridian").json()
+    assert [i["id"] for i in grouped] == [item_id]
+    # Patch status.
+    patched = client.patch(
+        f"/workspace/sprint-items/{item_id}", json={"status": "in_progress"}
+    )
+    assert patched.status_code == 200
+    assert patched.json()["status"] == "in_progress"
+    # Complete.
+    done = client.post(f"/workspace/sprint-items/{item_id}/complete")
+    assert done.status_code == 200
+    assert done.json()["status"] == "done"
+    assert done.json()["completed_at"] is not None
+    # Unknown id → 404.
+    assert client.post("/workspace/sprint-items/nope/complete").status_code == 404
+
+
+def test_mcp_workspace_sprint_item_roundtrip(client):
+    """MCP: add_workspace_sprint_item → get shows it; complete → status done."""
+    import json as _json
+
+    def _result(resp):
+        assert resp.get("result") is not None, resp
+        return _json.loads(resp["result"]["content"][0]["text"])
+
+    added = _result(_mcp_call(client, "add_workspace_sprint_item", {
+        "title": "thesis chapter 3", "group": "thesis",
+    }))
+    assert added["status"] == "todo"
+    item_id = added["id"]
+    # get_workspace_sprint_items shows it.
+    items = _result(_mcp_call(client, "get_workspace_sprint_items", {}))
+    assert any(i["id"] == item_id for i in items)
+    # group filter via the tool.
+    thesis = _result(_mcp_call(client, "get_workspace_sprint_items", {"group": "thesis"}))
+    assert [i["id"] for i in thesis] == [item_id]
+    # complete → done.
+    done = _result(_mcp_call(client, "complete_workspace_sprint_item", {"item_id": item_id}))
+    assert done["status"] == "done"
+    assert done["completed_at"] is not None
+
+
+def test_mcp_add_workspace_sprint_item_title_size_limit(client):
+    """MCP add_workspace_sprint_item rejects a title > 500 chars."""
+    resp = _mcp_call(client, "add_workspace_sprint_item", {"title": "t" * 501})
+    assert "sprint item title" in resp.get("error", {}).get("message", "").lower()
+
+
+# ---------------------------------------------------------------------------
 # 2da12762 — token-based OAuth hooks (registered_hostnames)
 # ---------------------------------------------------------------------------
 
@@ -5777,6 +6134,7 @@ def test_pg_migration_registry_matches_historical_order():
     ]
     assert late == [
         "_migrate_pg_workspace_tenant_isolation",
+        "_migrate_pg_workspace_sprint_board",
         "_migrate_pg_sprint_items_claimed_at",
         "_migrate_pg_sprint_item_tree",
         "_migrate_pg_api_token_type",
@@ -5794,10 +6152,16 @@ def test_pg_migration_registry_matches_historical_order():
         "_migrate_pg_notes_priority",
         "_migrate_pg_task_log_kind",
         "_migrate_pg_oauth_refresh_tokens",
+        "_migrate_pg_note_slug",
+        "_migrate_pg_decision_priority_edit_log",
+        "_migrate_pg_code_anchored_notes",
+        "_migrate_pg_note_source",
+        "_migrate_pg_session_sprint_version",
+        "_migrate_pg_project_execution_mode",
     ]
     # No duplicates across the three groups.
     allnames = core + hosted + late
-    assert len(allnames) == len(set(allnames)) == 49
+    assert len(allnames) == len(set(allnames)) == 56
 
 
 def test_default_agent_instructions_has_code_intel_protocol():
@@ -6077,7 +6441,8 @@ async def test_schema_all_tables_exist(db):
     """After init_db() every expected table must be present with key columns."""
     expected = {
         "projects": {"id", "name", "creator_human_id", "goal_mode", "decisions"},
-        "sessions": {"id", "project_id", "name", "human_id", "status", "last_seen"},
+        "sessions": {"id", "project_id", "name", "human_id", "status", "last_seen",
+                     "sprint_version"},
         "task_log": {"id", "session_id", "project_id", "description", "status",
                      "claimed_by", "claimed_at"},
         "goal_states": {"id", "project_id", "content", "version",
@@ -7871,6 +8236,26 @@ def test_install_watcher_sh_returns_script(client):
     assert r.headers["content-type"].startswith("text/plain")
 
 
+def test_install_tunnel_ps1_returns_script(client):
+    """e05d0e02 — GET /install_tunnel.ps1 serves the Windows tunnel auto-start
+    installer (Task Scheduler job that keeps `meridian --tunnel` alive)."""
+    r = client.get("/install_tunnel.ps1")
+    assert r.status_code == 200
+    assert "MeridianTunnel" in r.text and "ScheduledTask" in r.text
+    assert "--tunnel" in r.text
+    assert r.headers["content-type"].startswith("text/plain")
+
+
+def test_install_tunnel_sh_returns_script(client):
+    """e05d0e02 — GET /install_tunnel.sh serves the macOS LaunchAgent / Linux
+    systemd installer that keeps `meridian --tunnel` alive across reboots."""
+    r = client.get("/install_tunnel.sh")
+    assert r.status_code == 200
+    assert "launchctl" in r.text or "systemctl" in r.text
+    assert "--tunnel" in r.text
+    assert r.headers["content-type"].startswith("text/plain")
+
+
 @pytest.mark.asyncio
 async def test_create_stripe_billing_portal_session_rejects_no_customer():
     """G2.11 — helper raises ValueError when stripe_customer_id is missing,
@@ -8051,6 +8436,186 @@ async def test_get_pinned_decisions_filters_superseded(db):
     assert old["superseded_by"] == new["id"]
 
 
+# ---------------------------------------------------------------------------
+# 366317e9 — decision priority field + append-only edit history
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_decision_priority_migration_adds_columns_idempotently(db):
+    """The migration adds priority + edit_log; existing rows default to
+    priority='normal' / edit_log NULL, and re-running is a no-op."""
+    from meridian.db import migrations as _mig
+
+    # Columns are present after init.
+    assert await _mig._column_exists(db, "decisions_pinned", "priority")
+    assert await _mig._column_exists(db, "decisions_pinned", "edit_log")
+
+    p = await db_module.create_project(db, "pri-migrate")
+    d = await db_module.pin_decision(db, p["id"], "t", "b", "TECHNICAL")
+    # Raw row defaults.
+    async with db.execute(
+        "SELECT priority, edit_log FROM decisions_pinned WHERE id = ?", (d["id"],)
+    ) as cur:
+        row = await cur.fetchone()
+    assert (row["priority"] if isinstance(row, dict) else row[0]) == "normal"
+    assert (row["edit_log"] if isinstance(row, dict) else row[1]) is None
+
+    # Idempotent: second run does not raise and columns survive.
+    await _mig._migrate_decision_priority_edit_log(db)
+    assert await _mig._column_exists(db, "decisions_pinned", "priority")
+    assert await _mig._column_exists(db, "decisions_pinned", "edit_log")
+
+
+@pytest.mark.asyncio
+async def test_pin_decision_stores_priority(db):
+    p = await db_module.create_project(db, "pri-store")
+    d = await db_module.pin_decision(
+        db, p["id"], "urgent thing", "do it", "TECHNICAL", priority="urgent"
+    )
+    assert d["priority"] == "urgent"
+    assert d["edit_log"] == []
+
+
+@pytest.mark.asyncio
+async def test_pin_decision_defaults_priority_normal(db):
+    p = await db_module.create_project(db, "pri-default")
+    d = await db_module.pin_decision(db, p["id"], "t", "b", "TECHNICAL")
+    assert d["priority"] == "normal"
+
+
+@pytest.mark.asyncio
+async def test_pin_decision_invalid_priority_normalized(db):
+    """An invalid priority is coerced to 'normal' rather than rejected."""
+    p = await db_module.create_project(db, "pri-invalid")
+    d = await db_module.pin_decision(
+        db, p["id"], "t", "b", "TECHNICAL", priority="EXTREME"
+    )
+    assert d["priority"] == "normal"
+
+
+@pytest.mark.asyncio
+async def test_update_decision_priority(db):
+    p = await db_module.create_project(db, "pri-update")
+    d = await db_module.pin_decision(db, p["id"], "t", "b", "TECHNICAL")
+    assert d["priority"] == "normal"
+    updated = await db_module.update_pinned_decision(db, d["id"], priority="low")
+    assert updated["priority"] == "low"
+    # Invalid normalizes to normal.
+    updated = await db_module.update_pinned_decision(db, d["id"], priority="bogus")
+    assert updated["priority"] == "normal"
+
+
+@pytest.mark.asyncio
+async def test_edit_body_appends_previous_to_edit_log(db):
+    """Editing a body snapshots the previous body + ts into edit_log."""
+    p = await db_module.create_project(db, "edit-log")
+    d = await db_module.pin_decision(db, p["id"], "t", "body v1", "TECHNICAL")
+    assert d["edit_log"] == []
+
+    after1 = await db_module.update_pinned_decision(db, d["id"], body="body v2")
+    assert after1["body"] == "body v2"
+    assert len(after1["edit_log"]) == 1
+    assert after1["edit_log"][0]["body"] == "body v1"
+    assert after1["edit_log"][0]["ts"]  # non-empty iso timestamp
+
+
+@pytest.mark.asyncio
+async def test_edit_log_accumulates_append_only(db):
+    """Multiple body edits accumulate; earlier history is never dropped."""
+    p = await db_module.create_project(db, "edit-log-multi")
+    d = await db_module.pin_decision(db, p["id"], "t", "v1", "TECHNICAL")
+    await db_module.update_pinned_decision(db, d["id"], body="v2")
+    await db_module.update_pinned_decision(db, d["id"], body="v3")
+    final = await db_module.update_pinned_decision(db, d["id"], body="v4")
+    bodies = [e["body"] for e in final["edit_log"]]
+    assert bodies == ["v1", "v2", "v3"]
+    assert final["body"] == "v4"
+
+
+@pytest.mark.asyncio
+async def test_edit_log_unchanged_body_not_recorded(db):
+    """Re-saving the same body (or editing only title/priority) does not push
+    a spurious edit_log entry."""
+    p = await db_module.create_project(db, "edit-log-noop")
+    d = await db_module.pin_decision(db, p["id"], "t", "same", "TECHNICAL")
+    after = await db_module.update_pinned_decision(db, d["id"], body="same")
+    assert after["edit_log"] == []
+    after = await db_module.update_pinned_decision(
+        db, d["id"], title="new title", priority="urgent"
+    )
+    assert after["edit_log"] == []
+
+
+@pytest.mark.asyncio
+async def test_get_pinned_decisions_orders_by_priority(db):
+    """get_pinned_decisions returns urgent → normal → low, with parsed edit_log."""
+    p = await db_module.create_project(db, "pri-order")
+    await db_module.pin_decision(db, p["id"], "low one", "b", "TECHNICAL", priority="low")
+    await db_module.pin_decision(db, p["id"], "normal one", "b", "TECHNICAL")
+    await db_module.pin_decision(db, p["id"], "urgent one", "b", "TECHNICAL", priority="urgent")
+    decisions = await db_module.get_pinned_decisions(db, p["id"])
+    assert [d["title"] for d in decisions] == ["urgent one", "normal one", "low one"]
+    # edit_log is always a parsed list.
+    assert all(isinstance(d["edit_log"], list) for d in decisions)
+
+
+@pytest.mark.asyncio
+async def test_supersede_inherits_priority(db):
+    """A superseding decision inherits the old row's priority by default."""
+    p = await db_module.create_project(db, "pri-supersede")
+    d = await db_module.pin_decision(db, p["id"], "old", "b", "TECHNICAL", priority="urgent")
+    new = await db_module.supersede_pinned_decision(db, d["id"], "new", "b2", "TECHNICAL")
+    assert new["priority"] == "urgent"
+
+
+def test_decision_priority_http_round_trip(client):
+    """HTTP create with priority, PATCH to change it, and edit_log via PATCH body."""
+    project = client.post("/projects", json={"name": "pri-http"}).json()
+    r = client.post(
+        f"/projects/{project['id']}/decisions-pinned",
+        json={"title": "p1", "body": "v1", "category": "TECHNICAL", "priority": "urgent"},
+    )
+    assert r.status_code == 201
+    d = r.json()
+    assert d["priority"] == "urgent"
+    assert d["edit_log"] == []
+    # Change priority in place.
+    r = client.patch(
+        f"/projects/{project['id']}/decisions-pinned/{d['id']}",
+        json={"priority": "low"},
+    )
+    assert r.status_code == 200
+    assert r.json()["priority"] == "low"
+    # Edit body → edit_log records the prior body.
+    r = client.patch(
+        f"/projects/{project['id']}/decisions-pinned/{d['id']}",
+        json={"body": "v2"},
+    )
+    assert r.status_code == 200
+    body_json = r.json()
+    assert body_json["body"] == "v2"
+    assert [e["body"] for e in body_json["edit_log"]] == ["v1"]
+
+
+def test_mcp_pin_decision_with_priority(client):
+    """MCP pin_decision accepts priority and get_pinned_decisions returns it ordered."""
+    import json as _json
+    project = client.post("/projects", json={"name": "pri-mcp"}).json()
+    pid = project["id"]
+    _mcp_call(client, "pin_decision", {
+        "project_id": pid, "title": "low", "body": "b", "priority": "low",
+    })
+    _mcp_call(client, "pin_decision", {
+        "project_id": pid, "title": "urgent", "body": "b", "priority": "urgent",
+    })
+    resp = _mcp_call(client, "get_pinned_decisions", {"project_id": pid})
+    assert resp.get("result") is not None, resp
+    payload = _json.loads(resp["result"]["content"][0]["text"])
+    assert [d["title"] for d in payload] == ["urgent", "low"]
+    assert all("edit_log" in d and isinstance(d["edit_log"], list) for d in payload)
+
+
 def test_decisions_pinned_http_round_trip(client):
     """v2.4 — POST then GET then PATCH-supersede via HTTP endpoints."""
     project = client.post("/projects", json={"name": "v24-pin-http"}).json()
@@ -8158,6 +8723,123 @@ def test_hooks_session_start_and_stop(client):
     r = client.post("/hooks/stop", json={"project_id": project["id"], "session_id": session_id})
     assert r.status_code == 200
     assert r.json()["ok"] is True
+
+
+def _session_id_from_start(start_json: dict) -> str | None:
+    """Pull the full SESSION ID out of a /hooks/session-start response."""
+    ctx = start_json["hookSpecificOutput"]["additionalContext"]
+    for line in ctx.splitlines():
+        if line.startswith("SESSION ID:"):
+            return line.split(":", 1)[1].strip()
+    return None
+
+
+def test_hooks_stop_explicit_session_generates_delta_handoff(client, monkeypatch):
+    """07d62922: POST /hooks/stop with a session_id calls generate_handoff(mode='delta').
+
+    We monkeypatch generate_handoff to capture the mode it's invoked with and
+    confirm the server-side delta is produced even though the executor never
+    called generate_handoff itself.
+    """
+    captured: dict[str, object] = {}
+
+    async def _fake_handoff(db, project_id, output_dir, *, mode="full", session_id=None, **kw):
+        captured["mode"] = mode
+        captured["project_id"] = project_id
+        captured["session_id"] = session_id
+        return ("/tmp/handoff-delta.md", "# delta handoff\n")
+
+    monkeypatch.setattr("meridian.handoff.generate_handoff", _fake_handoff)
+
+    project = client.post("/projects", json={"name": "stop-delta-proj"}).json()
+    start = client.post("/hooks/session-start", json={"project_id": project["id"]}).json()
+    session_id = _session_id_from_start(start)
+    assert session_id
+
+    r = client.post(
+        "/hooks/stop",
+        json={"project_id": project["id"], "session_id": session_id},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ok"] is True
+    assert body["handoff"]["mode"] == "delta"
+    # generate_handoff was actually invoked, with mode='delta' and our session.
+    assert captured["mode"] == "delta"
+    assert captured["project_id"] == project["id"]
+    assert captured["session_id"] == session_id
+
+
+def test_hooks_stop_resolves_most_recent_active_session_without_session_id(client, monkeypatch):
+    """07d62922: with no session_id, /hooks/stop hands off the most-recent active session."""
+    captured: dict[str, object] = {}
+
+    async def _fake_handoff(db, project_id, output_dir, *, mode="full", session_id=None, **kw):
+        captured["mode"] = mode
+        captured["session_id"] = session_id
+        return ("/tmp/handoff-delta.md", "# delta handoff\n")
+
+    monkeypatch.setattr("meridian.handoff.generate_handoff", _fake_handoff)
+
+    project = client.post("/projects", json={"name": "stop-resolve-proj"}).json()
+    start = client.post("/hooks/session-start", json={"project_id": project["id"]}).json()
+    expected_session = _session_id_from_start(start)
+    assert expected_session
+
+    # No session_id supplied — server resolves the active session by project.
+    r = client.post("/hooks/stop", json={"project_id": project["id"]})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ok"] is True
+    assert body["handoff"]["mode"] == "delta"
+    assert captured["mode"] == "delta"
+    assert captured["session_id"] == expected_session
+
+
+def test_hooks_stop_no_resolvable_session_returns_ok_null_handoff(client, monkeypatch):
+    """07d62922: a project with no active session yields ok=true, handoff=null (best-effort)."""
+    called = {"n": 0}
+
+    async def _fake_handoff(*a, **kw):
+        called["n"] += 1
+        return ("/tmp/x.md", "x")
+
+    monkeypatch.setattr("meridian.handoff.generate_handoff", _fake_handoff)
+
+    # Project exists but no session-start ran, so there is no active session.
+    project = client.post("/projects", json={"name": "stop-nosession-proj"}).json()
+    r = client.post("/hooks/stop", json={"project_id": project["id"]})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ok"] is True
+    assert body["handoff"] is None
+    assert body.get("reason") == "no session"
+    # No session → generate_handoff must not be called at all.
+    assert called["n"] == 0
+
+
+def test_hooks_stop_handoff_exception_is_swallowed(client, monkeypatch):
+    """07d62922: generate_handoff raising still yields 200, ok=true, handoff=null."""
+
+    async def _boom(*a, **kw):
+        raise RuntimeError("handoff blew up")
+
+    monkeypatch.setattr("meridian.handoff.generate_handoff", _boom)
+
+    project = client.post("/projects", json={"name": "stop-boom-proj"}).json()
+    start = client.post("/hooks/session-start", json={"project_id": project["id"]}).json()
+    session_id = _session_id_from_start(start)
+    assert session_id
+
+    r = client.post(
+        "/hooks/stop",
+        json={"project_id": project["id"], "session_id": session_id},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ok"] is True
+    assert body["handoff"] is None
+    assert "handoff blew up" in body.get("error", "")
 
 
 def test_hooks_session_start_injects_full_uuid_not_truncated(client):
@@ -8773,6 +9455,726 @@ def test_project_note_kind_persists_and_coerces(client):
     notes = {n["title"]: n.get("note_kind") for n in client.get(f"/projects/{pid}/notes").json()}
     assert notes["Strategy"] == "insight"
     assert notes["Gotcha"] is None
+
+
+# ---------------------------------------------------------------------------
+# 5a5bba43 — note slugs + pull model (get_notes lightweight / read_note)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_add_project_note_generates_slug(db):
+    """5a5bba43 — add_project_note kebab-cases the title into a stored slug."""
+    p = await db_module.create_project(db, "5a5bba43-slug")
+    note = await db_module.add_project_note(
+        db, p["id"], "Reset the Local DB!", "rm -rf data/"
+    )
+    assert note["slug"] == "reset-the-local-db"
+
+
+@pytest.mark.asyncio
+async def test_note_slug_unique_per_project_on_collision(db):
+    """5a5bba43 — same title in one project gets -2/-3 suffixes; a different
+    project reuses the bare slug (uniqueness is per-project)."""
+    p1 = await db_module.create_project(db, "5a5bba43-coll-1")
+    p2 = await db_module.create_project(db, "5a5bba43-coll-2")
+    a = await db_module.add_project_note(db, p1["id"], "Deploy Steps", "a")
+    b = await db_module.add_project_note(db, p1["id"], "Deploy Steps", "b")
+    c = await db_module.add_project_note(db, p1["id"], "Deploy Steps", "c")
+    assert a["slug"] == "deploy-steps"
+    assert b["slug"] == "deploy-steps-2"
+    assert c["slug"] == "deploy-steps-3"
+    # Different project → bare slug is free again.
+    d = await db_module.add_project_note(db, p2["id"], "Deploy Steps", "d")
+    assert d["slug"] == "deploy-steps"
+
+
+@pytest.mark.asyncio
+async def test_get_project_notes_omits_bodies_by_default(db):
+    """5a5bba43 — pull model: default list has no body; bodies=True includes it."""
+    p = await db_module.create_project(db, "5a5bba43-bodies")
+    await db_module.add_project_note(
+        db, p["id"], "Gotcha", "secret heavy body text", tags="ops"
+    )
+    light = await db_module.get_project_notes(db, p["id"])
+    assert len(light) == 1
+    row = light[0]
+    assert "body" not in row
+    # Lightweight rows still carry the handle fields needed to drive read_note.
+    assert row["title"] == "Gotcha"
+    assert row["slug"] == "gotcha"
+    assert "id" in row and "tags" in row and "created_at" in row
+    # bodies=True restores the legacy full-row shape.
+    full = await db_module.get_project_notes(db, p["id"], bodies=True)
+    assert full[0]["body"] == "secret heavy body text"
+
+
+@pytest.mark.asyncio
+async def test_get_project_notes_query_still_searches_body_when_omitted(db):
+    """5a5bba43 — ?query searches the body in SQL even though the body field is
+    not returned in the lightweight (default) projection."""
+    p = await db_module.create_project(db, "5a5bba43-query")
+    await db_module.add_project_note(db, p["id"], "Title A", "needle in body")
+    await db_module.add_project_note(db, p["id"], "Title B", "unrelated text")
+    hits = await db_module.get_project_notes(db, p["id"], query="needle")
+    assert len(hits) == 1
+    assert hits[0]["title"] == "Title A"
+    assert "body" not in hits[0]
+
+
+# ---------------------------------------------------------------------------
+# 9fa119dd — notes pagination (cursor "Load More", mirrors sprint-items paging)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_get_project_notes_limit_and_offset(db):
+    """9fa119dd — get_project_notes respects limit/offset (SQL LIMIT/OFFSET) and
+    pages newest-first with no overlap, mirroring get_sprint_items_page."""
+    p = await db_module.create_project(db, "9fa119dd-limit")
+    for i in range(7):
+        await db_module.add_project_note(db, p["id"], f"note-{i}", f"body-{i}")
+    page1 = await db_module.get_project_notes(db, p["id"], limit=5, offset=0)
+    page2 = await db_module.get_project_notes(db, p["id"], limit=5, offset=5)
+    assert len(page1) == 5 and len(page2) == 2
+    # No overlap, no gap: the two pages together cover all 7 distinct notes.
+    ids1 = {n["id"] for n in page1}
+    ids2 = {n["id"] for n in page2}
+    assert ids1.isdisjoint(ids2)
+    assert len(ids1 | ids2) == 7
+    # limit=None keeps the legacy "every row" behaviour for existing callers.
+    everything = await db_module.get_project_notes(db, p["id"])
+    assert len(everything) == 7
+
+
+@pytest.mark.asyncio
+async def test_get_project_notes_limit_clamped(db):
+    """9fa119dd — limit is clamped to 1..500 (matches get_sprint_items_page)."""
+    p = await db_module.create_project(db, "9fa119dd-clamp")
+    for i in range(3):
+        await db_module.add_project_note(db, p["id"], f"n{i}", "b")
+    # limit below 1 clamps up to 1.
+    assert len(await db_module.get_project_notes(db, p["id"], limit=0)) == 1
+    assert len(await db_module.get_project_notes(db, p["id"], limit=-9)) == 1
+    # Absurdly large limit clamps to 500 but still returns all rows present.
+    assert len(await db_module.get_project_notes(db, p["id"], limit=99999)) == 3
+
+
+@pytest.mark.asyncio
+async def test_get_project_notes_page_cursor_walk(db):
+    """9fa119dd — get_project_notes_page returns the {notes, has_more,
+    next_cursor} envelope; the cursor walks the whole list with no overlap/gap
+    and terminates (has_more False, next_cursor None) on the last page."""
+    p = await db_module.create_project(db, "9fa119dd-cursor")
+    for i in range(5):
+        await db_module.add_project_note(db, p["id"], f"item-{i}", f"b-{i}")
+    first = await db_module.get_project_notes_page(db, p["id"], limit=2, cursor=0)
+    assert len(first["notes"]) == 2
+    assert first["has_more"] is True
+    assert first["next_cursor"] == 2
+    second = await db_module.get_project_notes_page(
+        db, p["id"], limit=2, cursor=first["next_cursor"]
+    )
+    assert len(second["notes"]) == 2 and second["has_more"] is True
+    assert second["next_cursor"] == 4
+    third = await db_module.get_project_notes_page(
+        db, p["id"], limit=2, cursor=second["next_cursor"]
+    )
+    assert len(third["notes"]) == 1
+    assert third["has_more"] is False
+    assert third["next_cursor"] is None
+    # Walking the cursor visited every note exactly once (no overlap/gap).
+    seen = [n["id"] for pg in (first, second, third) for n in pg["notes"]]
+    assert len(seen) == 5 and len(set(seen)) == 5
+
+
+@pytest.mark.asyncio
+async def test_get_project_notes_page_default_limit_is_100(db):
+    """9fa119dd — the page default caps at 100 with has_more when more exist."""
+    p = await db_module.create_project(db, "9fa119dd-default")
+    for i in range(101):
+        await db_module.add_project_note(db, p["id"], f"n{i:03d}", "b")
+    page = await db_module.get_project_notes_page(db, p["id"])
+    assert len(page["notes"]) == 100
+    assert page["has_more"] is True
+    assert page["next_cursor"] == 100
+    rest = await db_module.get_project_notes_page(db, p["id"], cursor=100)
+    assert len(rest["notes"]) == 1 and rest["has_more"] is False
+
+
+@pytest.mark.asyncio
+async def test_get_project_notes_page_respects_filters(db):
+    """9fa119dd — tag/query filters apply before paging; bodies flag honoured."""
+    p = await db_module.create_project(db, "9fa119dd-filter")
+    await db_module.add_project_note(db, p["id"], "Keep A", "needle one", tags="keep")
+    await db_module.add_project_note(db, p["id"], "Drop B", "unrelated", tags="drop")
+    await db_module.add_project_note(db, p["id"], "Keep C", "needle two", tags="keep")
+    tagged = await db_module.get_project_notes_page(db, p["id"], tag="keep", limit=10)
+    assert {n["title"] for n in tagged["notes"]} == {"Keep A", "Keep C"}
+    assert tagged["has_more"] is False
+    # query filter + bodies projection round-trip through the page envelope.
+    queried = await db_module.get_project_notes_page(
+        db, p["id"], query="needle two", limit=10, bodies=True
+    )
+    assert len(queried["notes"]) == 1
+    assert queried["notes"][0]["body"] == "needle two"
+
+
+def test_project_notes_paginated_endpoint(client):
+    """9fa119dd — GET /projects/{id}/notes?paginate=true returns the cursor
+    envelope; the cursor fetches the next page; the bare list is unchanged."""
+    pid = client.post("/projects", json={"name": "9fa119dd-route"}).json()["id"]
+    for i in range(3):
+        client.post(f"/projects/{pid}/notes", json={"title": f"t{i}", "body": "b"})
+    j = client.get(f"/projects/{pid}/notes?paginate=true&limit=2&cursor=0").json()
+    assert j["has_more"] is True and j["next_cursor"] == 2 and len(j["notes"]) == 2
+    # Notes carry bodies on the HTTP route (dashboard renders them).
+    assert "body" in j["notes"][0]
+    j2 = client.get(f"/projects/{pid}/notes?paginate=true&limit=2&cursor=2").json()
+    assert len(j2["notes"]) == 1 and j2["has_more"] is False and j2["next_cursor"] is None
+    # No overlap between the two cursor pages.
+    assert {n["id"] for n in j["notes"]}.isdisjoint({n["id"] for n in j2["notes"]})
+    # Without paginate= the legacy bare-list shape is preserved.
+    legacy = client.get(f"/projects/{pid}/notes").json()
+    assert isinstance(legacy, list) and len(legacy) == 3
+
+
+@pytest.mark.asyncio
+async def test_get_notes_mcp_tool_pagination_envelope(db):
+    """9fa119dd — the get_notes MCP tool returns the {notes, has_more,
+    next_cursor} envelope when limit/cursor is passed, and the lightweight bare
+    list (no body) when neither is — mirroring get_sprint_items' MCP behaviour."""
+    import meridian.server as srv
+
+    p = await db_module.create_project(db, "9fa119dd-mcp")
+    pid = p["id"]
+    for i in range(3):
+        await db_module.add_project_note(db, pid, f"note-{i}", f"body-{i}")
+    # Pagination requested → envelope, capped at limit.
+    page = await srv._dispatch_mcp_tool(
+        "get_notes", {"project_id": pid, "limit": 2, "cursor": 0}, db, "/tmp"
+    )
+    assert isinstance(page, dict)
+    assert set(page) >= {"notes", "has_more", "next_cursor"}
+    assert len(page["notes"]) == 2 and page["has_more"] is True and page["next_cursor"] == 2
+    rest = await srv._dispatch_mcp_tool(
+        "get_notes", {"project_id": pid, "limit": 2, "cursor": 2}, db, "/tmp"
+    )
+    assert len(rest["notes"]) == 1 and rest["has_more"] is False
+    # No args → unchanged lightweight bare list (back-compat, no body).
+    listed = await srv._dispatch_mcp_tool("get_notes", {"project_id": pid}, db, "/tmp")
+    assert isinstance(listed, list) and len(listed) == 3
+    assert "body" not in listed[0]
+
+
+def test_get_notes_tool_schema_documents_pagination():
+    """9fa119dd — the canonical get_notes schema exposes limit + cursor and the
+    description mentions the cursor/limit pagination."""
+    from meridian.mcp_tools import _MCP_TOOLS_LIST
+
+    tool = {t["name"]: t for t in _MCP_TOOLS_LIST}["get_notes"]
+    props = tool["inputSchema"]["properties"]
+    assert "limit" in props and "cursor" in props
+    assert "cursor" in tool["description"] and "next_cursor" in tool["description"]
+
+
+@pytest.mark.asyncio
+async def test_get_project_note_by_slug_returns_full_body(db):
+    """5a5bba43 — get_project_note_by_slug returns the one full note; wrong slug
+    or wrong project returns None (slugs are per-project)."""
+    p1 = await db_module.create_project(db, "5a5bba43-by-slug-1")
+    p2 = await db_module.create_project(db, "5a5bba43-by-slug-2")
+    await db_module.add_project_note(db, p1["id"], "Env Vars", "set FOO=bar")
+    got = await db_module.get_project_note_by_slug(db, p1["id"], "env-vars")
+    assert got is not None
+    assert got["body"] == "set FOO=bar"
+    assert got["slug"] == "env-vars"
+    # Unknown slug → None.
+    assert await db_module.get_project_note_by_slug(db, p1["id"], "nope") is None
+    # Right slug, wrong project → None (per-project scoping).
+    assert await db_module.get_project_note_by_slug(db, p2["id"], "env-vars") is None
+
+
+@pytest.mark.asyncio
+async def test_note_slug_backfill_populates_preexisting_rows(db):
+    """5a5bba43 — _migrate_note_slug backfills slugs for rows inserted before the
+    column existed, unique per project, and is idempotent on re-run."""
+    from meridian.db import migrations as _mig
+
+    p = await db_module.create_project(db, "5a5bba43-backfill")
+    pid = p["id"]
+    # Simulate legacy rows by clearing the slugs the inserts generated.
+    await db_module.add_project_note(db, pid, "Same Title", "one")
+    await db_module.add_project_note(db, pid, "Same Title", "two")
+    await db_module.add_project_note(db, pid, "Other", "three")
+    await db.execute("UPDATE project_notes SET slug = NULL WHERE project_id = ?", (pid,))
+    await db.commit()
+    # Re-run the migration → every row gets a unique, kebab-cased slug.
+    await _mig._migrate_note_slug(db)
+    rows = await db_module.get_project_notes(db, pid)
+    slugs = sorted(r["slug"] for r in rows)
+    assert slugs == ["other", "same-title", "same-title-2"]
+    assert all(r["slug"] for r in rows)
+    # Idempotent: a second run leaves the now-populated slugs untouched.
+    await _mig._migrate_note_slug(db)
+    rows2 = await db_module.get_project_notes(db, pid)
+    assert sorted(r["slug"] for r in rows2) == slugs
+
+
+@pytest.mark.asyncio
+async def test_migrate_code_anchored_notes_adds_columns_idempotently(db):
+    """771c00d7 — _migrate_code_anchored_notes adds file_path + symbol to
+    project_notes, and is a no-op on re-run (and when columns already exist)."""
+    from meridian.db import migrations as _mig
+
+    # Columns exist after init_db. Drop the table's awareness by checking
+    # introspection, then prove the migration is safely idempotent.
+    assert await _mig._column_exists(db, "project_notes", "file_path")
+    assert await _mig._column_exists(db, "project_notes", "symbol")
+    # Re-running must not raise (ADD COLUMN is guarded) and columns persist.
+    await _mig._migrate_code_anchored_notes(db)
+    await _mig._migrate_code_anchored_notes(db)
+    assert await _mig._column_exists(db, "project_notes", "file_path")
+    assert await _mig._column_exists(db, "project_notes", "symbol")
+
+
+@pytest.mark.asyncio
+async def test_add_code_anchored_note_round_trip(db):
+    """771c00d7 — a kind='code' note stores file_path + symbol; normal notes
+    leave both NULL and are unaffected."""
+    p = await db_module.create_project(db, "771c00d7-roundtrip")
+    pid = p["id"]
+    coded = await db_module.add_project_note(
+        db, pid, "Careful: psycopg3 %% rule", "Use %% not % in LIKE patterns",
+        kind="code", file_path="meridian/db/__init__.py", symbol="add_project_note",
+    )
+    assert coded["note_kind"] == "code"
+    assert coded["file_path"] == "meridian/db/__init__.py"
+    assert coded["symbol"] == "add_project_note"
+
+    plain = await db_module.add_project_note(db, pid, "Setup", "rm -rf data/")
+    assert plain.get("file_path") is None
+    assert plain.get("symbol") is None
+    assert plain.get("note_kind") is None
+
+    # A blank file_path is rejected; a symbol without a path is dropped.
+    with pytest.raises(ValueError):
+        await db_module.add_project_note(
+            db, pid, "Bad", "no path", kind="code", file_path="   "
+        )
+    no_path = await db_module.add_project_note(
+        db, pid, "Sym only", "b", kind="code", symbol="Foo.bar"
+    )
+    assert no_path.get("file_path") is None
+    assert no_path.get("symbol") is None
+
+
+@pytest.mark.asyncio
+async def test_get_code_notes_for_file_matching_and_symbol_scope(db):
+    """771c00d7 — get_code_notes_for_file matches by path; file-level anchors
+    surface for any symbol, symbol anchors only for that symbol."""
+    p = await db_module.create_project(db, "771c00d7-match")
+    pid = p["id"]
+    fpath = "meridian/server.py"
+    # File-level anchor (no symbol) + two symbol-scoped anchors.
+    await db_module.add_project_note(
+        db, pid, "File warning", "whole-file gotcha", kind="code", file_path=fpath
+    )
+    await db_module.add_project_note(
+        db, pid, "login warning", "auth edge case",
+        kind="code", file_path=fpath, symbol="AuthRouter.login",
+    )
+    await db_module.add_project_note(
+        db, pid, "logout warning", "session cleanup",
+        kind="code", file_path=fpath, symbol="AuthRouter.logout",
+    )
+    # A code note on a *different* file must never leak in.
+    await db_module.add_project_note(
+        db, pid, "other file", "x", kind="code", file_path="meridian/db/__init__.py"
+    )
+    # A normal note that happens to mention nothing — must be excluded.
+    await db_module.add_project_note(db, pid, "plain", "body")
+
+    # No symbol → only the file-level anchor.
+    file_only = await db_module.get_code_notes_for_file(db, pid, fpath)
+    assert {n["title"] for n in file_only} == {"File warning"}
+
+    # symbol='AuthRouter.login' → file-level + that symbol, not the other symbol.
+    scoped = await db_module.get_code_notes_for_file(
+        db, pid, fpath, symbol="AuthRouter.login"
+    )
+    assert {n["title"] for n in scoped} == {"File warning", "login warning"}
+
+    # A path with no anchors → empty. Blank path / project → empty.
+    assert await db_module.get_code_notes_for_file(db, pid, "nope.py") == []
+    assert await db_module.get_code_notes_for_file(db, pid, "  ") == []
+    assert await db_module.get_code_notes_for_file(db, "", fpath) == []
+    # Path normalization mirrors claim_file (.strip()) so surrounding ws matches.
+    assert len(await db_module.get_code_notes_for_file(db, pid, f"  {fpath}  ")) == 1
+
+
+@pytest.mark.asyncio
+async def test_claim_file_surfaces_code_notes(db):
+    """771c00d7 — claim_file's response carries code_notes for an anchored file,
+    and an empty list when the file has none."""
+    p = await db_module.create_project(db, "771c00d7-claim")
+    pid = p["id"]
+    fpath = "meridian/pg_adapter.py"
+    await db_module.add_project_note(
+        db, pid, "PG anchor", "psycopg3 uses %s", kind="code", file_path=fpath
+    )
+    sess = await db_module.register_session(db, pid, "worker")
+    sid = sess["id"]
+
+    claimed = await db_module.claim_file(db, fpath, sid)
+    assert claimed["claimed"] is True
+    assert [n["title"] for n in claimed["code_notes"]] == ["PG anchor"]
+
+    # A file with no anchors → empty code_notes (still present, additive).
+    other = await db_module.claim_file(db, "meridian/static/dashboard.css", sid)
+    assert other["code_notes"] == []
+
+    # get_file_claims with project_id → code_notes; without → legacy shape.
+    claims = await db_module.get_file_claims(db, fpath, pid)
+    assert [n["title"] for n in claims["code_notes"]] == ["PG anchor"]
+    legacy = await db_module.get_file_claims(db, fpath)
+    assert "code_notes" not in legacy
+
+
+@pytest.mark.asyncio
+async def test_claim_file_mcp_dispatch_includes_code_notes(db):
+    """771c00d7 — the claim_file MCP dispatch surfaces code_notes end-to-end."""
+    import meridian.server as srv
+
+    p = await db_module.create_project(db, "771c00d7-mcp")
+    pid = p["id"]
+    fpath = "meridian/mcp/handler.py"
+    await db_module.add_project_note(
+        db, pid, "Dispatch note", "watch the order", kind="code", file_path=fpath
+    )
+    sess = await db_module.register_session(db, pid, "mcp-worker")
+    out = await srv._dispatch_mcp_tool(
+        "claim_file", {"session_id": sess["id"], "file_path": fpath}, db, "/tmp"
+    )
+    assert out["claimed"] is True
+    assert [n["title"] for n in out["code_notes"]] == ["Dispatch note"]
+
+
+@pytest.mark.asyncio
+async def test_add_note_mcp_tool_accepts_code_anchor(db):
+    """771c00d7 — the add_note MCP tool stores a code anchor; schema advertises
+    file_path/symbol and the 'code' kind."""
+    import meridian.server as srv
+    from meridian.mcp_tools import _MCP_TOOLS_LIST
+
+    p = await db_module.create_project(db, "771c00d7-addnote")
+    pid = p["id"]
+    note = await srv._dispatch_mcp_tool(
+        "add_note",
+        {
+            "project_id": pid, "title": "anchor", "body": "b",
+            "kind": "code", "file_path": "meridian/db/__init__.py",
+            "symbol": "claim_file",
+        },
+        db, "/tmp",
+    )
+    assert note["note_kind"] == "code"
+    assert note["file_path"] == "meridian/db/__init__.py"
+    assert note["symbol"] == "claim_file"
+
+    by_name = {t["name"]: t for t in _MCP_TOOLS_LIST}
+    props = by_name["add_note"]["inputSchema"]["properties"]
+    assert "code" in props["kind"]["enum"]
+    assert "file_path" in props and "symbol" in props
+
+
+def test_tool_descriptions_enforce_session_protocol():
+    """8a04b6b3 — the three behaviour-critical tools lead their descriptions with
+    an enforcement directive so the model can't miss the protocol."""
+    from meridian.mcp_tools import _MCP_TOOLS_LIST
+
+    by_name = {t["name"]: t for t in _MCP_TOOLS_LIST}
+    assert "PLANNING SESSIONS: CALL THIS FIRST" in by_name["get_planning_brief"]["description"]
+    gh = by_name["generate_handoff"]["description"]
+    assert "EXECUTOR SESSIONS: MANDATORY" in gh and "Never write markdown manually" in gh
+    assert "ALWAYS call get_sprint_items first" in by_name["add_sprint_item"]["description"]
+
+
+@pytest.mark.asyncio
+async def test_read_note_mcp_tool_pull_model(db):
+    """5a5bba43 — get_notes MCP dispatch returns a no-body list by default;
+    read_note pulls one full body by slug; unknown slug returns an error."""
+    import meridian.server as srv
+
+    p = await db_module.create_project(db, "5a5bba43-mcp-pull")
+    pid = p["id"]
+    await db_module.add_project_note(db, pid, "Deploy Note", "update env vars first")
+    # get_notes → lightweight (no body).
+    listed = await srv._dispatch_mcp_tool("get_notes", {"project_id": pid}, db, "/tmp")
+    assert len(listed) == 1
+    assert "body" not in listed[0]
+    slug = listed[0]["slug"]
+    assert slug == "deploy-note"
+    # read_note(slug) → full body.
+    one = await srv._dispatch_mcp_tool(
+        "read_note", {"project_id": pid, "slug": slug}, db, "/tmp"
+    )
+    assert one["body"] == "update env vars first"
+    # Unknown slug → error payload, not a crash.
+    miss = await srv._dispatch_mcp_tool(
+        "read_note", {"project_id": pid, "slug": "ghost"}, db, "/tmp"
+    )
+    assert "error" in miss
+    # get_notes(bodies=true) opts back into the legacy full-row shape.
+    full = await srv._dispatch_mcp_tool(
+        "get_notes", {"project_id": pid, "bodies": True}, db, "/tmp"
+    )
+    assert full[0]["body"] == "update env vars first"
+
+
+@pytest.mark.asyncio
+async def test_read_note_registered_in_tool_list():
+    """5a5bba43 — read_note is declared in the canonical MCP tool list and marked
+    read-only so the dashboard/clients surface it correctly."""
+    from meridian.mcp_tools import _MCP_TOOLS_LIST, _READ_ONLY_TOOLS
+
+    by_name = {t["name"]: t for t in _MCP_TOOLS_LIST}
+    assert "read_note" in by_name
+    schema = by_name["read_note"]["inputSchema"]
+    # 8a449ec0 — project_id is now an alternative to project_name, so it is no
+    # longer strictly required; slug still is, and project_name is advertised.
+    assert schema["required"] == ["slug"]
+    assert "project_name" in schema["properties"]
+    assert "read_note" in _READ_ONLY_TOOLS
+    assert by_name["read_note"]["annotations"]["readOnlyHint"] is True
+
+
+# ---------------------------------------------------------------------------
+# e3f150d0 — document ingestion: project_notes.source + extract_text +
+# ingest_document
+# ---------------------------------------------------------------------------
+
+
+def _build_docx(paragraphs: list[str]) -> bytes:
+    """Build a minimal valid .docx (zip with word/document.xml) in memory.
+
+    Mirrors just enough of the OOXML container for extract_docx_text to parse:
+    one <w:p> per paragraph, each wrapping a <w:t> run. Stdlib only — the test
+    never depends on python-docx (which is not installed)."""
+    import io
+    import zipfile as _zip
+
+    W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    body = "".join(
+        f'<w:p><w:r><w:t xml:space="preserve">{p}</w:t></w:r></w:p>' for p in paragraphs
+    )
+    document_xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        f'<w:document xmlns:w="{W}"><w:body>{body}</w:body></w:document>'
+    )
+    content_types = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+        '<Default Extension="xml" ContentType="application/xml"/>'
+        '<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>'
+        '</Types>'
+    )
+    buf = io.BytesIO()
+    with _zip.ZipFile(buf, "w", _zip.ZIP_DEFLATED) as zf:
+        zf.writestr("[Content_Types].xml", content_types)
+        zf.writestr("word/document.xml", document_xml)
+    return buf.getvalue()
+
+
+@pytest.mark.asyncio
+async def test_migrate_note_source_adds_column_idempotently(db):
+    """e3f150d0 — _migrate_note_source adds project_notes.source and is a no-op
+    on re-run (and when the column already exists after init_db)."""
+    from meridian.db import migrations as _mig
+
+    assert await _mig._column_exists(db, "project_notes", "source")
+    # Re-running must not raise (ADD COLUMN is guarded) and the column persists.
+    await _mig._migrate_note_source(db)
+    await _mig._migrate_note_source(db)
+    assert await _mig._column_exists(db, "project_notes", "source")
+
+
+def test_extract_text_reads_txt_and_md(tmp_path):
+    """e3f150d0 — extract_text reads plain-text/markdown files verbatim."""
+    from meridian.doc_ingest import extract_text
+
+    # Write bytes so the on-disk newlines are deterministic across OSes (text
+    # mode rewrites \n -> \r\n on Windows). extract_text reads bytes verbatim.
+    txt = tmp_path / "spec.txt"
+    txt.write_bytes(b"line one\nline two\n")
+    assert extract_text(str(txt)) == "line one\nline two\n"
+
+    md = tmp_path / "notes.md"
+    md.write_bytes("# Heading\n\nbody text".encode("utf-8"))
+    assert extract_text(str(md)) == "# Heading\n\nbody text"
+
+
+def test_extract_text_docx_paragraph_breaks(tmp_path):
+    """e3f150d0 — extract_text unzips a .docx and joins <w:t> runs with newlines
+    on <w:p> paragraph boundaries (stdlib only, no python-docx)."""
+    from meridian.doc_ingest import extract_text, extract_docx_text
+
+    data = _build_docx(["First paragraph.", "Second paragraph.", "Third."])
+    # Direct bytes API.
+    assert extract_docx_text(data) == "First paragraph.\nSecond paragraph.\nThird."
+    # Via a real .docx file on disk.
+    docx = tmp_path / "thesis.docx"
+    docx.write_bytes(data)
+    assert extract_text(str(docx)) == "First paragraph.\nSecond paragraph.\nThird."
+
+
+def test_extract_text_pdf_and_unsupported_raise_clear_error(tmp_path):
+    """e3f150d0 — .pdf (and any other unsupported type) raises a clear error
+    telling the caller to pass pre-extracted text as content."""
+    from meridian.doc_ingest import extract_text, UnsupportedDocumentError
+
+    pdf = tmp_path / "paper.pdf"
+    pdf.write_bytes(b"%PDF-1.4 fake")
+    with pytest.raises(UnsupportedDocumentError) as exc_pdf:
+        extract_text(str(pdf))
+    assert "content" in str(exc_pdf.value).lower()
+
+    weird = tmp_path / "archive.zip"
+    weird.write_bytes(b"PK\x03\x04")
+    with pytest.raises(UnsupportedDocumentError) as exc_zip:
+        extract_text(str(weird))
+    assert "content" in str(exc_zip.value).lower()
+
+    # Missing file → FileNotFoundError.
+    with pytest.raises(FileNotFoundError):
+        extract_text(str(tmp_path / "nope.txt"))
+
+
+@pytest.mark.asyncio
+async def test_ingest_document_from_content_stores_document_note(db):
+    """e3f150d0 — ingest_document with content stores a kind='document' note
+    carrying the source; title/source provided are used verbatim."""
+    p = await db_module.create_project(db, "e3f150d0-content")
+    pid = p["id"]
+    note = await db_module.ingest_document(
+        db, pid,
+        content="Q3 revenue grew 12% QoQ.",
+        title="Q3 Report",
+        source="https://example.com/q3.pdf",
+        tags="finance,report",
+    )
+    assert note["note_kind"] == "document"
+    assert note["body"] == "Q3 revenue grew 12% QoQ."
+    assert note["source"] == "https://example.com/q3.pdf"
+    assert note["title"] == "Q3 Report"
+    # Searchable like any note (body full-text query).
+    hits = await db_module.get_project_notes(db, pid, query="revenue")
+    assert any(n["id"] == note["id"] for n in hits)
+
+
+@pytest.mark.asyncio
+async def test_ingest_document_from_file_extracts_and_defaults(db, tmp_path):
+    """e3f150d0 — ingest_document with file_path extracts server-side; title
+    defaults to the basename and source defaults to file_path."""
+    p = await db_module.create_project(db, "e3f150d0-file")
+    pid = p["id"]
+    doc = tmp_path / "design-spec.txt"
+    doc.write_text("The widget must debounce input by 300ms.", encoding="utf-8")
+    note = await db_module.ingest_document(db, pid, file_path=str(doc))
+    assert note["note_kind"] == "document"
+    assert note["body"] == "The widget must debounce input by 300ms."
+    assert note["title"] == "design-spec.txt"  # basename default
+    assert note["source"] == str(doc)           # source defaults to file_path
+
+
+@pytest.mark.asyncio
+async def test_ingest_document_caps_oversized_body(db):
+    """e3f150d0 — an oversized body is truncated with the '…[truncated]' marker
+    while staying a kind='document' note."""
+    from meridian.doc_ingest import DOC_BODY_MAX_CHARS, TRUNCATION_MARKER
+
+    p = await db_module.create_project(db, "e3f150d0-cap")
+    pid = p["id"]
+    big = "x" * (DOC_BODY_MAX_CHARS + 5000)
+    note = await db_module.ingest_document(db, pid, content=big, title="huge")
+    assert note["body"].endswith(TRUNCATION_MARKER)
+    assert len(note["body"]) == DOC_BODY_MAX_CHARS + len(TRUNCATION_MARKER)
+
+
+@pytest.mark.asyncio
+async def test_ingest_document_requires_content_or_file_path(db):
+    """e3f150d0 — calling with neither content nor file_path raises ValueError."""
+    p = await db_module.create_project(db, "e3f150d0-missing")
+    pid = p["id"]
+    with pytest.raises(ValueError):
+        await db_module.ingest_document(db, pid)
+
+
+@pytest.mark.asyncio
+async def test_ingest_document_mcp_tool_round_trip(db, tmp_path):
+    """e3f150d0 — the ingest_document MCP tool extracts a .docx server-side and
+    stores a kind='document' note; the PDF path returns a clear error payload.
+    Also asserts the tool is declared in the canonical tool list."""
+    import meridian.server as srv
+    from meridian.mcp_tools import _MCP_TOOLS_LIST
+
+    p = await db_module.create_project(db, "e3f150d0-mcp")
+    pid = p["id"]
+
+    docx = tmp_path / "chapter.docx"
+    docx.write_bytes(_build_docx(["Intro.", "Method."]))
+    note = await srv._dispatch_mcp_tool(
+        "ingest_document",
+        {"project_id": pid, "file_path": str(docx), "tags": "thesis"},
+        db, "/tmp",
+    )
+    assert note["note_kind"] == "document"
+    assert note["body"] == "Intro.\nMethod."
+    assert note["title"] == "chapter.docx"
+    assert note["source"] == str(docx)
+
+    # A .pdf file_path is rejected server-side with guidance to pass content.
+    pdf = tmp_path / "scan.pdf"
+    pdf.write_bytes(b"%PDF-1.7 ...")
+    err = await srv._dispatch_mcp_tool(
+        "ingest_document", {"project_id": pid, "file_path": str(pdf)}, db, "/tmp"
+    )
+    assert "error" in err and "content" in err["error"].lower()
+
+    by_name = {t["name"]: t for t in _MCP_TOOLS_LIST}
+    assert "ingest_document" in by_name
+    # 8a449ec0 — project_id resolvable via project_name, so required is now empty
+    # (the resolver/handler enforce a real project); project_name is advertised.
+    assert by_name["ingest_document"]["inputSchema"]["required"] == []
+    assert "project_name" in by_name["ingest_document"]["inputSchema"]["properties"]
+    # It writes, so it must not be flagged read-only.
+    assert by_name["ingest_document"]["annotations"]["readOnlyHint"] is False
+
+
+@pytest.mark.asyncio
+async def test_add_note_mcp_tool_stores_source_and_document_kind(db):
+    """e3f150d0 — the add_note MCP tool accepts source + kind='document' and the
+    schema advertises both."""
+    import meridian.server as srv
+    from meridian.mcp_tools import _MCP_TOOLS_LIST
+
+    p = await db_module.create_project(db, "e3f150d0-addnote")
+    pid = p["id"]
+    note = await srv._dispatch_mcp_tool(
+        "add_note",
+        {
+            "project_id": pid, "title": "Spec", "body": "ingested text",
+            "kind": "document", "source": "https://example.com/spec",
+        },
+        db, "/tmp",
+    )
+    assert note["note_kind"] == "document"
+    assert note["source"] == "https://example.com/spec"
+
+    by_name = {t["name"]: t for t in _MCP_TOOLS_LIST}
+    props = by_name["add_note"]["inputSchema"]["properties"]
+    assert "document" in props["kind"]["enum"]
+    assert "source" in props
 
 
 async def test_auto_capture_writes_session_note_not_project_note():
@@ -9711,7 +11113,10 @@ def test_update_sprint_item_in_mcp_tools_list_and_writable():
     tool = next((t for t in _MCP_TOOLS_LIST if t["name"] == "update_sprint_item"), None)
     assert tool is not None, "update_sprint_item missing from _MCP_TOOLS_LIST"
     assert tool["annotations"]["readOnlyHint"] is False
-    assert set(tool["inputSchema"]["required"]) == {"project_id", "item_id"}
+    # 8a449ec0 — project_id no longer strictly required (resolvable via
+    # project_name); item_id remains required, project_name is advertised.
+    assert set(tool["inputSchema"]["required"]) == {"item_id"}
+    assert "project_name" in tool["inputSchema"]["properties"]
 
 
 @pytest.mark.asyncio
@@ -10923,6 +12328,125 @@ async def test_add_sprint_item_no_warning_when_no_sessions(db):
 
 
 # ---------------------------------------------------------------------------
+# b0d42ef6 — add_sprint_item duplicate guard (BLOCKING with force override)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_add_sprint_item_blocks_duplicate_of_pending(db):
+    """A >=60% word-overlap title for a PENDING item is blocked (no row created)."""
+    p = await db_module.create_project(db, "dup-pending")
+    pid = p["id"]
+    existing = await db_module.add_sprint_item(db, pid, "v1", "Add OAuth login flow")
+
+    res = await db_module.add_sprint_item(db, pid, "v1", "add oauth login flow")
+    assert res.get("error") == "duplicate"
+    assert res["existing"]["id"] == existing["id"]
+    assert res["existing"]["status"] == "pending"
+    assert res["existing"]["title"] == "Add OAuth login flow"
+    assert res["existing"]["overlap_pct"] == 100
+    assert existing["id"][:8] in res["message"]
+    # No second row was created — only the original pending item exists.
+    items = await db_module.get_sprint_items(db, pid)
+    assert len(items) == 1
+    assert items[0]["id"] == existing["id"]
+
+
+@pytest.mark.asyncio
+async def test_add_sprint_item_blocks_duplicate_of_in_progress(db):
+    """A near-duplicate of an IN_PROGRESS item is blocked too."""
+    p = await db_module.create_project(db, "dup-in-progress")
+    pid = p["id"]
+    existing = await db_module.add_sprint_item(db, pid, "v1", "Rewrite the installer script")
+    await db_module.claim_sprint_item(db, pid, existing["id"])  # -> in_progress
+    claimed = await db_module.get_sprint_item(db, existing["id"])
+    assert claimed["status"] == "in_progress"
+
+    res = await db_module.add_sprint_item(db, pid, "v1", "rewrite installer script")
+    assert res.get("error") == "duplicate"
+    assert res["existing"]["id"] == existing["id"]
+    assert res["existing"]["status"] == "in_progress"
+    items = await db_module.get_sprint_items(db, pid)
+    assert len(items) == 1
+
+
+@pytest.mark.asyncio
+async def test_add_sprint_item_allows_duplicate_of_done(db):
+    """A duplicate of a DONE item is allowed — finished work never blocks."""
+    p = await db_module.create_project(db, "dup-done")
+    pid = p["id"]
+    done = await db_module.add_sprint_item(db, pid, "v1", "Add OAuth login flow")
+    await db_module.complete_sprint_item(db, pid, done["id"])
+
+    res = await db_module.add_sprint_item(db, pid, "v1", "Add OAuth login flow")
+    assert "error" not in res
+    assert res["id"] != done["id"]
+    items = await db_module.get_sprint_items(db, pid)
+    assert len(items) == 2
+
+
+@pytest.mark.asyncio
+async def test_add_sprint_item_allows_below_threshold(db):
+    """Below-threshold (<60%) similarity is allowed through."""
+    p = await db_module.create_project(db, "dup-below")
+    pid = p["id"]
+    await db_module.add_sprint_item(db, pid, "v1", "First fix")  # {first, fix}
+
+    # {second, fix}: overlap = 1/2 = 50% < 60% -> allowed.
+    res = await db_module.add_sprint_item(db, pid, "v1", "Second fix")
+    assert "error" not in res
+    items = await db_module.get_sprint_items(db, pid)
+    assert len(items) == 2
+
+
+@pytest.mark.asyncio
+async def test_add_sprint_item_force_overrides_duplicate(db):
+    """force=True bypasses the guard and creates the item despite overlap."""
+    p = await db_module.create_project(db, "dup-force")
+    pid = p["id"]
+    existing = await db_module.add_sprint_item(db, pid, "v1", "Add OAuth login flow")
+
+    # Sanity: it WOULD be blocked without force.
+    blocked = await db_module.add_sprint_item(db, pid, "v1", "Add OAuth login flow")
+    assert blocked.get("error") == "duplicate"
+
+    forced = await db_module.add_sprint_item(
+        db, pid, "v1", "Add OAuth login flow", force=True
+    )
+    assert "error" not in forced
+    assert forced["id"] != existing["id"]
+    items = await db_module.get_sprint_items(db, pid)
+    assert len(items) == 2
+
+
+@pytest.mark.asyncio
+async def test_add_sprint_item_dispatch_returns_duplicate_error(db):
+    """The MCP add_sprint_item tool surfaces the duplicate error; force=true overrides."""
+    import meridian.server as srv
+    p = await db_module.create_project(db, "dup-dispatch")
+    pid = p["id"]
+    existing = await db_module.add_sprint_item(db, pid, "v1", "Refactor the auth middleware")
+
+    res = await srv._dispatch_mcp_tool(
+        "add_sprint_item",
+        {"project_id": pid, "version": "v1", "title": "refactor auth middleware"},
+        db, "/tmp",
+    )
+    assert res.get("error") == "duplicate"
+    assert res["existing"]["id"] == existing["id"]
+    assert len(await db_module.get_sprint_items(db, pid)) == 1
+
+    forced = await srv._dispatch_mcp_tool(
+        "add_sprint_item",
+        {"project_id": pid, "version": "v1", "title": "refactor auth middleware", "force": True},
+        db, "/tmp",
+    )
+    assert forced.get("error") != "duplicate"
+    assert "id" in forced
+    assert len(await db_module.get_sprint_items(db, pid)) == 2
+
+
+# ---------------------------------------------------------------------------
 # fd86aacc — get_session_brief board change counter
 # ---------------------------------------------------------------------------
 
@@ -11632,12 +13156,17 @@ async def test_get_planning_brief_unknown_project(db):
 
 
 def test_mcp_prompts_list():
-    """prompts/list returns both registered prompts."""
+    """prompts/list returns every registered slash-command prompt."""
     from meridian.mcp.handler import _MCP_PROMPTS
 
     names = {p["name"] for p in _MCP_PROMPTS}
-    assert "start-executor" in names
-    assert "daily-standup" in names
+    assert {
+        "start-executor",
+        "daily-standup",
+        "planning-session-start",
+        "executor-goal",
+        "hotfix-loop",
+    } <= names
     for prompt in _MCP_PROMPTS:
         assert "description" in prompt
         assert "arguments" in prompt
@@ -11713,6 +13242,77 @@ async def test_mcp_initialize_advertises_prompts(db):
     assert "prompts" in res["result"]["capabilities"]
 
 
+# a7a67388 — planning-session-start / executor-goal / hotfix-loop prompts
+
+def test_mcp_prompts_get_planning_session_start():
+    """planning-session-start returns the planner protocol scaffold."""
+    from meridian.mcp.handler import _build_prompt_messages
+
+    msgs = _build_prompt_messages("planning-session-start", {"project_id": "plan-pid"})
+    assert len(msgs) == 1 and msgs[0]["role"] == "user"
+    text = msgs[0]["content"]["text"]
+    assert "plan-pid" in text
+    assert "get_planning_brief" in text
+    assert "add_sprint_item" in text
+
+
+def test_mcp_prompts_get_hotfix_loop():
+    """hotfix-loop returns the read -> edit -> push protocol."""
+    from meridian.mcp.handler import _build_prompt_messages
+
+    msgs = _build_prompt_messages("hotfix-loop", {"project_id": "fix-pid"})
+    assert len(msgs) == 1
+    text = msgs[0]["content"]["text"]
+    assert "fix-pid" in text
+    assert "claim_file" in text
+    assert "dev" in text  # push to dev only
+
+
+@pytest.mark.asyncio
+async def test_mcp_prompts_executor_goal_template_no_project(db):
+    """executor-goal with no project resolves to a template, not an error."""
+    from meridian.mcp.handler import _build_prompt_messages_async
+
+    msgs = await _build_prompt_messages_async("executor-goal", {}, db)
+    text = msgs[0]["content"]["text"]
+    assert "/goal" in text
+    assert "start_session" in text
+
+
+@pytest.mark.asyncio
+async def test_mcp_prompts_executor_goal_live_items(db):
+    """executor-goal with a real project_id renders its live pending items."""
+    from meridian.mcp.handler import _handle_mcp_request
+
+    proj = await db_module.create_project(db, "exec-goal-core")
+    pid = proj["id"]
+    item = await db_module.add_sprint_item(db, pid, "v1", "Render live goal items")
+
+    req = {
+        "jsonrpc": "2.0", "id": 7, "method": "prompts/get",
+        "params": {"name": "executor-goal", "arguments": {"project_id": pid}},
+    }
+    res = await _handle_mcp_request(req, db, "/tmp")
+    text = res["result"]["messages"][0]["content"]["text"]
+    assert item["id"] in text
+    assert "Render live goal items" in text
+    assert res["result"]["description"]
+
+
+@pytest.mark.asyncio
+async def test_mcp_prompts_get_unknown_returns_error(db):
+    """prompts/get for an unknown name returns a -32602 JSON-RPC error."""
+    from meridian.mcp.handler import _handle_mcp_request
+
+    req = {
+        "jsonrpc": "2.0", "id": 8, "method": "prompts/get",
+        "params": {"name": "does-not-exist"},
+    }
+    res = await _handle_mcp_request(req, db, "/tmp")
+    assert res["error"]["code"] == -32602
+    assert "unknown prompt" in res["error"]["message"]
+
+
 def test_new_planning_tools_in_tool_list():
     """reconcile_sprint_drift and get_planning_brief appear in _MCP_TOOLS_LIST."""
     from meridian.mcp_tools import _MCP_TOOLS_LIST, _READ_ONLY_TOOLS
@@ -11722,3 +13322,421 @@ def test_new_planning_tools_in_tool_list():
     assert "get_planning_brief" in names
     assert "reconcile_sprint_drift" in _READ_ONLY_TOOLS
     assert "get_planning_brief" in _READ_ONLY_TOOLS
+
+
+# ---------------------------------------------------------------------------
+# a76cb7c0 — start_session sprint-version scoping
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_migrate_session_sprint_version_adds_column_idempotently(db):
+    """a76cb7c0 — _migrate_session_sprint_version adds sessions.sprint_version
+    and is a no-op on re-run (and when the column already exists after init_db)."""
+    from meridian.db import migrations as _mig
+
+    assert await _mig._column_exists(db, "sessions", "sprint_version")
+    # Re-running must not raise (ADD COLUMN is guarded) and the column persists.
+    await _mig._migrate_session_sprint_version(db)
+    await _mig._migrate_session_sprint_version(db)
+    assert await _mig._column_exists(db, "sessions", "sprint_version")
+
+
+@pytest.mark.asyncio
+async def test_infer_active_sprint_version_picks_most_pending(db):
+    """The inferred bucket is the version with the most pending items."""
+    p = await db_module.create_project(db, "infer-most")
+    pid = p["id"]
+    # v0.1.x: 3 pending; v1.1: 1 pending → v0.1.x wins.
+    for i in range(3):
+        await db_module.add_sprint_item(db, pid, "v0.1.x", f"alpha item {i}")
+    await db_module.add_sprint_item(db, pid, "v1.1", "backlog item")
+    assert await db_module.infer_active_sprint_version(db, pid) == "v0.1.x"
+
+
+@pytest.mark.asyncio
+async def test_infer_active_sprint_version_ignores_done_and_human(db):
+    """Only pending (pending/todo) non-human items count toward the bucket."""
+    p = await db_module.create_project(db, "infer-status")
+    pid = p["id"]
+    # v2.0: 2 items but both completed → not pending.
+    done1 = await db_module.add_sprint_item(db, pid, "v2.0", "done one")
+    done2 = await db_module.add_sprint_item(db, pid, "v2.0", "done two")
+    await db_module.complete_sprint_item(db, pid, done1["id"])
+    await db_module.complete_sprint_item(db, pid, done2["id"])
+    # v0.1.x: 1 genuinely pending item.
+    await db_module.add_sprint_item(db, pid, "v0.1.x", "pending one")
+    # A human-assigned pending item in another bucket must be ignored.
+    await db_module.add_sprint_item(
+        db, pid, "vHuman", "human task", milestone_type="human",
+    )
+    assert await db_module.infer_active_sprint_version(db, pid) == "v0.1.x"
+
+
+@pytest.mark.asyncio
+async def test_infer_active_sprint_version_none_when_no_pending(db):
+    """No pending items → None (session left unscoped for back-compat)."""
+    p = await db_module.create_project(db, "infer-empty")
+    pid = p["id"]
+    assert await db_module.infer_active_sprint_version(db, pid) is None
+    # Completed-only board is still None.
+    done = await db_module.add_sprint_item(db, pid, "v1", "shipped")
+    await db_module.complete_sprint_item(db, pid, done["id"])
+    assert await db_module.infer_active_sprint_version(db, pid) is None
+
+
+@pytest.mark.asyncio
+async def test_get_sprint_items_version_filter(db):
+    """get_sprint_items(version=...) returns only that bucket; None = all."""
+    p = await db_module.create_project(db, "items-filter")
+    pid = p["id"]
+    await db_module.add_sprint_item(db, pid, "v0.1.x", "a")
+    await db_module.add_sprint_item(db, pid, "v0.1.x", "b")
+    await db_module.add_sprint_item(db, pid, "v1.1", "c")
+    scoped = await db_module.get_sprint_items(db, pid, version="v0.1.x")
+    assert {it["title"] for it in scoped} == {"a", "b"}
+    assert all(it["version"] == "v0.1.x" for it in scoped)
+    # None returns every version.
+    assert len(await db_module.get_sprint_items(db, pid)) == 3
+
+
+@pytest.mark.asyncio
+async def test_start_session_explicit_version_scopes_orientation(db, tmp_path):
+    """a76cb7c0 — explicit version is stored on the session and the compact
+    orientation's counts are filtered to that bucket."""
+    import meridian.server as srv
+
+    p = await db_module.create_project(db, "scope-explicit")
+    pid = p["id"]
+    # Two buckets; pass the SMALLER one explicitly to prove it overrides the
+    # most-pending inference (which would otherwise pick v9.9).
+    await db_module.add_sprint_item(db, pid, "v0.1.x", "scoped item")
+    for i in range(3):
+        await db_module.add_sprint_item(db, pid, "v9.9", f"other {i}")
+
+    payload = await srv._start_session_composite(
+        db, pid, "scoped-session", str(tmp_path), version="v0.1.x", compact=True,
+    )
+    assert payload["sprint_version"] == "v0.1.x"
+    # Only the one v0.1.x pending item is counted, not the 3 in v9.9.
+    assert payload["sprint_summary"]["total"] == 1
+    assert payload["sprint_summary"]["pending"] == 1
+    # Scope is persisted on the session row.
+    async with db.execute(
+        "SELECT sprint_version FROM sessions WHERE id = ?", (payload["session_id"],)
+    ) as cur:
+        row = await cur.fetchone()
+    assert (row["sprint_version"] if isinstance(row, dict) else row[0]) == "v0.1.x"
+
+
+@pytest.mark.asyncio
+async def test_start_session_full_block_scopes_sprint_items(db, tmp_path):
+    """The non-compact orientation's sprint_items list is filtered to the
+    session's resolved version too."""
+    import meridian.server as srv
+
+    p = await db_module.create_project(db, "scope-full")
+    pid = p["id"]
+    await db_module.add_sprint_item(db, pid, "v0.1.x", "in scope")
+    await db_module.add_sprint_item(db, pid, "v2.0", "out of scope")
+
+    payload = await srv._start_session_composite(
+        db, pid, "full-scoped", str(tmp_path), version="v0.1.x", compact=False,
+    )
+    assert payload["sprint_version"] == "v0.1.x"
+    titles = {it["title"] for it in payload["sprint_items"]}
+    assert titles == {"in scope"}
+
+
+@pytest.mark.asyncio
+async def test_start_session_infers_version_when_omitted(db, tmp_path):
+    """No version arg → infer the bucket with the most pending items, store it."""
+    import meridian.server as srv
+
+    p = await db_module.create_project(db, "scope-infer")
+    pid = p["id"]
+    for i in range(2):
+        await db_module.add_sprint_item(db, pid, "v0.1.x", f"alpha {i}")
+    await db_module.add_sprint_item(db, pid, "v1.1", "lonely backlog")
+
+    payload = await srv._start_session_composite(
+        db, pid, "infer-session", str(tmp_path), compact=True,
+    )
+    assert payload["sprint_version"] == "v0.1.x"
+    assert payload["sprint_summary"]["pending"] == 2
+
+
+@pytest.mark.asyncio
+async def test_start_session_no_pending_leaves_unscoped(db, tmp_path):
+    """No pending items → sprint_version is None and nothing is filtered
+    (full back-compat with pre-a76cb7c0 sessions)."""
+    import meridian.server as srv
+
+    p = await db_module.create_project(db, "scope-none")
+    pid = p["id"]
+    # Only a completed item exists — no pending bucket to infer.
+    done = await db_module.add_sprint_item(db, pid, "v1", "already shipped")
+    await db_module.complete_sprint_item(db, pid, done["id"])
+
+    payload = await srv._start_session_composite(
+        db, pid, "unscoped-session", str(tmp_path), compact=True,
+    )
+    assert payload["sprint_version"] is None
+    async with db.execute(
+        "SELECT sprint_version FROM sessions WHERE id = ?", (payload["session_id"],)
+    ) as cur:
+        row = await cur.fetchone()
+    assert (row["sprint_version"] if isinstance(row, dict) else row[0]) is None
+
+
+@pytest.mark.asyncio
+async def test_start_session_via_mcp_passes_version(db, tmp_path):
+    """The MCP tools/call dispatch threads `version` into the composite."""
+    from meridian.mcp.handler import _dispatch_mcp_tool
+
+    p = await db_module.create_project(db, "mcp-version")
+    pid = p["id"]
+    await db_module.add_sprint_item(db, pid, "v0.1.x", "scoped via mcp")
+    await db_module.add_sprint_item(db, pid, "v3.0", "other bucket")
+
+    result = await _dispatch_mcp_tool(
+        "start_session",
+        {"project_id": pid, "session_name": "mcp-sess", "version": "v0.1.x"},
+        db, str(tmp_path),
+    )
+    assert result["sprint_version"] == "v0.1.x"
+    assert result["sprint_summary"]["total"] == 1
+
+
+def test_build_quick_start_goal_filters_by_version():
+    """a76cb7c0 — _build_quick_start_goal(version=...) names only that bucket's
+    items; None keeps every pending item (legacy)."""
+    from meridian.handoff import _build_quick_start_goal
+
+    items = [
+        {"id": "aaa", "version": "v0.1.x"},
+        {"id": "bbb", "version": "v0.1.x"},
+        {"id": "ccc", "version": "v1.1"},
+    ]
+    scoped = _build_quick_start_goal(items, version="v0.1.x")
+    assert "aaa" in scoped and "bbb" in scoped
+    assert "ccc" not in scoped
+    # Unscoped names all three.
+    unscoped = _build_quick_start_goal(items)
+    assert "aaa" in unscoped and "ccc" in unscoped
+
+
+def test_build_quick_start_goal_version_with_no_matches():
+    """A version with no pending items falls back to the verify-complete goal."""
+    from meridian.handoff import _build_quick_start_goal
+
+    items = [{"id": "aaa", "version": "v1.1"}]
+    goal = _build_quick_start_goal(items, version="v0.1.x")
+    assert "Verify remaining work is complete" in goal
+
+
+# ---------------------------------------------------------------------------
+# ecf69de8 — per-project execution_mode (autonomous vs interactive)
+# ---------------------------------------------------------------------------
+
+
+def test_build_quick_start_goal_autonomous_directive():
+    """ecf69de8 — autonomous (default) prepends the non-deferential executor
+    directive so the session runs immediately."""
+    from meridian.handoff import (
+        _build_quick_start_goal,
+        _EXECUTOR_GOAL_DIRECTIVE,
+    )
+
+    items = [{"id": "aaa"}, {"id": "bbb"}]
+    # Explicit autonomous and the default both use the executor directive.
+    for goal in (
+        _build_quick_start_goal(items, execution_mode="autonomous"),
+        _build_quick_start_goal(items),
+    ):
+        assert _EXECUTOR_GOAL_DIRECTIVE.strip() in goal
+        assert "without asking for direction" in goal
+        assert "aaa" in goal and "bbb" in goal
+
+
+def test_build_quick_start_goal_interactive_directive():
+    """ecf69de8 — interactive prepends the deferential directive and drops the
+    'without asking' executor framing."""
+    from meridian.handoff import (
+        _build_quick_start_goal,
+        _INTERACTIVE_GOAL_DIRECTIVE,
+    )
+
+    items = [{"id": "aaa"}, {"id": "bbb"}]
+    goal = _build_quick_start_goal(items, execution_mode="interactive")
+    assert _INTERACTIVE_GOAL_DIRECTIVE.strip() in goal
+    assert "confirm with the human which to start" in goal
+    # The non-deferential executor line must NOT be present in interactive mode.
+    assert "without asking for direction" not in goal
+    # Items are still named so the human knows what's queued.
+    assert "aaa" in goal and "bbb" in goal
+
+
+def test_normalize_execution_mode_validates():
+    """ecf69de8 — normalize_execution_mode keeps valid values and falls back to
+    'autonomous' for anything else."""
+    assert db_module.normalize_execution_mode("autonomous") == "autonomous"
+    assert db_module.normalize_execution_mode("interactive") == "interactive"
+    assert db_module.normalize_execution_mode("INTERACTIVE") == "interactive"
+    assert db_module.normalize_execution_mode("  autonomous  ") == "autonomous"
+    # Invalid / missing → default.
+    assert db_module.normalize_execution_mode("bogus") == "autonomous"
+    assert db_module.normalize_execution_mode("") == "autonomous"
+    assert db_module.normalize_execution_mode(None) == "autonomous"
+
+
+@pytest.mark.asyncio
+async def test_create_project_execution_mode_default_and_set(db):
+    """ecf69de8 — create_project defaults to autonomous, accepts interactive,
+    and normalises an invalid value to autonomous."""
+    default = await db_module.create_project(db, "exec-mode-default")
+    assert default["execution_mode"] == "autonomous"
+
+    interactive = await db_module.create_project(
+        db, "exec-mode-interactive", execution_mode="interactive"
+    )
+    assert interactive["execution_mode"] == "interactive"
+
+    invalid = await db_module.create_project(
+        db, "exec-mode-invalid", execution_mode="sideways"
+    )
+    assert invalid["execution_mode"] == "autonomous"
+
+    # Setter flips it and normalises, and get_project_settings reflects it.
+    updated = await db_module.set_project_execution_mode(
+        db, default["id"], "interactive"
+    )
+    assert updated is not None
+    assert updated["execution_mode"] == "interactive"
+    settings = await db_module.get_project_settings(db, default["id"])
+    assert settings["execution_mode"] == "interactive"
+    # Invalid value via setter normalises back to autonomous.
+    reset = await db_module.set_project_execution_mode(db, default["id"], "nope")
+    assert reset is not None
+    assert reset["execution_mode"] == "autonomous"
+
+
+@pytest.mark.asyncio
+async def test_update_project_settings_execution_mode(db):
+    """ecf69de8 — execution_mode round-trips through update_project_settings and
+    a bad value normalises to autonomous."""
+    p = await db_module.create_project(db, "exec-mode-settings")
+    res = await db_module.update_project_settings(
+        db, p["id"], execution_mode="interactive"
+    )
+    assert res is not None
+    assert res["execution_mode"] == "interactive"
+    res2 = await db_module.update_project_settings(
+        db, p["id"], execution_mode="garbage"
+    )
+    assert res2["execution_mode"] == "autonomous"
+
+
+def test_migration_adds_execution_mode_default_autonomous(tmp_path):
+    """ecf69de8 — init_db adds execution_mode to a legacy projects table,
+    backfilling existing rows to 'autonomous', and is idempotent."""
+    import sqlite3
+
+    db_path = tmp_path / "legacy_exec_mode.db"
+    legacy = sqlite3.connect(db_path)
+    legacy.executescript(
+        """
+        CREATE TABLE projects (id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')));
+        INSERT INTO projects (id, name) VALUES ('p1', 'legacy-proj');
+        """
+    )
+    legacy.commit()
+    legacy.close()
+
+    async def run():
+        # First init applies the migration and backfills the existing row.
+        conn = await db_module.init_db(str(db_path))
+        try:
+            assert await db_module._column_exists(conn, "projects", "execution_mode")
+            proj = await db_module.get_project(conn, "p1")
+            assert proj is not None
+            assert proj["execution_mode"] == "autonomous"
+        finally:
+            await conn.close()
+        # Second init is a no-op (idempotent) and preserves the value.
+        conn2 = await db_module.init_db(str(db_path))
+        try:
+            proj2 = await db_module.get_project(conn2, "p1")
+            assert proj2["execution_mode"] == "autonomous"
+        finally:
+            await conn2.close()
+
+    import asyncio
+    asyncio.run(run())
+
+
+@pytest.mark.asyncio
+async def test_start_session_injects_execution_mode_directive(db, tmp_path):
+    """ecf69de8 — the start_session response includes the structured
+    execution_mode field AND a protocol-level directive line, for both the
+    compact and full payloads, reflecting each mode."""
+    import meridian.server as srv
+
+    # Autonomous (default) — compact path.
+    auto = await db_module.create_project(db, "ss-exec-auto")
+    res_c = await srv._start_session_composite(
+        db, auto["id"], "auto-compact", str(tmp_path), compact=True
+    )
+    assert res_c["execution_mode"] == "autonomous"
+    assert "EXECUTION MODE: autonomous" in res_c["execution_mode_directive"]
+    assert "EXECUTION MODE: autonomous" in res_c["agent_instructions"]
+    assert "do not defer" in res_c["agent_instructions"]
+
+    # Autonomous — full path.
+    res_f = await srv._start_session_composite(
+        db, auto["id"], "auto-full", str(tmp_path), compact=False
+    )
+    assert res_f["execution_mode"] == "autonomous"
+    assert "EXECUTION MODE: autonomous" in res_f["execution_mode_directive"]
+    assert res_f["agent_instructions"].startswith("EXECUTION MODE: autonomous")
+
+    # Interactive — compact + full both carry the deferential directive.
+    inter = await db_module.create_project(
+        db, "ss-exec-inter", execution_mode="interactive"
+    )
+    res_ic = await srv._start_session_composite(
+        db, inter["id"], "inter-compact", str(tmp_path), compact=True
+    )
+    assert res_ic["execution_mode"] == "interactive"
+    assert "EXECUTION MODE: interactive" in res_ic["execution_mode_directive"]
+    assert "ask for direction" in res_ic["agent_instructions"]
+
+    res_if = await srv._start_session_composite(
+        db, inter["id"], "inter-full", str(tmp_path), compact=False
+    )
+    assert res_if["execution_mode"] == "interactive"
+    assert res_if["agent_instructions"].startswith("EXECUTION MODE: interactive")
+
+
+@pytest.mark.asyncio
+async def test_executor_goal_prompt_scopes_to_active_version(db):
+    """The executor-goal MCP prompt filters its item list + /goal to the
+    inferred active sprint version."""
+    from meridian.mcp.handler import _build_executor_goal_messages
+
+    p = await db_module.create_project(db, "exec-goal-scope")
+    pid = p["id"]
+    a = await db_module.add_sprint_item(db, pid, "v0.1.x", "scoped exec item")
+    await db_module.add_sprint_item(db, pid, "v1.1", "other bucket item")
+    # v0.1.x is the only multi? No — both have 1; ensure v0.1.x wins by count.
+    await db_module.add_sprint_item(db, pid, "v0.1.x", "second scoped item")
+
+    messages = await _build_executor_goal_messages({"project_id": pid}, db)
+    text = messages[0]["content"]["text"]
+    assert a["id"] in text
+    # The other-bucket item id must not appear in the scoped template.
+    other = [
+        it for it in await db_module.get_sprint_items(db, pid, version="v1.1")
+    ][0]
+    assert other["id"] not in text

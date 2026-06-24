@@ -33,7 +33,7 @@ from fastapi.responses import Response
 
 from .. import db as db_module
 from .._deps import _hosted_mode, _get_tenant_from_request, _db
-from ..tunnel_plugins import normalize_plugins_config, resolve_plugins
+from ..tunnel_plugins import normalize_plugins_config, resolve_plugins, resolve_custom_plugins
 
 router = APIRouter()
 _log = logging.getLogger(__name__)
@@ -46,6 +46,7 @@ _tunnel_code_sockets: dict[str, WebSocket] = {}
 _tunnel_extract_sockets: dict[str, WebSocket] = {}
 _tunnel_ppt_sockets: dict[str, WebSocket] = {}
 _tunnel_word_sockets: dict[str, WebSocket] = {}
+_tunnel_dc_sockets: dict[str, WebSocket] = {}
 
 # Correlation maps: request_id → Future that resolves when client responds
 _pending_reqs: dict[str, asyncio.Future[dict]] = {}
@@ -53,6 +54,7 @@ _pending_code_reqs: dict[str, asyncio.Future[dict]] = {}
 _pending_extract_reqs: dict[str, asyncio.Future[dict]] = {}
 _pending_ppt_reqs: dict[str, asyncio.Future[dict]] = {}
 _pending_word_reqs: dict[str, asyncio.Future[dict]] = {}
+_pending_dc_reqs: dict[str, asyncio.Future[dict]] = {}
 
 
 def _is_tunnel_allowed(tenant: dict) -> bool:
@@ -408,6 +410,12 @@ async def tunnel_word_ws(ws: WebSocket, tenant_id: str) -> None:
     await _serve_tunnel_ws(ws, tenant_id, _tunnel_word_sockets, _pending_word_reqs, "word")
 
 
+@router.websocket("/tunnel-dc/{tenant_id}")
+async def tunnel_dc_ws(ws: WebSocket, tenant_id: str) -> None:
+    """Hold open a WebSocket for one tenant's desktop-commander proxy."""
+    await _serve_tunnel_ws(ws, tenant_id, _tunnel_dc_sockets, _pending_dc_reqs, "dc")
+
+
 # ---------------------------------------------------------------------------
 # Shared proxy helper
 # ---------------------------------------------------------------------------
@@ -743,6 +751,27 @@ async def word_mcp_proxy_subpath(tenant_id: str, rest: str, request: Request) ->
                                _tunnel_word_sockets, _pending_word_reqs, "word")
 
 
+@router.get("/dc/mcp/{tenant_id}")
+@router.post("/dc/mcp/{tenant_id}")
+@router.options("/dc/mcp/{tenant_id}")
+async def dc_mcp_proxy(tenant_id: str, request: Request) -> Response:
+    """Proxy requests to the tenant's desktop-commander over the dc tunnel."""
+    prefix = f"/dc/mcp/{tenant_id}"
+    local_path = request.url.path[len(prefix):] or "/"
+    return await _office_proxy(tenant_id, local_path, request,
+                               _tunnel_dc_sockets, _pending_dc_reqs, "dc")
+
+
+@router.get("/dc/mcp/{tenant_id}/{rest:path}")
+@router.post("/dc/mcp/{tenant_id}/{rest:path}")
+@router.options("/dc/mcp/{tenant_id}/{rest:path}")
+async def dc_mcp_proxy_subpath(tenant_id: str, rest: str, request: Request) -> Response:
+    """Same as dc_mcp_proxy but for sub-paths."""
+    local_path = f"/{rest}" if rest else "/"
+    return await _office_proxy(tenant_id, local_path, request,
+                               _tunnel_dc_sockets, _pending_dc_reqs, "dc")
+
+
 # ---------------------------------------------------------------------------
 # GET /tunnel/status/{tenant_id}  — lightweight status check (no auth required)
 # ---------------------------------------------------------------------------
@@ -757,6 +786,7 @@ async def tunnel_status(tenant_id: str) -> dict:
         "extract_active": tenant_id in _tunnel_extract_sockets,
         "ppt_active": tenant_id in _tunnel_ppt_sockets,
         "word_active": tenant_id in _tunnel_word_sockets,
+        "dc_active": tenant_id in _tunnel_dc_sockets,
     }
 
 
@@ -785,14 +815,17 @@ async def get_tunnel_plugins(request: Request) -> Response:
     tenant = await _get_tenant_from_request(request)
     if tenant is None:
         return _json_response({
-            "plugins": resolve_plugins(None), "config": {},
-            "active": {"fs": False, "code": False, "extract": False},
+            "plugins": resolve_plugins(None), "custom": [], "config": {},
+            "active": {"fs": False, "code": False, "extract": False, "ppt": False, "word": False, "dc": False},
             "plan": "free",
         })
     parsed = _parse_plugins_json(tenant.get("tunnel_plugins"))
     tid = tenant.get("id")
     return _json_response({
         "plugins": resolve_plugins(parsed),
+        # User-defined (non-built-in) plugins, so the dashboard can render and
+        # edit existing custom entries. LOCAL-ONLY — no server route involved.
+        "custom": resolve_custom_plugins(parsed),
         "config": parsed if isinstance(parsed, (dict, list)) else {},
         "active": {
             "fs": tid in _tunnel_sockets,
@@ -800,6 +833,7 @@ async def get_tunnel_plugins(request: Request) -> Response:
             "extract": tid in _tunnel_extract_sockets,
             "ppt": tid in _tunnel_ppt_sockets,
             "word": tid in _tunnel_word_sockets,
+            "dc": tid in _tunnel_dc_sockets,
         },
         # The tunnel (and thus this section) is Pro/admin-only; the dashboard
         # uses this to gate the Tunnel Plugins card.
@@ -901,7 +935,7 @@ async def get_tunnel_filesystem_roots(request: Request) -> Response:
 # so a stateless ``tools/call`` can find the owning tunnel without re-listing.
 # Cold/missing entries trigger a one-shot re-discovery via ``list_tunnel_tools``.
 
-_TUNNEL_LABELS = ("fs", "code", "extract", "ppt", "word")
+_TUNNEL_LABELS = ("fs", "code", "extract", "ppt", "word", "dc")
 
 # Human-readable connector prefix shown to Claude in tool names (e.g.
 # "filesystem:read_file" instead of "fs:read_file"). The routing cache still
@@ -913,6 +947,7 @@ SLOT_DISPLAY_NAMES = {
     "extract": "extractor",
     "ppt": "powerpoint",
     "word": "word",
+    "dc": "desktop-commander",
 }
 
 # Per-process routing cache: tenant_id → {tool_name: tunnel_label}
@@ -970,6 +1005,8 @@ def _label_maps(label: str) -> "tuple[dict[str, WebSocket], dict[str, asyncio.Fu
         return _tunnel_ppt_sockets, _pending_ppt_reqs
     if label == "word":
         return _tunnel_word_sockets, _pending_word_reqs
+    if label == "dc":
+        return _tunnel_dc_sockets, _pending_dc_reqs
     return _tunnel_extract_sockets, _pending_extract_reqs
 
 
@@ -981,6 +1018,7 @@ def has_active_tunnel(tenant_id: str) -> bool:
         or tenant_id in _tunnel_extract_sockets
         or tenant_id in _tunnel_ppt_sockets
         or tenant_id in _tunnel_word_sockets
+        or tenant_id in _tunnel_dc_sockets
     )
 
 
@@ -1043,6 +1081,29 @@ async def _tunnel_jsonrpc(
     return _parse_mcp_payload(resp.body)
 
 
+async def _fetch_slot_tools(tenant_id: str, label: str) -> "tuple[str, list[dict]]":
+    """Fetch tools/list for one tunnel slot with retries. Returns (label, tools)."""
+    sockets, _ = _label_maps(label)
+    if tenant_id not in sockets:
+        return label, []
+    tools: list[dict] = []
+    for _attempt in range(4):  # initial try + up to 3 retries
+        try:
+            resp = await asyncio.wait_for(
+                _tunnel_jsonrpc(tenant_id, label, "tools/list", {}),
+                timeout=3.0,
+            )
+            tools = ((resp.get("result") or {}).get("tools")) or [] if resp else []
+        except Exception as exc:  # noqa: BLE001
+            _log.debug("tunnel %s tools/list failed for %s: %s", label, tenant_id[:8], exc)
+            tools = []
+        if tools:
+            break
+        if _attempt < 3:
+            await asyncio.sleep(0.5)
+    return label, tools
+
+
 async def list_tunnel_tools(
     tenant_id: str, reserved_names: "frozenset[str] | set[str]" = frozenset(),
 ) -> list[dict]:
@@ -1056,21 +1117,14 @@ async def list_tunnel_tools(
     Because prefixed names can't collide with native/GitHub (bare) tool names,
     ``reserved_names`` no longer needs to drop them — it's kept for forward
     compatibility but matched against the prefixed name (a no-op in practice).
+    Slots are fetched in parallel so one slow/dead slot can't block the others.
     """
     aggregated: list[dict] = []
     routes: dict[str, str] = {}
-    for label in _TUNNEL_LABELS:
-        sockets, _ = _label_maps(label)
-        if tenant_id not in sockets:
-            continue
-        try:
-            resp = await _tunnel_jsonrpc(tenant_id, label, "tools/list", {})
-        except Exception as exc:  # noqa: BLE001
-            _log.debug("tunnel %s tools/list failed for %s: %s", label, tenant_id[:8], exc)
-            resp = None
-        if not resp:
-            continue
-        tools = ((resp.get("result") or {}).get("tools")) or []
+    slot_results = await asyncio.gather(
+        *[_fetch_slot_tools(tenant_id, label) for label in _TUNNEL_LABELS]
+    )
+    for label, tools in slot_results:
         for tool in tools:
             if not isinstance(tool, dict):
                 continue
@@ -1112,6 +1166,26 @@ async def call_tunnel_tool(
     sockets, _ = _label_maps(label)
     if tenant_id not in sockets:
         return None
+    # Filesystem tools require absolute paths. Relative paths resolve against
+    # the mcp-proxy CWD (usually the home dir) — not the intended repo root —
+    # causing confusing "file not found" errors. Catch them early and return a
+    # clear message so the caller knows what to fix.
+    if label == "fs" and arguments:
+        _PATH_KEYS = ("path", "paths", "source", "destination")
+        for _key in _PATH_KEYS:
+            _val = arguments.get(_key)
+            if _val is None:
+                continue
+            _candidates = [_val] if isinstance(_val, str) else (_val if isinstance(_val, list) else [])
+            for _p in _candidates:
+                if not isinstance(_p, str) or not _p:
+                    continue
+                import os.path as _osp
+                if not _osp.isabs(_p) and not (len(_p) >= 2 and _p[1] == ":"):
+                    raise RuntimeError(
+                        f"filesystem tools require absolute paths — got relative path {_p!r}. "
+                        f"Use a full path, e.g. C:\\\\Users\\\\13144\\\\Documents\\\\...\\\\{_p}"
+                    )
     # The tunneled server only knows the bare tool name; strip the connector prefix.
     bare_name = name.split("__", 1)[1] if "__" in name else name
     resp = await _tunnel_jsonrpc(

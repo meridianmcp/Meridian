@@ -81,15 +81,21 @@ async def add_sprint_item_endpoint(
     human_id = body.get("human_id") or None
     depends_on = body.get("depends_on") or None
     failure_mode = body.get("failure_mode") or None
+    force = bool(body.get("force", False))
     # G4.15 — safety limit
     from .. import limits as _limits  # noqa: PLC0415
     existing = await db_module.get_sprint_items(await _db(request), project_id)
     _limits.check_sprint_items_per_project(len(existing))
-    return await db_module.add_sprint_item(
+    result = await db_module.add_sprint_item(
         await _db(request), project_id, version, title,
         group=group, human_id=human_id,
         depends_on=depends_on, failure_mode=failure_mode,
+        force=force,
     )
+    # b0d42ef6 — duplicate guard blocked the insert: 409 Conflict with details.
+    if isinstance(result, dict) and result.get("error") == "duplicate":
+        raise HTTPException(status_code=409, detail=result)
+    return result
 
 
 @router.post("/projects/{project_id}/sprint-items/{item_id}/complete")

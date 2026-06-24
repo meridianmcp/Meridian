@@ -73,6 +73,25 @@ def test_dashboard_loads_200(client):
     )
 
 
+def test_workspace_personal_backlog_section_present(js):
+    """b2115251 — the Workspace settings area surfaces the cross-project personal
+    backlog (workspace sprint board): a list, an add control, grouping by bucket,
+    and status controls wired to the /workspace/sprint-items endpoints."""
+    # Section + add control ids.
+    assert "ws-sprint-list" in js, "personal backlog list container missing"
+    assert "ws-sprint-add" in js, "personal backlog add button missing"
+    assert "ws-sprint-title" in js, "personal backlog title input missing"
+    assert "ws-sprint-group" in js, "personal backlog bucket/group input missing"
+    assert "Personal backlog" in js, "personal backlog heading missing"
+    # Render + fetch wiring against the workspace sprint-items endpoint.
+    assert "renderWsSprint" in js, "renderWsSprint render function missing"
+    assert "/workspace/sprint-items" in js, "personal backlog endpoint wiring missing"
+    # Grouping by item_group bucket + status controls.
+    assert "data-ws-group" in js, "personal backlog item_group grouping missing"
+    assert "data-ws-status" in js, "personal backlog status dropdown missing"
+    assert "/complete" in js, "personal backlog complete control missing"
+
+
 def test_backburner_section_has_grouping_search_and_archive(js):
     """e62ce019 — the backburner section groups by item_group, has a filter box,
     and a per-item permanent-delete (archive) button wired to the DELETE path."""
@@ -84,6 +103,23 @@ def test_backburner_section_has_grouping_search_and_archive(js):
     # Per-item archive/delete button (write control → must be demo-hidden).
     assert "sprintArchive(" in js, "backburner archive button missing"
     assert "async function sprintArchive" in js, "sprintArchive impl missing"
+
+
+def test_notes_tab_has_cursor_load_more(js):
+    """9fa119dd — the notes tab paginates: the initial load hits the paginated
+    notes endpoint, and a "Load More" button fetches the next cursor + appends,
+    mirroring the devlog/tasks Load-More wiring."""
+    # Initial + subsequent fetches use the cursor-pagination endpoint.
+    assert "/notes?paginate=true&limit=" in js, (
+        "notes tab must fetch the paginated ?paginate=true endpoint"
+    )
+    # A Load More control wired to the cursor exists in the notes tab.
+    assert "notes-load-more-" in js, "notes Load More button id missing"
+    assert "const loadMore" in js, "notes loadMore() handler missing"
+    # The handler consumes the {notes, has_more, next_cursor} envelope.
+    assert "next_cursor" in js and "has_more" in js, (
+        "notes loadMore must read the has_more / next_cursor envelope"
+    )
 
 
 def test_dashboard_north_star_not_same_as_version_goal(js):
@@ -519,6 +555,45 @@ def test_known_locations_has_manual_path_entry(js):
     )
 
 
+def test_execution_mode_toggle_present(js):
+    """ecf69de8 — the settings tab renders an Execution Mode select (autonomous
+    vs interactive) that persists via saveProjectSettings (PATCH settings)."""
+    # Section header + the select element id.
+    assert "Execution Mode" in js, "Execution Mode section header missing"
+    assert "execution-mode-${projectId}" in js, "execution mode select id missing"
+    # Both posture options are rendered.
+    assert 'value="autonomous"' in js, "autonomous option missing"
+    assert 'value="interactive"' in js, "interactive option missing"
+    # onchange handler persists via saveProjectSettings with the execution_mode key.
+    assert "saveProjectSettings(projectId, { execution_mode: emSel.value })" in js, (
+        "execution mode change must persist via saveProjectSettings (PATCH settings)"
+    )
+
+
+def test_codeintel_tab_sends_project_slug_not_repo_path(js):
+    """HOTFIX 9d11c952 — the Code Intel tab must call index_status / get_architecture
+    with the `project` slug the code-intel graph keys on (root_path with :/\\ collapsed
+    to dashes, e.g. C-Users-13144-Documents-Meridian-repository), NOT a raw `repo_path`.
+    The backend tools require `project`; sending `repo_path` made the lookup a no-op."""
+    import re
+    # The slug helper exists and collapses drive-colon + path separators to dashes.
+    assert "_repoPathToProject" in js, "repo-path -> project slug helper missing"
+    assert re.search(r"_repoPathToProject\s*\([^)]*\)\s*\{[^}]*\[\\\\/:\]", js), (
+        "_repoPathToProject must collapse [\\\\/:] runs to dashes"
+    )
+    # Both tool calls send the derived `project`, and neither still sends `repo_path`.
+    assert "name: 'index_status', arguments: {project: _repoPathToProject(" in js, (
+        "index_status must be called with project slug, not repo_path"
+    )
+    assert "name: 'get_architecture', arguments: archArgs" in js
+    assert "{project: _repoPathToProject(archPath)}" in js, (
+        "get_architecture must be called with project slug, not repo_path"
+    )
+    assert "index_status', arguments: {repo_path:" not in js, (
+        "stale repo_path arg still sent to index_status"
+    )
+
+
 def test_tunnel_plugins_section_exposed_on_window(js):
     """Regression (9d03d7cc): loadTunnelPluginsSection must be on window so the
     settings module's window.loadTunnelPluginsSection?.() call actually renders it."""
@@ -538,3 +613,79 @@ def test_tunnel_plugins_section_plan_gated_and_collapsible(js):
     # Collapsible <details> card.
     assert "<details class=\"meridian-disclosure\" open" in js or \
            "<details class='meridian-disclosure' open" in js
+
+
+def test_tunnel_plugins_section_has_ux_enhancements(js):
+    """Sprint bca73c3f — the Tunnel Plugins card gains four UX sub-features:
+    (1) explicit reset-confirm dialog, (2) per-plugin live tools dropdown,
+    (3) OS-detected dependency-install cards, (4) a curated installable list."""
+    import re
+
+    # (4) Curated installable plugin list — a module-level constant with real,
+    # well-known MCP servers (name + command + description + docs).
+    assert "_CURATED_TUNNEL_PLUGINS" in js, "curated plugin constant missing"
+    assert "uvx mcp-server-fetch" in js, "curated 'Fetch' command missing"
+    assert "@modelcontextprotocol/server-sequential-thinking" in js, (
+        "curated 'Sequential Thinking' command missing"
+    )
+    # Rendered with a copy-to-clipboard action.
+    assert "navigator.clipboard" in js, "clipboard copy not wired"
+
+    # (2) Per-plugin live tools dropdown — JSON-RPC tools/list against the slot's
+    # MCP proxy at /<slot>/mcp/<tenantId>/mcp, parsed JSON-or-SSE like the code tab.
+    assert "method: 'tools/list'" in js, "tools/list JSON-RPC call missing"
+    assert re.search(r"`/\$\{slot\}/mcp/\$\{tenantId\}/mcp`", js), (
+        "per-slot MCP proxy URL (/<slot>/mcp/<tenantId>/mcp) not constructed"
+    )
+    # Tenant id sourced from /me (reused across slots), and the live tool names
+    # rendered from result.tools.
+    assert "api('/me')" in js, "tenant id must come from /me"
+    assert "result.tools" in js or "result && parsed.result.tools" in js or \
+           "parsed.result && parsed.result.tools" in js, "tool list not read from result.tools"
+    # Graceful 'not connected' state when the slot isn't live.
+    assert "not connected — start the tunnel" in js, "missing inactive-slot message"
+
+    # (3) OS-detected install command cards — navigator-based detection + the
+    # winget / brew install one-liners for uv and Node.js.
+    assert "_detectTunnelOs" in js, "OS detection helper missing"
+    assert "navigator.userAgent" in js and "navigator.platform" in js, (
+        "OS detection must read navigator.userAgent / navigator.platform"
+    )
+    assert "winget install --id=astral-sh.uv -e" in js, "Windows uv install cmd missing"
+    assert "winget install OpenJS.NodeJS -e" in js, "Windows Node install cmd missing"
+    assert "brew install uv" in js and "brew install node" in js, "macOS install cmds missing"
+    assert "https://astral.sh/uv/install.sh" in js, "Linux uv install cmd missing"
+
+    # (1) Reset still guards with a confirm() dialog (not regressed).
+    assert "confirm(" in js, "reset confirmation dialog regressed"
+
+
+def test_tunnel_plugins_custom_subsection_present(js):
+    """Sprint ce84619d — the Tunnel Plugins card gains a Custom plugins subsection:
+    a list of existing custom plugins (each with Remove), an add form (name /
+    command / port + Add), and the custom entries are merged into collectConfig."""
+    # The custom list is seeded from data.custom and kept in a mutable array.
+    assert "data.custom" in js or "data && data.custom" in js, (
+        "custom plugins must be read from the GET /tunnel/plugins `custom` key"
+    )
+    assert "const customPlugins" in js, "customPlugins array missing"
+    assert "renderCustomList" in js, "custom list renderer missing"
+
+    # Add form: name / command / port inputs + an Add button (id-scoped per project).
+    assert "tp-custom-name-${projectId}" in js, "custom name input missing"
+    assert "tp-custom-command-${projectId}" in js, "custom command input missing"
+    assert "tp-custom-port-${projectId}" in js, "custom port input missing"
+    assert "tp-custom-add-${projectId}" in js, "custom Add button missing"
+
+    # Per-row Remove button, wired via addEventListener (no inline onclick to globals).
+    assert "tp-custom-remove" in js, "custom Remove button missing"
+    assert "customPlugins.splice" in js, "Remove must drop the entry from customPlugins"
+
+    # collectConfig merges the custom entries (name + command + port + enabled).
+    assert "customPlugins.forEach" in js, "collectConfig must merge custom plugins"
+
+    # LOCAL-ONLY framing surfaced to the user (no claude.ai connector).
+    assert "127.0.0.1" in js, "custom plugins local-proxy framing missing"
+
+    # Add-form validation rejects the built-in default ports (8808–8813).
+    assert "8808" in js and "8813" in js, "custom port guard against built-in ports missing"

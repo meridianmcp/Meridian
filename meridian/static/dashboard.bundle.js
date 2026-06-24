@@ -2898,6 +2898,38 @@ project_id = "${displayPid}"`;
           }
         };
       }, 0);
+      const executionMode = projectSettings && projectSettings.execution_mode === "interactive" ? "interactive" : "autonomous";
+      html += `<div style="margin-bottom:16px">
+
+    <div style="color:var(--accent);font-size:10px;letter-spacing:.06em;text-transform:uppercase;margin-bottom:10px;padding-bottom:4px;border-bottom:1px solid var(--border)">Execution Mode</div>
+
+    <div style="font-size:10px;color:var(--muted);margin-bottom:10px">How a new session behaves when it starts. Injected into <code>start_session</code> at the protocol level.</div>
+
+    <label style="display:block;font-size:11px;color:var(--text);margin-bottom:4px">Executor posture</label>
+    <div style="font-size:10px;color:var(--muted);margin-bottom:6px"><strong>Autonomous</strong> claims and runs pending sprint items immediately without asking. <strong>Interactive</strong> reviews the items and asks which to start first.</div>
+    <select id="execution-mode-${projectId}" style="width:100%;padding:6px 8px;font-size:11px;background:var(--surface-1);color:var(--text);border:1px solid var(--border);border-radius:5px;cursor:pointer">
+      <option value="autonomous" ${executionMode === "autonomous" ? "selected" : ""}>Autonomous (claim &amp; run, do not defer)</option>
+      <option value="interactive" ${executionMode === "interactive" ? "selected" : ""}>Interactive (ask for direction first)</option>
+    </select>
+    <div id="execution-mode-status-${projectId}" style="font-size:10px;color:var(--muted);margin-top:6px;min-height:13px"></div>
+
+  </div>`;
+      setTimeout(() => {
+        const emSel = document.getElementById(`execution-mode-${projectId}`);
+        const emStatus = document.getElementById(`execution-mode-status-${projectId}`);
+        if (emSel) emSel.onchange = async () => {
+          if (emStatus) emStatus.textContent = "Saving\u2026";
+          try {
+            await saveProjectSettings(projectId, { execution_mode: emSel.value });
+            if (emStatus) emStatus.textContent = "Saved.";
+            setTimeout(() => {
+              if (emStatus) emStatus.textContent = "";
+            }, 1500);
+          } catch (e) {
+            if (emStatus) emStatus.textContent = `Save failed: ${String(e)}`;
+          }
+        };
+      }, 0);
       const autoWorktrees = parseInt((projectSettings && projectSettings.auto_worktrees) != null ? projectSettings.auto_worktrees : 1, 10);
       const requireMergeApproval = parseInt((projectSettings && projectSettings.require_merge_approval) != null ? projectSettings.require_merge_approval : 1, 10);
       html += `<div style="margin-bottom:16px">
@@ -3346,6 +3378,72 @@ project_id = "${displayPid}"`;
             noteAdd.disabled = false;
           }
         };
+        const sprintList = document.getElementById("ws-sprint-list");
+        async function renderWsSprint() {
+          if (!sprintList) return;
+          try {
+            const items = await api("/workspace/sprint-items");
+            if (!items || !items.length) {
+              sprintList.innerHTML = '<div style="color:var(--muted)">No personal backlog items yet.</div>';
+              return;
+            }
+            const groups = {};
+            items.forEach((it) => {
+              const g = it.item_group || "(ungrouped)";
+              (groups[g] = groups[g] || []).push(it);
+            });
+            const STATUSES = ["todo", "pending", "in_progress", "done", "skipped", "failed"];
+            sprintList.innerHTML = Object.keys(groups).map((g) => {
+              const rows = groups[g].map((it) => {
+                const done = it.status === "done" || it.status === "skipped";
+                const titleStyle = done ? "text-decoration:line-through;color:var(--muted)" : "";
+                const sel = `<select data-ws-status="${escapeHtml(it.id)}" style="font-size:9px;padding:1px 3px;background:var(--surface-2);border:1px solid var(--border);color:var(--text);border-radius:3px">` + STATUSES.map((s) => `<option value="${s}"${s === it.status ? " selected" : ""}>${s}</option>`).join("") + `</select>`;
+                return `<div data-ws-row="${escapeHtml(it.id)}" style="display:flex;justify-content:space-between;align-items:center;gap:8px;padding:3px 0;border-bottom:1px solid var(--border)"><span style="${titleStyle}">${escapeHtml(it.title || "")}${it.human_id ? ` <span style="color:var(--accent);font-size:9px">@${escapeHtml(it.human_id)}</span>` : ""}</span><span style="display:flex;gap:4px;flex-shrink:0;align-items:center">${sel}<button class="secondary" data-ws-done="${escapeHtml(it.id)}" style="font-size:9px;padding:2px 6px" title="Mark done">\u2713</button></span></div>`;
+              }).join("");
+              return `<div data-ws-group style="margin-bottom:8px"><div style="color:var(--accent);font-size:9px;letter-spacing:.05em;text-transform:uppercase;margin-bottom:2px">${escapeHtml(g)}</div>${rows}</div>`;
+            }).join("");
+            sprintList.querySelectorAll("select[data-ws-status]").forEach((sel) => {
+              sel.onchange = async () => {
+                try {
+                  await api(`/workspace/sprint-items/${sel.dataset.wsStatus}`, { method: "PATCH", body: JSON.stringify({ status: sel.value }) });
+                  renderWsSprint();
+                } catch (e) {
+                  alert("Error: " + e);
+                }
+              };
+            });
+            sprintList.querySelectorAll("button[data-ws-done]").forEach((btn) => {
+              btn.onclick = async () => {
+                try {
+                  await api(`/workspace/sprint-items/${btn.dataset.wsDone}/complete`, { method: "POST" });
+                  renderWsSprint();
+                } catch (e) {
+                  alert("Error: " + e);
+                }
+              };
+            });
+          } catch (e) {
+            sprintList.innerHTML = '<div style="color:var(--muted)">Failed to load.</div>';
+          }
+        }
+        renderWsSprint();
+        const sprintAdd = document.getElementById("ws-sprint-add");
+        if (sprintAdd) sprintAdd.onclick = async () => {
+          const title = (document.getElementById("ws-sprint-title")?.value || "").trim();
+          const group = (document.getElementById("ws-sprint-group")?.value || "").trim();
+          if (!title) return;
+          sprintAdd.disabled = true;
+          try {
+            await api("/workspace/sprint-items", { method: "POST", body: JSON.stringify({ title, group: group || void 0 }) });
+            document.getElementById("ws-sprint-title").value = "";
+            document.getElementById("ws-sprint-group").value = "";
+            renderWsSprint();
+          } catch (e) {
+            alert("Error: " + e);
+          } finally {
+            sprintAdd.disabled = false;
+          }
+        };
       }, 0);
       html += "</div></details>";
       html += "</div></details>";
@@ -3400,13 +3498,22 @@ project_id = "${displayPid}"`;
         <button id="ws-dec-add" class="primary" style="font-size:10px;padding:4px 10px">Pin</button>
       </div>
     </div>
-    <div>
+    <div style="margin-bottom:12px">
       <div style="font-size:10px;color:var(--text);margin-bottom:4px">Workspace notes</div>
       <div id="ws-notes-list" style="font-size:10px;font-family:var(--font-mono);margin-bottom:6px"><div style="color:var(--muted)">loading\u2026</div></div>
       <div style="display:flex;gap:6px;flex-wrap:wrap">
         <input id="ws-note-title" type="text" placeholder="Title" style="background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:4px 8px;flex:1;min-width:120px">
         <input id="ws-note-body" type="text" placeholder="Body" style="background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:4px 8px;flex:2;min-width:160px">
         <button id="ws-note-add" class="primary" style="font-size:10px;padding:4px 10px">Add</button>
+      </div>
+    </div>
+    <div id="ws-sprint-section">
+      <div style="font-size:10px;color:var(--text);margin-bottom:4px">Personal backlog <span style="font-size:9px;color:var(--muted)">(cross-project \u2014 not tied to any one project)</span></div>
+      <div id="ws-sprint-list" style="font-size:10px;font-family:var(--font-mono);margin-bottom:6px"><div style="color:var(--muted)">loading\u2026</div></div>
+      <div style="display:flex;gap:6px;flex-wrap:wrap">
+        <input id="ws-sprint-group" type="text" placeholder="Bucket (e.g. thesis)" style="background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:4px 8px;flex:1;min-width:100px">
+        <input id="ws-sprint-title" type="text" placeholder="What needs doing" style="background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:4px 8px;flex:2;min-width:160px">
+        <button id="ws-sprint-add" class="primary" style="font-size:10px;padding:4px 10px">Add</button>
       </div>
     </div>
   </div>`;
@@ -4662,6 +4769,21 @@ project_id = "${displayPid}"`;
     };
     const noteTags = (n) => String(n.tags || "").split(",").map((t) => t.trim()).filter(Boolean);
     let allNotes = [];
+    const NOTES_PAGE = 100;
+    let nextCursor = 0;
+    let hasMore = false;
+    const renderLoadMore = () => {
+      const existing = document.getElementById(`notes-load-more-${projectId}`);
+      if (existing) existing.remove();
+      if (!hasMore) return;
+      const btn = document.createElement("button");
+      btn.id = `notes-load-more-${projectId}`;
+      btn.className = "secondary";
+      btn.style = "width:100%;margin-top:8px;padding:5px;font-size:11px;font-family:var(--font-mono)";
+      btn.textContent = `Load ${NOTES_PAGE} more \u2193`;
+      btn.onclick = () => loadMore(btn);
+      body.appendChild(btn);
+    };
     const refreshTagOptions = () => {
       if (!tagSelect) return;
       const prev = tagSelect.value;
@@ -4698,6 +4820,7 @@ ${n.tags || ""}`.toLowerCase();
       if (!visible.length) {
         const reason = allNotes.length ? `(no notes match \u2014 clear the search/tag filter${!includeAuto ? " or tick \u201Csummaries\u201D" : ""})` : `(no notes yet \u2014 use the form below or <code>add_note</code> MCP tool)`;
         body.innerHTML = `<div style="color:var(--muted);padding:10px;text-align:center;border:1px dashed var(--border);border-radius:4px">${reason}</div>`;
+        renderLoadMore();
         return;
       }
       body.innerHTML = visible.map((n) => {
@@ -4735,11 +4858,41 @@ ${n.tags || ""}`.toLowerCase();
           }
         };
       });
+      renderLoadMore();
+    };
+    const loadMore = async (btn) => {
+      if (btn) {
+        btn.disabled = true;
+        btn.textContent = "loading\u2026";
+      }
+      try {
+        const page = await projectApi(
+          projectId,
+          `/projects/${projectId}/notes?paginate=true&limit=${NOTES_PAGE}&cursor=${nextCursor}`
+        ) || {};
+        allNotes = [...allNotes, ...page.notes || []];
+        hasMore = !!page.has_more;
+        nextCursor = page.next_cursor != null ? page.next_cursor : nextCursor;
+        refreshTagOptions();
+        applyFilters();
+      } catch (e) {
+        if (btn) {
+          btn.disabled = false;
+          btn.textContent = `Load ${NOTES_PAGE} more \u2193 (retry)`;
+        }
+        toast("load more failed: " + e.message, true);
+      }
     };
     const load = async () => {
       body.innerHTML = `<div class="empty" style="color:var(--muted)">loading notes\u2026</div>`;
       try {
-        allNotes = await projectApi(projectId, `/projects/${projectId}/notes`) || [];
+        const page = await projectApi(
+          projectId,
+          `/projects/${projectId}/notes?paginate=true&limit=${NOTES_PAGE}&cursor=0`
+        ) || {};
+        allNotes = page.notes || [];
+        hasMore = !!page.has_more;
+        nextCursor = page.next_cursor != null ? page.next_cursor : 0;
         refreshTagOptions();
         applyFilters();
       } catch (e) {
@@ -5739,6 +5892,7 @@ ${n.tags || ""}`.toLowerCase();
     if (activeVtab === "hitl") await loadHitlTab(projectId);
     if (activeVtab === "docs") await loadDocsTab(projectId);
     if (activeVtab === "settings") await loadSettingsTab(projectId);
+    if (activeVtab === "codeintel") await loadCodeIntelTab(projectId);
   }
   function syncSidebarActiveProject() {
     document.querySelectorAll(".project-item").forEach((item) => {
@@ -5918,6 +6072,58 @@ ${n.tags || ""}`.toLowerCase();
     }
   }
   var _TUNNEL_DEFAULT_PORTS = { fs: 8808, code: 8809, extract: 8810, ppt: 8811, word: 8812 };
+  var _CURATED_TUNNEL_PLUGINS = [
+    { name: "Sequential Thinking", command: "npx -y @modelcontextprotocol/server-sequential-thinking", description: "Structured step-by-step reasoning", docs: "https://github.com/modelcontextprotocol/servers" },
+    { name: "Fetch", command: "uvx mcp-server-fetch", description: "Fetch & convert web pages to markdown", docs: "https://github.com/modelcontextprotocol/servers" },
+    { name: "Git", command: "uvx mcp-server-git", description: "Read/search/manipulate Git repos", docs: "https://github.com/modelcontextprotocol/servers" },
+    { name: "Time", command: "uvx mcp-server-time", description: "Time & timezone conversion", docs: "https://github.com/modelcontextprotocol/servers" },
+    { name: "Memory", command: "npx -y @modelcontextprotocol/server-memory", description: "Knowledge-graph persistent memory", docs: "https://github.com/modelcontextprotocol/servers" }
+  ];
+  function _detectTunnelOs() {
+    const ua = (navigator.userAgent || "") + " " + (navigator.platform || "");
+    if (/win/i.test(ua)) return "windows";
+    if (/mac|darwin|iphone|ipad/i.test(ua)) return "macos";
+    return "linux";
+  }
+  var _TUNNEL_INSTALL_CMDS = {
+    windows: {
+      label: "Windows",
+      uv: "winget install --id=astral-sh.uv -e",
+      node: "winget install OpenJS.NodeJS -e"
+    },
+    macos: {
+      label: "macOS",
+      uv: "brew install uv",
+      node: "brew install node"
+    },
+    linux: {
+      label: "Linux",
+      uv: "curl -LsSf https://astral.sh/uv/install.sh | sh",
+      node: "sudo apt-get install -y nodejs npm"
+    }
+  };
+  async function _tunnelCopyToClipboard(text) {
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        await navigator.clipboard.writeText(text);
+        return true;
+      }
+    } catch (_) {
+    }
+    try {
+      const ta = document.createElement("textarea");
+      ta.value = text;
+      ta.style.position = "fixed";
+      ta.style.opacity = "0";
+      document.body.appendChild(ta);
+      ta.select();
+      const ok = document.execCommand("copy");
+      document.body.removeChild(ta);
+      return ok;
+    } catch (_) {
+      return false;
+    }
+  }
   async function loadTunnelPluginsSection(projectId) {
     const host = document.getElementById(`settings-body-${projectId}`);
     if (!host) return;
@@ -5936,6 +6142,12 @@ ${n.tags || ""}`.toLowerCase();
       }
       const plugins = data && data.plugins || [];
       const active = data && data.active || {};
+      const customPlugins = (data && data.custom || []).map((c) => ({
+        name: String(c.name || ""),
+        command: Array.isArray(c.command) ? c.command.join(" ") : String(c.command || ""),
+        port: c.port,
+        enabled: c.enabled !== false
+      }));
       const rows = plugins.map((p) => {
         const cmd = Array.isArray(p.command) ? p.command.join(" ") : "";
         const dot = active[p.slot] ? "var(--success, #3fb950)" : "var(--muted)";
@@ -5961,8 +6173,109 @@ ${n.tags || ""}`.toLowerCase();
               title="local proxy port"
               style="width:74px;box-sizing:border-box;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:5px 7px;outline:none">
           </div>
+          <details class="tp-tools" data-slot="${escapeHtml(p.slot)}" data-loaded="0" style="margin-top:6px">
+            <summary style="cursor:pointer;list-style:none;font-size:10px;color:var(--accent);user-select:none">&#9656; tools</summary>
+            <div class="tp-tools-body" style="margin-top:5px;font-size:10px;color:var(--muted);font-family:var(--font-mono)">&hellip;</div>
+          </details>
         </div>`;
       }).join("");
+      const detectedOs = _detectTunnelOs();
+      const installCard = (label, cmds, prominent) => `
+      <div style="border:1px solid var(--border);border-radius:4px;padding:8px;margin-bottom:6px;background:var(--surface-1)${prominent ? "" : ";opacity:.85"}">
+        <div style="font-size:10px;color:var(--text);font-weight:600;margin-bottom:6px">${escapeHtml(label)}${prominent ? ' <span style="color:var(--muted);font-weight:400">(detected)</span>' : ""}</div>
+        ${[["uv", "powers uvx plugins", cmds.uv], ["Node.js", "powers npx plugins", cmds.node]].map(([dep, note, command]) => `
+          <div style="margin-bottom:6px">
+            <div style="font-size:9px;color:var(--muted);margin-bottom:3px">${escapeHtml(dep)} <span style="opacity:.8">\u2014 ${escapeHtml(note)}</span></div>
+            <div style="display:flex;gap:6px;align-items:center">
+              <code style="flex:1;box-sizing:border-box;background:var(--surface-2);border:1px solid var(--border);border-radius:4px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:4px 7px;overflow-x:auto;white-space:nowrap">${escapeHtml(command)}</code>
+              <button class="secondary tp-copy" data-copy="${escapeHtml(command)}" style="padding:2px 8px;font-size:10px;flex-shrink:0">Copy</button>
+            </div>
+          </div>`).join("")}
+      </div>`;
+      const otherOsCards = Object.keys(_TUNNEL_INSTALL_CMDS).filter((k) => k !== detectedOs).map((k) => installCard(_TUNNEL_INSTALL_CMDS[k].label, _TUNNEL_INSTALL_CMDS[k], false)).join("");
+      const installSection = `
+      <details style="margin-top:8px;border:1px solid var(--border);border-radius:4px;background:var(--surface-2);padding:0">
+        <summary style="cursor:pointer;list-style:none;padding:6px 8px;font-size:10px;font-weight:600;color:var(--accent)">&#9656; Install dependencies</summary>
+        <div style="padding:0 8px 8px">
+          <div style="font-size:10px;color:var(--muted);margin-bottom:8px;line-height:1.5">
+            Tunnel plugins launch via <code>uvx</code> (uv) and <code>npx</code> (Node.js). Install whichever a plugin's command needs.
+          </div>
+          ${installCard(_TUNNEL_INSTALL_CMDS[detectedOs].label, _TUNNEL_INSTALL_CMDS[detectedOs], true)}
+          <details style="margin-top:2px">
+            <summary style="cursor:pointer;list-style:none;font-size:10px;color:var(--muted)">&#9656; other platforms</summary>
+            <div style="margin-top:6px">${otherOsCards}</div>
+          </details>
+        </div>
+      </details>`;
+      const curatedRows = _CURATED_TUNNEL_PLUGINS.map((c) => `
+      <div style="border:1px solid var(--border);border-radius:4px;padding:8px;margin-bottom:6px;background:var(--surface-1)">
+        <div style="display:flex;align-items:baseline;gap:6px;flex-wrap:wrap;margin-bottom:4px">
+          <span style="font-size:11px;color:var(--text);font-weight:600">${escapeHtml(c.name)}</span>
+          <a href="${escapeHtml(c.docs)}" target="_blank" rel="noopener" style="font-size:9px;color:var(--accent);text-decoration:none">docs &#8599;</a>
+        </div>
+        <div style="font-size:10px;color:var(--muted);margin-bottom:5px">${escapeHtml(c.description)}</div>
+        <div style="display:flex;gap:6px;align-items:center">
+          <code style="flex:1;box-sizing:border-box;background:var(--surface-2);border:1px solid var(--border);border-radius:4px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:4px 7px;overflow-x:auto;white-space:nowrap">${escapeHtml(c.command)}</code>
+          <button class="secondary tp-copy" data-copy="${escapeHtml(c.command)}" style="padding:2px 8px;font-size:10px;flex-shrink:0">Copy command</button>
+        </div>
+      </div>`).join("");
+      const browseSection = `
+      <details style="margin-top:8px;border:1px solid var(--border);border-radius:4px;background:var(--surface-2);padding:0">
+        <summary style="cursor:pointer;list-style:none;padding:6px 8px;font-size:10px;font-weight:600;color:var(--accent)">&#9656; Browse plugins</summary>
+        <div style="padding:0 8px 8px">
+          <div style="font-size:10px;color:var(--muted);margin-bottom:8px;line-height:1.5">
+            Well-known MCP servers. Copy a command and paste it into a slot above to swap that slot's launcher.
+          </div>
+          ${curatedRows}
+        </div>
+      </details>`;
+      const renderCustomList = () => {
+        const listEl = document.getElementById(`tp-custom-list-${projectId}`);
+        if (!listEl) return;
+        if (!customPlugins.length) {
+          listEl.innerHTML = '<div style="color:var(--muted);font-size:10px">No custom plugins yet.</div>';
+          return;
+        }
+        listEl.innerHTML = customPlugins.map((c, i) => `
+        <div style="border:1px solid var(--border);border-radius:4px;padding:8px;margin-bottom:6px;display:flex;gap:8px;align-items:center">
+          <div style="flex:1;min-width:0">
+            <div style="font-size:11px;color:var(--text);font-weight:600">${escapeHtml(c.name)}
+              <span style="font-size:9px;color:var(--muted);font-weight:400">:${escapeHtml(String(c.port))}</span></div>
+            <div style="font-size:10px;color:var(--muted);font-family:var(--font-mono);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escapeHtml(c.command)}</div>
+          </div>
+          <button class="secondary tp-custom-remove" data-idx="${i}" style="padding:2px 8px;font-size:10px;flex-shrink:0">Remove</button>
+        </div>`).join("");
+        listEl.querySelectorAll(".tp-custom-remove").forEach((btn) => {
+          btn.addEventListener("click", () => {
+            const idx = parseInt(btn.dataset.idx, 10);
+            if (Number.isInteger(idx)) {
+              customPlugins.splice(idx, 1);
+              renderCustomList();
+            }
+          });
+        });
+      };
+      const customSection = `
+      <details style="margin-top:8px;border:1px solid var(--border);border-radius:4px;background:var(--surface-2);padding:0">
+        <summary style="cursor:pointer;list-style:none;padding:6px 8px;font-size:10px;font-weight:600;color:var(--accent)">&#9656; Custom plugins</summary>
+        <div style="padding:0 8px 8px">
+          <div style="font-size:10px;color:var(--muted);margin-bottom:8px;line-height:1.5">
+            Add your own MCP server. Runs locally as <code>http://127.0.0.1:&lt;port&gt;</code> and is written
+            into this machine's <code>.mcp.json</code> for a co-located Cursor / Claude Code session.
+            Local-only \u2014 it does not appear in the claude.ai connector. Use a port outside 8808\u20138813.
+          </div>
+          <div id="tp-custom-list-${projectId}" style="margin-bottom:8px"></div>
+          <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
+            <input type="text" id="tp-custom-name-${projectId}" placeholder="name (e.g. fetch)"
+              style="width:120px;box-sizing:border-box;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:5px 7px;outline:none">
+            <input type="text" id="tp-custom-command-${projectId}" placeholder="command (e.g. uvx mcp-server-fetch)"
+              style="flex:1;min-width:160px;box-sizing:border-box;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:5px 7px;outline:none">
+            <input type="number" id="tp-custom-port-${projectId}" placeholder="port"
+              style="width:74px;box-sizing:border-box;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:5px 7px;outline:none">
+            <button class="secondary admin-only" id="tp-custom-add-${projectId}" style="padding:2px 10px;font-size:10px;flex-shrink:0">Add</button>
+          </div>
+        </div>
+      </details>`;
       section.innerHTML = `
       <details class="meridian-disclosure" open style="border:1px solid var(--border);border-radius:6px;background:var(--surface-2);padding:0">
       <summary style="cursor:pointer;list-style:none;padding:8px 10px;font-size:11px;font-weight:700;letter-spacing:.5px;color:var(--accent);text-transform:uppercase">Tunnel Plugins</summary>
@@ -5978,6 +6291,9 @@ ${n.tags || ""}`.toLowerCase();
         <button class="primary admin-only" id="tp-save-${projectId}" style="padding:2px 10px;font-size:10px">Save</button>
       </div>
       <div id="tp-status-${projectId}" style="font-size:10px;color:var(--muted);margin-top:4px;text-align:right"></div>
+      ${customSection}
+      ${installSection}
+      ${browseSection}
       </div>
       </details>`;
       const statusEl = document.getElementById(`tp-status-${projectId}`);
@@ -6003,6 +6319,13 @@ ${n.tags || ""}`.toLowerCase();
           if (Number.isInteger(portVal) && portVal !== _TUNNEL_DEFAULT_PORTS[slot]) entry.port = portVal;
           cfg.push(entry);
         });
+        customPlugins.forEach((c) => {
+          const name = (c.name || "").trim();
+          const command = (c.command || "").trim();
+          const port = parseInt(c.port, 10);
+          if (!name || !command || !Number.isInteger(port)) return;
+          cfg.push({ name, command, port, enabled: c.enabled !== false });
+        });
         return cfg;
       };
       document.getElementById(`tp-save-${projectId}`).onclick = async () => {
@@ -6015,7 +6338,7 @@ ${n.tags || ""}`.toLowerCase();
         }
       };
       document.getElementById(`tp-reset-${projectId}`).onclick = async () => {
-        if (!confirm("Clear all tunnel plugin overrides and return to built-in defaults?")) return;
+        if (!confirm("Reset tunnel plugins?\n\nThis clears ALL command and port overrides for every slot and returns them to Meridian's built-in defaults. This cannot be undone.")) return;
         try {
           await api2("/tunnel/plugins", { method: "PUT", body: JSON.stringify({ config: [] }) });
           toast("Reset to defaults");
@@ -6024,6 +6347,105 @@ ${n.tags || ""}`.toLowerCase();
           toast("Reset failed: " + e.message, true);
         }
       };
+      renderCustomList();
+      const _addCustom = () => {
+        const nameEl = document.getElementById(`tp-custom-name-${projectId}`);
+        const cmdEl = document.getElementById(`tp-custom-command-${projectId}`);
+        const portEl = document.getElementById(`tp-custom-port-${projectId}`);
+        const name = (nameEl && nameEl.value || "").trim();
+        const command = (cmdEl && cmdEl.value || "").trim();
+        const port = parseInt(portEl && portEl.value, 10);
+        if (!name || !command || !Number.isInteger(port)) {
+          toast("Custom plugin needs a name, command, and port", true);
+          return;
+        }
+        if (port < 1024 || port > 65535 || [8808, 8809, 8810, 8811, 8812, 8813].includes(port)) {
+          toast("Pick a port in 1024\u201365535 and outside 8808\u20138813", true);
+          return;
+        }
+        if (customPlugins.some((c) => c.name === name)) {
+          toast(`A custom plugin named "${name}" already exists`, true);
+          return;
+        }
+        customPlugins.push({ name, command, port, enabled: true });
+        if (nameEl) nameEl.value = "";
+        if (cmdEl) cmdEl.value = "";
+        if (portEl) portEl.value = "";
+        renderCustomList();
+      };
+      const _addBtn = document.getElementById(`tp-custom-add-${projectId}`);
+      if (_addBtn) _addBtn.addEventListener("click", _addCustom);
+      section.querySelectorAll(".tp-copy").forEach((btn) => {
+        btn.addEventListener("click", async () => {
+          const ok = await _tunnelCopyToClipboard(btn.dataset.copy || "");
+          if (ok) {
+            const prev = btn.textContent;
+            btn.textContent = "Copied";
+            setTimeout(() => {
+              btn.textContent = prev;
+            }, 1200);
+          } else {
+            toast("Copy failed \u2014 select and copy manually", true);
+          }
+        });
+      });
+      let _tenantIdPromise = null;
+      const _getTenantId = () => {
+        if (!_tenantIdPromise) {
+          _tenantIdPromise = api2("/me").then((m) => m && m.tenant_id || null).catch(() => null);
+        }
+        return _tenantIdPromise;
+      };
+      section.querySelectorAll(".tp-tools").forEach((det) => {
+        det.addEventListener("toggle", async () => {
+          if (!det.open || det.dataset.loaded === "1") return;
+          det.dataset.loaded = "1";
+          const slot = det.dataset.slot;
+          const bodyEl = det.querySelector(".tp-tools-body");
+          if (!bodyEl) return;
+          if (!active[slot]) {
+            bodyEl.innerHTML = '<span style="color:var(--muted)">not connected \u2014 start the tunnel</span>';
+            det.dataset.loaded = "0";
+            return;
+          }
+          bodyEl.textContent = "loading\u2026";
+          try {
+            const tenantId = await _getTenantId();
+            if (!tenantId) throw new Error("no tenant");
+            const r = await fetch(`/${slot}/mcp/${tenantId}/mcp`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json", "Accept": "application/json, text/event-stream" },
+              body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list", params: {} })
+            });
+            if (!r.ok) throw new Error(`HTTP ${r.status}`);
+            const text = await r.text();
+            let parsed = null;
+            if (text.trim().startsWith("{")) {
+              parsed = JSON.parse(text);
+            } else {
+              for (const line of text.split("\n")) {
+                if (line.startsWith("data:")) {
+                  try {
+                    parsed = JSON.parse(line.slice(5).trim());
+                  } catch (_) {
+                  }
+                }
+              }
+            }
+            if (!parsed) throw new Error("empty response");
+            if (parsed.error) throw new Error(parsed.error.message || String(parsed.error));
+            const tools = parsed.result && parsed.result.tools || [];
+            if (!tools.length) {
+              bodyEl.innerHTML = '<span style="color:var(--muted)">no tools reported</span>';
+              return;
+            }
+            bodyEl.innerHTML = `<div style="color:var(--muted);margin-bottom:3px">${tools.length} tool${tools.length !== 1 ? "s" : ""}</div>` + tools.map((t) => `<div style="color:var(--text)">${escapeHtml(t && t.name || String(t))}</div>`).join("");
+          } catch (e) {
+            bodyEl.innerHTML = `<span style="color:var(--muted)">not connected \u2014 start the tunnel</span>`;
+            det.dataset.loaded = "0";
+          }
+        });
+      });
     } catch (e) {
       section.innerHTML = `<div class="empty" style="color:var(--error)">Failed to load tunnel plugins: ${escapeHtml(e.message)}</div>`;
     }
@@ -7061,6 +7483,8 @@ Current: ${current || "(none)"}`,
 
       <button class="vtab-btn" data-vtab="settings" title="Notification Settings">\u2699</button>
 
+      <button class="vtab-btn" data-vtab="codeintel" title="Code Intel \u2014 codebase index &amp; architecture" id="vtab-codeintel-${project.id}" style="display:none">\u{1F50D}</button>
+
     </div>
 
     <div class="vtab-drawer open" id="drawer-${project.id}">
@@ -7785,6 +8209,22 @@ Current: ${current || "(none)"}`,
 
       </div>
 
+      <div class="drawer-panel" id="drawer-codeintel-${project.id}">
+
+        <div class="drawer-header">
+
+          <span>CODE INTEL \xB7 ${escapeHtml(project.name)}</span>
+
+        </div>
+
+        <div style="flex:1;overflow-y:auto;padding:14px" id="codeintel-body-${project.id}">
+
+          <div class="empty" style="color:var(--muted)">loading\u2026</div>
+
+        </div>
+
+      </div>
+
     </div>
 
     <section class="claude-handoff-panel">
@@ -7977,6 +8417,7 @@ Current: ${current || "(none)"}`,
           if (vtab === "hitl") loadHitlTab(project.id);
           if (vtab === "docs") loadDocsTab(project.id);
           if (vtab === "settings") loadSettingsTab(project.id);
+          if (vtab === "codeintel") loadCodeIntelTab(project.id);
         };
       });
       try {
@@ -7987,6 +8428,7 @@ Current: ${current || "(none)"}`,
         }
       } catch (_) {
       }
+      _initCodeIntelTabVisibility(project.id);
     }
     const goalDrawer = document.getElementById(`drawer-goal-${project.id}`);
     if (goalDrawer) {
@@ -9356,6 +9798,121 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
       body.innerHTML = `<div style="color:var(--error)">Failed to load tools: ${escapeHtml(String(e))}</div>`;
     }
   }
+  async function _initCodeIntelTabVisibility(projectId) {
+    if (!window.MERIDIAN_HOSTED) return;
+    try {
+      const data = await api2("/tunnel/plugins");
+      const btn = document.getElementById(`vtab-codeintel-${projectId}`);
+      if (!btn) return;
+      const isActive = !!(data && data.active && data.active.code);
+      btn.style.display = isActive ? "" : "none";
+    } catch (_) {
+    }
+  }
+  function _repoPathToProject(repoPath) {
+    return String(repoPath || "").replace(/[\\/:]+/g, "-").replace(/^-+|-+$/g, "");
+  }
+  async function loadCodeIntelTab(projectId) {
+    const body = document.getElementById(`codeintel-body-${projectId}`);
+    if (!body) return;
+    body.innerHTML = '<div class="empty" style="color:var(--muted)">loading\u2026</div>';
+    try {
+      const [pluginsData, meData, settingsData] = await Promise.all([
+        api2("/tunnel/plugins"),
+        api2("/me"),
+        loadProjectSettings2(projectId)
+      ]);
+      if (!pluginsData?.active?.code) {
+        body.innerHTML = '<div class="empty" style="color:var(--muted)">Code intel tunnel is not active. Run <code>meridian --tunnel</code> to connect it.</div>';
+        return;
+      }
+      const tenantId = meData?.tenant_id;
+      if (!tenantId) {
+        body.innerHTML = '<div class="empty" style="color:var(--error)">Could not resolve tenant ID from /me.</div>';
+        return;
+      }
+      const codeBase = `/code/mcp/${tenantId}/mcp`;
+      async function _codeMcpCall(method, params) {
+        const r = await fetch(codeBase, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "Accept": "application/json, text/event-stream" },
+          body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params: params || {} })
+        });
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        const text = await r.text();
+        let parsed = null;
+        if (text.trim().startsWith("{")) {
+          parsed = JSON.parse(text);
+        } else {
+          for (const line of text.split("\n")) {
+            if (line.startsWith("data:")) {
+              try {
+                parsed = JSON.parse(line.slice(5).trim());
+              } catch (_) {
+              }
+            }
+          }
+        }
+        if (!parsed) throw new Error("empty response from code MCP");
+        if (parsed.error) throw new Error(parsed.error.message || String(parsed.error));
+        return parsed.result;
+      }
+      let toolCount = 0;
+      try {
+        const tlResult = await _codeMcpCall("tools/list", {});
+        toolCount = (tlResult?.tools || []).length;
+      } catch (_) {
+      }
+      const execCfg = settingsData?.executor_config || {};
+      const repoPaths = Array.isArray(execCfg.repo_paths) ? execCfg.repo_paths : [];
+      let html = "";
+      html += `<div style="display:flex;align-items:center;gap:8px;margin-bottom:14px">
+      <span style="width:8px;height:8px;border-radius:50%;background:#22c55e;display:inline-block;flex-shrink:0"></span>
+      <span style="font-size:11px;color:var(--text);font-weight:600">Code Intel Live</span>
+      ${toolCount ? `<span style="font-size:10px;color:var(--muted)">${toolCount} tool${toolCount !== 1 ? "s" : ""}</span>` : ""}
+    </div>`;
+      html += `<div style="margin-bottom:16px"><div style="font-size:10px;color:var(--accent);text-transform:uppercase;letter-spacing:.06em;margin-bottom:8px;padding-bottom:4px;border-bottom:1px solid var(--border)">Index Status</div>`;
+      if (repoPaths.length) {
+        for (const rp of repoPaths) {
+          const cwd = typeof rp === "string" ? rp : rp.cwd || "";
+          const hostname = typeof rp === "object" ? rp.hostname || "" : "";
+          if (!cwd) continue;
+          try {
+            const result = await _codeMcpCall("tools/call", { name: "index_status", arguments: { project: _repoPathToProject(cwd) } });
+            const text = (result?.content || []).map((c) => c.text || "").join("").trim();
+            html += `<div style="margin-bottom:10px">
+            <div style="font-size:10px;color:var(--text);font-weight:600;margin-bottom:4px">${escapeHtml(cwd)}${hostname ? `<span style="color:var(--muted);font-weight:400"> \xB7 ${escapeHtml(hostname)}</span>` : ""}</div>
+            <pre style="font-size:10px;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;padding:8px;white-space:pre-wrap;word-break:break-all;color:var(--text);margin:0;line-height:1.5">${escapeHtml(text || "(no status returned)")}</pre>
+          </div>`;
+          } catch (e) {
+            html += `<div style="margin-bottom:10px">
+            <div style="font-size:10px;color:var(--text);font-weight:600;margin-bottom:4px">${escapeHtml(cwd)}</div>
+            <div style="font-size:10px;color:var(--error)">index_status failed: ${escapeHtml(String(e))}</div>
+          </div>`;
+          }
+        }
+      } else {
+        html += `<div style="font-size:10px;color:var(--muted)">No repo paths configured. Add them in Settings \u2192 Executor Config to see index status.</div>`;
+      }
+      html += "</div>";
+      html += `<div><div style="font-size:10px;color:var(--accent);text-transform:uppercase;letter-spacing:.06em;margin-bottom:8px;padding-bottom:4px;border-bottom:1px solid var(--border)">Architecture Summary</div>`;
+      try {
+        const archPath = repoPaths.length ? typeof repoPaths[0] === "string" ? repoPaths[0] : repoPaths[0].cwd || "" : "";
+        const archArgs = archPath ? { project: _repoPathToProject(archPath) } : {};
+        const archResult = await _codeMcpCall("tools/call", { name: "get_architecture", arguments: archArgs });
+        const archText = (archResult?.content || []).map((c) => c.text || "").join("").trim();
+        html += `<pre style="font-size:10px;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;padding:10px;white-space:pre-wrap;word-break:break-all;color:var(--text);margin:0;line-height:1.5">${escapeHtml(archText || "(no architecture returned)")}</pre>`;
+      } catch (e) {
+        html += `<div style="font-size:10px;color:var(--error)">get_architecture failed: ${escapeHtml(String(e))}</div>`;
+      }
+      html += `<div style="margin-top:8px;display:flex;gap:6px">
+      <button class="secondary" style="font-size:10px;padding:3px 10px" onclick="loadCodeIntelTab(${JSON.stringify(projectId)})">\u21BA Refresh</button>
+    </div></div>`;
+      body.innerHTML = html;
+    } catch (e) {
+      body.innerHTML = `<div style="color:var(--error)">Failed to load code intel: ${escapeHtml(String(e))}</div>`;
+    }
+  }
   function normalizeNotifyTarget(raw) {
     const v = (raw || "").trim();
     if (!v) return "";
@@ -10496,6 +11053,12 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
     PRODUCT: "#22d3ee",
     ARCHITECTURAL: "#fb923c"
   };
+  var _DECISION_PRIORITY_COLORS = {
+    urgent: "#f87171",
+    normal: "#94a3b8",
+    low: "#64748b"
+  };
+  var _DECISION_PRIORITY_ORDER = ["urgent", "normal", "low"];
   function renderConstitutionWarning2(projectId) {
     const host = document.getElementById(`constitution-warning-${projectId}`);
     if (!host) return;
@@ -10736,6 +11299,9 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
       host.innerHTML = items.map((d) => {
         const cat = d.category || "TECHNICAL";
         const color = _DECISION_CATEGORY_COLORS[cat] || _DECISION_CATEGORY_COLORS.TECHNICAL;
+        const prio = _DECISION_PRIORITY_ORDER.includes(d.priority) ? d.priority : "normal";
+        const prioColor = _DECISION_PRIORITY_COLORS[prio] || _DECISION_PRIORITY_COLORS.normal;
+        const editCount = Array.isArray(d.edit_log) ? d.edit_log.length : 0;
         const dateStr = (d.created_at || "").slice(0, 10);
         return `<div data-decision-card="${escapeHtml(d.id)}" style="background:var(--surface-2);border:1px solid var(--border);border-left:4px solid ${color};border-radius:4px;padding:10px 12px;margin-bottom:8px">
 
@@ -10745,11 +11311,15 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
 
             <span class="decision-cat-tag" data-id="${escapeHtml(d.id)}" data-cat="${escapeHtml(cat)}" title="Click to change category" style="display:inline-block;background:${color}22;color:${color};font-size:9px;font-weight:700;letter-spacing:.5px;padding:2px 6px;border-radius:3px;flex-shrink:0;cursor:pointer">${escapeHtml(cat)} \u25BE</span>
 
+            <span class="decision-prio-tag" data-id="${escapeHtml(d.id)}" data-prio="${escapeHtml(prio)}" data-project="${escapeHtml(projectId)}" title="Click to change priority (urgent \u2192 normal \u2192 low)" style="display:inline-block;background:${prioColor}22;color:${prioColor};font-size:9px;font-weight:700;letter-spacing:.5px;padding:2px 6px;border-radius:3px;flex-shrink:0;cursor:pointer">${prio === "urgent" ? "\u26A1 " : ""}${escapeHtml(prio.toUpperCase())} \u25BE</span>
+
             <span class="decision-title-view" data-id="${escapeHtml(d.id)}" title="Click to edit title" style="color:var(--accent);font-weight:600;font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;cursor:pointer">${escapeHtml(d.title || "")}</span>
 
           </div>
 
           <div style="display:flex;gap:6px;flex-shrink:0;align-items:center">
+
+            ${editCount ? `<span class="decision-edit-count" data-id="${escapeHtml(d.id)}" title="${editCount} previous ${editCount === 1 ? "revision" : "revisions"} \u2014 body has been edited" style="color:var(--muted);font-size:9px;border:1px solid var(--border);border-radius:3px;padding:1px 5px;cursor:default">\u270E ${editCount}</span>` : ""}
 
             <span style="color:var(--muted);font-size:10px">${escapeHtml(dateStr)}</span>
 
@@ -10875,6 +11445,24 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
       });
       host.querySelectorAll("[data-supersede]").forEach((btn) => {
         btn.onclick = () => supersedePinnedDecision(projectId, btn.dataset.supersede);
+      });
+      host.querySelectorAll(".decision-prio-tag").forEach((tag) => {
+        tag.onclick = async () => {
+          const id = tag.dataset.id;
+          const pid = tag.dataset.project;
+          const cur = _DECISION_PRIORITY_ORDER.includes(tag.dataset.prio) ? tag.dataset.prio : "normal";
+          const next = _DECISION_PRIORITY_ORDER[(_DECISION_PRIORITY_ORDER.indexOf(cur) + 1) % _DECISION_PRIORITY_ORDER.length];
+          try {
+            await api2(`/projects/${pid}/decisions-pinned/${id}`, {
+              method: "PATCH",
+              body: JSON.stringify({ priority: next })
+            });
+            toast(`priority \u2192 ${next}`);
+            loadPinnedDecisions(pid);
+          } catch (e) {
+            toast("priority change failed: " + e.message, true);
+          }
+        };
       });
       host.querySelectorAll("[data-archive-decision]").forEach((btn) => {
         btn.onclick = async () => {
@@ -11945,7 +12533,7 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
     }
   }
   try {
-    Object.assign(window, { hideHostedAdminControls, ensureSignOutLink: ensureSignOutLink2, ensureWorkspaceSwitcher: ensureWorkspaceSwitcher2, getActiveWorkspaceRole: getActiveWorkspaceRole2, showConnectDbModal, showLocalServerControls, _summarizeApiErrorText, _projectLoadErrorInfo, wireProjectLoadRetry: wireProjectLoadRetry2, renderProjectLoadError: renderProjectLoadError2, recordProjectLoadError, clearProjectLoadError, renderProjectLoadAlert, retryProjectSurface, syncSidebarActiveProject, autosizeGoalField, githubIconSvg: githubIconSvg2, getConstitutionLimit, loadProjectSettings: loadProjectSettings2, saveProjectSettings: saveProjectSettings2, loadExecutorRulesSection, loadTunnelPluginsSection, _demoTourDone: _demoTourDone2, _demoTourSavedStep: _demoTourSavedStep2, _demoTourSaveStep, _demoTourMarkDone, _demoTourClose, _tourActivateVtab, startDemoTour: startDemoTour2, resumeDemoTour, api: api2, projectApi: projectApi2, loadServerConfig, _armAccountSwitchWatch, _refreshOnFocus, _checkAccountSwitch, _showAccountSwitchBanner, updateGitHubConnectionIndicator, _updateConnectionIndicator, checkGitStatus, _doRestart, loadConfig, loadProjects, openTab, closeTab, saveTabs, renderTabs, _makeTabEl, _openTabMenu, _setProjectIcon, _renameProject, _deleteProject, activateTab, buildTabBody, scheduleLiveRefresh, initLiveAutoRefresh, loadLiveTab, refreshLiveTab, wireSprintAddEnter: wireSprintAddEnter2, sprintAction, sprintArchive, filterBackburner, sprintPushPrompt, sprintFeedback, sprintFeedbackNote, sprintItemEdit, addSprintItemFromInput: addSprintItemFromInput2, cacheMostRecentSession, renderLiveSessions, endLiveSession, openTimelineForSession, renderLiveQueue, addLiveTask, cancelLiveTask, showCopyPreview, wireClaudeLaunchPanel, stampHandoffTs, populateSessionDropdown, loadTimeline: loadTimeline2, _renderTimelineLog: _renderTimelineLog2, loadDocsTab, normalizeNotifyTarget, displayNotifyTarget: displayNotifyTarget2, osExecutorHintBanner: osExecutorHintBanner2, showFailoverBannerIfNeeded, suggestNtfyTopic, loadHitlTab, loadTeamTab, updateLiveFeed, loadRecentSessions, loadMilestones, loadRecentRuns, loadQueue, renderSearchResults: renderSearchResults2, wireQueueSectionToggles, refreshTab, refreshGoal, parseDecisionsBlob, renderConstitutionWarning: renderConstitutionWarning2, _hitlBadgeClick, initHitlPanel, setVtabCountBadge: setVtabCountBadge2, refreshProjectCountBadges, refreshHitl, _hitlAnswer, _hitlDismiss, loadPinnedDecisions, supersedePinnedDecision, addPinnedDecision, consolidateDecisions, renderDecisionsTable, wireGoalPreviewToggle, saveGoal, saveNorthStar, saveSprint, _sessionPresenceDot, refreshSessions, refreshTasks, renderTasks, _loadMoreTasks, renderTaskRow, deleteTaskRow, renderHitlRow, wireHitlRow, appendToGoal, hitlReply, hitlExecute, connectWs, handleWsEvent, restoreTabs, _deleteSprintItem, _sprintAction, completeSprintItem, failSprintItem, toggleExpand, state });
+    Object.assign(window, { loadCodeIntelTab, _initCodeIntelTabVisibility, hideHostedAdminControls, ensureSignOutLink: ensureSignOutLink2, ensureWorkspaceSwitcher: ensureWorkspaceSwitcher2, getActiveWorkspaceRole: getActiveWorkspaceRole2, showConnectDbModal, showLocalServerControls, _summarizeApiErrorText, _projectLoadErrorInfo, wireProjectLoadRetry: wireProjectLoadRetry2, renderProjectLoadError: renderProjectLoadError2, recordProjectLoadError, clearProjectLoadError, renderProjectLoadAlert, retryProjectSurface, syncSidebarActiveProject, autosizeGoalField, githubIconSvg: githubIconSvg2, getConstitutionLimit, loadProjectSettings: loadProjectSettings2, saveProjectSettings: saveProjectSettings2, loadExecutorRulesSection, loadTunnelPluginsSection, _demoTourDone: _demoTourDone2, _demoTourSavedStep: _demoTourSavedStep2, _demoTourSaveStep, _demoTourMarkDone, _demoTourClose, _tourActivateVtab, startDemoTour: startDemoTour2, resumeDemoTour, api: api2, projectApi: projectApi2, loadServerConfig, _armAccountSwitchWatch, _refreshOnFocus, _checkAccountSwitch, _showAccountSwitchBanner, updateGitHubConnectionIndicator, _updateConnectionIndicator, checkGitStatus, _doRestart, loadConfig, loadProjects, openTab, closeTab, saveTabs, renderTabs, _makeTabEl, _openTabMenu, _setProjectIcon, _renameProject, _deleteProject, activateTab, buildTabBody, scheduleLiveRefresh, initLiveAutoRefresh, loadLiveTab, refreshLiveTab, wireSprintAddEnter: wireSprintAddEnter2, sprintAction, sprintArchive, filterBackburner, sprintPushPrompt, sprintFeedback, sprintFeedbackNote, sprintItemEdit, addSprintItemFromInput: addSprintItemFromInput2, cacheMostRecentSession, renderLiveSessions, endLiveSession, openTimelineForSession, renderLiveQueue, addLiveTask, cancelLiveTask, showCopyPreview, wireClaudeLaunchPanel, stampHandoffTs, populateSessionDropdown, loadTimeline: loadTimeline2, _renderTimelineLog: _renderTimelineLog2, loadDocsTab, normalizeNotifyTarget, displayNotifyTarget: displayNotifyTarget2, osExecutorHintBanner: osExecutorHintBanner2, showFailoverBannerIfNeeded, suggestNtfyTopic, loadHitlTab, loadTeamTab, updateLiveFeed, loadRecentSessions, loadMilestones, loadRecentRuns, loadQueue, renderSearchResults: renderSearchResults2, wireQueueSectionToggles, refreshTab, refreshGoal, parseDecisionsBlob, renderConstitutionWarning: renderConstitutionWarning2, _hitlBadgeClick, initHitlPanel, setVtabCountBadge: setVtabCountBadge2, refreshProjectCountBadges, refreshHitl, _hitlAnswer, _hitlDismiss, loadPinnedDecisions, supersedePinnedDecision, addPinnedDecision, consolidateDecisions, renderDecisionsTable, wireGoalPreviewToggle, saveGoal, saveNorthStar, saveSprint, _sessionPresenceDot, refreshSessions, refreshTasks, renderTasks, _loadMoreTasks, renderTaskRow, deleteTaskRow, renderHitlRow, wireHitlRow, appendToGoal, hitlReply, hitlExecute, connectWs, handleWsEvent, restoreTabs, _deleteSprintItem, _sprintAction, completeSprintItem, failSprintItem, toggleExpand, state });
   } catch (e) {
   }
 })();

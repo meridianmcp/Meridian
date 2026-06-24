@@ -24,13 +24,25 @@ from typing import Any
 # slot = the fixed server transport a plugin rides on. Each built-in owns one
 # slot; that mapping is immutable (a config override can't move a built-in to
 # another slot, which would collide with the server routes).
-SLOTS = ("fs", "code", "extract", "ppt", "word")
+SLOTS = ("fs", "code", "extract", "ppt", "word", "dc")
 
 DEFAULT_FS_PORT = 8808
 DEFAULT_CODE_PORT = 8809
 DEFAULT_EXTRACT_PORT = 8810
 DEFAULT_PPT_PORT = 8811
 DEFAULT_WORD_PORT = 8812
+DEFAULT_DC_PORT = 8813
+
+# The code-extractor slot's default launcher: Serena (LSP-based symbol tools —
+# find_symbol / replace_symbol_body, etc.), run ephemerally via uvx. The
+# ``{repo_path}`` placeholder is expanded to the tunnel's working directory at
+# spawn time (see :func:`expand_command`) — Serena needs ``--project`` to load
+# the right repo. Swapping this default is a pure-data change here, no redeploy.
+SERENA_EXTRACT_COMMAND: list[str] = [
+    "uvx", "serena", "start-mcp-server",
+    "--context", "ide-assistant",
+    "--project", "{repo_path}",
+]
 
 # Ordered: filesystem first (the always-on base), then the two code plugins.
 BUILTIN_PLUGINS: list[dict[str, Any]] = [
@@ -64,8 +76,9 @@ BUILTIN_PLUGINS: list[dict[str, Any]] = [
         "url_prefix": "/extract",
         "enabled": True,
         "builtin": True,
-        "command": None,  # default: uvx mcp-server-code-extractor
-        "description": "Symbol extractor (mcp-server-code-extractor)",
+        # default: Serena (LSP symbol tools); {repo_path} expanded at spawn time.
+        "command": list(SERENA_EXTRACT_COMMAND),
+        "description": "Symbol-level code intelligence (Serena LSP)",
         "description_overrides": {},
     },
     {
@@ -91,6 +104,17 @@ BUILTIN_PLUGINS: list[dict[str, Any]] = [
         "command": ["uvx", "word-mcp-live"],
         "env": {"MCP_AUTHOR": "Adam", "MCP_AUTHOR_INITIALS": "AC"},
         "description": "Word authoring (word-mcp-live)",
+        "description_overrides": {},
+    },
+    {
+        "name": "desktop-commander",
+        "slot": "dc",
+        "port": DEFAULT_DC_PORT,
+        "url_prefix": "/dc",
+        "enabled": False,
+        "builtin": True,
+        "command": None,  # spawned via npx @wonderwhy-er/desktop-commander@latest
+        "description": "Desktop Commander — system tools, file access, terminal (local only)",
         "description_overrides": {},
     },
 ]
@@ -122,16 +146,32 @@ def _coerce_command(value: Any) -> list[str] | None:
     return None
 
 
-def normalize_plugins_config(raw: Any) -> dict[str, dict]:
-    """Validate stored config into ``{plugin_name: override_dict}``.
+def expand_command(value: Any, *, repo_path: str | None = None) -> list[str] | None:
+    """Coerce *value* to a command token list and expand template variables.
 
-    Accepts either a dict keyed by plugin name (``{"code-intel": {...}}``) or a
-    list of ``{"name": ..., ...}`` dicts (the dashboard form's shape). Unknown
-    plugin names are kept (so the config round-trips) but only built-in names
-    take effect in :func:`resolve_plugins`. Malformed input yields ``{}``.
+    Supports ``{repo_path}`` → *repo_path* (the tunnel's working directory) so a
+    plugin command can target the active repo — e.g. Serena's
+    ``--project {repo_path}`` (see :data:`SERENA_EXTRACT_COMMAND`). Unknown
+    ``{...}`` placeholders are left untouched. Accepts the same shapes as
+    :func:`_coerce_command`; ``None``/empty in yields ``None``. Returns a fresh
+    list, so module-level command constants are never mutated.
+    """
+    cmd = _coerce_command(value)
+    if cmd is None:
+        return None
+    rp = repo_path or ""
+    return [tok.replace("{repo_path}", rp) for tok in cmd]
+
+
+def _iter_plugin_items(raw: Any) -> list[dict]:
+    """Normalize a stored config into an ordered list of ``{"name", ...}`` dicts.
+
+    Accepts the dict-keyed form (``{"code-intel": {...}}``) or the list form (the
+    dashboard's shape). Order is preserved so first-occurrence dedup is possible
+    (see :func:`resolve_custom_plugins`). Non-dict / garbage input yields ``[]``.
     """
     if not raw:
-        return {}
+        return []
     items: list[dict] = []
     if isinstance(raw, dict):
         for name, ov in raw.items():
@@ -141,11 +181,19 @@ def normalize_plugins_config(raw: Any) -> dict[str, dict]:
                 items.append({"name": name})
     elif isinstance(raw, list):
         items = [x for x in raw if isinstance(x, dict) and x.get("name")]
-    else:
-        return {}
+    return items
 
+
+def normalize_plugins_config(raw: Any) -> dict[str, dict]:
+    """Validate stored config into ``{plugin_name: override_dict}``.
+
+    Accepts either a dict keyed by plugin name (``{"code-intel": {...}}``) or a
+    list of ``{"name": ..., ...}`` dicts (the dashboard form's shape). Unknown
+    plugin names are kept (so the config round-trips) but only built-in names
+    take effect in :func:`resolve_plugins`. Malformed input yields ``{}``.
+    """
     out: dict[str, dict] = {}
-    for it in items:
+    for it in _iter_plugin_items(raw):
         name = str(it.get("name") or "").strip()
         if not name:
             continue
@@ -168,6 +216,69 @@ def normalize_plugins_config(raw: Any) -> dict[str, dict]:
         if isinstance(env, dict):
             ov["env"] = {str(k): str(v) for k, v in env.items() if str(k)}
         out[name] = ov
+    return out
+
+
+# Built-in default ports — a custom plugin may not reuse one, or its local proxy
+# would collide with the built-in slot riding that port (see resolve_custom_plugins).
+_BUILTIN_DEFAULT_PORTS = frozenset({
+    DEFAULT_FS_PORT, DEFAULT_CODE_PORT, DEFAULT_EXTRACT_PORT,
+    DEFAULT_PPT_PORT, DEFAULT_WORD_PORT, DEFAULT_DC_PORT,
+})
+
+
+def resolve_custom_plugins(raw_config: Any) -> list[dict]:
+    """Resolve user-defined (non-built-in) plugins from the stored config.
+
+    A custom plugin is a config entry whose ``name`` is **not** a built-in name
+    (see :func:`builtin_names`), carrying its own ``command`` and a local
+    ``port``. Unlike the built-ins these are **LOCAL-ONLY** (pinned architectural
+    decision): they ride a local mcp-proxy port + the local ``.mcp.json`` and
+    have no server route — they never appear in the claude.ai connector. The
+    tunnel client spawns each enabled one behind ``_build_proxy_for_inner`` and
+    points the local MCP config at its ``http://127.0.0.1:<port>`` proxy.
+
+    Returns validated descriptors
+    ``{"name", "command" (list[str]), "port" (int), "enabled" (bool),
+    "builtin": False, "custom": True}``. Invalid entries are dropped silently
+    (they simply don't run); validation rules:
+
+    - ``name``: non-empty (stripped), not a built-in name, unique (first wins).
+    - ``command``: coerced via :func:`_coerce_command`; must be non-empty. The
+      ``{repo_path}`` template is left intact here — expansion happens in the
+      client at spawn time via :func:`expand_command`.
+    - ``port``: a real ``int`` (``bool`` rejected), in 1024–65535, and not one of
+      the built-in default ports (8808–8813) so a custom proxy can't collide
+      with a built-in slot.
+
+    Pure: no I/O, no subprocess. An empty/absent/garbage config yields ``[]``.
+    """
+    builtins = set(builtin_names())
+    out: list[dict] = []
+    seen: set[str] = set()
+    # Walk the raw items in their original order (not via normalize_plugins_config,
+    # whose dict collapse would make the *last* duplicate win) so dedup is first-wins.
+    for it in _iter_plugin_items(raw_config):
+        name = str(it.get("name") or "").strip()
+        if not name or name in builtins or name in seen:
+            continue
+        cmd = _coerce_command(it.get("command"))
+        if not cmd:
+            continue
+        port = it.get("port")
+        if not isinstance(port, int) or isinstance(port, bool):
+            continue
+        if not (1024 <= port <= 65535) or port in _BUILTIN_DEFAULT_PORTS:
+            continue
+        seen.add(name)
+        out.append({
+            "name": name,
+            "command": cmd,
+            "port": port,
+            "enabled": bool(it.get("enabled", True)),
+            "builtin": False,
+            "custom": True,
+        })
     return out
 
 

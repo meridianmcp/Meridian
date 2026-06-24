@@ -3312,7 +3312,16 @@ async def mcp_tools_doc() -> str:
     lines += ["## Notes\n"]
     lines += _render_tool("add_note",
         "Add a per-project wiki note. Use for setup instructions, gotchas, environment details, how-tos.")
-    lines += _render_tool("get_notes", "Read-only: List project notes (newest first). Filter by tag substring.")
+    lines += _render_tool("get_notes",
+        "Read-only: List project notes (newest first), LIGHTWEIGHT by default — id/slug/title/"
+        "tags/kind/priority/timestamps with NO body, so the list can't overflow context. Pull "
+        "model: scan the list, then `read_note(project_id, slug)` for one note's full body. Filter "
+        "by tag substring or `query` full-text search. Pass `bodies=true` only when you truly need "
+        "every body inline. Pass `limit` (default 100, max 500) and/or `cursor` for a "
+        "`{notes, has_more, next_cursor}` page, then re-call with `cursor=next_cursor`.")
+    lines += _render_tool("read_note",
+        "Read-only: Fetch one project note's full body by its per-project `slug` (the `slug` field "
+        "from `get_notes`). The pull half of the list→read model.")
     lines += _render_tool("delete_note")
     lines += ["## Projects\n"]
     lines += _render_tool("create_project")
@@ -3473,6 +3482,36 @@ async def _find_continuation_session(
     return None
 
 
+# ecf69de8 — protocol-level EXECUTION MODE directive. start_session leads the
+# agent_instructions / orientation with this line so the posture is a structured
+# instruction the session can't miss, not buried freetext. 'autonomous' tells the
+# session to claim and run immediately; 'interactive' tells it to ask first.
+_EXECUTION_MODE_DIRECTIVES = {
+    "autonomous": (
+        "EXECUTION MODE: autonomous — claim and run pending sprint items "
+        "immediately, do not defer. Do NOT ask which item to start; begin with "
+        "the first one now."
+    ),
+    "interactive": (
+        "EXECUTION MODE: interactive — ask for direction before executing. "
+        "Review the pending sprint items and confirm with the human which to "
+        "start before claiming or changing anything."
+    ),
+}
+
+
+def _execution_mode_directive(mode: str | None) -> str:
+    """Return the protocol-level EXECUTION MODE directive line for a project.
+
+    Unknown / missing modes fall back to the autonomous directive so the line is
+    always present and the default posture is non-deferential.
+    """
+    normalized = db_module.normalize_execution_mode(mode)
+    return _EXECUTION_MODE_DIRECTIVES.get(
+        normalized, _EXECUTION_MODE_DIRECTIVES["autonomous"]
+    )
+
+
 async def _start_session_composite(
     db: aiosqlite.Connection,
     project_id: str,
@@ -3483,6 +3522,7 @@ async def _start_session_composite(
     role: str | None = None,
     source: str | None = None,
     compact: bool = False,
+    version: str | None = None,
 ) -> dict[str, Any]:
     """Register + goal + tasks + sessions + handoff-check in one shot.
 
@@ -3495,6 +3535,13 @@ async def _start_session_composite(
     count — and skips the heavy goal_xml / cache_blocks / meridian_instructions
     / workspace payload that overflows an executor's context. Full context is
     available via ``compact=False`` or ``get_session_brief``.
+
+    ``version`` (a76cb7c0) scopes the session to a sprint-version bucket (e.g.
+    "v0.1.x"). When given, the orientation's sprint counts/items are filtered to
+    that version and the scope is stored on the session so later calls (/goal)
+    can reuse it. When omitted, the bucket with the most pending items is
+    inferred; if there are none, the session is left unscoped (every version,
+    legacy behaviour). The resolved value is returned as ``sprint_version``.
 
     G8.34 — If a session with the same ``session_name`` is still active and
     pinged a heartbeat within the last 5 minutes, return a compact
@@ -3548,8 +3595,20 @@ async def _start_session_composite(
 
     if not human_id and not _hosted_mode():
         human_id = db_module.get_default_human_id()
+    # a76cb7c0 — resolve the sprint-version scope: explicit `version` wins;
+    # otherwise infer the bucket with the most pending items. None (no pending
+    # items / no versioned items) leaves the session unscoped (all versions).
+    scoped_version = version
+    if scoped_version is None:
+        try:
+            scoped_version = await db_module.infer_active_sprint_version(
+                db, project_id
+            )
+        except Exception:
+            scoped_version = None
     session = await db_module.register_session(
-        db, project_id, session_name, human_id=human_id, client_type=client_type
+        db, project_id, session_name, human_id=human_id, client_type=client_type,
+        sprint_version=scoped_version,
     )
     _mark_session_connected(session["id"])
     # G9.x - If start_session is called with an explicit project_id, any pending
@@ -3601,8 +3660,11 @@ async def _start_session_composite(
     # instructions / workspace payload (the part that overflows an executor's
     # context) and return just enough to start working.
     if compact:
+        # a76cb7c0 — scope the counts/board_change to the session's sprint
+        # version when one was resolved, so an executor sees only its bucket.
         _c_items = await db_module.get_sprint_items(
-            db, project_id, include_human=(role != "executor")
+            db, project_id, include_human=(role != "executor"),
+            version=scoped_version,
         )
         _c_counts: dict[str, int] = {}
         for _it in _c_items:
@@ -3625,10 +3687,20 @@ async def _start_session_composite(
             else 0
         )
         _c_sprint = (goal or {}).get("sprint") if goal else None
+        # ecf69de8 — resolve the project's executor posture so the compact
+        # orientation carries it at the protocol level too.
+        _c_project = await db_module.get_project(db, project_id)
+        _c_mode = db_module.normalize_execution_mode(
+            (_c_project or {}).get("execution_mode")
+        )
+        _c_mode_directive = _execution_mode_directive(_c_mode)
         _c_payload = {
             "session_id": session["id"],
             "compact": True,
+            "execution_mode": _c_mode,  # ecf69de8 — structured posture field
+            "execution_mode_directive": _c_mode_directive,
             "sprint": (str(_c_sprint)[:300] if _c_sprint else None),
+            "sprint_version": scoped_version,
             "sprint_summary": {
                 "total": len(_c_items),
                 "done": _c_counts.get("done", 0),
@@ -3640,13 +3712,21 @@ async def _start_session_composite(
             "note": (
                 "Compact orientation. For full goal/decisions/instructions call "
                 "start_session(compact=False) or get_session_brief(project_id)."
+                + (
+                    f" Scoped to sprint version {scoped_version!r} — sprint counts/items "
+                    "are filtered to this bucket."
+                    if scoped_version else ""
+                )
             ),
         }
         # Per-project agent instructions are small but behaviorally critical
         # (custom rules the session must follow), so keep them even in compact.
+        # ecf69de8 — lead with the EXECUTION MODE directive so the posture is the
+        # first protocol-level instruction the session reads.
         _c_agent = await db_module.get_agent_instructions(db, project_id)
-        if _c_agent:
-            _c_payload["agent_instructions"] = _c_agent
+        _c_payload["agent_instructions"] = (
+            f"{_c_mode_directive}\n\n{_c_agent}" if _c_agent else _c_mode_directive
+        )
         # File conflict warnings must surface in compact mode — an executor that
         # misses them will silently overwrite another session's uncommitted work.
         _c_file_warnings = await db_module.get_file_conflict_warnings(
@@ -3696,9 +3776,11 @@ async def _start_session_composite(
     # v1.1 — surface the active sprint checklist so cold sessions see
     # what's in flight before doing anything. "Active" = todo/pending/in_progress.
     # Executor sessions (role="executor") exclude human-assigned tasks.
+    # a76cb7c0 — scope to the session's resolved sprint version when present.
     active_statuses = ("todo", "pending", "in_progress")
     all_sprint_items = await db_module.get_sprint_items(
-        db, project_id, include_human=(role != "executor")
+        db, project_id, include_human=(role != "executor"),
+        version=scoped_version,
     )
     pending_items = [
         it for it in all_sprint_items if it.get("status") in active_statuses
@@ -3737,14 +3819,28 @@ async def _start_session_composite(
     )
 
     # 8a0c5a78 — inject per-project agent instructions so every session sees them.
+    # ecf69de8 — lead them with the protocol-level EXECUTION MODE directive so the
+    # executor posture (autonomous vs interactive) is the first instruction read.
+    execution_mode = db_module.normalize_execution_mode(
+        (project or {}).get("execution_mode")
+    )
+    mode_directive = _execution_mode_directive(execution_mode)
     agent_instructions = await db_module.get_agent_instructions(db, project_id)
+    agent_instructions = (
+        f"{mode_directive}\n\n{agent_instructions}"
+        if agent_instructions
+        else mode_directive
+    )
 
     payload: dict[str, Any] = {
         "session_id": session["id"],
+        "execution_mode": execution_mode,  # ecf69de8 — structured posture field
+        "execution_mode_directive": mode_directive,
+        "sprint_version": scoped_version,  # a76cb7c0 — resolved scope (or None)
         "goal": goal,
         "goal_xml": goal_xml,  # v0.6.1 — always present
         "goal_cache_blocks": goal_cache_blocks,  # v0.6.2 — ready for Anthropic
-        "sprint_items": pending_items,  # v1.1 — active checklist
+        "sprint_items": pending_items,  # v1.1 — active checklist (scoped)
         "sprint_items_xml": sprint_items_xml,
         "recent_tasks": recent_tasks,
         "active_sessions": active_sessions,
@@ -4193,13 +4289,99 @@ async def hooks_session_start(body: dict[str, Any], request: Request) -> dict[st
     return {"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": additional_context}}
 
 
+def _normalize_hook_cwd_path(path: str) -> str:
+    """Normalize a hook cwd to the canonical form used in repo_paths matching.
+
+    Mirrors the nested ``_normalize_hook_cwd`` in ``hooks_session_start`` so the
+    stop hook resolves a project from a cwd the exact same way session-start
+    does (WSL /mnt/c/... → C:/..., backslashes → forward slashes, no trailing /).
+    """
+    value = (path or "").strip().replace("\\", "/")
+    m = re.match(r"^/mnt/([a-zA-Z])(?:/(.*))?$", value)
+    if m:
+        drive = m.group(1).upper()
+        rest = (m.group(2) or "").strip("/")
+        value = f"{drive}:/{rest}" if rest else f"{drive}:/"
+    return value.rstrip("/")
+
+
+async def _resolve_hook_project_id(
+    db: Any, cwd: str, hostname: str
+) -> str | None:
+    """Resolve a project id from a hook's cwd/hostname (best-effort, never raises).
+
+    Mirrors the cwd/hostname routing the SessionStart hook uses so the Stop
+    hook can target the same project when no explicit ``project_id`` is given:
+
+    * Pass 1 — exact cwd+hostname match in a project's ``repo_paths`` (and the
+      legacy single ``repo_path``), so cwd routing wins.
+    * Pass 2 — hostname registered in any project's machine ``hostnames`` list.
+    * Fallback — if exactly one project exists, route to it.
+
+    Returns the project id, or ``None`` when nothing matches.
+    """
+    norm_cwd = _normalize_hook_cwd_path(cwd).lower()
+    norm_hn = (hostname or "").strip().lower()
+    if not norm_cwd and not norm_hn:
+        return None
+    try:
+        projects = await db_module.list_projects(db)
+    except Exception:  # noqa: BLE001
+        return None
+    if not projects:
+        return None
+
+    def _cfg(p: dict[str, Any]) -> dict[str, Any]:
+        cfg = p.get("executor_config") or {}
+        if isinstance(cfg, str):
+            try:
+                cfg = json.loads(cfg)
+            except Exception:  # noqa: BLE001
+                cfg = {}
+        return cfg if isinstance(cfg, dict) else {}
+
+    # Pass 1: exact cwd (+ optional hostname) match in repo_paths / legacy repo_path.
+    if norm_cwd:
+        for p in projects:
+            cfg = _cfg(p)
+            for rp in (cfg.get("repo_paths") or []):
+                rp_cwd = _normalize_hook_cwd_path(rp.get("cwd", "")).lower()
+                rp_host = (rp.get("hostname") or "").lower()
+                if rp_cwd == norm_cwd and (not rp_host or rp_host == norm_hn):
+                    return p["id"]
+            legacy_rp = (cfg.get("repo_path") or "").strip()
+            if legacy_rp and _normalize_hook_cwd_path(legacy_rp).lower() == norm_cwd:
+                return p["id"]
+    # Pass 2: hostname registered at machine level (hostnames list).
+    if norm_hn:
+        for p in projects:
+            cfg = _cfg(p)
+            if any((h.get("hostname") or "").lower() == norm_hn for h in (cfg.get("hostnames") or [])):
+                return p["id"]
+    # Fallback: a single-project workspace is unambiguous.
+    if len(projects) == 1:
+        return projects[0]["id"]
+    return None
+
+
 @app.post("/hooks/stop")
 async def hooks_stop(body: dict[str, Any], request: Request) -> dict[str, Any]:
     """Claude Code / Codex Stop hook.
 
-    Accepts {project_id, session_id?}. Fires auto_capture + delta handoff
-    and returns immediately. Fire-and-forget — the agent does not wait for
-    this to complete before exiting.
+    Accepts {project_id?, session_id?, cwd?, hostname?}. Fires auto_capture +
+    a delta handoff so a delta is produced even when the executor disconnects
+    without calling generate_handoff itself.
+
+    Best-effort / non-blocking: this never raises out and never returns 4xx/5xx
+    for a missing session — a missing/unresolvable session yields
+    ``{"ok": true, "handoff": null, "reason": "no session"}`` and any
+    generate_handoff failure yields ``{"ok": true, "handoff": null, "error": ...}``
+    (both 200). The agent does not wait for this before exiting.
+
+    Resolution: an explicit ``session_id`` is preferred; otherwise the
+    most-recent active session for the project (resolved from ``project_id`` or,
+    failing that, the ``cwd``/``hostname`` the same way the SessionStart hook
+    routes) is handed off.
 
     Hosted callers can authenticate with Authorization: Bearer sk_meridian_...
     to route directly to their tenant DB. Local/browser-session behavior is
@@ -4207,26 +4389,55 @@ async def hooks_stop(body: dict[str, Any], request: Request) -> dict[str, Any]:
     """
     project_id = (body.get("project_id") or "").strip()
     session_id = (body.get("session_id") or "").strip() or None
-    if not project_id:
-        return {"ok": False, "error": "project_id required"}
+    hook_cwd = (body.get("cwd") or "").strip()
+    hook_hostname = (body.get("hostname") or "").strip()
+    # Resolve the tenant DB first so a bad Bearer token still 401s (hosted mode);
+    # everything after this point is best-effort and only ever returns 200.
     db = await _resolve_hook_db(request)
-    if session_id:
+    # No explicit project — try to route by cwd/hostname like session-start does.
+    if not project_id:
+        project_id = await _resolve_hook_project_id(db, hook_cwd, hook_hostname) or ""
+    if not project_id:
+        # Nothing identifies a project (no id, no cwd/hostname match) — can't act.
+        return {"ok": False, "error": "project_id required"}
+    # Resolve the session to hand off: explicit id wins, else most-recent active.
+    if not session_id:
         try:
-            await db_module.auto_capture_session(db, project_id, session_id)
+            active = await db_module.get_sessions(db, project_id, active_only=True)
+            if active:
+                session_id = active[0].get("id") or None
         except Exception:  # noqa: BLE001
-            pass
+            session_id = None
+    if not session_id:
+        # Best-effort: no session to summarise — never an error.
+        return {"ok": True, "handoff": None, "reason": "no session"}
+    # Bucket done tasks + finalize any session markdown (both guarded).
+    try:
+        await db_module.auto_capture_session(db, project_id, session_id)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
         await _finalize_session_md(db, project_id, session_id)
+    except Exception:  # noqa: BLE001
+        pass
+    # Produce the delta handoff inline but fully guarded — any failure (and the
+    # timeout) returns cleanly with handoff null so the hook never blocks/errors.
     try:
         from . import handoff as handoff_module_local
-        await asyncio.wait_for(
+        path, _content = await asyncio.wait_for(
             handoff_module_local.generate_handoff(
                 db, project_id, _data_dir(request), mode="delta", session_id=session_id
             ),
             timeout=20.0,
         )
-    except Exception:  # noqa: BLE001
-        pass
-    return {"ok": True}
+        return {"ok": True, "handoff": {"mode": "delta", "path": path}}
+    except Exception as exc:  # noqa: BLE001
+        import logging as _hook_logging
+        _hook_logging.getLogger("meridian.hooks").info(
+            "hooks/stop delta handoff failed for project=%s session=%s: %r",
+            project_id, session_id, exc,
+        )
+        return {"ok": True, "handoff": None, "error": str(exc)}
 
 
 # ---------------------------------------------------------------------------
@@ -5116,9 +5327,9 @@ async def _remote_mcp_inner(request: Request) -> Any:
     _td = _oa_mod._oa_tokens.get(_bearer_hash) if _bearer_hash else None  # noqa: SLF001
     if _td is None and _bearer_hash:
         _td = await _oa_mod._get_oauth_token_from_db(request.app.state.db, _bearer_hash)  # noqa: SLF001
-        if _td is not None:
+        if _td is not None and not _td.get("_is_api_token"):
             _oa_mod._oa_tokens[_bearer_hash] = _td  # noqa: SLF001
-    if _td is not None:
+    if _td is not None and not _td.get("_is_api_token"):
         if _tm_local.time() > _td.get("exp", 0):
             _oa_mod._oa_tokens.pop(_bearer_hash, None)  # noqa: SLF001
             _base_r = str(request.base_url).rstrip("/")
@@ -5139,8 +5350,12 @@ async def _remote_mcp_inner(request: Request) -> Any:
             try:
                 from ._deps import _open_tenant_db_by_id
                 _mdb = await _open_tenant_db_by_id(request, _oa_tenant_id)
-            except Exception:
-                pass  # fall back to auth DB — better than 500
+            except Exception as _db_err:
+                import logging as _mcp_log
+                _mcp_log.getLogger("meridian.mcp").error(
+                    "[mcp] DB routing failed for tenant %s: %s — request will use auth DB (HITL bug source)",
+                    _oa_tenant_id, _db_err,
+                )
         _mdd = request.app.state.data_dir
         _oa_tenant = None
         if _oa_tenant_id and _hosted_mode():

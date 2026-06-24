@@ -35,6 +35,7 @@ async def create_pinned_decision_endpoint(
     title = (body.get("title") or "").strip()
     text = (body.get("body") or "").strip()
     category = body.get("category", "TECHNICAL")
+    priority = body.get("priority", "normal")
     if not title or not text:
         raise HTTPException(status_code=400, detail="title and body required")
     validate_input_size(title, "decision title", 500)
@@ -44,7 +45,9 @@ async def create_pinned_decision_endpoint(
     existing = await db_module.get_pinned_decisions(await _db(request), project_id)
     _limits.check_decisions_per_project(len(existing))
     try:
-        result = await db_module.pin_decision(await _db(request), project_id, title, text, category)
+        result = await db_module.pin_decision(
+            await _db(request), project_id, title, text, category, priority=priority
+        )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     try:
@@ -75,7 +78,8 @@ async def update_pinned_decision_endpoint(
     if new_title and new_body:
         try:
             return await db_module.supersede_pinned_decision(
-                db, decision_id, new_title, new_body, body.get("category")
+                db, decision_id, new_title, new_body, body.get("category"),
+                priority=body.get("priority"),
             )
         except ValueError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -84,6 +88,7 @@ async def update_pinned_decision_endpoint(
         body=body.get("body"), title=body.get("title"),
         category=body.get("category"), status=body.get("status"),
         superseded_by=body.get("superseded_by"),
+        priority=body.get("priority"),
     )
     if result is None:
         raise HTTPException(status_code=404, detail="decision not found")

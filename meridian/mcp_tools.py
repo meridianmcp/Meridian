@@ -29,7 +29,9 @@ _TOOL_EXAMPLES: dict[str, str] = {
     "request_hitl": 'request_hitl(project_id="abc-123", question="Should we add rate limiting here?", urgency="normal")',
     "get_hitl_request": 'get_hitl_request(request_id="hitl-uuid")',
     "add_note": 'add_note(project_id="abc-123", title="Deploy note", body="Reminder: update env vars before deploy", tags="ops,deploy")',
+    "ingest_document": 'ingest_document(project_id="abc-123", file_path="docs/spec.docx", tags="spec")  # or, for a PDF: ingest_document(project_id="abc-123", content="<text you extracted>", title="Q3 report", source="https://example.com/q3.pdf")',
     "get_notes": 'get_notes(project_id="abc-123")',
+    "read_note": 'read_note(project_id="abc-123", slug="deploy-note")',
     "add_workspace_note": 'add_workspace_note(title="Onboarding", body="All repos use pixi", tags="setup")',
     "get_workspace_notes": 'get_workspace_notes(tag="setup")',
     "pin_workspace_decision": 'pin_workspace_decision(title="Monorepo", body="One repo for all services", category="ARCHITECTURAL")',
@@ -56,21 +58,25 @@ _TOOL_EXAMPLES: dict[str, str] = {
 
 _MCP_TOOLS_LIST: list[dict[str, Any]] = [
     {"name": "create_project", "description": "Create a new Meridian project.",
-     "inputSchema": {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}},
+     "inputSchema": {"type": "object", "properties": {
+         "name": {"type": "string"},
+         "execution_mode": {"type": "string", "enum": ["autonomous", "interactive"], "description": "Executor posture for sessions on this project. 'autonomous' (default) claims and runs sprint items immediately without asking; 'interactive' asks for direction first. Editable later in dashboard Settings."}},
+         "required": ["name"]}},
     {"name": "register_session", "description": "Low-level: register this session without loading goal context. Use start_session instead for executor/human sessions — it registers AND returns goal + tasks in one call. Use register_session when you only need a session ID and will fetch context separately.",
      "inputSchema": {"type": "object", "properties": {
-         "project_id": {"type": "string"}, "session_name": {"type": "string"},
+         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."}, "session_name": {"type": "string"},
          "human_id": {"type": "string"},
          "client": {"type": "string", "enum": ["claude-code", "claude-desktop", "cursor", "other"]}},
-         "required": ["project_id", "session_name"]}},
-    {"name": "start_session", "description": "Register a session and return orientation. Compact by default (session_id, sprint focus + status counts, 3 recent tasks, board_change count) to keep an executor's context small. Pass compact=false for the full block (goal XML, decisions, MERIDIAN.md instructions, workspace context, sprint items) — or fetch it later with get_session_brief.",
+         "required": ["session_name"]}},
+    {"name": "start_session", "description": "Register a session and return orientation. Compact by default (session_id, sprint focus + status counts, 3 recent tasks, board_change count) to keep an executor's context small. Pass compact=false for the full block (goal XML, decisions, MERIDIAN.md instructions, workspace context, sprint items) — or fetch it later with get_session_brief. Pass version to scope the session to one sprint-version bucket (e.g. 'v0.1.x'): the orientation's sprint counts/items filter to it and the scope is remembered for the /goal template. Omit version to auto-scope to the bucket with the most pending items (empty board → unscoped).",
      "inputSchema": {"type": "object", "properties": {
-          "project_id": {"type": "string"}, "session_name": {"type": "string"},
+          "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."}, "session_name": {"type": "string"},
           "human_id": {"type": "string"},
           "client": {"type": "string", "enum": ["claude-code", "claude-desktop", "cursor", "other"]},
           "role": {"type": "string", "enum": ["executor"], "description": "Pass 'executor' to inject executor_config and credentials guidance."},
-          "compact": {"type": "boolean", "description": "Default true — slim orientation. Set false for the full goal/instructions payload."}},
-          "required": ["project_id", "session_name"]}},
+          "compact": {"type": "boolean", "description": "Default true — slim orientation. Set false for the full goal/instructions payload."},
+          "version": {"type": "string", "description": "Optional sprint-version bucket (e.g. 'v0.1.x') to scope this session to. Sprint progress/items in the orientation and /goal filter to it. Omit to auto-infer the bucket with the most pending items."}},
+          "required": ["session_name"]}},
     {"name": "list_projects", "description":
         "Read-only: List all projects — find, browse, or look up your projects and their IDs. "
         "Call this first when you have a project name but need its project_id, or to discover "
@@ -84,63 +90,68 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "name": {"type": "string"}},
          "required": ["name"]}},
     {"name": "get_goal", "description": "Read-only: Fine-grained — return just the goal fields (north_star, sprint, version_goal) in isolation. Use start_session or get_session_brief for full context including tasks and decisions. Use get_goal when you only need the raw goal fields.",
-     "inputSchema": {"type": "object", "properties": {"project_id": {"type": "string"}}, "required": ["project_id"]}},
+     "inputSchema": {"type": "object", "properties": {"project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."}}, "required": []}},
     {"name": "set_goal", "description": "Set or update the goal state.",
      "inputSchema": {"type": "object", "properties": {
-         "project_id": {"type": "string"}, "content": {"type": "string"}}, "required": ["project_id", "content"]}},
+         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."}, "content": {"type": "string"}}, "required": ["content"]}},
     {"name": "set_north_star", "description": "Update only the north star — the long-lived product vision that rarely changes. Distinct from the version goal (set_goal). Any team member can call this.",
      "inputSchema": {"type": "object", "properties": {
-         "project_id": {"type": "string"},
+         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
          "north_star": {"type": "string"}},
-         "required": ["project_id", "north_star"]}},
+         "required": ["north_star"]}},
     {"name": "log_task", "description": "Log a task this session completed or is working on. Valid statuses: pending, in_progress, done, failed, backlog, future, backburner.",
      "inputSchema": {"type": "object", "properties": {
-         "session_id": {"type": "string"}, "project_id": {"type": "string"},
+         "session_id": {"type": "string"}, "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
          "description": {"type": "string"}, "status": {"type": "string"},
          "kind": {"type": "string", "enum": ["shipped", "found", "decided", "blocked"], "description": "Entry taxonomy. shipped=work done, found=discovery, decided=arch choice, blocked=blocker."}},
-         "required": ["session_id", "project_id", "description"]}},
+         "required": ["session_id", "description"]}},
     {"name": "get_tasks", "description": "Read-only: Get recent tasks across all sessions.",
      "inputSchema": {"type": "object", "properties": {
-         "project_id": {"type": "string"}, "limit": {"type": "integer"}}, "required": ["project_id"]}},
+         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."}, "limit": {"type": "integer"}}, "required": []}},
     {"name": "search_tasks", "description": "Read-only: Search tasks by keyword or natural-language query. Uses trigram similarity on Postgres, LIKE on SQLite. Returns top matches with similarity score.",
      "inputSchema": {"type": "object", "properties": {
-         "project_id": {"type": "string"}, "query": {"type": "string"}, "limit": {"type": "integer"}},
-         "required": ["project_id", "query"]}},
+         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."}, "query": {"type": "string"}, "limit": {"type": "integer"}},
+         "required": ["query"]}},
     {"name": "generate_handoff", "description":
+        "EXECUTOR SESSIONS: MANDATORY - call at end of every session before disconnect. "
+        "Never write markdown manually. "
         "Read-only: Generate a context handoff. mode='full' writes the complete L0/L1/L2 handoff; "
         "mode='delta' returns a compact session update (completed + pending + /goal); "
         "mode='starter' returns a <=20-line block for paste-after-/compact or cold start - "
         "project_id, start_session command, last 5 completed titles, top 3 pending IDs, /goal; "
         "mode='planner' returns strategic context for a claude.ai planning chat.",
      "inputSchema": {"type": "object", "properties": {
-         "project_id": {"type": "string"},
+         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
          "mode": {"type": "string", "enum": ["full", "delta", "planner", "starter"]},
          "session_id": {"type": "string", "description": "Optional session id for auto-delta on repeated calls in the same session."}},
-         "required": ["project_id"]}},
+         "required": []}},
     {"name": "get_context_block", "description":
         "Read-only: Return a compact plain-text project context block (north star, sprint, "
         "pending sprint items, recent tasks, recent decisions, active sessions). "
         "mode='full' (default) for Code Handoff into a fresh Claude Code session; "
         "mode='chat' for a shorter paste into a new claude.ai conversation.",
      "inputSchema": {"type": "object", "properties": {
-         "project_id": {"type": "string"},
+         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
          "mode": {"type": "string", "enum": ["full", "chat"]}},
-         "required": ["project_id"]}},
+         "required": []}},
     {"name": "pin_decision", "description":
         "Create a pinned decision (editable constitution row). Use for the "
         "current authoritative truth that supersedes earlier statements. "
         "category is free-text; suggested values: STRATEGIC, COMPETITIVE, "
         "TECHNICAL, TACTICAL, BUSINESS, PRODUCT, ARCHITECTURAL.",
      "inputSchema": {"type": "object", "properties": {
-         "project_id": {"type": "string"},
+         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
          "title": {"type": "string"},
          "body": {"type": "string"},
-         "category": {"type": "string"}},
-         "required": ["project_id", "title", "body"]}},
+         "category": {"type": "string"},
+         "priority": {"type": "string", "enum": ["urgent", "normal", "low"], "description": "urgent decisions sort first and are weighted higher in start_session / generate_handoff context. Default normal."}},
+         "required": ["title", "body"]}},
     {"name": "update_decision", "description":
         "Patch a pinned decision. Pass new_title + new_body to atomically "
         "supersede (creates a new active row, marks old as superseded with "
-        "back-link). Otherwise patches body/title/category/status in place.",
+        "back-link). Otherwise patches body/title/category/status/priority in "
+        "place. Editing the body appends the previous body to the append-only "
+        "edit_log (read it back via get_pinned_decisions).",
      "inputSchema": {"type": "object", "properties": {
          "decision_id": {"type": "string"},
          "new_title": {"type": "string"},
@@ -148,14 +159,18 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "title": {"type": "string"},
          "body": {"type": "string"},
          "category": {"type": "string"},
+         "priority": {"type": "string", "enum": ["urgent", "normal", "low"], "description": "Change ordering/weight (urgent | normal | low)."},
          "status": {"type": "string"}},
          "required": ["decision_id"]}},
     {"name": "get_pinned_decisions", "description":
-        "Read-only: List pinned decisions (active only by default, newest first).",
+        "Read-only: List pinned decisions, highest priority first (urgent → "
+        "normal → low, then newest-first). Active only by default. Each row "
+        "includes its priority and a parsed edit_log array of prior bodies "
+        "({body, ts}) recorded on every in-place body edit.",
      "inputSchema": {"type": "object", "properties": {
-         "project_id": {"type": "string"},
+         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
          "include_superseded": {"type": "boolean"}},
-         "required": ["project_id"]}},
+         "required": []}},
     {"name": "archive_decision", "description":
         "Archive a pinned decision by id. Soft-deletes to preserve the audit trail. "
         "Use when something was filed by mistake or is a duplicate. "
@@ -170,8 +185,8 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "up or before ending a session.",
      "inputSchema": {"type": "object", "properties": {
          "session_id": {"type": "string"},
-         "project_id": {"type": "string"}},
-         "required": ["session_id", "project_id"]}},
+         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."}},
+         "required": ["session_id"]}},
     {"name": "request_hitl", "description":
         "Surface a question to the human-in-the-loop queue. urgency='blocking' "
         "means this session pauses until answered (poll get_hitl_request). "
@@ -184,7 +199,7 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "string or 0-based index) to flag the safe default — the dashboard "
         "highlights it and Enter submits it, and an auto-answer picks it.",
      "inputSchema": {"type": "object", "properties": {
-         "project_id": {"type": "string"},
+         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
          "question": {"type": "string"},
          "session_id": {"type": "string"},
          "context": {"type": "string"},
@@ -193,7 +208,7 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "assigned_to": {"type": "string"},
          "options": {"type": "array", "items": {"type": "string"}, "description": "Answer choices rendered as selectable buttons in the dashboard."},
          "recommended": {"description": "The safe-default option — an option string or a 0-based index into options. Highlighted in the dashboard; Enter submits it; auto-answer prefers it."}},
-         "required": ["project_id", "question"]}},
+         "required": ["question"]}},
     {"name": "get_hitl_request", "description":
         "Read-only: Poll a HITL request for the human's answer. Returns the row including "
         "status ('pending'|'answered'|'dismissed') and answer text.",
@@ -204,18 +219,50 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "Add a per-project wiki note (setup, gotcha, howto, env, ...). "
         "Free-form title/body; comma-separated tags optional. Optional kind "
         "(wiki=gotcha/rule/howto, insight=strategic/product analysis, "
-        "reference=external/one-off docs) controls how the dashboard renders it. "
+        "reference=external/one-off docs, code=warning/context anchored to a "
+        "file, document=ingested report/spec/thesis) controls how the dashboard "
+        "renders it. For a code anchor pass kind='code' plus file_path (and "
+        "optional symbol): the note is then surfaced automatically when a session "
+        "calls claim_file/get_file_claims for that path, so the executor sees the "
+        "warning before editing. Pass source (a URL or file path) to record where "
+        "the note came from — set automatically by ingest_document. "
         "Tag a note 'roadmap' AND pass a committable category (TECHNICAL/"
         "ARCHITECTURAL/PRODUCT) to also append it to ROADMAP.md's roadmap-notes anchor.",
      "inputSchema": {"type": "object", "properties": {
-         "project_id": {"type": "string"},
+         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
          "title": {"type": "string"},
          "body": {"type": "string"},
          "tags": {"type": "string"},
-         "kind": {"type": "string", "enum": ["wiki", "insight", "reference"]},
+         "kind": {"type": "string", "enum": ["wiki", "insight", "reference", "code", "document"]},
          "priority": {"type": "string", "enum": ["high", "normal", "low"], "description": "high-priority notes surface first in generate_handoff and planner context."},
+         "file_path": {"type": "string", "description": "Code anchor (kind='code'): repo-relative or absolute path this note warns about. Surfaced at claim_file/get_file_claims for the same path."},
+         "symbol": {"type": "string", "description": "Optional symbol (class/function/method) to scope the code anchor to. File-level anchors (no symbol) surface for any symbol in the file."},
+         "source": {"type": "string", "description": "Provenance: a URL or file path this note was ingested from. Stored on the note (used by kind='document')."},
          "category": {"type": "string"}},
-         "required": ["project_id", "title", "body"]}},
+         "required": ["title", "body"]}},
+    {"name": "ingest_document", "description":
+        "Turn a Word/PDF/text document into a queryable kind='document' note with "
+        "a source link — a report, thesis chapter, or spec doc becomes searchable "
+        "project memory. Pass file_path OR content (one is required):\n"
+        "• file_path → Meridian extracts the text SERVER-SIDE, STDLIB ONLY: .txt/"
+        ".md/.markdown and source files are read directly; .docx is unzipped and "
+        "its paragraphs extracted (no python-docx). No new dependencies.\n"
+        "• content → use this for .pdf and anything Meridian can't parse server-"
+        "side: extract the text with YOUR OWN tools first, then pass it here. "
+        "(Passing file_path for a .pdf returns an error telling you to do this.)\n"
+        "title defaults to the file's basename; source defaults to file_path. The "
+        "stored body is capped (truncated with a '…[truncated]' marker if very "
+        "long; the kept prefix stays searchable). Meridian never summarizes — pass "
+        "a summary as content if you want one stored instead of the raw text. "
+        "Returns the created note (id, slug, title, source).",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "file_path": {"type": "string", "description": "Path to a .txt/.md/.docx file to extract server-side (stdlib only). For .pdf or other types, pass pre-extracted text as 'content' instead."},
+         "content": {"type": "string", "description": "Pre-extracted document text. Use for PDFs and any type Meridian can't parse server-side. Takes precedence over file_path when both are given."},
+         "title": {"type": "string", "description": "Note title. Defaults to the file's basename."},
+         "source": {"type": "string", "description": "Provenance URL/path stored on the note. Defaults to file_path."},
+         "tags": {"type": "string", "description": "Comma-separated tags."}},
+         "required": []}},
     {"name": "capture_insight", "description":
         "Save a key takeaway from a planning (claude.ai) conversation in one call — "
         "persists a prominent kind='insight' note that's searchable, filterable, and "
@@ -224,20 +271,41 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "bullet_points (a list, joined into a bullet list). Use mid-conversation "
         "whenever you're afraid of losing context.",
      "inputSchema": {"type": "object", "properties": {
-         "project_id": {"type": "string"},
+         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
          "title": {"type": "string"},
          "body": {"type": "string", "description": "Markdown body. Omit if using bullet_points."},
          "bullet_points": {"type": "array", "items": {"type": "string"}, "description": "Key takeaways, joined into a markdown bullet list."},
          "tags": {"type": "string", "description": "Optional comma-separated tags (an 'insight' tag is always added)."},
          "priority": {"type": "string", "enum": ["high", "normal", "low"], "description": "high-priority notes appear first in planner context and generate_handoff."}},
-         "required": ["project_id", "title"]}},
+         "required": ["title"]}},
     {"name": "get_notes", "description":
-        "Read-only: List project notes (newest first). Optional ?tag substring filter.",
+        "Read-only: List project notes (newest first), LIGHTWEIGHT by default — "
+        "each item is id/slug/title/tags/kind/priority/timestamps with NO body, "
+        "so the list never overflows context. This is the pull model: scan the "
+        "list, then call read_note(project_id, slug) to fetch one note's full "
+        "body on demand. Optional ?tag substring filter and ?query full-text "
+        "search (matches title+body even though bodies aren't returned). Pass "
+        "bodies=true only when you truly need every body inline. Pagination: "
+        "pass limit (default 100, max 500) and/or cursor to get a "
+        "{notes, has_more, next_cursor} envelope, then re-call with "
+        "cursor=next_cursor for the next page; omit both for the full list.",
      "inputSchema": {"type": "object", "properties": {
-         "project_id": {"type": "string"},
+         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
          "tag": {"type": "string"},
-         "query": {"type": "string", "description": "Text search across note title and body (case-insensitive)."}},
-         "required": ["project_id"]}},
+         "query": {"type": "string", "description": "Text search across note title and body (case-insensitive)."},
+         "bodies": {"type": "boolean", "description": "Default false. true returns full note bodies inline (legacy behavior) — usually unnecessary; prefer read_note(slug)."},
+         "limit": {"type": "integer", "description": "Page size (default 100, clamped 1..500). Passing limit or cursor switches the result to the {notes, has_more, next_cursor} pagination envelope."},
+         "cursor": {"type": "integer", "description": "Offset cursor from a prior page's next_cursor. Passing it switches the result to the {notes, has_more, next_cursor} envelope."}},
+         "required": []}},
+    {"name": "read_note", "description":
+        "Read-only: Fetch one project note's full body by its per-project slug "
+        "(the ``slug`` field from get_notes). The pull half of the list→read "
+        "model — get_notes returns slugs without bodies, read_note pulls a "
+        "single body when you need it.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "slug": {"type": "string", "description": "The note's slug (kebab-cased, unique per project) as returned by get_notes."}},
+         "required": ["slug"]}},
     {"name": "delete_note", "description":
         "Hard-delete a project note by id.",
      "inputSchema": {"type": "object", "properties": {
@@ -292,6 +360,40 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "sprint_name_default": {"type": "string"},
          "handoff_template": {"type": "string"}},
          "required": []}},
+    {"name": "add_workspace_sprint_item", "description":
+        "Add an item to the workspace-level personal backlog — a cross-project board NOT "
+        "tied to any single project (track thesis + Meridian + personal goals in one view). "
+        "Use the per-project add_sprint_item for project work instead. 'group' is the "
+        "cross-project bucket the item lives under (e.g. 'thesis', 'meridian', 'personal'); "
+        "'human_id' assigns it to a person. New items start as 'todo'.",
+     "inputSchema": {"type": "object", "properties": {
+         "title": {"type": "string"},
+         "group": {"type": "string", "description": "Cross-project bucket, e.g. 'thesis'/'meridian'/'personal'."},
+         "human_id": {"type": "string", "description": "Optional: person this item is assigned to."}},
+         "required": ["title"]}},
+    {"name": "get_workspace_sprint_items", "description":
+        "Read-only: List workspace personal-backlog items (grouped by 'group', then position). "
+        "Optional 'status' (todo/pending/in_progress/done/skipped/failed) and 'group' filters.",
+     "inputSchema": {"type": "object", "properties": {
+         "status": {"type": "string", "enum": ["todo", "pending", "in_progress", "done", "skipped", "failed"]},
+         "group": {"type": "string", "description": "Filter to a single cross-project bucket."}},
+         "required": []}},
+    {"name": "update_workspace_sprint_item", "description":
+        "Edit a workspace personal-backlog item: title, status, group, or human_id (assignee). "
+        "Only the fields you pass are changed. Pass an empty string for group/human_id to clear it. "
+        "Setting status to done/skipped/failed stamps completed_at. Returns the updated item.",
+     "inputSchema": {"type": "object", "properties": {
+         "item_id": {"type": "string"},
+         "title": {"type": "string"},
+         "status": {"type": "string", "enum": ["todo", "pending", "in_progress", "done", "skipped", "failed"]},
+         "group": {"type": "string", "description": "Move the item to a different cross-project bucket; empty string clears it."},
+         "human_id": {"type": "string", "description": "Reassign to a person; empty string clears it."}},
+         "required": ["item_id"]}},
+    {"name": "complete_workspace_sprint_item", "description":
+        "Mark a workspace personal-backlog item done (stamps completed_at). Returns the updated item.",
+     "inputSchema": {"type": "object", "properties": {
+         "item_id": {"type": "string"}},
+         "required": ["item_id"]}},
     {"name": "get_session_brief", "description":
         "Read-only: Call this FIRST for project summaries or to see what a session did — "
         "returns session, tasks, decisions, and recent commits in one call. "
@@ -300,10 +402,10 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "recent tasks, any blocking failures, and pending HITL requests in a compact "
         "XML envelope (<500 tokens).",
      "inputSchema": {"type": "object", "properties": {
-         "project_id": {"type": "string"},
+         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
          "role": {"type": "string", "enum": ["worker", "planner", "review"],
                   "description": "Controls verbosity. 'worker'=sprint+tasks only, 'planner'=full context."}},
-         "required": ["project_id"]}},
+         "required": []}},
     {"name": "list_hitl_requests", "description":
         "Read-only: List HITL requests without needing UUIDs. OMIT project_id to list pending "
         "HITLs across ALL your projects (matches the dashboard) — planning sessions should call it "
@@ -315,6 +417,7 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string",
                         "description": "Optional. Omit to list across all projects."},
+         "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
          "status": {"type": "string",
                     "description": "Filter: omit for pending+recent-answered (default), 'pending', 'answered', 'dismissed', or 'all'."},
          "limit": {"type": "integer", "description": "Max results, default 50."}},
@@ -337,10 +440,10 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "Read-only: List active sessions for a project. Useful for planning chat to see "
         "what's currently running before filing new sprint items.",
      "inputSchema": {"type": "object", "properties": {
-         "project_id": {"type": "string"},
+         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
          "status": {"type": "string",
                     "description": "Filter by status: 'active' (default), or 'all' for all sessions."}},
-         "required": ["project_id"]}},
+         "required": []}},
     {"name": "add_sprint_note", "description":
         "Add an ephemeral note to the current session's scratch pad. "
         "Use for constraints, blockers, working assumptions valid only this session. "
@@ -362,11 +465,11 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "sprint were never started, returns a WARNING block listing them. Pass force=true to "
         "override and overwrite anyway.",
      "inputSchema": {"type": "object", "properties": {
-         "project_id": {"type": "string"},
+         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
          "sprint": {"type": "string"},
          "force": {"type": "boolean",
                    "description": "Skip the unstarted-items guard and overwrite the sprint anyway."}},
-         "required": ["project_id", "sprint"]}},
+         "required": ["sprint"]}},
     {"name": "get_sprint_progress", "description":
         "Read-only: Return summary of sprint items by status (pending/in_progress/done/failed) "
         "optionally filtered by version or item_group. Returns total, done, in_progress, pending, "
@@ -375,18 +478,21 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "board_change field reporting items added since that session started (live-queue signal "
         "— call this between sprint items to pick up mid-run injections).",
      "inputSchema": {"type": "object", "properties": {
-         "project_id": {"type": "string"},
+         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
          "session_id": {"type": "string", "description": "Optional: include board_change (items added since this session started)."},
          "version": {"type": "string", "description": "Filter to a specific sprint version bucket."},
          "item_group": {"type": "string", "description": "Filter to a specific item group."}},
-         "required": ["project_id"]}},
+         "required": []}},
     {"name": "add_sprint_item", "description":
+        "ALWAYS call get_sprint_items first to check for existing pending items before adding. "
         "Append a todo item to the project's sprint checklist. Use when starting work on a "
         "new version so the next session sees what's in flight. Optional: group items under "
         "a named objective with 'group'; attribute to a person with 'human_id'. "
-        "Use 'depends_on' to block until another item finishes.",
+        "Use 'depends_on' to block until another item finishes. Blocks near-duplicate titles "
+        "(>=60% word overlap with an open pending/in_progress item) and returns the conflict; "
+        "pass force=true to add anyway.",
      "inputSchema": {"type": "object", "properties": {
-         "project_id": {"type": "string"},
+         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
          "version": {"type": "string"},
          "title": {"type": "string"},
          "group": {"type": "string", "description": "Optional objective name for grouping."},
@@ -395,59 +501,62 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "failure_mode": {"type": "string", "enum": ["continue", "stop"],
                           "description": "'stop' blocks this item if the parent fails."},
          "milestone_type": {"type": "string", "enum": ["task", "milestone", "human"],
-                            "description": "'milestone' renders as a timeline marker; 'human' marks a task for a human (hidden from executor sessions)."}},
-         "required": ["project_id", "version", "title"]}},
+                            "description": "'milestone' renders as a timeline marker; 'human' marks a task for a human (hidden from executor sessions)."},
+         "force": {"type": "boolean",
+                   "description": "Override the duplicate guard and add the item even if its title closely matches an existing open item. Default false."}},
+         "required": ["version", "title"]}},
     {"name": "update_sprint_item", "description":
         "Edit fields on an existing sprint item: title, version, notes, human_id (assignee), "
         "or group. Only the fields you pass are changed; omitted fields are left untouched. "
         "Pass an empty string for human_id or group to clear it. Returns the updated item, "
         "or an error if the id is unknown.",
      "inputSchema": {"type": "object", "properties": {
-         "project_id": {"type": "string"},
+         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
          "item_id": {"type": "string"},
          "title": {"type": "string", "description": "New title."},
          "version": {"type": "string", "description": "Move the item to a different version/sprint bucket."},
          "notes": {"type": "string", "description": "Free-form note/context shown on the item."},
          "human_id": {"type": "string", "description": "Reassign to a person (assignee); empty string clears it."},
          "group": {"type": "string", "description": "Objective name to group the item under (item_group); empty string clears it."}},
-         "required": ["project_id", "item_id"]}},
+         "required": ["item_id"]}},
     {"name": "complete_sprint_item", "description":
         "Mark a sprint item done. Pass task_id to link the task that shipped it. "
         "Pass session_id to get a board_change field (items injected mid-run) and an "
         "active-worktree merge reminder in the response.",
      "inputSchema": {"type": "object", "properties": {
-         "project_id": {"type": "string"},
+         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
          "item_id": {"type": "string"},
          "task_id": {"type": "string"},
          "session_id": {"type": "string", "description": "Optional: include board_change + worktree merge reminder."}},
-         "required": ["project_id", "item_id"]}},
+         "required": ["item_id"]}},
     {"name": "reconcile_sprint_drift", "description":
         "Read-only: Cross-reference pending sprint items against recent git commits and "
         "return items that may already be done. Uses keyword matching — confidence 'high' "
         "means 3+ keywords overlap (safe to mark done), 'medium' means 1-2 (verify first). "
         "Call during planning sessions to identify board drift before filing new items.",
      "inputSchema": {"type": "object", "properties": {
-         "project_id": {"type": "string"}},
-         "required": ["project_id"]}},
+         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."}},
+         "required": []}},
     {"name": "get_planning_brief", "description":
+        "PLANNING SESSIONS: CALL THIS FIRST before anything else. "
         "Read-only: Return a compact planning context — sprint, north star, pending items, "
         "in-progress items, recent tasks, active sessions, recent decisions, and pending HITLs. "
         "No session registration needed. Designed for planning chat sessions that need to see "
         "project state without side effects.",
      "inputSchema": {"type": "object", "properties": {
-         "project_id": {"type": "string"}},
-         "required": ["project_id"]}},
+         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."}},
+         "required": []}},
     {"name": "get_sprint_items", "description":
         "Read-only: List sprint items for a project. Optional status filter "
         "(todo|pending|in_progress|provisional_complete|done|failed|skipped|pushed|indeterminate). "
         "Cold sessions read this to know what's still owed.",
      "inputSchema": {"type": "object", "properties": {
-         "project_id": {"type": "string"},
+         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
          "status": {"type": "string",
                     "enum": ["pending", "todo", "in_progress", "provisional_complete",
                              "done", "failed", "skipped", "pushed", "indeterminate"],
                     "description": "Filter by status."}},
-         "required": ["project_id"]}},
+         "required": []}},
     {"name": "get_session_log", "description":
         "Read-only: Return the full task log for the given session. "
         "Returns every log_task description logged during the session, "
@@ -460,17 +569,17 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "and sprint items. Uses LIKE matching (SQLite) or ILIKE (Postgres). "
         "Returns grouped results: {tasks, notes, decisions, sprint_items, total}.",
      "inputSchema": {"type": "object", "properties": {
-         "project_id": {"type": "string"},
+         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
          "query": {"type": "string"},
          "limit": {"type": "integer", "description": "Max results per type (default 10)."}},
-         "required": ["project_id", "query"]}},
+         "required": ["query"]}},
     {"name": "get_agent_instructions", "description":
         "Read-only: Return the custom agent_instructions for a project. "
         "These are injected automatically by start_session so every session picks them up. "
         "Use this when you need to read or display the current instructions.",
      "inputSchema": {"type": "object", "properties": {
-         "project_id": {"type": "string"}},
-         "required": ["project_id"]}},
+         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."}},
+         "required": []}},
     {"name": "set_agent_instructions", "description":
         "Set or update the custom agent_instructions for a project. "
         "Instructions are injected into every start_session response so AI sessions see them "
@@ -478,9 +587,9 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "Pass null or empty string to clear. "
         "Use for persistent rules like coding conventions, deploy steps, or codebase notes.",
      "inputSchema": {"type": "object", "properties": {
-         "project_id": {"type": "string"},
+         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
          "instructions": {"type": "string", "description": "Markdown text injected at session start. Pass null to clear."}},
-         "required": ["project_id", "instructions"]}},
+         "required": ["instructions"]}},
     {"name": "set_executor_config", "description":
         "Store per-project executor defaults (repo_path, env_file, test_cmd, test_min, deploy_cmd, shell_type, branch). "
         "Merges onto the existing config — other keys (hostnames, filesystem_roots, …) are preserved. "
@@ -489,7 +598,7 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "Executor sessions auto-load these when start_session(role='executor') is used. "
         "Credentials rule is always injected separately: read secrets from env_file only, never remote shell.",
      "inputSchema": {"type": "object", "properties": {
-         "project_id": {"type": "string"},
+         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
          "repo_path": {"type": "string"},
          "repo_paths": {"type": "array", "items": {"type": "object", "properties": {
              "cwd": {"type": "string"}, "hostname": {"type": "string"}}},
@@ -500,7 +609,7 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "deploy_cmd": {"type": "string"},
          "shell_type": {"type": "string"},
          "branch": {"type": "string"}},
-         "required": ["project_id"]}},
+         "required": []}},
     {"name": "claim_file", "description":
         "Claim edit rights on a file for this session. Whole-file by default "
         "(auto-expires after 2 hours). For symbol-level claims — so two sessions "
@@ -510,7 +619,9 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "Python, tree-sitter for JS/TS/C/C++/Go/Rust/Java/C#), and hard-blocks if "
         "another live session already owns an overlapping line range — the block "
         "lists which symbols are still safe to claim. Unparseable content falls "
-        "back to a whole-file lock.",
+        "back to a whole-file lock. The response includes a `code_notes` list of "
+        "code-anchored project notes (kind='code') for this file/symbol — read "
+        "them before editing.",
      "inputSchema": {"type": "object", "properties": {
          "session_id": {"type": "string"},
          "file_path": {"type": "string"},
@@ -526,9 +637,14 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
     {"name": "get_file_claims", "description":
         "Read-only: show active claims on a file — the whole-file lock (with the "
         "holder's session name, if any) plus any symbol-level claims. Use to check "
-        "who owns a file before editing it.",
+        "who owns a file before editing it. Pass project_id (and optional symbol) "
+        "to also get a `code_notes` list of code-anchored notes (kind='code') for "
+        "that path.",
      "inputSchema": {"type": "object", "properties": {
-         "file_path": {"type": "string"}},
+         "file_path": {"type": "string"},
+         "project_id": {"type": "string", "description": "Include code-anchored notes (kind='code') for this project/path in the response."},
+         "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "symbol": {"type": "string", "description": "Optional symbol to scope code-anchored notes to (requires project_id)."}},
          "required": ["file_path"]}},
     {"name": "get_symbol_claims", "description":
         "Read-only: list symbol-level claims on a file (who owns which class/function/method line ranges).",
@@ -558,48 +674,48 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "session (claude.ai) to skip the HITL and apply the replacement directly; "
         "autonomous executor sessions should omit force so the diff stays gated.",
      "inputSchema": {"type": "object", "properties": {
-         "project_id": {"type": "string"},
+         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
          "file": {"type": "string", "description": "CLAUDE.md | AGENTS.md"},
          "anchor": {"type": "string"},
          "content": {"type": "string", "description": "Full proposed body for the section."},
          "session_id": {"type": "string"},
          "force": {"type": "boolean", "description": "Human planning sessions pass true to apply directly without HITL. Default false."},
          "urgency": {"type": "string", "enum": ["normal", "high", "blocking"]}},
-         "required": ["project_id", "file", "anchor", "content"]}},
+         "required": ["file", "anchor", "content"]}},
     {"name": "claim_sprint_item",
      "description": "Claim a pending sprint item: sets status to in_progress and records claimed_at. Read-only: false. Rejects if the item is already in_progress, done, failed, skipped, or its touches_files overlap active file claims from another live session.",
      "inputSchema": {"type": "object", "properties": {
-         "project_id": {"type": "string"},
+         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
          "item_id": {"type": "string"},
          "session_id": {"type": "string", "description": "Optional caller session id; its own file claims are ignored for conflict checks."}},
-         "required": ["project_id", "item_id"]}},
+         "required": ["item_id"]}},
     {"name": "add_subtask",
      "description": "Add a child sprint item under an existing parent item. Inherits the parent's version. Status starts as pending. Rejects if the parent is already done, failed, or skipped.",
      "inputSchema": {"type": "object", "properties": {
-         "project_id": {"type": "string"},
+         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
          "parent_id": {"type": "string", "description": "ID of the parent sprint item."},
          "title": {"type": "string", "description": "Title of the new subtask."}},
-         "required": ["project_id", "parent_id", "title"]}},
+         "required": ["parent_id", "title"]}},
     {"name": "split_sprint_item",
      "description": "Split a sprint item into multiple smaller items. The original is closed (skipped) and N new items are created with split_from referencing the original. Returns list of new items.",
      "inputSchema": {"type": "object", "properties": {
-         "project_id": {"type": "string"},
+         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
          "item_id": {"type": "string", "description": "ID of the item to split."},
          "titles": {"type": "array", "items": {"type": "string"},
                     "description": "Titles for the new items (minimum 2)."}},
-         "required": ["project_id", "item_id", "titles"]}},
+         "required": ["item_id", "titles"]}},
     {"name": "merge_sprint_items",
      "description": "Merge multiple sprint items into one. Source items are closed (skipped, merged_into=survivor). Returns the new survivor item.",
      "inputSchema": {"type": "object", "properties": {
-         "project_id": {"type": "string"},
+         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
          "item_ids": {"type": "array", "items": {"type": "string"},
                       "description": "IDs of items to merge (minimum 2)."},
          "new_title": {"type": "string", "description": "Title for the merged survivor item."}},
-         "required": ["project_id", "item_ids", "new_title"]}},
+         "required": ["item_ids", "new_title"]}},
 ]
 
 _READ_ONLY_TOOLS = {
-    "list_projects", "get_project_by_name", "get_goal", "get_notes",
+    "list_projects", "get_project_by_name", "get_goal", "get_notes", "read_note",
     "get_pinned_decisions", "get_tasks", "search_tasks", "search_all",
     "get_session_brief", "get_context_block", "get_hitl_request",
     "list_hitl_requests", "list_sessions", "get_sprint_notes",

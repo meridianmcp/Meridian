@@ -456,6 +456,7 @@ CREATE TABLE IF NOT EXISTS projects (
     github_repo TEXT,
     github_branch TEXT,
     queued_session TEXT,
+    execution_mode TEXT NOT NULL DEFAULT 'autonomous',
     created_at TEXT NOT NULL DEFAULT ({_TS})
 );
 
@@ -481,7 +482,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     last_seen TEXT NOT NULL DEFAULT ({_TS}),
     created_at TEXT NOT NULL DEFAULT ({_TS}),
     session_summary TEXT,
-    checkpoint_data TEXT
+    checkpoint_data TEXT,
+    sprint_version TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_log (
@@ -523,6 +525,8 @@ CREATE TABLE IF NOT EXISTS decisions_pinned (
     title TEXT NOT NULL,
     body TEXT NOT NULL,
     category TEXT NOT NULL DEFAULT 'TECHNICAL',
+    priority TEXT NOT NULL DEFAULT 'normal',
+    edit_log TEXT,
     status TEXT NOT NULL DEFAULT 'active',
     superseded_by TEXT REFERENCES decisions_pinned(id),
     created_at TEXT NOT NULL DEFAULT ({_TS}),
@@ -554,6 +558,10 @@ CREATE TABLE IF NOT EXISTS project_notes (
     title TEXT NOT NULL,
     body TEXT NOT NULL,
     tags TEXT,
+    slug TEXT,
+    file_path TEXT,
+    symbol TEXT,
+    source TEXT,
     created_at TEXT NOT NULL DEFAULT ({_TS}),
     updated_at TEXT NOT NULL DEFAULT ({_TS})
 );
@@ -638,6 +646,23 @@ CREATE TABLE IF NOT EXISTS workspace_decisions (
 CREATE INDEX IF NOT EXISTS idx_workspace_notes_created ON workspace_notes(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_workspace_decisions_status ON workspace_decisions(status, created_at DESC);
 -- tenant_id indexes added by _migrate_pg_workspace_tenant_isolation (migration handles existing DBs)
+
+-- workspace_sprint_items: tenant-global personal backlog, NOT tied to a single
+-- project. Mirrors the useful subset of sprint_items but keyed by tenant_id;
+-- item_group is the cross-project bucket ('thesis'/'meridian'/'personal').
+CREATE TABLE IF NOT EXISTS workspace_sprint_items (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT,
+    title TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'todo',
+    item_group TEXT,
+    human_id TEXT,
+    position INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT ({_TS}),
+    updated_at TEXT NOT NULL DEFAULT ({_TS}),
+    completed_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_workspace_sprint_items_tenant ON workspace_sprint_items(tenant_id, status);
 
 -- v3.4 — workspace-level settings singleton (tenant-global defaults).
 CREATE TABLE IF NOT EXISTS workspace_settings (
@@ -1087,6 +1112,32 @@ async def _migrate_pg_workspace_tenant_isolation(conn: PostgresConnection) -> No
         await conn.execute(sql)
 
 
+async def _migrate_pg_workspace_sprint_board(conn: PostgresConnection) -> None:
+    """workspace_sprint_items — tenant-global personal backlog (cross-project).
+
+    Mirrors the SQLite _migrate_workspace_sprint_board. Tenant-scoped
+    (tenant_id, NOT project_id). Idempotent — CREATE TABLE / INDEX IF NOT
+    EXISTS. CREATE_TABLES_CORE covers fresh DBs; this is the upgrade path."""
+    await conn.execute(
+        "CREATE TABLE IF NOT EXISTS workspace_sprint_items ("
+        "    id TEXT PRIMARY KEY,"
+        "    tenant_id TEXT,"
+        "    title TEXT NOT NULL,"
+        "    status TEXT NOT NULL DEFAULT 'todo',"
+        "    item_group TEXT,"
+        "    human_id TEXT,"
+        "    position INTEGER NOT NULL DEFAULT 0,"
+        "    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),"
+        "    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),"
+        "    completed_at TIMESTAMPTZ"
+        ")"
+    )
+    await conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_workspace_sprint_items_tenant "
+        "ON workspace_sprint_items(tenant_id, status)"
+    )
+
+
 async def _migrate_pg_admin_plan(conn: PostgresConnection) -> None:
     """Set plan='admin' for tenants whose email is in MERIDIAN_ADMIN_EMAILS / ADMIN_EMAIL.
 
@@ -1153,6 +1204,134 @@ async def _migrate_pg_oauth_refresh_tokens(conn: PostgresConnection) -> None:
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )"""
     )
+
+
+async def _migrate_pg_note_slug(conn: PostgresConnection) -> None:
+    """5a5bba43 — project_notes.slug: Obsidian ``mem:name`` style handle.
+
+    Adds a nullable ``slug`` column and backfills pre-existing rows with a
+    kebab-cased, per-project-unique slug derived from the title. Idempotent:
+    ADD COLUMN IF NOT EXISTS plus a backfill that only fills NULL/empty slugs,
+    so re-running on an already-migrated DB is a no-op. The uniqueness loop runs
+    in Python (mirrors the SQLite path) to stay in sync with add_project_note's
+    collision suffixing.
+    """
+    await conn.executescript(
+        "ALTER TABLE project_notes ADD COLUMN IF NOT EXISTS slug TEXT"
+    )
+    async with conn.execute(
+        "SELECT id, project_id, title FROM project_notes "
+        "WHERE slug IS NULL OR slug = '' ORDER BY created_at ASC, id ASC"
+    ) as cur:
+        rows = list(await cur.fetchall())
+    if not rows:
+        return
+    used: dict[str, set[str]] = {}
+    async with conn.execute(
+        "SELECT project_id, slug FROM project_notes "
+        "WHERE slug IS NOT NULL AND slug != ''"
+    ) as cur:
+        for r in await cur.fetchall():
+            used.setdefault(r["project_id"], set()).add(r["slug"])
+    for r in rows:
+        seen = used.setdefault(r["project_id"], set())
+        base = _slugify_note_pg(r["title"])
+        slug = base
+        n = 1
+        while slug in seen:
+            n += 1
+            slug = f"{base}-{n}"
+        seen.add(slug)
+        await conn.execute(
+            "UPDATE project_notes SET slug = ? WHERE id = ?", (slug, r["id"])
+        )
+
+
+async def _migrate_pg_decision_priority_edit_log(conn: PostgresConnection) -> None:
+    """366317e9 — decisions_pinned.priority + decisions_pinned.edit_log.
+
+    priority (urgent | normal | low, default 'normal') drives dashboard ordering
+    and context-injection weight. edit_log is an append-only JSON array of
+    ``{"body": <previous body>, "ts": <iso timestamp>}`` entries pushed on every
+    in-place body edit. Both ADD COLUMN IF NOT EXISTS so re-running is a no-op;
+    existing rows default priority to 'normal' and leave edit_log NULL.
+    """
+    await conn.executescript(
+        "ALTER TABLE decisions_pinned "
+        "ADD COLUMN IF NOT EXISTS priority TEXT NOT NULL DEFAULT 'normal'"
+    )
+    await conn.executescript(
+        "ALTER TABLE decisions_pinned ADD COLUMN IF NOT EXISTS edit_log TEXT"
+    )
+
+
+async def _migrate_pg_code_anchored_notes(conn: PostgresConnection) -> None:
+    """771c00d7 — project_notes.file_path + project_notes.symbol: code-anchored notes.
+
+    A note with note_kind='code' plus a ``file_path`` (and optional ``symbol``)
+    anchors a warning/context to a file/symbol, surfaced automatically at
+    ``claim_file``/``get_file_claims``. Both nullable so normal notes are
+    unaffected. ADD COLUMN IF NOT EXISTS so re-running is a no-op.
+    """
+    await conn.executescript(
+        "ALTER TABLE project_notes ADD COLUMN IF NOT EXISTS file_path TEXT"
+    )
+    await conn.executescript(
+        "ALTER TABLE project_notes ADD COLUMN IF NOT EXISTS symbol TEXT"
+    )
+
+
+async def _migrate_pg_note_source(conn: PostgresConnection) -> None:
+    """e3f150d0 — project_notes.source: provenance for an ingested note.
+
+    A document-ingested note (``note_kind='document'``) records the URL or file
+    path it was extracted from in ``source``. Nullable so normal notes are
+    unaffected. ADD COLUMN IF NOT EXISTS so re-running is a no-op. Mirrors
+    db._migrate_note_source.
+    """
+    await conn.executescript(
+        "ALTER TABLE project_notes ADD COLUMN IF NOT EXISTS source TEXT"
+    )
+
+
+async def _migrate_pg_session_sprint_version(conn: PostgresConnection) -> None:
+    """a76cb7c0 — sessions.sprint_version: the sprint-version bucket a session
+    is scoped to.
+
+    start_session stores either the explicit ``version`` it was given or the
+    inferred bucket (most pending items) so later calls auto-filter sprint
+    progress/items to it. Nullable so unscoped sessions behave as before. ADD
+    COLUMN IF NOT EXISTS so re-running is a no-op. Mirrors
+    db._migrate_session_sprint_version.
+    """
+    await conn.executescript(
+        "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS sprint_version TEXT"
+    )
+
+
+async def _migrate_pg_project_execution_mode(conn: PostgresConnection) -> None:
+    """ecf69de8 — projects.execution_mode: per-project executor posture.
+
+    'autonomous' (default) — claim and run pending sprint items immediately
+    without asking for direction. 'interactive' — review the items and ask the
+    human which to start first. Injected at the protocol level by start_session
+    and selects the /goal framing in _build_quick_start_goal. NOT NULL DEFAULT
+    'autonomous' so existing rows backfill to autonomous. ADD COLUMN IF NOT
+    EXISTS so re-running is a no-op. Mirrors db._migrate_project_execution_mode.
+    """
+    await conn.executescript(
+        "ALTER TABLE projects ADD COLUMN IF NOT EXISTS execution_mode "
+        "TEXT NOT NULL DEFAULT 'autonomous'"
+    )
+
+
+def _slugify_note_pg(title: str) -> str:
+    """Kebab-case a note title (lowercase, alnum+dashes, collapse, trim).
+
+    Mirrors db.migrations._slugify_note / db._slugify_note so SQLite and
+    Postgres produce identical slugs."""
+    slug = re.sub(r"[^a-z0-9]+", "-", (title or "").lower()).strip("-")
+    return slug or "note"
 
 
 async def get_project_ntfy_url(
@@ -1700,6 +1879,7 @@ _PG_MIGRATIONS_HOSTED = (
 # Late migrations — run on every DB after the hosted-only set.
 _PG_MIGRATIONS_LATE = (
     _migrate_pg_workspace_tenant_isolation,
+    _migrate_pg_workspace_sprint_board,
     _migrate_pg_sprint_items_claimed_at,
     _migrate_pg_sprint_item_tree,
     _migrate_pg_api_token_type,
@@ -1717,4 +1897,10 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_notes_priority,
     _migrate_pg_task_log_kind,
     _migrate_pg_oauth_refresh_tokens,
+    _migrate_pg_note_slug,
+    _migrate_pg_decision_priority_edit_log,
+    _migrate_pg_code_anchored_notes,
+    _migrate_pg_note_source,
+    _migrate_pg_session_sprint_version,
+    _migrate_pg_project_execution_mode,
 )

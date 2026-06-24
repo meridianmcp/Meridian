@@ -16,16 +16,21 @@ from meridian import tunnel_plugins as tp
 def test_resolve_defaults_returns_builtins_in_order():
     plugins = tp.resolve_plugins(None)
     assert [p["name"] for p in plugins] == [
-        "filesystem", "code-intel", "code-extractor", "powerpoint", "word"
+        "filesystem", "code-intel", "code-extractor", "powerpoint", "word", "desktop-commander"
     ]
-    assert [p["slot"] for p in plugins] == ["fs", "code", "extract", "ppt", "word"]
-    # The three code/fs slots default ON with no command override; the two Office
-    # slots default OFF with a built-in uvx command.
+    assert [p["slot"] for p in plugins] == ["fs", "code", "extract", "ppt", "word", "dc"]
+    # The three code/fs slots default ON with no command override; Office slots
+    # and desktop-commander default OFF.
     by_name = {p["name"]: p for p in plugins}
     assert all(by_name[n]["enabled"] for n in ("filesystem", "code-intel", "code-extractor"))
-    assert all(by_name[n]["command"] is None for n in ("filesystem", "code-intel", "code-extractor"))
+    # filesystem + code-intel use the client's platform default (command None);
+    # code-extractor defaults to Serena (LSP symbol tools), {repo_path} expanded
+    # to the served repo at spawn time.
+    assert all(by_name[n]["command"] is None for n in ("filesystem", "code-intel"))
+    assert by_name["code-extractor"]["command"] == tp.SERENA_EXTRACT_COMMAND
     assert by_name["powerpoint"]["enabled"] is False
     assert by_name["word"]["enabled"] is False
+    assert by_name["desktop-commander"]["enabled"] is False
     assert by_name["powerpoint"]["command"] == ["uvx", "powerpoint-mcp"]
     assert by_name["word"]["env"] == {"MCP_AUTHOR": "Adam", "MCP_AUTHOR_INITIALS": "AC"}
 
@@ -50,6 +55,33 @@ def test_active_plugins_filters_disabled():
 def test_plugin_by_slot():
     assert tp.plugin_by_slot(None, "code")["name"] == "code-intel"
     assert tp.plugin_by_slot(None, "nope") is None
+
+
+# ---------------------------------------------------------------------------
+# expand_command — {repo_path} template substitution (Serena extract default)
+# ---------------------------------------------------------------------------
+
+def test_expand_command_substitutes_repo_path_in_serena_default():
+    out = tp.expand_command(tp.SERENA_EXTRACT_COMMAND, repo_path="/home/me/proj")
+    assert out == ["uvx", "serena", "start-mcp-server",
+                   "--context", "ide-assistant", "--project", "/home/me/proj"]
+    # The module-level constant must not be mutated by expansion.
+    assert tp.SERENA_EXTRACT_COMMAND[-1] == "{repo_path}"
+
+
+def test_expand_command_accepts_string_and_leaves_unknown_placeholders():
+    out = tp.expand_command("tool --project {repo_path} --flag {other}", repo_path="/r")
+    assert out == ["tool", "--project", "/r", "--flag", "{other}"]
+
+
+def test_expand_command_none_and_empty_yield_none():
+    assert tp.expand_command(None, repo_path="/r") is None
+    assert tp.expand_command("   ", repo_path="/r") is None
+    assert tp.expand_command([], repo_path="/r") is None
+
+
+def test_expand_command_missing_repo_path_blanks_placeholder():
+    assert tp.expand_command(["x", "{repo_path}"]) == ["x", ""]
 
 
 # ---------------------------------------------------------------------------
@@ -127,7 +159,7 @@ def test_description_overrides_normalized_to_strings():
 
 def test_builtin_names_helper():
     assert tp.builtin_names() == (
-        "filesystem", "code-intel", "code-extractor", "powerpoint", "word"
+        "filesystem", "code-intel", "code-extractor", "powerpoint", "word", "desktop-commander"
     )
 
 
@@ -173,3 +205,98 @@ def test_resolve_detection_keeps_explicit_enable_without_binary():
     cfg = {"word": {"enabled": True}}
     by_slot = {p["slot"]: p for p in tp.resolve_plugins(cfg, detected_slots=set())}
     assert by_slot["word"]["enabled"] is True
+
+
+# ---------------------------------------------------------------------------
+# resolve_custom_plugins — user-defined LOCAL-ONLY plugins (ce84619d)
+# ---------------------------------------------------------------------------
+
+def test_custom_plugin_valid_entry_resolves():
+    cfg = [{"name": "fetch", "command": "uvx mcp-server-fetch", "port": 8901}]
+    custom = tp.resolve_custom_plugins(cfg)
+    assert custom == [{
+        "name": "fetch",
+        "command": ["uvx", "mcp-server-fetch"],
+        "port": 8901,
+        "enabled": True,
+        "builtin": False,
+        "custom": True,
+    }]
+
+
+def test_custom_plugin_command_list_form_and_explicit_disabled():
+    cfg = [{"name": "git", "command": ["uvx", "mcp-server-git"], "port": 9100, "enabled": False}]
+    custom = tp.resolve_custom_plugins(cfg)
+    assert len(custom) == 1
+    assert custom[0]["command"] == ["uvx", "mcp-server-git"]
+    assert custom[0]["enabled"] is False
+
+
+def test_custom_plugin_builtin_named_entry_excluded():
+    # A config entry named like a built-in is a slot override, never a custom plugin.
+    cfg = [{"name": "code-intel", "command": "codegraph", "port": 9001},
+           {"name": "filesystem", "command": "x", "port": 9002}]
+    assert tp.resolve_custom_plugins(cfg) == []
+
+
+def test_custom_plugin_empty_command_dropped():
+    cfg = [{"name": "nocmd", "command": "   ", "port": 9001},
+           {"name": "missing", "port": 9002}]
+    assert tp.resolve_custom_plugins(cfg) == []
+
+
+def test_custom_plugin_bad_ports_dropped():
+    cfg = [
+        {"name": "boolport", "command": "x", "port": True},      # bool is not a port
+        {"name": "lowport", "command": "x", "port": 80},          # < 1024
+        {"name": "highport", "command": "x", "port": 70000},      # > 65535
+        {"name": "strport", "command": "x", "port": "8901"},      # not an int
+    ]
+    assert tp.resolve_custom_plugins(cfg) == []
+
+
+def test_custom_plugin_builtin_default_ports_collision_dropped():
+    # 8808–8813 belong to built-in slots; a custom proxy may not reuse them.
+    for p in (8808, 8809, 8810, 8811, 8812, 8813):
+        cfg = [{"name": f"c{p}", "command": "x", "port": p}]
+        assert tp.resolve_custom_plugins(cfg) == [], f"port {p} should collide"
+
+
+def test_custom_plugin_duplicate_names_deduped_first_wins():
+    cfg = [
+        {"name": "dup", "command": "first", "port": 9001},
+        {"name": "dup", "command": "second", "port": 9002},
+    ]
+    custom = tp.resolve_custom_plugins(cfg)
+    assert len(custom) == 1
+    assert custom[0]["command"] == ["first"] and custom[0]["port"] == 9001
+
+
+def test_custom_plugin_repo_path_left_intact_at_resolve_time():
+    # {repo_path} is expanded by the client at spawn time, not here.
+    cfg = [{"name": "serena2", "command": "uvx serena --project {repo_path}", "port": 9300}]
+    custom = tp.resolve_custom_plugins(cfg)
+    assert custom[0]["command"] == ["uvx", "serena", "--project", "{repo_path}"]
+
+
+def test_custom_plugin_dict_form_config():
+    # The dict-keyed config shape resolves custom plugins too.
+    cfg = {"fetch": {"command": "uvx mcp-server-fetch", "port": 8901}}
+    custom = tp.resolve_custom_plugins(cfg)
+    assert len(custom) == 1 and custom[0]["name"] == "fetch"
+
+
+def test_custom_plugin_empty_and_garbage_config():
+    assert tp.resolve_custom_plugins(None) == []
+    assert tp.resolve_custom_plugins({}) == []
+    assert tp.resolve_custom_plugins("nonsense") == []
+
+
+def test_custom_plugin_command_and_port_round_trip_through_normalize():
+    # normalize_plugins_config must preserve a custom entry's command + port so
+    # the config round-trips (PUT → store → GET → resolve_custom_plugins).
+    norm = tp.normalize_plugins_config(
+        [{"name": "fetch", "command": "uvx mcp-server-fetch", "port": 8901}]
+    )
+    assert norm["fetch"]["command"] == ["uvx", "mcp-server-fetch"]
+    assert norm["fetch"]["port"] == 8901

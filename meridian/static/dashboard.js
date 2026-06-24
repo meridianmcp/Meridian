@@ -850,6 +850,8 @@ async function retryProjectSurface(projectId) {
 
   if (activeVtab === 'settings') await loadSettingsTab(projectId);
 
+  if (activeVtab === 'codeintel') await loadCodeIntelTab(projectId);
+
 }
 
 
@@ -1161,6 +1163,71 @@ async function loadExecutorRulesSection(projectId) {
 // only used to locate the settings DOM host.
 const _TUNNEL_DEFAULT_PORTS = { fs: 8808, code: 8809, extract: 8810, ppt: 8811, word: 8812 };
 
+// Curated, well-known MCP servers a user can drop into a tunnel slot's command.
+// Copy-to-clipboard for now (one-click custom-slot install lands in a later
+// sprint). Commands use the canonical `uvx` / `npx -y` launchers the tunnel
+// already knows how to spawn.
+const _CURATED_TUNNEL_PLUGINS = [
+  { name: 'Sequential Thinking', command: 'npx -y @modelcontextprotocol/server-sequential-thinking', description: 'Structured step-by-step reasoning', docs: 'https://github.com/modelcontextprotocol/servers' },
+  { name: 'Fetch', command: 'uvx mcp-server-fetch', description: 'Fetch & convert web pages to markdown', docs: 'https://github.com/modelcontextprotocol/servers' },
+  { name: 'Git', command: 'uvx mcp-server-git', description: 'Read/search/manipulate Git repos', docs: 'https://github.com/modelcontextprotocol/servers' },
+  { name: 'Time', command: 'uvx mcp-server-time', description: 'Time & timezone conversion', docs: 'https://github.com/modelcontextprotocol/servers' },
+  { name: 'Memory', command: 'npx -y @modelcontextprotocol/server-memory', description: 'Knowledge-graph persistent memory', docs: 'https://github.com/modelcontextprotocol/servers' },
+];
+
+// Detect the viewer's OS so we can surface the right dependency-install commands
+// for the two launchers tunnel plugins use (uv → uvx, Node → npx). Returns one
+// of 'windows' | 'macos' | 'linux' (best-effort; defaults to 'linux').
+function _detectTunnelOs() {
+  const ua = (navigator.userAgent || '') + ' ' + (navigator.platform || '');
+  if (/win/i.test(ua)) return 'windows';
+  if (/mac|darwin|iphone|ipad/i.test(ua)) return 'macos';
+  return 'linux';
+}
+
+// uv (powers `uvx`) + Node.js (powers `npx`) install one-liners per OS.
+const _TUNNEL_INSTALL_CMDS = {
+  windows: {
+    label: 'Windows',
+    uv: 'winget install --id=astral-sh.uv -e',
+    node: 'winget install OpenJS.NodeJS -e',
+  },
+  macos: {
+    label: 'macOS',
+    uv: 'brew install uv',
+    node: 'brew install node',
+  },
+  linux: {
+    label: 'Linux',
+    uv: 'curl -LsSf https://astral.sh/uv/install.sh | sh',
+    node: 'sudo apt-get install -y nodejs npm',
+  },
+};
+
+// Copy text to the clipboard with a graceful fallback for non-secure contexts
+// or browsers without the async Clipboard API.
+async function _tunnelCopyToClipboard(text) {
+  try {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      await navigator.clipboard.writeText(text);
+      return true;
+    }
+  } catch (_) { /* fall through to legacy path */ }
+  try {
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.style.position = 'fixed';
+    ta.style.opacity = '0';
+    document.body.appendChild(ta);
+    ta.select();
+    const ok = document.execCommand('copy');
+    document.body.removeChild(ta);
+    return ok;
+  } catch (_) {
+    return false;
+  }
+}
+
 async function loadTunnelPluginsSection(projectId) {
   const host = document.getElementById(`settings-body-${projectId}`);
   if (!host) return;
@@ -1181,6 +1248,16 @@ async function loadTunnelPluginsSection(projectId) {
     }
     const plugins = (data && data.plugins) || [];
     const active = (data && data.active) || {};
+    // User-defined (non-built-in) plugins — LOCAL-ONLY: they ride a local
+    // mcp-proxy port + the local .mcp.json, never the claude.ai connector.
+    // Kept in a mutable array so Add/Remove re-render without a round-trip;
+    // collectConfig() merges them into the PUT body alongside the slot overrides.
+    const customPlugins = ((data && data.custom) || []).map((c) => ({
+      name: String(c.name || ''),
+      command: Array.isArray(c.command) ? c.command.join(' ') : String(c.command || ''),
+      port: c.port,
+      enabled: c.enabled !== false,
+    }));
 
     const rows = plugins.map((p) => {
       const cmd = Array.isArray(p.command) ? p.command.join(' ') : '';
@@ -1207,8 +1284,121 @@ async function loadTunnelPluginsSection(projectId) {
               title="local proxy port"
               style="width:74px;box-sizing:border-box;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:5px 7px;outline:none">
           </div>
+          <details class="tp-tools" data-slot="${escapeHtml(p.slot)}" data-loaded="0" style="margin-top:6px">
+            <summary style="cursor:pointer;list-style:none;font-size:10px;color:var(--accent);user-select:none">&#9656; tools</summary>
+            <div class="tp-tools-body" style="margin-top:5px;font-size:10px;color:var(--muted);font-family:var(--font-mono)">&hellip;</div>
+          </details>
         </div>`;
     }).join('');
+
+    const detectedOs = _detectTunnelOs();
+    const installCard = (label, cmds, prominent) => `
+      <div style="border:1px solid var(--border);border-radius:4px;padding:8px;margin-bottom:6px;background:var(--surface-1)${prominent ? '' : ';opacity:.85'}">
+        <div style="font-size:10px;color:var(--text);font-weight:600;margin-bottom:6px">${escapeHtml(label)}${prominent ? ' <span style="color:var(--muted);font-weight:400">(detected)</span>' : ''}</div>
+        ${[['uv', 'powers uvx plugins', cmds.uv], ['Node.js', 'powers npx plugins', cmds.node]].map(([dep, note, command]) => `
+          <div style="margin-bottom:6px">
+            <div style="font-size:9px;color:var(--muted);margin-bottom:3px">${escapeHtml(dep)} <span style="opacity:.8">— ${escapeHtml(note)}</span></div>
+            <div style="display:flex;gap:6px;align-items:center">
+              <code style="flex:1;box-sizing:border-box;background:var(--surface-2);border:1px solid var(--border);border-radius:4px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:4px 7px;overflow-x:auto;white-space:nowrap">${escapeHtml(command)}</code>
+              <button class="secondary tp-copy" data-copy="${escapeHtml(command)}" style="padding:2px 8px;font-size:10px;flex-shrink:0">Copy</button>
+            </div>
+          </div>`).join('')}
+      </div>`;
+
+    const otherOsCards = Object.keys(_TUNNEL_INSTALL_CMDS)
+      .filter((k) => k !== detectedOs)
+      .map((k) => installCard(_TUNNEL_INSTALL_CMDS[k].label, _TUNNEL_INSTALL_CMDS[k], false))
+      .join('');
+
+    const installSection = `
+      <details style="margin-top:8px;border:1px solid var(--border);border-radius:4px;background:var(--surface-2);padding:0">
+        <summary style="cursor:pointer;list-style:none;padding:6px 8px;font-size:10px;font-weight:600;color:var(--accent)">&#9656; Install dependencies</summary>
+        <div style="padding:0 8px 8px">
+          <div style="font-size:10px;color:var(--muted);margin-bottom:8px;line-height:1.5">
+            Tunnel plugins launch via <code>uvx</code> (uv) and <code>npx</code> (Node.js). Install whichever a plugin's command needs.
+          </div>
+          ${installCard(_TUNNEL_INSTALL_CMDS[detectedOs].label, _TUNNEL_INSTALL_CMDS[detectedOs], true)}
+          <details style="margin-top:2px">
+            <summary style="cursor:pointer;list-style:none;font-size:10px;color:var(--muted)">&#9656; other platforms</summary>
+            <div style="margin-top:6px">${otherOsCards}</div>
+          </details>
+        </div>
+      </details>`;
+
+    const curatedRows = _CURATED_TUNNEL_PLUGINS.map((c) => `
+      <div style="border:1px solid var(--border);border-radius:4px;padding:8px;margin-bottom:6px;background:var(--surface-1)">
+        <div style="display:flex;align-items:baseline;gap:6px;flex-wrap:wrap;margin-bottom:4px">
+          <span style="font-size:11px;color:var(--text);font-weight:600">${escapeHtml(c.name)}</span>
+          <a href="${escapeHtml(c.docs)}" target="_blank" rel="noopener" style="font-size:9px;color:var(--accent);text-decoration:none">docs &#8599;</a>
+        </div>
+        <div style="font-size:10px;color:var(--muted);margin-bottom:5px">${escapeHtml(c.description)}</div>
+        <div style="display:flex;gap:6px;align-items:center">
+          <code style="flex:1;box-sizing:border-box;background:var(--surface-2);border:1px solid var(--border);border-radius:4px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:4px 7px;overflow-x:auto;white-space:nowrap">${escapeHtml(c.command)}</code>
+          <button class="secondary tp-copy" data-copy="${escapeHtml(c.command)}" style="padding:2px 8px;font-size:10px;flex-shrink:0">Copy command</button>
+        </div>
+      </div>`).join('');
+
+    const browseSection = `
+      <details style="margin-top:8px;border:1px solid var(--border);border-radius:4px;background:var(--surface-2);padding:0">
+        <summary style="cursor:pointer;list-style:none;padding:6px 8px;font-size:10px;font-weight:600;color:var(--accent)">&#9656; Browse plugins</summary>
+        <div style="padding:0 8px 8px">
+          <div style="font-size:10px;color:var(--muted);margin-bottom:8px;line-height:1.5">
+            Well-known MCP servers. Copy a command and paste it into a slot above to swap that slot's launcher.
+          </div>
+          ${curatedRows}
+        </div>
+      </details>`;
+
+    // Custom plugins subsection. Renders the user-defined plugins list (each with
+    // a Remove button) + an add form (name / command / port). LOCAL-ONLY: each
+    // runs as a local mcp-proxy and is written into the local .mcp.json — they
+    // never appear in the claude.ai connector. The list lives in `customPlugins`
+    // and is re-rendered into #tp-custom-list-${projectId} on every Add/Remove.
+    const renderCustomList = () => {
+      const listEl = document.getElementById(`tp-custom-list-${projectId}`);
+      if (!listEl) return;
+      if (!customPlugins.length) {
+        listEl.innerHTML = '<div style="color:var(--muted);font-size:10px">No custom plugins yet.</div>';
+        return;
+      }
+      listEl.innerHTML = customPlugins.map((c, i) => `
+        <div style="border:1px solid var(--border);border-radius:4px;padding:8px;margin-bottom:6px;display:flex;gap:8px;align-items:center">
+          <div style="flex:1;min-width:0">
+            <div style="font-size:11px;color:var(--text);font-weight:600">${escapeHtml(c.name)}
+              <span style="font-size:9px;color:var(--muted);font-weight:400">:${escapeHtml(String(c.port))}</span></div>
+            <div style="font-size:10px;color:var(--muted);font-family:var(--font-mono);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escapeHtml(c.command)}</div>
+          </div>
+          <button class="secondary tp-custom-remove" data-idx="${i}" style="padding:2px 8px;font-size:10px;flex-shrink:0">Remove</button>
+        </div>`).join('');
+      listEl.querySelectorAll('.tp-custom-remove').forEach((btn) => {
+        btn.addEventListener('click', () => {
+          const idx = parseInt(btn.dataset.idx, 10);
+          if (Number.isInteger(idx)) { customPlugins.splice(idx, 1); renderCustomList(); }
+        });
+      });
+    };
+
+    const customSection = `
+      <details style="margin-top:8px;border:1px solid var(--border);border-radius:4px;background:var(--surface-2);padding:0">
+        <summary style="cursor:pointer;list-style:none;padding:6px 8px;font-size:10px;font-weight:600;color:var(--accent)">&#9656; Custom plugins</summary>
+        <div style="padding:0 8px 8px">
+          <div style="font-size:10px;color:var(--muted);margin-bottom:8px;line-height:1.5">
+            Add your own MCP server. Runs locally as <code>http://127.0.0.1:&lt;port&gt;</code> and is written
+            into this machine's <code>.mcp.json</code> for a co-located Cursor / Claude Code session.
+            Local-only — it does not appear in the claude.ai connector. Use a port outside 8808–8813.
+          </div>
+          <div id="tp-custom-list-${projectId}" style="margin-bottom:8px"></div>
+          <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
+            <input type="text" id="tp-custom-name-${projectId}" placeholder="name (e.g. fetch)"
+              style="width:120px;box-sizing:border-box;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:5px 7px;outline:none">
+            <input type="text" id="tp-custom-command-${projectId}" placeholder="command (e.g. uvx mcp-server-fetch)"
+              style="flex:1;min-width:160px;box-sizing:border-box;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:5px 7px;outline:none">
+            <input type="number" id="tp-custom-port-${projectId}" placeholder="port"
+              style="width:74px;box-sizing:border-box;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:5px 7px;outline:none">
+            <button class="secondary admin-only" id="tp-custom-add-${projectId}" style="padding:2px 10px;font-size:10px;flex-shrink:0">Add</button>
+          </div>
+        </div>
+      </details>`;
 
     section.innerHTML = `
       <details class="meridian-disclosure" open style="border:1px solid var(--border);border-radius:6px;background:var(--surface-2);padding:0">
@@ -1225,6 +1415,9 @@ async function loadTunnelPluginsSection(projectId) {
         <button class="primary admin-only" id="tp-save-${projectId}" style="padding:2px 10px;font-size:10px">Save</button>
       </div>
       <div id="tp-status-${projectId}" style="font-size:10px;color:var(--muted);margin-top:4px;text-align:right"></div>
+      ${customSection}
+      ${installSection}
+      ${browseSection}
       </div>
       </details>`;
 
@@ -1245,6 +1438,15 @@ async function loadTunnelPluginsSection(projectId) {
         if (Number.isInteger(portVal) && portVal !== _TUNNEL_DEFAULT_PORTS[slot]) entry.port = portVal;
         cfg.push(entry);
       });
+      // Merge in the user-defined custom plugins (name + command + port + enabled).
+      // The server keeps non-built-in names, so these round-trip back as data.custom.
+      customPlugins.forEach((c) => {
+        const name = (c.name || '').trim();
+        const command = (c.command || '').trim();
+        const port = parseInt(c.port, 10);
+        if (!name || !command || !Number.isInteger(port)) return;
+        cfg.push({ name, command, port, enabled: c.enabled !== false });
+      });
       return cfg;
     };
 
@@ -1257,13 +1459,117 @@ async function loadTunnelPluginsSection(projectId) {
     };
 
     document.getElementById(`tp-reset-${projectId}`).onclick = async () => {
-      if (!confirm('Clear all tunnel plugin overrides and return to built-in defaults?')) return;
+      if (!confirm('Reset tunnel plugins?\n\nThis clears ALL command and port overrides for every slot and returns them to Meridian\'s built-in defaults. This cannot be undone.')) return;
       try {
         await api('/tunnel/plugins', { method: 'PUT', body: JSON.stringify({ config: [] }) });
         toast('Reset to defaults');
         loadTunnelPluginsSection(projectId);
       } catch (e) { toast('Reset failed: ' + e.message, true); }
     };
+
+    // Custom plugins: initial render + Add-form wiring.
+    renderCustomList();
+    const _addCustom = () => {
+      const nameEl = document.getElementById(`tp-custom-name-${projectId}`);
+      const cmdEl = document.getElementById(`tp-custom-command-${projectId}`);
+      const portEl = document.getElementById(`tp-custom-port-${projectId}`);
+      const name = (nameEl && nameEl.value || '').trim();
+      const command = (cmdEl && cmdEl.value || '').trim();
+      const port = parseInt(portEl && portEl.value, 10);
+      if (!name || !command || !Number.isInteger(port)) {
+        toast('Custom plugin needs a name, command, and port', true);
+        return;
+      }
+      if (port < 1024 || port > 65535 || [8808, 8809, 8810, 8811, 8812, 8813].includes(port)) {
+        toast('Pick a port in 1024–65535 and outside 8808–8813', true);
+        return;
+      }
+      if (customPlugins.some((c) => c.name === name)) {
+        toast(`A custom plugin named "${name}" already exists`, true);
+        return;
+      }
+      customPlugins.push({ name, command, port, enabled: true });
+      if (nameEl) nameEl.value = '';
+      if (cmdEl) cmdEl.value = '';
+      if (portEl) portEl.value = '';
+      renderCustomList();
+    };
+    const _addBtn = document.getElementById(`tp-custom-add-${projectId}`);
+    if (_addBtn) _addBtn.addEventListener('click', _addCustom);
+
+    // Copy buttons (install commands + curated plugin commands).
+    section.querySelectorAll('.tp-copy').forEach((btn) => {
+      btn.addEventListener('click', async () => {
+        const ok = await _tunnelCopyToClipboard(btn.dataset.copy || '');
+        if (ok) {
+          const prev = btn.textContent;
+          btn.textContent = 'Copied';
+          setTimeout(() => { btn.textContent = prev; }, 1200);
+        } else {
+          toast('Copy failed — select and copy manually', true);
+        }
+      });
+    });
+
+    // Per-plugin live tools dropdown. Lazy-load the slot's tool manifest the
+    // first time its <details> is expanded; reuse one /me lookup across slots.
+    let _tenantIdPromise = null;
+    const _getTenantId = () => {
+      if (!_tenantIdPromise) {
+        _tenantIdPromise = api('/me').then((m) => (m && m.tenant_id) || null).catch(() => null);
+      }
+      return _tenantIdPromise;
+    };
+
+    section.querySelectorAll('.tp-tools').forEach((det) => {
+      det.addEventListener('toggle', async () => {
+        if (!det.open || det.dataset.loaded === '1') return;
+        det.dataset.loaded = '1';
+        const slot = det.dataset.slot;
+        const bodyEl = det.querySelector('.tp-tools-body');
+        if (!bodyEl) return;
+        // Not active? Don't even bother hitting the proxy.
+        if (!active[slot]) {
+          bodyEl.innerHTML = '<span style="color:var(--muted)">not connected — start the tunnel</span>';
+          det.dataset.loaded = '0';
+          return;
+        }
+        bodyEl.textContent = 'loading…';
+        try {
+          const tenantId = await _getTenantId();
+          if (!tenantId) throw new Error('no tenant');
+          const r = await fetch(`/${slot}/mcp/${tenantId}/mcp`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'Accept': 'application/json, text/event-stream' },
+            body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} }),
+          });
+          if (!r.ok) throw new Error(`HTTP ${r.status}`);
+          const text = await r.text();
+          let parsed = null;
+          if (text.trim().startsWith('{')) {
+            parsed = JSON.parse(text);
+          } else {
+            for (const line of text.split('\n')) {
+              if (line.startsWith('data:')) {
+                try { parsed = JSON.parse(line.slice(5).trim()); } catch (_) {}
+              }
+            }
+          }
+          if (!parsed) throw new Error('empty response');
+          if (parsed.error) throw new Error(parsed.error.message || String(parsed.error));
+          const tools = (parsed.result && parsed.result.tools) || [];
+          if (!tools.length) {
+            bodyEl.innerHTML = '<span style="color:var(--muted)">no tools reported</span>';
+            return;
+          }
+          bodyEl.innerHTML = `<div style="color:var(--muted);margin-bottom:3px">${tools.length} tool${tools.length !== 1 ? 's' : ''}</div>` +
+            tools.map((t) => `<div style="color:var(--text)">${escapeHtml(t && t.name || String(t))}</div>`).join('');
+        } catch (e) {
+          bodyEl.innerHTML = `<span style="color:var(--muted)">not connected — start the tunnel</span>`;
+          det.dataset.loaded = '0';
+        }
+      });
+    });
   } catch (e) {
     section.innerHTML = `<div class="empty" style="color:var(--error)">Failed to load tunnel plugins: ${escapeHtml(e.message)}</div>`;
   }
@@ -3323,6 +3629,8 @@ function buildTabBody(project) {
 
       <button class="vtab-btn" data-vtab="settings" title="Notification Settings">⚙</button>
 
+      <button class="vtab-btn" data-vtab="codeintel" title="Code Intel — codebase index &amp; architecture" id="vtab-codeintel-${project.id}" style="display:none">🔍</button>
+
     </div>
 
     <div class="vtab-drawer open" id="drawer-${project.id}">
@@ -4047,6 +4355,22 @@ function buildTabBody(project) {
 
       </div>
 
+      <div class="drawer-panel" id="drawer-codeintel-${project.id}">
+
+        <div class="drawer-header">
+
+          <span>CODE INTEL · ${escapeHtml(project.name)}</span>
+
+        </div>
+
+        <div style="flex:1;overflow-y:auto;padding:14px" id="codeintel-body-${project.id}">
+
+          <div class="empty" style="color:var(--muted)">loading…</div>
+
+        </div>
+
+      </div>
+
     </div>
 
     <section class="claude-handoff-panel">
@@ -4289,6 +4613,8 @@ function buildTabBody(project) {
 
         if (vtab === 'settings') loadSettingsTab(project.id);
 
+        if (vtab === 'codeintel') loadCodeIntelTab(project.id);
+
       };
 
     });
@@ -4301,6 +4627,9 @@ function buildTabBody(project) {
         if (savedBtn) savedBtn.click();
       }
     } catch(_) {}
+
+    // Show Code Intel tab only when tunnel:code is active
+    _initCodeIntelTabVisibility(project.id);
 
   }
 
@@ -6780,6 +7109,145 @@ async function loadDocsTab(projectId) {
 
 
 
+// Code Intel tab — show only when tunnel:code socket is live.
+// Called once per project panel after vtab strip is wired.
+async function _initCodeIntelTabVisibility(projectId) {
+  if (!window.MERIDIAN_HOSTED) return;
+  try {
+    const data = await api('/tunnel/plugins');
+    const btn = document.getElementById(`vtab-codeintel-${projectId}`);
+    if (!btn) return;
+    const isActive = !!(data && data.active && data.active.code);
+    btn.style.display = isActive ? '' : 'none';
+  } catch (_) {}
+}
+
+// Code-intel projects are keyed by a slug derived from the repo's root path:
+// drive-colon and path separators (\\ / :) collapse to single dashes, e.g.
+// C:\Users\13144\Documents\Meridian\repository -> C-Users-13144-Documents-Meridian-repository.
+// The index_status / get_architecture tools take this `project` slug, NOT a raw repo_path.
+function _repoPathToProject(repoPath) {
+  return String(repoPath || '').replace(/[\\/:]+/g, '-').replace(/^-+|-+$/g, '');
+}
+
+async function loadCodeIntelTab(projectId) {
+  const body = document.getElementById(`codeintel-body-${projectId}`);
+  if (!body) return;
+
+  body.innerHTML = '<div class="empty" style="color:var(--muted)">loading…</div>';
+
+  try {
+    const [pluginsData, meData, settingsData] = await Promise.all([
+      api('/tunnel/plugins'),
+      api('/me'),
+      loadProjectSettings(projectId),
+    ]);
+
+    if (!pluginsData?.active?.code) {
+      body.innerHTML = '<div class="empty" style="color:var(--muted)">Code intel tunnel is not active. Run <code>meridian --tunnel</code> to connect it.</div>';
+      return;
+    }
+
+    const tenantId = meData?.tenant_id;
+    if (!tenantId) {
+      body.innerHTML = '<div class="empty" style="color:var(--error)">Could not resolve tenant ID from /me.</div>';
+      return;
+    }
+
+    const codeBase = `/code/mcp/${tenantId}/mcp`;
+
+    async function _codeMcpCall(method, params) {
+      const r = await fetch(codeBase, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json', 'Accept': 'application/json, text/event-stream'},
+        body: JSON.stringify({jsonrpc: '2.0', id: 1, method, params: params || {}}),
+      });
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const text = await r.text();
+      let parsed = null;
+      if (text.trim().startsWith('{')) {
+        parsed = JSON.parse(text);
+      } else {
+        for (const line of text.split('\n')) {
+          if (line.startsWith('data:')) {
+            try { parsed = JSON.parse(line.slice(5).trim()); } catch (_) {}
+          }
+        }
+      }
+      if (!parsed) throw new Error('empty response from code MCP');
+      if (parsed.error) throw new Error(parsed.error.message || String(parsed.error));
+      return parsed.result;
+    }
+
+    // Verify live + count available tools
+    let toolCount = 0;
+    try {
+      const tlResult = await _codeMcpCall('tools/list', {});
+      toolCount = (tlResult?.tools || []).length;
+    } catch (_) {}
+
+    const execCfg = settingsData?.executor_config || {};
+    const repoPaths = Array.isArray(execCfg.repo_paths) ? execCfg.repo_paths : [];
+
+    let html = '';
+
+    // Live indicator
+    html += `<div style="display:flex;align-items:center;gap:8px;margin-bottom:14px">
+      <span style="width:8px;height:8px;border-radius:50%;background:#22c55e;display:inline-block;flex-shrink:0"></span>
+      <span style="font-size:11px;color:var(--text);font-weight:600">Code Intel Live</span>
+      ${toolCount ? `<span style="font-size:10px;color:var(--muted)">${toolCount} tool${toolCount !== 1 ? 's' : ''}</span>` : ''}
+    </div>`;
+
+    // Index status per repo path
+    html += `<div style="margin-bottom:16px"><div style="font-size:10px;color:var(--accent);text-transform:uppercase;letter-spacing:.06em;margin-bottom:8px;padding-bottom:4px;border-bottom:1px solid var(--border)">Index Status</div>`;
+    if (repoPaths.length) {
+      for (const rp of repoPaths) {
+        const cwd = typeof rp === 'string' ? rp : (rp.cwd || '');
+        const hostname = typeof rp === 'object' ? (rp.hostname || '') : '';
+        if (!cwd) continue;
+        try {
+          const result = await _codeMcpCall('tools/call', {name: 'index_status', arguments: {project: _repoPathToProject(cwd)}});
+          const text = (result?.content || []).map(c => c.text || '').join('').trim();
+          html += `<div style="margin-bottom:10px">
+            <div style="font-size:10px;color:var(--text);font-weight:600;margin-bottom:4px">${escapeHtml(cwd)}${hostname ? `<span style="color:var(--muted);font-weight:400"> · ${escapeHtml(hostname)}</span>` : ''}</div>
+            <pre style="font-size:10px;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;padding:8px;white-space:pre-wrap;word-break:break-all;color:var(--text);margin:0;line-height:1.5">${escapeHtml(text || '(no status returned)')}</pre>
+          </div>`;
+        } catch (e) {
+          html += `<div style="margin-bottom:10px">
+            <div style="font-size:10px;color:var(--text);font-weight:600;margin-bottom:4px">${escapeHtml(cwd)}</div>
+            <div style="font-size:10px;color:var(--error)">index_status failed: ${escapeHtml(String(e))}</div>
+          </div>`;
+        }
+      }
+    } else {
+      html += `<div style="font-size:10px;color:var(--muted)">No repo paths configured. Add them in Settings → Executor Config to see index status.</div>`;
+    }
+    html += '</div>';
+
+    // Architecture summary
+    html += `<div><div style="font-size:10px;color:var(--accent);text-transform:uppercase;letter-spacing:.06em;margin-bottom:8px;padding-bottom:4px;border-bottom:1px solid var(--border)">Architecture Summary</div>`;
+    try {
+      const archPath = repoPaths.length ? (typeof repoPaths[0] === 'string' ? repoPaths[0] : (repoPaths[0].cwd || '')) : '';
+      const archArgs = archPath ? {project: _repoPathToProject(archPath)} : {};
+      const archResult = await _codeMcpCall('tools/call', {name: 'get_architecture', arguments: archArgs});
+      const archText = (archResult?.content || []).map(c => c.text || '').join('').trim();
+      html += `<pre style="font-size:10px;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;padding:10px;white-space:pre-wrap;word-break:break-all;color:var(--text);margin:0;line-height:1.5">${escapeHtml(archText || '(no architecture returned)')}</pre>`;
+    } catch (e) {
+      html += `<div style="font-size:10px;color:var(--error)">get_architecture failed: ${escapeHtml(String(e))}</div>`;
+    }
+    html += `<div style="margin-top:8px;display:flex;gap:6px">
+      <button class="secondary" style="font-size:10px;padding:3px 10px" onclick="loadCodeIntelTab(${JSON.stringify(projectId)})">↺ Refresh</button>
+    </div></div>`;
+
+    body.innerHTML = html;
+
+  } catch (e) {
+    body.innerHTML = `<div style="color:var(--error)">Failed to load code intel: ${escapeHtml(String(e))}</div>`;
+  }
+}
+
+
+
 // Turn a bare ntfy topic name ("my-alerts") into a full URL. Leaves real URLs,
 
 // email addresses, and anything containing a slash untouched.
@@ -8879,6 +9347,20 @@ const _DECISION_CATEGORY_COLORS = {
 
 };
 
+// 366317e9 — decision priority badge colors + cycle order. Clicking the badge
+// cycles urgent → normal → low → urgent. urgent decisions sort to the top.
+const _DECISION_PRIORITY_COLORS = {
+
+  urgent: '#f87171',
+
+  normal: '#94a3b8',
+
+  low:    '#64748b',
+
+};
+
+const _DECISION_PRIORITY_ORDER = ['urgent', 'normal', 'low'];
+
 
 
 function renderConstitutionWarning(projectId) {
@@ -9375,6 +9857,12 @@ async function loadPinnedDecisions(projectId, { showArchived = false } = {}) {
 
       const color = _DECISION_CATEGORY_COLORS[cat] || _DECISION_CATEGORY_COLORS.TECHNICAL;
 
+      const prio = _DECISION_PRIORITY_ORDER.includes(d.priority) ? d.priority : 'normal';
+
+      const prioColor = _DECISION_PRIORITY_COLORS[prio] || _DECISION_PRIORITY_COLORS.normal;
+
+      const editCount = Array.isArray(d.edit_log) ? d.edit_log.length : 0;
+
       const dateStr = (d.created_at || '').slice(0, 10);
 
       return `<div data-decision-card="${escapeHtml(d.id)}" style="background:var(--surface-2);border:1px solid var(--border);border-left:4px solid ${color};border-radius:4px;padding:10px 12px;margin-bottom:8px">
@@ -9385,11 +9873,15 @@ async function loadPinnedDecisions(projectId, { showArchived = false } = {}) {
 
             <span class="decision-cat-tag" data-id="${escapeHtml(d.id)}" data-cat="${escapeHtml(cat)}" title="Click to change category" style="display:inline-block;background:${color}22;color:${color};font-size:9px;font-weight:700;letter-spacing:.5px;padding:2px 6px;border-radius:3px;flex-shrink:0;cursor:pointer">${escapeHtml(cat)} ▾</span>
 
+            <span class="decision-prio-tag" data-id="${escapeHtml(d.id)}" data-prio="${escapeHtml(prio)}" data-project="${escapeHtml(projectId)}" title="Click to change priority (urgent → normal → low)" style="display:inline-block;background:${prioColor}22;color:${prioColor};font-size:9px;font-weight:700;letter-spacing:.5px;padding:2px 6px;border-radius:3px;flex-shrink:0;cursor:pointer">${prio === 'urgent' ? '⚡ ' : ''}${escapeHtml(prio.toUpperCase())} ▾</span>
+
             <span class="decision-title-view" data-id="${escapeHtml(d.id)}" title="Click to edit title" style="color:var(--accent);font-weight:600;font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;cursor:pointer">${escapeHtml(d.title || '')}</span>
 
           </div>
 
           <div style="display:flex;gap:6px;flex-shrink:0;align-items:center">
+
+            ${editCount ? `<span class="decision-edit-count" data-id="${escapeHtml(d.id)}" title="${editCount} previous ${editCount === 1 ? 'revision' : 'revisions'} — body has been edited" style="color:var(--muted);font-size:9px;border:1px solid var(--border);border-radius:3px;padding:1px 5px;cursor:default">✎ ${editCount}</span>` : ''}
 
             <span style="color:var(--muted);font-size:10px">${escapeHtml(dateStr)}</span>
 
@@ -9550,6 +10042,39 @@ async function loadPinnedDecisions(projectId, { showArchived = false } = {}) {
     host.querySelectorAll('[data-supersede]').forEach(btn => {
 
       btn.onclick = () => supersedePinnedDecision(projectId, btn.dataset.supersede);
+
+    });
+
+    // 366317e9 — click the priority badge to cycle urgent → normal → low.
+    host.querySelectorAll('.decision-prio-tag').forEach(tag => {
+
+      tag.onclick = async () => {
+
+        const id = tag.dataset.id;
+
+        const pid = tag.dataset.project;
+
+        const cur = _DECISION_PRIORITY_ORDER.includes(tag.dataset.prio) ? tag.dataset.prio : 'normal';
+
+        const next = _DECISION_PRIORITY_ORDER[(_DECISION_PRIORITY_ORDER.indexOf(cur) + 1) % _DECISION_PRIORITY_ORDER.length];
+
+        try {
+
+          await api(`/projects/${pid}/decisions-pinned/${id}`, {
+
+            method: 'PATCH',
+
+            body: JSON.stringify({ priority: next }),
+
+          });
+
+          toast(`priority → ${next}`);
+
+          loadPinnedDecisions(pid);
+
+        } catch (e) { toast('priority change failed: ' + e.message, true); }
+
+      };
 
     });
 
@@ -11653,4 +12178,4 @@ function toggleExpand(id) {
 
 // --- ITEM 4 esbuild: re-expose top-level symbols as globals so inline
 // handlers and cross-file references keep resolving after IIFE bundling.
-try { Object.assign(window, { hideHostedAdminControls, ensureSignOutLink, ensureWorkspaceSwitcher, getActiveWorkspaceRole, showConnectDbModal, showLocalServerControls, _summarizeApiErrorText, _projectLoadErrorInfo, wireProjectLoadRetry, renderProjectLoadError, recordProjectLoadError, clearProjectLoadError, renderProjectLoadAlert, retryProjectSurface, syncSidebarActiveProject, autosizeGoalField, githubIconSvg, getConstitutionLimit, loadProjectSettings, saveProjectSettings, loadExecutorRulesSection, loadTunnelPluginsSection, _demoTourDone, _demoTourSavedStep, _demoTourSaveStep, _demoTourMarkDone, _demoTourClose, _tourActivateVtab, startDemoTour, resumeDemoTour, api, projectApi, loadServerConfig, _armAccountSwitchWatch, _refreshOnFocus, _checkAccountSwitch, _showAccountSwitchBanner, updateGitHubConnectionIndicator, _updateConnectionIndicator, checkGitStatus, _doRestart, loadConfig, loadProjects, openTab, closeTab, saveTabs, renderTabs, _makeTabEl, _openTabMenu, _setProjectIcon, _renameProject, _deleteProject, activateTab, buildTabBody, scheduleLiveRefresh, initLiveAutoRefresh, loadLiveTab, refreshLiveTab, wireSprintAddEnter, sprintAction, sprintArchive, filterBackburner, sprintPushPrompt, sprintFeedback, sprintFeedbackNote, sprintItemEdit, addSprintItemFromInput, cacheMostRecentSession, renderLiveSessions, endLiveSession, openTimelineForSession, renderLiveQueue, addLiveTask, cancelLiveTask, showCopyPreview, wireClaudeLaunchPanel, stampHandoffTs, populateSessionDropdown, loadTimeline, _renderTimelineLog, loadDocsTab, normalizeNotifyTarget, displayNotifyTarget, osExecutorHintBanner, showFailoverBannerIfNeeded, suggestNtfyTopic, loadHitlTab, loadTeamTab, updateLiveFeed, loadRecentSessions, loadMilestones, loadRecentRuns, loadQueue, renderSearchResults, wireQueueSectionToggles, refreshTab, refreshGoal, parseDecisionsBlob, renderConstitutionWarning, _hitlBadgeClick, initHitlPanel, setVtabCountBadge, refreshProjectCountBadges, refreshHitl, _hitlAnswer, _hitlDismiss, loadPinnedDecisions, supersedePinnedDecision, addPinnedDecision, consolidateDecisions, renderDecisionsTable, wireGoalPreviewToggle, saveGoal, saveNorthStar, saveSprint, _sessionPresenceDot, refreshSessions, refreshTasks, renderTasks, _loadMoreTasks, renderTaskRow, deleteTaskRow, renderHitlRow, wireHitlRow, appendToGoal, hitlReply, hitlExecute, connectWs, handleWsEvent, restoreTabs, _deleteSprintItem, _sprintAction, completeSprintItem, failSprintItem, toggleExpand, state }); } catch (e) {}
+try { Object.assign(window, { loadCodeIntelTab, _initCodeIntelTabVisibility, hideHostedAdminControls, ensureSignOutLink, ensureWorkspaceSwitcher, getActiveWorkspaceRole, showConnectDbModal, showLocalServerControls, _summarizeApiErrorText, _projectLoadErrorInfo, wireProjectLoadRetry, renderProjectLoadError, recordProjectLoadError, clearProjectLoadError, renderProjectLoadAlert, retryProjectSurface, syncSidebarActiveProject, autosizeGoalField, githubIconSvg, getConstitutionLimit, loadProjectSettings, saveProjectSettings, loadExecutorRulesSection, loadTunnelPluginsSection, _demoTourDone, _demoTourSavedStep, _demoTourSaveStep, _demoTourMarkDone, _demoTourClose, _tourActivateVtab, startDemoTour, resumeDemoTour, api, projectApi, loadServerConfig, _armAccountSwitchWatch, _refreshOnFocus, _checkAccountSwitch, _showAccountSwitchBanner, updateGitHubConnectionIndicator, _updateConnectionIndicator, checkGitStatus, _doRestart, loadConfig, loadProjects, openTab, closeTab, saveTabs, renderTabs, _makeTabEl, _openTabMenu, _setProjectIcon, _renameProject, _deleteProject, activateTab, buildTabBody, scheduleLiveRefresh, initLiveAutoRefresh, loadLiveTab, refreshLiveTab, wireSprintAddEnter, sprintAction, sprintArchive, filterBackburner, sprintPushPrompt, sprintFeedback, sprintFeedbackNote, sprintItemEdit, addSprintItemFromInput, cacheMostRecentSession, renderLiveSessions, endLiveSession, openTimelineForSession, renderLiveQueue, addLiveTask, cancelLiveTask, showCopyPreview, wireClaudeLaunchPanel, stampHandoffTs, populateSessionDropdown, loadTimeline, _renderTimelineLog, loadDocsTab, normalizeNotifyTarget, displayNotifyTarget, osExecutorHintBanner, showFailoverBannerIfNeeded, suggestNtfyTopic, loadHitlTab, loadTeamTab, updateLiveFeed, loadRecentSessions, loadMilestones, loadRecentRuns, loadQueue, renderSearchResults, wireQueueSectionToggles, refreshTab, refreshGoal, parseDecisionsBlob, renderConstitutionWarning, _hitlBadgeClick, initHitlPanel, setVtabCountBadge, refreshProjectCountBadges, refreshHitl, _hitlAnswer, _hitlDismiss, loadPinnedDecisions, supersedePinnedDecision, addPinnedDecision, consolidateDecisions, renderDecisionsTable, wireGoalPreviewToggle, saveGoal, saveNorthStar, saveSprint, _sessionPresenceDot, refreshSessions, refreshTasks, renderTasks, _loadMoreTasks, renderTaskRow, deleteTaskRow, renderHitlRow, wireHitlRow, appendToGoal, hitlReply, hitlExecute, connectWs, handleWsEvent, restoreTabs, _deleteSprintItem, _sprintAction, completeSprintItem, failSprintItem, toggleExpand, state }); } catch (e) {}

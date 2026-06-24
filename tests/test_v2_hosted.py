@@ -224,11 +224,11 @@ def test_tunnel_plugins_get_returns_resolved_defaults(monkeypatch, tmp_path):
         assert r.status_code == 200
         body = r.json()
         assert [p["name"] for p in body["plugins"]] == [
-            "filesystem", "code-intel", "code-extractor", "powerpoint", "word"
+            "filesystem", "code-intel", "code-extractor", "powerpoint", "word", "desktop-commander"
         ]
         assert body["config"] == {}
         assert body["active"] == {
-            "fs": False, "code": False, "extract": False, "ppt": False, "word": False
+            "fs": False, "code": False, "extract": False, "ppt": False, "word": False, "dc": False
         }
 
 

@@ -41,8 +41,20 @@ def build_mcp_server():
 
     from mcp.server import Server
     from mcp.server.stdio import stdio_server
-    from mcp.types import TextContent, Tool
+    from mcp.types import (
+        GetPromptResult,
+        Prompt,
+        PromptArgument,
+        PromptMessage,
+        TextContent,
+        Tool,
+    )
     import json
+
+    # Slash-command prompt templates — share the exact same registry + builders
+    # as the HTTP /mcp surface (meridian/mcp/handler.py) so both transports
+    # advertise identical prompts and bodies.
+    from . import handler as _handler
 
     server: Server = Server("meridian")
 
@@ -83,6 +95,57 @@ def build_mcp_server():
             state["data_dir"] = str(data_dir)
         return state["db"]
 
+    @server.list_prompts()
+    async def list_prompts() -> list[Prompt]:
+        """Advertise the slash-command prompt templates (shared with HTTP /mcp)."""
+        return [
+            Prompt(
+                name=p["name"],
+                description=p.get("description", ""),
+                arguments=[
+                    PromptArgument(
+                        name=a["name"],
+                        description=a.get("description", ""),
+                        required=bool(a.get("required", False)),
+                    )
+                    for a in p.get("arguments", [])
+                ],
+            )
+            for p in _handler._MCP_PROMPTS
+        ]
+
+    @server.get_prompt()
+    async def get_prompt(
+        name: str, arguments: dict[str, str] | None
+    ) -> GetPromptResult:
+        """Render one prompt. ``executor-goal`` pulls live pending sprint items.
+
+        Delegates to the same async builder the HTTP surface uses so the two
+        transports never drift. An unknown name raises ValueError, which the MCP
+        SDK surfaces to the client as an error (mirrors the -32602 JSON-RPC error
+        on the HTTP path).
+        """
+        db = await _ensure_db()
+        messages = await _handler._build_prompt_messages_async(
+            name, arguments or {}, db
+        )
+        description = next(
+            (p["description"] for p in _handler._MCP_PROMPTS if p["name"] == name),
+            "",
+        )
+        return GetPromptResult(
+            description=description,
+            messages=[
+                PromptMessage(
+                    role=m["role"],
+                    content=TextContent(
+                        type="text", text=m["content"]["text"]
+                    ),
+                )
+                for m in messages
+            ],
+        )
+
     @server.list_tools()
     async def list_tools() -> list[Tool]:
         """Advertise every Meridian tool to the MCP client."""
@@ -96,7 +159,20 @@ def build_mcp_server():
                 ),
                 inputSchema={
                     "type": "object",
-                    "properties": {"name": {"type": "string"}},
+                    "properties": {
+                        "name": {"type": "string"},
+                        "execution_mode": {
+                            "type": "string",
+                            "enum": ["autonomous", "interactive"],
+                            "description": (
+                                "Executor posture for sessions on this project. "
+                                "'autonomous' (default) claims and runs sprint "
+                                "items immediately without asking; 'interactive' "
+                                "asks for direction first. Editable later in "
+                                "dashboard Settings."
+                            ),
+                        },
+                    },
                     "required": ["name"],
                 },
             ),
@@ -115,13 +191,14 @@ def build_mcp_server():
                     "type": "object",
                     "properties": {
                         "project_id": {"type": "string"},
+                        "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
                         "session_name": {"type": "string"},
                         "human_id": {
                             "type": "string",
                             "description": "Optional human owner identifier.",
                         },
                     },
-                    "required": ["project_id", "session_name"],
+                    "required": ["session_name"],
                 },
             ),
             Tool(
@@ -136,8 +213,8 @@ def build_mcp_server():
                 ),
                 inputSchema={
                     "type": "object",
-                    "properties": {"project_id": {"type": "string"}},
-                    "required": ["project_id"],
+                    "properties": {"project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."}},
+                    "required": [],
                 },
             ),
             Tool(
@@ -154,6 +231,7 @@ def build_mcp_server():
                     "type": "object",
                     "properties": {
                         "project_id": {"type": "string"},
+                        "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
                         "content": {
                             "oneOf": [
                                 {"type": "object"},
@@ -163,7 +241,7 @@ def build_mcp_server():
                         "north_star": {"type": "string"},
                         "sprint": {"type": "string"},
                     },
-                    "required": ["project_id", "content"],
+                    "required": ["content"],
                 },
             ),
             Tool(
@@ -178,10 +256,11 @@ def build_mcp_server():
                     "type": "object",
                     "properties": {
                         "project_id": {"type": "string"},
+                        "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
                         "north_star": {"type": "string"},
                         "human_id": {"type": "string"},
                     },
-                    "required": ["project_id", "north_star", "human_id"],
+                    "required": ["north_star", "human_id"],
                 },
             ),
             Tool(
@@ -195,9 +274,10 @@ def build_mcp_server():
                     "type": "object",
                     "properties": {
                         "project_id": {"type": "string"},
+                        "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
                         "sprint": {"type": "string"},
                     },
-                    "required": ["project_id", "sprint"],
+                    "required": ["sprint"],
                 },
             ),
             Tool(
@@ -212,6 +292,7 @@ def build_mcp_server():
                     "type": "object",
                     "properties": {
                         "project_id": {"type": "string"},
+                        "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
                         "repo_path": {"type": "string", "description": "Absolute path to the repo root."},
                         "env_file": {"type": "string", "description": "Path to .env file for the executor."},
                         "test_cmd": {"type": "string", "description": "Command to run the test suite."},
@@ -220,7 +301,7 @@ def build_mcp_server():
                         "shell_type": {"type": "string", "description": "Shell to use: bash, powershell, cmd."},
                         "branch": {"type": "string", "description": "Default working branch."},
                     },
-                    "required": ["project_id"],
+                    "required": [],
                 },
             ),
             Tool(
@@ -228,7 +309,9 @@ def build_mcp_server():
                 description=(
                     "Claim exclusive edit rights on a file path for this session. "
                     "Returns {claimed: true} on success or {claimed: false, holder_session_id} "
-                    "when another session holds the lock. Locks auto-expire after 2 hours. "
+                    "when another session holds the lock. The response also carries a "
+                    "`code_notes` list of code-anchored project notes (kind='code') for this "
+                    "path — read them before editing. Locks auto-expire after 2 hours. "
                     "Always release_file() when done editing."
                 ),
                 inputSchema={
@@ -236,6 +319,7 @@ def build_mcp_server():
                     "properties": {
                         "session_id": {"type": "string"},
                         "file_path": {"type": "string", "description": "Repo-relative or absolute file path."},
+                        "symbol": {"type": "string", "description": "Optional symbol to scope surfaced code-anchored notes to."},
                     },
                     "required": ["session_id", "file_path"],
                 },
@@ -285,6 +369,7 @@ def build_mcp_server():
                     "properties": {
                         "session_id": {"type": "string"},
                         "project_id": {"type": "string"},
+                        "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
                         "description": {"type": "string"},
                         "status": {
                             "type": "string",
@@ -299,7 +384,6 @@ def build_mcp_server():
                     },
                     "required": [
                         "session_id",
-                        "project_id",
                         "description",
                     ],
                 },
@@ -314,9 +398,10 @@ def build_mcp_server():
                     "type": "object",
                     "properties": {
                         "project_id": {"type": "string"},
+                        "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
                         "limit": {"type": "integer", "default": 20},
                     },
-                    "required": ["project_id"],
+                    "required": [],
                 },
             ),
             Tool(
@@ -331,10 +416,11 @@ def build_mcp_server():
                     "type": "object",
                     "properties": {
                         "project_id": {"type": "string"},
+                        "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
                         "query": {"type": "string"},
                         "limit": {"type": "integer", "default": 5},
                     },
-                    "required": ["project_id", "query"],
+                    "required": ["query"],
                 },
             ),
             Tool(
@@ -351,6 +437,8 @@ def build_mcp_server():
             Tool(
                 name="generate_handoff",
                 description=(
+                    "EXECUTOR SESSIONS: MANDATORY - call at end of every session "
+                    "before disconnect. Never write markdown manually. "
                     "Generate a context handoff file. Call when context is "
                     "filling up or before ending a session. mode='full' "
                     "writes the complete L0/L1/L2 handoff. mode='delta' "
@@ -365,6 +453,7 @@ def build_mcp_server():
                     "type": "object",
                     "properties": {
                         "project_id": {"type": "string"},
+                        "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
                         "mode": {
                             "type": "string",
                             "enum": ["full", "delta", "planner", "starter"],
@@ -377,7 +466,7 @@ def build_mcp_server():
                             ),
                         },
                     },
-                    "required": ["project_id"],
+                    "required": [],
                 },
             ),
             Tool(
@@ -394,13 +483,14 @@ def build_mcp_server():
                     "type": "object",
                     "properties": {
                         "project_id": {"type": "string"},
+                        "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
                         "mode": {
                             "type": "string",
                             "enum": ["full", "chat"],
                             "default": "full",
                         },
                     },
-                    "required": ["project_id"],
+                    "required": [],
                 },
             ),
             Tool(
@@ -411,17 +501,24 @@ def build_mcp_server():
                     "earlier statements. The append-only set_decision log "
                     "captures every micro-decision; pin_decision holds the "
                     "live constitution. category: STRATEGIC, COMPETITIVE, "
-                    "TECHNICAL, TACTICAL, BUSINESS, PRODUCT, ARCHITECTURAL."
+                    "TECHNICAL, TACTICAL, BUSINESS, PRODUCT, ARCHITECTURAL. "
+                    "priority (urgent|normal|low, default normal) weights "
+                    "dashboard ordering + injected context."
                 ),
                 inputSchema={
                     "type": "object",
                     "properties": {
                         "project_id": {"type": "string"},
+                        "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
                         "title": {"type": "string"},
                         "body": {"type": "string"},
                         "category": {"type": "string"},
+                        "priority": {
+                            "type": "string",
+                            "enum": ["urgent", "normal", "low"],
+                        },
                     },
-                    "required": ["project_id", "title", "body"],
+                    "required": ["title", "body"],
                 },
             ),
             Tool(
@@ -430,7 +527,8 @@ def build_mcp_server():
                     "v2.4 — patch a pinned decision. Pass new_title + new_body "
                     "to atomically supersede (new active row created, old "
                     "marked superseded with back-link). Otherwise patches "
-                    "body/title/category/status in place."
+                    "body/title/category/status/priority in place. Editing the "
+                    "body appends the prior body to the append-only edit_log."
                 ),
                 inputSchema={
                     "type": "object",
@@ -441,6 +539,10 @@ def build_mcp_server():
                         "title": {"type": "string"},
                         "body": {"type": "string"},
                         "category": {"type": "string"},
+                        "priority": {
+                            "type": "string",
+                            "enum": ["urgent", "normal", "low"],
+                        },
                         "status": {"type": "string"},
                     },
                     "required": ["decision_id"],
@@ -449,17 +551,20 @@ def build_mcp_server():
             Tool(
                 name="get_pinned_decisions",
                 description=(
-                    "v2.4 — list pinned decisions for a project (active only "
-                    "by default, newest first). Pass include_superseded=true "
-                    "for the full history."
+                    "v2.4 — list pinned decisions for a project, highest "
+                    "priority first (urgent → normal → low, then newest). "
+                    "Active only by default; pass include_superseded=true for "
+                    "the full history. Each row includes its priority and a "
+                    "parsed edit_log array of prior bodies ({body, ts})."
                 ),
                 inputSchema={
                     "type": "object",
                     "properties": {
                         "project_id": {"type": "string"},
+                        "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
                         "include_superseded": {"type": "boolean"},
                     },
-                    "required": ["project_id"],
+                    "required": [],
                 },
             ),
             Tool(
@@ -475,6 +580,7 @@ def build_mcp_server():
                     "type": "object",
                     "properties": {
                         "project_id": {"type": "string"},
+                        "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
                         "question": {"type": "string"},
                         "session_id": {"type": "string"},
                         "context": {"type": "string"},
@@ -485,7 +591,7 @@ def build_mcp_server():
                         },
                         "assigned_to": {"type": "string"},
                     },
-                    "required": ["project_id", "question"],
+                    "required": ["question"],
                 },
             ),
             Tool(
@@ -513,6 +619,7 @@ def build_mcp_server():
                     "type": "object",
                     "properties": {
                         "project_id": {"type": "string"},
+                        "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
                         "status": {
                             "type": "string",
                             "description": "Filter: 'pending' (default), 'answered', 'dismissed', or 'all'.",
@@ -522,7 +629,7 @@ def build_mcp_server():
                             "description": "Max results, default 50.",
                         },
                     },
-                    "required": ["project_id"],
+                    "required": [],
                 },
             ),
             Tool(
@@ -574,6 +681,7 @@ def build_mcp_server():
                     "type": "object",
                     "properties": {
                         "project_id": {"type": "string"},
+                        "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
                         "file": {
                             "type": "string",
                             "description": "CLAUDE.md | AGENTS.md",
@@ -589,7 +697,7 @@ def build_mcp_server():
                             "enum": ["normal", "high", "blocking"],
                         },
                     },
-                    "required": ["project_id", "file", "anchor", "content"],
+                    "required": ["file", "anchor", "content"],
                 },
             ),
             Tool(
@@ -603,12 +711,13 @@ def build_mcp_server():
                     "type": "object",
                     "properties": {
                         "project_id": {"type": "string"},
+                        "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
                         "status": {
                             "type": "string",
                             "description": "Filter: 'active' (default) or 'all'.",
                         },
                     },
-                    "required": ["project_id"],
+                    "required": [],
                 },
             ),
             Tool(
@@ -617,7 +726,10 @@ def build_mcp_server():
                     "Add a per-project wiki note (setup, gotcha, howto, env, ...). "
                     "Free-form title/body; comma-separated tags optional. Optional kind "
                     "(wiki=gotcha/rule/howto, insight=strategic/product analysis, "
-                    "reference=external/one-off docs) controls how the dashboard renders it. "
+                    "reference=external/one-off docs, code=warning/context anchored to a file) "
+                    "controls how the dashboard renders it. For a code anchor pass kind='code' "
+                    "plus file_path (and optional symbol): the note is surfaced automatically "
+                    "when a session calls claim_file/get_file_claims for that path. "
                     "Tag a note 'roadmap' AND pass a committable category (TECHNICAL/ARCHITECTURAL/PRODUCT) "
                     "to also append it to ROADMAP.md's roadmap-notes anchor."
                 ),
@@ -625,12 +737,13 @@ def build_mcp_server():
                     "type": "object",
                     "properties": {
                         "project_id": {"type": "string"},
+                        "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
                         "title": {"type": "string"},
                         "body": {"type": "string"},
                         "tags": {"type": "string"},
                         "kind": {
                             "type": "string",
-                            "enum": ["wiki", "insight", "reference"],
+                            "enum": ["wiki", "insight", "reference", "code", "document"],
                             "description": "Note taxonomy for dashboard rendering.",
                         },
                         "priority": {
@@ -638,27 +751,126 @@ def build_mcp_server():
                             "enum": ["high", "normal", "low"],
                             "description": "high-priority notes surface first in generate_handoff and planner context.",
                         },
+                        "file_path": {
+                            "type": "string",
+                            "description": "Code anchor (kind='code'): path this note warns about; surfaced at claim_file/get_file_claims for the same path.",
+                        },
+                        "symbol": {
+                            "type": "string",
+                            "description": "Optional symbol (class/function/method) to scope the code anchor to. File-level anchors surface for any symbol.",
+                        },
+                        "source": {
+                            "type": "string",
+                            "description": "Provenance: a URL or file path this note was ingested from (used by kind='document').",
+                        },
                         "category": {
                             "type": "string",
                             "description": "Required when tags includes 'roadmap'. E.g. TECHNICAL, ARCHITECTURAL, PRODUCT.",
                         },
                     },
-                    "required": ["project_id", "title", "body"],
+                    "required": ["title", "body"],
                 },
             ),
             Tool(
-                name="get_notes",
+                name="ingest_document",
                 description=(
-                    "v0.9 — list project notes (newest first). Optional "
-                    "``tag`` filter matches any comma-separated tag."
+                    "e3f150d0 — turn a Word/PDF/text document into a queryable "
+                    "kind='document' note with a source link (a report, thesis "
+                    "chapter, or spec doc becomes searchable project memory). "
+                    "Pass file_path OR content (one required): file_path is "
+                    "extracted SERVER-SIDE, STDLIB ONLY (.txt/.md/.markdown and "
+                    "source files read directly; .docx unzipped + paragraphs "
+                    "extracted, no python-docx, no new deps). For .pdf or any "
+                    "type Meridian can't parse server-side, extract the text with "
+                    "your OWN tools and pass it as content (passing a .pdf "
+                    "file_path returns an error telling you to do this). title "
+                    "defaults to the file's basename; source defaults to "
+                    "file_path. The stored body is capped (truncated with a "
+                    "'…[truncated]' marker if very long; the kept prefix stays "
+                    "searchable). Meridian never summarizes — pass a summary as "
+                    "content if you want one stored. Returns the created note "
+                    "(id, slug, title, source)."
                 ),
                 inputSchema={
                     "type": "object",
                     "properties": {
                         "project_id": {"type": "string"},
-                        "tag": {"type": "string"},
+                        "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+                        "file_path": {
+                            "type": "string",
+                            "description": "Path to a .txt/.md/.docx file to extract server-side (stdlib only). For .pdf or other types, pass pre-extracted text as 'content' instead.",
+                        },
+                        "content": {
+                            "type": "string",
+                            "description": "Pre-extracted document text. Use for PDFs and any type Meridian can't parse server-side. Takes precedence over file_path.",
+                        },
+                        "title": {
+                            "type": "string",
+                            "description": "Note title. Defaults to the file's basename.",
+                        },
+                        "source": {
+                            "type": "string",
+                            "description": "Provenance URL/path stored on the note. Defaults to file_path.",
+                        },
+                        "tags": {
+                            "type": "string",
+                            "description": "Comma-separated tags.",
+                        },
                     },
-                    "required": ["project_id"],
+                    "required": [],
+                },
+            ),
+            Tool(
+                name="get_notes",
+                description=(
+                    "v0.9 — list project notes (newest first), LIGHTWEIGHT by "
+                    "default: each item is id/slug/title/tags/kind/priority/"
+                    "timestamps with NO body, so the list never overflows "
+                    "context. Pull model: scan the list, then read_note("
+                    "project_id, slug) for one note's full body. Optional "
+                    "``tag`` filter matches any comma-separated tag. Pass "
+                    "bodies=true only when you truly need every body inline. "
+                    "Pagination: pass limit (default 100, max 500) and/or "
+                    "cursor for a {notes, has_more, next_cursor} envelope, then "
+                    "re-call with cursor=next_cursor; omit both for the full list."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "project_id": {"type": "string"},
+                        "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+                        "tag": {"type": "string"},
+                        "bodies": {
+                            "type": "boolean",
+                            "description": "Default false. true returns full bodies inline (legacy); prefer read_note(slug).",
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "description": "Page size (default 100, clamped 1..500). Passing limit or cursor returns the {notes, has_more, next_cursor} envelope.",
+                        },
+                        "cursor": {
+                            "type": "integer",
+                            "description": "Offset cursor from a prior page's next_cursor. Passing it returns the {notes, has_more, next_cursor} envelope.",
+                        },
+                    },
+                    "required": [],
+                },
+            ),
+            Tool(
+                name="read_note",
+                description=(
+                    "5a5bba43 — fetch one project note's full body by its "
+                    "per-project slug (the ``slug`` field from get_notes). The "
+                    "pull half of the list→read model."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "project_id": {"type": "string"},
+                        "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+                        "slug": {"type": "string"},
+                    },
+                    "required": ["slug"],
                 },
             ),
             Tool(
@@ -732,6 +944,75 @@ def build_mcp_server():
                         "include_superseded": {"type": "boolean"},
                     },
                     "required": [],
+                },
+            ),
+            Tool(
+                name="add_workspace_sprint_item",
+                description=(
+                    "Add an item to the workspace personal backlog — a "
+                    "cross-project board NOT tied to any single project "
+                    "(thesis + Meridian + personal goals in one view). "
+                    "'group' is the cross-project bucket (e.g. 'thesis', "
+                    "'meridian', 'personal'). New items start as 'todo'."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "title": {"type": "string"},
+                        "group": {"type": "string"},
+                        "human_id": {"type": "string"},
+                    },
+                    "required": ["title"],
+                },
+            ),
+            Tool(
+                name="get_workspace_sprint_items",
+                description=(
+                    "List workspace personal-backlog items (grouped by "
+                    "'group', then position). Optional 'status' and 'group' "
+                    "filters."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "status": {"type": "string"},
+                        "group": {"type": "string"},
+                    },
+                    "required": [],
+                },
+            ),
+            Tool(
+                name="update_workspace_sprint_item",
+                description=(
+                    "Edit a workspace personal-backlog item: title, status, "
+                    "group, or human_id. Only the fields passed are changed; "
+                    "empty string clears group/human_id. done/skipped/failed "
+                    "stamps completed_at."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "item_id": {"type": "string"},
+                        "title": {"type": "string"},
+                        "status": {"type": "string"},
+                        "group": {"type": "string"},
+                        "human_id": {"type": "string"},
+                    },
+                    "required": ["item_id"],
+                },
+            ),
+            Tool(
+                name="complete_workspace_sprint_item",
+                description=(
+                    "Mark a workspace personal-backlog item done (stamps "
+                    "completed_at)."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "item_id": {"type": "string"},
+                    },
+                    "required": ["item_id"],
                 },
             ),
             Tool(
@@ -888,6 +1169,8 @@ def build_mcp_server():
             Tool(
                 name="add_sprint_item",
                 description=(
+                    "ALWAYS call get_sprint_items first to check for existing "
+                    "pending items before adding. "
                     "Append a todo item to the project's machine-trackable "
                     "sprint checklist (v1.1). Use this when you start work on "
                     "a new version so the next session sees what's in flight. "
@@ -895,12 +1178,16 @@ def build_mcp_server():
                     "'group'; attribute the item to a person with 'human_id'. "
                     "Use 'depends_on' to block this item until another item "
                     "finishes; 'failure_mode=stop' stops the chain if the "
-                    "parent fails. Returns the new item."
+                    "parent fails. Blocks near-duplicate titles (>=60% word "
+                    "overlap with an open pending/in_progress item) and returns "
+                    "the conflict instead of creating a duplicate; pass "
+                    "force=true to add anyway. Returns the new item."
                 ),
                 inputSchema={
                     "type": "object",
                     "properties": {
                         "project_id": {"type": "string"},
+                        "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
                         "version": {"type": "string"},
                         "title": {"type": "string"},
                         "group": {
@@ -928,8 +1215,12 @@ def build_mcp_server():
                             "enum": ["task", "milestone", "human"],
                             "description": "'milestone' renders as a timeline marker; 'human' marks a task for a human (hidden from executor sessions). Default: 'task'.",
                         },
+                        "force": {
+                            "type": "boolean",
+                            "description": "Override the duplicate guard and add the item even if its title closely matches an existing open item. Default: false.",
+                        },
                     },
-                    "required": ["project_id", "version", "title"],
+                    "required": ["version", "title"],
                 },
             ),
             Tool(
@@ -945,6 +1236,7 @@ def build_mcp_server():
                     "type": "object",
                     "properties": {
                         "project_id": {"type": "string"},
+                        "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
                         "item_id": {"type": "string"},
                         "title": {"type": "string", "description": "New title."},
                         "version": {
@@ -964,7 +1256,7 @@ def build_mcp_server():
                             "description": "Objective name to group the item under (item_group); empty string clears it.",
                         },
                     },
-                    "required": ["project_id", "item_id"],
+                    "required": ["item_id"],
                 },
             ),
             Tool(
@@ -978,10 +1270,11 @@ def build_mcp_server():
                     "type": "object",
                     "properties": {
                         "project_id": {"type": "string"},
+                        "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
                         "item_id": {"type": "string"},
                         "task_id": {"type": "string"},
                     },
-                    "required": ["project_id", "item_id"],
+                    "required": ["item_id"],
                 },
             ),
             Tool(
@@ -1053,6 +1346,7 @@ def build_mcp_server():
                     "type": "object",
                     "properties": {
                         "project_id": {"type": "string"},
+                        "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
                         "status": {
                             "type": "string",
                             "enum": [
@@ -1065,7 +1359,7 @@ def build_mcp_server():
                             "description": "Include items with milestone_type='human'. Default: true. Pass false to hide human tasks (used by executor sessions).",
                         },
                     },
-                    "required": ["project_id"],
+                    "required": [],
                 },
             ),
             Tool(
@@ -1084,6 +1378,7 @@ def build_mcp_server():
                     "type": "object",
                     "properties": {
                         "project_id": {"type": "string"},
+                        "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
                         "session_name": {"type": "string"},
                         "human_id": {
                             "type": "string",
@@ -1099,8 +1394,17 @@ def build_mcp_server():
                             "enum": ["executor"],
                             "description": "Pass 'executor' to inject executor_config and credentials guidance.",
                         },
+                        "version": {
+                            "type": "string",
+                            "description": (
+                                "Optional sprint-version bucket (e.g. 'v0.1.x') to "
+                                "scope this session to — sprint progress/items in the "
+                                "orientation and /goal filter to it. Omit to auto-infer "
+                                "the bucket with the most pending items."
+                            ),
+                        },
                     },
-                    "required": ["project_id", "session_name"],
+                    "required": ["session_name"],
                 },
             ),
             Tool(
@@ -1145,13 +1449,14 @@ def build_mcp_server():
                     "type": "object",
                     "properties": {
                         "project_id": {"type": "string"},
+                        "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
                         "role": {
                             "type": "string",
                             "enum": ["worker", "planner", "review"],
                             "description": "Context verbosity. worker=sprint+tasks only.",
                         },
                     },
-                    "required": ["project_id"],
+                    "required": [],
                 },
             ),
         ]
@@ -1175,7 +1480,8 @@ def build_mcp_server():
                     }
                 else:
                     result = await db_module.create_project(
-                        db, arguments["name"]
+                        db, arguments["name"],
+                        execution_mode=arguments.get("execution_mode"),
                     )
             elif name == "register_session":
                 result = await db_module.register_session(
@@ -1315,6 +1621,7 @@ def build_mcp_server():
                         db,
                         arguments["file_path"],
                         arguments["session_id"],
+                        symbol=arguments.get("symbol"),
                     )
                 except ValueError as exc:
                     result = {"error": str(exc)}
@@ -1387,7 +1694,7 @@ def build_mcp_server():
                 "list_hitl_requests", "answer_hitl", "dismiss_hitl",
                 "update_md_section",
                 "list_sessions",
-                "add_note", "get_notes", "delete_note",
+                "add_note", "ingest_document", "get_notes", "read_note", "delete_note",
                 "add_workspace_note", "get_workspace_notes",
                 "pin_workspace_decision", "get_workspace_decisions",
             ):
@@ -1433,6 +1740,8 @@ def build_mcp_server():
                 result = {"session_id": arguments["session_id"], "ok": ok}
             elif name == "start_session":
                 # 3689f680 — compact by default (full block via compact=False).
+                # a76cb7c0 — optional `version` scopes the session to a
+                # sprint-version bucket.
                 result = await _start_session_composite(
                     db,
                     arguments["project_id"],
@@ -1442,6 +1751,7 @@ def build_mcp_server():
                     client_type=arguments.get("client"),
                     role=arguments.get("role"),
                     compact=arguments.get("compact", True),
+                    version=arguments.get("version"),
                 )
             elif name == "list_projects":
                 result = await db_module.list_project_summaries(db)
@@ -1491,6 +1801,7 @@ def build_mcp_server():
                     depends_on=arguments.get("depends_on"),
                     failure_mode=arguments.get("failure_mode"),
                     milestone_type=arguments.get("milestone_type", "task"),
+                    force=bool(arguments.get("force", False)),
                 )
             elif name == "update_sprint_item":
                 item = await db_module.patch_sprint_item(

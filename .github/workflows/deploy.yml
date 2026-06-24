@@ -21,24 +21,33 @@ on:
         options:
           - 'no'
           - 'yes'
+      hotfix:
+        description: 'Set to "yes" to skip coverage + preview and deploy straight to prod (emergency only).'
+        required: false
+        default: 'no'
+        type: choice
+        options:
+          - 'no'
+          - 'yes'
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
-  # ─── 1. Tests ──────────────────────────────────────────────────────────────
+  # ─── 1. Tests (skipped entirely for hotfix) ────────────────────────────────
   test:
     runs-on: ubuntu-latest
+    if: inputs.hotfix != 'yes'
     steps:
       - uses: actions/checkout@v4
-      - uses: prefix-dev/setup-pixi@v0.8.1
+      - uses: prefix-dev/setup-pixi@v0.9.3
         with:
           pixi-version: latest
           cache: true
       - run: pixi install
       - name: Cache Playwright browsers
         id: playwright-cache
-        uses: actions/cache@v4
+        uses: actions/cache@v4.2.3
         with:
           path: ~/.cache/ms-playwright
           key: playwright-${{ runner.os }}-${{ hashFiles('pixi.lock') }}
@@ -47,21 +56,27 @@ jobs:
         if: steps.playwright-cache.outputs.cache-hit != 'true'
       - run: pixi run python -m playwright install chromium
         if: steps.playwright-cache.outputs.cache-hit == 'true'
-      - run: pixi run python -m pytest tests/ -n auto -q --tb=short --ignore=tests/test_demo_ux.py --cov=meridian --cov-config=.coveragerc --cov-report=term-missing --cov-fail-under=80
+      - name: Run tests (fast for hotfix, full with coverage otherwise)
+        run: |
+          if [ "${{ inputs.hotfix }}" = "yes" ]; then
+            pixi run python -m pytest tests/test_core.py tests/test_new_v25.py tests/test_hosted.py tests/test_security.py -n auto -q --tb=short
+          else
+            pixi run test-cov
+          fi
 
   playwright-tests:
     runs-on: ubuntu-latest
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4
-      - uses: prefix-dev/setup-pixi@v0.8.1
+      - uses: prefix-dev/setup-pixi@v0.9.3
         with:
           pixi-version: latest
           cache: true
       - run: pixi install
       - name: Cache Playwright browsers
         id: playwright-cache
-        uses: actions/cache@v4
+        uses: actions/cache@v4.2.3
         with:
           path: ~/.cache/ms-playwright
           key: playwright-${{ runner.os }}-${{ hashFiles('pixi.lock') }}
@@ -72,10 +87,10 @@ jobs:
         if: steps.playwright-cache.outputs.cache-hit == 'true'
       - run: pixi run python -m pytest tests/test_demo_ux.py -q --tb=short
 
-  # ─── 2. Preview deploy (dev branch only) ──────────────────────────────────
+  # ─── 2. Preview deploy (dev branch only, skip for hotfix) ────────────────
   deploy-preview:
     needs: test
-    if: github.ref == 'refs/heads/dev'
+    if: github.ref == 'refs/heads/dev' && inputs.hotfix != 'yes'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -85,22 +100,22 @@ jobs:
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN_PREVIEW }}
 
-  # ─── 3. Smoke tests against preview ───────────────────────────────────────
+  # ─── 3. Smoke tests against preview (skip for hotfix) ────────────────────
   smoke-preview:
     needs: deploy-preview
-    if: github.ref == 'refs/heads/dev'
+    if: github.ref == 'refs/heads/dev' && inputs.hotfix != 'yes'
     runs-on: ubuntu-latest
     steps:
       - name: Wait for preview to boot (retry /health up to 90s)
         run: |
           BASE="https://meridian-preview.fly.dev"
           echo "Waiting for /health..."
-          for i in $(seq 1 18); do
+          for i in $(seq 1 9); do
             STATUS=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" "$BASE/health" || echo "000")
             echo "Attempt $i: $STATUS"
             [ "$STATUS" = "200" ] && break
-            [ "$i" = "18" ] && (echo "FAIL: /health never returned 200" && exit 1)
-            sleep 5
+            [ "$i" = "9" ] && (echo "FAIL: /health never returned 200" && exit 1)
+            sleep 10
           done
 
       - name: Landing page loads
@@ -125,11 +140,12 @@ jobs:
 
   # ─── 4. Merge dev → main on operator-gated promotion ──────────────────────
   merge-to-main:
-    needs: smoke-preview
+    needs: [smoke-preview, test]
     if: >
       github.event_name == 'workflow_dispatch' &&
       inputs.promote == 'yes' &&
-      github.ref == 'refs/heads/dev'
+      github.ref == 'refs/heads/dev' &&
+      (inputs.hotfix == 'yes' || needs.smoke-preview.result == 'success')
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -156,13 +172,16 @@ jobs:
 
   # ─── 5. Production deploy ─────────────────────────────────────────────────
   deploy:
-    needs: test
+    needs: [test, merge-to-main]
     if: >
-      (github.ref == 'refs/heads/main' &&
-       github.event_name == 'push' &&
-       github.actor == 'github-actions[bot]') ||
-      github.event_name == 'workflow_dispatch' ||
-      startsWith(github.ref, 'refs/tags/v')
+      always() &&
+      (needs.test.result == 'success' || needs.test.result == 'skipped') &&
+      (needs.merge-to-main.result == 'success' || needs.merge-to-main.result == 'skipped') &&
+      ((github.ref == 'refs/heads/main' &&
+        github.event_name == 'push' &&
+        github.actor == 'github-actions[bot]') ||
+       github.event_name == 'workflow_dispatch' ||
+       startsWith(github.ref, 'refs/tags/v'))
     runs-on: ubuntu-latest
     outputs:
       deployed_version: ${{ steps.deploy.outputs.deployed_version }}
@@ -189,7 +208,7 @@ jobs:
       - name: Post-deploy smoke test
         id: smoke
         run: |
-          sleep 20
+          if [ "${{ inputs.hotfix }}" = "yes" ]; then sleep 5; else sleep 10; fi
           STATUS=$(curl -s -o /dev/null -w "%{http_code}" https://usemeridian.us/health)
           echo "Health: $STATUS"
           [ "$STATUS" = "200" ] || (echo "FAIL: prod /health returned $STATUS" && exit 1)
@@ -259,7 +278,7 @@ jobs:
         with:
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
-      - uses: prefix-dev/setup-pixi@v0.8.1
+      - uses: prefix-dev/setup-pixi@v0.9.3
         with:
           pixi-version: latest
           cache: true

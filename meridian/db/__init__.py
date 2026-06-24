@@ -16,6 +16,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import time
 import uuid
 from pathlib import Path
@@ -26,6 +27,26 @@ import aiosqlite
 _log = logging.getLogger(__name__)
 
 _UNSET = object()  # sentinel for "not passed" in optional keyword args
+
+# ecf69de8 — per-project executor posture. 'autonomous' (default): claim and run
+# pending sprint items immediately without asking for direction. 'interactive':
+# review the items and ask the human which to start first. Anything else falls
+# back to the default so a bad value never persists.
+EXECUTION_MODES = ("autonomous", "interactive")
+DEFAULT_EXECUTION_MODE = "autonomous"
+
+
+def normalize_execution_mode(mode: str | None) -> str:
+    """Coerce an execution_mode input to a valid value.
+
+    Returns the lowercased value when it's one of EXECUTION_MODES, otherwise the
+    default ('autonomous'). Never raises — callers can pass user input directly.
+    """
+    if isinstance(mode, str):
+        candidate = mode.strip().lower()
+        if candidate in EXECUTION_MODES:
+            return candidate
+    return DEFAULT_EXECUTION_MODE
 
 # ---------------------------------------------------------------------------
 # Transparent field encryption (Fernet, MERIDIAN_ENCRYPTION_KEY env var).
@@ -155,6 +176,8 @@ CREATE TABLE IF NOT EXISTS projects (
     hitl_auto_answer INTEGER NOT NULL DEFAULT 0,
     icon TEXT,
     agent_instructions TEXT,
+    execution_mode TEXT NOT NULL DEFAULT 'autonomous'
+        CHECK (execution_mode IN ('autonomous', 'interactive')),
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -180,6 +203,7 @@ CREATE TABLE IF NOT EXISTS sessions (
         CHECK (status IN ('active','idle','closed','archived')),
     last_seen TEXT NOT NULL DEFAULT (datetime('now')),
     checkpoint_data TEXT,
+    sprint_version TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -248,6 +272,8 @@ CREATE TABLE IF NOT EXISTS decisions_pinned (
     title TEXT NOT NULL,
     body TEXT NOT NULL,
     category TEXT NOT NULL DEFAULT 'TECHNICAL',
+    priority TEXT NOT NULL DEFAULT 'normal',
+    edit_log TEXT,
     status TEXT NOT NULL DEFAULT 'active'
         CHECK (status IN ('active','superseded')),
     superseded_by TEXT REFERENCES decisions_pinned(id),
@@ -265,6 +291,10 @@ CREATE TABLE IF NOT EXISTS project_notes (
     body TEXT NOT NULL,
     tags TEXT,
     note_kind TEXT,
+    slug TEXT,
+    file_path TEXT,
+    symbol TEXT,
+    source TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
@@ -547,6 +577,29 @@ CREATE INDEX IF NOT EXISTS idx_workspace_notes_created
 CREATE INDEX IF NOT EXISTS idx_workspace_decisions_status
     ON workspace_decisions(status, created_at DESC);
 
+-- workspace_sprint_items: a tenant-global personal backlog that is NOT tied to
+-- any single project, so a solo dev can track cross-project goals (thesis,
+-- Meridian, personal) in one board. Mirrors the useful subset of sprint_items
+-- but keyed by tenant_id instead of project_id; ``item_group`` is the
+-- cross-project bucket (e.g. 'thesis'/'meridian'/'personal'). ``position``
+-- orders items within a group. One workspace per DB, same isolation model as
+-- workspace_notes / workspace_decisions.
+CREATE TABLE IF NOT EXISTS workspace_sprint_items (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT,
+    title TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'todo'
+        CHECK (status IN ('todo','pending','in_progress','done','skipped','failed')),
+    item_group TEXT,
+    human_id TEXT,
+    position INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    completed_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_workspace_sprint_items_tenant
+    ON workspace_sprint_items(tenant_id, status);
+
 -- v3.4 — workspace-level settings: tenant-global defaults that every project
 -- session can read at startup (e.g. a default HITL auto-answer posture, a
 -- default sprint label). Singleton row (id='singleton') per workspace DB, same
@@ -709,6 +762,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_touches_files(db)
     await _migrate_active_worktrees(db)
     await _migrate_workspace_tenant_isolation(db)
+    await _migrate_workspace_sprint_board(db)
     await _migrate_registered_hostnames(db)
     await _migrate_queued_session(db)
     await _migrate_parallel_safety(db)
@@ -721,7 +775,13 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_tunnel_plugins(db)
     await _migrate_notes_priority(db)
     await _migrate_task_log_kind(db)
+    await _migrate_note_slug(db)
     await _migrate_oauth_refresh_tokens(db)
+    await _migrate_decision_priority_edit_log(db)
+    await _migrate_code_anchored_notes(db)
+    await _migrate_note_source(db)
+    await _migrate_session_sprint_version(db)
+    await _migrate_project_execution_mode(db)
     return db
 
 
@@ -731,22 +791,44 @@ async def create_project(
     db: aiosqlite.Connection,
     name: str,
     human_id: str | None = None,
+    execution_mode: str | None = None,
 ) -> dict[str, Any]:
     """Insert a project and return it as a dict. Raises if the name exists.
 
     ``human_id`` (when provided) is recorded as the project's
     ``creator_human_id``. The creator's id is the only one allowed to
     update the goal state once goal-ownership enforcement is active.
+
+    ``execution_mode`` (ecf69de8) sets the project's executor posture —
+    'autonomous' (default) or 'interactive'. Invalid values normalise to
+    'autonomous' so a bad input never persists.
     """
     pid = _new_id()
+    mode = normalize_execution_mode(execution_mode)
     await db.execute(
-        "INSERT INTO projects (id, name, creator_human_id) VALUES (?, ?, ?)",
-        (pid, name, human_id),
+        "INSERT INTO projects (id, name, creator_human_id, execution_mode) "
+        "VALUES (?, ?, ?, ?)",
+        (pid, name, human_id, mode),
     )
     await db.commit()
     project = await get_project(db, pid)
     assert project is not None
     return project
+
+
+async def set_project_execution_mode(
+    db: aiosqlite.Connection, project_id: str, mode: str
+) -> dict[str, Any] | None:
+    """Set the executor posture for a project. Invalid values normalise to
+    'autonomous'. Returns the updated project dict, or None if not found.
+    """
+    normalized = normalize_execution_mode(mode)
+    await db.execute(
+        "UPDATE projects SET execution_mode = ? WHERE id = ?",
+        (normalized, project_id),
+    )
+    await db.commit()
+    return await get_project(db, project_id)
 
 
 async def get_project(
@@ -856,7 +938,8 @@ async def get_project_settings(
     """Return the persisted settings for a project."""
     async with db.execute(
         "SELECT id, max_pinned_decisions, executor_config, hitl_auto_answer, "
-        "auto_worktrees, require_merge_approval, code_intel_enabled "
+        "auto_worktrees, require_merge_approval, code_intel_enabled, "
+        "execution_mode "
         "FROM projects WHERE id = ?",
         (project_id,),
     ) as cur:
@@ -880,6 +963,8 @@ async def get_project_settings(
         "require_merge_approval": int(data.get("require_merge_approval") if data.get("require_merge_approval") is not None else 1),
         # Sprint-2/3 — codebase-memory-mcp toggle.
         "code_intel_enabled": int(data.get("code_intel_enabled") or 0),
+        # ecf69de8 — executor posture: 'autonomous' (default) | 'interactive'.
+        "execution_mode": normalize_execution_mode(data.get("execution_mode")),
     }
 
 
@@ -893,6 +978,7 @@ async def update_project_settings(
     auto_worktrees: int | None = None,
     require_merge_approval: int | None = None,
     code_intel_enabled: int | None = None,
+    execution_mode: str | None = None,
     github_repo: str | None = _UNSET,
     github_branch: str | None = _UNSET,
 ) -> dict[str, Any] | None:
@@ -921,6 +1007,10 @@ async def update_project_settings(
     if code_intel_enabled is not None:
         updates.append("code_intel_enabled = ?")
         params.append(1 if code_intel_enabled else 0)
+    if execution_mode is not None:
+        # ecf69de8 — normalise to a valid posture so a bad value never persists.
+        updates.append("execution_mode = ?")
+        params.append(normalize_execution_mode(execution_mode))
     if github_repo is not _UNSET:
         updates.append("github_repo = ?")
         params.append(github_repo or None)
@@ -1431,6 +1521,7 @@ async def register_session(
     session_type: str = "human",
     agent_framework: str = "claude_code",
     client_type: str | None = None,
+    sprint_version: str | None = None,
 ) -> dict[str, Any]:
     """Create a session row in 'active' state.
 
@@ -1449,14 +1540,19 @@ async def register_session(
 
     ``client_type`` (v2.6) identifies the client app: claude-code, claude-desktop,
     cursor, or other. Optional — used for presence indicators in the dashboard.
+
+    ``sprint_version`` (a76cb7c0) scopes the session to one sprint-version
+    bucket. start_session passes the explicit or inferred version so later calls
+    can auto-filter sprint progress/items to it. NULL = unscoped (all versions),
+    the legacy behaviour.
     """
     if session_type not in {"human", "worker"}:
         raise ValueError(f"invalid session_type: {session_type!r}")
     sid = _new_id()
     await db.execute(
-        "INSERT INTO sessions (id, project_id, name, human_id, session_type, agent_framework, client_type) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (sid, project_id, name, human_id, session_type, agent_framework, client_type),
+        "INSERT INTO sessions (id, project_id, name, human_id, session_type, agent_framework, client_type, sprint_version) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (sid, project_id, name, human_id, session_type, agent_framework, client_type, sprint_version),
     )
     await db.commit()
     async with db.execute(
@@ -2524,6 +2620,42 @@ _ACTIVE_SPRINT_STATUSES = {
     "pending", "in_progress", "todo", "indeterminate", "provisional_complete",
 }
 
+# Statuses that make an existing item a *blocking* duplicate when a new item
+# with a near-identical title is added. Only open/active work counts: a title
+# that overlaps a finished item (done / skipped / failed / pushed) is allowed
+# through, since re-doing finished work is legitimate. ``todo`` is the DB
+# default for freshly-added items and is pending-equivalent here.
+_DUP_BLOCKING_SPRINT_STATUSES = {"pending", "todo", "in_progress"}
+
+# b0d42ef6 — fuzzy-duplicate threshold for add_sprint_item. Two titles are
+# treated as duplicates when their word-set overlap is >= 60%.
+_SPRINT_DUP_OVERLAP_THRESHOLD = 0.60
+
+
+def _title_word_set(title: str) -> set[str]:
+    """Tokenise a sprint-item title into a lowercased word set.
+
+    Splits on any run of non-alphanumeric characters and lowercases, so
+    "Add OAuth login!" and "add  oauth   LOGIN" both yield {add, oauth, login}.
+    Punctuation and surrounding whitespace are discarded.
+    """
+    return {w for w in re.split(r"[^0-9a-z]+", title.lower()) if w}
+
+
+def _title_word_overlap(a: set[str], b: set[str]) -> float:
+    """Word-set overlap of two pre-tokenised titles, in ``[0.0, 1.0]``.
+
+    Defined as ``|a ∩ b| / |smaller set|`` (the overlap coefficient). Dividing
+    by the smaller of the two word sets makes the metric symmetric and means a
+    short title that is fully contained in a longer one scores 1.0 — so
+    "Add OAuth" vs "Add OAuth login and refresh-token rotation" is flagged as a
+    duplicate even though the longer title has many extra words. Returns 0.0 if
+    either set is empty.
+    """
+    if not a or not b:
+        return 0.0
+    return len(a & b) / min(len(a), len(b))
+
 # ---------------------------------------------------------------------------
 # get_sprint_progress 10s cache — one get_sprint_items DB query serves all
 # parallel sessions polling between tasks. Keyed by project_id; busted on any
@@ -2566,6 +2698,7 @@ async def add_sprint_item(
     depends_on: str | None = None,
     failure_mode: str | None = None,
     milestone_type: str = "task",
+    force: bool = False,
 ) -> dict[str, Any]:
     """Append a new ``todo`` sprint item to a project's checklist.
 
@@ -2578,11 +2711,49 @@ async def add_sprint_item(
     this item to proceed; 'stop' blocks it.
     ``milestone_type`` is 'task' (default) or 'milestone' — milestones
     render as vertical timeline markers in the sprint swimlane.
+
+    Duplicate guard (b0d42ef6): unless ``force`` is True, the new ``title``
+    is compared (word-set overlap, see ``_title_word_overlap``) against every
+    open item in the project (status pending / todo / in_progress). If any
+    existing item meets the >= 60% overlap threshold the item is **not**
+    inserted and a structured error dict is returned instead::
+
+        {"error": "duplicate", "message": ..., "existing": {id, title,
+         status, overlap_pct}}
+
+    The caller can pass ``force=True`` to override the guard and insert
+    anyway. Finished items (done / skipped / failed / pushed) never block,
+    so legitimately re-doing past work is unaffected.
     """
     if failure_mode not in (None, "continue", "stop"):
         raise ValueError("failure_mode must be 'continue' or 'stop'")
     if milestone_type not in ("task", "milestone", "human"):
         raise ValueError("milestone_type must be 'task', 'milestone', or 'human'")
+    # b0d42ef6 — block near-duplicate titles against open items unless forced.
+    if not force:
+        _new_words = _title_word_set(title)
+        if _new_words:
+            for _ex in await get_sprint_items(db, project_id):
+                if _ex.get("status") not in _DUP_BLOCKING_SPRINT_STATUSES:
+                    continue
+                _overlap = _title_word_overlap(_new_words, _title_word_set(_ex.get("title", "")))
+                if _overlap >= _SPRINT_DUP_OVERLAP_THRESHOLD:
+                    _pct = round(_overlap * 100)
+                    return {
+                        "error": "duplicate",
+                        "message": (
+                            f"Sprint item not created: title is {_pct}% a word-match "
+                            f"for existing {_ex['status']} item '{_ex.get('title', '')[:120]}' "
+                            f"({_ex['id'][:8]}). Pass force=true to add it anyway, or update "
+                            f"the existing item instead."
+                        ),
+                        "existing": {
+                            "id": _ex["id"],
+                            "title": _ex.get("title", ""),
+                            "status": _ex["status"],
+                            "overlap_pct": _pct,
+                        },
+                    }
     iid = _new_id()
     await db.execute(
         "INSERT INTO sprint_items "
@@ -3038,12 +3209,67 @@ async def get_sprint_items_page(
     return items, total
 
 
+async def infer_active_sprint_version(
+    db: aiosqlite.Connection, project_id: str
+) -> str | None:
+    """a76cb7c0 — infer the sprint-version bucket with the most pending items.
+
+    Counts pending (status ``pending``/``todo``) sprint items per non-empty
+    ``version`` and returns the bucket with the most. Human-assigned items
+    (milestone_type='human') are excluded — executor scoping should track the
+    automatable backlog, not a person's task list. Ties break on the bucket whose
+    earliest pending item was added first (the older sprint), so scoping is
+    stable across calls rather than flapping between equally-sized buckets.
+
+    Returns ``None`` when there are no pending items (or none carry a version),
+    so a session over an empty/version-less board is left unscoped (no filter)
+    and behaves exactly as before.
+    """
+    counts: dict[str, int] = {}
+    first_seen: dict[str, str] = {}
+    for it in await get_sprint_items(db, project_id, include_human=False):
+        if it.get("status") not in ("pending", "todo"):
+            continue
+        version = it.get("version")
+        if not version:
+            continue
+        counts[version] = counts.get(version, 0) + 1
+        added = str(it.get("added_at") or "")
+        # Items arrive oldest-first, so the first add_at we see per bucket is
+        # its earliest pending item — record it once for stable tie-breaking.
+        first_seen.setdefault(version, added)
+    if not counts:
+        return None
+    # Most pending wins; ties go to the bucket whose earliest pending item is
+    # oldest (smallest added_at) for deterministic, non-flapping scoping.
+    return max(
+        counts,
+        key=lambda v: (counts[v], _NEG_TS(first_seen.get(v, ""))),
+    )
+
+
+def _NEG_TS(ts: str) -> tuple[int, str]:
+    """Sort key making an EARLIER timestamp rank HIGHER in a max() tie-break.
+
+    Empty timestamps sort last (rank lowest). Returns a tuple whose natural
+    ordering is the reverse of the string order, so ``max(...)`` prefers the
+    oldest item without needing a separate min pass.
+    """
+    if not ts:
+        return (0, "")
+    # 1 outranks 0 (non-empty beats empty); the inverted string makes an
+    # earlier ts compare greater than a later one under default tuple ordering.
+    inverted = "".join(chr(255 - min(ord(c), 255)) for c in ts)
+    return (1, inverted)
+
+
 async def get_sprint_items(
     db: aiosqlite.Connection,
     project_id: str,
     status: str | None = None,
     show_blocked: bool = True,
     include_human: bool = True,
+    version: str | None = None,
 ) -> list[dict[str, Any]]:
     """List sprint items for a project, oldest first.
 
@@ -3056,6 +3282,10 @@ async def get_sprint_items(
 
     ``include_human=False`` excludes items with milestone_type='human'
     (used for executor sessions that should not see human-assigned tasks).
+
+    ``version`` (a76cb7c0) filters to a single sprint-version bucket. ``None``
+    returns every version. Used by version-scoped sessions so an executor sees
+    only the items in its bucket.
     """
     clauses = ["project_id = ?"]
     params_list: list = [project_id]
@@ -3067,6 +3297,9 @@ async def get_sprint_items(
             )
         clauses.append("status = ?")
         params_list.append(status)
+    if version is not None:
+        clauses.append("version = ?")
+        params_list.append(version)
     if not include_human:
         clauses.append("(milestone_type IS NULL OR milestone_type != 'human')")
     query = (
@@ -4568,6 +4801,83 @@ async def get_pool_project_counts(
 _FILE_LOCK_TTL_HOURS = 2
 
 
+def _normalize_file_path(file_path: str | None) -> str:
+    """Normalize a file path the same way ``claim_file`` stores it.
+
+    claim_file stores ``(file_path or "").strip()`` verbatim — no separator
+    rewriting — so code-anchored notes (771c00d7) must apply the *identical*
+    rule for their ``file_path`` anchor to match a claim. Centralized here so
+    the anchor and the lock can never drift apart.
+    """
+    return (file_path or "").strip()
+
+
+async def get_code_notes_for_file(
+    db: aiosqlite.Connection,
+    project_id: str,
+    file_path: str,
+    symbol: str | None = None,
+) -> list[dict[str, Any]]:
+    """771c00d7 — code-anchored notes for a file (newest first).
+
+    Returns full project_notes rows where ``note_kind='code'`` and ``file_path``
+    matches (after the same normalization ``claim_file`` applies) for the given
+    project. Symbol scoping:
+
+    * file-level anchors (note ``symbol`` is NULL/empty) always surface — they
+      apply to any symbol in the file;
+    * symbol anchors surface only when ``symbol`` is given and matches the
+      note's ``symbol``.
+
+    So ``symbol=None`` returns file-level anchors only; passing a ``symbol``
+    additionally returns anchors pinned to that symbol. Returns ``[]`` for a
+    blank path so callers can pass an un-anchored claim through unchanged.
+    """
+    normalized = _normalize_file_path(file_path)
+    if not normalized or not project_id:
+        return []
+    sym = (symbol or "").strip()
+    if sym:
+        clause = "AND (symbol IS NULL OR symbol = '' OR symbol = ?)"
+        params: list[Any] = [project_id, normalized, sym]
+    else:
+        clause = "AND (symbol IS NULL OR symbol = '')"
+        params = [project_id, normalized]
+    async with db.execute(
+        "SELECT * FROM project_notes "
+        "WHERE project_id = ? AND note_kind = 'code' AND file_path = ? "
+        f"{clause} ORDER BY created_at DESC",
+        params,
+    ) as cur:
+        rows = await cur.fetchall()
+    return [_row_to_dict(r) for r in rows if r is not None]  # type: ignore[misc]
+
+
+async def _code_notes_for_session_file(
+    db: aiosqlite.Connection,
+    session_id: str,
+    file_path: str,
+    symbol: str | None = None,
+) -> list[dict[str, Any]]:
+    """Resolve a session's project, then return its code-anchored notes for a file.
+
+    ``claim_file`` is keyed by session_id (not project_id), so we look up the
+    owning project here before delegating to :func:`get_code_notes_for_file`.
+    Best-effort: an unknown session id yields ``[]`` rather than raising, so the
+    file-lock path is never broken by the additive code-notes surface.
+    """
+    async with db.execute(
+        "SELECT project_id FROM sessions WHERE id = ?", (session_id,)
+    ) as cur:
+        row = await cur.fetchone()
+    sess = _row_to_dict(row)
+    if not sess or not sess.get("project_id"):
+        return []
+    return await get_code_notes_for_file(
+        db, sess["project_id"], file_path, symbol
+    )
+
+
 async def expire_file_locks(db: aiosqlite.Connection) -> int:
     """Delete expired file locks and return how many rows were cleared."""
     cursor = await db.execute(
@@ -4582,10 +4892,19 @@ async def claim_file(
     file_path: str,
     session_id: str,
     *,
+    symbol: str | None = None,
     ttl_hours: int = _FILE_LOCK_TTL_HOURS,
 ) -> dict[str, Any]:
-    """Claim a file path for a session, auto-releasing expired locks first."""
-    normalized = (file_path or "").strip()
+    """Claim a file path for a session, auto-releasing expired locks first.
+
+    771c00d7 — the returned dict carries a ``code_notes`` list: project notes
+    anchored to this file path (note_kind='code'), so the executor sees relevant
+    warnings/context before editing. When ``symbol`` is given, symbol-scoped
+    anchors for that symbol are preferred but file-level anchors (no symbol)
+    are always included. Empty when none. Additive — existing callers are
+    unaffected.
+    """
+    normalized = _normalize_file_path(file_path)
     if not normalized:
         raise ValueError("file_path is required")
     await expire_file_locks(db)
@@ -4603,6 +4922,9 @@ async def claim_file(
             "holder_session_id": existing.get("session_id"),
             "claimed_at": existing.get("claimed_at"),
             "expires_at": existing.get("expires_at"),
+            "code_notes": await _code_notes_for_session_file(
+                db, session_id, normalized, symbol
+            ),
         }
 
     if existing and existing.get("session_id") == session_id:
@@ -4631,6 +4953,9 @@ async def claim_file(
         "session_id": lock.get("session_id"),
         "claimed_at": lock.get("claimed_at"),
         "expires_at": lock.get("expires_at"),
+        "code_notes": await _code_notes_for_session_file(
+            db, session_id, normalized, symbol
+        ),
     }
 
 
@@ -4718,6 +5043,8 @@ async def get_file_conflict_warnings(
 async def get_file_claims(
     db: aiosqlite.Connection,
     file_path: str,
+    project_id: str | None = None,
+    symbol: str | None = None,
 ) -> dict[str, Any]:
     """Return active claims on a file: the whole-file lock plus symbol claims.
 
@@ -4725,8 +5052,13 @@ async def get_file_claims(
     lock past its TTL. ``file_lock`` is the active ``file_locks`` row (with the
     holder's ``session_name``) or ``None``; ``symbol_claims`` is the list from
     :func:`get_symbol_claims`.
+
+    771c00d7 — when ``project_id`` is supplied, the result also carries a
+    ``code_notes`` list of that project's code-anchored notes for this path
+    (symbol-scoped when ``symbol`` is given). ``project_id=None`` keeps the
+    legacy two-key result for callers that don't track a project.
     """
-    normalized = (file_path or "").strip()
+    normalized = _normalize_file_path(file_path)
     await expire_file_locks(db)
     async with db.execute(
         "SELECT fl.*, s.name AS session_name FROM file_locks fl "
@@ -4735,11 +5067,16 @@ async def get_file_claims(
         (normalized,),
     ) as cur:
         row = await cur.fetchone()
-    return {
+    result: dict[str, Any] = {
         "file_path": normalized,
         "file_lock": _row_to_dict(row),
         "symbol_claims": await get_symbol_claims(db, normalized),
     }
+    if project_id:
+        result["code_notes"] = await get_code_notes_for_file(
+            db, project_id, normalized, symbol
+        )
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -5181,6 +5518,45 @@ _SUGGESTED_DECISION_CATEGORIES = {
     "BUSINESS", "PRODUCT", "ARCHITECTURAL",
 }
 
+# 366317e9 — decision priority drives dashboard ordering + context-injection
+# weight. urgent surfaces first, then normal, then low. Rank map is reused by
+# get_pinned_decisions and the handoff/context-block sort keys.
+_DECISION_PRIORITIES = ("urgent", "normal", "low")
+_DECISION_PRIORITY_RANK = {"urgent": 0, "normal": 1, "low": 2}
+
+
+def _normalize_decision_priority(priority: str | None) -> str:
+    """Coerce an arbitrary priority into the {urgent, normal, low} set.
+
+    Unknown/empty values normalize to 'normal' so a bad input never rejects a
+    pin; the dashboard and context injection only understand the three levels.
+    """
+    p = (priority or "").strip().lower()
+    return p if p in _DECISION_PRIORITY_RANK else "normal"
+
+
+def _parse_decision_edit_log(raw: Any) -> list[dict[str, Any]]:
+    """Parse the ``edit_log`` JSON blob into a list. NULL/empty/garbage → []."""
+    if not raw:
+        return []
+    if isinstance(raw, list):
+        return raw
+    try:
+        parsed = json.loads(raw)
+    except (ValueError, TypeError):
+        return []
+    return parsed if isinstance(parsed, list) else []
+
+
+def _hydrate_decision_row(row: Any) -> dict[str, Any] | None:
+    """Row → dict with ``priority`` defaulted and ``edit_log`` parsed to a list."""
+    d = _row_to_dict(row)
+    if d is None:
+        return None
+    d["priority"] = _normalize_decision_priority(d.get("priority"))
+    d["edit_log"] = _parse_decision_edit_log(d.get("edit_log"))
+    return d
+
 
 async def pin_decision(
     db: aiosqlite.Connection,
@@ -5188,6 +5564,7 @@ async def pin_decision(
     title: str,
     body: str,
     category: str = "TECHNICAL",
+    priority: str = "normal",
 ) -> dict[str, Any]:
     """Create a new pinned decision row. Returns the inserted row.
 
@@ -5198,12 +5575,17 @@ async def pin_decision(
 
     category is free-text; suggested values: STRATEGIC, COMPETITIVE, TECHNICAL,
     TACTICAL, BUSINESS, PRODUCT, ARCHITECTURAL.
+
+    priority (366317e9) is one of urgent | normal | low (default normal);
+    invalid values normalize to 'normal'. It weights dashboard ordering and the
+    decisions injected into start_session / generate_handoff context.
     """
     did = _new_id()
+    priority = _normalize_decision_priority(priority)
     await db.execute(
-        "INSERT INTO decisions_pinned (id, project_id, title, body, category) "
-        "VALUES (?, ?, ?, ?, ?)",
-        (did, project_id, title, body, category),
+        "INSERT INTO decisions_pinned (id, project_id, title, body, category, priority) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (did, project_id, title, body, category, priority),
     )
     await db.commit()
     # ITEM 6 — live push so the constitution view refreshes without polling.
@@ -5218,7 +5600,7 @@ async def get_pinned_decision(
         "SELECT * FROM decisions_pinned WHERE id = ?", (decision_id,)
     ) as cur:
         row = await cur.fetchone()
-    return _row_to_dict(row)
+    return _hydrate_decision_row(row)
 
 
 async def get_pinned_decisions(
@@ -5226,7 +5608,12 @@ async def get_pinned_decisions(
     project_id: str,
     include_superseded: bool = False,
 ) -> list[dict[str, Any]]:
-    """Return all pinned decisions for a project, newest first.
+    """Return all pinned decisions for a project, highest priority first.
+
+    Rows are ordered urgent → normal → low, then newest-first within a
+    priority band, so the dashboard and context injection both surface the
+    most important decisions at the top. Each row carries a normalized
+    ``priority`` and a parsed ``edit_log`` list (366317e9).
 
     Defaults to active only — superseded entries stay in history but
     are filtered out of the live constitution view.
@@ -5245,7 +5632,11 @@ async def get_pinned_decisions(
         args = (project_id,)
     async with db.execute(sql, args) as cur:
         rows = await cur.fetchall()
-    return [_row_to_dict(r) for r in rows if r is not None]  # type: ignore[misc]
+    decisions = [_hydrate_decision_row(r) for r in rows if r is not None]
+    # Stable sort by priority rank keeps the SQL newest-first order within each
+    # band. urgent (0) < normal (1) < low (2).
+    decisions.sort(key=lambda d: _DECISION_PRIORITY_RANK.get(d["priority"], 1))  # type: ignore[index,union-attr]
+    return decisions  # type: ignore[return-value]
 
 
 async def update_pinned_decision(
@@ -5257,23 +5648,41 @@ async def update_pinned_decision(
     title: str | None = None,
     status: str | None = None,
     superseded_by: str | None = None,
+    priority: str | None = None,
 ) -> dict[str, Any] | None:
-    """Patch any combination of body / category / title / status / superseded_by.
+    """Patch any combination of body / category / title / status / superseded_by /
+    priority.
 
     Use ``status='superseded'`` + ``superseded_by=<new_id>`` to retire a
     decision while preserving the audit trail. Pass only the fields you
     intend to change; others stay untouched.
+
+    366317e9 — when ``body`` is patched to a *different* value, the previous
+    body is appended to the append-only ``edit_log`` JSON array as
+    ``{"body": <previous body>, "ts": <iso timestamp>}`` BEFORE the row is
+    overwritten. History is never dropped; multiple edits accumulate.
+    ``priority`` is normalized to {urgent, normal, low} (invalid → 'normal').
     """
+    from datetime import datetime, timezone
     existing = await get_pinned_decision(db, decision_id)
     if existing is None:
         return None
+    now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     fields: dict[str, Any] = {}
     if body is not None:
         fields["body"] = body
+        # Append-only edit history: snapshot the prior body before overwriting,
+        # but only when the body actually changed (no-op edits don't pollute it).
+        if body != existing.get("body"):
+            history = _parse_decision_edit_log(existing.get("edit_log"))
+            history.append({"body": existing.get("body"), "ts": now_iso})
+            fields["edit_log"] = json.dumps(history)
     if title is not None:
         fields["title"] = title
     if category is not None:
         fields["category"] = category
+    if priority is not None:
+        fields["priority"] = _normalize_decision_priority(priority)
     if status is not None:
         if status not in ("active", "superseded"):
             raise ValueError("status must be 'active' or 'superseded'")
@@ -5282,8 +5691,7 @@ async def update_pinned_decision(
         fields["superseded_by"] = superseded_by
     if not fields:
         return existing
-    from datetime import datetime, timezone
-    fields["updated_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    fields["updated_at"] = now_iso
     set_clause = ", ".join(f"{k} = ?" for k in fields)
     args = list(fields.values()) + [decision_id]
     await db.execute(
@@ -5299,11 +5707,13 @@ async def supersede_pinned_decision(
     new_title: str,
     new_body: str,
     category: str | None = None,
+    priority: str | None = None,
 ) -> dict[str, Any]:
     """Atomic supersede: create a new active decision and mark the old as superseded.
 
     Returns the new decision row. The old row keeps the back-link via
-    ``superseded_by`` so the dashboard can render the chain.
+    ``superseded_by`` so the dashboard can render the chain. The new row inherits
+    the old decision's priority unless ``priority`` overrides it (366317e9).
     """
     old = await get_pinned_decision(db, old_decision_id)
     if old is None:
@@ -5314,6 +5724,7 @@ async def supersede_pinned_decision(
         new_title,
         new_body,
         category or old.get("category", "TECHNICAL"),
+        priority or old.get("priority", "normal"),
     )
     await update_pinned_decision(
         db, old_decision_id, status="superseded", superseded_by=new["id"]
@@ -5887,6 +6298,33 @@ async def get_team_summary(
 # ---------------------------------------------------------------------------
 
 
+async def _unique_note_slug(
+    db: aiosqlite.Connection,
+    project_id: str,
+    base: str,
+    exclude_id: str | None = None,
+) -> str:
+    """Return ``base``, or base-2/base-3/… if the slug is taken in this project.
+
+    Slugs are unique *per project* (Obsidian ``mem:name`` style), so the same
+    slug may exist under different projects. ``exclude_id`` lets a row keep its
+    own slug on update without colliding with itself.
+    """
+    slug = base
+    n = 1
+    while True:
+        async with db.execute(
+            "SELECT id FROM project_notes WHERE project_id = ? AND slug = ?",
+            (project_id, slug),
+        ) as cur:
+            row = await cur.fetchone()
+        existing = _row_to_dict(row)
+        if existing is None or existing.get("id") == exclude_id:
+            return slug
+        n += 1
+        slug = f"{base}-{n}"
+
+
 async def add_project_note(
     db: aiosqlite.Connection,
     project_id: str,
@@ -5895,25 +6333,58 @@ async def add_project_note(
     tags: str | None = None,
     kind: str | None = None,
     priority: str = "normal",
+    file_path: str | None = None,
+    symbol: str | None = None,
+    source: str | None = None,
 ) -> dict[str, Any]:
     """Insert a project_notes row. tags is comma-separated free-form.
 
-    ``kind`` is the 9d44998b taxonomy (wiki | insight | reference); NULL is
-    treated as 'wiki' by readers. Unknown values are coerced to NULL so the
-    column stays a closed vocabulary.
+    ``kind`` is the note taxonomy (wiki | insight | reference | code |
+    document); NULL is treated as 'wiki' by readers. Unknown values are coerced
+    to NULL so the column stays a closed vocabulary.
+
+    e3f150d0 — ``source`` records where a note was ingested from (a URL or file
+    path), set by ``ingest_document`` for ``kind='document'`` notes. Nullable;
+    NULL for normal notes.
 
     ``priority`` is high/normal/low; defaults to 'normal'. High-priority notes
     are surfaced first in generate_handoff and get_session_brief (planner role).
+
+    771c00d7 — a code-anchored note pins a warning/context to a file: pass
+    ``kind='code'`` plus a non-empty ``file_path`` (and optional ``symbol``).
+    The path is normalized the same way ``claim_file`` stores it so the anchor
+    matches a claim, and the note surfaces automatically at claim_file /
+    get_file_claims. ``file_path``/``symbol`` are NULL for normal notes.
+
+    5a5bba43 — a kebab-cased ``slug`` is generated from the title and stored,
+    unique per project (collisions get a ``-2``/``-3``/… suffix). The slug is the
+    handle ``read_note(slug)`` and the dashboard's ``mem:name`` links resolve.
     """
-    if kind not in ("wiki", "insight", "reference"):
+    if kind not in ("wiki", "insight", "reference", "code", "document"):
         kind = None
     if priority not in ("high", "normal", "low"):
         priority = "normal"
+    stored_source = (source or "").strip() or None
+    # 771c00d7 — code anchor: require a real path, normalize it to match claims,
+    # and keep ``symbol`` only alongside a path. Anchors are independent of kind
+    # so an explicitly anchored note still resolves even if kind was coerced.
+    anchor_path = _normalize_file_path(file_path)
+    if file_path is not None and not anchor_path:
+        raise ValueError("file_path must be a non-empty string when provided")
+    sym = (symbol or "").strip()
+    stored_path = anchor_path or None
+    stored_symbol = sym or None
+    if stored_path is None:
+        stored_symbol = None  # a symbol is meaningless without a file anchor
     nid = _new_id()
+    slug = await _unique_note_slug(db, project_id, _slugify_note(title))
     await db.execute(
-        "INSERT INTO project_notes (id, project_id, title, body, tags, note_kind, priority) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (nid, project_id, title, body, tags, kind, priority),
+        "INSERT INTO project_notes "
+        "(id, project_id, title, body, tags, note_kind, priority, slug, "
+        "file_path, symbol, source) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (nid, project_id, title, body, tags, kind, priority, slug,
+         stored_path, stored_symbol, stored_source),
     )
     await db.commit()
     # ITEM 6 — live push so the Notes tab refreshes without polling.
@@ -5931,14 +6402,81 @@ async def get_project_note(
     return _row_to_dict(row)
 
 
-async def get_project_notes(
+async def ingest_document(
     db: aiosqlite.Connection,
     project_id: str,
-    tag: str | None = None,
-    query: str | None = None,
-) -> list[dict[str, Any]]:
-    """Return notes for a project, newest first. Optional tag filter (substring
-    match on tags) and/or text query (searches title + body)."""
+    file_path: str | None = None,
+    content: str | None = None,
+    title: str | None = None,
+    source: str | None = None,
+    tags: str | None = None,
+) -> dict[str, Any]:
+    """e3f150d0 — turn a document into a queryable ``kind='document'`` note.
+
+    Body selection:
+      * ``content`` given  → use it verbatim (the caller extracted the text, e.g.
+        from a PDF with its own tooling — Meridian never parses PDFs server-side).
+      * else ``file_path`` → extract the text server-side with the stdlib-only
+        ``doc_ingest.extract_text`` (.txt/.md/.docx). Unsupported types (.pdf, …)
+        raise, telling the caller to pass ``content`` instead.
+      * neither             → ``ValueError``.
+
+    Defaults: ``title`` falls back to the file's basename (or "Untitled
+    document"); ``source`` falls back to ``file_path``. The body is capped at
+    ``doc_ingest.DOC_BODY_MAX_CHARS`` (truncated with a clear "…[truncated]"
+    marker if longer; the kept prefix stays full-text searchable). The note is
+    stored via :func:`add_project_note` with ``kind='document'`` and ``source``.
+
+    Meridian is a coordination store, not an LLM: this never summarizes. Pass a
+    summary as ``content`` if you want one stored instead of the raw text.
+    """
+    from ..doc_ingest import extract_text, cap_body  # local import: avoid cycle
+
+    if content is not None and str(content).strip() != "":
+        body = content
+        ingest_source = source if (source and source.strip()) else (file_path or None)
+    elif file_path and str(file_path).strip():
+        # Server-side, stdlib-only extraction. extract_text raises a clear
+        # UnsupportedDocumentError for .pdf and other unparseable types.
+        body = extract_text(file_path)
+        ingest_source = source if (source and source.strip()) else file_path
+    else:
+        raise ValueError(
+            "ingest_document requires either 'content' (pre-extracted text) or "
+            "'file_path' (a .txt/.md/.docx file to extract server-side)"
+        )
+
+    # Title defaults to the file's basename, else a generic placeholder.
+    doc_title = (title or "").strip()
+    if not doc_title:
+        if file_path and str(file_path).strip():
+            doc_title = os.path.basename(file_path.strip()) or "Untitled document"
+        else:
+            doc_title = "Untitled document"
+
+    capped = cap_body(body or "")
+    return await add_project_note(
+        db,
+        project_id,
+        doc_title,
+        capped,
+        tags,
+        kind="document",
+        source=(ingest_source or None),
+    )
+
+
+def _project_notes_where(
+    db: aiosqlite.Connection,
+    project_id: str,
+    tag: str | None,
+    query: str | None,
+) -> tuple[str, list[Any]]:
+    """Build the shared WHERE clause + params for the project_notes filters.
+
+    Factored out so get_project_notes and get_project_notes_page apply the
+    exact same tag / full-text filtering before list vs. paginated fetch.
+    """
     is_pg = hasattr(db, "_pool")
     clauses: list[str] = ["project_id = ?"]
     params: list[Any] = [project_id]
@@ -5952,13 +6490,119 @@ async def get_project_notes(
         else:
             clauses.append("(title LIKE ? OR body LIKE ?)")
         params.extend([like_pat, like_pat])
-    where = " AND ".join(clauses)
-    async with db.execute(
-        f"SELECT * FROM project_notes WHERE {where} ORDER BY created_at DESC",
-        params or None,
-    ) as cur:
+    return " AND ".join(clauses), params
+
+
+def _project_notes_cols(bodies: bool) -> str:
+    """Column list for a notes fetch — full row when ``bodies`` else the
+    lightweight id/slug/title/kind/priority/timestamps projection."""
+    return (
+        "*"
+        if bodies
+        else "id, project_id, title, tags, note_kind, priority, slug, "
+        "created_at, updated_at"
+    )
+
+
+async def get_project_notes(
+    db: aiosqlite.Connection,
+    project_id: str,
+    tag: str | None = None,
+    query: str | None = None,
+    bodies: bool = False,
+    limit: int | None = None,
+    offset: int = 0,
+) -> list[dict[str, Any]]:
+    """Return notes for a project, newest first. Optional tag filter (substring
+    match on tags) and/or text query (searches title + body).
+
+    5a5bba43 — pull model: by default (``bodies=False``) the returned rows OMIT
+    the ``body`` field — a lightweight id/slug/title/kind/priority/timestamps
+    list — so bulk note injection can't overflow an agent's context. Callers
+    that actually render note bodies (dashboard notes view, handoff, planner
+    context) pass ``bodies=True``; agents fetch a single body on demand via
+    ``read_note(slug)`` → ``get_project_note_by_slug``.
+
+    The ``query`` filter always searches the body even when bodies are omitted
+    from the result — the search happens in SQL, the body just isn't returned.
+
+    9fa119dd — ``limit``/``offset`` add SQL LIMIT/OFFSET paging (clamped to
+    1..500) mirroring get_sprint_items_page. ``limit=None`` (the default) keeps
+    the legacy "return every matching row" behaviour for existing callers.
+    """
+    where, params = _project_notes_where(db, project_id, tag, query)
+    cols = _project_notes_cols(bodies)
+    sql = f"SELECT {cols} FROM project_notes WHERE {where} ORDER BY created_at DESC"
+    if limit is not None:
+        limit = max(1, min(int(limit), 500))
+        offset = max(0, int(offset))
+        sql += " LIMIT ? OFFSET ?"
+        params = [*params, limit, offset]
+    async with db.execute(sql, params or None) as cur:
         rows = await cur.fetchall()
     return [_row_to_dict(r) for r in rows if r is not None]  # type: ignore[misc]
+
+
+async def get_project_notes_page(
+    db: aiosqlite.Connection,
+    project_id: str,
+    tag: str | None = None,
+    query: str | None = None,
+    bodies: bool = False,
+    limit: int = 100,
+    cursor: int = 0,
+) -> dict[str, Any]:
+    """9fa119dd — one cursor page of project notes (newest first) for the
+    dashboard's "Load More" notes list.
+
+    Mirrors get_sprint_items_page's offset paging, but returns the
+    cursor envelope the dashboard / get_notes tool consume::
+
+        {"notes": [...], "has_more": bool, "next_cursor": int | None}
+
+    The cursor is the next offset (notes are ordered ``created_at DESC`` with no
+    stable secondary key, so an offset cursor is the consistent mechanism — same
+    as sprint items / tasks). One extra row is fetched internally to compute
+    ``has_more`` without a second COUNT query; ``next_cursor`` is the offset to
+    pass back for the following page, or ``None`` when the list is exhausted.
+
+    ``tag``, ``query`` and ``bodies`` behave exactly as in get_project_notes.
+    ``limit`` is clamped to 1..500.
+    """
+    limit = max(1, min(int(limit), 500))
+    cursor = max(0, int(cursor))
+    # Fetch limit+1: the extra row tells us another page exists without COUNT.
+    # Build the query directly (not via get_project_notes) so the +1 probe row
+    # isn't lost to that function's own 500-row clamp at the limit==500 boundary.
+    where, params = _project_notes_where(db, project_id, tag, query)
+    cols = _project_notes_cols(bodies)
+    async with db.execute(
+        f"SELECT {cols} FROM project_notes WHERE {where} "
+        "ORDER BY created_at DESC LIMIT ? OFFSET ?",
+        [*params, limit + 1, cursor],
+    ) as cur:
+        raw = await cur.fetchall()
+    rows = [_row_to_dict(r) for r in raw if r is not None]  # type: ignore[misc]
+    has_more = len(rows) > limit
+    notes = rows[:limit]
+    next_cursor = cursor + len(notes) if has_more else None
+    return {"notes": notes, "has_more": has_more, "next_cursor": next_cursor}
+
+
+async def get_project_note_by_slug(
+    db: aiosqlite.Connection, project_id: str, slug: str
+) -> dict[str, Any] | None:
+    """5a5bba43 — fetch a single full note (incl. body) by its per-project slug.
+
+    Backs the ``read_note(slug)`` MCP tool — the pull half of the list→read
+    model. Returns None when no note with that slug exists in the project.
+    """
+    async with db.execute(
+        "SELECT * FROM project_notes WHERE project_id = ? AND slug = ?",
+        (project_id, slug),
+    ) as cur:
+        row = await cur.fetchone()
+    return _row_to_dict(row)
 
 
 async def update_project_note(
@@ -6217,6 +6861,169 @@ async def delete_workspace_decision(
         rc = cur.rowcount or 0
     await db.commit()
     return rc > 0
+
+
+# --- Workspace sprint board (tenant-global personal backlog) ----------------
+# A cross-project backlog that is NOT tied to any single project. Mirrors the
+# useful subset of the per-project sprint_items shape but is keyed by tenant_id
+# (see _ws_tenant_clause), exactly like workspace_notes / workspace_decisions.
+# ``item_group`` is the cross-project bucket ('thesis'/'meridian'/'personal').
+
+_VALID_WS_SPRINT_STATUSES = {
+    "todo", "pending", "in_progress", "done", "skipped", "failed",
+}
+
+
+async def add_workspace_sprint_item(
+    db: aiosqlite.Connection,
+    title: str,
+    item_group: str | None = None,
+    human_id: str | None = None,
+    tenant_id: str | None = None,
+) -> dict[str, Any]:
+    """Append a ``todo`` item to the workspace-level personal backlog.
+
+    ``item_group`` is the cross-project bucket the item lives under (e.g.
+    'thesis' / 'meridian' / 'personal'); ``human_id`` attributes it to a
+    person. Workspace sprint items belong to the whole workspace, not a single
+    project, so there is no project_id. Scoped to ``tenant_id`` when provided
+    (hosted); None on self-host."""
+    iid = _new_id()
+    # New items go to the end of their group (highest position + 1).
+    scope, scope_params = _ws_tenant_clause(tenant_id)
+    where = f" WHERE {scope}" if scope else ""
+    async with db.execute(
+        f"SELECT COALESCE(MAX(position), -1) + 1 AS next_pos "
+        f"FROM workspace_sprint_items{where}",
+        scope_params or None,
+    ) as cur:
+        prow = await cur.fetchone()
+    next_pos = (prow["next_pos"] if isinstance(prow, dict) else prow[0]) or 0
+    await db.execute(
+        "INSERT INTO workspace_sprint_items "
+        "(id, tenant_id, title, item_group, human_id, position) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (iid, tenant_id, title, item_group or None, human_id or None, next_pos),
+    )
+    await db.commit()
+    async with db.execute(
+        "SELECT * FROM workspace_sprint_items WHERE id = ?", (iid,)
+    ) as cur:
+        row = await cur.fetchone()
+    return _row_to_dict(row) or {"id": iid}
+
+
+async def get_workspace_sprint_items(
+    db: aiosqlite.Connection,
+    status: str | None = None,
+    item_group: str | None = None,
+    tenant_id: str | None = None,
+) -> list[dict[str, Any]]:
+    """List workspace sprint items, grouped by ``item_group`` then position.
+
+    Optional ``status`` and ``item_group`` filters. Scoped to ``tenant_id``
+    when provided (hosted); None returns everything on self-host."""
+    clauses: list[str] = []
+    params: list[Any] = []
+    if status is not None:
+        if status not in _VALID_WS_SPRINT_STATUSES:
+            raise ValueError(
+                f"invalid workspace sprint-item status filter: {status!r}. "
+                f"Valid: {sorted(_VALID_WS_SPRINT_STATUSES)}"
+            )
+        clauses.append("status = ?")
+        params.append(status)
+    if item_group is not None:
+        clauses.append("item_group = ?")
+        params.append(item_group)
+    scope, scope_params = _ws_tenant_clause(tenant_id)
+    if scope:
+        clauses.append(scope)
+        params.extend(scope_params)
+    where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+    async with db.execute(
+        f"SELECT * FROM workspace_sprint_items{where} "
+        "ORDER BY item_group IS NULL, item_group ASC, position ASC, created_at ASC",
+        params or None,
+    ) as cur:
+        rows = await cur.fetchall()
+    return [_row_to_dict(r) for r in rows if r is not None]  # type: ignore[misc]
+
+
+async def update_workspace_sprint_item(
+    db: aiosqlite.Connection,
+    item_id: str,
+    title: str | None = None,
+    status: str | None = None,
+    item_group: str | None = None,
+    human_id: str | None = None,
+    tenant_id: str | None = None,
+) -> dict[str, Any] | None:
+    """Patch editable fields of a workspace sprint item (tenant-scoped).
+
+    Editable: title, status, item_group, human_id. Only fields passed as
+    non-None are changed. Pass an empty string to clear item_group/human_id.
+    A terminal status of 'done'/'skipped'/'failed' stamps ``completed_at``;
+    any other status clears it. Returns the updated item, or None if no row
+    matched (unknown id, or another tenant's item)."""
+    scope, scope_params = _ws_tenant_clause(tenant_id)
+    scope_sql = f" AND {scope}" if scope else ""
+    fields: list[str] = []
+    values: list[Any] = []
+    if title is not None:
+        fields.append("title = ?")
+        values.append(title)
+    if status is not None:
+        if status not in _VALID_WS_SPRINT_STATUSES:
+            raise ValueError(f"invalid workspace sprint-item status: {status!r}")
+        fields.append("status = ?")
+        values.append(status)
+        if status in {"done", "skipped", "failed"}:
+            fields.append("completed_at = datetime('now')")
+        else:
+            fields.append("completed_at = NULL")
+    if item_group is not None:
+        fields.append("item_group = ?")
+        values.append(item_group or None)
+    if human_id is not None:
+        fields.append("human_id = ?")
+        values.append(human_id or None)
+    if not fields:
+        async with db.execute(
+            f"SELECT * FROM workspace_sprint_items WHERE id = ?{scope_sql}",
+            [item_id, *scope_params],
+        ) as cur:
+            row = await cur.fetchone()
+        return _row_to_dict(row)
+    fields.append("updated_at = datetime('now')")
+    cursor = await db.execute(
+        f"UPDATE workspace_sprint_items SET {', '.join(fields)} "
+        f"WHERE id = ?{scope_sql}",
+        [*values, item_id, *scope_params],
+    )
+    await db.commit()
+    if cursor.rowcount == 0:
+        return None
+    async with db.execute(
+        f"SELECT * FROM workspace_sprint_items WHERE id = ?{scope_sql}",
+        [item_id, *scope_params],
+    ) as cur:
+        row = await cur.fetchone()
+    return _row_to_dict(row)
+
+
+async def complete_workspace_sprint_item(
+    db: aiosqlite.Connection,
+    item_id: str,
+    tenant_id: str | None = None,
+) -> dict[str, Any] | None:
+    """Mark a workspace sprint item ``done`` (stamps ``completed_at``).
+
+    Returns the updated item, or None if no row matched (unknown id / wrong
+    tenant)."""
+    return await update_workspace_sprint_item(
+        db, item_id, status="done", tenant_id=tenant_id
+    )
 
 
 _WORKSPACE_SETTINGS_ID = "singleton"

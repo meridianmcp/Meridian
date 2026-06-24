@@ -38,6 +38,9 @@ DEFAULT_EXTRACT_PROXY_PORT = 8810
 # local response surfaces as our error rather than the server's tunnel timeout.
 _LOCAL_REQUEST_TIMEOUT = 28.0
 _MAX_BACKOFF = 30.0
+# Crash isolation: how many times the watchdog relaunches a slot's proxy that
+# keeps exiting (e.g. ENOENT on a missing binary) before giving up on that slot.
+_WATCHDOG_MAX_RETRIES = 5
 
 
 def _force_utf8_io() -> None:
@@ -466,6 +469,18 @@ async def _download_codebase_memory_mcp() -> "str | None":
             r.raise_for_status()
             dest.write_bytes(r.content)
 
+        # Sanity-check: a real binary should be well over 1 MB. A redirect page
+        # or partial download will be tiny — reject it so we don't silently cache
+        # a broken file that produces "path not found" on every tunnel start.
+        if dest.stat().st_size < 1_000_000:
+            dest.unlink(missing_ok=True)
+            print(
+                f"  code-intel: downloaded file is too small ({dest.stat().st_size if dest.exists() else 0} bytes) "
+                "— likely a corrupt download. Try: npm install -g codebase-memory-mcp",
+                file=sys.stderr, flush=True,
+            )
+            return None
+
         if sys.platform != "win32":
             dest.chmod(dest.stat().st_mode | 0o111)  # make executable
 
@@ -777,30 +792,55 @@ async def _reconnect_loop(ws_url: str, port: int, label: str) -> None:
         backoff = min(backoff * 2, _MAX_BACKOFF)
 
 
-async def _proc_watchdog(holder: dict, poll_interval: float = 3.0) -> None:
-    """Relaunch a slot's local subprocess if it dies.
+async def _proc_watchdog(
+    holder: dict, poll_interval: float = 3.0, max_retries: int = _WATCHDOG_MAX_RETRIES
+) -> None:
+    """Relaunch a slot's local subprocess if it dies — with bounded retries.
 
     ``holder`` is a mutable dict ``{"proc", "cmd", "env", "label"}``. Each tick
-    polls ``holder["proc"].poll()``; if the process has exited (returncode is not
-    None) it is re-spawned from ``holder["cmd"]`` (with ``holder["env"]``) and
-    stored back into the holder. Without this, a crashed local proxy leaves
-    127.0.0.1:880x dead — the WebSocket reconnects to the server but the tools
-    silently vanish. Runs until cancelled.
+    polls ``holder["proc"].poll()``; if the process has exited it is re-spawned
+    from ``holder["cmd"]`` (with ``holder["env"]``) and stored back into the
+    holder. Without this, a crashed local proxy leaves 127.0.0.1:880x dead — the
+    WebSocket reconnects to the server but the tools silently vanish.
+
+    Crash isolation: a proxy whose command is broken (e.g. ENOENT on a missing
+    binary) used to be relaunched every tick forever, spamming the terminal. Now
+    consecutive failures back off exponentially (capped at ``_MAX_BACKOFF``) and
+    the watchdog gives up after ``max_retries`` straight failures, leaving that
+    one slot down without taking the tunnel — or the terminal — down with it. A
+    proxy that comes back healthy resets the counter, so an occasional crash
+    still recovers. Runs until cancelled or it gives up on the slot.
     """
     label = holder.get("label", "?")
+    failures = 0
+    backoff = poll_interval
     while True:
-        await asyncio.sleep(poll_interval)
+        await asyncio.sleep(backoff)
         proc = holder.get("proc")
         if proc is None or proc.poll() is None:
-            continue  # not started, or still running
+            if proc is not None:  # a healthy tick clears the crash streak
+                failures = 0
+                backoff = poll_interval
+            continue
+        failures += 1
+        if failures > max_retries:
+            print(
+                f"tunnel:{label}: local proxy keeps exiting (code {proc.returncode}); "
+                f"giving up after {max_retries} retries — fix the command and restart "
+                f"the tunnel.",
+                file=sys.stderr, flush=True,
+            )
+            return
         print(
-            f"tunnel:{label}: local proxy exited (code {proc.returncode}); relaunching",
+            f"tunnel:{label}: local proxy exited (code {proc.returncode}); relaunching "
+            f"(attempt {failures}/{max_retries})",
             file=sys.stderr, flush=True,
         )
         try:
             holder["proc"] = subprocess.Popen(holder["cmd"], env=holder.get("env"))
-        except Exception as exc:  # noqa: BLE001 — keep watching; try again next tick
+        except Exception as exc:  # noqa: BLE001 — count it, back off, may still recover
             print(f"tunnel:{label}: relaunch failed: {exc}", file=sys.stderr, flush=True)
+        backoff = min(max(backoff, poll_interval) * 2, _MAX_BACKOFF)
 
 
 # ---------------------------------------------------------------------------
@@ -811,13 +851,31 @@ async def _proc_watchdog(holder: dict, poll_interval: float = 3.0) -> None:
 TUNNEL_MCP_KEYS = ("meridian-fs", "meridian-code", "meridian-extractor")
 
 
-def _tunnel_mcp_entries(base_url: str, tenant_id: str) -> dict[str, dict]:
-    """The three HTTP MCP connector entries pointing at this tenant's tunnel."""
-    return {
+def _tunnel_mcp_entries(
+    base_url: str, tenant_id: str, custom: "list[dict] | None" = None,
+) -> dict[str, dict]:
+    """The HTTP MCP connector entries pointing at this tenant's tunnel.
+
+    The three built-in slots point at the hosted relay URLs (claude.ai-reachable).
+    *custom* is the list of running user-defined plugins (``{"name", "port"}``);
+    each gets an entry keyed ``meridian-custom-<name>`` pointing at its LOCAL
+    mcp-proxy (``http://127.0.0.1:<port>/mcp``) — they are LOCAL-ONLY and have no
+    server route, so a co-located client reaches them directly, not via the relay.
+    """
+    entries = {
         "meridian-fs": {"type": "http", "url": _permanent_url(base_url, tenant_id)},
         "meridian-code": {"type": "http", "url": _permanent_code_url(base_url, tenant_id)},
         "meridian-extractor": {"type": "http", "url": _permanent_extract_url(base_url, tenant_id)},
     }
+    for cp in custom or []:
+        name = cp.get("name")
+        port = cp.get("port")
+        if not name or not isinstance(port, int):
+            continue
+        entries[f"meridian-custom-{name}"] = {
+            "type": "http", "url": f"http://127.0.0.1:{port}/mcp",
+        }
+    return entries
 
 
 def _mcp_json_paths(cwd: "str | Path") -> list["Path"]:
@@ -859,14 +917,19 @@ def _inject_mcp_entries(text: "str | None", entries: dict[str, dict]) -> str:
 
 def _install_mcp_json(
     cwd: "str | Path", base_url: str, tenant_id: str,
+    custom: "list[dict] | None" = None,
 ) -> list[tuple["Path", "str | None"]]:
     """Inject tunnel connector entries into local MCP config files.
+
+    *custom* is the list of running user-defined plugins (``{"name", "port"}``);
+    each gets a LOCAL ``http://127.0.0.1:<port>/mcp`` connector entry alongside the
+    built-in relay entries (see :func:`_tunnel_mcp_entries`).
 
     Returns a list of ``(path, original_text_or_None)`` snapshots for restore.
     ``original_text_or_None`` is ``None`` when we created the file. Failures on
     any single file are reported and skipped — never fatal to the tunnel.
     """
-    entries = _tunnel_mcp_entries(base_url, tenant_id)
+    entries = _tunnel_mcp_entries(base_url, tenant_id, custom)
     snapshots: list[tuple[Path, str | None]] = []
     for path in _mcp_json_paths(cwd):
         existed = path.exists()
@@ -985,7 +1048,10 @@ async def run_tunnel(
     # /me response returns the already-resolved list (defaults + per-tenant
     # overrides); fall back to built-in defaults for older servers. Each slot
     # may be disabled, given a command override, or assigned a different port.
-    from .tunnel_plugins import resolve_plugins, detect_office_binaries
+    from .tunnel_plugins import (
+        resolve_plugins, resolve_custom_plugins, detect_office_binaries,
+        expand_command, SERENA_EXTRACT_COMMAND,
+    )
     # Auto-enable Office slots whose launcher is installed on this machine, unless
     # the user explicitly configured them. Resolve locally from the raw config
     # (tunnel_plugins_config) so binary-detection applies; fall back to the
@@ -1001,12 +1067,14 @@ async def run_tunnel(
     extract_plugin = by_slot.get("extract") or {}
     ppt_plugin = by_slot.get("ppt") or {}
     word_plugin = by_slot.get("word") or {}
+    dc_plugin = by_slot.get("dc") or {}
     # Per-slot effective ports (override > the run_tunnel arg default).
     fs_port = int(fs_plugin.get("port") or port)
     code_port = int(code_plugin.get("port") or code_port)
     extract_port = int(extract_plugin.get("port") or extract_port)
     ppt_port = int(ppt_plugin.get("port") or 8811)
     word_port = int(word_plugin.get("port") or 8812)
+    dc_port = int(dc_plugin.get("port") or 8813)
 
     # Filesystem connector roots (executor_config.filesystem_roots, unioned across
     # the tenant's projects). Empty → fall back to the home dir (repo_path).
@@ -1077,17 +1145,21 @@ async def run_tunnel(
                 flush=True,
             )
 
-    # 4. Spawn mcp-server-code-extractor proxy. It's a PyPI package (run via uvx,
-    #    or pip-installed and run as `python -m code_extractor`), wrapped in
-    #    mcp-proxy. None if the launcher can't be resolved.
+    # 4. Spawn the code-extractor proxy (slot "extract"). Default: Serena
+    #    (uvx serena ...), with {repo_path} expanded to the served repo so it
+    #    loads the right project. A tenant command override replaces it; an older
+    #    server that still resolves this slot to command=None falls back to
+    #    mcp-server-code-extractor via _resolve_extractor_inner_cmd().
     proc_extract = None
     if not extract_plugin.get("enabled", True):
         print("  code-extractor:    disabled (tunnel_plugins config)", flush=True)
     else:
-        ext_override = extract_plugin.get("command")
+        ext_raw = extract_plugin.get("command")
+        ext_override = expand_command(ext_raw, repo_path=repo_path)
         if ext_override:
             cmd_extract = _build_proxy_for_inner(npx, list(ext_override), extract_port)
-            print(f"  code-extractor:    http://127.0.0.1:{extract_port} (custom command)", flush=True)
+            _ext_label = "" if ext_raw == SERENA_EXTRACT_COMMAND else " (custom command)"
+            print(f"  code-extractor:    http://127.0.0.1:{extract_port}{_ext_label}", flush=True)
             try:
                 proc_extract = subprocess.Popen(cmd_extract)
                 proc_holders.append({"proc": proc_extract, "cmd": cmd_extract, "env": None, "label": "extract"})
@@ -1115,12 +1187,18 @@ async def run_tunnel(
     #     dashboard's Tunnel Plugins section. Each carries its own command and
     #     optional env (e.g. word-mcp-live's MCP_AUTHOR) in the plugin registry.
     office_procs: dict[str, subprocess.Popen] = {}
-    office_ports = {"ppt": ppt_port, "word": word_port}
+    office_ports = {"ppt": ppt_port, "word": word_port, "dc": dc_port}
     for slot, plugin, human in (("ppt", ppt_plugin, "PowerPoint"),
-                                ("word", word_plugin, "Word")):
+                                ("word", word_plugin, "Word"),
+                                ("dc", dc_plugin, "Desktop Commander")):
         if not plugin.get("enabled", False):
             continue
         cmd = plugin.get("command")
+        # Desktop Commander: default command uses bare "npx" (not the full resolved
+        # path) so mcp-proxy's --shell mode can invoke it via PATH without hitting
+        # the 'C:\Program Files\...' space-in-path quoting bug.
+        if cmd is None and slot == "dc":
+            cmd = ["npx", "-y", "@wonderwhy-er/desktop-commander@latest"]
         if not cmd:
             continue
         oport = office_ports[slot]
@@ -1129,16 +1207,40 @@ async def run_tunnel(
         if plugin_env:
             spawn_env = {**os.environ, **{str(k): str(v) for k, v in plugin_env.items()}}
         cmd_office = _build_proxy_for_inner(npx, list(cmd), oport)
-        print(f"  {human.lower()}:{' ' * (15 - len(human))}http://127.0.0.1:{oport}", flush=True)
+        print(f"  {human.lower():<16}http://127.0.0.1:{oport}", flush=True)
         try:
             office_procs[slot] = subprocess.Popen(cmd_office, env=spawn_env)
             proc_holders.append({"proc": office_procs[slot], "cmd": cmd_office, "env": spawn_env, "label": slot})
         except Exception as exc:
             print(f"  warning: could not start {slot} proxy: {exc}", file=sys.stderr)
 
+    # 4c. Spawn user-defined custom plugins (LOCAL-ONLY). These have no server
+    #     route — they ride a local mcp-proxy port + the local .mcp.json only, so
+    #     a co-located Cursor/Claude Code session connects to them at
+    #     http://127.0.0.1:<port>. {repo_path} in the command is expanded to the
+    #     served repo at spawn time, exactly like the built-in extractor slot.
+    custom_plugins = resolve_custom_plugins(me.get("tunnel_plugins_config"))
+    running_custom: list[dict] = []
+    for cp in custom_plugins:
+        if not cp.get("enabled", True):
+            continue
+        cname = cp["name"]
+        cport = cp["port"]
+        cmd_inner = expand_command(cp["command"], repo_path=repo_path)
+        if not cmd_inner:
+            continue
+        cmd_custom = _build_proxy_for_inner(npx, list(cmd_inner), cport)
+        print(f"  custom:{cname:<9}http://127.0.0.1:{cport}", flush=True)
+        try:
+            proc_custom = subprocess.Popen(cmd_custom)
+            proc_holders.append({"proc": proc_custom, "cmd": cmd_custom, "env": None, "label": f"custom:{cname}"})
+            running_custom.append({"name": cname, "port": cport})
+        except Exception as exc:
+            print(f"  warning: could not start custom plugin {cname!r}: {exc}", file=sys.stderr)
+
     # 5. Print permanent URLs.
     print("", flush=True)
-    print("  Permanent MCP URLs — add these to claude.ai once:", flush=True)
+    print("  Tunnel URLs (for Cursor / non-claude.ai clients only):", flush=True)
     if proc_fs is not None:
         print(f"    Filesystem:      {_permanent_url(base_url, tenant_id)}", flush=True)
     if proc_code is not None:
@@ -1149,6 +1251,7 @@ async def run_tunnel(
         print(f"    PowerPoint:      {_permanent_office_url(base_url, tenant_id, 'ppt')}", flush=True)
     if "word" in office_procs:
         print(f"    Word:            {_permanent_office_url(base_url, tenant_id, 'word')}", flush=True)
+    print(f"  claude.ai: all tools appear under your Meridian connector automatically.", flush=True)
     if proc_fs is not None:
         print(f"  (SSE clients: {_sse_url(base_url, tenant_id)})", flush=True)
     print("", flush=True)
@@ -1158,15 +1261,18 @@ async def run_tunnel(
     #     Restored to its original state on shutdown (step 8 finally block).
     mcp_snapshots: list[tuple[Path, str | None]] = []
     try:
-        mcp_snapshots = _install_mcp_json(Path.cwd(), base_url, tenant_id)
+        mcp_snapshots = _install_mcp_json(Path.cwd(), base_url, tenant_id, running_custom)
     except Exception as exc:  # noqa: BLE001
         print(f"  warning: could not update local MCP config: {exc}", file=sys.stderr, flush=True)
     if mcp_snapshots:
         for path, _orig in mcp_snapshots:
             print(f"  Updated MCP config: {path}", flush=True)
+        _custom_conns = "".join(
+            f", meridian-custom-{cp['name']}" for cp in running_custom
+        )
         print(
-            "    added connectors: meridian-fs, meridian-code, meridian-extractor "
-            "(removed on Ctrl+C)",
+            "    added connectors: meridian-fs, meridian-code, meridian-extractor"
+            f"{_custom_conns} (removed on Ctrl+C)",
             flush=True,
         )
         print(
@@ -1199,7 +1305,10 @@ async def run_tunnel(
         tasks.append(asyncio.ensure_future(
             _reconnect_loop(ws_office, office_ports[slot], slot)
         ))
-    if not tasks:
+    # Custom plugins are LOCAL-ONLY (no hosted relay, so no reconnect loop) but a
+    # running one still serves its local proxy + mcp.json connector — so it counts
+    # as "something to serve" even when every built-in slot is disabled.
+    if not tasks and not running_custom:
         print("error: no tunnel plugins enabled — nothing to serve.", file=sys.stderr)
         return 1
     # Watchdog per spawned slot — relaunch the local proxy if it crashes so the

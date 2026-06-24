@@ -38,11 +38,231 @@ _MCP_PROMPTS: list[dict[str, Any]] = [
             {"name": "project_id", "description": "Meridian project ID", "required": True},
         ],
     },
+    {
+        "name": "planning-session-start",
+        "description": (
+            "Planning-session scaffold — the get_planning_brief protocol and "
+            "tool-call order for a claude.ai planning chat."
+        ),
+        "arguments": [
+            {"name": "project_id", "description": "Meridian project ID", "required": False},
+            {"name": "project_name", "description": "Project name (used in the header when no id is given)", "required": False},
+        ],
+    },
+    {
+        "name": "executor-goal",
+        "description": (
+            "A /goal-style executor prompt built from the project's live pending "
+            "sprint items. Pass project_id (or project_name) for the real items; "
+            "omit both for a fill-in template."
+        ),
+        "arguments": [
+            {"name": "project_id", "description": "Meridian project ID — renders the live pending sprint items", "required": False},
+            {"name": "project_name", "description": "Project name — resolved to an id when project_id is omitted", "required": False},
+        ],
+    },
+    {
+        "name": "hotfix-loop",
+        "description": (
+            "The read → edit → push hotfix protocol for a fast, test-gated fix on "
+            "an existing Meridian project."
+        ),
+        "arguments": [
+            {"name": "project_id", "description": "Meridian project ID", "required": False},
+        ],
+    },
 ]
+
+
+def _one_user_message(text: str) -> list[dict[str, Any]]:
+    """Wrap a single prompt body in the MCP user-message envelope."""
+    return [{"role": "user", "content": {"type": "text", "text": text}}]
+
+
+async def _build_prompt_messages_async(
+    name: str, args: dict[str, Any], db: Any,
+) -> list[dict[str, Any]]:
+    """Async prompt builder — resolves dynamic prompts against the DB.
+
+    ``executor-goal`` pulls the project's live pending sprint items (reusing the
+    same goal builder generate_handoff uses) so the slash-command template
+    materialises a ready-to-run /goal string. Every other prompt is static and
+    falls through to the synchronous :func:`_build_prompt_messages`. All DB work
+    is guarded — a missing/unknown project degrades to the instructional
+    template instead of raising.
+    """
+    if name == "executor-goal":
+        return await _build_executor_goal_messages(args, db)
+    return _build_prompt_messages(name, args)
+
+
+async def _build_executor_goal_messages(
+    args: dict[str, Any], db: Any,
+) -> list[dict[str, Any]]:
+    """Build the executor-goal prompt from live pending sprint items.
+
+    Resolves the project from ``project_id`` (preferred) or ``project_name``.
+    When neither resolves to a project — or the project has no pending items —
+    returns a clear fill-in template rather than an error, so the slash command
+    is always useful even on a cold/empty project.
+    """
+    from ..handoff import _build_quick_start_goal, _prepare_pending_sprint_items
+
+    project: dict[str, Any] | None = None
+    project_id = (args.get("project_id") or "").strip()
+    project_name = (args.get("project_name") or "").strip()
+    if db is not None:
+        try:
+            if project_id:
+                project = await db_module.get_project(db, project_id)
+            elif project_name:
+                project = await db_module.get_project_by_name(db, project_name)
+        except Exception:  # noqa: BLE001 — degrade to template, never crash the prompt
+            project = None
+
+    if project is None:
+        # No project resolved → instructional template, not an error.
+        label = project_id or project_name or "<project_id>"
+        return _one_user_message(
+            f"Run an executor session for Meridian project `{label}`.\n\n"
+            "This is the template form — pass a real project_id (or project_name) "
+            "to materialise the live pending sprint items here.\n\n"
+            f"1. `start_session(project_id=\"{label}\", session_name=\"<brief task>\")` "
+            "— returns sprint focus, pending items, and recent tasks.\n"
+            "2. For each pending item: "
+            f"`claim_sprint_item(project_id=\"{label}\", item_id=\"<id>\")`, do the work, "
+            "run the test suite, then `complete_sprint_item(...)`. Do NOT ask what to work on.\n"
+            "3. `log_task(session_id=..., project_id=..., description=...)` after each meaningful step.\n"
+            "4. Between items call "
+            f"`get_sprint_progress(project_id=\"{label}\", session_id=...)` to pick up new items.\n"
+            "5. Before ending: `checkpoint(session_id=..., project_id=...)`.\n\n"
+            "/goal Complete the pending sprint items. Done when every claimed item is "
+            "marked complete via complete_sprint_item(), the test suite passes, and "
+            "generate_handoff() is called at the end. Stop after 40 turns or if HITL triggered.\n\n"
+            "Push to dev when tests pass. Never push broken code."
+        )
+
+    pid = project["id"]
+    pname = project.get("name") or pid
+    pending: list[dict[str, Any]] = []
+    # a76cb7c0 — scope the /goal template to the active sprint-version bucket so
+    # it matches what start_session(version=None) will auto-scope to (the bucket
+    # with the most pending items). Best-effort: None → no filter.
+    scoped_version: str | None = None
+    try:
+        scoped_version = await db_module.infer_active_sprint_version(db, pid)
+    except Exception:  # noqa: BLE001 — degrade to unscoped
+        scoped_version = None
+    try:
+        # Treat 'todo' + 'pending' as the pending bucket, exactly like
+        # generate_handoff, so freshly added items (status 'pending') and any
+        # 'todo' items both surface. Human-typed items are excluded. The version
+        # filter (when known) keeps the template focused on one bucket.
+        all_items = await db_module.get_sprint_items(
+            db, pid, include_human=False, version=scoped_version,
+        )
+        pending = [
+            it for it in all_items
+            if it.get("status") in ("todo", "pending")
+        ]
+        pending = _prepare_pending_sprint_items(pending)
+    except Exception:  # noqa: BLE001 — empty list still renders a valid goal
+        pending = []
+
+    quick_start_goal = _build_quick_start_goal(
+        pending,
+        version=scoped_version,
+        # ecf69de8 — the project's executor posture selects the /goal framing.
+        execution_mode=db_module.normalize_execution_mode(
+            project.get("execution_mode")
+        ),
+    )
+    if pending:
+        item_lines = "\n".join(
+            f"  {i}. [{it['id']}] {(it.get('title') or '').strip()}"
+            for i, it in enumerate(pending, 1)
+        )
+        items_block = f"Pending sprint items ({len(pending)}):\n{item_lines}\n\n"
+    else:
+        items_block = (
+            "No pending sprint items right now — verify the sprint is complete "
+            "or ask the planner for the next batch.\n\n"
+        )
+
+    return _one_user_message(
+        f"Run an executor session for Meridian project `{pname}` (`{pid}`).\n\n"
+        f"1. `start_session(project_id=\"{pid}\", session_name=\"<brief task>\")`.\n"
+        "2. Work the pending items below in order — "
+        f"`claim_sprint_item(project_id=\"{pid}\", item_id=...)`, do the work, run the "
+        "test suite, then `complete_sprint_item(...)`. Do NOT ask what to work on.\n"
+        "3. `log_task(session_id=..., project_id=..., description=...)` after each meaningful step.\n"
+        "4. Between items call "
+        f"`get_sprint_progress(project_id=\"{pid}\", session_id=...)` to pick up new items.\n"
+        "5. Before ending: `checkpoint(session_id=..., project_id=...)`.\n\n"
+        f"{items_block}"
+        f"{quick_start_goal}\n\n"
+        "Push to dev when tests pass. Never push broken code."
+    )
 
 
 def _build_prompt_messages(name: str, args: dict[str, Any]) -> list[dict[str, Any]]:
     pid = args.get("project_id", "<project_id>")
+    if name == "planning-session-start":
+        pid_arg = (args.get("project_id") or "").strip()
+        pname = (args.get("project_name") or "").strip()
+        header = pname or pid_arg or "this project"
+        pid_for_calls = pid_arg or "<project_id>"
+        return _one_user_message(
+            f"You are the **planner** for Meridian project {header}. Your job is "
+            "not to write code — it is to decide *what* should be built next and "
+            "in what order, then record those decisions in Meridian so executor "
+            "sessions can pick them up.\n\n"
+            "Planning protocol — call these tools in this order:\n"
+            f"1. `get_planning_brief(project_id=\"{pid_for_calls}\")` — load the compact "
+            "current state (sprint, north star, pending + in-progress items, recent "
+            "tasks, active sessions, pending HITLs).\n"
+            f"2. `get_sprint_progress(project_id=\"{pid_for_calls}\")` — see how much of the "
+            "current sprint is done vs. outstanding.\n"
+            f"3. `list_hitl_requests(project_id=\"{pid_for_calls}\")` — review open human "
+            "decisions blocking progress; answer or supersede them.\n"
+            f"4. `get_pinned_decisions(project_id=\"{pid_for_calls}\")` — re-read the "
+            "constitution so new items don't contradict prior choices.\n"
+            "5. Think through the scaffold below (current state → gaps & risks → "
+            "priorities → proposed items → open questions).\n"
+            f"6. `add_sprint_item(project_id=\"{pid_for_calls}\", title=\"...\", group=\"...\")` "
+            "— record each proposed next item.\n"
+            f"7. `pin_decision(project_id=\"{pid_for_calls}\", title=\"...\", body=\"...\", "
+            "category=\"...\")` — record any architectural / scope decisions you made.\n\n"
+            "Thinking scaffold — fill in before recording items/decisions:\n"
+            "- **Current state** — what's shipped, what's in flight.\n"
+            "- **Gaps & risks** — what's missing, fragile, or blocking.\n"
+            "- **Priorities** — the 1-3 things that matter most next, ranked.\n"
+            "- **Proposed next sprint items** — concrete items (title + group each).\n"
+            "- **Open questions** — anything needing a human decision (request_hitl if blocking)."
+        )
+    if name == "hotfix-loop":
+        pid_arg = (args.get("project_id") or "").strip() or "<project_id>"
+        return _one_user_message(
+            f"Run a hotfix loop on Meridian project `{pid_arg}` — a fast, "
+            "test-gated read → edit → push cycle for a single focused fix.\n\n"
+            f"1. `start_session(project_id=\"{pid_arg}\", session_name=\"hotfix: <what>\")` "
+            "to register and load current context.\n"
+            "2. **Read** — locate the bug. Read the failing file(s) and any test that "
+            "covers the area BEFORE editing; reproduce the failure first so you know "
+            "the fix worked.\n"
+            "3. `claim_file(session_id=..., file_path=...)` for each file you'll touch so "
+            "a parallel session doesn't collide.\n"
+            "4. **Edit** — make the minimal change that fixes the issue. No scope creep; "
+            "a hotfix touches as little as possible.\n"
+            "5. Run the full test suite and confirm it is green (do not reduce coverage). "
+            "Add or update a regression test for the bug.\n"
+            "6. `log_task(session_id=..., project_id=..., description=\"hotfix: ...\")` and "
+            "`release_file(...)` the files you claimed.\n"
+            "7. **Push** — commit and push to the dev branch only. Never push broken code, "
+            "and never push straight to main.\n"
+            "8. If anything is ambiguous or risky, "
+            f"`request_hitl(project_id=\"{pid_arg}\", question=...)` before pushing."
+        )
     if name == "start-executor":
         return [
             {
@@ -539,7 +759,7 @@ async def _handle_mcp_request(
         prompt_name = params.get("name", "")
         prompt_args = params.get("arguments") or {}
         try:
-            messages = _build_prompt_messages(prompt_name, prompt_args)
+            messages = await _build_prompt_messages_async(prompt_name, prompt_args, db)
         except ValueError as exc:
             return _server._jsonrpc_err(req_id, -32602, str(exc))
         return _server._jsonrpc_ok(req_id, {"description": next(
@@ -857,37 +1077,28 @@ async def _fetch_recent_commits(
     return commits
 
 
-async def _dispatch_mcp_tool(
+# Sentinel returned by a group handler when the tool name is not in that
+# group, so the dispatcher falls through to the next group. Distinct from
+# None, which is a legitimate handler return value (e.g. get_goal).
+_MISS: Any = object()
+
+
+async def _handle_project_tools(
     name: str,
     args: dict[str, Any],
     db: Any,
     data_dir: str,
-    tenant: dict[str, Any] | None = None,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
 ) -> Any:
-    """Route a tools/call to the appropriate db_module function."""
-    # Tenant scope for the workspace layer (notes/decisions/settings). None for
-    # self-host / unauthenticated; the db functions then skip isolation.
-    _mcp_tenant_id = tenant.get("id") if tenant else None
-    # b6ab6e83 — project_name resolver: accept project_name as alternative to
-    # project_id, and resolve non-UUID project_id values as human-readable names.
-    _pid_raw = args.get("project_id", "")
-    _pname_raw = args.get("project_name", "")
-    _is_uuid = bool(re.match(
-        r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
-        _pid_raw, re.I,
-    ))
-    if _pname_raw or (_pid_raw and not _is_uuid):
-        _lookup = _pname_raw or _pid_raw
-        _resolved_proj = await db_module.get_project_by_name(db, _lookup)
-        if _resolved_proj:
-            args = {**args, "project_id": _resolved_proj["id"]}
-        elif _pname_raw and not _pid_raw:
-            raise ValueError(f"no project found matching name '{_lookup}'")
+    """Dispatch group: create_project, register_session, start_session, list_projects, get_project_by_name, get_goal, set_goal, set_north_star."""
     if name == "create_project":
         existing = await db_module.get_project_by_name(db, args["name"])
         if existing is not None:
             return {"error": f"project '{args['name']}' already exists", "project": existing}
-        return await db_module.create_project(db, args["name"])
+        return await db_module.create_project(
+            db, args["name"], execution_mode=args.get("execution_mode"),
+        )
     if name == "register_session":
         hid = args.get("human_id")
         if not hid and not _hosted_mode():
@@ -902,6 +1113,8 @@ async def _dispatch_mcp_tool(
         # 3689f680 — MCP start_session defaults to a compact response so an
         # executor's context isn't blown by the full goal/instructions payload.
         # Pass compact=False explicitly for the full block.
+        # a76cb7c0 — optional `version` scopes the session to a sprint-version
+        # bucket (orientation counts/items + /goal filter to it).
         return await _server._start_session_composite(
             db,
             args["project_id"],
@@ -911,6 +1124,7 @@ async def _dispatch_mcp_tool(
             client_type=args.get("client"),
             role=args.get("role"),
             compact=args.get("compact", True),
+            version=args.get("version"),
         )
     if name == "list_projects":
         return await db_module.list_project_summaries(db)
@@ -932,6 +1146,18 @@ async def _dispatch_mcp_tool(
         return await db_module.set_goal(db, args["project_id"], args["content"])
     if name == "set_north_star":
         return await db_module.set_north_star(db, args["project_id"], args["north_star"])
+    return _MISS
+
+
+async def _handle_task_tools(
+    name: str,
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """Dispatch group: log_task, get_tasks, search_tasks, generate_handoff."""
     if name == "log_task":
         validate_input_size(args.get("description"), "description", 50_000)
         task = await db_module.log_task(
@@ -977,12 +1203,25 @@ async def _dispatch_mcp_tool(
             )
             mode = "full"
         return {"file_path": path, "content": content, "mode": mode}
+    return _MISS
+
+
+async def _handle_notes_decisions(
+    name: str,
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """Dispatch group: pin_decision, update_decision, get_pinned_decisions, archive_decision, add_note, ingest_document, capture_insight, get_notes, read_note, delete_note, add_workspace_note, get_workspace_notes, pin_workspace_decision, get_workspace_decisions, get_workspace_settings, update_workspace_settings, add_workspace_sprint_item, get_workspace_sprint_items, update_workspace_sprint_item, complete_workspace_sprint_item."""
     if name == "pin_decision":
         validate_input_size(args.get("title"), "decision title", 500)
         validate_input_size(args.get("body"), "decision body", 100_000)
         category = args.get("category", "TECHNICAL")
         result = await db_module.pin_decision(
             db, args["project_id"], args["title"], args["body"], category,
+            priority=args.get("priority", "normal"),
         )
         await _server._append_decision_to_md(args["title"], args["body"], category)
         return result
@@ -992,6 +1231,7 @@ async def _dispatch_mcp_tool(
         if new_title and new_body:
             return await db_module.supersede_pinned_decision(
                 db, args["decision_id"], new_title, new_body, args.get("category"),
+                priority=args.get("priority"),
             )
         result = await db_module.update_pinned_decision(
             db, args["decision_id"],
@@ -1000,6 +1240,7 @@ async def _dispatch_mcp_tool(
             category=args.get("category"),
             status=args.get("status"),
             superseded_by=args.get("superseded_by"),
+            priority=args.get("priority"),
         )
         if result is None:
             raise ValueError("decision not found")
@@ -1014,6 +1255,329 @@ async def _dispatch_mcp_tool(
         if not deleted:
             raise ValueError("decision not found")
         return {"deleted": True, "decision_id": args["decision_id"]}
+    if name == "add_note":
+        validate_input_size(args.get("title"), "note title", 500)
+        validate_input_size(args.get("body"), "note body", 10_000_000)
+        validate_input_size(args.get("file_path"), "note file_path", 2_000)
+        validate_input_size(args.get("symbol"), "note symbol", 500)
+        validate_input_size(args.get("source"), "note source", 2_000)
+        try:
+            result = await db_module.add_project_note(
+                db, args["project_id"], args["title"], args["body"],
+                args.get("tags"), kind=args.get("kind"),
+                priority=args.get("priority", "normal"),
+                file_path=args.get("file_path"), symbol=args.get("symbol"),
+                source=args.get("source"),
+            )
+        except ValueError as exc:
+            return {"error": str(exc)}
+        await _server._append_note_to_roadmap(
+            args["title"], args["body"], args.get("tags"), args.get("category"),
+        )
+        # e5592013 — lint: "MANUAL" notes are usually human tasks, not wiki.
+        if isinstance(result, dict) and "MANUAL" in (args.get("title") or ""):
+            result = {**result, "lint": _MANUAL_NOTE_LINT}
+        return result
+    if name == "ingest_document":
+        # e3f150d0 — extract a Word/PDF/text document into a kind='document'
+        # note. Extraction (.txt/.md/.docx) is stdlib-only and server-side;
+        # PDFs/unsupported types must be pre-extracted by the caller and passed
+        # as `content`. The body cap is applied inside db.ingest_document.
+        validate_input_size(args.get("title"), "document title", 500)
+        validate_input_size(args.get("file_path"), "document file_path", 2_000)
+        validate_input_size(args.get("source"), "document source", 2_000)
+        validate_input_size(args.get("content"), "document content", 50_000_000)
+        from ..doc_ingest import DocExtractionError  # local import: optional dep-free
+        try:
+            return await db_module.ingest_document(
+                db, args["project_id"],
+                file_path=args.get("file_path"),
+                content=args.get("content"),
+                title=args.get("title"),
+                source=args.get("source"),
+                tags=args.get("tags"),
+            )
+        except (ValueError, DocExtractionError, FileNotFoundError) as exc:
+            return {"error": str(exc)}
+    if name == "capture_insight":
+        # db9edba3 — one-call insight capture for planning (claude.ai) sessions:
+        # persists a kind='insight' note (prominent in the dashboard + surfaced in
+        # the planner handoff) WITHOUT the auto-capture "Session summary" noise.
+        validate_input_size(args.get("title"), "insight title", 500)
+        _ins_body = args.get("body")
+        _bullets = args.get("bullet_points")
+        if (not _ins_body) and isinstance(_bullets, list) and _bullets:
+            _ins_body = "\n".join(f"- {str(b).strip()}" for b in _bullets if str(b).strip())
+        _ins_body = _ins_body or ""
+        validate_input_size(_ins_body, "insight body", 10_000_000)
+        if not _ins_body:
+            return {"error": "capture_insight requires body or non-empty bullet_points"}
+        _ins_tags = args.get("tags")
+        _ins_tags = f"{_ins_tags},insight" if _ins_tags else "insight"
+        return await db_module.add_project_note(
+            db, args["project_id"], args["title"], _ins_body,
+            _ins_tags, kind="insight",
+            priority=args.get("priority", "normal"),
+        )
+    if name == "get_notes":
+        # 5a5bba43 — pull model: default to the lightweight list (no bodies) so
+        # bulk note injection can't overflow context. Agents fetch one body via
+        # read_note(slug). Pass bodies=true to opt back into full rows.
+        # 9fa119dd — cursor pagination, opt-in (mirrors get_sprint_items, whose
+        # MCP tool stays a bare list while the HTTP route paginates): pass
+        # ``cursor`` and/or ``limit`` to get the {notes, has_more, next_cursor}
+        # envelope, then re-call with cursor=next_cursor for the next page.
+        # Without either arg the legacy bare list is returned for back-compat.
+        if "cursor" in args or "limit" in args:
+            return await db_module.get_project_notes_page(
+                db, args["project_id"], tag=args.get("tag"), query=args.get("query"),
+                bodies=bool(args.get("bodies", False)),
+                limit=int(args.get("limit", 100)),
+                cursor=int(args.get("cursor", 0)),
+            )
+        return await db_module.get_project_notes(
+            db, args["project_id"], tag=args.get("tag"), query=args.get("query"),
+            bodies=bool(args.get("bodies", False)),
+        )
+    if name == "read_note":
+        # 5a5bba43 — the pull half of the list→read model: fetch one note's full
+        # body by its per-project slug (returned in the get_notes list).
+        note = await db_module.get_project_note_by_slug(
+            db, args["project_id"], args["slug"],
+        )
+        if note is None:
+            return {"error": f"note '{args['slug']}' not found in project {args['project_id']}"}
+        return note
+    if name == "delete_note":
+        ok = await db_module.delete_project_note(db, args["note_id"])
+        return {"deleted": ok}
+    if name == "add_workspace_note":
+        validate_input_size(args.get("title"), "note title", 500)
+        validate_input_size(args.get("body"), "note body", 10_000_000)
+        return await db_module.add_workspace_note(
+            db, args["title"], args["body"], args.get("tags"),
+            tenant_id=_mcp_tenant_id,
+        )
+    if name == "get_workspace_notes":
+        return await db_module.get_workspace_notes(
+            db, tag=args.get("tag"), tenant_id=_mcp_tenant_id,
+        )
+    if name == "pin_workspace_decision":
+        validate_input_size(args.get("title"), "decision title", 500)
+        validate_input_size(args.get("body"), "decision body", 100_000)
+        return await db_module.pin_workspace_decision(
+            db, args["title"], args["body"],
+            category=args.get("category", "TECHNICAL"),
+            tenant_id=_mcp_tenant_id,
+        )
+    if name == "get_workspace_decisions":
+        return await db_module.get_workspace_decisions(
+            db, include_superseded=args.get("include_superseded", False),
+            tenant_id=_mcp_tenant_id,
+        )
+    if name == "get_workspace_settings":
+        return await db_module.get_workspace_settings(db, tenant_id=_mcp_tenant_id)
+    if name == "update_workspace_settings":
+        return await db_module.update_workspace_settings(
+            db,
+            hitl_auto_answer_default=args.get("hitl_auto_answer_default"),
+            sprint_name_default=args.get("sprint_name_default"),
+            handoff_template=args.get("handoff_template"),
+            tenant_id=_mcp_tenant_id,
+        )
+    if name == "add_workspace_sprint_item":
+        validate_input_size(args.get("title"), "sprint item title", 500)
+        return await db_module.add_workspace_sprint_item(
+            db, args["title"],
+            item_group=args.get("group"),
+            human_id=args.get("human_id"),
+            tenant_id=_mcp_tenant_id,
+        )
+    if name == "get_workspace_sprint_items":
+        return await db_module.get_workspace_sprint_items(
+            db, status=args.get("status"), item_group=args.get("group"),
+            tenant_id=_mcp_tenant_id,
+        )
+    if name == "update_workspace_sprint_item":
+        validate_input_size(args.get("title"), "sprint item title", 500)
+        item = await db_module.update_workspace_sprint_item(
+            db, args["item_id"],
+            title=args.get("title"),
+            status=args.get("status"),
+            item_group=args.get("group"),
+            human_id=args.get("human_id"),
+            tenant_id=_mcp_tenant_id,
+        )
+        return item or {"error": "workspace sprint item not found"}
+    if name == "complete_workspace_sprint_item":
+        item = await db_module.complete_workspace_sprint_item(
+            db, args["item_id"], tenant_id=_mcp_tenant_id,
+        )
+        return item or {"error": "workspace sprint item not found"}
+    return _MISS
+
+
+async def _handle_hitl_tools(
+    name: str,
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """Dispatch group: request_hitl, get_hitl_request, list_hitl_requests, answer_hitl, dismiss_hitl, update_md_section."""
+    if name == "request_hitl":
+        validate_input_size(args.get("question"), "question", 10_000)
+        validate_input_size(args.get("context"), "context", 50_000)
+        _hitl_kind = args.get("kind", "question")
+        if _hitl_kind not in ("question", "correction"):
+            _hitl_kind = "question"
+        _hitl_options = args.get("options")
+        if _hitl_options is not None and not isinstance(_hitl_options, list):
+            _hitl_options = None
+        result = await db_module.request_hitl(
+            db, args["project_id"], args["question"],
+            session_id=args.get("session_id"),
+            context=args.get("context"),
+            urgency=args.get("urgency", "normal"),
+            assigned_to=args.get("assigned_to"),
+            kind=_hitl_kind,
+            options=_hitl_options,
+            recommended=args.get("recommended"),
+        )
+        # v3.4 — auto-answered requests need no human; skip the notification.
+        if result.get("answered_by") != "auto":
+            # Notify via configured notify_url — best-effort, non-blocking
+            _hitl_urgency = args.get("urgency", "normal").upper()
+            _hitl_q = args["question"][:200]
+            _hitl_base = os.environ.get("MERIDIAN_BASE_URL", "https://usemeridian.us").rstrip("/")
+            await _server._maybe_notify(
+                db, args["project_id"],
+                f"Action needed ({_hitl_urgency})",
+                f"{_hitl_q}\n\nAnswer at: {_hitl_base}/dashboard",
+                event="hitl",
+                tenant=tenant,
+                pref_key="hitl",
+            )
+        # Dual-channel: enrich response so Claude Code displays the question inline.
+        # The auto-answer short-circuit above already returned if answered_by='auto'.
+        _dc_result = dict(result)
+        if _dc_result.get("status") == "pending":
+            _dc_q = _dc_result.get("question", "")
+            _dc_urg = _dc_result.get("urgency", "normal")
+            _dc_rid = _dc_result.get("id", "")
+            _dc_opts: list[str] = []
+            _dc_rec: str | None = None
+            try:
+                _dc_pl = json.loads(_dc_result.get("payload") or "{}")
+                _dc_opts = _dc_pl.get("options") or []
+                _dc_rec = _dc_pl.get("recommended")
+            except (TypeError, ValueError):
+                pass
+            _opts_text = ""
+            if _dc_opts:
+                _opts_text = "\n\nOptions:\n" + "\n".join(
+                    f"  {i + 1}. {o}" + (" (recommended)" if o == _dc_rec else "")
+                    for i, o in enumerate(_dc_opts)
+                )
+            _dc_result["chat_prompt"] = (
+                f"[HITL {_dc_urg.upper()}] {_dc_q}{_opts_text}\n\n"
+                f"Filed in Meridian dashboard AND shown here — first answer wins.\n"
+                f"HITL ID: {_dc_rid}"
+            )
+            if _dc_urg == "blocking":
+                _dc_result["poll_instruction"] = (
+                    f"Show the question above to the user now. Then poll "
+                    f"get_hitl_request(request_id='{_dc_rid}') every 30 s. "
+                    f"If the user answers here in chat, call "
+                    f"answer_hitl(request_id='{_dc_rid}', answer='<their reply>'). "
+                    f"Whichever arrives first (dashboard or chat) unblocks you."
+                )
+        return _dc_result
+    if name == "get_hitl_request":
+        result = await db_module.get_hitl_request(db, args["request_id"])
+        if result is None:
+            raise ValueError("hitl request not found")
+        return result
+    if name == "list_hitl_requests":
+        # dcf1e428 — default 'recent' (pending + answered last 24h) so dismissed HITLs
+        # don't give false "no pending HITLs" confidence to planning sessions.
+        status_filter = args.get("status", "recent")
+        if status_filter == "all":
+            status_filter = None
+        # project_id is optional — None lists across all projects (like the
+        # dashboard), so cross-project HITLs aren't missed (277567dc).
+        return await db_module.list_hitl_requests(
+            db, args.get("project_id"),
+            status=status_filter,
+            limit=args.get("limit", 50),
+        )
+    if name == "answer_hitl":
+        result = await _server._answer_hitl_and_apply(
+            db, args["request_id"], args["answer"],
+            answered_by=args.get("answered_by"), approved=True,
+        )
+        if result is None:
+            raise ValueError("hitl request not found")
+        return result
+    if name == "dismiss_hitl":
+        result = await db_module.dismiss_hitl_request(db, args["request_id"])
+        if result is not None:
+            await _server._on_hitl_answered(db, result, approved=False)
+        if result is None:
+            raise ValueError("hitl request not found")
+        return result
+    if name == "update_md_section":
+        md_file = args["file"]
+        anchor = args["anchor"]
+        content = args["content"]
+        # Raises ValueError for non-replace anchors / unknown files / README.
+        md_anchors_module.assert_replace_target(md_file, anchor)
+        # v1.1 — force=true: human planning sessions (claude.ai) skip the HITL
+        # round-trip and apply the section replacement directly. Executor sessions
+        # omit force (default False) so the diff stays human-gated as before.
+        if args.get("force") in (True, 1, "true", "1", "yes"):
+            try:
+                path = await md_anchors_module.apply_replace(md_file, anchor, content)
+            except md_anchors_module.AnchorError as exc:
+                return {"applied": False, "apply_error": str(exc)}
+            except Exception as exc:  # noqa: BLE001 — never crash the tool call
+                return {"applied": False, "apply_error": f"write failed: {exc}"}
+            if path is None:
+                return {"applied": False, "reason": "no-op-or-hosted"}
+            return {"applied": True, "forced": True, "file": md_file, "anchor": anchor}
+        diff = md_anchors_module.build_diff(md_file, anchor, content)
+        payload = json.dumps({
+            "file": md_file,
+            "anchor": anchor,
+            "content": content,
+            "base_hash": md_anchors_module.anchor_content_hash(md_file, anchor),
+            "diff": diff,
+        })
+        return await db_module.request_hitl(
+            db, args["project_id"],
+            question=f"Approve update to {md_file} § {anchor}?",
+            session_id=args.get("session_id"),
+            context=(
+                f"Proposed section replacement for {md_file} (anchor: {anchor}). "
+                "Review the diff in the dashboard, then Approve or Reject."
+            ),
+            urgency=args.get("urgency", "normal"),
+            kind="md_section_update",
+            payload=payload,
+        )
+    return _MISS
+
+
+async def _handle_session_tools(
+    name: str,
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """Dispatch group: checkpoint, get_context_block, list_sessions, get_session_log, get_agent_instructions, set_agent_instructions, set_executor_config, idle_until_session_done, search_all, get_session_brief."""
     if name == "checkpoint":
         session_id = args["session_id"]
         project_id = args["project_id"]
@@ -1153,155 +1717,6 @@ async def _dispatch_mcp_tool(
                 "These are NOT auto-reconciled from git — you must mark them."
             )
         return _ckpt_resp
-    if name == "request_hitl":
-        validate_input_size(args.get("question"), "question", 10_000)
-        validate_input_size(args.get("context"), "context", 50_000)
-        _hitl_kind = args.get("kind", "question")
-        if _hitl_kind not in ("question", "correction"):
-            _hitl_kind = "question"
-        _hitl_options = args.get("options")
-        if _hitl_options is not None and not isinstance(_hitl_options, list):
-            _hitl_options = None
-        result = await db_module.request_hitl(
-            db, args["project_id"], args["question"],
-            session_id=args.get("session_id"),
-            context=args.get("context"),
-            urgency=args.get("urgency", "normal"),
-            assigned_to=args.get("assigned_to"),
-            kind=_hitl_kind,
-            options=_hitl_options,
-            recommended=args.get("recommended"),
-        )
-        # v3.4 — auto-answered requests need no human; skip the notification.
-        if result.get("answered_by") != "auto":
-            # Notify via configured notify_url — best-effort, non-blocking
-            _hitl_urgency = args.get("urgency", "normal").upper()
-            _hitl_q = args["question"][:200]
-            _hitl_base = os.environ.get("MERIDIAN_BASE_URL", "https://usemeridian.us").rstrip("/")
-            await _server._maybe_notify(
-                db, args["project_id"],
-                f"Action needed ({_hitl_urgency})",
-                f"{_hitl_q}\n\nAnswer at: {_hitl_base}/dashboard",
-                event="hitl",
-                tenant=tenant,
-                pref_key="hitl",
-            )
-        # Dual-channel: enrich response so Claude Code displays the question inline.
-        # The auto-answer short-circuit above already returned if answered_by='auto'.
-        _dc_result = dict(result)
-        if _dc_result.get("status") == "pending":
-            _dc_q = _dc_result.get("question", "")
-            _dc_urg = _dc_result.get("urgency", "normal")
-            _dc_rid = _dc_result.get("id", "")
-            _dc_opts: list[str] = []
-            _dc_rec: str | None = None
-            try:
-                _dc_pl = json.loads(_dc_result.get("payload") or "{}")
-                _dc_opts = _dc_pl.get("options") or []
-                _dc_rec = _dc_pl.get("recommended")
-            except (TypeError, ValueError):
-                pass
-            _opts_text = ""
-            if _dc_opts:
-                _opts_text = "\n\nOptions:\n" + "\n".join(
-                    f"  {i + 1}. {o}" + (" (recommended)" if o == _dc_rec else "")
-                    for i, o in enumerate(_dc_opts)
-                )
-            _dc_result["chat_prompt"] = (
-                f"[HITL {_dc_urg.upper()}] {_dc_q}{_opts_text}\n\n"
-                f"Filed in Meridian dashboard AND shown here — first answer wins.\n"
-                f"HITL ID: {_dc_rid}"
-            )
-            if _dc_urg == "blocking":
-                _dc_result["poll_instruction"] = (
-                    f"Show the question above to the user now. Then poll "
-                    f"get_hitl_request(request_id='{_dc_rid}') every 30 s. "
-                    f"If the user answers here in chat, call "
-                    f"answer_hitl(request_id='{_dc_rid}', answer='<their reply>'). "
-                    f"Whichever arrives first (dashboard or chat) unblocks you."
-                )
-        return _dc_result
-    if name == "get_hitl_request":
-        result = await db_module.get_hitl_request(db, args["request_id"])
-        if result is None:
-            raise ValueError("hitl request not found")
-        return result
-    if name == "add_note":
-        validate_input_size(args.get("title"), "note title", 500)
-        validate_input_size(args.get("body"), "note body", 10_000_000)
-        result = await db_module.add_project_note(
-            db, args["project_id"], args["title"], args["body"],
-            args.get("tags"), kind=args.get("kind"),
-            priority=args.get("priority", "normal"),
-        )
-        await _server._append_note_to_roadmap(
-            args["title"], args["body"], args.get("tags"), args.get("category"),
-        )
-        # e5592013 — lint: "MANUAL" notes are usually human tasks, not wiki.
-        if isinstance(result, dict) and "MANUAL" in (args.get("title") or ""):
-            result = {**result, "lint": _MANUAL_NOTE_LINT}
-        return result
-    if name == "capture_insight":
-        # db9edba3 — one-call insight capture for planning (claude.ai) sessions:
-        # persists a kind='insight' note (prominent in the dashboard + surfaced in
-        # the planner handoff) WITHOUT the auto-capture "Session summary" noise.
-        validate_input_size(args.get("title"), "insight title", 500)
-        _ins_body = args.get("body")
-        _bullets = args.get("bullet_points")
-        if (not _ins_body) and isinstance(_bullets, list) and _bullets:
-            _ins_body = "\n".join(f"- {str(b).strip()}" for b in _bullets if str(b).strip())
-        _ins_body = _ins_body or ""
-        validate_input_size(_ins_body, "insight body", 10_000_000)
-        if not _ins_body:
-            return {"error": "capture_insight requires body or non-empty bullet_points"}
-        _ins_tags = args.get("tags")
-        _ins_tags = f"{_ins_tags},insight" if _ins_tags else "insight"
-        return await db_module.add_project_note(
-            db, args["project_id"], args["title"], _ins_body,
-            _ins_tags, kind="insight",
-            priority=args.get("priority", "normal"),
-        )
-    if name == "get_notes":
-        return await db_module.get_project_notes(
-            db, args["project_id"], tag=args.get("tag"), query=args.get("query"),
-        )
-    if name == "delete_note":
-        ok = await db_module.delete_project_note(db, args["note_id"])
-        return {"deleted": ok}
-    if name == "add_workspace_note":
-        validate_input_size(args.get("title"), "note title", 500)
-        validate_input_size(args.get("body"), "note body", 10_000_000)
-        return await db_module.add_workspace_note(
-            db, args["title"], args["body"], args.get("tags"),
-            tenant_id=_mcp_tenant_id,
-        )
-    if name == "get_workspace_notes":
-        return await db_module.get_workspace_notes(
-            db, tag=args.get("tag"), tenant_id=_mcp_tenant_id,
-        )
-    if name == "pin_workspace_decision":
-        validate_input_size(args.get("title"), "decision title", 500)
-        validate_input_size(args.get("body"), "decision body", 100_000)
-        return await db_module.pin_workspace_decision(
-            db, args["title"], args["body"],
-            category=args.get("category", "TECHNICAL"),
-            tenant_id=_mcp_tenant_id,
-        )
-    if name == "get_workspace_decisions":
-        return await db_module.get_workspace_decisions(
-            db, include_superseded=args.get("include_superseded", False),
-            tenant_id=_mcp_tenant_id,
-        )
-    if name == "get_workspace_settings":
-        return await db_module.get_workspace_settings(db, tenant_id=_mcp_tenant_id)
-    if name == "update_workspace_settings":
-        return await db_module.update_workspace_settings(
-            db,
-            hitl_auto_answer_default=args.get("hitl_auto_answer_default"),
-            sprint_name_default=args.get("sprint_name_default"),
-            handoff_template=args.get("handoff_template"),
-            tenant_id=_mcp_tenant_id,
-        )
     if name == "get_context_block":
         # v2.3 — assemble the same shape as /projects/{id}/context-block but
         # return both the rendered text AND the source dict so MCP clients
@@ -1338,76 +1753,202 @@ async def _dispatch_mcp_tool(
             text = f"{ws_block}\n\n{text}"
         xml_text = f'<meridian_context project_id="{project_id}" mode="{mode}">\n{text}\n</meridian_context>'
         return {"mode": mode, "text": xml_text, "project_id": project_id}
-    if name == "list_hitl_requests":
-        # dcf1e428 — default 'recent' (pending + answered last 24h) so dismissed HITLs
-        # don't give false "no pending HITLs" confidence to planning sessions.
-        status_filter = args.get("status", "recent")
-        if status_filter == "all":
-            status_filter = None
-        # project_id is optional — None lists across all projects (like the
-        # dashboard), so cross-project HITLs aren't missed (277567dc).
-        return await db_module.list_hitl_requests(
-            db, args.get("project_id"),
-            status=status_filter,
-            limit=args.get("limit", 50),
-        )
-    if name == "answer_hitl":
-        result = await _server._answer_hitl_and_apply(
-            db, args["request_id"], args["answer"],
-            answered_by=args.get("answered_by"), approved=True,
-        )
-        if result is None:
-            raise ValueError("hitl request not found")
-        return result
-    if name == "dismiss_hitl":
-        result = await db_module.dismiss_hitl_request(db, args["request_id"])
-        if result is not None:
-            await _server._on_hitl_answered(db, result, approved=False)
-        if result is None:
-            raise ValueError("hitl request not found")
-        return result
-    if name == "update_md_section":
-        md_file = args["file"]
-        anchor = args["anchor"]
-        content = args["content"]
-        # Raises ValueError for non-replace anchors / unknown files / README.
-        md_anchors_module.assert_replace_target(md_file, anchor)
-        # v1.1 — force=true: human planning sessions (claude.ai) skip the HITL
-        # round-trip and apply the section replacement directly. Executor sessions
-        # omit force (default False) so the diff stays human-gated as before.
-        if args.get("force") in (True, 1, "true", "1", "yes"):
-            try:
-                path = await md_anchors_module.apply_replace(md_file, anchor, content)
-            except md_anchors_module.AnchorError as exc:
-                return {"applied": False, "apply_error": str(exc)}
-            except Exception as exc:  # noqa: BLE001 — never crash the tool call
-                return {"applied": False, "apply_error": f"write failed: {exc}"}
-            if path is None:
-                return {"applied": False, "reason": "no-op-or-hosted"}
-            return {"applied": True, "forced": True, "file": md_file, "anchor": anchor}
-        diff = md_anchors_module.build_diff(md_file, anchor, content)
-        payload = json.dumps({
-            "file": md_file,
-            "anchor": anchor,
-            "content": content,
-            "base_hash": md_anchors_module.anchor_content_hash(md_file, anchor),
-            "diff": diff,
-        })
-        return await db_module.request_hitl(
-            db, args["project_id"],
-            question=f"Approve update to {md_file} § {anchor}?",
-            session_id=args.get("session_id"),
-            context=(
-                f"Proposed section replacement for {md_file} (anchor: {anchor}). "
-                "Review the diff in the dashboard, then Approve or Reject."
-            ),
-            urgency=args.get("urgency", "normal"),
-            kind="md_section_update",
-            payload=payload,
-        )
     if name == "list_sessions":
         active_only = args.get("status", "active") != "all"
         return await db_module.get_sessions(db, args["project_id"], active_only=active_only)
+    if name == "get_session_log":
+        run = await db_module.get_executor_run_by_session(db, args.get("session_id", ""))
+        if run is None:
+            return {"error": "no run found for session"}
+        return {
+            "run_id": run["id"],
+            "session_id": run["session_id"],
+            "started_at": run["started_at"],
+            "ended_at": run.get("ended_at"),
+            "status": run["status"],
+            "task_count": run["task_count"],
+            "transcript": run["transcript"],
+        }
+    if name == "get_agent_instructions":
+        instructions = await db_module.get_agent_instructions(db, args["project_id"])
+        return {"project_id": args["project_id"], "agent_instructions": instructions}
+    if name == "set_agent_instructions":
+        validate_input_size(args.get("instructions"), "agent_instructions", 100_000)
+        instructions = (args.get("instructions") or "").strip() or None
+        return await db_module.set_agent_instructions(db, args["project_id"], instructions)
+    if name == "set_executor_config":
+        from ..executor_config import merge_repo_paths  # local — avoid import cycle
+        # Merge onto the existing config so we never wipe other keys (repo_paths,
+        # hostnames, filesystem_roots, …). repo_paths is merged entry-by-entry so
+        # a manual {cwd, hostname} coexists with hook-registered ones.
+        existing = await db_module.get_executor_config(db, args["project_id"])
+        cfg = dict(existing) if isinstance(existing, dict) else {}
+        for k in ("repo_path", "env_file", "test_cmd", "test_min",
+                  "deploy_cmd", "shell_type", "branch"):
+            if k in args:
+                cfg[k] = args[k]
+        if "repo_paths" in args:
+            cfg["repo_paths"] = merge_repo_paths(cfg.get("repo_paths"), args["repo_paths"])
+        return await db_module.set_executor_config(db, args["project_id"], cfg)
+    if name == "idle_until_session_done":
+        return await _server._idle_until_session_done(db, args["watching_session_id"])
+    if name == "search_all":
+        return await db_module.search_all(
+            db, args["project_id"], args["query"],
+            limit=args.get("limit", 10),
+        )
+    if name == "get_session_brief":
+        # v2.5 — single-call orientation, <500 tokens, XML output.
+        project_id = args["project_id"]
+        role = args.get("role", "worker")
+        session_id_for_notes = args.get("session_id")
+        goal = await db_module.get_goal(db, project_id)
+        tasks = await db_module.get_tasks(db, project_id, limit=5)
+        # dcf1e428 — use 'recent' to surface pending + answered last 24h for planning sessions
+        hitl_rows = await db_module.list_hitl_requests(db, project_id, status="recent")
+        sprint_items = await db_module.get_sprint_items(db, project_id, status="pending")
+        # 0507f4a1 — sprint progress summary for session brief
+        _all_items_for_progress = await db_module.get_sprint_items(db, project_id)
+        _done_count = sum(1 for it in _all_items_for_progress if it.get("status") == "done")
+        _total_count = len(_all_items_for_progress)
+        _pct = round(100 * _done_count / _total_count) if _total_count else 0
+        blocking = [t for t in tasks if t.get("status") == "failed"]
+        sprint_str = (goal.get("sprint") or "") if goal else ""
+        tasks_xml = "\n".join(
+            f'  <task status="{t.get("status","?")}">{(t.get("description") or "")[:80]}</task>'
+            for t in tasks
+        )
+        sprint_items_xml = "\n".join(
+            f'  <item version="{it.get("version","")}">{(it.get("title") or "")[:80]}</item>'
+            for it in sprint_items[:5]
+        )
+        # 277567dc — surface pending HITLs so session sees what needs a human decision.
+        # dcf1e428 — also surface recently answered HITLs so planning sessions can see what was decided.
+        _pending_hitls = [h for h in hitl_rows if h.get("status") == "pending"]
+        _answered_hitls = [h for h in hitl_rows if h.get("status") != "pending"]
+        if _pending_hitls:
+            hitl_xml = (
+                f'<hitl_pending count="{len(_pending_hitls)}">\n'
+                + "\n".join(
+                    f'  <request id="{h.get("id","")}" urgency="{h.get("urgency","normal")}">'
+                    f'{(h.get("question") or "")[:140]}</request>'
+                    for h in _pending_hitls[:5]
+                )
+                + "\n</hitl_pending>"
+            )
+        else:
+            hitl_xml = ""
+        if _answered_hitls:
+            hitl_xml += (
+                f'\n<hitl_recent count="{len(_answered_hitls)}">\n'
+                + "\n".join(
+                    f'  <request status="{h.get("status","?")}">'
+                    f'Q: {(h.get("question") or "")[:80]} '
+                    f'A: {(h.get("answer") or "")[:80]}</request>'
+                    for h in _answered_hitls[:3]
+                )
+                + "\n</hitl_recent>"
+            )
+        blocking_xml = f'<blocking>{(blocking[0].get("description") or "")[:100]}</blocking>' if blocking else ""
+        # v2.6 — include session scratch-pad notes at top of brief
+        notes_xml = ""
+        new_items_xml = ""
+        if session_id_for_notes:
+            try:
+                session_notes = await db_module.get_session_notes(db, session_id_for_notes)
+                if session_notes:
+                    notes_xml = "<session_notes>\n" + "\n".join(
+                        f'  <note title="{n.get("title","")}">{(n.get("body") or "")[:120]}</note>'
+                        for n in session_notes
+                    ) + "\n</session_notes>\n"
+            except Exception:
+                pass
+            # fd86aacc — show items added to the board since this session started
+            try:
+                _all_sess = await db_module.get_sessions(db, project_id, active_only=False)
+                _curr_sess = next(
+                    (s for s in _all_sess if s.get("id") == session_id_for_notes), None
+                )
+                if _curr_sess and _curr_sess.get("created_at"):
+                    _sess_started = str(_curr_sess["created_at"])
+                    _all_items = await db_module.get_sprint_items(db, project_id)
+                    _new_count = sum(
+                        1 for it in _all_items
+                        if (it.get("added_at") or "") >= _sess_started
+                    )
+                    if _new_count > 0:
+                        new_items_xml = (
+                            f'<board_change>{_new_count} item{"s" if _new_count != 1 else ""}'
+                            f' added since this session started</board_change>\n'
+                        )
+            except Exception:
+                pass
+        _progress_xml = (
+            f'<progress done="{_done_count}" total="{_total_count}" pct="{_pct}%"/>\n'
+            if _total_count else ""
+        )
+        # Sprint-4: planner role gets richer context — all decisions + all notes + active sessions.
+        planner_extra_xml = ""
+        if role == "planner":
+            try:
+                _decisions = await db_module.get_pinned_decisions(db, project_id, include_superseded=False)
+                if _decisions:
+                    # 366317e9 — already ordered urgent → normal → low by the DB
+                    # layer; surface the priority so the planner weights them.
+                    planner_extra_xml += "<decisions>\n" + "\n".join(
+                        f'  <decision priority="{d.get("priority","normal")}" category="{d.get("category","")}">{(d.get("title") or "")}: {(d.get("body") or "")[:120]}</decision>'
+                        for d in _decisions[:20]
+                    ) + "\n</decisions>\n"
+            except Exception:
+                pass
+            try:
+                # 5a5bba43 — planner context renders note bodies, so ask for them.
+                _wiki_notes = await db_module.get_project_notes(db, project_id, bodies=True)
+                # High-priority notes first
+                _wiki_notes = sorted(_wiki_notes, key=lambda n: {"high": 0, "normal": 1, "low": 2}.get(n.get("priority", "normal"), 1))
+                if _wiki_notes:
+                    planner_extra_xml += "<project_notes>\n" + "\n".join(
+                        f'  <note priority="{n.get("priority","normal")}" kind="{n.get("note_kind","wiki")}" tags="{n.get("tags","")}">'
+                        f'{(n.get("title") or "")}: {(n.get("body") or "")[:120]}</note>'
+                        for n in _wiki_notes[:30]
+                    ) + "\n</project_notes>\n"
+            except Exception:
+                pass
+            try:
+                _active_sessions = await db_module.get_sessions(db, project_id, active_only=True)
+                if _active_sessions:
+                    planner_extra_xml += "<active_sessions>\n" + "\n".join(
+                        f'  <session id="{s.get("id","")}" name="{s.get("name","")}" human="{s.get("human_id","")}" last_seen="{s.get("last_seen","")[:19]}"/>'
+                        for s in _active_sessions[:10]
+                    ) + "\n</active_sessions>\n"
+            except Exception:
+                pass
+        brief = (
+            f'<session_brief project_id="{project_id}" role="{role}">\n'
+            f'{notes_xml}'
+            f'{new_items_xml}'
+            f'{_progress_xml}'
+            f'<sprint>{sprint_str[:200]}</sprint>\n'
+            f'<pending_items>\n{sprint_items_xml}\n</pending_items>\n'
+            f'<last_tasks>\n{tasks_xml}\n</last_tasks>\n'
+            f'{blocking_xml}\n'
+            f'{hitl_xml}\n'
+            f'{planner_extra_xml}'
+            f'</session_brief>'
+        )
+        return {"text": brief, "project_id": project_id, "role": role}
+    return _MISS
+
+
+async def _handle_sprint_tools(
+    name: str,
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """Dispatch group: add_sprint_note, get_sprint_notes, add_sprint_item, update_sprint_item, set_sprint, get_sprint_progress, get_sprint_items, claim_sprint_item, add_subtask, split_sprint_item, merge_sprint_items, complete_sprint_item."""
     if name == "add_sprint_note":
         validate_input_size(args.get("title"), "note title", 500)
         validate_input_size(args.get("body"), "note body", 10_000_000)
@@ -1418,21 +1959,6 @@ async def _dispatch_mcp_tool(
         return await db_module.get_session_notes(db, args["session_id"])
     if name == "add_sprint_item":
         validate_input_size(args.get("title"), "sprint item title", 500)
-        # 10c0f6a0 — fuzzy duplicate guard: warn if title closely matches existing item
-        _new_words = set(args["title"].lower().split())
-        _dup_warnings: list[dict[str, Any]] = []
-        if len(_new_words) >= 3:
-            _all_items = await db_module.get_sprint_items(db, args["project_id"])
-            for _ex in _all_items:
-                if _ex.get("status") in {"pending", "todo", "in_progress", "done"}:
-                    _ex_words = set(_ex["title"].lower().split())
-                    if _ex_words:
-                        _overlap = len(_new_words & _ex_words) / len(_new_words)
-                        if _overlap >= 0.6:
-                            _dup_warnings.append({
-                                "item_id": _ex["id"], "title": _ex["title"][:120],
-                                "status": _ex["status"], "match_pct": round(_overlap * 100),
-                            })
         # fd86aacc — warn if active executor sessions exist when adding a new item
         _active_session_warnings: list[str] = []
         try:
@@ -1461,10 +1987,13 @@ async def _dispatch_mcp_tool(
             depends_on=args.get("depends_on"),
             failure_mode=args.get("failure_mode"),
             milestone_type=args.get("milestone_type", "task"),
+            force=bool(args.get("force", False)),
         )
+        # b0d42ef6 — duplicate guard blocked the insert: surface the error as-is
+        # (no item was created, so the warnings below don't apply).
+        if isinstance(_new_item, dict) and _new_item.get("error") == "duplicate":
+            return _new_item
         _extra: dict[str, Any] = {}
-        if _dup_warnings:
-            _extra["duplicate_warnings"] = _dup_warnings
         if _active_session_warnings:
             _extra["active_session_warning"] = (
                 "WARNING: " + "; ".join(_active_session_warnings)
@@ -1793,40 +2322,18 @@ async def _dispatch_mcp_tool(
                 pref_key="sprint",
             )
         return item
-    if name == "get_session_log":
-        run = await db_module.get_executor_run_by_session(db, args.get("session_id", ""))
-        if run is None:
-            return {"error": "no run found for session"}
-        return {
-            "run_id": run["id"],
-            "session_id": run["session_id"],
-            "started_at": run["started_at"],
-            "ended_at": run.get("ended_at"),
-            "status": run["status"],
-            "task_count": run["task_count"],
-            "transcript": run["transcript"],
-        }
-    if name == "get_agent_instructions":
-        instructions = await db_module.get_agent_instructions(db, args["project_id"])
-        return {"project_id": args["project_id"], "agent_instructions": instructions}
-    if name == "set_agent_instructions":
-        validate_input_size(args.get("instructions"), "agent_instructions", 100_000)
-        instructions = (args.get("instructions") or "").strip() or None
-        return await db_module.set_agent_instructions(db, args["project_id"], instructions)
-    if name == "set_executor_config":
-        from ..executor_config import merge_repo_paths  # local — avoid import cycle
-        # Merge onto the existing config so we never wipe other keys (repo_paths,
-        # hostnames, filesystem_roots, …). repo_paths is merged entry-by-entry so
-        # a manual {cwd, hostname} coexists with hook-registered ones.
-        existing = await db_module.get_executor_config(db, args["project_id"])
-        cfg = dict(existing) if isinstance(existing, dict) else {}
-        for k in ("repo_path", "env_file", "test_cmd", "test_min",
-                  "deploy_cmd", "shell_type", "branch"):
-            if k in args:
-                cfg[k] = args[k]
-        if "repo_paths" in args:
-            cfg["repo_paths"] = merge_repo_paths(cfg.get("repo_paths"), args["repo_paths"])
-        return await db_module.set_executor_config(db, args["project_id"], cfg)
+    return _MISS
+
+
+async def _handle_file_claims(
+    name: str,
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """Dispatch group: claim_file, get_file_claims, get_symbol_claims, get_symbol_hotspots, release_file."""
     if name == "claim_file":
         # 4bac57ff — symbol-level claim when both `symbol` and `content` are
         # supplied; otherwise the coarse whole-file lock. Falls back to a
@@ -1838,11 +2345,24 @@ async def _dispatch_mcp_tool(
                 db, args["session_id"], args["file_path"], _symbol, _content
             )
             if result.get("reason") == "unparseable":
-                return await db_module.claim_file(db, args["file_path"], args["session_id"])
+                # 771c00d7 — still surface code-anchored notes (symbol-scoped) on
+                # the whole-file fallback so the executor never misses a warning.
+                return await db_module.claim_file(
+                    db, args["file_path"], args["session_id"], symbol=_symbol
+                )
+            # 771c00d7 — attach symbol-scoped code notes to the symbol claim too,
+            # resolving the project from the session (same as claim_file does).
+            result["code_notes"] = await db_module._code_notes_for_session_file(
+                db, args["session_id"], args["file_path"], _symbol,
+            )
             return result
-        return await db_module.claim_file(db, args["file_path"], args["session_id"])
+        return await db_module.claim_file(
+            db, args["file_path"], args["session_id"], symbol=_symbol
+        )
     if name == "get_file_claims":
-        return await db_module.get_file_claims(db, args["file_path"])
+        return await db_module.get_file_claims(
+            db, args["file_path"], args.get("project_id"), args.get("symbol")
+        )
     if name == "get_symbol_claims":
         return {"claims": await db_module.get_symbol_claims(db, args["file_path"])}
     if name == "get_symbol_hotspots":
@@ -1854,150 +2374,18 @@ async def _dispatch_mcp_tool(
     if name == "release_file":
         released = await db_module.release_file(db, args["file_path"], args["session_id"])
         return {"released": released, "file_path": args["file_path"]}
-    if name == "idle_until_session_done":
-        return await _server._idle_until_session_done(db, args["watching_session_id"])
-    if name == "search_all":
-        return await db_module.search_all(
-            db, args["project_id"], args["query"],
-            limit=args.get("limit", 10),
-        )
-    if name == "get_session_brief":
-        # v2.5 — single-call orientation, <500 tokens, XML output.
-        project_id = args["project_id"]
-        role = args.get("role", "worker")
-        session_id_for_notes = args.get("session_id")
-        goal = await db_module.get_goal(db, project_id)
-        tasks = await db_module.get_tasks(db, project_id, limit=5)
-        # dcf1e428 — use 'recent' to surface pending + answered last 24h for planning sessions
-        hitl_rows = await db_module.list_hitl_requests(db, project_id, status="recent")
-        sprint_items = await db_module.get_sprint_items(db, project_id, status="pending")
-        # 0507f4a1 — sprint progress summary for session brief
-        _all_items_for_progress = await db_module.get_sprint_items(db, project_id)
-        _done_count = sum(1 for it in _all_items_for_progress if it.get("status") == "done")
-        _total_count = len(_all_items_for_progress)
-        _pct = round(100 * _done_count / _total_count) if _total_count else 0
-        blocking = [t for t in tasks if t.get("status") == "failed"]
-        sprint_str = (goal.get("sprint") or "") if goal else ""
-        tasks_xml = "\n".join(
-            f'  <task status="{t.get("status","?")}">{(t.get("description") or "")[:80]}</task>'
-            for t in tasks
-        )
-        sprint_items_xml = "\n".join(
-            f'  <item version="{it.get("version","")}">{(it.get("title") or "")[:80]}</item>'
-            for it in sprint_items[:5]
-        )
-        # 277567dc — surface pending HITLs so session sees what needs a human decision.
-        # dcf1e428 — also surface recently answered HITLs so planning sessions can see what was decided.
-        _pending_hitls = [h for h in hitl_rows if h.get("status") == "pending"]
-        _answered_hitls = [h for h in hitl_rows if h.get("status") != "pending"]
-        if _pending_hitls:
-            hitl_xml = (
-                f'<hitl_pending count="{len(_pending_hitls)}">\n'
-                + "\n".join(
-                    f'  <request id="{h.get("id","")}" urgency="{h.get("urgency","normal")}">'
-                    f'{(h.get("question") or "")[:140]}</request>'
-                    for h in _pending_hitls[:5]
-                )
-                + "\n</hitl_pending>"
-            )
-        else:
-            hitl_xml = ""
-        if _answered_hitls:
-            hitl_xml += (
-                f'\n<hitl_recent count="{len(_answered_hitls)}">\n'
-                + "\n".join(
-                    f'  <request status="{h.get("status","?")}">'
-                    f'Q: {(h.get("question") or "")[:80]} '
-                    f'A: {(h.get("answer") or "")[:80]}</request>'
-                    for h in _answered_hitls[:3]
-                )
-                + "\n</hitl_recent>"
-            )
-        blocking_xml = f'<blocking>{(blocking[0].get("description") or "")[:100]}</blocking>' if blocking else ""
-        # v2.6 — include session scratch-pad notes at top of brief
-        notes_xml = ""
-        new_items_xml = ""
-        if session_id_for_notes:
-            try:
-                session_notes = await db_module.get_session_notes(db, session_id_for_notes)
-                if session_notes:
-                    notes_xml = "<session_notes>\n" + "\n".join(
-                        f'  <note title="{n.get("title","")}">{(n.get("body") or "")[:120]}</note>'
-                        for n in session_notes
-                    ) + "\n</session_notes>\n"
-            except Exception:
-                pass
-            # fd86aacc — show items added to the board since this session started
-            try:
-                _all_sess = await db_module.get_sessions(db, project_id, active_only=False)
-                _curr_sess = next(
-                    (s for s in _all_sess if s.get("id") == session_id_for_notes), None
-                )
-                if _curr_sess and _curr_sess.get("created_at"):
-                    _sess_started = str(_curr_sess["created_at"])
-                    _all_items = await db_module.get_sprint_items(db, project_id)
-                    _new_count = sum(
-                        1 for it in _all_items
-                        if (it.get("added_at") or "") >= _sess_started
-                    )
-                    if _new_count > 0:
-                        new_items_xml = (
-                            f'<board_change>{_new_count} item{"s" if _new_count != 1 else ""}'
-                            f' added since this session started</board_change>\n'
-                        )
-            except Exception:
-                pass
-        _progress_xml = (
-            f'<progress done="{_done_count}" total="{_total_count}" pct="{_pct}%"/>\n'
-            if _total_count else ""
-        )
-        # Sprint-4: planner role gets richer context — all decisions + all notes + active sessions.
-        planner_extra_xml = ""
-        if role == "planner":
-            try:
-                _decisions = await db_module.get_pinned_decisions(db, project_id, include_superseded=False)
-                if _decisions:
-                    planner_extra_xml += "<decisions>\n" + "\n".join(
-                        f'  <decision category="{d.get("category","")}">{(d.get("title") or "")}: {(d.get("body") or "")[:120]}</decision>'
-                        for d in _decisions[:20]
-                    ) + "\n</decisions>\n"
-            except Exception:
-                pass
-            try:
-                _wiki_notes = await db_module.get_project_notes(db, project_id)
-                # High-priority notes first
-                _wiki_notes = sorted(_wiki_notes, key=lambda n: {"high": 0, "normal": 1, "low": 2}.get(n.get("priority", "normal"), 1))
-                if _wiki_notes:
-                    planner_extra_xml += "<project_notes>\n" + "\n".join(
-                        f'  <note priority="{n.get("priority","normal")}" kind="{n.get("note_kind","wiki")}" tags="{n.get("tags","")}">'
-                        f'{(n.get("title") or "")}: {(n.get("body") or "")[:120]}</note>'
-                        for n in _wiki_notes[:30]
-                    ) + "\n</project_notes>\n"
-            except Exception:
-                pass
-            try:
-                _active_sessions = await db_module.get_sessions(db, project_id, active_only=True)
-                if _active_sessions:
-                    planner_extra_xml += "<active_sessions>\n" + "\n".join(
-                        f'  <session id="{s.get("id","")}" name="{s.get("name","")}" human="{s.get("human_id","")}" last_seen="{s.get("last_seen","")[:19]}"/>'
-                        for s in _active_sessions[:10]
-                    ) + "\n</active_sessions>\n"
-            except Exception:
-                pass
-        brief = (
-            f'<session_brief project_id="{project_id}" role="{role}">\n'
-            f'{notes_xml}'
-            f'{new_items_xml}'
-            f'{_progress_xml}'
-            f'<sprint>{sprint_str[:200]}</sprint>\n'
-            f'<pending_items>\n{sprint_items_xml}\n</pending_items>\n'
-            f'<last_tasks>\n{tasks_xml}\n</last_tasks>\n'
-            f'{blocking_xml}\n'
-            f'{hitl_xml}\n'
-            f'{planner_extra_xml}'
-            f'</session_brief>'
-        )
-        return {"text": brief, "project_id": project_id, "role": role}
+    return _MISS
+
+
+async def _handle_planning_tools(
+    name: str,
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """Dispatch group: reconcile_sprint_drift, get_planning_brief."""
     if name == "reconcile_sprint_drift":
         from .. import handoff as handoff_module_local
         project = await db_module.get_project(db, args["project_id"])
@@ -2073,6 +2461,49 @@ async def _dispatch_mcp_tool(
                 for h in (hitls if isinstance(hitls, list) else [])[:5]
             ],
         }
+    return _MISS
+
+
+async def _dispatch_mcp_tool(
+    name: str,
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None = None,
+) -> Any:
+    """Route a tools/call to the appropriate db_module function."""
+    # Tenant scope for the workspace layer (notes/decisions/settings). None for
+    # self-host / unauthenticated; the db functions then skip isolation.
+    _mcp_tenant_id = tenant.get("id") if tenant else None
+    # b6ab6e83 — project_name resolver: accept project_name as alternative to
+    # project_id, and resolve non-UUID project_id values as human-readable names.
+    _pid_raw = args.get("project_id", "")
+    _pname_raw = args.get("project_name", "")
+    _is_uuid = bool(re.match(
+        r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+        _pid_raw, re.I,
+    ))
+    if _pname_raw or (_pid_raw and not _is_uuid):
+        _lookup = _pname_raw or _pid_raw
+        _resolved_proj = await db_module.get_project_by_name(db, _lookup)
+        if _resolved_proj:
+            args = {**args, "project_id": _resolved_proj["id"]}
+        elif _pname_raw and not _pid_raw:
+            raise ValueError(f"no project found matching name '{_lookup}'")
+    _groups = (
+        _handle_project_tools,
+        _handle_task_tools,
+        _handle_notes_decisions,
+        _handle_hitl_tools,
+        _handle_session_tools,
+        _handle_sprint_tools,
+        _handle_file_claims,
+        _handle_planning_tools,
+    )
+    for _grp in _groups:
+        _result = await _grp(name, args, db, data_dir, tenant, _mcp_tenant_id)
+        if _result is not _MISS:
+            return _result
     raise ValueError(f"unknown tool: {name}")
 
 
