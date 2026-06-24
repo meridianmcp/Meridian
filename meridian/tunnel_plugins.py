@@ -38,8 +38,12 @@ DEFAULT_DC_PORT = 8813
 # ``{repo_path}`` placeholder is expanded to the tunnel's working directory at
 # spawn time (see :func:`expand_command`) — Serena needs ``--project`` to load
 # the right repo. Swapping this default is a pure-data change here, no redeploy.
+#
+# The distribution is published on PyPI as ``serena-agent`` (the bare ``serena``
+# project ships no ``serena`` console script), so we pin ``uvx --from
+# serena-agent`` and invoke the ``serena`` entrypoint it provides.
 SERENA_EXTRACT_COMMAND: list[str] = [
-    "uvx", "serena", "start-mcp-server",
+    "uvx", "--from", "serena-agent", "serena", "start-mcp-server",
     "--context", "ide-assistant",
     "--project", "{repo_path}",
 ]
