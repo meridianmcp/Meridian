@@ -2522,6 +2522,166 @@ async def _handle_planning_tools(
     return _MISS
 
 
+async def _handle_plugin_tools(
+    name: str,
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """Dispatch group: list_plugins, get_plugin_details.
+
+    list_plugins returns a lightweight index (~500 tokens) so an executor can
+    see what tunnel plugins are active without loading 50k+ tokens of schemas.
+    get_plugin_details fetches the full schema for one named plugin on demand.
+    Both surface stored skill-guide notes (kind='plugin') when present.
+
+    These are non-fatal if no tunnel is active (returns empty list/error).
+    """
+    if name == "list_plugins":
+        from ..tunnel_plugins import BUILTIN_PLUGINS  # noqa: PLC0415
+        from ..routes import tunnel as _tunnel_mod  # noqa: PLC0415
+        _slot_display = _tunnel_mod.SLOT_DISPLAY_NAMES
+
+        builtin_by_slot = {p["slot"]: p for p in BUILTIN_PLUGINS}
+
+        # Fetch tunnel tool counts per slot (parallel, non-fatal)
+        slot_tool_counts: dict[str, int] = {}
+        tenant_id = tenant.get("id") if tenant else None
+        if tenant_id and _tunnel_mod.has_active_tunnel(tenant_id):
+            try:
+                slot_results = await asyncio.gather(
+                    *[
+                        _tunnel_mod._fetch_slot_tools(tenant_id, label)  # type: ignore[attr-defined]
+                        for label in _tunnel_mod._TUNNEL_LABELS  # type: ignore[attr-defined]
+                    ]
+                )
+                for label, tools in slot_results:
+                    slot_tool_counts[label] = len(tools)
+            except Exception:  # noqa: BLE001
+                pass
+
+        # Fetch stored skill notes (tagged 'plugin-skill') from workspace notes
+        skill_notes: dict[str, dict] = {}
+        try:
+            all_notes = await db_module.get_workspace_notes(
+                db,
+                tag="plugin-skill",
+                tenant_id=_mcp_tenant_id,
+            )
+            for n in (all_notes or []):
+                title = (n.get("title") or "").lower().strip()
+                tags = n.get("tags") or ""
+                # Derive the plugin key from the title or tags
+                # e.g. title "skill/filesystem" or tags "plugin-skill,filesystem"
+                for part in [title] + [t.strip() for t in tags.split(",")]:
+                    if part.startswith("skill/"):
+                        key = part[6:]
+                        skill_notes[key] = n
+                        break
+                    if part not in ("plugin-skill", ""):
+                        skill_notes[part] = n
+        except Exception:  # noqa: BLE001
+            pass
+
+        result_plugins = []
+        for plugin in BUILTIN_PLUGINS:
+            slot = plugin["slot"]
+            display_name = _slot_display.get(slot, slot)
+            tool_count = slot_tool_counts.get(slot, 0)
+            skill_key = plugin.get("name", "")
+            skill = skill_notes.get(skill_key) or skill_notes.get(display_name)
+            entry: dict[str, Any] = {
+                "name": plugin["name"],
+                "slot": slot,
+                "enabled": plugin.get("enabled", False),
+                "description": plugin.get("description", ""),
+                "tool_count": tool_count,
+                "active": slot in slot_tool_counts,
+            }
+            if skill:
+                entry["skill_note"] = {
+                    "title": skill.get("title", ""),
+                    "slug": skill.get("slug", ""),
+                    "body_preview": (skill.get("body") or "")[:200],
+                }
+            result_plugins.append(entry)
+
+        return {
+            "plugins": result_plugins,
+            "tunnel_active": bool(tenant_id and _tunnel_mod.has_active_tunnel(tenant_id)),
+            "hint": "Call get_plugin_details(name=<plugin_name>) for full tool schema.",
+        }
+
+    if name == "get_plugin_details":
+        from ..tunnel_plugins import BUILTIN_PLUGINS  # noqa: PLC0415
+        from ..routes import tunnel as _tunnel_mod  # noqa: PLC0415
+        _slot_display = _tunnel_mod.SLOT_DISPLAY_NAMES
+
+        plugin_name = (args.get("name") or "").strip()
+        if not plugin_name:
+            return {"error": "name is required"}
+
+        # Find the builtin plugin
+        target = next(
+            (p for p in BUILTIN_PLUGINS if p["name"] == plugin_name),
+            None,
+        )
+        if target is None:
+            return {"error": f"unknown plugin '{plugin_name}'. Call list_plugins to see available plugins."}
+
+        slot = target["slot"]
+        tenant_id = tenant.get("id") if tenant else None
+
+        # Fetch full tools list for this slot
+        tools: list[dict] = []
+        if tenant_id and _tunnel_mod.has_active_tunnel(tenant_id):
+            try:
+                _, tools = await _tunnel_mod._fetch_slot_tools(tenant_id, slot)  # type: ignore[attr-defined]
+            except Exception:  # noqa: BLE001
+                pass
+
+        # Fetch skill note if present (workspace-level notes tagged 'plugin-skill')
+        skill_note: dict | None = None
+        try:
+            all_ws_notes = await db_module.get_workspace_notes(
+                db,
+                tag="plugin-skill",
+                tenant_id=_mcp_tenant_id,
+            )
+            display_name = _slot_display.get(slot, slot)
+            for n in (all_ws_notes or []):
+                title = (n.get("title") or "").lower().strip()
+                tags_str = n.get("tags") or ""
+                tag_parts = [t.strip() for t in tags_str.split(",")]
+                if (plugin_name in tag_parts or display_name in tag_parts
+                        or title in (f"skill/{plugin_name}", f"skill/{display_name}",
+                                     plugin_name, display_name)):
+                    skill_note = n
+                    break
+        except Exception:  # noqa: BLE001
+            pass
+
+        result: dict[str, Any] = {
+            "name": target["name"],
+            "slot": slot,
+            "enabled": target.get("enabled", False),
+            "description": target.get("description", ""),
+            "tools": tools,
+            "tool_count": len(tools),
+        }
+        if skill_note:
+            result["skill_guide"] = {
+                "title": skill_note.get("title", ""),
+                "body": skill_note.get("body") or "",
+                "slug": skill_note.get("slug", ""),
+            }
+        return result
+
+    return _MISS
+
+
 async def _dispatch_mcp_tool(
     name: str,
     args: dict[str, Any],
@@ -2557,6 +2717,7 @@ async def _dispatch_mcp_tool(
         _handle_sprint_tools,
         _handle_file_claims,
         _handle_planning_tools,
+        _handle_plugin_tools,
     )
     for _grp in _groups:
         _result = await _grp(name, args, db, data_dir, tenant, _mcp_tenant_id)
