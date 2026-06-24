@@ -49,3 +49,21 @@ jobs:
         run: pip install ruff
       - name: Lint (warn only — violations do not fail CI yet)
         run: ruff check . || true
+
+  docs-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: prefix-dev/setup-pixi@v0.8.1
+        with:
+          pixi-version: latest
+          cache: false
+      - run: pixi install
+      - name: Regenerate MCP tool docs
+        run: pixi run python scripts/gen_docs.py
+      - name: Fail if docs/mcp-tools.md is stale
+        run: |
+          if ! git diff --exit-code docs/mcp-tools.md; then
+            echo "ERROR: docs/mcp-tools.md is out of date. Run 'pixi run python scripts/gen_docs.py' and commit the result."
+            exit 1
+          fi
