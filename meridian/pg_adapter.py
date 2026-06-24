@@ -481,7 +481,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     last_seen TEXT NOT NULL DEFAULT ({_TS}),
     created_at TEXT NOT NULL DEFAULT ({_TS}),
     session_summary TEXT,
-    checkpoint_data TEXT
+    checkpoint_data TEXT,
+    sprint_version TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_log (
@@ -1292,6 +1293,21 @@ async def _migrate_pg_note_source(conn: PostgresConnection) -> None:
     )
 
 
+async def _migrate_pg_session_sprint_version(conn: PostgresConnection) -> None:
+    """a76cb7c0 — sessions.sprint_version: the sprint-version bucket a session
+    is scoped to.
+
+    start_session stores either the explicit ``version`` it was given or the
+    inferred bucket (most pending items) so later calls auto-filter sprint
+    progress/items to it. Nullable so unscoped sessions behave as before. ADD
+    COLUMN IF NOT EXISTS so re-running is a no-op. Mirrors
+    db._migrate_session_sprint_version.
+    """
+    await conn.executescript(
+        "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS sprint_version TEXT"
+    )
+
+
 def _slugify_note_pg(title: str) -> str:
     """Kebab-case a note title (lowercase, alnum+dashes, collapse, trim).
 
@@ -1868,4 +1884,5 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_decision_priority_edit_log,
     _migrate_pg_code_anchored_notes,
     _migrate_pg_note_source,
+    _migrate_pg_session_sprint_version,
 )

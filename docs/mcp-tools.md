@@ -36,6 +36,7 @@ Register a session and get the full project context (goal, sprint, recent tasks,
 | `client` | string | optional |  |
 | `role` | string | optional | Pass 'executor' to inject executor_config and credentials guidance. |
 | `compact` | boolean | optional | Default true — slim orientation. Set false for the full goal/instructions payload. |
+| `version` | string | optional | Optional sprint-version bucket (e.g. 'v0.1.x') to scope this session to. Sprint progress/items in the orientation and /goal filter to it. Omit to auto-infer the bucket with the most pending items. |
 
 **Example:**
 ```

@@ -3492,6 +3492,7 @@ async def _start_session_composite(
     role: str | None = None,
     source: str | None = None,
     compact: bool = False,
+    version: str | None = None,
 ) -> dict[str, Any]:
     """Register + goal + tasks + sessions + handoff-check in one shot.
 
@@ -3504,6 +3505,13 @@ async def _start_session_composite(
     count — and skips the heavy goal_xml / cache_blocks / meridian_instructions
     / workspace payload that overflows an executor's context. Full context is
     available via ``compact=False`` or ``get_session_brief``.
+
+    ``version`` (a76cb7c0) scopes the session to a sprint-version bucket (e.g.
+    "v0.1.x"). When given, the orientation's sprint counts/items are filtered to
+    that version and the scope is stored on the session so later calls (/goal)
+    can reuse it. When omitted, the bucket with the most pending items is
+    inferred; if there are none, the session is left unscoped (every version,
+    legacy behaviour). The resolved value is returned as ``sprint_version``.
 
     G8.34 — If a session with the same ``session_name`` is still active and
     pinged a heartbeat within the last 5 minutes, return a compact
@@ -3557,8 +3565,20 @@ async def _start_session_composite(
 
     if not human_id and not _hosted_mode():
         human_id = db_module.get_default_human_id()
+    # a76cb7c0 — resolve the sprint-version scope: explicit `version` wins;
+    # otherwise infer the bucket with the most pending items. None (no pending
+    # items / no versioned items) leaves the session unscoped (all versions).
+    scoped_version = version
+    if scoped_version is None:
+        try:
+            scoped_version = await db_module.infer_active_sprint_version(
+                db, project_id
+            )
+        except Exception:
+            scoped_version = None
     session = await db_module.register_session(
-        db, project_id, session_name, human_id=human_id, client_type=client_type
+        db, project_id, session_name, human_id=human_id, client_type=client_type,
+        sprint_version=scoped_version,
     )
     _mark_session_connected(session["id"])
     # G9.x - If start_session is called with an explicit project_id, any pending
@@ -3610,8 +3630,11 @@ async def _start_session_composite(
     # instructions / workspace payload (the part that overflows an executor's
     # context) and return just enough to start working.
     if compact:
+        # a76cb7c0 — scope the counts/board_change to the session's sprint
+        # version when one was resolved, so an executor sees only its bucket.
         _c_items = await db_module.get_sprint_items(
-            db, project_id, include_human=(role != "executor")
+            db, project_id, include_human=(role != "executor"),
+            version=scoped_version,
         )
         _c_counts: dict[str, int] = {}
         for _it in _c_items:
@@ -3638,6 +3661,7 @@ async def _start_session_composite(
             "session_id": session["id"],
             "compact": True,
             "sprint": (str(_c_sprint)[:300] if _c_sprint else None),
+            "sprint_version": scoped_version,
             "sprint_summary": {
                 "total": len(_c_items),
                 "done": _c_counts.get("done", 0),
@@ -3649,6 +3673,11 @@ async def _start_session_composite(
             "note": (
                 "Compact orientation. For full goal/decisions/instructions call "
                 "start_session(compact=False) or get_session_brief(project_id)."
+                + (
+                    f" Scoped to sprint version {scoped_version!r} — sprint counts/items "
+                    "are filtered to this bucket."
+                    if scoped_version else ""
+                )
             ),
         }
         # Per-project agent instructions are small but behaviorally critical
@@ -3705,9 +3734,11 @@ async def _start_session_composite(
     # v1.1 — surface the active sprint checklist so cold sessions see
     # what's in flight before doing anything. "Active" = todo/pending/in_progress.
     # Executor sessions (role="executor") exclude human-assigned tasks.
+    # a76cb7c0 — scope to the session's resolved sprint version when present.
     active_statuses = ("todo", "pending", "in_progress")
     all_sprint_items = await db_module.get_sprint_items(
-        db, project_id, include_human=(role != "executor")
+        db, project_id, include_human=(role != "executor"),
+        version=scoped_version,
     )
     pending_items = [
         it for it in all_sprint_items if it.get("status") in active_statuses
@@ -3750,10 +3781,11 @@ async def _start_session_composite(
 
     payload: dict[str, Any] = {
         "session_id": session["id"],
+        "sprint_version": scoped_version,  # a76cb7c0 — resolved scope (or None)
         "goal": goal,
         "goal_xml": goal_xml,  # v0.6.1 — always present
         "goal_cache_blocks": goal_cache_blocks,  # v0.6.2 — ready for Anthropic
-        "sprint_items": pending_items,  # v1.1 — active checklist
+        "sprint_items": pending_items,  # v1.1 — active checklist (scoped)
         "sprint_items_xml": sprint_items_xml,
         "recent_tasks": recent_tasks,
         "active_sessions": active_sessions,

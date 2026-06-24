@@ -181,6 +181,7 @@ CREATE TABLE IF NOT EXISTS sessions (
         CHECK (status IN ('active','idle','closed','archived')),
     last_seen TEXT NOT NULL DEFAULT (datetime('now')),
     checkpoint_data TEXT,
+    sprint_version TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -757,6 +758,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_decision_priority_edit_log(db)
     await _migrate_code_anchored_notes(db)
     await _migrate_note_source(db)
+    await _migrate_session_sprint_version(db)
     return db
 
 
@@ -1466,6 +1468,7 @@ async def register_session(
     session_type: str = "human",
     agent_framework: str = "claude_code",
     client_type: str | None = None,
+    sprint_version: str | None = None,
 ) -> dict[str, Any]:
     """Create a session row in 'active' state.
 
@@ -1484,14 +1487,19 @@ async def register_session(
 
     ``client_type`` (v2.6) identifies the client app: claude-code, claude-desktop,
     cursor, or other. Optional — used for presence indicators in the dashboard.
+
+    ``sprint_version`` (a76cb7c0) scopes the session to one sprint-version
+    bucket. start_session passes the explicit or inferred version so later calls
+    can auto-filter sprint progress/items to it. NULL = unscoped (all versions),
+    the legacy behaviour.
     """
     if session_type not in {"human", "worker"}:
         raise ValueError(f"invalid session_type: {session_type!r}")
     sid = _new_id()
     await db.execute(
-        "INSERT INTO sessions (id, project_id, name, human_id, session_type, agent_framework, client_type) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (sid, project_id, name, human_id, session_type, agent_framework, client_type),
+        "INSERT INTO sessions (id, project_id, name, human_id, session_type, agent_framework, client_type, sprint_version) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (sid, project_id, name, human_id, session_type, agent_framework, client_type, sprint_version),
     )
     await db.commit()
     async with db.execute(
@@ -3148,12 +3156,67 @@ async def get_sprint_items_page(
     return items, total
 
 
+async def infer_active_sprint_version(
+    db: aiosqlite.Connection, project_id: str
+) -> str | None:
+    """a76cb7c0 — infer the sprint-version bucket with the most pending items.
+
+    Counts pending (status ``pending``/``todo``) sprint items per non-empty
+    ``version`` and returns the bucket with the most. Human-assigned items
+    (milestone_type='human') are excluded — executor scoping should track the
+    automatable backlog, not a person's task list. Ties break on the bucket whose
+    earliest pending item was added first (the older sprint), so scoping is
+    stable across calls rather than flapping between equally-sized buckets.
+
+    Returns ``None`` when there are no pending items (or none carry a version),
+    so a session over an empty/version-less board is left unscoped (no filter)
+    and behaves exactly as before.
+    """
+    counts: dict[str, int] = {}
+    first_seen: dict[str, str] = {}
+    for it in await get_sprint_items(db, project_id, include_human=False):
+        if it.get("status") not in ("pending", "todo"):
+            continue
+        version = it.get("version")
+        if not version:
+            continue
+        counts[version] = counts.get(version, 0) + 1
+        added = str(it.get("added_at") or "")
+        # Items arrive oldest-first, so the first add_at we see per bucket is
+        # its earliest pending item — record it once for stable tie-breaking.
+        first_seen.setdefault(version, added)
+    if not counts:
+        return None
+    # Most pending wins; ties go to the bucket whose earliest pending item is
+    # oldest (smallest added_at) for deterministic, non-flapping scoping.
+    return max(
+        counts,
+        key=lambda v: (counts[v], _NEG_TS(first_seen.get(v, ""))),
+    )
+
+
+def _NEG_TS(ts: str) -> tuple[int, str]:
+    """Sort key making an EARLIER timestamp rank HIGHER in a max() tie-break.
+
+    Empty timestamps sort last (rank lowest). Returns a tuple whose natural
+    ordering is the reverse of the string order, so ``max(...)`` prefers the
+    oldest item without needing a separate min pass.
+    """
+    if not ts:
+        return (0, "")
+    # 1 outranks 0 (non-empty beats empty); the inverted string makes an
+    # earlier ts compare greater than a later one under default tuple ordering.
+    inverted = "".join(chr(255 - min(ord(c), 255)) for c in ts)
+    return (1, inverted)
+
+
 async def get_sprint_items(
     db: aiosqlite.Connection,
     project_id: str,
     status: str | None = None,
     show_blocked: bool = True,
     include_human: bool = True,
+    version: str | None = None,
 ) -> list[dict[str, Any]]:
     """List sprint items for a project, oldest first.
 
@@ -3166,6 +3229,10 @@ async def get_sprint_items(
 
     ``include_human=False`` excludes items with milestone_type='human'
     (used for executor sessions that should not see human-assigned tasks).
+
+    ``version`` (a76cb7c0) filters to a single sprint-version bucket. ``None``
+    returns every version. Used by version-scoped sessions so an executor sees
+    only the items in its bucket.
     """
     clauses = ["project_id = ?"]
     params_list: list = [project_id]
@@ -3177,6 +3244,9 @@ async def get_sprint_items(
             )
         clauses.append("status = ?")
         params_list.append(status)
+    if version is not None:
+        clauses.append("version = ?")
+        params_list.append(version)
     if not include_human:
         clauses.append("(milestone_type IS NULL OR milestone_type != 'human')")
     query = (

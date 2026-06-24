@@ -145,12 +145,21 @@ async def _build_executor_goal_messages(
     pid = project["id"]
     pname = project.get("name") or pid
     pending: list[dict[str, Any]] = []
+    # a76cb7c0 — scope the /goal template to the active sprint-version bucket so
+    # it matches what start_session(version=None) will auto-scope to (the bucket
+    # with the most pending items). Best-effort: None → no filter.
+    scoped_version: str | None = None
+    try:
+        scoped_version = await db_module.infer_active_sprint_version(db, pid)
+    except Exception:  # noqa: BLE001 — degrade to unscoped
+        scoped_version = None
     try:
         # Treat 'todo' + 'pending' as the pending bucket, exactly like
         # generate_handoff, so freshly added items (status 'pending') and any
-        # 'todo' items both surface. Human-typed items are excluded.
+        # 'todo' items both surface. Human-typed items are excluded. The version
+        # filter (when known) keeps the template focused on one bucket.
         all_items = await db_module.get_sprint_items(
-            db, pid, include_human=False,
+            db, pid, include_human=False, version=scoped_version,
         )
         pending = [
             it for it in all_items
@@ -160,7 +169,7 @@ async def _build_executor_goal_messages(
     except Exception:  # noqa: BLE001 — empty list still renders a valid goal
         pending = []
 
-    quick_start_goal = _build_quick_start_goal(pending)
+    quick_start_goal = _build_quick_start_goal(pending, version=scoped_version)
     if pending:
         item_lines = "\n".join(
             f"  {i}. [{it['id']}] {(it.get('title') or '').strip()}"
@@ -1095,6 +1104,8 @@ async def _handle_project_tools(
         # 3689f680 — MCP start_session defaults to a compact response so an
         # executor's context isn't blown by the full goal/instructions payload.
         # Pass compact=False explicitly for the full block.
+        # a76cb7c0 — optional `version` scopes the session to a sprint-version
+        # bucket (orientation counts/items + /goal filter to it).
         return await _server._start_session_composite(
             db,
             args["project_id"],
@@ -1104,6 +1115,7 @@ async def _handle_project_tools(
             client_type=args.get("client"),
             role=args.get("role"),
             compact=args.get("compact", True),
+            version=args.get("version"),
         )
     if name == "list_projects":
         return await db_module.list_project_summaries(db)

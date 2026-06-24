@@ -95,8 +95,20 @@ def _build_quick_start_goal(
     pending_sprint_items: list[dict[str, Any]],
     *,
     test_floor: int = _DEFAULT_GOAL_TEST_FLOOR,
+    version: str | None = None,
 ) -> str:
-    """Build the handoff /goal template from the live pending sprint item ids."""
+    """Build the handoff /goal template from the live pending sprint item ids.
+
+    ``version`` (a76cb7c0) scopes the /goal to a single sprint-version bucket:
+    only items whose ``version`` matches are named, so a version-scoped session's
+    /goal doesn't pull in backlog/other-version items. ``None`` keeps every
+    pending item (legacy behaviour).
+    """
+    if version is not None:
+        pending_sprint_items = [
+            item for item in pending_sprint_items
+            if item.get("version") == version
+        ]
     item_ids = [item["id"] for item in pending_sprint_items if item.get("id")]
     if not item_ids:
         return (

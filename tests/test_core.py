@@ -6154,10 +6154,11 @@ def test_pg_migration_registry_matches_historical_order():
         "_migrate_pg_decision_priority_edit_log",
         "_migrate_pg_code_anchored_notes",
         "_migrate_pg_note_source",
+        "_migrate_pg_session_sprint_version",
     ]
     # No duplicates across the three groups.
     allnames = core + hosted + late
-    assert len(allnames) == len(set(allnames)) == 54
+    assert len(allnames) == len(set(allnames)) == 55
 
 
 def test_default_agent_instructions_has_code_intel_protocol():
@@ -6437,7 +6438,8 @@ async def test_schema_all_tables_exist(db):
     """After init_db() every expected table must be present with key columns."""
     expected = {
         "projects": {"id", "name", "creator_human_id", "goal_mode", "decisions"},
-        "sessions": {"id", "project_id", "name", "human_id", "status", "last_seen"},
+        "sessions": {"id", "project_id", "name", "human_id", "status", "last_seen",
+                     "sprint_version"},
         "task_log": {"id", "session_id", "project_id", "description", "status",
                      "claimed_by", "claimed_at"},
         "goal_states": {"id", "project_id", "content", "version",
@@ -13317,3 +13319,237 @@ def test_new_planning_tools_in_tool_list():
     assert "get_planning_brief" in names
     assert "reconcile_sprint_drift" in _READ_ONLY_TOOLS
     assert "get_planning_brief" in _READ_ONLY_TOOLS
+
+
+# ---------------------------------------------------------------------------
+# a76cb7c0 — start_session sprint-version scoping
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_migrate_session_sprint_version_adds_column_idempotently(db):
+    """a76cb7c0 — _migrate_session_sprint_version adds sessions.sprint_version
+    and is a no-op on re-run (and when the column already exists after init_db)."""
+    from meridian.db import migrations as _mig
+
+    assert await _mig._column_exists(db, "sessions", "sprint_version")
+    # Re-running must not raise (ADD COLUMN is guarded) and the column persists.
+    await _mig._migrate_session_sprint_version(db)
+    await _mig._migrate_session_sprint_version(db)
+    assert await _mig._column_exists(db, "sessions", "sprint_version")
+
+
+@pytest.mark.asyncio
+async def test_infer_active_sprint_version_picks_most_pending(db):
+    """The inferred bucket is the version with the most pending items."""
+    p = await db_module.create_project(db, "infer-most")
+    pid = p["id"]
+    # v0.1.x: 3 pending; v1.1: 1 pending → v0.1.x wins.
+    for i in range(3):
+        await db_module.add_sprint_item(db, pid, "v0.1.x", f"alpha item {i}")
+    await db_module.add_sprint_item(db, pid, "v1.1", "backlog item")
+    assert await db_module.infer_active_sprint_version(db, pid) == "v0.1.x"
+
+
+@pytest.mark.asyncio
+async def test_infer_active_sprint_version_ignores_done_and_human(db):
+    """Only pending (pending/todo) non-human items count toward the bucket."""
+    p = await db_module.create_project(db, "infer-status")
+    pid = p["id"]
+    # v2.0: 2 items but both completed → not pending.
+    done1 = await db_module.add_sprint_item(db, pid, "v2.0", "done one")
+    done2 = await db_module.add_sprint_item(db, pid, "v2.0", "done two")
+    await db_module.complete_sprint_item(db, pid, done1["id"])
+    await db_module.complete_sprint_item(db, pid, done2["id"])
+    # v0.1.x: 1 genuinely pending item.
+    await db_module.add_sprint_item(db, pid, "v0.1.x", "pending one")
+    # A human-assigned pending item in another bucket must be ignored.
+    await db_module.add_sprint_item(
+        db, pid, "vHuman", "human task", milestone_type="human",
+    )
+    assert await db_module.infer_active_sprint_version(db, pid) == "v0.1.x"
+
+
+@pytest.mark.asyncio
+async def test_infer_active_sprint_version_none_when_no_pending(db):
+    """No pending items → None (session left unscoped for back-compat)."""
+    p = await db_module.create_project(db, "infer-empty")
+    pid = p["id"]
+    assert await db_module.infer_active_sprint_version(db, pid) is None
+    # Completed-only board is still None.
+    done = await db_module.add_sprint_item(db, pid, "v1", "shipped")
+    await db_module.complete_sprint_item(db, pid, done["id"])
+    assert await db_module.infer_active_sprint_version(db, pid) is None
+
+
+@pytest.mark.asyncio
+async def test_get_sprint_items_version_filter(db):
+    """get_sprint_items(version=...) returns only that bucket; None = all."""
+    p = await db_module.create_project(db, "items-filter")
+    pid = p["id"]
+    await db_module.add_sprint_item(db, pid, "v0.1.x", "a")
+    await db_module.add_sprint_item(db, pid, "v0.1.x", "b")
+    await db_module.add_sprint_item(db, pid, "v1.1", "c")
+    scoped = await db_module.get_sprint_items(db, pid, version="v0.1.x")
+    assert {it["title"] for it in scoped} == {"a", "b"}
+    assert all(it["version"] == "v0.1.x" for it in scoped)
+    # None returns every version.
+    assert len(await db_module.get_sprint_items(db, pid)) == 3
+
+
+@pytest.mark.asyncio
+async def test_start_session_explicit_version_scopes_orientation(db, tmp_path):
+    """a76cb7c0 — explicit version is stored on the session and the compact
+    orientation's counts are filtered to that bucket."""
+    import meridian.server as srv
+
+    p = await db_module.create_project(db, "scope-explicit")
+    pid = p["id"]
+    # Two buckets; pass the SMALLER one explicitly to prove it overrides the
+    # most-pending inference (which would otherwise pick v9.9).
+    await db_module.add_sprint_item(db, pid, "v0.1.x", "scoped item")
+    for i in range(3):
+        await db_module.add_sprint_item(db, pid, "v9.9", f"other {i}")
+
+    payload = await srv._start_session_composite(
+        db, pid, "scoped-session", str(tmp_path), version="v0.1.x", compact=True,
+    )
+    assert payload["sprint_version"] == "v0.1.x"
+    # Only the one v0.1.x pending item is counted, not the 3 in v9.9.
+    assert payload["sprint_summary"]["total"] == 1
+    assert payload["sprint_summary"]["pending"] == 1
+    # Scope is persisted on the session row.
+    async with db.execute(
+        "SELECT sprint_version FROM sessions WHERE id = ?", (payload["session_id"],)
+    ) as cur:
+        row = await cur.fetchone()
+    assert (row["sprint_version"] if isinstance(row, dict) else row[0]) == "v0.1.x"
+
+
+@pytest.mark.asyncio
+async def test_start_session_full_block_scopes_sprint_items(db, tmp_path):
+    """The non-compact orientation's sprint_items list is filtered to the
+    session's resolved version too."""
+    import meridian.server as srv
+
+    p = await db_module.create_project(db, "scope-full")
+    pid = p["id"]
+    await db_module.add_sprint_item(db, pid, "v0.1.x", "in scope")
+    await db_module.add_sprint_item(db, pid, "v2.0", "out of scope")
+
+    payload = await srv._start_session_composite(
+        db, pid, "full-scoped", str(tmp_path), version="v0.1.x", compact=False,
+    )
+    assert payload["sprint_version"] == "v0.1.x"
+    titles = {it["title"] for it in payload["sprint_items"]}
+    assert titles == {"in scope"}
+
+
+@pytest.mark.asyncio
+async def test_start_session_infers_version_when_omitted(db, tmp_path):
+    """No version arg → infer the bucket with the most pending items, store it."""
+    import meridian.server as srv
+
+    p = await db_module.create_project(db, "scope-infer")
+    pid = p["id"]
+    for i in range(2):
+        await db_module.add_sprint_item(db, pid, "v0.1.x", f"alpha {i}")
+    await db_module.add_sprint_item(db, pid, "v1.1", "lonely backlog")
+
+    payload = await srv._start_session_composite(
+        db, pid, "infer-session", str(tmp_path), compact=True,
+    )
+    assert payload["sprint_version"] == "v0.1.x"
+    assert payload["sprint_summary"]["pending"] == 2
+
+
+@pytest.mark.asyncio
+async def test_start_session_no_pending_leaves_unscoped(db, tmp_path):
+    """No pending items → sprint_version is None and nothing is filtered
+    (full back-compat with pre-a76cb7c0 sessions)."""
+    import meridian.server as srv
+
+    p = await db_module.create_project(db, "scope-none")
+    pid = p["id"]
+    # Only a completed item exists — no pending bucket to infer.
+    done = await db_module.add_sprint_item(db, pid, "v1", "already shipped")
+    await db_module.complete_sprint_item(db, pid, done["id"])
+
+    payload = await srv._start_session_composite(
+        db, pid, "unscoped-session", str(tmp_path), compact=True,
+    )
+    assert payload["sprint_version"] is None
+    async with db.execute(
+        "SELECT sprint_version FROM sessions WHERE id = ?", (payload["session_id"],)
+    ) as cur:
+        row = await cur.fetchone()
+    assert (row["sprint_version"] if isinstance(row, dict) else row[0]) is None
+
+
+@pytest.mark.asyncio
+async def test_start_session_via_mcp_passes_version(db, tmp_path):
+    """The MCP tools/call dispatch threads `version` into the composite."""
+    from meridian.mcp.handler import _dispatch_mcp_tool
+
+    p = await db_module.create_project(db, "mcp-version")
+    pid = p["id"]
+    await db_module.add_sprint_item(db, pid, "v0.1.x", "scoped via mcp")
+    await db_module.add_sprint_item(db, pid, "v3.0", "other bucket")
+
+    result = await _dispatch_mcp_tool(
+        "start_session",
+        {"project_id": pid, "session_name": "mcp-sess", "version": "v0.1.x"},
+        db, str(tmp_path),
+    )
+    assert result["sprint_version"] == "v0.1.x"
+    assert result["sprint_summary"]["total"] == 1
+
+
+def test_build_quick_start_goal_filters_by_version():
+    """a76cb7c0 — _build_quick_start_goal(version=...) names only that bucket's
+    items; None keeps every pending item (legacy)."""
+    from meridian.handoff import _build_quick_start_goal
+
+    items = [
+        {"id": "aaa", "version": "v0.1.x"},
+        {"id": "bbb", "version": "v0.1.x"},
+        {"id": "ccc", "version": "v1.1"},
+    ]
+    scoped = _build_quick_start_goal(items, version="v0.1.x")
+    assert "aaa" in scoped and "bbb" in scoped
+    assert "ccc" not in scoped
+    # Unscoped names all three.
+    unscoped = _build_quick_start_goal(items)
+    assert "aaa" in unscoped and "ccc" in unscoped
+
+
+def test_build_quick_start_goal_version_with_no_matches():
+    """A version with no pending items falls back to the verify-complete goal."""
+    from meridian.handoff import _build_quick_start_goal
+
+    items = [{"id": "aaa", "version": "v1.1"}]
+    goal = _build_quick_start_goal(items, version="v0.1.x")
+    assert "Verify remaining work is complete" in goal
+
+
+@pytest.mark.asyncio
+async def test_executor_goal_prompt_scopes_to_active_version(db):
+    """The executor-goal MCP prompt filters its item list + /goal to the
+    inferred active sprint version."""
+    from meridian.mcp.handler import _build_executor_goal_messages
+
+    p = await db_module.create_project(db, "exec-goal-scope")
+    pid = p["id"]
+    a = await db_module.add_sprint_item(db, pid, "v0.1.x", "scoped exec item")
+    await db_module.add_sprint_item(db, pid, "v1.1", "other bucket item")
+    # v0.1.x is the only multi? No — both have 1; ensure v0.1.x wins by count.
+    await db_module.add_sprint_item(db, pid, "v0.1.x", "second scoped item")
+
+    messages = await _build_executor_goal_messages({"project_id": pid}, db)
+    text = messages[0]["content"]["text"]
+    assert a["id"] in text
+    # The other-bucket item id must not appear in the scoped template.
+    other = [
+        it for it in await db_module.get_sprint_items(db, pid, version="v1.1")
+    ][0]
+    assert other["id"] not in text

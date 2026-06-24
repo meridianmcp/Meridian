@@ -1381,6 +1381,15 @@ def build_mcp_server():
                             "enum": ["executor"],
                             "description": "Pass 'executor' to inject executor_config and credentials guidance.",
                         },
+                        "version": {
+                            "type": "string",
+                            "description": (
+                                "Optional sprint-version bucket (e.g. 'v0.1.x') to "
+                                "scope this session to — sprint progress/items in the "
+                                "orientation and /goal filter to it. Omit to auto-infer "
+                                "the bucket with the most pending items."
+                            ),
+                        },
                     },
                     "required": ["session_name"],
                 },
@@ -1717,6 +1726,8 @@ def build_mcp_server():
                 result = {"session_id": arguments["session_id"], "ok": ok}
             elif name == "start_session":
                 # 3689f680 — compact by default (full block via compact=False).
+                # a76cb7c0 — optional `version` scopes the session to a
+                # sprint-version bucket.
                 result = await _start_session_composite(
                     db,
                     arguments["project_id"],
@@ -1726,6 +1737,7 @@ def build_mcp_server():
                     client_type=arguments.get("client"),
                     role=arguments.get("role"),
                     compact=arguments.get("compact", True),
+                    version=arguments.get("version"),
                 )
             elif name == "list_projects":
                 result = await db_module.list_project_summaries(db)
