@@ -1161,7 +1161,17 @@ async function loadExecutorRulesSection(projectId) {
 // disabling a slot is a pure config change here — no redeploy. Rendered under
 // Settings, below Executor Rules. The config is account-scoped, so projectId is
 // only used to locate the settings DOM host.
-const _TUNNEL_DEFAULT_PORTS = { fs: 8808, code: 8809, extract: 8810, ppt: 8811, word: 8812 };
+const _TUNNEL_DEFAULT_PORTS = { fs: 8808, code: 8809, extract: 8810, ppt: 8811, word: 8812, dc: 8813 };
+
+// Opt-in slots (Office + Desktop Commander) ship disabled and their launcher is
+// not bundled, so a fresh account shows them "not connected" with no obvious next
+// step. These per-slot hints give a clear path to fix: the exact launcher command
+// + what it needs. Rendered under the slot row only while it isn't connected.
+const _OPTIN_SLOT_HINTS = {
+  word: { pkg: 'uvx word-mcp-live', note: 'Live Word editing with tracked changes — needs uv (uvx).' },
+  ppt: { pkg: 'uvx powerpoint-mcp', note: 'PowerPoint authoring — needs uv (uvx).' },
+  dc: { pkg: 'npx -y @wonderwhy-er/desktop-commander@latest', note: 'Desktop Commander, local only — needs Node (npx).' },
+};
 
 // Curated, well-known MCP servers a user can drop into a tunnel slot's command.
 // Copy-to-clipboard for now (one-click custom-slot install lands in a later
@@ -1263,6 +1273,13 @@ async function loadTunnelPluginsSection(projectId) {
       const cmd = Array.isArray(p.command) ? p.command.join(' ') : '';
       const dot = active[p.slot] ? 'var(--success, #3fb950)' : 'var(--muted)';
       const dotTitle = active[p.slot] ? 'connected' : 'not connected';
+      // Opt-in slots: when not connected, surface the launcher + how to enable it.
+      const hint = _OPTIN_SLOT_HINTS[p.slot];
+      const hintHtml = (hint && !active[p.slot]) ? `
+          <div style="margin-top:6px;font-size:9px;color:var(--muted);line-height:1.6">
+            Enable the toggle, then restart <code style="font-family:var(--font-mono)">meridian --tunnel</code> to launch
+            <code style="font-family:var(--font-mono)">${escapeHtml(hint.pkg)}</code>.<br>${escapeHtml(hint.note)}
+          </div>` : '';
       return `
         <div style="border:1px solid var(--border);border-radius:4px;padding:8px;margin-bottom:8px">
           <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px">
@@ -1284,6 +1301,7 @@ async function loadTunnelPluginsSection(projectId) {
               title="local proxy port"
               style="width:74px;box-sizing:border-box;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:5px 7px;outline:none">
           </div>
+          ${hintHtml}
           <details class="tp-tools" data-slot="${escapeHtml(p.slot)}" data-loaded="0" style="margin-top:6px">
             <summary style="cursor:pointer;list-style:none;font-size:10px;color:var(--accent);user-select:none">&#9656; tools</summary>
             <div class="tp-tools-body" style="margin-top:5px;font-size:10px;color:var(--muted);font-family:var(--font-mono)">&hellip;</div>
