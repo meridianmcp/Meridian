@@ -879,6 +879,104 @@ def _json_response(payload: dict, status_code: int = 200) -> Response:
     )
 
 
+# ---------------------------------------------------------------------------
+# MCP Registry proxy — sprint item 9b288b91
+# Proxies GET registry.modelcontextprotocol.io/v0/servers to avoid CORS.
+# Returns a normalised subset: id, name, description, install_command, homepage.
+# Cursor-based pagination: pass ?cursor=<opaque> to fetch the next page.
+# ---------------------------------------------------------------------------
+
+_REGISTRY_BASE = "https://registry.modelcontextprotocol.io/v0/servers"
+_REGISTRY_TIMEOUT = 8  # seconds
+
+
+def _extract_install_command(server: dict) -> str:
+    """Best-effort extraction of a runnable install command from a registry entry.
+
+    The MCP registry uses a packages[] array with package_arguments. We prefer
+    uvx (uv) over npx in that order, then fall back to any available runtime.
+    """
+    packages = server.get("packages") or []
+    # Preference order: uv → npm → any
+    _pref = {"uv": 0, "npm": 1}
+    best = None
+    best_score = 999
+    for pkg in packages:
+        runtime = (pkg.get("runtime") or "").lower()
+        score = _pref.get(runtime, 2)
+        if score < best_score:
+            best_score = score
+            best = pkg
+    if not best:
+        return ""
+    runtime = (best.get("runtime") or "").lower()
+    name = best.get("name") or ""
+    args = best.get("package_arguments") or []
+    # Build a string representation: uvx <name> [args] or npx -y <name> [args]
+    if runtime == "uv":
+        cmd_parts = ["uvx", name] + [str(a) for a in args if a]
+    elif runtime == "npm":
+        cmd_parts = ["npx", "-y", name] + [str(a) for a in args if a]
+    else:
+        cmd_parts = [name] + [str(a) for a in args if a]
+    return " ".join(p for p in cmd_parts if p)
+
+
+@router.get("/tunnel/registry")
+async def get_mcp_registry(request: Request) -> Response:
+    """Proxy the official MCP Registry API to avoid browser CORS restrictions.
+
+    Returns a page of MCP servers with: id, name, description, install_command,
+    homepage. Pass ?cursor=<token> for subsequent pages and ?limit=N (default 20,
+    max 50). Requires no auth — the registry is public.
+    """
+    import urllib.request
+    import urllib.parse
+
+    limit = min(int(request.query_params.get("limit", 20)), 50)
+    cursor = request.query_params.get("cursor", "")
+
+    params: dict[str, str] = {"limit": str(limit)}
+    if cursor:
+        params["cursor"] = cursor
+    url = _REGISTRY_BASE + "?" + urllib.parse.urlencode(params)
+
+    try:
+        req = urllib.request.Request(
+            url,
+            headers={"Accept": "application/json", "User-Agent": "Meridian/1.0"},
+        )
+        import socket as _socket
+        with urllib.request.urlopen(req, timeout=_REGISTRY_TIMEOUT) as resp:  # noqa: S310
+            raw = resp.read()
+        data = json.loads(raw)
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("MCP registry fetch failed: %s", exc)
+        return _json_response({"error": "registry unavailable", "servers": [], "next_cursor": None}, status_code=200)
+
+    servers_raw = data.get("servers") or []
+    servers_out = []
+    for s in servers_raw:
+        install_cmd = _extract_install_command(s)
+        homepage = ""
+        if s.get("source_code_location"):
+            homepage = s["source_code_location"].get("url", "")
+        if not homepage:
+            homepage = s.get("homepage", "") or ""
+        servers_out.append({
+            "id": s.get("id") or "",
+            "name": s.get("name") or s.get("id") or "",
+            "description": (s.get("description") or "")[:200],
+            "install_command": install_cmd,
+            "homepage": homepage,
+        })
+
+    return _json_response({
+        "servers": servers_out,
+        "next_cursor": data.get("nextCursor") or data.get("next_cursor") or None,
+    })
+
+
 def _union_filesystem_roots(projects: list[dict]) -> list[str]:
     """Collect a deduped, order-preserved list of executor_config.filesystem_roots
     across the given project rows. executor_config may be a JSON string or dict."""
