@@ -1876,6 +1876,44 @@ _PG_MIGRATIONS_HOSTED = (
     _migrate_pg_tunnel_plugins,
 )
 
+async def _migrate_pg_decision_code_anchor(conn: PostgresConnection) -> None:
+    """777f26b0 — decisions_pinned.code_anchor: optional file path anchor.
+
+    When set, get_decisions_for_file surfaces this decision automatically when
+    an executor calls claim_file for the matching path. Nullable so existing
+    decisions are unaffected. ADD COLUMN IF NOT EXISTS so re-running is a no-op.
+    Mirrors db._migrate_decision_code_anchor.
+    """
+    await conn.executescript(
+        "ALTER TABLE decisions_pinned ADD COLUMN IF NOT EXISTS code_anchor TEXT"
+    )
+
+
+async def _migrate_pg_session_graph_snapshots(conn: PostgresConnection) -> None:
+    """f773a99a — session_graph_snapshots: per-session code-graph metric snapshots.
+
+    Lightweight proxy metrics (node/edge/hotspot/churn counts) computed from
+    file_symbol_claims and task_log. Used by get_graph_diff to compare two
+    sessions' graph impact. CREATE TABLE IF NOT EXISTS so re-running is a no-op.
+    Mirrors db._migrate_session_graph_snapshots.
+    """
+    await conn.executescript(
+        "CREATE TABLE IF NOT EXISTS session_graph_snapshots ("
+        "    id TEXT PRIMARY KEY,"
+        "    session_id TEXT NOT NULL,"
+        "    project_id TEXT NOT NULL,"
+        "    snapshot_at TEXT NOT NULL DEFAULT (to_char(now() at time zone 'utc', 'YYYY-MM-DD HH24:MI:SS')),"
+        "    node_count INTEGER NOT NULL DEFAULT 0,"
+        "    edge_count INTEGER NOT NULL DEFAULT 0,"
+        "    hotspot_count INTEGER NOT NULL DEFAULT 0,"
+        "    file_churn INTEGER NOT NULL DEFAULT 0,"
+        "    metrics_json TEXT"
+        ");"
+        "CREATE INDEX IF NOT EXISTS idx_session_graph_snapshots_session "
+        "ON session_graph_snapshots(session_id);"
+    )
+
+
 # Late migrations — run on every DB after the hosted-only set.
 _PG_MIGRATIONS_LATE = (
     _migrate_pg_workspace_tenant_isolation,
@@ -1903,4 +1941,6 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_note_source,
     _migrate_pg_session_sprint_version,
     _migrate_pg_project_execution_mode,
+    _migrate_pg_decision_code_anchor,
+    _migrate_pg_session_graph_snapshots,
 )

@@ -6158,10 +6158,12 @@ def test_pg_migration_registry_matches_historical_order():
         "_migrate_pg_note_source",
         "_migrate_pg_session_sprint_version",
         "_migrate_pg_project_execution_mode",
+        "_migrate_pg_decision_code_anchor",
+        "_migrate_pg_session_graph_snapshots",
     ]
     # No duplicates across the three groups.
     allnames = core + hosted + late
-    assert len(allnames) == len(set(allnames)) == 56
+    assert len(allnames) == len(set(allnames)) == 58
 
 
 def test_default_agent_instructions_has_code_intel_protocol():

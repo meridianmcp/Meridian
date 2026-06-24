@@ -4954,6 +4954,7 @@ def _github_tools_for_tenant(tenant: dict) -> list[dict[str, Any]]:
                     "new_str": {"type": "string", "description": "Replacement text (may be empty to delete old_str)."},
                     "branch": {"type": "string", "description": "Branch to read + commit on (default: the project's configured branch)."},
                     "message": {"type": "string", "description": "Commit message (default: 'patch_file: update <path>')."},
+                    "session_id": {"type": "string", "description": "Caller session ID — if supplied, Meridian rejects the patch when the file is locked by a different session."},
                 },
                 "required": ["project_id", "file_path", "old_str", "new_str"],
             },
