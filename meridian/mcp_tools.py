@@ -679,6 +679,19 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
      "inputSchema": {"type": "object", "properties": {
          "name": {"type": "string", "description": "Plugin name as returned by list_plugins (e.g. 'filesystem', 'code-intel', 'code-extractor')."}},
          "required": ["name"]}},
+    {"name": "get_graph_diff", "description":
+        "Read-only: compare the latest code-graph snapshots of two sessions — returns delta in node_count, hotspot_count, and file_churn. Use snapshot_graph_metrics first to record each session's current state.",
+     "inputSchema": {"type": "object", "properties": {
+         "session_a": {"type": "string", "description": "First session ID."},
+         "session_b": {"type": "string", "description": "Second session ID to compare against session_a."}},
+         "required": ["session_a", "session_b"]}},
+    {"name": "snapshot_graph_metrics", "description":
+        "Record a code-graph snapshot for a session (node count, edge count, hotspot count, file churn). Call at session start and end to enable get_graph_diff comparisons.",
+     "inputSchema": {"type": "object", "properties": {
+         "session_id": {"type": "string"},
+         "project_id": {"type": "string"},
+         "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."}},
+         "required": ["session_id"]}},
     {"name": "idle_until_session_done", "description":
         "Read-only: Poll every 30 seconds until another session is closed or archived. Use this when you need to wait before editing a locked file.",
      "inputSchema": {"type": "object", "properties": {
@@ -745,6 +758,7 @@ _READ_ONLY_TOOLS = {
     "get_sprint_items", "get_sprint_progress", "get_agent_instructions",
     "reconcile_sprint_drift", "get_planning_brief", "get_file_claims",
     "list_plugins", "get_plugin_details",
+    "get_symbol_claims", "get_symbol_hotspots", "get_graph_diff",
 }
 _DESTRUCTIVE_TOOLS = {"delete_note", "archive_decision", "dismiss_hitl"}
 

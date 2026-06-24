@@ -388,6 +388,23 @@ async def _dispatch_github_tool(name: str, args: dict[str, Any], tenant: dict, d
                 content = _b64.b64decode(data.get("content", "")).decode("utf-8")
             except (ValueError, UnicodeDecodeError):
                 return {"error": f"{path} is not valid UTF-8 text — patch_file only supports text files"}
+            # 6efe7649 — lock enforcement: reject if file is held by another session.
+            _caller_session = (args.get("session_id") or "").strip()
+            if _caller_session:
+                async with db.execute(
+                    "SELECT session_id FROM file_locks "
+                    "WHERE file_path = ? AND expires_at > datetime('now')",
+                    (path,),
+                ) as _lk_cur:
+                    _lk_row = await _lk_cur.fetchone()
+                if _lk_row is not None:
+                    _holder = (
+                        _lk_row["session_id"]
+                        if hasattr(_lk_row, "keys")
+                        else _lk_row[0]
+                    )
+                    if _holder and _holder != _caller_session:
+                        return {"error": f"file locked by session {_holder[:8]}"}
             occurrences = content.count(old_str)
             if occurrences == 0:
                 return {"error": "old_str not found — it must match the file contents exactly (including whitespace)"}
@@ -2391,7 +2408,7 @@ async def _handle_file_claims(
     tenant: dict[str, Any] | None,
     _mcp_tenant_id: Any,
 ) -> Any:
-    """Dispatch group: claim_file, get_file_claims, get_symbol_claims, get_symbol_hotspots, release_file."""
+    """Dispatch group: claim_file, get_file_claims, get_symbol_claims, get_symbol_hotspots, release_file, get_graph_diff, snapshot_graph_metrics."""
     if name == "claim_file":
         # 4bac57ff — symbol-level claim when both `symbol` and `content` are
         # supplied; otherwise the coarse whole-file lock. Falls back to a
@@ -2424,11 +2441,44 @@ async def _handle_file_claims(
     if name == "get_symbol_claims":
         return {"claims": await db_module.get_symbol_claims(db, args["file_path"])}
     if name == "get_symbol_hotspots":
-        return {"hotspots": await db_module.get_symbol_hotspots(
+        _min_s = int(args.get("min_sessions") or 3)
+        _days = int(args.get("days") or 14)
+        hotspots = await db_module.get_symbol_hotspots(
             db, args.get("file_path"),
-            min_sessions=args.get("min_sessions", 3),
-            days=args.get("days", 14),
-        )}
+            min_sessions=_min_s,
+            days=_days,
+        )
+        # 1b4760a9 — file-level suggestions when any hotspot exceeds threshold.
+        suggestions: list[dict] = []
+        if any(h.get("session_count", 0) > 5 for h in hotspots):
+            suggestions = await db_module.get_hotspot_suggestions(
+                db, min_sessions=_min_s, days=_days
+            )
+        return {"hotspots": hotspots, "suggestions": suggestions}
+    if name == "get_graph_diff":
+        # f773a99a — compare graph snapshots between two sessions.
+        sa = (args.get("session_a") or "").strip()
+        sb = (args.get("session_b") or "").strip()
+        if not sa or not sb:
+            return {"error": "session_a and session_b are required"}
+        return await db_module.get_graph_diff(db, sa, sb)
+    if name == "snapshot_graph_metrics":
+        # f773a99a — take a graph snapshot for the calling session.
+        sid = (args.get("session_id") or "").strip()
+        pid = (args.get("project_id") or "").strip()
+        if not sid:
+            return {"error": "session_id is required"}
+        # Fall back to the session's own project_id if not explicitly provided.
+        if not pid:
+            async with db.execute(
+                "SELECT project_id FROM sessions WHERE id = ?", (sid,)
+            ) as _sc:
+                _sr = await _sc.fetchone()
+            if _sr:
+                pid = (_sr["project_id"] if hasattr(_sr, "keys") else _sr[0]) or ""
+        if not pid:
+            return {"error": "project_id is required (or pass project_name)"}
+        return await db_module.snapshot_graph_metrics(db, sid, pid)
     if name == "release_file":
         released = await db_module.release_file(db, args["file_path"], args["session_id"])
         return {"released": released, "file_path": args["file_path"]}
