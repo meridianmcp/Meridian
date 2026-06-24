@@ -55,7 +55,12 @@ def _spawn_kwargs() -> dict:
     :func:`_terminate_proc_tree`). No-op on POSIX.
     """
     if sys.platform == "win32":
-        return {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+        # CREATE_NEW_PROCESS_GROUP (0x00000200) is defined by the stdlib only on
+        # Windows. Reference it via getattr with the literal fallback so the win32
+        # branch is also evaluable on a non-Windows CI host (where a test may
+        # monkeypatch sys.platform to "win32"); on real Windows getattr returns the
+        # genuine constant.
+        return {"creationflags": getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)}
     return {}
 
 

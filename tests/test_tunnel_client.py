@@ -890,6 +890,15 @@ def test_spawn_kwargs_new_process_group_on_windows(monkeypatch):
     assert kw == {"creationflags": 0x00000200}
 
 
+def test_spawn_kwargs_win32_when_constant_missing(monkeypatch):
+    # Reproduces the Linux CI host: sys.platform forced to win32 but the stdlib
+    # defines no CREATE_NEW_PROCESS_GROUP. _spawn_kwargs must fall back to the
+    # literal value, not raise AttributeError (regression for the deploy gate).
+    monkeypatch.setattr(tc.sys, "platform", "win32")
+    monkeypatch.delattr(tc.subprocess, "CREATE_NEW_PROCESS_GROUP", raising=False)
+    assert tc._spawn_kwargs() == {"creationflags": 0x00000200}
+
+
 def test_spawn_kwargs_empty_on_posix(monkeypatch):
     monkeypatch.setattr(tc.sys, "platform", "linux")
     assert tc._spawn_kwargs() == {}
