@@ -645,6 +645,23 @@ CREATE INDEX IF NOT EXISTS idx_workspace_notes_created ON workspace_notes(create
 CREATE INDEX IF NOT EXISTS idx_workspace_decisions_status ON workspace_decisions(status, created_at DESC);
 -- tenant_id indexes added by _migrate_pg_workspace_tenant_isolation (migration handles existing DBs)
 
+-- workspace_sprint_items: tenant-global personal backlog, NOT tied to a single
+-- project. Mirrors the useful subset of sprint_items but keyed by tenant_id;
+-- item_group is the cross-project bucket ('thesis'/'meridian'/'personal').
+CREATE TABLE IF NOT EXISTS workspace_sprint_items (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT,
+    title TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'todo',
+    item_group TEXT,
+    human_id TEXT,
+    position INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT ({_TS}),
+    updated_at TEXT NOT NULL DEFAULT ({_TS}),
+    completed_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_workspace_sprint_items_tenant ON workspace_sprint_items(tenant_id, status);
+
 -- v3.4 — workspace-level settings singleton (tenant-global defaults).
 CREATE TABLE IF NOT EXISTS workspace_settings (
     id TEXT PRIMARY KEY DEFAULT 'singleton',
@@ -1091,6 +1108,32 @@ async def _migrate_pg_workspace_tenant_isolation(conn: PostgresConnection) -> No
         "CREATE INDEX IF NOT EXISTS idx_ws_decisions_tenant ON workspace_decisions(tenant_id)",
     ]:
         await conn.execute(sql)
+
+
+async def _migrate_pg_workspace_sprint_board(conn: PostgresConnection) -> None:
+    """workspace_sprint_items — tenant-global personal backlog (cross-project).
+
+    Mirrors the SQLite _migrate_workspace_sprint_board. Tenant-scoped
+    (tenant_id, NOT project_id). Idempotent — CREATE TABLE / INDEX IF NOT
+    EXISTS. CREATE_TABLES_CORE covers fresh DBs; this is the upgrade path."""
+    await conn.execute(
+        "CREATE TABLE IF NOT EXISTS workspace_sprint_items ("
+        "    id TEXT PRIMARY KEY,"
+        "    tenant_id TEXT,"
+        "    title TEXT NOT NULL,"
+        "    status TEXT NOT NULL DEFAULT 'todo',"
+        "    item_group TEXT,"
+        "    human_id TEXT,"
+        "    position INTEGER NOT NULL DEFAULT 0,"
+        "    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),"
+        "    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),"
+        "    completed_at TIMESTAMPTZ"
+        ")"
+    )
+    await conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_workspace_sprint_items_tenant "
+        "ON workspace_sprint_items(tenant_id, status)"
+    )
 
 
 async def _migrate_pg_admin_plan(conn: PostgresConnection) -> None:
@@ -1803,6 +1846,7 @@ _PG_MIGRATIONS_HOSTED = (
 # Late migrations — run on every DB after the hosted-only set.
 _PG_MIGRATIONS_LATE = (
     _migrate_pg_workspace_tenant_isolation,
+    _migrate_pg_workspace_sprint_board,
     _migrate_pg_sprint_items_claimed_at,
     _migrate_pg_sprint_item_tree,
     _migrate_pg_api_token_type,

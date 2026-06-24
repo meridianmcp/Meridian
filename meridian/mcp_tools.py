@@ -356,6 +356,40 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "sprint_name_default": {"type": "string"},
          "handoff_template": {"type": "string"}},
          "required": []}},
+    {"name": "add_workspace_sprint_item", "description":
+        "Add an item to the workspace-level personal backlog — a cross-project board NOT "
+        "tied to any single project (track thesis + Meridian + personal goals in one view). "
+        "Use the per-project add_sprint_item for project work instead. 'group' is the "
+        "cross-project bucket the item lives under (e.g. 'thesis', 'meridian', 'personal'); "
+        "'human_id' assigns it to a person. New items start as 'todo'.",
+     "inputSchema": {"type": "object", "properties": {
+         "title": {"type": "string"},
+         "group": {"type": "string", "description": "Cross-project bucket, e.g. 'thesis'/'meridian'/'personal'."},
+         "human_id": {"type": "string", "description": "Optional: person this item is assigned to."}},
+         "required": ["title"]}},
+    {"name": "get_workspace_sprint_items", "description":
+        "Read-only: List workspace personal-backlog items (grouped by 'group', then position). "
+        "Optional 'status' (todo/pending/in_progress/done/skipped/failed) and 'group' filters.",
+     "inputSchema": {"type": "object", "properties": {
+         "status": {"type": "string", "enum": ["todo", "pending", "in_progress", "done", "skipped", "failed"]},
+         "group": {"type": "string", "description": "Filter to a single cross-project bucket."}},
+         "required": []}},
+    {"name": "update_workspace_sprint_item", "description":
+        "Edit a workspace personal-backlog item: title, status, group, or human_id (assignee). "
+        "Only the fields you pass are changed. Pass an empty string for group/human_id to clear it. "
+        "Setting status to done/skipped/failed stamps completed_at. Returns the updated item.",
+     "inputSchema": {"type": "object", "properties": {
+         "item_id": {"type": "string"},
+         "title": {"type": "string"},
+         "status": {"type": "string", "enum": ["todo", "pending", "in_progress", "done", "skipped", "failed"]},
+         "group": {"type": "string", "description": "Move the item to a different cross-project bucket; empty string clears it."},
+         "human_id": {"type": "string", "description": "Reassign to a person; empty string clears it."}},
+         "required": ["item_id"]}},
+    {"name": "complete_workspace_sprint_item", "description":
+        "Mark a workspace personal-backlog item done (stamps completed_at). Returns the updated item.",
+     "inputSchema": {"type": "object", "properties": {
+         "item_id": {"type": "string"}},
+         "required": ["item_id"]}},
     {"name": "get_session_brief", "description":
         "Read-only: Call this FIRST for project summaries or to see what a session did — "
         "returns session, tasks, decisions, and recent commits in one call. "

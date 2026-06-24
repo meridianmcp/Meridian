@@ -3346,6 +3346,72 @@ project_id = "${displayPid}"`;
             noteAdd.disabled = false;
           }
         };
+        const sprintList = document.getElementById("ws-sprint-list");
+        async function renderWsSprint() {
+          if (!sprintList) return;
+          try {
+            const items = await api("/workspace/sprint-items");
+            if (!items || !items.length) {
+              sprintList.innerHTML = '<div style="color:var(--muted)">No personal backlog items yet.</div>';
+              return;
+            }
+            const groups = {};
+            items.forEach((it) => {
+              const g = it.item_group || "(ungrouped)";
+              (groups[g] = groups[g] || []).push(it);
+            });
+            const STATUSES = ["todo", "pending", "in_progress", "done", "skipped", "failed"];
+            sprintList.innerHTML = Object.keys(groups).map((g) => {
+              const rows = groups[g].map((it) => {
+                const done = it.status === "done" || it.status === "skipped";
+                const titleStyle = done ? "text-decoration:line-through;color:var(--muted)" : "";
+                const sel = `<select data-ws-status="${escapeHtml(it.id)}" style="font-size:9px;padding:1px 3px;background:var(--surface-2);border:1px solid var(--border);color:var(--text);border-radius:3px">` + STATUSES.map((s) => `<option value="${s}"${s === it.status ? " selected" : ""}>${s}</option>`).join("") + `</select>`;
+                return `<div data-ws-row="${escapeHtml(it.id)}" style="display:flex;justify-content:space-between;align-items:center;gap:8px;padding:3px 0;border-bottom:1px solid var(--border)"><span style="${titleStyle}">${escapeHtml(it.title || "")}${it.human_id ? ` <span style="color:var(--accent);font-size:9px">@${escapeHtml(it.human_id)}</span>` : ""}</span><span style="display:flex;gap:4px;flex-shrink:0;align-items:center">${sel}<button class="secondary" data-ws-done="${escapeHtml(it.id)}" style="font-size:9px;padding:2px 6px" title="Mark done">\u2713</button></span></div>`;
+              }).join("");
+              return `<div data-ws-group style="margin-bottom:8px"><div style="color:var(--accent);font-size:9px;letter-spacing:.05em;text-transform:uppercase;margin-bottom:2px">${escapeHtml(g)}</div>${rows}</div>`;
+            }).join("");
+            sprintList.querySelectorAll("select[data-ws-status]").forEach((sel) => {
+              sel.onchange = async () => {
+                try {
+                  await api(`/workspace/sprint-items/${sel.dataset.wsStatus}`, { method: "PATCH", body: JSON.stringify({ status: sel.value }) });
+                  renderWsSprint();
+                } catch (e) {
+                  alert("Error: " + e);
+                }
+              };
+            });
+            sprintList.querySelectorAll("button[data-ws-done]").forEach((btn) => {
+              btn.onclick = async () => {
+                try {
+                  await api(`/workspace/sprint-items/${btn.dataset.wsDone}/complete`, { method: "POST" });
+                  renderWsSprint();
+                } catch (e) {
+                  alert("Error: " + e);
+                }
+              };
+            });
+          } catch (e) {
+            sprintList.innerHTML = '<div style="color:var(--muted)">Failed to load.</div>';
+          }
+        }
+        renderWsSprint();
+        const sprintAdd = document.getElementById("ws-sprint-add");
+        if (sprintAdd) sprintAdd.onclick = async () => {
+          const title = (document.getElementById("ws-sprint-title")?.value || "").trim();
+          const group = (document.getElementById("ws-sprint-group")?.value || "").trim();
+          if (!title) return;
+          sprintAdd.disabled = true;
+          try {
+            await api("/workspace/sprint-items", { method: "POST", body: JSON.stringify({ title, group: group || void 0 }) });
+            document.getElementById("ws-sprint-title").value = "";
+            document.getElementById("ws-sprint-group").value = "";
+            renderWsSprint();
+          } catch (e) {
+            alert("Error: " + e);
+          } finally {
+            sprintAdd.disabled = false;
+          }
+        };
       }, 0);
       html += "</div></details>";
       html += "</div></details>";
@@ -3400,13 +3466,22 @@ project_id = "${displayPid}"`;
         <button id="ws-dec-add" class="primary" style="font-size:10px;padding:4px 10px">Pin</button>
       </div>
     </div>
-    <div>
+    <div style="margin-bottom:12px">
       <div style="font-size:10px;color:var(--text);margin-bottom:4px">Workspace notes</div>
       <div id="ws-notes-list" style="font-size:10px;font-family:var(--font-mono);margin-bottom:6px"><div style="color:var(--muted)">loading\u2026</div></div>
       <div style="display:flex;gap:6px;flex-wrap:wrap">
         <input id="ws-note-title" type="text" placeholder="Title" style="background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:4px 8px;flex:1;min-width:120px">
         <input id="ws-note-body" type="text" placeholder="Body" style="background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:4px 8px;flex:2;min-width:160px">
         <button id="ws-note-add" class="primary" style="font-size:10px;padding:4px 10px">Add</button>
+      </div>
+    </div>
+    <div id="ws-sprint-section">
+      <div style="font-size:10px;color:var(--text);margin-bottom:4px">Personal backlog <span style="font-size:9px;color:var(--muted)">(cross-project \u2014 not tied to any one project)</span></div>
+      <div id="ws-sprint-list" style="font-size:10px;font-family:var(--font-mono);margin-bottom:6px"><div style="color:var(--muted)">loading\u2026</div></div>
+      <div style="display:flex;gap:6px;flex-wrap:wrap">
+        <input id="ws-sprint-group" type="text" placeholder="Bucket (e.g. thesis)" style="background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:4px 8px;flex:1;min-width:100px">
+        <input id="ws-sprint-title" type="text" placeholder="What needs doing" style="background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:4px 8px;flex:2;min-width:160px">
+        <button id="ws-sprint-add" class="primary" style="font-size:10px;padding:4px 10px">Add</button>
       </div>
     </div>
   </div>`;

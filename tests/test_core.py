@@ -4473,6 +4473,196 @@ async def test_workspace_settings_single_row_fallback(db):
 
 
 # ---------------------------------------------------------------------------
+# b2115251 — workspace-level sprint board (cross-project personal backlog)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_migrate_workspace_sprint_board_idempotent(db):
+    """The migration creates workspace_sprint_items and re-running is a no-op."""
+    from meridian.db.migrations import _migrate_workspace_sprint_board
+
+    # init_db already ran it; a second run must not raise.
+    await _migrate_workspace_sprint_board(db)
+    async with db.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' "
+        "AND name='workspace_sprint_items'"
+    ) as cur:
+        assert await cur.fetchone() is not None
+    # Table is usable after the redundant migration.
+    item = await db_module.add_workspace_sprint_item(db, "still works")
+    assert item["status"] == "todo"
+
+
+@pytest.mark.asyncio
+async def test_add_workspace_sprint_item_defaults(db):
+    """A new workspace sprint item starts as todo with its bucket + position."""
+    item = await db_module.add_workspace_sprint_item(
+        db, "finish thesis ch3", item_group="thesis", human_id="adam"
+    )
+    assert item["status"] == "todo"
+    assert item["title"] == "finish thesis ch3"
+    assert item["item_group"] == "thesis"
+    assert item["human_id"] == "adam"
+    assert item["completed_at"] is None
+    # Second item in the same workspace gets the next position.
+    second = await db_module.add_workspace_sprint_item(db, "second")
+    assert second["position"] == item["position"] + 1
+
+
+@pytest.mark.asyncio
+async def test_workspace_sprint_items_isolated_by_tenant(db):
+    """Items created by tenant A must not be returned for tenant B."""
+    await db_module.add_workspace_sprint_item(
+        db, "A-task", item_group="thesis", tenant_id="tenant-a"
+    )
+    await db_module.add_workspace_sprint_item(
+        db, "B-task", item_group="thesis", tenant_id="tenant-b"
+    )
+    a = {i["title"] for i in await db_module.get_workspace_sprint_items(db, tenant_id="tenant-a")}
+    b = {i["title"] for i in await db_module.get_workspace_sprint_items(db, tenant_id="tenant-b")}
+    assert a == {"A-task"}
+    assert b == {"B-task"}
+
+
+@pytest.mark.asyncio
+async def test_workspace_sprint_item_legacy_null_visible_to_tenant(db):
+    """Pre-isolation rows (tenant_id IS NULL) stay visible to a tenant — they
+    only ever exist on that tenant's own dedicated DB. Mirrors workspace notes."""
+    await db_module.add_workspace_sprint_item(db, "legacy")  # tenant_id NULL
+    titles = {i["title"] for i in await db_module.get_workspace_sprint_items(db, tenant_id="tenant-a")}
+    assert "legacy" in titles
+
+
+@pytest.mark.asyncio
+async def test_workspace_sprint_items_group_filter(db):
+    """item_group is the cross-project bucket; the filter narrows to one bucket."""
+    await db_module.add_workspace_sprint_item(db, "thesis task", item_group="thesis", tenant_id="t")
+    await db_module.add_workspace_sprint_item(db, "meridian task", item_group="meridian", tenant_id="t")
+    thesis = await db_module.get_workspace_sprint_items(db, item_group="thesis", tenant_id="t")
+    assert [i["title"] for i in thesis] == ["thesis task"]
+
+
+@pytest.mark.asyncio
+async def test_workspace_sprint_items_status_filter(db):
+    """The status filter narrows the board; an invalid status filter raises."""
+    a = await db_module.add_workspace_sprint_item(db, "open one", tenant_id="t")
+    await db_module.add_workspace_sprint_item(db, "open two", tenant_id="t")
+    await db_module.complete_workspace_sprint_item(db, a["id"], tenant_id="t")
+    done = await db_module.get_workspace_sprint_items(db, status="done", tenant_id="t")
+    assert [i["title"] for i in done] == ["open one"]
+    with pytest.raises(ValueError):
+        await db_module.get_workspace_sprint_items(db, status="bogus", tenant_id="t")
+
+
+@pytest.mark.asyncio
+async def test_update_workspace_sprint_item_fields_and_completed_at(db):
+    """Patch title/status/group; terminal status stamps completed_at, then clears."""
+    item = await db_module.add_workspace_sprint_item(db, "old", tenant_id="t")
+    updated = await db_module.update_workspace_sprint_item(
+        db, item["id"], title="new", status="in_progress",
+        item_group="personal", tenant_id="t",
+    )
+    assert updated["title"] == "new"
+    assert updated["status"] == "in_progress"
+    assert updated["item_group"] == "personal"
+    assert updated["completed_at"] is None  # non-terminal clears it
+    # Terminal status stamps completed_at.
+    finished = await db_module.update_workspace_sprint_item(
+        db, item["id"], status="failed", tenant_id="t"
+    )
+    assert finished["completed_at"] is not None
+    # Re-opening clears it again.
+    reopened = await db_module.update_workspace_sprint_item(
+        db, item["id"], status="todo", tenant_id="t"
+    )
+    assert reopened["completed_at"] is None
+
+
+@pytest.mark.asyncio
+async def test_complete_workspace_sprint_item_respects_tenant(db):
+    """Tenant B cannot complete or update tenant A's item."""
+    item = await db_module.add_workspace_sprint_item(db, "A-only", tenant_id="tenant-a")
+    # Wrong tenant: no row matched.
+    assert await db_module.complete_workspace_sprint_item(db, item["id"], tenant_id="tenant-b") is None
+    assert await db_module.update_workspace_sprint_item(db, item["id"], title="x", tenant_id="tenant-b") is None
+    # Right tenant: completes and stamps done.
+    done = await db_module.complete_workspace_sprint_item(db, item["id"], tenant_id="tenant-a")
+    assert done["status"] == "done"
+    assert done["completed_at"] is not None
+
+
+@pytest.mark.asyncio
+async def test_workspace_sprint_item_none_tenant_self_host(db):
+    """Self-host (tenant_id=None) sees every item, like workspace notes."""
+    await db_module.add_workspace_sprint_item(db, "one", tenant_id="tenant-a")
+    await db_module.add_workspace_sprint_item(db, "two", tenant_id="tenant-b")
+    titles = {i["title"] for i in await db_module.get_workspace_sprint_items(db)}
+    assert titles == {"one", "two"}
+
+
+def test_workspace_sprint_items_crud_http(client):
+    """Workspace sprint items round-trip through the HTTP routes the dashboard uses."""
+    created = client.post(
+        "/workspace/sprint-items",
+        json={"title": "ship workspace board", "group": "meridian"},
+    )
+    assert created.status_code == 201
+    item_id = created.json()["id"]
+    assert created.json()["status"] == "todo"
+    # Listed and grouped.
+    listed = client.get("/workspace/sprint-items").json()
+    assert any(i["id"] == item_id for i in listed)
+    # Group filter.
+    grouped = client.get("/workspace/sprint-items?group=meridian").json()
+    assert [i["id"] for i in grouped] == [item_id]
+    # Patch status.
+    patched = client.patch(
+        f"/workspace/sprint-items/{item_id}", json={"status": "in_progress"}
+    )
+    assert patched.status_code == 200
+    assert patched.json()["status"] == "in_progress"
+    # Complete.
+    done = client.post(f"/workspace/sprint-items/{item_id}/complete")
+    assert done.status_code == 200
+    assert done.json()["status"] == "done"
+    assert done.json()["completed_at"] is not None
+    # Unknown id → 404.
+    assert client.post("/workspace/sprint-items/nope/complete").status_code == 404
+
+
+def test_mcp_workspace_sprint_item_roundtrip(client):
+    """MCP: add_workspace_sprint_item → get shows it; complete → status done."""
+    import json as _json
+
+    def _result(resp):
+        assert resp.get("result") is not None, resp
+        return _json.loads(resp["result"]["content"][0]["text"])
+
+    added = _result(_mcp_call(client, "add_workspace_sprint_item", {
+        "title": "thesis chapter 3", "group": "thesis",
+    }))
+    assert added["status"] == "todo"
+    item_id = added["id"]
+    # get_workspace_sprint_items shows it.
+    items = _result(_mcp_call(client, "get_workspace_sprint_items", {}))
+    assert any(i["id"] == item_id for i in items)
+    # group filter via the tool.
+    thesis = _result(_mcp_call(client, "get_workspace_sprint_items", {"group": "thesis"}))
+    assert [i["id"] for i in thesis] == [item_id]
+    # complete → done.
+    done = _result(_mcp_call(client, "complete_workspace_sprint_item", {"item_id": item_id}))
+    assert done["status"] == "done"
+    assert done["completed_at"] is not None
+
+
+def test_mcp_add_workspace_sprint_item_title_size_limit(client):
+    """MCP add_workspace_sprint_item rejects a title > 500 chars."""
+    resp = _mcp_call(client, "add_workspace_sprint_item", {"title": "t" * 501})
+    assert "sprint item title" in resp.get("error", {}).get("message", "").lower()
+
+
+# ---------------------------------------------------------------------------
 # 2da12762 — token-based OAuth hooks (registered_hostnames)
 # ---------------------------------------------------------------------------
 
@@ -5777,6 +5967,7 @@ def test_pg_migration_registry_matches_historical_order():
     ]
     assert late == [
         "_migrate_pg_workspace_tenant_isolation",
+        "_migrate_pg_workspace_sprint_board",
         "_migrate_pg_sprint_items_claimed_at",
         "_migrate_pg_sprint_item_tree",
         "_migrate_pg_api_token_type",
@@ -5801,7 +5992,7 @@ def test_pg_migration_registry_matches_historical_order():
     ]
     # No duplicates across the three groups.
     allnames = core + hosted + late
-    assert len(allnames) == len(set(allnames)) == 53
+    assert len(allnames) == len(set(allnames)) == 54
 
 
 def test_default_agent_instructions_has_code_intel_protocol():

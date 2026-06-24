@@ -163,3 +163,64 @@ async def update_workspace_settings_endpoint(
         handoff_template=body.get("handoff_template"),
         tenant_id=await _tenant_id(request),
     )
+
+
+# --- Workspace sprint board (cross-project personal backlog) ----------------
+
+@router.get("/workspace/sprint-items")
+async def list_workspace_sprint_items_endpoint(
+    request: Request, status: str | None = None, group: str | None = None
+) -> list[dict[str, Any]]:
+    """Workspace sprint items, grouped by item_group. ``?status=`` and
+    ``?group=`` filter. Not tied to any project."""
+    return await db_module.get_workspace_sprint_items(
+        await _db(request), status=status, item_group=group,
+        tenant_id=await _tenant_id(request),
+    )
+
+
+@router.post("/workspace/sprint-items", status_code=201)
+async def create_workspace_sprint_item_endpoint(
+    body: dict[str, Any], request: Request
+) -> dict[str, Any]:
+    """Add a workspace sprint item. Body: {title, group?, human_id?}."""
+    title = (body.get("title") or "").strip()
+    if not title:
+        raise HTTPException(status_code=400, detail="title required")
+    return await db_module.add_workspace_sprint_item(
+        await _db(request), title,
+        item_group=body.get("group", body.get("item_group")),
+        human_id=body.get("human_id"),
+        tenant_id=await _tenant_id(request),
+    )
+
+
+@router.patch("/workspace/sprint-items/{item_id}")
+async def patch_workspace_sprint_item_endpoint(
+    item_id: str, body: dict[str, Any], request: Request
+) -> dict[str, Any]:
+    """Patch title/status/group/human_id on a workspace sprint item."""
+    item = await db_module.update_workspace_sprint_item(
+        await _db(request), item_id,
+        title=body.get("title"),
+        status=body.get("status"),
+        item_group=body.get("group", body.get("item_group")),
+        human_id=body.get("human_id"),
+        tenant_id=await _tenant_id(request),
+    )
+    if item is None:
+        raise HTTPException(status_code=404, detail="sprint item not found")
+    return item
+
+
+@router.post("/workspace/sprint-items/{item_id}/complete")
+async def complete_workspace_sprint_item_endpoint(
+    item_id: str, request: Request
+) -> dict[str, Any]:
+    """Mark a workspace sprint item done (stamps completed_at)."""
+    item = await db_module.complete_workspace_sprint_item(
+        await _db(request), item_id, tenant_id=await _tenant_id(request)
+    )
+    if item is None:
+        raise HTTPException(status_code=404, detail="sprint item not found")
+    return item

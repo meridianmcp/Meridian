@@ -915,6 +915,75 @@ def build_mcp_server():
                 },
             ),
             Tool(
+                name="add_workspace_sprint_item",
+                description=(
+                    "Add an item to the workspace personal backlog — a "
+                    "cross-project board NOT tied to any single project "
+                    "(thesis + Meridian + personal goals in one view). "
+                    "'group' is the cross-project bucket (e.g. 'thesis', "
+                    "'meridian', 'personal'). New items start as 'todo'."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "title": {"type": "string"},
+                        "group": {"type": "string"},
+                        "human_id": {"type": "string"},
+                    },
+                    "required": ["title"],
+                },
+            ),
+            Tool(
+                name="get_workspace_sprint_items",
+                description=(
+                    "List workspace personal-backlog items (grouped by "
+                    "'group', then position). Optional 'status' and 'group' "
+                    "filters."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "status": {"type": "string"},
+                        "group": {"type": "string"},
+                    },
+                    "required": [],
+                },
+            ),
+            Tool(
+                name="update_workspace_sprint_item",
+                description=(
+                    "Edit a workspace personal-backlog item: title, status, "
+                    "group, or human_id. Only the fields passed are changed; "
+                    "empty string clears group/human_id. done/skipped/failed "
+                    "stamps completed_at."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "item_id": {"type": "string"},
+                        "title": {"type": "string"},
+                        "status": {"type": "string"},
+                        "group": {"type": "string"},
+                        "human_id": {"type": "string"},
+                    },
+                    "required": ["item_id"],
+                },
+            ),
+            Tool(
+                name="complete_workspace_sprint_item",
+                description=(
+                    "Mark a workspace personal-backlog item done (stamps "
+                    "completed_at)."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "item_id": {"type": "string"},
+                    },
+                    "required": ["item_id"],
+                },
+            ),
+            Tool(
                 name="enqueue_claude_task",
                 description=(
                     "PAID-TIER. Queue a long-running Claude Code subprocess "

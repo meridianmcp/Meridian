@@ -73,6 +73,25 @@ def test_dashboard_loads_200(client):
     )
 
 
+def test_workspace_personal_backlog_section_present(js):
+    """b2115251 — the Workspace settings area surfaces the cross-project personal
+    backlog (workspace sprint board): a list, an add control, grouping by bucket,
+    and status controls wired to the /workspace/sprint-items endpoints."""
+    # Section + add control ids.
+    assert "ws-sprint-list" in js, "personal backlog list container missing"
+    assert "ws-sprint-add" in js, "personal backlog add button missing"
+    assert "ws-sprint-title" in js, "personal backlog title input missing"
+    assert "ws-sprint-group" in js, "personal backlog bucket/group input missing"
+    assert "Personal backlog" in js, "personal backlog heading missing"
+    # Render + fetch wiring against the workspace sprint-items endpoint.
+    assert "renderWsSprint" in js, "renderWsSprint render function missing"
+    assert "/workspace/sprint-items" in js, "personal backlog endpoint wiring missing"
+    # Grouping by item_group bucket + status controls.
+    assert "data-ws-group" in js, "personal backlog item_group grouping missing"
+    assert "data-ws-status" in js, "personal backlog status dropdown missing"
+    assert "/complete" in js, "personal backlog complete control missing"
+
+
 def test_backburner_section_has_grouping_search_and_archive(js):
     """e62ce019 — the backburner section groups by item_group, has a filter box,
     and a per-item permanent-delete (archive) button wired to the DELETE path."""

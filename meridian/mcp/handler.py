@@ -1193,7 +1193,7 @@ async def _handle_notes_decisions(
     tenant: dict[str, Any] | None,
     _mcp_tenant_id: Any,
 ) -> Any:
-    """Dispatch group: pin_decision, update_decision, get_pinned_decisions, archive_decision, add_note, ingest_document, capture_insight, get_notes, read_note, delete_note, add_workspace_note, get_workspace_notes, pin_workspace_decision, get_workspace_decisions, get_workspace_settings, update_workspace_settings."""
+    """Dispatch group: pin_decision, update_decision, get_pinned_decisions, archive_decision, add_note, ingest_document, capture_insight, get_notes, read_note, delete_note, add_workspace_note, get_workspace_notes, pin_workspace_decision, get_workspace_decisions, get_workspace_settings, update_workspace_settings, add_workspace_sprint_item, get_workspace_sprint_items, update_workspace_sprint_item, complete_workspace_sprint_item."""
     if name == "pin_decision":
         validate_input_size(args.get("title"), "decision title", 500)
         validate_input_size(args.get("body"), "decision body", 100_000)
@@ -1364,6 +1364,35 @@ async def _handle_notes_decisions(
             handoff_template=args.get("handoff_template"),
             tenant_id=_mcp_tenant_id,
         )
+    if name == "add_workspace_sprint_item":
+        validate_input_size(args.get("title"), "sprint item title", 500)
+        return await db_module.add_workspace_sprint_item(
+            db, args["title"],
+            item_group=args.get("group"),
+            human_id=args.get("human_id"),
+            tenant_id=_mcp_tenant_id,
+        )
+    if name == "get_workspace_sprint_items":
+        return await db_module.get_workspace_sprint_items(
+            db, status=args.get("status"), item_group=args.get("group"),
+            tenant_id=_mcp_tenant_id,
+        )
+    if name == "update_workspace_sprint_item":
+        validate_input_size(args.get("title"), "sprint item title", 500)
+        item = await db_module.update_workspace_sprint_item(
+            db, args["item_id"],
+            title=args.get("title"),
+            status=args.get("status"),
+            item_group=args.get("group"),
+            human_id=args.get("human_id"),
+            tenant_id=_mcp_tenant_id,
+        )
+        return item or {"error": "workspace sprint item not found"}
+    if name == "complete_workspace_sprint_item":
+        item = await db_module.complete_workspace_sprint_item(
+            db, args["item_id"], tenant_id=_mcp_tenant_id,
+        )
+        return item or {"error": "workspace sprint item not found"}
     return _MISS
 
 

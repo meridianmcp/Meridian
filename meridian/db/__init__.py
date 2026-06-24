@@ -554,6 +554,29 @@ CREATE INDEX IF NOT EXISTS idx_workspace_notes_created
 CREATE INDEX IF NOT EXISTS idx_workspace_decisions_status
     ON workspace_decisions(status, created_at DESC);
 
+-- workspace_sprint_items: a tenant-global personal backlog that is NOT tied to
+-- any single project, so a solo dev can track cross-project goals (thesis,
+-- Meridian, personal) in one board. Mirrors the useful subset of sprint_items
+-- but keyed by tenant_id instead of project_id; ``item_group`` is the
+-- cross-project bucket (e.g. 'thesis'/'meridian'/'personal'). ``position``
+-- orders items within a group. One workspace per DB, same isolation model as
+-- workspace_notes / workspace_decisions.
+CREATE TABLE IF NOT EXISTS workspace_sprint_items (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT,
+    title TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'todo'
+        CHECK (status IN ('todo','pending','in_progress','done','skipped','failed')),
+    item_group TEXT,
+    human_id TEXT,
+    position INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    completed_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_workspace_sprint_items_tenant
+    ON workspace_sprint_items(tenant_id, status);
+
 -- v3.4 — workspace-level settings: tenant-global defaults that every project
 -- session can read at startup (e.g. a default HITL auto-answer posture, a
 -- default sprint label). Singleton row (id='singleton') per workspace DB, same
@@ -716,6 +739,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_touches_files(db)
     await _migrate_active_worktrees(db)
     await _migrate_workspace_tenant_isolation(db)
+    await _migrate_workspace_sprint_board(db)
     await _migrate_registered_hostnames(db)
     await _migrate_queued_session(db)
     await _migrate_parallel_safety(db)
@@ -6714,6 +6738,169 @@ async def delete_workspace_decision(
         rc = cur.rowcount or 0
     await db.commit()
     return rc > 0
+
+
+# --- Workspace sprint board (tenant-global personal backlog) ----------------
+# A cross-project backlog that is NOT tied to any single project. Mirrors the
+# useful subset of the per-project sprint_items shape but is keyed by tenant_id
+# (see _ws_tenant_clause), exactly like workspace_notes / workspace_decisions.
+# ``item_group`` is the cross-project bucket ('thesis'/'meridian'/'personal').
+
+_VALID_WS_SPRINT_STATUSES = {
+    "todo", "pending", "in_progress", "done", "skipped", "failed",
+}
+
+
+async def add_workspace_sprint_item(
+    db: aiosqlite.Connection,
+    title: str,
+    item_group: str | None = None,
+    human_id: str | None = None,
+    tenant_id: str | None = None,
+) -> dict[str, Any]:
+    """Append a ``todo`` item to the workspace-level personal backlog.
+
+    ``item_group`` is the cross-project bucket the item lives under (e.g.
+    'thesis' / 'meridian' / 'personal'); ``human_id`` attributes it to a
+    person. Workspace sprint items belong to the whole workspace, not a single
+    project, so there is no project_id. Scoped to ``tenant_id`` when provided
+    (hosted); None on self-host."""
+    iid = _new_id()
+    # New items go to the end of their group (highest position + 1).
+    scope, scope_params = _ws_tenant_clause(tenant_id)
+    where = f" WHERE {scope}" if scope else ""
+    async with db.execute(
+        f"SELECT COALESCE(MAX(position), -1) + 1 AS next_pos "
+        f"FROM workspace_sprint_items{where}",
+        scope_params or None,
+    ) as cur:
+        prow = await cur.fetchone()
+    next_pos = (prow["next_pos"] if isinstance(prow, dict) else prow[0]) or 0
+    await db.execute(
+        "INSERT INTO workspace_sprint_items "
+        "(id, tenant_id, title, item_group, human_id, position) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (iid, tenant_id, title, item_group or None, human_id or None, next_pos),
+    )
+    await db.commit()
+    async with db.execute(
+        "SELECT * FROM workspace_sprint_items WHERE id = ?", (iid,)
+    ) as cur:
+        row = await cur.fetchone()
+    return _row_to_dict(row) or {"id": iid}
+
+
+async def get_workspace_sprint_items(
+    db: aiosqlite.Connection,
+    status: str | None = None,
+    item_group: str | None = None,
+    tenant_id: str | None = None,
+) -> list[dict[str, Any]]:
+    """List workspace sprint items, grouped by ``item_group`` then position.
+
+    Optional ``status`` and ``item_group`` filters. Scoped to ``tenant_id``
+    when provided (hosted); None returns everything on self-host."""
+    clauses: list[str] = []
+    params: list[Any] = []
+    if status is not None:
+        if status not in _VALID_WS_SPRINT_STATUSES:
+            raise ValueError(
+                f"invalid workspace sprint-item status filter: {status!r}. "
+                f"Valid: {sorted(_VALID_WS_SPRINT_STATUSES)}"
+            )
+        clauses.append("status = ?")
+        params.append(status)
+    if item_group is not None:
+        clauses.append("item_group = ?")
+        params.append(item_group)
+    scope, scope_params = _ws_tenant_clause(tenant_id)
+    if scope:
+        clauses.append(scope)
+        params.extend(scope_params)
+    where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+    async with db.execute(
+        f"SELECT * FROM workspace_sprint_items{where} "
+        "ORDER BY item_group IS NULL, item_group ASC, position ASC, created_at ASC",
+        params or None,
+    ) as cur:
+        rows = await cur.fetchall()
+    return [_row_to_dict(r) for r in rows if r is not None]  # type: ignore[misc]
+
+
+async def update_workspace_sprint_item(
+    db: aiosqlite.Connection,
+    item_id: str,
+    title: str | None = None,
+    status: str | None = None,
+    item_group: str | None = None,
+    human_id: str | None = None,
+    tenant_id: str | None = None,
+) -> dict[str, Any] | None:
+    """Patch editable fields of a workspace sprint item (tenant-scoped).
+
+    Editable: title, status, item_group, human_id. Only fields passed as
+    non-None are changed. Pass an empty string to clear item_group/human_id.
+    A terminal status of 'done'/'skipped'/'failed' stamps ``completed_at``;
+    any other status clears it. Returns the updated item, or None if no row
+    matched (unknown id, or another tenant's item)."""
+    scope, scope_params = _ws_tenant_clause(tenant_id)
+    scope_sql = f" AND {scope}" if scope else ""
+    fields: list[str] = []
+    values: list[Any] = []
+    if title is not None:
+        fields.append("title = ?")
+        values.append(title)
+    if status is not None:
+        if status not in _VALID_WS_SPRINT_STATUSES:
+            raise ValueError(f"invalid workspace sprint-item status: {status!r}")
+        fields.append("status = ?")
+        values.append(status)
+        if status in {"done", "skipped", "failed"}:
+            fields.append("completed_at = datetime('now')")
+        else:
+            fields.append("completed_at = NULL")
+    if item_group is not None:
+        fields.append("item_group = ?")
+        values.append(item_group or None)
+    if human_id is not None:
+        fields.append("human_id = ?")
+        values.append(human_id or None)
+    if not fields:
+        async with db.execute(
+            f"SELECT * FROM workspace_sprint_items WHERE id = ?{scope_sql}",
+            [item_id, *scope_params],
+        ) as cur:
+            row = await cur.fetchone()
+        return _row_to_dict(row)
+    fields.append("updated_at = datetime('now')")
+    cursor = await db.execute(
+        f"UPDATE workspace_sprint_items SET {', '.join(fields)} "
+        f"WHERE id = ?{scope_sql}",
+        [*values, item_id, *scope_params],
+    )
+    await db.commit()
+    if cursor.rowcount == 0:
+        return None
+    async with db.execute(
+        f"SELECT * FROM workspace_sprint_items WHERE id = ?{scope_sql}",
+        [item_id, *scope_params],
+    ) as cur:
+        row = await cur.fetchone()
+    return _row_to_dict(row)
+
+
+async def complete_workspace_sprint_item(
+    db: aiosqlite.Connection,
+    item_id: str,
+    tenant_id: str | None = None,
+) -> dict[str, Any] | None:
+    """Mark a workspace sprint item ``done`` (stamps ``completed_at``).
+
+    Returns the updated item, or None if no row matched (unknown id / wrong
+    tenant)."""
+    return await update_workspace_sprint_item(
+        db, item_id, status="done", tenant_id=tenant_id
+    )
 
 
 _WORKSPACE_SETTINGS_ID = "singleton"
