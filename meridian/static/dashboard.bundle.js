@@ -9835,6 +9835,80 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
   function _repoPathToProject(repoPath) {
     return String(repoPath || "").replace(/[\\/:]+/g, "-").replace(/^-+|-+$/g, "");
   }
+  function _codeArchSection(archText) {
+    const rawPre = (t) => `<pre style="font-size:10px;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;padding:10px;white-space:pre-wrap;word-break:break-all;color:var(--text);margin:0;line-height:1.5">${escapeHtml(t || "(no architecture returned)")}</pre>`;
+    let arch = null;
+    try {
+      arch = JSON.parse(archText);
+    } catch (_) {
+      arch = null;
+    }
+    if (!arch || typeof arch !== "object") return { html: rawPre(archText), charts: [] };
+    const arr = (v) => Array.isArray(v) ? v : [];
+    const num = (v) => typeof v === "number" ? v : parseFloat(v);
+    const fin = (v) => Number.isFinite(num(v));
+    const charts = [];
+    let html = "";
+    const nodes = arr(arch.node_labels).filter((d) => d && d.label != null && fin(d.count));
+    if (nodes.length) {
+      html += `<div style="margin-bottom:14px"><div style="font-size:9px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px">Node types</div><canvas id="ci-nodes" height="120"></canvas></div>`;
+      charts.push({ id: "ci-nodes", config: {
+        type: "bar",
+        data: { labels: nodes.map((d) => String(d.label)), datasets: [{ data: nodes.map((d) => num(d.count)), backgroundColor: "rgba(96,165,250,0.7)", borderRadius: 2 }] },
+        options: { responsive: true, plugins: { legend: { display: false } }, scales: {
+          x: { ticks: { color: "#9ca3af", font: { size: 9 }, maxRotation: 45 }, grid: { color: "#1f2937" } },
+          y: { beginAtZero: true, ticks: { color: "#9ca3af", font: { size: 9 } }, grid: { color: "#1f2937" } }
+        } }
+      } });
+    }
+    const edges = arr(arch.edge_types).filter((d) => d && d.type != null && fin(d.count)).sort((a, b) => num(b.count) - num(a.count)).slice(0, 6);
+    if (edges.length) {
+      const palette = ["#60a5fa", "#34d399", "#fbbf24", "#f87171", "#a78bfa", "#f472b6"];
+      html += `<div style="margin-bottom:14px"><div style="font-size:9px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px">Top edge types</div><div style="max-width:230px;margin:0 auto"><canvas id="ci-edges" height="200"></canvas></div></div>`;
+      charts.push({ id: "ci-edges", config: {
+        type: "doughnut",
+        data: { labels: edges.map((d) => String(d.type)), datasets: [{ data: edges.map((d) => num(d.count)), backgroundColor: palette, borderWidth: 0 }] },
+        options: { responsive: true, plugins: { legend: { position: "right", labels: { color: "#9ca3af", font: { size: 9 }, boxWidth: 10 } } } }
+      } });
+    }
+    const hot = arr(arch.hotspots).filter((d) => d && d.name != null && fin(d.fan_in)).sort((a, b) => num(b.fan_in) - num(a.fan_in)).slice(0, 10);
+    if (hot.length) {
+      const maxFan = Math.max(...hot.map((d) => num(d.fan_in)), 1);
+      html += `<div style="margin-bottom:14px"><div style="font-size:9px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px">Hotspots (fan-in)</div>`;
+      for (const h of hot) {
+        const pct = Math.round(num(h.fan_in) / maxFan * 100);
+        html += `<div style="display:flex;align-items:center;gap:8px;margin-bottom:4px">
+        <div style="flex:1;min-width:0;font-size:10px;color:var(--text);font-family:var(--font-mono);white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="${escapeHtml(String(h.name))}">${escapeHtml(String(h.name))}</div>
+        <div style="flex:1;background:var(--surface-1);border-radius:3px;height:10px;overflow:hidden"><div style="width:${pct}%;height:100%;background:var(--accent)"></div></div>
+        <div style="width:30px;text-align:right;font-size:10px;color:var(--muted)">${num(h.fan_in)}</div>
+      </div>`;
+      }
+      html += `</div>`;
+    }
+    const pkgs = arr(arch.packages).filter((d) => d && d.name != null && fin(d.node_count)).sort((a, b) => num(b.node_count) - num(a.node_count)).slice(0, 15);
+    if (pkgs.length) {
+      html += `<div style="margin-bottom:14px"><div style="font-size:9px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px">Packages</div><table style="width:100%;border-collapse:collapse;font-size:10px">`;
+      for (const pk of pkgs) {
+        html += `<tr style="border-bottom:1px solid var(--border)"><td style="padding:3px 6px;color:var(--text);font-family:var(--font-mono)">${escapeHtml(String(pk.name))}</td><td style="padding:3px 6px;text-align:right;color:var(--muted)">${num(pk.node_count)}</td></tr>`;
+      }
+      html += `</table></div>`;
+    }
+    const layers = arr(arch.layers).filter((d) => d && d.name != null);
+    if (layers.length) {
+      const sorted = [...layers].sort((a, b) => a.layer > b.layer ? -1 : a.layer < b.layer ? 1 : 0);
+      html += `<div style="margin-bottom:14px"><div style="font-size:9px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px">Layers</div><div style="display:flex;flex-direction:column;gap:4px">`;
+      for (const ly of sorted) {
+        html += `<div style="padding:6px 10px;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;font-size:10px;color:var(--text);display:flex;justify-content:space-between">
+        <span style="font-family:var(--font-mono)">${escapeHtml(String(ly.name))}</span>
+        <span style="color:var(--muted)">layer ${escapeHtml(String(ly.layer))}</span>
+      </div>`;
+      }
+      html += `</div></div>`;
+    }
+    if (!html) return { html: rawPre(archText), charts: [] };
+    html += `<details style="margin-top:4px"><summary style="cursor:pointer;list-style:none;font-size:10px;color:var(--accent)">&#9656; raw JSON</summary>${rawPre(archText)}</details>`;
+    return { html, charts };
+  }
   async function loadCodeIntelTab(projectId) {
     const body = document.getElementById(`codeintel-body-${projectId}`);
     if (!body) return;
@@ -9889,6 +9963,7 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
       const execCfg = settingsData?.executor_config || {};
       const repoPaths = Array.isArray(execCfg.repo_paths) ? execCfg.repo_paths : [];
       let html = "";
+      let archCharts = [];
       html += `<div style="display:flex;align-items:center;gap:8px;margin-bottom:14px">
       <span style="width:8px;height:8px;border-radius:50%;background:#22c55e;display:inline-block;flex-shrink:0"></span>
       <span style="font-size:11px;color:var(--text);font-weight:600">Code Intel Live</span>
@@ -9924,7 +9999,9 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
         const archArgs = archPath ? { project: _repoPathToProject(archPath) } : {};
         const archResult = await _codeMcpCall("tools/call", { name: "get_architecture", arguments: archArgs });
         const archText = (archResult?.content || []).map((c) => c.text || "").join("").trim();
-        html += `<pre style="font-size:10px;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;padding:10px;white-space:pre-wrap;word-break:break-all;color:var(--text);margin:0;line-height:1.5">${escapeHtml(archText || "(no architecture returned)")}</pre>`;
+        const archSection = _codeArchSection(archText);
+        html += archSection.html;
+        archCharts = archSection.charts;
       } catch (e) {
         html += `<div style="font-size:10px;color:var(--error)">get_architecture failed: ${escapeHtml(String(e))}</div>`;
       }
@@ -9932,6 +10009,17 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
       <button class="secondary" style="font-size:10px;padding:3px 10px" onclick="loadCodeIntelTab(${JSON.stringify(projectId)})">\u21BA Refresh</button>
     </div></div>`;
       body.innerHTML = html;
+      if (window.Chart && archCharts.length) {
+        for (const c of archCharts) {
+          const el = document.getElementById(c.id);
+          if (el) {
+            try {
+              new Chart(el, c.config);
+            } catch (_) {
+            }
+          }
+        }
+      }
     } catch (e) {
       body.innerHTML = `<div style="color:var(--error)">Failed to load code intel: ${escapeHtml(String(e))}</div>`;
     }
