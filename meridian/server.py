@@ -4887,7 +4887,7 @@ def _jsonrpc_err(req_id: Any, code: int, message: str) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 _GITHUB_TOOL_NAMES = frozenset({
-    "read_file", "list_files", "search_code", "get_commits", "get_commit", "search_commits",
+    "read_file", "patch_file", "list_files", "search_code", "get_commits", "get_commit", "search_commits",
     "get_workflow_runs", "get_workflow_run_logs", "trigger_workflow", "git_diff",
     "list_branches", "list_issues", "create_issue", "get_issue",
 })
@@ -4900,6 +4900,7 @@ _GITHUB_READ_ONLY = frozenset({
 })
 _GITHUB_TITLE_OVERRIDES: dict[str, str] = {
     "read_file": "Read File",
+    "patch_file": "Patch File",
     "list_files": "List Files",
     "search_code": "Search Code",
     "get_commits": "Get Commits",
@@ -4917,7 +4918,7 @@ _GITHUB_TITLE_OVERRIDES: dict[str, str] = {
 
 
 def _github_tools_for_tenant(tenant: dict) -> list[dict[str, Any]]:
-    """Return the 5 GitHub tool defs if the tenant has a GitHub PAT set."""
+    """Return the GitHub tool defs if the tenant has a GitHub PAT set."""
     if not db_module.decrypt_field(tenant.get("github_pat")):
         return []
     _pid_prop = {"project_id": {"type": "string", "description": "Project ID whose GitHub repo to use."}}
@@ -4933,6 +4934,28 @@ def _github_tools_for_tenant(tenant: dict) -> list[dict[str, Any]]:
                     "ref": {"type": "string", "description": "Branch, tag, or commit SHA (default: configured branch)"},
                 },
                 "required": ["project_id", "path"],
+            },
+        },
+        {
+            "name": "patch_file",
+            "description": (
+                "Make a targeted edit to a file in the project's connected GitHub repo: "
+                "replace an exact substring (old_str) with new_str and commit it. old_str "
+                "must match the current file contents exactly (including whitespace) and "
+                "appear exactly once. Sends only the changed snippet, so it edits very "
+                "large files trivially — the targeted-write counterpart to read_file."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    **_pid_prop,
+                    "file_path": {"type": "string", "description": "File path relative to repo root (e.g. src/main.py)"},
+                    "old_str": {"type": "string", "description": "Exact substring to replace — must appear exactly once in the file."},
+                    "new_str": {"type": "string", "description": "Replacement text (may be empty to delete old_str)."},
+                    "branch": {"type": "string", "description": "Branch to read + commit on (default: the project's configured branch)."},
+                    "message": {"type": "string", "description": "Commit message (default: 'patch_file: update <path>')."},
+                },
+                "required": ["project_id", "file_path", "old_str", "new_str"],
             },
         },
         {

@@ -56,6 +56,10 @@ class _MockGHClient:
         self.calls.append(("POST", url, kwargs))
         return self._match(url)
 
+    async def put(self, url, **kwargs):
+        self.calls.append(("PUT", url, kwargs))
+        return self._match(url)
+
 
 async def _gh_project(db):
     """Create a project with a connected GitHub repo + a tenant dict with a PAT."""
@@ -81,6 +85,101 @@ def test_new_github_tools_registered():
         assert expected in server_module._GITHUB_TOOL_NAMES
     # No PAT → no tools.
     assert server_module._github_tools_for_tenant({"github_pat": None}) == []
+
+
+def test_patch_file_tool_registered_as_writeable():
+    """patch_file is advertised, routed, and (unlike read_file) not read-only."""
+    tenant = {"github_pat": db_module.encrypt_field("ghp_x")}
+    tools = server_module._github_tools_for_tenant(tenant)
+    patch = next((t for t in tools if t["name"] == "patch_file"), None)
+    assert patch is not None
+    assert patch["inputSchema"]["required"] == ["project_id", "file_path", "old_str", "new_str"]
+    assert "patch_file" in server_module._GITHUB_TOOL_NAMES
+    assert "patch_file" not in server_module._GITHUB_READ_ONLY  # it writes
+    assert patch["annotations"]["readOnlyHint"] is False
+
+
+@pytest.mark.asyncio
+async def test_github_patch_file_replaces_and_commits(db, monkeypatch):
+    import base64
+    proj, tenant = await _gh_project(db)
+    original = "line1\nTODO: fix\nline3\n"
+    # One route serves both the GET (reads content+sha) and the PUT (reads commit),
+    # since the mock matches by URL substring regardless of method.
+    mock = _MockGHClient([
+        ("/contents/app.py", _GHResp(200, {
+            "content": base64.b64encode(original.encode()).decode(),
+            "sha": "blobsha123", "path": "app.py", "size": len(original),
+            "commit": {"sha": "commitsha456789"},
+        })),
+    ])
+    monkeypatch.setattr("httpx.AsyncClient", lambda **kw: mock)
+    res = await server_module._dispatch_github_tool(
+        "patch_file",
+        {"project_id": proj["id"], "file_path": "app.py",
+         "old_str": "TODO: fix", "new_str": "done"},
+        tenant, db,
+    )
+    assert res["patched"] is True
+    assert res["branch"] == "main"  # defaulted to configured branch
+    assert res["commit_sha"] == "commitsha456"  # truncated to 12 chars
+    put_call = next(c for c in mock.calls if c[0] == "PUT")
+    sent = base64.b64decode(put_call[2]["json"]["content"]).decode()
+    assert sent == "line1\ndone\nline3\n"
+    assert put_call[2]["json"]["sha"] == "blobsha123"  # optimistic-concurrency sha
+    assert put_call[2]["json"]["branch"] == "main"
+
+
+@pytest.mark.asyncio
+async def test_github_patch_file_old_str_not_found(db, monkeypatch):
+    import base64
+    proj, tenant = await _gh_project(db)
+    mock = _MockGHClient([
+        ("/contents/app.py", _GHResp(200, {
+            "content": base64.b64encode(b"hello\n").decode(), "sha": "s", "path": "app.py", "size": 6,
+        })),
+    ])
+    monkeypatch.setattr("httpx.AsyncClient", lambda **kw: mock)
+    res = await server_module._dispatch_github_tool(
+        "patch_file",
+        {"project_id": proj["id"], "file_path": "app.py", "old_str": "nope", "new_str": "x"},
+        tenant, db,
+    )
+    assert "not found" in res["error"]
+    # Nothing was written.
+    assert not any(c[0] == "PUT" for c in mock.calls)
+
+
+@pytest.mark.asyncio
+async def test_github_patch_file_old_str_not_unique(db, monkeypatch):
+    import base64
+    proj, tenant = await _gh_project(db)
+    mock = _MockGHClient([
+        ("/contents/app.py", _GHResp(200, {
+            "content": base64.b64encode(b"x\nx\n").decode(), "sha": "s", "path": "app.py", "size": 4,
+        })),
+    ])
+    monkeypatch.setattr("httpx.AsyncClient", lambda **kw: mock)
+    res = await server_module._dispatch_github_tool(
+        "patch_file",
+        {"project_id": proj["id"], "file_path": "app.py", "old_str": "x", "new_str": "y"},
+        tenant, db,
+    )
+    assert "not unique" in res["error"]
+    assert not any(c[0] == "PUT" for c in mock.calls)
+
+
+@pytest.mark.asyncio
+async def test_github_patch_file_missing_file(db, monkeypatch):
+    proj, tenant = await _gh_project(db)
+    mock = _MockGHClient([("/contents/ghost.py", _GHResp(404, {}))])
+    monkeypatch.setattr("httpx.AsyncClient", lambda **kw: mock)
+    res = await server_module._dispatch_github_tool(
+        "patch_file",
+        {"project_id": proj["id"], "file_path": "ghost.py", "old_str": "a", "new_str": "b"},
+        tenant, db,
+    )
+    assert "File not found" in res["error"]
 
 
 @pytest.mark.asyncio

@@ -360,6 +360,63 @@ async def _dispatch_github_tool(name: str, args: dict[str, Any], tenant: dict, d
             content = _b64.b64decode(content_b64).decode("utf-8", errors="replace")
             return {"path": data["path"], "sha": data["sha"], "size": data["size"], "content": content}
 
+        if name == "patch_file":
+            # Targeted write: exact, unique substring replacement committed back via
+            # the contents API. Only the changed snippet crosses the wire, so it
+            # edits very large files trivially — the write counterpart to read_file.
+            path = (args.get("file_path") or args.get("path") or "").strip()
+            old_str = args.get("old_str")
+            new_str = args.get("new_str")
+            if not path:
+                return {"error": "file_path is required"}
+            if not isinstance(old_str, str) or not isinstance(new_str, str):
+                return {"error": "old_str and new_str are required strings"}
+            if old_str == new_str:
+                return {"error": "old_str and new_str are identical — nothing to change"}
+            ref = (args.get("branch") or branch).strip()
+            r = await http.get(
+                f"https://api.github.com/repos/{repo}/contents/{path}",
+                headers=gh_headers, params={"ref": ref},
+            )
+            if r.status_code == 404:
+                return {"error": f"File not found: {path} (branch {ref})"}
+            r.raise_for_status()
+            data = r.json()
+            if isinstance(data, list):
+                return {"error": f"{path} is a directory, not a file"}
+            try:
+                content = _b64.b64decode(data.get("content", "")).decode("utf-8")
+            except (ValueError, UnicodeDecodeError):
+                return {"error": f"{path} is not valid UTF-8 text — patch_file only supports text files"}
+            occurrences = content.count(old_str)
+            if occurrences == 0:
+                return {"error": "old_str not found — it must match the file contents exactly (including whitespace)"}
+            if occurrences > 1:
+                return {"error": f"old_str is not unique ({occurrences} matches) — add surrounding context to target a single location"}
+            new_content = content.replace(old_str, new_str, 1)
+            message = (args.get("message") or f"patch_file: update {path}").strip()
+            put = await http.put(
+                f"https://api.github.com/repos/{repo}/contents/{path}",
+                headers=gh_headers,
+                json={
+                    "message": message,
+                    "content": _b64.b64encode(new_content.encode("utf-8")).decode(),
+                    "sha": data.get("sha"),
+                    "branch": ref,
+                },
+            )
+            if put.status_code not in (200, 201):
+                return {"error": f"write failed ({put.status_code}): {put.text[:200]}"}
+            commit = (put.json() or {}).get("commit", {})
+            return {
+                "patched": True,
+                "path": path,
+                "branch": ref,
+                "commit_sha": (commit.get("sha") or "")[:12],
+                "bytes_before": len(content.encode("utf-8")),
+                "bytes_after": len(new_content.encode("utf-8")),
+            }
+
         if name == "list_files":
             path = args.get("path") or ""
             r = await http.get(
