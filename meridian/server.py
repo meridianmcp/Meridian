@@ -3280,6 +3280,10 @@ async def mcp_tools_doc() -> str:
         "decisions, active sessions). Use `mode='full'` to paste into a fresh Claude Code session; `mode='chat'` "
         "for a shorter paste into claude.ai.")
     lines += ["## Planning tools\n"]
+    lines += _render_tool("fan_out_sprint_items",
+        "Bulk-insert sprint items in one call — lets an orchestrator LLM decompose a goal "
+        "into parallel work items without N sequential `add_sprint_item` calls. Pass a list "
+        "of `{title, description?, group?, version?}` dicts; returns the list of new item IDs.")
     lines += _render_tool("get_planning_brief",
         "Read-only: Return a compact planning context (sprint, north star, pending items, "
         "in-progress items, recent tasks, active sessions, recent decisions, pending HITLs). "

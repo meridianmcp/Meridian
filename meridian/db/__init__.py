@@ -2771,6 +2771,44 @@ async def add_sprint_item(
     return item
 
 
+async def fan_out_sprint_items(
+    db: aiosqlite.Connection,
+    project_id: str,
+    items: list[dict[str, Any]],
+) -> list[str]:
+    """Bulk-insert sprint items for an orchestrator decomposing a goal.
+
+    ``items`` is a list of dicts, each with at minimum ``title`` (required)
+    and optionally ``description``, ``group``, and ``version``.  Missing
+    ``version`` defaults to the empty string (same as the common add_sprint_item
+    convention).  Unlike add_sprint_item the duplicate guard is **not** applied
+    here — the orchestrator is assumed to have already deduped.
+
+    Returns the list of new item IDs in insertion order.
+    """
+    ids: list[str] = []
+    for spec in items:
+        title = (spec.get("title") or "").strip()
+        if not title:
+            continue
+        version = (spec.get("version") or spec.get("sprint") or "").strip()
+        group = spec.get("group") or spec.get("item_group") or None
+        description = spec.get("description") or None
+        iid = _new_id()
+        await db.execute(
+            "INSERT INTO sprint_items "
+            "(id, project_id, version, title, item_group, notes) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (iid, project_id, version, title, group, description),
+        )
+        ids.append(iid)
+    if ids:
+        await db.commit()
+        _invalidate_sprint_items_cache(project_id)
+        _publish_project_event(project_id, "sprint_items_fanned_out", {"item_ids": ids})
+    return ids
+
+
 async def get_sprint_item(
     db: aiosqlite.Connection, item_id: str
 ) -> dict[str, Any] | None:

@@ -1,6 +1,6 @@
 # MCP Tool Reference
 
-Meridian exposes **67 tools** over MCP.
+Meridian exposes **68 tools** over MCP.
 
 They fall into two usage patterns:
 
@@ -408,6 +408,23 @@ get_context_block(project_id="abc-123", mode="chat")
 ---
 
 ## Planning tools
+
+### `fan_out_sprint_items`
+Bulk-insert sprint items in one call — lets an orchestrator LLM decompose a goal into parallel work items without N sequential `add_sprint_item` calls. Pass a list of `{title, description?, group?, version?}` dicts; returns the list of new item IDs.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `project_id` | string | optional |  |
+| `project_name` | string | optional | Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given. |
+| `items` | array | required | List of sprint item specs. Each must have at least a 'title'. |
+
+**Example:**
+```
+fan_out_sprint_items(project_id="abc-123", items=[{"title": "Design DB schema", "group": "backend"}, {"title": "Build API endpoints", "group": "backend"}, {"title": "Wire up frontend", "group": "frontend"}])
+```
+
+---
+
 
 ### `get_planning_brief`
 Read-only: Return a compact planning context (sprint, north star, pending items, in-progress items, recent tasks, active sessions, recent decisions, pending HITLs). No session registration needed — designed for planning chat sessions that need to see project state without side effects.
