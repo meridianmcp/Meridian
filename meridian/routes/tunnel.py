@@ -879,6 +879,186 @@ def _json_response(payload: dict, status_code: int = 200) -> Response:
     )
 
 
+# ---------------------------------------------------------------------------
+# Plugin install / uninstall — sprint item 56cb5d33
+# Three-state lifecycle: not_installed / installed_inactive / active.
+# POST /tunnel/plugins/install  — run uvx/npx install (self-hosted mode).
+# POST /tunnel/plugins/uninstall — remove from config + kill process.
+# GET  /tunnel/plugins/check    — detect if a command binary is available.
+# ---------------------------------------------------------------------------
+
+@router.get("/tunnel/plugins/check")
+async def check_plugin_installed(request: Request) -> Response:
+    """Check whether a plugin binary is available on the server's PATH.
+
+    Query params:
+      command — the install command string (e.g. "uvx mcp-server-fetch")
+
+    Returns {"installed": bool, "command": str}. Self-hosted only — on hosted
+    deployments the binary lives on the user's machine (via the tunnel client),
+    so this endpoint reports the server-side availability.
+    """
+    import shutil
+    command = request.query_params.get("command", "").strip()
+    if not command:
+        return _json_response({"error": "command required"}, status_code=400)
+    # Extract the binary name (first word of command, stripping uvx/npx wrappers)
+    parts = command.split()
+    binary = parts[0] if parts else ""
+    # For uvx/npx launchers, the real package is the second arg
+    if binary in ("uvx", "npx") and len(parts) >= 2:
+        # uvx mcp-server-fetch → check if uvx is available (uvx handles the rest)
+        binary = parts[0]
+    found = shutil.which(binary) is not None
+    return _json_response({"installed": found, "command": command, "binary": binary})
+
+
+_ALLOWED_LAUNCHERS = frozenset(["uvx", "npx"])
+
+@router.post("/tunnel/plugins/install")
+async def install_plugin(request: Request) -> Response:
+    """Run a plugin install command on the server machine (self-hosted deployments).
+
+    Body: {"command": "uvx mcp-server-fetch"}
+
+    Validates that the command starts with uvx or npx to prevent arbitrary
+    execution. Returns {"ok": bool, "output": str}.
+
+    In hosted mode the server and user machine are different — this endpoint
+    still runs but installs on the server (not the user's machine). The
+    dashboard shows a copy-to-clipboard fallback for hosted users.
+    """
+    import asyncio
+    import sys
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        return _json_response({"error": "invalid JSON body"}, status_code=400)
+    command = (body.get("command") or "").strip()
+    if not command:
+        return _json_response({"error": "command required"}, status_code=400)
+    parts = command.split()
+    launcher = parts[0] if parts else ""
+    if launcher not in _ALLOWED_LAUNCHERS:
+        return _json_response(
+            {"error": f"launcher '{launcher}' not allowed; must be uvx or npx"},
+            status_code=400,
+        )
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *parts,
+            "--help",  # dry-run: uvx/npx --help downloads the package without running the server
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _stdout, _stderr = await asyncio.wait_for(proc.communicate(), timeout=60)
+        ok = proc.returncode == 0
+        output = (_stdout + _stderr).decode(errors="replace")[:2000]
+        return _json_response({"ok": ok, "returncode": proc.returncode, "output": output})
+    except asyncio.TimeoutError:
+        return _json_response({"ok": False, "output": "install timed out (60s)"})
+    except Exception as exc:  # noqa: BLE001
+        return _json_response({"ok": False, "output": str(exc)})
+
+
+# ---------------------------------------------------------------------------
+# MCP Registry proxy — sprint item 9b288b91
+# Proxies GET registry.modelcontextprotocol.io/v0/servers to avoid CORS.
+# Returns a normalised subset: id, name, description, install_command, homepage.
+# Cursor-based pagination: pass ?cursor=<opaque> to fetch the next page.
+# ---------------------------------------------------------------------------
+
+_REGISTRY_BASE = "https://registry.modelcontextprotocol.io/v0/servers"
+_REGISTRY_TIMEOUT = 8  # seconds
+
+
+def _extract_install_command(server: dict) -> str:
+    """Best-effort extraction of a runnable install command from a registry entry.
+
+    The MCP registry uses a packages[] array with package_arguments. We prefer
+    uvx (uv) over npx in that order, then fall back to any available runtime.
+    """
+    packages = server.get("packages") or []
+    # Preference order: uv → npm → any
+    _pref = {"uv": 0, "npm": 1}
+    best = None
+    best_score = 999
+    for pkg in packages:
+        runtime = (pkg.get("runtime") or "").lower()
+        score = _pref.get(runtime, 2)
+        if score < best_score:
+            best_score = score
+            best = pkg
+    if not best:
+        return ""
+    runtime = (best.get("runtime") or "").lower()
+    name = best.get("name") or ""
+    args = best.get("package_arguments") or []
+    # Build a string representation: uvx <name> [args] or npx -y <name> [args]
+    if runtime == "uv":
+        cmd_parts = ["uvx", name] + [str(a) for a in args if a]
+    elif runtime == "npm":
+        cmd_parts = ["npx", "-y", name] + [str(a) for a in args if a]
+    else:
+        cmd_parts = [name] + [str(a) for a in args if a]
+    return " ".join(p for p in cmd_parts if p)
+
+
+@router.get("/tunnel/registry")
+async def get_mcp_registry(request: Request) -> Response:
+    """Proxy the official MCP Registry API to avoid browser CORS restrictions.
+
+    Returns a page of MCP servers with: id, name, description, install_command,
+    homepage. Pass ?cursor=<token> for subsequent pages and ?limit=N (default 20,
+    max 50). Requires no auth — the registry is public.
+    """
+    import urllib.request
+    import urllib.parse
+
+    limit = min(int(request.query_params.get("limit", 20)), 50)
+    cursor = request.query_params.get("cursor", "")
+
+    params: dict[str, str] = {"limit": str(limit)}
+    if cursor:
+        params["cursor"] = cursor
+    url = _REGISTRY_BASE + "?" + urllib.parse.urlencode(params)
+
+    try:
+        req = urllib.request.Request(
+            url,
+            headers={"Accept": "application/json", "User-Agent": "Meridian/1.0"},
+        )
+        import socket as _socket
+        with urllib.request.urlopen(req, timeout=_REGISTRY_TIMEOUT) as resp:  # noqa: S310
+            raw = resp.read()
+        data = json.loads(raw)
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("MCP registry fetch failed: %s", exc)
+        return _json_response({"error": "registry unavailable", "servers": [], "next_cursor": None}, status_code=200)
+
+    servers_raw = data.get("servers") or []
+    servers_out = []
+    for s in servers_raw:
+        install_cmd = _extract_install_command(s)
+        homepage = ""
+        if s.get("source_code_location"):
+            homepage = s["source_code_location"].get("url", "")
+        if not homepage:
+            homepage = s.get("homepage", "") or ""
+        servers_out.append({
+            "id": s.get("id") or "",
+            "name": s.get("name") or s.get("id") or "",
+            "description": (s.get("description") or "")[:200],
+            "install_command": install_cmd,
+            "homepage": homepage,
+        })
+
+    return _json_response({
+        "servers": servers_out,
+        "next_cursor": data.get("nextCursor") or data.get("next_cursor") or None,
+    })
+
+
 def _union_filesystem_roots(projects: list[dict]) -> list[str]:
     """Collect a deduped, order-preserved list of executor_config.filesystem_roots
     across the given project rows. executor_config may be a JSON string or dict."""

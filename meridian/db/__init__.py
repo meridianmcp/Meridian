@@ -782,6 +782,9 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_note_source(db)
     await _migrate_session_sprint_version(db)
     await _migrate_project_execution_mode(db)
+    await _migrate_decision_code_anchor(db)
+    await _migrate_session_graph_snapshots(db)
+    await _migrate_agent_tasks_table(db)
     return db
 
 
@@ -2769,6 +2772,44 @@ async def add_sprint_item(
     # ITEM 6 — live push so dashboards refresh the sprint board without polling.
     _publish_project_event(project_id, "sprint_item_added", {"item_id": iid})
     return item
+
+
+async def fan_out_sprint_items(
+    db: aiosqlite.Connection,
+    project_id: str,
+    items: list[dict[str, Any]],
+) -> list[str]:
+    """Bulk-insert sprint items for an orchestrator decomposing a goal.
+
+    ``items`` is a list of dicts, each with at minimum ``title`` (required)
+    and optionally ``description``, ``group``, and ``version``.  Missing
+    ``version`` defaults to the empty string (same as the common add_sprint_item
+    convention).  Unlike add_sprint_item the duplicate guard is **not** applied
+    here — the orchestrator is assumed to have already deduped.
+
+    Returns the list of new item IDs in insertion order.
+    """
+    ids: list[str] = []
+    for spec in items:
+        title = (spec.get("title") or "").strip()
+        if not title:
+            continue
+        version = (spec.get("version") or spec.get("sprint") or "").strip()
+        group = spec.get("group") or spec.get("item_group") or None
+        description = spec.get("description") or None
+        iid = _new_id()
+        await db.execute(
+            "INSERT INTO sprint_items "
+            "(id, project_id, version, title, item_group, notes) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (iid, project_id, version, title, group, description),
+        )
+        ids.append(iid)
+    if ids:
+        await db.commit()
+        _invalidate_sprint_items_cache(project_id)
+        _publish_project_event(project_id, "sprint_items_fanned_out", {"item_ids": ids})
+    return ids
 
 
 async def get_sprint_item(
@@ -4800,6 +4841,20 @@ async def get_pool_project_counts(
 
 _FILE_LOCK_TTL_HOURS = 2
 
+# 39544099 — shared staleness constant so file_locks and file_symbol_claims use the
+# same TTL. Both mechanisms now expire via heartbeat (session.last_seen > TTL) in
+# addition to the explicit expires_at column.
+_CLAIM_LIVE_HOURS = _FILE_LOCK_TTL_HOURS
+
+
+def _cutoff_dt(hours: int) -> str:
+    """Return an ISO-8601 datetime string ``hours`` ago (UTC).
+
+    Used as the shared staleness cutoff for file_locks and file_symbol_claims.
+    """
+    from datetime import datetime, timezone, timedelta
+    return (datetime.now(timezone.utc) - timedelta(hours=hours)).strftime("%Y-%m-%d %H:%M:%S")
+
 
 def _normalize_file_path(file_path: str | None) -> str:
     """Normalize a file path the same way ``claim_file`` stores it.
@@ -4878,10 +4933,66 @@ async def _code_notes_for_session_file(
     )
 
 
+async def _decision_notes_for_session_file(
+    db: aiosqlite.Connection,
+    session_id: str,
+    file_path: str,
+) -> list[dict[str, Any]]:
+    """Return code-anchored decisions for the file, resolved via session's project.
+
+    777f26b0 — companion to ``_code_notes_for_session_file``: fetches active
+    decisions whose ``code_anchor`` matches ``file_path`` so they can be injected
+    into the ``claim_file`` response as ``decision_notes``. Best-effort: unknown
+    session ids or pre-migration DBs yield ``[]`` rather than raising.
+    """
+    async with db.execute(
+        "SELECT project_id FROM sessions WHERE id = ?", (session_id,)
+    ) as cur:
+        row = await cur.fetchone()
+    sess = _row_to_dict(row)
+    if not sess or not sess.get("project_id"):
+        return []
+    return await get_decisions_for_file(db, sess["project_id"], file_path)
+
+
 async def expire_file_locks(db: aiosqlite.Connection) -> int:
-    """Delete expired file locks and return how many rows were cleared."""
+    """Delete expired file locks and return how many rows were cleared.
+
+    39544099 — two expiry paths (unified with file_symbol_claims):
+    1. Explicit TTL: expires_at column <= now (original).
+    2. Heartbeat: owning session's last_seen is older than _CLAIM_LIVE_HOURS
+       (handles crashed/orphaned sessions whose lock was never explicitly released).
+    """
+    stale_cutoff = _cutoff_dt(_CLAIM_LIVE_HOURS)
     cursor = await db.execute(
-        "DELETE FROM file_locks WHERE expires_at <= datetime('now')"
+        "DELETE FROM file_locks WHERE expires_at <= datetime('now') "
+        "OR session_id IN ("
+        "    SELECT id FROM sessions "
+        "    WHERE last_seen IS NOT NULL AND last_seen < ?"
+        ")",
+        (stale_cutoff,),
+    )
+    await db.commit()
+    return cursor.rowcount
+
+
+async def expire_stale_symbol_claims(db: aiosqlite.Connection) -> int:
+    """Soft-release symbol claims whose owning session's heartbeat has gone stale.
+
+    39544099 — parallel to expire_file_locks but for file_symbol_claims. Uses the
+    same _CLAIM_LIVE_HOURS cutoff so both expiry mechanisms share one constant.
+    Marks claims as released (sets released_at) rather than deleting so the hotspot
+    history (session_count aggregation) is preserved.
+    """
+    stale_cutoff = _cutoff_dt(_CLAIM_LIVE_HOURS)
+    cursor = await db.execute(
+        "UPDATE file_symbol_claims SET released_at = datetime('now') "
+        "WHERE released_at IS NULL "
+        "AND session_id IN ("
+        "    SELECT id FROM sessions "
+        "    WHERE last_seen IS NOT NULL AND last_seen < ?"
+        ")",
+        (stale_cutoff,),
     )
     await db.commit()
     return cursor.rowcount
@@ -4925,6 +5036,9 @@ async def claim_file(
             "code_notes": await _code_notes_for_session_file(
                 db, session_id, normalized, symbol
             ),
+            "decision_notes": await _decision_notes_for_session_file(
+                db, session_id, normalized
+            ),
         }
 
     if existing and existing.get("session_id") == session_id:
@@ -4935,9 +5049,13 @@ async def claim_file(
             (str(ttl_hours), existing["id"]),
         )
     else:
+        # Atomic INSERT — ON CONFLICT DO NOTHING races another concurrent INSERT
+        # on the same file_path. Re-select to check who won. Safe on both SQLite
+        # (single-writer) and Postgres (UNIQUE constraint is atomic).
         await db.execute(
             "INSERT INTO file_locks (id, file_path, session_id, claimed_at, expires_at) "
-            "VALUES (?, ?, ?, datetime('now'), datetime('now', ? || ' hours'))",
+            "VALUES (?, ?, ?, datetime('now'), datetime('now', ? || ' hours')) "
+            "ON CONFLICT (file_path) DO NOTHING",
             (_new_id(), normalized, session_id, str(ttl_hours)),
         )
     await db.commit()
@@ -4947,6 +5065,24 @@ async def claim_file(
     ) as cur:
         row = await cur.fetchone()
     lock = _row_to_dict(row) or {}
+    # b033c10f — re-check after INSERT to detect concurrent claim by another session.
+    # The ON CONFLICT DO NOTHING is a no-op when another session raced us; the
+    # re-SELECT reveals the actual winner. UPDATE path is already idempotent.
+    if lock.get("session_id") != session_id:
+        return {
+            "claimed": False,
+            "file_path": normalized,
+            "session_id": session_id,
+            "holder_session_id": lock.get("session_id"),
+            "claimed_at": lock.get("claimed_at"),
+            "expires_at": lock.get("expires_at"),
+            "code_notes": await _code_notes_for_session_file(
+                db, session_id, normalized, symbol
+            ),
+            "decision_notes": await _decision_notes_for_session_file(
+                db, session_id, normalized
+            ),
+        }
     return {
         "claimed": True,
         "file_path": normalized,
@@ -4955,6 +5091,10 @@ async def claim_file(
         "expires_at": lock.get("expires_at"),
         "code_notes": await _code_notes_for_session_file(
             db, session_id, normalized, symbol
+        ),
+        # 777f26b0 — decisions with code_anchor matching this file path.
+        "decision_notes": await _decision_notes_for_session_file(
+            db, session_id, normalized
         ),
     }
 
@@ -5096,12 +5236,12 @@ async def _live_symbol_claims_for_file(
 ) -> list[dict[str, Any]]:
     """Symbol claims on ``file_path`` held by *other* still-live sessions.
 
-    A session is live when status is active/live and last_seen is within the
-    last 10 minutes — mirrors get_file_conflict_warnings so a crashed session's
-    stale claims never block forever.
+    39544099 — uses _CLAIM_LIVE_HOURS (unified with file_locks TTL) as the
+    staleness cutoff instead of a hardcoded 10-minute window, so both expiry
+    mechanisms share the same constant. A crashed session's claims time out after
+    _CLAIM_LIVE_HOURS just like a whole-file lock does.
     """
-    from datetime import datetime, timezone, timedelta
-    cutoff_10m = (datetime.now(timezone.utc) - timedelta(minutes=10)).strftime("%Y-%m-%d %H:%M:%S")
+    cutoff = _cutoff_dt(_CLAIM_LIVE_HOURS)
     async with db.execute(
         "SELECT fsc.symbol_name, fsc.symbol_type, fsc.line_start, fsc.line_end, "
         "       fsc.session_id, s.name AS session_name "
@@ -5111,7 +5251,7 @@ async def _live_symbol_claims_for_file(
         "AND fsc.released_at IS NULL "
         "AND s.status IN ('active', 'live') "
         "AND (s.last_seen IS NULL OR s.last_seen > ?)",
-        (file_path, exclude_session_id, cutoff_10m),
+        (file_path, exclude_session_id, cutoff),
     ) as cur:
         rows = await cur.fetchall()
     return [r for r in (_row_to_dict(row) for row in rows) if r]
@@ -5304,6 +5444,51 @@ async def get_symbol_hotspots(
     async with db.execute(sql, tuple(params)) as cur:
         rows = await cur.fetchall()
     return [r for r in (_row_to_dict(row) for row in rows) if r]
+
+
+async def get_hotspot_suggestions(
+    db: aiosqlite.Connection,
+    *,
+    min_sessions: int = 5,
+    days: int = 30,
+) -> list[dict[str, Any]]:
+    """Return sprint item suggestions based on file-level contention hotspots.
+
+    1b4760a9 — files touched by min_sessions+ distinct sessions within days are
+    likely candidates for refactoring, clearer ownership, or better test coverage.
+    Returns dicts with: file_path, session_count, suggestion (human-readable
+    recommendation text). Computed over file_symbol_claims grouped by file_path
+    (not symbol), so a heavily-edited file surfaces even if individual symbols
+    each have low session counts.
+    """
+    params: list[Any] = [f"-{max(0, int(days))} days"]
+    sql = (
+        "SELECT file_path, COUNT(DISTINCT session_id) AS session_count "
+        "FROM file_symbol_claims "
+        "WHERE claimed_at > datetime('now', ?) "
+        "GROUP BY file_path "
+        "HAVING COUNT(DISTINCT session_id) >= ? "
+        "ORDER BY session_count DESC, file_path"
+    )
+    params.append(int(min_sessions))
+    async with db.execute(sql, tuple(params)) as cur:
+        rows = await cur.fetchall()
+    suggestions = []
+    for row in rows:
+        r = _row_to_dict(row)
+        if not r:
+            continue
+        fp = r.get("file_path", "")
+        sc = r.get("session_count", 0)
+        suggestions.append({
+            "file_path": fp,
+            "session_count": sc,
+            "suggestion": (
+                f"Refactor or add ownership docs for {fp} — "
+                f"touched by {sc} distinct sessions in the last {days} days"
+            ),
+        })
+    return suggestions
 
 
 # ---------------------------------------------------------------------------
@@ -5637,6 +5822,39 @@ async def get_pinned_decisions(
     # band. urgent (0) < normal (1) < low (2).
     decisions.sort(key=lambda d: _DECISION_PRIORITY_RANK.get(d["priority"], 1))  # type: ignore[index,union-attr]
     return decisions  # type: ignore[return-value]
+
+
+async def get_decisions_for_file(
+    db: aiosqlite.Connection,
+    project_id: str,
+    file_path: str,
+) -> list[dict[str, Any]]:
+    """Return active decisions with a code_anchor matching ``file_path``.
+
+    777f26b0 — decisions with a ``code_anchor`` set are surfaced automatically
+    when an executor calls ``claim_file`` for a matching path, so architectural
+    decisions relevant to the file are injected into the executor's context
+    before it edits. Only active decisions are returned; superseded ones are
+    excluded. Returns an empty list when no matches or when the decisions_pinned
+    table has no code_anchor column (pre-migration DBs).
+    """
+    normalized = _normalize_file_path(file_path)
+    if not normalized:
+        return []
+    try:
+        async with db.execute(
+            "SELECT * FROM decisions_pinned "
+            "WHERE project_id = ? AND status = 'active' "
+            "AND code_anchor IS NOT NULL AND code_anchor != '' "
+            "AND code_anchor = ? "
+            "ORDER BY created_at DESC",
+            (project_id, normalized),
+        ) as cur:
+            rows = await cur.fetchall()
+    except Exception:
+        # Column may not exist yet on pre-migration DBs — degrade gracefully.
+        return []
+    return [d for d in (_hydrate_decision_row(r) for r in rows) if d is not None]
 
 
 async def update_pinned_decision(
@@ -7997,3 +8215,248 @@ async def delete_changelog_entry(db: aiosqlite.Connection, entry_id: str) -> boo
     await db.execute("DELETE FROM changelog_entries WHERE id = ?", (entry_id,))
     await db.commit()
     return True
+
+
+# ---------------------------------------------------------------------------
+# f773a99a — Graph diff: per-session code-graph metric snapshots
+# ---------------------------------------------------------------------------
+
+
+async def snapshot_graph_metrics(
+    db: aiosqlite.Connection,
+    session_id: str,
+    project_id: str,
+) -> dict[str, Any]:
+    """Compute proxy graph metrics for a session and persist them.
+
+    Proxy metrics (no live code-graph traversal needed):
+    - node_count: distinct file_paths in file_symbol_claims for this project.
+    - edge_count: distinct (session_id, file_path) pairs — sessions touching files.
+    - hotspot_count: files with 3+ distinct sessions in file_symbol_claims.
+    - file_churn: distinct files touched in the last 7 days.
+
+    Idempotent: inserts a new snapshot row each time so callers can compare
+    across checkpoints. Returns the snapshot dict.
+    """
+    import json as _json
+
+    # node_count: distinct files claimed in this project across all sessions
+    async with db.execute(
+        "SELECT COUNT(DISTINCT fsc.file_path) AS cnt "
+        "FROM file_symbol_claims fsc "
+        "JOIN sessions s ON s.id = fsc.session_id "
+        "WHERE s.project_id = ?",
+        (project_id,),
+    ) as cur:
+        row = await cur.fetchone()
+    node_count = (_row_to_dict(row) or {}).get("cnt") or 0
+
+    # edge_count: distinct (session, file) pairs for this project
+    async with db.execute(
+        "SELECT COUNT(*) AS cnt "
+        "FROM ("
+        "    SELECT DISTINCT fsc.session_id, fsc.file_path "
+        "    FROM file_symbol_claims fsc "
+        "    JOIN sessions s ON s.id = fsc.session_id "
+        "    WHERE s.project_id = ?"
+        ")",
+        (project_id,),
+    ) as cur:
+        row = await cur.fetchone()
+    edge_count = (_row_to_dict(row) or {}).get("cnt") or 0
+
+    # hotspot_count: files with 3+ distinct sessions
+    async with db.execute(
+        "SELECT COUNT(*) AS cnt FROM ("
+        "    SELECT fsc.file_path "
+        "    FROM file_symbol_claims fsc "
+        "    JOIN sessions s ON s.id = fsc.session_id "
+        "    WHERE s.project_id = ? "
+        "    GROUP BY fsc.file_path "
+        "    HAVING COUNT(DISTINCT fsc.session_id) >= 3"
+        ")",
+        (project_id,),
+    ) as cur:
+        row = await cur.fetchone()
+    hotspot_count = (_row_to_dict(row) or {}).get("cnt") or 0
+
+    # file_churn: distinct files touched in last 7 days
+    async with db.execute(
+        "SELECT COUNT(DISTINCT fsc.file_path) AS cnt "
+        "FROM file_symbol_claims fsc "
+        "JOIN sessions s ON s.id = fsc.session_id "
+        "WHERE s.project_id = ? "
+        "AND fsc.claimed_at > datetime('now', '-7 days')",
+        (project_id,),
+    ) as cur:
+        row = await cur.fetchone()
+    file_churn = (_row_to_dict(row) or {}).get("cnt") or 0
+
+    metrics = {
+        "node_count": node_count,
+        "edge_count": edge_count,
+        "hotspot_count": hotspot_count,
+        "file_churn": file_churn,
+    }
+    snap_id = _new_id()
+    await db.execute(
+        "INSERT INTO session_graph_snapshots "
+        "(id, session_id, project_id, node_count, edge_count, hotspot_count, file_churn, metrics_json) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (snap_id, session_id, project_id, node_count, edge_count, hotspot_count, file_churn, _json.dumps(metrics)),
+    )
+    await db.commit()
+    return {"snapshot_id": snap_id, "session_id": session_id, "project_id": project_id, **metrics}
+
+
+async def get_graph_diff(
+    db: aiosqlite.Connection,
+    session_a_id: str,
+    session_b_id: str,
+) -> dict[str, Any]:
+    """Compare the latest graph snapshots of two sessions.
+
+    f773a99a — returns the delta between session_a and session_b's most recent
+    ``session_graph_snapshots`` rows: nodes_added, nodes_removed, new_hotspots,
+    file_churn_delta. Positive values mean session_b has more; negative means
+    session_a has more. Returns an error dict when either session has no snapshot.
+    """
+    async def _latest_snap(sid: str) -> dict[str, Any] | None:
+        async with db.execute(
+            "SELECT * FROM session_graph_snapshots WHERE session_id = ? "
+            "ORDER BY snapshot_at DESC LIMIT 1",
+            (sid,),
+        ) as cur:
+            row = await cur.fetchone()
+        return _row_to_dict(row)
+
+    snap_a = await _latest_snap(session_a_id)
+    snap_b = await _latest_snap(session_b_id)
+
+    if snap_a is None:
+        return {"error": f"No graph snapshot found for session {session_a_id[:8]}"}
+    if snap_b is None:
+        return {"error": f"No graph snapshot found for session {session_b_id[:8]}"}
+
+    node_a = snap_a.get("node_count") or 0
+    node_b = snap_b.get("node_count") or 0
+    hotspot_a = snap_a.get("hotspot_count") or 0
+    hotspot_b = snap_b.get("hotspot_count") or 0
+    churn_a = snap_a.get("file_churn") or 0
+    churn_b = snap_b.get("file_churn") or 0
+    edge_a = snap_a.get("edge_count") or 0
+    edge_b = snap_b.get("edge_count") or 0
+
+    return {
+        "session_a": session_a_id,
+        "session_b": session_b_id,
+        "snapshot_a_at": snap_a.get("snapshot_at"),
+        "snapshot_b_at": snap_b.get("snapshot_at"),
+        "nodes_added": node_b - node_a,
+        "nodes_removed": max(0, node_a - node_b),
+        "new_hotspots": hotspot_b - hotspot_a,
+        "file_churn_delta": churn_b - churn_a,
+        "edge_delta": edge_b - edge_a,
+        "summary": (
+            f"session_b has {node_b - node_a:+d} nodes, "
+            f"{hotspot_b - hotspot_a:+d} hotspots, "
+            f"{churn_b - churn_a:+d} file churn vs session_a"
+        ),
+    }
+
+
+# ---------------------------------------------------------------------------
+# A2A protocol — agent_tasks table (99e71b9e)
+# ---------------------------------------------------------------------------
+
+async def create_agent_task(
+    db: aiosqlite.Connection,
+    agent_id: str,
+    input_data: dict[str, Any],
+    session_id: str | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Insert a new agent task with status 'submitted'. Returns the task row."""
+    task_id = _new_id()
+    input_json = json.dumps(input_data)
+    meta_json = json.dumps(metadata) if metadata else None
+    await db.execute(
+        "INSERT INTO agent_tasks (id, agent_id, session_id, input, metadata) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (task_id, agent_id, session_id, input_json, meta_json),
+    )
+    await db.commit()
+    return await _get_agent_task(db, task_id)  # type: ignore[return-value]
+
+
+async def _get_agent_task(
+    db: aiosqlite.Connection, task_id: str
+) -> dict[str, Any] | None:
+    """Fetch one agent task by id."""
+    async with db.execute(
+        "SELECT * FROM agent_tasks WHERE id = ?", (task_id,)
+    ) as cur:
+        row = await cur.fetchone()
+    if row is None:
+        return None
+    task = _row_to_dict(row)
+    # Deserialize JSON blobs
+    if task.get("input"):
+        try:
+            task["input"] = json.loads(task["input"])
+        except Exception:
+            pass
+    if task.get("output"):
+        try:
+            task["output"] = json.loads(task["output"])
+        except Exception:
+            pass
+    if task.get("metadata"):
+        try:
+            task["metadata"] = json.loads(task["metadata"])
+        except Exception:
+            pass
+    return task
+
+
+async def get_agent_task(
+    db: aiosqlite.Connection, agent_id: str, task_id: str
+) -> dict[str, Any] | None:
+    """Fetch an agent task, scoped to agent_id for security."""
+    async with db.execute(
+        "SELECT * FROM agent_tasks WHERE id = ? AND agent_id = ?",
+        (task_id, agent_id),
+    ) as cur:
+        row = await cur.fetchone()
+    if row is None:
+        return None
+    task = _row_to_dict(row)
+    for field in ("input", "output", "metadata"):
+        if task.get(field):
+            try:
+                task[field] = json.loads(task[field])
+            except Exception:
+                pass
+    return task
+
+
+async def update_agent_task_status(
+    db: aiosqlite.Connection,
+    task_id: str,
+    status: str,
+    output: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    """Update the status (and optionally output) of an agent task."""
+    output_json = json.dumps(output) if output is not None else None
+    if output_json is not None:
+        await db.execute(
+            "UPDATE agent_tasks SET status=?, output=?, updated_at=datetime('now') WHERE id=?",
+            (status, output_json, task_id),
+        )
+    else:
+        await db.execute(
+            "UPDATE agent_tasks SET status=?, updated_at=datetime('now') WHERE id=?",
+            (status, task_id),
+        )
+    await db.commit()
+    return await _get_agent_task(db, task_id)

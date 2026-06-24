@@ -39,6 +39,7 @@ _TOOL_EXAMPLES: dict[str, str] = {
     "get_workspace_settings": 'get_workspace_settings()',
     "update_workspace_settings": 'update_workspace_settings(hitl_auto_answer_default=True, sprint_name_default="june-sprint")',
     "add_sprint_item": 'add_sprint_item(project_id="abc-123", title="Add OAuth login", item_group="auth")',
+    "fan_out_sprint_items": 'fan_out_sprint_items(project_id="abc-123", items=[{"title": "Design DB schema", "group": "backend"}, {"title": "Build API endpoints", "group": "backend"}, {"title": "Wire up frontend", "group": "frontend"}])',
     "update_sprint_item": 'update_sprint_item(project_id="abc-123", item_id="item-uuid", title="Add OAuth + SAML login", group="auth", human_id="alice")',
     "reconcile_sprint_drift": 'reconcile_sprint_drift(project_id="abc-123")',
     "get_planning_brief": 'get_planning_brief(project_id="abc-123")',
@@ -509,6 +510,31 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "force": {"type": "boolean",
                    "description": "Override the duplicate guard and add the item even if its title closely matches an existing open item. Default false."}},
          "required": ["version", "title"]}},
+    {"name": "fan_out_sprint_items",
+     "description":
+        "Bulk-insert sprint items from a single orchestrator call — decompose a goal into "
+        "parallel work items without N sequential add_sprint_item calls. Pass a list of "
+        "{title, description?, group?, version?} dicts; returns the list of new item_ids "
+        "in insertion order. No duplicate guard is applied (the caller is assumed to have "
+        "deduped). Items with empty titles are silently skipped.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"},
+         "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "items": {
+             "type": "array",
+             "description": "List of sprint item specs. Each must have at least a 'title'.",
+             "items": {
+                 "type": "object",
+                 "properties": {
+                     "title": {"type": "string", "description": "Sprint item title (required)."},
+                     "description": {"type": "string", "description": "Optional notes / detail for the item."},
+                     "group": {"type": "string", "description": "Optional objective group name."},
+                     "version": {"type": "string", "description": "Optional sprint-version bucket; defaults to empty string."},
+                 },
+                 "required": ["title"],
+             },
+         }},
+         "required": ["items"]}},
     {"name": "update_sprint_item", "description":
         "Edit fields on an existing sprint item: title, version, notes, human_id (assignee), "
         "or group. Only the fields you pass are changed; omitted fields are left untouched. "
@@ -662,6 +688,36 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "min_sessions": {"type": "integer"},
          "days": {"type": "integer"}},
          "required": []}},
+    {"name": "list_plugins", "description":
+        "Read-only: Lightweight index of active tunnel plugins — name, description, "
+        "enabled state, and tool_count. Does NOT return full tool schemas (use "
+        "get_plugin_details for that). Dramatically reduces context bloat vs. "
+        "dumping all plugin schemas at startup (~500 tokens vs 50k+). "
+        "Returns an 'active_plugins' list plus any stored skill notes.",
+     "inputSchema": {"type": "object", "properties": {},
+         "required": []}},
+    {"name": "get_plugin_details", "description":
+        "Read-only: Full schema for one named plugin (all tool definitions, "
+        "description overrides, and stored skill guide if available). "
+        "Use list_plugins first to see which plugins are active, then call "
+        "get_plugin_details(name) to load the schema for a specific plugin "
+        "on demand.",
+     "inputSchema": {"type": "object", "properties": {
+         "name": {"type": "string", "description": "Plugin name as returned by list_plugins (e.g. 'filesystem', 'code-intel', 'code-extractor')."}},
+         "required": ["name"]}},
+    {"name": "get_graph_diff", "description":
+        "Read-only: compare the latest code-graph snapshots of two sessions — returns delta in node_count, hotspot_count, and file_churn. Use snapshot_graph_metrics first to record each session's current state.",
+     "inputSchema": {"type": "object", "properties": {
+         "session_a": {"type": "string", "description": "First session ID."},
+         "session_b": {"type": "string", "description": "Second session ID to compare against session_a."}},
+         "required": ["session_a", "session_b"]}},
+    {"name": "snapshot_graph_metrics", "description":
+        "Record a code-graph snapshot for a session (node count, edge count, hotspot count, file churn). Call at session start and end to enable get_graph_diff comparisons.",
+     "inputSchema": {"type": "object", "properties": {
+         "session_id": {"type": "string"},
+         "project_id": {"type": "string"},
+         "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."}},
+         "required": ["session_id"]}},
     {"name": "idle_until_session_done", "description":
         "Read-only: Poll every 30 seconds until another session is closed or archived. Use this when you need to wait before editing a locked file.",
      "inputSchema": {"type": "object", "properties": {
@@ -727,6 +783,8 @@ _READ_ONLY_TOOLS = {
     "get_workspace_notes", "get_workspace_decisions", "get_workspace_settings",
     "get_sprint_items", "get_sprint_progress", "get_agent_instructions",
     "reconcile_sprint_drift", "get_planning_brief", "get_file_claims",
+    "list_plugins", "get_plugin_details",
+    "get_symbol_claims", "get_symbol_hotspots", "get_graph_diff",
 }
 _DESTRUCTIVE_TOOLS = {"delete_note", "archive_decision", "dismiss_hitl"}
 
@@ -770,6 +828,8 @@ _TITLE_OVERRIDES: dict[str, str] = {
     "reconcile_sprint_drift": "Reconcile Sprint Drift",
     "get_planning_brief": "Get Planning Brief",
     "get_file_claims": "Get File Claims",
+    "list_plugins": "List Plugins",
+    "get_plugin_details": "Get Plugin Details",
 }
 
 for _tool in _MCP_TOOLS_LIST:

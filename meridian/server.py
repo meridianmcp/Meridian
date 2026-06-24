@@ -604,6 +604,7 @@ from .routes.blog import router as _blog_router              # noqa: E402
 from .routes.marketplace import router as _marketplace_router  # noqa: E402
 from .routes.tunnel import router as _tunnel_router          # noqa: E402
 from .routes.oauth import router as _oauth_router            # noqa: E402
+from .routes.a2a import router as _a2a_router                # noqa: E402
 
 app.include_router(_oauth_router)
 app.include_router(_notes_router)
@@ -625,6 +626,7 @@ app.include_router(_projects_router)
 app.include_router(_blog_router)
 app.include_router(_marketplace_router)
 app.include_router(_tunnel_router)
+app.include_router(_a2a_router)
 
 # ---------------------------------------------------------------------------
 # Password gate middleware
@@ -3280,6 +3282,10 @@ async def mcp_tools_doc() -> str:
         "decisions, active sessions). Use `mode='full'` to paste into a fresh Claude Code session; `mode='chat'` "
         "for a shorter paste into claude.ai.")
     lines += ["## Planning tools\n"]
+    lines += _render_tool("fan_out_sprint_items",
+        "Bulk-insert sprint items in one call — lets an orchestrator LLM decompose a goal "
+        "into parallel work items without N sequential `add_sprint_item` calls. Pass a list "
+        "of `{title, description?, group?, version?}` dicts; returns the list of new item IDs.")
     lines += _render_tool("get_planning_brief",
         "Read-only: Return a compact planning context (sprint, north star, pending items, "
         "in-progress items, recent tasks, active sessions, recent decisions, pending HITLs). "
@@ -4954,6 +4960,7 @@ def _github_tools_for_tenant(tenant: dict) -> list[dict[str, Any]]:
                     "new_str": {"type": "string", "description": "Replacement text (may be empty to delete old_str)."},
                     "branch": {"type": "string", "description": "Branch to read + commit on (default: the project's configured branch)."},
                     "message": {"type": "string", "description": "Commit message (default: 'patch_file: update <path>')."},
+                    "session_id": {"type": "string", "description": "Caller session ID — if supplied, Meridian rejects the patch when the file is locked by a different session."},
                 },
                 "required": ["project_id", "file_path", "old_str", "new_str"],
             },

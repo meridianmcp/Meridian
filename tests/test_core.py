@@ -1114,6 +1114,69 @@ def test_tunnel_connect_page_redirects_unauthenticated(monkeypatch, tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# sprint item 56cb5d33 — Plugin three-state lifecycle endpoints
+# sprint item 9b288b91 — MCP Registry proxy endpoint
+# ---------------------------------------------------------------------------
+
+
+def test_tunnel_plugins_check_requires_command(client):
+    """GET /tunnel/plugins/check without ?command= returns 400."""
+    r = client.get("/tunnel/plugins/check")
+    assert r.status_code == 400
+    assert "command" in r.json().get("error", "")
+
+
+def test_tunnel_plugins_check_returns_installed_flag_for_python(client):
+    """GET /tunnel/plugins/check?command=python returns {installed: bool}."""
+    import sys
+    r = client.get("/tunnel/plugins/check?command=python")
+    assert r.status_code == 200
+    data = r.json()
+    assert "installed" in data
+    assert isinstance(data["installed"], bool)
+
+
+def test_tunnel_plugins_install_rejects_non_launcher(client):
+    """POST /tunnel/plugins/install with disallowed launcher → 400."""
+    r = client.post(
+        "/tunnel/plugins/install",
+        json={"command": "bash -c 'echo pwned'"},
+    )
+    assert r.status_code == 400
+    assert "launcher" in r.json().get("error", "").lower()
+
+
+def test_tunnel_plugins_install_accepts_uvx_command(client):
+    """POST /tunnel/plugins/install with uvx command → runs (may succeed or fail)."""
+    # We pass --help so no server actually starts; test only checks the route exists.
+    r = client.post(
+        "/tunnel/plugins/install",
+        json={"command": "uvx --help"},
+    )
+    assert r.status_code == 200
+    data = r.json()
+    assert "ok" in data
+
+
+def test_tunnel_registry_proxy_returns_servers_list(client):
+    """GET /tunnel/registry returns {servers: [], next_cursor: ...} even when offline."""
+    r = client.get("/tunnel/registry?limit=5")
+    assert r.status_code == 200
+    data = r.json()
+    # Must always return the servers key (may be empty if registry is unreachable)
+    assert "servers" in data
+    assert isinstance(data["servers"], list)
+    # next_cursor is present (may be None)
+    assert "next_cursor" in data
+
+
+def test_tunnel_registry_proxy_rejects_large_limit(client):
+    """GET /tunnel/registry caps limit at 50."""
+    r = client.get("/tunnel/registry?limit=999")
+    assert r.status_code == 200  # capped, not rejected
+
+
+# ---------------------------------------------------------------------------
 # tunnel_client.py — config cache unit tests
 # ---------------------------------------------------------------------------
 
@@ -6158,10 +6221,13 @@ def test_pg_migration_registry_matches_historical_order():
         "_migrate_pg_note_source",
         "_migrate_pg_session_sprint_version",
         "_migrate_pg_project_execution_mode",
+        "_migrate_pg_decision_code_anchor",
+        "_migrate_pg_session_graph_snapshots",
+        "_migrate_pg_agent_tasks_table",
     ]
     # No duplicates across the three groups.
     allnames = core + hosted + late
-    assert len(allnames) == len(set(allnames)) == 56
+    assert len(allnames) == len(set(allnames)) == 59
 
 
 def test_default_agent_instructions_has_code_intel_protocol():
@@ -13765,3 +13831,130 @@ async def test_executor_goal_prompt_scopes_to_active_version(db):
         it for it in await db_module.get_sprint_items(db, pid, version="v1.1")
     ][0]
     assert other["id"] not in text
+
+
+# ---------------------------------------------------------------------------
+# 355f187f — list_plugins / get_plugin_details MCP tools
+# ---------------------------------------------------------------------------
+
+def test_list_plugins_and_get_plugin_details_in_tool_list():
+    """list_plugins and get_plugin_details appear in _MCP_TOOLS_LIST."""
+    from meridian.mcp_tools import _MCP_TOOLS_LIST, _READ_ONLY_TOOLS
+    names = {t["name"] for t in _MCP_TOOLS_LIST}
+    assert "list_plugins" in names, "list_plugins missing from tool list"
+    assert "get_plugin_details" in names, "get_plugin_details missing from tool list"
+    assert "list_plugins" in _READ_ONLY_TOOLS
+    assert "get_plugin_details" in _READ_ONLY_TOOLS
+
+
+@pytest.mark.asyncio
+async def test_list_plugins_returns_builtin_plugins(db, tmp_path):
+    """list_plugins returns entries for all builtin plugins with expected fields."""
+    from meridian.mcp.handler import _dispatch_mcp_tool
+    from meridian.tunnel_plugins import BUILTIN_PLUGINS
+
+    result = await _dispatch_mcp_tool("list_plugins", {}, db, str(tmp_path), tenant=None)
+    assert isinstance(result, dict)
+    assert "plugins" in result
+    plugins = result["plugins"]
+    # Must return at least the 3 core builtin plugins
+    builtin_names = {p["name"] for p in BUILTIN_PLUGINS}
+    returned_names = {p["name"] for p in plugins}
+    assert builtin_names <= returned_names, f"missing builtins: {builtin_names - returned_names}"
+    # Each entry has expected keys
+    for p in plugins:
+        assert "name" in p
+        assert "slot" in p
+        assert "enabled" in p
+        assert "description" in p
+        assert "tool_count" in p
+        assert isinstance(p["tool_count"], int)
+    # No tunnel active → tool_count=0 for all
+    assert all(p["tool_count"] == 0 for p in plugins)
+    assert result["tunnel_active"] is False
+
+
+@pytest.mark.asyncio
+async def test_get_plugin_details_known_plugin(db, tmp_path):
+    """get_plugin_details returns correct structure for a known plugin name."""
+    from meridian.mcp.handler import _dispatch_mcp_tool
+
+    result = await _dispatch_mcp_tool(
+        "get_plugin_details", {"name": "filesystem"}, db, str(tmp_path), tenant=None
+    )
+    assert isinstance(result, dict)
+    assert result["name"] == "filesystem"
+    assert result["slot"] == "fs"
+    assert "description" in result
+    assert "tools" in result
+    assert isinstance(result["tools"], list)
+    assert "tool_count" in result
+
+
+@pytest.mark.asyncio
+async def test_get_plugin_details_unknown_plugin(db, tmp_path):
+    """get_plugin_details returns an error for an unknown plugin name."""
+    from meridian.mcp.handler import _dispatch_mcp_tool
+
+    result = await _dispatch_mcp_tool(
+        "get_plugin_details", {"name": "nonexistent-plugin"}, db, str(tmp_path), tenant=None
+    )
+    assert "error" in result
+
+
+@pytest.mark.asyncio
+async def test_get_plugin_details_missing_name(db, tmp_path):
+    """get_plugin_details returns error when name is missing."""
+    from meridian.mcp.handler import _dispatch_mcp_tool
+
+    result = await _dispatch_mcp_tool(
+        "get_plugin_details", {}, db, str(tmp_path), tenant=None
+    )
+    assert "error" in result
+
+
+# ---------------------------------------------------------------------------
+# 8a9fd15c — Plugin skill documents (workspace notes with plugin-skill tag)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_list_plugins_surfaces_skill_note(db, tmp_path):
+    """list_plugins includes skill_note when a matching workspace note exists."""
+    from meridian.mcp.handler import _dispatch_mcp_tool
+
+    # Store a skill note for the filesystem plugin
+    await db_module.add_workspace_note(
+        db,
+        title="filesystem",
+        body="## Filesystem Guide\nUse read_file for text files.",
+        tags="plugin-skill,filesystem",
+        tenant_id=None,
+    )
+
+    result = await _dispatch_mcp_tool("list_plugins", {}, db, str(tmp_path), tenant=None)
+    plugins = result["plugins"]
+    fs_entry = next((p for p in plugins if p["name"] == "filesystem"), None)
+    assert fs_entry is not None, "filesystem entry missing"
+    assert "skill_note" in fs_entry, "skill_note not surfaced in list_plugins"
+    assert "body_preview" in fs_entry["skill_note"]
+    assert "Filesystem Guide" in fs_entry["skill_note"]["body_preview"]
+
+
+@pytest.mark.asyncio
+async def test_get_plugin_details_surfaces_skill_guide(db, tmp_path):
+    """get_plugin_details includes skill_guide body when a skill note is stored."""
+    from meridian.mcp.handler import _dispatch_mcp_tool
+
+    await db_module.add_workspace_note(
+        db,
+        title="code-intel",
+        body="## Code Intel Guide\nUse search_graph first for source files.",
+        tags="plugin-skill,code-intel",
+        tenant_id=None,
+    )
+
+    result = await _dispatch_mcp_tool(
+        "get_plugin_details", {"name": "code-intel"}, db, str(tmp_path), tenant=None
+    )
+    assert "skill_guide" in result, "skill_guide missing from get_plugin_details"
+    assert "Code Intel Guide" in result["skill_guide"]["body"]
