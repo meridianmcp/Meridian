@@ -98,6 +98,17 @@ async def get_install_ps1() -> PlainTextResponse:
     return PlainTextResponse(script_path.read_text(encoding="utf-8"))
 
 
+@router.get("/install-windows.ps1")
+async def get_install_windows_ps1() -> PlainTextResponse:
+    # Installs the standalone meridian.exe binary into ~/.local/bin + user PATH
+    # (the Windows counterpart to install.sh). Lives in scripts/, unlike the
+    # root-level install.ps1 which installs meridian-connect.
+    script_path = _watcher_script_path("install-windows.ps1")
+    if not script_path.exists():
+        raise HTTPException(status_code=404, detail="install-windows.ps1 not found")
+    return PlainTextResponse(script_path.read_text(encoding="utf-8"))
+
+
 # ---------------------------------------------------------------------------
 # Connection management routes
 # ---------------------------------------------------------------------------

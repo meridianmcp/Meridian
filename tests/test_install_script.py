@@ -35,3 +35,41 @@ def test_install_ps1_hard_errors_and_aborts_before_running_binary():
     guard_idx = src.index("if (-not $downloaded)")
     run_idx = src.index("& $dest @args")
     assert guard_idx < run_idx, "download-failure guard must precede running the binary"
+
+
+# ---------------------------------------------------------------------------
+# install-windows.ps1 — standalone meridian.exe installer (fe41fba7)
+# ---------------------------------------------------------------------------
+
+_INSTALL_WINDOWS_PS1 = (
+    Path(__file__).resolve().parent.parent / "scripts" / "install-windows.ps1"
+)
+
+
+def test_install_windows_ps1_installs_meridian_exe_to_local_bin():
+    src = _INSTALL_WINDOWS_PS1.read_text(encoding="utf-8")
+    # Downloads the flat meridian.exe release asset into ~/.local/bin.
+    assert "releases/latest/download/meridian.exe" in src
+    assert ".local\\bin" in src
+    # Same download hardening as install.ps1: retries + non-empty verification.
+    assert "maxAttempts" in src and "for ($attempt" in src
+    assert ".Length -gt 0" in src
+    assert "Write-Error" in src and "exit 1" in src
+
+
+def test_install_windows_ps1_adds_path_without_setx():
+    src = _INSTALL_WINDOWS_PS1.read_text(encoding="utf-8")
+    # Persistent user PATH via SetEnvironmentVariable — NOT setx, which truncates
+    # PATH at 1024 chars and can corrupt it.
+    assert "SetEnvironmentVariable" in src
+    # No actual setx invocation (ignore comment lines that explain why we avoid it).
+    code_lines = [ln.strip() for ln in src.splitlines() if not ln.strip().startswith("#")]
+    assert not any("setx" in ln.lower() for ln in code_lines)
+
+
+def test_install_windows_ps1_route_serves_script(client):
+    r = client.get("/install-windows.ps1")
+    assert r.status_code == 200
+    assert "meridian.exe" in r.text
+    assert "SetEnvironmentVariable" in r.text
+    assert r.headers["content-type"].startswith("text/plain")

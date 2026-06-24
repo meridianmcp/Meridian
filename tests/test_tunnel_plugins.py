@@ -35,6 +35,21 @@ def test_resolve_defaults_returns_builtins_in_order():
     assert by_name["word"]["env"] == {"MCP_AUTHOR": "Adam", "MCP_AUTHOR_INITIALS": "AC"}
 
 
+def test_core_vs_plugin_tagging():
+    # b2a60de7 — fs/code/extract are always-on core tools; office + desktop-commander
+    # are opt-in plugins. The dashboard renders Core Tools (locked) vs Plugins.
+    by_slot = {p["slot"]: p for p in tp.resolve_plugins(None)}
+    assert by_slot["fs"]["core"] is True
+    assert by_slot["code"]["core"] is True
+    assert by_slot["extract"]["core"] is True
+    assert by_slot["ppt"]["core"] is False
+    assert by_slot["word"]["core"] is False
+    assert by_slot["dc"]["core"] is False
+    # core is a fixed property — a tenant config override cannot flip it.
+    flipped = {p["slot"]: p for p in tp.resolve_plugins({"word": {"enabled": True, "core": True}})}
+    assert flipped["word"]["core"] is False
+
+
 def test_resolve_empty_config_matches_defaults():
     assert tp.resolve_plugins({}) == tp.resolve_plugins(None)
     assert tp.resolve_plugins([]) == tp.resolve_plugins(None)
@@ -64,7 +79,8 @@ def test_plugin_by_slot():
 def test_expand_command_substitutes_repo_path_in_serena_default():
     out = tp.expand_command(tp.SERENA_EXTRACT_COMMAND, repo_path="/home/me/proj")
     assert out == ["uvx", "--from", "serena-agent", "serena", "start-mcp-server",
-                   "--context", "ide-assistant", "--project", "/home/me/proj"]
+                   "--context", "ide-assistant", "--open-web-dashboard", "false",
+                   "--project", "/home/me/proj"]
     # The module-level constant must not be mutated by expansion.
     assert tp.SERENA_EXTRACT_COMMAND[-1] == "{repo_path}"
 
@@ -76,6 +92,16 @@ def test_serena_extract_default_pins_serena_agent_distribution():
     cmd = tp.SERENA_EXTRACT_COMMAND
     assert cmd[:4] == ["uvx", "--from", "serena-agent", "serena"]
     assert "serena" not in cmd[1:3]  # not invoked as a bare ``uvx serena``
+
+
+def test_serena_extract_default_suppresses_web_dashboard():
+    # Regression (a39c4a99): the tunnel runs Serena headless, so it must not pop a
+    # browser tab to the web dashboard on every (re)start. The documented
+    # ``--open-web-dashboard false`` flag (value as a separate token) overrides the
+    # user's serena_config.yml.
+    cmd = tp.SERENA_EXTRACT_COMMAND
+    i = cmd.index("--open-web-dashboard")
+    assert cmd[i + 1] == "false"
 
 
 def test_expand_command_accepts_string_and_leaves_unknown_placeholders():

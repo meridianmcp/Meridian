@@ -6153,7 +6153,7 @@ ${n.tags || ""}`.toLowerCase();
         port: c.port,
         enabled: c.enabled !== false
       }));
-      const rows = plugins.map((p) => {
+      const renderRow = (p) => {
         const cmd = Array.isArray(p.command) ? p.command.join(" ") : "";
         const dot = active[p.slot] ? "var(--success, #3fb950)" : "var(--muted)";
         const dotTitle = active[p.slot] ? "connected" : "not connected";
@@ -6163,12 +6163,13 @@ ${n.tags || ""}`.toLowerCase();
             Enable the toggle, then restart <code style="font-family:var(--font-mono)">meridian --tunnel</code> to launch
             <code style="font-family:var(--font-mono)">${escapeHtml(hint.pkg)}</code>.<br>${escapeHtml(hint.note)}
           </div>` : "";
+        const toggle = p.core ? `<span title="core tool \u2014 always on" style="font-size:8px;font-weight:700;letter-spacing:.3px;color:var(--muted);border:1px solid var(--border);border-radius:3px;padding:1px 5px;text-transform:uppercase">core</span>` : `<input type="checkbox" class="tp-enabled" data-name="${escapeHtml(p.name)}" ${p.enabled ? "checked" : ""}
+                style="width:14px;height:14px;accent-color:var(--accent);cursor:pointer">`;
         return `
         <div style="border:1px solid var(--border);border-radius:4px;padding:8px;margin-bottom:8px">
           <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px">
-            <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:11px;color:var(--text);font-weight:600">
-              <input type="checkbox" class="tp-enabled" data-name="${escapeHtml(p.name)}" ${p.enabled ? "checked" : ""}
-                style="width:14px;height:14px;accent-color:var(--accent);cursor:pointer">
+            <label style="display:flex;align-items:center;gap:8px;cursor:${p.core ? "default" : "pointer"};font-size:11px;color:var(--text);font-weight:600">
+              ${toggle}
               ${escapeHtml(p.name)}
               <span style="font-size:9px;color:var(--muted);font-weight:400">/${escapeHtml(p.slot)}</span>
             </label>
@@ -6190,7 +6191,14 @@ ${n.tags || ""}`.toLowerCase();
             <div class="tp-tools-body" style="margin-top:5px;font-size:10px;color:var(--muted);font-family:var(--font-mono)">&hellip;</div>
           </details>
         </div>`;
-      }).join("");
+      };
+      const coreRows = plugins.filter((p) => p.core).map(renderRow).join("");
+      const pluginRows = plugins.filter((p) => !p.core).map(renderRow).join("");
+      const _sectionLabel = (text, note) => `<div style="font-size:9px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;margin:2px 0 6px">${text} <span style="font-weight:400;text-transform:none">${note}</span></div>`;
+      const rows = `
+      ${coreRows ? _sectionLabel("Core Tools", "\u2014 always on") + coreRows : ""}
+      ${_sectionLabel("Plugins", "\u2014 opt-in, toggle to enable")}
+      ${pluginRows || '<div style="color:var(--muted);font-size:10px">No plugins.</div>'}`;
       const detectedOs = _detectTunnelOs();
       const installCard = (label, cmds, prominent) => `
       <div style="border:1px solid var(--border);border-radius:4px;padding:8px;margin-bottom:6px;background:var(--surface-1)${prominent ? "" : ";opacity:.85"}">
@@ -6319,17 +6327,20 @@ ${n.tags || ""}`.toLowerCase();
       };
       const collectConfig = () => {
         const cfg = [];
-        section.querySelectorAll(".tp-enabled").forEach((en) => {
-          const name = en.dataset.name;
-          const cmdEl = section.querySelector(`.tp-command[data-name="${CSS.escape(name)}"]`);
+        section.querySelectorAll(".tp-command").forEach((cmdEl) => {
+          const name = cmdEl.dataset.name;
           const portEl = section.querySelector(`.tp-port[data-name="${CSS.escape(name)}"]`);
-          const entry = { name, enabled: en.checked };
-          const cmdVal = (cmdEl && cmdEl.value || "").trim();
+          const enEl = section.querySelector(`.tp-enabled[data-name="${CSS.escape(name)}"]`);
+          const entry = { name };
+          if (enEl) entry.enabled = enEl.checked;
+          const cmdVal = (cmdEl.value || "").trim();
           if (cmdVal) entry.command = cmdVal;
           const portVal = parseInt(portEl && portEl.value, 10);
           const slot = portEl && portEl.dataset.slot;
           if (Number.isInteger(portVal) && portVal !== _TUNNEL_DEFAULT_PORTS[slot]) entry.port = portVal;
-          cfg.push(entry);
+          if (entry.command !== void 0 || entry.port !== void 0 || entry.enabled !== void 0) {
+            cfg.push(entry);
+          }
         });
         customPlugins.forEach((c) => {
           const name = (c.name || "").trim();
