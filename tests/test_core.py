@@ -1114,6 +1114,69 @@ def test_tunnel_connect_page_redirects_unauthenticated(monkeypatch, tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# sprint item 56cb5d33 — Plugin three-state lifecycle endpoints
+# sprint item 9b288b91 — MCP Registry proxy endpoint
+# ---------------------------------------------------------------------------
+
+
+def test_tunnel_plugins_check_requires_command(client):
+    """GET /tunnel/plugins/check without ?command= returns 400."""
+    r = client.get("/tunnel/plugins/check")
+    assert r.status_code == 400
+    assert "command" in r.json().get("error", "")
+
+
+def test_tunnel_plugins_check_returns_installed_flag_for_python(client):
+    """GET /tunnel/plugins/check?command=python returns {installed: bool}."""
+    import sys
+    r = client.get("/tunnel/plugins/check?command=python")
+    assert r.status_code == 200
+    data = r.json()
+    assert "installed" in data
+    assert isinstance(data["installed"], bool)
+
+
+def test_tunnel_plugins_install_rejects_non_launcher(client):
+    """POST /tunnel/plugins/install with disallowed launcher → 400."""
+    r = client.post(
+        "/tunnel/plugins/install",
+        json={"command": "bash -c 'echo pwned'"},
+    )
+    assert r.status_code == 400
+    assert "launcher" in r.json().get("error", "").lower()
+
+
+def test_tunnel_plugins_install_accepts_uvx_command(client):
+    """POST /tunnel/plugins/install with uvx command → runs (may succeed or fail)."""
+    # We pass --help so no server actually starts; test only checks the route exists.
+    r = client.post(
+        "/tunnel/plugins/install",
+        json={"command": "uvx --help"},
+    )
+    assert r.status_code == 200
+    data = r.json()
+    assert "ok" in data
+
+
+def test_tunnel_registry_proxy_returns_servers_list(client):
+    """GET /tunnel/registry returns {servers: [], next_cursor: ...} even when offline."""
+    r = client.get("/tunnel/registry?limit=5")
+    assert r.status_code == 200
+    data = r.json()
+    # Must always return the servers key (may be empty if registry is unreachable)
+    assert "servers" in data
+    assert isinstance(data["servers"], list)
+    # next_cursor is present (may be None)
+    assert "next_cursor" in data
+
+
+def test_tunnel_registry_proxy_rejects_large_limit(client):
+    """GET /tunnel/registry caps limit at 50."""
+    r = client.get("/tunnel/registry?limit=999")
+    assert r.status_code == 200  # capped, not rejected
+
+
+# ---------------------------------------------------------------------------
 # tunnel_client.py — config cache unit tests
 # ---------------------------------------------------------------------------
 

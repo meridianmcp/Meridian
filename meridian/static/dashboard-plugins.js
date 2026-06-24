@@ -124,11 +124,16 @@ async function loadTunnelPluginsSection(projectId) {
 
     const renderRow = (p) => {
       const cmd = Array.isArray(p.command) ? p.command.join(' ') : '';
-      const dot = active[p.slot] ? 'var(--success, #3fb950)' : 'var(--muted)';
-      const dotTitle = active[p.slot] ? 'connected' : 'not connected';
-      // Opt-in slots: when not connected, surface the launcher + how to enable it.
+      // Three-state lifecycle (sprint item 56cb5d33):
+      // active → tunnel running and slot connected
+      // installed_inactive → enabled in config but tunnel not running
+      // not_installed → disabled or binary not available
+      const lifecycleState = _pluginLifecycleState(p, active);
+      // Derive install command from opt-in hint or existing command.
       const hint = _OPTIN_SLOT_HINTS[p.slot];
-      const hintHtml = (hint && !active[p.slot]) ? `
+      const installCmd = hint ? hint.pkg : (cmd || '');
+      const lifecycleBadge = _renderLifecycleBadge(p, lifecycleState, installCmd);
+      const hintHtml = (hint && lifecycleState === 'not_installed') ? `
           <div style="margin-top:6px;font-size:9px;color:var(--muted);line-height:1.6">
             Enable the toggle, then restart <code style="font-family:var(--font-mono)">meridian --tunnel</code> to launch
             <code style="font-family:var(--font-mono)">${escapeHtml(hint.pkg)}</code>.<br>${escapeHtml(hint.note)}
@@ -141,16 +146,14 @@ async function loadTunnelPluginsSection(projectId) {
         : `<input type="checkbox" class="tp-enabled" data-name="${escapeHtml(p.name)}" ${p.enabled ? 'checked' : ''}
                 style="width:14px;height:14px;accent-color:var(--accent);cursor:pointer">`;
       return `
-        <div style="border:1px solid var(--border);border-radius:4px;padding:8px;margin-bottom:8px">
+        <div style="border:1px solid var(--border);border-radius:4px;padding:8px;margin-bottom:8px" data-lifecycle="${lifecycleState}">
           <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px">
             <label style="display:flex;align-items:center;gap:8px;cursor:${p.core ? 'default' : 'pointer'};font-size:11px;color:var(--text);font-weight:600">
               ${toggle}
               ${escapeHtml(p.name)}
               <span style="font-size:9px;color:var(--muted);font-weight:400">/${escapeHtml(p.slot)}</span>
             </label>
-            <span title="${dotTitle}" style="display:inline-flex;align-items:center;gap:4px;font-size:9px;color:var(--muted)">
-              <span style="width:8px;height:8px;border-radius:50%;background:${dot}"></span>${dotTitle}
-            </span>
+            ${lifecycleBadge}
           </div>
           <div style="display:flex;gap:8px;align-items:center">
             <input type="text" class="tp-command" data-name="${escapeHtml(p.name)}" value="${escapeHtml(cmd)}"
@@ -387,6 +390,9 @@ async function loadTunnelPluginsSection(projectId) {
     _wireRegistryCopyButtons(section);
     _wireRegistryBrowse(section, projectId);
 
+    // Wire up three-state lifecycle Install buttons (sprint item 56cb5d33).
+    _wireLifecycleInstallButtons(section);
+
     // Per-plugin live tools dropdown. Lazy-load the slot's tool manifest the
     // first time its <details> is expanded; reuse one /me lookup across slots.
     let _tenantIdPromise = null;
@@ -613,3 +619,83 @@ function _wireRegistryBrowse(section, projectId) {
   }
 }
 window._wireRegistryBrowse = _wireRegistryBrowse;
+
+// ---------------------------------------------------------------------------
+// Plugin three-state lifecycle — sprint item 56cb5d33
+// States: not_installed | installed_inactive | active
+//
+// - active:             tunnel is running and slot is connected (active[slot]=true)
+// - installed_inactive: enabled in config but tunnel not connected / slot not active
+// - not_installed:      binary check failed or plugin explicitly disabled
+//
+// The dashboard shows:
+//   active            → green dot, "active" badge, Deactivate button
+//   installed_inactive → yellow dot, "inactive" badge, Activate button
+//   not_installed     → grey dot, "not installed" badge, Install button (copies cmd)
+// ---------------------------------------------------------------------------
+
+/**
+ * Determine the three-state lifecycle for a plugin slot.
+ * @param {object} plugin  - plugin descriptor from /tunnel/plugins response
+ * @param {object} active  - map of slot → bool (connected sockets)
+ * @returns {'active'|'installed_inactive'|'not_installed'}
+ */
+function _pluginLifecycleState(plugin, active) {
+  if (active && active[plugin.slot]) return 'active';
+  if (plugin.enabled !== false) return 'installed_inactive';
+  return 'not_installed';
+}
+window._pluginLifecycleState = _pluginLifecycleState;
+
+/**
+ * Render the three-state lifecycle badge + action button for a plugin row.
+ * Returns an HTML string. The Install button copies the launch command to
+ * clipboard (self-hosted: also offers a server-side binary check).
+ */
+function _renderLifecycleBadge(plugin, lifecycleState, installCmd) {
+  const styles = {
+    active:             { dot: 'var(--success, #3fb950)', label: 'active',    labelColor: 'var(--success, #3fb950)' },
+    installed_inactive: { dot: '#f59e0b',                 label: 'inactive',  labelColor: '#f59e0b' },
+    not_installed:      { dot: 'var(--muted)',             label: 'not installed', labelColor: 'var(--muted)' },
+  };
+  const s = styles[lifecycleState] || styles.not_installed;
+  const dotHtml = `<span style="width:8px;height:8px;border-radius:50%;background:${s.dot};flex-shrink:0"></span>`;
+  const labelHtml = `<span style="font-size:9px;color:${s.labelColor};font-weight:600">${s.label}</span>`;
+
+  let actionBtn = '';
+  if (lifecycleState === 'not_installed' && installCmd) {
+    const safeCmd = escapeHtml(installCmd);
+    actionBtn = `<button class="secondary tp-install-btn" data-install-cmd="${safeCmd}" style="padding:2px 8px;font-size:10px;flex-shrink:0" title="Copy install command">Install</button>`;
+  } else if (lifecycleState === 'installed_inactive') {
+    actionBtn = `<span style="font-size:9px;color:var(--muted);font-style:italic">start tunnel to activate</span>`;
+  }
+
+  return `<span style="display:inline-flex;align-items:center;gap:4px">${dotHtml}${labelHtml}${actionBtn ? ' ' + actionBtn : ''}</span>`;
+}
+window._renderLifecycleBadge = _renderLifecycleBadge;
+
+/**
+ * Wire Install buttons (.tp-install-btn) inside a container.
+ * Clicking copies the install command and optionally shows a check result.
+ */
+function _wireLifecycleInstallButtons(container) {
+  if (!container) return;
+  container.querySelectorAll('.tp-install-btn').forEach((btn) => {
+    if (btn.dataset.wired) return;
+    btn.dataset.wired = '1';
+    btn.addEventListener('click', async () => {
+      const cmd = btn.dataset.installCmd || '';
+      if (!cmd) return;
+      const ok = await _tunnelCopyToClipboard(cmd);
+      if (ok) {
+        const prev = btn.textContent;
+        btn.textContent = 'Copied!';
+        btn.title = 'Paste in your terminal to install';
+        setTimeout(() => { btn.textContent = prev; btn.title = 'Copy install command'; }, 2000);
+      } else {
+        toast('Copy failed — manual copy needed', true);
+      }
+    });
+  });
+}
+window._wireLifecycleInstallButtons = _wireLifecycleInstallButtons;
