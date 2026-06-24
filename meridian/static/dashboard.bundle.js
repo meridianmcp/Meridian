@@ -6071,7 +6071,12 @@ ${n.tags || ""}`.toLowerCase();
       section.innerHTML = `<div class="empty" style="color:var(--error)">Failed to load executor rules: ${escapeHtml(e.message)}</div>`;
     }
   }
-  var _TUNNEL_DEFAULT_PORTS = { fs: 8808, code: 8809, extract: 8810, ppt: 8811, word: 8812 };
+  var _TUNNEL_DEFAULT_PORTS = { fs: 8808, code: 8809, extract: 8810, ppt: 8811, word: 8812, dc: 8813 };
+  var _OPTIN_SLOT_HINTS = {
+    word: { pkg: "uvx word-mcp-live", note: "Live Word editing with tracked changes \u2014 needs uv (uvx)." },
+    ppt: { pkg: "uvx powerpoint-mcp", note: "PowerPoint authoring \u2014 needs uv (uvx)." },
+    dc: { pkg: "npx -y @wonderwhy-er/desktop-commander@latest", note: "Desktop Commander, local only \u2014 needs Node (npx)." }
+  };
   var _CURATED_TUNNEL_PLUGINS = [
     { name: "Sequential Thinking", command: "npx -y @modelcontextprotocol/server-sequential-thinking", description: "Structured step-by-step reasoning", docs: "https://github.com/modelcontextprotocol/servers" },
     { name: "Fetch", command: "uvx mcp-server-fetch", description: "Fetch & convert web pages to markdown", docs: "https://github.com/modelcontextprotocol/servers" },
@@ -6152,6 +6157,12 @@ ${n.tags || ""}`.toLowerCase();
         const cmd = Array.isArray(p.command) ? p.command.join(" ") : "";
         const dot = active[p.slot] ? "var(--success, #3fb950)" : "var(--muted)";
         const dotTitle = active[p.slot] ? "connected" : "not connected";
+        const hint = _OPTIN_SLOT_HINTS[p.slot];
+        const hintHtml = hint && !active[p.slot] ? `
+          <div style="margin-top:6px;font-size:9px;color:var(--muted);line-height:1.6">
+            Enable the toggle, then restart <code style="font-family:var(--font-mono)">meridian --tunnel</code> to launch
+            <code style="font-family:var(--font-mono)">${escapeHtml(hint.pkg)}</code>.<br>${escapeHtml(hint.note)}
+          </div>` : "";
         return `
         <div style="border:1px solid var(--border);border-radius:4px;padding:8px;margin-bottom:8px">
           <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px">
@@ -6173,6 +6184,7 @@ ${n.tags || ""}`.toLowerCase();
               title="local proxy port"
               style="width:74px;box-sizing:border-box;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:5px 7px;outline:none">
           </div>
+          ${hintHtml}
           <details class="tp-tools" data-slot="${escapeHtml(p.slot)}" data-loaded="0" style="margin-top:6px">
             <summary style="cursor:pointer;list-style:none;font-size:10px;color:var(--accent);user-select:none">&#9656; tools</summary>
             <div class="tp-tools-body" style="margin-top:5px;font-size:10px;color:var(--muted);font-family:var(--font-mono)">&hellip;</div>
