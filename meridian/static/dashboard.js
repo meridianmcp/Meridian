@@ -1,4 +1,5 @@
 ﻿// --- ITEM 4 esbuild: pull module scripts into the bundle graph ---
+import "./dashboard-core.js";
 import "./dashboard-utils.js";
 import "./dashboard-demo.js";
 import "./dashboard-timeline.js";
@@ -1602,96 +1603,9 @@ function resumeDemoTour() {
 
 
 
-async function api(path, opts={}) {
-
-  const headers = {'Content-Type': 'application/json'};
-
-  if (state.activeWorkspaceTenantId) {
-
-    headers['X-Workspace-Tenant-Id'] = state.activeWorkspaceTenantId;
-
-  }
-
-  const r = await fetch(path, { headers, ...opts });
-
-  if (!r.ok) {
-
-    if (r.status === 403 && isDemoMode()) {
-
-      showDemoReadonlyToast();
-
-      throw new Error('demo_readonly');
-
-    }
-
-    const text = await r.text();
-
-    const err = new Error(`${r.status}: ${text}`);
-
-    err.status = r.status;
-
-    err.endpoint = path;
-
-    err.responseText = text;
-
-    throw err;
-
-  }
-
-  return r.status === 204 ? null : r.json();
-
-}
-
-
-
-const _staleProjectsHandled = new Set();
-
-
-
-async function projectApi(projectId, path, opts={}) {
-
-  try {
-
-    const data = await api(path, opts);
-
-    clearProjectLoadError(projectId, path);
-
-    return data;
-
-  } catch (e) {
-
-    // Self-heal stale tabs: a "project not found" 404 for a project that isn't
-
-    // in the current account's project list means the signed-in account changed
-
-    // (often in another tab). Close the orphaned tab and prompt a refresh once,
-
-    // instead of spamming every panel with 404s until the user reloads.
-
-    if (e && e.status === 404 && /project not found/i.test(e.responseText || '')
-
-        && !(state.projects || []).some(p => p.id === projectId)
-
-        && !_staleProjectsHandled.has(projectId)) {
-
-      _staleProjectsHandled.add(projectId);
-
-      try { closeTab(projectId); } catch (_) {}
-
-      try { _checkAccountSwitch(); } catch (_) {}
-
-      throw e;
-
-    }
-
-    recordProjectLoadError(projectId, path, e);
-
-    throw e;
-
-  }
-
-}
-
+// function api -- moved to dashboard-core.js (sprint item ea0eda34)
+// function projectApi -- moved to dashboard-core.js
+// _staleProjectsHandled -- moved to dashboard-core.js
 
 
 async function loadServerConfig() {
