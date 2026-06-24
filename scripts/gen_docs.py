@@ -39,7 +39,11 @@ def main() -> None:
 
     out_path = _REPO_ROOT / "docs" / "mcp-tools.md"
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(content, encoding="utf-8")
+    # Force LF newlines so the committed file is identical on every platform.
+    # Without newline="\n", Path.write_text translates \n -> os.linesep (CRLF on
+    # Windows), which makes the CI docs-check diff fail when it regenerates the
+    # file on Linux (LF).
+    out_path.write_text(content, encoding="utf-8", newline="\n")
     n_lines = content.count("\n")
     print(f"Wrote {out_path.relative_to(_REPO_ROOT)} ({len(content)} bytes, {n_lines} lines)")
 
