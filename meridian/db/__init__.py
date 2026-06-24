@@ -5774,6 +5774,7 @@ async def request_hitl(
     payload: str | None = None,
     options: list[str] | None = None,
     recommended: str | int | None = None,
+    require_human: bool = False,
 ) -> dict[str, Any]:
     """Create a HITL request. Returns the inserted row.
 
@@ -5792,8 +5793,10 @@ async def request_hitl(
         raise ValueError(
             f"urgency must be one of {sorted(_VALID_HITL_URGENCY)}; got {urgency!r}"
         )
-    # cd134cf1 — fold options + recommended into the payload JSON.
-    if options is not None or recommended is not None:
+    # cd134cf1 — fold options + recommended into the payload JSON. e43e6941 —
+    # also persist require_human there (no migration) so the dashboard can flag a
+    # human-only request and the no-auto-answer rule survives a reload.
+    if options is not None or recommended is not None or require_human:
         try:
             _pl = json.loads(payload) if payload else {}
             if not isinstance(_pl, dict):
@@ -5806,6 +5809,8 @@ async def request_hitl(
         _rec = _resolve_recommended_option(_opts, recommended)
         if _rec is not None:
             _pl["recommended"] = _rec
+        if require_human:
+            _pl["require_human"] = True
         payload = json.dumps(_pl)
     hid = _new_id()
     await db.execute(
@@ -5819,15 +5824,19 @@ async def request_hitl(
     await db.commit()
     # ITEM 6 — live push so the HITL queue refreshes without polling.
     _publish_project_event(project_id, "hitl_filed", {"hitl_id": hid, "kind": kind})
-    # 035edf47 — per-project auto-answer with a 3-way mode (off/safe/aggressive).
-    # The auto-answered row stays in the queue (status='answered',
-    # answered_by='auto') for audit. See _hitl_should_auto_answer for the rules.
-    _aa_mode = await _project_hitl_auto_answer_mode(db, project_id)
-    if _hitl_should_auto_answer(_aa_mode, kind, question):
-        auto = _auto_hitl_answer(payload)
-        answered = await answer_hitl_request(db, hid, auto, answered_by="auto")
-        if answered is not None:
-            return answered
+    # e43e6941 — require_human forbids auto-answer entirely; reserve it for
+    # genuinely irreversible/destructive actions (token rotation, data migrations,
+    # rollbacks) so the auto-answer can never approve something that can't be
+    # undone. Otherwise apply the per-project 3-way mode (035edf47); an
+    # auto-answered row stays in the queue (status='answered', answered_by='auto')
+    # for audit. See _hitl_should_auto_answer for the rules.
+    if not require_human:
+        _aa_mode = await _project_hitl_auto_answer_mode(db, project_id)
+        if _hitl_should_auto_answer(_aa_mode, kind, question):
+            auto = _auto_hitl_answer(payload)
+            answered = await answer_hitl_request(db, hid, auto, answered_by="auto")
+            if answered is not None:
+                return answered
     return (await get_hitl_request(db, hid)) or {"id": hid}
 
 

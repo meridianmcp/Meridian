@@ -689,3 +689,29 @@ def test_tunnel_plugins_custom_subsection_present(js):
 
     # Add-form validation rejects the built-in default ports (8808–8813).
     assert "8808" in js and "8813" in js, "custom port guard against built-in ports missing"
+
+
+def test_code_intel_architecture_charts(js):
+    """0aca014f — get_architecture renders as charts, defensively.
+
+    The Architecture Summary no longer dumps a raw <pre>; it parses the
+    get_architecture JSON and draws Chart.js bar + donut charts plus
+    hotspots / packages / layers, with a raw fallback when the shape differs.
+    """
+    # The defensive renderer exists and is wired into the code-intel tab.
+    assert "_codeArchSection" in js, "architecture renderer missing"
+    assert "archSection.charts" in js, "charts must be collected for later instantiation"
+
+    # Defensive: parses JSON in a try (older servers return formatted text → raw).
+    assert "JSON.parse(archText)" in js
+    # Each documented schema field drives a section.
+    for field in ("node_labels", "edge_types", "hotspots", "packages", "layers"):
+        assert field in js, f"architecture field {field} not handled"
+
+    # Chart.js bar + donut, instantiated only when Chart + a canvas exist.
+    assert "type: 'bar'" in js and "type: 'doughnut'" in js
+    assert "window.Chart" in js, "chart instantiation must be guarded on Chart presence"
+    assert "ci-nodes" in js and "ci-edges" in js, "chart canvases missing"
+
+    # Graceful fallback: a raw-JSON view is always available.
+    assert "raw JSON" in js, "raw fallback view missing"

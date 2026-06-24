@@ -325,6 +325,7 @@ Surface a question to the human queue. Response includes `chat_prompt` (question
 | `assigned_to` | string | optional |  |
 | `options` | array | optional | Answer choices rendered as selectable buttons in the dashboard. |
 | `recommended` | string | optional | The safe-default option — an option string or a 0-based index into options. Highlighted in the dashboard; Enter submits it; auto-answer prefers it. |
+| `require_human` | boolean | optional | When true, the HITL can never be auto-answered — only an explicit human response unblocks it. Reserve for irreversible/destructive actions. |
 
 **Example:**
 ```
