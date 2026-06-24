@@ -35,6 +35,21 @@ def test_resolve_defaults_returns_builtins_in_order():
     assert by_name["word"]["env"] == {"MCP_AUTHOR": "Adam", "MCP_AUTHOR_INITIALS": "AC"}
 
 
+def test_core_vs_plugin_tagging():
+    # b2a60de7 — fs/code/extract are always-on core tools; office + desktop-commander
+    # are opt-in plugins. The dashboard renders Core Tools (locked) vs Plugins.
+    by_slot = {p["slot"]: p for p in tp.resolve_plugins(None)}
+    assert by_slot["fs"]["core"] is True
+    assert by_slot["code"]["core"] is True
+    assert by_slot["extract"]["core"] is True
+    assert by_slot["ppt"]["core"] is False
+    assert by_slot["word"]["core"] is False
+    assert by_slot["dc"]["core"] is False
+    # core is a fixed property — a tenant config override cannot flip it.
+    flipped = {p["slot"]: p for p in tp.resolve_plugins({"word": {"enabled": True, "core": True}})}
+    assert flipped["word"]["core"] is False
+
+
 def test_resolve_empty_config_matches_defaults():
     assert tp.resolve_plugins({}) == tp.resolve_plugins(None)
     assert tp.resolve_plugins([]) == tp.resolve_plugins(None)

@@ -63,6 +63,9 @@ BUILTIN_PLUGINS: list[dict[str, Any]] = [
         "url_prefix": "/fs",
         "enabled": True,
         "builtin": True,
+        # Core tools are always-on and have no enable toggle in the dashboard;
+        # plugins (core=False) are opt-in. (b2a60de7)
+        "core": True,
         # None → the client uses its platform-aware default builder for this slot.
         "command": None,
         "description": "Filesystem MCP (@modelcontextprotocol/server-filesystem)",
@@ -75,6 +78,7 @@ BUILTIN_PLUGINS: list[dict[str, Any]] = [
         "url_prefix": "/code",
         "enabled": True,
         "builtin": True,
+        "core": True,
         "command": None,  # default: codebase-memory-mcp (auto-installed)
         "description": "Code intelligence graph (codebase-memory-mcp)",
         "description_overrides": {},
@@ -86,6 +90,7 @@ BUILTIN_PLUGINS: list[dict[str, Any]] = [
         "url_prefix": "/extract",
         "enabled": True,
         "builtin": True,
+        "core": True,
         # default: Serena (LSP symbol tools); {repo_path} expanded at spawn time.
         "command": list(SERENA_EXTRACT_COMMAND),
         "description": "Symbol-level code intelligence (Serena LSP)",
@@ -99,6 +104,7 @@ BUILTIN_PLUGINS: list[dict[str, Any]] = [
         # Office plugins are opt-in: off by default, enabled from the dashboard.
         "enabled": False,
         "builtin": True,
+        "core": False,
         "command": ["uvx", "powerpoint-mcp"],
         "env": {},
         "description": "PowerPoint authoring (powerpoint-mcp)",
@@ -111,6 +117,7 @@ BUILTIN_PLUGINS: list[dict[str, Any]] = [
         "url_prefix": "/word",
         "enabled": False,
         "builtin": True,
+        "core": False,
         "command": ["uvx", "word-mcp-live"],
         "env": {"MCP_AUTHOR": "Adam", "MCP_AUTHOR_INITIALS": "AC"},
         "description": "Word authoring (word-mcp-live)",
@@ -123,6 +130,7 @@ BUILTIN_PLUGINS: list[dict[str, Any]] = [
         "url_prefix": "/dc",
         "enabled": False,
         "builtin": True,
+        "core": False,
         "command": None,  # spawned via npx @wonderwhy-er/desktop-commander@latest
         "description": "Desktop Commander — system tools, file access, terminal (local only)",
         "description_overrides": {},
