@@ -169,7 +169,14 @@ async def _build_executor_goal_messages(
     except Exception:  # noqa: BLE001 — empty list still renders a valid goal
         pending = []
 
-    quick_start_goal = _build_quick_start_goal(pending, version=scoped_version)
+    quick_start_goal = _build_quick_start_goal(
+        pending,
+        version=scoped_version,
+        # ecf69de8 — the project's executor posture selects the /goal framing.
+        execution_mode=db_module.normalize_execution_mode(
+            project.get("execution_mode")
+        ),
+    )
     if pending:
         item_lines = "\n".join(
             f"  {i}. [{it['id']}] {(it.get('title') or '').strip()}"
@@ -1089,7 +1096,9 @@ async def _handle_project_tools(
         existing = await db_module.get_project_by_name(db, args["name"])
         if existing is not None:
             return {"error": f"project '{args['name']}' already exists", "project": existing}
-        return await db_module.create_project(db, args["name"])
+        return await db_module.create_project(
+            db, args["name"], execution_mode=args.get("execution_mode"),
+        )
     if name == "register_session":
         hid = args.get("human_id")
         if not hid and not _hosted_mode():

@@ -1702,6 +1702,47 @@ export async function loadSettingsTab(projectId) {
 
 
 
+  // ecf69de8 — Execution Mode section: per-project executor posture.
+  // autonomous = claim and run immediately (default); interactive = ask first.
+
+  const executionMode = (projectSettings && projectSettings.execution_mode === 'interactive') ? 'interactive' : 'autonomous';
+
+  html += `<div style="margin-bottom:16px">
+
+    <div style="color:var(--accent);font-size:10px;letter-spacing:.06em;text-transform:uppercase;margin-bottom:10px;padding-bottom:4px;border-bottom:1px solid var(--border)">Execution Mode</div>
+
+    <div style="font-size:10px;color:var(--muted);margin-bottom:10px">How a new session behaves when it starts. Injected into <code>start_session</code> at the protocol level.</div>
+
+    <label style="display:block;font-size:11px;color:var(--text);margin-bottom:4px">Executor posture</label>
+    <div style="font-size:10px;color:var(--muted);margin-bottom:6px"><strong>Autonomous</strong> claims and runs pending sprint items immediately without asking. <strong>Interactive</strong> reviews the items and asks which to start first.</div>
+    <select id="execution-mode-${projectId}" style="width:100%;padding:6px 8px;font-size:11px;background:var(--surface-1);color:var(--text);border:1px solid var(--border);border-radius:5px;cursor:pointer">
+      <option value="autonomous" ${executionMode === 'autonomous' ? 'selected' : ''}>Autonomous (claim &amp; run, do not defer)</option>
+      <option value="interactive" ${executionMode === 'interactive' ? 'selected' : ''}>Interactive (ask for direction first)</option>
+    </select>
+    <div id="execution-mode-status-${projectId}" style="font-size:10px;color:var(--muted);margin-top:6px;min-height:13px"></div>
+
+  </div>`;
+
+  setTimeout(() => {
+
+    const emSel = document.getElementById(`execution-mode-${projectId}`);
+    const emStatus = document.getElementById(`execution-mode-status-${projectId}`);
+
+    if (emSel) emSel.onchange = async () => {
+      if (emStatus) emStatus.textContent = 'Saving…';
+      try {
+        await saveProjectSettings(projectId, { execution_mode: emSel.value });
+        if (emStatus) emStatus.textContent = 'Saved.';
+        setTimeout(() => { if (emStatus) emStatus.textContent = ''; }, 1500);
+      } catch (e) {
+        if (emStatus) emStatus.textContent = `Save failed: ${String(e)}`;
+      }
+    };
+
+  }, 0);
+
+
+
   // 0716c9e0 — Parallel Safety section
 
   const autoWorktrees = parseInt((projectSettings && projectSettings.auto_worktrees) != null ? projectSettings.auto_worktrees : 1, 10);

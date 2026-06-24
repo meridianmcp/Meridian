@@ -100,12 +100,22 @@ _EXECUTOR_GOAL_DIRECTIVE = (
     "Start with the first item now. "
 )
 
+# ecf69de8 — deferential framing for execution_mode='interactive' projects. The
+# /goal lists the same items but tells the session to confirm with the human
+# which to start before executing, instead of running immediately.
+_INTERACTIVE_GOAL_DIRECTIVE = (
+    "You are assisting interactively. Review the following sprint items and "
+    "confirm with the human which to start before executing. Ask for direction "
+    "before claiming or changing anything. "
+)
+
 
 def _build_quick_start_goal(
     pending_sprint_items: list[dict[str, Any]],
     *,
     test_floor: int = _DEFAULT_GOAL_TEST_FLOOR,
     version: str | None = None,
+    execution_mode: str = "autonomous",
 ) -> str:
     """Build the handoff /goal template from the live pending sprint item ids.
 
@@ -113,6 +123,12 @@ def _build_quick_start_goal(
     only items whose ``version`` matches are named, so a version-scoped session's
     /goal doesn't pull in backlog/other-version items. ``None`` keeps every
     pending item (legacy behaviour).
+
+    ``execution_mode`` (ecf69de8) selects the leading directive on the items
+    path: 'autonomous' (default) prepends the non-deferential executor directive
+    so the session runs immediately; 'interactive' prepends a deferential
+    directive so the session asks which item to start first. Any value other
+    than 'interactive' is treated as autonomous.
     """
     if version is not None:
         pending_sprint_items = [
@@ -126,8 +142,13 @@ def _build_quick_start_goal(
             f"passes {test_floor}+, and generate_handoff() is called at the "
             "end. Stop after 40 turns or if HITL triggered."
         )
+    directive = (
+        _INTERACTIVE_GOAL_DIRECTIVE
+        if execution_mode == "interactive"
+        else _EXECUTOR_GOAL_DIRECTIVE
+    )
     return (
-        f"/goal {_EXECUTOR_GOAL_DIRECTIVE}"
+        f"/goal {directive}"
         f"Complete sprint items: {', '.join(item_ids)}. "
         "Done when all listed sprint items are marked complete via "
         f"complete_sprint_item(), pixi run test passes {test_floor}+, and "
@@ -763,7 +784,13 @@ async def generate_handoff(
     now_utc = datetime.now(timezone.utc)
     generated_at = now_utc.isoformat(timespec="seconds")
     state_ts = now_utc.strftime("%Y-%m-%d %H:%M:%S")
-    quick_start_goal = _build_quick_start_goal(pending_sprint_items)
+    # ecf69de8 — the project's executor posture selects the /goal framing.
+    quick_start_goal = _build_quick_start_goal(
+        pending_sprint_items,
+        execution_mode=db_module.normalize_execution_mode(
+            project.get("execution_mode")
+        ),
+    )
 
     # Split tasks into L1 (last 10) and L2 (older).
     l1_tasks = tasks[:10]
@@ -1084,7 +1111,13 @@ async def _generate_starter_handoff(
         if it.get("status") in {"pending", "todo"}
     ]
     pending = _prepare_pending_sprint_items(pending)
-    quick_start_goal = _build_quick_start_goal(pending)
+    # ecf69de8 — the project's executor posture selects the /goal framing.
+    quick_start_goal = _build_quick_start_goal(
+        pending,
+        execution_mode=db_module.normalize_execution_mode(
+            project.get("execution_mode")
+        ),
+    )
     settings = await db_module.get_project_settings(db, project_id)
     executor_config = (settings or {}).get("executor_config") if settings else None
     content = _render_starter_handoff(

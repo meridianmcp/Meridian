@@ -535,6 +535,7 @@ Create a new Meridian project.
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `name` | string | required |  |
+| `execution_mode` | string | optional | Executor posture for sessions on this project. 'autonomous' (default) claims and runs sprint items immediately without asking; 'interactive' asks for direction first. Editable later in dashboard Settings. |
 
 **Example:**
 ```

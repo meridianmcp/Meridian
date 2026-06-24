@@ -159,7 +159,20 @@ def build_mcp_server():
                 ),
                 inputSchema={
                     "type": "object",
-                    "properties": {"name": {"type": "string"}},
+                    "properties": {
+                        "name": {"type": "string"},
+                        "execution_mode": {
+                            "type": "string",
+                            "enum": ["autonomous", "interactive"],
+                            "description": (
+                                "Executor posture for sessions on this project. "
+                                "'autonomous' (default) claims and runs sprint "
+                                "items immediately without asking; 'interactive' "
+                                "asks for direction first. Editable later in "
+                                "dashboard Settings."
+                            ),
+                        },
+                    },
                     "required": ["name"],
                 },
             ),
@@ -1467,7 +1480,8 @@ def build_mcp_server():
                     }
                 else:
                     result = await db_module.create_project(
-                        db, arguments["name"]
+                        db, arguments["name"],
+                        execution_mode=arguments.get("execution_mode"),
                     )
             elif name == "register_session":
                 result = await db_module.register_session(

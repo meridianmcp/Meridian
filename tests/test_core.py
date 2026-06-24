@@ -6157,10 +6157,11 @@ def test_pg_migration_registry_matches_historical_order():
         "_migrate_pg_code_anchored_notes",
         "_migrate_pg_note_source",
         "_migrate_pg_session_sprint_version",
+        "_migrate_pg_project_execution_mode",
     ]
     # No duplicates across the three groups.
     allnames = core + hosted + late
-    assert len(allnames) == len(set(allnames)) == 55
+    assert len(allnames) == len(set(allnames)) == 56
 
 
 def test_default_agent_instructions_has_code_intel_protocol():
@@ -13532,6 +13533,190 @@ def test_build_quick_start_goal_version_with_no_matches():
     items = [{"id": "aaa", "version": "v1.1"}]
     goal = _build_quick_start_goal(items, version="v0.1.x")
     assert "Verify remaining work is complete" in goal
+
+
+# ---------------------------------------------------------------------------
+# ecf69de8 — per-project execution_mode (autonomous vs interactive)
+# ---------------------------------------------------------------------------
+
+
+def test_build_quick_start_goal_autonomous_directive():
+    """ecf69de8 — autonomous (default) prepends the non-deferential executor
+    directive so the session runs immediately."""
+    from meridian.handoff import (
+        _build_quick_start_goal,
+        _EXECUTOR_GOAL_DIRECTIVE,
+    )
+
+    items = [{"id": "aaa"}, {"id": "bbb"}]
+    # Explicit autonomous and the default both use the executor directive.
+    for goal in (
+        _build_quick_start_goal(items, execution_mode="autonomous"),
+        _build_quick_start_goal(items),
+    ):
+        assert _EXECUTOR_GOAL_DIRECTIVE.strip() in goal
+        assert "without asking for direction" in goal
+        assert "aaa" in goal and "bbb" in goal
+
+
+def test_build_quick_start_goal_interactive_directive():
+    """ecf69de8 — interactive prepends the deferential directive and drops the
+    'without asking' executor framing."""
+    from meridian.handoff import (
+        _build_quick_start_goal,
+        _INTERACTIVE_GOAL_DIRECTIVE,
+    )
+
+    items = [{"id": "aaa"}, {"id": "bbb"}]
+    goal = _build_quick_start_goal(items, execution_mode="interactive")
+    assert _INTERACTIVE_GOAL_DIRECTIVE.strip() in goal
+    assert "confirm with the human which to start" in goal
+    # The non-deferential executor line must NOT be present in interactive mode.
+    assert "without asking for direction" not in goal
+    # Items are still named so the human knows what's queued.
+    assert "aaa" in goal and "bbb" in goal
+
+
+def test_normalize_execution_mode_validates():
+    """ecf69de8 — normalize_execution_mode keeps valid values and falls back to
+    'autonomous' for anything else."""
+    assert db_module.normalize_execution_mode("autonomous") == "autonomous"
+    assert db_module.normalize_execution_mode("interactive") == "interactive"
+    assert db_module.normalize_execution_mode("INTERACTIVE") == "interactive"
+    assert db_module.normalize_execution_mode("  autonomous  ") == "autonomous"
+    # Invalid / missing → default.
+    assert db_module.normalize_execution_mode("bogus") == "autonomous"
+    assert db_module.normalize_execution_mode("") == "autonomous"
+    assert db_module.normalize_execution_mode(None) == "autonomous"
+
+
+@pytest.mark.asyncio
+async def test_create_project_execution_mode_default_and_set(db):
+    """ecf69de8 — create_project defaults to autonomous, accepts interactive,
+    and normalises an invalid value to autonomous."""
+    default = await db_module.create_project(db, "exec-mode-default")
+    assert default["execution_mode"] == "autonomous"
+
+    interactive = await db_module.create_project(
+        db, "exec-mode-interactive", execution_mode="interactive"
+    )
+    assert interactive["execution_mode"] == "interactive"
+
+    invalid = await db_module.create_project(
+        db, "exec-mode-invalid", execution_mode="sideways"
+    )
+    assert invalid["execution_mode"] == "autonomous"
+
+    # Setter flips it and normalises, and get_project_settings reflects it.
+    updated = await db_module.set_project_execution_mode(
+        db, default["id"], "interactive"
+    )
+    assert updated is not None
+    assert updated["execution_mode"] == "interactive"
+    settings = await db_module.get_project_settings(db, default["id"])
+    assert settings["execution_mode"] == "interactive"
+    # Invalid value via setter normalises back to autonomous.
+    reset = await db_module.set_project_execution_mode(db, default["id"], "nope")
+    assert reset is not None
+    assert reset["execution_mode"] == "autonomous"
+
+
+@pytest.mark.asyncio
+async def test_update_project_settings_execution_mode(db):
+    """ecf69de8 — execution_mode round-trips through update_project_settings and
+    a bad value normalises to autonomous."""
+    p = await db_module.create_project(db, "exec-mode-settings")
+    res = await db_module.update_project_settings(
+        db, p["id"], execution_mode="interactive"
+    )
+    assert res is not None
+    assert res["execution_mode"] == "interactive"
+    res2 = await db_module.update_project_settings(
+        db, p["id"], execution_mode="garbage"
+    )
+    assert res2["execution_mode"] == "autonomous"
+
+
+def test_migration_adds_execution_mode_default_autonomous(tmp_path):
+    """ecf69de8 — init_db adds execution_mode to a legacy projects table,
+    backfilling existing rows to 'autonomous', and is idempotent."""
+    import sqlite3
+
+    db_path = tmp_path / "legacy_exec_mode.db"
+    legacy = sqlite3.connect(db_path)
+    legacy.executescript(
+        """
+        CREATE TABLE projects (id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')));
+        INSERT INTO projects (id, name) VALUES ('p1', 'legacy-proj');
+        """
+    )
+    legacy.commit()
+    legacy.close()
+
+    async def run():
+        # First init applies the migration and backfills the existing row.
+        conn = await db_module.init_db(str(db_path))
+        try:
+            assert await db_module._column_exists(conn, "projects", "execution_mode")
+            proj = await db_module.get_project(conn, "p1")
+            assert proj is not None
+            assert proj["execution_mode"] == "autonomous"
+        finally:
+            await conn.close()
+        # Second init is a no-op (idempotent) and preserves the value.
+        conn2 = await db_module.init_db(str(db_path))
+        try:
+            proj2 = await db_module.get_project(conn2, "p1")
+            assert proj2["execution_mode"] == "autonomous"
+        finally:
+            await conn2.close()
+
+    import asyncio
+    asyncio.run(run())
+
+
+@pytest.mark.asyncio
+async def test_start_session_injects_execution_mode_directive(db, tmp_path):
+    """ecf69de8 — the start_session response includes the structured
+    execution_mode field AND a protocol-level directive line, for both the
+    compact and full payloads, reflecting each mode."""
+    import meridian.server as srv
+
+    # Autonomous (default) — compact path.
+    auto = await db_module.create_project(db, "ss-exec-auto")
+    res_c = await srv._start_session_composite(
+        db, auto["id"], "auto-compact", str(tmp_path), compact=True
+    )
+    assert res_c["execution_mode"] == "autonomous"
+    assert "EXECUTION MODE: autonomous" in res_c["execution_mode_directive"]
+    assert "EXECUTION MODE: autonomous" in res_c["agent_instructions"]
+    assert "do not defer" in res_c["agent_instructions"]
+
+    # Autonomous — full path.
+    res_f = await srv._start_session_composite(
+        db, auto["id"], "auto-full", str(tmp_path), compact=False
+    )
+    assert res_f["execution_mode"] == "autonomous"
+    assert "EXECUTION MODE: autonomous" in res_f["execution_mode_directive"]
+    assert res_f["agent_instructions"].startswith("EXECUTION MODE: autonomous")
+
+    # Interactive — compact + full both carry the deferential directive.
+    inter = await db_module.create_project(
+        db, "ss-exec-inter", execution_mode="interactive"
+    )
+    res_ic = await srv._start_session_composite(
+        db, inter["id"], "inter-compact", str(tmp_path), compact=True
+    )
+    assert res_ic["execution_mode"] == "interactive"
+    assert "EXECUTION MODE: interactive" in res_ic["execution_mode_directive"]
+    assert "ask for direction" in res_ic["agent_instructions"]
+
+    res_if = await srv._start_session_composite(
+        db, inter["id"], "inter-full", str(tmp_path), compact=False
+    )
+    assert res_if["execution_mode"] == "interactive"
+    assert res_if["agent_instructions"].startswith("EXECUTION MODE: interactive")
 
 
 @pytest.mark.asyncio

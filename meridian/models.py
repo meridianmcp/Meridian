@@ -177,6 +177,12 @@ class ProjectSettings(BaseModel):
         le=1,
         description="Sprint-2/3: show codebase-memory-mcp install URL in dashboard and agent guidance.",
     )
+    execution_mode: Literal["autonomous", "interactive"] = Field(
+        default="autonomous",
+        description="ecf69de8: executor posture. 'autonomous' (default) claims "
+        "and runs sprint items immediately; 'interactive' asks for direction "
+        "before executing.",
+    )
 
 
 class ProjectSettingsPatch(BaseModel):
@@ -188,6 +194,7 @@ class ProjectSettingsPatch(BaseModel):
     auto_worktrees: int | None = Field(default=None, ge=0, le=1)
     require_merge_approval: int | None = Field(default=None, ge=0, le=1)
     code_intel_enabled: int | None = Field(default=None, ge=0, le=1)
+    execution_mode: Literal["autonomous", "interactive"] | None = None
 
 
 class GoalState(BaseModel):

@@ -3482,6 +3482,36 @@ async def _find_continuation_session(
     return None
 
 
+# ecf69de8 — protocol-level EXECUTION MODE directive. start_session leads the
+# agent_instructions / orientation with this line so the posture is a structured
+# instruction the session can't miss, not buried freetext. 'autonomous' tells the
+# session to claim and run immediately; 'interactive' tells it to ask first.
+_EXECUTION_MODE_DIRECTIVES = {
+    "autonomous": (
+        "EXECUTION MODE: autonomous — claim and run pending sprint items "
+        "immediately, do not defer. Do NOT ask which item to start; begin with "
+        "the first one now."
+    ),
+    "interactive": (
+        "EXECUTION MODE: interactive — ask for direction before executing. "
+        "Review the pending sprint items and confirm with the human which to "
+        "start before claiming or changing anything."
+    ),
+}
+
+
+def _execution_mode_directive(mode: str | None) -> str:
+    """Return the protocol-level EXECUTION MODE directive line for a project.
+
+    Unknown / missing modes fall back to the autonomous directive so the line is
+    always present and the default posture is non-deferential.
+    """
+    normalized = db_module.normalize_execution_mode(mode)
+    return _EXECUTION_MODE_DIRECTIVES.get(
+        normalized, _EXECUTION_MODE_DIRECTIVES["autonomous"]
+    )
+
+
 async def _start_session_composite(
     db: aiosqlite.Connection,
     project_id: str,
@@ -3657,9 +3687,18 @@ async def _start_session_composite(
             else 0
         )
         _c_sprint = (goal or {}).get("sprint") if goal else None
+        # ecf69de8 — resolve the project's executor posture so the compact
+        # orientation carries it at the protocol level too.
+        _c_project = await db_module.get_project(db, project_id)
+        _c_mode = db_module.normalize_execution_mode(
+            (_c_project or {}).get("execution_mode")
+        )
+        _c_mode_directive = _execution_mode_directive(_c_mode)
         _c_payload = {
             "session_id": session["id"],
             "compact": True,
+            "execution_mode": _c_mode,  # ecf69de8 — structured posture field
+            "execution_mode_directive": _c_mode_directive,
             "sprint": (str(_c_sprint)[:300] if _c_sprint else None),
             "sprint_version": scoped_version,
             "sprint_summary": {
@@ -3682,9 +3721,12 @@ async def _start_session_composite(
         }
         # Per-project agent instructions are small but behaviorally critical
         # (custom rules the session must follow), so keep them even in compact.
+        # ecf69de8 — lead with the EXECUTION MODE directive so the posture is the
+        # first protocol-level instruction the session reads.
         _c_agent = await db_module.get_agent_instructions(db, project_id)
-        if _c_agent:
-            _c_payload["agent_instructions"] = _c_agent
+        _c_payload["agent_instructions"] = (
+            f"{_c_mode_directive}\n\n{_c_agent}" if _c_agent else _c_mode_directive
+        )
         # File conflict warnings must surface in compact mode — an executor that
         # misses them will silently overwrite another session's uncommitted work.
         _c_file_warnings = await db_module.get_file_conflict_warnings(
@@ -3777,10 +3819,23 @@ async def _start_session_composite(
     )
 
     # 8a0c5a78 — inject per-project agent instructions so every session sees them.
+    # ecf69de8 — lead them with the protocol-level EXECUTION MODE directive so the
+    # executor posture (autonomous vs interactive) is the first instruction read.
+    execution_mode = db_module.normalize_execution_mode(
+        (project or {}).get("execution_mode")
+    )
+    mode_directive = _execution_mode_directive(execution_mode)
     agent_instructions = await db_module.get_agent_instructions(db, project_id)
+    agent_instructions = (
+        f"{mode_directive}\n\n{agent_instructions}"
+        if agent_instructions
+        else mode_directive
+    )
 
     payload: dict[str, Any] = {
         "session_id": session["id"],
+        "execution_mode": execution_mode,  # ecf69de8 — structured posture field
+        "execution_mode_directive": mode_directive,
         "sprint_version": scoped_version,  # a76cb7c0 — resolved scope (or None)
         "goal": goal,
         "goal_xml": goal_xml,  # v0.6.1 — always present

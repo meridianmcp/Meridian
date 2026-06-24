@@ -456,6 +456,7 @@ CREATE TABLE IF NOT EXISTS projects (
     github_repo TEXT,
     github_branch TEXT,
     queued_session TEXT,
+    execution_mode TEXT NOT NULL DEFAULT 'autonomous',
     created_at TEXT NOT NULL DEFAULT ({_TS})
 );
 
@@ -1308,6 +1309,22 @@ async def _migrate_pg_session_sprint_version(conn: PostgresConnection) -> None:
     )
 
 
+async def _migrate_pg_project_execution_mode(conn: PostgresConnection) -> None:
+    """ecf69de8 — projects.execution_mode: per-project executor posture.
+
+    'autonomous' (default) — claim and run pending sprint items immediately
+    without asking for direction. 'interactive' — review the items and ask the
+    human which to start first. Injected at the protocol level by start_session
+    and selects the /goal framing in _build_quick_start_goal. NOT NULL DEFAULT
+    'autonomous' so existing rows backfill to autonomous. ADD COLUMN IF NOT
+    EXISTS so re-running is a no-op. Mirrors db._migrate_project_execution_mode.
+    """
+    await conn.executescript(
+        "ALTER TABLE projects ADD COLUMN IF NOT EXISTS execution_mode "
+        "TEXT NOT NULL DEFAULT 'autonomous'"
+    )
+
+
 def _slugify_note_pg(title: str) -> str:
     """Kebab-case a note title (lowercase, alnum+dashes, collapse, trim).
 
@@ -1885,4 +1902,5 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_code_anchored_notes,
     _migrate_pg_note_source,
     _migrate_pg_session_sprint_version,
+    _migrate_pg_project_execution_mode,
 )

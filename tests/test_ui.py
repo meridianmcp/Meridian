@@ -555,6 +555,21 @@ def test_known_locations_has_manual_path_entry(js):
     )
 
 
+def test_execution_mode_toggle_present(js):
+    """ecf69de8 — the settings tab renders an Execution Mode select (autonomous
+    vs interactive) that persists via saveProjectSettings (PATCH settings)."""
+    # Section header + the select element id.
+    assert "Execution Mode" in js, "Execution Mode section header missing"
+    assert "execution-mode-${projectId}" in js, "execution mode select id missing"
+    # Both posture options are rendered.
+    assert 'value="autonomous"' in js, "autonomous option missing"
+    assert 'value="interactive"' in js, "interactive option missing"
+    # onchange handler persists via saveProjectSettings with the execution_mode key.
+    assert "saveProjectSettings(projectId, { execution_mode: emSel.value })" in js, (
+        "execution mode change must persist via saveProjectSettings (PATCH settings)"
+    )
+
+
 def test_codeintel_tab_sends_project_slug_not_repo_path(js):
     """HOTFIX 9d11c952 — the Code Intel tab must call index_status / get_architecture
     with the `project` slug the code-intel graph keys on (root_path with :/\\ collapsed

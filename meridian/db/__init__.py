@@ -28,6 +28,26 @@ _log = logging.getLogger(__name__)
 
 _UNSET = object()  # sentinel for "not passed" in optional keyword args
 
+# ecf69de8 — per-project executor posture. 'autonomous' (default): claim and run
+# pending sprint items immediately without asking for direction. 'interactive':
+# review the items and ask the human which to start first. Anything else falls
+# back to the default so a bad value never persists.
+EXECUTION_MODES = ("autonomous", "interactive")
+DEFAULT_EXECUTION_MODE = "autonomous"
+
+
+def normalize_execution_mode(mode: str | None) -> str:
+    """Coerce an execution_mode input to a valid value.
+
+    Returns the lowercased value when it's one of EXECUTION_MODES, otherwise the
+    default ('autonomous'). Never raises — callers can pass user input directly.
+    """
+    if isinstance(mode, str):
+        candidate = mode.strip().lower()
+        if candidate in EXECUTION_MODES:
+            return candidate
+    return DEFAULT_EXECUTION_MODE
+
 # ---------------------------------------------------------------------------
 # Transparent field encryption (Fernet, MERIDIAN_ENCRYPTION_KEY env var).
 # enc:<base64> prefix allows zero-downtime migration — plaintext values are
@@ -156,6 +176,8 @@ CREATE TABLE IF NOT EXISTS projects (
     hitl_auto_answer INTEGER NOT NULL DEFAULT 0,
     icon TEXT,
     agent_instructions TEXT,
+    execution_mode TEXT NOT NULL DEFAULT 'autonomous'
+        CHECK (execution_mode IN ('autonomous', 'interactive')),
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -759,6 +781,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_code_anchored_notes(db)
     await _migrate_note_source(db)
     await _migrate_session_sprint_version(db)
+    await _migrate_project_execution_mode(db)
     return db
 
 
@@ -768,22 +791,44 @@ async def create_project(
     db: aiosqlite.Connection,
     name: str,
     human_id: str | None = None,
+    execution_mode: str | None = None,
 ) -> dict[str, Any]:
     """Insert a project and return it as a dict. Raises if the name exists.
 
     ``human_id`` (when provided) is recorded as the project's
     ``creator_human_id``. The creator's id is the only one allowed to
     update the goal state once goal-ownership enforcement is active.
+
+    ``execution_mode`` (ecf69de8) sets the project's executor posture —
+    'autonomous' (default) or 'interactive'. Invalid values normalise to
+    'autonomous' so a bad input never persists.
     """
     pid = _new_id()
+    mode = normalize_execution_mode(execution_mode)
     await db.execute(
-        "INSERT INTO projects (id, name, creator_human_id) VALUES (?, ?, ?)",
-        (pid, name, human_id),
+        "INSERT INTO projects (id, name, creator_human_id, execution_mode) "
+        "VALUES (?, ?, ?, ?)",
+        (pid, name, human_id, mode),
     )
     await db.commit()
     project = await get_project(db, pid)
     assert project is not None
     return project
+
+
+async def set_project_execution_mode(
+    db: aiosqlite.Connection, project_id: str, mode: str
+) -> dict[str, Any] | None:
+    """Set the executor posture for a project. Invalid values normalise to
+    'autonomous'. Returns the updated project dict, or None if not found.
+    """
+    normalized = normalize_execution_mode(mode)
+    await db.execute(
+        "UPDATE projects SET execution_mode = ? WHERE id = ?",
+        (normalized, project_id),
+    )
+    await db.commit()
+    return await get_project(db, project_id)
 
 
 async def get_project(
@@ -893,7 +938,8 @@ async def get_project_settings(
     """Return the persisted settings for a project."""
     async with db.execute(
         "SELECT id, max_pinned_decisions, executor_config, hitl_auto_answer, "
-        "auto_worktrees, require_merge_approval, code_intel_enabled "
+        "auto_worktrees, require_merge_approval, code_intel_enabled, "
+        "execution_mode "
         "FROM projects WHERE id = ?",
         (project_id,),
     ) as cur:
@@ -917,6 +963,8 @@ async def get_project_settings(
         "require_merge_approval": int(data.get("require_merge_approval") if data.get("require_merge_approval") is not None else 1),
         # Sprint-2/3 — codebase-memory-mcp toggle.
         "code_intel_enabled": int(data.get("code_intel_enabled") or 0),
+        # ecf69de8 — executor posture: 'autonomous' (default) | 'interactive'.
+        "execution_mode": normalize_execution_mode(data.get("execution_mode")),
     }
 
 
@@ -930,6 +978,7 @@ async def update_project_settings(
     auto_worktrees: int | None = None,
     require_merge_approval: int | None = None,
     code_intel_enabled: int | None = None,
+    execution_mode: str | None = None,
     github_repo: str | None = _UNSET,
     github_branch: str | None = _UNSET,
 ) -> dict[str, Any] | None:
@@ -958,6 +1007,10 @@ async def update_project_settings(
     if code_intel_enabled is not None:
         updates.append("code_intel_enabled = ?")
         params.append(1 if code_intel_enabled else 0)
+    if execution_mode is not None:
+        # ecf69de8 — normalise to a valid posture so a bad value never persists.
+        updates.append("execution_mode = ?")
+        params.append(normalize_execution_mode(execution_mode))
     if github_repo is not _UNSET:
         updates.append("github_repo = ?")
         params.append(github_repo or None)
