@@ -782,6 +782,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_note_source(db)
     await _migrate_session_sprint_version(db)
     await _migrate_project_execution_mode(db)
+    await _migrate_agent_tasks_table(db)
     return db
 
 
@@ -8035,3 +8036,100 @@ async def delete_changelog_entry(db: aiosqlite.Connection, entry_id: str) -> boo
     await db.execute("DELETE FROM changelog_entries WHERE id = ?", (entry_id,))
     await db.commit()
     return True
+
+
+# ---------------------------------------------------------------------------
+# A2A protocol — agent_tasks table (99e71b9e)
+# ---------------------------------------------------------------------------
+
+async def create_agent_task(
+    db: aiosqlite.Connection,
+    agent_id: str,
+    input_data: dict[str, Any],
+    session_id: str | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Insert a new agent task with status 'submitted'. Returns the task row."""
+    task_id = _new_id()
+    input_json = json.dumps(input_data)
+    meta_json = json.dumps(metadata) if metadata else None
+    await db.execute(
+        "INSERT INTO agent_tasks (id, agent_id, session_id, input, metadata) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (task_id, agent_id, session_id, input_json, meta_json),
+    )
+    await db.commit()
+    return await _get_agent_task(db, task_id)  # type: ignore[return-value]
+
+
+async def _get_agent_task(
+    db: aiosqlite.Connection, task_id: str
+) -> dict[str, Any] | None:
+    """Fetch one agent task by id."""
+    async with db.execute(
+        "SELECT * FROM agent_tasks WHERE id = ?", (task_id,)
+    ) as cur:
+        row = await cur.fetchone()
+    if row is None:
+        return None
+    task = _row_to_dict(row)
+    # Deserialize JSON blobs
+    if task.get("input"):
+        try:
+            task["input"] = json.loads(task["input"])
+        except Exception:
+            pass
+    if task.get("output"):
+        try:
+            task["output"] = json.loads(task["output"])
+        except Exception:
+            pass
+    if task.get("metadata"):
+        try:
+            task["metadata"] = json.loads(task["metadata"])
+        except Exception:
+            pass
+    return task
+
+
+async def get_agent_task(
+    db: aiosqlite.Connection, agent_id: str, task_id: str
+) -> dict[str, Any] | None:
+    """Fetch an agent task, scoped to agent_id for security."""
+    async with db.execute(
+        "SELECT * FROM agent_tasks WHERE id = ? AND agent_id = ?",
+        (task_id, agent_id),
+    ) as cur:
+        row = await cur.fetchone()
+    if row is None:
+        return None
+    task = _row_to_dict(row)
+    for field in ("input", "output", "metadata"):
+        if task.get(field):
+            try:
+                task[field] = json.loads(task[field])
+            except Exception:
+                pass
+    return task
+
+
+async def update_agent_task_status(
+    db: aiosqlite.Connection,
+    task_id: str,
+    status: str,
+    output: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    """Update the status (and optionally output) of an agent task."""
+    output_json = json.dumps(output) if output is not None else None
+    if output_json is not None:
+        await db.execute(
+            "UPDATE agent_tasks SET status=?, output=?, updated_at=datetime('now') WHERE id=?",
+            (status, output_json, task_id),
+        )
+    else:
+        await db.execute(
+            "UPDATE agent_tasks SET status=?, updated_at=datetime('now') WHERE id=?",
+            (status, task_id),
+        )
+    await db.commit()
+    return await _get_agent_task(db, task_id)
