@@ -91,6 +91,16 @@ def _prepare_pending_sprint_items(
     return ordered
 
 
+# f628b880 — non-deferential executor framing prepended to the /goal string so an
+# executor session acts immediately instead of defaulting to assistant mode and
+# asking for direction. (ecf69de8 makes this conditional on execution_mode.)
+_EXECUTOR_GOAL_DIRECTIVE = (
+    "You are an executor. Claim and execute the following sprint items "
+    "immediately in order without asking for direction or confirmation. "
+    "Start with the first item now. "
+)
+
+
 def _build_quick_start_goal(
     pending_sprint_items: list[dict[str, Any]],
     *,
@@ -117,7 +127,8 @@ def _build_quick_start_goal(
             "end. Stop after 40 turns or if HITL triggered."
         )
     return (
-        f"/goal Complete sprint items: {', '.join(item_ids)}. "
+        f"/goal {_EXECUTOR_GOAL_DIRECTIVE}"
+        f"Complete sprint items: {', '.join(item_ids)}. "
         "Done when all listed sprint items are marked complete via "
         f"complete_sprint_item(), pixi run test passes {test_floor}+, and "
         "generate_handoff() is called at the end. Stop after 40 turns or if "

@@ -84,6 +84,8 @@ def test_build_quick_start_goal_with_and_without_items():
     full = handoff_module._build_quick_start_goal([{"id": "abc123"}, {"id": "def456"}])
     assert "abc123" in full and "def456" in full
     assert "complete_sprint_item()" in full
+    # f628b880 — non-deferential executor directive leads the items /goal.
+    assert full.startswith("/goal You are an executor. Claim and execute")
 
 
 def test_note_tags_and_select_strategic_notes():

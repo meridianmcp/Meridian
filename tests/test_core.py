@@ -271,9 +271,11 @@ async def test_handoff_lists_pending_sprint_items_in_dependency_order(db, tmp_pa
     assert f"Depends on item 1 (`{first['id']}`): First fix" in content
     assert f'start_session(project_id="{p["id"]}", session_name="<your-name>")' in content
     assert (
-        f"/goal Complete sprint items: {first['id']}, {second['id']}."
+        f"Complete sprint items: {first['id']}, {second['id']}."
         in content
     )
+    # f628b880 — the /goal leads with the non-deferential executor directive.
+    assert "/goal You are an executor. Claim and execute" in content
     assert "complete_sprint_item()" in content
 
 
@@ -332,7 +334,7 @@ async def test_handoff_delta_mode_reports_recent_changes(db, tmp_path):
     assert "# Session Update — alpha-delta" in content
     assert f"- {first['id']} — First fix" in content
     assert f"- {second['id']} [pending] Second fix" in content
-    assert f"/goal Complete sprint items: {second['id']}." in content
+    assert f"Complete sprint items: {second['id']}." in content
 
 
 async def test_handoff_starter_mode(db, tmp_path):
