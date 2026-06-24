@@ -1501,6 +1501,7 @@ async def _handle_hitl_tools(
             kind=_hitl_kind,
             options=_hitl_options,
             recommended=args.get("recommended"),
+            require_human=bool(args.get("require_human", False)),
         )
         # v3.4 — auto-answered requests need no human; skip the notification.
         if result.get("answered_by") != "auto":

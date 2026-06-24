@@ -197,7 +197,10 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "next sprint-item boundary, applies it, and continues. Pass `options` "
         "(answer choices, rendered as buttons) and `recommended` (an option "
         "string or 0-based index) to flag the safe default — the dashboard "
-        "highlights it and Enter submits it, and an auto-answer picks it.",
+        "highlights it and Enter submits it, and an auto-answer picks it. Set "
+        "require_human=true for genuinely irreversible/destructive actions (token "
+        "rotation, data migrations, rollbacks) so auto-answer can never approve it "
+        "— only an explicit human reply unblocks it.",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
          "question": {"type": "string"},
@@ -207,7 +210,8 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "kind": {"type": "string", "enum": ["question", "correction"], "description": "question (default, auto-answerable) or correction (non-blocking mid-run human correction)."},
          "assigned_to": {"type": "string"},
          "options": {"type": "array", "items": {"type": "string"}, "description": "Answer choices rendered as selectable buttons in the dashboard."},
-         "recommended": {"description": "The safe-default option — an option string or a 0-based index into options. Highlighted in the dashboard; Enter submits it; auto-answer prefers it."}},
+         "recommended": {"description": "The safe-default option — an option string or a 0-based index into options. Highlighted in the dashboard; Enter submits it; auto-answer prefers it."},
+         "require_human": {"type": "boolean", "description": "When true, the HITL can never be auto-answered — only an explicit human response unblocks it. Reserve for irreversible/destructive actions."}},
          "required": ["question"]}},
     {"name": "get_hitl_request", "description":
         "Read-only: Poll a HITL request for the human's answer. Returns the row including "

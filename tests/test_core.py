@@ -6938,6 +6938,31 @@ async def test_hitl_correction_nonblocking(db):
     assert answered["status"] == "answered"
 
 
+@pytest.mark.asyncio
+async def test_hitl_require_human_blocks_auto_answer(db):
+    """e43e6941 — require_human=True can never be auto-answered, even on a project
+    with auto-answer on; only an explicit human reply unblocks it."""
+    import json as _json
+    p = await db_module.create_project(db, "hitl-require-human")
+    await db_module.update_project_settings(db, p["id"], hitl_auto_answer=True)
+    # Sanity: the same benign question WITHOUT require_human auto-answers here.
+    auto = await db_module.request_hitl(db, p["id"], "Proceed with step two?")
+    assert auto["status"] == "answered" and auto["answered_by"] == "auto"
+    # With require_human, it stays pending despite auto-answer being on.
+    h = await db_module.request_hitl(
+        db, p["id"], "Proceed with step two?", require_human=True,
+    )
+    assert h["status"] == "pending"
+    assert h.get("answered_by") in (None, "")
+    # The flag is persisted in the payload (no migration) for the dashboard / audit.
+    assert _json.loads(h["payload"]).get("require_human") is True
+    # Only an explicit human answer unblocks it.
+    answered = await db_module.answer_hitl_request(
+        db, h["id"], "approved", answered_by="adam"
+    )
+    assert answered["status"] == "answered" and answered["answered_by"] == "adam"
+
+
 def test_hitl_should_auto_answer_modes():
     """035edf47 — 3-way auto-answer decision rules (off / safe / aggressive)."""
     f = db_module._hitl_should_auto_answer
