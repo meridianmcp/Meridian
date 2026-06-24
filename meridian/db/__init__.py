@@ -784,6 +784,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_project_execution_mode(db)
     await _migrate_decision_code_anchor(db)
     await _migrate_session_graph_snapshots(db)
+    await _migrate_agent_tasks_table(db)
     return db
 
 
@@ -2771,6 +2772,44 @@ async def add_sprint_item(
     # ITEM 6 — live push so dashboards refresh the sprint board without polling.
     _publish_project_event(project_id, "sprint_item_added", {"item_id": iid})
     return item
+
+
+async def fan_out_sprint_items(
+    db: aiosqlite.Connection,
+    project_id: str,
+    items: list[dict[str, Any]],
+) -> list[str]:
+    """Bulk-insert sprint items for an orchestrator decomposing a goal.
+
+    ``items`` is a list of dicts, each with at minimum ``title`` (required)
+    and optionally ``description``, ``group``, and ``version``.  Missing
+    ``version`` defaults to the empty string (same as the common add_sprint_item
+    convention).  Unlike add_sprint_item the duplicate guard is **not** applied
+    here — the orchestrator is assumed to have already deduped.
+
+    Returns the list of new item IDs in insertion order.
+    """
+    ids: list[str] = []
+    for spec in items:
+        title = (spec.get("title") or "").strip()
+        if not title:
+            continue
+        version = (spec.get("version") or spec.get("sprint") or "").strip()
+        group = spec.get("group") or spec.get("item_group") or None
+        description = spec.get("description") or None
+        iid = _new_id()
+        await db.execute(
+            "INSERT INTO sprint_items "
+            "(id, project_id, version, title, item_group, notes) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (iid, project_id, version, title, group, description),
+        )
+        ids.append(iid)
+    if ids:
+        await db.commit()
+        _invalidate_sprint_items_cache(project_id)
+        _publish_project_event(project_id, "sprint_items_fanned_out", {"item_ids": ids})
+    return ids
 
 
 async def get_sprint_item(
@@ -8324,3 +8363,100 @@ async def get_graph_diff(
             f"{churn_b - churn_a:+d} file churn vs session_a"
         ),
     }
+
+
+# ---------------------------------------------------------------------------
+# A2A protocol — agent_tasks table (99e71b9e)
+# ---------------------------------------------------------------------------
+
+async def create_agent_task(
+    db: aiosqlite.Connection,
+    agent_id: str,
+    input_data: dict[str, Any],
+    session_id: str | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Insert a new agent task with status 'submitted'. Returns the task row."""
+    task_id = _new_id()
+    input_json = json.dumps(input_data)
+    meta_json = json.dumps(metadata) if metadata else None
+    await db.execute(
+        "INSERT INTO agent_tasks (id, agent_id, session_id, input, metadata) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (task_id, agent_id, session_id, input_json, meta_json),
+    )
+    await db.commit()
+    return await _get_agent_task(db, task_id)  # type: ignore[return-value]
+
+
+async def _get_agent_task(
+    db: aiosqlite.Connection, task_id: str
+) -> dict[str, Any] | None:
+    """Fetch one agent task by id."""
+    async with db.execute(
+        "SELECT * FROM agent_tasks WHERE id = ?", (task_id,)
+    ) as cur:
+        row = await cur.fetchone()
+    if row is None:
+        return None
+    task = _row_to_dict(row)
+    # Deserialize JSON blobs
+    if task.get("input"):
+        try:
+            task["input"] = json.loads(task["input"])
+        except Exception:
+            pass
+    if task.get("output"):
+        try:
+            task["output"] = json.loads(task["output"])
+        except Exception:
+            pass
+    if task.get("metadata"):
+        try:
+            task["metadata"] = json.loads(task["metadata"])
+        except Exception:
+            pass
+    return task
+
+
+async def get_agent_task(
+    db: aiosqlite.Connection, agent_id: str, task_id: str
+) -> dict[str, Any] | None:
+    """Fetch an agent task, scoped to agent_id for security."""
+    async with db.execute(
+        "SELECT * FROM agent_tasks WHERE id = ? AND agent_id = ?",
+        (task_id, agent_id),
+    ) as cur:
+        row = await cur.fetchone()
+    if row is None:
+        return None
+    task = _row_to_dict(row)
+    for field in ("input", "output", "metadata"):
+        if task.get(field):
+            try:
+                task[field] = json.loads(task[field])
+            except Exception:
+                pass
+    return task
+
+
+async def update_agent_task_status(
+    db: aiosqlite.Connection,
+    task_id: str,
+    status: str,
+    output: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    """Update the status (and optionally output) of an agent task."""
+    output_json = json.dumps(output) if output is not None else None
+    if output_json is not None:
+        await db.execute(
+            "UPDATE agent_tasks SET status=?, output=?, updated_at=datetime('now') WHERE id=?",
+            (status, output_json, task_id),
+        )
+    else:
+        await db.execute(
+            "UPDATE agent_tasks SET status=?, updated_at=datetime('now') WHERE id=?",
+            (status, task_id),
+        )
+    await db.commit()
+    return await _get_agent_task(db, task_id)

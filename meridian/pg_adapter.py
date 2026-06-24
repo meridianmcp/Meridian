@@ -1325,6 +1325,33 @@ async def _migrate_pg_project_execution_mode(conn: PostgresConnection) -> None:
     )
 
 
+async def _migrate_pg_agent_tasks_table(conn: PostgresConnection) -> None:
+    """99e71b9e — agent_tasks: Google A2A protocol task storage.
+
+    Creates the agent_tasks table used by the A2A endpoint
+    (POST /a2a/{agent_id}/tasks/send). CREATE TABLE IF NOT EXISTS so
+    re-running is a no-op. Mirrors db._migrate_agent_tasks_table.
+    """
+    await conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS agent_tasks (
+            id TEXT PRIMARY KEY,
+            agent_id TEXT NOT NULL,
+            session_id TEXT,
+            status TEXT NOT NULL DEFAULT 'submitted'
+                CHECK (status IN ('submitted','working','completed','failed','canceled')),
+            input TEXT NOT NULL,
+            output TEXT,
+            metadata TEXT,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+        CREATE INDEX IF NOT EXISTS idx_agent_tasks_agent
+            ON agent_tasks(agent_id, status);
+        """
+    )
+
+
 def _slugify_note_pg(title: str) -> str:
     """Kebab-case a note title (lowercase, alnum+dashes, collapse, trim).
 
@@ -1943,4 +1970,5 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_project_execution_mode,
     _migrate_pg_decision_code_anchor,
     _migrate_pg_session_graph_snapshots,
+    _migrate_pg_agent_tasks_table,
 )

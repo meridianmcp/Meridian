@@ -2023,7 +2023,7 @@ async def _handle_sprint_tools(
     tenant: dict[str, Any] | None,
     _mcp_tenant_id: Any,
 ) -> Any:
-    """Dispatch group: add_sprint_note, get_sprint_notes, add_sprint_item, update_sprint_item, set_sprint, get_sprint_progress, get_sprint_items, claim_sprint_item, add_subtask, split_sprint_item, merge_sprint_items, complete_sprint_item."""
+    """Dispatch group: add_sprint_note, get_sprint_notes, add_sprint_item, fan_out_sprint_items, update_sprint_item, set_sprint, get_sprint_progress, get_sprint_items, claim_sprint_item, add_subtask, split_sprint_item, merge_sprint_items, complete_sprint_item."""
     if name == "add_sprint_note":
         validate_input_size(args.get("title"), "note title", 500)
         validate_input_size(args.get("body"), "note body", 10_000_000)
@@ -2077,6 +2077,17 @@ async def _handle_sprint_tools(
         if _extra:
             _new_item = {**_new_item, **_extra}
         return _new_item
+    if name == "fan_out_sprint_items":
+        items = args.get("items")
+        if not isinstance(items, list) or not items:
+            return {"error": "items must be a non-empty list of {title, ...} dicts"}
+        for spec in items:
+            validate_input_size(spec.get("title"), "sprint item title", 500)
+            validate_input_size(spec.get("description"), "sprint item description", 10_000)
+        ids = await db_module.fan_out_sprint_items(
+            db, args["project_id"], items
+        )
+        return {"item_ids": ids, "count": len(ids)}
     if name == "update_sprint_item":
         validate_input_size(args.get("title"), "sprint item title", 500)
         validate_input_size(args.get("notes"), "sprint item notes", 50_000)

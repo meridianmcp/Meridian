@@ -39,6 +39,7 @@ _TOOL_EXAMPLES: dict[str, str] = {
     "get_workspace_settings": 'get_workspace_settings()',
     "update_workspace_settings": 'update_workspace_settings(hitl_auto_answer_default=True, sprint_name_default="june-sprint")',
     "add_sprint_item": 'add_sprint_item(project_id="abc-123", title="Add OAuth login", item_group="auth")',
+    "fan_out_sprint_items": 'fan_out_sprint_items(project_id="abc-123", items=[{"title": "Design DB schema", "group": "backend"}, {"title": "Build API endpoints", "group": "backend"}, {"title": "Wire up frontend", "group": "frontend"}])',
     "update_sprint_item": 'update_sprint_item(project_id="abc-123", item_id="item-uuid", title="Add OAuth + SAML login", group="auth", human_id="alice")',
     "reconcile_sprint_drift": 'reconcile_sprint_drift(project_id="abc-123")',
     "get_planning_brief": 'get_planning_brief(project_id="abc-123")',
@@ -509,6 +510,31 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "force": {"type": "boolean",
                    "description": "Override the duplicate guard and add the item even if its title closely matches an existing open item. Default false."}},
          "required": ["version", "title"]}},
+    {"name": "fan_out_sprint_items",
+     "description":
+        "Bulk-insert sprint items from a single orchestrator call — decompose a goal into "
+        "parallel work items without N sequential add_sprint_item calls. Pass a list of "
+        "{title, description?, group?, version?} dicts; returns the list of new item_ids "
+        "in insertion order. No duplicate guard is applied (the caller is assumed to have "
+        "deduped). Items with empty titles are silently skipped.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"},
+         "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "items": {
+             "type": "array",
+             "description": "List of sprint item specs. Each must have at least a 'title'.",
+             "items": {
+                 "type": "object",
+                 "properties": {
+                     "title": {"type": "string", "description": "Sprint item title (required)."},
+                     "description": {"type": "string", "description": "Optional notes / detail for the item."},
+                     "group": {"type": "string", "description": "Optional objective group name."},
+                     "version": {"type": "string", "description": "Optional sprint-version bucket; defaults to empty string."},
+                 },
+                 "required": ["title"],
+             },
+         }},
+         "required": ["items"]}},
     {"name": "update_sprint_item", "description":
         "Edit fields on an existing sprint item: title, version, notes, human_id (assignee), "
         "or group. Only the fields you pass are changed; omitted fields are left untouched. "
