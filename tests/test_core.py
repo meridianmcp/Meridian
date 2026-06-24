@@ -13828,3 +13828,130 @@ async def test_executor_goal_prompt_scopes_to_active_version(db):
         it for it in await db_module.get_sprint_items(db, pid, version="v1.1")
     ][0]
     assert other["id"] not in text
+
+
+# ---------------------------------------------------------------------------
+# 355f187f — list_plugins / get_plugin_details MCP tools
+# ---------------------------------------------------------------------------
+
+def test_list_plugins_and_get_plugin_details_in_tool_list():
+    """list_plugins and get_plugin_details appear in _MCP_TOOLS_LIST."""
+    from meridian.mcp_tools import _MCP_TOOLS_LIST, _READ_ONLY_TOOLS
+    names = {t["name"] for t in _MCP_TOOLS_LIST}
+    assert "list_plugins" in names, "list_plugins missing from tool list"
+    assert "get_plugin_details" in names, "get_plugin_details missing from tool list"
+    assert "list_plugins" in _READ_ONLY_TOOLS
+    assert "get_plugin_details" in _READ_ONLY_TOOLS
+
+
+@pytest.mark.asyncio
+async def test_list_plugins_returns_builtin_plugins(db, tmp_path):
+    """list_plugins returns entries for all builtin plugins with expected fields."""
+    from meridian.mcp.handler import _dispatch_mcp_tool
+    from meridian.tunnel_plugins import BUILTIN_PLUGINS
+
+    result = await _dispatch_mcp_tool("list_plugins", {}, db, str(tmp_path), tenant=None)
+    assert isinstance(result, dict)
+    assert "plugins" in result
+    plugins = result["plugins"]
+    # Must return at least the 3 core builtin plugins
+    builtin_names = {p["name"] for p in BUILTIN_PLUGINS}
+    returned_names = {p["name"] for p in plugins}
+    assert builtin_names <= returned_names, f"missing builtins: {builtin_names - returned_names}"
+    # Each entry has expected keys
+    for p in plugins:
+        assert "name" in p
+        assert "slot" in p
+        assert "enabled" in p
+        assert "description" in p
+        assert "tool_count" in p
+        assert isinstance(p["tool_count"], int)
+    # No tunnel active → tool_count=0 for all
+    assert all(p["tool_count"] == 0 for p in plugins)
+    assert result["tunnel_active"] is False
+
+
+@pytest.mark.asyncio
+async def test_get_plugin_details_known_plugin(db, tmp_path):
+    """get_plugin_details returns correct structure for a known plugin name."""
+    from meridian.mcp.handler import _dispatch_mcp_tool
+
+    result = await _dispatch_mcp_tool(
+        "get_plugin_details", {"name": "filesystem"}, db, str(tmp_path), tenant=None
+    )
+    assert isinstance(result, dict)
+    assert result["name"] == "filesystem"
+    assert result["slot"] == "fs"
+    assert "description" in result
+    assert "tools" in result
+    assert isinstance(result["tools"], list)
+    assert "tool_count" in result
+
+
+@pytest.mark.asyncio
+async def test_get_plugin_details_unknown_plugin(db, tmp_path):
+    """get_plugin_details returns an error for an unknown plugin name."""
+    from meridian.mcp.handler import _dispatch_mcp_tool
+
+    result = await _dispatch_mcp_tool(
+        "get_plugin_details", {"name": "nonexistent-plugin"}, db, str(tmp_path), tenant=None
+    )
+    assert "error" in result
+
+
+@pytest.mark.asyncio
+async def test_get_plugin_details_missing_name(db, tmp_path):
+    """get_plugin_details returns error when name is missing."""
+    from meridian.mcp.handler import _dispatch_mcp_tool
+
+    result = await _dispatch_mcp_tool(
+        "get_plugin_details", {}, db, str(tmp_path), tenant=None
+    )
+    assert "error" in result
+
+
+# ---------------------------------------------------------------------------
+# 8a9fd15c — Plugin skill documents (workspace notes with plugin-skill tag)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_list_plugins_surfaces_skill_note(db, tmp_path):
+    """list_plugins includes skill_note when a matching workspace note exists."""
+    from meridian.mcp.handler import _dispatch_mcp_tool
+
+    # Store a skill note for the filesystem plugin
+    await db_module.add_workspace_note(
+        db,
+        title="filesystem",
+        body="## Filesystem Guide\nUse read_file for text files.",
+        tags="plugin-skill,filesystem",
+        tenant_id=None,
+    )
+
+    result = await _dispatch_mcp_tool("list_plugins", {}, db, str(tmp_path), tenant=None)
+    plugins = result["plugins"]
+    fs_entry = next((p for p in plugins if p["name"] == "filesystem"), None)
+    assert fs_entry is not None, "filesystem entry missing"
+    assert "skill_note" in fs_entry, "skill_note not surfaced in list_plugins"
+    assert "body_preview" in fs_entry["skill_note"]
+    assert "Filesystem Guide" in fs_entry["skill_note"]["body_preview"]
+
+
+@pytest.mark.asyncio
+async def test_get_plugin_details_surfaces_skill_guide(db, tmp_path):
+    """get_plugin_details includes skill_guide body when a skill note is stored."""
+    from meridian.mcp.handler import _dispatch_mcp_tool
+
+    await db_module.add_workspace_note(
+        db,
+        title="code-intel",
+        body="## Code Intel Guide\nUse search_graph first for source files.",
+        tags="plugin-skill,code-intel",
+        tenant_id=None,
+    )
+
+    result = await _dispatch_mcp_tool(
+        "get_plugin_details", {"name": "code-intel"}, db, str(tmp_path), tenant=None
+    )
+    assert "skill_guide" in result, "skill_guide missing from get_plugin_details"
+    assert "Code Intel Guide" in result["skill_guide"]["body"]

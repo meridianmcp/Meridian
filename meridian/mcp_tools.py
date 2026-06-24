@@ -662,6 +662,23 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "min_sessions": {"type": "integer"},
          "days": {"type": "integer"}},
          "required": []}},
+    {"name": "list_plugins", "description":
+        "Read-only: Lightweight index of active tunnel plugins — name, description, "
+        "enabled state, and tool_count. Does NOT return full tool schemas (use "
+        "get_plugin_details for that). Dramatically reduces context bloat vs. "
+        "dumping all plugin schemas at startup (~500 tokens vs 50k+). "
+        "Returns an 'active_plugins' list plus any stored skill notes.",
+     "inputSchema": {"type": "object", "properties": {},
+         "required": []}},
+    {"name": "get_plugin_details", "description":
+        "Read-only: Full schema for one named plugin (all tool definitions, "
+        "description overrides, and stored skill guide if available). "
+        "Use list_plugins first to see which plugins are active, then call "
+        "get_plugin_details(name) to load the schema for a specific plugin "
+        "on demand.",
+     "inputSchema": {"type": "object", "properties": {
+         "name": {"type": "string", "description": "Plugin name as returned by list_plugins (e.g. 'filesystem', 'code-intel', 'code-extractor')."}},
+         "required": ["name"]}},
     {"name": "idle_until_session_done", "description":
         "Read-only: Poll every 30 seconds until another session is closed or archived. Use this when you need to wait before editing a locked file.",
      "inputSchema": {"type": "object", "properties": {
@@ -727,6 +744,7 @@ _READ_ONLY_TOOLS = {
     "get_workspace_notes", "get_workspace_decisions", "get_workspace_settings",
     "get_sprint_items", "get_sprint_progress", "get_agent_instructions",
     "reconcile_sprint_drift", "get_planning_brief", "get_file_claims",
+    "list_plugins", "get_plugin_details",
 }
 _DESTRUCTIVE_TOOLS = {"delete_note", "archive_decision", "dismiss_hitl"}
 
@@ -770,6 +788,8 @@ _TITLE_OVERRIDES: dict[str, str] = {
     "reconcile_sprint_drift": "Reconcile Sprint Drift",
     "get_planning_brief": "Get Planning Brief",
     "get_file_claims": "Get File Claims",
+    "list_plugins": "List Plugins",
+    "get_plugin_details": "Get Plugin Details",
 }
 
 for _tool in _MCP_TOOLS_LIST:
