@@ -42,6 +42,217 @@ _MAX_BACKOFF = 30.0
 # Crash isolation: how many times the watchdog relaunches a slot's proxy that
 # keeps exiting (e.g. ENOENT on a missing binary) before giving up on that slot.
 _WATCHDOG_MAX_RETRIES = 5
+# Lazy spawn: how long (seconds) a slot may stay idle before auto-kill.
+# 3649a61a — don't spawn at startup; kill after 30min of no requests.
+_IDLE_KILL_SECONDS = 30 * 60
+
+
+# ---------------------------------------------------------------------------
+# SlotProxy — lazy-spawn subprocess manager (3649a61a)
+# ---------------------------------------------------------------------------
+
+class SlotProxy:
+    """Manages one tunnel slot's mcp-proxy subprocess with lazy spawning.
+
+    The proxy is NOT started when the ``SlotProxy`` is created — it is spawned
+    on the first incoming request (``ensure_running``) and automatically killed
+    after ``_IDLE_KILL_SECONDS`` of no activity. A ``_proc_watchdog``-compatible
+    holder dict is exposed as ``.holder`` so the existing watchdog logic can
+    relaunch the process if it crashes while active.
+
+    Thread-safety: all methods are called from the same asyncio event loop.
+    The ``asyncio.Lock`` only guards the startup race (two concurrent requests
+    arriving before the process is up).
+
+    Args:
+        cmd:   Full command for subprocess.Popen.
+        port:  The port the proxy listens on (``http://127.0.0.1:<port>``).
+        label: Human-readable slot name for log messages.
+        env:   Optional env dict for Popen; ``None`` inherits the parent env.
+    """
+
+    def __init__(
+        self,
+        cmd: "list[str]",
+        port: int,
+        label: str,
+        env: "dict | None" = None,
+    ) -> None:
+        self.cmd = cmd
+        self.port = port
+        self.label = label
+        self.env = env
+        self._proc: "subprocess.Popen | None" = None
+        self._last_used: float = 0.0
+        self._lock = asyncio.Lock()
+        # Holder dict for _proc_watchdog compatibility.
+        self.holder: dict = {
+            "proc": None,
+            "cmd": cmd,
+            "env": env,
+            "label": label,
+        }
+
+    @property
+    def is_running(self) -> bool:
+        """True if the subprocess is alive."""
+        return self._proc is not None and self._proc.poll() is None
+
+    def touch(self) -> None:
+        """Record the current time as the last-used timestamp."""
+        self._last_used = time.monotonic()
+
+    def idle_seconds(self) -> float:
+        """Seconds since the last request (or since epoch if never used)."""
+        if self._last_used == 0.0:
+            return 0.0
+        return time.monotonic() - self._last_used
+
+    async def ensure_running(self) -> None:
+        """Spawn the proxy subprocess if it is not already running.
+
+        Uses an asyncio.Lock to avoid double-spawning under concurrent first
+        requests. Prints a startup message so the user can see when the lazy
+        spawn fires. Non-blocking if the process is already alive.
+        """
+        if self.is_running:
+            return
+        async with self._lock:
+            # Re-check inside the lock — another coroutine may have spawned it
+            # while we were waiting.
+            if self.is_running:
+                return
+            print(
+                f"tunnel:{self.label}: spawning proxy (first request / after idle kill) "
+                f"on port {self.port}",
+                flush=True,
+            )
+            try:
+                self._proc = subprocess.Popen(
+                    self.cmd, env=self.env, **_spawn_kwargs()
+                )
+                self.holder["proc"] = self._proc
+            except Exception as exc:  # noqa: BLE001
+                print(
+                    f"tunnel:{self.label}: failed to spawn proxy: {exc}",
+                    file=sys.stderr, flush=True,
+                )
+                self._proc = None
+                self.holder["proc"] = None
+                return
+            # Brief pause to let the proxy's port bind before the first request
+            # hits it.  28s request timeout means a slow startup is recoverable
+            # (the caller retries on the next WS message) but 1s is usually
+            # enough for mcp-proxy to be ready.
+            await asyncio.sleep(1.0)
+            self.touch()
+
+    def kill(self) -> None:
+        """Terminate the proxy process (best-effort, no-op if not running)."""
+        _terminate_proc_tree(self._proc)
+        self._proc = None
+        self.holder["proc"] = None
+
+    def sync_holder(self) -> None:
+        """Sync the holder's proc reference (watchdog may have replaced it)."""
+        if self.holder.get("proc") is not self._proc:
+            self._proc = self.holder.get("proc")
+
+
+async def _idle_killer(proxy: "SlotProxy", idle_seconds: float = _IDLE_KILL_SECONDS) -> None:
+    """Periodically check if a slot's proxy has been idle too long and kill it.
+
+    Runs forever (until cancelled). Checks every ``idle_seconds / 6`` (5 min
+    for the default 30min window) so we don't over-check. Only kills when
+    ``proxy.is_running`` AND the idle window has been exceeded. The proxy is
+    re-spawned automatically on the next incoming request via ``ensure_running``.
+    """
+    poll_interval = max(60.0, idle_seconds / 6)
+    while True:
+        await asyncio.sleep(poll_interval)
+        proxy.sync_holder()
+        if proxy.is_running and proxy.idle_seconds() > idle_seconds:
+            print(
+                f"tunnel:{proxy.label}: idle for >{idle_seconds / 60:.0f}min — "
+                "killing proxy to free resources (will restart on next request)",
+                flush=True,
+            )
+            proxy.kill()
+
+
+async def _run_connection_lazy(
+    ws_url: str,
+    proxy: "SlotProxy",
+    label: str = "fs",
+) -> None:
+    """Hold one WebSocket session open with lazy proxy spawning.
+
+    Like ``_run_connection`` but uses a ``SlotProxy`` rather than a pre-spawned
+    port number.  The proxy is started on the first incoming ``request`` message
+    and its idle timer is reset on every request.
+
+    Proxy startup failures surface as HTTP 503 (not 502) so the server-side
+    relay returns a clear error rather than timing out, and the client retries
+    at the next request naturally.
+    """
+    import httpx
+    import websockets
+
+    async with websockets.connect(ws_url, max_size=None, ping_interval=20) as ws:
+        print(f"tunnel:{label}: connected (lazy mode)", flush=True)
+        local_base = f"http://127.0.0.1:{proxy.port}"
+        async with httpx.AsyncClient() as http_client:
+            async for raw in ws:
+                try:
+                    msg = json.loads(raw)
+                except (ValueError, TypeError):
+                    continue
+                if not isinstance(msg, dict):
+                    continue
+                if msg.get("type") == "ping":
+                    continue
+                if msg.get("type") == "request":
+                    # Lazy spawn: bring the proxy up if it died or was idle-killed.
+                    if not proxy.is_running:
+                        await proxy.ensure_running()
+                    if not proxy.is_running:
+                        # Spawn failed — return 503 so the server doesn't timeout.
+                        req_id = msg.get("id")
+                        err = json.dumps({"error": "local proxy not available"}).encode()
+                        await ws.send(json.dumps({
+                            "type": "response",
+                            "id": req_id,
+                            "status": 503,
+                            "headers": {"content-type": "application/json"},
+                            "body": base64.b64encode(err).decode(),
+                        }))
+                        continue
+                    proxy.touch()
+                    resp = await _relay_request(http_client, local_base, msg)
+                    await ws.send(json.dumps(resp))
+
+
+async def _reconnect_loop_lazy(
+    ws_url: str,
+    proxy: "SlotProxy",
+    label: str,
+) -> None:
+    """Keep one lazy-spawn tunnel alive, reconnecting with exponential backoff."""
+    backoff = 1.0
+    while True:
+        try:
+            await _run_connection_lazy(ws_url, proxy, label)
+            backoff = 1.0
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            print(
+                f"tunnel:{label}: disconnected ({exc}); reconnecting in {backoff:.0f}s",
+                file=sys.stderr,
+                flush=True,
+            )
+        await asyncio.sleep(backoff)
+        backoff = min(backoff * 2, _MAX_BACKOFF)
 
 
 def _spawn_kwargs() -> dict:
@@ -1159,13 +1370,19 @@ async def run_tunnel(
     # the tenant's projects). Empty → fall back to the home dir (repo_path).
     fs_roots = await _fetch_filesystem_roots(base_url, token)
 
-    # 2. Spawn filesystem proxy (slot "fs"). Honour an enable toggle + command
-    #    override; the default (no override) keeps the exact filesystem builder.
+    # 2. Build commands for all enabled slots. Processes are NOT spawned here —
+    #    lazy spawning (3649a61a) defers each proxy until its first incoming
+    #    request, then auto-kills after _IDLE_KILL_SECONDS of idle time.
     npx = _find_npx()
-    # Each spawned slot records a {proc, cmd, env, label} holder so a watchdog
-    # can relaunch it if the local proxy dies (see _proc_watchdog).
-    proc_holders: list[dict] = []
-    proc_fs: subprocess.Popen | None = None
+    # SlotProxy objects (one per enabled slot) replace the old proc_holders list.
+    slot_proxies: list[SlotProxy] = []
+    # Track which built-in slots have a registered SlotProxy (for URL printing).
+    proxy_fs: SlotProxy | None = None
+    proxy_code: SlotProxy | None = None
+    proxy_extract: SlotProxy | None = None
+    office_proxies: dict[str, SlotProxy] = {}
+    office_ports = {"ppt": ppt_port, "word": word_port, "dc": dc_port}
+
     if fs_plugin.get("enabled", True):
         fs_override = fs_plugin.get("command")
         cmd_fs = (
@@ -1174,62 +1391,40 @@ async def run_tunnel(
         )
         _served = ", ".join(fs_roots) if fs_roots else repo_path
         print(f"meridian tunnel: serving {_served}", flush=True)
-        print(f"  filesystem proxy: http://127.0.0.1:{fs_port}", flush=True)
-        try:
-            proc_fs = subprocess.Popen(cmd_fs, **_spawn_kwargs())
-            proc_holders.append({"proc": proc_fs, "cmd": cmd_fs, "env": None, "label": "fs"})
-        except FileNotFoundError:
-            print(
-                f"error: could not launch npx ({npx!r}). Is Node.js installed and "
-                "on PATH?",
-                file=sys.stderr,
-            )
-            return 1
+        print(f"  filesystem:        lazy-spawn on port {fs_port}", flush=True)
+        proxy_fs = SlotProxy(cmd_fs, fs_port, "fs")
+        slot_proxies.append(proxy_fs)
     else:
         print("  filesystem:        disabled (tunnel_plugins config)", flush=True)
 
-    # 3. Spawn the code-intel proxy (slot "code"). A command override (e.g.
-    #    codegraph) replaces codebase-memory-mcp and skips the auto-install; the
-    #    default path auto-installs codebase-memory-mcp if it is not found.
-    proc_code: subprocess.Popen | None = None
+    # 3. Code-intel slot (slot "code"). Resolve the command (including auto-
+    #    install of codebase-memory-mcp) at startup so we fail fast if it's
+    #    unavailable, but defer the actual Popen until first request.
     if not code_plugin.get("enabled", True):
         print("  code-intel:        disabled (tunnel_plugins config)", flush=True)
     elif code_plugin.get("command"):
         cmd_code = _build_proxy_for_inner(npx, list(code_plugin["command"]), code_port)
-        print(f"  code-intel proxy:  http://127.0.0.1:{code_port} (custom command)", flush=True)
-        try:
-            proc_code = subprocess.Popen(cmd_code, **_spawn_kwargs())
-            proc_holders.append({"proc": proc_code, "cmd": cmd_code, "env": None, "label": "code"})
-        except Exception as exc:
-            print(f"  warning: could not start code-intel proxy: {exc}", file=sys.stderr)
-            proc_code = None
+        print(f"  code-intel:        lazy-spawn on port {code_port} (custom command)", flush=True)
+        proxy_code = SlotProxy(cmd_code, code_port, "code")
+        slot_proxies.append(proxy_code)
     else:
         code_binary = await _ensure_codebase_memory_mcp()
         if code_binary is not None:
-            # Ensure managed bin dir is on PATH so child processes can find the binary too.
             managed_bin = str(_managed_bin_dir())
             if managed_bin not in os.environ.get("PATH", ""):
                 os.environ["PATH"] = managed_bin + os.pathsep + os.environ.get("PATH", "")
             cmd_code = _build_code_proxy_command(npx, code_binary, code_port)
-            print(f"  code-intel proxy:  http://127.0.0.1:{code_port}", flush=True)
-            try:
-                proc_code = subprocess.Popen(cmd_code, **_spawn_kwargs())
-                proc_holders.append({"proc": proc_code, "cmd": cmd_code, "env": None, "label": "code"})
-            except Exception as exc:
-                print(f"  warning: could not start code-intel proxy: {exc}", file=sys.stderr)
-                proc_code = None
+            print(f"  code-intel:        lazy-spawn on port {code_port}", flush=True)
+            proxy_code = SlotProxy(cmd_code, code_port, "code")
+            slot_proxies.append(proxy_code)
         else:
             print(
                 "  code-intel:        not available (codebase-memory-mcp could not be installed)",
                 flush=True,
             )
 
-    # 4. Spawn the code-extractor proxy (slot "extract"). Default: Serena
-    #    (uvx serena ...), with {repo_path} expanded to the served repo so it
-    #    loads the right project. A tenant command override replaces it; an older
-    #    server that still resolves this slot to command=None falls back to
-    #    mcp-server-code-extractor via _resolve_extractor_inner_cmd().
-    proc_extract = None
+    # 4. Code-extractor slot. Same lazy pattern — command resolved now, process
+    #    deferred to first request.
     if not extract_plugin.get("enabled", True):
         print("  code-extractor:    disabled (tunnel_plugins config)", flush=True)
     else:
@@ -1238,45 +1433,29 @@ async def run_tunnel(
         if ext_override:
             cmd_extract = _build_proxy_for_inner(npx, list(ext_override), extract_port)
             _ext_label = "" if ext_raw == SERENA_EXTRACT_COMMAND else " (custom command)"
-            print(f"  code-extractor:    http://127.0.0.1:{extract_port}{_ext_label}", flush=True)
-            try:
-                proc_extract = subprocess.Popen(cmd_extract, **_spawn_kwargs())
-                proc_holders.append({"proc": proc_extract, "cmd": cmd_extract, "env": None, "label": "extract"})
-            except Exception as exc:
-                print(f"  warning: could not start code-extractor proxy: {exc}", file=sys.stderr)
-                proc_extract = None
+            print(f"  code-extractor:    lazy-spawn on port {extract_port}{_ext_label}", flush=True)
+            proxy_extract = SlotProxy(cmd_extract, extract_port, "extract")
+            slot_proxies.append(proxy_extract)
         else:
             extractor_inner = _resolve_extractor_inner_cmd()
             if extractor_inner is not None:
                 cmd_extract = _build_extractor_proxy_command(npx, extractor_inner, extract_port)
-                print(f"  code-extractor:    http://127.0.0.1:{extract_port}", flush=True)
-                try:
-                    proc_extract = subprocess.Popen(cmd_extract, **_spawn_kwargs())
-                    proc_holders.append({"proc": proc_extract, "cmd": cmd_extract, "env": None, "label": "extract"})
-                except Exception as exc:
-                    print(f"  warning: could not start code-extractor proxy: {exc}", file=sys.stderr)
-                    proc_extract = None
+                print(f"  code-extractor:    lazy-spawn on port {extract_port}", flush=True)
+                proxy_extract = SlotProxy(cmd_extract, extract_port, "extract")
+                slot_proxies.append(proxy_extract)
             else:
                 print(
                     "  code-extractor:    not available (uvx missing and pip install failed)",
                     flush=True,
                 )
 
-    # 4b. Spawn Office MCP proxies (ppt/word). Off by default — enabled via the
-    #     dashboard's Tunnel Plugins section. Each carries its own command and
-    #     optional env (e.g. word-mcp-live's MCP_AUTHOR) in the plugin registry.
-    office_procs: dict[str, subprocess.Popen] = {}
-    office_ports = {"ppt": ppt_port, "word": word_port, "dc": dc_port}
+    # 4b. Office MCP slots (ppt/word/dc). Off by default; enabled via dashboard.
     for slot, plugin, human in (("ppt", ppt_plugin, "PowerPoint"),
                                 ("word", word_plugin, "Word"),
                                 ("dc", dc_plugin, "Desktop Commander")):
         if not plugin.get("enabled", False):
             continue
         cmd = plugin.get("command")
-        # Desktop Commander: no command override → use the per-OS default launcher.
-        # On Windows that wraps npx in `cmd /c` so mcp-proxy spawns the real
-        # cmd.exe and resolves npx via PATHEXT (a bare "npx" inner command would
-        # ENOENT and the watchdog would spin-loop). See _dc_default_command.
         if cmd is None and slot == "dc":
             cmd = _dc_default_command()
         if not cmd:
@@ -1287,20 +1466,17 @@ async def run_tunnel(
         if plugin_env:
             spawn_env = {**os.environ, **{str(k): str(v) for k, v in plugin_env.items()}}
         cmd_office = _build_proxy_for_inner(npx, list(cmd), oport)
-        print(f"  {human.lower():<16}http://127.0.0.1:{oport}", flush=True)
-        try:
-            office_procs[slot] = subprocess.Popen(cmd_office, env=spawn_env, **_spawn_kwargs())
-            proc_holders.append({"proc": office_procs[slot], "cmd": cmd_office, "env": spawn_env, "label": slot})
-        except Exception as exc:
-            print(f"  warning: could not start {slot} proxy: {exc}", file=sys.stderr)
+        print(f"  {human.lower():<16}lazy-spawn on port {oport}", flush=True)
+        op = SlotProxy(cmd_office, oport, slot, env=spawn_env)
+        office_proxies[slot] = op
+        slot_proxies.append(op)
 
-    # 4c. Spawn user-defined custom plugins (LOCAL-ONLY). These have no server
-    #     route — they ride a local mcp-proxy port + the local .mcp.json only, so
-    #     a co-located Cursor/Claude Code session connects to them at
-    #     http://127.0.0.1:<port>. {repo_path} in the command is expanded to the
-    #     served repo at spawn time, exactly like the built-in extractor slot.
+    # 4c. Custom plugins (LOCAL-ONLY) — still eagerly spawned because they serve
+    #     the local .mcp.json directly without a server relay route.
     custom_plugins = resolve_custom_plugins(me.get("tunnel_plugins_config"))
     running_custom: list[dict] = []
+    # proc_holders is kept for custom plugins (eager, no lazy-spawn).
+    proc_holders: list[dict] = []
     for cp in custom_plugins:
         if not cp.get("enabled", True):
             continue
@@ -1321,24 +1497,23 @@ async def run_tunnel(
     # 5. Print permanent URLs.
     print("", flush=True)
     print("  Tunnel URLs (for Cursor / non-claude.ai clients only):", flush=True)
-    if proc_fs is not None:
+    if proxy_fs is not None:
         print(f"    Filesystem:      {_permanent_url(base_url, tenant_id)}", flush=True)
-    if proc_code is not None:
+    if proxy_code is not None:
         print(f"    Code Intel:      {_permanent_code_url(base_url, tenant_id)}", flush=True)
-    if proc_extract is not None:
+    if proxy_extract is not None:
         print(f"    Code Extractor:  {_permanent_extract_url(base_url, tenant_id)}", flush=True)
-    if "ppt" in office_procs:
+    if "ppt" in office_proxies:
         print(f"    PowerPoint:      {_permanent_office_url(base_url, tenant_id, 'ppt')}", flush=True)
-    if "word" in office_procs:
+    if "word" in office_proxies:
         print(f"    Word:            {_permanent_office_url(base_url, tenant_id, 'word')}", flush=True)
     print(f"  claude.ai: all tools appear under your Meridian connector automatically.", flush=True)
-    if proc_fs is not None:
+    if proxy_fs is not None:
         print(f"  (SSE clients: {_sse_url(base_url, tenant_id)})", flush=True)
+    print(f"  Proxies start on first use; idle for >{_IDLE_KILL_SECONDS // 60}min → auto-kill + restart.", flush=True)
     print("", flush=True)
 
-    # 5b. Auto-update local MCP client config so a co-located Claude Code / Cursor
-    #     session picks up the fs/code/extractor connectors with zero manual edits.
-    #     Restored to its original state on shutdown (step 8 finally block).
+    # 5b. Auto-update local MCP client config.
     mcp_snapshots: list[tuple[Path, str | None]] = []
     try:
         mcp_snapshots = _install_mcp_json(Path.cwd(), base_url, tenant_id, running_custom)
@@ -1361,47 +1536,48 @@ async def run_tunnel(
         )
         print("", flush=True)
 
-    # 6. Auto-index code dirs via code-intel proxy (fire-and-forget background tasks).
+    # 6. Auto-index code dirs via code-intel proxy (fire-and-forget background
+    #    tasks). With lazy spawn we need to ensure the proxy is up first.
     index_tasks: list[asyncio.Task] = []
-    if proc_code is not None and code_dirs:
+    if proxy_code is not None and code_dirs:
+        async def _lazy_index(proxy: SlotProxy, code_dir: str) -> None:
+            await proxy.ensure_running()
+            if proxy.is_running:
+                await _index_code_dir(proxy.port, code_dir)
         for d in code_dirs:
             index_tasks.append(
-                asyncio.ensure_future(_index_code_dir(code_port, str(Path(d).resolve())))
+                asyncio.ensure_future(_lazy_index(proxy_code, str(Path(d).resolve())))
             )
 
-    # 7. Run reconnect loops — one per enabled slot whose proxy started.
+    # 7. Run lazy reconnect loops — one per enabled slot. Each loop also gets an
+    #    idle-killer coroutine that auto-kills the proxy after _IDLE_KILL_SECONDS.
     ws_fs = _ws_url(base_url, tenant_id, token)
     ws_code = _ws_code_url(base_url, tenant_id, token)
     ws_extract = _ws_extract_url(base_url, tenant_id, token)
     tasks: list[asyncio.Task] = []
-    if proc_fs is not None:
-        tasks.append(asyncio.ensure_future(_reconnect_loop(ws_fs, fs_port, "fs")))
-    if proc_code is not None:
-        tasks.append(asyncio.ensure_future(_reconnect_loop(ws_code, code_port, "code")))
-    if proc_extract is not None:
-        tasks.append(asyncio.ensure_future(_reconnect_loop(ws_extract, extract_port, "extract")))
-    for slot, oproc in office_procs.items():
+    if proxy_fs is not None:
+        tasks.append(asyncio.ensure_future(_reconnect_loop_lazy(ws_fs, proxy_fs, "fs")))
+        tasks.append(asyncio.ensure_future(_idle_killer(proxy_fs)))
+    if proxy_code is not None:
+        tasks.append(asyncio.ensure_future(_reconnect_loop_lazy(ws_code, proxy_code, "code")))
+        tasks.append(asyncio.ensure_future(_idle_killer(proxy_code)))
+    if proxy_extract is not None:
+        tasks.append(asyncio.ensure_future(_reconnect_loop_lazy(ws_extract, proxy_extract, "extract")))
+        tasks.append(asyncio.ensure_future(_idle_killer(proxy_extract)))
+    for slot, oproxy in office_proxies.items():
         ws_office = _ws_office_url(base_url, tenant_id, token, slot)
         tasks.append(asyncio.ensure_future(
-            _reconnect_loop(ws_office, office_ports[slot], slot)
+            _reconnect_loop_lazy(ws_office, oproxy, slot)
         ))
-    # Custom plugins are LOCAL-ONLY (no hosted relay, so no reconnect loop) but a
-    # running one still serves its local proxy + mcp.json connector — so it counts
-    # as "something to serve" even when every built-in slot is disabled.
+        tasks.append(asyncio.ensure_future(_idle_killer(oproxy)))
+    # Custom plugins (eager) still use the regular reconnect + watchdog.
+    for holder in proc_holders:
+        tasks.append(asyncio.ensure_future(_proc_watchdog(holder)))
     if not tasks and not running_custom:
         print("error: no tunnel plugins enabled — nothing to serve.", file=sys.stderr)
         return 1
-    # Watchdog per spawned slot — relaunch the local proxy if it crashes so the
-    # tools don't silently vanish while the WebSocket stays connected.
-    for holder in proc_holders:
-        tasks.append(asyncio.ensure_future(_proc_watchdog(holder)))
 
-    # Install signal handlers so Ctrl+C (and Ctrl+Break on Windows) cancels the
-    # slot loops and runs the cleanup below. On Windows the SelectorEventLoop has
-    # no add_signal_handler, and a bare KeyboardInterrupt out of run_until_complete
-    # would leave this coroutine suspended — skipping the proxy teardown and
-    # leaking node processes. Cancelling the tasks from the handler unwinds us
-    # through the finally cleanly instead.
+    # Install signal handlers for clean Ctrl+C shutdown.
     loop = asyncio.get_event_loop()
 
     def _request_stop(_signum=None, _frame=None):
@@ -1425,21 +1601,22 @@ async def run_tunnel(
         print("\ntunnel: shutting down", flush=True)
         return 0
     finally:
-        # Restore the original signal handlers.
+        # Restore original signal handlers.
         for _sig, _prev in installed_signals:
             try:
                 signal.signal(_sig, _prev)
             except (ValueError, OSError):  # noqa: PERF203
                 pass
-        # Restore local MCP config first so a Ctrl+C never leaves stale tunnel URLs.
+        # Restore local MCP config before killing processes.
         if mcp_snapshots:
             _restore_mcp_json(mcp_snapshots)
             print("  Restored local MCP config (removed tunnel connectors).", flush=True)
         for t in tasks + index_tasks:
             t.cancel()
-        # Terminate the current proc + its child tree for each slot (holder["proc"]
-        # may have been replaced by the watchdog after a relaunch). taskkill /T on
-        # Windows so the node/cmd grandchildren die too — not just the launcher.
+        # Kill all lazy slot proxies (only those actually running at shutdown).
+        for sp in slot_proxies:
+            sp.kill()
+        # Kill custom (eager) plugin processes.
         for holder in proc_holders:
             _terminate_proc_tree(holder.get("proc"))
     return 0

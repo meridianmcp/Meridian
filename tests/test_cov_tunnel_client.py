@@ -291,6 +291,236 @@ def test_reconnect_loop_backs_off_then_cancels(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# SlotProxy + lazy-spawn coroutines (3649a61a) — lazy plugin spawning
+# ---------------------------------------------------------------------------
+
+class _FakeProc:
+    """Minimal subprocess.Popen stand-in: alive until .terminate()/.kill()."""
+    def __init__(self, cmd=None, *a, **k):
+        self.cmd = cmd
+        self.pid = 4242
+        self._alive = True
+        self.returncode = None
+    def poll(self):
+        return None if self._alive else 0
+    def terminate(self):
+        self._alive = False
+        self.returncode = 0
+    def wait(self, timeout=None):
+        return 0
+    def kill(self):
+        self._alive = False
+        self.returncode = -9
+
+
+def test_slotproxy_ensure_running_spawns_once_then_kill(monkeypatch):
+    """ensure_running spawns lazily (not at construction); kill() tears it down."""
+    spawned = []
+    monkeypatch.setattr(tc.subprocess, "Popen",
+                        lambda cmd, *a, **k: spawned.append(cmd) or _FakeProc(cmd))
+    # Skip the 1s port-bind sleep.
+    monkeypatch.setattr(tc.asyncio, "sleep", AsyncMock(return_value=None))
+    # taskkill (win32 path of _terminate_proc_tree) must not hit the real shell.
+    monkeypatch.setattr(tc.subprocess, "run", lambda *a, **k: None)
+
+    sp = tc.SlotProxy(["proxy", "cmd"], 8808, "fs")
+    assert not sp.is_running          # NOT spawned at construction (lazy)
+    assert len(spawned) == 0
+
+    asyncio.run(sp.ensure_running())
+    assert sp.is_running
+    assert len(spawned) == 1
+    # Second call is a no-op while already running.
+    asyncio.run(sp.ensure_running())
+    assert len(spawned) == 1
+
+    sp.kill()
+    assert not sp.is_running
+    assert sp.holder["proc"] is None
+
+
+def test_slotproxy_ensure_running_swallows_spawn_failure(monkeypatch):
+    """A Popen that raises leaves the proxy not-running (no exception escapes)."""
+    def boom(cmd, *a, **k):
+        raise FileNotFoundError("no such binary")
+    monkeypatch.setattr(tc.subprocess, "Popen", boom)
+    sp = tc.SlotProxy(["bad", "cmd"], 8810, "extract")
+    asyncio.run(sp.ensure_running())  # must not raise
+    assert not sp.is_running
+    assert sp.holder["proc"] is None
+
+
+def test_slotproxy_idle_seconds_and_touch(monkeypatch):
+    sp = tc.SlotProxy(["x"], 8808, "fs")
+    assert sp.idle_seconds() == 0.0   # never used
+    t = {"now": 1000.0}
+    monkeypatch.setattr(tc.time, "monotonic", lambda: t["now"])
+    sp.touch()
+    t["now"] = 1042.0
+    assert sp.idle_seconds() == 42.0
+
+
+def test_idle_killer_kills_idle_proxy_then_cancels(monkeypatch):
+    """_idle_killer kills a running proxy once it exceeds the idle window."""
+    monkeypatch.setattr(tc.subprocess, "Popen", lambda *a, **k: _FakeProc())
+    monkeypatch.setattr(tc.subprocess, "run", lambda *a, **k: None)
+    sp = tc.SlotProxy(["x"], 8808, "fs")
+    sp._proc = tc.subprocess.Popen(["x"])
+    sp.holder["proc"] = sp._proc
+    assert sp.is_running
+
+    killed = {"n": 0}
+    real_kill = sp.kill
+    def counting_kill():
+        killed["n"] += 1
+        real_kill()
+    sp.kill = counting_kill
+    # Force the idle window to be exceeded.
+    monkeypatch.setattr(sp, "idle_seconds", lambda: 9999.0)
+
+    # Make the killer's poll-sleep a real (instant) yield so the loop ticks but
+    # control still returns to the event loop; cancel after the first kill.
+    # Capture the real sleep first — patching tc.asyncio.sleep replaces it on the
+    # shared asyncio module, so we must not call the patched name from inside.
+    _real_sleep = asyncio.sleep
+    async def quick_sleep(_n):
+        await _real_sleep(0)
+    monkeypatch.setattr(tc.asyncio, "sleep", quick_sleep)
+
+    async def drive():
+        task = asyncio.ensure_future(tc._idle_killer(sp, idle_seconds=1.0))
+        for _ in range(20):
+            await _real_sleep(0)
+            if killed["n"]:
+                break
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    asyncio.run(drive())
+    assert killed["n"] >= 1
+
+
+def test_run_connection_lazy_spawns_on_request_and_relays(monkeypatch):
+    """_run_connection_lazy brings the proxy up on the first request, touches it,
+    relays, and skips ping/non-dict/non-json noise."""
+    sent = []
+    relayed = []
+
+    class FakeWS:
+        def __init__(self):
+            self._msgs = [
+                "not-json",                               # ValueError → skip
+                json.dumps([1, 2]),                       # not a dict → skip
+                json.dumps({"type": "ping"}),             # ping → skip
+                json.dumps({"type": "request", "id": "1"}),  # spawns + relays
+            ]
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): pass
+        def __aiter__(self): return self
+        async def __anext__(self):
+            if not self._msgs:
+                raise StopAsyncIteration
+            return self._msgs.pop(0)
+        async def send(self, data): sent.append(data)
+
+    class FakeHttpClient:
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): pass
+
+    async def fake_relay(client, base, msg):
+        relayed.append((base, msg))
+        return {"type": "response", "id": msg["id"], "status": 200}
+
+    import httpx as _httpx
+    import websockets as _ws
+    monkeypatch.setattr(_ws, "connect", lambda url, **kw: FakeWS())
+    monkeypatch.setattr(_httpx, "AsyncClient", lambda *a, **k: FakeHttpClient())
+    monkeypatch.setattr(tc, "_relay_request", fake_relay)
+
+    proxy = tc.SlotProxy(["x"], 8808, "fs")
+    ensured = {"n": 0}
+
+    async def fake_ensure(self):
+        ensured["n"] += 1
+        self._proc = _FakeProc()
+        self.holder["proc"] = self._proc
+    monkeypatch.setattr(tc.SlotProxy, "ensure_running", fake_ensure)
+
+    asyncio.run(tc._run_connection_lazy("wss://x/tunnel/t", proxy, "fs"))
+    assert ensured["n"] == 1                       # spawned on first request
+    assert len(relayed) == 1
+    assert relayed[0][0] == "http://127.0.0.1:8808"
+    assert len(sent) == 1
+    assert json.loads(sent[0])["status"] == 200
+
+
+def test_run_connection_lazy_returns_503_when_spawn_fails(monkeypatch):
+    """If ensure_running can't bring the proxy up, the request gets a 503 (not a
+    server-side timeout)."""
+    sent = []
+
+    class FakeWS:
+        def __init__(self):
+            self._msgs = [json.dumps({"type": "request", "id": "7"})]
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): pass
+        def __aiter__(self): return self
+        async def __anext__(self):
+            if not self._msgs:
+                raise StopAsyncIteration
+            return self._msgs.pop(0)
+        async def send(self, data): sent.append(data)
+
+    class FakeHttpClient:
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): pass
+
+    import httpx as _httpx
+    import websockets as _ws
+    monkeypatch.setattr(_ws, "connect", lambda url, **kw: FakeWS())
+    monkeypatch.setattr(_httpx, "AsyncClient", lambda *a, **k: FakeHttpClient())
+
+    proxy = tc.SlotProxy(["x"], 8808, "fs")
+
+    async def fake_ensure(self):  # spawn fails → still not running
+        return None
+    monkeypatch.setattr(tc.SlotProxy, "ensure_running", fake_ensure)
+
+    asyncio.run(tc._run_connection_lazy("wss://x/tunnel/t", proxy, "fs"))
+    assert len(sent) == 1
+    assert json.loads(sent[0])["status"] == 503
+
+
+def test_reconnect_loop_lazy_backs_off_then_cancels(monkeypatch):
+    """A failing lazy connection is retried after backoff; CancelledError from the
+    connection propagates out (clean shutdown)."""
+    attempts = {"n": 0}
+
+    async def fake_run_connection_lazy(ws_url, proxy, label):
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            raise RuntimeError("dropped")
+        raise asyncio.CancelledError
+
+    sleeps = []
+
+    async def fake_sleep(n):
+        sleeps.append(n)
+
+    monkeypatch.setattr(tc, "_run_connection_lazy", fake_run_connection_lazy)
+    monkeypatch.setattr(tc.asyncio, "sleep", fake_sleep)
+
+    proxy = tc.SlotProxy(["x"], 8808, "fs")
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(tc._reconnect_loop_lazy("wss://x", proxy, "fs"))
+    assert attempts["n"] == 2
+    assert sleeps
+
+
+# ---------------------------------------------------------------------------
 # _inject_mcp_entries — non-dict top-level + non-dict mcpServers (778)
 # ---------------------------------------------------------------------------
 
@@ -528,20 +758,41 @@ def _stub_run_tunnel_spawn(monkeypatch, *, code_binary="/bin/codebase-memory-mcp
         def __init__(self, cmd):
             self.cmd = cmd
             procs.append(self)
+        def poll(self): return None  # alive (so SlotProxy.is_running is True)
         def terminate(self): pass
         def wait(self, timeout=None): return 0
         def kill(self): pass
 
     monkeypatch.setattr(tc.subprocess, "Popen", lambda cmd, *a, **k: FakeProc(cmd))
 
-    # Reconnect loops + watchdogs should return immediately (no real WS / polling).
-    async def fake_reconnect(ws_url, port, label):
+    # Lazy spawn (3649a61a): built-in slots are SlotProxy objects whose proxy is
+    # NOT Popen'd at startup — it spawns on the first request via ensure_running().
+    # Patch ensure_running to spawn synchronously (no 1s port-bind sleep, no real
+    # subprocess) so the `len(procs)` assertions still observe one Popen per slot.
+    async def fake_ensure_running(self):
+        if self.is_running:
+            return
+        self._proc = tc.subprocess.Popen(self.cmd, env=self.env)
+        self.holder["proc"] = self._proc
+        self.touch()
+
+    monkeypatch.setattr(tc.SlotProxy, "ensure_running", fake_ensure_running)
+
+    # Lazy reconnect loops spawn the proxy on connect (mirroring the first-request
+    # behaviour) then return — no real WS. The idle-killer is a no-op. The legacy
+    # watchdog (still used for eager custom plugins) also returns immediately.
+    async def fake_reconnect_lazy(ws_url, proxy, label):
+        await proxy.ensure_running()
+        return None
+
+    async def fake_idle_killer(proxy, idle_seconds=tc._IDLE_KILL_SECONDS):
         return None
 
     async def fake_watchdog(holder, poll_interval=3.0):
         return None
 
-    monkeypatch.setattr(tc, "_reconnect_loop", fake_reconnect)
+    monkeypatch.setattr(tc, "_reconnect_loop_lazy", fake_reconnect_lazy)
+    monkeypatch.setattr(tc, "_idle_killer", fake_idle_killer)
     monkeypatch.setattr(tc, "_proc_watchdog", fake_watchdog)
     return procs
 
@@ -637,8 +888,40 @@ def test_run_tunnel_command_overrides_and_index(monkeypatch, tmp_path):
     assert indexed and indexed[0][0] == 9002
 
 
-def test_run_tunnel_fs_npx_not_found_returns_1(monkeypatch, tmp_path):
-    _stub_run_tunnel_spawn(monkeypatch)
+def test_run_tunnel_fs_lazy_spawn_enoent_keeps_tunnel_up(monkeypatch, tmp_path):
+    """Lazy spawn (3649a61a) changes fs-failure semantics: under eager spawn an
+    fs npx ENOENT aborted startup (exit 1); now the Popen is deferred to the first
+    request inside SlotProxy.ensure_running, whose try/except swallows ENOENT. The
+    proxy simply never comes up and the tunnel stays alive (exit 0), retrying on a
+    later request rather than crashing at boot."""
+    # Set up the I/O stubs manually (NOT via _stub_run_tunnel_spawn, which would
+    # replace the real ensure_running we want to exercise here).
+    monkeypatch.setattr(tc, "_force_utf8_io", lambda: None)
+    monkeypatch.setattr(tc, "_resolve_token", lambda t: "sk_tok")
+    monkeypatch.setattr(tc, "_find_npx", lambda: "npx")
+    monkeypatch.setattr(tc, "_ensure_codebase_memory_mcp",
+                        AsyncMock(return_value="/bin/codebase-memory-mcp"))
+    monkeypatch.setattr(tc, "_resolve_extractor_inner_cmd",
+                        lambda: ["uvx", "mcp-server-code-extractor"])
+    # Skip ensure_running's 1s port-bind sleep on a successful spawn.
+    monkeypatch.setattr(tc.asyncio, "sleep", AsyncMock(return_value=None))
+
+    # Lazy reconnect drives the REAL ensure_running once then returns; idle-killer
+    # + legacy watchdog are no-ops.
+    async def fake_reconnect_lazy(ws_url, proxy, label):
+        await proxy.ensure_running()
+        return None
+
+    async def fake_idle_killer(proxy, idle_seconds=tc._IDLE_KILL_SECONDS):
+        return None
+
+    async def fake_watchdog(holder, poll_interval=3.0):
+        return None
+
+    monkeypatch.setattr(tc, "_reconnect_loop_lazy", fake_reconnect_lazy)
+    monkeypatch.setattr(tc, "_idle_killer", fake_idle_killer)
+    monkeypatch.setattr(tc, "_proc_watchdog", fake_watchdog)
+
     monkeypatch.setattr(
         tc, "_fetch_me",
         AsyncMock(return_value={"tenant_id": "t", "plan": "pro"}),
@@ -650,8 +933,8 @@ def test_run_tunnel_fs_npx_not_found_returns_1(monkeypatch, tmp_path):
 
     monkeypatch.setattr(tc.subprocess, "Popen", popen_enoent)
     rc = _run_tunnel(token="sk_tok", base_url="https://x", repo_path=str(tmp_path))
-    # fs proxy spawn FileNotFoundError → early return 1 (lines 940-946).
-    assert rc == 1
+    # fs lazy-spawn ENOENT is swallowed by ensure_running → tunnel stays up.
+    assert rc == 0
 
 
 def test_run_tunnel_code_unavailable_and_extract_disabled(monkeypatch, tmp_path):
@@ -719,8 +1002,12 @@ def test_run_tunnel_browser_auth_success_caches_token(monkeypatch, tmp_path):
 
 
 def test_run_tunnel_code_and_extract_popen_raise_are_warned(monkeypatch, tmp_path):
-    """code-intel + extractor Popen raising → warning branch, proc set to None,
-    but fs proxy keeps the tunnel alive (exit 0)."""
+    """code-intel + extractor lazy-spawn Popen raising → SlotProxy.ensure_running
+    warning branch (proc stays None), but fs proxy keeps the tunnel alive (exit 0).
+
+    Under lazy spawning (3649a61a) the Popen happens inside ensure_running, not at
+    startup — so this drives the real ensure_running and asserts its try/except
+    swallows the spawn failure for the code/extract slots."""
     monkeypatch.setattr(tc, "_force_utf8_io", lambda: None)
     monkeypatch.setattr(tc, "_resolve_token", lambda t: "sk_tok")
     monkeypatch.setattr(tc, "_find_npx", lambda: "npx")
@@ -733,17 +1020,27 @@ def test_run_tunnel_code_and_extract_popen_raise_are_warned(monkeypatch, tmp_pat
         AsyncMock(return_value={"tenant_id": "t", "plan": "pro"}),
     )
     monkeypatch.setattr(tc.Path, "cwd", staticmethod(lambda: tmp_path))
+    # Skip the 1s port-bind sleep ensure_running does after a successful spawn.
+    monkeypatch.setattr(tc.asyncio, "sleep", AsyncMock(return_value=None))
 
-    async def fake_reconnect(ws_url, port, label):
+    # Lazy reconnect loops drive the real ensure_running (to hit its spawn-failure
+    # branch) then return; idle-killer + legacy watchdog are no-ops.
+    async def fake_reconnect_lazy(ws_url, proxy, label):
+        await proxy.ensure_running()
+        return None
+
+    async def fake_idle_killer(proxy, idle_seconds=tc._IDLE_KILL_SECONDS):
         return None
 
     async def fake_watchdog(holder, poll_interval=3.0):
         return None
 
-    monkeypatch.setattr(tc, "_reconnect_loop", fake_reconnect)
+    monkeypatch.setattr(tc, "_reconnect_loop_lazy", fake_reconnect_lazy)
+    monkeypatch.setattr(tc, "_idle_killer", fake_idle_killer)
     monkeypatch.setattr(tc, "_proc_watchdog", fake_watchdog)
 
     class FakeProc:
+        def poll(self): return None  # alive
         def terminate(self): pass
         def wait(self, timeout=None): return 0
         def kill(self): pass
