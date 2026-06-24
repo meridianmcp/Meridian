@@ -884,8 +884,10 @@ def test_spawn_kwargs_new_process_group_on_windows(monkeypatch):
     monkeypatch.setattr(tc.sys, "platform", "win32")
     kw = tc._spawn_kwargs()
     # Children get their own group so a console Ctrl+C never reaches them (which
-    # is what triggers the "Terminate batch job (Y/N)?" hang).
-    assert kw == {"creationflags": tc.subprocess.CREATE_NEW_PROCESS_GROUP}
+    # is what triggers the "Terminate batch job (Y/N)?" hang). CREATE_NEW_PROCESS_GROUP
+    # is a Windows-only subprocess constant (0x00000200) — reference it by value so
+    # this assertion also runs on the Linux CI host, where the attribute is absent.
+    assert kw == {"creationflags": 0x00000200}
 
 
 def test_spawn_kwargs_empty_on_posix(monkeypatch):
