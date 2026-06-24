@@ -2865,6 +2865,171 @@ async def test_dispatch_unknown_project_name_raises(db):
 
 
 # ---------------------------------------------------------------------------
+# 8a449ec0 — project_name advertised in every project-scoped tool schema
+# ---------------------------------------------------------------------------
+
+def test_every_project_id_tool_schema_advertises_project_name():
+    """Generic contract: every _MCP_TOOLS_LIST tool whose inputSchema declares
+    project_id ALSO declares a sibling project_name property, and does NOT list
+    project_id in its required array (project_name is an accepted alternative;
+    the resolver + handlers enforce a real project at runtime). All OTHER
+    required fields are preserved."""
+    from meridian.mcp_tools import _MCP_TOOLS_LIST
+
+    checked = 0
+    for tool in _MCP_TOOLS_LIST:
+        schema = tool.get("inputSchema") or {}
+        props = schema.get("properties") or {}
+        if "project_id" not in props:
+            continue
+        checked += 1
+        name = tool["name"]
+        # 1. project_name sibling exists and is a string property.
+        assert "project_name" in props, f"{name} missing project_name property"
+        assert props["project_name"].get("type") == "string", name
+        assert "alternative to project_id" in (
+            props["project_name"].get("description") or ""
+        ), name
+        # 2. project_id is no longer strictly required.
+        required = schema.get("required") or []
+        assert "project_id" not in required, (
+            f"{name} still lists project_id as required"
+        )
+        # 3. project_name is an alternative, never itself required.
+        assert "project_name" not in required, name
+
+    # Sanity: the loop actually inspected the full project-scoped surface.
+    assert checked >= 38, f"expected >=38 project-scoped tools, saw {checked}"
+
+
+def test_project_name_change_preserves_other_required_fields():
+    """Removing project_id from required must not drop other required fields."""
+    from meridian.mcp_tools import _MCP_TOOLS_LIST
+
+    by_name = {t["name"]: t for t in _MCP_TOOLS_LIST}
+    expected = {
+        "log_task": {"session_id", "description"},
+        "set_goal": {"content"},
+        "set_north_star": {"north_star"},
+        "add_sprint_item": {"version", "title"},
+        "update_sprint_item": {"item_id"},
+        "update_md_section": {"file", "anchor", "content"},
+        "split_sprint_item": {"item_id", "titles"},
+        "merge_sprint_items": {"item_ids", "new_title"},
+        "register_session": {"session_name"},
+    }
+    for name, want in expected.items():
+        got = set(by_name[name]["inputSchema"].get("required") or [])
+        assert got == want, f"{name}: required={got}, expected {want}"
+
+
+def test_stdio_tool_schemas_advertise_project_name():
+    """stdio parity: every stdio Tool(...) decl that mirrors an _MCP_TOOLS_LIST
+    tool and declares project_id also advertises project_name and drops
+    project_id from required. Parsed straight from source via ast so the test
+    sees exactly what the stdio client is told."""
+    import ast
+
+    from meridian.mcp_tools import _MCP_TOOLS_LIST
+
+    allowed = {t["name"] for t in _MCP_TOOLS_LIST}
+    src = (
+        Path(__file__).resolve().parents[1]
+        / "meridian" / "mcp" / "stdio_handler.py"
+    ).read_text(encoding="utf-8")
+    tree = ast.parse(src)
+
+    seen = 0
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Call) and getattr(node.func, "id", None) == "Tool"):
+            continue
+        kw = {k.arg: k.value for k in node.keywords}
+        name_node = kw.get("name")
+        if not isinstance(name_node, ast.Constant) or "inputSchema" not in kw:
+            continue
+        name = name_node.value
+        if name not in allowed:
+            continue
+        schema = ast.literal_eval(kw["inputSchema"])
+        props = schema.get("properties") or {}
+        if "project_id" not in props:
+            continue
+        seen += 1
+        assert "project_name" in props, f"stdio {name} missing project_name"
+        assert "project_id" not in (schema.get("required") or []), (
+            f"stdio {name} still requires project_id"
+        )
+    assert seen >= 27, f"expected >=27 stdio project-scoped decls, saw {seen}"
+
+
+@pytest.mark.asyncio
+async def test_dispatch_project_scoped_tool_with_only_project_name(db):
+    """A project-scoped write tool invoked through _dispatch_mcp_tool with ONLY
+    project_name (no project_id) resolves the name and operates on the project."""
+    from meridian import server as srv
+
+    p = await db_module.create_project(db, "only-by-name-proj")
+    # add_sprint_item: required = {version, title}; project supplied by name.
+    added = await srv._dispatch_mcp_tool(
+        "add_sprint_item",
+        {"project_name": "only-by-name-proj", "version": "v1", "title": "By name"},
+        db, "/tmp",
+    )
+    assert added["title"] == "By name"
+    assert added["project_id"] == p["id"]
+
+    # get_sprint_items by name returns the same item.
+    items = await srv._dispatch_mcp_tool(
+        "get_sprint_items", {"project_name": "only-by-name-proj"}, db, "/tmp"
+    )
+    assert any(it["id"] == added["id"] for it in items)
+
+
+@pytest.mark.asyncio
+async def test_dispatch_project_id_wins_over_project_name(db):
+    """When both are given, project_id takes precedence (the resolver only
+    overrides when project_name is set OR project_id is a non-UUID name)."""
+    from meridian import server as srv
+
+    real = await db_module.create_project(db, "wins-real")
+    await db_module.create_project(db, "wins-decoy")
+    items = await srv._dispatch_mcp_tool(
+        "get_sprint_items",
+        {"project_id": real["id"], "project_name": "wins-decoy"},
+        db, "/tmp",
+    )
+    # Resolves against the UUID project_id, not the decoy name → no crash, list.
+    assert isinstance(items, list)
+
+
+@pytest.mark.asyncio
+async def test_dispatch_unresolvable_project_name_on_write_tool_raises(db):
+    """project_name that matches nothing on a write tool → clean ValueError."""
+    from meridian import server as srv
+
+    with pytest.raises(ValueError, match="no project found matching name"):
+        await srv._dispatch_mcp_tool(
+            "add_sprint_item",
+            {"project_name": "ghost-project", "version": "v1", "title": "x"},
+            db, "/tmp",
+        )
+
+
+@pytest.mark.asyncio
+async def test_dispatch_project_scoped_tool_with_neither_fails_cleanly(db):
+    """Neither project_id nor project_name → deterministic error, never a hang
+    or silent success. The resolver's args.get(...,"") defaults keep it from
+    KeyError-ing; the handler then surfaces a clean exception the transport
+    layers turn into an {"error": ...} payload."""
+    from meridian import server as srv
+
+    with pytest.raises((KeyError, ValueError)):
+        await srv._dispatch_mcp_tool(
+            "add_sprint_item", {"version": "v1", "title": "orphan"}, db, "/tmp"
+        )
+
+
+# ---------------------------------------------------------------------------
 # 5b13b7b6 — session name uniqueness
 # ---------------------------------------------------------------------------
 
@@ -9771,7 +9936,10 @@ async def test_read_note_registered_in_tool_list():
     by_name = {t["name"]: t for t in _MCP_TOOLS_LIST}
     assert "read_note" in by_name
     schema = by_name["read_note"]["inputSchema"]
-    assert schema["required"] == ["project_id", "slug"]
+    # 8a449ec0 — project_id is now an alternative to project_name, so it is no
+    # longer strictly required; slug still is, and project_name is advertised.
+    assert schema["required"] == ["slug"]
+    assert "project_name" in schema["properties"]
     assert "read_note" in _READ_ONLY_TOOLS
     assert by_name["read_note"]["annotations"]["readOnlyHint"] is True
 
@@ -9970,7 +10138,10 @@ async def test_ingest_document_mcp_tool_round_trip(db, tmp_path):
 
     by_name = {t["name"]: t for t in _MCP_TOOLS_LIST}
     assert "ingest_document" in by_name
-    assert by_name["ingest_document"]["inputSchema"]["required"] == ["project_id"]
+    # 8a449ec0 — project_id resolvable via project_name, so required is now empty
+    # (the resolver/handler enforce a real project); project_name is advertised.
+    assert by_name["ingest_document"]["inputSchema"]["required"] == []
+    assert "project_name" in by_name["ingest_document"]["inputSchema"]["properties"]
     # It writes, so it must not be flagged read-only.
     assert by_name["ingest_document"]["annotations"]["readOnlyHint"] is False
 
@@ -10937,7 +11108,10 @@ def test_update_sprint_item_in_mcp_tools_list_and_writable():
     tool = next((t for t in _MCP_TOOLS_LIST if t["name"] == "update_sprint_item"), None)
     assert tool is not None, "update_sprint_item missing from _MCP_TOOLS_LIST"
     assert tool["annotations"]["readOnlyHint"] is False
-    assert set(tool["inputSchema"]["required"]) == {"project_id", "item_id"}
+    # 8a449ec0 — project_id no longer strictly required (resolvable via
+    # project_name); item_id remains required, project_name is advertised.
+    assert set(tool["inputSchema"]["required"]) == {"item_id"}
+    assert "project_name" in tool["inputSchema"]["properties"]
 
 
 @pytest.mark.asyncio

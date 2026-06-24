@@ -178,13 +178,14 @@ def build_mcp_server():
                     "type": "object",
                     "properties": {
                         "project_id": {"type": "string"},
+                        "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
                         "session_name": {"type": "string"},
                         "human_id": {
                             "type": "string",
                             "description": "Optional human owner identifier.",
                         },
                     },
-                    "required": ["project_id", "session_name"],
+                    "required": ["session_name"],
                 },
             ),
             Tool(
@@ -199,8 +200,8 @@ def build_mcp_server():
                 ),
                 inputSchema={
                     "type": "object",
-                    "properties": {"project_id": {"type": "string"}},
-                    "required": ["project_id"],
+                    "properties": {"project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."}},
+                    "required": [],
                 },
             ),
             Tool(
@@ -217,6 +218,7 @@ def build_mcp_server():
                     "type": "object",
                     "properties": {
                         "project_id": {"type": "string"},
+                        "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
                         "content": {
                             "oneOf": [
                                 {"type": "object"},
@@ -226,7 +228,7 @@ def build_mcp_server():
                         "north_star": {"type": "string"},
                         "sprint": {"type": "string"},
                     },
-                    "required": ["project_id", "content"],
+                    "required": ["content"],
                 },
             ),
             Tool(
@@ -241,10 +243,11 @@ def build_mcp_server():
                     "type": "object",
                     "properties": {
                         "project_id": {"type": "string"},
+                        "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
                         "north_star": {"type": "string"},
                         "human_id": {"type": "string"},
                     },
-                    "required": ["project_id", "north_star", "human_id"],
+                    "required": ["north_star", "human_id"],
                 },
             ),
             Tool(
@@ -258,9 +261,10 @@ def build_mcp_server():
                     "type": "object",
                     "properties": {
                         "project_id": {"type": "string"},
+                        "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
                         "sprint": {"type": "string"},
                     },
-                    "required": ["project_id", "sprint"],
+                    "required": ["sprint"],
                 },
             ),
             Tool(
@@ -275,6 +279,7 @@ def build_mcp_server():
                     "type": "object",
                     "properties": {
                         "project_id": {"type": "string"},
+                        "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
                         "repo_path": {"type": "string", "description": "Absolute path to the repo root."},
                         "env_file": {"type": "string", "description": "Path to .env file for the executor."},
                         "test_cmd": {"type": "string", "description": "Command to run the test suite."},
@@ -283,7 +288,7 @@ def build_mcp_server():
                         "shell_type": {"type": "string", "description": "Shell to use: bash, powershell, cmd."},
                         "branch": {"type": "string", "description": "Default working branch."},
                     },
-                    "required": ["project_id"],
+                    "required": [],
                 },
             ),
             Tool(
@@ -351,6 +356,7 @@ def build_mcp_server():
                     "properties": {
                         "session_id": {"type": "string"},
                         "project_id": {"type": "string"},
+                        "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
                         "description": {"type": "string"},
                         "status": {
                             "type": "string",
@@ -365,7 +371,6 @@ def build_mcp_server():
                     },
                     "required": [
                         "session_id",
-                        "project_id",
                         "description",
                     ],
                 },
@@ -380,9 +385,10 @@ def build_mcp_server():
                     "type": "object",
                     "properties": {
                         "project_id": {"type": "string"},
+                        "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
                         "limit": {"type": "integer", "default": 20},
                     },
-                    "required": ["project_id"],
+                    "required": [],
                 },
             ),
             Tool(
@@ -397,10 +403,11 @@ def build_mcp_server():
                     "type": "object",
                     "properties": {
                         "project_id": {"type": "string"},
+                        "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
                         "query": {"type": "string"},
                         "limit": {"type": "integer", "default": 5},
                     },
-                    "required": ["project_id", "query"],
+                    "required": ["query"],
                 },
             ),
             Tool(
@@ -433,6 +440,7 @@ def build_mcp_server():
                     "type": "object",
                     "properties": {
                         "project_id": {"type": "string"},
+                        "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
                         "mode": {
                             "type": "string",
                             "enum": ["full", "delta", "planner", "starter"],
@@ -445,7 +453,7 @@ def build_mcp_server():
                             ),
                         },
                     },
-                    "required": ["project_id"],
+                    "required": [],
                 },
             ),
             Tool(
@@ -462,13 +470,14 @@ def build_mcp_server():
                     "type": "object",
                     "properties": {
                         "project_id": {"type": "string"},
+                        "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
                         "mode": {
                             "type": "string",
                             "enum": ["full", "chat"],
                             "default": "full",
                         },
                     },
-                    "required": ["project_id"],
+                    "required": [],
                 },
             ),
             Tool(
@@ -487,6 +496,7 @@ def build_mcp_server():
                     "type": "object",
                     "properties": {
                         "project_id": {"type": "string"},
+                        "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
                         "title": {"type": "string"},
                         "body": {"type": "string"},
                         "category": {"type": "string"},
@@ -495,7 +505,7 @@ def build_mcp_server():
                             "enum": ["urgent", "normal", "low"],
                         },
                     },
-                    "required": ["project_id", "title", "body"],
+                    "required": ["title", "body"],
                 },
             ),
             Tool(
@@ -538,9 +548,10 @@ def build_mcp_server():
                     "type": "object",
                     "properties": {
                         "project_id": {"type": "string"},
+                        "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
                         "include_superseded": {"type": "boolean"},
                     },
-                    "required": ["project_id"],
+                    "required": [],
                 },
             ),
             Tool(
@@ -556,6 +567,7 @@ def build_mcp_server():
                     "type": "object",
                     "properties": {
                         "project_id": {"type": "string"},
+                        "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
                         "question": {"type": "string"},
                         "session_id": {"type": "string"},
                         "context": {"type": "string"},
@@ -566,7 +578,7 @@ def build_mcp_server():
                         },
                         "assigned_to": {"type": "string"},
                     },
-                    "required": ["project_id", "question"],
+                    "required": ["question"],
                 },
             ),
             Tool(
@@ -594,6 +606,7 @@ def build_mcp_server():
                     "type": "object",
                     "properties": {
                         "project_id": {"type": "string"},
+                        "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
                         "status": {
                             "type": "string",
                             "description": "Filter: 'pending' (default), 'answered', 'dismissed', or 'all'.",
@@ -603,7 +616,7 @@ def build_mcp_server():
                             "description": "Max results, default 50.",
                         },
                     },
-                    "required": ["project_id"],
+                    "required": [],
                 },
             ),
             Tool(
@@ -655,6 +668,7 @@ def build_mcp_server():
                     "type": "object",
                     "properties": {
                         "project_id": {"type": "string"},
+                        "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
                         "file": {
                             "type": "string",
                             "description": "CLAUDE.md | AGENTS.md",
@@ -670,7 +684,7 @@ def build_mcp_server():
                             "enum": ["normal", "high", "blocking"],
                         },
                     },
-                    "required": ["project_id", "file", "anchor", "content"],
+                    "required": ["file", "anchor", "content"],
                 },
             ),
             Tool(
@@ -684,12 +698,13 @@ def build_mcp_server():
                     "type": "object",
                     "properties": {
                         "project_id": {"type": "string"},
+                        "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
                         "status": {
                             "type": "string",
                             "description": "Filter: 'active' (default) or 'all'.",
                         },
                     },
-                    "required": ["project_id"],
+                    "required": [],
                 },
             ),
             Tool(
@@ -709,6 +724,7 @@ def build_mcp_server():
                     "type": "object",
                     "properties": {
                         "project_id": {"type": "string"},
+                        "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
                         "title": {"type": "string"},
                         "body": {"type": "string"},
                         "tags": {"type": "string"},
@@ -739,7 +755,7 @@ def build_mcp_server():
                             "description": "Required when tags includes 'roadmap'. E.g. TECHNICAL, ARCHITECTURAL, PRODUCT.",
                         },
                     },
-                    "required": ["project_id", "title", "body"],
+                    "required": ["title", "body"],
                 },
             ),
             Tool(
@@ -766,6 +782,7 @@ def build_mcp_server():
                     "type": "object",
                     "properties": {
                         "project_id": {"type": "string"},
+                        "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
                         "file_path": {
                             "type": "string",
                             "description": "Path to a .txt/.md/.docx file to extract server-side (stdlib only). For .pdf or other types, pass pre-extracted text as 'content' instead.",
@@ -787,7 +804,7 @@ def build_mcp_server():
                             "description": "Comma-separated tags.",
                         },
                     },
-                    "required": ["project_id"],
+                    "required": [],
                 },
             ),
             Tool(
@@ -808,6 +825,7 @@ def build_mcp_server():
                     "type": "object",
                     "properties": {
                         "project_id": {"type": "string"},
+                        "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
                         "tag": {"type": "string"},
                         "bodies": {
                             "type": "boolean",
@@ -822,7 +840,7 @@ def build_mcp_server():
                             "description": "Offset cursor from a prior page's next_cursor. Passing it returns the {notes, has_more, next_cursor} envelope.",
                         },
                     },
-                    "required": ["project_id"],
+                    "required": [],
                 },
             ),
             Tool(
@@ -836,9 +854,10 @@ def build_mcp_server():
                     "type": "object",
                     "properties": {
                         "project_id": {"type": "string"},
+                        "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
                         "slug": {"type": "string"},
                     },
-                    "required": ["project_id", "slug"],
+                    "required": ["slug"],
                 },
             ),
             Tool(
@@ -1155,6 +1174,7 @@ def build_mcp_server():
                     "type": "object",
                     "properties": {
                         "project_id": {"type": "string"},
+                        "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
                         "version": {"type": "string"},
                         "title": {"type": "string"},
                         "group": {
@@ -1187,7 +1207,7 @@ def build_mcp_server():
                             "description": "Override the duplicate guard and add the item even if its title closely matches an existing open item. Default: false.",
                         },
                     },
-                    "required": ["project_id", "version", "title"],
+                    "required": ["version", "title"],
                 },
             ),
             Tool(
@@ -1203,6 +1223,7 @@ def build_mcp_server():
                     "type": "object",
                     "properties": {
                         "project_id": {"type": "string"},
+                        "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
                         "item_id": {"type": "string"},
                         "title": {"type": "string", "description": "New title."},
                         "version": {
@@ -1222,7 +1243,7 @@ def build_mcp_server():
                             "description": "Objective name to group the item under (item_group); empty string clears it.",
                         },
                     },
-                    "required": ["project_id", "item_id"],
+                    "required": ["item_id"],
                 },
             ),
             Tool(
@@ -1236,10 +1257,11 @@ def build_mcp_server():
                     "type": "object",
                     "properties": {
                         "project_id": {"type": "string"},
+                        "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
                         "item_id": {"type": "string"},
                         "task_id": {"type": "string"},
                     },
-                    "required": ["project_id", "item_id"],
+                    "required": ["item_id"],
                 },
             ),
             Tool(
@@ -1311,6 +1333,7 @@ def build_mcp_server():
                     "type": "object",
                     "properties": {
                         "project_id": {"type": "string"},
+                        "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
                         "status": {
                             "type": "string",
                             "enum": [
@@ -1323,7 +1346,7 @@ def build_mcp_server():
                             "description": "Include items with milestone_type='human'. Default: true. Pass false to hide human tasks (used by executor sessions).",
                         },
                     },
-                    "required": ["project_id"],
+                    "required": [],
                 },
             ),
             Tool(
@@ -1342,6 +1365,7 @@ def build_mcp_server():
                     "type": "object",
                     "properties": {
                         "project_id": {"type": "string"},
+                        "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
                         "session_name": {"type": "string"},
                         "human_id": {
                             "type": "string",
@@ -1358,7 +1382,7 @@ def build_mcp_server():
                             "description": "Pass 'executor' to inject executor_config and credentials guidance.",
                         },
                     },
-                    "required": ["project_id", "session_name"],
+                    "required": ["session_name"],
                 },
             ),
             Tool(
@@ -1403,13 +1427,14 @@ def build_mcp_server():
                     "type": "object",
                     "properties": {
                         "project_id": {"type": "string"},
+                        "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
                         "role": {
                             "type": "string",
                             "enum": ["worker", "planner", "review"],
                             "description": "Context verbosity. worker=sprint+tasks only.",
                         },
                     },
-                    "required": ["project_id"],
+                    "required": [],
                 },
             ),
         ]
