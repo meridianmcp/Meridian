@@ -45,6 +45,12 @@ DEFAULT_DC_PORT = 8813
 SERENA_EXTRACT_COMMAND: list[str] = [
     "uvx", "--from", "serena-agent", "serena", "start-mcp-server",
     "--context", "ide-assistant",
+    # Don't pop a browser tab to Serena's web dashboard on every tunnel (re)start
+    # — the tunnel runs Serena headless behind the proxy. ``--open-web-dashboard
+    # false`` is Serena's documented flag and overrides the user's global
+    # serena_config.yml, so it applies whether or not they already have one (the
+    # legacy native ``gui_log_window`` already defaults off). (a39c4a99)
+    "--open-web-dashboard", "false",
     "--project", "{repo_path}",
 ]
 
