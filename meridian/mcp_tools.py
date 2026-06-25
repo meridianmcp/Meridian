@@ -54,6 +54,7 @@ _TOOL_EXAMPLES: dict[str, str] = {
     "release_file": 'release_file(session_id="session-uuid", file_path="meridian/server.py")',
     "idle_until_session_done": 'idle_until_session_done(watching_session_id="session-uuid")',
     "get_session_log": 'get_session_log(session_id="session-uuid")',
+    "set_active_repo": 'set_active_repo(repo_path="C:\\\\Users\\\\me\\\\project")',
 }
 
 
@@ -803,6 +804,11 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
                       "description": "IDs of items to merge (minimum 2)."},
          "new_title": {"type": "string", "description": "Title for the merged survivor item."}},
          "required": ["item_ids", "new_title"]}},
+    {"name": "set_active_repo",
+     "description": "Update the tunnel's active Serena repo at runtime. When a planning session switches to a different codebase, call this so subsequent Serena requests (find_symbol, find_referencing_symbols, etc.) route to the new repo without restarting the tunnel. Has no effect when no tunnel is connected.",
+     "inputSchema": {"type": "object", "properties": {
+         "repo_path": {"type": "string", "description": "Absolute path to the repository to activate (e.g. /home/me/project or C:\\\\Users\\\\me\\\\project)."}},
+         "required": ["repo_path"]}},
 ]
 
 _READ_ONLY_TOOLS = {
@@ -861,6 +867,7 @@ _TITLE_OVERRIDES: dict[str, str] = {
     "get_file_claims": "Get File Claims",
     "list_plugins": "List Plugins",
     "get_plugin_details": "Get Plugin Details",
+    "set_active_repo": "Set Active Repo",
 }
 
 for _tool in _MCP_TOOLS_LIST:

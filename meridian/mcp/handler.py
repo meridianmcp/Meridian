@@ -2766,6 +2766,28 @@ async def _handle_plugin_tools(
     return _MISS
 
 
+async def _handle_tunnel_tools(
+    name: str,
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """Dispatch group: set_active_repo (tunnel control)."""
+    if name == "set_active_repo":
+        repo_path = str(args.get("repo_path") or "").strip()
+        if not repo_path:
+            raise ValueError("repo_path is required")
+        if tenant is None:
+            raise ValueError("set_active_repo requires an authenticated tenant (tunnel mode)")
+        tenant_id = tenant.get("id", "")
+        from ..routes import tunnel as _tunnel_mod  # noqa: PLC0415
+        result = await _tunnel_mod.send_active_repo_control(tenant_id, repo_path)
+        return result
+    return _MISS
+
+
 async def _dispatch_mcp_tool(
     name: str,
     args: dict[str, Any],
@@ -2802,6 +2824,7 @@ async def _dispatch_mcp_tool(
         _handle_file_claims,
         _handle_planning_tools,
         _handle_plugin_tools,
+        _handle_tunnel_tools,
     )
     for _grp in _groups:
         _result = await _grp(name, args, db, data_dir, tenant, _mcp_tenant_id)

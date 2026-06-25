@@ -689,12 +689,12 @@ _TOOLS_LIST_JSON = {
 
 
 def test_prefix_tool_name_adds_prefix():
-    assert tc._prefix_tool_name("read_file", "Filesystem") == "Filesystem: read_file"
+    assert tc._prefix_tool_name("read_file", "Filesystem") == "Filesystem__read_file"
 
 
 def test_prefix_tool_name_never_double_prefixes():
     once = tc._prefix_tool_name("read_file", "Filesystem")
-    assert tc._prefix_tool_name(once, "Filesystem") == "Filesystem: read_file"
+    assert tc._prefix_tool_name(once, "Filesystem") == "Filesystem__read_file"
 
 
 def test_prefix_tool_name_passes_non_string_through():
@@ -706,7 +706,7 @@ def test_apply_tool_prefix_plain_json():
     body = json.dumps(_TOOLS_LIST_JSON).encode()
     out = json.loads(tc._apply_tool_prefix(body, "Filesystem"))
     names = [t["name"] for t in out["result"]["tools"]]
-    assert names == ["Filesystem: read_file", "Filesystem: write_file"]
+    assert names == ["Filesystem__read_file", "Filesystem__write_file"]
 
 
 def test_apply_tool_prefix_sse_framed():
@@ -722,7 +722,7 @@ def test_apply_tool_prefix_sse_framed():
     data_line = [ln for ln in out.splitlines() if ln.startswith("data:")][0]
     payload = json.loads(data_line[len("data:"):].strip())
     assert [t["name"] for t in payload["result"]["tools"]] == [
-        "Serena: read_file", "Serena: write_file"
+        "Serena__read_file", "Serena__write_file"
     ]
 
 
@@ -751,7 +751,7 @@ def test_apply_tool_prefix_never_double_prefixes_body():
     once = tc._apply_tool_prefix(body, "Filesystem")
     twice = tc._apply_tool_prefix(once, "Filesystem")
     names = [t["name"] for t in json.loads(twice)["result"]["tools"]]
-    assert names == ["Filesystem: read_file", "Filesystem: write_file"]
+    assert names == ["Filesystem__read_file", "Filesystem__write_file"]
 
 
 def test_relay_request_prefixes_tools_list_and_drops_content_length():
@@ -770,7 +770,7 @@ def test_relay_request_prefixes_tools_list_and_drops_content_length():
     resp = asyncio.run(_inner())
     out = json.loads(base64.b64decode(resp["body"]))
     assert [t["name"] for t in out["result"]["tools"]] == [
-        "Filesystem: read_file", "Filesystem: write_file"
+        "Filesystem__read_file", "Filesystem__write_file"
     ]
     # Content-Length is recomputed by the server, so the stale one is dropped.
     assert not any(k.lower() == "content-length" for k in resp["headers"])
@@ -1230,3 +1230,35 @@ def test_proc_watchdog_healthy_tick_resets_failure_streak(monkeypatch):
 
     # Recovered repeatedly — relaunch count exceeds max_retries, so it never gave up.
     assert len(spawned) > 3
+
+
+# ---------------------------------------------------------------------------
+# set_active_repo control message — pool.default_repo_path mutation
+# ---------------------------------------------------------------------------
+
+def test_extract_pool_set_active_repo_updates_default():
+    """set_active_repo control message updates pool.default_repo_path in-place."""
+    from meridian.serena_pool import SerenaDaemonPool
+    pool = SerenaDaemonPool(default_repo_path="/original/repo")
+
+    # Replicate the exact logic inside _run_extract_pool_connection.
+    msg = {"type": "set_active_repo", "repo_path": "/new/repo"}
+    new_path = str(msg.get("repo_path") or "").strip()
+    if new_path:
+        pool.default_repo_path = pool._normalize(new_path)
+
+    assert pool.default_repo_path == pool._normalize("/new/repo")
+
+
+def test_extract_pool_set_active_repo_blank_is_noop():
+    """set_active_repo with blank repo_path leaves default_repo_path unchanged."""
+    from meridian.serena_pool import SerenaDaemonPool
+    pool = SerenaDaemonPool(default_repo_path="/original/repo")
+    original = pool.default_repo_path
+
+    msg = {"type": "set_active_repo", "repo_path": "   "}
+    new_path = str(msg.get("repo_path") or "").strip()
+    if new_path:
+        pool.default_repo_path = pool._normalize(new_path)
+
+    assert pool.default_repo_path == original

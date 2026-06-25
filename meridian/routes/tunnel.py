@@ -417,6 +417,110 @@ async def tunnel_dc_ws(ws: WebSocket, tenant_id: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# /tunnel/active-repo  — control: update pool's default repo_path at runtime
+# ---------------------------------------------------------------------------
+
+class _ActiveRepoBody:
+    """Thin data holder for POST /tunnel/active-repo (avoids Pydantic import cost)."""
+    __slots__ = ("repo_path",)
+
+    def __init__(self, repo_path: str) -> None:
+        self.repo_path = repo_path
+
+
+@router.post("/tunnel/active-repo")
+async def set_tunnel_active_repo(request: Request) -> Response:
+    """Send a set_active_repo control message to the tenant's extract WebSocket.
+
+    The tunnel client's _run_extract_pool_connection handles this message and
+    updates SerenaPool.default_repo_path at runtime — no tunnel restart needed.
+    Returns 503 when no extract tunnel is connected, 404 when auth fails.
+    """
+    if not _hosted_mode():
+        return Response(
+            content='{"error":"tunnel requires hosted mode"}',
+            status_code=503,
+            media_type="application/json",
+        )
+
+    auth_header = request.headers.get("authorization", "")
+    raw_token = auth_header[len("Bearer "):].strip() if auth_header.lower().startswith("bearer ") else auth_header
+    if not raw_token:
+        raw_token = request.query_params.get("token", "")
+    auth_db = request.app.state.db
+    tenant = await _resolve_tenant_from_token(auth_db, raw_token)
+    if tenant is None:
+        return Response(
+            content='{"error":"invalid token"}',
+            status_code=401,
+            media_type="application/json",
+        )
+    if not _is_tunnel_allowed(tenant):
+        return Response(
+            content='{"error":"tunnel requires Pro plan"}',
+            status_code=403,
+            media_type="application/json",
+        )
+
+    try:
+        body = await request.json()
+        repo_path = str(body.get("repo_path") or "").strip()
+    except Exception:
+        return Response(
+            content='{"error":"invalid JSON body — expected {repo_path: str}"}',
+            status_code=400,
+            media_type="application/json",
+        )
+    if not repo_path:
+        return Response(
+            content='{"error":"repo_path is required"}',
+            status_code=400,
+            media_type="application/json",
+        )
+
+    tenant_id = tenant["id"]
+    ws = _tunnel_extract_sockets.get(tenant_id)
+    if ws is None:
+        return Response(
+            content='{"status":"not_connected","message":"no active extract tunnel — start meridian --tunnel first"}',
+            status_code=503,
+            media_type="application/json",
+        )
+
+    try:
+        await ws.send_json({"type": "set_active_repo", "repo_path": repo_path})
+    except Exception as exc:
+        _log.debug("set_active_repo: send error for %s: %s", tenant_id[:8], exc)
+        return Response(
+            content=json.dumps({"status": "error", "message": str(exc)}),
+            status_code=502,
+            media_type="application/json",
+        )
+
+    return Response(
+        content=json.dumps({"status": "ok", "repo_path": repo_path}),
+        status_code=200,
+        media_type="application/json",
+    )
+
+
+async def send_active_repo_control(tenant_id: str, repo_path: str) -> dict[str, str]:
+    """Send set_active_repo over the extract WebSocket for a tenant.
+
+    Called by the MCP handler (no HTTP round-trip needed). Returns a status dict
+    with ``status`` of ``"ok"``, ``"not_connected"``, or ``"error"``.
+    """
+    ws = _tunnel_extract_sockets.get(tenant_id)
+    if ws is None:
+        return {"status": "not_connected", "message": "no active extract tunnel — start meridian --tunnel first"}
+    try:
+        await ws.send_json({"type": "set_active_repo", "repo_path": repo_path})
+        return {"status": "ok", "repo_path": repo_path}
+    except Exception as exc:  # noqa: BLE001
+        return {"status": "error", "message": str(exc)}
+
+
+# ---------------------------------------------------------------------------
 # Shared proxy helper
 # ---------------------------------------------------------------------------
 

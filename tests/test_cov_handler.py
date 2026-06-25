@@ -1269,3 +1269,69 @@ def test_update_md_section_unknown_file_raises():
             ))
     finally:
         _run(db.close())
+
+
+# ---------------------------------------------------------------------------
+# set_active_repo — tunnel tool dispatch
+# ---------------------------------------------------------------------------
+
+def test_dispatch_set_active_repo_no_repo_path_raises():
+    db = _make_db()
+    try:
+        with pytest.raises(ValueError, match="repo_path is required"):
+            _run(mh._dispatch_mcp_tool(
+                "set_active_repo", {"repo_path": ""},
+                db, "/tmp", tenant={"id": "t1"},
+            ))
+    finally:
+        _run(db.close())
+
+
+def test_dispatch_set_active_repo_no_tenant_raises():
+    db = _make_db()
+    try:
+        with pytest.raises(ValueError, match="authenticated tenant"):
+            _run(mh._dispatch_mcp_tool(
+                "set_active_repo", {"repo_path": "/some/repo"},
+                db, "/tmp", tenant=None,
+            ))
+    finally:
+        _run(db.close())
+
+
+def test_dispatch_set_active_repo_not_connected(monkeypatch):
+    """set_active_repo with no extract tunnel returns not_connected status."""
+    from meridian.routes import tunnel as tn
+    monkeypatch.setattr(tn, "_tunnel_extract_sockets", {})
+    db = _make_db()
+    try:
+        result = _run(mh._dispatch_mcp_tool(
+            "set_active_repo", {"repo_path": "/my/repo"},
+            db, "/tmp", tenant={"id": "no-tenant"},
+        ))
+        assert result["status"] == "not_connected"
+    finally:
+        _run(db.close())
+
+
+def test_dispatch_set_active_repo_ok(monkeypatch):
+    """set_active_repo with a live extract WS returns ok status."""
+    sent = []
+
+    class _FakeWS:
+        async def send_json(self, obj):
+            sent.append(obj)
+
+    from meridian.routes import tunnel as tn
+    monkeypatch.setattr(tn, "_tunnel_extract_sockets", {"t1": _FakeWS()})
+    db = _make_db()
+    try:
+        result = _run(mh._dispatch_mcp_tool(
+            "set_active_repo", {"repo_path": "/my/repo"},
+            db, "/tmp", tenant={"id": "t1"},
+        ))
+        assert result["status"] == "ok"
+        assert result["repo_path"] == "/my/repo"
+        assert sent == [{"type": "set_active_repo", "repo_path": "/my/repo"}]
+    finally:
+        _run(db.close())

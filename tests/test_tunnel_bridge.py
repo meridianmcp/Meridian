@@ -605,3 +605,42 @@ def test_office_slots_in_label_maps_and_bridge():
     assert "ppt" in tn._TUNNEL_LABELS and "word" in tn._TUNNEL_LABELS
     tn._tunnel_word_sockets["t1"] = object()
     assert tn.has_active_tunnel("t1") is True
+
+
+# ---------------------------------------------------------------------------
+# send_active_repo_control — helper for the MCP handler
+# ---------------------------------------------------------------------------
+
+class _FakeExtractWS:
+    """Minimal WebSocket stub for send_active_repo_control tests."""
+    def __init__(self, raise_on_send=False):
+        self.sent = []
+        self._raise = raise_on_send
+
+    async def send_json(self, obj):
+        if self._raise:
+            raise RuntimeError("ws broken")
+        self.sent.append(obj)
+
+
+def test_send_active_repo_control_not_connected():
+    # No extract socket for this tenant → not_connected status.
+    result = asyncio.run(tn.send_active_repo_control("no-tenant", "/some/repo"))
+    assert result["status"] == "not_connected"
+    assert "extract tunnel" in result["message"]
+
+
+def test_send_active_repo_control_ok():
+    ws = _FakeExtractWS()
+    tn._tunnel_extract_sockets["t1"] = ws
+    result = asyncio.run(tn.send_active_repo_control("t1", "/my/repo"))
+    assert result == {"status": "ok", "repo_path": "/my/repo"}
+    assert ws.sent == [{"type": "set_active_repo", "repo_path": "/my/repo"}]
+
+
+def test_send_active_repo_control_send_error():
+    ws = _FakeExtractWS(raise_on_send=True)
+    tn._tunnel_extract_sockets["t1"] = ws
+    result = asyncio.run(tn.send_active_repo_control("t1", "/my/repo"))
+    assert result["status"] == "error"
+    assert "ws broken" in result["message"]
