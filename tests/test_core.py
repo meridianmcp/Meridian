@@ -6191,6 +6191,7 @@ def test_pg_migration_registry_matches_historical_order():
         "_migrate_pg_v25_notification_prefs",
         "_migrate_pg_tenants_is_internal",
         "_migrate_pg_workspace_members_rbac",
+        "_migrate_pg_workspace_members_project_scope",
         "_migrate_pg_admin_plan",
         "_migrate_pg_tunnel_active",
         "_migrate_pg_tunnel_plugins",
@@ -6230,7 +6231,7 @@ def test_pg_migration_registry_matches_historical_order():
     ]
     # No duplicates across the three groups.
     allnames = core + hosted + late
-    assert len(allnames) == len(set(allnames)) == 62
+    assert len(allnames) == len(set(allnames)) == 63
 
 
 def test_default_agent_instructions_has_code_intel_protocol():
@@ -7994,6 +7995,153 @@ async def test_g519_rbac_migration_is_idempotent_and_widens_check():
             row = await cur.fetchone()
         assert row["role"] == "admin"
         assert row["github_access"] == "write"
+    finally:
+        await db.close()
+
+
+# ---------------------------------------------------------------------------
+# d116642e — project-level invites foundation (nullable workspace_members.project_id)
+# Listing-only scoping. Airtight per-request enforcement intentionally deferred
+# (pin b11c7cf6) — not tested here because it is not implemented.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_d116642e_workspace_members_has_project_id_column():
+    """The project_id column exists after init_db (both schema + migration)."""
+    db = await db_module.init_db(":memory:")
+    try:
+        assert await db_module._column_exists(db, "workspace_members", "project_id")
+        # Migration is idempotent — re-running is a no-op.
+        await db_module._migrate_workspace_members_project_scope(db)
+        await db_module._migrate_workspace_members_project_scope(db)
+        assert await db_module._column_exists(db, "workspace_members", "project_id")
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_d116642e_create_invite_stores_project_id():
+    """create_workspace_invite persists project_id (None = workspace-wide)."""
+    db = await db_module.init_db(":memory:")
+    try:
+        await db.execute(
+            "INSERT INTO tenants (id, email) VALUES (?, ?)",
+            ("t-pi", "owner@example.com"),
+        )
+        await db.commit()
+        scoped = await db_module.create_workspace_invite(
+            db, "t-pi", "scoped@example.com", "member", "h1", project_id="proj-A"
+        )
+        wide = await db_module.create_workspace_invite(
+            db, "t-pi", "wide@example.com", "member", "h2"
+        )
+        assert scoped["project_id"] == "proj-A"
+        assert wide["project_id"] is None
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_d116642e_get_workspaces_surfaces_project_id():
+    """get_workspaces_for_email surfaces project_id on accepted rows."""
+    from datetime import datetime, timezone
+    db = await db_module.init_db(":memory:")
+    try:
+        await db.execute(
+            "INSERT INTO tenants (id, email) VALUES (?, ?)",
+            ("t-ws", "owner@example.com"),
+        )
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        await db.execute(
+            "INSERT INTO workspace_members "
+            "(id, tenant_id, email, role, github_access, token_hash, project_id, joined_at) "
+            "VALUES (?, ?, ?, ?, ?, NULL, ?, ?)",
+            ("m-s", "t-ws", "scoped@example.com", "member", "read", "proj-A", now),
+        )
+        await db.commit()
+        rows = await db_module.get_workspaces_for_email(db, "scoped@example.com")
+        assert len(rows) == 1
+        assert rows[0]["project_id"] == "proj-A"
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_d116642e_scoped_project_ids_semantics():
+    """get_scoped_project_ids_for_member: scoped rows return their ids; a
+    workspace-wide row (project_id NULL) returns None (no scoping)."""
+    from datetime import datetime, timezone
+    db = await db_module.init_db(":memory:")
+    try:
+        await db.execute(
+            "INSERT INTO tenants (id, email) VALUES (?, ?)",
+            ("t-sc", "owner@example.com"),
+        )
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        # A scoped member with two project-scoped accepted rows.
+        for i, pid in enumerate(("proj-A", "proj-B")):
+            await db.execute(
+                "INSERT INTO workspace_members "
+                "(id, tenant_id, email, role, github_access, token_hash, project_id, joined_at) "
+                "VALUES (?, ?, ?, ?, ?, NULL, ?, ?)",
+                (f"m-s{i}", "t-sc", "scoped@example.com", "member", "read", pid, now),
+            )
+        # A workspace-wide member (project_id NULL).
+        await db.execute(
+            "INSERT INTO workspace_members "
+            "(id, tenant_id, email, role, github_access, token_hash, project_id, joined_at) "
+            "VALUES (?, ?, ?, ?, ?, NULL, NULL, ?)",
+            ("m-w", "t-sc", "wide@example.com", "member", "read", now),
+        )
+        await db.commit()
+
+        scoped = await db_module.get_scoped_project_ids_for_member(
+            db, "t-sc", "scoped@example.com"
+        )
+        assert sorted(scoped) == ["proj-A", "proj-B"]
+
+        # Workspace-wide member → None (sees everything).
+        assert await db_module.get_scoped_project_ids_for_member(
+            db, "t-sc", "wide@example.com"
+        ) is None
+
+        # Non-member → None.
+        assert await db_module.get_scoped_project_ids_for_member(
+            db, "t-sc", "stranger@example.com"
+        ) is None
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_d116642e_mixed_scoped_and_wide_membership_is_unscoped():
+    """A member with BOTH a scoped and a workspace-wide row sees everything
+    (any workspace-wide membership wins → no listing scoping)."""
+    from datetime import datetime, timezone
+    db = await db_module.init_db(":memory:")
+    try:
+        await db.execute(
+            "INSERT INTO tenants (id, email) VALUES (?, ?)",
+            ("t-mix", "owner@example.com"),
+        )
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        await db.execute(
+            "INSERT INTO workspace_members "
+            "(id, tenant_id, email, role, github_access, token_hash, project_id, joined_at) "
+            "VALUES (?, ?, ?, ?, ?, NULL, ?, ?)",
+            ("m-mx1", "t-mix", "mix@example.com", "member", "read", "proj-A", now),
+        )
+        await db.execute(
+            "INSERT INTO workspace_members "
+            "(id, tenant_id, email, role, github_access, token_hash, project_id, joined_at) "
+            "VALUES (?, ?, ?, ?, ?, NULL, NULL, ?)",
+            ("m-mx2", "t-mix", "mix@example.com", "member", "read", now),
+        )
+        await db.commit()
+        assert await db_module.get_scoped_project_ids_for_member(
+            db, "t-mix", "mix@example.com"
+        ) is None
     finally:
         await db.close()
 

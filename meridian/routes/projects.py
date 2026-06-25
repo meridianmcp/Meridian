@@ -12,6 +12,7 @@ from .._deps import (
     _db,
     _data_dir,
     _get_tenant_from_request,
+    _scoped_project_ids_for_request,
     validate_input_size,
 )
 from .. import db as db_module
@@ -103,8 +104,19 @@ async def _ensure_unique_ntfy_topic(
 
 @router.get("/projects", response_model=list[Project])
 async def list_projects(request: Request) -> list[dict[str, Any]]:
-    """List every project."""
-    return await db_module.list_projects(await _db(request))
+    """List projects visible to the caller.
+
+    d116642e — project-scoped workspace members (invited to a single project,
+    not the whole workspace) only see their scoped project(s) here. Workspace
+    owners and workspace-wide members see everything. This is listing-only
+    scoping; see _scoped_project_ids_for_request.
+    """
+    projects = await db_module.list_projects(await _db(request))
+    scoped = await _scoped_project_ids_for_request(request)
+    if scoped is not None:
+        allowed = set(scoped)
+        projects = [p for p in projects if p.get("id") in allowed]
+    return projects
 
 
 @router.post("/projects", response_model=Project, status_code=201)

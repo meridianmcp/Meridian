@@ -421,6 +421,12 @@ CREATE TABLE IF NOT EXISTS workspace_members (
     email TEXT NOT NULL,
     role TEXT NOT NULL DEFAULT 'member',
     github_access TEXT NOT NULL DEFAULT 'read',
+    -- d116642e: project-level invites foundation.
+    -- NULL = workspace-wide member (sees all projects, current behavior);
+    -- set = project-scoped member (listing-only scoping, see get_workspaces_for_email).
+    -- Airtight per-request access enforcement is intentionally NOT implemented
+    -- here — it is gated on the open product decision in pin b11c7cf6.
+    project_id TEXT,
     token_hash TEXT,
     invited_at TEXT NOT NULL DEFAULT (datetime('now')),
     joined_at TEXT
@@ -770,6 +776,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_tenants_is_internal(db)
     await _migrate_admin_plan(db)
     await _migrate_workspace_members_rbac(db)
+    await _migrate_workspace_members_project_scope(db)
     await _migrate_sprint_items_indeterminate(db)
     await _migrate_sprint_item_tree(db)
     await _migrate_sprint_items_provisional_complete(db)
@@ -8303,11 +8310,19 @@ async def create_workspace_invite(
     token_hash: str,
     *,
     github_access: str | None = None,
+    project_id: str | None = None,
 ) -> dict[str, Any]:
     """Insert a pending workspace member row (joined_at=NULL).
 
     G5.20 — ``github_access`` caps repo-touching MCP tools for this invitee.
     Defaults from role when omitted (viewer→none, member→read, admin/owner→write).
+
+    d116642e — ``project_id`` scopes the invite to a single project. When
+    ``None`` (default) the member is workspace-wide and sees every project
+    (current behavior). When set, the member is project-scoped: listing-only
+    scoping applies (they see only that project in listings). Airtight
+    per-request access enforcement is deferred pending the product decision
+    (pin b11c7cf6).
     """
     from .. import roles as _roles  # noqa: PLC0415
     mid = _new_id()
@@ -8315,9 +8330,9 @@ async def create_workspace_invite(
         github_access = _roles.default_github_access_for_role(role)
     await db.execute(
         "INSERT INTO workspace_members "
-        "(id, tenant_id, email, role, github_access, token_hash) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
-        (mid, tenant_id, email, role, github_access, token_hash),
+        "(id, tenant_id, email, role, github_access, token_hash, project_id) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (mid, tenant_id, email, role, github_access, token_hash, project_id),
     )
     await db.commit()
     async with db.execute("SELECT * FROM workspace_members WHERE id = ?", (mid,)) as cur:
@@ -8548,14 +8563,16 @@ async def get_workspaces_for_email(
 ) -> list[dict[str, Any]]:
     """Return workspaces the email has been invited to (accepted rows only).
 
-    Each row: {tenant_id, owner_email, role, github_access}.
-    Used to populate the workspace-switcher dropdown.
+    Each row: {tenant_id, owner_email, role, github_access, project_id}.
+    ``project_id`` (d116642e) is NULL for workspace-wide members and set for
+    project-scoped members. Used to populate the workspace-switcher dropdown.
     """
     e = (email or "").strip().lower()
     if not e:
         return []
     async with db.execute(
-        "SELECT wm.tenant_id, wm.role, wm.github_access, t.email AS owner_email "
+        "SELECT wm.tenant_id, wm.role, wm.github_access, wm.project_id, "
+        "t.email AS owner_email "
         "FROM workspace_members wm "
         "JOIN tenants t ON t.id = wm.tenant_id "
         "WHERE LOWER(wm.email) = ? AND wm.joined_at IS NOT NULL "
@@ -8564,6 +8581,48 @@ async def get_workspaces_for_email(
     ) as cur:
         rows = await cur.fetchall()
     return [_row_to_dict(r) for r in rows if r is not None]
+
+
+async def get_scoped_project_ids_for_member(
+    db: aiosqlite.Connection,
+    tenant_id: str,
+    email: str,
+) -> list[str] | None:
+    """d116642e — listing-only project scoping for a workspace member.
+
+    Returns the set of project_ids an accepted member is scoped to within the
+    given tenant's workspace, or ``None`` when the member is NOT project-scoped
+    (i.e. has any workspace-wide row, or is not a member at all) — meaning they
+    see every project.
+
+    Semantics:
+      - returns ``None``  → no scoping; caller lists all projects (default).
+      - returns ``[...]`` → list only these project_ids in UI listings.
+
+    NOTE: this is listing-only scoping. It does NOT block direct-by-ID access to
+    other projects in the same workspace — airtight per-request enforcement is
+    deferred pending the open product decision (pin b11c7cf6). Writes remain
+    gated by role enforcement (393eed0a).
+    """
+    e = (email or "").strip().lower()
+    if not e:
+        return None
+    async with db.execute(
+        "SELECT project_id FROM workspace_members "
+        "WHERE tenant_id = ? AND LOWER(email) = ? AND joined_at IS NOT NULL",
+        (tenant_id, e),
+    ) as cur:
+        rows = await cur.fetchall()
+    if not rows:
+        return None
+    scoped: list[str] = []
+    for r in rows:
+        pid = r["project_id"] if isinstance(r, dict) else r[0]
+        if pid is None:
+            # Any workspace-wide membership row wins → no scoping.
+            return None
+        scoped.append(pid)
+    return scoped
 
 
 # ---------------------------------------------------------------------------

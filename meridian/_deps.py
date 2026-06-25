@@ -287,6 +287,50 @@ async def _get_tenant_from_request(request: Request) -> "dict | None":
     return None
 
 
+async def _scoped_project_ids_for_request(request: Request) -> "list[str] | None":
+    """d116642e — listing-only project scoping for the current request.
+
+    Returns the list of project_ids the caller is scoped to when they are a
+    *project-scoped* member of the workspace they are currently viewing
+    (i.e. they switched into a workspace they were invited to with a specific
+    project_id). Returns ``None`` when scoping does not apply — the caller is
+    the workspace owner, a workspace-wide member, in self-hosted/demo mode, or
+    unauthenticated — meaning every project is listed (current behavior).
+
+    Scoping only fires when an ``X-Workspace-Tenant-Id`` header points the
+    caller at a *different* workspace than their own (a true cross-workspace
+    view); a caller in their own workspace always sees everything.
+
+    This is listing-only: it filters what the dashboard shows. It does NOT
+    block direct-by-ID access to sibling projects in the same workspace —
+    airtight per-request enforcement is deferred pending the product decision
+    (pin b11c7cf6). Writes stay gated by role enforcement (393eed0a).
+    """
+    if not _hosted_mode():
+        return None
+    if request.cookies.get(_DEMO_CONTEXT_COOKIE):
+        return None
+
+    ws_header = request.headers.get("x-workspace-tenant-id", "").strip()
+    if not ws_header:
+        return None
+
+    from . import db as db_module
+
+    caller = await _get_tenant_from_request(request)
+    if not caller:
+        return None
+    caller_email = caller.get("email", "")
+    if ws_header == caller.get("id"):
+        # Viewing own workspace — never scoped.
+        return None
+
+    auth_db = request.app.state.db
+    return await db_module.get_scoped_project_ids_for_member(
+        auth_db, ws_header, caller_email
+    )
+
+
 # ---------------------------------------------------------------------------
 # Data directory helper
 # ---------------------------------------------------------------------------

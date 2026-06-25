@@ -760,6 +760,10 @@ CREATE TABLE IF NOT EXISTS workspace_members (
     role TEXT NOT NULL DEFAULT 'member',
     github_access TEXT NOT NULL DEFAULT 'read'
         CHECK (github_access IN ('none','read','write')),
+    -- d116642e: project-level invites foundation. NULL = workspace-wide
+    -- (current behavior); set = project-scoped (listing-only scoping for now).
+    -- Airtight per-request enforcement deferred (pin b11c7cf6).
+    project_id TEXT,
     token_hash TEXT,
     invited_at TEXT NOT NULL DEFAULT ({_TS}),
     joined_at TEXT
@@ -1072,6 +1076,21 @@ async def _migrate_pg_workspace_members_rbac(conn: PostgresConnection) -> None:
     await conn.executescript(
         "ALTER TABLE workspace_members "
         "ADD COLUMN IF NOT EXISTS joined_at TEXT"
+    )
+
+
+async def _migrate_pg_workspace_members_project_scope(conn: PostgresConnection) -> None:
+    """d116642e — project-level invites foundation.
+
+    Adds a nullable ``project_id`` to ``workspace_members``: NULL = workspace-wide
+    member (current behavior), set = project-scoped member (listing-only scoping
+    for now). ADD COLUMN IF NOT EXISTS so re-running is a no-op. Mirrors
+    db._migrate_workspace_members_project_scope. Airtight per-request access
+    enforcement is intentionally deferred pending the product decision (pin
+    b11c7cf6).
+    """
+    await conn.executescript(
+        "ALTER TABLE workspace_members ADD COLUMN IF NOT EXISTS project_id TEXT"
     )
 
 
@@ -1911,6 +1930,7 @@ _PG_MIGRATIONS_HOSTED = (
     _migrate_pg_v25_notification_prefs,
     _migrate_pg_tenants_is_internal,
     _migrate_pg_workspace_members_rbac,
+    _migrate_pg_workspace_members_project_scope,
     _migrate_pg_admin_plan,
     _migrate_pg_tunnel_active,
     _migrate_pg_tunnel_plugins,
