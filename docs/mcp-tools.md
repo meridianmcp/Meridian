@@ -194,6 +194,8 @@ Store project-level executor defaults so worker sessions start with repo path, e
 | `deploy_cmd` | string | optional |  |
 | `shell_type` | string | optional |  |
 | `branch` | string | optional |  |
+| `filesystem_roots` | array | optional | Directories the tunnel's filesystem connector may serve (unioned across the tenant's projects). Overwrites the existing list. |
+| `context_threshold` | integer | optional | Turns before a context-budget warning is surfaced to the session. |
 
 **Example:**
 ```

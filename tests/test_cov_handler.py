@@ -1335,3 +1335,116 @@ def test_dispatch_set_active_repo_ok(monkeypatch):
         assert sent == [{"type": "set_active_repo", "repo_path": "/my/repo"}]
     finally:
         _run(db.close())
+
+
+# ---------------------------------------------------------------------------
+# 3adbc954 — set_executor_config must persist filesystem_roots (was dropped)
+# ---------------------------------------------------------------------------
+
+def test_set_executor_config_persists_filesystem_roots():
+    """filesystem_roots passed to set_executor_config round-trips (regression)."""
+    db = _make_db()
+    try:
+        proj = _run(mh._dispatch_mcp_tool("create_project", {"name": "fsr"}, db, "/tmp"))
+        pid = proj["id"]
+        out = _run(mh._dispatch_mcp_tool(
+            "set_executor_config",
+            {"project_id": pid, "filesystem_roots": ["C:/a", "D:/b"]},
+            db, "/tmp",
+        ))
+        assert out["filesystem_roots"] == ["C:/a", "D:/b"]
+        # Read back through a fresh get to prove it persisted to the DB.
+        import meridian.db as db_module
+        cfg = _run(db_module.get_executor_config(db, pid))
+        assert cfg["filesystem_roots"] == ["C:/a", "D:/b"]
+    finally:
+        _run(db.close())
+
+
+def test_set_executor_config_filesystem_roots_coexist_with_repo_path():
+    """Setting repo_path later does not wipe a previously-set filesystem_roots."""
+    db = _make_db()
+    try:
+        proj = _run(mh._dispatch_mcp_tool("create_project", {"name": "fsr2"}, db, "/tmp"))
+        pid = proj["id"]
+        _run(mh._dispatch_mcp_tool(
+            "set_executor_config",
+            {"project_id": pid, "filesystem_roots": ["/x"]},
+            db, "/tmp",
+        ))
+        out = _run(mh._dispatch_mcp_tool(
+            "set_executor_config",
+            {"project_id": pid, "repo_path": "/x/repo"},
+            db, "/tmp",
+        ))
+        assert out["filesystem_roots"] == ["/x"]
+        assert out["repo_path"] == "/x/repo"
+    finally:
+        _run(db.close())
+
+
+# ---------------------------------------------------------------------------
+# b2a417ad — start_session points the Serena pool at the project's repo so
+# claude.ai chat sessions (no X-Meridian-Repo-Path header) route correctly.
+# ---------------------------------------------------------------------------
+
+def test_start_session_sends_active_repo_and_fs_roots(monkeypatch):
+    """start_session with a tenant + known repo_path sends BOTH the extract
+    set_active_repo control and the fs add_fs_roots control."""
+    extract_sent = []
+    fs_sent = []
+
+    class _FakeExtractWS:
+        async def send_json(self, obj):
+            extract_sent.append(obj)
+
+    class _FakeFsWS:
+        async def send_json(self, obj):
+            fs_sent.append(obj)
+
+    from meridian.routes import tunnel as tn
+    monkeypatch.setattr(tn, "_tunnel_extract_sockets", {"t1": _FakeExtractWS()})
+    monkeypatch.setattr(tn, "_tunnel_sockets", {"t1": _FakeFsWS()})
+    db = _make_db()
+    try:
+        proj = _run(mh._dispatch_mcp_tool("create_project", {"name": "ss-route"}, db, "/tmp"))
+        pid = proj["id"]
+        _run(mh._dispatch_mcp_tool(
+            "set_executor_config",
+            {"project_id": pid, "repo_path": "C:/repo/here"},
+            db, "/tmp",
+        ))
+        _run(mh._dispatch_mcp_tool(
+            "start_session",
+            {"project_id": pid, "session_name": "chat"}, db, "/tmp",
+            tenant={"id": "t1"},
+        ))
+        assert {"type": "set_active_repo", "repo_path": "C:/repo/here"} in extract_sent
+        assert {"type": "add_fs_roots", "roots": ["C:/repo/here"]} in fs_sent
+    finally:
+        _run(db.close())
+
+
+def test_start_session_no_repo_path_sends_nothing(monkeypatch):
+    """No repo_path configured → no control messages, start_session still works."""
+    extract_sent = []
+
+    class _FakeExtractWS:
+        async def send_json(self, obj):
+            extract_sent.append(obj)
+
+    from meridian.routes import tunnel as tn
+    monkeypatch.setattr(tn, "_tunnel_extract_sockets", {"t1": _FakeExtractWS()})
+    monkeypatch.setattr(tn, "_tunnel_sockets", {})
+    db = _make_db()
+    try:
+        proj = _run(mh._dispatch_mcp_tool("create_project", {"name": "ss-norepo"}, db, "/tmp"))
+        out = _run(mh._dispatch_mcp_tool(
+            "start_session",
+            {"project_id": proj["id"], "session_name": "chat"}, db, "/tmp",
+            tenant={"id": "t1"},
+        ))
+        assert isinstance(out, dict)
+        assert extract_sent == []
+    finally:
+        _run(db.close())

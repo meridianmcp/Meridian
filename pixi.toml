@@ -17,6 +17,10 @@ pytest = ">=8.0"
 pytest-asyncio = ">=0.23"
 pytest-xdist = ">=3.5"
 pytest-cov = ">=4.0"
+# 343cb26d — per-test wall-clock kill so a single hung test (lingering asyncio
+# loop / subprocess) can't keep the CI job alive indefinitely. Used via
+# --timeout=60 in the test tasks below + the test.yml workflow.
+pytest-timeout = ">=2.1"
 beautifulsoup4 = ">=4.12"
 git-cliff = ">=2.13.1,<3"
 
@@ -68,8 +72,8 @@ dev = { features = ["dev"], solve-group = "default" }
 [tasks]
 start = { cmd = "python -m meridian", env = { MERIDIAN_CLAUDE_CLI = "cmd /c C:/Users/13144/AppData/Roaming/npm/claude.cmd -p" } }
 dev = "uvicorn meridian.server:app --reload --port 7878"
-test = "pytest tests/ -n auto -q --tb=short --ignore=tests/test_demo_ux.py"
-test-cov = "pytest tests/ -n auto -q --tb=short --ignore=tests/test_demo_ux.py --cov=meridian --cov-config=.coveragerc --cov-report=term-missing --cov-fail-under=80"
+test = "pytest tests/ -n auto -q --tb=short --ignore=tests/test_demo_ux.py --timeout=60"
+test-cov = "pytest tests/ -n auto -q --tb=short --ignore=tests/test_demo_ux.py --timeout=60 --cov=meridian --cov-config=.coveragerc --cov-report=term-missing --cov-fail-under=80"
 test-fast = "pytest tests/test_core.py tests/test_new_v25.py tests/test_hosted.py tests/test_github.py tests/test_milestones.py tests/test_md_anchors.py tests/test_security.py tests/test_ui.py tests/test_executor_runs.py tests/test_error_alerting.py tests/test_v2_hosted.py -n auto -q --tb=short"
 build-exe = "pyinstaller meridian.spec --clean"
 build-connect = "pyinstaller meridian-connect.spec --clean"
