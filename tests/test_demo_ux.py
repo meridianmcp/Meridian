@@ -327,6 +327,164 @@ def test_demo_write_button_shows_friendly_toast(client):
 
 
 @pytestmark_playwright
+def test_settings_tab_classifier(client):
+    """0bf67524 — the settings-tab classifier maps section ids to the right tab.
+
+    Runs the real bundled `window._classifySettingsSection` in-browser so the
+    shipped logic (not a re-implementation) is what's asserted.
+    """
+    import threading
+    import uvicorn
+    from meridian import server as server_module
+
+    with sync_playwright() as p:
+        config = uvicorn.Config(server_module.app, host="127.0.0.1", port=17882, log_level="error")
+        server = uvicorn.Server(config)
+        thread = threading.Thread(target=server.run, daemon=True)
+        thread.start()
+        import time; time.sleep(1.5)
+
+        try:
+            browser = p.chromium.launch()
+            page = browser.new_page()
+            page.goto("http://127.0.0.1:17882/demo", wait_until="domcontentloaded")
+            page.wait_for_timeout(2000)  # allow the bundle to load + run
+
+            result = page.evaluate(
+                """() => {
+                    const fn = window._classifySettingsSection;
+                    if (typeof fn !== 'function') return {error: 'classifier missing'};
+                    const mk = (id) => { const d = document.createElement('div'); d.id = id; return d; };
+                    return {
+                        account_card: fn(mk('settings-account-card-P'), 'P'),
+                        danger: fn(mk('settings-account-danger-P'), 'P'),
+                        members: fn(mk('members-section-P'), 'P'),
+                        github: fn(mk('github-card-P'), 'P'),
+                        workspace: fn(mk('workspace-section-P'), 'P'),
+                        project_grp: fn(mk('settings-grp-ps-P'), 'P'),
+                        notifications: fn(mk('settings-notifications-card-P'), 'P'),
+                        unknown: fn(mk('something-random-P'), 'P'),
+                    };
+                }"""
+            )
+            assert result.get("error") is None, result
+            assert result["account_card"] == "account"
+            assert result["danger"] == "account"
+            assert result["members"] == "account"
+            assert result["github"] == "account"
+            assert result["workspace"] == "workspace"
+            assert result["project_grp"] == "project"
+            assert result["notifications"] == "project"
+            assert result["unknown"] == "project"  # safe default
+
+            browser.close()
+        finally:
+            server.should_exit = True
+
+
+@pytestmark_playwright
+def test_settings_tabs_organize_and_switch(client):
+    """0bf67524 — _organizeSettingsIntoTabs builds the Project/Workspace/Account
+    tab bar, distributes sections, extracts the nested workspace-section, routes
+    async-appended sections, and switches panes on click. Runs the real bundle."""
+    import threading
+    import uvicorn
+    from meridian import server as server_module
+
+    with sync_playwright() as p:
+        config = uvicorn.Config(server_module.app, host="127.0.0.1", port=17883, log_level="error")
+        server = uvicorn.Server(config)
+        thread = threading.Thread(target=server.run, daemon=True)
+        thread.start()
+        import time; time.sleep(1.5)
+
+        try:
+            browser = p.chromium.launch()
+            page = browser.new_page()
+            page.goto("http://127.0.0.1:17883/demo", wait_until="domcontentloaded")
+            page.wait_for_timeout(2000)
+
+            built = page.evaluate(
+                """() => {
+                    const PID = 'TESTPID';
+                    // Build a synthetic flat settings body mirroring the template:
+                    // an account card, the PROJECT SETTINGS group, and the account
+                    // group with the workspace-section nested inside it.
+                    const body = document.createElement('div');
+                    body.id = 'settings-body-' + PID;
+                    body.innerHTML =
+                        '<div id="settings-account-card-' + PID + '">acct</div>' +
+                        '<details id="settings-grp-ps-' + PID + '">proj</details>' +
+                        '<details id="settings-grp-aw-' + PID + '">acctgrp' +
+                          '<div id="workspace-section-' + PID + '">ws</div>' +
+                        '</details>' +
+                        '<div id="settings-notifications-card-' + PID + '">notif</div>';
+                    document.body.appendChild(body);
+                    window._organizeSettingsIntoTabs(PID);
+
+                    const paneOf = (sel) => {
+                        const el = document.querySelector(sel);
+                        const pane = el && el.closest('.settings-tabpane');
+                        return pane ? pane.dataset.stabPane : null;
+                    };
+                    const tabBtns = body.querySelectorAll('.settings-tabbar .settings-tab-btn');
+
+                    // Simulate an async-appended Tunnel Plugins section → account.
+                    const tp = document.createElement('div');
+                    tp.id = 'tunnel-plugins-' + PID;
+                    tp.textContent = 'tunnel';
+                    body.appendChild(tp);
+                    return {
+                        nButtons: tabBtns.length,
+                        labels: Array.from(tabBtns).map(b => b.textContent),
+                        accountCardPane: paneOf('#settings-account-card-' + PID),
+                        projGrpPane: paneOf('#settings-grp-ps-' + PID),
+                        workspacePane: paneOf('#workspace-section-' + PID),
+                        notifPane: paneOf('#settings-notifications-card-' + PID),
+                    };
+                }"""
+            )
+            assert built["nButtons"] == 3, built
+            assert built["labels"] == ["Project", "Workspace", "Account"], built
+            assert built["accountCardPane"] == "account", built
+            assert built["projGrpPane"] == "project", built
+            # The nested workspace-section is extracted into the Workspace pane.
+            assert built["workspacePane"] == "workspace", built
+            assert built["notifPane"] == "project", built
+
+            # Let the MutationObserver route the async-appended tunnel section.
+            page.wait_for_timeout(200)
+            tunnel_pane = page.evaluate(
+                """() => {
+                    const el = document.getElementById('tunnel-plugins-TESTPID');
+                    const pane = el && el.closest('.settings-tabpane');
+                    return pane ? pane.dataset.stabPane : null;
+                }"""
+            )
+            assert tunnel_pane == "account", f"tunnel section routed to {tunnel_pane!r}"
+
+            # Switching tabs: activate Workspace → only the workspace pane visible.
+            vis = page.evaluate(
+                """() => {
+                    window._activateSettingsTab('TESTPID', 'workspace');
+                    const body = document.getElementById('settings-body-TESTPID');
+                    const paneVis = {};
+                    body.querySelectorAll(':scope > .settings-tabpane').forEach(pn => {
+                        paneVis[pn.dataset.stabPane] = pn.style.display !== 'none';
+                    });
+                    return paneVis;
+                }"""
+            )
+            assert vis["workspace"] is True, vis
+            assert vis["project"] is False, vis
+            assert vis["account"] is False, vis
+
+            browser.close()
+        finally:
+            server.should_exit = True
+
+
+@pytestmark_playwright
 def test_panels_render_without_pageerror(client):
     """Playwright: /dashboard and /demo render a non-empty main panel, throw
     zero uncaught JS errors, and never 5xx on the panel's data requests.

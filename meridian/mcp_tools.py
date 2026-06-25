@@ -360,11 +360,16 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "handoff_template (string) overrides the default full-mode handoff with a "
         "custom template — supports {{sprint}}, {{recent_tasks}}, {{decisions}}, "
         "{{north_star}}, {{version_goal}}, {{pending_items}}, {{notes}} placeholders. "
-        "Pass an empty string to revert to the server default.",
+        "execution_mode_default ('autonomous'|'interactive', '' to clear) and "
+        "code_intel_enabled_default (bool) are cascade defaults seeded onto NEW "
+        "projects in this workspace (existing projects are unchanged). "
+        "Pass an empty string to revert a field to the server default.",
      "inputSchema": {"type": "object", "properties": {
          "hitl_auto_answer_default": {"type": "boolean"},
          "sprint_name_default": {"type": "string"},
-         "handoff_template": {"type": "string"}},
+         "handoff_template": {"type": "string"},
+         "execution_mode_default": {"type": "string", "description": "Seed new projects' execution mode: 'autonomous', 'interactive', or '' to clear."},
+         "code_intel_enabled_default": {"type": "boolean", "description": "Seed new projects' code-intel toggle."}},
          "required": []}},
     {"name": "add_workspace_sprint_item", "description":
         "Add an item to the workspace-level personal backlog — a cross-project board NOT "

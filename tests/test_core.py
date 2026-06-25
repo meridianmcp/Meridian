@@ -4547,6 +4547,9 @@ def test_workspace_settings_roundtrip_http(client):
     initial = client.get("/workspace/settings").json()
     assert initial["hitl_auto_answer_default"] is False
     assert initial["sprint_name_default"] is None
+    # 0bf67524 — new cascade-default fields default to None.
+    assert initial["execution_mode_default"] is None
+    assert initial["code_intel_enabled_default"] is None
     patched = client.patch(
         "/workspace/settings",
         json={"hitl_auto_answer_default": True, "sprint_name_default": "june"},
@@ -4557,6 +4560,20 @@ def test_workspace_settings_roundtrip_http(client):
     again = client.get("/workspace/settings").json()
     assert again["hitl_auto_answer_default"] is True
     assert again["sprint_name_default"] == "june"
+
+
+def test_workspace_settings_cascade_defaults_http(client):
+    """0bf67524 — PATCH persists the execution_mode/code_intel cascade defaults."""
+    patched = client.patch(
+        "/workspace/settings",
+        json={"execution_mode_default": "interactive",
+              "code_intel_enabled_default": True},
+    ).json()
+    assert patched["execution_mode_default"] == "interactive"
+    assert patched["code_intel_enabled_default"] is True
+    again = client.get("/workspace/settings").json()
+    assert again["execution_mode_default"] == "interactive"
+    assert again["code_intel_enabled_default"] is True
 
 
 def test_workspace_settings_partial_patch_preserves_other_field(client):
