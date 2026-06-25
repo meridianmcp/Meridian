@@ -1505,7 +1505,7 @@ async def run_tunnel(
     _force_utf8_io()
     # Resolve base_url first — it's the cache key for the stored token.
     base_url = _resolve_base_url(base_url)
-    repo_path = str(Path(repo_path or Path.home()).resolve())
+    repo_path = str(Path(repo_path or Path.cwd()).resolve())
 
     # Token priority: --token / env vars > cached token > browser auth flow.
     # The --token flag is kept for CI/scripted use so the raw value is never in
