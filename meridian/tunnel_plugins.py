@@ -73,7 +73,7 @@ BUILTIN_PLUGINS: list[dict[str, Any]] = [
         # generic filesystem tool names are namespaced in the connector. Slots
         # whose inner server already self-prefixes its tools leave this None to
         # avoid double-prefixing. (b4455202)
-        "prefix": "Filesystem",
+        "prefix": None,
         "description": "Filesystem MCP (@modelcontextprotocol/server-filesystem)",
         "description_overrides": {},
     },
@@ -103,7 +103,7 @@ BUILTIN_PLUGINS: list[dict[str, Any]] = [
         "command": list(SERENA_EXTRACT_COMMAND),
         # Serena's bare tool names (find_symbol, replace_symbol_body, …) get a
         # "Serena: " display prefix at the relay so they're namespaced. (b4455202)
-        "prefix": "Serena",
+        "prefix": None,
         "description": "Symbol-level code intelligence (Serena LSP)",
         "description_overrides": {},
     },
