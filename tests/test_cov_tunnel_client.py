@@ -439,6 +439,8 @@ def test_run_connection_lazy_spawns_on_request_and_relays(monkeypatch):
     monkeypatch.setattr(_ws, "connect", lambda url, **kw: FakeWS())
     monkeypatch.setattr(_httpx, "AsyncClient", lambda *a, **k: FakeHttpClient())
     monkeypatch.setattr(tc, "_relay_request", fake_relay)
+    # Pre-flight is incidental here — keep it healthy so it sends no extra msg.
+    monkeypatch.setattr(tc, "_probe_slot_health", AsyncMock(return_value=True))
 
     proxy = tc.SlotProxy(["x"], 8808, "fs")
     ensured = {"n": 0}
@@ -518,6 +520,119 @@ def test_reconnect_loop_lazy_backs_off_then_cancels(monkeypatch):
         asyncio.run(tc._reconnect_loop_lazy("wss://x", proxy, "fs"))
     assert attempts["n"] == 2
     assert sleeps
+
+
+# ---------------------------------------------------------------------------
+# d71ba2e7 — core slot pre-flight health check
+# ---------------------------------------------------------------------------
+
+class _FakeProbeResp:
+    def __init__(self, status):
+        self.status_code = status
+
+
+def _patch_probe_client(monkeypatch, statuses):
+    """Patch httpx.AsyncClient so each .post() pops the next status (or raises
+    on an Exception value)."""
+    seq = list(statuses)
+
+    class _FakeClient:
+        def __init__(self, *a, **k):
+            pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): pass
+        async def post(self, *a, **k):
+            val = seq.pop(0)
+            if isinstance(val, Exception):
+                raise val
+            return _FakeProbeResp(val)
+
+    import httpx as _httpx
+    monkeypatch.setattr(_httpx, "AsyncClient", _FakeClient)
+
+
+def test_probe_slot_health_ok_first_try(monkeypatch):
+    _patch_probe_client(monkeypatch, [200])
+    assert asyncio.run(tc._probe_slot_health(8808, attempts=2, delay=0)) is True
+
+
+def test_probe_slot_health_retries_then_succeeds(monkeypatch):
+    # First a connection error, then a 200 on the retry.
+    _patch_probe_client(monkeypatch, [ConnectionError("refused"), 200])
+    assert asyncio.run(tc._probe_slot_health(8808, attempts=2, delay=0)) is True
+
+
+def test_probe_slot_health_all_fail(monkeypatch):
+    _patch_probe_client(monkeypatch, [503, 500])
+    assert asyncio.run(tc._probe_slot_health(8808, attempts=2, delay=0)) is False
+
+
+def test_preflight_slot_reports_unhealthy_on_failure(monkeypatch):
+    sent = []
+
+    class _WS:
+        async def send(self, data): sent.append(json.loads(data))
+
+    monkeypatch.setattr(tc, "_probe_slot_health", AsyncMock(return_value=False))
+    healthy = asyncio.run(tc._preflight_slot(_WS(), 8808, "fs"))
+    assert healthy is False
+    assert sent == [{"type": "plugin_status", "slot": "fs", "healthy": False}]
+
+
+def test_preflight_slot_healthy_sends_nothing(monkeypatch):
+    sent = []
+
+    class _WS:
+        async def send(self, data): sent.append(json.loads(data))
+
+    monkeypatch.setattr(tc, "_probe_slot_health", AsyncMock(return_value=True))
+    healthy = asyncio.run(tc._preflight_slot(_WS(), 8808, "code"))
+    assert healthy is True
+    assert sent == []
+
+
+def test_run_connection_lazy_preflight_reports_unhealthy(monkeypatch):
+    """First request triggers spawn + pre-flight; a failing probe sends a
+    plugin_status(unhealthy) up the WS before relaying."""
+    sent = []
+
+    class FakeWS:
+        def __init__(self):
+            self._msgs = [json.dumps({"type": "request", "id": "1"})]
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): pass
+        def __aiter__(self): return self
+        async def __anext__(self):
+            if not self._msgs:
+                raise StopAsyncIteration
+            return self._msgs.pop(0)
+        async def send(self, data): sent.append(json.loads(data))
+
+    class FakeHttpClient:
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): pass
+
+    async def fake_relay(client, base, msg, tool_prefix=None):
+        return {"type": "response", "id": msg["id"], "status": 200}
+
+    import httpx as _httpx
+    import websockets as _ws
+    monkeypatch.setattr(_ws, "connect", lambda url, **kw: FakeWS())
+    monkeypatch.setattr(_httpx, "AsyncClient", lambda *a, **k: FakeHttpClient())
+    monkeypatch.setattr(tc, "_relay_request", fake_relay)
+    monkeypatch.setattr(tc, "_probe_slot_health", AsyncMock(return_value=False))
+
+    proxy = tc.SlotProxy(["x"], 8808, "fs")
+
+    async def fake_ensure(self):
+        self._proc = _FakeProc()
+        self.holder["proc"] = self._proc
+    monkeypatch.setattr(tc.SlotProxy, "ensure_running", fake_ensure)
+
+    asyncio.run(tc._run_connection_lazy("wss://x/tunnel/t", proxy, "fs"))
+    # Both the plugin_status (unhealthy) and the relayed response were sent.
+    assert {"type": "plugin_status", "slot": "fs", "healthy": False} in sent
+    assert any(m.get("status") == 200 for m in sent)
 
 
 # ---------------------------------------------------------------------------

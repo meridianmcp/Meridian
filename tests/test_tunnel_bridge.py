@@ -111,6 +111,68 @@ def test_list_tunnel_tools_aggregates_and_reserves(monkeypatch):
     }
 
 
+# ---------------------------------------------------------------------------
+# d71ba2e7 — core slot health registry + suppression
+# ---------------------------------------------------------------------------
+
+def test_slot_health_registry_record_query_clear():
+    try:
+        assert tn._slot_is_healthy("th", "fs") is True       # default: healthy
+        tn._record_slot_health("th", "fs", False)
+        assert tn._slot_is_healthy("th", "fs") is False
+        tn._record_slot_health("th", "code", True)
+        assert tn._slot_is_healthy("th", "code") is True
+        # Clear one slot leaves the other.
+        tn._clear_slot_health("th", "fs")
+        assert tn._slot_is_healthy("th", "fs") is True
+        assert tn._slot_is_healthy("th", "code") is True
+        # Empty slot value is ignored.
+        tn._record_slot_health("th", "", False)
+        # Clear all.
+        tn._clear_slot_health("th")
+        assert tn._slot_health.get("th") is None
+    finally:
+        tn._slot_health.pop("th", None)
+
+
+def test_list_tunnel_tools_suppresses_unhealthy_slot(monkeypatch):
+    tn._tunnel_sockets["th2"] = object()
+    tn._tunnel_code_sockets["th2"] = object()
+    tn._record_slot_health("th2", "fs", False)  # fs marked unhealthy
+
+    def responder(label, method, params):
+        if label == "fs":
+            return {"result": {"tools": [{"name": "read_file"}]}}
+        if label == "code":
+            return {"result": {"tools": [{"name": "trace_path"}]}}
+        return {"result": {"tools": []}}
+
+    _stub_proxy(monkeypatch, responder)
+    try:
+        tools = asyncio.run(tn.list_tunnel_tools("th2"))
+        names = {t["name"] for t in tools}
+        # fs suppressed; only code's tool survives.
+        assert names == {"codebase__trace_path"}
+        assert "filesystem__read_file" not in names
+    finally:
+        tn._slot_health.pop("th2", None)
+        tn._tunnel_sockets.pop("th2", None)
+        tn._tunnel_code_sockets.pop("th2", None)
+        tn._tunnel_tool_routes.pop("th2", None)
+
+
+def test_tunnel_status_includes_slot_health():
+    tn._tunnel_sockets["th3"] = object()
+    tn._record_slot_health("th3", "extract", False)
+    try:
+        status = asyncio.run(tn.tunnel_status("th3"))
+        assert status["active"] is True
+        assert status["slot_health"] == {"extract": False}
+    finally:
+        tn._slot_health.pop("th3", None)
+        tn._tunnel_sockets.pop("th3", None)
+
+
 def test_call_tunnel_tool_routes_to_owner(monkeypatch):
     tn._tunnel_code_sockets["t1"] = object()
     # Routing cache is keyed by the connector-prefixed name.
@@ -349,6 +411,7 @@ def test_tunnel_status_reports_active_sockets():
         "ppt_active": False,
         "word_active": False,
         "dc_active": False,
+        "slot_health": {},  # d71ba2e7 — no slots reported unhealthy
     }
 
 

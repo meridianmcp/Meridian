@@ -198,6 +198,12 @@ async def test_extract_pool_connection_routes_by_header(monkeypatch, tmp_path):
 
     monkeypatch.setattr(tc, "_relay_request", fake_relay)
 
+    # Pre-flight is incidental to this routing test — keep the slot healthy so
+    # it doesn't emit an extra plugin_status message (d71ba2e7).
+    async def _healthy(*a, **k):
+        return True
+    monkeypatch.setattr(tc, "_probe_slot_health", _healthy)
+
     repo = tmp_path / "myrepo"; repo.mkdir()
 
     # Fake websocket: yields one request then stops.

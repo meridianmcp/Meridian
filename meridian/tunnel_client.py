@@ -183,6 +183,61 @@ async def _idle_killer(proxy: "SlotProxy", idle_seconds: float = _IDLE_KILL_SECO
             proxy.kill()
 
 
+async def _probe_slot_health(
+    port: int, *, attempts: int = 2, delay: float = 3.0
+) -> bool:
+    """Pre-flight a freshly-spawned slot proxy with a ``tools/list`` JSON-RPC.
+
+    POSTs to ``http://127.0.0.1:{port}/mcp`` and returns True when the proxy
+    answers with an HTTP 2xx (it is alive and serving MCP). Retries up to
+    *attempts* times with *delay* seconds between tries — a proxy can accept the
+    Popen but still be binding its port for a second or two. (d71ba2e7)
+    """
+    import httpx
+
+    payload = {"jsonrpc": "2.0", "id": "preflight", "method": "tools/list", "params": {}}
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream",
+    }
+    for attempt in range(max(1, attempts)):
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as c:
+                r = await c.post(
+                    f"http://127.0.0.1:{port}/mcp", json=payload, headers=headers
+                )
+            if r.status_code < 400:
+                return True
+        except Exception:  # noqa: BLE001 — connection refused / not up yet
+            pass
+        if attempt + 1 < max(1, attempts):
+            await asyncio.sleep(delay)
+    return False
+
+
+async def _report_slot_health(ws, label: str, healthy: bool) -> None:
+    """Send a ``plugin_status`` control message up the slot's WebSocket so the
+    server can suppress (or restore) this slot's tools. Best-effort. (d71ba2e7)"""
+    try:
+        await ws.send(json.dumps({"type": "plugin_status", "slot": label, "healthy": healthy}))
+    except Exception:  # noqa: BLE001 — never let health reporting break the relay
+        pass
+
+
+async def _preflight_slot(ws, port: int, label: str) -> bool:
+    """Probe a slot after its first spawn; report unhealthy on failure. Returns
+    the health result so callers can log it. (d71ba2e7)"""
+    healthy = await _probe_slot_health(port)
+    if not healthy:
+        print(
+            f"tunnel:{label}: pre-flight health check FAILED on port {port} — "
+            "marking slot unhealthy (its tools will be suppressed)",
+            file=sys.stderr, flush=True,
+        )
+        await _report_slot_health(ws, label, False)
+    return healthy
+
+
 async def _run_connection_lazy(
     ws_url: str,
     proxy: "SlotProxy",
@@ -208,6 +263,10 @@ async def _run_connection_lazy(
     import websockets
 
     _known: list[str] = list(known_repo_paths or [])
+    # d71ba2e7 — one pre-flight health check per connection, fired right after
+    # the first lazy spawn so a proxy that Popen-succeeds but never serves is
+    # reported unhealthy instead of silently 503-ing on every tool call.
+    _preflight_done = False
 
     async with websockets.connect(ws_url, max_size=None, ping_interval=20) as ws:
         print(f"tunnel:{label}: connected (lazy mode)", flush=True)
@@ -238,6 +297,7 @@ async def _run_connection_lazy(
                     continue
                 if msg.get("type") == "request":
                     # Lazy spawn: bring the proxy up if it died or was idle-killed.
+                    _was_running = proxy.is_running
                     if not proxy.is_running:
                         await proxy.ensure_running()
                     if not proxy.is_running:
@@ -252,6 +312,10 @@ async def _run_connection_lazy(
                             "body": base64.b64encode(err).decode(),
                         }))
                         continue
+                    # Pre-flight the proxy once, the first time we bring it up.
+                    if not _preflight_done and not _was_running:
+                        _preflight_done = True
+                        await _preflight_slot(ws, proxy.port, label)
                     proxy.touch()
                     resp = await _relay_request(
                         http_client, local_base, msg, tool_prefix=tool_prefix
@@ -340,6 +404,9 @@ async def _run_extract_pool_connection(
     import httpx
     import websockets
 
+    # d71ba2e7 — one pre-flight per connection after the first daemon spawn.
+    _preflight_done = False
+
     async with websockets.connect(ws_url, max_size=None, ping_interval=20) as ws:
         print(f"tunnel:{label}: connected (Serena daemon pool)", flush=True)
         async with httpx.AsyncClient() as http_client:
@@ -376,6 +443,11 @@ async def _run_extract_pool_connection(
                         file=sys.stderr, flush=True,
                     )
                 if daemon is None or not daemon.is_alive:
+                    # First-spawn failure → report the slot unhealthy so the
+                    # server stops advertising extractor tools (d71ba2e7).
+                    if not _preflight_done:
+                        _preflight_done = True
+                        await _report_slot_health(ws, label, False)
                     err = json.dumps(
                         {"error": f"Serena daemon for {repo_path} not available"}
                     ).encode()
@@ -387,6 +459,10 @@ async def _run_extract_pool_connection(
                         "body": base64.b64encode(err).decode(),
                     }))
                     continue
+                # First successful daemon — pre-flight its MCP port once.
+                if not _preflight_done:
+                    _preflight_done = True
+                    await _preflight_slot(ws, daemon.port, label)
                 resp = await _relay_request(
                     http_client, f"http://127.0.0.1:{daemon.port}", msg,
                     tool_prefix=tool_prefix,
