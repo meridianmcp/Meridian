@@ -970,6 +970,90 @@ def test_start_session_composite():
         _run(db.close())
 
 
+def test_add_sprint_item_auto_infers_touches_resources():
+    """07bdfdbb — a title with no explicit resources gets inferred ones."""
+    db = _make_db()
+    try:
+        proj = _run(mh._dispatch_mcp_tool("create_project", {"name": "infer1"}, db, "/tmp"))
+        out = _run(mh._dispatch_mcp_tool(
+            "add_sprint_item",
+            {"project_id": proj["id"], "version": "v1", "title": "fix server oauth route"},
+            db, "/tmp",
+        ))
+        tr = out.get("touches_resources")
+        if isinstance(tr, str):
+            tr = json.loads(tr)
+        assert "inferred:file:meridian/server.py" in tr
+    finally:
+        _run(db.close())
+
+
+def test_add_sprint_item_explicit_resources_not_inferred():
+    """Explicit touches_resources are kept verbatim — no inference applied."""
+    db = _make_db()
+    try:
+        proj = _run(mh._dispatch_mcp_tool("create_project", {"name": "infer2"}, db, "/tmp"))
+        out = _run(mh._dispatch_mcp_tool(
+            "add_sprint_item",
+            {"project_id": proj["id"], "version": "v1", "title": "fix server route",
+             "touches_resources": ["file:custom.py"]},
+            db, "/tmp",
+        ))
+        tr = out.get("touches_resources")
+        if isinstance(tr, str):
+            tr = json.loads(tr)
+        assert tr == ["file:custom.py"]
+    finally:
+        _run(db.close())
+
+
+def test_add_sprint_item_no_keyword_match_stays_undeclared():
+    """A title that matches no hotspot keyword gets no inferred resources."""
+    db = _make_db()
+    try:
+        proj = _run(mh._dispatch_mcp_tool("create_project", {"name": "infer4"}, db, "/tmp"))
+        out = _run(mh._dispatch_mcp_tool(
+            "add_sprint_item",
+            {"project_id": proj["id"], "version": "v1", "title": "zzz qqq wibble"},
+            db, "/tmp",
+        ))
+        tr = out.get("touches_resources")
+        if isinstance(tr, str) and tr:
+            tr = json.loads(tr)
+        assert not tr
+    finally:
+        _run(db.close())
+
+
+def test_fan_out_sprint_items_auto_infers_per_item():
+    """07bdfdbb — fan-out infers resources per item from each title."""
+    db = _make_db()
+    try:
+        proj = _run(mh._dispatch_mcp_tool("create_project", {"name": "infer3"}, db, "/tmp"))
+        out = _run(mh._dispatch_mcp_tool(
+            "fan_out_sprint_items",
+            {"project_id": proj["id"], "items": [
+                {"title": "update dashboard tab", "version": "v1"},
+                {"title": "fix db migration query", "version": "v1"},
+            ]},
+            db, "/tmp",
+        ))
+        assert out["count"] == 2
+        items = _run(mh._dispatch_mcp_tool(
+            "get_sprint_items", {"project_id": proj["id"]}, db, "/tmp",
+        ))
+        all_tr: list[str] = []
+        for it in items:
+            tr = it.get("touches_resources")
+            if isinstance(tr, str) and tr:
+                tr = json.loads(tr)
+            all_tr.extend(tr or [])
+        assert "inferred:file:meridian/static/dashboard.js" in all_tr
+        assert "inferred:file:meridian/db/__init__.py" in all_tr
+    finally:
+        _run(db.close())
+
+
 def test_set_sprint_unstarted_warning():
     db = _make_db()
     try:

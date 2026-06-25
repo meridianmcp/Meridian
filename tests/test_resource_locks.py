@@ -421,6 +421,45 @@ async def test_parallelizable_groups_mcp_handler_warns_on_undeclared(db):
     assert "resource declarations" in res["warning"]
 
 
+def test_normalize_resource_id_strips_inferred_marker():
+    # 07bdfdbb — inferred resources canonicalize the same as explicit ones.
+    assert db_module.normalize_resource_id(
+        "inferred:file:meridian/server.py"
+    ) == "file:meridian/server.py"
+    assert db_module.normalize_resource_id(
+        "file:meridian/server.py"
+    ) == "file:meridian/server.py"
+
+
+def test_serialize_touches_resources_preserves_inferred_marker():
+    out = db_module.serialize_touches_resources(["inferred:file:a.py"])
+    assert json.loads(out) == ["inferred:file:a.py"]
+    # Explicit resources are stored without a marker.
+    out2 = db_module.serialize_touches_resources(["file:a.py"])
+    assert json.loads(out2) == ["file:a.py"]
+
+
+def test_parse_touches_resources_strips_inferred_for_comparison():
+    # Stored marker is dropped for the conflict-comparison id.
+    assert db_module.parse_touches_resources(["inferred:file:a.py"]) == ["file:a.py"]
+
+
+@pytest.mark.asyncio
+async def test_inferred_resource_conflicts_with_explicit(db):
+    """07bdfdbb — an inferred resource collides with an explicit one for the same
+    file, so the two items are serialized into different groups."""
+    p = await db_module.create_project(db, "infconf")
+    await db_module.add_sprint_item(
+        db, p["id"], "v1", "a", touches_resources=["file:meridian/server.py"]
+    )
+    await db_module.add_sprint_item(
+        db, p["id"], "v1", "b", touches_resources=["inferred:file:meridian/server.py"]
+    )
+    res = await db_module.get_parallelizable_groups(db, p["id"], version="v1")
+    assert res["undeclared_count"] == 0  # both have resources
+    assert res["group_count"] == 2       # same file → can't co-schedule
+
+
 @pytest.mark.asyncio
 async def test_orchestration_hint_surfaces_undeclared_warning(db, tmp_path):
     """de730a25 — start_session's orchestration hint flags undeclared items."""

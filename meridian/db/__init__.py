@@ -5634,8 +5634,16 @@ def parse_resource_identifier(identifier: str) -> tuple[str, str]:
     against :data:`RESOURCE_TYPES`; the value keeps any further colons intact so
     ``"route:POST:/x"`` parses to ``("route", "POST:/x")``. Raises ``ValueError``
     for a missing/unknown type or an empty value.
+
+    07bdfdbb — a leading ``inferred:`` provenance marker (used for
+    auto-populated touches_resources) is stripped before type parsing, so an
+    inferred resource canonicalizes to the SAME id as an explicit one and still
+    participates in conflict detection. The marker only survives in the raw
+    stored value, where it flags the resource as a guess that can be overridden.
     """
     text = (identifier or "").strip()
+    if text.lower().startswith("inferred:"):
+        text = text[len("inferred:"):].strip()
     if ":" not in text:
         raise ValueError(
             f"invalid resource identifier {identifier!r}: expected '<type>:<value>'"
@@ -5733,10 +5741,18 @@ def serialize_touches_resources(raw: Any) -> str | None:
         candidate = str(value or "").strip()
         if not candidate:
             continue
-        norm = normalize_resource_id(candidate)  # raises on bad input
+        # 07bdfdbb — preserve an `inferred:` provenance marker in storage so the
+        # guess stays distinguishable/overridable, while deduping + comparing on
+        # the underlying canonical id (normalize_resource_id strips the marker).
+        marker = ""
+        body = candidate
+        if candidate.lower().startswith("inferred:"):
+            marker = "inferred:"
+            body = candidate[len("inferred:"):].strip()
+        norm = normalize_resource_id(body)  # raises on bad input
         if norm not in seen:
             seen.add(norm)
-            normalized.append(norm)
+            normalized.append(marker + norm)
     return json.dumps(normalized) if normalized else None
 
 
