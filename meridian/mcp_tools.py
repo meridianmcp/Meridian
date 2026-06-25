@@ -507,6 +507,8 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
                           "description": "'stop' blocks this item if the parent fails."},
          "milestone_type": {"type": "string", "enum": ["task", "milestone", "human"],
                             "description": "'milestone' renders as a timeline marker; 'human' marks a task for a human (hidden from executor sessions)."},
+         "touches_resources": {"type": "array", "items": {"type": "string"},
+                               "description": "Typed resource identifiers this item touches, for parallel conflict detection: 'file:path.py', 'db:migrations', 'mcp_tool:name', 'route:METHOD:/path', 'pypi:publish', 'github:tag'. Used by get_parallelizable_groups to cluster non-overlapping items."},
          "force": {"type": "boolean",
                    "description": "Override the duplicate guard and add the item even if its title closely matches an existing open item. Default false."}},
          "required": ["version", "title"]}},
@@ -530,6 +532,7 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
                      "description": {"type": "string", "description": "Optional notes / detail for the item."},
                      "group": {"type": "string", "description": "Optional objective group name."},
                      "version": {"type": "string", "description": "Optional sprint-version bucket; defaults to empty string."},
+                     "touches_resources": {"type": "array", "items": {"type": "string"}, "description": "Optional typed resource identifiers (file:/db:/mcp_tool:/route:/pypi:/github:) for parallel conflict detection."},
                  },
                  "required": ["title"],
              },
@@ -547,7 +550,9 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "version": {"type": "string", "description": "Move the item to a different version/sprint bucket."},
          "notes": {"type": "string", "description": "Free-form note/context shown on the item."},
          "human_id": {"type": "string", "description": "Reassign to a person (assignee); empty string clears it."},
-         "group": {"type": "string", "description": "Objective name to group the item under (item_group); empty string clears it."}},
+         "group": {"type": "string", "description": "Objective name to group the item under (item_group); empty string clears it."},
+         "touches_resources": {"type": "array", "items": {"type": "string"},
+                               "description": "Replace the item's typed resource identifiers (file:/db:/mcp_tool:/route:/pypi:/github:). Pass [] to clear. Omit to leave unchanged."}},
          "required": ["item_id"]}},
     {"name": "complete_sprint_item", "description":
         "Mark a sprint item done. Pass task_id to link the task that shipped it. "
@@ -586,6 +591,20 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
                     "enum": ["pending", "todo", "in_progress", "provisional_complete",
                              "done", "failed", "skipped", "pushed", "indeterminate"],
                     "description": "Filter by status."}},
+         "required": []}},
+    {"name": "get_parallelizable_groups", "description":
+        "Read-only: Return clusters of pending sprint items that are safe to run "
+        "simultaneously. Filters pending/todo items (optionally by version) whose "
+        "depends_on is satisfied, then greedily partitions them into groups where no "
+        "two items in a group share a touches_resources identifier. The orchestrator "
+        "fans out each group as a parallel subagent batch and runs the groups in "
+        "sequence. Returns {version, groups: [[item,...],...], group_count, "
+        "eligible_count, undeclared_count, blocked: [...]}. Items still waiting on an "
+        "unfinished dependency are listed under 'blocked', not in any group. "
+        "Makes parallel sprints system-enforced rather than LLM-guessed.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "version": {"type": "string", "description": "Optional: only consider items in this sprint-version bucket."}},
          "required": []}},
     {"name": "get_session_log", "description":
         "Read-only: Return the full task log for the given session. "

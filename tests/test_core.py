@@ -6204,6 +6204,9 @@ def test_pg_migration_registry_matches_historical_order():
         "_migrate_pg_api_token_expires_at",
         "_migrate_pg_oauth_codes",
         "_migrate_pg_github_to_projects",
+        "_migrate_pg_touches_resources",
+        "_migrate_pg_resource_locks",
+        "_migrate_pg_sprint_item_stall_count",
         "_migrate_pg_queued_session",
         "_migrate_pg_parallel_safety",
         "_migrate_pg_changelog_entries",
@@ -6227,7 +6230,7 @@ def test_pg_migration_registry_matches_historical_order():
     ]
     # No duplicates across the three groups.
     allnames = core + hosted + late
-    assert len(allnames) == len(set(allnames)) == 59
+    assert len(allnames) == len(set(allnames)) == 62
 
 
 def test_default_agent_instructions_has_code_intel_protocol():

@@ -501,6 +501,25 @@ CREATE INDEX IF NOT EXISTS idx_file_locks_session
 CREATE INDEX IF NOT EXISTS idx_file_locks_expires
     ON file_locks(expires_at);
 
+-- 501ec93f — resource_locks: generalize file_locks to any typed resource
+-- (file:path, db:migrations, mcp_tool:name, route:METHOD:/path, pypi:publish,
+-- github:tag). Same TTL + UNIQUE primitive: one holder per resource_id at a
+-- time, auto-expiring by TTL or owning-session heartbeat.
+CREATE TABLE IF NOT EXISTS resource_locks (
+    id TEXT PRIMARY KEY,
+    resource_id TEXT NOT NULL UNIQUE,
+    resource_type TEXT NOT NULL,
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    claimed_at TEXT NOT NULL DEFAULT (datetime('now')),
+    expires_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_resource_locks_session
+    ON resource_locks(session_id);
+CREATE INDEX IF NOT EXISTS idx_resource_locks_expires
+    ON resource_locks(expires_at);
+CREATE INDEX IF NOT EXISTS idx_resource_locks_type
+    ON resource_locks(resource_type);
+
 -- Symbol-level parallel protection (4bac57ff): claim individual class/function
 -- /method line ranges so two sessions can edit the same file without colliding.
 CREATE TABLE IF NOT EXISTS file_symbol_claims (
@@ -760,6 +779,9 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_device_codes_table(db)
     await _migrate_github_to_projects(db)
     await _migrate_touches_files(db)
+    await _migrate_touches_resources(db)
+    await _migrate_resource_locks(db)
+    await _migrate_sprint_item_stall_count(db)
     await _migrate_active_worktrees(db)
     await _migrate_workspace_tenant_isolation(db)
     await _migrate_workspace_sprint_board(db)
@@ -1947,15 +1969,178 @@ async def keepalive_sessions(
     return cursor.rowcount
 
 
+# bc9259b8 — worker stall auto-retry budget. A sprint item left in_progress by a
+# closing/stale worker is re-queued to pending while its stall_count is within
+# this budget; once it would exceed the budget it is marked failed silently (no
+# HITL, no human ping) so the orchestrator just moves on.
+_MAX_SPRINT_STALL_RETRIES = 2
+
+
+async def _session_stall_summary(
+    db: aiosqlite.Connection, session_id: str, *, limit: int = 5
+) -> str:
+    """Build a compact 'last session log' string for a stalled worker session.
+
+    Joins the session's most recent task_log descriptions so the failure note on
+    a permanently-stalled item captures what the worker was doing. Best-effort:
+    returns '(no session log)' when the session logged nothing.
+    """
+    async with db.execute(
+        "SELECT description FROM task_log WHERE session_id = ? "
+        "ORDER BY created_at DESC LIMIT ?",
+        (session_id, limit),
+    ) as cur:
+        rows = await cur.fetchall()
+    descs = [str((_row_to_dict(r) or {}).get("description") or "").strip() for r in rows]
+    descs = [d for d in descs if d]
+    if not descs:
+        return "(no session log)"
+    return " | ".join(descs)
+
+
+async def _stalled_item_ids_for_session(
+    db: aiosqlite.Connection, session_id: str
+) -> list[str]:
+    """Return distinct sprint-item ids this session was working on.
+
+    A worker links to an item via a registered worktree (active_worktrees.item_id)
+    or via task_log rows tagged with sprint_item_id. The union covers both the
+    worktree-isolated and single-tree worker styles.
+    """
+    ids: list[str] = []
+    seen: set[str] = set()
+    async with db.execute(
+        "SELECT item_id FROM active_worktrees "
+        "WHERE session_id = ? AND item_id IS NOT NULL AND removed_at IS NULL",
+        (session_id,),
+    ) as cur:
+        for r in await cur.fetchall():
+            iid = (_row_to_dict(r) or {}).get("item_id")
+            if iid and iid not in seen:
+                seen.add(iid)
+                ids.append(iid)
+    async with db.execute(
+        "SELECT DISTINCT sprint_item_id FROM task_log "
+        "WHERE session_id = ? AND sprint_item_id IS NOT NULL",
+        (session_id,),
+    ) as cur:
+        for r in await cur.fetchall():
+            iid = (_row_to_dict(r) or {}).get("sprint_item_id")
+            if iid and iid not in seen:
+                seen.add(iid)
+                ids.append(iid)
+    return ids
+
+
+async def requeue_or_fail_stalled_item(
+    db: aiosqlite.Connection,
+    project_id: str,
+    item_id: str,
+    *,
+    session_id: str | None = None,
+) -> dict[str, Any] | None:
+    """bc9259b8 — handle one stalled sprint item: re-queue, or fail after the budget.
+
+    Increments ``stall_count``. While the new count is within
+    :data:`_MAX_SPRINT_STALL_RETRIES`, the item is re-queued to ``pending``
+    (claim cleared) so another worker can pick it up. Once the new count exceeds
+    the budget the item is marked ``failed`` with the stalling session's last log
+    appended to its notes — silently, with no HITL. No-op (returns None) when the
+    item is missing, in another project, or not currently ``in_progress``.
+    """
+    item = await get_sprint_item(db, item_id)
+    if item is None or item.get("project_id") != project_id:
+        return None
+    if (item.get("status") or "pending") != "in_progress":
+        return None  # completed/failed/already re-queued — not a stall
+    new_count = int(item.get("stall_count") or 0) + 1
+    if new_count > _MAX_SPRINT_STALL_RETRIES:
+        last_log = (
+            await _session_stall_summary(db, session_id) if session_id else "(unknown session)"
+        )
+        reason = (
+            f"Auto-failed after {new_count - 1} stall retr"
+            f"{'y' if new_count - 1 == 1 else 'ies'} "
+            f"(worker closed without completing). Last session log: {last_log}"
+        )
+        await db.execute(
+            "UPDATE sprint_items SET status = 'failed', stall_count = ?, "
+            "claimed_at = NULL, notes = ? WHERE id = ? AND project_id = ?",
+            (new_count, reason, item_id, project_id),
+        )
+        await db.commit()
+        _invalidate_sprint_items_cache(project_id)
+        _publish_project_event(
+            project_id, "sprint_item_updated", {"item_id": item_id, "status": "failed"}
+        )
+        updated = await get_sprint_item(db, item_id)
+        return {"action": "failed", "item": updated, "stall_count": new_count}
+    await db.execute(
+        "UPDATE sprint_items SET status = 'pending', stall_count = ?, "
+        "claimed_at = NULL, completed_at = NULL WHERE id = ? AND project_id = ?",
+        (new_count, item_id, project_id),
+    )
+    await db.commit()
+    _invalidate_sprint_items_cache(project_id)
+    _publish_project_event(
+        project_id, "sprint_item_updated", {"item_id": item_id, "status": "pending"}
+    )
+    updated = await get_sprint_item(db, item_id)
+    return {"action": "requeued", "item": updated, "stall_count": new_count}
+
+
+async def handle_session_stall(
+    db: aiosqlite.Connection, session_id: str
+) -> dict[str, Any]:
+    """bc9259b8 — re-queue or fail any sprint items a closing worker left in_progress.
+
+    Finds every sprint item this session was working on (worktree or task link)
+    that is still ``in_progress`` and routes it through
+    :func:`requeue_or_fail_stalled_item`. Returns ``{"requeued": [ids], "failed":
+    [ids]}``. Safe no-op when the session completed its work (items already done).
+    """
+    async with db.execute(
+        "SELECT project_id FROM sessions WHERE id = ?", (session_id,)
+    ) as cur:
+        srow = await cur.fetchone()
+    sess = _row_to_dict(srow)
+    requeued: list[str] = []
+    failed: list[str] = []
+    if not sess or not sess.get("project_id"):
+        return {"requeued": requeued, "failed": failed}
+    project_id = sess["project_id"]
+    for item_id in await _stalled_item_ids_for_session(db, session_id):
+        result = await requeue_or_fail_stalled_item(
+            db, project_id, item_id, session_id=session_id
+        )
+        if result is None:
+            continue
+        if result["action"] == "failed":
+            failed.append(item_id)
+        else:
+            requeued.append(item_id)
+    return {"requeued": requeued, "failed": failed}
+
+
 async def close_session(db: aiosqlite.Connection, session_id: str) -> None:
-    """Mark a session as closed and finalize its executor_run."""
+    """Mark a session as closed and finalize its executor_run.
+
+    bc9259b8 — before tearing down, any sprint item this worker left in_progress
+    (closed without complete_sprint_item) is re-queued to pending, or failed
+    silently once it exhausts its stall-retry budget.
+    """
     await db.execute(
         "UPDATE sessions SET status = 'closed' WHERE id = ?",
         (session_id,),
     )
     await release_file_locks_for_session(db, session_id)
+    await release_resource_locks_for_session(db, session_id)
     await release_symbol_claims_for_session(db, session_id)
     await db.commit()
+    try:
+        await handle_session_stall(db, session_id)
+    except Exception:  # noqa: BLE001 — stall recovery must never block session close
+        pass
     try:
         await finalize_executor_run(db, session_id, status="done")
     except Exception:
@@ -2571,15 +2756,14 @@ async def expire_inactive_sessions(
         affected_project_ids = [row["project_id"] for row in await cur.fetchall()]
 
     async with db.execute(
-        "SELECT id, sprint_item_id FROM task_log "
+        "SELECT id, sprint_item_id, claimed_by FROM task_log "
         "WHERE claimed_by IN ("
         "  SELECT id FROM sessions WHERE status IN ('active', 'idle') AND last_seen < ?"
         ") AND status = 'in_progress'",
         (cutoff,),
     ) as cur:
-        stale_rows = await cur.fetchall()
+        stale_rows = [_row_to_dict(r) or {} for r in await cur.fetchall()]
     stale_task_ids = [row["id"] for row in stale_rows]
-    linked_item_ids = [row["sprint_item_id"] for row in stale_rows if row["sprint_item_id"]]
     if stale_task_ids:
         placeholders = ", ".join("?" for _ in stale_task_ids)
         await db.execute(
@@ -2587,12 +2771,22 @@ async def expire_inactive_sessions(
             f"WHERE id IN ({placeholders})",
             tuple(stale_task_ids),
         )
-    if linked_item_ids:
-        placeholders = ", ".join("?" for _ in linked_item_ids)
-        await db.execute(
-            f"UPDATE sprint_items SET status = 'pending', completed_at = NULL "
-            f"WHERE id IN ({placeholders}) AND status = 'in_progress'",
-            tuple(linked_item_ids),
+    await db.commit()
+    # bc9259b8 — a crashed worker never calls close_session, so route each linked
+    # in_progress sprint item through the stall-retry budget here too: re-queue
+    # while under budget, fail silently once exhausted (instead of resetting to
+    # pending forever). Dedup on item_id; keep the claiming session for the log.
+    _seen_items: set[str] = set()
+    for row in stale_rows:
+        iid = row.get("sprint_item_id")
+        if not iid or iid in _seen_items:
+            continue
+        _seen_items.add(iid)
+        item = await get_sprint_item(db, iid)
+        if item is None:
+            continue
+        await requeue_or_fail_stalled_item(
+            db, item["project_id"], iid, session_id=row.get("claimed_by")
         )
     cursor = await db.execute(
         "UPDATE sessions SET status = 'archived' "
@@ -2701,6 +2895,7 @@ async def add_sprint_item(
     depends_on: str | None = None,
     failure_mode: str | None = None,
     milestone_type: str = "task",
+    touches_resources: Any = None,
     force: bool = False,
 ) -> dict[str, Any]:
     """Append a new ``todo`` sprint item to a project's checklist.
@@ -2757,13 +2952,16 @@ async def add_sprint_item(
                             "overlap_pct": _pct,
                         },
                     }
+    # 501ec93f — normalize + validate typed resource identifiers (raises on bad input).
+    resources_json = serialize_touches_resources(touches_resources)
     iid = _new_id()
     await db.execute(
         "INSERT INTO sprint_items "
-        "(id, project_id, version, title, item_group, human_id, depends_on, failure_mode, milestone_type) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "(id, project_id, version, title, item_group, human_id, depends_on, "
+        "failure_mode, milestone_type, touches_resources) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (iid, project_id, version, title, group, human_id,
-         depends_on, failure_mode or "continue", milestone_type),
+         depends_on, failure_mode or "continue", milestone_type, resources_json),
     )
     await db.commit()
     item = await get_sprint_item(db, iid)
@@ -2797,12 +2995,16 @@ async def fan_out_sprint_items(
         version = (spec.get("version") or spec.get("sprint") or "").strip()
         group = spec.get("group") or spec.get("item_group") or None
         description = spec.get("description") or None
+        try:
+            resources_json = serialize_touches_resources(spec.get("touches_resources"))
+        except ValueError:
+            resources_json = None  # best-effort in bulk insert — skip bad values
         iid = _new_id()
         await db.execute(
             "INSERT INTO sprint_items "
-            "(id, project_id, version, title, item_group, notes) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (iid, project_id, version, title, group, description),
+            "(id, project_id, version, title, item_group, notes, touches_resources) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (iid, project_id, version, title, group, description, resources_json),
         )
         ids.append(iid)
     if ids:
@@ -3039,12 +3241,16 @@ async def patch_sprint_item(
     notes: str | None = None,
     human_id: str | None = None,
     item_group: str | None = None,
+    touches_resources: Any = _UNSET,
 ) -> dict[str, Any] | None:
     """Update editable fields of a sprint item.
 
     Editable: title, version, status, feedback, notes, human_id (assignee),
-    item_group. Only fields passed as non-None are changed; omitted fields are
-    left untouched. To clear human_id or item_group, pass an empty string.
+    item_group, touches_resources. Only fields passed as non-None are changed;
+    omitted fields are left untouched. To clear human_id or item_group, pass an
+    empty string. ``touches_resources`` (501ec93f) uses the ``_UNSET`` sentinel
+    so it can be omitted entirely; pass ``None`` or ``[]`` to clear it, or a list
+    / JSON string / comma-separated string of typed ids to set it.
     """
     fields: list[str] = []
     values: list[Any] = []
@@ -3074,6 +3280,9 @@ async def patch_sprint_item(
     if item_group is not None:
         fields.append("item_group = ?")
         values.append(item_group or None)
+    if touches_resources is not _UNSET:
+        fields.append("touches_resources = ?")
+        values.append(serialize_touches_resources(touches_resources))
     if not fields:
         return await get_sprint_item(db, item_id)
     values.extend([item_id, project_id])
@@ -5217,6 +5426,425 @@ async def get_file_claims(
             db, project_id, normalized, symbol
         )
     return result
+
+
+# ---------------------------------------------------------------------------
+# Generalized typed-resource locks (501ec93f)
+# ---------------------------------------------------------------------------
+
+# Valid resource-type prefixes for a touches_resources / resource_locks entry.
+# A typed identifier is "<type>:<value>"; 'route' additionally carries the HTTP
+# method, e.g. "route:POST:/projects". Unknown types are rejected so a typo
+# never silently becomes an un-conflicting resource.
+RESOURCE_TYPES = (
+    "file",       # file:meridian/db/__init__.py
+    "db",         # db:migrations
+    "mcp_tool",   # mcp_tool:get_parallelizable_groups
+    "route",      # route:POST:/projects
+    "pypi",       # pypi:publish
+    "github",     # github:tag
+)
+
+
+def parse_resource_identifier(identifier: str) -> tuple[str, str]:
+    """Split a typed resource identifier into ``(resource_type, value)``.
+
+    ``identifier`` is ``"<type>:<value>"``. The type is matched case-insensitively
+    against :data:`RESOURCE_TYPES`; the value keeps any further colons intact so
+    ``"route:POST:/x"`` parses to ``("route", "POST:/x")``. Raises ``ValueError``
+    for a missing/unknown type or an empty value.
+    """
+    text = (identifier or "").strip()
+    if ":" not in text:
+        raise ValueError(
+            f"invalid resource identifier {identifier!r}: expected '<type>:<value>'"
+        )
+    rtype, value = text.split(":", 1)
+    rtype = rtype.strip().lower()
+    value = value.strip()
+    if rtype not in RESOURCE_TYPES:
+        raise ValueError(
+            f"unknown resource type {rtype!r}: expected one of {', '.join(RESOURCE_TYPES)}"
+        )
+    if not value:
+        raise ValueError(f"resource identifier {identifier!r} has an empty value")
+    return rtype, value
+
+
+def normalize_resource_id(identifier: str) -> str:
+    """Canonicalize a typed resource identifier for storage / comparison.
+
+    Lowercases the type, strips whitespace, and normalizes ``file:`` paths the
+    same way file locks do (backslashes → slashes, drop a leading ``./``) so the
+    same file referenced two ways collides on one lock. Returns the canonical
+    ``"<type>:<value>"`` string. Raises ``ValueError`` on an invalid identifier.
+    """
+    rtype, value = parse_resource_identifier(identifier)
+    if rtype == "file":
+        value = value.replace("\\", "/")
+        if value.startswith("./"):
+            value = value[2:]
+    return f"{rtype}:{value}"
+
+
+def parse_touches_resources(raw: Any) -> list[str]:
+    """Decode a sprint item's ``touches_resources`` field into normalized ids.
+
+    Accepts a JSON list, a Python list, or a comma-separated string. Each entry
+    is normalized via :func:`normalize_resource_id`; entries that fail validation
+    are skipped (best-effort decode so a single bad value never breaks reads).
+    Duplicates are collapsed while preserving first-seen order. ``None``/empty
+    yields ``[]``.
+    """
+    if raw is None:
+        return []
+    if isinstance(raw, list):
+        values: list[Any] = raw
+    else:
+        text = str(raw).strip()
+        if not text:
+            return []
+        try:
+            decoded = json.loads(text)
+            values = decoded if isinstance(decoded, list) else [decoded]
+        except Exception:  # noqa: BLE001
+            values = [part.strip() for part in text.split(",")]
+    out: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        candidate = str(value or "").strip()
+        if not candidate:
+            continue
+        try:
+            normalized = normalize_resource_id(candidate)
+        except ValueError:
+            continue
+        if normalized not in seen:
+            seen.add(normalized)
+            out.append(normalized)
+    return out
+
+
+def serialize_touches_resources(raw: Any) -> str | None:
+    """Normalize and JSON-encode a touches_resources input for storage.
+
+    Returns a JSON array string, or ``None`` when there are no valid resources
+    (so the column stays NULL rather than holding ``"[]"``). Raises ``ValueError``
+    when an explicit identifier is malformed, so writers surface bad input
+    instead of silently dropping it.
+    """
+    if raw is None:
+        return None
+    if isinstance(raw, list):
+        items = raw
+    else:
+        text = str(raw).strip()
+        if not text:
+            return None
+        try:
+            decoded = json.loads(text)
+            items = decoded if isinstance(decoded, list) else [decoded]
+        except Exception:  # noqa: BLE001
+            items = [part.strip() for part in text.split(",")]
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for value in items:
+        candidate = str(value or "").strip()
+        if not candidate:
+            continue
+        norm = normalize_resource_id(candidate)  # raises on bad input
+        if norm not in seen:
+            seen.add(norm)
+            normalized.append(norm)
+    return json.dumps(normalized) if normalized else None
+
+
+async def expire_resource_locks(db: aiosqlite.Connection) -> int:
+    """Delete expired resource locks and return how many rows were cleared.
+
+    Mirrors :func:`expire_file_locks` exactly — two expiry paths: explicit TTL
+    (expires_at <= now) and owning-session heartbeat (last_seen older than
+    _CLAIM_LIVE_HOURS, for crashed sessions that never released).
+    """
+    stale_cutoff = _cutoff_dt(_CLAIM_LIVE_HOURS)
+    cursor = await db.execute(
+        "DELETE FROM resource_locks WHERE expires_at <= datetime('now') "
+        "OR session_id IN ("
+        "    SELECT id FROM sessions "
+        "    WHERE last_seen IS NOT NULL AND last_seen < ?"
+        ")",
+        (stale_cutoff,),
+    )
+    await db.commit()
+    return cursor.rowcount
+
+
+async def claim_resource(
+    db: aiosqlite.Connection,
+    resource_id: str,
+    session_id: str,
+    *,
+    ttl_hours: int = _FILE_LOCK_TTL_HOURS,
+) -> dict[str, Any]:
+    """Claim a typed resource for a session, auto-releasing expired locks first.
+
+    Same primitive as :func:`claim_file` but for any typed resource id. Returns
+    ``{"claimed": bool, "resource_id", "resource_type", "session_id",
+    "claimed_at", "expires_at", ...}``. When another live session already holds
+    the resource, ``claimed`` is False and ``holder_session_id`` names the owner.
+    Re-claiming a resource you already hold refreshes the TTL (idempotent).
+    """
+    normalized = normalize_resource_id(resource_id)  # raises on bad input
+    rtype, _ = parse_resource_identifier(normalized)
+    await expire_resource_locks(db)
+    async with db.execute(
+        "SELECT * FROM resource_locks WHERE resource_id = ?",
+        (normalized,),
+    ) as cur:
+        existing_row = await cur.fetchone()
+    existing = _row_to_dict(existing_row)
+    if existing and existing.get("session_id") != session_id:
+        return {
+            "claimed": False,
+            "resource_id": normalized,
+            "resource_type": rtype,
+            "session_id": session_id,
+            "holder_session_id": existing.get("session_id"),
+            "claimed_at": existing.get("claimed_at"),
+            "expires_at": existing.get("expires_at"),
+        }
+    if existing and existing.get("session_id") == session_id:
+        await db.execute(
+            "UPDATE resource_locks SET claimed_at = datetime('now'), "
+            "expires_at = datetime('now', ? || ' hours') WHERE id = ?",
+            (str(ttl_hours), existing["id"]),
+        )
+    else:
+        await db.execute(
+            "INSERT INTO resource_locks "
+            "(id, resource_id, resource_type, session_id, claimed_at, expires_at) "
+            "VALUES (?, ?, ?, ?, datetime('now'), datetime('now', ? || ' hours')) "
+            "ON CONFLICT (resource_id) DO NOTHING",
+            (_new_id(), normalized, rtype, session_id, str(ttl_hours)),
+        )
+    await db.commit()
+    async with db.execute(
+        "SELECT * FROM resource_locks WHERE resource_id = ?",
+        (normalized,),
+    ) as cur:
+        row = await cur.fetchone()
+    lock = _row_to_dict(row) or {}
+    if lock.get("session_id") != session_id:
+        # Another session raced us (ON CONFLICT DO NOTHING was a no-op).
+        return {
+            "claimed": False,
+            "resource_id": normalized,
+            "resource_type": rtype,
+            "session_id": session_id,
+            "holder_session_id": lock.get("session_id"),
+            "claimed_at": lock.get("claimed_at"),
+            "expires_at": lock.get("expires_at"),
+        }
+    return {
+        "claimed": True,
+        "resource_id": normalized,
+        "resource_type": rtype,
+        "session_id": lock.get("session_id"),
+        "claimed_at": lock.get("claimed_at"),
+        "expires_at": lock.get("expires_at"),
+    }
+
+
+async def release_resource(
+    db: aiosqlite.Connection,
+    resource_id: str,
+    session_id: str,
+) -> bool:
+    """Release a resource lock only when it is owned by ``session_id``."""
+    try:
+        normalized = normalize_resource_id(resource_id)
+    except ValueError:
+        return False
+    cursor = await db.execute(
+        "DELETE FROM resource_locks WHERE resource_id = ? AND session_id = ?",
+        (normalized, session_id),
+    )
+    await db.commit()
+    return cursor.rowcount > 0
+
+
+async def release_resource_locks_for_session(
+    db: aiosqlite.Connection,
+    session_id: str,
+) -> int:
+    """Release every resource lock held by a session."""
+    cursor = await db.execute(
+        "DELETE FROM resource_locks WHERE session_id = ?",
+        (session_id,),
+    )
+    await db.commit()
+    return cursor.rowcount
+
+
+async def get_resource_claims(
+    db: aiosqlite.Connection,
+    resource_id: str,
+) -> dict[str, Any]:
+    """Return the active lock on a resource (with holder session_name) or None.
+
+    Read-only. Expires stale locks first so callers never see a lock past TTL.
+    """
+    normalized = normalize_resource_id(resource_id)
+    await expire_resource_locks(db)
+    async with db.execute(
+        "SELECT rl.*, s.name AS session_name FROM resource_locks rl "
+        "LEFT JOIN sessions s ON s.id = rl.session_id "
+        "WHERE rl.resource_id = ?",
+        (normalized,),
+    ) as cur:
+        row = await cur.fetchone()
+    return {
+        "resource_id": normalized,
+        "resource_lock": _row_to_dict(row),
+    }
+
+
+async def get_resource_conflicts(
+    db: aiosqlite.Connection,
+    project_id: str,
+    resources: list[str],
+    *,
+    exclude_session_id: str | None = None,
+) -> list[dict[str, Any]]:
+    """Return active resource locks (held by other live sessions) overlapping ``resources``.
+
+    Used for pre-claim / pre-fanout conflict detection: given the resource ids a
+    unit of work wants to touch, surface any that another still-live session in
+    the project already holds. Stale locks are expired first.
+    """
+    wanted: set[str] = set()
+    for r in resources or []:
+        try:
+            wanted.add(normalize_resource_id(r))
+        except ValueError:
+            continue
+    if not wanted:
+        return []
+    await expire_resource_locks(db)
+    params: list[Any] = [project_id]
+    exclude_clause = ""
+    if exclude_session_id:
+        exclude_clause = "AND rl.session_id != ? "
+        params.append(exclude_session_id)
+    async with db.execute(
+        "SELECT rl.resource_id, rl.resource_type, rl.session_id, "
+        "       s.name AS session_name, s.last_seen "
+        "FROM resource_locks rl "
+        "JOIN sessions s ON s.id = rl.session_id "
+        "WHERE s.project_id = ? "
+        f"{exclude_clause}"
+        "AND s.status IN ('active', 'live') "
+        "AND (s.last_seen IS NULL OR s.last_seen > datetime('now', '-10 minutes'))",
+        tuple(params),
+    ) as cur:
+        rows = await cur.fetchall()
+    conflicts: list[dict[str, Any]] = []
+    for row in rows:
+        r = _row_to_dict(row) or {}
+        rid = str(r.get("resource_id") or "")
+        if rid not in wanted:
+            continue
+        conflicts.append({
+            "resource_id": rid,
+            "resource_type": r.get("resource_type"),
+            "session_id": r.get("session_id"),
+            "session_name": r.get("session_name"),
+            "last_seen": r.get("last_seen"),
+        })
+    return conflicts
+
+
+async def get_parallelizable_groups(
+    db: aiosqlite.Connection,
+    project_id: str,
+    version: str | None = None,
+) -> dict[str, Any]:
+    """255096d9 — cluster pending sprint items that are safe to run in parallel.
+
+    Algorithm:
+      1. Take pending/todo items (optionally filtered to ``version``) whose
+         ``depends_on`` is satisfied (no parent, or parent is done — or parent
+         failed with failure_mode='continue'). Items still waiting on a parent
+         are returned separately under ``blocked``.
+      2. Build a conflict graph: two eligible items conflict when their
+         ``touches_resources`` sets intersect (see 501ec93f). An item with no
+         declared resources conflicts with nothing (empty ∩ anything = ∅).
+      3. Greedy first-fit coloring partitions the items into groups such that no
+         two items *within a group* share a resource — so every group is a batch
+         the orchestrator can fan out simultaneously, and successive groups run
+         in sequence.
+
+    Returns ``{"version", "groups": [[item, ...], ...], "group_count",
+    "eligible_count", "blocked": [...], "undeclared_count"}``. ``groups`` items
+    are full sprint-item dicts with a derived ``resources`` list attached.
+    """
+    items = await get_sprint_items(db, project_id)
+    if version is not None:
+        items = [it for it in items if it.get("version") == version]
+    claimable_statuses = {"pending", "todo"}
+    eligible: list[dict[str, Any]] = []
+    blocked: list[dict[str, Any]] = []
+    for it in items:
+        if (it.get("status") or "pending") not in claimable_statuses:
+            continue
+        if it.get("claimed_at"):
+            continue  # already in flight
+        parent_block = await get_blocking_dependency_for_sprint_item(db, it["id"])
+        if parent_block is not None:
+            # Parent failed + this item's failure_mode='continue' → still runnable.
+            if (
+                parent_block.get("status") == "failed"
+                and (it.get("failure_mode") or "continue") == "continue"
+            ):
+                pass
+            else:
+                blocked.append({
+                    "id": it["id"],
+                    "title": it.get("title", ""),
+                    "depends_on": it.get("depends_on"),
+                    "blocked_by_status": parent_block.get("status"),
+                })
+                continue
+        enriched = {**it, "resources": parse_touches_resources(it.get("touches_resources"))}
+        eligible.append(enriched)
+    # Stable order: oldest first, then id, so coloring is deterministic.
+    eligible.sort(key=lambda it: (str(it.get("added_at") or ""), it["id"]))
+    # Greedy first-fit graph coloring on the resource-conflict graph.
+    groups: list[list[dict[str, Any]]] = []
+    group_resource_sets: list[set[str]] = []
+    undeclared = 0
+    for it in eligible:
+        res = set(it["resources"])
+        if not res:
+            undeclared += 1
+        placed = False
+        for gi, used in enumerate(group_resource_sets):
+            if res.isdisjoint(used):
+                groups[gi].append(it)
+                used.update(res)
+                placed = True
+                break
+        if not placed:
+            groups.append([it])
+            group_resource_sets.append(set(res))
+    return {
+        "version": version,
+        "groups": groups,
+        "group_count": len(groups),
+        "eligible_count": len(eligible),
+        "undeclared_count": undeclared,
+        "blocked": blocked,
+    }
 
 
 # ---------------------------------------------------------------------------
