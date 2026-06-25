@@ -1244,6 +1244,9 @@ async def _handle_project_tools(
             # 9f6aec5f — inject a codebase-architecture summary so the executor
             # starts already knowing the code's shape. No-op without a healthy,
             # indexed code-intel tunnel; never fails the orientation.
+            # 2c645647 — when that index is available, also prepend the
+            # CODEBASE INDEX directive to agent_instructions so graph-tool usage
+            # is a protocol-level instruction, not just advisory tool text.
             try:
                 if isinstance(result, dict) and "continuation" not in result:
                     _cc = await _server._build_codebase_context(
@@ -1252,6 +1255,11 @@ async def _handle_project_tools(
                     )
                     if _cc:
                         result["codebase_context"] = _cc
+                        _existing_ai = result.get("agent_instructions")
+                        result["agent_instructions"] = (
+                            f"{_server.CODEBASE_INDEX_DIRECTIVE}\n\n{_existing_ai}"
+                            if _existing_ai else _server.CODEBASE_INDEX_DIRECTIVE
+                        )
             except Exception:  # noqa: BLE001 — orientation must not break
                 pass
         return result

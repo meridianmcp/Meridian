@@ -3631,6 +3631,17 @@ async def _build_orchestration_hint(
 _CODEBASE_CONTEXT_TTL = 600.0  # 10 minutes
 _codebase_context_cache: dict[str, tuple[float, dict[str, Any]]] = {}
 
+# 2c645647 — protocol-level directive prepended to agent_instructions when a
+# healthy codebase index is available, so the executor reaches for the graph
+# tools instead of blind filesystem reads/grep (advisory tool descriptions alone
+# don't reliably steer it — this rides at the same level as the EXECUTION MODE
+# directive).
+CODEBASE_INDEX_DIRECTIVE = (
+    "CODEBASE INDEX AVAILABLE: use codebase__search_graph / "
+    "codebase__get_code_snippet BEFORE reading files. Do NOT use filesystem read "
+    "or grep for code navigation — the index is faster and pre-loaded."
+)
+
 
 def _summarize_architecture(arch: dict[str, Any]) -> dict[str, Any] | None:
     """Distill a codebase-memory-mcp ``get_architecture`` payload into a compact

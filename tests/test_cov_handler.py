@@ -1503,6 +1503,57 @@ def test_start_session_filesystem_roots_only_no_repo_path(monkeypatch):
         _run(db.close())
 
 
+def test_start_session_injects_codebase_directive_when_index_healthy(monkeypatch):
+    """9f6aec5f + 2c645647 — a healthy code index injects codebase_context AND
+    prepends the CODEBASE INDEX directive to agent_instructions."""
+    import meridian.server as srv
+    from meridian.routes import tunnel as tn
+    monkeypatch.setattr(tn, "_tunnel_extract_sockets", {})
+    monkeypatch.setattr(tn, "_tunnel_sockets", {})
+
+    async def fake_cc(tenant_id, project_id, *, compact):
+        return {"packages": ["meridian"], "note": "idx"}
+    monkeypatch.setattr(srv, "_build_codebase_context", fake_cc)
+
+    db = _make_db()
+    try:
+        proj = _run(mh._dispatch_mcp_tool("create_project", {"name": "ci-dir"}, db, "/tmp"))
+        out = _run(mh._dispatch_mcp_tool(
+            "start_session",
+            {"project_id": proj["id"], "session_name": "chat"}, db, "/tmp",
+            tenant={"id": "t1"},
+        ))
+        assert out["codebase_context"]["packages"] == ["meridian"]
+        assert out["agent_instructions"].startswith(srv.CODEBASE_INDEX_DIRECTIVE)
+    finally:
+        _run(db.close())
+
+
+def test_start_session_no_codebase_directive_when_no_index(monkeypatch):
+    """No healthy index → no codebase_context and no directive prepended."""
+    import meridian.server as srv
+    from meridian.routes import tunnel as tn
+    monkeypatch.setattr(tn, "_tunnel_extract_sockets", {})
+    monkeypatch.setattr(tn, "_tunnel_sockets", {})
+
+    async def fake_cc(tenant_id, project_id, *, compact):
+        return None
+    monkeypatch.setattr(srv, "_build_codebase_context", fake_cc)
+
+    db = _make_db()
+    try:
+        proj = _run(mh._dispatch_mcp_tool("create_project", {"name": "ci-none"}, db, "/tmp"))
+        out = _run(mh._dispatch_mcp_tool(
+            "start_session",
+            {"project_id": proj["id"], "session_name": "chat"}, db, "/tmp",
+            tenant={"id": "t1"},
+        ))
+        assert "codebase_context" not in out
+        assert srv.CODEBASE_INDEX_DIRECTIVE not in (out.get("agent_instructions") or "")
+    finally:
+        _run(db.close())
+
+
 def test_start_session_no_repo_path_sends_nothing(monkeypatch):
     """No repo_path configured → no control messages, start_session still works."""
     extract_sent = []
