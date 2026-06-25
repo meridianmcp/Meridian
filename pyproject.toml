@@ -1,6 +1,6 @@
 [project]
 name = "meridian-server"
-version = "0.1.5"
+version = "0.1.6"
 description = "Multi-session Claude coordinator MCP server"
 requires-python = ">=3.11,<3.13"
 dependencies = [
