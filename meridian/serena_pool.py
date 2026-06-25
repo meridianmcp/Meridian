@@ -41,11 +41,11 @@ def build_serena_command(repo_path: str, port: int) -> list[str]:
     Uses ``--transport streamable-http --port`` so Serena serves HTTP directly
     (no mcp-proxy bridge needed) and ``--project`` to scope it to ``repo_path``.
     Mirrors the flags in :data:`meridian.tunnel_plugins.SERENA_EXTRACT_COMMAND`
-    (headless, ide-assistant context) plus the per-instance transport/port.
+    (headless, claude-code context) plus the per-instance transport/port.
     """
     return [
         "uvx", "--from", "serena-agent", "serena", "start-mcp-server",
-        "--context", "ide-assistant",
+        "--context", "claude-code",
         "--open-web-dashboard", "false",
         "--transport", "streamable-http",
         "--port", str(port),

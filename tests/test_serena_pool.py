@@ -66,6 +66,13 @@ def test_build_serena_command_has_transport_and_project():
     assert cmd[cmd.index("--open-web-dashboard") + 1] == "false"
 
 
+def test_build_serena_command_uses_claude_code_context():
+    # Regression: was "ide-assistant" (deprecated); must be "claude-code".
+    cmd = build_serena_command("/repo/x", 8825)
+    assert "--context" in cmd
+    assert cmd[cmd.index("--context") + 1] == "claude-code"
+
+
 def test_resolve_repo_path_header_case_insensitive():
     assert resolve_repo_path({"X-Meridian-Repo-Path": "/a"}, "/def") == "/a"
     assert resolve_repo_path({"x-meridian-repo-path": "/b"}, "/def") == "/b"

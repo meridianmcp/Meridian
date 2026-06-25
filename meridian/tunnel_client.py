@@ -292,11 +292,20 @@ async def _run_extract_pool_connection(
                     continue
                 if msg.get("type") == "ping":
                     continue
+                if msg.get("type") == "set_active_repo":
+                    new_path = str(msg.get("repo_path") or "").strip()
+                    if new_path:
+                        pool.default_repo_path = pool._normalize(new_path)
+                        print(
+                            f"tunnel:extract: active repo → {pool.default_repo_path}",
+                            flush=True,
+                        )
+                    continue
                 if msg.get("type") != "request":
                     continue
                 req_id = msg.get("id")
                 repo_path = _serena_pool.resolve_repo_path(
-                    msg.get("headers") or {}, default_repo_path
+                    msg.get("headers") or {}, pool.default_repo_path or default_repo_path
                 )
                 daemon = None
                 try:
@@ -1086,7 +1095,7 @@ async def _index_code_dir(port: int, code_dir: str) -> None:
 # ---------------------------------------------------------------------------
 
 def _prefix_tool_name(name: Any, prefix: str) -> Any:
-    """Prepend ``"<prefix>: "`` to a tool name, never double-prefixing.
+    """Prepend ``"<prefix>__"`` to a tool name, never double-prefixing.
 
     Returns *name* unchanged if it is not a string or already carries the prefix.
     """
