@@ -944,6 +944,66 @@ def test_run_tunnel_cached_rejected_browser_ok_then_me_fails_returns_1(monkeypat
 
 
 # ---------------------------------------------------------------------------
+# d1c528f5 — Node.js gate + fnm auto-install
+# ---------------------------------------------------------------------------
+
+def test_check_node_true_when_both_present(monkeypatch):
+    monkeypatch.setattr(tc.shutil, "which", lambda name: f"/usr/bin/{name}")
+    assert tc._check_node() is True
+
+
+def test_check_node_false_when_node_missing(monkeypatch):
+    monkeypatch.setattr(tc.shutil, "which", lambda name: None if name == "node" else "/x/npx")
+    assert tc._check_node() is False
+
+
+def test_ensure_node_present_returns_true(monkeypatch):
+    monkeypatch.setattr(tc, "_check_node", lambda: True)
+    assert tc._ensure_node(False) is True
+
+
+def test_ensure_node_missing_no_autoinstall_returns_false(monkeypatch, capsys):
+    monkeypatch.setattr(tc, "_check_node", lambda: False)
+    assert tc._ensure_node(False) is False
+    err = capsys.readouterr().err
+    assert "Node.js" in err and "required" in err
+
+
+def test_ensure_node_autoinstall_success(monkeypatch):
+    monkeypatch.setattr(tc, "_check_node", lambda: False)
+    monkeypatch.setattr(tc, "_install_node_via_fnm", lambda: True)
+    assert tc._ensure_node(True) is True
+
+
+def test_ensure_node_autoinstall_failure_returns_false(monkeypatch):
+    monkeypatch.setattr(tc, "_check_node", lambda: False)
+    monkeypatch.setattr(tc, "_install_node_via_fnm", lambda: False)
+    assert tc._ensure_node(True) is False
+
+
+def test_install_node_via_fnm_no_fnm_no_installer_returns_false(monkeypatch):
+    # No fnm, no winget/scoop/curl/bash available → cannot install.
+    monkeypatch.setattr(tc.shutil, "which", lambda name: None)
+    assert tc._install_node_via_fnm() is False
+
+
+def test_run_tunnel_node_missing_returns_1(monkeypatch):
+    """No Node + auto-install off → run_tunnel exits 1 instead of spawning
+    broken proxies."""
+    monkeypatch.setattr(tc, "_force_utf8_io", lambda: None)
+    monkeypatch.setattr(tc, "_resolve_token", lambda t: "sk_tok")
+    monkeypatch.setattr(
+        tc, "_fetch_me",
+        AsyncMock(return_value={"tenant_id": "t1", "plan": "pro"}),
+    )
+    monkeypatch.setattr(tc, "_write_cached_token", lambda *a, **k: None)
+    monkeypatch.setattr(tc, "_fetch_filesystem_roots", AsyncMock(return_value=([], [])))
+    monkeypatch.setattr(tc, "_ensure_node", lambda auto: False)
+    rc = _run_tunnel(token="sk_tok", base_url="https://x")
+    assert rc == 1
+
+
+# ---------------------------------------------------------------------------
 # run_tunnel — happy-ish path: all slots up, reconnect loops short-circuit
 # ---------------------------------------------------------------------------
 
@@ -953,6 +1013,8 @@ def _stub_run_tunnel_spawn(monkeypatch, *, code_binary="/bin/codebase-memory-mcp
     monkeypatch.setattr(tc, "_force_utf8_io", lambda: None)
     monkeypatch.setattr(tc, "_resolve_token", lambda t: "sk_tok")
     monkeypatch.setattr(tc, "_find_npx", lambda: "npx")
+    # d1c528f5 — pretend Node is present so the gate doesn't short-circuit.
+    monkeypatch.setattr(tc, "_ensure_node", lambda auto: True)
     monkeypatch.setattr(tc, "_ensure_codebase_memory_mcp",
                         AsyncMock(return_value=code_binary))
     monkeypatch.setattr(

@@ -1191,6 +1191,107 @@ def _build_proxy_for_inner(
     return cmd
 
 
+def _check_node() -> bool:
+    """True when a usable Node.js (``node`` + ``npx``) is on PATH.
+
+    Every tunnel slot runs its inner server through ``npx mcp-proxy``, so Node is
+    a hard prerequisite — without it mcp-proxy can't start and each slot would
+    silently 503. (d1c528f5)
+    """
+    return bool(shutil.which("node")) and bool(
+        shutil.which("npx") or shutil.which("npx.cmd")
+    )
+
+
+def _install_node_via_fnm() -> bool:
+    """Best-effort install of Node LTS via fnm (Fast Node Manager).
+
+    fnm needs no admin rights and is cross-platform, so it's the least-friction
+    way to provision Node for a user who only has Python/pixi. fnm itself is
+    installed first when missing (winget/scoop on Windows, the official
+    ``curl | bash`` script on POSIX). Every step is best-effort: all failures are
+    swallowed and the function returns whether ``_check_node`` passes afterward,
+    so the caller can fall back to a clear error. (d1c528f5)
+    """
+    fnm = shutil.which("fnm")
+    try:
+        if fnm is None:
+            if sys.platform == "win32":
+                if shutil.which("winget"):
+                    installer = ["winget", "install", "-e", "--id", "Schniz.fnm",
+                                 "--accept-source-agreements", "--accept-package-agreements"]
+                elif shutil.which("scoop"):
+                    installer = ["scoop", "install", "fnm"]
+                else:
+                    return False
+                subprocess.run(installer, check=False, timeout=600)
+            else:
+                if not shutil.which("bash") or not shutil.which("curl"):
+                    return False
+                subprocess.run(
+                    "curl -fsSL https://fnm.vercel.app/install | bash",
+                    shell=True, check=False, timeout=600,
+                )
+            fnm = shutil.which("fnm")
+            if fnm is None:
+                return False
+        # Install + select Node LTS. fnm installs into its own dir; reflect the
+        # resulting node path on this process's PATH so the spawned proxies see it.
+        subprocess.run([fnm, "install", "--lts"], check=False, timeout=600)
+        subprocess.run([fnm, "use", "lts-latest"], check=False, timeout=120)
+        try:
+            out = subprocess.run(
+                [fnm, "exec", "--using=lts-latest", "node", "-e",
+                 "process.stdout.write(process.execPath)"],
+                check=False, capture_output=True, text=True, timeout=120,
+            )
+            node_path = (out.stdout or "").strip()
+            if node_path:
+                bindir = str(Path(node_path).parent)
+                if bindir and bindir not in os.environ.get("PATH", ""):
+                    os.environ["PATH"] = bindir + os.pathsep + os.environ.get("PATH", "")
+        except Exception:  # noqa: BLE001 — PATH reflect is best-effort
+            pass
+        return _check_node()
+    except Exception:  # noqa: BLE001 — install is best-effort; caller degrades
+        return False
+
+
+def _ensure_node(auto_install: bool) -> bool:
+    """Ensure Node.js is available for the npx-based proxies.
+
+    Returns True when Node is usable. When it's missing: auto-install via fnm if
+    *auto_install* is set, otherwise print a clear, actionable error and return
+    False so the caller disables the npm-dependent slots instead of handing
+    mcp-proxy a broken npx path. (d1c528f5)
+    """
+    if _check_node():
+        return True
+    if auto_install:
+        print(
+            "meridian tunnel: Node.js not found — installing Node LTS via fnm "
+            "(no admin required)…",
+            flush=True,
+        )
+        if _install_node_via_fnm():
+            print("meridian tunnel: Node.js installed and on PATH.", flush=True)
+            return True
+        print(
+            "meridian tunnel: automatic Node.js install failed.",
+            file=sys.stderr, flush=True,
+        )
+    print(
+        "meridian tunnel: Node.js (node + npx) is required to run the tunnel "
+        "proxies but was not found on PATH.\n"
+        "  Fix: install Node LTS (https://nodejs.org) or fnm "
+        "(https://github.com/Schniz/fnm), then restart the tunnel.\n"
+        "  Or enable Settings → Tunnel → \"Auto-install Node\" (or set "
+        "MERIDIAN_AUTO_INSTALL_NODE=1) to let Meridian install it for you.",
+        file=sys.stderr, flush=True,
+    )
+    return False
+
+
 def _find_npx() -> str:
     """Locate the npx launcher.
 
@@ -1909,6 +2010,18 @@ async def run_tunnel(
     # the tenant's projects). Empty → fall back to the home dir (repo_path).
     # known_repo_paths are trust anchors for silent auto-add (b9d1b606).
     fs_roots, known_repo_paths = await _fetch_filesystem_roots(base_url, token)
+
+    # 1c. Node.js gate (d1c528f5) — every slot runs its inner server through
+    #     ``npx mcp-proxy``, so without Node the proxies can't start. Auto-install
+    #     via fnm when the workspace opts in (or MERIDIAN_AUTO_INSTALL_NODE=1);
+    #     otherwise print a clear error and stop rather than spawning broken
+    #     proxies that silently 503 on first call.
+    _auto_install_node = bool(me.get("auto_install_node_deps")) or (
+        os.environ.get("MERIDIAN_AUTO_INSTALL_NODE", "").strip().lower()
+        in ("1", "true", "yes")
+    )
+    if not _ensure_node(_auto_install_node):
+        return 1
 
     # 2. Build commands for all enabled slots. Processes are NOT spawned here —
     #    lazy spawning (3649a61a) defers each proxy until its first incoming
