@@ -1384,6 +1384,18 @@ async def _migrate_pg_agent_tasks_table(conn: PostgresConnection) -> None:
     )
 
 
+async def _migrate_pg_sprint_item_owner(conn: PostgresConnection) -> None:
+    """4f02340e — sprint_items.owner: mixed-ownership task chains.
+
+    Nullable ``owner`` column ('human' | 'ai' | NULL) for the alternating
+    claim/handoff state machine. ADD COLUMN IF NOT EXISTS so re-running is a
+    no-op. Mirrors db._migrate_sprint_item_owner.
+    """
+    await conn.executescript(
+        "ALTER TABLE sprint_items ADD COLUMN IF NOT EXISTS owner TEXT"
+    )
+
+
 def _slugify_note_pg(title: str) -> str:
     """Kebab-case a note title (lowercase, alnum+dashes, collapse, trim).
 
@@ -2050,4 +2062,5 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_decision_code_anchor,
     _migrate_pg_session_graph_snapshots,
     _migrate_pg_agent_tasks_table,
+    _migrate_pg_sprint_item_owner,
 )

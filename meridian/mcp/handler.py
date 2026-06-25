@@ -2347,7 +2347,8 @@ async def _handle_sprint_tools(
         return item
     if name == "add_subtask":
         return await db_module.add_subtask(
-            db, args["project_id"], args["parent_id"], args["title"]
+            db, args["project_id"], args["parent_id"], args["title"],
+            owner=args.get("owner"),
         )
     if name == "split_sprint_item":
         return await db_module.split_sprint_item(

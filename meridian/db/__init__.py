@@ -257,7 +257,11 @@ CREATE TABLE IF NOT EXISTS sprint_items (
     parent_id TEXT DEFAULT NULL REFERENCES sprint_items(id),
     split_from TEXT DEFAULT NULL,
     merged_into TEXT DEFAULT NULL,
-    merged_from TEXT DEFAULT NULL
+    merged_from TEXT DEFAULT NULL,
+    -- 4f02340e: mixed-ownership task chains. owner of a subtask: 'human' | 'ai'
+    -- | NULL (unassigned). Drives the alternating claim/handoff state machine
+    -- in _advance_task_chain. NULL on parents and on legacy single-owner items.
+    owner TEXT DEFAULT NULL
 );
 
 -- v2.4 — decisions_pinned: editable constitution alongside the append-only
@@ -814,6 +818,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_decision_code_anchor(db)
     await _migrate_session_graph_snapshots(db)
     await _migrate_agent_tasks_table(db)
+    await _migrate_sprint_item_owner(db)
     return db
 
 
@@ -3160,12 +3165,19 @@ async def complete_sprint_item(
     item_id: str,
     task_id: str | None = None,
 ) -> dict[str, Any] | None:
-    """Mark a sprint item ``done`` and optionally link the task that shipped it."""
+    """Mark a sprint item ``done`` and optionally link the task that shipped it.
+
+    4f02340e — when the completed item is part of a mixed-ownership subtask
+    chain, advance the chain: an AI→human transition auto-files a HITL handoff,
+    a human→AI transition un-blocks the next AI subtask (see
+    :func:`_advance_task_chain`).
+    """
     result = await _update_sprint_item_status(
         db, project_id, item_id, "done", task_id=task_id
     )
     if result is not None:
         await _maybe_rollup_parent(db, project_id, item_id)
+        await _advance_task_chain(db, project_id, item_id)
     return result
 
 
@@ -3352,12 +3364,28 @@ async def add_subtask(
     project_id: str,
     parent_id: str,
     title: str,
+    owner: str | None = None,
 ) -> dict[str, Any]:
     """Create a child sprint item under parent_id.
 
     Inherits version from parent. Rejects if parent doesn't exist or is
     done/failed/skipped.
+
+    4f02340e — mixed-ownership task chains. ``owner`` is 'human', 'ai', or None
+    (unassigned). When owner-tagged subtasks are added in sequence they form a
+    *chain*: each new owned subtask ``depends_on`` the previously added owned
+    sibling, so only the head of the chain is claimable and ownership alternates
+    as the chain advances (see :func:`_advance_task_chain`). When an AI subtask
+    completes and the next link is human-owned, a HITL handoff is auto-filed;
+    when a human completes theirs, the next AI subtask un-blocks (becomes
+    claimable). The parent stays in_progress until every subtask is terminal
+    (existing :func:`_maybe_rollup_parent` behavior — unchanged).
+
+    Unowned subtasks (owner=None) keep the legacy behavior: no chaining,
+    independently claimable.
     """
+    if owner not in (None, "human", "ai"):
+        raise ValueError("owner must be 'human', 'ai', or None")
     parent = await get_sprint_item(db, parent_id)
     if parent is None or parent.get("project_id") != project_id:
         raise ValueError(f"parent sprint item not found: {parent_id}")
@@ -3366,17 +3394,113 @@ async def add_subtask(
         raise ValueError(
             f"cannot add subtask to parent with status '{parent.get('status')}'"
         )
+    # Chain owned subtasks: a new owned subtask depends on the current tail of
+    # the chain — the owned sibling that no other owned sibling depends on yet.
+    # This is insertion-order-independent (added_at has only second resolution,
+    # so it can't be used to break ties deterministically) and portable across
+    # SQLite/Postgres. Unowned subtasks never chain.
+    depends_on: str | None = None
+    if owner is not None:
+        async with db.execute(
+            "SELECT id FROM sprint_items "
+            "WHERE parent_id = ? AND project_id = ? AND owner IS NOT NULL "
+            "AND id NOT IN ("
+            "  SELECT depends_on FROM sprint_items "
+            "  WHERE parent_id = ? AND project_id = ? AND depends_on IS NOT NULL"
+            ")",
+            (parent_id, project_id, parent_id, project_id),
+        ) as cur:
+            tails = await cur.fetchall()
+        # In a well-formed chain there is exactly one tail. If somehow more than
+        # one (e.g. an unchained owned item existed), prefer the one matching no
+        # dependents — take the first deterministically by id.
+        tail_ids = sorted(
+            (r["id"] if isinstance(r, dict) else r[0]) for r in tails
+        )
+        if tail_ids:
+            depends_on = tail_ids[-1]
     iid = _new_id()
     await db.execute(
         "INSERT INTO sprint_items "
-        "(id, project_id, version, title, parent_id, milestone_type) "
-        "VALUES (?, ?, ?, ?, ?, 'task')",
-        (iid, project_id, parent.get("version", ""), title, parent_id),
+        "(id, project_id, version, title, parent_id, milestone_type, owner, depends_on) "
+        "VALUES (?, ?, ?, ?, ?, 'task', ?, ?)",
+        (iid, project_id, parent.get("version", ""), title, parent_id, owner, depends_on),
     )
     await db.commit()
     item = await get_sprint_item(db, iid)
     assert item is not None
+    _invalidate_sprint_items_cache(project_id)
     return item
+
+
+async def _advance_task_chain(
+    db: aiosqlite.Connection,
+    project_id: str,
+    completed_item_id: str,
+) -> dict[str, Any] | None:
+    """4f02340e — advance a mixed-ownership subtask chain after a completion.
+
+    Called when a subtask is marked ``done``. Finds the next link in the chain
+    (the owned sibling whose ``depends_on`` is the just-completed item) and:
+
+      - next link is **human**-owned  → auto-file a HITL handoff (kind
+        ``'handoff'``, assigned to the human) so a person is pulled in. The next
+        item un-blocks (its depends_on is now done) and shows as claimable in
+        the human's queue.
+      - next link is **ai**-owned     → no HITL; the item simply un-blocks and
+        becomes claimable by an AI session (existing depends_on machinery).
+
+    Returns the filed HITL request dict when a handoff was created, else None.
+    Idempotent-ish: a handoff is only filed when the just-completed item is
+    itself owned (so it is part of a chain) and a next owned link exists.
+    """
+    completed = await get_sprint_item(db, completed_item_id)
+    if completed is None or completed.get("project_id") != project_id:
+        return None
+    if not completed.get("owner"):
+        return None  # not part of an owned chain
+    # The next link: an owned sibling that depends on the completed item.
+    async with db.execute(
+        "SELECT * FROM sprint_items "
+        "WHERE project_id = ? AND depends_on = ? AND owner IS NOT NULL "
+        "ORDER BY added_at ASC, id ASC LIMIT 1",
+        (project_id, completed_item_id),
+    ) as cur:
+        row = await cur.fetchone()
+    nxt = _row_to_dict(row) if row is not None else None
+    if not nxt:
+        return None
+    if (nxt.get("status") or "pending") in {"done", "failed", "skipped"}:
+        return None
+    if nxt.get("owner") != "human":
+        # AI link — nothing to file; depends_on now satisfied → claimable.
+        _publish_project_event(
+            project_id, "sprint_item_updated",
+            {"item_id": nxt["id"], "chain": "ai_claimable"},
+        )
+        return None
+    # Human link — pull a person in via a HITL handoff.
+    title = nxt.get("title", "")
+    question = (
+        f"Task chain handoff: your turn on subtask '{title}'. "
+        f"The preceding AI subtask ('{completed.get('title', '')}') is complete."
+    )
+    context = (
+        f"Mixed-ownership task chain (parent {completed.get('parent_id') or '?'}). "
+        f"Next subtask {nxt['id']} is assigned to a human. Mark it done "
+        f"(complete_sprint_item) to release the following AI subtask."
+    )
+    hitl = await request_hitl(
+        db, project_id, question,
+        context=context,
+        kind="handoff",
+        assigned_to=nxt.get("human_id") or "human",
+    )
+    _publish_project_event(
+        project_id, "sprint_item_updated",
+        {"item_id": nxt["id"], "chain": "human_handoff", "hitl_id": hitl.get("id")},
+    )
+    return hitl
 
 
 async def split_sprint_item(

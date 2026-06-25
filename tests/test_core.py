@@ -6228,10 +6228,11 @@ def test_pg_migration_registry_matches_historical_order():
         "_migrate_pg_decision_code_anchor",
         "_migrate_pg_session_graph_snapshots",
         "_migrate_pg_agent_tasks_table",
+        "_migrate_pg_sprint_item_owner",
     ]
     # No duplicates across the three groups.
     allnames = core + hosted + late
-    assert len(allnames) == len(set(allnames)) == 63
+    assert len(allnames) == len(set(allnames)) == 64
 
 
 def test_default_agent_instructions_has_code_intel_protocol():
@@ -14109,3 +14110,138 @@ async def test_get_plugin_details_surfaces_skill_guide(db, tmp_path):
     )
     assert "skill_guide" in result, "skill_guide missing from get_plugin_details"
     assert "Code Intel Guide" in result["skill_guide"]["body"]
+
+
+# ---------------------------------------------------------------------------
+# 4f02340e — mixed-ownership task chains
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_chain_sprint_items_has_owner_column(db):
+    """sprint_items.owner exists after init_db; migration is idempotent."""
+    assert await db_module._column_exists(db, "sprint_items", "owner")
+    await db_module._migrate_sprint_item_owner(db)
+    await db_module._migrate_sprint_item_owner(db)
+    assert await db_module._column_exists(db, "sprint_items", "owner")
+
+
+@pytest.mark.asyncio
+async def test_chain_add_subtask_validates_owner(db):
+    """add_subtask rejects an invalid owner value."""
+    p = await db_module.create_project(db, "chain-owner-val")
+    parent = await db_module.add_sprint_item(db, p["id"], "v1", "Parent task")
+    with pytest.raises(ValueError):
+        await db_module.add_subtask(db, p["id"], parent["id"], "bad", owner="robot")
+
+
+@pytest.mark.asyncio
+async def test_chain_owned_subtasks_chain_via_depends_on(db):
+    """Owned subtasks added in sequence chain: each depends on the prior owned
+    sibling; the head has no dependency. Unowned subtasks never chain."""
+    p = await db_module.create_project(db, "chain-deps")
+    parent = await db_module.add_sprint_item(db, p["id"], "v1", "Provision + verify")
+    s1 = await db_module.add_subtask(db, p["id"], parent["id"], "Human creates resource", owner="human")
+    s2 = await db_module.add_subtask(db, p["id"], parent["id"], "AI configures it", owner="ai")
+    s3 = await db_module.add_subtask(db, p["id"], parent["id"], "Human adds secrets", owner="human")
+    assert s1["owner"] == "human" and not s1["depends_on"]
+    assert s2["owner"] == "ai" and s2["depends_on"] == s1["id"]
+    assert s3["owner"] == "human" and s3["depends_on"] == s2["id"]
+    # An unowned subtask is independent.
+    s4 = await db_module.add_subtask(db, p["id"], parent["id"], "Loose subtask")
+    assert s4["owner"] is None and not s4["depends_on"]
+
+
+@pytest.mark.asyncio
+async def test_chain_ai_complete_files_hitl_handoff_to_human(db):
+    """When an AI subtask completes and the next link is human-owned, a HITL
+    handoff is auto-filed."""
+    p = await db_module.create_project(db, "chain-ai-to-human")
+    parent = await db_module.add_sprint_item(db, p["id"], "v1", "Configure then secure")
+    ai = await db_module.add_subtask(db, p["id"], parent["id"], "AI configures", owner="ai")
+    human = await db_module.add_subtask(db, p["id"], parent["id"], "Human adds secrets", owner="human")
+
+    before = await db_module.list_hitl_requests(db, p["id"])
+    await db_module.complete_sprint_item(db, p["id"], ai["id"])
+    after = await db_module.list_hitl_requests(db, p["id"])
+
+    assert len(after) == len(before) + 1
+    handoffs = [h for h in after if h["kind"] == "handoff"]
+    assert handoffs, "expected a handoff HITL to be filed"
+    assert human["title"] in handoffs[0]["question"]
+
+
+@pytest.mark.asyncio
+async def test_chain_human_complete_does_not_file_hitl_for_ai(db):
+    """When a human subtask completes and the next link is AI-owned, no HITL is
+    filed — the AI subtask simply un-blocks (depends_on satisfied)."""
+    p = await db_module.create_project(db, "chain-human-to-ai")
+    parent = await db_module.add_sprint_item(db, p["id"], "v1", "Create then configure")
+    human = await db_module.add_subtask(db, p["id"], parent["id"], "Human creates", owner="human")
+    ai = await db_module.add_subtask(db, p["id"], parent["id"], "AI configures", owner="ai")
+
+    await db_module.complete_sprint_item(db, p["id"], human["id"])
+    hitls = await db_module.list_hitl_requests(db, p["id"])
+    assert [h for h in hitls if h["kind"] == "handoff"] == []
+    # AI subtask is now claimable (its dependency is done).
+    claimed = await db_module.claim_sprint_item(db, p["id"], ai["id"])
+    assert claimed["status"] == "in_progress"
+
+
+@pytest.mark.asyncio
+async def test_chain_parent_stays_in_progress_until_all_done(db):
+    """Parent rolls up to done only after every subtask is terminal."""
+    p = await db_module.create_project(db, "chain-rollup")
+    parent = await db_module.add_sprint_item(db, p["id"], "v1", "Full chain")
+    await db_module.claim_sprint_item(db, p["id"], parent["id"])  # parent in_progress
+    a = await db_module.add_subtask(db, p["id"], parent["id"], "step A", owner="human")
+    b = await db_module.add_subtask(db, p["id"], parent["id"], "step B", owner="ai")
+
+    await db_module.complete_sprint_item(db, p["id"], a["id"])
+    mid = await db_module.get_sprint_item(db, parent["id"])
+    assert mid["status"] == "in_progress", "parent must stay active mid-chain"
+
+    await db_module.complete_sprint_item(db, p["id"], b["id"])
+    end = await db_module.get_sprint_item(db, parent["id"])
+    assert end["status"] == "done"
+
+
+@pytest.mark.asyncio
+async def test_chain_full_alternating_workflow(db):
+    """End-to-end: human → AI → human chain.
+
+    human creates resource → AI configures → human adds secrets.
+    Completing the human head un-blocks the AI step (no HITL); completing the AI
+    step files a handoff for the final human step.
+    """
+    p = await db_module.create_project(db, "chain-e2e")
+    parent = await db_module.add_sprint_item(db, p["id"], "v1", "Onboard resource")
+    h1 = await db_module.add_subtask(db, p["id"], parent["id"], "Human creates resource", owner="human")
+    ai = await db_module.add_subtask(db, p["id"], parent["id"], "AI configures it", owner="ai")
+    h2 = await db_module.add_subtask(db, p["id"], parent["id"], "Human adds secrets", owner="human")
+
+    # Human finishes the head → AI un-blocks, no handoff.
+    await db_module.complete_sprint_item(db, p["id"], h1["id"])
+    assert [x for x in await db_module.list_hitl_requests(db, p["id"]) if x["kind"] == "handoff"] == []
+
+    # AI finishes → handoff filed for the final human step.
+    await db_module.claim_sprint_item(db, p["id"], ai["id"])
+    await db_module.complete_sprint_item(db, p["id"], ai["id"])
+    handoffs = [x for x in await db_module.list_hitl_requests(db, p["id"]) if x["kind"] == "handoff"]
+    assert len(handoffs) == 1
+    assert h2["title"] in handoffs[0]["question"]
+
+
+@pytest.mark.asyncio
+async def test_chain_add_subtask_owner_via_mcp(db, tmp_path):
+    """The add_subtask MCP tool threads the owner param through to the chain."""
+    from meridian.mcp.handler import _dispatch_mcp_tool
+
+    p = await db_module.create_project(db, "chain-mcp")
+    parent = await db_module.add_sprint_item(db, p["id"], "v1", "Parent via mcp")
+    sub = await _dispatch_mcp_tool(
+        "add_subtask",
+        {"project_id": p["id"], "parent_id": parent["id"], "title": "AI step", "owner": "ai"},
+        db, str(tmp_path), tenant=None,
+    )
+    assert sub["owner"] == "ai"
