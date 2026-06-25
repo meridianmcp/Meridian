@@ -73,7 +73,7 @@ BUILTIN_PLUGINS: list[dict[str, Any]] = [
         # generic filesystem tool names are namespaced in the connector. Slots
         # whose inner server already self-prefixes its tools leave this None to
         # avoid double-prefixing. (b4455202)
-        "prefix": "Filesystem",
+        "prefix": None,
         "description": "Filesystem MCP (@modelcontextprotocol/server-filesystem)",
         "description_overrides": {},
     },
