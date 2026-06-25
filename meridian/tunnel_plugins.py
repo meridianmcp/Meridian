@@ -103,7 +103,7 @@ BUILTIN_PLUGINS: list[dict[str, Any]] = [
         "command": list(SERENA_EXTRACT_COMMAND),
         # Serena's bare tool names (find_symbol, replace_symbol_body, …) get a
         # "Serena: " display prefix at the relay so they're namespaced. (b4455202)
-        "prefix": "Serena",
+        "prefix": None,
         "description": "Symbol-level code intelligence (Serena LSP)",
         "description_overrides": {},
     },
