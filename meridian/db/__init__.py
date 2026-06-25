@@ -6000,14 +6000,21 @@ async def get_parallelizable_groups(
         eligible.append(enriched)
     # Stable order: oldest first, then id, so coloring is deterministic.
     eligible.sort(key=lambda it: (str(it.get("added_at") or ""), it["id"]))
-    # Greedy first-fit graph coloring on the resource-conflict graph.
+    # de730a25 — separate declared from undeclared items. An item with no
+    # touches_resources is disjoint with everything, so the old single-pass
+    # coloring dropped it into group 0 next to declared items and they fanned
+    # out together — unsafe, because an undeclared item may genuinely conflict
+    # with anything. Now: color-graph only the DECLARED items into safe parallel
+    # groups, then give each UNDECLARED item its own singleton group so they run
+    # sequentially (parallel safety can't be proven for them).
+    declared = [it for it in eligible if it["resources"]]
+    undeclared_items = [it for it in eligible if not it["resources"]]
+    undeclared = len(undeclared_items)
+    # Greedy first-fit graph coloring on the declared items' conflict graph.
     groups: list[list[dict[str, Any]]] = []
     group_resource_sets: list[set[str]] = []
-    undeclared = 0
-    for it in eligible:
+    for it in declared:
         res = set(it["resources"])
-        if not res:
-            undeclared += 1
         placed = False
         for gi, used in enumerate(group_resource_sets):
             if res.isdisjoint(used):
@@ -6018,6 +6025,9 @@ async def get_parallelizable_groups(
         if not placed:
             groups.append([it])
             group_resource_sets.append(set(res))
+    # Each undeclared item is its own sequential group (never co-scheduled).
+    for it in undeclared_items:
+        groups.append([it])
     return {
         "version": version,
         "groups": groups,

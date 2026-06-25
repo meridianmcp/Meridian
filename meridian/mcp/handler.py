@@ -2274,9 +2274,20 @@ async def _handle_sprint_tools(
         return _items
     if name == "get_parallelizable_groups":
         # 255096d9 — cluster pending items safe to fan out simultaneously.
-        return await db_module.get_parallelizable_groups(
+        _grp = await db_module.get_parallelizable_groups(
             db, args["project_id"], version=args.get("version")
         )
+        # de730a25 — flag undeclared items prominently. They each run in their own
+        # sequential group now, but the orchestrator should know parallel safety
+        # couldn't be proven for them.
+        _und = _grp.get("undeclared_count", 0)
+        if _und:
+            _grp["warning"] = (
+                f"{_und} item(s) lack resource declarations — parallel safety not "
+                "guaranteed; each is scheduled in its own sequential group. Add "
+                "touches_resources to let them parallelize."
+            )
+        return _grp
     if name == "claim_sprint_item":
         # ITEM 3 — protect installer scripts: refuse to claim a sprint item whose
         # touches_files includes hooks.ps1 / hooks.sh unless force=true is passed.
