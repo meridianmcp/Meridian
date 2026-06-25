@@ -278,6 +278,12 @@ async def _migrate_v34_workspace_settings(db: aiosqlite.Connection) -> None:
     )
     # v1.1 — per-user handoff template (NULL = server default Jinja2 template)
     await _migrate_add_column_if_missing(db, "workspace_settings", "handoff_template", "TEXT")
+    # 0bf67524 — workspace-default settings that seed NEW projects in the
+    # workspace (cascade-at-creation). NULL = no default (project uses its own
+    # built-in default). execution_mode_default ∈ {autonomous, interactive};
+    # code_intel_enabled_default ∈ {0, 1}.
+    await _migrate_add_column_if_missing(db, "workspace_settings", "execution_mode_default", "TEXT")
+    await _migrate_add_column_if_missing(db, "workspace_settings", "code_intel_enabled_default", "INTEGER")
 
 
 async def _migrate_dunning_fields(db: aiosqlite.Connection) -> None:

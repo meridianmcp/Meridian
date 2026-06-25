@@ -1803,6 +1803,81 @@
       grid.insertAdjacentElement("afterend", link);
     });
   }
+  function _classifySettingsSection(el, projectId) {
+    const id = el && el.id || "";
+    const has = (frag) => id.indexOf(frag) !== -1;
+    if (has("workspace-section")) return "workspace";
+    if (has("settings-account-card") || has("settings-account-danger") || has("settings-grp-aw") || has("settings-grp-blog") || has("members-section") || has("fs-mcp-section") || has("tunnel-plugins") || has("github-card")) return "account";
+    return "project";
+  }
+  window._classifySettingsSection = _classifySettingsSection;
+  function _applyActiveTabVisibility(projectId) {
+    const body = document.getElementById(`settings-body-${projectId}`);
+    if (!body) return;
+    const key = body.dataset.activeStab || "project";
+    body.querySelectorAll(":scope > .settings-tabpane").forEach((p) => {
+      p.style.display = p.dataset.stabPane === key ? "" : "none";
+    });
+    body.querySelectorAll(":scope > .settings-tabbar .settings-tab-btn").forEach((b) => {
+      const active = b.dataset.stabBtn === key;
+      b.style.color = active ? "var(--text)" : "var(--muted)";
+      b.style.borderBottomColor = active ? "var(--accent)" : "transparent";
+      b.style.fontWeight = active ? "600" : "400";
+    });
+  }
+  function _activateSettingsTab(projectId, key) {
+    const body = document.getElementById(`settings-body-${projectId}`);
+    if (!body) return;
+    body.dataset.activeStab = key;
+    _applyActiveTabVisibility(projectId);
+  }
+  window._activateSettingsTab = _activateSettingsTab;
+  function _organizeSettingsIntoTabs(projectId) {
+    const body = document.getElementById(`settings-body-${projectId}`);
+    if (!body || body.dataset.tabbed === "1") return;
+    body.dataset.tabbed = "1";
+    const TABS = [["project", "Project"], ["workspace", "Workspace"], ["account", "Account"]];
+    const panes = {};
+    const bar = document.createElement("div");
+    bar.className = "settings-tabbar";
+    bar.style.cssText = "display:flex;gap:2px;margin-bottom:12px;border-bottom:1px solid var(--border);position:sticky;top:0;background:var(--surface);z-index:2";
+    TABS.forEach(([key, label]) => {
+      const pane = document.createElement("div");
+      pane.className = "settings-tabpane";
+      pane.dataset.stabPane = key;
+      panes[key] = pane;
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "settings-tab-btn";
+      btn.dataset.stabBtn = key;
+      btn.textContent = label;
+      btn.style.cssText = "background:none;border:none;border-bottom:2px solid transparent;color:var(--muted);font-size:11px;font-family:var(--font-mono);padding:6px 12px;cursor:pointer";
+      btn.onclick = () => _activateSettingsTab(projectId, key);
+      bar.appendChild(btn);
+    });
+    Array.from(body.children).forEach((el) => {
+      panes[_classifySettingsSection(el, projectId)].appendChild(el);
+    });
+    body.appendChild(bar);
+    TABS.forEach(([key]) => body.appendChild(panes[key]));
+    const wsSec = document.getElementById(`workspace-section-${projectId}`);
+    if (wsSec && wsSec.parentElement !== panes.workspace) panes.workspace.appendChild(wsSec);
+    try {
+      const obs = new MutationObserver((muts) => {
+        muts.forEach((m) => m.addedNodes.forEach((node) => {
+          if (node.nodeType !== 1) return;
+          if (node.classList && (node.classList.contains("settings-tabpane") || node.classList.contains("settings-tabbar"))) return;
+          const tab = (node.id || "").indexOf("tunnel-plugins") !== -1 ? "account" : _classifySettingsSection(node, projectId);
+          panes[tab].appendChild(node);
+          _applyActiveTabVisibility(projectId);
+        }));
+      });
+      obs.observe(body, { childList: true });
+    } catch (e) {
+    }
+    _activateSettingsTab(projectId, "project");
+  }
+  window._organizeSettingsIntoTabs = _organizeSettingsIntoTabs;
   async function loadSettingsTab2(projectId) {
     const body = document.getElementById(`settings-body-${projectId}`);
     if (!body) return;
@@ -3220,6 +3295,8 @@ project_id = "${displayPid}"`;
         const displayIn = document.getElementById("ws-display-name");
         const nudgeIn = document.getElementById("ws-nudge-threshold");
         const handoffTplIn = document.getElementById("ws-handoff-template");
+        const execModeIn = document.getElementById("ws-exec-mode-default");
+        const codeIntelCb = document.getElementById("ws-code-intel-default");
         const saveBtn = document.getElementById("ws-settings-save");
         const saveStatus = document.getElementById("ws-settings-status");
         (async () => {
@@ -3230,6 +3307,8 @@ project_id = "${displayPid}"`;
             if (displayIn) displayIn.value = s.display_name || "";
             if (nudgeIn) nudgeIn.value = s.log_task_sprint_nudge_threshold != null ? s.log_task_sprint_nudge_threshold : 5;
             if (handoffTplIn) handoffTplIn.value = s.handoff_template || "";
+            if (execModeIn) execModeIn.value = s.execution_mode_default || "";
+            if (codeIntelCb) codeIntelCb.checked = !!s.code_intel_enabled_default;
           } catch (e) {
             if (saveStatus) saveStatus.textContent = "Could not load workspace defaults.";
           }
@@ -3245,7 +3324,10 @@ project_id = "${displayPid}"`;
                 sprint_name_default: sprintIn && sprintIn.value.trim() || "",
                 display_name: displayIn && displayIn.value.trim() || "",
                 log_task_sprint_nudge_threshold: isNaN(nudgeVal) ? 5 : Math.max(0, nudgeVal),
-                handoff_template: handoffTplIn && handoffTplIn.value.trim() || ""
+                handoff_template: handoffTplIn && handoffTplIn.value.trim() || "",
+                // 0bf67524 — "" clears the default; a value seeds new projects.
+                execution_mode_default: execModeIn ? execModeIn.value : "",
+                code_intel_enabled_default: codeIntelCb && codeIntelCb.checked ? 1 : 0
               })
             });
             if (saveStatus) saveStatus.textContent = "Saved.";
@@ -3519,7 +3601,21 @@ project_id = "${displayPid}"`;
       <label style="display:flex;gap:8px;align-items:flex-start;font-size:11px;color:var(--text);cursor:pointer;margin-bottom:6px">
         <input type="checkbox" id="ws-hitl-default" style="margin-top:2px">
         <span>Auto-answer HITL by default<br>
-          <span style="font-size:9px;color:var(--muted)">Suggested default for new projects' HITL auto-answer toggle.</span>
+          <span style="font-size:9px;color:var(--muted)">Seeded onto new projects' HITL auto-answer toggle.</span>
+        </span>
+      </label>
+      <label style="font-size:10px;color:var(--muted);display:block;margin-bottom:6px">Default execution mode for new projects<br>
+        <select id="ws-exec-mode-default" style="background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:3px 6px;margin-top:2px">
+          <option value="">(no default \u2014 use built-in)</option>
+          <option value="autonomous">autonomous</option>
+          <option value="interactive">interactive</option>
+        </select>
+        <span style="display:block;font-size:9px;color:var(--muted);margin-top:2px">New projects in this workspace start in this posture (0bf67524). Existing projects are unchanged.</span>
+      </label>
+      <label style="display:flex;gap:8px;align-items:flex-start;font-size:11px;color:var(--text);cursor:pointer;margin-bottom:6px">
+        <input type="checkbox" id="ws-code-intel-default" style="margin-top:2px">
+        <span>Enable Code Intel on new projects by default<br>
+          <span style="font-size:9px;color:var(--muted)">Seeds new projects' code-intel toggle on.</span>
         </span>
       </label>
       <label style="font-size:10px;color:var(--muted);display:block">Default sprint name<br>
@@ -4054,6 +4150,11 @@ project_id = "${displayPid}"`;
         console.error("Settings render failed:", renderErr);
         body.innerHTML = `<div style="color:var(--error);font-size:11px">Failed to render settings: ${escapeHtml(String(renderErr))}</div>`;
         return;
+      }
+      try {
+        _organizeSettingsIntoTabs(projectId);
+      } catch (e) {
+        console.error("Settings tabs failed:", e);
       }
       _applySettingsRoleVisibility(projectId, _guest);
       _collapseConnectPlatforms(projectId);

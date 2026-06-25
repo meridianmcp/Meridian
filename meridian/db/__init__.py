@@ -645,6 +645,8 @@ CREATE TABLE IF NOT EXISTS workspace_settings (
     display_name TEXT,
     log_task_sprint_nudge_threshold INTEGER NOT NULL DEFAULT 5,
     handoff_template TEXT,
+    execution_mode_default TEXT,
+    code_intel_enabled_default INTEGER,
     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE TABLE IF NOT EXISTS feedback (
@@ -835,6 +837,7 @@ async def create_project(
     name: str,
     human_id: str | None = None,
     execution_mode: str | None = None,
+    tenant_id: str | None = None,
 ) -> dict[str, Any]:
     """Insert a project and return it as a dict. Raises if the name exists.
 
@@ -845,7 +848,21 @@ async def create_project(
     ``execution_mode`` (ecf69de8) sets the project's executor posture —
     'autonomous' (default) or 'interactive'. Invalid values normalise to
     'autonomous' so a bad input never persists.
+
+    ``tenant_id`` (0bf67524) — when given, the new project is seeded from the
+    workspace's cascade defaults (execution_mode_default, hitl_auto_answer_default,
+    code_intel_enabled_default) for any field the caller didn't set explicitly.
+    Existing projects are never touched; this is a creation-time cascade only.
     """
+    # Resolve workspace defaults for seeding (best-effort; never block creation).
+    _ws: dict[str, Any] = {}
+    if tenant_id is not None:
+        try:
+            _ws = await get_workspace_settings(db, tenant_id=tenant_id)
+        except Exception:  # noqa: BLE001 — missing/old workspace_settings → no seed
+            _ws = {}
+    if execution_mode is None and _ws.get("execution_mode_default"):
+        execution_mode = _ws["execution_mode_default"]
     pid = _new_id()
     mode = normalize_execution_mode(execution_mode)
     await db.execute(
@@ -854,6 +871,13 @@ async def create_project(
         (pid, name, human_id, mode),
     )
     await db.commit()
+    # Seed the remaining cascade defaults onto the fresh project row.
+    _ci_default = _ws.get("code_intel_enabled_default")
+    if _ci_default is not None:
+        await update_project_settings(db, pid, code_intel_enabled=1 if _ci_default else 0)
+    if _ws.get("hitl_auto_answer_default"):
+        # Workspace default ON → seed the project to "safe" (mode 1) auto-answer.
+        await update_project_settings(db, pid, hitl_auto_answer=1)
     project = await get_project(db, pid)
     assert project is not None
     return project
@@ -8125,7 +8149,8 @@ async def get_workspace_settings(
     """
     _cols = (
         "SELECT hitl_auto_answer_default, sprint_name_default, display_name, "
-        "log_task_sprint_nudge_threshold, handoff_template, updated_at "
+        "log_task_sprint_nudge_threshold, handoff_template, "
+        "execution_mode_default, code_intel_enabled_default, updated_at "
         "FROM workspace_settings"
     )
     async with db.execute(
@@ -8142,6 +8167,10 @@ async def get_workspace_settings(
         if len(some) == 1:
             row = some[0]
     data = _row_to_dict(row) or {}
+    # 0bf67524 — cascade defaults. None ⇒ "no workspace default set" (new
+    # projects keep their own built-in default); a value ⇒ seed new projects.
+    _emode = data.get("execution_mode_default")
+    _ci_default = data.get("code_intel_enabled_default")
     return {
         "hitl_auto_answer_default": bool(data.get("hitl_auto_answer_default")),
         "sprint_name_default": data.get("sprint_name_default"),
@@ -8150,6 +8179,8 @@ async def get_workspace_settings(
         if data.get("log_task_sprint_nudge_threshold") is not None
         else 5,
         "handoff_template": data.get("handoff_template"),
+        "execution_mode_default": _emode if _emode in ("autonomous", "interactive") else None,
+        "code_intel_enabled_default": (None if _ci_default is None else bool(_ci_default)),
         "updated_at": data.get("updated_at"),
     }
 
@@ -8162,12 +8193,16 @@ async def update_workspace_settings(
     display_name: str | None = None,
     log_task_sprint_nudge_threshold: int | None = None,
     handoff_template: str | None = None,
+    execution_mode_default: str | None = None,
+    code_intel_enabled_default: "bool | int | str | None" = None,
     tenant_id: str | None = None,
 ) -> dict[str, Any]:
     """Upsert the per-tenant workspace settings row and return the new values.
 
     Only the fields passed (non-None) are changed. ``sprint_name_default=""``
-    or ``display_name=""`` explicitly clears that label.
+    or ``display_name=""`` explicitly clears that label. ``execution_mode_default=""``
+    clears the execution-mode default (new projects revert to their own default);
+    ``code_intel_enabled_default`` accepts a bool/0/1 or the string ``""`` to clear.
     """
     settings_key = _ws_settings_key(tenant_id)
     # Ensure the row exists before updating individual fields.
@@ -8194,6 +8229,18 @@ async def update_workspace_settings(
         updates.append("handoff_template = ?")
         # Empty string clears the custom template (reverts to server default).
         params.append(handoff_template.strip() or None)
+    if execution_mode_default is not None:
+        updates.append("execution_mode_default = ?")
+        # Empty string clears the default; otherwise normalize to a valid posture.
+        _emode = (execution_mode_default or "").strip().lower()
+        params.append(normalize_execution_mode(_emode) if _emode else None)
+    if code_intel_enabled_default is not None:
+        updates.append("code_intel_enabled_default = ?")
+        # "" clears; any truthy/1 → 1, falsey/0 → 0.
+        if isinstance(code_intel_enabled_default, str) and not code_intel_enabled_default.strip():
+            params.append(None)
+        else:
+            params.append(1 if code_intel_enabled_default and code_intel_enabled_default not in ("0", "false", "False") else 0)
     if updates:
         from datetime import datetime, timezone
         now_ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")

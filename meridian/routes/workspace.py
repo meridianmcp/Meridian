@@ -161,6 +161,9 @@ async def update_workspace_settings_endpoint(
         display_name=body.get("display_name"),
         log_task_sprint_nudge_threshold=int(nudge_thresh) if nudge_thresh is not None else None,
         handoff_template=body.get("handoff_template"),
+        # 0bf67524 — cascade defaults seeded onto new projects.
+        execution_mode_default=body.get("execution_mode_default"),
+        code_intel_enabled_default=body.get("code_intel_enabled_default"),
         tenant_id=await _tenant_id(request),
     )
 

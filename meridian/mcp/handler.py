@@ -1183,6 +1183,8 @@ async def _handle_project_tools(
             return {"error": f"project '{args['name']}' already exists", "project": existing}
         return await db_module.create_project(
             db, args["name"], execution_mode=args.get("execution_mode"),
+            # 0bf67524 — seed from workspace cascade defaults when authenticated.
+            tenant_id=(tenant.get("id") if tenant else None),
         )
     if name == "register_session":
         hid = args.get("human_id")
@@ -1531,6 +1533,9 @@ async def _handle_notes_decisions(
             hitl_auto_answer_default=args.get("hitl_auto_answer_default"),
             sprint_name_default=args.get("sprint_name_default"),
             handoff_template=args.get("handoff_template"),
+            # 0bf67524 — cascade defaults for new projects.
+            execution_mode_default=args.get("execution_mode_default"),
+            code_intel_enabled_default=args.get("code_intel_enabled_default"),
             tenant_id=_mcp_tenant_id,
         )
     if name == "add_workspace_sprint_item":

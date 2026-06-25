@@ -688,6 +688,8 @@ CREATE TABLE IF NOT EXISTS workspace_settings (
     display_name TEXT,
     log_task_sprint_nudge_threshold INTEGER NOT NULL DEFAULT 5,
     handoff_template TEXT,
+    execution_mode_default TEXT,
+    code_intel_enabled_default INTEGER,
     updated_at TEXT NOT NULL DEFAULT ({_TS})
 );
 """
@@ -1704,12 +1706,16 @@ async def _migrate_pg_v34_workspace_settings(conn: PostgresConnection) -> None:
 
 
 async def _migrate_pg_workspace_settings_columns(conn: PostgresConnection) -> None:
-    """Add display_name and log_task_sprint_nudge_threshold to existing workspace_settings rows."""
+    """Add display_name, log_task_sprint_nudge_threshold, handoff_template, and
+    the 0bf67524 cascade defaults (execution_mode_default, code_intel_enabled_default)
+    to existing workspace_settings rows. Idempotent (ADD COLUMN IF NOT EXISTS)."""
     await conn.executescript(
         "ALTER TABLE workspace_settings ADD COLUMN IF NOT EXISTS display_name TEXT;"
         "ALTER TABLE workspace_settings ADD COLUMN IF NOT EXISTS "
         "log_task_sprint_nudge_threshold INTEGER NOT NULL DEFAULT 5;"
-        "ALTER TABLE workspace_settings ADD COLUMN IF NOT EXISTS handoff_template TEXT"
+        "ALTER TABLE workspace_settings ADD COLUMN IF NOT EXISTS handoff_template TEXT;"
+        "ALTER TABLE workspace_settings ADD COLUMN IF NOT EXISTS execution_mode_default TEXT;"
+        "ALTER TABLE workspace_settings ADD COLUMN IF NOT EXISTS code_intel_enabled_default INTEGER"
     )
 
 

@@ -142,7 +142,12 @@ async def create_project(
     all_projects = await db_module.list_projects(await _db(request))
     _limits.check_projects_per_tenant(len(all_projects))
     db = await _db(request)
-    project = await db_module.create_project(db, body.name, human_id=body.human_id)
+    # 0bf67524 — pass tenant_id so the new project is seeded from the workspace's
+    # cascade defaults (execution mode / HITL / code intel).
+    project = await db_module.create_project(
+        db, body.name, human_id=body.human_id,
+        tenant_id=(tenant.get("id") if tenant else None),
+    )
     from ..agent_defaults import DEFAULT_AGENT_INSTRUCTIONS  # noqa: PLC0415
     await db_module.set_agent_instructions(db, project["id"], DEFAULT_AGENT_INSTRUCTIONS)
     # c3e91df4 — start the free-tier trial clock on first own project creation,
