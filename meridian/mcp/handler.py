@@ -1189,7 +1189,7 @@ async def _handle_project_tools(
         # Pass compact=False explicitly for the full block.
         # a76cb7c0 — optional `version` scopes the session to a sprint-version
         # bucket (orientation counts/items + /goal filter to it).
-        return await _server._start_session_composite(
+        result = await _server._start_session_composite(
             db,
             args["project_id"],
             args["session_name"],
@@ -1200,6 +1200,21 @@ async def _handle_project_tools(
             compact=args.get("compact", True),
             version=args.get("version"),
         )
+        # b9d1b606 — expand fs proxy roots so the executor's repo_path is
+        # accessible without a separate set_active_repo call.
+        if tenant is not None:
+            try:
+                tenant_id = tenant.get("id", "")
+                exec_cfg = await db_module.get_executor_config(db, args["project_id"])
+                repo_path = exec_cfg.get("repo_path") if exec_cfg else None
+                if repo_path and isinstance(repo_path, str) and repo_path.strip():
+                    from ..routes import tunnel as _tunnel_mod
+                    await _tunnel_mod.send_add_fs_roots_control(
+                        tenant_id, [repo_path.strip()]
+                    )
+            except Exception:  # noqa: BLE001 — non-fatal background expansion
+                pass
+        return result
     if name == "list_projects":
         return await db_module.list_project_summaries(db)
     if name == "get_project_by_name":
