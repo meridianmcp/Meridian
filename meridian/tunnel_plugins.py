@@ -44,7 +44,7 @@ DEFAULT_DC_PORT = 8813
 # serena-agent`` and invoke the ``serena`` entrypoint it provides.
 SERENA_EXTRACT_COMMAND: list[str] = [
     "uvx", "--from", "serena-agent", "serena", "start-mcp-server",
-    "--context", "ide-assistant",
+    "--context", "claude-code",
     # Don't pop a browser tab to Serena's web dashboard on every tunnel (re)start
     # — the tunnel runs Serena headless behind the proxy. ``--open-web-dashboard
     # false`` is Serena's documented flag and overrides the user's global

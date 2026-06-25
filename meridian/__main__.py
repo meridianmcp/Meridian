@@ -65,7 +65,7 @@ def _kill_port(port: int) -> None:
 if sys.platform == "win32":
     import selectors
     # psycopg3 requires SelectorEventLoop — override Windows default ProactorEventLoop
-    asyncio.set_event_loop_policy(asyncio.DefaultEventLoopPolicy())
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     loop = asyncio.SelectorEventLoop(selectors.SelectSelector())
     asyncio.set_event_loop(loop)
 
@@ -132,6 +132,9 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     if args.tunnel:
+        print("[meridian] --tunnel: killing stale ports 8808-8813", flush=True)
+        for _p in range(8808, 8814):
+            _kill_port(_p)
         from .tunnel_client import run_tunnel
 
         loop = asyncio.get_event_loop()

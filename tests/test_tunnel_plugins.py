@@ -79,7 +79,7 @@ def test_plugin_by_slot():
 def test_expand_command_substitutes_repo_path_in_serena_default():
     out = tp.expand_command(tp.SERENA_EXTRACT_COMMAND, repo_path="/home/me/proj")
     assert out == ["uvx", "--from", "serena-agent", "serena", "start-mcp-server",
-                   "--context", "ide-assistant", "--open-web-dashboard", "false",
+                   "--context", "claude-code", "--open-web-dashboard", "false",
                    "--project", "/home/me/proj"]
     # The module-level constant must not be mutated by expansion.
     assert tp.SERENA_EXTRACT_COMMAND[-1] == "{repo_path}"
