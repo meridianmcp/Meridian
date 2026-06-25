@@ -70,6 +70,12 @@ _No pinned decisions yet — use `pin_decision` MCP tool to establish the consti
 {% if it.depends_on %}   Depends on item {{ it.dependency_position or "?" }} (`{{ it.depends_on }}`){% if it.dependency_title %}: {{ it.dependency_title }}{% endif %}{% if it.dependency_status %} — currently {{ it.dependency_status }}{% endif %}
 {% else %}   Depends on: none
 {% endif %}
+{% if it.code_pointers -%}
+   Code pointers:
+{% for ptr in it.code_pointers -%}
+   - `{{ ptr.qualified_name or ptr.function }}`{% if ptr.file %} — {{ ptr.file }}{% endif %}{% if ptr.function and ptr.function != ptr.qualified_name %} ({{ ptr.function }}){% endif %}
+{% endfor -%}
+{% endif -%}
 {% endfor %}
 {% endif %}
 
