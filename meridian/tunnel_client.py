@@ -1092,7 +1092,7 @@ def _prefix_tool_name(name: Any, prefix: str) -> Any:
     """
     if not isinstance(name, str):
         return name
-    marker = f"{prefix}: "
+    marker = f"{prefix}__"
     if name.startswith(marker):
         return name
     return marker + name
