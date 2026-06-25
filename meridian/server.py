@@ -5298,7 +5298,10 @@ async def _mcp_get(request: Request):
     accept = request.headers.get("accept", "")
     if "text/event-stream" in accept:
         return _RR("/mcp/sse")
-    return JSONResponse({"name": "meridian", "version": "1.0", "transport": "http+sse"})
+    return JSONResponse(
+        {"name": "meridian", "version": "1.0", "transport": "http+sse"},
+        headers={"Cache-Control": "no-store, no-cache"},
+    )
 
 
 
