@@ -1241,6 +1241,19 @@ async def _handle_project_tools(
                     await _tunnel_mod.send_active_repo_control(tenant_id, serena_target)
             except Exception:  # noqa: BLE001 — non-fatal background expansion
                 pass
+            # 9f6aec5f — inject a codebase-architecture summary so the executor
+            # starts already knowing the code's shape. No-op without a healthy,
+            # indexed code-intel tunnel; never fails the orientation.
+            try:
+                if isinstance(result, dict) and "continuation" not in result:
+                    _cc = await _server._build_codebase_context(
+                        tenant.get("id", ""), args["project_id"],
+                        compact=args.get("compact", True),
+                    )
+                    if _cc:
+                        result["codebase_context"] = _cc
+            except Exception:  # noqa: BLE001 — orientation must not break
+                pass
         return result
     if name == "list_projects":
         return await db_module.list_project_summaries(db)

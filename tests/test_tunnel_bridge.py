@@ -707,3 +707,112 @@ def test_send_active_repo_control_send_error():
     result = asyncio.run(tn.send_active_repo_control("t1", "/my/repo"))
     assert result["status"] == "error"
     assert "ws broken" in result["message"]
+
+
+# ---------------------------------------------------------------------------
+# 9f6aec5f — codebase-context injection for start_session orientation
+# ---------------------------------------------------------------------------
+
+import meridian.server as srv  # noqa: E402
+
+
+def test_summarize_architecture_extracts_fields():
+    arch = {
+        "packages": [{"name": "meridian"}, {"name": "tests"}],
+        "layers": ["routes", "db"],
+        "hotspots": [{"symbol": "server.app"}, {"symbol": "db.init_db"}],
+        "entry_points": [{"path": "meridian/__main__.py"}],
+        "stats": {"files": 120, "symbols": 3400, "blob": "x" * 999},
+    }
+    out = srv._summarize_architecture(arch)
+    assert out["packages"] == ["meridian", "tests"]
+    assert out["layers"] == ["routes", "db"]
+    assert out["hotspots"] == ["server.app", "db.init_db"]
+    assert out["entry_points"] == ["meridian/__main__.py"]
+    # Only small scalar stats survive; the big blob is dropped.
+    assert out["stats"] == {"files": 120, "symbols": 3400}
+
+
+def test_summarize_architecture_garbage_returns_none():
+    assert srv._summarize_architecture(None) is None
+    assert srv._summarize_architecture({}) is None
+    assert srv._summarize_architecture({"packages": "nope"}) is None
+
+
+def test_truncate_codebase_summary_limits():
+    summary = {
+        "packages": list("abcdefgh"),
+        "hotspots": list("12345678"),
+        "entry_points": ["a", "b", "c", "d"],
+        "layers": ["x", "y"],
+        "stats": {"files": 1},
+    }
+    out = srv._truncate_codebase_summary(summary)
+    assert out["packages"] == list("abcde")     # capped at 5
+    assert out["hotspots"] == list("12345")      # capped at 5
+    assert out["entry_points"] == ["a", "b", "c"]  # capped at 3
+    assert out["stats"] == {"files": 1}
+    assert "layers" not in out                   # dropped in compact form
+
+
+def test_parse_tunnel_tool_text_decodes():
+    res = {"content": [{"type": "text", "text": json.dumps({"packages": []})}]}
+    assert srv._parse_tunnel_tool_text(res) == {"packages": []}
+    assert srv._parse_tunnel_tool_text({"content": []}) is None
+    assert srv._parse_tunnel_tool_text({"content": [{"text": "not json"}]}) is None
+    assert srv._parse_tunnel_tool_text(None) is None
+
+
+def test_build_codebase_context_no_tunnel_returns_none():
+    assert asyncio.run(srv._build_codebase_context(None, "p1", compact=True)) is None
+    # tenant set but no code socket connected.
+    assert asyncio.run(srv._build_codebase_context("tc", "p1", compact=True)) is None
+
+
+def test_build_codebase_context_unhealthy_slot_returns_none(monkeypatch):
+    tn._tunnel_code_sockets["tc"] = object()
+    tn._record_slot_health("tc", "code", False)
+    try:
+        out = asyncio.run(srv._build_codebase_context("tc", "p1", compact=True))
+        assert out is None
+    finally:
+        tn._slot_health.pop("tc", None)
+
+
+def test_build_codebase_context_fetches_and_caches(monkeypatch):
+    tn._tunnel_code_sockets["tc"] = object()
+    calls = {"n": 0}
+
+    async def fake_call(tenant_id, name, args):
+        calls["n"] += 1
+        assert name == "codebase__get_architecture"
+        return {"content": [{"type": "text", "text": json.dumps({
+            "packages": [{"name": "meridian"}],
+            "hotspots": [{"symbol": "server.app"}],
+        })}]}
+
+    monkeypatch.setattr(tn, "call_tunnel_tool", fake_call)
+    srv._codebase_context_cache.pop("p9", None)
+    try:
+        out = asyncio.run(srv._build_codebase_context("tc", "p9", compact=False))
+        assert out["packages"] == ["meridian"]
+        assert out["hotspots"] == ["server.app"]
+        assert "note" in out
+        # Second call within TTL is served from cache (no second tunnel call).
+        out2 = asyncio.run(srv._build_codebase_context("tc", "p9", compact=True))
+        assert out2["packages"] == ["meridian"]
+        assert calls["n"] == 1
+    finally:
+        srv._codebase_context_cache.pop("p9", None)
+
+
+def test_build_codebase_context_not_indexed_returns_none(monkeypatch):
+    tn._tunnel_code_sockets["tc"] = object()
+
+    async def fake_call(tenant_id, name, args):
+        return {"content": [{"type": "text", "text": json.dumps({})}]}  # empty arch
+
+    monkeypatch.setattr(tn, "call_tunnel_tool", fake_call)
+    srv._codebase_context_cache.pop("pne", None)
+    out = asyncio.run(srv._build_codebase_context("tc", "pne", compact=True))
+    assert out is None
