@@ -1207,19 +1207,38 @@ async def _handle_project_tools(
         # header) route code-intel requests to the right daemon. start_session is
         # the per-session signal of "which project am I working on now"; both
         # control messages are best-effort and never fail the orientation.
+        # bc2e5ff0 — serve repo_path AND filesystem_roots (e.g. a separate
+        # Outputs dir). Previously only repo_path was sent, so the tunnel never
+        # served the extra roots even after set_executor_config persisted them.
         if tenant is not None:
             try:
                 tenant_id = tenant.get("id", "")
                 exec_cfg = await db_module.get_executor_config(db, args["project_id"])
                 repo_path = exec_cfg.get("repo_path") if exec_cfg else None
-                if repo_path and isinstance(repo_path, str) and repo_path.strip():
+                fs_roots = (exec_cfg.get("filesystem_roots") if exec_cfg else None) or []
+                # Union repo_path + filesystem_roots, deduped, order-preserved.
+                candidates = []
+                if isinstance(repo_path, str):
+                    candidates.append(repo_path)
+                candidates.extend(r for r in fs_roots if isinstance(r, str))
+                all_roots: list[str] = []
+                seen: set[str] = set()
+                for r in candidates:
+                    s = r.strip()
+                    if s and s not in seen:
+                        seen.add(s)
+                        all_roots.append(s)
+                if all_roots:
                     from ..routes import tunnel as _tunnel_mod
-                    await _tunnel_mod.send_add_fs_roots_control(
-                        tenant_id, [repo_path.strip()]
+                    await _tunnel_mod.send_add_fs_roots_control(tenant_id, all_roots)
+                    # Serena pool tracks one active repo: prefer repo_path, else
+                    # the first root (Serena indexes a single project at a time).
+                    serena_target = (
+                        repo_path.strip()
+                        if isinstance(repo_path, str) and repo_path.strip()
+                        else all_roots[0]
                     )
-                    await _tunnel_mod.send_active_repo_control(
-                        tenant_id, repo_path.strip()
-                    )
+                    await _tunnel_mod.send_active_repo_control(tenant_id, serena_target)
             except Exception:  # noqa: BLE001 — non-fatal background expansion
                 pass
         return result

@@ -789,9 +789,11 @@ def test_relay_request_no_prefix_leaves_tools_unchanged():
 def test_builtin_plugins_have_prefix_field():
     from meridian.tunnel_plugins import BUILTIN_PLUGINS
     by_name = {p["name"]: p for p in BUILTIN_PLUGINS}
-    # Generic-name slots are prefixed; self-prefixing slots are None.
-    assert by_name["filesystem"]["prefix"] == "Filesystem"
-    assert by_name["code-extractor"]["prefix"] == "Serena"
+    # 49905647 — every builtin prefix MUST be None: the server-side bridge
+    # (routes/tunnel.py SLOT_DISPLAY_NAMES) already namespaces each slot's tools,
+    # so a client prefix here would double-prefix (filesystem__Filesystem__...).
+    assert by_name["filesystem"]["prefix"] is None
+    assert by_name["code-extractor"]["prefix"] is None
     assert by_name["code-intel"]["prefix"] is None
     assert by_name["powerpoint"]["prefix"] is None
     # Every builtin declares the field (so resolve_plugins always carries it).
@@ -801,8 +803,9 @@ def test_builtin_plugins_have_prefix_field():
 def test_resolve_plugins_carries_prefix():
     from meridian.tunnel_plugins import resolve_plugins
     by_slot = {p["slot"]: p for p in resolve_plugins(None)}
-    assert by_slot["fs"]["prefix"] == "Filesystem"
-    assert by_slot["extract"]["prefix"] == "Serena"
+    # All None — server bridge owns the only tool-name namespacing. (49905647)
+    assert by_slot["fs"]["prefix"] is None
+    assert by_slot["extract"]["prefix"] is None
     assert by_slot["code"]["prefix"] is None
 
 
