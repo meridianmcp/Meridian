@@ -1416,12 +1416,14 @@ async def provision_neon_db(tenant_id: str, db: Any) -> dict[str, Any]:
         raise RuntimeError(f"Failed to get connection URI for customer database {db_name!r}")
 
     # Persist on tenant — encrypt the connection string at rest.
+    # Per-tenant key when MERIDIAN_MASTER_SECRET is set, else legacy global key.
+    from .tenant_crypto import encrypt_tenant_db_url  # noqa: PLC0415
     updated = await db_module.update_tenant(
         db,
         tenant_id,
         neon_project_id=neon_project_id,
         pool_project_id=pool["id"],
-        neon_db_url=db_module.encrypt_field(conn_uri),
+        neon_db_url=encrypt_tenant_db_url(tenant_id, conn_uri),
     )
 
     # v1.0 — set PITR retention on the pool project based on plan tier.

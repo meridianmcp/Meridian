@@ -134,8 +134,10 @@ async def _open_tenant_db_by_id(request: Request, tenant_id: str) -> Any:
 
     url: str | None = None
     if tenant.get("neon_db_url"):
+        from .tenant_crypto import decrypt_tenant_db_url  # noqa: PLC0415
         try:
-            url = db_module.decrypt_field(tenant["neon_db_url"]) or None
+            # Dual-read: per-tenant ("v2:") or legacy global key, transparently.
+            url = decrypt_tenant_db_url(tenant_id, tenant["neon_db_url"]) or None
         except Exception:
             _log.warning("Failed to decrypt neon_db_url for tenant %s", tenant_id)
             url = None

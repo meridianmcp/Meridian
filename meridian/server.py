@@ -351,6 +351,21 @@ async def lifespan(app: FastAPI):
             Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         db = await db_module.init_db(db_path)
     app.state.db = db
+
+    # Per-tenant neon_db_url re-key (security item 3dbe23e3). NO-OP unless
+    # MERIDIAN_MASTER_SECRET is set — so this is a zero-behavior-change deploy
+    # in prod (where the secret is currently unset). Guarded + never crashes
+    # boot; re-keys legacy global-key URLs to per-tenant keys, idempotently.
+    try:
+        from .tenant_crypto import rekey_tenant_db_urls  # noqa: PLC0415
+        await rekey_tenant_db_urls(db)
+    except Exception:  # noqa: BLE001 — re-key must never block server startup
+        import logging as _rekey_log  # noqa: PLC0415
+        _rekey_log.getLogger(__name__).warning(
+            "per-tenant neon_db_url re-key raised during startup; continuing",
+            exc_info=True,
+        )
+
     # True when the main DB is a remote/Postgres backend (env URL or toml conn).
     # The demo DB resolver fails closed against this so /demo never serves real data.
     app.state.db_is_remote = bool(db_url)
@@ -2896,7 +2911,9 @@ async def workspace_connect_db(request: Request) -> dict[str, Any]:
         await test_conn.close()
     except Exception as exc:
         raise HTTPException(status_code=422, detail=f"Could not connect: {exc}") from exc
-    encrypted = db_module.encrypt_field(url)
+    # Per-tenant key when MERIDIAN_MASTER_SECRET is set, else legacy global key.
+    from .tenant_crypto import encrypt_tenant_db_url
+    encrypted = encrypt_tenant_db_url(tenant["id"], url)
     auth_db = request.app.state.db
     await db_module.update_tenant(auth_db, tenant["id"], neon_db_url=encrypted)
     # Evict cached connection so next request re-opens with the new URL
