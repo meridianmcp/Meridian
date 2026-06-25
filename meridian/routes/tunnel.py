@@ -1184,6 +1184,29 @@ def _union_filesystem_roots(projects: list[dict]) -> list[str]:
     return roots
 
 
+def _union_repo_paths(projects: list[dict]) -> list[str]:
+    """Collect a deduped, order-preserved list of executor_config.repo_path across
+    project rows. These are the dirs the tunnel is *implicitly* trusted to access —
+    used by the client for silent auto-add when a filesystem call is denied for a
+    path within one of these dirs."""
+    paths: list[str] = []
+    seen: set[str] = set()
+    for p in projects:
+        raw = p.get("executor_config")
+        if isinstance(raw, str) and raw.strip():
+            try:
+                raw = json.loads(raw)
+            except Exception:  # noqa: BLE001
+                continue
+        if not isinstance(raw, dict):
+            continue
+        rp = raw.get("repo_path")
+        if isinstance(rp, str) and rp.strip() and rp.strip() not in seen:
+            seen.add(rp.strip())
+            paths.append(rp.strip())
+    return paths
+
+
 @router.get("/tunnel/filesystem-roots")
 async def get_tunnel_filesystem_roots(request: Request) -> Response:
     """Return the directories the tunnel's filesystem connector may read.
@@ -1193,16 +1216,41 @@ async def get_tunnel_filesystem_roots(request: Request) -> Response:
     roots across all of the tenant's projects. An empty list means the client
     falls back to the user's home directory (current default behaviour). Best-effort:
     any DB error yields an empty list rather than failing the tunnel.
+
+    Also returns ``known_repo_paths`` — the union of ``executor_config.repo_path``
+    across all projects. The tunnel client uses these as implicitly-trusted roots
+    for the silent path auto-add (item 3 of dynamic-fs-roots feature).
     """
     tenant = await _get_tenant_from_request(request)
     if tenant is None:
-        return _json_response({"filesystem_roots": []})
+        return _json_response({"filesystem_roots": [], "known_repo_paths": []})
     try:
         db = await _db(request)
         projects = await db_module.list_projects(db)
     except Exception:  # noqa: BLE001 — unprovisioned/unreachable DB → defaults
         projects = []
-    return _json_response({"filesystem_roots": _union_filesystem_roots(projects)})
+    return _json_response({
+        "filesystem_roots": _union_filesystem_roots(projects),
+        "known_repo_paths": _union_repo_paths(projects),
+    })
+
+
+async def send_add_fs_roots_control(tenant_id: str, roots: list[str]) -> dict[str, str]:
+    """Send add_fs_roots over the main (fs) WebSocket for a tenant.
+
+    Called by the MCP handler after start_session detects a new repo_path.
+    Returns a status dict with ``status`` of ``"ok"``, ``"not_connected"``, or
+    ``"error"``. Non-blocking best-effort — callers should never let this fail
+    the start_session response.
+    """
+    ws = _tunnel_sockets.get(tenant_id)
+    if ws is None:
+        return {"status": "not_connected", "message": "no active fs tunnel"}
+    try:
+        await ws.send_json({"type": "add_fs_roots", "roots": roots})
+        return {"status": "ok", "roots": roots}
+    except Exception as exc:  # noqa: BLE001
+        return {"status": "error", "message": str(exc)}
 
 
 # ---------------------------------------------------------------------------

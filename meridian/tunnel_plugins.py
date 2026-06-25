@@ -69,11 +69,11 @@ BUILTIN_PLUGINS: list[dict[str, Any]] = [
         # None → the client uses its platform-aware default builder for this slot.
         "command": None,
         # Tool-name display prefix the proxy relay prepends to this slot's
-        # tools/list entries (e.g. "read_file" → "Filesystem: read_file") so the
+        # tools/list entries (e.g. "read_file" → "Filesystem__read_file") so the
         # generic filesystem tool names are namespaced in the connector. Slots
         # whose inner server already self-prefixes its tools leave this None to
         # avoid double-prefixing. (b4455202)
-        "prefix": None,
+        "prefix": "Filesystem",
         "description": "Filesystem MCP (@modelcontextprotocol/server-filesystem)",
         "description_overrides": {},
     },
@@ -102,8 +102,8 @@ BUILTIN_PLUGINS: list[dict[str, Any]] = [
         # default: Serena (LSP symbol tools); {repo_path} expanded at spawn time.
         "command": list(SERENA_EXTRACT_COMMAND),
         # Serena's bare tool names (find_symbol, replace_symbol_body, …) get a
-        # "Serena: " display prefix at the relay so they're namespaced. (b4455202)
-        "prefix": None,
+        # "Serena__" display prefix at the relay so they're namespaced. (b4455202)
+        "prefix": "Serena",
         "description": "Symbol-level code intelligence (Serena LSP)",
         "description_overrides": {},
     },

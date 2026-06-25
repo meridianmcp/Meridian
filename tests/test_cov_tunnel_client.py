@@ -499,7 +499,7 @@ def test_reconnect_loop_lazy_backs_off_then_cancels(monkeypatch):
     connection propagates out (clean shutdown)."""
     attempts = {"n": 0}
 
-    async def fake_run_connection_lazy(ws_url, proxy, label, tool_prefix=None):
+    async def fake_run_connection_lazy(ws_url, proxy, label, tool_prefix=None, known_repo_paths=None):
         attempts["n"] += 1
         if attempts["n"] == 1:
             raise RuntimeError("dropped")
@@ -781,7 +781,7 @@ def _stub_run_tunnel_spawn(monkeypatch, *, code_binary="/bin/codebase-memory-mcp
     # Lazy reconnect loops spawn the proxy on connect (mirroring the first-request
     # behaviour) then return — no real WS. The idle-killer is a no-op. The legacy
     # watchdog (still used for eager custom plugins) also returns immediately.
-    async def fake_reconnect_lazy(ws_url, proxy, label, tool_prefix=None):
+    async def fake_reconnect_lazy(ws_url, proxy, label, tool_prefix=None, known_repo_paths=None):
         await proxy.ensure_running()
         return None
 
@@ -920,7 +920,7 @@ def test_run_tunnel_fs_lazy_spawn_enoent_keeps_tunnel_up(monkeypatch, tmp_path):
 
     # Lazy reconnect drives the REAL ensure_running once then returns; idle-killer
     # + legacy watchdog are no-ops.
-    async def fake_reconnect_lazy(ws_url, proxy, label, tool_prefix=None):
+    async def fake_reconnect_lazy(ws_url, proxy, label, tool_prefix=None, known_repo_paths=None):
         await proxy.ensure_running()
         return None
 
@@ -1046,7 +1046,7 @@ def test_run_tunnel_code_and_extract_popen_raise_are_warned(monkeypatch, tmp_pat
 
     # Lazy reconnect loops drive the real ensure_running (to hit its spawn-failure
     # branch) then return; idle-killer + legacy watchdog are no-ops.
-    async def fake_reconnect_lazy(ws_url, proxy, label, tool_prefix=None):
+    async def fake_reconnect_lazy(ws_url, proxy, label, tool_prefix=None, known_repo_paths=None):
         await proxy.ensure_running()
         return None
 

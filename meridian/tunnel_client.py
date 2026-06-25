@@ -188,6 +188,7 @@ async def _run_connection_lazy(
     proxy: "SlotProxy",
     label: str = "fs",
     tool_prefix: str | None = None,
+    known_repo_paths: "list[str] | None" = None,
 ) -> None:
     """Hold one WebSocket session open with lazy proxy spawning.
 
@@ -198,9 +199,15 @@ async def _run_connection_lazy(
     Proxy startup failures surface as HTTP 503 (not 502) so the server-side
     relay returns a clear error rather than timing out, and the client retries
     at the next request naturally.
+
+    *known_repo_paths* are trusted root anchors: if a path-not-allowed error
+    falls under one of these roots the proxy is automatically expanded and the
+    request retried once (b9d1b606).
     """
     import httpx
     import websockets
+
+    _known: list[str] = list(known_repo_paths or [])
 
     async with websockets.connect(ws_url, max_size=None, ping_interval=20) as ws:
         print(f"tunnel:{label}: connected (lazy mode)", flush=True)
@@ -214,6 +221,20 @@ async def _run_connection_lazy(
                 if not isinstance(msg, dict):
                     continue
                 if msg.get("type") == "ping":
+                    continue
+                if msg.get("type") == "add_fs_roots":
+                    # Control message: expand the filesystem proxy's allowed dirs.
+                    new_roots: list[str] = msg.get("roots") or []
+                    updated_cmd, changed = _add_fs_roots_to_cmd(proxy.cmd, new_roots)
+                    if changed:
+                        proxy.cmd = updated_cmd
+                        if proxy.is_running:
+                            proxy.kill()
+                            await proxy.ensure_running()
+                        print(
+                            f"tunnel:{label}: expanded allowed dirs → {new_roots}",
+                            flush=True,
+                        )
                     continue
                 if msg.get("type") == "request":
                     # Lazy spawn: bring the proxy up if it died or was idle-killed.
@@ -235,6 +256,40 @@ async def _run_connection_lazy(
                     resp = await _relay_request(
                         http_client, local_base, msg, tool_prefix=tool_prefix
                     )
+                    # Auto-add: if access was denied and the path falls under a
+                    # known repo_path, silently expand and retry once (b9d1b606).
+                    denied_path = _extract_denied_path(resp)
+                    if denied_path and _known:
+                        try:
+                            dp = Path(denied_path).resolve()
+                        except Exception:
+                            dp = None
+                        if dp is not None:
+                            anchor = next(
+                                (
+                                    r for r in _known
+                                    if _is_subpath(dp, Path(r))
+                                ),
+                                None,
+                            )
+                            if anchor:
+                                updated_cmd, changed = _add_fs_roots_to_cmd(
+                                    proxy.cmd, [anchor]
+                                )
+                                if changed:
+                                    proxy.cmd = updated_cmd
+                                    proxy.kill()
+                                    await proxy.ensure_running()
+                                    if proxy.is_running:
+                                        print(
+                                            f"tunnel:{label}: auto-added {anchor!r} "
+                                            f"(denied: {denied_path!r})",
+                                            flush=True,
+                                        )
+                                        resp = await _relay_request(
+                                            http_client, local_base, msg,
+                                            tool_prefix=tool_prefix,
+                                        )
                     await ws.send(json.dumps(resp))
 
 
@@ -243,12 +298,17 @@ async def _reconnect_loop_lazy(
     proxy: "SlotProxy",
     label: str,
     tool_prefix: str | None = None,
+    known_repo_paths: "list[str] | None" = None,
 ) -> None:
     """Keep one lazy-spawn tunnel alive, reconnecting with exponential backoff."""
     backoff = 1.0
     while True:
         try:
-            await _run_connection_lazy(ws_url, proxy, label, tool_prefix=tool_prefix)
+            await _run_connection_lazy(
+                ws_url, proxy, label,
+                tool_prefix=tool_prefix,
+                known_repo_paths=known_repo_paths,
+            )
             backoff = 1.0
         except asyncio.CancelledError:
             raise
@@ -1012,11 +1072,64 @@ def _build_proxy_command(
     return cmd
 
 
-async def _fetch_filesystem_roots(base_url: str, token: str) -> "list[str]":
+def _is_subpath(child: "Path", parent: "Path") -> bool:
+    """Return True if *child* is under *parent* (both resolved)."""
+    try:
+        child.relative_to(parent)
+        return True
+    except ValueError:
+        return False
+
+
+def _add_fs_roots_to_cmd(cmd: "list[str]", new_roots: "list[str]") -> "tuple[list[str], bool]":
+    """Append *new_roots* to an existing ``_build_proxy_command`` result.
+
+    Finds the ``@modelcontextprotocol/server-filesystem`` token in *cmd* and
+    appends any roots that are not already present.  Returns ``(updated_cmd,
+    changed)`` — if nothing was added *changed* is ``False`` and *cmd* is
+    returned unchanged.
+    """
+    try:
+        idx = cmd.index("@modelcontextprotocol/server-filesystem")
+    except ValueError:
+        return cmd, False
+    existing: set[str] = set(cmd[idx + 1:])
+    to_add = [r for r in new_roots if r and r.strip() and r.strip() not in existing]
+    if not to_add:
+        return cmd, False
+    return cmd[:idx + 1] + list(cmd[idx + 1:]) + to_add, True
+
+
+def _extract_denied_path(resp: dict) -> "str | None":
+    """Parse the denied path from a filesystem MCP 'access denied' response.
+
+    Looks for ``"Access denied - path outside allowed directories: <path>"``
+    inside the base64-encoded response body.  Returns the path string if found,
+    ``None`` otherwise.
+    """
+    import re
+    body_b64 = resp.get("body") or ""
+    try:
+        body = base64.b64decode(body_b64).decode("utf-8", errors="replace")
+    except Exception:
+        return None
+    m = re.search(r"Access denied - path outside allowed directories:\s*(.+?)(?:\"|}|$)", body)
+    if m:
+        return m.group(1).strip().rstrip('"').rstrip("'").rstrip("\\")
+    return None
+
+
+async def _fetch_filesystem_roots(
+    base_url: str, token: str
+) -> "tuple[list[str], list[str]]":
     """GET /tunnel/filesystem-roots — the dirs the fs connector may serve.
 
-    Returns the tenant's configured roots (unioned across projects), or an empty
-    list on any error so the caller falls back to the home-directory default.
+    Returns ``(filesystem_roots, known_repo_paths)``.  ``filesystem_roots`` are
+    the explicit allowed dirs (unioned ``executor_config.filesystem_roots`` across
+    projects); ``known_repo_paths`` are the implicit trust anchors
+    (``executor_config.repo_path`` per project) used for silent auto-add.
+    Both lists are empty on any error so the caller falls back to the
+    home-directory default.
     """
     import httpx
 
@@ -1027,11 +1140,16 @@ async def _fetch_filesystem_roots(base_url: str, token: str) -> "list[str]":
                 headers={"Authorization": f"Bearer {token}"},
             )
             if r.status_code == 200:
-                roots = (r.json() or {}).get("filesystem_roots") or []
-                return [str(x).strip() for x in roots if isinstance(x, str) and x.strip()]
+                data = r.json() or {}
+                roots = data.get("filesystem_roots") or []
+                known = data.get("known_repo_paths") or []
+                return (
+                    [str(x).strip() for x in roots if isinstance(x, str) and x.strip()],
+                    [str(x).strip() for x in known if isinstance(x, str) and x.strip()],
+                )
     except Exception:  # noqa: BLE001 — network/parse error → defaults
         pass
-    return []
+    return [], []
 
 
 # ---------------------------------------------------------------------------
@@ -1610,7 +1728,8 @@ async def run_tunnel(
 
     # Filesystem connector roots (executor_config.filesystem_roots, unioned across
     # the tenant's projects). Empty → fall back to the home dir (repo_path).
-    fs_roots = await _fetch_filesystem_roots(base_url, token)
+    # known_repo_paths are trust anchors for silent auto-add (b9d1b606).
+    fs_roots, known_repo_paths = await _fetch_filesystem_roots(base_url, token)
 
     # 2. Build commands for all enabled slots. Processes are NOT spawned here —
     #    lazy spawning (3649a61a) defers each proxy until its first incoming
@@ -1818,7 +1937,11 @@ async def run_tunnel(
     tasks: list[asyncio.Task] = []
     if proxy_fs is not None:
         tasks.append(asyncio.ensure_future(
-            _reconnect_loop_lazy(ws_fs, proxy_fs, "fs", tool_prefix=slot_prefixes.get("fs"))
+            _reconnect_loop_lazy(
+                ws_fs, proxy_fs, "fs",
+                tool_prefix=slot_prefixes.get("fs"),
+                known_repo_paths=known_repo_paths,
+            )
         ))
         tasks.append(asyncio.ensure_future(_idle_killer(proxy_fs)))
     if proxy_code is not None:
