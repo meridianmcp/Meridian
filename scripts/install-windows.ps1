@@ -7,6 +7,27 @@
 #
 $ErrorActionPreference = "Stop"
 
+# ---- Primary path: uv tool install ------------------------------------------
+# If `uv` is on PATH, install the published PyPI package as a uv tool. This is
+# the preferred path — uv manages an isolated venv + a shim on PATH, and users
+# get pip-style upgrades (`uv tool upgrade meridian-server`). Falls back to the
+# binary download below if uv isn't installed or the install fails.
+$uv = Get-Command uv -ErrorAction SilentlyContinue
+if ($null -ne $uv) {
+    Write-Host "uv detected — installing meridian-server via uv tool install..."
+    & uv tool install meridian-server
+    if ($LASTEXITCODE -eq 0) {
+        Write-Host ""
+        Write-Host "Installed meridian-server with uv."
+        Write-Host "If 'meridian' isn't found, run:  uv tool update-shell  (then restart your terminal)"
+        Write-Host ""
+        Write-Host "Done. In a NEW terminal, run:  meridian --tunnel --repo ."
+        exit 0
+    }
+    Write-Warning "uv tool install failed; falling back to binary download."
+}
+
+# ---- Fallback path: download the standalone binary --------------------------
 $binDir = Join-Path $env:USERPROFILE ".local\bin"
 $dest = Join-Path $binDir "meridian.exe"
 # The release attaches the Windows binary as a flat `meridian.exe` asset

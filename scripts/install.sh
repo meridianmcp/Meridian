@@ -6,6 +6,25 @@ INSTALL_DIR="$HOME/.meridian"
 
 echo "Installing Meridian..."
 
+# ---- Primary path: uv tool install ------------------------------------------
+# If `uv` is on PATH, install the published PyPI package as a uv tool. This is
+# the preferred path — uv manages an isolated venv + a shim on PATH, and users
+# upgrade with `uv tool upgrade meridian-server`. Falls back to the source
+# clone + pixi install below if uv isn't installed or the install fails.
+if command -v uv >/dev/null 2>&1; then
+  echo "uv detected — installing meridian-server via uv tool install..."
+  if uv tool install meridian-server; then
+    echo ""
+    echo "Installed meridian-server with uv."
+    echo "If 'meridian' isn't found, run: uv tool update-shell  (then restart your shell)"
+    echo "Run: meridian --tunnel --repo ."
+    exit 0
+  fi
+  echo "uv tool install failed; falling back to source install." >&2
+fi
+
+# ---- Fallback path: clone repo + pixi ---------------------------------------
+
 # Check dependencies
 command -v git >/dev/null 2>&1 || { echo "git required"; exit 1; }
 command -v python3 >/dev/null 2>&1 || { echo "python3 required"; exit 1; }
