@@ -2455,6 +2455,29 @@ async def search_tasks(
     return [_row_to_dict(r) for r in rows]  # type: ignore[misc]
 
 
+def _search_snippet(text: str | None, query: str, window: int = 60) -> str:
+    """Return a short context window of ``text`` centered on ``query``.
+
+    Used by :func:`search_all` to give the dashboard a preview of the matching
+    body text. Case-insensitive. Adds leading/trailing ellipses when the snippet
+    is clipped from a longer body. Returns an empty string when ``text`` is
+    falsy or the query term is not present (e.g. a title-only match).
+    """
+    if not text or not query:
+        return ""
+    idx = text.lower().find(query.lower())
+    if idx == -1:
+        return ""
+    start = max(0, idx - window)
+    end = min(len(text), idx + len(query) + window)
+    snippet = text[start:end].strip()
+    if start > 0:
+        snippet = "…" + snippet
+    if end < len(text):
+        snippet = snippet + "…"
+    return snippet
+
+
 async def search_all(
     db: Any,
     project_id: str,
@@ -2463,11 +2486,21 @@ async def search_all(
 ) -> dict[str, Any]:
     """Universal search across task_log, project_notes, sprint_items, and decisions_pinned.
 
+    Matches both header fields (title) and body text:
+      - task_log.description
+      - project_notes.title + project_notes.body
+      - decisions_pinned.title + decisions_pinned.body
+      - sprint_items.title + sprint_items.notes
+
     SQLite: LIKE %query% on all relevant text fields.
-    Postgres: ILIKE with optional pg_trgm similarity fallback.
+    Postgres: ILIKE on all relevant text fields (portable across both backends;
+    pg_trgm/tsvector are Postgres-only so we keep to ILIKE here for parity).
 
     Returns grouped results: {tasks, notes, decisions, sprint_items}.
-    Each item includes a `match_type` key for the source table.
+    Each item includes a ``match_type`` key for the source table and a
+    ``snippet`` key — a short window of the matching body text centered on the
+    query term (empty string when no body field matched, e.g. a title-only
+    match).
     """
     like_pat = f"%{query}%"
     is_pg = hasattr(db, "_pool")
@@ -2532,6 +2565,17 @@ async def search_all(
     notes = await _search(notes_sql, (project_id, like_pat, like_pat, limit))
     decisions = await _search(decisions_sql, (project_id, like_pat, like_pat, limit))
     sprint_items = await _search(sprint_sql, (project_id, like_pat, like_pat, limit))
+
+    # Attach a body-text snippet for each result so the dashboard search bar can
+    # surface matching context. The body field name differs per content type.
+    for t in tasks:
+        t["snippet"] = _search_snippet(t.get("description"), query)
+    for n in notes:
+        n["snippet"] = _search_snippet(n.get("body"), query)
+    for d in decisions:
+        d["snippet"] = _search_snippet(d.get("body"), query)
+    for s in sprint_items:
+        s["snippet"] = _search_snippet(s.get("notes"), query)
 
     return {
         "query": query,
