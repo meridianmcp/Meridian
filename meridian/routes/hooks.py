@@ -21,7 +21,13 @@ def _hook_script_path(filename: str) -> Path:
 
 
 def _watcher_script_path(filename: str) -> Path:
-    return Path(__file__).parent.parent.parent / "scripts" / filename
+    # In Docker (non-editable install), __file__ resolves to site-packages,
+    # not /app. WORKDIR is /app and scripts/ lives there, so fall back to cwd.
+    repo_root = Path(__file__).resolve().parent.parent.parent
+    candidate = repo_root / "scripts" / filename
+    if candidate.exists():
+        return candidate
+    return Path.cwd() / "scripts" / filename
 
 
 # ---------------------------------------------------------------------------
