@@ -131,7 +131,7 @@ BUILTIN_PLUGINS: list[dict[str, Any]] = [
         "enabled": False,
         "builtin": True,
         "core": False,
-        "command": ["uvx", "word-mcp-live"],
+        "command": ["uvx", "--from", "word-mcp-live", "word_mcp_server.exe"],
         "env": {"MCP_AUTHOR": "Adam", "MCP_AUTHOR_INITIALS": "AC"},
         # word-mcp-live self-prefixes its tools — leave empty.
         "prefix": None,
