@@ -5991,7 +5991,19 @@ async def get_parallelizable_groups(
     claimable_statuses = {"pending", "todo"}
     eligible: list[dict[str, Any]] = []
     blocked: list[dict[str, Any]] = []
+    # df573218 — surface currently-claimed work so an orchestrator sees the live
+    # parallelism state (and knows an item it planned was grabbed by another).
+    running: list[dict[str, Any]] = []
     for it in items:
+        if it.get("status") == "in_progress" or (
+            (it.get("status") or "pending") in claimable_statuses and it.get("claimed_at")
+        ):
+            running.append({
+                "id": it["id"],
+                "title": it.get("title", ""),
+                "status": it.get("status"),
+                "claimed_at": it.get("claimed_at"),
+            })
         if (it.get("status") or "pending") not in claimable_statuses:
             continue
         if it.get("claimed_at"):
@@ -6051,6 +6063,7 @@ async def get_parallelizable_groups(
         "eligible_count": len(eligible),
         "undeclared_count": undeclared,
         "blocked": blocked,
+        "running": running,  # df573218 — items currently in flight
     }
 
 

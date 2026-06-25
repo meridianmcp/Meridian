@@ -2390,7 +2390,38 @@ async def _handle_sprint_tools(
                         }
                 except Exception:  # noqa: BLE001
                     pass
-            raise
+            # df573218 — claim race: another session grabbed this item between
+            # planning and claiming. Instead of crashing the worker with a hard
+            # error, point it at the next claimable item so it can keep going.
+            _next_item = None
+            try:
+                _grp = await db_module.get_parallelizable_groups(
+                    db, args["project_id"], version=_stale_item.get("version") if _stale_item else None
+                )
+                for _group in _grp.get("groups", []):
+                    for _cand in _group:
+                        if _cand.get("id") != args["item_id"]:
+                            _next_item = _cand
+                            break
+                    if _next_item is not None:
+                        break
+            except Exception:  # noqa: BLE001
+                pass
+            return {
+                "status": "already_claimed",
+                "item_id": args["item_id"],
+                "current_status": (_stale_item or {}).get("status"),
+                "next_available_id": (_next_item or {}).get("id"),
+                "next_available_title": (_next_item or {}).get("title"),
+                "message": (
+                    "Item was already claimed by another session. "
+                    + (
+                        f"Claim next_available_id ({(_next_item or {}).get('id')}) instead."
+                        if _next_item else
+                        "No other claimable items remain in this version."
+                    )
+                ),
+            }
         if item is None:
             raise ValueError("sprint item not found")
 

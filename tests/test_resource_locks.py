@@ -421,6 +421,20 @@ async def test_parallelizable_groups_mcp_handler_warns_on_undeclared(db):
     assert "resource declarations" in res["warning"]
 
 
+@pytest.mark.asyncio
+async def test_parallelizable_groups_running_field(db):
+    """df573218 — in-flight (claimed) items surface under 'running'."""
+    p = await db_module.create_project(db, "running1")
+    a = await db_module.add_sprint_item(db, p["id"], "v1", "a", touches_resources=["file:a.py"])
+    await db_module.add_sprint_item(db, p["id"], "v1", "b", touches_resources=["file:b.py"])
+    await db_module.claim_sprint_item(db, p["id"], a["id"])
+    res = await db_module.get_parallelizable_groups(db, p["id"], version="v1")
+    running_ids = {r["id"] for r in res["running"]}
+    assert a["id"] in running_ids
+    # a is in flight → only b remains claimable.
+    assert res["eligible_count"] == 1
+
+
 def test_normalize_resource_id_strips_inferred_marker():
     # 07bdfdbb — inferred resources canonicalize the same as explicit ones.
     assert db_module.normalize_resource_id(
