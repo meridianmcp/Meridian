@@ -13602,6 +13602,166 @@ async def test_start_session_via_mcp_passes_version(db, tmp_path):
     assert result["sprint_summary"]["total"] == 1
 
 
+# ---------------------------------------------------------------------------
+# Auto-orchestration hint in start_session (a6cacfef)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_start_session_orchestration_parallel_when_conflict_free(db, tmp_path):
+    """Two pending items touching different files cluster into one group with
+    >1 item → recommended_strategy 'parallel', returned in the compact block."""
+    import meridian.server as srv
+
+    p = await db_module.create_project(db, "orch-parallel")
+    pid = p["id"]
+    await db_module.add_sprint_item(
+        db, pid, "v0.1.x", "edit alpha", touches_resources=["file:a.py"]
+    )
+    await db_module.add_sprint_item(
+        db, pid, "v0.1.x", "edit beta", touches_resources=["file:b.py"]
+    )
+
+    payload = await srv._start_session_composite(
+        db, pid, "orch-sess", str(tmp_path), version="v0.1.x", compact=True,
+    )
+    orch = payload["orchestration"]
+    assert orch["recommended_strategy"] == "parallel"
+    assert orch["eligible_count"] == 2
+    # Conflict-free items share a single group of two.
+    assert orch["group_count"] == 1
+    assert sum(len(g) for g in orch["groups"]) == 2
+    # Compact group form carries id + title only.
+    first = orch["groups"][0][0]
+    assert set(first) == {"id", "title"}
+
+
+@pytest.mark.asyncio
+async def test_start_session_orchestration_sequential_single_item(db, tmp_path):
+    """A single pending item → one group of one → recommended_strategy
+    'sequential' (no fan-out possible)."""
+    import meridian.server as srv
+
+    p = await db_module.create_project(db, "orch-seq")
+    pid = p["id"]
+    await db_module.add_sprint_item(
+        db, pid, "v0.1.x", "lone edit", touches_resources=["file:shared.py"]
+    )
+
+    payload = await srv._start_session_composite(
+        db, pid, "seq-sess", str(tmp_path), version="v0.1.x", compact=True,
+    )
+    orch = payload["orchestration"]
+    assert orch["recommended_strategy"] == "sequential"
+    assert orch["group_count"] == 1
+    assert orch["eligible_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_start_session_orchestration_parallel_multiple_groups(db, tmp_path):
+    """Two items touching the SAME file split into two groups → group_count>1,
+    so per the strategy rule the orchestrator can still wave them: 'parallel'."""
+    import meridian.server as srv
+
+    p = await db_module.create_project(db, "orch-multigroup")
+    pid = p["id"]
+    await db_module.add_sprint_item(
+        db, pid, "v0.1.x", "first edit", touches_resources=["file:shared.py"]
+    )
+    await db_module.add_sprint_item(
+        db, pid, "v0.1.x", "second edit", touches_resources=["file:shared.py"]
+    )
+
+    payload = await srv._start_session_composite(
+        db, pid, "multigroup-sess", str(tmp_path), version="v0.1.x", compact=True,
+    )
+    orch = payload["orchestration"]
+    assert orch["group_count"] == 2
+    assert orch["recommended_strategy"] == "parallel"
+
+
+@pytest.mark.asyncio
+async def test_start_session_orchestration_full_block(db, tmp_path):
+    """The non-compact orientation also carries the orchestration hint."""
+    import meridian.server as srv
+
+    p = await db_module.create_project(db, "orch-full")
+    pid = p["id"]
+    await db_module.add_sprint_item(
+        db, pid, "v0.1.x", "task one", touches_resources=["file:x.py"]
+    )
+    await db_module.add_sprint_item(
+        db, pid, "v0.1.x", "task two", touches_resources=["file:y.py"]
+    )
+
+    payload = await srv._start_session_composite(
+        db, pid, "orch-full-sess", str(tmp_path), version="v0.1.x", compact=False,
+    )
+    assert payload["orchestration"]["recommended_strategy"] == "parallel"
+
+
+@pytest.mark.asyncio
+async def test_start_session_no_orchestration_when_no_pending(db, tmp_path):
+    """No pending items → no orchestration block (degrade gracefully)."""
+    import meridian.server as srv
+
+    p = await db_module.create_project(db, "orch-none")
+    pid = p["id"]
+    done = await db_module.add_sprint_item(db, pid, "v1", "already done")
+    await db_module.complete_sprint_item(db, pid, done["id"])
+
+    payload = await srv._start_session_composite(
+        db, pid, "orch-none-sess", str(tmp_path), compact=True,
+    )
+    assert "orchestration" not in payload
+
+
+@pytest.mark.asyncio
+async def test_start_session_orchestration_degrades_on_grouping_error(
+    db, tmp_path, monkeypatch
+):
+    """If get_parallelizable_groups raises, start_session still succeeds and
+    simply omits the orchestration hint."""
+    import meridian.server as srv
+
+    p = await db_module.create_project(db, "orch-error")
+    pid = p["id"]
+    await db_module.add_sprint_item(db, pid, "v0.1.x", "some pending work")
+
+    async def _boom(*_a, **_k):
+        raise RuntimeError("grouping failed")
+
+    monkeypatch.setattr(db_module, "get_parallelizable_groups", _boom)
+
+    payload = await srv._start_session_composite(
+        db, pid, "orch-err-sess", str(tmp_path), version="v0.1.x", compact=True,
+    )
+    # start_session did NOT break; the hint is simply absent.
+    assert "session_id" in payload
+    assert "orchestration" not in payload
+
+
+@pytest.mark.asyncio
+async def test_start_session_orchestration_scoped_to_version(db, tmp_path):
+    """Orchestration only plans the session's version bucket, not other buckets."""
+    import meridian.server as srv
+
+    p = await db_module.create_project(db, "orch-scope")
+    pid = p["id"]
+    await db_module.add_sprint_item(
+        db, pid, "v0.1.x", "in scope one", touches_resources=["file:a.py"]
+    )
+    # An out-of-scope item in another bucket must NOT inflate eligible_count.
+    await db_module.add_sprint_item(
+        db, pid, "v9.9", "out of scope", touches_resources=["file:z.py"]
+    )
+
+    payload = await srv._start_session_composite(
+        db, pid, "orch-scope-sess", str(tmp_path), version="v0.1.x", compact=True,
+    )
+    assert payload["orchestration"]["eligible_count"] == 1
+
+
 def test_build_quick_start_goal_filters_by_version():
     """a76cb7c0 — _build_quick_start_goal(version=...) names only that bucket's
     items; None keeps every pending item (legacy)."""

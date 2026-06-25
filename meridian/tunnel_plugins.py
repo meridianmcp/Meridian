@@ -68,6 +68,12 @@ BUILTIN_PLUGINS: list[dict[str, Any]] = [
         "core": True,
         # None → the client uses its platform-aware default builder for this slot.
         "command": None,
+        # Tool-name display prefix the proxy relay prepends to this slot's
+        # tools/list entries (e.g. "read_file" → "Filesystem: read_file") so the
+        # generic filesystem tool names are namespaced in the connector. Slots
+        # whose inner server already self-prefixes its tools leave this None to
+        # avoid double-prefixing. (b4455202)
+        "prefix": "Filesystem",
         "description": "Filesystem MCP (@modelcontextprotocol/server-filesystem)",
         "description_overrides": {},
     },
@@ -80,6 +86,8 @@ BUILTIN_PLUGINS: list[dict[str, Any]] = [
         "builtin": True,
         "core": True,
         "command": None,  # default: codebase-memory-mcp (auto-installed)
+        # codebase-memory-mcp already self-prefixes its tools — leave empty.
+        "prefix": None,
         "description": "Code intelligence graph (codebase-memory-mcp)",
         "description_overrides": {},
     },
@@ -93,6 +101,9 @@ BUILTIN_PLUGINS: list[dict[str, Any]] = [
         "core": True,
         # default: Serena (LSP symbol tools); {repo_path} expanded at spawn time.
         "command": list(SERENA_EXTRACT_COMMAND),
+        # Serena's bare tool names (find_symbol, replace_symbol_body, …) get a
+        # "Serena: " display prefix at the relay so they're namespaced. (b4455202)
+        "prefix": "Serena",
         "description": "Symbol-level code intelligence (Serena LSP)",
         "description_overrides": {},
     },
@@ -107,6 +118,8 @@ BUILTIN_PLUGINS: list[dict[str, Any]] = [
         "core": False,
         "command": ["uvx", "powerpoint-mcp"],
         "env": {},
+        # powerpoint-mcp self-prefixes its tools — leave empty to avoid doubling.
+        "prefix": None,
         "description": "PowerPoint authoring (powerpoint-mcp)",
         "description_overrides": {},
     },
@@ -120,6 +133,8 @@ BUILTIN_PLUGINS: list[dict[str, Any]] = [
         "core": False,
         "command": ["uvx", "word-mcp-live"],
         "env": {"MCP_AUTHOR": "Adam", "MCP_AUTHOR_INITIALS": "AC"},
+        # word-mcp-live self-prefixes its tools — leave empty.
+        "prefix": None,
         "description": "Word authoring (word-mcp-live)",
         "description_overrides": {},
     },
@@ -132,6 +147,8 @@ BUILTIN_PLUGINS: list[dict[str, Any]] = [
         "builtin": True,
         "core": False,
         "command": None,  # spawned via npx @wonderwhy-er/desktop-commander@latest
+        # Desktop Commander self-prefixes its tools — leave empty.
+        "prefix": None,
         "description": "Desktop Commander — system tools, file access, terminal (local only)",
         "description_overrides": {},
     },

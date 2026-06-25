@@ -187,6 +187,7 @@ async def _run_connection_lazy(
     ws_url: str,
     proxy: "SlotProxy",
     label: str = "fs",
+    tool_prefix: str | None = None,
 ) -> None:
     """Hold one WebSocket session open with lazy proxy spawning.
 
@@ -231,7 +232,9 @@ async def _run_connection_lazy(
                         }))
                         continue
                     proxy.touch()
-                    resp = await _relay_request(http_client, local_base, msg)
+                    resp = await _relay_request(
+                        http_client, local_base, msg, tool_prefix=tool_prefix
+                    )
                     await ws.send(json.dumps(resp))
 
 
@@ -239,12 +242,13 @@ async def _reconnect_loop_lazy(
     ws_url: str,
     proxy: "SlotProxy",
     label: str,
+    tool_prefix: str | None = None,
 ) -> None:
     """Keep one lazy-spawn tunnel alive, reconnecting with exponential backoff."""
     backoff = 1.0
     while True:
         try:
-            await _run_connection_lazy(ws_url, proxy, label)
+            await _run_connection_lazy(ws_url, proxy, label, tool_prefix=tool_prefix)
             backoff = 1.0
         except asyncio.CancelledError:
             raise
@@ -263,6 +267,7 @@ async def _run_extract_pool_connection(
     pool: "SerenaDaemonPool",
     default_repo_path: str,
     label: str = "extract",
+    tool_prefix: str | None = None,
 ) -> None:
     """Hold one WebSocket open for the code-extractor slot, routed via the pool.
 
@@ -314,7 +319,8 @@ async def _run_extract_pool_connection(
                     }))
                     continue
                 resp = await _relay_request(
-                    http_client, f"http://127.0.0.1:{daemon.port}", msg
+                    http_client, f"http://127.0.0.1:{daemon.port}", msg,
+                    tool_prefix=tool_prefix,
                 )
                 await ws.send(json.dumps(resp))
 
@@ -324,12 +330,15 @@ async def _reconnect_loop_extract_pool(
     pool: "SerenaDaemonPool",
     default_repo_path: str,
     label: str = "extract",
+    tool_prefix: str | None = None,
 ) -> None:
     """Keep the pooled code-extractor tunnel alive, reconnecting with backoff."""
     backoff = 1.0
     while True:
         try:
-            await _run_extract_pool_connection(ws_url, pool, default_repo_path, label)
+            await _run_extract_pool_connection(
+                ws_url, pool, default_repo_path, label, tool_prefix=tool_prefix
+            )
             backoff = 1.0
         except asyncio.CancelledError:
             raise
@@ -1073,15 +1082,118 @@ async def _index_code_dir(port: int, code_dir: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Tool-name prefixing (b4455202) — pure, unit-tested
+# ---------------------------------------------------------------------------
+
+def _prefix_tool_name(name: Any, prefix: str) -> Any:
+    """Prepend ``"<prefix>: "`` to a tool name, never double-prefixing.
+
+    Returns *name* unchanged if it is not a string or already carries the prefix.
+    """
+    if not isinstance(name, str):
+        return name
+    marker = f"{prefix}: "
+    if name.startswith(marker):
+        return name
+    return marker + name
+
+
+def _prefix_tools_in_jsonrpc(obj: Any, prefix: str) -> bool:
+    """In-place: prefix every ``result.tools[*].name`` in a JSON-RPC object.
+
+    Returns True if *obj* was a tools/list-shaped response (``result.tools`` is a
+    list) and at least one entry was inspected, else False (so callers can skip
+    re-serialising untouched bodies). Tolerant of malformed shapes.
+    """
+    if not isinstance(obj, dict):
+        return False
+    result = obj.get("result")
+    if not isinstance(result, dict):
+        return False
+    tools = result.get("tools")
+    if not isinstance(tools, list):
+        return False
+    for tool in tools:
+        if isinstance(tool, dict) and "name" in tool:
+            tool["name"] = _prefix_tool_name(tool["name"], prefix)
+    return True
+
+
+def _apply_tool_prefix(body: bytes, prefix: str | None) -> bytes:
+    """Rewrite tool names in a relayed ``tools/list`` response body.
+
+    *body* is the raw HTTP response content from the local mcp-proxy. mcp-proxy's
+    Streamable HTTP transport returns either a bare JSON-RPC object or an SSE
+    stream (``event: message\\n data: {json}\\n\\n``); both are handled. Only
+    ``tools/list``-shaped JSON-RPC payloads (``result.tools``) are touched —
+    every other body (tools/call results, initialize, errors, non-JSON) is
+    returned byte-for-byte unchanged. Never raises: any parse failure degrades to
+    the original body. A falsy/empty *prefix* is a no-op.
+    """
+    if not prefix or not body:
+        return body
+    # Cheap guard: only bodies that could carry a tools list are worth parsing.
+    if b'"tools"' not in body:
+        return body
+    try:
+        text = body.decode("utf-8")
+    except (UnicodeDecodeError, AttributeError):
+        return body
+
+    # Plain JSON-RPC object (no SSE framing).
+    stripped = text.lstrip()
+    if stripped.startswith("{"):
+        try:
+            obj = json.loads(text)
+        except ValueError:
+            return body
+        if _prefix_tools_in_jsonrpc(obj, prefix):
+            return json.dumps(obj).encode("utf-8")
+        return body
+
+    # SSE framing: rewrite each ``data:`` line's JSON payload, preserve the rest
+    # (event:/id:/comment lines, blank separators, CRLF or LF) verbatim.
+    changed = False
+    out_lines: list[str] = []
+    for line in text.splitlines(keepends=True):
+        bare = line.rstrip("\r\n")
+        if bare.startswith("data:"):
+            payload = bare[5:]
+            lead = payload[: len(payload) - len(payload.lstrip())]
+            data = payload.strip()
+            if data:
+                try:
+                    obj = json.loads(data)
+                except ValueError:
+                    out_lines.append(line)
+                    continue
+                if _prefix_tools_in_jsonrpc(obj, prefix):
+                    newline = line[len(bare):]  # original "\n"/"\r\n"/"" suffix
+                    out_lines.append(f"data:{lead}{json.dumps(obj)}{newline}")
+                    changed = True
+                    continue
+        out_lines.append(line)
+    if not changed:
+        return body
+    return "".join(out_lines).encode("utf-8")
+
+
+# ---------------------------------------------------------------------------
 # Request relay (mostly pure — unit tested with httpx MockTransport)
 # ---------------------------------------------------------------------------
 
-async def _relay_request(http_client, local_base: str, msg: dict) -> dict:
+async def _relay_request(
+    http_client, local_base: str, msg: dict, *, tool_prefix: str | None = None
+) -> dict:
     """Proxy one server ``request`` message to the local mcp-proxy.
 
     Returns a ``response`` message (same correlation id) with a base64 body,
     matching the protocol in ``routes/tunnel.py``. Local failures come back as
     a 502 so the server resolves its pending future instead of timing out.
+
+    ``tool_prefix`` (b4455202) — when set, ``tools/list`` response bodies get
+    each tool name prefixed (e.g. ``read_file`` → ``Filesystem: read_file``).
+    Non-tools/list responses pass through untouched.
     """
     req_id = msg.get("id")
     method = (msg.get("method") or "GET").upper()
@@ -1103,11 +1215,22 @@ async def _relay_request(http_client, local_base: str, msg: dict) -> dict:
             timeout=_LOCAL_REQUEST_TIMEOUT,
         )
         resp_body = resp.content or b""
+        resp_headers = dict(resp.headers)
+        if tool_prefix and resp_body:
+            new_body = _apply_tool_prefix(resp_body, tool_prefix)
+            if new_body != resp_body:
+                resp_body = new_body
+                # The rewrite changes the byte length — drop the now-stale
+                # Content-Length so the server frames the new body correctly.
+                resp_headers = {
+                    k: v for k, v in resp_headers.items()
+                    if k.lower() != "content-length"
+                }
         return {
             "type": "response",
             "id": req_id,
             "status": resp.status_code,
-            "headers": dict(resp.headers),
+            "headers": resp_headers,
             "body": base64.b64encode(resp_body).decode() if resp_body else "",
         }
     except Exception as exc:  # local proxy down / timeout / bad response
@@ -1138,7 +1261,9 @@ async def _fetch_me(base_url: str, token: str) -> dict:
         return r.json()
 
 
-async def _run_connection(ws_url: str, port: int, label: str = "fs") -> None:
+async def _run_connection(
+    ws_url: str, port: int, label: str = "fs", tool_prefix: str | None = None
+) -> None:
     """Hold one WebSocket session open, relaying requests until it drops."""
     import httpx
     import websockets
@@ -1157,7 +1282,9 @@ async def _run_connection(ws_url: str, port: int, label: str = "fs") -> None:
                 if msg.get("type") == "ping":
                     continue
                 if msg.get("type") == "request":
-                    resp = await _relay_request(http_client, local_base, msg)
+                    resp = await _relay_request(
+                        http_client, local_base, msg, tool_prefix=tool_prefix
+                    )
                     await ws.send(json.dumps(resp))
 
 
@@ -1165,12 +1292,14 @@ async def _run_connection(ws_url: str, port: int, label: str = "fs") -> None:
 # Orchestration
 # ---------------------------------------------------------------------------
 
-async def _reconnect_loop(ws_url: str, port: int, label: str) -> None:
+async def _reconnect_loop(
+    ws_url: str, port: int, label: str, tool_prefix: str | None = None
+) -> None:
     """Keep one tunnel alive, reconnecting with exponential backoff."""
     backoff = 1.0
     while True:
         try:
-            await _run_connection(ws_url, port, label)
+            await _run_connection(ws_url, port, label, tool_prefix=tool_prefix)
             backoff = 1.0
         except asyncio.CancelledError:
             raise
@@ -1667,30 +1796,46 @@ async def run_tunnel(
 
     # 7. Run lazy reconnect loops — one per enabled slot. Each loop also gets an
     #    idle-killer coroutine that auto-kills the proxy after _IDLE_KILL_SECONDS.
+    # b4455202 — per-slot tool-name display prefix (e.g. "Filesystem", "Serena")
+    # the relay prepends to that slot's tools/list. Slots whose inner server
+    # already self-prefixes carry prefix=None (no-op).
+    slot_prefixes = {
+        s: (by_slot.get(s) or {}).get("prefix")
+        for s in ("fs", "code", "extract", "ppt", "word", "dc")
+    }
     ws_fs = _ws_url(base_url, tenant_id, token)
     ws_code = _ws_code_url(base_url, tenant_id, token)
     ws_extract = _ws_extract_url(base_url, tenant_id, token)
     tasks: list[asyncio.Task] = []
     if proxy_fs is not None:
-        tasks.append(asyncio.ensure_future(_reconnect_loop_lazy(ws_fs, proxy_fs, "fs")))
+        tasks.append(asyncio.ensure_future(
+            _reconnect_loop_lazy(ws_fs, proxy_fs, "fs", tool_prefix=slot_prefixes.get("fs"))
+        ))
         tasks.append(asyncio.ensure_future(_idle_killer(proxy_fs)))
     if proxy_code is not None:
-        tasks.append(asyncio.ensure_future(_reconnect_loop_lazy(ws_code, proxy_code, "code")))
+        tasks.append(asyncio.ensure_future(
+            _reconnect_loop_lazy(ws_code, proxy_code, "code", tool_prefix=slot_prefixes.get("code"))
+        ))
         tasks.append(asyncio.ensure_future(_idle_killer(proxy_code)))
     if proxy_extract is not None:
-        tasks.append(asyncio.ensure_future(_reconnect_loop_lazy(ws_extract, proxy_extract, "extract")))
+        tasks.append(asyncio.ensure_future(
+            _reconnect_loop_lazy(ws_extract, proxy_extract, "extract", tool_prefix=slot_prefixes.get("extract"))
+        ))
         tasks.append(asyncio.ensure_future(_idle_killer(proxy_extract)))
     elif serena_pool is not None:
         # 64650cb4 — pooled Serena: per-repo routing + idle reaper instead of a
         # single SlotProxy + idle-killer.
         tasks.append(asyncio.ensure_future(
-            _reconnect_loop_extract_pool(ws_extract, serena_pool, repo_path, "extract")
+            _reconnect_loop_extract_pool(
+                ws_extract, serena_pool, repo_path, "extract",
+                tool_prefix=slot_prefixes.get("extract"),
+            )
         ))
         tasks.append(asyncio.ensure_future(_pool_idle_reaper(serena_pool)))
     for slot, oproxy in office_proxies.items():
         ws_office = _ws_office_url(base_url, tenant_id, token, slot)
         tasks.append(asyncio.ensure_future(
-            _reconnect_loop_lazy(ws_office, oproxy, slot)
+            _reconnect_loop_lazy(ws_office, oproxy, slot, tool_prefix=slot_prefixes.get(slot))
         ))
         tasks.append(asyncio.ensure_future(_idle_killer(oproxy)))
     # Custom plugins (eager) still use the regular reconnect + watchdog.

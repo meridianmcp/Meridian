@@ -78,6 +78,14 @@ Do not default to hand-writing a markdown file in place of the tool.
 - **Codebase-wide discovery:** `codebase__search_graph` first, then `find_symbol` to read.
 - Docs (`.md`) are the exception — edit those with normal file tools.
 
+> **Tool names over the tunnel connector are slot-prefixed** (b4455202): the
+> filesystem slot's tools appear as `Filesystem: read_file` etc., and Serena's as
+> `Serena: find_symbol`, `Serena: replace_symbol_body`, `Serena:
+> find_referencing_symbols`. The bare names above are the underlying tools; in a
+> claude.ai connector session call them by their `Serena: `/`Filesystem: `
+> display name. Code-intel / Office / Desktop-Commander tools already self-prefix
+> and are not double-prefixed.
+
 ---
 
 ## Tests & coverage

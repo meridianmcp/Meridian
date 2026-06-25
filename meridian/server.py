@@ -3518,6 +3518,56 @@ def _execution_mode_directive(mode: str | None) -> str:
     )
 
 
+async def _build_orchestration_hint(
+    db: aiosqlite.Connection,
+    project_id: str,
+    version: str | None,
+) -> dict[str, Any] | None:
+    """a6cacfef — auto-orchestration hint attached to ``start_session``.
+
+    Clusters the pending sprint items (via :func:`db.get_parallelizable_groups`,
+    scoped to the session's ``version`` when set) and returns a compact
+    ``orchestration`` block so a fresh session sees the recommended fan-out plan
+    without calling ``get_parallelizable_groups`` manually.
+
+    ``recommended_strategy`` is ``"parallel"`` when there is more than one group
+    OR any single group holds more than one item (i.e. work can run concurrently),
+    else ``"sequential"``. Groups are returned in a compact form (id + title per
+    item) to avoid bloating the orientation. Returns ``None`` when there is no
+    eligible work to plan. NEVER raises — the caller wraps in try/except, and on
+    any failure start_session simply ships no hint.
+    """
+    grouping = await db_module.get_parallelizable_groups(db, project_id, version)
+    groups = grouping.get("groups") or []
+    if not groups:
+        return None
+    group_count = grouping.get("group_count", len(groups))
+    any_multi = any(len(g) > 1 for g in groups)
+    strategy = "parallel" if (group_count > 1 or any_multi) else "sequential"
+    compact_groups = [
+        [
+            {"id": it.get("id"), "title": it.get("title", "")}
+            for it in group
+        ]
+        for group in groups
+    ]
+    hint: dict[str, Any] = {
+        "recommended_strategy": strategy,
+        "group_count": group_count,
+        "eligible_count": grouping.get("eligible_count", 0),
+        "groups": compact_groups,
+    }
+    blocked = grouping.get("blocked") or []
+    if blocked:
+        hint["blocked_count"] = len(blocked)
+    hint["note"] = (
+        f"{grouping.get('eligible_count', 0)} pending item(s) cluster into "
+        f"{group_count} conflict-free group(s); recommended strategy: "
+        f"{strategy}. Call get_parallelizable_groups(project_id) for full detail."
+    )
+    return hint
+
+
 async def _start_session_composite(
     db: aiosqlite.Connection,
     project_id: str,
@@ -3740,6 +3790,19 @@ async def _start_session_composite(
         )
         if _c_file_warnings:
             _c_payload["file_warnings"] = _c_file_warnings
+        # a6cacfef — when pending items exist, surface the recommended fan-out
+        # plan so a fresh session sees the strategy without a manual call. Never
+        # let grouping break start_session (degrade to no hint).
+        _c_pending = _c_payload["sprint_summary"]["pending"]
+        if _c_pending > 0:
+            try:
+                _c_orch = await _build_orchestration_hint(
+                    db, project_id, scoped_version
+                )
+                if _c_orch is not None:
+                    _c_payload["orchestration"] = _c_orch
+            except Exception:
+                pass
         return _c_payload
 
     await _expire_and_generate_handoffs(db, data_dir)
@@ -3871,6 +3934,18 @@ async def _start_session_composite(
         )
     if file_warnings:
         payload["file_warnings"] = file_warnings
+    # a6cacfef — auto-orchestration hint: when there are pending items, attach the
+    # recommended fan-out strategy + grouped plan (scoped to the session's sprint
+    # version). Wrapped so a grouping failure never breaks start_session.
+    if pending_items:
+        try:
+            orchestration = await _build_orchestration_hint(
+                db, project_id, scoped_version
+            )
+            if orchestration is not None:
+                payload["orchestration"] = orchestration
+        except Exception:
+            pass
     if executor_config is not None:
         payload["executor_config"] = executor_config
         payload["executor_context"] = executor_context
