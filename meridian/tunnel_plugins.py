@@ -75,6 +75,11 @@ BUILTIN_PLUGINS: list[dict[str, Any]] = [
         # client prefix too produces double-prefixed names like
         # "filesystem__Filesystem__read_file" in the claude.ai connector. (49905647)
         "prefix": None,
+        # 4ea1b9d5 — "stateless" slots ride mcp-proxy's --stateless flag (each
+        # POST handled independently, the default for the one-shot tunnel relay).
+        # "persistent" slots (e.g. Desktop Commander) keep a stateful inner
+        # process across requests and so omit --stateless + skip the idle-killer.
+        "session_mode": "stateless",
         "description": "Filesystem MCP (@modelcontextprotocol/server-filesystem)",
         "description_overrides": {},
     },
@@ -89,6 +94,7 @@ BUILTIN_PLUGINS: list[dict[str, Any]] = [
         "command": None,  # default: codebase-memory-mcp (auto-installed)
         # codebase-memory-mcp already self-prefixes its tools — leave empty.
         "prefix": None,
+        "session_mode": "stateless",
         "description": "Code intelligence graph (codebase-memory-mcp)",
         "description_overrides": {},
     },
@@ -106,6 +112,7 @@ BUILTIN_PLUGINS: list[dict[str, Any]] = [
         # "extractor__find_symbol" via SLOT_DISPLAY_NAMES. A client prefix here
         # would double them to "extractor__Serena__find_symbol". (49905647)
         "prefix": None,
+        "session_mode": "stateless",
         "description": "Symbol-level code intelligence (Serena LSP)",
         "description_overrides": {},
     },
@@ -122,6 +129,7 @@ BUILTIN_PLUGINS: list[dict[str, Any]] = [
         "env": {},
         # powerpoint-mcp self-prefixes its tools — leave empty to avoid doubling.
         "prefix": None,
+        "session_mode": "stateless",
         "description": "PowerPoint authoring (powerpoint-mcp)",
         "description_overrides": {},
     },
@@ -137,6 +145,7 @@ BUILTIN_PLUGINS: list[dict[str, Any]] = [
         "env": {"MCP_AUTHOR": "Adam", "MCP_AUTHOR_INITIALS": "AC"},
         # word-mcp-live self-prefixes its tools — leave empty.
         "prefix": None,
+        "session_mode": "stateless",
         "description": "Word authoring (word-mcp-live)",
         "description_overrides": {},
     },
@@ -151,6 +160,9 @@ BUILTIN_PLUGINS: list[dict[str, Any]] = [
         "command": None,  # spawned via npx @wonderwhy-er/desktop-commander@latest
         # Desktop Commander self-prefixes its tools — leave empty.
         "prefix": None,
+        # 4ea1b9d5 — DC runs stateful terminal sessions: persistent so the inner
+        # process survives across requests (no --stateless, no idle-kill).
+        "session_mode": "persistent",
         "description": "Desktop Commander — system tools, file access, terminal (local only)",
         "description_overrides": {},
     },

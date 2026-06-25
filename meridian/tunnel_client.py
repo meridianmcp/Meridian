@@ -1163,7 +1163,7 @@ def _build_code_proxy_command(
 
 
 def _build_proxy_for_inner(
-    npx: str, inner_cmd: list[str], port: int
+    npx: str, inner_cmd: list[str], port: int, *, stateless: bool = True
 ) -> list[str]:
     """Wrap an arbitrary *inner_cmd* in mcp-proxy on *port*.
 
@@ -1176,13 +1176,120 @@ def _build_proxy_for_inner(
 
     On Windows ``--shell`` is added only when the inner launcher is a ``.cmd``/
     ``.bat`` shim (Node 24 CVE-2024-27980 mitigation), matching the other builders.
+
+    *stateless* (4ea1b9d5) — when False, ``--stateless`` is omitted so the inner
+    server keeps state across requests. Used for ``session_mode: "persistent"``
+    slots like Desktop Commander, whose terminal sessions must survive between
+    calls; ``--stateless`` would reset them on every POST.
     """
-    cmd = [npx, "-y", "mcp-proxy", "--port", str(port),
-           "--server", "stream", "--stateless"]
+    cmd = [npx, "-y", "mcp-proxy", "--port", str(port), "--server", "stream"]
+    if stateless:
+        cmd.append("--stateless")
     if sys.platform == "win32" and inner_cmd and inner_cmd[0].lower().endswith((".cmd", ".bat")):
         cmd.append("--shell")
     cmd += ["--", *inner_cmd]
     return cmd
+
+
+def _check_node() -> bool:
+    """True when a usable Node.js (``node`` + ``npx``) is on PATH.
+
+    Every tunnel slot runs its inner server through ``npx mcp-proxy``, so Node is
+    a hard prerequisite — without it mcp-proxy can't start and each slot would
+    silently 503. (d1c528f5)
+    """
+    return bool(shutil.which("node")) and bool(
+        shutil.which("npx") or shutil.which("npx.cmd")
+    )
+
+
+def _install_node_via_fnm() -> bool:
+    """Best-effort install of Node LTS via fnm (Fast Node Manager).
+
+    fnm needs no admin rights and is cross-platform, so it's the least-friction
+    way to provision Node for a user who only has Python/pixi. fnm itself is
+    installed first when missing (winget/scoop on Windows, the official
+    ``curl | bash`` script on POSIX). Every step is best-effort: all failures are
+    swallowed and the function returns whether ``_check_node`` passes afterward,
+    so the caller can fall back to a clear error. (d1c528f5)
+    """
+    fnm = shutil.which("fnm")
+    try:
+        if fnm is None:
+            if sys.platform == "win32":
+                if shutil.which("winget"):
+                    installer = ["winget", "install", "-e", "--id", "Schniz.fnm",
+                                 "--accept-source-agreements", "--accept-package-agreements"]
+                elif shutil.which("scoop"):
+                    installer = ["scoop", "install", "fnm"]
+                else:
+                    return False
+                subprocess.run(installer, check=False, timeout=600)
+            else:
+                if not shutil.which("bash") or not shutil.which("curl"):
+                    return False
+                subprocess.run(
+                    "curl -fsSL https://fnm.vercel.app/install | bash",
+                    shell=True, check=False, timeout=600,
+                )
+            fnm = shutil.which("fnm")
+            if fnm is None:
+                return False
+        # Install + select Node LTS. fnm installs into its own dir; reflect the
+        # resulting node path on this process's PATH so the spawned proxies see it.
+        subprocess.run([fnm, "install", "--lts"], check=False, timeout=600)
+        subprocess.run([fnm, "use", "lts-latest"], check=False, timeout=120)
+        try:
+            out = subprocess.run(
+                [fnm, "exec", "--using=lts-latest", "node", "-e",
+                 "process.stdout.write(process.execPath)"],
+                check=False, capture_output=True, text=True, timeout=120,
+            )
+            node_path = (out.stdout or "").strip()
+            if node_path:
+                bindir = str(Path(node_path).parent)
+                if bindir and bindir not in os.environ.get("PATH", ""):
+                    os.environ["PATH"] = bindir + os.pathsep + os.environ.get("PATH", "")
+        except Exception:  # noqa: BLE001 — PATH reflect is best-effort
+            pass
+        return _check_node()
+    except Exception:  # noqa: BLE001 — install is best-effort; caller degrades
+        return False
+
+
+def _ensure_node(auto_install: bool) -> bool:
+    """Ensure Node.js is available for the npx-based proxies.
+
+    Returns True when Node is usable. When it's missing: auto-install via fnm if
+    *auto_install* is set, otherwise print a clear, actionable error and return
+    False so the caller disables the npm-dependent slots instead of handing
+    mcp-proxy a broken npx path. (d1c528f5)
+    """
+    if _check_node():
+        return True
+    if auto_install:
+        print(
+            "meridian tunnel: Node.js not found — installing Node LTS via fnm "
+            "(no admin required)…",
+            flush=True,
+        )
+        if _install_node_via_fnm():
+            print("meridian tunnel: Node.js installed and on PATH.", flush=True)
+            return True
+        print(
+            "meridian tunnel: automatic Node.js install failed.",
+            file=sys.stderr, flush=True,
+        )
+    print(
+        "meridian tunnel: Node.js (node + npx) is required to run the tunnel "
+        "proxies but was not found on PATH.\n"
+        "  Fix: install Node LTS (https://nodejs.org) or fnm "
+        "(https://github.com/Schniz/fnm), then restart the tunnel.\n"
+        "  Or enable Settings → Tunnel → \"Auto-install Node\" (or set "
+        "MERIDIAN_AUTO_INSTALL_NODE=1) to let Meridian install it for you.",
+        file=sys.stderr, flush=True,
+    )
+    return False
 
 
 def _find_npx() -> str:
@@ -1904,6 +2011,18 @@ async def run_tunnel(
     # known_repo_paths are trust anchors for silent auto-add (b9d1b606).
     fs_roots, known_repo_paths = await _fetch_filesystem_roots(base_url, token)
 
+    # 1c. Node.js gate (d1c528f5) — every slot runs its inner server through
+    #     ``npx mcp-proxy``, so without Node the proxies can't start. Auto-install
+    #     via fnm when the workspace opts in (or MERIDIAN_AUTO_INSTALL_NODE=1);
+    #     otherwise print a clear error and stop rather than spawning broken
+    #     proxies that silently 503 on first call.
+    _auto_install_node = bool(me.get("auto_install_node_deps")) or (
+        os.environ.get("MERIDIAN_AUTO_INSTALL_NODE", "").strip().lower()
+        in ("1", "true", "yes")
+    )
+    if not _ensure_node(_auto_install_node):
+        return 1
+
     # 2. Build commands for all enabled slots. Processes are NOT spawned here —
     #    lazy spawning (3649a61a) defers each proxy until its first incoming
     #    request, then auto-kills after _IDLE_KILL_SECONDS of idle time.
@@ -1917,6 +2036,10 @@ async def run_tunnel(
     serena_pool: SerenaDaemonPool | None = None  # 64650cb4 — default-Serena extract
     office_proxies: dict[str, SlotProxy] = {}
     office_ports = {"ppt": ppt_port, "word": word_port, "dc": dc_port}
+    # 4ea1b9d5 — slots whose session_mode is "persistent" (e.g. Desktop
+    # Commander): they keep a stateful inner process, so they skip the
+    # idle-killer that would otherwise tear the session down after 30min.
+    persistent_slots: set[str] = set()
 
     if fs_plugin.get("enabled", True):
         fs_override = fs_plugin.get("command")
@@ -2011,11 +2134,17 @@ async def run_tunnel(
         spawn_env = None
         if plugin_env:
             spawn_env = {**os.environ, **{str(k): str(v) for k, v in plugin_env.items()}}
-        cmd_office = _build_proxy_for_inner(npx, list(cmd), oport)
-        print(f"  {human.lower():<16}lazy-spawn on port {oport}", flush=True)
+        # 4ea1b9d5 — persistent slots omit --stateless so their inner process
+        # keeps state across requests (DC terminal sessions).
+        _persistent = plugin.get("session_mode") == "persistent"
+        cmd_office = _build_proxy_for_inner(npx, list(cmd), oport, stateless=not _persistent)
+        mode_note = " (persistent)" if _persistent else ""
+        print(f"  {human.lower():<16}lazy-spawn on port {oport}{mode_note}", flush=True)
         op = SlotProxy(cmd_office, oport, slot, env=spawn_env)
         office_proxies[slot] = op
         slot_proxies.append(op)
+        if _persistent:
+            persistent_slots.add(slot)
 
     # 4c. Custom plugins (LOCAL-ONLY) — still eagerly spawned because they serve
     #     the local .mcp.json directly without a server relay route.
@@ -2142,7 +2271,10 @@ async def run_tunnel(
         tasks.append(asyncio.ensure_future(
             _reconnect_loop_lazy(ws_office, oproxy, slot, tool_prefix=slot_prefixes.get(slot))
         ))
-        tasks.append(asyncio.ensure_future(_idle_killer(oproxy)))
+        # 4ea1b9d5 — persistent slots keep their inner process alive; don't
+        # attach the idle-killer that would reset their session after 30min.
+        if slot not in persistent_slots:
+            tasks.append(asyncio.ensure_future(_idle_killer(oproxy)))
     # Custom plugins (eager) still use the regular reconnect + watchdog.
     for holder in proc_holders:
         tasks.append(asyncio.ensure_future(_proc_watchdog(holder)))
