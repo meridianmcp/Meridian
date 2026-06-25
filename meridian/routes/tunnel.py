@@ -56,6 +56,40 @@ _pending_ppt_reqs: dict[str, asyncio.Future[dict]] = {}
 _pending_word_reqs: dict[str, asyncio.Future[dict]] = {}
 _pending_dc_reqs: dict[str, asyncio.Future[dict]] = {}
 
+# d71ba2e7 — per-tenant core-slot health: tenant_id → {slot_label: healthy}.
+# Absent ⇒ assumed healthy. The client sends a
+# ``{"type":"plugin_status","slot":...,"healthy":false}`` message over a slot's
+# WebSocket when its proxy spawns but doesn't actually serve (pre-flight
+# tools/list fails, d71ba2e7) or when the watchdog exhausts retries (a3410a9c).
+# ``list_tunnel_tools`` then suppresses that slot's tools instead of advertising
+# tools that 503 on first call.
+_slot_health: dict[str, dict[str, bool]] = {}
+
+
+def _record_slot_health(tenant_id: str, slot: str, healthy: bool) -> None:
+    """Record a core slot's health for a tenant (from a plugin_status message)."""
+    if not slot:
+        return
+    _slot_health.setdefault(tenant_id, {})[slot] = bool(healthy)
+
+
+def _slot_is_healthy(tenant_id: str, slot: str) -> bool:
+    """True unless a plugin_status message marked this slot unhealthy."""
+    return _slot_health.get(tenant_id, {}).get(slot, True)
+
+
+def _clear_slot_health(tenant_id: str, slot: "str | None" = None) -> None:
+    """Drop a slot's health (or all of a tenant's) — called on WS disconnect so a
+    fresh reconnect starts from the assumed-healthy default."""
+    if slot is None:
+        _slot_health.pop(tenant_id, None)
+        return
+    slots = _slot_health.get(tenant_id)
+    if slots is not None:
+        slots.pop(slot, None)
+        if not slots:
+            _slot_health.pop(tenant_id, None)
+
 
 def _is_tunnel_allowed(tenant: dict) -> bool:
     """Return True for Pro, admin, and internal tenants."""
@@ -143,6 +177,11 @@ async def tunnel_ws(ws: WebSocket, tenant_id: str) -> None:
             if msg_type == "ping":
                 continue
 
+            if msg_type == "plugin_status":
+                # d71ba2e7 — client reports this slot's live health.
+                _record_slot_health(tenant_id, msg.get("slot") or "fs", msg.get("healthy", True))
+                continue
+
             if msg_type == "response":
                 req_id = msg.get("id")
                 fut = _pending_reqs.get(req_id)
@@ -155,6 +194,7 @@ async def tunnel_ws(ws: WebSocket, tenant_id: str) -> None:
         _log.debug("tunnel: tenant %s disconnected: %s", tenant_id[:8], exc)
     finally:
         _tunnel_sockets.pop(tenant_id, None)
+        _clear_slot_health(tenant_id, "fs")
         # Cancel any in-flight proxy requests for this tenant
         for fut in list(_pending_reqs.values()):
             if not fut.done():
@@ -223,6 +263,9 @@ async def tunnel_code_ws(ws: WebSocket, tenant_id: str) -> None:
             msg_type = msg.get("type")
             if msg_type == "ping":
                 continue
+            if msg_type == "plugin_status":
+                _record_slot_health(tenant_id, msg.get("slot") or "code", msg.get("healthy", True))
+                continue
             if msg_type == "response":
                 req_id = msg.get("id")
                 fut = _pending_code_reqs.get(req_id)
@@ -235,6 +278,7 @@ async def tunnel_code_ws(ws: WebSocket, tenant_id: str) -> None:
         _log.debug("tunnel-code: tenant %s disconnected: %s", tenant_id[:8], exc)
     finally:
         _tunnel_code_sockets.pop(tenant_id, None)
+        _clear_slot_health(tenant_id, "code")
         for fut in list(_pending_code_reqs.values()):
             if not fut.done():
                 fut.cancel()
@@ -297,6 +341,9 @@ async def tunnel_extract_ws(ws: WebSocket, tenant_id: str) -> None:
             msg_type = msg.get("type")
             if msg_type == "ping":
                 continue
+            if msg_type == "plugin_status":
+                _record_slot_health(tenant_id, msg.get("slot") or "extract", msg.get("healthy", True))
+                continue
             if msg_type == "response":
                 req_id = msg.get("id")
                 fut = _pending_extract_reqs.get(req_id)
@@ -309,6 +356,7 @@ async def tunnel_extract_ws(ws: WebSocket, tenant_id: str) -> None:
         _log.debug("tunnel-extract: tenant %s disconnected: %s", tenant_id[:8], exc)
     finally:
         _tunnel_extract_sockets.pop(tenant_id, None)
+        _clear_slot_health(tenant_id, "extract")
         for fut in list(_pending_extract_reqs.values()):
             if not fut.done():
                 fut.cancel()
@@ -891,6 +939,10 @@ async def tunnel_status(tenant_id: str) -> dict:
         "ppt_active": tenant_id in _tunnel_ppt_sockets,
         "word_active": tenant_id in _tunnel_word_sockets,
         "dc_active": tenant_id in _tunnel_dc_sockets,
+        # d71ba2e7 — slots the client reported unhealthy (pre-flight tools/list
+        # failed / watchdog gave up). Absent slot ⇒ assumed healthy. Dashboard
+        # renders these as a degraded status dot.
+        "slot_health": dict(_slot_health.get(tenant_id, {})),
     }
 
 
@@ -1453,8 +1505,11 @@ async def list_tunnel_tools(
     """
     aggregated: list[dict] = []
     routes: dict[str, str] = {}
+    # d71ba2e7 — skip slots a plugin_status message marked unhealthy so we never
+    # advertise tools that would 503 on first call.
+    healthy_labels = [l for l in _TUNNEL_LABELS if _slot_is_healthy(tenant_id, l)]
     slot_results = await asyncio.gather(
-        *[_fetch_slot_tools(tenant_id, label) for label in _TUNNEL_LABELS]
+        *[_fetch_slot_tools(tenant_id, label) for label in healthy_labels]
     )
     for label, tools in slot_results:
         for tool in tools:
