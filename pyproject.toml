@@ -36,6 +36,11 @@ dependencies = [
     "tree-sitter-c-sharp>=0.21",
 ]
 
+[project.scripts]
+# Console entry so `uv tool install meridian-server` / `pipx install` provide a
+# `meridian` command (CLI dispatcher: `meridian --tunnel`, `meridian --mcp`, …).
+meridian = "meridian.__main__:main"
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
