@@ -31,6 +31,9 @@ import sys
 import time
 from pathlib import Path
 
+from . import serena_pool as _serena_pool
+from .serena_pool import SerenaDaemonPool, SERENA_POOL_BASE_PORT
+
 DEFAULT_BASE_URL = "https://usemeridian.us"
 DEFAULT_PROXY_PORT = 8808
 DEFAULT_CODE_PROXY_PORT = 8809
@@ -253,6 +256,107 @@ async def _reconnect_loop_lazy(
             )
         await asyncio.sleep(backoff)
         backoff = min(backoff * 2, _MAX_BACKOFF)
+
+
+async def _run_extract_pool_connection(
+    ws_url: str,
+    pool: "SerenaDaemonPool",
+    default_repo_path: str,
+    label: str = "extract",
+) -> None:
+    """Hold one WebSocket open for the code-extractor slot, routed via the pool.
+
+    64650cb4 — unlike :func:`_run_connection_lazy` (one fixed proxy port) each
+    incoming request is routed to the Serena daemon for the caller's repo_path:
+    the ``X-Meridian-Repo-Path`` header picks the repo (falling back to the
+    tunnel's ``default_repo_path``) and the matching daemon is spawned on demand.
+    Spawn/route failures come back as HTTP 503 so the server doesn't time out.
+    """
+    import httpx
+    import websockets
+
+    async with websockets.connect(ws_url, max_size=None, ping_interval=20) as ws:
+        print(f"tunnel:{label}: connected (Serena daemon pool)", flush=True)
+        async with httpx.AsyncClient() as http_client:
+            async for raw in ws:
+                try:
+                    msg = json.loads(raw)
+                except (ValueError, TypeError):
+                    continue
+                if not isinstance(msg, dict):
+                    continue
+                if msg.get("type") == "ping":
+                    continue
+                if msg.get("type") != "request":
+                    continue
+                req_id = msg.get("id")
+                repo_path = _serena_pool.resolve_repo_path(
+                    msg.get("headers") or {}, default_repo_path
+                )
+                daemon = None
+                try:
+                    daemon = pool.get_or_spawn(repo_path)
+                except Exception as exc:  # noqa: BLE001 — spawn failure → 503
+                    print(
+                        f"tunnel:{label}: failed to start Serena for {repo_path}: {exc}",
+                        file=sys.stderr, flush=True,
+                    )
+                if daemon is None or not daemon.is_alive:
+                    err = json.dumps(
+                        {"error": f"Serena daemon for {repo_path} not available"}
+                    ).encode()
+                    await ws.send(json.dumps({
+                        "type": "response",
+                        "id": req_id,
+                        "status": 503,
+                        "headers": {"content-type": "application/json"},
+                        "body": base64.b64encode(err).decode(),
+                    }))
+                    continue
+                resp = await _relay_request(
+                    http_client, f"http://127.0.0.1:{daemon.port}", msg
+                )
+                await ws.send(json.dumps(resp))
+
+
+async def _reconnect_loop_extract_pool(
+    ws_url: str,
+    pool: "SerenaDaemonPool",
+    default_repo_path: str,
+    label: str = "extract",
+) -> None:
+    """Keep the pooled code-extractor tunnel alive, reconnecting with backoff."""
+    backoff = 1.0
+    while True:
+        try:
+            await _run_extract_pool_connection(ws_url, pool, default_repo_path, label)
+            backoff = 1.0
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            print(
+                f"tunnel:{label}: disconnected ({exc}); reconnecting in {backoff:.0f}s",
+                file=sys.stderr,
+                flush=True,
+            )
+        await asyncio.sleep(backoff)
+        backoff = min(backoff * 2, _MAX_BACKOFF)
+
+
+async def _pool_idle_reaper(
+    pool: "SerenaDaemonPool", idle_seconds: float = _IDLE_KILL_SECONDS
+) -> None:
+    """Periodically reap Serena daemons idle past the TTL (mirrors _idle_killer)."""
+    poll_interval = max(60.0, idle_seconds / 6)
+    while True:
+        await asyncio.sleep(poll_interval)
+        reaped = pool.reap_idle()
+        for repo_path in reaped:
+            print(
+                f"tunnel:extract: Serena for {repo_path} idle >"
+                f"{idle_seconds / 60:.0f}min — killed (restarts on next request)",
+                flush=True,
+            )
 
 
 def _spawn_kwargs() -> dict:
@@ -1380,6 +1484,7 @@ async def run_tunnel(
     proxy_fs: SlotProxy | None = None
     proxy_code: SlotProxy | None = None
     proxy_extract: SlotProxy | None = None
+    serena_pool: SerenaDaemonPool | None = None  # 64650cb4 — default-Serena extract
     office_proxies: dict[str, SlotProxy] = {}
     office_ports = {"ppt": ppt_port, "word": word_port, "dc": dc_port}
 
@@ -1429,11 +1534,22 @@ async def run_tunnel(
         print("  code-extractor:    disabled (tunnel_plugins config)", flush=True)
     else:
         ext_raw = extract_plugin.get("command")
-        ext_override = expand_command(ext_raw, repo_path=repo_path)
-        if ext_override:
+        if ext_raw == SERENA_EXTRACT_COMMAND:
+            # 64650cb4 — default Serena: a per-repo_path daemon pool instead of a
+            # single fixed --project instance, so executor sessions touching other
+            # repos no longer hit Serena's "outside configured workspaces" error.
+            serena_pool = SerenaDaemonPool(
+                default_repo_path=repo_path,
+                spawn=lambda cmd: subprocess.Popen(cmd, **_spawn_kwargs()),
+            )
+            print(
+                f"  code-extractor:    Serena daemon pool (lazy, per repo_path) "
+                f"from port {SERENA_POOL_BASE_PORT}",
+                flush=True,
+            )
+        elif (ext_override := expand_command(ext_raw, repo_path=repo_path)):
             cmd_extract = _build_proxy_for_inner(npx, list(ext_override), extract_port)
-            _ext_label = "" if ext_raw == SERENA_EXTRACT_COMMAND else " (custom command)"
-            print(f"  code-extractor:    lazy-spawn on port {extract_port}{_ext_label}", flush=True)
+            print(f"  code-extractor:    lazy-spawn on port {extract_port} (custom command)", flush=True)
             proxy_extract = SlotProxy(cmd_extract, extract_port, "extract")
             slot_proxies.append(proxy_extract)
         else:
@@ -1501,7 +1617,7 @@ async def run_tunnel(
         print(f"    Filesystem:      {_permanent_url(base_url, tenant_id)}", flush=True)
     if proxy_code is not None:
         print(f"    Code Intel:      {_permanent_code_url(base_url, tenant_id)}", flush=True)
-    if proxy_extract is not None:
+    if proxy_extract is not None or serena_pool is not None:
         print(f"    Code Extractor:  {_permanent_extract_url(base_url, tenant_id)}", flush=True)
     if "ppt" in office_proxies:
         print(f"    PowerPoint:      {_permanent_office_url(base_url, tenant_id, 'ppt')}", flush=True)
@@ -1564,6 +1680,13 @@ async def run_tunnel(
     if proxy_extract is not None:
         tasks.append(asyncio.ensure_future(_reconnect_loop_lazy(ws_extract, proxy_extract, "extract")))
         tasks.append(asyncio.ensure_future(_idle_killer(proxy_extract)))
+    elif serena_pool is not None:
+        # 64650cb4 — pooled Serena: per-repo routing + idle reaper instead of a
+        # single SlotProxy + idle-killer.
+        tasks.append(asyncio.ensure_future(
+            _reconnect_loop_extract_pool(ws_extract, serena_pool, repo_path, "extract")
+        ))
+        tasks.append(asyncio.ensure_future(_pool_idle_reaper(serena_pool)))
     for slot, oproxy in office_proxies.items():
         ws_office = _ws_office_url(base_url, tenant_id, token, slot)
         tasks.append(asyncio.ensure_future(
@@ -1616,6 +1739,9 @@ async def run_tunnel(
         # Kill all lazy slot proxies (only those actually running at shutdown).
         for sp in slot_proxies:
             sp.kill()
+        # 64650cb4 — tear down every pooled Serena daemon.
+        if serena_pool is not None:
+            serena_pool.shutdown()
         # Kill custom (eager) plugin processes.
         for holder in proc_holders:
             _terminate_proc_tree(holder.get("proc"))

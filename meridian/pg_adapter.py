@@ -611,6 +611,19 @@ CREATE TABLE IF NOT EXISTS file_locks (
 CREATE INDEX IF NOT EXISTS idx_file_locks_session ON file_locks(session_id);
 CREATE INDEX IF NOT EXISTS idx_file_locks_expires ON file_locks(expires_at);
 
+-- 501ec93f — resource_locks: generalized typed-resource lock (see db.py).
+CREATE TABLE IF NOT EXISTS resource_locks (
+    id TEXT PRIMARY KEY,
+    resource_id TEXT NOT NULL UNIQUE,
+    resource_type TEXT NOT NULL,
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    claimed_at TEXT NOT NULL DEFAULT ({_TS}),
+    expires_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_resource_locks_session ON resource_locks(session_id);
+CREATE INDEX IF NOT EXISTS idx_resource_locks_expires ON resource_locks(expires_at);
+CREATE INDEX IF NOT EXISTS idx_resource_locks_type ON resource_locks(resource_type);
+
 -- worktree isolation: live git worktrees registered per session.
 CREATE TABLE IF NOT EXISTS active_worktrees (
     id TEXT PRIMARY KEY,
@@ -1941,6 +1954,49 @@ async def _migrate_pg_session_graph_snapshots(conn: PostgresConnection) -> None:
     )
 
 
+async def _migrate_pg_touches_resources(conn: PostgresConnection) -> None:
+    """501ec93f — sprint_items.touches_resources: typed resource identifiers.
+
+    JSON list generalizing touches_files. Nullable; ADD COLUMN IF NOT EXISTS so
+    re-running is a no-op. Mirrors db._migrate_touches_resources.
+    """
+    await conn.executescript(
+        "ALTER TABLE sprint_items ADD COLUMN IF NOT EXISTS touches_resources TEXT"
+    )
+
+
+async def _migrate_pg_sprint_item_stall_count(conn: PostgresConnection) -> None:
+    """bc9259b8 — sprint_items.stall_count: worker stall auto-retry counter.
+
+    ADD COLUMN IF NOT EXISTS so re-running is a no-op. Mirrors
+    db._migrate_sprint_item_stall_count.
+    """
+    await conn.executescript(
+        "ALTER TABLE sprint_items ADD COLUMN IF NOT EXISTS stall_count INTEGER NOT NULL DEFAULT 0"
+    )
+
+
+async def _migrate_pg_resource_locks(conn: PostgresConnection) -> None:
+    """501ec93f — resource_locks: generalized typed-resource lock on existing PG DBs.
+
+    CREATE TABLE IF NOT EXISTS so re-running is a no-op. Mirrors
+    db._migrate_resource_locks.
+    """
+    await conn.executescript(
+        "CREATE TABLE IF NOT EXISTS resource_locks ("
+        "    id TEXT PRIMARY KEY,"
+        "    resource_id TEXT NOT NULL UNIQUE,"
+        "    resource_type TEXT NOT NULL,"
+        "    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,"
+        f"    claimed_at TEXT NOT NULL DEFAULT ({_TS}),"
+        "    expires_at TEXT NOT NULL"
+        ");"
+        "CREATE INDEX IF NOT EXISTS idx_resource_locks_session ON resource_locks(session_id);"
+        "CREATE INDEX IF NOT EXISTS idx_resource_locks_expires ON resource_locks(expires_at);"
+        "CREATE INDEX IF NOT EXISTS idx_resource_locks_type ON resource_locks(resource_type)"
+    )
+
+
 # Late migrations — run on every DB after the hosted-only set.
 _PG_MIGRATIONS_LATE = (
     _migrate_pg_workspace_tenant_isolation,
@@ -1951,6 +2007,9 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_api_token_expires_at,
     _migrate_pg_oauth_codes,
     _migrate_pg_github_to_projects,
+    _migrate_pg_touches_resources,
+    _migrate_pg_resource_locks,
+    _migrate_pg_sprint_item_stall_count,
     _migrate_pg_queued_session,
     _migrate_pg_parallel_safety,
     _migrate_pg_changelog_entries,

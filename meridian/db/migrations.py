@@ -12,7 +12,7 @@ from typing import Any
 
 import aiosqlite
 
-__all__ = ['_migrate_task_log_backlog_future', '_migrate_task_log_backburner', '_migrate_task_log_hitl', '_column_exists', '_migrate_add_column_if_missing', '_migrate_human_identity', '_migrate_v24_task_tree_and_framework', '_migrate_v25_feedback_and_notifications', '_migrate_v33_hitl_kind_payload', '_migrate_v34_hitl_auto_answer', '_migrate_v34_workspace_settings', '_migrate_dunning_fields', '_migrate_overage_fields', '_migrate_v26_client_type', '_migrate_ntfy_notifications', '_migrate_notify_email', '_migrate_github_integration', '_migrate_sprint_item_dependencies', '_migrate_v09_notes_and_magic_links', '_migrate_v24_pinned_decisions_and_hitl', '_migrate_goal_field_timestamps', '_migrate_task_claims', '_migrate_task_sprint_link', '_migrate_session_type', '_migrate_session_summary', '_migrate_parent_session_id', '_migrate_decisions', '_migrate_goal_mode', '_migrate_worker_pid', '_migrate_rewind_token', '_migrate_project_settings', '_migrate_neon_pool_projects_free_tier', '_migrate_tenants_free_plan', '_migrate_decisions_free_category', '_migrate_sessions_archived', '_migrate_goal_hierarchy', '_migrate_sprint_items_v2', '_migrate_drop_chat_tables', '_migrate_hosted_tables', '_migrate_session_notes', '_migrate_milestone_type', '_migrate_executor_runs', '_migrate_file_locks', '_migrate_file_symbol_claims', '_migrate_blog_posts', '_migrate_workspace_layer', '_migrate_checkpoint_data', 'init_hosted_tables', '_migrate_sprint_item_tree', '_migrate_api_token_type', '_migrate_api_tokens_expires_at', '_migrate_github_to_projects', '_migrate_touches_files', '_migrate_oauth_codes_table', '_migrate_device_codes_table', '_migrate_sprint_items_indeterminate', '_migrate_sprint_items_provisional_complete', '_migrate_workspace_members_rbac', '_migrate_project_icon', '_internal_emails', '_migrate_tenants_is_internal', '_migrate_admin_plan', '_migrate_active_worktrees', '_migrate_workspace_tenant_isolation', '_migrate_workspace_sprint_board', '_migrate_registered_hostnames', '_migrate_queued_session', '_migrate_parallel_safety', '_migrate_changelog_entries', '_migrate_agent_instructions', '_migrate_note_kind', '_migrate_tunnel_active', '_backfill_agent_instructions', '_migrate_code_intel', '_migrate_tunnel_plugins', '_migrate_notes_priority', '_migrate_task_log_kind', '_migrate_note_slug', '_slugify_note', '_migrate_oauth_refresh_tokens', '_migrate_decision_priority_edit_log', '_migrate_code_anchored_notes', '_migrate_note_source', '_migrate_session_sprint_version', '_migrate_project_execution_mode', '_migrate_decision_code_anchor', '_migrate_session_graph_snapshots', '_migrate_agent_tasks_table']
+__all__ = ['_migrate_task_log_backlog_future', '_migrate_task_log_backburner', '_migrate_task_log_hitl', '_column_exists', '_migrate_add_column_if_missing', '_migrate_human_identity', '_migrate_v24_task_tree_and_framework', '_migrate_v25_feedback_and_notifications', '_migrate_v33_hitl_kind_payload', '_migrate_v34_hitl_auto_answer', '_migrate_v34_workspace_settings', '_migrate_dunning_fields', '_migrate_overage_fields', '_migrate_v26_client_type', '_migrate_ntfy_notifications', '_migrate_notify_email', '_migrate_github_integration', '_migrate_sprint_item_dependencies', '_migrate_v09_notes_and_magic_links', '_migrate_v24_pinned_decisions_and_hitl', '_migrate_goal_field_timestamps', '_migrate_task_claims', '_migrate_task_sprint_link', '_migrate_session_type', '_migrate_session_summary', '_migrate_parent_session_id', '_migrate_decisions', '_migrate_goal_mode', '_migrate_worker_pid', '_migrate_rewind_token', '_migrate_project_settings', '_migrate_neon_pool_projects_free_tier', '_migrate_tenants_free_plan', '_migrate_decisions_free_category', '_migrate_sessions_archived', '_migrate_goal_hierarchy', '_migrate_sprint_items_v2', '_migrate_drop_chat_tables', '_migrate_hosted_tables', '_migrate_session_notes', '_migrate_milestone_type', '_migrate_executor_runs', '_migrate_file_locks', '_migrate_file_symbol_claims', '_migrate_blog_posts', '_migrate_workspace_layer', '_migrate_checkpoint_data', 'init_hosted_tables', '_migrate_sprint_item_tree', '_migrate_api_token_type', '_migrate_api_tokens_expires_at', '_migrate_github_to_projects', '_migrate_touches_files', '_migrate_touches_resources', '_migrate_resource_locks', '_migrate_sprint_item_stall_count', '_migrate_oauth_codes_table', '_migrate_device_codes_table', '_migrate_sprint_items_indeterminate', '_migrate_sprint_items_provisional_complete', '_migrate_workspace_members_rbac', '_migrate_project_icon', '_internal_emails', '_migrate_tenants_is_internal', '_migrate_admin_plan', '_migrate_active_worktrees', '_migrate_workspace_tenant_isolation', '_migrate_workspace_sprint_board', '_migrate_registered_hostnames', '_migrate_queued_session', '_migrate_parallel_safety', '_migrate_changelog_entries', '_migrate_agent_instructions', '_migrate_note_kind', '_migrate_tunnel_active', '_backfill_agent_instructions', '_migrate_code_intel', '_migrate_tunnel_plugins', '_migrate_notes_priority', '_migrate_task_log_kind', '_migrate_note_slug', '_slugify_note', '_migrate_oauth_refresh_tokens', '_migrate_decision_priority_edit_log', '_migrate_code_anchored_notes', '_migrate_note_source', '_migrate_session_sprint_version', '_migrate_project_execution_mode', '_migrate_decision_code_anchor', '_migrate_session_graph_snapshots', '_migrate_agent_tasks_table']
 
 async def _migrate_task_log_backlog_future(db: aiosqlite.Connection) -> None:
     """Rebuild ``task_log`` to add 'backlog' and 'future' statuses (v1.9.x).
@@ -1125,6 +1125,63 @@ async def _migrate_github_to_projects(db: aiosqlite.Connection) -> None:
 async def _migrate_touches_files(db: aiosqlite.Connection) -> None:
     """Add touches_files TEXT column to sprint_items for file conflict tracking."""
     await _migrate_add_column_if_missing(db, "sprint_items", "touches_files", "TEXT")
+
+
+async def _migrate_touches_resources(db: aiosqlite.Connection) -> None:
+    """501ec93f — sprint_items.touches_resources: typed resource identifiers.
+
+    Generalizes touches_files (file:path only) to any conflict-bearing resource —
+    file:path, db:migrations, mcp_tool:name, route:METHOD:/path, pypi:publish,
+    github:tag. Stored as a JSON list of strings; NULL means "no declared
+    resources". Consumed by get_parallelizable_groups for pre-fanout conflict
+    detection and backed at runtime by the resource_locks table.
+    """
+    await _migrate_add_column_if_missing(db, "sprint_items", "touches_resources", "TEXT")
+
+
+async def _migrate_sprint_item_stall_count(db: aiosqlite.Connection) -> None:
+    """bc9259b8 — sprint_items.stall_count: worker stall auto-retry counter.
+
+    Incremented each time a worker session closes (or goes stale) with the item
+    still in_progress instead of completing it. The item is re-queued to pending
+    while stall_count is within the retry budget, then marked failed silently.
+    Nullable INTEGER defaulting to 0 so existing rows read as "never stalled".
+    """
+    await _migrate_add_column_if_missing(
+        db, "sprint_items", "stall_count", "INTEGER NOT NULL DEFAULT 0"
+    )
+
+
+async def _migrate_resource_locks(db: aiosqlite.Connection) -> None:
+    """501ec93f — resource_locks: generalize file_locks to any typed resource.
+
+    Same TTL + UNIQUE primitive as file_locks (one holder per resource at a time,
+    auto-expiring by explicit TTL or owning-session heartbeat) but keyed by a
+    typed resource_id ('file:path', 'db:migrations', 'mcp_tool:name',
+    'route:POST:/x', 'pypi:publish', 'github:tag') so non-file conflicts can be
+    serialized the same way file edits already are. CREATE_TABLES covers fresh
+    DBs; this is the upgrade path for existing ones.
+    """
+    await db.execute(
+        """CREATE TABLE IF NOT EXISTS resource_locks (
+            id TEXT PRIMARY KEY,
+            resource_id TEXT NOT NULL UNIQUE,
+            resource_type TEXT NOT NULL,
+            session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+            claimed_at TEXT NOT NULL DEFAULT (datetime('now')),
+            expires_at TEXT NOT NULL
+        )"""
+    )
+    await db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_resource_locks_session ON resource_locks(session_id)"
+    )
+    await db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_resource_locks_expires ON resource_locks(expires_at)"
+    )
+    await db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_resource_locks_type ON resource_locks(resource_type)"
+    )
+    await db.commit()
 
 
 async def _migrate_note_kind(db: aiosqlite.Connection) -> None:

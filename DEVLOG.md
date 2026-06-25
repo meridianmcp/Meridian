@@ -25,4 +25,8 @@
 - 2026-06-24 **test-ckpt-session** — Fixed the bug
 - 2026-06-24 **exec-1** — did A (+1 more)
 - 2026-06-24 **session-with-tasks** — task one (+1 more)
+- 2026-06-25 **test-ckpt-session** — Fixed the bug
+- 2026-06-25 **session-with-tasks** — task one (+1 more)
+- 2026-06-25 **exec-1** — did B (+1 more)
+- 2026-06-25 **exec-1** — did A (+1 more)
 <!-- MERIDIAN:ANCHOR:END:devlog -->

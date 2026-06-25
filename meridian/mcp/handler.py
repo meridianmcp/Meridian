@@ -2055,15 +2055,20 @@ async def _handle_sprint_tools(
                         pass
         except Exception:
             pass
-        _new_item = await db_module.add_sprint_item(
-            db, args["project_id"], args["version"], args["title"],
-            group=args.get("group"),
-            human_id=args.get("human_id"),
-            depends_on=args.get("depends_on"),
-            failure_mode=args.get("failure_mode"),
-            milestone_type=args.get("milestone_type", "task"),
-            force=bool(args.get("force", False)),
-        )
+        try:
+            _new_item = await db_module.add_sprint_item(
+                db, args["project_id"], args["version"], args["title"],
+                group=args.get("group"),
+                human_id=args.get("human_id"),
+                depends_on=args.get("depends_on"),
+                failure_mode=args.get("failure_mode"),
+                milestone_type=args.get("milestone_type", "task"),
+                touches_resources=args.get("touches_resources"),
+                force=bool(args.get("force", False)),
+            )
+        except ValueError as exc:
+            # 501ec93f — malformed touches_resources identifier; surface, don't crash.
+            return {"error": str(exc)}
         # b0d42ef6 — duplicate guard blocked the insert: surface the error as-is
         # (no item was created, so the warnings below don't apply).
         if isinstance(_new_item, dict) and _new_item.get("error") == "duplicate":
@@ -2091,14 +2096,23 @@ async def _handle_sprint_tools(
     if name == "update_sprint_item":
         validate_input_size(args.get("title"), "sprint item title", 500)
         validate_input_size(args.get("notes"), "sprint item notes", 50_000)
-        item = await db_module.patch_sprint_item(
-            db, args["project_id"], args["item_id"],
+        _patch_kwargs: dict[str, Any] = dict(
             title=args.get("title"),
             version=args.get("version"),
             notes=args.get("notes"),
             human_id=args.get("human_id"),
             item_group=args.get("group"),
         )
+        # 501ec93f — only forward touches_resources when the caller supplied it,
+        # so omitting the key leaves the stored value untouched (_UNSET sentinel).
+        if "touches_resources" in args:
+            _patch_kwargs["touches_resources"] = args.get("touches_resources")
+        try:
+            item = await db_module.patch_sprint_item(
+                db, args["project_id"], args["item_id"], **_patch_kwargs
+            )
+        except ValueError as exc:
+            return {"error": str(exc)}
         return item or {"error": "sprint item not found"}
     if name == "set_sprint":
         # 62d321dd — guard: warn if pending items were never started before rolling sprint
@@ -2186,6 +2200,11 @@ async def _handle_sprint_tools(
                 except Exception:  # noqa: BLE001
                     pass
         return _items
+    if name == "get_parallelizable_groups":
+        # 255096d9 — cluster pending items safe to fan out simultaneously.
+        return await db_module.get_parallelizable_groups(
+            db, args["project_id"], version=args.get("version")
+        )
     if name == "claim_sprint_item":
         # ITEM 3 — protect installer scripts: refuse to claim a sprint item whose
         # touches_files includes hooks.ps1 / hooks.sh unless force=true is passed.

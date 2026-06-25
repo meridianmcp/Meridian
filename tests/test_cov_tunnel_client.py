@@ -791,9 +791,21 @@ def _stub_run_tunnel_spawn(monkeypatch, *, code_binary="/bin/codebase-memory-mcp
     async def fake_watchdog(holder, poll_interval=3.0):
         return None
 
+    # 64650cb4 — the default-Serena extract slot is now a SerenaDaemonPool, not a
+    # SlotProxy. Its reconnect loop spawns the default-repo daemon (one Popen via
+    # the pool, matching the per-slot proc accounting); the idle reaper is a no-op.
+    async def fake_reconnect_extract_pool(ws_url, pool, repo_path, label="extract"):
+        pool.get_or_spawn(repo_path)
+        return None
+
+    async def fake_pool_reaper(pool, idle_seconds=tc._IDLE_KILL_SECONDS):
+        return None
+
     monkeypatch.setattr(tc, "_reconnect_loop_lazy", fake_reconnect_lazy)
     monkeypatch.setattr(tc, "_idle_killer", fake_idle_killer)
     monkeypatch.setattr(tc, "_proc_watchdog", fake_watchdog)
+    monkeypatch.setattr(tc, "_reconnect_loop_extract_pool", fake_reconnect_extract_pool)
+    monkeypatch.setattr(tc, "_pool_idle_reaper", fake_pool_reaper)
     return procs
 
 
@@ -918,9 +930,18 @@ def test_run_tunnel_fs_lazy_spawn_enoent_keeps_tunnel_up(monkeypatch, tmp_path):
     async def fake_watchdog(holder, poll_interval=3.0):
         return None
 
+    # 64650cb4 — pooled extract slot: no-op so the run_tunnel task gather returns.
+    async def fake_reconnect_extract_pool(ws_url, pool, repo_path, label="extract"):
+        return None
+
+    async def fake_pool_reaper(pool, idle_seconds=tc._IDLE_KILL_SECONDS):
+        return None
+
     monkeypatch.setattr(tc, "_reconnect_loop_lazy", fake_reconnect_lazy)
     monkeypatch.setattr(tc, "_idle_killer", fake_idle_killer)
     monkeypatch.setattr(tc, "_proc_watchdog", fake_watchdog)
+    monkeypatch.setattr(tc, "_reconnect_loop_extract_pool", fake_reconnect_extract_pool)
+    monkeypatch.setattr(tc, "_pool_idle_reaper", fake_pool_reaper)
 
     monkeypatch.setattr(
         tc, "_fetch_me",
@@ -1035,9 +1056,19 @@ def test_run_tunnel_code_and_extract_popen_raise_are_warned(monkeypatch, tmp_pat
     async def fake_watchdog(holder, poll_interval=3.0):
         return None
 
+    # 64650cb4 — pooled extract slot: no-op (spawn failures are handled per-request
+    # at 503, not at startup, so the default extract spawns nothing here).
+    async def fake_reconnect_extract_pool(ws_url, pool, repo_path, label="extract"):
+        return None
+
+    async def fake_pool_reaper(pool, idle_seconds=tc._IDLE_KILL_SECONDS):
+        return None
+
     monkeypatch.setattr(tc, "_reconnect_loop_lazy", fake_reconnect_lazy)
     monkeypatch.setattr(tc, "_idle_killer", fake_idle_killer)
     monkeypatch.setattr(tc, "_proc_watchdog", fake_watchdog)
+    monkeypatch.setattr(tc, "_reconnect_loop_extract_pool", fake_reconnect_extract_pool)
+    monkeypatch.setattr(tc, "_pool_idle_reaper", fake_pool_reaper)
 
     class FakeProc:
         def poll(self): return None  # alive
