@@ -2822,6 +2822,13 @@ async def workspace_invite(request: Request) -> dict[str, Any]:
         )
     if not github_access:
         github_access = default_github_access_for_role(role)
+    # d116642e — optional project-level invite. When omitted/blank the member
+    # is workspace-wide (current behavior). When set, the member is scoped to
+    # that single project (listing-only scoping; airtight per-request access
+    # enforcement deferred pending product decision, pin b11c7cf6).
+    raw_project_id = body.get("project_id")
+    project_id = raw_project_id.strip() if isinstance(raw_project_id, str) else None
+    project_id = project_id or None
     db = request.app.state.db
     limit = _WORKSPACE_MEMBER_LIMITS.get(tenant.get("plan", "standard"), 25)
     count = await db_module.count_workspace_members(db, tenant["id"])
@@ -2830,7 +2837,8 @@ async def workspace_invite(request: Request) -> dict[str, Any]:
     raw_token = _secrets.token_urlsafe(32)
     token_hash = hashlib.sha256(raw_token.encode()).hexdigest()
     invite = await db_module.create_workspace_invite(
-        db, tenant["id"], email, role, token_hash, github_access=github_access,
+        db, tenant["id"], email, role, token_hash,
+        github_access=github_access, project_id=project_id,
     )
     base = os.environ.get("MERIDIAN_SERVER_URL", "https://usemeridian.us").rstrip("/")
     invite_url = f"{base}/workspace/accept?token={raw_token}"
@@ -2838,7 +2846,10 @@ async def workspace_invite(request: Request) -> dict[str, Any]:
         await send_invite_email(email, invite_url, tenant["email"])
     except Exception:
         pass  # email failure doesn't block invite creation
-    return {"id": invite["id"], "email": email, "role": role, "pending": True}
+    return {
+        "id": invite["id"], "email": email, "role": role,
+        "project_id": project_id, "pending": True,
+    }
 
 
 @app.post("/workspace/invite/{member_id}/resend", status_code=200)

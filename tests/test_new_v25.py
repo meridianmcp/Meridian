@@ -1945,3 +1945,85 @@ def test_get_notes_http_query_param(client):
     hits = r.json()
     assert len(hits) == 1
     assert hits[0]["title"] == "Env setup"
+
+
+# ---------------------------------------------------------------------------
+# 13e2c1e6 — search_all full-text snippets across body fields
+# ---------------------------------------------------------------------------
+
+
+def test_search_snippet_centers_on_match():
+    """_search_snippet returns a window centered on the matching term."""
+    text = "alpha beta gamma delta DATABASE_URL epsilon zeta eta theta"
+    snip = db_module._search_snippet(text, "database_url", window=10)
+    assert "DATABASE_URL" in snip
+    # Window of 10 chars each side keeps the snippet far shorter than the body.
+    assert len(snip) < len(text)
+
+
+def test_search_snippet_adds_ellipses_when_clipped():
+    """_search_snippet adds leading/trailing ellipses when clipped."""
+    text = "x" * 200 + " psycopg3 " + "y" * 200
+    snip = db_module._search_snippet(text, "psycopg3", window=20)
+    assert snip.startswith("…")
+    assert snip.endswith("…")
+    assert "psycopg3" in snip
+
+
+def test_search_snippet_empty_when_no_body_or_no_match():
+    """_search_snippet returns '' for empty body or absent term."""
+    assert db_module._search_snippet(None, "x") == ""
+    assert db_module._search_snippet("", "x") == ""
+    assert db_module._search_snippet("hello world", "absent") == ""
+
+
+@pytest.mark.asyncio
+async def test_search_all_returns_body_snippet_for_notes(db):
+    """search_all attaches a body snippet for note body matches."""
+    p = await db_module.create_project(db, "sa-snippet-notes")
+    await db_module.add_project_note(
+        db, p["id"], "Ops runbook",
+        "The deploy step requires you to export DATABASE_URL before migrating.",
+    )
+    result = await db_module.search_all(db, p["id"], "DATABASE_URL")
+    assert len(result["notes"]) == 1
+    assert "DATABASE_URL" in result["notes"][0]["snippet"]
+
+
+@pytest.mark.asyncio
+async def test_search_all_snippet_for_task_decision_sprint(db):
+    """search_all snippets cover task descriptions, decision and sprint bodies."""
+    p = await db_module.create_project(db, "sa-snippet-all")
+    s = await db_module.register_session(db, p["id"], "s1")
+    await db_module.log_task(
+        db, s["id"], p["id"], "Investigate flaky uvicorn worker restart loop", "done"
+    )
+    await db_module.pin_decision(
+        db, p["id"], "Use SelectorEventLoop",
+        "ProactorEventLoop deadlocks on Windows watchfiles imports.",
+    )
+    item = await db_module.add_sprint_item(db, p["id"], "v1", "Harden event loop")
+    await db_module.patch_sprint_item(
+        db, p["id"], item["id"], notes="Pin SelectorEventLoop in __main__.py for win32."
+    )
+
+    tasks = await db_module.search_all(db, p["id"], "uvicorn")
+    assert "uvicorn" in tasks["tasks"][0]["snippet"].lower()
+
+    decs = await db_module.search_all(db, p["id"], "deadlocks")
+    assert "deadlocks" in decs["decisions"][0]["snippet"].lower()
+
+    sprints = await db_module.search_all(db, p["id"], "SelectorEventLoop")
+    sprint_snips = [i["snippet"] for i in sprints["sprint_items"]]
+    assert any("SelectorEventLoop" in s for s in sprint_snips)
+
+
+@pytest.mark.asyncio
+async def test_search_all_title_only_match_has_empty_snippet(db):
+    """A title-only sprint match yields an empty body snippet, not an error."""
+    p = await db_module.create_project(db, "sa-title-only")
+    await db_module.add_sprint_item(db, p["id"], "v1", "Implement rate limiting")
+    result = await db_module.search_all(db, p["id"], "rate limiting")
+    matches = [i for i in result["sprint_items"] if i["title"] == "Implement rate limiting"]
+    assert matches
+    assert matches[0]["snippet"] == ""

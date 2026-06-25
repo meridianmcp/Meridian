@@ -257,7 +257,11 @@ CREATE TABLE IF NOT EXISTS sprint_items (
     parent_id TEXT DEFAULT NULL REFERENCES sprint_items(id),
     split_from TEXT DEFAULT NULL,
     merged_into TEXT DEFAULT NULL,
-    merged_from TEXT DEFAULT NULL
+    merged_from TEXT DEFAULT NULL,
+    -- 4f02340e: mixed-ownership task chains. owner of a subtask: 'human' | 'ai'
+    -- | NULL (unassigned). Drives the alternating claim/handoff state machine
+    -- in _advance_task_chain. NULL on parents and on legacy single-owner items.
+    owner TEXT DEFAULT NULL
 );
 
 -- v2.4 — decisions_pinned: editable constitution alongside the append-only
@@ -421,6 +425,12 @@ CREATE TABLE IF NOT EXISTS workspace_members (
     email TEXT NOT NULL,
     role TEXT NOT NULL DEFAULT 'member',
     github_access TEXT NOT NULL DEFAULT 'read',
+    -- d116642e: project-level invites foundation.
+    -- NULL = workspace-wide member (sees all projects, current behavior);
+    -- set = project-scoped member (listing-only scoping, see get_workspaces_for_email).
+    -- Airtight per-request access enforcement is intentionally NOT implemented
+    -- here — it is gated on the open product decision in pin b11c7cf6.
+    project_id TEXT,
     token_hash TEXT,
     invited_at TEXT NOT NULL DEFAULT (datetime('now')),
     joined_at TEXT
@@ -467,6 +477,11 @@ CREATE TABLE IF NOT EXISTS session_notes (
     session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
     title TEXT NOT NULL,
     body TEXT NOT NULL,
+    -- 0d7de2a2: thinking_sync. note_kind classifies a sprint note. NULL/'note'
+    -- = a normal note; 'thinking' = a HOOKS_DEBUG_STATE scratchpad note
+    -- auto-persisted by the client-side thinking_sync hook. The dashboard
+    -- renders 'thinking' notes with a distinct icon.
+    note_kind TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -770,6 +785,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_tenants_is_internal(db)
     await _migrate_admin_plan(db)
     await _migrate_workspace_members_rbac(db)
+    await _migrate_workspace_members_project_scope(db)
     await _migrate_sprint_items_indeterminate(db)
     await _migrate_sprint_item_tree(db)
     await _migrate_sprint_items_provisional_complete(db)
@@ -807,6 +823,8 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_decision_code_anchor(db)
     await _migrate_session_graph_snapshots(db)
     await _migrate_agent_tasks_table(db)
+    await _migrate_sprint_item_owner(db)
+    await _migrate_session_note_kind(db)
     return db
 
 
@@ -2455,6 +2473,29 @@ async def search_tasks(
     return [_row_to_dict(r) for r in rows]  # type: ignore[misc]
 
 
+def _search_snippet(text: str | None, query: str, window: int = 60) -> str:
+    """Return a short context window of ``text`` centered on ``query``.
+
+    Used by :func:`search_all` to give the dashboard a preview of the matching
+    body text. Case-insensitive. Adds leading/trailing ellipses when the snippet
+    is clipped from a longer body. Returns an empty string when ``text`` is
+    falsy or the query term is not present (e.g. a title-only match).
+    """
+    if not text or not query:
+        return ""
+    idx = text.lower().find(query.lower())
+    if idx == -1:
+        return ""
+    start = max(0, idx - window)
+    end = min(len(text), idx + len(query) + window)
+    snippet = text[start:end].strip()
+    if start > 0:
+        snippet = "…" + snippet
+    if end < len(text):
+        snippet = snippet + "…"
+    return snippet
+
+
 async def search_all(
     db: Any,
     project_id: str,
@@ -2463,11 +2504,21 @@ async def search_all(
 ) -> dict[str, Any]:
     """Universal search across task_log, project_notes, sprint_items, and decisions_pinned.
 
+    Matches both header fields (title) and body text:
+      - task_log.description
+      - project_notes.title + project_notes.body
+      - decisions_pinned.title + decisions_pinned.body
+      - sprint_items.title + sprint_items.notes
+
     SQLite: LIKE %query% on all relevant text fields.
-    Postgres: ILIKE with optional pg_trgm similarity fallback.
+    Postgres: ILIKE on all relevant text fields (portable across both backends;
+    pg_trgm/tsvector are Postgres-only so we keep to ILIKE here for parity).
 
     Returns grouped results: {tasks, notes, decisions, sprint_items}.
-    Each item includes a `match_type` key for the source table.
+    Each item includes a ``match_type`` key for the source table and a
+    ``snippet`` key — a short window of the matching body text centered on the
+    query term (empty string when no body field matched, e.g. a title-only
+    match).
     """
     like_pat = f"%{query}%"
     is_pg = hasattr(db, "_pool")
@@ -2532,6 +2583,17 @@ async def search_all(
     notes = await _search(notes_sql, (project_id, like_pat, like_pat, limit))
     decisions = await _search(decisions_sql, (project_id, like_pat, like_pat, limit))
     sprint_items = await _search(sprint_sql, (project_id, like_pat, like_pat, limit))
+
+    # Attach a body-text snippet for each result so the dashboard search bar can
+    # surface matching context. The body field name differs per content type.
+    for t in tasks:
+        t["snippet"] = _search_snippet(t.get("description"), query)
+    for n in notes:
+        n["snippet"] = _search_snippet(n.get("body"), query)
+    for d in decisions:
+        d["snippet"] = _search_snippet(d.get("body"), query)
+    for s in sprint_items:
+        s["snippet"] = _search_snippet(s.get("notes"), query)
 
     return {
         "query": query,
@@ -3109,12 +3171,19 @@ async def complete_sprint_item(
     item_id: str,
     task_id: str | None = None,
 ) -> dict[str, Any] | None:
-    """Mark a sprint item ``done`` and optionally link the task that shipped it."""
+    """Mark a sprint item ``done`` and optionally link the task that shipped it.
+
+    4f02340e — when the completed item is part of a mixed-ownership subtask
+    chain, advance the chain: an AI→human transition auto-files a HITL handoff,
+    a human→AI transition un-blocks the next AI subtask (see
+    :func:`_advance_task_chain`).
+    """
     result = await _update_sprint_item_status(
         db, project_id, item_id, "done", task_id=task_id
     )
     if result is not None:
         await _maybe_rollup_parent(db, project_id, item_id)
+        await _advance_task_chain(db, project_id, item_id)
     return result
 
 
@@ -3301,12 +3370,28 @@ async def add_subtask(
     project_id: str,
     parent_id: str,
     title: str,
+    owner: str | None = None,
 ) -> dict[str, Any]:
     """Create a child sprint item under parent_id.
 
     Inherits version from parent. Rejects if parent doesn't exist or is
     done/failed/skipped.
+
+    4f02340e — mixed-ownership task chains. ``owner`` is 'human', 'ai', or None
+    (unassigned). When owner-tagged subtasks are added in sequence they form a
+    *chain*: each new owned subtask ``depends_on`` the previously added owned
+    sibling, so only the head of the chain is claimable and ownership alternates
+    as the chain advances (see :func:`_advance_task_chain`). When an AI subtask
+    completes and the next link is human-owned, a HITL handoff is auto-filed;
+    when a human completes theirs, the next AI subtask un-blocks (becomes
+    claimable). The parent stays in_progress until every subtask is terminal
+    (existing :func:`_maybe_rollup_parent` behavior — unchanged).
+
+    Unowned subtasks (owner=None) keep the legacy behavior: no chaining,
+    independently claimable.
     """
+    if owner not in (None, "human", "ai"):
+        raise ValueError("owner must be 'human', 'ai', or None")
     parent = await get_sprint_item(db, parent_id)
     if parent is None or parent.get("project_id") != project_id:
         raise ValueError(f"parent sprint item not found: {parent_id}")
@@ -3315,17 +3400,113 @@ async def add_subtask(
         raise ValueError(
             f"cannot add subtask to parent with status '{parent.get('status')}'"
         )
+    # Chain owned subtasks: a new owned subtask depends on the current tail of
+    # the chain — the owned sibling that no other owned sibling depends on yet.
+    # This is insertion-order-independent (added_at has only second resolution,
+    # so it can't be used to break ties deterministically) and portable across
+    # SQLite/Postgres. Unowned subtasks never chain.
+    depends_on: str | None = None
+    if owner is not None:
+        async with db.execute(
+            "SELECT id FROM sprint_items "
+            "WHERE parent_id = ? AND project_id = ? AND owner IS NOT NULL "
+            "AND id NOT IN ("
+            "  SELECT depends_on FROM sprint_items "
+            "  WHERE parent_id = ? AND project_id = ? AND depends_on IS NOT NULL"
+            ")",
+            (parent_id, project_id, parent_id, project_id),
+        ) as cur:
+            tails = await cur.fetchall()
+        # In a well-formed chain there is exactly one tail. If somehow more than
+        # one (e.g. an unchained owned item existed), prefer the one matching no
+        # dependents — take the first deterministically by id.
+        tail_ids = sorted(
+            (r["id"] if isinstance(r, dict) else r[0]) for r in tails
+        )
+        if tail_ids:
+            depends_on = tail_ids[-1]
     iid = _new_id()
     await db.execute(
         "INSERT INTO sprint_items "
-        "(id, project_id, version, title, parent_id, milestone_type) "
-        "VALUES (?, ?, ?, ?, ?, 'task')",
-        (iid, project_id, parent.get("version", ""), title, parent_id),
+        "(id, project_id, version, title, parent_id, milestone_type, owner, depends_on) "
+        "VALUES (?, ?, ?, ?, ?, 'task', ?, ?)",
+        (iid, project_id, parent.get("version", ""), title, parent_id, owner, depends_on),
     )
     await db.commit()
     item = await get_sprint_item(db, iid)
     assert item is not None
+    _invalidate_sprint_items_cache(project_id)
     return item
+
+
+async def _advance_task_chain(
+    db: aiosqlite.Connection,
+    project_id: str,
+    completed_item_id: str,
+) -> dict[str, Any] | None:
+    """4f02340e — advance a mixed-ownership subtask chain after a completion.
+
+    Called when a subtask is marked ``done``. Finds the next link in the chain
+    (the owned sibling whose ``depends_on`` is the just-completed item) and:
+
+      - next link is **human**-owned  → auto-file a HITL handoff (kind
+        ``'handoff'``, assigned to the human) so a person is pulled in. The next
+        item un-blocks (its depends_on is now done) and shows as claimable in
+        the human's queue.
+      - next link is **ai**-owned     → no HITL; the item simply un-blocks and
+        becomes claimable by an AI session (existing depends_on machinery).
+
+    Returns the filed HITL request dict when a handoff was created, else None.
+    Idempotent-ish: a handoff is only filed when the just-completed item is
+    itself owned (so it is part of a chain) and a next owned link exists.
+    """
+    completed = await get_sprint_item(db, completed_item_id)
+    if completed is None or completed.get("project_id") != project_id:
+        return None
+    if not completed.get("owner"):
+        return None  # not part of an owned chain
+    # The next link: an owned sibling that depends on the completed item.
+    async with db.execute(
+        "SELECT * FROM sprint_items "
+        "WHERE project_id = ? AND depends_on = ? AND owner IS NOT NULL "
+        "ORDER BY added_at ASC, id ASC LIMIT 1",
+        (project_id, completed_item_id),
+    ) as cur:
+        row = await cur.fetchone()
+    nxt = _row_to_dict(row) if row is not None else None
+    if not nxt:
+        return None
+    if (nxt.get("status") or "pending") in {"done", "failed", "skipped"}:
+        return None
+    if nxt.get("owner") != "human":
+        # AI link — nothing to file; depends_on now satisfied → claimable.
+        _publish_project_event(
+            project_id, "sprint_item_updated",
+            {"item_id": nxt["id"], "chain": "ai_claimable"},
+        )
+        return None
+    # Human link — pull a person in via a HITL handoff.
+    title = nxt.get("title", "")
+    question = (
+        f"Task chain handoff: your turn on subtask '{title}'. "
+        f"The preceding AI subtask ('{completed.get('title', '')}') is complete."
+    )
+    context = (
+        f"Mixed-ownership task chain (parent {completed.get('parent_id') or '?'}). "
+        f"Next subtask {nxt['id']} is assigned to a human. Mark it done "
+        f"(complete_sprint_item) to release the following AI subtask."
+    )
+    hitl = await request_hitl(
+        db, project_id, question,
+        context=context,
+        kind="handoff",
+        assigned_to=nxt.get("human_id") or "human",
+    )
+    _publish_project_event(
+        project_id, "sprint_item_updated",
+        {"item_id": nxt["id"], "chain": "human_handoff", "hitl_id": hitl.get("id")},
+    )
+    return hitl
 
 
 async def split_sprint_item(
@@ -8259,11 +8440,19 @@ async def create_workspace_invite(
     token_hash: str,
     *,
     github_access: str | None = None,
+    project_id: str | None = None,
 ) -> dict[str, Any]:
     """Insert a pending workspace member row (joined_at=NULL).
 
     G5.20 — ``github_access`` caps repo-touching MCP tools for this invitee.
     Defaults from role when omitted (viewer→none, member→read, admin/owner→write).
+
+    d116642e — ``project_id`` scopes the invite to a single project. When
+    ``None`` (default) the member is workspace-wide and sees every project
+    (current behavior). When set, the member is project-scoped: listing-only
+    scoping applies (they see only that project in listings). Airtight
+    per-request access enforcement is deferred pending the product decision
+    (pin b11c7cf6).
     """
     from .. import roles as _roles  # noqa: PLC0415
     mid = _new_id()
@@ -8271,9 +8460,9 @@ async def create_workspace_invite(
         github_access = _roles.default_github_access_for_role(role)
     await db.execute(
         "INSERT INTO workspace_members "
-        "(id, tenant_id, email, role, github_access, token_hash) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
-        (mid, tenant_id, email, role, github_access, token_hash),
+        "(id, tenant_id, email, role, github_access, token_hash, project_id) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (mid, tenant_id, email, role, github_access, token_hash, project_id),
     )
     await db.commit()
     async with db.execute("SELECT * FROM workspace_members WHERE id = ?", (mid,)) as cur:
@@ -8504,14 +8693,16 @@ async def get_workspaces_for_email(
 ) -> list[dict[str, Any]]:
     """Return workspaces the email has been invited to (accepted rows only).
 
-    Each row: {tenant_id, owner_email, role, github_access}.
-    Used to populate the workspace-switcher dropdown.
+    Each row: {tenant_id, owner_email, role, github_access, project_id}.
+    ``project_id`` (d116642e) is NULL for workspace-wide members and set for
+    project-scoped members. Used to populate the workspace-switcher dropdown.
     """
     e = (email or "").strip().lower()
     if not e:
         return []
     async with db.execute(
-        "SELECT wm.tenant_id, wm.role, wm.github_access, t.email AS owner_email "
+        "SELECT wm.tenant_id, wm.role, wm.github_access, wm.project_id, "
+        "t.email AS owner_email "
         "FROM workspace_members wm "
         "JOIN tenants t ON t.id = wm.tenant_id "
         "WHERE LOWER(wm.email) = ? AND wm.joined_at IS NOT NULL "
@@ -8520,6 +8711,48 @@ async def get_workspaces_for_email(
     ) as cur:
         rows = await cur.fetchall()
     return [_row_to_dict(r) for r in rows if r is not None]
+
+
+async def get_scoped_project_ids_for_member(
+    db: aiosqlite.Connection,
+    tenant_id: str,
+    email: str,
+) -> list[str] | None:
+    """d116642e — listing-only project scoping for a workspace member.
+
+    Returns the set of project_ids an accepted member is scoped to within the
+    given tenant's workspace, or ``None`` when the member is NOT project-scoped
+    (i.e. has any workspace-wide row, or is not a member at all) — meaning they
+    see every project.
+
+    Semantics:
+      - returns ``None``  → no scoping; caller lists all projects (default).
+      - returns ``[...]`` → list only these project_ids in UI listings.
+
+    NOTE: this is listing-only scoping. It does NOT block direct-by-ID access to
+    other projects in the same workspace — airtight per-request enforcement is
+    deferred pending the open product decision (pin b11c7cf6). Writes remain
+    gated by role enforcement (393eed0a).
+    """
+    e = (email or "").strip().lower()
+    if not e:
+        return None
+    async with db.execute(
+        "SELECT project_id FROM workspace_members "
+        "WHERE tenant_id = ? AND LOWER(email) = ? AND joined_at IS NOT NULL",
+        (tenant_id, e),
+    ) as cur:
+        rows = await cur.fetchall()
+    if not rows:
+        return None
+    scoped: list[str] = []
+    for r in rows:
+        pid = r["project_id"] if isinstance(r, dict) else r[0]
+        if pid is None:
+            # Any workspace-wide membership row wins → no scoping.
+            return None
+        scoped.append(pid)
+    return scoped
 
 
 # ---------------------------------------------------------------------------
@@ -8706,12 +8939,25 @@ async def add_session_note(
     session_id: str,
     title: str,
     body: str,
+    note_kind: str | None = None,
 ) -> dict[str, Any]:
-    """Add an ephemeral note scoped to a session. Auto-deleted on session close."""
+    """Add an ephemeral note scoped to a session. Auto-deleted on session close.
+
+    0d7de2a2 — ``note_kind`` classifies the note. None/'note' is a normal
+    sprint note. 'thinking' marks a HOOKS_DEBUG_STATE scratchpad note
+    auto-persisted by Claude's client-side thinking_sync hook; the dashboard
+    renders these with a distinct icon and they round-trip into the next
+    session brief. Any other value is normalized to None (a normal note).
+    """
+    if note_kind not in (None, "note", "thinking"):
+        note_kind = None
+    if note_kind == "note":
+        note_kind = None
     nid = _new_id()
     await db.execute(
-        "INSERT INTO session_notes (id, session_id, title, body) VALUES (?, ?, ?, ?)",
-        (nid, session_id, title, body),
+        "INSERT INTO session_notes (id, session_id, title, body, note_kind) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (nid, session_id, title, body, note_kind),
     )
     await db.commit()
     async with db.execute(
@@ -8724,12 +8970,31 @@ async def add_session_note(
 async def get_session_notes(
     db: aiosqlite.Connection,
     session_id: str,
+    note_kind: str | None = None,
 ) -> list[dict[str, Any]]:
-    """Return all notes for a session, newest first."""
-    async with db.execute(
-        "SELECT * FROM session_notes WHERE session_id = ? ORDER BY created_at DESC",
-        (session_id,),
-    ) as cur:
+    """Return all notes for a session, newest first.
+
+    0d7de2a2 — pass ``note_kind='thinking'`` to return only thinking_sync
+    scratchpad notes, or ``'note'`` for only normal notes. Omit to return all.
+    """
+    if note_kind == "thinking":
+        sql = (
+            "SELECT * FROM session_notes WHERE session_id = ? "
+            "AND note_kind = 'thinking' ORDER BY created_at DESC"
+        )
+        params: tuple = (session_id,)
+    elif note_kind == "note":
+        sql = (
+            "SELECT * FROM session_notes WHERE session_id = ? "
+            "AND (note_kind IS NULL OR note_kind = 'note') ORDER BY created_at DESC"
+        )
+        params = (session_id,)
+    else:
+        sql = (
+            "SELECT * FROM session_notes WHERE session_id = ? ORDER BY created_at DESC"
+        )
+        params = (session_id,)
+    async with db.execute(sql, params) as cur:
         rows = await cur.fetchall()
     return [_row_to_dict(r) for r in rows if r is not None]  # type: ignore[misc]
 

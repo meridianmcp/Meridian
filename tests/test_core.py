@@ -6191,6 +6191,7 @@ def test_pg_migration_registry_matches_historical_order():
         "_migrate_pg_v25_notification_prefs",
         "_migrate_pg_tenants_is_internal",
         "_migrate_pg_workspace_members_rbac",
+        "_migrate_pg_workspace_members_project_scope",
         "_migrate_pg_admin_plan",
         "_migrate_pg_tunnel_active",
         "_migrate_pg_tunnel_plugins",
@@ -6227,10 +6228,12 @@ def test_pg_migration_registry_matches_historical_order():
         "_migrate_pg_decision_code_anchor",
         "_migrate_pg_session_graph_snapshots",
         "_migrate_pg_agent_tasks_table",
+        "_migrate_pg_sprint_item_owner",
+        "_migrate_pg_session_note_kind",
     ]
     # No duplicates across the three groups.
     allnames = core + hosted + late
-    assert len(allnames) == len(set(allnames)) == 62
+    assert len(allnames) == len(set(allnames)) == 65
 
 
 def test_default_agent_instructions_has_code_intel_protocol():
@@ -7994,6 +7997,153 @@ async def test_g519_rbac_migration_is_idempotent_and_widens_check():
             row = await cur.fetchone()
         assert row["role"] == "admin"
         assert row["github_access"] == "write"
+    finally:
+        await db.close()
+
+
+# ---------------------------------------------------------------------------
+# d116642e — project-level invites foundation (nullable workspace_members.project_id)
+# Listing-only scoping. Airtight per-request enforcement intentionally deferred
+# (pin b11c7cf6) — not tested here because it is not implemented.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_d116642e_workspace_members_has_project_id_column():
+    """The project_id column exists after init_db (both schema + migration)."""
+    db = await db_module.init_db(":memory:")
+    try:
+        assert await db_module._column_exists(db, "workspace_members", "project_id")
+        # Migration is idempotent — re-running is a no-op.
+        await db_module._migrate_workspace_members_project_scope(db)
+        await db_module._migrate_workspace_members_project_scope(db)
+        assert await db_module._column_exists(db, "workspace_members", "project_id")
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_d116642e_create_invite_stores_project_id():
+    """create_workspace_invite persists project_id (None = workspace-wide)."""
+    db = await db_module.init_db(":memory:")
+    try:
+        await db.execute(
+            "INSERT INTO tenants (id, email) VALUES (?, ?)",
+            ("t-pi", "owner@example.com"),
+        )
+        await db.commit()
+        scoped = await db_module.create_workspace_invite(
+            db, "t-pi", "scoped@example.com", "member", "h1", project_id="proj-A"
+        )
+        wide = await db_module.create_workspace_invite(
+            db, "t-pi", "wide@example.com", "member", "h2"
+        )
+        assert scoped["project_id"] == "proj-A"
+        assert wide["project_id"] is None
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_d116642e_get_workspaces_surfaces_project_id():
+    """get_workspaces_for_email surfaces project_id on accepted rows."""
+    from datetime import datetime, timezone
+    db = await db_module.init_db(":memory:")
+    try:
+        await db.execute(
+            "INSERT INTO tenants (id, email) VALUES (?, ?)",
+            ("t-ws", "owner@example.com"),
+        )
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        await db.execute(
+            "INSERT INTO workspace_members "
+            "(id, tenant_id, email, role, github_access, token_hash, project_id, joined_at) "
+            "VALUES (?, ?, ?, ?, ?, NULL, ?, ?)",
+            ("m-s", "t-ws", "scoped@example.com", "member", "read", "proj-A", now),
+        )
+        await db.commit()
+        rows = await db_module.get_workspaces_for_email(db, "scoped@example.com")
+        assert len(rows) == 1
+        assert rows[0]["project_id"] == "proj-A"
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_d116642e_scoped_project_ids_semantics():
+    """get_scoped_project_ids_for_member: scoped rows return their ids; a
+    workspace-wide row (project_id NULL) returns None (no scoping)."""
+    from datetime import datetime, timezone
+    db = await db_module.init_db(":memory:")
+    try:
+        await db.execute(
+            "INSERT INTO tenants (id, email) VALUES (?, ?)",
+            ("t-sc", "owner@example.com"),
+        )
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        # A scoped member with two project-scoped accepted rows.
+        for i, pid in enumerate(("proj-A", "proj-B")):
+            await db.execute(
+                "INSERT INTO workspace_members "
+                "(id, tenant_id, email, role, github_access, token_hash, project_id, joined_at) "
+                "VALUES (?, ?, ?, ?, ?, NULL, ?, ?)",
+                (f"m-s{i}", "t-sc", "scoped@example.com", "member", "read", pid, now),
+            )
+        # A workspace-wide member (project_id NULL).
+        await db.execute(
+            "INSERT INTO workspace_members "
+            "(id, tenant_id, email, role, github_access, token_hash, project_id, joined_at) "
+            "VALUES (?, ?, ?, ?, ?, NULL, NULL, ?)",
+            ("m-w", "t-sc", "wide@example.com", "member", "read", now),
+        )
+        await db.commit()
+
+        scoped = await db_module.get_scoped_project_ids_for_member(
+            db, "t-sc", "scoped@example.com"
+        )
+        assert sorted(scoped) == ["proj-A", "proj-B"]
+
+        # Workspace-wide member → None (sees everything).
+        assert await db_module.get_scoped_project_ids_for_member(
+            db, "t-sc", "wide@example.com"
+        ) is None
+
+        # Non-member → None.
+        assert await db_module.get_scoped_project_ids_for_member(
+            db, "t-sc", "stranger@example.com"
+        ) is None
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_d116642e_mixed_scoped_and_wide_membership_is_unscoped():
+    """A member with BOTH a scoped and a workspace-wide row sees everything
+    (any workspace-wide membership wins → no listing scoping)."""
+    from datetime import datetime, timezone
+    db = await db_module.init_db(":memory:")
+    try:
+        await db.execute(
+            "INSERT INTO tenants (id, email) VALUES (?, ?)",
+            ("t-mix", "owner@example.com"),
+        )
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        await db.execute(
+            "INSERT INTO workspace_members "
+            "(id, tenant_id, email, role, github_access, token_hash, project_id, joined_at) "
+            "VALUES (?, ?, ?, ?, ?, NULL, ?, ?)",
+            ("m-mx1", "t-mix", "mix@example.com", "member", "read", "proj-A", now),
+        )
+        await db.execute(
+            "INSERT INTO workspace_members "
+            "(id, tenant_id, email, role, github_access, token_hash, project_id, joined_at) "
+            "VALUES (?, ?, ?, ?, ?, NULL, NULL, ?)",
+            ("m-mx2", "t-mix", "mix@example.com", "member", "read", now),
+        )
+        await db.commit()
+        assert await db_module.get_scoped_project_ids_for_member(
+            db, "t-mix", "mix@example.com"
+        ) is None
     finally:
         await db.close()
 
@@ -14121,3 +14271,216 @@ async def test_get_plugin_details_surfaces_skill_guide(db, tmp_path):
     )
     assert "skill_guide" in result, "skill_guide missing from get_plugin_details"
     assert "Code Intel Guide" in result["skill_guide"]["body"]
+
+
+# ---------------------------------------------------------------------------
+# 4f02340e — mixed-ownership task chains
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_chain_sprint_items_has_owner_column(db):
+    """sprint_items.owner exists after init_db; migration is idempotent."""
+    assert await db_module._column_exists(db, "sprint_items", "owner")
+    await db_module._migrate_sprint_item_owner(db)
+    await db_module._migrate_sprint_item_owner(db)
+    assert await db_module._column_exists(db, "sprint_items", "owner")
+
+
+@pytest.mark.asyncio
+async def test_chain_add_subtask_validates_owner(db):
+    """add_subtask rejects an invalid owner value."""
+    p = await db_module.create_project(db, "chain-owner-val")
+    parent = await db_module.add_sprint_item(db, p["id"], "v1", "Parent task")
+    with pytest.raises(ValueError):
+        await db_module.add_subtask(db, p["id"], parent["id"], "bad", owner="robot")
+
+
+@pytest.mark.asyncio
+async def test_chain_owned_subtasks_chain_via_depends_on(db):
+    """Owned subtasks added in sequence chain: each depends on the prior owned
+    sibling; the head has no dependency. Unowned subtasks never chain."""
+    p = await db_module.create_project(db, "chain-deps")
+    parent = await db_module.add_sprint_item(db, p["id"], "v1", "Provision + verify")
+    s1 = await db_module.add_subtask(db, p["id"], parent["id"], "Human creates resource", owner="human")
+    s2 = await db_module.add_subtask(db, p["id"], parent["id"], "AI configures it", owner="ai")
+    s3 = await db_module.add_subtask(db, p["id"], parent["id"], "Human adds secrets", owner="human")
+    assert s1["owner"] == "human" and not s1["depends_on"]
+    assert s2["owner"] == "ai" and s2["depends_on"] == s1["id"]
+    assert s3["owner"] == "human" and s3["depends_on"] == s2["id"]
+    # An unowned subtask is independent.
+    s4 = await db_module.add_subtask(db, p["id"], parent["id"], "Loose subtask")
+    assert s4["owner"] is None and not s4["depends_on"]
+
+
+@pytest.mark.asyncio
+async def test_chain_ai_complete_files_hitl_handoff_to_human(db):
+    """When an AI subtask completes and the next link is human-owned, a HITL
+    handoff is auto-filed."""
+    p = await db_module.create_project(db, "chain-ai-to-human")
+    parent = await db_module.add_sprint_item(db, p["id"], "v1", "Configure then secure")
+    ai = await db_module.add_subtask(db, p["id"], parent["id"], "AI configures", owner="ai")
+    human = await db_module.add_subtask(db, p["id"], parent["id"], "Human adds secrets", owner="human")
+
+    before = await db_module.list_hitl_requests(db, p["id"])
+    await db_module.complete_sprint_item(db, p["id"], ai["id"])
+    after = await db_module.list_hitl_requests(db, p["id"])
+
+    assert len(after) == len(before) + 1
+    handoffs = [h for h in after if h["kind"] == "handoff"]
+    assert handoffs, "expected a handoff HITL to be filed"
+    assert human["title"] in handoffs[0]["question"]
+
+
+@pytest.mark.asyncio
+async def test_chain_human_complete_does_not_file_hitl_for_ai(db):
+    """When a human subtask completes and the next link is AI-owned, no HITL is
+    filed — the AI subtask simply un-blocks (depends_on satisfied)."""
+    p = await db_module.create_project(db, "chain-human-to-ai")
+    parent = await db_module.add_sprint_item(db, p["id"], "v1", "Create then configure")
+    human = await db_module.add_subtask(db, p["id"], parent["id"], "Human creates", owner="human")
+    ai = await db_module.add_subtask(db, p["id"], parent["id"], "AI configures", owner="ai")
+
+    await db_module.complete_sprint_item(db, p["id"], human["id"])
+    hitls = await db_module.list_hitl_requests(db, p["id"])
+    assert [h for h in hitls if h["kind"] == "handoff"] == []
+    # AI subtask is now claimable (its dependency is done).
+    claimed = await db_module.claim_sprint_item(db, p["id"], ai["id"])
+    assert claimed["status"] == "in_progress"
+
+
+@pytest.mark.asyncio
+async def test_chain_parent_stays_in_progress_until_all_done(db):
+    """Parent rolls up to done only after every subtask is terminal."""
+    p = await db_module.create_project(db, "chain-rollup")
+    parent = await db_module.add_sprint_item(db, p["id"], "v1", "Full chain")
+    await db_module.claim_sprint_item(db, p["id"], parent["id"])  # parent in_progress
+    a = await db_module.add_subtask(db, p["id"], parent["id"], "step A", owner="human")
+    b = await db_module.add_subtask(db, p["id"], parent["id"], "step B", owner="ai")
+
+    await db_module.complete_sprint_item(db, p["id"], a["id"])
+    mid = await db_module.get_sprint_item(db, parent["id"])
+    assert mid["status"] == "in_progress", "parent must stay active mid-chain"
+
+    await db_module.complete_sprint_item(db, p["id"], b["id"])
+    end = await db_module.get_sprint_item(db, parent["id"])
+    assert end["status"] == "done"
+
+
+@pytest.mark.asyncio
+async def test_chain_full_alternating_workflow(db):
+    """End-to-end: human → AI → human chain.
+
+    human creates resource → AI configures → human adds secrets.
+    Completing the human head un-blocks the AI step (no HITL); completing the AI
+    step files a handoff for the final human step.
+    """
+    p = await db_module.create_project(db, "chain-e2e")
+    parent = await db_module.add_sprint_item(db, p["id"], "v1", "Onboard resource")
+    h1 = await db_module.add_subtask(db, p["id"], parent["id"], "Human creates resource", owner="human")
+    ai = await db_module.add_subtask(db, p["id"], parent["id"], "AI configures it", owner="ai")
+    h2 = await db_module.add_subtask(db, p["id"], parent["id"], "Human adds secrets", owner="human")
+
+    # Human finishes the head → AI un-blocks, no handoff.
+    await db_module.complete_sprint_item(db, p["id"], h1["id"])
+    assert [x for x in await db_module.list_hitl_requests(db, p["id"]) if x["kind"] == "handoff"] == []
+
+    # AI finishes → handoff filed for the final human step.
+    await db_module.claim_sprint_item(db, p["id"], ai["id"])
+    await db_module.complete_sprint_item(db, p["id"], ai["id"])
+    handoffs = [x for x in await db_module.list_hitl_requests(db, p["id"]) if x["kind"] == "handoff"]
+    assert len(handoffs) == 1
+    assert h2["title"] in handoffs[0]["question"]
+
+
+@pytest.mark.asyncio
+async def test_chain_add_subtask_owner_via_mcp(db, tmp_path):
+    """The add_subtask MCP tool threads the owner param through to the chain."""
+    from meridian.mcp.handler import _dispatch_mcp_tool
+
+    p = await db_module.create_project(db, "chain-mcp")
+    parent = await db_module.add_sprint_item(db, p["id"], "v1", "Parent via mcp")
+    sub = await _dispatch_mcp_tool(
+        "add_subtask",
+        {"project_id": p["id"], "parent_id": parent["id"], "title": "AI step", "owner": "ai"},
+        db, str(tmp_path), tenant=None,
+    )
+    assert sub["owner"] == "ai"
+
+
+# ---------------------------------------------------------------------------
+# 0d7de2a2 — thinking_sync mode (server side: note_kind='thinking')
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_thinking_session_notes_has_note_kind_column(db):
+    """session_notes.note_kind exists after init_db; migration idempotent."""
+    assert await db_module._column_exists(db, "session_notes", "note_kind")
+    await db_module._migrate_session_note_kind(db)
+    await db_module._migrate_session_note_kind(db)
+    assert await db_module._column_exists(db, "session_notes", "note_kind")
+
+
+@pytest.mark.asyncio
+async def test_thinking_add_session_note_persists_kind(db):
+    """add_session_note stores note_kind='thinking' distinctly; default is None."""
+    p = await db_module.create_project(db, "think-persist")
+    s = await db_module.register_session(db, p["id"], "s1")
+    t = await db_module.add_session_note(
+        db, s["id"], "HOOKS_DEBUG_STATE", "tried X; X failed; confirmed Y",
+        note_kind="thinking",
+    )
+    n = await db_module.add_session_note(db, s["id"], "Constraint", "no asyncpg")
+    assert t["note_kind"] == "thinking"
+    assert n["note_kind"] is None
+
+
+@pytest.mark.asyncio
+async def test_thinking_add_session_note_normalizes_bad_kind(db):
+    """An unknown note_kind falls back to a normal note (None)."""
+    p = await db_module.create_project(db, "think-bad")
+    s = await db_module.register_session(db, p["id"], "s1")
+    n = await db_module.add_session_note(
+        db, s["id"], "t", "b", note_kind="bogus"
+    )
+    assert n["note_kind"] is None
+
+
+@pytest.mark.asyncio
+async def test_thinking_get_session_notes_filter_by_kind(db):
+    """get_session_notes filters by note_kind: thinking-only, note-only, or all."""
+    p = await db_module.create_project(db, "think-filter")
+    s = await db_module.register_session(db, p["id"], "s1")
+    await db_module.add_session_note(db, s["id"], "T1", "thinking one", note_kind="thinking")
+    await db_module.add_session_note(db, s["id"], "N1", "normal one")
+    await db_module.add_session_note(db, s["id"], "T2", "thinking two", note_kind="thinking")
+
+    all_notes = await db_module.get_session_notes(db, s["id"])
+    thinking = await db_module.get_session_notes(db, s["id"], note_kind="thinking")
+    normal = await db_module.get_session_notes(db, s["id"], note_kind="note")
+    assert len(all_notes) == 3
+    assert len(thinking) == 2 and all(x["note_kind"] == "thinking" for x in thinking)
+    assert len(normal) == 1 and normal[0]["note_kind"] is None
+
+
+@pytest.mark.asyncio
+async def test_thinking_mcp_roundtrip(db, tmp_path):
+    """The add_sprint_note / get_sprint_notes MCP tools thread note_kind through."""
+    from meridian.mcp.handler import _dispatch_mcp_tool
+
+    p = await db_module.create_project(db, "think-mcp")
+    s = await db_module.register_session(db, p["id"], "s1")
+    await _dispatch_mcp_tool(
+        "add_sprint_note",
+        {"session_id": s["id"], "title": "HOOKS_DEBUG_STATE",
+         "body": "state snapshot", "note_kind": "thinking"},
+        db, str(tmp_path), tenant=None,
+    )
+    fetched = await _dispatch_mcp_tool(
+        "get_sprint_notes",
+        {"session_id": s["id"], "note_kind": "thinking"},
+        db, str(tmp_path), tenant=None,
+    )
+    assert len(fetched) == 1
+    assert fetched[0]["note_kind"] == "thinking"

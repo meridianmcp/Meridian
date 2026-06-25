@@ -583,6 +583,9 @@ CREATE TABLE IF NOT EXISTS session_notes (
     session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
     title TEXT NOT NULL,
     body TEXT NOT NULL,
+    -- 0d7de2a2: thinking_sync. 'thinking' marks a HOOKS_DEBUG_STATE scratchpad
+    -- note; NULL/'note' = a normal note. See db._migrate_session_note_kind.
+    note_kind TEXT,
     created_at TEXT NOT NULL DEFAULT ({_TS})
 );
 CREATE INDEX IF NOT EXISTS idx_session_notes_session ON session_notes(session_id);
@@ -760,6 +763,10 @@ CREATE TABLE IF NOT EXISTS workspace_members (
     role TEXT NOT NULL DEFAULT 'member',
     github_access TEXT NOT NULL DEFAULT 'read'
         CHECK (github_access IN ('none','read','write')),
+    -- d116642e: project-level invites foundation. NULL = workspace-wide
+    -- (current behavior); set = project-scoped (listing-only scoping for now).
+    -- Airtight per-request enforcement deferred (pin b11c7cf6).
+    project_id TEXT,
     token_hash TEXT,
     invited_at TEXT NOT NULL DEFAULT ({_TS}),
     joined_at TEXT
@@ -1075,6 +1082,21 @@ async def _migrate_pg_workspace_members_rbac(conn: PostgresConnection) -> None:
     )
 
 
+async def _migrate_pg_workspace_members_project_scope(conn: PostgresConnection) -> None:
+    """d116642e — project-level invites foundation.
+
+    Adds a nullable ``project_id`` to ``workspace_members``: NULL = workspace-wide
+    member (current behavior), set = project-scoped member (listing-only scoping
+    for now). ADD COLUMN IF NOT EXISTS so re-running is a no-op. Mirrors
+    db._migrate_workspace_members_project_scope. Airtight per-request access
+    enforcement is intentionally deferred pending the product decision (pin
+    b11c7cf6).
+    """
+    await conn.executescript(
+        "ALTER TABLE workspace_members ADD COLUMN IF NOT EXISTS project_id TEXT"
+    )
+
+
 async def _migrate_pg_tenants_is_internal(conn: PostgresConnection) -> None:
     """G2.10 — tenants.is_internal column + backfill known internal emails.
     Postgres mirror of db._migrate_tenants_is_internal. Online-safe ADD
@@ -1362,6 +1384,29 @@ async def _migrate_pg_agent_tasks_table(conn: PostgresConnection) -> None:
         CREATE INDEX IF NOT EXISTS idx_agent_tasks_agent
             ON agent_tasks(agent_id, status);
         """
+    )
+
+
+async def _migrate_pg_session_note_kind(conn: PostgresConnection) -> None:
+    """0d7de2a2 — session_notes.note_kind: thinking_sync scratchpad notes.
+
+    Nullable ``note_kind`` ('thinking' | NULL/'note'). ADD COLUMN IF NOT EXISTS
+    so re-running is a no-op. Mirrors db._migrate_session_note_kind.
+    """
+    await conn.executescript(
+        "ALTER TABLE session_notes ADD COLUMN IF NOT EXISTS note_kind TEXT"
+    )
+
+
+async def _migrate_pg_sprint_item_owner(conn: PostgresConnection) -> None:
+    """4f02340e — sprint_items.owner: mixed-ownership task chains.
+
+    Nullable ``owner`` column ('human' | 'ai' | NULL) for the alternating
+    claim/handoff state machine. ADD COLUMN IF NOT EXISTS so re-running is a
+    no-op. Mirrors db._migrate_sprint_item_owner.
+    """
+    await conn.executescript(
+        "ALTER TABLE sprint_items ADD COLUMN IF NOT EXISTS owner TEXT"
     )
 
 
@@ -1911,6 +1956,7 @@ _PG_MIGRATIONS_HOSTED = (
     _migrate_pg_v25_notification_prefs,
     _migrate_pg_tenants_is_internal,
     _migrate_pg_workspace_members_rbac,
+    _migrate_pg_workspace_members_project_scope,
     _migrate_pg_admin_plan,
     _migrate_pg_tunnel_active,
     _migrate_pg_tunnel_plugins,
@@ -2030,4 +2076,6 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_decision_code_anchor,
     _migrate_pg_session_graph_snapshots,
     _migrate_pg_agent_tasks_table,
+    _migrate_pg_sprint_item_owner,
+    _migrate_pg_session_note_kind,
 )

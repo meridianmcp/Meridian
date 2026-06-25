@@ -452,17 +452,28 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
     {"name": "add_sprint_note", "description":
         "Add an ephemeral note to the current session's scratch pad. "
         "Use for constraints, blockers, working assumptions valid only this session. "
-        "Notes are auto-deleted when the session closes.",
+        "Notes are auto-deleted when the session closes. "
+        "Pass note_kind='thinking' for a thinking_sync (HOOKS_DEBUG_STATE) note: a "
+        "structured snapshot of the reasoning state (what was tried, what failed, "
+        "current confirmed state) that the dashboard renders with a distinct icon. "
+        "Intended for Claude's client-side thinking_sync post-tool-call hook, which "
+        "extracts the extended-thinking scratchpad and persists it here so debugging "
+        "state survives across turns and into the next session brief.",
      "inputSchema": {"type": "object", "properties": {
          "session_id": {"type": "string"},
          "title": {"type": "string"},
-         "body": {"type": "string"}},
+         "body": {"type": "string"},
+         "note_kind": {"type": "string", "enum": ["note", "thinking"],
+                       "description": "'note' (default) or 'thinking' for a thinking_sync scratchpad note."}},
          "required": ["session_id", "title", "body"]}},
     {"name": "get_sprint_notes", "description":
         "Read-only: Get all ephemeral scratch-pad notes for the current session. "
-        "Shown at the top of session briefs so every cold start sees active constraints.",
+        "Shown at the top of session briefs so every cold start sees active constraints. "
+        "Pass note_kind='thinking' to fetch only thinking_sync scratchpad notes, or "
+        "'note' for only normal notes; omit for all.",
      "inputSchema": {"type": "object", "properties": {
-         "session_id": {"type": "string"}},
+         "session_id": {"type": "string"},
+         "note_kind": {"type": "string", "enum": ["note", "thinking"]}},
          "required": ["session_id"]}},
     {"name": "set_sprint", "description":
         "Update only the sprint — the short-term focus that changes each session or week. "
@@ -769,11 +780,12 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "session_id": {"type": "string", "description": "Optional caller session id; its own file claims are ignored for conflict checks."}},
          "required": ["item_id"]}},
     {"name": "add_subtask",
-     "description": "Add a child sprint item under an existing parent item. Inherits the parent's version. Status starts as pending. Rejects if the parent is already done, failed, or skipped.",
+     "description": "Add a child sprint item under an existing parent item. Inherits the parent's version. Status starts as pending. Rejects if the parent is already done, failed, or skipped. Pass owner='human' or owner='ai' to build a mixed-ownership task chain: owned subtasks added in sequence become a strict chain (each depends on the previous owned sibling), and completing one auto-advances ownership — an AI→human step files a HITL handoff, a human→AI step un-blocks the next AI subtask. The parent stays in_progress until all subtasks are terminal.",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
          "parent_id": {"type": "string", "description": "ID of the parent sprint item."},
-         "title": {"type": "string", "description": "Title of the new subtask."}},
+         "title": {"type": "string", "description": "Title of the new subtask."},
+         "owner": {"type": "string", "enum": ["human", "ai"], "description": "Optional owner for mixed-ownership task chains: 'human' or 'ai'. Omit for a legacy unchained subtask."}},
          "required": ["parent_id", "title"]}},
     {"name": "split_sprint_item",
      "description": "Split a sprint item into multiple smaller items. The original is closed (skipped) and N new items are created with split_from referencing the original. Returns list of new items.",
