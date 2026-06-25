@@ -636,6 +636,100 @@ def test_run_connection_lazy_preflight_reports_unhealthy(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# a3410a9c — core slot watchdog escalation + background re-probe recovery
+# ---------------------------------------------------------------------------
+
+def test_run_connection_lazy_escalates_after_repeated_spawn_failures(monkeypatch):
+    """Once spawn failures exceed the retry budget, the slot is reported
+    unhealthy exactly once; every failed request still gets a 503."""
+    sent = []
+    n_requests = tc._WATCHDOG_MAX_RETRIES + 1
+
+    class FakeWS:
+        def __init__(self):
+            self._msgs = [json.dumps({"type": "request", "id": str(i)}) for i in range(n_requests)]
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): pass
+        def __aiter__(self): return self
+        async def __anext__(self):
+            if not self._msgs:
+                raise StopAsyncIteration
+            return self._msgs.pop(0)
+        async def send(self, data): sent.append(json.loads(data))
+
+    class FakeHttpClient:
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): pass
+
+    import httpx as _httpx
+    import websockets as _ws
+    monkeypatch.setattr(_ws, "connect", lambda url, **kw: FakeWS())
+    monkeypatch.setattr(_httpx, "AsyncClient", lambda *a, **k: FakeHttpClient())
+
+    async def fake_ensure(self):  # proxy never comes up
+        return None
+    monkeypatch.setattr(tc.SlotProxy, "ensure_running", fake_ensure)
+
+    proxy = tc.SlotProxy(["x"], 8808, "fs")
+    asyncio.run(tc._run_connection_lazy("wss://x", proxy, "fs"))
+
+    statuses = [m for m in sent if m.get("type") == "plugin_status"]
+    assert statuses == [{"type": "plugin_status", "slot": "fs", "healthy": False}]
+    assert len([m for m in sent if m.get("status") == 503]) == n_requests
+
+
+def test_run_connection_lazy_reprobe_recovers(monkeypatch):
+    """After escalation, the background re-probe brings the slot back and reports
+    healthy once the proxy serves again."""
+    monkeypatch.setattr(tc, "_SLOT_REPROBE_INTERVAL", 0.01)
+    sent = []
+    state = {"spawn_ok": False}
+    fail_budget = tc._WATCHDOG_MAX_RETRIES + 1
+
+    class FakeWS:
+        def __init__(self):
+            self._n = 0
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): pass
+        def __aiter__(self): return self
+        async def __anext__(self):
+            self._n += 1
+            if self._n <= fail_budget:
+                return json.dumps({"type": "request", "id": str(self._n)})
+            # Escalation happened — let the proxy recover and give the re-probe
+            # (0.01s) time to fire between pings, then end the stream.
+            state["spawn_ok"] = True
+            if self._n < fail_budget + 8:
+                await asyncio.sleep(0.03)
+                return json.dumps({"type": "ping"})
+            raise StopAsyncIteration
+        async def send(self, data): sent.append(json.loads(data))
+
+    class FakeHttpClient:
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): pass
+
+    import httpx as _httpx
+    import websockets as _ws
+    monkeypatch.setattr(_ws, "connect", lambda url, **kw: FakeWS())
+    monkeypatch.setattr(_httpx, "AsyncClient", lambda *a, **k: FakeHttpClient())
+    monkeypatch.setattr(tc, "_probe_slot_health", AsyncMock(return_value=True))
+
+    async def fake_ensure(self):
+        if state["spawn_ok"]:
+            self._proc = _FakeProc()
+            self.holder["proc"] = self._proc
+    monkeypatch.setattr(tc.SlotProxy, "ensure_running", fake_ensure)
+
+    proxy = tc.SlotProxy(["x"], 8808, "fs")
+    asyncio.run(tc._run_connection_lazy("wss://x", proxy, "fs"))
+
+    statuses = [m for m in sent if m.get("type") == "plugin_status"]
+    assert {"type": "plugin_status", "slot": "fs", "healthy": False} in statuses
+    assert {"type": "plugin_status", "slot": "fs", "healthy": True} in statuses
+
+
+# ---------------------------------------------------------------------------
 # _inject_mcp_entries — non-dict top-level + non-dict mcpServers (778)
 # ---------------------------------------------------------------------------
 

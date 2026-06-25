@@ -48,6 +48,11 @@ _WATCHDOG_MAX_RETRIES = 5
 # Lazy spawn: how long (seconds) a slot may stay idle before auto-kill.
 # 3649a61a — don't spawn at startup; kill after 30min of no requests.
 _IDLE_KILL_SECONDS = 30 * 60
+# a3410a9c — once a core slot is marked unhealthy, how often (seconds) the
+# background re-probe retries spawning + tools/list to auto-recover the slot
+# (e.g. the missing npx/binary became available). On success the client tells
+# the server to re-advertise the slot's tools.
+_SLOT_REPROBE_INTERVAL = 60.0
 
 
 # ---------------------------------------------------------------------------
@@ -266,95 +271,148 @@ async def _run_connection_lazy(
     # d71ba2e7 — one pre-flight health check per connection, fired right after
     # the first lazy spawn so a proxy that Popen-succeeds but never serves is
     # reported unhealthy instead of silently 503-ing on every tool call.
+    # a3410a9c — track consecutive spawn failures and, once they exhaust the
+    # retry budget (or the pre-flight fails), mark the slot unhealthy and start a
+    # background re-probe that auto-recovers it when the proxy serves again.
     _preflight_done = False
+    _spawn_failures = 0
+    _unhealthy = False
+    _reprobe_task: "asyncio.Task | None" = None
 
-    async with websockets.connect(ws_url, max_size=None, ping_interval=20) as ws:
-        print(f"tunnel:{label}: connected (lazy mode)", flush=True)
-        local_base = f"http://127.0.0.1:{proxy.port}"
-        async with httpx.AsyncClient() as http_client:
-            async for raw in ws:
-                try:
-                    msg = json.loads(raw)
-                except (ValueError, TypeError):
-                    continue
-                if not isinstance(msg, dict):
-                    continue
-                if msg.get("type") == "ping":
-                    continue
-                if msg.get("type") == "add_fs_roots":
-                    # Control message: expand the filesystem proxy's allowed dirs.
-                    new_roots: list[str] = msg.get("roots") or []
-                    updated_cmd, changed = _add_fs_roots_to_cmd(proxy.cmd, new_roots)
-                    if changed:
-                        proxy.cmd = updated_cmd
-                        if proxy.is_running:
-                            proxy.kill()
-                            await proxy.ensure_running()
-                        print(
-                            f"tunnel:{label}: expanded allowed dirs → {new_roots}",
-                            flush=True,
-                        )
-                    continue
-                if msg.get("type") == "request":
-                    # Lazy spawn: bring the proxy up if it died or was idle-killed.
-                    _was_running = proxy.is_running
-                    if not proxy.is_running:
-                        await proxy.ensure_running()
-                    if not proxy.is_running:
-                        # Spawn failed — return 503 so the server doesn't timeout.
-                        req_id = msg.get("id")
-                        err = json.dumps({"error": "local proxy not available"}).encode()
-                        await ws.send(json.dumps({
-                            "type": "response",
-                            "id": req_id,
-                            "status": 503,
-                            "headers": {"content-type": "application/json"},
-                            "body": base64.b64encode(err).decode(),
-                        }))
-                        continue
-                    # Pre-flight the proxy once, the first time we bring it up.
-                    if not _preflight_done and not _was_running:
-                        _preflight_done = True
-                        await _preflight_slot(ws, proxy.port, label)
-                    proxy.touch()
-                    resp = await _relay_request(
-                        http_client, local_base, msg, tool_prefix=tool_prefix
+    async def _reprobe() -> None:
+        """Background recovery: retry spawn + tools/list every
+        _SLOT_REPROBE_INTERVAL; on the first healthy probe, re-advertise."""
+        nonlocal _unhealthy, _reprobe_task
+        while True:
+            await asyncio.sleep(_SLOT_REPROBE_INTERVAL)
+            try:
+                if not proxy.is_running:
+                    await proxy.ensure_running()
+                if proxy.is_running and await _probe_slot_health(proxy.port, attempts=1):
+                    _unhealthy = False
+                    _reprobe_task = None
+                    await _report_slot_health(ws, label, True)
+                    print(
+                        f"tunnel:{label}: slot recovered — re-advertising tools",
+                        flush=True,
                     )
-                    # Auto-add: if access was denied and the path falls under a
-                    # known repo_path, silently expand and retry once (b9d1b606).
-                    denied_path = _extract_denied_path(resp)
-                    if denied_path and _known:
-                        try:
-                            dp = Path(denied_path).resolve()
-                        except Exception:
-                            dp = None
-                        if dp is not None:
-                            anchor = next(
-                                (
-                                    r for r in _known
-                                    if _is_subpath(dp, Path(r))
-                                ),
-                                None,
+                    return
+            except Exception:  # noqa: BLE001 — keep retrying until cancelled
+                pass
+
+    async def _mark_unhealthy(*, already_reported: bool = False) -> None:
+        """Suppress this slot's tools and begin background recovery. Idempotent."""
+        nonlocal _unhealthy, _reprobe_task
+        if _unhealthy:
+            return
+        _unhealthy = True
+        if not already_reported:
+            await _report_slot_health(ws, label, False)
+        if _reprobe_task is None:
+            _reprobe_task = asyncio.ensure_future(_reprobe())
+
+    try:
+        async with websockets.connect(ws_url, max_size=None, ping_interval=20) as ws:
+            print(f"tunnel:{label}: connected (lazy mode)", flush=True)
+            local_base = f"http://127.0.0.1:{proxy.port}"
+            async with httpx.AsyncClient() as http_client:
+                async for raw in ws:
+                    try:
+                        msg = json.loads(raw)
+                    except (ValueError, TypeError):
+                        continue
+                    if not isinstance(msg, dict):
+                        continue
+                    if msg.get("type") == "ping":
+                        continue
+                    if msg.get("type") == "add_fs_roots":
+                        # Control message: expand the filesystem proxy's allowed dirs.
+                        new_roots: list[str] = msg.get("roots") or []
+                        updated_cmd, changed = _add_fs_roots_to_cmd(proxy.cmd, new_roots)
+                        if changed:
+                            proxy.cmd = updated_cmd
+                            if proxy.is_running:
+                                proxy.kill()
+                                await proxy.ensure_running()
+                            print(
+                                f"tunnel:{label}: expanded allowed dirs → {new_roots}",
+                                flush=True,
                             )
-                            if anchor:
-                                updated_cmd, changed = _add_fs_roots_to_cmd(
-                                    proxy.cmd, [anchor]
+                        continue
+                    if msg.get("type") == "request":
+                        # Lazy spawn: bring the proxy up if it died or was idle-killed.
+                        _was_running = proxy.is_running
+                        if not proxy.is_running:
+                            await proxy.ensure_running()
+                        if not proxy.is_running:
+                            # Spawn failed — count it; escalate to unhealthy once
+                            # the slot exhausts its retry budget (a3410a9c).
+                            _spawn_failures += 1
+                            if _spawn_failures > _WATCHDOG_MAX_RETRIES:
+                                await _mark_unhealthy()
+                            # Return 503 so the server doesn't time out.
+                            req_id = msg.get("id")
+                            err = json.dumps({"error": "local proxy not available"}).encode()
+                            await ws.send(json.dumps({
+                                "type": "response",
+                                "id": req_id,
+                                "status": 503,
+                                "headers": {"content-type": "application/json"},
+                                "body": base64.b64encode(err).decode(),
+                            }))
+                            continue
+                        _spawn_failures = 0
+                        # Pre-flight the proxy once, the first time we bring it up.
+                        if not _preflight_done and not _was_running:
+                            _preflight_done = True
+                            if not await _preflight_slot(ws, proxy.port, label):
+                                # _preflight_slot already reported unhealthy; just
+                                # start the background re-probe.
+                                await _mark_unhealthy(already_reported=True)
+                        proxy.touch()
+                        resp = await _relay_request(
+                            http_client, local_base, msg, tool_prefix=tool_prefix
+                        )
+                        # Auto-add: if access was denied and the path falls under
+                        # a known repo_path, silently expand and retry once (b9d1b606).
+                        denied_path = _extract_denied_path(resp)
+                        if denied_path and _known:
+                            try:
+                                dp = Path(denied_path).resolve()
+                            except Exception:
+                                dp = None
+                            if dp is not None:
+                                anchor = next(
+                                    (
+                                        r for r in _known
+                                        if _is_subpath(dp, Path(r))
+                                    ),
+                                    None,
                                 )
-                                if changed:
-                                    proxy.cmd = updated_cmd
-                                    proxy.kill()
-                                    await proxy.ensure_running()
-                                    if proxy.is_running:
-                                        print(
-                                            f"tunnel:{label}: auto-added {anchor!r} "
-                                            f"(denied: {denied_path!r})",
-                                            flush=True,
-                                        )
-                                        resp = await _relay_request(
-                                            http_client, local_base, msg,
-                                            tool_prefix=tool_prefix,
-                                        )
-                    await ws.send(json.dumps(resp))
+                                if anchor:
+                                    updated_cmd, changed = _add_fs_roots_to_cmd(
+                                        proxy.cmd, [anchor]
+                                    )
+                                    if changed:
+                                        proxy.cmd = updated_cmd
+                                        proxy.kill()
+                                        await proxy.ensure_running()
+                                        if proxy.is_running:
+                                            print(
+                                                f"tunnel:{label}: auto-added {anchor!r} "
+                                                f"(denied: {denied_path!r})",
+                                                flush=True,
+                                            )
+                                            resp = await _relay_request(
+                                                http_client, local_base, msg,
+                                                tool_prefix=tool_prefix,
+                                            )
+                        await ws.send(json.dumps(resp))
+    finally:
+        # Stop the background re-probe when the connection closes so it doesn't
+        # outlive the WebSocket it reports on (a3410a9c).
+        if _reprobe_task is not None:
+            _reprobe_task.cancel()
 
 
 async def _reconnect_loop_lazy(
@@ -405,69 +463,108 @@ async def _run_extract_pool_connection(
     import websockets
 
     # d71ba2e7 — one pre-flight per connection after the first daemon spawn.
+    # a3410a9c — escalate a dead extract slot to unhealthy and background-reprobe.
     _preflight_done = False
+    _unhealthy = False
+    _reprobe_task: "asyncio.Task | None" = None
 
-    async with websockets.connect(ws_url, max_size=None, ping_interval=20) as ws:
-        print(f"tunnel:{label}: connected (Serena daemon pool)", flush=True)
-        async with httpx.AsyncClient() as http_client:
-            async for raw in ws:
-                try:
-                    msg = json.loads(raw)
-                except (ValueError, TypeError):
-                    continue
-                if not isinstance(msg, dict):
-                    continue
-                if msg.get("type") == "ping":
-                    continue
-                if msg.get("type") == "set_active_repo":
-                    new_path = str(msg.get("repo_path") or "").strip()
-                    if new_path:
-                        pool.default_repo_path = pool._normalize(new_path)
-                        print(
-                            f"tunnel:extract: active repo → {pool.default_repo_path}",
-                            flush=True,
-                        )
-                    continue
-                if msg.get("type") != "request":
-                    continue
-                req_id = msg.get("id")
-                repo_path = _serena_pool.resolve_repo_path(
-                    msg.get("headers") or {}, pool.default_repo_path or default_repo_path
-                )
-                daemon = None
-                try:
-                    daemon = pool.get_or_spawn(repo_path)
-                except Exception as exc:  # noqa: BLE001 — spawn failure → 503
+    async def _reprobe(ws) -> None:
+        """Retry spawning the default-repo daemon every _SLOT_REPROBE_INTERVAL;
+        re-advertise the extract slot once one comes up healthy. (a3410a9c)"""
+        nonlocal _unhealthy, _reprobe_task
+        target = pool.default_repo_path or default_repo_path
+        while True:
+            await asyncio.sleep(_SLOT_REPROBE_INTERVAL)
+            try:
+                d = pool.get_or_spawn(target)
+                if d is not None and d.is_alive and await _probe_slot_health(d.port, attempts=1):
+                    _unhealthy = False
+                    _reprobe_task = None
+                    await _report_slot_health(ws, label, True)
                     print(
-                        f"tunnel:{label}: failed to start Serena for {repo_path}: {exc}",
-                        file=sys.stderr, flush=True,
+                        f"tunnel:{label}: slot recovered — re-advertising tools",
+                        flush=True,
                     )
-                if daemon is None or not daemon.is_alive:
-                    # First-spawn failure → report the slot unhealthy so the
-                    # server stops advertising extractor tools (d71ba2e7).
+                    return
+            except Exception:  # noqa: BLE001 — keep retrying until cancelled
+                pass
+
+    async def _mark_unhealthy(ws, *, already_reported: bool = False) -> None:
+        nonlocal _unhealthy, _reprobe_task
+        if _unhealthy:
+            return
+        _unhealthy = True
+        if not already_reported:
+            await _report_slot_health(ws, label, False)
+        if _reprobe_task is None:
+            _reprobe_task = asyncio.ensure_future(_reprobe(ws))
+
+    try:
+        async with websockets.connect(ws_url, max_size=None, ping_interval=20) as ws:
+            print(f"tunnel:{label}: connected (Serena daemon pool)", flush=True)
+            async with httpx.AsyncClient() as http_client:
+                async for raw in ws:
+                    try:
+                        msg = json.loads(raw)
+                    except (ValueError, TypeError):
+                        continue
+                    if not isinstance(msg, dict):
+                        continue
+                    if msg.get("type") == "ping":
+                        continue
+                    if msg.get("type") == "set_active_repo":
+                        new_path = str(msg.get("repo_path") or "").strip()
+                        if new_path:
+                            pool.default_repo_path = pool._normalize(new_path)
+                            print(
+                                f"tunnel:extract: active repo → {pool.default_repo_path}",
+                                flush=True,
+                            )
+                        continue
+                    if msg.get("type") != "request":
+                        continue
+                    req_id = msg.get("id")
+                    repo_path = _serena_pool.resolve_repo_path(
+                        msg.get("headers") or {}, pool.default_repo_path or default_repo_path
+                    )
+                    daemon = None
+                    try:
+                        daemon = pool.get_or_spawn(repo_path)
+                    except Exception as exc:  # noqa: BLE001 — spawn failure → 503
+                        print(
+                            f"tunnel:{label}: failed to start Serena for {repo_path}: {exc}",
+                            file=sys.stderr, flush=True,
+                        )
+                    if daemon is None or not daemon.is_alive:
+                        # First-spawn failure → mark unhealthy (suppress tools)
+                        # and start the background re-probe (d71ba2e7 + a3410a9c).
+                        if not _preflight_done:
+                            _preflight_done = True
+                            await _mark_unhealthy(ws)
+                        err = json.dumps(
+                            {"error": f"Serena daemon for {repo_path} not available"}
+                        ).encode()
+                        await ws.send(json.dumps({
+                            "type": "response",
+                            "id": req_id,
+                            "status": 503,
+                            "headers": {"content-type": "application/json"},
+                            "body": base64.b64encode(err).decode(),
+                        }))
+                        continue
+                    # First successful daemon — pre-flight its MCP port once.
                     if not _preflight_done:
                         _preflight_done = True
-                        await _report_slot_health(ws, label, False)
-                    err = json.dumps(
-                        {"error": f"Serena daemon for {repo_path} not available"}
-                    ).encode()
-                    await ws.send(json.dumps({
-                        "type": "response",
-                        "id": req_id,
-                        "status": 503,
-                        "headers": {"content-type": "application/json"},
-                        "body": base64.b64encode(err).decode(),
-                    }))
-                    continue
-                # First successful daemon — pre-flight its MCP port once.
-                if not _preflight_done:
-                    _preflight_done = True
-                    await _preflight_slot(ws, daemon.port, label)
-                resp = await _relay_request(
-                    http_client, f"http://127.0.0.1:{daemon.port}", msg,
-                    tool_prefix=tool_prefix,
-                )
-                await ws.send(json.dumps(resp))
+                        if not await _preflight_slot(ws, daemon.port, label):
+                            await _mark_unhealthy(ws, already_reported=True)
+                    resp = await _relay_request(
+                        http_client, f"http://127.0.0.1:{daemon.port}", msg,
+                        tool_prefix=tool_prefix,
+                    )
+                    await ws.send(json.dumps(resp))
+    finally:
+        if _reprobe_task is not None:
+            _reprobe_task.cancel()
 
 
 async def _reconnect_loop_extract_pool(
