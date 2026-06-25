@@ -1054,6 +1054,17 @@ def _suggest_files_for_title(title: str) -> list[str]:
     return suggested
 
 
+def _infer_touches_resources(title: str) -> list[str]:
+    """07bdfdbb — auto-populate touches_resources from a sprint item's title when
+    none is supplied, so the item isn't left undeclared (and thus forced into its
+    own sequential group — see de730a25). Reuses the :func:`_suggest_files_for_title`
+    keyword rules. Each guess is prefixed ``inferred:`` so it's distinguishable
+    from an explicit declaration and can be overridden, while still normalizing to
+    the same id for conflict detection.
+    """
+    return [f"inferred:file:{path}" for path in _suggest_files_for_title(title or "")]
+
+
 async def _unclaimed_file_warnings(
     db: Any,
     session_id: str,
@@ -2127,6 +2138,12 @@ async def _handle_sprint_tools(
                         pass
         except Exception:
             pass
+        # 07bdfdbb — auto-infer touches_resources from the title when the caller
+        # supplied none, so the item can parallelize instead of falling into its
+        # own sequential undeclared group (de730a25).
+        _touches = args.get("touches_resources")
+        if not _touches:
+            _touches = _infer_touches_resources(args.get("title") or "") or None
         try:
             _new_item = await db_module.add_sprint_item(
                 db, args["project_id"], args["version"], args["title"],
@@ -2135,7 +2152,7 @@ async def _handle_sprint_tools(
                 depends_on=args.get("depends_on"),
                 failure_mode=args.get("failure_mode"),
                 milestone_type=args.get("milestone_type", "task"),
-                touches_resources=args.get("touches_resources"),
+                touches_resources=_touches,
                 force=bool(args.get("force", False)),
             )
         except ValueError as exc:
@@ -2158,11 +2175,19 @@ async def _handle_sprint_tools(
         items = args.get("items")
         if not isinstance(items, list) or not items:
             return {"error": "items must be a non-empty list of {title, ...} dicts"}
+        _enriched: list[dict] = []
         for spec in items:
             validate_input_size(spec.get("title"), "sprint item title", 500)
             validate_input_size(spec.get("description"), "sprint item description", 10_000)
+            # 07bdfdbb — auto-infer per-item touches_resources when none supplied,
+            # so a fanned-out batch doesn't become an all-undeclared pile-up.
+            if isinstance(spec, dict) and not spec.get("touches_resources"):
+                _inf = _infer_touches_resources(spec.get("title") or "")
+                if _inf:
+                    spec = {**spec, "touches_resources": _inf}
+            _enriched.append(spec)
         ids = await db_module.fan_out_sprint_items(
-            db, args["project_id"], items
+            db, args["project_id"], _enriched
         )
         return {"item_ids": ids, "count": len(ids)}
     if name == "update_sprint_item":
@@ -2274,9 +2299,20 @@ async def _handle_sprint_tools(
         return _items
     if name == "get_parallelizable_groups":
         # 255096d9 — cluster pending items safe to fan out simultaneously.
-        return await db_module.get_parallelizable_groups(
+        _grp = await db_module.get_parallelizable_groups(
             db, args["project_id"], version=args.get("version")
         )
+        # de730a25 — flag undeclared items prominently. They each run in their own
+        # sequential group now, but the orchestrator should know parallel safety
+        # couldn't be proven for them.
+        _und = _grp.get("undeclared_count", 0)
+        if _und:
+            _grp["warning"] = (
+                f"{_und} item(s) lack resource declarations — parallel safety not "
+                "guaranteed; each is scheduled in its own sequential group. Add "
+                "touches_resources to let them parallelize."
+            )
+        return _grp
     if name == "claim_sprint_item":
         # ITEM 3 — protect installer scripts: refuse to claim a sprint item whose
         # touches_files includes hooks.ps1 / hooks.sh unless force=true is passed.
@@ -2354,7 +2390,38 @@ async def _handle_sprint_tools(
                         }
                 except Exception:  # noqa: BLE001
                     pass
-            raise
+            # df573218 — claim race: another session grabbed this item between
+            # planning and claiming. Instead of crashing the worker with a hard
+            # error, point it at the next claimable item so it can keep going.
+            _next_item = None
+            try:
+                _grp = await db_module.get_parallelizable_groups(
+                    db, args["project_id"], version=_stale_item.get("version") if _stale_item else None
+                )
+                for _group in _grp.get("groups", []):
+                    for _cand in _group:
+                        if _cand.get("id") != args["item_id"]:
+                            _next_item = _cand
+                            break
+                    if _next_item is not None:
+                        break
+            except Exception:  # noqa: BLE001
+                pass
+            return {
+                "status": "already_claimed",
+                "item_id": args["item_id"],
+                "current_status": (_stale_item or {}).get("status"),
+                "next_available_id": (_next_item or {}).get("id"),
+                "next_available_title": (_next_item or {}).get("title"),
+                "message": (
+                    "Item was already claimed by another session. "
+                    + (
+                        f"Claim next_available_id ({(_next_item or {}).get('id')}) instead."
+                        if _next_item else
+                        "No other claimable items remain in this version."
+                    )
+                ),
+            }
         if item is None:
             raise ValueError("sprint item not found")
 

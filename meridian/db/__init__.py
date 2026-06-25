@@ -5634,8 +5634,16 @@ def parse_resource_identifier(identifier: str) -> tuple[str, str]:
     against :data:`RESOURCE_TYPES`; the value keeps any further colons intact so
     ``"route:POST:/x"`` parses to ``("route", "POST:/x")``. Raises ``ValueError``
     for a missing/unknown type or an empty value.
+
+    07bdfdbb — a leading ``inferred:`` provenance marker (used for
+    auto-populated touches_resources) is stripped before type parsing, so an
+    inferred resource canonicalizes to the SAME id as an explicit one and still
+    participates in conflict detection. The marker only survives in the raw
+    stored value, where it flags the resource as a guess that can be overridden.
     """
     text = (identifier or "").strip()
+    if text.lower().startswith("inferred:"):
+        text = text[len("inferred:"):].strip()
     if ":" not in text:
         raise ValueError(
             f"invalid resource identifier {identifier!r}: expected '<type>:<value>'"
@@ -5733,10 +5741,18 @@ def serialize_touches_resources(raw: Any) -> str | None:
         candidate = str(value or "").strip()
         if not candidate:
             continue
-        norm = normalize_resource_id(candidate)  # raises on bad input
+        # 07bdfdbb — preserve an `inferred:` provenance marker in storage so the
+        # guess stays distinguishable/overridable, while deduping + comparing on
+        # the underlying canonical id (normalize_resource_id strips the marker).
+        marker = ""
+        body = candidate
+        if candidate.lower().startswith("inferred:"):
+            marker = "inferred:"
+            body = candidate[len("inferred:"):].strip()
+        norm = normalize_resource_id(body)  # raises on bad input
         if norm not in seen:
             seen.add(norm)
-            normalized.append(norm)
+            normalized.append(marker + norm)
     return json.dumps(normalized) if normalized else None
 
 
@@ -5975,7 +5991,19 @@ async def get_parallelizable_groups(
     claimable_statuses = {"pending", "todo"}
     eligible: list[dict[str, Any]] = []
     blocked: list[dict[str, Any]] = []
+    # df573218 — surface currently-claimed work so an orchestrator sees the live
+    # parallelism state (and knows an item it planned was grabbed by another).
+    running: list[dict[str, Any]] = []
     for it in items:
+        if it.get("status") == "in_progress" or (
+            (it.get("status") or "pending") in claimable_statuses and it.get("claimed_at")
+        ):
+            running.append({
+                "id": it["id"],
+                "title": it.get("title", ""),
+                "status": it.get("status"),
+                "claimed_at": it.get("claimed_at"),
+            })
         if (it.get("status") or "pending") not in claimable_statuses:
             continue
         if it.get("claimed_at"):
@@ -6000,14 +6028,21 @@ async def get_parallelizable_groups(
         eligible.append(enriched)
     # Stable order: oldest first, then id, so coloring is deterministic.
     eligible.sort(key=lambda it: (str(it.get("added_at") or ""), it["id"]))
-    # Greedy first-fit graph coloring on the resource-conflict graph.
+    # de730a25 — separate declared from undeclared items. An item with no
+    # touches_resources is disjoint with everything, so the old single-pass
+    # coloring dropped it into group 0 next to declared items and they fanned
+    # out together — unsafe, because an undeclared item may genuinely conflict
+    # with anything. Now: color-graph only the DECLARED items into safe parallel
+    # groups, then give each UNDECLARED item its own singleton group so they run
+    # sequentially (parallel safety can't be proven for them).
+    declared = [it for it in eligible if it["resources"]]
+    undeclared_items = [it for it in eligible if not it["resources"]]
+    undeclared = len(undeclared_items)
+    # Greedy first-fit graph coloring on the declared items' conflict graph.
     groups: list[list[dict[str, Any]]] = []
     group_resource_sets: list[set[str]] = []
-    undeclared = 0
-    for it in eligible:
+    for it in declared:
         res = set(it["resources"])
-        if not res:
-            undeclared += 1
         placed = False
         for gi, used in enumerate(group_resource_sets):
             if res.isdisjoint(used):
@@ -6018,6 +6053,9 @@ async def get_parallelizable_groups(
         if not placed:
             groups.append([it])
             group_resource_sets.append(set(res))
+    # Each undeclared item is its own sequential group (never co-scheduled).
+    for it in undeclared_items:
+        groups.append([it])
     return {
         "version": version,
         "groups": groups,
@@ -6025,6 +6063,7 @@ async def get_parallelizable_groups(
         "eligible_count": len(eligible),
         "undeclared_count": undeclared,
         "blocked": blocked,
+        "running": running,  # df573218 — items currently in flight
     }
 
 

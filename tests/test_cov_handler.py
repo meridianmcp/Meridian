@@ -970,6 +970,90 @@ def test_start_session_composite():
         _run(db.close())
 
 
+def test_add_sprint_item_auto_infers_touches_resources():
+    """07bdfdbb — a title with no explicit resources gets inferred ones."""
+    db = _make_db()
+    try:
+        proj = _run(mh._dispatch_mcp_tool("create_project", {"name": "infer1"}, db, "/tmp"))
+        out = _run(mh._dispatch_mcp_tool(
+            "add_sprint_item",
+            {"project_id": proj["id"], "version": "v1", "title": "fix server oauth route"},
+            db, "/tmp",
+        ))
+        tr = out.get("touches_resources")
+        if isinstance(tr, str):
+            tr = json.loads(tr)
+        assert "inferred:file:meridian/server.py" in tr
+    finally:
+        _run(db.close())
+
+
+def test_add_sprint_item_explicit_resources_not_inferred():
+    """Explicit touches_resources are kept verbatim — no inference applied."""
+    db = _make_db()
+    try:
+        proj = _run(mh._dispatch_mcp_tool("create_project", {"name": "infer2"}, db, "/tmp"))
+        out = _run(mh._dispatch_mcp_tool(
+            "add_sprint_item",
+            {"project_id": proj["id"], "version": "v1", "title": "fix server route",
+             "touches_resources": ["file:custom.py"]},
+            db, "/tmp",
+        ))
+        tr = out.get("touches_resources")
+        if isinstance(tr, str):
+            tr = json.loads(tr)
+        assert tr == ["file:custom.py"]
+    finally:
+        _run(db.close())
+
+
+def test_add_sprint_item_no_keyword_match_stays_undeclared():
+    """A title that matches no hotspot keyword gets no inferred resources."""
+    db = _make_db()
+    try:
+        proj = _run(mh._dispatch_mcp_tool("create_project", {"name": "infer4"}, db, "/tmp"))
+        out = _run(mh._dispatch_mcp_tool(
+            "add_sprint_item",
+            {"project_id": proj["id"], "version": "v1", "title": "zzz qqq wibble"},
+            db, "/tmp",
+        ))
+        tr = out.get("touches_resources")
+        if isinstance(tr, str) and tr:
+            tr = json.loads(tr)
+        assert not tr
+    finally:
+        _run(db.close())
+
+
+def test_fan_out_sprint_items_auto_infers_per_item():
+    """07bdfdbb — fan-out infers resources per item from each title."""
+    db = _make_db()
+    try:
+        proj = _run(mh._dispatch_mcp_tool("create_project", {"name": "infer3"}, db, "/tmp"))
+        out = _run(mh._dispatch_mcp_tool(
+            "fan_out_sprint_items",
+            {"project_id": proj["id"], "items": [
+                {"title": "update dashboard tab", "version": "v1"},
+                {"title": "fix db migration query", "version": "v1"},
+            ]},
+            db, "/tmp",
+        ))
+        assert out["count"] == 2
+        items = _run(mh._dispatch_mcp_tool(
+            "get_sprint_items", {"project_id": proj["id"]}, db, "/tmp",
+        ))
+        all_tr: list[str] = []
+        for it in items:
+            tr = it.get("touches_resources")
+            if isinstance(tr, str) and tr:
+                tr = json.loads(tr)
+            all_tr.extend(tr or [])
+        assert "inferred:file:meridian/static/dashboard.js" in all_tr
+        assert "inferred:file:meridian/db/__init__.py" in all_tr
+    finally:
+        _run(db.close())
+
+
 def test_set_sprint_unstarted_warning():
     db = _make_db()
     try:
@@ -990,6 +1074,62 @@ def test_set_sprint_unstarted_warning():
             "set_sprint", {"project_id": pid, "sprint": "Sprint 2", "force": True}, db, "/tmp",
         ))
         assert "sprint_not_updated" not in forced
+    finally:
+        _run(db.close())
+
+
+def test_claim_sprint_item_race_returns_already_claimed():
+    """df573218 — claiming an item another session already grabbed returns a
+    structured already_claimed response pointing at the next item, not a crash."""
+    db = _make_db()
+    try:
+        proj = _run(mh._dispatch_mcp_tool("create_project", {"name": "race"}, db, "/tmp"))
+        pid = proj["id"]
+        a = _run(mh._dispatch_mcp_tool(
+            "add_sprint_item",
+            {"project_id": pid, "version": "v1", "title": "a", "touches_resources": ["file:a.py"]},
+            db, "/tmp",
+        ))
+        b = _run(mh._dispatch_mcp_tool(
+            "add_sprint_item",
+            {"project_id": pid, "version": "v1", "title": "b", "touches_resources": ["file:b.py"]},
+            db, "/tmp",
+        ))
+        # First claim succeeds.
+        first = _run(mh._dispatch_mcp_tool(
+            "claim_sprint_item", {"project_id": pid, "item_id": a["id"]}, db, "/tmp",
+        ))
+        assert first.get("status") == "in_progress"
+        # Second claim of the SAME item → already_claimed + points at b.
+        out = _run(mh._dispatch_mcp_tool(
+            "claim_sprint_item", {"project_id": pid, "item_id": a["id"]}, db, "/tmp",
+        ))
+        assert out["status"] == "already_claimed"
+        assert out["current_status"] == "in_progress"
+        assert out["next_available_id"] == b["id"]
+    finally:
+        _run(db.close())
+
+
+def test_claim_sprint_item_race_no_next_item():
+    """When the raced item is the only one, next_available_id is None."""
+    db = _make_db()
+    try:
+        proj = _run(mh._dispatch_mcp_tool("create_project", {"name": "race2"}, db, "/tmp"))
+        pid = proj["id"]
+        a = _run(mh._dispatch_mcp_tool(
+            "add_sprint_item",
+            {"project_id": pid, "version": "v1", "title": "only", "touches_resources": ["file:a.py"]},
+            db, "/tmp",
+        ))
+        _run(mh._dispatch_mcp_tool(
+            "claim_sprint_item", {"project_id": pid, "item_id": a["id"]}, db, "/tmp",
+        ))
+        out = _run(mh._dispatch_mcp_tool(
+            "claim_sprint_item", {"project_id": pid, "item_id": a["id"]}, db, "/tmp",
+        ))
+        assert out["status"] == "already_claimed"
+        assert out["next_available_id"] is None
     finally:
         _run(db.close())
 

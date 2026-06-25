@@ -301,8 +301,28 @@ async def test_parallelizable_groups_undeclared_count(db):
     await db_module.add_sprint_item(db, p["id"], "v1", "y")  # no resources
     res = await db_module.get_parallelizable_groups(db, p["id"], version="v1")
     assert res["undeclared_count"] == 2
-    # Undeclared items conflict with nothing → all in one batch
-    assert res["group_count"] == 1
+    # de730a25 — undeclared items can't be proven conflict-free, so each gets its
+    # own sequential group instead of being co-scheduled in group 0.
+    assert res["group_count"] == 2
+    assert all(len(g) == 1 for g in res["groups"])
+
+
+@pytest.mark.asyncio
+async def test_parallelizable_groups_undeclared_isolated_from_declared(db):
+    """de730a25 — an undeclared item never shares a group with declared items."""
+    p = await db_module.create_project(db, "alpha")
+    await db_module.add_sprint_item(db, p["id"], "v1", "a", touches_resources=["file:a.py"])
+    await db_module.add_sprint_item(db, p["id"], "v1", "b", touches_resources=["file:b.py"])
+    await db_module.add_sprint_item(db, p["id"], "v1", "u")  # undeclared
+    res = await db_module.get_parallelizable_groups(db, p["id"], version="v1")
+    assert res["undeclared_count"] == 1
+    # Declared a + b (disjoint) share one parallel group; the undeclared item is
+    # alone in its own group → 2 groups total.
+    assert res["group_count"] == 2
+    declared_group = next(g for g in res["groups"] if len(g) == 2)
+    assert {it["title"] for it in declared_group} == {"a", "b"}
+    undeclared_group = next(g for g in res["groups"] if len(g) == 1)
+    assert undeclared_group[0]["title"] == "u"
 
 
 @pytest.mark.asyncio
@@ -383,3 +403,90 @@ async def test_parallelizable_groups_via_mcp_handler(db):
     )
     assert res["group_count"] == 1
     assert res["eligible_count"] == 1
+    # No undeclared items → no warning.
+    assert "warning" not in res
+
+
+@pytest.mark.asyncio
+async def test_parallelizable_groups_mcp_handler_warns_on_undeclared(db):
+    """de730a25 — the MCP tool surfaces a warning when items lack declarations."""
+    from meridian import server as srv
+    p = await db_module.create_project(db, "alpha")
+    await db_module.add_sprint_item(db, p["id"], "v1", "u")  # undeclared
+    res = await srv._dispatch_mcp_tool(
+        "get_parallelizable_groups", {"project_id": p["id"], "version": "v1"}, db, "/tmp",
+    )
+    assert res["undeclared_count"] == 1
+    assert "warning" in res
+    assert "resource declarations" in res["warning"]
+
+
+@pytest.mark.asyncio
+async def test_parallelizable_groups_running_field(db):
+    """df573218 — in-flight (claimed) items surface under 'running'."""
+    p = await db_module.create_project(db, "running1")
+    a = await db_module.add_sprint_item(db, p["id"], "v1", "a", touches_resources=["file:a.py"])
+    await db_module.add_sprint_item(db, p["id"], "v1", "b", touches_resources=["file:b.py"])
+    await db_module.claim_sprint_item(db, p["id"], a["id"])
+    res = await db_module.get_parallelizable_groups(db, p["id"], version="v1")
+    running_ids = {r["id"] for r in res["running"]}
+    assert a["id"] in running_ids
+    # a is in flight → only b remains claimable.
+    assert res["eligible_count"] == 1
+
+
+def test_normalize_resource_id_strips_inferred_marker():
+    # 07bdfdbb — inferred resources canonicalize the same as explicit ones.
+    assert db_module.normalize_resource_id(
+        "inferred:file:meridian/server.py"
+    ) == "file:meridian/server.py"
+    assert db_module.normalize_resource_id(
+        "file:meridian/server.py"
+    ) == "file:meridian/server.py"
+
+
+def test_serialize_touches_resources_preserves_inferred_marker():
+    out = db_module.serialize_touches_resources(["inferred:file:a.py"])
+    assert json.loads(out) == ["inferred:file:a.py"]
+    # Explicit resources are stored without a marker.
+    out2 = db_module.serialize_touches_resources(["file:a.py"])
+    assert json.loads(out2) == ["file:a.py"]
+
+
+def test_parse_touches_resources_strips_inferred_for_comparison():
+    # Stored marker is dropped for the conflict-comparison id.
+    assert db_module.parse_touches_resources(["inferred:file:a.py"]) == ["file:a.py"]
+
+
+@pytest.mark.asyncio
+async def test_inferred_resource_conflicts_with_explicit(db):
+    """07bdfdbb — an inferred resource collides with an explicit one for the same
+    file, so the two items are serialized into different groups."""
+    p = await db_module.create_project(db, "infconf")
+    await db_module.add_sprint_item(
+        db, p["id"], "v1", "a", touches_resources=["file:meridian/server.py"]
+    )
+    await db_module.add_sprint_item(
+        db, p["id"], "v1", "b", touches_resources=["inferred:file:meridian/server.py"]
+    )
+    res = await db_module.get_parallelizable_groups(db, p["id"], version="v1")
+    assert res["undeclared_count"] == 0  # both have resources
+    assert res["group_count"] == 2       # same file → can't co-schedule
+
+
+@pytest.mark.asyncio
+async def test_orchestration_hint_surfaces_undeclared_warning(db, tmp_path):
+    """de730a25 — start_session's orchestration hint flags undeclared items."""
+    import meridian.server as srv
+    p = await db_module.create_project(db, "orch-undeclared")
+    pid = p["id"]
+    await db_module.add_sprint_item(db, pid, "v0.1.x", "declared",
+                                    touches_resources=["file:a.py"])
+    await db_module.add_sprint_item(db, pid, "v0.1.x", "undeclared-one")
+    payload = await srv._start_session_composite(
+        db, pid, "orch-und-sess", str(tmp_path), version="v0.1.x", compact=True,
+    )
+    orch = payload["orchestration"]
+    assert orch["undeclared_count"] == 1
+    assert "warning" in orch
+    assert "parallel safety" in orch["warning"]

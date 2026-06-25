@@ -3617,10 +3617,24 @@ async def _build_orchestration_hint(
     blocked = grouping.get("blocked") or []
     if blocked:
         hint["blocked_count"] = len(blocked)
+    # de730a25 — surface undeclared items prominently. They now each run in their
+    # own sequential group (not co-scheduled), but the orchestrator should know
+    # parallel safety couldn't be proven for them.
+    undeclared = grouping.get("undeclared_count", 0)
+    _warn = ""
+    if undeclared:
+        hint["undeclared_count"] = undeclared
+        hint["warning"] = (
+            f"{undeclared} item(s) lack resource declarations — parallel safety "
+            "not guaranteed; each runs in its own sequential group. Add "
+            "touches_resources to let them parallelize."
+        )
+        _warn = f" ⚠ {hint['warning']}"
     hint["note"] = (
         f"{grouping.get('eligible_count', 0)} pending item(s) cluster into "
         f"{group_count} conflict-free group(s); recommended strategy: "
         f"{strategy}. Call get_parallelizable_groups(project_id) for full detail."
+        + _warn
     )
     return hint
 
