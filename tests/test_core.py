@@ -13808,9 +13808,10 @@ async def test_start_session_orchestration_sequential_single_item(db, tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_start_session_orchestration_parallel_multiple_groups(db, tmp_path):
-    """Two items touching the SAME file split into two groups → group_count>1,
-    so per the strategy rule the orchestrator can still wave them: 'parallel'."""
+async def test_start_session_orchestration_sequential_conflicting_items(db, tmp_path):
+    """Two items touching the SAME file split into two single-item groups. They
+    conflict, so no two items can run at once → recommended_strategy 'sequential'
+    even though group_count > 1 (multiple singletons ≠ parallel)."""
     import meridian.server as srv
 
     p = await db_module.create_project(db, "orch-multigroup")
@@ -13827,7 +13828,7 @@ async def test_start_session_orchestration_parallel_multiple_groups(db, tmp_path
     )
     orch = payload["orchestration"]
     assert orch["group_count"] == 2
-    assert orch["recommended_strategy"] == "parallel"
+    assert orch["recommended_strategy"] == "sequential"
 
 
 @pytest.mark.asyncio

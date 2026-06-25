@@ -3583,20 +3583,24 @@ async def _build_orchestration_hint(
     ``orchestration`` block so a fresh session sees the recommended fan-out plan
     without calling ``get_parallelizable_groups`` manually.
 
-    ``recommended_strategy`` is ``"parallel"`` when there is more than one group
-    OR any single group holds more than one item (i.e. work can run concurrently),
-    else ``"sequential"``. Groups are returned in a compact form (id + title per
-    item) to avoid bloating the orientation. Returns ``None`` when there is no
-    eligible work to plan. NEVER raises — the caller wraps in try/except, and on
-    any failure start_session simply ships no hint.
+    ``recommended_strategy`` is ``"parallel"`` only when at least one group holds
+    more than one item (i.e. two or more items can genuinely run concurrently),
+    else ``"sequential"``. Note many single-item groups (group_count > 1) means
+    every item conflicts with the others and they must be serialized — that is
+    ``"sequential"``, not parallel. Groups are returned in a compact form (id +
+    title per item) to avoid bloating the orientation. Returns ``None`` when there
+    is no eligible work to plan. NEVER raises — the caller wraps in try/except, and
+    on any failure start_session simply ships no hint.
     """
     grouping = await db_module.get_parallelizable_groups(db, project_id, version)
     groups = grouping.get("groups") or []
     if not groups:
         return None
     group_count = grouping.get("group_count", len(groups))
+    # "parallel" only when some group can actually run >1 item at once. Multiple
+    # single-item groups are mutually-conflicting work → sequential.
     any_multi = any(len(g) > 1 for g in groups)
-    strategy = "parallel" if (group_count > 1 or any_multi) else "sequential"
+    strategy = "parallel" if any_multi else "sequential"
     compact_groups = [
         [
             {"id": it.get("id"), "title": it.get("title", "")}
