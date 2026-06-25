@@ -293,6 +293,157 @@ async def _annotate_touches_files(
     return pending_items
 
 
+# ---------------------------------------------------------------------------
+# 91ac0199 — code-pointer enrichment. When the project's codebase is indexed
+# and the `enrich_handoffs_with_code_pointers` setting is on (default True),
+# generate_handoff runs a code-graph search per pending sprint item and injects
+# {file, function, qualified_name} pointers into each item's handoff block so the
+# next executor starts with exact locations instead of discovering at runtime.
+#
+# There is no in-process code-graph: the code-intel layer is an external MCP
+# (codebase-memory-mcp) reached over a tunnel. So enrichment is driven through an
+# injectable ``graph_searcher`` callable (mirrors the ``summarizer`` seam). When
+# none is supplied, ``_resolve_graph_searcher`` returns None and enrichment
+# degrades to no pointers. Every call is wrapped so this NEVER raises out of
+# generate_handoff — breaking the mandatory handoff is unacceptable.
+# ---------------------------------------------------------------------------
+
+# Default flag value when the setting has never been written.
+_ENRICH_CODE_POINTERS_DEFAULT = True
+# Cap on items enriched per handoff — keeps a large backlog from issuing dozens
+# of graph queries on every handoff.
+_MAX_ENRICHED_ITEMS = 25
+
+
+def _code_pointers_enabled(settings: dict[str, Any] | None) -> bool:
+    """Return whether code-pointer enrichment is on for this project.
+
+    The flag lives in the per-project ``executor_config`` JSON blob (no schema
+    migration needed). Absent / unset ⇒ default True. Any explicit falsey value
+    turns it off.
+    """
+    if not settings:
+        return _ENRICH_CODE_POINTERS_DEFAULT
+    cfg = settings.get("executor_config") or {}
+    if not isinstance(cfg, dict) or "enrich_handoffs_with_code_pointers" not in cfg:
+        return _ENRICH_CODE_POINTERS_DEFAULT
+    return bool(cfg.get("enrich_handoffs_with_code_pointers"))
+
+
+def _resolve_graph_searcher(
+    project_id: str,
+) -> Callable[[str], Any] | None:
+    """Return a code-graph search callable for ``project_id`` or None.
+
+    The default implementation returns None because the code-graph lives in an
+    out-of-process MCP that is not callable synchronously from here. The seam
+    exists so deployments that *do* have an in-process searcher (and tests) can
+    inject one via the ``graph_searcher`` argument to ``generate_handoff``.
+    """
+    return None
+
+
+def _coerce_match_list(result: Any) -> list[Any]:
+    """Normalise a graph-search result into a list of match dicts."""
+    if result is None:
+        return []
+    if isinstance(result, list):
+        return result
+    if isinstance(result, dict):
+        for key in ("results", "matches", "nodes", "hits", "items"):
+            val = result.get(key)
+            if isinstance(val, list):
+                return val
+        # A single match dict (file/name keys) is itself one result.
+        return [result]
+    return []
+
+
+def _normalize_code_pointer(match: Any) -> dict[str, str] | None:
+    """Coerce a single graph-search match into a {file, function, qualified_name}
+    pointer. Returns None when the match has no usable location info."""
+    if not isinstance(match, dict):
+        return None
+    file = (
+        match.get("file")
+        or match.get("file_path")
+        or match.get("path")
+        or ""
+    )
+    function = (
+        match.get("function")
+        or match.get("name")
+        or match.get("symbol")
+        or ""
+    )
+    qualified = (
+        match.get("qualified_name")
+        or match.get("qualified")
+        or match.get("fqn")
+        or function
+    )
+    file = str(file).strip()
+    function = str(function).strip()
+    qualified = str(qualified).strip()
+    if not (file or function or qualified):
+        return None
+    return {
+        "file": file,
+        "function": function,
+        "qualified_name": qualified,
+    }
+
+
+def _code_pointer_query(title: str, kws: set[str]) -> str:
+    """Build a stable, readable graph-search query from an item title."""
+    return " ".join(
+        w for w in re.findall(r"[a-z0-9_/-]{3,}", title.lower()) if w in kws
+    ) or title.strip()
+
+
+async def _annotate_code_pointers(
+    pending_items: list[dict[str, Any]],
+    searcher: Callable[[str], Any] | None,
+) -> list[dict[str, Any]]:
+    """Attach ``code_pointers`` to pending items via a code-graph search.
+
+    For each item, build a keyword query from its title, call ``searcher``, take
+    the top match, normalise it to {file, function, qualified_name}, and store it
+    as ``item["code_pointers"]`` (a one-element list). Items with no match are
+    left untouched.
+
+    ``searcher`` may be a coroutine function or a plain callable; results may be
+    a list, a dict with a ``results``/``matches`` key, or a single match dict.
+
+    Robustness contract: this must NEVER raise. All failures degrade to no
+    pointer for that item — generate_handoff is mandatory and breaking it is
+    unacceptable.
+    """
+    if searcher is None:
+        return pending_items
+    for item in pending_items[:_MAX_ENRICHED_ITEMS]:
+        if item.get("code_pointers"):
+            continue
+        title = item.get("title") or ""
+        kws = _extract_keywords(title)
+        if not kws:
+            continue
+        query = _code_pointer_query(title, kws)
+        try:
+            result = searcher(query)
+            if hasattr(result, "__await__"):
+                result = await result  # type: ignore[misc]
+            matches = _coerce_match_list(result)
+            if not matches:
+                continue
+            pointer = _normalize_code_pointer(matches[0])
+            if pointer:
+                item["code_pointers"] = [pointer]
+        except Exception:  # noqa: BLE001 — enrichment is best-effort, never fatal
+            continue
+    return pending_items
+
+
 def resolve_handoff_mode(
     requested_mode: str | None,
     session_id: str | None = None,
@@ -707,6 +858,7 @@ async def generate_handoff(
     mode: str = "full",
     session_id: str | None = None,
     commit_messages: list[str] | None = None,
+    graph_searcher: Callable[[str], Any] | None = None,
 ) -> tuple[str, str]:
     """Fetch all state, render the L0/L1/L2 template, write the file, return both.
 
@@ -780,6 +932,23 @@ async def generate_handoff(
     pending_sprint_items = _annotate_possibly_done(pending_sprint_items, tasks, commit_messages)
     # Auto-set touches_files from recent git history for items without it.
     pending_sprint_items = await _annotate_touches_files(db, project_id, pending_sprint_items)
+    # 91ac0199 — enrich each pending item with exact code pointers when the
+    # codebase is indexed and the setting is on. Fully guarded: any failure
+    # (no settings, code intel off/unindexed, searcher raising) degrades to no
+    # pointers and never breaks the mandatory handoff.
+    try:
+        proj_settings = await db_module.get_project_settings(db, project_id)
+    except Exception:  # noqa: BLE001 — settings fetch must never break handoff
+        proj_settings = None
+    if _code_pointers_enabled(proj_settings):
+        searcher = graph_searcher or _resolve_graph_searcher(project_id)
+        if searcher is not None:
+            try:
+                pending_sprint_items = await _annotate_code_pointers(
+                    pending_sprint_items, searcher
+                )
+            except Exception:  # noqa: BLE001 — enrichment is best-effort
+                pass
     decisions_log = (project.get("decisions") or "").strip()
     now_utc = datetime.now(timezone.utc)
     generated_at = now_utc.isoformat(timespec="seconds")
