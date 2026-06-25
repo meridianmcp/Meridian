@@ -1014,6 +1014,42 @@ def test_build_proxy_for_inner_shell_for_cmd_shim_on_windows(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# 4ea1b9d5 — session_mode: persistent slots omit --stateless
+# ---------------------------------------------------------------------------
+
+def test_build_proxy_for_inner_persistent_omits_stateless():
+    cmd = tc._build_proxy_for_inner("npx", ["dc", "--serve"], 8813, stateless=False)
+    assert "--stateless" not in cmd
+    # Streamable HTTP transport is still present.
+    assert cmd[:6] == ["npx", "-y", "mcp-proxy", "--port", "8813", "--server"]
+    assert cmd[cmd.index("--") + 1:] == ["dc", "--serve"]
+
+
+def test_build_proxy_for_inner_stateless_default_true():
+    cmd = tc._build_proxy_for_inner("npx", ["x"], 8813)
+    assert "--stateless" in cmd
+
+
+def test_builtin_plugins_session_mode():
+    from meridian.tunnel_plugins import BUILTIN_PLUGINS
+    by_name = {p["name"]: p for p in BUILTIN_PLUGINS}
+    # Desktop Commander runs stateful terminal sessions → persistent.
+    assert by_name["desktop-commander"]["session_mode"] == "persistent"
+    # Everything else is stateless (one-shot tunnel relay).
+    for name in ("filesystem", "code-intel", "code-extractor", "powerpoint", "word"):
+        assert by_name[name]["session_mode"] == "stateless"
+    # Every builtin declares the field so resolve_plugins always carries it.
+    assert all("session_mode" in p for p in BUILTIN_PLUGINS)
+
+
+def test_resolve_plugins_carries_session_mode():
+    from meridian.tunnel_plugins import resolve_plugins
+    by_slot = {p["slot"]: p for p in resolve_plugins(None)}
+    assert by_slot["dc"]["session_mode"] == "persistent"
+    assert by_slot["fs"]["session_mode"] == "stateless"
+
+
+# ---------------------------------------------------------------------------
 # Windows shutdown hardening — process group + tree teardown (ff0809e1)
 # ---------------------------------------------------------------------------
 

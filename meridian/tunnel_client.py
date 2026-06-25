@@ -1163,7 +1163,7 @@ def _build_code_proxy_command(
 
 
 def _build_proxy_for_inner(
-    npx: str, inner_cmd: list[str], port: int
+    npx: str, inner_cmd: list[str], port: int, *, stateless: bool = True
 ) -> list[str]:
     """Wrap an arbitrary *inner_cmd* in mcp-proxy on *port*.
 
@@ -1176,9 +1176,15 @@ def _build_proxy_for_inner(
 
     On Windows ``--shell`` is added only when the inner launcher is a ``.cmd``/
     ``.bat`` shim (Node 24 CVE-2024-27980 mitigation), matching the other builders.
+
+    *stateless* (4ea1b9d5) — when False, ``--stateless`` is omitted so the inner
+    server keeps state across requests. Used for ``session_mode: "persistent"``
+    slots like Desktop Commander, whose terminal sessions must survive between
+    calls; ``--stateless`` would reset them on every POST.
     """
-    cmd = [npx, "-y", "mcp-proxy", "--port", str(port),
-           "--server", "stream", "--stateless"]
+    cmd = [npx, "-y", "mcp-proxy", "--port", str(port), "--server", "stream"]
+    if stateless:
+        cmd.append("--stateless")
     if sys.platform == "win32" and inner_cmd and inner_cmd[0].lower().endswith((".cmd", ".bat")):
         cmd.append("--shell")
     cmd += ["--", *inner_cmd]
@@ -1917,6 +1923,10 @@ async def run_tunnel(
     serena_pool: SerenaDaemonPool | None = None  # 64650cb4 — default-Serena extract
     office_proxies: dict[str, SlotProxy] = {}
     office_ports = {"ppt": ppt_port, "word": word_port, "dc": dc_port}
+    # 4ea1b9d5 — slots whose session_mode is "persistent" (e.g. Desktop
+    # Commander): they keep a stateful inner process, so they skip the
+    # idle-killer that would otherwise tear the session down after 30min.
+    persistent_slots: set[str] = set()
 
     if fs_plugin.get("enabled", True):
         fs_override = fs_plugin.get("command")
@@ -2011,11 +2021,17 @@ async def run_tunnel(
         spawn_env = None
         if plugin_env:
             spawn_env = {**os.environ, **{str(k): str(v) for k, v in plugin_env.items()}}
-        cmd_office = _build_proxy_for_inner(npx, list(cmd), oport)
-        print(f"  {human.lower():<16}lazy-spawn on port {oport}", flush=True)
+        # 4ea1b9d5 — persistent slots omit --stateless so their inner process
+        # keeps state across requests (DC terminal sessions).
+        _persistent = plugin.get("session_mode") == "persistent"
+        cmd_office = _build_proxy_for_inner(npx, list(cmd), oport, stateless=not _persistent)
+        mode_note = " (persistent)" if _persistent else ""
+        print(f"  {human.lower():<16}lazy-spawn on port {oport}{mode_note}", flush=True)
         op = SlotProxy(cmd_office, oport, slot, env=spawn_env)
         office_proxies[slot] = op
         slot_proxies.append(op)
+        if _persistent:
+            persistent_slots.add(slot)
 
     # 4c. Custom plugins (LOCAL-ONLY) — still eagerly spawned because they serve
     #     the local .mcp.json directly without a server relay route.
@@ -2142,7 +2158,10 @@ async def run_tunnel(
         tasks.append(asyncio.ensure_future(
             _reconnect_loop_lazy(ws_office, oproxy, slot, tool_prefix=slot_prefixes.get(slot))
         ))
-        tasks.append(asyncio.ensure_future(_idle_killer(oproxy)))
+        # 4ea1b9d5 — persistent slots keep their inner process alive; don't
+        # attach the idle-killer that would reset their session after 30min.
+        if slot not in persistent_slots:
+            tasks.append(asyncio.ensure_future(_idle_killer(oproxy)))
     # Custom plugins (eager) still use the regular reconnect + watchdog.
     for holder in proc_holders:
         tasks.append(asyncio.ensure_future(_proc_watchdog(holder)))
