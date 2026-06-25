@@ -673,6 +673,140 @@ def test_relay_request_drops_host_header():
 
 
 # ---------------------------------------------------------------------------
+# Tool-name prefixing (b4455202)
+# ---------------------------------------------------------------------------
+
+_TOOLS_LIST_JSON = {
+    "jsonrpc": "2.0",
+    "id": 1,
+    "result": {
+        "tools": [
+            {"name": "read_file", "description": "Read a file"},
+            {"name": "write_file", "description": "Write a file"},
+        ]
+    },
+}
+
+
+def test_prefix_tool_name_adds_prefix():
+    assert tc._prefix_tool_name("read_file", "Filesystem") == "Filesystem: read_file"
+
+
+def test_prefix_tool_name_never_double_prefixes():
+    once = tc._prefix_tool_name("read_file", "Filesystem")
+    assert tc._prefix_tool_name(once, "Filesystem") == "Filesystem: read_file"
+
+
+def test_prefix_tool_name_passes_non_string_through():
+    assert tc._prefix_tool_name(None, "Filesystem") is None
+    assert tc._prefix_tool_name(123, "Filesystem") == 123
+
+
+def test_apply_tool_prefix_plain_json():
+    body = json.dumps(_TOOLS_LIST_JSON).encode()
+    out = json.loads(tc._apply_tool_prefix(body, "Filesystem"))
+    names = [t["name"] for t in out["result"]["tools"]]
+    assert names == ["Filesystem: read_file", "Filesystem: write_file"]
+
+
+def test_apply_tool_prefix_sse_framed():
+    body = (
+        b"event: message\r\n"
+        + b"data: " + json.dumps(_TOOLS_LIST_JSON).encode() + b"\r\n\r\n"
+    )
+    out = tc._apply_tool_prefix(body, "Serena").decode()
+    # SSE framing (event line, CRLF, blank separator) is preserved.
+    assert out.startswith("event: message\r\n")
+    assert out.endswith("\r\n\r\n")
+    # The data payload's tool names are prefixed.
+    data_line = [ln for ln in out.splitlines() if ln.startswith("data:")][0]
+    payload = json.loads(data_line[len("data:"):].strip())
+    assert [t["name"] for t in payload["result"]["tools"]] == [
+        "Serena: read_file", "Serena: write_file"
+    ]
+
+
+def test_apply_tool_prefix_no_prefix_is_noop():
+    body = json.dumps(_TOOLS_LIST_JSON).encode()
+    assert tc._apply_tool_prefix(body, None) == body
+    assert tc._apply_tool_prefix(body, "") == body
+
+
+def test_apply_tool_prefix_leaves_non_tools_list_untouched():
+    # A tools/call result (no result.tools list) must pass through byte-for-byte.
+    body = json.dumps({
+        "jsonrpc": "2.0", "id": 2,
+        "result": {"content": [{"type": "text", "text": "hi"}]},
+    }).encode()
+    assert tc._apply_tool_prefix(body, "Filesystem") == body
+
+
+def test_apply_tool_prefix_non_json_passthrough():
+    body = b"not json at all { tools"
+    assert tc._apply_tool_prefix(body, "Filesystem") == body
+
+
+def test_apply_tool_prefix_never_double_prefixes_body():
+    body = json.dumps(_TOOLS_LIST_JSON).encode()
+    once = tc._apply_tool_prefix(body, "Filesystem")
+    twice = tc._apply_tool_prefix(once, "Filesystem")
+    names = [t["name"] for t in json.loads(twice)["result"]["tools"]]
+    assert names == ["Filesystem: read_file", "Filesystem: write_file"]
+
+
+def test_relay_request_prefixes_tools_list_and_drops_content_length():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=_TOOLS_LIST_JSON)
+
+    msg = {"type": "request", "id": "t1", "method": "POST", "path": "/mcp"}
+
+    async def _inner():
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport) as client:
+            return await tc._relay_request(
+                client, "http://127.0.0.1:8808", msg, tool_prefix="Filesystem"
+            )
+
+    resp = asyncio.run(_inner())
+    out = json.loads(base64.b64decode(resp["body"]))
+    assert [t["name"] for t in out["result"]["tools"]] == [
+        "Filesystem: read_file", "Filesystem: write_file"
+    ]
+    # Content-Length is recomputed by the server, so the stale one is dropped.
+    assert not any(k.lower() == "content-length" for k in resp["headers"])
+
+
+def test_relay_request_no_prefix_leaves_tools_unchanged():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=_TOOLS_LIST_JSON)
+
+    msg = {"type": "request", "id": "t2", "method": "POST", "path": "/mcp"}
+    resp = _relay(msg, handler)
+    out = json.loads(base64.b64decode(resp["body"]))
+    assert [t["name"] for t in out["result"]["tools"]] == ["read_file", "write_file"]
+
+
+def test_builtin_plugins_have_prefix_field():
+    from meridian.tunnel_plugins import BUILTIN_PLUGINS
+    by_name = {p["name"]: p for p in BUILTIN_PLUGINS}
+    # Generic-name slots are prefixed; self-prefixing slots are None.
+    assert by_name["filesystem"]["prefix"] == "Filesystem"
+    assert by_name["code-extractor"]["prefix"] == "Serena"
+    assert by_name["code-intel"]["prefix"] is None
+    assert by_name["powerpoint"]["prefix"] is None
+    # Every builtin declares the field (so resolve_plugins always carries it).
+    assert all("prefix" in p for p in BUILTIN_PLUGINS)
+
+
+def test_resolve_plugins_carries_prefix():
+    from meridian.tunnel_plugins import resolve_plugins
+    by_slot = {p["slot"]: p for p in resolve_plugins(None)}
+    assert by_slot["fs"]["prefix"] == "Filesystem"
+    assert by_slot["extract"]["prefix"] == "Serena"
+    assert by_slot["code"]["prefix"] is None
+
+
+# ---------------------------------------------------------------------------
 # .mcp.json auto-update (STEP 2)
 # ---------------------------------------------------------------------------
 

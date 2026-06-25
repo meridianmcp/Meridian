@@ -185,7 +185,7 @@ async def test_extract_pool_connection_routes_by_header(monkeypatch, tmp_path):
 
     captured = {}
 
-    async def fake_relay(http_client, local_base, msg):
+    async def fake_relay(http_client, local_base, msg, tool_prefix=None):
         captured["local_base"] = local_base
         return {"type": "response", "id": msg.get("id"), "status": 200, "headers": {}, "body": ""}
 
