@@ -68,12 +68,13 @@ BUILTIN_PLUGINS: list[dict[str, Any]] = [
         "core": True,
         # None → the client uses its platform-aware default builder for this slot.
         "command": None,
-        # Tool-name display prefix the proxy relay prepends to this slot's
-        # tools/list entries (e.g. "read_file" → "Filesystem__read_file") so the
-        # generic filesystem tool names are namespaced in the connector. Slots
-        # whose inner server already self-prefixes its tools leave this None to
-        # avoid double-prefixing. (b4455202)
-        "prefix": "Filesystem",
+        # Tool-name display prefix the client relay prepends to this slot's
+        # tools/list entries. MUST stay None: the server-side bridge
+        # (routes/tunnel.py list_tunnel_tools) already namespaces every slot's
+        # tools via SLOT_DISPLAY_NAMES (fs → "filesystem__read_file"). Setting a
+        # client prefix too produces double-prefixed names like
+        # "filesystem__Filesystem__read_file" in the claude.ai connector. (49905647)
+        "prefix": None,
         "description": "Filesystem MCP (@modelcontextprotocol/server-filesystem)",
         "description_overrides": {},
     },
@@ -101,9 +102,10 @@ BUILTIN_PLUGINS: list[dict[str, Any]] = [
         "core": True,
         # default: Serena (LSP symbol tools); {repo_path} expanded at spawn time.
         "command": list(SERENA_EXTRACT_COMMAND),
-        # Serena's bare tool names (find_symbol, replace_symbol_body, …) get a
-        # "Serena__" display prefix at the relay so they're namespaced. (b4455202)
-        "prefix": "Serena",
+        # MUST stay None — the server bridge namespaces extract-slot tools as
+        # "extractor__find_symbol" via SLOT_DISPLAY_NAMES. A client prefix here
+        # would double them to "extractor__Serena__find_symbol". (49905647)
+        "prefix": None,
         "description": "Symbol-level code intelligence (Serena LSP)",
         "description_overrides": {},
     },

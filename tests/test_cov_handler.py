@@ -1425,6 +1425,84 @@ def test_start_session_sends_active_repo_and_fs_roots(monkeypatch):
         _run(db.close())
 
 
+def test_start_session_unions_repo_path_and_filesystem_roots(monkeypatch):
+    """bc2e5ff0 — start_session serves repo_path AND filesystem_roots (deduped),
+    and the Serena target stays the repo_path."""
+    extract_sent = []
+    fs_sent = []
+
+    class _FakeExtractWS:
+        async def send_json(self, obj):
+            extract_sent.append(obj)
+
+    class _FakeFsWS:
+        async def send_json(self, obj):
+            fs_sent.append(obj)
+
+    from meridian.routes import tunnel as tn
+    monkeypatch.setattr(tn, "_tunnel_extract_sockets", {"t1": _FakeExtractWS()})
+    monkeypatch.setattr(tn, "_tunnel_sockets", {"t1": _FakeFsWS()})
+    db = _make_db()
+    try:
+        proj = _run(mh._dispatch_mcp_tool("create_project", {"name": "ss-union"}, db, "/tmp"))
+        pid = proj["id"]
+        _run(mh._dispatch_mcp_tool(
+            "set_executor_config",
+            {"project_id": pid, "repo_path": "C:/repo",
+             "filesystem_roots": ["C:/repo", "D:/Outputs", "E:/data"]},
+            db, "/tmp",
+        ))
+        _run(mh._dispatch_mcp_tool(
+            "start_session",
+            {"project_id": pid, "session_name": "chat"}, db, "/tmp",
+            tenant={"id": "t1"},
+        ))
+        # repo_path first, then the extra roots; the duplicate C:/repo is deduped.
+        assert {"type": "add_fs_roots",
+                "roots": ["C:/repo", "D:/Outputs", "E:/data"]} in fs_sent
+        # Serena indexes one project — it stays pinned to repo_path.
+        assert {"type": "set_active_repo", "repo_path": "C:/repo"} in extract_sent
+    finally:
+        _run(db.close())
+
+
+def test_start_session_filesystem_roots_only_no_repo_path(monkeypatch):
+    """With only filesystem_roots set (no repo_path), the Serena target falls
+    back to the first root and all roots are served."""
+    extract_sent = []
+    fs_sent = []
+
+    class _FakeExtractWS:
+        async def send_json(self, obj):
+            extract_sent.append(obj)
+
+    class _FakeFsWS:
+        async def send_json(self, obj):
+            fs_sent.append(obj)
+
+    from meridian.routes import tunnel as tn
+    monkeypatch.setattr(tn, "_tunnel_extract_sockets", {"t1": _FakeExtractWS()})
+    monkeypatch.setattr(tn, "_tunnel_sockets", {"t1": _FakeFsWS()})
+    db = _make_db()
+    try:
+        proj = _run(mh._dispatch_mcp_tool("create_project", {"name": "ss-rootsonly"}, db, "/tmp"))
+        pid = proj["id"]
+        _run(mh._dispatch_mcp_tool(
+            "set_executor_config",
+            {"project_id": pid, "filesystem_roots": ["D:/Outputs", "E:/data"]},
+            db, "/tmp",
+        ))
+        _run(mh._dispatch_mcp_tool(
+            "start_session",
+            {"project_id": pid, "session_name": "chat"}, db, "/tmp",
+            tenant={"id": "t1"},
+        ))
+        assert {"type": "add_fs_roots", "roots": ["D:/Outputs", "E:/data"]} in fs_sent
+        assert {"type": "set_active_repo", "repo_path": "D:/Outputs"} in extract_sent
+    finally:
+        _run(db.close())
+
+
 def test_start_session_no_repo_path_sends_nothing(monkeypatch):
     """No repo_path configured → no control messages, start_session still works."""
     extract_sent = []
