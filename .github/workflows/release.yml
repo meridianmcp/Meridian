@@ -19,6 +19,8 @@ jobs:
         with:
           pixi-version: latest
           cache: true
+      - name: Install UPX (binary compression)
+        run: choco install upx -y --no-progress
       - name: Build Windows executable
         run: pixi run build-exe
       - name: Upload Windows artifact
@@ -35,6 +37,8 @@ jobs:
         with:
           pixi-version: latest
           cache: true
+      - name: Install UPX (binary compression)
+        run: sudo apt-get update && sudo apt-get install -y upx-ucl
       - name: Build Linux executable
         run: pixi run build-exe
       - name: Stage artifact
