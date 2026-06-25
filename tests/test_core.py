@@ -6229,10 +6229,11 @@ def test_pg_migration_registry_matches_historical_order():
         "_migrate_pg_session_graph_snapshots",
         "_migrate_pg_agent_tasks_table",
         "_migrate_pg_sprint_item_owner",
+        "_migrate_pg_session_note_kind",
     ]
     # No duplicates across the three groups.
     allnames = core + hosted + late
-    assert len(allnames) == len(set(allnames)) == 64
+    assert len(allnames) == len(set(allnames)) == 65
 
 
 def test_default_agent_instructions_has_code_intel_protocol():
@@ -14245,3 +14246,81 @@ async def test_chain_add_subtask_owner_via_mcp(db, tmp_path):
         db, str(tmp_path), tenant=None,
     )
     assert sub["owner"] == "ai"
+
+
+# ---------------------------------------------------------------------------
+# 0d7de2a2 — thinking_sync mode (server side: note_kind='thinking')
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_thinking_session_notes_has_note_kind_column(db):
+    """session_notes.note_kind exists after init_db; migration idempotent."""
+    assert await db_module._column_exists(db, "session_notes", "note_kind")
+    await db_module._migrate_session_note_kind(db)
+    await db_module._migrate_session_note_kind(db)
+    assert await db_module._column_exists(db, "session_notes", "note_kind")
+
+
+@pytest.mark.asyncio
+async def test_thinking_add_session_note_persists_kind(db):
+    """add_session_note stores note_kind='thinking' distinctly; default is None."""
+    p = await db_module.create_project(db, "think-persist")
+    s = await db_module.register_session(db, p["id"], "s1")
+    t = await db_module.add_session_note(
+        db, s["id"], "HOOKS_DEBUG_STATE", "tried X; X failed; confirmed Y",
+        note_kind="thinking",
+    )
+    n = await db_module.add_session_note(db, s["id"], "Constraint", "no asyncpg")
+    assert t["note_kind"] == "thinking"
+    assert n["note_kind"] is None
+
+
+@pytest.mark.asyncio
+async def test_thinking_add_session_note_normalizes_bad_kind(db):
+    """An unknown note_kind falls back to a normal note (None)."""
+    p = await db_module.create_project(db, "think-bad")
+    s = await db_module.register_session(db, p["id"], "s1")
+    n = await db_module.add_session_note(
+        db, s["id"], "t", "b", note_kind="bogus"
+    )
+    assert n["note_kind"] is None
+
+
+@pytest.mark.asyncio
+async def test_thinking_get_session_notes_filter_by_kind(db):
+    """get_session_notes filters by note_kind: thinking-only, note-only, or all."""
+    p = await db_module.create_project(db, "think-filter")
+    s = await db_module.register_session(db, p["id"], "s1")
+    await db_module.add_session_note(db, s["id"], "T1", "thinking one", note_kind="thinking")
+    await db_module.add_session_note(db, s["id"], "N1", "normal one")
+    await db_module.add_session_note(db, s["id"], "T2", "thinking two", note_kind="thinking")
+
+    all_notes = await db_module.get_session_notes(db, s["id"])
+    thinking = await db_module.get_session_notes(db, s["id"], note_kind="thinking")
+    normal = await db_module.get_session_notes(db, s["id"], note_kind="note")
+    assert len(all_notes) == 3
+    assert len(thinking) == 2 and all(x["note_kind"] == "thinking" for x in thinking)
+    assert len(normal) == 1 and normal[0]["note_kind"] is None
+
+
+@pytest.mark.asyncio
+async def test_thinking_mcp_roundtrip(db, tmp_path):
+    """The add_sprint_note / get_sprint_notes MCP tools thread note_kind through."""
+    from meridian.mcp.handler import _dispatch_mcp_tool
+
+    p = await db_module.create_project(db, "think-mcp")
+    s = await db_module.register_session(db, p["id"], "s1")
+    await _dispatch_mcp_tool(
+        "add_sprint_note",
+        {"session_id": s["id"], "title": "HOOKS_DEBUG_STATE",
+         "body": "state snapshot", "note_kind": "thinking"},
+        db, str(tmp_path), tenant=None,
+    )
+    fetched = await _dispatch_mcp_tool(
+        "get_sprint_notes",
+        {"session_id": s["id"], "note_kind": "thinking"},
+        db, str(tmp_path), tenant=None,
+    )
+    assert len(fetched) == 1
+    assert fetched[0]["note_kind"] == "thinking"

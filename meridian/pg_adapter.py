@@ -583,6 +583,9 @@ CREATE TABLE IF NOT EXISTS session_notes (
     session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
     title TEXT NOT NULL,
     body TEXT NOT NULL,
+    -- 0d7de2a2: thinking_sync. 'thinking' marks a HOOKS_DEBUG_STATE scratchpad
+    -- note; NULL/'note' = a normal note. See db._migrate_session_note_kind.
+    note_kind TEXT,
     created_at TEXT NOT NULL DEFAULT ({_TS})
 );
 CREATE INDEX IF NOT EXISTS idx_session_notes_session ON session_notes(session_id);
@@ -1384,6 +1387,17 @@ async def _migrate_pg_agent_tasks_table(conn: PostgresConnection) -> None:
     )
 
 
+async def _migrate_pg_session_note_kind(conn: PostgresConnection) -> None:
+    """0d7de2a2 — session_notes.note_kind: thinking_sync scratchpad notes.
+
+    Nullable ``note_kind`` ('thinking' | NULL/'note'). ADD COLUMN IF NOT EXISTS
+    so re-running is a no-op. Mirrors db._migrate_session_note_kind.
+    """
+    await conn.executescript(
+        "ALTER TABLE session_notes ADD COLUMN IF NOT EXISTS note_kind TEXT"
+    )
+
+
 async def _migrate_pg_sprint_item_owner(conn: PostgresConnection) -> None:
     """4f02340e — sprint_items.owner: mixed-ownership task chains.
 
@@ -2063,4 +2077,5 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_session_graph_snapshots,
     _migrate_pg_agent_tasks_table,
     _migrate_pg_sprint_item_owner,
+    _migrate_pg_session_note_kind,
 )

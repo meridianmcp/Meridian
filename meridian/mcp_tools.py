@@ -452,17 +452,28 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
     {"name": "add_sprint_note", "description":
         "Add an ephemeral note to the current session's scratch pad. "
         "Use for constraints, blockers, working assumptions valid only this session. "
-        "Notes are auto-deleted when the session closes.",
+        "Notes are auto-deleted when the session closes. "
+        "Pass note_kind='thinking' for a thinking_sync (HOOKS_DEBUG_STATE) note: a "
+        "structured snapshot of the reasoning state (what was tried, what failed, "
+        "current confirmed state) that the dashboard renders with a distinct icon. "
+        "Intended for Claude's client-side thinking_sync post-tool-call hook, which "
+        "extracts the extended-thinking scratchpad and persists it here so debugging "
+        "state survives across turns and into the next session brief.",
      "inputSchema": {"type": "object", "properties": {
          "session_id": {"type": "string"},
          "title": {"type": "string"},
-         "body": {"type": "string"}},
+         "body": {"type": "string"},
+         "note_kind": {"type": "string", "enum": ["note", "thinking"],
+                       "description": "'note' (default) or 'thinking' for a thinking_sync scratchpad note."}},
          "required": ["session_id", "title", "body"]}},
     {"name": "get_sprint_notes", "description":
         "Read-only: Get all ephemeral scratch-pad notes for the current session. "
-        "Shown at the top of session briefs so every cold start sees active constraints.",
+        "Shown at the top of session briefs so every cold start sees active constraints. "
+        "Pass note_kind='thinking' to fetch only thinking_sync scratchpad notes, or "
+        "'note' for only normal notes; omit for all.",
      "inputSchema": {"type": "object", "properties": {
-         "session_id": {"type": "string"}},
+         "session_id": {"type": "string"},
+         "note_kind": {"type": "string", "enum": ["note", "thinking"]}},
          "required": ["session_id"]}},
     {"name": "set_sprint", "description":
         "Update only the sprint — the short-term focus that changes each session or week. "

@@ -477,6 +477,11 @@ CREATE TABLE IF NOT EXISTS session_notes (
     session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
     title TEXT NOT NULL,
     body TEXT NOT NULL,
+    -- 0d7de2a2: thinking_sync. note_kind classifies a sprint note. NULL/'note'
+    -- = a normal note; 'thinking' = a HOOKS_DEBUG_STATE scratchpad note
+    -- auto-persisted by the client-side thinking_sync hook. The dashboard
+    -- renders 'thinking' notes with a distinct icon.
+    note_kind TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -819,6 +824,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_session_graph_snapshots(db)
     await _migrate_agent_tasks_table(db)
     await _migrate_sprint_item_owner(db)
+    await _migrate_session_note_kind(db)
     return db
 
 
@@ -8933,12 +8939,25 @@ async def add_session_note(
     session_id: str,
     title: str,
     body: str,
+    note_kind: str | None = None,
 ) -> dict[str, Any]:
-    """Add an ephemeral note scoped to a session. Auto-deleted on session close."""
+    """Add an ephemeral note scoped to a session. Auto-deleted on session close.
+
+    0d7de2a2 — ``note_kind`` classifies the note. None/'note' is a normal
+    sprint note. 'thinking' marks a HOOKS_DEBUG_STATE scratchpad note
+    auto-persisted by Claude's client-side thinking_sync hook; the dashboard
+    renders these with a distinct icon and they round-trip into the next
+    session brief. Any other value is normalized to None (a normal note).
+    """
+    if note_kind not in (None, "note", "thinking"):
+        note_kind = None
+    if note_kind == "note":
+        note_kind = None
     nid = _new_id()
     await db.execute(
-        "INSERT INTO session_notes (id, session_id, title, body) VALUES (?, ?, ?, ?)",
-        (nid, session_id, title, body),
+        "INSERT INTO session_notes (id, session_id, title, body, note_kind) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (nid, session_id, title, body, note_kind),
     )
     await db.commit()
     async with db.execute(
@@ -8951,12 +8970,31 @@ async def add_session_note(
 async def get_session_notes(
     db: aiosqlite.Connection,
     session_id: str,
+    note_kind: str | None = None,
 ) -> list[dict[str, Any]]:
-    """Return all notes for a session, newest first."""
-    async with db.execute(
-        "SELECT * FROM session_notes WHERE session_id = ? ORDER BY created_at DESC",
-        (session_id,),
-    ) as cur:
+    """Return all notes for a session, newest first.
+
+    0d7de2a2 — pass ``note_kind='thinking'`` to return only thinking_sync
+    scratchpad notes, or ``'note'`` for only normal notes. Omit to return all.
+    """
+    if note_kind == "thinking":
+        sql = (
+            "SELECT * FROM session_notes WHERE session_id = ? "
+            "AND note_kind = 'thinking' ORDER BY created_at DESC"
+        )
+        params: tuple = (session_id,)
+    elif note_kind == "note":
+        sql = (
+            "SELECT * FROM session_notes WHERE session_id = ? "
+            "AND (note_kind IS NULL OR note_kind = 'note') ORDER BY created_at DESC"
+        )
+        params = (session_id,)
+    else:
+        sql = (
+            "SELECT * FROM session_notes WHERE session_id = ? ORDER BY created_at DESC"
+        )
+        params = (session_id,)
+    async with db.execute(sql, params) as cur:
         rows = await cur.fetchall()
     return [_row_to_dict(r) for r in rows if r is not None]  # type: ignore[misc]
 

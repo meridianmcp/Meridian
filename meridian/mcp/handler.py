@@ -2028,10 +2028,13 @@ async def _handle_sprint_tools(
         validate_input_size(args.get("title"), "note title", 500)
         validate_input_size(args.get("body"), "note body", 10_000_000)
         return await db_module.add_session_note(
-            db, args["session_id"], args["title"], args["body"]
+            db, args["session_id"], args["title"], args["body"],
+            note_kind=args.get("note_kind"),
         )
     if name == "get_sprint_notes":
-        return await db_module.get_session_notes(db, args["session_id"])
+        return await db_module.get_session_notes(
+            db, args["session_id"], note_kind=args.get("note_kind")
+        )
     if name == "add_sprint_item":
         validate_input_size(args.get("title"), "sprint item title", 500)
         # fd86aacc — warn if active executor sessions exist when adding a new item
