@@ -125,6 +125,7 @@ from .executor_config import (
 )
 from . import goal_md as goal_md_module
 from . import enqueue as enqueue_module
+from . import dispatcher as dispatcher_module
 from . import handoff as handoff_module
 from . import toml_config as toml_config_module
 from . import md_anchors as md_anchors_module
@@ -550,6 +551,23 @@ async def lifespan(app: FastAPI):
     keepalive_task = asyncio.create_task(_run_session_keepalive_loop(db))
     app.state.keepalive_task = keepalive_task
 
+    # 57f7f7ba — autonomous dispatcher daemon.
+    # GUARDRAIL: DEFAULT OFF. start_dispatcher_if_enabled is a no-op unless
+    # MERIDIAN_DISPATCHER_ENABLED == "1". On the multi-tenant production server
+    # the env var is unset, so NO worker (`claude -p`) processes are ever
+    # auto-spawned. Enabling it is an explicit, opt-in operator decision on a
+    # single-tenant self-hosted box. See meridian/dispatcher.py.
+    app.state.dispatcher = None
+    if dispatcher_module.is_enabled():
+        try:
+            _disp_project = os.environ.get("MERIDIAN_DISPATCHER_PROJECT_ID")
+            if _disp_project:
+                dispatcher_module.start_dispatcher_if_enabled(
+                    app, db, _disp_project
+                )
+        except Exception:  # noqa: BLE001 — never block startup on the dispatcher
+            pass
+
     try:
         yield
 
@@ -570,6 +588,13 @@ async def lifespan(app: FastAPI):
             await keepalive_task
         except (asyncio.CancelledError, Exception):  # noqa: BLE001
             pass
+        # 57f7f7ba — stop the autonomous dispatcher if it was enabled.
+        _disp = getattr(app.state, "dispatcher", None)
+        if _disp is not None:
+            try:
+                await _disp.stop()
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
         await db.close()
 
 

@@ -1,0 +1,275 @@
+"""Tests for the autonomous dispatcher daemon (item 57f7f7ba).
+
+The dispatcher must:
+  * dispatch a parallelizable group via the enqueue primitive,
+  * never dispatch the same item twice (dedup),
+  * wake immediately on a board_change trigger event,
+  * bound concurrency at max_in_flight,
+  * and — critically — NOT start in the server lifespan unless
+    MERIDIAN_DISPATCHER_ENABLED == "1".
+
+enqueue_claude_task is always mocked so NO real `claude -p` process spawns.
+"""
+
+from __future__ import annotations
+
+import asyncio
+
+import pytest
+import pytest_asyncio
+
+from meridian import db as db_module
+from meridian import dispatcher as dispatcher_module
+from meridian.dispatcher import Dispatcher, is_enabled, start_dispatcher_if_enabled
+
+
+@pytest_asyncio.fixture
+async def project(db):
+    proj = await db_module.create_project(db, "dispatch-proj")
+    return proj["id"]
+
+
+class _FakeEnqueue:
+    """Records enqueue calls; returns a fake pending task. Never spawns."""
+
+    def __init__(self):
+        self.calls: list[dict] = []
+
+    async def __call__(self, db, session_id, project_id, prompt, **kwargs):
+        self.calls.append(
+            {"session_id": session_id, "project_id": project_id, "prompt": prompt}
+        )
+        return {"id": f"task-{len(self.calls)}", "status": "pending"}
+
+
+# --- is_enabled / guardrail -------------------------------------------------
+
+
+def test_is_enabled_default_off(monkeypatch):
+    monkeypatch.delenv(dispatcher_module.ENABLE_ENV_VAR, raising=False)
+    assert is_enabled() is False
+
+
+@pytest.mark.parametrize("val", ["0", "true", "TRUE", "yes", "", "on"])
+def test_is_enabled_strict(monkeypatch, val):
+    monkeypatch.setenv(dispatcher_module.ENABLE_ENV_VAR, val)
+    assert is_enabled() is False
+
+
+def test_is_enabled_one(monkeypatch):
+    monkeypatch.setenv(dispatcher_module.ENABLE_ENV_VAR, "1")
+    assert is_enabled() is True
+
+
+def test_start_if_enabled_noop_when_unset(monkeypatch):
+    """GUARDRAIL: default OFF — returns None and starts nothing."""
+    monkeypatch.delenv(dispatcher_module.ENABLE_ENV_VAR, raising=False)
+
+    class _App:
+        class state:  # noqa: N801
+            pass
+
+    result = start_dispatcher_if_enabled(_App, object(), "pid")
+    assert result is None
+    assert getattr(_App.state, "dispatcher", None) in (None,)
+
+
+@pytest.mark.asyncio
+async def test_start_if_enabled_starts_when_on(monkeypatch, db, project):
+    monkeypatch.setenv(dispatcher_module.ENABLE_ENV_VAR, "1")
+    fake = _FakeEnqueue()
+
+    class _App:
+        class state:  # noqa: N801
+            pass
+
+    disp = start_dispatcher_if_enabled(
+        _App, db, project, interval=0.05, enqueue_fn=fake
+    )
+    assert disp is not None
+    assert _App.state.dispatcher is disp
+    await disp.stop()
+
+
+# --- dispatch_once ----------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_dispatch_once_enqueues_group(db, project):
+    await db_module.add_sprint_item(
+        db, project, "v1", "Item A", touches_resources=["file:fileA"]
+    )
+    await db_module.add_sprint_item(
+        db, project, "v1", "Item B", touches_resources=["file:fileB"]
+    )
+    fake = _FakeEnqueue()
+    disp = Dispatcher(db, project, enqueue_fn=fake)
+
+    enqueued = await disp.dispatch_once()
+    # Two non-conflicting items land in the first parallel group.
+    assert len(enqueued) == 2
+    assert len(fake.calls) == 2
+    prompts = " ".join(c["prompt"] for c in fake.calls)
+    assert "Item A" in prompts and "Item B" in prompts
+    # All enqueued under the same lazily-created dispatcher session.
+    sids = {c["session_id"] for c in fake.calls}
+    assert len(sids) == 1
+
+
+@pytest.mark.asyncio
+async def test_dispatch_once_empty_board(db, project):
+    fake = _FakeEnqueue()
+    disp = Dispatcher(db, project, enqueue_fn=fake)
+    assert await disp.dispatch_once() == []
+    assert fake.calls == []
+
+
+@pytest.mark.asyncio
+async def test_dispatch_dedups_items(db, project):
+    await db_module.add_sprint_item(
+        db, project, "v1", "Only Item", touches_resources=["file:x"]
+    )
+    fake = _FakeEnqueue()
+    disp = Dispatcher(db, project, enqueue_fn=fake)
+
+    first = await disp.dispatch_once()
+    assert len(first) == 1
+    # Second pass: same item still pending on the board, but already dispatched.
+    second = await disp.dispatch_once()
+    assert second == []
+    assert len(fake.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_max_in_flight_bounds_concurrency(db, project):
+    for i in range(5):
+        await db_module.add_sprint_item(
+            db, project, "v1", f"Item {i}", touches_resources=[f"file:r{i}"]
+        )
+    fake = _FakeEnqueue()
+    disp = Dispatcher(db, project, enqueue_fn=fake, max_in_flight=2)
+
+    enqueued = await disp.dispatch_once()
+    assert len(enqueued) == 2
+    # A further pass enqueues nothing more — we are at the cap.
+    assert await disp.dispatch_once() == []
+    assert len(fake.calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_dispatch_skips_failed_enqueue(db, project):
+    await db_module.add_sprint_item(
+        db, project, "v1", "Boom", touches_resources=["file:x"]
+    )
+
+    async def _boom(*a, **k):
+        raise RuntimeError("spawn failed")
+
+    disp = Dispatcher(db, project, enqueue_fn=_boom)
+    enqueued = await disp.dispatch_once()
+    assert enqueued == []
+    # Not marked dispatched, so a later (working) pass can retry.
+    fake = _FakeEnqueue()
+    disp._enqueue = fake
+    again = await disp.dispatch_once()
+    assert len(again) == 1
+
+
+# --- run loop + trigger -----------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_run_loop_dispatches_then_trigger(db, project):
+    await db_module.add_sprint_item(
+        db, project, "v1", "Loop Item", touches_resources=["file:x"]
+    )
+    fake = _FakeEnqueue()
+    # Long interval so the only fast pass beyond the first is via trigger().
+    disp = Dispatcher(db, project, interval=100.0, enqueue_fn=fake)
+    disp.start()
+
+    # First immediate pass dispatches the item.
+    for _ in range(50):
+        await asyncio.sleep(0.01)
+        if fake.calls:
+            break
+    assert len(fake.calls) == 1
+
+    # Add a new item and fire the board_change trigger for an immediate pass.
+    await db_module.add_sprint_item(
+        db, project, "v1", "Late Item", touches_resources=["file:y"]
+    )
+    disp.trigger()
+
+    for _ in range(50):
+        await asyncio.sleep(0.01)
+        if len(fake.calls) >= 2:
+            break
+    assert len(fake.calls) == 2
+    assert any("Late Item" in c["prompt"] for c in fake.calls)
+
+    await disp.stop()
+    assert disp._task is None
+
+
+@pytest.mark.asyncio
+async def test_notify_board_change_alias(db, project):
+    disp = Dispatcher(db, project)
+    assert disp.notify_board_change == disp.trigger
+    disp.notify_board_change()
+    assert disp._wake.is_set()
+
+
+@pytest.mark.asyncio
+async def test_start_is_idempotent(db, project):
+    fake = _FakeEnqueue()
+    disp = Dispatcher(db, project, interval=100.0, enqueue_fn=fake)
+    t1 = disp.start()
+    t2 = disp.start()
+    assert t1 is t2
+    await disp.stop()
+
+
+@pytest.mark.asyncio
+async def test_stop_without_start_is_safe(db, project):
+    disp = Dispatcher(db, project)
+    await disp.stop()  # no task — must not raise
+
+
+@pytest.mark.asyncio
+async def test_run_loop_survives_pass_error(db, project):
+    """A failing dispatch pass must not kill the loop."""
+    calls = {"n": 0}
+
+    async def _flaky_groups(db_, pid, version):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("transient")
+        return {"groups": []}
+
+    disp = Dispatcher(
+        db, project, interval=0.02, get_groups_fn=_flaky_groups
+    )
+    disp.start()
+    for _ in range(50):
+        await asyncio.sleep(0.01)
+        if calls["n"] >= 2:
+            break
+    await disp.stop()
+    assert calls["n"] >= 2  # loop kept going after the first error
+
+
+def test_worker_prompt_includes_resources():
+    item = {"id": "abc123", "title": "Do thing", "resources": ["fileA", "fileB"]}
+    prompt = dispatcher_module._worker_prompt(item, "proj-1")
+    assert "abc123" in prompt
+    assert "Do thing" in prompt
+    assert "fileA" in prompt and "fileB" in prompt
+    assert "proj-1" in prompt
+
+
+def test_worker_prompt_no_resources():
+    item = {"id": "abc123", "title": "Do thing"}
+    prompt = dispatcher_module._worker_prompt(item, "proj-1")
+    assert "abc123" in prompt
+    assert "resources" not in prompt.lower()
