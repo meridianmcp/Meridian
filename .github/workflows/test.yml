@@ -12,6 +12,10 @@ env:
 jobs:
   test-core:
     runs-on: ubuntu-latest
+    # 343cb26d — hard ceiling so a hung test (lingering asyncio loop / xdist
+    # worker) can never keep the job "in progress" indefinitely. --timeout=60
+    # below kills the individual test first; this is the backstop for the job.
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: prefix-dev/setup-pixi@v0.8.1
@@ -19,10 +23,13 @@ jobs:
           pixi-version: latest
           cache: false
       - run: pixi install
-      - run: pixi run python -m pytest tests/ -n auto -q --tb=short --ignore=tests/test_demo_ux.py --cov=meridian --cov-config=.coveragerc --cov-report=term-missing --cov-fail-under=80
+      - run: pixi run python -m pytest tests/ -n auto -q --tb=short --ignore=tests/test_demo_ux.py --timeout=60 --cov=meridian --cov-config=.coveragerc --cov-report=term-missing --cov-fail-under=80
 
   test-ux:
     runs-on: ubuntu-latest
+    # 343cb26d — backstop: the demo-UX suite drives a live uvicorn + Playwright,
+    # the most likely place to leave a lingering process and hang the job.
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: prefix-dev/setup-pixi@v0.8.1

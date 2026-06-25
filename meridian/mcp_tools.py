@@ -669,7 +669,10 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "test_min": {"type": "integer"},
          "deploy_cmd": {"type": "string"},
          "shell_type": {"type": "string"},
-         "branch": {"type": "string"}},
+         "branch": {"type": "string"},
+         "filesystem_roots": {"type": "array", "items": {"type": "string"},
+             "description": "Directories the tunnel's filesystem connector may serve (unioned across the tenant's projects). Overwrites the existing list."},
+         "context_threshold": {"type": "integer", "description": "Turns before a context-budget warning is surfaced to the session."}},
          "required": []}},
     {"name": "claim_file", "description":
         "Claim edit rights on a file for this session. Whole-file by default "

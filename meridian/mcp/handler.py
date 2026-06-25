@@ -1202,6 +1202,11 @@ async def _handle_project_tools(
         )
         # b9d1b606 — expand fs proxy roots so the executor's repo_path is
         # accessible without a separate set_active_repo call.
+        # b2a417ad — also point the Serena daemon pool at this project's repo so
+        # claude.ai chat sessions (which never set the X-Meridian-Repo-Path
+        # header) route code-intel requests to the right daemon. start_session is
+        # the per-session signal of "which project am I working on now"; both
+        # control messages are best-effort and never fail the orientation.
         if tenant is not None:
             try:
                 tenant_id = tenant.get("id", "")
@@ -1211,6 +1216,9 @@ async def _handle_project_tools(
                     from ..routes import tunnel as _tunnel_mod
                     await _tunnel_mod.send_add_fs_roots_control(
                         tenant_id, [repo_path.strip()]
+                    )
+                    await _tunnel_mod.send_active_repo_control(
+                        tenant_id, repo_path.strip()
                     )
             except Exception:  # noqa: BLE001 — non-fatal background expansion
                 pass
@@ -1873,8 +1881,14 @@ async def _handle_session_tools(
         # a manual {cwd, hostname} coexists with hook-registered ones.
         existing = await db_module.get_executor_config(db, args["project_id"])
         cfg = dict(existing) if isinstance(existing, dict) else {}
+        # 3adbc954 — filesystem_roots, hostnames, context_threshold and isolation
+        # were missing from this copy list, so passing them was silently dropped
+        # (the call returned filesystem_roots: []). All scalar/list keys overwrite;
+        # repo_paths alone is merged entry-by-entry below.
         for k in ("repo_path", "env_file", "test_cmd", "test_min",
-                  "deploy_cmd", "shell_type", "branch"):
+                  "deploy_cmd", "shell_type", "branch",
+                  "filesystem_roots", "hostnames", "context_threshold",
+                  "isolation"):
             if k in args:
                 cfg[k] = args[k]
         if "repo_paths" in args:
