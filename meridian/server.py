@@ -3625,6 +3625,151 @@ async def _build_orchestration_hint(
     return hint
 
 
+# 9f6aec5f — codebase-context cache: project_id → (monotonic_ts, summary). The
+# architecture call hits the tenant's live code-intel tunnel, so we memoize per
+# project for a short TTL to keep start_session fast across rapid re-orientations.
+_CODEBASE_CONTEXT_TTL = 600.0  # 10 minutes
+_codebase_context_cache: dict[str, tuple[float, dict[str, Any]]] = {}
+
+# 2c645647 — protocol-level directive prepended to agent_instructions when a
+# healthy codebase index is available, so the executor reaches for the graph
+# tools instead of blind filesystem reads/grep (advisory tool descriptions alone
+# don't reliably steer it — this rides at the same level as the EXECUTION MODE
+# directive).
+CODEBASE_INDEX_DIRECTIVE = (
+    "CODEBASE INDEX AVAILABLE: use codebase__search_graph / "
+    "codebase__get_code_snippet BEFORE reading files. Do NOT use filesystem read "
+    "or grep for code navigation — the index is faster and pre-loaded."
+)
+
+
+def _summarize_architecture(arch: dict[str, Any]) -> dict[str, Any] | None:
+    """Distill a codebase-memory-mcp ``get_architecture`` payload into a compact
+    orientation block (top packages / layers / hotspots / entry points).
+
+    Defensive: the architecture schema varies by indexer version, so every field
+    is optional and bad shapes degrade to an empty result (→ no block injected).
+    """
+    if not isinstance(arch, dict):
+        return None
+
+    def _names(value: Any, key: str = "name", limit: int = 8) -> list[str]:
+        out: list[str] = []
+        if isinstance(value, list):
+            for item in value[:limit]:
+                if isinstance(item, str):
+                    out.append(item)
+                elif isinstance(item, dict):
+                    label = item.get(key) or item.get("path") or item.get("symbol")
+                    if isinstance(label, str) and label.strip():
+                        out.append(label.strip())
+        return out
+
+    summary: dict[str, Any] = {}
+    packages = _names(arch.get("packages"))
+    layers = _names(arch.get("layers"))
+    hotspots = _names(arch.get("hotspots"), key="symbol")
+    entry_points = _names(arch.get("entry_points") or arch.get("entrypoints"))
+    if packages:
+        summary["packages"] = packages
+    if layers:
+        summary["layers"] = layers
+    if hotspots:
+        summary["hotspots"] = hotspots
+    if entry_points:
+        summary["entry_points"] = entry_points
+    stats = arch.get("stats") or arch.get("summary")
+    if isinstance(stats, dict):
+        # Keep only small scalar counts (files/symbols/edges), never large blobs.
+        small = {
+            k: v for k, v in stats.items()
+            if isinstance(v, (int, float)) and not isinstance(v, bool)
+        }
+        if small:
+            summary["stats"] = small
+    return summary or None
+
+
+def _truncate_codebase_summary(summary: dict[str, Any]) -> dict[str, Any]:
+    """Compact-mode variant: keep only the few highest-signal entries so an
+    executor's context isn't flooded. (9f6aec5f)"""
+    out: dict[str, Any] = {}
+    for key, limit in (("packages", 5), ("hotspots", 5), ("entry_points", 3)):
+        vals = summary.get(key)
+        if isinstance(vals, list) and vals:
+            out[key] = vals[:limit]
+    if "stats" in summary:
+        out["stats"] = summary["stats"]
+    return out
+
+
+def _parse_tunnel_tool_text(result: Any) -> Any:
+    """Extract and JSON-decode the text payload from a tunnel ``tools/call``
+    result envelope (``{"content": [{"type": "text", "text": "..."}]}``).
+    Returns the decoded object, or None on any shape/parse error."""
+    if not isinstance(result, dict):
+        return None
+    content = result.get("content")
+    if not isinstance(content, list) or not content:
+        return None
+    first = content[0]
+    if not isinstance(first, dict):
+        return None
+    text = first.get("text")
+    if not isinstance(text, str) or not text.strip():
+        return None
+    try:
+        return json.loads(text)
+    except (ValueError, TypeError):
+        return None
+
+
+async def _build_codebase_context(
+    tenant_id: str | None, project_id: str, *, compact: bool
+) -> dict[str, Any] | None:
+    """Fetch + summarize the project's codebase architecture for start_session.
+
+    Returns a ``codebase_context`` block (top packages / layers / hotspots /
+    entry points) so an executor starts already knowing the code's shape — or
+    None when there's nothing to inject. Gated on a live, healthy code-intel
+    tunnel and memoized per project for ``_CODEBASE_CONTEXT_TTL``. NEVER raises:
+    any failure (no tunnel, unhealthy slot, not indexed, bad payload) degrades to
+    None so start_session is unaffected. (9f6aec5f)
+    """
+    if not tenant_id:
+        return None
+    from .routes import tunnel as _tunnel_mod  # noqa: PLC0415 — avoid import cycle
+    # Code-intel slot must be connected AND not flagged unhealthy (d71ba2e7).
+    if tenant_id not in _tunnel_mod._tunnel_code_sockets:
+        return None
+    if not _tunnel_mod._slot_is_healthy(tenant_id, "code"):
+        return None
+
+    now = time.monotonic()
+    cached = _codebase_context_cache.get(project_id)
+    if cached is not None and (now - cached[0]) < _CODEBASE_CONTEXT_TTL:
+        summary = cached[1]
+    else:
+        try:
+            result = await _tunnel_mod.call_tunnel_tool(
+                tenant_id, "codebase__get_architecture", {}
+            )
+        except Exception:  # noqa: BLE001 — tunnel/tool error → no block
+            return None
+        arch = _parse_tunnel_tool_text(result)
+        summary = _summarize_architecture(arch) if isinstance(arch, dict) else None
+        if not summary:
+            return None
+        _codebase_context_cache[project_id] = (now, summary)
+
+    block = _truncate_codebase_summary(summary) if compact else dict(summary)
+    block["note"] = (
+        "Codebase index summary (from code-intel). Use codebase__search_graph / "
+        "codebase__get_code_snippet to drill in — no filesystem search needed."
+    )
+    return block
+
+
 async def _start_session_composite(
     db: aiosqlite.Connection,
     project_id: str,
