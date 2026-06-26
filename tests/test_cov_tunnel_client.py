@@ -636,6 +636,39 @@ def test_run_connection_lazy_preflight_reports_unhealthy(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# 9a8645c1 — Serena access-denied classification
+# ---------------------------------------------------------------------------
+
+def test_classify_serena_failure_access_denied():
+    f = tc._classify_serena_failure
+    # PermissionError → access_denied.
+    r = f(PermissionError("access is denied"))
+    assert r is not None and r[0] == "access_denied"
+    # WinError 5 string signature.
+    assert f("[WinError 5] Access is denied: 'My Music'")[0] == "access_denied"
+    # POSIX errno 13.
+    assert f(OSError("[Errno 13] Permission denied"))[0] == "access_denied"
+    # Benign / unrelated → None (caller falls back to a generic reason).
+    assert f(RuntimeError("connection refused")) is None
+    assert f("") is None
+    assert f(None) is None
+
+
+def test_report_slot_health_carries_reason(monkeypatch):
+    sent = []
+
+    class _WS:
+        async def send(self, data): sent.append(json.loads(data))
+
+    asyncio.run(tc._report_slot_health(_WS(), "extract", False,
+                                       reason="access_denied", detail="fix your repo path"))
+    assert sent == [{
+        "type": "plugin_status", "slot": "extract", "healthy": False,
+        "reason": "access_denied", "detail": "fix your repo path",
+    }]
+
+
+# ---------------------------------------------------------------------------
 # a3410a9c — core slot watchdog escalation + background re-probe recovery
 # ---------------------------------------------------------------------------
 
@@ -1078,6 +1111,38 @@ def _stub_run_tunnel_spawn(monkeypatch, *, code_binary="/bin/codebase-memory-mcp
     monkeypatch.setattr(tc, "_reconnect_loop_extract_pool", fake_reconnect_extract_pool)
     monkeypatch.setattr(tc, "_pool_idle_reaper", fake_pool_reaper)
     return procs
+
+
+def test_run_tunnel_extra_fs_roots_union(monkeypatch, tmp_path):
+    """cbbd0eb4 — extra_fs_roots are resolved + unioned into the fs proxy roots."""
+    _stub_run_tunnel_spawn(monkeypatch)
+    monkeypatch.setattr(
+        tc, "_fetch_me",
+        AsyncMock(return_value={"tenant_id": "tid-x", "plan": "pro"}),
+    )
+    monkeypatch.setattr(
+        tc, "_fetch_filesystem_roots",
+        AsyncMock(return_value=(["/server/root"], [])),
+    )
+    captured = {}
+    real_build = tc._build_proxy_command
+
+    def cap_build(npx, repo_path, port=tc.DEFAULT_PROXY_PORT, roots=None):
+        captured["roots"] = roots
+        return real_build(npx, repo_path, port, roots=roots)
+
+    monkeypatch.setattr(tc, "_build_proxy_command", cap_build)
+    monkeypatch.setattr(tc.Path, "cwd", staticmethod(lambda: tmp_path))
+    outputs = tmp_path / "Outputs"
+    outputs.mkdir()
+
+    rc = _run_tunnel(token="sk", base_url="https://x",
+                     repo_path=str(tmp_path), extra_fs_roots=[str(outputs)])
+    assert rc == 0
+    roots = captured["roots"]
+    assert roots is not None
+    assert "/server/root" in roots                       # server roots preserved
+    assert any("Outputs" in r for r in roots)            # extra root unioned in
 
 
 def test_run_tunnel_full_path_all_slots(monkeypatch, tmp_path):

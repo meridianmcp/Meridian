@@ -65,12 +65,30 @@ _pending_dc_reqs: dict[str, asyncio.Future[dict]] = {}
 # tools that 503 on first call.
 _slot_health: dict[str, dict[str, bool]] = {}
 
+# 9a8645c1 — optional per-slot diagnostic for an unhealthy slot:
+# tenant_id → {slot: {"reason": str, "detail": str}}. Lets the dashboard show an
+# actionable warning (e.g. Serena access-denied + fix hint) instead of a silent
+# dead dot. Cleared when the slot recovers or the WS disconnects.
+_slot_status_detail: dict[str, dict[str, dict[str, str]]] = {}
 
-def _record_slot_health(tenant_id: str, slot: str, healthy: bool) -> None:
-    """Record a core slot's health for a tenant (from a plugin_status message)."""
+
+def _record_slot_health(
+    tenant_id: str, slot: str, healthy: bool,
+    reason: "str | None" = None, detail: "str | None" = None,
+) -> None:
+    """Record a core slot's health for a tenant (from a plugin_status message).
+    9a8645c1 — when unhealthy, also stash an optional reason/detail; healthy
+    clears any prior diagnostic."""
     if not slot:
         return
     _slot_health.setdefault(tenant_id, {})[slot] = bool(healthy)
+    if healthy:
+        _slot_status_detail.get(tenant_id, {}).pop(slot, None)
+    elif reason or detail:
+        _slot_status_detail.setdefault(tenant_id, {})[slot] = {
+            "reason": reason or "unhealthy",
+            "detail": detail or "",
+        }
 
 
 def _slot_is_healthy(tenant_id: str, slot: str) -> bool:
@@ -83,12 +101,18 @@ def _clear_slot_health(tenant_id: str, slot: "str | None" = None) -> None:
     fresh reconnect starts from the assumed-healthy default."""
     if slot is None:
         _slot_health.pop(tenant_id, None)
+        _slot_status_detail.pop(tenant_id, None)
         return
     slots = _slot_health.get(tenant_id)
     if slots is not None:
         slots.pop(slot, None)
         if not slots:
             _slot_health.pop(tenant_id, None)
+    _det = _slot_status_detail.get(tenant_id)
+    if _det is not None:
+        _det.pop(slot, None)
+        if not _det:
+            _slot_status_detail.pop(tenant_id, None)
 
 
 def _is_tunnel_allowed(tenant: dict) -> bool:
@@ -178,8 +202,11 @@ async def tunnel_ws(ws: WebSocket, tenant_id: str) -> None:
                 continue
 
             if msg_type == "plugin_status":
-                # d71ba2e7 — client reports this slot's live health.
-                _record_slot_health(tenant_id, msg.get("slot") or "fs", msg.get("healthy", True))
+                # d71ba2e7 — client reports this slot's live health (+ 9a8645c1 reason).
+                _record_slot_health(
+                    tenant_id, msg.get("slot") or "fs", msg.get("healthy", True),
+                    reason=msg.get("reason"), detail=msg.get("detail"),
+                )
                 continue
 
             if msg_type == "response":
@@ -264,7 +291,10 @@ async def tunnel_code_ws(ws: WebSocket, tenant_id: str) -> None:
             if msg_type == "ping":
                 continue
             if msg_type == "plugin_status":
-                _record_slot_health(tenant_id, msg.get("slot") or "code", msg.get("healthy", True))
+                _record_slot_health(
+                    tenant_id, msg.get("slot") or "code", msg.get("healthy", True),
+                    reason=msg.get("reason"), detail=msg.get("detail"),
+                )
                 continue
             if msg_type == "response":
                 req_id = msg.get("id")
@@ -342,7 +372,10 @@ async def tunnel_extract_ws(ws: WebSocket, tenant_id: str) -> None:
             if msg_type == "ping":
                 continue
             if msg_type == "plugin_status":
-                _record_slot_health(tenant_id, msg.get("slot") or "extract", msg.get("healthy", True))
+                _record_slot_health(
+                    tenant_id, msg.get("slot") or "extract", msg.get("healthy", True),
+                    reason=msg.get("reason"), detail=msg.get("detail"),
+                )
                 continue
             if msg_type == "response":
                 req_id = msg.get("id")
@@ -943,6 +976,11 @@ async def tunnel_status(tenant_id: str) -> dict:
         # failed / watchdog gave up). Absent slot ⇒ assumed healthy. Dashboard
         # renders these as a degraded status dot.
         "slot_health": dict(_slot_health.get(tenant_id, {})),
+        # 9a8645c1 — per-slot diagnostic (reason + actionable detail) for an
+        # unhealthy slot, so the dashboard shows a warning badge with a fix hint.
+        "slot_status": {
+            k: dict(v) for k, v in _slot_status_detail.get(tenant_id, {}).items()
+        },
     }
 
 
@@ -995,6 +1033,12 @@ async def get_tunnel_plugins(request: Request) -> Response:
         # uses this to gate the Tunnel Plugins card.
         "plan": tenant.get("plan") or "free",
         "is_admin": bool(tenant.get("is_internal")),
+        # 9a8645c1 — per-slot health + diagnostic so the dashboard can render a
+        # warning badge (e.g. Serena access-denied) on a degraded slot's row.
+        "slot_health": dict(_slot_health.get(tid, {})),
+        "slot_status": {
+            k: dict(v) for k, v in _slot_status_detail.get(tid, {}).items()
+        },
     })
 
 

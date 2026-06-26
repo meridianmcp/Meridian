@@ -53,20 +53,29 @@ def test_build_parser_accepts_tunnel_flags():
     assert args.tunnel is True
     assert args.token == "sk_meridian_x"
     assert args.server == "https://example.test"
-    assert args.repo == "/tmp/repo"
+    # cbbd0eb4 — --repo is nargs='+', so a single path is a one-element list.
+    assert args.repo == ["/tmp/repo"]
     assert args.tunnel_port == 9000
     assert args.code_dirs == ["/a", "/b"]
+
+
+def test_build_parser_repo_accepts_multiple_paths():
+    """cbbd0eb4 — --repo takes multiple paths."""
+    parser = tunnel_main._build_parser()
+    args = parser.parse_args(["--repo", "/a", "/b", "/c"])
+    assert args.repo == ["/a", "/b", "/c"]
 
 
 def test_main_invokes_run_tunnel(monkeypatch):
     """main() should forward parsed args to run_tunnel and return its code."""
     captured = {}
 
-    async def fake_run_tunnel(*, token, base_url, repo_path, port, code_dirs):
+    async def fake_run_tunnel(*, token, base_url, repo_path, extra_fs_roots, port, code_dirs):
         captured.update(
             token=token,
             base_url=base_url,
             repo_path=repo_path,
+            extra_fs_roots=extra_fs_roots,
             port=port,
             code_dirs=code_dirs,
         )
@@ -84,9 +93,27 @@ def test_main_invokes_run_tunnel(monkeypatch):
         "token": "sk_t",
         "base_url": "https://s",
         "repo_path": "/r",
+        "extra_fs_roots": [],
         "port": 8888,
         "code_dirs": None,
     }
+
+
+def test_main_repo_multipath_splits_first_vs_rest(monkeypatch):
+    """cbbd0eb4 — first --repo path is repo_path, the rest are extra fs roots."""
+    captured = {}
+
+    async def fake_run_tunnel(*, token, base_url, repo_path, extra_fs_roots, port, code_dirs):
+        captured.update(repo_path=repo_path, extra_fs_roots=extra_fs_roots)
+        return 0
+
+    from meridian import tunnel_client
+    monkeypatch.setattr(tunnel_client, "run_tunnel", fake_run_tunnel)
+
+    rc = tunnel_main.main(["--repo", "/first", "/second", "/third"])
+    assert rc == 0
+    assert captured["repo_path"] == "/first"
+    assert captured["extra_fs_roots"] == ["/second", "/third"]
 
 
 def test_resolve_loop_reuses_open_loop():

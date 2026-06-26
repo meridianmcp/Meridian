@@ -327,6 +327,48 @@ def test_demo_write_button_shows_friendly_toast(client):
 
 
 @pytestmark_playwright
+def test_slot_health_warning_renderer(client):
+    """9a8645c1 — _renderSlotHealthWarning shows an actionable badge for an
+    unhealthy slot and nothing for a healthy one. Runs the real bundle."""
+    import threading
+    import uvicorn
+    from meridian import server as server_module
+
+    with sync_playwright() as p:
+        config = uvicorn.Config(server_module.app, host="127.0.0.1", port=17884, log_level="error")
+        server = uvicorn.Server(config)
+        thread = threading.Thread(target=server.run, daemon=True)
+        thread.start()
+        import time; time.sleep(1.5)
+        try:
+            browser = p.chromium.launch()
+            page = browser.new_page()
+            page.goto("http://127.0.0.1:17884/demo", wait_until="domcontentloaded")
+            page.wait_for_timeout(2000)
+            res = page.evaluate(
+                """() => {
+                    const f = window._renderSlotHealthWarning;
+                    if (typeof f !== 'function') return {error: 'missing'};
+                    const ss = {extract: {reason: 'access_denied', detail: 'use a specific repo path'}};
+                    return {
+                        unhealthy: f('extract', ss),
+                        healthy: f('fs', ss),       // no entry → ''
+                        empty: f('extract', {}),
+                    };
+                }"""
+            )
+            assert res.get("error") is None, res
+            assert "access denied" in res["unhealthy"]
+            assert "specific repo path" in res["unhealthy"]
+            assert "data-slot-warning" in res["unhealthy"]
+            assert res["healthy"] == ""
+            assert res["empty"] == ""
+            browser.close()
+        finally:
+            server.should_exit = True
+
+
+@pytestmark_playwright
 def test_settings_tab_classifier(client):
     """0bf67524 — the settings-tab classifier maps section ids to the right tab.
 
