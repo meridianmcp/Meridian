@@ -1,6 +1,38 @@
 // dashboard-sprint.js — sprint/queue renderers extracted from dashboard.js
 // Depends on: dashboard-utils.js (escapeHtml, getPanelState, formatRelativeTime, _PLAN_LABELS)
 
+// c2fe20c3 — history-signal badges for a sprint item so pending items aren't
+// indistinguishable: a stall counter (↻N), a "retried" tag (claimed before, now
+// back to pending), and a live pulse dot for an in-progress (claimed) item. Pure
+// + exported for the UI test. The pulse keyframes are injected once.
+function _ensureSprintPulseStyle() {
+  if (typeof document === 'undefined') return;
+  if (document.getElementById('sprint-pulse-style')) return;
+  const st = document.createElement('style');
+  st.id = 'sprint-pulse-style';
+  st.textContent = '@keyframes sprintPulse{0%{box-shadow:0 0 0 0 rgba(34,197,94,0.6)}70%{box-shadow:0 0 0 5px rgba(34,197,94,0)}100%{box-shadow:0 0 0 0 rgba(34,197,94,0)}}';
+  document.head.appendChild(st);
+}
+
+function _sprintHistoryBadges(it) {
+  if (!it) return '';
+  _ensureSprintPulseStyle();
+  let html = '';
+  const stall = Number(it.stall_count || 0);
+  if (stall > 0) {
+    html += `<span class="sprint-stall-badge" title="Stalled and re-queued ${stall} time(s)" style="margin-left:6px;font-size:9px;font-weight:700;color:#f59e0b;background:#f59e0b22;border-radius:3px;padding:1px 5px">↻${stall}</span>`;
+  }
+  const isPending = it.status === 'pending' || it.status === 'todo';
+  if (isPending && it.claimed_at) {
+    html += `<span class="sprint-retried-badge" title="Was claimed by a session before — now back to pending" style="margin-left:6px;font-size:9px;color:var(--muted);border:1px solid var(--border);border-radius:3px;padding:1px 5px">retried</span>`;
+  }
+  if (it.status === 'in_progress' && it.claimed_at) {
+    html += `<span class="sprint-live-dot" title="Claimed by an active session" style="display:inline-block;width:7px;height:7px;border-radius:50%;background:#22c55e;margin-left:6px;animation:sprintPulse 1.6s infinite;vertical-align:middle"></span>`;
+  }
+  return html;
+}
+if (typeof window !== 'undefined') window._sprintHistoryBadges = _sprintHistoryBadges;
+
 export function _renderPlanBadge(me) {
 
   const planColors = { free: '#3b82f6', trial: '#059669', standard: '#3b82f6', pro: '#7c3aed', admin: '#9ca3af' };
@@ -524,7 +556,7 @@ export function renderSprintProgress(projectId, items) {
 
       <div style="flex:1;min-width:0">
 
-        <span class="sprint-item-title">${escapeHtml(it.title)}${indBadge}${childBadge}</span>
+        <span class="sprint-item-title">${escapeHtml(it.title)}${indBadge}${childBadge}${_sprintHistoryBadges(it)}</span>
 
         ${notesHtml}
 

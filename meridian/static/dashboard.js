@@ -6722,6 +6722,152 @@ function _codeArchSection(archText) {
 }
 
 
+// 65742e42 — normalize a codebase__query_graph result (package-edge Cypher) into
+// a list of {source, target, value} edges. Defensive: tolerates row arrays
+// ([a, b, count]) and a few common object shapes; bad input → []. Pure + tested.
+function _normalizeGraphEdges(queryResult) {
+  let rows = [];
+  try {
+    const txt = ((queryResult && queryResult.content) || []).map(c => c.text || '').join('').trim();
+    if (!txt) return [];
+    const obj = JSON.parse(txt);
+    rows = Array.isArray(obj) ? obj : (obj.rows || obj.data || obj.results || obj.records || []);
+  } catch (_) { return []; }
+  const edges = [];
+  for (const row of (Array.isArray(rows) ? rows : [])) {
+    if (Array.isArray(row) && row.length >= 2) {
+      edges.push({ source: String(row[0]), target: String(row[1]), value: Number(row[2]) || 1 });
+    } else if (row && typeof row === 'object') {
+      const src = row.source ?? row.from ?? row['a.package'] ?? row.a;
+      const tgt = row.target ?? row.to ?? row['b.package'] ?? row.b;
+      const val = row.value ?? row.count ?? row['count(r)'] ?? row.weight ?? 1;
+      if (src != null && tgt != null) {
+        edges.push({ source: String(src), target: String(tgt), value: Number(val) || 1 });
+      }
+    }
+  }
+  return edges;
+}
+if (typeof window !== 'undefined') window._normalizeGraphEdges = _normalizeGraphEdges;
+
+// 65742e42 — build an ECharts force-graph option from architecture packages +
+// cross-package edges. Nodes are packages (sized by node_count, colored by
+// layer); the 'hotspots' view instead sizes by connection degree to surface the
+// most-connected packages. Returns null when there are no packages. Pure + tested.
+function _buildCodebaseForceGraph(packages, edges, view) {
+  const pkgs = (packages || []).filter(p => p && p.name != null);
+  if (!pkgs.length) return null;
+  const layers = [...new Set(pkgs.map(p => String(p.layer != null ? p.layer : 'other')))];
+  const palette = ['#60a5fa', '#34d399', '#fbbf24', '#f87171', '#a78bfa', '#f472b6', '#22d3ee'];
+  const layerColor = {};
+  layers.forEach((l, i) => { layerColor[l] = palette[i % palette.length]; });
+  const degree = {};
+  (edges || []).forEach(e => {
+    if (!e) return;
+    degree[e.source] = (degree[e.source] || 0) + (Number(e.value) || 1);
+    degree[e.target] = (degree[e.target] || 0) + (Number(e.value) || 1);
+  });
+  const metric = (p) => view === 'hotspots'
+    ? (degree[String(p.name)] || 0)
+    : (Number(p.node_count) || 0);
+  const maxMetric = Math.max(1, ...pkgs.map(metric));
+  const nodes = pkgs.map(p => {
+    const lyr = String(p.layer != null ? p.layer : 'other');
+    return {
+      name: String(p.name),
+      value: metric(p),
+      symbolSize: 8 + 42 * (metric(p) / maxMetric),
+      category: layers.indexOf(lyr),
+      itemStyle: { color: layerColor[lyr] },
+    };
+  });
+  const names = new Set(nodes.map(n => n.name));
+  const links = (edges || [])
+    .filter(e => e && names.has(e.source) && names.has(e.target) && e.source !== e.target)
+    .map(e => ({
+      source: e.source, target: e.target, value: Number(e.value) || 1,
+      lineStyle: { width: Math.min(6, 1 + (Number(e.value) || 1) / 3) },
+    }));
+  return {
+    tooltip: { confine: true },
+    legend: [{ data: layers, textStyle: { color: '#9ca3af', fontSize: 9 }, top: 0 }],
+    series: [{
+      type: 'graph', layout: 'force', roam: true, draggable: true,
+      categories: layers.map(l => ({ name: l })),
+      label: { show: true, fontSize: 9, color: '#e5e7eb', position: 'right' },
+      force: { repulsion: 140, edgeLength: 90, gravity: 0.08 },
+      data: nodes, links,
+      emphasis: { focus: 'adjacency' },
+      lineStyle: { color: 'source', opacity: 0.5, curveness: 0.1 },
+    }],
+  };
+}
+if (typeof window !== 'undefined') window._buildCodebaseForceGraph = _buildCodebaseForceGraph;
+
+// Render the force-graph into a container + wire the Packages/Hotspots toggle.
+// Best-effort: missing echarts / no packages → leaves the placeholder text.
+function _renderCodebaseGraph(containerId, packages, edges) {
+  if (typeof window === 'undefined' || !window.echarts) return;
+  const el = document.getElementById(containerId);
+  if (!el) return;
+  const opt = _buildCodebaseForceGraph(packages, edges, 'packages');
+  if (!opt) return;
+  let chart;
+  try { chart = window.echarts.init(el); } catch (_) { return; }
+  chart.setOption(opt);
+  const setView = (view) => {
+    const o = _buildCodebaseForceGraph(packages, edges, view);
+    if (o) chart.setOption(o, true);
+    document.querySelectorAll(`[data-cg-toggle][data-cg-for="${containerId}"]`).forEach(b => {
+      const on = b.getAttribute('data-cg-toggle') === view;
+      b.style.color = on ? 'var(--text)' : 'var(--muted)';
+      b.style.borderColor = on ? 'var(--accent)' : 'var(--border)';
+    });
+  };
+  document.querySelectorAll(`[data-cg-toggle][data-cg-for="${containerId}"]`).forEach(b => {
+    b.onclick = () => setView(b.getAttribute('data-cg-toggle'));
+  });
+  setView('packages');
+}
+if (typeof window !== 'undefined') window._renderCodebaseGraph = _renderCodebaseGraph;
+
+// 5813affe — POST the (already-fetched) package graph to the server, which
+// renders a static Graphviz PNG and returns it as a base64 data URI. Surfaces an
+// actionable hint when Graphviz isn't installed (503 graphviz_missing).
+async function _generateCodebaseMap(projectId) {
+  const data = (window._codeGraphData || {})[projectId];
+  const out = data && document.getElementById(`${data.cgId}-map`);
+  if (!data || !out) return;
+  if (!(data.packages || []).length) {
+    out.innerHTML = `<div style="font-size:10px;color:var(--muted)">No packages to map yet — index the repo first.</div>`;
+    return;
+  }
+  out.innerHTML = `<div style="font-size:10px;color:var(--muted)">rendering map…</div>`;
+  try {
+    const r = await fetch(`/projects/${encodeURIComponent(projectId)}/codebase-map`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ packages: data.packages, edges: data.edges, hotspots: false }),
+    });
+    if (r.status === 503) {
+      const body = await r.json().catch(() => ({}));
+      out.innerHTML = `<div style="font-size:10px;color:#e0b400;border:1px solid #c79a00;border-radius:4px;padding:6px 8px;background:rgba(199,154,0,0.10)">&#9888; ${escapeHtml(body.message || 'Graphviz is not installed on the server.')}</div>`;
+      return;
+    }
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const body = await r.json();
+    if (body.image) {
+      out.innerHTML = `<img src="${body.image}" alt="Codebase package map" style="max-width:100%;border:1px solid var(--border);border-radius:4px;background:#0b0e14">`;
+    } else {
+      out.innerHTML = `<div style="font-size:10px;color:var(--error)">No image returned.</div>`;
+    }
+  } catch (e) {
+    out.innerHTML = `<div style="font-size:10px;color:var(--error)">Map generation failed: ${escapeHtml(String(e))}</div>`;
+  }
+}
+if (typeof window !== 'undefined') window._generateCodebaseMap = _generateCodebaseMap;
+
+
 async function loadCodeIntelTab(projectId) {
   const body = document.getElementById(`codeintel-body-${projectId}`);
   if (!body) return;
@@ -6783,12 +6929,33 @@ async function loadCodeIntelTab(projectId) {
 
     let html = '';
     let archCharts = [];  // {id, config} pairs instantiated after body.innerHTML
+    // 65742e42 — codebase force-graph data, populated in the Architecture section
+    // below and rendered after body.innerHTML into the container added here.
+    let _graphPackages = [];
+    let _graphEdges = [];
+    const _cgId = `ci-forcegraph-${projectId}`;
 
     // Live indicator
     html += `<div style="display:flex;align-items:center;gap:8px;margin-bottom:14px">
       <span style="width:8px;height:8px;border-radius:50%;background:#22c55e;display:inline-block;flex-shrink:0"></span>
       <span style="font-size:11px;color:var(--text);font-weight:600">Code Intel Live</span>
       ${toolCount ? `<span style="font-size:10px;color:var(--muted)">${toolCount} tool${toolCount !== 1 ? 's' : ''}</span>` : ''}
+    </div>`;
+
+    // 65742e42 — codebase force-graph at the top of the tab (filled below).
+    // 5813affe — "Generate Map" exports a static graphviz PNG of the same graph.
+    html += `<div style="margin-bottom:16px">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px">
+        <div style="font-size:10px;color:var(--accent);text-transform:uppercase;letter-spacing:.06em">Package Graph</div>
+        <div style="display:flex;gap:4px;align-items:center">
+          <button data-cg-toggle="packages" data-cg-for="${_cgId}" style="background:none;border:1px solid var(--accent);border-radius:3px;color:var(--text);font-size:9px;font-family:var(--font-mono);padding:2px 8px;cursor:pointer">Packages</button>
+          <button data-cg-toggle="hotspots" data-cg-for="${_cgId}" style="background:none;border:1px solid var(--border);border-radius:3px;color:var(--muted);font-size:9px;font-family:var(--font-mono);padding:2px 8px;cursor:pointer">Hotspots</button>
+          <button id="${_cgId}-genmap" onclick="_generateCodebaseMap(${JSON.stringify(projectId)})" style="background:none;border:1px solid var(--border);border-radius:3px;color:var(--muted);font-size:9px;font-family:var(--font-mono);padding:2px 8px;cursor:pointer" title="Render a static PNG map via Graphviz">Generate Map</button>
+        </div>
+      </div>
+      <div id="${_cgId}" style="width:100%;height:400px;background:var(--surface-1);border:1px solid var(--border);border-radius:4px"></div>
+      <div id="${_cgId}-empty" style="display:none;font-size:10px;color:var(--muted);margin-top:4px">No package graph yet — index the repo to populate it.</div>
+      <div id="${_cgId}-map" style="margin-top:8px"></div>
     </div>`;
 
     // Index status per repo path
@@ -6827,6 +6994,20 @@ async function loadCodeIntelTab(projectId) {
       const archSection = _codeArchSection(archText);
       html += archSection.html;
       archCharts = archSection.charts;
+      // 65742e42 — capture packages + fetch cross-package edges for the force-graph.
+      try {
+        const _arch = JSON.parse(archText);
+        _graphPackages = Array.isArray(_arch?.packages) ? _arch.packages : [];
+      } catch (_) { _graphPackages = []; }
+      if (_graphPackages.length) {
+        try {
+          const _edgeRes = await _codeMcpCall('tools/call', {name: 'query_graph', arguments: {
+            ...archArgs,
+            cypher: 'MATCH (a)-[r]->(b) WHERE a.package <> b.package RETURN a.package, b.package, count(r)',
+          }});
+          _graphEdges = _normalizeGraphEdges(_edgeRes);
+        } catch (_) { _graphEdges = []; }  // nodes-only graph still renders
+      }
     } catch (e) {
       html += `<div style="font-size:10px;color:var(--error)">get_architecture failed: ${escapeHtml(String(e))}</div>`;
     }
@@ -6844,6 +7025,19 @@ async function loadCodeIntelTab(projectId) {
         const el = document.getElementById(c.id);
         if (el) { try { new Chart(el, c.config); } catch (_) { /* skip a bad chart */ } }
       }
+    }
+
+    // 65742e42 — render the package force-graph (or show the empty hint).
+    // 5813affe — stash the graph so "Generate Map" can POST it for a PNG render.
+    window._codeGraphData = window._codeGraphData || {};
+    window._codeGraphData[projectId] = { packages: _graphPackages, edges: _graphEdges, cgId: _cgId };
+    if (_graphPackages.length) {
+      _renderCodebaseGraph(_cgId, _graphPackages, _graphEdges);
+    } else {
+      const _ph = document.getElementById(_cgId);
+      const _em = document.getElementById(`${_cgId}-empty`);
+      if (_ph) _ph.style.display = 'none';
+      if (_em) _em.style.display = 'block';
     }
 
   } catch (e) {
@@ -9144,11 +9338,12 @@ function initHitlPanel() {
 
   refreshHitl();
 
-  // 20591f72 — restore 60s fallback poll: WS push is the fast path but if the
-  // project panel isn't open yet (no WS listener) the event is dropped silently.
-  // 60s keeps the bar fresh without noticeable lag for the human.
+  // 20591f72 — fallback poll: WS push is the fast path but if the project panel
+  // isn't open yet (no WS listener) the event is dropped silently.
+  // 0b9b12c8 — 10s (was 60s) so a blocking HITL appears promptly even when WS
+  // push is missed.
   if (_hitlPollTimer) clearInterval(_hitlPollTimer);
-  _hitlPollTimer = setInterval(refreshHitl, 60000);
+  _hitlPollTimer = setInterval(refreshHitl, 10000);
 
 }
 
@@ -9219,6 +9414,27 @@ async function refreshProjectCountBadges(projectId) {
 }
 
 
+
+// 0b9b12c8 — render recently auto-answered HITLs greyed out so the human can
+// see what the auto-answer resolved vs. what's genuinely pending. Pure +
+// exported for the UI test. Returns '' when there are none.
+function _renderAutoAnsweredHitls(answered) {
+  const auto = (answered || []).filter(r => r && r.answered_by === 'auto').slice(0, 5);
+  if (!auto.length) return '';
+  const rows = auto.map(r => {
+    const ts = formatRelativeTime(r.answered_at || r.created_at);
+    return `<div data-hitl-auto-id="${escapeHtml(r.id)}" style="opacity:0.55;border-left:3px solid var(--muted);background:var(--surface-1);padding:8px 12px;margin-bottom:6px;border-radius:0 4px 4px 0">
+        <div style="display:flex;justify-content:space-between;gap:8px;margin-bottom:4px">
+          <span style="background:var(--surface-2);color:var(--muted);font-size:9px;font-weight:700;letter-spacing:.5px;padding:2px 6px;border-radius:3px">AUTO-ANSWERED</span>
+          <span style="color:var(--muted);font-size:10px">${escapeHtml(ts)}</span>
+        </div>
+        <div style="color:var(--text);white-space:pre-wrap;word-break:break-word;font-size:11px;margin-bottom:3px">${escapeHtml(r.question || '')}</div>
+        <div style="color:var(--muted);font-size:11px"><span style="font-weight:600">→</span> ${escapeHtml(r.answer || '')}</div>
+      </div>`;
+  }).join('');
+  return `<div data-hitl-auto-section style="margin:10px 0 4px;font-size:9px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.5px">Recently auto-answered</div>${rows}`;
+}
+window._renderAutoAnsweredHitls = _renderAutoAnsweredHitls;
 
 async function refreshHitl() {
 
@@ -9356,9 +9572,27 @@ async function refreshHitl() {
 
     });
 
+    // 0b9b12c8 — append a greyed "recently auto-answered" section (best-effort).
+    try {
+
+      const answered = await api('/hitl?status=answered&limit=10');
+
+      const autoHtml = _renderAutoAnsweredHitls(answered);
+
+      if (autoHtml) list.insertAdjacentHTML('beforeend', autoHtml);
+
+    } catch (e) {
+
+      console.error('[meridian] auto-answered HITL fetch failed:', e);
+
+    }
+
   } catch (e) {
 
-    // Silent fail on poll — don't toast every 30s when offline.
+    // 0b9b12c8 — don't toast every poll (noisy when offline), but DO log to the
+    // console so a non-200 /hitl (HITLs silently never appearing) is debuggable
+    // in devtools instead of vanishing.
+    console.error('[meridian] refreshHitl failed — HITL bar may be stale:', e);
 
   }
 

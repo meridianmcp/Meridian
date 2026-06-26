@@ -220,6 +220,50 @@ async def get_project_settings(project_id: str, request: Request) -> dict[str, A
     return settings
 
 
+@router.post("/projects/{project_id}/codebase-map")
+async def generate_codebase_map(project_id: str, request: Request) -> dict[str, Any]:
+    """5813affe — render a package-level codebase map (graphviz) from the graph
+    the dashboard already fetched, and return it inline as a base64 PNG.
+
+    Body: ``{"packages": [...], "edges": [...], "hotspots": bool}``. Graphviz is
+    an optional system dependency — when ``dot`` isn't installed this returns a
+    503 with an actionable install hint instead of failing opaquely.
+    """
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail="invalid JSON body")
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="body must be an object")
+    graph = {"packages": body.get("packages") or [], "edges": body.get("edges") or []}
+    if not graph["packages"]:
+        raise HTTPException(status_code=400, detail="no packages supplied — index the repo first")
+
+    import base64
+    import tempfile
+    from pathlib import Path as _Path
+    from ..codebase_map import GraphvizMissingError, render_map
+
+    out = _Path(tempfile.gettempdir()) / f"meridian_codebase_map_{project_id[:8]}.png"
+    try:
+        render_map(graph, str(out), hotspots_only=bool(body.get("hotspots")))
+    except GraphvizMissingError as exc:
+        return Response(
+            content=json.dumps({"error": "graphviz_missing", "message": str(exc)}),
+            status_code=503, media_type="application/json",
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"map render failed: {exc}")
+    try:
+        png_b64 = base64.b64encode(out.read_bytes()).decode("ascii")
+    finally:
+        try:
+            out.unlink()
+        except OSError:
+            pass
+    return {"image": f"data:image/png;base64,{png_b64}", "format": "png"}
+
+
 @router.patch("/projects/{project_id}/settings", response_model=ProjectSettings)
 async def patch_project_settings(
     project_id: str, body: ProjectSettingsPatch, request: Request
