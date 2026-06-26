@@ -1134,6 +1134,98 @@ def test_claim_sprint_item_race_no_next_item():
         _run(db.close())
 
 
+def test_start_session_reports_hitl_auto_answer_mode():
+    """72e12ed8 — orientation carries the project's HITL auto-answer mode + directive."""
+    import meridian.db as db_module
+    db = _make_db()
+    try:
+        proj = _run(mh._dispatch_mcp_tool("create_project", {"name": "hitlmode"}, db, "/tmp"))
+        pid = proj["id"]
+        # Default mode 0 → OFF directive.
+        out = _run(mh._dispatch_mcp_tool(
+            "start_session", {"project_id": pid, "session_name": "s1"}, db, "/tmp",
+        ))
+        assert out["hitl_auto_answer_mode"] == 0
+        assert "auto-answer OFF" in out["hitl_auto_answer_directive"]
+        # Set mode 2 → AGGRESSIVE directive on a fresh session.
+        _run(db_module.update_project_settings(db, pid, hitl_auto_answer=2))
+        out2 = _run(mh._dispatch_mcp_tool(
+            "start_session", {"project_id": pid, "session_name": "s2"}, db, "/tmp",
+        ))
+        assert out2["hitl_auto_answer_mode"] == 2
+        assert "AGGRESSIVE" in out2["hitl_auto_answer_directive"]
+    finally:
+        _run(db.close())
+
+
+def test_update_sprint_item_blocks_in_progress():
+    """586eeda9 — mutating an in_progress item is blocked unless force=true."""
+    db = _make_db()
+    try:
+        proj = _run(mh._dispatch_mcp_tool("create_project", {"name": "mutguard"}, db, "/tmp"))
+        pid = proj["id"]
+        item = _run(mh._dispatch_mcp_tool(
+            "add_sprint_item", {"project_id": pid, "version": "v1", "title": "a",
+                                "touches_resources": ["file:a.py"]}, db, "/tmp",
+        ))
+        _run(mh._dispatch_mcp_tool(
+            "claim_sprint_item", {"project_id": pid, "item_id": item["id"]}, db, "/tmp",
+        ))
+        out = _run(mh._dispatch_mcp_tool(
+            "update_sprint_item", {"project_id": pid, "item_id": item["id"], "title": "b"},
+            db, "/tmp",
+        ))
+        assert out["error"] == "IN_PROGRESS"
+        assert "force=true" in out["message"]
+        forced = _run(mh._dispatch_mcp_tool(
+            "update_sprint_item",
+            {"project_id": pid, "item_id": item["id"], "title": "b", "force": True},
+            db, "/tmp",
+        ))
+        assert forced.get("error") != "IN_PROGRESS"
+        assert forced.get("title") == "b"
+    finally:
+        _run(db.close())
+
+
+def test_update_sprint_item_pending_not_blocked():
+    """A pending (unclaimed) item mutates freely."""
+    db = _make_db()
+    try:
+        proj = _run(mh._dispatch_mcp_tool("create_project", {"name": "mutok"}, db, "/tmp"))
+        pid = proj["id"]
+        item = _run(mh._dispatch_mcp_tool(
+            "add_sprint_item", {"project_id": pid, "version": "v1", "title": "a"}, db, "/tmp",
+        ))
+        out = _run(mh._dispatch_mcp_tool(
+            "update_sprint_item", {"project_id": pid, "item_id": item["id"], "title": "renamed"},
+            db, "/tmp",
+        ))
+        assert out.get("title") == "renamed"
+    finally:
+        _run(db.close())
+
+
+def test_fan_out_warns_on_active_session():
+    """586eeda9 — fan_out_sprint_items surfaces an active-session warning."""
+    import meridian.db as db_module
+    db = _make_db()
+    try:
+        proj = _run(mh._dispatch_mcp_tool("create_project", {"name": "fanwarn"}, db, "/tmp"))
+        pid = proj["id"]
+        _run(db_module.register_session(db, pid, "live-worker"))
+        out = _run(mh._dispatch_mcp_tool(
+            "fan_out_sprint_items",
+            {"project_id": pid, "items": [{"title": "x", "version": "v1"}]},
+            db, "/tmp",
+        ))
+        assert out["count"] == 1
+        assert "active_session_warning" in out
+        assert "live-worker" in out["active_session_warning"]
+    finally:
+        _run(db.close())
+
+
 def test_claim_sprint_item_protected_files():
     import meridian.db as db_module
 
@@ -1497,6 +1589,19 @@ def test_set_executor_config_persists_filesystem_roots():
         import meridian.db as db_module
         cfg = _run(db_module.get_executor_config(db, pid))
         assert cfg["filesystem_roots"] == ["C:/a", "D:/b"]
+    finally:
+        _run(db.close())
+
+
+def test_set_executor_config_persists_max_turns():
+    """d2c47f43 — max_turns round-trips through set_executor_config."""
+    db = _make_db()
+    try:
+        proj = _run(mh._dispatch_mcp_tool("create_project", {"name": "mt"}, db, "/tmp"))
+        out = _run(mh._dispatch_mcp_tool(
+            "set_executor_config", {"project_id": proj["id"], "max_turns": 75}, db, "/tmp",
+        ))
+        assert out["max_turns"] == 75
     finally:
         _run(db.close())
 

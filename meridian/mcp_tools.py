@@ -190,7 +190,16 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."}},
          "required": ["session_id"]}},
     {"name": "request_hitl", "description":
-        "Surface a question to the human-in-the-loop queue. urgency='blocking' "
+        "Surface a question to the human-in-the-loop queue. ALWAYS use this to ask "
+        "the human a question — never just ask in chat, which is invisible to the "
+        "dashboard and to an unattended/autonomous run. IMPORTANT: when the "
+        "project's HITL auto-answer mode is on (1=safe, 2=aggressive) and the "
+        "question is not destructive / not require_human, this tool RESOLVES "
+        "IMMEDIATELY and returns the chosen answer inline in the response (it does "
+        "NOT block) — so calling it is cheap and is the right move even when you "
+        "expect a quick yes/no. The active mode is reported in the start_session "
+        "orientation as hitl_auto_answer_mode. "
+        "urgency='blocking' "
         "means this session pauses until answered (poll get_hitl_request). "
         "urgency='normal'/'high' lands in the dashboard but doesn't block. "
         "assigned_to routes to a specific human_id (null = broadcast). "
@@ -677,7 +686,8 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "branch": {"type": "string"},
          "filesystem_roots": {"type": "array", "items": {"type": "string"},
              "description": "Directories the tunnel's filesystem connector may serve (unioned across the tenant's projects). Overwrites the existing list."},
-         "context_threshold": {"type": "integer", "description": "Turns before a context-budget warning is surfaced to the session."}},
+         "context_threshold": {"type": "integer", "description": "Turns before a context-budget warning is surfaced to the session."},
+         "max_turns": {"type": "integer", "description": "Turn ceiling injected into the /goal string ('Stop after N turns'). Default 200."}},
          "required": []}},
     {"name": "claim_file", "description":
         "Claim edit rights on a file for this session. Whole-file by default "

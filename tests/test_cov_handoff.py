@@ -88,6 +88,31 @@ def test_build_quick_start_goal_with_and_without_items():
     assert full.startswith("/goal You are an executor. Claim and execute")
 
 
+def test_build_quick_start_goal_max_turns():
+    """d2c47f43 — max_turns sets the 'Stop after N turns' ceiling (default 200)."""
+    # Default 200 on both paths.
+    assert "Stop after 200 turns" in handoff_module._build_quick_start_goal([])
+    assert "Stop after 200 turns" in handoff_module._build_quick_start_goal([{"id": "x"}])
+    # Override applies to both paths.
+    assert "Stop after 50 turns" in handoff_module._build_quick_start_goal([], max_turns=50)
+    assert "Stop after 50 turns" in handoff_module._build_quick_start_goal(
+        [{"id": "x"}], max_turns=50)
+    # Invalid / non-positive falls back to default.
+    assert "Stop after 200 turns" in handoff_module._build_quick_start_goal([{"id": "x"}], max_turns=0)
+    assert "Stop after 200 turns" in handoff_module._build_quick_start_goal([{"id": "x"}], max_turns="bad")
+
+
+def test_max_turns_from_settings():
+    """d2c47f43 — extract executor_config.max_turns with a 200 default."""
+    f = handoff_module._max_turns_from_settings
+    assert f(None) == 200
+    assert f({"executor_config": {}}) == 200
+    assert f({"executor_config": {"max_turns": 75}}) == 75
+    assert f({"executor_config": {"max_turns": 0}}) == 200       # non-positive → default
+    assert f({"executor_config": {"max_turns": "nope"}}) == 200  # bad → default
+    assert f({"executor_config": "notadict"}) == 200
+
+
 def test_note_tags_and_select_strategic_notes():
     notes = [
         {"title": "Insight one", "body": "b", "kind": "insight"},

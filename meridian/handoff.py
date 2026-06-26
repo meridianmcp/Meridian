@@ -110,12 +110,31 @@ _INTERACTIVE_GOAL_DIRECTIVE = (
 )
 
 
+# d2c47f43 — default turn ceiling in the /goal string when the project's
+# executor_config doesn't override it via `max_turns`.
+_DEFAULT_GOAL_MAX_TURNS = 200
+
+
+def _max_turns_from_settings(proj_settings: dict[str, Any] | None) -> int:
+    """Extract executor_config.max_turns (default 200). (d2c47f43)"""
+    cfg = (proj_settings or {}).get("executor_config") or {}
+    if not isinstance(cfg, dict):
+        return _DEFAULT_GOAL_MAX_TURNS
+    raw = cfg.get("max_turns")
+    try:
+        val = int(raw)
+        return val if val > 0 else _DEFAULT_GOAL_MAX_TURNS
+    except (TypeError, ValueError):
+        return _DEFAULT_GOAL_MAX_TURNS
+
+
 def _build_quick_start_goal(
     pending_sprint_items: list[dict[str, Any]],
     *,
     test_floor: int = _DEFAULT_GOAL_TEST_FLOOR,
     version: str | None = None,
     execution_mode: str = "autonomous",
+    max_turns: int = _DEFAULT_GOAL_MAX_TURNS,
 ) -> str:
     """Build the handoff /goal template from the live pending sprint item ids.
 
@@ -129,7 +148,17 @@ def _build_quick_start_goal(
     so the session runs immediately; 'interactive' prepends a deferential
     directive so the session asks which item to start first. Any value other
     than 'interactive' is treated as autonomous.
+
+    ``max_turns`` (d2c47f43) sets the "Stop after N turns" ceiling. Sourced from
+    the project's ``executor_config.max_turns`` (default 200) so a long-running
+    sprint isn't cut off at the old hardcoded 40.
     """
+    try:
+        _turns = int(max_turns)
+        if _turns <= 0:
+            _turns = _DEFAULT_GOAL_MAX_TURNS
+    except (TypeError, ValueError):
+        _turns = _DEFAULT_GOAL_MAX_TURNS
     if version is not None:
         pending_sprint_items = [
             item for item in pending_sprint_items
@@ -140,7 +169,7 @@ def _build_quick_start_goal(
         return (
             "/goal Verify remaining work is complete. Done when pixi run test "
             f"passes {test_floor}+, and generate_handoff() is called at the "
-            "end. Stop after 40 turns or if HITL triggered."
+            f"end. Stop after {_turns} turns or if HITL triggered."
         )
     directive = (
         _INTERACTIVE_GOAL_DIRECTIVE
@@ -152,7 +181,7 @@ def _build_quick_start_goal(
         f"Complete sprint items: {', '.join(item_ids)}. "
         "Done when all listed sprint items are marked complete via "
         f"complete_sprint_item(), pixi run test passes {test_floor}+, and "
-        "generate_handoff() is called at the end. Stop after 40 turns or if "
+        f"generate_handoff() is called at the end. Stop after {_turns} turns or if "
         "HITL triggered."
     )
 
@@ -959,6 +988,7 @@ async def generate_handoff(
         execution_mode=db_module.normalize_execution_mode(
             project.get("execution_mode")
         ),
+        max_turns=_max_turns_from_settings(proj_settings),
     )
 
     # Split tasks into L1 (last 10) and L2 (older).
@@ -1280,15 +1310,16 @@ async def _generate_starter_handoff(
         if it.get("status") in {"pending", "todo"}
     ]
     pending = _prepare_pending_sprint_items(pending)
+    settings = await db_module.get_project_settings(db, project_id)
+    executor_config = (settings or {}).get("executor_config") if settings else None
     # ecf69de8 — the project's executor posture selects the /goal framing.
     quick_start_goal = _build_quick_start_goal(
         pending,
         execution_mode=db_module.normalize_execution_mode(
             project.get("execution_mode")
         ),
+        max_turns=_max_turns_from_settings(settings),
     )
-    settings = await db_module.get_project_settings(db, project_id)
-    executor_config = (settings or {}).get("executor_config") if settings else None
     content = _render_starter_handoff(
         project,
         completed_items=completed,
