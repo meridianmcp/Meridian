@@ -173,6 +173,34 @@ def test_tunnel_status_includes_slot_health():
         tn._tunnel_sockets.pop("th3", None)
 
 
+def test_slot_status_detail_record_clear():
+    """9a8645c1 — unhealthy reports stash a reason/detail; healthy clears it."""
+    try:
+        tn._record_slot_health("thd", "extract", False,
+                               reason="access_denied", detail="use a specific repo path")
+        assert tn._slot_status_detail["thd"]["extract"]["reason"] == "access_denied"
+        status = asyncio.run(tn.tunnel_status("thd"))
+        assert status["slot_status"]["extract"]["reason"] == "access_denied"
+        assert "specific repo path" in status["slot_status"]["extract"]["detail"]
+        tn._record_slot_health("thd", "extract", True)  # recovery clears it
+        assert "extract" not in tn._slot_status_detail.get("thd", {})
+    finally:
+        tn._slot_health.pop("thd", None)
+        tn._slot_status_detail.pop("thd", None)
+
+
+def test_clear_slot_health_drops_detail():
+    """Disconnect clears both health and the diagnostic detail."""
+    try:
+        tn._record_slot_health("thc", "extract", False, reason="access_denied", detail="x")
+        tn._clear_slot_health("thc", "extract")
+        assert tn._slot_status_detail.get("thc") is None
+        assert tn._slot_health.get("thc") is None
+    finally:
+        tn._slot_health.pop("thc", None)
+        tn._slot_status_detail.pop("thc", None)
+
+
 def test_call_tunnel_tool_routes_to_owner(monkeypatch):
     tn._tunnel_code_sockets["t1"] = object()
     # Routing cache is keyed by the connector-prefixed name.
@@ -412,6 +440,7 @@ def test_tunnel_status_reports_active_sockets():
         "word_active": False,
         "dc_active": False,
         "slot_health": {},  # d71ba2e7 — no slots reported unhealthy
+        "slot_status": {},  # 9a8645c1 — no slot diagnostics
     }
 
 

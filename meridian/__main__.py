@@ -101,8 +101,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--repo",
+        nargs="+",
         default=None,
-        help="Repo path to expose over --tunnel (defaults to current directory).",
+        help="Repo path(s) to expose over --tunnel (defaults to current "
+             "directory). First path = active repo (Serena --project); extra "
+             "paths = additional filesystem roots. (cbbd0eb4)",
     )
     parser.add_argument(
         "--tunnel-port",
@@ -138,12 +141,17 @@ def main(argv: list[str] | None = None) -> int:
         from .tunnel_client import run_tunnel
 
         loop = asyncio.get_event_loop()
+        # cbbd0eb4 — --repo is nargs='+': first = active repo, rest = extra fs roots.
+        _repo_list = args.repo if isinstance(args.repo, list) else ([args.repo] if args.repo else [])
+        _repo_path = _repo_list[0] if _repo_list else None
+        _extra_roots = _repo_list[1:]
         try:
             return loop.run_until_complete(
                 run_tunnel(
                     token=args.token,
                     base_url=args.server,
-                    repo_path=args.repo,
+                    repo_path=_repo_path,
+                    extra_fs_roots=_extra_roots,
                     port=args.tunnel_port,
                     code_dirs=args.code_dirs,
                 )

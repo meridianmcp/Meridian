@@ -4958,6 +4958,17 @@ project_id = "${displayPid}"`;
     }
   }
   window._tunnelCopyToClipboard = _tunnelCopyToClipboard;
+  function _renderSlotHealthWarning(slot, slotStatus) {
+    const st = slotStatus && slotStatus[slot];
+    if (!st || !st.reason && !st.detail) return "";
+    const label = st.reason === "access_denied" ? "access denied" : (st.reason || "unavailable").replace(/_/g, " ");
+    const detail = st.detail ? `<div style="margin-top:3px;color:var(--muted);font-weight:400">${escapeHtml(st.detail)}</div>` : "";
+    return `
+        <div data-slot-warning="${escapeHtml(slot)}" style="margin-top:6px;padding:6px 8px;border:1px solid #c79a00;border-radius:4px;background:rgba(199,154,0,0.10);font-size:9px;line-height:1.6;color:#e0b400">
+          <span style="font-weight:700">&#9888; ${escapeHtml(label)}</span>${detail}
+        </div>`;
+  }
+  window._renderSlotHealthWarning = _renderSlotHealthWarning;
   async function loadTunnelPluginsSection2(projectId) {
     const host = document.getElementById(`settings-body-${projectId}`);
     if (!host) return;
@@ -4982,6 +4993,7 @@ project_id = "${displayPid}"`;
         port: c.port,
         enabled: c.enabled !== false
       }));
+      const slotStatus = data && data.slot_status || {};
       const renderRow = (p) => {
         const cmd = Array.isArray(p.command) ? p.command.join(" ") : "";
         const lifecycleState = _pluginLifecycleState(p, active);
@@ -4993,6 +5005,7 @@ project_id = "${displayPid}"`;
             Enable the toggle, then restart <code style="font-family:var(--font-mono)">meridian --tunnel</code> to launch
             <code style="font-family:var(--font-mono)">${escapeHtml(hint.pkg)}</code>.<br>${escapeHtml(hint.note)}
           </div>` : "";
+        const warnHtml = _renderSlotHealthWarning(p.slot, slotStatus);
         const toggle = p.core ? `<span title="core tool \u2014 always on" style="font-size:8px;font-weight:700;letter-spacing:.3px;color:var(--muted);border:1px solid var(--border);border-radius:3px;padding:1px 5px;text-transform:uppercase">core</span>` : `<input type="checkbox" class="tp-enabled" data-name="${escapeHtml(p.name)}" ${p.enabled ? "checked" : ""}
                 style="width:14px;height:14px;accent-color:var(--accent);cursor:pointer">`;
         return `
@@ -5013,6 +5026,7 @@ project_id = "${displayPid}"`;
               title="local proxy port"
               style="width:74px;box-sizing:border-box;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:5px 7px;outline:none">
           </div>
+          ${warnHtml}
           ${hintHtml}
           <details class="tp-tools" data-slot="${escapeHtml(p.slot)}" data-loaded="0" style="margin-top:6px">
             <summary style="cursor:pointer;list-style:none;font-size:10px;color:var(--accent);user-select:none">&#9656; tools</summary>

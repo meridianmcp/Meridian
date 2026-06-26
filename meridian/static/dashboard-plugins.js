@@ -91,6 +91,22 @@ async function _tunnelCopyToClipboard(text) {
 }
 window._tunnelCopyToClipboard = _tunnelCopyToClipboard;
 
+// 9a8645c1 — render an actionable yellow warning for a slot the client reported
+// unhealthy (slot_status[slot] = {reason, detail}). Returns '' when healthy.
+// Pure + exported so the UI test can exercise it directly.
+function _renderSlotHealthWarning(slot, slotStatus) {
+  const st = slotStatus && slotStatus[slot];
+  if (!st || (!st.reason && !st.detail)) return '';
+  const label = st.reason === 'access_denied' ? 'access denied'
+    : (st.reason || 'unavailable').replace(/_/g, ' ');
+  const detail = st.detail ? `<div style="margin-top:3px;color:var(--muted);font-weight:400">${escapeHtml(st.detail)}</div>` : '';
+  return `
+        <div data-slot-warning="${escapeHtml(slot)}" style="margin-top:6px;padding:6px 8px;border:1px solid #c79a00;border-radius:4px;background:rgba(199,154,0,0.10);font-size:9px;line-height:1.6;color:#e0b400">
+          <span style="font-weight:700">&#9888; ${escapeHtml(label)}</span>${detail}
+        </div>`;
+}
+window._renderSlotHealthWarning = _renderSlotHealthWarning;
+
 async function loadTunnelPluginsSection(projectId) {
   const host = document.getElementById(`settings-body-${projectId}`);
   if (!host) return;
@@ -122,6 +138,9 @@ async function loadTunnelPluginsSection(projectId) {
       enabled: c.enabled !== false,
     }));
 
+    // 9a8645c1 — per-slot health diagnostics (e.g. Serena access-denied) so a
+    // degraded slot shows an actionable yellow warning instead of a silent dot.
+    const slotStatus = (data && data.slot_status) || {};
     const renderRow = (p) => {
       const cmd = Array.isArray(p.command) ? p.command.join(' ') : '';
       // Three-state lifecycle (sprint item 56cb5d33):
@@ -138,6 +157,9 @@ async function loadTunnelPluginsSection(projectId) {
             Enable the toggle, then restart <code style="font-family:var(--font-mono)">meridian --tunnel</code> to launch
             <code style="font-family:var(--font-mono)">${escapeHtml(hint.pkg)}</code>.<br>${escapeHtml(hint.note)}
           </div>` : '';
+      // 9a8645c1 — yellow warning badge when the client reported this slot
+      // unhealthy with a reason (e.g. Serena access-denied).
+      const warnHtml = _renderSlotHealthWarning(p.slot, slotStatus);
       // Core tools are always-on: show a locked "core" badge instead of an enable
       // toggle. Plugins keep the checkbox. collectConfig keys off .tp-command (on
       // every row), so a core slot's command/port override still saves. (b2a60de7)
@@ -163,6 +185,7 @@ async function loadTunnelPluginsSection(projectId) {
               title="local proxy port"
               style="width:74px;box-sizing:border-box;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:5px 7px;outline:none">
           </div>
+          ${warnHtml}
           ${hintHtml}
           <details class="tp-tools" data-slot="${escapeHtml(p.slot)}" data-loaded="0" style="margin-top:6px">
             <summary style="cursor:pointer;list-style:none;font-size:10px;color:var(--accent);user-select:none">&#9656; tools</summary>

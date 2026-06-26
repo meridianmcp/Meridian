@@ -220,13 +220,51 @@ async def _probe_slot_health(
     return False
 
 
-async def _report_slot_health(ws, label: str, healthy: bool) -> None:
+async def _report_slot_health(
+    ws, label: str, healthy: bool, *, reason: str | None = None, detail: str | None = None
+) -> None:
     """Send a ``plugin_status`` control message up the slot's WebSocket so the
-    server can suppress (or restore) this slot's tools. Best-effort. (d71ba2e7)"""
+    server can suppress (or restore) this slot's tools. Best-effort. (d71ba2e7)
+
+    9a8645c1 — an unhealthy report may carry a ``reason`` (e.g. ``access_denied``)
+    and a human-readable ``detail`` so the dashboard shows an actionable warning
+    instead of a silent dead dot."""
+    msg: dict = {"type": "plugin_status", "slot": label, "healthy": healthy}
+    if reason:
+        msg["reason"] = reason
+    if detail:
+        msg["detail"] = detail
     try:
-        await ws.send(json.dumps({"type": "plugin_status", "slot": label, "healthy": healthy}))
+        await ws.send(json.dumps(msg))
     except Exception:  # noqa: BLE001 — never let health reporting break the relay
         pass
+
+
+# 9a8645c1 — actionable hint shown when Serena (the extract slot) can't start.
+_SERENA_ACCESS_DENIED_HINT = (
+    "Serena could not read the repo (access denied). Point the tunnel at a "
+    "SPECIFIC repo dir, not a parent like Documents — a parent often contains "
+    "broken Windows junctions (e.g. 'My Music') that Serena trips on. Use "
+    "`meridian --tunnel --repo C:\\path\\to\\your-repo` (the first --repo path is "
+    "the active repo)."
+)
+
+
+def _classify_serena_failure(err: object) -> "tuple[str, str] | None":
+    """Classify a Serena spawn/startup failure from an exception or stderr text.
+
+    Returns ``(reason, detail)`` — ``("access_denied", <hint>)`` for a
+    PermissionError / WinError 5 / 'access is denied' signature, else None so the
+    caller falls back to a generic reason. Pure + unit-tested. (9a8645c1)"""
+    if isinstance(err, PermissionError):
+        return ("access_denied", _SERENA_ACCESS_DENIED_HINT)
+    text = (str(err) or "").lower()
+    if not text:
+        return None
+    if ("winerror 5" in text or "access is denied" in text
+            or "permissionerror" in text or "errno 13" in text):
+        return ("access_denied", _SERENA_ACCESS_DENIED_HINT)
+    return None
 
 
 async def _preflight_slot(ws, port: int, label: str) -> bool:
@@ -489,13 +527,16 @@ async def _run_extract_pool_connection(
             except Exception:  # noqa: BLE001 — keep retrying until cancelled
                 pass
 
-    async def _mark_unhealthy(ws, *, already_reported: bool = False) -> None:
+    async def _mark_unhealthy(
+        ws, *, already_reported: bool = False,
+        reason: str | None = None, detail: str | None = None,
+    ) -> None:
         nonlocal _unhealthy, _reprobe_task
         if _unhealthy:
             return
         _unhealthy = True
         if not already_reported:
-            await _report_slot_health(ws, label, False)
+            await _report_slot_health(ws, label, False, reason=reason, detail=detail)
         if _reprobe_task is None:
             _reprobe_task = asyncio.ensure_future(_reprobe(ws))
 
@@ -528,9 +569,11 @@ async def _run_extract_pool_connection(
                         msg.get("headers") or {}, pool.default_repo_path or default_repo_path
                     )
                     daemon = None
+                    _spawn_exc: object = None
                     try:
                         daemon = pool.get_or_spawn(repo_path)
                     except Exception as exc:  # noqa: BLE001 — spawn failure → 503
+                        _spawn_exc = exc
                         print(
                             f"tunnel:{label}: failed to start Serena for {repo_path}: {exc}",
                             file=sys.stderr, flush=True,
@@ -538,9 +581,18 @@ async def _run_extract_pool_connection(
                     if daemon is None or not daemon.is_alive:
                         # First-spawn failure → mark unhealthy (suppress tools)
                         # and start the background re-probe (d71ba2e7 + a3410a9c).
+                        # 9a8645c1 — classify access-denied (broken-junction scans)
+                        # so the dashboard shows an actionable warning + bad path.
                         if not _preflight_done:
                             _preflight_done = True
-                            await _mark_unhealthy(ws)
+                            _cls = _classify_serena_failure(_spawn_exc) if _spawn_exc else None
+                            if _cls is not None:
+                                _reason, _detail = _cls
+                            else:
+                                _reason, _detail = ("extract_unavailable", _SERENA_ACCESS_DENIED_HINT)
+                            print(f"tunnel:{label}: {_detail} (repo: {repo_path})",
+                                  file=sys.stderr, flush=True)
+                            await _mark_unhealthy(ws, reason=_reason, detail=_detail)
                         err = json.dumps(
                             {"error": f"Serena daemon for {repo_path} not available"}
                         ).encode()
@@ -1890,6 +1942,7 @@ async def run_tunnel(
     token: str | None = None,
     base_url: str | None = None,
     repo_path: str | None = None,
+    extra_fs_roots: list[str] | None = None,
     port: int = DEFAULT_PROXY_PORT,
     code_port: int = DEFAULT_CODE_PROXY_PORT,
     extract_port: int = DEFAULT_EXTRACT_PROXY_PORT,
@@ -2010,6 +2063,23 @@ async def run_tunnel(
     # the tenant's projects). Empty → fall back to the home dir (repo_path).
     # known_repo_paths are trust anchors for silent auto-add (b9d1b606).
     fs_roots, known_repo_paths = await _fetch_filesystem_roots(base_url, token)
+    # cbbd0eb4 — extra --repo paths (after the first) become additional fs roots,
+    # resolved + deduped onto the front so the connector serves exactly the dirs
+    # the user named (and the active repo_path) — not a broad parent dir.
+    if extra_fs_roots:
+        _resolved_extra: list[str] = []
+        for _r in extra_fs_roots:
+            try:
+                _rp = str(Path(_r).resolve())
+            except Exception:  # noqa: BLE001
+                continue
+            if _rp and _rp not in _resolved_extra:
+                _resolved_extra.append(_rp)
+        if _resolved_extra:
+            _union = list(dict.fromkeys([*fs_roots, *_resolved_extra]))
+            fs_roots = _union
+            # The extra roots are also trust anchors for silent auto-add.
+            known_repo_paths = list(dict.fromkeys([*known_repo_paths, *_resolved_extra]))
 
     # 1c. Node.js gate (d1c528f5) — every slot runs its inner server through
     #     ``npx mcp-proxy``, so without Node the proxies can't start. Auto-install
