@@ -5433,6 +5433,25 @@ async def claim_file(
     if not normalized:
         raise ValueError("file_path is required")
     await expire_file_locks(db)
+    # 63b030a6 — file ⊃ symbol hierarchy: a whole-file lock conflicts with any
+    # live symbol claim on the file held by another session. Block here so the
+    # coarser grain can't silently stomp a finer one.
+    _other_symbols = await _live_symbol_claims_for_file(db, normalized, session_id)
+    if _other_symbols:
+        _holder = _other_symbols[0]
+        return {
+            "claimed": False,
+            "reason": "symbol_locked",
+            "file_path": normalized,
+            "session_id": session_id,
+            "holder_session_id": _holder.get("session_id"),
+            "symbol_claims": _other_symbols,
+            "message": (
+                f"Cannot whole-file claim {normalized}: "
+                f"{len(_other_symbols)} symbol(s) on it are claimed by another live "
+                "session. Claim a specific free symbol with claim_symbol, or wait."
+            ),
+        }
     async with db.execute(
         "SELECT * FROM file_locks WHERE file_path = ?",
         (normalized,),
@@ -5643,6 +5662,7 @@ async def get_file_claims(
 # never silently becomes an un-conflicting resource.
 RESOURCE_TYPES = (
     "file",       # file:meridian/db/__init__.py
+    "symbol",     # symbol:meridian/db/__init__.py::create_project (63b030a6)
     "db",         # db:migrations
     "mcp_tool",   # mcp_tool:get_parallelizable_groups
     "route",      # route:POST:/projects
@@ -5684,20 +5704,78 @@ def parse_resource_identifier(identifier: str) -> tuple[str, str]:
     return rtype, value
 
 
+def _normalize_resource_file_path(value: str) -> str:
+    """Normalize a file path for a ``file:``/``symbol:`` resource id: backslashes
+    → slashes, drop a leading ``./`` (so the same file referenced two ways
+    collides on one resource lock). Distinct from :func:`_normalize_file_path`,
+    which is strip-only to match how ``claim_file`` / code-note anchors store
+    paths — do not merge the two. (63b030a6)"""
+    value = (value or "").replace("\\", "/")
+    if value.startswith("./"):
+        value = value[2:]
+    return value
+
+
 def normalize_resource_id(identifier: str) -> str:
     """Canonicalize a typed resource identifier for storage / comparison.
 
     Lowercases the type, strips whitespace, and normalizes ``file:`` paths the
     same way file locks do (backslashes → slashes, drop a leading ``./``) so the
-    same file referenced two ways collides on one lock. Returns the canonical
+    same file referenced two ways collides on one lock. ``symbol:`` ids
+    (63b030a6, ``symbol:<path>::<symbol>``) normalize the path part the same way
+    while preserving the ``::<symbol>`` scope. Returns the canonical
     ``"<type>:<value>"`` string. Raises ``ValueError`` on an invalid identifier.
     """
     rtype, value = parse_resource_identifier(identifier)
     if rtype == "file":
-        value = value.replace("\\", "/")
-        if value.startswith("./"):
-            value = value[2:]
+        value = _normalize_resource_file_path(value)
+    elif rtype == "symbol":
+        # symbol:<path>::<symbol> — normalize the file path, keep the symbol scope.
+        path, sep, sym = value.partition("::")
+        value = _normalize_resource_file_path(path) + (sep + sym if sep else "")
     return f"{rtype}:{value}"
+
+
+def _resource_file_of(rid: str) -> "str | None":
+    """Return the file path a ``file:`` / ``symbol:`` resource id refers to, or
+    None for other resource types. (63b030a6 — cross-type conflict detection.)"""
+    if rid.startswith("file:"):
+        return rid[len("file:"):]
+    if rid.startswith("symbol:"):
+        return rid[len("symbol:"):].partition("::")[0]
+    return None
+
+
+def _two_resources_conflict(r1: str, r2: str) -> bool:
+    """True if two normalized resource ids conflict under the file⊃symbol hierarchy.
+
+    Rules (63b030a6):
+      - identical ids conflict (file:X vs file:X, symbol:X::a vs symbol:X::a);
+      - a whole-file lock conflicts with ANY symbol on that file
+        (file:X vs symbol:X::a) — file is the most exclusive grain;
+      - two DIFFERENT symbols on the same file do NOT conflict
+        (symbol:X::a vs symbol:X::b) — that's the point of symbol-level locking;
+      - everything else conflicts only on exact string equality.
+    """
+    if r1 == r2:
+        return True
+    f1, f2 = _resource_file_of(r1), _resource_file_of(r2)
+    if f1 is not None and f1 == f2:
+        # Same file. Conflict unless BOTH are (distinct) symbol claims.
+        both_symbols = r1.startswith("symbol:") and r2.startswith("symbol:")
+        return not both_symbols
+    return False
+
+
+def _resource_sets_conflict(a: "set[str] | frozenset[str]", b: "set[str] | frozenset[str]") -> bool:
+    """True if any resource in *a* conflicts with any in *b* under the file/symbol
+    hierarchy. Replaces a plain ``set.isdisjoint`` so file-vs-symbol overlaps are
+    caught. (63b030a6)"""
+    for ra in a:
+        for rb in b:
+            if _two_resources_conflict(ra, rb):
+                return True
+    return False
 
 
 def parse_touches_resources(raw: Any) -> list[str]:
@@ -6069,7 +6147,9 @@ async def get_parallelizable_groups(
         res = set(it["resources"])
         placed = False
         for gi, used in enumerate(group_resource_sets):
-            if res.isdisjoint(used):
+            # 63b030a6 — cross-type aware: file:X conflicts with symbol:X::*, but
+            # symbol:X::a and symbol:X::b can co-schedule. (plain isdisjoint missed this)
+            if not _resource_sets_conflict(res, used):
                 groups[gi].append(it)
                 used.update(res)
                 placed = True
@@ -6153,6 +6233,28 @@ async def claim_symbol(
         raise ValueError("file_path is required")
     if not symbol:
         raise ValueError("symbol is required")
+
+    # 63b030a6 — file ⊃ symbol hierarchy: if another live session holds a
+    # WHOLE-FILE lock on this file, no symbol-level claim is allowed (the file
+    # owner may touch any symbol). Mirror the inverse block in claim_file.
+    await expire_file_locks(db)
+    async with db.execute(
+        "SELECT session_id, claimed_at, expires_at FROM file_locks WHERE file_path = ?",
+        (_normalize_file_path(normalized),),
+    ) as cur:
+        _fl_row = await cur.fetchone()
+    _fl = _row_to_dict(_fl_row)
+    if _fl and _fl.get("session_id") and _fl.get("session_id") != session_id:
+        return {
+            "claimed": False,
+            "reason": "file_locked",
+            "file_path": normalized,
+            "holder_session_id": _fl.get("session_id"),
+            "message": (
+                f"Cannot claim symbol in {normalized}: another live session holds a "
+                "whole-file lock on it. Wait for it to release, or coordinate."
+            ),
+        }
 
     symbols = extract_symbols(normalized, content or "")
     if not symbols:
