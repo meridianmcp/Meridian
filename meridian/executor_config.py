@@ -17,6 +17,7 @@ EXECUTOR_CONFIG_KEYS = (
     "branch",
     "context_threshold",
     "isolation",
+    "max_turns",  # d2c47f43 — /goal "Stop after N turns" ceiling (default 200)
 )
 
 EXECUTOR_CREDENTIALS_RULE = (

@@ -3571,6 +3571,34 @@ def _execution_mode_directive(mode: str | None) -> str:
     )
 
 
+# 72e12ed8 — HITL auto-answer directive surfaced in the start_session orientation
+# so executors know whether request_hitl resolves inline or blocks for a human.
+_HITL_MODE_DIRECTIVES = {
+    0: ("HITL: auto-answer OFF — request_hitl queues for a human and "
+        "urgency='blocking' pauses you until answered. Still ALWAYS use request_hitl "
+        "to ask the human; never just ask in chat."),
+    1: ("HITL: auto-answer SAFE — request_hitl resolves immediately for "
+        "non-destructive questions and returns the answer inline (it does not "
+        "block). Use it freely; require_human=true still routes to a human."),
+    2: ("HITL: auto-answer AGGRESSIVE — request_hitl resolves immediately and "
+        "returns the answer inline for nearly all questions. Use it freely; "
+        "require_human=true still forces a human reply."),
+}
+
+
+def _hitl_mode_directive(mode: int) -> str:
+    """Protocol-level HITL directive line for the project's auto-answer mode."""
+    return _HITL_MODE_DIRECTIVES.get(int(mode or 0), _HITL_MODE_DIRECTIVES[0])
+
+
+async def _hitl_auto_answer_mode_safe(db: aiosqlite.Connection, project_id: str) -> int:
+    """Resolve a project's HITL auto-answer mode (0/1/2); 0 on any error."""
+    try:
+        return int(await db_module._project_hitl_auto_answer_mode(db, project_id))
+    except Exception:  # noqa: BLE001
+        return 0
+
+
 async def _build_orchestration_hint(
     db: aiosqlite.Connection,
     project_id: str,
@@ -3966,11 +3994,16 @@ async def _start_session_composite(
             (_c_project or {}).get("execution_mode")
         )
         _c_mode_directive = _execution_mode_directive(_c_mode)
+        # 72e12ed8 — surface the HITL auto-answer mode so executors know upfront
+        # that request_hitl resolves inline (1/2) vs. blocks for a human (0).
+        _c_hitl_mode = await _hitl_auto_answer_mode_safe(db, project_id)
         _c_payload = {
             "session_id": session["id"],
             "compact": True,
             "execution_mode": _c_mode,  # ecf69de8 — structured posture field
             "execution_mode_directive": _c_mode_directive,
+            "hitl_auto_answer_mode": _c_hitl_mode,
+            "hitl_auto_answer_directive": _hitl_mode_directive(_c_hitl_mode),
             "sprint": (str(_c_sprint)[:300] if _c_sprint else None),
             "sprint_version": scoped_version,
             "sprint_summary": {
@@ -4117,10 +4150,14 @@ async def _start_session_composite(
         else mode_directive
     )
 
+    # 72e12ed8 — HITL auto-answer mode in the full orientation too.
+    _hitl_mode = await _hitl_auto_answer_mode_safe(db, project_id)
     payload: dict[str, Any] = {
         "session_id": session["id"],
         "execution_mode": execution_mode,  # ecf69de8 — structured posture field
         "execution_mode_directive": mode_directive,
+        "hitl_auto_answer_mode": _hitl_mode,
+        "hitl_auto_answer_directive": _hitl_mode_directive(_hitl_mode),
         "sprint_version": scoped_version,  # a76cb7c0 — resolved scope (or None)
         "goal": goal,
         "goal_xml": goal_xml,  # v0.6.1 — always present

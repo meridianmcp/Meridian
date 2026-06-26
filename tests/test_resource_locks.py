@@ -435,6 +435,107 @@ async def test_parallelizable_groups_running_field(db):
     assert res["eligible_count"] == 1
 
 
+def test_normalize_symbol_resource_id():
+    """63b030a6 — symbol ids normalize the file-path part, keep the ::symbol scope."""
+    assert db_module.normalize_resource_id(
+        "symbol:meridian\\db\\__init__.py::create_project"
+    ) == "symbol:meridian/db/__init__.py::create_project"
+    assert db_module.normalize_resource_id(
+        "symbol:./a.py::foo"
+    ) == "symbol:a.py::foo"
+    # symbol is a recognized type now.
+    assert "symbol" in db_module.RESOURCE_TYPES
+
+
+def test_two_resources_conflict_file_symbol_hierarchy():
+    """63b030a6 — file ⊃ symbol conflict rules."""
+    c = db_module._two_resources_conflict
+    # Identical ids conflict.
+    assert c("file:a.py", "file:a.py") is True
+    assert c("symbol:a.py::f", "symbol:a.py::f") is True
+    # Whole-file lock conflicts with any symbol on that file (either order).
+    assert c("file:a.py", "symbol:a.py::f") is True
+    assert c("symbol:a.py::f", "file:a.py") is True
+    # Different symbols on the same file do NOT conflict.
+    assert c("symbol:a.py::f", "symbol:a.py::g") is False
+    # Symbols on different files don't conflict.
+    assert c("symbol:a.py::f", "symbol:b.py::f") is False
+    # Unrelated files don't conflict.
+    assert c("file:a.py", "file:b.py") is False
+    # Non-file types conflict only on exact equality.
+    assert c("db:migrations", "db:migrations") is True
+    assert c("db:migrations", "db:other") is False
+
+
+@pytest.mark.asyncio
+async def test_parallelizable_groups_symbol_level(db):
+    """63b030a6 — two distinct symbols in the same file co-schedule; a whole-file
+    item conflicts with a symbol item in that file."""
+    p = await db_module.create_project(db, "symgroups")
+    await db_module.add_sprint_item(db, p["id"], "v1", "edit f",
+                                    touches_resources=["symbol:a.py::f"])
+    await db_module.add_sprint_item(db, p["id"], "v1", "edit g",
+                                    touches_resources=["symbol:a.py::g"])
+    res = await db_module.get_parallelizable_groups(db, p["id"], version="v1")
+    # Distinct symbols on the same file → one parallel group of two.
+    assert res["group_count"] == 1
+    assert len(res["groups"][0]) == 2
+
+
+@pytest.mark.asyncio
+async def test_parallelizable_groups_file_vs_symbol_conflict(db):
+    p = await db_module.create_project(db, "symconf")
+    await db_module.add_sprint_item(db, p["id"], "v1", "whole file",
+                                    touches_resources=["file:a.py"])
+    await db_module.add_sprint_item(db, p["id"], "v1", "one symbol",
+                                    touches_resources=["symbol:a.py::f"])
+    res = await db_module.get_parallelizable_groups(db, p["id"], version="v1")
+    # file:a.py conflicts with symbol:a.py::f → must serialize into 2 groups.
+    assert res["group_count"] == 2
+
+
+_XLOCK_SRC = (
+    "class AuthRouter:\n"
+    "    def login(self):\n"
+    "        return 1\n"
+    "\n"
+    "def helper():\n"
+    "    return 3\n"
+)
+
+
+@pytest.mark.asyncio
+async def test_claim_file_blocked_by_other_session_symbol_claim(db):
+    """63b030a6 gap (1) — a whole-file claim is refused while another session
+    holds a live symbol claim on that file."""
+    p = await db_module.create_project(db, "xlock1")
+    s1 = await db_module.register_session(db, p["id"], "sess-a")
+    s2 = await db_module.register_session(db, p["id"], "sess-b")
+    claim = await db_module.claim_symbol(db, s1["id"], "meridian/server.py", "AuthRouter", _XLOCK_SRC)
+    assert claim["claimed"] is True
+    blocked = await db_module.claim_file(db, "meridian/server.py", s2["id"])
+    assert blocked["claimed"] is False
+    assert blocked["reason"] == "symbol_locked"
+    # The same session that holds the symbol claim is still allowed to whole-file
+    # claim (no other-session symbol claims block it).
+    same = await db_module.claim_file(db, "meridian/server.py", s1["id"])
+    assert same["claimed"] is True
+
+
+@pytest.mark.asyncio
+async def test_claim_symbol_blocked_by_other_session_file_lock(db):
+    """63b030a6 gap (2) — a symbol claim is refused while another session holds a
+    whole-file lock on that file."""
+    p = await db_module.create_project(db, "xlock2")
+    s1 = await db_module.register_session(db, p["id"], "sess-a")
+    s2 = await db_module.register_session(db, p["id"], "sess-b")
+    fc = await db_module.claim_file(db, "meridian/server.py", s1["id"])
+    assert fc["claimed"] is True
+    blocked = await db_module.claim_symbol(db, s2["id"], "meridian/server.py", "AuthRouter", _XLOCK_SRC)
+    assert blocked["claimed"] is False
+    assert blocked["reason"] == "file_locked"
+
+
 def test_normalize_resource_id_strips_inferred_marker():
     # 07bdfdbb — inferred resources canonicalize the same as explicit ones.
     assert db_module.normalize_resource_id(

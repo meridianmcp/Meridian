@@ -138,7 +138,7 @@ async def _build_executor_goal_messages(
             "5. Before ending: `checkpoint(session_id=..., project_id=...)`.\n\n"
             "/goal Complete the pending sprint items. Done when every claimed item is "
             "marked complete via complete_sprint_item(), the test suite passes, and "
-            "generate_handoff() is called at the end. Stop after 40 turns or if HITL triggered.\n\n"
+            "generate_handoff() is called at the end. Stop after 200 turns or if HITL triggered.\n\n"
             "Push to dev when tests pass. Never push broken code."
         )
 
@@ -169,6 +169,12 @@ async def _build_executor_goal_messages(
     except Exception:  # noqa: BLE001 — empty list still renders a valid goal
         pending = []
 
+    # d2c47f43 — read the project's max_turns override for the /goal ceiling.
+    from ..handoff import _max_turns_from_settings  # noqa: PLC0415
+    try:
+        _goal_settings = await db_module.get_project_settings(db, pid)
+    except Exception:  # noqa: BLE001
+        _goal_settings = None
     quick_start_goal = _build_quick_start_goal(
         pending,
         version=scoped_version,
@@ -176,6 +182,7 @@ async def _build_executor_goal_messages(
         execution_mode=db_module.normalize_execution_mode(
             project.get("execution_mode")
         ),
+        max_turns=_max_turns_from_settings(_goal_settings),
     )
     if pending:
         item_lines = "\n".join(
@@ -1065,6 +1072,37 @@ def _infer_touches_resources(title: str) -> list[str]:
     return [f"inferred:file:{path}" for path in _suggest_files_for_title(title or "")]
 
 
+async def _active_executor_session_warnings(db: Any, project_id: str) -> list[str]:
+    """fd86aacc — names of executor sessions seen active in the last 10 minutes.
+
+    Used to warn when sprint items are added/fanned-out while executors are
+    mid-run, so a board change isn't silently injected behind their back.
+    Best-effort: any error yields an empty list. (586eeda9 — shared by
+    add_sprint_item + fan_out_sprint_items.)
+    """
+    warnings: list[str] = []
+    try:
+        from datetime import datetime, timezone as _tz
+        _now = datetime.now(_tz.utc)
+        for _sess in await db_module.get_sessions(db, project_id):
+            _ls = _sess.get("last_seen")
+            if not _ls:
+                continue
+            try:
+                _dt = datetime.fromisoformat(str(_ls).replace("Z", "+00:00"))
+                if _dt.tzinfo is None:
+                    _dt = _dt.replace(tzinfo=_tz.utc)
+                if (_now - _dt).total_seconds() < 600:
+                    warnings.append(
+                        f"session '{_sess.get('name', _sess.get('id', '?'))}' is active"
+                    )
+            except Exception:  # noqa: BLE001
+                pass
+    except Exception:  # noqa: BLE001
+        pass
+    return warnings
+
+
 async def _unclaimed_file_warnings(
     db: Any,
     session_id: str,
@@ -1944,7 +1982,7 @@ async def _handle_session_tools(
         for k in ("repo_path", "env_file", "test_cmd", "test_min",
                   "deploy_cmd", "shell_type", "branch",
                   "filesystem_roots", "hostnames", "context_threshold",
-                  "isolation"):
+                  "isolation", "max_turns"):
             if k in args:
                 cfg[k] = args[k]
         if "repo_paths" in args:
@@ -2123,26 +2161,7 @@ async def _handle_sprint_tools(
     if name == "add_sprint_item":
         validate_input_size(args.get("title"), "sprint item title", 500)
         # fd86aacc — warn if active executor sessions exist when adding a new item
-        _active_session_warnings: list[str] = []
-        try:
-            from datetime import datetime, timezone as _tz
-            _active_sessions = await db_module.get_sessions(db, args["project_id"])
-            _now_ts = datetime.now(_tz.utc)
-            for _sess in _active_sessions:
-                _ls = _sess.get("last_seen")
-                if _ls:
-                    try:
-                        _ls_dt = datetime.fromisoformat(str(_ls).replace("Z", "+00:00"))
-                        if _ls_dt.tzinfo is None:
-                            _ls_dt = _ls_dt.replace(tzinfo=_tz.utc)
-                        if (_now_ts - _ls_dt).total_seconds() < 600:
-                            _active_session_warnings.append(
-                                f"session '{_sess.get('name', _sess.get('id','?'))}' is active"
-                            )
-                    except Exception:
-                        pass
-        except Exception:
-            pass
+        _active_session_warnings = await _active_executor_session_warnings(db, args["project_id"])
         # 07bdfdbb — auto-infer touches_resources from the title when the caller
         # supplied none, so the item can parallelize instead of falling into its
         # own sequential undeclared group (de730a25).
@@ -2194,10 +2213,39 @@ async def _handle_sprint_tools(
         ids = await db_module.fan_out_sprint_items(
             db, args["project_id"], _enriched
         )
-        return {"item_ids": ids, "count": len(ids)}
+        _result: dict[str, Any] = {"item_ids": ids, "count": len(ids)}
+        # 586eeda9 — same active-session warning as add_sprint_item: a fanned-out
+        # batch injected mid-run is a board change executors should know about.
+        _fo_warnings = await _active_executor_session_warnings(db, args["project_id"])
+        if _fo_warnings:
+            _result["active_session_warning"] = (
+                "WARNING: " + "; ".join(_fo_warnings)
+                + " — items added but may not be picked up until next session start."
+            )
+        return _result
     if name == "update_sprint_item":
         validate_input_size(args.get("title"), "sprint item title", 500)
         validate_input_size(args.get("notes"), "sprint item notes", 50_000)
+        # 586eeda9 — hard-block mutating an in_progress item: an executor owns it
+        # and a concurrent title/notes/resources change is undefined behaviour.
+        # force=true overrides (destructive). Mirrors the set_sprint force guard.
+        if not (args.get("force") in (True, 1, "true", "1", "yes")):
+            _cur = await db_module.get_sprint_item(db, args["item_id"])
+            if _cur is not None and _cur.get("status") == "in_progress":
+                _owner = ""
+                _ca = _cur.get("claimed_at")
+                if _ca:
+                    _owner = f" (claimed {_ca})"
+                return {
+                    "error": "IN_PROGRESS",
+                    "message": (
+                        f"Item is in_progress and owned by an active session{_owner} — "
+                        "cannot mutate while claimed. Wait for completion, call "
+                        "fail_sprint_item first, or pass force=true to override."
+                    ),
+                    "item_id": args["item_id"],
+                    "claimed_at": _ca,
+                }
         _patch_kwargs: dict[str, Any] = dict(
             title=args.get("title"),
             version=args.get("version"),
