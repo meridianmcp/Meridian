@@ -1170,6 +1170,32 @@
   }
 
   // meridian/static/dashboard-sprint.js
+  function _ensureSprintPulseStyle() {
+    if (typeof document === "undefined") return;
+    if (document.getElementById("sprint-pulse-style")) return;
+    const st = document.createElement("style");
+    st.id = "sprint-pulse-style";
+    st.textContent = "@keyframes sprintPulse{0%{box-shadow:0 0 0 0 rgba(34,197,94,0.6)}70%{box-shadow:0 0 0 5px rgba(34,197,94,0)}100%{box-shadow:0 0 0 0 rgba(34,197,94,0)}}";
+    document.head.appendChild(st);
+  }
+  function _sprintHistoryBadges(it) {
+    if (!it) return "";
+    _ensureSprintPulseStyle();
+    let html = "";
+    const stall = Number(it.stall_count || 0);
+    if (stall > 0) {
+      html += `<span class="sprint-stall-badge" title="Stalled and re-queued ${stall} time(s)" style="margin-left:6px;font-size:9px;font-weight:700;color:#f59e0b;background:#f59e0b22;border-radius:3px;padding:1px 5px">\u21BB${stall}</span>`;
+    }
+    const isPending = it.status === "pending" || it.status === "todo";
+    if (isPending && it.claimed_at) {
+      html += `<span class="sprint-retried-badge" title="Was claimed by a session before \u2014 now back to pending" style="margin-left:6px;font-size:9px;color:var(--muted);border:1px solid var(--border);border-radius:3px;padding:1px 5px">retried</span>`;
+    }
+    if (it.status === "in_progress" && it.claimed_at) {
+      html += `<span class="sprint-live-dot" title="Claimed by an active session" style="display:inline-block;width:7px;height:7px;border-radius:50%;background:#22c55e;margin-left:6px;animation:sprintPulse 1.6s infinite;vertical-align:middle"></span>`;
+    }
+    return html;
+  }
+  if (typeof window !== "undefined") window._sprintHistoryBadges = _sprintHistoryBadges;
   function _renderPlanBadge2(me) {
     const planColors = { free: "#3b82f6", trial: "#059669", standard: "#3b82f6", pro: "#7c3aed", admin: "#9ca3af" };
     const planLabels = _PLAN_LABELS;
@@ -1453,7 +1479,7 @@
 
       <div style="flex:1;min-width:0">
 
-        <span class="sprint-item-title">${escapeHtml(it.title)}${indBadge}${childBadge}</span>
+        <span class="sprint-item-title">${escapeHtml(it.title)}${indBadge}${childBadge}${_sprintHistoryBadges(it)}</span>
 
         ${notesHtml}
 
@@ -10212,6 +10238,145 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
     html += `<details style="margin-top:4px"><summary style="cursor:pointer;list-style:none;font-size:10px;color:var(--accent)">&#9656; raw JSON</summary>${rawPre(archText)}</details>`;
     return { html, charts };
   }
+  function _normalizeGraphEdges(queryResult) {
+    let rows = [];
+    try {
+      const txt = (queryResult && queryResult.content || []).map((c) => c.text || "").join("").trim();
+      if (!txt) return [];
+      const obj = JSON.parse(txt);
+      rows = Array.isArray(obj) ? obj : obj.rows || obj.data || obj.results || obj.records || [];
+    } catch (_) {
+      return [];
+    }
+    const edges = [];
+    for (const row of Array.isArray(rows) ? rows : []) {
+      if (Array.isArray(row) && row.length >= 2) {
+        edges.push({ source: String(row[0]), target: String(row[1]), value: Number(row[2]) || 1 });
+      } else if (row && typeof row === "object") {
+        const src = row.source ?? row.from ?? row["a.package"] ?? row.a;
+        const tgt = row.target ?? row.to ?? row["b.package"] ?? row.b;
+        const val = row.value ?? row.count ?? row["count(r)"] ?? row.weight ?? 1;
+        if (src != null && tgt != null) {
+          edges.push({ source: String(src), target: String(tgt), value: Number(val) || 1 });
+        }
+      }
+    }
+    return edges;
+  }
+  if (typeof window !== "undefined") window._normalizeGraphEdges = _normalizeGraphEdges;
+  function _buildCodebaseForceGraph(packages, edges, view) {
+    const pkgs = (packages || []).filter((p) => p && p.name != null);
+    if (!pkgs.length) return null;
+    const layers = [...new Set(pkgs.map((p) => String(p.layer != null ? p.layer : "other")))];
+    const palette = ["#60a5fa", "#34d399", "#fbbf24", "#f87171", "#a78bfa", "#f472b6", "#22d3ee"];
+    const layerColor = {};
+    layers.forEach((l, i) => {
+      layerColor[l] = palette[i % palette.length];
+    });
+    const degree = {};
+    (edges || []).forEach((e) => {
+      if (!e) return;
+      degree[e.source] = (degree[e.source] || 0) + (Number(e.value) || 1);
+      degree[e.target] = (degree[e.target] || 0) + (Number(e.value) || 1);
+    });
+    const metric = (p) => view === "hotspots" ? degree[String(p.name)] || 0 : Number(p.node_count) || 0;
+    const maxMetric = Math.max(1, ...pkgs.map(metric));
+    const nodes = pkgs.map((p) => {
+      const lyr = String(p.layer != null ? p.layer : "other");
+      return {
+        name: String(p.name),
+        value: metric(p),
+        symbolSize: 8 + 42 * (metric(p) / maxMetric),
+        category: layers.indexOf(lyr),
+        itemStyle: { color: layerColor[lyr] }
+      };
+    });
+    const names = new Set(nodes.map((n) => n.name));
+    const links = (edges || []).filter((e) => e && names.has(e.source) && names.has(e.target) && e.source !== e.target).map((e) => ({
+      source: e.source,
+      target: e.target,
+      value: Number(e.value) || 1,
+      lineStyle: { width: Math.min(6, 1 + (Number(e.value) || 1) / 3) }
+    }));
+    return {
+      tooltip: { confine: true },
+      legend: [{ data: layers, textStyle: { color: "#9ca3af", fontSize: 9 }, top: 0 }],
+      series: [{
+        type: "graph",
+        layout: "force",
+        roam: true,
+        draggable: true,
+        categories: layers.map((l) => ({ name: l })),
+        label: { show: true, fontSize: 9, color: "#e5e7eb", position: "right" },
+        force: { repulsion: 140, edgeLength: 90, gravity: 0.08 },
+        data: nodes,
+        links,
+        emphasis: { focus: "adjacency" },
+        lineStyle: { color: "source", opacity: 0.5, curveness: 0.1 }
+      }]
+    };
+  }
+  if (typeof window !== "undefined") window._buildCodebaseForceGraph = _buildCodebaseForceGraph;
+  function _renderCodebaseGraph(containerId, packages, edges) {
+    if (typeof window === "undefined" || !window.echarts) return;
+    const el = document.getElementById(containerId);
+    if (!el) return;
+    const opt = _buildCodebaseForceGraph(packages, edges, "packages");
+    if (!opt) return;
+    let chart;
+    try {
+      chart = window.echarts.init(el);
+    } catch (_) {
+      return;
+    }
+    chart.setOption(opt);
+    const setView = (view) => {
+      const o = _buildCodebaseForceGraph(packages, edges, view);
+      if (o) chart.setOption(o, true);
+      document.querySelectorAll(`[data-cg-toggle][data-cg-for="${containerId}"]`).forEach((b) => {
+        const on = b.getAttribute("data-cg-toggle") === view;
+        b.style.color = on ? "var(--text)" : "var(--muted)";
+        b.style.borderColor = on ? "var(--accent)" : "var(--border)";
+      });
+    };
+    document.querySelectorAll(`[data-cg-toggle][data-cg-for="${containerId}"]`).forEach((b) => {
+      b.onclick = () => setView(b.getAttribute("data-cg-toggle"));
+    });
+    setView("packages");
+  }
+  if (typeof window !== "undefined") window._renderCodebaseGraph = _renderCodebaseGraph;
+  async function _generateCodebaseMap(projectId) {
+    const data = (window._codeGraphData || {})[projectId];
+    const out = data && document.getElementById(`${data.cgId}-map`);
+    if (!data || !out) return;
+    if (!(data.packages || []).length) {
+      out.innerHTML = `<div style="font-size:10px;color:var(--muted)">No packages to map yet \u2014 index the repo first.</div>`;
+      return;
+    }
+    out.innerHTML = `<div style="font-size:10px;color:var(--muted)">rendering map\u2026</div>`;
+    try {
+      const r = await fetch(`/projects/${encodeURIComponent(projectId)}/codebase-map`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ packages: data.packages, edges: data.edges, hotspots: false })
+      });
+      if (r.status === 503) {
+        const body2 = await r.json().catch(() => ({}));
+        out.innerHTML = `<div style="font-size:10px;color:#e0b400;border:1px solid #c79a00;border-radius:4px;padding:6px 8px;background:rgba(199,154,0,0.10)">&#9888; ${escapeHtml(body2.message || "Graphviz is not installed on the server.")}</div>`;
+        return;
+      }
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const body = await r.json();
+      if (body.image) {
+        out.innerHTML = `<img src="${body.image}" alt="Codebase package map" style="max-width:100%;border:1px solid var(--border);border-radius:4px;background:#0b0e14">`;
+      } else {
+        out.innerHTML = `<div style="font-size:10px;color:var(--error)">No image returned.</div>`;
+      }
+    } catch (e) {
+      out.innerHTML = `<div style="font-size:10px;color:var(--error)">Map generation failed: ${escapeHtml(String(e))}</div>`;
+    }
+  }
+  if (typeof window !== "undefined") window._generateCodebaseMap = _generateCodebaseMap;
   async function loadCodeIntelTab(projectId) {
     const body = document.getElementById(`codeintel-body-${projectId}`);
     if (!body) return;
@@ -10267,10 +10432,26 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
       const repoPaths = Array.isArray(execCfg.repo_paths) ? execCfg.repo_paths : [];
       let html = "";
       let archCharts = [];
+      let _graphPackages = [];
+      let _graphEdges = [];
+      const _cgId = `ci-forcegraph-${projectId}`;
       html += `<div style="display:flex;align-items:center;gap:8px;margin-bottom:14px">
       <span style="width:8px;height:8px;border-radius:50%;background:#22c55e;display:inline-block;flex-shrink:0"></span>
       <span style="font-size:11px;color:var(--text);font-weight:600">Code Intel Live</span>
       ${toolCount ? `<span style="font-size:10px;color:var(--muted)">${toolCount} tool${toolCount !== 1 ? "s" : ""}</span>` : ""}
+    </div>`;
+      html += `<div style="margin-bottom:16px">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px">
+        <div style="font-size:10px;color:var(--accent);text-transform:uppercase;letter-spacing:.06em">Package Graph</div>
+        <div style="display:flex;gap:4px;align-items:center">
+          <button data-cg-toggle="packages" data-cg-for="${_cgId}" style="background:none;border:1px solid var(--accent);border-radius:3px;color:var(--text);font-size:9px;font-family:var(--font-mono);padding:2px 8px;cursor:pointer">Packages</button>
+          <button data-cg-toggle="hotspots" data-cg-for="${_cgId}" style="background:none;border:1px solid var(--border);border-radius:3px;color:var(--muted);font-size:9px;font-family:var(--font-mono);padding:2px 8px;cursor:pointer">Hotspots</button>
+          <button id="${_cgId}-genmap" onclick="_generateCodebaseMap(${JSON.stringify(projectId)})" style="background:none;border:1px solid var(--border);border-radius:3px;color:var(--muted);font-size:9px;font-family:var(--font-mono);padding:2px 8px;cursor:pointer" title="Render a static PNG map via Graphviz">Generate Map</button>
+        </div>
+      </div>
+      <div id="${_cgId}" style="width:100%;height:400px;background:var(--surface-1);border:1px solid var(--border);border-radius:4px"></div>
+      <div id="${_cgId}-empty" style="display:none;font-size:10px;color:var(--muted);margin-top:4px">No package graph yet \u2014 index the repo to populate it.</div>
+      <div id="${_cgId}-map" style="margin-top:8px"></div>
     </div>`;
       html += `<div style="margin-bottom:16px"><div style="font-size:10px;color:var(--accent);text-transform:uppercase;letter-spacing:.06em;margin-bottom:8px;padding-bottom:4px;border-bottom:1px solid var(--border)">Index Status</div>`;
       if (repoPaths.length) {
@@ -10305,6 +10486,23 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
         const archSection = _codeArchSection(archText);
         html += archSection.html;
         archCharts = archSection.charts;
+        try {
+          const _arch = JSON.parse(archText);
+          _graphPackages = Array.isArray(_arch?.packages) ? _arch.packages : [];
+        } catch (_) {
+          _graphPackages = [];
+        }
+        if (_graphPackages.length) {
+          try {
+            const _edgeRes = await _codeMcpCall("tools/call", { name: "query_graph", arguments: {
+              ...archArgs,
+              cypher: "MATCH (a)-[r]->(b) WHERE a.package <> b.package RETURN a.package, b.package, count(r)"
+            } });
+            _graphEdges = _normalizeGraphEdges(_edgeRes);
+          } catch (_) {
+            _graphEdges = [];
+          }
+        }
       } catch (e) {
         html += `<div style="font-size:10px;color:var(--error)">get_architecture failed: ${escapeHtml(String(e))}</div>`;
       }
@@ -10322,6 +10520,16 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
             }
           }
         }
+      }
+      window._codeGraphData = window._codeGraphData || {};
+      window._codeGraphData[projectId] = { packages: _graphPackages, edges: _graphEdges, cgId: _cgId };
+      if (_graphPackages.length) {
+        _renderCodebaseGraph(_cgId, _graphPackages, _graphEdges);
+      } else {
+        const _ph = document.getElementById(_cgId);
+        const _em = document.getElementById(`${_cgId}-empty`);
+        if (_ph) _ph.style.display = "none";
+        if (_em) _em.style.display = "block";
       }
     } catch (e) {
       body.innerHTML = `<div style="color:var(--error)">Failed to load code intel: ${escapeHtml(String(e))}</div>`;
@@ -11557,7 +11765,7 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
     }
     refreshHitl();
     if (_hitlPollTimer) clearInterval(_hitlPollTimer);
-    _hitlPollTimer = setInterval(refreshHitl, 6e4);
+    _hitlPollTimer = setInterval(refreshHitl, 1e4);
   }
   function setVtabCountBadge2(selector, count) {
     document.querySelectorAll(selector).forEach((badge) => {
@@ -11583,6 +11791,23 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
       setVtabCountBadge2(`.decisions-gtab-badge[data-pid="${projectId}"]`, (pinnedRes.value || []).length);
     }
   }
+  function _renderAutoAnsweredHitls(answered) {
+    const auto = (answered || []).filter((r) => r && r.answered_by === "auto").slice(0, 5);
+    if (!auto.length) return "";
+    const rows = auto.map((r) => {
+      const ts = formatRelativeTime(r.answered_at || r.created_at);
+      return `<div data-hitl-auto-id="${escapeHtml(r.id)}" style="opacity:0.55;border-left:3px solid var(--muted);background:var(--surface-1);padding:8px 12px;margin-bottom:6px;border-radius:0 4px 4px 0">
+        <div style="display:flex;justify-content:space-between;gap:8px;margin-bottom:4px">
+          <span style="background:var(--surface-2);color:var(--muted);font-size:9px;font-weight:700;letter-spacing:.5px;padding:2px 6px;border-radius:3px">AUTO-ANSWERED</span>
+          <span style="color:var(--muted);font-size:10px">${escapeHtml(ts)}</span>
+        </div>
+        <div style="color:var(--text);white-space:pre-wrap;word-break:break-word;font-size:11px;margin-bottom:3px">${escapeHtml(r.question || "")}</div>
+        <div style="color:var(--muted);font-size:11px"><span style="font-weight:600">\u2192</span> ${escapeHtml(r.answer || "")}</div>
+      </div>`;
+    }).join("");
+    return `<div data-hitl-auto-section style="margin:10px 0 4px;font-size:9px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.5px">Recently auto-answered</div>${rows}`;
+  }
+  window._renderAutoAnsweredHitls = _renderAutoAnsweredHitls;
   async function refreshHitl() {
     const bar = document.getElementById("hitl-bar");
     const countEl = document.getElementById("hitl-count");
@@ -11662,7 +11887,15 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
           if (ev.key === "Enter") _hitlAnswer(inp.dataset.hitlId);
         };
       });
+      try {
+        const answered = await api("/hitl?status=answered&limit=10");
+        const autoHtml = _renderAutoAnsweredHitls(answered);
+        if (autoHtml) list.insertAdjacentHTML("beforeend", autoHtml);
+      } catch (e) {
+        console.error("[meridian] auto-answered HITL fetch failed:", e);
+      }
     } catch (e) {
+      console.error("[meridian] refreshHitl failed \u2014 HITL bar may be stale:", e);
     }
   }
   async function _hitlAnswer(id) {

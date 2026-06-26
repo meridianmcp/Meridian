@@ -327,6 +327,159 @@ def test_demo_write_button_shows_friendly_toast(client):
 
 
 @pytestmark_playwright
+def test_codebase_force_graph_builder(client):
+    """65742e42 — _buildCodebaseForceGraph + _normalizeGraphEdges produce a valid
+    ECharts force-graph option from architecture packages + edges."""
+    import threading
+    import uvicorn
+    from meridian import server as server_module
+
+    with sync_playwright() as p:
+        config = uvicorn.Config(server_module.app, host="127.0.0.1", port=17887, log_level="error")
+        server = uvicorn.Server(config)
+        thread = threading.Thread(target=server.run, daemon=True)
+        thread.start()
+        import time; time.sleep(1.5)
+        try:
+            browser = p.chromium.launch()
+            page = browser.new_page()
+            page.goto("http://127.0.0.1:17887/demo", wait_until="domcontentloaded")
+            page.wait_for_timeout(2000)
+            res = page.evaluate(
+                """() => {
+                    const bg = window._buildCodebaseForceGraph;
+                    const ne = window._normalizeGraphEdges;
+                    if (typeof bg !== 'function' || typeof ne !== 'function') return {error: 'missing'};
+                    const pkgs = [
+                        {name: 'meridian.db', node_count: 100, layer: 0},
+                        {name: 'meridian.routes', node_count: 40, layer: 1},
+                        {name: 'tests', node_count: 10, layer: 2},
+                    ];
+                    // Edge normalization from a row-array result envelope.
+                    const edges = ne({content: [{text: JSON.stringify([
+                        ['meridian.routes', 'meridian.db', 12],
+                        ['tests', 'meridian.db', 3],
+                    ])}]});
+                    const opt = bg(pkgs, edges, 'packages');
+                    const optHot = bg(pkgs, edges, 'hotspots');
+                    return {
+                        edges,
+                        type: opt.series[0].type,
+                        layout: opt.series[0].layout,
+                        nNodes: opt.series[0].data.length,
+                        nLinks: opt.series[0].links.length,
+                        nCats: opt.series[0].categories.length,
+                        empty: bg([], edges, 'packages'),
+                        hotHasData: optHot.series[0].data.length === 3,
+                    };
+                }"""
+            )
+            assert res.get("error") is None, res
+            assert res["edges"] == [
+                {"source": "meridian.routes", "target": "meridian.db", "value": 12},
+                {"source": "tests", "target": "meridian.db", "value": 3},
+            ]
+            assert res["type"] == "graph"
+            assert res["layout"] == "force"
+            assert res["nNodes"] == 3
+            assert res["nLinks"] == 2
+            assert res["nCats"] == 3          # 3 distinct layers
+            assert res["empty"] is None       # no packages → null
+            assert res["hotHasData"] is True
+            browser.close()
+        finally:
+            server.should_exit = True
+
+
+@pytestmark_playwright
+def test_sprint_history_badges_renderer(client):
+    """c2fe20c3 — stall counter, retried tag, and live pulse dot render per item."""
+    import threading
+    import uvicorn
+    from meridian import server as server_module
+
+    with sync_playwright() as p:
+        config = uvicorn.Config(server_module.app, host="127.0.0.1", port=17886, log_level="error")
+        server = uvicorn.Server(config)
+        thread = threading.Thread(target=server.run, daemon=True)
+        thread.start()
+        import time; time.sleep(1.5)
+        try:
+            browser = p.chromium.launch()
+            page = browser.new_page()
+            page.goto("http://127.0.0.1:17886/demo", wait_until="domcontentloaded")
+            page.wait_for_timeout(2000)
+            res = page.evaluate(
+                """() => {
+                    const f = window._sprintHistoryBadges;
+                    if (typeof f !== 'function') return {error: 'missing'};
+                    return {
+                        stalled: f({status: 'pending', stall_count: 3}),
+                        retried: f({status: 'pending', claimed_at: '2026-01-01 00:00:00'}),
+                        live: f({status: 'in_progress', claimed_at: '2026-01-01 00:00:00'}),
+                        fresh: f({status: 'pending'}),
+                    };
+                }"""
+            )
+            assert res.get("error") is None, res
+            assert "↻3" in res["stalled"]
+            assert "sprint-retried-badge" in res["retried"]
+            assert "sprint-live-dot" in res["live"]
+            assert res["fresh"] == ""  # fresh pending → no badges
+            # The pulse keyframes style was injected.
+            has_style = page.evaluate("() => !!document.getElementById('sprint-pulse-style')")
+            assert has_style
+            browser.close()
+        finally:
+            server.should_exit = True
+
+
+@pytestmark_playwright
+def test_auto_answered_hitl_renderer(client):
+    """0b9b12c8 — auto-answered HITLs render greyed; non-auto / empty render ''."""
+    import threading
+    import uvicorn
+    from meridian import server as server_module
+
+    with sync_playwright() as p:
+        config = uvicorn.Config(server_module.app, host="127.0.0.1", port=17885, log_level="error")
+        server = uvicorn.Server(config)
+        thread = threading.Thread(target=server.run, daemon=True)
+        thread.start()
+        import time; time.sleep(1.5)
+        try:
+            browser = p.chromium.launch()
+            page = browser.new_page()
+            page.goto("http://127.0.0.1:17885/demo", wait_until="domcontentloaded")
+            page.wait_for_timeout(2000)
+            res = page.evaluate(
+                """() => {
+                    const f = window._renderAutoAnsweredHitls;
+                    if (typeof f !== 'function') return {error: 'missing'};
+                    return {
+                        withAuto: f([
+                            {id: 'a', answered_by: 'auto', question: 'deploy?', answer: 'yes'},
+                            {id: 'b', answered_by: 'human', question: 'x', answer: 'no'},
+                        ]),
+                        none: f([{id: 'b', answered_by: 'human', question: 'x'}]),
+                        empty: f([]),
+                    };
+                }"""
+            )
+            assert res.get("error") is None, res
+            assert "AUTO-ANSWERED" in res["withAuto"]
+            assert "deploy?" in res["withAuto"]
+            assert "data-hitl-auto-id" in res["withAuto"]
+            # The human-answered one is NOT included.
+            assert res["withAuto"].count("data-hitl-auto-id") == 1
+            assert res["none"] == ""
+            assert res["empty"] == ""
+            browser.close()
+        finally:
+            server.should_exit = True
+
+
+@pytestmark_playwright
 def test_slot_health_warning_renderer(client):
     """9a8645c1 — _renderSlotHealthWarning shows an actionable badge for an
     unhealthy slot and nothing for a healthy one. Runs the real bundle."""
