@@ -827,6 +827,8 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_agent_tasks_table(db)
     await _migrate_sprint_item_owner(db)
     await _migrate_session_note_kind(db)
+    await _migrate_handoffs_table(db)
+    await _migrate_decision_assumption(db)
     return db
 
 
@@ -6714,6 +6716,14 @@ def _hydrate_decision_row(row: Any) -> dict[str, Any] | None:
         return None
     d["priority"] = _normalize_decision_priority(d.get("priority"))
     d["edit_log"] = _parse_decision_edit_log(d.get("edit_log"))
+    # 2b39549d — always surface the assumption fields (keys present even on
+    # pre-migration rows). A decision with an assumption but no recorded status
+    # is treated as 'unvalidated'.
+    _assump = d.get("assumption")
+    d["assumption"] = _assump
+    d["assumption_status"] = d.get("assumption_status") or (
+        "unvalidated" if _assump else None
+    )
     return d
 
 
@@ -6724,6 +6734,7 @@ async def pin_decision(
     body: str,
     category: str = "TECHNICAL",
     priority: str = "normal",
+    assumption: str | None = None,
 ) -> dict[str, Any]:
     """Create a new pinned decision row. Returns the inserted row.
 
@@ -6741,10 +6752,14 @@ async def pin_decision(
     """
     did = _new_id()
     priority = _normalize_decision_priority(priority)
+    # 2b39549d — an assumption starts life 'unvalidated'; no assumption → NULL.
+    _assump = (assumption or "").strip() or None
+    _assump_status = "unvalidated" if _assump else None
     await db.execute(
-        "INSERT INTO decisions_pinned (id, project_id, title, body, category, priority) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
-        (did, project_id, title, body, category, priority),
+        "INSERT INTO decisions_pinned "
+        "(id, project_id, title, body, category, priority, assumption, assumption_status) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (did, project_id, title, body, category, priority, _assump, _assump_status),
     )
     await db.commit()
     # ITEM 6 — live push so the constitution view refreshes without polling.
@@ -6841,9 +6856,11 @@ async def update_pinned_decision(
     status: str | None = None,
     superseded_by: str | None = None,
     priority: str | None = None,
+    assumption: str | None = None,
+    assumption_status: str | None = None,
 ) -> dict[str, Any] | None:
     """Patch any combination of body / category / title / status / superseded_by /
-    priority.
+    priority / assumption / assumption_status.
 
     Use ``status='superseded'`` + ``superseded_by=<new_id>`` to retire a
     decision while preserving the audit trail. Pass only the fields you
@@ -6881,6 +6898,15 @@ async def update_pinned_decision(
         fields["status"] = status
     if superseded_by is not None:
         fields["superseded_by"] = superseded_by
+    # 2b39549d — assumption text + validation state.
+    if assumption is not None:
+        fields["assumption"] = assumption.strip() or None
+    if assumption_status is not None:
+        if assumption_status not in ("unvalidated", "confirmed", "invalidated"):
+            raise ValueError(
+                "assumption_status must be unvalidated|confirmed|invalidated"
+            )
+        fields["assumption_status"] = assumption_status
     if not fields:
         return existing
     fields["updated_at"] = now_iso
@@ -9541,3 +9567,287 @@ async def update_agent_task_status(
         )
     await db.commit()
     return await _get_agent_task(db, task_id)
+
+
+# ---------------------------------------------------------------------------
+# Handoff history (8819d6b1) — each generated handoff is its own row in the
+# handoffs table, so the dashboard/planner can list history, diff between
+# sessions, and detect "a new handoff arrived since you last checked"
+# (ab514e43). record_handoff is called from handoff.generate_handoff.
+# ---------------------------------------------------------------------------
+async def record_handoff(
+    db: aiosqlite.Connection,
+    project_id: str,
+    mode: str,
+    body: str,
+    session_id: str | None = None,
+) -> dict[str, Any]:
+    """Insert a handoff history row and return it.
+
+    ``mode`` is the rendered handoff mode (full/delta/…). ``session_id`` links
+    the handoff to the session that produced it (NULL for project-level renders).
+    """
+    hid = _new_id()
+    await db.execute(
+        "INSERT INTO handoffs (id, project_id, session_id, mode, body) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (hid, project_id, session_id, mode, body),
+    )
+    await db.commit()
+    return (await get_handoff(db, hid)) or {"id": hid}
+
+
+async def get_handoff(
+    db: aiosqlite.Connection, handoff_id: str
+) -> dict[str, Any] | None:
+    """Fetch a single handoff row by id."""
+    async with db.execute(
+        "SELECT * FROM handoffs WHERE id = ?", (handoff_id,)
+    ) as cur:
+        row = await cur.fetchone()
+    return _row_to_dict(row)
+
+
+async def get_handoffs(
+    db: aiosqlite.Connection,
+    project_id: str,
+    limit: int = 20,
+    *,
+    session_id: str | None = None,
+) -> list[dict[str, Any]]:
+    """Return handoff history for a project, newest first (body included).
+
+    Pass ``session_id`` to scope to one session's handoffs. ``limit`` is clamped
+    to 1..200.
+    """
+    limit = max(1, min(int(limit or 20), 200))
+    if session_id:
+        sql = (
+            "SELECT * FROM handoffs WHERE project_id = ? AND session_id = ? "
+            "ORDER BY created_at DESC, id DESC LIMIT ?"
+        )
+        params: tuple[Any, ...] = (project_id, session_id, limit)
+    else:
+        sql = (
+            "SELECT * FROM handoffs WHERE project_id = ? "
+            "ORDER BY created_at DESC, id DESC LIMIT ?"
+        )
+        params = (project_id, limit)
+    async with db.execute(sql, params) as cur:
+        rows = await cur.fetchall()
+    return [d for d in (_row_to_dict(r) for r in rows) if d is not None]
+
+
+async def get_latest_handoff(
+    db: aiosqlite.Connection, project_id: str
+) -> dict[str, Any] | None:
+    """Return the most recent handoff row for a project, or None."""
+    rows = await get_handoffs(db, project_id, limit=1)
+    return rows[0] if rows else None
+
+
+# ---------------------------------------------------------------------------
+# validate_assumption (8ec5493b) — one-call assumption validation: stamp the
+# decision's assumption_status, save a code-anchored finding note, and fire a
+# blocking HITL when the assumption is invalidated. Builds on the assumption
+# fields added in 2b39549d.
+# ---------------------------------------------------------------------------
+async def validate_assumption(
+    db: aiosqlite.Connection,
+    decision_id: str,
+    finding: str,
+    confirmed: bool,
+    *,
+    file_path: str | None = None,
+    symbol: str | None = None,
+    session_id: str | None = None,
+) -> dict[str, Any]:
+    """Confirm or invalidate the assumption a pinned decision rests on.
+
+    - Stamps ``assumption_status`` = confirmed | invalidated on the decision.
+    - Saves a code-anchored ``kind='insight'`` note carrying ``finding`` (tagged
+      ``assumption`` + the status; high priority when invalidated).
+    - On invalidation, fires a **blocking** HITL so work depending on the
+      decision pauses for human judgment.
+
+    Returns ``{decision, assumption_status, note, hitl}`` (``hitl`` is None when
+    confirmed). Raises ValueError if the decision does not exist.
+    """
+    decision = await get_pinned_decision(db, decision_id)
+    if decision is None:
+        raise ValueError("decision not found")
+    status = "confirmed" if confirmed else "invalidated"
+    project_id = decision["project_id"]
+    title = (decision.get("title") or "decision").strip()
+    updated = await update_pinned_decision(
+        db, decision_id, assumption_status=status
+    )
+    note = await add_project_note(
+        db, project_id,
+        f"Assumption {status}: {title}"[:500],
+        finding or "(no finding text)",
+        f"assumption,{status}",
+        kind="insight",
+        priority="high" if not confirmed else "normal",
+        file_path=file_path, symbol=symbol,
+    )
+    hitl: dict[str, Any] | None = None
+    if not confirmed:
+        # hitl_requests.session_id is a FK — only link a session that exists so a
+        # stale/unknown id degrades to a project-level HITL instead of crashing.
+        _sid = session_id or None
+        if _sid:
+            async with db.execute(
+                "SELECT 1 FROM sessions WHERE id = ?", (_sid,)
+            ) as _cur:
+                if await _cur.fetchone() is None:
+                    _sid = None
+        hitl = await request_hitl(
+            db, project_id,
+            (
+                f"Assumption INVALIDATED for decision '{title}': "
+                f"{(finding or '').strip()[:300]}. Work depending on this "
+                "decision is blocked — decide how to proceed (revise the "
+                "decision, re-scope dependent items, or proceed anyway)."
+            ),
+            session_id=_sid,
+            context=(
+                f"decision_id={decision_id}; assumption="
+                f"{(decision.get('assumption') or '(none recorded)')[:300]}"
+            ),
+            urgency="blocking",
+        )
+    return {
+        "decision": updated,
+        "assumption_status": status,
+        "note": note,
+        "hitl": hitl,
+    }
+
+
+# ---------------------------------------------------------------------------
+# save_finding (e1f43ee7) — phase-agnostic capture primitive. Decoupled from any
+# search tool: turns a finding from web/arxiv/code/conversation into a durable,
+# addressable note with provenance. capture_research_finding (b1d36e93) is the
+# web/paper-shaped wrapper over it.
+# ---------------------------------------------------------------------------
+_FINDING_SOURCE_TYPES = ("web", "arxiv", "code", "conversation")
+
+
+async def save_finding(
+    db: aiosqlite.Connection,
+    project_id: str,
+    summary: str,
+    *,
+    source_url: str | None = None,
+    source_type: str = "web",
+    decision_id: str | None = None,
+) -> dict[str, Any]:
+    """Persist a finding as an addressable ``kind='finding'`` note with provenance.
+
+    The note is tagged ``finding`` + the source_type (so it's discoverable via
+    get_notes(tag='finding')), carries ``source_url`` as provenance, and — when
+    ``decision_id`` is given — is also tagged ``decision:<id>`` to link it to that
+    pinned decision. The note title is derived from the first line of ``summary``.
+
+    Returns ``{note, source_type, decision_id}``. Raises ValueError if
+    ``decision_id`` is given but no such decision exists.
+    """
+    st = (source_type or "web").strip().lower()
+    if st not in _FINDING_SOURCE_TYPES:
+        st = "web"
+    summary = summary or ""
+    stripped = summary.strip()
+    first_line = stripped.splitlines()[0] if stripped else "finding"
+    title = f"Finding: {first_line}"[:200]
+    tags = f"finding,{st}"
+    linked: str | None = None
+    if decision_id:
+        if await get_pinned_decision(db, decision_id) is None:
+            raise ValueError("decision not found")
+        tags = f"{tags},decision:{decision_id}"
+        linked = decision_id
+    note = await add_project_note(
+        db, project_id, title, summary, tags,
+        kind="finding", source=source_url,
+    )
+    return {"note": note, "source_type": st, "decision_id": linked}
+
+
+# ---------------------------------------------------------------------------
+# get_last_session_brief (81170c84) — "what did the last session do" for a
+# planning chat: the most recent session's completed sprint items, task log, and
+# the latest pinned decisions, so a planner sees executor output without manual
+# copy-paste.
+# ---------------------------------------------------------------------------
+async def get_last_session_brief(
+    db: aiosqlite.Connection, project_id: str, *, exclude_session_id: str | None = None
+) -> dict[str, Any] | None:
+    """Summarize the most recent session for a project, or None if there are none.
+
+    ``exclude_session_id`` skips a session (e.g. the planner's own) so the brief
+    reports the last *other* session. Completed items are linked via task_id →
+    task.session_id. Returns name/status/last_seen + completed_items +
+    recent_tasks + recent_pinned_decisions.
+    """
+    sessions = await get_sessions(db, project_id, active_only=False)
+    if exclude_session_id:
+        sessions = [s for s in sessions if s.get("id") != exclude_session_id]
+    if not sessions:
+        return None
+    last = sessions[0]
+    sid = last["id"]
+    all_tasks = await get_tasks(db, project_id, limit=200)
+    session_task_ids = {t["id"] for t in all_tasks if t.get("session_id") == sid}
+    session_tasks = [t for t in all_tasks if t.get("session_id") == sid][:15]
+    items_all = await get_sprint_items(db, project_id)
+    completed_items = [
+        {
+            "id": it["id"],
+            "title": (it.get("title") or "")[:120],
+            "status": it.get("status"),
+        }
+        for it in items_all
+        if it.get("task_id") in session_task_ids
+        and it.get("status") in {"done", "skipped", "failed", "pushed"}
+    ][:20]
+    pinned = await get_pinned_decisions(db, project_id)
+    recent_decisions = [
+        {"id": d.get("id"), "title": (d.get("title") or "")[:120]}
+        for d in pinned[:3]
+    ]
+    return {
+        "session_id": sid,
+        "name": last.get("name"),
+        "human_id": last.get("human_id"),
+        "status": last.get("status"),
+        "last_seen": last.get("last_seen"),
+        "session_summary": last.get("session_summary"),
+        "completed_items": completed_items,
+        "recent_tasks": [
+            {
+                "description": (t.get("description") or "")[:160],
+                "status": t.get("status"),
+                "kind": t.get("kind"),
+            }
+            for t in session_tasks
+        ],
+        "recent_pinned_decisions": recent_decisions,
+    }
+
+
+async def get_session_file_claims(
+    db: aiosqlite.Connection, session_id: str
+) -> list[str]:
+    """Return the file paths a session currently holds an active lock on.
+
+    1750dccf — used by get_session_brief(role='executor') to remind an executor
+    what it has claimed. Stale locks are expired first so the list is live.
+    """
+    await expire_file_locks(db)
+    async with db.execute(
+        "SELECT file_path FROM file_locks WHERE session_id = ? ORDER BY file_path",
+        (session_id,),
+    ) as cur:
+        rows = await cur.fetchall()
+    return [r["file_path"] for r in rows if r is not None]

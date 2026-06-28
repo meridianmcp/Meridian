@@ -546,6 +546,404 @@ def test_dispatch_project_name_resolution_success():
         _run(db.close())
 
 
+def test_decision_assumption_field_and_planning_brief():
+    # 2b39549d — assumption + assumption_status on decisions, surfaced in
+    # get_planning_brief until confirmed. Writes go through db_module directly to
+    # avoid the committable-category DECISIONS.md side effect of the MCP tool.
+    import meridian.db as db_module
+    db = _make_db()
+    try:
+        proj = _run(db_module.create_project(db, "assump-proj"))
+        dec = _run(db_module.pin_decision(
+            db, proj["id"], "Use psycopg3", "asyncpg DLL issues on Windows",
+            assumption="psycopg3 pool handles our concurrency",
+        ))
+        assert dec["assumption"] == "psycopg3 pool handles our concurrency"
+        assert dec["assumption_status"] == "unvalidated"
+        # Surfaced in the planning brief (read-only dispatch).
+        brief = _run(mh._dispatch_mcp_tool(
+            "get_planning_brief", {"project_id": proj["id"]}, db, "/tmp"))
+        ua = brief["unvalidated_assumptions"]
+        assert len(ua) == 1 and ua[0]["decision_id"] == dec["id"]
+        assert ua[0]["assumption_status"] == "unvalidated"
+        # Confirming it drops it out of the brief.
+        _run(db_module.update_pinned_decision(
+            db, dec["id"], assumption_status="confirmed"))
+        brief2 = _run(mh._dispatch_mcp_tool(
+            "get_planning_brief", {"project_id": proj["id"]}, db, "/tmp"))
+        assert brief2["unvalidated_assumptions"] == []
+        # Invalid status is rejected.
+        with pytest.raises(ValueError, match="assumption_status must be"):
+            _run(db_module.update_pinned_decision(
+                db, dec["id"], assumption_status="bogus"))
+    finally:
+        _run(db.close())
+
+
+def test_decision_without_assumption_has_null_status():
+    # 2b39549d — a decision with no assumption has null fields and never appears
+    # in the planning brief's unvalidated_assumptions.
+    import meridian.db as db_module
+    db = _make_db()
+    try:
+        proj = _run(db_module.create_project(db, "noassump"))
+        dec = _run(db_module.pin_decision(db, proj["id"], "X", "Y"))
+        assert dec["assumption"] is None and dec["assumption_status"] is None
+        brief = _run(mh._dispatch_mcp_tool(
+            "get_planning_brief", {"project_id": proj["id"]}, db, "/tmp"))
+        assert brief["unvalidated_assumptions"] == []
+    finally:
+        _run(db.close())
+
+
+def test_validate_assumption_confirmed():
+    # 8ec5493b — confirm: stamps status, saves code-anchored note, no HITL.
+    import meridian.db as db_module
+    db = _make_db()
+    try:
+        proj = _run(db_module.create_project(db, "va-confirm"))
+        dec = _run(db_module.pin_decision(
+            db, proj["id"], "Use psycopg3", "body", assumption="pool handles load"))
+        res = _run(mh._dispatch_mcp_tool("validate_assumption", {
+            "decision_id": dec["id"],
+            "finding": "Benchmarked: pool sustains 200 conns",
+            "confirmed": True,
+            "file_path": "meridian/pg_adapter.py", "symbol": "PostgresPool",
+        }, db, "/tmp"))
+        assert res["assumption_status"] == "confirmed"
+        assert res["hitl"] is None
+        assert res["note"]["file_path"] == "meridian/pg_adapter.py"
+        assert res["note"]["symbol"] == "PostgresPool"
+        assert "confirmed" in (res["note"].get("tags") or "")
+        # Decision row stamped.
+        dec2 = _run(db_module.get_pinned_decision(db, dec["id"]))
+        assert dec2["assumption_status"] == "confirmed"
+        # No blocking HITL created.
+        hitls = _run(db_module.list_hitl_requests(db, proj["id"], status="pending"))
+        assert all(h.get("urgency") != "blocking" for h in hitls)
+    finally:
+        _run(db.close())
+
+
+def test_validate_assumption_invalidated_fires_blocking_hitl():
+    # 8ec5493b — invalidate: stamps status + fires a blocking HITL.
+    import meridian.db as db_module
+    db = _make_db()
+    try:
+        proj = _run(db_module.create_project(db, "va-invalid"))
+        sess = _run(db_module.register_session(db, proj["id"], "planner-1"))
+        dec = _run(db_module.pin_decision(
+            db, proj["id"], "Use psycopg3", "body", assumption="pool handles load"))
+        res = _run(mh._dispatch_mcp_tool("validate_assumption", {
+            "decision_id": dec["id"],
+            "finding": "pool deadlocks at 50 conns on Windows",
+            "confirmed": False,
+            "session_id": sess["id"],
+        }, db, "/tmp"))
+        assert res["assumption_status"] == "invalidated"
+        assert res["hitl"] is not None
+        assert res["hitl"]["urgency"] == "blocking"
+        assert res["hitl"]["session_id"] == sess["id"]
+        assert "invalidated" in (res["note"].get("tags") or "")
+        dec2 = _run(db_module.get_pinned_decision(db, dec["id"]))
+        assert dec2["assumption_status"] == "invalidated"
+        hitls = _run(db_module.list_hitl_requests(db, proj["id"], status="pending"))
+        assert any(h.get("urgency") == "blocking" for h in hitls)
+    finally:
+        _run(db.close())
+
+
+def test_validate_assumption_stale_session_degrades():
+    # 8ec5493b — a non-existent session_id must not crash (FK); the blocking HITL
+    # is created project-level (session_id None) instead.
+    import meridian.db as db_module
+    db = _make_db()
+    try:
+        proj = _run(db_module.create_project(db, "va-stale"))
+        dec = _run(db_module.pin_decision(db, proj["id"], "T", "B", assumption="A"))
+        res = _run(mh._dispatch_mcp_tool("validate_assumption", {
+            "decision_id": dec["id"], "finding": "nope", "confirmed": False,
+            "session_id": "ghost-session",
+        }, db, "/tmp"))
+        assert res["hitl"]["urgency"] == "blocking"
+        assert res["hitl"]["session_id"] is None
+    finally:
+        _run(db.close())
+
+
+def test_validate_assumption_unknown_decision_errors():
+    db = _make_db()
+    try:
+        out = _run(mh._dispatch_mcp_tool("validate_assumption", {
+            "decision_id": "no-such-decision", "finding": "x", "confirmed": True,
+        }, db, "/tmp"))
+        assert "error" in out and "not found" in out["error"]
+    finally:
+        _run(db.close())
+
+
+def test_validate_assumption_requires_confirmed_field():
+    import meridian.db as db_module
+    db = _make_db()
+    try:
+        proj = _run(db_module.create_project(db, "va-req"))
+        dec = _run(db_module.pin_decision(db, proj["id"], "T", "B", assumption="A"))
+        out = _run(mh._dispatch_mcp_tool("validate_assumption", {
+            "decision_id": dec["id"], "finding": "x",
+        }, db, "/tmp"))
+        assert "error" in out and "confirmed" in out["error"]
+    finally:
+        _run(db.close())
+
+
+def test_save_finding_basic_and_decision_link():
+    # e1f43ee7 — capture primitive: addressable note + provenance + decision link.
+    import meridian.db as db_module
+    db = _make_db()
+    try:
+        proj = _run(db_module.create_project(db, "sf-proj"))
+        res = _run(mh._dispatch_mcp_tool("save_finding", {
+            "project_id": proj["id"],
+            "summary": "psycopg3 supports pipeline mode\nextra detail",
+            "source_url": "https://example.com/x", "source_type": "web",
+        }, db, "/tmp"))
+        assert res["source_type"] == "web" and res["decision_id"] is None
+        note = res["note"]
+        assert note["source"] == "https://example.com/x"
+        assert "finding" in (note.get("tags") or "")
+        assert note["title"].startswith("Finding: psycopg3 supports pipeline mode")
+        # Unknown source_type falls back to web.
+        res2 = _run(mh._dispatch_mcp_tool("save_finding", {
+            "project_id": proj["id"], "summary": "x", "source_type": "bogus",
+        }, db, "/tmp"))
+        assert res2["source_type"] == "web"
+        # Decision linkage tags the note decision:<id>.
+        dec = _run(db_module.pin_decision(db, proj["id"], "T", "B"))
+        res3 = _run(mh._dispatch_mcp_tool("save_finding", {
+            "project_id": proj["id"], "summary": "supports X",
+            "decision_id": dec["id"], "source_type": "arxiv",
+        }, db, "/tmp"))
+        assert res3["decision_id"] == dec["id"]
+        assert f"decision:{dec['id']}" in (res3["note"].get("tags") or "")
+        assert "arxiv" in (res3["note"].get("tags") or "")
+        # Unknown decision errors; empty summary errors.
+        out = _run(mh._dispatch_mcp_tool("save_finding", {
+            "project_id": proj["id"], "summary": "y", "decision_id": "ghost",
+        }, db, "/tmp"))
+        assert "error" in out and "not found" in out["error"]
+        out2 = _run(mh._dispatch_mcp_tool("save_finding", {
+            "project_id": proj["id"], "summary": "   ",
+        }, db, "/tmp"))
+        assert "error" in out2
+    finally:
+        _run(db.close())
+
+
+def test_capture_research_finding_infers_arxiv():
+    # b1d36e93 — wrapper over save_finding; arXiv URL → source_type=arxiv.
+    import meridian.db as db_module
+    db = _make_db()
+    try:
+        proj = _run(db_module.create_project(db, "crf-proj"))
+        res = _run(mh._dispatch_mcp_tool("capture_research_finding", {
+            "project_id": proj["id"], "url": "https://arxiv.org/abs/1234.5678",
+            "summary": "Paper shows Y",
+        }, db, "/tmp"))
+        assert res["source_type"] == "arxiv"
+        assert res["note"]["source"] == "https://arxiv.org/abs/1234.5678"
+        assert "arxiv" in (res["note"].get("tags") or "")
+        # Non-arxiv URL → web; related_decision_id links it.
+        dec = _run(db_module.pin_decision(db, proj["id"], "T", "B"))
+        res2 = _run(mh._dispatch_mcp_tool("capture_research_finding", {
+            "project_id": proj["id"], "url": "https://blog.example.com/post",
+            "summary": "Blog says Z", "related_decision_id": dec["id"],
+        }, db, "/tmp"))
+        assert res2["source_type"] == "web" and res2["decision_id"] == dec["id"]
+        # Missing url errors.
+        out = _run(mh._dispatch_mcp_tool("capture_research_finding", {
+            "project_id": proj["id"], "summary": "no url",
+        }, db, "/tmp"))
+        assert "error" in out
+    finally:
+        _run(db.close())
+
+
+def test_planning_brief_last_session_view():
+    # 81170c84 — get_planning_brief surfaces the most recent session's completed
+    # items, task log, and recent decisions.
+    import meridian.db as db_module
+    db = _make_db()
+    try:
+        proj = _run(db_module.create_project(db, "ls-proj"))
+        sess = _run(db_module.register_session(db, proj["id"], "executor-1"))
+        task = _run(db_module.log_task(
+            db, sess["id"], proj["id"], "Implemented OAuth refresh"))
+        item = _run(db_module.add_sprint_item(
+            db, proj["id"], "v1", "OAuth refresh endpoint"))
+        _run(db_module.complete_sprint_item(
+            db, proj["id"], item["id"], task_id=task["id"]))
+        _run(db_module.pin_decision(db, proj["id"], "Use psycopg3", "body"))
+        brief = _run(mh._dispatch_mcp_tool(
+            "get_planning_brief", {"project_id": proj["id"]}, db, "/tmp"))
+        ls = brief["last_session"]
+        assert ls is not None
+        assert ls["session_id"] == sess["id"]
+        assert ls["name"] == "executor-1"
+        assert any(ci["id"] == item["id"] for ci in ls["completed_items"])
+        assert any(
+            "OAuth refresh" in (t["description"] or "") for t in ls["recent_tasks"])
+        assert any(
+            d["title"] == "Use psycopg3" for d in ls["recent_pinned_decisions"])
+    finally:
+        _run(db.close())
+
+
+def test_planning_brief_last_session_none_when_no_sessions():
+    import meridian.db as db_module
+    db = _make_db()
+    try:
+        proj = _run(db_module.create_project(db, "ls-empty"))
+        brief = _run(mh._dispatch_mcp_tool(
+            "get_planning_brief", {"project_id": proj["id"]}, db, "/tmp"))
+        assert brief["last_session"] is None
+    finally:
+        _run(db.close())
+
+
+def test_planning_brief_new_handoff_signal():
+    # ab514e43 — new-handoff signal: latest_handoff + since-based new flag.
+    import meridian.db as db_module
+    db = _make_db()
+    try:
+        proj = _run(db_module.create_project(db, "nh-proj"))
+        sess = _run(db_module.register_session(db, proj["id"], "executor-7"))
+        # No handoff yet → no signal, but generated_at always present.
+        b0 = _run(mh._dispatch_mcp_tool(
+            "get_planning_brief", {"project_id": proj["id"]}, db, "/tmp"))
+        assert b0["latest_handoff"] is None
+        assert b0["new_handoff_available"] is False
+        assert b0["handoff_signal"] is None
+        assert b0["generated_at"]
+        # Record a handoff → surfaced as new (no since baseline).
+        _run(db_module.record_handoff(
+            db, proj["id"], "delta", "handoff body here", session_id=sess["id"]))
+        b1 = _run(mh._dispatch_mcp_tool(
+            "get_planning_brief", {"project_id": proj["id"]}, db, "/tmp"))
+        lh = b1["latest_handoff"]
+        assert lh is not None and lh["session_id"] == sess["id"]
+        assert lh["session_name"] == "executor-7" and lh["mode"] == "delta"
+        assert "handoff body" in lh["body_preview"]
+        assert b1["new_handoff_available"] is True
+        assert b1["handoff_signal"] and "executor-7" in b1["handoff_signal"]
+        # since in the future → not new.
+        b2 = _run(mh._dispatch_mcp_tool("get_planning_brief", {
+            "project_id": proj["id"], "since": "2999-01-01 00:00:00"}, db, "/tmp"))
+        assert b2["new_handoff_available"] is False
+        assert b2["handoff_signal"] is None
+        # since in the past → new.
+        b3 = _run(mh._dispatch_mcp_tool("get_planning_brief", {
+            "project_id": proj["id"], "since": "2000-01-01 00:00:00"}, db, "/tmp"))
+        assert b3["new_handoff_available"] is True
+    finally:
+        _run(db.close())
+
+
+def test_refresh_context_compact_recovery():
+    # d8bd59c4 — compact post-compaction recovery snapshot.
+    import meridian.db as db_module
+    db = _make_db()
+    try:
+        proj = _run(db_module.create_project(db, "rc-proj"))
+        sess = _run(db_module.register_session(db, proj["id"], "exec-rc"))
+        _run(db_module.add_sprint_item(db, proj["id"], "v1", "pending item A"))
+        _run(db_module.pin_decision(
+            db, proj["id"], "Urgent thing", "body",
+            priority="urgent", assumption="risky guess"))
+        _run(db_module.record_handoff(
+            db, proj["id"], "full", "handoff body", session_id=sess["id"]))
+        _run(db_module.add_project_note(
+            db, proj["id"], "Key note", "note body", "tag", priority="high"))
+        rc = _run(mh._dispatch_mcp_tool(
+            "refresh_context", {"project_id": proj["id"]}, db, "/tmp"))
+        assert rc["project_name"] == "rc-proj"
+        assert rc["sprint_progress"]["total"] >= 1
+        assert any(it["title"] == "pending item A" for it in rc["next_pending_items"])
+        assert rc["active_session_id"] == sess["id"]
+        assert len(rc["recent_handoffs"]) == 1
+        assert any(d["title"] == "Urgent thing" for d in rc["high_priority_decisions"])
+        assert any(
+            a["assumption_status"] == "unvalidated"
+            for a in rc["unvalidated_assumptions"])
+        assert any(n.get("slug") for n in rc["key_note_slugs"])
+    finally:
+        _run(db.close())
+
+
+def test_get_session_brief_executor_and_planner_roles_differ():
+    # 1750dccf — role tailors the brief: executor gets version scope + file
+    # claims; planner gets decisions-needing-revisit. They must differ.
+    import meridian.db as db_module
+    db = _make_db()
+    try:
+        proj = _run(db_module.create_project(db, "role-proj"))
+        sess = _run(db_module.register_session(
+            db, proj["id"], "exec-r", sprint_version="v0.1.x"))
+        _run(db_module.register_session(db, proj["id"], "older-exec"))
+        _run(db_module.add_sprint_item(db, proj["id"], "v0.1.x", "scoped item"))
+        _run(db_module.claim_file(db, "meridian/server.py", sess["id"]))
+        _run(db_module.pin_decision(
+            db, proj["id"], "Risky choice", "body", assumption="might not hold"))
+        ex = _run(mh._dispatch_mcp_tool("get_session_brief", {
+            "project_id": proj["id"], "role": "executor", "session_id": sess["id"],
+        }, db, "/tmp"))
+        pl = _run(mh._dispatch_mcp_tool("get_session_brief", {
+            "project_id": proj["id"], "role": "planner", "session_id": sess["id"],
+        }, db, "/tmp"))
+        # Executor-only sections.
+        assert ex["role"] == "executor"
+        assert "version_scope" in ex["text"]
+        assert "my_file_claims" in ex["text"]
+        assert "meridian/server.py" in ex["text"]
+        assert "decisions_needing_revisit" not in ex["text"]
+        # Planner-only sections.
+        assert pl["role"] == "planner"
+        assert "decisions_needing_revisit" in pl["text"]
+        assert "my_file_claims" not in pl["text"]
+        # The two briefs are genuinely different.
+        assert ex["text"] != pl["text"]
+    finally:
+        _run(db.close())
+
+
+def test_add_sprint_item_drift_check_blocks_and_force_overrides():
+    # 7e212375 — a title that overlaps an existing migration is blocked with a
+    # drift_warning; force=true bypasses and adds it.
+    import meridian.db as db_module
+    db = _make_db()
+    try:
+        proj = _run(db_module.create_project(db, "drift-proj"))
+        out = _run(mh._dispatch_mcp_tool("add_sprint_item", {
+            "project_id": proj["id"], "version": "v1",
+            "title": "handoffs table body persistence",
+        }, db, "/tmp"))
+        assert out.get("drift_warning") is True
+        assert out["matches"]
+        items = _run(db_module.get_sprint_items(db, proj["id"]))
+        assert not any(
+            "handoffs table body" in (it.get("title") or "") for it in items)
+        # force=true bypasses the drift check.
+        out2 = _run(mh._dispatch_mcp_tool("add_sprint_item", {
+            "project_id": proj["id"], "version": "v1",
+            "title": "handoffs table body persistence", "force": True,
+        }, db, "/tmp"))
+        assert not out2.get("drift_warning")
+        items2 = _run(db_module.get_sprint_items(db, proj["id"]))
+        assert any(
+            "handoffs table body" in (it.get("title") or "") for it in items2)
+    finally:
+        _run(db.close())
+
+
 def test_dispatch_unknown_tool_raises():
     db = _make_db()
     try:

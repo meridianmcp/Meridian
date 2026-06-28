@@ -18,6 +18,7 @@ the field is always populated.
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
 import os
 import re
@@ -186,8 +187,18 @@ def _build_quick_start_goal(
     )
 
 
-def _extract_keywords(text: str) -> set[str]:
-    """Extract significant lowercase keywords from a title/description string."""
+def _extract_keywords(
+    text: str, extra_stop: "frozenset[str] | set[str] | None" = None
+) -> set[str]:
+    """Extract significant lowercase keywords from a title/description string.
+
+    ``extra_stop`` (23e79944) is an optional second stop set removed on top of
+    the base one. The possibly-done heuristic passes :data:`_MERIDIAN_STOP_WORDS`
+    so Meridian-domain high-frequency terms (session/handoff/notes/decisions/…)
+    don't count as keyword overlap — they appear in nearly every task-log entry
+    and otherwise produced constant false ``possibly_done`` flags. Other callers
+    (code-pointer / touches-files matching) pass nothing and keep those terms.
+    """
     stop = {
         "a", "an", "the", "and", "or", "in", "on", "at", "to", "for",
         "of", "is", "it", "fix", "add", "update", "remove", "change",
@@ -195,7 +206,25 @@ def _extract_keywords(text: str) -> set[str]:
         "this", "that", "into", "as", "be", "has", "was", "not", "no",
     }
     words = re.findall(r"[a-z0-9_/-]{3,}", text.lower())
-    return {w for w in words if w not in stop}
+    kws = {w for w in words if w not in stop}
+    if extra_stop:
+        kws -= set(extra_stop)
+    return kws
+
+
+# 23e79944 — Meridian-domain high-frequency terms. These show up in almost every
+# task-log entry and commit message ("complete sprint item", "generate handoff",
+# "pin decision", …), so counting them as keyword overlap made _annotate_possibly_done
+# flag nearly every pending item. Filtered out (on top of the base stop set) only
+# in the possibly-done heuristic — code-pointer/file matching still see them since
+# they're legitimate symbol names there.
+_MERIDIAN_STOP_WORDS: "frozenset[str]" = frozenset({
+    "session", "sessions", "handoff", "handoffs", "note", "notes",
+    "decision", "decisions", "sprint", "item", "items", "task", "tasks",
+    "project", "projects", "meridian", "test", "tests", "passing", "pass",
+    "dashboard", "tool", "tools", "mcp", "feat", "docs", "complete",
+    "completed", "log", "logs", "board", "context", "field",
+})
 
 
 def reconcile_sprint_items(
@@ -237,6 +266,165 @@ def reconcile_sprint_items(
     return results
 
 
+@functools.lru_cache(maxsize=1)
+def _migration_blocks() -> tuple[tuple[str, frozenset[str]], ...]:
+    """Parse db/migrations.py into ``(migration_name, keyword_set)`` blocks.
+
+    7e212375 — each block's keyword set is the words in its ``_migrate_*`` name
+    plus the quoted table/column identifiers it touches, so the drift check can
+    point at the specific ``_migrate_X`` that already added a thing. Cached: the
+    file is static at runtime. Returns ``()`` if the file can't be read.
+    """
+    try:
+        src = (
+            Path(__file__).resolve().parent / "db" / "migrations.py"
+        ).read_text(encoding="utf-8")
+    except Exception:  # noqa: BLE001
+        return ()
+    parts = re.split(r"\nasync def (_migrate_[a-z0-9_]+)\(", src)
+    blocks: list[tuple[str, frozenset[str]]] = []
+
+    def _add(toks: set[str], ident: str) -> None:
+        ident = ident.lower()
+        if len(ident) >= 3:
+            toks.add(ident)
+        toks.update(p for p in ident.split("_") if len(p) >= 3)
+
+    _col_types = (
+        r"TEXT|INTEGER|REAL|BLOB|BOOLEAN|BOOL|TIMESTAMPTZ|TIMESTAMP|"
+        r"BIGINT|BIGSERIAL|SERIAL|JSONB|JSON|NUMERIC|DATE"
+    )
+    # parts = [preamble, name1, body1, name2, body2, ...]
+    for i in range(1, len(parts), 2):
+        name = parts[i]
+        body = parts[i + 1] if i + 1 < len(parts) else ""
+        toks: set[str] = set()
+        for p in name.replace("_migrate_", "").split("_"):
+            if len(p) >= 3:
+                toks.add(p)
+        # Table / index names.
+        for tbl in re.findall(
+            r"(?:CREATE TABLE(?: IF NOT EXISTS)?|ALTER TABLE|\bON)\s+"
+            r"([a-z][a-z0-9_]+)",
+            body, re.I,
+        ):
+            _add(toks, tbl)
+        # Columns added via the helper: add_column_if_missing(db, "tbl", "col", ...).
+        for tbl, col in re.findall(
+            r'add_column_if_missing\(\s*\w+,\s*"([^"]+)",\s*"([^"]+)"', body
+        ):
+            _add(toks, tbl)
+            _add(toks, col)
+        # Columns / ADD COLUMN declarations followed by a SQL type.
+        for col in re.findall(
+            rf"(?:\n\s+|ADD COLUMN(?: IF NOT EXISTS)?\s+)([a-z][a-z0-9_]+)\s+"
+            rf"(?:{_col_types})",
+            body, re.I,
+        ):
+            _add(toks, col)
+        blocks.append((name, frozenset(toks)))
+    return tuple(blocks)
+
+
+def detect_sprint_item_drift(
+    title: str,
+    recent_commits: list[Any] | None = None,
+    *,
+    migration_blocks: "tuple[tuple[str, frozenset[str]], ...] | None" = None,
+    min_overlap: int = 3,
+) -> list[dict[str, Any]]:
+    """Spot a sprint-item title that may already be implemented.
+
+    7e212375 — compares the title's keywords against (1) each migration block's
+    keyword set and (2) recent commit messages. A match needs ``min_overlap``
+    (default 3) shared keywords. Returns ``[{kind, ref, detail}]`` — ``kind`` is
+    'migration' (ref=_migrate_X) or 'commit' (ref=sha) — empty when nothing
+    crosses the threshold. ``migration_blocks`` is injectable for tests; it
+    defaults to :func:`_migration_blocks`.
+    """
+    kws = _extract_keywords(title)
+    matches: list[dict[str, Any]] = []
+    if len(kws) < min_overlap:
+        return matches
+    blocks = migration_blocks if migration_blocks is not None else _migration_blocks()
+    for name, toks in blocks:
+        overlap = kws & set(toks)
+        if len(overlap) >= min_overlap:
+            matches.append({
+                "kind": "migration",
+                "ref": name,
+                "detail": f"shares {sorted(overlap)} with migrations.py/{name}",
+            })
+            break  # one schema match is enough signal
+    for c in (recent_commits or []):
+        if isinstance(c, str):
+            msg, sha = c, ""
+        else:
+            msg, sha = (c.get("message") or ""), str(c.get("sha") or "")
+        overlap = kws & _extract_keywords(msg)
+        if len(overlap) >= min_overlap:
+            matches.append({
+                "kind": "commit",
+                "ref": sha[:12] or msg[:40],
+                "detail": msg[:120],
+            })
+    return matches
+
+
+def extract_transcript_narrative(
+    transcript_path: str,
+    *,
+    max_messages: int = 40,
+    max_chars: int = 4000,
+) -> str:
+    """Read a Claude Code transcript.jsonl and return a compact work narrative.
+
+    571b8b60 — pulls the assistant's text turns (what it said it did), NOT
+    verbatim tool inputs/outputs, so the Stop hook can build a richer delta
+    handoff than task-log lines alone. Bounded: keeps the last ``max_messages``
+    assistant text turns, capped to ``max_chars`` (most-recent kept). Returns
+    "" on any error, a missing file, or an empty/text-less transcript — callers
+    treat that as "no narrative" and fall back to the plain delta.
+    """
+    try:
+        p = Path(transcript_path)
+        if not p.is_file():
+            return ""
+        raw = p.read_text(encoding="utf-8", errors="replace")
+    except Exception:  # noqa: BLE001
+        return ""
+    texts: list[str] = []
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except Exception:  # noqa: BLE001 — skip non-JSON lines
+            continue
+        msg = obj.get("message") if isinstance(obj, dict) else None
+        if not isinstance(msg, dict) or msg.get("role") != "assistant":
+            continue
+        content = msg.get("content")
+        if isinstance(content, str):
+            t = content.strip()
+            if t:
+                texts.append(t)
+        elif isinstance(content, list):
+            for block in content:
+                # Assistant text blocks only — skip tool_use / tool_result noise.
+                if isinstance(block, dict) and block.get("type") == "text":
+                    t = (block.get("text") or "").strip()
+                    if t:
+                        texts.append(t)
+    if not texts:
+        return ""
+    narrative = "\n\n".join(texts[-max_messages:]).strip()
+    if len(narrative) > max_chars:
+        narrative = "…" + narrative[-max_chars:]
+    return narrative
+
+
 def _annotate_possibly_done(
     pending_items: list[dict[str, Any]],
     recent_tasks: list[dict[str, Any]],
@@ -245,8 +433,13 @@ def _annotate_possibly_done(
     """Flag pending sprint items whose keywords match a recent task or commit.
 
     Adds ``possibly_done=True`` and ``possibly_done_matches`` (list of
-    matching descriptions) to any item with ≥2 keyword matches in the last
+    matching descriptions) to any item with ≥3 keyword matches in the last
     20 tasks or last 10 commits.  Items are not modified otherwise.
+
+    23e79944 — the overlap threshold is 3 (raised from 2) and Meridian-domain
+    high-frequency terms (:data:`_MERIDIAN_STOP_WORDS`) are excluded from the
+    keyword sets, so items sharing only generic words like "session"/"handoff"/
+    "notes"/"decisions" with a large task log no longer trigger false positives.
     """
     # Build a corpus of recent activity texts
     corpus: list[str] = [
@@ -257,13 +450,13 @@ def _annotate_possibly_done(
 
     for item in pending_items:
         title = item.get("title") or ""
-        kws = _extract_keywords(title)
-        if len(kws) < 2:
+        kws = _extract_keywords(title, _MERIDIAN_STOP_WORDS)
+        if len(kws) < 3:
             continue
         matches = []
         for text in corpus:
-            text_kws = _extract_keywords(text)
-            if len(kws & text_kws) >= 2:
+            text_kws = _extract_keywords(text, _MERIDIAN_STOP_WORDS)
+            if len(kws & text_kws) >= 3:
                 matches.append(text[:120])
         if matches:
             item["possibly_done"] = True
@@ -888,6 +1081,7 @@ async def generate_handoff(
     session_id: str | None = None,
     commit_messages: list[str] | None = None,
     graph_searcher: Callable[[str], Any] | None = None,
+    extra_narrative: str | None = None,
 ) -> tuple[str, str]:
     """Fetch all state, render the L0/L1/L2 template, write the file, return both.
 
@@ -1091,12 +1285,27 @@ async def generate_handoff(
             f"{queued_goal}\n=== END QUEUE ==="
         )
 
+    # 571b8b60 — enrich the body with a transcript-derived work narrative when
+    # the Stop hook supplies one (richer than task-log lines alone).
+    if extra_narrative:
+        content = (
+            f"{content}\n\n## Session narrative (from transcript)\n\n"
+            f"{extra_narrative.strip()}\n"
+        )
+
     out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / f"{_slugify(project['name'])}_handoff.md"
     out_path.write_text(content, encoding="utf-8")
     if session_id:
         _SESSION_HANDOFF_STATE[session_id] = state_ts
+    # 8819d6b1 — persist this handoff to the history table so the dashboard /
+    # planner can list past handoffs and detect new ones. Never break handoff
+    # generation if the insert fails (e.g. pre-migration DB).
+    try:
+        await db_module.record_handoff(db, project_id, mode, content, session_id)
+    except Exception:  # noqa: BLE001
+        pass
     return str(out_path.resolve()), content
 
 

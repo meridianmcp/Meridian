@@ -1410,6 +1410,7 @@ async def _handle_notes_decisions(
         result = await db_module.pin_decision(
             db, args["project_id"], args["title"], args["body"], category,
             priority=args.get("priority", "normal"),
+            assumption=args.get("assumption"),
         )
         await _server._append_decision_to_md(args["title"], args["body"], category)
         return result
@@ -1429,10 +1430,30 @@ async def _handle_notes_decisions(
             status=args.get("status"),
             superseded_by=args.get("superseded_by"),
             priority=args.get("priority"),
+            assumption=args.get("assumption"),
+            assumption_status=args.get("assumption_status"),
         )
         if result is None:
             raise ValueError("decision not found")
         return result
+    if name == "validate_assumption":
+        # 8ec5493b — one-call assumption validation: stamp the decision's
+        # assumption_status, save a code-anchored finding note, and fire a
+        # blocking HITL on invalidation.
+        if "confirmed" not in args:
+            return {"error": "validate_assumption requires 'confirmed' (bool)"}
+        validate_input_size(args.get("finding"), "finding", 100_000)
+        validate_input_size(args.get("file_path"), "file_path", 2_000)
+        validate_input_size(args.get("symbol"), "symbol", 500)
+        try:
+            return await db_module.validate_assumption(
+                db, args["decision_id"], args.get("finding") or "",
+                bool(args.get("confirmed")),
+                file_path=args.get("file_path"), symbol=args.get("symbol"),
+                session_id=args.get("session_id"),
+            )
+        except ValueError as exc:
+            return {"error": str(exc)}
     if name == "get_pinned_decisions":
         return await db_module.get_pinned_decisions(
             db, args["project_id"],
@@ -1507,6 +1528,40 @@ async def _handle_notes_decisions(
             _ins_tags, kind="insight",
             priority=args.get("priority", "normal"),
         )
+    if name == "save_finding":
+        # e1f43ee7 — phase-agnostic capture primitive (decoupled from search).
+        validate_input_size(args.get("summary"), "finding summary", 1_000_000)
+        validate_input_size(args.get("source_url"), "source_url", 2_000)
+        if not (args.get("summary") or "").strip():
+            return {"error": "save_finding requires a non-empty summary"}
+        try:
+            return await db_module.save_finding(
+                db, args["project_id"], args.get("summary") or "",
+                source_url=args.get("source_url"),
+                source_type=args.get("source_type", "web"),
+                decision_id=args.get("decision_id"),
+            )
+        except ValueError as exc:
+            return {"error": str(exc)}
+    if name == "capture_research_finding":
+        # b1d36e93 — web/paper-shaped wrapper over save_finding; arXiv URLs are
+        # auto-tagged source_type=arxiv.
+        validate_input_size(args.get("summary"), "finding summary", 1_000_000)
+        validate_input_size(args.get("url"), "url", 2_000)
+        _url = (args.get("url") or "").strip()
+        if not _url:
+            return {"error": "capture_research_finding requires a url"}
+        if not (args.get("summary") or "").strip():
+            return {"error": "capture_research_finding requires a non-empty summary"}
+        _st = "arxiv" if "arxiv.org" in _url.lower() else "web"
+        try:
+            return await db_module.save_finding(
+                db, args["project_id"], args.get("summary") or "",
+                source_url=_url, source_type=_st,
+                decision_id=args.get("related_decision_id"),
+            )
+        except ValueError as exc:
+            return {"error": str(exc)}
     if name == "get_notes":
         # 5a5bba43 — pull model: default to the lightweight list (no bodies) so
         # bulk note injection can't overflow context. Agents fetch one body via
@@ -2121,6 +2176,106 @@ async def _handle_session_tools(
                     ) + "\n</active_sessions>\n"
             except Exception:
                 pass
+        # 1750dccf — role-specific enrichment so executor and planner briefs differ.
+        role_extra_xml = ""
+        if role == "executor":
+            # Version-scoped pending items + this session's file claims + the
+            # decisions code-anchored to the files it holds.
+            _sess_row = None
+            if session_id_for_notes:
+                _sess_all_x = await db_module.get_sessions(
+                    db, project_id, active_only=False
+                )
+                _sess_row = next(
+                    (s for s in _sess_all_x if s.get("id") == session_id_for_notes),
+                    None,
+                )
+            _ver = (_sess_row or {}).get("sprint_version")
+            if _ver:
+                _scoped = [it for it in sprint_items if it.get("version") == _ver]
+                role_extra_xml += (
+                    f'<version_scope version="{_ver}" pending="{len(_scoped)}">\n'
+                    + "\n".join(
+                        f'  <item>{(it.get("title") or "")[:80]}</item>'
+                        for it in _scoped[:5]
+                    )
+                    + "\n</version_scope>\n"
+                )
+            if session_id_for_notes:
+                try:
+                    _claimed = await db_module.get_session_file_claims(
+                        db, session_id_for_notes
+                    )
+                except Exception:
+                    _claimed = []
+                if _claimed:
+                    role_extra_xml += (
+                        "<my_file_claims>\n"
+                        + "\n".join(f"  <file>{c}</file>" for c in _claimed[:20])
+                        + "\n</my_file_claims>\n"
+                    )
+                    _rel: list[dict[str, Any]] = []
+                    _seen_dec: set[Any] = set()
+                    for _fp in _claimed[:20]:
+                        try:
+                            for _d in await db_module.get_decisions_for_file(
+                                db, project_id, _fp
+                            ):
+                                if _d.get("id") not in _seen_dec:
+                                    _seen_dec.add(_d.get("id"))
+                                    _rel.append(_d)
+                        except Exception:
+                            pass
+                    if _rel:
+                        role_extra_xml += (
+                            "<relevant_decisions>\n"
+                            + "\n".join(
+                                f'  <decision anchor="{d.get("code_anchor","")}">'
+                                f'{(d.get("title") or "")}: '
+                                f'{(d.get("body") or "")[:100]}</decision>'
+                                for d in _rel[:10]
+                            )
+                            + "\n</relevant_decisions>\n"
+                        )
+        elif role == "planner":
+            # Last session summary + decisions sitting on unconfirmed assumptions
+            # (what needs revisiting).
+            try:
+                _ls = await db_module.get_last_session_brief(
+                    db, project_id, exclude_session_id=session_id_for_notes
+                )
+            except Exception:
+                _ls = None
+            if _ls:
+                role_extra_xml += (
+                    f'<last_session name="{_ls.get("name","")}" '
+                    f'status="{_ls.get("status","")}">\n'
+                    + "".join(
+                        f'  <completed>{(ci.get("title") or "")[:80]}</completed>\n'
+                        for ci in (_ls.get("completed_items") or [])[:8]
+                    )
+                    + "</last_session>\n"
+                )
+            try:
+                _pin_r = await db_module.get_pinned_decisions(db, project_id)
+                _revisit = [
+                    d for d in _pin_r
+                    if d.get("assumption")
+                    and d.get("assumption_status") != "confirmed"
+                ]
+                if _revisit:
+                    role_extra_xml += (
+                        "<decisions_needing_revisit>\n"
+                        + "\n".join(
+                            f'  <decision status="{d.get("assumption_status")}">'
+                            f'{(d.get("title") or "")}: assumption='
+                            f'{(d.get("assumption") or "")[:80]}</decision>'
+                            for d in _revisit[:10]
+                        )
+                        + "\n</decisions_needing_revisit>\n"
+                    )
+            except Exception:
+                pass
         brief = (
             f'<session_brief project_id="{project_id}" role="{role}">\n'
             f'{notes_xml}'
@@ -2132,6 +2287,7 @@ async def _handle_session_tools(
             f'{blocking_xml}\n'
             f'{hitl_xml}\n'
             f'{planner_extra_xml}'
+            f'{role_extra_xml}'
             f'</session_brief>'
         )
         return {"text": brief, "project_id": project_id, "role": role}
@@ -2160,6 +2316,35 @@ async def _handle_sprint_tools(
         )
     if name == "add_sprint_item":
         validate_input_size(args.get("title"), "sprint item title", 500)
+        # 7e212375 — codebase drift check: if the title looks already-implemented
+        # (3+ keyword overlap with a specific migration or a recent commit),
+        # block with a warning unless force=true. Closes the "adding items for
+        # already-shipped work" gap. Migration check is offline (cached file);
+        # the commit check degrades to empty if git isn't reachable.
+        if not bool(args.get("force", False)):
+            from .. import handoff as _handoff_drift
+            try:
+                _proj_for_drift = await db_module.get_project(db, args["project_id"])
+                _drift_commits = (
+                    await _fetch_recent_commits(_proj_for_drift, tenant)
+                    if _proj_for_drift else []
+                )
+            except Exception:  # noqa: BLE001
+                _drift_commits = []
+            _drift = _handoff_drift.detect_sprint_item_drift(
+                args.get("title") or "", _drift_commits,
+            )
+            if _drift:
+                return {
+                    "drift_warning": True,
+                    "title": args.get("title"),
+                    "matches": _drift[:5],
+                    "message": (
+                        "This may already be implemented — "
+                        + "; ".join(f"{m['kind']}:{m['ref']}" for m in _drift[:3])
+                        + ". Pass force=true to add it anyway."
+                    ),
+                }
         # fd86aacc — warn if active executor sessions exist when adding a new item
         _active_session_warnings = await _active_executor_session_warnings(db, args["project_id"])
         # 07bdfdbb — auto-infer touches_resources from the title when the caller
@@ -2760,6 +2945,58 @@ async def _handle_planning_tools(
         hitls = await db_module.list_hitl_requests(db, project_id, status="pending")
         decisions_raw = (project.get("decisions") or "").strip()
         recent_decisions = [ln.strip() for ln in decisions_raw.splitlines() if ln.strip()][-3:]
+        # 2b39549d — surface decisions resting on assumptions that aren't yet
+        # confirmed (unvalidated or invalidated) so the planner always sees what
+        # needs validating / what just broke.
+        pinned = await db_module.get_pinned_decisions(db, project_id)
+        unvalidated_assumptions = [
+            {
+                "decision_id": d.get("id"),
+                "title": (d.get("title") or "")[:120],
+                "assumption": (d.get("assumption") or "")[:200],
+                "assumption_status": d.get("assumption_status"),
+            }
+            for d in pinned
+            if d.get("assumption") and d.get("assumption_status") != "confirmed"
+        ]
+        # 81170c84 — "what did the last session do": surface the most recent
+        # session's completed items + task log + recent decisions so a planner
+        # sees executor output without manual copy-paste.
+        last_session = await db_module.get_last_session_brief(db, project_id)
+        # ab514e43 — "new handoff available" signal. ``generated_at`` lets the
+        # planner pass it back as ``since`` next call; a handoff filed after
+        # ``since`` (or any handoff when ``since`` is omitted) flags as new.
+        from datetime import datetime, timezone  # local: avoid top-level churn
+        brief_generated_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        since = args.get("since")
+        latest_h = await db_module.get_latest_handoff(db, project_id)
+        latest_handoff = None
+        new_handoff_available = False
+        handoff_signal = None
+        if latest_h:
+            _sessions_all = await db_module.get_sessions(
+                db, project_id, active_only=False
+            )
+            _name_by_id = {s.get("id"): s.get("name") for s in _sessions_all}
+            _hc = str(latest_h.get("created_at") or "")
+            _sname = _name_by_id.get(latest_h.get("session_id"))
+            latest_handoff = {
+                "id": latest_h.get("id"),
+                "session_id": latest_h.get("session_id"),
+                "session_name": _sname,
+                "mode": latest_h.get("mode"),
+                "created_at": _hc,
+                "body_preview": (latest_h.get("body") or "")[:600],
+            }
+            new_handoff_available = (since is None) or (_hc > str(since))
+            if new_handoff_available:
+                handoff_signal = (
+                    f"New handoff available: session "
+                    f"'{_sname or latest_h.get('session_id')}' filed a "
+                    f"{latest_h.get('mode')} handoff at {_hc} — read it via "
+                    f"get_session_brief(project_id, session_id="
+                    f"'{latest_h.get('session_id')}')."
+                )
         return {
             "project_id": project_id,
             "project_name": project.get("name"),
@@ -2783,6 +3020,12 @@ async def _handle_planning_tools(
                 for s in sessions
             ],
             "recent_decisions": recent_decisions,
+            "unvalidated_assumptions": unvalidated_assumptions,
+            "last_session": last_session,
+            "generated_at": brief_generated_at,
+            "latest_handoff": latest_handoff,
+            "new_handoff_available": new_handoff_available,
+            "handoff_signal": handoff_signal,
             "pending_hitls": [
                 {
                     "id": h.get("id"),
@@ -2791,6 +3034,86 @@ async def _handle_planning_tools(
                 }
                 for h in (hitls if isinstance(hitls, list) else [])[:5]
             ],
+        }
+    if name == "refresh_context":
+        # d8bd59c4 — single-call post-compaction recovery for planning chats.
+        # COMPACT by design: counts + ids + slugs, not full bodies, so it can be
+        # called the moment a chat feels disoriented without overflowing context.
+        project_id = args["project_id"]
+        project = await db_module.get_project(db, project_id)
+        if project is None:
+            raise ValueError("project not found")
+        goal = await db_module.get_goal(db, project_id)
+        all_items = await db_module.get_sprint_items(db, project_id)
+        done = sum(1 for it in all_items if it.get("status") == "done")
+        total = len(all_items)
+        pending = [it for it in all_items if it.get("status") == "pending"]
+        active_sessions = await db_module.get_sessions(
+            db, project_id, active_only=True
+        )
+        recent_handoffs = await db_module.get_handoffs(db, project_id, limit=3)
+        pinned = await db_module.get_pinned_decisions(db, project_id)
+        high_priority_decisions = [
+            {"id": d.get("id"), "title": (d.get("title") or "")[:120]}
+            for d in pinned if d.get("priority") == "urgent"
+        ][:5]
+        unvalidated_assumptions = [
+            {
+                "decision_id": d.get("id"),
+                "title": (d.get("title") or "")[:120],
+                "assumption_status": d.get("assumption_status"),
+            }
+            for d in pinned
+            if d.get("assumption") and d.get("assumption_status") != "confirmed"
+        ]
+        notes = await db_module.get_project_notes(db, project_id)
+        _rank = {"high": 0, "normal": 1, "low": 2}
+        key_notes = sorted(
+            [n for n in notes if n.get("slug")],
+            key=lambda n: _rank.get(n.get("priority"), 1),
+        )[:10]
+        key_note_slugs = [
+            {
+                "slug": n.get("slug"),
+                "title": (n.get("title") or "")[:100],
+                "kind": n.get("note_kind") or n.get("kind"),
+            }
+            for n in key_notes
+        ]
+        return {
+            "project_id": project_id,
+            "project_name": project.get("name"),
+            "sprint": (goal.get("sprint") or "") if goal else "",
+            "north_star": (goal.get("north_star") or "") if goal else "",
+            "sprint_progress": {
+                "done": done,
+                "total": total,
+                "pending": len(pending),
+                "percent_complete": round(100 * done / total) if total else 0,
+            },
+            "next_pending_items": [
+                {"id": it["id"], "title": (it.get("title") or "")[:100]}
+                for it in pending[:5]
+            ],
+            "active_session_id": (
+                active_sessions[0]["id"] if active_sessions else None
+            ),
+            "active_sessions": [
+                {"id": s.get("id"), "name": s.get("name")}
+                for s in active_sessions[:5]
+            ],
+            "recent_handoffs": [
+                {
+                    "id": h.get("id"),
+                    "session_id": h.get("session_id"),
+                    "mode": h.get("mode"),
+                    "created_at": h.get("created_at"),
+                }
+                for h in recent_handoffs
+            ],
+            "high_priority_decisions": high_priority_decisions,
+            "unvalidated_assumptions": unvalidated_assumptions,
+            "key_note_slugs": key_note_slugs,
         }
     return _MISS
 

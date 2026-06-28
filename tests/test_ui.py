@@ -628,6 +628,8 @@ def test_tunnel_plugins_section_has_ux_enhancements(js):
     assert "@modelcontextprotocol/server-sequential-thinking" in js, (
         "curated 'Sequential Thinking' command missing"
     )
+    # 19e063e4 — arXiv research-prospecting server in the curated list.
+    assert "uvx arxiv-mcp-server" in js, "curated 'arXiv' command missing"
     # Rendered with a copy-to-clipboard action.
     assert "navigator.clipboard" in js, "clipboard copy not wired"
 

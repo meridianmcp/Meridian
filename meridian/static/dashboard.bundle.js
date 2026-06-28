@@ -4933,7 +4933,8 @@ project_id = "${displayPid}"`;
     { name: "Fetch", command: "uvx mcp-server-fetch", description: "Fetch & convert web pages to markdown", docs: "https://github.com/modelcontextprotocol/servers" },
     { name: "Git", command: "uvx mcp-server-git", description: "Read/search/manipulate Git repos", docs: "https://github.com/modelcontextprotocol/servers" },
     { name: "Time", command: "uvx mcp-server-time", description: "Time & timezone conversion", docs: "https://github.com/modelcontextprotocol/servers" },
-    { name: "Memory", command: "npx -y @modelcontextprotocol/server-memory", description: "Knowledge-graph persistent memory", docs: "https://github.com/modelcontextprotocol/servers" }
+    { name: "Memory", command: "npx -y @modelcontextprotocol/server-memory", description: "Knowledge-graph persistent memory", docs: "https://github.com/modelcontextprotocol/servers" },
+    { name: "arXiv", command: "uvx arxiv-mcp-server", description: "arXiv search, download papers as markdown, citation graph (Semantic Scholar), topic watches \u2014 research prospecting for planning sessions", docs: "https://github.com/blazickjp/arxiv-mcp-server" }
   ];
   window._CURATED_TUNNEL_PLUGINS = _CURATED_TUNNEL_PLUGINS;
   function _detectTunnelOs() {

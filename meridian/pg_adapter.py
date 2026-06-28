@@ -1362,6 +1362,28 @@ async def _migrate_pg_project_execution_mode(conn: PostgresConnection) -> None:
     )
 
 
+async def _migrate_pg_handoffs_table(conn: PostgresConnection) -> None:
+    """8819d6b1 — handoffs: per-session handoff history.
+
+    Postgres mirror of db._migrate_handoffs_table. CREATE TABLE / INDEX IF NOT
+    EXISTS so re-running is a no-op.
+    """
+    await conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS handoffs (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL,
+            session_id TEXT,
+            mode TEXT NOT NULL DEFAULT 'full',
+            body TEXT NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+        CREATE INDEX IF NOT EXISTS idx_handoffs_project
+            ON handoffs(project_id, created_at);
+        """
+    )
+
+
 async def _migrate_pg_agent_tasks_table(conn: PostgresConnection) -> None:
     """99e71b9e — agent_tasks: Google A2A protocol task storage.
 
@@ -1981,6 +2003,19 @@ async def _migrate_pg_decision_code_anchor(conn: PostgresConnection) -> None:
     )
 
 
+async def _migrate_pg_decision_assumption(conn: PostgresConnection) -> None:
+    """2b39549d — decisions_pinned.assumption + assumption_status.
+
+    Records the unverified assumption a decision rests on and its validation
+    state (unvalidated|confirmed|invalidated). Both nullable. ADD COLUMN IF NOT
+    EXISTS so re-running is a no-op. Mirrors db._migrate_decision_assumption.
+    """
+    await conn.executescript(
+        "ALTER TABLE decisions_pinned ADD COLUMN IF NOT EXISTS assumption TEXT; "
+        "ALTER TABLE decisions_pinned ADD COLUMN IF NOT EXISTS assumption_status TEXT;"
+    )
+
+
 async def _migrate_pg_session_graph_snapshots(conn: PostgresConnection) -> None:
     """f773a99a — session_graph_snapshots: per-session code-graph metric snapshots.
 
@@ -2084,4 +2119,6 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_agent_tasks_table,
     _migrate_pg_sprint_item_owner,
     _migrate_pg_session_note_kind,
+    _migrate_pg_handoffs_table,
+    _migrate_pg_decision_assumption,
 )
