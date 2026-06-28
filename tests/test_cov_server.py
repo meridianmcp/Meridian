@@ -432,6 +432,36 @@ def test_hooks_stop_happy(client):
     assert r.json()["ok"] is True
 
 
+def test_hooks_stop_transcript_narrative(client, tmp_path):
+    # 571b8b60 — Stop hook reads transcript_path and folds the assistant work
+    # narrative into the delta handoff body.
+    import json as _json
+    from pathlib import Path as _Path
+
+    p = _create_project(client, "hooks-stop-transcript")
+    sess = client.post(
+        "/sessions/register", json={"project_id": p["id"], "name": "exec-h"}
+    ).json()
+    transcript = tmp_path / "transcript.jsonl"
+    transcript.write_text(
+        _json.dumps({"message": {"role": "assistant",
+                     "content": "Refactored the auth module and added 3 tests."}})
+        + "\n",
+        encoding="utf-8",
+    )
+    r = client.post("/hooks/stop", json={
+        "project_id": p["id"], "session_id": sess["id"],
+        "transcript_path": str(transcript),
+    })
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ok"] is True
+    assert body["handoff"]["transcript_narrative"] is True
+    handoff_text = _Path(body["handoff"]["path"]).read_text(encoding="utf-8")
+    assert "Session narrative (from transcript)" in handoff_text
+    assert "Refactored the auth module" in handoff_text
+
+
 def test_hooks_session_start_no_project_no_projects(client):
     # No project_id and no projects in DB -> 400.
     r = client.post("/hooks/session-start", json={})

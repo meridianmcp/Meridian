@@ -146,7 +146,8 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "title": {"type": "string"},
          "body": {"type": "string"},
          "category": {"type": "string"},
-         "priority": {"type": "string", "enum": ["urgent", "normal", "low"], "description": "urgent decisions sort first and are weighted higher in start_session / generate_handoff context. Default normal."}},
+         "priority": {"type": "string", "enum": ["urgent", "normal", "low"], "description": "urgent decisions sort first and are weighted higher in start_session / generate_handoff context. Default normal."},
+         "assumption": {"type": "string", "description": "Optional unverified assumption this decision rests on. Recorded with status 'unvalidated' and surfaced in get_planning_brief until validate_assumption confirms or invalidates it."}},
          "required": ["title", "body"]}},
     {"name": "update_decision", "description":
         "Patch a pinned decision. Pass new_title + new_body to atomically "
@@ -162,8 +163,25 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "body": {"type": "string"},
          "category": {"type": "string"},
          "priority": {"type": "string", "enum": ["urgent", "normal", "low"], "description": "Change ordering/weight (urgent | normal | low)."},
-         "status": {"type": "string"}},
+         "status": {"type": "string"},
+         "assumption": {"type": "string", "description": "Set/replace the decision's underlying assumption text."},
+         "assumption_status": {"type": "string", "enum": ["unvalidated", "confirmed", "invalidated"], "description": "Stamp the assumption's validation state. Usually set via the validate_assumption tool, which also fires HITL on invalidation."}},
          "required": ["decision_id"]}},
+    {"name": "validate_assumption", "description":
+        "Confirm or invalidate the assumption a pinned decision rests on, in one "
+        "call — no phase switching. Stamps the decision's assumption_status "
+        "(confirmed|invalidated), saves a code-anchored note with your finding, "
+        "and when confirmed=false fires a BLOCKING HITL so work depending on the "
+        "decision pauses for human judgment. Use the moment you discover whether "
+        "an assumption holds (a planning-session prospect moment).",
+     "inputSchema": {"type": "object", "properties": {
+         "decision_id": {"type": "string"},
+         "finding": {"type": "string", "description": "What you found that confirms or refutes the assumption."},
+         "confirmed": {"type": "boolean", "description": "true = assumption holds; false = invalidated (fires a blocking HITL)."},
+         "file_path": {"type": "string", "description": "Optional file path the finding is anchored to (code-anchored note)."},
+         "symbol": {"type": "string", "description": "Optional symbol within file_path."},
+         "session_id": {"type": "string", "description": "Session firing the validation; linked to the blocking HITL on invalidation."}},
+         "required": ["decision_id", "finding", "confirmed"]}},
     {"name": "get_pinned_decisions", "description":
         "Read-only: List pinned decisions, highest priority first (urgent → "
         "normal → low, then newest-first). Active only by default. Each row "
@@ -293,6 +311,32 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "tags": {"type": "string", "description": "Optional comma-separated tags (an 'insight' tag is always added)."},
          "priority": {"type": "string", "enum": ["high", "normal", "low"], "description": "high-priority notes appear first in planner context and generate_handoff."}},
          "required": ["title"]}},
+    {"name": "save_finding", "description":
+        "Phase-agnostic capture primitive: turn a finding into a durable, "
+        "addressable note with provenance — works with ANY source (Claude's "
+        "built-in web search, the arXiv MCP, Serena, a teammate). Decoupled from "
+        "search so capture survives regardless of how you found it. The summary's "
+        "first line becomes the note title; the note is tagged 'finding' + the "
+        "source_type. Optionally links to a pinned decision. Returns the note.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "summary": {"type": "string", "description": "The finding text (markdown). Its first line becomes the note title."},
+         "source_url": {"type": "string", "description": "Provenance URL/path stored on the note."},
+         "source_type": {"type": "string", "enum": ["web", "arxiv", "code", "conversation"], "description": "Where the finding came from. Default web; unknown values fall back to web."},
+         "decision_id": {"type": "string", "description": "Optional pinned-decision id to link this finding to (tagged decision:<id>)."}},
+         "required": ["summary"]}},
+    {"name": "capture_research_finding", "description":
+        "Inline capture for web/paper research during planning: save a finding "
+        "from a URL as an addressable note with the source link, optionally linked "
+        "to a decision. A research-shaped wrapper over save_finding — arXiv URLs "
+        "are tagged source_type=arxiv automatically, everything else as web. Turns "
+        "web-search results into durable Meridian artifacts instead of evaporating.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "url": {"type": "string", "description": "Source URL of the web page or paper."},
+         "summary": {"type": "string", "description": "Your summary of the finding (markdown)."},
+         "related_decision_id": {"type": "string", "description": "Optional pinned-decision id to link the finding to."}},
+         "required": ["url", "summary"]}},
     {"name": "get_notes", "description":
         "Read-only: List project notes (newest first), LIGHTWEIGHT by default — "
         "each item is id/slug/title/tags/kind/priority/timestamps with NO body, "
@@ -423,8 +467,9 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "XML envelope (<500 tokens).",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
-         "role": {"type": "string", "enum": ["worker", "planner", "review"],
-                  "description": "Controls verbosity. 'worker'=sprint+tasks only, 'planner'=full context."}},
+         "role": {"type": "string", "enum": ["worker", "executor", "planner", "review"],
+                  "description": "Tailors the brief. 'worker'=sprint+tasks only; 'executor'=adds version-scoped pending items, this session's file claims, and decisions code-anchored to them (pass session_id); 'planner'=adds full decisions/notes/sessions, last-session summary, and decisions needing revisit."},
+         "session_id": {"type": "string", "description": "Caller session id — enables session-scratchpad notes, board-change detection, and (role='executor') file-claim + version scoping."}},
          "required": []}},
     {"name": "list_hitl_requests", "description":
         "Read-only: List HITL requests without needing UUIDs. OMIT project_id to list pending "
@@ -521,7 +566,8 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "a named objective with 'group'; attribute to a person with 'human_id'. "
         "Use 'depends_on' to block until another item finishes. Blocks near-duplicate titles "
         "(>=60% word overlap with an open pending/in_progress item) and returns the conflict; "
-        "pass force=true to add anyway.",
+        "also warns (drift_warning) when the title looks already-shipped — 3+ keyword overlap "
+        "with a migrations.py/_migrate_X or a recent commit; pass force=true to add anyway.",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
          "version": {"type": "string"},
@@ -536,7 +582,7 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "touches_resources": {"type": "array", "items": {"type": "string"},
                                "description": "Typed resource identifiers this item touches, for parallel conflict detection: 'file:path.py', 'db:migrations', 'mcp_tool:name', 'route:METHOD:/path', 'pypi:publish', 'github:tag'. Used by get_parallelizable_groups to cluster non-overlapping items."},
          "force": {"type": "boolean",
-                   "description": "Override the duplicate guard and add the item even if its title closely matches an existing open item. Default false."}},
+                   "description": "Override the duplicate guard AND the codebase drift check (7e212375) and add the item even if its title matches an existing open item or looks already-shipped. Default false."}},
          "required": ["version", "title"]}},
     {"name": "fan_out_sprint_items",
      "description":
@@ -601,9 +647,22 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
     {"name": "get_planning_brief", "description":
         "PLANNING SESSIONS: CALL THIS FIRST before anything else. "
         "Read-only: Return a compact planning context — sprint, north star, pending items, "
-        "in-progress items, recent tasks, active sessions, recent decisions, and pending HITLs. "
+        "in-progress items, recent tasks, active sessions, recent decisions, unvalidated "
+        "assumptions, the last session's output (last_session), and a new-handoff signal. "
         "No session registration needed. Designed for planning chat sessions that need to see "
-        "project state without side effects.",
+        "project state without side effects. Pass `since` (a prior call's generated_at) to flag "
+        "only handoffs filed since you last checked.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "since": {"type": "string", "description": "Optional ISO timestamp (a prior brief's generated_at). When given, new_handoff_available flags only handoffs filed after it."}},
+         "required": []}},
+    {"name": "refresh_context", "description":
+        "Single-call post-compaction recovery for planning chats. Returns a "
+        "COMPACT snapshot — current sprint + progress, next pending items, the "
+        "active session id, recent handoffs, high-priority (urgent) decisions, "
+        "unvalidated assumptions, and key note slugs — small enough not to "
+        "overflow context. Call this the moment a chat feels disoriented (e.g. "
+        "right after a /compact) to re-orient in one round-trip.",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."}},
          "required": []}},

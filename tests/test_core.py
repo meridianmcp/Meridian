@@ -2622,6 +2622,36 @@ def test_start_session_returns_all_fields(client):
     assert "AGENTS.md" in body["files"]
 
 
+def test_start_session_execute_immediately_signal(client):
+    """331896e1 — pending items + autonomous posture → explicit execute-now signal
+    naming the first item, so an executor never asks "what should I work on?"."""
+    project = client.post("/projects", json={"name": "exec-now-proj"}).json()
+    client.post(
+        f"/projects/{project['id']}/sprint-items",
+        json={"version": "v1", "title": "first task"},
+    )
+    r = client.post(
+        f"/projects/{project['id']}/start-session",
+        json={"session_name": "w1"},
+    )
+    body = r.json()
+    assert body["execute_immediately"] is True
+    assert body["execute_immediately_signal"]
+    assert "first task" in body["execute_immediately_signal"]
+
+
+def test_start_session_no_execute_signal_when_board_empty(client):
+    """331896e1 — no pending items → no execute-now signal (nothing to claim)."""
+    project = client.post("/projects", json={"name": "empty-board-proj"}).json()
+    r = client.post(
+        f"/projects/{project['id']}/start-session",
+        json={"session_name": "w1"},
+    )
+    body = r.json()
+    assert body["execute_immediately"] is False
+    assert body["execute_immediately_signal"] is None
+
+
 def test_start_session_goal_has_ambient_tasks(client):
     """goal.ambient_tasks is populated from the last task log entries."""
     project = client.post("/projects", json={"name": "alpha"}).json()
@@ -6247,10 +6277,12 @@ def test_pg_migration_registry_matches_historical_order():
         "_migrate_pg_agent_tasks_table",
         "_migrate_pg_sprint_item_owner",
         "_migrate_pg_session_note_kind",
+        "_migrate_pg_handoffs_table",
+        "_migrate_pg_decision_assumption",
     ]
     # No duplicates across the three groups.
     allnames = core + hosted + late
-    assert len(allnames) == len(set(allnames)) == 65
+    assert len(allnames) == len(set(allnames)) == 67
 
 
 def test_default_agent_instructions_has_code_intel_protocol():

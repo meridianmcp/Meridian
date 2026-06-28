@@ -13,6 +13,11 @@ for "what has been decided, claimed, and shipped."
   These appear in the decisions log (newest first) and persist across sessions.
 - **`generate_handoff`** when context is filling up (~80k tokens) or before you stop.
   A clean handoff lets a fresh session resume without re-deriving everything.
+- **`refresh_context(project_name=...)` the moment you're disoriented** — after a
+  `/compact`, a long gap, or losing the thread, call it for a one-round-trip,
+  compact snapshot (sprint + progress, active session id, recent handoffs,
+  urgent decisions, unvalidated assumptions, key note slugs) instead of
+  re-reading everything.
 - **`claim_task`** before starting work on something a parallel session might pick up.
   **`release_task`** if you bail — don't leave it claimed.
 - **`claim_file(session_id, file_path)`** before editing shared files when parallel

@@ -3997,11 +3997,37 @@ async def _start_session_composite(
         # 72e12ed8 — surface the HITL auto-answer mode so executors know upfront
         # that request_hitl resolves inline (1/2) vs. blocks for a human (0).
         _c_hitl_mode = await _hitl_auto_answer_mode_safe(db, project_id)
+        # 331896e1 — explicit "execute immediately" signal: when the board has
+        # pending work, the session is scoped to a version, and the posture is
+        # autonomous, tell the executor to claim+run now instead of asking what
+        # to work on. The boolean is machine-checkable; the signal string is the
+        # human-readable nudge naming the first item.
+        _c_pending = _c_counts.get("pending", 0) + _c_counts.get("todo", 0)
+        _c_execute_now = bool(
+            _c_pending > 0 and scoped_version and _c_mode == "autonomous"
+        )
+        _c_execute_signal = None
+        if _c_execute_now:
+            _c_first = next(
+                (it for it in _c_items if it.get("status") in ("pending", "todo")),
+                None,
+            )
+            _c_execute_signal = (
+                f"{_c_pending} pending item(s) in sprint {scoped_version!r}. "
+                "EXECUTE NOW: claim the first unclaimed item and start working "
+                "immediately — do not ask what to work on."
+                + (
+                    f" First up: {(_c_first.get('title') or '')[:100]}"
+                    if _c_first else ""
+                )
+            )
         _c_payload = {
             "session_id": session["id"],
             "compact": True,
             "execution_mode": _c_mode,  # ecf69de8 — structured posture field
             "execution_mode_directive": _c_mode_directive,
+            "execute_immediately": _c_execute_now,
+            "execute_immediately_signal": _c_execute_signal,
             "hitl_auto_answer_mode": _c_hitl_mode,
             "hitl_auto_answer_directive": _hitl_mode_directive(_c_hitl_mode),
             "sprint": (str(_c_sprint)[:300] if _c_sprint else None),
@@ -4010,7 +4036,7 @@ async def _start_session_composite(
                 "total": len(_c_items),
                 "done": _c_counts.get("done", 0),
                 "in_progress": _c_counts.get("in_progress", 0),
-                "pending": _c_counts.get("pending", 0) + _c_counts.get("todo", 0),
+                "pending": _c_pending,
             },
             "recent_tasks": recent_tasks[:3],
             "board_change": _c_board_change,
@@ -4152,10 +4178,28 @@ async def _start_session_composite(
 
     # 72e12ed8 — HITL auto-answer mode in the full orientation too.
     _hitl_mode = await _hitl_auto_answer_mode_safe(db, project_id)
+    # 331896e1 — explicit execute-immediately signal (see compact path).
+    _exec_now = bool(
+        pending_items and scoped_version and execution_mode == "autonomous"
+    )
+    _exec_signal = None
+    if _exec_now:
+        _first_p = pending_items[0] if isinstance(pending_items[0], dict) else {}
+        _exec_signal = (
+            f"{len(pending_items)} pending item(s) in sprint {scoped_version!r}. "
+            "EXECUTE NOW: claim the first unclaimed item and start working "
+            "immediately — do not ask what to work on."
+            + (
+                f" First up: {(_first_p.get('title') or '')[:100]}"
+                if _first_p else ""
+            )
+        )
     payload: dict[str, Any] = {
         "session_id": session["id"],
         "execution_mode": execution_mode,  # ecf69de8 — structured posture field
         "execution_mode_directive": mode_directive,
+        "execute_immediately": _exec_now,
+        "execute_immediately_signal": _exec_signal,
         "hitl_auto_answer_mode": _hitl_mode,
         "hitl_auto_answer_directive": _hitl_mode_directive(_hitl_mode),
         "sprint_version": scoped_version,  # a76cb7c0 — resolved scope (or None)
@@ -4725,6 +4769,9 @@ async def hooks_stop(body: dict[str, Any], request: Request) -> dict[str, Any]:
     session_id = (body.get("session_id") or "").strip() or None
     hook_cwd = (body.get("cwd") or "").strip()
     hook_hostname = (body.get("hostname") or "").strip()
+    # 571b8b60 — Claude Code passes the transcript path; a bounded read of its
+    # assistant text turns enriches the delta handoff below.
+    transcript_path = (body.get("transcript_path") or "").strip()
     # Resolve the tenant DB first so a bad Bearer token still 401s (hosted mode);
     # everything after this point is best-effort and only ever returns 200.
     db = await _resolve_hook_db(request)
@@ -4758,13 +4805,31 @@ async def hooks_stop(body: dict[str, Any], request: Request) -> dict[str, Any]:
     # timeout) returns cleanly with handoff null so the hook never blocks/errors.
     try:
         from . import handoff as handoff_module_local
+        # 571b8b60 — bounded transcript read (local file, capped) → work
+        # narrative folded into the delta body. Guarded: any failure yields ""
+        # and the handoff falls back to the plain delta.
+        _narrative = ""
+        if transcript_path:
+            try:
+                _narrative = handoff_module_local.extract_transcript_narrative(
+                    transcript_path
+                )
+            except Exception:  # noqa: BLE001
+                _narrative = ""
         path, _content = await asyncio.wait_for(
             handoff_module_local.generate_handoff(
-                db, project_id, _data_dir(request), mode="delta", session_id=session_id
+                db, project_id, _data_dir(request), mode="delta",
+                session_id=session_id, extra_narrative=_narrative or None,
             ),
             timeout=20.0,
         )
-        return {"ok": True, "handoff": {"mode": "delta", "path": path}}
+        return {
+            "ok": True,
+            "handoff": {
+                "mode": "delta", "path": path,
+                "transcript_narrative": bool(_narrative),
+            },
+        }
     except Exception as exc:  # noqa: BLE001
         import logging as _hook_logging
         _hook_logging.getLogger("meridian.hooks").info(

@@ -8,6 +8,7 @@ pure helpers, and the HTTP endpoints (including error paths).
 from __future__ import annotations
 
 import asyncio
+import json
 
 import pytest
 
@@ -207,6 +208,200 @@ def test_annotate_possibly_done():
     out = handoff_module._annotate_possibly_done(pending, tasks)
     assert out[0]["possibly_done"] is True
     assert out[0]["possibly_done_matches"]
+
+
+def test_extract_keywords_extra_stop():
+    # 23e79944 — extra_stop drops Meridian-domain terms on top of the base set.
+    text = "session handoff notes decisions postgres"
+    base = handoff_module._extract_keywords(text)
+    assert {"session", "handoff", "notes", "decisions", "postgres"} <= base
+    filtered = handoff_module._extract_keywords(
+        text, handoff_module._MERIDIAN_STOP_WORDS
+    )
+    assert filtered == {"postgres"}
+
+
+def test_annotate_possibly_done_ignores_meridian_stopwords():
+    # 23e79944 — an item overlapping a busy task log ONLY on Meridian-domain
+    # high-frequency words (session/handoff/notes/decisions/sprint) must NOT be
+    # flagged possibly_done. This was the constant false-positive being fixed.
+    pending = [{"id": "i1", "title": "session handoff notes decisions sprint"}]
+    tasks = [{
+        "description": "logged session, generated handoff, pinned decisions, "
+                       "updated notes for the sprint board",
+    }]
+    out = handoff_module._annotate_possibly_done(pending, tasks)
+    assert not out[0].get("possibly_done")
+
+
+def test_annotate_possibly_done_threshold_is_three():
+    # 23e79944 — exactly 2 distinctive keyword overlaps is now below threshold.
+    pending = [{"id": "i1", "title": "oauth redirect bug"}]
+    tasks = [{"description": "fixed the oauth redirect on login"}]  # overlap 2
+    out = handoff_module._annotate_possibly_done(pending, tasks)
+    assert not out[0].get("possibly_done")
+    # 3 distinctive overlaps still flags.
+    pending2 = [{"id": "i2", "title": "oauth redirect cookie bug"}]
+    tasks2 = [{"description": "fixed the oauth redirect cookie on login"}]
+    out2 = handoff_module._annotate_possibly_done(pending2, tasks2)
+    assert out2[0].get("possibly_done") is True
+
+
+# ---------------------------------------------------------------------------
+# Sprint-item drift detection (7e212375)
+# ---------------------------------------------------------------------------
+
+
+def test_detect_sprint_item_drift_migration_and_commit():
+    blocks = (
+        ("_migrate_handoffs_table",
+         frozenset({"handoffs", "table", "body", "session", "mode"})),
+    )
+    # 3 tokens shared with a migration block → migration match.
+    m = handoff_module.detect_sprint_item_drift(
+        "handoffs table body column", migration_blocks=blocks)
+    assert any(
+        x["kind"] == "migration" and x["ref"] == "_migrate_handoffs_table"
+        for x in m)
+    # 3 tokens shared with a commit message → commit match.
+    m2 = handoff_module.detect_sprint_item_drift(
+        "oauth token refresh endpoint",
+        recent_commits=[{"sha": "abc123def4567", "message":
+                         "feat: oauth token refresh endpoint added"}],
+        migration_blocks=(),
+    )
+    assert any(x["kind"] == "commit" for x in m2)
+    # Below the overlap threshold → nothing.
+    assert handoff_module.detect_sprint_item_drift(
+        "totally novel widget", migration_blocks=blocks, recent_commits=[]) == []
+    # <3 keywords → guarded out.
+    assert handoff_module.detect_sprint_item_drift(
+        "ab cd", migration_blocks=blocks) == []
+
+
+def test_migration_blocks_includes_known_migrations():
+    names = {n for n, _ in handoff_module._migration_blocks()}
+    assert "_migrate_handoffs_table" in names
+    assert "_migrate_decision_assumption" in names
+
+
+# ---------------------------------------------------------------------------
+# Stop-hook transcript narrative (571b8b60)
+# ---------------------------------------------------------------------------
+
+
+def test_extract_transcript_narrative(tmp_path):
+    # 571b8b60 — keep assistant text turns, drop tool_use/tool_result noise.
+    f = tmp_path / "transcript.jsonl"
+    lines = [
+        json.dumps({"type": "assistant", "message": {"role": "assistant",
+                    "content": [
+                        {"type": "text", "text": "Implemented the OAuth refresh endpoint."},
+                        {"type": "tool_use", "name": "Edit", "input": {"secret": "xyzsecret"}},
+                    ]}}),
+        json.dumps({"type": "user", "message": {"role": "user", "content": [
+            {"type": "tool_result", "content": "file-written-output"},
+        ]}}),
+        json.dumps({"type": "assistant", "message": {"role": "assistant",
+                    "content": "Added tests and they pass."}}),
+        "not json at all",
+    ]
+    f.write_text("\n".join(lines), encoding="utf-8")
+    nar = handoff_module.extract_transcript_narrative(str(f))
+    assert "OAuth refresh endpoint" in nar
+    assert "Added tests and they pass." in nar
+    assert "xyzsecret" not in nar       # tool input excluded
+    assert "file-written-output" not in nar  # tool result excluded
+
+
+def test_extract_transcript_narrative_missing_file_returns_empty():
+    assert handoff_module.extract_transcript_narrative("/no/such/path.jsonl") == ""
+
+
+def test_extract_transcript_narrative_caps_length(tmp_path):
+    f = tmp_path / "t.jsonl"
+    f.write_text(
+        json.dumps({"message": {"role": "assistant", "content": "x" * 10000}}),
+        encoding="utf-8",
+    )
+    nar = handoff_module.extract_transcript_narrative(str(f), max_chars=100)
+    assert len(nar) <= 101  # 100 chars + the leading ellipsis
+
+
+@pytest.mark.asyncio
+async def test_generate_handoff_includes_extra_narrative(db, tmp_path):
+    # 571b8b60 — extra_narrative is folded into the delta body.
+    p = await db_module.create_project(db, "narr-proj")
+    _, content = await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="delta",
+        extra_narrative="Did the thing and verified it.",
+    )
+    assert "Session narrative (from transcript)" in content
+    assert "Did the thing and verified it." in content
+
+
+# ---------------------------------------------------------------------------
+# Handoff history table (8819d6b1)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_record_and_list_handoffs(db):
+    # 8819d6b1 — record + list newest-first + latest + session scoping + by-id.
+    p = await db_module.create_project(db, "handoff-history")
+    h1 = await db_module.record_handoff(
+        db, p["id"], "full", "body one", session_id="s1"
+    )
+    assert h1["id"] and h1["mode"] == "full" and h1["body"] == "body one"
+    assert h1["project_id"] == p["id"] and h1["session_id"] == "s1"
+    # Force h1 older so ordering is deterministic regardless of clock resolution.
+    await db.execute(
+        "UPDATE handoffs SET created_at = '2000-01-01 00:00:00' WHERE id = ?",
+        (h1["id"],),
+    )
+    await db.commit()
+    h2 = await db_module.record_handoff(
+        db, p["id"], "delta", "body two", session_id="s2"
+    )
+    rows = await db_module.get_handoffs(db, p["id"])
+    assert [r["id"] for r in rows] == [h2["id"], h1["id"]]  # newest first
+    latest = await db_module.get_latest_handoff(db, p["id"])
+    assert latest["id"] == h2["id"]
+    # session scoping
+    only_s1 = await db_module.get_handoffs(db, p["id"], session_id="s1")
+    assert len(only_s1) == 1 and only_s1[0]["id"] == h1["id"]
+    # fetch by id
+    assert (await db_module.get_handoff(db, h1["id"]))["body"] == "body one"
+
+
+@pytest.mark.asyncio
+async def test_get_latest_handoff_none_when_empty(db):
+    p = await db_module.create_project(db, "handoff-empty")
+    assert await db_module.get_latest_handoff(db, p["id"]) is None
+    assert await db_module.get_handoffs(db, p["id"]) == []
+
+
+@pytest.mark.asyncio
+async def test_generate_handoff_persists_history_row(db, tmp_path):
+    # 8819d6b1 — generate_handoff (full) writes a handoffs row linked to session.
+    p = await db_module.create_project(db, "handoff-persist")
+    await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True,
+        mode="full", session_id="sess-x",
+    )
+    rows = await db_module.get_handoffs(db, p["id"])
+    assert len(rows) >= 1
+    assert rows[0]["mode"] == "full"
+    assert rows[0]["session_id"] == "sess-x"
+    assert rows[0]["body"]
+
+
+@pytest.mark.asyncio
+async def test_migrate_handoffs_table_idempotent(db):
+    # Re-running the migration must be a no-op (init_db already ran it).
+    from meridian.db.migrations import _migrate_handoffs_table
+    await _migrate_handoffs_table(db)
+    await _migrate_handoffs_table(db)
 
 
 # ---------------------------------------------------------------------------

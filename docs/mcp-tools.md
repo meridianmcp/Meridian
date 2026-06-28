@@ -1,6 +1,6 @@
 # MCP Tool Reference
 
-Meridian exposes **74 tools** over MCP.
+Meridian exposes **78 tools** over MCP.
 
 They fall into two usage patterns:
 
@@ -53,7 +53,8 @@ Read-only: Call this FIRST for project summaries or to see what a session did �
 |-----------|------|----------|-------------|
 | `project_id` | string | optional |  |
 | `project_name` | string | optional | Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given. |
-| `role` | string | optional | Controls verbosity. 'worker'=sprint+tasks only, 'planner'=full context. |
+| `role` | string | optional | Tailors the brief. 'worker'=sprint+tasks only; 'executor'=adds version-scoped pending items, this session's file claims, and decisions code-anchored to them (pass session_id); 'planner'=adds full decisions/notes/sessions, last-session summary, and decisions needing revisit. |
+| `session_id` | string | optional | Caller session id — enables session-scratchpad notes, board-change detection, and (role='executor') file-claim + version scoping. |
 
 **Example:**
 ```
@@ -269,6 +270,7 @@ Categories: `STRATEGIC` · `COMPETITIVE` · `TECHNICAL` · `TACTICAL` · `BUSINE
 | `body` | string | required |  |
 | `category` | string | optional |  |
 | `priority` | string | optional | urgent decisions sort first and are weighted higher in start_session / generate_handoff context. Default normal. |
+| `assumption` | string | optional | Optional unverified assumption this decision rests on. Recorded with status 'unvalidated' and surfaced in get_planning_brief until validate_assumption confirms or invalidates it. |
 
 **Example:**
 ```
@@ -291,6 +293,8 @@ Patch a pinned decision. Pass `new_title` + `new_body` to atomically supersede (
 | `category` | string | optional |  |
 | `priority` | string | optional | Change ordering/weight (urgent \| normal \| low). |
 | `status` | string | optional |  |
+| `assumption` | string | optional | Set/replace the decision's underlying assumption text. |
+| `assumption_status` | string | optional | Stamp the assumption's validation state. Usually set via the validate_assumption tool, which also fires HITL on invalidation. |
 
 ---
 
@@ -436,6 +440,7 @@ Read-only: Return a compact planning context (sprint, north star, pending items,
 |-----------|------|----------|-------------|
 | `project_id` | string | optional |  |
 | `project_name` | string | optional | Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given. |
+| `since` | string | optional | Optional ISO timestamp (a prior brief's generated_at). When given, new_handoff_available flags only handoffs filed after it. |
 
 **Example:**
 ```
