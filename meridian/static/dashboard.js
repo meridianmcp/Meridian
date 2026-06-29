@@ -5308,6 +5308,144 @@ async function sprintItemNotesEdit(projectId, itemId) {
 }
 
 
+async function sprintItemResourcesEdit(projectId, itemId, rawJson) {
+
+  /** Inline-edit the touches_resources field of a sprint item. */
+
+  const row = document.querySelector(`.sprint-item-row[data-item="${CSS.escape(itemId)}"]`);
+
+  if (!row) return;
+
+  if (row.querySelector('.sprint-resources-textarea')) return;
+
+  let current = [];
+
+  try { current = JSON.parse(rawJson || '[]'); } catch { current = []; }
+
+  const existingEl = row.querySelector('.sprint-item-resources');
+
+  const textarea = document.createElement('textarea');
+
+  textarea.className = 'sprint-resources-textarea';
+
+  textarea.value = current.join('\n');
+
+  textarea.placeholder = 'One resource per line, e.g.\nfile:meridian/db/__init__.py\nnote:my-note\ndecision:abc123';
+
+  textarea.style.cssText = 'width:100%;min-height:56px;background:var(--surface-1);border:1px solid var(--accent);border-radius:3px;padding:3px 5px;color:var(--text);font-size:10px;font-family:var(--font-mono);line-height:1.4;resize:vertical;box-sizing:border-box;margin-top:3px';
+
+  if (existingEl) {
+
+    existingEl.replaceWith(textarea);
+
+  } else {
+
+    const notesEl = row.querySelector('.sprint-item-notes');
+
+    const anchor = notesEl || row.querySelector('.sprint-item-title');
+
+    if (anchor) anchor.parentNode.insertBefore(textarea, anchor.nextSibling);
+
+    else row.appendChild(textarea);
+
+  }
+
+  textarea.focus();
+
+  const save = async () => {
+
+    const lines = textarea.value.split('\n').map(s => s.trim()).filter(Boolean);
+
+    try {
+
+      await api(`/projects/${projectId}/sprint-items/${itemId}`, {
+
+        method: 'PATCH',
+
+        body: JSON.stringify({ touches_resources: lines.length ? lines : null }),
+
+      });
+
+      await refreshLiveTab(projectId);
+
+    } catch(e) { toast(`Save failed: ${e.message}`, true); cancel(); }
+
+  };
+
+  const cancel = () => {
+
+    if (existingEl) textarea.replaceWith(existingEl);
+
+    else textarea.remove();
+
+  };
+
+  textarea.onkeydown = e => {
+
+    if (e.key === 'Escape') { e.preventDefault(); cancel(); }
+
+    if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); save(); }
+
+  };
+
+  textarea.onblur = () => setTimeout(() => {
+
+    if (!row.contains(document.activeElement)) save();
+
+  }, 150);
+
+}
+
+
+async function resourceChipClick(projectId, resourceId) {
+
+  /** Show a small popover listing sprint items that declare this resource. */
+
+  const existing = document.getElementById('resource-chip-popover');
+
+  if (existing) existing.remove();
+
+  let items = [];
+
+  try {
+
+    items = await api(`/projects/${projectId}/resources/sprint-items?resource=${encodeURIComponent(resourceId)}`);
+
+  } catch(e) {
+
+    toast(`Lookup failed: ${e.message}`, true);
+
+    return;
+
+  }
+
+  const pop = document.createElement('div');
+
+  pop.id = 'resource-chip-popover';
+
+  pop.style.cssText = 'position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);background:var(--surface-0,#1a1a1a);border:1px solid var(--border);border-radius:6px;padding:12px 14px;z-index:9999;min-width:280px;max-width:480px;max-height:320px;overflow-y:auto;box-shadow:0 8px 32px rgba(0,0,0,.6)';
+
+  const esc = s => (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+
+  pop.innerHTML = `
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+      <span style="font-size:11px;font-weight:600;color:var(--text)">Sprint items touching <code style="font-size:10px">${esc(resourceId)}</code></span>
+      <button onclick="document.getElementById('resource-chip-popover').remove()" style="background:none;border:none;cursor:pointer;color:var(--muted);font-size:14px;line-height:1;padding:0 2px">✕</button>
+    </div>
+    ${items.length === 0
+      ? `<div style="font-size:10px;color:var(--muted)">No sprint items reference this resource.</div>`
+      : items.map(it => `<div style="font-size:10px;padding:4px 0;border-top:1px solid var(--border);color:var(--text)"><span style="color:var(--muted);margin-right:4px">${esc(it.status)}</span>${esc(it.title)}</div>`).join('')
+    }
+  `;
+
+  document.body.appendChild(pop);
+
+  const close = e => { if (!pop.contains(e.target)) { pop.remove(); document.removeEventListener('click', close); } };
+
+  setTimeout(() => document.addEventListener('click', close), 50);
+
+}
+
 
 async function loadSprintNotesPanel(projectId, sessionId) {
 

@@ -1930,16 +1930,16 @@ def test_dispatch_set_active_repo_no_tenant_raises():
 
 
 def test_dispatch_set_active_repo_not_connected(monkeypatch):
-    """set_active_repo with no extract tunnel returns not_connected status."""
+    """set_active_repo with no extract tunnel raises actionable ValueError."""
     from meridian.routes import tunnel as tn
     monkeypatch.setattr(tn, "_tunnel_extract_sockets", {})
     db = _make_db()
     try:
-        result = _run(mh._dispatch_mcp_tool(
-            "set_active_repo", {"repo_path": "/my/repo"},
-            db, "/tmp", tenant={"id": "no-tenant"},
-        ))
-        assert result["status"] == "not_connected"
+        with pytest.raises(ValueError, match="tunnel not connected"):
+            _run(mh._dispatch_mcp_tool(
+                "set_active_repo", {"repo_path": "/my/repo"},
+                db, "/tmp", tenant={"id": "no-tenant"},
+            ))
     finally:
         _run(db.close())
 

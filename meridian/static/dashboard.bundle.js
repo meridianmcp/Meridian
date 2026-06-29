@@ -1431,12 +1431,25 @@
       const isActive = activeSet.has(it.status);
       const meta = it.pushed_to ? `<span class="sprint-item-meta">\u2192 ${escapeHtml(it.pushed_to)}</span>` : "";
       const notesHtml = it.notes && !it.pushed_to ? `<div class="sprint-item-notes" style="font-size:10px;color:var(--muted);margin-top:2px;line-height:1.4;white-space:pre-wrap;word-break:break-word">${escapeHtml(it.notes.length > 180 ? it.notes.slice(0, 180) + "\u2026" : it.notes)}</div>` : "";
+      const _resources = (() => {
+        try {
+          return JSON.parse(it.touches_resources || "[]");
+        } catch {
+          return [];
+        }
+      })();
+      const resourcesHtml = _resources.length > 0 ? `<div class="sprint-item-resources" style="display:flex;flex-wrap:wrap;gap:3px;margin-top:3px">${_resources.map((r) => {
+        const chipColor = r.startsWith("note:") ? "var(--accent-blue,#3b82f6)" : r.startsWith("decision:") ? "#a78bfa" : "var(--muted)";
+        return `<span class="resource-chip" onclick="resourceChipClick('${escapeHtml(projectId)}','${escapeHtml(r)}')" style="font-size:9px;padding:1px 5px;border-radius:3px;cursor:pointer;background:var(--surface-2);border:1px solid var(--border);color:${chipColor};font-family:var(--font-mono)">${escapeHtml(r)}</span>`;
+      }).join("")}</div>` : "";
       const editBtn = `<button class="sprint-btn" title="Edit title/version"
 
              onclick="sprintItemEdit('${escapeHtml(projectId)}','${escapeHtml(it.id)}')">\u270F</button>`;
       const notesBtn = `<button class="sprint-btn" title="Add/edit notes"
 
              onclick="sprintItemNotesEdit('${escapeHtml(projectId)}','${escapeHtml(it.id)}')">\u{1F4DD}</button>`;
+      const resourcesBtn = `<button class="sprint-btn" title="Edit touches_resources"
+             onclick="sprintItemResourcesEdit('${escapeHtml(projectId)}','${escapeHtml(it.id)}',${JSON.stringify(it.touches_resources || null)})">\u{1F517}</button>`;
       const feedbackHtml = "";
       const canEdit = it.status === "pending" || it.status === "todo";
       const actions = isActive ? `<span class="sprint-item-actions">
@@ -1461,6 +1474,8 @@
 
            ${notesBtn}
 
+           ${resourcesBtn}
+
          </span>` : `<span class="sprint-item-actions">${meta}${feedbackHtml}</span>`;
       const allKids = allChildrenOf.get(it.id) || [];
       const kidDone = allKids.filter((c) => c.status === "done").length;
@@ -1482,6 +1497,8 @@
         <span class="sprint-item-title">${escapeHtml(it.title)}${indBadge}${childBadge}${_sprintHistoryBadges(it)}</span>
 
         ${notesHtml}
+
+        ${resourcesHtml}
 
       </div>
 
@@ -3743,6 +3760,14 @@ project_id = "${displayPid}"`;
 
         </select>
 
+        <select id="invite-scope-${projectId}" title="Scope to project (blank = full workspace access)" style="background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:4px 6px">
+
+          <option value="">all projects</option>
+
+          ${(window.state.projects || []).map((p) => `<option value="${escapeHtml(p.id)}">${escapeHtml(p.name || p.id)}</option>`).join("")}
+
+        </select>
+
         <button id="invite-btn-${projectId}" class="primary" style="font-size:10px;padding:4px 10px">Invite</button>
 
       </div>
@@ -3755,6 +3780,7 @@ project_id = "${displayPid}"`;
           const inviteBtn = document.getElementById(`invite-btn-${projectId}`);
           const inviteEmail = document.getElementById(`invite-email-${projectId}`);
           const inviteRole = document.getElementById(`invite-role-${projectId}`);
+          const inviteScope = document.getElementById(`invite-scope-${projectId}`);
           const inviteStatus = document.getElementById(`invite-status-${projectId}`);
           async function renderMembers() {
             if (!listEl) return;
@@ -3765,13 +3791,15 @@ project_id = "${displayPid}"`;
                 return;
               }
               const ROLE_CHOICES = ["admin", "member", "viewer"];
+              const projectNameById = Object.fromEntries((window.state.projects || []).map((p) => [p.id, p.name || p.id]));
               listEl.innerHTML = members.map((m) => {
                 const opts = ROLE_CHOICES.map((r) => `<option value="${r}" ${m.role === r ? "selected" : ""}>${r}</option>`).join("");
+                const scopeBadge = m.project_id ? ` <span style="color:var(--muted);font-size:9px" title="Scoped to project ${escapeHtml(m.project_id)}">\xB7 ${escapeHtml(projectNameById[m.project_id] || m.project_id)}</span>` : "";
                 return `
 
             <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;padding:4px 0;border-bottom:1px solid var(--border)">
 
-              <span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escapeHtml(m.email)}${m.pending ? ' <span style="color:var(--accent);font-size:9px;font-weight:600">Invited</span>' : ""}</span>
+              <span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escapeHtml(m.email)}${scopeBadge}${m.pending ? ' <span style="color:var(--accent);font-size:9px;font-weight:600">Invited</span>' : ""}</span>
 
               ${m.pending ? `<button class="resend-invite-btn secondary" data-mid="${escapeHtml(m.id)}" title="Resend invite" style="font-size:9px;padding:2px 7px">Resend</button>` : `<select class="member-role-select" data-mid="${escapeHtml(m.id)}" title="Change role" style="background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:2px 5px">${opts}</select>`}
 
@@ -3848,6 +3876,7 @@ project_id = "${displayPid}"`;
             inviteBtn.onclick = async () => {
               const email = (inviteEmail?.value || "").trim();
               const role = inviteRole?.value || "member";
+              const scopedProjectId = inviteScope?.value || null;
               if (!email) {
                 if (inviteStatus) inviteStatus.textContent = "Enter an email address.";
                 return;
@@ -3855,7 +3884,7 @@ project_id = "${displayPid}"`;
               inviteBtn.disabled = true;
               inviteBtn.textContent = "Sending\u2026";
               try {
-                await api("/workspace/invite", { method: "POST", body: JSON.stringify({ email, role }) });
+                await api("/workspace/invite", { method: "POST", body: JSON.stringify({ email, role, project_id: scopedProjectId || void 0 }) });
                 if (inviteEmail) inviteEmail.value = "";
                 if (inviteStatus) {
                   inviteStatus.textContent = `Invite sent to ${email}.`;

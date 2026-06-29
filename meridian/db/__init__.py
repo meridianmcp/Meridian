@@ -5762,6 +5762,8 @@ RESOURCE_TYPES = (
     "route",      # route:POST:/projects
     "pypi",       # pypi:publish
     "github",     # github:tag
+    "note",       # note:<slug>  — project note
+    "decision",   # decision:<id>  — pinned decision
 )
 
 
@@ -5950,6 +5952,51 @@ def serialize_touches_resources(raw: Any) -> str | None:
             seen.add(norm)
             normalized.append(marker + norm)
     return json.dumps(normalized) if normalized else None
+
+
+# f5f2a89d — [[slug]] backlink parsing for notes/decisions
+_BACKLINK_RE = re.compile(r'\[\[([^\]]+)\]\]')
+
+
+def parse_note_backlinks(body: str) -> list[str]:
+    """Extract [[slug]] references from a note or decision body."""
+    return _BACKLINK_RE.findall(body or "")
+
+
+async def get_notes_backlinked_to(
+    db: aiosqlite.Connection, project_id: str, slug: str
+) -> list[dict[str, Any]]:
+    """Return lightweight records for notes whose body references [[slug]]."""
+    pattern = f"%[[{slug}]]%"
+    async with db.execute(
+        "SELECT id, slug, title FROM project_notes "
+        "WHERE project_id = ? AND body LIKE ?",
+        (project_id, pattern),
+    ) as cur:
+        rows = await cur.fetchall()
+    return [{"id": r[0], "slug": r[1], "title": r[2]} for r in (rows or [])]
+
+
+async def get_sprint_items_for_resource(
+    db: aiosqlite.Connection, project_id: str, resource_id: str
+) -> list[dict[str, Any]]:
+    """Return sprint items whose touches_resources includes resource_id.
+
+    f5f2a89d — reverse lookup used by the dashboard chip popover.
+    Candidates are pre-filtered with LIKE, then confirmed with parse_touches_resources
+    so inferred: markers and case don't produce false positives.
+    """
+    pattern = f"%{resource_id}%"
+    async with db.execute(
+        "SELECT * FROM sprint_items WHERE project_id = ? AND touches_resources LIKE ?",
+        (project_id, pattern),
+    ) as cur:
+        rows = await cur.fetchall()
+    items = [_row_to_dict(r) for r in (rows or []) if r]
+    return [
+        it for it in items
+        if resource_id in parse_touches_resources(it.get("touches_resources"))
+    ]
 
 
 async def expire_resource_locks(db: aiosqlite.Connection) -> int:
@@ -7915,13 +7962,19 @@ async def get_project_note_by_slug(
 
     Backs the ``read_note(slug)`` MCP tool — the pull half of the list→read
     model. Returns None when no note with that slug exists in the project.
+
+    f5f2a89d — includes ``referenced_by``: lightweight list of notes whose body
+    contains ``[[slug]]`` linking back to this note.
     """
     async with db.execute(
         "SELECT * FROM project_notes WHERE project_id = ? AND slug = ?",
         (project_id, slug),
     ) as cur:
         row = await cur.fetchone()
-    return _row_to_dict(row)
+    note = _row_to_dict(row)
+    if note is not None:
+        note["referenced_by"] = await get_notes_backlinked_to(db, project_id, slug)
+    return note
 
 
 async def update_project_note(

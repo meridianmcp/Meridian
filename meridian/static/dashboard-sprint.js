@@ -480,6 +480,14 @@ export function renderSprintProgress(projectId, items) {
       ? `<div class="sprint-item-notes" style="font-size:10px;color:var(--muted);margin-top:2px;line-height:1.4;white-space:pre-wrap;word-break:break-word">${escapeHtml(it.notes.length > 180 ? it.notes.slice(0, 180) + '…' : it.notes)}</div>`
       : '';
 
+    const _resources = (() => { try { return JSON.parse(it.touches_resources || '[]'); } catch { return []; } })();
+    const resourcesHtml = _resources.length > 0
+      ? `<div class="sprint-item-resources" style="display:flex;flex-wrap:wrap;gap:3px;margin-top:3px">${_resources.map(r => {
+          const chipColor = r.startsWith('note:') ? 'var(--accent-blue,#3b82f6)' : r.startsWith('decision:') ? '#a78bfa' : 'var(--muted)';
+          return `<span class="resource-chip" onclick="resourceChipClick('${escapeHtml(projectId)}','${escapeHtml(r)}')" style="font-size:9px;padding:1px 5px;border-radius:3px;cursor:pointer;background:var(--surface-2);border:1px solid var(--border);color:${chipColor};font-family:var(--font-mono)">${escapeHtml(r)}</span>`;
+        }).join('')}</div>`
+      : '';
+
     const editBtn = `<button class="sprint-btn" title="Edit title/version"
 
              onclick="sprintItemEdit('${escapeHtml(projectId)}','${escapeHtml(it.id)}')">✏</button>`;
@@ -487,6 +495,9 @@ export function renderSprintProgress(projectId, items) {
     const notesBtn = `<button class="sprint-btn" title="Add/edit notes"
 
              onclick="sprintItemNotesEdit('${escapeHtml(projectId)}','${escapeHtml(it.id)}')">📝</button>`;
+
+    const resourcesBtn = `<button class="sprint-btn" title="Edit touches_resources"
+             onclick="sprintItemResourcesEdit('${escapeHtml(projectId)}','${escapeHtml(it.id)}',${JSON.stringify(it.touches_resources||null)})">🔗</button>`;
 
     const feedbackHtml = '';
 
@@ -515,6 +526,8 @@ export function renderSprintProgress(projectId, items) {
            ${canEdit ? editBtn : ''}
 
            ${notesBtn}
+
+           ${resourcesBtn}
 
          </span>`
 
@@ -559,6 +572,8 @@ export function renderSprintProgress(projectId, items) {
         <span class="sprint-item-title">${escapeHtml(it.title)}${indBadge}${childBadge}${_sprintHistoryBadges(it)}</span>
 
         ${notesHtml}
+
+        ${resourcesHtml}
 
       </div>
 

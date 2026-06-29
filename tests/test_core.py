@@ -14668,3 +14668,114 @@ async def test_get_github_token_for_project_none_when_no_connections(db):
     token, login = await db_module.get_github_token_for_project(db, "t3-nobody", p["id"])
     assert token is None
     assert login is None
+
+
+# ---------------------------------------------------------------------------
+# f5f2a89d — Cross-entity backlinks + code prospects UI
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_note_and_decision_are_valid_resource_types(db):
+    """'note' and 'decision' are now valid touches_resources prefixes."""
+    rtype, value = db_module.parse_resource_identifier("note:my-design-doc")
+    assert rtype == "note"
+    assert value == "my-design-doc"
+    rtype2, value2 = db_module.parse_resource_identifier("decision:abc123")
+    assert rtype2 == "decision"
+    assert value2 == "abc123"
+
+
+@pytest.mark.asyncio
+async def test_parse_note_backlinks_extracts_slugs(db):
+    """parse_note_backlinks returns all [[slug]] matches from a body."""
+    body = "See [[auth-design]] and [[deploy-plan]] for context."
+    slugs = db_module.parse_note_backlinks(body)
+    assert slugs == ["auth-design", "deploy-plan"]
+
+
+@pytest.mark.asyncio
+async def test_parse_note_backlinks_empty(db):
+    """parse_note_backlinks returns [] for bodies with no [[...]] links."""
+    assert db_module.parse_note_backlinks("No backlinks here.") == []
+    assert db_module.parse_note_backlinks("") == []
+
+
+@pytest.mark.asyncio
+async def test_get_notes_backlinked_to(db):
+    """get_notes_backlinked_to returns notes whose body contains [[slug]]."""
+    p = await db_module.create_project(db, "backlink-proj")
+    await db_module.add_project_note(db, p["id"], "Auth Design", "See [[deploy-plan]] for infra")
+    await db_module.add_project_note(db, p["id"], "Deploy Plan", "Our deploy plan details")
+    await db_module.add_project_note(db, p["id"], "Other Note", "no links here")
+    refs = await db_module.get_notes_backlinked_to(db, p["id"], "deploy-plan")
+    assert len(refs) == 1
+    assert refs[0]["title"] == "Auth Design"
+
+
+@pytest.mark.asyncio
+async def test_get_project_note_by_slug_includes_referenced_by(db):
+    """get_project_note_by_slug includes a referenced_by list."""
+    p = await db_module.create_project(db, "ref-by-proj")
+    note_a = await db_module.add_project_note(db, p["id"], "Note A", "See [[note-b]] for details")
+    note_b = await db_module.add_project_note(db, p["id"], "Note B", "Original content")
+    result = await db_module.get_project_note_by_slug(db, p["id"], note_b["slug"])
+    assert result is not None
+    assert "referenced_by" in result
+    assert any(r["id"] == note_a["id"] for r in result["referenced_by"])
+
+
+@pytest.mark.asyncio
+async def test_get_sprint_items_for_resource(db):
+    """get_sprint_items_for_resource finds items by touches_resources."""
+    p = await db_module.create_project(db, "res-lookup-proj")
+    it = await db_module.add_sprint_item(db, p["id"], "v1", "Do the DB work",
+                                          touches_resources=["file:meridian/db/__init__.py",
+                                                             "note:auth-design"])
+    await db_module.add_sprint_item(db, p["id"], "v1", "Unrelated task")
+    results = await db_module.get_sprint_items_for_resource(
+        db, p["id"], "file:meridian/db/__init__.py"
+    )
+    assert len(results) == 1
+    assert results[0]["id"] == it["id"]
+    # note: prefix also works
+    results2 = await db_module.get_sprint_items_for_resource(db, p["id"], "note:auth-design")
+    assert len(results2) == 1
+
+
+def test_sprint_items_for_resource_endpoint(client):
+    """GET /projects/{id}/resources/sprint-items?resource=... returns matches."""
+    r = client.post("/projects", json={"name": "res-ep-proj"})
+    assert r.status_code == 201
+    pid = r.json()["id"]
+    client.post(f"/projects/{pid}/sprint-items", json={
+        "version": "v1",
+        "title": "Work on auth",
+        "touches_resources": ["note:auth-design", "file:meridian/server.py"],
+    })
+    r = client.get(f"/projects/{pid}/resources/sprint-items?resource=note:auth-design")
+    assert r.status_code == 200
+    data = r.json()
+    assert len(data) == 1
+    assert "auth" in data[0]["title"]
+
+
+def test_sprint_items_for_resource_invalid_type_returns_422(client):
+    """GET /projects/{id}/resources/sprint-items with unknown type → 422."""
+    r = client.post("/projects", json={"name": "res-422-proj"})
+    pid = r.json()["id"]
+    r = client.get(f"/projects/{pid}/resources/sprint-items?resource=badtype:foo")
+    assert r.status_code == 422
+
+
+def test_patch_sprint_item_touches_resources(client):
+    """PATCH sprint item with touches_resources updates the field."""
+    r = client.post("/projects", json={"name": "res-patch-proj"})
+    pid = r.json()["id"]
+    it = client.post(f"/projects/{pid}/sprint-items", json={"version": "v1", "title": "Patch me"}).json()
+    r = client.patch(f"/projects/{pid}/sprint-items/{it['id']}",
+                     json={"touches_resources": ["note:my-note", "decision:d1"]})
+    assert r.status_code == 200
+    data = r.json()
+    resources = json.loads(data["touches_resources"] or "[]")
+    assert "note:my-note" in resources
+    assert "decision:d1" in resources

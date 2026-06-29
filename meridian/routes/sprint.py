@@ -86,11 +86,12 @@ async def add_sprint_item_endpoint(
     from .. import limits as _limits  # noqa: PLC0415
     existing = await db_module.get_sprint_items(await _db(request), project_id)
     _limits.check_sprint_items_per_project(len(existing))
+    touches_resources = body.get("touches_resources") or None
     result = await db_module.add_sprint_item(
         await _db(request), project_id, version, title,
         group=group, human_id=human_id,
         depends_on=depends_on, failure_mode=failure_mode,
-        force=force,
+        force=force, touches_resources=touches_resources,
     )
     # b0d42ef6 — duplicate guard blocked the insert: 409 Conflict with details.
     if isinstance(result, dict) and result.get("error") == "duplicate":
@@ -212,11 +213,13 @@ async def patch_sprint_item_endpoint(
     notes = body.get("notes")
     human_id = body.get("human_id")
     item_group = body.get("group", body.get("item_group"))
+    touches_resources = body.get("touches_resources", db_module._UNSET)
     item = await db_module.patch_sprint_item(
         await _db(request), project_id, item_id, title=title, version=version,
         status=status,
         feedback_thumb=feedback_thumb, feedback_note=feedback_note,
         notes=notes, human_id=human_id, item_group=item_group,
+        touches_resources=touches_resources,
     )
     if item is None:
         raise HTTPException(status_code=404, detail="sprint item not found")
@@ -315,3 +318,22 @@ async def reconcile_sprint_items_endpoint(
         "matched_count": len(matches),
         "matches": matches,
     }
+
+
+@router.get("/projects/{project_id}/resources/sprint-items")
+async def sprint_items_for_resource(
+    project_id: str, resource: str, request: Request
+) -> list[dict[str, Any]]:
+    """f5f2a89d — reverse lookup: sprint items whose touches_resources includes resource.
+
+    ``resource`` is a typed id, e.g. ``file:meridian/db/__init__.py``,
+    ``note:my-note``, ``decision:abc123``.  Returns all sprint items (any status)
+    that declare or infer that resource.
+    """
+    try:
+        db_module.parse_resource_identifier(resource)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    return await db_module.get_sprint_items_for_resource(
+        await _db(request), project_id, resource
+    )
