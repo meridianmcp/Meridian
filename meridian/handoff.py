@@ -136,6 +136,7 @@ def _build_quick_start_goal(
     version: str | None = None,
     execution_mode: str = "autonomous",
     max_turns: int = _DEFAULT_GOAL_MAX_TURNS,
+    hitl_auto_answer_mode: int = 0,
 ) -> str:
     """Build the handoff /goal template from the live pending sprint item ids.
 
@@ -153,6 +154,11 @@ def _build_quick_start_goal(
     ``max_turns`` (d2c47f43) sets the "Stop after N turns" ceiling. Sourced from
     the project's ``executor_config.max_turns`` (default 200) so a long-running
     sprint isn't cut off at the old hardcoded 40.
+
+    ``hitl_auto_answer_mode`` (ddd8b9bf) adapts the HITL stop-condition clause:
+    mode 0 — "stop if HITL triggered"; mode 1/2 — "Do NOT file HITLs, skip
+    blocked items and continue" (the auto-answer path never blocks the executor,
+    so the old "stop if HITL triggered" clause was dead code for modes 1/2).
     """
     try:
         _turns = int(max_turns)
@@ -160,6 +166,12 @@ def _build_quick_start_goal(
             _turns = _DEFAULT_GOAL_MAX_TURNS
     except (TypeError, ValueError):
         _turns = _DEFAULT_GOAL_MAX_TURNS
+    # ddd8b9bf — HITL clause differs by mode.
+    _hitl_clause = (
+        "Do NOT file HITLs — auto-answer is on, skip blocked items and continue."
+        if int(hitl_auto_answer_mode or 0) >= 1
+        else "or if HITL triggered."
+    )
     if version is not None:
         pending_sprint_items = [
             item for item in pending_sprint_items
@@ -170,7 +182,7 @@ def _build_quick_start_goal(
         return (
             "/goal Verify remaining work is complete. Done when pixi run test "
             f"passes {test_floor}+, and generate_handoff() is called at the "
-            f"end. Stop after {_turns} turns or if HITL triggered."
+            f"end. Stop after {_turns} turns {_hitl_clause}"
         )
     directive = (
         _INTERACTIVE_GOAL_DIRECTIVE
@@ -182,8 +194,8 @@ def _build_quick_start_goal(
         f"Complete sprint items: {', '.join(item_ids)}. "
         "Done when all listed sprint items are marked complete via "
         f"complete_sprint_item(), pixi run test passes {test_floor}+, and "
-        f"generate_handoff() is called at the end. Stop after {_turns} turns or if "
-        "HITL triggered."
+        f"generate_handoff() is called at the end. Stop after {_turns} turns "
+        f"{_hitl_clause}"
     )
 
 
@@ -1177,12 +1189,19 @@ async def generate_handoff(
     generated_at = now_utc.isoformat(timespec="seconds")
     state_ts = now_utc.strftime("%Y-%m-%d %H:%M:%S")
     # ecf69de8 — the project's executor posture selects the /goal framing.
+    # ddd8b9bf — also pass HITL mode so the stop-condition clause is correct.
+    _hitl_aa_mode = 0
+    try:
+        _hitl_aa_mode = int(await db_module._project_hitl_auto_answer_mode(db, project_id))
+    except Exception:  # noqa: BLE001
+        pass
     quick_start_goal = _build_quick_start_goal(
         pending_sprint_items,
         execution_mode=db_module.normalize_execution_mode(
             project.get("execution_mode")
         ),
         max_turns=_max_turns_from_settings(proj_settings),
+        hitl_auto_answer_mode=_hitl_aa_mode,
     )
 
     # Split tasks into L1 (last 10) and L2 (older).
@@ -1522,12 +1541,21 @@ async def _generate_starter_handoff(
     settings = await db_module.get_project_settings(db, project_id)
     executor_config = (settings or {}).get("executor_config") if settings else None
     # ecf69de8 — the project's executor posture selects the /goal framing.
+    # ddd8b9bf — also pass HITL mode so the stop-condition clause is correct.
+    _s_hitl_mode = 0
+    try:
+        _s_hitl_mode = int(
+            await db_module._project_hitl_auto_answer_mode(db, project["id"])
+        )
+    except Exception:  # noqa: BLE001
+        pass
     quick_start_goal = _build_quick_start_goal(
         pending,
         execution_mode=db_module.normalize_execution_mode(
             project.get("execution_mode")
         ),
         max_turns=_max_turns_from_settings(settings),
+        hitl_auto_answer_mode=_s_hitl_mode,
     )
     content = _render_starter_handoff(
         project,

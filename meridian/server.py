@@ -4055,9 +4055,13 @@ async def _start_session_composite(
         # (custom rules the session must follow), so keep them even in compact.
         # ecf69de8 — lead with the EXECUTION MODE directive so the posture is the
         # first protocol-level instruction the session reads.
+        # ddd8b9bf — also prepend HITL mode directive so executors know upfront
+        # whether request_hitl blocks or auto-resolves.
         _c_agent = await db_module.get_agent_instructions(db, project_id)
+        _c_hitl_directive = _hitl_mode_directive(_c_hitl_mode)
+        _c_combined_directive = f"{_c_mode_directive}\n\n{_c_hitl_directive}"
         _c_payload["agent_instructions"] = (
-            f"{_c_mode_directive}\n\n{_c_agent}" if _c_agent else _c_mode_directive
+            f"{_c_combined_directive}\n\n{_c_agent}" if _c_agent else _c_combined_directive
         )
         # File conflict warnings must surface in compact mode — an executor that
         # misses them will silently overwrite another session's uncommitted work.
@@ -4170,15 +4174,19 @@ async def _start_session_composite(
         (project or {}).get("execution_mode")
     )
     mode_directive = _execution_mode_directive(execution_mode)
-    agent_instructions = await db_module.get_agent_instructions(db, project_id)
-    agent_instructions = (
-        f"{mode_directive}\n\n{agent_instructions}"
-        if agent_instructions
-        else mode_directive
-    )
 
     # 72e12ed8 — HITL auto-answer mode in the full orientation too.
     _hitl_mode = await _hitl_auto_answer_mode_safe(db, project_id)
+    # ddd8b9bf — also prepend HITL mode directive so executors know upfront whether
+    # request_hitl blocks or auto-resolves (changes executor behavior significantly).
+    hitl_directive = _hitl_mode_directive(_hitl_mode)
+    combined_directive = f"{mode_directive}\n\n{hitl_directive}"
+    agent_instructions = await db_module.get_agent_instructions(db, project_id)
+    agent_instructions = (
+        f"{combined_directive}\n\n{agent_instructions}"
+        if agent_instructions
+        else combined_directive
+    )
     # 331896e1 — explicit execute-immediately signal (see compact path).
     _exec_now = bool(
         pending_items and scoped_version and execution_mode == "autonomous"
