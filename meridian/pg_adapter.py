@@ -2084,6 +2084,30 @@ async def _migrate_pg_resource_locks(conn: PostgresConnection) -> None:
     )
 
 
+async def _migrate_pg_github_connections(conn: PostgresConnection) -> None:
+    """0b061f45 — multi-account GitHub OAuth.
+
+    ``github_connections`` stores N encrypted PATs per tenant keyed by
+    account_login. ``projects.github_account_login`` pins a specific account.
+    Idempotent (CREATE … IF NOT EXISTS / ADD COLUMN IF NOT EXISTS).
+    Mirrors db._migrate_github_connections.
+    """
+    await conn.executescript(
+        "CREATE TABLE IF NOT EXISTS github_connections ("
+        "    id TEXT PRIMARY KEY,"
+        "    tenant_id TEXT NOT NULL,"
+        "    account_login TEXT NOT NULL,"
+        "    token TEXT NOT NULL,"
+        "    scope TEXT,"
+        f"    connected_at TEXT NOT NULL DEFAULT ({_TS}),"
+        "    UNIQUE(tenant_id, account_login)"
+        ");"
+        "CREATE INDEX IF NOT EXISTS idx_github_connections_tenant "
+        "ON github_connections(tenant_id);"
+        "ALTER TABLE projects ADD COLUMN IF NOT EXISTS github_account_login TEXT"
+    )
+
+
 # Late migrations — run on every DB after the hosted-only set.
 _PG_MIGRATIONS_LATE = (
     _migrate_pg_workspace_tenant_isolation,
@@ -2121,4 +2145,5 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_session_note_kind,
     _migrate_pg_handoffs_table,
     _migrate_pg_decision_assumption,
+    _migrate_pg_github_connections,
 )

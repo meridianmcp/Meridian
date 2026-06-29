@@ -6279,10 +6279,11 @@ def test_pg_migration_registry_matches_historical_order():
         "_migrate_pg_session_note_kind",
         "_migrate_pg_handoffs_table",
         "_migrate_pg_decision_assumption",
+        "_migrate_pg_github_connections",
     ]
     # No duplicates across the three groups.
     allnames = core + hosted + late
-    assert len(allnames) == len(set(allnames)) == 67
+    assert len(allnames) == len(set(allnames)) == 68
 
 
 def test_default_agent_instructions_has_code_intel_protocol():
@@ -14603,3 +14604,67 @@ async def test_set_active_repo_also_expands_fs_roots(db, tmp_path, monkeypatch):
     )
     assert result["status"] == "ok"
     assert fs_roots_calls == [["/home/user/myrepo"]]
+
+
+# ---------------------------------------------------------------------------
+# 0b061f45 — Multi-account GitHub OAuth DB layer
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_github_connections_add_and_list(db):
+    """add_github_connection upserts; get_github_connections returns list."""
+    await db_module.add_github_connection(db, "tenant-a", "acme-bot", "token-xyz", "repo")
+    conns = await db_module.get_github_connections(db, "tenant-a")
+    assert len(conns) == 1
+    assert conns[0]["account_login"] == "acme-bot"
+    # tokens are NOT returned
+    assert "token" not in conns[0]
+
+
+@pytest.mark.asyncio
+async def test_github_connections_upsert_replaces_token(db):
+    """Adding the same account twice updates the token (upsert)."""
+    await db_module.add_github_connection(db, "tenant-b", "user1", "old-token")
+    await db_module.add_github_connection(db, "tenant-b", "user1", "new-token")
+    conns = await db_module.get_github_connections(db, "tenant-b")
+    assert len(conns) == 1  # not duplicated
+
+
+@pytest.mark.asyncio
+async def test_github_connections_remove(db):
+    """remove_github_connection deletes the row."""
+    await db_module.add_github_connection(db, "tenant-c", "bob", "tok")
+    await db_module.remove_github_connection(db, "tenant-c", "bob")
+    conns = await db_module.get_github_connections(db, "tenant-c")
+    assert conns == []
+
+
+@pytest.mark.asyncio
+async def test_get_github_token_for_project_pinned(db):
+    """get_github_token_for_project returns pinned account token when set."""
+    p = await db_module.create_project(db, "gh-pin-test")
+    await db_module.add_github_connection(db, "t1", "alice", "alice-tok")
+    await db_module.add_github_connection(db, "t1", "bob", "bob-tok")
+    await db_module.update_project_settings(db, p["id"], github_account_login="alice")
+    token, login = await db_module.get_github_token_for_project(db, "t1", p["id"])
+    assert login == "alice"
+    assert token == "alice-tok"  # decrypted
+
+
+@pytest.mark.asyncio
+async def test_get_github_token_for_project_fallback_first(db):
+    """Falls back to first connected account when no project pin is set."""
+    p = await db_module.create_project(db, "gh-fallback-test")
+    await db_module.add_github_connection(db, "t2", "first-user", "first-tok")
+    token, login = await db_module.get_github_token_for_project(db, "t2", p["id"])
+    assert login == "first-user"
+    assert token == "first-tok"
+
+
+@pytest.mark.asyncio
+async def test_get_github_token_for_project_none_when_no_connections(db):
+    """Returns (None, None) when no connections exist."""
+    p = await db_module.create_project(db, "gh-empty-test")
+    token, login = await db_module.get_github_token_for_project(db, "t3-nobody", p["id"])
+    assert token is None
+    assert login is None
