@@ -2663,6 +2663,14 @@ export async function loadSettingsTab(projectId) {
 
         </select>
 
+        <select id="invite-scope-${projectId}" title="Scope to project (blank = full workspace access)" style="background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:4px 6px">
+
+          <option value="">all projects</option>
+
+          ${(window.state.projects || []).map(p => `<option value="${escapeHtml(p.id)}">${escapeHtml(p.name || p.id)}</option>`).join('')}
+
+        </select>
+
         <button id="invite-btn-${projectId}" class="primary" style="font-size:10px;padding:4px 10px">Invite</button>
 
       </div>
@@ -2682,6 +2690,8 @@ export async function loadSettingsTab(projectId) {
       const inviteEmail = document.getElementById(`invite-email-${projectId}`);
 
       const inviteRole = document.getElementById(`invite-role-${projectId}`);
+
+      const inviteScope = document.getElementById(`invite-scope-${projectId}`);
 
       const inviteStatus = document.getElementById(`invite-status-${projectId}`);
 
@@ -2705,15 +2715,21 @@ export async function loadSettingsTab(projectId) {
 
           const ROLE_CHOICES = ['admin', 'member', 'viewer'];
 
+          const projectNameById = Object.fromEntries((window.state.projects || []).map(p => [p.id, p.name || p.id]));
+
           listEl.innerHTML = members.map(m => {
 
             const opts = ROLE_CHOICES.map(r => `<option value="${r}" ${m.role === r ? 'selected' : ''}>${r}</option>`).join('');
+
+            const scopeBadge = m.project_id
+              ? ` <span style="color:var(--muted);font-size:9px" title="Scoped to project ${escapeHtml(m.project_id)}">· ${escapeHtml(projectNameById[m.project_id] || m.project_id)}</span>`
+              : '';
 
             return `
 
             <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;padding:4px 0;border-bottom:1px solid var(--border)">
 
-              <span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escapeHtml(m.email)}${m.pending ? ' <span style="color:var(--accent);font-size:9px;font-weight:600">Invited</span>' : ''}</span>
+              <span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escapeHtml(m.email)}${scopeBadge}${m.pending ? ' <span style="color:var(--accent);font-size:9px;font-weight:600">Invited</span>' : ''}</span>
 
               ${m.pending ? `<button class="resend-invite-btn secondary" data-mid="${escapeHtml(m.id)}" title="Resend invite" style="font-size:9px;padding:2px 7px">Resend</button>` : `<select class="member-role-select" data-mid="${escapeHtml(m.id)}" title="Change role" style="background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:2px 5px">${opts}</select>`}
 
@@ -2839,6 +2855,8 @@ export async function loadSettingsTab(projectId) {
 
           const role = inviteRole?.value || 'member';
 
+          const scopedProjectId = inviteScope?.value || null;
+
           if (!email) { if (inviteStatus) inviteStatus.textContent = 'Enter an email address.'; return; }
 
           inviteBtn.disabled = true;
@@ -2847,7 +2865,7 @@ export async function loadSettingsTab(projectId) {
 
           try {
 
-            await api('/workspace/invite', { method: 'POST', body: JSON.stringify({ email, role }) });
+            await api('/workspace/invite', { method: 'POST', body: JSON.stringify({ email, role, project_id: scopedProjectId || undefined }) });
 
             if (inviteEmail) inviteEmail.value = '';
 

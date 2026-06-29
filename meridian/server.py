@@ -2974,6 +2974,7 @@ async def workspace_list_members(request: Request) -> list[dict[str, Any]]:
             "github_access": m.get("github_access"),
             "joined_at": m.get("joined_at"),
             "pending": m.get("joined_at") is None,
+            "project_id": m.get("project_id"),
         }
         for m in members
     ]
