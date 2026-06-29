@@ -14534,3 +14534,72 @@ async def test_thinking_mcp_roundtrip(db, tmp_path):
     )
     assert len(fetched) == 1
     assert fetched[0]["note_kind"] == "thinking"
+
+
+# ---------------------------------------------------------------------------
+# 26c38b8e — HOTFIX: claude.ai MCP session broken
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_log_task_unknown_session_raises_clean_error(db, tmp_path):
+    """log_task with a bogus session_id raises a human-readable ValueError."""
+    from meridian.mcp.handler import _dispatch_mcp_tool
+    p = await db_module.create_project(db, "hotfix-logtask")
+    with pytest.raises(ValueError, match="start_session first"):
+        await _dispatch_mcp_tool(
+            "log_task",
+            {
+                "session_id": "00000000-0000-0000-0000-000000000000",
+                "project_id": p["id"],
+                "description": "should fail",
+            },
+            db, str(tmp_path), tenant=None,
+        )
+
+
+@pytest.mark.asyncio
+async def test_set_active_repo_no_tunnel_raises_actionable_error(db, tmp_path, monkeypatch):
+    """set_active_repo raises a descriptive error when no tunnel is connected."""
+    from meridian.mcp.handler import _dispatch_mcp_tool
+    from meridian.routes import tunnel as tunnel_mod
+
+    async def _not_connected(tenant_id: str, repo_path: str):
+        return {"status": "not_connected", "message": "no active extract tunnel"}
+
+    monkeypatch.setattr(tunnel_mod, "send_active_repo_control", _not_connected)
+
+    fake_tenant = {"id": "tenant-test-01"}
+    with pytest.raises(ValueError, match="tunnel not connected"):
+        await _dispatch_mcp_tool(
+            "set_active_repo",
+            {"repo_path": "/home/user/repo"},
+            db, str(tmp_path), tenant=fake_tenant,
+        )
+
+
+@pytest.mark.asyncio
+async def test_set_active_repo_also_expands_fs_roots(db, tmp_path, monkeypatch):
+    """set_active_repo calls send_add_fs_roots_control to unlock the FS connector."""
+    from meridian.mcp.handler import _dispatch_mcp_tool
+    from meridian.routes import tunnel as tunnel_mod
+
+    async def _ok_extract(tenant_id: str, repo_path: str):
+        return {"status": "ok", "repo_path": repo_path}
+
+    fs_roots_calls: list[list[str]] = []
+
+    async def _capture_fs(tenant_id: str, roots: list[str]):
+        fs_roots_calls.append(roots)
+        return {"status": "ok", "roots": roots}
+
+    monkeypatch.setattr(tunnel_mod, "send_active_repo_control", _ok_extract)
+    monkeypatch.setattr(tunnel_mod, "send_add_fs_roots_control", _capture_fs)
+
+    fake_tenant = {"id": "tenant-test-02"}
+    result = await _dispatch_mcp_tool(
+        "set_active_repo",
+        {"repo_path": "/home/user/myrepo"},
+        db, str(tmp_path), tenant=fake_tenant,
+    )
+    assert result["status"] == "ok"
+    assert fs_roots_calls == [["/home/user/myrepo"]]
