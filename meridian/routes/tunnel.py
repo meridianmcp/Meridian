@@ -48,6 +48,12 @@ _tunnel_ppt_sockets: dict[str, WebSocket] = {}
 _tunnel_word_sockets: dict[str, WebSocket] = {}
 _tunnel_dc_sockets: dict[str, WebSocket] = {}
 
+# 4d9ad87b — active repo per tenant, updated whenever set_active_repo is called.
+# Enables call_tunnel_tool to inject X-Meridian-Repo-Path so the SerenaDaemonPool
+# routes each tools/call to the correct per-repo daemon without a set_active_repo
+# prelude on every request.
+_tenant_active_repo: dict[str, str] = {}
+
 # Correlation maps: request_id → Future that resolves when client responds
 _pending_reqs: dict[str, asyncio.Future[dict]] = {}
 _pending_code_reqs: dict[str, asyncio.Future[dict]] = {}
@@ -590,7 +596,11 @@ async def send_active_repo_control(tenant_id: str, repo_path: str) -> dict[str, 
 
     Called by the MCP handler (no HTTP round-trip needed). Returns a status dict
     with ``status`` of ``"ok"``, ``"not_connected"``, or ``"error"``.
+
+    4d9ad87b — always updates _tenant_active_repo so subsequent call_tunnel_tool
+    calls can inject X-Meridian-Repo-Path without a separate set_active_repo.
     """
+    _tenant_active_repo[tenant_id] = repo_path
     ws = _tunnel_extract_sockets.get(tenant_id)
     if ws is None:
         return {"status": "not_connected", "message": "no active extract tunnel — start meridian --tunnel first"}
@@ -1486,8 +1496,14 @@ def _parse_mcp_payload(raw: bytes | None) -> dict | None:
 
 async def _tunnel_jsonrpc(
     tenant_id: str, label: str, method: str, params: dict | None,
+    repo_path: str | None = None,
 ) -> dict | None:
-    """Send one JSON-RPC request to a tunneled MCP server and parse the reply."""
+    """Send one JSON-RPC request to a tunneled MCP server and parse the reply.
+
+    4d9ad87b — ``repo_path`` is forwarded as ``X-Meridian-Repo-Path`` so the
+    tunnel's SerenaDaemonPool can route code-intel requests to the correct
+    per-repo daemon without the server knowing about the pool directly.
+    """
     sockets, pending = _label_maps(label)
     if tenant_id not in sockets:
         return None
@@ -1497,10 +1513,12 @@ async def _tunnel_jsonrpc(
         "method": method,
         "params": params or {},
     }).encode()
-    headers = {
+    headers: dict[str, str] = {
         "content-type": "application/json",
         "accept": "application/json, text/event-stream",
     }
+    if repo_path:
+        headers["x-meridian-repo-path"] = repo_path
     resp = await _do_proxy(
         tenant_id, "POST", "/mcp", "", headers, body, sockets, pending, label,
     )
@@ -1579,12 +1597,17 @@ async def list_tunnel_tools(
 
 async def call_tunnel_tool(
     tenant_id: str, name: str, arguments: dict | None,
+    repo_path: str | None = None,
 ) -> dict | None:
     """Route a ``tools/call`` to the tunnel that owns ``name``.
 
     Returns the MCP ``result`` object (with ``content``) on success, or None if
     no active tunnel exposes a tool by that name. Raises on a tunnel-reported
     JSON-RPC error so the caller can surface it as a normal MCP error.
+
+    4d9ad87b — ``repo_path`` (explicit or from _tenant_active_repo cache) is
+    forwarded as ``X-Meridian-Repo-Path`` so the SerenaDaemonPool on the tunnel
+    client routes code-intel requests to the correct per-repo Serena daemon.
     """
     label = (_tunnel_tool_routes.get(tenant_id) or {}).get(name)
     if label is None:
@@ -1617,11 +1640,15 @@ async def call_tunnel_tool(
                         f"filesystem tools require absolute paths — got relative path {_p!r}. "
                         f"Use a full path, e.g. C:\\\\Users\\\\13144\\\\Documents\\\\...\\\\{_p}"
                     )
+    # 4d9ad87b — resolve repo_path: explicit arg wins, then cached value from the
+    # last send_active_repo_control call for this tenant.
+    effective_repo_path = repo_path or _tenant_active_repo.get(tenant_id)
     # The tunneled server only knows the bare tool name; strip the connector prefix.
     bare_name = name.split("__", 1)[1] if "__" in name else name
     resp = await _tunnel_jsonrpc(
         tenant_id, label, "tools/call",
         {"name": bare_name, "arguments": arguments or {}},
+        repo_path=effective_repo_path,
     )
     if not resp:
         return None
