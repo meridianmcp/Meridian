@@ -1,6 +1,7 @@
 :root {
   --bg: #0d0f12;
   --surface: #13161b;
+  --surface-1: #161a21;
   --surface-2: #1a1e25;
   --border: #232830;
   --text: #d8dde6;
@@ -339,6 +340,7 @@ button.danger { background: rgba(255,107,107,0.15); border-color: var(--status-f
 button.danger:hover { background: rgba(255,107,107,0.25); }
 button.execute { background: var(--status-hitl); border-color: var(--status-hitl); color: #1a0f00; font-weight: 700; }
 button.execute:hover { filter: brightness(1.1); }
+button:disabled, button[disabled] { opacity: 0.45; cursor: not-allowed; pointer-events: none; }
 
 input[type=text] {
   background: var(--surface-2); border: 1px solid var(--border);
