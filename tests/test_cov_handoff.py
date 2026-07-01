@@ -87,6 +87,11 @@ def test_build_quick_start_goal_with_and_without_items():
     assert "complete_sprint_item()" in full
     # f628b880 — non-deferential executor directive leads the items /goal.
     assert full.startswith("/goal You are an executor. Claim and execute")
+    # 4cfaecc2 — the items /goal instructs a live board query up front, and the
+    # test floor tracks the real suite size (524 -> 2150).
+    assert 'get_sprint_items(status="pending")' in full
+    assert "pixi run test passes 2150+" in full
+    assert handoff_module._DEFAULT_GOAL_TEST_FLOOR == 2150
 
 
 def test_build_quick_start_goal_max_turns():
@@ -101,6 +106,76 @@ def test_build_quick_start_goal_max_turns():
     # Invalid / non-positive falls back to default.
     assert "Stop after 200 turns" in handoff_module._build_quick_start_goal([{"id": "x"}], max_turns=0)
     assert "Stop after 200 turns" in handoff_module._build_quick_start_goal([{"id": "x"}], max_turns="bad")
+
+
+def test_resolve_graph_searcher_uses_registered_resolver():
+    """4cfaecc2 — _resolve_graph_searcher consults the injectable resolver and is
+    guarded so a resolver that raises can never break the mandatory handoff."""
+    try:
+        # No resolver registered -> None (historical default).
+        handoff_module.set_graph_searcher_resolver(None)
+        assert handoff_module._resolve_graph_searcher("proj-1") is None
+        # Registered resolver's return value is passed through, keyed by project.
+        def _sentinel(_q):
+            return [{"file": "a.py"}]
+        handoff_module.set_graph_searcher_resolver(
+            lambda pid: _sentinel if pid == "proj-1" else None
+        )
+        assert handoff_module._resolve_graph_searcher("proj-1") is _sentinel
+        assert handoff_module._resolve_graph_searcher("other") is None
+        # A resolver that raises degrades to None.
+        def _boom(_pid):
+            raise RuntimeError("nope")
+        handoff_module.set_graph_searcher_resolver(_boom)
+        assert handoff_module._resolve_graph_searcher("proj-1") is None
+    finally:
+        handoff_module.set_graph_searcher_resolver(None)
+
+
+def test_agent_instructions_stale_detection():
+    """99e50a1d — stored copies predating the standard are flagged; the current
+    default and genuinely-bespoke docs are not."""
+    from meridian import agent_defaults as ad
+    # Current default carries the marker -> not stale.
+    assert ad.parse_standard_version(ad.DEFAULT_AGENT_INSTRUCTIONS) == \
+        ad.AGENT_INSTRUCTIONS_STANDARD_VERSION
+    assert ad.agent_instructions_stale(ad.DEFAULT_AGENT_INSTRUCTIONS) is False
+    # None / empty -> session uses live default, never stale.
+    assert ad.agent_instructions_stale(None) is False
+    assert ad.agent_instructions_stale("   ") is False
+    # A pre-versioning Meridian rules doc (no marker) -> stale.
+    old = "# Meridian — executor rules\nCall start_session(project_id=...) first."
+    assert ad.parse_standard_version(old) is None
+    assert ad.agent_instructions_stale(old) is True
+    # An explicit older version marker -> stale.
+    assert ad.agent_instructions_stale(
+        "Meridian start_session <!-- meridian-executor-standard: v1 -->"
+    ) is True
+    # Bespoke, non-Meridian instructions -> never nagged.
+    assert ad.agent_instructions_stale("Just do whatever, no rules here.") is False
+
+
+@pytest.mark.asyncio
+async def test_generate_handoff_warns_on_stale_executor_rules(db, tmp_path):
+    """99e50a1d — a project whose stored rules predate the standard leads its
+    handoff with a sync notice; a current project does not."""
+    from meridian import agent_defaults as ad
+    stale = await db_module.create_project(db, "stale-proj")
+    await db_module.set_agent_instructions(
+        db, stale["id"],
+        "# Meridian — executor rules\nCall start_session(project_id=...) first.",
+    )
+    _, content = await handoff_module.generate_handoff(
+        db, stale["id"], str(tmp_path), skip_ai_summary=True
+    )
+    assert "Executor rules are behind the current standard" in content
+
+    fresh = await db_module.create_project(db, "fresh-proj")
+    await db_module.set_agent_instructions(db, fresh["id"], ad.DEFAULT_AGENT_INSTRUCTIONS)
+    _, content2 = await handoff_module.generate_handoff(
+        db, fresh["id"], str(tmp_path), skip_ai_summary=True
+    )
+    assert "Executor rules are behind the current standard" not in content2
 
 
 def test_max_turns_from_settings():

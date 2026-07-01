@@ -598,6 +598,28 @@ def test_known_locations_has_manual_path_entry(js):
     )
 
 
+def test_max_turns_slider_supports_megasprints():
+    """47af402c — Executor Config exposes a max_turns slider (ceiling 400) with
+    escalating warnings at 200+/300+, and the checkpoint (context_threshold)
+    slider ceiling is raised to 200 to match megasprints."""
+    from pathlib import Path
+    static = Path(__file__).parent.parent / "meridian" / "static"
+    settings_src = (static / "dashboard-settings.ts").read_text(encoding="utf-8")
+    # max_turns slider present with a 400 ceiling.
+    assert "exec-max_turns-" in settings_src, "max_turns slider missing"
+    assert 'type="range" min="40" max="400"' in settings_src, "max_turns ceiling must be 400"
+    # Escalating inline warnings at 200+/300+.
+    assert "Very long sprint (300+" in settings_src, "300+ warning missing"
+    assert "Long sprint (200+" in settings_src, "200+ warning missing"
+    # Saved value is clamped to [40, 400].
+    assert "Math.min(400, Math.max(40, mtRaw))" in settings_src, "max_turns must clamp to [40,400]"
+    # Checkpoint slider ceiling raised 100 -> 200 to match.
+    assert 'id="exec-context_threshold-${projectId}" type="range" min="10" max="200"' in settings_src, (
+        "checkpoint slider ceiling must be raised to 200"
+    )
+    assert "Math.min(200, Math.max(10, ctxRaw))" in settings_src, "checkpoint clamp must be raised to 200"
+
+
 def test_execution_mode_toggle_present(js):
     """ecf69de8 — the settings tab renders an Execution Mode select (autonomous
     vs interactive) that persists via saveProjectSettings (PATCH settings)."""

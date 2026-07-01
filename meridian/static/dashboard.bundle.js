@@ -67,6 +67,7 @@
   var SESSION_LIVE_WINDOW_MS = 10 * 60 * 1e3;
   var DEFAULT_MAX_PINNED_DECISIONS2 = 20;
   var DEFAULT_CONTEXT_THRESHOLD2 = 40;
+  var DEFAULT_MAX_TURNS2 = 200;
   function getPanelState2(projectId) {
     window.state.panels[projectId] = window.state.panels[projectId] || {};
     return window.state.panels[projectId];
@@ -130,7 +131,8 @@
       SESSION_LIVE_WINDOW_MS,
       _HUMAN_COLORS,
       DEFAULT_MAX_PINNED_DECISIONS: DEFAULT_MAX_PINNED_DECISIONS2,
-      DEFAULT_CONTEXT_THRESHOLD: DEFAULT_CONTEXT_THRESHOLD2
+      DEFAULT_CONTEXT_THRESHOLD: DEFAULT_CONTEXT_THRESHOLD2,
+      DEFAULT_MAX_TURNS: DEFAULT_MAX_TURNS2
     });
   } catch (e3) {
   }
@@ -3268,9 +3270,19 @@ project_id = "${displayPid}"`;
 
       Checkpoint after <span id="exec-context_threshold-val-${projectId}" style="color:var(--text);font-family:var(--font-mono)">${escapeHtml(String(execCfg.context_threshold || DEFAULT_CONTEXT_THRESHOLD))}</span> turns
 
-      <input id="exec-context_threshold-${projectId}" type="range" min="10" max="100" step="5" value="${escapeHtml(String(execCfg.context_threshold || DEFAULT_CONTEXT_THRESHOLD))}" style="width:100%;max-width:320px;margin-top:4px;display:block">
+      <input id="exec-context_threshold-${projectId}" type="range" min="10" max="200" step="5" value="${escapeHtml(String(execCfg.context_threshold || DEFAULT_CONTEXT_THRESHOLD))}" style="width:100%;max-width:320px;margin-top:4px;display:block">
 
       <span style="font-size:9px;color:var(--muted)">When a session passes this many turns, <code>get_context_block</code> nudges it to checkpoint.</span>
+
+    </label>
+
+    <label style="display:block;font-size:10px;color:var(--muted);margin-top:10px">
+
+      Stop after <span id="exec-max_turns-val-${projectId}" style="color:var(--text);font-family:var(--font-mono)">${escapeHtml(String(execCfg.max_turns || DEFAULT_MAX_TURNS))}</span> turns
+
+      <input id="exec-max_turns-${projectId}" type="range" min="40" max="400" step="20" value="${escapeHtml(String(execCfg.max_turns || DEFAULT_MAX_TURNS))}" style="width:100%;max-width:320px;margin-top:4px;display:block">
+
+      <span id="exec-max_turns-warn-${projectId}" style="font-size:9px;color:var(--muted)"></span>
 
     </label>
 
@@ -3292,6 +3304,31 @@ project_id = "${displayPid}"`;
         if (ctxSlider && ctxVal) {
           ctxSlider.addEventListener("input", () => {
             ctxVal.textContent = ctxSlider.value;
+          });
+        }
+        const mtSlider = document.getElementById(`exec-max_turns-${projectId}`);
+        const mtVal = document.getElementById(`exec-max_turns-val-${projectId}`);
+        const mtWarn = document.getElementById(`exec-max_turns-warn-${projectId}`);
+        const _renderMtWarn = (v3) => {
+          if (!mtWarn) return;
+          const n2 = parseInt(v3 || "", 10);
+          if (n2 >= 300) {
+            mtWarn.textContent = "\u26A0 Very long sprint (300+ turns) \u2014 high context/token cost; checkpoint frequently and expect drift.";
+            mtWarn.style.color = "var(--danger, #e5534b)";
+          } else if (n2 >= 200) {
+            mtWarn.textContent = "\u26A0 Long sprint (200+ turns) \u2014 set a checkpoint cadence so context does not overflow mid-run.";
+            mtWarn.style.color = "var(--warning, #d29922)";
+          } else {
+            mtWarn.textContent = "Turns before the /goal auto-stops. Raise for megasprints.";
+            mtWarn.style.color = "var(--muted)";
+          }
+        };
+        if (mtSlider && mtVal) {
+          mtVal.textContent = mtSlider.value;
+          _renderMtWarn(mtSlider.value);
+          mtSlider.addEventListener("input", () => {
+            mtVal.textContent = mtSlider.value;
+            _renderMtWarn(mtSlider.value);
           });
         }
         let _execRepoPaths = Array.isArray(execCfg.repo_paths) ? [...execCfg.repo_paths] : [];
@@ -3380,7 +3417,9 @@ project_id = "${displayPid}"`;
           const minVal = minEl ? parseInt(minEl.value || "", 10) : NaN;
           if (!isNaN(minVal) && minVal > 0) cfg.test_min = minVal;
           const ctxRaw = ctxSlider ? parseInt(ctxSlider.value || "", 10) : NaN;
-          if (!isNaN(ctxRaw)) cfg.context_threshold = Math.min(100, Math.max(10, ctxRaw));
+          if (!isNaN(ctxRaw)) cfg.context_threshold = Math.min(200, Math.max(10, ctxRaw));
+          const mtRaw = mtSlider ? parseInt(mtSlider.value || "", 10) : NaN;
+          if (!isNaN(mtRaw)) cfg.max_turns = Math.min(400, Math.max(40, mtRaw));
           try {
             await saveProjectSettings(projectId, { executor_config: cfg });
             if (statusEl) statusEl.textContent = "Saved.";

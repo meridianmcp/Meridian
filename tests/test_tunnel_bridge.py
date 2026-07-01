@@ -223,6 +223,46 @@ def test_call_tunnel_tool_routes_to_owner(monkeypatch):
     assert seen["params"] == {"name": "trace_path", "arguments": {"symbol": "foo"}}
 
 
+def test_build_graph_searcher_none_without_tunnel():
+    """4cfaecc2 — no active tunnel → no searcher (enrichment stays a no-op)."""
+    assert tn.build_graph_searcher(None) is None
+    assert tn.build_graph_searcher("no-tunnel") is None
+
+
+def test_build_graph_searcher_queries_code_intel_slot(monkeypatch):
+    """4cfaecc2 — with a tunnel, the searcher issues search_graph over the tunnel
+    and unwraps the MCP text envelope into the raw match payload."""
+    tn._tunnel_sockets["t1"] = object()
+    tn._tunnel_code_sockets["t1"] = object()
+    tn._tunnel_tool_routes["t1"] = {"search_graph": "code"}
+    seen = {}
+
+    def responder(label, method, params):
+        seen["params"] = params
+        payload = {"results": [{"file": "x.py", "name": "foo"}]}
+        return {"result": {"content": [{"type": "text", "text": json.dumps(payload)}]}}
+
+    _stub_proxy(monkeypatch, responder)
+    searcher = tn.build_graph_searcher("t1")
+    assert searcher is not None
+    matches = asyncio.run(searcher("some query"))
+    assert seen["params"]["name"] == "search_graph"
+    assert matches["results"][0]["file"] == "x.py"
+
+
+def test_build_graph_searcher_swallows_tunnel_errors(monkeypatch):
+    """The searcher never raises — a tunnel error yields None for that query."""
+    tn._tunnel_sockets["t1"] = object()
+
+    async def boom(*_a, **_k):
+        raise RuntimeError("tunnel down")
+
+    monkeypatch.setattr(tn, "call_tunnel_tool", boom)
+    searcher = tn.build_graph_searcher("t1")
+    assert searcher is not None
+    assert asyncio.run(searcher("q")) is None
+
+
 def test_call_tunnel_tool_strips_prefix_before_forward(monkeypatch):
     """call_tunnel_tool('codebase__get_symbols_tool') forwards bare 'get_symbols_tool'."""
     tn._tunnel_code_sockets["t1"] = object()

@@ -2011,9 +2011,19 @@ export async function loadSettingsTab(projectId: any, { force = false } = {}) {
 
       Checkpoint after <span id="exec-context_threshold-val-${projectId}" style="color:var(--text);font-family:var(--font-mono)">${escapeHtml(String(execCfg.context_threshold || DEFAULT_CONTEXT_THRESHOLD))}</span> turns
 
-      <input id="exec-context_threshold-${projectId}" type="range" min="10" max="100" step="5" value="${escapeHtml(String(execCfg.context_threshold || DEFAULT_CONTEXT_THRESHOLD))}" style="width:100%;max-width:320px;margin-top:4px;display:block">
+      <input id="exec-context_threshold-${projectId}" type="range" min="10" max="200" step="5" value="${escapeHtml(String(execCfg.context_threshold || DEFAULT_CONTEXT_THRESHOLD))}" style="width:100%;max-width:320px;margin-top:4px;display:block">
 
       <span style="font-size:9px;color:var(--muted)">When a session passes this many turns, <code>get_context_block</code> nudges it to checkpoint.</span>
+
+    </label>
+
+    <label style="display:block;font-size:10px;color:var(--muted);margin-top:10px">
+
+      Stop after <span id="exec-max_turns-val-${projectId}" style="color:var(--text);font-family:var(--font-mono)">${escapeHtml(String(execCfg.max_turns || DEFAULT_MAX_TURNS))}</span> turns
+
+      <input id="exec-max_turns-${projectId}" type="range" min="40" max="400" step="20" value="${escapeHtml(String(execCfg.max_turns || DEFAULT_MAX_TURNS))}" style="width:100%;max-width:320px;margin-top:4px;display:block">
+
+      <span id="exec-max_turns-warn-${projectId}" style="font-size:9px;color:var(--muted)"></span>
 
     </label>
 
@@ -2047,6 +2057,32 @@ export async function loadSettingsTab(projectId: any, { force = false } = {}) {
 
       ctxSlider.addEventListener('input', () => { ctxVal.textContent = ctxSlider.value; });
 
+    }
+
+    // 47af402c — max_turns slider (ceiling 400) with escalating warnings so
+    // megasprints are supported without an artificial cap, but the cost/context
+    // risk of very long runs is surfaced inline.
+    const mtSlider = document.getElementById(`exec-max_turns-${projectId}`);
+    const mtVal = document.getElementById(`exec-max_turns-val-${projectId}`);
+    const mtWarn = document.getElementById(`exec-max_turns-warn-${projectId}`);
+    const _renderMtWarn = (v: any) => {
+      if (!mtWarn) return;
+      const n = parseInt(v || '', 10);
+      if (n >= 300) {
+        mtWarn.textContent = '⚠ Very long sprint (300+ turns) — high context/token cost; checkpoint frequently and expect drift.';
+        mtWarn.style.color = 'var(--danger, #e5534b)';
+      } else if (n >= 200) {
+        mtWarn.textContent = '⚠ Long sprint (200+ turns) — set a checkpoint cadence so context does not overflow mid-run.';
+        mtWarn.style.color = 'var(--warning, #d29922)';
+      } else {
+        mtWarn.textContent = 'Turns before the /goal auto-stops. Raise for megasprints.';
+        mtWarn.style.color = 'var(--muted)';
+      }
+    };
+    if (mtSlider && mtVal) {
+      mtVal.textContent = mtSlider.value;
+      _renderMtWarn(mtSlider.value);
+      mtSlider.addEventListener('input', () => { mtVal.textContent = mtSlider.value; _renderMtWarn(mtSlider.value); });
     }
 
     // Wire repo_paths delete/clear in Executor Config section
@@ -2137,7 +2173,11 @@ export async function loadSettingsTab(projectId: any, { force = false } = {}) {
 
       const ctxRaw = ctxSlider ? parseInt(ctxSlider.value || '', 10) : NaN;
 
-      if (!isNaN(ctxRaw)) cfg.context_threshold = Math.min(100, Math.max(10, ctxRaw));
+      if (!isNaN(ctxRaw)) cfg.context_threshold = Math.min(200, Math.max(10, ctxRaw));
+
+      const mtRaw = mtSlider ? parseInt(mtSlider.value || '', 10) : NaN;
+
+      if (!isNaN(mtRaw)) cfg.max_turns = Math.min(400, Math.max(40, mtRaw));
 
       try {
 

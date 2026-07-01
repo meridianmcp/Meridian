@@ -200,7 +200,7 @@ async def test_handoff_generates_clean_markdown(db, tmp_path):
     assert "did A" in content and "did B" in content
     assert "## Quick Start" in content
     assert "/goal Verify remaining work is complete." in content
-    assert "pixi run test passes 524+" in content
+    assert "pixi run test passes 2150+" in content
     assert "## Resume Instructions" in content
     on_disk = tmp_path / "alpha_handoff.md"
     assert on_disk.exists()

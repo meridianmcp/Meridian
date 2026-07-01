@@ -1720,3 +1720,51 @@ async def call_tunnel_tool(
     if err:
         raise RuntimeError(str(err.get("message") if isinstance(err, dict) else err))
     return resp.get("result")
+
+
+def _extract_graph_matches(result: Any) -> Any:
+    """Unwrap an MCP ``tools/call`` result into a plain match payload.
+
+    Code-intel ``search_graph`` returns its JSON payload inside the MCP
+    ``content[].text`` envelope. Pull the first text block and json-decode it so
+    the handoff enrichment layer (``_coerce_match_list``) sees the raw
+    ``{"results": [...]}`` dict it already understands. Anything unexpected is
+    returned untouched — the caller degrades to no pointers.
+    """
+    if not isinstance(result, dict):
+        return result
+    content = result.get("content")
+    if isinstance(content, list):
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                text = block.get("text") or ""
+                try:
+                    return json.loads(text)
+                except Exception:  # noqa: BLE001 — non-JSON text is not a match set
+                    return text
+    return result
+
+
+def build_graph_searcher(tenant_id: str | None):
+    """Return an async code-graph searcher bound to a tenant's tunnel, or None.
+
+    4cfaecc2 — this is the concrete wiring behind handoff.py's
+    ``_resolve_graph_searcher`` seam. When the tenant has an active tunnel
+    exposing the code-intel ``search_graph`` tool, the returned coroutine issues
+    a ``tools/call`` over the tunnel and normalises the result. When no tunnel is
+    active, returns None so enrichment stays a no-op. The searcher itself never
+    raises — any tunnel/parse failure yields ``None`` for that query.
+    """
+    if not tenant_id or not has_active_tunnel(tenant_id):
+        return None
+
+    async def _search(query: str) -> Any:
+        try:
+            result = await call_tunnel_tool(
+                tenant_id, "search_graph", {"query": query, "limit": 3},
+            )
+        except Exception:  # noqa: BLE001 — best-effort enrichment, never fatal
+            return None
+        return _extract_graph_matches(result)
+
+    return _search

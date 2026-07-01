@@ -37,6 +37,7 @@ declare global {
   const state: any;
   const STORAGE_KEY: any;
   const DEFAULT_CONTEXT_THRESHOLD: any;
+  const DEFAULT_MAX_TURNS: any;
   const DEFAULT_MAX_PINNED_DECISIONS: any;
   const QUEUE_DONE_PAGE_SIZE: any;
   const SESSION_LIVE_WINDOW_MS: any;

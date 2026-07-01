@@ -14,6 +14,9 @@ export const QUEUE_DONE_PAGE_SIZE = 10;
 export const SESSION_LIVE_WINDOW_MS = 10 * 60 * 1000;
 export const DEFAULT_MAX_PINNED_DECISIONS = 20;
 export const DEFAULT_CONTEXT_THRESHOLD = 40;
+// 47af402c — /goal "Stop after N turns" default; slider ceiling raised to 400
+// to support megasprints (warnings surface at 200+/300+).
+export const DEFAULT_MAX_TURNS = 200;
 
 /** Minimal shape of a session row used by the age/live helpers. */
 export interface SessionLike {
@@ -87,5 +90,6 @@ try {
     getPanelState, toast, escapeHtml, formatRelativeTime, sessionAgeMs, isLiveSession,
     _colorForHuman, _PLAN_LABELS, QUEUE_DONE_PAGE_SIZE, SESSION_LIVE_WINDOW_MS,
     _HUMAN_COLORS, DEFAULT_MAX_PINNED_DECISIONS, DEFAULT_CONTEXT_THRESHOLD,
+    DEFAULT_MAX_TURNS,
   });
 } catch (e) { /* window unavailable (non-browser) */ }

@@ -1456,6 +1456,18 @@ async def _handle_task_tools(
         # Fetch recent commits for reconcile annotations (non-fatal)
         _gh_project = await db_module.get_project(db, args["project_id"])
         _gh_commits = await _fetch_recent_commits(_gh_project or {}, tenant)
+        # 4cfaecc2 — wire code-pointer enrichment to the tunnel code-intel slot.
+        # Build a tunnel-backed graph searcher when a tunnel is active; None
+        # otherwise (enrichment degrades to no pointers). Fully guarded — never
+        # break the mandatory handoff over an enrichment convenience.
+        _graph_searcher = None
+        try:
+            from ..routes import tunnel as _tunnel_mod  # noqa: PLC0415
+            _graph_searcher = _tunnel_mod.build_graph_searcher(
+                tenant.get("id") if tenant else None
+            )
+        except Exception:  # noqa: BLE001
+            _graph_searcher = None
         try:
             path, content = await asyncio.wait_for(
                 handoff_module_local.generate_handoff(
@@ -1465,6 +1477,7 @@ async def _handle_task_tools(
                     mode=mode,
                     session_id=session_id,
                     commit_messages=[c["message"] for c in _gh_commits],
+                    graph_searcher=_graph_searcher,
                 ),
                 timeout=90.0,
             )
@@ -1473,7 +1486,22 @@ async def _handle_task_tools(
                 db, args["project_id"], data_dir
             )
             mode = "full"
-        return {"file_path": path, "content": content, "mode": mode}
+        # 99e50a1d — surface a machine-readable staleness flag so the dashboard /
+        # caller can offer a one-click sync when the project's stored executor
+        # rules predate the current standard.
+        _tpl_stale = False
+        try:
+            from ..agent_defaults import agent_instructions_stale  # noqa: PLC0415
+            _stored_ai = await db_module.get_agent_instructions(db, args["project_id"])
+            _tpl_stale = agent_instructions_stale(_stored_ai)
+        except Exception:  # noqa: BLE001
+            _tpl_stale = False
+        return {
+            "file_path": path,
+            "content": content,
+            "mode": mode,
+            "template_stale": _tpl_stale,
+        }
     return _MISS
 
 

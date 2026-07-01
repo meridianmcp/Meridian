@@ -38,7 +38,7 @@ _env = Environment(
     autoescape=select_autoescape(disabled_extensions=("md", "j2")),
     keep_trailing_newline=True,
 )
-_DEFAULT_GOAL_TEST_FLOOR = 524
+_DEFAULT_GOAL_TEST_FLOOR = 2150
 _STRATEGIC_NOTE_TAGS = {"planning", "strategy", "competitive", "acquisition"}
 _SESSION_HANDOFF_STATE: dict[str, str] = {}
 
@@ -191,6 +191,11 @@ def _build_quick_start_goal(
     )
     return (
         f"/goal {directive}"
+        # 4cfaecc2 — the baked-in id list is a point-in-time snapshot; a live
+        # board query keeps a resumed session honest about mid-run injections
+        # and already-claimed items instead of trusting a stale list.
+        'First call get_sprint_items(status="pending") to load the live board '
+        "(the ids below are a snapshot and may have shifted). "
         f"Complete sprint items: {', '.join(item_ids)}. "
         "Done when all listed sprint items are marked complete via "
         f"complete_sprint_item(), pixi run test passes {test_floor}+, and "
@@ -564,17 +569,44 @@ def _code_pointers_enabled(settings: dict[str, Any] | None) -> bool:
     return bool(cfg.get("enrich_handoffs_with_code_pointers"))
 
 
+# 4cfaecc2 — wireable resolver seam. handoff.py deliberately does NOT import the
+# tunnel/routing layer (that would be a layering violation and an import cycle),
+# so the server registers a resolver at startup that maps a project_id to a
+# tunnel-backed graph searcher. Absent a registered resolver, enrichment stays a
+# no-op (the historical behaviour), and the resolver — like every enrichment hop —
+# is fully guarded so it can never break the mandatory handoff.
+_GRAPH_SEARCHER_RESOLVER: Callable[[str], Callable[[str], Any] | None] | None = None
+
+
+def set_graph_searcher_resolver(
+    resolver: Callable[[str], Callable[[str], Any] | None] | None,
+) -> None:
+    """Register (or clear with None) the project_id -> graph-searcher resolver.
+
+    Called once by the server layer, which has the tenant/tunnel context that
+    handoff.py must not import directly.
+    """
+    global _GRAPH_SEARCHER_RESOLVER
+    _GRAPH_SEARCHER_RESOLVER = resolver
+
+
 def _resolve_graph_searcher(
     project_id: str,
 ) -> Callable[[str], Any] | None:
     """Return a code-graph search callable for ``project_id`` or None.
 
-    The default implementation returns None because the code-graph lives in an
-    out-of-process MCP that is not callable synchronously from here. The seam
-    exists so deployments that *do* have an in-process searcher (and tests) can
-    inject one via the ``graph_searcher`` argument to ``generate_handoff``.
+    Consults the resolver registered via :func:`set_graph_searcher_resolver`
+    (wired to the tunnel code-intel slot by the server). When no resolver is
+    registered — or it raises/returns None — enrichment degrades to no pointers.
+    Tests and in-process deployments can also inject a searcher directly via the
+    ``graph_searcher`` argument to ``generate_handoff``, which takes precedence.
     """
-    return None
+    if _GRAPH_SEARCHER_RESOLVER is None:
+        return None
+    try:
+        return _GRAPH_SEARCHER_RESOLVER(project_id)
+    except Exception:  # noqa: BLE001 — resolver must never break the handoff
+        return None
 
 
 def _coerce_match_list(result: Any) -> list[Any]:
@@ -1084,6 +1116,34 @@ def _render_custom_handoff(
     return rendered
 
 
+def _stale_template_warning(stored_instructions: str | None) -> str:
+    """Return a stale-standard warning block, or '' when up to date (99e50a1d).
+
+    When a project's stored ``agent_instructions`` predate the current executor
+    standard, surface a prominent (but non-blocking) notice at the top of the
+    handoff so the next session syncs instead of silently running an old
+    coordination protocol (e.g. the thesis project stuck on the pre-versioning
+    project_id/no-continue pattern). Fully guarded — never breaks the handoff.
+    """
+    try:
+        from .agent_defaults import (  # noqa: PLC0415
+            AGENT_INSTRUCTIONS_STANDARD_VERSION,
+            agent_instructions_stale,
+        )
+        if not agent_instructions_stale(stored_instructions):
+            return ""
+    except Exception:  # noqa: BLE001 — a warning must never break the handoff
+        return ""
+    return (
+        "> ⚠️ **Executor rules are behind the current standard "
+        f"(v{AGENT_INSTRUCTIONS_STANDARD_VERSION}).** This project's stored "
+        "agent_instructions predate the latest coordination rules (e.g. the "
+        "project_name-first `start_session` idiom + code-intel protocol). Sync "
+        "with `set_agent_instructions(project_id, <current default>)`, or reset "
+        "in the dashboard → Settings → Executor Rules."
+    )
+
+
 async def generate_handoff(
     db: aiosqlite.Connection,
     project_id: str,
@@ -1293,6 +1353,12 @@ async def generate_handoff(
         decisions_count=len([d for d in pinned_decisions if d.get("status") == "active"]),
     )
     content = f"{readiness_block}\n\n{content}"
+
+    # 99e50a1d — if this project's stored executor rules predate the current
+    # standard, lead the handoff with a sync notice (best-effort, never fatal).
+    _tpl_warning = _stale_template_warning(project.get("agent_instructions"))
+    if _tpl_warning:
+        content = f"{_tpl_warning}\n\n{content}"
 
     # 10e6b265 — session queue: append the queued next-session goal (if any) and
     # clear it so the handoff surfaces the next /goal inline, exactly once.
