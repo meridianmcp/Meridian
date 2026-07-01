@@ -14,6 +14,16 @@
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
 <!-- ECharts for the Timeline swimlane. -->
 <script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"></script>
+<!-- 455b7970: Cytoscape.js + fcose layout for the Code Intel compound graph and
+     the sprint dependency DAG. Loaded as globals (window.cytoscape) so they stay
+     out of the esbuild bundle; the panels degrade gracefully when absent.
+     fcose is NOT self-contained — it needs layout-base + cose-base as globals
+     first, or it throws "Cannot read properties of undefined (reading
+     'layoutBase')" on load. Order matters: layout-base → cose-base → fcose. -->
+<script src="https://cdn.jsdelivr.net/npm/cytoscape@3/dist/cytoscape.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/layout-base/layout-base.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/cose-base/cose-base.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/cytoscape-fcose@2/cytoscape-fcose.js"></script>
 <link rel="stylesheet" href="/static/dashboard.css?v={{ asset_version or version }}">
 </head>
 <body>
@@ -143,7 +153,9 @@
 </div>
 
 <!-- ITEM 4 esbuild: single bundled IIFE (build with `node build.mjs`) -->
-<script src="/static/dashboard.bundle.js?v={{ asset_version or version }}"></script>
+<!-- 9aba783f: ?v= is the bundle's content hash (asset-manifest.json) so a deploy
+     always busts the browser cache, even when no version/git SHA is available. -->
+<script src="/static/dashboard.bundle.js?v={{ bundle_hash or asset_version or version }}"></script>
 
 </body>
 </html>

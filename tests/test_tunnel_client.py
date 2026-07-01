@@ -178,7 +178,8 @@ def test_build_proxy_command_uses_shell_on_windows(monkeypatch):
     assert "--shell" not in tc._build_proxy_command("npx", "/repo")
 
 
-def test_build_code_proxy_command_structure():
+def test_build_code_proxy_command_structure(monkeypatch):
+    monkeypatch.setattr(tc.sys, "platform", "linux")  # test POSIX path — no --shell
     cmd = tc._build_code_proxy_command("npx", "/usr/local/bin/codebase-memory-mcp", port=9009)
     assert cmd[0] == "npx"
     assert "mcp-proxy" in cmd
@@ -190,7 +191,6 @@ def test_build_code_proxy_command_structure():
     assert "--" in cmd
     sep = cmd.index("--")
     assert cmd[sep + 1] == "/usr/local/bin/codebase-memory-mcp"
-    # codebase-memory-mcp is a native binary — no --shell needed
     assert "--shell" not in cmd
 
 
@@ -325,12 +325,13 @@ def test_build_code_proxy_command_uses_shell_for_cmd_shim_on_windows(monkeypatch
     assert cmd[sep + 1] == shim
 
 
-def test_build_code_proxy_command_no_shell_for_native_exe_on_windows(monkeypatch):
+def test_build_code_proxy_command_shell_for_native_exe_on_windows(monkeypatch):
+    # .exe binaries also need --shell on Windows: mcp-proxy (Node.js) can't spawn
+    # them directly in all environments. Matches FS slot's unconditional --shell.
     monkeypatch.setattr(tc.sys, "platform", "win32")
     exe = r"C:\Users\13144\.meridian\bin\codebase-memory-mcp.exe"
     cmd = tc._build_code_proxy_command("npx.cmd", exe, port=9009)
-    # A real .exe spawns directly — no --shell (preserves space-in-path support).
-    assert "--shell" not in cmd
+    assert "--shell" in cmd
     sep = cmd.index("--")
     assert cmd[sep + 1] == exe
 
@@ -936,6 +937,49 @@ def test_force_utf8_io_tolerates_streams_without_reconfigure(monkeypatch):
 def test_config_path_under_home(monkeypatch, tmp_path):
     monkeypatch.setattr(tc.Path, "home", staticmethod(lambda: tmp_path))
     assert tc._config_path() == tmp_path / ".meridian" / "config.json"
+
+
+# ---------------------------------------------------------------------------
+# Package cache locations — _package_cache_locations / first-run banner (a887155d)
+# ---------------------------------------------------------------------------
+
+def test_package_cache_locations_has_keys(monkeypatch):
+    """Returns npx/uvx/uv_tools, all non-empty strings, no subprocess needed."""
+    loc = tc._package_cache_locations()
+    assert set(loc) == {"npx", "uvx", "uv_tools"}
+    assert all(isinstance(v, str) and v for v in loc.values())
+    # npx packages live under the npm cache's _npx subdir.
+    assert loc["npx"].endswith("_npx")
+
+
+def test_package_cache_locations_respects_env(monkeypatch):
+    """Explicit package-manager env vars override the per-OS defaults."""
+    monkeypatch.setenv("npm_config_cache", "/custom/npm")
+    monkeypatch.setenv("UV_CACHE_DIR", "/custom/uvcache")
+    monkeypatch.setenv("UV_TOOL_DIR", "/custom/uvtools")
+    loc = tc._package_cache_locations()
+    assert loc["npx"] == str(tc.Path("/custom/npm") / "_npx")
+    assert loc["uvx"] == "/custom/uvcache"
+    assert loc["uv_tools"] == "/custom/uvtools"
+
+
+def test_print_package_cache_locations_first_run_then_suppressed(monkeypatch, tmp_path, capsys):
+    """Prints once on first run, writes a marker, and stays silent thereafter."""
+    marker = tmp_path / ".cache_locations_shown"
+    monkeypatch.setattr(tc, "_cache_locations_marker", lambda: marker)
+
+    assert tc._print_package_cache_locations() is True
+    out1 = capsys.readouterr().out
+    assert "Package caches" in out1
+    assert marker.exists()
+
+    # Second run: marker present → no print, returns False.
+    assert tc._print_package_cache_locations() is False
+    assert capsys.readouterr().out == ""
+
+    # force=True prints again even with the marker present.
+    assert tc._print_package_cache_locations(force=True) is True
+    assert "Package caches" in capsys.readouterr().out
 
 
 def test_read_cached_token_missing_file_returns_none(monkeypatch, tmp_path):

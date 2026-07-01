@@ -692,6 +692,19 @@ CREATE TABLE IF NOT EXISTS workspace_settings (
     code_intel_enabled_default INTEGER,
     updated_at TEXT NOT NULL DEFAULT ({_TS})
 );
+
+-- 6234f9b8 — blog_posts: admin-authored posts served at /blog/<slug>.
+CREATE TABLE IF NOT EXISTS blog_posts (
+    id TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    slug TEXT NOT NULL UNIQUE,
+    body_md TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'draft',
+    created_at TEXT NOT NULL DEFAULT ({_TS}),
+    updated_at TEXT NOT NULL DEFAULT ({_TS}),
+    published_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_blog_posts_status ON blog_posts(status);
 """
 
 # Tables that go ONLY in the main auth DB (MERIDIAN_DB_URL).
@@ -1208,6 +1221,16 @@ async def _migrate_pg_tunnel_plugins(conn: PostgresConnection) -> None:
     )
 
 
+async def _migrate_pg_tunnel_plugins_by_host(conn: PostgresConnection) -> None:
+    """8660d701 — tenants.tunnel_plugins_by_host: per-machine tunnel plugin config
+    (JSON {hostname: overrides}). The legacy tunnel_plugins stays the default for
+    hosts without a per-host entry. Mirrors SQLite _migrate_tunnel_plugins_by_host.
+    Idempotent."""
+    await conn.executescript(
+        "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS tunnel_plugins_by_host TEXT"
+    )
+
+
 async def _migrate_pg_code_intel(conn: PostgresConnection) -> None:
     """Sprint-2/3 — projects.code_intel_enabled: per-project Code Intelligence toggle."""
     await conn.executescript(
@@ -1431,6 +1454,63 @@ async def _migrate_pg_sprint_item_owner(conn: PostgresConnection) -> None:
     """
     await conn.executescript(
         "ALTER TABLE sprint_items ADD COLUMN IF NOT EXISTS owner TEXT"
+    )
+
+
+async def _migrate_pg_sprint_item_quality_gates(conn: PostgresConnection) -> None:
+    """5823db0b — quality gates + actor attribution on sprint_items.
+
+    Nullable ``required_notes`` (gate) + ``actor`` (attribution) columns. ADD
+    COLUMN IF NOT EXISTS so re-running is a no-op. Mirrors
+    db.migrations._migrate_sprint_item_quality_gates.
+    """
+    await conn.executescript(
+        "ALTER TABLE sprint_items ADD COLUMN IF NOT EXISTS required_notes INTEGER DEFAULT 0;"
+        "ALTER TABLE sprint_items ADD COLUMN IF NOT EXISTS actor TEXT;"
+    )
+
+
+async def _migrate_pg_parallel_primitives(conn: PostgresConnection) -> None:
+    """Wave-4 parallel-coordination primitives (ffa03655, c35370cc, d3a3a01d).
+
+    Postgres mirror of db.migrations._migrate_parallel_primitives: session_findings,
+    session_messages, file_read_claims. CREATE ... IF NOT EXISTS (idempotent).
+    """
+    await conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS session_findings (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL,
+            session_id TEXT,
+            key TEXT,
+            title TEXT,
+            content TEXT NOT NULL,
+            task_id TEXT,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+        CREATE INDEX IF NOT EXISTS idx_findings_project ON session_findings(project_id, key);
+        CREATE TABLE IF NOT EXISTS session_messages (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL,
+            from_session_id TEXT,
+            to_session_id TEXT NOT NULL,
+            kind TEXT,
+            payload TEXT NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            read_at TIMESTAMPTZ
+        );
+        CREATE INDEX IF NOT EXISTS idx_messages_to ON session_messages(to_session_id, read_at);
+        CREATE TABLE IF NOT EXISTS file_read_claims (
+            id TEXT PRIMARY KEY,
+            file_path TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            claimed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            expires_at TIMESTAMPTZ NOT NULL,
+            UNIQUE(file_path, session_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_read_claims_file ON file_read_claims(file_path);
+        CREATE INDEX IF NOT EXISTS idx_read_claims_expires ON file_read_claims(expires_at);
+        """
     )
 
 
@@ -1988,6 +2068,7 @@ _PG_MIGRATIONS_HOSTED = (
     _migrate_pg_admin_plan,
     _migrate_pg_tunnel_active,
     _migrate_pg_tunnel_plugins,
+    _migrate_pg_tunnel_plugins_by_host,
 )
 
 async def _migrate_pg_decision_code_anchor(conn: PostgresConnection) -> None:
@@ -2108,6 +2189,28 @@ async def _migrate_pg_github_connections(conn: PostgresConnection) -> None:
     )
 
 
+async def _migrate_pg_blog_posts(conn: PostgresConnection) -> None:
+    """6234f9b8 — blog_posts table for the admin Blog CMS.
+
+    Was added to the SQLite schema only; Postgres DBs 500'd on /admin/blog/posts
+    with 'relation blog_posts does not exist'. CREATE IF NOT EXISTS so re-running
+    is a no-op. Mirrors db._migrate_blog_posts.
+    """
+    await conn.executescript(
+        f"CREATE TABLE IF NOT EXISTS blog_posts ("
+        f"    id TEXT PRIMARY KEY,"
+        f"    title TEXT NOT NULL,"
+        f"    slug TEXT NOT NULL UNIQUE,"
+        f"    body_md TEXT NOT NULL DEFAULT '',"
+        f"    status TEXT NOT NULL DEFAULT 'draft',"
+        f"    created_at TEXT NOT NULL DEFAULT ({_TS}),"
+        f"    updated_at TEXT NOT NULL DEFAULT ({_TS}),"
+        f"    published_at TEXT"
+        f");"
+        f"CREATE INDEX IF NOT EXISTS idx_blog_posts_status ON blog_posts(status)"
+    )
+
+
 # Late migrations — run on every DB after the hosted-only set.
 _PG_MIGRATIONS_LATE = (
     _migrate_pg_workspace_tenant_isolation,
@@ -2146,4 +2249,7 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_handoffs_table,
     _migrate_pg_decision_assumption,
     _migrate_pg_github_connections,
+    _migrate_pg_blog_posts,
+    _migrate_pg_sprint_item_quality_gates,
+    _migrate_pg_parallel_primitives,
 )

@@ -8,6 +8,22 @@ Users can view / edit / reset this in the dashboard:
   Project → Settings → Executor Rules
 """
 
+from __future__ import annotations
+
+import re
+
+# 99e50a1d — the executor-rules / handoff standard is versioned. Bump this
+# whenever the default changes in a way stored per-project copies should
+# re-sync to. The hidden marker below is embedded in DEFAULT_AGENT_INSTRUCTIONS,
+# so a project's stored copy carries the version it was last synced from and
+# generate_handoff can warn when that copy predates the current standard.
+#
+#   v1 — pre-versioning baseline (implicit; stored copies with no marker).
+#   v2 — project_name-first start_session idiom + code-intel protocol; marker added.
+AGENT_INSTRUCTIONS_STANDARD_VERSION = 2
+
+_STANDARD_MARKER_RE = re.compile(r"meridian-executor-standard:\s*v(\d+)")
+
 DEFAULT_AGENT_INSTRUCTIONS = """\
 # Meridian — executor rules
 
@@ -74,4 +90,35 @@ list AND the task involves source code files, use them BEFORE any `read_file` or
 files when code intel tools are present is a protocol violation. For non-code
 files (documents, presentations, spreadsheets, config, data), use filesystem
 tools directly.
+
+<!-- meridian-executor-standard: v2 -->
 """
+
+
+def parse_standard_version(text: str | None) -> int | None:
+    """Return the embedded executor-standard version in ``text``, or None.
+
+    Stored copies from before versioning (v1) carry no marker and return None.
+    """
+    if not text:
+        return None
+    match = _STANDARD_MARKER_RE.search(text)
+    return int(match.group(1)) if match else None
+
+
+def agent_instructions_stale(stored: str | None) -> bool:
+    """True when a project's STORED executor rules predate the current standard.
+
+    ``None`` (no stored copy — the session falls back to the live default) is
+    never stale. A stored copy is stale only when it *looks like* a Meridian
+    executor-rules doc (so genuinely bespoke instructions are never nagged) and
+    its embedded standard version is missing or older than
+    :data:`AGENT_INSTRUCTIONS_STANDARD_VERSION`.
+    """
+    if not stored or not stored.strip():
+        return False
+    looks_like_standard = "Meridian" in stored and "start_session" in stored
+    if not looks_like_standard:
+        return False
+    version = parse_standard_version(stored)
+    return version is None or version < AGENT_INSTRUCTIONS_STANDARD_VERSION

@@ -57,6 +57,23 @@ jobs:
       - name: Lint (warn only — violations do not fail CI yet)
         run: ruff check . || true
 
+  frontend:
+    # 8e29733e — TypeScript strict type-check + Preact component coverage gate.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: npm ci
+      - name: Type-check (strict)
+        run: npx tsc --noEmit
+      - name: Build dashboard bundle
+        run: node build.mjs
+      - name: Component unit tests + coverage gate (70%+)
+        run: npx vitest run --coverage
+
   docs-check:
     runs-on: ubuntu-latest
     steps:

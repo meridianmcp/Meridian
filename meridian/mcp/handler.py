@@ -787,6 +787,7 @@ async def _handle_mcp_request(
     tenant: dict[str, Any] | None = None,
     token_type: str = "readwrite",
     enforce_role: str | None = None,
+    scoped_project_ids: "list[str] | None" = None,
 ) -> dict[str, Any]:
     """Dispatch one JSON-RPC 2.0 MCP request and return the response dict.
 
@@ -852,6 +853,22 @@ async def _handle_mcp_request(
         args = params.get("arguments") or {}
         if token_type == "readonly" and name not in _server._mcp_readonly_tools:
             return _server._jsonrpc_err(req_id, -32603, f"tool '{name}' not allowed for read-only tokens")
+        # 95499c3e / decision 6fe5210c — Option A project-scope enforcement for
+        # API tokens (mirrors the HTTP middleware). A scoped member may only touch
+        # projects in their scope; resolve the tool's target project (by project_id,
+        # else project_name → id) and deny when it's out of scope.
+        if scoped_project_ids is not None:
+            _tgt_pid = (args.get("project_id") or "").strip()
+            if not _tgt_pid and args.get("project_name"):
+                try:
+                    _sp = await db_module.get_project_by_name(db, str(args["project_name"]))
+                    _tgt_pid = (_sp or {}).get("id", "") if _sp else ""
+                except Exception:  # noqa: BLE001
+                    _tgt_pid = ""
+            if _tgt_pid and _tgt_pid not in scoped_project_ids:
+                return _server._jsonrpc_err(
+                    req_id, -32603, "project is outside your access scope",
+                )
         # 393eed0a — workspace-role gate (defense in depth for cross-workspace MCP).
         if enforce_role is not None and name not in _server._mcp_readonly_tools \
                 and name not in _server._GITHUB_TOOL_NAMES:
@@ -1072,6 +1089,62 @@ def _infer_touches_resources(title: str) -> list[str]:
     return [f"inferred:file:{path}" for path in _suggest_files_for_title(title or "")]
 
 
+def _prospect_code_context(item: dict[str, Any]) -> dict[str, Any] | None:
+    """04a15d3f — best-effort code-prospecting context for a freshly-claimed item.
+
+    Parses the item's typed ``touches_resources`` into the files and symbols an
+    executor should prospect before editing and emits the exact code-intel calls
+    to run — ``codebase__search_graph`` for ``file:`` entries, Serena
+    ``find_symbol`` for ``symbol:`` entries. With no declared resources it falls
+    back to title-keyword file inference (:func:`_suggest_files_for_title`).
+
+    The code index lives behind the executor's tunnel, so the server surfaces
+    the prospecting *targets and commands* rather than inlining graph results:
+    this never touches the tunnel and returns ``None`` when there's nothing to
+    suggest, so it can't fail (or block) a claim — non-fatal by construction.
+    """
+    files: list[str] = []
+    symbols: list[str] = []
+    for entry in _parse_touches_files(item.get("touches_resources")):
+        if entry.startswith("file:"):
+            files.append(entry[len("file:"):])
+        elif entry.startswith("symbol:"):
+            symbols.append(entry[len("symbol:"):])
+        elif entry.startswith("inferred:file:"):
+            files.append(entry[len("inferred:file:"):])
+    if files or symbols:
+        ctx: dict[str, Any] = {"source": "touches_resources"}
+        if files:
+            ctx["files"] = files
+            ctx["search_graph_calls"] = [
+                f'codebase__search_graph(query="{f}")' for f in files
+            ]
+        if symbols:
+            ctx["symbols"] = symbols
+            ctx["find_symbol_calls"] = [
+                f'find_symbol(name_path="{s}")' for s in symbols
+            ]
+        ctx["hint"] = (
+            "Prospect before editing: run the listed code-intel calls "
+            "(no-op if the code tunnel/index isn't connected)."
+        )
+        return ctx
+    inferred = _suggest_files_for_title(item.get("title") or "")
+    if inferred:
+        return {
+            "source": "title_inference",
+            "files": inferred,
+            "search_graph_calls": [
+                f'codebase__search_graph(query="{f}")' for f in inferred
+            ],
+            "hint": (
+                "No touches_resources declared; these files were inferred from "
+                "the item title. Prospect before editing."
+            ),
+        }
+    return None
+
+
 async def _active_executor_session_warnings(db: Any, project_id: str) -> list[str]:
     """fd86aacc — names of executor sessions seen active in the last 10 minutes.
 
@@ -1240,16 +1313,24 @@ async def _handle_project_tools(
         # Pass compact=False explicitly for the full block.
         # a76cb7c0 — optional `version` scopes the session to a sprint-version
         # bucket (orientation counts/items + /goal filter to it).
+        # 599d0097 — session_name is optional: when omitted/blank, generate a
+        # meaningful default from the first pending item title + timestamp.
+        _sname = (args.get("session_name") or "").strip()
+        if not _sname:
+            _sname = await db_module.generate_default_session_name(
+                db, args["project_id"]
+            )
         result = await _server._start_session_composite(
             db,
             args["project_id"],
-            args["session_name"],
+            _sname,
             data_dir,
             human_id=args.get("human_id"),
             client_type=args.get("client"),
             role=args.get("role"),
             compact=args.get("compact", True),
             version=args.get("version"),
+            mode=args.get("mode"),
         )
         # b9d1b606 — expand fs proxy roots so the executor's repo_path is
         # accessible without a separate set_active_repo call.
@@ -1382,6 +1463,18 @@ async def _handle_task_tools(
         # Fetch recent commits for reconcile annotations (non-fatal)
         _gh_project = await db_module.get_project(db, args["project_id"])
         _gh_commits = await _fetch_recent_commits(_gh_project or {}, tenant)
+        # 4cfaecc2 — wire code-pointer enrichment to the tunnel code-intel slot.
+        # Build a tunnel-backed graph searcher when a tunnel is active; None
+        # otherwise (enrichment degrades to no pointers). Fully guarded — never
+        # break the mandatory handoff over an enrichment convenience.
+        _graph_searcher = None
+        try:
+            from ..routes import tunnel as _tunnel_mod  # noqa: PLC0415
+            _graph_searcher = _tunnel_mod.build_graph_searcher(
+                tenant.get("id") if tenant else None
+            )
+        except Exception:  # noqa: BLE001
+            _graph_searcher = None
         try:
             path, content = await asyncio.wait_for(
                 handoff_module_local.generate_handoff(
@@ -1391,6 +1484,7 @@ async def _handle_task_tools(
                     mode=mode,
                     session_id=session_id,
                     commit_messages=[c["message"] for c in _gh_commits],
+                    graph_searcher=_graph_searcher,
                 ),
                 timeout=90.0,
             )
@@ -1399,7 +1493,22 @@ async def _handle_task_tools(
                 db, args["project_id"], data_dir
             )
             mode = "full"
-        return {"file_path": path, "content": content, "mode": mode}
+        # 99e50a1d — surface a machine-readable staleness flag so the dashboard /
+        # caller can offer a one-click sync when the project's stored executor
+        # rules predate the current standard.
+        _tpl_stale = False
+        try:
+            from ..agent_defaults import agent_instructions_stale  # noqa: PLC0415
+            _stored_ai = await db_module.get_agent_instructions(db, args["project_id"])
+            _tpl_stale = agent_instructions_stale(_stored_ai)
+        except Exception:  # noqa: BLE001
+            _tpl_stale = False
+        return {
+            "file_path": path,
+            "content": content,
+            "mode": mode,
+            "template_stale": _tpl_stale,
+        }
     return _MISS
 
 
@@ -1877,7 +1986,16 @@ async def _handle_session_tools(
             f"Done when complete_sprint_item()\'d, tests pass, generate_handoff called."
         ) if pending_items else "/goal Continue work — all sprint items done."
         # 04f03ee4 — include start_session one-liner so next session can resume immediately
-        start_fresh = f'start_session(project_id="{project_id}", session_name="describe-what-youre-doing")'
+        # 11a91d31 — default to project_name (idiomatic per 8a449ec0); project_id as a comment.
+        try:
+            _ck_proj = await db_module.get_project(db, project_id)
+            _ck_pname = (_ck_proj or {}).get("name") or project_id
+        except Exception:  # noqa: BLE001
+            _ck_pname = project_id
+        start_fresh = (
+            f'start_session(project_name="{_ck_pname}", session_name="describe-what-youre-doing")'
+            f'  # project_id={project_id}'
+        )
         # fa595ad8 — store snapshot for Recent Sessions dashboard panel (non-fatal)
         # v3.1 — snapshot now lives on sessions.checkpoint_data, not a checkpoint:* note.
         try:
@@ -2451,6 +2569,9 @@ async def _handle_sprint_tools(
         # so omitting the key leaves the stored value untouched (_UNSET sentinel).
         if "touches_resources" in args:
             _patch_kwargs["touches_resources"] = args.get("touches_resources")
+        # 5823db0b — allow flagging an item as requiring completion evidence.
+        if "required_notes" in args:
+            _patch_kwargs["required_notes"] = args.get("required_notes")
         try:
             item = await db_module.patch_sprint_item(
                 db, args["project_id"], args["item_id"], **_patch_kwargs
@@ -2560,6 +2681,12 @@ async def _handle_sprint_tools(
                 "touches_resources to let them parallelize."
             )
         return _grp
+    if name == "analyze_sprint":
+        # e77f09d1 — one-call planning brief: parallelism + dependency chains +
+        # resource conflicts + stalls synthesized for a planning session.
+        return await db_module.analyze_sprint(
+            db, args["project_id"], version=args.get("version")
+        )
     if name == "claim_sprint_item":
         # ITEM 3 — protect installer scripts: refuse to claim a sprint item whose
         # touches_files includes hooks.ps1 / hooks.sh unless force=true is passed.
@@ -2614,7 +2741,12 @@ async def _handle_sprint_tools(
                 }
 
         try:
-            item = await db_module.claim_sprint_item(db, args["project_id"], args["item_id"])
+            # 5823db0b — actor attribution: record who claimed the item (explicit
+            # actor arg, else the claiming session id).
+            _claim_actor = args.get("actor") or args.get("session_id")
+            item = await db_module.claim_sprint_item(
+                db, args["project_id"], args["item_id"], actor=_claim_actor
+            )
         except ValueError:
             # 10c0f6a0 — if already in_progress, check for stale claim and surface info
             _stale_item = await db_module.get_sprint_item(db, args["item_id"])
@@ -2730,6 +2862,17 @@ async def _handle_sprint_tools(
             item = dict(item)
             item["suggested_files"] = _sug
 
+        # 04a15d3f — auto-prospect: surface the code-intel targets (files/symbols)
+        # the executor should search before editing, derived from touches_resources
+        # (or inferred from the title). Best-effort; never blocks the claim.
+        try:
+            _code_ctx = _prospect_code_context(item)
+        except Exception:  # noqa: BLE001
+            _code_ctx = None
+        if _code_ctx:
+            item = dict(item)
+            item["code_context"] = _code_ctx
+
         return item
     if name == "add_subtask":
         return await db_module.add_subtask(
@@ -2772,10 +2915,22 @@ async def _handle_sprint_tools(
             except Exception:  # noqa: BLE001
                 pass
 
-        item = await db_module.complete_sprint_item(
-            db, args["project_id"], args["item_id"],
-            task_id=args.get("task_id"),
-        )
+        # 5823db0b — quality gate + actor attribution. Pass evidence notes and
+        # the completing actor; surface the required_notes gate as a clean error.
+        _complete_actor = args.get("actor") or _complete_session_id or None
+        try:
+            item = await db_module.complete_sprint_item(
+                db, args["project_id"], args["item_id"],
+                task_id=args.get("task_id"),
+                notes=args.get("notes"),
+                actor=_complete_actor,
+            )
+        except db_module.SprintItemEvidenceRequired as exc:
+            return {
+                "error": "EVIDENCE_REQUIRED",
+                "item_id": args["item_id"],
+                "message": str(exc),
+            }
         if item is None:
             raise ValueError("sprint item not found")
         if _merge_warning:
@@ -2848,13 +3003,47 @@ async def _handle_file_claims(
                 db, args["session_id"], args["file_path"], _symbol,
             )
             return result
+        # ffa03655 — read|write claim grain (default write/exclusive).
         return await db_module.claim_file(
-            db, args["file_path"], args["session_id"], symbol=_symbol
+            db, args["file_path"], args["session_id"], symbol=_symbol,
+            mode=args.get("mode", "write"),
         )
     if name == "get_file_claims":
         return await db_module.get_file_claims(
             db, args["file_path"], args.get("project_id"), args.get("symbol")
         )
+    if name == "store_finding":
+        validate_input_size(args.get("content"), "finding content", 1_000_000)
+        if not (args.get("content") or "").strip():
+            return {"error": "store_finding requires non-empty content"}
+        return await db_module.store_finding(
+            db, args["project_id"], args["content"],
+            session_id=args.get("session_id"), key=args.get("key"),
+            title=args.get("title"), task_id=args.get("task_id"),
+        )
+    if name == "get_findings":
+        return await db_module.get_findings(
+            db, args["project_id"], key=args.get("key"),
+            session_id=args.get("session_id"), limit=int(args.get("limit", 50)),
+        )
+    if name == "send_message":
+        validate_input_size(args.get("payload"), "message payload", 1_000_000)
+        return await db_module.send_message(
+            db, args["project_id"], args["to_session_id"], args.get("payload", ""),
+            from_session_id=args.get("from_session_id") or args.get("session_id"),
+            kind=args.get("kind"),
+        )
+    if name == "receive_messages":
+        return await db_module.receive_messages(
+            db, args["session_id"],
+            mark_read=args.get("mark_read", True),
+            limit=int(args.get("limit", 50)),
+        )
+    if name == "idle_until_all_done":
+        _sids = args.get("session_ids") or []
+        if isinstance(_sids, str):
+            _sids = [s.strip() for s in _sids.split(",") if s.strip()]
+        return await db_module.idle_until_all_done(db, _sids)
     if name == "get_symbol_claims":
         return {"claims": await db_module.get_symbol_claims(db, args["file_path"])}
     if name == "get_symbol_hotspots":

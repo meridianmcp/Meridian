@@ -38,7 +38,7 @@ _env = Environment(
     autoescape=select_autoescape(disabled_extensions=("md", "j2")),
     keep_trailing_newline=True,
 )
-_DEFAULT_GOAL_TEST_FLOOR = 524
+_DEFAULT_GOAL_TEST_FLOOR = 2150
 _STRATEGIC_NOTE_TAGS = {"planning", "strategy", "competitive", "acquisition"}
 _SESSION_HANDOFF_STATE: dict[str, str] = {}
 
@@ -129,6 +129,47 @@ def _max_turns_from_settings(proj_settings: dict[str, Any] | None) -> int:
         return _DEFAULT_GOAL_MAX_TURNS
 
 
+def _partition_into_waves(
+    items: list[dict[str, Any]],
+) -> list[list[dict[str, Any]]]:
+    """Topologically layer items by ``depends_on`` into ordered waves (3726cf70).
+
+    Wave 0 holds items that depend on nothing else in the set; wave N holds
+    items whose in-set dependency sits in wave N-1. Items within a wave carry no
+    ordering constraint between them (parallel-safe, subject to the resource
+    conflicts the executor still checks at claim time). External or cyclic
+    dependencies collapse to wave 0 so nothing is ever dropped. Input order is
+    preserved within each wave. The sage/topological wave model — run each wave
+    fully before the next.
+    """
+    by_id = {it["id"]: it for it in items if it.get("id")}
+    wave_of: dict[str, int] = {}
+
+    def _depth(iid: str, seen: set[str]) -> int:
+        if iid in wave_of:
+            return wave_of[iid]
+        if iid in seen:  # dependency cycle — treat as a root
+            return 0
+        seen.add(iid)
+        it = by_id.get(iid)
+        dep = it.get("depends_on") if it else None
+        depth = (_depth(dep, seen) + 1) if (dep and dep in by_id) else 0
+        wave_of[iid] = depth
+        return depth
+
+    for iid in by_id:
+        _depth(iid, set())
+    if not wave_of:
+        return []
+    max_wave = max(wave_of.values())
+    waves: list[list[dict[str, Any]]] = [[] for _ in range(max_wave + 1)]
+    for it in items:
+        iid = it.get("id")
+        if iid in wave_of:
+            waves[wave_of[iid]].append(it)
+    return [w for w in waves if w]
+
+
 def _build_quick_start_goal(
     pending_sprint_items: list[dict[str, Any]],
     *,
@@ -189,9 +230,31 @@ def _build_quick_start_goal(
         if execution_mode == "interactive"
         else _EXECUTOR_GOAL_DIRECTIVE
     )
+    # 3726cf70 — when the pending items form a depends_on graph, structure the
+    # /goal into ordered waves (finish a wave before the next; within-wave items
+    # are parallel-safe). With no dependencies there's a single wave, so the flat
+    # "Complete sprint items: …" phrasing is preserved (no behaviour change).
+    waves = _partition_into_waves(pending_sprint_items)
+    if len(waves) > 1:
+        wave_txt = "; ".join(
+            f"Wave {i + 1}: {', '.join(it['id'] for it in wave if it.get('id'))}"
+            for i, wave in enumerate(waves)
+        )
+        items_clause = (
+            "Complete sprint items in wave order — finish each wave before "
+            "starting the next; items within a wave are parallel-safe: "
+            f"{wave_txt}. "
+        )
+    else:
+        items_clause = f"Complete sprint items: {', '.join(item_ids)}. "
     return (
         f"/goal {directive}"
-        f"Complete sprint items: {', '.join(item_ids)}. "
+        # 4cfaecc2 — the baked-in id list is a point-in-time snapshot; a live
+        # board query keeps a resumed session honest about mid-run injections
+        # and already-claimed items instead of trusting a stale list.
+        'First call get_sprint_items(status="pending") to load the live board '
+        "(the ids below are a snapshot and may have shifted). "
+        f"{items_clause}"
         "Done when all listed sprint items are marked complete via "
         f"complete_sprint_item(), pixi run test passes {test_floor}+, and "
         f"generate_handoff() is called at the end. Stop after {_turns} turns "
@@ -564,17 +627,44 @@ def _code_pointers_enabled(settings: dict[str, Any] | None) -> bool:
     return bool(cfg.get("enrich_handoffs_with_code_pointers"))
 
 
+# 4cfaecc2 — wireable resolver seam. handoff.py deliberately does NOT import the
+# tunnel/routing layer (that would be a layering violation and an import cycle),
+# so the server registers a resolver at startup that maps a project_id to a
+# tunnel-backed graph searcher. Absent a registered resolver, enrichment stays a
+# no-op (the historical behaviour), and the resolver — like every enrichment hop —
+# is fully guarded so it can never break the mandatory handoff.
+_GRAPH_SEARCHER_RESOLVER: Callable[[str], Callable[[str], Any] | None] | None = None
+
+
+def set_graph_searcher_resolver(
+    resolver: Callable[[str], Callable[[str], Any] | None] | None,
+) -> None:
+    """Register (or clear with None) the project_id -> graph-searcher resolver.
+
+    Called once by the server layer, which has the tenant/tunnel context that
+    handoff.py must not import directly.
+    """
+    global _GRAPH_SEARCHER_RESOLVER
+    _GRAPH_SEARCHER_RESOLVER = resolver
+
+
 def _resolve_graph_searcher(
     project_id: str,
 ) -> Callable[[str], Any] | None:
     """Return a code-graph search callable for ``project_id`` or None.
 
-    The default implementation returns None because the code-graph lives in an
-    out-of-process MCP that is not callable synchronously from here. The seam
-    exists so deployments that *do* have an in-process searcher (and tests) can
-    inject one via the ``graph_searcher`` argument to ``generate_handoff``.
+    Consults the resolver registered via :func:`set_graph_searcher_resolver`
+    (wired to the tunnel code-intel slot by the server). When no resolver is
+    registered — or it raises/returns None — enrichment degrades to no pointers.
+    Tests and in-process deployments can also inject a searcher directly via the
+    ``graph_searcher`` argument to ``generate_handoff``, which takes precedence.
     """
-    return None
+    if _GRAPH_SEARCHER_RESOLVER is None:
+        return None
+    try:
+        return _GRAPH_SEARCHER_RESOLVER(project_id)
+    except Exception:  # noqa: BLE001 — resolver must never break the handoff
+        return None
 
 
 def _coerce_match_list(result: Any) -> list[Any]:
@@ -705,8 +795,10 @@ def _render_starter_handoff(
     pid = project["id"]
     name = project["name"]
     lines = [
-        f"project_id: {pid}",
-        f'start: start_session(project_id="{pid}", session_name="describe-what-youre-doing")',
+        # 11a91d31 — default to project_name (the idiomatic interface per 8a449ec0);
+        # project_id stays as a fallback comment.
+        f'start: start_session(project_name="{name}", session_name="describe-what-youre-doing")',
+        f"project_id (fallback): {pid}",
         "",
         f"# Meridian — {name}",
     ]
@@ -790,7 +882,7 @@ def _render_delta_handoff(
     """Return a compact handoff for back-to-back goal runs in one session."""
     # 04f03ee4 — one-liner start instruction at very top of delta output
     lines = [
-        f"To start fresh: start_session(project_id=\"{project['id']}\", session_name=\"describe-what-youre-doing\")",
+        f"To start fresh: start_session(project_name=\"{project['name']}\", session_name=\"describe-what-youre-doing\")  # project_id={project['id']}",
         "",
         f"# Session Update — {project['name']}",
         f"_Generated at {generated_at} (delta mode)_",
@@ -1082,6 +1174,34 @@ def _render_custom_handoff(
     return rendered
 
 
+def _stale_template_warning(stored_instructions: str | None) -> str:
+    """Return a stale-standard warning block, or '' when up to date (99e50a1d).
+
+    When a project's stored ``agent_instructions`` predate the current executor
+    standard, surface a prominent (but non-blocking) notice at the top of the
+    handoff so the next session syncs instead of silently running an old
+    coordination protocol (e.g. the thesis project stuck on the pre-versioning
+    project_id/no-continue pattern). Fully guarded — never breaks the handoff.
+    """
+    try:
+        from .agent_defaults import (  # noqa: PLC0415
+            AGENT_INSTRUCTIONS_STANDARD_VERSION,
+            agent_instructions_stale,
+        )
+        if not agent_instructions_stale(stored_instructions):
+            return ""
+    except Exception:  # noqa: BLE001 — a warning must never break the handoff
+        return ""
+    return (
+        "> ⚠️ **Executor rules are behind the current standard "
+        f"(v{AGENT_INSTRUCTIONS_STANDARD_VERSION}).** This project's stored "
+        "agent_instructions predate the latest coordination rules (e.g. the "
+        "project_name-first `start_session` idiom + code-intel protocol). Sync "
+        "with `set_agent_instructions(project_id, <current default>)`, or reset "
+        "in the dashboard → Settings → Executor Rules."
+    )
+
+
 async def generate_handoff(
     db: aiosqlite.Connection,
     project_id: str,
@@ -1291,6 +1411,12 @@ async def generate_handoff(
         decisions_count=len([d for d in pinned_decisions if d.get("status") == "active"]),
     )
     content = f"{readiness_block}\n\n{content}"
+
+    # 99e50a1d — if this project's stored executor rules predate the current
+    # standard, lead the handoff with a sync notice (best-effort, never fatal).
+    _tpl_warning = _stale_template_warning(project.get("agent_instructions"))
+    if _tpl_warning:
+        content = f"{_tpl_warning}\n\n{content}"
 
     # 10e6b265 — session queue: append the queued next-session goal (if any) and
     # clear it so the handoff surfaces the next /goal inline, exactly once.

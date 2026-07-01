@@ -813,6 +813,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_tunnel_active(db)
     await _migrate_code_intel(db)
     await _migrate_tunnel_plugins(db)
+    await _migrate_tunnel_plugins_by_host(db)
     await _migrate_notes_priority(db)
     await _migrate_task_log_kind(db)
     await _migrate_note_slug(db)
@@ -830,6 +831,8 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_handoffs_table(db)
     await _migrate_decision_assumption(db)
     await _migrate_github_connections(db)
+    await _migrate_sprint_item_quality_gates(db)
+    await _migrate_parallel_primitives(db)
     return db
 
 
@@ -1727,6 +1730,37 @@ async def register_session(
         "session_id": sid, "session_name": name, "human_id": human_id,
     })
     return session
+
+
+async def generate_default_session_name(
+    db: aiosqlite.Connection,
+    project_id: str,
+) -> str:
+    """599d0097 — derive a meaningful session name when start_session gets none.
+
+    Uses the first pending/todo sprint item's title (slugified to its first few
+    words) plus a UTC timestamp, so an unnamed session reads as e.g.
+    ``wire-billing-oauth-20260701-2130`` instead of forcing the caller to invent
+    a string. Falls back to ``session-<timestamp>`` when the board is empty. The
+    timestamp keeps the name unique (the board rejects duplicate active names).
+    """
+    from datetime import datetime, timezone  # local: db/__init__ has no top import
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    try:
+        items = await get_sprint_items(db, project_id, include_human=False)
+    except Exception:  # noqa: BLE001 — naming must never block start_session
+        items = []
+    first = next(
+        (it for it in items
+         if (it.get("status") or "pending") in {"pending", "todo"}),
+        None,
+    )
+    title = (first or {}).get("title") or ""
+    words = re.findall(r"[a-z0-9]+", title.lower())
+    if words:
+        slug = "-".join(words[:5])[:48].strip("-") or "session"
+        return f"{slug}-{ts}"
+    return f"session-{ts}"
 
 
 def build_worker_context_xml(
@@ -3213,12 +3247,14 @@ async def _update_sprint_item_status(
     task_id: str | None = None,
     notes: str | None = None,
     pushed_to: str | None = None,
+    actor: str | None = None,
 ) -> dict[str, Any] | None:
     """Internal: flip a sprint item's status and optionally link a task.
 
     Terminal statuses (done / skipped / failed / pushed) stamp
     ``completed_at``; non-terminal statuses clear it. ``pushed_to``
-    records the target version when status == 'pushed'.
+    records the target version when status == 'pushed'. ``actor`` (5823db0b)
+    records the executor id/name that made this transition.
     """
     if status not in _VALID_SPRINT_STATUSES:
         raise ValueError(f"invalid sprint-item status: {status!r}")
@@ -3239,6 +3275,9 @@ async def _update_sprint_item_status(
     if pushed_to is not None:
         fields.append("pushed_to = ?")
         values.append(pushed_to)
+    if actor is not None:
+        fields.append("actor = ?")
+        values.append(actor)
     values.append(item_id)
     values.append(project_id)
     cursor = await db.execute(
@@ -3283,11 +3322,18 @@ async def _maybe_rollup_parent(db: aiosqlite.Connection, project_id: str, item_i
         await _update_sprint_item_status(db, project_id, parent_id, "indeterminate")
 
 
+class SprintItemEvidenceRequired(ValueError):
+    """Raised when complete_sprint_item is blocked by the required_notes gate
+    (5823db0b) — the item is flagged required_notes but has no evidence."""
+
+
 async def complete_sprint_item(
     db: aiosqlite.Connection,
     project_id: str,
     item_id: str,
     task_id: str | None = None,
+    notes: str | None = None,
+    actor: str | None = None,
 ) -> dict[str, Any] | None:
     """Mark a sprint item ``done`` and optionally link the task that shipped it.
 
@@ -3295,9 +3341,29 @@ async def complete_sprint_item(
     chain, advance the chain: an AI→human transition auto-files a HITL handoff,
     a human→AI transition un-blocks the next AI subtask (see
     :func:`_advance_task_chain`).
+
+    5823db0b — quality gate: when the item is flagged ``required_notes``, refuse
+    to complete unless evidence exists — an existing ``notes`` value, a linked
+    ``task_id``, or a ``notes`` argument on this call (which is persisted).
+    ``actor`` records which executor completed the item.
     """
+    item = await get_sprint_item(db, item_id)
+    if item is not None and item.get("project_id") == project_id:
+        if item.get("required_notes"):
+            has_evidence = bool(
+                (notes or "").strip()
+                or task_id
+                or (item.get("notes") or "").strip()
+                or (item.get("task_id"))
+            )
+            if not has_evidence:
+                raise SprintItemEvidenceRequired(
+                    f"item {item_id} requires evidence before completion — pass "
+                    "notes=... (what shipped / how it was verified) or link a "
+                    "task_id. This item was flagged required_notes."
+                )
     result = await _update_sprint_item_status(
-        db, project_id, item_id, "done", task_id=task_id
+        db, project_id, item_id, "done", task_id=task_id, notes=notes, actor=actor
     )
     if result is not None:
         await _maybe_rollup_parent(db, project_id, item_id)
@@ -3354,11 +3420,13 @@ async def claim_sprint_item(
     db: aiosqlite.Connection,
     project_id: str,
     item_id: str,
+    actor: str | None = None,
 ) -> dict[str, Any] | None:
     """Claim a sprint item: set status='in_progress' and claimed_at=now().
 
     Rejects (raises ValueError) if already in_progress, done, failed, or skipped.
-    Returns None if the item doesn't exist.
+    Returns None if the item doesn't exist. ``actor`` (5823db0b) records which
+    executor claimed the item.
     """
     item = await get_sprint_item(db, item_id)
     if item is None:
@@ -3371,9 +3439,10 @@ async def claim_sprint_item(
             f"cannot claim item with status '{item.get('status')}'"
         )
     cursor = await db.execute(
-        "UPDATE sprint_items SET status = 'in_progress', claimed_at = datetime('now') "
+        "UPDATE sprint_items SET status = 'in_progress', "
+        "claimed_at = datetime('now'), actor = COALESCE(?, actor) "
         "WHERE id = ? AND project_id = ?",
-        (item_id, project_id),
+        (actor, item_id, project_id),
     )
     await db.commit()
     if cursor.rowcount == 0:
@@ -3429,11 +3498,13 @@ async def patch_sprint_item(
     human_id: str | None = None,
     item_group: str | None = None,
     touches_resources: Any = _UNSET,
+    required_notes: bool | int | None = None,
 ) -> dict[str, Any] | None:
     """Update editable fields of a sprint item.
 
     Editable: title, version, status, feedback, notes, human_id (assignee),
-    item_group, touches_resources. Only fields passed as non-None are changed;
+    item_group, touches_resources, required_notes. Only fields passed as
+    non-None are changed;
     omitted fields are left untouched. To clear human_id or item_group, pass an
     empty string. ``touches_resources`` (501ec93f) uses the ``_UNSET`` sentinel
     so it can be omitted entirely; pass ``None`` or ``[]`` to clear it, or a list
@@ -3470,6 +3541,9 @@ async def patch_sprint_item(
     if touches_resources is not _UNSET:
         fields.append("touches_resources = ?")
         values.append(serialize_touches_resources(touches_resources))
+    if required_notes is not None:
+        fields.append("required_notes = ?")
+        values.append(1 if required_notes else 0)
     if not fields:
         return await get_sprint_item(db, item_id)
     values.extend([item_id, project_id])
@@ -4980,7 +5054,7 @@ async def update_tenant(
         "compute_cu_hours_used", "storage_gb_used",
         "overage_reset_at", "compute_throttled_at",
         "trial_started_at", "inactivity_expires_at",
-        "github_pat", "tunnel_active", "tunnel_plugins",
+        "github_pat", "tunnel_active", "tunnel_plugins", "tunnel_plugins_by_host",
     }
     updates = {k: v for k, v in fields.items() if k in allowed}
     if not updates:
@@ -5513,6 +5587,7 @@ async def claim_file(
     *,
     symbol: str | None = None,
     ttl_hours: int = _FILE_LOCK_TTL_HOURS,
+    mode: str = "write",
 ) -> dict[str, Any]:
     """Claim a file path for a session, auto-releasing expired locks first.
 
@@ -5522,11 +5597,38 @@ async def claim_file(
     anchors for that symbol are preferred but file-level anchors (no symbol)
     are always included. Empty when none. Additive — existing callers are
     unaffected.
+
+    ffa03655 — ``mode`` selects the claim grain. ``write`` (default, legacy) is
+    an EXCLUSIVE lock: it blocks other writers and is itself blocked by any other
+    session's live read claim ("no lock on an open door" for reads, exclusion for
+    writes). ``read`` is a SHARED claim: many sessions can hold a read claim on
+    the same file concurrently (zero false contention for parallel reader agents),
+    blocked only by another session's exclusive write lock.
     """
     normalized = _normalize_file_path(file_path)
     if not normalized:
         raise ValueError("file_path is required")
     await expire_file_locks(db)
+    await expire_file_read_claims(db)
+    _mode = "read" if str(mode or "write").lower() == "read" else "write"
+    if _mode == "read":
+        return await _claim_file_read(db, normalized, session_id, ttl_hours, symbol)
+    # ffa03655 — exclusive write waits for readers: another session's live read
+    # claim blocks a write claim.
+    _readers = await _other_read_claims(db, normalized, session_id)
+    if _readers:
+        return {
+            "claimed": False,
+            "reason": "read_locked",
+            "claim_mode": "write",
+            "file_path": normalized,
+            "session_id": session_id,
+            "read_claims": [r.get("session_id") for r in _readers],
+            "message": (
+                f"Cannot write-claim {normalized}: {len(_readers)} reader(s) hold a "
+                "shared read claim. Wait for readers to release, or read-claim instead."
+            ),
+        }
     # 63b030a6 — file ⊃ symbol hierarchy: a whole-file lock conflicts with any
     # live symbol claim on the file held by another session. Block here so the
     # coarser grain can't silently stomp a finer one.
@@ -5612,6 +5714,7 @@ async def claim_file(
         }
     return {
         "claimed": True,
+        "claim_mode": "write",
         "file_path": normalized,
         "session_id": lock.get("session_id"),
         "claimed_at": lock.get("claimed_at"),
@@ -5622,6 +5725,95 @@ async def claim_file(
         # 777f26b0 — decisions with code_anchor matching this file path.
         "decision_notes": await _decision_notes_for_session_file(
             db, session_id, normalized
+        ),
+    }
+
+
+async def expire_file_read_claims(db: aiosqlite.Connection) -> None:
+    """ffa03655 — drop read claims whose TTL has lapsed (mirrors expire_file_locks)."""
+    await db.execute(
+        "DELETE FROM file_read_claims WHERE expires_at < datetime('now')"
+    )
+    await db.commit()
+
+
+async def _other_read_claims(
+    db: aiosqlite.Connection, file_path: str, session_id: str
+) -> list[dict[str, Any]]:
+    """Live read claims on ``file_path`` held by sessions other than this one."""
+    async with db.execute(
+        "SELECT * FROM file_read_claims WHERE file_path = ? AND session_id != ?",
+        (file_path, session_id),
+    ) as cur:
+        return [_row_to_dict(r) for r in await cur.fetchall()]
+
+
+async def _all_read_claims(
+    db: aiosqlite.Connection, file_path: str
+) -> list[dict[str, Any]]:
+    async with db.execute(
+        "SELECT * FROM file_read_claims WHERE file_path = ?", (file_path,)
+    ) as cur:
+        return [_row_to_dict(r) for r in await cur.fetchall()]
+
+
+async def _claim_file_read(
+    db: aiosqlite.Connection,
+    normalized: str,
+    session_id: str,
+    ttl_hours: int,
+    symbol: str | None,
+) -> dict[str, Any]:
+    """ffa03655 — acquire (or refresh) a SHARED read claim on ``normalized``.
+
+    Blocked only by another session's exclusive write lock; multiple sessions may
+    hold a read claim on the same file at once.
+    """
+    async with db.execute(
+        "SELECT * FROM file_locks WHERE file_path = ?", (normalized,)
+    ) as cur:
+        wrow = _row_to_dict(await cur.fetchone())
+    if wrow and wrow.get("session_id") != session_id:
+        return {
+            "claimed": False,
+            "reason": "write_locked",
+            "claim_mode": "read",
+            "file_path": normalized,
+            "session_id": session_id,
+            "holder_session_id": wrow.get("session_id"),
+            "message": (
+                f"Cannot read-claim {normalized}: it is write-locked by another "
+                "live session. Wait for the writer to release."
+            ),
+        }
+    async with db.execute(
+        "SELECT id FROM file_read_claims WHERE file_path = ? AND session_id = ?",
+        (normalized, session_id),
+    ) as cur:
+        existing = _row_to_dict(await cur.fetchone())
+    if existing:
+        await db.execute(
+            "UPDATE file_read_claims SET claimed_at = datetime('now'), "
+            "expires_at = datetime('now', ? || ' hours') WHERE id = ?",
+            (str(ttl_hours), existing["id"]),
+        )
+    else:
+        await db.execute(
+            "INSERT INTO file_read_claims (id, file_path, session_id, claimed_at, expires_at) "
+            "VALUES (?, ?, ?, datetime('now'), datetime('now', ? || ' hours'))",
+            (_new_id(), normalized, session_id, str(ttl_hours)),
+        )
+    await db.commit()
+    readers = await _all_read_claims(db, normalized)
+    return {
+        "claimed": True,
+        "claim_mode": "read",
+        "file_path": normalized,
+        "session_id": session_id,
+        "readers": [r.get("session_id") for r in readers],
+        "reader_count": len(readers),
+        "code_notes": await _code_notes_for_session_file(
+            db, session_id, normalized, symbol
         ),
     }
 
@@ -5646,17 +5838,27 @@ async def release_file(
         "WHERE file_path = ? AND session_id = ? AND released_at IS NULL",
         (normalized, session_id),
     )
+    # ffa03655 — also drop any shared read claim this session holds on the file.
+    read_cursor = await db.execute(
+        "DELETE FROM file_read_claims WHERE file_path = ? AND session_id = ?",
+        (normalized, session_id),
+    )
     await db.commit()
-    return cursor.rowcount > 0 or sym_cursor.rowcount > 0
+    return cursor.rowcount > 0 or sym_cursor.rowcount > 0 or read_cursor.rowcount > 0
 
 
 async def release_file_locks_for_session(
     db: aiosqlite.Connection,
     session_id: str,
 ) -> int:
-    """Release every file lock held by a session."""
+    """Release every file lock held by a session (write locks + read claims)."""
     cursor = await db.execute(
         "DELETE FROM file_locks WHERE session_id = ?",
+        (session_id,),
+    )
+    # ffa03655 — also drop the session's shared read claims on cleanup.
+    await db.execute(
+        "DELETE FROM file_read_claims WHERE session_id = ?",
         (session_id,),
     )
     await db.commit()
@@ -5727,6 +5929,7 @@ async def get_file_claims(
     """
     normalized = _normalize_file_path(file_path)
     await expire_file_locks(db)
+    await expire_file_read_claims(db)
     async with db.execute(
         "SELECT fl.*, s.name AS session_name FROM file_locks fl "
         "LEFT JOIN sessions s ON s.id = fl.session_id "
@@ -5738,6 +5941,8 @@ async def get_file_claims(
         "file_path": normalized,
         "file_lock": _row_to_dict(row),
         "symbol_claims": await get_symbol_claims(db, normalized),
+        # ffa03655 — shared read claims held on this file (many concurrent).
+        "read_claims": await _all_read_claims(db, normalized),
     }
     if project_id:
         result["code_notes"] = await get_code_notes_for_file(
@@ -6310,6 +6515,241 @@ async def get_parallelizable_groups(
         "blocked": blocked,
         "running": running,  # df573218 — items currently in flight
     }
+
+
+async def analyze_sprint(
+    db: aiosqlite.Connection,
+    project_id: str,
+    version: str | None = None,
+) -> dict[str, Any]:
+    """e77f09d1 — synthesize a structured planning brief for the current sprint.
+
+    One call combines what a planner otherwise assembles from four:
+      * parallelizability — conflict-free batches from
+        :func:`get_parallelizable_groups` (group_count, max fan-out, blocked).
+      * dependency chains — ``depends_on`` walked to the root for each open item.
+      * resource conflicts — open items whose ``touches_resources`` intersect
+        (why they can't co-schedule).
+      * stalls — open items with a non-zero ``stall_count``.
+
+    Returns a single dict with a human ``summary`` line and a
+    ``recommended_strategy`` ('parallel' when any group holds >1 item).
+    """
+    groups_info = await get_parallelizable_groups(db, project_id, version=version)
+    items = await get_sprint_items(db, project_id)
+    if version is not None:
+        items = [it for it in items if it.get("version") == version]
+    _open = {"pending", "todo", "in_progress"}
+    open_items = [it for it in items if (it.get("status") or "pending") in _open]
+    by_id = {it["id"]: it for it in items}
+
+    # Dependency chains: walk depends_on to the root for each open dependent item.
+    def _chain_for(item: dict[str, Any]) -> list[dict[str, Any]]:
+        chain: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        cur: dict[str, Any] | None = item
+        while cur is not None and cur["id"] not in seen:
+            seen.add(cur["id"])
+            chain.append({
+                "id": cur["id"],
+                "title": cur.get("title", ""),
+                "status": cur.get("status"),
+            })
+            dep = cur.get("depends_on")
+            cur = by_id.get(dep) if dep else None
+        chain.reverse()
+        return chain
+
+    chains = [
+        _chain_for(it) for it in open_items if it.get("depends_on")
+    ]
+    chains = [c for c in chains if len(c) > 1]
+    longest_chain = max((len(c) for c in chains), default=1)
+
+    # Resource/file conflicts among open items (shared touches_resources).
+    res_map: dict[str, list[str]] = {}
+    for it in open_items:
+        for res in parse_touches_resources(it.get("touches_resources")):
+            res_map.setdefault(res, []).append(it["id"])
+    conflicts = [
+        {"resource": res, "item_ids": ids}
+        for res, ids in sorted(res_map.items()) if len(ids) > 1
+    ]
+
+    stalls = [
+        {"id": it["id"], "title": it.get("title", ""),
+         "stall_count": it.get("stall_count") or 0}
+        for it in open_items if (it.get("stall_count") or 0) > 0
+    ]
+
+    groups = groups_info.get("groups", [])
+    max_group = max((len(g) for g in groups), default=0)
+    strategy = "parallel" if max_group > 1 else "sequential"
+    summary = (
+        f"{groups_info.get('eligible_count', 0)} eligible item(s) in "
+        f"{groups_info.get('group_count', 0)} group(s) (max {max_group} parallel); "
+        f"longest dependency chain {longest_chain}; {len(conflicts)} resource "
+        f"conflict(s); {len(stalls)} stalled; "
+        f"{len(groups_info.get('blocked', []))} blocked."
+    )
+    return {
+        "version": version,
+        "summary": summary,
+        "recommended_strategy": strategy,
+        "parallelism": {
+            "group_count": groups_info.get("group_count", 0),
+            "eligible_count": groups_info.get("eligible_count", 0),
+            "max_parallel": max_group,
+            "undeclared_count": groups_info.get("undeclared_count", 0),
+            "groups": [
+                [{"id": it["id"], "title": it.get("title", "")} for it in g]
+                for g in groups
+            ],
+        },
+        "dependency_chains": chains,
+        "longest_chain": longest_chain,
+        "file_conflicts": conflicts,
+        "stalls": stalls,
+        "blocked": groups_info.get("blocked", []),
+        "running": groups_info.get("running", []),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Parallel-coordination primitives (Wave 4): findings + messaging + barrier.
+# ---------------------------------------------------------------------------
+
+async def store_finding(
+    db: aiosqlite.Connection,
+    project_id: str,
+    content: str,
+    *,
+    session_id: str | None = None,
+    key: str | None = None,
+    title: str | None = None,
+    task_id: str | None = None,
+) -> dict[str, Any]:
+    """c35370cc — persist a per-task intermediate result to ``session_findings``.
+
+    Parallel reader agents write findings that survive session boundaries; an
+    orchestrator or writer agent reads them back via :func:`get_findings`. ``key``
+    is an optional bucket (e.g. a subsystem name) for scoped retrieval.
+    """
+    fid = _new_id()
+    await db.execute(
+        "INSERT INTO session_findings "
+        "(id, project_id, session_id, key, title, content, task_id) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (fid, project_id, session_id, key, title, content, task_id),
+    )
+    await db.commit()
+    async with db.execute(
+        "SELECT * FROM session_findings WHERE id = ?", (fid,)
+    ) as cur:
+        return _row_to_dict(await cur.fetchone()) or {}
+
+
+async def get_findings(
+    db: aiosqlite.Connection,
+    project_id: str,
+    *,
+    key: str | None = None,
+    session_id: str | None = None,
+    limit: int = 50,
+) -> list[dict[str, Any]]:
+    """c35370cc — read stored findings for a project (newest first), optionally
+    scoped by ``key`` and/or ``session_id``."""
+    sql = "SELECT * FROM session_findings WHERE project_id = ?"
+    params: list[Any] = [project_id]
+    if key is not None:
+        sql += " AND key = ?"
+        params.append(key)
+    if session_id is not None:
+        sql += " AND session_id = ?"
+        params.append(session_id)
+    sql += " ORDER BY created_at DESC, id DESC LIMIT ?"
+    params.append(int(limit))
+    async with db.execute(sql, params) as cur:
+        rows = await cur.fetchall()
+    return [_row_to_dict(r) for r in rows]
+
+
+async def send_message(
+    db: aiosqlite.Connection,
+    project_id: str,
+    to_session_id: str,
+    payload: str,
+    *,
+    from_session_id: str | None = None,
+    kind: str | None = None,
+) -> dict[str, Any]:
+    """d3a3a01d — enqueue an actor-model message to another session."""
+    mid = _new_id()
+    await db.execute(
+        "INSERT INTO session_messages "
+        "(id, project_id, from_session_id, to_session_id, kind, payload) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (mid, project_id, from_session_id, to_session_id, kind, payload),
+    )
+    await db.commit()
+    async with db.execute(
+        "SELECT * FROM session_messages WHERE id = ?", (mid,)
+    ) as cur:
+        return _row_to_dict(await cur.fetchone()) or {}
+
+
+async def receive_messages(
+    db: aiosqlite.Connection,
+    session_id: str,
+    *,
+    mark_read: bool = True,
+    limit: int = 50,
+) -> list[dict[str, Any]]:
+    """d3a3a01d — fetch unread messages addressed to ``session_id`` (oldest
+    first) and, by default, mark them read so the next poll only sees new ones."""
+    async with db.execute(
+        "SELECT * FROM session_messages WHERE to_session_id = ? AND read_at IS NULL "
+        "ORDER BY created_at ASC, id ASC LIMIT ?",
+        (session_id, int(limit)),
+    ) as cur:
+        rows = [_row_to_dict(r) for r in await cur.fetchall()]
+    if mark_read and rows:
+        ids = [r["id"] for r in rows]
+        placeholders = ",".join("?" for _ in ids)
+        await db.execute(
+            f"UPDATE session_messages SET read_at = datetime('now') WHERE id IN ({placeholders})",
+            ids,
+        )
+        await db.commit()
+    return rows
+
+
+async def idle_until_all_done(
+    db: aiosqlite.Connection,
+    session_ids: list[str],
+) -> dict[str, Any]:
+    """d3a3a01d — non-blocking barrier check across sibling sessions.
+
+    Returns ``{all_done, pending, statuses}``. A session counts as done when it
+    is closed/archived (or missing); active/idle sessions are still running. The
+    server can't block, so the caller polls until ``all_done`` is True — the
+    A2A-compatible "wait for X, Y, Z to finish" primitive.
+    """
+    statuses: dict[str, Any] = {}
+    pending: list[str] = []
+    for sid in session_ids or []:
+        async with db.execute(
+            "SELECT status FROM sessions WHERE id = ?", (sid,)
+        ) as cur:
+            row = await cur.fetchone()
+        if row is None:
+            statuses[sid] = "missing"
+            continue
+        status = row["status"] if isinstance(row, dict) else row[0]
+        statuses[sid] = status
+        if status in ("active", "idle"):
+            pending.append(sid)
+    return {"all_done": not pending, "pending": pending, "statuses": statuses}
 
 
 # ---------------------------------------------------------------------------

@@ -243,6 +243,60 @@ def test_resolve_detection_keeps_explicit_enable_without_binary():
 
 
 # ---------------------------------------------------------------------------
+# cc904bfe — stale custom-command override detection ("newer default available")
+# ---------------------------------------------------------------------------
+
+def test_resolve_plugins_flags_stale_extract_override():
+    """A saved extract command matching the OLD default (pre-Serena) is flagged
+    stale_override, with the newer default surfaced for the dashboard badge."""
+    cfg = {"code-extractor": {"command": ["uvx", "mcp-server-code-extractor"]}}
+    ext = {p["slot"]: p for p in tp.resolve_plugins(cfg)}["extract"]
+    assert ext.get("stale_override") is True
+    assert ext["newer_default_command"] == list(tp.SERENA_EXTRACT_COMMAND)
+    assert ext.get("newer_default_label")
+    # We warn, not silently swap — the override still runs.
+    assert ext["command"] == ["uvx", "mcp-server-code-extractor"]
+    # The internal previous_defaults list is not leaked to clients.
+    assert "previous_defaults" not in ext
+
+
+def test_resolve_plugins_no_stale_flag_for_default_or_custom():
+    """The badge does NOT fire for the current default or a genuinely custom command."""
+    ext_default = {p["slot"]: p for p in tp.resolve_plugins(None)}["extract"]
+    assert "stale_override" not in ext_default
+    cfg = {"code-extractor": {"command": ["uvx", "my-own-extractor"]}}
+    ext_custom = {p["slot"]: p for p in tp.resolve_plugins(cfg)}["extract"]
+    assert "stale_override" not in ext_custom
+
+
+# ---------------------------------------------------------------------------
+# 8660d701 — per-machine (hostname-keyed) config resolution
+# ---------------------------------------------------------------------------
+
+def test_parse_plugins_by_host_is_tolerant():
+    assert tp.parse_plugins_by_host(None) == {}
+    assert tp.parse_plugins_by_host("") == {}
+    assert tp.parse_plugins_by_host("not json") == {}
+    assert tp.parse_plugins_by_host("[1, 2]") == {}  # non-dict JSON
+    assert tp.parse_plugins_by_host('{"hostA": {"code-intel": {"enabled": false}}}') == {
+        "hostA": {"code-intel": {"enabled": False}}
+    }
+    assert tp.parse_plugins_by_host({"hostB": {}}) == {"hostB": {}}
+
+
+def test_select_host_config_per_machine_else_default():
+    default = {"code-extractor": {"command": ["x"]}}
+    by_host = '{"hostA": {"powerpoint": {"enabled": true}}}'
+    # hostA has its own config → that wins.
+    assert tp.select_host_config(default, by_host, "hostA") == {"powerpoint": {"enabled": True}}
+    # hostB has none → per-tenant default.
+    assert tp.select_host_config(default, by_host, "hostB") == default
+    # No hostname / no by-host map → default (legacy single-machine behaviour).
+    assert tp.select_host_config(default, by_host, None) == default
+    assert tp.select_host_config(default, None, "hostA") == default
+
+
+# ---------------------------------------------------------------------------
 # resolve_custom_plugins — user-defined LOCAL-ONLY plugins (ce84619d)
 # ---------------------------------------------------------------------------
 

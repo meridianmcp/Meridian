@@ -1,6 +1,9 @@
 // dashboard-sprint.js — sprint/queue renderers extracted from dashboard.js
 // Depends on: dashboard-utils.js (escapeHtml, getPanelState, formatRelativeTime, _PLAN_LABELS)
 
+// 233bae67 — sprint dependency DAG (Cytoscape, guarded/CDN-global).
+import { buildSprintDagElements, mountSprintDag } from "./components/sprintGraph";
+
 // c2fe20c3 — history-signal badges for a sprint item so pending items aren't
 // indistinguishable: a stall counter (↻N), a "retried" tag (claimed before, now
 // back to pending), and a live pulse dot for an in-progress (claimed) item. Pure
@@ -14,7 +17,7 @@ function _ensureSprintPulseStyle() {
   document.head.appendChild(st);
 }
 
-function _sprintHistoryBadges(it) {
+function _sprintHistoryBadges(it: any) {
   if (!it) return '';
   _ensureSprintPulseStyle();
   let html = '';
@@ -33,9 +36,9 @@ function _sprintHistoryBadges(it) {
 }
 if (typeof window !== 'undefined') window._sprintHistoryBadges = _sprintHistoryBadges;
 
-export function _renderPlanBadge(me) {
+export function _renderPlanBadge(me: any) {
 
-  const planColors = { free: '#3b82f6', trial: '#059669', standard: '#3b82f6', pro: '#7c3aed', admin: '#9ca3af' };
+  const planColors: Record<string, string> = { free: '#3b82f6', trial: '#059669', standard: '#3b82f6', pro: '#7c3aed', admin: '#9ca3af' };
 
   const planLabels = _PLAN_LABELS;
 
@@ -63,7 +66,7 @@ export function _renderPlanBadge(me) {
 
     badge.textContent = badgeLabel;
 
-    verEl.parentNode.insertBefore(badge, verEl.nextSibling);
+    verEl.parentNode!.insertBefore(badge, verEl.nextSibling);
 
   }
 
@@ -99,7 +102,7 @@ export function _renderPlanBadge(me) {
 
       link.style = 'margin-left:6px;padding:2px 7px;border-radius:10px;font-size:10px;font-weight:600;letter-spacing:0.03em;background:transparent;color:var(--accent);border:1px solid var(--accent)55;vertical-align:middle;text-decoration:none;cursor:pointer';
 
-      planBadge.parentNode.insertBefore(link, planBadge.nextSibling);
+      planBadge.parentNode!.insertBefore(link, planBadge.nextSibling);
 
     }
 
@@ -220,7 +223,7 @@ export function _renderPlanBadge(me) {
 
 }
 
-export function renderSprintProgress(projectId, items) {
+export function renderSprintProgress(projectId: string, items: any) {
 
   /** Full grouped sprint board — replaces the old plain progress bar. */
 
@@ -230,15 +233,15 @@ export function renderSprintProgress(projectId, items) {
 
 
 
-  const statusIcon = s => ({
+  const statusIcon = (s: any) => (({
 
     pending: '○', todo: '○', in_progress: '◑',
 
     done: '●', failed: '✕', skipped: '—', pushed: '→', indeterminate: '⚠'
 
-  }[s] || '?');
+  } as Record<string, string>)[s] || '?');
 
-  const statusColor = s => ({
+  const statusColor = (s: any) => (({
 
     pending: 'var(--muted)', todo: 'var(--muted)',
 
@@ -254,7 +257,7 @@ export function renderSprintProgress(projectId, items) {
 
     indeterminate: '#fbbf24'
 
-  }[s] || 'var(--muted)');
+  } as Record<string, string>)[s] || 'var(--muted)');
 
   const activeSet = new Set(['pending', 'todo', 'in_progress']);
 
@@ -278,7 +281,7 @@ export function renderSprintProgress(projectId, items) {
 
       </div>`;
 
-    root.querySelector('.sprint-add-btn').onclick =
+    root.querySelector('.sprint-add-btn')!.onclick =
 
       () => addSprintItemFromInput(projectId);
 
@@ -300,15 +303,15 @@ export function renderSprintProgress(projectId, items) {
 
   // Include active items + done/skipped items from versions that still have active peers.
 
-  const activeVersions = new Set(items.filter(it => activeStatuses.has(it.status)).map(it => it.version));
+  const activeVersions = new Set(items.filter((it: any) => activeStatuses.has(it.status)).map((it: any) => it.version));
 
-  let displayItems = items.filter(it =>
+  let displayItems = items.filter((it: any) =>
 
     activeStatuses.has(it.status) || (it.version && activeVersions.has(it.version))
 
   );
 
-  if (displayItems.length === 0) displayItems = items.filter(it => activeStatuses.has(it.status));
+  if (displayItems.length === 0) displayItems = items.filter((it: any) => activeStatuses.has(it.status));
 
 
 
@@ -330,7 +333,7 @@ export function renderSprintProgress(projectId, items) {
 
       </div>`;
 
-    root.querySelector('.sprint-add-btn').onclick = () => addSprintItemFromInput(projectId);
+    root.querySelector('.sprint-add-btn')!.onclick = () => addSprintItemFromInput(projectId);
 
     wireSprintAddEnter(projectId, root);
 
@@ -342,7 +345,7 @@ export function renderSprintProgress(projectId, items) {
 
   // Indeterminate items — amber "⚠ Needs attention" section above the queue.
 
-  const indeterminateItems = items.filter(it => it.status === 'indeterminate');
+  const indeterminateItems = items.filter((it: any) => it.status === 'indeterminate');
 
   let html = '';
 
@@ -352,7 +355,7 @@ export function renderSprintProgress(projectId, items) {
 
       <div style="color:#fbbf24;font-weight:600;margin-bottom:6px;font-size:12px">⚠ Needs attention (${indeterminateItems.length})</div>`;
 
-    html += indeterminateItems.map(it => `
+    html += indeterminateItems.map((it: any) => `
 
       <div class="sprint-item-row" data-item="${escapeHtml(it.id)}" style="background:transparent;border-bottom:1px solid #5a3b00;padding:4px 0">
 
@@ -390,7 +393,7 @@ export function renderSprintProgress(projectId, items) {
 
   // Human-assigned items — "Your tasks" section above the pending queue.
 
-  const humanItems = items.filter(it => it.milestone_type === 'human' && activeSet.has(it.status));
+  const humanItems = items.filter((it: any) => it.milestone_type === 'human' && activeSet.has(it.status));
 
   if (humanItems.length > 0) {
 
@@ -398,7 +401,7 @@ export function renderSprintProgress(projectId, items) {
 
       <div style="color:var(--accent);font-weight:600;margin-bottom:6px;font-size:12px">👤 Your tasks (${humanItems.length})</div>`;
 
-    html += humanItems.map(it => `
+    html += humanItems.map((it: any) => `
 
       <div class="sprint-item-row" data-item="${escapeHtml(it.id)}" style="background:transparent;border-bottom:1px solid rgba(59,130,246,0.2);padding:4px 0">
 
@@ -426,7 +429,7 @@ export function renderSprintProgress(projectId, items) {
 
   const allChildrenOf = new Map();
 
-  items.forEach(it => {
+  items.forEach((it: any) => {
 
     if (it.parent_id) {
 
@@ -442,7 +445,7 @@ export function renderSprintProgress(projectId, items) {
 
   const displayedParentIds = new Set(
 
-    displayItems.map(it => it.id).filter(id => allChildrenOf.has(id))
+    displayItems.map((it: any) => it.id).filter((id: any) => allChildrenOf.has(id))
 
   );
 
@@ -450,7 +453,7 @@ export function renderSprintProgress(projectId, items) {
 
   const displayChildrenOf = new Map();
 
-  displayItems.forEach(it => {
+  displayItems.forEach((it: any) => {
 
     if (it.parent_id && displayedParentIds.has(it.parent_id)) {
 
@@ -462,7 +465,7 @@ export function renderSprintProgress(projectId, items) {
 
   });
 
-  const renderItem = (it, isChild) => {
+  const renderItem = (it: any, isChild: any) => {
 
     const icon = statusIcon(it.status);
 
@@ -482,7 +485,7 @@ export function renderSprintProgress(projectId, items) {
 
     const _resources = (() => { try { return JSON.parse(it.touches_resources || '[]'); } catch { return []; } })();
     const resourcesHtml = _resources.length > 0
-      ? `<div class="sprint-item-resources" style="display:flex;flex-wrap:wrap;gap:3px;margin-top:3px">${_resources.map(r => {
+      ? `<div class="sprint-item-resources" style="display:flex;flex-wrap:wrap;gap:3px;margin-top:3px">${_resources.map((r: any) => {
           const chipColor = r.startsWith('note:') ? 'var(--accent-blue,#3b82f6)' : r.startsWith('decision:') ? '#a78bfa' : 'var(--muted)';
           return `<span class="resource-chip" onclick="resourceChipClick('${escapeHtml(projectId)}','${escapeHtml(r)}')" style="font-size:9px;padding:1px 5px;border-radius:3px;cursor:pointer;background:var(--surface-2);border:1px solid var(--border);color:${chipColor};font-family:var(--font-mono)">${escapeHtml(r)}</span>`;
         }).join('')}</div>`
@@ -537,7 +540,7 @@ export function renderSprintProgress(projectId, items) {
 
     const allKids = allChildrenOf.get(it.id) || [];
 
-    const kidDone = allKids.filter(c => c.status === 'done').length;
+    const kidDone = allKids.filter((c: any) => c.status === 'done').length;
 
     const childBadge = allKids.length > 0
 
@@ -599,7 +602,7 @@ export function renderSprintProgress(projectId, items) {
 
            <div style="padding:2px 0">
 
-             ${dispKids.map(c => renderItem(c, true)).join('')}
+             ${dispKids.map((c: any) => renderItem(c, true)).join('')}
 
            </div>
 
@@ -613,11 +616,11 @@ export function renderSprintProgress(projectId, items) {
 
   // Group by version (then item_group within version).
 
-  const versionOrder = [...new Set(displayItems.map(it => it.version || ''))];
+  const versionOrder = [...new Set(displayItems.map((it: any) => it.version || ''))];
 
   const groups = new Map();
 
-  displayItems.forEach(it => {
+  displayItems.forEach((it: any) => {
 
     const g = it.version || '';
 
@@ -637,9 +640,9 @@ export function renderSprintProgress(projectId, items) {
 
     // Render only top-level items; children of displayed parents are rendered under their parent.
 
-    const topLevel = groupItems.filter(it => !it.parent_id || !displayedParentIds.has(it.parent_id));
+    const topLevel = groupItems.filter((it: any) => !it.parent_id || !displayedParentIds.has(it.parent_id));
 
-    html += topLevel.map(it => renderItem(it, false)).join('');
+    html += topLevel.map((it: any) => renderItem(it, false)).join('');
 
   }
 
@@ -649,7 +652,7 @@ export function renderSprintProgress(projectId, items) {
 
   const total = displayItems.length;
 
-  const done = displayItems.filter(i => i.status === 'done').length;
+  const done = displayItems.filter((i: any) => i.status === 'done').length;
 
   const pct = total > 0 ? Math.round((done / total) * 100) : 0;
 
@@ -687,7 +690,7 @@ export function renderSprintProgress(projectId, items) {
 
   // Backburner section — pushed/post-launch items collapsed by default
 
-  const pushedItems = items.filter(it => it.status === 'pushed');
+  const pushedItems = items.filter((it: any) => it.status === 'pushed');
 
   if (pushedItems.length > 0) {
 
@@ -701,7 +704,7 @@ export function renderSprintProgress(projectId, items) {
 
       <div style="padding:4px 10px 8px">
 
-        ${pushedItems.map(it => `<div class="sprint-item-row" data-item="${escapeHtml(it.id)}" data-title="${escapeHtml(it.title)}" data-version="${escapeHtml(it.version || '')}" style="display:flex;align-items:center;gap:6px;padding:3px 0;border-top:1px solid var(--border)">
+        ${pushedItems.map((it: any) => `<div class="sprint-item-row" data-item="${escapeHtml(it.id)}" data-title="${escapeHtml(it.title)}" data-version="${escapeHtml(it.version || '')}" style="display:flex;align-items:center;gap:6px;padding:3px 0;border-top:1px solid var(--border)">
 
           <span style="color:var(--muted);font-size:10px;flex-shrink:0">→</span>
 
@@ -725,15 +728,40 @@ export function renderSprintProgress(projectId, items) {
 
   root.innerHTML = html;
 
-  root.querySelector('.sprint-add-btn').onclick =
+  root.querySelector('.sprint-add-btn')!.onclick =
 
     () => addSprintItemFromInput(projectId);
 
   wireSprintAddEnter(projectId, root);
 
+  // 233bae67 — collapsible dependency DAG below the board. Lazy-mounts a
+  // Cytoscape graph (depends_on + file-conflict edges, status colors, critical
+  // path) on first open, when window.cytoscape is present. Best-effort: any
+  // failure leaves the board untouched.
+  try {
+    if (Array.isArray(items) && items.length) {
+      const dag = document.createElement('details');
+      dag.className = 'sprint-dag-wrap';
+      dag.style.marginTop = '8px';
+      dag.innerHTML =
+        '<summary style="cursor:pointer;font-size:10px;color:var(--muted)">Dependency graph</summary>' +
+        `<div id="sprint-dag-${escapeHtml(projectId)}" class="sprint-dag" ` +
+        'style="width:100%;height:320px;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;margin-top:4px"></div>';
+      root.appendChild(dag);
+      dag.addEventListener('toggle', () => {
+        if (!dag.open) return;
+        const host = dag.querySelector('.sprint-dag') as HTMLElement | null;
+        if (host && !host.dataset.mounted) {
+          const cy = mountSprintDag(host, buildSprintDagElements(items));
+          if (cy) host.dataset.mounted = '1';
+        }
+      });
+    }
+  } catch (e) { /* dependency graph is best-effort */ }
+
 }
 
-export function renderQueue(projectId, sprintItems = []) {
+export function renderQueue(projectId: string, sprintItems: any = []) {
 
   /** Render the 5-group sprint board for the Queue tab.
 
@@ -758,11 +786,11 @@ export function renderQueue(projectId, sprintItems = []) {
   const doneLimit = panel.queueDoneLimit || QUEUE_DONE_PAGE_SIZE;
   const totalDoneCount = panel.queueTotalDoneCount != null
     ? panel.queueTotalDoneCount
-    : (sprintItems || []).filter(it => it.status === 'done').length;
+    : (sprintItems || []).filter((it: any) => it.status === 'done').length;
 
   const items = (sprintItems || []).slice();
 
-  const sortByNewest = (a, b) =>
+  const sortByNewest = (a: any, b: any) =>
 
     String(b.completed_at || b.added_at || '').localeCompare(String(a.completed_at || a.added_at || ''));
 
@@ -770,31 +798,31 @@ export function renderQueue(projectId, sprintItems = []) {
 
   const backburner = items
 
-    .filter(it => ['pushed', 'skipped'].includes(it.status))
+    .filter((it: any) => ['pushed', 'skipped'].includes(it.status))
 
     .sort(sortByNewest);
 
   const pending = items
 
-    .filter(it => it.status === 'pending' || it.status === 'todo')
+    .filter((it: any) => it.status === 'pending' || it.status === 'todo')
 
     .sort(sortByNewest);
 
   const inProgress = items
 
-    .filter(it => it.status === 'in_progress')
+    .filter((it: any) => it.status === 'in_progress')
 
     .sort(sortByNewest);
 
   const failed = items
 
-    .filter(it => it.status === 'failed')
+    .filter((it: any) => it.status === 'failed')
 
     .sort(sortByNewest);
 
   const doneAll = items
 
-    .filter(it => it.status === 'done')
+    .filter((it: any) => it.status === 'done')
 
     .sort(sortByNewest);
 
@@ -802,7 +830,7 @@ export function renderQueue(projectId, sprintItems = []) {
 
 
 
-  const renderItem = (it) => {
+  const renderItem = (it: any) => {
 
     const version = it.version ? `<span style="font-size:9px;color:var(--accent);background:var(--accent)1a;border:1px solid var(--accent)33;border-radius:999px;padding:1px 6px;font-family:var(--font-mono)">${escapeHtml(it.version)}</span>` : '';
 
@@ -891,7 +919,7 @@ export function renderQueue(projectId, sprintItems = []) {
 
 
 
-  const section = (icon, title, rows, emptyMsg, opts = {}) => {
+  const section = (icon: any, title: any, rows: any, emptyMsg: any, opts: any = {}) => {
 
     const key = opts.key || '';
 
@@ -939,7 +967,7 @@ export function renderQueue(projectId, sprintItems = []) {
 
     const collapsed = sectionState.backburner ?? true;
 
-    const groups = {};
+    const groups: Record<string, any[]> = {};
 
     for (const it of backburner) {
 

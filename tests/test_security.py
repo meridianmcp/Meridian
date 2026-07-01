@@ -272,6 +272,76 @@ def test_role_enforcement_cross_workspace_http_and_mcp(monkeypatch, tmp_path):
         assert "cannot perform" in r.text
 
 
+def test_project_scope_enforcement_http_and_mcp(monkeypatch, tmp_path):
+    """95499c3e / decision 6fe5210c — Option A airtight per-request enforcement.
+
+    A project-scoped member is 403'd on any project outside their scope — even by
+    direct ID (403, not 404, so existence isn't leaked) — on both the HTTP routes
+    and the MCP dispatch. Workspace-wide members are unaffected.
+    """
+    import asyncio
+    from datetime import datetime, timezone
+    from meridian import db as db_module
+
+    with _boot_hosted_role_client(monkeypatch, tmp_path) as c:
+        db = c.app.state.db
+
+        async def _setup():
+            owner = await db_module.upsert_tenant(db, "ps-owner@example.com")
+            # admin plan → cross-workspace switch resolves to the auth DB in tests.
+            await db.execute("UPDATE tenants SET plan='admin' WHERE id=?", (owner["id"],))
+            scoped = await db_module.upsert_tenant(db, "ps-scoped@example.com")
+            wide = await db_module.upsert_tenant(db, "ps-wide@example.com")
+            raw_scoped, _ = await db_module.create_api_token(db, scoped["id"])
+            raw_wide, _ = await db_module.create_api_token(db, wide["id"])
+            proj_a = await db_module.create_project(db, "ps-proj-a")
+            proj_b = await db_module.create_project(db, "ps-proj-b")
+            now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+            # Scoped member: invited to owner's workspace, scoped to proj_a only.
+            await db.execute(
+                "INSERT INTO workspace_members "
+                "(id, tenant_id, email, role, github_access, joined_at, project_id) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                ("ps-wm-scoped", owner["id"], "ps-scoped@example.com", "member", "none", now, proj_a["id"]),
+            )
+            # Workspace-wide member: project_id NULL → sees everything.
+            await db.execute(
+                "INSERT INTO workspace_members "
+                "(id, tenant_id, email, role, github_access, joined_at, project_id) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                ("ps-wm-wide", owner["id"], "ps-wide@example.com", "member", "none", now, None),
+            )
+            await db.commit()
+            return owner["id"], raw_scoped, raw_wide, proj_a["id"], proj_b["id"]
+
+        owner_id, tok_scoped, tok_wide, pid_a, pid_b = asyncio.run(_setup())
+        h_scoped = {"Authorization": f"Bearer {tok_scoped}", "X-Workspace-Tenant-Id": owner_id}
+        h_wide = {"Authorization": f"Bearer {tok_wide}", "X-Workspace-Tenant-Id": owner_id}
+
+        # HTTP: scoped member CAN reach their own project by direct ID.
+        assert c.get(f"/projects/{pid_a}/tasks", headers=h_scoped).status_code == 200
+        # HTTP: scoped member CANNOT reach a sibling project — 403, NOT 404.
+        r = c.get(f"/projects/{pid_b}/tasks", headers=h_scoped)
+        assert r.status_code == 403, r.text
+        assert "scope" in r.text.lower()
+        # HTTP: workspace-wide member reaches both projects.
+        assert c.get(f"/projects/{pid_a}/tasks", headers=h_wide).status_code == 200
+        assert c.get(f"/projects/{pid_b}/tasks", headers=h_wide).status_code == 200
+
+        # MCP dispatch enforcement matches the HTTP enforcement.
+        def _mcp(tok, args):
+            return c.post(
+                "/mcp",
+                headers={"Authorization": f"Bearer {tok}", "X-Workspace-Tenant-Id": owner_id},
+                json={"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                      "params": {"name": "get_tasks", "arguments": args}},
+            )
+        assert "outside your access scope" not in _mcp(tok_scoped, {"project_id": pid_a}).text
+        assert "outside your access scope" in _mcp(tok_scoped, {"project_id": pid_b}).text
+        # Workspace-wide member: MCP allowed on the sibling project too.
+        assert "outside your access scope" not in _mcp(tok_wide, {"project_id": pid_b}).text
+
+
 # ---------------------------------------------------------------------------
 # fdf1120f — magic-link verify renders HTML on failure, never a blank JSON page
 # ---------------------------------------------------------------------------

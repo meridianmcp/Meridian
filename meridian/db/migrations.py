@@ -12,7 +12,7 @@ from typing import Any
 
 import aiosqlite
 
-__all__ = ['_migrate_task_log_backlog_future', '_migrate_task_log_backburner', '_migrate_task_log_hitl', '_column_exists', '_migrate_add_column_if_missing', '_migrate_human_identity', '_migrate_v24_task_tree_and_framework', '_migrate_v25_feedback_and_notifications', '_migrate_v33_hitl_kind_payload', '_migrate_v34_hitl_auto_answer', '_migrate_v34_workspace_settings', '_migrate_dunning_fields', '_migrate_overage_fields', '_migrate_v26_client_type', '_migrate_ntfy_notifications', '_migrate_notify_email', '_migrate_github_integration', '_migrate_sprint_item_dependencies', '_migrate_v09_notes_and_magic_links', '_migrate_v24_pinned_decisions_and_hitl', '_migrate_goal_field_timestamps', '_migrate_task_claims', '_migrate_task_sprint_link', '_migrate_session_type', '_migrate_session_summary', '_migrate_parent_session_id', '_migrate_decisions', '_migrate_goal_mode', '_migrate_worker_pid', '_migrate_rewind_token', '_migrate_project_settings', '_migrate_neon_pool_projects_free_tier', '_migrate_tenants_free_plan', '_migrate_decisions_free_category', '_migrate_sessions_archived', '_migrate_goal_hierarchy', '_migrate_sprint_items_v2', '_migrate_drop_chat_tables', '_migrate_hosted_tables', '_migrate_session_notes', '_migrate_milestone_type', '_migrate_executor_runs', '_migrate_file_locks', '_migrate_file_symbol_claims', '_migrate_blog_posts', '_migrate_workspace_layer', '_migrate_checkpoint_data', 'init_hosted_tables', '_migrate_sprint_item_tree', '_migrate_api_token_type', '_migrate_api_tokens_expires_at', '_migrate_github_to_projects', '_migrate_touches_files', '_migrate_touches_resources', '_migrate_resource_locks', '_migrate_sprint_item_stall_count', '_migrate_oauth_codes_table', '_migrate_device_codes_table', '_migrate_sprint_items_indeterminate', '_migrate_sprint_items_provisional_complete', '_migrate_workspace_members_rbac', '_migrate_workspace_members_project_scope', '_migrate_project_icon', '_internal_emails', '_migrate_tenants_is_internal', '_migrate_admin_plan', '_migrate_active_worktrees', '_migrate_workspace_tenant_isolation', '_migrate_workspace_sprint_board', '_migrate_registered_hostnames', '_migrate_queued_session', '_migrate_parallel_safety', '_migrate_changelog_entries', '_migrate_agent_instructions', '_migrate_note_kind', '_migrate_tunnel_active', '_backfill_agent_instructions', '_migrate_code_intel', '_migrate_tunnel_plugins', '_migrate_notes_priority', '_migrate_task_log_kind', '_migrate_note_slug', '_slugify_note', '_migrate_oauth_refresh_tokens', '_migrate_decision_priority_edit_log', '_migrate_code_anchored_notes', '_migrate_note_source', '_migrate_session_sprint_version', '_migrate_project_execution_mode', '_migrate_decision_code_anchor', '_migrate_session_graph_snapshots', '_migrate_agent_tasks_table', '_migrate_sprint_item_owner', '_migrate_session_note_kind', '_migrate_handoffs_table', '_migrate_decision_assumption', '_migrate_github_connections']
+__all__ = ['_migrate_task_log_backlog_future', '_migrate_task_log_backburner', '_migrate_task_log_hitl', '_column_exists', '_migrate_add_column_if_missing', '_migrate_human_identity', '_migrate_v24_task_tree_and_framework', '_migrate_v25_feedback_and_notifications', '_migrate_v33_hitl_kind_payload', '_migrate_v34_hitl_auto_answer', '_migrate_v34_workspace_settings', '_migrate_dunning_fields', '_migrate_overage_fields', '_migrate_v26_client_type', '_migrate_ntfy_notifications', '_migrate_notify_email', '_migrate_github_integration', '_migrate_sprint_item_dependencies', '_migrate_v09_notes_and_magic_links', '_migrate_v24_pinned_decisions_and_hitl', '_migrate_goal_field_timestamps', '_migrate_task_claims', '_migrate_task_sprint_link', '_migrate_session_type', '_migrate_session_summary', '_migrate_parent_session_id', '_migrate_decisions', '_migrate_goal_mode', '_migrate_worker_pid', '_migrate_rewind_token', '_migrate_project_settings', '_migrate_neon_pool_projects_free_tier', '_migrate_tenants_free_plan', '_migrate_decisions_free_category', '_migrate_sessions_archived', '_migrate_goal_hierarchy', '_migrate_sprint_items_v2', '_migrate_drop_chat_tables', '_migrate_hosted_tables', '_migrate_session_notes', '_migrate_milestone_type', '_migrate_executor_runs', '_migrate_file_locks', '_migrate_file_symbol_claims', '_migrate_blog_posts', '_migrate_workspace_layer', '_migrate_checkpoint_data', 'init_hosted_tables', '_migrate_sprint_item_tree', '_migrate_api_token_type', '_migrate_api_tokens_expires_at', '_migrate_github_to_projects', '_migrate_touches_files', '_migrate_touches_resources', '_migrate_resource_locks', '_migrate_sprint_item_stall_count', '_migrate_oauth_codes_table', '_migrate_device_codes_table', '_migrate_sprint_items_indeterminate', '_migrate_sprint_items_provisional_complete', '_migrate_workspace_members_rbac', '_migrate_workspace_members_project_scope', '_migrate_project_icon', '_internal_emails', '_migrate_tenants_is_internal', '_migrate_admin_plan', '_migrate_active_worktrees', '_migrate_workspace_tenant_isolation', '_migrate_workspace_sprint_board', '_migrate_registered_hostnames', '_migrate_queued_session', '_migrate_parallel_safety', '_migrate_changelog_entries', '_migrate_agent_instructions', '_migrate_note_kind', '_migrate_tunnel_active', '_backfill_agent_instructions', '_migrate_code_intel', '_migrate_tunnel_plugins', '_migrate_tunnel_plugins_by_host', '_migrate_notes_priority', '_migrate_task_log_kind', '_migrate_note_slug', '_slugify_note', '_migrate_oauth_refresh_tokens', '_migrate_decision_priority_edit_log', '_migrate_code_anchored_notes', '_migrate_note_source', '_migrate_session_sprint_version', '_migrate_project_execution_mode', '_migrate_decision_code_anchor', '_migrate_session_graph_snapshots', '_migrate_agent_tasks_table', '_migrate_sprint_item_owner', '_migrate_session_note_kind', '_migrate_handoffs_table', '_migrate_decision_assumption', '_migrate_github_connections', '_migrate_sprint_item_quality_gates', '_migrate_parallel_primitives']
 
 async def _migrate_task_log_backlog_future(db: aiosqlite.Connection) -> None:
     """Rebuild ``task_log`` to add 'backlog' and 'future' statuses (v1.9.x).
@@ -1687,6 +1687,16 @@ async def _migrate_tunnel_plugins(db: aiosqlite.Connection) -> None:
     await _migrate_add_column_if_missing(db, "tenants", "tunnel_plugins", "TEXT")
 
 
+async def _migrate_tunnel_plugins_by_host(db: aiosqlite.Connection) -> None:
+    """8660d701 — tenants.tunnel_plugins_by_host: per-machine tunnel plugin config,
+    JSON ``{hostname: <overrides>}``. Each machine running ``meridian --tunnel`` has
+    different software installed, so config is keyed by (tenant_id, hostname). The
+    legacy ``tenants.tunnel_plugins`` stays the default for any host without a
+    per-host entry. NULL → no per-host overrides (every host uses the default).
+    Idempotent."""
+    await _migrate_add_column_if_missing(db, "tenants", "tunnel_plugins_by_host", "TEXT")
+
+
 async def _migrate_notes_priority(db: aiosqlite.Connection) -> None:
     """Sprint-4 — project_notes.priority: high/normal/low ranking for generate_handoff
     and get_session_brief planner role. High-priority notes are surfaced first.
@@ -1906,6 +1916,94 @@ async def _migrate_sprint_item_owner(db: aiosqlite.Connection) -> None:
     await db.execute(
         "CREATE INDEX IF NOT EXISTS idx_agent_tasks_agent "
         "ON agent_tasks(agent_id, status)"
+    )
+    await db.commit()
+
+
+async def _migrate_sprint_item_quality_gates(db: aiosqlite.Connection) -> None:
+    """5823db0b — quality gates + actor attribution on sprint_items.
+
+    Two additive, nullable columns (existing rows unaffected, idempotent):
+    - ``required_notes`` (INTEGER DEFAULT 0): when set, complete_sprint_item is
+      blocked until the item has evidence (existing notes, a linked task, or a
+      ``notes`` argument on the completing call).
+    - ``actor`` (TEXT): the executor id/name that last claimed or completed the
+      item, so a parallel board records *who* did each piece of work.
+
+    Borrowed from task-orchestrator (jpicklyk): a note gate the server enforces,
+    plus actor attribution on every state transition.
+    """
+    await _migrate_add_column_if_missing(
+        db, "sprint_items", "required_notes", "INTEGER DEFAULT 0"
+    )
+    await _migrate_add_column_if_missing(db, "sprint_items", "actor", "TEXT")
+    await db.commit()
+
+
+async def _migrate_parallel_primitives(db: aiosqlite.Connection) -> None:
+    """Wave-4 parallel-coordination primitives (ffa03655, c35370cc, d3a3a01d).
+
+    Three additive tables (CREATE ... IF NOT EXISTS — idempotent):
+    - session_findings — materialized per-task intermediate results that survive
+      session boundaries (parallel readers write, orchestrator/writers read).
+    - session_messages — actor-model messages between sessions (send/receive).
+    - file_read_claims — shared read claims so many reader sessions coexist on a
+      file without the exclusive file_locks contention (writes stay exclusive).
+    Mirrored in pg_adapter._migrate_pg_parallel_primitives.
+    """
+    await db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS session_findings (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL,
+            session_id TEXT,
+            key TEXT,
+            title TEXT,
+            content TEXT NOT NULL,
+            task_id TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )
+        """
+    )
+    await db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_findings_project "
+        "ON session_findings(project_id, key)"
+    )
+    await db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS session_messages (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL,
+            from_session_id TEXT,
+            to_session_id TEXT NOT NULL,
+            kind TEXT,
+            payload TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            read_at TEXT
+        )
+        """
+    )
+    await db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_messages_to "
+        "ON session_messages(to_session_id, read_at)"
+    )
+    await db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS file_read_claims (
+            id TEXT PRIMARY KEY,
+            file_path TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            claimed_at TEXT NOT NULL DEFAULT (datetime('now')),
+            expires_at TEXT NOT NULL,
+            UNIQUE(file_path, session_id)
+        )
+        """
+    )
+    await db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_read_claims_file ON file_read_claims(file_path)"
+    )
+    await db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_read_claims_expires ON file_read_claims(expires_at)"
     )
     await db.commit()
 

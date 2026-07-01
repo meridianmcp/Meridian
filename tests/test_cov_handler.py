@@ -1021,6 +1021,197 @@ def test_dispatch_complete_sprint_item_not_found_raises():
         _run(db.close())
 
 
+def test_dispatch_sprint_item_quality_gates_and_actor():
+    """5823db0b — required_notes blocks completion until evidence exists; claim
+    and complete record the actor."""
+    db = _make_db()
+    try:
+        proj = _run(mh._dispatch_mcp_tool("create_project", {"name": "qg"}, db, "/tmp"))
+        pid = proj["id"]
+        item = _run(mh._dispatch_mcp_tool(
+            "add_sprint_item",
+            {"project_id": pid, "title": "gated work", "version": "v1"}, db, "/tmp"))
+        iid = item["id"]
+        # Flag the item as requiring evidence.
+        _run(mh._dispatch_mcp_tool(
+            "update_sprint_item",
+            {"project_id": pid, "item_id": iid, "required_notes": True}, db, "/tmp"))
+        # Claim with an actor — recorded on the item.
+        claimed = _run(mh._dispatch_mcp_tool(
+            "claim_sprint_item",
+            {"project_id": pid, "item_id": iid, "actor": "agent-A"}, db, "/tmp"))
+        assert claimed["actor"] == "agent-A"
+        # Completing without evidence is refused by the gate.
+        blocked = _run(mh._dispatch_mcp_tool(
+            "complete_sprint_item",
+            {"project_id": pid, "item_id": iid, "actor": "agent-A"}, db, "/tmp"))
+        assert blocked["error"] == "EVIDENCE_REQUIRED"
+        # Completing with evidence notes succeeds and records actor + notes.
+        done = _run(mh._dispatch_mcp_tool(
+            "complete_sprint_item",
+            {"project_id": pid, "item_id": iid, "actor": "agent-A",
+             "notes": "shipped X; tests green"}, db, "/tmp"))
+        assert done["status"] == "done"
+        assert done["actor"] == "agent-A"
+        assert "shipped X" in (done["notes"] or "")
+    finally:
+        _run(db.close())
+
+
+def test_dispatch_analyze_sprint_synthesizes_brief():
+    """e77f09d1 — analyze_sprint reports parallelism, dependency chains, and
+    resource conflicts in one structured brief."""
+    db = _make_db()
+    try:
+        proj = _run(mh._dispatch_mcp_tool("create_project", {"name": "as"}, db, "/tmp"))
+        pid = proj["id"]
+        a = _run(mh._dispatch_mcp_tool("add_sprint_item",
+            {"project_id": pid, "title": "provision cache", "version": "v1",
+             "touches_resources": ["file:server.py"]}, db, "/tmp"))
+        _run(mh._dispatch_mcp_tool("add_sprint_item",
+            {"project_id": pid, "title": "tune indexer", "version": "v1",
+             "touches_resources": ["file:server.py"]}, db, "/tmp"))
+        _run(mh._dispatch_mcp_tool("add_sprint_item",
+            {"project_id": pid, "title": "wire billing", "version": "v1",
+             "touches_resources": ["file:db.py"], "depends_on": a["id"]}, db, "/tmp"))
+        brief = _run(mh._dispatch_mcp_tool("analyze_sprint",
+            {"project_id": pid, "version": "v1"}, db, "/tmp"))
+        assert "summary" in brief
+        assert brief["recommended_strategy"] in ("parallel", "sequential")
+        # The two file:server.py items conflict — reported explicitly.
+        conflict_resources = [c["resource"] for c in brief["file_conflicts"]]
+        assert "file:server.py" in conflict_resources
+        # "wire billing" depends_on "provision cache" — a chain of length >= 2.
+        assert brief["longest_chain"] >= 2
+        assert brief["parallelism"]["eligible_count"] >= 2
+    finally:
+        _run(db.close())
+
+
+def test_generate_default_session_name_from_pending_item():
+    """599d0097 — an unnamed session is named from the first pending item title
+    + timestamp, and start_session works with no session_name."""
+    import meridian.db as db_module
+    db = _make_db()
+    try:
+        proj = _run(mh._dispatch_mcp_tool("create_project", {"name": "dn"}, db, "/tmp"))
+        pid = proj["id"]
+        _run(mh._dispatch_mcp_tool("add_sprint_item",
+            {"project_id": pid, "title": "Wire Billing OAuth", "version": "v1"}, db, "/tmp"))
+        name = _run(db_module.generate_default_session_name(db, pid))
+        assert name.startswith("wire-billing-oauth-")
+        # start_session with NO session_name succeeds and registers a named session.
+        res = _run(mh._dispatch_mcp_tool("start_session", {"project_id": pid}, db, "/tmp"))
+        sid = res["session_id"]
+        sessions = _run(db_module.get_sessions(db, pid, active_only=False))
+        sess = next(s for s in sessions if s["id"] == sid)
+        assert sess["name"] and "wire-billing-oauth" in sess["name"]
+    finally:
+        _run(db.close())
+
+
+def test_generate_default_session_name_empty_board():
+    """599d0097 — empty board falls back to session-<timestamp>."""
+    import meridian.db as db_module
+    db = _make_db()
+    try:
+        proj = _run(mh._dispatch_mcp_tool("create_project", {"name": "eb"}, db, "/tmp"))
+        name = _run(db_module.generate_default_session_name(db, proj["id"]))
+        assert name.startswith("session-")
+    finally:
+        _run(db.close())
+
+
+def test_dispatch_complete_sprint_item_no_gate_when_not_flagged():
+    """5823db0b — items without required_notes complete freely (no regression)."""
+    db = _make_db()
+    try:
+        proj = _run(mh._dispatch_mcp_tool("create_project", {"name": "ng"}, db, "/tmp"))
+        pid = proj["id"]
+        item = _run(mh._dispatch_mcp_tool(
+            "add_sprint_item",
+            {"project_id": pid, "title": "free work", "version": "v1"}, db, "/tmp"))
+        done = _run(mh._dispatch_mcp_tool(
+            "complete_sprint_item",
+            {"project_id": pid, "item_id": item["id"]}, db, "/tmp"))
+        assert done["status"] == "done"
+    finally:
+        _run(db.close())
+
+
+def test_read_write_claim_distinction():
+    """ffa03655 — shared read claims coexist; write is exclusive and waits for readers."""
+    import meridian.db as db_module
+    db = _make_db()
+    try:
+        proj = _run(db_module.create_project(db, "rw"))
+        pid = proj["id"]
+        s1 = _run(db_module.register_session(db, pid, "reader-1"))
+        s2 = _run(db_module.register_session(db, pid, "reader-2"))
+        s3 = _run(db_module.register_session(db, pid, "writer"))
+        r1 = _run(db_module.claim_file(db, "x.py", s1["id"], mode="read"))
+        r2 = _run(db_module.claim_file(db, "x.py", s2["id"], mode="read"))
+        assert r1["claimed"] and r1["claim_mode"] == "read"
+        assert r2["claimed"] and set(r2["readers"]) >= {s1["id"], s2["id"]}
+        # Writer blocked while readers hold the file.
+        w = _run(db_module.claim_file(db, "x.py", s3["id"], mode="write"))
+        assert not w["claimed"] and w["reason"] == "read_locked"
+        # Readers release → writer can claim exclusively.
+        _run(db_module.release_file(db, "x.py", s1["id"]))
+        _run(db_module.release_file(db, "x.py", s2["id"]))
+        w2 = _run(db_module.claim_file(db, "x.py", s3["id"], mode="write"))
+        assert w2["claimed"] and w2["claim_mode"] == "write"
+        # New reader blocked by the exclusive write lock.
+        r3 = _run(db_module.claim_file(db, "x.py", s1["id"], mode="read"))
+        assert not r3["claimed"] and r3["reason"] == "write_locked"
+    finally:
+        _run(db.close())
+
+
+def test_store_and_get_findings_roundtrip():
+    """c35370cc — findings persist and read back by key, incl. via dispatch."""
+    import meridian.db as db_module
+    db = _make_db()
+    try:
+        proj = _run(mh._dispatch_mcp_tool("create_project", {"name": "f"}, db, "/tmp"))
+        pid = proj["id"]
+        _run(mh._dispatch_mcp_tool("store_finding",
+            {"project_id": pid, "content": "auth uses JWT", "key": "auth"}, db, "/tmp"))
+        _run(db_module.store_finding(db, pid, "db is postgres", key="db"))
+        allf = _run(mh._dispatch_mcp_tool("get_findings", {"project_id": pid}, db, "/tmp"))
+        assert len(allf) == 2
+        authf = _run(mh._dispatch_mcp_tool("get_findings", {"project_id": pid, "key": "auth"}, db, "/tmp"))
+        assert len(authf) == 1 and "JWT" in authf[0]["content"]
+    finally:
+        _run(db.close())
+
+
+def test_session_messaging_and_barrier():
+    """d3a3a01d — send/receive + non-blocking idle_until_all_done barrier."""
+    import meridian.db as db_module
+    db = _make_db()
+    try:
+        proj = _run(db_module.create_project(db, "m"))
+        pid = proj["id"]
+        s1 = _run(db_module.register_session(db, pid, "a"))
+        s2 = _run(db_module.register_session(db, pid, "b"))
+        _run(db_module.send_message(db, pid, s2["id"], "do Y", from_session_id=s1["id"]))
+        msgs = _run(db_module.receive_messages(db, s2["id"]))
+        assert len(msgs) == 1 and msgs[0]["payload"] == "do Y"
+        # Marked read → next receive is empty.
+        assert _run(db_module.receive_messages(db, s2["id"])) == []
+        # Barrier: both active → not done.
+        st = _run(db_module.idle_until_all_done(db, [s1["id"], s2["id"]]))
+        assert not st["all_done"] and set(st["pending"]) == {s1["id"], s2["id"]}
+        # Close both → done.
+        _run(db_module.close_session(db, s1["id"]))
+        _run(db_module.close_session(db, s2["id"]))
+        st2 = _run(db_module.idle_until_all_done(db, [s1["id"], s2["id"]]))
+        assert st2["all_done"] and st2["pending"] == []
+    finally:
+        _run(db.close())
+
+
 def test_dispatch_get_context_block_project_not_found_raises():
     db = _make_db()
     try:

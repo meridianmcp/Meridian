@@ -285,3 +285,8 @@ node_modules/
 # Parallel-session git worktrees (fffdcc95) — executor sessions isolate work in
 # .claude/worktrees/{session_id}; these must never show as untracked in the main checkout.
 .claude/worktrees/
+
+# Tool caches / build reports / nested extension repo — never part of the source tree.
+.serena/
+coverage/
+extensions/claude-mcp/

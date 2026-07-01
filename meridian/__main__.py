@@ -31,10 +31,20 @@ import sys
 
 
 def _kill_port(port: int) -> None:
-    """Kill any process listening on the given port before starting."""
+    """Kill any process listening on the given port before starting.
+
+    The free-port probe uses a short timeout so a dropped SYN (e.g. a firewall
+    that black-holes rather than refuses) can't stall startup for seconds per
+    port. A refused connection still returns instantly; a timeout is treated as
+    "free" so we never block. (a887155d)
+    """
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        if s.connect_ex(("127.0.0.1", port)) != 0:
-            return  # port is free
+        s.settimeout(0.25)
+        try:
+            if s.connect_ex(("127.0.0.1", port)) != 0:
+                return  # port is free (connection refused)
+        except OSError:
+            return  # timed out / unreachable → treat as free, don't hang
     if sys.platform == "win32":
         result = subprocess.run(
             f"netstat -ano | findstr :{port}",
@@ -68,6 +78,28 @@ if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     loop = asyncio.SelectorEventLoop(selectors.SelectSelector())
     asyncio.set_event_loop(loop)
+
+
+def _ensure_event_loop() -> "asyncio.AbstractEventLoop":
+    """Return the thread's event loop, creating one if none is set or it's closed.
+
+    Python 3.12 makes ``asyncio.get_event_loop()`` raise ``RuntimeError`` when no
+    loop is set for the current thread (e.g. after another test closed it under
+    pytest-xdist, or on a non-Windows entrypoint where the module-scope loop
+    above never ran). The CLI dispatch drives its own loop via
+    ``run_until_complete``, so it just needs *a* usable loop regardless of
+    ambient state — this keeps that robust without changing Windows behaviour
+    (the module-scope SelectorEventLoop is returned unchanged when present).
+    """
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_closed():
+            raise RuntimeError("event loop is closed")
+        return loop
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        return loop
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -114,6 +146,12 @@ def main(argv: list[str] | None = None) -> int:
         help="Local port for the tunnel's mcp-proxy (default 8808).",
     )
     parser.add_argument(
+        "--no-kill",
+        action="store_true",
+        help="Skip the stale-port cleanup (8808-8813) at --tunnel startup. Use "
+        "for fast restarts when you know no old proxies are lingering. (a887155d)",
+    )
+    parser.add_argument(
         "--code-dir",
         action="append",
         metavar="PATH",
@@ -135,12 +173,15 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     if args.tunnel:
-        print("[meridian] --tunnel: killing stale ports 8808-8813", flush=True)
-        for _p in range(8808, 8814):
-            _kill_port(_p)
+        if args.no_kill:
+            print("[meridian] --tunnel: --no-kill set, skipping stale-port cleanup", flush=True)
+        else:
+            print("[meridian] --tunnel: killing stale ports 8808-8813", flush=True)
+            for _p in range(8808, 8814):
+                _kill_port(_p)
         from .tunnel_client import run_tunnel
 
-        loop = asyncio.get_event_loop()
+        loop = _ensure_event_loop()
         # cbbd0eb4 — --repo is nargs='+': first = active repo, rest = extra fs roots.
         _repo_list = args.repo if isinstance(args.repo, list) else ([args.repo] if args.repo else [])
         _repo_path = _repo_list[0] if _repo_list else None
@@ -165,7 +206,7 @@ def main(argv: list[str] | None = None) -> int:
         _, run_stdio = build_mcp_server()
         # On Windows asyncio.run() creates a new ProactorEventLoop, breaking psycopg3.
         # Use the SelectorEventLoop we set at module scope instead.
-        loop = asyncio.get_event_loop()
+        loop = _ensure_event_loop()
         loop.run_until_complete(run_stdio())
         return 0
 
@@ -186,7 +227,7 @@ def main(argv: list[str] | None = None) -> int:
             loop="none",
         )
         server = uvicorn.Server(config)
-        loop = asyncio.get_event_loop()  # SelectorEventLoop set above in module scope
+        loop = _ensure_event_loop()  # SelectorEventLoop set above in module scope on win32
         loop.run_until_complete(server.serve())
     else:
         uvicorn.run(

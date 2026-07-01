@@ -1,6 +1,6 @@
 # MCP Tool Reference
 
-Meridian exposes **78 tools** over MCP.
+Meridian exposes **84 tools** over MCP.
 
 They fall into two usage patterns:
 
@@ -13,7 +13,7 @@ They fall into two usage patterns:
 
 | Tool | One-liner | Example call |
 |------|-----------|-------------|
-| `start_session` | Register session, get full project context | `start_session(project_id="abc-123", session_name="feature-x", human_id="alice")` |
+| `start_session` | Register session, get full project context | `start_session(project_name="my-project", session_name="feature-x", human_id="alice")` |
 | `log_task` | Record completed work to the shared task log | `log_task(session_id="sid", project_id="abc-123", description="Wired OAuth redirect")` |
 | `checkpoint` | Snapshot progress: auto-capture + delta handoff + next /goal | `checkpoint(session_id="sid", project_id="abc-123")` |
 | `pin_decision` | Add an architectural decision to the live constitution | `pin_decision(project_id="abc-123", title="Use psycopg3", body="asyncpg has DLL issues on Windows", category="TECHNICAL")` |
@@ -31,16 +31,17 @@ Register a session and get the full project context (goal, sprint, recent tasks,
 |-----------|------|----------|-------------|
 | `project_id` | string | optional |  |
 | `project_name` | string | optional | Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given. |
-| `session_name` | string | required |  |
+| `session_name` | string | optional | Optional (599d0097): omit or leave blank to auto-generate a meaningful name from the first pending sprint item title + a timestamp, instead of inventing a string. |
 | `human_id` | string | optional |  |
 | `client` | string | optional |  |
 | `role` | string | optional | Pass 'executor' to inject executor_config and credentials guidance. |
 | `compact` | boolean | optional | Default true — slim orientation. Set false for the full goal/instructions payload. |
 | `version` | string | optional | Optional sprint-version bucket (e.g. 'v0.1.x') to scope this session to. Sprint progress/items in the orientation and /goal filter to it. Omit to auto-infer the bucket with the most pending items. |
+| `mode` | string | optional | Pass 'continue' to resume an already-active same-name session WITHOUT re-reading the full L0/L1/L2 orientation: returns just session_id + live pending items + the ready-to-paste /goal string. Auto-detected anyway within a 5-min heartbeat window; 'continue' widens that so a known-yours session resumes cleanly even after a longer gap. |
 
 **Example:**
 ```
-start_session(project_id="abc-123", session_name="feature-x", human_id="alice", role="executor")
+start_session(project_name="my-project", session_name="feature-x", human_id="alice", role="executor")
 ```
 
 ---
@@ -214,6 +215,7 @@ Claim exclusive edit rights on a file path for this session. Locks auto-expire a
 |-----------|------|----------|-------------|
 | `session_id` | string | required |  |
 | `file_path` | string | required |  |
+| `mode` | string | optional | Claim grain (ffa03655). 'write' (default) = EXCLUSIVE: blocks other writers and is blocked by any other session's read claim. 'read' = SHARED: many sessions can read-claim the same file at once (no false contention for parallel reader agents), blocked only by another session's write lock. |
 | `symbol` | string | optional | Optional symbol to claim (class/function/method name, e.g. 'AuthRouter' or 'AuthRouter.login'). Requires `content`. |
 | `content` | string | optional | Full source of the file, required when `symbol` is given so the server can resolve the symbol's line range. |
 
@@ -252,6 +254,74 @@ Read-only: Wait on another session before touching a shared file. The tool polls
 ```
 idle_until_session_done(watching_session_id="session-uuid")
 ```
+
+---
+
+## Parallel coordination
+
+### `store_finding`
+PARALLEL COORDINATION (c35370cc): persist a per-task intermediate result to the session_findings table so it survives session boundaries. Parallel reader agents write findings; an orchestrator or writer agent reads them via get_findings. Unlike save_finding (which creates a research note), this is a lightweight key→content store for agent-to-agent handoff of intermediate work.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `project_id` | string | optional |  |
+| `project_name` | string | optional | Project name — an alternative to project_id. |
+| `content` | string | required | The finding body. |
+| `key` | string | optional | Optional bucket/topic for scoped retrieval (e.g. a subsystem name). |
+| `title` | string | optional | Optional short title. |
+| `session_id` | string | optional | Optional writing session. |
+| `task_id` | string | optional | Optional task this finding belongs to. |
+
+---
+
+
+### `get_findings`
+Read-only (c35370cc): read stored session_findings for a project (newest first), optionally scoped by key and/or session_id. The read side of store_finding.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `project_id` | string | optional |  |
+| `project_name` | string | optional | Project name — an alternative to project_id. |
+| `key` | string | optional | Only findings in this bucket. |
+| `session_id` | string | optional | Only findings from this session. |
+| `limit` | integer | optional | Max rows (default 50). |
+
+---
+
+
+### `send_message`
+PARALLEL COORDINATION (d3a3a01d): enqueue an actor-model message to another session (session_messages table). 'Done with X, you do Y' between parallel agents. The recipient reads with receive_messages. A2A-compatible.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `project_id` | string | optional |  |
+| `project_name` | string | optional | Project name — an alternative to project_id. |
+| `to_session_id` | string | required | Recipient session id. |
+| `payload` | string | required | Message body (text or JSON). |
+| `from_session_id` | string | optional | Sender session id (defaults to session_id). |
+| `kind` | string | optional | Optional message kind/tag. |
+
+---
+
+
+### `receive_messages`
+PARALLEL COORDINATION (d3a3a01d): fetch unread messages addressed to a session (oldest first) and mark them read by default. The receive side of send_message.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `session_id` | string | required | The recipient session. |
+| `mark_read` | boolean | optional | Mark fetched messages read (default true). |
+| `limit` | integer | optional | Max messages (default 50). |
+
+---
+
+
+### `idle_until_all_done`
+PARALLEL COORDINATION (d3a3a01d): non-blocking barrier check across sibling sessions. Returns {all_done, pending, statuses}; a session is done when closed/archived/missing. The server can't block, so poll until all_done is true — the A2A 'wait for X, Y, Z to finish' primitive.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `session_ids` | array | required | Sessions to wait on. |
 
 ---
 
@@ -446,6 +516,18 @@ Read-only: Return a compact planning context (sprint, north star, pending items,
 ```
 get_planning_brief(project_id="abc-123")
 ```
+
+---
+
+
+### `analyze_sprint`
+PLANNING: Read-only synthesis of the current sprint into one structured brief — parallelizability (conflict-free groups + max fan-out), dependency chains (depends_on walked to the root), resource/file conflicts (items sharing touches_resources), and stalls (stall_count>0). Returns {summary, recommended_strategy, parallelism, dependency_chains, longest_chain, file_conflicts, stalls, blocked, running}. Call in planning sessions instead of stitching together get_parallelizable_groups + manual dependency/conflict analysis.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `project_id` | string | optional |  |
+| `project_name` | string | optional | Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given. |
+| `version` | string | optional | Optional: only analyze items in this sprint-version bucket. |
 
 ---
 
