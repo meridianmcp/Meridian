@@ -7753,7 +7753,7 @@ def test_landing_page_has_solution_dashboard_shot(client):
     """G6.27 — landing page shows the real dashboard screenshot, not a mockup."""
     r = client.get("/")
     assert r.status_code == 200
-    assert "/static/dashboard-hero-screenshot.png" in r.text
+    assert "/static/dashboard-queue.png" in r.text
     assert "solution-shot" in r.text
 
 
