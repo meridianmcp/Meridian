@@ -93,7 +93,7 @@ export function showFeedbackModal() {
 
   overlay.style.cssText = 'position:fixed;inset:0;z-index:10000;background:rgba(0,0,0,.55);display:flex;align-items:center;justify-content:center';
 
-  const box = document.createElement('div');
+  const box: any = document.createElement('div');
 
   box.style.cssText = 'background:var(--surface-0);border:1px solid var(--border);border-radius:8px;padding:24px 28px;width:440px;max-width:94vw;display:flex;flex-direction:column;gap:12px';
 
@@ -168,7 +168,7 @@ export function showFeedbackModal() {
 
       setTimeout(() => overlay.remove(), 900);
 
-    } catch (e) {
+    } catch (e: any) {
 
       statusEl.textContent = e.message || 'Could not send — please try again.';
 
@@ -316,7 +316,7 @@ export function hideDemoAdminControls() {
 
       const orig = btn.onclick;
 
-      btn.onclick = (e) => { e.preventDefault(); e.stopPropagation(); showDemoReadonlyToast(); };
+      btn.onclick = (e: any) => { e.preventDefault(); e.stopPropagation(); showDemoReadonlyToast(); };
 
     });
 
@@ -327,6 +327,8 @@ export function hideDemoAdminControls() {
 export function showDemoReadonlyToast() {
 
   const el = document.getElementById('toast');
+
+  if (!el) return; // cb7d55ae — #toast may be absent; no-op instead of throwing.
 
   el.innerHTML = 'Read-only demo — <a href="/auth/login" style="color:#fff;font-weight:600;text-decoration:underline">sign in for full access →</a>';
 

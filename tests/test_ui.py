@@ -49,6 +49,49 @@ def css(client):
     return client.get("/static/dashboard.css").text
 
 
+def test_settings_panel_reinits_on_project_tab_switch(js):
+    """73907f9e — the project-tab switch path (activateTab) force-reloads the
+    Settings panel when settings is the active vtab, so switching to an
+    already-built tab doesn't show a blank panel (the renderer's TTL cache +
+    MutationObserver could otherwise leave it empty)."""
+    # The forced settings re-init and its marker live in dashboard.ts (activateTab).
+    assert "loadSettingsTab(id, { force: true })" in js, (
+        "tab switch must force-reload the Settings panel (73907f9e)"
+    )
+    assert "73907f9e" in js
+    # It is gated on the active vtab being settings (not fired for every tab).
+    assert "_activeVtab === 'settings'" in js
+
+
+def test_tunnel_stale_override_badge_rendered(js):
+    """cc904bfe — the Tunnel Plugins section renders a 'newer default available'
+    badge with a Use-new-default action when a slot's saved command is a stale
+    copy of an old built-in default (resolve_plugins sets p.stale_override)."""
+    assert "_renderStaleOverrideWarning" in js
+    assert "newer default available" in js
+    assert "tp-reset-default" in js
+    assert "cc904bfe" in js
+
+
+def test_invite_scope_dropdown_and_co_admin_badge(js):
+    """95499c3e — the team-members UI has a project-scope dropdown on the invite
+    form (blank = full workspace) and labels a project-scoped admin as a co-admin
+    in the member list."""
+    assert "invite-scope-" in js          # scope dropdown on the invite form
+    assert "all projects" in js           # blank option = workspace-wide
+    assert "co-admin @ " in js            # scoped-admin label in the member list
+    assert "95499c3e" in js
+
+
+def test_tunnel_per_machine_picker_rendered(js):
+    """8660d701 — the Tunnel Plugins section renders a per-machine picker and
+    scopes the fetch/save to the selected hostname (?hostname=)."""
+    assert "tp-host-" in js
+    assert "Default (all machines)" in js
+    assert "encodeURIComponent(_selHost)" in js
+    assert "8660d701" in js
+
+
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------

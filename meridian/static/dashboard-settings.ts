@@ -1,6 +1,6 @@
-export function suggestNtfyTopic(projectId) {
+export function suggestNtfyTopic(projectId: any) {
 
-  const proj = (window.state?.projects || []).find(p => p.id === projectId);
+  const proj = (window.state?.projects || []).find((p: any) => p.id === projectId);
 
   const slug = (proj?.name || 'meridian')
 
@@ -18,7 +18,7 @@ export function suggestNtfyTopic(projectId) {
 
 // 9b8261e4 — hide owner-only settings cards from invited viewers/members. The
 // real gate is server-side (393eed0a); this keeps the guest UI honest and clean.
-function _applySettingsRoleVisibility(projectId, guest) {
+function _applySettingsRoleVisibility(projectId: any, guest: any) {
   if (!guest) return;
   const body = document.getElementById(`settings-body-${projectId}`);
   if (!body) return;
@@ -45,7 +45,7 @@ function _detectClientOS() {
   return ua.includes('win') ? 'windows' : 'unix';
 }
 
-function _collapseConnectPlatforms(projectId) {
+function _collapseConnectPlatforms(projectId: any) {
   const body = document.getElementById(`settings-body-${projectId}`);
   if (!body) return;
   const os = _detectClientOS();
@@ -58,7 +58,7 @@ function _collapseConnectPlatforms(projectId) {
     wrap.style.display = (platform === os) ? '' : 'none';
     if (wrap.parentElement) grids.add(wrap.parentElement);
   });
-  grids.forEach(grid => {
+  grids.forEach((grid: any) => {
     if (grid.parentElement && grid.parentElement.querySelector('.connect-os-toggle')) return;
     const link = document.createElement('a');
     link.href = '#';
@@ -68,7 +68,7 @@ function _collapseConnectPlatforms(projectId) {
     link.onclick = (e) => {
       e.preventDefault();
       const expanded = link.dataset.expanded === '1';
-      grid.querySelectorAll('[data-connect-platform]').forEach(el => {
+      grid.querySelectorAll('[data-connect-platform]').forEach((el: any) => {
         el.style.display = expanded ? (el.dataset.connectPlatform === os ? '' : 'none') : '';
       });
       link.dataset.expanded = expanded ? '' : '1';
@@ -82,9 +82,9 @@ function _collapseConnectPlatforms(projectId) {
 // section element to one of the three tabs by its id. Exposed on window so the
 // UI test can exercise it directly. Unknown sections default to 'project' so a
 // section is never orphaned/hidden.
-function _classifySettingsSection(el, projectId) {
+function _classifySettingsSection(el: any, projectId: any) {
   const id = (el && el.id) || '';
-  const has = (frag) => id.indexOf(frag) !== -1;
+  const has = (frag: any) => id.indexOf(frag) !== -1;
   // Workspace: cross-project defaults + workspace decisions/notes/backlog.
   if (has('workspace-section')) return 'workspace';
   // Account: identity, billing, danger zone, team, connectivity, blog admin.
@@ -97,7 +97,7 @@ function _classifySettingsSection(el, projectId) {
 }
 window._classifySettingsSection = _classifySettingsSection;
 
-function _applyActiveTabVisibility(projectId) {
+function _applyActiveTabVisibility(projectId: any) {
   const body = document.getElementById(`settings-body-${projectId}`);
   if (!body) return;
   const key = body.dataset.activeStab || 'project';
@@ -112,7 +112,7 @@ function _applyActiveTabVisibility(projectId) {
   });
 }
 
-function _activateSettingsTab(projectId, key) {
+function _activateSettingsTab(projectId: any, key: any) {
   const body = document.getElementById(`settings-body-${projectId}`);
   if (!body) return;
   body.dataset.activeStab = key;
@@ -124,12 +124,12 @@ window._activateSettingsTab = _activateSettingsTab;
 // Account tabs. Reparenting nodes preserves their attached event handlers, so the
 // 2,800-line template + all its wiring stays untouched. A MutationObserver routes
 // the async-appended sections (Executor Rules, Tunnel Plugins) into the right tab.
-function _organizeSettingsIntoTabs(projectId) {
+function _organizeSettingsIntoTabs(projectId: any) {
   const body = document.getElementById(`settings-body-${projectId}`);
   if (!body || body.dataset.tabbed === '1') return;
   body.dataset.tabbed = '1';
   const TABS = [['project', 'Project'], ['workspace', 'Workspace'], ['account', 'Account']];
-  const panes = {};
+  const panes: Record<string, any> = {};
   const bar = document.createElement('div');
   bar.className = 'settings-tabbar';
   bar.style.cssText = 'display:flex;gap:2px;margin-bottom:12px;border-bottom:1px solid var(--border);position:sticky;top:0;background:var(--surface);z-index:2';
@@ -174,16 +174,32 @@ function _organizeSettingsIntoTabs(projectId) {
       }));
     });
     obs.observe(body, { childList: true });
-  } catch (e) { /* MutationObserver unavailable → late sections stay in project */ }
+    body._settingsObs = obs;
+  } catch (e: any) { /* MutationObserver unavailable → late sections stay in project */ }
   _activateSettingsTab(projectId, 'project');
 }
 window._organizeSettingsIntoTabs = _organizeSettingsIntoTabs;
 
-export async function loadSettingsTab(projectId) {
+export async function loadSettingsTab(projectId: any, { force = false } = {}) {
 
   const body = document.getElementById(`settings-body-${projectId}`);
 
   if (!body) return;
+
+  // Return immediately on repeated tab switches if content is fresh (< 30 s old).
+  // This eliminates the lag caused by re-running 10+ API calls on every click.
+  // Callers that need a guaranteed refresh (e.g. after saving GitHub settings)
+  // pass { force: true } to bypass.
+  if (!force && body.dataset.tabbed === '1' && body.children.length > 0) {
+    const age = Date.now() - parseInt(body.dataset.settingsTs || '0', 10);
+    if (age < 30000) return;
+  }
+
+  // Disconnect any MutationObserver from a previous render before replacing innerHTML.
+  // Without this, the observer moves every newly-added child to orphaned pane elements,
+  // leaving the body blank on the second (and any subsequent) settings tab open.
+  if (body._settingsObs) { body._settingsObs.disconnect(); body._settingsObs = null; }
+  delete body.dataset.tabbed;
 
   body.innerHTML = '<div style="color:var(--muted);font-size:11px">loading…</div>';
 
@@ -238,7 +254,7 @@ export async function loadSettingsTab(projectId) {
 
   const ghRepos = Array.isArray(ghData?.repos) ? ghData.repos : [];
 
-  const ghRepoMap = Object.fromEntries(ghRepos.map(repo => [repo.full_name, repo]));
+  const ghRepoMap = Object.fromEntries(ghRepos.map((repo: any) => [repo.full_name, repo]));
 
   const ghSelectedRepo = ghData?.repo || ghRepos[0]?.full_name || '';
 
@@ -247,6 +263,8 @@ export async function loadSettingsTab(projectId) {
   const ghUsername = ghData?.github_user || ghData?.login || '';
 
   const ghAvatarUrl = ghData?.avatar_url || '';
+
+  const ghConnections = Array.isArray(ghData?.connections) ? ghData.connections : [];
 
   const ghRepoChoices = ghRepos.length
 
@@ -268,7 +286,7 @@ export async function loadSettingsTab(projectId) {
 
   const repoGroups = new Map();
 
-  ghRepoChoices.forEach(repo => {
+  ghRepoChoices.forEach((repo: any) => {
 
     const fullName = repo.full_name || '';
 
@@ -314,9 +332,9 @@ export async function loadSettingsTab(projectId) {
 
         .slice()
 
-        .sort((a, b) => String(a.name || a.full_name || '').localeCompare(String(b.name || b.full_name || '')))
+        .sort((a: any, b: any) => String(a.name || a.full_name || '').localeCompare(String(b.name || b.full_name || '')))
 
-        .map(repo => {
+        .map((repo: any) => {
 
           const fullName = repo.full_name || '';
 
@@ -336,7 +354,7 @@ export async function loadSettingsTab(projectId) {
 
   const hooksBaseUrl = ((mcpData && mcpData.base_url) || window.location.origin || window.state.serverConfig?.server_url || 'http://localhost:7878').replace(/\/$/, '');
 
-  function buildHookCurlHeaders(token) {
+  function buildHookCurlHeaders(token: any) {
 
     const headers = [];
 
@@ -350,7 +368,7 @@ export async function loadSettingsTab(projectId) {
 
 
 
-  function buildHookCurlCommand(path, token) {
+  function buildHookCurlCommand(path: any, token: any) {
 
     const cmd = `curl -s -X POST ${buildHookCurlHeaders(token)} -d '{"project_id":"${projectId}"}' ${hooksBaseUrl}/hooks/${path}`;
 
@@ -362,7 +380,7 @@ export async function loadSettingsTab(projectId) {
 
 
 
-  function buildHookPowerShellCommand(path, token) {
+  function buildHookPowerShellCommand(path: any, token: any) {
 
     const headerClause = token ? ` -Headers @{ Authorization = 'Bearer ${token}' }` : '';
 
@@ -380,7 +398,7 @@ export async function loadSettingsTab(projectId) {
 
 
 
-  function buildClaudeHookSnippet(platform, token) {
+  function buildClaudeHookSnippet(platform: any, token: any) {
 
     const start = platform === 'windows'
 
@@ -410,7 +428,7 @@ export async function loadSettingsTab(projectId) {
 
 
 
-  function buildCodexHookSnippet(platform, token) {
+  function buildCodexHookSnippet(platform: any, token: any) {
 
     const start = platform === 'windows'
 
@@ -431,9 +449,9 @@ export async function loadSettingsTab(projectId) {
 
 
   // Settings section accordion state — persisted per project
-  let _secState = { connect: true, executor: false, config: false, account: false };
+  let _secState: Record<string, boolean> = { connect: true, executor: false, config: false, account: false };
   try { Object.assign(_secState, JSON.parse(localStorage.getItem('meridian.settings.sections.' + projectId) || '{}')); } catch(e) {}
-  const _secHtml = function(k, title) {
+  const _secHtml = function(k: any, title: any) {
     const openAttr = _secState[k] ? 'open' : '';
     const caretRot = _secState[k] ? 'transform:rotate(90deg)' : '';
     return '<details id="settings-sec-' + k + '-' + projectId + '" ' + openAttr + ' style="margin-bottom:12px;border:1px solid var(--border);border-radius:6px">' +
@@ -444,11 +462,11 @@ export async function loadSettingsTab(projectId) {
   };
 
   // Collect repo_paths across all projects for filesystem MCP snippet
-  const _allRepoPaths = [];
+  const _allRepoPaths: any[] = [];
   if (!isHostedMode()) {
     try {
       const _allProjSettings = await Promise.allSettled(
-        (window.state.projects || []).map(p => loadProjectSettings(p.id))
+        (window.state.projects || []).map((p: any) => loadProjectSettings(p.id))
       );
       for (const _ps of _allProjSettings) {
         if (_ps.status === 'fulfilled') {
@@ -790,6 +808,36 @@ export async function loadSettingsTab(projectId) {
 
     </div>
 
+    ${ghConnections.length ? `
+
+      <div style="margin-bottom:10px;padding:8px 10px;border:1px solid var(--border);border-radius:5px;background:var(--surface-1)">
+
+        <div style="font-size:9px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.04em;margin-bottom:6px">Connected accounts</div>
+
+        <div style="display:flex;flex-direction:column;gap:5px">
+
+          ${ghConnections.map(function(c: any){
+            var login = (c && c.account_login) || '';
+            var active = !!ghUsername && login.toLowerCase() === ghUsername.toLowerCase();
+            return `<div style="display:flex;align-items:center;gap:8px">`
+              + `<img src="https://github.com/${encodeURIComponent(login)}.png?size=32" alt="" style="width:18px;height:18px;border-radius:50%;border:1px solid var(--border);background:var(--surface-2)" onerror="this.style.visibility='hidden'">`
+              + `<span style="font-size:11px;color:var(--text);font-weight:600">@${escapeHtml(login)}</span>`
+              + (active
+                  ? `<span style="font-size:8px;font-weight:700;color:#22c55e;border:1px solid #22c55e55;border-radius:3px;padding:1px 5px">ACTIVE</span>`
+                  : `<button class="secondary gh-acct-use" data-login="${escapeHtml(login)}" style="font-size:9px;padding:1px 7px">Use for this project</button>`)
+              + `<span style="flex:1"></span>`
+              + `<button class="secondary gh-acct-remove" data-login="${escapeHtml(login)}" style="font-size:9px;padding:1px 7px;color:var(--danger,#ef4444)">Disconnect</button>`
+              + `</div>`;
+          }).join('')}
+
+        </div>
+
+        <button class="secondary" id="github-add-account-${projectId}" style="margin-top:8px;font-size:10px;padding:3px 10px">+ Connect another GitHub account</button>
+
+      </div>
+
+    ` : ''}
+
     ${ghData?.connected ? `
 
       <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:10px">
@@ -870,7 +918,7 @@ export async function loadSettingsTab(projectId) {
       <div id="exec-ez-hosts-tbl-${projectId}" style="margin-bottom:8px;font-size:10px;font-family:var(--font-mono)">${
         _klHosts.length
           ? '<table style="width:100%;border-collapse:collapse">' +
-            _klHosts.map((h, i) => `<tr>
+            _klHosts.map((h: any, i: any) => `<tr>
               <td style="padding:2px 6px 2px 0;color:var(--text)">${escapeHtml(h.hostname || '')}</td>
               <td style="padding:2px 6px 2px 0;color:var(--muted)"><label style="display:flex;align-items:center;gap:4px;cursor:pointer;font-size:9px"><input type="checkbox" class="exec-ez-host-autocwd" data-pid="${escapeHtml(projectId)}" data-idx="${i}" ${h.auto_add_cwds ? 'checked' : ''} style="cursor:pointer"> Auto-add new cwds</label></td>
               <td style="padding:2px 0;text-align:right"><button class="exec-ez-del-host" data-pid="${escapeHtml(projectId)}" data-idx="${i}" style="font-size:9px;padding:1px 6px;background:transparent;border:1px solid var(--border);border-radius:3px;color:var(--muted);cursor:pointer">Remove</button></td>
@@ -881,7 +929,7 @@ export async function loadSettingsTab(projectId) {
       <div id="exec-ez-paths-tbl-${projectId}" style="margin-bottom:8px;font-size:10px;font-family:var(--font-mono)">${
         _klPaths.length
           ? '<table style="width:100%;border-collapse:collapse">' +
-            _klPaths.map((p, i) => `<tr>
+            _klPaths.map((p: any, i: any) => `<tr>
               <td style="padding:2px 6px 2px 0;color:var(--text)">${escapeHtml(p.hostname || '')}</td>
               <td style="padding:2px 6px 2px 0;color:var(--muted)">${escapeHtml(p.cwd || '')}</td>
               <td style="padding:2px 0;text-align:right"><button class="exec-ez-del-row" data-pid="${escapeHtml(projectId)}" data-idx="${i}" style="font-size:9px;padding:1px 6px;background:transparent;border:1px solid var(--border);border-radius:3px;color:var(--muted);cursor:pointer">Remove</button></td>
@@ -893,7 +941,7 @@ export async function loadSettingsTab(projectId) {
         <input id="exec-ez-add-host-${projectId}" type="text" placeholder="hostname" list="exec-ez-host-options-${projectId}" value="${escapeHtml(String((_klHosts[0] && _klHosts[0].hostname) || ''))}" style="flex:1;box-sizing:border-box;background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:3px 6px">
         <button id="exec-ez-add-btn-${projectId}" class="secondary" style="font-size:10px;padding:3px 10px">Add</button>
       </div>
-      <datalist id="exec-ez-host-options-${projectId}">${_klHosts.map(h => `<option value="${escapeHtml(String(h.hostname || ''))}"></option>`).join('')}</datalist>
+      <datalist id="exec-ez-host-options-${projectId}">${_klHosts.map((h: any) => `<option value="${escapeHtml(String(h.hostname || ''))}"></option>`).join('')}</datalist>
       <div style="display:flex;gap:8px;align-items:center">
         <button id="exec-ez-save-${projectId}" class="primary" style="font-size:10px;padding:3px 10px">Save</button>
         <button id="exec-ez-clear-${projectId}" class="secondary" style="font-size:10px;padding:3px 10px">Clear all</button>
@@ -1055,7 +1103,7 @@ export async function loadSettingsTab(projectId) {
 
     ];
 
-    const projectOpts = projects.map(p =>
+    const projectOpts = projects.map((p: any) =>
 
       `<option value="${escapeHtml(p.id)}">${escapeHtml(p.name)}</option>`
 
@@ -1122,13 +1170,13 @@ export async function loadSettingsTab(projectId) {
 
 
 
-      const configBlock = document.getElementById(`mcp-config-block-${projectId}`);
+      const configBlock = document.getElementById(`mcp-config-block-${projectId}`)!;
 
-      const copyBtn = document.getElementById(`mcp-copy-btn-${projectId}`);
+      const copyBtn = document.getElementById(`mcp-copy-btn-${projectId}`)!;
 
-      const copyStatus = document.getElementById(`mcp-copy-status-${projectId}`);
+      const copyStatus = document.getElementById(`mcp-copy-status-${projectId}`)!;
 
-      const fileNote = document.getElementById(`mcp-file-note-${projectId}`);
+      const fileNote = document.getElementById(`mcp-file-note-${projectId}`)!;
 
       const genBtn = document.getElementById(`mcp-gen-token-${projectId}`);
 
@@ -1307,7 +1355,7 @@ export async function loadSettingsTab(projectId) {
             copyBtn.disabled = false;
 
             // Show raw key reveal zone
-            const mcpRevealEl = document.getElementById(`mcp-key-reveal-${projectId}`);
+            const mcpRevealEl = document.getElementById(`mcp-key-reveal-${projectId}`)!;
             const mcpRevealInput = document.getElementById(`mcp-key-reveal-input-${projectId}`);
             const mcpKeyCopyBtn = document.getElementById(`mcp-key-copy-btn-${projectId}`);
             const mcpKeyDismiss = document.getElementById(`mcp-key-dismiss-${projectId}`);
@@ -1325,7 +1373,7 @@ export async function loadSettingsTab(projectId) {
               copyStatus.textContent = 'Real key generated — save it, it won\'t be shown again.';
             }
 
-          } catch (e) {
+          } catch (e: any) {
 
             if (copyStatus) copyStatus.textContent = `error: ${escapeHtml(String(e))}`;
 
@@ -1359,7 +1407,7 @@ export async function loadSettingsTab(projectId) {
 
             setTimeout(() => { copyBtn.textContent = 'Copy config'; }, 1800);
 
-          } catch (e) {
+          } catch (e: any) {
 
             copyStatus.textContent = 'Copy failed — select and copy manually';
 
@@ -1519,7 +1567,7 @@ export async function loadSettingsTab(projectId) {
 
       if (goalEl) goalEl.value = goalText;
 
-      function _codexCopySetup(btnId, text) {
+      function _codexCopySetup(btnId: any, text: any) {
 
         const btn = document.getElementById(btnId);
 
@@ -1697,7 +1745,7 @@ export async function loadSettingsTab(projectId) {
 
         renderConstitutionWarning(projectId);
 
-      } catch (e) {
+      } catch (e: any) {
 
         if (status) status.textContent = `Save failed: ${String(e)}`;
 
@@ -1731,7 +1779,7 @@ export async function loadSettingsTab(projectId) {
 
   // 035edf47 — 3-way auto-answer mode: 0=off, 1=safe, 2=aggressive.
   const hitlMode = Math.max(0, Math.min(2, parseInt((projectSettings && projectSettings.hitl_auto_answer) || 0, 10) || 0));
-  const _hitlDesc = {
+  const _hitlDesc: Record<number, string> = {
     0: 'Off — every request waits for a human.',
     1: 'Safe — auto-answers routine executor questions only; corrections, file-diff approvals, location mismatches, and anything destructive still wait for you.',
     2: 'Aggressive — auto-answers everything except corrections and security-sensitive requests.',
@@ -1785,7 +1833,7 @@ export async function loadSettingsTab(projectId) {
 
         if (status) status.textContent = _hitlDesc[m];
 
-      } catch (e) {
+      } catch (e: any) {
 
         sel.value = prev;
 
@@ -1835,7 +1883,7 @@ export async function loadSettingsTab(projectId) {
         await saveProjectSettings(projectId, { execution_mode: emSel.value });
         if (emStatus) emStatus.textContent = 'Saved.';
         setTimeout(() => { if (emStatus) emStatus.textContent = ''; }, 1500);
-      } catch (e) {
+      } catch (e: any) {
         if (emStatus) emStatus.textContent = `Save failed: ${String(e)}`;
       }
     };
@@ -1880,13 +1928,13 @@ export async function loadSettingsTab(projectId) {
     const rmSel = document.getElementById(`require-merge-${projectId}`);
     const psStatus = document.getElementById(`parallel-safety-status-${projectId}`);
 
-    const saveSetting = async (patch) => {
+    const saveSetting = async (patch: any) => {
       if (psStatus) psStatus.textContent = 'Saving…';
       try {
         await saveProjectSettings(projectId, patch);
         if (psStatus) psStatus.textContent = 'Saved.';
         setTimeout(() => { if (psStatus) psStatus.textContent = ''; }, 1500);
-      } catch (e) {
+      } catch (e: any) {
         if (psStatus) psStatus.textContent = `Save failed: ${String(e)}`;
       }
     };
@@ -1917,7 +1965,7 @@ export async function loadSettingsTab(projectId) {
           const rps = Array.isArray(execCfg.repo_paths) ? execCfg.repo_paths : [];
           if (!rps.length) return '<div style="color:var(--muted);font-style:italic">No locations tracked yet.</div>';
           return '<table style="width:100%;border-collapse:collapse">' +
-            rps.map((p, i) => `<tr>
+            rps.map((p: any, i: any) => `<tr>
               <td style="padding:2px 6px 2px 0;color:var(--text)">${escapeHtml(p.hostname || '')}</td>
               <td style="padding:2px 6px 2px 0;color:var(--muted)">${escapeHtml(p.cwd || '')}</td>
               <td style="padding:2px 0;text-align:right"><button class="exec-del-rp-row" data-pid="${escapeHtml(projectId)}" data-idx="${i}" style="font-size:9px;padding:1px 6px;background:transparent;border:1px solid var(--border);border-radius:3px;color:var(--muted);cursor:pointer">✕</button></td>
@@ -2030,7 +2078,7 @@ export async function loadSettingsTab(projectId) {
 
     // Wire filesystem_roots add/remove list (plain directory strings)
     let _execFsRoots = Array.isArray(execCfg.filesystem_roots)
-      ? execCfg.filesystem_roots.filter(r => typeof r === 'string' && r.trim()).map(r => r.trim())
+      ? execCfg.filesystem_roots.filter((r: any) => typeof r === 'string' && r.trim()).map((r: any) => r.trim())
       : [];
     const _fsTblEl = document.getElementById(`exec-fs-roots-tbl-${projectId}`);
     const _rerenderFsTbl = () => {
@@ -2040,7 +2088,7 @@ export async function loadSettingsTab(projectId) {
         return;
       }
       _fsTblEl.innerHTML = '<table style="width:100%;border-collapse:collapse">' +
-        _execFsRoots.map((p, i) => `<tr>
+        _execFsRoots.map((p: any, i: any) => `<tr>
           <td style="padding:2px 6px 2px 0;color:var(--text);font-size:10px;font-family:var(--font-mono)">${escapeHtml(p)}</td>
           <td style="padding:2px 0;text-align:right"><button class="exec-del-fs-row" data-idx="${i}" style="font-size:9px;padding:1px 6px;background:transparent;border:1px solid var(--border);border-radius:3px;color:var(--muted);cursor:pointer">✕</button></td>
         </tr>`).join('') + '</table>';
@@ -2067,7 +2115,7 @@ export async function loadSettingsTab(projectId) {
 
       const fields = ['env_file', 'test_cmd', 'deploy_cmd', 'branch'];
 
-      const cfg = {};
+      const cfg: Record<string, any> = {};
 
       cfg.repo_paths = _execRepoPaths;
       cfg.filesystem_roots = _execFsRoots;
@@ -2099,7 +2147,7 @@ export async function loadSettingsTab(projectId) {
 
         setTimeout(() => { if (statusEl) statusEl.textContent = ''; }, 2000);
 
-      } catch (e) {
+      } catch (e: any) {
 
         if (statusEl) statusEl.textContent = `Save failed: ${String(e)}`;
 
@@ -2162,7 +2210,7 @@ export async function loadSettingsTab(projectId) {
 
         if (codeIntelCb) codeIntelCb.checked = !!s.code_intel_enabled_default;
 
-      } catch (e) {
+      } catch (e: any) {
         // A failed load must not masquerade as "saved defaults" — surface it so
         // the toggle state shown is never silently stale.
         if (saveStatus) saveStatus.textContent = 'Could not load workspace defaults.';
@@ -2209,7 +2257,7 @@ export async function loadSettingsTab(projectId) {
 
         toast('Workspace defaults saved');
 
-      } catch (e) {
+      } catch (e: any) {
 
         const msg = (e && e.message) ? e.message : String(e);
 
@@ -2241,7 +2289,7 @@ export async function loadSettingsTab(projectId) {
 
         decList.innerHTML = (items && items.length)
 
-          ? items.map(d => `<div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px;padding:4px 0;border-bottom:1px solid var(--border)">
+          ? items.map((d: any) => `<div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px;padding:4px 0;border-bottom:1px solid var(--border)">
 
               <span><span style="color:var(--accent)">${escapeHtml(d.category || 'TECHNICAL')}</span> ${escapeHtml(d.title || '')}: <span style="color:var(--muted)">${escapeHtml(d.body || '')}</span></span>
 
@@ -2259,13 +2307,13 @@ export async function loadSettingsTab(projectId) {
 
             try { await api(`/workspace/decisions/${btn.dataset.did}`, { method: 'DELETE' }); renderWsDecisions(); }
 
-            catch (e) { alert('Error: ' + e); }
+            catch (e: any) { alert('Error: ' + e); }
 
           };
 
         });
 
-      } catch (e) { decList.innerHTML = '<div style="color:var(--muted)">Failed to load.</div>'; }
+      } catch (e: any) { decList.innerHTML = '<div style="color:var(--muted)">Failed to load.</div>'; }
 
     }
 
@@ -2287,13 +2335,13 @@ export async function loadSettingsTab(projectId) {
 
         await api('/workspace/decisions', { method: 'POST', body: JSON.stringify({ title, body }) });
 
-        document.getElementById('ws-dec-title').value = '';
+        document.getElementById('ws-dec-title')!.value = '';
 
-        document.getElementById('ws-dec-body').value = '';
+        document.getElementById('ws-dec-body')!.value = '';
 
         renderWsDecisions();
 
-      } catch (e) { alert('Error: ' + e); } finally { decAdd.disabled = false; }
+      } catch (e: any) { alert('Error: ' + e); } finally { decAdd.disabled = false; }
 
     };
 
@@ -2313,7 +2361,7 @@ export async function loadSettingsTab(projectId) {
 
         noteList.innerHTML = (items && items.length)
 
-          ? items.map(n => `<div data-note-row="${escapeHtml(n.id)}" style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px;padding:4px 0;border-bottom:1px solid var(--border)">
+          ? items.map((n: any) => `<div data-note-row="${escapeHtml(n.id)}" style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px;padding:4px 0;border-bottom:1px solid var(--border)">
 
               <span data-note-view="${escapeHtml(n.id)}">${escapeHtml(n.title || '')}: <span style="color:var(--muted)">${escapeHtml(n.body || '')}</span>${n.tags ? ` <span style="color:var(--accent);font-size:9px">${escapeHtml(n.tags)}</span>` : ''}</span>
 
@@ -2335,7 +2383,7 @@ export async function loadSettingsTab(projectId) {
 
             try { await api(`/workspace/notes/${btn.dataset.nid}`, { method: 'DELETE' }); renderWsNotes(); }
 
-            catch (e) { alert('Error: ' + e); }
+            catch (e: any) { alert('Error: ' + e); }
 
           };
 
@@ -2347,7 +2395,7 @@ export async function loadSettingsTab(projectId) {
 
             const nid = btn.dataset.nidEdit;
             const row = noteList.querySelector(`[data-note-row="${nid}"]`);
-            const view = noteList.querySelector(`[data-note-view="${nid}"]`);
+            const view = noteList.querySelector(`[data-note-view="${nid}"]`)!;
             if (!row || row.querySelector('textarea')) return;
             const titleVal = btn.dataset.ntitle;
             const bodyVal = btn.dataset.nbody;
@@ -2361,16 +2409,16 @@ export async function loadSettingsTab(projectId) {
                 <button class="primary" style="font-size:9px;padding:2px 8px">Save</button>
                 <button class="secondary" style="font-size:9px;padding:2px 8px">Cancel</button>
               </span>`;
-            row.insertBefore(edit, row.querySelector('[data-note-view]').nextSibling);
-            edit.querySelector('button.secondary').onclick = () => { edit.remove(); view.style.display = ''; };
-            edit.querySelector('button.primary').onclick = async () => {
-              const newTitle = edit.querySelector('input').value.trim();
-              const newBody = edit.querySelector('textarea').value.trim();
+            row.insertBefore(edit, row.querySelector('[data-note-view]')!.nextSibling);
+            edit.querySelector('button.secondary')!.onclick = () => { edit.remove(); view.style.display = ''; };
+            edit.querySelector('button.primary')!.onclick = async () => {
+              const newTitle = edit.querySelector('input')!.value.trim();
+              const newBody = edit.querySelector('textarea')!.value.trim();
               if (!newTitle || !newBody) return;
               try {
                 await api(`/workspace/notes/${nid}`, { method: 'PATCH', body: JSON.stringify({ title: newTitle, body: newBody }) });
                 renderWsNotes();
-              } catch (e) { alert('Error: ' + e); }
+              } catch (e: any) { alert('Error: ' + e); }
             };
 
           };
@@ -2390,30 +2438,30 @@ export async function loadSettingsTab(projectId) {
             picker.style.cssText = 'display:flex;gap:4px;align-items:center;flex-shrink:0';
             picker.innerHTML = `
               <select data-move-select style="font-size:9px;padding:2px 4px;background:var(--surface-2);border:1px solid var(--border);color:var(--text);border-radius:3px;max-width:120px">
-                ${projects.map(p => `<option value="${escapeHtml(p.id)}">${escapeHtml(p.name || p.id)}</option>`).join('')}
+                ${projects.map((p: any) => `<option value="${escapeHtml(p.id)}">${escapeHtml(p.name || p.id)}</option>`).join('')}
               </select>
               <button class="primary" data-move-go style="font-size:9px;padding:2px 8px">Move</button>
               <button class="secondary" data-move-cancel style="font-size:9px;padding:2px 6px">×</button>`;
-            const actions = btn.parentElement;
+            const actions = btn.parentElement!;
             actions.style.display = 'none';
             row.appendChild(picker);
-            picker.querySelector('[data-move-cancel]').onclick = () => { picker.remove(); actions.style.display = ''; };
-            picker.querySelector('[data-move-go]').onclick = async () => {
-              const targetId = picker.querySelector('[data-move-select]').value;
+            picker.querySelector('[data-move-cancel]')!.onclick = () => { picker.remove(); actions.style.display = ''; };
+            picker.querySelector('[data-move-go]')!.onclick = async () => {
+              const targetId = picker.querySelector('[data-move-select]')!.value;
               if (!targetId) return;
               try {
                 await api(`/workspace/notes/${nid}/move`, { method: 'POST', body: JSON.stringify({ project_id: targetId }) });
                 renderWsNotes();
                 // Refresh the target project's notes tab if it happens to be open.
                 try { if (typeof loadNotesTab === 'function') await loadNotesTab(targetId); } catch (_) { /* tab not open */ }
-              } catch (e) { alert('Error: ' + e); }
+              } catch (e: any) { alert('Error: ' + e); }
             };
 
           };
 
         });
 
-      } catch (e) { noteList.innerHTML = '<div style="color:var(--muted)">Failed to load.</div>'; }
+      } catch (e: any) { noteList.innerHTML = '<div style="color:var(--muted)">Failed to load.</div>'; }
 
     }
 
@@ -2435,13 +2483,13 @@ export async function loadSettingsTab(projectId) {
 
         await api('/workspace/notes', { method: 'POST', body: JSON.stringify({ title, body }) });
 
-        document.getElementById('ws-note-title').value = '';
+        document.getElementById('ws-note-title')!.value = '';
 
-        document.getElementById('ws-note-body').value = '';
+        document.getElementById('ws-note-body')!.value = '';
 
         renderWsNotes();
 
-      } catch (e) { alert('Error: ' + e); } finally { noteAdd.disabled = false; }
+      } catch (e: any) { alert('Error: ' + e); } finally { noteAdd.disabled = false; }
 
     };
 
@@ -2457,14 +2505,14 @@ export async function loadSettingsTab(projectId) {
           return;
         }
         // Group by item_group bucket so cross-project goals cluster together.
-        const groups = {};
-        items.forEach(it => {
+        const groups: Record<string, any[]> = {};
+        items.forEach((it: any) => {
           const g = it.item_group || '(ungrouped)';
           (groups[g] = groups[g] || []).push(it);
         });
         const STATUSES = ['todo', 'pending', 'in_progress', 'done', 'skipped', 'failed'];
         sprintList.innerHTML = Object.keys(groups).map(g => {
-          const rows = groups[g].map(it => {
+          const rows = groups[g].map((it: any) => {
             const done = it.status === 'done' || it.status === 'skipped';
             const titleStyle = done ? 'text-decoration:line-through;color:var(--muted)' : '';
             const sel = `<select data-ws-status="${escapeHtml(it.id)}" style="font-size:9px;padding:1px 3px;background:var(--surface-2);border:1px solid var(--border);color:var(--text);border-radius:3px">`
@@ -2482,17 +2530,17 @@ export async function loadSettingsTab(projectId) {
         sprintList.querySelectorAll('select[data-ws-status]').forEach(sel => {
           sel.onchange = async () => {
             try { await api(`/workspace/sprint-items/${sel.dataset.wsStatus}`, { method: 'PATCH', body: JSON.stringify({ status: sel.value }) }); renderWsSprint(); }
-            catch (e) { alert('Error: ' + e); }
+            catch (e: any) { alert('Error: ' + e); }
           };
         });
         // Quick complete button.
         sprintList.querySelectorAll('button[data-ws-done]').forEach(btn => {
           btn.onclick = async () => {
             try { await api(`/workspace/sprint-items/${btn.dataset.wsDone}/complete`, { method: 'POST' }); renderWsSprint(); }
-            catch (e) { alert('Error: ' + e); }
+            catch (e: any) { alert('Error: ' + e); }
           };
         });
-      } catch (e) { sprintList.innerHTML = '<div style="color:var(--muted)">Failed to load.</div>'; }
+      } catch (e: any) { sprintList.innerHTML = '<div style="color:var(--muted)">Failed to load.</div>'; }
     }
 
     renderWsSprint();
@@ -2506,10 +2554,10 @@ export async function loadSettingsTab(projectId) {
       sprintAdd.disabled = true;
       try {
         await api('/workspace/sprint-items', { method: 'POST', body: JSON.stringify({ title, group: group || undefined }) });
-        document.getElementById('ws-sprint-title').value = '';
-        document.getElementById('ws-sprint-group').value = '';
+        document.getElementById('ws-sprint-title')!.value = '';
+        document.getElementById('ws-sprint-group')!.value = '';
         renderWsSprint();
-      } catch (e) { alert('Error: ' + e); } finally { sprintAdd.disabled = false; }
+      } catch (e: any) { alert('Error: ' + e); } finally { sprintAdd.disabled = false; }
     };
 
   }, 0);
@@ -2667,7 +2715,7 @@ export async function loadSettingsTab(projectId) {
 
           <option value="">all projects</option>
 
-          ${(window.state.projects || []).map(p => `<option value="${escapeHtml(p.id)}">${escapeHtml(p.name || p.id)}</option>`).join('')}
+          ${(window.state.projects || []).map((p: any) => `<option value="${escapeHtml(p.id)}">${escapeHtml(p.name || p.id)}</option>`).join('')}
 
         </select>
 
@@ -2683,7 +2731,7 @@ export async function loadSettingsTab(projectId) {
 
     setTimeout(async () => {
 
-      const listEl = document.getElementById(`members-list-${projectId}`);
+      const listEl = document.getElementById(`members-list-${projectId}`)!;
 
       const inviteBtn = document.getElementById(`invite-btn-${projectId}`);
 
@@ -2715,14 +2763,18 @@ export async function loadSettingsTab(projectId) {
 
           const ROLE_CHOICES = ['admin', 'member', 'viewer'];
 
-          const projectNameById = Object.fromEntries((window.state.projects || []).map(p => [p.id, p.name || p.id]));
+          const projectNameById = Object.fromEntries((window.state.projects || []).map((p: any) => [p.id, p.name || p.id]));
 
-          listEl.innerHTML = members.map(m => {
+          listEl.innerHTML = members.map((m: any) => {
 
             const opts = ROLE_CHOICES.map(r => `<option value="${r}" ${m.role === r ? 'selected' : ''}>${r}</option>`).join('');
 
+            // 95499c3e — a project-scoped member with an admin role is a "co-admin"
+            // (admin of that one project, 403'd elsewhere). Surface it explicitly;
+            // other scoped roles just show the project they're scoped to.
+            const _isCoAdmin = m.role === 'admin' && !!m.project_id;
             const scopeBadge = m.project_id
-              ? ` <span style="color:var(--muted);font-size:9px" title="Scoped to project ${escapeHtml(m.project_id)}">· ${escapeHtml(projectNameById[m.project_id] || m.project_id)}</span>`
+              ? ` <span style="color:${_isCoAdmin ? 'var(--accent)' : 'var(--muted)'};font-size:9px;font-weight:${_isCoAdmin ? '600' : '400'}" title="${_isCoAdmin ? 'Co-admin — admin of' : 'Scoped to'} project ${escapeHtml(m.project_id)}">· ${_isCoAdmin ? 'co-admin @ ' : ''}${escapeHtml(projectNameById[m.project_id] || m.project_id)}</span>`
               : '';
 
             return `
@@ -2769,7 +2821,7 @@ export async function loadSettingsTab(projectId) {
 
                 if (inviteStatus) { inviteStatus.textContent = `Role updated to ${newRole}.`; setTimeout(() => { if (inviteStatus) inviteStatus.textContent = ''; }, 2500); }
 
-              } catch (e) {
+              } catch (e: any) {
 
                 sel.value = sel.dataset.prev;  // revert when the server rejects (e.g. 403)
 
@@ -3021,9 +3073,9 @@ export async function loadSettingsTab(projectId) {
 
 
 
-        function pct(used, limit) { return Math.min(100, limit > 0 ? (used / limit * 100) : 0); }
+        function pct(used: any, limit: any) { return Math.min(100, limit > 0 ? (used / limit * 100) : 0); }
 
-        function barColor(p) { return p >= 100 ? '#ef4444' : p >= 80 ? '#f59e0b' : 'var(--accent)'; }
+        function barColor(p: any) { return p >= 100 ? '#ef4444' : p >= 80 ? '#f59e0b' : 'var(--accent)'; }
 
 
 
@@ -3339,7 +3391,9 @@ export async function loadSettingsTab(projectId) {
   // 0bf67524 — reorganize the flat settings body into Project/Workspace/Account
   // tabs. Runs before the deferred setTimeout(0) wiring (which finds elements by
   // id, so reparenting is transparent) and sets up an observer for async sections.
-  try { _organizeSettingsIntoTabs(projectId); } catch (e) { console.error('Settings tabs failed:', e); }
+  try { _organizeSettingsIntoTabs(projectId); } catch (e: any) { console.error('Settings tabs failed:', e); }
+
+  body.dataset.settingsTs = String(Date.now());
 
   _applySettingsRoleVisibility(projectId, _guest);
 
@@ -3348,11 +3402,11 @@ export async function loadSettingsTab(projectId) {
   // Append the Executor Rules + Code Intelligence section (defined in dashboard.js)
   // so the full settings tab includes it. Fire-and-forget so its fetch doesn't
   // delay the rest of the settings wiring below. (fix-settings-tab)
-  try { window.loadExecutorRulesSection?.(projectId); } catch (e) {}
+  try { window.loadExecutorRulesSection?.(projectId); } catch (e: any) {}
 
   // Tunnel Plugins section (per-account tunnel config) — also defined in
   // dashboard.js, appended below Executor Rules.
-  try { window.loadTunnelPluginsSection?.(projectId); } catch (e) {}
+  try { (window.loadTunnelPluginsSection as any)?.(projectId); } catch (e: any) {}
 
   if (isDemoMode()) hideDemoAdminControls();
 
@@ -3361,21 +3415,22 @@ export async function loadSettingsTab(projectId) {
     const titleIn = document.getElementById('blog-title');
     const bodyIn = document.getElementById('blog-body');
     const idIn = document.getElementById('blog-edit-id');
-    const listEl = document.getElementById('blog-list');
+    const listEl = document.getElementById('blog-list')!;
     const statusEl = document.getElementById('blog-status');
     const saveBtn = document.getElementById('blog-save');
     const genBtn = document.getElementById('blog-gen');
     const newBtn = document.getElementById('blog-new');
     if (!listEl || !saveBtn) return;  // not admin / not rendered
 
-    const setStatus = (m) => { if (statusEl) { statusEl.textContent = m; if (m) setTimeout(() => { if (statusEl.textContent === m) statusEl.textContent = ''; }, 2500); } };
+    const setStatus = (m: any) => { if (statusEl) { statusEl.textContent = m; if (m) setTimeout(() => { if (statusEl.textContent === m) statusEl.textContent = ''; }, 2500); } };
     const clearEditor = () => { if (idIn) idIn.value = ''; if (titleIn) titleIn.value = ''; if (bodyIn) bodyIn.value = ''; };
 
     async function loadList() {
+      listEl.innerHTML = '<div style="color:var(--muted)">Loading…</div>';
       try {
         const posts = await api('/admin/blog/posts');
         if (!posts.length) { listEl.innerHTML = '<div style="color:var(--muted)">No posts yet.</div>'; return; }
-        listEl.innerHTML = posts.map(p => {
+        listEl.innerHTML = posts.map((p: any) => {
           const pub = p.status === 'published';
           return `<div style="display:flex;align-items:center;gap:6px;padding:5px 0;border-bottom:1px solid var(--border)">
             <span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escapeHtml(p.title)}</span>
@@ -3386,17 +3441,17 @@ export async function loadSettingsTab(projectId) {
           </div>`;
         }).join('');
         listEl.querySelectorAll('.blog-edit').forEach(b => b.onclick = async () => {
-          try { const p = await api(`/admin/blog/posts/${b.dataset.id}`); if (idIn) idIn.value = p.id; if (titleIn) titleIn.value = p.title; if (bodyIn) bodyIn.value = p.body_md || ''; setStatus('Loaded for editing.'); } catch (e) { toast('load failed: ' + e.message, true); }
+          try { const p = await api(`/admin/blog/posts/${b.dataset.id}`); if (idIn) idIn.value = p.id; if (titleIn) titleIn.value = p.title; if (bodyIn) bodyIn.value = p.body_md || ''; setStatus('Loaded for editing.'); } catch (e: any) { toast('load failed: ' + e.message, true); }
         });
         listEl.querySelectorAll('.blog-toggle').forEach(b => b.onclick = async () => {
           const action = b.dataset.pub === '1' ? 'unpublish' : 'publish';
-          try { await api(`/admin/blog/posts/${b.dataset.id}/${action}`, { method: 'POST' }); toast(action + 'ed ✓'); loadList(); } catch (e) { toast('failed: ' + e.message, true); }
+          try { await api(`/admin/blog/posts/${b.dataset.id}/${action}`, { method: 'POST' }); toast(action + 'ed ✓'); loadList(); } catch (e: any) { toast('failed: ' + e.message, true); }
         });
         listEl.querySelectorAll('.blog-del').forEach(b => b.onclick = async () => {
           if (!confirm('Delete this post?')) return;
-          try { await api(`/admin/blog/posts/${b.dataset.id}`, { method: 'DELETE' }); toast('deleted'); if (idIn && idIn.value === b.dataset.id) clearEditor(); loadList(); } catch (e) { toast('failed: ' + e.message, true); }
+          try { await api(`/admin/blog/posts/${b.dataset.id}`, { method: 'DELETE' }); toast('deleted'); if (idIn && idIn.value === b.dataset.id) clearEditor(); loadList(); } catch (e: any) { toast('failed: ' + e.message, true); }
         });
-      } catch (e) { listEl.innerHTML = `<div style="color:var(--muted)">Could not load posts: ${escapeHtml(e.message)}</div>`; }
+      } catch (e: any) { listEl.innerHTML = `<div style="color:#f87171">Failed to load posts: ${escapeHtml(e.message || String(e))}</div>`; }
     }
 
     saveBtn.onclick = async () => {
@@ -3404,16 +3459,16 @@ export async function loadSettingsTab(projectId) {
       if (!title) { setStatus('Title required.'); return; }
       saveBtn.disabled = true;
       try {
-        const payload = { title, body_md: (bodyIn && bodyIn.value) || '' };
+        const payload: any = { title, body_md: (bodyIn && bodyIn.value) || '' };
         if (idIn && idIn.value) payload.id = idIn.value;
         const saved = await api('/admin/blog/posts', { method: 'POST', body: JSON.stringify(payload) });
         if (idIn) idIn.value = saved.id;
         setStatus('Saved draft.'); toast('saved ✓'); loadList();
-      } catch (e) { toast('save failed: ' + e.message, true); }
+      } catch (e: any) { toast('save failed: ' + e.message, true); }
       finally { saveBtn.disabled = false; }
     };
     if (genBtn) genBtn.onclick = async () => {
-      try { const d = await api('/admin/blog/generate-draft', { method: 'POST' }); if (idIn) idIn.value = ''; if (titleIn) titleIn.value = d.title || ''; if (bodyIn) bodyIn.value = d.body_md || ''; setStatus('Draft generated — review and save.'); } catch (e) { toast('failed: ' + e.message, true); }
+      try { const d = await api('/admin/blog/generate-draft', { method: 'POST' }); if (idIn) idIn.value = ''; if (titleIn) titleIn.value = d.title || ''; if (bodyIn) bodyIn.value = d.body_md || ''; setStatus('Draft generated — review and save.'); } catch (e: any) { toast('failed: ' + e.message, true); }
     };
     if (newBtn) newBtn.onclick = () => { clearEditor(); setStatus('New post.'); };
     loadList();
@@ -3528,7 +3583,7 @@ export async function loadSettingsTab(projectId) {
         const settings = await api(`/projects/${projectId}/settings`);
         const cfg = (settings && settings.executor_config) || {};
         const paths = Array.isArray(cfg.repo_paths) ? cfg.repo_paths.slice() : [];
-        const dup = paths.some(p => (p.cwd || '').trim() === cwd && (p.hostname || '').trim() === hostname);
+        const dup = paths.some((p: any) => (p.cwd || '').trim() === cwd && (p.hostname || '').trim() === hostname);
         if (!dup) paths.push({ cwd, hostname });
         cfg.repo_paths = paths;
         delete cfg.repo_path;
@@ -3537,7 +3592,7 @@ export async function loadSettingsTab(projectId) {
         _rerenderPathsTbl();
         if (_ezAddCwd) _ezAddCwd.value = '';
         if (ezStatus) { ezStatus.textContent = dup ? 'Already present.' : 'Added.'; setTimeout(() => { if (ezStatus) ezStatus.textContent = ''; }, 2000); }
-      } catch (e) {
+      } catch (e: any) {
         if (ezStatus) ezStatus.textContent = `Add failed: ${String(e)}`;
       } finally {
         if (_ezAddBtn) _ezAddBtn.disabled = false;
@@ -3618,7 +3673,7 @@ export async function loadSettingsTab(projectId) {
 
         setTimeout(() => { window.location.href = '/'; }, 1200);
 
-      } catch (e) {
+      } catch (e: any) {
 
         toast('Delete failed: ' + e.message, true);
 
@@ -3648,7 +3703,7 @@ export async function loadSettingsTab(projectId) {
 
         window.location.href = data.url;
 
-      } catch (e) {
+      } catch (e: any) {
 
         toast('Could not open billing portal: ' + e.message, true);
 
@@ -3664,13 +3719,13 @@ export async function loadSettingsTab(projectId) {
 
 
   // Shared token variable for both setTimeout blocks (MCP config and hooks config)
-  var currentToken = null;
+  var currentToken: any = null;
 
   setTimeout(() => {
 
     const hostedPlaceholderToken = mcpData ? ('sk_meridian_' + 'x'.repeat(32)) : '';
 
-    let hooksToken = null;
+    let hooksToken: any = null;
 
 
 
@@ -3730,7 +3785,7 @@ export async function loadSettingsTab(projectId) {
 
     const tokenListEl = document.getElementById(`hooks-token-list-${projectId}`);
 
-    const renderHooksTokenList = (tokens) => {
+    const renderHooksTokenList = (tokens: any) => {
 
       if (!tokenListEl) return;
 
@@ -3785,7 +3840,7 @@ export async function loadSettingsTab(projectId) {
 
             await loadHooksTokens();
 
-          } catch (e) {
+          } catch (e: any) {
 
             btn.disabled = false;
 
@@ -3813,7 +3868,7 @@ export async function loadSettingsTab(projectId) {
 
         renderHooksTokenList(tokens);
 
-      } catch (e) {
+      } catch (e: any) {
 
         tokenListEl.innerHTML = `<div style="font-size:10px;color:var(--danger,#ef4444)">Could not load API keys.</div>`;
 
@@ -3827,7 +3882,7 @@ export async function loadSettingsTab(projectId) {
 
 
 
-    const wireCopy = (buttonId, targetId) => {
+    const wireCopy = (buttonId: any, targetId: any) => {
 
       const btn = document.getElementById(buttonId);
 
@@ -3845,7 +3900,7 @@ export async function loadSettingsTab(projectId) {
 
           setTimeout(() => { btn.textContent = 'Copy'; }, 1800);
 
-        } catch (e) {
+        } catch (e: any) {
 
           btn.textContent = 'Select and copy manually';
 
@@ -3875,8 +3930,8 @@ export async function loadSettingsTab(projectId) {
 
 
 
-    function _showKeyReveal(rawToken, label) {
-      const revealEl = document.getElementById(`hooks-key-reveal-${projectId}`);
+    function _showKeyReveal(rawToken: any, label: any) {
+      const revealEl = document.getElementById(`hooks-key-reveal-${projectId}`)!;
       const revealInput = document.getElementById(`hooks-key-reveal-input-${projectId}`);
       const revealCopyBtn = document.getElementById(`hooks-key-copy-btn-${projectId}`);
       const revealDismiss = document.getElementById(`hooks-key-dismiss-${projectId}`);
@@ -3927,7 +3982,7 @@ export async function loadSettingsTab(projectId) {
 
           _showKeyReveal(tok.token, 'API key');
 
-        } catch (e) {
+        } catch (e: any) {
 
           const statusEl = document.getElementById(`hooks-token-status-${projectId}`);
 
@@ -3963,7 +4018,7 @@ export async function loadSettingsTab(projectId) {
 
           await loadHooksTokens();
 
-        } catch (e) {
+        } catch (e: any) {
 
           const statusEl = document.getElementById(`hooks-token-status-${projectId}`);
 
@@ -4060,7 +4115,7 @@ export async function loadSettingsTab(projectId) {
 
         }
 
-      } catch (e) {
+      } catch (e: any) {
 
         if (statusEl) statusEl.textContent = 'error';
 
@@ -4104,7 +4159,7 @@ export async function loadSettingsTab(projectId) {
 
         }
 
-      } catch (e) {
+      } catch (e: any) {
 
         if (statusEl) statusEl.textContent = 'error';
 
@@ -4134,7 +4189,7 @@ export async function loadSettingsTab(projectId) {
 
         if (statusEl) { statusEl.textContent = 'sent!'; setTimeout(() => { statusEl.textContent = ''; }, 3000); }
 
-      } catch (e) {
+      } catch (e: any) {
 
         if (statusEl) {
 
@@ -4206,7 +4261,7 @@ export async function loadSettingsTab(projectId) {
 
       const statusEl = document.getElementById(`settings-save-status-${projectId}`);
 
-      const payload = {};
+      const payload: Record<string, any> = {};
 
       body.querySelectorAll('input[data-pref]').forEach(c => { payload[c.dataset.pref] = c.checked; });
 
@@ -4216,7 +4271,7 @@ export async function loadSettingsTab(projectId) {
 
         if (statusEl) { statusEl.textContent = 'saved'; setTimeout(() => { statusEl.textContent = ''; }, 1800); }
 
-      } catch (e) {
+      } catch (e: any) {
 
         if (statusEl) statusEl.textContent = `error: ${escapeHtml(String(e))}`;
 
@@ -4241,6 +4296,86 @@ export async function loadSettingsTab(projectId) {
     };
 
   }
+
+  // 330937c6 — multi-account: "Connect another account" forces GitHub's account
+  // picker (select_account=1) so a different account can be attached from one browser.
+  const ghAddAccountBtn = document.getElementById(`github-add-account-${projectId}`);
+
+  if (ghAddAccountBtn) {
+
+    ghAddAccountBtn.onclick = () => {
+
+      window.location.href = `/auth/github/repo-connect?project_id=${encodeURIComponent(projectId)}&select_account=1`;
+
+    };
+
+  }
+
+  // 330937c6 — pin a connected account to this project (resolution order uses it).
+  document.querySelectorAll(`#github-card-${projectId} .gh-acct-use`).forEach(btn => {
+
+    btn.onclick = async () => {
+
+      const login = btn.dataset.login || '';
+
+      if (!login) return;
+
+      btn.disabled = true;
+
+      try {
+
+        await api(`/projects/${projectId}/github/account`, {
+
+          method: 'PATCH',
+
+          body: JSON.stringify({ account_login: login }),
+
+        });
+
+        loadSettingsTab(projectId, { force: true });
+
+      } catch (e: any) {
+
+        btn.disabled = false;
+
+        toast('Could not switch account: ' + (e.message || e), true);
+
+      }
+
+    };
+
+  });
+
+  // 330937c6 — disconnect a specific GitHub account (removes its stored token).
+  document.querySelectorAll(`#github-card-${projectId} .gh-acct-remove`).forEach(btn => {
+
+    btn.onclick = async () => {
+
+      const login = btn.dataset.login || '';
+
+      if (!login) return;
+
+      if (!confirm(`Disconnect GitHub account @${login}? Projects using it fall back to another connected account.`)) return;
+
+      btn.disabled = true;
+
+      try {
+
+        await api(`/github/connections/${encodeURIComponent(login)}`, { method: 'DELETE' });
+
+        loadSettingsTab(projectId, { force: true });
+
+      } catch (e: any) {
+
+        btn.disabled = false;
+
+        toast('Could not disconnect: ' + (e.message || e), true);
+
+      }
+
+    };
+
+  });
 
 
 
@@ -4282,9 +4417,9 @@ export async function loadSettingsTab(projectId) {
 
         });
 
-        loadSettingsTab(projectId);
+        loadSettingsTab(projectId, { force: true });
 
-      } catch (e) {
+      } catch (e: any) {
 
         if (statusEl) statusEl.textContent = e.message || 'Save failed';
 
@@ -4318,9 +4453,9 @@ export async function loadSettingsTab(projectId) {
 
         await api(`/projects/${projectId}/github/disconnect`, { method: 'DELETE' });
 
-        loadSettingsTab(projectId);
+        loadSettingsTab(projectId, { force: true });
 
-      } catch (e) {
+      } catch (e: any) {
 
         if (statusEl) statusEl.textContent = 'error disconnecting';
 
@@ -4346,7 +4481,7 @@ export async function loadSettingsTab(projectId) {
 
   if (ghBranchSelect) {
 
-    const fillBranches = async (repo, preferred) => {
+    const fillBranches = async (repo: any, preferred: any) => {
 
       const fallback = preferred || ghSelectedBranch || 'main';
 
@@ -4362,13 +4497,13 @@ export async function loadSettingsTab(projectId) {
 
         if (!branches.length) branches = [fallback];
 
-        ghBranchSelect.innerHTML = branches.map(b =>
+        ghBranchSelect.innerHTML = branches.map((b: any) =>
 
           `<option value="${escapeHtml(b)}" ${b === want ? 'selected' : ''}>${escapeHtml(b)}</option>`
 
         ).join('');
 
-      } catch (e) {
+      } catch (e: any) {
 
         // Leave the current single-option select in place on failure.
 
@@ -4424,7 +4559,7 @@ export async function loadSettingsTab(projectId) {
 
         }
 
-      } catch (e) {
+      } catch (e: any) {
 
         if (statusEl) statusEl.textContent = 'error';
 
@@ -4438,7 +4573,7 @@ export async function loadSettingsTab(projectId) {
 
   }
 
-  } catch (e) {
+  } catch (e: any) {
     body.innerHTML = `<div style="color:var(--error);font-size:11px">Failed to load settings: ${escapeHtml(String(e))}</div>`;
   }
 
@@ -4446,4 +4581,4 @@ export async function loadSettingsTab(projectId) {
 
 // --- esbuild: re-expose top-level symbols as globals so inline
 // handlers and cross-file references keep resolving after IIFE bundling.
-try { Object.assign(window, { suggestNtfyTopic, loadSettingsTab }); } catch (e) {}
+try { Object.assign(window, { suggestNtfyTopic, loadSettingsTab }); } catch (e: any) {}

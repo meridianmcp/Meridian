@@ -143,7 +143,9 @@
 </div>
 
 <!-- ITEM 4 esbuild: single bundled IIFE (build with `node build.mjs`) -->
-<script src="/static/dashboard.bundle.js?v={{ asset_version or version }}"></script>
+<!-- 9aba783f: ?v= is the bundle's content hash (asset-manifest.json) so a deploy
+     always busts the browser cache, even when no version/git SHA is available. -->
+<script src="/static/dashboard.bundle.js?v={{ bundle_hash or asset_version or version }}"></script>
 
 </body>
 </html>

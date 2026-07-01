@@ -108,6 +108,12 @@ BUILTIN_PLUGINS: list[dict[str, Any]] = [
         "core": True,
         # default: Serena (LSP symbol tools); {repo_path} expanded at spawn time.
         "command": list(SERENA_EXTRACT_COMMAND),
+        # cc904bfe — historical defaults this slot has shipped. A saved override
+        # matching one of these (but not the current default) is a stale copy of
+        # an old default → the dashboard shows a "newer default available" badge.
+        # The extract slot defaulted to `uvx mcp-server-code-extractor` (command
+        # None → that builder) before Serena (commit 1428f1b).
+        "previous_defaults": [["uvx", "mcp-server-code-extractor"]],
         # MUST stay None — the server bridge namespaces extract-slot tools as
         # "extractor__find_symbol" via SLOT_DISPLAY_NAMES. A client prefix here
         # would double them to "extractor__Serena__find_symbol". (49905647)
@@ -359,8 +365,58 @@ def resolve_plugins(raw_config: Any, detected_slots: Any = frozenset()) -> list[
         # slot / url_prefix are immutable for built-ins.
         merged["slot"] = base["slot"]
         merged["url_prefix"] = base["url_prefix"]
+        # cc904bfe — flag a stale custom command override: the tenant saved a
+        # `command` that matches a *previous* built-in default for this slot (so
+        # it was a copy of the old default, now superseded by a new one). The
+        # tunnel still runs the override, but the dashboard surfaces a "newer
+        # default available" badge so the user can opt back into the new default.
+        # A genuinely-custom command (not in previous_defaults) is left untouched.
+        ov_cmd = ov.get("command")
+        prev_defaults = base.get("previous_defaults") or []
+        if (ov_cmd and ov_cmd != base.get("command")
+                and any(ov_cmd == pd for pd in prev_defaults)):
+            merged["stale_override"] = True
+            merged["newer_default_command"] = base.get("command")
+            merged["newer_default_label"] = base.get("description")
+        merged.pop("previous_defaults", None)  # internal — don't leak to clients
         resolved.append(merged)
     return resolved
+
+
+def parse_plugins_by_host(raw: Any) -> dict[str, Any]:
+    """8660d701 — parse ``tenants.tunnel_plugins_by_host`` into ``{hostname: config}``.
+
+    Tolerant of None / empty / malformed JSON / non-dict input (all → ``{}``), so a
+    junk value never breaks tunnel resolution.
+    """
+    import json
+    val: Any = raw
+    if isinstance(raw, str):
+        if not raw.strip():
+            return {}
+        try:
+            val = json.loads(raw)
+        except Exception:  # noqa: BLE001
+            return {}
+    if not isinstance(val, dict):
+        return {}
+    return {str(k): v for k, v in val.items() if str(k)}
+
+
+def select_host_config(default_config: Any, by_host_raw: Any, hostname: str | None) -> Any:
+    """8660d701 — the effective tunnel-plugins config for one machine.
+
+    Returns the machine's per-host config when ``hostname`` has an entry in
+    ``by_host_raw`` (``tenants.tunnel_plugins_by_host``); otherwise the per-tenant
+    default ``default_config`` (already-parsed ``tunnel_plugins``). This is how a
+    machine running ``meridian --tunnel`` gets its own config while existing
+    single-machine tenants keep working unchanged.
+    """
+    if hostname:
+        by_host = parse_plugins_by_host(by_host_raw)
+        if hostname in by_host:
+            return by_host[hostname]
+    return default_config
 
 
 # Office slots auto-enable when their MCP launcher is on PATH (sprint 6c2b3562).

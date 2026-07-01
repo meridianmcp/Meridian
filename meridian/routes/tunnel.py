@@ -25,6 +25,7 @@ import base64
 import hashlib
 import json
 import logging
+import time
 import uuid
 from typing import Any
 
@@ -1023,16 +1024,44 @@ async def get_tunnel_plugins(request: Request) -> Response:
             "active": {"fs": False, "code": False, "extract": False, "ppt": False, "word": False, "dc": False},
             "plan": "free",
         })
-    parsed = _parse_plugins_json(tenant.get("tunnel_plugins"))
+    # 8660d701 — per-machine config. ?hostname=X scopes to that machine's config
+    # (from tunnel_plugins_by_host), falling back to the per-tenant default. No
+    # hostname → the default config (back-compat with the single-machine dashboard).
+    from ..tunnel_plugins import select_host_config, parse_plugins_by_host
+    hostname = (request.query_params.get("hostname") or "").strip() or None
+    by_host = parse_plugins_by_host(tenant.get("tunnel_plugins_by_host"))
+    parsed = select_host_config(
+        _parse_plugins_json(tenant.get("tunnel_plugins")),
+        tenant.get("tunnel_plugins_by_host"),
+        hostname,
+    )
     tid = tenant.get("id")
+    # Machines the dashboard can offer per-machine config for: those with a saved
+    # per-host config + machines that registered hook tokens (registered_hostnames).
+    _hosts = set(by_host.keys())
+    try:
+        for _m in await db_module.list_registered_hostnames(request.app.state.db, tid):
+            if _m.get("hostname"):
+                _hosts.add(str(_m["hostname"]))
+    except Exception:  # noqa: BLE001 — host listing is best-effort
+        pass
     return _json_response({
         "plugins": resolve_plugins(parsed),
         # User-defined (non-built-in) plugins, so the dashboard can render and
         # edit existing custom entries. LOCAL-ONLY — no server route involved.
         "custom": resolve_custom_plugins(parsed),
         "config": parsed if isinstance(parsed, (dict, list)) else {},
+        # 8660d701 — per-machine config UI: the selected machine + the machines the
+        # dashboard can pick from (configured + registered), and which already have
+        # an explicit per-host config saved.
+        "hostname": hostname,
+        "hosts": sorted(_hosts),
+        "configured_hosts": sorted(by_host.keys()),
         "active": {
-            "fs": tid in _tunnel_sockets,
+            # On Fly.io multi-instance, the WebSocket may be held by a different
+            # instance (in-memory miss). Fall back to tenant.tunnel_active (DB flag
+            # set on connect, cleared on disconnect) so status stays correct.
+            "fs": (tid in _tunnel_sockets) or bool(tenant.get("tunnel_active")),
             "code": tid in _tunnel_code_sockets,
             "extract": tid in _tunnel_extract_sockets,
             "ppt": tid in _tunnel_ppt_sockets,
@@ -1069,12 +1098,29 @@ async def put_tunnel_plugins(request: Request) -> Response:
         return _json_response({"error": "invalid JSON body"}, status_code=400)
     raw = body.get("config") if isinstance(body, dict) and "config" in body else body
     normalized = normalize_plugins_config(raw)
-    stored = json.dumps(normalized) if normalized else None
+    # 8660d701 — ?hostname=X persists this config for that machine only
+    # (tunnel_plugins_by_host); without a hostname it writes the per-tenant default
+    # (tunnel_plugins), preserving the legacy single-machine behaviour.
+    hostname = (request.query_params.get("hostname") or "").strip() or None
     # tenants lives in the control-plane DB (app.state.db), not the tenant's
     # data-plane DB — mirror the WS handler's update_tenant(tunnel_active=...).
-    await db_module.update_tenant(request.app.state.db, tenant["id"], tunnel_plugins=stored)
+    if hostname:
+        from ..tunnel_plugins import parse_plugins_by_host
+        by_host = parse_plugins_by_host(tenant.get("tunnel_plugins_by_host"))
+        if normalized:
+            by_host[hostname] = normalized
+        else:
+            by_host.pop(hostname, None)  # empty → clear this machine's override
+        stored_by_host = json.dumps(by_host) if by_host else None
+        await db_module.update_tenant(
+            request.app.state.db, tenant["id"], tunnel_plugins_by_host=stored_by_host)
+    else:
+        stored = json.dumps(normalized) if normalized else None
+        await db_module.update_tenant(
+            request.app.state.db, tenant["id"], tunnel_plugins=stored)
     return _json_response({
         "ok": True,
+        "hostname": hostname,
         "plugins": resolve_plugins(normalized),
         "config": normalized,
     })
@@ -1180,6 +1226,11 @@ async def install_plugin(request: Request) -> Response:
 
 _REGISTRY_BASE = "https://registry.modelcontextprotocol.io/v0/servers"
 _REGISTRY_TIMEOUT = 8  # seconds
+# Per-process response cache: "{limit}:{cursor}" → (response_dict, monotonic_ts)
+# Serves stale data on upstream failure so the registry never appears empty just
+# because Fly.io egress is briefly unreachable.
+_registry_cache: dict[str, tuple[dict, float]] = {}
+_REGISTRY_CACHE_TTL = 3600  # seconds
 
 
 def _extract_install_command(server: dict) -> str:
@@ -1233,18 +1284,29 @@ async def get_mcp_registry(request: Request) -> Response:
         params["cursor"] = cursor
     url = _REGISTRY_BASE + "?" + urllib.parse.urlencode(params)
 
+    cache_key = f"{limit}:{cursor}"
+
     try:
         req = urllib.request.Request(
             url,
             headers={"Accept": "application/json", "User-Agent": "Meridian/1.0"},
         )
-        import socket as _socket
         with urllib.request.urlopen(req, timeout=_REGISTRY_TIMEOUT) as resp:  # noqa: S310
             raw = resp.read()
         data = json.loads(raw)
     except Exception as exc:  # noqa: BLE001
         _log.warning("MCP registry fetch failed: %s", exc)
-        return _json_response({"error": "registry unavailable", "servers": [], "next_cursor": None}, status_code=200)
+        # Return cached data if available — prevents the browse section from
+        # appearing empty just because Fly.io egress is temporarily unreachable.
+        cached = _registry_cache.get(cache_key)
+        if cached and (time.monotonic() - cached[1]) < _REGISTRY_CACHE_TTL:
+            _log.info("MCP registry: serving cached response (age=%.0fs)", time.monotonic() - cached[1])
+            return _json_response({**cached[0], "cached": True})
+        # No cache — 503 so api() throws and the client falls back to curated list.
+        return _json_response(
+            {"error": f"registry unavailable: {exc}", "servers": [], "next_cursor": None},
+            status_code=503,
+        )
 
     servers_raw = data.get("servers") or []
     servers_out = []
@@ -1263,10 +1325,12 @@ async def get_mcp_registry(request: Request) -> Response:
             "homepage": homepage,
         })
 
-    return _json_response({
+    result = {
         "servers": servers_out,
         "next_cursor": data.get("nextCursor") or data.get("next_cursor") or None,
-    })
+    }
+    _registry_cache[cache_key] = (result, time.monotonic())
+    return _json_response(result)
 
 
 def _union_filesystem_roots(projects: list[dict]) -> list[str]:

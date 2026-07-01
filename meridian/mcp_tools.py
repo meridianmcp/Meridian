@@ -7,7 +7,7 @@ from typing import Any
 
 _TOOL_EXAMPLES: dict[str, str] = {
     "create_project": 'create_project(name="my-app")',
-    "start_session": 'start_session(project_id="abc-123", session_name="feature-x", human_id="alice", role="executor")',
+    "start_session": 'start_session(project_name="my-project", session_name="feature-x", human_id="alice", role="executor")',
     "register_session": 'register_session(project_id="abc-123", session_name="feature-x", human_id="alice")',
     "log_task": 'log_task(session_id="session-uuid", project_id="abc-123", description="Fixed auth bug", status="done")',
     "get_context_block": 'get_context_block(project_id="abc-123", mode="chat")',
@@ -77,7 +77,8 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
           "client": {"type": "string", "enum": ["claude-code", "claude-desktop", "cursor", "other"]},
           "role": {"type": "string", "enum": ["executor"], "description": "Pass 'executor' to inject executor_config and credentials guidance."},
           "compact": {"type": "boolean", "description": "Default true — slim orientation. Set false for the full goal/instructions payload."},
-          "version": {"type": "string", "description": "Optional sprint-version bucket (e.g. 'v0.1.x') to scope this session to. Sprint progress/items in the orientation and /goal filter to it. Omit to auto-infer the bucket with the most pending items."}},
+          "version": {"type": "string", "description": "Optional sprint-version bucket (e.g. 'v0.1.x') to scope this session to. Sprint progress/items in the orientation and /goal filter to it. Omit to auto-infer the bucket with the most pending items."},
+          "mode": {"type": "string", "enum": ["continue"], "description": "Pass 'continue' to resume an already-active same-name session WITHOUT re-reading the full L0/L1/L2 orientation: returns just session_id + live pending items + the ready-to-paste /goal string. Auto-detected anyway within a 5-min heartbeat window; 'continue' widens that so a known-yours session resumes cleanly even after a longer gap."}},
           "required": ["session_name"]}},
     {"name": "list_projects", "description":
         "Read-only: List all projects — find, browse, or look up your projects and their IDs. "

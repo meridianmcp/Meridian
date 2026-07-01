@@ -31,10 +31,20 @@ import sys
 
 
 def _kill_port(port: int) -> None:
-    """Kill any process listening on the given port before starting."""
+    """Kill any process listening on the given port before starting.
+
+    The free-port probe uses a short timeout so a dropped SYN (e.g. a firewall
+    that black-holes rather than refuses) can't stall startup for seconds per
+    port. A refused connection still returns instantly; a timeout is treated as
+    "free" so we never block. (a887155d)
+    """
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        if s.connect_ex(("127.0.0.1", port)) != 0:
-            return  # port is free
+        s.settimeout(0.25)
+        try:
+            if s.connect_ex(("127.0.0.1", port)) != 0:
+                return  # port is free (connection refused)
+        except OSError:
+            return  # timed out / unreachable → treat as free, don't hang
     if sys.platform == "win32":
         result = subprocess.run(
             f"netstat -ano | findstr :{port}",
@@ -114,6 +124,12 @@ def main(argv: list[str] | None = None) -> int:
         help="Local port for the tunnel's mcp-proxy (default 8808).",
     )
     parser.add_argument(
+        "--no-kill",
+        action="store_true",
+        help="Skip the stale-port cleanup (8808-8813) at --tunnel startup. Use "
+        "for fast restarts when you know no old proxies are lingering. (a887155d)",
+    )
+    parser.add_argument(
         "--code-dir",
         action="append",
         metavar="PATH",
@@ -135,9 +151,12 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     if args.tunnel:
-        print("[meridian] --tunnel: killing stale ports 8808-8813", flush=True)
-        for _p in range(8808, 8814):
-            _kill_port(_p)
+        if args.no_kill:
+            print("[meridian] --tunnel: --no-kill set, skipping stale-port cleanup", flush=True)
+        else:
+            print("[meridian] --tunnel: killing stale ports 8808-8813", flush=True)
+            for _p in range(8808, 8814):
+                _kill_port(_p)
         from .tunnel_client import run_tunnel
 
         loop = asyncio.get_event_loop()

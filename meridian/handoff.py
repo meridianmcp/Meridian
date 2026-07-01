@@ -705,8 +705,10 @@ def _render_starter_handoff(
     pid = project["id"]
     name = project["name"]
     lines = [
-        f"project_id: {pid}",
-        f'start: start_session(project_id="{pid}", session_name="describe-what-youre-doing")',
+        # 11a91d31 — default to project_name (the idiomatic interface per 8a449ec0);
+        # project_id stays as a fallback comment.
+        f'start: start_session(project_name="{name}", session_name="describe-what-youre-doing")',
+        f"project_id (fallback): {pid}",
         "",
         f"# Meridian — {name}",
     ]
@@ -790,7 +792,7 @@ def _render_delta_handoff(
     """Return a compact handoff for back-to-back goal runs in one session."""
     # 04f03ee4 — one-liner start instruction at very top of delta output
     lines = [
-        f"To start fresh: start_session(project_id=\"{project['id']}\", session_name=\"describe-what-youre-doing\")",
+        f"To start fresh: start_session(project_name=\"{project['name']}\", session_name=\"describe-what-youre-doing\")  # project_id={project['id']}",
         "",
         f"# Session Update — {project['name']}",
         f"_Generated at {generated_at} (delta mode)_",

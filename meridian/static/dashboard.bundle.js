@@ -1,25 +1,26 @@
+"use strict";
 (() => {
-  // meridian/static/dashboard-core.js
+  // meridian/static/dashboard-core.ts
   async function api2(path, opts = {}) {
     const state2 = window.state || {};
     const headers = { "Content-Type": "application/json" };
     if (state2.activeWorkspaceTenantId) {
       headers["X-Workspace-Tenant-Id"] = state2.activeWorkspaceTenantId;
     }
-    const r = await fetch(path, { headers, ...opts });
-    if (!r.ok) {
-      if (r.status === 403 && (typeof isDemoMode === "function" ? isDemoMode() : false)) {
+    const r3 = await fetch(path, { headers, ...opts });
+    if (!r3.ok) {
+      if (r3.status === 403 && (typeof isDemoMode === "function" ? isDemoMode() : false)) {
         if (typeof showDemoReadonlyToast === "function") showDemoReadonlyToast();
         throw new Error("demo_readonly");
       }
-      const text = await r.text();
-      const err = new Error(`${r.status}: ${text}`);
-      err.status = r.status;
+      const text = await r3.text();
+      const err = new Error(`${r3.status}: ${text}`);
+      err.status = r3.status;
       err.endpoint = path;
       err.responseText = text;
       throw err;
     }
-    return r.status === 204 ? null : r.json();
+    return r3.status === 204 ? null : r3.json();
   }
   window.api = api2;
   var _staleProjectsHandled = /* @__PURE__ */ new Set();
@@ -30,31 +31,38 @@
       const data = await api2(path, opts);
       if (typeof clearProjectLoadError === "function") clearProjectLoadError(projectId, path);
       return data;
-    } catch (e) {
-      if (e && e.status === 404 && /project not found/i.test(e.responseText || "") && !(state2.projects || []).some((p) => p.id === projectId) && !_staleProjectsHandled.has(projectId)) {
+    } catch (e3) {
+      if (e3 && e3.status === 404 && /project not found/i.test(e3.responseText || "") && !(state2.projects || []).some((p3) => p3.id === projectId) && !_staleProjectsHandled.has(projectId)) {
         _staleProjectsHandled.add(projectId);
         try {
           if (typeof closeTab === "function") closeTab(projectId);
-        } catch (_) {
+        } catch (_2) {
         }
         try {
           if (typeof _checkAccountSwitch === "function") _checkAccountSwitch();
-        } catch (_) {
+        } catch (_2) {
         }
-        throw e;
+        throw e3;
       }
-      if (typeof recordProjectLoadError === "function") recordProjectLoadError(projectId, path, e);
-      throw e;
+      if (typeof recordProjectLoadError === "function") recordProjectLoadError(projectId, path, e3);
+      throw e3;
     }
   }
   window.projectApi = projectApi2;
   try {
     Object.assign(window, { api: api2, projectApi: projectApi2, _staleProjectsHandled });
-  } catch (e) {
+  } catch (e3) {
   }
 
-  // meridian/static/dashboard-utils.js
-  var _PLAN_LABELS2 = { solo: "Standard", free: "Free Trial", standard: "Standard", pro: "Pro", trial: "Trial", admin: "Admin" };
+  // meridian/static/dashboard-utils.ts
+  var _PLAN_LABELS2 = {
+    solo: "Standard",
+    free: "Free Trial",
+    standard: "Standard",
+    pro: "Pro",
+    trial: "Trial",
+    admin: "Admin"
+  };
   var QUEUE_DONE_PAGE_SIZE2 = 10;
   var SESSION_LIVE_WINDOW_MS = 10 * 60 * 1e3;
   var DEFAULT_MAX_PINNED_DECISIONS2 = 20;
@@ -63,16 +71,19 @@
     window.state.panels[projectId] = window.state.panels[projectId] || {};
     return window.state.panels[projectId];
   }
+  var _toastTimer;
   function toast2(msg, isError = false) {
     const el = document.getElementById("toast");
+    if (!el) return;
     el.textContent = msg;
     el.classList.toggle("error", isError);
     el.classList.add("show");
-    clearTimeout(toast2._t);
-    toast2._t = setTimeout(() => el.classList.remove("show"), 2600);
+    clearTimeout(_toastTimer);
+    _toastTimer = setTimeout(() => el.classList.remove("show"), 2600);
   }
-  function escapeHtml2(s) {
-    return String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
+  function escapeHtml2(s3) {
+    const map = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" };
+    return String(s3).replace(/[&<>"']/g, (c3) => map[c3] ?? c3);
   }
   function formatRelativeTime2(ts) {
     if (!ts) return "";
@@ -96,20 +107,35 @@
   }
   function isLiveSession2(session, ageMs) {
     const age = ageMs == null ? sessionAgeMs2(session) : ageMs;
-    return session && session.status === "active" && age >= 0 && age <= SESSION_LIVE_WINDOW_MS;
+    return !!session && session.status === "active" && age >= 0 && age <= SESSION_LIVE_WINDOW_MS;
   }
   var _HUMAN_COLORS = ["#6c8fff", "#a78bfa", "#22d3ee", "#4ade80", "#fbbf24", "#f87171", "#fb923c", "#e879f9"];
   function _colorForHuman2(humanId) {
-    let h = 0;
-    for (let i = 0; i < (humanId || "").length; i++) h = (h << 5) - h + humanId.charCodeAt(i) | 0;
-    return _HUMAN_COLORS[Math.abs(h) % _HUMAN_COLORS.length];
+    let h2 = 0;
+    const id = humanId || "";
+    for (let i3 = 0; i3 < id.length; i3++) h2 = (h2 << 5) - h2 + id.charCodeAt(i3) | 0;
+    return _HUMAN_COLORS[Math.abs(h2) % _HUMAN_COLORS.length];
   }
   try {
-    Object.assign(window, { getPanelState: getPanelState2, toast: toast2, escapeHtml: escapeHtml2, formatRelativeTime: formatRelativeTime2, sessionAgeMs: sessionAgeMs2, isLiveSession: isLiveSession2, _colorForHuman: _colorForHuman2, _PLAN_LABELS: _PLAN_LABELS2, QUEUE_DONE_PAGE_SIZE: QUEUE_DONE_PAGE_SIZE2, SESSION_LIVE_WINDOW_MS, _HUMAN_COLORS, DEFAULT_MAX_PINNED_DECISIONS: DEFAULT_MAX_PINNED_DECISIONS2, DEFAULT_CONTEXT_THRESHOLD: DEFAULT_CONTEXT_THRESHOLD2 });
-  } catch (e) {
+    Object.assign(window, {
+      getPanelState: getPanelState2,
+      toast: toast2,
+      escapeHtml: escapeHtml2,
+      formatRelativeTime: formatRelativeTime2,
+      sessionAgeMs: sessionAgeMs2,
+      isLiveSession: isLiveSession2,
+      _colorForHuman: _colorForHuman2,
+      _PLAN_LABELS: _PLAN_LABELS2,
+      QUEUE_DONE_PAGE_SIZE: QUEUE_DONE_PAGE_SIZE2,
+      SESSION_LIVE_WINDOW_MS,
+      _HUMAN_COLORS,
+      DEFAULT_MAX_PINNED_DECISIONS: DEFAULT_MAX_PINNED_DECISIONS2,
+      DEFAULT_CONTEXT_THRESHOLD: DEFAULT_CONTEXT_THRESHOLD2
+    });
+  } catch (e3) {
   }
 
-  // meridian/static/dashboard-demo.js
+  // meridian/static/dashboard-demo.ts
   function isDemoMode2() {
     return !!window.state?.serverConfig?.demo_mode || window.location.pathname.startsWith("/demo");
   }
@@ -139,7 +165,7 @@
     btn.onclick = () => {
       try {
         startDemoTour(0);
-      } catch (e) {
+      } catch (e3) {
       }
     };
     footer.appendChild(btn);
@@ -166,7 +192,7 @@
     btn.onclick = () => {
       try {
         showFeedbackModal();
-      } catch (e) {
+      } catch (e3) {
       }
     };
     footer.appendChild(btn);
@@ -221,8 +247,8 @@
     document.body.appendChild(overlay);
     const statusEl = box.querySelector("#feedback-status");
     box.querySelector("#feedback-cancel").onclick = () => overlay.remove();
-    overlay.onclick = (e) => {
-      if (e.target === overlay) overlay.remove();
+    overlay.onclick = (e3) => {
+      if (e3.target === overlay) overlay.remove();
     };
     box.querySelector("#feedback-send").onclick = async () => {
       const type = box.querySelector("#feedback-type").value;
@@ -245,8 +271,8 @@
         statusEl.textContent = "Thanks! Feedback sent.";
         statusEl.style.color = "#059669";
         setTimeout(() => overlay.remove(), 900);
-      } catch (e) {
-        statusEl.textContent = e.message || "Could not send \u2014 please try again.";
+      } catch (e3) {
+        statusEl.textContent = e3.message || "Could not send \u2014 please try again.";
         statusEl.style.color = "var(--danger,#dc2626)";
       }
     };
@@ -322,9 +348,9 @@
         btn.style.opacity = String(parseFloat(btn.style.opacity || "1") * 0.55);
         btn.style.cursor = "not-allowed";
         const orig = btn.onclick;
-        btn.onclick = (e) => {
-          e.preventDefault();
-          e.stopPropagation();
+        btn.onclick = (e3) => {
+          e3.preventDefault();
+          e3.stopPropagation();
           showDemoReadonlyToast2();
         };
       });
@@ -332,6 +358,7 @@
   }
   function showDemoReadonlyToast2() {
     const el = document.getElementById("toast");
+    if (!el) return;
     el.innerHTML = 'Read-only demo \u2014 <a href="/auth/login" style="color:#fff;font-weight:600;text-decoration:underline">sign in for full access \u2192</a>';
     el.classList.add("error", "show");
     clearTimeout(toast._t);
@@ -370,43 +397,43 @@
   </div>
 
 </div>`;
-    overlay.addEventListener("click", (e) => {
-      if (e.target === overlay) overlay.remove();
+    overlay.addEventListener("click", (e3) => {
+      if (e3.target === overlay) overlay.remove();
     });
     document.body.appendChild(overlay);
   }
   try {
     Object.assign(window, { isDemoMode: isDemoMode2, isHostedMode: isHostedMode2, isHostedAdmin: isHostedAdmin2, ensureTourButton: ensureTourButton2, ensureFeedbackButton: ensureFeedbackButton2, showFeedbackModal, hideDemoAdminControls: hideDemoAdminControls2, showDemoReadonlyToast: showDemoReadonlyToast2, showDemoOnboardingOverlay: showDemoOnboardingOverlay2 });
-  } catch (e) {
+  } catch (e3) {
   }
 
-  // meridian/static/dashboard-timeline.js
+  // meridian/static/dashboard-timeline.ts
   function renderTimeline2(projectId, data) {
     const wrap = document.getElementById(`timeline-wrap-${projectId}`);
     if (!wrap) return;
-    const p = window.state?.panels[projectId];
-    const sessionFilter = p && p.timelineSessionFilter;
+    const p3 = window.state?.panels[projectId];
+    const sessionFilter = p3 && p3.timelineSessionFilter;
     const rawTasks = data && data.tasks || [];
-    const tasks = sessionFilter ? rawTasks.filter((t) => t.session_id === sessionFilter) : rawTasks;
+    const tasks = sessionFilter ? rawTasks.filter((t3) => t3.session_id === sessionFilter) : rawTasks;
     const goal_events = sessionFilter ? [] : data && data.goal_events || [];
     data = { ...data || {}, tasks, goal_events };
     if (!tasks.length && !goal_events.length) {
       wrap.innerHTML = `<div class="timeline-empty">no activity yet \u2014 log a task to see it here</div>`;
       return;
     }
-    if (p && p._echart) {
+    if (p3 && p3._echart) {
       try {
-        p._echart.dispose();
-      } catch (_) {
+        p3._echart.dispose();
+      } catch (_2) {
       }
-      p._echart = null;
+      p3._echart = null;
     }
-    if (p && p._heatchart) {
+    if (p3 && p3._heatchart) {
       try {
-        p._heatchart.dispose();
-      } catch (_) {
+        p3._heatchart.dispose();
+      } catch (_2) {
       }
-      p._heatchart = null;
+      p3._heatchart = null;
     }
     if (typeof echarts === "undefined") {
       _renderTimelineLog(projectId, data);
@@ -415,7 +442,7 @@
     const savedTlView = (() => {
       try {
         return localStorage.getItem("meridian_tl_view_" + projectId) || "heatmap";
-      } catch (_) {
+      } catch (_2) {
         return "heatmap";
       }
     })();
@@ -465,10 +492,10 @@
         tasksPane.innerHTML = `<div class="timeline-empty">no tasks logged yet</div>`;
         return;
       }
-      tasksPane.innerHTML = tasks2.map((t) => {
-        const ts = (t.created_at || "").slice(0, 16).replace("T", " ");
-        const who = t.human_id || t.session_name || "";
-        const status = (t.status || "").toUpperCase();
+      tasksPane.innerHTML = tasks2.map((t3) => {
+        const ts = (t3.created_at || "").slice(0, 16).replace("T", " ");
+        const who = t3.human_id || t3.session_name || "";
+        const status = (t3.status || "").toUpperCase();
         return `<div style="padding:5px 8px;border-bottom:1px solid var(--border);display:flex;gap:8px;align-items:baseline">
 
         <span style="font-size:9px;color:var(--muted);white-space:nowrap;min-width:100px">${escapeHtml(ts)}</span>
@@ -477,14 +504,14 @@
 
         <span style="font-size:10px;color:var(--muted);white-space:nowrap">[${escapeHtml(status)}]</span>
 
-        <span style="font-size:11px;color:var(--text);word-break:break-word">${escapeHtml(t.description || "")}</span>
+        <span style="font-size:11px;color:var(--text);word-break:break-word">${escapeHtml(t3.description || "")}</span>
 
       </div>`;
       }).join("");
     };
     const _renderSprintsView = (groupBySprint) => {
       api(`/projects/${projectId}/sprint-items?status=done`).then((items) => {
-        const done = (items || []).filter((it) => it.status === "done").sort((a, b) => String(b.completed_at || b.added_at || "").localeCompare(String(a.completed_at || a.added_at || "")));
+        const done = (items || []).filter((it) => it.status === "done").sort((a3, b2) => String(b2.completed_at || b2.added_at || "").localeCompare(String(a3.completed_at || a3.added_at || "")));
         if (!done.length) {
           sprintsPane.innerHTML = `<div class="timeline-empty">no completed sprint items</div>`;
           return;
@@ -517,8 +544,8 @@
           </div>`
           ).join("");
         }
-      }).catch((e) => {
-        sprintsPane.innerHTML = `<div class="timeline-empty">failed: ${escapeHtml(e.message)}</div>`;
+      }).catch((e3) => {
+        sprintsPane.innerHTML = `<div class="timeline-empty">failed: ${escapeHtml(e3.message)}</div>`;
       });
     };
     _renderTimelineHeatmap(projectId, data, heatPane);
@@ -529,7 +556,7 @@
     const viewSelect = document.getElementById(`tl-view-select-${projectId}`);
     const clearSessionBtn = document.getElementById(`tl-clear-session-${projectId}`);
     if (clearSessionBtn) clearSessionBtn.onclick = () => {
-      if (p) p.timelineSessionFilter = null;
+      if (p3) p3.timelineSessionFilter = null;
       loadTimeline(projectId);
     };
     if (viewSelect) {
@@ -537,23 +564,23 @@
         const view = viewSelect.value;
         try {
           localStorage.setItem("meridian_tl_view_" + projectId, view);
-        } catch (_) {
+        } catch (_2) {
         }
-        wrap.querySelectorAll(".tl-subtab").forEach((b) => b.classList.toggle("active", b.dataset.sub === view));
+        wrap.querySelectorAll(".tl-subtab").forEach((b2) => b2.classList.toggle("active", b2.dataset.sub === view));
         heatPane.style.display = view === "heatmap" ? "" : "none";
         detailPane.style.display = view === "detail" ? "" : "none";
         tasksPane.style.display = view === "tasks" ? "" : "none";
         sprintsPane.style.display = view === "sprints" || view === "by-sprint" ? "" : "none";
-        if (view === "heatmap" && p && p._heatchart) {
+        if (view === "heatmap" && p3 && p3._heatchart) {
           try {
-            p._heatchart.resize();
-          } catch (_) {
+            p3._heatchart.resize();
+          } catch (_2) {
           }
         }
-        if (view === "detail" && p && p._echart) {
+        if (view === "detail" && p3 && p3._echart) {
           try {
-            p._echart.resize();
-          } catch (_) {
+            p3._echart.resize();
+          } catch (_2) {
           }
         }
         if (view === "tasks") _renderTasksFlat();
@@ -567,23 +594,23 @@
         if (viewSelect) viewSelect.value = sub;
         try {
           localStorage.setItem("meridian_tl_view_" + projectId, sub);
-        } catch (_) {
+        } catch (_2) {
         }
-        wrap.querySelectorAll(".tl-subtab").forEach((b) => b.classList.toggle("active", b === btn));
+        wrap.querySelectorAll(".tl-subtab").forEach((b2) => b2.classList.toggle("active", b2 === btn));
         heatPane.style.display = sub === "heatmap" ? "" : "none";
         detailPane.style.display = sub === "detail" ? "" : "none";
         tasksPane.style.display = "none";
         sprintsPane.style.display = "none";
-        if (sub === "heatmap" && p && p._heatchart) {
+        if (sub === "heatmap" && p3 && p3._heatchart) {
           try {
-            p._heatchart.resize();
-          } catch (_) {
+            p3._heatchart.resize();
+          } catch (_2) {
           }
         }
-        if (sub === "detail" && p && p._echart) {
+        if (sub === "detail" && p3 && p3._echart) {
           try {
-            p._echart.resize();
-          } catch (_) {
+            p3._echart.resize();
+          } catch (_2) {
           }
         }
       };
@@ -591,22 +618,22 @@
   }
   function _heatmapPieces(maxScale) {
     const colors = ["#bbf7d0", "#4ade80", "#16a34a", "#ca8a04", "#ea580c", "#dc2626"];
-    const n = colors.length;
+    const n2 = colors.length;
     const pieces = [];
     let lo = 1;
-    for (let i = 0; i < n; i++) {
-      if (i === n - 1) {
-        pieces.push({ min: lo, color: colors[i], label: `${lo}+` });
+    for (let i3 = 0; i3 < n2; i3++) {
+      if (i3 === n2 - 1) {
+        pieces.push({ min: lo, color: colors[i3], label: `${lo}+` });
         break;
       }
-      const hi = Math.max(lo, Math.round(maxScale * (i + 1) / n));
-      pieces.push({ min: lo, max: hi, color: colors[i], label: lo === hi ? `${lo}` : `${lo}\u2013${hi}` });
+      const hi = Math.max(lo, Math.round(maxScale * (i3 + 1) / n2));
+      pieces.push({ min: lo, max: hi, color: colors[i3], label: lo === hi ? `${lo}` : `${lo}\u2013${hi}` });
       lo = hi + 1;
     }
     return pieces;
   }
   function _heatmapMaxFor(projectId) {
-    const raw = parseInt(localStorage.getItem(`meridian_heatmap_max_${projectId}`), 10);
+    const raw = parseInt(localStorage.getItem(`meridian_heatmap_max_${projectId}`) || "", 10);
     if (!Number.isFinite(raw)) return 25;
     return Math.min(100, Math.max(10, raw));
   }
@@ -618,8 +645,8 @@
       return;
     }
     const cssVar = (name, fallback) => {
-      const v = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
-      return v || fallback;
+      const v3 = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+      return v3 || fallback;
     };
     const emptyColor = cssVar("--surface-2", "#1a2740");
     const borderCol = cssVar("--border", "#232830");
@@ -629,31 +656,31 @@
     let allClients = data.clients && data.clients.slice() || [];
     if (!allPeople.length || !allClients.length) {
       const ps = /* @__PURE__ */ new Set(), cs = /* @__PURE__ */ new Set();
-      daily.forEach((d) => (d.sessions || []).forEach((s) => {
-        ps.add(s.person || s.human || "(unknown)");
-        cs.add(s.client || "(none)");
+      daily.forEach((d3) => (d3.sessions || []).forEach((s3) => {
+        ps.add(s3.person || s3.human || "(unknown)");
+        cs.add(s3.client || "(none)");
       }));
       if (!allPeople.length) allPeople = [...ps].sort();
       if (!allClients.length) allClients = [...cs].sort();
     }
-    const dates = daily.map((d) => d.date).sort();
+    const dates = daily.map((d3) => d3.date).sort();
     const rangeStart = dates[0];
     const rangeEnd = dates[dates.length - 1];
-    const selKey = (k) => `meridian_tl_${k}_${projectId}`;
-    const loadSel = (k, all) => {
+    const selKey = (k3) => `meridian_tl_${k3}_${projectId}`;
+    const loadSel = (k3, all) => {
       try {
-        const raw = JSON.parse(localStorage.getItem(selKey(k)) || "null");
+        const raw = JSON.parse(localStorage.getItem(selKey(k3)) || "null");
         if (Array.isArray(raw)) {
-          const keep = raw.filter((x) => all.includes(x));
+          const keep = raw.filter((x2) => all.includes(x2));
           if (keep.length) return new Set(keep);
         }
-      } catch (_) {
+      } catch (_2) {
       }
       return new Set(all);
     };
     let selPeople = loadSel("people", allPeople);
     let selClients = loadSel("clients", allClients);
-    const clientOK = (s) => selClients.size === allClients.length || selClients.has(s.client || "(none)");
+    const clientOK = (s3) => selClients.size === allClients.length || selClients.has(s3.client || "(none)");
     const CELL = 16;
     const CAL_TOP = 28;
     const CAL_H = CELL * 7 + 34;
@@ -661,25 +688,25 @@
     const rowH = CAL_H + ROW_GAP;
     let detailByPersonDay = {};
     function computeView() {
-      let rows = allPeople.filter((p) => selPeople.has(p));
+      let rows = allPeople.filter((p3) => selPeople.has(p3));
       if (!rows.length) rows = allPeople.slice();
       const multi = rows.length > 1;
       const rowKeys = multi ? rows : ["__all__"];
       detailByPersonDay = {};
       const countByKeyDay = {};
-      daily.forEach((d) => {
-        (d.sessions || []).forEach((s) => {
-          if (!clientOK(s)) return;
-          const person = s.person || s.human || "(unknown)";
+      daily.forEach((d3) => {
+        (d3.sessions || []).forEach((s3) => {
+          if (!clientOK(s3)) return;
+          const person = s3.person || s3.human || "(unknown)";
           if (!selPeople.has(person)) return;
           const key = multi ? person : "__all__";
-          countByKeyDay[`${key}|${d.date}`] = (countByKeyDay[`${key}|${d.date}`] || 0) + s.count;
-          (detailByPersonDay[`${key}|${d.date}`] = detailByPersonDay[`${key}|${d.date}`] || []).push(s);
+          countByKeyDay[`${key}|${d3.date}`] = (countByKeyDay[`${key}|${d3.date}`] || 0) + s3.count;
+          (detailByPersonDay[`${key}|${d3.date}`] = detailByPersonDay[`${key}|${d3.date}`] || []).push(s3);
         });
       });
       const calendars2 = [], series2 = [], titles2 = [];
-      rowKeys.forEach((rk, i) => {
-        const top = CAL_TOP + i * rowH;
+      rowKeys.forEach((rk, i3) => {
+        const top = CAL_TOP + i3 * rowH;
         calendars2.push({
           top,
           left: multi ? 120 : 40,
@@ -700,16 +727,16 @@
             textStyle: { color: _colorForHuman(rk === "(unknown)" ? "" : rk), fontFamily: "IBM Plex Mono", fontSize: 10, fontWeight: "bold" }
           });
         }
-        const pts = daily.map((d) => {
-          const count = countByKeyDay[`${rk}|${d.date}`] || 0;
-          const dayDetail = detailByPersonDay[`${rk}|${d.date}`] || [];
-          const scount = new Set(dayDetail.map((s) => s.session_id)).size;
-          return { value: [d.date, count], scount, person: rk };
+        const pts = daily.map((d3) => {
+          const count = countByKeyDay[`${rk}|${d3.date}`] || 0;
+          const dayDetail = detailByPersonDay[`${rk}|${d3.date}`] || [];
+          const scount = new Set(dayDetail.map((s3) => s3.session_id)).size;
+          return { value: [d3.date, count], scount, person: rk };
         }).filter((pt) => pt.value[1] > 0);
         series2.push({
           type: "heatmap",
           coordinateSystem: "calendar",
-          calendarIndex: i,
+          calendarIndex: i3,
           data: pts,
           // Stamp the day-of-month (dark) onto cells that had activity, so the
           // calendar reads as a calendar — empty days carry no label since pts
@@ -720,10 +747,10 @@
             fontFamily: "IBM Plex Mono",
             fontSize: 10,
             fontWeight: "bold",
-            formatter: (p) => {
-              const v = p.value && p.value[0];
-              if (!v) return "";
-              const dd = parseInt(String(v).slice(8, 10), 10);
+            formatter: (p3) => {
+              const v3 = p3.value && p3.value[0];
+              if (!v3) return "";
+              const dd = parseInt(String(v3).slice(8, 10), 10);
               return Number.isFinite(dd) ? String(dd) : "";
             }
           }
@@ -742,17 +769,17 @@
       bar.className = "tl-filter-bar";
       bar.style.cssText = "display:flex;flex-wrap:wrap;align-items:center;gap:8px;padding:0 4px 8px;font-size:10px;font-family:IBM Plex Mono,monospace;color:var(--muted)";
       paneEl.appendChild(bar);
-      const toggle = (sel, all, key, x) => {
-        if (x === "__all__") sel = new Set(all);
+      const toggle = (sel, all, key, x2) => {
+        if (x2 === "__all__") sel = new Set(all);
         else {
-          sel.has(x) ? sel.delete(x) : sel.add(x);
+          sel.has(x2) ? sel.delete(x2) : sel.add(x2);
           if (!sel.size) sel = new Set(all);
         }
         localStorage.setItem(selKey(key), JSON.stringify([...sel]));
         return sel;
       };
-      const closeAllPanels = () => bar.querySelectorAll("[data-tl-panel]").forEach((p) => {
-        p.style.display = "none";
+      const closeAllPanels = () => bar.querySelectorAll("[data-tl-panel]").forEach((p3) => {
+        p3.style.display = "none";
       });
       const mkDropdown = (labelText, all, getSel, setSel, key) => {
         const wrap = document.createElement("div");
@@ -786,8 +813,8 @@
             row.onmouseleave = () => {
               if (!active) row.style.background = "transparent";
             };
-            row.onclick = (e) => {
-              e.stopPropagation();
+            row.onclick = (e3) => {
+              e3.stopPropagation();
               setSel(toggle(getSel(), all, key, value));
               sync();
               applyFilters();
@@ -795,10 +822,10 @@
             return row;
           };
           panel.appendChild(mkRow("All", "__all__", allSel));
-          all.forEach((x) => panel.appendChild(mkRow(x.length > 30 ? x.slice(0, 29) + "\u2026" : x, x, sel.has(x))));
+          all.forEach((x2) => panel.appendChild(mkRow(x2.length > 30 ? x2.slice(0, 29) + "\u2026" : x2, x2, sel.has(x2))));
         };
-        btn.onclick = (e) => {
-          e.stopPropagation();
+        btn.onclick = (e3) => {
+          e3.stopPropagation();
           const willOpen = panel.style.display === "none";
           closeAllPanels();
           panel.style.display = willOpen ? "block" : "none";
@@ -809,13 +836,13 @@
         return wrap;
       };
       if (allPeople.length > 1) {
-        bar.appendChild(mkDropdown("People", allPeople, () => selPeople, (s) => {
-          selPeople = s;
+        bar.appendChild(mkDropdown("People", allPeople, () => selPeople, (s3) => {
+          selPeople = s3;
         }, "people"));
       }
       if (allClients.length > 1) {
-        bar.appendChild(mkDropdown("Client", allClients, () => selClients, (s) => {
-          selClients = s;
+        bar.appendChild(mkDropdown("Client", allClients, () => selClients, (s3) => {
+          selClients = s3;
         }, "clients"));
       }
       paneEl.addEventListener("click", closeAllPanels);
@@ -860,10 +887,10 @@
         borderColor: "#1e3a5f",
         textStyle: { color: "#c7d5ef", fontSize: 11, fontFamily: "IBM Plex Mono" },
         formatter: (params) => {
-          const d = params.data;
-          if (!d || !d.value) return "";
-          const date = d.value[0], count = d.value[1];
-          return `<b>${escapeHtml(date)}</b> \u2014 ${count} task${count === 1 ? "" : "s"} across ${d.scount} session${d.scount === 1 ? "" : "s"}`;
+          const d3 = params.data;
+          if (!d3 || !d3.value) return "";
+          const date = d3.value[0], count = d3.value[1];
+          return `<b>${escapeHtml(date)}</b> \u2014 ${count} task${count === 1 ? "" : "s"} across ${d3.scount} session${d3.scount === 1 ? "" : "s"}`;
         }
       },
       visualMap: {
@@ -886,10 +913,10 @@
         detailBox.innerHTML = `<span style="color:var(--muted)">${escapeHtml(date)} \u2014 no sessions</span>`;
         return;
       }
-      const total = list.reduce((a, s) => a + s.count, 0);
-      const rows = list.map((s) => {
-        const cli = s.client && s.client !== "(none)" ? `<span class="tl-heat-sess-client">${escapeHtml(s.client)}</span>` : "";
-        return `<div class="tl-heat-sess"><span class="tl-heat-sess-name">${escapeHtml(s.name || "(unknown)")}</span>` + cli + `<span class="tl-heat-sess-count">${s.count} task${s.count === 1 ? "" : "s"}</span></div>`;
+      const total = list.reduce((a3, s3) => a3 + s3.count, 0);
+      const rows = list.map((s3) => {
+        const cli = s3.client && s3.client !== "(none)" ? `<span class="tl-heat-sess-client">${escapeHtml(s3.client)}</span>` : "";
+        return `<div class="tl-heat-sess"><span class="tl-heat-sess-name">${escapeHtml(s3.name || "(unknown)")}</span>` + cli + `<span class="tl-heat-sess-count">${s3.count} task${s3.count === 1 ? "" : "s"}</span></div>`;
       }).join("");
       detailBox.innerHTML = `<div class="tl-heat-detail-head">${escapeHtml(person)} \xB7 ${escapeHtml(date)} \xB7 ${total} task${total === 1 ? "" : "s"} \xB7 ${list.length} session${list.length === 1 ? "" : "s"}</div>${rows}`;
     };
@@ -915,45 +942,45 @@
       );
       try {
         chart.resize();
-      } catch (_) {
+      } catch (_2) {
       }
     };
     try {
       new ResizeObserver(() => {
         try {
           chart.resize();
-        } catch (_) {
+        } catch (_2) {
         }
       }).observe(container);
-    } catch (_) {
+    } catch (_2) {
     }
   }
   function _renderTimelineGantt(projectId, data, paneEl) {
     if (!paneEl) return;
-    const p = window.state?.panels[projectId];
+    const p3 = window.state?.panels[projectId];
     const { tasks = [], goal_events = [] } = data || {};
     const parseTs = (ts) => {
       if (!ts) return null;
       try {
         return new Date(ts.includes("T") ? ts : ts.replace(" ", "T") + "Z");
-      } catch (_) {
+      } catch (_2) {
         return null;
       }
     };
-    const sessionNames = [...new Set(tasks.map((t) => t.session_name || "(unknown)"))];
+    const sessionNames = [...new Set(tasks.map((t3) => t3.session_name || "(unknown)"))];
     const yCategories = [...sessionNames, "goal"];
     const STATUS_COLOR = { done: "#34d399", failed: "#f87171", in_progress: "#6c8fff", pending: "#9ca3af" };
     const byStatus = {};
-    tasks.forEach((t) => {
-      const d = parseTs(t.created_at);
-      if (!d) return;
-      const st = t.status || "pending";
+    tasks.forEach((t3) => {
+      const d3 = parseTs(t3.created_at);
+      if (!d3) return;
+      const st = t3.status || "pending";
       if (!byStatus[st]) byStatus[st] = [];
       byStatus[st].push({
-        value: [d.getTime(), t.session_name || "(unknown)"],
-        desc: t.description || "",
-        sess: t.session_name || "(unknown)",
-        ts: t.created_at,
+        value: [d3.getTime(), t3.session_name || "(unknown)"],
+        desc: t3.description || "",
+        sess: t3.session_name || "(unknown)",
+        ts: t3.created_at,
         status: st
       });
     });
@@ -967,24 +994,24 @@
       data: pts
     }));
     const goalByKey = /* @__PURE__ */ new Map();
-    goal_events.forEach((g) => {
-      if (g.field === "version_goal") {
-        const s = g.new_summary || "";
-        if (s.startsWith("[AUTO SUMMARY") || s.startsWith("- [DONE]") || s.startsWith("- [PENDING]")) return;
+    goal_events.forEach((g2) => {
+      if (g2.field === "version_goal") {
+        const s3 = g2.new_summary || "";
+        if (s3.startsWith("[AUTO SUMMARY") || s3.startsWith("- [DONE]") || s3.startsWith("- [PENDING]")) return;
       }
-      const key = g.field + (g.updated_at || "").slice(0, 13);
-      if (!goalByKey.has(key) || g.version > (goalByKey.get(key).version || 0)) goalByKey.set(key, g);
+      const key = g2.field + (g2.updated_at || "").slice(0, 13);
+      if (!goalByKey.has(key) || g2.version > (goalByKey.get(key).version || 0)) goalByKey.set(key, g2);
     });
     const GOAL_COLOR = { sprint_updated_at: "#6c8fff", ns_updated_at: "#fbbf24", content_updated_at: "#a78bfa" };
     const goalPts = [];
     const markLineData = [];
-    goalByKey.forEach((g) => {
-      const d = parseTs(g.updated_at);
-      if (!d) return;
-      const color = GOAL_COLOR[g.field] || "#a78bfa";
-      const lbl = g.field.replace("_updated_at", "").replace("_", " ");
-      const ms = d.getTime();
-      goalPts.push({ value: [ms, "goal"], field: lbl, version: g.version, ts: g.updated_at, itemStyle: { color } });
+    goalByKey.forEach((g2) => {
+      const d3 = parseTs(g2.updated_at);
+      if (!d3) return;
+      const color = GOAL_COLOR[g2.field] || "#a78bfa";
+      const lbl = g2.field.replace("_updated_at", "").replace("_", " ");
+      const ms = d3.getTime();
+      goalPts.push({ value: [ms, "goal"], field: lbl, version: g2.version, ts: g2.updated_at, itemStyle: { color } });
       markLineData.push({ xAxis: ms, lineStyle: { color, type: "dashed", width: 1, opacity: 0.5 }, label: { show: false } });
     });
     if (goalPts.length) {
@@ -1014,14 +1041,14 @@
         className: "timeline-tooltip",
         extraCssText: "max-width:340px;white-space:normal;",
         position: (point, params, dom, rect, size) => {
-          const x = point[0], y = point[1];
+          const x2 = point[0], y3 = point[1];
           const containerWidth = size && size.viewSize && size.viewSize[0] || 0;
-          return x > containerWidth * 0.6 ? [x - 300, y] : [x + 20, y];
+          return x2 > containerWidth * 0.6 ? [x2 - 300, y3] : [x2 + 20, y3];
         },
         formatter: (params) => {
-          const d = params.data;
-          if (d.field) return `<b>${escapeHtml(d.field)}</b> v${d.version}<br><span style="color:#8b9cba;font-size:9px">${escapeHtml(d.ts || "")}</span>`;
-          return `<b>${escapeHtml(d.sess)}</b><br><span style="color:${STATUS_COLOR[d.status] || "#9ca3af"}">${escapeHtml(d.status)}</span> \xB7 <span style="color:#8b9cba;font-size:9px">${escapeHtml(d.ts || "")}</span><br><span class="timeline-tooltip-desc" style="color:#c7d5ef">${escapeHtml(d.desc)}</span>`;
+          const d3 = params.data;
+          if (d3.field) return `<b>${escapeHtml(d3.field)}</b> v${d3.version}<br><span style="color:#8b9cba;font-size:9px">${escapeHtml(d3.ts || "")}</span>`;
+          return `<b>${escapeHtml(d3.sess)}</b><br><span style="color:${STATUS_COLOR[d3.status] || "#9ca3af"}">${escapeHtml(d3.status)}</span> \xB7 <span style="color:#8b9cba;font-size:9px">${escapeHtml(d3.ts || "")}</span><br><span class="timeline-tooltip-desc" style="color:#c7d5ef">${escapeHtml(d3.desc)}</span>`;
         }
       },
       legend: {
@@ -1046,7 +1073,7 @@
           color: "#8b9cba",
           fontFamily: "IBM Plex Mono",
           fontSize: 9,
-          formatter: (v) => v.length > 22 ? v.slice(0, 21) + "\u2026" : v,
+          formatter: (v3) => v3.length > 22 ? v3.slice(0, 21) + "\u2026" : v3,
           width: 148,
           overflow: "truncate"
         },
@@ -1056,7 +1083,7 @@
       series,
       dataZoom: [{ type: "inside", xAxisIndex: 0 }]
     });
-    if (p) p._echart = chart;
+    if (p3) p3._echart = chart;
     const tlRangeKey = `meridian_tl_range_${projectId}`;
     const fromInput = document.getElementById(`timeline-from-${projectId}`);
     const toInput = document.getElementById(`timeline-to-${projectId}`);
@@ -1065,12 +1092,12 @@
       if (from || to) {
         try {
           chart.dispatchAction({ type: "dataZoom", dataZoomIndex: 0, startValue: from ? from.getTime() : void 0, endValue: to ? to.getTime() : void 0 });
-        } catch (_) {
+        } catch (_2) {
         }
       } else {
         try {
           chart.dispatchAction({ type: "dataZoom", dataZoomIndex: 0, start: 0, end: 100 });
-        } catch (_) {
+        } catch (_2) {
         }
       }
     };
@@ -1093,14 +1120,14 @@
         } else {
           localStorage.removeItem(tlRangeKey);
         }
-      } catch (_) {
+      } catch (_2) {
       }
       setZoom(from, to);
     };
     const savedRange = (() => {
       try {
         return JSON.parse(localStorage.getItem(tlRangeKey) || "null");
-      } catch (_) {
+      } catch (_2) {
         return null;
       }
     })();
@@ -1117,12 +1144,12 @@
     const r30Btn = document.getElementById(`timeline-r30d-${projectId}`);
     const rAllBtn = document.getElementById(`timeline-rall-${projectId}`);
     if (r7Btn) r7Btn.onclick = () => {
-      if (fromInput) fromInput.value = new Date(nowD - 7 * 864e5).toISOString().slice(0, 10);
+      if (fromInput) fromInput.value = new Date(nowD.getTime() - 7 * 864e5).toISOString().slice(0, 10);
       if (toInput) toInput.value = todayStr;
       applyRange();
     };
     if (r30Btn) r30Btn.onclick = () => {
-      if (fromInput) fromInput.value = new Date(nowD - 30 * 864e5).toISOString().slice(0, 10);
+      if (fromInput) fromInput.value = new Date(nowD.getTime() - 30 * 864e5).toISOString().slice(0, 10);
       if (toInput) toInput.value = todayStr;
       applyRange();
     };
@@ -1132,7 +1159,7 @@
       if (errEl) errEl.style.display = "none";
       try {
         localStorage.removeItem(tlRangeKey);
-      } catch (_) {
+      } catch (_2) {
       }
       setZoom(null, null);
     };
@@ -1140,18 +1167,18 @@
       new ResizeObserver(() => {
         try {
           chart.resize();
-        } catch (_) {
+        } catch (_2) {
         }
       }).observe(container);
-    } catch (_) {
+    } catch (_2) {
     }
   }
   try {
     Object.assign(window, { renderTimeline: renderTimeline2, _heatmapPieces, _heatmapMaxFor, _renderTimelineHeatmap, _renderTimelineGantt });
-  } catch (e) {
+  } catch (e3) {
   }
 
-  // meridian/static/dashboard-mcp.js
+  // meridian/static/dashboard-mcp.ts
   function _renderToolEntry2(tool) {
     const props = tool.inputSchema && tool.inputSchema.properties ? tool.inputSchema.properties : {};
     const required = new Set(tool.inputSchema && tool.inputSchema.required || []);
@@ -1161,15 +1188,15 @@
       const desc = schema.description ? escapeHtml(schema.description) : "";
       return `<tr><td style="color:var(--text);padding:2px 10px 2px 0">${escapeHtml(name)}</td><td style="color:var(--muted);padding:2px 10px 2px 0">${type}</td><td style="color:var(--muted);padding:2px 10px 2px 0;font-style:italic">${req}</td><td style="color:var(--muted);padding:2px 0">${desc}</td></tr>`;
     }).join("");
-    const signature = Object.keys(props).map((n) => required.has(n) ? n : `${n}?`).join(", ");
+    const signature = Object.keys(props).map((n2) => required.has(n2) ? n2 : `${n2}?`).join(", ");
     return `<div class="tool-entry" data-search="${escapeHtml((tool.name || "") + " " + (tool.description || ""))}" style="margin-bottom:14px"><div style="color:var(--text);font-weight:600;font-size:13px">${escapeHtml(tool.name)}(<span style="color:var(--muted);font-weight:400">${escapeHtml(signature)}</span>)</div><div style="color:var(--muted);margin:3px 0 5px 0;font-size:12px;line-height:1.45">${escapeHtml(tool.description || "")}</div>${params ? `<table style="font-size:11px;border-collapse:collapse;width:100%">${params}</table>` : ""}</div>`;
   }
   try {
     Object.assign(window, { _renderToolEntry: _renderToolEntry2 });
-  } catch (e) {
+  } catch (e3) {
   }
 
-  // meridian/static/dashboard-sprint.js
+  // meridian/static/dashboard-sprint.ts
   function _ensureSprintPulseStyle() {
     if (typeof document === "undefined") return;
     if (document.getElementById("sprint-pulse-style")) return;
@@ -1231,11 +1258,11 @@
       const bannerBg = elapsed >= 28 ? "#dc2626" : elapsed >= 25 ? "#d97706" : "#ca8a04";
       const upgradeUrl = window.state?.serverConfig?.stripe_payment_link || "/pricing";
       const daysStr = me.days_remaining != null ? `${me.days_remaining} day${me.days_remaining !== 1 ? "s" : ""}` : "limited time";
-      const b = document.createElement("div");
-      b.id = "trial-banner";
-      b.style = `position:fixed;top:0;left:0;right:0;z-index:9997;background:${bannerBg};color:#fff;text-align:center;padding:5px 12px;font-size:12px;font-family:inherit;letter-spacing:0.02em;display:flex;align-items:center;justify-content:center;gap:10px`;
-      b.innerHTML = `<span>Free trial \xB7 <strong>${daysStr} remaining</strong></span><a href="${escapeHtml(upgradeUrl)}" style="color:#fff;text-decoration:underline;font-weight:600;white-space:nowrap">Upgrade to Standard \u2192</a><button onclick="sessionStorage.setItem('trial-banner-dismissed','1');this.closest('#trial-banner').remove();document.body.style.paddingTop=Math.max(0,parseInt(document.body.style.paddingTop||'0',10)-28)+'px'" style="background:none;border:none;color:rgba(255,255,255,0.7);font-size:16px;cursor:pointer;padding:0 0 0 6px;line-height:1" title="Dismiss for this session">\xD7</button>`;
-      document.body.prepend(b);
+      const b2 = document.createElement("div");
+      b2.id = "trial-banner";
+      b2.style = `position:fixed;top:0;left:0;right:0;z-index:9997;background:${bannerBg};color:#fff;text-align:center;padding:5px 12px;font-size:12px;font-family:inherit;letter-spacing:0.02em;display:flex;align-items:center;justify-content:center;gap:10px`;
+      b2.innerHTML = `<span>Free trial \xB7 <strong>${daysStr} remaining</strong></span><a href="${escapeHtml(upgradeUrl)}" style="color:#fff;text-decoration:underline;font-weight:600;white-space:nowrap">Upgrade to Standard \u2192</a><button onclick="sessionStorage.setItem('trial-banner-dismissed','1');this.closest('#trial-banner').remove();document.body.style.paddingTop=Math.max(0,parseInt(document.body.style.paddingTop||'0',10)-28)+'px'" style="background:none;border:none;color:rgba(255,255,255,0.7);font-size:16px;cursor:pointer;padding:0 0 0 6px;line-height:1" title="Dismiss for this session">\xD7</button>`;
+      document.body.prepend(b2);
       document.body.style.paddingTop = parseInt(document.body.style.paddingTop || "0", 10) + 28 + "px";
     }
     if (isHostedMode() && !isHostedAdmin()) {
@@ -1254,20 +1281,20 @@
       }
     }
     if (me.expired && !document.getElementById("expired-banner")) {
-      const b = document.createElement("div");
-      b.id = "expired-banner";
+      const b2 = document.createElement("div");
+      b2.id = "expired-banner";
       const expLabel = (_PLAN_LABELS[plan] || plan) + " expired";
-      b.style = "position:fixed;top:0;left:0;right:0;z-index:9998;background:#dc2626;color:#fff;text-align:center;padding:5px 12px;font-size:12px;font-family:inherit;letter-spacing:0.02em";
-      b.innerHTML = `${expLabel}. <a href="/pricing" style="color:#fff;text-decoration:underline">Upgrade to continue \u2192</a>`;
-      document.body.prepend(b);
+      b2.style = "position:fixed;top:0;left:0;right:0;z-index:9998;background:#dc2626;color:#fff;text-align:center;padding:5px 12px;font-size:12px;font-family:inherit;letter-spacing:0.02em";
+      b2.innerHTML = `${expLabel}. <a href="/pricing" style="color:#fff;text-decoration:underline">Upgrade to continue \u2192</a>`;
+      document.body.prepend(b2);
       document.body.style.paddingTop = parseInt(document.body.style.paddingTop || "0", 10) + 28 + "px";
     }
     if (me.github_connected === false && !isDemoMode() && !document.getElementById("github-onboarding-banner") && !sessionStorage.getItem("github-banner-dismissed")) {
-      const b = document.createElement("div");
-      b.id = "github-onboarding-banner";
-      b.style = "position:fixed;top:0;left:0;right:0;z-index:9997;background:#7c3aed;color:#fff;text-align:center;padding:5px 12px;font-size:12px;font-family:inherit;display:flex;align-items:center;justify-content:center;gap:10px";
-      b.innerHTML = `<span>Connect your GitHub repo \u2014 give your AI sessions live code access, no extra installs needed.</span><a href="#settings" onclick="document.querySelector('.vtab-btn[data-vtab=settings]')?.click()" style="color:#fff;text-decoration:underline;white-space:nowrap">Connect now \u2192</a><button onclick="sessionStorage.setItem('github-banner-dismissed','1');this.closest('#github-onboarding-banner').remove();document.body.style.paddingTop=Math.max(0,parseInt(document.body.style.paddingTop||'0',10)-28)+'px'" style="background:none;border:none;color:rgba(255,255,255,0.7);font-size:16px;cursor:pointer;padding:0 0 0 6px;line-height:1" title="Dismiss">\xD7</button>`;
-      document.body.prepend(b);
+      const b2 = document.createElement("div");
+      b2.id = "github-onboarding-banner";
+      b2.style = "position:fixed;top:0;left:0;right:0;z-index:9997;background:#7c3aed;color:#fff;text-align:center;padding:5px 12px;font-size:12px;font-family:inherit;display:flex;align-items:center;justify-content:center;gap:10px";
+      b2.innerHTML = `<span>Connect your GitHub repo \u2014 give your AI sessions live code access, no extra installs needed.</span><a href="#settings" onclick="document.querySelector('.vtab-btn[data-vtab=settings]')?.click()" style="color:#fff;text-decoration:underline;white-space:nowrap">Connect now \u2192</a><button onclick="sessionStorage.setItem('github-banner-dismissed','1');this.closest('#github-onboarding-banner').remove();document.body.style.paddingTop=Math.max(0,parseInt(document.body.style.paddingTop||'0',10)-28)+'px'" style="background:none;border:none;color:rgba(255,255,255,0.7);font-size:16px;cursor:pointer;padding:0 0 0 6px;line-height:1" title="Dismiss">\xD7</button>`;
+      document.body.prepend(b2);
       document.body.style.paddingTop = parseInt(document.body.style.paddingTop || "0", 10) + 28 + "px";
     }
     ensureSignOutLink(me.email);
@@ -1276,7 +1303,7 @@
   function renderSprintProgress2(projectId, items) {
     const root = document.getElementById(`live-sprint-progress-${projectId}`);
     if (!root) return;
-    const statusIcon = (s) => ({
+    const statusIcon = (s3) => ({
       pending: "\u25CB",
       todo: "\u25CB",
       in_progress: "\u25D1",
@@ -1285,8 +1312,8 @@
       skipped: "\u2014",
       pushed: "\u2192",
       indeterminate: "\u26A0"
-    })[s] || "?";
-    const statusColor = (s) => ({
+    })[s3] || "?";
+    const statusColor = (s3) => ({
       pending: "var(--muted)",
       todo: "var(--muted)",
       in_progress: "var(--accent)",
@@ -1295,7 +1322,7 @@
       skipped: "var(--muted)",
       pushed: "var(--accent)",
       indeterminate: "#fbbf24"
-    })[s] || "var(--muted)";
+    })[s3] || "var(--muted)";
     const activeSet = /* @__PURE__ */ new Set(["pending", "todo", "in_progress"]);
     if (items.length === 0) {
       root.innerHTML = `
@@ -1438,9 +1465,9 @@
           return [];
         }
       })();
-      const resourcesHtml = _resources.length > 0 ? `<div class="sprint-item-resources" style="display:flex;flex-wrap:wrap;gap:3px;margin-top:3px">${_resources.map((r) => {
-        const chipColor = r.startsWith("note:") ? "var(--accent-blue,#3b82f6)" : r.startsWith("decision:") ? "#a78bfa" : "var(--muted)";
-        return `<span class="resource-chip" onclick="resourceChipClick('${escapeHtml(projectId)}','${escapeHtml(r)}')" style="font-size:9px;padding:1px 5px;border-radius:3px;cursor:pointer;background:var(--surface-2);border:1px solid var(--border);color:${chipColor};font-family:var(--font-mono)">${escapeHtml(r)}</span>`;
+      const resourcesHtml = _resources.length > 0 ? `<div class="sprint-item-resources" style="display:flex;flex-wrap:wrap;gap:3px;margin-top:3px">${_resources.map((r3) => {
+        const chipColor = r3.startsWith("note:") ? "var(--accent-blue,#3b82f6)" : r3.startsWith("decision:") ? "#a78bfa" : "var(--muted)";
+        return `<span class="resource-chip" onclick="resourceChipClick('${escapeHtml(projectId)}','${escapeHtml(r3)}')" style="font-size:9px;padding:1px 5px;border-radius:3px;cursor:pointer;background:var(--surface-2);border:1px solid var(--border);color:${chipColor};font-family:var(--font-mono)">${escapeHtml(r3)}</span>`;
       }).join("")}</div>` : "";
       const editBtn = `<button class="sprint-btn" title="Edit title/version"
 
@@ -1478,7 +1505,7 @@
 
          </span>` : `<span class="sprint-item-actions">${meta}${feedbackHtml}</span>`;
       const allKids = allChildrenOf.get(it.id) || [];
-      const kidDone = allKids.filter((c) => c.status === "done").length;
+      const kidDone = allKids.filter((c3) => c3.status === "done").length;
       const childBadge = allKids.length > 0 ? `<span style="font-size:10px;color:var(--muted);margin-left:4px">[${kidDone}/${allKids.length}]</span>` : "";
       const indBadge = it.status === "indeterminate" ? `<span style="color:#fbbf24;margin-left:4px;font-size:11px">\u26A0</span>` : "";
       const indentStyle = isChild ? "margin-left:16px;border-left:2px solid var(--border);padding-left:8px;" : "";
@@ -1518,7 +1545,7 @@
 
            <div style="padding:2px 0">
 
-             ${dispKids.map((c) => renderItem(c, true)).join("")}
+             ${dispKids.map((c3) => renderItem(c3, true)).join("")}
 
            </div>
 
@@ -1528,9 +1555,9 @@
     const versionOrder = [...new Set(displayItems.map((it) => it.version || ""))];
     const groups = /* @__PURE__ */ new Map();
     displayItems.forEach((it) => {
-      const g = it.version || "";
-      if (!groups.has(g)) groups.set(g, []);
-      groups.get(g).push(it);
+      const g2 = it.version || "";
+      if (!groups.has(g2)) groups.set(g2, []);
+      groups.get(g2).push(it);
     });
     for (const [groupName, groupItems] of groups) {
       if (groupName) {
@@ -1540,7 +1567,7 @@
       html += topLevel.map((it) => renderItem(it, false)).join("");
     }
     const total = displayItems.length;
-    const done = displayItems.filter((i) => i.status === "done").length;
+    const done = displayItems.filter((i3) => i3.status === "done").length;
     const pct = total > 0 ? Math.round(done / total * 100) : 0;
     const pctColor = done === 0 ? "var(--muted)" : done === total ? "var(--accent-green)" : "#fbbf24";
     html += `<div class="sprint-footer">
@@ -1606,7 +1633,7 @@
     const doneLimit = panel.queueDoneLimit || QUEUE_DONE_PAGE_SIZE;
     const totalDoneCount = panel.queueTotalDoneCount != null ? panel.queueTotalDoneCount : (sprintItems || []).filter((it) => it.status === "done").length;
     const items = (sprintItems || []).slice();
-    const sortByNewest = (a, b) => String(b.completed_at || b.added_at || "").localeCompare(String(a.completed_at || a.added_at || ""));
+    const sortByNewest = (a3, b2) => String(b2.completed_at || b2.added_at || "").localeCompare(String(a3.completed_at || a3.added_at || ""));
     const backburner = items.filter((it) => ["pushed", "skipped"].includes(it.status)).sort(sortByNewest);
     const pending = items.filter((it) => it.status === "pending" || it.status === "todo").sort(sortByNewest);
     const inProgress = items.filter((it) => it.status === "in_progress").sort(sortByNewest);
@@ -1718,22 +1745,22 @@
       const collapsed = sectionState.backburner ?? true;
       const groups = {};
       for (const it of backburner) {
-        const g = it.item_group || "(ungrouped)";
-        (groups[g] = groups[g] || []).push(it);
+        const g2 = it.item_group || "(ungrouped)";
+        (groups[g2] = groups[g2] || []).push(it);
       }
-      const groupNames = Object.keys(groups).sort((a, b) => a.localeCompare(b));
+      const groupNames = Object.keys(groups).sort((a3, b2) => a3.localeCompare(b2));
       const search = `<input type="text" id="backburner-search-${escapeHtml(projectId)}" placeholder="filter backburner\u2026"
 
       oninput="filterBackburner('${escapeHtml(projectId)}', this.value)"
 
       style="width:100%;box-sizing:border-box;background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:3px 8px;margin-bottom:8px;outline:none">`;
-      const groupHtml = groupNames.map((g) => `
+      const groupHtml = groupNames.map((g2) => `
 
       <div class="bb-group">
 
-        <div style="font-size:9px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:0.4px;margin:8px 0 4px">${escapeHtml(g)} <span style="opacity:0.6">(${groups[g].length})</span></div>
+        <div style="font-size:9px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:0.4px;margin:8px 0 4px">${escapeHtml(g2)} <span style="opacity:0.6">(${groups[g2].length})</span></div>
 
-        ${groups[g].map(renderItem).join("")}
+        ${groups[g2].map(renderItem).join("")}
 
       </div>`).join("");
       return `<div class="queue-section" data-section="backburner" data-collapsed="${collapsed ? "true" : "false"}">
@@ -1778,12 +1805,12 @@
   }
   try {
     Object.assign(window, { _renderPlanBadge: _renderPlanBadge2, renderSprintProgress: renderSprintProgress2, renderQueue: renderQueue2 });
-  } catch (e) {
+  } catch (e3) {
   }
 
-  // meridian/static/dashboard-settings.js
+  // meridian/static/dashboard-settings.ts
   function suggestNtfyTopic2(projectId) {
-    const proj = (window.state?.projects || []).find((p) => p.id === projectId);
+    const proj = (window.state?.projects || []).find((p3) => p3.id === projectId);
     const slug = (proj?.name || "meridian").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 24) || "meridian";
     return slug;
   }
@@ -1806,8 +1833,8 @@
     });
     const inviteForm = document.getElementById(`settings-invite-form-${projectId}`);
     if (inviteForm) inviteForm.style.display = "none";
-    body.querySelectorAll("button").forEach((b) => {
-      if (/^save\b/i.test((b.textContent || "").trim())) b.style.display = "none";
+    body.querySelectorAll("button").forEach((b2) => {
+      if (/^save\b/i.test((b2.textContent || "").trim())) b2.style.display = "none";
     });
   }
   function _detectClientOS() {
@@ -1834,8 +1861,8 @@
       link.className = "connect-os-toggle";
       link.textContent = "Show other platforms";
       link.style.cssText = "display:inline-block;margin:2px 0 6px;font-size:10px;color:var(--accent);text-decoration:none;cursor:pointer";
-      link.onclick = (e) => {
-        e.preventDefault();
+      link.onclick = (e3) => {
+        e3.preventDefault();
         const expanded = link.dataset.expanded === "1";
         grid.querySelectorAll("[data-connect-platform]").forEach((el) => {
           el.style.display = expanded ? el.dataset.connectPlatform === os ? "" : "none" : "";
@@ -1858,14 +1885,14 @@
     const body = document.getElementById(`settings-body-${projectId}`);
     if (!body) return;
     const key = body.dataset.activeStab || "project";
-    body.querySelectorAll(":scope > .settings-tabpane").forEach((p) => {
-      p.style.display = p.dataset.stabPane === key ? "" : "none";
+    body.querySelectorAll(":scope > .settings-tabpane").forEach((p3) => {
+      p3.style.display = p3.dataset.stabPane === key ? "" : "none";
     });
-    body.querySelectorAll(":scope > .settings-tabbar .settings-tab-btn").forEach((b) => {
-      const active = b.dataset.stabBtn === key;
-      b.style.color = active ? "var(--text)" : "var(--muted)";
-      b.style.borderBottomColor = active ? "var(--accent)" : "transparent";
-      b.style.fontWeight = active ? "600" : "400";
+    body.querySelectorAll(":scope > .settings-tabbar .settings-tab-btn").forEach((b2) => {
+      const active = b2.dataset.stabBtn === key;
+      b2.style.color = active ? "var(--text)" : "var(--muted)";
+      b2.style.borderBottomColor = active ? "var(--accent)" : "transparent";
+      b2.style.fontWeight = active ? "600" : "400";
     });
   }
   function _activateSettingsTab(projectId, key) {
@@ -1907,7 +1934,7 @@
     if (wsSec && wsSec.parentElement !== panes.workspace) panes.workspace.appendChild(wsSec);
     try {
       const obs = new MutationObserver((muts) => {
-        muts.forEach((m) => m.addedNodes.forEach((node) => {
+        muts.forEach((m3) => m3.addedNodes.forEach((node) => {
           if (node.nodeType !== 1) return;
           if (node.classList && (node.classList.contains("settings-tabpane") || node.classList.contains("settings-tabbar"))) return;
           const tab = (node.id || "").indexOf("tunnel-plugins") !== -1 ? "account" : _classifySettingsSection(node, projectId);
@@ -1916,14 +1943,24 @@
         }));
       });
       obs.observe(body, { childList: true });
-    } catch (e) {
+      body._settingsObs = obs;
+    } catch (e3) {
     }
     _activateSettingsTab(projectId, "project");
   }
   window._organizeSettingsIntoTabs = _organizeSettingsIntoTabs;
-  async function loadSettingsTab2(projectId) {
+  async function loadSettingsTab2(projectId, { force = false } = {}) {
     const body = document.getElementById(`settings-body-${projectId}`);
     if (!body) return;
+    if (!force && body.dataset.tabbed === "1" && body.children.length > 0) {
+      const age = Date.now() - parseInt(body.dataset.settingsTs || "0", 10);
+      if (age < 3e4) return;
+    }
+    if (body._settingsObs) {
+      body._settingsObs.disconnect();
+      body._settingsObs = null;
+    }
+    delete body.dataset.tabbed;
     body.innerHTML = '<div style="color:var(--muted);font-size:11px">loading\u2026</div>';
     const _activeRole = await getActiveWorkspaceRole();
     const _guest = _activeRole === "viewer" || _activeRole === "member";
@@ -1933,34 +1970,34 @@
       { key: "sprint", label: "Sprint done \u2014 all items completed" }
     ];
     try {
-      let buildHookCurlHeaders = function(token) {
+      let buildHookCurlHeaders2 = function(token) {
         const headers = [];
         if (token) headers.push(`-H 'Authorization: Bearer ${token}'`);
         headers.push(`-H 'Content-Type: application/json'`);
         return headers.join(" ");
-      }, buildHookCurlCommand = function(path, token) {
-        const cmd = `curl -s -X POST ${buildHookCurlHeaders(token)} -d '{"project_id":"${projectId}"}' ${hooksBaseUrl}/hooks/${path}`;
+      }, buildHookCurlCommand2 = function(path, token) {
+        const cmd = `curl -s -X POST ${buildHookCurlHeaders2(token)} -d '{"project_id":"${projectId}"}' ${hooksBaseUrl}/hooks/${path}`;
         if (path === "session-start") return `${cmd} | jq -r '.hookSpecificOutput.additionalContext // empty'`;
         return cmd;
-      }, buildHookPowerShellCommand = function(path, token) {
+      }, buildHookPowerShellCommand2 = function(path, token) {
         const headerClause = token ? ` -Headers @{ Authorization = 'Bearer ${token}' }` : "";
         const bodyJson = `{"project_id":"${projectId}"}`;
         if (path === "session-start") {
           return `powershell -NoProfile -NonInteractive -Command "try { $r = Invoke-WebRequest -Method POST -Uri '${hooksBaseUrl}/hooks/session-start'${headerClause} -ContentType 'application/json' -Body '${bodyJson}' -UseBasicParsing; $r.Content } catch { '{}' }"`;
         }
         return `powershell -NoProfile -NonInteractive -Command "try { Invoke-WebRequest -Method POST -Uri '${hooksBaseUrl}/hooks/stop'${headerClause} -ContentType 'application/json' -Body '${bodyJson}' -UseBasicParsing | Out-Null } catch { }"`;
-      }, buildClaudeHookSnippet = function(platform, token) {
-        const start = platform === "windows" ? buildHookPowerShellCommand("session-start", token) : buildHookCurlCommand("session-start", token);
-        const stop = platform === "windows" ? buildHookPowerShellCommand("stop", token) : buildHookCurlCommand("stop", token);
+      }, buildClaudeHookSnippet2 = function(platform, token) {
+        const start = platform === "windows" ? buildHookPowerShellCommand2("session-start", token) : buildHookCurlCommand2("session-start", token);
+        const stop = platform === "windows" ? buildHookPowerShellCommand2("stop", token) : buildHookCurlCommand2("stop", token);
         return JSON.stringify({
           hooks: {
             SessionStart: [{ matcher: "", hooks: [{ type: "command", command: start }] }],
             Stop: [{ matcher: "", hooks: [{ type: "command", command: stop }] }]
           }
         }, null, 2);
-      }, buildCodexHookSnippet = function(platform, token) {
-        const start = platform === "windows" ? buildHookPowerShellCommand("session-start", token) : buildHookCurlCommand("session-start", token);
-        const stop = platform === "windows" ? buildHookPowerShellCommand("stop", token) : buildHookCurlCommand("stop", token);
+      }, buildCodexHookSnippet2 = function(platform, token) {
+        const start = platform === "windows" ? buildHookPowerShellCommand2("session-start", token) : buildHookCurlCommand2("session-start", token);
+        const stop = platform === "windows" ? buildHookPowerShellCommand2("stop", token) : buildHookCurlCommand2("stop", token);
         return `[mcp_servers.meridian]
 type = "http"
 url = "${hooksBaseUrl}/mcp"
@@ -1969,6 +2006,7 @@ url = "${hooksBaseUrl}/mcp"
 session_start = ${JSON.stringify(start)}
 stop = ${JSON.stringify(stop)}`;
       };
+      var buildHookCurlHeaders = buildHookCurlHeaders2, buildHookCurlCommand = buildHookCurlCommand2, buildHookPowerShellCommand = buildHookPowerShellCommand2, buildClaudeHookSnippet = buildClaudeHookSnippet2, buildCodexHookSnippet = buildCodexHookSnippet2;
       const [notifResult, mcpResult, settingsResult, ntfyResult, ghResult] = await Promise.allSettled([
         api("/settings/notifications"),
         api("/settings/mcp-config"),
@@ -1986,6 +2024,7 @@ stop = ${JSON.stringify(stop)}`;
       const ghSelectedBranch = ghData?.branch || ghRepoMap[ghSelectedRepo]?.default_branch || "main";
       const ghUsername = ghData?.github_user || ghData?.login || "";
       const ghAvatarUrl = ghData?.avatar_url || "";
+      const ghConnections = Array.isArray(ghData?.connections) ? ghData.connections : [];
       const ghRepoChoices = ghRepos.length ? ghRepos : ghSelectedRepo ? [{
         full_name: ghSelectedRepo,
         name: ghSelectedRepo.split("/").slice(-1)[0] || ghSelectedRepo,
@@ -1999,17 +2038,17 @@ stop = ${JSON.stringify(stop)}`;
         if (!repoGroups.has(owner)) repoGroups.set(owner, []);
         repoGroups.get(owner).push(repo);
       });
-      const ghRepoOptions = Array.from(repoGroups.keys()).sort((a, b) => {
-        const aPersonal = !!ghUsername && a.toLowerCase() === ghUsername.toLowerCase();
-        const bPersonal = !!ghUsername && b.toLowerCase() === ghUsername.toLowerCase();
+      const ghRepoOptions = Array.from(repoGroups.keys()).sort((a3, b2) => {
+        const aPersonal = !!ghUsername && a3.toLowerCase() === ghUsername.toLowerCase();
+        const bPersonal = !!ghUsername && b2.toLowerCase() === ghUsername.toLowerCase();
         if (aPersonal !== bPersonal) return aPersonal ? -1 : 1;
-        const aMeridian = a.toLowerCase() === "meridianmcp";
-        const bMeridian = b.toLowerCase() === "meridianmcp";
+        const aMeridian = a3.toLowerCase() === "meridianmcp";
+        const bMeridian = b2.toLowerCase() === "meridianmcp";
         if (aMeridian !== bMeridian) return aMeridian ? -1 : 1;
-        return a.localeCompare(b);
+        return a3.localeCompare(b2);
       }).map((owner) => {
         const label = !!ghUsername && owner.toLowerCase() === ghUsername.toLowerCase() ? `Personal (@${owner})` : `${owner} repos`;
-        const options = (repoGroups.get(owner) || []).slice().sort((a, b) => String(a.name || a.full_name || "").localeCompare(String(b.name || b.full_name || ""))).map((repo) => {
+        const options = (repoGroups.get(owner) || []).slice().sort((a3, b2) => String(a3.name || a3.full_name || "").localeCompare(String(b2.name || b2.full_name || ""))).map((repo) => {
           const fullName = repo.full_name || "";
           const repoName = repo.name || (fullName.includes("/") ? fullName.split("/").slice(-1)[0] : fullName);
           return `<option value="${escapeHtml(fullName)}" ${fullName === ghSelectedRepo ? "selected" : ""}>${escapeHtml(repoName)}</option>`;
@@ -2020,18 +2059,18 @@ stop = ${JSON.stringify(stop)}`;
       let _secState = { connect: true, executor: false, config: false, account: false };
       try {
         Object.assign(_secState, JSON.parse(localStorage.getItem("meridian.settings.sections." + projectId) || "{}"));
-      } catch (e) {
+      } catch (e3) {
       }
-      const _secHtml = function(k, title) {
-        const openAttr = _secState[k] ? "open" : "";
-        const caretRot = _secState[k] ? "transform:rotate(90deg)" : "";
-        return '<details id="settings-sec-' + k + "-" + projectId + '" ' + openAttr + ' style="margin-bottom:12px;border:1px solid var(--border);border-radius:6px"><summary style="cursor:pointer;list-style:none;padding:10px 12px;display:flex;align-items:center;gap:8px"><span class="meridian-caret" style="display:inline-block;font-size:10px;color:var(--muted);transition:transform 120ms ease;' + caretRot + '">\u25B6</span><span style="font-weight:600;font-size:11px;color:var(--text)">' + title + '</span></summary><div style="padding:0 0 4px">';
+      const _secHtml = function(k3, title) {
+        const openAttr = _secState[k3] ? "open" : "";
+        const caretRot = _secState[k3] ? "transform:rotate(90deg)" : "";
+        return '<details id="settings-sec-' + k3 + "-" + projectId + '" ' + openAttr + ' style="margin-bottom:12px;border:1px solid var(--border);border-radius:6px"><summary style="cursor:pointer;list-style:none;padding:10px 12px;display:flex;align-items:center;gap:8px"><span class="meridian-caret" style="display:inline-block;font-size:10px;color:var(--muted);transition:transform 120ms ease;' + caretRot + '">\u25B6</span><span style="font-weight:600;font-size:11px;color:var(--text)">' + title + '</span></summary><div style="padding:0 0 4px">';
       };
       const _allRepoPaths = [];
       if (!isHostedMode()) {
         try {
           const _allProjSettings = await Promise.allSettled(
-            (window.state.projects || []).map((p) => loadProjectSettings(p.id))
+            (window.state.projects || []).map((p3) => loadProjectSettings(p3.id))
           );
           for (const _ps of _allProjSettings) {
             if (_ps.status === "fulfilled") {
@@ -2041,7 +2080,7 @@ stop = ${JSON.stringify(stop)}`;
               }
             }
           }
-        } catch (_) {
+        } catch (_2) {
         }
       }
       let html = "";
@@ -2103,7 +2142,7 @@ stop = ${JSON.stringify(stop)}`;
         let _advOpen = false;
         try {
           _advOpen = localStorage.getItem(_advKey) === "1";
-        } catch (e) {
+        } catch (e3) {
         }
         html += `<details class="meridian-disclosure" style="margin-bottom:16px;border:1px solid var(--border);border-radius:6px;background:var(--surface-2)">
 
@@ -2238,7 +2277,7 @@ stop = ${JSON.stringify(stop)}`;
         let _psOpen = true;
         try {
           _psOpen = localStorage.getItem("meridian.settings.ps." + projectId) !== "0";
-        } catch (e) {
+        } catch (e3) {
         }
         const _psRot = _psOpen ? "transform:rotate(90deg)" : "";
         html += `<details id="settings-grp-ps-${projectId}" ${_psOpen ? "open" : ""} style="margin-bottom:12px;border:2px solid var(--border);border-radius:8px"><summary style="cursor:pointer;list-style:none;padding:10px 14px;display:flex;align-items:center;gap:8px;background:var(--surface-2);border-radius:8px"><span class="meridian-caret" style="display:inline-block;font-size:10px;color:var(--muted);transition:transform 120ms ease;${_psRot}">\u25B6</span><span style="font-weight:700;font-size:11px;color:var(--text);letter-spacing:.04em">PROJECT SETTINGS</span></summary><div style="padding:8px 8px 4px">`;
@@ -2308,6 +2347,28 @@ stop = ${JSON.stringify(stop)}`;
       ` : ""}
 
     </div>
+
+    ${ghConnections.length ? `
+
+      <div style="margin-bottom:10px;padding:8px 10px;border:1px solid var(--border);border-radius:5px;background:var(--surface-1)">
+
+        <div style="font-size:9px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.04em;margin-bottom:6px">Connected accounts</div>
+
+        <div style="display:flex;flex-direction:column;gap:5px">
+
+          ${ghConnections.map(function(c3) {
+          var login = c3 && c3.account_login || "";
+          var active = !!ghUsername && login.toLowerCase() === ghUsername.toLowerCase();
+          return `<div style="display:flex;align-items:center;gap:8px"><img src="https://github.com/${encodeURIComponent(login)}.png?size=32" alt="" style="width:18px;height:18px;border-radius:50%;border:1px solid var(--border);background:var(--surface-2)" onerror="this.style.visibility='hidden'"><span style="font-size:11px;color:var(--text);font-weight:600">@${escapeHtml(login)}</span>` + (active ? `<span style="font-size:8px;font-weight:700;color:#22c55e;border:1px solid #22c55e55;border-radius:3px;padding:1px 5px">ACTIVE</span>` : `<button class="secondary gh-acct-use" data-login="${escapeHtml(login)}" style="font-size:9px;padding:1px 7px">Use for this project</button>`) + `<span style="flex:1"></span><button class="secondary gh-acct-remove" data-login="${escapeHtml(login)}" style="font-size:9px;padding:1px 7px;color:var(--danger,#ef4444)">Disconnect</button></div>`;
+        }).join("")}
+
+        </div>
+
+        <button class="secondary" id="github-add-account-${projectId}" style="margin-top:8px;font-size:10px;padding:3px 10px">+ Connect another GitHub account</button>
+
+      </div>
+
+    ` : ""}
 
     ${ghData?.connected ? `
 
@@ -2383,23 +2444,23 @@ stop = ${JSON.stringify(stop)}`;
       <div style="font-weight:600;font-size:13px;color:var(--text);margin-bottom:4px">Known Locations</div>
       <div style="font-size:11px;color:var(--muted);margin-bottom:10px">First hook from a new machine auto-registers it here. All future sessions from that machine route to this project regardless of directory.</div>
       <div style="font-size:10px;font-weight:600;color:var(--text);margin-bottom:4px">Registered Machines</div>
-      <div id="exec-ez-hosts-tbl-${projectId}" style="margin-bottom:8px;font-size:10px;font-family:var(--font-mono)">${_klHosts.length ? '<table style="width:100%;border-collapse:collapse">' + _klHosts.map((h, i) => `<tr>
-              <td style="padding:2px 6px 2px 0;color:var(--text)">${escapeHtml(h.hostname || "")}</td>
-              <td style="padding:2px 6px 2px 0;color:var(--muted)"><label style="display:flex;align-items:center;gap:4px;cursor:pointer;font-size:9px"><input type="checkbox" class="exec-ez-host-autocwd" data-pid="${escapeHtml(projectId)}" data-idx="${i}" ${h.auto_add_cwds ? "checked" : ""} style="cursor:pointer"> Auto-add new cwds</label></td>
-              <td style="padding:2px 0;text-align:right"><button class="exec-ez-del-host" data-pid="${escapeHtml(projectId)}" data-idx="${i}" style="font-size:9px;padding:1px 6px;background:transparent;border:1px solid var(--border);border-radius:3px;color:var(--muted);cursor:pointer">Remove</button></td>
+      <div id="exec-ez-hosts-tbl-${projectId}" style="margin-bottom:8px;font-size:10px;font-family:var(--font-mono)">${_klHosts.length ? '<table style="width:100%;border-collapse:collapse">' + _klHosts.map((h2, i3) => `<tr>
+              <td style="padding:2px 6px 2px 0;color:var(--text)">${escapeHtml(h2.hostname || "")}</td>
+              <td style="padding:2px 6px 2px 0;color:var(--muted)"><label style="display:flex;align-items:center;gap:4px;cursor:pointer;font-size:9px"><input type="checkbox" class="exec-ez-host-autocwd" data-pid="${escapeHtml(projectId)}" data-idx="${i3}" ${h2.auto_add_cwds ? "checked" : ""} style="cursor:pointer"> Auto-add new cwds</label></td>
+              <td style="padding:2px 0;text-align:right"><button class="exec-ez-del-host" data-pid="${escapeHtml(projectId)}" data-idx="${i3}" style="font-size:9px;padding:1px 6px;background:transparent;border:1px solid var(--border);border-radius:3px;color:var(--muted);cursor:pointer">Remove</button></td>
             </tr>`).join("") + "</table>" : '<div style="color:var(--muted);font-style:italic;font-size:10px">No machines registered yet \u2014 first hook auto-registers.</div>'}</div>
       <div style="font-size:10px;font-weight:600;color:var(--text);margin-bottom:4px">Specific Paths (cwd overrides)</div>
-      <div id="exec-ez-paths-tbl-${projectId}" style="margin-bottom:8px;font-size:10px;font-family:var(--font-mono)">${_klPaths.length ? '<table style="width:100%;border-collapse:collapse">' + _klPaths.map((p, i) => `<tr>
-              <td style="padding:2px 6px 2px 0;color:var(--text)">${escapeHtml(p.hostname || "")}</td>
-              <td style="padding:2px 6px 2px 0;color:var(--muted)">${escapeHtml(p.cwd || "")}</td>
-              <td style="padding:2px 0;text-align:right"><button class="exec-ez-del-row" data-pid="${escapeHtml(projectId)}" data-idx="${i}" style="font-size:9px;padding:1px 6px;background:transparent;border:1px solid var(--border);border-radius:3px;color:var(--muted);cursor:pointer">Remove</button></td>
+      <div id="exec-ez-paths-tbl-${projectId}" style="margin-bottom:8px;font-size:10px;font-family:var(--font-mono)">${_klPaths.length ? '<table style="width:100%;border-collapse:collapse">' + _klPaths.map((p3, i3) => `<tr>
+              <td style="padding:2px 6px 2px 0;color:var(--text)">${escapeHtml(p3.hostname || "")}</td>
+              <td style="padding:2px 6px 2px 0;color:var(--muted)">${escapeHtml(p3.cwd || "")}</td>
+              <td style="padding:2px 0;text-align:right"><button class="exec-ez-del-row" data-pid="${escapeHtml(projectId)}" data-idx="${i3}" style="font-size:9px;padding:1px 6px;background:transparent;border:1px solid var(--border);border-radius:3px;color:var(--muted);cursor:pointer">Remove</button></td>
             </tr>`).join("") + "</table>" : '<div style="color:var(--muted);font-style:italic;font-size:10px">No path overrides \u2014 machine-level routing handles most cases.</div>'}</div>
       <div style="display:flex;gap:6px;margin-bottom:8px">
         <input id="exec-ez-add-cwd-${projectId}" type="text" placeholder="cwd e.g. C:\\Users\\you\\project" style="flex:2;box-sizing:border-box;background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:3px 6px">
         <input id="exec-ez-add-host-${projectId}" type="text" placeholder="hostname" list="exec-ez-host-options-${projectId}" value="${escapeHtml(String(_klHosts[0] && _klHosts[0].hostname || ""))}" style="flex:1;box-sizing:border-box;background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:3px 6px">
         <button id="exec-ez-add-btn-${projectId}" class="secondary" style="font-size:10px;padding:3px 10px">Add</button>
       </div>
-      <datalist id="exec-ez-host-options-${projectId}">${_klHosts.map((h) => `<option value="${escapeHtml(String(h.hostname || ""))}"></option>`).join("")}</datalist>
+      <datalist id="exec-ez-host-options-${projectId}">${_klHosts.map((h2) => `<option value="${escapeHtml(String(h2.hostname || ""))}"></option>`).join("")}</datalist>
       <div style="display:flex;gap:8px;align-items:center">
         <button id="exec-ez-save-${projectId}" class="primary" style="font-size:10px;padding:3px 10px">Save</button>
         <button id="exec-ez-clear-${projectId}" class="secondary" style="font-size:10px;padding:3px 10px">Clear all</button>
@@ -2545,7 +2606,7 @@ stop = ${JSON.stringify(stop)}`;
           { id: "cursor", label: "Cursor", file: "~/.cursor/mcp.json" }
         ];
         const projectOpts = projects.map(
-          (p) => `<option value="${escapeHtml(p.id)}">${escapeHtml(p.name)}</option>`
+          (p3) => `<option value="${escapeHtml(p3.id)}">${escapeHtml(p3.name)}</option>`
         ).join("");
         html += `<div style="margin-bottom:16px">
 
@@ -2561,7 +2622,7 @@ stop = ${JSON.stringify(stop)}`;
 
         <div style="display:flex;gap:0;border:1px solid var(--border);border-radius:3px;overflow:hidden" id="mcp-client-tabs-${projectId}">
 
-          ${clients.map((c, i) => `<button data-client="${c.id}" style="background:${i === 0 ? "var(--accent)" : "var(--surface-1)"};color:${i === 0 ? "#000" : "var(--text)"};border:none;padding:3px 10px;font-size:10px;font-family:var(--font-mono);cursor:pointer;white-space:nowrap">${c.label}</button>`).join("")}
+          ${clients.map((c3, i3) => `<button data-client="${c3.id}" style="background:${i3 === 0 ? "var(--accent)" : "var(--surface-1)"};color:${i3 === 0 ? "#000" : "var(--text)"};border:none;padding:3px 10px;font-size:10px;font-family:var(--font-mono);cursor:pointer;white-space:nowrap">${c3.label}</button>`).join("")}
 
         </div>
 
@@ -2616,7 +2677,7 @@ stop = ${JSON.stringify(stop)}`;
             }, null, 2);
           }
           function renderConfig() {
-            const cli = clients.find((c) => c.id === activeClient) || clients[0];
+            const cli = clients.find((c3) => c3.id === activeClient) || clients[0];
             const cfg = buildConfig();
             if (cfg) {
               configBlock.textContent = cfg;
@@ -2657,9 +2718,9 @@ stop = ${JSON.stringify(stop)}`;
             tabsEl.querySelectorAll("button[data-client]").forEach((btn) => {
               btn.onclick = () => {
                 activeClient = btn.dataset.client;
-                tabsEl.querySelectorAll("button[data-client]").forEach((b) => {
-                  b.style.background = b === btn ? "var(--accent)" : "var(--surface-1)";
-                  b.style.color = b === btn ? "#000" : "var(--text)";
+                tabsEl.querySelectorAll("button[data-client]").forEach((b2) => {
+                  b2.style.background = b2 === btn ? "var(--accent)" : "var(--surface-1)";
+                  b2.style.color = b2 === btn ? "#000" : "var(--text)";
                 });
                 renderConfig();
               };
@@ -2692,7 +2753,7 @@ stop = ${JSON.stringify(stop)}`;
                       setTimeout(() => {
                         copyHostedBtn.textContent = "Copy .mcp.json";
                       }, 1800);
-                    } catch (e) {
+                    } catch (e3) {
                     }
                   };
                 }
@@ -2702,10 +2763,11 @@ stop = ${JSON.stringify(stop)}`;
                 const mcpKeyCopyBtn = document.getElementById(`mcp-key-copy-btn-${projectId}`);
                 const mcpKeyDismiss = document.getElementById(`mcp-key-dismiss-${projectId}`);
                 if (mcpRevealEl && mcpRevealInput) {
-                  let _hideMcpReveal = function() {
+                  let _hideMcpReveal2 = function() {
                     mcpRevealEl.style.display = "none";
                     if (copyStatus) copyStatus.textContent = "Key saved: " + ("sk_meridian_\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022" + tok.token.slice(-4)) + tok.token.slice(-4);
                   };
+                  var _hideMcpReveal = _hideMcpReveal2;
                   mcpRevealInput.value = tok.token;
                   mcpRevealEl.style.display = "";
                   if (mcpKeyCopyBtn) mcpKeyCopyBtn.onclick = async () => {
@@ -2715,16 +2777,16 @@ stop = ${JSON.stringify(stop)}`;
                       setTimeout(() => {
                         mcpKeyCopyBtn.textContent = "Copy key";
                       }, 1800);
-                    } catch (e) {
+                    } catch (e3) {
                     }
                   };
-                  if (mcpKeyDismiss) mcpKeyDismiss.onclick = _hideMcpReveal;
-                  setTimeout(_hideMcpReveal, 3e4);
+                  if (mcpKeyDismiss) mcpKeyDismiss.onclick = _hideMcpReveal2;
+                  setTimeout(_hideMcpReveal2, 3e4);
                 } else if (copyStatus) {
                   copyStatus.textContent = "Real key generated \u2014 save it, it won't be shown again.";
                 }
-              } catch (e) {
-                if (copyStatus) copyStatus.textContent = `error: ${escapeHtml(String(e))}`;
+              } catch (e3) {
+                if (copyStatus) copyStatus.textContent = `error: ${escapeHtml(String(e3))}`;
               } finally {
                 genBtn.disabled = false;
                 genBtn.textContent = "Generate new key";
@@ -2741,7 +2803,7 @@ stop = ${JSON.stringify(stop)}`;
                 setTimeout(() => {
                   copyBtn.textContent = "Copy config";
                 }, 1800);
-              } catch (e) {
+              } catch (e3) {
                 copyStatus.textContent = "Copy failed \u2014 select and copy manually";
               }
             };
@@ -2875,7 +2937,7 @@ project_id = "${displayPid}"`;
                 setTimeout(() => {
                   btn.textContent = "Copy";
                 }, 1800);
-              } catch (e) {
+              } catch (e3) {
                 btn.textContent = "Select and copy manually";
               }
             };
@@ -2891,7 +2953,7 @@ project_id = "${displayPid}"`;
                 setTimeout(() => {
                   copyGoalBtn.textContent = "Copy";
                 }, 1800);
-              } catch (e) {
+              } catch (e3) {
                 copyGoalBtn.textContent = "Select and copy manually";
               }
             };
@@ -2910,8 +2972,8 @@ project_id = "${displayPid}"`;
                     if (goalStatusEl) goalStatusEl.textContent = "";
                   }, 2e3);
                 }
-              } catch (e) {
-                if (goalStatusEl) goalStatusEl.textContent = `Failed: ${String(e)}`;
+              } catch (e3) {
+                if (goalStatusEl) goalStatusEl.textContent = `Failed: ${String(e3)}`;
               } finally {
                 saveGoalBtn.disabled = false;
               }
@@ -2932,8 +2994,8 @@ project_id = "${displayPid}"`;
                     if (goalStatusEl) goalStatusEl.textContent = "";
                   }, 2e3);
                 }
-              } catch (e) {
-                if (goalStatusEl) goalStatusEl.textContent = `Failed: ${String(e)}`;
+              } catch (e3) {
+                if (goalStatusEl) goalStatusEl.textContent = `Failed: ${String(e3)}`;
               } finally {
                 regenGoalBtn.disabled = false;
               }
@@ -2948,8 +3010,8 @@ project_id = "${displayPid}"`;
                 await api(`/projects/${projectId}/github/push-mcp-template`, { method: "POST" });
                 pushBtn.textContent = "\u2713 Pushed!";
                 pushBtn.style.color = "#059669";
-              } catch (e) {
-                const msg = String(e);
+              } catch (e3) {
+                const msg = String(e3);
                 if (msg.includes("409")) {
                   pushBtn.textContent = "Already exists";
                 } else {
@@ -3009,17 +3071,17 @@ project_id = "${displayPid}"`;
             sel.value = String(saved.max_pinned_decisions || DEFAULT_MAX_PINNED_DECISIONS);
             if (status) status.textContent = `Warning threshold saved at ${saved.max_pinned_decisions}.`;
             renderConstitutionWarning(projectId);
-          } catch (e) {
-            if (status) status.textContent = `Save failed: ${String(e)}`;
+          } catch (e3) {
+            if (status) status.textContent = `Save failed: ${String(e3)}`;
           } finally {
             sel.disabled = false;
           }
         };
         sel.addEventListener("change", commit);
         sel.addEventListener("blur", commit);
-        sel.addEventListener("keydown", (e) => {
-          if (e.key === "Enter") {
-            e.preventDefault();
+        sel.addEventListener("keydown", (e3) => {
+          if (e3.key === "Enter") {
+            e3.preventDefault();
             sel.blur();
           }
         });
@@ -3059,12 +3121,12 @@ project_id = "${displayPid}"`;
           try {
             const mode = Math.max(0, Math.min(2, parseInt(sel.value, 10) || 0));
             const saved = await saveProjectSettings(projectId, { hitl_auto_answer: mode });
-            const m = Math.max(0, Math.min(2, parseInt(saved && saved.hitl_auto_answer || 0, 10) || 0));
-            sel.value = String(m);
-            if (status) status.textContent = _hitlDesc[m];
-          } catch (e) {
+            const m3 = Math.max(0, Math.min(2, parseInt(saved && saved.hitl_auto_answer || 0, 10) || 0));
+            sel.value = String(m3);
+            if (status) status.textContent = _hitlDesc[m3];
+          } catch (e3) {
             sel.value = prev;
-            if (status) status.textContent = `Save failed: ${String(e)}`;
+            if (status) status.textContent = `Save failed: ${String(e3)}`;
           } finally {
             sel.disabled = false;
           }
@@ -3097,8 +3159,8 @@ project_id = "${displayPid}"`;
             setTimeout(() => {
               if (emStatus) emStatus.textContent = "";
             }, 1500);
-          } catch (e) {
-            if (emStatus) emStatus.textContent = `Save failed: ${String(e)}`;
+          } catch (e3) {
+            if (emStatus) emStatus.textContent = `Save failed: ${String(e3)}`;
           }
         };
       }, 0);
@@ -3138,8 +3200,8 @@ project_id = "${displayPid}"`;
             setTimeout(() => {
               if (psStatus) psStatus.textContent = "";
             }, 1500);
-          } catch (e) {
-            if (psStatus) psStatus.textContent = `Save failed: ${String(e)}`;
+          } catch (e3) {
+            if (psStatus) psStatus.textContent = `Save failed: ${String(e3)}`;
           }
         };
         if (awSel) awSel.onchange = () => saveSetting({ auto_worktrees: parseInt(awSel.value, 10) });
@@ -3160,10 +3222,10 @@ project_id = "${displayPid}"`;
         ${(() => {
         const rps = Array.isArray(execCfg.repo_paths) ? execCfg.repo_paths : [];
         if (!rps.length) return '<div style="color:var(--muted);font-style:italic">No locations tracked yet.</div>';
-        return '<table style="width:100%;border-collapse:collapse">' + rps.map((p, i) => `<tr>
-              <td style="padding:2px 6px 2px 0;color:var(--text)">${escapeHtml(p.hostname || "")}</td>
-              <td style="padding:2px 6px 2px 0;color:var(--muted)">${escapeHtml(p.cwd || "")}</td>
-              <td style="padding:2px 0;text-align:right"><button class="exec-del-rp-row" data-pid="${escapeHtml(projectId)}" data-idx="${i}" style="font-size:9px;padding:1px 6px;background:transparent;border:1px solid var(--border);border-radius:3px;color:var(--muted);cursor:pointer">\u2715</button></td>
+        return '<table style="width:100%;border-collapse:collapse">' + rps.map((p3, i3) => `<tr>
+              <td style="padding:2px 6px 2px 0;color:var(--text)">${escapeHtml(p3.hostname || "")}</td>
+              <td style="padding:2px 6px 2px 0;color:var(--muted)">${escapeHtml(p3.cwd || "")}</td>
+              <td style="padding:2px 0;text-align:right"><button class="exec-del-rp-row" data-pid="${escapeHtml(projectId)}" data-idx="${i3}" style="font-size:9px;padding:1px 6px;background:transparent;border:1px solid var(--border);border-radius:3px;color:var(--muted);cursor:pointer">\u2715</button></td>
             </tr>`).join("") + "</table>";
       })()}
       </div>
@@ -3239,23 +3301,23 @@ project_id = "${displayPid}"`;
           if (!_execRepoPaths.length) {
             _rpTblEl.innerHTML = '<div style="color:var(--muted);font-style:italic;font-size:10px">No locations tracked yet.</div>';
           } else {
-            _rpTblEl.innerHTML = '<table style="width:100%;border-collapse:collapse">' + _execRepoPaths.map((p, i) => `<tr>
-            <td style="padding:2px 6px 2px 0;color:var(--text);font-size:10px;font-family:var(--font-mono)">${escapeHtml(p.hostname || "")}</td>
-            <td style="padding:2px 6px 2px 0;color:var(--muted);font-size:10px;font-family:var(--font-mono)">${escapeHtml(p.cwd || "")}</td>
-            <td style="padding:2px 0;text-align:right"><button class="exec-del-rp-row" data-pid="${escapeHtml(projectId)}" data-idx="${i}" style="font-size:9px;padding:1px 6px;background:transparent;border:1px solid var(--border);border-radius:3px;color:var(--muted);cursor:pointer">\u2715</button></td>
+            _rpTblEl.innerHTML = '<table style="width:100%;border-collapse:collapse">' + _execRepoPaths.map((p3, i3) => `<tr>
+            <td style="padding:2px 6px 2px 0;color:var(--text);font-size:10px;font-family:var(--font-mono)">${escapeHtml(p3.hostname || "")}</td>
+            <td style="padding:2px 6px 2px 0;color:var(--muted);font-size:10px;font-family:var(--font-mono)">${escapeHtml(p3.cwd || "")}</td>
+            <td style="padding:2px 0;text-align:right"><button class="exec-del-rp-row" data-pid="${escapeHtml(projectId)}" data-idx="${i3}" style="font-size:9px;padding:1px 6px;background:transparent;border:1px solid var(--border);border-radius:3px;color:var(--muted);cursor:pointer">\u2715</button></td>
           </tr>`).join("") + "</table>";
-            _rpTblEl.querySelectorAll(".exec-del-rp-row").forEach((b) => {
-              b.onclick = () => {
-                _execRepoPaths.splice(parseInt(b.dataset.idx, 10), 1);
+            _rpTblEl.querySelectorAll(".exec-del-rp-row").forEach((b2) => {
+              b2.onclick = () => {
+                _execRepoPaths.splice(parseInt(b2.dataset.idx, 10), 1);
                 _rerenderRpTbl();
               };
             });
           }
         };
         if (_rpTblEl) {
-          _rpTblEl.querySelectorAll(".exec-del-rp-row").forEach((b) => {
-            b.onclick = () => {
-              _execRepoPaths.splice(parseInt(b.dataset.idx, 10), 1);
+          _rpTblEl.querySelectorAll(".exec-del-rp-row").forEach((b2) => {
+            b2.onclick = () => {
+              _execRepoPaths.splice(parseInt(b2.dataset.idx, 10), 1);
               _rerenderRpTbl();
             };
           });
@@ -3267,7 +3329,7 @@ project_id = "${displayPid}"`;
             _rerenderRpTbl();
           };
         }
-        let _execFsRoots = Array.isArray(execCfg.filesystem_roots) ? execCfg.filesystem_roots.filter((r) => typeof r === "string" && r.trim()).map((r) => r.trim()) : [];
+        let _execFsRoots = Array.isArray(execCfg.filesystem_roots) ? execCfg.filesystem_roots.filter((r3) => typeof r3 === "string" && r3.trim()).map((r3) => r3.trim()) : [];
         const _fsTblEl = document.getElementById(`exec-fs-roots-tbl-${projectId}`);
         const _rerenderFsTbl = () => {
           if (!_fsTblEl) return;
@@ -3275,13 +3337,13 @@ project_id = "${displayPid}"`;
             _fsTblEl.innerHTML = '<div style="color:var(--muted);font-style:italic;font-size:10px">None \u2014 defaults to your home directory.</div>';
             return;
           }
-          _fsTblEl.innerHTML = '<table style="width:100%;border-collapse:collapse">' + _execFsRoots.map((p, i) => `<tr>
-          <td style="padding:2px 6px 2px 0;color:var(--text);font-size:10px;font-family:var(--font-mono)">${escapeHtml(p)}</td>
-          <td style="padding:2px 0;text-align:right"><button class="exec-del-fs-row" data-idx="${i}" style="font-size:9px;padding:1px 6px;background:transparent;border:1px solid var(--border);border-radius:3px;color:var(--muted);cursor:pointer">\u2715</button></td>
+          _fsTblEl.innerHTML = '<table style="width:100%;border-collapse:collapse">' + _execFsRoots.map((p3, i3) => `<tr>
+          <td style="padding:2px 6px 2px 0;color:var(--text);font-size:10px;font-family:var(--font-mono)">${escapeHtml(p3)}</td>
+          <td style="padding:2px 0;text-align:right"><button class="exec-del-fs-row" data-idx="${i3}" style="font-size:9px;padding:1px 6px;background:transparent;border:1px solid var(--border);border-radius:3px;color:var(--muted);cursor:pointer">\u2715</button></td>
         </tr>`).join("") + "</table>";
-          _fsTblEl.querySelectorAll(".exec-del-fs-row").forEach((b) => {
-            b.onclick = () => {
-              _execFsRoots.splice(parseInt(b.dataset.idx, 10), 1);
+          _fsTblEl.querySelectorAll(".exec-del-fs-row").forEach((b2) => {
+            b2.onclick = () => {
+              _execFsRoots.splice(parseInt(b2.dataset.idx, 10), 1);
               _rerenderFsTbl();
             };
           });
@@ -3290,16 +3352,16 @@ project_id = "${displayPid}"`;
         const _fsInput = document.getElementById(`exec-fs-roots-input-${projectId}`);
         const _fsAddBtn = document.getElementById(`exec-fs-roots-add-${projectId}`);
         const _addFsRoot = () => {
-          const v = (_fsInput?.value || "").trim();
-          if (!v) return;
-          if (!_execFsRoots.includes(v)) _execFsRoots.push(v);
+          const v3 = (_fsInput?.value || "").trim();
+          if (!v3) return;
+          if (!_execFsRoots.includes(v3)) _execFsRoots.push(v3);
           if (_fsInput) _fsInput.value = "";
           _rerenderFsTbl();
         };
         if (_fsAddBtn) _fsAddBtn.onclick = _addFsRoot;
-        if (_fsInput) _fsInput.addEventListener("keydown", (e) => {
-          if (e.key === "Enter") {
-            e.preventDefault();
+        if (_fsInput) _fsInput.addEventListener("keydown", (e3) => {
+          if (e3.key === "Enter") {
+            e3.preventDefault();
             _addFsRoot();
           }
         });
@@ -3310,9 +3372,9 @@ project_id = "${displayPid}"`;
           cfg.repo_paths = _execRepoPaths;
           cfg.filesystem_roots = _execFsRoots;
           if (Array.isArray(execCfg.hostnames)) cfg.hostnames = execCfg.hostnames;
-          for (const f of fields) {
-            const val = (document.getElementById(`exec-${f}-${projectId}`)?.value || "").trim();
-            if (val) cfg[f] = val;
+          for (const f4 of fields) {
+            const val = (document.getElementById(`exec-${f4}-${projectId}`)?.value || "").trim();
+            if (val) cfg[f4] = val;
           }
           const minEl = document.getElementById(`exec-test_min-${projectId}`);
           const minVal = minEl ? parseInt(minEl.value || "", 10) : NaN;
@@ -3325,8 +3387,8 @@ project_id = "${displayPid}"`;
             setTimeout(() => {
               if (statusEl) statusEl.textContent = "";
             }, 2e3);
-          } catch (e) {
-            if (statusEl) statusEl.textContent = `Save failed: ${String(e)}`;
+          } catch (e3) {
+            if (statusEl) statusEl.textContent = `Save failed: ${String(e3)}`;
           } finally {
             saveBtn.disabled = false;
           }
@@ -3344,15 +3406,15 @@ project_id = "${displayPid}"`;
         const saveStatus = document.getElementById("ws-settings-status");
         (async () => {
           try {
-            const s = await api("/workspace/settings");
-            if (hitlCb) hitlCb.checked = !!s.hitl_auto_answer_default;
-            if (sprintIn) sprintIn.value = s.sprint_name_default || "";
-            if (displayIn) displayIn.value = s.display_name || "";
-            if (nudgeIn) nudgeIn.value = s.log_task_sprint_nudge_threshold != null ? s.log_task_sprint_nudge_threshold : 5;
-            if (handoffTplIn) handoffTplIn.value = s.handoff_template || "";
-            if (execModeIn) execModeIn.value = s.execution_mode_default || "";
-            if (codeIntelCb) codeIntelCb.checked = !!s.code_intel_enabled_default;
-          } catch (e) {
+            const s3 = await api("/workspace/settings");
+            if (hitlCb) hitlCb.checked = !!s3.hitl_auto_answer_default;
+            if (sprintIn) sprintIn.value = s3.sprint_name_default || "";
+            if (displayIn) displayIn.value = s3.display_name || "";
+            if (nudgeIn) nudgeIn.value = s3.log_task_sprint_nudge_threshold != null ? s3.log_task_sprint_nudge_threshold : 5;
+            if (handoffTplIn) handoffTplIn.value = s3.handoff_template || "";
+            if (execModeIn) execModeIn.value = s3.execution_mode_default || "";
+            if (codeIntelCb) codeIntelCb.checked = !!s3.code_intel_enabled_default;
+          } catch (e3) {
             if (saveStatus) saveStatus.textContent = "Could not load workspace defaults.";
           }
         })();
@@ -3378,8 +3440,8 @@ project_id = "${displayPid}"`;
               if (saveStatus) saveStatus.textContent = "";
             }, 2e3);
             toast("Workspace defaults saved");
-          } catch (e) {
-            const msg = e && e.message ? e.message : String(e);
+          } catch (e3) {
+            const msg = e3 && e3.message ? e3.message : String(e3);
             if (saveStatus) saveStatus.textContent = `Save failed: ${msg}`;
             toast(`Save failed: ${msg}`, true);
           } finally {
@@ -3391,11 +3453,11 @@ project_id = "${displayPid}"`;
           if (!decList) return;
           try {
             const items = await api("/workspace/decisions");
-            decList.innerHTML = items && items.length ? items.map((d) => `<div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px;padding:4px 0;border-bottom:1px solid var(--border)">
+            decList.innerHTML = items && items.length ? items.map((d3) => `<div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px;padding:4px 0;border-bottom:1px solid var(--border)">
 
-              <span><span style="color:var(--accent)">${escapeHtml(d.category || "TECHNICAL")}</span> ${escapeHtml(d.title || "")}: <span style="color:var(--muted)">${escapeHtml(d.body || "")}</span></span>
+              <span><span style="color:var(--accent)">${escapeHtml(d3.category || "TECHNICAL")}</span> ${escapeHtml(d3.title || "")}: <span style="color:var(--muted)">${escapeHtml(d3.body || "")}</span></span>
 
-              <button class="secondary" data-did="${escapeHtml(d.id)}" style="font-size:9px;padding:2px 7px">\xD7</button>
+              <button class="secondary" data-did="${escapeHtml(d3.id)}" style="font-size:9px;padding:2px 7px">\xD7</button>
 
             </div>`).join("") : '<div style="color:var(--muted)">No workspace decisions yet.</div>';
             decList.querySelectorAll("button[data-did]").forEach((btn) => {
@@ -3404,12 +3466,12 @@ project_id = "${displayPid}"`;
                 try {
                   await api(`/workspace/decisions/${btn.dataset.did}`, { method: "DELETE" });
                   renderWsDecisions();
-                } catch (e) {
-                  alert("Error: " + e);
+                } catch (e3) {
+                  alert("Error: " + e3);
                 }
               };
             });
-          } catch (e) {
+          } catch (e3) {
             decList.innerHTML = '<div style="color:var(--muted)">Failed to load.</div>';
           }
         }
@@ -3425,8 +3487,8 @@ project_id = "${displayPid}"`;
             document.getElementById("ws-dec-title").value = "";
             document.getElementById("ws-dec-body").value = "";
             renderWsDecisions();
-          } catch (e) {
-            alert("Error: " + e);
+          } catch (e3) {
+            alert("Error: " + e3);
           } finally {
             decAdd.disabled = false;
           }
@@ -3436,14 +3498,14 @@ project_id = "${displayPid}"`;
           if (!noteList) return;
           try {
             const items = await api("/workspace/notes");
-            noteList.innerHTML = items && items.length ? items.map((n) => `<div data-note-row="${escapeHtml(n.id)}" style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px;padding:4px 0;border-bottom:1px solid var(--border)">
+            noteList.innerHTML = items && items.length ? items.map((n2) => `<div data-note-row="${escapeHtml(n2.id)}" style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px;padding:4px 0;border-bottom:1px solid var(--border)">
 
-              <span data-note-view="${escapeHtml(n.id)}">${escapeHtml(n.title || "")}: <span style="color:var(--muted)">${escapeHtml(n.body || "")}</span>${n.tags ? ` <span style="color:var(--accent);font-size:9px">${escapeHtml(n.tags)}</span>` : ""}</span>
+              <span data-note-view="${escapeHtml(n2.id)}">${escapeHtml(n2.title || "")}: <span style="color:var(--muted)">${escapeHtml(n2.body || "")}</span>${n2.tags ? ` <span style="color:var(--accent);font-size:9px">${escapeHtml(n2.tags)}</span>` : ""}</span>
 
               <span style="display:flex;gap:4px;flex-shrink:0">
-                <button class="secondary" data-nid-edit="${escapeHtml(n.id)}" data-ntitle="${escapeHtml(n.title || "")}" data-nbody="${escapeHtml(n.body || "")}" style="font-size:9px;padding:2px 6px" title="Edit">\u270E</button>
-                <button class="secondary" data-nid-move="${escapeHtml(n.id)}" style="font-size:9px;padding:2px 6px" title="Move to project">\u2197</button>
-                <button class="secondary" data-nid="${escapeHtml(n.id)}" style="font-size:9px;padding:2px 7px">\xD7</button>
+                <button class="secondary" data-nid-edit="${escapeHtml(n2.id)}" data-ntitle="${escapeHtml(n2.title || "")}" data-nbody="${escapeHtml(n2.body || "")}" style="font-size:9px;padding:2px 6px" title="Edit">\u270E</button>
+                <button class="secondary" data-nid-move="${escapeHtml(n2.id)}" style="font-size:9px;padding:2px 6px" title="Move to project">\u2197</button>
+                <button class="secondary" data-nid="${escapeHtml(n2.id)}" style="font-size:9px;padding:2px 7px">\xD7</button>
               </span>
 
             </div>`).join("") : '<div style="color:var(--muted)">No workspace notes yet.</div>';
@@ -3453,8 +3515,8 @@ project_id = "${displayPid}"`;
                 try {
                   await api(`/workspace/notes/${btn.dataset.nid}`, { method: "DELETE" });
                   renderWsNotes();
-                } catch (e) {
-                  alert("Error: " + e);
+                } catch (e3) {
+                  alert("Error: " + e3);
                 }
               };
             });
@@ -3488,8 +3550,8 @@ project_id = "${displayPid}"`;
                   try {
                     await api(`/workspace/notes/${nid}`, { method: "PATCH", body: JSON.stringify({ title: newTitle, body: newBody }) });
                     renderWsNotes();
-                  } catch (e) {
-                    alert("Error: " + e);
+                  } catch (e3) {
+                    alert("Error: " + e3);
                   }
                 };
               };
@@ -3508,7 +3570,7 @@ project_id = "${displayPid}"`;
                 picker.style.cssText = "display:flex;gap:4px;align-items:center;flex-shrink:0";
                 picker.innerHTML = `
               <select data-move-select style="font-size:9px;padding:2px 4px;background:var(--surface-2);border:1px solid var(--border);color:var(--text);border-radius:3px;max-width:120px">
-                ${projects.map((p) => `<option value="${escapeHtml(p.id)}">${escapeHtml(p.name || p.id)}</option>`).join("")}
+                ${projects.map((p3) => `<option value="${escapeHtml(p3.id)}">${escapeHtml(p3.name || p3.id)}</option>`).join("")}
               </select>
               <button class="primary" data-move-go style="font-size:9px;padding:2px 8px">Move</button>
               <button class="secondary" data-move-cancel style="font-size:9px;padding:2px 6px">\xD7</button>`;
@@ -3527,15 +3589,15 @@ project_id = "${displayPid}"`;
                     renderWsNotes();
                     try {
                       if (typeof loadNotesTab === "function") await loadNotesTab(targetId);
-                    } catch (_) {
+                    } catch (_2) {
                     }
-                  } catch (e) {
-                    alert("Error: " + e);
+                  } catch (e3) {
+                    alert("Error: " + e3);
                   }
                 };
               };
             });
-          } catch (e) {
+          } catch (e3) {
             noteList.innerHTML = '<div style="color:var(--muted)">Failed to load.</div>';
           }
         }
@@ -3551,8 +3613,8 @@ project_id = "${displayPid}"`;
             document.getElementById("ws-note-title").value = "";
             document.getElementById("ws-note-body").value = "";
             renderWsNotes();
-          } catch (e) {
-            alert("Error: " + e);
+          } catch (e3) {
+            alert("Error: " + e3);
           } finally {
             noteAdd.disabled = false;
           }
@@ -3568,26 +3630,26 @@ project_id = "${displayPid}"`;
             }
             const groups = {};
             items.forEach((it) => {
-              const g = it.item_group || "(ungrouped)";
-              (groups[g] = groups[g] || []).push(it);
+              const g2 = it.item_group || "(ungrouped)";
+              (groups[g2] = groups[g2] || []).push(it);
             });
             const STATUSES = ["todo", "pending", "in_progress", "done", "skipped", "failed"];
-            sprintList.innerHTML = Object.keys(groups).map((g) => {
-              const rows = groups[g].map((it) => {
+            sprintList.innerHTML = Object.keys(groups).map((g2) => {
+              const rows = groups[g2].map((it) => {
                 const done = it.status === "done" || it.status === "skipped";
                 const titleStyle = done ? "text-decoration:line-through;color:var(--muted)" : "";
-                const sel = `<select data-ws-status="${escapeHtml(it.id)}" style="font-size:9px;padding:1px 3px;background:var(--surface-2);border:1px solid var(--border);color:var(--text);border-radius:3px">` + STATUSES.map((s) => `<option value="${s}"${s === it.status ? " selected" : ""}>${s}</option>`).join("") + `</select>`;
+                const sel = `<select data-ws-status="${escapeHtml(it.id)}" style="font-size:9px;padding:1px 3px;background:var(--surface-2);border:1px solid var(--border);color:var(--text);border-radius:3px">` + STATUSES.map((s3) => `<option value="${s3}"${s3 === it.status ? " selected" : ""}>${s3}</option>`).join("") + `</select>`;
                 return `<div data-ws-row="${escapeHtml(it.id)}" style="display:flex;justify-content:space-between;align-items:center;gap:8px;padding:3px 0;border-bottom:1px solid var(--border)"><span style="${titleStyle}">${escapeHtml(it.title || "")}${it.human_id ? ` <span style="color:var(--accent);font-size:9px">@${escapeHtml(it.human_id)}</span>` : ""}</span><span style="display:flex;gap:4px;flex-shrink:0;align-items:center">${sel}<button class="secondary" data-ws-done="${escapeHtml(it.id)}" style="font-size:9px;padding:2px 6px" title="Mark done">\u2713</button></span></div>`;
               }).join("");
-              return `<div data-ws-group style="margin-bottom:8px"><div style="color:var(--accent);font-size:9px;letter-spacing:.05em;text-transform:uppercase;margin-bottom:2px">${escapeHtml(g)}</div>${rows}</div>`;
+              return `<div data-ws-group style="margin-bottom:8px"><div style="color:var(--accent);font-size:9px;letter-spacing:.05em;text-transform:uppercase;margin-bottom:2px">${escapeHtml(g2)}</div>${rows}</div>`;
             }).join("");
             sprintList.querySelectorAll("select[data-ws-status]").forEach((sel) => {
               sel.onchange = async () => {
                 try {
                   await api(`/workspace/sprint-items/${sel.dataset.wsStatus}`, { method: "PATCH", body: JSON.stringify({ status: sel.value }) });
                   renderWsSprint();
-                } catch (e) {
-                  alert("Error: " + e);
+                } catch (e3) {
+                  alert("Error: " + e3);
                 }
               };
             });
@@ -3596,12 +3658,12 @@ project_id = "${displayPid}"`;
                 try {
                   await api(`/workspace/sprint-items/${btn.dataset.wsDone}/complete`, { method: "POST" });
                   renderWsSprint();
-                } catch (e) {
-                  alert("Error: " + e);
+                } catch (e3) {
+                  alert("Error: " + e3);
                 }
               };
             });
-          } catch (e) {
+          } catch (e3) {
             sprintList.innerHTML = '<div style="color:var(--muted)">Failed to load.</div>';
           }
         }
@@ -3617,8 +3679,8 @@ project_id = "${displayPid}"`;
             document.getElementById("ws-sprint-title").value = "";
             document.getElementById("ws-sprint-group").value = "";
             renderWsSprint();
-          } catch (e) {
-            alert("Error: " + e);
+          } catch (e3) {
+            alert("Error: " + e3);
           } finally {
             sprintAdd.disabled = false;
           }
@@ -3630,7 +3692,7 @@ project_id = "${displayPid}"`;
         let _awOpen = false;
         try {
           _awOpen = localStorage.getItem("meridian.settings.aw." + projectId) === "1";
-        } catch (e) {
+        } catch (e3) {
         }
         const _awRot = _awOpen ? "transform:rotate(90deg)" : "";
         html += `<details id="settings-grp-aw-${projectId}" ${_awOpen ? "open" : ""} style="margin-bottom:12px;border:2px solid var(--border);border-radius:8px"><summary style="cursor:pointer;list-style:none;padding:10px 14px;display:flex;align-items:center;gap:8px;background:var(--surface-2);border-radius:8px"><span class="meridian-caret" style="display:inline-block;font-size:10px;color:var(--muted);transition:transform 120ms ease;${_awRot}">\u25B6</span><span style="font-weight:700;font-size:11px;color:var(--text);letter-spacing:.04em">ACCOUNT &amp; WORKSPACE</span></summary><div style="padding:8px 8px 4px">`;
@@ -3711,9 +3773,9 @@ project_id = "${displayPid}"`;
     </div>
   </div>`;
       if (!isHostedMode() && _allRepoPaths.length > 0) {
-        const _fsPaths = _allRepoPaths.map((p) => JSON.stringify(p)).join(" ");
-        const _fsNpx = `npx -y @modelcontextprotocol/server-filesystem ${_allRepoPaths.map((p) => JSON.stringify(p)).join(" ")}`;
-        const _fsClaude = `claude mcp add filesystem -- npx -y @modelcontextprotocol/server-filesystem ${_allRepoPaths.map((p) => JSON.stringify(p)).join(" ")}`;
+        const _fsPaths = _allRepoPaths.map((p3) => JSON.stringify(p3)).join(" ");
+        const _fsNpx = `npx -y @modelcontextprotocol/server-filesystem ${_allRepoPaths.map((p3) => JSON.stringify(p3)).join(" ")}`;
+        const _fsClaude = `claude mcp add filesystem -- npx -y @modelcontextprotocol/server-filesystem ${_allRepoPaths.map((p3) => JSON.stringify(p3)).join(" ")}`;
         html += `<div style="margin-bottom:16px" id="fs-mcp-section-${projectId}">
       <details>
         <summary style="cursor:pointer;list-style:none;display:flex;align-items:center;gap:6px;padding-bottom:6px;border-bottom:1px solid var(--border);margin-bottom:8px">
@@ -3764,7 +3826,7 @@ project_id = "${displayPid}"`;
 
           <option value="">all projects</option>
 
-          ${(window.state.projects || []).map((p) => `<option value="${escapeHtml(p.id)}">${escapeHtml(p.name || p.id)}</option>`).join("")}
+          ${(window.state.projects || []).map((p3) => `<option value="${escapeHtml(p3.id)}">${escapeHtml(p3.name || p3.id)}</option>`).join("")}
 
         </select>
 
@@ -3791,19 +3853,20 @@ project_id = "${displayPid}"`;
                 return;
               }
               const ROLE_CHOICES = ["admin", "member", "viewer"];
-              const projectNameById = Object.fromEntries((window.state.projects || []).map((p) => [p.id, p.name || p.id]));
-              listEl.innerHTML = members.map((m) => {
-                const opts = ROLE_CHOICES.map((r) => `<option value="${r}" ${m.role === r ? "selected" : ""}>${r}</option>`).join("");
-                const scopeBadge = m.project_id ? ` <span style="color:var(--muted);font-size:9px" title="Scoped to project ${escapeHtml(m.project_id)}">\xB7 ${escapeHtml(projectNameById[m.project_id] || m.project_id)}</span>` : "";
+              const projectNameById = Object.fromEntries((window.state.projects || []).map((p3) => [p3.id, p3.name || p3.id]));
+              listEl.innerHTML = members.map((m3) => {
+                const opts = ROLE_CHOICES.map((r3) => `<option value="${r3}" ${m3.role === r3 ? "selected" : ""}>${r3}</option>`).join("");
+                const _isCoAdmin = m3.role === "admin" && !!m3.project_id;
+                const scopeBadge = m3.project_id ? ` <span style="color:${_isCoAdmin ? "var(--accent)" : "var(--muted)"};font-size:9px;font-weight:${_isCoAdmin ? "600" : "400"}" title="${_isCoAdmin ? "Co-admin \u2014 admin of" : "Scoped to"} project ${escapeHtml(m3.project_id)}">\xB7 ${_isCoAdmin ? "co-admin @ " : ""}${escapeHtml(projectNameById[m3.project_id] || m3.project_id)}</span>` : "";
                 return `
 
             <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;padding:4px 0;border-bottom:1px solid var(--border)">
 
-              <span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escapeHtml(m.email)}${scopeBadge}${m.pending ? ' <span style="color:var(--accent);font-size:9px;font-weight:600">Invited</span>' : ""}</span>
+              <span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escapeHtml(m3.email)}${scopeBadge}${m3.pending ? ' <span style="color:var(--accent);font-size:9px;font-weight:600">Invited</span>' : ""}</span>
 
-              ${m.pending ? `<button class="resend-invite-btn secondary" data-mid="${escapeHtml(m.id)}" title="Resend invite" style="font-size:9px;padding:2px 7px">Resend</button>` : `<select class="member-role-select" data-mid="${escapeHtml(m.id)}" title="Change role" style="background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:2px 5px">${opts}</select>`}
+              ${m3.pending ? `<button class="resend-invite-btn secondary" data-mid="${escapeHtml(m3.id)}" title="Resend invite" style="font-size:9px;padding:2px 7px">Resend</button>` : `<select class="member-role-select" data-mid="${escapeHtml(m3.id)}" title="Change role" style="background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:2px 5px">${opts}</select>`}
 
-              <button class="secondary" data-mid="${escapeHtml(m.id)}" title="Remove member" style="font-size:9px;padding:2px 7px">\xD7</button>
+              <button class="secondary" data-mid="${escapeHtml(m3.id)}" title="Remove member" style="font-size:9px;padding:2px 7px">\xD7</button>
 
             </div>`;
               }).join("");
@@ -3827,9 +3890,9 @@ project_id = "${displayPid}"`;
                         if (inviteStatus) inviteStatus.textContent = "";
                       }, 2500);
                     }
-                  } catch (e) {
+                  } catch (e3) {
                     sel.value = sel.dataset.prev;
-                    if (inviteStatus) inviteStatus.textContent = `Error: ${escapeHtml(String(e))}`;
+                    if (inviteStatus) inviteStatus.textContent = `Error: ${escapeHtml(String(e3))}`;
                   } finally {
                     sel.disabled = false;
                   }
@@ -3848,9 +3911,9 @@ project_id = "${displayPid}"`;
                         if (inviteStatus) inviteStatus.textContent = "";
                       }, 2500);
                     }
-                  } catch (e) {
+                  } catch (e3) {
                     btn.textContent = "Resend";
-                    if (inviteStatus) inviteStatus.textContent = `Error: ${escapeHtml(String(e))}`;
+                    if (inviteStatus) inviteStatus.textContent = `Error: ${escapeHtml(String(e3))}`;
                   } finally {
                     btn.disabled = false;
                   }
@@ -3862,12 +3925,12 @@ project_id = "${displayPid}"`;
                   try {
                     await api(`/workspace/members/${btn.dataset.mid}`, { method: "DELETE" });
                     renderMembers();
-                  } catch (e) {
-                    alert("Error: " + e);
+                  } catch (e3) {
+                    alert("Error: " + e3);
                   }
                 };
               });
-            } catch (e) {
+            } catch (e3) {
               if (listEl) listEl.innerHTML = '<div style="color:var(--muted);font-size:10px">Members only available in hosted mode.</div>';
             }
           }
@@ -3893,8 +3956,8 @@ project_id = "${displayPid}"`;
                   }, 3e3);
                 }
                 renderMembers();
-              } catch (e) {
-                if (inviteStatus) inviteStatus.textContent = `Error: ${escapeHtml(String(e))}`;
+              } catch (e3) {
+                if (inviteStatus) inviteStatus.textContent = `Error: ${escapeHtml(String(e3))}`;
               } finally {
                 inviteBtn.disabled = false;
                 inviteBtn.textContent = "Invite";
@@ -3943,8 +4006,8 @@ project_id = "${displayPid}"`;
             try {
               await api("/account/delete", { method: "POST", body: JSON.stringify({ confirmation: "DELETE" }) });
               window.location.href = "/";
-            } catch (e) {
-              if (deleteStatus) deleteStatus.textContent = `Error: ${escapeHtml(String(e))}`;
+            } catch (e3) {
+              if (deleteStatus) deleteStatus.textContent = `Error: ${escapeHtml(String(e3))}`;
               deleteBtn2.disabled = false;
               deleteBtn2.textContent = "Delete my account";
             }
@@ -3963,18 +4026,19 @@ project_id = "${displayPid}"`;
           const usageEl = document.getElementById(`usage-body-${projectId}`);
           if (!usageEl) return;
           try {
-            let pct = function(used, limit) {
+            let pct2 = function(used, limit) {
               return Math.min(100, limit > 0 ? used / limit * 100 : 0);
-            }, barColor = function(p) {
-              return p >= 100 ? "#ef4444" : p >= 80 ? "#f59e0b" : "var(--accent)";
+            }, barColor2 = function(p3) {
+              return p3 >= 100 ? "#ef4444" : p3 >= 80 ? "#f59e0b" : "var(--accent)";
             };
-            const u = await api("/settings/usage");
-            const c = u.compute || {};
-            const s = u.storage || {};
-            const unlimited = !!u.unlimited;
+            var pct = pct2, barColor = barColor2;
+            const u4 = await api("/settings/usage");
+            const c3 = u4.compute || {};
+            const s3 = u4.storage || {};
+            const unlimited = !!u4.unlimited;
             const headerEl = document.getElementById(`usage-header-${projectId}`);
             if (headerEl) {
-              if (u.plan === "free") headerEl.textContent = "Trial usage";
+              if (u4.plan === "free") headerEl.textContent = "Trial usage";
               else if (unlimited) headerEl.textContent = "Usage";
               else headerEl.textContent = "Usage this month";
             }
@@ -3985,7 +4049,7 @@ project_id = "${displayPid}"`;
 
               <span style="color:var(--text)">Compute</span>
 
-              <span>${c.used.toFixed(2)} CU-hrs <span style="color:var(--accent)">\xB7 Unlimited</span></span>
+              <span>${c3.used.toFixed(2)} CU-hrs <span style="color:var(--accent)">\xB7 Unlimited</span></span>
 
             </div>
 
@@ -3993,28 +4057,28 @@ project_id = "${displayPid}"`;
 
               <span style="color:var(--text)">Storage</span>
 
-              <span>${s.used_gb.toFixed(3)} GB <span style="color:var(--accent)">\xB7 Unlimited</span></span>
+              <span>${s3.used_gb.toFixed(3)} GB <span style="color:var(--accent)">\xB7 Unlimited</span></span>
 
             </div>`;
               return;
             }
-            const cpct = pct(c.used, c.grace);
-            const spct = pct(s.used_gb, s.limit_gb);
+            const cpct = pct2(c3.used, c3.grace);
+            const spct = pct2(s3.used_gb, s3.limit_gb);
             usageEl.innerHTML = `
 
           <div style="margin-bottom:10px">
 
             <div style="display:flex;justify-content:space-between;margin-bottom:3px">
 
-              <span style="color:var(--text)">Compute${c.throttled ? ' <span style="color:#ef4444">(throttled)</span>' : ""}</span>
+              <span style="color:var(--text)">Compute${c3.throttled ? ' <span style="color:#ef4444">(throttled)</span>' : ""}</span>
 
-              <span>${c.used.toFixed(2)} / ${c.limit} CU-hrs <span style="color:var(--muted)">(${c.grace} w/grace)</span></span>
+              <span>${c3.used.toFixed(2)} / ${c3.limit} CU-hrs <span style="color:var(--muted)">(${c3.grace} w/grace)</span></span>
 
             </div>
 
             <div style="background:var(--surface-1);border-radius:2px;height:5px;overflow:hidden">
 
-              <div style="background:${barColor(cpct)};width:${cpct}%;height:100%;transition:width .3s"></div>
+              <div style="background:${barColor2(cpct)};width:${cpct}%;height:100%;transition:width .3s"></div>
 
             </div>
 
@@ -4026,13 +4090,13 @@ project_id = "${displayPid}"`;
 
               <span style="color:var(--text)">Storage</span>
 
-              <span>${s.used_gb.toFixed(3)} / ${s.limit_gb} GB</span>
+              <span>${s3.used_gb.toFixed(3)} / ${s3.limit_gb} GB</span>
 
             </div>
 
             <div style="background:var(--surface-1);border-radius:2px;height:5px;overflow:hidden">
 
-              <div style="background:${barColor(spct)};width:${spct}%;height:100%;transition:width .3s"></div>
+              <div style="background:${barColor2(spct)};width:${spct}%;height:100%;transition:width .3s"></div>
 
             </div>
 
@@ -4044,7 +4108,7 @@ project_id = "${displayPid}"`;
 
               Compute overage budget ($USD/mo, 0 = throttle)<br>
 
-              <input id="compute-cap-${projectId}" type="number" min="0" step="1" value="${c.cap_usd}" style="background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:3px 6px;width:80px;margin-top:3px">
+              <input id="compute-cap-${projectId}" type="number" min="0" step="1" value="${c3.cap_usd}" style="background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:3px 6px;width:80px;margin-top:3px">
 
             </label>
 
@@ -4052,7 +4116,7 @@ project_id = "${displayPid}"`;
 
               Storage overage budget ($USD/mo, 0 = block)<br>
 
-              <input id="storage-cap-${projectId}" type="number" min="0" step="1" value="${s.cap_usd}" style="background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:3px 6px;width:80px;margin-top:3px">
+              <input id="storage-cap-${projectId}" type="number" min="0" step="1" value="${s3.cap_usd}" style="background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:3px 6px;width:80px;margin-top:3px">
 
             </label>
 
@@ -4076,14 +4140,14 @@ project_id = "${displayPid}"`;
                       capsStatus.textContent = "";
                     }, 2e3);
                   }
-                } catch (e) {
-                  if (capsStatus) capsStatus.textContent = `error: ${escapeHtml(String(e))}`;
+                } catch (e3) {
+                  if (capsStatus) capsStatus.textContent = `error: ${escapeHtml(String(e3))}`;
                 } finally {
                   saveBtn.disabled = false;
                 }
               };
             }
-          } catch (e) {
+          } catch (e3) {
             if (usageEl) usageEl.textContent = "Usage data unavailable.";
           }
         }, 0);
@@ -4095,7 +4159,7 @@ project_id = "${displayPid}"`;
       let ntfyWarnAcknowledged = false;
       try {
         ntfyWarnAcknowledged = localStorage.getItem(STORAGE_KEY("ntfy.warn.dismissed")) === "1";
-      } catch (e) {
+      } catch (e3) {
       }
       const ntfyInputDisabled = ntfyWarnAcknowledged ? "" : "disabled";
       const ntfyWarnDisplay = ntfyWarnAcknowledged ? "display:none" : "";
@@ -4177,13 +4241,13 @@ project_id = "${displayPid}"`;
         html += `<div style="margin-bottom:12px">
 
       <div style="color:var(--accent);font-size:10px;letter-spacing:.06em;text-transform:uppercase;margin-bottom:10px;padding-bottom:4px;border-bottom:1px solid var(--border)">Email notifications</div>`;
-        PREFS.forEach((p) => {
-          const checked = prefs[p.key] ? "checked" : "";
+        PREFS.forEach((p3) => {
+          const checked = prefs[p3.key] ? "checked" : "";
           html += `<label style="display:flex;align-items:center;gap:8px;margin-bottom:8px;cursor:pointer;font-family:var(--font-mono);font-size:11px;color:var(--text)">
 
-        <input type="checkbox" data-pref="${p.key}" ${checked} style="cursor:pointer">
+        <input type="checkbox" data-pref="${p3.key}" ${checked} style="cursor:pointer">
 
-        ${escapeHtml(p.label)}
+        ${escapeHtml(p3.label)}
 
       </label>`;
         });
@@ -4208,18 +4272,19 @@ project_id = "${displayPid}"`;
       }
       try {
         _organizeSettingsIntoTabs(projectId);
-      } catch (e) {
-        console.error("Settings tabs failed:", e);
+      } catch (e3) {
+        console.error("Settings tabs failed:", e3);
       }
+      body.dataset.settingsTs = String(Date.now());
       _applySettingsRoleVisibility(projectId, _guest);
       _collapseConnectPlatforms(projectId);
       try {
         window.loadExecutorRulesSection?.(projectId);
-      } catch (e) {
+      } catch (e3) {
       }
       try {
         window.loadTunnelPluginsSection?.(projectId);
-      } catch (e) {
+      } catch (e3) {
       }
       if (isDemoMode()) hideDemoAdminControls();
       setTimeout(() => {
@@ -4232,11 +4297,11 @@ project_id = "${displayPid}"`;
         const genBtn = document.getElementById("blog-gen");
         const newBtn = document.getElementById("blog-new");
         if (!listEl || !saveBtn) return;
-        const setStatus = (m) => {
+        const setStatus = (m3) => {
           if (statusEl) {
-            statusEl.textContent = m;
-            if (m) setTimeout(() => {
-              if (statusEl.textContent === m) statusEl.textContent = "";
+            statusEl.textContent = m3;
+            if (m3) setTimeout(() => {
+              if (statusEl.textContent === m3) statusEl.textContent = "";
             }, 2500);
           }
         };
@@ -4246,56 +4311,57 @@ project_id = "${displayPid}"`;
           if (bodyIn) bodyIn.value = "";
         };
         async function loadList() {
+          listEl.innerHTML = '<div style="color:var(--muted)">Loading\u2026</div>';
           try {
             const posts = await api("/admin/blog/posts");
             if (!posts.length) {
               listEl.innerHTML = '<div style="color:var(--muted)">No posts yet.</div>';
               return;
             }
-            listEl.innerHTML = posts.map((p) => {
-              const pub = p.status === "published";
+            listEl.innerHTML = posts.map((p3) => {
+              const pub = p3.status === "published";
               return `<div style="display:flex;align-items:center;gap:6px;padding:5px 0;border-bottom:1px solid var(--border)">
-            <span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escapeHtml(p.title)}</span>
+            <span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escapeHtml(p3.title)}</span>
             <span style="font-size:9px;font-weight:600;padding:1px 6px;border-radius:3px;background:${pub ? "#22c55e22;color:#22c55e" : "var(--muted)22;color:var(--muted)"}">${pub ? "published" : "draft"}</span>
-            <button class="secondary blog-edit" data-id="${escapeHtml(p.id)}" style="font-size:9px;padding:2px 7px">Edit</button>
-            <button class="secondary blog-toggle" data-id="${escapeHtml(p.id)}" data-pub="${pub ? "1" : "0"}" style="font-size:9px;padding:2px 7px">${pub ? "Unpublish" : "Publish"}</button>
-            <button class="secondary blog-del" data-id="${escapeHtml(p.id)}" style="font-size:9px;padding:2px 7px">\u{1F5D1}</button>
+            <button class="secondary blog-edit" data-id="${escapeHtml(p3.id)}" style="font-size:9px;padding:2px 7px">Edit</button>
+            <button class="secondary blog-toggle" data-id="${escapeHtml(p3.id)}" data-pub="${pub ? "1" : "0"}" style="font-size:9px;padding:2px 7px">${pub ? "Unpublish" : "Publish"}</button>
+            <button class="secondary blog-del" data-id="${escapeHtml(p3.id)}" style="font-size:9px;padding:2px 7px">\u{1F5D1}</button>
           </div>`;
             }).join("");
-            listEl.querySelectorAll(".blog-edit").forEach((b) => b.onclick = async () => {
+            listEl.querySelectorAll(".blog-edit").forEach((b2) => b2.onclick = async () => {
               try {
-                const p = await api(`/admin/blog/posts/${b.dataset.id}`);
-                if (idIn) idIn.value = p.id;
-                if (titleIn) titleIn.value = p.title;
-                if (bodyIn) bodyIn.value = p.body_md || "";
+                const p3 = await api(`/admin/blog/posts/${b2.dataset.id}`);
+                if (idIn) idIn.value = p3.id;
+                if (titleIn) titleIn.value = p3.title;
+                if (bodyIn) bodyIn.value = p3.body_md || "";
                 setStatus("Loaded for editing.");
-              } catch (e) {
-                toast("load failed: " + e.message, true);
+              } catch (e3) {
+                toast("load failed: " + e3.message, true);
               }
             });
-            listEl.querySelectorAll(".blog-toggle").forEach((b) => b.onclick = async () => {
-              const action = b.dataset.pub === "1" ? "unpublish" : "publish";
+            listEl.querySelectorAll(".blog-toggle").forEach((b2) => b2.onclick = async () => {
+              const action = b2.dataset.pub === "1" ? "unpublish" : "publish";
               try {
-                await api(`/admin/blog/posts/${b.dataset.id}/${action}`, { method: "POST" });
+                await api(`/admin/blog/posts/${b2.dataset.id}/${action}`, { method: "POST" });
                 toast(action + "ed \u2713");
                 loadList();
-              } catch (e) {
-                toast("failed: " + e.message, true);
+              } catch (e3) {
+                toast("failed: " + e3.message, true);
               }
             });
-            listEl.querySelectorAll(".blog-del").forEach((b) => b.onclick = async () => {
+            listEl.querySelectorAll(".blog-del").forEach((b2) => b2.onclick = async () => {
               if (!confirm("Delete this post?")) return;
               try {
-                await api(`/admin/blog/posts/${b.dataset.id}`, { method: "DELETE" });
+                await api(`/admin/blog/posts/${b2.dataset.id}`, { method: "DELETE" });
                 toast("deleted");
-                if (idIn && idIn.value === b.dataset.id) clearEditor();
+                if (idIn && idIn.value === b2.dataset.id) clearEditor();
                 loadList();
-              } catch (e) {
-                toast("failed: " + e.message, true);
+              } catch (e3) {
+                toast("failed: " + e3.message, true);
               }
             });
-          } catch (e) {
-            listEl.innerHTML = `<div style="color:var(--muted)">Could not load posts: ${escapeHtml(e.message)}</div>`;
+          } catch (e3) {
+            listEl.innerHTML = `<div style="color:#f87171">Failed to load posts: ${escapeHtml(e3.message || String(e3))}</div>`;
           }
         }
         saveBtn.onclick = async () => {
@@ -4313,21 +4379,21 @@ project_id = "${displayPid}"`;
             setStatus("Saved draft.");
             toast("saved \u2713");
             loadList();
-          } catch (e) {
-            toast("save failed: " + e.message, true);
+          } catch (e3) {
+            toast("save failed: " + e3.message, true);
           } finally {
             saveBtn.disabled = false;
           }
         };
         if (genBtn) genBtn.onclick = async () => {
           try {
-            const d = await api("/admin/blog/generate-draft", { method: "POST" });
+            const d3 = await api("/admin/blog/generate-draft", { method: "POST" });
             if (idIn) idIn.value = "";
-            if (titleIn) titleIn.value = d.title || "";
-            if (bodyIn) bodyIn.value = d.body_md || "";
+            if (titleIn) titleIn.value = d3.title || "";
+            if (bodyIn) bodyIn.value = d3.body_md || "";
             setStatus("Draft generated \u2014 review and save.");
-          } catch (e) {
-            toast("failed: " + e.message, true);
+          } catch (e3) {
+            toast("failed: " + e3.message, true);
           }
         };
         if (newBtn) newBtn.onclick = () => {
@@ -4337,15 +4403,15 @@ project_id = "${displayPid}"`;
         loadList();
       }, 0);
       setTimeout(() => {
-        ["connect", "executor", "config", "account"].forEach(function(k) {
-          const det = document.getElementById("settings-sec-" + k + "-" + projectId);
+        ["connect", "executor", "config", "account"].forEach(function(k3) {
+          const det = document.getElementById("settings-sec-" + k3 + "-" + projectId);
           if (!det) return;
           det.addEventListener("toggle", function() {
             try {
               const ss = JSON.parse(localStorage.getItem("meridian.settings.sections." + projectId) || "{}");
-              ss[k] = det.open;
+              ss[k3] = det.open;
               localStorage.setItem("meridian.settings.sections." + projectId, JSON.stringify(ss));
-            } catch (e) {
+            } catch (e3) {
             }
             const caret = det.querySelector(":scope > summary .meridian-caret");
             if (caret) caret.style.transform = det.open ? "rotate(90deg)" : "";
@@ -4356,10 +4422,10 @@ project_id = "${displayPid}"`;
           psGrp.addEventListener("toggle", function() {
             try {
               localStorage.setItem("meridian.settings.ps." + projectId, psGrp.open ? "1" : "0");
-            } catch (e) {
+            } catch (e3) {
             }
-            const c = psGrp.querySelector(":scope > summary .meridian-caret");
-            if (c) c.style.transform = psGrp.open ? "rotate(90deg)" : "";
+            const c3 = psGrp.querySelector(":scope > summary .meridian-caret");
+            if (c3) c3.style.transform = psGrp.open ? "rotate(90deg)" : "";
           });
         }
         const awGrp = document.getElementById("settings-grp-aw-" + projectId);
@@ -4367,10 +4433,10 @@ project_id = "${displayPid}"`;
           awGrp.addEventListener("toggle", function() {
             try {
               localStorage.setItem("meridian.settings.aw." + projectId, awGrp.open ? "1" : "0");
-            } catch (e) {
+            } catch (e3) {
             }
-            const c = awGrp.querySelector(":scope > summary .meridian-caret");
-            if (c) c.style.transform = awGrp.open ? "rotate(90deg)" : "";
+            const c3 = awGrp.querySelector(":scope > summary .meridian-caret");
+            if (c3) c3.style.transform = awGrp.open ? "rotate(90deg)" : "";
           });
         }
       }, 0);
@@ -4385,10 +4451,10 @@ project_id = "${displayPid}"`;
         const _rerenderHostsTbl = () => {
           const tbl = document.getElementById(`exec-ez-hosts-tbl-${projectId}`);
           if (!tbl) return;
-          tbl.innerHTML = _ezHosts.length ? '<table style="width:100%;border-collapse:collapse">' + _ezHosts.map((h, i) => `<tr>
-            <td style="padding:2px 6px 2px 0;color:var(--text);font-size:10px;font-family:var(--font-mono)">${escapeHtml(h.hostname || "")}</td>
-            <td style="padding:2px 6px 2px 0;color:var(--muted)"><label style="display:flex;align-items:center;gap:4px;cursor:pointer;font-size:9px"><input type="checkbox" class="exec-ez-host-autocwd" data-pid="${escapeHtml(projectId)}" data-idx="${i}" ${h.auto_add_cwds ? "checked" : ""} style="cursor:pointer"> Auto-add new cwds</label></td>
-            <td style="padding:2px 0;text-align:right"><button class="exec-ez-del-host" data-pid="${escapeHtml(projectId)}" data-idx="${i}" style="font-size:9px;padding:1px 6px;background:transparent;border:1px solid var(--border);border-radius:3px;color:var(--muted);cursor:pointer">\u2715</button></td>
+          tbl.innerHTML = _ezHosts.length ? '<table style="width:100%;border-collapse:collapse">' + _ezHosts.map((h2, i3) => `<tr>
+            <td style="padding:2px 6px 2px 0;color:var(--text);font-size:10px;font-family:var(--font-mono)">${escapeHtml(h2.hostname || "")}</td>
+            <td style="padding:2px 6px 2px 0;color:var(--muted)"><label style="display:flex;align-items:center;gap:4px;cursor:pointer;font-size:9px"><input type="checkbox" class="exec-ez-host-autocwd" data-pid="${escapeHtml(projectId)}" data-idx="${i3}" ${h2.auto_add_cwds ? "checked" : ""} style="cursor:pointer"> Auto-add new cwds</label></td>
+            <td style="padding:2px 0;text-align:right"><button class="exec-ez-del-host" data-pid="${escapeHtml(projectId)}" data-idx="${i3}" style="font-size:9px;padding:1px 6px;background:transparent;border:1px solid var(--border);border-radius:3px;color:var(--muted);cursor:pointer">\u2715</button></td>
           </tr>`).join("") + "</table>" : '<div style="color:var(--muted);font-style:italic;font-size:10px">No machines registered yet \u2014 first hook auto-registers.</div>';
           _wireHostBtns();
         };
@@ -4410,10 +4476,10 @@ project_id = "${displayPid}"`;
         const _rerenderPathsTbl = () => {
           const tbl = document.getElementById(`exec-ez-paths-tbl-${projectId}`);
           if (!tbl) return;
-          tbl.innerHTML = _ezPaths.length ? '<table style="width:100%;border-collapse:collapse">' + _ezPaths.map((p, i) => `<tr>
-            <td style="padding:2px 6px 2px 0;color:var(--text);font-size:10px;font-family:var(--font-mono)">${escapeHtml(p.hostname || "")}</td>
-            <td style="padding:2px 6px 2px 0;color:var(--muted);font-size:10px;font-family:var(--font-mono)">${escapeHtml(p.cwd || "")}</td>
-            <td style="padding:2px 0;text-align:right"><button class="exec-ez-del-row" data-pid="${escapeHtml(projectId)}" data-idx="${i}" style="font-size:9px;padding:1px 6px;background:transparent;border:1px solid var(--border);border-radius:3px;color:var(--muted);cursor:pointer">\u2715</button></td>
+          tbl.innerHTML = _ezPaths.length ? '<table style="width:100%;border-collapse:collapse">' + _ezPaths.map((p3, i3) => `<tr>
+            <td style="padding:2px 6px 2px 0;color:var(--text);font-size:10px;font-family:var(--font-mono)">${escapeHtml(p3.hostname || "")}</td>
+            <td style="padding:2px 6px 2px 0;color:var(--muted);font-size:10px;font-family:var(--font-mono)">${escapeHtml(p3.cwd || "")}</td>
+            <td style="padding:2px 0;text-align:right"><button class="exec-ez-del-row" data-pid="${escapeHtml(projectId)}" data-idx="${i3}" style="font-size:9px;padding:1px 6px;background:transparent;border:1px solid var(--border);border-radius:3px;color:var(--muted);cursor:pointer">\u2715</button></td>
           </tr>`).join("") + "</table>" : '<div style="color:var(--muted);font-style:italic;font-size:10px">No path overrides \u2014 machine-level routing handles most cases.</div>';
           _wirePathBtns();
         };
@@ -4441,7 +4507,7 @@ project_id = "${displayPid}"`;
             const settings = await api(`/projects/${projectId}/settings`);
             const cfg = settings && settings.executor_config || {};
             const paths = Array.isArray(cfg.repo_paths) ? cfg.repo_paths.slice() : [];
-            const dup = paths.some((p) => (p.cwd || "").trim() === cwd && (p.hostname || "").trim() === hostname);
+            const dup = paths.some((p3) => (p3.cwd || "").trim() === cwd && (p3.hostname || "").trim() === hostname);
             if (!dup) paths.push({ cwd, hostname });
             cfg.repo_paths = paths;
             delete cfg.repo_path;
@@ -4455,16 +4521,16 @@ project_id = "${displayPid}"`;
                 if (ezStatus) ezStatus.textContent = "";
               }, 2e3);
             }
-          } catch (e) {
-            if (ezStatus) ezStatus.textContent = `Add failed: ${String(e)}`;
+          } catch (e3) {
+            if (ezStatus) ezStatus.textContent = `Add failed: ${String(e3)}`;
           } finally {
             if (_ezAddBtn) _ezAddBtn.disabled = false;
           }
         };
         if (_ezAddBtn) _ezAddBtn.onclick = _doAddPath;
-        if (_ezAddCwd) _ezAddCwd.addEventListener("keydown", (e) => {
-          if (e.key === "Enter") {
-            e.preventDefault();
+        if (_ezAddCwd) _ezAddCwd.addEventListener("keydown", (e3) => {
+          if (e3.key === "Enter") {
+            e3.preventDefault();
             _doAddPath();
           }
         });
@@ -4489,8 +4555,8 @@ project_id = "${displayPid}"`;
                 if (ezStatus) ezStatus.textContent = "";
               }, 2e3);
             }
-          } catch (e) {
-            if (ezStatus) ezStatus.textContent = `Save failed: ${String(e)}`;
+          } catch (e3) {
+            if (ezStatus) ezStatus.textContent = `Save failed: ${String(e3)}`;
           } finally {
             ezSaveBtn.disabled = false;
           }
@@ -4516,8 +4582,8 @@ project_id = "${displayPid}"`;
             setTimeout(() => {
               window.location.href = "/";
             }, 1200);
-          } catch (e) {
-            toast("Delete failed: " + e.message, true);
+          } catch (e3) {
+            toast("Delete failed: " + e3.message, true);
             deleteBtn.disabled = false;
           }
         };
@@ -4530,8 +4596,8 @@ project_id = "${displayPid}"`;
           try {
             const data = await api("/billing/portal", { method: "POST" });
             window.location.href = data.url;
-          } catch (e) {
-            toast("Could not open billing portal: " + e.message, true);
+          } catch (e3) {
+            toast("Could not open billing portal: " + e3.message, true);
             billingPortalBtn.disabled = false;
             billingPortalBtn.textContent = "Manage billing \u2192";
           }
@@ -4548,10 +4614,10 @@ project_id = "${displayPid}"`;
           const snippets = {
             [`hooks-install-unix-${projectId}`]: installUnix,
             [`hooks-install-windows-${projectId}`]: installWindows,
-            [`hooks-win-claude-${projectId}`]: buildClaudeHookSnippet("windows", activeToken),
-            [`hooks-win-codex-${projectId}`]: buildCodexHookSnippet("windows", activeToken),
-            [`hooks-unix-claude-${projectId}`]: buildClaudeHookSnippet("unix", activeToken),
-            [`hooks-unix-codex-${projectId}`]: buildCodexHookSnippet("unix", activeToken)
+            [`hooks-win-claude-${projectId}`]: buildClaudeHookSnippet2("windows", activeToken),
+            [`hooks-win-codex-${projectId}`]: buildCodexHookSnippet2("windows", activeToken),
+            [`hooks-unix-claude-${projectId}`]: buildClaudeHookSnippet2("unix", activeToken),
+            [`hooks-unix-codex-${projectId}`]: buildCodexHookSnippet2("unix", activeToken)
           };
           Object.entries(snippets).forEach(([id, text]) => {
             const el = document.getElementById(id);
@@ -4600,10 +4666,10 @@ project_id = "${displayPid}"`;
                 const statusEl = document.getElementById(`hooks-token-status-${projectId}`);
                 if (statusEl) statusEl.textContent = "API key revoked.";
                 await loadHooksTokens();
-              } catch (e) {
+              } catch (e3) {
                 btn.disabled = false;
                 const statusEl = document.getElementById(`hooks-token-status-${projectId}`);
-                if (statusEl) statusEl.textContent = `error: ${escapeHtml(String(e))}`;
+                if (statusEl) statusEl.textContent = `error: ${escapeHtml(String(e3))}`;
               }
             };
           });
@@ -4614,10 +4680,10 @@ project_id = "${displayPid}"`;
           try {
             const tokens = await api("/auth/tokens");
             renderHooksTokenList(tokens);
-          } catch (e) {
+          } catch (e3) {
             tokenListEl.innerHTML = `<div style="font-size:10px;color:var(--danger,#ef4444)">Could not load API keys.</div>`;
             const statusEl = document.getElementById(`hooks-token-status-${projectId}`);
-            if (statusEl) statusEl.textContent = `error: ${escapeHtml(String(e))}`;
+            if (statusEl) statusEl.textContent = `error: ${escapeHtml(String(e3))}`;
           }
         }
         const wireCopy = (buttonId, targetId) => {
@@ -4631,7 +4697,7 @@ project_id = "${displayPid}"`;
               setTimeout(() => {
                 btn.textContent = "Copy";
               }, 1800);
-            } catch (e) {
+            } catch (e3) {
               btn.textContent = "Select and copy manually";
             }
           };
@@ -4666,7 +4732,7 @@ project_id = "${displayPid}"`;
                 setTimeout(() => {
                   revealCopyBtn.textContent = "Copy key";
                 }, 1800);
-              } catch (e) {
+              } catch (e3) {
               }
             };
           }
@@ -4686,13 +4752,13 @@ project_id = "${displayPid}"`;
               await loadHooksTokens();
               const hostedMcpEl2 = document.getElementById(`hosted-mcp-json-${projectId}`);
               if (hostedMcpEl2) {
-                const j = JSON.stringify({ mcpServers: { meridian: { command: "npx", args: ["-y", "mcp-remote", "https://usemeridian.us/mcp"], env: { BEARER_TOKEN: tok.token } } } }, null, 2);
-                hostedMcpEl2.textContent = j;
+                const j3 = JSON.stringify({ mcpServers: { meridian: { command: "npx", args: ["-y", "mcp-remote", "https://usemeridian.us/mcp"], env: { BEARER_TOKEN: tok.token } } } }, null, 2);
+                hostedMcpEl2.textContent = j3;
               }
               _showKeyReveal(tok.token, "API key");
-            } catch (e) {
+            } catch (e3) {
               const statusEl = document.getElementById(`hooks-token-status-${projectId}`);
-              if (statusEl) statusEl.textContent = `error: ${escapeHtml(String(e))}`;
+              if (statusEl) statusEl.textContent = `error: ${escapeHtml(String(e3))}`;
             } finally {
               genBtn.disabled = false;
               genBtn.textContent = hooksToken ? "Generate new key" : "Generate API key";
@@ -4708,9 +4774,9 @@ project_id = "${displayPid}"`;
               const tok = await api("/auth/tokens", { method: "POST", body: JSON.stringify({ label: "readonly", token_type: "readonly" }) });
               _showKeyReveal(tok.token, "Read-only key");
               await loadHooksTokens();
-            } catch (e) {
+            } catch (e3) {
               const statusEl = document.getElementById(`hooks-token-status-${projectId}`);
-              if (statusEl) statusEl.textContent = `error: ${escapeHtml(String(e))}`;
+              if (statusEl) statusEl.textContent = `error: ${escapeHtml(String(e3))}`;
             } finally {
               genReadonlyBtn.disabled = false;
               genReadonlyBtn.textContent = "Generate read-only key";
@@ -4751,7 +4817,7 @@ project_id = "${displayPid}"`;
                 statusEl.textContent = "";
               }, 2400);
             }
-          } catch (e) {
+          } catch (e3) {
             if (statusEl) statusEl.textContent = "error";
           }
         };
@@ -4773,7 +4839,7 @@ project_id = "${displayPid}"`;
                 statusEl.textContent = "";
               }, 2400);
             }
-          } catch (e) {
+          } catch (e3) {
             if (statusEl) statusEl.textContent = "error";
           }
         };
@@ -4791,9 +4857,9 @@ project_id = "${displayPid}"`;
                 statusEl.textContent = "";
               }, 3e3);
             }
-          } catch (e) {
+          } catch (e3) {
             if (statusEl) {
-              const raw = String(e?.message || e || "");
+              const raw = String(e3?.message || e3 || "");
               let msg = raw.replace(/^\d+:\s*/, "");
               try {
                 const parsed = JSON.parse(msg);
@@ -4813,7 +4879,7 @@ project_id = "${displayPid}"`;
           if (!ntfyWarnAckCb.checked) return;
           try {
             localStorage.setItem(STORAGE_KEY("ntfy.warn.dismissed"), "1");
-          } catch (e) {
+          } catch (e3) {
           }
           const warnEl = document.getElementById(`ntfy-warn-${projectId}`);
           if (warnEl) warnEl.style.display = "none";
@@ -4832,8 +4898,8 @@ project_id = "${displayPid}"`;
         cb.onchange = async () => {
           const statusEl = document.getElementById(`settings-save-status-${projectId}`);
           const payload = {};
-          body.querySelectorAll("input[data-pref]").forEach((c) => {
-            payload[c.dataset.pref] = c.checked;
+          body.querySelectorAll("input[data-pref]").forEach((c3) => {
+            payload[c3.dataset.pref] = c3.checked;
           });
           try {
             await api("/settings/notifications", { method: "PATCH", body: JSON.stringify(payload) });
@@ -4843,8 +4909,8 @@ project_id = "${displayPid}"`;
                 statusEl.textContent = "";
               }, 1800);
             }
-          } catch (e) {
-            if (statusEl) statusEl.textContent = `error: ${escapeHtml(String(e))}`;
+          } catch (e3) {
+            if (statusEl) statusEl.textContent = `error: ${escapeHtml(String(e3))}`;
           }
         };
       });
@@ -4854,6 +4920,44 @@ project_id = "${displayPid}"`;
           window.location.href = `/auth/github/repo-connect?project_id=${encodeURIComponent(projectId)}`;
         };
       }
+      const ghAddAccountBtn = document.getElementById(`github-add-account-${projectId}`);
+      if (ghAddAccountBtn) {
+        ghAddAccountBtn.onclick = () => {
+          window.location.href = `/auth/github/repo-connect?project_id=${encodeURIComponent(projectId)}&select_account=1`;
+        };
+      }
+      document.querySelectorAll(`#github-card-${projectId} .gh-acct-use`).forEach((btn) => {
+        btn.onclick = async () => {
+          const login = btn.dataset.login || "";
+          if (!login) return;
+          btn.disabled = true;
+          try {
+            await api(`/projects/${projectId}/github/account`, {
+              method: "PATCH",
+              body: JSON.stringify({ account_login: login })
+            });
+            loadSettingsTab2(projectId, { force: true });
+          } catch (e3) {
+            btn.disabled = false;
+            toast("Could not switch account: " + (e3.message || e3), true);
+          }
+        };
+      });
+      document.querySelectorAll(`#github-card-${projectId} .gh-acct-remove`).forEach((btn) => {
+        btn.onclick = async () => {
+          const login = btn.dataset.login || "";
+          if (!login) return;
+          if (!confirm(`Disconnect GitHub account @${login}? Projects using it fall back to another connected account.`)) return;
+          btn.disabled = true;
+          try {
+            await api(`/github/connections/${encodeURIComponent(login)}`, { method: "DELETE" });
+            loadSettingsTab2(projectId, { force: true });
+          } catch (e3) {
+            btn.disabled = false;
+            toast("Could not disconnect: " + (e3.message || e3), true);
+          }
+        };
+      });
       const ghSaveBtn = document.getElementById(`github-save-btn-${projectId}`);
       if (ghSaveBtn) {
         ghSaveBtn.onclick = async () => {
@@ -4872,9 +4976,9 @@ project_id = "${displayPid}"`;
               method: "POST",
               body: JSON.stringify({ repo, branch })
             });
-            loadSettingsTab2(projectId);
-          } catch (e) {
-            if (statusEl) statusEl.textContent = e.message || "Save failed";
+            loadSettingsTab2(projectId, { force: true });
+          } catch (e3) {
+            if (statusEl) statusEl.textContent = e3.message || "Save failed";
           } finally {
             ghSaveBtn.disabled = false;
             ghSaveBtn.textContent = "Save repo";
@@ -4888,8 +4992,8 @@ project_id = "${displayPid}"`;
           ghDisconnectBtn.disabled = true;
           try {
             await api(`/projects/${projectId}/github/disconnect`, { method: "DELETE" });
-            loadSettingsTab2(projectId);
-          } catch (e) {
+            loadSettingsTab2(projectId, { force: true });
+          } catch (e3) {
             if (statusEl) statusEl.textContent = "error disconnecting";
             ghDisconnectBtn.disabled = false;
           }
@@ -4907,9 +5011,9 @@ project_id = "${displayPid}"`;
             if (want && !branches.includes(want)) branches.unshift(want);
             if (!branches.length) branches = [fallback];
             ghBranchSelect.innerHTML = branches.map(
-              (b) => `<option value="${escapeHtml(b)}" ${b === want ? "selected" : ""}>${escapeHtml(b)}</option>`
+              (b2) => `<option value="${escapeHtml(b2)}" ${b2 === want ? "selected" : ""}>${escapeHtml(b2)}</option>`
             ).join("");
-          } catch (e) {
+          } catch (e3) {
           }
         };
         fillBranches(ghSelectedRepo, ghSelectedBranch);
@@ -4934,23 +5038,23 @@ project_id = "${displayPid}"`;
                 statusEl.textContent = "";
               }, 3e3);
             }
-          } catch (e) {
+          } catch (e3) {
             if (statusEl) statusEl.textContent = "error";
           } finally {
             ghTestBtn.disabled = false;
           }
         };
       }
-    } catch (e) {
-      body.innerHTML = `<div style="color:var(--error);font-size:11px">Failed to load settings: ${escapeHtml(String(e))}</div>`;
+    } catch (e3) {
+      body.innerHTML = `<div style="color:var(--error);font-size:11px">Failed to load settings: ${escapeHtml(String(e3))}</div>`;
     }
   }
   try {
     Object.assign(window, { suggestNtfyTopic: suggestNtfyTopic2, loadSettingsTab: loadSettingsTab2 });
-  } catch (e) {
+  } catch (e3) {
   }
 
-  // meridian/static/dashboard-plugins.js
+  // meridian/static/dashboard-plugins.ts
   var _TUNNEL_DEFAULT_PORTS = { fs: 8808, code: 8809, extract: 8810, ppt: 8811, word: 8812, dc: 8813 };
   var _OPTIN_SLOT_HINTS = {
     word: { pkg: "uvx word-mcp-live", note: "Live Word editing with tracked changes \u2014 needs uv (uvx)." },
@@ -4997,7 +5101,7 @@ project_id = "${displayPid}"`;
         await navigator.clipboard.writeText(text);
         return true;
       }
-    } catch (_) {
+    } catch (_2) {
     }
     try {
       const ta = document.createElement("textarea");
@@ -5009,7 +5113,7 @@ project_id = "${displayPid}"`;
       const ok = document.execCommand("copy");
       document.body.removeChild(ta);
       return ok;
-    } catch (_) {
+    } catch (_2) {
       return false;
     }
   }
@@ -5025,7 +5129,19 @@ project_id = "${displayPid}"`;
         </div>`;
   }
   window._renderSlotHealthWarning = _renderSlotHealthWarning;
-  async function loadTunnelPluginsSection2(projectId) {
+  function _renderStaleOverrideWarning(p3) {
+    if (!p3 || !p3.stale_override) return "";
+    const newer = Array.isArray(p3.newer_default_command) ? p3.newer_default_command.join(" ") : "";
+    const label = p3.newer_default_label ? escapeHtml(p3.newer_default_label) : "a newer built-in default";
+    return `
+        <div data-slot-stale="${escapeHtml(p3.slot)}" style="margin-top:6px;padding:6px 8px;border:1px solid #3b82f6;border-radius:4px;background:rgba(59,130,246,0.10);font-size:9px;line-height:1.6;color:#7dd3fc">
+          <span style="font-weight:700">&#9888; newer default available</span> \u2014 your saved command is an old built-in default. Current default: <b>${label}</b>${newer ? ` (<code style="font-family:var(--font-mono)">${escapeHtml(newer)}</code>)` : ""}.
+          <button type="button" class="tp-reset-default" style="margin-left:6px;background:none;border:1px solid #3b82f6;border-radius:3px;color:#7dd3fc;font-size:8px;padding:1px 6px;cursor:pointer"
+            onclick="var r=this.closest('[data-lifecycle]'); if(r){var c=r.querySelector('.tp-command'); if(c){c.value=''; c.dispatchEvent(new Event('input',{bubbles:true}));}}">Use new default</button>
+        </div>`;
+  }
+  window._renderStaleOverrideWarning = _renderStaleOverrideWarning;
+  async function loadTunnelPluginsSection2(projectId, hostname) {
     const host = document.getElementById(`settings-body-${projectId}`);
     if (!host) return;
     const existing = document.getElementById(`tunnel-plugins-section-${projectId}`);
@@ -5034,8 +5150,10 @@ project_id = "${displayPid}"`;
     section.id = `tunnel-plugins-section-${projectId}`;
     section.style.cssText = "margin-top:18px;padding-top:14px;border-top:1px solid var(--border)";
     host.appendChild(section);
+    const _selHost = (hostname || "").trim();
+    const _hq = _selHost ? "?hostname=" + encodeURIComponent(_selHost) : "";
     try {
-      const data = await api("/tunnel/plugins");
+      const data = await api("/tunnel/plugins" + _hq);
       const plan = data && data.plan || "free";
       if (!(plan === "pro" || plan === "admin" || data && data.is_admin)) {
         section.remove();
@@ -5043,55 +5161,56 @@ project_id = "${displayPid}"`;
       }
       const plugins = data && data.plugins || [];
       const active = data && data.active || {};
-      const customPlugins = (data && data.custom || []).map((c) => ({
-        name: String(c.name || ""),
-        command: Array.isArray(c.command) ? c.command.join(" ") : String(c.command || ""),
-        port: c.port,
-        enabled: c.enabled !== false
+      const customPlugins = (data && data.custom || []).map((c3) => ({
+        name: String(c3.name || ""),
+        command: Array.isArray(c3.command) ? c3.command.join(" ") : String(c3.command || ""),
+        port: c3.port,
+        enabled: c3.enabled !== false
       }));
       const slotStatus = data && data.slot_status || {};
-      const renderRow = (p) => {
-        const cmd = Array.isArray(p.command) ? p.command.join(" ") : "";
-        const lifecycleState = _pluginLifecycleState(p, active);
-        const hint = _OPTIN_SLOT_HINTS[p.slot];
+      const renderRow = (p3) => {
+        const cmd = Array.isArray(p3.command) ? p3.command.join(" ") : "";
+        const lifecycleState = _pluginLifecycleState(p3, active);
+        const hint = _OPTIN_SLOT_HINTS[p3.slot];
         const installCmd = hint ? hint.pkg : cmd || "";
-        const lifecycleBadge = _renderLifecycleBadge(p, lifecycleState, installCmd);
+        const lifecycleBadge = _renderLifecycleBadge(p3, lifecycleState, installCmd);
         const hintHtml = hint && lifecycleState === "not_installed" ? `
           <div style="margin-top:6px;font-size:9px;color:var(--muted);line-height:1.6">
             Enable the toggle, then restart <code style="font-family:var(--font-mono)">meridian --tunnel</code> to launch
             <code style="font-family:var(--font-mono)">${escapeHtml(hint.pkg)}</code>.<br>${escapeHtml(hint.note)}
           </div>` : "";
-        const warnHtml = _renderSlotHealthWarning(p.slot, slotStatus);
-        const toggle = p.core ? `<span title="core tool \u2014 always on" style="font-size:8px;font-weight:700;letter-spacing:.3px;color:var(--muted);border:1px solid var(--border);border-radius:3px;padding:1px 5px;text-transform:uppercase">core</span>` : `<input type="checkbox" class="tp-enabled" data-name="${escapeHtml(p.name)}" ${p.enabled ? "checked" : ""}
+        const warnHtml = _renderSlotHealthWarning(p3.slot, slotStatus);
+        const toggle = p3.core ? `<span title="core tool \u2014 always on" style="font-size:8px;font-weight:700;letter-spacing:.3px;color:var(--muted);border:1px solid var(--border);border-radius:3px;padding:1px 5px;text-transform:uppercase">core</span>` : `<input type="checkbox" class="tp-enabled" data-name="${escapeHtml(p3.name)}" ${p3.enabled ? "checked" : ""}
                 style="width:14px;height:14px;accent-color:var(--accent);cursor:pointer">`;
         return `
         <div style="border:1px solid var(--border);border-radius:4px;padding:8px;margin-bottom:8px" data-lifecycle="${lifecycleState}">
           <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px">
-            <label style="display:flex;align-items:center;gap:8px;cursor:${p.core ? "default" : "pointer"};font-size:11px;color:var(--text);font-weight:600">
+            <label style="display:flex;align-items:center;gap:8px;cursor:${p3.core ? "default" : "pointer"};font-size:11px;color:var(--text);font-weight:600">
               ${toggle}
-              ${escapeHtml(p.name)}
-              <span style="font-size:9px;color:var(--muted);font-weight:400">/${escapeHtml(p.slot)}</span>
+              ${escapeHtml(p3.name)}
+              <span style="font-size:9px;color:var(--muted);font-weight:400">/${escapeHtml(p3.slot)}</span>
             </label>
             ${lifecycleBadge}
           </div>
           <div style="display:flex;gap:8px;align-items:center">
-            <input type="text" class="tp-command" data-name="${escapeHtml(p.name)}" value="${escapeHtml(cmd)}"
-              placeholder="default (${escapeHtml(p.description || "built-in command")})"
+            <input type="text" class="tp-command" data-name="${escapeHtml(p3.name)}" value="${escapeHtml(cmd)}"
+              placeholder="default (${escapeHtml(p3.description || "built-in command")})"
               style="flex:1;box-sizing:border-box;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:5px 7px;outline:none">
-            <input type="number" class="tp-port" data-name="${escapeHtml(p.name)}" data-slot="${escapeHtml(p.slot)}" value="${p.port}"
+            <input type="number" class="tp-port" data-name="${escapeHtml(p3.name)}" data-slot="${escapeHtml(p3.slot)}" value="${p3.port}"
               title="local proxy port"
               style="width:74px;box-sizing:border-box;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:5px 7px;outline:none">
           </div>
           ${warnHtml}
+          ${_renderStaleOverrideWarning(p3)}
           ${hintHtml}
-          <details class="tp-tools" data-slot="${escapeHtml(p.slot)}" data-loaded="0" style="margin-top:6px">
+          <details class="tp-tools" data-slot="${escapeHtml(p3.slot)}" data-loaded="0" style="margin-top:6px">
             <summary style="cursor:pointer;list-style:none;font-size:10px;color:var(--accent);user-select:none">&#9656; tools</summary>
             <div class="tp-tools-body" style="margin-top:5px;font-size:10px;color:var(--muted);font-family:var(--font-mono)">&hellip;</div>
           </details>
         </div>`;
       };
-      const coreRows = plugins.filter((p) => p.core).map(renderRow).join("");
-      const pluginRows = plugins.filter((p) => !p.core).map(renderRow).join("");
+      const coreRows = plugins.filter((p3) => p3.core).map(renderRow).join("");
+      const pluginRows = plugins.filter((p3) => !p3.core).map(renderRow).join("");
       const _sectionLabel = (text, note) => `<div style="font-size:9px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;margin:2px 0 6px">${text} <span style="font-weight:400;text-transform:none">${note}</span></div>`;
       const rows = `
       ${coreRows ? _sectionLabel("Core Tools", "\u2014 always on") + coreRows : ""}
@@ -5110,7 +5229,7 @@ project_id = "${displayPid}"`;
             </div>
           </div>`).join("")}
       </div>`;
-      const otherOsCards = Object.keys(_TUNNEL_INSTALL_CMDS).filter((k) => k !== detectedOs).map((k) => installCard(_TUNNEL_INSTALL_CMDS[k].label, _TUNNEL_INSTALL_CMDS[k], false)).join("");
+      const otherOsCards = Object.keys(_TUNNEL_INSTALL_CMDS).filter((k3) => k3 !== detectedOs).map((k3) => installCard(_TUNNEL_INSTALL_CMDS[k3].label, _TUNNEL_INSTALL_CMDS[k3], false)).join("");
       const installSection = `
       <details style="margin-top:8px;border:1px solid var(--border);border-radius:4px;background:var(--surface-2);padding:0">
         <summary style="cursor:pointer;list-style:none;padding:6px 8px;font-size:10px;font-weight:600;color:var(--accent)">&#9656; Install dependencies</summary>
@@ -5133,14 +5252,14 @@ project_id = "${displayPid}"`;
           listEl.innerHTML = '<div style="color:var(--muted);font-size:10px">No custom plugins yet.</div>';
           return;
         }
-        listEl.innerHTML = customPlugins.map((c, i) => `
+        listEl.innerHTML = customPlugins.map((c3, i3) => `
         <div style="border:1px solid var(--border);border-radius:4px;padding:8px;margin-bottom:6px;display:flex;gap:8px;align-items:center">
           <div style="flex:1;min-width:0">
-            <div style="font-size:11px;color:var(--text);font-weight:600">${escapeHtml(c.name)}
-              <span style="font-size:9px;color:var(--muted);font-weight:400">:${escapeHtml(String(c.port))}</span></div>
-            <div style="font-size:10px;color:var(--muted);font-family:var(--font-mono);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escapeHtml(c.command)}</div>
+            <div style="font-size:11px;color:var(--text);font-weight:600">${escapeHtml(c3.name)}
+              <span style="font-size:9px;color:var(--muted);font-weight:400">:${escapeHtml(String(c3.port))}</span></div>
+            <div style="font-size:10px;color:var(--muted);font-family:var(--font-mono);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escapeHtml(c3.command)}</div>
           </div>
-          <button class="secondary tp-custom-remove" data-idx="${i}" style="padding:2px 8px;font-size:10px;flex-shrink:0">Remove</button>
+          <button class="secondary tp-custom-remove" data-idx="${i3}" style="padding:2px 8px;font-size:10px;flex-shrink:0">Remove</button>
         </div>`).join("");
         listEl.querySelectorAll(".tp-custom-remove").forEach((btn) => {
           btn.addEventListener("click", () => {
@@ -5173,6 +5292,17 @@ project_id = "${displayPid}"`;
           </div>
         </div>
       </details>`;
+      const _tpHosts = data && data.hosts || [];
+      const _tpConfigured = new Set(data && data.configured_hosts || []);
+      const _hostPicker = _tpHosts.length ? `
+      <div style="display:flex;align-items:center;gap:6px;margin-bottom:8px;flex-wrap:wrap">
+        <span style="font-size:10px;color:var(--muted)">Machine:</span>
+        <select id="tp-host-${projectId}" style="background:var(--surface-1);border:1px solid var(--border);border-radius:4px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:3px 6px;outline:none">
+          <option value="" ${!_selHost ? "selected" : ""}>Default (all machines)</option>
+          ${_tpHosts.map((h2) => `<option value="${escapeHtml(h2)}" ${h2 === _selHost ? "selected" : ""}>${escapeHtml(h2)}${_tpConfigured.has(h2) ? " \u25CF" : ""}</option>`).join("")}
+        </select>
+        <span style="font-size:9px;color:var(--muted)">${_selHost ? "editing " + escapeHtml(_selHost) : "default \u2014 applies to machines without their own config"}</span>
+      </div>` : "";
       section.innerHTML = `
       <details class="meridian-disclosure" open style="border:1px solid var(--border);border-radius:6px;background:var(--surface-2);padding:0">
       <summary style="cursor:pointer;list-style:none;padding:8px 10px;font-size:11px;font-weight:700;letter-spacing:.5px;color:var(--accent);text-transform:uppercase">Tunnel Plugins</summary>
@@ -5182,6 +5312,7 @@ project_id = "${displayPid}"`;
         blank for the built-in default, or set one to swap it (e.g. <code>code-intel</code> \u2192
         <code>codegraph</code>). Changes apply the next time the tunnel restarts.
       </div>
+      ${_hostPicker}
       ${rows || '<div style="color:var(--muted);font-size:10px">No plugins.</div>'}
       <div style="display:flex;justify-content:flex-end;gap:6px;margin-top:6px">
         <button class="secondary admin-only" id="tp-reset-${projectId}" style="padding:2px 10px;font-size:10px" title="Clear all overrides (back to built-in defaults)">Reset to defaults</button>
@@ -5194,14 +5325,16 @@ project_id = "${displayPid}"`;
       </div>
       </details>`;
       const statusEl = document.getElementById(`tp-status-${projectId}`);
-      const setStatus = (m) => {
+      const setStatus = (m3) => {
         if (statusEl) {
-          statusEl.textContent = m;
-          if (m) setTimeout(() => {
-            if (statusEl.textContent === m) statusEl.textContent = "";
+          statusEl.textContent = m3;
+          if (m3) setTimeout(() => {
+            if (statusEl.textContent === m3) statusEl.textContent = "";
           }, 2500);
         }
       };
+      const _hostSel = document.getElementById(`tp-host-${projectId}`);
+      if (_hostSel) _hostSel.onchange = () => loadTunnelPluginsSection2(projectId, _hostSel.value);
       const collectConfig = () => {
         const cfg = [];
         section.querySelectorAll(".tp-command").forEach((cmdEl) => {
@@ -5219,32 +5352,32 @@ project_id = "${displayPid}"`;
             cfg.push(entry);
           }
         });
-        customPlugins.forEach((c) => {
-          const name = (c.name || "").trim();
-          const command = (c.command || "").trim();
-          const port = parseInt(c.port, 10);
+        customPlugins.forEach((c3) => {
+          const name = (c3.name || "").trim();
+          const command = (c3.command || "").trim();
+          const port = parseInt(c3.port, 10);
           if (!name || !command || !Number.isInteger(port)) return;
-          cfg.push({ name, command, port, enabled: c.enabled !== false });
+          cfg.push({ name, command, port, enabled: c3.enabled !== false });
         });
         return cfg;
       };
       document.getElementById(`tp-save-${projectId}`).onclick = async () => {
         try {
-          await api("/tunnel/plugins", { method: "PUT", body: JSON.stringify({ config: collectConfig() }) });
-          toast("Tunnel plugins saved");
+          await api("/tunnel/plugins" + _hq, { method: "PUT", body: JSON.stringify({ config: collectConfig() }) });
+          toast(_selHost ? `Saved for ${_selHost}` : "Tunnel plugins saved");
           setStatus("Saved \u2014 restart the tunnel to apply.");
-        } catch (e) {
-          toast("Save failed: " + e.message, true);
+        } catch (e3) {
+          toast("Save failed: " + e3.message, true);
         }
       };
       document.getElementById(`tp-reset-${projectId}`).onclick = async () => {
         if (!confirm("Reset tunnel plugins?\n\nThis clears ALL command and port overrides for every slot and returns them to Meridian's built-in defaults. This cannot be undone.")) return;
         try {
-          await api("/tunnel/plugins", { method: "PUT", body: JSON.stringify({ config: [] }) });
+          await api("/tunnel/plugins" + _hq, { method: "PUT", body: JSON.stringify({ config: [] }) });
           toast("Reset to defaults");
-          loadTunnelPluginsSection2(projectId);
-        } catch (e) {
-          toast("Reset failed: " + e.message, true);
+          loadTunnelPluginsSection2(projectId, _selHost);
+        } catch (e3) {
+          toast("Reset failed: " + e3.message, true);
         }
       };
       renderCustomList();
@@ -5263,7 +5396,7 @@ project_id = "${displayPid}"`;
           toast("Pick a port in 1024\u201365535 and outside 8808\u20138813", true);
           return;
         }
-        if (customPlugins.some((c) => c.name === name)) {
+        if (customPlugins.some((c3) => c3.name === name)) {
           toast(`A custom plugin named "${name}" already exists`, true);
           return;
         }
@@ -5295,7 +5428,7 @@ project_id = "${displayPid}"`;
       let _tenantIdPromise = null;
       const _getTenantId = () => {
         if (!_tenantIdPromise) {
-          _tenantIdPromise = api("/me").then((m) => m && m.tenant_id || null).catch(() => null);
+          _tenantIdPromise = api("/me").then((m3) => m3 && m3.tenant_id || null).catch(() => null);
         }
         return _tenantIdPromise;
       };
@@ -5315,13 +5448,13 @@ project_id = "${displayPid}"`;
           try {
             const tenantId = await _getTenantId();
             if (!tenantId) throw new Error("no tenant");
-            const r = await fetch(`/${slot}/mcp/${tenantId}/mcp`, {
+            const r3 = await fetch(`/${slot}/mcp/${tenantId}/mcp`, {
               method: "POST",
               headers: { "Content-Type": "application/json", "Accept": "application/json, text/event-stream" },
               body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list", params: {} })
             });
-            if (!r.ok) throw new Error(`HTTP ${r.status}`);
-            const text = await r.text();
+            if (!r3.ok) throw new Error(`HTTP ${r3.status}`);
+            const text = await r3.text();
             let parsed = null;
             if (text.trim().startsWith("{")) {
               parsed = JSON.parse(text);
@@ -5330,7 +5463,7 @@ project_id = "${displayPid}"`;
                 if (line.startsWith("data:")) {
                   try {
                     parsed = JSON.parse(line.slice(5).trim());
-                  } catch (_) {
+                  } catch (_2) {
                   }
                 }
               }
@@ -5342,15 +5475,15 @@ project_id = "${displayPid}"`;
               bodyEl.innerHTML = '<span style="color:var(--muted)">no tools reported</span>';
               return;
             }
-            bodyEl.innerHTML = `<div style="color:var(--muted);margin-bottom:3px">${tools.length} tool${tools.length !== 1 ? "s" : ""}</div>` + tools.map((t) => `<div style="color:var(--text)">${escapeHtml(t && t.name || String(t))}</div>`).join("");
-          } catch (e) {
+            bodyEl.innerHTML = `<div style="color:var(--muted);margin-bottom:3px">${tools.length} tool${tools.length !== 1 ? "s" : ""}</div>` + tools.map((t3) => `<div style="color:var(--text)">${escapeHtml(t3 && t3.name || String(t3))}</div>`).join("");
+          } catch (e3) {
             bodyEl.innerHTML = `<span style="color:var(--muted)">not connected \u2014 start the tunnel</span>`;
             det.dataset.loaded = "0";
           }
         });
       });
-    } catch (e) {
-      section.innerHTML = `<div class="empty" style="color:var(--error)">Failed to load tunnel plugins: ${escapeHtml(e.message)}</div>`;
+    } catch (e3) {
+      section.innerHTML = `<div class="empty" style="color:var(--error)">Failed to load tunnel plugins: ${escapeHtml(e3.message)}</div>`;
     }
   }
   window.loadTunnelPluginsSection = loadTunnelPluginsSection2;
@@ -5363,19 +5496,19 @@ project_id = "${displayPid}"`;
         servers = data.servers;
         nextCursor = data.next_cursor || null;
       }
-    } catch (_) {
+    } catch (_2) {
     }
     if (!servers) {
-      const curatedRows = _CURATED_TUNNEL_PLUGINS.map((c) => `
+      const curatedRows = _CURATED_TUNNEL_PLUGINS.map((c3) => `
       <div style="border:1px solid var(--border);border-radius:4px;padding:8px;margin-bottom:6px;background:var(--surface-1)">
         <div style="display:flex;align-items:baseline;gap:6px;flex-wrap:wrap;margin-bottom:4px">
-          <span style="font-size:11px;color:var(--text);font-weight:600">${escapeHtml(c.name)}</span>
-          <a href="${escapeHtml(c.docs)}" target="_blank" rel="noopener" style="font-size:9px;color:var(--accent);text-decoration:none">docs &#8599;</a>
+          <span style="font-size:11px;color:var(--text);font-weight:600">${escapeHtml(c3.name)}</span>
+          <a href="${escapeHtml(c3.docs)}" target="_blank" rel="noopener" style="font-size:9px;color:var(--accent);text-decoration:none">docs &#8599;</a>
         </div>
-        <div style="font-size:10px;color:var(--muted);margin-bottom:5px">${escapeHtml(c.description)}</div>
+        <div style="font-size:10px;color:var(--muted);margin-bottom:5px">${escapeHtml(c3.description)}</div>
         <div style="display:flex;gap:6px;align-items:center">
-          <code style="flex:1;box-sizing:border-box;background:var(--surface-2);border:1px solid var(--border);border-radius:4px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:4px 7px;overflow-x:auto;white-space:nowrap">${escapeHtml(c.command)}</code>
-          <button class="secondary tp-copy" data-copy="${escapeHtml(c.command)}" style="padding:2px 8px;font-size:10px;flex-shrink:0">Copy command</button>
+          <code style="flex:1;box-sizing:border-box;background:var(--surface-2);border:1px solid var(--border);border-radius:4px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:4px 7px;overflow-x:auto;white-space:nowrap">${escapeHtml(c3.command)}</code>
+          <button class="secondary tp-copy" data-copy="${escapeHtml(c3.command)}" style="padding:2px 8px;font-size:10px;flex-shrink:0">Copy command</button>
         </div>
       </div>`).join("");
       return `
@@ -5389,11 +5522,11 @@ project_id = "${displayPid}"`;
         </div>
       </details>`;
     }
-    const _renderRegistryCard = (s) => {
-      const name = escapeHtml(s.name || s.id || "");
-      const desc = escapeHtml(s.description || "");
-      const installCmd = s.install_command || "";
-      const homepage = escapeHtml(s.homepage || s.url || "");
+    const _renderRegistryCard = (s3) => {
+      const name = escapeHtml(s3.name || s3.id || "");
+      const desc = escapeHtml(s3.description || "");
+      const installCmd = s3.install_command || "";
+      const homepage = escapeHtml(s3.homepage || s3.url || "");
       return `
       <div style="border:1px solid var(--border);border-radius:4px;padding:8px;margin-bottom:6px;background:var(--surface-1)">
         <div style="display:flex;align-items:baseline;gap:6px;flex-wrap:wrap;margin-bottom:4px">
@@ -5449,12 +5582,12 @@ project_id = "${displayPid}"`;
     const searchEl = document.getElementById(`rg-search-${projectId}`);
     if (searchEl) {
       searchEl.addEventListener("input", () => {
-        const q = searchEl.value.toLowerCase();
+        const q2 = searchEl.value.toLowerCase();
         const listEl = document.getElementById(`rg-list-${projectId}`);
         if (!listEl) return;
         listEl.querySelectorAll(":scope > div").forEach((row) => {
           const text = row.textContent.toLowerCase();
-          row.style.display = text.includes(q) ? "" : "none";
+          row.style.display = text.includes(q2) ? "" : "none";
         });
       });
     }
@@ -5470,9 +5603,9 @@ project_id = "${displayPid}"`;
           if (data && Array.isArray(data.servers)) {
             const listEl = document.getElementById(`rg-list-${projectId}`);
             if (listEl) {
-              data.servers.forEach((s) => {
+              data.servers.forEach((s3) => {
                 const tmp = document.createElement("div");
-                tmp.innerHTML = window._renderRegistryCard ? window._renderRegistryCard(s) : "";
+                tmp.innerHTML = window._renderRegistryCard ? window._renderRegistryCard(s3) : "";
                 while (tmp.firstChild) listEl.appendChild(tmp.firstChild);
               });
               _wireRegistryCopyButtons(listEl);
@@ -5485,10 +5618,10 @@ project_id = "${displayPid}"`;
               loadMoreBtn.remove();
             }
           }
-        } catch (e) {
+        } catch (e3) {
           loadMoreBtn.textContent = "Load more";
           loadMoreBtn.disabled = false;
-          toast("Failed to load more: " + e.message, true);
+          toast("Failed to load more: " + e3.message, true);
         }
       });
     }
@@ -5506,9 +5639,9 @@ project_id = "${displayPid}"`;
       installed_inactive: { dot: "#f59e0b", label: "inactive", labelColor: "#f59e0b" },
       not_installed: { dot: "var(--muted)", label: "not installed", labelColor: "var(--muted)" }
     };
-    const s = styles[lifecycleState] || styles.not_installed;
-    const dotHtml = `<span style="width:8px;height:8px;border-radius:50%;background:${s.dot};flex-shrink:0"></span>`;
-    const labelHtml = `<span style="font-size:9px;color:${s.labelColor};font-weight:600">${s.label}</span>`;
+    const s3 = styles[lifecycleState] || styles.not_installed;
+    const dotHtml = `<span style="width:8px;height:8px;border-radius:50%;background:${s3.dot};flex-shrink:0"></span>`;
+    const labelHtml = `<span style="font-size:9px;color:${s3.labelColor};font-weight:600">${s3.label}</span>`;
     let actionBtn = "";
     if (lifecycleState === "not_installed" && installCmd) {
       const safeCmd = escapeHtml(installCmd);
@@ -5544,7 +5677,7 @@ project_id = "${displayPid}"`;
   }
   window._wireLifecycleInstallButtons = _wireLifecycleInstallButtons;
 
-  // meridian/static/dashboard-notes.js
+  // meridian/static/dashboard-notes.ts
   async function loadNotesTab2(projectId) {
     const body = document.getElementById(`notes-body-${projectId}`);
     const searchInput = document.getElementById(`notes-search-${projectId}`);
@@ -5556,9 +5689,9 @@ project_id = "${displayPid}"`;
       insight: { label: "insight", color: "var(--accent)", border: "var(--accent)" },
       reference: { label: "reference", color: "#c9a227", border: "#c9a227" }
     };
-    const noteKind = (n) => {
-      const k = String(n.note_kind || "").toLowerCase();
-      return KIND_STYLE[k] ? k : "wiki";
+    const noteKind = (n2) => {
+      const k3 = String(n2.note_kind || "").toLowerCase();
+      return KIND_STYLE[k3] ? k3 : "wiki";
     };
     const addTitle = document.getElementById(`notes-add-title-${projectId}`);
     const addBody = document.getElementById(`notes-add-body-${projectId}`);
@@ -5566,12 +5699,12 @@ project_id = "${displayPid}"`;
     const addKind = document.getElementById(`notes-add-kind-${projectId}`);
     const addBtn = document.getElementById(`notes-add-btn-${projectId}`);
     if (!body) return;
-    const isAutoCapture = (n) => {
-      const title = String(n.title || "").trim().toLowerCase();
-      const tags = String(n.tags || "").split(",").map((t) => t.trim().toLowerCase());
+    const isAutoCapture = (n2) => {
+      const title = String(n2.title || "").trim().toLowerCase();
+      const tags = String(n2.tags || "").split(",").map((t3) => t3.trim().toLowerCase());
       return title.startsWith("checkpoint:") || title.startsWith("session summary") || tags.includes("checkpoint") || tags.includes("auto-capture");
     };
-    const noteTags = (n) => String(n.tags || "").split(",").map((t) => t.trim()).filter(Boolean);
+    const noteTags = (n2) => String(n2.tags || "").split(",").map((t3) => t3.trim()).filter(Boolean);
     let allNotes = [];
     const NOTES_PAGE = 100;
     let nextCursor = 0;
@@ -5592,34 +5725,34 @@ project_id = "${displayPid}"`;
       if (!tagSelect) return;
       const prev = tagSelect.value;
       const seen = /* @__PURE__ */ new Set();
-      for (const n of allNotes) {
-        if (!showAuto?.checked && isAutoCapture(n)) continue;
-        for (const t of noteTags(n)) seen.add(t);
+      for (const n2 of allNotes) {
+        if (!showAuto?.checked && isAutoCapture(n2)) continue;
+        for (const t3 of noteTags(n2)) seen.add(t3);
       }
-      const tags = [...seen].sort((a, b) => a.localeCompare(b));
-      tagSelect.innerHTML = `<option value="">all tags</option>` + tags.map((t) => `<option value="${escapeHtml(t)}">${escapeHtml(t)}</option>`).join("");
+      const tags = [...seen].sort((a3, b2) => a3.localeCompare(b2));
+      tagSelect.innerHTML = `<option value="">all tags</option>` + tags.map((t3) => `<option value="${escapeHtml(t3)}">${escapeHtml(t3)}</option>`).join("");
       if (tags.includes(prev)) tagSelect.value = prev;
     };
     const applyFilters = () => {
-      const q = (searchInput?.value || "").trim().toLowerCase();
+      const q2 = (searchInput?.value || "").trim().toLowerCase();
       const selectedTag = (tagSelect?.value || "").trim().toLowerCase();
       const selectedKind = (kindSelect?.value || "").trim().toLowerCase();
       const includeAuto = !!showAuto?.checked;
-      const visible = allNotes.filter((n) => {
-        if (!includeAuto && isAutoCapture(n)) return false;
-        if (selectedKind && noteKind(n) !== selectedKind) return false;
-        if (selectedTag && !noteTags(n).map((t) => t.toLowerCase()).includes(selectedTag)) return false;
-        if (q) {
-          const hay = `${n.title || ""}
-${n.body || ""}
-${n.tags || ""}`.toLowerCase();
-          if (!hay.includes(q)) return false;
+      const visible = allNotes.filter((n2) => {
+        if (!includeAuto && isAutoCapture(n2)) return false;
+        if (selectedKind && noteKind(n2) !== selectedKind) return false;
+        if (selectedTag && !noteTags(n2).map((t3) => t3.toLowerCase()).includes(selectedTag)) return false;
+        if (q2) {
+          const hay = `${n2.title || ""}
+${n2.body || ""}
+${n2.tags || ""}`.toLowerCase();
+          if (!hay.includes(q2)) return false;
         }
         return true;
       });
       setVtabCountBadge(
         `.notes-vtab-badge[data-pid="${projectId}"]`,
-        allNotes.filter((n) => !isAutoCapture(n)).length
+        allNotes.filter((n2) => !isAutoCapture(n2)).length
       );
       if (!visible.length) {
         const reason = allNotes.length ? `(no notes match \u2014 clear the search/tag filter${!includeAuto ? " or tick \u201Csummaries\u201D" : ""})` : `(no notes yet \u2014 use the form below or <code>add_note</code> MCP tool)`;
@@ -5627,38 +5760,38 @@ ${n.tags || ""}`.toLowerCase();
         renderLoadMore();
         return;
       }
-      body.innerHTML = visible.map((n) => {
-        const pills = noteTags(n).map(
-          (t) => `<span style="display:inline-block;background:var(--accent)22;color:var(--accent);font-size:9px;font-weight:600;padding:1px 6px;border-radius:3px;margin-right:4px">${escapeHtml(t)}</span>`
+      body.innerHTML = visible.map((n2) => {
+        const pills = noteTags(n2).map(
+          (t3) => `<span style="display:inline-block;background:var(--accent)22;color:var(--accent);font-size:9px;font-weight:600;padding:1px 6px;border-radius:3px;margin-right:4px">${escapeHtml(t3)}</span>`
         ).join("");
-        const dt = (n.created_at || "").slice(0, 10);
-        const kind = noteKind(n);
+        const dt = (n2.created_at || "").slice(0, 10);
+        const kind = noteKind(n2);
         const ks = KIND_STYLE[kind];
         const isInsight = kind === "insight";
         const kindPill = `<span title="note kind: ${ks.label}" style="display:inline-block;background:${ks.color}22;color:${ks.color};font-size:9px;font-weight:700;padding:1px 6px;border-radius:3px;margin-right:4px;text-transform:uppercase;letter-spacing:0.4px">${ks.label}</span>`;
-        const autoPill = isAutoCapture(n) ? `<span title="Auto-captured session summary" style="display:inline-block;background:var(--surface-3,#2a2f3a);color:var(--muted);font-size:9px;font-weight:600;padding:1px 6px;border-radius:3px;margin-right:4px">session</span>` : "";
+        const autoPill = isAutoCapture(n2) ? `<span title="Auto-captured session summary" style="display:inline-block;background:var(--surface-3,#2a2f3a);color:var(--muted);font-size:9px;font-weight:600;padding:1px 6px;border-radius:3px;margin-right:4px">session</span>` : "";
         return `<div style="background:var(--surface-2);border:1px solid var(--border);border-left:${isInsight ? "4px" : "3px"} solid ${ks.border};border-radius:0 4px 4px 0;padding:${isInsight ? "12px 14px" : "10px 12px"};margin-bottom:8px">
           <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:6px">
             <div style="display:flex;align-items:center;gap:8px;min-width:0;flex:1">
-              <span style="color:var(--accent);font-weight:600;font-size:${isInsight ? "13px" : "12px"}">${escapeHtml(n.title || "")}</span>
+              <span style="color:var(--accent);font-weight:600;font-size:${isInsight ? "13px" : "12px"}">${escapeHtml(n2.title || "")}</span>
               <span style="color:var(--muted);font-size:10px">${escapeHtml(dt)}</span>
             </div>
-            <button class="secondary notes-del-btn guest-hidden" data-note-id="${escapeHtml(n.id)}" style="padding:1px 8px;font-size:10px">Delete</button>
+            <button class="secondary notes-del-btn guest-hidden" data-note-id="${escapeHtml(n2.id)}" style="padding:1px 8px;font-size:10px">Delete</button>
           </div>
           <div style="margin-bottom:6px">${kindPill}${autoPill}${pills}</div>
-          <div class="note-body-md" style="color:var(--text);line-height:1.5;font-size:12px">${typeof marked !== "undefined" ? marked.parse(n.body || "") : escapeHtml(n.body || "")}</div>
+          <div class="note-body-md" style="color:var(--text);line-height:1.5;font-size:12px">${typeof marked !== "undefined" ? marked.parse(n2.body || "") : escapeHtml(n2.body || "")}</div>
         </div>`;
       }).join("");
       body.querySelectorAll(".notes-del-btn").forEach((btn) => {
         btn.onclick = async () => {
           if (!confirm("Delete this note?")) return;
           try {
-            const r = await fetch(`/projects/${projectId}/notes/${btn.dataset.noteId}`, { method: "DELETE" });
-            if (!r.ok) throw new Error(`${r.status}`);
+            const r3 = await fetch(`/projects/${projectId}/notes/${btn.dataset.noteId}`, { method: "DELETE" });
+            if (!r3.ok) throw new Error(`${r3.status}`);
             toast("note deleted");
             await load();
-          } catch (e) {
-            toast("delete failed: " + e.message, true);
+          } catch (e3) {
+            toast("delete failed: " + e3.message, true);
           }
         };
       });
@@ -5679,12 +5812,12 @@ ${n.tags || ""}`.toLowerCase();
         nextCursor = page.next_cursor != null ? page.next_cursor : nextCursor;
         refreshTagOptions();
         applyFilters();
-      } catch (e) {
+      } catch (e3) {
         if (btn) {
           btn.disabled = false;
           btn.textContent = `Load ${NOTES_PAGE} more \u2193 (retry)`;
         }
-        toast("load more failed: " + e.message, true);
+        toast("load more failed: " + e3.message, true);
       }
     };
     const load = async () => {
@@ -5699,16 +5832,16 @@ ${n.tags || ""}`.toLowerCase();
         nextCursor = page.next_cursor != null ? page.next_cursor : 0;
         refreshTagOptions();
         applyFilters();
-      } catch (e) {
-        body.innerHTML = renderProjectLoadError(projectId, "Notes unavailable", `/projects/${projectId}/notes`, e);
+      } catch (e3) {
+        body.innerHTML = renderProjectLoadError(projectId, "Notes unavailable", `/projects/${projectId}/notes`, e3);
         wireProjectLoadRetry(body, projectId);
       }
     };
     if (searchInput) {
-      let t = null;
+      let t3 = null;
       searchInput.oninput = () => {
-        clearTimeout(t);
-        t = setTimeout(applyFilters, 150);
+        clearTimeout(t3);
+        t3 = setTimeout(applyFilters, 150);
       };
     }
     if (tagSelect) tagSelect.onchange = applyFilters;
@@ -5742,18 +5875,18 @@ ${n.tags || ""}`.toLowerCase();
         if (res && res.lint) toast(res.lint, false);
         else toast("note added");
         await load();
-      } catch (e) {
-        toast("add failed: " + e.message, true);
+      } catch (e3) {
+        toast("add failed: " + e3.message, true);
       }
     };
     await load();
   }
   try {
     Object.assign(window, { loadNotesTab: loadNotesTab2 });
-  } catch (e) {
+  } catch (e3) {
   }
 
-  // meridian/static/dashboard-files.js
+  // meridian/static/dashboard-files.ts
   function _rewriteRepoImages(container, projectId) {
     if (!container || !projectId) return;
     container.querySelectorAll("img").forEach((img) => {
@@ -5775,13 +5908,13 @@ ${n.tags || ""}`.toLowerCase();
         return;
       }
       listEl.innerHTML = files.map(
-        (f) => `<div class="file-item" data-filename="${escapeHtml(f)}">${escapeHtml(f)}</div>`
+        (f4) => `<div class="file-item" data-filename="${escapeHtml(f4)}">${escapeHtml(f4)}</div>`
       ).join("");
       listEl.querySelectorAll(".file-item").forEach((item) => {
         item.onclick = () => openFileEditor(projectId, item.dataset.filename);
       });
-    } catch (e) {
-      listEl.innerHTML = `<div style="padding:14px;color:var(--status-failed);font-family:'IBM Plex Mono',monospace;font-size:11px">Error: ${escapeHtml(e.message)}</div>`;
+    } catch (e3) {
+      listEl.innerHTML = `<div style="padding:14px;color:var(--status-failed);font-family:'IBM Plex Mono',monospace;font-size:11px">Error: ${escapeHtml(e3.message)}</div>`;
     }
   }
   async function openFileEditor(projectId, filename) {
@@ -5809,11 +5942,11 @@ ${n.tags || ""}`.toLowerCase();
         previewDiv.style.display = "";
       }
       contentEl.style.display = "none";
-      if (editBtn && !editBtn._wired) {
+      if (editBtn && previewBtn && previewDiv && !editBtn._wired) {
         editBtn._wired = true;
         [editBtn, previewBtn].forEach((btn) => {
           btn.onclick = () => {
-            [editBtn, previewBtn].forEach((b) => b.classList.toggle("active", b === btn));
+            [editBtn, previewBtn].forEach((b2) => b2.classList.toggle("active", b2 === btn));
             if (btn.dataset.fmode === "preview") {
               const md = contentEl.value || "";
               const html = typeof marked !== "undefined" ? marked.parse(md) : escapeHtml(md);
@@ -5828,8 +5961,8 @@ ${n.tags || ""}`.toLowerCase();
           };
         });
       }
-    } catch (e) {
-      toast("open failed: " + e.message, true);
+    } catch (e3) {
+      toast("open failed: " + e3.message, true);
     }
   }
   async function saveFile2(projectId) {
@@ -5844,24 +5977,24 @@ ${n.tags || ""}`.toLowerCase();
         body: JSON.stringify({ content: contentEl.value })
       });
       toast(`saved ${filename}`);
-    } catch (e) {
-      toast("save failed: " + e.message, true);
+    } catch (e3) {
+      toast("save failed: " + e3.message, true);
     }
   }
   try {
     Object.assign(window, { _rewriteRepoImages, loadFilesTab: loadFilesTab2, openFileEditor, saveFile: saveFile2 });
-  } catch (e) {
+  } catch (e3) {
   }
 
-  // meridian/static/dashboard-rewind.js
+  // meridian/static/dashboard-rewind.ts
   function initRewindTab2(projectId) {
-    const p = window.state.panels[projectId];
-    if (!p) return;
-    if (p.rewindWired) {
-      if (p.rewindDays) loadRewindTab2(projectId, p.rewindDays);
+    const p3 = window.state.panels[projectId];
+    if (!p3) return;
+    if (p3.rewindWired) {
+      if (p3.rewindDays) loadRewindTab2(projectId, p3.rewindDays);
       return;
     }
-    p.rewindWired = true;
+    p3.rewindWired = true;
     document.querySelectorAll(`.rewind-day-btn[data-pid="${projectId}"]`).forEach((btn) => {
       btn.onclick = () => {
         const days = parseInt(btn.dataset.days, 10) || 7;
@@ -5877,10 +6010,10 @@ ${n.tags || ""}`.toLowerCase();
       let _st = null;
       searchInp.addEventListener("input", function() {
         clearTimeout(_st);
-        const q = this.value.trim();
+        const q2 = this.value.trim();
         _st = setTimeout(async () => {
-          if (!q) {
-            if (p.rewindDays) loadRewindTab2(projectId, p.rewindDays);
+          if (!q2) {
+            if (p3.rewindDays) loadRewindTab2(projectId, p3.rewindDays);
             else {
               if (wrap) wrap.innerHTML = '<div class="empty" style="color:var(--muted)">pick a window above</div>';
             }
@@ -5889,10 +6022,10 @@ ${n.tags || ""}`.toLowerCase();
           if (!wrap) return;
           wrap.innerHTML = '<div class="empty" style="color:var(--muted)">searching\u2026</div>';
           try {
-            const results = await api(`/projects/${projectId}/search?q=${encodeURIComponent(q)}&limit=15`);
-            wrap.innerHTML = renderSearchResults(q, results);
-          } catch (e) {
-            wrap.innerHTML = `<div class="empty">search failed: ${escapeHtml(e.message)}</div>`;
+            const results = await api(`/projects/${projectId}/search?q=${encodeURIComponent(q2)}&limit=15`);
+            wrap.innerHTML = renderSearchResults(q2, results);
+          } catch (e3) {
+            wrap.innerHTML = `<div class="empty">search failed: ${escapeHtml(e3.message)}</div>`;
           }
         }, 350);
       });
@@ -5902,10 +6035,10 @@ ${n.tags || ""}`.toLowerCase();
   async function loadRewindTab2(projectId, days) {
     const wrap = document.getElementById(`rewind-wrap-${projectId}`);
     if (!wrap) return;
-    const p = window.state.panels[projectId];
-    if (p) p.rewindDays = days;
-    document.querySelectorAll(`.rewind-day-btn[data-pid="${projectId}"]`).forEach((b) => {
-      b.classList.toggle("active", parseInt(b.dataset.days, 10) === days);
+    const p3 = window.state.panels[projectId];
+    if (p3) p3.rewindDays = days;
+    document.querySelectorAll(`.rewind-day-btn[data-pid="${projectId}"]`).forEach((b2) => {
+      b2.classList.toggle("active", parseInt(b2.dataset.days, 10) === days);
     });
     wrap.innerHTML = '<div style="color:var(--muted)">loading rewind\u2026</div>';
     try {
@@ -5914,22 +6047,22 @@ ${n.tags || ""}`.toLowerCase();
         api(`/projects/${projectId}/goal-history`).catch(() => []),
         api(`/projects/${projectId}/stats?days=30`).catch(() => null)
       ]);
-      const activeTab = p && p.rewindSubtab || "versions";
+      const activeTab = p3 && p3.rewindSubtab || "versions";
       wrap.innerHTML = renderRewindSubtabs(projectId, data, history2, stats, activeTab);
       wrap.querySelectorAll(".rewind-subtab-btn").forEach((btn) => {
         btn.onclick = () => {
           const tab = btn.dataset.tab;
-          if (p) p.rewindSubtab = tab;
-          wrap.querySelectorAll(".rewind-subtab-btn").forEach((b) => b.classList.toggle("active", b.dataset.tab === tab));
-          wrap.querySelectorAll(".rewind-subtab-pane").forEach((c) => {
-            c.style.display = c.dataset.tab === tab ? "" : "none";
+          if (p3) p3.rewindSubtab = tab;
+          wrap.querySelectorAll(".rewind-subtab-btn").forEach((b2) => b2.classList.toggle("active", b2.dataset.tab === tab));
+          wrap.querySelectorAll(".rewind-subtab-pane").forEach((c3) => {
+            c3.style.display = c3.dataset.tab === tab ? "" : "none";
           });
           if (tab === "charts") initRewindCharts(projectId, stats);
         };
       });
       if (activeTab === "charts" && stats) initRewindCharts(projectId, stats);
-    } catch (e) {
-      wrap.innerHTML = `<div style="color:var(--status-failed)">rewind failed: ${escapeHtml(e.message)}</div>`;
+    } catch (e3) {
+      wrap.innerHTML = `<div style="color:var(--status-failed)">rewind failed: ${escapeHtml(e3.message)}</div>`;
     }
   }
   function renderRewindSubtabs(projectId, data, history2, stats, activeTab) {
@@ -5940,7 +6073,7 @@ ${n.tags || ""}`.toLowerCase();
       { id: "activity", label: "\u{1F4CB} Activity" },
       { id: "charts", label: "\u{1F4CA} Charts" }
     ];
-    const tabBar = `<div class="rewind-subtab-bar">${tabs.map((t) => `<button class="rewind-subtab-btn${activeTab === t.id ? " active" : ""}" data-tab="${t.id}">${t.label}</button>`).join("")}</div>`;
+    const tabBar = `<div class="rewind-subtab-bar">${tabs.map((t3) => `<button class="rewind-subtab-btn${activeTab === t3.id ? " active" : ""}" data-tab="${t3.id}">${t3.label}</button>`).join("")}</div>`;
     const make = (id, html) => `<div class="rewind-subtab-pane" data-tab="${id}" style="${activeTab === id ? "" : "display:none"}">${html}</div>`;
     return tabBar + make("activity", renderRewindActivity(projectId, data)) + make("versions", renderRewindVersions(projectId, data)) + make("sprint", renderRewindSprint(projectId, data)) + make("goals", renderRewindGoals(projectId, data, history2)) + make("charts", renderRewindCharts(projectId, stats));
   }
@@ -5974,22 +6107,22 @@ ${n.tags || ""}`.toLowerCase();
   }
   function initRewindCharts(projectId, stats) {
     if (!stats || typeof Chart === "undefined") return;
-    const p = window.state.panels[projectId];
-    if (p) {
-      if (p._chartTasks) {
-        p._chartTasks.destroy();
-        p._chartTasks = null;
+    const p3 = window.state.panels[projectId];
+    if (p3) {
+      if (p3._chartTasks) {
+        p3._chartTasks.destroy();
+        p3._chartTasks = null;
       }
-      if (p._chartSprint) {
-        p._chartSprint.destroy();
-        p._chartSprint = null;
+      if (p3._chartSprint) {
+        p3._chartSprint.destroy();
+        p3._chartSprint = null;
       }
     }
     const tasksCanvas = document.getElementById(`chart-tasks-${projectId}`);
     const sprintItemsPerDay = stats.sprint_items_per_day || stats.tasks_per_day;
     if (tasksCanvas && sprintItemsPerDay) {
-      const labels = sprintItemsPerDay.map((d) => d.day.slice(5));
-      const totals = sprintItemsPerDay.map((d) => d.total);
+      const labels = sprintItemsPerDay.map((d3) => d3.day.slice(5));
+      const totals = sprintItemsPerDay.map((d3) => d3.total);
       const chart = new Chart(tasksCanvas, {
         type: "bar",
         data: {
@@ -6010,7 +6143,7 @@ ${n.tags || ""}`.toLowerCase();
           }
         }
       });
-      if (p) p._chartTasks = chart;
+      if (p3) p3._chartTasks = chart;
     }
     const sprintCanvas = document.getElementById(`chart-sprint-${projectId}`);
     if (sprintCanvas && stats.sprint_velocity && stats.sprint_velocity.length) {
@@ -6018,11 +6151,11 @@ ${n.tags || ""}`.toLowerCase();
       const chart = new Chart(sprintCanvas, {
         type: "bar",
         data: {
-          labels: sv.map((v) => v.version),
+          labels: sv.map((v3) => v3.version),
           datasets: [{
             label: "% done",
-            data: sv.map((v) => v.pct),
-            backgroundColor: sv.map((v) => v.pct === 100 ? "rgba(52, 211, 153, 0.7)" : "rgba(96, 165, 250, 0.7)"),
+            data: sv.map((v3) => v3.pct),
+            backgroundColor: sv.map((v3) => v3.pct === 100 ? "rgba(52, 211, 153, 0.7)" : "rgba(96, 165, 250, 0.7)"),
             borderRadius: 2
           }]
         },
@@ -6041,7 +6174,7 @@ ${n.tags || ""}`.toLowerCase();
           }
         }
       });
-      if (p) p._chartSprint = chart;
+      if (p3) p3._chartSprint = chart;
     }
   }
   function renderRewindSprint(projectId, data) {
@@ -6052,46 +6185,46 @@ ${n.tags || ""}`.toLowerCase();
       return '<div style="padding:14px;color:var(--muted);font-size:11px">No sprint items yet.</div>';
     }
     const byVersion = {};
-    allItems.forEach((s) => {
-      const v = s.version || "current";
-      if (!byVersion[v]) byVersion[v] = [];
-      byVersion[v].push(s);
+    allItems.forEach((s3) => {
+      const v3 = s3.version || "current";
+      if (!byVersion[v3]) byVersion[v3] = [];
+      byVersion[v3].push(s3);
     });
-    const statusDot = (s) => {
-      if (s.status === "done") return '<span style="color:var(--status-done)">\u2713</span>';
-      if (s.status === "failed") return '<span style="color:var(--status-failed)">\u2717</span>';
-      if (s.status === "pushed") return '<span style="color:var(--muted)">\u2192</span>';
+    const statusDot = (s3) => {
+      if (s3.status === "done") return '<span style="color:var(--status-done)">\u2713</span>';
+      if (s3.status === "failed") return '<span style="color:var(--status-failed)">\u2717</span>';
+      if (s3.status === "pushed") return '<span style="color:var(--muted)">\u2192</span>';
       return '<span style="color:var(--status-pending)">\u25CB</span>';
     };
     let html = "";
-    const versions = Object.keys(byVersion).sort((a, b) => {
-      if (a === "current") return -1;
-      if (b === "current") return 1;
-      return b.localeCompare(a);
+    const versions = Object.keys(byVersion).sort((a3, b2) => {
+      if (a3 === "current") return -1;
+      if (b2 === "current") return 1;
+      return b2.localeCompare(a3);
     });
-    versions.forEach((v) => {
-      const vItems = byVersion[v];
-      const doneCount = vItems.filter((s) => s.status === "done").length;
+    versions.forEach((v3) => {
+      const vItems = byVersion[v3];
+      const doneCount = vItems.filter((s3) => s3.status === "done").length;
       const total = vItems.length;
       const pct = total ? Math.round(doneCount / total * 100) : 0;
-      const id = `sprint-v-${projectId}-${v.replace(/[^a-z0-9]/gi, "")}`;
+      const id = `sprint-v-${projectId}-${v3.replace(/[^a-z0-9]/gi, "")}`;
       html += `<section style="margin-bottom:10px">
 
       <div style="cursor:pointer;display:flex;justify-content:space-between;align-items:center;padding:5px 0;border-bottom:1px solid var(--border)" onclick="toggleExpand('${id}')">
 
-        <span style="color:var(--accent);font-weight:600;font-size:11px">${escapeHtml(v)}</span>
+        <span style="color:var(--accent);font-weight:600;font-size:11px">${escapeHtml(v3)}</span>
 
         <span style="color:var(--muted);font-size:10px">${doneCount}/${total} done (${pct}%) <span class="expand-arrow">\u25B6</span></span>
 
       </div>
 
-      <div id="${id}" style="display:${v === "current" ? "block" : "none"}">
+      <div id="${id}" style="display:${v3 === "current" ? "block" : "none"}">
 
-        ${vItems.map((s) => `<div style="padding:3px 0 3px 8px;font-size:11px;display:flex;gap:6px;align-items:flex-start">
+        ${vItems.map((s3) => `<div style="padding:3px 0 3px 8px;font-size:11px;display:flex;gap:6px;align-items:flex-start">
 
-          ${statusDot(s)}
+          ${statusDot(s3)}
 
-          <span style="color:${s.status === "done" ? "var(--muted)" : "var(--text)"};${s.status === "done" ? "text-decoration:line-through" : ""}">${escapeHtml(s.title || "")}</span>
+          <span style="color:${s3.status === "done" ? "var(--muted)" : "var(--text)"};${s3.status === "done" ? "text-decoration:line-through" : ""}">${escapeHtml(s3.title || "")}</span>
 
         </div>`).join("")}
 
@@ -6121,21 +6254,21 @@ ${n.tags || ""}`.toLowerCase();
   }
   function renderRewindActivity(projectId, data) {
     const sessByName = /* @__PURE__ */ new Map();
-    (data.session_summaries || []).forEach((s) => {
-      const prev = sessByName.get(s.session_name);
-      if (!prev || (s.tasks_completed || 0) > (prev.tasks_completed || 0)) {
-        sessByName.set(s.session_name, s);
+    (data.session_summaries || []).forEach((s3) => {
+      const prev = sessByName.get(s3.session_name);
+      if (!prev || (s3.tasks_completed || 0) > (prev.tasks_completed || 0)) {
+        sessByName.set(s3.session_name, s3);
       }
     });
     const dedupedSessions = [...sessByName.values()];
-    const sessions = _rewindSec("\u{1F9E0}", "Sessions", dedupedSessions, (s) => `<div style="padding:3px 0;border-left:2px solid var(--border);padding-left:8px;margin-bottom:4px">
+    const sessions = _rewindSec("\u{1F9E0}", "Sessions", dedupedSessions, (s3) => `<div style="padding:3px 0;border-left:2px solid var(--border);padding-left:8px;margin-bottom:4px">
 
-      <div style="color:var(--accent)">${escapeHtml(s.session_name)} <span style="color:var(--muted);font-size:10px">\xB7 ${s.tasks_completed} done</span></div>
+      <div style="color:var(--accent)">${escapeHtml(s3.session_name)} <span style="color:var(--muted);font-size:10px">\xB7 ${s3.tasks_completed} done</span></div>
 
-      <div style="color:var(--muted);font-size:10px">${escapeHtml(s.summary || "")}</div>
+      <div style="color:var(--muted);font-size:10px">${escapeHtml(s3.summary || "")}</div>
 
     </div>`);
-    const decisions = _rewindSec("\u{1F4CB}", "Decisions logged", data.decisions_logged, (d) => `<div style="padding:2px 0"><span style="color:var(--muted);font-size:10px">[${escapeHtml(d.logged_at || "")}]</span> ${escapeHtml(d.text || "")}</div>`);
+    const decisions = _rewindSec("\u{1F4CB}", "Decisions logged", data.decisions_logged, (d3) => `<div style="padding:2px 0"><span style="color:var(--muted);font-size:10px">[${escapeHtml(d3.logged_at || "")}]</span> ${escapeHtml(d3.text || "")}</div>`);
     const byStatus = data.tasks_by_status || {};
     const summary = `<section style="margin-top:14px;padding-top:10px;border-top:1px solid var(--border)">
 
@@ -6149,9 +6282,9 @@ ${n.tags || ""}`.toLowerCase();
       "\u{1F4E6}",
       "Milestones shipped",
       data.versions_shipped,
-      (v) => `<div style="padding:5px 0;border-bottom:1px solid var(--border);font-size:11px;white-space:pre-wrap;word-break:break-word;line-height:1.6;color:var(--text)">${escapeHtml(v)}</div>`
+      (v3) => `<div style="padding:5px 0;border-bottom:1px solid var(--border);font-size:11px;white-space:pre-wrap;word-break:break-word;line-height:1.6;color:var(--text)">${escapeHtml(v3)}</div>`
     );
-    const sprints = _rewindSec("\u2705", "Sprint items completed", data.sprint_items_completed, (s) => `<div style="padding:2px 0"><span style="color:var(--accent-green)">${escapeHtml(s.version || "")}</span> \u2014 ${escapeHtml(s.title || "")} <span style="color:var(--muted);font-size:10px">${escapeHtml(s.completed_at || "")}</span></div>`);
+    const sprints = _rewindSec("\u2705", "Sprint items completed", data.sprint_items_completed, (s3) => `<div style="padding:2px 0"><span style="color:var(--accent-green)">${escapeHtml(s3.version || "")}</span> \u2014 ${escapeHtml(s3.title || "")} <span style="color:var(--muted);font-size:10px">${escapeHtml(s3.completed_at || "")}</span></div>`);
     const summary = `<section style="margin-top:14px;padding-top:10px;border-top:1px solid var(--border)">
 
     <div style="color:var(--accent);font-weight:600">\u{1F4CA} ${(data.sprint_items_completed || []).length} sprint items completed over ${data.period_days}d</div>
@@ -6161,15 +6294,15 @@ ${n.tags || ""}`.toLowerCase();
   }
   function renderRewindGoals(projectId, data, history2) {
     const preStyle = "margin:0;white-space:pre-wrap;word-break:break-word;background:var(--bg-card);padding:6px;border-radius:3px;font-size:10px;font-family:inherit";
-    const goals = _rewindSec("\u{1F3AF}", "Goal changes", (data.goal_changes || []).slice().reverse(), (g, idx) => {
+    const goals = _rewindSec("\u{1F3AF}", "Goal changes", (data.goal_changes || []).slice().reverse(), (g2, idx) => {
       const id = `gc-expand-${projectId}-${idx}`;
       return `<div style="padding:3px 0;border-left:2px solid var(--border);padding-left:8px;margin-bottom:4px">
 
       <div style="cursor:pointer;user-select:none" onclick="toggleExpand('${id}')">
 
-        <div style="color:var(--muted);font-size:10px">${escapeHtml(g.field)} \xB7 ${escapeHtml(g.changed_at || "")} <span class="expand-arrow" style="font-size:9px">\u25B6</span></div>
+        <div style="color:var(--muted);font-size:10px">${escapeHtml(g2.field)} \xB7 ${escapeHtml(g2.changed_at || "")} <span class="expand-arrow" style="font-size:9px">\u25B6</span></div>
 
-        <div style="color:var(--text);font-size:10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${escapeHtml((g.new_summary || "(empty)").slice(0, 120))}</div>
+        <div style="color:var(--text);font-size:10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${escapeHtml((g2.new_summary || "(empty)").slice(0, 120))}</div>
 
       </div>
 
@@ -6177,11 +6310,11 @@ ${n.tags || ""}`.toLowerCase();
 
         <div style="color:var(--muted);font-size:10px;margin-bottom:2px">before:</div>
 
-        <pre style="${preStyle};margin-bottom:6px">${escapeHtml(g.old_full || "(empty)")}</pre>
+        <pre style="${preStyle};margin-bottom:6px">${escapeHtml(g2.old_full || "(empty)")}</pre>
 
         <div style="color:var(--muted);font-size:10px;margin-bottom:2px">after:</div>
 
-        <pre style="${preStyle}">${escapeHtml(g.new_full || "(empty)")}</pre>
+        <pre style="${preStyle}">${escapeHtml(g2.new_full || "(empty)")}</pre>
 
       </div>
 
@@ -6189,17 +6322,17 @@ ${n.tags || ""}`.toLowerCase();
     });
     let historyHtml = "";
     if (history2 && history2.length) {
-      const rows = [...history2].reverse().map((v, idx) => {
+      const rows = [...history2].reverse().map((v3, idx) => {
         const id = `gv-expand-${projectId}-${idx}`;
-        const raw = (v.version_goal || v.north_star || "").replace(/\s+/g, " ").trim();
+        const raw = (v3.version_goal || v3.north_star || "").replace(/\s+/g, " ").trim();
         const snippet = raw.length > 80 ? raw.slice(0, 79) + "\u2026" : raw;
         return `<div style="border-left:2px solid var(--border);padding-left:8px;margin-bottom:4px">
 
         <div style="cursor:pointer;user-select:none" onclick="toggleExpand('${id}')" title="${escapeHtml(raw)}">
 
-          <span style="color:var(--accent)">v${v.version}</span>
+          <span style="color:var(--accent)">v${v3.version}</span>
 
-          <span style="color:var(--muted);font-size:10px"> \xB7 ${escapeHtml(v.created_at || "")}</span>
+          <span style="color:var(--muted);font-size:10px"> \xB7 ${escapeHtml(v3.created_at || "")}</span>
 
           <span> ${escapeHtml(snippet)}</span>
 
@@ -6211,15 +6344,15 @@ ${n.tags || ""}`.toLowerCase();
 
           <div style="color:var(--muted);font-size:10px;margin-bottom:2px">north_star:</div>
 
-          <pre style="${preStyle};margin-bottom:6px">${escapeHtml(v.north_star || "(empty)")}</pre>
+          <pre style="${preStyle};margin-bottom:6px">${escapeHtml(v3.north_star || "(empty)")}</pre>
 
           <div style="color:var(--muted);font-size:10px;margin-bottom:2px">version_goal:</div>
 
-          <pre style="${preStyle};margin-bottom:6px">${escapeHtml(v.version_goal || "(empty)")}</pre>
+          <pre style="${preStyle};margin-bottom:6px">${escapeHtml(v3.version_goal || "(empty)")}</pre>
 
           <div style="color:var(--muted);font-size:10px;margin-bottom:2px">sprint:</div>
 
-          <pre style="${preStyle}">${escapeHtml(v.sprint || "(empty)")}</pre>
+          <pre style="${preStyle}">${escapeHtml(v3.sprint || "(empty)")}</pre>
 
         </div>
 
@@ -6236,34 +6369,616 @@ ${n.tags || ""}`.toLowerCase();
     return goals + historyHtml;
   }
   async function copyRewindLink(projectId) {
-    const p = window.state.panels[projectId];
-    const days = p && p.rewindDays || 7;
+    const p3 = window.state.panels[projectId];
+    const days = p3 && p3.rewindDays || 7;
     try {
       const res = await api(`/projects/${projectId}/rewind-token`, { method: "POST" });
       let base = "";
       try {
         const cfg = await api("/config");
         base = cfg.server_url || window.location.origin;
-      } catch (_) {
+      } catch (_2) {
         base = window.location.origin;
       }
       const url = `${base}/projects/${projectId}/rewind?days=${days}&token=${encodeURIComponent(res.token)}`;
       try {
         await navigator.clipboard.writeText(url);
         toast("shareable link copied");
-      } catch (_) {
+      } catch (_2) {
         window.prompt("copy this URL", url);
       }
-    } catch (e) {
-      toast("share failed: " + e.message);
+    } catch (e3) {
+      toast("share failed: " + e3.message);
     }
   }
   try {
     Object.assign(window, { initRewindTab: initRewindTab2, loadRewindTab: loadRewindTab2, renderRewindSubtabs, renderRewindCharts, initRewindCharts, renderRewindSprint, _rewindSec, renderRewindActivity, renderRewindVersions, renderRewindGoals, copyRewindLink });
-  } catch (e) {
+  } catch (e3) {
   }
 
-  // meridian/static/dashboard.js
+  // node_modules/preact/dist/preact.module.js
+  var n;
+  var l;
+  var u;
+  var t;
+  var i;
+  var r;
+  var o;
+  var e;
+  var f;
+  var c;
+  var a;
+  var s;
+  var h;
+  var p;
+  var v;
+  var y;
+  var d = {};
+  var w = [];
+  var _ = /acit|ex(?:s|g|n|p|$)|rph|grid|ows|mnc|ntw|ine[ch]|zoo|^ord|itera/i;
+  var g = Array.isArray;
+  function m(n2, l3) {
+    for (var u4 in l3) n2[u4] = l3[u4];
+    return n2;
+  }
+  function b(n2) {
+    n2 && n2.parentNode && n2.parentNode.removeChild(n2);
+  }
+  function k(l3, u4, t3) {
+    var i3, r3, o3, e3 = {};
+    for (o3 in u4) "key" == o3 ? i3 = u4[o3] : "ref" == o3 ? r3 = u4[o3] : e3[o3] = u4[o3];
+    if (arguments.length > 2 && (e3.children = arguments.length > 3 ? n.call(arguments, 2) : t3), "function" == typeof l3 && null != l3.defaultProps) for (o3 in l3.defaultProps) void 0 === e3[o3] && (e3[o3] = l3.defaultProps[o3]);
+    return x(l3, e3, i3, r3, null);
+  }
+  function x(n2, t3, i3, r3, o3) {
+    var e3 = { type: n2, props: t3, key: i3, ref: r3, __k: null, __: null, __b: 0, __e: null, __c: null, constructor: void 0, __v: null == o3 ? ++u : o3, __i: -1, __u: 0 };
+    return null == o3 && null != l.vnode && l.vnode(e3), e3;
+  }
+  function S(n2) {
+    return n2.children;
+  }
+  function C(n2, l3) {
+    this.props = n2, this.context = l3;
+  }
+  function $(n2, l3) {
+    if (null == l3) return n2.__ ? $(n2.__, n2.__i + 1) : null;
+    for (var u4; l3 < n2.__k.length; l3++) if (null != (u4 = n2.__k[l3]) && null != u4.__e) return u4.__e;
+    return "function" == typeof n2.type ? $(n2) : null;
+  }
+  function I(n2) {
+    if (n2.__P && n2.__d) {
+      var u4 = n2.__v, t3 = u4.__e, i3 = [], r3 = [], o3 = m({}, u4);
+      o3.__v = u4.__v + 1, l.vnode && l.vnode(o3), q(n2.__P, o3, u4, n2.__n, n2.__P.namespaceURI, 32 & u4.__u ? [t3] : null, i3, null == t3 ? $(u4) : t3, !!(32 & u4.__u), r3), o3.__v = u4.__v, o3.__.__k[o3.__i] = o3, D(i3, o3, r3), u4.__e = u4.__ = null, o3.__e != t3 && P(o3);
+    }
+  }
+  function P(n2) {
+    if (null != (n2 = n2.__) && null != n2.__c) return n2.__e = n2.__c.base = null, n2.__k.some(function(l3) {
+      if (null != l3 && null != l3.__e) return n2.__e = n2.__c.base = l3.__e;
+    }), P(n2);
+  }
+  function A(n2) {
+    (!n2.__d && (n2.__d = true) && i.push(n2) && !H.__r++ || r != l.debounceRendering) && ((r = l.debounceRendering) || o)(H);
+  }
+  function H() {
+    try {
+      for (var n2, l3 = 1; i.length; ) i.length > l3 && i.sort(e), n2 = i.shift(), l3 = i.length, I(n2);
+    } finally {
+      i.length = H.__r = 0;
+    }
+  }
+  function L(n2, l3, u4, t3, i3, r3, o3, e3, f4, c3, a3) {
+    var s3, h2, p3, v3, y3, _2, g2, m3 = t3 && t3.__k || w, b2 = l3.length;
+    for (f4 = T(u4, l3, m3, f4, b2), s3 = 0; s3 < b2; s3++) null != (p3 = u4.__k[s3]) && (h2 = -1 != p3.__i && m3[p3.__i] || d, p3.__i = s3, _2 = q(n2, p3, h2, i3, r3, o3, e3, f4, c3, a3), v3 = p3.__e, p3.ref && h2.ref != p3.ref && (h2.ref && J(h2.ref, null, p3), a3.push(p3.ref, p3.__c || v3, p3)), null == y3 && null != v3 && (y3 = v3), (g2 = !!(4 & p3.__u)) || h2.__k === p3.__k ? (f4 = j(p3, f4, n2, g2), g2 && h2.__e && (h2.__e = null)) : "function" == typeof p3.type && void 0 !== _2 ? f4 = _2 : v3 && (f4 = v3.nextSibling), p3.__u &= -7);
+    return u4.__e = y3, f4;
+  }
+  function T(n2, l3, u4, t3, i3) {
+    var r3, o3, e3, f4, c3, a3 = u4.length, s3 = a3, h2 = 0;
+    for (n2.__k = new Array(i3), r3 = 0; r3 < i3; r3++) null != (o3 = l3[r3]) && "boolean" != typeof o3 && "function" != typeof o3 ? ("string" == typeof o3 || "number" == typeof o3 || "bigint" == typeof o3 || o3.constructor == String ? o3 = n2.__k[r3] = x(null, o3, null, null, null) : g(o3) ? o3 = n2.__k[r3] = x(S, { children: o3 }, null, null, null) : void 0 === o3.constructor && o3.__b > 0 ? o3 = n2.__k[r3] = x(o3.type, o3.props, o3.key, o3.ref ? o3.ref : null, o3.__v) : n2.__k[r3] = o3, f4 = r3 + h2, o3.__ = n2, o3.__b = n2.__b + 1, e3 = null, -1 != (c3 = o3.__i = O(o3, u4, f4, s3)) && (s3--, (e3 = u4[c3]) && (e3.__u |= 2)), null == e3 || null == e3.__v ? (-1 == c3 && (i3 > a3 ? h2-- : i3 < a3 && h2++), "function" != typeof o3.type && (o3.__u |= 4)) : c3 != f4 && (c3 == f4 - 1 ? h2-- : c3 == f4 + 1 ? h2++ : (c3 > f4 ? h2-- : h2++, o3.__u |= 4))) : n2.__k[r3] = null;
+    if (s3) for (r3 = 0; r3 < a3; r3++) null != (e3 = u4[r3]) && 0 == (2 & e3.__u) && (e3.__e == t3 && (t3 = $(e3)), K(e3, e3));
+    return t3;
+  }
+  function j(n2, l3, u4, t3) {
+    var i3, r3;
+    if ("function" == typeof n2.type) {
+      for (i3 = n2.__k, r3 = 0; i3 && r3 < i3.length; r3++) i3[r3] && (i3[r3].__ = n2, l3 = j(i3[r3], l3, u4, t3));
+      return l3;
+    }
+    n2.__e != l3 && (t3 && (l3 && n2.type && !l3.parentNode && (l3 = $(n2)), u4.insertBefore(n2.__e, l3 || null)), l3 = n2.__e);
+    do {
+      l3 = l3 && l3.nextSibling;
+    } while (null != l3 && 8 == l3.nodeType);
+    return l3;
+  }
+  function O(n2, l3, u4, t3) {
+    var i3, r3, o3, e3 = n2.key, f4 = n2.type, c3 = l3[u4], a3 = null != c3 && 0 == (2 & c3.__u);
+    if (null === c3 && null == e3 || a3 && e3 == c3.key && f4 == c3.type) return u4;
+    if (t3 > (a3 ? 1 : 0)) {
+      for (i3 = u4 - 1, r3 = u4 + 1; i3 >= 0 || r3 < l3.length; ) if (null != (c3 = l3[o3 = i3 >= 0 ? i3-- : r3++]) && 0 == (2 & c3.__u) && e3 == c3.key && f4 == c3.type) return o3;
+    }
+    return -1;
+  }
+  function z(n2, l3, u4) {
+    "-" == l3[0] ? n2.setProperty(l3, null == u4 ? "" : u4) : n2[l3] = null == u4 ? "" : "number" != typeof u4 || _.test(l3) ? u4 : u4 + "px";
+  }
+  function N(n2, l3, u4, t3, i3) {
+    var r3, o3;
+    n: if ("style" == l3) if ("string" == typeof u4) n2.style.cssText = u4;
+    else {
+      if ("string" == typeof t3 && (n2.style.cssText = t3 = ""), t3) for (l3 in t3) u4 && l3 in u4 || z(n2.style, l3, "");
+      if (u4) for (l3 in u4) t3 && u4[l3] == t3[l3] || z(n2.style, l3, u4[l3]);
+    }
+    else if ("o" == l3[0] && "n" == l3[1]) r3 = l3 != (l3 = l3.replace(s, "$1")), o3 = l3.toLowerCase(), l3 = o3 in n2 || "onFocusOut" == l3 || "onFocusIn" == l3 ? o3.slice(2) : l3.slice(2), n2.l || (n2.l = {}), n2.l[l3 + r3] = u4, u4 ? t3 ? u4[a] = t3[a] : (u4[a] = h, n2.addEventListener(l3, r3 ? v : p, r3)) : n2.removeEventListener(l3, r3 ? v : p, r3);
+    else {
+      if ("http://www.w3.org/2000/svg" == i3) l3 = l3.replace(/xlink(H|:h)/, "h").replace(/sName$/, "s");
+      else if ("width" != l3 && "height" != l3 && "href" != l3 && "list" != l3 && "form" != l3 && "tabIndex" != l3 && "download" != l3 && "rowSpan" != l3 && "colSpan" != l3 && "role" != l3 && "popover" != l3 && l3 in n2) try {
+        n2[l3] = null == u4 ? "" : u4;
+        break n;
+      } catch (n3) {
+      }
+      "function" == typeof u4 || (null == u4 || false === u4 && "-" != l3[4] ? n2.removeAttribute(l3) : n2.setAttribute(l3, "popover" == l3 && 1 == u4 ? "" : u4));
+    }
+  }
+  function V(n2) {
+    return function(u4) {
+      if (this.l) {
+        var t3 = this.l[u4.type + n2];
+        if (null == u4[c]) u4[c] = h++;
+        else if (u4[c] < t3[a]) return;
+        return t3(l.event ? l.event(u4) : u4);
+      }
+    };
+  }
+  function q(n2, u4, t3, i3, r3, o3, e3, f4, c3, a3) {
+    var s3, h2, p3, v3, y3, d3, _2, k3, x2, M, $2, I2, P2, A2, H2, T2, j3 = u4.type;
+    if (void 0 !== u4.constructor) return null;
+    128 & t3.__u && (c3 = !!(32 & t3.__u), o3 = [f4 = u4.__e = t3.__e]), (s3 = l.__b) && s3(u4);
+    n: if ("function" == typeof j3) {
+      h2 = e3.length;
+      try {
+        if (x2 = u4.props, M = j3.prototype && j3.prototype.render, $2 = (s3 = j3.contextType) && i3[s3.__c], I2 = s3 ? $2 ? $2.props.value : s3.__ : i3, t3.__c ? k3 = (p3 = u4.__c = t3.__c).__ = p3.__E : (M ? u4.__c = p3 = new j3(x2, I2) : (u4.__c = p3 = new C(x2, I2), p3.constructor = j3, p3.render = Q), $2 && $2.sub(p3), p3.state || (p3.state = {}), p3.__n = i3, v3 = p3.__d = true, p3.__h = [], p3._sb = []), M && null == p3.__s && (p3.__s = p3.state), M && null != j3.getDerivedStateFromProps && (p3.__s == p3.state && (p3.__s = m({}, p3.__s)), m(p3.__s, j3.getDerivedStateFromProps(x2, p3.__s))), y3 = p3.props, d3 = p3.state, p3.__v = u4, v3) M && null == j3.getDerivedStateFromProps && null != p3.componentWillMount && p3.componentWillMount(), M && null != p3.componentDidMount && p3.__h.push(p3.componentDidMount);
+        else {
+          if (M && null == j3.getDerivedStateFromProps && x2 !== y3 && null != p3.componentWillReceiveProps && p3.componentWillReceiveProps(x2, I2), u4.__v == t3.__v || !p3.__e && null != p3.shouldComponentUpdate && false === p3.shouldComponentUpdate(x2, p3.__s, I2)) {
+            u4.__v != t3.__v && (p3.props = x2, p3.state = p3.__s, p3.__d = false), u4.__e = t3.__e, u4.__k = t3.__k, u4.__k.some(function(n3) {
+              n3 && (n3.__ = u4);
+            }), w.push.apply(p3.__h, p3._sb), p3._sb = [], p3.__h.length && e3.push(p3);
+            break n;
+          }
+          null != p3.componentWillUpdate && p3.componentWillUpdate(x2, p3.__s, I2), M && null != p3.componentDidUpdate && p3.__h.push(function() {
+            p3.componentDidUpdate(y3, d3, _2);
+          });
+        }
+        if (p3.context = I2, p3.props = x2, p3.__P = n2, p3.__e = false, P2 = l.__r, A2 = 0, M) p3.state = p3.__s, p3.__d = false, P2 && P2(u4), s3 = p3.render(p3.props, p3.state, p3.context), w.push.apply(p3.__h, p3._sb), p3._sb = [];
+        else do {
+          p3.__d = false, P2 && P2(u4), s3 = p3.render(p3.props, p3.state, p3.context), p3.state = p3.__s;
+        } while (p3.__d && ++A2 < 25);
+        p3.state = p3.__s, null != p3.getChildContext && (i3 = m(m({}, i3), p3.getChildContext())), M && !v3 && null != p3.getSnapshotBeforeUpdate && (_2 = p3.getSnapshotBeforeUpdate(y3, d3)), H2 = null != s3 && s3.type === S && null == s3.key ? E(s3.props.children) : s3, f4 = L(n2, g(H2) ? H2 : [H2], u4, t3, i3, r3, o3, e3, f4, c3, a3), p3.base = u4.__e, u4.__u &= -161, p3.__h.length && e3.push(p3), k3 && (p3.__E = p3.__ = null);
+      } catch (n3) {
+        if (e3.length = h2, u4.__v = null, c3 || null != o3) if (n3.then) {
+          for (u4.__u |= c3 ? 160 : 128; f4 && 8 == f4.nodeType && f4.nextSibling; ) f4 = f4.nextSibling;
+          null != o3 && (o3[o3.indexOf(f4)] = null), u4.__e = f4;
+        } else {
+          if (null != o3) for (T2 = o3.length; T2--; ) b(o3[T2]);
+          B(u4);
+        }
+        else u4.__e = t3.__e, !u4.__k && t3.__k && (u4.__k = t3.__k), n3.then || B(u4);
+        l.__e(n3, u4, t3);
+      }
+    } else null == o3 && u4.__v == t3.__v ? (u4.__k = t3.__k, u4.__e = t3.__e) : f4 = u4.__e = G(t3.__e, u4, t3, i3, r3, o3, e3, c3, a3);
+    return (s3 = l.diffed) && s3(u4), 128 & u4.__u ? void 0 : f4;
+  }
+  function B(n2) {
+    n2 && (n2.__c && (n2.__c.__e = true), n2.__k && n2.__k.some(B));
+  }
+  function D(n2, u4, t3) {
+    for (var i3 = 0; i3 < t3.length; i3++) J(t3[i3], t3[++i3], t3[++i3]);
+    l.__c && l.__c(u4, n2), n2.some(function(u5) {
+      try {
+        n2 = u5.__h, u5.__h = [], n2.some(function(n3) {
+          n3.call(u5);
+        });
+      } catch (n3) {
+        l.__e(n3, u5.__v);
+      }
+    });
+  }
+  function E(n2) {
+    return "object" != typeof n2 || null == n2 || n2.__b > 0 ? n2 : g(n2) ? n2.map(E) : void 0 !== n2.constructor ? null : m({}, n2);
+  }
+  function G(u4, t3, i3, r3, o3, e3, f4, c3, a3) {
+    var s3, h2, p3, v3, y3, w3, _2, m3 = i3.props || d, k3 = t3.props, x2 = t3.type;
+    if ("svg" == x2 ? o3 = "http://www.w3.org/2000/svg" : "math" == x2 ? o3 = "http://www.w3.org/1998/Math/MathML" : o3 || (o3 = "http://www.w3.org/1999/xhtml"), null != e3) {
+      for (s3 = 0; s3 < e3.length; s3++) if ((y3 = e3[s3]) && "setAttribute" in y3 == !!x2 && (x2 ? y3.localName == x2 : 3 == y3.nodeType)) {
+        u4 = y3, e3[s3] = null;
+        break;
+      }
+    }
+    if (null == u4) {
+      if (null == x2) return document.createTextNode(k3);
+      u4 = document.createElementNS(o3, x2, k3.is && k3), c3 && (l.__m && l.__m(t3, e3), c3 = false), e3 = null;
+    }
+    if (null == x2) m3 === k3 || c3 && u4.data == k3 || (u4.data = k3);
+    else {
+      if (e3 = "textarea" == x2 && null != k3.defaultValue ? null : e3 && n.call(u4.childNodes), !c3 && null != e3) for (m3 = {}, s3 = 0; s3 < u4.attributes.length; s3++) m3[(y3 = u4.attributes[s3]).name] = y3.value;
+      for (s3 in m3) y3 = m3[s3], "dangerouslySetInnerHTML" == s3 ? p3 = y3 : "children" == s3 || s3 in k3 || "value" == s3 && "defaultValue" in k3 || "checked" == s3 && "defaultChecked" in k3 || N(u4, s3, null, y3, o3);
+      for (s3 in k3) y3 = k3[s3], "children" == s3 ? v3 = y3 : "dangerouslySetInnerHTML" == s3 ? h2 = y3 : "value" == s3 ? w3 = y3 : "checked" == s3 ? _2 = y3 : c3 && "function" != typeof y3 || m3[s3] === y3 || N(u4, s3, y3, m3[s3], o3);
+      if (h2) c3 || p3 && (h2.__html == p3.__html || h2.__html == u4.innerHTML) || (u4.innerHTML = h2.__html), t3.__k = [];
+      else if (p3 && (u4.innerHTML = ""), L("template" == t3.type ? u4.content : u4, g(v3) ? v3 : [v3], t3, i3, r3, "foreignObject" == x2 ? "http://www.w3.org/1999/xhtml" : o3, e3, f4, e3 ? e3[0] : i3.__k && $(i3, 0), c3, a3), null != e3) for (s3 = e3.length; s3--; ) b(e3[s3]);
+      c3 && "textarea" != x2 || (s3 = "value", "progress" == x2 && null == w3 ? u4.removeAttribute("value") : null != w3 && (w3 !== u4[s3] || "progress" == x2 && !w3 || "option" == x2 && w3 != m3[s3]) && N(u4, s3, w3, m3[s3], o3), s3 = "checked", null != _2 && _2 != u4[s3] && N(u4, s3, _2, m3[s3], o3));
+    }
+    return u4;
+  }
+  function J(n2, u4, t3) {
+    try {
+      if ("function" == typeof n2) {
+        var i3 = "function" == typeof n2.__u;
+        i3 && n2.__u(), i3 && null == u4 || (n2.__u = n2(u4));
+      } else n2.current = u4;
+    } catch (n3) {
+      l.__e(n3, t3);
+    }
+  }
+  function K(n2, u4, t3) {
+    var i3, r3;
+    if (l.unmount && l.unmount(n2), (i3 = n2.ref) && (i3.current && i3.current != n2.__e || J(i3, null, u4)), null != (i3 = n2.__c)) {
+      if (i3.componentWillUnmount) try {
+        i3.componentWillUnmount();
+      } catch (n3) {
+        l.__e(n3, u4);
+      }
+      i3.base = i3.__P = i3.__n = null;
+    }
+    if (i3 = n2.__k) for (r3 = 0; r3 < i3.length; r3++) i3[r3] && K(i3[r3], u4, t3 || "function" != typeof n2.type);
+    t3 || b(n2.__e), n2.__c = n2.__ = n2.__e = void 0;
+  }
+  function Q(n2, l3, u4) {
+    return this.constructor(n2, u4);
+  }
+  function R(u4, t3, i3) {
+    var r3, o3, e3, f4;
+    t3 == document && (t3 = document.documentElement), l.__ && l.__(u4, t3), o3 = (r3 = "function" == typeof i3) ? null : i3 && i3.__k || t3.__k, e3 = [], f4 = [], q(t3, u4 = (!r3 && i3 || t3).__k = k(S, null, [u4]), o3 || d, d, t3.namespaceURI, !r3 && i3 ? [i3] : o3 ? null : t3.firstChild ? n.call(t3.childNodes) : null, e3, !r3 && i3 ? i3 : o3 ? o3.__e : t3.firstChild, r3, f4), D(e3, u4, f4), u4.props.children = null;
+  }
+  n = w.slice, l = { __e: function(n2, l3, u4, t3) {
+    for (var i3, r3, o3; l3 = l3.__; ) if ((i3 = l3.__c) && !i3.__) try {
+      if ((r3 = i3.constructor) && null != r3.getDerivedStateFromError && (i3.setState(r3.getDerivedStateFromError(n2)), o3 = i3.__d), null != i3.componentDidCatch && (i3.componentDidCatch(n2, t3 || {}), o3 = i3.__d), o3) return i3.__E = i3;
+    } catch (l4) {
+      n2 = l4;
+    }
+    throw n2;
+  } }, u = 0, t = function(n2) {
+    return null != n2 && void 0 === n2.constructor;
+  }, C.prototype.setState = function(n2, l3) {
+    var u4;
+    u4 = null != this.__s && this.__s != this.state ? this.__s : this.__s = m({}, this.state), "function" == typeof n2 && (n2 = n2(m({}, u4), this.props)), n2 && m(u4, n2), null != n2 && this.__v && (l3 && this._sb.push(l3), A(this));
+  }, C.prototype.forceUpdate = function(n2) {
+    this.__v && (this.__e = true, n2 && this.__h.push(n2), A(this));
+  }, C.prototype.render = S, i = [], o = "function" == typeof Promise ? Promise.prototype.then.bind(Promise.resolve()) : setTimeout, e = function(n2, l3) {
+    return n2.__v.__b - l3.__v.__b;
+  }, H.__r = 0, f = Math.random().toString(8), c = "__d" + f, a = "__a" + f, s = /(PointerCapture)$|Capture$/i, h = 0, p = V(false), v = V(true), y = 0;
+
+  // node_modules/preact/hooks/dist/hooks.module.js
+  var t2;
+  var r2;
+  var u2;
+  var i2;
+  var o2 = 0;
+  var f2 = [];
+  var c2 = l;
+  var e2 = c2.__b;
+  var a2 = c2.__r;
+  var v2 = c2.diffed;
+  var l2 = c2.__c;
+  var m2 = c2.unmount;
+  var p2 = c2.__;
+  function s2(n2, t3) {
+    c2.__h && c2.__h(r2, n2, o2 || t3), o2 = 0;
+    var u4 = r2.__H || (r2.__H = { __: [], __h: [] });
+    return n2 >= u4.__.length && u4.__.push({}), u4.__[n2];
+  }
+  function d2(n2) {
+    return o2 = 1, y2(D2, n2);
+  }
+  function y2(n2, u4, i3) {
+    var o3 = s2(t2++, 2);
+    if (o3.t = n2, !o3.__c && (o3.__ = [i3 ? i3(u4) : D2(void 0, u4), function(n3) {
+      var t3 = o3.__N ? o3.__N[0] : o3.__[0], r3 = o3.t(t3, n3);
+      t3 !== r3 && (o3.__N = [r3, o3.__[1]], o3.__c.setState({}));
+    }], o3.__c = r2, !r2.__f)) {
+      var f4 = function(n3, t3, r3) {
+        if (!o3.__c.__H) return true;
+        var u5 = false, i4 = o3.__c.props !== n3;
+        if (o3.__c.__H.__.some(function(n4) {
+          if (n4.__N) {
+            u5 = true;
+            var t4 = n4.__[0];
+            n4.__ = n4.__N, n4.__N = void 0, t4 !== n4.__[0] && (i4 = true);
+          }
+        }), c3) {
+          var f5 = c3.call(this, n3, t3, r3);
+          return u5 ? f5 || i4 : f5;
+        }
+        return !u5 || i4;
+      };
+      r2.__f = true;
+      var c3 = r2.shouldComponentUpdate, e3 = r2.componentWillUpdate;
+      r2.componentWillUpdate = function(n3, t3, r3) {
+        if (this.__e) {
+          var u5 = c3;
+          c3 = void 0, f4(n3, t3, r3), c3 = u5;
+        }
+        e3 && e3.call(this, n3, t3, r3);
+      }, r2.shouldComponentUpdate = f4;
+    }
+    return o3.__N || o3.__;
+  }
+  function j2() {
+    for (var n2; n2 = f2.shift(); ) {
+      var t3 = n2.__H;
+      if (n2.__P && t3) try {
+        t3.__h.some(z2), t3.__h.some(B2), t3.__h = [];
+      } catch (r3) {
+        t3.__h = [], c2.__e(r3, n2.__v);
+      }
+    }
+  }
+  c2.__b = function(n2) {
+    r2 = null, e2 && e2(n2);
+  }, c2.__ = function(n2, t3) {
+    n2 && t3.__k && t3.__k.__m && (n2.__m = t3.__k.__m), p2 && p2(n2, t3);
+  }, c2.__r = function(n2) {
+    a2 && a2(n2), t2 = 0;
+    var i3 = (r2 = n2.__c).__H;
+    i3 && (u2 === r2 ? (i3.__h = [], r2.__h = [], i3.__.some(function(n3) {
+      n3.__N && (n3.__ = n3.__N), n3.u = n3.__N = void 0;
+    })) : (i3.__h.length && j2(), t2 = 0)), u2 = r2;
+  }, c2.diffed = function(n2) {
+    v2 && v2(n2);
+    var t3 = n2.__c;
+    t3 && t3.__H && (t3.__H.__h.length && (1 !== f2.push(t3) && i2 === c2.requestAnimationFrame || ((i2 = c2.requestAnimationFrame) || w2)(j2)), t3.__H.__.some(function(n3) {
+      n3.u && (n3.__H = n3.u, n3.u = void 0);
+    })), u2 = r2 = null;
+  }, c2.__c = function(n2, t3) {
+    t3.some(function(n3) {
+      try {
+        n3.__h.some(z2), n3.__h = n3.__h.filter(function(n4) {
+          return !n4.__ || B2(n4);
+        });
+      } catch (r3) {
+        t3.some(function(n4) {
+          n4.__h && (n4.__h = []);
+        }), t3 = [], c2.__e(r3, n3.__v);
+      }
+    }), l2 && l2(n2, t3);
+  }, c2.unmount = function(n2) {
+    m2 && m2(n2);
+    var t3, r3 = n2.__c;
+    r3 && r3.__H && (r3.__H.__.some(function(n3) {
+      try {
+        z2(n3);
+      } catch (n4) {
+        t3 = n4;
+      }
+    }), r3.__H = void 0, t3 && c2.__e(t3, r3.__v));
+  };
+  var k2 = "function" == typeof requestAnimationFrame;
+  function w2(n2) {
+    var t3, r3 = function() {
+      clearTimeout(u4), k2 && cancelAnimationFrame(t3), setTimeout(n2);
+    }, u4 = setTimeout(r3, 35);
+    k2 && (t3 = requestAnimationFrame(r3));
+  }
+  function z2(n2) {
+    var t3 = r2, u4 = n2.__c;
+    "function" == typeof u4 && (n2.__c = void 0, u4()), r2 = t3;
+  }
+  function B2(n2) {
+    var t3 = r2;
+    n2.__c = n2.__(), r2 = t3;
+  }
+  function D2(n2, t3) {
+    return "function" == typeof t3 ? t3(n2) : t3;
+  }
+
+  // node_modules/preact/jsx-runtime/dist/jsxRuntime.module.js
+  var f3 = 0;
+  function u3(e3, t3, n2, o3, i3, u4) {
+    t3 || (t3 = {});
+    var a3, c3, p3 = t3;
+    if ("ref" in p3) for (c3 in p3 = {}, t3) "ref" == c3 ? a3 = t3[c3] : p3[c3] = t3[c3];
+    var l3 = { type: e3, props: p3, key: n2, ref: a3, __k: null, __: null, __b: 0, __e: null, __c: null, constructor: void 0, __v: --f3, __i: -1, __u: 0, __source: i3, __self: u4 };
+    if ("function" == typeof e3 && (a3 = e3.defaultProps)) for (c3 in a3) void 0 === p3[c3] && (p3[c3] = a3[c3]);
+    return l.vnode && l.vnode(l3), l3;
+  }
+
+  // meridian/static/components/CodeIntelPanel.tsx
+  var PALETTE = ["#7dd3fc", "#a78bfa", "#34d399", "#fbbf24", "#fb7185", "#60a5fa", "#f472b6"];
+  function buildLayers(arch) {
+    const packages = arch && Array.isArray(arch.packages) ? arch.packages.filter((p3) => !!p3 && !!p3.name) : [];
+    if (!packages.length) return [];
+    const byRank = /* @__PURE__ */ new Map();
+    for (const p3 of packages) {
+      const key = String(p3.layer ?? "other");
+      const bucket = byRank.get(key);
+      if (bucket) bucket.push(p3);
+      else byRank.set(key, [p3]);
+    }
+    const ranks = Array.from(byRank.keys()).sort((a3, b2) => {
+      const na = Number(a3);
+      const nb = Number(b2);
+      const aNum = a3 !== "" && !Number.isNaN(na);
+      const bNum = b2 !== "" && !Number.isNaN(nb);
+      if (aNum && bNum) return nb - na;
+      if (aNum) return -1;
+      if (bNum) return 1;
+      return a3.localeCompare(b2);
+    });
+    return ranks.map((rank) => ({
+      rank,
+      label: labelForRank(arch, rank),
+      packages: byRank.get(rank).slice().sort((a3, b2) => (b2.node_count ?? 0) - (a3.node_count ?? 0))
+    }));
+  }
+  function labelForRank(arch, rank) {
+    const named = arch && Array.isArray(arch.layers) ? arch.layers.find((l3) => l3 && String(l3.layer) === rank && l3.name) : null;
+    if (named && named.name) return `${named.name} \xB7 layer ${rank}`;
+    return rank === "other" ? "unlayered" : `layer ${rank}`;
+  }
+  function CodeIntelPanel(props) {
+    const { status, error, architecture, onGenerateMap } = props;
+    const [zoom, setZoom] = d2(1);
+    const [mapStatus, setMapStatus] = d2("idle");
+    const [mapUrl, setMapUrl] = d2("");
+    const [mapError, setMapError] = d2("");
+    if (status === "loading") {
+      return /* @__PURE__ */ u3("div", { class: "ci-state ci-loading", role: "status", style: STATE_STYLE, children: "Loading code intelligence\u2026" });
+    }
+    if (status === "error") {
+      return /* @__PURE__ */ u3("div", { class: "ci-state ci-error", role: "alert", style: { ...STATE_STYLE, color: "var(--error,#ef4444)" }, children: [
+        "Failed to load code intelligence: ",
+        error || "unknown error"
+      ] });
+    }
+    const layers = buildLayers(architecture);
+    const hasGraph = layers.length > 0;
+    async function handleGenerate() {
+      if (!onGenerateMap) return;
+      setMapStatus("loading");
+      setMapError("");
+      try {
+        const url = await onGenerateMap();
+        setMapUrl(url);
+        setMapStatus("ready");
+      } catch (e3) {
+        setMapError(e3 instanceof Error ? e3.message : String(e3));
+        setMapStatus("error");
+      }
+    }
+    return /* @__PURE__ */ u3("div", { class: "ci-panel", children: [
+      /* @__PURE__ */ u3(
+        "div",
+        {
+          class: "ci-toolbar",
+          style: { display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: "6px" },
+          children: [
+            /* @__PURE__ */ u3(
+              "span",
+              {
+                class: "ci-title",
+                style: { fontSize: "10px", color: "var(--accent)", textTransform: "uppercase", letterSpacing: ".06em" },
+                children: "Package Graph"
+              }
+            ),
+            /* @__PURE__ */ u3("div", { class: "ci-controls", style: { display: "flex", gap: "4px", alignItems: "center" }, children: [
+              /* @__PURE__ */ u3(
+                "button",
+                {
+                  class: "ci-zoom-out",
+                  "aria-label": "Zoom out",
+                  onClick: () => setZoom((z3) => Math.max(0.5, +(z3 - 0.1).toFixed(2))),
+                  style: CTRL_STYLE,
+                  children: "\u2212"
+                }
+              ),
+              /* @__PURE__ */ u3("span", { class: "ci-zoom-label", style: { fontSize: "9px", color: "var(--muted)", minWidth: "30px", textAlign: "center" }, children: [
+                Math.round(zoom * 100),
+                "%"
+              ] }),
+              /* @__PURE__ */ u3(
+                "button",
+                {
+                  class: "ci-zoom-in",
+                  "aria-label": "Zoom in",
+                  onClick: () => setZoom((z3) => Math.min(2, +(z3 + 0.1).toFixed(2))),
+                  style: CTRL_STYLE,
+                  children: "+"
+                }
+              ),
+              onGenerateMap ? /* @__PURE__ */ u3(
+                "button",
+                {
+                  class: "ci-genmap",
+                  disabled: mapStatus === "loading",
+                  onClick: handleGenerate,
+                  title: "Render a static PNG map via Graphviz",
+                  style: CTRL_STYLE,
+                  children: mapStatus === "loading" ? "Generating\u2026" : "Generate Map"
+                }
+              ) : null
+            ] })
+          ]
+        }
+      ),
+      hasGraph ? /* @__PURE__ */ u3(
+        "div",
+        {
+          class: "ci-dag",
+          style: {
+            width: "100%",
+            background: "var(--surface-1)",
+            border: "1px solid var(--border)",
+            borderRadius: "4px",
+            padding: "10px",
+            overflow: "auto"
+          },
+          children: /* @__PURE__ */ u3("div", { style: { transform: `scale(${zoom})`, transformOrigin: "top left", display: "flex", flexDirection: "column", gap: "10px" }, children: layers.map((layer, i3) => /* @__PURE__ */ u3("div", { class: "ci-layer", style: { display: "flex", alignItems: "center", gap: "8px" }, children: [
+            /* @__PURE__ */ u3(
+              "div",
+              {
+                class: "ci-layer-label",
+                style: { width: "120px", flexShrink: 0, fontSize: "9px", color: "var(--muted)", textAlign: "right", fontFamily: "var(--font-mono)" },
+                children: layer.label
+              }
+            ),
+            /* @__PURE__ */ u3("div", { class: "ci-layer-nodes", style: { display: "flex", flexWrap: "wrap", gap: "6px", flex: 1, borderLeft: "2px solid var(--border)", paddingLeft: "8px" }, children: layer.packages.map((p3) => /* @__PURE__ */ u3(
+              "div",
+              {
+                class: "ci-node",
+                title: `${p3.name} \xB7 ${p3.node_count ?? 0} nodes`,
+                style: {
+                  display: "flex",
+                  alignItems: "center",
+                  gap: "5px",
+                  background: "var(--surface-2)",
+                  border: `1px solid ${PALETTE[i3 % PALETTE.length]}55`,
+                  borderLeft: `3px solid ${PALETTE[i3 % PALETTE.length]}`,
+                  borderRadius: "3px",
+                  padding: "3px 7px",
+                  fontSize: "10px",
+                  color: "var(--text)",
+                  fontFamily: "var(--font-mono)"
+                },
+                children: [
+                  /* @__PURE__ */ u3("span", { class: "ci-node-name", children: p3.name }),
+                  /* @__PURE__ */ u3("span", { class: "ci-node-count", style: { fontSize: "8px", color: "var(--muted)" }, children: p3.node_count ?? 0 })
+                ]
+              },
+              p3.name
+            )) })
+          ] }, layer.rank)) })
+        }
+      ) : /* @__PURE__ */ u3("div", { class: "ci-state ci-empty", style: { ...STATE_STYLE, color: "var(--muted)" }, children: "No package graph yet \u2014 index the repo to populate it." }),
+      mapStatus === "ready" && mapUrl ? /* @__PURE__ */ u3("div", { class: "ci-map", style: { marginTop: "8px" }, children: /* @__PURE__ */ u3("img", { src: mapUrl, alt: "Codebase package map", style: { maxWidth: "100%", border: "1px solid var(--border)", borderRadius: "4px", background: "#0b0e14" } }) }) : null,
+      mapStatus === "error" ? /* @__PURE__ */ u3("div", { class: "ci-state ci-map-error", role: "alert", style: { ...STATE_STYLE, color: "var(--error,#ef4444)", marginTop: "8px" }, children: [
+        "Map generation failed: ",
+        mapError
+      ] }) : null
+    ] });
+  }
+  var STATE_STYLE = { fontSize: "11px", padding: "16px", textAlign: "center", color: "var(--muted)" };
+  var CTRL_STYLE = {
+    background: "none",
+    border: "1px solid var(--border)",
+    borderRadius: "3px",
+    color: "var(--muted)",
+    fontSize: "9px",
+    fontFamily: "var(--font-mono)",
+    padding: "2px 8px",
+    cursor: "pointer"
+  };
+  function mountCodeIntelPanel(container, props) {
+    R(/* @__PURE__ */ u3(CodeIntelPanel, { ...props }), container);
+  }
+
+  // meridian/static/dashboard.ts
   var TABS_KEY = "meridian.openTabs";
   var ACTIVE_PROJECT_KEY = "meridian.activeProject";
   var state = {
@@ -6299,7 +7014,7 @@ ${n.tags || ""}`.toLowerCase();
     const connInd = document.getElementById("connection-indicator");
     if (!isHostedAdmin()) {
       if (connInd) connInd.style.display = "none";
-      document.querySelectorAll(".conn-popup").forEach((p) => p.remove());
+      document.querySelectorAll(".conn-popup").forEach((p3) => p3.remove());
     } else {
       document.querySelectorAll(".hosted-label").forEach((el) => el.remove());
     }
@@ -6318,7 +7033,7 @@ ${n.tags || ""}`.toLowerCase();
         _renderPlanBadge(me);
         ensureSignOutLink2(me.email);
       }
-    } catch (e) {
+    } catch (e3) {
     }
     const advLink = document.getElementById("ez-advanced-link");
     if (advLink) advLink.textContent = "Close";
@@ -6364,8 +7079,8 @@ ${n.tags || ""}`.toLowerCase();
     if (!footer || document.getElementById("workspace-switcher")) return;
     let workspaces;
     try {
-      workspaces = await fetch("/me/workspaces").then((r) => r.ok ? r.json() : null);
-    } catch (_) {
+      workspaces = await fetch("/me/workspaces").then((r3) => r3.ok ? r3.json() : null);
+    } catch (_2) {
       return;
     }
     if (!workspaces || workspaces.length < 2) return;
@@ -6387,16 +7102,16 @@ ${n.tags || ""}`.toLowerCase();
     });
     sel.onchange = async () => {
       const chosen = sel.value;
-      const own = workspaces.find((w) => w.is_own);
+      const own = workspaces.find((w3) => w3.is_own);
       state.activeWorkspaceTenantId = own && chosen === own.tenant_id ? null : chosen;
-      [...state.tabs].forEach((t) => {
+      [...state.tabs].forEach((t3) => {
         try {
-          closeTab2(t.id);
-        } catch (_) {
+          closeTab2(t3.id);
+        } catch (_2) {
         }
       });
       await loadProjects();
-      const active = workspaces.find((w) => w.tenant_id === chosen);
+      const active = workspaces.find((w3) => w3.tenant_id === chosen);
       sel.title = active ? active.is_own ? "My workspace" : `${active.owner_email} (${active.role})` : "";
       _renderWorkspaceContextBadge(wrap, workspaces);
       _refreshGuestMode();
@@ -6414,8 +7129,8 @@ ${n.tags || ""}`.toLowerCase();
       connectLink.style.opacity = ".7";
       connectLink.style.color = "var(--muted)";
     };
-    connectLink.onclick = (e) => {
-      e.preventDefault();
+    connectLink.onclick = (e3) => {
+      e3.preventDefault();
       showConnectDbModal();
     };
     wrap.appendChild(label);
@@ -6429,10 +7144,10 @@ ${n.tags || ""}`.toLowerCase();
   async function getActiveWorkspaceRole2() {
     if (!isHostedMode() || !state.activeWorkspaceTenantId) return "owner";
     try {
-      const wss = await fetch("/me/workspaces").then((r) => r.ok ? r.json() : null);
-      const ws = (wss || []).find((w) => w.tenant_id === state.activeWorkspaceTenantId);
+      const wss = await fetch("/me/workspaces").then((r3) => r3.ok ? r3.json() : null);
+      const ws = (wss || []).find((w3) => w3.tenant_id === state.activeWorkspaceTenantId);
       return ws && ws.role || "owner";
-    } catch (_) {
+    } catch (_2) {
       return "owner";
     }
   }
@@ -6445,7 +7160,7 @@ ${n.tags || ""}`.toLowerCase();
       badge.style.cssText = "display:inline-block;margin-top:6px;padding:2px 8px;border-radius:10px;font-size:9px;font-weight:700;letter-spacing:.05em;font-family:var(--font-mono);text-transform:uppercase";
       wrap.appendChild(badge);
     }
-    const active = (workspaces || []).find((w) => state.activeWorkspaceTenantId ? w.tenant_id === state.activeWorkspaceTenantId : w.is_own);
+    const active = (workspaces || []).find((w3) => state.activeWorkspaceTenantId ? w3.tenant_id === state.activeWorkspaceTenantId : w3.is_own);
     const colors = { free: "#3b82f6", trial: "#059669", standard: "#3b82f6", pro: "#7c3aed", admin: "#9ca3af", invite: "#f59e0b" };
     let label, color;
     if (active && !active.is_own) {
@@ -6463,10 +7178,10 @@ ${n.tags || ""}`.toLowerCase();
   }
   function _filterTabRows(query, container, rowSelector) {
     if (!container) return;
-    const q = (query || "").trim().toLowerCase();
+    const q2 = (query || "").trim().toLowerCase();
     container.querySelectorAll(rowSelector).forEach((row) => {
       const hay = (row.dataset.search || row.textContent || "").toLowerCase();
-      row.style.display = !q || hay.includes(q) ? "" : "none";
+      row.style.display = !q2 || hay.includes(q2) ? "" : "none";
     });
   }
   function _wireTabSearch(inputId, containerId, rowSelector) {
@@ -6482,9 +7197,9 @@ ${n.tags || ""}`.toLowerCase();
   async function _refreshGuestMode() {
     let guest = false;
     try {
-      const r = await getActiveWorkspaceRole2();
-      guest = r === "viewer" || r === "member";
-    } catch (_) {
+      const r3 = await getActiveWorkspaceRole2();
+      guest = r3 === "viewer" || r3 === "member";
+    } catch (_2) {
     }
     document.body.classList.toggle("meridian-guest", guest);
   }
@@ -6519,8 +7234,8 @@ ${n.tags || ""}`.toLowerCase();
     const urlInput = box.querySelector("#connect-db-url");
     const statusEl = box.querySelector("#connect-db-status");
     box.querySelector("#connect-db-cancel").onclick = () => overlay.remove();
-    overlay.onclick = (e) => {
-      if (e.target === overlay) overlay.remove();
+    overlay.onclick = (e3) => {
+      if (e3.target === overlay) overlay.remove();
     };
     box.querySelector("#connect-db-save").onclick = async () => {
       const url = urlInput.value.trim();
@@ -6539,8 +7254,8 @@ ${n.tags || ""}`.toLowerCase();
           overlay.remove();
           loadProjects();
         }, 800);
-      } catch (e) {
-        statusEl.textContent = e.message || "Connection failed \u2014 check the URL and credentials.";
+      } catch (e3) {
+        statusEl.textContent = e3.message || "Connection failed \u2014 check the URL and credentials.";
         statusEl.style.color = "var(--danger,#dc2626)";
       }
     };
@@ -6553,7 +7268,7 @@ ${n.tags || ""}`.toLowerCase();
       if (el) el.style.display = "";
     });
   }
-  var STORAGE_KEY2 = (k) => (isDemoMode() ? "meridian_demo_" : "meridian_") + k.replace(/^meridian[._]/, "");
+  var STORAGE_KEY2 = (k3) => (isDemoMode() ? "meridian_demo_" : "meridian_") + k3.replace(/^meridian[._]/, "");
   var NORTH_STAR_MIN_HEIGHT_PX = 180;
   var GITHUB_OCTICON_PATH = "M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z";
   function _summarizeApiErrorText(raw) {
@@ -6565,7 +7280,7 @@ ${n.tags || ""}`.toLowerCase();
         if (parsed && typeof parsed === "object") {
           summary = parsed.detail || parsed.error || parsed.message || raw;
         }
-      } catch (_) {
+      } catch (_2) {
         summary = raw;
       }
     }
@@ -6627,7 +7342,7 @@ ${n.tags || ""}`.toLowerCase();
     const host = document.getElementById(`project-fetch-alert-${projectId}`);
     if (!host) return;
     const panel = getPanelState(projectId);
-    const errors = Object.values(panel.loadErrors || {}).sort((a, b) => b.at - a.at);
+    const errors = Object.values(panel.loadErrors || {}).sort((a3, b2) => b2.at - a3.at);
     if (!errors.length) {
       host.style.display = "none";
       host.innerHTML = "";
@@ -6803,22 +7518,22 @@ ${n.tags || ""}`.toLowerCase();
             body: JSON.stringify({ agent_instructions: ta.value })
           });
           toast("Executor rules saved");
-        } catch (e) {
-          toast("Save failed: " + e.message, true);
+        } catch (e3) {
+          toast("Save failed: " + e3.message, true);
         }
       };
       document.getElementById(`agent-instructions-reset-${projectId}`).onclick = async () => {
         if (!confirm("Reset to Meridian default executor rules? Your custom rules will be replaced.")) return;
         try {
-          const r = await api(`/projects/${projectId}/agent-instructions`, {
+          const r3 = await api(`/projects/${projectId}/agent-instructions`, {
             method: "PATCH",
             body: JSON.stringify({ agent_instructions: null })
           });
-          ta.value = r.agent_instructions || defaultText;
+          ta.value = r3.agent_instructions || defaultText;
           charEl.textContent = `${ta.value.length} chars`;
           toast("Reset to defaults");
-        } catch (e) {
-          toast("Reset failed: " + e.message, true);
+        } catch (e3) {
+          toast("Reset failed: " + e3.message, true);
         }
       };
       const ciBlock = document.createElement("div");
@@ -6867,12 +7582,12 @@ ${n.tags || ""}`.toLowerCase();
             body: JSON.stringify({ code_intel_enabled: enabled })
           });
           toast(enabled ? "Code Intelligence enabled" : "Code Intelligence disabled");
-        } catch (e) {
-          toast("Save failed: " + e.message, true);
+        } catch (e3) {
+          toast("Save failed: " + e3.message, true);
         }
       };
-    } catch (e) {
-      section.innerHTML = `<div class="empty" style="color:var(--error)">Failed to load executor rules: ${escapeHtml(e.message)}</div>`;
+    } catch (e3) {
+      section.innerHTML = `<div class="empty" style="color:var(--error)">Failed to load executor rules: ${escapeHtml(e3.message)}</div>`;
     }
   }
   var _DEMO_TOUR_STEPS = [
@@ -6957,28 +7672,28 @@ ${n.tags || ""}`.toLowerCase();
   function _demoTourDone2() {
     try {
       return localStorage.getItem(STORAGE_KEY2("tour.done")) === "1";
-    } catch (e) {
+    } catch (e3) {
       return false;
     }
   }
   function _demoTourSavedStep2() {
     try {
       return parseInt(localStorage.getItem(STORAGE_KEY2("tour.step")) || "0", 10) || 0;
-    } catch (e) {
+    } catch (e3) {
       return 0;
     }
   }
   function _demoTourSaveStep(step) {
     try {
       localStorage.setItem(STORAGE_KEY2("tour.step"), String(step));
-    } catch (e) {
+    } catch (e3) {
     }
   }
   function _demoTourMarkDone() {
     try {
       localStorage.setItem(STORAGE_KEY2("tour.done"), "1");
       localStorage.removeItem(STORAGE_KEY2("tour.step"));
-    } catch (e) {
+    } catch (e3) {
     }
   }
   function _demoTourClose() {
@@ -7003,18 +7718,18 @@ ${n.tags || ""}`.toLowerCase();
       return;
     }
     _demoTourSaveStep(step);
-    const s = _DEMO_TOUR_STEPS[step];
+    const s3 = _DEMO_TOUR_STEPS[step];
     try {
-      _tourActivateVtab(s.vtab, s.gtab);
-    } catch (e) {
+      _tourActivateVtab(s3.vtab, s3.gtab);
+    } catch (e3) {
     }
     const isLast = step === _DEMO_TOUR_STEPS.length - 1;
     let targetEl = null;
-    if (s.target) {
-      targetEl = s.target();
-    } else if (s.vtab) {
+    if (s3.target) {
+      targetEl = s3.target();
+    } else if (s3.vtab) {
       const pid = state.activeTab;
-      targetEl = pid ? document.querySelector(`#vtab-strip-${pid} .vtab-btn[data-vtab="${s.vtab}"]`) : null;
+      targetEl = pid ? document.querySelector(`#vtab-strip-${pid} .vtab-btn[data-vtab="${s3.vtab}"]`) : null;
     }
     if (targetEl) {
       const rect = targetEl.getBoundingClientRect();
@@ -7038,9 +7753,9 @@ ${n.tags || ""}`.toLowerCase();
 
     <div style="font-size:.82rem;color:#6c8fff;font-weight:600;margin-bottom:8px;letter-spacing:.3px">${stepLabel}</div>
 
-    <div style="font-size:1.12rem;font-weight:700;color:#e8eaf0;margin-bottom:10px">${s.title}</div>
+    <div style="font-size:1.12rem;font-weight:700;color:#e8eaf0;margin-bottom:10px">${s3.title}</div>
 
-    <div style="font-size:.98rem;color:#c4c6d4;line-height:1.65;margin-bottom:18px">${s.body}</div>
+    <div style="font-size:.98rem;color:#c4c6d4;line-height:1.65;margin-bottom:18px">${s3.body}</div>
 
     <div style="display:flex;gap:8px;align-items:center">
 
@@ -7062,14 +7777,14 @@ ${n.tags || ""}`.toLowerCase();
     border-radius:10px;padding:18px 22px;width:330px;max-width:calc(100vw - 24px);
 
     box-shadow:0 8px 32px rgba(0,0,0,0.6);font-family:inherit;`;
-    if (!targetEl || s.position === "center") {
+    if (!targetEl || s3.position === "center") {
       tip.style.top = "50%";
       tip.style.left = "50%";
       tip.style.transform = "translate(-50%, -50%)";
     } else {
       const rect = targetEl.getBoundingClientRect();
       const PAD = 12;
-      if (s.position === "right") {
+      if (s3.position === "right") {
         tip.style.top = `${Math.min(rect.top, window.innerHeight - 200)}px`;
         tip.style.left = `${rect.right + PAD}px`;
       } else {
@@ -7102,11 +7817,11 @@ ${n.tags || ""}`.toLowerCase();
       const verEl = document.getElementById("server-version");
       if (verEl && cfg?.version) verEl.textContent = `v${cfg.version}`;
       if (cfg?.demo_mode && !document.getElementById("demo-mode-banner")) {
-        const b = document.createElement("div");
-        b.id = "demo-mode-banner";
-        b.style = "position:fixed;top:0;left:0;right:0;z-index:9999;background:#7c3aed;color:#fff;text-align:center;padding:4px 12px;font-size:11px;font-family:inherit;letter-spacing:0.02em";
-        b.innerHTML = 'Preview mode \u2014 read only \xB7 <a href="/auth/login" style="color:#fff;text-decoration:underline;font-weight:600">Sign in \u2192</a>';
-        document.body.prepend(b);
+        const b2 = document.createElement("div");
+        b2.id = "demo-mode-banner";
+        b2.style = "position:fixed;top:0;left:0;right:0;z-index:9999;background:#7c3aed;color:#fff;text-align:center;padding:4px 12px;font-size:11px;font-family:inherit;letter-spacing:0.02em";
+        b2.innerHTML = 'Preview mode \u2014 read only \xB7 <a href="/auth/login" style="color:#fff;text-decoration:underline;font-weight:600">Sign in \u2192</a>';
+        document.body.prepend(b2);
         document.body.style.paddingTop = parseInt(document.body.style.paddingTop || "0", 10) + 22 + "px";
         if (!_demoTourDone2()) {
           resumeDemoTour();
@@ -7114,16 +7829,16 @@ ${n.tags || ""}`.toLowerCase();
       }
       if (cfg?.demo_mode) hideDemoAdminControls();
       _updateConnectionIndicator(cfg);
-    } catch (e) {
+    } catch (e3) {
     }
     if (window.location.pathname.startsWith("/demo")) {
       try {
         localStorage.removeItem(STORAGE_KEY2(TABS_KEY));
-      } catch (e) {
+      } catch (e3) {
       }
       try {
         localStorage.removeItem(STORAGE_KEY2(ACTIVE_PROJECT_KEY));
-      } catch (e) {
+      } catch (e3) {
       }
       hideDemoAdminControls();
       showDemoOnboardingOverlay();
@@ -7143,7 +7858,7 @@ ${n.tags || ""}`.toLowerCase();
         updateTunnelConnectionIndicator(me);
         _armAccountSwitchWatch(me.email || "");
       }
-    } catch (e) {
+    } catch (e3) {
     }
   }
   function _armAccountSwitchWatch(loadedEmail) {
@@ -7162,7 +7877,7 @@ ${n.tags || ""}`.toLowerCase();
   async function _refreshOnFocus() {
     try {
       await loadProjects();
-    } catch (_) {
+    } catch (_2) {
     }
     const pid = state.activeTab;
     if (!pid) return;
@@ -7175,7 +7890,7 @@ ${n.tags || ""}`.toLowerCase();
         refreshHitl(pid),
         loadSprintBoard(pid)
       ]);
-    } catch (_) {
+    } catch (_2) {
     }
   }
   async function _checkAccountSwitch2() {
@@ -7183,7 +7898,7 @@ ${n.tags || ""}`.toLowerCase();
     let me;
     try {
       me = await api("/me");
-    } catch (_) {
+    } catch (_2) {
       return;
     }
     const now = me && me.email || "";
@@ -7192,11 +7907,11 @@ ${n.tags || ""}`.toLowerCase();
   }
   function _showAccountSwitchBanner(newEmail) {
     if (document.getElementById("account-switch-banner")) return;
-    const b = document.createElement("div");
-    b.id = "account-switch-banner";
-    b.style = "position:fixed;top:0;left:0;right:0;z-index:10000;background:#b45309;color:#fff;text-align:center;padding:6px 12px;font-size:12px;font-family:inherit;letter-spacing:0.02em;display:flex;align-items:center;justify-content:center;gap:12px";
-    b.innerHTML = `<span>You're now signed in as <strong>${escapeHtml(newEmail)}</strong> in another tab. Refresh to load this account.</span><button id="account-switch-refresh" style="background:#fff;color:#b45309;font-weight:700;border:none;text-decoration:none;padding:2px 12px;border-radius:4px;white-space:nowrap;cursor:pointer">Refresh</button>`;
-    document.body.prepend(b);
+    const b2 = document.createElement("div");
+    b2.id = "account-switch-banner";
+    b2.style = "position:fixed;top:0;left:0;right:0;z-index:10000;background:#b45309;color:#fff;text-align:center;padding:6px 12px;font-size:12px;font-family:inherit;letter-spacing:0.02em;display:flex;align-items:center;justify-content:center;gap:12px";
+    b2.innerHTML = `<span>You're now signed in as <strong>${escapeHtml(newEmail)}</strong> in another tab. Refresh to load this account.</span><button id="account-switch-refresh" style="background:#fff;color:#b45309;font-weight:700;border:none;text-decoration:none;padding:2px 12px;border-radius:4px;white-space:nowrap;cursor:pointer">Refresh</button>`;
+    document.body.prepend(b2);
     document.body.style.paddingTop = parseInt(document.body.style.paddingTop || "0", 10) + 30 + "px";
     const btn = document.getElementById("account-switch-refresh");
     if (btn) btn.onclick = () => location.reload();
@@ -7253,9 +7968,9 @@ ${n.tags || ""}`.toLowerCase();
     if (conns.length > 0 && wrap) {
       wrap.style.cursor = "pointer";
       wrap.title = "Click to switch connection";
-      wrap.onclick = (e) => {
-        e.stopPropagation();
-        document.querySelectorAll(".conn-popup").forEach((p) => p.remove());
+      wrap.onclick = (e3) => {
+        e3.stopPropagation();
+        document.querySelectorAll(".conn-popup").forEach((p3) => p3.remove());
         const popup = document.createElement("div");
         popup.className = "conn-popup";
         popup.style.cssText = "position:fixed;background:var(--surface-2);border:1px solid var(--border);border-radius:4px;z-index:1001;min-width:180px;box-shadow:0 4px 12px rgba(0,0,0,0.4);font-size:11px;font-family:var(--font-mono);padding:6px 0";
@@ -7269,35 +7984,35 @@ ${n.tags || ""}`.toLowerCase();
         const hosted = isHostedMode();
         const adminFull = !hosted || isHostedAdmin();
         const activeName = cfg.connection_name || (cfg.db === "postgres" ? "env (postgres)" : "local");
-        let displayConns = (conns || []).map((c) => ({ ...c, active: c.name === activeName }));
+        let displayConns = (conns || []).map((c3) => ({ ...c3, active: c3.name === activeName }));
         if (hosted) {
-          displayConns = displayConns.filter((c) => (c.type || "sqlite") === "postgres");
+          displayConns = displayConns.filter((c3) => (c3.type || "sqlite") === "postgres");
         }
-        if (!displayConns.find((c) => c.active)) {
+        if (!displayConns.find((c3) => c3.active)) {
           displayConns.unshift({ name: activeName, type: cfg.db, active: true });
         }
-        displayConns.forEach((c) => {
+        displayConns.forEach((c3) => {
           const item = document.createElement("div");
-          item.style.cssText = `padding:6px 12px;cursor:pointer;display:flex;align-items:center;gap:8px;justify-content:space-between;${c.active ? "color:var(--accent)" : "color:var(--text)"}`;
+          item.style.cssText = `padding:6px 12px;cursor:pointer;display:flex;align-items:center;gap:8px;justify-content:space-between;${c3.active ? "color:var(--accent)" : "color:var(--text)"}`;
           const left = document.createElement("div");
           left.style.cssText = "display:flex;align-items:center;gap:8px;flex:1;min-width:0";
           const dot2 = document.createElement("span");
-          dot2.style.cssText = `display:inline-block;width:6px;height:6px;border-radius:50%;flex-shrink:0;background:${c.active ? "var(--accent)" : "var(--muted)"}`;
+          dot2.style.cssText = `display:inline-block;width:6px;height:6px;border-radius:50%;flex-shrink:0;background:${c3.active ? "var(--accent)" : "var(--muted)"}`;
           left.appendChild(dot2);
-          let connLabel = c.name + " (" + (c.type || "sqlite") + ")";
-          if (c.url_masked) {
+          let connLabel = c3.name + " (" + (c3.type || "sqlite") + ")";
+          if (c3.url_masked) {
             try {
-              const hostMatch = c.url_masked.match(/@([^/:?]+)/);
+              const hostMatch = c3.url_masked.match(/@([^/:?]+)/);
               if (hostMatch) {
                 const host = hostMatch[1];
                 connLabel += " \u2014 " + (host.length > 22 ? host.slice(0, 20) + "\u2026" : host);
               }
-            } catch (_) {
+            } catch (_2) {
             }
           }
           left.appendChild(document.createTextNode(connLabel));
           const _nonprod = /\b(dev|test|staging|sandbox)\b/i;
-          if (_nonprod.test(c.name)) {
+          if (_nonprod.test(c3.name)) {
             const badge = document.createElement("span");
             badge.textContent = "\u26A0";
             badge.title = "Non-production connection";
@@ -7305,19 +8020,19 @@ ${n.tags || ""}`.toLowerCase();
             left.appendChild(badge);
           }
           item.appendChild(left);
-          if (c.name && c.name !== "local" && adminFull) {
+          if (c3.name && c3.name !== "local" && adminFull) {
             const del = document.createElement("button");
             del.textContent = "\xD7";
-            del.title = c.active ? "Remove connection (will switch to local)" : "Remove connection";
+            del.title = c3.active ? "Remove connection (will switch to local)" : "Remove connection";
             del.style.cssText = "background:none;border:none;color:var(--muted);cursor:pointer;font-size:14px;padding:0 2px;line-height:1;flex-shrink:0";
             del.onmouseenter = () => del.style.color = "var(--status-failed)";
             del.onmouseleave = () => del.style.color = "var(--muted)";
-            del.onclick = async (e2) => {
-              e2.stopPropagation();
-              const msg = c.active ? 'Remove active connection "' + c.name + '"? This will switch to local (SQLite). Requires restart.' : 'Remove connection "' + c.name + '"?';
+            del.onclick = async (e4) => {
+              e4.stopPropagation();
+              const msg = c3.active ? 'Remove active connection "' + c3.name + '"? This will switch to local (SQLite). Requires restart.' : 'Remove connection "' + c3.name + '"?';
               if (!confirm(msg)) return;
               try {
-                await api("/config/connections/" + encodeURIComponent(c.name), { method: "DELETE" });
+                await api("/config/connections/" + encodeURIComponent(c3.name), { method: "DELETE" });
                 popup.remove();
                 await loadServerConfig();
               } catch (ex) {
@@ -7327,37 +8042,37 @@ ${n.tags || ""}`.toLowerCase();
             item.appendChild(del);
           }
           item.onmouseenter = () => {
-            if (!c.active) left.style.color = "var(--accent)";
+            if (!c3.active) left.style.color = "var(--accent)";
             item.style.background = "var(--surface-3)";
           };
           item.onmouseleave = () => {
             left.style.color = "";
             item.style.background = "";
           };
-          item.onclick = async (e2) => {
-            if (e2.target.tagName === "BUTTON") return;
+          item.onclick = async (e4) => {
+            if (e4.target.tagName === "BUTTON") return;
             popup.remove();
-            if (c.active) return;
+            if (c3.active) return;
             try {
-              await api("/config/connections", { method: "POST", body: JSON.stringify({ name: c.name, activate: true }) });
+              await api("/config/connections", { method: "POST", body: JSON.stringify({ name: c3.name, activate: true }) });
               await loadServerConfig();
               if (isHostedMode()) {
-                toast('Connection saved as "' + c.name + '" \u2014 applies on next server restart');
+                toast('Connection saved as "' + c3.name + '" \u2014 applies on next server restart');
               } else {
                 const banner = document.getElementById("update-banner");
                 const bannerSpan = banner?.querySelector("span");
                 if (banner) {
                   banner.style.display = "block";
-                  if (bannerSpan) bannerSpan.textContent = "\u26A0\uFE0F Connection changed to " + c.name + " \u2014 restart to apply";
+                  if (bannerSpan) bannerSpan.textContent = "\u26A0\uFE0F Connection changed to " + c3.name + " \u2014 restart to apply";
                 }
               }
               const dot3 = document.getElementById("connection-dot");
               const label2 = document.getElementById("connection-label");
               if (dot3) dot3.style.background = "var(--accent)";
-              if (label2) label2.textContent = c.name + " (" + (c.type || "sqlite") + ")";
-            } catch (e3) {
-              console.error("Switch failed:", e3);
-              toast("Switch failed: " + e3.message, true);
+              if (label2) label2.textContent = c3.name + " (" + (c3.type || "sqlite") + ")";
+            } catch (e5) {
+              console.error("Switch failed:", e5);
+              toast("Switch failed: " + e5.message, true);
             }
           };
           popup.appendChild(item);
@@ -7387,12 +8102,12 @@ ${n.tags || ""}`.toLowerCase();
     if (conns.length > 1 && switcher) {
       switcher.style.display = "none";
       switcher.innerHTML = conns.map(
-        (c) => `<option value="${c.name}" ${c.active ? "selected" : ""}>${c.name}</option>`
+        (c3) => `<option value="${c3.name}" ${c3.active ? "selected" : ""}>${c3.name}</option>`
       ).join("");
       switcher.onchange = async () => {
         try {
           const sel = switcher.value;
-          const conn = (cfg.connections || []).find((c) => c.name === sel) || {};
+          const conn = (cfg.connections || []).find((c3) => c3.name === sel) || {};
           await api("/config/connections", {
             method: "POST",
             body: JSON.stringify({ name: sel, type: conn.type || "sqlite", activate: true })
@@ -7405,8 +8120,8 @@ ${n.tags || ""}`.toLowerCase();
           } else {
             toast("Switched to " + sel + " \u2014 restart to apply");
           }
-        } catch (e) {
-          toast("Switch failed: " + e.message, true);
+        } catch (e3) {
+          toast("Switch failed: " + e3.message, true);
         }
       };
     }
@@ -7423,17 +8138,17 @@ ${n.tags || ""}`.toLowerCase();
       btn.style.color = "var(--muted)";
     }
     try {
-      const s = await api("/admin/git-status");
-      if (!s.ok) throw new Error(s.error || "git check failed");
-      if (s.behind > 0) {
+      const s3 = await api("/admin/git-status");
+      if (!s3.ok) throw new Error(s3.error || "git check failed");
+      if (s3.behind > 0) {
         const banner = document.getElementById("update-banner");
         const span = banner?.querySelector("span");
         if (banner) {
           banner.style.display = "block";
-          if (span) span.textContent = `\u26A0\uFE0F ${s.behind} commit${s.behind > 1 ? "s" : ""} behind origin/${s.branch} (${s.local_hash} \u2260 ${s.remote_hash}) \u2014 git pull recommended`;
+          if (span) span.textContent = `\u26A0\uFE0F ${s3.behind} commit${s3.behind > 1 ? "s" : ""} behind origin/${s3.branch} (${s3.local_hash} \u2260 ${s3.remote_hash}) \u2014 git pull recommended`;
         }
         if (btn) {
-          btn.textContent = `\u2193 ${s.behind} behind`;
+          btn.textContent = `\u2193 ${s3.behind} behind`;
           btn.style.color = "var(--status-failed)";
         }
       } else {
@@ -7448,7 +8163,7 @@ ${n.tags || ""}`.toLowerCase();
           }
         }, 3e3);
       }
-    } catch (e) {
+    } catch (e3) {
       if (btn) {
         btn.textContent = "check updates";
         btn.style.color = "var(--muted)";
@@ -7465,27 +8180,27 @@ ${n.tags || ""}`.toLowerCase();
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ confirm: true })
       });
-    } catch (_) {
+    } catch (_2) {
     }
-    document.querySelectorAll("#restart-server-btn, #banner-restart-btn").forEach((b) => {
-      b.textContent = "Restarting\u2026";
-      b.disabled = true;
+    document.querySelectorAll("#restart-server-btn, #banner-restart-btn").forEach((b2) => {
+      b2.textContent = "Restarting\u2026";
+      b2.disabled = true;
     });
     const started = Date.now();
     while (Date.now() - started < 3e4) {
-      await new Promise((r) => setTimeout(r, 2e3));
+      await new Promise((r3) => setTimeout(r3, 2e3));
       try {
-        const r = await fetch("/health");
-        if (r.ok) {
+        const r3 = await fetch("/health");
+        if (r3.ok) {
           window.location.href = window.location.pathname + "?_cb=" + Date.now();
           return;
         }
-      } catch (_) {
+      } catch (_2) {
       }
     }
-    document.querySelectorAll("#restart-server-btn, #banner-restart-btn").forEach((b) => {
-      b.textContent = "Restart timed out";
-      b.disabled = false;
+    document.querySelectorAll("#restart-server-btn, #banner-restart-btn").forEach((b2) => {
+      b2.textContent = "Restart timed out";
+      b2.disabled = false;
     });
     toast("Server did not come back within 30s \u2014 start manually", true);
   }
@@ -7505,48 +8220,48 @@ ${n.tags || ""}`.toLowerCase();
       } else {
         methodEl.style.display = "none";
       }
-    } catch (e) {
+    } catch (e3) {
     }
   }
   async function loadProjects() {
     const list = document.getElementById("project-list");
     try {
       state.projects = await api("/projects");
-    } catch (e) {
+    } catch (e3) {
       state.projects = [];
       if (list) {
-        list.innerHTML = `<div class="empty" style="color:var(--status-failed);padding:6px 4px">projects failed: ${escapeHtml(e.message)}</div>`;
+        list.innerHTML = `<div class="empty" style="color:var(--status-failed);padding:6px 4px">projects failed: ${escapeHtml(e3.message)}</div>`;
       }
       return;
     }
     list.innerHTML = "";
-    state.projects.forEach((p) => {
+    state.projects.forEach((p3) => {
       const div = document.createElement("div");
-      div.className = "project-item" + (state.activeTab === p.id ? " active" : "");
-      div.dataset.projectId = p.id;
+      div.className = "project-item" + (state.activeTab === p3.id ? " active" : "");
+      div.dataset.projectId = p3.id;
       div.style.cssText = "display:flex;align-items:center;justify-content:space-between;gap:4px;";
       const nameSpan = document.createElement("span");
       nameSpan.style.cssText = "flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap";
-      nameSpan.textContent = p.name;
+      nameSpan.textContent = p3.name;
       const menuBtn = document.createElement("button");
       menuBtn.textContent = "\u22EF";
       menuBtn.title = "Project actions";
       menuBtn.style.cssText = "background:none;border:none;color:var(--muted);cursor:pointer;padding:0 4px;font-size:14px;line-height:1;flex-shrink:0";
       menuBtn.onmouseenter = () => menuBtn.style.color = "var(--text)";
       menuBtn.onmouseleave = () => menuBtn.style.color = "var(--muted)";
-      menuBtn.onclick = (e) => {
-        e.stopPropagation();
-        let t = state.tabs.find((tab) => tab.id === p.id);
-        if (!t) {
-          openTab(p);
-          t = state.tabs.find((tab) => tab.id === p.id);
+      menuBtn.onclick = (e3) => {
+        e3.stopPropagation();
+        let t3 = state.tabs.find((tab) => tab.id === p3.id);
+        if (!t3) {
+          openTab(p3);
+          t3 = state.tabs.find((tab) => tab.id === p3.id);
         }
-        if (t) _openTabMenu(t, menuBtn);
+        if (t3) _openTabMenu(t3, menuBtn);
       };
       div.appendChild(nameSpan);
       div.appendChild(menuBtn);
-      div.onclick = (e) => {
-        if (e.target !== menuBtn) openTab(p);
+      div.onclick = (e3) => {
+        if (e3.target !== menuBtn) openTab(p3);
       };
       list.appendChild(div);
     });
@@ -7555,18 +8270,18 @@ ${n.tags || ""}`.toLowerCase();
       switcher.style.display = "none";
       const previous = switcher.value;
       switcher.innerHTML = "";
-      state.projects.forEach((p) => {
+      state.projects.forEach((p3) => {
         const opt = document.createElement("option");
-        opt.value = p.id;
-        opt.textContent = p.name;
+        opt.value = p3.id;
+        opt.textContent = p3.name;
         switcher.appendChild(opt);
       });
-      if (previous && state.projects.some((p) => p.id === previous)) switcher.value = previous;
+      if (previous && state.projects.some((p3) => p3.id === previous)) switcher.value = previous;
     }
     syncSidebarActiveProject();
   }
   function openTab(project) {
-    const existing = state.tabs.find((t) => t.id === project.id);
+    const existing = state.tabs.find((t3) => t3.id === project.id);
     if (existing) {
       activateTab(project.id);
       return;
@@ -7579,12 +8294,12 @@ ${n.tags || ""}`.toLowerCase();
     setTimeout(() => refreshProjectCountBadges(project.id), 100);
   }
   function closeTab2(id) {
-    state.tabs = state.tabs.filter((t) => t.id !== id);
+    state.tabs = state.tabs.filter((t3) => t3.id !== id);
     const panel = state.panels[id];
     if (panel) {
       try {
         panel.ws && panel.ws.close();
-      } catch (e) {
+      } catch (e3) {
       }
       delete state.panels[id];
     }
@@ -7601,8 +8316,8 @@ ${n.tags || ""}`.toLowerCase();
   }
   function saveTabs() {
     try {
-      localStorage.setItem(STORAGE_KEY2(TABS_KEY), JSON.stringify(state.tabs.map((t) => t.id)));
-    } catch (e) {
+      localStorage.setItem(STORAGE_KEY2(TABS_KEY), JSON.stringify(state.tabs.map((t3) => t3.id)));
+    } catch (e3) {
     }
   }
   var TAB_OVERFLOW_THRESHOLD = 10;
@@ -7612,14 +8327,14 @@ ${n.tags || ""}`.toLowerCase();
     const overflow = state.tabs.length >= TAB_OVERFLOW_THRESHOLD;
     const visible = overflow ? state.tabs.slice(0, TAB_OVERFLOW_THRESHOLD - 1) : state.tabs;
     const hidden = overflow ? state.tabs.slice(TAB_OVERFLOW_THRESHOLD - 1) : [];
-    visible.forEach((t) => bar.appendChild(_makeTabEl(t)));
+    visible.forEach((t3) => bar.appendChild(_makeTabEl(t3)));
     if (overflow) {
       const more = document.createElement("div");
       more.className = "tab tab-overflow";
       more.textContent = `>> ${hidden.length} more`;
-      more.title = hidden.map((t) => t.project.name).join(", ");
-      more.onclick = (e) => {
-        e.stopPropagation();
+      more.title = hidden.map((t3) => t3.project.name).join(", ");
+      more.onclick = (e3) => {
+        e3.stopPropagation();
         let menu = document.getElementById("tab-overflow-menu");
         if (menu) {
           menu.remove();
@@ -7631,15 +8346,15 @@ ${n.tags || ""}`.toLowerCase();
         const rect = more.getBoundingClientRect();
         menu.style.top = rect.bottom + 4 + "px";
         menu.style.left = rect.left + "px";
-        hidden.forEach((t) => {
+        hidden.forEach((t3) => {
           const item = document.createElement("div");
           item.style.cssText = "padding:8px 12px;cursor:pointer;font-size:11px;font-family:var(--font-mono)";
-          item.textContent = t.project.name;
+          item.textContent = t3.project.name;
           item.onmouseenter = () => item.style.background = "var(--surface-1)";
           item.onmouseleave = () => item.style.background = "";
           item.onclick = () => {
             menu.remove();
-            activateTab(t.id);
+            activateTab(t3.id);
           };
           menu.appendChild(item);
         });
@@ -7653,41 +8368,41 @@ ${n.tags || ""}`.toLowerCase();
       bar.appendChild(more);
     }
   }
-  function _makeTabEl(t) {
+  function _makeTabEl(t3) {
     const div = document.createElement("div");
-    div.className = "tab" + (state.activeTab === t.id ? " active" : "");
-    div.dataset.tabId = t.id;
-    div.onclick = () => activateTab(t.id);
-    if (t.project.icon) {
+    div.className = "tab" + (state.activeTab === t3.id ? " active" : "");
+    div.dataset.tabId = t3.id;
+    div.onclick = () => activateTab(t3.id);
+    if (t3.project.icon) {
       const iconSpan = document.createElement("span");
-      iconSpan.textContent = t.project.icon;
+      iconSpan.textContent = t3.project.icon;
       iconSpan.style.cssText = "margin-right:5px;font-size:1.05em";
       div.appendChild(iconSpan);
     }
     const nameSpan = document.createElement("span");
-    nameSpan.textContent = t.project.name;
+    nameSpan.textContent = t3.project.name;
     div.appendChild(nameSpan);
     const kebab = document.createElement("button");
     kebab.className = "tab-kebab";
     kebab.textContent = "\u22EF";
     kebab.title = "Project actions";
-    kebab.onclick = (e) => {
-      e.stopPropagation();
-      _openTabMenu(t, kebab);
+    kebab.onclick = (e3) => {
+      e3.stopPropagation();
+      _openTabMenu(t3, kebab);
     };
     div.appendChild(kebab);
     const close = document.createElement("button");
     close.className = "close";
     close.textContent = "\xD7";
-    close.onclick = (e) => {
-      e.stopPropagation();
-      closeTab2(t.id);
+    close.onclick = (e3) => {
+      e3.stopPropagation();
+      closeTab2(t3.id);
     };
     div.appendChild(close);
     return div;
   }
-  function _openTabMenu(t, anchor) {
-    document.querySelectorAll(".tab-context-menu").forEach((m) => m.remove());
+  function _openTabMenu(t3, anchor) {
+    document.querySelectorAll(".tab-context-menu").forEach((m3) => m3.remove());
     const menu = document.createElement("div");
     menu.className = "tab-context-menu";
     menu.style.cssText = "position:fixed;background:var(--surface-2);border:1px solid var(--border);border-radius:4px;z-index:1001;min-width:150px;box-shadow:0 4px 12px rgba(0,0,0,0.4);font-size:11px;font-family:var(--font-mono)";
@@ -7711,12 +8426,12 @@ ${n.tags || ""}`.toLowerCase();
     }
     const uuidDiv = document.createElement("div");
     uuidDiv.style.cssText = "padding:6px 12px;color:var(--muted);font-size:10px;border-bottom:1px solid var(--border);user-select:all;cursor:text";
-    uuidDiv.textContent = t.id;
+    uuidDiv.textContent = t3.id;
     menu.appendChild(uuidDiv);
-    menuItem("\u270F Rename", () => _renameProject(t));
-    menuItem("\u{1F3A8} Change icon\u2026", () => _setProjectIcon(t));
+    menuItem("\u270F Rename", () => _renameProject(t3));
+    menuItem("\u{1F3A8} Change icon\u2026", () => _setProjectIcon(t3));
     menuItem("\u2B07 Download DB", () => window.open("/admin/snapshot", "_blank"));
-    menuItem("\u{1F5D1} Delete project\u2026", () => _deleteProject(t));
+    menuItem("\u{1F5D1} Delete project\u2026", () => _deleteProject(t3));
     const rect = anchor.getBoundingClientRect();
     menu.style.top = rect.bottom + 4 + "px";
     menu.style.left = rect.left + "px";
@@ -7727,8 +8442,8 @@ ${n.tags || ""}`.toLowerCase();
     };
     setTimeout(() => document.addEventListener("click", dismiss), 0);
   }
-  async function _setProjectIcon(t) {
-    const current = t.project.icon || "";
+  async function _setProjectIcon(t3) {
+    const current = t3.project.icon || "";
     const next = window.prompt(
       `Paste a single emoji to use as the project icon (or leave blank to clear).
 
@@ -7738,37 +8453,37 @@ Current: ${current || "(none)"}`,
     if (next === null) return;
     const icon = next.trim() ? next.trim().slice(0, 8) : null;
     try {
-      const updated = await api(`/projects/${t.id}/icon`, {
+      const updated = await api(`/projects/${t3.id}/icon`, {
         method: "PATCH",
         body: JSON.stringify({ icon })
       });
-      t.project = { ...t.project, icon: updated.icon || null };
-      const proj = state.projects.find((p) => p.id === t.id);
+      t3.project = { ...t3.project, icon: updated.icon || null };
+      const proj = state.projects.find((p3) => p3.id === t3.id);
       if (proj) proj.icon = updated.icon || null;
       renderTabs();
       toast(icon ? `Icon set to ${icon}` : "Icon cleared");
-    } catch (e) {
-      toast("Update failed: " + e.message, true);
+    } catch (e3) {
+      toast("Update failed: " + e3.message, true);
     }
   }
-  async function _renameProject(t) {
-    const newName = window.prompt(`Rename "${t.project.name}" to:`, t.project.name);
-    if (!newName || newName.trim() === t.project.name) return;
+  async function _renameProject(t3) {
+    const newName = window.prompt(`Rename "${t3.project.name}" to:`, t3.project.name);
+    if (!newName || newName.trim() === t3.project.name) return;
     try {
-      const updated = await api(`/projects/${t.id}/rename`, {
+      const updated = await api(`/projects/${t3.id}/rename`, {
         method: "POST",
         body: JSON.stringify({ name: newName.trim() })
       });
-      t.project = { ...t.project, name: updated.name };
-      const hdr = document.querySelector(`#drawer-status-${t.id} .drawer-header span:first-child`);
+      t3.project = { ...t3.project, name: updated.name };
+      const hdr = document.querySelector(`#drawer-status-${t3.id} .drawer-header span:first-child`);
       if (hdr) hdr.textContent = "STATUS \xB7 " + updated.name;
       renderTabs();
       toast("Renamed to " + updated.name);
-    } catch (e) {
-      toast("Rename failed: " + e.message, true);
+    } catch (e3) {
+      toast("Rename failed: " + e3.message, true);
     }
   }
-  async function _deleteProject(t) {
+  async function _deleteProject(t3) {
     await new Promise((resolve) => {
       if (document.getElementById("delete-project-modal")) return resolve();
       const overlay = document.createElement("div");
@@ -7776,7 +8491,7 @@ Current: ${current || "(none)"}`,
       overlay.style.cssText = "position:fixed;inset:0;z-index:10000;background:rgba(0,0,0,.6);display:flex;align-items:center;justify-content:center";
       const box = document.createElement("div");
       box.style.cssText = "background:var(--surface-0);border:1px solid var(--border);border-radius:8px;padding:24px 28px;width:420px;max-width:94vw;display:flex;flex-direction:column;gap:14px";
-      const name = escapeHtml(t.project.name);
+      const name = escapeHtml(t3.project.name);
       box.innerHTML = `<div style="font-weight:700;font-size:14px;color:var(--danger,#dc2626)">Delete "${name}"?</div><div style="font-size:12px;color:var(--muted)">Permanently deletes all sessions, tasks, decisions, and goal history. <strong>Cannot be undone.</strong></div><div style="display:flex;gap:8px;justify-content:flex-end"><button id="del-proj-cancel" class="secondary" style="font-size:12px">Cancel</button><button id="del-proj-confirm" style="font-size:12px;background:var(--danger,#dc2626);color:#fff;border:none;border-radius:5px;padding:6px 16px;cursor:pointer">Delete project</button></div>`;
       overlay.appendChild(box);
       document.body.appendChild(overlay);
@@ -7784,8 +8499,8 @@ Current: ${current || "(none)"}`,
         overlay.remove();
         resolve();
       };
-      overlay.onclick = (e) => {
-        if (e.target === overlay) {
+      overlay.onclick = (e3) => {
+        if (e3.target === overlay) {
           overlay.remove();
           resolve();
         }
@@ -7793,19 +8508,19 @@ Current: ${current || "(none)"}`,
       box.querySelector("#del-proj-confirm").onclick = async () => {
         overlay.remove();
         try {
-          await api(`/projects/${t.id}`, { method: "DELETE" });
-          closeTab2(t.id);
-          state.projects = state.projects.filter((p) => p.id !== t.id);
+          await api(`/projects/${t3.id}`, { method: "DELETE" });
+          closeTab2(t3.id);
+          state.projects = state.projects.filter((p3) => p3.id !== t3.id);
           await loadProjects();
           toast("Project deleted");
-        } catch (e) {
-          if (e.status === 404) {
-            closeTab2(t.id);
-            state.projects = state.projects.filter((p) => p.id !== t.id);
+        } catch (e3) {
+          if (e3.status === 404) {
+            closeTab2(t3.id);
+            state.projects = state.projects.filter((p3) => p3.id !== t3.id);
             await loadProjects();
             toast("Project removed");
           } else {
-            toast(e.message.includes("409") ? "Cannot delete \u2014 active tasks in progress." : "Delete failed: " + e.message, true);
+            toast(e3.message.includes("409") ? "Cannot delete \u2014 active tasks in progress." : "Delete failed: " + e3.message, true);
           }
         }
         resolve();
@@ -7823,10 +8538,24 @@ Current: ${current || "(none)"}`,
     if (empty) empty.remove();
     try {
       localStorage.setItem(STORAGE_KEY2(ACTIVE_PROJECT_KEY), id);
-    } catch (e) {
+    } catch (e3) {
     }
     const switcher = document.getElementById("project-switcher");
     if (switcher) switcher.value = id;
+    try {
+      const _panel = getPanelState(id);
+      let _activeVtab = _panel && _panel.activeVtab;
+      if (!_activeVtab) {
+        try {
+          _activeVtab = localStorage.getItem("meridian_last_tab_" + id);
+        } catch (_2) {
+        }
+      }
+      if (_activeVtab === "settings" && typeof loadSettingsTab === "function") {
+        loadSettingsTab(id, { force: true });
+      }
+    } catch (_2) {
+    }
   }
   function buildTabBody(project) {
     const root = document.getElementById("tab-bodies");
@@ -8765,17 +9494,17 @@ Current: ${current || "(none)"}`,
       vtabStrip.querySelectorAll(".vtab-btn").forEach((btn) => {
         btn.onclick = () => {
           const vtab = btn.dataset.vtab;
-          const p = state.panels[project.id];
-          vtabStrip.querySelectorAll(".vtab-btn").forEach((b) => {
-            b.classList.toggle("active", b.dataset.vtab === vtab);
+          const p3 = state.panels[project.id];
+          vtabStrip.querySelectorAll(".vtab-btn").forEach((b2) => {
+            b2.classList.toggle("active", b2.dataset.vtab === vtab);
           });
           drawer.querySelectorAll(".drawer-panel").forEach((dp) => {
             dp.classList.toggle("active", dp.id === `drawer-${vtab}-${project.id}`);
           });
-          p.activeVtab = vtab;
+          p3.activeVtab = vtab;
           try {
             localStorage.setItem("meridian_last_tab_" + project.id, vtab);
-          } catch (_) {
+          } catch (_2) {
           }
           if (vtab === "files") loadFilesTab(project.id);
           if (vtab === "devlog") refreshTasks(project.id);
@@ -8785,13 +9514,13 @@ Current: ${current || "(none)"}`,
             loadQueue(project.id);
             updateLiveFeed(project.id);
             loadRecentRuns(project.id);
-            clearInterval(p._liveFeedInterval);
-            p._liveFeedInterval = setInterval(() => {
-              if (p.activeVtab === "queue") updateLiveFeed(project.id);
-              else clearInterval(p._liveFeedInterval);
+            clearInterval(p3._liveFeedInterval);
+            p3._liveFeedInterval = setInterval(() => {
+              if (p3.activeVtab === "queue") updateLiveFeed(project.id);
+              else clearInterval(p3._liveFeedInterval);
             }, 5e3);
           } else {
-            clearInterval(p._liveFeedInterval);
+            clearInterval(p3._liveFeedInterval);
           }
           if (vtab === "live") loadLiveTab(project.id);
           if (vtab === "team") loadTeamTab(project.id);
@@ -8808,7 +9537,7 @@ Current: ${current || "(none)"}`,
           const savedBtn = vtabStrip.querySelector('.vtab-btn[data-vtab="' + saved + '"]');
           if (savedBtn) savedBtn.click();
         }
-      } catch (_) {
+      } catch (_2) {
       }
       _initCodeIntelTabVisibility(project.id);
     }
@@ -8816,10 +9545,10 @@ Current: ${current || "(none)"}`,
     if (goalDrawer) {
       goalDrawer.querySelectorAll(".goal-subtab-btn").forEach((btn) => {
         btn.onclick = () => {
-          goalDrawer.querySelectorAll(".goal-subtab-btn").forEach((b) => b.classList.toggle("active", b === btn));
+          goalDrawer.querySelectorAll(".goal-subtab-btn").forEach((b2) => b2.classList.toggle("active", b2 === btn));
           const gtab = btn.dataset.gtab;
-          goalDrawer.querySelectorAll(".goal-subtab-panel").forEach((p) => {
-            p.classList.toggle("active", p.id === `gtab-${gtab}-${project.id}`);
+          goalDrawer.querySelectorAll(".goal-subtab-panel").forEach((p3) => {
+            p3.classList.toggle("active", p3.id === `gtab-${gtab}-${project.id}`);
           });
           if (gtab === "decisions") loadPinnedDecisions(project.id);
         };
@@ -8871,8 +9600,8 @@ Current: ${current || "(none)"}`,
           decForm.style.display = "none";
           toast("decision pinned");
           loadPinnedDecisions(project.id);
-        } catch (e) {
-          if (decFormStatus) decFormStatus.textContent = `Error: ${escapeHtml(String(e))}`;
+        } catch (e3) {
+          if (decFormStatus) decFormStatus.textContent = `Error: ${escapeHtml(String(e3))}`;
         } finally {
           decFormAdd.disabled = false;
         }
@@ -8890,8 +9619,8 @@ Current: ${current || "(none)"}`,
         if (decFormStatus) decFormStatus.textContent = over || near ? `Body: ${len.toLocaleString()}/${limit.toLocaleString()}` : "";
       };
       [decFormTitle, decFormBody].forEach((el) => {
-        if (el) el.addEventListener("keydown", (e) => {
-          if ((e.ctrlKey || e.metaKey) && e.key === "Enter") doAddDecision();
+        if (el) el.addEventListener("keydown", (e3) => {
+          if ((e3.ctrlKey || e3.metaKey) && e3.key === "Enter") doAddDecision();
         });
       });
     }
@@ -8918,12 +9647,12 @@ Current: ${current || "(none)"}`,
         const scopeItems = items.filter(
           (it) => activeStatuses.has(it.status) || it.version && activeVersions.has(it.version)
         );
-        const doneCount = scopeItems.filter((i) => i.status === "done" || i.status === "skipped").length;
-        const activeCount = scopeItems.filter((i) => activeStatuses.has(i.status)).length;
+        const doneCount = scopeItems.filter((i3) => i3.status === "done" || i3.status === "skipped").length;
+        const activeCount = scopeItems.filter((i3) => activeStatuses.has(i3.status)).length;
         const total = scopeItems.length;
         const pct = total > 0 ? Math.round(doneCount / total * 100) : 0;
         const pctColor = doneCount === 0 ? "var(--muted)" : doneCount === total ? "var(--accent-green)" : "#fbbf24";
-        const pendingItems = scopeItems.filter((i) => activeStatuses.has(i.status));
+        const pendingItems = scopeItems.filter((i3) => activeStatuses.has(i3.status));
         const statusColors = { pending: "var(--muted)", todo: "var(--muted)", in_progress: "#fbbf24" };
         const itemsHtml = pendingItems.slice(0, 10).map((it) => {
           const color = statusColors[it.status] || "var(--muted)";
@@ -8941,10 +9670,10 @@ Current: ${current || "(none)"}`,
         <span style="opacity:0.5">\xB7 See LIVE tab for full board</span>
 
       </div>${itemsHtml}`;
-      } catch (e) {
+      } catch (e3) {
         const board = document.getElementById(`sprint-board-goal-${project.id}`);
         if (!board) return;
-        board.innerHTML = renderProjectLoadError2(project.id, "Sprint board unavailable", sprintItemsPath, e);
+        board.innerHTML = renderProjectLoadError2(project.id, "Sprint board unavailable", sprintItemsPath, e3);
         wireProjectLoadRetry2(board, project.id);
       }
     }
@@ -8956,12 +9685,12 @@ Current: ${current || "(none)"}`,
       if (!sel || !inp) return;
       try {
         const sessions = await projectApi(project.id, `/projects/${project.id}/sessions`);
-        const active = (sessions || []).filter((s) => s.status !== "closed" && s.status !== "archived");
-        const opts = active.map((s) => `<option value="${escapeHtml(s.name)}">${escapeHtml(s.name)}</option>`).join("");
+        const active = (sessions || []).filter((s3) => s3.status !== "closed" && s3.status !== "archived");
+        const opts = active.map((s3) => `<option value="${escapeHtml(s3.name)}">${escapeHtml(s3.name)}</option>`).join("");
         sel.innerHTML = opts + '<option value="__custom__">Custom\u2026</option>';
         _sprintSelectSyncers[project.id] = function(val) {
           if (!sel) return;
-          const match = Array.from(sel.options).find((o) => o.value === val && o.value !== "__custom__");
+          const match = Array.from(sel.options).find((o3) => o3.value === val && o3.value !== "__custom__");
           if (match) {
             sel.value = val;
             inp.value = val;
@@ -8977,7 +9706,7 @@ Current: ${current || "(none)"}`,
           }
         };
         if (inp.value) _sprintSelectSyncers[project.id](inp.value);
-      } catch (_) {
+      } catch (_2) {
         sel.innerHTML = '<option value="__custom__">Custom\u2026</option>';
         inp.style.display = "block";
       }
@@ -9001,13 +9730,13 @@ Current: ${current || "(none)"}`,
           await api(`/projects/${project.id}/sprint-items`, { method: "POST", body: JSON.stringify({ title, version: state.panels[project.id]?.sprint || "current" }) });
           sprintAddInput.value = "";
           loadSprintBoard2();
-        } catch (e) {
-          console.error("Add sprint item failed:", e);
+        } catch (e3) {
+          console.error("Add sprint item failed:", e3);
         }
       };
       sprintAddBtn.onclick = doAdd;
-      sprintAddInput.onkeydown = (e) => {
-        if (e.key === "Enter") doAdd();
+      sprintAddInput.onkeydown = (e3) => {
+        if (e3.key === "Enter") doAdd();
       };
     }
     {
@@ -9024,14 +9753,14 @@ Current: ${current || "(none)"}`,
             await api(`/projects/${project.id}/devlog`, { method: "POST", body: JSON.stringify({ text }) });
             appendText.value = "";
             toast("Appended to DEVLOG.md");
-          } catch (e) {
-            if (appendStatus) appendStatus.textContent = `Error: ${escapeHtml(String(e))}`;
+          } catch (e3) {
+            if (appendStatus) appendStatus.textContent = `Error: ${escapeHtml(String(e3))}`;
           } finally {
             appendBtn.disabled = false;
           }
         };
-        appendText.addEventListener("keydown", (e) => {
-          if ((e.ctrlKey || e.metaKey) && e.key === "Enter") appendBtn.click();
+        appendText.addEventListener("keydown", (e3) => {
+          if ((e3.ctrlKey || e3.metaKey) && e3.key === "Enter") appendBtn.click();
         });
       }
     }
@@ -9040,17 +9769,17 @@ Current: ${current || "(none)"}`,
     document.getElementById(`goal-north-star-${project.id}`).addEventListener("blur", () => saveNorthStar(project.id));
     document.getElementById(`goal-sprint-${project.id}`).addEventListener("blur", () => saveSprint(project.id));
     document.getElementById(`goal-${project.id}`).addEventListener("input", function() {
-      const p = state.panels[project.id];
-      this.classList.toggle("dirty", this.value !== (p._lastSaved || ""));
+      const p3 = state.panels[project.id];
+      this.classList.toggle("dirty", this.value !== (p3._lastSaved || ""));
     });
     document.getElementById(`goal-north-star-${project.id}`).addEventListener("input", function() {
-      const p = state.panels[project.id];
-      this.classList.toggle("dirty", this.value !== (p._serverNorthStar || ""));
+      const p3 = state.panels[project.id];
+      this.classList.toggle("dirty", this.value !== (p3._serverNorthStar || ""));
       autosizeGoalField(this);
     });
     document.getElementById(`goal-sprint-${project.id}`).addEventListener("input", function() {
-      const p = state.panels[project.id];
-      this.classList.toggle("dirty", this.value !== (p._serverSprint || ""));
+      const p3 = state.panels[project.id];
+      this.classList.toggle("dirty", this.value !== (p3._serverSprint || ""));
     });
     autosizeGoalField(document.getElementById(`goal-north-star-${project.id}`));
     const fileBackBtn = document.getElementById(`file-back-${project.id}`);
@@ -9069,13 +9798,13 @@ Current: ${current || "(none)"}`,
   var LIVE_THROTTLE_MS = 1e4;
   var liveRefreshState = {};
   function scheduleLiveRefresh(projectId) {
-    const s = liveRefreshState[projectId] || (liveRefreshState[projectId] = {});
-    clearTimeout(s.timer);
-    if (!s.enabled) return;
-    const sinceLastMs = Date.now() - (s.lastRefresh || 0);
+    const s3 = liveRefreshState[projectId] || (liveRefreshState[projectId] = {});
+    clearTimeout(s3.timer);
+    if (!s3.enabled) return;
+    const sinceLastMs = Date.now() - (s3.lastRefresh || 0);
     const wait = Math.max(LIVE_THROTTLE_MS, LIVE_REFRESH_MS - sinceLastMs);
-    s.timer = setTimeout(async () => {
-      s.lastRefresh = Date.now();
+    s3.timer = setTimeout(async () => {
+      s3.lastRefresh = Date.now();
       const panel = state.panels[projectId];
       if (panel && panel.activeVtab === "live") {
         await refreshLiveTab(projectId);
@@ -9084,23 +9813,23 @@ Current: ${current || "(none)"}`,
     }, wait);
   }
   function initLiveAutoRefresh(projectId) {
-    const s = liveRefreshState[projectId] || (liveRefreshState[projectId] = {});
+    const s3 = liveRefreshState[projectId] || (liveRefreshState[projectId] = {});
     const stored = localStorage.getItem(STORAGE_KEY2("meridian.liveAutoRefresh"));
-    s.enabled = stored === null ? true : stored === "true";
+    s3.enabled = stored === null ? true : stored === "true";
     const btn = document.getElementById(`live-auto-btn-${projectId}`);
     if (btn) {
-      btn.textContent = s.enabled ? "\u21BB Auto" : "\u21BB Off";
-      btn.style.opacity = s.enabled ? "1" : "0.4";
+      btn.textContent = s3.enabled ? "\u21BB Auto" : "\u21BB Off";
+      btn.style.opacity = s3.enabled ? "1" : "0.4";
       btn.onclick = () => {
-        s.enabled = !s.enabled;
-        localStorage.setItem(STORAGE_KEY2("meridian.liveAutoRefresh"), String(s.enabled));
-        btn.textContent = s.enabled ? "\u21BB Auto" : "\u21BB Off";
-        btn.style.opacity = s.enabled ? "1" : "0.4";
-        if (s.enabled) scheduleLiveRefresh(projectId);
-        else clearTimeout(s.timer);
+        s3.enabled = !s3.enabled;
+        localStorage.setItem(STORAGE_KEY2("meridian.liveAutoRefresh"), String(s3.enabled));
+        btn.textContent = s3.enabled ? "\u21BB Auto" : "\u21BB Off";
+        btn.style.opacity = s3.enabled ? "1" : "0.4";
+        if (s3.enabled) scheduleLiveRefresh(projectId);
+        else clearTimeout(s3.timer);
       };
     }
-    if (s.enabled) scheduleLiveRefresh(projectId);
+    if (s3.enabled) scheduleLiveRefresh(projectId);
   }
   async function loadLiveTab(projectId) {
     const panel = state.panels[projectId];
@@ -9164,8 +9893,8 @@ Current: ${current || "(none)"}`,
             if (addText) addText.value = "";
             addArea.style.display = "none";
             addToggle.textContent = "+ Expand";
-          } catch (e) {
-            toast("Failed: " + e.message, true);
+          } catch (e3) {
+            toast("Failed: " + e3.message, true);
           }
         };
       }
@@ -9200,8 +9929,8 @@ Current: ${current || "(none)"}`,
           const errEl = overlay.querySelector("#_new-sprint-err");
           const close = () => overlay.remove();
           overlay.querySelector("#_new-sprint-cancel").onclick = close;
-          overlay.onclick = (e) => {
-            if (e.target === overlay) close();
+          overlay.onclick = (e3) => {
+            if (e3.target === overlay) close();
           };
           const submit = async () => {
             const name = (inp.value || "").trim();
@@ -9215,16 +9944,16 @@ Current: ${current || "(none)"}`,
               await api(`/projects/${projectId}/goal/sprint`, { method: "POST", body: JSON.stringify({ sprint: name }) });
               toast(`Sprint set: ${name}`);
               close();
-            } catch (e) {
-              errEl.textContent = e.message || "Failed";
+            } catch (e3) {
+              errEl.textContent = e3.message || "Failed";
               errEl.style.display = "";
               overlay.querySelector("#_new-sprint-submit").disabled = false;
             }
           };
           overlay.querySelector("#_new-sprint-submit").onclick = submit;
-          inp.addEventListener("keydown", (e) => {
-            if (e.key === "Enter") submit();
-            if (e.key === "Escape") close();
+          inp.addEventListener("keydown", (e3) => {
+            if (e3.key === "Enter") submit();
+            if (e3.key === "Escape") close();
           });
           setTimeout(() => inp.focus(), 50);
         };
@@ -9260,7 +9989,7 @@ Current: ${current || "(none)"}`,
         const sessions = sessionsResult.value || [];
         renderLiveSessions(projectId, sessions, tasksResult.value || [], worktrees);
         cacheMostRecentSession(projectId, sessions);
-        const activeSession = sessions.find((s) => s.status === "active") || sessions[0];
+        const activeSession = sessions.find((s3) => s3.status === "active") || sessions[0];
         if (activeSession && activeSession.id) {
           loadSprintNotesPanel(projectId, activeSession.id).catch(() => {
           });
@@ -9283,13 +10012,13 @@ Current: ${current || "(none)"}`,
           wireProjectLoadRetry2(queueRoot, projectId);
         }
       }
-    } catch (e) {
+    } catch (e3) {
     }
   }
   function wireSprintAddEnter2(projectId, root) {
     const inp = root.querySelector(`#sprint-add-input-${projectId}`);
-    if (inp) inp.onkeydown = (e) => {
-      if (e.key === "Enter") addSprintItemFromInput2(projectId);
+    if (inp) inp.onkeydown = (e3) => {
+      if (e3.key === "Enter") addSprintItemFromInput2(projectId);
     };
   }
   async function sprintAction(projectId, itemId, action) {
@@ -9300,32 +10029,32 @@ Current: ${current || "(none)"}`,
       );
       toast(`Sprint item ${action}d`);
       await refreshLiveTab(projectId);
-    } catch (e) {
-      toast(`Failed: ${e.message}`, true);
+    } catch (e3) {
+      toast(`Failed: ${e3.message}`, true);
     }
   }
   async function sprintArchive(projectId, itemId) {
     if (!confirm("Permanently delete this backburner item? This cannot be undone.")) return;
     try {
-      const r = await fetch(`/projects/${projectId}/sprint-items/${itemId}`, { method: "DELETE" });
-      if (!r.ok && r.status !== 204) throw new Error(`${r.status}`);
+      const r3 = await fetch(`/projects/${projectId}/sprint-items/${itemId}`, { method: "DELETE" });
+      if (!r3.ok && r3.status !== 204) throw new Error(`${r3.status}`);
       toast("Backburner item deleted");
       await refreshLiveTab(projectId);
-    } catch (e) {
-      toast(`Delete failed: ${e.message}`, true);
+    } catch (e3) {
+      toast(`Delete failed: ${e3.message}`, true);
     }
   }
   function filterBackburner(projectId, value) {
-    const q = (value || "").trim().toLowerCase();
+    const q2 = (value || "").trim().toLowerCase();
     const sec = document.querySelector('.queue-section[data-section="backburner"]');
     if (!sec) return;
     sec.querySelectorAll(".queue-item").forEach((el) => {
-      const hit = !q || (el.dataset.bbTitle || "").includes(q) || (el.dataset.bbGroup || "").includes(q);
+      const hit = !q2 || (el.dataset.bbTitle || "").includes(q2) || (el.dataset.bbGroup || "").includes(q2);
       el.style.display = hit ? "" : "none";
     });
-    sec.querySelectorAll(".bb-group").forEach((g) => {
-      const anyVisible = Array.from(g.querySelectorAll(".queue-item")).some((el) => el.style.display !== "none");
-      g.style.display = anyVisible ? "" : "none";
+    sec.querySelectorAll(".bb-group").forEach((g2) => {
+      const anyVisible = Array.from(g2.querySelectorAll(".queue-item")).some((el) => el.style.display !== "none");
+      g2.style.display = anyVisible ? "" : "none";
     });
   }
   async function sprintPushPrompt(projectId, itemId) {
@@ -9338,8 +10067,8 @@ Current: ${current || "(none)"}`,
       );
       toast("Sprint item pushed to " + toVersion);
       await refreshLiveTab(projectId);
-    } catch (e) {
-      toast(`Push failed: ${e.message}`, true);
+    } catch (e3) {
+      toast(`Push failed: ${e3.message}`, true);
     }
   }
   async function sprintFeedback(projectId, itemId, thumb, currentThumb, event) {
@@ -9351,8 +10080,8 @@ Current: ${current || "(none)"}`,
         { method: "PATCH", body: JSON.stringify({ feedback_thumb: newThumb }) }
       );
       await refreshLiveTab(projectId);
-    } catch (e) {
-      toast("Feedback failed: " + e.message, true);
+    } catch (e3) {
+      toast("Feedback failed: " + e3.message, true);
     }
   }
   async function sprintFeedbackNote(projectId, itemId, note) {
@@ -9363,8 +10092,8 @@ Current: ${current || "(none)"}`,
         { method: "PATCH", body: JSON.stringify({ feedback_note: note.trim() }) }
       );
       await refreshLiveTab(projectId);
-    } catch (e) {
-      toast("Note save failed: " + e.message, true);
+    } catch (e3) {
+      toast("Note save failed: " + e3.message, true);
     }
   }
   async function sprintItemEdit(projectId, itemId) {
@@ -9401,8 +10130,8 @@ Current: ${current || "(none)"}`,
           body: JSON.stringify({ title: newTitle, version: newVersion || void 0 })
         });
         await refreshLiveTab(projectId);
-      } catch (e) {
-        toast(`Save failed: ${e.message}`, true);
+      } catch (e3) {
+        toast(`Save failed: ${e3.message}`, true);
         cancel();
       }
     };
@@ -9410,12 +10139,12 @@ Current: ${current || "(none)"}`,
       titleInput.replaceWith(titleSpan);
       verInput.replaceWith(verSpan);
     };
-    titleInput.onkeydown = verInput.onkeydown = (e) => {
-      if (e.key === "Enter") {
-        e.preventDefault();
+    titleInput.onkeydown = verInput.onkeydown = (e3) => {
+      if (e3.key === "Enter") {
+        e3.preventDefault();
         save();
       }
-      if (e.key === "Escape") cancel();
+      if (e3.key === "Escape") cancel();
     };
     titleInput.onblur = verInput.onblur = () => {
       setTimeout(() => {
@@ -9437,24 +10166,24 @@ Current: ${current || "(none)"}`,
       }
       section.style.display = "";
       if (divider) divider.style.display = "";
-      container.innerHTML = notes.map((n) => `
+      container.innerHTML = notes.map((n2) => `
 
       <div style="background:var(--surface-2);border:1px solid var(--border);border-left:3px solid var(--accent-green,#22c55e);border-radius:0 4px 4px 0;padding:6px 8px;margin-bottom:6px">
 
         <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:3px">
 
-          <span style="color:var(--accent-green,#22c55e);font-weight:600;font-size:11px">${escapeHtml(n.title || "")}</span>
+          <span style="color:var(--accent-green,#22c55e);font-weight:600;font-size:11px">${escapeHtml(n2.title || "")}</span>
 
-          <span style="color:var(--muted);font-size:9px">${escapeHtml((n.created_at || "").slice(0, 16).replace("T", " "))}</span>
+          <span style="color:var(--muted);font-size:9px">${escapeHtml((n2.created_at || "").slice(0, 16).replace("T", " "))}</span>
 
         </div>
 
-        <div style="color:var(--text);font-size:10px;line-height:1.5;white-space:pre-wrap;word-break:break-word">${typeof marked !== "undefined" ? marked.parse(n.body || "") : escapeHtml(n.body || "")}</div>
+        <div style="color:var(--text);font-size:10px;line-height:1.5;white-space:pre-wrap;word-break:break-word">${typeof marked !== "undefined" ? marked.parse(n2.body || "") : escapeHtml(n2.body || "")}</div>
 
       </div>
 
     `).join("");
-    } catch (_) {
+    } catch (_2) {
       section.style.display = "none";
       if (divider) divider.style.display = "none";
     }
@@ -9472,8 +10201,8 @@ Current: ${current || "(none)"}`,
     } else {
       const panel = state.panels[projectId];
       const sprint = panel && panel._serverSprint || "";
-      const m = sprint.match(/v[\w.+-]+/i);
-      version = m ? m[0] : "current";
+      const m3 = sprint.match(/v[\w.+-]+/i);
+      version = m3 ? m3[0] : "current";
       title = val;
     }
     if (!title) {
@@ -9494,17 +10223,17 @@ Current: ${current || "(none)"}`,
       inp.style.borderColor = "";
       toast("Sprint item added");
       await refreshLiveTab(projectId);
-    } catch (e) {
-      toast("Add failed: " + e.message, true);
+    } catch (e3) {
+      toast("Add failed: " + e3.message, true);
     }
   }
   function cacheMostRecentSession(projectId, sessions) {
     const panel = state.panels[projectId];
     if (!panel) return;
     const sorted = sessions.slice().sort(
-      (a, b) => (b.last_seen || "").localeCompare(a.last_seen || "")
+      (a3, b2) => (b2.last_seen || "").localeCompare(a3.last_seen || "")
     );
-    const top = sorted.find((s) => isLiveSession(s)) || sorted.find((s) => s.status !== "closed") || sorted[0];
+    const top = sorted.find((s3) => isLiveSession(s3)) || sorted.find((s3) => s3.status !== "closed") || sorted[0];
     if (top) panel.liveLastSessionId = top.id;
   }
   function renderLiveSessions(projectId, sessions, tasks, worktrees) {
@@ -9517,21 +10246,21 @@ Current: ${current || "(none)"}`,
     });
     const claimMap = /* @__PURE__ */ new Map();
     const taskMap = /* @__PURE__ */ new Map();
-    tasks.forEach((t) => {
-      if (t.claimed_by && (t.status === "pending" || t.status === "in_progress")) {
-        claimMap.set(t.claimed_by, t);
+    tasks.forEach((t3) => {
+      if (t3.claimed_by && (t3.status === "pending" || t3.status === "in_progress")) {
+        claimMap.set(t3.claimed_by, t3);
       }
-      const sid = t.session_id || t.claimed_by;
+      const sid = t3.session_id || t3.claimed_by;
       if (sid) {
         if (!taskMap.has(sid)) taskMap.set(sid, []);
-        taskMap.get(sid).push(t);
+        taskMap.get(sid).push(t3);
       }
     });
-    taskMap.forEach((rows2) => rows2.sort((a, b) => String(b.created_at || "").localeCompare(String(a.created_at || ""))));
-    const rows = sessions.map((s) => {
-      const ageMs = sessionAgeMs(s);
-      return { s, ageMs };
-    }).filter(({ ageMs }) => ageMs > 0 && ageMs <= 24 * 3600 * 1e3).sort((a, b) => a.ageMs - b.ageMs);
+    taskMap.forEach((rows2) => rows2.sort((a3, b2) => String(b2.created_at || "").localeCompare(String(a3.created_at || ""))));
+    const rows = sessions.map((s3) => {
+      const ageMs = sessionAgeMs(s3);
+      return { s: s3, ageMs };
+    }).filter(({ ageMs }) => ageMs > 0 && ageMs <= 24 * 3600 * 1e3).sort((a3, b2) => a3.ageMs - b2.ageMs);
     const LIVE_PRESENCE_MS = 10 * 60 * 1e3;
     const liveSection = root.closest(".live-section");
     const sectionDivider = liveSection ? liveSection.nextElementSibling : null;
@@ -9548,28 +10277,28 @@ Current: ${current || "(none)"}`,
       root.innerHTML = '<div class="live-empty">No active sessions.</div>';
       return;
     }
-    root.innerHTML = rows.map(({ s, ageMs }) => {
+    root.innerHTML = rows.map(({ s: s3, ageMs }) => {
       const mins = ageMs / 6e4;
-      const live = isLiveSession(s, ageMs);
+      const live = isLiveSession(s3, ageMs);
       const dot = live ? mins < 5 ? "\u{1F7E2}" : "\u{1F7E1}" : "\u26AB";
-      const displayStatus = live ? "live" : s.status === "closed" || s.status === "archived" ? s.status : "idle";
-      const label = s.human_id ? `${s.human_id}/${s.name}` : s.name;
-      const claimed = claimMap.get(s.id);
+      const displayStatus = live ? "live" : s3.status === "closed" || s3.status === "archived" ? s3.status : "idle";
+      const label = s3.human_id ? `${s3.human_id}/${s3.name}` : s3.name;
+      const claimed = claimMap.get(s3.id);
       const claimedRow = claimed ? `<div class="live-session-task">\u21B3 ${escapeHtml((claimed.description || "").slice(0, 140))}</div>` : "";
-      const sessionTasks = taskMap.get(s.id) || [];
+      const sessionTasks = taskMap.get(s3.id) || [];
       const taskRows = sessionTasks.slice(0, 3).map(
-        (t) => `<div class="live-session-task">\u21B3 ${escapeHtml((t.description || "").slice(0, 140))}</div>`
+        (t3) => `<div class="live-session-task">\u21B3 ${escapeHtml((t3.description || "").slice(0, 140))}</div>`
       ).join("") || claimedRow;
-      const taskLink = sessionTasks.length > 0 ? `<button class="link-button live-session-task-link" data-session-id="${escapeHtml(s.id)}" style="margin-left:18px;margin-top:3px;font-size:10px;color:var(--accent);background:none;border:none;padding:0;cursor:pointer">View all ${sessionTasks.length} tasks \u2192</button>` : "";
-      const summary = s.session_summary;
-      const summaryRow = summary && summary.summary && (s.status === "closed" || s.status === "archived") ? `<div class="live-session-outcome" style="font-size:10px;color:var(--muted);margin-top:3px;padding-left:18px">\u2713 ${escapeHtml((summary.summary || "").slice(0, 160))}` + (summary.tasks_completed != null ? ` \xB7 ${summary.tasks_completed} tasks` : "") + `</div>` : "";
-      const fw = s.agent_framework || "claude_code";
+      const taskLink = sessionTasks.length > 0 ? `<button class="link-button live-session-task-link" data-session-id="${escapeHtml(s3.id)}" style="margin-left:18px;margin-top:3px;font-size:10px;color:var(--accent);background:none;border:none;padding:0;cursor:pointer">View all ${sessionTasks.length} tasks \u2192</button>` : "";
+      const summary = s3.session_summary;
+      const summaryRow = summary && summary.summary && (s3.status === "closed" || s3.status === "archived") ? `<div class="live-session-outcome" style="font-size:10px;color:var(--muted);margin-top:3px;padding-left:18px">\u2713 ${escapeHtml((summary.summary || "").slice(0, 160))}` + (summary.tasks_completed != null ? ` \xB7 ${summary.tasks_completed} tasks` : "") + `</div>` : "";
+      const fw = s3.agent_framework || "claude_code";
       const fwBadge = fw && fw !== "claude_code" ? `<span class="framework-badge" title="framework: ${escapeHtml(fw)}" style="display:inline-block;background:var(--surface-2);color:var(--accent);font-size:9px;font-weight:600;padding:1px 5px;border-radius:3px;margin-left:4px">${escapeHtml(fw)}</span>` : "";
-      const sessionWorktrees = worktreeMap.get(s.id) || [];
+      const sessionWorktrees = worktreeMap.get(s3.id) || [];
       const worktreeBadges = sessionWorktrees.map(
         (branch) => `<span class="worktree-badge" title="active worktree: ${escapeHtml(branch)}" style="display:inline-block;background:var(--surface-2);color:#a78bfa;font-size:9px;font-weight:600;padding:1px 5px;border-radius:3px;margin-left:4px">\u2387 ${escapeHtml(branch.replace("worktree/", ""))}</span>`
       ).join("");
-      const endBtn = live ? `<button class="secondary live-session-end" data-session-id="${escapeHtml(s.id)}" style="padding:1px 6px;font-size:9px;margin-left:6px" title="Mark this session idle">End session</button>` : "";
+      const endBtn = live ? `<button class="secondary live-session-end" data-session-id="${escapeHtml(s3.id)}" style="padding:1px 6px;font-size:9px;margin-left:6px" title="Mark this session idle">End session</button>` : "";
       return `<div class="live-session-row" data-session-status="${escapeHtml(displayStatus)}">
 
       <div class="live-session-head">
@@ -9580,7 +10309,7 @@ Current: ${current || "(none)"}`,
 
         <span class="live-session-status" style="font-size:9px;color:var(--muted);text-transform:uppercase">${escapeHtml(displayStatus)}</span>
 
-        <span class="live-session-age">${escapeHtml(formatRelativeTime(s.last_seen))}</span>
+        <span class="live-session-age">${escapeHtml(formatRelativeTime(s3.last_seen))}</span>
 
         ${endBtn}
 
@@ -9606,8 +10335,8 @@ Current: ${current || "(none)"}`,
       });
       toast("Session marked idle");
       await refreshLiveTab(projectId);
-    } catch (e) {
-      toast(`End session failed: ${e.message}`, true);
+    } catch (e3) {
+      toast(`End session failed: ${e3.message}`, true);
     }
   }
   function openTimelineForSession(projectId, sessionId) {
@@ -9615,7 +10344,7 @@ Current: ${current || "(none)"}`,
     panel.timelineSessionFilter = sessionId || null;
     try {
       localStorage.setItem("meridian_tl_view_" + projectId, "tasks");
-    } catch (_) {
+    } catch (_2) {
     }
     const btn = document.querySelector(`#vtab-strip-${projectId} .vtab-btn[data-vtab="timeline"]`);
     if (btn) btn.click();
@@ -9624,42 +10353,42 @@ Current: ${current || "(none)"}`,
   function renderLiveQueue(projectId, tasks) {
     const root = document.getElementById(`live-queue-${projectId}`);
     if (!root) return;
-    const live = tasks.filter((t) => t.status === "pending" || t.status === "in_progress");
+    const live = tasks.filter((t3) => t3.status === "pending" || t3.status === "in_progress");
     if (!live.length) {
       root.innerHTML = '<div class="live-empty">Queue is empty. Add a task above.</div>';
       return;
     }
-    live.sort((a, b) => {
-      if (a.status !== b.status) return a.status === "in_progress" ? -1 : 1;
-      return (b.created_at || "").localeCompare(a.created_at || "");
+    live.sort((a3, b2) => {
+      if (a3.status !== b2.status) return a3.status === "in_progress" ? -1 : 1;
+      return (b2.created_at || "").localeCompare(a3.created_at || "");
     });
-    root.innerHTML = live.map((t) => {
-      const dot = t.status === "in_progress" ? "\u{1F535}" : "\u{1F4CB}";
-      const claimLabel = t.claimed_by_human_id || t.claimed_by_session_name || t.claimed_by || "";
-      const claimed = t.claimed_by ? `<span class="live-task-claim">claimed by: ${escapeHtml(claimLabel.slice(0, 24))}</span>` : "";
-      const ts = formatRelativeTime(t.created_at);
-      const eid = `live-expand-${projectId}-${t.id.slice(0, 8)}`;
+    root.innerHTML = live.map((t3) => {
+      const dot = t3.status === "in_progress" ? "\u{1F535}" : "\u{1F4CB}";
+      const claimLabel = t3.claimed_by_human_id || t3.claimed_by_session_name || t3.claimed_by || "";
+      const claimed = t3.claimed_by ? `<span class="live-task-claim">claimed by: ${escapeHtml(claimLabel.slice(0, 24))}</span>` : "";
+      const ts = formatRelativeTime(t3.created_at);
+      const eid = `live-expand-${projectId}-${t3.id.slice(0, 8)}`;
       const expandMeta = [
-        t.session_name ? `session: ${t.session_name}` : "",
-        t.claimed_by ? `claimed_by: ${t.claimed_by_human_id || t.claimed_by_session_name || t.claimed_by}` : "",
-        t.created_at ? `created: ${t.created_at}` : "",
-        t.claimed_at ? `claimed: ${t.claimed_at}` : ""
+        t3.session_name ? `session: ${t3.session_name}` : "",
+        t3.claimed_by ? `claimed_by: ${t3.claimed_by_human_id || t3.claimed_by_session_name || t3.claimed_by}` : "",
+        t3.created_at ? `created: ${t3.created_at}` : "",
+        t3.claimed_at ? `claimed: ${t3.claimed_at}` : ""
       ].filter(Boolean).join(" \xB7 ");
-      return `<div class="live-task-row" data-task="${escapeHtml(t.id)}">
+      return `<div class="live-task-row" data-task="${escapeHtml(t3.id)}">
 
       <span class="live-dot">${dot}</span>
 
       <div class="live-task-body" style="cursor:pointer" onclick="toggleExpand('${eid}')">
 
-        <div class="live-task-desc">${escapeHtml((t.description || "").slice(0, 200))}</div>
+        <div class="live-task-desc">${escapeHtml((t3.description || "").slice(0, 200))}</div>
 
         <div class="live-task-meta">${escapeHtml(ts)} ${claimed} <span class="expand-arrow" style="font-size:9px;color:var(--muted)">\u25B6</span></div>
 
-        <div id="${eid}" style="display:none;margin-top:4px;font-size:10px;color:var(--muted);white-space:pre-wrap;word-break:break-word">${escapeHtml(t.description || "")}${expandMeta ? "\n" + escapeHtml(expandMeta) : ""}</div>
+        <div id="${eid}" style="display:none;margin-top:4px;font-size:10px;color:var(--muted);white-space:pre-wrap;word-break:break-word">${escapeHtml(t3.description || "")}${expandMeta ? "\n" + escapeHtml(expandMeta) : ""}</div>
 
       </div>
 
-      <button class="live-task-cancel" data-cancel="${escapeHtml(t.id)}" title="Mark done / cancel">\xD7</button>
+      <button class="live-task-cancel" data-cancel="${escapeHtml(t3.id)}" title="Mark done / cancel">\xD7</button>
 
     </div>`;
     }).join("");
@@ -9674,7 +10403,7 @@ Current: ${current || "(none)"}`,
       try {
         const sessions = await api(`/projects/${projectId}/sessions`);
         cacheMostRecentSession(projectId, sessions || []);
-      } catch (e) {
+      } catch (e3) {
       }
     }
     const sid = panel && panel.liveLastSessionId;
@@ -9695,8 +10424,8 @@ Current: ${current || "(none)"}`,
       toast("task queued");
       await refreshLiveTab(projectId);
       return true;
-    } catch (e) {
-      toast("add task failed: " + e.message, true);
+    } catch (e3) {
+      toast("add task failed: " + e3.message, true);
       return false;
     }
   }
@@ -9708,8 +10437,8 @@ Current: ${current || "(none)"}`,
       });
       toast("task closed");
       await refreshLiveTab(projectId);
-    } catch (e) {
-      toast("cancel failed: " + e.message, true);
+    } catch (e3) {
+      toast("cancel failed: " + e3.message, true);
     }
   }
   function showCopyPreview(title, content) {
@@ -9735,13 +10464,13 @@ Current: ${current || "(none)"}`,
     const ta = overlay.querySelector("textarea");
     const close = () => overlay.remove();
     cancelBtn.onclick = close;
-    overlay.addEventListener("click", (e) => {
-      if (e.target === overlay) close();
+    overlay.addEventListener("click", (e3) => {
+      if (e3.target === overlay) close();
     });
     copyBtn.onclick = async () => {
       try {
         await navigator.clipboard.writeText(ta.value);
-      } catch (_) {
+      } catch (_2) {
         ta.select();
         document.execCommand("copy");
       }
@@ -9764,7 +10493,7 @@ Current: ${current || "(none)"}`,
         const parsed = JSON.parse(text);
         if (Array.isArray(parsed)) return parsed.map(normalizeTouchesFile).filter(Boolean);
         return [normalizeTouchesFile(parsed)].filter(Boolean);
-      } catch (e) {
+      } catch (e3) {
         return text.split(",").map(normalizeTouchesFile).filter(Boolean);
       }
     }
@@ -9798,13 +10527,13 @@ SEQUENTIAL MODE:
         const warnEl = document.getElementById(`touches-files-warning-${projectId}`);
         if (warnEl) warnEl.style.display = conflicts.length ? "" : "none";
         if (!conflicts.length) return true;
-        const files = Array.from(new Set(conflicts.map((c) => c.file))).join(", ");
+        const files = Array.from(new Set(conflicts.map((c3) => c3.file))).join(", ");
         return confirm(`touches_files conflict warning:
 
 ${files}
 
 Continue copying the handoff?`);
-      } catch (e) {
+      } catch (e3) {
         return true;
       }
     }
@@ -9812,12 +10541,12 @@ Continue copying the handoff?`);
     if (sequentialToggle) {
       try {
         sequentialToggle.checked = localStorage.getItem(sequentialKey) === "1";
-      } catch (e) {
+      } catch (e3) {
       }
       sequentialToggle.onchange = () => {
         try {
           localStorage.setItem(sequentialKey, sequentialToggle.checked ? "1" : "0");
-        } catch (e) {
+        } catch (e3) {
         }
       };
     }
@@ -9833,13 +10562,13 @@ Continue copying the handoff?`);
       copyStartChatBtn.textContent = "Loading\u2026";
       try {
         if (!await warnBeforeHandoffCopy()) return;
-        const r = await fetch(`/projects/${projectId}/handoff`, { method: "POST" });
-        if (!r.ok) throw new Error(`${r.status}`);
-        const payload = await r.json();
+        const r3 = await fetch(`/projects/${projectId}/handoff`, { method: "POST" });
+        if (!r3.ok) throw new Error(`${r3.status}`);
+        const payload = await r3.json();
         const text = applySequentialMode(payload.content || "");
         showCopyPreview("Claude / Codex Handoff", text);
-      } catch (e) {
-        toast("handoff failed: " + e.message, true);
+      } catch (e3) {
+        toast("handoff failed: " + e3.message, true);
       } finally {
         copyStartChatBtn.disabled = false;
         copyStartChatBtn.textContent = orig;
@@ -9875,8 +10604,8 @@ Project ID: ${projectId}`;
         btn.title = "Sign in to use";
         btn.style.opacity = "0.45";
         btn.style.cursor = "not-allowed";
-        btn.onclick = (e) => {
-          e.preventDefault();
+        btn.onclick = (e3) => {
+          e3.preventDefault();
           showDemoReadonlyToast();
         };
       });
@@ -9906,23 +10635,23 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
       if (resultEl) resultEl.style.display = "none";
       if (emptyEl) emptyEl.style.display = "none";
       try {
-        const r = await fetch(`/projects/${projectId}/start-worker-session`, {
+        const r3 = await fetch(`/projects/${projectId}/start-worker-session`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({})
         });
-        if (r.status === 404) {
+        if (r3.status === 404) {
           if (emptyEl) emptyEl.style.display = "";
           return;
         }
-        if (!r.ok) throw new Error(`${r.status}`);
-        const body = await r.json();
+        if (!r3.ok) throw new Error(`${r3.status}`);
+        const body = await r3.json();
         const xml = body.worker_context || "";
         if (xmlEl) xmlEl.textContent = xml;
         if (resultEl) resultEl.style.display = "";
         toast("worker session ready");
-      } catch (e) {
-        toast("start worker failed: " + e.message, true);
+      } catch (e3) {
+        toast("start worker failed: " + e3.message, true);
       }
     };
     const copyWorkerBtn = document.getElementById(`copy-worker-${projectId}`);
@@ -9936,8 +10665,8 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
       try {
         await navigator.clipboard.writeText(text);
         toast("worker context copied");
-      } catch (e) {
-        toast("copy failed: " + e.message, true);
+      } catch (e3) {
+        toast("copy failed: " + e3.message, true);
       }
     };
     const copyHandoffBtn = document.getElementById(`copy-handoff-${projectId}`);
@@ -9947,9 +10676,9 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
       copyHandoffBtn.textContent = "Loading\u2026";
       try {
         if (!await warnBeforeHandoffCopy()) return;
-        const r = await fetch(`/projects/${projectId}/handoff`, { method: "POST" });
-        if (!r.ok) throw new Error(`${r.status}`);
-        const payload = await r.json();
+        const r3 = await fetch(`/projects/${projectId}/handoff`, { method: "POST" });
+        if (!r3.ok) throw new Error(`${r3.status}`);
+        const payload = await r3.json();
         const text = applySequentialMode(payload.content || "");
         if (text) {
           const rawContainer = document.getElementById(`handoff-raw-${projectId}`);
@@ -9963,13 +10692,13 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
           try {
             await navigator.clipboard.writeText(text);
             toast("handoff copied to clipboard");
-          } catch (_) {
+          } catch (_2) {
             toast("text shown below \u2014 select all and copy");
           }
           stampHandoffTs(projectId, /* @__PURE__ */ new Date());
         }
-      } catch (e) {
-        toast("handoff failed: " + e.message, true);
+      } catch (e3) {
+        toast("handoff failed: " + e3.message, true);
       } finally {
         copyHandoffBtn.disabled = false;
         copyHandoffBtn.textContent = orig;
@@ -9982,7 +10711,7 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
       try {
         await navigator.clipboard.writeText(rawTextEl.value);
         toast("copied");
-      } catch (_) {
+      } catch (_2) {
         rawTextEl.select();
         document.execCommand("copy");
       }
@@ -9998,12 +10727,12 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
       copyContextBtn.disabled = true;
       copyContextBtn.textContent = "Loading\u2026";
       try {
-        const r = await fetch(`/projects/${projectId}/context-block?mode=chat`);
-        if (!r.ok) throw new Error(`${r.status}`);
-        const text = await r.text();
+        const r3 = await fetch(`/projects/${projectId}/context-block?mode=chat`);
+        if (!r3.ok) throw new Error(`${r3.status}`);
+        const text = await r3.text();
         showCopyPreview("Chat Context \u2014 paste into claude.ai", text);
-      } catch (e) {
-        toast("copy context failed: " + e.message, true);
+      } catch (e3) {
+        toast("copy context failed: " + e3.message, true);
       } finally {
         copyContextBtn.disabled = false;
         copyContextBtn.textContent = orig;
@@ -10016,9 +10745,9 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
       regenBtn.disabled = true;
       regenBtn.textContent = "Regenerating\u2026";
       try {
-        const r = await fetch(`/projects/${projectId}/handoff`, { method: "POST" });
-        if (!r.ok) throw new Error(`${r.status}`);
-        await r.json();
+        const r3 = await fetch(`/projects/${projectId}/handoff`, { method: "POST" });
+        if (!r3.ok) throw new Error(`${r3.status}`);
+        await r3.json();
         stampHandoffTs(projectId, /* @__PURE__ */ new Date());
         if (tsEl) {
           const prev = tsEl.textContent;
@@ -10026,8 +10755,8 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
           setTimeout(() => stampHandoffTs(projectId, /* @__PURE__ */ new Date()), 2e3);
         }
         toast("handoff regenerated");
-      } catch (e) {
-        toast("regenerate failed: " + e.message, true);
+      } catch (e3) {
+        toast("regenerate failed: " + e3.message, true);
       } finally {
         regenBtn.disabled = false;
         regenBtn.textContent = orig;
@@ -10044,18 +10773,18 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
     const sel = document.getElementById(`continue-session-${projectId}`);
     if (!sel) return;
     const sorted = (sessions || []).slice().sort(
-      (a, b) => (b.last_seen || "").localeCompare(a.last_seen || "")
+      (a3, b2) => (b2.last_seen || "").localeCompare(a3.last_seen || "")
     ).slice(0, 5);
     if (!sorted.length) {
       sel.innerHTML = '<option value="">(no sessions yet)</option>';
       return;
     }
     const prev = sel.value;
-    sel.innerHTML = sorted.map((s) => {
-      const label = `${s.name} \u2014 ${formatRelativeTime(s.last_seen)}`;
-      return `<option value="${escapeHtml(s.name)}">${escapeHtml(label)}</option>`;
+    sel.innerHTML = sorted.map((s3) => {
+      const label = `${s3.name} \u2014 ${formatRelativeTime(s3.last_seen)}`;
+      return `<option value="${escapeHtml(s3.name)}">${escapeHtml(label)}</option>`;
     }).join("");
-    if (prev && sorted.some((s) => s.name === prev)) sel.value = prev;
+    if (prev && sorted.some((s3) => s3.name === prev)) sel.value = prev;
   }
   async function loadTimeline2(projectId) {
     const wrap = document.getElementById(`timeline-wrap-${projectId}`);
@@ -10064,8 +10793,8 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
     let data;
     try {
       data = await api(`/projects/${projectId}/timeline`);
-    } catch (e) {
-      wrap.innerHTML = `<div class="timeline-empty">timeline failed: ${escapeHtml(e.message)}</div>`;
+    } catch (e3) {
+      wrap.innerHTML = `<div class="timeline-empty">timeline failed: ${escapeHtml(e3.message)}</div>`;
       return;
     }
     renderTimeline(projectId, data);
@@ -10085,19 +10814,19 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
       return isAbs ? new Date(iso).toISOString().replace("T", " ").slice(0, 16) : formatRelativeTime(ts);
     };
     const events = [];
-    tasks.forEach((t) => {
-      const icon = { done: "\u2705", failed: "\u274C" }[t.status] || "\u2022";
-      events.push({ ts: t.created_at, actor: t.session_name || "(unknown)", desc: `${icon} ${(t.description || "").slice(0, 100)}` });
+    tasks.forEach((t3) => {
+      const icon = { done: "\u2705", failed: "\u274C" }[t3.status] || "\u2022";
+      events.push({ ts: t3.created_at, actor: t3.session_name || "(unknown)", desc: `${icon} ${(t3.description || "").slice(0, 100)}` });
     });
     const goalByField = /* @__PURE__ */ new Map();
-    goal_events.forEach((g) => {
-      const key = g.field + (g.updated_at || "").slice(0, 13);
-      if (!goalByField.has(key) || g.version > (goalByField.get(key).version || 0)) goalByField.set(key, g);
+    goal_events.forEach((g2) => {
+      const key = g2.field + (g2.updated_at || "").slice(0, 13);
+      if (!goalByField.has(key) || g2.version > (goalByField.get(key).version || 0)) goalByField.set(key, g2);
     });
-    goalByField.forEach((g) => events.push({ ts: g.updated_at || "", actor: "goal", desc: `\u{1F4CB} ${g.field} \u2192 v${g.version}` }));
-    events.sort((a, b) => (b.ts || "").localeCompare(a.ts || ""));
+    goalByField.forEach((g2) => events.push({ ts: g2.updated_at || "", actor: "goal", desc: `\u{1F4CB} ${g2.field} \u2192 v${g2.version}` }));
+    events.sort((a3, b2) => (b2.ts || "").localeCompare(a3.ts || ""));
     wrap.innerHTML = `<div class="timeline-log">${events.map(
-      (e) => `<div class="timeline-log-entry"><span class="timeline-log-ts">${escapeHtml(fmtTs(e.ts))}</span><span class="timeline-log-actor">${escapeHtml(e.actor)}</span><span class="timeline-log-desc">${escapeHtml(e.desc)}</span></div>`
+      (e3) => `<div class="timeline-log-entry"><span class="timeline-log-ts">${escapeHtml(fmtTs(e3.ts))}</span><span class="timeline-log-actor">${escapeHtml(e3.actor)}</span><span class="timeline-log-desc">${escapeHtml(e3.desc)}</span></div>`
     ).join("")}</div>`;
   }
   var _TOOL_CATEGORIES = {
@@ -10150,13 +10879,13 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
         return;
       }
       const byName = {};
-      tools.forEach((t) => {
-        byName[t.name] = t;
+      tools.forEach((t3) => {
+        byName[t3.name] = t3;
       });
       let html = "";
       const categorized = /* @__PURE__ */ new Set();
       for (const [cat, names] of Object.entries(_TOOL_CATEGORIES)) {
-        const catTools = names.map((n) => byName[n]).filter(Boolean);
+        const catTools = names.map((n2) => byName[n2]).filter(Boolean);
         if (!catTools.length) continue;
         html += `<div style="margin-bottom:18px"><div style="color:var(--accent);font-size:10px;letter-spacing:.06em;text-transform:uppercase;margin-bottom:8px;padding-bottom:4px;border-bottom:1px solid var(--border)">${_CATEGORY_LABELS[cat]}</div>`;
         catTools.forEach((tool) => {
@@ -10165,7 +10894,7 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
         });
         html += "</div>";
       }
-      const rest = tools.filter((t) => !categorized.has(t.name));
+      const rest = tools.filter((t3) => !categorized.has(t3.name));
       if (rest.length) {
         html += `<div style="margin-bottom:18px"><div style="color:var(--accent);font-size:10px;letter-spacing:.06em;text-transform:uppercase;margin-bottom:8px;padding-bottom:4px;border-bottom:1px solid var(--border)">Other</div>`;
         rest.forEach((tool) => {
@@ -10176,8 +10905,8 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
       const _toolSearch = `<div style="position:sticky;top:0;background:var(--surface-1,#10131a);padding:0 0 8px;margin-bottom:6px;z-index:2"><input type="text" id="docs-search-${projectId}" placeholder="Search tools by name or description\u2026" style="width:100%;box-sizing:border-box;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;color:var(--text);font-size:12px;font-family:var(--font-mono);padding:5px 9px;outline:none"></div>`;
       body.innerHTML = _toolSearch + html;
       _wireTabSearch(`docs-search-${projectId}`, `docs-body-${projectId}`, ".tool-entry");
-    } catch (e) {
-      body.innerHTML = `<div style="color:var(--error)">Failed to load tools: ${escapeHtml(String(e))}</div>`;
+    } catch (e3) {
+      body.innerHTML = `<div style="color:var(--error)">Failed to load tools: ${escapeHtml(String(e3))}</div>`;
     }
   }
   async function _initCodeIntelTabVisibility(projectId) {
@@ -10188,63 +10917,63 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
       if (!btn) return;
       const isActive = !!(data && data.active && data.active.code);
       btn.style.display = isActive ? "" : "none";
-    } catch (_) {
+    } catch (_2) {
     }
   }
   function _repoPathToProject(repoPath) {
     return String(repoPath || "").replace(/[\\/:]+/g, "-").replace(/^-+|-+$/g, "");
   }
   function _codeArchSection(archText) {
-    const rawPre = (t) => `<pre style="font-size:10px;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;padding:10px;white-space:pre-wrap;word-break:break-all;color:var(--text);margin:0;line-height:1.5">${escapeHtml(t || "(no architecture returned)")}</pre>`;
+    const rawPre = (t3) => `<pre style="font-size:10px;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;padding:10px;white-space:pre-wrap;word-break:break-all;color:var(--text);margin:0;line-height:1.5">${escapeHtml(t3 || "(no architecture returned)")}</pre>`;
     let arch = null;
     try {
       arch = JSON.parse(archText);
-    } catch (_) {
+    } catch (_2) {
       arch = null;
     }
     if (!arch || typeof arch !== "object") return { html: rawPre(archText), charts: [] };
-    const arr = (v) => Array.isArray(v) ? v : [];
-    const num = (v) => typeof v === "number" ? v : parseFloat(v);
-    const fin = (v) => Number.isFinite(num(v));
+    const arr = (v3) => Array.isArray(v3) ? v3 : [];
+    const num = (v3) => typeof v3 === "number" ? v3 : parseFloat(v3);
+    const fin = (v3) => Number.isFinite(num(v3));
     const charts = [];
     let html = "";
-    const nodes = arr(arch.node_labels).filter((d) => d && d.label != null && fin(d.count));
+    const nodes = arr(arch.node_labels).filter((d3) => d3 && d3.label != null && fin(d3.count));
     if (nodes.length) {
       html += `<div style="margin-bottom:14px"><div style="font-size:9px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px">Node types</div><canvas id="ci-nodes" height="120"></canvas></div>`;
       charts.push({ id: "ci-nodes", config: {
         type: "bar",
-        data: { labels: nodes.map((d) => String(d.label)), datasets: [{ data: nodes.map((d) => num(d.count)), backgroundColor: "rgba(96,165,250,0.7)", borderRadius: 2 }] },
+        data: { labels: nodes.map((d3) => String(d3.label)), datasets: [{ data: nodes.map((d3) => num(d3.count)), backgroundColor: "rgba(96,165,250,0.7)", borderRadius: 2 }] },
         options: { responsive: true, plugins: { legend: { display: false } }, scales: {
           x: { ticks: { color: "#9ca3af", font: { size: 9 }, maxRotation: 45 }, grid: { color: "#1f2937" } },
           y: { beginAtZero: true, ticks: { color: "#9ca3af", font: { size: 9 } }, grid: { color: "#1f2937" } }
         } }
       } });
     }
-    const edges = arr(arch.edge_types).filter((d) => d && d.type != null && fin(d.count)).sort((a, b) => num(b.count) - num(a.count)).slice(0, 6);
+    const edges = arr(arch.edge_types).filter((d3) => d3 && d3.type != null && fin(d3.count)).sort((a3, b2) => num(b2.count) - num(a3.count)).slice(0, 6);
     if (edges.length) {
       const palette = ["#60a5fa", "#34d399", "#fbbf24", "#f87171", "#a78bfa", "#f472b6"];
       html += `<div style="margin-bottom:14px"><div style="font-size:9px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px">Top edge types</div><div style="max-width:230px;margin:0 auto"><canvas id="ci-edges" height="200"></canvas></div></div>`;
       charts.push({ id: "ci-edges", config: {
         type: "doughnut",
-        data: { labels: edges.map((d) => String(d.type)), datasets: [{ data: edges.map((d) => num(d.count)), backgroundColor: palette, borderWidth: 0 }] },
+        data: { labels: edges.map((d3) => String(d3.type)), datasets: [{ data: edges.map((d3) => num(d3.count)), backgroundColor: palette, borderWidth: 0 }] },
         options: { responsive: true, plugins: { legend: { position: "right", labels: { color: "#9ca3af", font: { size: 9 }, boxWidth: 10 } } } }
       } });
     }
-    const hot = arr(arch.hotspots).filter((d) => d && d.name != null && fin(d.fan_in)).sort((a, b) => num(b.fan_in) - num(a.fan_in)).slice(0, 10);
+    const hot = arr(arch.hotspots).filter((d3) => d3 && d3.name != null && fin(d3.fan_in)).sort((a3, b2) => num(b2.fan_in) - num(a3.fan_in)).slice(0, 10);
     if (hot.length) {
-      const maxFan = Math.max(...hot.map((d) => num(d.fan_in)), 1);
+      const maxFan = Math.max(...hot.map((d3) => num(d3.fan_in)), 1);
       html += `<div style="margin-bottom:14px"><div style="font-size:9px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px">Hotspots (fan-in)</div>`;
-      for (const h of hot) {
-        const pct = Math.round(num(h.fan_in) / maxFan * 100);
+      for (const h2 of hot) {
+        const pct = Math.round(num(h2.fan_in) / maxFan * 100);
         html += `<div style="display:flex;align-items:center;gap:8px;margin-bottom:4px">
-        <div style="flex:1;min-width:0;font-size:10px;color:var(--text);font-family:var(--font-mono);white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="${escapeHtml(String(h.name))}">${escapeHtml(String(h.name))}</div>
+        <div style="flex:1;min-width:0;font-size:10px;color:var(--text);font-family:var(--font-mono);white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="${escapeHtml(String(h2.name))}">${escapeHtml(String(h2.name))}</div>
         <div style="flex:1;background:var(--surface-1);border-radius:3px;height:10px;overflow:hidden"><div style="width:${pct}%;height:100%;background:var(--accent)"></div></div>
-        <div style="width:30px;text-align:right;font-size:10px;color:var(--muted)">${num(h.fan_in)}</div>
+        <div style="width:30px;text-align:right;font-size:10px;color:var(--muted)">${num(h2.fan_in)}</div>
       </div>`;
       }
       html += `</div>`;
     }
-    const pkgs = arr(arch.packages).filter((d) => d && d.name != null && fin(d.node_count)).sort((a, b) => num(b.node_count) - num(a.node_count)).slice(0, 15);
+    const pkgs = arr(arch.packages).filter((d3) => d3 && d3.name != null && fin(d3.node_count)).sort((a3, b2) => num(b2.node_count) - num(a3.node_count)).slice(0, 15);
     if (pkgs.length) {
       html += `<div style="margin-bottom:14px"><div style="font-size:9px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px">Packages</div><table style="width:100%;border-collapse:collapse;font-size:10px">`;
       for (const pk of pkgs) {
@@ -10252,9 +10981,9 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
       }
       html += `</table></div>`;
     }
-    const layers = arr(arch.layers).filter((d) => d && d.name != null);
+    const layers = arr(arch.layers).filter((d3) => d3 && d3.name != null);
     if (layers.length) {
-      const sorted = [...layers].sort((a, b) => a.layer > b.layer ? -1 : a.layer < b.layer ? 1 : 0);
+      const sorted = [...layers].sort((a3, b2) => a3.layer > b2.layer ? -1 : a3.layer < b2.layer ? 1 : 0);
       html += `<div style="margin-bottom:14px"><div style="font-size:9px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px">Layers</div><div style="display:flex;flex-direction:column;gap:4px">`;
       for (const ly of sorted) {
         html += `<div style="padding:6px 10px;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;font-size:10px;color:var(--text);display:flex;justify-content:space-between">
@@ -10271,11 +11000,11 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
   function _normalizeGraphEdges(queryResult) {
     let rows = [];
     try {
-      const txt = (queryResult && queryResult.content || []).map((c) => c.text || "").join("").trim();
+      const txt = (queryResult && queryResult.content || []).map((c3) => c3.text || "").join("").trim();
       if (!txt) return [];
       const obj = JSON.parse(txt);
       rows = Array.isArray(obj) ? obj : obj.rows || obj.data || obj.results || obj.records || [];
-    } catch (_) {
+    } catch (_2) {
       return [];
     }
     const edges = [];
@@ -10295,38 +11024,38 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
   }
   if (typeof window !== "undefined") window._normalizeGraphEdges = _normalizeGraphEdges;
   function _buildCodebaseForceGraph(packages, edges, view) {
-    const pkgs = (packages || []).filter((p) => p && p.name != null);
+    const pkgs = (packages || []).filter((p3) => p3 && p3.name != null);
     if (!pkgs.length) return null;
-    const layers = [...new Set(pkgs.map((p) => String(p.layer != null ? p.layer : "other")))];
+    const layers = [...new Set(pkgs.map((p3) => String(p3.layer != null ? p3.layer : "other")))];
     const palette = ["#60a5fa", "#34d399", "#fbbf24", "#f87171", "#a78bfa", "#f472b6", "#22d3ee"];
     const layerColor = {};
-    layers.forEach((l, i) => {
-      layerColor[l] = palette[i % palette.length];
+    layers.forEach((l3, i3) => {
+      layerColor[l3] = palette[i3 % palette.length];
     });
     const degree = {};
-    (edges || []).forEach((e) => {
-      if (!e) return;
-      degree[e.source] = (degree[e.source] || 0) + (Number(e.value) || 1);
-      degree[e.target] = (degree[e.target] || 0) + (Number(e.value) || 1);
+    (edges || []).forEach((e3) => {
+      if (!e3) return;
+      degree[e3.source] = (degree[e3.source] || 0) + (Number(e3.value) || 1);
+      degree[e3.target] = (degree[e3.target] || 0) + (Number(e3.value) || 1);
     });
-    const metric = (p) => view === "hotspots" ? degree[String(p.name)] || 0 : Number(p.node_count) || 0;
+    const metric = (p3) => view === "hotspots" ? degree[String(p3.name)] || 0 : Number(p3.node_count) || 0;
     const maxMetric = Math.max(1, ...pkgs.map(metric));
-    const nodes = pkgs.map((p) => {
-      const lyr = String(p.layer != null ? p.layer : "other");
+    const nodes = pkgs.map((p3) => {
+      const lyr = String(p3.layer != null ? p3.layer : "other");
       return {
-        name: String(p.name),
-        value: metric(p),
-        symbolSize: 8 + 42 * (metric(p) / maxMetric),
+        name: String(p3.name),
+        value: metric(p3),
+        symbolSize: 8 + 42 * (metric(p3) / maxMetric),
         category: layers.indexOf(lyr),
         itemStyle: { color: layerColor[lyr] }
       };
     });
-    const names = new Set(nodes.map((n) => n.name));
-    const links = (edges || []).filter((e) => e && names.has(e.source) && names.has(e.target) && e.source !== e.target).map((e) => ({
-      source: e.source,
-      target: e.target,
-      value: Number(e.value) || 1,
-      lineStyle: { width: Math.min(6, 1 + (Number(e.value) || 1) / 3) }
+    const names = new Set(nodes.map((n2) => n2.name));
+    const links = (edges || []).filter((e3) => e3 && names.has(e3.source) && names.has(e3.target) && e3.source !== e3.target).map((e3) => ({
+      source: e3.source,
+      target: e3.target,
+      value: Number(e3.value) || 1,
+      lineStyle: { width: Math.min(6, 1 + (Number(e3.value) || 1) / 3) }
     }));
     return {
       tooltip: { confine: true },
@@ -10336,7 +11065,7 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
         layout: "force",
         roam: true,
         draggable: true,
-        categories: layers.map((l) => ({ name: l })),
+        categories: layers.map((l3) => ({ name: l3 })),
         label: { show: true, fontSize: 9, color: "#e5e7eb", position: "right" },
         force: { repulsion: 140, edgeLength: 90, gravity: 0.08 },
         data: nodes,
@@ -10356,21 +11085,21 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
     let chart;
     try {
       chart = window.echarts.init(el);
-    } catch (_) {
+    } catch (_2) {
       return;
     }
     chart.setOption(opt);
     const setView = (view) => {
-      const o = _buildCodebaseForceGraph(packages, edges, view);
-      if (o) chart.setOption(o, true);
-      document.querySelectorAll(`[data-cg-toggle][data-cg-for="${containerId}"]`).forEach((b) => {
-        const on = b.getAttribute("data-cg-toggle") === view;
-        b.style.color = on ? "var(--text)" : "var(--muted)";
-        b.style.borderColor = on ? "var(--accent)" : "var(--border)";
+      const o3 = _buildCodebaseForceGraph(packages, edges, view);
+      if (o3) chart.setOption(o3, true);
+      document.querySelectorAll(`[data-cg-toggle][data-cg-for="${containerId}"]`).forEach((b2) => {
+        const on = b2.getAttribute("data-cg-toggle") === view;
+        b2.style.color = on ? "var(--text)" : "var(--muted)";
+        b2.style.borderColor = on ? "var(--accent)" : "var(--border)";
       });
     };
-    document.querySelectorAll(`[data-cg-toggle][data-cg-for="${containerId}"]`).forEach((b) => {
-      b.onclick = () => setView(b.getAttribute("data-cg-toggle"));
+    document.querySelectorAll(`[data-cg-toggle][data-cg-for="${containerId}"]`).forEach((b2) => {
+      b2.onclick = () => setView(b2.getAttribute("data-cg-toggle"));
     });
     setView("packages");
   }
@@ -10385,25 +11114,25 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
     }
     out.innerHTML = `<div style="font-size:10px;color:var(--muted)">rendering map\u2026</div>`;
     try {
-      const r = await fetch(`/projects/${encodeURIComponent(projectId)}/codebase-map`, {
+      const r3 = await fetch(`/projects/${encodeURIComponent(projectId)}/codebase-map`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ packages: data.packages, edges: data.edges, hotspots: false })
       });
-      if (r.status === 503) {
-        const body2 = await r.json().catch(() => ({}));
+      if (r3.status === 503) {
+        const body2 = await r3.json().catch(() => ({}));
         out.innerHTML = `<div style="font-size:10px;color:#e0b400;border:1px solid #c79a00;border-radius:4px;padding:6px 8px;background:rgba(199,154,0,0.10)">&#9888; ${escapeHtml(body2.message || "Graphviz is not installed on the server.")}</div>`;
         return;
       }
-      if (!r.ok) throw new Error(`HTTP ${r.status}`);
-      const body = await r.json();
+      if (!r3.ok) throw new Error(`HTTP ${r3.status}`);
+      const body = await r3.json();
       if (body.image) {
         out.innerHTML = `<img src="${body.image}" alt="Codebase package map" style="max-width:100%;border:1px solid var(--border);border-radius:4px;background:#0b0e14">`;
       } else {
         out.innerHTML = `<div style="font-size:10px;color:var(--error)">No image returned.</div>`;
       }
-    } catch (e) {
-      out.innerHTML = `<div style="font-size:10px;color:var(--error)">Map generation failed: ${escapeHtml(String(e))}</div>`;
+    } catch (e3) {
+      out.innerHTML = `<div style="font-size:10px;color:var(--error)">Map generation failed: ${escapeHtml(String(e3))}</div>`;
     }
   }
   if (typeof window !== "undefined") window._generateCodebaseMap = _generateCodebaseMap;
@@ -10428,13 +11157,13 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
       }
       const codeBase = `/code/mcp/${tenantId}/mcp`;
       async function _codeMcpCall(method, params) {
-        const r = await fetch(codeBase, {
+        const r3 = await fetch(codeBase, {
           method: "POST",
           headers: { "Content-Type": "application/json", "Accept": "application/json, text/event-stream" },
           body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params: params || {} })
         });
-        if (!r.ok) throw new Error(`HTTP ${r.status}`);
-        const text = await r.text();
+        if (!r3.ok) throw new Error(`HTTP ${r3.status}`);
+        const text = await r3.text();
         let parsed = null;
         if (text.trim().startsWith("{")) {
           parsed = JSON.parse(text);
@@ -10443,7 +11172,7 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
             if (line.startsWith("data:")) {
               try {
                 parsed = JSON.parse(line.slice(5).trim());
-              } catch (_) {
+              } catch (_2) {
               }
             }
           }
@@ -10456,7 +11185,7 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
       try {
         const tlResult = await _codeMcpCall("tools/list", {});
         toolCount = (tlResult?.tools || []).length;
-      } catch (_) {
+      } catch (_2) {
       }
       const execCfg = settingsData?.executor_config || {};
       const repoPaths = Array.isArray(execCfg.repo_paths) ? execCfg.repo_paths : [];
@@ -10464,25 +11193,15 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
       let archCharts = [];
       let _graphPackages = [];
       let _graphEdges = [];
+      let _graphArch = null;
+      let _archError = "";
       const _cgId = `ci-forcegraph-${projectId}`;
       html += `<div style="display:flex;align-items:center;gap:8px;margin-bottom:14px">
       <span style="width:8px;height:8px;border-radius:50%;background:#22c55e;display:inline-block;flex-shrink:0"></span>
       <span style="font-size:11px;color:var(--text);font-weight:600">Code Intel Live</span>
       ${toolCount ? `<span style="font-size:10px;color:var(--muted)">${toolCount} tool${toolCount !== 1 ? "s" : ""}</span>` : ""}
     </div>`;
-      html += `<div style="margin-bottom:16px">
-      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px">
-        <div style="font-size:10px;color:var(--accent);text-transform:uppercase;letter-spacing:.06em">Package Graph</div>
-        <div style="display:flex;gap:4px;align-items:center">
-          <button data-cg-toggle="packages" data-cg-for="${_cgId}" style="background:none;border:1px solid var(--accent);border-radius:3px;color:var(--text);font-size:9px;font-family:var(--font-mono);padding:2px 8px;cursor:pointer">Packages</button>
-          <button data-cg-toggle="hotspots" data-cg-for="${_cgId}" style="background:none;border:1px solid var(--border);border-radius:3px;color:var(--muted);font-size:9px;font-family:var(--font-mono);padding:2px 8px;cursor:pointer">Hotspots</button>
-          <button id="${_cgId}-genmap" onclick="_generateCodebaseMap(${JSON.stringify(projectId)})" style="background:none;border:1px solid var(--border);border-radius:3px;color:var(--muted);font-size:9px;font-family:var(--font-mono);padding:2px 8px;cursor:pointer" title="Render a static PNG map via Graphviz">Generate Map</button>
-        </div>
-      </div>
-      <div id="${_cgId}" style="width:100%;height:400px;background:var(--surface-1);border:1px solid var(--border);border-radius:4px"></div>
-      <div id="${_cgId}-empty" style="display:none;font-size:10px;color:var(--muted);margin-top:4px">No package graph yet \u2014 index the repo to populate it.</div>
-      <div id="${_cgId}-map" style="margin-top:8px"></div>
-    </div>`;
+      html += `<div style="margin-bottom:16px"><div id="${_cgId}-panel"></div></div>`;
       html += `<div style="margin-bottom:16px"><div style="font-size:10px;color:var(--accent);text-transform:uppercase;letter-spacing:.06em;margin-bottom:8px;padding-bottom:4px;border-bottom:1px solid var(--border)">Index Status</div>`;
       if (repoPaths.length) {
         for (const rp of repoPaths) {
@@ -10491,15 +11210,15 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
           if (!cwd) continue;
           try {
             const result = await _codeMcpCall("tools/call", { name: "index_status", arguments: { project: _repoPathToProject(cwd) } });
-            const text = (result?.content || []).map((c) => c.text || "").join("").trim();
+            const text = (result?.content || []).map((c3) => c3.text || "").join("").trim();
             html += `<div style="margin-bottom:10px">
             <div style="font-size:10px;color:var(--text);font-weight:600;margin-bottom:4px">${escapeHtml(cwd)}${hostname ? `<span style="color:var(--muted);font-weight:400"> \xB7 ${escapeHtml(hostname)}</span>` : ""}</div>
             <pre style="font-size:10px;background:var(--surface-1);border:1px solid var(--border);border-radius:4px;padding:8px;white-space:pre-wrap;word-break:break-all;color:var(--text);margin:0;line-height:1.5">${escapeHtml(text || "(no status returned)")}</pre>
           </div>`;
-          } catch (e) {
+          } catch (e3) {
             html += `<div style="margin-bottom:10px">
             <div style="font-size:10px;color:var(--text);font-weight:600;margin-bottom:4px">${escapeHtml(cwd)}</div>
-            <div style="font-size:10px;color:var(--error)">index_status failed: ${escapeHtml(String(e))}</div>
+            <div style="font-size:10px;color:var(--error)">index_status failed: ${escapeHtml(String(e3))}</div>
           </div>`;
           }
         }
@@ -10512,14 +11231,15 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
         const archPath = repoPaths.length ? typeof repoPaths[0] === "string" ? repoPaths[0] : repoPaths[0].cwd || "" : "";
         const archArgs = archPath ? { project: _repoPathToProject(archPath) } : {};
         const archResult = await _codeMcpCall("tools/call", { name: "get_architecture", arguments: archArgs });
-        const archText = (archResult?.content || []).map((c) => c.text || "").join("").trim();
+        const archText = (archResult?.content || []).map((c3) => c3.text || "").join("").trim();
         const archSection = _codeArchSection(archText);
         html += archSection.html;
         archCharts = archSection.charts;
         try {
           const _arch = JSON.parse(archText);
+          _graphArch = _arch;
           _graphPackages = Array.isArray(_arch?.packages) ? _arch.packages : [];
-        } catch (_) {
+        } catch (_2) {
           _graphPackages = [];
         }
         if (_graphPackages.length) {
@@ -10529,73 +11249,89 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
               cypher: "MATCH (a)-[r]->(b) WHERE a.package <> b.package RETURN a.package, b.package, count(r)"
             } });
             _graphEdges = _normalizeGraphEdges(_edgeRes);
-          } catch (_) {
+          } catch (_2) {
             _graphEdges = [];
           }
         }
-      } catch (e) {
-        html += `<div style="font-size:10px;color:var(--error)">get_architecture failed: ${escapeHtml(String(e))}</div>`;
+      } catch (e3) {
+        _archError = String(e3);
+        html += `<div style="font-size:10px;color:var(--error)">get_architecture failed: ${escapeHtml(String(e3))}</div>`;
       }
       html += `<div style="margin-top:8px;display:flex;gap:6px">
       <button class="secondary" style="font-size:10px;padding:3px 10px" onclick="loadCodeIntelTab(${JSON.stringify(projectId)})">\u21BA Refresh</button>
     </div></div>`;
       body.innerHTML = html;
       if (window.Chart && archCharts.length) {
-        for (const c of archCharts) {
-          const el = document.getElementById(c.id);
+        for (const c3 of archCharts) {
+          const el = document.getElementById(c3.id);
           if (el) {
             try {
-              new Chart(el, c.config);
-            } catch (_) {
+              new Chart(el, c3.config);
+            } catch (_2) {
             }
           }
         }
       }
       window._codeGraphData = window._codeGraphData || {};
       window._codeGraphData[projectId] = { packages: _graphPackages, edges: _graphEdges, cgId: _cgId };
-      if (_graphPackages.length) {
-        _renderCodebaseGraph(_cgId, _graphPackages, _graphEdges);
-      } else {
-        const _ph = document.getElementById(_cgId);
-        const _em = document.getElementById(`${_cgId}-empty`);
-        if (_ph) _ph.style.display = "none";
-        if (_em) _em.style.display = "block";
+      const _panelEl = document.getElementById(`${_cgId}-panel`);
+      if (_panelEl) {
+        mountCodeIntelPanel(_panelEl, {
+          status: _archError ? "error" : "ready",
+          error: _archError,
+          architecture: _graphArch || { packages: _graphPackages },
+          onGenerateMap: async () => {
+            const r3 = await fetch(`/projects/${encodeURIComponent(projectId)}/codebase-map`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ packages: _graphPackages, edges: _graphEdges, hotspots: false })
+            });
+            if (r3.status === 503) {
+              const b3 = await r3.json().catch(() => ({}));
+              throw new Error(b3.message || "Graphviz is not installed on the server.");
+            }
+            if (!r3.ok) throw new Error(`HTTP ${r3.status}`);
+            const b2 = await r3.json();
+            if (!b2.image) throw new Error("No image returned.");
+            return b2.image;
+          }
+        });
       }
-    } catch (e) {
-      body.innerHTML = `<div style="color:var(--error)">Failed to load code intel: ${escapeHtml(String(e))}</div>`;
+    } catch (e3) {
+      body.innerHTML = `<div style="color:var(--error)">Failed to load code intel: ${escapeHtml(String(e3))}</div>`;
     }
   }
   function normalizeNotifyTarget(raw) {
-    const v = (raw || "").trim();
-    if (!v) return "";
-    if (v.includes("://") || v.includes("@") || v.includes("/")) return v;
-    return `https://ntfy.sh/${v}`;
+    const v3 = (raw || "").trim();
+    if (!v3) return "";
+    if (v3.includes("://") || v3.includes("@") || v3.includes("/")) return v3;
+    return `https://ntfy.sh/${v3}`;
   }
   function displayNotifyTarget2(raw) {
-    const v = (raw || "").trim();
-    if (!v) return "";
-    const lower = v.toLowerCase();
+    const v3 = (raw || "").trim();
+    if (!v3) return "";
+    const lower = v3.toLowerCase();
     for (const prefix of ["https://ntfy.sh/", "http://ntfy.sh/", "ntfy.sh/"]) {
-      if (lower.startsWith(prefix)) return v.slice(prefix.length).replace(/\/+$/, "");
+      if (lower.startsWith(prefix)) return v3.slice(prefix.length).replace(/\/+$/, "");
     }
-    return v;
+    return v3;
   }
   function osExecutorHintBanner2(projectId) {
     try {
       if (localStorage.getItem("meridian.hooks.osbanner.dismissed") === "1") return "";
-    } catch (e) {
+    } catch (e3) {
     }
     const ua = String(navigator.userAgentData?.platform || navigator.platform || navigator.userAgent || "").toLowerCase();
     const isWin = ua.includes("win");
     const msg = isWin ? "Windows detected \u2014 executors use <strong>PowerShell</strong>; run Python with <code>pixi run python</code>." : "Mac / Linux detected \u2014 executors use <strong>bash</strong>; run Python with <code>python3</code>.";
-    return `<div data-os-hint style="display:flex;align-items:flex-start;gap:8px;background:var(--surface-1);border:1px solid var(--border);border-left:3px solid var(--accent);border-radius:4px;padding:8px 10px;margin-bottom:10px;font-size:10px;color:var(--text);line-height:1.5"><span style="flex:1">${msg}</span><button title="Dismiss" onclick="try{localStorage.setItem('meridian.hooks.osbanner.dismissed','1')}catch(e){}; var _b=this.closest('[data-os-hint]'); if(_b)_b.remove();" style="background:none;border:none;color:var(--muted);cursor:pointer;font-size:13px;line-height:1;padding:0 2px;flex-shrink:0">\xD7</button></div>`;
+    return `<div data-os-hint style="display:flex;align-items:flex-start;gap:8px;background:var(--surface-1);border:1px solid var(--border);border-left:3px solid var(--accent);border-radius:4px;padding:8px 10px;margin-bottom:10px;font-size:10px;color:var(--text);line-height:1.5"><span style="flex:1">${msg}</span><button title="Dismiss" onclick="try{localStorage.setItem('meridian.hooks.osbanner.dismissed','1')}catch(e: any){}; var _b=this.closest('[data-os-hint]'); if(_b)_b.remove();" style="background:none;border:none;color:var(--muted);cursor:pointer;font-size:13px;line-height:1;padding:0 2px;flex-shrink:0">\xD7</button></div>`;
   }
   function showFailoverBannerIfNeeded() {
     try {
       if (sessionStorage.getItem("meridian.failover.dismissed") === "1") return;
-    } catch (e) {
+    } catch (e3) {
     }
-    fetch("/failover-status").then((r) => r.ok ? r.json() : null).then((data) => {
+    fetch("/failover-status").then((r3) => r3.ok ? r3.json() : null).then((data) => {
       if (!data || !data.is_failover) return;
       if (document.getElementById("failover-banner")) return;
       const bar = document.createElement("div");
@@ -10611,7 +11347,7 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
       btn.onclick = () => {
         try {
           sessionStorage.setItem("meridian.failover.dismissed", "1");
-        } catch (e) {
+        } catch (e3) {
         }
         bar.remove();
       };
@@ -10642,8 +11378,8 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
         </div>`;
           return;
         }
-        const pending = rows.filter((r) => r.status === "pending");
-        const resolved = rows.filter((r) => r.status !== "pending");
+        const pending = rows.filter((r3) => r3.status === "pending");
+        const resolved = rows.filter((r3) => r3.status !== "pending");
         const renderDiff = (diffText) => {
           const lines = String(diffText || "").split("\n").map((ln) => {
             let color = "var(--text)";
@@ -10655,35 +11391,35 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
           });
           return `<pre style="margin-top:8px;padding:8px;background:var(--surface-1);border:1px solid var(--border);border-radius:3px;font-size:10px;font-family:var(--font-mono);max-height:260px;overflow:auto">${lines.join("")}</pre>`;
         };
-        const renderCard = (r) => {
-          const urg = r.urgency || "normal";
-          const st = r.status || "pending";
-          const dt = (r.created_at || "").slice(0, 16).replace("T", " ");
-          const isMd = r.kind === "md_section_update";
+        const renderCard = (r3) => {
+          const urg = r3.urgency || "normal";
+          const st = r3.status || "pending";
+          const dt = (r3.created_at || "").slice(0, 16).replace("T", " ");
+          const isMd = r3.kind === "md_section_update";
           let pl = null;
-          if (isMd && r.payload) {
+          if (isMd && r3.payload) {
             try {
-              pl = JSON.parse(r.payload);
-            } catch (e) {
+              pl = JSON.parse(r3.payload);
+            } catch (e3) {
               pl = null;
             }
           }
           const mdMeta = isMd && pl ? `<div style="margin-top:6px;font-size:10px;color:var(--accent)"><b>${escapeHtml(pl.file || "")}</b> \xA7 ${escapeHtml(pl.anchor || "")}</div>` : "";
           const diffHtml = isMd && pl && pl.diff ? renderDiff(pl.diff) : "";
-          const answerHtml = r.answer ? `<div style="margin-top:8px;padding:6px 8px;background:var(--surface-1);border-radius:3px;border-left:3px solid #22c55e;color:var(--text);font-size:11px"><b>Answer:</b> ${escapeHtml(r.answer)}</div>` : "";
-          const applyErr = r.apply_error ? `<div style="margin-top:6px;color:#e05252;font-size:10px"><b>Not applied:</b> ${escapeHtml(r.apply_error)}</div>` : "";
-          const ctxHtml = r.context ? `<div style="margin-top:6px;color:var(--muted);font-size:11px;font-style:italic">${escapeHtml(r.context.slice(0, 200))}</div>` : "";
+          const answerHtml = r3.answer ? `<div style="margin-top:8px;padding:6px 8px;background:var(--surface-1);border-radius:3px;border-left:3px solid #22c55e;color:var(--text);font-size:11px"><b>Answer:</b> ${escapeHtml(r3.answer)}</div>` : "";
+          const applyErr = r3.apply_error ? `<div style="margin-top:6px;color:#e05252;font-size:10px"><b>Not applied:</b> ${escapeHtml(r3.apply_error)}</div>` : "";
+          const ctxHtml = r3.context ? `<div style="margin-top:6px;color:var(--muted);font-size:11px;font-style:italic">${escapeHtml(r3.context.slice(0, 200))}</div>` : "";
           let optPayload = null;
           try {
-            optPayload = r.payload ? JSON.parse(r.payload) : null;
-          } catch (e) {
+            optPayload = r3.payload ? JSON.parse(r3.payload) : null;
+          } catch (e3) {
             optPayload = null;
           }
           const hitlOpts = optPayload && Array.isArray(optPayload.options) ? optPayload.options : [];
           const hitlRec = optPayload && typeof optPayload.recommended === "string" ? optPayload.recommended : null;
           const dualChannelHint = st === "pending" && !isMd && (urg === "blocking" || urg === "high") ? `<div style="margin-top:6px;display:flex;align-items:center;gap:6px;font-size:10px;color:var(--accent)">
                <span title="Also displayed inline in Claude Code \u2014 first answer (dashboard or chat) wins">\u{1F4DF} Dual-channel \u2014 also shown in Claude Code chat</span>
-               <button class="secondary hitl-copy-id-btn" data-hitl-id="${escapeHtml(r.id)}" title="Copy HITL ID to clipboard" style="padding:1px 7px;font-size:9px">Copy ID</button>
+               <button class="secondary hitl-copy-id-btn" data-hitl-id="${escapeHtml(r3.id)}" title="Copy HITL ID to clipboard" style="padding:1px 7px;font-size:9px">Copy ID</button>
              </div>` : "";
           let actionBtns = "";
           if (st === "pending" && isMd) {
@@ -10691,28 +11427,28 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
 
           <div style="display:flex;gap:6px;margin-top:8px;align-items:center">
 
-            <button class="primary hitl-approve-btn" data-hitl-id="${escapeHtml(r.id)}" style="padding:3px 12px;font-size:10px">Approve &amp; write</button>
+            <button class="primary hitl-approve-btn" data-hitl-id="${escapeHtml(r3.id)}" style="padding:3px 12px;font-size:10px">Approve &amp; write</button>
 
-            <button class="secondary hitl-reject-btn" data-hitl-id="${escapeHtml(r.id)}" style="padding:3px 10px;font-size:10px">Reject</button>
+            <button class="secondary hitl-reject-btn" data-hitl-id="${escapeHtml(r3.id)}" style="padding:3px 10px;font-size:10px">Reject</button>
 
           </div>`;
           } else if (st === "pending" && hitlOpts.length) {
-            const optBtns = hitlOpts.map((o, i) => {
-              const isRec = hitlRec !== null && String(o) === hitlRec;
+            const optBtns = hitlOpts.map((o3, i3) => {
+              const isRec = hitlRec !== null && String(o3) === hitlRec;
               const recStyle = isRec ? "border:1px solid var(--accent);background:var(--accent)1a;font-weight:600" : "";
               const recBadge = isRec ? ' <span style="font-size:8px;color:var(--accent);font-weight:700;text-transform:uppercase;letter-spacing:.04em">(recommended)</span>' : "";
-              return `<button class="secondary hitl-opt-btn" data-hitl-id="${escapeHtml(r.id)}" data-answer="${escapeHtml(o)}"${isRec ? ' data-recommended="1" autofocus' : ""} style="padding:3px 10px;font-size:10px;text-align:left;${recStyle}">${i + 1}. ${escapeHtml(o)}${recBadge}</button>`;
+              return `<button class="secondary hitl-opt-btn" data-hitl-id="${escapeHtml(r3.id)}" data-answer="${escapeHtml(o3)}"${isRec ? ' data-recommended="1" autofocus' : ""} style="padding:3px 10px;font-size:10px;text-align:left;${recStyle}">${i3 + 1}. ${escapeHtml(o3)}${recBadge}</button>`;
             }).join("\n");
             const kbHint = hitlOpts.length ? `<div style="font-size:9px;color:var(--muted);margin-top:2px">Press <b>1\u2013${Math.min(9, hitlOpts.length)}</b> to choose${hitlRec !== null ? ", <b>Enter</b> for the recommended option" : ""}.</div>` : "";
             actionBtns = `
 
-          <div class="hitl-opts" data-hitl-id="${escapeHtml(r.id)}" tabindex="0" style="display:flex;flex-direction:column;gap:4px;margin-top:8px;outline:none">
+          <div class="hitl-opts" data-hitl-id="${escapeHtml(r3.id)}" tabindex="0" style="display:flex;flex-direction:column;gap:4px;margin-top:8px;outline:none">
 
             ${optBtns}
 
             ${kbHint}
 
-            <button class="secondary hitl-dismiss-btn" data-hitl-id="${escapeHtml(r.id)}" style="padding:3px 10px;font-size:10px;margin-top:2px;align-self:flex-start">Dismiss</button>
+            <button class="secondary hitl-dismiss-btn" data-hitl-id="${escapeHtml(r3.id)}" style="padding:3px 10px;font-size:10px;margin-top:2px;align-self:flex-start">Dismiss</button>
 
           </div>`;
           } else if (st === "pending") {
@@ -10720,25 +11456,25 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
 
           <div style="display:flex;gap:6px;margin-top:8px;align-items:center">
 
-            <input type="text" placeholder="Answer\u2026" id="hitl-ans-${r.id}" style="flex:1;background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:11px;font-family:var(--font-mono);padding:4px 8px;outline:none">
+            <input type="text" placeholder="Answer\u2026" id="hitl-ans-${r3.id}" style="flex:1;background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:11px;font-family:var(--font-mono);padding:4px 8px;outline:none">
 
-            <button class="primary hitl-answer-btn" data-hitl-id="${escapeHtml(r.id)}" style="padding:3px 10px;font-size:10px">Answer</button>
+            <button class="primary hitl-answer-btn" data-hitl-id="${escapeHtml(r3.id)}" style="padding:3px 10px;font-size:10px">Answer</button>
 
-            <button class="secondary hitl-dismiss-btn" data-hitl-id="${escapeHtml(r.id)}" style="padding:3px 10px;font-size:10px">Dismiss</button>
+            <button class="secondary hitl-dismiss-btn" data-hitl-id="${escapeHtml(r3.id)}" style="padding:3px 10px;font-size:10px">Dismiss</button>
 
           </div>`;
           }
-          return `<div class="hitl-row" data-search="${escapeHtml((r.question || "") + " " + (r.status || "") + " " + (r.context || ""))}" style="background:var(--surface-2);border:1px solid var(--border);border-left:3px solid ${urgencyColor[urg] || "var(--accent)"};border-radius:0 4px 4px 0;padding:10px 12px;margin-bottom:8px">
+          return `<div class="hitl-row" data-search="${escapeHtml((r3.question || "") + " " + (r3.status || "") + " " + (r3.context || ""))}" style="background:var(--surface-2);border:1px solid var(--border);border-left:3px solid ${urgencyColor[urg] || "var(--accent)"};border-radius:0 4px 4px 0;padding:10px 12px;margin-bottom:8px">
 
           <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px;margin-bottom:4px">
 
-            <div style="font-weight:600;font-size:12px;color:var(--text)">${escapeHtml(r.question || "")}</div>
+            <div style="font-weight:600;font-size:12px;color:var(--text)">${escapeHtml(r3.question || "")}</div>
 
             <div style="display:flex;gap:4px;flex-shrink:0">
 
-              ${r.answered_by === "auto" ? `<span title="Auto-answered \u2014 no human reviewed this" style="font-size:9px;font-weight:600;background:var(--accent)22;color:var(--accent);padding:1px 6px;border-radius:3px">auto</span>` : ""}
+              ${r3.answered_by === "auto" ? `<span title="Auto-answered \u2014 no human reviewed this" style="font-size:9px;font-weight:600;background:var(--accent)22;color:var(--accent);padding:1px 6px;border-radius:3px">auto</span>` : ""}
 
-              ${r.kind === "correction" ? `<span title="Mid-run correction \u2014 non-blocking; the executor applies it at the next item boundary" style="font-size:9px;font-weight:600;background:#f59e0b22;color:#f59e0b;padding:1px 6px;border-radius:3px">\u270E correction</span>` : ""}
+              ${r3.kind === "correction" ? `<span title="Mid-run correction \u2014 non-blocking; the executor applies it at the next item boundary" style="font-size:9px;font-weight:600;background:#f59e0b22;color:#f59e0b;padding:1px 6px;border-radius:3px">\u270E correction</span>` : ""}
 
               <span style="font-size:9px;font-weight:600;background:${urgencyColor[urg] || "var(--accent)"}22;color:${urgencyColor[urg] || "var(--accent)"};padding:1px 6px;border-radius:3px">${escapeHtml(urg)}</span>
 
@@ -10748,7 +11484,7 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
 
           </div>
 
-          <div style="color:var(--muted);font-size:10px">${escapeHtml(dt)}${r.assigned_to ? " \xB7 @" + escapeHtml(r.assigned_to) : ""}</div>
+          <div style="color:var(--muted);font-size:10px">${escapeHtml(dt)}${r3.assigned_to ? " \xB7 @" + escapeHtml(r3.assigned_to) : ""}</div>
 
           ${mdMeta}${ctxHtml}${dualChannelHint}${diffHtml}${answerHtml}${applyErr}${actionBtns}
 
@@ -10774,8 +11510,8 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
               await api(`/hitl/${id}`, { method: "PATCH", body: JSON.stringify({ action: "answer", answer }) });
               toast("answered \u2713");
               render();
-            } catch (e) {
-              toast("failed: " + e.message, true);
+            } catch (e3) {
+              toast("failed: " + e3.message, true);
             }
           };
         });
@@ -10787,26 +11523,26 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
               await api(`/hitl/${id}`, { method: "PATCH", body: JSON.stringify({ action: "answer", answer }) });
               toast("answered \u2713");
               render();
-            } catch (e) {
-              toast("failed: " + e.message, true);
+            } catch (e3) {
+              toast("failed: " + e3.message, true);
             }
           };
         });
         body.querySelectorAll(".hitl-opts").forEach((box) => {
-          box.addEventListener("keydown", (e) => {
+          box.addEventListener("keydown", (e3) => {
             const btns = Array.from(box.querySelectorAll(".hitl-opt-btn"));
             if (!btns.length) return;
-            if (e.key === "Enter") {
+            if (e3.key === "Enter") {
               const rec = box.querySelector('.hitl-opt-btn[data-recommended="1"]');
               const target = rec || (document.activeElement && document.activeElement.classList.contains("hitl-opt-btn") ? document.activeElement : null);
               if (target) {
-                e.preventDefault();
+                e3.preventDefault();
                 target.click();
               }
-            } else if (/^[1-9]$/.test(e.key)) {
-              const idx = parseInt(e.key, 10) - 1;
+            } else if (/^[1-9]$/.test(e3.key)) {
+              const idx = parseInt(e3.key, 10) - 1;
               if (idx < btns.length) {
-                e.preventDefault();
+                e3.preventDefault();
                 btns[idx].click();
               }
             }
@@ -10819,8 +11555,8 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
               await api(`/hitl/${btn.dataset.hitlId}`, { method: "PATCH", body: JSON.stringify({ action: "dismiss" }) });
               toast("dismissed");
               render();
-            } catch (e) {
-              toast("failed: " + e.message, true);
+            } catch (e3) {
+              toast("failed: " + e3.message, true);
             }
           };
         });
@@ -10832,8 +11568,8 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
               if (res && res.applied === false) toast("not applied: " + (res.apply_error || "see card"), true);
               else toast("approved \u2713 \u2014 section written, staged for checkpoint");
               render();
-            } catch (e) {
-              toast("failed: " + e.message, true);
+            } catch (e3) {
+              toast("failed: " + e3.message, true);
             }
           };
         });
@@ -10844,8 +11580,8 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
               await api(`/hitl/${btn.dataset.hitlId}`, { method: "PATCH", body: JSON.stringify({ action: "dismiss" }) });
               toast("rejected");
               render();
-            } catch (e) {
-              toast("failed: " + e.message, true);
+            } catch (e3) {
+              toast("failed: " + e3.message, true);
             }
           };
         });
@@ -10863,8 +11599,8 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
             });
           };
         });
-      } catch (e) {
-        body.innerHTML = `<div style="color:var(--muted)">failed to load HITL queue: ${escapeHtml(String(e))}</div>`;
+      } catch (e3) {
+        body.innerHTML = `<div style="color:var(--muted)">failed to load HITL queue: ${escapeHtml(String(e3))}</div>`;
       }
     };
     if (statusFilter) statusFilter.onchange = render;
@@ -10891,30 +11627,30 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
           return;
         }
         const dotColor = { active: "#4ade80", recent: "#fbbf24", idle: "#6b7280" };
-        const cards = humans.map((h) => {
-          const c = _colorForHuman(h.human_id);
-          const dc = dotColor[h.presence] || dotColor.idle;
-          const fw = h.agent_framework && h.agent_framework !== "claude_code" ? `<span style="background:var(--surface-2);color:var(--accent);font-size:9px;font-weight:600;padding:1px 5px;border-radius:3px;margin-left:4px">${escapeHtml(h.agent_framework)}</span>` : "";
-          const tasksLine = `${h.tasks_done} done \xB7 ${h.tasks_pending} pending${h.tasks_failed ? " \xB7 " + h.tasks_failed + " failed" : ""}`;
-          const lastSeen = h.last_seen ? formatRelativeTime(h.last_seen) : "never";
-          const recent = (h.recent || []).slice(0, 3).map((t) => {
-            const s = (t.status || "?").toUpperCase();
-            const desc = (t.description || "").slice(0, 90);
-            return `<div style="color:var(--muted);font-size:10px;padding:1px 0">[${escapeHtml(s)}] ${escapeHtml(desc)}</div>`;
+        const cards = humans.map((h2) => {
+          const c3 = _colorForHuman(h2.human_id);
+          const dc = dotColor[h2.presence] || dotColor.idle;
+          const fw = h2.agent_framework && h2.agent_framework !== "claude_code" ? `<span style="background:var(--surface-2);color:var(--accent);font-size:9px;font-weight:600;padding:1px 5px;border-radius:3px;margin-left:4px">${escapeHtml(h2.agent_framework)}</span>` : "";
+          const tasksLine = `${h2.tasks_done} done \xB7 ${h2.tasks_pending} pending${h2.tasks_failed ? " \xB7 " + h2.tasks_failed + " failed" : ""}`;
+          const lastSeen = h2.last_seen ? formatRelativeTime(h2.last_seen) : "never";
+          const recent = (h2.recent || []).slice(0, 3).map((t3) => {
+            const s3 = (t3.status || "?").toUpperCase();
+            const desc = (t3.description || "").slice(0, 90);
+            return `<div style="color:var(--muted);font-size:10px;padding:1px 0">[${escapeHtml(s3)}] ${escapeHtml(desc)}</div>`;
           }).join("");
-          return `<div class="team-card" data-search="${escapeHtml((h.human_id || "") + " " + (h.active_session || "") + " " + (h.agent_framework || ""))}" style="background:var(--surface-2);border:1px solid var(--border);border-left:3px solid ${c};border-radius:4px;padding:10px 12px;margin-bottom:8px">
+          return `<div class="team-card" data-search="${escapeHtml((h2.human_id || "") + " " + (h2.active_session || "") + " " + (h2.agent_framework || ""))}" style="background:var(--surface-2);border:1px solid var(--border);border-left:3px solid ${c3};border-radius:4px;padding:10px 12px;margin-bottom:8px">
 
           <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px">
 
             <span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${dc}"></span>
 
-            <span style="color:${c};font-weight:600">${escapeHtml(h.human_id)}</span>${fw}
+            <span style="color:${c3};font-weight:600">${escapeHtml(h2.human_id)}</span>${fw}
 
             <span style="color:var(--muted);font-size:10px;margin-left:auto">${escapeHtml(lastSeen)}</span>
 
           </div>
 
-          <div style="color:var(--text);font-size:11px;margin-bottom:2px">${escapeHtml(h.active_session || "(no active session)")}</div>
+          <div style="color:var(--text);font-size:11px;margin-bottom:2px">${escapeHtml(h2.active_session || "(no active session)")}</div>
 
           <div style="color:var(--accent);font-size:10px;margin-bottom:4px">${escapeHtml(tasksLine)}</div>
 
@@ -10927,14 +11663,14 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
           const windowStart = Date.now() - days * 86400 * 1e3;
           const history2 = await api(`/projects/${projectId}/goal-history`);
           const sorted = [...history2 || []].sort(
-            (a, b) => Date.parse((a.created_at || "").replace(" ", "T") + "Z") - Date.parse((b.created_at || "").replace(" ", "T") + "Z")
+            (a3, b2) => Date.parse((a3.created_at || "").replace(" ", "T") + "Z") - Date.parse((b2.created_at || "").replace(" ", "T") + "Z")
           );
-          sorted.forEach((entry, i) => {
+          sorted.forEach((entry, i3) => {
             const ts = entry.created_at;
             if (!ts) return;
-            const t = Date.parse(ts.replace(" ", "T") + "Z");
-            if (!isFinite(t) || t < windowStart) return;
-            const prev = sorted[i - 1];
+            const t3 = Date.parse(ts.replace(" ", "T") + "Z");
+            if (!isFinite(t3) || t3 < windowStart) return;
+            const prev = sorted[i3 - 1];
             if (!prev) {
               goalMarkers.push({ ts, field: "content_updated_at", label: "" });
               return;
@@ -10953,17 +11689,17 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
               goalMarkers.push({ ts, field: "content_updated_at", label: "" });
             }
           });
-          goalMarkers = goalMarkers.filter((m, i) => !goalMarkers.slice(0, i).some(
-            (p) => p.field === m.field && Math.abs(Date.parse((m.ts || "").replace(" ", "T") + "Z") - Date.parse((p.ts || "").replace(" ", "T") + "Z")) < 6e4
+          goalMarkers = goalMarkers.filter((m3, i3) => !goalMarkers.slice(0, i3).some(
+            (p3) => p3.field === m3.field && Math.abs(Date.parse((m3.ts || "").replace(" ", "T") + "Z") - Date.parse((p3.ts || "").replace(" ", "T") + "Z")) < 6e4
           ));
-        } catch (_) {
+        } catch (_2) {
         }
-        const standup = humans.map((h) => {
-          const c = _colorForHuman(h.human_id);
-          const last = (h.recent || []).map((t) => (t.description || "").slice(0, 60)).slice(0, 4).join("; ");
-          return `<div style="padding:3px 0;border-left:2px solid ${c};padding-left:8px;font-size:11px">
+        const standup = humans.map((h2) => {
+          const c3 = _colorForHuman(h2.human_id);
+          const last = (h2.recent || []).map((t3) => (t3.description || "").slice(0, 60)).slice(0, 4).join("; ");
+          return `<div style="padding:3px 0;border-left:2px solid ${c3};padding-left:8px;font-size:11px">
 
-          <span style="color:${c};font-weight:600">${escapeHtml(h.human_id)}</span> \xB7 ${h.tasks_done} done \u2014 <span style="color:var(--muted)">${escapeHtml(last) || "\u2014"}</span>
+          <span style="color:${c3};font-weight:600">${escapeHtml(h2.human_id)}</span> \xB7 ${h2.tasks_done} done \u2014 <span style="color:var(--muted)">${escapeHtml(last) || "\u2014"}</span>
 
         </div>`;
         }).join("");
@@ -10971,13 +11707,13 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
         try {
           const pinned = await api(`/projects/${projectId}/decisions-pinned`);
           if (pinned && pinned.length) {
-            const rows = pinned.slice(0, 8).map((d) => {
-              const cat = d.category ? `<span style="font-size:9px;color:var(--muted);margin-left:4px">${escapeHtml(d.category)}</span>` : "";
+            const rows = pinned.slice(0, 8).map((d3) => {
+              const cat = d3.category ? `<span style="font-size:9px;color:var(--muted);margin-left:4px">${escapeHtml(d3.category)}</span>` : "";
               return `<div style="padding:4px 0;border-bottom:1px solid var(--border)">
 
-              <div style="font-size:11px;font-weight:600;color:var(--text)">${escapeHtml(d.title)}${cat}</div>
+              <div style="font-size:11px;font-weight:600;color:var(--text)">${escapeHtml(d3.title)}${cat}</div>
 
-              <div style="font-size:10px;color:var(--muted);margin-top:1px;white-space:pre-wrap">${escapeHtml((d.body || "").slice(0, 160))}</div>
+              <div style="font-size:10px;color:var(--muted);margin-top:1px;white-space:pre-wrap">${escapeHtml((d3.body || "").slice(0, 160))}</div>
 
             </div>`;
             }).join("");
@@ -10989,7 +11725,7 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
 
           </section>`;
           }
-        } catch (_) {
+        } catch (_2) {
         }
         body.innerHTML = `
 
@@ -11011,8 +11747,8 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
 
         ${decisionsHtml}`;
         _wireTabSearch(`team-search-${projectId}`, `team-body-${projectId}`, ".team-card");
-      } catch (e) {
-        body.innerHTML = renderProjectLoadError2(projectId, "Team summary unavailable", `/team/summary?project_id=${encodeURIComponent(projectId)}&days=${days}`, e);
+      } catch (e3) {
+        body.innerHTML = renderProjectLoadError2(projectId, "Team summary unavailable", `/team/summary?project_id=${encodeURIComponent(projectId)}&days=${days}`, e3);
         wireProjectLoadRetry2(body, projectId);
       }
     };
@@ -11026,7 +11762,7 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
     const panel = getPanelState(projectId);
     try {
       const sessions = await api(`/projects/${projectId}/sessions?active_only=true`);
-      const active = sessions && sessions.filter((s) => s.status === "active");
+      const active = sessions && sessions.filter((s3) => s3.status === "active");
       if (!active || active.length === 0) {
         panel.liveSessionId = null;
         el.style.display = "none";
@@ -11037,10 +11773,10 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
       const tasks = await api(`/projects/${projectId}/sessions/${sess.id}/tasks/live?limit=5`).catch(() => []);
       const elapsed = sess.last_seen ? Math.round((Date.now() - (/* @__PURE__ */ new Date(sess.last_seen + "Z")).getTime()) / 6e4) : null;
       const elapsedStr = elapsed !== null ? elapsed < 2 ? "just now" : `${elapsed}m ago` : "";
-      const taskRows = (tasks || []).map((t) => {
-        const icon = t.status === "done" ? "\u2713" : t.status === "failed" ? "\u2717" : t.status === "in_progress" ? "\u25B6" : "\xB7";
-        const color = t.status === "done" ? "var(--status-done)" : t.status === "failed" ? "var(--status-failed)" : t.status === "in_progress" ? "var(--accent)" : "var(--muted)";
-        const desc = (t.description || "").length > 80 ? t.description.slice(0, 80) + "\u2026" : t.description;
+      const taskRows = (tasks || []).map((t3) => {
+        const icon = t3.status === "done" ? "\u2713" : t3.status === "failed" ? "\u2717" : t3.status === "in_progress" ? "\u25B6" : "\xB7";
+        const color = t3.status === "done" ? "var(--status-done)" : t3.status === "failed" ? "var(--status-failed)" : t3.status === "in_progress" ? "var(--accent)" : "var(--muted)";
+        const desc = (t3.description || "").length > 80 ? t3.description.slice(0, 80) + "\u2026" : t3.description;
         return `<div style="display:flex;gap:6px;align-items:baseline;padding:1px 0">
 
         <span style="color:${color};font-size:10px;flex-shrink:0">${icon}</span>
@@ -11050,13 +11786,13 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
       </div>`;
       }).join("");
       const extraCount = active.length - 1;
-      const extraRows = active.slice(1).map((s) => {
-        const age = s.last_seen ? Math.round((Date.now() - (/* @__PURE__ */ new Date(s.last_seen + "Z")).getTime()) / 6e4) : null;
+      const extraRows = active.slice(1).map((s3) => {
+        const age = s3.last_seen ? Math.round((Date.now() - (/* @__PURE__ */ new Date(s3.last_seen + "Z")).getTime()) / 6e4) : null;
         const ageStr = age !== null ? age < 2 ? "just now" : `${age}m ago` : "";
         return `<div style="display:flex;align-items:center;gap:6px;padding:2px 0">
         <span style="font-size:9px;color:var(--accent)">\u25CF</span>
-        <span style="font-size:10px;color:var(--text);font-family:var(--font-mono)">${escapeHtml(s.name || "unnamed")}</span>
-        ${s.human_id ? `<span style="font-size:9px;color:var(--muted)">${escapeHtml(s.human_id)}</span>` : ""}
+        <span style="font-size:10px;color:var(--text);font-family:var(--font-mono)">${escapeHtml(s3.name || "unnamed")}</span>
+        ${s3.human_id ? `<span style="font-size:9px;color:var(--muted)">${escapeHtml(s3.human_id)}</span>` : ""}
         ${ageStr ? `<span style="font-size:9px;color:var(--muted);margin-left:auto">${ageStr}</span>` : ""}
       </div>`;
       }).join("");
@@ -11095,7 +11831,7 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
         }
       }
       el.style.display = "block";
-    } catch (e) {
+    } catch (e3) {
       panel.liveSessionId = null;
       el.style.display = "none";
     }
@@ -11106,7 +11842,7 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
     try {
       const panel = getPanelState(projectId);
       const allSessions = Array.isArray(sessions) ? sessions : await api(`/projects/${projectId}/sessions?active_only=false`);
-      const recent = (allSessions || []).filter((s) => s.id !== panel.liveSessionId && !isLiveSession(s)).sort((a, b) => String(b.last_seen || b.created_at || "").localeCompare(String(a.last_seen || a.created_at || ""))).slice(0, 5);
+      const recent = (allSessions || []).filter((s3) => s3.id !== panel.liveSessionId && !isLiveSession(s3)).sort((a3, b2) => String(b2.last_seen || b2.created_at || "").localeCompare(String(a3.last_seen || a3.created_at || ""))).slice(0, 5);
       if (!recent.length) {
         el.style.display = "none";
         return;
@@ -11115,23 +11851,23 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
 
       <div style="font-size:9px;font-weight:700;color:var(--muted);letter-spacing:.07em;text-transform:uppercase;margin-bottom:6px">Recent Sessions</div>
 
-      ${recent.map((s) => {
-        const seenAt = s.last_seen || s.created_at || "";
+      ${recent.map((s3) => {
+        const seenAt = s3.last_seen || s3.created_at || "";
         const dt = seenAt ? formatRelativeTime(seenAt) : "";
-        const name = escapeHtml(s.name || s.id || "session");
-        const status = s.status === "idle" ? "idle" : s.status === "closed" ? "done" : s.status || "session";
-        const _rawSummary = s.session_summary;
+        const name = escapeHtml(s3.name || s3.id || "session");
+        const status = s3.status === "idle" ? "idle" : s3.status === "closed" ? "done" : s3.status || "session";
+        const _rawSummary = s3.session_summary;
         const summaryText = typeof _rawSummary === "string" ? _rawSummary : _rawSummary && _rawSummary.summary ? _rawSummary.summary : "";
         const summaryPreview = summaryText ? escapeHtml(summaryText.slice(0, 90)) : "";
         const hasSummary = !!summaryText;
-        const humanClause = s.human_id ? `, human_id="${String(s.human_id).replace(/"/g, '\\"')}"` : "";
-        const cmd = `start_session(project_id="${projectId}", session_name="${String(s.name || "resume-session").replace(/"/g, '\\"')}"${humanClause})`;
+        const humanClause = s3.human_id ? `, human_id="${String(s3.human_id).replace(/"/g, '\\"')}"` : "";
+        const cmd = `start_session(project_id="${projectId}", session_name="${String(s3.name || "resume-session").replace(/"/g, '\\"')}"${humanClause})`;
         const safeCmd = escapeHtml(cmd);
-        return `<div class="recent-session-row" data-session-id="${escapeHtml(s.id)}" style="border:1px solid var(--border);border-radius:3px;padding:5px 8px;margin-bottom:4px;background:var(--surface-1);cursor:pointer">
+        return `<div class="recent-session-row" data-session-id="${escapeHtml(s3.id)}" style="border:1px solid var(--border);border-radius:3px;padding:5px 8px;margin-bottom:4px;background:var(--surface-1);cursor:pointer">
 
           <div style="display:flex;justify-content:space-between;align-items:center;gap:6px">
 
-            <span style="font-weight:600;font-size:10px;color:var(--text);font-family:var(--font-mono);overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${escapeHtml(s.name || "")}">${name}</span>
+            <span style="font-weight:600;font-size:10px;color:var(--text);font-family:var(--font-mono);overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${escapeHtml(s3.name || "")}">${name}</span>
 
             <div style="display:flex;gap:4px;align-items:center;flex-shrink:0">
 
@@ -11140,7 +11876,7 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
               <button class="secondary resume-session-btn" data-cmd="${safeCmd}"
 
                 style="padding:1px 6px;font-size:9px" title="Copy start_session() to clipboard">Resume</button>
-              <button class="secondary recent-session-timeline-btn" data-session-id="${escapeHtml(s.id)}"
+              <button class="secondary recent-session-timeline-btn" data-session-id="${escapeHtml(s3.id)}"
                 style="padding:1px 6px;font-size:9px" title="Open filtered timeline">Timeline</button>
               <span class="recent-session-chevron" style="font-size:9px;color:var(--muted);margin-left:2px">\u25BC</span>
 
@@ -11184,10 +11920,10 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
               const fullSummary = target.dataset.fullSummary || "";
               const taskRows = await api(`/projects/${projectId}/sessions/${sid}/tasks/live?limit=20`);
               const summaryHtml = fullSummary ? `<div style="color:var(--text-dim);margin-bottom:5px;white-space:pre-wrap;word-break:break-word">${escapeHtml(fullSummary)}</div>` : "";
-              const tasksHtml = taskRows && taskRows.length ? taskRows.map((t) => `<div style="padding:2px 0"><span style="color:var(--accent)">${escapeHtml((t.status || "").toUpperCase())}</span> ${escapeHtml((t.description || "").slice(0, 180))}</div>`).join("") : "<div>(no task log for this session)</div>";
+              const tasksHtml = taskRows && taskRows.length ? taskRows.map((t3) => `<div style="padding:2px 0"><span style="color:var(--accent)">${escapeHtml((t3.status || "").toUpperCase())}</span> ${escapeHtml((t3.description || "").slice(0, 180))}</div>`).join("") : "<div>(no task log for this session)</div>";
               target.innerHTML = summaryHtml + tasksHtml;
               target.dataset.loaded = "1";
-            } catch (e) {
+            } catch (e3) {
               target.textContent = "failed to load tasks";
             }
           }
@@ -11196,7 +11932,7 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
         };
       });
       el.style.display = "block";
-    } catch (_) {
+    } catch (_2) {
       el.style.display = "none";
     }
   }
@@ -11207,33 +11943,33 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
       const all = await api(`/projects/${projectId}/sprint-items`);
       const doneStatuses = /* @__PURE__ */ new Set(["done", "skipped", "failed", "pushed"]);
       const milestones = (all || []).filter(
-        (i) => i.milestone_type === "milestone" || doneStatuses.has(i.status)
-      ).sort((a, b) => {
-        const aTs = a.completed_at || a.added_at || "";
-        const bTs = b.completed_at || b.added_at || "";
+        (i3) => i3.milestone_type === "milestone" || doneStatuses.has(i3.status)
+      ).sort((a3, b2) => {
+        const aTs = a3.completed_at || a3.added_at || "";
+        const bTs = b2.completed_at || b2.added_at || "";
         return bTs.localeCompare(aTs);
       });
       if (!milestones.length) {
         el.style.display = "none";
         return;
       }
-      const statusIcon = (s) => s === "done" ? "\u2713" : s === "failed" ? "\u2717" : s === "pushed" ? "\u2192" : s === "skipped" ? "\u2014" : s === "in_progress" ? "\u25B6" : "\u25E6";
-      const statusColor = (s) => s === "done" ? "var(--accent-green,#34d399)" : s === "failed" ? "#e05" : s === "pushed" ? "var(--accent)" : s === "in_progress" ? "var(--accent)" : "var(--muted)";
+      const statusIcon = (s3) => s3 === "done" ? "\u2713" : s3 === "failed" ? "\u2717" : s3 === "pushed" ? "\u2192" : s3 === "skipped" ? "\u2014" : s3 === "in_progress" ? "\u25B6" : "\u25E6";
+      const statusColor = (s3) => s3 === "done" ? "var(--accent-green,#34d399)" : s3 === "failed" ? "#e05" : s3 === "pushed" ? "var(--accent)" : s3 === "in_progress" ? "var(--accent)" : "var(--muted)";
       el.innerHTML = `
 
       <div style="font-size:9px;font-weight:700;color:var(--muted);letter-spacing:.07em;text-transform:uppercase;margin-bottom:6px">Completed (${milestones.length})</div>
 
       <div style="display:flex;flex-wrap:wrap;gap:6px">
 
-        ${milestones.slice(0, 20).map((m) => {
-        const date = (m.completed_at || m.added_at || "").slice(0, 10);
-        const ic = statusIcon(m.status);
-        const col = statusColor(m.status);
-        return `<div style="display:flex;align-items:center;gap:4px;border:1px solid var(--border);border-radius:3px;padding:3px 7px;background:var(--surface-1);opacity:${m.status === "done" ? 1 : 0.7}">
+        ${milestones.slice(0, 20).map((m3) => {
+        const date = (m3.completed_at || m3.added_at || "").slice(0, 10);
+        const ic = statusIcon(m3.status);
+        const col = statusColor(m3.status);
+        return `<div style="display:flex;align-items:center;gap:4px;border:1px solid var(--border);border-radius:3px;padding:3px 7px;background:var(--surface-1);opacity:${m3.status === "done" ? 1 : 0.7}">
 
             <span style="color:${col};font-size:11px">${ic}</span>
 
-            <span style="font-family:var(--font-mono);font-size:10px;color:var(--text)">${escapeHtml((m.title || "").slice(0, 40))}</span>
+            <span style="font-family:var(--font-mono);font-size:10px;color:var(--text)">${escapeHtml((m3.title || "").slice(0, 40))}</span>
 
             ${date ? `<span style="font-size:9px;color:var(--muted)">${escapeHtml(date)}</span>` : ""}
 
@@ -11244,7 +11980,7 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
 
       </div>`;
       el.style.display = "block";
-    } catch (_) {
+    } catch (_2) {
       el.style.display = "none";
     }
   }
@@ -11315,7 +12051,7 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
           transcript.style.display = "block";
         });
       });
-    } catch (_) {
+    } catch (_2) {
       body.innerHTML = '<div style="color:var(--muted);font-size:10px">Could not load runs.</div>';
     }
   }
@@ -11330,7 +12066,7 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
         projectApi(projectId, `/projects/${projectId}/sessions?active_only=false`).catch(() => []),
         projectApi(projectId, `/projects/${projectId}/sprint-items?with_counts=true`)
       ]);
-      const liveSession = (sessions || []).find((s) => isLiveSession(s));
+      const liveSession = (sessions || []).find((s3) => isLiveSession(s3));
       panel.liveSessionId = liveSession ? liveSession.id : null;
       const sprintPayload = sprintItems || [];
       panel.queueSprintItems = Array.isArray(sprintPayload) ? sprintPayload : sprintPayload.items || [];
@@ -11360,24 +12096,24 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
           let _searchTimer = null;
           searchInput.addEventListener("input", function() {
             clearTimeout(_searchTimer);
-            const q = this.value.trim();
+            const q2 = this.value.trim();
             _searchTimer = setTimeout(async () => {
-              if (!q) {
+              if (!q2) {
                 renderCurrentQueue();
                 return;
               }
               try {
-                const results = await api(`/projects/${projectId}/search?q=${encodeURIComponent(q)}&limit=10`);
-                body.innerHTML = renderSearchResults2(q, results);
-              } catch (e) {
-                body.innerHTML = `<div class="empty">search failed: ${escapeHtml(e.message)}</div>`;
+                const results = await api(`/projects/${projectId}/search?q=${encodeURIComponent(q2)}&limit=10`);
+                body.innerHTML = renderSearchResults2(q2, results);
+              } catch (e3) {
+                body.innerHTML = `<div class="empty">search failed: ${escapeHtml(e3.message)}</div>`;
               }
             }, 300);
           });
         }
       }
-    } catch (e) {
-      body.innerHTML = renderProjectLoadError2(projectId, "Queue unavailable", `/projects/${projectId}/sprint-items`, e);
+    } catch (e3) {
+      body.innerHTML = renderProjectLoadError2(projectId, "Queue unavailable", `/projects/${projectId}/sprint-items`, e3);
       wireProjectLoadRetry2(body, projectId);
     }
   }
@@ -11395,37 +12131,37 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
       const data = await projectApi(projectId, `/projects/${projectId}/reconcile`);
       if (!data.matches || data.matches.length === 0) {
         container.innerHTML = `<span style="color:var(--muted)">\u2713 No drift detected (checked ${data.commit_count || 0} commits against ${data.pending_count || 0} pending items)</span>
-        <button onclick="document.getElementById('reconcile-results-${projectId}').style.display='none'" style="margin-left:10px;background:none;border:none;color:var(--muted);cursor:pointer;font-size:10px">\u2715</button>`;
+        <button onclick="document.getElementById('reconcile-results-${projectId}')!.style.display='none'" style="margin-left:10px;background:none;border:none;color:var(--muted);cursor:pointer;font-size:10px">\u2715</button>`;
       } else {
-        const n = data.matches.length;
-        let html = `<div style="margin-bottom:6px;color:var(--warning,#f59e0b);font-weight:600">${n} item${n !== 1 ? "s" : ""} may already be shipped \u2014 verify before executing</div>`;
-        data.matches.forEach((m) => {
-          const confidence = m.confidence === "high" ? "\u{1F534} high" : "\u{1F7E1} medium";
-          const commits = (m.matching_commits || []).slice(0, 2).map(
-            (c) => `<span style="color:var(--muted)">${escapeHtml(c.sha)} \u2014 ${escapeHtml(c.message)}</span>`
+        const n2 = data.matches.length;
+        let html = `<div style="margin-bottom:6px;color:var(--warning,#f59e0b);font-weight:600">${n2} item${n2 !== 1 ? "s" : ""} may already be shipped \u2014 verify before executing</div>`;
+        data.matches.forEach((m3) => {
+          const confidence = m3.confidence === "high" ? "\u{1F534} high" : "\u{1F7E1} medium";
+          const commits = (m3.matching_commits || []).slice(0, 2).map(
+            (c3) => `<span style="color:var(--muted)">${escapeHtml(c3.sha)} \u2014 ${escapeHtml(c3.message)}</span>`
           ).join("<br>");
           html += `<div style="border:1px solid var(--border);border-radius:4px;padding:6px 8px;margin-bottom:6px;background:var(--surface-3,var(--surface-2))">
           <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px">
             <div>
-              <span style="color:var(--text)">${escapeHtml(m.title.slice(0, 80))}${m.title.length > 80 ? "\u2026" : ""}</span>
+              <span style="color:var(--text)">${escapeHtml(m3.title.slice(0, 80))}${m3.title.length > 80 ? "\u2026" : ""}</span>
               <span style="margin-left:6px;font-size:9px;opacity:0.7">${confidence}</span>
               <div style="margin-top:3px;font-size:9px">${commits}</div>
             </div>
             <div style="display:flex;gap:4px;flex-shrink:0">
               <button class="primary" style="padding:2px 7px;font-size:9px"
-                onclick="reconcileMarkDone('${projectId}','${m.item_id}',this)">Mark done</button>
+                onclick="reconcileMarkDone('${projectId}','${m3.item_id}',this)">Mark done</button>
               <button class="secondary" style="padding:2px 7px;font-size:9px"
                 onclick="this.closest('div[style]').remove()">Keep</button>
             </div>
           </div>
         </div>`;
         });
-        html += `<button onclick="document.getElementById('reconcile-results-${projectId}').style.display='none'" style="background:none;border:none;color:var(--muted);cursor:pointer;font-size:10px;margin-top:2px">Dismiss</button>`;
+        html += `<button onclick="document.getElementById('reconcile-results-${projectId}')!.style.display='none'" style="background:none;border:none;color:var(--muted);cursor:pointer;font-size:10px;margin-top:2px">Dismiss</button>`;
         container.innerHTML = html;
       }
-    } catch (e) {
-      container.innerHTML = `<span style="color:var(--danger,#ef4444)">Reconcile failed: ${escapeHtml(e.message)}</span>
-      <button onclick="document.getElementById('reconcile-results-${projectId}').style.display='none'" style="margin-left:10px;background:none;border:none;color:var(--muted);cursor:pointer;font-size:10px">\u2715</button>`;
+    } catch (e3) {
+      container.innerHTML = `<span style="color:var(--danger,#ef4444)">Reconcile failed: ${escapeHtml(e3.message)}</span>
+      <button onclick="document.getElementById('reconcile-results-${projectId}')!.style.display='none'" style="margin-left:10px;background:none;border:none;color:var(--muted);cursor:pointer;font-size:10px">\u2715</button>`;
     } finally {
       if (btn) {
         btn.disabled = false;
@@ -11447,38 +12183,38 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
 
     </div>`;
     };
-    const taskRow = (t) => `<div style="border:1px solid var(--border);border-radius:3px;padding:5px 8px;margin-bottom:4px;background:var(--surface-2)">
+    const taskRow = (t3) => `<div style="border:1px solid var(--border);border-radius:3px;padding:5px 8px;margin-bottom:4px;background:var(--surface-2)">
 
     <div style="display:flex;justify-content:space-between;gap:6px">
 
-      <span style="font-size:11px;color:var(--text);font-family:var(--font-mono);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${escapeHtml(t.description || "")}">${escapeHtml((t.description || "").slice(0, 100))}</span>
+      <span style="font-size:11px;color:var(--text);font-family:var(--font-mono);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${escapeHtml(t3.description || "")}">${escapeHtml((t3.description || "").slice(0, 100))}</span>
 
-      <span style="font-size:9px;color:var(--muted);flex-shrink:0">${escapeHtml(t.status || "")}</span>
+      <span style="font-size:9px;color:var(--muted);flex-shrink:0">${escapeHtml(t3.status || "")}</span>
 
     </div>
 
   </div>`;
-    const noteRow = (n) => `<div style="border:1px solid var(--border);border-left:3px solid var(--accent);border-radius:0 3px 3px 0;padding:5px 8px;margin-bottom:4px;background:var(--surface-2)" title="${escapeHtml(n.body || "")}">
+    const noteRow = (n2) => `<div style="border:1px solid var(--border);border-left:3px solid var(--accent);border-radius:0 3px 3px 0;padding:5px 8px;margin-bottom:4px;background:var(--surface-2)" title="${escapeHtml(n2.body || "")}">
 
-    <div style="font-size:11px;font-weight:600;color:var(--accent)" title="${escapeHtml(n.title || "")}">${escapeHtml((n.title || "").slice(0, 80))}</div>
+    <div style="font-size:11px;font-weight:600;color:var(--accent)" title="${escapeHtml(n2.title || "")}">${escapeHtml((n2.title || "").slice(0, 80))}</div>
 
-    <div style="font-size:10px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${escapeHtml((n.body || "").slice(0, 80))}</div>
-
-  </div>`;
-    const decisionRow = (d) => `<div style="border:1px solid var(--border);border-left:3px solid var(--warning,#fa0);border-radius:0 3px 3px 0;padding:5px 8px;margin-bottom:4px;background:var(--surface-2)" title="${escapeHtml(d.body || "")}">
-
-    <div style="font-size:11px;font-weight:600;color:var(--text)" title="${escapeHtml(d.title || "")}">${escapeHtml((d.title || "").slice(0, 80))}</div>
-
-    <div style="font-size:10px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${escapeHtml((d.body || "").slice(0, 80))}</div>
+    <div style="font-size:10px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${escapeHtml((n2.body || "").slice(0, 80))}</div>
 
   </div>`;
-    const sprintRow = (s) => `<div style="border:1px solid var(--border);border-radius:3px;padding:5px 8px;margin-bottom:4px;background:var(--surface-2)">
+    const decisionRow = (d3) => `<div style="border:1px solid var(--border);border-left:3px solid var(--warning,#fa0);border-radius:0 3px 3px 0;padding:5px 8px;margin-bottom:4px;background:var(--surface-2)" title="${escapeHtml(d3.body || "")}">
+
+    <div style="font-size:11px;font-weight:600;color:var(--text)" title="${escapeHtml(d3.title || "")}">${escapeHtml((d3.title || "").slice(0, 80))}</div>
+
+    <div style="font-size:10px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${escapeHtml((d3.body || "").slice(0, 80))}</div>
+
+  </div>`;
+    const sprintRow = (s3) => `<div style="border:1px solid var(--border);border-radius:3px;padding:5px 8px;margin-bottom:4px;background:var(--surface-2)">
 
     <div style="display:flex;justify-content:space-between;gap:6px">
 
-      <span style="font-size:11px;color:var(--text);font-family:var(--font-mono);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${escapeHtml(s.title || "")}">${escapeHtml((s.title || "").slice(0, 100))}</span>
+      <span style="font-size:11px;color:var(--text);font-family:var(--font-mono);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${escapeHtml(s3.title || "")}">${escapeHtml((s3.title || "").slice(0, 100))}</span>
 
-      <span style="font-size:9px;color:var(--muted);flex-shrink:0">${escapeHtml(s.version || "")} \xB7 ${escapeHtml(s.status || "")}</span>
+      <span style="font-size:9px;color:var(--muted);flex-shrink:0">${escapeHtml(s3.version || "")} \xB7 ${escapeHtml(s3.status || "")}</span>
 
     </div>
 
@@ -11548,9 +12284,9 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
         header._queueWired = true;
         const toggle = () => applyState(section.dataset.collapsed !== "true", true);
         header.onclick = toggle;
-        header.onkeydown = (e) => {
-          if (e.key === "Enter" || e.key === " ") {
-            e.preventDefault();
+        header.onkeydown = (e3) => {
+          if (e3.key === "Enter" || e3.key === " ") {
+            e3.preventDefault();
             toggle();
           }
         };
@@ -11572,8 +12308,8 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
         const pid = el.id.replace("queue-body-", "");
         loadQueue(pid);
       });
-    } catch (e) {
-      toast("Action failed: " + e.message, true);
+    } catch (e3) {
+      toast("Action failed: " + e3.message, true);
     }
   };
   async function refreshTab(projectId) {
@@ -11585,7 +12321,7 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
   }
   async function refreshGoal(projectId) {
     const ta = document.getElementById(`goal-${projectId}`);
-    const v = document.getElementById(`goal-version-${projectId}`);
+    const v3 = document.getElementById(`goal-version-${projectId}`);
     if (!ta) return;
     const goalPath = `/projects/${projectId}/goal`;
     try {
@@ -11644,7 +12380,7 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
           autoBlocksEl.style.display = "none";
         }
       }
-      v.textContent = `v${goal.version}`;
+      v3.textContent = `v${goal.version}`;
       const vState = document.getElementById(`goal-state-${projectId}`);
       if (vState) vState.textContent = `v${goal.version}`;
       const nsTA = document.getElementById(`goal-north-star-${projectId}`);
@@ -11657,12 +12393,12 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
         spTA.value = goal.sprint || "";
         if (_sprintSelectSyncers[projectId]) _sprintSelectSyncers[projectId](goal.sprint || "");
       }
-      const p = state.panels[projectId];
-      p._serverNorthStar = goal.north_star || "";
-      p._serverSprint = goal.sprint || "";
+      const p3 = state.panels[projectId];
+      p3._serverNorthStar = goal.north_star || "";
+      p3._serverSprint = goal.sprint || "";
       const nsLock = document.getElementById(`goal-ns-lock-${projectId}`);
       if (nsLock) nsLock.textContent = goal.north_star ? "locked" : "unlocked";
-      p._lastSaved = text;
+      p3._lastSaved = text;
       if (nsTA) {
         nsTA.classList.remove("dirty");
       }
@@ -11679,20 +12415,20 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
       if (tsSp) tsSp.textContent = updAt ? `\xB7 ${updAt}` : "";
       renderDecisionsTable(projectId, goal.decisions || "");
       loadPinnedDecisions(projectId);
-    } catch (e) {
+    } catch (e3) {
       ta.value = "";
       ta.placeholder = "Goal state failed to load.";
-      v.textContent = "(load failed)";
+      v3.textContent = "(load failed)";
       const titleEl = document.getElementById(`goal-title-${projectId}`);
       if (titleEl) titleEl.textContent = "Goal state unavailable";
     }
   }
   function parseDecisionsBlob(blob) {
     if (!blob || typeof blob !== "string") return [];
-    const chunks = blob.split(/\n\s*\n/).map((c) => c.trim()).filter(Boolean);
+    const chunks = blob.split(/\n\s*\n/).map((c3) => c3.trim()).filter(Boolean);
     return chunks.map((chunk) => {
-      const m = chunk.match(/^\[(\d{4}-\d{2}-\d{2})\]\s*(.*)$/s);
-      if (m) return { date: m[1], text: m[2].trim() };
+      const m3 = chunk.match(/^\[(\d{4}-\d{2}-\d{2})\]\s*(.*)$/s);
+      if (m3) return { date: m3[1], text: m3[2].trim() };
       return { date: "", text: chunk };
     });
   }
@@ -11754,8 +12490,8 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
           });
           toast(`Archived ${archiveCount} pinned decision${archiveCount === 1 ? "" : "s"}`);
           loadPinnedDecisions(projectId);
-        } catch (e) {
-          toast("archive failed: " + e.message, true);
+        } catch (e3) {
+          toast("archive failed: " + e3.message, true);
         }
       };
     }
@@ -11810,9 +12546,9 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
       api(`/projects/${projectId}/decisions-pinned`)
     ]);
     if (notesRes.status === "fulfilled") {
-      const visible = (notesRes.value || []).filter((n) => {
-        const title = String(n.title || "").trim().toLowerCase();
-        const tags = String(n.tags || "").split(",").map((t) => t.trim().toLowerCase()).filter(Boolean);
+      const visible = (notesRes.value || []).filter((n2) => {
+        const title = String(n2.title || "").trim().toLowerCase();
+        const tags = String(n2.tags || "").split(",").map((t3) => t3.trim().toLowerCase()).filter(Boolean);
         return !title.startsWith("checkpoint:") && !tags.includes("checkpoint");
       });
       setVtabCountBadge2(`.notes-vtab-badge[data-pid="${projectId}"]`, visible.length);
@@ -11822,34 +12558,34 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
     }
   }
   function _renderAutoAnsweredHitls(answered) {
-    const auto = (answered || []).filter((r) => r && r.answered_by === "auto").slice(0, 5);
+    const auto = (answered || []).filter((r3) => r3 && r3.answered_by === "auto").slice(0, 5);
     if (!auto.length) return "";
-    const rows = auto.map((r) => {
-      const ts = formatRelativeTime(r.answered_at || r.created_at);
-      return `<div data-hitl-auto-id="${escapeHtml(r.id)}" style="opacity:0.55;border-left:3px solid var(--muted);background:var(--surface-1);padding:8px 12px;margin-bottom:6px;border-radius:0 4px 4px 0">
+    const rows = auto.map((r3) => {
+      const ts = formatRelativeTime(r3.answered_at || r3.created_at);
+      return `<div data-hitl-auto-id="${escapeHtml(r3.id)}" style="opacity:0.55;border-left:3px solid var(--muted);background:var(--surface-1);padding:8px 12px;margin-bottom:6px;border-radius:0 4px 4px 0">
         <div style="display:flex;justify-content:space-between;gap:8px;margin-bottom:4px">
           <span style="background:var(--surface-2);color:var(--muted);font-size:9px;font-weight:700;letter-spacing:.5px;padding:2px 6px;border-radius:3px">AUTO-ANSWERED</span>
           <span style="color:var(--muted);font-size:10px">${escapeHtml(ts)}</span>
         </div>
-        <div style="color:var(--text);white-space:pre-wrap;word-break:break-word;font-size:11px;margin-bottom:3px">${escapeHtml(r.question || "")}</div>
-        <div style="color:var(--muted);font-size:11px"><span style="font-weight:600">\u2192</span> ${escapeHtml(r.answer || "")}</div>
+        <div style="color:var(--text);white-space:pre-wrap;word-break:break-word;font-size:11px;margin-bottom:3px">${escapeHtml(r3.question || "")}</div>
+        <div style="color:var(--muted);font-size:11px"><span style="font-weight:600">\u2192</span> ${escapeHtml(r3.answer || "")}</div>
       </div>`;
     }).join("");
     return `<div data-hitl-auto-section style="margin:10px 0 4px;font-size:9px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.5px">Recently auto-answered</div>${rows}`;
   }
   window._renderAutoAnsweredHitls = _renderAutoAnsweredHitls;
-  async function refreshHitl() {
+  async function refreshHitl(_pid) {
     const bar = document.getElementById("hitl-bar");
     const countEl = document.getElementById("hitl-count");
     const list = document.getElementById("hitl-list");
     if (!bar || !countEl || !list) return;
     try {
       const items = await api("/hitl?status=pending&limit=50");
-      const n = items.length;
-      countEl.textContent = String(n);
+      const n2 = items.length;
+      countEl.textContent = String(n2);
       const perProject = /* @__PURE__ */ new Map();
-      for (const r of items) {
-        const pid = r && r.project_id;
+      for (const r3 of items) {
+        const pid = r3 && r3.project_id;
         if (!pid) continue;
         perProject.set(pid, (perProject.get(pid) || 0) + 1);
       }
@@ -11857,26 +12593,26 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
         const pid = badge.getAttribute("data-pid");
         setVtabCountBadge2(`.hitl-vtab-badge[data-pid="${pid}"]`, perProject.get(pid) || 0);
       });
-      if (n === 0) {
+      if (n2 === 0) {
         bar.style.display = "none";
         document.getElementById("hitl-panel").style.display = "none";
         return;
       }
       bar.style.display = "flex";
-      list.innerHTML = items.map((r) => {
-        const color = _HITL_URGENCY_COLOR[r.urgency] || _HITL_URGENCY_COLOR.normal;
-        const ts = formatRelativeTime(r.created_at);
-        const ctx = r.context ? `<details style="margin-top:4px"><summary style="cursor:pointer;color:var(--muted);font-size:10px">context</summary><pre style="margin:6px 0 0;padding:6px 8px;background:var(--surface-1);border-radius:3px;font-size:11px;white-space:pre-wrap;word-break:break-word">${escapeHtml(r.context)}</pre></details>` : "";
-        const assigned = r.assigned_to ? `<span style="color:var(--muted);font-size:10px">\u2192 ${escapeHtml(r.assigned_to)}</span>` : "";
-        return `<div data-hitl-id="${escapeHtml(r.id)}" style="border-left:3px solid ${color};background:var(--surface-1);padding:10px 12px;margin-bottom:8px;border-radius:0 4px 4px 0">
+      list.innerHTML = items.map((r3) => {
+        const color = _HITL_URGENCY_COLOR[r3.urgency] || _HITL_URGENCY_COLOR.normal;
+        const ts = formatRelativeTime(r3.created_at);
+        const ctx = r3.context ? `<details style="margin-top:4px"><summary style="cursor:pointer;color:var(--muted);font-size:10px">context</summary><pre style="margin:6px 0 0;padding:6px 8px;background:var(--surface-1);border-radius:3px;font-size:11px;white-space:pre-wrap;word-break:break-word">${escapeHtml(r3.context)}</pre></details>` : "";
+        const assigned = r3.assigned_to ? `<span style="color:var(--muted);font-size:10px">\u2192 ${escapeHtml(r3.assigned_to)}</span>` : "";
+        return `<div data-hitl-id="${escapeHtml(r3.id)}" style="border-left:3px solid ${color};background:var(--surface-1);padding:10px 12px;margin-bottom:8px;border-radius:0 4px 4px 0">
 
         <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:6px;flex-wrap:wrap">
 
           <div style="display:flex;align-items:center;gap:6px;min-width:0;flex:1">
 
-            <span style="background:${color}22;color:${color};font-size:9px;font-weight:700;letter-spacing:.5px;padding:2px 6px;border-radius:3px">${escapeHtml((r.urgency || "normal").toUpperCase())}</span>
+            <span style="background:${color}22;color:${color};font-size:9px;font-weight:700;letter-spacing:.5px;padding:2px 6px;border-radius:3px">${escapeHtml((r3.urgency || "normal").toUpperCase())}</span>
 
-            ${r.kind === "correction" ? `<span title="Mid-run correction \u2014 non-blocking" style="background:#f59e0b22;color:#f59e0b;font-size:9px;font-weight:700;letter-spacing:.5px;padding:2px 6px;border-radius:3px">\u270E CORRECTION</span>` : ""}
+            ${r3.kind === "correction" ? `<span title="Mid-run correction \u2014 non-blocking" style="background:#f59e0b22;color:#f59e0b;font-size:9px;font-weight:700;letter-spacing:.5px;padding:2px 6px;border-radius:3px">\u270E CORRECTION</span>` : ""}
 
             ${assigned}
 
@@ -11886,21 +12622,21 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
 
           <div style="display:flex;gap:4px">
 
-            <button class="secondary hitl-dismiss-btn" data-hitl-id="${escapeHtml(r.id)}" style="padding:2px 8px;font-size:10px">Dismiss</button>
+            <button class="secondary hitl-dismiss-btn" data-hitl-id="${escapeHtml(r3.id)}" style="padding:2px 8px;font-size:10px">Dismiss</button>
 
           </div>
 
         </div>
 
-        <div style="color:var(--text);white-space:pre-wrap;word-break:break-word;line-height:1.5;font-size:12px;margin-bottom:8px">${escapeHtml(r.question || "")}</div>
+        <div style="color:var(--text);white-space:pre-wrap;word-break:break-word;line-height:1.5;font-size:12px;margin-bottom:8px">${escapeHtml(r3.question || "")}</div>
 
         ${ctx}
 
         <div style="display:flex;gap:6px;margin-top:8px">
 
-          <input type="text" class="hitl-answer-input" data-hitl-id="${escapeHtml(r.id)}" placeholder="Type answer and hit Enter\u2026" style="flex:1;background:var(--surface-2);border:1px solid var(--border);border-radius:4px;padding:6px 10px;color:var(--text);font-family:var(--font-mono);font-size:11px;outline:none">
+          <input type="text" class="hitl-answer-input" data-hitl-id="${escapeHtml(r3.id)}" placeholder="Type answer and hit Enter\u2026" style="flex:1;background:var(--surface-2);border:1px solid var(--border);border-radius:4px;padding:6px 10px;color:var(--text);font-family:var(--font-mono);font-size:11px;outline:none">
 
-          <button class="primary hitl-answer-btn" data-hitl-id="${escapeHtml(r.id)}" style="padding:5px 12px;font-size:11px">Answer</button>
+          <button class="primary hitl-answer-btn" data-hitl-id="${escapeHtml(r3.id)}" style="padding:5px 12px;font-size:11px">Answer</button>
 
         </div>
 
@@ -11921,11 +12657,11 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
         const answered = await api("/hitl?status=answered&limit=10");
         const autoHtml = _renderAutoAnsweredHitls(answered);
         if (autoHtml) list.insertAdjacentHTML("beforeend", autoHtml);
-      } catch (e) {
-        console.error("[meridian] auto-answered HITL fetch failed:", e);
+      } catch (e3) {
+        console.error("[meridian] auto-answered HITL fetch failed:", e3);
       }
-    } catch (e) {
-      console.error("[meridian] refreshHitl failed \u2014 HITL bar may be stale:", e);
+    } catch (e3) {
+      console.error("[meridian] refreshHitl failed \u2014 HITL bar may be stale:", e3);
     }
   }
   async function _hitlAnswer(id) {
@@ -11942,8 +12678,8 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
       });
       toast("HITL answered");
       refreshHitl();
-    } catch (e) {
-      toast("answer failed: " + e.message, true);
+    } catch (e3) {
+      toast("answer failed: " + e3.message, true);
     }
   }
   async function _hitlDismiss(id) {
@@ -11954,8 +12690,8 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
         body: JSON.stringify({ action: "dismiss" })
       });
       refreshHitl();
-    } catch (e) {
-      toast("dismiss failed: " + e.message, true);
+    } catch (e3) {
+      toast("dismiss failed: " + e3.message, true);
     }
   }
   async function loadPinnedDecisions(projectId, { showArchived = false } = {}) {
@@ -11965,7 +12701,7 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
       await loadProjectSettings2(projectId);
       const url = showArchived ? `/projects/${projectId}/decisions-pinned?include_superseded=true` : `/projects/${projectId}/decisions-pinned`;
       const allItems = await api(url);
-      const items = showArchived ? allItems || [] : (allItems || []).filter((d) => d.status !== "superseded");
+      const items = showArchived ? allItems || [] : (allItems || []).filter((d3) => d3.status !== "superseded");
       getPanelState(projectId)._pinnedDecisions = items || [];
       setVtabCountBadge2(`.decisions-gtab-badge[data-pid="${projectId}"]`, (items || []).length);
       renderConstitutionWarning2(projectId);
@@ -11973,60 +12709,60 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
         host.innerHTML = `<div style="color:var(--muted);padding:10px;text-align:center;border:1px dashed var(--border);border-radius:4px">(no pinned decisions yet \u2014 call <code>pin_decision</code> from MCP)</div>`;
         return;
       }
-      host.innerHTML = items.map((d) => {
-        const cat = d.category || "TECHNICAL";
+      host.innerHTML = items.map((d3) => {
+        const cat = d3.category || "TECHNICAL";
         const color = _DECISION_CATEGORY_COLORS[cat] || _DECISION_CATEGORY_COLORS.TECHNICAL;
-        const prio = _DECISION_PRIORITY_ORDER.includes(d.priority) ? d.priority : "normal";
+        const prio = _DECISION_PRIORITY_ORDER.includes(d3.priority) ? d3.priority : "normal";
         const prioColor = _DECISION_PRIORITY_COLORS[prio] || _DECISION_PRIORITY_COLORS.normal;
-        const editCount = Array.isArray(d.edit_log) ? d.edit_log.length : 0;
-        const dateStr = (d.created_at || "").slice(0, 10);
-        return `<div data-decision-card="${escapeHtml(d.id)}" style="background:var(--surface-2);border:1px solid var(--border);border-left:4px solid ${color};border-radius:4px;padding:10px 12px;margin-bottom:8px">
+        const editCount = Array.isArray(d3.edit_log) ? d3.edit_log.length : 0;
+        const dateStr = (d3.created_at || "").slice(0, 10);
+        return `<div data-decision-card="${escapeHtml(d3.id)}" style="background:var(--surface-2);border:1px solid var(--border);border-left:4px solid ${color};border-radius:4px;padding:10px 12px;margin-bottom:8px">
 
         <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;gap:8px">
 
           <div style="display:flex;align-items:center;gap:8px;min-width:0;flex:1">
 
-            <span class="decision-cat-tag" data-id="${escapeHtml(d.id)}" data-cat="${escapeHtml(cat)}" title="Click to change category" style="display:inline-block;background:${color}22;color:${color};font-size:9px;font-weight:700;letter-spacing:.5px;padding:2px 6px;border-radius:3px;flex-shrink:0;cursor:pointer">${escapeHtml(cat)} \u25BE</span>
+            <span class="decision-cat-tag" data-id="${escapeHtml(d3.id)}" data-cat="${escapeHtml(cat)}" title="Click to change category" style="display:inline-block;background:${color}22;color:${color};font-size:9px;font-weight:700;letter-spacing:.5px;padding:2px 6px;border-radius:3px;flex-shrink:0;cursor:pointer">${escapeHtml(cat)} \u25BE</span>
 
-            <span class="decision-prio-tag" data-id="${escapeHtml(d.id)}" data-prio="${escapeHtml(prio)}" data-project="${escapeHtml(projectId)}" title="Click to change priority (urgent \u2192 normal \u2192 low)" style="display:inline-block;background:${prioColor}22;color:${prioColor};font-size:9px;font-weight:700;letter-spacing:.5px;padding:2px 6px;border-radius:3px;flex-shrink:0;cursor:pointer">${prio === "urgent" ? "\u26A1 " : ""}${escapeHtml(prio.toUpperCase())} \u25BE</span>
+            <span class="decision-prio-tag" data-id="${escapeHtml(d3.id)}" data-prio="${escapeHtml(prio)}" data-project="${escapeHtml(projectId)}" title="Click to change priority (urgent \u2192 normal \u2192 low)" style="display:inline-block;background:${prioColor}22;color:${prioColor};font-size:9px;font-weight:700;letter-spacing:.5px;padding:2px 6px;border-radius:3px;flex-shrink:0;cursor:pointer">${prio === "urgent" ? "\u26A1 " : ""}${escapeHtml(prio.toUpperCase())} \u25BE</span>
 
-            <span class="decision-title-view" data-id="${escapeHtml(d.id)}" title="Click to edit title" style="color:var(--accent);font-weight:600;font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;cursor:pointer">${escapeHtml(d.title || "")}</span>
+            <span class="decision-title-view" data-id="${escapeHtml(d3.id)}" title="Click to edit title" style="color:var(--accent);font-weight:600;font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;cursor:pointer">${escapeHtml(d3.title || "")}</span>
 
           </div>
 
           <div style="display:flex;gap:6px;flex-shrink:0;align-items:center">
 
-            ${editCount ? `<span class="decision-edit-count" data-id="${escapeHtml(d.id)}" title="${editCount} previous ${editCount === 1 ? "revision" : "revisions"} \u2014 body has been edited" style="color:var(--muted);font-size:9px;border:1px solid var(--border);border-radius:3px;padding:1px 5px;cursor:default">\u270E ${editCount}</span>` : ""}
+            ${editCount ? `<span class="decision-edit-count" data-id="${escapeHtml(d3.id)}" title="${editCount} previous ${editCount === 1 ? "revision" : "revisions"} \u2014 body has been edited" style="color:var(--muted);font-size:9px;border:1px solid var(--border);border-radius:3px;padding:1px 5px;cursor:default">\u270E ${editCount}</span>` : ""}
 
             <span style="color:var(--muted);font-size:10px">${escapeHtml(dateStr)}</span>
 
-            <button class="secondary" data-supersede="${escapeHtml(d.id)}" style="padding:1px 6px;font-size:9px">Supersede</button>
+            <button class="secondary" data-supersede="${escapeHtml(d3.id)}" style="padding:1px 6px;font-size:9px">Supersede</button>
 
-            <button class="secondary guest-hidden" data-archive-decision="${escapeHtml(d.id)}" title="Archive this decision (soft-delete; visible via 'View archived')" style="padding:1px 6px;font-size:9px;color:var(--muted)">Archive</button>
+            <button class="secondary guest-hidden" data-archive-decision="${escapeHtml(d3.id)}" title="Archive this decision (soft-delete; visible via 'View archived')" style="padding:1px 6px;font-size:9px;color:var(--muted)">Archive</button>
 
           </div>
 
         </div>
 
-        <div class="decision-body-view" data-id="${escapeHtml(d.id)}" title="Click to edit" style="color:var(--text);white-space:pre-wrap;word-break:break-word;line-height:1.5;font-size:12px;cursor:pointer">${escapeHtml(d.body || "")}</div>
+        <div class="decision-body-view" data-id="${escapeHtml(d3.id)}" title="Click to edit" style="color:var(--text);white-space:pre-wrap;word-break:break-word;line-height:1.5;font-size:12px;cursor:pointer">${escapeHtml(d3.body || "")}</div>
 
-        <div class="decision-edit-area" data-id="${escapeHtml(d.id)}" style="display:none;margin-top:6px">
+        <div class="decision-edit-area" data-id="${escapeHtml(d3.id)}" style="display:none;margin-top:6px">
 
-          <input type="text" class="decision-edit-title" data-id="${escapeHtml(d.id)}"
+          <input type="text" class="decision-edit-title" data-id="${escapeHtml(d3.id)}"
 
-            value="${escapeHtml(d.title || "")}"
+            value="${escapeHtml(d3.title || "")}"
 
             style="width:100%;padding:4px 6px;background:var(--surface-1);border:1px solid var(--accent);border-radius:3px;color:var(--text);font-size:12px;font-family:var(--font-mono);outline:none;margin-bottom:4px">
 
-          <textarea class="decision-edit-body" data-id="${escapeHtml(d.id)}" rows="4"
+          <textarea class="decision-edit-body" data-id="${escapeHtml(d3.id)}" rows="4"
 
-            style="width:100%;padding:4px 6px;background:var(--surface-1);border:1px solid var(--accent);border-radius:3px;color:var(--text);font-size:12px;font-family:var(--font-mono);resize:vertical;outline:none">${escapeHtml(d.body || "")}</textarea>
+            style="width:100%;padding:4px 6px;background:var(--surface-1);border:1px solid var(--accent);border-radius:3px;color:var(--text);font-size:12px;font-family:var(--font-mono);resize:vertical;outline:none">${escapeHtml(d3.body || "")}</textarea>
 
           <div style="display:flex;gap:6px;justify-content:flex-end;margin-top:4px">
 
-            <button class="secondary decision-edit-cancel" data-id="${escapeHtml(d.id)}" style="padding:2px 8px;font-size:10px">Cancel</button>
+            <button class="secondary decision-edit-cancel" data-id="${escapeHtml(d3.id)}" style="padding:2px 8px;font-size:10px">Cancel</button>
 
-            <button class="primary decision-edit-save" data-id="${escapeHtml(d.id)}" data-project="${escapeHtml(projectId)}" style="padding:2px 8px;font-size:10px">Save</button>
+            <button class="primary decision-edit-save" data-id="${escapeHtml(d3.id)}" data-project="${escapeHtml(projectId)}" style="padding:2px 8px;font-size:10px">Save</button>
 
           </div>
 
@@ -12053,20 +12789,20 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
       });
       const _CATS = ["TECHNICAL", "STRATEGIC", "ARCHITECTURAL", "PRODUCT", "TACTICAL", "BUSINESS", "COMPETITIVE"];
       host.querySelectorAll(".decision-cat-tag").forEach((tag) => {
-        tag.onclick = (e) => {
-          e.stopPropagation();
+        tag.onclick = (e3) => {
+          e3.stopPropagation();
           const id = tag.dataset.id;
           const cur = tag.dataset.cat;
-          document.querySelectorAll(".decision-cat-dropdown").forEach((d) => d.remove());
+          document.querySelectorAll(".decision-cat-dropdown").forEach((d3) => d3.remove());
           const sel = document.createElement("select");
           sel.className = "decision-cat-dropdown";
           sel.style.cssText = "position:absolute;z-index:9999;background:#1a1a1a;color:#f0f0f0;font-size:10px;font-weight:700;border:1px solid var(--border);border-radius:4px;padding:3px 5px;cursor:pointer";
-          _CATS.forEach((c) => {
-            const o = document.createElement("option");
-            o.value = c;
-            o.textContent = c;
-            if (c === cur) o.selected = true;
-            sel.appendChild(o);
+          _CATS.forEach((c3) => {
+            const o3 = document.createElement("option");
+            o3.value = c3;
+            o3.textContent = c3;
+            if (c3 === cur) o3.selected = true;
+            sel.appendChild(o3);
           });
           const rect = tag.getBoundingClientRect();
           sel.style.left = rect.left + window.scrollX + "px";
@@ -12077,7 +12813,7 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
           if (typeof sel.showPicker === "function") {
             try {
               sel.showPicker();
-            } catch (_) {
+            } catch (_2) {
               sel.click();
             }
           } else {
@@ -12115,8 +12851,8 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
             });
             toast("decision saved");
             loadPinnedDecisions(pid);
-          } catch (e) {
-            toast("save failed: " + e.message, true);
+          } catch (e3) {
+            toast("save failed: " + e3.message, true);
           }
         };
       });
@@ -12136,8 +12872,8 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
             });
             toast(`priority \u2192 ${next}`);
             loadPinnedDecisions(pid);
-          } catch (e) {
-            toast("priority change failed: " + e.message, true);
+          } catch (e3) {
+            toast("priority change failed: " + e3.message, true);
           }
         };
       });
@@ -12151,21 +12887,21 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
             });
             toast("decision archived");
             loadPinnedDecisions(projectId);
-          } catch (e) {
-            toast("archive failed: " + e.message, true);
+          } catch (e3) {
+            toast("archive failed: " + e3.message, true);
           }
         };
       });
       const toggleEl = document.getElementById(`decisions-view-archived-${projectId}`);
       if (toggleEl) {
         if (showArchived) {
-          const archivedCount = (allItems || []).filter((d) => d.status === "superseded").length;
+          const archivedCount = (allItems || []).filter((d3) => d3.status === "superseded").length;
           toggleEl.innerHTML = `<button class="secondary" style="padding:2px 8px;font-size:10px" onclick="loadPinnedDecisions('${escapeHtml(projectId)}', {showArchived:false})">\u2190 Hide archived</button> <span style="color:var(--muted)">${archivedCount} archived</span>`;
         } else {
           api(`/projects/${projectId}/decisions-pinned?include_superseded=true`).then((all) => {
-            const n = (all || []).filter((d) => d.status === "superseded").length;
+            const n2 = (all || []).filter((d3) => d3.status === "superseded").length;
             const el2 = document.getElementById(`decisions-view-archived-${projectId}`);
-            if (el2) el2.innerHTML = n > 0 ? `<button class="secondary" style="padding:2px 8px;font-size:10px" onclick="loadPinnedDecisions('${escapeHtml(projectId)}', {showArchived:true})">View archived (${n}) \u25B8</button>` : "";
+            if (el2) el2.innerHTML = n2 > 0 ? `<button class="secondary" style="padding:2px 8px;font-size:10px" onclick="loadPinnedDecisions('${escapeHtml(projectId)}', {showArchived:true})">View archived (${n2}) \u25B8</button>` : "";
           }).catch(() => {
           });
         }
@@ -12178,7 +12914,7 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
       }
       try {
         const all = await api(`/projects/${projectId}/decisions-pinned?include_superseded=true`);
-        const superseded = (all || []).filter((d) => d.status === "superseded");
+        const superseded = (all || []).filter((d3) => d3.status === "superseded");
         if (superseded.length > 0) {
           supersededEl.innerHTML = `<details style="margin-top:8px;margin-bottom:6px">
 
@@ -12190,17 +12926,17 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
 
           <div style="margin-top:6px">
 
-            ${superseded.map((d) => {
-            const cat = d.category || "TECHNICAL";
+            ${superseded.map((d3) => {
+            const cat = d3.category || "TECHNICAL";
             const color = _DECISION_CATEGORY_COLORS[cat] || _DECISION_CATEGORY_COLORS.TECHNICAL;
-            const dateStr = (d.created_at || "").slice(0, 10);
+            const dateStr = (d3.created_at || "").slice(0, 10);
             return `<div style="background:var(--surface-1);border:1px solid var(--border);border-left:4px solid ${color}55;border-radius:4px;padding:8px 12px;margin-bottom:6px;opacity:0.6">
 
                 <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px">
 
                   <span style="display:inline-block;background:${color}11;color:${color}88;font-size:9px;font-weight:700;padding:1px 5px;border-radius:3px">${escapeHtml(cat)}</span>
 
-                  <span style="color:var(--muted);font-weight:600;font-size:11px;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${escapeHtml(d.title || "")}">${escapeHtml(d.title || "")}</span>
+                  <span style="color:var(--muted);font-weight:600;font-size:11px;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${escapeHtml(d3.title || "")}">${escapeHtml(d3.title || "")}</span>
 
                   <span style="color:var(--muted);font-size:9px;flex-shrink:0">${escapeHtml(dateStr)}</span>
 
@@ -12208,7 +12944,7 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
 
                 </div>
 
-                <div style="color:var(--muted);font-size:11px;white-space:pre-wrap;word-break:break-word;line-height:1.5">${escapeHtml((d.body || "").slice(0, 200))}</div>
+                <div style="color:var(--muted);font-size:11px;white-space:pre-wrap;word-break:break-word;line-height:1.5">${escapeHtml((d3.body || "").slice(0, 200))}</div>
 
               </div>`;
           }).join("")}
@@ -12219,12 +12955,12 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
         } else {
           supersededEl.innerHTML = "";
         }
-      } catch (_) {
+      } catch (_2) {
       }
-    } catch (e) {
+    } catch (e3) {
       if (state.panels[projectId]) state.panels[projectId]._pinnedDecisions = [];
       renderConstitutionWarning2(projectId);
-      host.innerHTML = `<div style="color:var(--muted)">failed to load pinned decisions: ${escapeHtml(String(e))}</div>`;
+      host.innerHTML = `<div style="color:var(--muted)">failed to load pinned decisions: ${escapeHtml(String(e3))}</div>`;
     }
   }
   async function supersedePinnedDecision(projectId, decisionId) {
@@ -12239,8 +12975,8 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
       });
       toast("decision superseded");
       loadPinnedDecisions(projectId);
-    } catch (e) {
-      toast("supersede failed: " + e.message, true);
+    } catch (e3) {
+      toast("supersede failed: " + e3.message, true);
     }
   }
   async function addPinnedDecision(projectId) {
@@ -12257,8 +12993,8 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
       });
       toast("decision pinned");
       loadPinnedDecisions(projectId);
-    } catch (e) {
-      toast("pin failed: " + e.message, true);
+    } catch (e3) {
+      toast("pin failed: " + e3.message, true);
     }
   }
   async function consolidateDecisions(projectId) {
@@ -12310,8 +13046,8 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
 
     </div>`;
     document.body.appendChild(overlay);
-    overlay.addEventListener("click", (e) => {
-      if (e.target === overlay) overlay.remove();
+    overlay.addEventListener("click", (e3) => {
+      if (e3.target === overlay) overlay.remove();
     });
     document.getElementById("_consolidate-cancel").onclick = () => overlay.remove();
     document.getElementById("_consolidate-run").onclick = async () => {
@@ -12333,8 +13069,8 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
         const consolidated = result.consolidated || [];
         const previewOverlay = document.createElement("div");
         previewOverlay.style.cssText = "position:fixed;inset:0;background:rgba(0,0,0,0.72);z-index:9999;display:flex;align-items:center;justify-content:center";
-        const previewHtml = consolidated.map((d) => {
-          const cat = (d.category || "TECHNICAL").toUpperCase();
+        const previewHtml = consolidated.map((d3) => {
+          const cat = (d3.category || "TECHNICAL").toUpperCase();
           const color = _DECISION_CATEGORY_COLORS[cat] || _DECISION_CATEGORY_COLORS.TECHNICAL;
           return `<div style="background:var(--surface-2);border-left:4px solid ${color};border-radius:4px;padding:8px 10px;margin-bottom:8px">
 
@@ -12342,11 +13078,11 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
 
             <span style="background:${color}22;color:${color};font-size:9px;font-weight:700;padding:1px 5px;border-radius:3px">${escapeHtml(cat)}</span>
 
-            <span style="color:var(--accent);font-weight:600;font-size:12px">${escapeHtml(d.title || "")}</span>
+            <span style="color:var(--accent);font-weight:600;font-size:12px">${escapeHtml(d3.title || "")}</span>
 
           </div>
 
-          <div style="color:var(--text);font-size:11px;white-space:pre-wrap">${escapeHtml(d.body || "")}</div>
+          <div style="color:var(--text);font-size:11px;white-space:pre-wrap">${escapeHtml(d3.body || "")}</div>
 
         </div>`;
         }).join("");
@@ -12370,8 +13106,8 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
 
         </div>`;
         document.body.appendChild(previewOverlay);
-        previewOverlay.addEventListener("click", (e) => {
-          if (e.target === previewOverlay) previewOverlay.remove();
+        previewOverlay.addEventListener("click", (e3) => {
+          if (e3.target === previewOverlay) previewOverlay.remove();
         });
         document.getElementById("_preview-cancel").onclick = () => previewOverlay.remove();
         document.getElementById("_preview-apply").onclick = async () => {
@@ -12386,16 +13122,16 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
             previewOverlay.remove();
             toast(`Consolidated: ${consolidated.length} decisions applied`);
             loadPinnedDecisions(projectId);
-          } catch (e) {
-            toast("Apply failed: " + e.message, true);
+          } catch (e3) {
+            toast("Apply failed: " + e3.message, true);
             applyBtn.textContent = "Apply \u2192";
             applyBtn.disabled = false;
           }
         };
-      } catch (e) {
+      } catch (e3) {
         runBtn.textContent = "Consolidate \u2192";
         runBtn.disabled = false;
-        toast("Consolidation failed: " + e.message, true);
+        toast("Consolidation failed: " + e3.message, true);
       }
     };
   }
@@ -12428,8 +13164,8 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
     row.querySelectorAll(".preview-btn").forEach((btn) => {
       btn.onclick = () => {
         const mode = btn.dataset.mode;
-        row.querySelectorAll(".preview-btn").forEach((b) => {
-          b.classList.toggle("active", b.dataset.mode === mode);
+        row.querySelectorAll(".preview-btn").forEach((b2) => {
+          b2.classList.toggle("active", b2.dataset.mode === mode);
         });
         if (mode === "preview") {
           const md = taEl.value || "";
@@ -12459,7 +13195,7 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
     if (state.panels[projectId].goalIsJson) {
       try {
         content = JSON.parse(raw);
-      } catch (e) {
+      } catch (e3) {
       }
     }
     try {
@@ -12467,8 +13203,8 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
       state.panels[projectId]._lastSaved = raw;
       toast("version goal saved");
       refreshGoal(projectId);
-    } catch (e) {
-      toast("save failed: " + e.message, true);
+    } catch (e3) {
+      toast("save failed: " + e3.message, true);
     }
   }
   async function saveNorthStar(projectId) {
@@ -12492,8 +13228,8 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
       });
       toast("north star saved");
       refreshGoal(projectId);
-    } catch (e) {
-      toast("save failed: " + e.message, true);
+    } catch (e3) {
+      toast("save failed: " + e3.message, true);
     }
   }
   async function saveSprint(projectId) {
@@ -12510,13 +13246,13 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
       });
       toast("sprint saved");
       refreshGoal(projectId);
-    } catch (e) {
-      toast("save failed: " + e.message, true);
+    } catch (e3) {
+      toast("save failed: " + e3.message, true);
     }
   }
   function _sessionPresenceDot(last_seen) {
     if (!last_seen) return "\u26AB";
-    const mins = (Date.now() - /* @__PURE__ */ new Date(last_seen.replace(" ", "T") + "Z")) / 6e4;
+    const mins = (Date.now() - (/* @__PURE__ */ new Date(last_seen.replace(" ", "T") + "Z")).getTime()) / 6e4;
     if (mins < 6) return "\u{1F7E2}";
     if (mins < 30) return "\u{1F7E1}";
     return "\u26AB";
@@ -12534,39 +13270,39 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
       }
       const groups = {};
       const order = [];
-      for (const s of sessions) {
-        const h = s.human_id || "\0unknown";
-        if (!groups[h]) {
-          groups[h] = [];
-          order.push(h);
+      for (const s3 of sessions) {
+        const h2 = s3.human_id || "\0unknown";
+        if (!groups[h2]) {
+          groups[h2] = [];
+          order.push(h2);
         }
-        groups[h].push(s);
+        groups[h2].push(s3);
       }
-      for (const g of Object.values(groups)) {
-        g.sort((a, b) => (b.last_seen || "").localeCompare(a.last_seen || ""));
+      for (const g2 of Object.values(groups)) {
+        g2.sort((a3, b2) => (b2.last_seen || "").localeCompare(a3.last_seen || ""));
       }
-      const rows = order.map((h) => {
-        const humanSessions = groups[h];
-        const label = h === "\0unknown" ? humanSessions.length === 1 ? humanSessions[0].name : "unknown" : h;
+      const rows = order.map((h2) => {
+        const humanSessions = groups[h2];
+        const label = h2 === "\0unknown" ? humanSessions.length === 1 ? humanSessions[0].name : "unknown" : h2;
         const topDot = _sessionPresenceDot(humanSessions[0]?.last_seen);
         const header = `<div class="session-row" style="font-weight:600;padding-top:4px"><span class="name">${topDot} ${escapeHtml(label)}</span><span class="meta">${humanSessions.length} session${humanSessions.length > 1 ? "s" : ""}</span></div>`;
-        const children = humanSessions.map((s) => {
+        const children = humanSessions.map((s3) => {
           let ageMs = 0;
           try {
-            const ts = s.last_seen ? s.last_seen.replace(" ", "T") + "Z" : "";
+            const ts = s3.last_seen ? s3.last_seen.replace(" ", "T") + "Z" : "";
             if (ts) ageMs = Date.now() - new Date(ts).getTime();
-          } catch (e) {
+          } catch (e3) {
           }
           const ageH = ageMs / 36e5;
           const opacity = ageH < 1 ? 1 : ageH < 24 ? 0.7 : 0.4;
-          const clientBadge = s.client_type ? `<span style="font-size:9px;color:var(--muted);margin-left:4px">${escapeHtml(s.client_type)}</span>` : "";
-          return `<div class="session-row" style="opacity:${opacity};padding-left:18px;font-size:11px"><span class="name">${escapeHtml(s.name)}${clientBadge}</span><span class="meta">${escapeHtml(s.status)} \xB7 ${escapeHtml(formatRelativeTime(s.last_seen))}</span></div>`;
+          const clientBadge = s3.client_type ? `<span style="font-size:9px;color:var(--muted);margin-left:4px">${escapeHtml(s3.client_type)}</span>` : "";
+          return `<div class="session-row" style="opacity:${opacity};padding-left:18px;font-size:11px"><span class="name">${escapeHtml(s3.name)}${clientBadge}</span><span class="meta">${escapeHtml(s3.status)} \xB7 ${escapeHtml(formatRelativeTime(s3.last_seen))}</span></div>`;
         }).join("");
         return header + children;
       }).join("");
       root.innerHTML = rows;
-    } catch (e) {
-      root.innerHTML = renderProjectLoadError2(projectId, "Sessions unavailable", sessionsPath, e);
+    } catch (e3) {
+      root.innerHTML = renderProjectLoadError2(projectId, "Sessions unavailable", sessionsPath, e3);
       wireProjectLoadRetry2(root, projectId);
     }
   }
@@ -12577,14 +13313,14 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
       state.panels[projectId].taskCache = tasks;
       state.panels[projectId].taskOffset = tasks.length;
       renderTasks(projectId);
-    } catch (e) {
+    } catch (e3) {
       const root = document.getElementById(`tasks-${projectId}`);
       const hitlRoot = document.getElementById(`hitl-queue-${projectId}`);
       const banner = document.getElementById(`hitl-banner-${projectId}`);
       if (banner) banner.style.display = "none";
       if (hitlRoot) hitlRoot.innerHTML = "";
       if (root) {
-        root.innerHTML = renderProjectLoadError2(projectId, "Task log unavailable", tasksPath, e);
+        root.innerHTML = renderProjectLoadError2(projectId, "Task log unavailable", tasksPath, e3);
         wireProjectLoadRetry2(root, projectId);
       }
     }
@@ -12595,11 +13331,11 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
     const hitlRoot = document.getElementById(`hitl-queue-${projectId}`);
     const banner = document.getElementById(`hitl-banner-${projectId}`);
     if (!root || !hitlRoot) return;
-    const hitl = tasks.filter((t) => t.status === "pending-hitl");
+    const hitl = tasks.filter((t3) => t3.status === "pending-hitl");
     banner.style.display = hitl.length ? "block" : "none";
-    hitlRoot.innerHTML = hitl.map((t) => renderHitlRow(projectId, t)).join("");
-    hitl.forEach((t) => wireHitlRow(projectId, t));
-    root.innerHTML = tasks.map((t) => renderTaskRow(t)).join("");
+    hitlRoot.innerHTML = hitl.map((t3) => renderHitlRow(projectId, t3)).join("");
+    hitl.forEach((t3) => wireHitlRow(projectId, t3));
+    root.innerHTML = tasks.map((t3) => renderTaskRow(t3)).join("");
     _wireTabSearch(`devlog-search-${projectId}`, `tasks-${projectId}`, ".task");
     const existingBtn = document.getElementById(`devlog-load-more-${projectId}`);
     if (existingBtn) existingBtn.remove();
@@ -12614,41 +13350,41 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
     }
   }
   async function _loadMoreTasks(projectId, btn) {
-    const p = state.panels[projectId];
-    const offset = p.taskOffset || 0;
+    const p3 = state.panels[projectId];
+    const offset = p3.taskOffset || 0;
     btn.disabled = true;
     btn.textContent = "loading\u2026";
     try {
       const more = await api(`/projects/${projectId}/tasks?limit=100&offset=${offset}`);
-      p.taskCache = [...p.taskCache || [], ...more];
-      p.taskOffset = offset + more.length;
+      p3.taskCache = [...p3.taskCache || [], ...more];
+      p3.taskOffset = offset + more.length;
       const root = document.getElementById(`tasks-${projectId}`);
-      if (root) root.innerHTML += more.map((t) => renderTaskRow(t)).join("");
+      if (root) root.innerHTML += more.map((t3) => renderTaskRow(t3)).join("");
       if (more.length < 100) {
         btn.remove();
       } else {
         btn.disabled = false;
         btn.textContent = "Load 100 more \u2193";
       }
-    } catch (e) {
+    } catch (e3) {
       btn.disabled = false;
       btn.textContent = "Load 100 more \u2193 (retry)";
     }
   }
-  function renderTaskRow(t) {
-    const claimBadge = t.claimed_by ? `<span class="claim-badge" title="claimed at ${escapeHtml(t.claimed_at || "")}">U0001f512 ${escapeHtml((t.claimed_by_human_id || t.claimed_by_session_name || t.claimed_by || "").slice(0, 16))}</span>` : "";
-    const deleteBtn = `<button class="guest-hidden" title="Delete from task log (permanent)" onclick="deleteTaskRow(event,'${t.id}','${t.status}')" style="background:none;border:none;color:var(--muted);cursor:pointer;font-size:13px;padding:0 4px;flex-shrink:0;line-height:1" onmouseenter="this.style.color='var(--status-failed)'" onmouseleave="this.style.color='var(--muted)'">\xD7</button>`;
+  function renderTaskRow(t3) {
+    const claimBadge = t3.claimed_by ? `<span class="claim-badge" title="claimed at ${escapeHtml(t3.claimed_at || "")}">U0001f512 ${escapeHtml((t3.claimed_by_human_id || t3.claimed_by_session_name || t3.claimed_by || "").slice(0, 16))}</span>` : "";
+    const deleteBtn = `<button class="guest-hidden" title="Delete from task log (permanent)" onclick="deleteTaskRow(event,'${t3.id}','${t3.status}')" style="background:none;border:none;color:var(--muted);cursor:pointer;font-size:13px;padding:0 4px;flex-shrink:0;line-height:1" onmouseenter="this.style.color='var(--status-failed)'" onmouseleave="this.style.color='var(--muted)'">\xD7</button>`;
     return `
 
-    <div class="task ${t.status}" id="task-row-${t.id}" data-search="${escapeHtml((t.description || "") + " " + (t.session_name || "") + " " + (t.claimed_by_session_name || "") + " " + (t.status || ""))}" style="display:flex;align-items:flex-start;gap:4px">
+    <div class="task ${t3.status}" id="task-row-${t3.id}" data-search="${escapeHtml((t3.description || "") + " " + (t3.session_name || "") + " " + (t3.claimed_by_session_name || "") + " " + (t3.status || ""))}" style="display:flex;align-items:flex-start;gap:4px">
 
-      <span class="status-badge">${t.status}</span>
+      <span class="status-badge">${t3.status}</span>
 
       <div style="flex:1;min-width:0">
 
-        <div class="desc">${escapeHtml(t.description)}</div>
+        <div class="desc">${escapeHtml(t3.description)}</div>
 
-        <div class="meta">${escapeHtml(t.created_at)} ${claimBadge}</div>
+        <div class="meta">${escapeHtml(t3.created_at)} ${claimBadge}</div>
 
       </div>
 
@@ -12656,34 +13392,34 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
 
     </div>`;
   }
-  async function deleteTaskRow(e, taskId, status) {
-    e.stopPropagation();
+  async function deleteTaskRow(e3, taskId, status) {
+    e3.stopPropagation();
     const warn = status === "pending" || status === "in_progress" ? "This task is " + status + ". Deleting it is permanent. Continue?" : "Permanently delete this task from the log?";
     if (!confirm(warn)) return;
     try {
       await api("/tasks/" + taskId, { method: "DELETE" });
       const row = document.getElementById("task-row-" + taskId);
       if (row) row.remove();
-    } catch (e2) {
-      console.error("Delete failed:", e2);
+    } catch (e22) {
+      console.error("Delete failed:", e22);
     }
   }
-  function renderHitlRow(projectId, t) {
-    const isExecute = t.description.startsWith("[EXECUTE]");
+  function renderHitlRow(projectId, t3) {
+    const isExecute = t3.description.startsWith("[EXECUTE]");
     const label = isExecute ? "EXECUTE REQUEST" : "QUESTION";
-    const body = t.description.replace(/^\[(ASK|EXECUTE)\]:?\s*/, "");
+    const body = t3.description.replace(/^\[(ASK|EXECUTE)\]:?\s*/, "");
     if (isExecute) {
       return `
 
-      <div class="hitl-row" data-task="${t.id}">
+      <div class="hitl-row" data-task="${t3.id}">
 
         <div class="prompt"><strong>${label}</strong> \xB7 ${escapeHtml(body)}</div>
 
         <div class="controls">
 
-          <button class="execute" data-action="confirm" data-task="${t.id}">EXECUTE</button>
+          <button class="execute" data-action="confirm" data-task="${t3.id}">EXECUTE</button>
 
-          <button class="danger"  data-action="reject"  data-task="${t.id}">REJECT</button>
+          <button class="danger"  data-action="reject"  data-task="${t3.id}">REJECT</button>
 
         </div>
 
@@ -12691,38 +13427,38 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
     }
     return `
 
-    <div class="hitl-row" data-task="${t.id}">
+    <div class="hitl-row" data-task="${t3.id}">
 
       <div class="prompt"><strong>${label}</strong> \xB7 ${escapeHtml(body)}</div>
 
       <div class="controls">
 
-        <input type="text" placeholder="your reply" data-input="${t.id}">
+        <input type="text" placeholder="your reply" data-input="${t3.id}">
 
-        <button class="primary" data-action="reply" data-task="${t.id}">reply</button>
+        <button class="primary" data-action="reply" data-task="${t3.id}">reply</button>
 
       </div>
 
     </div>`;
   }
-  function wireHitlRow(projectId, t) {
-    const row = document.querySelector(`#hitl-queue-${projectId} [data-task="${t.id}"]`);
+  function wireHitlRow(projectId, t3) {
+    const row = document.querySelector(`#hitl-queue-${projectId} [data-task="${t3.id}"]`);
     if (!row) return;
     row.querySelectorAll("button[data-action]").forEach((btn) => {
       btn.onclick = () => {
         const action = btn.dataset.action;
         if (action === "reply") {
-          const inp = row.querySelector(`input[data-input="${t.id}"]`);
+          const inp = row.querySelector(`input[data-input="${t3.id}"]`);
           const text = (inp && inp.value || "").trim();
           if (!text) {
             toast("enter a reply first", true);
             return;
           }
-          hitlReply(projectId, t.id, text);
+          hitlReply(projectId, t3.id, text);
         } else if (action === "confirm") {
-          hitlExecute(projectId, t.id, true);
+          hitlExecute(projectId, t3.id, true);
         } else if (action === "reject") {
-          hitlExecute(projectId, t.id, false);
+          hitlExecute(projectId, t3.id, false);
         }
       };
     });
@@ -12732,7 +13468,7 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
     try {
       const goal = await api(`/projects/${projectId}/goal`);
       current = typeof goal.content === "string" ? goal.content : JSON.stringify(goal.content, null, 2);
-    } catch (e) {
+    } catch (e3) {
     }
     const next = current ? current.trimEnd() + "\n" + line : line;
     await api(`/projects/${projectId}/goal`, { method: "POST", body: JSON.stringify({ content: next }) });
@@ -12742,8 +13478,8 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
       await appendToGoal(projectId, `[HITL-REPLY:${taskId}:] ${text}`);
       await api(`/tasks/${taskId}`, { method: "PATCH", body: JSON.stringify({ status: "done", description: `[ANSWERED] ${text}` }) });
       toast("reply sent");
-    } catch (e) {
-      toast("reply failed: " + e.message, true);
+    } catch (e3) {
+      toast("reply failed: " + e3.message, true);
     }
   }
   async function hitlExecute(projectId, taskId, confirmed) {
@@ -12757,8 +13493,8 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
         await api(`/tasks/${taskId}`, { method: "PATCH", body: JSON.stringify({ status: "failed" }) });
         toast("execute rejected");
       }
-    } catch (e) {
-      toast("execute failed: " + e.message, true);
+    } catch (e3) {
+      toast("execute failed: " + e3.message, true);
     }
   }
   function connectWs(projectId) {
@@ -12781,7 +13517,7 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
       try {
         const event = JSON.parse(ev.data);
         handleWsEvent(projectId, event);
-      } catch (e) {
+      } catch (e3) {
       }
     };
     state.panels[projectId].ws = ws;
@@ -12797,14 +13533,14 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
       return;
     }
     if (event.type === "project_renamed") {
-      const tab = state.tabs.find((t) => t.id === event.project_id);
+      const tab = state.tabs.find((t3) => t3.id === event.project_id);
       if (tab) {
         tab.project = { ...tab.project, name: event.name };
         const hdr = document.querySelector(`#drawer-status-${event.project_id} .drawer-header span:first-child`);
         if (hdr) hdr.textContent = "STATUS \xB7 " + event.name;
         renderTabs();
       }
-      const proj = state.projects.find((p) => p.id === event.project_id);
+      const proj = state.projects.find((p3) => p3.id === event.project_id);
       if (proj) {
         proj.name = event.name;
         loadProjects();
@@ -12856,8 +13592,8 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
     if (event.type === "task_created") {
       cache.unshift(event.task);
     } else if (event.type === "task_updated") {
-      const i = cache.findIndex((t) => t.id === event.task.id);
-      if (i >= 0) cache[i] = event.task;
+      const i3 = cache.findIndex((t3) => t3.id === event.task.id);
+      if (i3 >= 0) cache[i3] = event.task;
       else cache.unshift(event.task);
     }
     renderTasks(projectId);
@@ -12879,13 +13615,13 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
     const humanId = (humanInp && humanInp.value || "").trim();
     if (humanId) body.human_id = humanId;
     try {
-      const p = await api("/projects", { method: "POST", body: JSON.stringify(body) });
+      const p3 = await api("/projects", { method: "POST", body: JSON.stringify(body) });
       inp.value = "";
       if (humanInp) humanInp.value = "";
       await loadProjects();
-      openTab(p);
-    } catch (e) {
-      toast("create failed: " + e.message, true);
+      openTab(p3);
+    } catch (e3) {
+      toast("create failed: " + e3.message, true);
     }
   };
   {
@@ -12894,8 +13630,8 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
       switcher.addEventListener("change", (ev) => {
         const id = ev.target.value;
         if (!id) return;
-        const p = state.projects.find((x) => x.id === id);
-        if (p) openTab(p);
+        const p3 = state.projects.find((x2) => x2.id === id);
+        if (p3) openTab(p3);
       });
     }
   }
@@ -12904,20 +13640,20 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
     let preferred = null;
     try {
       preferred = localStorage.getItem(STORAGE_KEY2(ACTIVE_PROJECT_KEY));
-    } catch (e) {
+    } catch (e3) {
     }
     try {
       saved = JSON.parse(localStorage.getItem(STORAGE_KEY2(TABS_KEY)) || "[]");
-    } catch (e) {
+    } catch (e3) {
     }
     for (const id of saved) {
-      const p = state.projects.find((x) => x.id === id);
-      if (p) openTab(p);
+      const p3 = state.projects.find((x2) => x2.id === id);
+      if (p3) openTab(p3);
     }
     if (state.tabs.length === 0 && state.projects.length > 0) {
-      const fallback = state.projects.find((p) => p.id === preferred) || state.projects[0];
+      const fallback = state.projects.find((p3) => p3.id === preferred) || state.projects[0];
       if (fallback) openTab(fallback);
-    } else if (preferred && state.tabs.find((t) => t.id === preferred)) {
+    } else if (preferred && state.tabs.find((t3) => t3.id === preferred)) {
       activateTab(preferred);
     }
   }
@@ -12927,7 +13663,7 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
       state.activeWorkspaceTenantId = _wsParam;
       try {
         history.replaceState(null, "", window.location.pathname);
-      } catch (_) {
+      } catch (_2) {
       }
     }
     await loadServerConfig();
@@ -12939,13 +13675,13 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
     await loadProjects();
     if (state.projects.length === 0 && !state.activeWorkspaceTenantId && isHostedMode() && !isDemoMode()) {
       try {
-        const wss = await fetch("/me/workspaces").then((r) => r.ok ? r.json() : null);
-        const first = wss && wss.find((w) => !w.is_own);
+        const wss = await fetch("/me/workspaces").then((r3) => r3.ok ? r3.json() : null);
+        const first = wss && wss.find((w3) => !w3.is_own);
         if (first) {
           state.activeWorkspaceTenantId = first.tenant_id;
           await loadProjects();
         }
-      } catch (_) {
+      } catch (_2) {
       }
     }
     if (isDemoMode()) hideDemoAdminControls();
@@ -12964,7 +13700,7 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
     const requestedProjectId = dashboardParams.get("project_id") || "";
     const requestedTab = dashboardParams.get("tab") || "";
     if (requestedProjectId) {
-      const requestedProject = state.projects.find((p) => p.id === requestedProjectId);
+      const requestedProject = state.projects.find((p3) => p3.id === requestedProjectId);
       if (requestedProject) {
         openTab(requestedProject);
         if (requestedTab && requestedTab !== "status") {
@@ -12986,7 +13722,7 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
             stopBtn.disabled = true;
             const restartBtn2 = document.getElementById("restart-server-btn");
             if (restartBtn2) restartBtn2.style.display = "none";
-          } catch (e) {
+          } catch (e3) {
             toast("Shutdown request sent.", false);
           }
         };
@@ -13013,7 +13749,7 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
           if (msg) msg.textContent = data.warning;
           banner.style.display = "block";
         }
-      } catch (_) {
+      } catch (_2) {
       }
     }
     _checkGitStatus();
@@ -13022,7 +13758,7 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
     if (workspaceEntry) {
       workspaceEntry.onclick = () => {
         const targetId = state.activeTab || state.projects[0]?.id;
-        const project = state.projects.find((p) => p.id === targetId);
+        const project = state.projects.find((p3) => p3.id === targetId);
         if (!project) return;
         if (!document.getElementById(`tab-body-${targetId}`)) openTab(project);
         document.querySelector(`#vtab-strip-${targetId} [data-vtab="settings"]`)?.click();
@@ -13036,32 +13772,32 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
     try {
       await api(`/projects/${projectId}/sprint-items/${itemId}`, { method: "DELETE" });
       if (_sprintBoardReloaders[projectId]) _sprintBoardReloaders[projectId]();
-    } catch (e) {
-      console.error("Delete sprint item failed:", e);
+    } catch (e3) {
+      console.error("Delete sprint item failed:", e3);
     }
   }
   async function _sprintAction(projectId, itemId, action) {
     try {
       await api(`/projects/${projectId}/sprint-items/${itemId}/${action}`, { method: "POST" });
       if (_sprintBoardReloaders[projectId]) _sprintBoardReloaders[projectId]();
-    } catch (e) {
-      console.error("Sprint action failed:", action, e);
+    } catch (e3) {
+      console.error("Sprint action failed:", action, e3);
     }
   }
   async function completeSprintItem(projectId, itemId) {
     try {
       await api(`/projects/${projectId}/sprint-items/${itemId}/complete`, { method: "POST" });
       if (_sprintBoardReloaders[projectId]) _sprintBoardReloaders[projectId]();
-    } catch (e) {
-      console.error("Complete sprint item failed:", e);
+    } catch (e3) {
+      console.error("Complete sprint item failed:", e3);
     }
   }
   async function failSprintItem(projectId, itemId) {
     try {
       await api(`/projects/${projectId}/sprint-items/${itemId}/fail`, { method: "POST" });
       if (_sprintBoardReloaders[projectId]) _sprintBoardReloaders[projectId]();
-    } catch (e) {
-      console.error("Fail sprint item failed:", e);
+    } catch (e3) {
+      console.error("Fail sprint item failed:", e3);
     }
   }
   document.getElementById("ez-create-btn").onclick = async () => {
@@ -13078,21 +13814,21 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
     try {
       const body = { name };
       if (humanEl.value.trim()) body.human_id = humanEl.value.trim();
-      const p = await api("/projects", { method: "POST", body: JSON.stringify(body) });
+      const p3 = await api("/projects", { method: "POST", body: JSON.stringify(body) });
       document.getElementById("ez-wizard").style.display = "none";
       await loadProjects();
       await restoreTabs();
-      openTab(p);
-    } catch (e) {
-      errEl.textContent = "create failed: " + e.message;
+      openTab(p3);
+    } catch (e3) {
+      errEl.textContent = "create failed: " + e3.message;
       errEl.style.display = "block";
     }
   };
-  document.getElementById("ez-project-name").addEventListener("keydown", (e) => {
-    if (e.key === "Enter") document.getElementById("ez-create-btn").click();
+  document.getElementById("ez-project-name").addEventListener("keydown", (e3) => {
+    if (e3.key === "Enter") document.getElementById("ez-create-btn").click();
   });
-  document.getElementById("ez-advanced-link").onclick = (e) => {
-    e.preventDefault();
+  document.getElementById("ez-advanced-link").onclick = (e3) => {
+    e3.preventDefault();
     document.getElementById("ez-wizard").style.display = "none";
     document.getElementById("new-project-name").focus();
     restoreTabs();
@@ -13117,10 +13853,10 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
         errEl.style.display = msg ? "block" : "none";
       }
     }
-    document.addEventListener("keydown", (e) => {
-      if (e.key === "Escape") {
-        const m = document.getElementById("conn-setup-modal");
-        if (m && m.style.display !== "none") m.style.display = "none";
+    document.addEventListener("keydown", (e3) => {
+      if (e3.key === "Escape") {
+        const m3 = document.getElementById("conn-setup-modal");
+        if (m3 && m3.style.display !== "none") m3.style.display = "none";
       }
     });
     window._showConnSetupIfNeeded = (cfg) => {
@@ -13159,8 +13895,8 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
         modal.style.display = "none";
         toast("Saved \u2014 restarting\u2026");
         await _doRestart(false);
-      } catch (e) {
-        showErr("Failed: " + e.message);
+      } catch (e3) {
+        showErr("Failed: " + e3.message);
         sqliteSave.textContent = "Save & Restart \u2192";
         sqliteSave.disabled = false;
       }
@@ -13191,8 +13927,8 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
         modal.style.display = "none";
         toast("Saved \u2014 restarting\u2026");
         await _doRestart(false);
-      } catch (e) {
-        showErr("Failed: " + e.message);
+      } catch (e3) {
+        showErr("Failed: " + e3.message);
         pgSave.textContent = "Save & Restart \u2192";
         pgSave.disabled = false;
       }
@@ -13211,6 +13947,6 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
   }
   try {
     Object.assign(window, { loadCodeIntelTab, _initCodeIntelTabVisibility, hideHostedAdminControls, ensureSignOutLink: ensureSignOutLink2, ensureWorkspaceSwitcher: ensureWorkspaceSwitcher2, getActiveWorkspaceRole: getActiveWorkspaceRole2, showConnectDbModal, showLocalServerControls, _summarizeApiErrorText, _projectLoadErrorInfo, wireProjectLoadRetry: wireProjectLoadRetry2, renderProjectLoadError: renderProjectLoadError2, recordProjectLoadError: recordProjectLoadError2, clearProjectLoadError: clearProjectLoadError2, renderProjectLoadAlert, retryProjectSurface, syncSidebarActiveProject, autosizeGoalField, githubIconSvg: githubIconSvg2, getConstitutionLimit, loadProjectSettings: loadProjectSettings2, saveProjectSettings: saveProjectSettings2, loadExecutorRulesSection, loadTunnelPluginsSection, _demoTourDone: _demoTourDone2, _demoTourSavedStep: _demoTourSavedStep2, _demoTourSaveStep, _demoTourMarkDone, _demoTourClose, _tourActivateVtab, startDemoTour: startDemoTour2, resumeDemoTour, api, projectApi, loadServerConfig, _armAccountSwitchWatch, _refreshOnFocus, _checkAccountSwitch: _checkAccountSwitch2, _showAccountSwitchBanner, updateGitHubConnectionIndicator, _updateConnectionIndicator, checkGitStatus, _doRestart, loadConfig, loadProjects, openTab, closeTab: closeTab2, saveTabs, renderTabs, _makeTabEl, _openTabMenu, _setProjectIcon, _renameProject, _deleteProject, activateTab, buildTabBody, scheduleLiveRefresh, initLiveAutoRefresh, loadLiveTab, refreshLiveTab, wireSprintAddEnter: wireSprintAddEnter2, sprintAction, sprintArchive, filterBackburner, sprintPushPrompt, sprintFeedback, sprintFeedbackNote, sprintItemEdit, addSprintItemFromInput: addSprintItemFromInput2, cacheMostRecentSession, renderLiveSessions, endLiveSession, openTimelineForSession, renderLiveQueue, addLiveTask, cancelLiveTask, showCopyPreview, wireClaudeLaunchPanel, stampHandoffTs, populateSessionDropdown, loadTimeline: loadTimeline2, _renderTimelineLog: _renderTimelineLog2, loadDocsTab, normalizeNotifyTarget, displayNotifyTarget: displayNotifyTarget2, osExecutorHintBanner: osExecutorHintBanner2, showFailoverBannerIfNeeded, suggestNtfyTopic, loadHitlTab, loadTeamTab, updateLiveFeed, loadRecentSessions, loadMilestones, loadRecentRuns, loadQueue, renderSearchResults: renderSearchResults2, wireQueueSectionToggles, refreshTab, refreshGoal, parseDecisionsBlob, renderConstitutionWarning: renderConstitutionWarning2, _hitlBadgeClick, initHitlPanel, setVtabCountBadge: setVtabCountBadge2, refreshProjectCountBadges, refreshHitl, _hitlAnswer, _hitlDismiss, loadPinnedDecisions, supersedePinnedDecision, addPinnedDecision, consolidateDecisions, renderDecisionsTable, wireGoalPreviewToggle, saveGoal, saveNorthStar, saveSprint, _sessionPresenceDot, refreshSessions, refreshTasks, renderTasks, _loadMoreTasks, renderTaskRow, deleteTaskRow, renderHitlRow, wireHitlRow, appendToGoal, hitlReply, hitlExecute, connectWs, handleWsEvent, restoreTabs, _deleteSprintItem, _sprintAction, completeSprintItem, failSprintItem, toggleExpand, state });
-  } catch (e) {
+  } catch (e3) {
   }
 })();

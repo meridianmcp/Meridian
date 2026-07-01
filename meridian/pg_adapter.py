@@ -692,6 +692,19 @@ CREATE TABLE IF NOT EXISTS workspace_settings (
     code_intel_enabled_default INTEGER,
     updated_at TEXT NOT NULL DEFAULT ({_TS})
 );
+
+-- 6234f9b8 — blog_posts: admin-authored posts served at /blog/<slug>.
+CREATE TABLE IF NOT EXISTS blog_posts (
+    id TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    slug TEXT NOT NULL UNIQUE,
+    body_md TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'draft',
+    created_at TEXT NOT NULL DEFAULT ({_TS}),
+    updated_at TEXT NOT NULL DEFAULT ({_TS}),
+    published_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_blog_posts_status ON blog_posts(status);
 """
 
 # Tables that go ONLY in the main auth DB (MERIDIAN_DB_URL).
@@ -1205,6 +1218,16 @@ async def _migrate_pg_tunnel_plugins(conn: PostgresConnection) -> None:
     defaults. Mirrors the SQLite _migrate_tunnel_plugins. Idempotent."""
     await conn.executescript(
         "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS tunnel_plugins TEXT"
+    )
+
+
+async def _migrate_pg_tunnel_plugins_by_host(conn: PostgresConnection) -> None:
+    """8660d701 — tenants.tunnel_plugins_by_host: per-machine tunnel plugin config
+    (JSON {hostname: overrides}). The legacy tunnel_plugins stays the default for
+    hosts without a per-host entry. Mirrors SQLite _migrate_tunnel_plugins_by_host.
+    Idempotent."""
+    await conn.executescript(
+        "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS tunnel_plugins_by_host TEXT"
     )
 
 
@@ -1988,6 +2011,7 @@ _PG_MIGRATIONS_HOSTED = (
     _migrate_pg_admin_plan,
     _migrate_pg_tunnel_active,
     _migrate_pg_tunnel_plugins,
+    _migrate_pg_tunnel_plugins_by_host,
 )
 
 async def _migrate_pg_decision_code_anchor(conn: PostgresConnection) -> None:
@@ -2108,6 +2132,28 @@ async def _migrate_pg_github_connections(conn: PostgresConnection) -> None:
     )
 
 
+async def _migrate_pg_blog_posts(conn: PostgresConnection) -> None:
+    """6234f9b8 — blog_posts table for the admin Blog CMS.
+
+    Was added to the SQLite schema only; Postgres DBs 500'd on /admin/blog/posts
+    with 'relation blog_posts does not exist'. CREATE IF NOT EXISTS so re-running
+    is a no-op. Mirrors db._migrate_blog_posts.
+    """
+    await conn.executescript(
+        f"CREATE TABLE IF NOT EXISTS blog_posts ("
+        f"    id TEXT PRIMARY KEY,"
+        f"    title TEXT NOT NULL,"
+        f"    slug TEXT NOT NULL UNIQUE,"
+        f"    body_md TEXT NOT NULL DEFAULT '',"
+        f"    status TEXT NOT NULL DEFAULT 'draft',"
+        f"    created_at TEXT NOT NULL DEFAULT ({_TS}),"
+        f"    updated_at TEXT NOT NULL DEFAULT ({_TS}),"
+        f"    published_at TEXT"
+        f");"
+        f"CREATE INDEX IF NOT EXISTS idx_blog_posts_status ON blog_posts(status)"
+    )
+
+
 # Late migrations — run on every DB after the hosted-only set.
 _PG_MIGRATIONS_LATE = (
     _migrate_pg_workspace_tenant_isolation,
@@ -2146,4 +2192,5 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_handoffs_table,
     _migrate_pg_decision_assumption,
     _migrate_pg_github_connections,
+    _migrate_pg_blog_posts,
 )

@@ -787,6 +787,7 @@ async def _handle_mcp_request(
     tenant: dict[str, Any] | None = None,
     token_type: str = "readwrite",
     enforce_role: str | None = None,
+    scoped_project_ids: "list[str] | None" = None,
 ) -> dict[str, Any]:
     """Dispatch one JSON-RPC 2.0 MCP request and return the response dict.
 
@@ -852,6 +853,22 @@ async def _handle_mcp_request(
         args = params.get("arguments") or {}
         if token_type == "readonly" and name not in _server._mcp_readonly_tools:
             return _server._jsonrpc_err(req_id, -32603, f"tool '{name}' not allowed for read-only tokens")
+        # 95499c3e / decision 6fe5210c — Option A project-scope enforcement for
+        # API tokens (mirrors the HTTP middleware). A scoped member may only touch
+        # projects in their scope; resolve the tool's target project (by project_id,
+        # else project_name → id) and deny when it's out of scope.
+        if scoped_project_ids is not None:
+            _tgt_pid = (args.get("project_id") or "").strip()
+            if not _tgt_pid and args.get("project_name"):
+                try:
+                    _sp = await db_module.get_project_by_name(db, str(args["project_name"]))
+                    _tgt_pid = (_sp or {}).get("id", "") if _sp else ""
+                except Exception:  # noqa: BLE001
+                    _tgt_pid = ""
+            if _tgt_pid and _tgt_pid not in scoped_project_ids:
+                return _server._jsonrpc_err(
+                    req_id, -32603, "project is outside your access scope",
+                )
         # 393eed0a — workspace-role gate (defense in depth for cross-workspace MCP).
         if enforce_role is not None and name not in _server._mcp_readonly_tools \
                 and name not in _server._GITHUB_TOOL_NAMES:
@@ -1072,6 +1089,62 @@ def _infer_touches_resources(title: str) -> list[str]:
     return [f"inferred:file:{path}" for path in _suggest_files_for_title(title or "")]
 
 
+def _prospect_code_context(item: dict[str, Any]) -> dict[str, Any] | None:
+    """04a15d3f — best-effort code-prospecting context for a freshly-claimed item.
+
+    Parses the item's typed ``touches_resources`` into the files and symbols an
+    executor should prospect before editing and emits the exact code-intel calls
+    to run — ``codebase__search_graph`` for ``file:`` entries, Serena
+    ``find_symbol`` for ``symbol:`` entries. With no declared resources it falls
+    back to title-keyword file inference (:func:`_suggest_files_for_title`).
+
+    The code index lives behind the executor's tunnel, so the server surfaces
+    the prospecting *targets and commands* rather than inlining graph results:
+    this never touches the tunnel and returns ``None`` when there's nothing to
+    suggest, so it can't fail (or block) a claim — non-fatal by construction.
+    """
+    files: list[str] = []
+    symbols: list[str] = []
+    for entry in _parse_touches_files(item.get("touches_resources")):
+        if entry.startswith("file:"):
+            files.append(entry[len("file:"):])
+        elif entry.startswith("symbol:"):
+            symbols.append(entry[len("symbol:"):])
+        elif entry.startswith("inferred:file:"):
+            files.append(entry[len("inferred:file:"):])
+    if files or symbols:
+        ctx: dict[str, Any] = {"source": "touches_resources"}
+        if files:
+            ctx["files"] = files
+            ctx["search_graph_calls"] = [
+                f'codebase__search_graph(query="{f}")' for f in files
+            ]
+        if symbols:
+            ctx["symbols"] = symbols
+            ctx["find_symbol_calls"] = [
+                f'find_symbol(name_path="{s}")' for s in symbols
+            ]
+        ctx["hint"] = (
+            "Prospect before editing: run the listed code-intel calls "
+            "(no-op if the code tunnel/index isn't connected)."
+        )
+        return ctx
+    inferred = _suggest_files_for_title(item.get("title") or "")
+    if inferred:
+        return {
+            "source": "title_inference",
+            "files": inferred,
+            "search_graph_calls": [
+                f'codebase__search_graph(query="{f}")' for f in inferred
+            ],
+            "hint": (
+                "No touches_resources declared; these files were inferred from "
+                "the item title. Prospect before editing."
+            ),
+        }
+    return None
+
+
 async def _active_executor_session_warnings(db: Any, project_id: str) -> list[str]:
     """fd86aacc — names of executor sessions seen active in the last 10 minutes.
 
@@ -1250,6 +1323,7 @@ async def _handle_project_tools(
             role=args.get("role"),
             compact=args.get("compact", True),
             version=args.get("version"),
+            mode=args.get("mode"),
         )
         # b9d1b606 — expand fs proxy roots so the executor's repo_path is
         # accessible without a separate set_active_repo call.
@@ -1877,7 +1951,16 @@ async def _handle_session_tools(
             f"Done when complete_sprint_item()\'d, tests pass, generate_handoff called."
         ) if pending_items else "/goal Continue work — all sprint items done."
         # 04f03ee4 — include start_session one-liner so next session can resume immediately
-        start_fresh = f'start_session(project_id="{project_id}", session_name="describe-what-youre-doing")'
+        # 11a91d31 — default to project_name (idiomatic per 8a449ec0); project_id as a comment.
+        try:
+            _ck_proj = await db_module.get_project(db, project_id)
+            _ck_pname = (_ck_proj or {}).get("name") or project_id
+        except Exception:  # noqa: BLE001
+            _ck_pname = project_id
+        start_fresh = (
+            f'start_session(project_name="{_ck_pname}", session_name="describe-what-youre-doing")'
+            f'  # project_id={project_id}'
+        )
         # fa595ad8 — store snapshot for Recent Sessions dashboard panel (non-fatal)
         # v3.1 — snapshot now lives on sessions.checkpoint_data, not a checkpoint:* note.
         try:
@@ -2729,6 +2812,17 @@ async def _handle_sprint_tools(
         if _sug:
             item = dict(item)
             item["suggested_files"] = _sug
+
+        # 04a15d3f — auto-prospect: surface the code-intel targets (files/symbols)
+        # the executor should search before editing, derived from touches_resources
+        # (or inferred from the title). Best-effort; never blocks the claim.
+        try:
+            _code_ctx = _prospect_code_context(item)
+        except Exception:  # noqa: BLE001
+            _code_ctx = None
+        if _code_ctx:
+            item = dict(item)
+            item["code_context"] = _code_ctx
 
         return item
     if name == "add_subtask":

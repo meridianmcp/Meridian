@@ -15,9 +15,9 @@
 // Core fetch wrapper — adds workspace tenant header + demo-mode 403 handling.
 // ---------------------------------------------------------------------------
 
-async function api(path, opts={}) {
+async function api(path: string, opts: RequestInit = {}): Promise<any> {
   const state = window.state || {};
-  const headers = {'Content-Type': 'application/json'};
+  const headers: Record<string, string> = {'Content-Type': 'application/json'};
   if (state.activeWorkspaceTenantId) {
     headers['X-Workspace-Tenant-Id'] = state.activeWorkspaceTenantId;
   }
@@ -28,7 +28,8 @@ async function api(path, opts={}) {
       throw new Error('demo_readonly');
     }
     const text = await r.text();
-    const err = new Error(`${r.status}: ${text}`);
+    // Augmented Error (extra fields consumed by projectApi + callers).
+    const err: any = new Error(`${r.status}: ${text}`);
     err.status = r.status;
     err.endpoint = path;
     err.responseText = text;
@@ -46,19 +47,19 @@ window.api = api;
 const _staleProjectsHandled = new Set();
 window._staleProjectsHandled = _staleProjectsHandled;
 
-async function projectApi(projectId, path, opts={}) {
+async function projectApi(projectId: string, path: string, opts: RequestInit = {}): Promise<any> {
   const state = window.state || {};
   try {
     const data = await api(path, opts);
     if (typeof clearProjectLoadError === 'function') clearProjectLoadError(projectId, path);
     return data;
-  } catch (e) {
+  } catch (e: any) {
     // Self-heal stale tabs: a "project not found" 404 for a project that isn't
     // in the current account's project list means the signed-in account changed
     // (often in another tab). Close the orphaned tab and prompt a refresh once,
     // instead of spamming every panel with 404s until the user reloads.
     if (e && e.status === 404 && /project not found/i.test(e.responseText || '')
-        && !(state.projects || []).some(p => p.id === projectId)
+        && !(state.projects || []).some((p: any) => p.id === projectId)
         && !_staleProjectsHandled.has(projectId)) {
       _staleProjectsHandled.add(projectId);
       try { if (typeof closeTab === 'function') closeTab(projectId); } catch (_) {}

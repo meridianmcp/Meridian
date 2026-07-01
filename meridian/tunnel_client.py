@@ -789,6 +789,74 @@ def _config_path() -> Path:
     return Path.home() / ".meridian" / "config.json"
 
 
+# ---------------------------------------------------------------------------
+# Package cache locations — shown once on first tunnel run (a887155d)
+# ---------------------------------------------------------------------------
+
+def _package_cache_locations() -> dict[str, str]:
+    """Where npx (Node MCPs) and uvx (Python MCPs) land downloaded packages.
+
+    Derived from the package managers' env vars with per-OS defaults — no
+    subprocess is spawned, so this never slows tunnel startup. Best-effort:
+    the paths are the documented defaults, accurate unless the user overrode
+    them outside the standard env vars.
+    """
+    home = Path.home()
+    local = os.environ.get("LOCALAPPDATA")
+    win = sys.platform == "win32"
+
+    npm_cache = os.environ.get("npm_config_cache")
+    if not npm_cache:
+        npm_cache = str(Path(local) / "npm-cache") if (win and local) else str(home / ".npm")
+
+    uv_cache = os.environ.get("UV_CACHE_DIR")
+    if not uv_cache:
+        uv_cache = str(Path(local) / "uv" / "cache") if (win and local) else str(home / ".cache" / "uv")
+
+    uv_tools = os.environ.get("UV_TOOL_DIR")
+    if not uv_tools:
+        uv_tools = str(Path(local) / "uv" / "tools") if (win and local) else str(home / ".local" / "share" / "uv" / "tools")
+
+    return {
+        "npx": str(Path(npm_cache) / "_npx"),
+        "uvx": uv_cache,
+        "uv_tools": uv_tools,
+    }
+
+
+def _cache_locations_marker() -> Path:
+    """Marker whose existence means cache locations were already shown once."""
+    return Path.home() / ".meridian" / ".cache_locations_shown"
+
+
+def _print_package_cache_locations(*, force: bool = False) -> bool:
+    """Print where npx/uvx cache downloaded MCP servers — once, on first run.
+
+    A marker file under ``~/.meridian`` suppresses the banner on later runs so
+    repeat starts stay terse. Returns True if it printed. Best-effort: any FS
+    error is swallowed (we'd just print again next time) and never blocks
+    startup. (a887155d)
+    """
+    marker = _cache_locations_marker()
+    if not force:
+        try:
+            if marker.exists():
+                return False
+        except OSError:
+            pass
+    loc = _package_cache_locations()
+    print("  Package caches (first run — where downloaded MCP servers land):", flush=True)
+    print(f"    npx (Node MCPs):   {loc['npx']}", flush=True)
+    print(f"    uvx (Python MCPs): {loc['uvx']}", flush=True)
+    print(f"    uv tools:          {loc['uv_tools']}", flush=True)
+    try:
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text("1", encoding="utf-8")
+    except OSError:
+        pass
+    return True
+
+
 def _read_cached_token(base_url: str) -> str | None:
     """Return a cached tunnel token for *base_url* if present and unexpired."""
     path = _config_path()
@@ -1208,7 +1276,13 @@ def _build_code_proxy_command(
     """
     cmd = [npx, "-y", "mcp-proxy", "--port", str(port),
            "--server", "stream", "--stateless"]
-    if sys.platform == "win32" and binary.lower().endswith((".cmd", ".bat")):
+    if sys.platform == "win32":
+        # Always add --shell on Windows: mcp-proxy (Node.js) cannot spawn .exe
+        # binaries directly in some environments (missing DLL PATH, Node spawn
+        # restrictions). cmd.exe handles resolution reliably. Mirrors the FS slot's
+        # unconditional --shell. Limitation: paths with spaces in them won't work
+        # via --shell (cmd.exe splits on spaces); .cmd shims need shell anyway per
+        # Node 24 CVE-2024-27980.
         cmd.append("--shell")
     cmd += ["--", binary]
     return cmd
@@ -1708,14 +1782,25 @@ async def _relay_request(
 # ---------------------------------------------------------------------------
 
 async def _fetch_me(base_url: str, token: str) -> dict:
-    """GET /me and return the JSON body (raises on transport/HTTP error)."""
-    import httpx
+    """GET /me and return the JSON body (raises on transport/HTTP error).
 
+    8660d701 — sends this machine's hostname (X-Meridian-Hostname) so the server
+    resolves THIS machine's tunnel plugin config (per-machine, since different
+    machines have different software installed). Best-effort: a missing hostname
+    just falls back to the per-tenant default config server-side.
+    """
+    import httpx
+    import socket
+
+    try:
+        _hostname = socket.gethostname() or ""
+    except Exception:  # noqa: BLE001
+        _hostname = ""
+    headers = {"Authorization": f"Bearer {token}"}
+    if _hostname:
+        headers["X-Meridian-Hostname"] = _hostname
     async with httpx.AsyncClient(timeout=15.0) as client:
-        r = await client.get(
-            f"{base_url}/me",
-            headers={"Authorization": f"Bearer {token}"},
-        )
+        r = await client.get(f"{base_url}/me", headers=headers)
         r.raise_for_status()
         return r.json()
 
@@ -2256,6 +2341,11 @@ async def run_tunnel(
     if proxy_fs is not None:
         print(f"  (SSE clients: {_sse_url(base_url, tenant_id)})", flush=True)
     print(f"  Proxies start on first use; idle for >{_IDLE_KILL_SECONDS // 60}min → auto-kill + restart.", flush=True)
+    # First-run orientation: where npx/uvx drop downloaded MCP packages.
+    try:
+        _print_package_cache_locations()
+    except Exception:  # noqa: BLE001 — informational only, never block startup
+        pass
     print("", flush=True)
 
     # 5b. Auto-update local MCP client config.

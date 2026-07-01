@@ -1,13 +1,13 @@
 // dashboard-mcp.js — MCP tool renderer extracted from dashboard.js
 // Depends on: dashboard-utils.js (escapeHtml)
 
-export function _renderToolEntry(tool) {
+export function _renderToolEntry(tool: any): string {
 
   const props = (tool.inputSchema && tool.inputSchema.properties) ? tool.inputSchema.properties : {};
 
   const required = new Set((tool.inputSchema && tool.inputSchema.required) || []);
 
-  const params = Object.entries(props).map(([name, schema]) => {
+  const params = Object.entries(props).map(([name, schema]: [string, any]) => {
 
     const req = required.has(name) ? 'required' : 'optional';
 

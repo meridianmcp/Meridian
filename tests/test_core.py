@@ -349,8 +349,8 @@ async def test_handoff_starter_mode(db, tmp_path):
     )
     lines = [l for l in content.splitlines() if l]
     assert len(lines) <= 20, f"starter mode must be ≤20 non-empty lines, got {len(lines)}"
-    assert f'project_id: {p["id"]}' in content
-    assert 'start_session' in content
+    assert f'start_session(project_name="{p["name"]}"' in content  # 11a91d31 — name-first
+    assert f'project_id (fallback): {p["id"]}' in content
     assert it2["id"][:8] in content   # pending item ID appears
     assert "/goal" in content
 
@@ -1159,21 +1159,27 @@ def test_tunnel_plugins_install_accepts_uvx_command(client):
 
 
 def test_tunnel_registry_proxy_returns_servers_list(client):
-    """GET /tunnel/registry returns {servers: [], next_cursor: ...} even when offline."""
+    """GET /tunnel/registry returns a structured response.
+
+    200 with servers list when upstream is reachable or cache exists.
+    503 with error field when upstream is unreachable and no cache exists
+    (client falls back to curated list on 503).
+    """
     r = client.get("/tunnel/registry?limit=5")
-    assert r.status_code == 200
+    assert r.status_code in (200, 503)
     data = r.json()
-    # Must always return the servers key (may be empty if registry is unreachable)
-    assert "servers" in data
-    assert isinstance(data["servers"], list)
-    # next_cursor is present (may be None)
-    assert "next_cursor" in data
+    if r.status_code == 200:
+        assert "servers" in data
+        assert isinstance(data["servers"], list)
+        assert "next_cursor" in data
+    else:
+        assert "error" in data
 
 
 def test_tunnel_registry_proxy_rejects_large_limit(client):
-    """GET /tunnel/registry caps limit at 50."""
+    """GET /tunnel/registry caps limit at 50 — must not return 4xx for a large limit."""
     r = client.get("/tunnel/registry?limit=999")
-    assert r.status_code == 200  # capped, not rejected
+    assert r.status_code in (200, 503)  # capped, not rejected with 4xx
 
 
 # ---------------------------------------------------------------------------
@@ -5620,6 +5626,37 @@ def test_dashboard_uses_static_assets(client):
     assert "/static/dashboard.css" in r.text
 
 
+def test_dashboard_bundle_cache_busted_by_content_hash(client):
+    """9aba783f — the bundle <script> ?v= token is the bundle's sha256 content
+    hash (from asset-manifest.json), so a deploy busts the browser cache even
+    when no version / git SHA is available in prod."""
+    import hashlib
+    from pathlib import Path
+    from meridian import _deps
+
+    static = Path(_deps.__file__).parent / "static"
+    actual = hashlib.sha256((static / "dashboard.bundle.js").read_bytes()).hexdigest()[:12]
+    # Manifest reader, loaded constant, and served HTML all agree on the hash.
+    assert _deps._read_bundle_hash() == actual
+    assert _deps._BUNDLE_HASH == actual
+    r = client.get("/dashboard")
+    assert r.status_code == 200
+    assert f"/static/dashboard.bundle.js?v={actual}" in r.text
+
+
+def test_read_bundle_hash_falls_back_when_manifest_missing(monkeypatch, tmp_path):
+    """9aba783f — a dev checkout with no asset-manifest.json falls back to
+    _ASSET_VERSION rather than crashing import."""
+    from meridian import _deps
+
+    monkeypatch.setattr(_deps, "Path", _deps.Path)  # keep Path
+    # Point the manifest lookup at an empty dir by monkeypatching __file__ dir.
+    fake_pkg = tmp_path / "meridian"
+    (fake_pkg / "static").mkdir(parents=True)
+    monkeypatch.setattr(_deps, "__file__", str(fake_pkg / "_deps.py"))
+    assert _deps._read_bundle_hash() == _deps._ASSET_VERSION
+
+
 # ---------------------------------------------------------------------------
 # v1.3.0 — "Last X days" project rewind view
 # ---------------------------------------------------------------------------
@@ -6242,6 +6279,7 @@ def test_pg_migration_registry_matches_historical_order():
         "_migrate_pg_admin_plan",
         "_migrate_pg_tunnel_active",
         "_migrate_pg_tunnel_plugins",
+        "_migrate_pg_tunnel_plugins_by_host",
     ]
     assert late == [
         "_migrate_pg_workspace_tenant_isolation",
@@ -6280,10 +6318,11 @@ def test_pg_migration_registry_matches_historical_order():
         "_migrate_pg_handoffs_table",
         "_migrate_pg_decision_assumption",
         "_migrate_pg_github_connections",
+        "_migrate_pg_blog_posts",
     ]
     # No duplicates across the three groups.
     allnames = core + hosted + late
-    assert len(allnames) == len(set(allnames)) == 68
+    assert len(allnames) == len(set(allnames)) == 70
 
 
 def test_default_agent_instructions_has_code_intel_protocol():
@@ -8370,6 +8409,67 @@ async def test_start_session_skips_continuation_for_stale_session():
         )
         assert second.get("continuation") is not True
         assert second["session_id"] != first_sid
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_start_session_continue_mode_returns_pending_and_goal():
+    """c793377d — auto-detected continuation returns a compact resume payload:
+    session_id + live pending items + ready-to-paste /goal, no full re-read."""
+    from meridian.server import _start_session_composite
+    db = await db_module.init_db(":memory:")
+    try:
+        p = await db_module.create_project(db, "continue-proj")
+        item = await db_module.add_sprint_item(db, p["id"], "v9", "Wire the widget")
+        first = await _start_session_composite(
+            db, p["id"], "resume-me", "/tmp", version="v9",
+        )
+        assert "continuation" not in first
+        # Immediate re-call within the heartbeat window → continue payload.
+        second = await _start_session_composite(
+            db, p["id"], "resume-me", "/tmp", source="resume",
+        )
+        assert second.get("continuation") is True
+        assert second.get("mode") == "continue"
+        assert second["session_id"] == first["session_id"]
+        assert second["pending_count"] == 1
+        assert second["pending_items"][0]["id"] == item["id"]
+        # The /goal string is ready to paste and names the pending item.
+        assert second["goal_string"].startswith("/goal")
+        assert item["id"] in second["goal_string"]
+        # No heavy L0/L1/L2 context.
+        assert "goal_xml" not in second
+        assert "cache_blocks" not in second
+        assert "meridian_instructions" not in second
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_start_session_continue_mode_resumes_past_heartbeat_window():
+    """c793377d — explicit mode='continue' resumes a same-name session even when
+    last_seen is older than the 5-min auto-detect window."""
+    from meridian.server import _start_session_composite
+    db = await db_module.init_db(":memory:")
+    try:
+        p = await db_module.create_project(db, "continue-stale")
+        first = await _start_session_composite(db, p["id"], "long-task", "/tmp")
+        first_sid = first["session_id"]
+        await db.execute(
+            "UPDATE sessions SET last_seen = datetime('now', '-30 minutes') WHERE id = ?",
+            (first_sid,),
+        )
+        await db.commit()
+        # 30 min > the 5-min auto-detect window, so a plain re-call would register
+        # fresh (see test_start_session_skips_continuation_for_stale_session).
+        # mode='continue' widens the window and resumes the original session.
+        cont = await _start_session_composite(
+            db, p["id"], "long-task", "/tmp", mode="continue",
+        )
+        assert cont.get("continuation") is True
+        assert cont.get("mode") == "continue"
+        assert cont["session_id"] == first_sid
     finally:
         await db.close()
 
@@ -12261,6 +12361,55 @@ async def test_claim_sprint_item_returns_worktree_fields_when_isolation_set(db):
     assert "git worktree add" in result["worktree_setup_cmd"]
     assert "git worktree remove" in result["worktree_cleanup_cmd"]
     assert "git merge" in result["worktree_merge_cmd"]
+
+
+@pytest.mark.asyncio
+async def test_claim_returns_code_context_from_touches_resources(db):
+    """04a15d3f — claim surfaces code_context (files + symbols + prospect calls)
+    parsed from the item's typed touches_resources."""
+    import json as _json
+    import meridian.server as srv
+
+    p = await db_module.create_project(db, "prospect-tr")
+    item = await db_module.add_sprint_item(db, p["id"], "v1", "Fix the registry proxy")
+    await db.execute(
+        "UPDATE sprint_items SET touches_resources = ? WHERE id = ?",
+        (_json.dumps(["file:meridian/routes/tunnel.py", "symbol:get_mcp_registry"]), item["id"]),
+    )
+    await db.commit()
+
+    result = await srv._dispatch_mcp_tool(
+        "claim_sprint_item",
+        {"project_id": p["id"], "item_id": item["id"]},
+        db, "/tmp",
+    )
+    ctx = result.get("code_context")
+    assert ctx is not None
+    assert ctx["source"] == "touches_resources"
+    assert ctx["files"] == ["meridian/routes/tunnel.py"]
+    assert ctx["symbols"] == ["get_mcp_registry"]
+    assert any("get_mcp_registry" in c for c in ctx["find_symbol_calls"])
+    assert any("tunnel.py" in c for c in ctx["search_graph_calls"])
+
+
+@pytest.mark.asyncio
+async def test_claim_code_context_falls_back_to_title_inference(db):
+    """04a15d3f — with no touches_resources, code_context is inferred from the
+    item title via the hotspot keyword rules (_suggest_files_for_title)."""
+    import meridian.server as srv
+
+    p = await db_module.create_project(db, "prospect-title")
+    item = await db_module.add_sprint_item(db, p["id"], "v1", "Fix dashboard button styling")
+
+    result = await srv._dispatch_mcp_tool(
+        "claim_sprint_item",
+        {"project_id": p["id"], "item_id": item["id"]},
+        db, "/tmp",
+    )
+    ctx = result.get("code_context")
+    assert ctx is not None
+    assert ctx["source"] == "title_inference"
+    assert ctx["files"]  # at least one file inferred from the title
 
 
 @pytest.mark.asyncio

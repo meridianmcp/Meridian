@@ -13,7 +13,7 @@ They fall into two usage patterns:
 
 | Tool | One-liner | Example call |
 |------|-----------|-------------|
-| `start_session` | Register session, get full project context | `start_session(project_id="abc-123", session_name="feature-x", human_id="alice")` |
+| `start_session` | Register session, get full project context | `start_session(project_name="my-project", session_name="feature-x", human_id="alice")` |
 | `log_task` | Record completed work to the shared task log | `log_task(session_id="sid", project_id="abc-123", description="Wired OAuth redirect")` |
 | `checkpoint` | Snapshot progress: auto-capture + delta handoff + next /goal | `checkpoint(session_id="sid", project_id="abc-123")` |
 | `pin_decision` | Add an architectural decision to the live constitution | `pin_decision(project_id="abc-123", title="Use psycopg3", body="asyncpg has DLL issues on Windows", category="TECHNICAL")` |
@@ -37,10 +37,11 @@ Register a session and get the full project context (goal, sprint, recent tasks,
 | `role` | string | optional | Pass 'executor' to inject executor_config and credentials guidance. |
 | `compact` | boolean | optional | Default true — slim orientation. Set false for the full goal/instructions payload. |
 | `version` | string | optional | Optional sprint-version bucket (e.g. 'v0.1.x') to scope this session to. Sprint progress/items in the orientation and /goal filter to it. Omit to auto-infer the bucket with the most pending items. |
+| `mode` | string | optional | Pass 'continue' to resume an already-active same-name session WITHOUT re-reading the full L0/L1/L2 orientation: returns just session_id + live pending items + the ready-to-paste /goal string. Auto-detected anyway within a 5-min heartbeat window; 'continue' widens that so a known-yours session resumes cleanly even after a longer gap. |
 
 **Example:**
 ```
-start_session(project_id="abc-123", session_name="feature-x", human_id="alice", role="executor")
+start_session(project_name="my-project", session_name="feature-x", human_id="alice", role="executor")
 ```
 
 ---

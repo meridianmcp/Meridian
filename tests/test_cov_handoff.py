@@ -596,8 +596,8 @@ async def test_generate_handoff_starter_and_compact(db, tmp_path):
         path, content = await handoff_module.generate_handoff(
             db, p["id"], str(tmp_path), mode=mode
         )
-        assert f'project_id: {p["id"]}' in content
-        assert "start_session" in content
+        assert f'start_session(project_name="{p["name"]}"' in content  # 11a91d31
+        assert f'project_id (fallback): {p["id"]}' in content
         assert it2["id"][:8] in content
         assert "Done:" in content
         assert path.endswith("alpha-starter-cov_starter.md")
@@ -828,6 +828,27 @@ def test_build_quick_start_goal_empty_items_hitl_mode_adapts():
     assert "or if HITL triggered." in empty_mode0
     empty_mode2 = handoff_module._build_quick_start_goal([], hitl_auto_answer_mode=2)
     assert "Do NOT file HITLs" in empty_mode2
+
+
+def test_handoff_start_session_lines_prefer_project_name():
+    """11a91d31 — the starter + delta handoff start_session lines default to
+    project_name (the idiomatic interface per 8a449ec0); project_id stays only as
+    a fallback comment, never as the start_session(project_id=...) call."""
+    proj = {"id": "abc-123-uuid", "name": "meridian-build"}
+    starter = handoff_module._render_starter_handoff(
+        proj, completed_items=[], pending_items=[], quick_start_goal="/goal x",
+    )
+    assert 'start_session(project_name="meridian-build"' in starter
+    assert 'start_session(project_id=' not in starter
+    assert "abc-123-uuid" in starter  # present as the fallback reference
+
+    delta = handoff_module._render_delta_handoff(
+        proj, generated_at="2026-06-30", completed_items=[],
+        in_progress_items=[], pending_sprint_items=[], quick_start_goal="/goal x",
+    )
+    assert 'start_session(project_name="meridian-build"' in delta
+    assert 'start_session(project_id=' not in delta
+    assert "project_id=abc-123-uuid" in delta  # inline fallback comment
 
 
 def test_start_session_agent_instructions_includes_hitl_directive(client):

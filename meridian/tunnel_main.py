@@ -79,6 +79,13 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Local port for the tunnel's mcp-proxy (default 8808).",
     )
     parser.add_argument(
+        "--no-kill",
+        action="store_true",
+        help="Skip stale-port cleanup for fast restarts. Accepted for parity "
+        "with `python -m meridian --tunnel`; the slim binary does not run the "
+        "port-kill loop, so this is a no-op here. (a887155d)",
+    )
+    parser.add_argument(
         "--code-dir",
         action="append",
         metavar="PATH",

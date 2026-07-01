@@ -1,7 +1,7 @@
 // Extracted from dashboard.js -- timeline/heatmap/gantt functions
 // DO NOT DELETE -- loaded via script tag in dashboard.html
 
-export function renderTimeline(projectId, data) {
+export function renderTimeline(projectId: any, data: any) {
 
   const wrap = document.getElementById(`timeline-wrap-${projectId}`);
 
@@ -10,7 +10,7 @@ export function renderTimeline(projectId, data) {
   const p = window.state?.panels[projectId];
   const sessionFilter = p && p.timelineSessionFilter;
   const rawTasks = (data && data.tasks) || [];
-  const tasks = sessionFilter ? rawTasks.filter(t => t.session_id === sessionFilter) : rawTasks;
+  const tasks = sessionFilter ? rawTasks.filter((t: any) => t.session_id === sessionFilter) : rawTasks;
   const goal_events = sessionFilter ? [] : ((data && data.goal_events) || []);
   data = { ...(data || {}), tasks, goal_events };
 
@@ -84,13 +84,13 @@ export function renderTimeline(projectId, data) {
 
     <div id="tl-pane-sprints-${projectId}" style="display:${savedTlView === 'sprints' || savedTlView === 'by-sprint' ? '' : 'none'}"></div>`;
 
-  const heatPane = document.getElementById(`tl-pane-heatmap-${projectId}`);
+  const heatPane = document.getElementById(`tl-pane-heatmap-${projectId}`)!;
 
-  const detailPane = document.getElementById(`tl-pane-detail-${projectId}`);
+  const detailPane = document.getElementById(`tl-pane-detail-${projectId}`)!;
 
-  const tasksPane = document.getElementById(`tl-pane-tasks-${projectId}`);
+  const tasksPane = document.getElementById(`tl-pane-tasks-${projectId}`)!;
 
-  const sprintsPane = document.getElementById(`tl-pane-sprints-${projectId}`);
+  const sprintsPane = document.getElementById(`tl-pane-sprints-${projectId}`)!;
 
 
 
@@ -100,7 +100,7 @@ export function renderTimeline(projectId, data) {
 
     if (!tasks.length) { tasksPane.innerHTML = `<div class="timeline-empty">no tasks logged yet</div>`; return; }
 
-    tasksPane.innerHTML = tasks.map(t => {
+    tasksPane.innerHTML = tasks.map((t: any) => {
 
       const ts = (t.created_at || '').slice(0, 16).replace('T', ' ');
 
@@ -126,11 +126,11 @@ export function renderTimeline(projectId, data) {
 
 
 
-  const _renderSprintsView = (groupBySprint) => {
+  const _renderSprintsView = (groupBySprint: any) => {
 
     api(`/projects/${projectId}/sprint-items?status=done`).then(items => {
 
-      const done = (items || []).filter(it => it.status === 'done').sort((a,b) =>
+      const done = (items || []).filter((it: any) => it.status === 'done').sort((a: any,b: any) =>
 
         String(b.completed_at || b.added_at || '').localeCompare(String(a.completed_at || a.added_at || '')));
 
@@ -138,9 +138,9 @@ export function renderTimeline(projectId, data) {
 
       if (groupBySprint) {
 
-        const groups = {};
+        const groups: Record<string, any[]> = {};
 
-        done.forEach(it => {
+        done.forEach((it: any) => {
 
           const key = it.version || it.item_group || '(unversioned)';
 
@@ -154,7 +154,7 @@ export function renderTimeline(projectId, data) {
 
             <div style="font-size:10px;font-weight:700;color:var(--accent);text-transform:uppercase;letter-spacing:.04em;padding:4px 0;border-bottom:1px solid var(--border);margin-bottom:4px">${escapeHtml(grp)} (${items.length})</div>
 
-            ${items.map(it => `<div style="padding:3px 0;font-size:11px;color:var(--text);display:flex;gap:8px"><span style="font-size:9px;color:var(--muted);white-space:nowrap;min-width:70px">${escapeHtml((it.completed_at || it.added_at || '').slice(0,10))}</span><span>${escapeHtml(it.title || '')}</span></div>`).join('')}
+            ${items.map((it: any) => `<div style="padding:3px 0;font-size:11px;color:var(--text);display:flex;gap:8px"><span style="font-size:9px;color:var(--muted);white-space:nowrap;min-width:70px">${escapeHtml((it.completed_at || it.added_at || '').slice(0,10))}</span><span>${escapeHtml(it.title || '')}</span></div>`).join('')}
 
           </div>`
 
@@ -162,7 +162,7 @@ export function renderTimeline(projectId, data) {
 
       } else {
 
-        sprintsPane.innerHTML = done.map(it =>
+        sprintsPane.innerHTML = done.map((it: any) =>
 
           `<div style="padding:4px 0;font-size:11px;color:var(--text);display:flex;gap:8px;border-bottom:1px solid var(--border)33">
 
@@ -270,7 +270,7 @@ export function renderTimeline(projectId, data) {
 
 }
 
-export function _heatmapPieces(maxScale) {
+export function _heatmapPieces(maxScale: any) {
 
   // Six-bucket green→red ramp scaled proportionally to maxScale so projects
 
@@ -306,9 +306,9 @@ export function _heatmapPieces(maxScale) {
 
 }
 
-export function _heatmapMaxFor(projectId) {
+export function _heatmapMaxFor(projectId: any) {
 
-  const raw = parseInt(localStorage.getItem(`meridian_heatmap_max_${projectId}`), 10);
+  const raw = parseInt(localStorage.getItem(`meridian_heatmap_max_${projectId}`) || '', 10);
 
   if (!Number.isFinite(raw)) return 25;
 
@@ -316,7 +316,7 @@ export function _heatmapMaxFor(projectId) {
 
 }
 
-export function _renderTimelineHeatmap(projectId, data, paneEl) {
+export function _renderTimelineHeatmap(projectId: any, data: any, paneEl: any) {
 
   /** Contribution calendar — one colored square per day, intensity by task
 
@@ -338,7 +338,7 @@ export function _renderTimelineHeatmap(projectId, data, paneEl) {
 
 
 
-  const cssVar = (name, fallback) => {
+  const cssVar = (name: any, fallback: any) => {
 
     const v = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
 
@@ -370,7 +370,7 @@ export function _renderTimelineHeatmap(projectId, data, paneEl) {
 
     const ps = new Set(), cs = new Set();
 
-    daily.forEach(d => (d.sessions || []).forEach(s => {
+    daily.forEach((d: any) => (d.sessions || []).forEach((s: any) => {
 
       ps.add(s.person || s.human || '(unknown)');
 
@@ -386,7 +386,7 @@ export function _renderTimelineHeatmap(projectId, data, paneEl) {
 
 
 
-  const dates = daily.map(d => d.date).sort();
+  const dates = daily.map((d: any) => d.date).sort();
 
   const rangeStart = dates[0];
 
@@ -398,9 +398,9 @@ export function _renderTimelineHeatmap(projectId, data, paneEl) {
 
   // back to "all" so it can never blank the calendar.
 
-  const selKey = (k) => `meridian_tl_${k}_${projectId}`;
+  const selKey = (k: any) => `meridian_tl_${k}_${projectId}`;
 
-  const loadSel = (k, all) => {
+  const loadSel = (k: any, all: any) => {
 
     try {
 
@@ -424,7 +424,7 @@ export function _renderTimelineHeatmap(projectId, data, paneEl) {
 
   let selClients = loadSel('clients', allClients);
 
-  const clientOK = (s) => selClients.size === allClients.length || selClients.has(s.client || '(none)');
+  const clientOK = (s: any) => selClients.size === allClients.length || selClients.has(s.client || '(none)');
 
 
 
@@ -442,7 +442,7 @@ export function _renderTimelineHeatmap(projectId, data, paneEl) {
 
   // Per (rowKey,day) detail so clicking a cell shows that row's sessions.
 
-  let detailByPersonDay = {};
+  let detailByPersonDay: Record<string, any[]> = {};
 
 
 
@@ -454,7 +454,7 @@ export function _renderTimelineHeatmap(projectId, data, paneEl) {
 
   function computeView() {
 
-    let rows = allPeople.filter(p => selPeople.has(p));
+    let rows = allPeople.filter((p: any) => selPeople.has(p));
 
     if (!rows.length) rows = allPeople.slice();
 
@@ -466,11 +466,11 @@ export function _renderTimelineHeatmap(projectId, data, paneEl) {
 
     detailByPersonDay = {};
 
-    const countByKeyDay = {};
+    const countByKeyDay: Record<string, number> = {};
 
-    daily.forEach(d => {
+    daily.forEach((d: any) => {
 
-      (d.sessions || []).forEach(s => {
+      (d.sessions || []).forEach((s: any) => {
 
         if (!clientOK(s)) return;
 
@@ -490,9 +490,9 @@ export function _renderTimelineHeatmap(projectId, data, paneEl) {
 
 
 
-    const calendars = [], series = [], titles = [];
+    const calendars: any[] = [], series: any[] = [], titles: any[] = [];
 
-    rowKeys.forEach((rk, i) => {
+    rowKeys.forEach((rk: any, i: any) => {
 
       const top = CAL_TOP + i * rowH;
 
@@ -536,17 +536,17 @@ export function _renderTimelineHeatmap(projectId, data, paneEl) {
 
       }
 
-      const pts = daily.map(d => {
+      const pts = daily.map((d: any) => {
 
         const count = countByKeyDay[`${rk}|${d.date}`] || 0;
 
         const dayDetail = detailByPersonDay[`${rk}|${d.date}`] || [];
 
-        const scount = new Set(dayDetail.map(s => s.session_id)).size;
+        const scount = new Set(dayDetail.map((s: any) => s.session_id)).size;
 
         return { value: [d.date, count], scount: scount, person: rk };
 
-      }).filter(pt => pt.value[1] > 0);
+      }).filter((pt: any) => pt.value[1] > 0);
 
       series.push({
 
@@ -576,7 +576,7 @@ export function _renderTimelineHeatmap(projectId, data, paneEl) {
 
           fontWeight: 'bold',
 
-          formatter: (p) => {
+          formatter: (p: any) => {
 
             const v = p.value && p.value[0];
 
@@ -638,7 +638,7 @@ export function _renderTimelineHeatmap(projectId, data, paneEl) {
 
     // calendar can never blank out.
 
-    const toggle = (sel, all, key, x) => {
+    const toggle = (sel: any, all: any, key: any, x: any) => {
 
       if (x === '__all__') sel = new Set(all);
 
@@ -662,7 +662,7 @@ export function _renderTimelineHeatmap(projectId, data, paneEl) {
 
     // rows are highlighted blue/white.
 
-    const mkDropdown = (labelText, all, getSel, setSel, key) => {
+    const mkDropdown = (labelText: any, all: any, getSel: any, setSel: any, key: any) => {
 
       const wrap = document.createElement('div');
 
@@ -700,7 +700,7 @@ export function _renderTimelineHeatmap(projectId, data, paneEl) {
 
         panel.innerHTML = '';
 
-        const mkRow = (text, value, active) => {
+        const mkRow = (text: any, value: any, active: any) => {
 
           const row = document.createElement('div');
 
@@ -732,7 +732,7 @@ export function _renderTimelineHeatmap(projectId, data, paneEl) {
 
         panel.appendChild(mkRow('All', '__all__', allSel));
 
-        all.forEach(x => panel.appendChild(mkRow(x.length > 30 ? x.slice(0, 29) + '…' : x, x, sel.has(x))));
+        all.forEach((x: any) => panel.appendChild(mkRow(x.length > 30 ? x.slice(0, 29) + '…' : x, x, sel.has(x))));
 
       };
 
@@ -762,13 +762,13 @@ export function _renderTimelineHeatmap(projectId, data, paneEl) {
 
     if (allPeople.length > 1) {
 
-      bar.appendChild(mkDropdown('People', allPeople, () => selPeople, (s) => { selPeople = s; }, 'people'));
+      bar.appendChild(mkDropdown('People', allPeople, () => selPeople, (s: any) => { selPeople = s; }, 'people'));
 
     }
 
     if (allClients.length > 1) {
 
-      bar.appendChild(mkDropdown('Client', allClients, () => selClients, (s) => { selClients = s; }, 'clients'));
+      bar.appendChild(mkDropdown('Client', allClients, () => selClients, (s: any) => { selClients = s; }, 'clients'));
 
     }
 
@@ -860,7 +860,7 @@ export function _renderTimelineHeatmap(projectId, data, paneEl) {
 
       textStyle: { color: '#c7d5ef', fontSize: 11, fontFamily: 'IBM Plex Mono' },
 
-      formatter: params => {
+      formatter: (params: any) => {
 
         const d = params.data;
 
@@ -902,7 +902,7 @@ export function _renderTimelineHeatmap(projectId, data, paneEl) {
 
 
 
-  const renderDetail = (person, date) => {
+  const renderDetail = (person: any, date: any) => {
 
     const list = detailByPersonDay[`${person}|${date}`] || [];
 
@@ -914,9 +914,9 @@ export function _renderTimelineHeatmap(projectId, data, paneEl) {
 
     }
 
-    const total = list.reduce((a, s) => a + s.count, 0);
+    const total = list.reduce((a: any, s: any) => a + s.count, 0);
 
-    const rows = list.map(s => {
+    const rows = list.map((s: any) => {
 
       const cli = s.client && s.client !== '(none)'
 
@@ -938,7 +938,7 @@ export function _renderTimelineHeatmap(projectId, data, paneEl) {
 
 
 
-  chart.on('click', params => {
+  chart.on('click', (params: any) => {
 
     if (params.componentType !== 'series' || !params.data || !params.data.value) return;
 
@@ -994,7 +994,7 @@ export function _renderTimelineHeatmap(projectId, data, paneEl) {
 
 }
 
-export function _renderTimelineGantt(projectId, data, paneEl) {
+export function _renderTimelineGantt(projectId: any, data: any, paneEl: any) {
 
   /** Per-session ECharts gantt — the secondary "Detail" timeline view. */
 
@@ -1006,7 +1006,7 @@ export function _renderTimelineGantt(projectId, data, paneEl) {
 
 
 
-  const parseTs = ts => {
+  const parseTs = (ts: any) => {
 
     if (!ts) return null;
 
@@ -1016,19 +1016,19 @@ export function _renderTimelineGantt(projectId, data, paneEl) {
 
 
 
-  const sessionNames = [...new Set(tasks.map(t => t.session_name || '(unknown)'))];
+  const sessionNames = [...new Set(tasks.map((t: any) => t.session_name || '(unknown)'))];
 
   const yCategories = [...sessionNames, 'goal'];
 
 
 
-  const STATUS_COLOR = { done: '#34d399', failed: '#f87171', in_progress: '#6c8fff', pending: '#9ca3af' };
+  const STATUS_COLOR: Record<string, string> = { done: '#34d399', failed: '#f87171', in_progress: '#6c8fff', pending: '#9ca3af' };
 
 
 
-  const byStatus = {};
+  const byStatus: Record<string, any[]> = {};
 
-  tasks.forEach(t => {
+  tasks.forEach((t: any) => {
 
     const d = parseTs(t.created_at);
 
@@ -1056,7 +1056,7 @@ export function _renderTimelineGantt(projectId, data, paneEl) {
 
 
 
-  const series = Object.entries(byStatus).map(([st, pts]) => ({
+  const series: any[] = Object.entries(byStatus).map(([st, pts]) => ({
 
     name: st,
 
@@ -1078,7 +1078,7 @@ export function _renderTimelineGantt(projectId, data, paneEl) {
 
   const goalByKey = new Map();
 
-  goal_events.forEach(g => {
+  goal_events.forEach((g: any) => {
 
     if (g.field === 'version_goal') {
 
@@ -1096,11 +1096,11 @@ export function _renderTimelineGantt(projectId, data, paneEl) {
 
 
 
-  const GOAL_COLOR = { sprint_updated_at: '#6c8fff', ns_updated_at: '#fbbf24', content_updated_at: '#a78bfa' };
+  const GOAL_COLOR: Record<string, string> = { sprint_updated_at: '#6c8fff', ns_updated_at: '#fbbf24', content_updated_at: '#a78bfa' };
 
-  const goalPts = [];
+  const goalPts: any[] = [];
 
-  const markLineData = [];
+  const markLineData: any[] = [];
 
   goalByKey.forEach(g => {
 
@@ -1180,7 +1180,7 @@ export function _renderTimelineGantt(projectId, data, paneEl) {
 
       extraCssText: 'max-width:340px;white-space:normal;',
 
-      position: (point, params, dom, rect, size) => {
+      position: (point: any, params: any, dom: any, rect: any, size: any) => {
 
         const x = point[0], y = point[1];
 
@@ -1190,7 +1190,7 @@ export function _renderTimelineGantt(projectId, data, paneEl) {
 
       },
 
-      formatter: params => {
+      formatter: (params: any) => {
 
         const d = params.data;
 
@@ -1238,7 +1238,7 @@ export function _renderTimelineGantt(projectId, data, paneEl) {
 
         color: '#8b9cba', fontFamily: 'IBM Plex Mono', fontSize: 9,
 
-        formatter: v => v.length > 22 ? v.slice(0, 21) + '…' : v,
+        formatter: (v: any) => v.length > 22 ? v.slice(0, 21) + '…' : v,
 
         width: 148, overflow: 'truncate',
 
@@ -1272,7 +1272,7 @@ export function _renderTimelineGantt(projectId, data, paneEl) {
 
 
 
-  const setZoom = (from, to) => {
+  const setZoom = (from: any, to: any) => {
 
     if (from || to) {
 
@@ -1354,7 +1354,7 @@ export function _renderTimelineGantt(projectId, data, paneEl) {
 
   if (r7Btn) r7Btn.onclick = () => {
 
-    if (fromInput) fromInput.value = new Date(nowD - 7 * 86400000).toISOString().slice(0, 10);
+    if (fromInput) fromInput.value = new Date(nowD.getTime() - 7 * 86400000).toISOString().slice(0, 10);
 
     if (toInput) toInput.value = todayStr;
 
@@ -1364,7 +1364,7 @@ export function _renderTimelineGantt(projectId, data, paneEl) {
 
   if (r30Btn) r30Btn.onclick = () => {
 
-    if (fromInput) fromInput.value = new Date(nowD - 30 * 86400000).toISOString().slice(0, 10);
+    if (fromInput) fromInput.value = new Date(nowD.getTime() - 30 * 86400000).toISOString().slice(0, 10);
 
     if (toInput) toInput.value = todayStr;
 

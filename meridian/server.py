@@ -30,6 +30,7 @@ from pathlib import Path
 from ._deps import (
     _VERSION,
     _ASSET_VERSION,
+    _BUNDLE_HASH,
     _GIT_SHA,
     _resource_path,
     _templates,
@@ -539,7 +540,7 @@ async def lifespan(app: FastAPI):
         for rel in [
             "meridian/server.py",
             "meridian/db.py",
-            "meridian/static/dashboard.js",
+            "meridian/static/dashboard.ts",
         ]:
             try:
                 h.update(Path(rel).read_bytes())
@@ -695,6 +696,41 @@ button{{width:100%;margin-top:14px;padding:11px;background:#6c8fff;border:none;b
 <label>Password</label>
 <input type="password" name="password" autofocus placeholder="Enter preview password">
 {err}<button type="submit">Continue</button></form></div></body></html>"""
+
+# 95499c3e / decision 6fe5210c — Option A: airtight per-request project-scope
+# enforcement. Matches a /projects/{uuid} or /projects/{uuid}/... path so we only
+# gate by-ID project access (not the /projects listing or /projects/by-name lookup).
+_PROJECT_ID_PATH_RE = re.compile(
+    r"^/projects/([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12})(?:/|$)"
+)
+
+
+@app.middleware("http")
+async def project_scope_enforcement(request: Request, call_next):
+    """95499c3e / decision 6fe5210c — a project-scoped workspace member is 403'd on
+    any project outside their scope, even by direct ID (not just hidden from
+    listings). Workspace-wide members and the tenant owner are unaffected.
+
+    This is the single chokepoint for every ``/projects/{uuid}/*`` HTTP route —
+    routes scatter ``get_project`` calls with no shared dependency, so enforcing
+    here covers them all at once. Returns 403 (not 404) so existence isn't leaked.
+    The MCP dispatch layer enforces the same rule separately (see /mcp).
+    """
+    m = _PROJECT_ID_PATH_RE.match(request.url.path)
+    if m is not None:
+        from ._deps import _scoped_project_ids_for_request  # noqa: PLC0415
+        try:
+            scoped = await _scoped_project_ids_for_request(request)
+        except Exception:  # noqa: BLE001 — a scope-check failure must never 500 a request
+            scoped = None
+        if scoped is not None and m.group(1) not in scoped:
+            return JSONResponse(
+                {"detail": "Project is outside your access scope."},
+                status_code=403,
+            )
+    return await call_next(request)
+
 
 @app.middleware("http")
 async def site_password_gate(request: Request, call_next):
@@ -1665,6 +1701,15 @@ async def me_endpoint(request: Request) -> dict[str, Any]:
     if tenant.get("is_internal"):
         expired = False
         days_remaining = None
+    # 8660d701 — per-machine tunnel config. The client sends its hostname; resolve
+    # that machine's config (or the per-tenant default for unconfigured machines).
+    from .tunnel_plugins import resolve_plugins, select_host_config
+    _me_hostname = (request.headers.get("X-Meridian-Hostname") or "").strip() or None
+    _me_eff_cfg = select_host_config(
+        _parsed_tunnel_plugins(tenant.get("tunnel_plugins")),
+        tenant.get("tunnel_plugins_by_host"),
+        _me_hostname,
+    )
     return {
         "plan": plan,
         "email": tenant.get("email", ""),
@@ -1686,11 +1731,15 @@ async def me_endpoint(request: Request) -> dict[str, Any]:
         # Resolved tunnel plugin registry (3-slot model) — the client spawns
         # whatever is enabled here, applying any per-tenant command/port
         # overrides over the built-in defaults. NULL config → built-in defaults.
-        "tunnel_plugins": _resolved_tunnel_plugins(tenant.get("tunnel_plugins")),
+        # 8660d701 — per-machine config: the tunnel client sends X-Meridian-Hostname,
+        # so we resolve THIS machine's config from tunnel_plugins_by_host (falling
+        # back to the per-tenant default). Different machines, different software.
+        "tunnel_plugins": resolve_plugins(_me_eff_cfg),
         # Raw per-tenant overrides so the client can re-resolve locally with
         # binary-detection (auto-enabling Office slots) while still honouring any
         # explicit enabled setting the user saved.
-        "tunnel_plugins_config": _parsed_tunnel_plugins(tenant.get("tunnel_plugins")),
+        "tunnel_plugins_config": _me_eff_cfg,
+        "tunnel_hostname": _me_hostname,
     }
 
 
@@ -2207,6 +2256,7 @@ async def dashboard_html(request: Request) -> Any:
         {
             "version": _VERSION,
             "asset_version": _ASSET_VERSION,
+            "bundle_hash": _BUNDLE_HASH,
             "demo_mode": False,
             "hosted_mode": os.environ.get("MERIDIAN_HOSTED", "").lower() in ("1", "true", "yes"),
             "is_admin": is_admin,
@@ -2245,6 +2295,7 @@ async def demo_dashboard(request: Request) -> Any:
         {
             "version": _VERSION,
             "asset_version": _ASSET_VERSION,
+            "bundle_hash": _BUNDLE_HASH,
             "demo_mode": True,
             "hosted_mode": False,
             "is_admin": False,
@@ -2441,7 +2492,7 @@ async def _regenerate_claude_md(
             "**Key Files:**",
             "- `meridian/server.py` — FastAPI app + MCP handlers",
             "- `meridian/db.py` — all DB functions (SQLite + Postgres)",
-            "- `meridian/static/dashboard.js` — dashboard UI",
+            "- `meridian/static/dashboard.ts` — dashboard UI",
             "- `tests/test_core.py` — full test suite",
             "- `data/meridian-build_handoff.md` — session handoff",
             "",
@@ -2822,10 +2873,11 @@ async def workspace_invite(request: Request) -> dict[str, Any]:
         )
     if not github_access:
         github_access = default_github_access_for_role(role)
-    # d116642e — optional project-level invite. When omitted/blank the member
-    # is workspace-wide (current behavior). When set, the member is scoped to
-    # that single project (listing-only scoping; airtight per-request access
-    # enforcement deferred pending product decision, pin b11c7cf6).
+    # d116642e — optional project-level invite. When omitted/blank the member is
+    # workspace-wide. When set, the member is scoped to that single project. As of
+    # 95499c3e (decision 6fe5210c, Option A) this is airtight per-request access
+    # enforcement (403 on any other project by direct ID), not just listing-only.
+    # A scoped member with an admin role is a "co-admin" (admin of that project).
     raw_project_id = body.get("project_id")
     project_id = raw_project_id.strip() if isinstance(raw_project_id, str) else None
     project_id = project_id or None
@@ -3173,7 +3225,7 @@ The 5 tools you use 90% of the time:
 
 | Tool | One-liner | Example |
 |------|-----------|---------|
-| start_session | Register session, get full project context | start_session(project_id="abc-123", session_name="feature-x") |
+| start_session | Register session, get full project context | start_session(project_name="my-project", session_name="feature-x") |
 | log_task | Record completed work | log_task(session_id="sid", project_id="abc-123", description="Fixed OAuth redirect") |
 | checkpoint | Snapshot: auto-capture + delta handoff + next /goal | checkpoint(session_id="sid", project_id="abc-123") |
 | pin_decision | Add to live constitution | pin_decision(project_id="abc-123", title="Use psycopg3", body="asyncpg has DLL issues on Windows", category="TECHNICAL") |
@@ -3252,7 +3304,7 @@ async def mcp_tools_doc() -> str:
         "\n",
         "| Tool | One-liner | Example call |\n",
         "|------|-----------|-------------|\n",
-        "| `start_session` | Register session, get full project context | `start_session(project_id=\"abc-123\", session_name=\"feature-x\", human_id=\"alice\")` |\n",
+        "| `start_session` | Register session, get full project context | `start_session(project_name=\"my-project\", session_name=\"feature-x\", human_id=\"alice\")` |\n",
         "| `log_task` | Record completed work to the shared task log | `log_task(session_id=\"sid\", project_id=\"abc-123\", description=\"Wired OAuth redirect\")` |\n",
         "| `checkpoint` | Snapshot progress: auto-capture + delta handoff + next /goal | `checkpoint(session_id=\"sid\", project_id=\"abc-123\")` |\n",
         "| `pin_decision` | Add an architectural decision to the live constitution | `pin_decision(project_id=\"abc-123\", title=\"Use psycopg3\", body=\"asyncpg has DLL issues on Windows\", category=\"TECHNICAL\")` |\n",
@@ -3542,6 +3594,80 @@ async def _find_continuation_session(
     return None
 
 
+async def _build_continue_payload(
+    db: aiosqlite.Connection,
+    project_id: str,
+    session: dict[str, Any],
+    *,
+    source: str | None = None,
+) -> dict[str, Any]:
+    """c793377d — compact 'just continue' resume block.
+
+    Returns only what an executor needs to pick up where it left off — the
+    session_id, the live pending sprint items (scoped to the session's version),
+    and the ready-to-paste /goal string — and deliberately skips the heavy
+    L0/L1/L2 orientation (goal_xml / cache_blocks / instructions / workspace).
+    Used both by the auto-detected heartbeat-window continuation and an explicit
+    mode='continue'. Every enrichment is best-effort so a resume never fails.
+    """
+    scoped_version = session.get("sprint_version") or None
+    try:
+        _all = await db_module.get_sprint_items(
+            db, project_id, include_human=False, version=scoped_version,
+        )
+    except Exception:  # noqa: BLE001
+        _all = []
+    pending = [it for it in _all if (it.get("status") in ("pending", "todo"))]
+    try:
+        _proj = await db_module.get_project(db, project_id)
+        _mode = db_module.normalize_execution_mode((_proj or {}).get("execution_mode"))
+    except Exception:  # noqa: BLE001
+        _mode = "autonomous"
+    try:
+        _settings = await db_module.get_project_settings(db, project_id)
+        _max_turns = handoff_module._max_turns_from_settings(_settings)
+    except Exception:  # noqa: BLE001
+        _max_turns = handoff_module._DEFAULT_GOAL_MAX_TURNS
+    _hitl_mode = await _hitl_auto_answer_mode_safe(db, project_id)
+    # `goal_string` (not `goal`) deliberately — consumers like hooks_session_start
+    # treat a result `goal` key as the goal *dict* (north_star/sprint); this is the
+    # ready-to-paste /goal *command* string, a distinct shape.
+    goal_string = handoff_module._build_quick_start_goal(
+        pending,
+        version=scoped_version,
+        execution_mode=_mode,
+        max_turns=_max_turns,
+        hitl_auto_answer_mode=_hitl_mode,
+    )
+    recent = await db_module.get_tasks(db, project_id, limit=5)
+    pending_slim = [
+        {
+            "id": it.get("id"),
+            "title": it.get("title"),
+            "status": it.get("status"),
+            "version": it.get("version"),
+        }
+        for it in pending
+    ]
+    return {
+        "continuation": True,
+        "mode": "continue",
+        "session_id": session["id"],
+        "session": session,
+        "source": source,
+        "sprint_version": scoped_version,
+        "pending_items": pending_slim,
+        "pending_count": len(pending_slim),
+        "goal_string": goal_string,
+        "recent_tasks": recent,
+        "note": (
+            "Continue mode — resumed without re-reading L0/L1/L2 context. Claim "
+            "the first pending item and keep going; call "
+            "get_session_brief(project_id) only if you need the full orientation."
+        ),
+    }
+
+
 # ecf69de8 — protocol-level EXECUTION MODE directive. start_session leads the
 # agent_instructions / orientation with this line so the posture is a structured
 # instruction the session can't miss, not buried freetext. 'autonomous' tells the
@@ -3824,6 +3950,7 @@ async def _start_session_composite(
     source: str | None = None,
     compact: bool = False,
     version: str | None = None,
+    mode: str | None = None,
 ) -> dict[str, Any]:
     """Register + goal + tasks + sessions + handoff-check in one shot.
 
@@ -3850,19 +3977,15 @@ async def _start_session_composite(
     (project_id, session_name); NEVER on Mcp-Session-Id since ChatGPT
     regenerates that header per tool call.
     """
-    existing = await _find_continuation_session(db, project_id, session_name)
+    # c793377d — "just continue" resume. Auto-detect uses the 5-min heartbeat
+    # window; an explicit mode='continue' widens it so an executor can resume a
+    # session it knows is still its own without re-reading L0/L1/L2 context.
+    _continue_window = 7 * 24 * 60 if (mode or "").lower() == "continue" else 5
+    existing = await _find_continuation_session(
+        db, project_id, session_name, max_idle_minutes=_continue_window
+    )
     if existing is not None:
-        # Compact resume block — caller already has the heavy context.
-        recent = await db_module.get_tasks(db, project_id, limit=10)
-        return {
-            "continuation": True,
-            "session": existing,
-            "source": source,
-            "recent_tasks": recent,
-            "note": "Resumed existing session (last_seen within 5 min). "
-                    "Call start_session(source='startup') after a real cold boot "
-                    "to get the full orientation block.",
-        }
+        return await _build_continue_payload(db, project_id, existing, source=source)
     # v1.8.x — archive sessions silent for 7+ days so they don't crowd
     # the active list seen by new sessions.
     await db_module.archive_empty_sessions(db)
@@ -5850,6 +5973,11 @@ async def _remote_mcp_inner(request: Request) -> Any:
     # claude.ai connector never sends it, so this is a no-op (no DB hit) on the
     # hot path.
     _enf_role = None
+    # 95499c3e — project-scope ids for API-token callers (mirrors the HTTP
+    # middleware): a scoped member's token is 403'd on out-of-scope projects at
+    # the MCP dispatch layer. Both only fire when an X-Workspace-Tenant-Id header
+    # rides along (the claude.ai connector never sends it → no-op, no DB hit).
+    _scoped_pids = None
     if request.headers.get("x-workspace-tenant-id", "").strip():
         try:
             _ctx = await _enforcement_context(request)
@@ -5857,12 +5985,17 @@ async def _remote_mcp_inner(request: Request) -> Any:
                 _enf_role = _ctx[2]
         except Exception:
             _enf_role = None
+        try:
+            from ._deps import _scoped_project_ids_for_request as _scoped_fn  # noqa: PLC0415
+            _scoped_pids = await _scoped_fn(request)
+        except Exception:
+            _scoped_pids = None
 
     if isinstance(body, list):
-        results = [await _handle_mcp_request(item, db, data_dir, tenant=tenant, token_type=_token_type, enforce_role=_enf_role) for item in body]
+        results = [await _handle_mcp_request(item, db, data_dir, tenant=tenant, token_type=_token_type, enforce_role=_enf_role, scoped_project_ids=_scoped_pids) for item in body]
         return JSONResponse(results)
 
-    result = await _handle_mcp_request(body, db, data_dir, tenant=tenant, token_type=_token_type, enforce_role=_enf_role)
+    result = await _handle_mcp_request(body, db, data_dir, tenant=tenant, token_type=_token_type, enforce_role=_enf_role, scoped_project_ids=_scoped_pids)
     return JSONResponse(result)
 
 # ---------------------------------------------------------------------------

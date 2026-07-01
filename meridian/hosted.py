@@ -228,8 +228,14 @@ async def get_github_auth_url(
     *,
     state: str = "",
     redirect_uri: str | None = None,
+    prompt: str = "",
 ) -> str:
-    """Return the GitHub OAuth authorization URL."""
+    """Return the GitHub OAuth authorization URL.
+
+    ``prompt='select_account'`` forces GitHub to show its account chooser
+    instead of silently reusing the browser's current GitHub session — used by
+    the multi-account "Connect another account" flow (330937c6).
+    """
     from urllib.parse import urlencode
 
     client_id = _require_cfg("GITHUB_CLIENT_ID")
@@ -241,6 +247,8 @@ async def get_github_auth_url(
     ]
     if state:
         params.append(("state", state))
+    if prompt:
+        params.append(("prompt", prompt))
     return f"https://github.com/login/oauth/authorize?{urlencode(params)}"
 
 
@@ -846,11 +854,16 @@ async def auth_github_repo_connect(request: Request) -> RedirectResponse:
         await get_current_tenant(request)
     except HTTPException:
         return RedirectResponse("/auth/login", status_code=302)
+    # 330937c6 — "Connect another account" passes select_account=1 so GitHub shows
+    # the account chooser rather than reusing the current GitHub browser session,
+    # which is the only way to attach a second account from one browser.
+    select_account = request.query_params.get("select_account", "").strip().lower() in ("1", "true", "yes")
     try:
         url = await get_github_auth_url(
             scope="repo",
             state=f"repo:{project_id}",
             redirect_uri=_github_repo_callback_url(),
+            prompt="select_account" if select_account else "",
         )
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc

@@ -67,9 +67,28 @@ def _read_git_sha() -> str:
         return _read_version()
 
 
+def _read_bundle_hash() -> str:
+    """9aba783f — content hash of the dashboard bundle, emitted by build.mjs into
+    ``meridian/static/asset-manifest.json``. Used as the bundle's ``?v=`` token so
+    every content change busts the browser cache even when no version / git SHA is
+    available in prod. Falls back to ``_ASSET_VERSION`` when the manifest is absent
+    (e.g. a dev checkout that hasn't run ``node build.mjs`` yet)."""
+    import json
+    try:
+        manifest = Path(__file__).parent / "static" / "asset-manifest.json"
+        data = json.loads(manifest.read_text(encoding="utf-8"))
+        h = str(data.get("bundle_hash") or "").strip()
+        if h:
+            return h
+    except Exception:
+        pass
+    return _ASSET_VERSION
+
+
 _VERSION = _read_version()
 _GIT_SHA = _read_git_sha()
 _ASSET_VERSION = f"{_VERSION}-{_GIT_SHA}" if _GIT_SHA != _VERSION else _VERSION
+_BUNDLE_HASH = _read_bundle_hash()
 
 
 # ---------------------------------------------------------------------------
