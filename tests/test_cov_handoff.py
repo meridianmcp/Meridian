@@ -132,6 +132,41 @@ def test_resolve_graph_searcher_uses_registered_resolver():
         handoff_module.set_graph_searcher_resolver(None)
 
 
+def test_partition_into_waves_topological_layers():
+    """3726cf70 — depends_on chains are layered into ordered waves; within-wave
+    items are unordered; cycles/external deps collapse to wave 0."""
+    items = [
+        {"id": "a"},
+        {"id": "b", "depends_on": "a"},
+        {"id": "c", "depends_on": "b"},
+        {"id": "d", "depends_on": "a"},
+        {"id": "e", "depends_on": "external-not-in-set"},
+    ]
+    waves = handoff_module._partition_into_waves(items)
+    ids = [[it["id"] for it in w] for w in waves]
+    assert ids[0] == ["a", "e"]           # roots (a; e's dep is external)
+    assert set(ids[1]) == {"b", "d"}      # depend on a
+    assert ids[2] == ["c"]                # depends on b
+    # A cycle must not hang or drop items.
+    cyc = handoff_module._partition_into_waves(
+        [{"id": "x", "depends_on": "y"}, {"id": "y", "depends_on": "x"}]
+    )
+    assert sum(len(w) for w in cyc) == 2
+
+
+def test_build_quick_start_goal_wave_structured_with_deps():
+    """3726cf70 — a dependency graph yields a wave-structured /goal; a flat list
+    (no deps) keeps the legacy phrasing."""
+    flat = handoff_module._build_quick_start_goal([{"id": "a1"}, {"id": "a2"}])
+    assert "Complete sprint items: a1, a2." in flat
+    assert "Wave" not in flat
+    waved = handoff_module._build_quick_start_goal([
+        {"id": "a1"}, {"id": "a2", "depends_on": "a1"},
+    ])
+    assert "wave order" in waved
+    assert "Wave 1: a1" in waved and "Wave 2: a2" in waved
+
+
 def test_agent_instructions_stale_detection():
     """99e50a1d — stored copies predating the standard are flagged; the current
     default and genuinely-bespoke docs are not."""

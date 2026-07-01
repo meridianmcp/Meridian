@@ -98,4 +98,21 @@ describe("helpers + mount guard", () => {
     expect((window as any).cytoscape).toBeUndefined();
     expect(mountSprintDag(document.createElement("div"), buildSprintDagElements(ITEMS))).toBeNull();
   });
+
+  it("mountSprintDag builds a cy instance with status-colored nodes when a global is present", () => {
+    const captured: any = {};
+    (window as any).cytoscape = (cfg: any) => { captured.cfg = cfg; return { destroy() {} }; };
+    try {
+      const inst = mountSprintDag(document.createElement("div"), buildSprintDagElements(ITEMS));
+      expect(inst).not.toBeNull();
+      const nodes = captured.cfg.elements.filter((e: any) => e.group === "nodes");
+      // The 'done' item 'a' carries its status color into the cy element data.
+      const nodeA = nodes.find((n: any) => n.data.id === "item:a");
+      expect(nodeA.data.color).toBe(SPRINT_STATUS_COLORS.done);
+      // fcose is optional; without it the layout falls back to breadthfirst.
+      expect(captured.cfg.layout.name).toBe("breadthfirst");
+    } finally {
+      delete (window as any).cytoscape;
+    }
+  });
 });

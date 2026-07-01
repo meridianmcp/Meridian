@@ -129,6 +129,47 @@ def _max_turns_from_settings(proj_settings: dict[str, Any] | None) -> int:
         return _DEFAULT_GOAL_MAX_TURNS
 
 
+def _partition_into_waves(
+    items: list[dict[str, Any]],
+) -> list[list[dict[str, Any]]]:
+    """Topologically layer items by ``depends_on`` into ordered waves (3726cf70).
+
+    Wave 0 holds items that depend on nothing else in the set; wave N holds
+    items whose in-set dependency sits in wave N-1. Items within a wave carry no
+    ordering constraint between them (parallel-safe, subject to the resource
+    conflicts the executor still checks at claim time). External or cyclic
+    dependencies collapse to wave 0 so nothing is ever dropped. Input order is
+    preserved within each wave. The sage/topological wave model — run each wave
+    fully before the next.
+    """
+    by_id = {it["id"]: it for it in items if it.get("id")}
+    wave_of: dict[str, int] = {}
+
+    def _depth(iid: str, seen: set[str]) -> int:
+        if iid in wave_of:
+            return wave_of[iid]
+        if iid in seen:  # dependency cycle — treat as a root
+            return 0
+        seen.add(iid)
+        it = by_id.get(iid)
+        dep = it.get("depends_on") if it else None
+        depth = (_depth(dep, seen) + 1) if (dep and dep in by_id) else 0
+        wave_of[iid] = depth
+        return depth
+
+    for iid in by_id:
+        _depth(iid, set())
+    if not wave_of:
+        return []
+    max_wave = max(wave_of.values())
+    waves: list[list[dict[str, Any]]] = [[] for _ in range(max_wave + 1)]
+    for it in items:
+        iid = it.get("id")
+        if iid in wave_of:
+            waves[wave_of[iid]].append(it)
+    return [w for w in waves if w]
+
+
 def _build_quick_start_goal(
     pending_sprint_items: list[dict[str, Any]],
     *,
@@ -189,6 +230,23 @@ def _build_quick_start_goal(
         if execution_mode == "interactive"
         else _EXECUTOR_GOAL_DIRECTIVE
     )
+    # 3726cf70 — when the pending items form a depends_on graph, structure the
+    # /goal into ordered waves (finish a wave before the next; within-wave items
+    # are parallel-safe). With no dependencies there's a single wave, so the flat
+    # "Complete sprint items: …" phrasing is preserved (no behaviour change).
+    waves = _partition_into_waves(pending_sprint_items)
+    if len(waves) > 1:
+        wave_txt = "; ".join(
+            f"Wave {i + 1}: {', '.join(it['id'] for it in wave if it.get('id'))}"
+            for i, wave in enumerate(waves)
+        )
+        items_clause = (
+            "Complete sprint items in wave order — finish each wave before "
+            "starting the next; items within a wave are parallel-safe: "
+            f"{wave_txt}. "
+        )
+    else:
+        items_clause = f"Complete sprint items: {', '.join(item_ids)}. "
     return (
         f"/goal {directive}"
         # 4cfaecc2 — the baked-in id list is a point-in-time snapshot; a live
@@ -196,7 +254,7 @@ def _build_quick_start_goal(
         # and already-claimed items instead of trusting a stale list.
         'First call get_sprint_items(status="pending") to load the live board '
         "(the ids below are a snapshot and may have shifted). "
-        f"Complete sprint items: {', '.join(item_ids)}. "
+        f"{items_clause}"
         "Done when all listed sprint items are marked complete via "
         f"complete_sprint_item(), pixi run test passes {test_floor}+, and "
         f"generate_handoff() is called at the end. Stop after {_turns} turns "

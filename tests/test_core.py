@@ -270,8 +270,11 @@ async def test_handoff_lists_pending_sprint_items_in_dependency_order(db, tmp_pa
     assert "2. [pending] Second fix" in content
     assert f"Depends on item 1 (`{first['id']}`): First fix" in content
     assert f'start_session(project_id="{p["id"]}", session_name="<your-name>")' in content
+    # 3726cf70 — a depends_on relationship renders the /goal as ordered waves
+    # (finish wave 1 before wave 2), which IS the dependency order made explicit.
+    assert "wave order" in content
     assert (
-        f"Complete sprint items: {first['id']}, {second['id']}."
+        f"Wave 1: {first['id']}; Wave 2: {second['id']}."
         in content
     )
     # f628b880 — the /goal leads with the non-deferential executor directive.
