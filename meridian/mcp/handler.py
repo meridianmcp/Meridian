@@ -3003,13 +3003,47 @@ async def _handle_file_claims(
                 db, args["session_id"], args["file_path"], _symbol,
             )
             return result
+        # ffa03655 — read|write claim grain (default write/exclusive).
         return await db_module.claim_file(
-            db, args["file_path"], args["session_id"], symbol=_symbol
+            db, args["file_path"], args["session_id"], symbol=_symbol,
+            mode=args.get("mode", "write"),
         )
     if name == "get_file_claims":
         return await db_module.get_file_claims(
             db, args["file_path"], args.get("project_id"), args.get("symbol")
         )
+    if name == "store_finding":
+        validate_input_size(args.get("content"), "finding content", 1_000_000)
+        if not (args.get("content") or "").strip():
+            return {"error": "store_finding requires non-empty content"}
+        return await db_module.store_finding(
+            db, args["project_id"], args["content"],
+            session_id=args.get("session_id"), key=args.get("key"),
+            title=args.get("title"), task_id=args.get("task_id"),
+        )
+    if name == "get_findings":
+        return await db_module.get_findings(
+            db, args["project_id"], key=args.get("key"),
+            session_id=args.get("session_id"), limit=int(args.get("limit", 50)),
+        )
+    if name == "send_message":
+        validate_input_size(args.get("payload"), "message payload", 1_000_000)
+        return await db_module.send_message(
+            db, args["project_id"], args["to_session_id"], args.get("payload", ""),
+            from_session_id=args.get("from_session_id") or args.get("session_id"),
+            kind=args.get("kind"),
+        )
+    if name == "receive_messages":
+        return await db_module.receive_messages(
+            db, args["session_id"],
+            mark_read=args.get("mark_read", True),
+            limit=int(args.get("limit", 50)),
+        )
+    if name == "idle_until_all_done":
+        _sids = args.get("session_ids") or []
+        if isinstance(_sids, str):
+            _sids = [s.strip() for s in _sids.split(",") if s.strip()]
+        return await db_module.idle_until_all_done(db, _sids)
     if name == "get_symbol_claims":
         return {"claims": await db_module.get_symbol_claims(db, args["file_path"])}
     if name == "get_symbol_hotspots":

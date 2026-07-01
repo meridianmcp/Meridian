@@ -1470,6 +1470,50 @@ async def _migrate_pg_sprint_item_quality_gates(conn: PostgresConnection) -> Non
     )
 
 
+async def _migrate_pg_parallel_primitives(conn: PostgresConnection) -> None:
+    """Wave-4 parallel-coordination primitives (ffa03655, c35370cc, d3a3a01d).
+
+    Postgres mirror of db.migrations._migrate_parallel_primitives: session_findings,
+    session_messages, file_read_claims. CREATE ... IF NOT EXISTS (idempotent).
+    """
+    await conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS session_findings (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL,
+            session_id TEXT,
+            key TEXT,
+            title TEXT,
+            content TEXT NOT NULL,
+            task_id TEXT,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+        CREATE INDEX IF NOT EXISTS idx_findings_project ON session_findings(project_id, key);
+        CREATE TABLE IF NOT EXISTS session_messages (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL,
+            from_session_id TEXT,
+            to_session_id TEXT NOT NULL,
+            kind TEXT,
+            payload TEXT NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            read_at TIMESTAMPTZ
+        );
+        CREATE INDEX IF NOT EXISTS idx_messages_to ON session_messages(to_session_id, read_at);
+        CREATE TABLE IF NOT EXISTS file_read_claims (
+            id TEXT PRIMARY KEY,
+            file_path TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            claimed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            expires_at TIMESTAMPTZ NOT NULL,
+            UNIQUE(file_path, session_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_read_claims_file ON file_read_claims(file_path);
+        CREATE INDEX IF NOT EXISTS idx_read_claims_expires ON file_read_claims(expires_at);
+        """
+    )
+
+
 def _slugify_note_pg(title: str) -> str:
     """Kebab-case a note title (lowercase, alnum+dashes, collapse, trim).
 
@@ -2207,4 +2251,5 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_github_connections,
     _migrate_pg_blog_posts,
     _migrate_pg_sprint_item_quality_gates,
+    _migrate_pg_parallel_primitives,
 )

@@ -781,9 +781,60 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
      "inputSchema": {"type": "object", "properties": {
          "session_id": {"type": "string"},
          "file_path": {"type": "string"},
+         "mode": {"type": "string", "enum": ["read", "write"], "description": "Claim grain (ffa03655). 'write' (default) = EXCLUSIVE: blocks other writers and is blocked by any other session's read claim. 'read' = SHARED: many sessions can read-claim the same file at once (no false contention for parallel reader agents), blocked only by another session's write lock."},
          "symbol": {"type": "string", "description": "Optional symbol to claim (class/function/method name, e.g. 'AuthRouter' or 'AuthRouter.login'). Requires `content`."},
          "content": {"type": "string", "description": "Full source of the file, required when `symbol` is given so the server can resolve the symbol's line range."}},
          "required": ["session_id", "file_path"]}},
+    {"name": "store_finding", "description":
+        "PARALLEL COORDINATION (c35370cc): persist a per-task intermediate result to the "
+        "session_findings table so it survives session boundaries. Parallel reader agents "
+        "write findings; an orchestrator or writer agent reads them via get_findings. Unlike "
+        "save_finding (which creates a research note), this is a lightweight key→content store "
+        "for agent-to-agent handoff of intermediate work.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id."},
+         "content": {"type": "string", "description": "The finding body."},
+         "key": {"type": "string", "description": "Optional bucket/topic for scoped retrieval (e.g. a subsystem name)."},
+         "title": {"type": "string", "description": "Optional short title."},
+         "session_id": {"type": "string", "description": "Optional writing session."},
+         "task_id": {"type": "string", "description": "Optional task this finding belongs to."}},
+         "required": ["content"]}},
+    {"name": "get_findings", "description":
+        "Read-only (c35370cc): read stored session_findings for a project (newest first), "
+        "optionally scoped by key and/or session_id. The read side of store_finding.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id."},
+         "key": {"type": "string", "description": "Only findings in this bucket."},
+         "session_id": {"type": "string", "description": "Only findings from this session."},
+         "limit": {"type": "integer", "description": "Max rows (default 50)."}},
+         "required": []}},
+    {"name": "send_message", "description":
+        "PARALLEL COORDINATION (d3a3a01d): enqueue an actor-model message to another session "
+        "(session_messages table). 'Done with X, you do Y' between parallel agents. The "
+        "recipient reads with receive_messages. A2A-compatible.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id."},
+         "to_session_id": {"type": "string", "description": "Recipient session id."},
+         "payload": {"type": "string", "description": "Message body (text or JSON)."},
+         "from_session_id": {"type": "string", "description": "Sender session id (defaults to session_id)."},
+         "kind": {"type": "string", "description": "Optional message kind/tag."}},
+         "required": ["to_session_id", "payload"]}},
+    {"name": "receive_messages", "description":
+        "PARALLEL COORDINATION (d3a3a01d): fetch unread messages addressed to a session "
+        "(oldest first) and mark them read by default. The receive side of send_message.",
+     "inputSchema": {"type": "object", "properties": {
+         "session_id": {"type": "string", "description": "The recipient session."},
+         "mark_read": {"type": "boolean", "description": "Mark fetched messages read (default true)."},
+         "limit": {"type": "integer", "description": "Max messages (default 50)."}},
+         "required": ["session_id"]}},
+    {"name": "idle_until_all_done", "description":
+        "PARALLEL COORDINATION (d3a3a01d): non-blocking barrier check across sibling sessions. "
+        "Returns {all_done, pending, statuses}; a session is done when closed/archived/missing. "
+        "The server can't block, so poll until all_done is true — the A2A 'wait for X, Y, Z to "
+        "finish' primitive.",
+     "inputSchema": {"type": "object", "properties": {
+         "session_ids": {"type": "array", "items": {"type": "string"}, "description": "Sessions to wait on."}},
+         "required": ["session_ids"]}},
     {"name": "release_file", "description":
         "Release a file lock (and any symbol claims this session holds on it).",
      "inputSchema": {"type": "object", "properties": {

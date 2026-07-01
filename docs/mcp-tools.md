@@ -1,6 +1,6 @@
 # MCP Tool Reference
 
-Meridian exposes **79 tools** over MCP.
+Meridian exposes **84 tools** over MCP.
 
 They fall into two usage patterns:
 
@@ -215,6 +215,7 @@ Claim exclusive edit rights on a file path for this session. Locks auto-expire a
 |-----------|------|----------|-------------|
 | `session_id` | string | required |  |
 | `file_path` | string | required |  |
+| `mode` | string | optional | Claim grain (ffa03655). 'write' (default) = EXCLUSIVE: blocks other writers and is blocked by any other session's read claim. 'read' = SHARED: many sessions can read-claim the same file at once (no false contention for parallel reader agents), blocked only by another session's write lock. |
 | `symbol` | string | optional | Optional symbol to claim (class/function/method name, e.g. 'AuthRouter' or 'AuthRouter.login'). Requires `content`. |
 | `content` | string | optional | Full source of the file, required when `symbol` is given so the server can resolve the symbol's line range. |
 
@@ -253,6 +254,74 @@ Read-only: Wait on another session before touching a shared file. The tool polls
 ```
 idle_until_session_done(watching_session_id="session-uuid")
 ```
+
+---
+
+## Parallel coordination
+
+### `store_finding`
+PARALLEL COORDINATION (c35370cc): persist a per-task intermediate result to the session_findings table so it survives session boundaries. Parallel reader agents write findings; an orchestrator or writer agent reads them via get_findings. Unlike save_finding (which creates a research note), this is a lightweight key→content store for agent-to-agent handoff of intermediate work.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `project_id` | string | optional |  |
+| `project_name` | string | optional | Project name — an alternative to project_id. |
+| `content` | string | required | The finding body. |
+| `key` | string | optional | Optional bucket/topic for scoped retrieval (e.g. a subsystem name). |
+| `title` | string | optional | Optional short title. |
+| `session_id` | string | optional | Optional writing session. |
+| `task_id` | string | optional | Optional task this finding belongs to. |
+
+---
+
+
+### `get_findings`
+Read-only (c35370cc): read stored session_findings for a project (newest first), optionally scoped by key and/or session_id. The read side of store_finding.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `project_id` | string | optional |  |
+| `project_name` | string | optional | Project name — an alternative to project_id. |
+| `key` | string | optional | Only findings in this bucket. |
+| `session_id` | string | optional | Only findings from this session. |
+| `limit` | integer | optional | Max rows (default 50). |
+
+---
+
+
+### `send_message`
+PARALLEL COORDINATION (d3a3a01d): enqueue an actor-model message to another session (session_messages table). 'Done with X, you do Y' between parallel agents. The recipient reads with receive_messages. A2A-compatible.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `project_id` | string | optional |  |
+| `project_name` | string | optional | Project name — an alternative to project_id. |
+| `to_session_id` | string | required | Recipient session id. |
+| `payload` | string | required | Message body (text or JSON). |
+| `from_session_id` | string | optional | Sender session id (defaults to session_id). |
+| `kind` | string | optional | Optional message kind/tag. |
+
+---
+
+
+### `receive_messages`
+PARALLEL COORDINATION (d3a3a01d): fetch unread messages addressed to a session (oldest first) and mark them read by default. The receive side of send_message.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `session_id` | string | required | The recipient session. |
+| `mark_read` | boolean | optional | Mark fetched messages read (default true). |
+| `limit` | integer | optional | Max messages (default 50). |
+
+---
+
+
+### `idle_until_all_done`
+PARALLEL COORDINATION (d3a3a01d): non-blocking barrier check across sibling sessions. Returns {all_done, pending, statuses}; a session is done when closed/archived/missing. The server can't block, so poll until all_done is true — the A2A 'wait for X, Y, Z to finish' primitive.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `session_ids` | array | required | Sessions to wait on. |
 
 ---
 

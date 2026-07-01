@@ -3354,6 +3354,12 @@ async def mcp_tools_doc() -> str:
         "Release a file lock held by this session when you're done editing.")
     lines += _render_tool("idle_until_session_done",
         "Read-only: Wait on another session before touching a shared file. The tool polls every 30 seconds until the watched session is done.")
+    lines += ["## Parallel coordination\n"]
+    lines += _render_tool("store_finding")
+    lines += _render_tool("get_findings")
+    lines += _render_tool("send_message")
+    lines += _render_tool("receive_messages")
+    lines += _render_tool("idle_until_all_done")
     lines += ["## Decisions\n"]
     lines += _render_tool("pin_decision",
         "Record an authoritative decision that supersedes earlier statements. Pinned decisions appear in every "

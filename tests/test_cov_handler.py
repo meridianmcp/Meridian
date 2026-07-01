@@ -1139,6 +1139,79 @@ def test_dispatch_complete_sprint_item_no_gate_when_not_flagged():
         _run(db.close())
 
 
+def test_read_write_claim_distinction():
+    """ffa03655 — shared read claims coexist; write is exclusive and waits for readers."""
+    import meridian.db as db_module
+    db = _make_db()
+    try:
+        proj = _run(db_module.create_project(db, "rw"))
+        pid = proj["id"]
+        s1 = _run(db_module.register_session(db, pid, "reader-1"))
+        s2 = _run(db_module.register_session(db, pid, "reader-2"))
+        s3 = _run(db_module.register_session(db, pid, "writer"))
+        r1 = _run(db_module.claim_file(db, "x.py", s1["id"], mode="read"))
+        r2 = _run(db_module.claim_file(db, "x.py", s2["id"], mode="read"))
+        assert r1["claimed"] and r1["claim_mode"] == "read"
+        assert r2["claimed"] and set(r2["readers"]) >= {s1["id"], s2["id"]}
+        # Writer blocked while readers hold the file.
+        w = _run(db_module.claim_file(db, "x.py", s3["id"], mode="write"))
+        assert not w["claimed"] and w["reason"] == "read_locked"
+        # Readers release → writer can claim exclusively.
+        _run(db_module.release_file(db, "x.py", s1["id"]))
+        _run(db_module.release_file(db, "x.py", s2["id"]))
+        w2 = _run(db_module.claim_file(db, "x.py", s3["id"], mode="write"))
+        assert w2["claimed"] and w2["claim_mode"] == "write"
+        # New reader blocked by the exclusive write lock.
+        r3 = _run(db_module.claim_file(db, "x.py", s1["id"], mode="read"))
+        assert not r3["claimed"] and r3["reason"] == "write_locked"
+    finally:
+        _run(db.close())
+
+
+def test_store_and_get_findings_roundtrip():
+    """c35370cc — findings persist and read back by key, incl. via dispatch."""
+    import meridian.db as db_module
+    db = _make_db()
+    try:
+        proj = _run(mh._dispatch_mcp_tool("create_project", {"name": "f"}, db, "/tmp"))
+        pid = proj["id"]
+        _run(mh._dispatch_mcp_tool("store_finding",
+            {"project_id": pid, "content": "auth uses JWT", "key": "auth"}, db, "/tmp"))
+        _run(db_module.store_finding(db, pid, "db is postgres", key="db"))
+        allf = _run(mh._dispatch_mcp_tool("get_findings", {"project_id": pid}, db, "/tmp"))
+        assert len(allf) == 2
+        authf = _run(mh._dispatch_mcp_tool("get_findings", {"project_id": pid, "key": "auth"}, db, "/tmp"))
+        assert len(authf) == 1 and "JWT" in authf[0]["content"]
+    finally:
+        _run(db.close())
+
+
+def test_session_messaging_and_barrier():
+    """d3a3a01d — send/receive + non-blocking idle_until_all_done barrier."""
+    import meridian.db as db_module
+    db = _make_db()
+    try:
+        proj = _run(db_module.create_project(db, "m"))
+        pid = proj["id"]
+        s1 = _run(db_module.register_session(db, pid, "a"))
+        s2 = _run(db_module.register_session(db, pid, "b"))
+        _run(db_module.send_message(db, pid, s2["id"], "do Y", from_session_id=s1["id"]))
+        msgs = _run(db_module.receive_messages(db, s2["id"]))
+        assert len(msgs) == 1 and msgs[0]["payload"] == "do Y"
+        # Marked read → next receive is empty.
+        assert _run(db_module.receive_messages(db, s2["id"])) == []
+        # Barrier: both active → not done.
+        st = _run(db_module.idle_until_all_done(db, [s1["id"], s2["id"]]))
+        assert not st["all_done"] and set(st["pending"]) == {s1["id"], s2["id"]}
+        # Close both → done.
+        _run(db_module.close_session(db, s1["id"]))
+        _run(db_module.close_session(db, s2["id"]))
+        st2 = _run(db_module.idle_until_all_done(db, [s1["id"], s2["id"]]))
+        assert st2["all_done"] and st2["pending"] == []
+    finally:
+        _run(db.close())
+
+
 def test_dispatch_get_context_block_project_not_found_raises():
     db = _make_db()
     try:
