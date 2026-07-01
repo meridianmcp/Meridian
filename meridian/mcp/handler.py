@@ -1313,10 +1313,17 @@ async def _handle_project_tools(
         # Pass compact=False explicitly for the full block.
         # a76cb7c0 — optional `version` scopes the session to a sprint-version
         # bucket (orientation counts/items + /goal filter to it).
+        # 599d0097 — session_name is optional: when omitted/blank, generate a
+        # meaningful default from the first pending item title + timestamp.
+        _sname = (args.get("session_name") or "").strip()
+        if not _sname:
+            _sname = await db_module.generate_default_session_name(
+                db, args["project_id"]
+            )
         result = await _server._start_session_composite(
             db,
             args["project_id"],
-            args["session_name"],
+            _sname,
             data_dir,
             human_id=args.get("human_id"),
             client_type=args.get("client"),
@@ -2562,6 +2569,9 @@ async def _handle_sprint_tools(
         # so omitting the key leaves the stored value untouched (_UNSET sentinel).
         if "touches_resources" in args:
             _patch_kwargs["touches_resources"] = args.get("touches_resources")
+        # 5823db0b — allow flagging an item as requiring completion evidence.
+        if "required_notes" in args:
+            _patch_kwargs["required_notes"] = args.get("required_notes")
         try:
             item = await db_module.patch_sprint_item(
                 db, args["project_id"], args["item_id"], **_patch_kwargs
@@ -2671,6 +2681,12 @@ async def _handle_sprint_tools(
                 "touches_resources to let them parallelize."
             )
         return _grp
+    if name == "analyze_sprint":
+        # e77f09d1 — one-call planning brief: parallelism + dependency chains +
+        # resource conflicts + stalls synthesized for a planning session.
+        return await db_module.analyze_sprint(
+            db, args["project_id"], version=args.get("version")
+        )
     if name == "claim_sprint_item":
         # ITEM 3 — protect installer scripts: refuse to claim a sprint item whose
         # touches_files includes hooks.ps1 / hooks.sh unless force=true is passed.
@@ -2725,7 +2741,12 @@ async def _handle_sprint_tools(
                 }
 
         try:
-            item = await db_module.claim_sprint_item(db, args["project_id"], args["item_id"])
+            # 5823db0b — actor attribution: record who claimed the item (explicit
+            # actor arg, else the claiming session id).
+            _claim_actor = args.get("actor") or args.get("session_id")
+            item = await db_module.claim_sprint_item(
+                db, args["project_id"], args["item_id"], actor=_claim_actor
+            )
         except ValueError:
             # 10c0f6a0 — if already in_progress, check for stale claim and surface info
             _stale_item = await db_module.get_sprint_item(db, args["item_id"])
@@ -2894,10 +2915,22 @@ async def _handle_sprint_tools(
             except Exception:  # noqa: BLE001
                 pass
 
-        item = await db_module.complete_sprint_item(
-            db, args["project_id"], args["item_id"],
-            task_id=args.get("task_id"),
-        )
+        # 5823db0b — quality gate + actor attribution. Pass evidence notes and
+        # the completing actor; surface the required_notes gate as a clean error.
+        _complete_actor = args.get("actor") or _complete_session_id or None
+        try:
+            item = await db_module.complete_sprint_item(
+                db, args["project_id"], args["item_id"],
+                task_id=args.get("task_id"),
+                notes=args.get("notes"),
+                actor=_complete_actor,
+            )
+        except db_module.SprintItemEvidenceRequired as exc:
+            return {
+                "error": "EVIDENCE_REQUIRED",
+                "item_id": args["item_id"],
+                "message": str(exc),
+            }
         if item is None:
             raise ValueError("sprint item not found")
         if _merge_warning:

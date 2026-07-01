@@ -3397,6 +3397,7 @@ async def mcp_tools_doc() -> str:
         "in-progress items, recent tasks, active sessions, recent decisions, pending HITLs). "
         "No session registration needed — designed for planning chat sessions that need to see "
         "project state without side effects.")
+    lines += _render_tool("analyze_sprint")
     lines += _render_tool("reconcile_sprint_drift",
         "Read-only: Cross-reference pending sprint items against recent git commits and return "
         "items that may already be done. confidence='high' means 3+ keywords overlap (safe to "

@@ -1,6 +1,6 @@
 # MCP Tool Reference
 
-Meridian exposes **78 tools** over MCP.
+Meridian exposes **79 tools** over MCP.
 
 They fall into two usage patterns:
 
@@ -31,7 +31,7 @@ Register a session and get the full project context (goal, sprint, recent tasks,
 |-----------|------|----------|-------------|
 | `project_id` | string | optional |  |
 | `project_name` | string | optional | Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given. |
-| `session_name` | string | required |  |
+| `session_name` | string | optional | Optional (599d0097): omit or leave blank to auto-generate a meaningful name from the first pending sprint item title + a timestamp, instead of inventing a string. |
 | `human_id` | string | optional |  |
 | `client` | string | optional |  |
 | `role` | string | optional | Pass 'executor' to inject executor_config and credentials guidance. |
@@ -447,6 +447,18 @@ Read-only: Return a compact planning context (sprint, north star, pending items,
 ```
 get_planning_brief(project_id="abc-123")
 ```
+
+---
+
+
+### `analyze_sprint`
+PLANNING: Read-only synthesis of the current sprint into one structured brief — parallelizability (conflict-free groups + max fan-out), dependency chains (depends_on walked to the root), resource/file conflicts (items sharing touches_resources), and stalls (stall_count>0). Returns {summary, recommended_strategy, parallelism, dependency_chains, longest_chain, file_conflicts, stalls, blocked, running}. Call in planning sessions instead of stitching together get_parallelizable_groups + manual dependency/conflict analysis.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `project_id` | string | optional |  |
+| `project_name` | string | optional | Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given. |
+| `version` | string | optional | Optional: only analyze items in this sprint-version bucket. |
 
 ---
 

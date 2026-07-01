@@ -1457,6 +1457,19 @@ async def _migrate_pg_sprint_item_owner(conn: PostgresConnection) -> None:
     )
 
 
+async def _migrate_pg_sprint_item_quality_gates(conn: PostgresConnection) -> None:
+    """5823db0b — quality gates + actor attribution on sprint_items.
+
+    Nullable ``required_notes`` (gate) + ``actor`` (attribution) columns. ADD
+    COLUMN IF NOT EXISTS so re-running is a no-op. Mirrors
+    db.migrations._migrate_sprint_item_quality_gates.
+    """
+    await conn.executescript(
+        "ALTER TABLE sprint_items ADD COLUMN IF NOT EXISTS required_notes INTEGER DEFAULT 0;"
+        "ALTER TABLE sprint_items ADD COLUMN IF NOT EXISTS actor TEXT;"
+    )
+
+
 def _slugify_note_pg(title: str) -> str:
     """Kebab-case a note title (lowercase, alnum+dashes, collapse, trim).
 
@@ -2193,4 +2206,5 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_decision_assumption,
     _migrate_pg_github_connections,
     _migrate_pg_blog_posts,
+    _migrate_pg_sprint_item_quality_gates,
 )

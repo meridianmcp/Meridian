@@ -6319,10 +6319,11 @@ def test_pg_migration_registry_matches_historical_order():
         "_migrate_pg_decision_assumption",
         "_migrate_pg_github_connections",
         "_migrate_pg_blog_posts",
+        "_migrate_pg_sprint_item_quality_gates",
     ]
     # No duplicates across the three groups.
     allnames = core + hosted + late
-    assert len(allnames) == len(set(allnames)) == 70
+    assert len(allnames) == len(set(allnames)) == 71
 
 
 def test_default_agent_instructions_has_code_intel_protocol():

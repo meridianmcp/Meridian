@@ -831,6 +831,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_handoffs_table(db)
     await _migrate_decision_assumption(db)
     await _migrate_github_connections(db)
+    await _migrate_sprint_item_quality_gates(db)
     return db
 
 
@@ -1728,6 +1729,37 @@ async def register_session(
         "session_id": sid, "session_name": name, "human_id": human_id,
     })
     return session
+
+
+async def generate_default_session_name(
+    db: aiosqlite.Connection,
+    project_id: str,
+) -> str:
+    """599d0097 — derive a meaningful session name when start_session gets none.
+
+    Uses the first pending/todo sprint item's title (slugified to its first few
+    words) plus a UTC timestamp, so an unnamed session reads as e.g.
+    ``wire-billing-oauth-20260701-2130`` instead of forcing the caller to invent
+    a string. Falls back to ``session-<timestamp>`` when the board is empty. The
+    timestamp keeps the name unique (the board rejects duplicate active names).
+    """
+    from datetime import datetime, timezone  # local: db/__init__ has no top import
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    try:
+        items = await get_sprint_items(db, project_id, include_human=False)
+    except Exception:  # noqa: BLE001 — naming must never block start_session
+        items = []
+    first = next(
+        (it for it in items
+         if (it.get("status") or "pending") in {"pending", "todo"}),
+        None,
+    )
+    title = (first or {}).get("title") or ""
+    words = re.findall(r"[a-z0-9]+", title.lower())
+    if words:
+        slug = "-".join(words[:5])[:48].strip("-") or "session"
+        return f"{slug}-{ts}"
+    return f"session-{ts}"
 
 
 def build_worker_context_xml(
@@ -3214,12 +3246,14 @@ async def _update_sprint_item_status(
     task_id: str | None = None,
     notes: str | None = None,
     pushed_to: str | None = None,
+    actor: str | None = None,
 ) -> dict[str, Any] | None:
     """Internal: flip a sprint item's status and optionally link a task.
 
     Terminal statuses (done / skipped / failed / pushed) stamp
     ``completed_at``; non-terminal statuses clear it. ``pushed_to``
-    records the target version when status == 'pushed'.
+    records the target version when status == 'pushed'. ``actor`` (5823db0b)
+    records the executor id/name that made this transition.
     """
     if status not in _VALID_SPRINT_STATUSES:
         raise ValueError(f"invalid sprint-item status: {status!r}")
@@ -3240,6 +3274,9 @@ async def _update_sprint_item_status(
     if pushed_to is not None:
         fields.append("pushed_to = ?")
         values.append(pushed_to)
+    if actor is not None:
+        fields.append("actor = ?")
+        values.append(actor)
     values.append(item_id)
     values.append(project_id)
     cursor = await db.execute(
@@ -3284,11 +3321,18 @@ async def _maybe_rollup_parent(db: aiosqlite.Connection, project_id: str, item_i
         await _update_sprint_item_status(db, project_id, parent_id, "indeterminate")
 
 
+class SprintItemEvidenceRequired(ValueError):
+    """Raised when complete_sprint_item is blocked by the required_notes gate
+    (5823db0b) — the item is flagged required_notes but has no evidence."""
+
+
 async def complete_sprint_item(
     db: aiosqlite.Connection,
     project_id: str,
     item_id: str,
     task_id: str | None = None,
+    notes: str | None = None,
+    actor: str | None = None,
 ) -> dict[str, Any] | None:
     """Mark a sprint item ``done`` and optionally link the task that shipped it.
 
@@ -3296,9 +3340,29 @@ async def complete_sprint_item(
     chain, advance the chain: an AI→human transition auto-files a HITL handoff,
     a human→AI transition un-blocks the next AI subtask (see
     :func:`_advance_task_chain`).
+
+    5823db0b — quality gate: when the item is flagged ``required_notes``, refuse
+    to complete unless evidence exists — an existing ``notes`` value, a linked
+    ``task_id``, or a ``notes`` argument on this call (which is persisted).
+    ``actor`` records which executor completed the item.
     """
+    item = await get_sprint_item(db, item_id)
+    if item is not None and item.get("project_id") == project_id:
+        if item.get("required_notes"):
+            has_evidence = bool(
+                (notes or "").strip()
+                or task_id
+                or (item.get("notes") or "").strip()
+                or (item.get("task_id"))
+            )
+            if not has_evidence:
+                raise SprintItemEvidenceRequired(
+                    f"item {item_id} requires evidence before completion — pass "
+                    "notes=... (what shipped / how it was verified) or link a "
+                    "task_id. This item was flagged required_notes."
+                )
     result = await _update_sprint_item_status(
-        db, project_id, item_id, "done", task_id=task_id
+        db, project_id, item_id, "done", task_id=task_id, notes=notes, actor=actor
     )
     if result is not None:
         await _maybe_rollup_parent(db, project_id, item_id)
@@ -3355,11 +3419,13 @@ async def claim_sprint_item(
     db: aiosqlite.Connection,
     project_id: str,
     item_id: str,
+    actor: str | None = None,
 ) -> dict[str, Any] | None:
     """Claim a sprint item: set status='in_progress' and claimed_at=now().
 
     Rejects (raises ValueError) if already in_progress, done, failed, or skipped.
-    Returns None if the item doesn't exist.
+    Returns None if the item doesn't exist. ``actor`` (5823db0b) records which
+    executor claimed the item.
     """
     item = await get_sprint_item(db, item_id)
     if item is None:
@@ -3372,9 +3438,10 @@ async def claim_sprint_item(
             f"cannot claim item with status '{item.get('status')}'"
         )
     cursor = await db.execute(
-        "UPDATE sprint_items SET status = 'in_progress', claimed_at = datetime('now') "
+        "UPDATE sprint_items SET status = 'in_progress', "
+        "claimed_at = datetime('now'), actor = COALESCE(?, actor) "
         "WHERE id = ? AND project_id = ?",
-        (item_id, project_id),
+        (actor, item_id, project_id),
     )
     await db.commit()
     if cursor.rowcount == 0:
@@ -3430,11 +3497,13 @@ async def patch_sprint_item(
     human_id: str | None = None,
     item_group: str | None = None,
     touches_resources: Any = _UNSET,
+    required_notes: bool | int | None = None,
 ) -> dict[str, Any] | None:
     """Update editable fields of a sprint item.
 
     Editable: title, version, status, feedback, notes, human_id (assignee),
-    item_group, touches_resources. Only fields passed as non-None are changed;
+    item_group, touches_resources, required_notes. Only fields passed as
+    non-None are changed;
     omitted fields are left untouched. To clear human_id or item_group, pass an
     empty string. ``touches_resources`` (501ec93f) uses the ``_UNSET`` sentinel
     so it can be omitted entirely; pass ``None`` or ``[]`` to clear it, or a list
@@ -3471,6 +3540,9 @@ async def patch_sprint_item(
     if touches_resources is not _UNSET:
         fields.append("touches_resources = ?")
         values.append(serialize_touches_resources(touches_resources))
+    if required_notes is not None:
+        fields.append("required_notes = ?")
+        values.append(1 if required_notes else 0)
     if not fields:
         return await get_sprint_item(db, item_id)
     values.extend([item_id, project_id])
@@ -6310,6 +6382,104 @@ async def get_parallelizable_groups(
         "undeclared_count": undeclared,
         "blocked": blocked,
         "running": running,  # df573218 — items currently in flight
+    }
+
+
+async def analyze_sprint(
+    db: aiosqlite.Connection,
+    project_id: str,
+    version: str | None = None,
+) -> dict[str, Any]:
+    """e77f09d1 — synthesize a structured planning brief for the current sprint.
+
+    One call combines what a planner otherwise assembles from four:
+      * parallelizability — conflict-free batches from
+        :func:`get_parallelizable_groups` (group_count, max fan-out, blocked).
+      * dependency chains — ``depends_on`` walked to the root for each open item.
+      * resource conflicts — open items whose ``touches_resources`` intersect
+        (why they can't co-schedule).
+      * stalls — open items with a non-zero ``stall_count``.
+
+    Returns a single dict with a human ``summary`` line and a
+    ``recommended_strategy`` ('parallel' when any group holds >1 item).
+    """
+    groups_info = await get_parallelizable_groups(db, project_id, version=version)
+    items = await get_sprint_items(db, project_id)
+    if version is not None:
+        items = [it for it in items if it.get("version") == version]
+    _open = {"pending", "todo", "in_progress"}
+    open_items = [it for it in items if (it.get("status") or "pending") in _open]
+    by_id = {it["id"]: it for it in items}
+
+    # Dependency chains: walk depends_on to the root for each open dependent item.
+    def _chain_for(item: dict[str, Any]) -> list[dict[str, Any]]:
+        chain: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        cur: dict[str, Any] | None = item
+        while cur is not None and cur["id"] not in seen:
+            seen.add(cur["id"])
+            chain.append({
+                "id": cur["id"],
+                "title": cur.get("title", ""),
+                "status": cur.get("status"),
+            })
+            dep = cur.get("depends_on")
+            cur = by_id.get(dep) if dep else None
+        chain.reverse()
+        return chain
+
+    chains = [
+        _chain_for(it) for it in open_items if it.get("depends_on")
+    ]
+    chains = [c for c in chains if len(c) > 1]
+    longest_chain = max((len(c) for c in chains), default=1)
+
+    # Resource/file conflicts among open items (shared touches_resources).
+    res_map: dict[str, list[str]] = {}
+    for it in open_items:
+        for res in parse_touches_resources(it.get("touches_resources")):
+            res_map.setdefault(res, []).append(it["id"])
+    conflicts = [
+        {"resource": res, "item_ids": ids}
+        for res, ids in sorted(res_map.items()) if len(ids) > 1
+    ]
+
+    stalls = [
+        {"id": it["id"], "title": it.get("title", ""),
+         "stall_count": it.get("stall_count") or 0}
+        for it in open_items if (it.get("stall_count") or 0) > 0
+    ]
+
+    groups = groups_info.get("groups", [])
+    max_group = max((len(g) for g in groups), default=0)
+    strategy = "parallel" if max_group > 1 else "sequential"
+    summary = (
+        f"{groups_info.get('eligible_count', 0)} eligible item(s) in "
+        f"{groups_info.get('group_count', 0)} group(s) (max {max_group} parallel); "
+        f"longest dependency chain {longest_chain}; {len(conflicts)} resource "
+        f"conflict(s); {len(stalls)} stalled; "
+        f"{len(groups_info.get('blocked', []))} blocked."
+    )
+    return {
+        "version": version,
+        "summary": summary,
+        "recommended_strategy": strategy,
+        "parallelism": {
+            "group_count": groups_info.get("group_count", 0),
+            "eligible_count": groups_info.get("eligible_count", 0),
+            "max_parallel": max_group,
+            "undeclared_count": groups_info.get("undeclared_count", 0),
+            "groups": [
+                [{"id": it["id"], "title": it.get("title", "")} for it in g]
+                for g in groups
+            ],
+        },
+        "dependency_chains": chains,
+        "longest_chain": longest_chain,
+        "file_conflicts": conflicts,
+        "stalls": stalls,
+        "blocked": groups_info.get("blocked", []),
+        "running": groups_info.get("running", []),
     }
 
 

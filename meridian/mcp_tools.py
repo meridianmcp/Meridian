@@ -72,14 +72,14 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "required": ["session_name"]}},
     {"name": "start_session", "description": "Register a session and return orientation. Compact by default (session_id, sprint focus + status counts, 3 recent tasks, board_change count) to keep an executor's context small. Pass compact=false for the full block (goal XML, decisions, MERIDIAN.md instructions, workspace context, sprint items) — or fetch it later with get_session_brief. Pass version to scope the session to one sprint-version bucket (e.g. 'v0.1.x'): the orientation's sprint counts/items filter to it and the scope is remembered for the /goal template. Omit version to auto-scope to the bucket with the most pending items (empty board → unscoped).",
      "inputSchema": {"type": "object", "properties": {
-          "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."}, "session_name": {"type": "string"},
+          "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."}, "session_name": {"type": "string", "description": "Optional (599d0097): omit or leave blank to auto-generate a meaningful name from the first pending sprint item title + a timestamp, instead of inventing a string."},
           "human_id": {"type": "string"},
           "client": {"type": "string", "enum": ["claude-code", "claude-desktop", "cursor", "other"]},
           "role": {"type": "string", "enum": ["executor"], "description": "Pass 'executor' to inject executor_config and credentials guidance."},
           "compact": {"type": "boolean", "description": "Default true — slim orientation. Set false for the full goal/instructions payload."},
           "version": {"type": "string", "description": "Optional sprint-version bucket (e.g. 'v0.1.x') to scope this session to. Sprint progress/items in the orientation and /goal filter to it. Omit to auto-infer the bucket with the most pending items."},
           "mode": {"type": "string", "enum": ["continue"], "description": "Pass 'continue' to resume an already-active same-name session WITHOUT re-reading the full L0/L1/L2 orientation: returns just session_id + live pending items + the ready-to-paste /goal string. Auto-detected anyway within a 5-min heartbeat window; 'continue' widens that so a known-yours session resumes cleanly even after a longer gap."}},
-          "required": ["session_name"]}},
+          "required": []}},
     {"name": "list_projects", "description":
         "Read-only: List all projects — find, browse, or look up your projects and their IDs. "
         "Call this first when you have a project name but need its project_id, or to discover "
@@ -625,16 +625,21 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "human_id": {"type": "string", "description": "Reassign to a person (assignee); empty string clears it."},
          "group": {"type": "string", "description": "Objective name to group the item under (item_group); empty string clears it."},
          "touches_resources": {"type": "array", "items": {"type": "string"},
-                               "description": "Replace the item's typed resource identifiers (file:/db:/mcp_tool:/route:/pypi:/github:). Pass [] to clear. Omit to leave unchanged."}},
+                               "description": "Replace the item's typed resource identifiers (file:/db:/mcp_tool:/route:/pypi:/github:). Pass [] to clear. Omit to leave unchanged."},
+         "required_notes": {"type": "boolean", "description": "Quality gate (5823db0b): when true, complete_sprint_item is blocked until the item has evidence (existing notes, a linked task, or a notes= argument on completion)."}},
          "required": ["item_id"]}},
     {"name": "complete_sprint_item", "description":
         "Mark a sprint item done. Pass task_id to link the task that shipped it. "
         "Pass session_id to get a board_change field (items injected mid-run) and an "
-        "active-worktree merge reminder in the response.",
+        "active-worktree merge reminder in the response. If the item is flagged "
+        "required_notes, you MUST pass notes= (evidence: what shipped / how verified) "
+        "or a task_id, or completion is refused (EVIDENCE_REQUIRED).",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
          "item_id": {"type": "string"},
          "task_id": {"type": "string"},
+         "notes": {"type": "string", "description": "Evidence for the completion (what shipped / how it was verified). Persisted on the item; satisfies the required_notes gate."},
+         "actor": {"type": "string", "description": "Executor id/name recorded as having completed the item (defaults to session_id)."},
          "session_id": {"type": "string", "description": "Optional: include board_change + worktree merge reminder."}},
          "required": ["item_id"]}},
     {"name": "reconcile_sprint_drift", "description":
@@ -691,6 +696,18 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
          "version": {"type": "string", "description": "Optional: only consider items in this sprint-version bucket."}},
+         "required": []}},
+    {"name": "analyze_sprint", "description":
+        "PLANNING: Read-only synthesis of the current sprint into one structured brief — "
+        "parallelizability (conflict-free groups + max fan-out), dependency chains "
+        "(depends_on walked to the root), resource/file conflicts (items sharing "
+        "touches_resources), and stalls (stall_count>0). Returns {summary, "
+        "recommended_strategy, parallelism, dependency_chains, longest_chain, "
+        "file_conflicts, stalls, blocked, running}. Call in planning sessions instead of "
+        "stitching together get_parallelizable_groups + manual dependency/conflict analysis.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "version": {"type": "string", "description": "Optional: only analyze items in this sprint-version bucket."}},
          "required": []}},
     {"name": "get_session_log", "description":
         "Read-only: Return the full task log for the given session. "
@@ -852,10 +869,11 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "urgency": {"type": "string", "enum": ["normal", "high", "blocking"]}},
          "required": ["file", "anchor", "content"]}},
     {"name": "claim_sprint_item",
-     "description": "Claim a pending sprint item: sets status to in_progress and records claimed_at. Read-only: false. Rejects if the item is already in_progress, done, failed, skipped, or its touches_files overlap active file claims from another live session.",
+     "description": "Claim a pending sprint item: sets status to in_progress and records claimed_at + actor. Read-only: false. Rejects if the item is already in_progress, done, failed, skipped, or its touches_files overlap active file claims from another live session.",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
          "item_id": {"type": "string"},
+         "actor": {"type": "string", "description": "Executor id/name recorded as having claimed the item (5823db0b; defaults to session_id)."},
          "session_id": {"type": "string", "description": "Optional caller session id; its own file claims are ignored for conflict checks."}},
          "required": ["item_id"]}},
     {"name": "add_subtask",
